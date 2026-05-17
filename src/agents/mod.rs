@@ -39,9 +39,11 @@ pub struct AgentSpec {
     pub(crate) login_argv: &'static [&'static str],
     /// argv prefix for the run flow. User-supplied args are appended.
     pub(crate) run_argv: &'static [&'static str],
-    /// Optional OAuth callback port to forward host:port → container:port
-    /// during login. `None` = no port forward (device-code flow or
-    /// agents that don't use browser callback).
+    /// OAuth callback port the agent's login server binds inside the
+    /// sandbox. `None` for agents that use device-code flow (no
+    /// callback, no port forward needed). For callback-based agents we
+    /// match the agent's hardcoded port and rely on the user overriding
+    /// via `PILLBOX_<ID>_OAUTH_PORT` if the agent ever moves it.
     pub(crate) oauth_port: Option<u16>,
 }
 
@@ -54,11 +56,17 @@ pub const CLAUDE: AgentSpec = AgentSpec {
     oauth_port: Some(54545),
 };
 
+// codex's default login starts a localhost callback server on a port it
+// picks itself (observed: 1455). Inside a sandbox that port isn't bound on
+// the host, so the browser redirect 404s. codex ships `--device-auth`
+// specifically for headless/sandbox use: it shows a URL + code in the
+// terminal, user pastes the code in their browser, codex polls for
+// completion. No port forwarding, no callback server.
 pub const CODEX: AgentSpec = AgentSpec {
     id: "codex",
     guest_cred_dir: "/home/lum/.codex",
     cred_filename: "auth.json",
-    login_argv: &["codex", "login"],
+    login_argv: &["codex", "login", "--device-auth"],
     run_argv: &["codex"],
     oauth_port: None,
 };
@@ -72,6 +80,18 @@ impl AgentSpec {
     pub fn id(&self) -> &'static str {
         self.id
     }
+
+    /// OAuth callback port to forward, after applying any user override.
+    /// `PILLBOX_<UPPERCASE_ID>_OAUTH_PORT` lets a user patch around the
+    /// agent moving its hardcoded port without rebuilding pillbox.
+    fn resolved_oauth_port(&self) -> Option<u16> {
+        let default = self.oauth_port?;
+        let var = format!("PILLBOX_{}_OAUTH_PORT", self.id.to_uppercase());
+        std::env::var(&var)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .or(Some(default))
+    }
 }
 
 impl AgentSpec {
@@ -82,7 +102,7 @@ impl AgentSpec {
         let mount = format!("{}:{}", tmp.path().display(), self.guest_cred_dir);
 
         let mut args = base_docker_args();
-        if let Some(port) = self.oauth_port {
+        if let Some(port) = self.resolved_oauth_port() {
             args.push("-p".into());
             args.push(format!("{port}:{port}"));
         }

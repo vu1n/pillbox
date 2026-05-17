@@ -1,16 +1,20 @@
 //! Claude Code adapter.
 //!
-//! Login flow: bind-mount a host tempdir at `/home/lum/.claude`, run
-//! `claude /login` inside the runner image, and after the container
-//! exits read `<tempdir>/.credentials.json` and persist its contents
-//! to the OS keychain under provider id `claude`.
+//! Login: bind-mount a host tempdir at `/home/lum/.claude`, run
+//! `claude auth login --claudeai` inside the runner image, then read
+//! `<tempdir>/.credentials.json` and persist its contents to the OS
+//! keychain under provider id `claude`.
 //!
-//! Run flow: load the stored credentials, write them to a host tempdir,
-//! bind-mount that tempdir at `/home/lum/.claude`, bind-mount the current
-//! working directory at `/workspace`, and exec `claude <args...>` inside
-//! the runner image.
+//! Run: stage stored credentials into a host tempdir, bind-mount that
+//! at `/home/lum/.claude`, bind-mount the current working directory at
+//! `/workspace`, and exec `claude <args>` inside the runner image.
 
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{anyhow, Context, Result};
 
@@ -21,73 +25,58 @@ const GUEST_HOME: &str = "/home/lum";
 const GUEST_CLAUDE_DIR: &str = "/home/lum/.claude";
 const GUEST_WORKSPACE: &str = "/workspace";
 
-/// Port that Claude Code's OAuth callback listener uses. If wrong we'll
-/// need to detect dynamically from claude's stdout in v0.2.
-///
-/// TODO(v0.1): verify on a real `claude /login` invocation. If claude
-/// picks a random port, we'll fall back to `-P` (publish all) and
-/// document a known-issue.
+/// Port Claude Code's OAuth callback listener binds. Hardcoded for v0.1;
+/// auto-detection from claude's stdout is a v0.2 task if claude picks a
+/// random port.
 const CLAUDE_OAUTH_PORT: u16 = 54545;
 
 pub fn login() -> Result<()> {
-    docker::check_available()?;
-    docker::check_image()?;
+    docker::check_ready()?;
 
-    let tmp = tempdir("pillbox-claude-login")?;
-    let mount_src = tmp.to_string_lossy().to_string();
+    let tmp = TempDir::create("pillbox-claude-login")?;
+    let port_map = format!("{CLAUDE_OAUTH_PORT}:{CLAUDE_OAUTH_PORT}");
+    let mount = format!("{}:{GUEST_CLAUDE_DIR}", tmp.path().display());
 
     println!("pillbox: starting Claude Code OAuth flow inside a sandbox.");
     println!("pillbox: a URL will print below — open it in your browser to authenticate.");
     println!();
 
-    // Bind-mount tempdir at /home/lum/.claude so claude writes
-    // .credentials.json into a location we can read after exit. The
-    // container runs as root (default) and the tempdir is owned by the
-    // host user — Docker Desktop's macOS userns mapping makes that work.
-    let port_map = format!("{CLAUDE_OAUTH_PORT}:{CLAUDE_OAUTH_PORT}");
-    let mount_arg = format!("{mount_src}:{GUEST_CLAUDE_DIR}");
-    let home_env = format!("HOME={GUEST_HOME}");
+    let mut args = base_docker_args();
+    args.extend([
+        "-p".into(),
+        port_map,
+        "-v".into(),
+        mount,
+        docker::RUNNER_IMAGE.into(),
+        "claude".into(),
+        "auth".into(),
+        "login".into(),
+        "--claudeai".into(),
+    ]);
 
-    let status = docker::run_interactive(&[
-        "-it",
-        "--rm",
-        "-p",
-        &port_map,
-        "-v",
-        &mount_arg,
-        "-e",
-        &home_env,
-        "-e",
-        "TERM=xterm-256color",
-        docker::RUNNER_IMAGE,
-        "claude",
-        "/login",
-    ])?;
-
+    let status = docker::run_interactive(&args)?;
     if !status.success() {
         return Err(anyhow!(
-            "claude /login exited with status {status}. \
+            "claude auth login exited with status {status}. \
              Re-run `pillbox claude login` and complete the OAuth flow."
         ));
     }
 
-    let creds_path = tmp.join(".credentials.json");
-    if !creds_path.exists() {
-        return Err(anyhow!(
-            "claude /login completed but no credentials file was written at {}.\n\
-             Check the sandbox output above for hints.",
-            creds_path.display()
-        ));
-    }
-    let payload = fs::read_to_string(&creds_path)
-        .with_context(|| format!("read {}", creds_path.display()))?;
+    let creds_path = tmp.path().join(".credentials.json");
+    let payload = match fs::read_to_string(&creds_path) {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(anyhow!(
+                "claude auth login completed but no credentials file at {}.\n\
+                 Check the sandbox output above for hints.",
+                creds_path.display()
+            ));
+        }
+        Err(e) => return Err(e).with_context(|| format!("read {}", creds_path.display())),
+    };
 
     keychain::save(PROVIDER, &payload)?;
-
-    // Best-effort cleanup. macOS tempdirs auto-clear, but the credentials
-    // file deserves an explicit unlink to minimize on-disk lifetime.
-    let _ = fs::remove_file(&creds_path);
-    let _ = fs::remove_dir_all(&tmp);
+    drop(tmp);
 
     println!();
     println!("pillbox: ✓ credentials stored in your OS keychain (service `pillbox`, account `claude`).");
@@ -96,88 +85,99 @@ pub fn login() -> Result<()> {
 }
 
 pub fn run(args: Vec<String>) -> Result<()> {
-    docker::check_available()?;
-    docker::check_image()?;
+    docker::check_ready()?;
 
-    let payload = keychain::load(PROVIDER)?.ok_or_else(|| {
-        anyhow!(
-            "no stored credentials for `claude`. Run `pillbox claude login` first."
-        )
-    })?;
+    let payload = keychain::load(PROVIDER)?
+        .ok_or_else(|| anyhow!("no stored credentials for `claude`. Run `pillbox claude login` first."))?;
 
-    // Stage creds into a tempdir we bind-mount into the sandbox.
-    let creds_tmp = tempdir("pillbox-claude-creds")?;
-    let creds_path = creds_tmp.join(".credentials.json");
-    fs::write(&creds_path, &payload).with_context(|| {
-        format!("write staged credentials to {}", creds_path.display())
-    })?;
-    set_secret_perms(&creds_path)?;
+    let tmp = TempDir::create("pillbox-claude-creds")?;
+    let creds_path = tmp.path().join(".credentials.json");
+    write_secret(&creds_path, &payload)?;
 
-    // Stage cwd → /workspace.
     let cwd = std::env::current_dir().context("resolve current working directory")?;
-    let cwd_str = cwd.to_string_lossy().to_string();
-    let creds_mount = format!("{}:{GUEST_CLAUDE_DIR}", creds_tmp.to_string_lossy());
-    let cwd_mount = format!("{cwd_str}:{GUEST_WORKSPACE}");
-    let home_env = format!("HOME={GUEST_HOME}");
+    let creds_mount = format!("{}:{GUEST_CLAUDE_DIR}", tmp.path().display());
+    let cwd_mount = format!("{}:{GUEST_WORKSPACE}", cwd.display());
 
-    let mut docker_args = vec![
-        "-it",
-        "--rm",
-        "-v",
-        &creds_mount,
-        "-v",
-        &cwd_mount,
-        "-w",
-        GUEST_WORKSPACE,
-        "-e",
-        &home_env,
-        "-e",
-        "TERM=xterm-256color",
-        docker::RUNNER_IMAGE,
-        "claude",
-    ];
-    let extras: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    docker_args.extend(extras);
+    let mut docker_args = base_docker_args();
+    docker_args.extend([
+        "-v".into(),
+        creds_mount,
+        "-v".into(),
+        cwd_mount,
+        "-w".into(),
+        GUEST_WORKSPACE.into(),
+        docker::RUNNER_IMAGE.into(),
+        "claude".into(),
+    ]);
+    docker_args.extend(args);
 
     let status = docker::run_interactive(&docker_args)?;
-
-    // TODO(v0.2): if claude refreshed the access token mid-session,
-    //             re-persist the updated .credentials.json back to the
-    //             keychain so we don't drift from the live token.
-
-    let _ = fs::remove_file(&creds_path);
-    let _ = fs::remove_dir_all(&creds_tmp);
-
+    drop(tmp);
     if !status.success() {
         return Err(anyhow!("claude exited with status {status}"));
     }
     Ok(())
 }
 
-/// Make a fresh tempdir with a stable prefix so users can find it in
-/// `/tmp` if something goes wrong mid-flow. We avoid the `tempfile`
-/// crate to keep pillbox's dep tree minimal.
-fn tempdir(prefix: &str) -> Result<PathBuf> {
-    let base = std::env::temp_dir();
-    let unique = format!(
-        "{prefix}-{}",
-        chrono::Utc::now().format("%Y%m%d-%H%M%S-%f")
-    );
-    let dir = base.join(unique);
-    fs::create_dir_all(&dir).with_context(|| format!("create tempdir {}", dir.display()))?;
-    set_secret_perms(&dir)?;
-    Ok(dir)
+/// Shared flags + env every pillbox docker invocation needs.
+fn base_docker_args() -> Vec<String> {
+    vec![
+        "-it".into(),
+        "--rm".into(),
+        "-e".into(),
+        format!("HOME={GUEST_HOME}"),
+        "-e".into(),
+        "TERM=xterm-256color".into(),
+    ]
 }
 
-#[cfg(unix)]
-fn set_secret_perms(path: &std::path::Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = if path.is_dir() { 0o700 } else { 0o600 };
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))
-        .with_context(|| format!("chmod {} {:o}", path.display(), mode))
-}
-
-#[cfg(not(unix))]
-fn set_secret_perms(_path: &std::path::Path) -> Result<()> {
+/// Create a file with 0600 perms from the start (no world-readable window).
+fn write_secret(path: &Path, payload: &str) -> Result<()> {
+    use std::io::Write;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("open {} for write", path.display()))?;
+    file.write_all(payload.as_bytes())
+        .with_context(|| format!("write to {}", path.display()))?;
     Ok(())
+}
+
+/// RAII tempdir guard. Removes the directory (and any contents — including
+/// captured credentials) on drop, whether the caller exits via Ok, Err, or
+/// panic. This is the primary defense against leaving credentials on disk
+/// when something fails between login and keychain save.
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn create(prefix: &str) -> Result<Self> {
+        // We avoid the `tempfile` crate to keep the dep tree minimal.
+        // SystemTime's nanos-since-epoch is unique enough for our single-
+        // process, sequential use case.
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("{prefix}-{nanos:x}"));
+        fs::create_dir(&dir).with_context(|| format!("create tempdir {}", dir.display()))?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("chmod {} 0700", dir.display()))?;
+        Ok(Self { path: dir })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        // Best-effort: nothing useful to do if removal fails (process is
+        // exiting). The OS will reclaim /tmp eventually either way.
+        let _ = fs::remove_dir_all(&self.path);
+    }
 }

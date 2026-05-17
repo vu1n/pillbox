@@ -1,48 +1,40 @@
 //! Thin wrapper over the `docker` CLI.
 //!
-//! v0.1 shells out to docker rather than using a Rust SDK like bollard so
-//! the runtime dep stays at "Docker Desktop installed" — no extra crates,
-//! no extra failure modes. Trade-off: less typed error handling.
+//! Shells out instead of using a Rust SDK to keep the runtime dep at
+//! "Docker Desktop installed" — no extra crates, no extra failure modes.
 
 use std::process::{Command, ExitStatus, Stdio};
 
 use anyhow::{anyhow, Context, Result};
 
-/// The published runner image. For v0.1 we point at the same Dockerfile
-/// lum uses (renamed to `pillbox` in this session). Once we publish to
-/// GHCR this becomes a stable tag.
+/// Published runner image tag. For v0.1 this is the locally-built lum image
+/// (named `pillbox` in this session). v0.2 publishes to GHCR.
 pub const RUNNER_IMAGE: &str = "pillbox:latest";
 
-/// Verify Docker is installed and reachable.
-pub fn check_available() -> Result<()> {
-    let out = Command::new("docker")
-        .arg("version")
-        .arg("--format")
-        .arg("{{.Server.Version}}")
-        .output()
-        .context(
-            "running `docker version` — is Docker Desktop installed and running?",
-        )?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(anyhow!(
-            "docker is installed but the daemon isn't responding:\n{stderr}"
-        ));
-    }
-    Ok(())
-}
-
-/// Confirm the runner image is available locally. We do NOT auto-pull in
-/// v0.1 — pull failure is a separate UX problem and we want users to see
-/// the explicit "image not found" message until publishing is set up.
-pub fn check_image() -> Result<()> {
+/// Confirm Docker is reachable and the runner image is available. One
+/// subprocess call instead of two: `docker image inspect` fails with a
+/// clear "Cannot connect to Docker daemon" message if the daemon is
+/// down, and with a clear "No such image" message if the image is
+/// missing — we just translate each into a more actionable hint.
+pub fn check_ready() -> Result<()> {
     let out = Command::new("docker")
         .arg("image")
         .arg("inspect")
         .arg(RUNNER_IMAGE)
+        .arg("--format")
+        .arg("{{.Id}}")
         .output()
-        .context("checking runner image")?;
-    if !out.status.success() {
+        .context("running `docker` — is Docker Desktop installed?")?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if stderr.contains("Cannot connect to the Docker daemon") {
+        return Err(anyhow!(
+            "Docker daemon isn't running. Start Docker Desktop and retry."
+        ));
+    }
+    if stderr.contains("No such image") || stderr.contains("Error response from daemon") {
         return Err(anyhow!(
             "runner image `{RUNNER_IMAGE}` not found locally.\n\n\
              For v0.1, build it from the lum repo:\n  \
@@ -50,15 +42,11 @@ pub fn check_image() -> Result<()> {
              A published GHCR image is on the v0.2 roadmap."
         ));
     }
-    Ok(())
+    Err(anyhow!("docker pre-flight failed: {stderr}"))
 }
 
-/// Run an interactive Docker container, attaching the current process's
-/// stdin/stdout/stderr. Blocks until the container exits.
-///
-/// `args` is the full argv after `docker run` (e.g. `["-it", "--rm",
-/// "-v", "...", "pillbox:latest", "claude", "/login"]`).
-pub fn run_interactive(args: &[&str]) -> Result<ExitStatus> {
+/// Run `docker run <args...>` with stdio inherited from the parent.
+pub fn run_interactive(args: &[String]) -> Result<ExitStatus> {
     let status = Command::new("docker")
         .arg("run")
         .args(args)

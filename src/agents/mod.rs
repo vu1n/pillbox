@@ -134,6 +134,16 @@ impl AgentSpec {
             ));
         }
 
+        // Mark provider-specific "I've onboarded the user" flags so the
+        // agent's interactive TUI doesn't re-prompt onboarding on every
+        // run. Skipped silently if the agent doesn't need any.
+        if let Err(e) = self.post_login_finalize(&home) {
+            eprintln!(
+                "pillbox: warning: could not finalize {} onboarding flags: {e}",
+                self.id
+            );
+        }
+
         println!();
         println!(
             "pillbox: ✓ {} authenticated. State persisted at {}.",
@@ -185,6 +195,49 @@ impl AgentSpec {
         let status = docker::run_interactive(&args)?;
         if !status.success() {
             return Err(anyhow!("{} exited with status {status}", self.id));
+        }
+        Ok(())
+    }
+
+    /// Per-agent post-login fix-ups. Claude's interactive TUI re-runs
+    /// its first-launch wizard ("Choose theme", "Select login method")
+    /// every session unless `~/.claude.json` has `hasCompletedOnboarding:
+    /// true`. The login flow doesn't set it — it's only set by clicking
+    /// through the wizard end-to-end. We set it directly after a
+    /// successful `claude auth login` so the next `pillbox claude run`
+    /// drops straight into a working REPL.
+    fn post_login_finalize(&self, home: &Path) -> Result<()> {
+        if self.id != "claude" {
+            return Ok(());
+        }
+        let claude_json = home.join(".claude.json");
+        if !claude_json.exists() {
+            // claude wrote no profile file — nothing to mark. Shouldn't
+            // happen since claude auth login always writes it, but be
+            // defensive.
+            return Ok(());
+        }
+        // Use jq inside a one-shot container — already in the image, no
+        // host Python/jq required. The edit is atomic via mv.
+        let one_liner =
+            "jq '.hasCompletedOnboarding = true' /home/lum/.claude.json > /tmp/x && \
+             mv /tmp/x /home/lum/.claude.json";
+        let args = [
+            "--rm".to_string(),
+            "-v".into(),
+            format!("{}:{GUEST_HOME}", home.display()),
+            "-e".into(),
+            format!("HOME={GUEST_HOME}"),
+            docker::RUNNER_IMAGE.into(),
+            "sh".into(),
+            "-c".into(),
+            one_liner.to_string(),
+        ];
+        let status = docker::run_interactive(&args)?;
+        if !status.success() {
+            return Err(anyhow!(
+                "post-login finalize (jq edit of .claude.json) failed: {status}"
+            ));
         }
         Ok(())
     }

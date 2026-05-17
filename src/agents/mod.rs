@@ -84,13 +84,17 @@ impl AgentSpec {
     /// OAuth callback port to forward, after applying any user override.
     /// `PILLBOX_<UPPERCASE_ID>_OAUTH_PORT` lets a user patch around the
     /// agent moving its hardcoded port without rebuilding pillbox.
+    /// Unparseable override values silently fall back to the hardcoded
+    /// port — pillbox doesn't surface a warning because users typically
+    /// only set this when something's already gone wrong with login.
     fn resolved_oauth_port(&self) -> Option<u16> {
         let default = self.oauth_port?;
         let var = format!("PILLBOX_{}_OAUTH_PORT", self.id.to_uppercase());
-        std::env::var(&var)
+        let port = std::env::var(&var)
             .ok()
             .and_then(|s| s.parse().ok())
-            .or(Some(default))
+            .unwrap_or(default);
+        Some(port)
     }
 }
 

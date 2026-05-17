@@ -153,7 +153,7 @@ impl AgentSpec {
         Ok(())
     }
 
-    pub fn run(&self, extra_args: Vec<String>) -> Result<()> {
+    pub fn run(&self, opts: RunOpts) -> Result<()> {
         docker::check_ready()?;
 
         let payload = keychain::load(self.id)?.ok_or_else(|| {
@@ -167,19 +167,29 @@ impl AgentSpec {
         let creds_path = tmp.path().join(self.cred_filename);
         write_secret(&creds_path, &payload)?;
 
-        let cwd = std::env::current_dir().context("resolve current working directory")?;
+        let workspace_host = match opts.workspace {
+            Some(p) => p,
+            None => std::env::current_dir().context("resolve current working directory")?,
+        };
+        let workspace_name = workspace_mount_name(&workspace_host, opts.name.as_deref())?;
+        let guest_workspace = format!("{GUEST_WORKSPACE}/{workspace_name}");
+
         let mut args = base_docker_args();
         args.extend([
             "-v".into(),
             format!("{}:{}", tmp.path().display(), self.guest_cred_dir),
             "-v".into(),
-            format!("{}:{GUEST_WORKSPACE}", cwd.display()),
+            format!("{}:{guest_workspace}", workspace_host.display()),
             "-w".into(),
-            GUEST_WORKSPACE.into(),
-            docker::RUNNER_IMAGE.into(),
+            guest_workspace,
         ]);
+        for m in &opts.mounts {
+            args.push("-v".into());
+            args.push(m.clone());
+        }
+        args.push(docker::RUNNER_IMAGE.into());
         args.extend(self.run_argv.iter().map(|s| s.to_string()));
-        args.extend(extra_args);
+        args.extend(opts.args);
 
         let status = docker::run_interactive(&args)?;
         drop(tmp);
@@ -188,6 +198,47 @@ impl AgentSpec {
         }
         Ok(())
     }
+}
+
+/// Caller-supplied options for `AgentSpec::run`. Built from CLI args in
+/// [`crate::main`] but kept as a plain struct so the agents layer doesn't
+/// depend on clap.
+pub struct RunOpts {
+    /// Host path to mount as the workspace. `None` = use the current
+    /// working directory.
+    pub workspace: Option<PathBuf>,
+    /// Override the basename used as the workspace mount point inside the
+    /// guest. `None` = derive from `workspace.file_name()`.
+    pub name: Option<String>,
+    /// Extra bind mounts as `HOST:GUEST` strings, passed through to
+    /// `docker run -v` verbatim. Repeatable.
+    pub mounts: Vec<String>,
+    /// Args forwarded to the agent CLI inside the guest.
+    pub args: Vec<String>,
+}
+
+/// Resolve the directory name we use as the workspace mount point inside
+/// the guest (`/workspace/<name>`).
+///
+/// Priority:
+///   1. `--name` override if provided (validated as a single path component)
+///   2. The host workspace dir's basename
+///   3. Fall back to `workspace` for unusual paths (e.g. `/` has no basename)
+fn workspace_mount_name(host: &Path, override_name: Option<&str>) -> Result<String> {
+    if let Some(name) = override_name {
+        if name.is_empty() || name.contains('/') || name.contains('\0') {
+            return Err(anyhow!(
+                "--name `{name}` must be a non-empty single path component (no `/` or NUL)"
+            ));
+        }
+        return Ok(name.to_string());
+    }
+    let derived = host
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("workspace");
+    Ok(derived.to_string())
 }
 
 /// Shared flags + env every pillbox docker invocation needs.

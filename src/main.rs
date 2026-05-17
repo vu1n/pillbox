@@ -16,6 +16,8 @@
 //! Adding a new agent = adding one `AgentSpec` constant in `agents`
 //! and one variant here.
 
+use std::path::PathBuf;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
@@ -23,7 +25,7 @@ mod agents;
 mod docker;
 mod keychain;
 
-use agents::AgentSpec;
+use agents::{AgentSpec, RunOpts};
 
 #[derive(Parser, Debug)]
 #[command(name = "pillbox", version, about, long_about = None)]
@@ -56,9 +58,28 @@ enum AgentAction {
     /// Run the OAuth flow inside a one-shot sandbox and store the
     /// resulting credentials in the OS keychain.
     Login,
-    /// Launch the agent in a fresh sandbox with stored credentials + the
-    /// current working directory mounted in.
+    /// Launch the agent in a fresh sandbox with stored credentials and
+    /// a project directory mounted in.
     Run {
+        /// Host path to mount as the workspace. Defaults to the current
+        /// working directory.
+        #[arg(long, value_name = "PATH")]
+        workspace: Option<PathBuf>,
+
+        /// Override the workspace mount-point name inside the guest.
+        /// The agent's working directory becomes `/workspace/<name>`
+        /// instead of `/workspace/<basename-of-workspace>`. Useful when
+        /// pillbox is driven by automation (e.g. lum spawning per-thread
+        /// workspaces with synthetic ids).
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+
+        /// Extra bind mount, passed through to `docker run -v`.
+        /// Repeatable: `--mount ~/.aws:/home/lum/.aws:ro --mount /tmp:/scratch`.
+        #[arg(long = "mount", value_name = "HOST:GUEST")]
+        mounts: Vec<String>,
+
+        /// Args forwarded to the agent CLI inside the sandbox.
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
     },
@@ -90,6 +111,16 @@ fn main() -> Result<()> {
 fn dispatch_agent(spec: AgentSpec, action: AgentAction) -> Result<()> {
     match action {
         AgentAction::Login => spec.login(),
-        AgentAction::Run { args } => spec.run(args),
+        AgentAction::Run {
+            workspace,
+            name,
+            mounts,
+            args,
+        } => spec.run(RunOpts {
+            workspace,
+            name,
+            mounts,
+            args,
+        }),
     }
 }

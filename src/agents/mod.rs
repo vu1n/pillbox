@@ -36,12 +36,20 @@ const GUEST_WORKSPACE: &str = "/workspace";
 pub struct AgentSpec {
     /// Provider id — keychain account name + CLI subject (e.g. `claude`).
     pub(crate) id: &'static str,
-    /// Guest directory the agent writes its credentials into. Pillbox
-    /// bind-mounts a host tempdir on top of this path during both login
-    /// and run so it can stage / capture the credentials file.
-    pub(crate) guest_cred_dir: &'static str,
-    /// Filename within `guest_cred_dir` that holds the credentials.
-    pub(crate) cred_filename: &'static str,
+    /// Paths (relative to the guest's HOME) where the agent stores its
+    /// persistent state. Files OR directories. Pillbox bind-mounts a
+    /// single host tempdir as HOME and captures only the contents of
+    /// these paths — ephemeral chatter (history, sessions, cache) that
+    /// the agent writes elsewhere in HOME is NOT persisted.
+    ///
+    /// Claude in particular writes both `.claude/.credentials.json` (auth)
+    /// AND `.claude.json` (profile config, sibling of the cred dir) —
+    /// missing the latter is what makes its first-run wizard fire
+    /// every session.
+    pub(crate) state_paths: &'static [&'static str],
+    /// Path (relative to HOME) of the file pillbox checks for after
+    /// `login` to confirm the agent actually wrote credentials.
+    pub(crate) cred_sentinel: &'static str,
     /// argv for the login flow (runs after the standard `docker run`
     /// flags + image name).
     pub(crate) login_argv: &'static [&'static str],
@@ -57,8 +65,8 @@ pub struct AgentSpec {
 
 pub const CLAUDE: AgentSpec = AgentSpec {
     id: "claude",
-    guest_cred_dir: "/home/lum/.claude",
-    cred_filename: ".credentials.json",
+    state_paths: &[".claude", ".claude.json"],
+    cred_sentinel: ".claude/.credentials.json",
     login_argv: &["claude", "auth", "login", "--claudeai"],
     run_argv: &["claude"],
     oauth_port: Some(54545),
@@ -72,8 +80,8 @@ pub const CLAUDE: AgentSpec = AgentSpec {
 // completion. No port forwarding, no callback server.
 pub const CODEX: AgentSpec = AgentSpec {
     id: "codex",
-    guest_cred_dir: "/home/lum/.codex",
-    cred_filename: "auth.json",
+    state_paths: &[".codex"],
+    cred_sentinel: ".codex/auth.json",
     login_argv: &["codex", "login", "--device-auth"],
     run_argv: &["codex"],
     oauth_port: None,
@@ -111,7 +119,7 @@ impl AgentSpec {
         docker::check_ready()?;
 
         let tmp = TempDir::create(&format!("pillbox-{}-login", self.id))?;
-        let mount = format!("{}:{}", tmp.path().display(), self.guest_cred_dir);
+        let mount = format!("{}:{GUEST_HOME}", tmp.path().display());
 
         let mut args = base_docker_args();
         if let Some(port) = self.resolved_oauth_port() {
@@ -135,21 +143,13 @@ impl AgentSpec {
             ));
         }
 
-        let bundle = capture_bundle(tmp.path())?;
-        if bundle.files.is_empty() {
+        let bundle = capture_bundle(tmp.path(), self.state_paths)?;
+        if !bundle.files.contains_key(self.cred_sentinel) {
             return Err(anyhow!(
-                "{} login completed but wrote nothing to {}.\n\
+                "{} login completed but `{}` is missing under {}.\n\
                  Check the sandbox output above for hints.",
                 self.id,
-                tmp.path().display()
-            ));
-        }
-        if !bundle.files.contains_key(self.cred_filename) {
-            return Err(anyhow!(
-                "{} login completed but the expected credentials file `{}` is missing from {}.\n\
-                 Check the sandbox output above for hints.",
-                self.id,
-                self.cred_filename,
+                self.cred_sentinel,
                 tmp.path().display()
             ));
         }
@@ -175,11 +175,10 @@ impl AgentSpec {
                 self.id, self.id
             )
         })?;
-        let bundle = Bundle::from_json(&payload, self.cred_filename)?;
+        let bundle = Bundle::from_json(&payload, self.cred_sentinel)?;
 
         let tmp = TempDir::create(&format!("pillbox-{}-creds", self.id))?;
         bundle.restore_into(tmp.path())?;
-        let creds_path = tmp.path().join(self.cred_filename);
 
         let workspace_host = match opts.workspace {
             Some(p) => p,
@@ -191,7 +190,7 @@ impl AgentSpec {
         let mut args = base_docker_args();
         args.extend([
             "-v".into(),
-            format!("{}:{}", tmp.path().display(), self.guest_cred_dir),
+            format!("{}:{GUEST_HOME}", tmp.path().display()),
             "-v".into(),
             format!("{}:{guest_workspace}", workspace_host.display()),
             "-w".into(),
@@ -207,43 +206,46 @@ impl AgentSpec {
 
         let status = docker::run_interactive(&args)?;
 
-        // If the agent refreshed tokens or rewrote any of its state during
-        // the session, the bind-mounted tempdir reflects the new state.
-        // Capture the whole bundle and persist back to keychain so the
-        // next run picks up fresh state. Done regardless of `status` —
-        // refresh may happen and then the agent exits non-zero for
-        // unrelated reasons, and we still want the new tokens.
-        write_back_bundle(self.id, tmp.path(), &payload, self.cred_filename);
+        // Persist any rotated tokens / updated state back to keychain.
+        // Only paths in `state_paths` are captured — random session/
+        // history files the agent wrote elsewhere in HOME are dropped
+        // with the tempdir.
+        write_back_bundle(self.id, tmp.path(), &payload, self.state_paths, self.cred_sentinel);
         drop(tmp);
 
         if !status.success() {
             return Err(anyhow!("{} exited with status {status}", self.id));
         }
-        let _ = creds_path; // silence unused; kept for clarity
         Ok(())
     }
 }
 
-/// Capture the entire bind-mounted credential directory after the agent
-/// exits and persist it back to keychain if anything changed.
-/// Best-effort: warns on failure rather than failing the whole `run`,
-/// since the user has already gotten value from the session and the
-/// next run will rediscover any genuinely broken state.
-fn write_back_bundle(provider: &str, tmp: &Path, original: &str, cred_filename: &str) {
-    let bundle = match capture_bundle(tmp) {
+/// Capture the agent's tracked state paths after the agent exits and
+/// persist back to keychain if anything changed. Best-effort: warns on
+/// failure rather than failing the whole `run`, since the user has
+/// already gotten value from the session and the next run will
+/// rediscover any genuinely broken state.
+fn write_back_bundle(
+    provider: &str,
+    tmp: &Path,
+    original: &str,
+    state_paths: &[&str],
+    cred_sentinel: &str,
+) {
+    let bundle = match capture_bundle(tmp, state_paths) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("pillbox: warning: could not snapshot {provider} state for write-back: {e}");
             return;
         }
     };
-    // Cred file must still be present for the bundle to be useful.
-    // (Sometimes the agent transiently removes/replaces it during a
-    // refresh; if it's missing at exit, something's wrong — don't
-    // overwrite the keychain with a partial bundle.)
-    if !bundle.files.contains_key(cred_filename) {
+    // Sentinel must still be present for the bundle to be useful.
+    // Agents sometimes transiently remove/replace the cred file during
+    // refresh; if it's missing at exit, refuse to overwrite keychain
+    // with a partial bundle.
+    if !bundle.files.contains_key(cred_sentinel) {
         eprintln!(
-            "pillbox: warning: {provider} state at exit is missing `{cred_filename}`; \
+            "pillbox: warning: {provider} state at exit is missing `{cred_sentinel}`; \
              keychain not updated."
         );
         return;
@@ -281,16 +283,16 @@ impl Bundle {
         serde_json::to_string(self).context("serialize credential bundle")
     }
 
-    fn from_json(payload: &str, cred_filename: &str) -> Result<Self> {
+    fn from_json(payload: &str, cred_sentinel: &str) -> Result<Self> {
         // Back-compat: pillbox v0.2-alpha stored the raw .credentials.json
         // contents directly. If the payload looks like a single-file
         // bare cred (an object that's NOT a `{files:{...}}` bundle), wrap
-        // it on the fly. Detection heuristic: bundles start with the
-        // literal `{"files":`.
+        // it on the fly using the sentinel path. Detection heuristic:
+        // bundles start with the literal `{"files":`.
         let trimmed = payload.trim_start();
         if !trimmed.starts_with("{\"files\":") {
             let mut files = BTreeMap::new();
-            files.insert(cred_filename.to_string(), payload.to_string());
+            files.insert(cred_sentinel.to_string(), payload.to_string());
             return Ok(Self { files });
         }
         serde_json::from_str(payload).context("parse credential bundle")
@@ -311,16 +313,54 @@ impl Bundle {
     }
 }
 
-/// Snapshot every regular file under `dir` into a `Bundle`. Symlinks and
-/// subdirectory entries below the top level are walked recursively so
-/// agents that scaffold sub-paths (e.g. `.claude/projects/.../auth.json`)
-/// round-trip cleanly. Refuses bundles over [`MAX_BUNDLE_BYTES`] so we
-/// don't blindly stash a whole sessions/ history into the keychain.
-fn capture_bundle(dir: &Path) -> Result<Bundle> {
+/// Snapshot the named `state_paths` (relative to `root`) into a `Bundle`.
+/// Each path may be a file or a directory; directories are walked
+/// recursively. Missing paths are skipped silently — an agent on first
+/// login may not have written every path yet. Refuses bundles over
+/// [`MAX_BUNDLE_BYTES`] so a session/history leak doesn't overflow a
+/// keychain backend.
+fn capture_bundle(root: &Path, state_paths: &[&str]) -> Result<Bundle> {
     let mut files = BTreeMap::new();
     let mut total_bytes = 0usize;
-    walk_files(dir, dir, &mut files, &mut total_bytes)?;
+    for state in state_paths {
+        let abs = root.join(state);
+        let meta = match fs::symlink_metadata(&abs) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("stat {}", abs.display())),
+        };
+        if meta.is_file() {
+            capture_file(root, &abs, &mut files, &mut total_bytes)?;
+        } else if meta.is_dir() {
+            walk_files(root, &abs, &mut files, &mut total_bytes)?;
+        }
+        // Symlinks / other types intentionally skipped — auth state shouldn't include them.
+    }
     Ok(Bundle { files })
+}
+
+fn capture_file(
+    root: &Path,
+    path: &Path,
+    out: &mut BTreeMap<String, String>,
+    total: &mut usize,
+) -> Result<()> {
+    let rel = path
+        .strip_prefix(root)
+        .with_context(|| format!("relativize {}", path.display()))?
+        .to_string_lossy()
+        .into_owned();
+    let contents =
+        fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    *total += contents.len();
+    if *total > MAX_BUNDLE_BYTES {
+        return Err(anyhow!(
+            "credential bundle exceeds {MAX_BUNDLE_BYTES} bytes \
+             — refusing to stash that much state in the keychain"
+        ));
+    }
+    out.insert(rel, contents);
+    Ok(())
 }
 
 fn walk_files(
@@ -337,28 +377,10 @@ fn walk_files(
             .with_context(|| format!("stat {}", path.display()))?;
         if file_type.is_dir() {
             walk_files(root, &path, out, total)?;
-            continue;
+        } else if file_type.is_file() {
+            capture_file(root, &path, out, total)?;
         }
-        if !file_type.is_file() {
-            // Skip symlinks, sockets, etc. — nothing an auth flow should
-            // be writing legitimately.
-            continue;
-        }
-        let rel = path
-            .strip_prefix(root)
-            .with_context(|| format!("relativize {}", path.display()))?
-            .to_string_lossy()
-            .into_owned();
-        let contents = fs::read_to_string(&path)
-            .with_context(|| format!("read {}", path.display()))?;
-        *total += contents.len();
-        if *total > MAX_BUNDLE_BYTES {
-            return Err(anyhow!(
-                "credential bundle exceeds {MAX_BUNDLE_BYTES} bytes \
-                 — refusing to stash that much state in the keychain"
-            ));
-        }
-        out.insert(rel, contents);
+        // Symlinks/sockets/etc. skipped.
     }
     Ok(())
 }

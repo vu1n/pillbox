@@ -279,6 +279,12 @@ fn base_docker_args() -> Vec<String> {
         format!("HOME={GUEST_HOME}"),
         "-e".into(),
         "TERM=xterm-256color".into(),
+        // Include $HOME/.local/bin so agents that self-update or look
+        // for their own native install at the standard XDG-ish location
+        // don't print "your PATH is missing ~/.local/bin" warnings.
+        // /usr/local/bin still ships the actual baked-in binaries.
+        "-e".into(),
+        format!("PATH={GUEST_HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin"),
     ]
 }
 

@@ -1,10 +1,11 @@
 //! pillbox — sandboxed coding agents with one-command auth.
 //!
-//! See README.md for the design rationale. The high-level model:
+//! See README.md for the design rationale. High-level model:
 //!
-//! 1. `pillbox <agent> login` — boots a one-shot Docker sandbox, runs the
-//!    agent's OAuth flow inside it, captures the resulting credentials,
-//!    persists them to the OS keychain, destroys the sandbox.
+//! 1. `pillbox <agent> login` — boots a one-shot Docker sandbox, runs
+//!    the agent's OAuth flow inside it, captures the resulting
+//!    credentials, persists them to the OS keychain, destroys the
+//!    sandbox.
 //!
 //! 2. `pillbox <agent> run [args]` — boots a fresh Docker sandbox with
 //!    the saved credentials mounted in + the current working directory
@@ -12,7 +13,8 @@
 //!
 //! 3. `pillbox auth list / rm` — manage stored credentials.
 //!
-//! v0.1 supports Claude Code only. Codex / opencode adapters are v0.2.
+//! Adding a new agent = adding one `AgentSpec` constant in `agents`
+//! and one variant here.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -20,6 +22,8 @@ use clap::{Parser, Subcommand};
 mod agents;
 mod docker;
 mod keychain;
+
+use agents::AgentSpec;
 
 #[derive(Parser, Debug)]
 #[command(name = "pillbox", version, about, long_about = None)]
@@ -30,10 +34,15 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Claude Code agent commands (`pillbox claude login` / `pillbox claude run`).
+    /// Claude Code agent.
     Claude {
         #[command(subcommand)]
-        action: ClaudeAction,
+        action: AgentAction,
+    },
+    /// OpenAI Codex agent.
+    Codex {
+        #[command(subcommand)]
+        action: AgentAction,
     },
     /// Manage stored credentials.
     Auth {
@@ -43,14 +52,13 @@ enum Command {
 }
 
 #[derive(Subcommand, Debug)]
-enum ClaudeAction {
-    /// Run the Claude Code OAuth flow inside a one-shot sandbox and store
-    /// the resulting credentials in the OS keychain.
+enum AgentAction {
+    /// Run the OAuth flow inside a one-shot sandbox and store the
+    /// resulting credentials in the OS keychain.
     Login,
-    /// Run Claude Code in a fresh sandbox with stored credentials + the
+    /// Launch the agent in a fresh sandbox with stored credentials + the
     /// current working directory mounted in.
     Run {
-        /// Arguments to forward to `claude` inside the sandbox.
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
     },
@@ -62,7 +70,7 @@ enum AuthAction {
     List,
     /// Remove a provider's stored credentials.
     Rm {
-        /// Provider to remove (e.g. `claude`).
+        /// Provider id (e.g. `claude`, `codex`).
         provider: String,
     },
 }
@@ -70,13 +78,18 @@ enum AuthAction {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Claude { action } => match action {
-            ClaudeAction::Login => agents::claude::login(),
-            ClaudeAction::Run { args } => agents::claude::run(args),
-        },
+        Command::Claude { action } => dispatch_agent(agents::CLAUDE, action),
+        Command::Codex { action } => dispatch_agent(agents::CODEX, action),
         Command::Auth { action } => match action {
             AuthAction::List => keychain::list(),
             AuthAction::Rm { provider } => keychain::remove(&provider),
         },
+    }
+}
+
+fn dispatch_agent(spec: AgentSpec, action: AgentAction) -> Result<()> {
+    match action {
+        AgentAction::Login => spec.login(),
+        AgentAction::Run { args } => spec.run(args),
     }
 }

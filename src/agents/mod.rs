@@ -192,11 +192,53 @@ impl AgentSpec {
         args.extend(opts.args);
 
         let status = docker::run_interactive(&args)?;
+
+        // If the agent refreshed its tokens during the session, the file
+        // on the host tempdir has updated content. Persist it back to the
+        // keychain so the next run isn't stuck with stale creds (which
+        // forces re-login once the access token expires). Done regardless
+        // of `status` — refresh may happen and then the agent exits
+        // non-zero for unrelated reasons, and we still want the new tokens.
+        write_back_refreshed(self.id, &creds_path, &payload);
         drop(tmp);
+
         if !status.success() {
             return Err(anyhow!("{} exited with status {status}", self.id));
         }
         Ok(())
+    }
+}
+
+/// Compare the file the agent left in the bind-mounted tempdir against
+/// the original keychain payload, and update the keychain if the agent
+/// rotated tokens. Best-effort: warns on failure rather than failing the
+/// whole `run` since the user has already gotten value from the session
+/// and the stale token will be caught on the next refresh anyway.
+fn write_back_refreshed(provider: &str, creds_path: &Path, original: &str) {
+    let refreshed = match fs::read_to_string(creds_path) {
+        Ok(s) => s,
+        // Agent didn't end up writing a creds file (or it was deleted) —
+        // nothing to persist.
+        Err(_) => return,
+    };
+    if refreshed == original {
+        return;
+    }
+    // Cheap sanity check: every agent we ship writes a JSON object. If
+    // claude crashed mid-write we'd get a truncated file; refuse to
+    // overwrite the keychain with garbage.
+    if !refreshed.trim_start().starts_with('{') {
+        eprintln!(
+            "pillbox: warning: {provider} credentials file at {} doesn't look like JSON; \
+             not updating keychain.",
+            creds_path.display()
+        );
+        return;
+    }
+    if let Err(e) = keychain::save(provider, &refreshed) {
+        eprintln!(
+            "pillbox: warning: failed to write refreshed {provider} credentials to keychain: {e}"
+        );
     }
 }
 

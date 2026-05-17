@@ -14,21 +14,7 @@ readme = "README.md"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
-# JSON serialization for multi-file credential bundles in the keychain
-# (a `{relative_path: contents}` map per provider).
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-
-# Platform-native credential stores. v3 has cleaner platform features than
-# v4 (which pulls in a SQLite-style fallback store we don't need).
-[target.'cfg(target_os = "macos")'.dependencies]
-keyring = { version = "3", features = ["apple-native"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-keyring = { version = "3", features = ["windows-native"] }
+dirs = "5"
 
 [profile.release]
 strip = true

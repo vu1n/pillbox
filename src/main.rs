@@ -3,27 +3,22 @@
 //! See README.md for the design rationale. High-level model:
 //!
 //! 1. `pillbox <agent> login` — boots a one-shot Docker sandbox, runs
-//!    the agent's OAuth flow inside it, captures the resulting
-//!    credentials, persists them to the OS keychain, destroys the
-//!    sandbox.
+//!    the agent's OAuth flow inside it. Whatever the agent writes to
+//!    HOME during login persists at `~/.pillbox/data/<provider>/`.
 //!
 //! 2. `pillbox <agent> run [args]` — boots a fresh Docker sandbox with
-//!    the saved credentials mounted in + the current working directory
-//!    mounted at /workspace, attaches a PTY, runs the agent.
+//!    that persistent HOME mounted in + the current working directory
+//!    mounted at `/workspace/<name>`, attaches a PTY, runs the agent.
 //!
-//! 3. `pillbox auth list / rm` — manage stored credentials.
-//!
-//! Adding a new agent = adding one `AgentSpec` constant in `agents`
-//! and one variant here.
+//! 3. `pillbox auth list / rm` — show / forget persistent state.
 
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 mod agents;
 mod docker;
-mod keychain;
 
 use agents::{AgentSpec, RunOpts};
 
@@ -46,7 +41,7 @@ enum Command {
         #[command(subcommand)]
         action: AgentAction,
     },
-    /// Manage stored credentials.
+    /// Inspect or remove persisted agent state.
     Auth {
         #[command(subcommand)]
         action: AuthAction,
@@ -55,11 +50,11 @@ enum Command {
 
 #[derive(Subcommand, Debug)]
 enum AgentAction {
-    /// Run the OAuth flow inside a one-shot sandbox and store the
-    /// resulting credentials in the OS keychain.
+    /// Run the OAuth flow inside a one-shot sandbox and persist the
+    /// resulting state under `~/.pillbox/data/<provider>/`.
     Login,
-    /// Launch the agent in a fresh sandbox with stored credentials and
-    /// a project directory mounted in.
+    /// Launch the agent in a fresh sandbox with stored state and a
+    /// project directory mounted in.
     Run {
         /// Host path to mount as the workspace. Defaults to the current
         /// working directory.
@@ -87,9 +82,9 @@ enum AgentAction {
 
 #[derive(Subcommand, Debug)]
 enum AuthAction {
-    /// Show which providers have stored credentials.
+    /// Show which providers have authenticated state on disk.
     List,
-    /// Remove a provider's stored credentials.
+    /// Remove a provider's persistent state (`~/.pillbox/data/<provider>/`).
     Rm {
         /// Provider id (e.g. `claude`, `codex`).
         provider: String,
@@ -102,8 +97,8 @@ fn main() -> Result<()> {
         Command::Claude { action } => dispatch_agent(agents::CLAUDE, action),
         Command::Codex { action } => dispatch_agent(agents::CODEX, action),
         Command::Auth { action } => match action {
-            AuthAction::List => keychain::list(),
-            AuthAction::Rm { provider } => keychain::remove(&provider),
+            AuthAction::List => auth_list(),
+            AuthAction::Rm { provider } => auth_rm(&provider),
         },
     }
 }
@@ -123,4 +118,35 @@ fn dispatch_agent(spec: AgentSpec, action: AgentAction) -> Result<()> {
             args,
         }),
     }
+}
+
+fn auth_list() -> Result<()> {
+    println!("Persistent state under ~/.pillbox/data/:");
+    let mut any = false;
+    for spec in agents::ALL {
+        let home = spec.home_dir()?;
+        if spec.is_authenticated() {
+            println!("  {:<10} ✓ ({})", spec.id(), home.display());
+            any = true;
+        }
+    }
+    if !any {
+        println!("  (none)");
+        println!();
+        println!("Run `pillbox claude login` to authenticate.");
+    }
+    Ok(())
+}
+
+fn auth_rm(provider: &str) -> Result<()> {
+    let spec = agents::ALL
+        .iter()
+        .find(|s| s.id() == provider)
+        .with_context(|| format!("unknown provider `{provider}`"))?;
+    if spec.forget()? {
+        println!("Removed {provider} state.");
+    } else {
+        println!("No state stored for {provider}.");
+    }
+    Ok(())
 }

@@ -866,6 +866,8 @@ dependencies = [
  "anyhow",
  "clap",
  "keyring",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

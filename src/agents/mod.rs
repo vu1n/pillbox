@@ -8,6 +8,7 @@
 //! spec (none yet).
 
 use std::{
+    collections::BTreeMap,
     fs,
     io::Write,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
@@ -18,6 +19,13 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 
 use crate::{docker, keychain};
+
+/// Hard cap on the total bytes pillbox will stash in a keychain entry.
+/// Real auth bundles for the agents we ship are a few KB each. If we see
+/// 1 MB+, the agent has probably leaked unrelated state (a sessions/
+/// directory, history, etc.) into the cred dir — refuse rather than
+/// overflow some keychain backend's per-entry limit.
+const MAX_BUNDLE_BYTES: usize = 1024 * 1024;
 
 const GUEST_HOME: &str = "/home/lum";
 const GUEST_WORKSPACE: &str = "/workspace";
@@ -127,20 +135,25 @@ impl AgentSpec {
             ));
         }
 
-        let creds_path = tmp.path().join(self.cred_filename);
-        let payload = match fs::read_to_string(&creds_path) {
-            Ok(p) => p,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(anyhow!(
-                    "{} login completed but no credentials file at {}.\n\
-                     Check the sandbox output above for hints.",
-                    self.id,
-                    creds_path.display()
-                ));
-            }
-            Err(e) => return Err(e).with_context(|| format!("read {}", creds_path.display())),
-        };
-
+        let bundle = capture_bundle(tmp.path())?;
+        if bundle.files.is_empty() {
+            return Err(anyhow!(
+                "{} login completed but wrote nothing to {}.\n\
+                 Check the sandbox output above for hints.",
+                self.id,
+                tmp.path().display()
+            ));
+        }
+        if !bundle.files.contains_key(self.cred_filename) {
+            return Err(anyhow!(
+                "{} login completed but the expected credentials file `{}` is missing from {}.\n\
+                 Check the sandbox output above for hints.",
+                self.id,
+                self.cred_filename,
+                tmp.path().display()
+            ));
+        }
+        let payload = bundle.to_json()?;
         keychain::save(self.id, &payload)?;
         drop(tmp);
 
@@ -162,10 +175,11 @@ impl AgentSpec {
                 self.id, self.id
             )
         })?;
+        let bundle = Bundle::from_json(&payload, self.cred_filename)?;
 
         let tmp = TempDir::create(&format!("pillbox-{}-creds", self.id))?;
+        bundle.restore_into(tmp.path())?;
         let creds_path = tmp.path().join(self.cred_filename);
-        write_secret(&creds_path, &payload)?;
 
         let workspace_host = match opts.workspace {
             Some(p) => p,
@@ -193,53 +207,160 @@ impl AgentSpec {
 
         let status = docker::run_interactive(&args)?;
 
-        // If the agent refreshed its tokens during the session, the file
-        // on the host tempdir has updated content. Persist it back to the
-        // keychain so the next run isn't stuck with stale creds (which
-        // forces re-login once the access token expires). Done regardless
-        // of `status` — refresh may happen and then the agent exits
-        // non-zero for unrelated reasons, and we still want the new tokens.
-        write_back_refreshed(self.id, &creds_path, &payload);
+        // If the agent refreshed tokens or rewrote any of its state during
+        // the session, the bind-mounted tempdir reflects the new state.
+        // Capture the whole bundle and persist back to keychain so the
+        // next run picks up fresh state. Done regardless of `status` —
+        // refresh may happen and then the agent exits non-zero for
+        // unrelated reasons, and we still want the new tokens.
+        write_back_bundle(self.id, tmp.path(), &payload, self.cred_filename);
         drop(tmp);
 
         if !status.success() {
             return Err(anyhow!("{} exited with status {status}", self.id));
         }
+        let _ = creds_path; // silence unused; kept for clarity
         Ok(())
     }
 }
 
-/// Compare the file the agent left in the bind-mounted tempdir against
-/// the original keychain payload, and update the keychain if the agent
-/// rotated tokens. Best-effort: warns on failure rather than failing the
-/// whole `run` since the user has already gotten value from the session
-/// and the stale token will be caught on the next refresh anyway.
-fn write_back_refreshed(provider: &str, creds_path: &Path, original: &str) {
-    let refreshed = match fs::read_to_string(creds_path) {
+/// Capture the entire bind-mounted credential directory after the agent
+/// exits and persist it back to keychain if anything changed.
+/// Best-effort: warns on failure rather than failing the whole `run`,
+/// since the user has already gotten value from the session and the
+/// next run will rediscover any genuinely broken state.
+fn write_back_bundle(provider: &str, tmp: &Path, original: &str, cred_filename: &str) {
+    let bundle = match capture_bundle(tmp) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("pillbox: warning: could not snapshot {provider} state for write-back: {e}");
+            return;
+        }
+    };
+    // Cred file must still be present for the bundle to be useful.
+    // (Sometimes the agent transiently removes/replaces it during a
+    // refresh; if it's missing at exit, something's wrong — don't
+    // overwrite the keychain with a partial bundle.)
+    if !bundle.files.contains_key(cred_filename) {
+        eprintln!(
+            "pillbox: warning: {provider} state at exit is missing `{cred_filename}`; \
+             keychain not updated."
+        );
+        return;
+    }
+    let refreshed = match bundle.to_json() {
         Ok(s) => s,
-        // Agent didn't end up writing a creds file (or it was deleted) —
-        // nothing to persist.
-        Err(_) => return,
+        Err(e) => {
+            eprintln!("pillbox: warning: could not serialize {provider} state: {e}");
+            return;
+        }
     };
     if refreshed == original {
         return;
     }
-    // Cheap sanity check: every agent we ship writes a JSON object. If
-    // claude crashed mid-write we'd get a truncated file; refuse to
-    // overwrite the keychain with garbage.
-    if !refreshed.trim_start().starts_with('{') {
-        eprintln!(
-            "pillbox: warning: {provider} credentials file at {} doesn't look like JSON; \
-             not updating keychain.",
-            creds_path.display()
-        );
-        return;
-    }
     if let Err(e) = keychain::save(provider, &refreshed) {
         eprintln!(
-            "pillbox: warning: failed to write refreshed {provider} credentials to keychain: {e}"
+            "pillbox: warning: failed to write refreshed {provider} state to keychain: {e}"
         );
     }
+}
+
+/// On-host representation of an agent's full credential-dir state.
+/// `files` keys are POSIX-style relative paths under `guest_cred_dir`;
+/// values are the raw file contents. We treat everything as UTF-8 — the
+/// cred files we know about (claude `.credentials.json`, codex
+/// `auth.json`, claude `settings.json`) are text. If an agent ever
+/// writes binary auth state, this'll need a base64 escape hatch.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct Bundle {
+    files: BTreeMap<String, String>,
+}
+
+impl Bundle {
+    fn to_json(&self) -> Result<String> {
+        serde_json::to_string(self).context("serialize credential bundle")
+    }
+
+    fn from_json(payload: &str, cred_filename: &str) -> Result<Self> {
+        // Back-compat: pillbox v0.2-alpha stored the raw .credentials.json
+        // contents directly. If the payload looks like a single-file
+        // bare cred (an object that's NOT a `{files:{...}}` bundle), wrap
+        // it on the fly. Detection heuristic: bundles start with the
+        // literal `{"files":`.
+        let trimmed = payload.trim_start();
+        if !trimmed.starts_with("{\"files\":") {
+            let mut files = BTreeMap::new();
+            files.insert(cred_filename.to_string(), payload.to_string());
+            return Ok(Self { files });
+        }
+        serde_json::from_str(payload).context("parse credential bundle")
+    }
+
+    fn restore_into(&self, dir: &Path) -> Result<()> {
+        for (rel, contents) in &self.files {
+            let dest = dir.join(rel);
+            if let Some(parent) = dest.parent() {
+                if parent != dir {
+                    fs::create_dir_all(parent)
+                        .with_context(|| format!("create {}", parent.display()))?;
+                }
+            }
+            write_secret(&dest, contents)?;
+        }
+        Ok(())
+    }
+}
+
+/// Snapshot every regular file under `dir` into a `Bundle`. Symlinks and
+/// subdirectory entries below the top level are walked recursively so
+/// agents that scaffold sub-paths (e.g. `.claude/projects/.../auth.json`)
+/// round-trip cleanly. Refuses bundles over [`MAX_BUNDLE_BYTES`] so we
+/// don't blindly stash a whole sessions/ history into the keychain.
+fn capture_bundle(dir: &Path) -> Result<Bundle> {
+    let mut files = BTreeMap::new();
+    let mut total_bytes = 0usize;
+    walk_files(dir, dir, &mut files, &mut total_bytes)?;
+    Ok(Bundle { files })
+}
+
+fn walk_files(
+    root: &Path,
+    cur: &Path,
+    out: &mut BTreeMap<String, String>,
+    total: &mut usize,
+) -> Result<()> {
+    for entry in fs::read_dir(cur).with_context(|| format!("read {}", cur.display()))? {
+        let entry = entry.with_context(|| format!("read entry under {}", cur.display()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("stat {}", path.display()))?;
+        if file_type.is_dir() {
+            walk_files(root, &path, out, total)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            // Skip symlinks, sockets, etc. — nothing an auth flow should
+            // be writing legitimately.
+            continue;
+        }
+        let rel = path
+            .strip_prefix(root)
+            .with_context(|| format!("relativize {}", path.display()))?
+            .to_string_lossy()
+            .into_owned();
+        let contents = fs::read_to_string(&path)
+            .with_context(|| format!("read {}", path.display()))?;
+        *total += contents.len();
+        if *total > MAX_BUNDLE_BYTES {
+            return Err(anyhow!(
+                "credential bundle exceeds {MAX_BUNDLE_BYTES} bytes \
+                 — refusing to stash that much state in the keychain"
+            ));
+        }
+        out.insert(rel, contents);
+    }
+    Ok(())
 }
 
 /// Caller-supplied options for `AgentSpec::run`. Built from CLI args in

@@ -23,26 +23,26 @@ const GUEST_HOME: &str = "/home/lum";
 const GUEST_WORKSPACE: &str = "/workspace";
 
 /// Static description of a coding-agent adapter. Adding a new agent =
-/// adding one `AgentSpec` constant below.
+/// adding one `AgentSpec` constant below and one entry in `ALL`.
 #[derive(Clone, Copy)]
 pub struct AgentSpec {
     /// Provider id — keychain account name + CLI subject (e.g. `claude`).
-    pub id: &'static str,
+    pub(crate) id: &'static str,
     /// Guest directory the agent writes its credentials into. Pillbox
     /// bind-mounts a host tempdir on top of this path during both login
     /// and run so it can stage / capture the credentials file.
-    pub guest_cred_dir: &'static str,
+    pub(crate) guest_cred_dir: &'static str,
     /// Filename within `guest_cred_dir` that holds the credentials.
-    pub cred_filename: &'static str,
+    pub(crate) cred_filename: &'static str,
     /// argv for the login flow (runs after the standard `docker run`
     /// flags + image name).
-    pub login_argv: &'static [&'static str],
+    pub(crate) login_argv: &'static [&'static str],
     /// argv prefix for the run flow. User-supplied args are appended.
-    pub run_argv: &'static [&'static str],
+    pub(crate) run_argv: &'static [&'static str],
     /// Optional OAuth callback port to forward host:port → container:port
     /// during login. `None` = no port forward (device-code flow or
     /// agents that don't use browser callback).
-    pub oauth_port: Option<u16>,
+    pub(crate) oauth_port: Option<u16>,
 }
 
 pub const CLAUDE: AgentSpec = AgentSpec {
@@ -60,11 +60,19 @@ pub const CODEX: AgentSpec = AgentSpec {
     cred_filename: "auth.json",
     login_argv: &["codex", "login"],
     run_argv: &["codex"],
-    // codex's flow appears to use a different mechanism than claude's —
-    // leaving port unmapped for v0.2 and we'll add if the OAuth flow
-    // turns out to need one.
     oauth_port: None,
 };
+
+/// Every shipped agent adapter. `pillbox auth list` and other
+/// keychain-iterating callers walk this so they stay in sync as new
+/// agents are added.
+pub const ALL: &[&AgentSpec] = &[&CLAUDE, &CODEX];
+
+impl AgentSpec {
+    pub fn id(&self) -> &'static str {
+        self.id
+    }
+}
 
 impl AgentSpec {
     pub fn login(&self) -> Result<()> {
@@ -193,15 +201,32 @@ struct TempDir {
 
 impl TempDir {
     fn create(prefix: &str) -> Result<Self> {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("{prefix}-{nanos:x}"));
-        fs::create_dir(&dir).with_context(|| format!("create tempdir {}", dir.display()))?;
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("chmod {} 0700", dir.display()))?;
-        Ok(Self { path: dir })
+        // Avoid the `tempfile` crate to keep the dep tree minimal.
+        // SystemTime nanos are unique enough for normal sequential use,
+        // but two pillbox invocations launched in the same nanosecond
+        // (CI bursts, coarse-clock VMs) would collide. Cheap retry on
+        // EEXIST handles that.
+        let base = std::env::temp_dir();
+        for attempt in 0u32..16 {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let dir = base.join(format!("{prefix}-{nanos:x}-{attempt}"));
+            match fs::create_dir(&dir) {
+                Ok(()) => {
+                    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+                        .with_context(|| format!("chmod {} 0700", dir.display()))?;
+                    return Ok(Self { path: dir });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("create tempdir {}", dir.display()));
+                }
+            }
+        }
+        Err(anyhow!("could not create a unique tempdir under {} after 16 attempts", base.display()))
     }
 
     fn path(&self) -> &Path {

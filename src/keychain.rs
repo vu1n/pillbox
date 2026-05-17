@@ -11,12 +11,9 @@
 
 use anyhow::{Context, Result};
 
-const SERVICE: &str = "pillbox";
+use crate::agents;
 
-/// The list of providers we know about. Used by `pillbox auth list` so we
-/// can iterate without dragging in a keychain enumeration API (the macOS
-/// `keyring` crate doesn't expose listing across services).
-const KNOWN_PROVIDERS: &[&str] = &["claude", "codex", "opencode", "github"];
+const SERVICE: &str = "pillbox";
 
 pub fn save(provider: &str, payload: &str) -> Result<()> {
     let entry = keyring::Entry::new(SERVICE, provider)
@@ -40,7 +37,8 @@ pub fn load(provider: &str) -> Result<Option<String>> {
 pub fn list() -> Result<()> {
     println!("Stored credentials (service `{SERVICE}`):");
     let mut any = false;
-    for provider in KNOWN_PROVIDERS {
+    for spec in agents::ALL {
+        let provider = spec.id();
         let entry = keyring::Entry::new(SERVICE, provider)?;
         match entry.get_password() {
             Ok(_) => {
@@ -48,9 +46,7 @@ pub fn list() -> Result<()> {
                 any = true;
             }
             Err(keyring::Error::NoEntry) => {}
-            Err(e) => {
-                println!("  {provider:<10} ⚠ error: {e}");
-            }
+            Err(e) => println!("  {provider:<10} ⚠ error: {e}"),
         }
     }
     if !any {

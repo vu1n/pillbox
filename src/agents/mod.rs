@@ -216,12 +216,14 @@ impl AgentSpec {
             .into());
         }
 
-        let workspace_host = match opts.workspace {
-            Some(p) => p,
+        let workspace_host = match &opts.workspace {
+            Some(p) => p.clone(),
             None => std::env::current_dir().context("resolve current working directory")?,
         };
         let workspace_name = workspace_mount_name(&workspace_host, opts.name.as_deref())?;
         let guest_workspace = format!("{GUEST_WORKSPACE}/{workspace_name}");
+
+        let env_vars = resolve_run_env(&opts)?;
 
         let mut args = base_docker_args();
         args.extend([
@@ -235,6 +237,10 @@ impl AgentSpec {
         for m in &opts.mounts {
             args.push("-v".into());
             args.push(m.clone());
+        }
+        for (k, v) in &env_vars {
+            args.push("-e".into());
+            args.push(format!("{k}={v}"));
         }
         args.push(docker::RUNNER_IMAGE.into());
         args.extend(self.run_argv.iter().map(|s| s.to_string()));
@@ -267,7 +273,82 @@ pub(crate) struct RunOpts {
     pub(crate) workspace: Option<PathBuf>,
     pub(crate) name: Option<String>,
     pub(crate) mounts: Vec<String>,
+    /// `--with NAME[=ENV_VAR]` entries (parsed from raw CLI strings)
+    pub(crate) withs: Vec<String>,
+    /// `--env BUNDLE` names (stored env bundles to inject)
+    pub(crate) env_bundles: Vec<String>,
+    /// `--env-file PATH` paths (ad-hoc .env files to inject, no persistence)
+    pub(crate) env_files: Vec<PathBuf>,
     pub(crate) args: Vec<String>,
+}
+
+/// Compose the final env map applied to the run sandbox.
+///
+/// Precedence (later layers override earlier ones, per AGENTS.md):
+///   1. `--env <bundle>` (lowest)
+///   2. `--env-file <path>`
+///   3. `--with NAME[=ENV_VAR]` (highest)
+///
+/// Emits one `pillbox: note: ENVVAR shadowed by --with` line to stderr
+/// each time a higher-precedence layer overrides a lower one — visible
+/// to agents without spamming.
+fn resolve_run_env(opts: &RunOpts) -> Result<std::collections::BTreeMap<String, String>> {
+    use std::collections::BTreeMap;
+    let mut env: BTreeMap<String, String> = BTreeMap::new();
+
+    // Layer 1: stored env bundles.
+    for bundle_name in &opts.env_bundles {
+        let vars = crate::envs::read(bundle_name)?.ok_or_else(|| {
+            PillboxError::runtime(
+                "run",
+                format!("env bundle `{bundle_name}` not found"),
+            )
+            .with_next(format!("pillbox env list  # see what's stored"))
+        })?;
+        for (k, v) in vars {
+            if let Some(prev) = env.insert(k.clone(), v) {
+                eprintln!(
+                    "pillbox: note: {k} shadowed by --env {bundle_name} (was set to `{}`)",
+                    crate::secrets::mask(&prev)
+                );
+            }
+        }
+    }
+
+    // Layer 2: ad-hoc .env files.
+    for path in &opts.env_files {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("read {}", path.display()))?;
+        let vars = crate::envs::parse_dotenv(&raw, &path.display().to_string())?;
+        for (k, v) in vars {
+            if let Some(_prev) = env.insert(k.clone(), v) {
+                eprintln!(
+                    "pillbox: note: {k} shadowed by --env-file {}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    // Layer 3: --with entries.
+    for entry in &opts.withs {
+        let (secret_name, env_var) = match entry.split_once('=') {
+            Some((s, e)) => (s.to_string(), e.to_string()),
+            None => (entry.clone(), entry.clone()),
+        };
+        let value = crate::secrets::read(&secret_name)?.ok_or_else(|| {
+            PillboxError::runtime(
+                "run",
+                format!("secret `{secret_name}` not found"),
+            )
+            .with_next(format!("pillbox secret add {secret_name}"))
+        })?;
+        if let Some(_prev) = env.insert(env_var.clone(), value) {
+            eprintln!("pillbox: note: {env_var} shadowed by --with {entry}");
+        }
+    }
+
+    Ok(env)
 }
 
 /// Ensure `~/.pillbox/data/<provider>/` exists with 0700 perms.

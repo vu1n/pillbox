@@ -77,16 +77,31 @@ enum AgentAction {
 
         /// Override the workspace mount-point name inside the guest.
         /// The agent's working directory becomes `/workspace/<name>`
-        /// instead of `/workspace/<basename-of-workspace>`. Useful when
-        /// pillbox is driven by automation (e.g. lum spawning per-thread
-        /// workspaces with synthetic ids).
+        /// instead of `/workspace/<basename-of-workspace>`.
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
 
         /// Extra bind mount, passed through to `docker run -v`.
-        /// Repeatable: `--mount ~/.aws:/home/lum/.aws:ro --mount /tmp:/scratch`.
+        /// Repeatable: `--mount ~/.aws:/home/lum/.aws:ro`.
         #[arg(long = "mount", value_name = "HOST:GUEST")]
         mounts: Vec<String>,
+
+        /// Inject a stored secret as an env var in the sandbox.
+        /// `NAME` alone binds to `NAME`; `NAME=ENV_VAR` rebinds.
+        /// Repeatable. Highest precedence in the env composition order.
+        #[arg(long = "with", value_name = "NAME[=ENV_VAR]")]
+        withs: Vec<String>,
+
+        /// Inject every variable from a stored env bundle.
+        /// Repeatable. Lowest precedence — overridden by --env-file and --with.
+        #[arg(long = "env", value_name = "BUNDLE")]
+        env_bundles: Vec<String>,
+
+        /// Inject every variable from a `.env`-formatted file on disk.
+        /// No persistence. Resolved relative to the current working
+        /// directory at invocation time. Repeatable.
+        #[arg(long = "env-file", value_name = "PATH")]
+        env_files: Vec<PathBuf>,
 
         /// Args forwarded to the agent CLI inside the sandbox.
         #[arg(trailing_var_arg = true)]
@@ -231,11 +246,17 @@ fn dispatch_agent(spec: AgentSpec, action: AgentAction) -> Result<()> {
             workspace,
             name,
             mounts,
+            withs,
+            env_bundles,
+            env_files,
             args,
         } => spec.run(RunOpts {
             workspace,
             name,
             mounts,
+            withs,
+            env_bundles,
+            env_files,
             args,
         }),
     }

@@ -37,6 +37,10 @@ pub(crate) struct Config {
     /// Default `--env-file PATH` entries. Tilde-expanded.
     #[serde(default)]
     pub(crate) env_file: Vec<String>,
+    /// Default for `--strict` (Gondolin microVM mode). CLI `--strict`
+    /// remains accepted; setting `true` here just makes it the default.
+    #[serde(default)]
+    pub(crate) strict: bool,
     /// Path the config was loaded from. Useful for `--show-config` and error
     /// messages. Not in the TOML schema.
     #[serde(skip)]
@@ -174,6 +178,7 @@ env = "dev"
 with = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY=OPENAI_KEY"]
 mount = ["~/.aws:/home/lum/.aws:ro"]
 env_file = [".env.local"]
+strict = true
 "#,
         );
         let cfg = Config::load_from(&root.path().join("pillbox.toml")).unwrap();
@@ -183,6 +188,7 @@ env_file = [".env.local"]
         assert_eq!(cfg.mount.len(), 1);
         assert!(cfg.mount[0].starts_with('/'));
         assert_eq!(cfg.env_file, vec![".env.local"]);
+        assert!(cfg.strict);
     }
 
     #[test]

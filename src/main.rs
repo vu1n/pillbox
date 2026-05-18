@@ -335,7 +335,19 @@ fn dispatch_agent(spec: AgentSpec, action: AgentAction) -> Result<()> {
             vault,
             args,
         } => {
-            if strict {
+            let mut opts = RunOpts {
+                workspace,
+                name,
+                mounts,
+                withs,
+                env_bundles,
+                env_files,
+                vault,
+                strict,
+                args,
+            };
+            opts.apply_defaults(config::Config::resolve(config, no_config)?);
+            if opts.strict {
                 return Err(PillboxError::usage(
                     "run",
                     "--strict (Gondolin microVM) is unavailable in this build",
@@ -345,17 +357,6 @@ fn dispatch_agent(spec: AgentSpec, action: AgentAction) -> Result<()> {
                 )
                 .into());
             }
-            let mut opts = RunOpts {
-                workspace,
-                name,
-                mounts,
-                withs,
-                env_bundles,
-                env_files,
-                vault,
-                args,
-            };
-            opts.apply_defaults(config::Config::resolve(config, no_config)?);
             spec.run(opts)
         }
     }
@@ -407,6 +408,9 @@ fn show_config(json: bool) -> Result<()> {
             if !c.env_file.is_empty() {
                 println!("  env_file  = {:?}", c.env_file);
             }
+            if c.strict {
+                println!("  strict    = true");
+            }
         }
         None => {
             println!("No pillbox.toml found between cwd and filesystem root.");
@@ -438,6 +442,7 @@ fn config_json_payload(cfg: &Option<config::Config>) -> serde_json::Value {
         o.insert("with".into(), json_string_array(&c.with));
         o.insert("mount".into(), json_string_array(&c.mount));
         o.insert("env_file".into(), json_string_array(&c.env_file));
+        o.insert("strict".into(), serde_json::Value::Bool(c.strict));
     }
     serde_json::Value::Object(o)
 }

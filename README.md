@@ -120,6 +120,7 @@ pillbox <agent> run -- AGENT-ARGS      # forward args to the agent CLI
 - [docs/](./docs/) — topic deep dives
   - [secrets.md](./docs/secrets.md) — secrets, env bundles, precedence rules
   - [config.md](./docs/config.md) — per-project `pillbox.toml`
+  - [vault.md](./docs/vault.md) — `--vault` MITM proxy + stub credential swap
   - [strict.md](./docs/strict.md) — `--strict` Gondolin microVM mode
   - [recipes.md](./docs/recipes.md) — copy-paste flows for common tasks
   - [security.md](./docs/security.md) — threat model and what pillbox defends against

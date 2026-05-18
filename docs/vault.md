@@ -144,7 +144,7 @@ should be a conscious manual step.
 ## See also
 
 - [secrets.md](./secrets.md) — `--with` mounts secrets; vault swaps OAuth tokens
-- [strict.md](./strict.md) — `--strict` Gondolin microVM mode; the
-  vault + strict interaction story lives there for now
+- [strict.md](./strict.md) — `--strict` Gondolin microVM mode; see its
+  "Interaction with `--vault`" section for current wiring status
 - [security.md](./security.md) — full threat model
 - [../AGENTS.md](../AGENTS.md) — agent-facing command reference

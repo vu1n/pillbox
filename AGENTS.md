@@ -59,6 +59,7 @@ Stop reading if that's all you need. The rest is reference.
 | `--strict` | off | Use a Gondolin microVM instead of Docker. v0.4 ships the flag; errors with "unavailable in this build". Real impl in v0.5. See [docs/strict.md](./docs/strict.md). |
 | `--config PATH` | — | Use a specific pillbox.toml (disables discovery) |
 | `--no-config` | — | Skip pillbox.toml discovery entirely |
+| `--vault` | — | Route Anthropic API traffic through the pillbox stub-swap proxy. `claude` only in v0.4. See [docs/vault.md](./docs/vault.md). |
 
 Defaults from `./pillbox.toml` (or any ancestor directory) are applied first, then CLI flags. Multi-value flags (`--with`, `--mount`, `--env-file`) append to the file's list. Single-value flags (`--name`, `--env`) override the file's value. See [docs/config.md](./docs/config.md) for the full schema.
 
@@ -101,6 +102,13 @@ pillbox: note: ANTHROPIC_API_KEY shadowed by --with
 |---|---|
 | `pillbox auth list [--json]` | Show which agents have stored login state |
 | `pillbox auth rm AGENT` | Wipe an agent's stored state (forces re-login next run) |
+
+### Vault (subject = `vault`)
+
+| Command | What it does |
+|---|---|
+| `pillbox vault ca [--json]` | Print path to the CA cert (creates it on first call) |
+| `pillbox vault status [--json]` | Report whether a CA is on disk and where |
 
 ### Operational (subject = `config` | `doctor` | `version`)
 
@@ -208,6 +216,21 @@ All `--json` outputs include a `version` field. Add fields freely in future rele
     "mount": ["/Users/x/.aws:/home/lum/.aws:ro"],
     "env_file": [".env.local"]
   }
+}
+
+// pillbox vault ca --json
+{
+  "version": 1,
+  "ca_cert_path": "/Users/x/.pillbox/vault/pillbox-vault-ca.crt"
+}
+
+// pillbox vault status --json
+// ca_cert_path is null when ca_exists is false.
+{
+  "version": 1,
+  "ca_exists": true,
+  "ca_dir": "/Users/x/.pillbox/vault",
+  "ca_cert_path": "/Users/x/.pillbox/vault/pillbox-vault-ca.crt"
 }
 ```
 

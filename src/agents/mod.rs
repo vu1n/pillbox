@@ -47,6 +47,9 @@ pub struct AgentSpec {
     /// `claude auth login` (or equivalent) wrote everything the agent
     /// needs and no further fix-up is required.
     pub(crate) post_login_finalize: Option<fn(&Path) -> Result<()>>,
+    /// Whether `pillbox <agent> run --vault` is supported. v0.4 wires
+    /// vault only for claude; codex follows in v0.5.
+    pub(crate) vault_capable: bool,
 }
 
 pub const CLAUDE: AgentSpec = AgentSpec {
@@ -56,6 +59,7 @@ pub const CLAUDE: AgentSpec = AgentSpec {
     run_argv: &["claude"],
     oauth_port: Some(54545),
     post_login_finalize: Some(finalize_claude_onboarding),
+    vault_capable: true,
 };
 
 // codex's default login binds a localhost callback on a port it picks
@@ -69,6 +73,7 @@ pub const CODEX: AgentSpec = AgentSpec {
     run_argv: &["codex"],
     oauth_port: None,
     post_login_finalize: None,
+    vault_capable: false,
 };
 
 pub const ALL: &[&AgentSpec] = &[&CLAUDE, &CODEX];
@@ -225,6 +230,22 @@ impl AgentSpec {
 
         let env_vars = resolve_run_env(&opts)?;
 
+        // Start the vault proxy BEFORE assembling docker args so its mounts
+        // and env vars can be appended. The session is held until docker
+        // exits — drop order shuts the proxy down cleanly.
+        let vault_session = if opts.vault {
+            if !self.vault_capable {
+                return Err(PillboxError::usage(
+                    "run",
+                    format!("--vault is not supported for `{}` (v0.4 supports claude only)", self.id),
+                )
+                .into());
+            }
+            Some(crate::vault::VaultSession::start(&home)?)
+        } else {
+            None
+        };
+
         let mut args = base_docker_args();
         args.extend([
             "-v".into(),
@@ -242,11 +263,20 @@ impl AgentSpec {
             args.push("-e".into());
             args.push(format!("{k}={v}"));
         }
+        if let Some(session) = &vault_session {
+            args.extend(session.docker_extras(GUEST_HOME));
+            eprintln!(
+                "pillbox: vault proxy listening on {} (ca: {})",
+                session.listen_addr(),
+                session.ca_cert_path().display()
+            );
+        }
         args.push(docker::RUNNER_IMAGE.into());
         args.extend(self.run_argv.iter().map(|s| s.to_string()));
         args.extend(opts.args);
 
         let status = docker::run_interactive(&args)?;
+        drop(vault_session);
         if !status.success() {
             return Err(PillboxError::runtime(
                 "run",
@@ -279,6 +309,8 @@ pub(crate) struct RunOpts {
     pub(crate) env_bundles: Vec<String>,
     /// `--env-file PATH` paths (ad-hoc .env files to inject, no persistence)
     pub(crate) env_files: Vec<PathBuf>,
+    /// `--vault` — route API traffic through the pillbox stub-swap proxy.
+    pub(crate) vault: bool,
     pub(crate) args: Vec<String>,
 }
 

@@ -25,6 +25,7 @@ mod envs;
 mod errors;
 mod paths;
 mod secrets;
+mod vault;
 
 use agents::{AgentSpec, RunOpts};
 use errors::PillboxError;
@@ -69,6 +70,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect the credential vault (CA cert path, status).
+    Vault {
+        #[command(subcommand)]
+        action: VaultAction,
+    },
     /// Diagnose pillbox's environment (Docker, image, perms).
     Doctor {
         /// Emit machine-readable JSON.
@@ -77,6 +83,22 @@ enum Command {
     },
     /// Print pillbox version + the runner image tag it targets.
     Version,
+}
+
+#[derive(Subcommand, Debug)]
+enum VaultAction {
+    /// Print the path to the vault CA cert (created on first vault use).
+    Ca {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print vault state: whether a CA exists, where its files live.
+    Status {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -132,6 +154,12 @@ enum AgentAction {
         /// Skip pillbox.toml discovery entirely.
         #[arg(long)]
         no_config: bool,
+
+        /// Route the agent's API traffic through pillbox's vault proxy.
+        /// Real OAuth tokens stay on the host; the guest sees stubs.
+        /// Anthropic-only in v0.4; only `claude` is supported.
+        #[arg(long)]
+        vault: bool,
 
         /// Args forwarded to the agent CLI inside the sandbox.
         #[arg(trailing_var_arg = true)]
@@ -271,6 +299,10 @@ fn main() -> ExitCode {
             EnvAction::Rm { name } => envs::rm(&name),
         },
         Command::Config { json } => show_config(json),
+        Command::Vault { action } => match action {
+            VaultAction::Ca { json } => vault_ca(json),
+            VaultAction::Status { json } => vault_status(json),
+        },
         Command::Doctor { json } => doctor::run(json),
         Command::Version => {
             println!(
@@ -300,6 +332,7 @@ fn dispatch_agent(spec: AgentSpec, action: AgentAction) -> Result<()> {
             strict,
             config,
             no_config,
+            vault,
             args,
         } => {
             if strict {
@@ -319,6 +352,7 @@ fn dispatch_agent(spec: AgentSpec, action: AgentAction) -> Result<()> {
                 withs,
                 env_bundles,
                 env_files,
+                vault,
                 args,
             };
             opts.apply_defaults(config::Config::resolve(config, no_config)?);
@@ -415,6 +449,58 @@ fn json_string_array(items: &[String]) -> serde_json::Value {
             .map(|s| serde_json::Value::String(s.clone()))
             .collect(),
     )
+}
+
+fn vault_ca(json: bool) -> Result<()> {
+    let ca_dir = paths::data_subdir("vault")?;
+    let ca = vault::Ca::ensure(&ca_dir).map_err(|e| {
+        errors::PillboxError::runtime("vault ca", format!("ensure ca: {e}"))
+    })?;
+    if json {
+        println!(
+            "{}",
+            paths::json_v1(vec![(
+                "ca_cert_path",
+                serde_json::Value::String(ca.cert_path().display().to_string()),
+            )]),
+        );
+    } else {
+        println!("{}", ca.cert_path().display());
+    }
+    Ok(())
+}
+
+fn vault_status(json: bool) -> Result<()> {
+    let ca_dir = paths::data_subdir("vault")?;
+    let ca_cert = vault::ca_cert_path_in(&ca_dir);
+    let exists = ca_cert.exists();
+    if json {
+        let cert_path_val = if exists {
+            serde_json::Value::String(ca_cert.display().to_string())
+        } else {
+            serde_json::Value::Null
+        };
+        println!(
+            "{}",
+            paths::json_v1(vec![
+                ("ca_exists", serde_json::Value::Bool(exists)),
+                ("ca_dir", serde_json::Value::String(ca_dir.display().to_string())),
+                ("ca_cert_path", cert_path_val),
+            ]),
+        );
+        return Ok(());
+    }
+    if exists {
+        println!("CA exists at {}", ca_cert.display());
+        println!();
+        println!("Run `pillbox claude run --vault` to route claude traffic through the proxy.");
+    } else {
+        println!("No vault CA on disk yet.");
+        println!();
+        println!("The CA is created lazily on first `pillbox claude run --vault`,");
+        println!("or eagerly with `pillbox vault ca`.");
+    }
+    Ok(())
 }
 
 fn build_auth_list_json() -> String {

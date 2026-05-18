@@ -10,7 +10,7 @@ Gondolin microVM (independent kernel, QEMU or krun).
 today returns:
 
 ```
-pillbox: run failed. --strict (Gondolin microVM) is not yet wired up
+pillbox: run failed. --strict (Gondolin microVM) is unavailable in this build
   Next: pillbox claude run   # use the default Docker sandbox
 ```
 

@@ -114,8 +114,7 @@ enum AgentAction {
         env_files: Vec<PathBuf>,
 
         /// Use a hardware-isolated microVM (Gondolin) instead of Docker.
-        /// v0.4 ships the flag; the Gondolin spawn integration follows in
-        /// v0.5. Passing --strict today returns a clear error.
+        /// v0.4 ships the flag only; see docs/strict.md.
         #[arg(long)]
         strict: bool,
 
@@ -288,7 +287,7 @@ fn dispatch_agent(spec: AgentSpec, action: AgentAction) -> Result<()> {
             if strict {
                 return Err(PillboxError::usage(
                     "run",
-                    "--strict (Gondolin microVM) is not yet wired up",
+                    "--strict (Gondolin microVM) is unavailable in this build",
                 )
                 .with_next(
                     "pillbox claude run   # use the default Docker sandbox",

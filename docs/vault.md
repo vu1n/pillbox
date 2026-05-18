@@ -31,6 +31,9 @@ pillbox vault status
 
 # Run claude with vault on
 pillbox claude run --vault
+
+# Codex works the same way (v0.5).
+pillbox codex run --vault
 ```
 
 That's it. The first `--vault` run generates `~/.pillbox/vault/pillbox-vault-ca.crt`
@@ -40,20 +43,45 @@ in-process MITM proxy bound to a random localhost port, and wires
 
 The CA persists across runs — sandboxes share the trust root.
 
-## What's in scope for v0.4
+## What's vaulted
 
 | Surface | Status |
 |---|---|
-| `claude` agent, OAuth tokens (`claudeAiOauth` block) | ✅ Vaulted |
+| `claude` agent, OAuth tokens (`claudeAiOauth` block) | ✅ |
 | `api.anthropic.com` request bodies / headers | ✅ Stub → real swap |
 | `console.anthropic.com/oauth/token` (rotation) | ✅ Real → stub swap inbound |
-| `codex` agent | ❌ Not yet — defer to v0.5 |
-| Anthropic API keys (`x-api-key` header via `--with`) | ❌ Not yet — OAuth path only |
-| GitHub PATs | ❌ Not yet — defer to v0.5 |
-| Other hosts (GitHub, OpenAI, etc.) | Pass through unmodified |
+| `codex` agent, ChatGPT-mode OAuth tokens (`tokens` block) | ✅ (v0.5) |
+| `chatgpt.com`, `chat.openai.com` request headers | ✅ Stub → real swap (v0.5) |
+| `auth.openai.com/oauth/token` (rotation) | ✅ Real → stub swap inbound (v0.5) |
+| `codex` ApiKey mode (`OPENAI_API_KEY` in auth.json) | ❌ — API-key vault track |
+| Anthropic API keys (`x-api-key` header via `--with`) | ❌ — API-key vault track |
+| GitHub PATs | ❌ — separate provider track |
+| `api.openai.com` and all other hosts | Pass through unmodified |
 
-Running `pillbox claude run --vault` for a non-claude agent errors with
-exit 2 (usage error).
+Running `--vault` for an agent that isn't `vault_capable` errors with
+exit 2 (usage error). Codex with ApiKey-mode `auth.json` is rejected at
+provisioning with a clear pointer to the API-key vault track.
+
+## Architecture
+
+The proxy holds a list of `VaultProvider`s. Each provider owns:
+
+- the host predicate (`api.anthropic.com` for claude; `chatgpt.com` +
+  `chat.openai.com` + `auth.openai.com` for codex)
+- the credentials file path inside the guest (`.claude/.credentials.json`
+  for claude; `.codex/auth.json` for codex)
+- the stub format (`sk-ant-oat01-` / `sk-ant-ort01-` for claude;
+  `pb-codex-oat-` / `pb-codex-ort-` for codex)
+- the request/response swap logic
+
+Adding a new vaulted service (e.g. GitHub PATs in a future PR) means
+implementing the `VaultProvider` trait in a new file under
+`src/vault/providers/` and registering it in `providers::registry()`.
+Server core doesn't change.
+
+A single shared `Registry` holds `sandbox_id → SandboxData` and
+`stub_token → sandbox_id` lookups across all providers. Stubs never
+collide because each provider has its own prefix.
 
 ## How it works
 
@@ -96,10 +124,11 @@ exit 2 (usage error).
   └─────────────────────────┘
 ```
 
-Stubs encode the sandbox id (`sk-ant-oat01-<sandbox_id_compact><random>`)
-so the proxy can resolve them without binding to TCP source-port. A
-sandbox whose lease was dropped no longer resolves — re-using its stub
-from outside gets 401.
+Stubs encode the sandbox id (e.g. claude:
+`sk-ant-oat01-<sandbox_id_compact><random>`, codex:
+`pb-codex-oat-<sandbox_id_compact><random>`) so the proxy can resolve
+them without binding to TCP source-port. A sandbox whose lease was
+dropped no longer resolves — re-using its stub from outside gets 401.
 
 ## Files on disk
 

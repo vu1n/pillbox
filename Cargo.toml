@@ -19,8 +19,10 @@ serde_json = "1"
 toml = "0.8"
 
 # Credential vault — MITM HTTPS proxy that swaps stub creds for real
-# ones at the host boundary. Anthropic only for v0.4. See src/vault/.
+# ones at the host boundary. Anthropic + codex providers as of v0.5.
+# See src/vault/.
 hudsucker = { version = "0.24", default-features = true, features = ["http2"] }
+async-trait = "0.1"
 rcgen = "0.14"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "sync", "time"] }
 http-body-util = "0.1"

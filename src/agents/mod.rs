@@ -47,8 +47,10 @@ pub struct AgentSpec {
     /// `claude auth login` (or equivalent) wrote everything the agent
     /// needs and no further fix-up is required.
     pub(crate) post_login_finalize: Option<fn(&Path) -> Result<()>>,
-    /// Whether `pillbox <agent> run --vault` is supported. v0.4 wires
-    /// vault only for claude; codex follows in v0.5.
+    /// Whether `pillbox <agent> run --vault` is supported. The vault
+    /// provider for the agent is looked up by [`Self::id`] —
+    /// `vault_capable = true` requires a matching entry in
+    /// `vault::providers::registry()`.
     pub(crate) vault_capable: bool,
 }
 
@@ -73,7 +75,9 @@ pub const CODEX: AgentSpec = AgentSpec {
     run_argv: &["codex"],
     oauth_port: None,
     post_login_finalize: None,
-    vault_capable: false,
+    // v0.5: vault supports codex ChatGPT-mode auth.json. ApiKey-mode
+    // auth.json is rejected at lease time (see vault::providers::codex).
+    vault_capable: true,
 };
 
 pub const ALL: &[&AgentSpec] = &[&CLAUDE, &CODEX];
@@ -237,11 +241,11 @@ impl AgentSpec {
             if !self.vault_capable {
                 return Err(PillboxError::usage(
                     "run",
-                    format!("--vault is not supported for `{}` (v0.4 supports claude only)", self.id),
+                    format!("--vault is not supported for `{}`", self.id),
                 )
                 .into());
             }
-            Some(crate::vault::VaultSession::start(&home)?)
+            Some(crate::vault::VaultSession::start(self.id, &home)?)
         } else {
             None
         };

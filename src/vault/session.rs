@@ -1,8 +1,8 @@
-//! Glue between `pillbox claude run --vault` and the vault server.
+//! Glue between `pillbox <agent> run --vault` and the vault server.
 //!
 //! Owns the lifetime of the proxy + lease + stub credentials file for
-//! one `claude run` invocation. Drop order is intentional:
-//!  1. `lease` — removes the stub mapping from the server.
+//! one `run` invocation. Drop order is intentional:
+//!  1. `lease` — removes the stub mapping from the server registry.
 //!  2. `server` — sends graceful-shutdown signal to the proxy task.
 //!  3. `runtime` — aborts any remaining tasks, frees resources.
 //!  4. `stub_file` — deletes the temp file holding the stub JSON.
@@ -19,7 +19,7 @@ use anyhow::Result;
 
 use crate::errors::PillboxError;
 use crate::paths;
-use crate::vault::{AnthropicCreds, SandboxLease, Server, ServerConfig};
+use crate::vault::{providers, SandboxLease, Server, ServerConfig};
 
 pub(crate) struct VaultSession {
     // Order matters — see module doc.
@@ -29,23 +29,51 @@ pub(crate) struct VaultSession {
     stub_file: tempfile::NamedTempFile,
     ca_cert_path: PathBuf,
     listen_addr: SocketAddr,
+    /// Guest-relative path the stub file is mounted at (e.g.
+    /// `.claude/.credentials.json` or `.codex/auth.json`). The agent
+    /// provider tells us where.
+    creds_path: PathBuf,
 }
 
 impl VaultSession {
-    /// Spin up the vault proxy for one claude sandbox.
+    /// Spin up the vault proxy for one sandbox run.
     ///
-    /// `agent_home` is the host directory bind-mounted at `/home/lum`
-    /// inside the guest (e.g. `~/.pillbox/data/claude/`). Pillbox loads
-    /// the real `.credentials.json` from there and writes a stub to a
-    /// host temp file the session owns.
+    /// `agent_id` selects the provider (must match an entry in
+    /// [`providers::registry`]). `agent_home` is the host directory
+    /// bind-mounted at `/home/lum` inside the guest (e.g.
+    /// `~/.pillbox/data/<agent>/`). The real creds are loaded from
+    /// `<agent_home>/<provider creds_path>`.
     ///
     /// Caller is responsible for checking `AgentSpec::vault_capable`
-    /// before invoking — this assumes claude's credentials layout.
-    pub(crate) fn start(agent_home: &Path) -> Result<Self> {
-        let creds_path = agent_home.join(".claude").join(".credentials.json");
-        let creds = AnthropicCreds::load_from_file(&creds_path).map_err(|e| {
-            PillboxError::runtime("vault", format!("load {}: {e}", creds_path.display()))
-                .with_next("pillbox claude login   # refresh credentials")
+    /// before invoking.
+    pub(crate) fn start(agent_id: &str, agent_home: &Path) -> Result<Self> {
+        let provider = providers::provider_for(agent_id).ok_or_else(|| {
+            PillboxError::runtime(
+                "vault",
+                format!("no vault provider for agent `{agent_id}`"),
+            )
+        })?;
+
+        let creds_rel = provider.creds_path().to_path_buf();
+        let creds_path = agent_home.join(&creds_rel);
+
+        let real_bytes = fs::read(&creds_path).map_err(|e| {
+            PillboxError::runtime(
+                "vault",
+                format!("read {}: {e}", creds_path.display()),
+            )
+            .with_next(format!(
+                "pillbox {agent_id} login   # refresh credentials"
+            ))
+        })?;
+        let real: serde_json::Value = serde_json::from_slice(&real_bytes).map_err(|e| {
+            PillboxError::runtime(
+                "vault",
+                format!("parse {}: {e}", creds_path.display()),
+            )
+            .with_next(format!(
+                "pillbox {agent_id} login   # credentials file is malformed"
+            ))
         })?;
 
         let ca_dir = paths::data_subdir("vault")?;
@@ -67,17 +95,17 @@ impl VaultSession {
 
         let sandbox_id = uuid::Uuid::now_v7().to_string();
         let lease = server
-            .lease(&sandbox_id, creds)
+            .lease(provider.id(), &sandbox_id, real)
             .map_err(|e| PillboxError::runtime("vault", format!("lease sandbox: {e}")))?;
 
         // Write stub creds to a 0600 temp file the docker mount will overlay
-        // onto the guest's .credentials.json.
+        // onto the guest's real credentials file.
         let stub_file = tempfile::Builder::new()
             .prefix("pillbox-stub-")
             .suffix(".json")
             .tempfile()
             .map_err(|e| PillboxError::runtime("vault", format!("create stub file: {e}")))?;
-        write_private(stub_file.path(), lease.stub_credentials_json())?;
+        write_private(stub_file.path(), lease.stub_credentials_body())?;
 
         Ok(Self {
             _lease: lease,
@@ -86,11 +114,13 @@ impl VaultSession {
             stub_file,
             ca_cert_path,
             listen_addr,
+            creds_path: creds_rel,
         })
     }
 
-    /// Extra docker args to layer onto a normal `claude run`:
-    /// `-v stubfile:.../credentials.json:ro`, `-v cacert:/etc/pillbox-ca.crt:ro`,
+    /// Extra docker args to layer onto a normal `<agent> run`:
+    /// `-v stubfile:<guest_home>/<creds_path>:ro`,
+    /// `-v cacert:/etc/pillbox-ca.crt:ro`,
     /// `-e NODE_EXTRA_CA_CERTS=...`, `-e HTTPS_PROXY=...`, `-e HTTP_PROXY=...`.
     pub(crate) fn docker_extras(&self, guest_home: &str) -> Vec<String> {
         let port = self.listen_addr.port();
@@ -99,7 +129,7 @@ impl VaultSession {
         // unconditionally — Docker Desktop ignores it harmlessly.
         let proxy_url = format!("http://host.docker.internal:{port}");
         let guest_ca = "/etc/pillbox-ca.crt";
-        let guest_creds = format!("{guest_home}/.claude/.credentials.json");
+        let guest_creds = format!("{guest_home}/{}", self.creds_path.display());
 
         vec![
             "--add-host".into(),

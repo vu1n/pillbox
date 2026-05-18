@@ -113,6 +113,12 @@ enum AgentAction {
         #[arg(long = "env-file", value_name = "PATH")]
         env_files: Vec<PathBuf>,
 
+        /// Use a hardware-isolated microVM (Gondolin) instead of Docker.
+        /// v0.4 ships the flag; the Gondolin spawn integration follows in
+        /// v0.5. Passing --strict today returns a clear error.
+        #[arg(long)]
+        strict: bool,
+
         /// Args forwarded to the agent CLI inside the sandbox.
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
@@ -276,16 +282,29 @@ fn dispatch_agent(spec: AgentSpec, action: AgentAction) -> Result<()> {
             withs,
             env_bundles,
             env_files,
+            strict,
             args,
-        } => spec.run(RunOpts {
-            workspace,
-            name,
-            mounts,
-            withs,
-            env_bundles,
-            env_files,
-            args,
-        }),
+        } => {
+            if strict {
+                return Err(PillboxError::usage(
+                    "run",
+                    "--strict (Gondolin microVM) is not yet wired up",
+                )
+                .with_next(
+                    "pillbox claude run   # use the default Docker sandbox",
+                )
+                .into());
+            }
+            spec.run(RunOpts {
+                workspace,
+                name,
+                mounts,
+                withs,
+                env_bundles,
+                env_files,
+                args,
+            })
+        }
     }
 }
 

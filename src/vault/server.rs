@@ -30,8 +30,12 @@ use tokio::net::TcpListener;
 
 use super::{
     ca::Ca,
+    known_secrets::VaultMeta,
     lease::SandboxLease,
-    providers::{self, host_from_uri, PendingFlow, Registry, VaultProvider},
+    providers::{
+        self, host_from_uri, mint_stub, PendingFlow, Registry, SandboxData, VaultProvider,
+        API_KEY_PROVIDER_ID,
+    },
 };
 
 /// Configuration for [`Server::start`].
@@ -182,6 +186,83 @@ impl Server {
             stub_body,
             Arc::clone(&self.inner),
         ))
+    }
+
+    /// Lease a stub for a `--with NAME=ENV_VAR --vault`'d API key.
+    ///
+    /// `vault_meta` carries the host the secret talks to, the header
+    /// scheme, and the real-key prefix the stub should mimic. The stub
+    /// is registered against a freshly-minted `sandbox_id` (separate
+    /// from any OAuth lease's sandbox id) so dropping it releases just
+    /// this entry.
+    ///
+    /// Returns the lease *and* the stub string the caller injects into
+    /// the guest env. The stub mimics the real-key prefix so
+    /// client-side format validators (e.g. an SDK that checks
+    /// `key.starts_with("sk-ant-api03-")`) still accept it.
+    pub fn lease_api_key(
+        &self,
+        secret_name: &str,
+        real_value: &str,
+        vault_meta: &VaultMeta,
+    ) -> Result<(SandboxLease, String), String> {
+        // Verify that a registered provider claims the host this stub
+        // will travel to. Without one, the proxy would never see the
+        // request and the swap would never fire — better to fail fast at
+        // lease time.
+        if self
+            .inner
+            .provider_for_host(&vault_meta.vault.host)
+            .is_none()
+        {
+            return Err(format!(
+                "no vault provider intercepts host `{}`; pillbox can't swap stubs there",
+                vault_meta.vault.host
+            ));
+        }
+
+        let sandbox_id = uuid::Uuid::now_v7().to_string();
+        let stub = mint_stub(&vault_meta.vault.prefix, &sandbox_id);
+
+        {
+            let mut registry = self.inner.registry_lock();
+            registry.insert(
+                sandbox_id.clone(),
+                SandboxData {
+                    provider_id: API_KEY_PROVIDER_ID,
+                    real: serde_json::json!({
+                        "name": secret_name,
+                        "value": real_value,
+                        "host": vault_meta.vault.host,
+                        "scheme": vault_meta.vault.header_scheme.as_str(),
+                    }),
+                    stubs: vec![stub.clone()],
+                },
+            );
+        }
+
+        let lease = SandboxLease::new(
+            sandbox_id,
+            stub.clone(),
+            Arc::clone(&self.inner),
+        );
+        Ok((lease, stub))
+    }
+
+    /// Convenience accessor matching `lease_api_key`'s vault-meta input
+    /// for callers that only have a [`HeaderScheme`] in hand and don't
+    /// want to plumb a full `VaultMeta`.
+    #[cfg(test)]
+    pub(crate) fn lease_api_key_for_test(
+        &self,
+        name: &str,
+        real: &str,
+        host: &str,
+        scheme: super::known_secrets::HeaderScheme,
+        prefix: &str,
+    ) -> Result<(SandboxLease, String), String> {
+        let meta = VaultMeta::new(host.into(), scheme, prefix.into());
+        self.lease_api_key(name, real, &meta)
     }
 
     /// Test-only: borrow the inner registry mutex. Use `inner_for_test`
@@ -449,6 +530,113 @@ mod tests {
             .lease("nope", "sbx-1", sample_anthropic_real())
             .unwrap_err();
         assert!(err.contains("unknown vault provider"), "got: {err}");
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn lease_api_key_registers_swappable_stub() {
+        use crate::vault::known_secrets::HeaderScheme;
+
+        let (server, dir) = fresh_server().await;
+        let (lease, stub) = server
+            .lease_api_key_for_test(
+                "ANTHROPIC_API_KEY",
+                "sk-ant-api03-REAL",
+                "api.anthropic.com",
+                HeaderScheme::XApiKey,
+                "sk-ant-api03-",
+            )
+            .expect("lease api key");
+
+        // Stub mimics the prefix and is alphanumeric in the tail.
+        assert!(stub.starts_with("sk-ant-api03-"));
+        let tail = stub.strip_prefix("sk-ant-api03-").unwrap();
+        assert!(tail.chars().all(|c| c.is_ascii_alphanumeric()));
+
+        // Registry resolves stub → real via the API-key path.
+        {
+            let registry = server.registry_lock_for_test();
+            assert_eq!(
+                registry.api_key_real_for_stub(&stub),
+                Some("sk-ant-api03-REAL"),
+            );
+        }
+
+        drop(lease);
+
+        // Stub vanishes from the registry on drop.
+        {
+            let registry = server.registry_lock_for_test();
+            assert!(registry.api_key_real_for_stub(&stub).is_none());
+        }
+
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn lease_api_key_rejects_unknown_host() {
+        use crate::vault::known_secrets::HeaderScheme;
+
+        let (server, dir) = fresh_server().await;
+        let err = server
+            .lease_api_key_for_test(
+                "MY_KEY",
+                "real",
+                "api.invented.example",
+                HeaderScheme::AuthorizationBearer,
+                "x-",
+            )
+            .unwrap_err();
+        assert!(err.contains("no vault provider"), "got: {err}");
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn oauth_and_api_key_leases_coexist_on_same_server() {
+        use crate::vault::known_secrets::HeaderScheme;
+
+        let (server, dir) = fresh_server().await;
+        let oauth = server
+            .lease("claude", "sbx-oauth", sample_anthropic_real())
+            .expect("oauth lease");
+        let (api, stub) = server
+            .lease_api_key_for_test(
+                "ANTHROPIC_API_KEY",
+                "sk-ant-api03-REAL",
+                "api.anthropic.com",
+                HeaderScheme::XApiKey,
+                "sk-ant-api03-",
+            )
+            .expect("api key lease");
+
+        // Both lookups work independently.
+        {
+            let registry = server.registry_lock_for_test();
+            // OAuth stubs registered against sbx-oauth resolve real
+            // accessToken via JSON pointer.
+            let oauth_stubs = registry.stubs_for("sbx-oauth").unwrap().to_vec();
+            for s in &oauth_stubs {
+                assert_eq!(registry.sandbox_for_stub(s), Some("sbx-oauth"));
+            }
+            // API-key stub resolves real via api_key_real_for_stub.
+            assert_eq!(
+                registry.api_key_real_for_stub(&stub),
+                Some("sk-ant-api03-REAL"),
+            );
+        }
+
+        // Dropping the API-key lease leaves OAuth intact.
+        drop(api);
+        {
+            let registry = server.registry_lock_for_test();
+            assert!(registry.api_key_real_for_stub(&stub).is_none());
+            assert!(registry.stubs_for("sbx-oauth").is_some());
+        }
+
+        drop(oauth);
         drop(server);
         let _ = std::fs::remove_dir_all(&dir);
     }

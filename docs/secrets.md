@@ -159,14 +159,55 @@ pillbox secret add ANTHROPIC_API_KEY --from-env ANTHROPIC_API_KEY
 pillbox claude run --env all --with ANTHROPIC_API_KEY
 ```
 
+## Vaulted secrets
+
+`pillbox secret add NAME --vault` marks a secret for stub-swap at
+injection time. With the flag set, `--with NAME` injects a stub value
+into the guest env instead of the real secret; the MITM proxy swaps
+stub → real on egress to the secret's host. A leaked stub from inside
+the sandbox is useless to an attacker — it only resolves to the real
+key while the run's vault session is alive.
+
+```sh
+# Known names: host + scheme + prefix come from the built-in registry.
+pillbox secret add ANTHROPIC_API_KEY --vault            # api.anthropic.com / x-api-key
+pillbox secret add OPENAI_API_KEY    --vault            # api.openai.com    / Authorization: Bearer
+pillbox secret add GITHUB_TOKEN      --vault            # api.github.com    / Authorization: Bearer
+pillbox secret add GH_TOKEN          --vault            # alias for GITHUB_TOKEN
+
+# Custom name → known mapping:
+pillbox secret add MY_ANTHROPIC --vault --maps-to ANTHROPIC_API_KEY
+
+# Custom name → fully specified:
+pillbox secret add INTERNAL --vault \
+    --host api.internal.example.com \
+    --header-scheme x-api-key \
+    --prefix int-
+```
+
+At run time the existing `--with NAME` automatically uses the stub if
+the secret has a `.meta.json` sidecar. Storage:
+
+```
+~/.pillbox/secrets/
+├── ANTHROPIC_API_KEY            # 0600, real value
+├── ANTHROPIC_API_KEY.meta.json  # 0600, { vault: {host, header_scheme, prefix} }
+└── PLAIN_SECRET                 # 0600, real value (no sidecar = not vaulted)
+```
+
+`pillbox secret rm NAME` removes both files. Re-adding without
+`--vault` cleans up any stale sidecar. See [vault.md](./vault.md) for
+the proxy + provider architecture.
+
 ## What pillbox does NOT do
 
 - **Encrypt at rest.** Files are 0600 plaintext. Disk encryption
   (FileVault / LUKS / BitLocker) is the at-rest defense.
-- **Vault the value from the agent.** The secret is mounted into the
-  guest env where the agent can read it. v0.4's vault tier will swap in
-  a stub + egress proxy for API keys; OAuth subscription tokens stay
-  mounted.
+- **Vault the value from the agent on bare `secret add`.** Plain
+  (non-`--vault`) `--with` injects the real value. Use `--vault` at add
+  time for stub-swap behavior.
+- **Vault non-HTTP-API secrets.** The proxy only sees HTTPS to known
+  hosts. SSH keys, database passwords, etc. fall back to plain mount.
 - **Sync across machines.** One secret store per OS user, per host.
 
 ## See also

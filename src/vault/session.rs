@@ -19,63 +19,45 @@ use anyhow::Result;
 
 use crate::errors::PillboxError;
 use crate::paths;
-use crate::vault::{providers, SandboxLease, Server, ServerConfig};
+use crate::vault::{providers, SandboxLease, Server, ServerConfig, VaultMeta};
 
-pub(crate) struct VaultSession {
-    // Order matters — see module doc.
-    _lease: SandboxLease,
-    _server: Server,
-    _runtime: tokio::runtime::Runtime,
+/// One OAuth-credentials swap mounted into the guest. Owns the temp file
+/// holding the stub creds plus its mount-target path. `VaultSession`
+/// keeps a `Vec` of these — currently always 0 or 1 entries (one agent,
+/// one creds file), but the shape future-proofs us if a single sandbox
+/// ever needs multiple creds files.
+struct OAuthMount {
     stub_file: tempfile::NamedTempFile,
-    ca_cert_path: PathBuf,
-    listen_addr: SocketAddr,
     /// Guest-relative path the stub file is mounted at (e.g.
     /// `.claude/.credentials.json` or `.codex/auth.json`). The agent
     /// provider tells us where.
     creds_path: PathBuf,
+    _lease: SandboxLease,
+}
+
+pub(crate) struct VaultSession {
+    // Drop order matters — see module doc. `api_key_leases` and
+    // `oauth_mounts` both hold `SandboxLease`s that remove their entries
+    // from the server registry on drop; `_server` then signals proxy
+    // shutdown; `_runtime` aborts any remaining tasks last.
+    api_key_leases: Vec<SandboxLease>,
+    oauth_mounts: Vec<OAuthMount>,
+    server: Server,
+    _runtime: tokio::runtime::Runtime,
+    ca_cert_path: PathBuf,
+    listen_addr: SocketAddr,
 }
 
 impl VaultSession {
-    /// Spin up the vault proxy for one sandbox run.
+    /// Spin up the vault proxy server.
     ///
-    /// `agent_id` selects the provider (must match an entry in
-    /// [`providers::registry`]). `agent_home` is the host directory
-    /// bind-mounted at `/home/lum` inside the guest (e.g.
-    /// `~/.pillbox/data/<agent>/`). The real creds are loaded from
-    /// `<agent_home>/<provider creds_path>`.
-    ///
-    /// Caller is responsible for checking `AgentSpec::vault_capable`
-    /// before invoking.
-    pub(crate) fn start(agent_id: &str, agent_home: &Path) -> Result<Self> {
-        let provider = providers::provider_for(agent_id).ok_or_else(|| {
-            PillboxError::runtime(
-                "vault",
-                format!("no vault provider for agent `{agent_id}`"),
-            )
-        })?;
-
-        let creds_rel = provider.creds_path().to_path_buf();
-        let creds_path = agent_home.join(&creds_rel);
-
-        let real_bytes = fs::read(&creds_path).map_err(|e| {
-            PillboxError::runtime(
-                "vault",
-                format!("read {}: {e}", creds_path.display()),
-            )
-            .with_next(format!(
-                "pillbox {agent_id} login   # refresh credentials"
-            ))
-        })?;
-        let real: serde_json::Value = serde_json::from_slice(&real_bytes).map_err(|e| {
-            PillboxError::runtime(
-                "vault",
-                format!("parse {}: {e}", creds_path.display()),
-            )
-            .with_next(format!(
-                "pillbox {agent_id} login   # credentials file is malformed"
-            ))
-        })?;
-
+    /// If `oauth` is `Some`, an OAuth lease for that agent is taken and
+    /// a stub credentials file is written to a temp path the caller can
+    /// mount via [`Self::docker_extras`]. Pass `None` when the agent
+    /// itself isn't `vault_capable` but the run still has `--with
+    /// FOO --vault`-flagged secrets that need stub swapping — pillbox
+    /// still needs a proxy + CA + leases for those.
+    pub(crate) fn start(oauth: Option<OAuthAgent<'_>>) -> Result<Self> {
         let ca_dir = paths::data_subdir("vault")?;
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -93,35 +75,43 @@ impl VaultSession {
         let listen_addr = server.listen_addr();
         let ca_cert_path = server.ca_cert_path().to_path_buf();
 
-        let sandbox_id = uuid::Uuid::now_v7().to_string();
-        let lease = server
-            .lease(provider.id(), &sandbox_id, real)
-            .map_err(|e| PillboxError::runtime("vault", format!("lease sandbox: {e}")))?;
-
-        // Write stub creds to a 0600 temp file the docker mount will overlay
-        // onto the guest's real credentials file.
-        let stub_file = tempfile::Builder::new()
-            .prefix("pillbox-stub-")
-            .suffix(".json")
-            .tempfile()
-            .map_err(|e| PillboxError::runtime("vault", format!("create stub file: {e}")))?;
-        write_private(stub_file.path(), lease.stub_credentials_body())?;
+        let mut oauth_mounts = Vec::new();
+        if let Some(agent) = oauth {
+            oauth_mounts.push(provision_oauth_mount(&server, agent)?);
+        }
 
         Ok(Self {
-            _lease: lease,
-            _server: server,
+            api_key_leases: Vec::new(),
+            oauth_mounts,
+            server,
             _runtime: runtime,
-            stub_file,
             ca_cert_path,
             listen_addr,
-            creds_path: creds_rel,
         })
     }
 
+    /// Lease a stub for one `--with NAME --vault`'d API key. Returns the
+    /// stub string the caller should inject into the guest env in place
+    /// of the real secret value.
+    pub(crate) fn lease_api_key(
+        &mut self,
+        secret_name: &str,
+        real_value: &str,
+        meta: &VaultMeta,
+    ) -> Result<String> {
+        let (lease, stub) = self
+            .server
+            .lease_api_key(secret_name, real_value, meta)
+            .map_err(|e| PillboxError::runtime("vault", format!("lease api key: {e}")))?;
+        self.api_key_leases.push(lease);
+        Ok(stub)
+    }
+
     /// Extra docker args to layer onto a normal `<agent> run`:
-    /// `-v stubfile:<guest_home>/<creds_path>:ro`,
     /// `-v cacert:/etc/pillbox-ca.crt:ro`,
-    /// `-e NODE_EXTRA_CA_CERTS=...`, `-e HTTPS_PROXY=...`, `-e HTTP_PROXY=...`.
+    /// `-e NODE_EXTRA_CA_CERTS=...`, `-e HTTPS_PROXY=...`,
+    /// `-e HTTP_PROXY=...`, plus one `-v stubfile:<creds>:ro` per OAuth
+    /// mount.
     pub(crate) fn docker_extras(&self, guest_home: &str) -> Vec<String> {
         let port = self.listen_addr.port();
         // host.docker.internal works on Docker Desktop (macOS/Windows). Linux
@@ -129,22 +119,27 @@ impl VaultSession {
         // unconditionally — Docker Desktop ignores it harmlessly.
         let proxy_url = format!("http://host.docker.internal:{port}");
         let guest_ca = "/etc/pillbox-ca.crt";
-        let guest_creds = format!("{guest_home}/{}", self.creds_path.display());
 
-        vec![
+        let mut out = vec![
             "--add-host".into(),
             "host.docker.internal:host-gateway".into(),
             "-v".into(),
             format!("{}:{guest_ca}:ro", self.ca_cert_path.display()),
-            "-v".into(),
-            format!("{}:{guest_creds}:ro", self.stub_file.path().display()),
+        ];
+        for mount in &self.oauth_mounts {
+            let guest_creds = format!("{guest_home}/{}", mount.creds_path.display());
+            out.push("-v".into());
+            out.push(format!("{}:{guest_creds}:ro", mount.stub_file.path().display()));
+        }
+        out.extend([
             "-e".into(),
             format!("NODE_EXTRA_CA_CERTS={guest_ca}"),
             "-e".into(),
             format!("HTTPS_PROXY={proxy_url}"),
             "-e".into(),
             format!("HTTP_PROXY={proxy_url}"),
-        ]
+        ]);
+        out
     }
 
     pub(crate) fn listen_addr(&self) -> SocketAddr {
@@ -154,6 +149,66 @@ impl VaultSession {
     pub(crate) fn ca_cert_path(&self) -> &Path {
         &self.ca_cert_path
     }
+}
+
+/// Input to `VaultSession::start` when the agent itself needs an OAuth
+/// stub. `agent_id` selects the provider (matches `AgentSpec::id`).
+pub(crate) struct OAuthAgent<'a> {
+    pub(crate) agent_id: &'a str,
+    pub(crate) agent_home: &'a Path,
+}
+
+fn provision_oauth_mount(server: &Server, agent: OAuthAgent<'_>) -> Result<OAuthMount> {
+    let provider = providers::provider_for(agent.agent_id).ok_or_else(|| {
+        PillboxError::runtime(
+            "vault",
+            format!("no vault provider for agent `{}`", agent.agent_id),
+        )
+    })?;
+
+    let creds_rel = provider.creds_path().to_path_buf();
+    let creds_path = agent.agent_home.join(&creds_rel);
+
+    let real_bytes = fs::read(&creds_path).map_err(|e| {
+        PillboxError::runtime(
+            "vault",
+            format!("read {}: {e}", creds_path.display()),
+        )
+        .with_next(format!(
+            "pillbox {} login   # refresh credentials",
+            agent.agent_id
+        ))
+    })?;
+    let real: serde_json::Value = serde_json::from_slice(&real_bytes).map_err(|e| {
+        PillboxError::runtime(
+            "vault",
+            format!("parse {}: {e}", creds_path.display()),
+        )
+        .with_next(format!(
+            "pillbox {} login   # credentials file is malformed",
+            agent.agent_id
+        ))
+    })?;
+
+    let sandbox_id = uuid::Uuid::now_v7().to_string();
+    let lease = server
+        .lease(provider.id(), &sandbox_id, real)
+        .map_err(|e| PillboxError::runtime("vault", format!("lease sandbox: {e}")))?;
+
+    // Write stub creds to a 0600 temp file the docker mount will overlay
+    // onto the guest's real credentials file.
+    let stub_file = tempfile::Builder::new()
+        .prefix("pillbox-stub-")
+        .suffix(".json")
+        .tempfile()
+        .map_err(|e| PillboxError::runtime("vault", format!("create stub file: {e}")))?;
+    write_private(stub_file.path(), lease.stub_credentials_body())?;
+
+    Ok(OAuthMount {
+        stub_file,
+        creds_path: creds_rel,
+        _lease: lease,
+    })
 }
 
 fn write_private(path: &Path, content: &str) -> Result<()> {

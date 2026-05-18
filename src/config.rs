@@ -202,11 +202,13 @@ strict = true
 
     #[test]
     fn tilde_expands_in_mount_host_only() {
-        std::env::set_var("HOME", "/h");
-        assert_eq!(
-            expand_tilde_in_mount("~/.aws:/home/lum/.aws:ro"),
-            "/h/.aws:/home/lum/.aws:ro"
-        );
+        crate::test_util::with_isolated_home("config-tilde", || {
+            let home = std::env::var("HOME").unwrap();
+            assert_eq!(
+                expand_tilde_in_mount("~/.aws:/home/lum/.aws:ro"),
+                format!("{home}/.aws:/home/lum/.aws:ro"),
+            );
+        });
     }
 
     #[test]

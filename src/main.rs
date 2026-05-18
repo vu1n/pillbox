@@ -25,6 +25,8 @@ mod envs;
 mod errors;
 mod paths;
 mod secrets;
+#[cfg(test)]
+mod test_util;
 mod vault;
 
 use agents::{AgentSpec, RunOpts};
@@ -194,6 +196,33 @@ enum SecretAction {
         /// Fail (exit 1) if the secret already exists. Default is silent overwrite.
         #[arg(long)]
         if_not_exists: bool,
+        /// Mark this secret as vaulted: at `run` time, the real value
+        /// stays on the host and the guest sees a per-sandbox stub
+        /// that gets swapped at the pillbox proxy. Known names
+        /// (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GITHUB_TOKEN`,
+        /// `GH_TOKEN`) auto-fill the host/scheme/prefix; for anything
+        /// else, pass `--maps-to` or `--host`+`--header-scheme`+`--prefix`.
+        #[arg(long)]
+        vault: bool,
+        /// Alias this secret to a known name's vault config (e.g.
+        /// `--maps-to ANTHROPIC_API_KEY` reuses Anthropic's host /
+        /// scheme / prefix). Mutually exclusive with manual --host/--header-scheme/--prefix.
+        #[arg(
+            long,
+            value_name = "KNOWN_NAME",
+            requires = "vault",
+            conflicts_with_all = ["host", "header_scheme", "prefix"],
+        )]
+        maps_to: Option<String>,
+        /// Vault host the secret talks to (e.g. `api.anthropic.com`).
+        #[arg(long, value_name = "HOST", requires = "vault")]
+        host: Option<String>,
+        /// Header scheme used by the upstream: `x-api-key` or `authorization-bearer`.
+        #[arg(long = "header-scheme", value_name = "SCHEME", requires = "vault")]
+        header_scheme: Option<String>,
+        /// Stub prefix the minted token should mimic (e.g. `sk-ant-api03-`).
+        #[arg(long, value_name = "PREFIX", requires = "vault")]
+        prefix: Option<String>,
     },
     /// List stored secret names.
     List {
@@ -267,13 +296,21 @@ fn main() -> ExitCode {
                 name,
                 from_env,
                 if_not_exists,
-            } => {
-                let source = match from_env {
-                    Some(var) => secrets::AddSource::EnvVar(var),
-                    None => secrets::AddSource::Stdin,
-                };
-                secrets::add(&name, source, if_not_exists)
-            }
+                vault,
+                maps_to,
+                host,
+                header_scheme,
+                prefix,
+            } => secret_add(
+                name,
+                from_env,
+                if_not_exists,
+                vault,
+                maps_to,
+                host,
+                header_scheme,
+                prefix,
+            ),
             SecretAction::List { json } => secrets::list(json),
             SecretAction::Show {
                 name,
@@ -528,6 +565,110 @@ fn build_auth_list_json() -> String {
         })
         .collect();
     paths::json_v1(vec![("agents", serde_json::Value::Array(arr))])
+}
+
+#[allow(clippy::too_many_arguments)] // mirrors the SecretAction::Add fields 1-to-1
+fn secret_add(
+    name: String,
+    from_env: Option<String>,
+    if_not_exists: bool,
+    vault: bool,
+    maps_to: Option<String>,
+    host: Option<String>,
+    header_scheme: Option<String>,
+    prefix: Option<String>,
+) -> Result<()> {
+    let source = match from_env {
+        Some(var) => secrets::AddSource::EnvVar(var),
+        None => secrets::AddSource::Stdin,
+    };
+    let vault_meta = resolve_vault_meta(
+        &name,
+        vault,
+        maps_to.as_deref(),
+        host.as_deref(),
+        header_scheme.as_deref(),
+        prefix.as_deref(),
+    )?;
+    secrets::add(&name, source, if_not_exists, vault_meta)
+}
+
+/// Build a [`vault::VaultMeta`] from the user-provided flags on
+/// `pillbox secret add`. Mutual-exclusion and "manual flags must come
+/// together" are enforced here so the call-site stays linear.
+fn resolve_vault_meta(
+    name: &str,
+    vault: bool,
+    maps_to: Option<&str>,
+    host: Option<&str>,
+    header_scheme: Option<&str>,
+    prefix: Option<&str>,
+) -> Result<Option<vault::VaultMeta>> {
+    if !vault {
+        // Sanity: clap's `requires = "vault"` should already block this,
+        // but defend against future refactors that strip the requires.
+        if maps_to.is_some() || host.is_some() || header_scheme.is_some() || prefix.is_some() {
+            return Err(PillboxError::usage(
+                "secret add",
+                "--maps-to / --host / --header-scheme / --prefix require --vault",
+            )
+            .into());
+        }
+        return Ok(None);
+    }
+
+    if let Some(alias) = maps_to {
+        let known = vault::known_secrets::lookup(alias).ok_or_else(|| {
+            PillboxError::usage(
+                "secret add",
+                format!(
+                    "--maps-to `{alias}` is not a known secret name. \
+                     Known: ANTHROPIC_API_KEY, OPENAI_API_KEY, GITHUB_TOKEN (alias GH_TOKEN)"
+                ),
+            )
+        })?;
+        return Ok(Some(known.to_meta()));
+    }
+
+    let manual_count = [host.is_some(), header_scheme.is_some(), prefix.is_some()]
+        .iter()
+        .filter(|b| **b)
+        .count();
+
+    if manual_count == 0 {
+        // No manual flags: try the known-secrets registry by name.
+        let known = vault::known_secrets::lookup(name).ok_or_else(|| {
+            PillboxError::usage(
+                "secret add",
+                format!(
+                    "`{name}` is not a known secret. Pass `--maps-to KNOWN` to alias \
+                     it, or `--host H --header-scheme {{x-api-key|authorization-bearer}} --prefix P` \
+                     to spell out the vault config."
+                ),
+            )
+            .with_next(format!(
+                "pillbox secret add {name} --vault --maps-to ANTHROPIC_API_KEY"
+            ))
+        })?;
+        return Ok(Some(known.to_meta()));
+    }
+
+    if manual_count != 3 {
+        return Err(PillboxError::usage(
+            "secret add",
+            "--host, --header-scheme, and --prefix must all be passed together",
+        )
+        .into());
+    }
+
+    let scheme = vault::HeaderScheme::parse(header_scheme.unwrap()).map_err(|e| {
+        PillboxError::usage("secret add", e)
+    })?;
+    Ok(Some(vault::VaultMeta::new(
+        host.unwrap().to_string(),
+        scheme,
+        prefix.unwrap().to_string(),
+    )))
 }
 
 fn auth_rm(provider: &str) -> Result<()> {

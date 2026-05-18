@@ -60,6 +60,12 @@ pub(crate) fn json_v1(fields: Vec<(&'static str, serde_json::Value)>) -> String 
     serde_json::Value::Object(root).to_string()
 }
 
+/// Process-wide lock for tests that mutate `$HOME`. Shared so tests
+/// across `secrets` / `agents` / `vault` modules can't race each other
+/// when cargo runs them on multiple threads.
+#[cfg(test)]
+pub(crate) static TEST_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;

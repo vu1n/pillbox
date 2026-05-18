@@ -19,6 +19,7 @@ use clap::{Parser, Subcommand};
 
 mod agents;
 mod docker;
+mod envs;
 mod errors;
 mod secrets;
 
@@ -53,6 +54,11 @@ enum Command {
     Secret {
         #[command(subcommand)]
         action: SecretAction,
+    },
+    /// Manage env bundles (whole .env files, loaded as a unit).
+    Env {
+        #[command(subcommand)]
+        action: EnvAction,
     },
 }
 
@@ -135,6 +141,37 @@ enum SecretAction {
     Rm { name: String },
 }
 
+#[derive(Subcommand, Debug)]
+enum EnvAction {
+    /// Parse a `.env`-formatted file and persist it as a named bundle.
+    Load {
+        /// Bundle name.
+        name: String,
+        /// Path to the `.env` file to load (resolved against cwd at invocation time).
+        path: PathBuf,
+        /// Fail if a bundle by this name already exists.
+        #[arg(long)]
+        if_not_exists: bool,
+    },
+    /// List stored bundles.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show a bundle's variables (values masked by default).
+    Show {
+        name: String,
+        #[arg(long)]
+        reveal: bool,
+        #[arg(long, requires = "reveal")]
+        to_stdout: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a stored bundle.
+    Rm { name: String },
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
@@ -164,6 +201,21 @@ fn main() -> ExitCode {
                 json,
             } => secrets::show(&name, reveal, to_stdout, json),
             SecretAction::Rm { name } => secrets::rm(&name),
+        },
+        Command::Env { action } => match action {
+            EnvAction::Load {
+                name,
+                path,
+                if_not_exists,
+            } => envs::load(&name, &path, if_not_exists),
+            EnvAction::List { json } => envs::list(json),
+            EnvAction::Show {
+                name,
+                reveal,
+                to_stdout,
+                json,
+            } => envs::show(&name, reveal, to_stdout, json),
+            EnvAction::Rm { name } => envs::rm(&name),
         },
     };
     match result {

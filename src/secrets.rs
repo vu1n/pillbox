@@ -215,7 +215,9 @@ fn write_secret_file(path: &std::path::Path, value: &str) -> Result<()> {
 /// Mask all but the last 4 chars of `value`. Short values are fully
 /// masked. Trailing whitespace is ignored when deciding what counts as
 /// "last 4 chars" so newline-suffixed tokens don't leak.
-fn mask(value: &str) -> String {
+///
+/// Shared with envs.rs.
+pub(crate) fn mask(value: &str) -> String {
     let core = value.trim_end();
     let chars: Vec<char> = core.chars().collect();
     if chars.len() <= 4 {

@@ -210,31 +210,23 @@ pub(crate) fn mask(value: &str) -> String {
 // ── JSON output ─────────────────────────────────────────────────────────────
 
 fn build_list_json(names: &[String]) -> String {
-    let mut value = serde_json::Map::new();
-    value.insert("version".into(), serde_json::Value::Number(1.into()));
-    value.insert(
-        "secrets".into(),
-        serde_json::Value::Array(
-            names
-                .iter()
-                .map(|n| {
-                    let mut o = serde_json::Map::new();
-                    o.insert("name".into(), serde_json::Value::String(n.clone()));
-                    serde_json::Value::Object(o)
-                })
-                .collect(),
-        ),
-    );
-    serde_json::Value::Object(value).to_string()
+    let arr: Vec<serde_json::Value> = names
+        .iter()
+        .map(|n| {
+            let mut o = serde_json::Map::new();
+            o.insert("name".into(), serde_json::Value::String(n.clone()));
+            serde_json::Value::Object(o)
+        })
+        .collect();
+    crate::paths::json_v1(vec![("secrets", serde_json::Value::Array(arr))])
 }
 
 fn build_show_json(name: &str, value: &str, revealed: bool) -> String {
-    let mut o = serde_json::Map::new();
-    o.insert("version".into(), serde_json::Value::Number(1.into()));
-    o.insert("name".into(), serde_json::Value::String(name.into()));
-    o.insert("value".into(), serde_json::Value::String(value.into()));
-    o.insert("revealed".into(), serde_json::Value::Bool(revealed));
-    serde_json::Value::Object(o).to_string()
+    crate::paths::json_v1(vec![
+        ("name", serde_json::Value::String(name.into())),
+        ("value", serde_json::Value::String(value.into())),
+        ("revealed", serde_json::Value::Bool(revealed)),
+    ])
 }
 
 #[cfg(test)]
@@ -257,5 +249,4 @@ mod tests {
     fn mask_ignores_trailing_whitespace() {
         assert_eq!(mask("abcdefgh\n"), "****efgh");
     }
-
 }

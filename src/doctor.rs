@@ -164,9 +164,8 @@ fn to_json(checks: &[Check], overall_ok: bool) -> String {
             serde_json::Value::Object(o)
         })
         .collect();
-    let mut root = serde_json::Map::new();
-    root.insert("version".into(), serde_json::Value::Number(1.into()));
-    root.insert("checks".into(), serde_json::Value::Array(arr));
-    root.insert("overall_ok".into(), serde_json::Value::Bool(overall_ok));
-    serde_json::Value::Object(root).to_string()
+    crate::paths::json_v1(vec![
+        ("checks", serde_json::Value::Array(arr)),
+        ("overall_ok", serde_json::Value::Bool(overall_ok)),
+    ])
 }

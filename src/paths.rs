@@ -48,6 +48,18 @@ pub(crate) fn data_subdir(name: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Serialize a pillbox JSON output with the standard `version: 1`
+/// envelope. Every `--json` payload goes through this so consumers can
+/// pin against the version field. Bump the constant on a breaking change.
+pub(crate) fn json_v1(fields: Vec<(&'static str, serde_json::Value)>) -> String {
+    let mut root = serde_json::Map::new();
+    root.insert("version".into(), serde_json::Value::Number(1.into()));
+    for (k, v) in fields {
+        root.insert(k.into(), v);
+    }
+    serde_json::Value::Object(root).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

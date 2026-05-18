@@ -184,16 +184,20 @@ enum EnvAction {
     },
     /// List stored bundles.
     List {
+        /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
     },
     /// Show a bundle's variables (values masked by default).
     Show {
         name: String,
+        /// Print plain values. Refuses if stdout is not a TTY unless --to-stdout is set.
         #[arg(long)]
         reveal: bool,
+        /// Acknowledge writing the revealed values to a non-TTY (pipe / file).
         #[arg(long, requires = "reveal")]
         to_stdout: bool,
+        /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
     },
@@ -326,10 +330,7 @@ fn build_auth_list_json() -> String {
             serde_json::Value::Object(o)
         })
         .collect();
-    let mut root = serde_json::Map::new();
-    root.insert("version".into(), serde_json::Value::Number(1.into()));
-    root.insert("agents".into(), serde_json::Value::Array(arr));
-    serde_json::Value::Object(root).to_string()
+    paths::json_v1(vec![("agents", serde_json::Value::Array(arr))])
 }
 
 fn auth_rm(provider: &str) -> Result<()> {

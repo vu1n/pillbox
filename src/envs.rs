@@ -102,9 +102,7 @@ pub(crate) fn list(json: bool) -> Result<()> {
     }
     println!("Stored env bundles under ~/.pillbox/env/:");
     for name in &names {
-        let count = read(name)?
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let count = read(name)?.map(|m| m.len()).unwrap_or(0);
         println!("  {name:<20} ({count} variables)");
     }
     Ok(())
@@ -250,10 +248,7 @@ fn build_list_json(names: &[String]) -> Result<String> {
         );
         bundles.push(serde_json::Value::Object(o));
     }
-    let mut root = serde_json::Map::new();
-    root.insert("version".into(), serde_json::Value::Number(1.into()));
-    root.insert("bundles".into(), serde_json::Value::Array(bundles));
-    Ok(serde_json::Value::Object(root).to_string())
+    Ok(crate::paths::json_v1(vec![("bundles", serde_json::Value::Array(bundles))]))
 }
 
 fn build_show_json(
@@ -271,12 +266,11 @@ fn build_show_json(
             serde_json::Value::Object(o)
         })
         .collect();
-    let mut root = serde_json::Map::new();
-    root.insert("version".into(), serde_json::Value::Number(1.into()));
-    root.insert("name".into(), serde_json::Value::String(name.into()));
-    root.insert("revealed".into(), serde_json::Value::Bool(revealed));
-    root.insert("variables".into(), serde_json::Value::Array(variables));
-    Ok(serde_json::Value::Object(root).to_string())
+    Ok(crate::paths::json_v1(vec![
+        ("name", serde_json::Value::String(name.into())),
+        ("revealed", serde_json::Value::Bool(revealed)),
+        ("variables", serde_json::Value::Array(variables)),
+    ]))
 }
 
 #[cfg(test)]

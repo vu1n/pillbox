@@ -86,9 +86,12 @@ work *in theory* (Docker + `$HOME` exist) but haven't been tested.
 - **v0.2** ✅ Codex adapter; `--workspace` / `--name` / `--mount` ergonomics;
   persistent agent HOME under `~/.pillbox/data/<provider>/`
 - **v0.3** ✅ Secrets + env bundles + `pillbox doctor` / `version`
-- **v0.4** — Vault tier (stub creds + egress proxy swap for API keys + GitHub
-  PATs); `pillbox run --strict` (Gondolin microVMs); per-project
-  `pillbox.toml`
+- **v0.4** ✅ Per-project `pillbox.toml`; credential vault for claude's
+  Anthropic OAuth (`--vault`); `--strict` flag locked in (Gondolin
+  microVM impl follows in v0.5)
+- **v0.5** — Wire `--strict` to Gondolin microVMs; extend vault to
+  Anthropic API keys + GitHub PATs + codex; `pillbox.toml` `strict`
+  field
 
 ## Build (pre-GHCR: requires the lum-built runner image)
 

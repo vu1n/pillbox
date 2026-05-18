@@ -55,6 +55,7 @@ Stop reading if that's all you need. The rest is reference.
 | `--with NAME[=ENV_VAR]` | — | Inject one stored secret. `NAME` alone means `NAME=NAME`. Repeatable. |
 | `--env BUNDLE` | — | Inject every variable from a stored env bundle |
 | `--env-file PATH` | — | Inject every variable from a `.env` file on disk (no persistence) |
+| `--strict` | off | Use a Gondolin microVM instead of Docker. v0.4 ships the flag; errors with "not yet wired up". Real impl in v0.5. See [docs/strict.md](./docs/strict.md). |
 
 Env composition order (later flags override earlier ones):
 

@@ -119,6 +119,7 @@ pillbox <agent> run -- AGENT-ARGS      # forward args to the agent CLI
 - [AGENTS.md](./AGENTS.md) — agent-facing command reference (one screen)
 - [docs/](./docs/) — topic deep dives
   - [secrets.md](./docs/secrets.md) — secrets, env bundles, precedence rules
+  - [strict.md](./docs/strict.md) — `--strict` Gondolin microVM mode
   - [recipes.md](./docs/recipes.md) — copy-paste flows for common tasks
   - [security.md](./docs/security.md) — threat model and what pillbox defends against
 

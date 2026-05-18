@@ -22,7 +22,7 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 
-use crate::docker;
+use crate::{docker, errors::PillboxError};
 
 const GUEST_HOME: &str = "/home/lum";
 const GUEST_WORKSPACE: &str = "/workspace";
@@ -157,19 +157,25 @@ impl AgentSpec {
 
         let status = docker::run_interactive(&args)?;
         if !status.success() {
-            return Err(anyhow!(
-                "{} login exited with status {status}. Re-run `pillbox {} login`.",
-                self.id, self.id
-            ));
+            return Err(PillboxError::runtime(
+                "login",
+                format!("{} exited with status {status}", self.id),
+            )
+            .with_next(format!("pillbox {} login", self.id))
+            .into());
         }
 
         if !home.join(self.cred_sentinel).exists() {
-            return Err(anyhow!(
-                "{} login completed but `{}` was not written.\n\
-                 Check the sandbox output above for hints.",
-                self.id,
-                home.join(self.cred_sentinel).display()
-            ));
+            return Err(PillboxError::runtime(
+                "login",
+                format!(
+                    "{} completed but `{}` was not written",
+                    self.id,
+                    home.join(self.cred_sentinel).display()
+                ),
+            )
+            .with_next(format!("pillbox {} login   # check the sandbox output above for clues", self.id))
+            .into());
         }
 
         // Apply the agent's post-login fix-up if it has one (e.g. claude
@@ -202,10 +208,12 @@ impl AgentSpec {
 
         let home = self.home_dir()?;
         if !home.join(self.cred_sentinel).exists() {
-            return Err(anyhow!(
-                "no stored credentials for `{}`. Run `pillbox {} login` first.",
-                self.id, self.id
-            ));
+            return Err(PillboxError::runtime(
+                "run",
+                format!("no stored credentials for `{}`", self.id),
+            )
+            .with_next(format!("pillbox {} login", self.id))
+            .into());
         }
 
         let workspace_host = match opts.workspace {
@@ -234,7 +242,11 @@ impl AgentSpec {
 
         let status = docker::run_interactive(&args)?;
         if !status.success() {
-            return Err(anyhow!("{} exited with status {status}", self.id));
+            return Err(PillboxError::runtime(
+                "run",
+                format!("{} exited with status {status}", self.id),
+            )
+            .into());
         }
         Ok(())
     }
@@ -293,9 +305,11 @@ fn base_docker_args() -> Vec<String> {
 fn workspace_mount_name(host: &Path, override_name: Option<&str>) -> Result<String> {
     if let Some(name) = override_name {
         if name.is_empty() || name.contains('/') || name.contains('\0') {
-            return Err(anyhow!(
-                "--name `{name}` must be a non-empty single path component (no `/` or NUL)"
-            ));
+            return Err(PillboxError::usage(
+                "run",
+                format!("--name `{name}` must be a non-empty single path component (no `/` or NUL)"),
+            )
+            .into());
         }
         return Ok(name.to_string());
     }

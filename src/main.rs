@@ -12,15 +12,17 @@
 //!
 //! 3. `pillbox auth list / rm` — show / forget persistent state.
 
-use std::path::PathBuf;
+use std::{path::PathBuf, process::ExitCode};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod agents;
 mod docker;
+mod errors;
 
 use agents::{AgentSpec, RunOpts};
+use errors::PillboxError;
 
 #[derive(Parser, Debug)]
 #[command(name = "pillbox", version, about, long_about = None)]
@@ -91,15 +93,19 @@ enum AuthAction {
     },
 }
 
-fn main() -> Result<()> {
+fn main() -> ExitCode {
     let cli = Cli::parse();
-    match cli.command {
+    let result = match cli.command {
         Command::Claude { action } => dispatch_agent(agents::CLAUDE, action),
         Command::Codex { action } => dispatch_agent(agents::CODEX, action),
         Command::Auth { action } => match action {
             AuthAction::List => auth_list(),
             AuthAction::Rm { provider } => auth_rm(&provider),
         },
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => errors::report(&e),
     }
 }
 
@@ -142,7 +148,13 @@ fn auth_rm(provider: &str) -> Result<()> {
     let spec = agents::ALL
         .iter()
         .find(|s| s.id() == provider)
-        .with_context(|| format!("unknown provider `{provider}`"))?;
+        .ok_or_else(|| {
+            PillboxError::usage(
+                "auth rm",
+                format!("unknown provider `{provider}`"),
+            )
+            .with_next("pillbox auth list  # see what's available")
+        })?;
     if spec.forget()? {
         println!("Removed {provider} state.");
     } else {

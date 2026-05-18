@@ -5,7 +5,9 @@
 
 use std::process::{Command, ExitStatus, Stdio};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
+
+use crate::errors::PillboxError;
 
 /// Published runner image tag. For v0.1 this is the locally-built lum image
 /// (named `pillbox` in this session). v0.2 publishes to GHCR.
@@ -30,19 +32,22 @@ pub fn check_ready() -> Result<()> {
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
     if stderr.contains("Cannot connect to the Docker daemon") {
-        return Err(anyhow!(
-            "Docker daemon isn't running. Start Docker Desktop and retry."
-        ));
+        return Err(PillboxError::resource(
+            "docker pre-flight",
+            "Docker daemon isn't running",
+        )
+        .with_next("start Docker Desktop, then re-run pillbox")
+        .into());
     }
     if stderr.contains("No such image") || stderr.contains("Error response from daemon") {
-        return Err(anyhow!(
-            "runner image `{RUNNER_IMAGE}` not found locally.\n\n\
-             For v0.1, build it from the lum repo:\n  \
-             cd ~/code/lum && bun run build:runtime-image:pillbox\n\n\
-             A published GHCR image is on the v0.2 roadmap."
-        ));
+        return Err(PillboxError::resource(
+            "docker pre-flight",
+            format!("runner image `{RUNNER_IMAGE}` not found locally"),
+        )
+        .with_next("cd ~/code/lum && bun run build:runtime-image:pillbox  # GHCR publish lands in v0.4")
+        .into());
     }
-    Err(anyhow!("docker pre-flight failed: {stderr}"))
+    Err(PillboxError::resource("docker pre-flight", stderr.into_owned()).into())
 }
 
 /// Run `docker run <args...>` with stdio inherited from the parent.

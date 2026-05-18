@@ -35,6 +35,7 @@ All fields optional. Unknown fields are rejected with exit 3.
 | `with` | string list | `--with NAME[=ENV_VAR]` | CLI entries appended. |
 | `mount` | string list | `--mount HOST:GUEST[:opts]` | CLI entries appended. Tilde-expanded. |
 | `env_file` | string list | `--env-file PATH` | CLI entries appended. Tilde-expanded. Paths resolved relative to cwd at invocation, NOT relative to the config file. |
+| `strict` | bool | `--strict` | OR-merged with CLI: either source can trigger it. See [strict.md](./strict.md) — flag-only in v0.5; impl in v0.6. |
 
 ## Merge rules
 

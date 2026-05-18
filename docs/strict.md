@@ -16,9 +16,9 @@ pillbox: run failed. --strict (Gondolin microVM) is unavailable in this build
 
 Exit code 2 (usage error).
 
-The CLI shape is locked in v0.4 so scripts can be written ahead of
-time. A matching `strict` field in `pillbox.toml` and the Gondolin
-spawn integration both land in v0.5.
+The CLI shape was locked in v0.4, and the `pillbox.toml` `strict`
+field landed in v0.5 (see [config.md](./config.md)). Both surfaces
+emit the same exit-2 error until the Gondolin spawn integration lands.
 
 ## Why ship the flag without the impl
 

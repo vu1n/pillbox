@@ -20,6 +20,7 @@ use clap::{Parser, Subcommand};
 mod agents;
 mod docker;
 mod errors;
+mod secrets;
 
 use agents::{AgentSpec, RunOpts};
 use errors::PillboxError;
@@ -47,6 +48,11 @@ enum Command {
     Auth {
         #[command(subcommand)]
         action: AuthAction,
+    },
+    /// Manage named secrets (single value → env var).
+    Secret {
+        #[command(subcommand)]
+        action: SecretAction,
     },
 }
 
@@ -93,6 +99,42 @@ enum AuthAction {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum SecretAction {
+    /// Store a secret value (reads from stdin by default).
+    Add {
+        /// Secret name. ASCII alphanumeric + `_`, `-`, `.` only.
+        name: String,
+        /// Read the value from this host env var instead of stdin.
+        #[arg(long, value_name = "VAR")]
+        from_env: Option<String>,
+        /// Fail (exit 1) if the secret already exists. Default is silent overwrite.
+        #[arg(long)]
+        if_not_exists: bool,
+    },
+    /// List stored secret names.
+    List {
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show a secret's value (masked by default).
+    Show {
+        name: String,
+        /// Print the plain value. Refuses if stdout is not a TTY unless --to-stdout is set.
+        #[arg(long)]
+        reveal: bool,
+        /// Acknowledge writing the revealed value to a non-TTY (pipe / file).
+        #[arg(long, requires = "reveal")]
+        to_stdout: bool,
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a stored secret.
+    Rm { name: String },
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
@@ -101,6 +143,27 @@ fn main() -> ExitCode {
         Command::Auth { action } => match action {
             AuthAction::List => auth_list(),
             AuthAction::Rm { provider } => auth_rm(&provider),
+        },
+        Command::Secret { action } => match action {
+            SecretAction::Add {
+                name,
+                from_env,
+                if_not_exists,
+            } => {
+                let source = match from_env {
+                    Some(var) => secrets::AddSource::EnvVar(var),
+                    None => secrets::AddSource::Stdin,
+                };
+                secrets::add(&name, source, if_not_exists)
+            }
+            SecretAction::List { json } => secrets::list(json),
+            SecretAction::Show {
+                name,
+                reveal,
+                to_stdout,
+                json,
+            } => secrets::show(&name, reveal, to_stdout, json),
+            SecretAction::Rm { name } => secrets::rm(&name),
         },
     };
     match result {

@@ -19,8 +19,10 @@ use clap::{Parser, Subcommand};
 
 mod agents;
 mod docker;
+mod doctor;
 mod envs;
 mod errors;
+mod paths;
 mod secrets;
 
 use agents::{AgentSpec, RunOpts};
@@ -60,6 +62,14 @@ enum Command {
         #[command(subcommand)]
         action: EnvAction,
     },
+    /// Diagnose pillbox's environment (Docker, image, perms).
+    Doctor {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print pillbox version + the runner image tag it targets.
+    Version,
 }
 
 #[derive(Subcommand, Debug)]
@@ -232,6 +242,15 @@ fn main() -> ExitCode {
             } => envs::show(&name, reveal, to_stdout, json),
             EnvAction::Rm { name } => envs::rm(&name),
         },
+        Command::Doctor { json } => doctor::run(json),
+        Command::Version => {
+            println!(
+                "pillbox {} (runner image: {})",
+                env!("CARGO_PKG_VERSION"),
+                docker::RUNNER_IMAGE
+            );
+            Ok(())
+        }
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

@@ -353,7 +353,7 @@ fn resolve_run_env(opts: &RunOpts) -> Result<std::collections::BTreeMap<String, 
 
 /// Ensure `~/.pillbox/data/<provider>/` exists with 0700 perms.
 fn ensure_provider_home(spec: &AgentSpec) -> Result<PathBuf> {
-    let home = spec.home_dir()?;
+    let home = crate::paths::data_subdir("data")?.join(spec.id);
     fs::create_dir_all(&home)
         .with_context(|| format!("create {}", home.display()))?;
     fs::set_permissions(&home, fs::Permissions::from_mode(0o700))

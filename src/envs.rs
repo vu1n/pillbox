@@ -15,7 +15,7 @@ use std::{
     collections::BTreeMap,
     fs,
     io::Write,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
 
@@ -24,29 +24,11 @@ use anyhow::{Context, Result};
 use crate::errors::PillboxError;
 
 fn validate_name(name: &str) -> Result<()> {
-    if name.is_empty() {
-        return Err(PillboxError::usage("env load", "name cannot be empty").into());
-    }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
-    {
-        return Err(PillboxError::usage(
-            "env load",
-            format!("name `{name}` must be ASCII alphanumeric plus `_`, `-`, or `.`"),
-        )
-        .into());
-    }
-    Ok(())
+    crate::paths::validate_name("env", name)
 }
 
 fn env_dir() -> Result<PathBuf> {
-    let home = std::env::var("HOME").context("could not resolve $HOME")?;
-    let dir = PathBuf::from(home).join(".pillbox").join("env");
-    fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("chmod {} 0700", dir.display()))?;
-    Ok(dir)
+    crate::paths::data_subdir("env")
 }
 
 fn bundle_path(name: &str) -> Result<PathBuf> {

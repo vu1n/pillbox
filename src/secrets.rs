@@ -15,7 +15,7 @@
 use std::{
     fs,
     io::{IsTerminal, Read, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::OpenOptionsExt,
     path::PathBuf,
 };
 
@@ -23,34 +23,13 @@ use anyhow::{Context, Result};
 
 use crate::errors::PillboxError;
 
-/// Name → filename character whitelist. Keeps secret names predictable
-/// across platforms and stops a careless `pillbox secret add ../../foo`
-/// from escaping the secrets dir.
 fn validate_name(name: &str) -> Result<()> {
-    if name.is_empty() {
-        return Err(PillboxError::usage("secret add", "name cannot be empty").into());
-    }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
-    {
-        return Err(PillboxError::usage(
-            "secret add",
-            format!("name `{name}` must be ASCII alphanumeric plus `_`, `-`, or `.`"),
-        )
-        .into());
-    }
-    Ok(())
+    crate::paths::validate_name("secret", name)
 }
 
 /// `~/.pillbox/secrets/` — created on first use, 0700.
 fn secrets_dir() -> Result<PathBuf> {
-    let home = std::env::var("HOME").context("could not resolve $HOME")?;
-    let dir = PathBuf::from(home).join(".pillbox").join("secrets");
-    fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("chmod {} 0700", dir.display()))?;
-    Ok(dir)
+    crate::paths::data_subdir("secrets")
 }
 
 fn secret_path(name: &str) -> Result<PathBuf> {

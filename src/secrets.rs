@@ -22,10 +22,7 @@ use std::{
 use anyhow::{Context, Result};
 
 use crate::errors::PillboxError;
-
-fn validate_name(name: &str) -> Result<()> {
-    crate::paths::validate_name("secret", name)
-}
+use crate::paths::validate_name;
 
 /// `~/.pillbox/secrets/` — created on first use, 0700.
 fn secrets_dir() -> Result<PathBuf> {
@@ -38,7 +35,7 @@ fn secret_path(name: &str) -> Result<PathBuf> {
 
 /// Read a secret's stored value. Returns `None` if not present.
 pub(crate) fn read(name: &str) -> Result<Option<String>> {
-    validate_name(name)?;
+    validate_name("secret read", name)?;
     let path = secret_path(name)?;
     match fs::read_to_string(&path) {
         Ok(v) => Ok(Some(v)),
@@ -64,7 +61,7 @@ pub(crate) fn names() -> Result<Vec<String>> {
 }
 
 pub(crate) fn add(name: &str, source: AddSource, if_not_exists: bool) -> Result<()> {
-    validate_name(name)?;
+    validate_name("secret add", name)?;
     let path = secret_path(name)?;
     if if_not_exists && path.exists() {
         return Err(PillboxError::runtime(
@@ -129,7 +126,7 @@ pub(crate) fn show(name: &str, reveal: bool, to_stdout: bool, json: bool) -> Res
 }
 
 pub(crate) fn rm(name: &str) -> Result<()> {
-    validate_name(name)?;
+    validate_name("secret rm", name)?;
     let path = secret_path(name)?;
     match fs::remove_file(&path) {
         Ok(()) => {
@@ -261,18 +258,4 @@ mod tests {
         assert_eq!(mask("abcdefgh\n"), "****efgh");
     }
 
-    #[test]
-    fn validate_name_accepts_normal_names() {
-        assert!(validate_name("ANTHROPIC_API_KEY").is_ok());
-        assert!(validate_name("db.staging").is_ok());
-        assert!(validate_name("foo-bar").is_ok());
-    }
-
-    #[test]
-    fn validate_name_rejects_escape_attempts() {
-        assert!(validate_name("../etc/passwd").is_err());
-        assert!(validate_name("foo/bar").is_err());
-        assert!(validate_name("").is_err());
-        assert!(validate_name("foo bar").is_err()); // spaces
-    }
 }

@@ -47,3 +47,23 @@ pub(crate) fn data_subdir(name: &str) -> Result<PathBuf> {
         .with_context(|| format!("chmod {} 0700", dir.display()))?;
     Ok(dir)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_name_accepts_normal_names() {
+        assert!(validate_name("secret add", "ANTHROPIC_API_KEY").is_ok());
+        assert!(validate_name("env load", "db.staging").is_ok());
+        assert!(validate_name("secret add", "foo-bar").is_ok());
+    }
+
+    #[test]
+    fn validate_name_rejects_escape_attempts() {
+        assert!(validate_name("secret add", "../etc/passwd").is_err());
+        assert!(validate_name("secret add", "foo/bar").is_err());
+        assert!(validate_name("secret add", "").is_err());
+        assert!(validate_name("secret add", "foo bar").is_err());
+    }
+}

@@ -122,7 +122,11 @@ enum AgentAction {
 #[derive(Subcommand, Debug)]
 enum AuthAction {
     /// Show which providers have authenticated state on disk.
-    List,
+    List {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Remove a provider's persistent state (`~/.pillbox/data/<provider>/`).
     Rm {
         /// Provider id (e.g. `claude`, `codex`).
@@ -203,7 +207,7 @@ fn main() -> ExitCode {
         Command::Claude { action } => dispatch_agent(agents::CLAUDE, action),
         Command::Codex { action } => dispatch_agent(agents::CODEX, action),
         Command::Auth { action } => match action {
-            AuthAction::List => auth_list(),
+            AuthAction::List { json } => auth_list(json),
             AuthAction::Rm { provider } => auth_rm(&provider),
         },
         Command::Secret { action } => match action {
@@ -281,7 +285,11 @@ fn dispatch_agent(spec: AgentSpec, action: AgentAction) -> Result<()> {
     }
 }
 
-fn auth_list() -> Result<()> {
+fn auth_list(json: bool) -> Result<()> {
+    if json {
+        println!("{}", build_auth_list_json());
+        return Ok(());
+    }
     println!("Persistent state under ~/.pillbox/data/:");
     let mut any = false;
     for spec in agents::ALL {
@@ -297,6 +305,31 @@ fn auth_list() -> Result<()> {
         println!("Run `pillbox claude login` to authenticate.");
     }
     Ok(())
+}
+
+fn build_auth_list_json() -> String {
+    let arr: Vec<serde_json::Value> = agents::ALL
+        .iter()
+        .map(|spec| {
+            let home = spec
+                .home_dir()
+                .ok()
+                .map(|h| serde_json::Value::String(h.display().to_string()))
+                .unwrap_or(serde_json::Value::Null);
+            let mut o = serde_json::Map::new();
+            o.insert("id".into(), serde_json::Value::String(spec.id().into()));
+            o.insert("home".into(), home);
+            o.insert(
+                "authenticated".into(),
+                serde_json::Value::Bool(spec.is_authenticated()),
+            );
+            serde_json::Value::Object(o)
+        })
+        .collect();
+    let mut root = serde_json::Map::new();
+    root.insert("version".into(), serde_json::Value::Number(1.into()));
+    root.insert("agents".into(), serde_json::Value::Array(arr));
+    serde_json::Value::Object(root).to_string()
 }
 
 fn auth_rm(provider: &str) -> Result<()> {

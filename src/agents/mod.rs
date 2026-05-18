@@ -317,8 +317,12 @@ fn resolve_run_env(opts: &RunOpts) -> Result<std::collections::BTreeMap<String, 
 
     // Layer 2: ad-hoc .env files.
     for path in &opts.env_files {
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let raw = std::fs::read_to_string(path).map_err(|e| {
+            PillboxError::runtime(
+                "run",
+                format!("could not read --env-file {}: {e}", path.display()),
+            )
+        })?;
         let vars = crate::envs::parse_dotenv(&raw, &path.display().to_string())?;
         for (k, v) in vars {
             if let Some(_prev) = env.insert(k.clone(), v) {

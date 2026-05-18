@@ -22,10 +22,7 @@ use std::{
 use anyhow::{Context, Result};
 
 use crate::errors::PillboxError;
-
-fn validate_name(name: &str) -> Result<()> {
-    crate::paths::validate_name("env", name)
-}
+use crate::paths::validate_name;
 
 fn env_dir() -> Result<PathBuf> {
     crate::paths::data_subdir("env")
@@ -37,7 +34,7 @@ fn bundle_path(name: &str) -> Result<PathBuf> {
 
 /// Read a bundle's parsed key/value pairs.
 pub(crate) fn read(name: &str) -> Result<Option<BTreeMap<String, String>>> {
-    validate_name(name)?;
+    validate_name("env show", name)?;
     let path = bundle_path(name)?;
     let content = match fs::read_to_string(&path) {
         Ok(s) => s,
@@ -63,7 +60,7 @@ pub(crate) fn names() -> Result<Vec<String>> {
 }
 
 pub(crate) fn load(name: &str, source_path: &Path, if_not_exists: bool) -> Result<()> {
-    validate_name(name)?;
+    validate_name("env load", name)?;
     let dest = bundle_path(name)?;
     if if_not_exists && dest.exists() {
         return Err(PillboxError::runtime(
@@ -75,8 +72,12 @@ pub(crate) fn load(name: &str, source_path: &Path, if_not_exists: bool) -> Resul
         ))
         .into());
     }
-    let content = fs::read_to_string(source_path)
-        .with_context(|| format!("read {}", source_path.display()))?;
+    let content = fs::read_to_string(source_path).map_err(|e| {
+        PillboxError::runtime(
+            "env load",
+            format!("could not read {}: {e}", source_path.display()),
+        )
+    })?;
     let parsed = parse_dotenv(&content, &source_path.display().to_string())?;
     write_bundle_file(&dest, &content)?;
     println!(
@@ -139,7 +140,7 @@ pub(crate) fn show(name: &str, reveal: bool, to_stdout: bool, json: bool) -> Res
 }
 
 pub(crate) fn rm(name: &str) -> Result<()> {
-    validate_name(name)?;
+    validate_name("env rm", name)?;
     let path = bundle_path(name)?;
     match fs::remove_file(&path) {
         Ok(()) => {

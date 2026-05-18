@@ -315,6 +315,9 @@ pub(crate) struct RunOpts {
     pub(crate) env_files: Vec<PathBuf>,
     /// `--vault` — route API traffic through the pillbox stub-swap proxy.
     pub(crate) vault: bool,
+    /// `--strict` — opt into the Gondolin microVM sandbox (gated until v0.6
+    /// wires the spawn integration; today this is an error trigger).
+    pub(crate) strict: bool,
     pub(crate) args: Vec<String>,
 }
 
@@ -336,6 +339,9 @@ impl RunOpts {
             &mut self.env_files,
             cfg.env_file.into_iter().map(PathBuf::from).collect(),
         );
+        // Bool fields OR-merge: either source can trigger, CLI can't unset
+        // config-on.
+        self.strict |= cfg.strict;
     }
 }
 

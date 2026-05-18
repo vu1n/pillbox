@@ -335,8 +335,19 @@ fn dispatch_agent(spec: AgentSpec, action: AgentAction) -> Result<()> {
             vault,
             args,
         } => {
-            let cfg = config::Config::resolve(config, no_config)?;
-            if strict || cfg.strict {
+            let mut opts = RunOpts {
+                workspace,
+                name,
+                mounts,
+                withs,
+                env_bundles,
+                env_files,
+                vault,
+                strict,
+                args,
+            };
+            opts.apply_defaults(config::Config::resolve(config, no_config)?);
+            if opts.strict {
                 return Err(PillboxError::usage(
                     "run",
                     "--strict (Gondolin microVM) is unavailable in this build",
@@ -346,17 +357,6 @@ fn dispatch_agent(spec: AgentSpec, action: AgentAction) -> Result<()> {
                 )
                 .into());
             }
-            let mut opts = RunOpts {
-                workspace,
-                name,
-                mounts,
-                withs,
-                env_bundles,
-                env_files,
-                vault,
-                args,
-            };
-            opts.apply_defaults(cfg);
             spec.run(opts)
         }
     }

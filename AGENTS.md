@@ -9,7 +9,7 @@ you want.
 
 ---
 
-## Mental model — 4 things
+## Mental model — 5 things
 
 | Concept | What it is | Where it lives |
 |---|---|---|
@@ -17,6 +17,7 @@ you want.
 | **secret** | A single named value bound to one env var | `~/.pillbox/secrets/<name>` |
 | **env** | A named bundle of secrets, `.env`-file shaped | `~/.pillbox/env/<name>` |
 | **workspace** | A host directory mounted at `/workspace/<name>` inside the sandbox | passed at run-time |
+| **config** | Per-project defaults for `run` flags | `./pillbox.toml` (walks up from cwd) |
 
 The whole CLI is **subject → verb**: `pillbox <subject> <verb> [args]`.
 Pattern-match on that and you'll predict every command correctly.
@@ -55,7 +56,11 @@ Stop reading if that's all you need. The rest is reference.
 | `--with NAME[=ENV_VAR]` | — | Inject one stored secret. `NAME` alone means `NAME=NAME`. Repeatable. |
 | `--env BUNDLE` | — | Inject every variable from a stored env bundle |
 | `--env-file PATH` | — | Inject every variable from a `.env` file on disk (no persistence) |
-| `--strict` | off | Use a Gondolin microVM instead of Docker. v0.4 ships the flag; errors with "not yet wired up". Real impl in v0.5. See [docs/strict.md](./docs/strict.md). |
+| `--strict` | off | Use a Gondolin microVM instead of Docker. v0.4 ships the flag; errors with "unavailable in this build". Real impl in v0.5. See [docs/strict.md](./docs/strict.md). |
+| `--config PATH` | — | Use a specific pillbox.toml (disables discovery) |
+| `--no-config` | — | Skip pillbox.toml discovery entirely |
+
+Defaults from `./pillbox.toml` (or any ancestor directory) are applied first, then CLI flags. Multi-value flags (`--with`, `--mount`, `--env-file`) append to the file's list. Single-value flags (`--name`, `--env`) override the file's value. See [docs/config.md](./docs/config.md) for the full schema.
 
 Env composition order (later flags override earlier ones):
 
@@ -97,10 +102,11 @@ pillbox: note: ANTHROPIC_API_KEY shadowed by --with
 | `pillbox auth list [--json]` | Show which agents have stored login state |
 | `pillbox auth rm AGENT` | Wipe an agent's stored state (forces re-login next run) |
 
-### Operational (subject = `doctor` | `version`)
+### Operational (subject = `config` | `doctor` | `version`)
 
 | Command | What it does |
 |---|---|
+| `pillbox config [--json]` | Show the resolved `pillbox.toml` for the current directory (or that none was found) |
 | `pillbox doctor [--json]` | Diagnose environment: Docker running, image present, perms OK, `$HOME` resolvable |
 | `pillbox version` | Print pillbox version + the image tag it targets |
 
@@ -188,6 +194,20 @@ All `--json` outputs include a `version` field. Add fields freely in future rele
     { "name": "data_dir_perms", "ok": true, "detail": "/Users/x/.pillbox/ mode 0700" }
   ],
   "overall_ok": true
+}
+
+// pillbox config --json
+// `config.source` is null when no pillbox.toml was found between cwd and /.
+{
+  "version": 1,
+  "config": {
+    "source": "/Users/x/work/myapp/pillbox.toml",
+    "name": "myapp",
+    "env": "dev",
+    "with": ["ANTHROPIC_API_KEY"],
+    "mount": ["/Users/x/.aws:/home/lum/.aws:ro"],
+    "env_file": [".env.local"]
+  }
 }
 ```
 

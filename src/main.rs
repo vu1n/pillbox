@@ -18,6 +18,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod agents;
+mod config;
 mod docker;
 mod doctor;
 mod envs;
@@ -61,6 +62,12 @@ enum Command {
     Env {
         #[command(subcommand)]
         action: EnvAction,
+    },
+    /// Show the resolved pillbox.toml (if any) for the current directory.
+    Config {
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Diagnose pillbox's environment (Docker, image, perms).
     Doctor {
@@ -117,6 +124,14 @@ enum AgentAction {
         /// v0.4 ships the flag only; see docs/strict.md.
         #[arg(long)]
         strict: bool,
+
+        /// Load defaults from a specific pillbox.toml. Disables discovery.
+        #[arg(long, value_name = "PATH", conflicts_with = "no_config")]
+        config: Option<PathBuf>,
+
+        /// Skip pillbox.toml discovery entirely.
+        #[arg(long)]
+        no_config: bool,
 
         /// Args forwarded to the agent CLI inside the sandbox.
         #[arg(trailing_var_arg = true)]
@@ -255,6 +270,7 @@ fn main() -> ExitCode {
             } => envs::show(&name, reveal, to_stdout, json),
             EnvAction::Rm { name } => envs::rm(&name),
         },
+        Command::Config { json } => show_config(json),
         Command::Doctor { json } => doctor::run(json),
         Command::Version => {
             println!(
@@ -282,6 +298,8 @@ fn dispatch_agent(spec: AgentSpec, action: AgentAction) -> Result<()> {
             env_bundles,
             env_files,
             strict,
+            config,
+            no_config,
             args,
         } => {
             if strict {
@@ -294,7 +312,7 @@ fn dispatch_agent(spec: AgentSpec, action: AgentAction) -> Result<()> {
                 )
                 .into());
             }
-            spec.run(RunOpts {
+            let mut opts = RunOpts {
                 workspace,
                 name,
                 mounts,
@@ -302,7 +320,9 @@ fn dispatch_agent(spec: AgentSpec, action: AgentAction) -> Result<()> {
                 env_bundles,
                 env_files,
                 args,
-            })
+            };
+            opts.apply_defaults(config::Config::resolve(config, no_config)?);
+            spec.run(opts)
         }
     }
 }
@@ -327,6 +347,74 @@ fn auth_list(json: bool) -> Result<()> {
         println!("Run `pillbox claude login` to authenticate.");
     }
     Ok(())
+}
+
+fn show_config(json: bool) -> Result<()> {
+    let cfg = config::Config::discover()?;
+    if json {
+        println!("{}", paths::json_v1(vec![("config", config_json_payload(&cfg))]));
+        return Ok(());
+    }
+    match cfg {
+        Some(c) => {
+            println!("Loaded from: {}", c.source.as_ref().unwrap().display());
+            if let Some(n) = &c.name {
+                println!("  name      = {n}");
+            }
+            if let Some(e) = &c.env {
+                println!("  env       = {e}");
+            }
+            if !c.with.is_empty() {
+                println!("  with      = {:?}", c.with);
+            }
+            if !c.mount.is_empty() {
+                println!("  mount     = {:?}", c.mount);
+            }
+            if !c.env_file.is_empty() {
+                println!("  env_file  = {:?}", c.env_file);
+            }
+        }
+        None => {
+            println!("No pillbox.toml found between cwd and filesystem root.");
+            println!();
+            println!("Create one to set per-project defaults. Example:");
+            println!("  name = \"myapp\"");
+            println!("  env = \"dev\"");
+            println!("  with = [\"ANTHROPIC_API_KEY\"]");
+        }
+    }
+    Ok(())
+}
+
+fn config_json_payload(cfg: &Option<config::Config>) -> serde_json::Value {
+    let mut o = serde_json::Map::new();
+    let source = cfg
+        .as_ref()
+        .and_then(|c| c.source.as_ref())
+        .map(|p| serde_json::Value::String(p.display().to_string()))
+        .unwrap_or(serde_json::Value::Null);
+    o.insert("source".into(), source);
+    if let Some(c) = cfg {
+        if let Some(n) = &c.name {
+            o.insert("name".into(), serde_json::Value::String(n.clone()));
+        }
+        if let Some(e) = &c.env {
+            o.insert("env".into(), serde_json::Value::String(e.clone()));
+        }
+        o.insert("with".into(), json_string_array(&c.with));
+        o.insert("mount".into(), json_string_array(&c.mount));
+        o.insert("env_file".into(), json_string_array(&c.env_file));
+    }
+    serde_json::Value::Object(o)
+}
+
+fn json_string_array(items: &[String]) -> serde_json::Value {
+    serde_json::Value::Array(
+        items
+            .iter()
+            .map(|s| serde_json::Value::String(s.clone()))
+            .collect(),
+    )
 }
 
 fn build_auth_list_json() -> String {

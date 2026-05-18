@@ -282,6 +282,33 @@ pub(crate) struct RunOpts {
     pub(crate) args: Vec<String>,
 }
 
+impl RunOpts {
+    /// Layer `pillbox.toml` defaults under the CLI flags already present
+    /// in `self`. Single-value fields (`name`) only fill in if CLI didn't
+    /// supply one. Multi-value fields prepend the config's entries so CLI
+    /// entries land later in the env composition order (higher precedence).
+    pub(crate) fn apply_defaults(&mut self, cfg: crate::config::Config) {
+        if self.name.is_none() {
+            self.name = cfg.name;
+        }
+        prepend_vec(&mut self.mounts, cfg.mount);
+        prepend_vec(&mut self.withs, cfg.with);
+        if let Some(bundle) = cfg.env {
+            self.env_bundles.insert(0, bundle);
+        }
+        prepend_vec(
+            &mut self.env_files,
+            cfg.env_file.into_iter().map(PathBuf::from).collect(),
+        );
+    }
+}
+
+fn prepend_vec<T>(dst: &mut Vec<T>, src: Vec<T>) {
+    let cli = std::mem::take(dst);
+    *dst = src;
+    dst.extend(cli);
+}
+
 /// Compose the final env map applied to the run sandbox.
 ///
 /// Precedence (later layers override earlier ones, per AGENTS.md):

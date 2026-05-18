@@ -14,7 +14,10 @@ readme = "README.md"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
-dirs = "5"
+# Edit a single key in ~/.pillbox/data/claude/.claude.json after login
+# (see agents::finalize_claude_onboarding). Use the `Value` API only —
+# no derive macros, no `serde` crate dep.
+serde_json = "1"
 
 [profile.release]
 strip = true

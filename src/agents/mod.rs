@@ -41,6 +41,12 @@ pub struct AgentSpec {
     /// OAuth callback port the agent's login server binds. `None` for
     /// device-code flows. Override with `PILLBOX_<ID>_OAUTH_PORT`.
     pub(crate) oauth_port: Option<u16>,
+    /// Optional fix-up that runs on the *host* after a successful login.
+    /// Agents whose interactive TUI needs setup-marker files (e.g. claude's
+    /// `hasCompletedOnboarding`) wire one of these in. `None` means
+    /// `claude auth login` (or equivalent) wrote everything the agent
+    /// needs and no further fix-up is required.
+    pub(crate) post_login_finalize: Option<fn(&Path) -> Result<()>>,
 }
 
 pub const CLAUDE: AgentSpec = AgentSpec {
@@ -49,6 +55,7 @@ pub const CLAUDE: AgentSpec = AgentSpec {
     login_argv: &["claude", "auth", "login", "--claudeai"],
     run_argv: &["claude"],
     oauth_port: Some(54545),
+    post_login_finalize: Some(finalize_claude_onboarding),
 };
 
 // codex's default login binds a localhost callback on a port it picks
@@ -61,27 +68,58 @@ pub const CODEX: AgentSpec = AgentSpec {
     login_argv: &["codex", "login", "--device-auth"],
     run_argv: &["codex"],
     oauth_port: None,
+    post_login_finalize: None,
 };
 
 pub const ALL: &[&AgentSpec] = &[&CLAUDE, &CODEX];
 
+/// Set `hasCompletedOnboarding: true` in `~/.pillbox/data/claude/.claude.json`
+/// so claude's interactive TUI doesn't re-run its first-launch wizard
+/// (theme picker, login-method picker) on every `pillbox claude run`.
+/// The flag is normally set by clicking through the wizard end-to-end;
+/// `claude auth login` itself doesn't set it.
+fn finalize_claude_onboarding(home: &Path) -> Result<()> {
+    let path = home.join(".claude.json");
+    if !path.exists() {
+        // Claude wrote no profile file. Shouldn't happen after a
+        // successful auth login, but tolerate it rather than failing
+        // the whole login flow.
+        return Ok(());
+    }
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("read {}", path.display()))?;
+    let mut value: serde_json::Value = serde_json::from_str(&raw)
+        .with_context(|| format!("parse {}", path.display()))?;
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("expected top-level JSON object in {}", path.display()))?;
+    obj.insert(
+        "hasCompletedOnboarding".to_string(),
+        serde_json::Value::Bool(true),
+    );
+    let serialized = serde_json::to_string_pretty(&value)
+        .with_context(|| format!("serialize {}", path.display()))?;
+    fs::write(&path, serialized)
+        .with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
 impl AgentSpec {
-    pub fn id(&self) -> &'static str {
+    pub(crate) fn id(&self) -> &'static str {
         self.id
     }
 
     /// `~/.pillbox/data/<id>/` — created on first use.
-    pub fn home_dir(&self) -> Result<PathBuf> {
-        let base = dirs::home_dir()
-            .context("could not resolve $HOME")?
+    pub(crate) fn home_dir(&self) -> Result<PathBuf> {
+        let home = std::env::var("HOME").context("could not resolve $HOME")?;
+        Ok(PathBuf::from(home)
             .join(".pillbox")
             .join("data")
-            .join(self.id);
-        Ok(base)
+            .join(self.id))
     }
 
     /// Whether the agent has been logged in (cred sentinel present).
-    pub fn is_authenticated(&self) -> bool {
+    pub(crate) fn is_authenticated(&self) -> bool {
         match self.home_dir() {
             Ok(home) => home.join(self.cred_sentinel).exists(),
             Err(_) => false,
@@ -98,7 +136,7 @@ impl AgentSpec {
         Some(port)
     }
 
-    pub fn login(&self) -> Result<()> {
+    pub(crate) fn login(&self) -> Result<()> {
         docker::check_ready()?;
 
         let home = ensure_provider_home(self)?;
@@ -134,14 +172,16 @@ impl AgentSpec {
             ));
         }
 
-        // Mark provider-specific "I've onboarded the user" flags so the
-        // agent's interactive TUI doesn't re-prompt onboarding on every
-        // run. Skipped silently if the agent doesn't need any.
-        if let Err(e) = self.post_login_finalize(&home) {
-            eprintln!(
-                "pillbox: warning: could not finalize {} onboarding flags: {e}",
-                self.id
-            );
+        // Apply the agent's post-login fix-up if it has one (e.g. claude
+        // needs hasCompletedOnboarding: true so its TUI skips the wizard).
+        // Warning-only — login itself already succeeded.
+        if let Some(finalize) = self.post_login_finalize {
+            if let Err(e) = finalize(&home) {
+                eprintln!(
+                    "pillbox: warning: could not finalize {} setup: {e}",
+                    self.id
+                );
+            }
         }
 
         println!();
@@ -157,7 +197,7 @@ impl AgentSpec {
         Ok(())
     }
 
-    pub fn run(&self, opts: RunOpts) -> Result<()> {
+    pub(crate) fn run(&self, opts: RunOpts) -> Result<()> {
         docker::check_ready()?;
 
         let home = self.home_dir()?;
@@ -199,51 +239,8 @@ impl AgentSpec {
         Ok(())
     }
 
-    /// Per-agent post-login fix-ups. Claude's interactive TUI re-runs
-    /// its first-launch wizard ("Choose theme", "Select login method")
-    /// every session unless `~/.claude.json` has `hasCompletedOnboarding:
-    /// true`. The login flow doesn't set it — it's only set by clicking
-    /// through the wizard end-to-end. We set it directly after a
-    /// successful `claude auth login` so the next `pillbox claude run`
-    /// drops straight into a working REPL.
-    fn post_login_finalize(&self, home: &Path) -> Result<()> {
-        if self.id != "claude" {
-            return Ok(());
-        }
-        let claude_json = home.join(".claude.json");
-        if !claude_json.exists() {
-            // claude wrote no profile file — nothing to mark. Shouldn't
-            // happen since claude auth login always writes it, but be
-            // defensive.
-            return Ok(());
-        }
-        // Use jq inside a one-shot container — already in the image, no
-        // host Python/jq required. The edit is atomic via mv.
-        let one_liner =
-            "jq '.hasCompletedOnboarding = true' /home/lum/.claude.json > /tmp/x && \
-             mv /tmp/x /home/lum/.claude.json";
-        let args = [
-            "--rm".to_string(),
-            "-v".into(),
-            format!("{}:{GUEST_HOME}", home.display()),
-            "-e".into(),
-            format!("HOME={GUEST_HOME}"),
-            docker::RUNNER_IMAGE.into(),
-            "sh".into(),
-            "-c".into(),
-            one_liner.to_string(),
-        ];
-        let status = docker::run_interactive(&args)?;
-        if !status.success() {
-            return Err(anyhow!(
-                "post-login finalize (jq edit of .claude.json) failed: {status}"
-            ));
-        }
-        Ok(())
-    }
-
     /// Wipe the provider's persistent state. Used by `pillbox auth rm`.
-    pub fn forget(&self) -> Result<bool> {
+    pub(crate) fn forget(&self) -> Result<bool> {
         let home = self.home_dir()?;
         if !home.exists() {
             return Ok(false);
@@ -254,11 +251,11 @@ impl AgentSpec {
     }
 }
 
-pub struct RunOpts {
-    pub workspace: Option<PathBuf>,
-    pub name: Option<String>,
-    pub mounts: Vec<String>,
-    pub args: Vec<String>,
+pub(crate) struct RunOpts {
+    pub(crate) workspace: Option<PathBuf>,
+    pub(crate) name: Option<String>,
+    pub(crate) mounts: Vec<String>,
+    pub(crate) args: Vec<String>,
 }
 
 /// Ensure `~/.pillbox/data/<provider>/` exists with 0700 perms.
@@ -282,9 +279,12 @@ fn base_docker_args() -> Vec<String> {
         // Include $HOME/.local/bin so agents that self-update or look
         // for their own native install at the standard XDG-ish location
         // don't print "your PATH is missing ~/.local/bin" warnings.
-        // /usr/local/bin still ships the actual baked-in binaries.
+        // /usr/local/bin comes FIRST so the baked-in binaries win over
+        // anything an agent might write into its own persistent
+        // ~/.local/bin/ — defense against a future agent or its plugin
+        // silently overriding the runtime image.
         "-e".into(),
-        format!("PATH={GUEST_HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin"),
+        format!("PATH=/usr/local/bin:/usr/bin:/bin:{GUEST_HOME}/.local/bin"),
     ]
 }
 

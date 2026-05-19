@@ -232,23 +232,37 @@ impl AgentSpec {
         let workspace_name = workspace_mount_name(&workspace_host, opts.name.as_deref())?;
         let guest_workspace = format!("{GUEST_WORKSPACE}/{workspace_name}");
 
-        let env_vars = resolve_run_env(&opts)?;
+        if opts.vault && !self.vault_capable {
+            return Err(PillboxError::usage(
+                "run",
+                format!("--vault is not supported for `{}`", self.id),
+            )
+            .into());
+        }
 
-        // Start the vault proxy BEFORE assembling docker args so its mounts
-        // and env vars can be appended. The session is held until docker
-        // exits — drop order shuts the proxy down cleanly.
-        let vault_session = if opts.vault {
-            if !self.vault_capable {
-                return Err(PillboxError::usage(
-                    "run",
-                    format!("--vault is not supported for `{}`", self.id),
-                )
-                .into());
-            }
-            Some(crate::vault::VaultSession::start(self.id, &home)?)
+        // Resolve `--with` entries up front (one sidecar lookup per entry,
+        // shared across both the "needs session?" decision and the env
+        // resolution below). This avoids walking the list twice with a
+        // disk hit each time. The session may exist even when the agent
+        // isn't using OAuth — non-vault-capable agents can still benefit
+        // from API-key stub swap for `--with`'d secrets.
+        let withs_resolved = resolve_with_entries(&opts.withs)?;
+        let any_vaulted = withs_resolved.iter().any(|w| w.meta.is_some());
+        let mut vault_session = if opts.vault || any_vaulted {
+            let oauth = if opts.vault {
+                Some(crate::vault::OAuthAgent {
+                    agent_id: self.id,
+                    agent_home: &home,
+                })
+            } else {
+                None
+            };
+            Some(crate::vault::VaultSession::start(oauth)?)
         } else {
             None
         };
+
+        let env_vars = resolve_run_env(&opts, &withs_resolved, vault_session.as_mut())?;
 
         let mut args = base_docker_args();
         args.extend([
@@ -361,7 +375,44 @@ fn prepend_vec<T>(dst: &mut Vec<T>, src: Vec<T>) {
 /// Emits one `pillbox: note: ENVVAR shadowed by --with` line to stderr
 /// each time a higher-precedence layer overrides a lower one — visible
 /// to agents without spamming.
-fn resolve_run_env(opts: &RunOpts) -> Result<std::collections::BTreeMap<String, String>> {
+
+/// One `--with` entry resolved against the secrets store. `meta` is
+/// `Some` iff the secret has a `.meta.json` sidecar (i.e. it's vaulted).
+/// Computed once per run so resolve_run_env doesn't re-stat per entry,
+/// and so `run` can use the same data to decide whether to spin up a
+/// `VaultSession` (any `meta.is_some()` → need session).
+pub(crate) struct ResolvedWith {
+    pub(crate) secret_name: String,
+    pub(crate) env_var: String,
+    pub(crate) meta: Option<crate::vault::VaultMeta>,
+    pub(crate) raw_entry: String,
+}
+
+pub(crate) fn resolve_with_entries(withs: &[String]) -> Result<Vec<ResolvedWith>> {
+    let mut out = Vec::with_capacity(withs.len());
+    for entry in withs {
+        let (secret_name, env_var) = match entry.split_once('=') {
+            Some((s, e)) => (s.to_string(), e.to_string()),
+            None => (entry.clone(), entry.clone()),
+        };
+        // Propagate sidecar parse errors: silently treating a vaulted
+        // secret as plain would leak the real key into the guest.
+        let meta = crate::secrets::read_meta(&secret_name)?;
+        out.push(ResolvedWith {
+            secret_name,
+            env_var,
+            meta,
+            raw_entry: entry.clone(),
+        });
+    }
+    Ok(out)
+}
+
+fn resolve_run_env(
+    opts: &RunOpts,
+    withs: &[ResolvedWith],
+    mut vault: Option<&mut crate::vault::VaultSession>,
+) -> Result<std::collections::BTreeMap<String, String>> {
     use std::collections::BTreeMap;
     let mut env: BTreeMap<String, String> = BTreeMap::new();
 
@@ -403,21 +454,45 @@ fn resolve_run_env(opts: &RunOpts) -> Result<std::collections::BTreeMap<String, 
         }
     }
 
-    // Layer 3: --with entries.
-    for entry in &opts.withs {
-        let (secret_name, env_var) = match entry.split_once('=') {
-            Some((s, e)) => (s.to_string(), e.to_string()),
-            None => (entry.clone(), entry.clone()),
-        };
-        let value = crate::secrets::read(&secret_name)?.ok_or_else(|| {
+    // Layer 3: --with entries. The sidecar lookup already happened in
+    // `resolve_with_entries`; here we only need to read the real value
+    // and (if vaulted + session active) swap it for a stub. `opts.withs`
+    // is the raw input — the resolved view is what we iterate.
+    for w in withs {
+        let real_value = crate::secrets::read(&w.secret_name)?.ok_or_else(|| {
             PillboxError::runtime(
                 "run",
-                format!("secret `{secret_name}` not found"),
+                format!("secret `{}` not found", w.secret_name),
             )
-            .with_next(format!("pillbox secret add {secret_name}"))
+            .with_next(format!("pillbox secret add {}", w.secret_name))
         })?;
-        if let Some(_prev) = env.insert(env_var.clone(), value) {
-            eprintln!("pillbox: note: {env_var} shadowed by --with {entry}");
+
+        let injected = match (w.meta.as_ref(), vault.as_deref_mut()) {
+            (Some(meta), Some(session)) => {
+                // Strip trailing whitespace on the real value before
+                // handing it to the vault — same trim logic
+                // secrets::read uses internally (defensive: real_value
+                // already trimmed, but make explicit).
+                session.lease_api_key(&w.secret_name, real_value.trim_end(), meta)?
+            }
+            (Some(_meta), None) => {
+                // Vaulted secret but no session — shouldn't happen if
+                // `run` initialised the session correctly. Fail loudly
+                // rather than silently leaking the real key.
+                return Err(PillboxError::runtime(
+                    "run",
+                    format!(
+                        "secret `{}` is marked vaulted but no vault session is active",
+                        w.secret_name
+                    ),
+                )
+                .into());
+            }
+            (None, _) => real_value,
+        };
+
+        if let Some(_prev) = env.insert(w.env_var.clone(), injected) {
+            eprintln!("pillbox: note: {} shadowed by --with {}", w.env_var, w.raw_entry);
         }
     }
 
@@ -473,4 +548,185 @@ fn workspace_mount_name(host: &Path, override_name: Option<&str>) -> Result<Stri
         .filter(|s| !s.is_empty())
         .unwrap_or("workspace");
     Ok(derived.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::with_isolated_home;
+    use crate::vault::{HeaderScheme, OAuthAgent, VaultMeta, VaultSession};
+
+    fn run_opts_with_withs(withs: Vec<&str>) -> RunOpts {
+        RunOpts {
+            workspace: None,
+            name: None,
+            mounts: Vec::new(),
+            withs: withs.into_iter().map(String::from).collect(),
+            env_bundles: Vec::new(),
+            env_files: Vec::new(),
+            vault: false,
+            strict: false,
+            args: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn resolve_run_env_injects_plain_secret_without_vault_session() {
+        with_isolated_home("agents-plain", || {
+            crate::secrets::add(
+                "PLAIN_KEY",
+                crate::secrets::AddSource::EnvVar({
+                    std::env::set_var("__PILLBOX_TEST_PLAIN", "raw-value");
+                    "__PILLBOX_TEST_PLAIN".into()
+                }),
+                false,
+                None,
+            )
+            .unwrap();
+            std::env::remove_var("__PILLBOX_TEST_PLAIN");
+
+            let opts = run_opts_with_withs(vec!["PLAIN_KEY"]);
+            let withs = resolve_with_entries(&opts.withs).unwrap();
+            let env = resolve_run_env(&opts, &withs, None).unwrap();
+            assert_eq!(env.get("PLAIN_KEY").map(String::as_str), Some("raw-value"));
+        });
+    }
+
+    #[test]
+    fn resolve_run_env_swaps_vaulted_secret_for_stub() {
+        with_isolated_home("agents-vault", || {
+            // Stash a vaulted secret. Meta points to api.anthropic.com which
+            // is intercepted by the bundled AnthropicProvider.
+            std::env::set_var("__PILLBOX_TEST_VAULTED", "sk-ant-api03-REAL");
+            crate::secrets::add(
+                "VAULTED_KEY",
+                crate::secrets::AddSource::EnvVar("__PILLBOX_TEST_VAULTED".into()),
+                false,
+                Some(VaultMeta::new(
+                    "api.anthropic.com".into(),
+                    HeaderScheme::XApiKey,
+                    "sk-ant-api03-".into(),
+                )),
+            )
+            .unwrap();
+            std::env::remove_var("__PILLBOX_TEST_VAULTED");
+
+            // No OAuth — just a session that supports API-key leases.
+            let mut session = VaultSession::start(None::<OAuthAgent>).unwrap();
+            let opts = run_opts_with_withs(vec!["VAULTED_KEY"]);
+            let withs = resolve_with_entries(&opts.withs).unwrap();
+            let env = resolve_run_env(&opts, &withs, Some(&mut session)).unwrap();
+
+            let injected = env.get("VAULTED_KEY").cloned().unwrap();
+            // Stub mimics the prefix, NOT the real value.
+            assert!(injected.starts_with("sk-ant-api03-"), "got {injected}");
+            assert_ne!(injected, "sk-ant-api03-REAL");
+        });
+    }
+
+    #[test]
+    fn resolve_run_env_mixed_vaulted_and_plain() {
+        with_isolated_home("agents-mix", || {
+            // Plain secret.
+            std::env::set_var("__PILLBOX_TEST_MIX_P", "plain-val");
+            crate::secrets::add(
+                "MIX_PLAIN",
+                crate::secrets::AddSource::EnvVar("__PILLBOX_TEST_MIX_P".into()),
+                false,
+                None,
+            )
+            .unwrap();
+            std::env::remove_var("__PILLBOX_TEST_MIX_P");
+            // Vaulted secret.
+            std::env::set_var("__PILLBOX_TEST_MIX_V", "ghp_REAL_token");
+            crate::secrets::add(
+                "MIX_VAULTED",
+                crate::secrets::AddSource::EnvVar("__PILLBOX_TEST_MIX_V".into()),
+                false,
+                Some(VaultMeta::new(
+                    "api.github.com".into(),
+                    HeaderScheme::AuthorizationBearer,
+                    "ghp_".into(),
+                )),
+            )
+            .unwrap();
+            std::env::remove_var("__PILLBOX_TEST_MIX_V");
+
+            let mut session = VaultSession::start(None::<OAuthAgent>).unwrap();
+            let opts = run_opts_with_withs(vec!["MIX_PLAIN", "MIX_VAULTED=GITHUB_TOKEN"]);
+            let withs = resolve_with_entries(&opts.withs).unwrap();
+            let env = resolve_run_env(&opts, &withs, Some(&mut session)).unwrap();
+
+            assert_eq!(env.get("MIX_PLAIN").map(String::as_str), Some("plain-val"));
+            let stub = env.get("GITHUB_TOKEN").cloned().unwrap();
+            assert!(stub.starts_with("ghp_"));
+            assert_ne!(stub, "ghp_REAL_token");
+        });
+    }
+
+    #[test]
+    fn resolve_run_env_vaulted_without_session_errors_loudly() {
+        with_isolated_home("agents-novault", || {
+            std::env::set_var("__PILLBOX_TEST_NOV", "REAL");
+            crate::secrets::add(
+                "NO_SESSION_KEY",
+                crate::secrets::AddSource::EnvVar("__PILLBOX_TEST_NOV".into()),
+                false,
+                Some(VaultMeta::new(
+                    "api.openai.com".into(),
+                    HeaderScheme::AuthorizationBearer,
+                    "sk-".into(),
+                )),
+            )
+            .unwrap();
+            std::env::remove_var("__PILLBOX_TEST_NOV");
+
+            let opts = run_opts_with_withs(vec!["NO_SESSION_KEY"]);
+            let withs = resolve_with_entries(&opts.withs).unwrap();
+            let err = resolve_run_env(&opts, &withs, None).unwrap_err();
+            let s = format!("{err}");
+            assert!(s.contains("vaulted"), "expected vaulted error, got: {s}");
+        });
+    }
+
+    #[test]
+    fn resolve_with_entries_detects_meta_sidecar() {
+        with_isolated_home("agents-detect", || {
+            std::env::set_var("__PILLBOX_TEST_DETECT_A", "v");
+            crate::secrets::add(
+                "DETECT_PLAIN",
+                crate::secrets::AddSource::EnvVar("__PILLBOX_TEST_DETECT_A".into()),
+                false,
+                None,
+            )
+            .unwrap();
+            std::env::set_var("__PILLBOX_TEST_DETECT_B", "v");
+            crate::secrets::add(
+                "DETECT_VAULTED",
+                crate::secrets::AddSource::EnvVar("__PILLBOX_TEST_DETECT_B".into()),
+                false,
+                Some(VaultMeta::new(
+                    "api.anthropic.com".into(),
+                    HeaderScheme::XApiKey,
+                    "sk-ant-api03-".into(),
+                )),
+            )
+            .unwrap();
+            std::env::remove_var("__PILLBOX_TEST_DETECT_A");
+            std::env::remove_var("__PILLBOX_TEST_DETECT_B");
+
+            let plain = resolve_with_entries(&["DETECT_PLAIN".into()]).unwrap();
+            assert!(plain[0].meta.is_none());
+
+            let vaulted = resolve_with_entries(&["DETECT_VAULTED".into()]).unwrap();
+            assert!(vaulted[0].meta.is_some());
+
+            let mixed = resolve_with_entries(&[
+                "DETECT_PLAIN".into(),
+                "DETECT_VAULTED=GITHUB_TOKEN".into(),
+            ])
+            .unwrap();
+            assert!(mixed.iter().any(|w| w.meta.is_some()));
+        });
+    }
 }

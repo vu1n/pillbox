@@ -18,12 +18,23 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use hudsucker::{
-    hyper::{Request, Response, StatusCode},
+    hyper::{header::HeaderValue, Request, Response, StatusCode},
     Body, RequestOrResponse,
 };
 
 pub(crate) mod anthropic;
 pub(crate) mod codex;
+pub(crate) mod github;
+pub(crate) mod openai;
+
+/// Marker provider_id for entries minted by `Server::lease_api_key`.
+/// These don't correspond to a [`VaultProvider`] — they're plain
+/// stub→real string mappings used by the per-host providers'
+/// `handle_request` to swap `x-api-key`/`Authorization: Bearer` headers.
+///
+/// The shape of `SandboxData::real` for these entries is:
+/// `{"name": "<env var name>", "value": "<real key>"}`.
+pub(crate) const API_KEY_PROVIDER_ID: &str = "api-key";
 
 use super::server::ServerInner;
 
@@ -114,6 +125,20 @@ impl Registry {
     pub(crate) fn stubs_for(&self, sandbox_id: &str) -> Option<&[String]> {
         self.by_sandbox.get(sandbox_id).map(|d| d.stubs.as_slice())
     }
+
+    /// Resolve `stub` to the real API-key value previously registered via
+    /// `Server::lease_api_key`. Returns `None` if the stub isn't known, or
+    /// if it's known but belongs to a non-API-key (e.g. OAuth) entry.
+    pub(crate) fn api_key_real_for_stub(&self, stub: &str) -> Option<&str> {
+        let sandbox_id = self.by_stub.get(stub)?;
+        let data = self.by_sandbox.get(sandbox_id)?;
+        if data.provider_id != API_KEY_PROVIDER_ID {
+            return None;
+        }
+        data.real
+            .get("value")
+            .and_then(|v| v.as_str())
+    }
 }
 
 /// Provider contract. A provider is a stateless dispatcher: it takes the
@@ -174,6 +199,8 @@ pub(crate) fn registry() -> Vec<Box<dyn VaultProvider>> {
     vec![
         Box::new(anthropic::AnthropicProvider),
         Box::new(codex::CodexProvider),
+        Box::new(openai::OpenAiApiKeyProvider),
+        Box::new(github::GithubProvider),
     ]
 }
 
@@ -227,6 +254,91 @@ pub(crate) fn mint_stub(prefix: &str, sandbox_id: &str) -> String {
         uuid::Uuid::now_v7().simple(),
         uuid::Uuid::now_v7().simple()
     )
+}
+
+/// Guest-relative path the API-key providers (openai, github,
+/// anthropic-api-key branch) would mount their creds file to. None of
+/// them actually mount a file — the real key travels via `--with`-
+/// injected env vars — so this is purely here to satisfy the trait's
+/// `creds_path`. Pillbox never reads it for API-key entries.
+pub(crate) const API_KEY_UNUSED_CREDS_PATH: &str = ".pillbox/api-key-no-file";
+
+/// Error returned from an API-key provider's `provision`. These
+/// providers are intentionally not OAuth-shaped — callers must use
+/// [`super::server::Server::lease_api_key`] instead.
+pub(crate) fn provision_is_api_key_only(provider_label: &str) -> Result<String, String> {
+    Err(format!(
+        "{provider_label} provider is API-key only: use Server::lease_api_key, \
+         not the OAuth-shaped provision path"
+    ))
+}
+
+/// Outcome of an API-key header swap.
+pub(crate) enum ApiKeySwap {
+    /// Header rewritten in place with the supplied scheme/value.
+    Swapped(HeaderValue),
+    /// Bearer/token-shaped, but the stub isn't in the registry.
+    /// The provider should pass the request through unchanged — a
+    /// `--with`'d real key (no vault meta) is a legitimate case.
+    PassThrough,
+    /// The header value isn't valid UTF-8 (or the rebuilt value isn't a
+    /// valid HTTP header). Caller should 401 with the supplied detail.
+    Unauthorized(&'static str),
+}
+
+/// Resolve a stub → real lookup for an `Authorization`-style header and
+/// return the rebuilt header value with the supplied `scheme` ("Bearer"
+/// for OpenAI / modern GitHub PATs, "token" for legacy GitHub clients).
+///
+/// `header_value` is the raw inbound header. If it doesn't start with
+/// `scheme + " "` the caller must dispatch differently — this helper
+/// is the swap step, not the parse step.
+pub(crate) fn swap_bearer_style(
+    header_value: &HeaderValue,
+    scheme: &str,
+    server: &ServerInner,
+) -> ApiKeySwap {
+    let Ok(auth_str) = header_value.to_str() else {
+        return ApiKeySwap::Unauthorized("non-utf8 authorization");
+    };
+    let prefix = format!("{scheme} ");
+    let Some(stub) = auth_str.strip_prefix(prefix.as_str()) else {
+        return ApiKeySwap::PassThrough;
+    };
+    let real = {
+        let registry = server.registry_lock();
+        registry.api_key_real_for_stub(stub).map(str::to_owned)
+    };
+    let Some(real) = real else {
+        return ApiKeySwap::PassThrough;
+    };
+    match HeaderValue::from_str(&format!("{scheme} {real}")) {
+        Ok(hv) => ApiKeySwap::Swapped(hv),
+        Err(_) => ApiKeySwap::Unauthorized("invalid real token"),
+    }
+}
+
+/// Equivalent of `swap_bearer_style` for raw-value headers like
+/// Anthropic's `x-api-key`, where the header value IS the stub (no
+/// scheme prefix).
+pub(crate) fn swap_raw_header(
+    header_value: &HeaderValue,
+    server: &ServerInner,
+) -> ApiKeySwap {
+    let Ok(stub) = header_value.to_str() else {
+        return ApiKeySwap::Unauthorized("non-utf8 header");
+    };
+    let real = {
+        let registry = server.registry_lock();
+        registry.api_key_real_for_stub(stub).map(str::to_owned)
+    };
+    let Some(real) = real else {
+        return ApiKeySwap::PassThrough;
+    };
+    match HeaderValue::from_str(&real) {
+        Ok(hv) => ApiKeySwap::Swapped(hv),
+        Err(_) => ApiKeySwap::Unauthorized("invalid real token"),
+    }
 }
 
 #[cfg(test)]

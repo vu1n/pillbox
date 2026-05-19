@@ -81,7 +81,10 @@ pillbox: note: ANTHROPIC_API_KEY shadowed by --with
 | `pillbox secret add NAME` | Read value from stdin, store at `~/.pillbox/secrets/NAME` (0600). Overwrites silently. |
 | `pillbox secret add NAME --from-env VAR` | Read value from `$VAR` in the host environment |
 | `pillbox secret add NAME --if-not-exists` | Exit 1 if NAME already exists (use to gate "create-only" agent flows) |
-| `pillbox secret list [--json]` | List secret names |
+| `pillbox secret add NAME --vault` | Mark the secret for stub-swap at injection time. For known names (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GITHUB_TOKEN`/`GH_TOKEN`) host + header scheme + prefix come from the built-in registry. |
+| `pillbox secret add NAME --vault --maps-to KNOWN` | Use a known name's host/scheme/prefix for a custom-named secret. |
+| `pillbox secret add NAME --vault --host H --header-scheme {x-api-key\|authorization-bearer} --prefix P` | Vault metadata for an unknown name. |
+| `pillbox secret list [--json]` | List secret names; vaulted entries annotated with `host / scheme`. |
 | `pillbox secret show NAME [--json]` | Show NAME's value, **masked by default** (`sk-ant-***`) |
 | `pillbox secret show NAME --reveal` | Show plain value. Refuses if stdout is not a TTY unless `--to-stdout` is also passed. |
 | `pillbox secret rm NAME` | Delete the secret |
@@ -158,17 +161,23 @@ All `--json` outputs include a `version` field. Add fields freely in future rele
 
 ```jsonc
 // pillbox secret list --json
+// `vault` is omitted on entries without a .meta.json sidecar.
 {
   "version": 1,
-  "secrets": [{ "name": "ANTHROPIC_API_KEY", "created_at": "2026-05-18T03:24:08Z" }]
+  "secrets": [
+    { "name": "OPENAI_API_KEY" },
+    { "name": "ANTHROPIC_API_KEY",
+      "vault": { "host": "api.anthropic.com", "header_scheme": "x-api-key" } }
+  ]
 }
 
 // pillbox secret show NAME --json
+// `vault` block present iff the secret has a .meta.json sidecar.
 {
   "version": 1,
   "name": "ANTHROPIC_API_KEY",
   "value": "sk-ant-***",       // masked unless --reveal
-  "created_at": "2026-05-18T03:24:08Z"
+  "vault": { "host": "api.anthropic.com", "header_scheme": "x-api-key", "prefix": "sk-ant-api03-" }
 }
 
 // pillbox env list --json

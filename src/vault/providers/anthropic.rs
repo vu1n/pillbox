@@ -19,7 +19,8 @@ use hudsucker::{
 use serde::Deserialize;
 
 use super::{
-    host_from_uri, mint_stub, unauthorized, PendingFlow, Registry, SandboxData, VaultProvider,
+    host_from_uri, mint_stub, swap_raw_header, unauthorized, ApiKeySwap, PendingFlow, Registry,
+    SandboxData, VaultProvider,
 };
 use crate::vault::server::ServerInner;
 
@@ -290,7 +291,28 @@ async fn handle_oauth_request(
     Request::from_parts(parts, Body::from(new_body)).into()
 }
 
+/// Two flows can target `api.anthropic.com`:
+///  - Claude Code's OAuth path: `Authorization: Bearer <stub>` (the
+///    accessToken family minted by `provision`).
+///  - A `--with ANTHROPIC_API_KEY --vault`'d request: `x-api-key: <stub>`
+///    minted by `Server::lease_api_key`.
+///
+/// We dispatch by which header is present. If neither carries one of
+/// ours, we pass through (lets unvaulted `--with` requests keep working).
 async fn handle_api_request(
+    req: Request<Body>,
+    server: &ServerInner,
+) -> RequestOrResponse {
+    let has_x_api_key = req.headers().get(X_API_KEY_HEADER).is_some();
+    if has_x_api_key {
+        return handle_api_request_x_api_key(req, server).await;
+    }
+    handle_api_request_bearer(req, server).await
+}
+
+const X_API_KEY_HEADER: &str = "x-api-key";
+
+async fn handle_api_request_bearer(
     req: Request<Body>,
     server: &ServerInner,
 ) -> RequestOrResponse {
@@ -334,6 +356,26 @@ async fn handle_api_request(
     }
 
     Request::from_parts(parts, body).into()
+}
+
+async fn handle_api_request_x_api_key(
+    req: Request<Body>,
+    server: &ServerInner,
+) -> RequestOrResponse {
+    let (mut parts, body) = req.into_parts();
+    let Some(header_value) = parts.headers.get(X_API_KEY_HEADER).cloned() else {
+        return Request::from_parts(parts, body).into();
+    };
+    match swap_raw_header(&header_value, server) {
+        ApiKeySwap::Swapped(hv) => {
+            parts.headers.insert(X_API_KEY_HEADER, hv);
+            Request::from_parts(parts, body).into()
+        }
+        // Pass through preserves the unvaulted `--with ANTHROPIC_API_KEY`
+        // path (real key already in place, nothing to swap).
+        ApiKeySwap::PassThrough => Request::from_parts(parts, body).into(),
+        ApiKeySwap::Unauthorized(detail) => unauthorized(detail).into(),
+    }
 }
 
 fn stubs_for(registry: &Registry, sandbox_id: &str) -> Option<(String, String)> {
@@ -430,6 +472,38 @@ mod tests {
         assert_eq!(
             AnthropicProvider.creds_path(),
             Path::new(".claude/.credentials.json")
+        );
+    }
+
+    #[test]
+    fn api_key_branch_resolves_via_registry() {
+        use crate::vault::providers::{SandboxData, API_KEY_PROVIDER_ID};
+
+        let mut r = Registry::new();
+        let stub = "sk-ant-api03-stubvalue";
+        r.insert(
+            "sbx-apikey".into(),
+            SandboxData {
+                provider_id: API_KEY_PROVIDER_ID,
+                real: serde_json::json!({
+                    "name": "ANTHROPIC_API_KEY",
+                    "value": "sk-ant-api03-REAL-secret"
+                }),
+                stubs: vec![stub.into()],
+            },
+        );
+        // The Anthropic provider should look this up via
+        // `api_key_real_for_stub` even though the entry was minted
+        // outside the OAuth `provision` path.
+        assert_eq!(
+            r.api_key_real_for_stub(stub),
+            Some("sk-ant-api03-REAL-secret"),
+        );
+        // OAuth-style real lookup should NOT pick it up (different shape).
+        assert!(
+            r.real("sbx-apikey")
+                .and_then(|v| v.pointer("/claudeAiOauth/accessToken"))
+                .is_none()
         );
     }
 }

@@ -53,14 +53,20 @@ The CA persists across runs — sandboxes share the trust root.
 | `codex` agent, ChatGPT-mode OAuth tokens (`tokens` block) | ✅ (v0.5) |
 | `chatgpt.com`, `chat.openai.com` request headers | ✅ Stub → real swap (v0.5) |
 | `auth.openai.com/oauth/token` (rotation) | ✅ Real → stub swap inbound (v0.5) |
-| `codex` ApiKey mode (`OPENAI_API_KEY` in auth.json) | ❌ — API-key vault track |
-| Anthropic API keys (`x-api-key` header via `--with`) | ❌ — API-key vault track |
-| GitHub PATs | ❌ — separate provider track |
-| `api.openai.com` and all other hosts | Pass through unmodified |
+| `codex` ApiKey mode (`OPENAI_API_KEY` in auth.json) | ❌ — use `--with OPENAI_API_KEY` via the secret-vault path instead |
+| Anthropic API keys (`x-api-key` header via `--with`) | ✅ (v0.5) — see [secrets.md](./secrets.md#vaulted-secrets) |
+| OpenAI API keys (`Authorization: Bearer` to api.openai.com via `--with`) | ✅ (v0.5) |
+| GitHub PATs (`Authorization: Bearer` / `token` to api.github.com via `--with`) | ✅ (v0.5) |
+| All other hosts | Pass through unmodified |
 
-Running `--vault` for an agent that isn't `vault_capable` errors with
-exit 2 (usage error). Codex with ApiKey-mode `auth.json` is rejected at
-provisioning with a clear pointer to the API-key vault track.
+Two vault flavors:
+
+- **Agent OAuth** (`pillbox claude run --vault`, `pillbox codex run --vault`): proxy provisions a stub credentials FILE bind-mounted over the agent's real auth file. One lease per `--vault` run.
+- **Secret API key** (`pillbox secret add NAME --vault` then `pillbox <agent> run --with NAME`): proxy provisions a stub VALUE injected as an env var in place of the real secret. One lease per vaulted `--with` per run.
+
+Both kinds coexist in the same run — e.g. `pillbox claude run --vault --with ANTHROPIC_API_KEY` runs claude with vaulted OAuth tokens AND a vaulted API key on the same `api.anthropic.com` host. AnthropicProvider branches by header (`Authorization: Bearer` → OAuth, `x-api-key` → API key).
+
+Running `--vault` for an agent that isn't `vault_capable` errors with exit 2.
 
 ## Architecture
 

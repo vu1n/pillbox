@@ -1,8 +1,32 @@
-//! Shared `~/.pillbox/` directory helpers. Every creator goes through
-//! here so the parent's perms get pinned to 0700 on every touch
-//! (`fs::create_dir_all` uses the process umask, typically 022 → 755).
+//! Shared `~/.pillbox/` directory helpers.
+//!
+//! v0.6 layout — pillbox is now a bundle, not a flat namespace:
+//!
+//! ```text
+//! ~/.pillbox/                   (0700)
+//! ├── global/                   (0700)         — global pillbox
+//! │   ├── secrets/
+//! │   ├── env/
+//! │   ├── auth/{claude,codex}/  — agent OAuth state, shared across projects
+//! │   └── vault/                — CA + key
+//! └── projects/                 (0700)
+//!     └── -Users-vuln-code-foo/ — one per dir with pillbox.toml
+//!         ├── meta.json
+//!         ├── secrets/          — overrides global on key conflict
+//!         ├── env/
+//!         ├── auth/             — reserved (per-project auth deferred to v0.7)
+//!         └── vault/
+//! ```
+//!
+//! Every creator goes through here so the parent's perms get pinned to
+//! 0700 on every touch (`fs::create_dir_all` uses the process umask,
+//! typically 022 → 755).
 
-use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result};
 
@@ -27,21 +51,23 @@ pub(crate) fn validate_name(action: &'static str, name: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn data_root() -> Result<PathBuf> {
+/// `~/.pillbox/` itself — 0700, created lazily. Every per-scope dir
+/// (`global/`, `projects/<key>/`) sits under this.
+pub(crate) fn pillbox_root() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("could not resolve $HOME")?;
     let root = PathBuf::from(home).join(".pillbox");
     fs::create_dir_all(&root).with_context(|| format!("create {}", root.display()))?;
-    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("chmod {} 0700", root.display()))?;
+    ensure_mode_0700(&root)?;
     Ok(root)
 }
 
-pub(crate) fn data_subdir(name: &str) -> Result<PathBuf> {
-    let dir = data_root()?.join(name);
-    fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("chmod {} 0700", dir.display()))?;
-    Ok(dir)
+/// Idempotently apply 0700 perms to a directory we created or expect to
+/// own. Called on every touch so a stray `chmod -R 755` somewhere else
+/// gets tightened back on the next pillbox invocation.
+pub(crate) fn ensure_mode_0700(p: &Path) -> Result<()> {
+    fs::set_permissions(p, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("chmod {} 0700", p.display()))?;
+    Ok(())
 }
 
 /// Serialize a pillbox JSON output with the standard `version: 1`
@@ -54,6 +80,24 @@ pub(crate) fn json_v1(fields: Vec<(&'static str, serde_json::Value)>) -> String 
         root.insert(k.into(), v);
     }
     serde_json::Value::Object(root).to_string()
+}
+
+/// Subdirectory names that, if present at the top level of `~/.pillbox/`,
+/// indicate a v0.5 install. v0.6 keeps the same names but only under
+/// `global/` and `projects/<key>/`, so a top-level hit is a clean signal
+/// without false positives. Used by `pillbox` (init/lifecycle guards) and
+/// `doctor` (warning surface). Single source so the two stay in sync.
+pub(crate) const V0_5_LEGACY_SUBDIRS: &[&str] = &["data", "secrets", "env", "vault"];
+
+/// Returns the legacy v0.5 subdir names that exist directly under `root`.
+/// `root` is expected to be `~/.pillbox/`. Empty vec means no legacy
+/// layout detected.
+pub(crate) fn detect_legacy_subdirs(root: &Path) -> Vec<&'static str> {
+    V0_5_LEGACY_SUBDIRS
+        .iter()
+        .copied()
+        .filter(|name| root.join(name).is_dir())
+        .collect()
 }
 
 /// Process-wide lock for tests that mutate `$HOME`. Shared so tests

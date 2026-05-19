@@ -1,18 +1,14 @@
 //! Per-agent adapters.
 //!
-//! Each agent gets a persistent HOME directory at
-//! `~/.pillbox/data/<provider>/` on the host. That directory is
-//! bind-mounted at `/home/lum` (the guest's HOME) for both login and
-//! run. Whatever the agent writes — `.credentials.json`, `.claude.json`,
-//! `.codex/auth.json`, settings, refresh tokens — persists there
-//! naturally. No tempdir capture/restore, no JSON bundling, no
-//! keychain dance.
+//! v0.6: each agent's persistent HOME ("auth state") lives under the
+//! resolved auth pillbox. PR 2 always resolves to the **global** pillbox
+//! — one `claude login` is shared across every project pillbox. v0.7 may
+//! expose a per-project auth override if real signal materializes.
 //!
-//! Tradeoff vs. an OS-keychain-based approach: auth state lives as
-//! plain files under `~/.pillbox/`, readable by anyone with access to
-//! the user's home directory. For laptop dev use that's the same
-//! posture as `~/.aws/credentials` or `~/.docker/config.json` — fine.
-//! For shared / hostile-tenant scenarios it's not.
+//! Storage shape: `<auth_pillbox>/auth/<provider>/`. That directory is
+//! bind-mounted at `/home/lum` (the guest's HOME) for both login and run.
+//! Whatever the agent writes — `.credentials.json`, settings, refresh
+//! tokens — persists there naturally.
 
 use std::{
     fs,
@@ -22,6 +18,7 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 
+use crate::pillbox::{self, Pillbox};
 use crate::{docker, errors::PillboxError};
 
 pub(crate) const GUEST_HOME: &str = "/home/lum";
@@ -29,28 +26,12 @@ pub(crate) const GUEST_WORKSPACE: &str = "/workspace";
 
 #[derive(Clone, Copy)]
 pub struct AgentSpec {
-    /// Provider id — CLI subject + data directory name (e.g. `claude`).
     pub(crate) id: &'static str,
-    /// File (relative to HOME) that must exist after login for it to be
-    /// considered successful.
     pub(crate) cred_sentinel: &'static str,
-    /// argv for the login flow.
     pub(crate) login_argv: &'static [&'static str],
-    /// argv prefix for the run flow. User args are appended.
     pub(crate) run_argv: &'static [&'static str],
-    /// OAuth callback port the agent's login server binds. `None` for
-    /// device-code flows. Override with `PILLBOX_<ID>_OAUTH_PORT`.
     pub(crate) oauth_port: Option<u16>,
-    /// Optional fix-up that runs on the *host* after a successful login.
-    /// Agents whose interactive TUI needs setup-marker files (e.g. claude's
-    /// `hasCompletedOnboarding`) wire one of these in. `None` means
-    /// `claude auth login` (or equivalent) wrote everything the agent
-    /// needs and no further fix-up is required.
     pub(crate) post_login_finalize: Option<fn(&Path) -> Result<()>>,
-    /// Whether `pillbox <agent> run --vault` is supported. The vault
-    /// provider for the agent is looked up by [`Self::id`] —
-    /// `vault_capable = true` requires a matching entry in
-    /// `vault::providers::registry()`.
     pub(crate) vault_capable: bool,
 }
 
@@ -64,10 +45,6 @@ pub const CLAUDE: AgentSpec = AgentSpec {
     vault_capable: true,
 };
 
-// codex's default login binds a localhost callback on a port it picks
-// (observed: 1455) which the sandbox can't expose. --device-auth is
-// codex's headless mode: URL + code in the terminal, user pastes in
-// browser, codex polls. No port forward.
 pub const CODEX: AgentSpec = AgentSpec {
     id: "codex",
     cred_sentinel: ".codex/auth.json",
@@ -75,24 +52,14 @@ pub const CODEX: AgentSpec = AgentSpec {
     run_argv: &["codex"],
     oauth_port: None,
     post_login_finalize: None,
-    // v0.5: vault supports codex ChatGPT-mode auth.json. ApiKey-mode
-    // auth.json is rejected at lease time (see vault::providers::codex).
     vault_capable: true,
 };
 
 pub const ALL: &[&AgentSpec] = &[&CLAUDE, &CODEX];
 
-/// Set `hasCompletedOnboarding: true` in `~/.pillbox/data/claude/.claude.json`
-/// so claude's interactive TUI doesn't re-run its first-launch wizard
-/// (theme picker, login-method picker) on every `pillbox claude run`.
-/// The flag is normally set by clicking through the wizard end-to-end;
-/// `claude auth login` itself doesn't set it.
 fn finalize_claude_onboarding(home: &Path) -> Result<()> {
     let path = home.join(".claude.json");
     if !path.exists() {
-        // Claude wrote no profile file. Shouldn't happen after a
-        // successful auth login, but tolerate it rather than failing
-        // the whole login flow.
         return Ok(());
     }
     let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
@@ -116,18 +83,26 @@ impl AgentSpec {
         self.id
     }
 
-    /// `~/.pillbox/data/<id>/` — created on first use.
-    pub(crate) fn home_dir(&self) -> Result<PathBuf> {
-        let home = std::env::var("HOME").context("could not resolve $HOME")?;
-        Ok(PathBuf::from(home)
-            .join(".pillbox")
-            .join("data")
-            .join(self.id))
+    /// Resolve the auth pillbox for this agent. PR 2: always global. PR 3+
+    /// may consult the resolved pillbox's `[auth]` config to opt into a
+    /// per-project override.
+    pub(crate) fn auth_pillbox(&self, _resolved: &Pillbox) -> Pillbox {
+        pillbox::global()
     }
 
-    /// Whether the agent has been logged in (cred sentinel present).
-    pub(crate) fn is_authenticated(&self) -> bool {
-        match self.home_dir() {
+    /// `<auth_pillbox>/auth/<id>/` — created on first use, 0700.
+    pub(crate) fn home_dir(&self, resolved: &Pillbox) -> Result<PathBuf> {
+        let auth = self.auth_pillbox(resolved);
+        let auth_root = auth.subdir("auth")?;
+        let dir = auth_root.join(self.id);
+        fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("chmod {} 0700", dir.display()))?;
+        Ok(dir)
+    }
+
+    pub(crate) fn is_authenticated(&self, resolved: &Pillbox) -> bool {
+        match self.home_dir(resolved) {
             Ok(home) => home.join(self.cred_sentinel).exists(),
             Err(_) => false,
         }
@@ -143,10 +118,10 @@ impl AgentSpec {
         Some(port)
     }
 
-    pub(crate) fn login(&self) -> Result<()> {
+    pub(crate) fn login(&self, resolved: &Pillbox) -> Result<()> {
         docker::check_ready()?;
 
-        let home = ensure_provider_home(self)?;
+        let home = self.home_dir(resolved)?;
 
         let mut args = base_docker_args();
         if let Some(port) = self.resolved_oauth_port() {
@@ -168,7 +143,7 @@ impl AgentSpec {
                 "login",
                 format!("{} exited with status {status}", self.id),
             )
-            .with_next(format!("pillbox {} login", self.id))
+            .with_next(format!("pillbox auth login --agent {}", self.id))
             .into());
         }
 
@@ -182,15 +157,12 @@ impl AgentSpec {
                 ),
             )
             .with_next(format!(
-                "pillbox {} login   # check the sandbox output above for clues",
+                "pillbox auth login --agent {}   # check the sandbox output above for clues",
                 self.id
             ))
             .into());
         }
 
-        // Apply the agent's post-login fix-up if it has one (e.g. claude
-        // needs hasCompletedOnboarding: true so its TUI skips the wizard).
-        // Warning-only — login itself already succeeded.
         if let Some(finalize) = self.post_login_finalize {
             if let Err(e) = finalize(&home) {
                 eprintln!(
@@ -207,15 +179,14 @@ impl AgentSpec {
             home.display()
         );
         println!(
-            "pillbox: try `pillbox {} run` to launch it in a sandboxed shell.",
+            "pillbox: try `pillbox run --agent {}` to launch it.",
             self.id
         );
         Ok(())
     }
 
-    /// Wipe the provider's persistent state. Used by `pillbox auth rm`.
-    pub(crate) fn forget(&self) -> Result<bool> {
-        let home = self.home_dir()?;
+    pub(crate) fn forget(&self, resolved: &Pillbox) -> Result<bool> {
+        let home = self.home_dir(resolved)?;
         if !home.exists() {
             return Ok(false);
         }
@@ -230,58 +201,28 @@ pub(crate) struct RunOpts {
     pub(crate) mounts: Vec<String>,
     /// `--with NAME[=ENV_VAR]` entries (parsed from raw CLI strings)
     pub(crate) withs: Vec<String>,
-    /// `--env BUNDLE` names (stored env bundles to inject)
+    /// `--env BUNDLE` names
     pub(crate) env_bundles: Vec<String>,
-    /// `--env-file PATH` paths (ad-hoc .env files to inject, no persistence)
+    /// `--env-file PATH` paths (ad-hoc, no persistence)
     pub(crate) env_files: Vec<PathBuf>,
     /// `--vault` — route API traffic through the pillbox stub-swap proxy.
     pub(crate) vault: bool,
     pub(crate) args: Vec<String>,
 }
 
+#[allow(dead_code)]
 impl RunOpts {
-    /// Layer `pillbox.toml` defaults under the CLI flags already present
-    /// in `self`. Single-value fields (`name`) only fill in if CLI didn't
-    /// supply one. Multi-value fields prepend the config's entries so CLI
-    /// entries land later in the env composition order (higher precedence).
+    /// In v0.6 PR 2, the only pillbox.toml field that backs a RunOpts
+    /// default is `name`. Multi-value defaults from v0.5 (`with`, `mount`,
+    /// `env_file`, `env`) are dropped — they didn't carry their weight
+    /// and made the descriptor sprawl.
     pub(crate) fn apply_defaults(&mut self, cfg: crate::config::Config) {
         if self.name.is_none() {
             self.name = cfg.name;
         }
-        prepend_vec(&mut self.mounts, cfg.mount);
-        prepend_vec(&mut self.withs, cfg.with);
-        if let Some(bundle) = cfg.env {
-            self.env_bundles.insert(0, bundle);
-        }
-        prepend_vec(
-            &mut self.env_files,
-            cfg.env_file.into_iter().map(PathBuf::from).collect(),
-        );
     }
 }
 
-fn prepend_vec<T>(dst: &mut Vec<T>, src: Vec<T>) {
-    let cli = std::mem::take(dst);
-    *dst = src;
-    dst.extend(cli);
-}
-
-/// Compose the final env map applied to the run sandbox.
-///
-/// Precedence (later layers override earlier ones, per AGENTS.md):
-///   1. `--env <bundle>` (lowest)
-///   2. `--env-file <path>`
-///   3. `--with NAME[=ENV_VAR]` (highest)
-///
-/// Emits one `pillbox: note: ENVVAR shadowed by --with` line to stderr
-/// each time a higher-precedence layer overrides a lower one — visible
-/// to agents without spamming.
-///
-/// One `--with` entry resolved against the secrets store. `meta` is
-/// `Some` iff the secret has a `.meta.json` sidecar (i.e. it's vaulted).
-/// Computed once per run so resolve_run_env doesn't re-stat per entry,
-/// and so `run` can use the same data to decide whether to spin up a
-/// `VaultSession` (any `meta.is_some()` → need session).
 pub(crate) struct ResolvedWith {
     pub(crate) secret_name: String,
     pub(crate) env_var: String,
@@ -289,16 +230,17 @@ pub(crate) struct ResolvedWith {
     pub(crate) raw_entry: String,
 }
 
-pub(crate) fn resolve_with_entries(withs: &[String]) -> Result<Vec<ResolvedWith>> {
+pub(crate) fn resolve_with_entries(
+    resolved: &Pillbox,
+    withs: &[String],
+) -> Result<Vec<ResolvedWith>> {
     let mut out = Vec::with_capacity(withs.len());
     for entry in withs {
         let (secret_name, env_var) = match entry.split_once('=') {
             Some((s, e)) => (s.to_string(), e.to_string()),
             None => (entry.clone(), entry.clone()),
         };
-        // Propagate sidecar parse errors: silently treating a vaulted
-        // secret as plain would leak the real key into the guest.
-        let meta = crate::secrets::read_meta(&secret_name)?;
+        let meta = crate::secrets::read_meta(resolved, &secret_name)?;
         out.push(ResolvedWith {
             secret_name,
             env_var,
@@ -310,6 +252,7 @@ pub(crate) fn resolve_with_entries(withs: &[String]) -> Result<Vec<ResolvedWith>
 }
 
 pub(crate) fn resolve_run_env(
+    resolved: &Pillbox,
     opts: &RunOpts,
     withs: &[ResolvedWith],
     mut vault: Option<&mut crate::vault::VaultSession>,
@@ -317,9 +260,9 @@ pub(crate) fn resolve_run_env(
     use std::collections::BTreeMap;
     let mut env: BTreeMap<String, String> = BTreeMap::new();
 
-    // Layer 1: stored env bundles.
+    // Layer 1: stored env bundles (inheritance applies).
     for bundle_name in &opts.env_bundles {
-        let vars = crate::envs::read(bundle_name)?.ok_or_else(|| {
+        let vars = crate::envs::read(resolved, bundle_name)?.ok_or_else(|| {
             PillboxError::runtime("run", format!("env bundle `{bundle_name}` not found"))
                 .with_next("pillbox env list  # see what's stored".to_string())
         })?;
@@ -352,28 +295,18 @@ pub(crate) fn resolve_run_env(
         }
     }
 
-    // Layer 3: --with entries. The sidecar lookup already happened in
-    // `resolve_with_entries`; here we only need to read the real value
-    // and (if vaulted + session active) swap it for a stub. `opts.withs`
-    // is the raw input — the resolved view is what we iterate.
+    // Layer 3: --with entries.
     for w in withs {
-        let real_value = crate::secrets::read(&w.secret_name)?.ok_or_else(|| {
+        let real_value = crate::secrets::read(resolved, &w.secret_name)?.ok_or_else(|| {
             PillboxError::runtime("run", format!("secret `{}` not found", w.secret_name))
                 .with_next(format!("pillbox secret add {}", w.secret_name))
         })?;
 
         let injected = match (w.meta.as_ref(), vault.as_deref_mut()) {
             (Some(meta), Some(session)) => {
-                // Strip trailing whitespace on the real value before
-                // handing it to the vault — same trim logic
-                // secrets::read uses internally (defensive: real_value
-                // already trimmed, but make explicit).
                 session.lease_api_key(&w.secret_name, real_value.trim_end(), meta)?
             }
             (Some(_meta), None) => {
-                // Vaulted secret but no session — shouldn't happen if
-                // `run` initialised the session correctly. Fail loudly
-                // rather than silently leaking the real key.
                 return Err(PillboxError::runtime(
                     "run",
                     format!(
@@ -397,15 +330,6 @@ pub(crate) fn resolve_run_env(
     Ok(env)
 }
 
-/// Ensure `~/.pillbox/data/<provider>/` exists with 0700 perms.
-fn ensure_provider_home(spec: &AgentSpec) -> Result<PathBuf> {
-    let home = crate::paths::data_subdir("data")?.join(spec.id);
-    fs::create_dir_all(&home).with_context(|| format!("create {}", home.display()))?;
-    fs::set_permissions(&home, fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("chmod {} 0700", home.display()))?;
-    Ok(home)
-}
-
 pub(crate) fn base_docker_args() -> Vec<String> {
     vec![
         "-it".into(),
@@ -414,20 +338,11 @@ pub(crate) fn base_docker_args() -> Vec<String> {
         format!("HOME={GUEST_HOME}"),
         "-e".into(),
         "TERM=xterm-256color".into(),
-        // Include $HOME/.local/bin so agents that self-update or look
-        // for their own native install at the standard XDG-ish location
-        // don't print "your PATH is missing ~/.local/bin" warnings.
-        // /usr/local/bin comes FIRST so the baked-in binaries win over
-        // anything an agent might write into its own persistent
-        // ~/.local/bin/ — defense against a future agent or its plugin
-        // silently overriding the runtime image.
         "-e".into(),
         format!("PATH=/usr/local/bin:/usr/bin:/bin:{GUEST_HOME}/.local/bin"),
     ]
 }
 
-/// Resolve the basename used as the workspace mount point. Override
-/// > derived basename > "workspace" fallback.
 pub(crate) fn workspace_mount_name(host: &Path, override_name: Option<&str>) -> Result<String> {
     if let Some(name) = override_name {
         if name.is_empty() || name.contains('/') || name.contains('\0') {
@@ -452,6 +367,8 @@ pub(crate) fn workspace_mount_name(host: &Path, override_name: Option<&str>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pillbox;
+    use crate::secrets::{AddSource, WriteScope};
     use crate::test_util::with_isolated_home;
     use crate::vault::{HeaderScheme, OAuthAgent, VaultMeta, VaultSession};
 
@@ -471,12 +388,13 @@ mod tests {
     #[test]
     fn resolve_run_env_injects_plain_secret_without_vault_session() {
         with_isolated_home("agents-plain", || {
+            let g = pillbox::global();
+            std::env::set_var("__PILLBOX_TEST_PLAIN", "raw-value");
             crate::secrets::add(
+                &g,
+                WriteScope::Resolved,
                 "PLAIN_KEY",
-                crate::secrets::AddSource::EnvVar({
-                    std::env::set_var("__PILLBOX_TEST_PLAIN", "raw-value");
-                    "__PILLBOX_TEST_PLAIN".into()
-                }),
+                AddSource::EnvVar("__PILLBOX_TEST_PLAIN".into()),
                 false,
                 None,
             )
@@ -484,8 +402,8 @@ mod tests {
             std::env::remove_var("__PILLBOX_TEST_PLAIN");
 
             let opts = run_opts_with_withs(vec!["PLAIN_KEY"]);
-            let withs = resolve_with_entries(&opts.withs).unwrap();
-            let env = resolve_run_env(&opts, &withs, None).unwrap();
+            let withs = resolve_with_entries(&g, &opts.withs).unwrap();
+            let env = resolve_run_env(&g, &opts, &withs, None).unwrap();
             assert_eq!(env.get("PLAIN_KEY").map(String::as_str), Some("raw-value"));
         });
     }
@@ -493,12 +411,13 @@ mod tests {
     #[test]
     fn resolve_run_env_swaps_vaulted_secret_for_stub() {
         with_isolated_home("agents-vault", || {
-            // Stash a vaulted secret. Meta points to api.anthropic.com which
-            // is intercepted by the bundled AnthropicProvider.
+            let g = pillbox::global();
             std::env::set_var("__PILLBOX_TEST_VAULTED", "sk-ant-api03-REAL");
             crate::secrets::add(
+                &g,
+                WriteScope::Resolved,
                 "VAULTED_KEY",
-                crate::secrets::AddSource::EnvVar("__PILLBOX_TEST_VAULTED".into()),
+                AddSource::EnvVar("__PILLBOX_TEST_VAULTED".into()),
                 false,
                 Some(VaultMeta::new(
                     "api.anthropic.com".into(),
@@ -509,14 +428,12 @@ mod tests {
             .unwrap();
             std::env::remove_var("__PILLBOX_TEST_VAULTED");
 
-            // No OAuth — just a session that supports API-key leases.
-            let mut session = VaultSession::start(None::<OAuthAgent>).unwrap();
+            let mut session = VaultSession::start(None::<OAuthAgent>, &g).unwrap();
             let opts = run_opts_with_withs(vec!["VAULTED_KEY"]);
-            let withs = resolve_with_entries(&opts.withs).unwrap();
-            let env = resolve_run_env(&opts, &withs, Some(&mut session)).unwrap();
+            let withs = resolve_with_entries(&g, &opts.withs).unwrap();
+            let env = resolve_run_env(&g, &opts, &withs, Some(&mut session)).unwrap();
 
             let injected = env.get("VAULTED_KEY").cloned().unwrap();
-            // Stub mimics the prefix, NOT the real value.
             assert!(injected.starts_with("sk-ant-api03-"), "got {injected}");
             assert_ne!(injected, "sk-ant-api03-REAL");
         });
@@ -525,21 +442,24 @@ mod tests {
     #[test]
     fn resolve_run_env_mixed_vaulted_and_plain() {
         with_isolated_home("agents-mix", || {
-            // Plain secret.
+            let g = pillbox::global();
             std::env::set_var("__PILLBOX_TEST_MIX_P", "plain-val");
             crate::secrets::add(
+                &g,
+                WriteScope::Resolved,
                 "MIX_PLAIN",
-                crate::secrets::AddSource::EnvVar("__PILLBOX_TEST_MIX_P".into()),
+                AddSource::EnvVar("__PILLBOX_TEST_MIX_P".into()),
                 false,
                 None,
             )
             .unwrap();
             std::env::remove_var("__PILLBOX_TEST_MIX_P");
-            // Vaulted secret.
             std::env::set_var("__PILLBOX_TEST_MIX_V", "ghp_REAL_token");
             crate::secrets::add(
+                &g,
+                WriteScope::Resolved,
                 "MIX_VAULTED",
-                crate::secrets::AddSource::EnvVar("__PILLBOX_TEST_MIX_V".into()),
+                AddSource::EnvVar("__PILLBOX_TEST_MIX_V".into()),
                 false,
                 Some(VaultMeta::new(
                     "api.github.com".into(),
@@ -550,10 +470,10 @@ mod tests {
             .unwrap();
             std::env::remove_var("__PILLBOX_TEST_MIX_V");
 
-            let mut session = VaultSession::start(None::<OAuthAgent>).unwrap();
+            let mut session = VaultSession::start(None::<OAuthAgent>, &g).unwrap();
             let opts = run_opts_with_withs(vec!["MIX_PLAIN", "MIX_VAULTED=GITHUB_TOKEN"]);
-            let withs = resolve_with_entries(&opts.withs).unwrap();
-            let env = resolve_run_env(&opts, &withs, Some(&mut session)).unwrap();
+            let withs = resolve_with_entries(&g, &opts.withs).unwrap();
+            let env = resolve_run_env(&g, &opts, &withs, Some(&mut session)).unwrap();
 
             assert_eq!(env.get("MIX_PLAIN").map(String::as_str), Some("plain-val"));
             let stub = env.get("GITHUB_TOKEN").cloned().unwrap();
@@ -565,10 +485,13 @@ mod tests {
     #[test]
     fn resolve_run_env_vaulted_without_session_errors_loudly() {
         with_isolated_home("agents-novault", || {
+            let g = pillbox::global();
             std::env::set_var("__PILLBOX_TEST_NOV", "REAL");
             crate::secrets::add(
+                &g,
+                WriteScope::Resolved,
                 "NO_SESSION_KEY",
-                crate::secrets::AddSource::EnvVar("__PILLBOX_TEST_NOV".into()),
+                AddSource::EnvVar("__PILLBOX_TEST_NOV".into()),
                 false,
                 Some(VaultMeta::new(
                     "api.openai.com".into(),
@@ -580,8 +503,8 @@ mod tests {
             std::env::remove_var("__PILLBOX_TEST_NOV");
 
             let opts = run_opts_with_withs(vec!["NO_SESSION_KEY"]);
-            let withs = resolve_with_entries(&opts.withs).unwrap();
-            let err = resolve_run_env(&opts, &withs, None).unwrap_err();
+            let withs = resolve_with_entries(&g, &opts.withs).unwrap();
+            let err = resolve_run_env(&g, &opts, &withs, None).unwrap_err();
             let s = format!("{err}");
             assert!(s.contains("vaulted"), "expected vaulted error, got: {s}");
         });
@@ -590,18 +513,23 @@ mod tests {
     #[test]
     fn resolve_with_entries_detects_meta_sidecar() {
         with_isolated_home("agents-detect", || {
+            let g = pillbox::global();
             std::env::set_var("__PILLBOX_TEST_DETECT_A", "v");
             crate::secrets::add(
+                &g,
+                WriteScope::Resolved,
                 "DETECT_PLAIN",
-                crate::secrets::AddSource::EnvVar("__PILLBOX_TEST_DETECT_A".into()),
+                AddSource::EnvVar("__PILLBOX_TEST_DETECT_A".into()),
                 false,
                 None,
             )
             .unwrap();
             std::env::set_var("__PILLBOX_TEST_DETECT_B", "v");
             crate::secrets::add(
+                &g,
+                WriteScope::Resolved,
                 "DETECT_VAULTED",
-                crate::secrets::AddSource::EnvVar("__PILLBOX_TEST_DETECT_B".into()),
+                AddSource::EnvVar("__PILLBOX_TEST_DETECT_B".into()),
                 false,
                 Some(VaultMeta::new(
                     "api.anthropic.com".into(),
@@ -613,18 +541,34 @@ mod tests {
             std::env::remove_var("__PILLBOX_TEST_DETECT_A");
             std::env::remove_var("__PILLBOX_TEST_DETECT_B");
 
-            let plain = resolve_with_entries(&["DETECT_PLAIN".into()]).unwrap();
+            let plain = resolve_with_entries(&g, &["DETECT_PLAIN".into()]).unwrap();
             assert!(plain[0].meta.is_none());
 
-            let vaulted = resolve_with_entries(&["DETECT_VAULTED".into()]).unwrap();
+            let vaulted = resolve_with_entries(&g, &["DETECT_VAULTED".into()]).unwrap();
             assert!(vaulted[0].meta.is_some());
+        });
+    }
 
-            let mixed = resolve_with_entries(&[
-                "DETECT_PLAIN".into(),
-                "DETECT_VAULTED=GITHUB_TOKEN".into(),
-            ])
-            .unwrap();
-            assert!(mixed.iter().any(|w| w.meta.is_some()));
+    #[test]
+    fn home_dir_is_under_global_auth() {
+        with_isolated_home("agents-global-auth", || {
+            // Construct a project pillbox; the auth scope should still
+            // resolve to global per the v0.6 rule.
+            let tmp = tempfile::tempdir().unwrap();
+            let saved = std::env::current_dir().ok();
+            std::env::set_current_dir(tmp.path()).unwrap();
+            pillbox::new(Some("p".into()), None).unwrap();
+            let proj = crate::pillbox::Pillbox::resolve(None).unwrap();
+            assert!(!proj.is_global());
+
+            let home = CLAUDE.home_dir(&proj).unwrap();
+            // home is <home>/.pillbox/global/auth/claude
+            let s = home.display().to_string();
+            assert!(s.contains(".pillbox/global/auth/claude"), "got: {s}");
+
+            if let Some(c) = saved {
+                let _ = std::env::set_current_dir(c);
+            }
         });
     }
 }

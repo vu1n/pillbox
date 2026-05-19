@@ -1,15 +1,23 @@
-//! `pillbox.toml` — per-project defaults for `pillbox <agent> run`.
+//! `pillbox.toml` — the v0.6 pillbox descriptor.
 //!
-//! Discovered by walking up from cwd to filesystem root, like `.gitignore`
-//! or `Cargo.toml`. The first file found wins. Pass `--config PATH` to
-//! point at a specific file, or `--no-config` to skip discovery.
+//! A `pillbox.toml` at the project root marks a directory as a pillbox.
+//! The descriptor is intentionally minimal in PR 2 — just enough to give
+//! the pillbox a display name and pick a default agent. Workspace
+//! backends (PR 3) and vault config will add more sections later.
 //!
-//! CLI flags layer on top of the file:
-//! - single-value fields (`name`, `env`) — CLI overrides config
-//! - multi-value fields (`with`, `mount`, `env_file`) — CLI appends to config
+//! ```toml
+//! # required
+//! name = "my-project"
 //!
-//! Tilde-prefixed paths in the file are expanded against `$HOME`. CLI
-//! flags don't need tilde handling because the shell already did it.
+//! # optional — default agent for `pillbox run`
+//! agent = "claude"          # or "codex"
+//!
+//! # PR 3 will fill this in.
+//! [workspace]
+//! ```
+//!
+//! Discovery is the same shape as `.gitignore` / `Cargo.toml`: walk up
+//! from cwd until a `pillbox.toml` is found.
 
 use std::{
     fs,
@@ -21,70 +29,39 @@ use serde::Deserialize;
 
 use crate::errors::PillboxError;
 
+/// `[workspace]` table — empty in PR 2, scaffolding for the workspace
+/// backends in PR 3.
 #[derive(Debug, Default, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
+#[allow(dead_code)] // populated in PR 3 (workspace backends)
+pub(crate) struct WorkspaceConfig {
+    // Empty intentionally — backend / endpoint / bucket land in PR 3.
+}
+
+#[derive(Debug, Default, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)] // `agent`, `workspace`, `source` consumed by PR 3 + later
 pub(crate) struct Config {
-    /// Override the workspace mount-point name (`/workspace/<name>`).
+    /// Display name for the pillbox. Required in well-formed configs but
+    /// optional here so a half-written file still parses (the loader
+    /// enforces presence — see `Config::load_from`).
+    #[serde(default)]
     pub(crate) name: Option<String>,
-    /// Default `--env BUNDLE` to apply.
-    pub(crate) env: Option<String>,
-    /// Default `--with NAME[=ENV_VAR]` entries.
+    /// Default agent for `pillbox run` (`claude` | `codex`). `None` falls
+    /// back to a built-in default at run time.
     #[serde(default)]
-    pub(crate) with: Vec<String>,
-    /// Default `--mount HOST:GUEST[:opts]` entries. Tilde-expanded.
+    pub(crate) agent: Option<String>,
+    /// Reserved for PR 3.
     #[serde(default)]
-    pub(crate) mount: Vec<String>,
-    /// Default `--env-file PATH` entries. Tilde-expanded.
-    #[serde(default)]
-    pub(crate) env_file: Vec<String>,
-    /// Path the config was loaded from. Useful for `--show-config` and error
-    /// messages. Not in the TOML schema.
+    pub(crate) workspace: WorkspaceConfig,
+
+    /// Path the config was loaded from. Useful for `info` output.
     #[serde(skip)]
     pub(crate) source: Option<PathBuf>,
 }
 
+#[allow(dead_code)] // `load_from` is exercised by tests + PR 3
 impl Config {
-    pub(crate) fn empty() -> Self {
-        Self::default()
-    }
-
-    /// Walk up from `start` looking for `pillbox.toml`. Returns the loaded
-    /// config (with `source` set) or `None` if no file is found.
-    pub(crate) fn discover_from(start: &Path) -> Result<Option<Config>> {
-        let mut dir = start;
-        loop {
-            let candidate = dir.join("pillbox.toml");
-            if candidate.is_file() {
-                return Self::load_from(&candidate).map(Some);
-            }
-            match dir.parent() {
-                Some(parent) => dir = parent,
-                None => return Ok(None),
-            }
-        }
-    }
-
-    /// Like `discover_from` but starts at `std::env::current_dir()`.
-    pub(crate) fn discover() -> Result<Option<Config>> {
-        let cwd = std::env::current_dir().map_err(|e| {
-            PillboxError::runtime("config discover", format!("could not resolve cwd: {e}"))
-        })?;
-        Self::discover_from(&cwd)
-    }
-
-    /// Resolve the effective config for a `run` invocation given the CLI
-    /// flags. Mirrors the user's expectation: `--no-config` wins, then
-    /// `--config PATH`, otherwise discover-from-cwd (empty if nothing found).
-    pub(crate) fn resolve(explicit: Option<PathBuf>, no_config: bool) -> Result<Config> {
-        if no_config {
-            return Ok(Self::empty());
-        }
-        if let Some(p) = explicit {
-            return Self::load_from(&p);
-        }
-        Ok(Self::discover()?.unwrap_or_else(Self::empty))
-    }
-
     pub(crate) fn load_from(path: &Path) -> Result<Config> {
         let raw = fs::read_to_string(path).map_err(|e| {
             PillboxError::runtime(
@@ -94,38 +71,15 @@ impl Config {
         })?;
         let mut cfg: Config = toml::from_str(&raw)
             .map_err(|e| PillboxError::config("config load", format!("{}: {e}", path.display())))?;
-        cfg.expand_tildes();
+        if cfg.name.as_deref().map(str::trim).unwrap_or("").is_empty() {
+            return Err(PillboxError::config(
+                "config load",
+                format!("{}: missing required field `name`", path.display()),
+            )
+            .into());
+        }
         cfg.source = Some(path.to_path_buf());
         Ok(cfg)
-    }
-
-    fn expand_tildes(&mut self) {
-        for m in &mut self.mount {
-            *m = expand_tilde_in_mount(m);
-        }
-        for f in &mut self.env_file {
-            *f = expand_tilde(f);
-        }
-    }
-}
-
-/// Expand a single leading `~/` against `$HOME`. Bare `~` (no slash) is
-/// left alone since it's not a path. Returns the input unchanged if
-/// `$HOME` is unresolvable.
-fn expand_tilde(s: &str) -> String {
-    if let Some(rest) = s.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return format!("{home}/{rest}");
-        }
-    }
-    s.to_string()
-}
-
-/// `HOST:GUEST[:opts]` — expand `~` only in the host part.
-fn expand_tilde_in_mount(spec: &str) -> String {
-    match spec.split_once(':') {
-        Some((host, rest)) => format!("{}:{}", expand_tilde(host), rest),
-        None => expand_tilde(spec),
     }
 }
 
@@ -141,44 +95,29 @@ mod tests {
     }
 
     #[test]
-    fn discover_walks_up_to_find_config() {
+    fn load_accepts_minimal_config() {
         let root = TempDir::new().unwrap();
-        let nested = root.path().join("a/b/c");
-        fs::create_dir_all(&nested).unwrap();
-        write_config(root.path(), "name = \"frommarker\"\n");
-
-        let cfg = Config::discover_from(&nested).unwrap().unwrap();
-        assert_eq!(cfg.name.as_deref(), Some("frommarker"));
-        assert_eq!(cfg.source, Some(root.path().join("pillbox.toml")));
-    }
-
-    #[test]
-    fn discover_returns_none_when_no_config() {
-        let root = TempDir::new().unwrap();
-        let res = Config::discover_from(root.path()).unwrap();
-        assert!(res.is_none());
-    }
-
-    #[test]
-    fn load_parses_all_fields() {
-        let root = TempDir::new().unwrap();
-        write_config(
-            root.path(),
-            r#"
-name = "myapp"
-env = "dev"
-with = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY=OPENAI_KEY"]
-mount = ["~/.aws:/home/lum/.aws:ro"]
-env_file = [".env.local"]
-"#,
-        );
+        write_config(root.path(), "name = \"alpha\"\n");
         let cfg = Config::load_from(&root.path().join("pillbox.toml")).unwrap();
-        assert_eq!(cfg.name.as_deref(), Some("myapp"));
-        assert_eq!(cfg.env.as_deref(), Some("dev"));
-        assert_eq!(cfg.with.len(), 2);
-        assert_eq!(cfg.mount.len(), 1);
-        assert!(cfg.mount[0].starts_with('/'));
-        assert_eq!(cfg.env_file, vec![".env.local"]);
+        assert_eq!(cfg.name.as_deref(), Some("alpha"));
+        assert_eq!(cfg.agent, None);
+    }
+
+    #[test]
+    fn load_parses_agent_field() {
+        let root = TempDir::new().unwrap();
+        write_config(root.path(), "name = \"a\"\nagent = \"claude\"\n");
+        let cfg = Config::load_from(&root.path().join("pillbox.toml")).unwrap();
+        assert_eq!(cfg.agent.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn load_rejects_missing_name() {
+        let root = TempDir::new().unwrap();
+        write_config(root.path(), "agent = \"claude\"\n");
+        let err = Config::load_from(&root.path().join("pillbox.toml")).unwrap_err();
+        let s = format!("{err}");
+        assert!(s.contains("name"));
     }
 
     #[test]
@@ -186,36 +125,27 @@ env_file = [".env.local"]
         let root = TempDir::new().unwrap();
         write_config(root.path(), "name = \"x\"\nbogus = 1\n");
         let err = Config::load_from(&root.path().join("pillbox.toml")).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("bogus") || msg.contains("unknown"));
+        let s = format!("{err}");
+        assert!(s.contains("bogus") || s.contains("unknown"));
     }
 
     #[test]
-    fn load_rejects_legacy_strict_field() {
-        // v0.6 ripped `--strict` and the pillbox.toml `strict` field
-        // (was a v0.5 placeholder for the Gondolin microVM mode that
-        // never shipped). Old configs with `strict = true` now fail at
-        // load time with a clear unknown-field error.
+    fn load_rejects_legacy_with_field() {
+        // v0.5 had `with = [...]`; v0.6 drops it. Old configs fail loud.
         let root = TempDir::new().unwrap();
-        write_config(root.path(), "name = \"x\"\nstrict = true\n");
+        write_config(
+            root.path(),
+            "name = \"x\"\nwith = [\"ANTHROPIC_API_KEY\"]\n",
+        );
         let err = Config::load_from(&root.path().join("pillbox.toml")).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("strict") || msg.contains("unknown"));
+        let s = format!("{err}");
+        assert!(s.contains("with") || s.contains("unknown"));
     }
 
     #[test]
-    fn tilde_expands_in_mount_host_only() {
-        crate::test_util::with_isolated_home("config-tilde", || {
-            let home = std::env::var("HOME").unwrap();
-            assert_eq!(
-                expand_tilde_in_mount("~/.aws:/home/lum/.aws:ro"),
-                format!("{home}/.aws:/home/lum/.aws:ro"),
-            );
-        });
-    }
-
-    #[test]
-    fn tilde_no_op_for_absolute() {
-        assert_eq!(expand_tilde("/abs/path"), "/abs/path");
+    fn load_accepts_empty_workspace_table() {
+        let root = TempDir::new().unwrap();
+        write_config(root.path(), "name = \"x\"\n\n[workspace]\n");
+        Config::load_from(&root.path().join("pillbox.toml")).unwrap();
     }
 }

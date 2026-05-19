@@ -1,100 +1,112 @@
-# Per-project config (`pillbox.toml`)
+# pillbox.toml — the pillbox descriptor
 
-A `pillbox.toml` at the project root supplies defaults for `pillbox
-<agent> run` flags. Pillbox walks up from the current working directory
-to find one, like `.gitignore` or `Cargo.toml`. The first file found
-wins.
+A `pillbox.toml` at a directory's root marks it as a **project
+pillbox**. Pillbox walks up from cwd looking for one (like `.gitignore`
+or `Cargo.toml`); the first match wins. No match → fall back to the
+global pillbox.
 
 For the command-table reference see [../AGENTS.md](../AGENTS.md).
 
-## Quick example
+## Schema (v0.6)
 
 ```toml
-# ~/work/myapp/pillbox.toml
-name = "myapp"
-env = "dev"
-with = ["ANTHROPIC_API_KEY"]
-mount = ["~/.aws:/home/lum/.aws:ro"]
-env_file = [".env.local"]
+# Required
+name = "my-project"
+
+# Optional — default agent for `pillbox run`
+agent = "claude"          # "claude" | "codex"
+
+# Reserved for PR 3 (workspace backends: S3/R2, Git, Tarball)
+[workspace]
 ```
 
-```sh
-cd ~/work/myapp
-pillbox claude run           # uses the four defaults above
-pillbox claude run --env stage   # appends 'stage' to ['dev']; both layered
-```
+Unknown fields are rejected with exit 3.
 
-## Schema
+| Field | Type | Notes |
+|---|---|---|
+| `name` | string | Required. Display name for the pillbox; also defaults `pillbox run`'s `--name`. |
+| `agent` | string | Default agent for `pillbox run` (`claude` or `codex`). |
+| `[workspace]` | table | Empty in PR 2 — backend config lands in PR 3. |
 
-All fields optional. Unknown fields are rejected with exit 3.
+`pillbox.toml` is the **descriptor** users edit by hand. The durable
+record lives in `<state_dir>/meta.json` (see below) and is rewritten by
+pillbox.
 
-| Field | Type | Maps to | Notes |
-|---|---|---|---|
-| `name` | string | `--name` | Single-value: CLI overrides. |
-| `env` | string | `--env BUNDLE` | Single-value, but applied as the first env layer at run-time. Lowest precedence in env composition. |
-| `with` | string list | `--with NAME[=ENV_VAR]` | CLI entries appended. |
-| `mount` | string list | `--mount HOST:GUEST[:opts]` | CLI entries appended. Tilde-expanded. |
-| `env_file` | string list | `--env-file PATH` | CLI entries appended. Tilde-expanded. Paths resolved relative to cwd at invocation, NOT relative to the config file. |
+## State directory and the path key
 
-## Merge rules
-
-- **Single-value fields** (`name`, `env`): CLI flag overrides the file's value.
-- **Multi-value fields** (`with`, `mount`, `env_file`): file's list comes first, CLI list is appended. Both apply.
-
-The env composition order at run-time is unchanged:
+`pillbox new` creates a state directory under
+`~/.pillbox/projects/<key>/`. The key is the **absolute path of the
+directory holding `pillbox.toml`, with `/` replaced by `-`**:
 
 ```
-config env  →  cli --env  →  config env_file  →  cli --env-file  →  config with  →  cli --with
-        (lowest)                                                                          (highest)
+/Users/vuln/work/myapp          → -Users-vuln-work-myapp
+/home/alice/projects/api-svc    → -home-alice-projects-api-svc
 ```
 
-If two layers set the same key, pillbox emits one line to stderr per shadowed variable (see [secrets.md](./secrets.md) for the exact formats).
+Greppable, human-readable, unique per machine. Symlinks resolve before
+encoding so two paths to the same directory collapse to one key.
+
+```
+~/.pillbox/projects/-Users-vuln-work-myapp/
+├── meta.json          # { name, created_at, agent_default }
+├── secrets/           # 0700
+├── env/               # 0700
+├── auth/              # reserved (v0.7 per-project auth override)
+└── vault/             # 0700
+```
+
+`meta.json` is rewritten by pillbox; don't edit it directly. To change
+the pillbox's name, edit `pillbox.toml`'s `name = ` field and pillbox
+will reconcile on the next `pillbox new` (PR 3 will add `pillbox
+reconfigure`).
 
 ## Discovery rules
 
 - Pillbox starts at `std::env::current_dir()`.
-- It walks up parent directories until it finds `pillbox.toml`.
-- It stops at the first match — multiple configs in the path are NOT merged.
-- It stops at the filesystem root with no match.
+- Walks up looking for `pillbox.toml`.
+- Stops at the first match (multiple configs in the path are NOT merged).
+- Falls back to the global pillbox if nothing is found.
 
-To inspect what pillbox found (or didn't):
-
-```sh
-pillbox config           # human-readable
-pillbox config --json    # for scripts; includes "source" path
-```
-
-## Escape hatches
+To inspect what discovery resolved to:
 
 ```sh
-pillbox claude run --no-config              # skip discovery entirely
-pillbox claude run --config /tmp/other.toml # use a specific file
+pillbox info          # human
+pillbox info --json   # machine
 ```
 
-`--config` and `--no-config` are mutually exclusive.
+## Overriding discovery
 
-## Tilde expansion
+```sh
+pillbox --pillbox myapp secret list      # operate on named pillbox
+pillbox --pillbox global auth list       # explicit global
+pillbox --pillbox -Users-vuln-work-myapp info   # by path key
+```
 
-Paths in `mount` and `env_file` are expanded against `$HOME` when they
-start with `~/`. CLI flags don't need this — the shell already expanded
-`~` before pillbox saw the argument.
+`--pillbox` is global — works on every per-pillbox command.
 
-`mount = ["~/.aws:/home/lum/.aws:ro"]` becomes
-`/Users/you/.aws:/home/lum/.aws:ro` before being passed to Docker.
+## What's NOT in pillbox.toml (v0.6 PR 2)
+
+v0.5 had multi-value defaults (`with`, `mount`, `env_file`, `env`) for
+the `run` flags. v0.6 drops them — they sprawled the descriptor and
+hid behavior. CLI flags are the single source of truth for those.
+Re-add by alias if you need:
+
+```sh
+# Old v0.5: pillbox.toml had `with = ["ANTHROPIC_API_KEY"]`
+# New v0.6: pass at the command line, or wrap in a shell alias.
+alias pbrun='pillbox run --with ANTHROPIC_API_KEY'
+```
 
 ## Anti-patterns
 
-- ❌ **Don't put secret values in `pillbox.toml`.** It's plaintext config,
-  often checked into git. Use `pillbox secret add NAME` and reference by
-  name via `with = ["NAME"]`.
-- ❌ Don't expect multiple configs to merge. Pillbox finds one and uses
-  it. If you want shared config across projects, symlink or factor it
-  out yourself.
-- ❌ Don't put `env_file` paths relative to the config file location.
-  They're resolved against cwd at invocation, not the config's directory.
+- Don't put secret values in `pillbox.toml`. Plaintext config, often
+  committed. Use `pillbox secret add` and reference by name via
+  `--with`.
+- Don't expect multiple configs to merge. One is found and used.
+- Don't edit `meta.json` directly. Edit the descriptor.
 
 ## See also
 
-- [secrets.md](./secrets.md) — what `with` references and how composition works
-- [recipes.md](./recipes.md) — copy-paste flows including `pillbox.toml` setups
+- [secrets.md](./secrets.md) — pillbox-scoped secrets + env bundles
+- [vault.md](./vault.md) — per-pillbox vault state
 - [../AGENTS.md](../AGENTS.md) — agent-facing command reference

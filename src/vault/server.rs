@@ -271,6 +271,17 @@ impl Server {
     /// tests use this to call `handle_request` / `handle_response`
     /// directly on a constructed hyper Request/Response, bypassing the
     /// proxy/TLS stack.
+    ///
+    /// Why bypass instead of driving a real `Proxy`: hudsucker 0.24's
+    /// public builder doesn't let us inject a custom upstream hyper
+    /// connector, so a real end-to-end run would need either a
+    /// `CONNECT`-through stub HTTP server or unsafe internals. Calling
+    /// the provider methods directly covers the swap logic; the
+    /// `should_intercept` → dispatch chain inside [`VaultHandler`] is a
+    /// thin wrapper and is not currently exercised. Worth revisiting if
+    /// hudsucker exposes the connector seam (or we change dispatch
+    /// policy — provider priority, fall-through on overlapping
+    /// `intercept`).
     #[cfg(test)]
     pub(crate) fn inner_for_test(&self) -> &ServerInner {
         &self.inner
@@ -341,50 +352,10 @@ impl HttpHandler for VaultHandler {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
-    use crate::vault::{
-        providers::{anthropic, codex},
-        server::{Server, ServerConfig},
+    use crate::vault::providers::{
+        anthropic, codex,
+        test_support::{fresh_server, sample_anthropic_real, sample_codex_real},
     };
-
-    fn sample_anthropic_real() -> serde_json::Value {
-        serde_json::json!({
-            "claudeAiOauth": {
-                "accessToken": "REAL_ACCESS",
-                "refreshToken": "REAL_REFRESH",
-                "expiresAt": 1700000000_u64
-            }
-        })
-    }
-
-    const FAKE_JWT: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature_part_here";
-
-    fn sample_codex_real() -> serde_json::Value {
-        serde_json::json!({
-            "auth_mode": "ChatGPT",
-            "tokens": {
-                "id_token": FAKE_JWT,
-                "access_token": FAKE_JWT,
-                "refresh_token": "rt_codex_real",
-                "account_id": "acct_x"
-            },
-            "last_refresh": "2026-05-18T00:00:00Z",
-            "agent_identity": serde_json::Value::Null
-        })
-    }
-
-    async fn fresh_server() -> (Server, PathBuf) {
-        let dir =
-            std::env::temp_dir().join(format!("pillbox-vault-server-{}", uuid::Uuid::now_v7()));
-        let server = Server::start(ServerConfig {
-            bind: None,
-            ca_dir: dir.clone(),
-        })
-        .await
-        .expect("server start");
-        (server, dir)
-    }
 
     #[tokio::test]
     async fn server_binds_and_writes_ca_cert() {

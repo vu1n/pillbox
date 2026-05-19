@@ -402,11 +402,7 @@ fn stubs_for(registry: &Registry, sandbox_id: &str) -> Option<(String, String)> 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// JWT-shaped strings (3 dot-separated parts). We're not validating
-    /// the JWT signature — codex's own validator handles that downstream
-    /// — but the shape check in `provision` requires it.
-    const FAKE_JWT: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature_part_here";
+    use crate::vault::providers::test_support::FAKE_JWT;
 
     fn sample_chatgpt_real() -> serde_json::Value {
         serde_json::json!({

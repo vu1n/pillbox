@@ -5,6 +5,11 @@ on:
   pull_request:
 permissions:
   contents: read
+# Cancel stale in-flight runs when a new commit lands on the same PR /
+# branch — saves macOS minutes (~10x cost) on iterative force-pushes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   test:
     strategy:
@@ -24,7 +29,15 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-      - run: cargo fmt --check
-      - run: cargo build --all-targets
+          # On Cargo.lock churn the target/ dir is stale but the registry
+          # download is still good; fall back to the newest cache for this
+          # OS so we don't re-fetch every crate.
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      # Lint+format gates are platform-independent; only run them once
+      # (on ubuntu) to save macOS minutes (~10x cost).
+      - if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --check
       - run: cargo test --all-targets
-      - run: cargo clippy --all-targets -- -D warnings
+      - if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy --all-targets -- -D warnings

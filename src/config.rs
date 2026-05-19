@@ -37,10 +37,6 @@ pub(crate) struct Config {
     /// Default `--env-file PATH` entries. Tilde-expanded.
     #[serde(default)]
     pub(crate) env_file: Vec<String>,
-    /// Default for `--strict` (Gondolin microVM mode). CLI `--strict`
-    /// remains accepted; setting `true` here just makes it the default.
-    #[serde(default)]
-    pub(crate) strict: bool,
     /// Path the config was loaded from. Useful for `--show-config` and error
     /// messages. Not in the TOML schema.
     #[serde(skip)]
@@ -174,7 +170,6 @@ env = "dev"
 with = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY=OPENAI_KEY"]
 mount = ["~/.aws:/home/lum/.aws:ro"]
 env_file = [".env.local"]
-strict = true
 "#,
         );
         let cfg = Config::load_from(&root.path().join("pillbox.toml")).unwrap();
@@ -184,7 +179,6 @@ strict = true
         assert_eq!(cfg.mount.len(), 1);
         assert!(cfg.mount[0].starts_with('/'));
         assert_eq!(cfg.env_file, vec![".env.local"]);
-        assert!(cfg.strict);
     }
 
     #[test]
@@ -194,6 +188,19 @@ strict = true
         let err = Config::load_from(&root.path().join("pillbox.toml")).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("bogus") || msg.contains("unknown"));
+    }
+
+    #[test]
+    fn load_rejects_legacy_strict_field() {
+        // v0.6 ripped `--strict` and the pillbox.toml `strict` field
+        // (was a v0.5 placeholder for the Gondolin microVM mode that
+        // never shipped). Old configs with `strict = true` now fail at
+        // load time with a clear unknown-field error.
+        let root = TempDir::new().unwrap();
+        write_config(root.path(), "name = \"x\"\nstrict = true\n");
+        let err = Config::load_from(&root.path().join("pillbox.toml")).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("strict") || msg.contains("unknown"));
     }
 
     #[test]

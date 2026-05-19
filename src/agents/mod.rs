@@ -24,8 +24,8 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::{docker, errors::PillboxError};
 
-const GUEST_HOME: &str = "/home/lum";
-const GUEST_WORKSPACE: &str = "/workspace";
+pub(crate) const GUEST_HOME: &str = "/home/lum";
+pub(crate) const GUEST_WORKSPACE: &str = "/workspace";
 
 #[derive(Clone, Copy)]
 pub struct AgentSpec {
@@ -213,99 +213,6 @@ impl AgentSpec {
         Ok(())
     }
 
-    pub(crate) fn run(&self, opts: RunOpts) -> Result<()> {
-        docker::check_ready()?;
-
-        let home = self.home_dir()?;
-        if !home.join(self.cred_sentinel).exists() {
-            return Err(PillboxError::runtime(
-                "run",
-                format!("no stored credentials for `{}`", self.id),
-            )
-            .with_next(format!("pillbox {} login", self.id))
-            .into());
-        }
-
-        let workspace_host = match &opts.workspace {
-            Some(p) => p.clone(),
-            None => std::env::current_dir().context("resolve current working directory")?,
-        };
-        let workspace_name = workspace_mount_name(&workspace_host, opts.name.as_deref())?;
-        let guest_workspace = format!("{GUEST_WORKSPACE}/{workspace_name}");
-
-        if opts.vault && !self.vault_capable {
-            return Err(PillboxError::usage(
-                "run",
-                format!("--vault is not supported for `{}`", self.id),
-            )
-            .into());
-        }
-
-        // Resolve `--with` entries up front (one sidecar lookup per entry,
-        // shared across both the "needs session?" decision and the env
-        // resolution below). This avoids walking the list twice with a
-        // disk hit each time. The session may exist even when the agent
-        // isn't using OAuth — non-vault-capable agents can still benefit
-        // from API-key stub swap for `--with`'d secrets.
-        let withs_resolved = resolve_with_entries(&opts.withs)?;
-        let any_vaulted = withs_resolved.iter().any(|w| w.meta.is_some());
-        let mut vault_session = if opts.vault || any_vaulted {
-            let oauth = if opts.vault {
-                Some(crate::vault::OAuthAgent {
-                    agent_id: self.id,
-                    agent_home: &home,
-                })
-            } else {
-                None
-            };
-            Some(crate::vault::VaultSession::start(oauth)?)
-        } else {
-            None
-        };
-
-        let env_vars = resolve_run_env(&opts, &withs_resolved, vault_session.as_mut())?;
-
-        let mut args = base_docker_args();
-        args.extend([
-            "-v".into(),
-            format!("{}:{GUEST_HOME}", home.display()),
-            "-v".into(),
-            format!("{}:{guest_workspace}", workspace_host.display()),
-            "-w".into(),
-            guest_workspace,
-        ]);
-        for m in &opts.mounts {
-            args.push("-v".into());
-            args.push(m.clone());
-        }
-        for (k, v) in &env_vars {
-            args.push("-e".into());
-            args.push(format!("{k}={v}"));
-        }
-        if let Some(session) = &vault_session {
-            args.extend(session.docker_extras(GUEST_HOME));
-            eprintln!(
-                "pillbox: vault proxy listening on {} (ca: {})",
-                session.listen_addr(),
-                session.ca_cert_path().display()
-            );
-        }
-        args.push(docker::RUNNER_IMAGE.into());
-        args.extend(self.run_argv.iter().map(|s| s.to_string()));
-        args.extend(opts.args);
-
-        let status = docker::run_interactive(&args)?;
-        drop(vault_session);
-        if !status.success() {
-            return Err(PillboxError::runtime(
-                "run",
-                format!("{} exited with status {status}", self.id),
-            )
-            .into());
-        }
-        Ok(())
-    }
-
     /// Wipe the provider's persistent state. Used by `pillbox auth rm`.
     pub(crate) fn forget(&self) -> Result<bool> {
         let home = self.home_dir()?;
@@ -329,9 +236,6 @@ pub(crate) struct RunOpts {
     pub(crate) env_files: Vec<PathBuf>,
     /// `--vault` — route API traffic through the pillbox stub-swap proxy.
     pub(crate) vault: bool,
-    /// `--strict` — opt into the Gondolin microVM sandbox (gated until v0.6
-    /// wires the spawn integration; today this is an error trigger).
-    pub(crate) strict: bool,
     pub(crate) args: Vec<String>,
 }
 
@@ -353,9 +257,6 @@ impl RunOpts {
             &mut self.env_files,
             cfg.env_file.into_iter().map(PathBuf::from).collect(),
         );
-        // Bool fields OR-merge: either source can trigger, CLI can't unset
-        // config-on.
-        self.strict |= cfg.strict;
     }
 }
 
@@ -408,7 +309,7 @@ pub(crate) fn resolve_with_entries(withs: &[String]) -> Result<Vec<ResolvedWith>
     Ok(out)
 }
 
-fn resolve_run_env(
+pub(crate) fn resolve_run_env(
     opts: &RunOpts,
     withs: &[ResolvedWith],
     mut vault: Option<&mut crate::vault::VaultSession>,
@@ -505,7 +406,7 @@ fn ensure_provider_home(spec: &AgentSpec) -> Result<PathBuf> {
     Ok(home)
 }
 
-fn base_docker_args() -> Vec<String> {
+pub(crate) fn base_docker_args() -> Vec<String> {
     vec![
         "-it".into(),
         "--rm".into(),
@@ -527,7 +428,7 @@ fn base_docker_args() -> Vec<String> {
 
 /// Resolve the basename used as the workspace mount point. Override
 /// > derived basename > "workspace" fallback.
-fn workspace_mount_name(host: &Path, override_name: Option<&str>) -> Result<String> {
+pub(crate) fn workspace_mount_name(host: &Path, override_name: Option<&str>) -> Result<String> {
     if let Some(name) = override_name {
         if name.is_empty() || name.contains('/') || name.contains('\0') {
             return Err(PillboxError::usage(
@@ -563,7 +464,6 @@ mod tests {
             env_bundles: Vec::new(),
             env_files: Vec::new(),
             vault: false,
-            strict: false,
             args: Vec::new(),
         }
     }

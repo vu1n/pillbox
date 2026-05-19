@@ -68,8 +68,9 @@ Pillbox **does not** defend against:
   disk — same posture as `~/.aws/credentials`, `~/.docker/config.json`,
   `~/.gh/hosts.yml`.
 - Compromised Docker daemon, container escape, or kernel-level attacks.
-  Pillbox uses standard Docker isolation. A `--strict` mode for
-  hardware-isolated microVMs via Gondolin is planned for v0.4.
+  Pillbox uses standard Docker isolation. The v0.6 remote-sandbox model
+  moves the agent off the developer machine entirely (VPS, E2B) for
+  workloads that need stronger isolation than a local container.
 
 This is the same security posture as the rest of the developer toolchain
 (`gh`, `aws`, `docker`, `kubectl`). Pillbox is not a secrets manager — it's
@@ -87,11 +88,13 @@ work *in theory* (Docker + `$HOME` exist) but haven't been tested.
   persistent agent HOME under `~/.pillbox/data/<provider>/`
 - **v0.3** ✅ Secrets + env bundles + `pillbox doctor` / `version`
 - **v0.4** ✅ Per-project `pillbox.toml`; credential vault for claude's
-  Anthropic OAuth (`--vault`); `--strict` flag locked in (Gondolin
-  microVM impl follows in v0.5)
-- **v0.5** — Wire `--strict` to Gondolin microVMs; extend vault to
-  Anthropic API keys + GitHub PATs + codex; `pillbox.toml` `strict`
-  field
+  Anthropic OAuth (`--vault`)
+- **v0.5** ✅ Codex vault + API-key vault + integration tests + CI
+- **v0.6** — Local-OR-remote sandbox model. Pillbox runs agents locally
+  (Docker, current) or on a remote target (VPS via SSH, E2B managed
+  cloud). Vault sidecar deploys to the remote env at session start;
+  real secrets stay in sidecar memory. `--strict` placeholder ripped
+  (was wrong scope).
 
 ## Build (pre-GHCR: requires the lum-built runner image)
 
@@ -124,7 +127,6 @@ pillbox <agent> run -- AGENT-ARGS      # forward args to the agent CLI
   - [secrets.md](./docs/secrets.md) — secrets, env bundles, precedence rules
   - [config.md](./docs/config.md) — per-project `pillbox.toml`
   - [vault.md](./docs/vault.md) — `--vault` MITM proxy + stub credential swap
-  - [strict.md](./docs/strict.md) — `--strict` Gondolin microVM mode
   - [recipes.md](./docs/recipes.md) — copy-paste flows for common tasks
   - [security.md](./docs/security.md) — threat model and what pillbox defends against
 

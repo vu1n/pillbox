@@ -128,4 +128,183 @@ mod tests {
         assert_eq!(r.api_key_real_for_stub(stub), Some("sk-real-xyz"));
         assert!(r.api_key_real_for_stub("sk-unknown").is_none());
     }
+
+    // ── End-to-end Request/Response integration tests ────────────────
+
+    use crate::vault::known_secrets::HeaderScheme;
+    use crate::vault::providers::test_support::{
+        body_bytes, build_request, cleanup, expect_request, fresh_server,
+    };
+    use crate::vault::providers::PendingFlow;
+    use hudsucker::{hyper::Request as HReq, Body};
+
+    #[tokio::test]
+    async fn bearer_request_swaps_stub_to_real_api_key() {
+        let (server, dir) = fresh_server().await;
+        let (_lease, stub) = server
+            .lease_api_key_for_test(
+                "OPENAI_API_KEY",
+                "sk-real-openai-key",
+                "api.openai.com",
+                HeaderScheme::AuthorizationBearer,
+                "sk-",
+            )
+            .expect("lease api key");
+
+        let req = build_request(
+            "POST",
+            "https://api.openai.com/v1/chat/completions",
+            Body::empty(),
+        );
+        let req = {
+            let (mut parts, body) = req.into_parts();
+            parts
+                .headers
+                .insert("authorization", format!("Bearer {stub}").parse().unwrap());
+            HReq::from_parts(parts, body)
+        };
+
+        let mut pending: Option<PendingFlow> = None;
+        let out = OpenAiApiKeyProvider
+            .handle_request(req, server.inner_for_test(), &mut pending)
+            .await;
+        let out_req = expect_request(out, "openai bearer swap");
+        let auth = out_req
+            .headers()
+            .get("authorization")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(auth, "Bearer sk-real-openai-key");
+        assert!(pending.is_none());
+
+        drop(_lease);
+        cleanup(server, dir);
+    }
+
+    #[tokio::test]
+    async fn bearer_unknown_stub_passes_through() {
+        // OpenAI provider uses `swap_bearer_style`, which returns
+        // `PassThrough` for unrecognised stubs (preserves the
+        // `--with OPENAI_API_KEY` no-vault path).
+        let (server, dir) = fresh_server().await;
+        let req = build_request(
+            "POST",
+            "https://api.openai.com/v1/chat/completions",
+            Body::empty(),
+        );
+        let req = {
+            let (mut parts, body) = req.into_parts();
+            parts.headers.insert(
+                "authorization",
+                "Bearer sk-unknown-passthrough".parse().unwrap(),
+            );
+            HReq::from_parts(parts, body)
+        };
+
+        let mut pending = None;
+        let out = OpenAiApiKeyProvider
+            .handle_request(req, server.inner_for_test(), &mut pending)
+            .await;
+        let out_req = expect_request(out, "openai pass-through");
+        assert_eq!(
+            out_req
+                .headers()
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer sk-unknown-passthrough"
+        );
+
+        cleanup(server, dir);
+    }
+
+    #[tokio::test]
+    async fn no_auth_header_passes_through() {
+        let (server, dir) = fresh_server().await;
+        let req = build_request("GET", "https://api.openai.com/v1/models", Body::empty());
+        let mut pending = None;
+        let out = OpenAiApiKeyProvider
+            .handle_request(req, server.inner_for_test(), &mut pending)
+            .await;
+        let out_req = expect_request(out, "openai no-auth");
+        assert!(out_req.headers().get("authorization").is_none());
+        cleanup(server, dir);
+    }
+
+    #[tokio::test]
+    async fn anthropic_stub_routed_to_openai_handler_is_no_op() {
+        // Cross-provider routing sanity: an anthropic-OAuth bearer
+        // (sk-ant-oat01-…) reaching the openai handler should NOT
+        // resolve via openai (the registry entry is OAuth-shaped, not
+        // API-key-shaped) — provider must pass through unchanged.
+        let (server, dir) = fresh_server().await;
+        let _lease = server
+            .lease(
+                "claude",
+                "sbx-cross",
+                crate::vault::providers::test_support::sample_anthropic_real(),
+            )
+            .expect("lease");
+        let stub_access = {
+            let registry = server.registry_lock_for_test();
+            registry
+                .stubs_for("sbx-cross")
+                .unwrap()
+                .iter()
+                .find(|s| s.starts_with("sk-ant-oat01-"))
+                .cloned()
+                .unwrap()
+        };
+
+        let req = build_request(
+            "POST",
+            "https://api.openai.com/v1/chat/completions",
+            Body::empty(),
+        );
+        let req = {
+            let (mut parts, body) = req.into_parts();
+            parts.headers.insert(
+                "authorization",
+                format!("Bearer {stub_access}").parse().unwrap(),
+            );
+            HReq::from_parts(parts, body)
+        };
+
+        let mut pending = None;
+        let out = OpenAiApiKeyProvider
+            .handle_request(req, server.inner_for_test(), &mut pending)
+            .await;
+        let out_req = expect_request(out, "cross-provider no-op");
+        // Bearer header untouched.
+        assert_eq!(
+            out_req
+                .headers()
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            format!("Bearer {stub_access}")
+        );
+
+        drop(_lease);
+        cleanup(server, dir);
+    }
+
+    #[tokio::test]
+    async fn handle_response_is_pass_through() {
+        let (server, dir) = fresh_server().await;
+        let res = hudsucker::hyper::Response::builder()
+            .status(200)
+            .body(Body::from("hello"))
+            .unwrap();
+        let mut pending = None;
+        let out = OpenAiApiKeyProvider
+            .handle_response(res, server.inner_for_test(), &mut pending)
+            .await;
+        let bytes = body_bytes(out.into_body()).await;
+        assert_eq!(bytes, b"hello");
+        cleanup(server, dir);
+    }
 }

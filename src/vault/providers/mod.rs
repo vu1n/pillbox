@@ -135,9 +135,7 @@ impl Registry {
         if data.provider_id != API_KEY_PROVIDER_ID {
             return None;
         }
-        data.real
-            .get("value")
-            .and_then(|v| v.as_str())
+        data.real.get("value").and_then(|v| v.as_str())
     }
 }
 
@@ -321,10 +319,7 @@ pub(crate) fn swap_bearer_style(
 /// Equivalent of `swap_bearer_style` for raw-value headers like
 /// Anthropic's `x-api-key`, where the header value IS the stub (no
 /// scheme prefix).
-pub(crate) fn swap_raw_header(
-    header_value: &HeaderValue,
-    server: &ServerInner,
-) -> ApiKeySwap {
+pub(crate) fn swap_raw_header(header_value: &HeaderValue, server: &ServerInner) -> ApiKeySwap {
     let Ok(stub) = header_value.to_str() else {
         return ApiKeySwap::Unauthorized("non-utf8 header");
     };
@@ -356,10 +351,7 @@ mod tests {
     #[test]
     fn insert_then_remove_clears_stub_lookups() {
         let mut r = Registry::new();
-        r.insert(
-            "sbx-1".into(),
-            data("claude", vec!["stub-a", "stub-b"]),
-        );
+        r.insert("sbx-1".into(), data("claude", vec!["stub-a", "stub-b"]));
         assert_eq!(r.sandbox_for_stub("stub-a"), Some("sbx-1"));
         assert_eq!(r.sandbox_for_stub("stub-b"), Some("sbx-1"));
 
@@ -378,11 +370,7 @@ mod tests {
         });
         r.insert("sbx-1".into(), d);
 
-        r.rotate_real_field(
-            "sbx-1",
-            "/claudeAiOauth/accessToken",
-            "new-access".into(),
-        );
+        r.rotate_real_field("sbx-1", "/claudeAiOauth/accessToken", "new-access".into());
 
         let v = r.real("sbx-1").unwrap();
         assert_eq!(
@@ -415,5 +403,143 @@ mod tests {
         assert!(provider_for("claude").is_some());
         assert!(provider_for("codex").is_some());
         assert!(provider_for("nope").is_none());
+    }
+}
+
+// ── Shared integration-test helpers ────────────────────────────────────
+//
+// Per-provider integration tests construct hyper `Request<Body>` /
+// `Response<Body>` objects and feed them straight to the matching
+// provider's `handle_request` / `handle_response`. The plumbing
+// (booting a `Server`, draining bodies, asserting on stubbed/swapped
+// headers) is identical across providers — collect it here so each
+// provider's test module stays focused on its own header/body shape.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::PathBuf;
+
+    use http_body_util::BodyExt;
+    use hudsucker::{
+        hyper::{Request, Response},
+        Body, RequestOrResponse,
+    };
+
+    use crate::vault::server::{Server, ServerConfig};
+
+    /// Spin up a fresh vault `Server` bound to an ephemeral local port,
+    /// plus the tempdir the CA was written into (for cleanup).
+    pub(crate) async fn fresh_server() -> (Server, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("pillbox-vault-itest-{}", uuid::Uuid::now_v7()));
+        let server = Server::start(ServerConfig {
+            bind: None,
+            ca_dir: dir.clone(),
+        })
+        .await
+        .expect("server start");
+        (server, dir)
+    }
+
+    /// Drop the server (graceful proxy shutdown) and best-effort remove
+    /// the CA tempdir. Tests pair this with `fresh_server`.
+    pub(crate) fn cleanup(server: Server, dir: PathBuf) {
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sample real anthropic creds blob used by lease() in tests.
+    pub(crate) fn sample_anthropic_real() -> serde_json::Value {
+        serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "REAL_ACCESS",
+                "refreshToken": "REAL_REFRESH",
+                "expiresAt": 1_700_000_000_u64,
+                "subscriptionType": "pro"
+            }
+        })
+    }
+
+    /// JWT-shaped placeholder used for codex tests (3 dot-separated
+    /// parts so `provision` accepts it).
+    pub(crate) const FAKE_JWT: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature_part_here";
+
+    pub(crate) fn sample_codex_real() -> serde_json::Value {
+        serde_json::json!({
+            "auth_mode": "ChatGPT",
+            "tokens": {
+                "id_token": FAKE_JWT,
+                "access_token": FAKE_JWT,
+                "refresh_token": "rt_codex_real",
+                "account_id": "acct_x"
+            },
+            "last_refresh": "2026-05-18T00:00:00Z",
+            "agent_identity": serde_json::Value::Null
+        })
+    }
+
+    /// Build a minimal `Request<Body>` aimed at `uri`. Caller adds the
+    /// auth header(s) it cares about; this just sets the URI (so
+    /// `host_from_uri` resolves) and method.
+    pub(crate) fn build_request(method: &str, uri: &str, body: Body) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(body)
+            .expect("build request")
+    }
+
+    /// Build a 200-OK `Response<Body>` with a JSON body. Used for the
+    /// OAuth refresh-response swap tests.
+    pub(crate) fn build_json_response(body_json: serde_json::Value) -> Response<Body> {
+        let bytes = serde_json::to_vec(&body_json).expect("serialize json body");
+        let len = bytes.len();
+        Response::builder()
+            .status(200)
+            .header("content-type", "application/json")
+            .header("content-length", len)
+            .body(Body::from(bytes))
+            .expect("build response")
+    }
+
+    /// Collect a body's bytes into a `Vec<u8>`. Tests use this to read
+    /// the rewritten body of the returned Request/Response.
+    pub(crate) async fn body_bytes(body: Body) -> Vec<u8> {
+        body.collect()
+            .await
+            .expect("collect body")
+            .to_bytes()
+            .to_vec()
+    }
+
+    /// Collect a body's bytes and parse as JSON. Convenience wrapper for
+    /// the OAuth refresh body assertions.
+    pub(crate) async fn body_json(body: Body) -> serde_json::Value {
+        let bytes = body_bytes(body).await;
+        serde_json::from_slice(&bytes).expect("body should be json")
+    }
+
+    /// Destructure a `RequestOrResponse` into the `Request` variant or
+    /// panic with `label`. Tests use this to assert the provider chose
+    /// pass-through / swap rather than 401.
+    pub(crate) fn expect_request(rr: RequestOrResponse, label: &str) -> Request<Body> {
+        match rr {
+            RequestOrResponse::Request(req) => req,
+            RequestOrResponse::Response(res) => {
+                panic!(
+                    "{label}: expected Request, got Response with status {}",
+                    res.status()
+                )
+            }
+        }
+    }
+
+    /// Destructure a `RequestOrResponse` into the `Response` variant or
+    /// panic with `label`. Tests use this to assert the provider
+    /// rejected an unknown stub at the proxy edge.
+    pub(crate) fn expect_response(rr: RequestOrResponse, label: &str) -> Response<Body> {
+        match rr {
+            RequestOrResponse::Request(_) => panic!("{label}: expected Response, got Request"),
+            RequestOrResponse::Response(res) => res,
+        }
     }
 }

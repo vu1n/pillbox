@@ -276,10 +276,7 @@ async fn handle_oauth_request(
     };
 
     if let (Some(obj), Some(real)) = (value.as_object_mut(), real_refresh) {
-        obj.insert(
-            "refresh_token".to_string(),
-            serde_json::Value::String(real),
-        );
+        obj.insert("refresh_token".to_string(), serde_json::Value::String(real));
     }
 
     let new_body = serde_json::to_vec(&value).unwrap_or(collected.to_vec());
@@ -299,10 +296,7 @@ async fn handle_oauth_request(
 ///
 /// We dispatch by which header is present. If neither carries one of
 /// ours, we pass through (lets unvaulted `--with` requests keep working).
-async fn handle_api_request(
-    req: Request<Body>,
-    server: &ServerInner,
-) -> RequestOrResponse {
+async fn handle_api_request(req: Request<Body>, server: &ServerInner) -> RequestOrResponse {
     let has_x_api_key = req.headers().get(X_API_KEY_HEADER).is_some();
     if has_x_api_key {
         return handle_api_request_x_api_key(req, server).await;
@@ -312,10 +306,7 @@ async fn handle_api_request(
 
 const X_API_KEY_HEADER: &str = "x-api-key";
 
-async fn handle_api_request_bearer(
-    req: Request<Body>,
-    server: &ServerInner,
-) -> RequestOrResponse {
+async fn handle_api_request_bearer(req: Request<Body>, server: &ServerInner) -> RequestOrResponse {
     let (mut parts, body) = req.into_parts();
 
     let Some(auth_value) = parts.headers.get(AUTHORIZATION).cloned() else {
@@ -500,10 +491,415 @@ mod tests {
             Some("sk-ant-api03-REAL-secret"),
         );
         // OAuth-style real lookup should NOT pick it up (different shape).
-        assert!(
-            r.real("sbx-apikey")
-                .and_then(|v| v.pointer("/claudeAiOauth/accessToken"))
-                .is_none()
+        assert!(r
+            .real("sbx-apikey")
+            .and_then(|v| v.pointer("/claudeAiOauth/accessToken"))
+            .is_none());
+    }
+
+    // ── End-to-end Request/Response integration tests ────────────────
+    //
+    // These tests construct hyper `Request<Body>` / `Response<Body>`
+    // objects, hand them to the provider's handlers, and assert on the
+    // returned objects. They live in the crate test module (rather than
+    // a separate `tests/` integration crate) because the trait methods
+    // and supporting types are `pub(crate)`.
+
+    use crate::vault::known_secrets::HeaderScheme;
+    use crate::vault::providers::test_support::{
+        body_bytes, body_json, build_json_response, build_request, cleanup, expect_request,
+        expect_response, fresh_server, sample_anthropic_real,
+    };
+    use hudsucker::Body;
+
+    /// Pull the access + refresh stubs out of the registry for a sandbox
+    /// id. Tests use this right after `Server::lease("claude", ..)` to
+    /// learn the stubs the provider minted.
+    fn stubs_for_sandbox(
+        server: &crate::vault::server::Server,
+        sandbox_id: &str,
+    ) -> (String, String) {
+        let registry = server.registry_lock_for_test();
+        let stubs = registry.stubs_for(sandbox_id).unwrap().to_vec();
+        let access = stubs
+            .iter()
+            .find(|s| s.starts_with(STUB_ACCESS_PREFIX))
+            .cloned()
+            .expect("access stub present");
+        let refresh = stubs
+            .iter()
+            .find(|s| s.starts_with(STUB_REFRESH_PREFIX))
+            .cloned()
+            .expect("refresh stub present");
+        (access, refresh)
+    }
+
+    #[tokio::test]
+    async fn bearer_request_swaps_stub_to_real_access_token() {
+        let (server, dir) = fresh_server().await;
+        let _lease = server
+            .lease("claude", "sbx-int", sample_anthropic_real())
+            .expect("lease");
+        let (stub_access, _stub_refresh) = stubs_for_sandbox(&server, "sbx-int");
+
+        let req = build_request(
+            "POST",
+            "https://api.anthropic.com/v1/messages",
+            Body::empty(),
         );
+        let req = {
+            let (mut parts, body) = req.into_parts();
+            parts.headers.insert(
+                "authorization",
+                format!("Bearer {stub_access}").parse().unwrap(),
+            );
+            Request::from_parts(parts, body)
+        };
+
+        let mut pending: Option<PendingFlow> = None;
+        let out = AnthropicProvider
+            .handle_request(req, server.inner_for_test(), &mut pending)
+            .await;
+        let out_req = expect_request(out, "bearer swap");
+
+        let auth = out_req
+            .headers()
+            .get("authorization")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(auth, "Bearer REAL_ACCESS");
+        // The bearer flow doesn't need a response-side swap.
+        assert!(pending.is_none());
+
+        drop(_lease);
+        cleanup(server, dir);
+    }
+
+    #[tokio::test]
+    async fn bearer_request_with_unknown_stub_returns_401() {
+        let (server, dir) = fresh_server().await;
+        let req = build_request(
+            "POST",
+            "https://api.anthropic.com/v1/messages",
+            Body::empty(),
+        );
+        let req = {
+            let (mut parts, body) = req.into_parts();
+            parts.headers.insert(
+                "authorization",
+                "Bearer sk-ant-oat01-unknownStubValue".parse().unwrap(),
+            );
+            Request::from_parts(parts, body)
+        };
+
+        let mut pending: Option<PendingFlow> = None;
+        let out = AnthropicProvider
+            .handle_request(req, server.inner_for_test(), &mut pending)
+            .await;
+        let res = expect_response(out, "unknown bearer");
+        assert_eq!(res.status(), 401);
+        let body = body_bytes(res.into_body()).await;
+        let s = std::str::from_utf8(&body).unwrap();
+        assert!(s.contains("\"vault\":\"unauthorized\""), "body: {s}");
+        assert!(s.contains("unknown stub access token"), "body: {s}");
+        assert!(pending.is_none());
+
+        cleanup(server, dir);
+    }
+
+    #[tokio::test]
+    async fn bearer_request_without_auth_header_passes_through() {
+        let (server, dir) = fresh_server().await;
+        let req = build_request("GET", "https://api.anthropic.com/v1/models", Body::empty());
+
+        let mut pending: Option<PendingFlow> = None;
+        let out = AnthropicProvider
+            .handle_request(req, server.inner_for_test(), &mut pending)
+            .await;
+        let out_req = expect_request(out, "no-auth pass-through");
+        assert!(out_req.headers().get("authorization").is_none());
+        assert!(pending.is_none());
+
+        cleanup(server, dir);
+    }
+
+    #[tokio::test]
+    async fn x_api_key_request_swaps_stub_to_real_value() {
+        let (server, dir) = fresh_server().await;
+        let (_api_lease, stub) = server
+            .lease_api_key_for_test(
+                "ANTHROPIC_API_KEY",
+                "sk-ant-api03-REAL-secret",
+                "api.anthropic.com",
+                HeaderScheme::XApiKey,
+                "sk-ant-api03-",
+            )
+            .expect("lease api key");
+
+        let req = build_request(
+            "POST",
+            "https://api.anthropic.com/v1/messages",
+            Body::empty(),
+        );
+        let req = {
+            let (mut parts, body) = req.into_parts();
+            parts.headers.insert("x-api-key", stub.parse().unwrap());
+            Request::from_parts(parts, body)
+        };
+
+        let mut pending: Option<PendingFlow> = None;
+        let out = AnthropicProvider
+            .handle_request(req, server.inner_for_test(), &mut pending)
+            .await;
+        let out_req = expect_request(out, "x-api-key swap");
+        let key = out_req
+            .headers()
+            .get("x-api-key")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(key, "sk-ant-api03-REAL-secret");
+
+        drop(_api_lease);
+        cleanup(server, dir);
+    }
+
+    #[tokio::test]
+    async fn x_api_key_unknown_stub_passes_through() {
+        // For x-api-key, an unknown value is treated as a `--with`'d
+        // real key (no vault meta) — the provider should pass it
+        // through rather than 401. This is documented on `ApiKeySwap::PassThrough`.
+        let (server, dir) = fresh_server().await;
+        let req = build_request(
+            "POST",
+            "https://api.anthropic.com/v1/messages",
+            Body::empty(),
+        );
+        let req = {
+            let (mut parts, body) = req.into_parts();
+            parts
+                .headers
+                .insert("x-api-key", "sk-ant-api03-not-a-stub".parse().unwrap());
+            Request::from_parts(parts, body)
+        };
+
+        let mut pending: Option<PendingFlow> = None;
+        let out = AnthropicProvider
+            .handle_request(req, server.inner_for_test(), &mut pending)
+            .await;
+        let out_req = expect_request(out, "x-api-key pass-through");
+        assert_eq!(
+            out_req
+                .headers()
+                .get("x-api-key")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "sk-ant-api03-not-a-stub"
+        );
+
+        cleanup(server, dir);
+    }
+
+    #[tokio::test]
+    async fn oauth_refresh_request_swaps_body_and_sets_pending() {
+        let (server, dir) = fresh_server().await;
+        let _lease = server
+            .lease("claude", "sbx-oauth", sample_anthropic_real())
+            .expect("lease");
+        let (_, stub_refresh) = stubs_for_sandbox(&server, "sbx-oauth");
+
+        let body_json_in = serde_json::json!({
+            "grant_type": "refresh_token",
+            "refresh_token": stub_refresh,
+        });
+        let body_bytes_in = serde_json::to_vec(&body_json_in).unwrap();
+        let len = body_bytes_in.len();
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://console.anthropic.com/oauth/token")
+            .header("content-type", "application/json")
+            .header("content-length", len)
+            .body(Body::from(body_bytes_in))
+            .unwrap();
+
+        let mut pending: Option<PendingFlow> = None;
+        let out = AnthropicProvider
+            .handle_request(req, server.inner_for_test(), &mut pending)
+            .await;
+        let out_req = expect_request(out, "oauth refresh request");
+
+        let body = body_json(out_req.into_body()).await;
+        assert_eq!(
+            body.get("refresh_token").and_then(|v| v.as_str()),
+            Some("REAL_REFRESH")
+        );
+        let flow = pending.expect("pending should be set for oauth refresh");
+        assert_eq!(flow.provider_id, "claude");
+        assert_eq!(flow.sandbox_id, "sbx-oauth");
+
+        drop(_lease);
+        cleanup(server, dir);
+    }
+
+    #[tokio::test]
+    async fn oauth_refresh_request_unknown_stub_returns_401_and_no_pending() {
+        let (server, dir) = fresh_server().await;
+        let body_json_in = serde_json::json!({
+            "grant_type": "refresh_token",
+            "refresh_token": "sk-ant-ort01-unknownStubRefresh",
+        });
+        let body_bytes_in = serde_json::to_vec(&body_json_in).unwrap();
+        let len = body_bytes_in.len();
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://console.anthropic.com/oauth/token")
+            .header("content-type", "application/json")
+            .header("content-length", len)
+            .body(Body::from(body_bytes_in))
+            .unwrap();
+
+        let mut pending: Option<PendingFlow> = None;
+        let out = AnthropicProvider
+            .handle_request(req, server.inner_for_test(), &mut pending)
+            .await;
+        let res = expect_response(out, "oauth unknown stub");
+        assert_eq!(res.status(), 401);
+        assert!(pending.is_none());
+
+        cleanup(server, dir);
+    }
+
+    #[tokio::test]
+    async fn oauth_refresh_response_swaps_real_to_new_stubs_and_rotates_registry() {
+        let (server, dir) = fresh_server().await;
+        let _lease = server
+            .lease("claude", "sbx-rot", sample_anthropic_real())
+            .expect("lease");
+        let (stub_access_before, stub_refresh_before) = stubs_for_sandbox(&server, "sbx-rot");
+
+        // The response handler only fires when pending was set by a
+        // prior request-side swap. Mirror that here.
+        let mut pending: Option<PendingFlow> = Some(PendingFlow {
+            provider_id: "claude",
+            sandbox_id: "sbx-rot".into(),
+        });
+
+        let res = build_json_response(serde_json::json!({
+            "access_token": "NEW_REAL_ACCESS",
+            "refresh_token": "NEW_REAL_REFRESH",
+            "expires_in": 3600,
+        }));
+
+        let out = AnthropicProvider
+            .handle_response(res, server.inner_for_test(), &mut pending)
+            .await;
+
+        // Pending must be cleared so the next request/response pair
+        // starts fresh.
+        assert!(pending.is_none());
+
+        let (parts, body) = out.into_parts();
+        // content-length must reflect the rewritten body, not the old one.
+        let cl: usize = parts
+            .headers
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse().ok())
+            .expect("content-length present and numeric");
+        let raw_body = body_bytes(body).await;
+        assert_eq!(cl, raw_body.len(), "content-length matches body length");
+
+        let body: serde_json::Value = serde_json::from_slice(&raw_body).unwrap();
+        let access = body.get("access_token").and_then(|v| v.as_str()).unwrap();
+        let refresh = body.get("refresh_token").and_then(|v| v.as_str()).unwrap();
+        // Body must carry stubs back to the guest, not the new real tokens.
+        assert!(access.starts_with(STUB_ACCESS_PREFIX), "got {access}");
+        assert!(refresh.starts_with(STUB_REFRESH_PREFIX), "got {refresh}");
+        assert!(!raw_body.windows(15).any(|w| w == b"NEW_REAL_ACCESS"));
+        assert!(!raw_body.windows(16).any(|w| w == b"NEW_REAL_REFRESH"));
+
+        // Stubs minted at provision time stay stable across rotation —
+        // pillbox rotates only the *real* side, not the stub the guest sees.
+        let (stub_access_after, stub_refresh_after) = stubs_for_sandbox(&server, "sbx-rot");
+        assert_eq!(stub_access_before, stub_access_after);
+        assert_eq!(stub_refresh_before, stub_refresh_after);
+
+        // Registry's stored real values must have rotated.
+        {
+            let registry = server.registry_lock_for_test();
+            let real = registry.real("sbx-rot").unwrap();
+            assert_eq!(
+                real.pointer("/claudeAiOauth/accessToken")
+                    .and_then(|v| v.as_str()),
+                Some("NEW_REAL_ACCESS")
+            );
+            assert_eq!(
+                real.pointer("/claudeAiOauth/refreshToken")
+                    .and_then(|v| v.as_str()),
+                Some("NEW_REAL_REFRESH")
+            );
+        }
+
+        drop(_lease);
+        cleanup(server, dir);
+    }
+
+    #[tokio::test]
+    async fn lease_drop_makes_stub_stop_resolving() {
+        let (server, dir) = fresh_server().await;
+        let lease = server
+            .lease("claude", "sbx-drop", sample_anthropic_real())
+            .expect("lease");
+        let (stub_access, _stub_refresh) = stubs_for_sandbox(&server, "sbx-drop");
+
+        // Sanity: stub resolves before drop.
+        {
+            let req = build_request(
+                "POST",
+                "https://api.anthropic.com/v1/messages",
+                Body::empty(),
+            );
+            let req = {
+                let (mut parts, body) = req.into_parts();
+                parts.headers.insert(
+                    "authorization",
+                    format!("Bearer {stub_access}").parse().unwrap(),
+                );
+                Request::from_parts(parts, body)
+            };
+            let mut pending = None;
+            let out = AnthropicProvider
+                .handle_request(req, server.inner_for_test(), &mut pending)
+                .await;
+            let _ = expect_request(out, "pre-drop swap");
+        }
+
+        // Drop the lease — the registry mapping is removed.
+        drop(lease);
+
+        // Same stub now 401s.
+        let req = build_request(
+            "POST",
+            "https://api.anthropic.com/v1/messages",
+            Body::empty(),
+        );
+        let req = {
+            let (mut parts, body) = req.into_parts();
+            parts.headers.insert(
+                "authorization",
+                format!("Bearer {stub_access}").parse().unwrap(),
+            );
+            Request::from_parts(parts, body)
+        };
+        let mut pending = None;
+        let out = AnthropicProvider
+            .handle_request(req, server.inner_for_test(), &mut pending)
+            .await;
+        let res = expect_response(out, "post-drop 401");
+        assert_eq!(res.status(), 401);
+
+        cleanup(server, dir);
     }
 }

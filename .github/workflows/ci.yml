@@ -1,0 +1,43 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+# Cancel stale in-flight runs when a new commit lands on the same PR /
+# branch — saves macOS minutes (~10x cost) on iterative force-pushes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rust
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          # On Cargo.lock churn the target/ dir is stale but the registry
+          # download is still good; fall back to the newest cache for this
+          # OS so we don't re-fetch every crate.
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      # Lint+format gates are platform-independent; only run them once
+      # (on ubuntu) to save macOS minutes (~10x cost).
+      - if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --check
+      - run: cargo test --all-targets
+      - if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy --all-targets -- -D warnings

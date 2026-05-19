@@ -14,7 +14,7 @@
 //!    it over the guest's real credentials file (at the path the
 //!    provider's `creds_path()` reports).
 //! 4. The CA cert is mounted into the guest, and `NODE_EXTRA_CA_CERTS`
-//!    + `HTTPS_PROXY=http://host.docker.internal:<port>` are wired into
+//!    plus `HTTPS_PROXY=http://host.docker.internal:<port>` are wired into
 //!    the guest env.
 //! 5. Guest hits an intercepted host; the proxy dispatches to the
 //!    provider that owns the host, which swaps stubs for real tokens

@@ -129,7 +129,10 @@ impl VaultSession {
         for mount in &self.oauth_mounts {
             let guest_creds = format!("{guest_home}/{}", mount.creds_path.display());
             out.push("-v".into());
-            out.push(format!("{}:{guest_creds}:ro", mount.stub_file.path().display()));
+            out.push(format!(
+                "{}:{guest_creds}:ro",
+                mount.stub_file.path().display()
+            ));
         }
         out.extend([
             "-e".into(),
@@ -170,24 +173,17 @@ fn provision_oauth_mount(server: &Server, agent: OAuthAgent<'_>) -> Result<OAuth
     let creds_path = agent.agent_home.join(&creds_rel);
 
     let real_bytes = fs::read(&creds_path).map_err(|e| {
-        PillboxError::runtime(
-            "vault",
-            format!("read {}: {e}", creds_path.display()),
+        PillboxError::runtime("vault", format!("read {}: {e}", creds_path.display())).with_next(
+            format!("pillbox {} login   # refresh credentials", agent.agent_id),
         )
-        .with_next(format!(
-            "pillbox {} login   # refresh credentials",
-            agent.agent_id
-        ))
     })?;
     let real: serde_json::Value = serde_json::from_slice(&real_bytes).map_err(|e| {
-        PillboxError::runtime(
-            "vault",
-            format!("parse {}: {e}", creds_path.display()),
+        PillboxError::runtime("vault", format!("parse {}: {e}", creds_path.display())).with_next(
+            format!(
+                "pillbox {} login   # credentials file is malformed",
+                agent.agent_id
+            ),
         )
-        .with_next(format!(
-            "pillbox {} login   # credentials file is malformed",
-            agent.agent_id
-        ))
     })?;
 
     let sandbox_id = uuid::Uuid::now_v7().to_string();
@@ -218,11 +214,8 @@ fn write_private(path: &Path, content: &str) -> Result<()> {
         .write(true)
         .mode(0o600)
         .open(path)
-        .map_err(|e| {
-            PillboxError::runtime("vault", format!("open {}: {e}", path.display()))
-        })?;
-    f.write_all(content.as_bytes()).map_err(|e| {
-        PillboxError::runtime("vault", format!("write {}: {e}", path.display()))
-    })?;
+        .map_err(|e| PillboxError::runtime("vault", format!("open {}: {e}", path.display())))?;
+    f.write_all(content.as_bytes())
+        .map_err(|e| PillboxError::runtime("vault", format!("write {}: {e}", path.display())))?;
     Ok(())
 }

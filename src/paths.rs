@@ -2,11 +2,7 @@
 //! here so the parent's perms get pinned to 0700 on every touch
 //! (`fs::create_dir_all` uses the process umask, typically 022 → 755).
 
-use std::{
-    fs,
-    os::unix::fs::PermissionsExt,
-    path::PathBuf,
-};
+use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
 
 use anyhow::{Context, Result};
 

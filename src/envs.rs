@@ -63,14 +63,13 @@ pub(crate) fn load(name: &str, source_path: &Path, if_not_exists: bool) -> Resul
     validate_name("env load", name)?;
     let dest = bundle_path(name)?;
     if if_not_exists && dest.exists() {
-        return Err(PillboxError::runtime(
-            "env load",
-            format!("bundle `{name}` already exists"),
-        )
-        .with_next(format!(
-            "pillbox env rm {name}  # then re-load  (or drop --if-not-exists)"
-        ))
-        .into());
+        return Err(
+            PillboxError::runtime("env load", format!("bundle `{name}` already exists"))
+                .with_next(format!(
+                    "pillbox env rm {name}  # then re-load  (or drop --if-not-exists)"
+                ))
+                .into(),
+        );
     }
     let content = fs::read_to_string(source_path).map_err(|e| {
         PillboxError::runtime(
@@ -110,10 +109,9 @@ pub(crate) fn list(json: bool) -> Result<()> {
 
 pub(crate) fn show(name: &str, reveal: bool, to_stdout: bool, json: bool) -> Result<()> {
     let vars = read(name)?.ok_or_else(|| {
-        PillboxError::runtime("env show", format!("bundle `{name}` not found"))
-            .with_next(format!(
-                "pillbox env load {name} <PATH>  # load one from a .env file"
-            ))
+        PillboxError::runtime("env show", format!("bundle `{name}` not found")).with_next(format!(
+            "pillbox env load {name} <PATH>  # load one from a .env file"
+        ))
     })?;
     if reveal && !std::io::IsTerminal::is_terminal(&std::io::stdout()) && !to_stdout {
         return Err(PillboxError::usage(
@@ -197,7 +195,9 @@ pub(crate) fn parse_dotenv(content: &str, source: &str) -> Result<BTreeMap<Strin
 
 fn is_valid_env_key(k: &str) -> bool {
     let mut chars = k.chars();
-    let Some(first) = chars.next() else { return false };
+    let Some(first) = chars.next() else {
+        return false;
+    };
     if !(first.is_ascii_alphabetic() || first == '_') {
         return false;
     }
@@ -248,14 +248,13 @@ fn build_list_json(names: &[String]) -> Result<String> {
         );
         bundles.push(serde_json::Value::Object(o));
     }
-    Ok(crate::paths::json_v1(vec![("bundles", serde_json::Value::Array(bundles))]))
+    Ok(crate::paths::json_v1(vec![(
+        "bundles",
+        serde_json::Value::Array(bundles),
+    )]))
 }
 
-fn build_show_json(
-    name: &str,
-    vars: &BTreeMap<String, String>,
-    revealed: bool,
-) -> Result<String> {
+fn build_show_json(name: &str, vars: &BTreeMap<String, String>, revealed: bool) -> Result<String> {
     let variables: Vec<serde_json::Value> = vars
         .iter()
         .map(|(k, v)| {
@@ -286,8 +285,11 @@ mod tests {
 
     #[test]
     fn ignores_comments_and_blanks() {
-        let out = parse_dotenv("# top comment\n\nFOO=bar\n  # indented comment\nBAZ=qux\n", "t")
-            .unwrap();
+        let out = parse_dotenv(
+            "# top comment\n\nFOO=bar\n  # indented comment\nBAZ=qux\n",
+            "t",
+        )
+        .unwrap();
         assert_eq!(out.len(), 2);
     }
 
@@ -299,8 +301,7 @@ mod tests {
 
     #[test]
     fn unwraps_quoted_values() {
-        let out =
-            parse_dotenv("A=\"hello world\"\nB='single quoted'\nC=plain\n", "t").unwrap();
+        let out = parse_dotenv("A=\"hello world\"\nB='single quoted'\nC=plain\n", "t").unwrap();
         assert_eq!(out.get("A").unwrap(), "hello world");
         assert_eq!(out.get("B").unwrap(), "single quoted");
         assert_eq!(out.get("C").unwrap(), "plain");

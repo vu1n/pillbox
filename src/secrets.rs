@@ -84,10 +84,7 @@ pub(crate) fn read_meta(name: &str) -> Result<Option<VaultMeta>> {
         Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
     };
     let meta: VaultMeta = serde_json::from_str(&raw).map_err(|e| {
-        PillboxError::config(
-            "secret read",
-            format!("parse {}: {e}", path.display()),
-        )
+        PillboxError::config("secret read", format!("parse {}: {e}", path.display()))
     })?;
     Ok(Some(meta))
 }
@@ -117,12 +114,13 @@ pub(crate) fn add(
     validate_name("secret add", name)?;
     let path = secret_path(name)?;
     if if_not_exists && path.exists() {
-        return Err(PillboxError::runtime(
-            "secret add",
-            format!("`{name}` already exists"),
-        )
-        .with_next(format!("pillbox secret rm {name}  # then re-add  (or drop --if-not-exists)"))
-        .into());
+        return Err(
+            PillboxError::runtime("secret add", format!("`{name}` already exists"))
+                .with_next(format!(
+                    "pillbox secret rm {name}  # then re-add  (or drop --if-not-exists)"
+                ))
+                .into(),
+        );
     }
     let value = read_value(name, source)?;
     write_secret_file(&path, &value)?;
@@ -326,12 +324,7 @@ fn build_list_json(names: &[String]) -> Result<String> {
     )]))
 }
 
-fn build_show_json(
-    name: &str,
-    value: &str,
-    revealed: bool,
-    meta: Option<&VaultMeta>,
-) -> String {
+fn build_show_json(name: &str, value: &str, revealed: bool, meta: Option<&VaultMeta>) -> String {
     let mut fields: Vec<(&'static str, serde_json::Value)> = vec![
         ("name", serde_json::Value::String(name.into())),
         ("value", serde_json::Value::String(value.into())),
@@ -374,7 +367,10 @@ mod tests {
     #[test]
     fn mask_shows_last_four_chars() {
         assert_eq!(mask("abcdefgh"), "****efgh");
-        assert_eq!(mask("sk-ant-api03-secretvalue123"), "***********************e123");
+        assert_eq!(
+            mask("sk-ant-api03-secretvalue123"),
+            "***********************e123"
+        );
     }
 
     #[test]

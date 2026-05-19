@@ -12,9 +12,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use rcgen::{
-    BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose,
-};
+use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose};
 use time::{Duration, OffsetDateTime};
 
 const CA_CERT_FILE: &str = "pillbox-vault-ca.crt";
@@ -49,10 +47,10 @@ impl Ca {
         let key_path = dir.join(CA_KEY_FILE);
 
         if cert_path.exists() && key_path.exists() {
-            let cert_pem = fs::read_to_string(&cert_path)
-                .map_err(|error| format!("read ca cert: {error}"))?;
-            let key_pem = fs::read_to_string(&key_path)
-                .map_err(|error| format!("read ca key: {error}"))?;
+            let cert_pem =
+                fs::read_to_string(&cert_path).map_err(|error| format!("read ca cert: {error}"))?;
+            let key_pem =
+                fs::read_to_string(&key_path).map_err(|error| format!("read ca key: {error}"))?;
             return Ok(Self {
                 cert_pem,
                 key_pem,
@@ -100,8 +98,8 @@ impl Ca {
 
     /// Build an rcgen `Issuer` so the proxy can mint leaf certs.
     pub fn issuer(&self) -> Result<Issuer<'static, KeyPair>, String> {
-        let key_pair = KeyPair::from_pem(&self.key_pem)
-            .map_err(|error| format!("parse ca key: {error}"))?;
+        let key_pair =
+            KeyPair::from_pem(&self.key_pem).map_err(|error| format!("parse ca key: {error}"))?;
         Issuer::from_ca_cert_pem(&self.cert_pem, key_pair)
             .map_err(|error| format!("parse ca cert: {error}"))
     }

@@ -56,7 +56,6 @@ Stop reading if that's all you need. The rest is reference.
 | `--with NAME[=ENV_VAR]` | — | Inject one stored secret. `NAME` alone means `NAME=NAME`. Repeatable. |
 | `--env BUNDLE` | — | Inject every variable from a stored env bundle |
 | `--env-file PATH` | — | Inject every variable from a `.env` file on disk (no persistence) |
-| `--strict` | off | Use a Gondolin microVM instead of Docker. v0.4 ships the flag; errors with "unavailable in this build". Real impl in v0.5. See [docs/strict.md](./docs/strict.md). |
 | `--config PATH` | — | Use a specific pillbox.toml (disables discovery) |
 | `--no-config` | — | Skip pillbox.toml discovery entirely |
 | `--vault` | — | Route the agent's auth traffic through the pillbox stub-swap proxy. Supports `claude` (Anthropic OAuth) and `codex` (ChatGPT-mode OAuth). See [docs/vault.md](./docs/vault.md). |

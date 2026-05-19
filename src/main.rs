@@ -24,6 +24,7 @@ mod doctor;
 mod envs;
 mod errors;
 mod paths;
+mod sandbox;
 mod secrets;
 #[cfg(test)]
 mod test_util;
@@ -76,6 +77,23 @@ enum Command {
     Vault {
         #[command(subcommand)]
         action: VaultAction,
+    },
+    /// Run the credential vault as a standalone sidecar process.
+    ///
+    /// v0.6 scaffolding for the local-or-remote sandbox model: PR 2 will
+    /// `ssh remote pillbox sidecar` to host the vault next to a remote
+    /// agent run. For PR 1 the subcommand only verifies the standalone
+    /// vault-server mode boots and is killable; the credential-accept
+    /// path lands in PR 2.
+    Sidecar {
+        /// Listen address for the proxy. Defaults to `127.0.0.1:0`
+        /// (pick a free port).
+        #[arg(long, value_name = "ADDR")]
+        bind: Option<String>,
+        /// Emit the listen address + CA cert path + pid as JSON to
+        /// stdout instead of human text.
+        #[arg(long)]
+        json: bool,
     },
     /// Diagnose pillbox's environment (Docker, image, perms).
     Doctor {
@@ -143,11 +161,6 @@ enum AgentAction {
         /// directory at invocation time. Repeatable.
         #[arg(long = "env-file", value_name = "PATH")]
         env_files: Vec<PathBuf>,
-
-        /// Use a hardware-isolated microVM (Gondolin) instead of Docker.
-        /// v0.4 ships the flag only; see docs/strict.md.
-        #[arg(long)]
-        strict: bool,
 
         /// Load defaults from a specific pillbox.toml. Disables discovery.
         #[arg(long, value_name = "PATH", conflicts_with = "no_config")]
@@ -340,6 +353,7 @@ fn main() -> ExitCode {
             VaultAction::Ca { json } => vault_ca(json),
             VaultAction::Status { json } => vault_status(json),
         },
+        Command::Sidecar { bind, json } => sidecar_run(bind, json),
         Command::Doctor { json } => doctor::run(json),
         Command::Version => {
             println!(
@@ -366,7 +380,6 @@ fn dispatch_agent(spec: AgentSpec, action: AgentAction) -> Result<()> {
             withs,
             env_bundles,
             env_files,
-            strict,
             config,
             no_config,
             vault,
@@ -380,19 +393,16 @@ fn dispatch_agent(spec: AgentSpec, action: AgentAction) -> Result<()> {
                 env_bundles,
                 env_files,
                 vault,
-                strict,
                 args,
             };
             opts.apply_defaults(config::Config::resolve(config, no_config)?);
-            if opts.strict {
-                return Err(PillboxError::usage(
-                    "run",
-                    "--strict (Gondolin microVM) is unavailable in this build",
-                )
-                .with_next("pillbox claude run   # use the default Docker sandbox")
-                .into());
-            }
-            spec.run(opts)
+            // Backend selection lives here, at the CLI/config seam, so a
+            // future `--target` flag or `pillbox.toml` field can pick
+            // between local Docker and a remote backend without
+            // threading state through `AgentSpec`. PR 1 only ships
+            // LocalDocker; PR 2 adds the remote arm.
+            use crate::sandbox::SandboxBackend;
+            crate::sandbox::local_docker::LocalDocker.run(&spec, opts)
         }
     }
 }
@@ -446,9 +456,6 @@ fn show_config(json: bool) -> Result<()> {
             if !c.env_file.is_empty() {
                 println!("  env_file  = {:?}", c.env_file);
             }
-            if c.strict {
-                println!("  strict    = true");
-            }
         }
         None => {
             println!("No pillbox.toml found between cwd and filesystem root.");
@@ -480,7 +487,6 @@ fn config_json_payload(cfg: &Option<config::Config>) -> serde_json::Value {
         o.insert("with".into(), json_string_array(&c.with));
         o.insert("mount".into(), json_string_array(&c.mount));
         o.insert("env_file".into(), json_string_array(&c.env_file));
-        o.insert("strict".into(), serde_json::Value::Bool(c.strict));
     }
     serde_json::Value::Object(o)
 }
@@ -671,6 +677,85 @@ fn resolve_vault_meta(
         scheme,
         prefix.unwrap().to_string(),
     )))
+}
+
+/// Run the credential vault as a standalone process. PR 1 scope:
+/// start the server, print its listen address + CA cert path so a
+/// caller can attach, and block until SIGTERM / SIGINT. PR 2 will
+/// add the credentials-accept endpoint so a remote `pillbox run`
+/// orchestrator can ship real creds in over a control channel.
+fn sidecar_run(bind: Option<String>, json: bool) -> Result<()> {
+    use std::net::SocketAddr;
+
+    let bind_addr =
+        match bind {
+            Some(s) => Some(s.parse::<SocketAddr>().map_err(|e| {
+                PillboxError::usage("sidecar", format!("invalid --bind `{s}`: {e}"))
+            })?),
+            None => None,
+        };
+
+    let ca_dir = paths::data_subdir("vault")?;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| PillboxError::runtime("sidecar", format!("tokio runtime: {e}")))?;
+
+    let server = runtime
+        .block_on(vault::Server::start(vault::ServerConfig {
+            bind: bind_addr,
+            ca_dir,
+        }))
+        .map_err(|e| PillboxError::runtime("sidecar", format!("start vault server: {e}")))?;
+
+    let listen_addr = server.listen_addr();
+    let ca_cert_path = server.ca_cert_path().to_path_buf();
+    let pid = std::process::id();
+
+    if json {
+        println!(
+            "{}",
+            paths::json_v1(vec![
+                (
+                    "listen_addr",
+                    serde_json::Value::String(listen_addr.to_string()),
+                ),
+                (
+                    "ca_cert_path",
+                    serde_json::Value::String(ca_cert_path.display().to_string()),
+                ),
+                ("pid", serde_json::Value::Number(pid.into())),
+            ]),
+        );
+    } else {
+        println!("pillbox sidecar listening on {listen_addr}");
+        println!("  ca_cert: {}", ca_cert_path.display());
+        println!("  pid:     {pid}");
+        println!();
+        println!("Send SIGTERM (or Ctrl+C) to stop. PR 2 wires the credential-accept side.");
+    }
+    // Flush so a parent reading stdout line-buffered sees the address
+    // before it blocks on SIGTERM.
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+
+    // Block until SIGTERM or SIGINT. Server is dropped after the block,
+    // which signals graceful shutdown to the proxy task.
+    runtime.block_on(async {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .map_err(|e| PillboxError::runtime("sidecar", format!("install SIGTERM: {e}")))?;
+        let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .map_err(|e| PillboxError::runtime("sidecar", format!("install SIGINT: {e}")))?;
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
+        Ok::<(), PillboxError>(())
+    })?;
+
+    drop(server);
+    Ok(())
 }
 
 fn auth_rm(provider: &str) -> Result<()> {

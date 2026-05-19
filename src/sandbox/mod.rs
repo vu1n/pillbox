@@ -13,14 +13,13 @@ pub(crate) mod local_docker;
 use anyhow::Result;
 
 use crate::agents::{AgentSpec, RunOpts};
+use crate::pillbox::Pillbox;
 
 /// One backend = one way to provision a sandbox + vault session, inject
 /// credentials, run the agent under a PTY, and wait for exit.
 ///
-/// Methods take `&self` rather than `self` so the same backend can be
-/// reused across multiple runs without rebuilding (e.g. an SSH backend
-/// will eventually hold a connection pool).
+/// v0.6: takes a resolved [`Pillbox`] so the backend can locate the
+/// auth home + vault state for the right scope.
 pub(crate) trait SandboxBackend {
-    /// Equivalent to today's `AgentSpec::run`: end-to-end run.
-    fn run(&self, spec: &AgentSpec, opts: RunOpts) -> Result<()>;
+    fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>;
 }

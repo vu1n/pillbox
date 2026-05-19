@@ -87,7 +87,10 @@ fn check_data_dir_perms() -> Check {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Check::ok(
                 name,
-                format!("{} will be created on first use", path.display()),
+                format!(
+                    "{} will be created on first use (run `pillbox init`)",
+                    path.display()
+                ),
             );
         }
         Err(e) => {
@@ -98,7 +101,7 @@ fn check_data_dir_perms() -> Check {
     // Strict 0700: even *read* access by group/world leaks the list of
     // authenticated providers and stored secret names.
     if mode & 0o077 != 0 {
-        Check::fail(
+        return Check::fail(
             name,
             format!(
                 "{} mode {:o} is group/world accessible — run `chmod 700 {}`",
@@ -106,10 +109,24 @@ fn check_data_dir_perms() -> Check {
                 mode,
                 path.display()
             ),
-        )
-    } else {
-        Check::ok(name, format!("{} mode {mode:o}", path.display()))
+        );
     }
+    // Surface a hint if the v0.5 layout is still around — pillbox itself
+    // errors out at command-time, but doctor flagging it here makes the
+    // diagnosis surface earlier in onboarding. The list of names that
+    // qualify as "legacy" lives in `paths::V0_5_LEGACY_SUBDIRS`.
+    let legacy = crate::paths::detect_legacy_subdirs(&path);
+    if let Some(first) = legacy.first() {
+        return Check::fail(
+            name,
+            format!(
+                "{} mode {mode:o}; legacy v0.5 layout detected (~/.pillbox/{first}/). \
+                 Move ~/.pillbox aside and run `pillbox init`.",
+                path.display(),
+            ),
+        );
+    }
+    Check::ok(name, format!("{} mode {mode:o}", path.display()))
 }
 
 fn check_docker_daemon() -> Check {

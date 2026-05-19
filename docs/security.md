@@ -10,7 +10,7 @@ disk encryption for at-rest defense. Pillbox does the same.
 
 | Threat | How pillbox mitigates |
 |---|---|
-| Agent reads `~/.claude` or `~/.codex` on the host | Sandbox only mounts `~/.pillbox/data/<agent>/`; the agent never sees the host's real config directories. |
+| Agent reads `~/.claude` or `~/.codex` on the host | Sandbox only mounts the resolved auth pillbox's `auth/<agent>/` dir; the agent never sees the host's real config directories. |
 | Agent reads host environment variables | Container env is built from `pillbox` flags only. The host's `$ANTHROPIC_API_KEY` etc. don't leak in. |
 | Login flow contaminated by host state | The login container is one-shot and fresh — no prior state mounted. |
 | Other host tools accidentally consuming pillbox state | Everything is namespaced under `~/.pillbox/` with restrictive perms. |
@@ -27,30 +27,42 @@ disk encryption for at-rest defense. Pillbox does the same.
 | Kernel-level or hypervisor attacks | Docker shares the host kernel. Moving execution to a remote, hardware-isolated host (v0.6) is the answer for workloads that need defense at this tier. |
 | Multi-user separation on a shared host | One secret store per OS user. 0600 blocks other non-root users from reading; a root user on the host bypasses it. |
 
-## Where data lives
+## Where data lives (v0.6)
 
 ```
-~/.pillbox/                       # 0700, parent enforced by paths::data_root
-├── data/                         # 0700
-│   ├── claude/                   # 0700 — claude's HOME between runs
-│   │   ├── .claude/
-│   │   │   ├── .credentials.json    # OAuth tokens (0600)
-│   │   │   └── settings.json
-│   │   └── .claude.json             # profile config
-│   └── codex/                    # 0700 — codex's HOME between runs
-│       └── .codex/
-│           ├── auth.json
-│           └── config.toml
-├── secrets/                      # 0700
-│   └── ANTHROPIC_API_KEY         # 0600, plaintext value
-└── env/                          # 0700
-    └── prod                      # 0600, raw .env content
+~/.pillbox/                          # 0700, parent enforced by paths::pillbox_root
+├── global/                          # 0700 — global pillbox
+│   ├── secrets/<NAME>               # 0600 — plaintext value
+│   ├── env/<NAME>                   # 0600 — raw .env content
+│   ├── auth/                        # 0700 — agent OAuth state (shared)
+│   │   ├── claude/                  # 0700 — claude's HOME between runs
+│   │   │   ├── .claude/
+│   │   │   │   ├── .credentials.json    # OAuth tokens (0600)
+│   │   │   │   └── settings.json
+│   │   │   └── .claude.json             # profile config
+│   │   └── codex/                   # 0700 — codex's HOME between runs
+│   │       └── .codex/
+│   │           ├── auth.json
+│   │           └── config.toml
+│   └── vault/                       # 0700 — CA + key for global vault sessions
+└── projects/                        # 0700
+    └── -Users-x-work-myapp/         # 0700 — one per project pillbox
+        ├── meta.json                # 0600 — descriptor mirror
+        ├── secrets/                 # overrides global on key conflict
+        ├── env/
+        ├── auth/                    # reserved (v0.7 per-project override)
+        └── vault/                   # 0700 — CA + key for this pillbox's vault sessions
 ```
 
-Every directory under `~/.pillbox/` is created via `paths::data_subdir`
-which idempotently re-applies 0700 — so even if a user runs `chmod -R
+Every directory under `~/.pillbox/` is created via the paths helpers
+which idempotently re-apply 0700 — so even if a user runs `chmod -R
 755 ~/.pillbox` by accident, the next pillbox invocation tightens it
 back. `pillbox doctor` flags any remaining loose perms.
+
+`pillbox doctor` also flags the v0.5 layout if it's still present
+(`~/.pillbox/data/`, `~/.pillbox/secrets/`, etc. at the top level).
+v0.6 commands refuse to run until that's moved aside — see the README
+section "Hard reset from v0.5".
 
 ## Why files, not Keychain / DPAPI / libsecret
 

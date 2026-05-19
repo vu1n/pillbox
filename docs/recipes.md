@@ -17,12 +17,19 @@ cd ~/code/pillbox && cargo install --path .
 # Verify
 pillbox doctor
 
-# Authenticate
-pillbox claude login        # OAuth in browser
-pillbox codex login         # device code (URL + code printed)
+# Bootstrap the global pillbox
+pillbox init
+
+# Authenticate (writes to global, shared across projects)
+pillbox auth login --agent claude    # OAuth in browser
+pillbox auth login --agent codex     # device code (URL + code printed)
 
 # Confirm
 pillbox auth list
+
+# Set up a project pillbox
+cd ~/work/myapp
+pillbox new --name myapp
 ```
 
 ## One agent, one API key
@@ -31,7 +38,7 @@ The simplest possible flow.
 
 ```sh
 pillbox secret add ANTHROPIC_API_KEY              # paste, then Ctrl-D
-pillbox claude run --with ANTHROPIC_API_KEY
+pillbox run --with ANTHROPIC_API_KEY
 ```
 
 Inside the sandbox, claude sees `$ANTHROPIC_API_KEY` set to the value
@@ -46,16 +53,16 @@ pillbox env load dev   ~/work/myapp/.env.dev
 pillbox env load stage ~/work/myapp/.env.staging
 pillbox env load prod  ~/work/myapp/.env.prod
 
-pillbox claude run --env dev
-pillbox claude run --env stage
-pillbox claude run --env prod
+pillbox run --env dev
+pillbox run --env stage
+pillbox run --env prod
 ```
 
 To override a single variable for one run (e.g. swap in your personal
 API key):
 
 ```sh
-pillbox claude run --env prod --with ANTHROPIC_API_KEY
+pillbox run --env prod --with ANTHROPIC_API_KEY
 # pillbox: note: ANTHROPIC_API_KEY shadowed by --with ANTHROPIC_API_KEY
 ```
 
@@ -95,13 +102,13 @@ If you want hard failure on conflict, drop the `|| true`.
 
 ```sh
 # Read-only AWS creds
-pillbox claude run --mount ~/.aws:/home/lum/.aws:ro
+pillbox run --mount ~/.aws:/home/lum/.aws:ro
 
 # Sibling repo at /workspace/sibling (in addition to cwd)
-pillbox claude run --mount ~/work/sibling-repo:/workspace/sibling
+pillbox run --mount ~/work/sibling-repo:/workspace/sibling
 
 # SSH agent socket (Linux)
-pillbox claude run --mount $SSH_AUTH_SOCK:/ssh-agent --with SSH_AUTH_SOCK=SSH_AUTH_SOCK
+pillbox run --mount $SSH_AUTH_SOCK:/ssh-agent --with SSH_AUTH_SOCK=SSH_AUTH_SOCK
 ```
 
 The agent's working directory inside the sandbox is always
@@ -112,7 +119,7 @@ with `--name`).
 
 ```sh
 cd ~/work/primary
-pillbox claude run \
+pillbox run \
   --name primary \
   --mount ~/work/lib-a:/workspace/lib-a \
   --mount ~/work/lib-b:/workspace/lib-b \
@@ -155,8 +162,8 @@ that — fields will be added freely, the version bumps on restructure.
 ## Forgetting an agent
 
 ```sh
-pillbox auth rm claude       # wipes ~/.pillbox/data/claude/
-pillbox claude login         # back to a fresh OAuth flow
+pillbox auth rm claude       # wipes ~/.pillbox/global/auth/claude/
+pillbox auth login --agent claude         # back to a fresh OAuth flow
 ```
 
 Useful when you want to log into a different account, or when an agent
@@ -169,7 +176,7 @@ pillbox secret rm ANTHROPIC_API_KEY
 pillbox secret add ANTHROPIC_API_KEY    # paste new value
 ```
 
-Subsequent `pillbox claude run --with ANTHROPIC_API_KEY` picks up the
+Subsequent `pillbox run --with ANTHROPIC_API_KEY` picks up the
 new value automatically — secrets are read at run-time, not at
 sandbox-build-time.
 
@@ -181,14 +188,14 @@ with `pillbox` installed but no state:
 ```sh
 pillbox doctor --json                                # 1. environment sane?
 pillbox auth list --json                             # 2. anyone authenticated?
-# If not, ask the user to run `pillbox claude login` themselves —
+# If not, ask the user to run `pillbox auth login --agent claude` themselves —
 # the OAuth browser flow needs a human.
 
 pillbox secret list --json                           # 3. what secrets exist?
 pillbox env list --json                              # 4. what bundles exist?
 ```
 
-From there, build the right `pillbox claude run` invocation. If a
+From there, build the right `pillbox run` invocation. If a
 needed secret/bundle isn't present, ask the user for the value (or
 where to source it from) rather than guessing.
 

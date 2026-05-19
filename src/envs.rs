@@ -1,15 +1,14 @@
-//! `pillbox env …` — named bundles of environment variables, sourced
-//! from `.env`-formatted files.
+//! `pillbox env …` — named bundles of environment variables, scoped to
+//! the current pillbox.
 //!
-//! Storage: one file per bundle at `~/.pillbox/env/<name>` (0600). The
-//! stored file is the `.env` content verbatim (after we've validated
-//! it parses).
+//! Storage: one file per bundle at `<pillbox>/env/<name>` (0600). Reads
+//! merge global + project (project shadows global on key conflict).
+//! Writes default to project; `--global` forces global.
 //!
-//! The parser is intentionally minimal — KEY=VALUE per line, `#`
-//! comments, blank lines, optional `export` prefix, single/double quotes
-//! around values. No variable interpolation, no command substitution,
-//! no multi-line values. That's enough for the 95% case and predictable
-//! across machines.
+//! The parser is intentionally minimal — KEY=VALUE per line, `#` comments,
+//! blank lines, optional `export` prefix, single/double quotes around
+//! values. No interpolation, no command substitution, no multi-line. Same
+//! grammar as v0.5.
 
 use std::{
     collections::BTreeMap,
@@ -23,53 +22,100 @@ use anyhow::{Context, Result};
 
 use crate::errors::PillboxError;
 use crate::paths::validate_name;
+use crate::pillbox::{Pillbox, Scope, WriteScope};
 
-fn env_dir() -> Result<PathBuf> {
-    crate::paths::data_subdir("env")
+/// Write-side: creates `<pillbox>/env/` if absent and pins 0700.
+fn env_dir(pb: &Pillbox) -> Result<PathBuf> {
+    pb.subdir("env")
 }
 
-fn bundle_path(name: &str) -> Result<PathBuf> {
-    Ok(env_dir()?.join(name))
+/// Read-side: skip the `mkdir`/`chmod`. Bundle reads happen N times per
+/// `pillbox run` (once per `--env BUNDLE`) across two scopes; the dir-touch
+/// overhead is wasted work on the steady-state happy path.
+fn env_dir_read(pb: &Pillbox) -> PathBuf {
+    pb.subdir_path("env")
 }
 
-/// Read a bundle's parsed key/value pairs.
-pub(crate) fn read(name: &str) -> Result<Option<BTreeMap<String, String>>> {
+fn bundle_path(pb: &Pillbox, name: &str) -> Result<PathBuf> {
+    Ok(env_dir(pb)?.join(name))
+}
+
+fn bundle_path_read(pb: &Pillbox, name: &str) -> PathBuf {
+    env_dir_read(pb).join(name)
+}
+
+/// Read a bundle's parsed key/value pairs, walking project → global.
+/// Returns the first scope that has the bundle. Bundles are atomic — we
+/// don't merge KV pairs across scopes; one full file wins.
+pub(crate) fn read(resolved: &Pillbox, name: &str) -> Result<Option<BTreeMap<String, String>>> {
     validate_name("env show", name)?;
-    let path = bundle_path(name)?;
-    let content = match fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
-    };
-    parse_dotenv(&content, &path.display().to_string()).map(Some)
+    for pb in resolved.read_chain() {
+        let path = bundle_path_read(&pb, name);
+        let content = match fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+        };
+        return parse_dotenv(&content, &path.display().to_string()).map(Some);
+    }
+    Ok(None)
 }
 
-pub(crate) fn names() -> Result<Vec<String>> {
-    let dir = env_dir()?;
-    let mut out = Vec::new();
-    for entry in fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
-        let entry = entry?;
-        if entry.file_type()?.is_file() {
-            if let Some(name) = entry.file_name().to_str() {
-                out.push(name.to_string());
+#[derive(Debug, Clone)]
+pub(crate) struct MergedBundle {
+    pub(crate) name: String,
+    pub(crate) scope: String,
+    pub(crate) from_project: bool,
+}
+
+pub(crate) fn names_merged(resolved: &Pillbox) -> Result<Vec<MergedBundle>> {
+    let mut map: BTreeMap<String, MergedBundle> = BTreeMap::new();
+    for pb in resolved.read_chain() {
+        let dir = env_dir_read(&pb);
+        if !dir.exists() {
+            continue;
+        }
+        for entry in fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
             }
+            let fname = match entry.file_name().into_string() {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            map.entry(fname.clone()).or_insert(MergedBundle {
+                name: fname,
+                scope: pb.display_name().to_string(),
+                from_project: matches!(pb.scope, Scope::Project { .. }),
+            });
         }
     }
-    out.sort();
-    Ok(out)
+    Ok(map.into_values().collect())
 }
 
-pub(crate) fn load(name: &str, source_path: &Path, if_not_exists: bool) -> Result<()> {
+pub(crate) fn load(
+    resolved: &Pillbox,
+    scope: WriteScope,
+    name: &str,
+    source_path: &Path,
+    if_not_exists: bool,
+) -> Result<()> {
     validate_name("env load", name)?;
-    let dest = bundle_path(name)?;
+    let target = resolved.write_target(scope);
+    let dest = bundle_path(&target, name)?;
     if if_not_exists && dest.exists() {
-        return Err(
-            PillboxError::runtime("env load", format!("bundle `{name}` already exists"))
-                .with_next(format!(
-                    "pillbox env rm {name}  # then re-load  (or drop --if-not-exists)"
-                ))
-                .into(),
-        );
+        return Err(PillboxError::runtime(
+            "env load",
+            format!(
+                "bundle `{name}` already exists in `{}`",
+                target.display_name()
+            ),
+        )
+        .with_next(format!(
+            "pillbox env rm {name}  # then re-load  (or drop --if-not-exists)"
+        ))
+        .into());
     }
     let content = fs::read_to_string(source_path).map_err(|e| {
         PillboxError::runtime(
@@ -80,35 +126,50 @@ pub(crate) fn load(name: &str, source_path: &Path, if_not_exists: bool) -> Resul
     let parsed = parse_dotenv(&content, &source_path.display().to_string())?;
     write_bundle_file(&dest, &content)?;
     println!(
-        "pillbox: ✓ env bundle `{name}` stored ({} variables) at {}",
+        "pillbox: ✓ env bundle `{name}` stored in `{}` ({} variables) at {}",
+        target.display_name(),
         parsed.len(),
         dest.display()
     );
     Ok(())
 }
 
-pub(crate) fn list(json: bool) -> Result<()> {
-    let names = names()?;
+pub(crate) fn list(resolved: &Pillbox, json: bool) -> Result<()> {
+    let names = names_merged(resolved)?;
     if json {
-        println!("{}", build_list_json(&names)?);
+        println!("{}", build_list_json(resolved, &names)?);
         return Ok(());
     }
     if names.is_empty() {
-        println!("(no env bundles stored)");
+        println!("(no env bundles stored for `{}`)", resolved.display_name());
         println!();
         println!("Load one with: pillbox env load <NAME> <PATH>");
         return Ok(());
     }
-    println!("Stored env bundles under ~/.pillbox/env/:");
-    for name in &names {
-        let count = read(name)?.map(|m| m.len()).unwrap_or(0);
-        println!("  {name:<20} ({count} variables)");
+    println!(
+        "Env bundles visible from `{}` (project shadows global on conflict):",
+        resolved.display_name()
+    );
+    for entry in &names {
+        let count = read(resolved, &entry.name)?.map(|m| m.len()).unwrap_or(0);
+        let scope_tag = if entry.from_project {
+            "project"
+        } else {
+            "global"
+        };
+        println!("  {:<20}  [{scope_tag}]  ({count} variables)", entry.name);
     }
     Ok(())
 }
 
-pub(crate) fn show(name: &str, reveal: bool, to_stdout: bool, json: bool) -> Result<()> {
-    let vars = read(name)?.ok_or_else(|| {
+pub(crate) fn show(
+    resolved: &Pillbox,
+    name: &str,
+    reveal: bool,
+    to_stdout: bool,
+    json: bool,
+) -> Result<()> {
+    let vars = read(resolved, name)?.ok_or_else(|| {
         PillboxError::runtime("env show", format!("bundle `{name}` not found")).with_next(format!(
             "pillbox env load {name} <PATH>  # load one from a .env file"
         ))
@@ -135,33 +196,31 @@ pub(crate) fn show(name: &str, reveal: bool, to_stdout: bool, json: bool) -> Res
     Ok(())
 }
 
-pub(crate) fn rm(name: &str) -> Result<()> {
+pub(crate) fn rm(resolved: &Pillbox, scope: WriteScope, name: &str) -> Result<()> {
     validate_name("env rm", name)?;
-    let path = bundle_path(name)?;
+    let target = resolved.write_target(scope);
+    let path = bundle_path(&target, name)?;
     match fs::remove_file(&path) {
         Ok(()) => {
-            println!("pillbox: ✓ env bundle `{name}` removed");
+            println!(
+                "pillbox: ✓ env bundle `{name}` removed from `{}`",
+                target.display_name()
+            );
             Ok(())
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            println!("(no env bundle named `{name}` was stored)");
+            println!(
+                "(no env bundle named `{name}` was stored in `{}`)",
+                target.display_name()
+            );
             Ok(())
         }
         Err(e) => Err(e).with_context(|| format!("remove {}", path.display())),
     }
 }
 
-// ── .env parsing ────────────────────────────────────────────────────────────
+// ── .env parsing ────────────────────────────────────────────────────────
 
-/// Minimal `.env` parser. Documented grammar:
-///   - One assignment per line. Lines may have leading whitespace.
-///   - `# ...` after whitespace = comment; the rest of the line is ignored.
-///   - Blank lines ignored.
-///   - Optional leading `export ` is allowed and dropped.
-///   - Key: ASCII alphanumeric + `_`, must start with a letter or `_`.
-///   - Value: from the first `=` to end of line. If wrapped in single
-///     OR double quotes, the quotes are stripped (one quote pair only).
-///     No escape sequences, no interpolation, no multi-line.
 pub(crate) fn parse_dotenv(content: &str, source: &str) -> Result<BTreeMap<String, String>> {
     let mut out = BTreeMap::new();
     for (lineno, raw) in content.lines().enumerate() {
@@ -234,24 +293,31 @@ fn mask(value: &str) -> String {
     crate::secrets::mask(value)
 }
 
-// ── JSON output ─────────────────────────────────────────────────────────────
+// ── JSON ────────────────────────────────────────────────────────────────
 
-fn build_list_json(names: &[String]) -> Result<String> {
+fn build_list_json(resolved: &Pillbox, names: &[MergedBundle]) -> Result<String> {
     let mut bundles = Vec::new();
     for name in names {
-        let count = read(name)?.map(|m| m.len()).unwrap_or(0);
+        let count = read(resolved, &name.name)?.map(|m| m.len()).unwrap_or(0);
         let mut o = serde_json::Map::new();
-        o.insert("name".into(), serde_json::Value::String(name.clone()));
+        o.insert("name".into(), serde_json::Value::String(name.name.clone()));
+        o.insert(
+            "scope".into(),
+            serde_json::Value::String(name.scope.clone()),
+        );
         o.insert(
             "variable_count".into(),
             serde_json::Value::Number(count.into()),
         );
         bundles.push(serde_json::Value::Object(o));
     }
-    Ok(crate::paths::json_v1(vec![(
-        "bundles",
-        serde_json::Value::Array(bundles),
-    )]))
+    Ok(crate::paths::json_v1(vec![
+        (
+            "pillbox",
+            serde_json::Value::String(resolved.display_name().into()),
+        ),
+        ("bundles", serde_json::Value::Array(bundles)),
+    ]))
 }
 
 fn build_show_json(name: &str, vars: &BTreeMap<String, String>, revealed: bool) -> Result<String> {

@@ -18,7 +18,7 @@ use std::{
 use anyhow::Result;
 
 use crate::errors::PillboxError;
-use crate::paths;
+use crate::pillbox::Pillbox;
 use crate::vault::{providers, SandboxLease, Server, ServerConfig, VaultMeta};
 
 /// One OAuth-credentials swap mounted into the guest. Owns the temp file
@@ -57,8 +57,8 @@ impl VaultSession {
     /// itself isn't `vault_capable` but the run still has `--with
     /// FOO --vault`-flagged secrets that need stub swapping — pillbox
     /// still needs a proxy + CA + leases for those.
-    pub(crate) fn start(oauth: Option<OAuthAgent<'_>>) -> Result<Self> {
-        let ca_dir = paths::data_subdir("vault")?;
+    pub(crate) fn start(oauth: Option<OAuthAgent<'_>>, pillbox: &Pillbox) -> Result<Self> {
+        let ca_dir = pillbox.subdir("vault")?;
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()

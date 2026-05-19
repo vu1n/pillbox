@@ -6,6 +6,12 @@ stub → real on outbound requests to `api.anthropic.com` and
 `console.anthropic.com`, and swaps real → stub on inbound responses
 (so rotated tokens never reach the guest).
 
+**v0.6 scope:** vault state is **per-pillbox**. Each pillbox gets its
+own CA + key at `<state_dir>/vault/`. A run inside project `myapp` uses
+`~/.pillbox/projects/<key>/vault/pillbox-vault-ca.crt`; a run with
+`--pillbox global` uses `~/.pillbox/global/vault/`. Leases never
+collide across pillboxes.
+
 For the command reference, see [../AGENTS.md](../AGENTS.md).
 
 ## When to use it
@@ -29,17 +35,18 @@ pillbox vault ca
 # Check vault state
 pillbox vault status
 
-# Run claude with vault on
-pillbox claude run --vault
+# Run the configured agent with vault on
+pillbox run --vault
 
-# Codex works the same way (v0.5).
-pillbox codex run --vault
+# Force a specific agent regardless of pillbox.toml
+pillbox run --agent codex --vault
 ```
 
-That's it. The first `--vault` run generates `~/.pillbox/vault/pillbox-vault-ca.crt`
-and the matching private key, leases a per-sandbox stub pair, starts an
-in-process MITM proxy bound to a random localhost port, and wires
-`HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS` into the container.
+That's it. The first `--vault` run generates the CA at
+`<pillbox>/vault/pillbox-vault-ca.crt` and the matching private key,
+leases a per-sandbox stub pair, starts an in-process MITM proxy bound
+to a random localhost port, and wires `HTTPS_PROXY` +
+`NODE_EXTRA_CA_CERTS` into the container.
 
 The CA persists across runs — sandboxes share the trust root.
 
@@ -61,10 +68,10 @@ The CA persists across runs — sandboxes share the trust root.
 
 Two vault flavors:
 
-- **Agent OAuth** (`pillbox claude run --vault`, `pillbox codex run --vault`): proxy provisions a stub credentials FILE bind-mounted over the agent's real auth file. One lease per `--vault` run.
-- **Secret API key** (`pillbox secret add NAME --vault` then `pillbox <agent> run --with NAME`): proxy provisions a stub VALUE injected as an env var in place of the real secret. One lease per vaulted `--with` per run.
+- **Agent OAuth** (`pillbox run --vault`): proxy provisions a stub credentials FILE bind-mounted over the agent's real auth file. One lease per `--vault` run.
+- **Secret API key** (`pillbox secret add NAME --vault` then `pillbox run --with NAME`): proxy provisions a stub VALUE injected as an env var in place of the real secret. One lease per vaulted `--with` per run.
 
-Both kinds coexist in the same run — e.g. `pillbox claude run --vault --with ANTHROPIC_API_KEY` runs claude with vaulted OAuth tokens AND a vaulted API key on the same `api.anthropic.com` host. AnthropicProvider branches by header (`Authorization: Bearer` → OAuth, `x-api-key` → API key).
+Both kinds coexist in the same run — e.g. `pillbox run --vault --with ANTHROPIC_API_KEY` runs the agent with vaulted OAuth tokens AND a vaulted API key on the same `api.anthropic.com` host. AnthropicProvider branches by header (`Authorization: Bearer` → OAuth, `x-api-key` → API key).
 
 Running `--vault` for an agent that isn't `vault_capable` errors with exit 2.
 
@@ -94,7 +101,7 @@ collide because each provider has its own prefix.
 ```
    host                                       guest (docker)
   ┌─────────────────────────┐              ┌──────────────────────────┐
-  │ ~/.pillbox/data/claude/ │ ──mount──▶   │ /home/lum/.claude/       │
+  │ ~/.pillbox/global/auth/claude/ │ ──mount──▶   │ /home/lum/.claude/       │
   │  .claude/               │              │  (real creds.json file)  │
   │   .credentials.json     │              │                          │
   │   (real OAuth tokens)   │              │                          │
@@ -138,11 +145,17 @@ dropped no longer resolves — re-using its stub from outside gets 401.
 
 ## Files on disk
 
+Per-pillbox CA + key. Path depends on the resolved scope:
+
 ```
-~/.pillbox/vault/
+<pillbox_state_dir>/vault/
 ├── pillbox-vault-ca.crt    # 0644 — self-signed root, valid 5 years
 └── pillbox-vault-ca.key    # 0600 — sensitive
 ```
+
+Examples:
+- Global pillbox: `~/.pillbox/global/vault/`
+- Project pillbox: `~/.pillbox/projects/-Users-x-work-myapp/vault/`
 
 The CA cert is mounted read-only into the guest at
 `/etc/pillbox-ca.crt`. The private key never leaves the host.
@@ -168,9 +181,10 @@ exits.
 ## Cleanup
 
 ```sh
-# Forget the CA (forces regeneration on next vault run; old guests will
-# fail to verify the proxy if reused without re-issued certs).
-rm -rf ~/.pillbox/vault/
+# Forget the CA for the current pillbox (forces regeneration on the
+# next vault run; old guests will fail to verify until they're issued
+# a new cert chain).
+rm -rf "$(pillbox vault status --json | jq -r .ca_dir)"
 ```
 
 There's no `pillbox vault forget` subcommand because removing the CA

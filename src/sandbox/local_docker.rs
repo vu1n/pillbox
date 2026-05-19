@@ -1,9 +1,9 @@
 //! `SandboxBackend` implementation that uses the host's Docker daemon.
 //!
-//! This is the historical pillbox run path — lifted verbatim out of
-//! `AgentSpec::run` so a future remote backend (SSH to a VPS, E2B
-//! managed cloud) can sit beside it without each backend re-deriving
-//! the env / mount / vault wiring.
+//! v0.6: takes a resolved [`Pillbox`] so the agent's auth home + vault
+//! state come from the right scope. Auth currently always resolves to
+//! global; vault state lives per-pillbox so a project's leases never
+//! collide with another's.
 
 use anyhow::{Context, Result};
 
@@ -12,23 +12,22 @@ use crate::agents::{
     base_docker_args, resolve_run_env, resolve_with_entries, workspace_mount_name, AgentSpec,
     RunOpts, GUEST_HOME, GUEST_WORKSPACE,
 };
+use crate::pillbox::Pillbox;
 use crate::{docker, errors::PillboxError};
 
-/// Local Docker backend. Stateless — every `run` shells out to `docker
-/// run` directly. The `docker` CLI is the only host dep.
 pub(crate) struct LocalDocker;
 
 impl SandboxBackend for LocalDocker {
-    fn run(&self, spec: &AgentSpec, opts: RunOpts) -> Result<()> {
+    fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
         docker::check_ready()?;
 
-        let home = spec.home_dir()?;
+        let home = spec.home_dir(resolved)?;
         if !home.join(spec.cred_sentinel).exists() {
             return Err(PillboxError::runtime(
                 "run",
                 format!("no stored credentials for `{}`", spec.id),
             )
-            .with_next(format!("pillbox {} login", spec.id))
+            .with_next(format!("pillbox auth login --agent {}", spec.id))
             .into());
         }
 
@@ -47,13 +46,7 @@ impl SandboxBackend for LocalDocker {
             .into());
         }
 
-        // Resolve `--with` entries up front (one sidecar lookup per entry,
-        // shared across both the "needs session?" decision and the env
-        // resolution below). This avoids walking the list twice with a
-        // disk hit each time. The session may exist even when the agent
-        // isn't using OAuth — non-vault-capable agents can still benefit
-        // from API-key stub swap for `--with`'d secrets.
-        let withs_resolved = resolve_with_entries(&opts.withs)?;
+        let withs_resolved = resolve_with_entries(resolved, &opts.withs)?;
         let any_vaulted = withs_resolved.iter().any(|w| w.meta.is_some());
         let mut vault_session = if opts.vault || any_vaulted {
             let oauth = if opts.vault {
@@ -64,12 +57,12 @@ impl SandboxBackend for LocalDocker {
             } else {
                 None
             };
-            Some(crate::vault::VaultSession::start(oauth)?)
+            Some(crate::vault::VaultSession::start(oauth, resolved)?)
         } else {
             None
         };
 
-        let env_vars = resolve_run_env(&opts, &withs_resolved, vault_session.as_mut())?;
+        let env_vars = resolve_run_env(resolved, &opts, &withs_resolved, vault_session.as_mut())?;
 
         let mut args = base_docker_args();
         args.extend([

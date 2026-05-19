@@ -96,12 +96,8 @@ impl Config {
                 format!("could not read {}: {e}", path.display()),
             )
         })?;
-        let mut cfg: Config = toml::from_str(&raw).map_err(|e| {
-            PillboxError::config(
-                "config load",
-                format!("{}: {e}", path.display()),
-            )
-        })?;
+        let mut cfg: Config = toml::from_str(&raw)
+            .map_err(|e| PillboxError::config("config load", format!("{}: {e}", path.display())))?;
         cfg.expand_tildes();
         cfg.source = Some(path.to_path_buf());
         Ok(cfg)

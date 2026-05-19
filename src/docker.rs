@@ -32,19 +32,20 @@ pub fn check_ready() -> Result<()> {
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
     if stderr.contains("Cannot connect to the Docker daemon") {
-        return Err(PillboxError::resource(
-            "docker pre-flight",
-            "Docker daemon isn't running",
-        )
-        .with_next("start Docker Desktop, then re-run pillbox")
-        .into());
+        return Err(
+            PillboxError::resource("docker pre-flight", "Docker daemon isn't running")
+                .with_next("start Docker Desktop, then re-run pillbox")
+                .into(),
+        );
     }
     if stderr.contains("No such image") || stderr.contains("Error response from daemon") {
         return Err(PillboxError::resource(
             "docker pre-flight",
             format!("runner image `{RUNNER_IMAGE}` not found locally"),
         )
-        .with_next("cd ~/code/lum && bun run build:runtime-image:pillbox  # GHCR publish lands in v0.4")
+        .with_next(
+            "cd ~/code/lum && bun run build:runtime-image:pillbox  # GHCR publish lands in v0.4",
+        )
         .into());
     }
     Err(PillboxError::resource("docker pre-flight", stderr.into_owned()).into())

@@ -389,9 +389,7 @@ fn dispatch_agent(spec: AgentSpec, action: AgentAction) -> Result<()> {
                     "run",
                     "--strict (Gondolin microVM) is unavailable in this build",
                 )
-                .with_next(
-                    "pillbox claude run   # use the default Docker sandbox",
-                )
+                .with_next("pillbox claude run   # use the default Docker sandbox")
                 .into());
             }
             spec.run(opts)
@@ -424,7 +422,10 @@ fn auth_list(json: bool) -> Result<()> {
 fn show_config(json: bool) -> Result<()> {
     let cfg = config::Config::discover()?;
     if json {
-        println!("{}", paths::json_v1(vec![("config", config_json_payload(&cfg))]));
+        println!(
+            "{}",
+            paths::json_v1(vec![("config", config_json_payload(&cfg))])
+        );
         return Ok(());
     }
     match cfg {
@@ -495,9 +496,8 @@ fn json_string_array(items: &[String]) -> serde_json::Value {
 
 fn vault_ca(json: bool) -> Result<()> {
     let ca_dir = paths::data_subdir("vault")?;
-    let ca = vault::Ca::ensure(&ca_dir).map_err(|e| {
-        errors::PillboxError::runtime("vault ca", format!("ensure ca: {e}"))
-    })?;
+    let ca = vault::Ca::ensure(&ca_dir)
+        .map_err(|e| errors::PillboxError::runtime("vault ca", format!("ensure ca: {e}")))?;
     if json {
         println!(
             "{}",
@@ -526,7 +526,10 @@ fn vault_status(json: bool) -> Result<()> {
             "{}",
             paths::json_v1(vec![
                 ("ca_exists", serde_json::Value::Bool(exists)),
-                ("ca_dir", serde_json::Value::String(ca_dir.display().to_string())),
+                (
+                    "ca_dir",
+                    serde_json::Value::String(ca_dir.display().to_string())
+                ),
                 ("ca_cert_path", cert_path_val),
             ]),
         );
@@ -661,9 +664,8 @@ fn resolve_vault_meta(
         .into());
     }
 
-    let scheme = vault::HeaderScheme::parse(header_scheme.unwrap()).map_err(|e| {
-        PillboxError::usage("secret add", e)
-    })?;
+    let scheme = vault::HeaderScheme::parse(header_scheme.unwrap())
+        .map_err(|e| PillboxError::usage("secret add", e))?;
     Ok(Some(vault::VaultMeta::new(
         host.unwrap().to_string(),
         scheme,
@@ -676,11 +678,8 @@ fn auth_rm(provider: &str) -> Result<()> {
         .iter()
         .find(|s| s.id() == provider)
         .ok_or_else(|| {
-            PillboxError::usage(
-                "auth rm",
-                format!("unknown provider `{provider}`"),
-            )
-            .with_next("pillbox auth list  # see what's available")
+            PillboxError::usage("auth rm", format!("unknown provider `{provider}`"))
+                .with_next("pillbox auth list  # see what's available")
         })?;
     if spec.forget()? {
         println!("Removed {provider} state.");

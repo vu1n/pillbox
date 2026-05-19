@@ -141,4 +141,173 @@ mod tests {
         );
         assert_eq!(r.api_key_real_for_stub(stub), Some("ghp_realtoken"));
     }
+
+    // ── End-to-end Request/Response integration tests ────────────────
+
+    use crate::vault::known_secrets::HeaderScheme;
+    use crate::vault::providers::test_support::{
+        build_request, cleanup, expect_request, fresh_server,
+    };
+    use crate::vault::providers::PendingFlow;
+    use hudsucker::{hyper::Request as HReq, Body};
+
+    fn lease_github_pat(
+        server: &crate::vault::server::Server,
+        real: &str,
+    ) -> (crate::vault::lease::SandboxLease, String) {
+        server
+            .lease_api_key_for_test(
+                "GITHUB_TOKEN",
+                real,
+                "api.github.com",
+                HeaderScheme::AuthorizationBearer,
+                "ghp_",
+            )
+            .expect("lease github pat")
+    }
+
+    #[tokio::test]
+    async fn bearer_request_swaps_stub_to_real_pat() {
+        let (server, dir) = fresh_server().await;
+        let (_lease, stub) = lease_github_pat(&server, "ghp_realpat_value");
+
+        let req = build_request("GET", "https://api.github.com/user", Body::empty());
+        let req = {
+            let (mut parts, body) = req.into_parts();
+            parts
+                .headers
+                .insert("authorization", format!("Bearer {stub}").parse().unwrap());
+            HReq::from_parts(parts, body)
+        };
+
+        let mut pending: Option<PendingFlow> = None;
+        let out = GithubProvider
+            .handle_request(req, server.inner_for_test(), &mut pending)
+            .await;
+        let out_req = expect_request(out, "github bearer swap");
+        assert_eq!(
+            out_req
+                .headers()
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer ghp_realpat_value"
+        );
+
+        drop(_lease);
+        cleanup(server, dir);
+    }
+
+    #[tokio::test]
+    async fn token_scheme_legacy_request_swaps_stub_to_real_pat() {
+        // octokit defaults to `Authorization: token <pat>`. The provider
+        // must preserve that scheme on the way out.
+        let (server, dir) = fresh_server().await;
+        let (_lease, stub) = lease_github_pat(&server, "ghp_legacytoken_value");
+
+        let req = build_request("GET", "https://api.github.com/repos/me/foo", Body::empty());
+        let req = {
+            let (mut parts, body) = req.into_parts();
+            parts
+                .headers
+                .insert("authorization", format!("token {stub}").parse().unwrap());
+            HReq::from_parts(parts, body)
+        };
+
+        let mut pending = None;
+        let out = GithubProvider
+            .handle_request(req, server.inner_for_test(), &mut pending)
+            .await;
+        let out_req = expect_request(out, "github token swap");
+        assert_eq!(
+            out_req
+                .headers()
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "token ghp_legacytoken_value"
+        );
+
+        drop(_lease);
+        cleanup(server, dir);
+    }
+
+    #[tokio::test]
+    async fn unknown_scheme_passes_through() {
+        // Anything that isn't `Bearer ` / `token ` is left alone for
+        // GitHub to reject on its end.
+        let (server, dir) = fresh_server().await;
+        let req = build_request("GET", "https://api.github.com/user", Body::empty());
+        let req = {
+            let (mut parts, body) = req.into_parts();
+            parts
+                .headers
+                .insert("authorization", "Basic dXNlcjpwYXNz".parse().unwrap());
+            HReq::from_parts(parts, body)
+        };
+
+        let mut pending = None;
+        let out = GithubProvider
+            .handle_request(req, server.inner_for_test(), &mut pending)
+            .await;
+        let out_req = expect_request(out, "github unknown scheme pass-through");
+        assert_eq!(
+            out_req
+                .headers()
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Basic dXNlcjpwYXNz"
+        );
+
+        cleanup(server, dir);
+    }
+
+    #[tokio::test]
+    async fn unknown_stub_passes_through() {
+        // Bearer-style with a stub the registry doesn't recognise =>
+        // `swap_bearer_style` returns PassThrough.
+        let (server, dir) = fresh_server().await;
+        let req = build_request("GET", "https://api.github.com/user", Body::empty());
+        let req = {
+            let (mut parts, body) = req.into_parts();
+            parts.headers.insert(
+                "authorization",
+                "Bearer ghp_not_in_registry".parse().unwrap(),
+            );
+            HReq::from_parts(parts, body)
+        };
+        let mut pending = None;
+        let out = GithubProvider
+            .handle_request(req, server.inner_for_test(), &mut pending)
+            .await;
+        let out_req = expect_request(out, "github unknown stub");
+        assert_eq!(
+            out_req
+                .headers()
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer ghp_not_in_registry"
+        );
+
+        cleanup(server, dir);
+    }
+
+    #[tokio::test]
+    async fn no_auth_header_passes_through() {
+        let (server, dir) = fresh_server().await;
+        let req = build_request("GET", "https://api.github.com/", Body::empty());
+        let mut pending = None;
+        let out = GithubProvider
+            .handle_request(req, server.inner_for_test(), &mut pending)
+            .await;
+        let out_req = expect_request(out, "github no-auth");
+        assert!(out_req.headers().get("authorization").is_none());
+        cleanup(server, dir);
+    }
 }

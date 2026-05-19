@@ -109,10 +109,8 @@ impl Server {
 
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
-        let providers: Vec<Arc<dyn VaultProvider>> = providers::registry()
-            .into_iter()
-            .map(Arc::from)
-            .collect();
+        let providers: Vec<Arc<dyn VaultProvider>> =
+            providers::registry().into_iter().map(Arc::from).collect();
 
         let inner = Arc::new(ServerInner {
             listen_addr,
@@ -241,11 +239,7 @@ impl Server {
             );
         }
 
-        let lease = SandboxLease::new(
-            sandbox_id,
-            stub.clone(),
-            Arc::clone(&self.inner),
-        );
+        let lease = SandboxLease::new(sandbox_id, stub.clone(), Arc::clone(&self.inner));
         Ok((lease, stub))
     }
 
@@ -271,6 +265,15 @@ impl Server {
     #[cfg(test)]
     pub(crate) fn registry_lock_for_test(&self) -> MutexGuard<'_, Registry> {
         self.inner.registry_lock()
+    }
+
+    /// Test-only: borrow the shared `ServerInner`. Provider integration
+    /// tests use this to call `handle_request` / `handle_response`
+    /// directly on a constructed hyper Request/Response, bypassing the
+    /// proxy/TLS stack.
+    #[cfg(test)]
+    pub(crate) fn inner_for_test(&self) -> &ServerInner {
+        &self.inner
     }
 }
 
@@ -314,11 +317,7 @@ impl HttpHandler for VaultHandler {
             .await
     }
 
-    async fn handle_response(
-        &mut self,
-        _ctx: &HttpContext,
-        res: Response<Body>,
-    ) -> Response<Body> {
+    async fn handle_response(&mut self, _ctx: &HttpContext, res: Response<Body>) -> Response<Body> {
         let provider_id = match &self.pending {
             Some(flow) => flow.provider_id,
             None => return res,
@@ -359,8 +358,7 @@ mod tests {
         })
     }
 
-    const FAKE_JWT: &str =
-        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature_part_here";
+    const FAKE_JWT: &str = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature_part_here";
 
     fn sample_codex_real() -> serde_json::Value {
         serde_json::json!({
@@ -377,8 +375,8 @@ mod tests {
     }
 
     async fn fresh_server() -> (Server, PathBuf) {
-        let dir = std::env::temp_dir()
-            .join(format!("pillbox-vault-server-{}", uuid::Uuid::now_v7()));
+        let dir =
+            std::env::temp_dir().join(format!("pillbox-vault-server-{}", uuid::Uuid::now_v7()));
         let server = Server::start(ServerConfig {
             bind: None,
             ca_dir: dir.clone(),
@@ -678,6 +676,117 @@ mod tests {
         }
 
         drop(b);
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Cross-provider routing ────────────────────────────────────────
+    //
+    // The Registry is shared across all providers, so any provider can
+    // *resolve* any stub. Provider isolation comes from each provider
+    // only acting on stubs whose prefix or shape it recognises. These
+    // tests pin that contract from the registry side.
+
+    #[tokio::test]
+    async fn registry_resolves_stubs_to_owning_sandbox_regardless_of_provider() {
+        let (server, dir) = fresh_server().await;
+        let _a = server
+            .lease("claude", "sbx-claude", sample_anthropic_real())
+            .expect("claude lease");
+        let _c = server
+            .lease("codex", "sbx-codex", sample_codex_real())
+            .expect("codex lease");
+
+        let registry = server.registry_lock_for_test();
+        for stub in registry.stubs_for("sbx-claude").unwrap() {
+            assert_eq!(registry.sandbox_for_stub(stub), Some("sbx-claude"));
+            // Confirm the stub looks anthropic-y, not codex-y.
+            assert!(
+                stub.starts_with(crate::vault::providers::anthropic::STUB_ACCESS_PREFIX)
+                    || stub.starts_with(crate::vault::providers::anthropic::STUB_REFRESH_PREFIX),
+                "claude stubs should carry anthropic prefix, got {stub}"
+            );
+        }
+        for stub in registry.stubs_for("sbx-codex").unwrap() {
+            assert_eq!(registry.sandbox_for_stub(stub), Some("sbx-codex"));
+            assert!(
+                stub.starts_with(crate::vault::providers::codex::STUB_ACCESS_PREFIX)
+                    || stub.starts_with(crate::vault::providers::codex::STUB_REFRESH_PREFIX),
+                "codex stubs should carry codex prefix, got {stub}"
+            );
+        }
+        drop(registry);
+
+        drop(_a);
+        drop(_c);
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn anthropic_oauth_stub_seen_by_openai_handler_is_no_op() {
+        // The vault server dispatches by host, not by stub — but if an
+        // anthropic-prefixed stub ever flows through the openai handler
+        // (e.g. a misconfigured guest sends api.openai.com a Bearer
+        // sk-ant-oat01-…), the openai handler must NOT swap the
+        // header. The anthropic OAuth entry is OAuth-shaped, not
+        // API-key-shaped, so `api_key_real_for_stub` returns None →
+        // `swap_bearer_style` returns PassThrough.
+        use hudsucker::{
+            hyper::{header::AUTHORIZATION, Request},
+            Body,
+        };
+
+        let (server, dir) = fresh_server().await;
+        let _lease = server
+            .lease("claude", "sbx-x", sample_anthropic_real())
+            .expect("lease");
+        let stub_access = {
+            let registry = server.registry_lock_for_test();
+            registry
+                .stubs_for("sbx-x")
+                .unwrap()
+                .iter()
+                .find(|s| s.starts_with(crate::vault::providers::anthropic::STUB_ACCESS_PREFIX))
+                .cloned()
+                .unwrap()
+        };
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://api.openai.com/v1/chat/completions")
+            .header(AUTHORIZATION, format!("Bearer {stub_access}"))
+            .body(Body::empty())
+            .unwrap();
+
+        let openai = crate::vault::providers::openai::OpenAiApiKeyProvider;
+        let mut pending: Option<crate::vault::providers::PendingFlow> = None;
+        let out = crate::vault::providers::VaultProvider::handle_request(
+            &openai,
+            req,
+            server.inner_for_test(),
+            &mut pending,
+        )
+        .await;
+        let out_req = match out {
+            hudsucker::RequestOrResponse::Request(r) => r,
+            hudsucker::RequestOrResponse::Response(r) => {
+                panic!("expected pass-through Request, got status {}", r.status())
+            }
+        };
+        // Bearer header preserved verbatim — openai didn't touch the
+        // anthropic stub.
+        assert_eq!(
+            out_req
+                .headers()
+                .get(AUTHORIZATION)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            format!("Bearer {stub_access}")
+        );
+
+        drop(_lease);
         drop(server);
         let _ = std::fs::remove_dir_all(&dir);
     }

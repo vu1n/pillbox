@@ -30,11 +30,7 @@ pub struct SandboxLease {
 }
 
 impl SandboxLease {
-    pub(crate) fn new(
-        sandbox_id: String,
-        stub_body: String,
-        server: Arc<ServerInner>,
-    ) -> Self {
+    pub(crate) fn new(sandbox_id: String, stub_body: String, server: Arc<ServerInner>) -> Self {
         Self {
             sandbox_id,
             stub_body,

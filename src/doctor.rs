@@ -2,12 +2,7 @@
 //! `overall_ok` field (or the ✗ lines in human output) is what callers
 //! branch on.
 
-use std::{
-    os::unix::fs::PermissionsExt,
-    path::PathBuf,
-    process::Command,
-    thread,
-};
+use std::{os::unix::fs::PermissionsExt, path::PathBuf, process::Command, thread};
 
 use anyhow::Result;
 
@@ -22,10 +17,18 @@ struct Check {
 
 impl Check {
     fn ok(name: &'static str, detail: impl Into<String>) -> Self {
-        Check { name, ok: true, detail: detail.into() }
+        Check {
+            name,
+            ok: true,
+            detail: detail.into(),
+        }
     }
     fn fail(name: &'static str, detail: impl Into<String>) -> Self {
-        Check { name, ok: false, detail: detail.into() }
+        Check {
+            name,
+            ok: false,
+            detail: detail.into(),
+        }
     }
 }
 
@@ -82,7 +85,10 @@ fn check_data_dir_perms() -> Check {
     let meta = match std::fs::metadata(&path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Check::ok(name, format!("{} will be created on first use", path.display()));
+            return Check::ok(
+                name,
+                format!("{} will be created on first use", path.display()),
+            );
         }
         Err(e) => {
             return Check::fail(name, format!("could not stat {}: {e}", path.display()));
@@ -96,7 +102,9 @@ fn check_data_dir_perms() -> Check {
             name,
             format!(
                 "{} mode {:o} is group/world accessible — run `chmod 700 {}`",
-                path.display(), mode, path.display()
+                path.display(),
+                mode,
+                path.display()
             ),
         )
     } else {
@@ -130,7 +138,13 @@ fn check_docker_daemon() -> Check {
 fn check_runner_image() -> Check {
     let name = "runner_image";
     match Command::new("docker")
-        .args(["image", "inspect", docker::RUNNER_IMAGE, "--format", "{{.Id}}"])
+        .args([
+            "image",
+            "inspect",
+            docker::RUNNER_IMAGE,
+            "--format",
+            "{{.Id}}",
+        ])
         .output()
     {
         Ok(out) if out.status.success() => {

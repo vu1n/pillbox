@@ -22,10 +22,8 @@ pub(crate) fn with_isolated_home<F: FnOnce()>(label: &str, body: F) {
     let _guard = crate::paths::TEST_HOME_LOCK
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    let tmp: PathBuf = std::env::temp_dir().join(format!(
-        "pillbox-{label}-{}",
-        uuid::Uuid::now_v7().simple()
-    ));
+    let tmp: PathBuf =
+        std::env::temp_dir().join(format!("pillbox-{label}-{}", uuid::Uuid::now_v7().simple()));
     std::fs::create_dir_all(&tmp).unwrap();
     let prev_home = std::env::var_os("HOME");
     std::env::set_var("HOME", &tmp);

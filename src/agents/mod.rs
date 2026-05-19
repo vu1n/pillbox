@@ -95,10 +95,9 @@ fn finalize_claude_onboarding(home: &Path) -> Result<()> {
         // the whole login flow.
         return Ok(());
     }
-    let raw = fs::read_to_string(&path)
-        .with_context(|| format!("read {}", path.display()))?;
-    let mut value: serde_json::Value = serde_json::from_str(&raw)
-        .with_context(|| format!("parse {}", path.display()))?;
+    let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
     let obj = value
         .as_object_mut()
         .ok_or_else(|| anyhow!("expected top-level JSON object in {}", path.display()))?;
@@ -108,8 +107,7 @@ fn finalize_claude_onboarding(home: &Path) -> Result<()> {
     );
     let serialized = serde_json::to_string_pretty(&value)
         .with_context(|| format!("serialize {}", path.display()))?;
-    fs::write(&path, serialized)
-        .with_context(|| format!("write {}", path.display()))?;
+    fs::write(&path, serialized).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 
@@ -183,7 +181,10 @@ impl AgentSpec {
                     home.join(self.cred_sentinel).display()
                 ),
             )
-            .with_next(format!("pillbox {} login   # check the sandbox output above for clues", self.id))
+            .with_next(format!(
+                "pillbox {} login   # check the sandbox output above for clues",
+                self.id
+            ))
             .into());
         }
 
@@ -311,8 +312,7 @@ impl AgentSpec {
         if !home.exists() {
             return Ok(false);
         }
-        fs::remove_dir_all(&home)
-            .with_context(|| format!("remove {}", home.display()))?;
+        fs::remove_dir_all(&home).with_context(|| format!("remove {}", home.display()))?;
         Ok(true)
     }
 }
@@ -375,7 +375,7 @@ fn prepend_vec<T>(dst: &mut Vec<T>, src: Vec<T>) {
 /// Emits one `pillbox: note: ENVVAR shadowed by --with` line to stderr
 /// each time a higher-precedence layer overrides a lower one — visible
 /// to agents without spamming.
-
+///
 /// One `--with` entry resolved against the secrets store. `meta` is
 /// `Some` iff the secret has a `.meta.json` sidecar (i.e. it's vaulted).
 /// Computed once per run so resolve_run_env doesn't re-stat per entry,
@@ -419,11 +419,8 @@ fn resolve_run_env(
     // Layer 1: stored env bundles.
     for bundle_name in &opts.env_bundles {
         let vars = crate::envs::read(bundle_name)?.ok_or_else(|| {
-            PillboxError::runtime(
-                "run",
-                format!("env bundle `{bundle_name}` not found"),
-            )
-            .with_next(format!("pillbox env list  # see what's stored"))
+            PillboxError::runtime("run", format!("env bundle `{bundle_name}` not found"))
+                .with_next("pillbox env list  # see what's stored".to_string())
         })?;
         for (k, v) in vars {
             if let Some(prev) = env.insert(k.clone(), v) {
@@ -460,11 +457,8 @@ fn resolve_run_env(
     // is the raw input — the resolved view is what we iterate.
     for w in withs {
         let real_value = crate::secrets::read(&w.secret_name)?.ok_or_else(|| {
-            PillboxError::runtime(
-                "run",
-                format!("secret `{}` not found", w.secret_name),
-            )
-            .with_next(format!("pillbox secret add {}", w.secret_name))
+            PillboxError::runtime("run", format!("secret `{}` not found", w.secret_name))
+                .with_next(format!("pillbox secret add {}", w.secret_name))
         })?;
 
         let injected = match (w.meta.as_ref(), vault.as_deref_mut()) {
@@ -492,7 +486,10 @@ fn resolve_run_env(
         };
 
         if let Some(_prev) = env.insert(w.env_var.clone(), injected) {
-            eprintln!("pillbox: note: {} shadowed by --with {}", w.env_var, w.raw_entry);
+            eprintln!(
+                "pillbox: note: {} shadowed by --with {}",
+                w.env_var, w.raw_entry
+            );
         }
     }
 
@@ -502,8 +499,7 @@ fn resolve_run_env(
 /// Ensure `~/.pillbox/data/<provider>/` exists with 0700 perms.
 fn ensure_provider_home(spec: &AgentSpec) -> Result<PathBuf> {
     let home = crate::paths::data_subdir("data")?.join(spec.id);
-    fs::create_dir_all(&home)
-        .with_context(|| format!("create {}", home.display()))?;
+    fs::create_dir_all(&home).with_context(|| format!("create {}", home.display()))?;
     fs::set_permissions(&home, fs::Permissions::from_mode(0o700))
         .with_context(|| format!("chmod {} 0700", home.display()))?;
     Ok(home)
@@ -536,7 +532,9 @@ fn workspace_mount_name(host: &Path, override_name: Option<&str>) -> Result<Stri
         if name.is_empty() || name.contains('/') || name.contains('\0') {
             return Err(PillboxError::usage(
                 "run",
-                format!("--name `{name}` must be a non-empty single path component (no `/` or NUL)"),
+                format!(
+                    "--name `{name}` must be a non-empty single path component (no `/` or NUL)"
+                ),
             )
             .into());
         }

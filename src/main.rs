@@ -33,6 +33,7 @@ mod secrets;
 #[cfg(test)]
 mod test_util;
 mod vault;
+mod workspace;
 
 use agents::RunOpts;
 use errors::PillboxError;
@@ -56,8 +57,10 @@ enum Command {
     /// Create the global pillbox at `~/.pillbox/global/`. Idempotent.
     Init,
     /// Create a project pillbox in the current directory. Writes
-    /// `pillbox.toml` to cwd and a state dir at
-    /// `~/.pillbox/projects/<dash-encoded-cwd>/`.
+    /// `pillbox.toml` to cwd, creates a state dir at
+    /// `~/.pillbox/projects/<dash-encoded-cwd>/`, and initializes a
+    /// rustic repository (local by default; `--workspace-backend s3`
+    /// to use an S3-shaped bucket).
     New {
         /// Display name for the pillbox. Defaults to the cwd's basename.
         #[arg(long, value_name = "NAME")]
@@ -65,6 +68,36 @@ enum Command {
         /// Default agent for `pillbox run` (`claude` | `codex`).
         #[arg(long, value_name = "AGENT")]
         agent: Option<String>,
+        /// Workspace backend variant. `local` (default) stores the
+        /// rustic repo under `~/.pillbox/projects/<key>/repo/`; `s3`
+        /// stores it in a user-owned S3-compatible bucket.
+        #[arg(long = "workspace-backend", value_name = "VARIANT")]
+        workspace_backend: Option<String>,
+        /// S3-only: bucket name.
+        #[arg(long, value_name = "BUCKET")]
+        bucket: Option<String>,
+        /// S3-only: endpoint URL (R2, MinIO, native S3, …).
+        #[arg(long, value_name = "URL")]
+        endpoint: Option<String>,
+        /// S3-only: region. Defaults to `auto`.
+        #[arg(long, value_name = "REGION")]
+        region: Option<String>,
+        /// S3-only: object key prefix within the bucket.
+        #[arg(long, value_name = "PREFIX")]
+        prefix: Option<String>,
+        /// S3-only: env var name that holds the access key.
+        #[arg(long = "access-key-env", value_name = "VAR")]
+        access_key_env: Option<String>,
+        /// S3-only: env var name that holds the secret key.
+        #[arg(long = "secret-key-env", value_name = "VAR")]
+        secret_key_env: Option<String>,
+        /// Clone a git repository into cwd at pillbox-creation time.
+        /// Refuses if cwd isn't empty.
+        #[arg(long = "from-git", value_name = "URL")]
+        from_git: Option<String>,
+        /// Optional ref (branch or SHA) when paired with `--from-git`.
+        #[arg(long = "git-ref", value_name = "REF", requires = "from_git")]
+        git_ref: Option<String>,
     },
     /// List every pillbox on disk (global + projects).
     List {
@@ -147,6 +180,54 @@ enum Command {
     },
     /// Print pillbox version + the runner image tag it targets.
     Version,
+    /// Snapshot the current workspace (cwd) into the pillbox's
+    /// rustic repository.
+    Push {
+        #[arg(long, value_name = "NAME")]
+        tag: Option<String>,
+        #[arg(long, short = 'm', value_name = "TEXT")]
+        message: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Restore the workspace from a snapshot. Defaults to the latest.
+    Pull {
+        #[arg(long, value_name = "HANDLE")]
+        snapshot: Option<String>,
+    },
+    /// Inspect / manage the pillbox's snapshots.
+    Snapshot {
+        #[command(subcommand)]
+        action: SnapshotAction,
+    },
+    /// Workspace-level operations (rekey, …).
+    Workspace {
+        #[command(subcommand)]
+        action: WorkspaceAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SnapshotAction {
+    /// List every snapshot in the pillbox's repository.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one snapshot's metadata. Accepts a unique prefix.
+    Show {
+        handle: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove one snapshot. Data packs survive until a future `prune`.
+    Rm { handle: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum WorkspaceAction {
+    /// Rotate the repository encryption password.
+    Rekey,
 }
 
 #[derive(Subcommand, Debug)]
@@ -279,7 +360,33 @@ fn run(cli: Cli) -> Result<()> {
     let pillbox_arg = cli.pillbox.as_deref();
     match cli.command {
         Command::Init => pillbox::init(),
-        Command::New { name, agent } => pillbox::new(name, agent),
+        Command::New {
+            name,
+            agent,
+            workspace_backend,
+            bucket,
+            endpoint,
+            region,
+            prefix,
+            access_key_env,
+            secret_key_env,
+            from_git,
+            git_ref,
+        } => pillbox::new(
+            name,
+            agent,
+            pillbox::NewWorkspaceArgs {
+                backend: workspace_backend,
+                endpoint,
+                region,
+                bucket,
+                prefix,
+                access_key_env,
+                secret_key_env,
+                from_git,
+                git_ref,
+            },
+        ),
         Command::List { json } => pillbox::list(json),
         Command::Rm { name } => pillbox::rm(&name),
         Command::Info { json } => pillbox::info(pillbox_arg, json),
@@ -344,6 +451,22 @@ fn run(cli: Cli) -> Result<()> {
                 docker::RUNNER_IMAGE
             );
             Ok(())
+        }
+        Command::Push { tag, message, json } => {
+            let resolved = Pillbox::resolve(pillbox_arg)?;
+            dispatch_push(&resolved, tag, message, json)
+        }
+        Command::Pull { snapshot } => {
+            let resolved = Pillbox::resolve(pillbox_arg)?;
+            dispatch_pull(&resolved, snapshot)
+        }
+        Command::Snapshot { action } => {
+            let resolved = Pillbox::resolve(pillbox_arg)?;
+            dispatch_snapshot(&resolved, action)
+        }
+        Command::Workspace { action } => {
+            let resolved = Pillbox::resolve(pillbox_arg)?;
+            dispatch_workspace(&resolved, action)
         }
     }
 }
@@ -797,4 +920,194 @@ fn sidecar_run(resolved: &Pillbox, bind: Option<String>, json: bool) -> Result<(
 
     drop(server);
     Ok(())
+}
+
+// ── workspace dispatch ────────────────────────────────────────────────────
+
+fn dispatch_push(
+    resolved: &Pillbox,
+    tag: Option<String>,
+    message: Option<String>,
+    json: bool,
+) -> Result<()> {
+    use crate::workspace::{PushOptions, WorkspaceBackend};
+    let backend = resolved.workspace()?;
+    let cwd = std::env::current_dir()
+        .map_err(|e| PillboxError::runtime("push", format!("could not resolve cwd: {e}")))?;
+    let snap = backend.push(&cwd, PushOptions { tag, message })?;
+    if json {
+        println!("{}", snapshot_json(&snap));
+    } else {
+        println!(
+            "pillbox: ✓ snapshot {} ({} bytes)",
+            snap.handle.short(),
+            snap.bytes
+        );
+        if let Some(t) = &snap.tag {
+            println!("  tag:        {t}");
+        }
+        if let Some(m) = &snap.message {
+            println!("  message:    {m}");
+        }
+        if let Some(a) = &snap.git_anchor {
+            let dirty = if snap.git_dirty { " (dirty)" } else { "" };
+            println!("  git anchor: {a}{dirty}");
+        }
+        println!("  created:    {}", snap.created_at);
+    }
+    Ok(())
+}
+
+fn dispatch_pull(resolved: &Pillbox, snapshot: Option<String>) -> Result<()> {
+    use crate::workspace::{SnapshotHandle, WorkspaceBackend};
+    let backend = resolved.workspace()?;
+    let cwd = std::env::current_dir()
+        .map_err(|e| PillboxError::runtime("pull", format!("could not resolve cwd: {e}")))?;
+    let handle = snapshot.as_ref().map(|s| SnapshotHandle::new(s.clone()));
+    backend.pull(&cwd, handle.as_ref())?;
+    let label = handle
+        .as_ref()
+        .map(|h| h.short().to_string())
+        .unwrap_or_else(|| "latest".into());
+    println!(
+        "pillbox: ✓ restored snapshot {label} into {}",
+        cwd.display()
+    );
+    Ok(())
+}
+
+fn dispatch_snapshot(resolved: &Pillbox, action: SnapshotAction) -> Result<()> {
+    use crate::workspace::{SnapshotHandle, WorkspaceBackend};
+    let backend = resolved.workspace()?;
+    match action {
+        SnapshotAction::List { json } => {
+            let snaps = backend.snapshots()?;
+            if json {
+                let arr: Vec<serde_json::Value> = snaps.iter().map(snapshot_value).collect();
+                println!(
+                    "{}",
+                    paths::json_v1(vec![
+                        (
+                            "pillbox",
+                            serde_json::Value::String(resolved.display_name().into())
+                        ),
+                        ("snapshots", serde_json::Value::Array(arr)),
+                    ])
+                );
+                return Ok(());
+            }
+            if snaps.is_empty() {
+                println!("(no snapshots yet)");
+                println!();
+                println!("Run `pillbox push` to take the first snapshot.");
+                return Ok(());
+            }
+            println!("Snapshots for `{}`:", resolved.display_name());
+            for s in snaps {
+                let tag = s
+                    .tag
+                    .as_deref()
+                    .map(|t| format!(" [{t}]"))
+                    .unwrap_or_default();
+                println!("  {} {}{}", s.handle.short(), s.created_at, tag);
+                if let Some(m) = &s.message {
+                    println!("    {m}");
+                }
+            }
+        }
+        SnapshotAction::Show { handle, json } => {
+            let snap = backend.snapshot_show(&SnapshotHandle::new(handle))?;
+            if json {
+                println!("{}", snapshot_json(&snap));
+            } else {
+                println!("Snapshot {}", snap.handle);
+                println!("  created:    {}", snap.created_at);
+                if let Some(t) = &snap.tag {
+                    println!("  tag:        {t}");
+                }
+                if let Some(m) = &snap.message {
+                    println!("  message:    {m}");
+                }
+                if let Some(a) = &snap.git_anchor {
+                    let dirty = if snap.git_dirty { " (dirty)" } else { "" };
+                    println!("  git anchor: {a}{dirty}");
+                }
+                println!("  bytes:      {}", snap.bytes);
+            }
+        }
+        SnapshotAction::Rm { handle } => {
+            // `handle` may be a prefix the user typed; echo it back via
+            // the canonical short form. Resolution already happened
+            // inside `snapshot_rm`.
+            let h = SnapshotHandle::new(handle.clone());
+            backend.snapshot_rm(&h)?;
+            println!("pillbox: ✓ removed snapshot {}", h.short());
+        }
+    }
+    Ok(())
+}
+
+fn dispatch_workspace(resolved: &Pillbox, action: WorkspaceAction) -> Result<()> {
+    use crate::workspace::WorkspaceBackend;
+    let backend = resolved.workspace()?;
+    match action {
+        WorkspaceAction::Rekey => {
+            backend.rekey()?;
+            println!("pillbox: ✓ workspace password rotated");
+            // rustic_core 0.11 exposes `add_key` but not a public
+            // single-call "remove old key by password" — see the NOTE
+            // in `RusticBackend::rekey`. Surface that explicitly so the
+            // user isn't surprised when the previous password still
+            // opens the repo. Drop this hint once rustic adds the API.
+            println!();
+            println!("note: rustic_core 0.11 cannot revoke the previous password from the repo;");
+            println!("      treat the old password as compromised — back up + recreate the");
+            println!("      pillbox if you need a hard cutover.");
+        }
+    }
+    Ok(())
+}
+
+fn snapshot_value(snap: &crate::workspace::Snapshot) -> serde_json::Value {
+    let mut o = serde_json::Map::new();
+    o.insert(
+        "handle".into(),
+        serde_json::Value::String(snap.handle.as_str().into()),
+    );
+    o.insert(
+        "short".into(),
+        serde_json::Value::String(snap.handle.short().into()),
+    );
+    o.insert(
+        "created_at".into(),
+        serde_json::Value::String(snap.created_at.clone()),
+    );
+    o.insert(
+        "tag".into(),
+        snap.tag
+            .as_deref()
+            .map(|s| serde_json::Value::String(s.to_string()))
+            .unwrap_or(serde_json::Value::Null),
+    );
+    o.insert(
+        "message".into(),
+        snap.message
+            .as_deref()
+            .map(|s| serde_json::Value::String(s.to_string()))
+            .unwrap_or(serde_json::Value::Null),
+    );
+    o.insert(
+        "git_anchor".into(),
+        snap.git_anchor
+            .as_deref()
+            .map(|s| serde_json::Value::String(s.to_string()))
+            .unwrap_or(serde_json::Value::Null),
+    );
+    o.insert("git_dirty".into(), serde_json::Value::Bool(snap.git_dirty));
+    o.insert("bytes".into(), serde_json::Value::Number(snap.bytes.into()));
+    serde_json::Value::Object(o)
+}
+
+fn snapshot_json(snap: &crate::workspace::Snapshot) -> String {
+    paths::json_v1(vec![("snapshot", snapshot_value(snap))])
 }

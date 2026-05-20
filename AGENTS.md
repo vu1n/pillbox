@@ -55,7 +55,7 @@ Stop reading if that's all you need.
 | Command | What it does |
 |---|---|
 | `pillbox init` | Create the global pillbox. Idempotent. |
-| `pillbox new [--name N] [--agent A]` | Create a project pillbox in cwd. Writes `pillbox.toml` + state dir. |
+| `pillbox new [--name N] [--agent A] [workspace flags]` | Create a project pillbox in cwd. Writes `pillbox.toml` + state dir + initializes a rustic repo. |
 | `pillbox list [--json]` | Every pillbox on disk (global + projects). |
 | `pillbox rm NAME` | Delete a project pillbox. Refuses `global`. |
 | `pillbox info [--json]` | Show the resolved pillbox for cwd (or `--pillbox`). |
@@ -81,6 +81,12 @@ global pillbox regardless of where you are.
 | `pillbox sidecar [--bind] [--json]` | Standalone vault sidecar process. |
 | `pillbox doctor [--json]` | Diagnose Docker, image, perms, `$HOME`. |
 | `pillbox version` | Print pillbox + runner image versions. |
+| `pillbox push [--tag T] [--message M] [--json]` | Snapshot cwd into the pillbox's rustic repo. |
+| `pillbox pull [--snapshot HANDLE]` | Restore cwd from a snapshot (defaults to latest). |
+| `pillbox snapshot list [--json]` | List every snapshot in the pillbox's repo. |
+| `pillbox snapshot show HANDLE [--json]` | Show one snapshot (HANDLE may be a unique prefix). |
+| `pillbox snapshot rm HANDLE` | Forget a snapshot (data packs survive until prune). |
+| `pillbox workspace rekey` | Rotate the rustic repo password. **Caveat:** rustic_core 0.11 has no public API to delete the prior key; both passwords keep working until upstream lands deletion. Treat the old password as compromised. |
 
 ### `pillbox run` flags
 
@@ -243,6 +249,32 @@ future releases; the version bumps on restructure. Pin against
     { "name": "data_dir_perms", "ok": true, "detail": "/Users/x/.pillbox mode 700" }
   ],
   "overall_ok": true
+}
+
+// pillbox snapshot list --json
+{
+  "version": 1,
+  "pillbox": "myapp",
+  "snapshots": [
+    {
+      "handle": "<64-char hex>",
+      "short": "<first 8 chars>",
+      "created_at": "2026-05-20T17:30:00Z",
+      "tag": "v1",
+      "message": "first cut",
+      "git_anchor": "abc123...",
+      "git_dirty": false,
+      "bytes": 1024
+    }
+  ]
+}
+
+// pillbox snapshot show HANDLE --json  (also: pillbox push --json)
+{
+  "version": 1,
+  "snapshot": { "handle": "...", "short": "...", "created_at": "...",
+                "tag": null, "message": null,
+                "git_anchor": null, "git_dirty": false, "bytes": 0 }
 }
 
 // pillbox vault status --json

@@ -30,6 +30,17 @@ time = "0.3"
 uuid = { version = "1", features = ["v7"] }
 tempfile = "3"
 
+# Workspace versioning — rustic_core is a Rust port of restic. Each
+# pillbox owns one rustic repository (local on disk, or S3-shaped via
+# opendal). See src/workspace/.
+rustic_core = "0.11"
+rustic_backend = { version = "0.6", default-features = false, features = ["opendal"] }
+rand = "0.9"
+# rustic_core re-exposes timestamps as jiff::Zoned — depend on jiff
+# directly so the helper that normalizes to strict RFC3339 doesn't
+# look at types it can't name.
+jiff = "0.2"
+
 [profile.release]
 strip = true
 lto = "thin"

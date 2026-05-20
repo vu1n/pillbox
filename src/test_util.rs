@@ -18,6 +18,12 @@ use std::path::PathBuf;
 ///
 /// `label` is folded into the tempdir name to make debugging leaked
 /// dirs easier — pass a short, unique string per call site.
+///
+/// Sets `PILLBOX_SKIP_WORKSPACE_INIT=1` so any `pillbox::new` call inside
+/// `body` skips the (intentionally slow, ~5s scrypt) rustic init. Unit
+/// tests that DO need a real repo on disk should drive
+/// [`crate::workspace::rustic::RusticBackend`] against a `TempDir`
+/// directly instead of going through `pillbox::new`.
 pub(crate) fn with_isolated_home<F: FnOnce()>(label: &str, body: F) {
     let _guard = crate::paths::TEST_HOME_LOCK
         .lock()
@@ -27,12 +33,18 @@ pub(crate) fn with_isolated_home<F: FnOnce()>(label: &str, body: F) {
     std::fs::create_dir_all(&tmp).unwrap();
     let prev_home = std::env::var_os("HOME");
     std::env::set_var("HOME", &tmp);
+    let prev_skip = std::env::var_os("PILLBOX_SKIP_WORKSPACE_INIT");
+    std::env::set_var("PILLBOX_SKIP_WORKSPACE_INIT", "1");
 
     body();
 
     match prev_home {
         Some(v) => std::env::set_var("HOME", v),
         None => std::env::remove_var("HOME"),
+    }
+    match prev_skip {
+        Some(v) => std::env::set_var("PILLBOX_SKIP_WORKSPACE_INIT", v),
+        None => std::env::remove_var("PILLBOX_SKIP_WORKSPACE_INIT"),
     }
     let _ = std::fs::remove_dir_all(&tmp);
 }

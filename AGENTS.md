@@ -79,6 +79,10 @@ global pillbox regardless of where you are.
 | `pillbox auth list/rm` | List/remove agent OAuth state. |
 | `pillbox vault ca/status [--json]` | Inspect the per-pillbox vault CA. |
 | `pillbox sidecar [--bind] [--json]` | Standalone vault sidecar process. |
+| `pillbox remote add NAME --url ssh://user@host[:port] [--agent A] [--global]` | Register a remote VPS for `pillbox run --remote NAME`. The user must have `pillbox` installed on the VPS themselves (we don't deploy binaries). |
+| `pillbox remote list [--json]` | List remotes visible from the current pillbox (project + global, deduplicated). |
+| `pillbox remote info NAME [--json]` | Show one remote (with inheritance). |
+| `pillbox remote rm NAME [--global]` | Remove a registered remote. |
 | `pillbox doctor [--json]` | Diagnose Docker, image, perms, `$HOME`. |
 | `pillbox version` | Print pillbox + runner image versions. |
 | `pillbox push [--tag T] [--message M] [--json]` | Snapshot cwd into the pillbox's rustic repo. |
@@ -100,6 +104,7 @@ global pillbox regardless of where you are.
 | `--env BUNDLE` | — | Inject every variable from a stored env bundle. |
 | `--env-file PATH` | — | Inject every variable from a `.env` on disk. |
 | `--vault` | — | Route agent traffic through the stub-swap proxy. |
+| `--remote NAME` | — | Run on a registered remote VPS instead of locally. Requires an S3-shaped workspace backend in v0.6 PR 4. |
 
 Env composition order (later layers override earlier):
 

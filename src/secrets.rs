@@ -24,15 +24,14 @@
 use std::{
     collections::BTreeMap,
     fs,
-    io::{IsTerminal, Read, Write},
-    os::unix::fs::OpenOptionsExt,
-    path::{Path, PathBuf},
+    io::{IsTerminal, Read},
+    path::PathBuf,
 };
 
 use anyhow::{Context, Result};
 
 use crate::errors::PillboxError;
-use crate::paths::validate_name;
+use crate::paths::{validate_name, write_private_file};
 #[cfg(test)]
 use crate::pillbox;
 use crate::pillbox::{Pillbox, Scope};
@@ -154,7 +153,7 @@ fn write_meta(pb: &Pillbox, name: &str, meta: &VaultMeta) -> Result<()> {
     let path = meta_path(pb, name)?;
     let body = serde_json::to_string_pretty(meta)
         .with_context(|| format!("serialize meta for `{name}`"))?;
-    write_secret_file(&path, &body)
+    write_private_file(&path, body.as_bytes())
 }
 
 pub(crate) fn add(
@@ -179,7 +178,7 @@ pub(crate) fn add(
         .into());
     }
     let value = read_value(name, source)?;
-    write_secret_file(&path, &value)?;
+    write_private_file(&path, value.as_bytes())?;
     if let Some(meta) = vault_meta.as_ref() {
         write_meta(&target, name, meta)?;
     } else {
@@ -349,19 +348,6 @@ fn read_value(name: &str, source: AddSource) -> Result<String> {
     Ok(raw.trim_end().to_string())
 }
 
-fn write_secret_file(path: &Path, value: &str) -> Result<()> {
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .with_context(|| format!("open {} for write", path.display()))?;
-    file.write_all(value.as_bytes())
-        .with_context(|| format!("write to {}", path.display()))?;
-    Ok(())
-}
-
 pub(crate) fn mask(value: &str) -> String {
     let core = value.trim_end();
     let chars: Vec<char> = core.chars().collect();
@@ -483,7 +469,12 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let saved = std::env::current_dir().ok();
             std::env::set_current_dir(tmp.path()).unwrap();
-            pillbox::new(Some("proj".into()), None).unwrap();
+            pillbox::new(
+                Some("proj".into()),
+                None,
+                pillbox::NewWorkspaceArgs::default(),
+            )
+            .unwrap();
             let proj = Pillbox::resolve(None).unwrap();
             assert!(!proj.is_global());
 
@@ -512,7 +503,12 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let saved = std::env::current_dir().ok();
             std::env::set_current_dir(tmp.path()).unwrap();
-            pillbox::new(Some("proj".into()), None).unwrap();
+            pillbox::new(
+                Some("proj".into()),
+                None,
+                pillbox::NewWorkspaceArgs::default(),
+            )
+            .unwrap();
             let proj = Pillbox::resolve(None).unwrap();
 
             let g = pillbox::global();
@@ -532,7 +528,12 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let saved = std::env::current_dir().ok();
             std::env::set_current_dir(tmp.path()).unwrap();
-            pillbox::new(Some("proj".into()), None).unwrap();
+            pillbox::new(
+                Some("proj".into()),
+                None,
+                pillbox::NewWorkspaceArgs::default(),
+            )
+            .unwrap();
             let proj = Pillbox::resolve(None).unwrap();
 
             // Pass WriteScope::Global from a project context — value lands
@@ -558,7 +559,12 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let saved = std::env::current_dir().ok();
             std::env::set_current_dir(tmp.path()).unwrap();
-            pillbox::new(Some("proj".into()), None).unwrap();
+            pillbox::new(
+                Some("proj".into()),
+                None,
+                pillbox::NewWorkspaceArgs::default(),
+            )
+            .unwrap();
             let proj = Pillbox::resolve(None).unwrap();
             let g = pillbox::global();
             add_plain(&g, WriteScope::Resolved, "G_ONLY", "x");

@@ -16,17 +16,57 @@ name = "my-project"
 # Optional — default agent for `pillbox run`
 agent = "claude"          # "claude" | "codex"
 
-# Reserved for PR 3 (workspace backends: S3/R2, Git, Tarball)
+# Workspace backend (PR 3). Default is local.
 [workspace]
+backend = "local"         # or "s3"
+# s3-only:
+# endpoint = "https://<acct>.r2.cloudflarestorage.com"
+# region = "auto"
+# bucket = "my-bucket"
+# prefix = "pillbox/"
+# access_key_env = "R2_ACCESS_KEY"   # env var NAME, not the secret value
+# secret_key_env = "R2_SECRET_KEY"
 ```
 
-Unknown fields are rejected with exit 3.
+Unknown top-level fields are rejected with exit 3. The `[workspace]`
+table is intentionally permissive so older binaries keep parsing
+descriptors that gain fields in future releases — the trade-off is that
+typos *inside* `[workspace]` are silently ignored at parse time.
 
 | Field | Type | Notes |
 |---|---|---|
 | `name` | string | Required. Display name for the pillbox; also defaults `pillbox run`'s `--name`. |
 | `agent` | string | Default agent for `pillbox run` (`claude` or `codex`). |
-| `[workspace]` | table | Empty in PR 2 — backend config lands in PR 3. |
+| `[workspace].backend` | string | `local` (default) or `s3`. Picks the rustic-backed snapshot store. |
+| `[workspace].endpoint` | string | S3-only. URL for R2, MinIO, Backblaze, native S3, etc. |
+| `[workspace].region` | string | S3-only. Defaults to `auto`. |
+| `[workspace].bucket` | string | S3-only. Bucket name. |
+| `[workspace].prefix` | string | S3-only. Object key prefix inside the bucket. |
+| `[workspace].access_key_env` | string | S3-only. Env var NAME (not value) that holds the access key. |
+| `[workspace].secret_key_env` | string | S3-only. Env var NAME (not value) that holds the secret key. |
+
+The S3 credentials are referenced by env-var **name**, not by value, so
+`pillbox.toml` stays safe to check into git. Set the env vars in your
+shell (or via a secret manager) before `pillbox push` / `pillbox pull`.
+
+### `--from-git` credentials
+
+`pillbox new --from-git URL` shells out to `git clone URL`. If `URL`
+embeds a PAT (e.g. `https://ghp_xxx@github.com/...`), git records that
+PAT in `<cwd>/.git/config`. Any subsequent `pillbox push` will snapshot
+`.git/` and therefore the token. For private repos use a git
+credential helper or SSH key — pillbox doesn't strip credentials from
+URLs because doing so silently would also break the legitimate "I
+know what I'm doing" case.
+
+### Workspace data on disk
+
+Either way, the **encryption password** for the rustic repository
+lives at `~/.pillbox/projects/<key>/repo-password` (0600, local-only).
+With the S3 backend that means a stolen bucket alone can't be decrypted.
+
+For the local backend, the rustic repo itself lives at
+`~/.pillbox/projects/<key>/repo/`.
 
 `pillbox.toml` is the **descriptor** users edit by hand. The durable
 record lives in `<state_dir>/meta.json` (see below) and is rewritten by
@@ -48,7 +88,9 @@ encoding so two paths to the same directory collapse to one key.
 
 ```
 ~/.pillbox/projects/-Users-vuln-work-myapp/
-├── meta.json          # { name, created_at, agent_default }
+├── meta.json          # { name, created_at, agent_default, workspace }
+├── repo-password      # 0600 — rustic repo encryption password (local only)
+├── repo/              # local rustic repository (backend = "local")
 ├── secrets/           # 0700
 ├── env/               # 0700
 ├── auth/              # reserved (v0.7 per-project auth override)

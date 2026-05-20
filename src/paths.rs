@@ -24,7 +24,8 @@
 
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
+    io::Write,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -67,6 +68,24 @@ pub(crate) fn pillbox_root() -> Result<PathBuf> {
 pub(crate) fn ensure_mode_0700(p: &Path) -> Result<()> {
     fs::set_permissions(p, fs::Permissions::from_mode(0o700))
         .with_context(|| format!("chmod {} 0700", p.display()))?;
+    Ok(())
+}
+
+/// Write `body` to `path` with 0600 perms (create / truncate). Shared
+/// across every spot that stashes a secret-shaped value on disk:
+/// `secrets/<name>`, `repo-password`, future per-pillbox tokens. Use
+/// this instead of hand-rolling `OpenOptions::new().mode(0o600)` so the
+/// invariant ("secret-on-disk = 0600") lives in one place.
+pub(crate) fn write_private_file(path: &Path, body: &[u8]) -> Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("open {} for write", path.display()))?;
+    file.write_all(body)
+        .with_context(|| format!("write to {}", path.display()))?;
     Ok(())
 }
 

@@ -28,15 +28,17 @@
 
 use std::{
     fs,
-    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::config::{BackendKind, WorkspaceConfig};
 use crate::errors::PillboxError;
-use crate::paths::{detect_legacy_subdirs, ensure_mode_0700, pillbox_root};
+use crate::paths::{detect_legacy_subdirs, ensure_mode_0700, pillbox_root, write_private_file};
+use crate::workspace::rustic::{RusticBackend, RusticVariant, PASSWORD_FILE, REPO_DIR};
+use crate::workspace::WorkspaceBackend;
 
 /// The descriptor file that marks a directory as a project pillbox.
 pub(crate) const PILLBOX_TOML: &str = "pillbox.toml";
@@ -76,6 +78,13 @@ pub(crate) struct ProjectMeta {
     /// `None` falls back to the built-in default at run time.
     #[serde(default)]
     pub(crate) agent_default: Option<String>,
+    /// Workspace backend selector. Mirrors `pillbox.toml`'s `[workspace]`
+    /// table. Persisted in `meta.json` so runtime callers (`pillbox push`
+    /// / `pillbox pull`) don't have to re-read + re-validate the
+    /// descriptor on every command — the state dir already has the
+    /// resolved values.
+    #[serde(default)]
+    pub(crate) workspace: WorkspaceConfig,
 }
 
 /// Either the global pillbox or one specific project. The scope drives
@@ -125,6 +134,52 @@ impl Pillbox {
     #[allow(dead_code)]
     pub(crate) fn is_global(&self) -> bool {
         matches!(self.scope, Scope::Global)
+    }
+
+    /// Resolve the configured workspace backend. Reads from
+    /// `meta.json.workspace` (populated by `pillbox new`) so we don't
+    /// re-parse `pillbox.toml` every time. Returns `None` for the
+    /// global pillbox (which doesn't own a workspace).
+    ///
+    /// The S3 variant pulls credentials from the env vars named in
+    /// `meta.json.workspace.{access_key_env,secret_key_env}`. Missing
+    /// envs surface as a runtime error rather than panic.
+    pub(crate) fn workspace(&self) -> Result<RusticBackend> {
+        let meta = self.meta.as_ref().ok_or_else(|| {
+            PillboxError::usage(
+                "workspace",
+                "the global pillbox has no workspace; cd into a project pillbox",
+            )
+        })?;
+        let password_file = self.state_dir.join(PASSWORD_FILE);
+        let variant = match meta.workspace.backend_kind() {
+            BackendKind::Local => RusticVariant::Local {
+                repo_path: self.state_dir.join(REPO_DIR),
+            },
+            BackendKind::S3 => {
+                let w = &meta.workspace;
+                let endpoint = require_field(w.endpoint.as_deref(), "endpoint")?;
+                let region = w.region.clone().unwrap_or_else(|| "auto".to_string());
+                let bucket = require_field(w.bucket.as_deref(), "bucket")?;
+                let prefix = w.prefix.clone().unwrap_or_default();
+                let access_key_env = require_field(w.access_key_env.as_deref(), "access_key_env")?;
+                let secret_key_env = require_field(w.secret_key_env.as_deref(), "secret_key_env")?;
+                let access_key = read_env_or_err(&access_key_env)?;
+                let secret_key = read_env_or_err(&secret_key_env)?;
+                RusticVariant::S3 {
+                    endpoint,
+                    region,
+                    bucket,
+                    prefix,
+                    access_key,
+                    secret_key,
+                }
+            }
+        };
+        Ok(RusticBackend {
+            variant,
+            password_file,
+        })
     }
 
     /// Per-pillbox subdirectory under the state dir, idempotently 0700.
@@ -362,21 +417,7 @@ fn write_project_meta(state_dir: &Path, meta: &ProjectMeta) -> Result<()> {
     let path = state_dir.join("meta.json");
     let body = serde_json::to_string_pretty(meta)
         .with_context(|| format!("serialize meta for `{}`", meta.name))?;
-    write_state_file(&path, &body)
-}
-
-fn write_state_file(path: &Path, body: &str) -> Result<()> {
-    use std::io::Write;
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .with_context(|| format!("open {}", path.display()))?;
-    f.write_all(body.as_bytes())
-        .with_context(|| format!("write {}", path.display()))?;
-    Ok(())
+    write_private_file(&path, body.as_bytes())
 }
 
 /// `pillbox init` — create the global pillbox. Idempotent: subsequent
@@ -393,11 +434,28 @@ pub(crate) fn init() -> Result<()> {
     Ok(())
 }
 
+/// Workspace flags supplied to `pillbox new` (PR 3). All optional —
+/// the default is a local rustic repo under
+/// `~/.pillbox/projects/<key>/repo/`.
+#[derive(Debug, Default)]
+pub(crate) struct NewWorkspaceArgs {
+    pub(crate) backend: Option<String>,
+    pub(crate) endpoint: Option<String>,
+    pub(crate) region: Option<String>,
+    pub(crate) bucket: Option<String>,
+    pub(crate) prefix: Option<String>,
+    pub(crate) access_key_env: Option<String>,
+    pub(crate) secret_key_env: Option<String>,
+    pub(crate) from_git: Option<String>,
+    pub(crate) git_ref: Option<String>,
+}
+
 /// `pillbox new` — create a project pillbox in the current directory.
-/// Writes `pillbox.toml` next to the cwd and creates the state dir under
-/// `~/.pillbox/projects/<key>/`. Fails if a pillbox already exists at
-/// either location.
-pub(crate) fn new(name: Option<String>, agent: Option<String>) -> Result<()> {
+/// Writes `pillbox.toml` next to the cwd, creates the state dir under
+/// `~/.pillbox/projects/<key>/`, initializes a rustic repo, and
+/// optionally clones from `--from-git`. Fails if a pillbox already
+/// exists at either location.
+pub(crate) fn new(name: Option<String>, agent: Option<String>, ws: NewWorkspaceArgs) -> Result<()> {
     check_legacy_layout()?;
     let cwd = std::env::current_dir()
         .map_err(|e| PillboxError::runtime("pillbox new", format!("could not resolve cwd: {e}")))?;
@@ -417,6 +475,7 @@ pub(crate) fn new(name: Option<String>, agent: Option<String>) -> Result<()> {
     if let Some(a) = agent.as_deref() {
         validate_agent(a)?;
     }
+    let workspace_cfg = build_workspace_config(&ws)?;
     let key = path_to_key(&cwd)?;
     let state_dir = projects_root()?.join(&key);
     if state_dir.exists() {
@@ -430,21 +489,172 @@ pub(crate) fn new(name: Option<String>, agent: Option<String>) -> Result<()> {
     fs::create_dir_all(&state_dir).with_context(|| format!("create {}", state_dir.display()))?;
     ensure_mode_0700(&state_dir)?;
 
+    // --from-git: clone before initializing rustic, so the workspace
+    // has content. Clone target is cwd itself; refuse if cwd isn't
+    // empty (mirrors `git clone`'s own behavior).
+    if let Some(url) = ws.from_git.as_deref() {
+        clone_git_into_cwd(&cwd, url, ws.git_ref.as_deref())?;
+    }
+
     // Write the descriptor first so a failure on meta.json leaves the
     // user with a half-set-up directory they can re-run against.
-    write_descriptor(&descriptor, &display_name, agent.as_deref())?;
+    write_descriptor(&descriptor, &display_name, agent.as_deref(), &workspace_cfg)?;
     let meta = ProjectMeta {
         name: display_name.clone(),
         created_at: rfc3339_now(),
         agent_default: agent,
+        workspace: workspace_cfg.clone(),
     };
     write_project_meta(&state_dir, &meta)?;
+
+    // Initialize the rustic repo + password file. Built from the
+    // resolved pillbox so the variant logic stays in one place.
+    let pb = Pillbox {
+        scope: Scope::Project {
+            key: key.clone(),
+            source_dir: cwd.clone(),
+        },
+        state_dir: state_dir.clone(),
+        meta: Some(meta),
+    };
+    // For S3 the env vars must be set NOW so init can talk to the
+    // bucket. We don't actually push a snapshot here, just init the
+    // repo skeleton.
+    //
+    // Test escape hatch: rustic's scrypt key derivation takes ~5s by
+    // design (deliberately slow vs. brute force). Set
+    // `PILLBOX_SKIP_WORKSPACE_INIT=1` to suppress repo init for tests
+    // that exercise non-workspace surfaces (secrets, auth, …). Tests
+    // that DO want a real repo (`tests/workspace.rs`, the workspace
+    // unit tests) just don't set the var. Never set it in production.
+    if std::env::var_os("PILLBOX_SKIP_WORKSPACE_INIT").is_none() {
+        let backend = pb.workspace()?;
+        backend.init_for_pillbox()?;
+    }
 
     println!("pillbox: ✓ project pillbox `{display_name}` created");
     println!("  descriptor: {}", descriptor.display());
     println!("  state dir:  {}", state_dir.display());
+    match workspace_cfg.backend_kind() {
+        BackendKind::Local => {
+            println!(
+                "  workspace:  local rustic repo at {}",
+                state_dir.join(REPO_DIR).display()
+            );
+        }
+        BackendKind::S3 => {
+            println!(
+                "  workspace:  s3://{}/{} ({})",
+                workspace_cfg.bucket.as_deref().unwrap_or(""),
+                workspace_cfg.prefix.as_deref().unwrap_or(""),
+                workspace_cfg.endpoint.as_deref().unwrap_or(""),
+            );
+        }
+    }
+    println!(
+        "  password:   {} (0600, local only)",
+        state_dir.join(PASSWORD_FILE).display()
+    );
     println!();
     println!("Run agents with `pillbox run` from inside this directory.");
+    println!("Snapshot the workspace with `pillbox push`.");
+    Ok(())
+}
+
+/// Validate + assemble a [`WorkspaceConfig`] from CLI args. Local
+/// backend is the default; S3 demands the full opt set so we fail
+/// early with one error rather than per-field.
+fn build_workspace_config(ws: &NewWorkspaceArgs) -> Result<WorkspaceConfig> {
+    let kind = match ws.backend.as_deref() {
+        Some("local") | None => BackendKind::Local,
+        Some("s3") => BackendKind::S3,
+        Some(other) => {
+            return Err(PillboxError::usage(
+                "pillbox new",
+                format!("--workspace-backend `{other}` (known: local, s3)"),
+            )
+            .into())
+        }
+    };
+    if kind == BackendKind::Local {
+        let stray = [
+            ("--bucket", ws.bucket.is_some()),
+            ("--endpoint", ws.endpoint.is_some()),
+            ("--region", ws.region.is_some()),
+            ("--prefix", ws.prefix.is_some()),
+            ("--access-key-env", ws.access_key_env.is_some()),
+            ("--secret-key-env", ws.secret_key_env.is_some()),
+        ];
+        if let Some((flag, _)) = stray.iter().find(|(_, set)| *set) {
+            return Err(PillboxError::usage(
+                "pillbox new",
+                format!("{flag} is only valid with --workspace-backend s3"),
+            )
+            .into());
+        }
+        return Ok(WorkspaceConfig {
+            backend: Some(BackendKind::Local.as_str().into()),
+            ..Default::default()
+        });
+    }
+
+    // s3
+    let bucket = ws.bucket.clone().ok_or_else(|| {
+        PillboxError::usage(
+            "pillbox new",
+            "--workspace-backend s3 requires --bucket BUCKET",
+        )
+    })?;
+    let endpoint = ws.endpoint.clone().ok_or_else(|| {
+        PillboxError::usage(
+            "pillbox new",
+            "--workspace-backend s3 requires --endpoint URL",
+        )
+    })?;
+    let access_key_env = ws.access_key_env.clone().ok_or_else(|| {
+        PillboxError::usage(
+            "pillbox new",
+            "--workspace-backend s3 requires --access-key-env VAR",
+        )
+    })?;
+    let secret_key_env = ws.secret_key_env.clone().ok_or_else(|| {
+        PillboxError::usage(
+            "pillbox new",
+            "--workspace-backend s3 requires --secret-key-env VAR",
+        )
+    })?;
+    Ok(WorkspaceConfig {
+        backend: Some(BackendKind::S3.as_str().into()),
+        endpoint: Some(endpoint),
+        region: Some(ws.region.clone().unwrap_or_else(|| "auto".to_string())),
+        bucket: Some(bucket),
+        prefix: ws.prefix.clone(),
+        access_key_env: Some(access_key_env),
+        secret_key_env: Some(secret_key_env),
+    })
+}
+
+fn clone_git_into_cwd(cwd: &Path, url: &str, git_ref: Option<&str>) -> Result<()> {
+    // Refuse to clone into a non-empty dir — git clone would itself
+    // refuse, but we want a pillbox-flavored error first.
+    let any = fs::read_dir(cwd)
+        .with_context(|| format!("read {}", cwd.display()))?
+        .next()
+        .is_some();
+    if any {
+        return Err(PillboxError::usage(
+            "pillbox new",
+            format!(
+                "--from-git requires an empty directory (cwd `{}` is not empty)",
+                cwd.display()
+            ),
+        )
+        .into());
+    }
+    // Clone into a scratch sibling and merge so the descriptor write
+    // doesn't fight git over an existing `.git`. We clone DIRECTLY
+    // into cwd; git accepts this when the dir is empty.
+    crate::workspace::git_inflow::clone_into(url, cwd, git_ref)?;
     Ok(())
 }
 
@@ -529,6 +739,26 @@ pub(crate) fn info(explicit: Option<&str>, json: bool) -> Result<()> {
                     println!("  agent:      {a}");
                 }
                 println!("  created:    {}", m.created_at);
+            }
+            // Snapshot count — best-effort: opening the workspace can
+            // fail on an in-flight repo or a missing password (e.g.
+            // user just ran `pillbox new` and the repo dir was wiped
+            // out of band). Failure isn't fatal for `info`; we just
+            // skip the section. Keeps `info` always-printable.
+            match pb.workspace().and_then(|b| b.snapshots()) {
+                Ok(snaps) if snaps.is_empty() => {
+                    println!("  snapshots:  none yet — run `pillbox push` to take the first");
+                }
+                Ok(snaps) => {
+                    let latest = snaps.last().unwrap();
+                    println!(
+                        "  snapshots:  {} (latest: {} {})",
+                        snaps.len(),
+                        latest.handle.short(),
+                        latest.created_at
+                    );
+                }
+                Err(_) => {}
             }
         }
     }
@@ -634,16 +864,67 @@ fn validate_agent(a: &str) -> Result<()> {
     }
 }
 
-fn write_descriptor(path: &Path, name: &str, agent: Option<&str>) -> Result<()> {
+fn write_descriptor(
+    path: &Path,
+    name: &str,
+    agent: Option<&str>,
+    workspace: &WorkspaceConfig,
+) -> Result<()> {
     use std::io::Write;
     let mut body = format!("# v0.6 pillbox descriptor — see docs/config.md\n\nname = \"{name}\"\n");
     if let Some(a) = agent {
         body.push_str(&format!("agent = \"{a}\"\n"));
     }
+    // Always emit a `[workspace]` table so the user sees the resolved
+    // backend even when it's the default.
+    body.push_str("\n[workspace]\n");
+    let backend = workspace.backend_kind();
+    body.push_str(&format!("backend = \"{}\"\n", backend.as_str()));
+    if backend == BackendKind::S3 {
+        if let Some(v) = workspace.endpoint.as_deref() {
+            body.push_str(&format!("endpoint = \"{v}\"\n"));
+        }
+        if let Some(v) = workspace.region.as_deref() {
+            body.push_str(&format!("region = \"{v}\"\n"));
+        }
+        if let Some(v) = workspace.bucket.as_deref() {
+            body.push_str(&format!("bucket = \"{v}\"\n"));
+        }
+        if let Some(v) = workspace.prefix.as_deref() {
+            body.push_str(&format!("prefix = \"{v}\"\n"));
+        }
+        if let Some(v) = workspace.access_key_env.as_deref() {
+            body.push_str(&format!("access_key_env = \"{v}\"\n"));
+        }
+        if let Some(v) = workspace.secret_key_env.as_deref() {
+            body.push_str(&format!("secret_key_env = \"{v}\"\n"));
+        }
+    }
     let mut f = fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
     f.write_all(body.as_bytes())
         .with_context(|| format!("write {}", path.display()))?;
     Ok(())
+}
+
+fn require_field(v: Option<&str>, name: &'static str) -> Result<String> {
+    v.map(str::to_string).ok_or_else(|| {
+        PillboxError::config(
+            "workspace",
+            format!("[workspace] is missing required field `{name}` for the s3 backend"),
+        )
+        .into()
+    })
+}
+
+fn read_env_or_err(name: &str) -> Result<String> {
+    std::env::var(name).map_err(|_| {
+        PillboxError::runtime(
+            "workspace",
+            format!("env var `{name}` is not set (referenced by [workspace] in pillbox.toml)"),
+        )
+        .with_next(format!("export {name}=...  # then re-run"))
+        .into()
+    })
 }
 
 fn rfc3339_now() -> String {
@@ -763,7 +1044,12 @@ mod tests {
             let saved_cwd = std::env::current_dir().ok();
             std::env::set_current_dir(tmp.path()).unwrap();
 
-            new(Some("alpha".into()), Some("claude".into())).unwrap();
+            new(
+                Some("alpha".into()),
+                Some("claude".into()),
+                NewWorkspaceArgs::default(),
+            )
+            .unwrap();
 
             let descriptor = tmp.path().join(PILLBOX_TOML);
             assert!(descriptor.is_file());
@@ -792,7 +1078,7 @@ mod tests {
             std::env::set_current_dir(tmp.path()).unwrap();
             fs::write(tmp.path().join(PILLBOX_TOML), "name = \"x\"\n").unwrap();
 
-            let err = new(None, None).unwrap_err();
+            let err = new(None, None, NewWorkspaceArgs::default()).unwrap_err();
             let s = format!("{err}");
             assert!(s.contains("already exists"), "got: {s}");
 
@@ -847,7 +1133,7 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let saved_cwd = std::env::current_dir().ok();
             std::env::set_current_dir(tmp.path()).unwrap();
-            new(Some("alpha".into()), None).unwrap();
+            new(Some("alpha".into()), None, NewWorkspaceArgs::default()).unwrap();
 
             // Now from /tmp (no descriptor), resolve by name.
             std::env::set_current_dir("/tmp").unwrap();
@@ -876,7 +1162,7 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let saved_cwd = std::env::current_dir().ok();
             std::env::set_current_dir(tmp.path()).unwrap();
-            new(Some("beta".into()), None).unwrap();
+            new(Some("beta".into()), None, NewWorkspaceArgs::default()).unwrap();
 
             let all = collect_all().unwrap();
             assert!(all.iter().any(|p| p.is_global()));
@@ -894,7 +1180,7 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let saved_cwd = std::env::current_dir().ok();
             std::env::set_current_dir(tmp.path()).unwrap();
-            new(Some("gamma".into()), None).unwrap();
+            new(Some("gamma".into()), None, NewWorkspaceArgs::default()).unwrap();
 
             let key = path_to_key(tmp.path()).unwrap();
             let home = std::env::var("HOME").unwrap();

@@ -26,24 +26,40 @@ use crate::errors::PillboxError;
 /// `dest` must be empty (git clone refuses an existing non-empty target
 /// dir, which is what we want — `pillbox new --from-git` runs at
 /// pillbox-creation time, before any other writes).
+///
+/// **Credentials**: pillbox passes `url` to `git clone` unmodified. A
+/// PAT-embedded URL (`https://ghp_xxx@github.com/...`) WILL be persisted
+/// by git into `<dest>/.git/config` as the `[remote "origin"].url`,
+/// and rustic snapshots that include `.git/` will therefore contain
+/// the token. Prefer credential helpers / SSH for private repos — see
+/// `docs/config.md` for the recommended workflow. We deliberately set
+/// `GIT_TERMINAL_PROMPT=0` so a missing-credential clone fails fast
+/// instead of hanging an automation context.
 pub(crate) fn clone_into(url: &str, dest: &Path, git_ref: Option<&str>) -> Result<String> {
+    eprintln!("pillbox: cloning {url}...");
     let mut cmd = Command::new("git");
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
     cmd.arg("clone");
     if let Some(r) = git_ref {
         cmd.arg("--branch").arg(r);
     }
     cmd.arg(url).arg(dest);
-    let out = cmd.output().map_err(|e| {
+    // Inherit stdio so git's own "Receiving objects: …%" progress
+    // (written to stderr) streams straight to the user. Capturing via
+    // `.output()` makes a large-repo clone look hung for minutes.
+    let status = cmd.status().map_err(|e| {
         PillboxError::resource(
             "workspace clone",
             format!("could not invoke git: {e} (is git installed?)"),
         )
     })?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    if !status.success() {
         return Err(PillboxError::runtime(
             "workspace clone",
-            format!("git clone {url} failed: {}", stderr.trim()),
+            format!(
+                "git clone {url} failed (exit {})",
+                status.code().unwrap_or(-1)
+            ),
         )
         .into());
     }

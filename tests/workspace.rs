@@ -11,34 +11,14 @@
 //! all; we don't bypass it here so the integration tests prove the
 //! repo can be re-opened cleanly.
 
+mod common;
+
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::Command;
 
 use tempfile::TempDir;
 
-fn pillbox_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_pillbox"))
-}
-
-fn run(home: &std::path::Path, cwd: &std::path::Path, args: &[&str]) -> Output {
-    Command::new(pillbox_bin())
-        .env("HOME", home)
-        .current_dir(cwd)
-        .args(args)
-        .output()
-        .expect("spawn pillbox")
-}
-
-fn assert_ok(out: &Output, label: &str) {
-    if !out.status.success() {
-        panic!(
-            "{label} failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
-            out.status,
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr),
-        );
-    }
-}
+use common::{assert_ok, pillbox_bin, run};
 
 #[test]
 fn new_initializes_rustic_repo_for_local_backend() {

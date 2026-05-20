@@ -28,7 +28,10 @@ backend = "local"         # or "s3"
 # secret_key_env = "R2_SECRET_KEY"
 ```
 
-Unknown fields are rejected with exit 3.
+Unknown top-level fields are rejected with exit 3. The `[workspace]`
+table is intentionally permissive so older binaries keep parsing
+descriptors that gain fields in future releases — the trade-off is that
+typos *inside* `[workspace]` are silently ignored at parse time.
 
 | Field | Type | Notes |
 |---|---|---|
@@ -45,6 +48,16 @@ Unknown fields are rejected with exit 3.
 The S3 credentials are referenced by env-var **name**, not by value, so
 `pillbox.toml` stays safe to check into git. Set the env vars in your
 shell (or via a secret manager) before `pillbox push` / `pillbox pull`.
+
+### `--from-git` credentials
+
+`pillbox new --from-git URL` shells out to `git clone URL`. If `URL`
+embeds a PAT (e.g. `https://ghp_xxx@github.com/...`), git records that
+PAT in `<cwd>/.git/config`. Any subsequent `pillbox push` will snapshot
+`.git/` and therefore the token. For private repos use a git
+credential helper or SSH key — pillbox doesn't strip credentials from
+URLs because doing so silently would also break the legitimate "I
+know what I'm doing" case.
 
 ### Workspace data on disk
 

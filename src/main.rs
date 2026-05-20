@@ -18,7 +18,7 @@
 use std::{path::PathBuf, process::ExitCode};
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 mod agents;
 mod config;
@@ -183,15 +183,22 @@ enum Command {
     /// Snapshot the current workspace (cwd) into the pillbox's
     /// rustic repository.
     Push {
+        /// Short tag for the snapshot (e.g. `v1`, `before-refactor`).
+        /// Surfaced in `snapshot list` next to the handle.
         #[arg(long, value_name = "NAME")]
         tag: Option<String>,
+        /// Free-form snapshot message (analogous to a commit message).
         #[arg(long, short = 'm', value_name = "TEXT")]
         message: Option<String>,
+        /// Emit the snapshot record as JSON on stdout. Stable schema —
+        /// pin against `version: 1`.
         #[arg(long)]
         json: bool,
     },
     /// Restore the workspace from a snapshot. Defaults to the latest.
     Pull {
+        /// Snapshot to restore. Accepts a unique prefix (≥ 4 hex chars)
+        /// or the full handle. Omit to restore the latest snapshot.
         #[arg(long, value_name = "HANDLE")]
         snapshot: Option<String>,
     },
@@ -205,23 +212,37 @@ enum Command {
         #[command(subcommand)]
         action: WorkspaceAction,
     },
+    /// Emit a shell completion script on stdout. Pipe into your shell's
+    /// completion dir (`bash`, `zsh`, `fish`, `powershell`, `elvish`).
+    Completions {
+        /// Shell to generate completions for.
+        #[arg(value_name = "SHELL")]
+        shell: clap_complete::Shell,
+    },
 }
 
 #[derive(Subcommand, Debug)]
 enum SnapshotAction {
     /// List every snapshot in the pillbox's repository.
     List {
+        /// Emit a JSON array of snapshot records on stdout. Stable
+        /// schema — pin against `version: 1`.
         #[arg(long)]
         json: bool,
     },
     /// Show one snapshot's metadata. Accepts a unique prefix.
     Show {
+        /// Snapshot handle (full hex ID or a unique prefix ≥ 4 chars).
         handle: String,
+        /// Emit the snapshot record as JSON on stdout.
         #[arg(long)]
         json: bool,
     },
     /// Remove one snapshot. Data packs survive until a future `prune`.
-    Rm { handle: String },
+    Rm {
+        /// Snapshot handle (full hex ID or a unique prefix ≥ 4 chars).
+        handle: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -463,6 +484,16 @@ fn run(cli: Cli) -> Result<()> {
         Command::Snapshot { action } => {
             let resolved = Pillbox::resolve(pillbox_arg)?;
             dispatch_snapshot(&resolved, action)
+        }
+        Command::Completions { shell } => {
+            // `Cli::command()` materializes the clap definition without
+            // re-parsing argv; generate_to_stdout writes the shell
+            // script for the user to source. No pillbox resolution
+            // needed — this is a static codegen step.
+            let mut cmd = Cli::command();
+            let bin_name = cmd.get_name().to_string();
+            clap_complete::generate(shell, &mut cmd, bin_name, &mut std::io::stdout());
+            Ok(())
         }
         Command::Workspace { action } => {
             let resolved = Pillbox::resolve(pillbox_arg)?;
@@ -939,9 +970,17 @@ fn dispatch_push(
         println!("{}", snapshot_json(&snap));
     } else {
         println!(
-            "pillbox: ✓ snapshot {} ({} bytes)",
+            "pillbox: ✓ snapshot {} ({})",
             snap.handle.short(),
-            snap.bytes
+            human_bytes(snap.bytes)
+        );
+        // `files_changed` from rustic counts files where content hash
+        // moved, including newly added ones, so `files_new` is a subset
+        // of `files_changed`. Surface both — "5 new, 12 changed (200
+        // total)" reads more clearly than a single "changed" number.
+        println!(
+            "  files:      {} new, {} changed ({} total)",
+            snap.files_new, snap.files_changed, snap.files_total
         );
         if let Some(t) = &snap.tag {
             println!("  tag:        {t}");
@@ -956,6 +995,25 @@ fn dispatch_push(
         println!("  created:    {}", snap.created_at);
     }
     Ok(())
+}
+
+/// Render `bytes` as a short human-readable string (`104 B`, `4.2 KB`,
+/// `1.3 MB`, …). Used by push / snapshot list / snapshot show output.
+/// Binary prefixes intentionally — restic/rustic dedup math is binary
+/// too, so the units line up if anyone cross-checks against the repo.
+fn human_bytes(b: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    if b < KB {
+        format!("{b} B")
+    } else if b < MB {
+        format!("{:.1} KB", b as f64 / KB as f64)
+    } else if b < GB {
+        format!("{:.1} MB", b as f64 / MB as f64)
+    } else {
+        format!("{:.2} GB", b as f64 / GB as f64)
+    }
 }
 
 fn dispatch_pull(resolved: &Pillbox, snapshot: Option<String>) -> Result<()> {
@@ -1013,7 +1071,17 @@ fn dispatch_snapshot(resolved: &Pillbox, action: SnapshotAction) -> Result<()> {
                 if let Some(m) = &s.message {
                     println!("    {m}");
                 }
+                // git anchor — short SHA + dirty marker, mirroring
+                // `git log --oneline`. Helps the user correlate a
+                // snapshot back to a commit at a glance.
+                if let Some(a) = &s.git_anchor {
+                    let short = &a[..a.len().min(7)];
+                    let dirty = if s.git_dirty { " (dirty)" } else { "" };
+                    println!("    git {short}{dirty}");
+                }
             }
+            println!();
+            println!("Use `pillbox snapshot show <HANDLE>` for details, `pillbox pull --snapshot <HANDLE>` to restore.");
         }
         SnapshotAction::Show { handle, json } => {
             let snap = backend.snapshot_show(&SnapshotHandle::new(handle))?;
@@ -1032,7 +1100,7 @@ fn dispatch_snapshot(resolved: &Pillbox, action: SnapshotAction) -> Result<()> {
                     let dirty = if snap.git_dirty { " (dirty)" } else { "" };
                     println!("  git anchor: {a}{dirty}");
                 }
-                println!("  bytes:      {}", snap.bytes);
+                println!("  size:       {}", human_bytes(snap.bytes));
             }
         }
         SnapshotAction::Rm { handle } => {
@@ -1105,6 +1173,18 @@ fn snapshot_value(snap: &crate::workspace::Snapshot) -> serde_json::Value {
     );
     o.insert("git_dirty".into(), serde_json::Value::Bool(snap.git_dirty));
     o.insert("bytes".into(), serde_json::Value::Number(snap.bytes.into()));
+    o.insert(
+        "files_new".into(),
+        serde_json::Value::Number(snap.files_new.into()),
+    );
+    o.insert(
+        "files_changed".into(),
+        serde_json::Value::Number(snap.files_changed.into()),
+    );
+    o.insert(
+        "files_total".into(),
+        serde_json::Value::Number(snap.files_total.into()),
+    );
     serde_json::Value::Object(o)
 }
 

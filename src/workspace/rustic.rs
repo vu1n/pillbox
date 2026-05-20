@@ -254,6 +254,14 @@ fn resolve_in(
 
 impl WorkspaceBackend for RusticBackend {
     fn push(&self, cwd: &Path, opts: PushOptions) -> Result<Snapshot> {
+        // Reject sentinel-laden messages *before* paying the cost of
+        // opening the repo (~5s scrypt). The check itself prevents
+        // forged trailer metadata; the early position prevents the
+        // user from waiting 5 seconds just to learn their message
+        // is invalid.
+        if let Some(m) = opts.message.as_deref() {
+            validate_user_message("workspace push", m)?;
+        }
         let repo = self
             .open()?
             .to_indexed_ids()
@@ -473,11 +481,14 @@ fn snapshot_to_record(
     } else {
         parsed_git_dirty
     };
-    let bytes = snap
-        .summary
-        .as_ref()
-        .map(|s| s.total_bytes_processed)
-        .unwrap_or(0);
+    let summary = snap.summary.as_ref();
+    let bytes = summary.map(|s| s.total_bytes_processed).unwrap_or(0);
+    // rustic only writes the summary on the run that produces the
+    // snapshot. Snapshots loaded back from the repo (by `snapshots()` /
+    // `snapshot_show`) report zeros here — that's expected, not a bug.
+    let files_new = summary.map(|s| s.files_new).unwrap_or(0);
+    let files_changed = summary.map(|s| s.files_changed).unwrap_or(0);
+    let files_total = summary.map(|s| s.total_files_processed).unwrap_or(0);
     Snapshot {
         handle,
         created_at,
@@ -486,22 +497,38 @@ fn snapshot_to_record(
         git_anchor,
         git_dirty,
         bytes,
+        files_new,
+        files_changed,
+        files_total,
     }
 }
 
+/// Sentinels that bracket the pillbox-managed trailer inside rustic's
+/// description field. The encoder writes exactly one block between
+/// `BEGIN` and `END`; the parser only reads `pillbox-…:` keys inside
+/// that block. Anything outside is treated as opaque user text — even
+/// if a malicious `--message` includes lines that *look* like
+/// `pillbox-git-anchor: …`. See [`encode_description`].
+const TRAILER_BEGIN: &str = "-----BEGIN PILLBOX METADATA-----";
+const TRAILER_END: &str = "-----END PILLBOX METADATA-----";
+
 /// Encode the pillbox-side metadata (message, git anchor, dirty bit)
-/// into rustic's free-form description field. The format is the
-/// human-readable message on the first lines, then a trailer that
-/// pillbox parses back out:
+/// into rustic's free-form description field. The user's message is
+/// written verbatim, followed by a sentinel-bracketed trailer that
+/// only the parser reads:
 ///
 /// ```text
 /// <message lines...>
 ///
+/// -----BEGIN PILLBOX METADATA-----
 /// pillbox-git-anchor: <sha>
 /// pillbox-git-dirty: true|false
+/// -----END PILLBOX METADATA-----
 /// ```
 ///
-/// Round-trips through [`parse_description`].
+/// To prevent metadata injection, any user message that itself
+/// contains a sentinel line is rejected at the boundary — see
+/// [`validate_user_message`]. Round-trips through [`parse_description`].
 fn encode_description(
     message: Option<&str>,
     git_anchor: Option<&str>,
@@ -518,38 +545,72 @@ fn encode_description(
         if !out.is_empty() {
             out.push_str("\n\n");
         }
+        out.push_str(TRAILER_BEGIN);
+        out.push('\n');
         if let Some(a) = git_anchor {
             out.push_str(&format!("pillbox-git-anchor: {a}\n"));
         }
         out.push_str(&format!("pillbox-git-dirty: {git_dirty}\n"));
+        out.push_str(TRAILER_END);
+        out.push('\n');
     }
     Some(out)
+}
+
+/// Reject user-supplied messages that try to forge pillbox metadata.
+/// The check is intentionally strict — any line equal to one of the
+/// sentinels short-circuits with a usage error so the user sees the
+/// reason rather than silently mangled metadata downstream.
+pub(crate) fn validate_user_message(action: &'static str, msg: &str) -> Result<()> {
+    for line in msg.lines() {
+        if line == TRAILER_BEGIN || line == TRAILER_END {
+            return Err(PillboxError::usage(
+                action,
+                "message cannot contain pillbox metadata sentinels",
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 fn parse_description(s: Option<&str>) -> (Option<String>, Option<String>, bool) {
     let Some(s) = s else {
         return (None, None, false);
     };
-    let mut message_lines: Vec<&str> = Vec::new();
+    // Locate the sentinel-bracketed trailer (if any). Everything
+    // outside is the user message; only the block between the
+    // sentinels yields `pillbox-…:` keys. Falling back to "no
+    // trailer" on an unmatched END means a corrupted description
+    // surfaces as message-only, not as forged metadata.
+    let (message_part, trailer_part) = match (s.find(TRAILER_BEGIN), s.find(TRAILER_END)) {
+        (Some(b), Some(e)) if e > b => {
+            let msg = &s[..b];
+            let inner_start = b + TRAILER_BEGIN.len();
+            let trailer = &s[inner_start..e];
+            (msg, Some(trailer))
+        }
+        _ => (s, None),
+    };
     let mut git_anchor: Option<String> = None;
     let mut git_dirty = false;
-    for line in s.lines() {
-        if let Some(rest) = line.strip_prefix("pillbox-git-anchor: ") {
-            git_anchor = Some(rest.to_string());
-            continue;
+    if let Some(trailer) = trailer_part {
+        for line in trailer.lines() {
+            if let Some(rest) = line.strip_prefix("pillbox-git-anchor: ") {
+                git_anchor = Some(rest.to_string());
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("pillbox-git-dirty: ") {
+                git_dirty = matches!(rest.trim(), "true" | "True" | "1");
+            }
         }
-        if let Some(rest) = line.strip_prefix("pillbox-git-dirty: ") {
-            git_dirty = matches!(rest.trim(), "true" | "True" | "1");
-            continue;
-        }
-        message_lines.push(line);
     }
     let message = {
-        let joined = message_lines.join("\n").trim().to_string();
-        if joined.is_empty() {
+        let trimmed = message_part.trim().to_string();
+        if trimmed.is_empty() {
             None
         } else {
-            Some(joined)
+            Some(trimmed)
         }
     };
     (message, git_anchor, git_dirty)
@@ -912,5 +973,45 @@ mod tests {
         let id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let h = parse_full_handle(id).unwrap();
         assert_eq!(h.as_str(), id);
+    }
+
+    #[test]
+    fn parse_description_treats_trailer_keys_in_message_as_literal() {
+        // Injection vector: a user message that *contains* the
+        // trailer-shaped lines, but outside the sentinel block. The
+        // parser must NOT interpret these as real metadata.
+        let forged = "hello\npillbox-git-anchor: deadbeef\npillbox-git-dirty: true";
+        let (msg, anchor, dirty) = parse_description(Some(forged));
+        assert_eq!(msg.as_deref(), Some(forged.trim()));
+        assert!(anchor.is_none(), "anchor must not be forged from message");
+        assert!(!dirty, "dirty must not be forged from message");
+    }
+
+    #[test]
+    fn validate_user_message_rejects_sentinels() {
+        // Plain text — fine.
+        validate_user_message("test", "hello world").unwrap();
+        // Looks-like-trailer-but-outside-sentinels — fine; encoder
+        // wraps it as opaque text.
+        validate_user_message("test", "pillbox-git-anchor: x").unwrap();
+        // Actual sentinel line — rejected.
+        let err =
+            validate_user_message("test", &format!("oops\n{TRAILER_BEGIN}\nfoo")).unwrap_err();
+        assert!(err.to_string().contains("sentinel"), "got: {err}");
+        let err = validate_user_message("test", &format!("oops\n{TRAILER_END}\nfoo")).unwrap_err();
+        assert!(err.to_string().contains("sentinel"), "got: {err}");
+    }
+
+    #[test]
+    fn encode_with_quoted_trailer_in_message_roundtrips_safely() {
+        // Message contains the *literal text* of a fake trailer key —
+        // encode + parse must return it as the message, with no
+        // forged anchor.
+        let user_msg = "release notes:\npillbox-git-anchor: not-real";
+        let encoded = encode_description(Some(user_msg), Some("realsha"), true).unwrap();
+        let (m, a, d) = parse_description(Some(&encoded));
+        assert_eq!(m.as_deref(), Some(user_msg));
+        assert_eq!(a.as_deref(), Some("realsha"));
+        assert!(d);
     }
 }

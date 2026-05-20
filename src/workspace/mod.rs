@@ -91,6 +91,12 @@ pub(crate) struct PushOptions {
 /// run as reported by rustic's snapshot summary — not the deduplicated
 /// store size. Informational; deduplication numbers live in rustic
 /// itself.
+///
+/// `files_new` / `files_changed` / `files_total` come from the same
+/// rustic summary. On a snapshot loaded back from the repo, rustic
+/// doesn't repopulate these (the summary only fires for the run that
+/// produced the snapshot), so reads from `snapshots()` / `snapshot_show`
+/// may report zeros. They're populated on the `push` return value.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Snapshot {
     pub(crate) handle: SnapshotHandle,
@@ -100,6 +106,9 @@ pub(crate) struct Snapshot {
     pub(crate) git_anchor: Option<String>,
     pub(crate) git_dirty: bool,
     pub(crate) bytes: u64,
+    pub(crate) files_new: u64,
+    pub(crate) files_changed: u64,
+    pub(crate) files_total: u64,
 }
 
 /// One backend = one rustic repository the pillbox owns. The trait

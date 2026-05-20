@@ -10,15 +10,14 @@
 //! We point `$HOME` at a tempdir so the vault CA + state files don't
 //! pollute the dev machine.
 
+mod common;
+
 use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-fn pillbox_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_pillbox"))
-}
+use common::pillbox_bin;
 
 #[test]
 fn sidecar_prints_listen_addr_and_shuts_down_on_sigterm() {

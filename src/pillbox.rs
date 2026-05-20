@@ -28,7 +28,6 @@
 
 use std::{
     fs,
-    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
 };
 
@@ -37,8 +36,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{BackendKind, WorkspaceConfig};
 use crate::errors::PillboxError;
-use crate::paths::{detect_legacy_subdirs, ensure_mode_0700, pillbox_root};
+use crate::paths::{detect_legacy_subdirs, ensure_mode_0700, pillbox_root, write_private_file};
 use crate::workspace::rustic::{RusticBackend, RusticVariant, PASSWORD_FILE, REPO_DIR};
+use crate::workspace::WorkspaceBackend;
 
 /// The descriptor file that marks a directory as a project pillbox.
 pub(crate) const PILLBOX_TOML: &str = "pillbox.toml";
@@ -417,21 +417,7 @@ fn write_project_meta(state_dir: &Path, meta: &ProjectMeta) -> Result<()> {
     let path = state_dir.join("meta.json");
     let body = serde_json::to_string_pretty(meta)
         .with_context(|| format!("serialize meta for `{}`", meta.name))?;
-    write_state_file(&path, &body)
-}
-
-fn write_state_file(path: &Path, body: &str) -> Result<()> {
-    use std::io::Write;
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .with_context(|| format!("open {}", path.display()))?;
-    f.write_all(body.as_bytes())
-        .with_context(|| format!("write {}", path.display()))?;
-    Ok(())
+    write_private_file(&path, body.as_bytes())
 }
 
 /// `pillbox init` — create the global pillbox. Idempotent: subsequent
@@ -753,6 +739,26 @@ pub(crate) fn info(explicit: Option<&str>, json: bool) -> Result<()> {
                     println!("  agent:      {a}");
                 }
                 println!("  created:    {}", m.created_at);
+            }
+            // Snapshot count — best-effort: opening the workspace can
+            // fail on an in-flight repo or a missing password (e.g.
+            // user just ran `pillbox new` and the repo dir was wiped
+            // out of band). Failure isn't fatal for `info`; we just
+            // skip the section. Keeps `info` always-printable.
+            match pb.workspace().and_then(|b| b.snapshots()) {
+                Ok(snaps) if snaps.is_empty() => {
+                    println!("  snapshots:  none yet — run `pillbox push` to take the first");
+                }
+                Ok(snaps) => {
+                    let latest = snaps.last().unwrap();
+                    println!(
+                        "  snapshots:  {} (latest: {} {})",
+                        snaps.len(),
+                        latest.handle.short(),
+                        latest.created_at
+                    );
+                }
+                Err(_) => {}
             }
         }
     }

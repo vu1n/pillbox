@@ -57,6 +57,20 @@ pub const CODEX: AgentSpec = AgentSpec {
 
 pub const ALL: &[&AgentSpec] = &[&CLAUDE, &CODEX];
 
+/// Look up an agent spec by id, or return a usage error listing the
+/// known ids. Centralized so every CLI surface that takes an
+/// `--agent` / `agent` argument reports the same diagnostic.
+pub(crate) fn lookup(action: &'static str, id: &str) -> Result<&'static AgentSpec> {
+    ALL.iter().copied().find(|s| s.id() == id).ok_or_else(|| {
+        let known: Vec<&str> = ALL.iter().map(|s| s.id()).collect();
+        PillboxError::usage(
+            action,
+            format!("unknown agent `{id}` (known: {})", known.join(", ")),
+        )
+        .into()
+    })
+}
+
 fn finalize_claude_onboarding(home: &Path) -> Result<()> {
     let path = home.join(".claude.json");
     if !path.exists() {
@@ -208,6 +222,17 @@ pub(crate) struct RunOpts {
     /// `--vault` — route API traffic through the pillbox stub-swap proxy.
     pub(crate) vault: bool,
     pub(crate) args: Vec<String>,
+    /// Remote name (`--remote NAME`). Resolved to a `Remote` record in
+    /// `dispatch_run` and threaded through to the sandbox backend. Kept
+    /// on `RunOpts` rather than the trait method so other v0.6+ runtime
+    /// inputs (proxy URL, detach flag, etc.) can be added without
+    /// expanding the trait's signature.
+    pub(crate) remote_name: Option<String>,
+    /// Hidden `--vault-stdin` invocation — true when the remote side of a
+    /// `pillbox run --remote` call should read a [`VaultStdinBlob`] from
+    /// stdin and re-spawn the agent locally with pre-resolved secrets.
+    /// See [`crate::sandbox::remote_ssh`] for the protocol.
+    pub(crate) vault_stdin: bool,
 }
 
 #[allow(dead_code)]
@@ -382,6 +407,8 @@ mod tests {
             env_files: Vec::new(),
             vault: false,
             args: Vec::new(),
+            remote_name: None,
+            vault_stdin: false,
         }
     }
 

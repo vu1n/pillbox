@@ -61,6 +61,19 @@ pub(crate) enum WriteScope {
     Global,
 }
 
+impl WriteScope {
+    /// Convert a CLI `--global` boolean into the matching scope. Every
+    /// `dispatch_*` arm that maps a `--global` flag uses this so the
+    /// "true → Global, false → Resolved" rule lives in one place.
+    pub(crate) fn from_global_flag(global: bool) -> Self {
+        if global {
+            Self::Global
+        } else {
+            Self::Resolved
+        }
+    }
+}
+
 /// On-disk per-project state record. Forward-compatible: unknown fields
 /// (added by a newer pillbox version writing the same `meta.json`) are
 /// ignored on load rather than rejected, so an older binary can still
@@ -852,16 +865,7 @@ fn default_name_from_dir(p: &Path) -> String {
 }
 
 fn validate_agent(a: &str) -> Result<()> {
-    if crate::agents::ALL.iter().any(|s| s.id() == a) {
-        Ok(())
-    } else {
-        let known: Vec<&str> = crate::agents::ALL.iter().map(|s| s.id()).collect();
-        Err(PillboxError::usage(
-            "pillbox new",
-            format!("unknown agent `{a}` (known: {})", known.join(", ")),
-        )
-        .into())
-    }
+    crate::agents::lookup("pillbox new", a).map(|_| ())
 }
 
 fn write_descriptor(

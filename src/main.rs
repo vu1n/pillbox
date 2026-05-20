@@ -28,6 +28,7 @@ mod envs;
 mod errors;
 mod paths;
 mod pillbox;
+mod remote;
 mod sandbox;
 mod secrets;
 #[cfg(test)]
@@ -142,9 +143,26 @@ enum Command {
         /// Route the agent's API traffic through pillbox's vault proxy.
         #[arg(long)]
         vault: bool,
+        /// Run on a registered remote VPS (`pillbox remote add NAME …`).
+        /// The agent launches inside a pillbox sandbox on the remote;
+        /// the local terminal proxies the remote PTY.
+        #[arg(long, value_name = "NAME", conflicts_with = "vault_stdin")]
+        remote: Option<String>,
+        /// Hidden: invoked by the remote side of `pillbox run --remote`.
+        /// Reads a [`crate::sandbox::remote_ssh::VaultStdinBlob`] from
+        /// stdin and runs the agent locally with the pre-resolved
+        /// state. Not for direct user consumption — the protocol is
+        /// internal and may change between releases.
+        #[arg(long = "vault-stdin", hide = true)]
+        vault_stdin: bool,
         /// Args forwarded to the agent CLI inside the sandbox.
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
+    },
+    /// Manage SSH-reachable remote VPSes for `pillbox run --remote NAME`.
+    Remote {
+        #[command(subcommand)]
+        action: RemoteAction,
     },
     /// Manage stored secrets for the current pillbox.
     Secret {
@@ -357,6 +375,52 @@ enum AuthAction {
 }
 
 #[derive(Subcommand, Debug)]
+enum RemoteAction {
+    /// Register a remote VPS for use with `pillbox run --remote NAME`.
+    ///
+    /// Two positional args: `NAME URL`, matching `git remote add`. The
+    /// long `--url` spelling is accepted as a hidden alias so scripts
+    /// written against earlier drafts of this PR keep working.
+    Add {
+        /// Display name. Used as `pillbox run --remote NAME`.
+        name: String,
+        /// SSH destination URL: `ssh://user@host[:port]`. Either
+        /// positional or via `--url`; exactly one form is required.
+        url: Option<String>,
+        /// Hidden alias for the positional URL — see the command docs.
+        #[arg(long = "url", value_name = "URL", hide = true, conflicts_with = "url")]
+        url_flag: Option<String>,
+        /// Default agent for runs against this remote (overrides the
+        /// pillbox's own `agent` field). Optional.
+        #[arg(long, value_name = "AGENT")]
+        agent: Option<String>,
+        /// Fail if the remote already exists in the chosen scope.
+        #[arg(long)]
+        if_not_exists: bool,
+        /// Write to the global pillbox instead of the resolved one.
+        #[arg(long)]
+        global: bool,
+    },
+    /// List remotes visible from the current pillbox (project + global).
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a registered remote from the resolved scope (or `--global`).
+    Rm {
+        name: String,
+        #[arg(long)]
+        global: bool,
+    },
+    /// Show details for one remote (with inheritance).
+    Info {
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum VaultAction {
     Ca {
         #[arg(long)]
@@ -420,6 +484,8 @@ fn run(cli: Cli) -> Result<()> {
             env_bundles,
             env_files,
             vault,
+            remote,
+            vault_stdin,
             args,
         } => {
             let resolved = Pillbox::resolve(pillbox_arg)?;
@@ -435,8 +501,14 @@ fn run(cli: Cli) -> Result<()> {
                     env_files,
                     vault,
                     args,
+                    remote_name: remote,
+                    vault_stdin,
                 },
             )
+        }
+        Command::Remote { action } => {
+            let resolved = Pillbox::resolve(pillbox_arg)?;
+            dispatch_remote(&resolved, action)
         }
         Command::Secret { action } => {
             let resolved = Pillbox::resolve(pillbox_arg)?;
@@ -515,32 +587,75 @@ fn resolve_agent_spec(
     } else {
         "claude".into()
     };
-    agents::ALL
-        .iter()
-        .copied()
-        .find(|s| s.id() == id)
-        .ok_or_else(|| {
-            let known: Vec<&str> = agents::ALL.iter().map(|s| s.id()).collect();
-            PillboxError::usage(
-                "run",
-                format!("unknown agent `{id}` (known: {})", known.join(", ")),
-            )
-            .into()
-        })
+    agents::lookup("run", &id)
 }
 
 fn dispatch_run(resolved: &Pillbox, agent: Option<String>, mut opts: RunOpts) -> Result<()> {
+    // Hidden remote-side handler. The blob carries everything we need
+    // (agent id, args, env, secrets), so we ignore the agent override
+    // and the rest of `RunOpts` and dispatch directly into the
+    // vault-stdin code path. clap's `conflicts_with` already rejects
+    // `--remote` + `--vault-stdin` together, so no further check needed.
+    if opts.vault_stdin {
+        return crate::sandbox::remote_ssh::dispatch_vault_stdin(resolved);
+    }
+
+    // Branch 2/3: resolve the agent + apply pillbox.toml defaults; the
+    // backend selection happens below.
     let spec = resolve_agent_spec(resolved, agent.as_deref())?;
-    // Apply the `name` default from pillbox.toml when the CLI didn't
-    // pass `--name`. The descriptor lives next to cwd; `Config::load_from`
-    // would re-parse it, so we just consult the loaded meta.json instead.
     if let Some(meta) = &resolved.meta {
         if opts.name.is_none() {
             opts.name = Some(meta.name.clone());
         }
     }
-    use crate::sandbox::SandboxBackend;
-    crate::sandbox::local_docker::LocalDocker.run(spec, opts, resolved)
+
+    let remote_record = match opts.remote_name.as_deref() {
+        Some(name) => Some(remote::read(resolved, name)?.ok_or_else(|| {
+            PillboxError::runtime("run", format!("remote `{name}` not found"))
+                .with_next(format!("pillbox remote add {name} ssh://user@host"))
+        })?),
+        None => None,
+    };
+
+    let backend = crate::sandbox::select_backend(remote_record);
+    backend.run(spec, opts, resolved)
+}
+
+fn dispatch_remote(resolved: &Pillbox, action: RemoteAction) -> Result<()> {
+    match action {
+        RemoteAction::Add {
+            name,
+            url,
+            url_flag,
+            agent,
+            if_not_exists,
+            global,
+        } => {
+            // clap's `conflicts_with` already rejects passing both, so
+            // here we just pick whichever was given. Missing-both → a
+            // pointed usage error rather than the generic "ARGS missing".
+            let url = url.or(url_flag).ok_or_else(|| {
+                PillboxError::usage(
+                    "remote add",
+                    "missing SSH URL — pass it positionally: \
+                     `pillbox remote add NAME ssh://user@host`",
+                )
+            })?;
+            remote::add(
+                resolved,
+                WriteScope::from_global_flag(global),
+                &name,
+                &url,
+                agent,
+                if_not_exists,
+            )
+        }
+        RemoteAction::List { json } => remote::list(resolved, json),
+        RemoteAction::Rm { name, global } => {
+            remote::rm(resolved, WriteScope::from_global_flag(global), &name)
+        }
+        RemoteAction::Info { name, json } => remote::info(resolved, &name, json),
+    }
 }
 
 fn dispatch_secret(resolved: &Pillbox, action: SecretAction) -> Result<()> {
@@ -570,11 +685,7 @@ fn dispatch_secret(resolved: &Pillbox, action: SecretAction) -> Result<()> {
             )?;
             secrets::add(
                 resolved,
-                if global {
-                    WriteScope::Global
-                } else {
-                    WriteScope::Resolved
-                },
+                WriteScope::from_global_flag(global),
                 &name,
                 source,
                 if_not_exists,
@@ -588,15 +699,9 @@ fn dispatch_secret(resolved: &Pillbox, action: SecretAction) -> Result<()> {
             to_stdout,
             json,
         } => secrets::show(resolved, &name, reveal, to_stdout, json),
-        SecretAction::Rm { name, global } => secrets::rm(
-            resolved,
-            if global {
-                WriteScope::Global
-            } else {
-                WriteScope::Resolved
-            },
-            &name,
-        ),
+        SecretAction::Rm { name, global } => {
+            secrets::rm(resolved, WriteScope::from_global_flag(global), &name)
+        }
     }
 }
 
@@ -609,11 +714,7 @@ fn dispatch_env(resolved: &Pillbox, action: EnvAction) -> Result<()> {
             global,
         } => envs::load(
             resolved,
-            if global {
-                WriteScope::Global
-            } else {
-                WriteScope::Resolved
-            },
+            WriteScope::from_global_flag(global),
             &name,
             &path,
             if_not_exists,
@@ -625,15 +726,9 @@ fn dispatch_env(resolved: &Pillbox, action: EnvAction) -> Result<()> {
             to_stdout,
             json,
         } => envs::show(resolved, &name, reveal, to_stdout, json),
-        EnvAction::Rm { name, global } => envs::rm(
-            resolved,
-            if global {
-                WriteScope::Global
-            } else {
-                WriteScope::Resolved
-            },
-            &name,
-        ),
+        EnvAction::Rm { name, global } => {
+            envs::rm(resolved, WriteScope::from_global_flag(global), &name)
+        }
     }
 }
 
@@ -641,16 +736,9 @@ fn dispatch_auth(resolved: &Pillbox, action: AuthAction) -> Result<()> {
     match action {
         AuthAction::Login { agent, global } => {
             note_auth_global_is_implicit(global);
-            let spec = agents::ALL
-                .iter()
-                .copied()
-                .find(|s| s.id() == agent)
-                .ok_or_else(|| {
-                    PillboxError::usage("auth login", format!("unknown agent `{agent}`"))
-                })?;
             // Auth is always global today — passing the resolved pillbox
             // keeps the API uniform for the v0.7 per-project override.
-            spec.login(resolved)
+            agents::lookup("auth login", &agent)?.login(resolved)
         }
         AuthAction::List { json, global } => {
             note_auth_global_is_implicit(global);

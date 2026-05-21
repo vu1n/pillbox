@@ -3,21 +3,25 @@
 //!
 //! v0.6 splits the run path off of `AgentSpec` into a trait so we can
 //! pick at run time between executing the agent locally (Docker) and
-//! remotely (SSH to a VPS, later E2B managed cloud).
+//! remotely (SSH to a VPS, E2B managed cloud).
 //!
 //! - PR 1 — trait + `LocalDocker` impl, no remote backends.
-//! - PR 4 — `RemoteSshSandbox` impl: ssh into a registered VPS, run a
-//!   pillbox sandbox **there**, proxy stdio back to the local terminal.
-//!   See [`remote_ssh`].
+//! - PR 4 — `RemoteSshSandbox`: ssh into a registered VPS, run a
+//!   pillbox sandbox there, proxy stdio back. See [`remote_ssh`].
+//! - PR 5 — `RemoteE2bSandbox`: spawn an E2B managed sandbox via the
+//!   `@e2b/code-interpreter` JS SDK (bundled Node helper). See
+//!   [`remote_e2b`]. Selected when the remote URL has the `e2b://`
+//!   scheme; everything else routes to SSH.
 
 pub(crate) mod local_docker;
+pub(crate) mod remote_e2b;
 pub(crate) mod remote_ssh;
 
 use anyhow::Result;
 
 use crate::agents::{AgentSpec, RunOpts};
 use crate::pillbox::Pillbox;
-use crate::remote::Remote;
+use crate::remote::{Remote, RemoteUrl};
 
 /// One backend = one way to provision a sandbox + vault session, inject
 /// credentials, run the agent under a PTY, and wait for exit.
@@ -28,12 +32,23 @@ pub(crate) trait SandboxBackend {
     fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>;
 }
 
-/// Pick a backend for one `pillbox run` invocation. Centralized here so
-/// the trait shape and the selection rule live next to each other —
-/// when v0.6 PR 5 adds E2B, this is the only place that grows a new arm.
+/// Pick a backend for one `pillbox run` invocation. The parsed
+/// [`RemoteUrl`] variant is the discriminator — keeps the `"ssh://"` /
+/// `"e2b://"` literals out of the dispatcher. A bad URL here would have
+/// been caught at `remote add` time and again at registry read, but
+/// the backend constructors re-validate inside `run` so a hand-edited
+/// TOML still fails with a pointed error rather than a generic "could
+/// not connect".
 pub(crate) fn select_backend(remote: Option<Remote>) -> Box<dyn SandboxBackend> {
-    match remote {
-        Some(r) => Box::new(remote_ssh::RemoteSshSandbox::new(r)),
-        None => Box::new(local_docker::LocalDocker),
+    let Some(r) = remote else {
+        return Box::new(local_docker::LocalDocker);
+    };
+    // Unknown / malformed URL → fall through to SSH so the backend's own
+    // re-parse produces the actionable error. The registry's `parse_remote`
+    // already rejects unknown schemes at load time, so this branch is only
+    // ever taken on hand-edited TOML.
+    match r.parsed_url() {
+        Ok(RemoteUrl::E2b(_)) => Box::new(remote_e2b::RemoteE2bSandbox::new(r)),
+        Ok(RemoteUrl::Ssh(_)) | Err(_) => Box::new(remote_ssh::RemoteSshSandbox::new(r)),
     }
 }

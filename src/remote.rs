@@ -1,7 +1,8 @@
-//! Remote-VPS registry — names + SSH URLs the user can target with
+//! Remote registry — names + URLs the user can target with
 //! `pillbox run --remote NAME`. Pillbox itself doesn't deploy the
-//! binary; users `brew install pillbox` / `cargo install pillbox` on
-//! the VPS, then register it here so we know how to reach it.
+//! binary; users install pillbox at the remote end (VPS package /
+//! E2B template image), then register a label here so we know how to
+//! reach it.
 //!
 //! ## Storage
 //!
@@ -20,11 +21,14 @@
 //! resolved pillbox; `--global` forces global. Mirrors the secret / env
 //! inheritance rule (see `pillbox::WriteScope`).
 //!
-//! ## URL shape
+//! ## URL shapes
 //!
-//! Only `ssh://user@host[:port]` is accepted today. We could later add
-//! `ssh+e2b://...` etc., but PR 4 is openssh-only and we want clear
-//! error messages when the user mistypes.
+//! - `ssh://user@host[:port]` → VPS over openssh (PR 4).
+//! - `e2b://TEMPLATE_ID`      → E2B managed sandbox (PR 5).
+//!
+//! [`parse_remote_url`] is the single dispatch point; the on-disk shape
+//! never grew a `kind` field — keeping `url` as the discriminator means
+//! a hand-edited remote tells you what it is at a glance.
 
 use std::{
     fs,
@@ -50,13 +54,47 @@ pub(crate) const REMOTES_DIR: &str = "remotes";
 pub(crate) struct Remote {
     /// Display name. Must match the file stem (`<name>.toml`).
     pub(crate) name: String,
-    /// SSH URL — `ssh://user@host[:port]`. Parsed by [`parse_ssh_url`]
-    /// at register and connect time.
+    /// Remote URL — `ssh://user@host[:port]` or `e2b://TEMPLATE_ID`.
+    /// Parsed by [`parse_remote_url`] at register and connect time.
     pub(crate) url: String,
     /// Default agent for `pillbox run --remote NAME` (overrides the
     /// pillbox's own `agent` field). Optional.
     #[serde(default)]
     pub(crate) default_agent: Option<String>,
+}
+
+/// Tagged URL — what kind of backend the URL targets. Constructed once
+/// at registry-load time by [`parse_remote_url`]; the dispatcher in
+/// `sandbox::select_backend` matches on the variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RemoteUrl {
+    /// VPS reachable over openssh.
+    Ssh(SshUrl),
+    /// E2B managed cloud sandbox keyed by template id.
+    E2b(E2bRef),
+}
+
+impl RemoteUrl {
+    /// Short scheme label for diagnostics + `info` JSON.
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            RemoteUrl::Ssh(_) => "ssh",
+            RemoteUrl::E2b(_) => "e2b",
+        }
+    }
+}
+
+impl Remote {
+    /// Parsed URL, re-validated at every call. Cheap; the parser is
+    /// stateless and the input is small. Single dispatch point so the
+    /// `"ssh://"` / `"e2b://"` literals don't leak into `select_backend`.
+    ///
+    /// Returns `Err` only if the on-disk URL is malformed — readers
+    /// (`parse_remote`) already validate at load time, so this is
+    /// belt-and-suspenders for hand-edited TOML.
+    pub(crate) fn parsed_url(&self) -> Result<RemoteUrl, String> {
+        parse_remote_url(&self.url)
+    }
 }
 
 /// Decomposed `ssh://user@host[:port]` URL. Stored as a plain struct so
@@ -80,10 +118,65 @@ impl SshUrl {
     }
 }
 
-/// Validate + parse an `ssh://user@host[:port]` URL. The whole URL
-/// surface we support today; richer schemes (key path overrides, etc.)
-/// can go through `~/.ssh/config` instead of being baked into the
-/// registry.
+/// Decomposed `e2b://TEMPLATE_ID` URL. Stored plain so the dispatcher
+/// can hand the template directly to the helper subprocess without
+/// re-parsing. Template IDs in E2B's surface are alphanumeric with `-`
+/// / `_` separators; we validate that shape locally and let E2B reject
+/// at sandbox-creation time if the value is otherwise wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct E2bRef {
+    pub(crate) template: String,
+}
+
+/// Dispatch on URL scheme. The only public validator the registry uses
+/// on write / read; backend-specific parsers ([`parse_ssh_url`] /
+/// [`parse_e2b_url`]) are kept around for callers (e.g. the SSH backend
+/// re-parses inside its `run` for belt-and-suspenders against a
+/// hand-edited TOML).
+pub(crate) fn parse_remote_url(url: &str) -> Result<RemoteUrl, String> {
+    if url.starts_with("ssh://") {
+        return parse_ssh_url(url).map(RemoteUrl::Ssh);
+    }
+    if url.starts_with("e2b://") {
+        return parse_e2b_url(url).map(RemoteUrl::E2b);
+    }
+    Err(format!(
+        "unsupported URL scheme in `{url}` (expected `ssh://user@host[:port]` or `e2b://TEMPLATE_ID`)"
+    ))
+}
+
+/// Validate + parse an `e2b://TEMPLATE_ID` URL. Template IDs are
+/// alphanumeric + `-` / `_`; UUIDs and human-readable aliases both
+/// satisfy that shape. Empty or punctuation-laden values are rejected
+/// at register time so the error message points at the URL, not the
+/// helper-subprocess output.
+///
+/// Signature mirrors [`parse_ssh_url`]: callers pass the full `e2b://…`
+/// URL and the prefix is stripped internally, so error messages can
+/// always quote the user-facing form without a second `full` arg.
+pub(crate) fn parse_e2b_url(url: &str) -> Result<E2bRef, String> {
+    let rest = url
+        .strip_prefix("e2b://")
+        .ok_or_else(|| format!("expected `e2b://TEMPLATE_ID`, got `{url}`"))?;
+    if rest.is_empty() {
+        return Err(format!("missing template id in `{url}`"));
+    }
+    if let Some(bad) = rest
+        .chars()
+        .find(|c| !c.is_ascii_alphanumeric() && *c != '-' && *c != '_')
+    {
+        return Err(format!(
+            "invalid character `{bad}` in e2b template id `{rest}` (expected alphanumeric + `-` / `_`)"
+        ));
+    }
+    Ok(E2bRef {
+        template: rest.to_string(),
+    })
+}
+
+/// Validate + parse an `ssh://user@host[:port]` URL. Richer schemes
+/// (key path overrides, etc.) can go through `~/.ssh/config` instead
+/// of being baked into the registry.
 pub(crate) fn parse_ssh_url(url: &str) -> Result<SshUrl, String> {
     let rest = url
         .strip_prefix("ssh://")
@@ -218,9 +311,9 @@ fn parse_remote(raw: &str, source: &Path) -> Result<Remote> {
         .map_err(|e| PillboxError::config("remote read", format!("{}: {e}", source.display())))?;
     // Belt-and-suspenders: a TOML file written by an older / hand-edited
     // pillbox without a valid URL should fail at load time, not at
-    // connect time. parse_ssh_url's diagnostic is more actionable than
-    // openssh's "could not connect".
-    parse_ssh_url(&r.url)
+    // connect time. parse_remote_url's diagnostic is more actionable than
+    // "could not connect" / "template not found".
+    parse_remote_url(&r.url)
         .map_err(|e| PillboxError::config("remote read", format!("{}: {e}", source.display())))?;
     Ok(r)
 }
@@ -235,7 +328,7 @@ pub(crate) fn add(
     if_not_exists: bool,
 ) -> Result<()> {
     validate_name("remote add", name)?;
-    parse_ssh_url(url).map_err(|e| PillboxError::usage("remote add", e))?;
+    parse_remote_url(url).map_err(|e| PillboxError::usage("remote add", e))?;
     if let Some(agent) = default_agent.as_deref() {
         crate::agents::lookup("remote add", agent)?;
     }
@@ -300,7 +393,9 @@ pub(crate) fn list(resolved: &Pillbox, json: bool) -> Result<()> {
     if entries.is_empty() {
         println!("(no remotes registered for `{}`)", resolved.display_name());
         println!();
-        println!("Add one with: pillbox remote add NAME ssh://user@host");
+        println!("Add one with:");
+        println!("  pillbox remote add NAME ssh://user@host       # VPS over openssh");
+        println!("  pillbox remote add NAME e2b://TEMPLATE_ID     # E2B managed sandbox");
         return Ok(());
     }
     println!(
@@ -330,8 +425,9 @@ pub(crate) fn list(resolved: &Pillbox, json: bool) -> Result<()> {
 /// `pillbox remote info NAME`.
 pub(crate) fn info(resolved: &Pillbox, name: &str, json: bool) -> Result<()> {
     let (remote, source) = read_inherited(resolved, name)?.ok_or_else(|| {
-        PillboxError::runtime("remote info", format!("`{name}` not found"))
-            .with_next(format!("pillbox remote add {name} ssh://user@host"))
+        PillboxError::runtime("remote info", format!("`{name}` not found")).with_next(format!(
+            "pillbox remote add {name} ssh://user@host  # or e2b://TEMPLATE_ID"
+        ))
     })?;
     if json {
         println!("{}", build_info_json(&remote, &source));
@@ -400,6 +496,15 @@ fn build_info_json(remote: &Remote, source: &str) -> String {
         serde_json::Value::String(remote.name.clone()),
     );
     o.insert("url".into(), serde_json::Value::String(remote.url.clone()));
+    // The `kind` field is derived from the URL scheme, not stored on
+    // disk — but downstream JSON consumers (tooling, scripts) appreciate
+    // not having to re-parse to know which backend will be used.
+    if let Ok(parsed) = parse_remote_url(&remote.url) {
+        o.insert(
+            "kind".into(),
+            serde_json::Value::String(parsed.kind().to_string()),
+        );
+    }
     o.insert("source".into(), serde_json::Value::String(source.into()));
     if let Some(a) = remote.default_agent.as_deref() {
         o.insert(
@@ -415,6 +520,54 @@ mod tests {
     use super::*;
     use crate::pillbox;
     use crate::test_util::with_isolated_home;
+
+    #[test]
+    fn parse_remote_url_ssh() {
+        let url = parse_remote_url("ssh://alice@example.com:2222").unwrap();
+        assert_eq!(url.kind(), "ssh");
+        match url {
+            RemoteUrl::Ssh(s) => assert_eq!(s.destination(), "alice@example.com:2222"),
+            RemoteUrl::E2b(_) => panic!("expected ssh"),
+        }
+    }
+
+    #[test]
+    fn parse_remote_url_e2b() {
+        let url = parse_remote_url("e2b://pillbox-default-template").unwrap();
+        assert_eq!(url.kind(), "e2b");
+        match url {
+            RemoteUrl::E2b(e) => assert_eq!(e.template, "pillbox-default-template"),
+            RemoteUrl::Ssh(_) => panic!("expected e2b"),
+        }
+    }
+
+    #[test]
+    fn parse_remote_url_rejects_unknown_scheme() {
+        let err = parse_remote_url("http://example.com").unwrap_err();
+        assert!(err.contains("unsupported URL scheme"));
+        assert!(err.contains("ssh://"));
+        assert!(err.contains("e2b://"));
+    }
+
+    #[test]
+    fn parse_e2b_url_accepts_uuid_and_alias() {
+        // Realistic E2B template IDs: human alias or UUID-ish.
+        assert!(parse_remote_url("e2b://my-pillbox-runner").is_ok());
+        assert!(parse_remote_url("e2b://7f1c4e2a-9b8d-4f3e-a5c6-1d2e3f405060").is_ok());
+        assert!(parse_remote_url("e2b://templ_underscored_123").is_ok());
+    }
+
+    #[test]
+    fn parse_e2b_url_rejects_empty_template() {
+        let err = parse_remote_url("e2b://").unwrap_err();
+        assert!(err.contains("missing template id"));
+    }
+
+    #[test]
+    fn parse_e2b_url_rejects_punctuation() {
+        let err = parse_remote_url("e2b://bad/template").unwrap_err();
+        assert!(err.contains("invalid character"));
+    }
 
     #[test]
     fn parse_ssh_url_basic() {

@@ -4,10 +4,10 @@ version = "0.1.0-alpha.1"
 edition = "2021"
 authors = ["vu1n"]
 license = "MIT OR Apache-2.0"
-description = "Sandboxed coding agents with one-command auth (gh-auth-style for Claude Code / Codex / opencode)"
+description = "Sandboxed coding agents, bundled — local Docker, SSH VPS, or E2B managed sandbox. Per-project workspace + vault + auth + config in one self-contained pillbox."
 repository = "https://github.com/vu1n/pillbox"
 homepage = "https://github.com/vu1n/pillbox"
-keywords = ["sandbox", "agent", "claude", "codex", "docker"]
+keywords = ["sandbox", "agent", "claude", "codex", "e2b"]
 categories = ["command-line-utilities", "development-tools"]
 readme = "README.md"
 

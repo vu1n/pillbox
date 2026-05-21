@@ -83,6 +83,11 @@ global pillbox regardless of where you are.
 | `pillbox remote list [--json]` | List remotes visible from the current pillbox (project + global, deduplicated). |
 | `pillbox remote info NAME [--json]` | Show one remote (with inheritance). |
 | `pillbox remote rm NAME [--global]` | Remove a registered remote. |
+| `pillbox session list [--json]` | List sessions started from this pillbox (oldest first). |
+| `pillbox session info ID [--json]` | Show one session (accepts unique id prefix ≥ 4 chars). |
+| `pillbox session attach ID` | Reattach to a detached session. Detach again with Ctrl-A + D or `pillbox session detach ID` from another shell. v0.6 PR 6: e2b:// remotes only. |
+| `pillbox session detach ID` | Signal a currently-attached pillbox to detach (SIGTERM, no-op if already detached). |
+| `pillbox session rm ID` | Tear down the backend (kill sandbox) and remove the session record. |
 | `pillbox doctor [--json]` | Diagnose Docker, image, perms, `$HOME`. |
 | `pillbox version` | Print pillbox + runner image versions. |
 | `pillbox push [--tag T] [--message M] [--json]` | Snapshot cwd into the pillbox's rustic repo. |
@@ -105,6 +110,8 @@ global pillbox regardless of where you are.
 | `--env-file PATH` | — | Inject every variable from a `.env` on disk. |
 | `--vault` | — | Route agent traffic through the stub-swap proxy. |
 | `--remote NAME` | — | Run on a registered remote (`ssh://` or `e2b://`) instead of locally. Requires an S3-shaped workspace backend. For `e2b://` remotes: `node` + `npm i -g e2b` must be installed locally and `E2B_API_KEY` must be available in the environment. |
+| `--detach` | — | Start the session and immediately return — the agent keeps running in the background; reattach with `pillbox session attach <id>`. Requires `--remote`. v0.6 PR 6: e2b:// remotes only. |
+| `--label TEXT` | — | Human label for a detached session, surfaced in `pillbox session list`. Only meaningful with `--detach`. |
 
 Env composition order (later layers override earlier):
 
@@ -129,6 +136,28 @@ pillbox: note: ANTHROPIC_API_KEY shadowed by --with
 | `--vault` | Mark as vaulted (stub-swap at injection time). |
 | `--maps-to KNOWN` | Alias to a known name's vault config (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GITHUB_TOKEN`). |
 | `--host H` `--header-scheme {x-api-key\|authorization-bearer}` `--prefix P` | Vault metadata for a custom name (all three required together). |
+
+### Sessions — detach + reattach (e2b:// only in v0.6 PR 6)
+
+`pillbox run --remote NAME` against an `e2b://` remote can be left
+running and reconnected to later.
+
+| Action | How |
+|---|---|
+| Start in the background | `pillbox run --remote cloud --detach [--label TEXT]` — prints the new session id, agent keeps running. |
+| Detach from an interactive run | `Ctrl-A D` from the local terminal. Sandbox keeps running; pillbox returns. |
+| List | `pillbox session list` — id, attached/detached, agent, remote, started_at, label. |
+| Reattach | `pillbox session attach ID` (id or unique ≥4-char prefix). |
+| Detach from another shell | `pillbox session detach ID` — SIGTERMs the local pillbox that's attached. Exits 0 if already detached. |
+| Tear down | `pillbox session rm ID` — kills the sandbox and removes the local record. |
+
+The detach hotkey is `Ctrl-A D` (matches GNU screen). `Ctrl-A Ctrl-A`
+sends a literal Ctrl-A through to the sandbox PTY so readline's
+beginning-of-line still works inside the agent.
+
+Sessions are NOT inherited across pillboxes — they live in the
+pillbox that started them. A project pillbox's `session list` shows
+only its own sessions; the global pillbox's list shows global ones.
 
 ---
 

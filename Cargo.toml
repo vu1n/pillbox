@@ -37,6 +37,10 @@ tempfile = "3"
 rustic_core = "0.11"
 rustic_backend = { version = "0.6", default-features = false, features = ["opendal"] }
 rand = "0.9"
+# Unix-only: `pillbox session detach <id>` SIGTERMs the attached
+# pillbox process. Direct dep so a `cargo audit` flags advisories
+# instead of hiding behind a transitive resolution.
+libc = "0.2"
 # rustic_core re-exposes timestamps as jiff::Zoned — depend on jiff
 # directly so the helper that normalizes to strict RFC3339 doesn't
 # look at types it can't name.

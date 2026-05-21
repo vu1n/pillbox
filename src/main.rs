@@ -31,6 +31,7 @@ mod pillbox;
 mod remote;
 mod sandbox;
 mod secrets;
+mod session;
 #[cfg(test)]
 mod test_util;
 mod vault;
@@ -155,6 +156,17 @@ enum Command {
         /// internal and may change between releases.
         #[arg(long = "vault-stdin", hide = true)]
         vault_stdin: bool,
+        /// Start the agent and immediately return — keeps the remote
+        /// session alive in the background. Reattach later with
+        /// `pillbox session attach <id>`. v0.6 PR 6: e2b:// remotes
+        /// only (ssh:// detach lands in a follow-up).
+        #[arg(long, requires = "remote")]
+        detach: bool,
+        /// Human label for the detached session (surfaced in `session
+        /// list`). Only meaningful with `--detach` — clap rejects the
+        /// flag without it instead of silently dropping the value.
+        #[arg(long, value_name = "TEXT", requires = "detach")]
+        label: Option<String>,
         /// Args forwarded to the agent CLI inside the sandbox.
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
@@ -163,6 +175,11 @@ enum Command {
     Remote {
         #[command(subcommand)]
         action: RemoteAction,
+    },
+    /// Manage detached sessions started with `pillbox run --remote NAME --detach`.
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
     },
     /// Manage stored secrets for the current pillbox.
     Secret {
@@ -421,6 +438,33 @@ enum RemoteAction {
 }
 
 #[derive(Subcommand, Debug)]
+enum SessionAction {
+    /// List sessions started from this pillbox (oldest first).
+    List {
+        /// Emit a JSON array of session records. Pin to `version: 1`.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one session (accepts a unique id prefix ≥ 4 chars).
+    Info {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reattach to a detached session. Streams the remote PTY back
+    /// into the current terminal. Detach again with Ctrl-A + D or by
+    /// running `pillbox session detach <id>` from another shell.
+    Attach { id: String },
+    /// Signal a currently-attached pillbox process to detach. The
+    /// session record is left in place; the backend keeps running.
+    /// Idempotent — no error if the session is already detached.
+    Detach { id: String },
+    /// Tear down the backend resources (kill the sandbox) and remove
+    /// the session record. Idempotent.
+    Rm { id: String },
+}
+
+#[derive(Subcommand, Debug)]
 enum VaultAction {
     Ca {
         #[arg(long)]
@@ -486,6 +530,8 @@ fn run(cli: Cli) -> Result<()> {
             vault,
             remote,
             vault_stdin,
+            detach,
+            label,
             args,
         } => {
             let resolved = Pillbox::resolve(pillbox_arg)?;
@@ -503,12 +549,18 @@ fn run(cli: Cli) -> Result<()> {
                     args,
                     remote_name: remote,
                     vault_stdin,
+                    detach,
+                    label,
                 },
             )
         }
         Command::Remote { action } => {
             let resolved = Pillbox::resolve(pillbox_arg)?;
             dispatch_remote(&resolved, action)
+        }
+        Command::Session { action } => {
+            let resolved = Pillbox::resolve(pillbox_arg)?;
+            dispatch_session(&resolved, action)
         }
         Command::Secret { action } => {
             let resolved = Pillbox::resolve(pillbox_arg)?;
@@ -655,6 +707,230 @@ fn dispatch_remote(resolved: &Pillbox, action: RemoteAction) -> Result<()> {
             remote::rm(resolved, WriteScope::from_global_flag(global), &name)
         }
         RemoteAction::Info { name, json } => remote::info(resolved, &name, json),
+    }
+}
+
+fn dispatch_session(resolved: &Pillbox, action: SessionAction) -> Result<()> {
+    match action {
+        SessionAction::List { json } => session_list(resolved, json),
+        SessionAction::Info { id, json } => session_info(resolved, &id, json),
+        SessionAction::Attach { id } => session_attach(resolved, &id),
+        SessionAction::Detach { id } => session_detach(resolved, &id),
+        SessionAction::Rm { id } => session_rm(resolved, &id),
+    }
+}
+
+fn session_list(resolved: &Pillbox, json: bool) -> Result<()> {
+    let entries = session::list(resolved)?;
+    if json {
+        // Single source of truth for the on-wire shape lives on
+        // `Session::to_json_value` so list + info stay in lockstep.
+        let arr: Vec<serde_json::Value> = entries
+            .iter()
+            .map(session::Session::to_json_value)
+            .collect();
+        println!(
+            "{}",
+            crate::paths::json_v1(vec![
+                ("pillbox", resolved.display_name().into()),
+                ("sessions", serde_json::Value::Array(arr))
+            ])
+        );
+        return Ok(());
+    }
+    if entries.is_empty() {
+        println!("(no sessions in `{}`)", resolved.display_name());
+        println!();
+        println!("Start one with: pillbox run --remote NAME --detach");
+        return Ok(());
+    }
+    println!(
+        "Sessions in `{}` (id        attached?  agent    remote          started_at):",
+        resolved.display_name()
+    );
+    for s in entries {
+        let attached = match s.attached_pid {
+            Some(_) => "active  ",
+            None => "detached",
+        };
+        let label = s
+            .label
+            .as_deref()
+            .map(|l| format!(" [{l}]"))
+            .unwrap_or_default();
+        println!(
+            "  {}  {attached}  {:<7}  {:<14}  {}{label}",
+            s.id, s.agent_id, s.remote, s.started_at
+        );
+    }
+    Ok(())
+}
+
+fn session_info(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
+    let s = session::resolve(resolved, id)?;
+    if json {
+        println!(
+            "{}",
+            crate::paths::json_v1(vec![("session", s.to_json_value())])
+        );
+        return Ok(());
+    }
+    println!("Session: {}", s.id);
+    if let Some(label) = &s.label {
+        println!("  label:        {label}");
+    }
+    println!("  remote:       {}", s.remote);
+    println!("  backend:      {}", s.backend);
+    println!("  sandbox_id:   {}", s.sandbox_id);
+    println!("  pty_pid:      {}", s.pty_pid);
+    println!("  agent:        {}", s.agent_id);
+    println!("  started_at:   {}", s.started_at);
+    println!(
+        "  attached_pid: {}",
+        match s.attached_pid {
+            Some(p) => p.to_string(),
+            None => "(detached)".to_string(),
+        }
+    );
+    Ok(())
+}
+
+fn session_attach(resolved: &Pillbox, id: &str) -> Result<()> {
+    let s = session::resolve(resolved, id)?;
+    let remote = remote::read(resolved, &s.remote)?.ok_or_else(|| {
+        PillboxError::runtime(
+            "session attach",
+            format!(
+                "remote `{}` is no longer registered — session record is orphaned",
+                s.remote
+            ),
+        )
+        .with_next(format!("pillbox session rm {}", s.id))
+    })?;
+    match s.backend.as_str() {
+        session::BACKEND_E2B => sandbox::remote_e2b::reattach(resolved, &remote, &s),
+        session::BACKEND_SSH => Err(PillboxError::usage(
+            "session attach",
+            "ssh session attach is not implemented in v0.6 PR 6 (tmux integration lands next)",
+        )
+        .into()),
+        other => Err(PillboxError::config(
+            "session attach",
+            format!("unknown session backend `{other}`"),
+        )
+        .into()),
+    }
+}
+
+fn session_detach(resolved: &Pillbox, id: &str) -> Result<()> {
+    let s = session::resolve(resolved, id)?;
+    let pid = match s.attached_pid {
+        Some(p) => p,
+        None => {
+            println!("(session `{}` is already detached)", s.id);
+            return Ok(());
+        }
+    };
+    // SIGTERM the attached pillbox process. Its helper handles SIGTERM
+    // → emits `detach-pressed` → exits 100 → that pillbox sees the
+    // exit code, marks the session detached, and prints the reattach
+    // hint. We clear the attached_pid field below as a belt-and-
+    // suspenders — if the attached pillbox has crashed already, its
+    // cleanup never ran.
+    //
+    // The session record is user-writable TOML — `attached_pid` could
+    // be hand-edited (or stale after a pillbox crash + pid reuse).
+    // Defenses, in order:
+    //   1. Reject pid <= 1 and our own pid up front — kill(0, _)
+    //      signals the whole process group; kill(-1, _) broadcasts;
+    //      kill(1, _) targets init/launchd. None of those can ever be
+    //      a pillbox we spawned.
+    //   2. Range-check into libc::pid_t (i32 on Linux/macOS).
+    //   3. Probe with kill(pid, 0) first: if the pid no longer exists
+    //      we treat the session as already-detached without sending a
+    //      signal to a recycled process.
+    // We cannot fully defeat pid reuse races (the kernel could recycle
+    // between probe and SIGTERM); these checks shrink the window and
+    // reject the obviously-wrong cases.
+    #[cfg(unix)]
+    {
+        let self_pid = i64::from(std::process::id());
+        if pid <= 1 || pid == self_pid {
+            return Err(PillboxError::runtime(
+                "session detach",
+                format!(
+                    "refusing to signal pid {pid} (reserved / self) — session record may be \
+                     corrupted; inspect `pillbox session info {}` and clear with `pillbox session rm`",
+                    s.id
+                ),
+            )
+            .into());
+        }
+        let target = libc::pid_t::try_from(pid).map_err(|_| {
+            PillboxError::runtime("session detach", format!("pid {pid} out of range"))
+        })?;
+        // Liveness probe: signal 0 returns 0 iff the pid exists AND we
+        // have permission to signal it. If ESRCH the attached pillbox
+        // already exited; clear the stamp and return without firing
+        // SIGTERM at whatever recycled pid now lives there.
+        // SAFETY: signal 0 performs no signal delivery, only the pid
+        // and permission checks. Always safe to call.
+        let probe = unsafe { libc::kill(target, 0) };
+        if probe != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ESRCH) {
+                eprintln!("pillbox: warning: attached pid {pid} no longer exists; clearing stamp.");
+                session::mark_detached(resolved, &s.id)?;
+                return Ok(());
+            }
+            // EPERM or other: the pid exists but isn't ours to signal.
+            // Refuse rather than try.
+            return Err(PillboxError::runtime(
+                "session detach",
+                format!("kill probe pid {pid}: {err}"),
+            )
+            .into());
+        }
+        // SAFETY: SIGTERM to a validated pid we just confirmed is
+        // signalable by this uid; no signal handler installed on this
+        // side; we own the target process (it's another pillbox we
+        // spawned).
+        let rc = unsafe { libc::kill(target, libc::SIGTERM) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::ESRCH) {
+                eprintln!("pillbox: warning: kill {pid}: {err}");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        return Err(PillboxError::resource(
+            "session detach",
+            "session detach requires SIGTERM (Unix only) in v0.6",
+        )
+        .into());
+    }
+    session::mark_detached(resolved, &s.id)?;
+    println!("pillbox: ✓ session `{}` detach signalled.", s.id);
+    Ok(())
+}
+
+fn session_rm(resolved: &Pillbox, id: &str) -> Result<()> {
+    let s = session::resolve(resolved, id)?;
+    match s.backend.as_str() {
+        session::BACKEND_E2B => sandbox::remote_e2b::kill_session(resolved, &s),
+        session::BACKEND_SSH => Err(PillboxError::usage(
+            "session rm",
+            "ssh session rm is not implemented in v0.6 PR 6 (tmux integration lands next)",
+        )
+        .into()),
+        other => Err(PillboxError::config(
+            "session rm",
+            format!("unknown session backend `{other}`"),
+        )
+        .into()),
     }
 }
 

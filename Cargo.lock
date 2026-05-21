@@ -2550,6 +2550,7 @@ dependencies = [
  "http-body-util",
  "hudsucker",
  "jiff",
+ "libc",
  "rand 0.9.4",
  "rcgen",
  "rustic_backend",

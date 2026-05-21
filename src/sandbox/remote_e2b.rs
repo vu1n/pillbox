@@ -37,22 +37,22 @@
 //! `pillbox run --vault-stdin` has read it.
 
 use std::{
-    collections::BTreeMap,
     io::{self, BufRead, BufReader, Write},
     path::PathBuf,
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
 };
 
 use anyhow::{Context, Result};
 
-use super::remote_ssh::{InlineSecret, VaultStdinBlob, BLOB_VERSION};
+use super::remote_ssh::{build_vault_stdin_blob, VaultStdinBlob};
 use super::SandboxBackend;
-use crate::agents::{workspace_mount_name, AgentSpec, RunOpts};
+use crate::agents::{AgentSpec, RunOpts};
 use crate::config::BackendKind;
 use crate::errors::PillboxError;
 use crate::paths::{ensure_mode_0700, pillbox_root};
 use crate::pillbox::Pillbox;
 use crate::remote::{E2bRef, Remote, RemoteUrl};
+use crate::session::{self, Session, BACKEND_E2B};
 
 /// Embedded helper script — bundled into the binary so users don't have
 /// to manage two files in lockstep. The cache path embeds
@@ -71,6 +71,12 @@ const HELPER_SCRIPT: &str = include_str!("e2b-helper.mjs");
 /// loudly so a stale cached helper from an older pillbox can't silently
 /// drop into the new dispatcher.
 const HELPER_PROTO_VERSION: u32 = 1;
+
+/// Exit code the helper uses when the user intentionally detaches
+/// (Ctrl-A D) — distinct from 0 (clean PTY exit), 130 (SIGINT), 143
+/// (SIGTERM). Kept in lockstep with `DETACH_EXIT_CODE` in
+/// `e2b-helper.mjs`.
+pub(crate) const DETACH_EXIT_CODE: i32 = 100;
 
 /// `pillbox run --remote NAME` backend for an E2B remote.
 pub(crate) struct RemoteE2bSandbox {
@@ -126,93 +132,48 @@ impl SandboxBackend for RemoteE2bSandbox {
             }
         };
 
-        let blob = build_blob(spec, &opts, resolved)?;
-        run_via_helper(&self.remote.name, &e2b, &blob)
-    }
-}
-
-/// Shared blob-build path. Mirrors the SSH backend's resolution: real
-/// secret values come from THIS host's vault; only resolved values
-/// cross the helper subprocess. Vaulted secrets keep their `vault_meta`
-/// so the in-sandbox pillbox can re-lease them through its own session.
-fn build_blob(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Result<VaultStdinBlob> {
-    let withs = crate::agents::resolve_with_entries(resolved, &opts.withs)?;
-    if opts.vault && !spec.vault_capable {
-        return Err(PillboxError::usage(
-            "run --remote (e2b)",
-            format!("--vault is not supported for `{}`", spec.id),
+        let blob = build_vault_stdin_blob(spec, &opts, resolved, "run --remote (e2b)")?;
+        let label = opts.label.clone();
+        let detach = opts.detach;
+        run_attach(
+            resolved,
+            &self.remote.name,
+            spec.id,
+            label,
+            &e2b,
+            &blob,
+            detach,
         )
-        .into());
     }
-
-    let mut secrets = Vec::with_capacity(withs.len());
-    for w in &withs {
-        let real = crate::secrets::read(resolved, &w.secret_name)?.ok_or_else(|| {
-            PillboxError::runtime(
-                "run --remote (e2b)",
-                format!("secret `{}` not found", w.secret_name),
-            )
-            .with_next(format!("pillbox secret add {}", w.secret_name))
-        })?;
-        secrets.push(InlineSecret {
-            name: w.secret_name.clone(),
-            env_var: w.env_var.clone(),
-            value: real.trim_end().to_string(),
-            vault_meta: w.meta.clone(),
-        });
-    }
-
-    let mut env = BTreeMap::new();
-    for bundle in &opts.env_bundles {
-        let vars = crate::envs::read(resolved, bundle)?.ok_or_else(|| {
-            PillboxError::runtime(
-                "run --remote (e2b)",
-                format!("env bundle `{bundle}` not found"),
-            )
-        })?;
-        for (k, v) in vars {
-            env.insert(k, v);
-        }
-    }
-    for path in &opts.env_files {
-        let raw = std::fs::read_to_string(path).map_err(|e| {
-            PillboxError::runtime(
-                "run --remote (e2b)",
-                format!("could not read --env-file {}: {e}", path.display()),
-            )
-        })?;
-        let vars = crate::envs::parse_dotenv(&raw, &path.display().to_string())?;
-        for (k, v) in vars {
-            env.insert(k, v);
-        }
-    }
-
-    let workspace_host = match &opts.workspace {
-        Some(p) => p.clone(),
-        None => std::env::current_dir().context("resolve current working directory")?,
-    };
-    let workspace_name = workspace_mount_name(&workspace_host, opts.name.as_deref())?;
-
-    Ok(VaultStdinBlob {
-        version: BLOB_VERSION,
-        agent_id: spec.id.to_string(),
-        agent_args: opts.args.clone(),
-        workspace_mount_name: workspace_name,
-        vault: opts.vault,
-        secrets,
-        env,
-    })
 }
 
-/// Stage the blob, extract the helper, run `node helper.mjs attach …`.
-fn run_via_helper(remote_name: &str, e2b: &E2bRef, blob: &VaultStdinBlob) -> Result<()> {
+/// Initial attach — create a new sandbox + PTY, launch the agent, and
+/// either stream the PTY back to the user (interactive) or exit
+/// immediately after the launch line is delivered (`--detach`). Either
+/// way the session record is written to the local registry so the user
+/// can `pillbox session list` / `attach` / `rm` it later.
+///
+/// Exit-code semantics from the helper:
+///   - 0  + last event `detached`       → `--detach` success: keep record, sandbox running
+///   - 0  (no detach event)             → agent finished cleanly: kill sandbox, remove record
+///   - 100 + last event `detach-pressed` → user typed Ctrl-A D: keep record, sandbox running
+///   - non-zero (other)                 → failure: kill sandbox best-effort, remove record
+#[allow(clippy::too_many_arguments)]
+fn run_attach(
+    resolved: &Pillbox,
+    remote_name: &str,
+    agent_id: &'static str,
+    label: Option<String>,
+    e2b: &E2bRef,
+    blob: &VaultStdinBlob,
+    detach: bool,
+) -> Result<()> {
     let blob_bytes = blob.to_bytes()?;
     // `tempfile()` creates the file atomically via `O_CREAT | O_EXCL`
-    // with mode 0o600 on Unix (see `tempfile::Builder` docs / source).
-    // We write through its open handle so the staged blob never exists
-    // on disk with a wider mode and we never re-open the path (which
-    // would risk a symlink/race against the predictable suffix). Other
-    // local users can't read the file even momentarily.
+    // with mode 0o600 on Unix. We write through its open handle so the
+    // staged blob never exists on disk with a wider mode and we never
+    // re-open the path (which would risk a symlink/race against the
+    // predictable suffix).
     let mut tmp = tempfile::Builder::new()
         .prefix("pillbox-e2b-blob-")
         .suffix(".json")
@@ -226,14 +187,15 @@ fn run_via_helper(remote_name: &str, e2b: &E2bRef, blob: &VaultStdinBlob) -> Res
     })?;
 
     let helper = ensure_helper_extracted()?;
-    // Match the SSH backend's wording — `(<url>)` — so the message looks
-    // the same regardless of which scheme the user registered. The URL
-    // string is what the user typed at `remote add`, so they recognize
-    // it.
     eprintln!(
         "pillbox: connecting to `{remote_name}` (e2b://{}) …",
         e2b.template
     );
+    if !detach {
+        // Interactive attach — surface the detach hotkey so the user
+        // can leave the session running without reading the docs.
+        eprintln!("pillbox: detach with Ctrl-A D to keep the sandbox running.");
+    }
 
     let mut cmd = Command::new("node");
     cmd.arg(&helper)
@@ -244,63 +206,272 @@ fn run_via_helper(remote_name: &str, e2b: &E2bRef, blob: &VaultStdinBlob) -> Res
         .arg(remote_name)
         .arg("--blob-file")
         .arg(tmp.path());
-    // The user's terminal: keystrokes in, agent output out. The helper
-    // writes a one-line `{type:"sandbox-up", sandboxId:"…"}` JSON to
-    // stderr before any other output, so we can't blindly inherit
-    // stderr without parsing — but that one line is a small price for
-    // letting `node`'s own crashes flow through to the user.
+    if detach {
+        cmd.arg("--detach");
+    }
+    let (status, pumped) = run_helper(cmd, "run --remote (e2b)")?;
+    drop(tmp);
+
+    // Decide what to do based on the final pump state + the helper's
+    // exit code. The session record is written before any branch that
+    // leaves the sandbox alive, so the user always has an id to attach
+    // to. `detach == true` is the only branch where the helper exits
+    // with status 0 AND we keep the sandbox.
+    match (status.success(), pumped.last_event.as_deref(), detach) {
+        // Interactive launch, agent ran to completion cleanly — tear
+        // it all down (the sandbox is empty / agent done).
+        (true, None, false) => {
+            // No record was ever written — nothing to clean up.
+            Ok(())
+        }
+        // `--detach` path: helper emitted `detached` after launch and
+        // exited. Persist the session so the user can reattach.
+        (true, Some("detached"), true) => {
+            let session =
+                persist_session_from_pump(resolved, remote_name, agent_id, label, &pumped, None)?;
+            println!(
+                "pillbox: ✓ session `{}` started in background (sandbox `{}`).",
+                session.id, session.sandbox_id
+            );
+            println!("         pillbox session attach {}  # reattach", session.id);
+            Ok(())
+        }
+        // Interactive Ctrl-A D — helper exited 100 with `detach-pressed`.
+        // Persist the session and tell the user how to come back.
+        (false, Some("detach-pressed"), false) if status.code() == Some(DETACH_EXIT_CODE) => {
+            let session =
+                persist_session_from_pump(resolved, remote_name, agent_id, label, &pumped, None)?;
+            eprintln!(
+                "pillbox: detached. reattach with `pillbox session attach {}`",
+                session.id
+            );
+            Ok(())
+        }
+        // Anything else is a failure — surface the helper diagnostic
+        // and a generic prereq hint if we never saw the handshake.
+        _ => {
+            let mut err = PillboxError::runtime(
+                "run --remote (e2b)",
+                format!("helper exited with status {status}"),
+            );
+            if pumped.sandbox_id.is_none() {
+                err = err.with_next(
+                    "check the helper diagnostic above; common causes: \
+                     `npm i -g e2b`, set $E2B_API_KEY, valid template id",
+                );
+            }
+            Err(err.into())
+        }
+    }
+}
+
+/// `pillbox session attach <id>` for an E2B session. Spawns the helper
+/// in `reattach` mode, marks the session as attached for the duration,
+/// and clears the mark on exit (clean detach, Ctrl-A D, or peer death).
+pub(crate) fn reattach(resolved: &Pillbox, remote: &Remote, session: &Session) -> Result<()> {
+    if session.backend != BACKEND_E2B {
+        return Err(PillboxError::usage(
+            "session attach",
+            format!(
+                "session `{}` is backed by `{}`, not e2b — attach not yet supported",
+                session.id, session.backend
+            ),
+        )
+        .into());
+    }
+    let helper = ensure_helper_extracted()?;
+    eprintln!(
+        "pillbox: reattaching to `{}` (sandbox `{}`) …",
+        remote.name, session.sandbox_id
+    );
+    // Surface the detach hotkey on every reattach — without this the
+    // user has no way to discover it short of reading the docs.
+    eprintln!("pillbox: detach with Ctrl-A D (the sandbox keeps running).");
+
+    session::mark_attached(resolved, &session.id, std::process::id() as i64)?;
+
+    let mut cmd = Command::new("node");
+    cmd.arg(&helper)
+        .arg("reattach")
+        .arg("--sandbox-id")
+        .arg(&session.sandbox_id)
+        .arg("--pid")
+        .arg(session.pty_pid.to_string());
+    let pump_result = run_helper(cmd, "session attach");
+
+    // Always clear attached_pid before returning, even on error. The
+    // session record is still valid (sandbox is up); only the "who's
+    // attached" stamp changes.
+    let _ = session::mark_detached(resolved, &session.id);
+
+    let (status, pumped) = pump_result?;
+    if status.code() == Some(DETACH_EXIT_CODE)
+        && pumped.last_event.as_deref() == Some("detach-pressed")
+    {
+        eprintln!(
+            "pillbox: detached. reattach with `pillbox session attach {}`",
+            session.id
+        );
+        return Ok(());
+    }
+    if !status.success() {
+        return Err(PillboxError::runtime(
+            "session attach",
+            format!("helper exited with status {status}"),
+        )
+        .into());
+    }
+    // Process inside the PTY exited (e.g. user typed `exit`). The
+    // sandbox is empty but still alive — leave the record. The user
+    // can `pillbox session rm <id>` to tear it down or reattach to
+    // start something else inside.
+    Ok(())
+}
+
+/// `pillbox session rm <id>` for an E2B session. Spawns the helper in
+/// `kill` mode, then unconditionally deletes the local record (a
+/// failed kill is logged but doesn't leave a dangling session entry —
+/// the sandbox may have already timed out / been killed elsewhere).
+///
+/// **Trade-off (intentional):** if `sandbox.kill` fails for an
+/// unrelated reason (e.g. transient network blip) we still drop the
+/// record. The user loses the handle to retry from pillbox, but the
+/// sandbox will time out on E2B's side (the `SANDBOX_TIMEOUT_MS`
+/// helper default) and any further cleanup can be done from the
+/// `e2b` CLI directly. The alternative (gating delete on kill) leaves
+/// stale records for sandboxes that E2B has already reaped, which we
+/// saw bite users more often. Reconsider if/when E2B exposes a clean
+/// "kill or already-dead" status code.
+pub(crate) fn kill_session(resolved: &Pillbox, session: &Session) -> Result<()> {
+    if session.backend != BACKEND_E2B {
+        return Err(PillboxError::usage(
+            "session rm",
+            format!(
+                "session `{}` is backed by `{}`, not e2b — rm not yet supported",
+                session.id, session.backend
+            ),
+        )
+        .into());
+    }
+    let helper = ensure_helper_extracted()?;
+    let mut cmd = Command::new("node");
+    cmd.arg(&helper)
+        .arg("kill")
+        .arg("--sandbox-id")
+        .arg(&session.sandbox_id);
+    // `kill` mode has no PTY and no user interaction — capture stdout
+    // so a chatty SDK doesn't leak random bytes onto the user's terminal.
+    // Stderr keeps the helper handshake + diagnostics.
+    let outcome = run_helper_quiet(cmd, "session rm");
+    if let Err(e) = outcome.as_ref() {
+        eprintln!("pillbox: warning: sandbox kill failed: {e}");
+    }
+    session::delete(resolved, &session.id)?;
+    println!(
+        "pillbox: ✓ session `{}` removed (sandbox `{}` killed).",
+        session.id, session.sandbox_id
+    );
+    Ok(())
+}
+
+/// Build a [`Session`] from the data we learned during the helper run,
+/// persist it, and return it. Pulled out so `run_attach` doesn't grow
+/// duplicate "did we have a sandbox_id and pid? then write a record"
+/// blocks at each happy path.
+fn persist_session_from_pump(
+    resolved: &Pillbox,
+    remote_name: &str,
+    agent_id: &'static str,
+    label: Option<String>,
+    pump: &PumpOutcome,
+    attached_pid: Option<i64>,
+) -> Result<Session> {
+    let sandbox_id = pump.sandbox_id.clone().ok_or_else(|| {
+        PillboxError::runtime(
+            "run --remote (e2b)",
+            "helper exited successfully but never sent the sandbox-up handshake",
+        )
+    })?;
+    let session = Session {
+        id: Session::new_id(),
+        label,
+        remote: remote_name.to_string(),
+        backend: BACKEND_E2B.to_string(),
+        sandbox_id,
+        pty_pid: pump.pid.unwrap_or(0),
+        agent_id: agent_id.to_string(),
+        started_at: session::now_rfc3339(),
+        attached_pid,
+    };
+    session::write(resolved, &session)?;
+    Ok(session)
+}
+
+/// Run a pre-configured helper command with full stdio inheritance
+/// (terminal in, PTY out). Pumps stderr line-by-line on a background
+/// thread; returns the helper's exit status + everything we learned
+/// from its stderr stream.
+fn run_helper(
+    mut cmd: Command,
+    action: &'static str,
+) -> Result<(std::process::ExitStatus, PumpOutcome)> {
     cmd.stdin(Stdio::inherit());
     cmd.stdout(Stdio::inherit());
     cmd.stderr(Stdio::piped());
+    spawn_and_pump(cmd, action)
+}
 
-    let mut child = cmd.spawn().map_err(|e| {
-        PillboxError::resource("run --remote (e2b)", format!("could not spawn node: {e}"))
-            .with_next("install Node.js + run `npm i -g e2b` (https://e2b.dev/docs)")
-    })?;
-
-    // Pump helper stderr → ours. The helper writes one JSON handshake
-    // line first; we parse + verify it (proto version, sandbox id) and
-    // surface the sandbox id to the user. Everything after that line is
-    // a real diagnostic and passes straight through.
-    let stderr = child.stderr.take().ok_or_else(|| {
-        PillboxError::runtime("run --remote (e2b)", "helper stderr unexpectedly closed")
-    })?;
-    let stderr_thread = std::thread::spawn(move || pump_helper_stderr(stderr));
-
-    let status = child
-        .wait()
-        .map_err(|e| PillboxError::runtime("run --remote (e2b)", format!("wait on helper: {e}")))?;
-    // Tempfile drops here — staged blob is unlinked even if the helper
-    // panicked before reading it.
-    drop(tmp);
-    // Receive whether the helper made it past the handshake. If not,
-    // the failure is almost certainly a missing dep / unset API key, and
-    // the user's terminal already has the helper's diagnostic on it —
-    // we just append a generic Next: pointing at the prereqs.
-    let pumped = stderr_thread.join().unwrap_or_default();
+/// Like [`run_helper`] but captures stdout too. Used by `kill` mode
+/// where the helper has no PTY and any bytes on stdout would be SDK
+/// noise spilling onto the user's terminal.
+fn run_helper_quiet(mut cmd: Command, action: &'static str) -> Result<()> {
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let (status, _pumped) = spawn_and_pump(cmd, action)?;
     if !status.success() {
-        let mut err = PillboxError::runtime(
-            "run --remote (e2b)",
-            format!("helper exited with status {status}"),
+        return Err(
+            PillboxError::runtime(action, format!("helper exited with status {status}")).into(),
         );
-        if !pumped.saw_handshake {
-            err = err.with_next(
-                "check the helper diagnostic above; common causes: \
-                 `npm i -g e2b`, set $E2B_API_KEY, valid template id",
-            );
-        }
-        return Err(err.into());
     }
     Ok(())
 }
 
+fn spawn_and_pump(
+    mut cmd: Command,
+    action: &'static str,
+) -> Result<(std::process::ExitStatus, PumpOutcome)> {
+    let mut child: Child = cmd.spawn().map_err(|e| {
+        PillboxError::resource(action, format!("could not spawn node: {e}"))
+            .with_next("install Node.js + run `npm i -g e2b` (https://e2b.dev/docs)")
+    })?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| PillboxError::runtime(action, "helper stderr unexpectedly closed"))?;
+    let stderr_thread = std::thread::spawn(move || pump_helper_stderr(stderr));
+    let status = child
+        .wait()
+        .map_err(|e| PillboxError::runtime(action, format!("wait on helper: {e}")))?;
+    let pumped = stderr_thread.join().unwrap_or_default();
+    Ok((status, pumped))
+}
+
 /// What `pump_helper_stderr` learned from the helper's stderr stream.
-/// Currently just "did we see a well-formed `sandbox-up`"; the caller
-/// uses it to decide whether to attach a generic prereq hint to a
-/// helper-exit failure.
+/// The Rust side uses these to (a) write the session record after a
+/// successful handshake and (b) distinguish "user detached" from
+/// "agent finished" / "helper crashed" via `last_event`.
 #[derive(Debug, Default)]
 struct PumpOutcome {
-    saw_handshake: bool,
+    /// Sandbox id from the `sandbox-up` handshake (if seen).
+    sandbox_id: Option<String>,
+    /// PTY pid from the `sandbox-up` handshake (if present — only
+    /// attach + reattach send it; `kill` does not).
+    pid: Option<i64>,
+    /// `type` of the last JSON event the helper wrote — typically
+    /// `sandbox-up`, `detached`, or `detach-pressed`. Used by the
+    /// caller to disambiguate the meaning of the helper's exit code.
+    last_event: Option<String>,
 }
 
 /// Extract `e2b-helper.mjs` to `~/.pillbox/cache/e2b-helper-v<pkg>.mjs`.
@@ -327,72 +498,117 @@ pub(crate) fn ensure_helper_extracted() -> Result<PathBuf> {
 
 /// Read helper stderr line-by-line.
 ///
-/// The first line is the helper's `{"type":"sandbox-up", protoVersion,
-/// sandboxId}` JSON handshake. We parse + verify it, then surface the
-/// sandbox id so the user can see what they're attached to (matches the
-/// SSH backend's "connecting to NAME (URL) …" diagnostic, just delayed
-/// until the sandbox is actually up).
+/// The protocol is a sequence of JSON event lines (see `e2b-helper.mjs`
+/// header for the schema). The first such line is the `sandbox-up`
+/// handshake; subsequent lines may be `detached` / `detach-pressed`.
+/// Everything that isn't a recognized JSON event is forwarded raw so
+/// real diagnostics (network errors, `sandbox.kill` failures, stack
+/// traces from the SDK) stay visible.
 ///
-/// Failure modes — all kept visible to the user, not swallowed:
-///   - line isn't JSON: helper crashed before the handshake; forward it.
-///   - JSON parses but `type != "sandbox-up"`: helper protocol drift;
-///     forward + tag.
-///   - `protoVersion` doesn't match [`HELPER_PROTO_VERSION`]: stale
-///     extracted helper from an older binary; tell the user how to fix.
+/// Forwarded text is sanitized through [`sanitize_terminal_line`] so a
+/// chatty SDK / network error can't smuggle ANSI escape sequences (cursor
+/// moves, title rewrites, OSC 8 hyperlinks) through to the user's
+/// terminal. The local pillbox-formatted messages above this layer are
+/// trusted and pass through unchanged.
 ///
-/// Everything after the handshake line is a real runtime diagnostic and
-/// streams through verbatim (network errors, `sandbox.kill` failures,
-/// stack traces from the SDK).
+/// Returns the cumulative state at end-of-stream — caller uses
+/// `last_event` to disambiguate "user detached" from "agent finished".
 fn pump_helper_stderr(stderr: std::process::ChildStderr) -> PumpOutcome {
     let mut outcome = PumpOutcome::default();
-    let mut reader = BufReader::new(stderr);
-    let mut first = String::new();
-    if reader.read_line(&mut first).is_err() || first.is_empty() {
-        return outcome;
-    }
-    let trimmed = first.trim();
-    if trimmed.starts_with('{') {
+    let reader = BufReader::new(stderr);
+    let mut sink = io::stderr();
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        let trimmed = line.trim();
+        if !trimmed.starts_with('{') {
+            // Free-text diagnostic — forward sanitized.
+            let _ = writeln!(sink, "{}", sanitize_terminal_line(&line));
+            continue;
+        }
         match serde_json::from_str::<serde_json::Value>(trimmed) {
-            Ok(v) => {
-                let ty = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
-                let proto = v.get("protoVersion").and_then(|x| x.as_u64()).unwrap_or(0);
-                let sandbox_id = v.get("sandboxId").and_then(|x| x.as_str()).unwrap_or("");
-                if ty == "sandbox-up" && proto == u64::from(HELPER_PROTO_VERSION) {
-                    let _ = writeln!(std::io::stderr(), "pillbox: ✓ sandbox `{sandbox_id}` up");
-                    outcome.saw_handshake = true;
-                } else if ty == "sandbox-up" {
+            Ok(v) => match v.get("type").and_then(|x| x.as_str()) {
+                Some("sandbox-up") => {
+                    let proto = v.get("protoVersion").and_then(|x| x.as_u64()).unwrap_or(0);
+                    let sandbox_id = v
+                        .get("sandboxId")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let pid = v.get("pid").and_then(|x| x.as_i64());
+                    if proto != u64::from(HELPER_PROTO_VERSION) {
+                        let _ = writeln!(
+                            sink,
+                            "pillbox: helper protoVersion mismatch (got {proto}, expected {HELPER_PROTO_VERSION}). \
+                             Stale extracted helper — `rm ~/.pillbox/cache/e2b-helper-*` and retry."
+                        );
+                        continue;
+                    }
                     let _ = writeln!(
-                        std::io::stderr(),
-                        "pillbox: helper protoVersion mismatch (got {proto}, expected {HELPER_PROTO_VERSION}). \
-                         Stale extracted helper — `rm ~/.pillbox/cache/e2b-helper-*` and retry."
+                        sink,
+                        "pillbox: ✓ sandbox `{}` up",
+                        sanitize_terminal_line(&sandbox_id)
                     );
-                } else {
-                    let _ = writeln!(
-                        std::io::stderr(),
-                        "pillbox: unexpected helper handshake `{ty}` — forwarding raw"
-                    );
-                    let _ = std::io::stderr().write_all(first.as_bytes());
+                    outcome.sandbox_id = Some(sandbox_id);
+                    outcome.pid = pid;
+                    outcome.last_event = Some("sandbox-up".into());
                 }
-            }
+                Some(ty @ ("detached" | "detach-pressed")) => {
+                    outcome.last_event = Some(ty.to_string());
+                }
+                Some(ty) => {
+                    let _ = writeln!(
+                        sink,
+                        "pillbox: unexpected helper event `{}` — forwarding raw",
+                        sanitize_terminal_line(ty)
+                    );
+                    let _ = writeln!(sink, "{}", sanitize_terminal_line(&line));
+                }
+                None => {
+                    let _ = writeln!(sink, "{}", sanitize_terminal_line(&line));
+                }
+            },
             Err(_) => {
                 // JSON-looking but malformed — likely a diagnostic that
-                // happens to start with `{`. Forward.
-                let _ = std::io::stderr().write_all(first.as_bytes());
+                // happens to start with `{`. Forward sanitized.
+                let _ = writeln!(sink, "{}", sanitize_terminal_line(&line));
             }
         }
-    } else {
-        // The helper failed before sending the handshake. The line is the
-        // actual error; pass it through.
-        let _ = std::io::stderr().write_all(first.as_bytes());
     }
-    // Stream everything after the handshake straight through. `io::copy`
-    // pulls from the BufReader (its internal buffer keeps the post-line
-    // bytes already consumed by `read_line`) and pushes to our stderr.
-    // The reader keeps borrow of stderr only for the duration of the call,
-    // so no intermediate buffer is needed.
-    let mut sink = io::stderr();
-    let _ = io::copy(&mut reader, &mut sink);
     outcome
+}
+
+/// Replace control bytes that can drive a terminal (ESC = 0x1B, CSI
+/// 0x9B, BEL = 0x07, plus the rest of the C0 set except `\t`) with a
+/// printable `^X` form so a stderr diagnostic forwarded from the helper
+/// can't move the cursor, rewrite the title, or smuggle an OSC 8
+/// hyperlink onto the user's terminal. Cheap — only allocates when the
+/// input actually contains something dangerous.
+fn sanitize_terminal_line(s: &str) -> std::borrow::Cow<'_, str> {
+    let needs_sanitize = s
+        .bytes()
+        .any(|b| b == 0x1B || b == 0x07 || (b < 0x20 && b != b'\t'));
+    if !needs_sanitize {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        let c = ch as u32;
+        if c == 0x1B {
+            out.push_str("^[");
+        } else if c == 0x07 {
+            out.push_str("^G");
+        } else if c < 0x20 && ch != '\t' {
+            // Caret notation for other C0 controls.
+            out.push('^');
+            out.push(char::from_u32(c + 0x40).unwrap_or('?'));
+        } else {
+            out.push(ch);
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 #[cfg(test)]
@@ -426,5 +642,42 @@ mod tests {
             let stem = p.file_stem().unwrap().to_str().unwrap();
             assert!(stem.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
         });
+    }
+
+    #[test]
+    fn sanitize_terminal_line_passes_plain_text() {
+        // Borrowed (zero-alloc) fast path for the common case.
+        let s = "sandbox sb_123 ready";
+        let out = sanitize_terminal_line(s);
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(out, s);
+    }
+
+    #[test]
+    fn sanitize_terminal_line_neutralizes_esc_and_csi() {
+        // Cursor-up: ESC [ A — must not survive.
+        let s = "boom\x1b[Aoverwrite";
+        let out = sanitize_terminal_line(s);
+        assert_eq!(out, "boom^[[Aoverwrite");
+        assert!(!out.contains('\x1b'));
+    }
+
+    #[test]
+    fn sanitize_terminal_line_neutralizes_osc_hyperlink() {
+        // OSC 8 hyperlink frames a clickable link in modern terminals.
+        // Sanitizer strips the ESC/BEL framing so the literal URL shows.
+        let s = "\x1b]8;;https://evil.example/\x07click\x1b]8;;\x07";
+        let out = sanitize_terminal_line(s);
+        assert!(!out.contains('\x1b'));
+        assert!(!out.contains('\x07'));
+        assert!(out.contains("https://evil.example/"));
+    }
+
+    #[test]
+    fn sanitize_terminal_line_keeps_tab() {
+        // Tab is benign and breaking it would mangle real diagnostics.
+        let s = "col1\tcol2";
+        let out = sanitize_terminal_line(s);
+        assert_eq!(out, s);
     }
 }

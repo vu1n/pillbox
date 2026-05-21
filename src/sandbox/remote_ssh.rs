@@ -188,6 +188,19 @@ impl RemoteSshSandbox {
 
 impl SandboxBackend for RemoteSshSandbox {
     fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
+        // v0.6 PR 6 ships session list/attach/detach for the E2B
+        // backend only. The SSH path needs tmux-on-the-remote wiring
+        // for persistence — landing in a follow-up. Hard-error now so
+        // a user who tries `--detach` against an ssh:// remote gets a
+        // clear message instead of a half-detached run.
+        if opts.detach {
+            return Err(PillboxError::usage(
+                "run --remote --detach",
+                "ssh:// detached sessions are not yet implemented (tmux integration lands next). \
+                 Use `e2b://` remotes for `--detach` / `session attach` today, or run interactively against ssh.",
+            )
+            .into());
+        }
         // Workspace handoff rule: S3-shaped backends only in PR 4. The
         // remote runs its own pillbox against the SAME `[workspace]`
         // config — bucket, endpoint, prefix all match, so no data has
@@ -211,76 +224,7 @@ impl SandboxBackend for RemoteSshSandbox {
             .into());
         }
 
-        // Resolve --with entries locally. Real secret values come from
-        // THIS host's vault; only the resolved values cross SSH (once,
-        // over the encrypted channel, into the remote pillbox's vault
-        // session memory).
-        let withs = crate::agents::resolve_with_entries(resolved, &opts.withs)?;
-        if opts.vault && !spec.vault_capable {
-            return Err(PillboxError::usage(
-                "run --remote",
-                format!("--vault is not supported for `{}`", spec.id),
-            )
-            .into());
-        }
-
-        let mut secrets = Vec::with_capacity(withs.len());
-        for w in &withs {
-            let real = crate::secrets::read(resolved, &w.secret_name)?.ok_or_else(|| {
-                PillboxError::runtime(
-                    "run --remote",
-                    format!("secret `{}` not found", w.secret_name),
-                )
-                .with_next(format!("pillbox secret add {}", w.secret_name))
-            })?;
-            secrets.push(InlineSecret {
-                name: w.secret_name.clone(),
-                env_var: w.env_var.clone(),
-                value: real.trim_end().to_string(),
-                vault_meta: w.meta.clone(),
-            });
-        }
-
-        // Pre-resolve --env / --env-file the same way LocalDocker would,
-        // so the remote doesn't have to know anything about the host's
-        // env bundles or local files.
-        let mut env = std::collections::BTreeMap::new();
-        for bundle in &opts.env_bundles {
-            let vars = crate::envs::read(resolved, bundle)?.ok_or_else(|| {
-                PillboxError::runtime("run --remote", format!("env bundle `{bundle}` not found"))
-            })?;
-            for (k, v) in vars {
-                env.insert(k, v);
-            }
-        }
-        for path in &opts.env_files {
-            let raw = std::fs::read_to_string(path).map_err(|e| {
-                PillboxError::runtime(
-                    "run --remote",
-                    format!("could not read --env-file {}: {e}", path.display()),
-                )
-            })?;
-            let vars = crate::envs::parse_dotenv(&raw, &path.display().to_string())?;
-            for (k, v) in vars {
-                env.insert(k, v);
-            }
-        }
-
-        let workspace_host = match &opts.workspace {
-            Some(p) => p.clone(),
-            None => std::env::current_dir().context("resolve current working directory")?,
-        };
-        let workspace_name = workspace_mount_name(&workspace_host, opts.name.as_deref())?;
-
-        let blob = VaultStdinBlob {
-            version: BLOB_VERSION,
-            agent_id: spec.id.to_string(),
-            agent_args: opts.args.clone(),
-            workspace_mount_name: workspace_name,
-            vault: opts.vault,
-            secrets,
-            env,
-        };
+        let blob = build_vault_stdin_blob(spec, &opts, resolved, "run --remote")?;
 
         // Sanity-check the URL once more before connecting — the registry
         // validates on add, but a hand-edited file could slip through.
@@ -303,6 +247,91 @@ impl SandboxBackend for RemoteSshSandbox {
 
         run_over_ssh(&destination, &blob)
     }
+}
+
+/// Build a [`VaultStdinBlob`] from `RunOpts` against the resolved pillbox.
+/// Shared between the SSH backend (sends inline over stdin) and the E2B
+/// backend (stages the same struct to a sandbox tmp file via the Files
+/// API). Both backends consume identical wire shape on the remote side
+/// (`pillbox run --vault-stdin`), so the resolution logic lives here in
+/// one place — secret material crosses the host boundary once, in a
+/// known JSON wrapping with `BLOB_VERSION`.
+///
+/// `action` is the diagnostic label threaded into error messages (e.g.
+/// `"run --remote"` vs `"run --remote (e2b)"`) so the user sees which
+/// backend they were on when a `--with` / `--env` resolution failed.
+pub(super) fn build_vault_stdin_blob(
+    spec: &AgentSpec,
+    opts: &RunOpts,
+    resolved: &Pillbox,
+    action: &'static str,
+) -> Result<VaultStdinBlob> {
+    // Resolve --with entries locally. Real secret values come from THIS
+    // host's vault; only the resolved values cross the wire (once, into
+    // the remote pillbox's vault session memory or the sandbox's tmp blob).
+    let withs = crate::agents::resolve_with_entries(resolved, &opts.withs)?;
+    if opts.vault && !spec.vault_capable {
+        return Err(PillboxError::usage(
+            action,
+            format!("--vault is not supported for `{}`", spec.id),
+        )
+        .into());
+    }
+
+    let mut secrets = Vec::with_capacity(withs.len());
+    for w in &withs {
+        let real = crate::secrets::read(resolved, &w.secret_name)?.ok_or_else(|| {
+            PillboxError::runtime(action, format!("secret `{}` not found", w.secret_name))
+                .with_next(format!("pillbox secret add {}", w.secret_name))
+        })?;
+        secrets.push(InlineSecret {
+            name: w.secret_name.clone(),
+            env_var: w.env_var.clone(),
+            value: real.trim_end().to_string(),
+            vault_meta: w.meta.clone(),
+        });
+    }
+
+    // Pre-resolve --env / --env-file the same way LocalDocker would, so
+    // the remote doesn't have to know anything about the host's env
+    // bundles or local files.
+    let mut env = std::collections::BTreeMap::new();
+    for bundle in &opts.env_bundles {
+        let vars = crate::envs::read(resolved, bundle)?.ok_or_else(|| {
+            PillboxError::runtime(action, format!("env bundle `{bundle}` not found"))
+        })?;
+        for (k, v) in vars {
+            env.insert(k, v);
+        }
+    }
+    for path in &opts.env_files {
+        let raw = std::fs::read_to_string(path).map_err(|e| {
+            PillboxError::runtime(
+                action,
+                format!("could not read --env-file {}: {e}", path.display()),
+            )
+        })?;
+        let vars = crate::envs::parse_dotenv(&raw, &path.display().to_string())?;
+        for (k, v) in vars {
+            env.insert(k, v);
+        }
+    }
+
+    let workspace_host = match &opts.workspace {
+        Some(p) => p.clone(),
+        None => std::env::current_dir().context("resolve current working directory")?,
+    };
+    let workspace_name = workspace_mount_name(&workspace_host, opts.name.as_deref())?;
+
+    Ok(VaultStdinBlob {
+        version: BLOB_VERSION,
+        agent_id: spec.id.to_string(),
+        agent_args: opts.args.clone(),
+        workspace_mount_name: workspace_name,
+        vault: opts.vault,
+        secrets,
+        env,
+    })
 }
 
 /// Connect, send the blob over stdin, proxy stdout/stderr/exit-status

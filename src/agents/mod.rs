@@ -233,6 +233,14 @@ pub(crate) struct RunOpts {
     /// stdin and re-spawn the agent locally with pre-resolved secrets.
     /// See [`crate::sandbox::remote_ssh`] for the protocol.
     pub(crate) vault_stdin: bool,
+    /// `--detach` — start the remote session and exit. The session is
+    /// recorded in the per-pillbox registry and the user reattaches
+    /// with `pillbox session attach <id>`. v0.6 PR 6: e2b:// remotes
+    /// only (ssh:// is hard-errored by the SSH backend).
+    pub(crate) detach: bool,
+    /// `--label TEXT` — human label for a detached session, surfaced
+    /// in `pillbox session list`. Only meaningful with `--detach`.
+    pub(crate) label: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -409,6 +417,8 @@ mod tests {
             args: Vec::new(),
             remote_name: None,
             vault_stdin: false,
+            detach: false,
+            label: None,
         }
     }
 

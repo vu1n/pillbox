@@ -1,17 +1,17 @@
 //! Sandbox backends — the surface that actually runs a configured
 //! [`AgentSpec`] for `pillbox run`.
 //!
-//! v0.6 splits the run path off of `AgentSpec` into a trait so we can
+//! The run path is split off of `AgentSpec` into a trait so we can
 //! pick at run time between executing the agent locally (Docker) and
 //! remotely (SSH to a VPS, E2B managed cloud).
 //!
-//! - PR 1 — trait + `LocalDocker` impl, no remote backends.
-//! - PR 4 — `RemoteSshSandbox`: ssh into a registered VPS, run a
-//!   pillbox sandbox there, proxy stdio back. See [`remote_ssh`].
-//! - PR 5 — `RemoteE2bSandbox`: spawn an E2B managed sandbox via the
-//!   `@e2b/code-interpreter` JS SDK (bundled Node helper). See
-//!   [`remote_e2b`]. Selected when the remote URL has the `e2b://`
-//!   scheme; everything else routes to SSH.
+//! - [`local_docker::LocalDocker`] — host Docker daemon.
+//! - [`remote_ssh::RemoteSshSandbox`] — ssh into a registered VPS,
+//!   run a pillbox sandbox there, proxy stdio back.
+//! - [`remote_e2b::RemoteE2bSandbox`] — spawn an E2B managed sandbox
+//!   via the `@e2b/code-interpreter` JS SDK (bundled Node helper).
+//!   Selected when the remote URL has the `e2b://` scheme; everything
+//!   else routes to SSH.
 
 pub(crate) mod local_docker;
 pub(crate) mod remote_e2b;

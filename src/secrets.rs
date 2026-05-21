@@ -25,16 +25,17 @@ use std::{
     collections::BTreeMap,
     fs,
     io::{IsTerminal, Read},
-    path::PathBuf,
+    path::Path,
 };
 
 use anyhow::{Context, Result};
 
 use crate::errors::PillboxError;
-use crate::paths::{validate_name, write_private_file};
+use crate::paths::validate_name;
 #[cfg(test)]
 use crate::pillbox;
 use crate::pillbox::{Pillbox, Scope};
+use crate::registry::{self as reg, InheritedRegistry, Registry};
 use crate::vault::VaultMeta;
 
 // Re-export so callers that already use `secrets::WriteScope` keep
@@ -43,48 +44,58 @@ use crate::vault::VaultMeta;
 // particular kind of stored data (secrets vs env bundles).
 pub(crate) use crate::pillbox::WriteScope;
 
-/// Write-side: creates `<pillbox>/secrets/` if absent and pins 0700.
-fn secrets_dir(pb: &Pillbox) -> Result<PathBuf> {
-    pb.subdir("secrets")
-}
+/// Suffix for vault sidecar files. Sits next to the secret value in
+/// the same `secrets/` directory; `names_merged` filters it out so
+/// `secret list` doesn't double-list the same name.
+const META_SUFFIX: &str = ".meta.json";
 
-/// Read-side: just the path, no `mkdir`/`chmod`. `pillbox run` walks
-/// secrets per `--with` entry across two scopes — paying dir-creation
-/// syscalls on every lookup adds up quickly.
-fn secrets_dir_read(pb: &Pillbox) -> PathBuf {
-    pb.subdir_path("secrets")
+/// Registry for the secret value itself — file body is the raw value
+/// (with trailing whitespace trimmed at write time, see `read_value`).
+struct SecretRegistry;
+impl Registry for SecretRegistry {
+    type Record = String;
+    const SUBDIR: &'static str = "secrets";
+    fn read_action() -> &'static str {
+        "secret read"
+    }
+    fn filename(name: &str) -> String {
+        // Raw — `~/.pillbox/.../secrets/ANTHROPIC_API_KEY` rather than
+        // `secrets/ANTHROPIC_API_KEY.toml`. Co-located sidecar
+        // `<name>.meta.json` lives in `SecretMetaRegistry`.
+        name.to_string()
+    }
+    fn parse(raw: &str, _source: &Path) -> Result<Self::Record> {
+        Ok(raw.to_string())
+    }
 }
+impl InheritedRegistry for SecretRegistry {}
 
-fn secret_path(pb: &Pillbox, name: &str) -> Result<PathBuf> {
-    Ok(secrets_dir(pb)?.join(name))
+/// Parallel registry for vault sidecar JSON. Same dir as the secret
+/// value but a `.meta.json` suffix — keeping the JSON next to the
+/// value means `rm secrets/<name>` cleans both with no orphans.
+struct SecretMetaRegistry;
+impl Registry for SecretMetaRegistry {
+    type Record = VaultMeta;
+    const SUBDIR: &'static str = "secrets";
+    fn read_action() -> &'static str {
+        "secret read"
+    }
+    fn filename(name: &str) -> String {
+        format!("{name}{META_SUFFIX}")
+    }
+    fn parse(raw: &str, source: &Path) -> Result<Self::Record> {
+        serde_json::from_str(raw).map_err(|e| {
+            PillboxError::config("secret read", format!("parse {}: {e}", source.display())).into()
+        })
+    }
 }
-
-fn secret_path_read(pb: &Pillbox, name: &str) -> PathBuf {
-    secrets_dir_read(pb).join(name)
-}
-
-fn meta_path(pb: &Pillbox, name: &str) -> Result<PathBuf> {
-    Ok(secrets_dir(pb)?.join(format!("{name}.meta.json")))
-}
-
-fn meta_path_read(pb: &Pillbox, name: &str) -> PathBuf {
-    secrets_dir_read(pb).join(format!("{name}.meta.json"))
-}
+impl InheritedRegistry for SecretMetaRegistry {}
 
 /// Read a secret's stored value, walking scopes project → global. Returns
 /// `(value, source_pillbox_name)` so callers can surface where the secret
 /// came from. Returns `None` if neither scope has it.
 pub(crate) fn read_inherited(resolved: &Pillbox, name: &str) -> Result<Option<(String, String)>> {
-    validate_name("secret read", name)?;
-    for pb in resolved.read_chain() {
-        let path = secret_path_read(&pb, name);
-        match fs::read_to_string(&path) {
-            Ok(v) => return Ok(Some((v, pb.display_name().to_string()))),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
-        }
-    }
-    Ok(None)
+    reg::read_inherited::<SecretRegistry>(resolved, name)
 }
 
 /// Read just the value (no source). Used by run-path code that doesn't
@@ -95,10 +106,16 @@ pub(crate) fn read(resolved: &Pillbox, name: &str) -> Result<Option<String>> {
 
 /// Names of every stored secret across both scopes, deduplicated. Project
 /// names shadow global. Sidecar `.meta.json` files are filtered out.
+///
+/// Bypasses `registry::list_merged` because that helper reads each
+/// record's file body (`read_to_string`) up front to construct
+/// `MergedEntry<String>`; `secret list` only prints names + asks the
+/// caller's discretion when meta is needed. We pay one `read_dir` per
+/// scope and zero per-secret reads.
 pub(crate) fn names_merged(resolved: &Pillbox) -> Result<Vec<MergedEntry>> {
     let mut map: BTreeMap<String, MergedEntry> = BTreeMap::new();
     for pb in resolved.read_chain() {
-        let dir = secrets_dir_read(&pb);
+        let dir = SecretRegistry::dir_read(&pb);
         if !dir.exists() {
             continue;
         }
@@ -111,7 +128,7 @@ pub(crate) fn names_merged(resolved: &Pillbox) -> Result<Vec<MergedEntry>> {
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            if fname.ends_with(".meta.json") {
+            if fname.ends_with(META_SUFFIX) {
                 continue;
             }
             map.entry(fname.clone()).or_insert_with(|| MergedEntry {
@@ -132,28 +149,13 @@ pub(crate) struct MergedEntry {
 }
 
 pub(crate) fn read_meta(resolved: &Pillbox, name: &str) -> Result<Option<VaultMeta>> {
-    validate_name("secret read", name)?;
-    for pb in resolved.read_chain() {
-        let path = meta_path_read(&pb, name);
-        let raw = match fs::read_to_string(&path) {
-            Ok(v) => v,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
-        };
-        let meta: VaultMeta = serde_json::from_str(&raw).map_err(|e| {
-            PillboxError::config("secret read", format!("parse {}: {e}", path.display()))
-        })?;
-        return Ok(Some(meta));
-    }
-    Ok(None)
+    Ok(reg::read_inherited::<SecretMetaRegistry>(resolved, name)?.map(|(m, _)| m))
 }
 
 fn write_meta(pb: &Pillbox, name: &str, meta: &VaultMeta) -> Result<()> {
-    validate_name("secret meta", name)?;
-    let path = meta_path(pb, name)?;
     let body = serde_json::to_string_pretty(meta)
         .with_context(|| format!("serialize meta for `{name}`"))?;
-    write_private_file(&path, body.as_bytes())
+    reg::write_record::<SecretMetaRegistry>(pb, name, body.as_bytes())
 }
 
 pub(crate) fn add(
@@ -166,7 +168,7 @@ pub(crate) fn add(
 ) -> Result<()> {
     validate_name("secret add", name)?;
     let target = resolved.write_target(scope);
-    let path = secret_path(&target, name)?;
+    let path = SecretRegistry::path(&target, name)?;
     if if_not_exists && path.exists() {
         return Err(PillboxError::runtime(
             "secret add",
@@ -178,18 +180,13 @@ pub(crate) fn add(
         .into());
     }
     let value = read_value(name, source)?;
-    write_private_file(&path, value.as_bytes())?;
+    reg::write_record::<SecretRegistry>(&target, name, value.as_bytes())?;
     if let Some(meta) = vault_meta.as_ref() {
         write_meta(&target, name, meta)?;
     } else {
-        let m = meta_path(&target, name)?;
-        match fs::remove_file(&m) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(e).with_context(|| format!("remove {}", m.display()));
-            }
-        }
+        // Scrub any pre-existing sidecar so a freshly-added plain
+        // secret can't masquerade as still-vaulted on next read.
+        SecretMetaRegistry::delete(&target, name)?;
     }
     if let Some(meta) = vault_meta {
         println!(
@@ -291,20 +288,11 @@ pub(crate) fn show(
 }
 
 pub(crate) fn rm(resolved: &Pillbox, scope: WriteScope, name: &str) -> Result<()> {
-    validate_name("secret rm", name)?;
     let target = resolved.write_target(scope);
-    let path = secret_path(&target, name)?;
-    let removed = match fs::remove_file(&path) {
-        Ok(()) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(e) => return Err(e).with_context(|| format!("remove {}", path.display())),
-    };
-    let m = meta_path(&target, name)?;
-    match fs::remove_file(&m) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("remove {}", m.display())),
-    }
+    let removed = SecretRegistry::delete(&target, name)?;
+    // Always sweep the sidecar — orphan `.meta.json` files would
+    // otherwise resurface on the next `secret list`.
+    SecretMetaRegistry::delete(&target, name)?;
     if removed {
         println!(
             "pillbox: ✓ secret `{name}` removed from `{}`",
@@ -544,7 +532,7 @@ mod tests {
             assert_eq!(v.as_deref(), Some("g-val"));
 
             // And project alone has no value (would only see it via inheritance).
-            let path = secret_path(&proj, "EXPLICIT_GLOBAL").unwrap();
+            let path = SecretRegistry::path(&proj, "EXPLICIT_GLOBAL").unwrap();
             assert!(!path.exists());
 
             if let Some(c) = saved {
@@ -610,7 +598,7 @@ mod tests {
     fn missing_meta_means_not_vaulted() {
         with_isolated_home("secrets-nometa", || {
             let g = pillbox::global();
-            let dir = secrets_dir(&g).unwrap();
+            let dir = SecretRegistry::dir(&g).unwrap();
             std::fs::write(dir.join("X"), b"x").unwrap();
             assert!(read_meta(&g, "X").unwrap().is_none());
         });

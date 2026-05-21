@@ -228,15 +228,10 @@ pub(crate) struct RunOpts {
     /// inputs (proxy URL, detach flag, etc.) can be added without
     /// expanding the trait's signature.
     pub(crate) remote_name: Option<String>,
-    /// Hidden `--vault-stdin` invocation — true when the remote side of a
-    /// `pillbox run --remote` call should read a [`VaultStdinBlob`] from
-    /// stdin and re-spawn the agent locally with pre-resolved secrets.
-    /// See [`crate::sandbox::remote_ssh`] for the protocol.
-    pub(crate) vault_stdin: bool,
     /// `--detach` — start the remote session and exit. The session is
     /// recorded in the per-pillbox registry and the user reattaches
-    /// with `pillbox session attach <id>`. v0.6 PR 6: e2b:// remotes
-    /// only (ssh:// is hard-errored by the SSH backend).
+    /// with `pillbox session attach <id>`. v0.6: e2b:// remotes only
+    /// (ssh:// is hard-errored by the SSH backend).
     pub(crate) detach: bool,
     /// `--label TEXT` — human label for a detached session, surfaced
     /// in `pillbox session list`. Only meaningful with `--detach`.
@@ -416,7 +411,6 @@ mod tests {
             vault: false,
             args: Vec::new(),
             remote_name: None,
-            vault_stdin: false,
             detach: false,
             label: None,
         }

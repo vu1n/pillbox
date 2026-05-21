@@ -188,11 +188,11 @@ impl RemoteSshSandbox {
 
 impl SandboxBackend for RemoteSshSandbox {
     fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
-        // v0.6 PR 6 ships session list/attach/detach for the E2B
-        // backend only. The SSH path needs tmux-on-the-remote wiring
-        // for persistence — landing in a follow-up. Hard-error now so
-        // a user who tries `--detach` against an ssh:// remote gets a
-        // clear message instead of a half-detached run.
+        // Session list/attach/detach is E2B-only today; the SSH path
+        // needs tmux-on-the-remote wiring for persistence (follow-up).
+        // Hard-error now so a user who tries `--detach` against an
+        // ssh:// remote gets a clear message instead of a half-detached
+        // run.
         if opts.detach {
             return Err(PillboxError::usage(
                 "run --remote --detach",
@@ -201,10 +201,10 @@ impl SandboxBackend for RemoteSshSandbox {
             )
             .into());
         }
-        // Workspace handoff rule: S3-shaped backends only in PR 4. The
-        // remote runs its own pillbox against the SAME `[workspace]`
-        // config — bucket, endpoint, prefix all match, so no data has
-        // to cross SSH. Local-rustic-via-tarball is the PR 4.1 follow-up.
+        // Workspace handoff rule: S3-shaped backends only. The remote
+        // runs its own pillbox against the SAME `[workspace]` config —
+        // bucket, endpoint, prefix all match, so no data has to cross
+        // SSH. Local-rustic-via-tarball is the planned follow-up.
         let meta = resolved.meta.as_ref().ok_or_else(|| {
             PillboxError::usage(
                 "run --remote",
@@ -214,9 +214,9 @@ impl SandboxBackend for RemoteSshSandbox {
         if meta.workspace.backend_kind() != BackendKind::S3 {
             return Err(PillboxError::usage(
                 "run --remote",
-                "remote runs require an S3-shaped workspace backend in v0.6 PR 4 \
+                "remote runs require an S3-shaped workspace backend \
                  (the remote rustic_core needs the same bucket/endpoint). \
-                 Local-rustic via tarball transport is the PR 4.1 follow-up.",
+                 Local-rustic via tarball transport is the planned follow-up.",
             )
             .with_next(
                 "pillbox new --workspace-backend s3 …  # or use a project that already has one",

@@ -167,8 +167,10 @@ only its own sessions; the global pillbox's list shows global ones.
 |---|---|---|
 | Secrets | project + global, project wins on conflict | resolved pillbox (or `--global`) |
 | Env bundles | project + global, project wins on conflict | resolved pillbox (or `--global`) |
+| Remotes | project + global, project wins on conflict | resolved pillbox (or `--global`) |
 | Agent auth | global only | global only |
 | Vault state | per-pillbox | per-pillbox |
+| Sessions | per-pillbox (no inheritance) | resolved pillbox |
 
 From a global pillbox, reads see only global. From a project pillbox,
 reads merge global into project (project wins on overlap).
@@ -362,5 +364,6 @@ v0.5 command shapes that break in v0.6:
 
 ## Pillbox version this guide describes
 
-v0.6 (PR 2 — pillbox-as-bundle reshape). If `pillbox version` reports
-something else, command shapes may differ.
+v0.6 (through PR 6 — pillbox-as-bundle reshape + workspace versioning +
+remote backends + sessions). If `pillbox version` reports something
+else, command shapes may differ.

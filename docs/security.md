@@ -44,14 +44,22 @@ disk encryption for at-rest defense. Pillbox does the same.
 │   │       └── .codex/
 │   │           ├── auth.json
 │   │           └── config.toml
-│   └── vault/                       # 0700 — CA + key for global vault sessions
-└── projects/                        # 0700
-    └── -Users-x-work-myapp/         # 0700 — one per project pillbox
-        ├── meta.json                # 0600 — descriptor mirror
-        ├── secrets/                 # overrides global on key conflict
-        ├── env/
-        ├── auth/                    # reserved (v0.7 per-project override)
-        └── vault/                   # 0700 — CA + key for this pillbox's vault sessions
+│   ├── vault/                       # 0700 — CA + key for vault sessions
+│   ├── remotes/                     # 0700 — registered ssh:// + e2b:// remotes
+│   └── sessions/                    # 0700 — detached-session records (e2b)
+├── projects/                        # 0700
+│   └── -Users-x-work-myapp/         # 0700 — one per project pillbox
+│       ├── meta.json                # 0600 — descriptor mirror (incl. workspace)
+│       ├── secrets/                 # overrides global on key conflict
+│       ├── env/
+│       ├── auth/                    # reserved (v0.7 per-project override)
+│       ├── vault/                   # 0700 — CA + key
+│       ├── remotes/                 # per-pillbox remote overrides
+│       ├── sessions/                # sessions started here
+│       ├── repo-password            # 0600 — rustic encryption password (local-only)
+│       └── repo/                    # local rustic repository (local backend only)
+└── cache/                           # 0700 — versioned helper scripts
+    └── e2b-helper-v0.1.0-alpha.1.mjs   # written by ensure_helper_extracted
 ```
 
 Every directory under `~/.pillbox/` is created via the paths helpers
@@ -105,12 +113,13 @@ Same model for `pillbox env show`.
 
 ## Sandbox isolation in detail
 
-Each `pillbox <agent> run` invocation launches a fresh container with:
+Each `pillbox run` invocation launches a fresh container with:
 
 - `--rm` so it's deleted on exit. No state persists in the container.
-- A clean `/home/lum` populated by bind-mounting `~/.pillbox/data/<agent>/`.
-  The agent only sees its OWN persistent HOME, not the user's real
-  `~/.claude` / `~/.codex`.
+- A clean `/home/lum` populated by bind-mounting the resolved auth
+  pillbox's `auth/<agent>/` directory (e.g.
+  `~/.pillbox/global/auth/claude/`). The agent only sees its OWN
+  persistent HOME, not the user's real `~/.claude` / `~/.codex`.
 - A workspace bind mount at `/workspace/<name>` (defaults to cwd).
 - Env vars composed from `--env BUNDLE` → `--env-file PATH` → `--with
   NAME` only. The host's environment doesn't leak in.
@@ -119,8 +128,71 @@ Each `pillbox <agent> run` invocation launches a fresh container with:
   into `$HOME/.local/bin`.
 
 The login flow is the same shape, except no workspace mount and no
-secret/env injection — it's just `pillbox <agent> login` running the
-agent's OAuth flow in a one-shot container.
+secret/env injection — it's just `pillbox auth login --agent <agent>`
+running the agent's OAuth flow in a one-shot container.
+
+## Remote backends (v0.6 PR 4 / 5 / 6)
+
+`pillbox run --remote NAME` adds two new threat boundaries — the
+local helper subprocess (E2B) or `ssh` client, and the remote
+sandbox itself. The full design is in [remotes.md](./remotes.md);
+the security-relevant pieces:
+
+### What crosses the wire
+
+Real secret values cross the network **once**, at session start, as
+a versioned JSON blob:
+
+- **ssh://** — blob piped over `ssh`'s stdin (encrypted channel) to
+  `pillbox run --vault-stdin` on the remote. Never on disk on
+  either side.
+- **e2b://** — blob staged to a 0600 tempfile locally (atomic
+  `O_EXCL` via `tempfile::Builder`, unlinked on exit), then
+  uploaded into the sandbox's `/tmp` via the E2B Files API and
+  consumed + `rm -f`'d by the in-sandbox `pillbox run
+  --vault-stdin`. The local tempfile path is visible to other local
+  users via `ps -ef`; the file itself is 0600 so they can't read
+  it, but assume the path is leak-prone on a multi-user host.
+
+The blob schema is versioned and forward-compat: unknown JSON keys
+within a known version are tolerated, but a `version` mismatch
+fails the parse loudly so a newer client paired with an older
+remote can't silently drop required fields. `Debug` is implemented
+by hand on `VaultStdinBlob` and `InlineSecret` so a stray `dbg!` /
+`tracing::debug!(?blob)` never prints secret values.
+
+### Helper subprocess (E2B)
+
+There's no usable Rust SDK for E2B today, so pillbox embeds a small
+Node helper (`src/sandbox/e2b-helper.mjs`) and spawns it as a
+subprocess. Risks + mitigations:
+
+| Risk | Mitigation |
+|---|---|
+| Stale cached helper from an older pillbox accepted by a newer one | Helper emits `{type:"sandbox-up", protoVersion}` on stderr first; Rust verifies against `HELPER_PROTO_VERSION` and refuses to proceed on mismatch with a `rm ~/.pillbox/cache/e2b-helper-*` hint. |
+| ANSI escape injection from helper SDK errors / unknown event types | Every untrusted helper-stderr passthrough runs through `sanitize_terminal_line` (ESC / BEL / C0 → caret notation) before the user's terminal sees it. |
+| `serde_json` parser leak of stdin bytes on malformed blob | `VaultStdinBlob::from_bytes` maps any parse error to a fixed `"invalid JSON blob on stdin"` string. |
+| Helper trust | We bundle the helper into the pillbox binary via `include_str!` — auditable in-tree; `npm i -g e2b` brings in the JS SDK from npm under the user's standard Node trust boundary. |
+
+### Sessions (detach + reattach)
+
+`pillbox session detach <id>` SIGTERMs the `attached_pid` recorded
+in the session TOML. The recorded pid is validated before
+signalling:
+
+- Refused if `pid <= 1` (init / reserved).
+- Refused if it equals the calling process's own pid.
+- A `kill(pid, 0)` liveness probe runs first — on `ESRCH` (no such
+  process), the stale `attached_pid` stamp is cleared and the
+  command exits successfully without sending SIGTERM. This
+  defeats pid-reuse against a session whose previous attacher
+  crashed.
+
+Session records themselves contain only opaque resource handles
+(sandbox ids, pids) — no credentials, no secrets. The threat from
+exposure of a session record is "can co-tenant on the host hijack
+the session?" — they'd need the E2B API key, which is not in the
+record.
 
 ## Threat model honesty
 
@@ -146,6 +218,5 @@ can't make for you.
 
 ## Reporting issues
 
-Found a real escape, perms bug, or credential leak? Open an issue at
-https://github.com/vu1n/pillbox. A dedicated `SECURITY.md` with a
-private reporting channel will ship before pillbox leaves pre-alpha.
+See [../SECURITY.md](../SECURITY.md) at the repo root for the
+disclosure policy and reporting channels.

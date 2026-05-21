@@ -107,7 +107,9 @@ pillbox run --mount ~/.aws:/home/lum/.aws:ro
 # Sibling repo at /workspace/sibling (in addition to cwd)
 pillbox run --mount ~/work/sibling-repo:/workspace/sibling
 
-# SSH agent socket (Linux)
+# SSH agent socket (Linux). Stash the var name first; pillbox looks
+# it up at run time so the recipe stays sandbox-safe.
+pillbox secret add SSH_AUTH_SOCK --from-env SSH_AUTH_SOCK
 pillbox run --mount $SSH_AUTH_SOCK:/ssh-agent --with SSH_AUTH_SOCK=SSH_AUTH_SOCK
 ```
 
@@ -159,6 +161,103 @@ pillbox doctor --json | jq '.overall_ok'
 Every `--json` payload includes a top-level `version: 1`. Pin against
 that — fields will be added freely, the version bumps on restructure.
 
+## Running on a registered VPS over SSH
+
+```sh
+# One-time: install pillbox on the VPS (we don't deploy binaries).
+ssh deploy@vps.example.com 'cargo install --git https://github.com/vu1n/pillbox'
+
+# Register it locally.
+pillbox remote add prod-vps ssh://deploy@vps.example.com
+
+# A remote run needs an S3-shaped workspace backend; the VPS pulls
+# from the same bucket, so no workspace bytes cross SSH.
+pillbox new --workspace-backend s3 \
+  --bucket my-snapshots --endpoint https://acct.r2.cloudflarestorage.com \
+  --access-key-env R2_ACCESS_KEY --secret-key-env R2_SECRET_KEY
+
+pillbox run --remote prod-vps
+```
+
+Real secret values cross the network once over the SSH-encrypted
+channel, into the remote pillbox's vault session memory. Nothing is
+written to disk on the remote.
+
+## Running on an E2B managed sandbox
+
+```sh
+# Prereqs (one-time, local machine):
+brew install node               # or use your OS package manager
+npm i -g e2b                    # the JS SDK; pillbox spawns it via Node
+export E2B_API_KEY="e2b_…"      # or pillbox secret add E2B_API_KEY
+
+# Register the template (you've baked pillbox into the image yourself).
+pillbox remote add prod-cloud e2b://my-pillbox-template
+
+pillbox run --remote prod-cloud
+```
+
+The first remote run extracts the embedded Node helper to
+`~/.pillbox/cache/e2b-helper-v<pkg>.mjs` (0700) and uses it for
+subsequent runs. `pillbox version` upgrades replace the cached
+helper automatically — older versioned files sit on disk until you
+`rm ~/.pillbox/cache/e2b-helper-*`.
+
+## Detached background session + reattach
+
+```sh
+# Start, immediately return — agent keeps running in the background.
+pillbox run --remote prod-cloud --detach --label "nightly-refactor"
+# pillbox: ✓ session `abc123def456` started in background (sandbox `sb_xxx`).
+#          pillbox session attach abc123def456  # reattach
+
+# Browse:
+pillbox session list                       # human
+pillbox session list --json                # machine
+
+# Reattach. Ctrl-A D detaches again without killing.
+pillbox session attach abc123def456
+
+# Detach from another shell (no need to be the attached terminal).
+pillbox session detach abc123def456
+
+# Tear down for good (kills the sandbox + removes the record).
+pillbox session rm abc123def456
+```
+
+Ids accept any unique prefix ≥ 4 chars (`pillbox session attach
+abc1` works if there's only one match). Ambiguous prefixes list the
+candidates in the error.
+
+## Snapshot / restore the workspace
+
+Every project pillbox owns one rustic repository (encrypted,
+content-addressed). Snapshots are cheap; the encryption password
+lives at `<state_dir>/repo-password` (0600, local-only) so a stolen
+S3 bucket alone can't be decrypted.
+
+```sh
+# Snapshot cwd into the repo (rustic dedupes against prior snapshots).
+pillbox push --tag "before-refactor" --message "experiment in scope"
+
+# List what's in the repo.
+pillbox snapshot list
+
+# Restore — defaults to the latest snapshot.
+pillbox pull
+
+# Restore a specific snapshot by handle prefix.
+pillbox pull --snapshot abcd
+
+# Rotate the encryption password (old key still works until upstream
+# lands deletion — treat as compromised).
+pillbox workspace rekey
+```
+
+For an S3-backed pillbox the snapshots land in your bucket; for a
+local-backed pillbox they land at `<state_dir>/repo/`. Either way,
+the encryption password stays on the host.
+
 ## Forgetting an agent
 
 ```sh
@@ -193,11 +292,15 @@ pillbox auth list --json                             # 2. anyone authenticated?
 
 pillbox secret list --json                           # 3. what secrets exist?
 pillbox env list --json                              # 4. what bundles exist?
+pillbox remote list --json                           # 5. any registered remotes?
+pillbox session list --json                          # 6. any detached sessions?
 ```
 
-From there, build the right `pillbox run` invocation. If a
-needed secret/bundle isn't present, ask the user for the value (or
-where to source it from) rather than guessing.
+From there, build the right `pillbox run` invocation. If a needed
+secret / bundle isn't present, ask the user for the value (or where
+to source it from) rather than guessing. A non-empty
+`pillbox session list` is a signal that something is already
+running in the background — surface it before launching another.
 
 ## What NOT to do
 

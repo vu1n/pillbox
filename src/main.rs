@@ -171,7 +171,7 @@ enum Command {
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
     },
-    /// Manage SSH-reachable remote VPSes for `pillbox run --remote NAME`.
+    /// Manage remotes (SSH VPSes + E2B sandboxes) for `pillbox run --remote NAME`.
     Remote {
         #[command(subcommand)]
         action: RemoteAction,

@@ -23,24 +23,22 @@
 //!
 //! ## URL shapes
 //!
-//! - `ssh://user@host[:port]` → VPS over openssh (PR 4).
-//! - `e2b://TEMPLATE_ID`      → E2B managed sandbox (PR 5).
+//! - `ssh://user@host[:port]` → VPS over openssh.
+//! - `e2b://TEMPLATE_ID`      → E2B managed sandbox.
 //!
 //! [`parse_remote_url`] is the single dispatch point; the on-disk shape
 //! never grew a `kind` field — keeping `url` as the discriminator means
 //! a hand-edited remote tells you what it is at a glance.
 
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::errors::PillboxError;
-use crate::paths::{validate_name, write_private_file};
-use crate::pillbox::{Pillbox, Scope, WriteScope};
+use crate::paths::validate_name;
+use crate::pillbox::{Pillbox, WriteScope};
+use crate::registry::{self as reg, InheritedRegistry, Registry};
 
 /// Subdirectory under a pillbox's state dir that holds remote-registry
 /// TOML files. One file per remote — easy to grep, easy to `rm`.
@@ -206,46 +204,41 @@ pub(crate) fn parse_ssh_url(url: &str) -> Result<SshUrl, String> {
     })
 }
 
-/// Write-side: ensure `<pillbox>/remotes/` exists at 0700, return its
-/// path. Mirrors `secrets::secrets_dir` so the perms invariant lives in
-/// one place (`Pillbox::subdir`).
-fn remotes_dir(pb: &Pillbox) -> Result<PathBuf> {
-    pb.subdir(REMOTES_DIR)
+/// Registry plumbing for remotes — TOML on disk, project→global
+/// inheritance. URL re-validation lives in [`Self::parse`] so a
+/// malformed `url =` on disk surfaces at read time, not connect time.
+struct RemoteRegistry;
+impl Registry for RemoteRegistry {
+    type Record = Remote;
+    const SUBDIR: &'static str = REMOTES_DIR;
+    fn read_action() -> &'static str {
+        "remote lookup"
+    }
+    fn filename(name: &str) -> String {
+        format!("{name}.toml")
+    }
+    fn parse(raw: &str, source: &Path) -> Result<Self::Record> {
+        let r: Remote = toml::from_str(raw).map_err(|e| {
+            PillboxError::config("remote read", format!("{}: {e}", source.display()))
+        })?;
+        // Belt-and-suspenders: a TOML file written by an older /
+        // hand-edited pillbox without a valid URL should fail at load
+        // time, not at connect time. parse_remote_url's diagnostic is
+        // more actionable than "could not connect" / "template not found".
+        parse_remote_url(&r.url).map_err(|e| {
+            PillboxError::config("remote read", format!("{}: {e}", source.display()))
+        })?;
+        Ok(r)
+    }
 }
-
-/// Read-side: just join the path. Read code paths walk the scope chain
-/// and may encounter pillboxes with no remotes/ dir yet — paying a
-/// `create_dir_all` per lookup would be wasteful.
-fn remotes_dir_read(pb: &Pillbox) -> PathBuf {
-    pb.subdir_path(REMOTES_DIR)
-}
-
-fn remote_path(pb: &Pillbox, name: &str) -> Result<PathBuf> {
-    Ok(remotes_dir(pb)?.join(format!("{name}.toml")))
-}
-
-fn remote_path_read(pb: &Pillbox, name: &str) -> PathBuf {
-    remotes_dir_read(pb).join(format!("{name}.toml"))
-}
+impl InheritedRegistry for RemoteRegistry {}
 
 /// Look up a remote by name. Walks project → global so a remote
 /// registered globally is visible from every project pillbox, but a
 /// project may shadow a global remote of the same name with its own.
 /// Returns `(remote, source_pillbox_name)`.
 pub(crate) fn read_inherited(resolved: &Pillbox, name: &str) -> Result<Option<(Remote, String)>> {
-    validate_name("remote lookup", name)?;
-    for pb in resolved.read_chain() {
-        let path = remote_path_read(&pb, name);
-        match fs::read_to_string(&path) {
-            Ok(raw) => {
-                let remote = parse_remote(&raw, &path)?;
-                return Ok(Some((remote, pb.display_name().to_string())));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
-        }
-    }
-    Ok(None)
+    reg::read_inherited::<RemoteRegistry>(resolved, name)
 }
 
 /// Same as [`read_inherited`] but only returns the [`Remote`].
@@ -254,68 +247,12 @@ pub(crate) fn read(resolved: &Pillbox, name: &str) -> Result<Option<Remote>> {
 }
 
 /// One remote, with the scope it came from. Used by `pillbox remote list`.
-#[derive(Debug, Clone)]
-pub(crate) struct MergedRemote {
-    pub(crate) remote: Remote,
-    pub(crate) scope: String,
-    pub(crate) from_project: bool,
-}
+pub(crate) type MergedRemote = reg::MergedEntry<Remote>;
 
 /// All remotes visible from `resolved`, deduplicated. Project entries
 /// shadow global ones of the same name.
 pub(crate) fn list_merged(resolved: &Pillbox) -> Result<Vec<MergedRemote>> {
-    use std::collections::BTreeMap;
-    let mut map: BTreeMap<String, MergedRemote> = BTreeMap::new();
-    for pb in resolved.read_chain() {
-        let dir = remotes_dir_read(&pb);
-        if !dir.exists() {
-            continue;
-        }
-        let from_project = matches!(pb.scope, Scope::Project { .. });
-        for entry in fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
-            let entry = entry?;
-            if !entry.file_type()?.is_file() {
-                continue;
-            }
-            let fname = match entry.file_name().into_string() {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            let name = match fname.strip_suffix(".toml") {
-                Some(s) => s.to_string(),
-                None => continue,
-            };
-            // Already populated from an earlier (project) scope —
-            // global is the fallback, so don't clobber.
-            if map.contains_key(&name) {
-                continue;
-            }
-            let raw = fs::read_to_string(entry.path())
-                .with_context(|| format!("read {}", entry.path().display()))?;
-            let remote = parse_remote(&raw, &entry.path())?;
-            map.insert(
-                name.clone(),
-                MergedRemote {
-                    remote,
-                    scope: pb.display_name().to_string(),
-                    from_project,
-                },
-            );
-        }
-    }
-    Ok(map.into_values().collect())
-}
-
-fn parse_remote(raw: &str, source: &Path) -> Result<Remote> {
-    let r: Remote = toml::from_str(raw)
-        .map_err(|e| PillboxError::config("remote read", format!("{}: {e}", source.display())))?;
-    // Belt-and-suspenders: a TOML file written by an older / hand-edited
-    // pillbox without a valid URL should fail at load time, not at
-    // connect time. parse_remote_url's diagnostic is more actionable than
-    // "could not connect" / "template not found".
-    parse_remote_url(&r.url)
-        .map_err(|e| PillboxError::config("remote read", format!("{}: {e}", source.display())))?;
-    Ok(r)
+    reg::list_merged::<RemoteRegistry>(resolved)
 }
 
 /// `pillbox remote add NAME --url ssh://user@host`.
@@ -333,8 +270,7 @@ pub(crate) fn add(
         crate::agents::lookup("remote add", agent)?;
     }
     let target = resolved.write_target(scope);
-    let path = remote_path(&target, name)?;
-    if if_not_exists && path.exists() {
+    if if_not_exists && RemoteRegistry::path(&target, name)?.exists() {
         return Err(PillboxError::runtime(
             "remote add",
             format!(
@@ -351,7 +287,7 @@ pub(crate) fn add(
         default_agent,
     };
     let body = render_toml(&remote);
-    write_private_file(&path, body.as_bytes())?;
+    reg::write_record::<RemoteRegistry>(&target, name, body.as_bytes())?;
     println!(
         "pillbox: ✓ remote `{name}` -> {url} (stored in `{}`)",
         target.display_name()
@@ -361,26 +297,18 @@ pub(crate) fn add(
 
 /// `pillbox remote rm NAME`.
 pub(crate) fn rm(resolved: &Pillbox, scope: WriteScope, name: &str) -> Result<()> {
-    validate_name("remote rm", name)?;
     let target = resolved.write_target(scope);
-    let path = remote_path(&target, name)?;
-    match fs::remove_file(&path) {
-        Ok(()) => {
-            println!(
-                "pillbox: ✓ remote `{name}` removed from `{}`",
-                target.display_name()
-            );
-            Ok(())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            println!(
-                "(no remote named `{name}` was stored in `{}`)",
-                target.display_name()
-            );
-            Ok(())
-        }
-        Err(e) => Err(e).with_context(|| format!("remove {}", path.display())),
+    match RemoteRegistry::delete(&target, name)? {
+        true => println!(
+            "pillbox: ✓ remote `{name}` removed from `{}`",
+            target.display_name()
+        ),
+        false => println!(
+            "(no remote named `{name}` was stored in `{}`)",
+            target.display_name()
+        ),
     }
+    Ok(())
 }
 
 /// `pillbox remote list`.
@@ -409,14 +337,14 @@ pub(crate) fn list(resolved: &Pillbox, json: bool) -> Result<()> {
             "global"
         };
         let agent = entry
-            .remote
+            .record
             .default_agent
             .as_deref()
             .map(|a| format!(" agent={a}"))
             .unwrap_or_default();
         println!(
             "  {:<20}  [{scope_tag}]  {}{}",
-            entry.remote.name, entry.remote.url, agent,
+            entry.record.name, entry.record.url, agent,
         );
     }
     Ok(())
@@ -464,14 +392,14 @@ fn build_list_json(resolved: &Pillbox, entries: &[MergedRemote]) -> String {
             let mut o = serde_json::Map::new();
             o.insert(
                 "name".into(),
-                serde_json::Value::String(e.remote.name.clone()),
+                serde_json::Value::String(e.record.name.clone()),
             );
             o.insert(
                 "url".into(),
-                serde_json::Value::String(e.remote.url.clone()),
+                serde_json::Value::String(e.record.url.clone()),
             );
             o.insert("scope".into(), serde_json::Value::String(e.scope.clone()));
-            if let Some(a) = e.remote.default_agent.as_deref() {
+            if let Some(a) = e.record.default_agent.as_deref() {
                 o.insert(
                     "default_agent".into(),
                     serde_json::Value::String(a.to_string()),
@@ -809,13 +737,13 @@ mod tests {
             .unwrap();
 
             let entries = list_merged(&proj).unwrap();
-            let g_only = entries.iter().find(|e| e.remote.name == "g_only").unwrap();
-            let p_only = entries.iter().find(|e| e.remote.name == "p_only").unwrap();
-            let both = entries.iter().find(|e| e.remote.name == "both").unwrap();
+            let g_only = entries.iter().find(|e| e.record.name == "g_only").unwrap();
+            let p_only = entries.iter().find(|e| e.record.name == "p_only").unwrap();
+            let both = entries.iter().find(|e| e.record.name == "both").unwrap();
             assert!(!g_only.from_project);
             assert!(p_only.from_project);
             assert!(both.from_project, "project should shadow global");
-            assert_eq!(both.remote.url, "ssh://a@p-both");
+            assert_eq!(both.record.url, "ssh://a@p-both");
 
             if let Some(c) = saved {
                 let _ = std::env::set_current_dir(c);
@@ -860,7 +788,7 @@ mod tests {
             .unwrap();
             let g = pillbox::global();
             // Project alone has no remote.
-            let local_path = remote_path(&proj, "explicit").unwrap();
+            let local_path = RemoteRegistry::path(&proj, "explicit").unwrap();
             assert!(!local_path.exists());
             // Global has it.
             assert!(read(&g, "explicit").unwrap().is_some());
@@ -875,8 +803,8 @@ mod tests {
     fn corrupt_toml_surfaces_config_error() {
         with_isolated_home("remote-corrupt", || {
             let g = pillbox::global();
-            let dir = remotes_dir(&g).unwrap();
-            fs::write(dir.join("bad.toml"), b"not valid toml = !!!").unwrap();
+            let dir = RemoteRegistry::dir(&g).unwrap();
+            std::fs::write(dir.join("bad.toml"), b"not valid toml = !!!").unwrap();
             let err = read(&g, "bad").unwrap_err();
             assert!(format!("{err}").contains("remote read"));
         });

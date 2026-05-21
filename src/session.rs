@@ -13,12 +13,12 @@
 //! a project pillbox would mislead the user about which workspace is
 //! mounted in the running sandbox.
 //!
-//! ## Backend coverage (v0.6 PR 6)
+//! ## Backend coverage
 //!
 //! Only `e2b` backed sessions exist today — E2B's `sandbox.pty.connect`
 //! gives us a clean reattach primitive. SSH-backed sessions error
 //! loudly on `--detach` / `session attach`; the tmux-based path lands
-//! in a follow-up PR.
+//! in a follow-up.
 //!
 //! ## Threat model
 //!
@@ -50,15 +50,15 @@
 //! will only signal whichever pid landed last. Detect by reading the
 //! file after attach if you need certainty.
 
-use std::{fs, path::PathBuf};
+use std::{fs, path::Path};
 
 use anyhow::{Context, Result};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 use crate::errors::PillboxError;
-use crate::paths::{validate_name, write_private_file};
 use crate::pillbox::Pillbox;
+use crate::registry::{self as reg, Registry};
 
 /// Subdirectory under a pillbox's state dir holding session records.
 /// Mirrors `remotes/` and `secrets/` — one file per record, easy to
@@ -66,13 +66,53 @@ use crate::pillbox::Pillbox;
 /// callers go through `list` / `read` / `write` / `delete`.
 const SESSIONS_DIR: &str = "sessions";
 
+/// Registry plumbing for sessions. No-inheritance — a session is
+/// concrete runtime state tied to the pillbox that started it, so we
+/// implement [`Registry`] but not `InheritedRegistry`.
+struct SessionRegistry;
+impl Registry for SessionRegistry {
+    type Record = Session;
+    const SUBDIR: &'static str = SESSIONS_DIR;
+    fn read_action() -> &'static str {
+        "session read"
+    }
+    fn filename(name: &str) -> String {
+        format!("{name}.toml")
+    }
+    fn parse(raw: &str, source: &Path) -> Result<Self::Record> {
+        toml::from_str(raw).map_err(|e| {
+            PillboxError::config("session read", format!("{}: {e}", source.display())).into()
+        })
+    }
+}
+
 /// Backend label written into the session record. Kept as a string
 /// (not an enum) on disk so a future binary that adds a backend can
-/// still read older sessions. `session_attach` / `session_rm` in
-/// `main.rs` are the dispatch points; backend-specific guards live in
-/// the matching `sandbox::*` module.
+/// still read older sessions. Dispatch goes through [`Backend::parse`]
+/// so callers can match on a typed enum without resurrecting the
+/// stringly path each time.
 pub(crate) const BACKEND_E2B: &str = "e2b";
 pub(crate) const BACKEND_SSH: &str = "ssh";
+
+/// Typed view of the on-disk `backend` string. Returned by
+/// [`Backend::parse`]; `None` means a backend label this binary doesn't
+/// know about (older or hand-edited record). Callers report the raw
+/// label in the error so the user can grep for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Backend {
+    E2b,
+    Ssh,
+}
+
+impl Backend {
+    pub(crate) fn parse(label: &str) -> Option<Self> {
+        match label {
+            BACKEND_E2B => Some(Backend::E2b),
+            BACKEND_SSH => Some(Backend::Ssh),
+            _ => None,
+        }
+    }
+}
 
 /// On-disk shape. Forward-compatible: serde will ignore unknown fields
 /// so a future binary writing extra metadata (e.g. a "last seen"
@@ -151,47 +191,18 @@ impl Session {
     }
 }
 
-fn sessions_dir(pb: &Pillbox) -> Result<PathBuf> {
-    pb.subdir(SESSIONS_DIR)
-}
-
-fn sessions_dir_read(pb: &Pillbox) -> PathBuf {
-    pb.subdir_path(SESSIONS_DIR)
-}
-
-fn session_path(pb: &Pillbox, id: &str) -> Result<PathBuf> {
-    Ok(sessions_dir(pb)?.join(format!("{id}.toml")))
-}
-
-fn session_path_read(pb: &Pillbox, id: &str) -> PathBuf {
-    sessions_dir_read(pb).join(format!("{id}.toml"))
-}
-
 /// Persist a session record. Used by both detached-start (writes the
 /// initial record) and attach (updates `attached_pid`).
 pub(crate) fn write(pb: &Pillbox, session: &Session) -> Result<()> {
-    validate_name("session write", &session.id)?;
-    let path = session_path(pb, &session.id)?;
     let body = toml::to_string(session)
         .map_err(|e| PillboxError::config("session write", e.to_string()))?;
-    write_private_file(&path, body.as_bytes())
+    reg::write_record::<SessionRegistry>(pb, &session.id, body.as_bytes())
 }
 
 /// Read by exact id. Returns `Ok(None)` for missing records (callers
 /// usually want `resolve` instead, which accepts prefixes).
 pub(crate) fn read(pb: &Pillbox, id: &str) -> Result<Option<Session>> {
-    validate_name("session read", id)?;
-    let path = session_path_read(pb, id);
-    match fs::read_to_string(&path) {
-        Ok(raw) => {
-            let s: Session = toml::from_str(&raw).map_err(|e| {
-                PillboxError::config("session read", format!("{}: {e}", path.display()))
-            })?;
-            Ok(Some(s))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
-    }
+    SessionRegistry::read_one(pb, id)
 }
 
 /// Resolve a user-typed id that may be a unique prefix (>=4 chars).
@@ -247,8 +258,12 @@ pub(crate) fn resolve(pb: &Pillbox, id_or_prefix: &str) -> Result<Session> {
 
 /// All sessions in the current pillbox, sorted by `started_at` (oldest
 /// first so `session list` is stable across re-runs).
+///
+/// Sessions are no-inheritance — single-scope only — so we walk this
+/// pillbox's `sessions/` directly rather than going through
+/// `registry::list_merged`.
 pub(crate) fn list(pb: &Pillbox) -> Result<Vec<Session>> {
-    let dir = sessions_dir_read(pb);
+    let dir = SessionRegistry::dir_read(pb);
     if !dir.exists() {
         return Ok(Vec::new());
     }
@@ -267,10 +282,7 @@ pub(crate) fn list(pb: &Pillbox) -> Result<Vec<Session>> {
             continue;
         }
         let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        let s: Session = toml::from_str(&raw).map_err(|e| {
-            PillboxError::config("session list", format!("{}: {e}", path.display()))
-        })?;
-        out.push(s);
+        out.push(SessionRegistry::parse(&raw, &path)?);
     }
     out.sort_by(|a, b| a.started_at.cmp(&b.started_at));
     Ok(out)
@@ -280,13 +292,7 @@ pub(crate) fn list(pb: &Pillbox) -> Result<Vec<Session>> {
 /// caller is expected to have already torn down the backend resources
 /// (sandbox kill, etc.) before scrubbing the record.
 pub(crate) fn delete(pb: &Pillbox, id: &str) -> Result<()> {
-    validate_name("session rm", id)?;
-    let path = session_path(pb, id)?;
-    match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e).with_context(|| format!("remove {}", path.display())),
-    }
+    SessionRegistry::delete(pb, id).map(|_| ())
 }
 
 /// Stamp the currently-running pillbox's PID into the session record.
@@ -302,11 +308,19 @@ pub(crate) fn mark_attached(pb: &Pillbox, id: &str, pid: i64) -> Result<()> {
 /// Clear the attached-pid stamp. Called on clean exit (Ctrl-A+D, peer
 /// closure, sandbox death). Failing to clear is non-fatal — the next
 /// `attach` will overwrite it.
+///
+/// No-op (no write) when the record is already detached — `reattach`'s
+/// cleanup fires this on every exit path, so the common case after a
+/// clean detach is "already None on disk; skip the write". Avoids
+/// touching the file on every helper exit just to set the same value.
 pub(crate) fn mark_detached(pb: &Pillbox, id: &str) -> Result<()> {
     let mut s = match read(pb, id)? {
         Some(s) => s,
         None => return Ok(()),
     };
+    if s.attached_pid.is_none() {
+        return Ok(());
+    }
     s.attached_pid = None;
     write(pb, &s)
 }
@@ -446,6 +460,26 @@ mod tests {
             delete(&g, &s.id).unwrap();
             assert!(read(&g, &s.id).unwrap().is_none());
             delete(&g, &s.id).unwrap();
+        });
+    }
+
+    #[test]
+    fn mark_detached_is_no_op_when_already_detached() {
+        // `reattach`'s cleanup fires `mark_detached` on every exit path,
+        // including the common case where the local pump has already
+        // cleared the stamp. Re-writing the TOML to set the same
+        // `attached_pid = None` is wasted work; pin the optimization
+        // in place by checking mtime stability.
+        with_isolated_home("session-detach-noop", || {
+            let g = pillbox::global();
+            let s = make("r", BACKEND_E2B);
+            write(&g, &s).unwrap();
+            let path = SessionRegistry::path_read(&g, &s.id);
+            let mtime_a = fs::metadata(&path).unwrap().modified().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            mark_detached(&g, &s.id).unwrap();
+            let mtime_b = fs::metadata(&path).unwrap().modified().unwrap();
+            assert_eq!(mtime_a, mtime_b, "mark_detached re-wrote a no-op");
         });
     }
 

@@ -10,39 +10,38 @@
 //! values. No interpolation, no command substitution, no multi-line. Same
 //! grammar as v0.5.
 
-use std::{
-    collections::BTreeMap,
-    fs,
-    io::Write,
-    os::unix::fs::OpenOptionsExt,
-    path::{Path, PathBuf},
-};
+use std::{collections::BTreeMap, fs, path::Path};
 
 use anyhow::{Context, Result};
 
 use crate::errors::PillboxError;
 use crate::paths::validate_name;
 use crate::pillbox::{Pillbox, Scope, WriteScope};
+use crate::registry::{self as reg, InheritedRegistry, Registry};
 
-/// Write-side: creates `<pillbox>/env/` if absent and pins 0700.
-fn env_dir(pb: &Pillbox) -> Result<PathBuf> {
-    pb.subdir("env")
+/// Registry plumbing for env bundles. Records are raw file bodies
+/// (a `String`); the `parse_dotenv` KV decode happens at the call
+/// site because some callers (run-time injection) want the parsed
+/// map while `show` / `list` are happy with the raw text.
+struct EnvRegistry;
+impl Registry for EnvRegistry {
+    type Record = String;
+    const SUBDIR: &'static str = "env";
+    fn read_action() -> &'static str {
+        "env show"
+    }
+    fn filename(name: &str) -> String {
+        // Raw name on disk — env bundles don't append an extension so
+        // a user can `cat <name>` directly. Anything that lands in
+        // `env/` is assumed to be a bundle; no sidecar files like
+        // secrets has.
+        name.to_string()
+    }
+    fn parse(raw: &str, _source: &Path) -> Result<Self::Record> {
+        Ok(raw.to_string())
+    }
 }
-
-/// Read-side: skip the `mkdir`/`chmod`. Bundle reads happen N times per
-/// `pillbox run` (once per `--env BUNDLE`) across two scopes; the dir-touch
-/// overhead is wasted work on the steady-state happy path.
-fn env_dir_read(pb: &Pillbox) -> PathBuf {
-    pb.subdir_path("env")
-}
-
-fn bundle_path(pb: &Pillbox, name: &str) -> Result<PathBuf> {
-    Ok(env_dir(pb)?.join(name))
-}
-
-fn bundle_path_read(pb: &Pillbox, name: &str) -> PathBuf {
-    env_dir_read(pb).join(name)
-}
+impl InheritedRegistry for EnvRegistry {}
 
 /// Read a bundle's parsed key/value pairs, walking project → global.
 /// Returns the first scope that has the bundle. Bundles are atomic — we
@@ -50,11 +49,13 @@ fn bundle_path_read(pb: &Pillbox, name: &str) -> PathBuf {
 pub(crate) fn read(resolved: &Pillbox, name: &str) -> Result<Option<BTreeMap<String, String>>> {
     validate_name("env show", name)?;
     for pb in resolved.read_chain() {
-        let path = bundle_path_read(&pb, name);
+        let path = EnvRegistry::path_read(&pb, name);
         let content = match fs::read_to_string(&path) {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+            Err(e) => {
+                return Err(e).with_context(|| format!("read {}", path.display()));
+            }
         };
         return parse_dotenv(&content, &path.display().to_string()).map(Some);
     }
@@ -68,10 +69,14 @@ pub(crate) struct MergedBundle {
     pub(crate) from_project: bool,
 }
 
+/// Just the filenames + scope tags — `list` only needs to know which
+/// bundles exist. Skips `registry::list_merged` because that reads
+/// every record's file body up-front; `pillbox env list` only prints
+/// names + counts (and re-reads on demand via `read()`).
 pub(crate) fn names_merged(resolved: &Pillbox) -> Result<Vec<MergedBundle>> {
     let mut map: BTreeMap<String, MergedBundle> = BTreeMap::new();
     for pb in resolved.read_chain() {
-        let dir = env_dir_read(&pb);
+        let dir = EnvRegistry::dir_read(&pb);
         if !dir.exists() {
             continue;
         }
@@ -103,7 +108,7 @@ pub(crate) fn load(
 ) -> Result<()> {
     validate_name("env load", name)?;
     let target = resolved.write_target(scope);
-    let dest = bundle_path(&target, name)?;
+    let dest = EnvRegistry::path(&target, name)?;
     if if_not_exists && dest.exists() {
         return Err(PillboxError::runtime(
             "env load",
@@ -124,7 +129,7 @@ pub(crate) fn load(
         )
     })?;
     let parsed = parse_dotenv(&content, &source_path.display().to_string())?;
-    write_bundle_file(&dest, &content)?;
+    reg::write_record::<EnvRegistry>(&target, name, content.as_bytes())?;
     println!(
         "pillbox: ✓ env bundle `{name}` stored in `{}` ({} variables) at {}",
         target.display_name(),
@@ -197,26 +202,18 @@ pub(crate) fn show(
 }
 
 pub(crate) fn rm(resolved: &Pillbox, scope: WriteScope, name: &str) -> Result<()> {
-    validate_name("env rm", name)?;
     let target = resolved.write_target(scope);
-    let path = bundle_path(&target, name)?;
-    match fs::remove_file(&path) {
-        Ok(()) => {
-            println!(
-                "pillbox: ✓ env bundle `{name}` removed from `{}`",
-                target.display_name()
-            );
-            Ok(())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            println!(
-                "(no env bundle named `{name}` was stored in `{}`)",
-                target.display_name()
-            );
-            Ok(())
-        }
-        Err(e) => Err(e).with_context(|| format!("remove {}", path.display())),
+    match EnvRegistry::delete(&target, name)? {
+        true => println!(
+            "pillbox: ✓ env bundle `{name}` removed from `{}`",
+            target.display_name()
+        ),
+        false => println!(
+            "(no env bundle named `{name}` was stored in `{}`)",
+            target.display_name()
+        ),
     }
+    Ok(())
 }
 
 // ── .env parsing ────────────────────────────────────────────────────────
@@ -274,19 +271,6 @@ fn unquote(raw: &str) -> String {
         }
     }
     trimmed.to_string()
-}
-
-fn write_bundle_file(path: &Path, content: &str) -> Result<()> {
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .with_context(|| format!("open {} for write", path.display()))?;
-    file.write_all(content.as_bytes())
-        .with_context(|| format!("write to {}", path.display()))?;
-    Ok(())
 }
 
 fn mask(value: &str) -> String {

@@ -52,7 +52,7 @@ use crate::errors::PillboxError;
 use crate::paths::{ensure_mode_0700, pillbox_root};
 use crate::pillbox::Pillbox;
 use crate::remote::{E2bRef, Remote, RemoteUrl};
-use crate::session::{self, Session, BACKEND_E2B};
+use crate::session::{self, Backend, Session, BACKEND_E2B};
 
 /// Embedded helper script — bundled into the binary so users don't have
 /// to manage two files in lockstep. The cache path embeds
@@ -104,9 +104,9 @@ impl SandboxBackend for RemoteE2bSandbox {
         if meta.workspace.backend_kind() != BackendKind::S3 {
             return Err(PillboxError::usage(
                 "run --remote (e2b)",
-                "remote runs require an S3-shaped workspace backend in v0.6 \
+                "remote runs require an S3-shaped workspace backend \
                  (the E2B sandbox needs the same bucket/endpoint to restore from). \
-                 Local-rustic via tarball transport is the PR 4.1 follow-up.",
+                 Local-rustic via tarball transport is the planned follow-up.",
             )
             .with_next("pillbox new --workspace-backend s3 …")
             .into());
@@ -269,7 +269,7 @@ fn run_attach(
 /// in `reattach` mode, marks the session as attached for the duration,
 /// and clears the mark on exit (clean detach, Ctrl-A D, or peer death).
 pub(crate) fn reattach(resolved: &Pillbox, remote: &Remote, session: &Session) -> Result<()> {
-    if session.backend != BACKEND_E2B {
+    if Backend::parse(&session.backend) != Some(Backend::E2b) {
         return Err(PillboxError::usage(
             "session attach",
             format!(
@@ -343,7 +343,7 @@ pub(crate) fn reattach(resolved: &Pillbox, remote: &Remote, session: &Session) -
 /// saw bite users more often. Reconsider if/when E2B exposes a clean
 /// "kill or already-dead" status code.
 pub(crate) fn kill_session(resolved: &Pillbox, session: &Session) -> Result<()> {
-    if session.backend != BACKEND_E2B {
+    if Backend::parse(&session.backend) != Some(Backend::E2b) {
         return Err(PillboxError::usage(
             "session rm",
             format!(
@@ -496,6 +496,13 @@ pub(crate) fn ensure_helper_extracted() -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Hard cap on a single helper stderr line we'll buffer in memory.
+/// Real helper events are ~100 bytes; sanity-cap at 64 KiB so a buggy
+/// SDK or someone feeding non-newline-terminated junk through the pipe
+/// can't make us grow a `String` unboundedly. Lines longer than this
+/// are truncated with a `…` marker and we resync on the next newline.
+const MAX_HELPER_LINE_BYTES: usize = 64 * 1024;
+
 /// Read helper stderr line-by-line.
 ///
 /// The protocol is a sequence of JSON event lines (see `e2b-helper.mjs`
@@ -511,15 +518,20 @@ pub(crate) fn ensure_helper_extracted() -> Result<PathBuf> {
 /// terminal. The local pillbox-formatted messages above this layer are
 /// trusted and pass through unchanged.
 ///
+/// Per-line memory is bounded by [`MAX_HELPER_LINE_BYTES`] so a runaway
+/// helper writing no newline can't make the pump thread balloon. The
+/// reader resynchronises at the next `\n` after the truncation marker.
+///
 /// Returns the cumulative state at end-of-stream — caller uses
 /// `last_event` to disambiguate "user detached" from "agent finished".
 fn pump_helper_stderr(stderr: std::process::ChildStderr) -> PumpOutcome {
     let mut outcome = PumpOutcome::default();
-    let reader = BufReader::new(stderr);
+    let mut reader = BufReader::new(stderr);
     let mut sink = io::stderr();
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
+    loop {
+        let line = match read_bounded_line(&mut reader, MAX_HELPER_LINE_BYTES) {
+            Ok(Some(l)) => l,
+            Ok(None) => break,
             Err(_) => break,
         };
         let trimmed = line.trim();
@@ -578,6 +590,70 @@ fn pump_helper_stderr(stderr: std::process::ChildStderr) -> PumpOutcome {
         }
     }
     outcome
+}
+
+/// Read up to one newline-terminated line from `reader`, capping the
+/// in-memory line buffer at `max`. Returns `Ok(None)` on clean EOF,
+/// `Ok(Some(line))` for a normal (or truncated) line — the trailing
+/// `\n` is stripped if present.
+///
+/// Truncation strategy: once the line buffer hits `max`, we append a
+/// `…` marker and then drain bytes from the underlying reader until we
+/// hit `\n` (or EOF), without copying them anywhere. This keeps memory
+/// bounded while still resynchronising on the next line boundary so a
+/// runaway helper can't poison the pump for the rest of the stream.
+fn read_bounded_line<R: BufRead>(reader: &mut R, max: usize) -> io::Result<Option<String>> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut truncated = false;
+    loop {
+        let chunk = match reader.fill_buf() {
+            Ok(c) => c,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if chunk.is_empty() {
+            // EOF. If we have buffered bytes return them as the final
+            // line (no trailing newline); otherwise signal end-of-stream.
+            if buf.is_empty() && !truncated {
+                return Ok(None);
+            }
+            return Ok(Some(finalize_bounded(buf, truncated)));
+        }
+        match chunk.iter().position(|&b| b == b'\n') {
+            Some(idx) => {
+                if !truncated {
+                    let take = (max - buf.len()).min(idx);
+                    buf.extend_from_slice(&chunk[..take]);
+                    if take < idx {
+                        truncated = true;
+                    }
+                }
+                // Consume up to AND including the newline.
+                reader.consume(idx + 1);
+                return Ok(Some(finalize_bounded(buf, truncated)));
+            }
+            None => {
+                if !truncated {
+                    let room = max.saturating_sub(buf.len());
+                    let take = room.min(chunk.len());
+                    buf.extend_from_slice(&chunk[..take]);
+                    if buf.len() >= max {
+                        truncated = true;
+                    }
+                }
+                let len = chunk.len();
+                reader.consume(len);
+            }
+        }
+    }
+}
+
+fn finalize_bounded(buf: Vec<u8>, truncated: bool) -> String {
+    let mut s = String::from_utf8_lossy(&buf).into_owned();
+    if truncated {
+        s.push('…');
+    }
+    s
 }
 
 /// Replace control bytes that can drive a terminal (ESC = 0x1B, CSI
@@ -679,5 +755,50 @@ mod tests {
         let s = "col1\tcol2";
         let out = sanitize_terminal_line(s);
         assert_eq!(out, s);
+    }
+
+    #[test]
+    fn read_bounded_line_reads_normal_lines() {
+        let data = b"hello\nworld\n";
+        let mut reader = BufReader::new(&data[..]);
+        let a = read_bounded_line(&mut reader, 64).unwrap();
+        assert_eq!(a.as_deref(), Some("hello"));
+        let b = read_bounded_line(&mut reader, 64).unwrap();
+        assert_eq!(b.as_deref(), Some("world"));
+        let c = read_bounded_line(&mut reader, 64).unwrap();
+        assert!(c.is_none(), "EOF after last newline");
+    }
+
+    #[test]
+    fn read_bounded_line_returns_final_unterminated_line() {
+        // Stream ends without a trailing newline — the last line still
+        // surfaces so we don't drop helper diagnostics on a crashy exit.
+        let data = b"final-line";
+        let mut reader = BufReader::new(&data[..]);
+        let a = read_bounded_line(&mut reader, 64).unwrap();
+        assert_eq!(a.as_deref(), Some("final-line"));
+        let b = read_bounded_line(&mut reader, 64).unwrap();
+        assert!(b.is_none());
+    }
+
+    #[test]
+    fn read_bounded_line_truncates_runaway_lines() {
+        // Megabyte of `A` followed by a newline — must not allocate more
+        // than `max` and must resync on the next line.
+        let mut data = vec![b'A'; 1_000_000];
+        data.push(b'\n');
+        data.extend_from_slice(b"next\n");
+        let mut reader = BufReader::new(&data[..]);
+        let a = read_bounded_line(&mut reader, 128).unwrap().unwrap();
+        // Truncation marker appended.
+        assert!(a.ends_with('…'), "expected truncation marker, got {a:?}");
+        assert!(
+            a.len() <= 128 + '…'.len_utf8(),
+            "bounded line grew past cap: {}",
+            a.len()
+        );
+        // Next line is intact — pump resynced past the runaway.
+        let b = read_bounded_line(&mut reader, 128).unwrap();
+        assert_eq!(b.as_deref(), Some("next"));
     }
 }

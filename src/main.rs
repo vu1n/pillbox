@@ -28,6 +28,7 @@ mod envs;
 mod errors;
 mod paths;
 mod pillbox;
+mod registry;
 mod remote;
 mod sandbox;
 mod secrets;
@@ -535,6 +536,13 @@ fn run(cli: Cli) -> Result<()> {
             args,
         } => {
             let resolved = Pillbox::resolve(pillbox_arg)?;
+            // Hidden remote-side handler. The blob carries everything we
+            // need (agent id, args, env, secrets); the rest of `--run` is
+            // ignored. clap's `conflicts_with` already rejects `--remote`
+            // + `--vault-stdin` together, so no further check needed.
+            if vault_stdin {
+                return crate::sandbox::remote_ssh::dispatch_vault_stdin(&resolved);
+            }
             dispatch_run(
                 &resolved,
                 agent,
@@ -548,7 +556,6 @@ fn run(cli: Cli) -> Result<()> {
                     vault,
                     args,
                     remote_name: remote,
-                    vault_stdin,
                     detach,
                     label,
                 },
@@ -643,17 +650,8 @@ fn resolve_agent_spec(
 }
 
 fn dispatch_run(resolved: &Pillbox, agent: Option<String>, mut opts: RunOpts) -> Result<()> {
-    // Hidden remote-side handler. The blob carries everything we need
-    // (agent id, args, env, secrets), so we ignore the agent override
-    // and the rest of `RunOpts` and dispatch directly into the
-    // vault-stdin code path. clap's `conflicts_with` already rejects
-    // `--remote` + `--vault-stdin` together, so no further check needed.
-    if opts.vault_stdin {
-        return crate::sandbox::remote_ssh::dispatch_vault_stdin(resolved);
-    }
-
-    // Branch 2/3: resolve the agent + apply pillbox.toml defaults; the
-    // backend selection happens below.
+    // Resolve the agent + apply pillbox.toml defaults; the backend
+    // selection happens below.
     let spec = resolve_agent_spec(resolved, agent.as_deref())?;
     if let Some(meta) = &resolved.meta {
         if opts.name.is_none() {
@@ -807,16 +805,16 @@ fn session_attach(resolved: &Pillbox, id: &str) -> Result<()> {
         )
         .with_next(format!("pillbox session rm {}", s.id))
     })?;
-    match s.backend.as_str() {
-        session::BACKEND_E2B => sandbox::remote_e2b::reattach(resolved, &remote, &s),
-        session::BACKEND_SSH => Err(PillboxError::usage(
+    match session::Backend::parse(&s.backend) {
+        Some(session::Backend::E2b) => sandbox::remote_e2b::reattach(resolved, &remote, &s),
+        Some(session::Backend::Ssh) => Err(PillboxError::usage(
             "session attach",
-            "ssh session attach is not implemented in v0.6 PR 6 (tmux integration lands next)",
+            "ssh session attach is not yet implemented (tmux integration lands next)",
         )
         .into()),
-        other => Err(PillboxError::config(
+        None => Err(PillboxError::config(
             "session attach",
-            format!("unknown session backend `{other}`"),
+            format!("unknown session backend `{}`", s.backend),
         )
         .into()),
     }
@@ -919,16 +917,16 @@ fn session_detach(resolved: &Pillbox, id: &str) -> Result<()> {
 
 fn session_rm(resolved: &Pillbox, id: &str) -> Result<()> {
     let s = session::resolve(resolved, id)?;
-    match s.backend.as_str() {
-        session::BACKEND_E2B => sandbox::remote_e2b::kill_session(resolved, &s),
-        session::BACKEND_SSH => Err(PillboxError::usage(
+    match session::Backend::parse(&s.backend) {
+        Some(session::Backend::E2b) => sandbox::remote_e2b::kill_session(resolved, &s),
+        Some(session::Backend::Ssh) => Err(PillboxError::usage(
             "session rm",
-            "ssh session rm is not implemented in v0.6 PR 6 (tmux integration lands next)",
+            "ssh session rm is not yet implemented (tmux integration lands next)",
         )
         .into()),
-        other => Err(PillboxError::config(
+        None => Err(PillboxError::config(
             "session rm",
-            format!("unknown session backend `{other}`"),
+            format!("unknown session backend `{}`", s.backend),
         )
         .into()),
     }

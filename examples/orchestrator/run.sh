@@ -83,6 +83,11 @@ fi
 # ────────── Stage 4: second-pass analysis
 echo "▶ Pulling failed fork for analysis..."
 FAILED_DIR=$(mktemp -d "${TMPDIR:-/tmp}/pillbox-failed-XXXXXX")
+# The orchestrator listening on `$WEBHOOK_URL` should have already
+# called `pillbox session done --result-snapshot HANDLE` on the host,
+# so the record carries the snapshot. If you're running this without
+# a webhook listener, pass `--result-snapshot HANDLE` straight from
+# the event payload before invoking `session pull`.
 pillbox session pull "$TASK_SESSION" --to "$FAILED_DIR"
 
 # Trace path (if pillbox attached one) goes alongside the workspace

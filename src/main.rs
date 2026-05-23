@@ -488,6 +488,20 @@ enum SessionAction {
     /// Tear down the backend resources (kill the sandbox) and remove
     /// the session record. Idempotent.
     Rm { id: String },
+    /// Rehydrate a session's result workspace into a directory. Reads
+    /// `result_snapshot` from the session record (set by `session done
+    /// --result-snapshot`) and asks the workspace backend to pull it.
+    /// Used by orchestrators for post-mortem inspection of a failed
+    /// fork: analyzer agents read the failed session's workspace
+    /// without having to re-run anything.
+    Pull {
+        id: String,
+        /// Destination directory. Created if missing. Defaults to
+        /// `./session-<id>` so two sequential pulls don't clobber each
+        /// other.
+        #[arg(long, value_name = "DIR")]
+        to: Option<PathBuf>,
+    },
     /// Mark a session done, emitting `session.completed` or
     /// `session.failed` to every configured sink (JSONL + webhook +
     /// OTel). Invoked manually for orchestrator-driven completion, or
@@ -518,6 +532,13 @@ enum SessionAction {
         /// consumers; pillbox doesn't dereference it today.
         #[arg(long = "trace-path", value_name = "PATH")]
         trace_path: Option<String>,
+        /// Rustic snapshot handle of the agent's result workspace,
+        /// captured by the in-sandbox wrapper (`pillbox push --tag
+        /// session-<id>`) after the agent exits. Recorded on the
+        /// session record so `pillbox session pull <id>` can rehydrate
+        /// it later; also included in the terminal-event payload.
+        #[arg(long = "result-snapshot", value_name = "HANDLE")]
+        result_snapshot: Option<String>,
     },
     /// Stream session lifecycle events as JSONL on stdout.
     ///
@@ -820,7 +841,17 @@ fn dispatch_session(resolved: &Pillbox, action: SessionAction) -> Result<()> {
             reason,
             exit_code,
             trace_path,
-        } => session_done(resolved, &id, status, reason, exit_code, trace_path),
+            result_snapshot,
+        } => session_done(
+            resolved,
+            &id,
+            status,
+            reason,
+            exit_code,
+            trace_path,
+            result_snapshot,
+        ),
+        SessionAction::Pull { id, to } => session_pull(resolved, &id, to.as_deref()),
     }
 }
 
@@ -1038,6 +1069,41 @@ fn session_rm(resolved: &Pillbox, id: &str) -> Result<()> {
     }
 }
 
+fn session_pull(resolved: &Pillbox, id: &str, to: Option<&std::path::Path>) -> Result<()> {
+    use crate::workspace::{SnapshotHandle, WorkspaceBackend};
+    let session = session::resolve(resolved, id)?;
+    let handle_str = session.result_snapshot.as_ref().ok_or_else(|| {
+        PillboxError::runtime(
+            "session pull",
+            format!(
+                "session `{}` has no result_snapshot yet — the agent hasn't \
+                 finished (or never called `pillbox session done --result-snapshot`)",
+                session.id
+            ),
+        )
+        .with_next(format!("pillbox session info {}", session.id))
+    })?;
+    let backend = resolved.workspace()?;
+    let target = match to {
+        Some(p) => p.to_path_buf(),
+        None => std::env::current_dir()
+            .map_err(|e| PillboxError::runtime("session pull", format!("resolve cwd: {e}")))?
+            .join(format!("session-{}", session.id)),
+    };
+    std::fs::create_dir_all(&target)
+        .map_err(|e| PillboxError::runtime("session pull", format!("create {target:?}: {e}")))?;
+    let handle = SnapshotHandle::new(handle_str.clone());
+    backend.pull(&target, Some(&handle))?;
+    println!(
+        "pillbox: ✓ restored session `{}` (snapshot `{}`) into {}",
+        session.id,
+        handle.short(),
+        target.display()
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn session_done(
     resolved: &Pillbox,
     id: &str,
@@ -1045,6 +1111,7 @@ fn session_done(
     reason: Option<String>,
     exit_code: Option<i32>,
     trace_path: Option<String>,
+    result_snapshot: Option<String>,
 ) -> Result<()> {
     // Defense-in-depth on the id arg. `Session::new_id` produces 12
     // ascii-hex chars; the registry-resolve path enforces this via
@@ -1061,17 +1128,34 @@ fn session_done(
     // record. We still want to emit a valid event payload with the id;
     // the webhook / OTel sinks carry it to the orchestrator, which
     // correlates against its own `session.started` event.
-    let session =
+    let mut session =
         session::resolve(resolved, id).unwrap_or_else(|_| session::Session::stub_from_id(id));
+    // If the caller passed a `--result-snapshot` AND the session has a
+    // real registry entry (not a sandbox-side stub), persist the
+    // snapshot onto the record so a later `pillbox session pull <id>`
+    // can rehydrate it without round-tripping through the event
+    // stream. Stubs have empty `remote` — that's the cheapest tell
+    // that we built it from id alone.
+    if let Some(snap) = &result_snapshot {
+        if !session.remote.is_empty() {
+            session.result_snapshot = Some(snap.clone());
+            // Best-effort: a write failure here doesn't void the event.
+            if let Err(e) = session::write(resolved, &session) {
+                eprintln!("pillbox: warning: result_snapshot not persisted to session record: {e}");
+            }
+        }
+    }
     let event = match status {
         DoneStatus::Ok => events::EventType::SessionCompleted {
             exit_code,
             trace_path,
+            result_snapshot,
         },
         DoneStatus::Failed => events::EventType::SessionFailed {
             reason: reason.unwrap_or_else(|| "agent failed".to_string()),
             exit_code,
             trace_path,
+            result_snapshot,
         },
     };
     events::emit_session_event(resolved, event, &session);

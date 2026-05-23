@@ -419,15 +419,31 @@ async function runAttach(args) {
 	const webhookExport = args.eventsWebhook
 		? `export PILLBOX_EVENTS_WEBHOOK=${shellEscape(args.eventsWebhook)}; `
 		: "";
+	// After the agent exits, snapshot the modified workspace into the
+	// shared rustic repo (`pillbox push --tag session-<id> --json`) and
+	// extract the snapshot handle from the JSON output. The handle gets
+	// passed to `pillbox session done --result-snapshot HANDLE` so the
+	// host record can be updated by an orchestrator (or by a manual
+	// `session done` invocation on the host).
+	//
+	// `jq -r .snapshot.handle` is the canonical extraction — pillbox's
+	// own `--json` output keeps that shape stable. `2>/dev/null` on the
+	// push hides the human banner (we already have JSON); if push or
+	// jq fail, `RESULT_SNAPSHOT` stays empty and `--result-snapshot`
+	// is dropped from the `session done` call (the if-non-empty guard
+	// at the bottom of the line). That keeps the failure path clean —
+	// terminal event still fires, just without a result_snapshot.
 	const launch =
 		`stty -echo raw 2>/dev/null; printf '%s\\n' '${BOOT_MARKER}'; ` +
 		`${webhookExport}` +
 		`pillbox run --vault-stdin < ${shellEscape(blobRemote)}; ` +
 		`PB_EXIT=$?; ` +
+		`RESULT_SNAPSHOT=$(pillbox push --tag ${shellEscape(`session-${args.sessionId}`)} --message ${shellEscape(`agent result for session ${args.sessionId}`)} --json 2>/dev/null | jq -r '.snapshot.handle // empty' 2>/dev/null); ` +
 		`pillbox session done ${sessionIdEsc} ` +
 		`--status "$([ $PB_EXIT = 0 ] && echo ok || echo failed)" ` +
 		`--exit-code "$PB_EXIT" ` +
-		`--reason "$([ $PB_EXIT = 0 ] && echo agent-completed || echo "agent exited $PB_EXIT")"; ` +
+		`--reason "$([ $PB_EXIT = 0 ] && echo agent-completed || echo "agent exited $PB_EXIT")" ` +
+		`$([ -n "$RESULT_SNAPSHOT" ] && echo --result-snapshot "$RESULT_SNAPSHOT"); ` +
 		`rm -f ${shellEscape(blobRemote)}\n`;
 	try {
 		await sandbox.pty.sendInput(pid, Buffer.from(launch));

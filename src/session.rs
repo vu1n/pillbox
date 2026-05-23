@@ -149,6 +149,21 @@ pub(crate) struct Session {
     /// `pillbox session detach <id>` sends `SIGTERM` to this pid.
     #[serde(default)]
     pub(crate) attached_pid: Option<i64>,
+    /// Workspace snapshot the session forked from. Captured at session
+    /// create time (the latest snapshot in the pillbox's rustic repo).
+    /// `None` if the workspace had no snapshots yet — first run against
+    /// an empty repo. Used by `session diff` (PR 1b) to compute what
+    /// the agent changed relative to its starting point.
+    #[serde(default)]
+    pub(crate) base_snapshot: Option<String>,
+    /// Workspace snapshot of the agent's result, captured by the
+    /// in-sandbox wrapper after the agent exits and passed to
+    /// `pillbox session done --result-snapshot HANDLE`. `None` until
+    /// the session finishes (or never set for runs that crashed
+    /// before the wrapper could push). `pillbox session pull <id>`
+    /// rehydrates this snapshot for post-mortem inspection.
+    #[serde(default)]
+    pub(crate) result_snapshot: Option<String>,
 }
 
 impl Session {
@@ -186,6 +201,8 @@ impl Session {
             agent_id: String::new(),
             started_at: String::new(),
             attached_pid: None,
+            base_snapshot: None,
+            result_snapshot: None,
         }
     }
 
@@ -212,6 +229,8 @@ impl Session {
             agent_id: "claude".to_string(),
             started_at: "2026-05-23T13:37:00Z".to_string(),
             attached_pid: None,
+            base_snapshot: None,
+            result_snapshot: None,
         }
     }
 
@@ -240,6 +259,20 @@ impl Session {
                 Some(p) => serde_json::Value::from(p),
                 None => serde_json::Value::Null,
             },
+        );
+        o.insert(
+            "base_snapshot".into(),
+            self.base_snapshot
+                .clone()
+                .map(serde_json::Value::String)
+                .unwrap_or(serde_json::Value::Null),
+        );
+        o.insert(
+            "result_snapshot".into(),
+            self.result_snapshot
+                .clone()
+                .map(serde_json::Value::String)
+                .unwrap_or(serde_json::Value::Null),
         );
         serde_json::Value::Object(o)
     }

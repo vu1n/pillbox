@@ -111,11 +111,19 @@ pub(crate) enum EventType {
     SessionCompleted {
         exit_code: Option<i32>,
         trace_path: Option<String>,
+        /// Rustic snapshot handle of the agent's result workspace,
+        /// pushed by the in-sandbox wrapper after the agent exits.
+        /// Consumers correlate with `base_snapshot` (on the session
+        /// record + future `session.started` event) to compute the
+        /// fork's diff. `session pull <id>` rehydrates from this
+        /// handle.
+        result_snapshot: Option<String>,
     },
     SessionFailed {
         reason: String,
         exit_code: Option<i32>,
         trace_path: Option<String>,
+        result_snapshot: Option<String>,
     },
     SessionDropped,
 }
@@ -169,6 +177,8 @@ const EVENT_FIELDS: &[&str] = &[
     "reason",
     "exit_code",
     "trace_path",
+    "result_snapshot",
+    "base_snapshot",
 ];
 
 /// Emit one event for a session lifecycle transition. Routes through
@@ -291,17 +301,29 @@ fn build_event_json(ty: &EventType, session: &Session) -> String {
     } else {
         serde_json::Value::Null
     };
-    let (reason, exit_code, trace_path) = match ty {
+    let (reason, exit_code, trace_path, result_snapshot) = match ty {
         EventType::SessionCompleted {
             exit_code,
             trace_path,
-        } => (None, *exit_code, trace_path.clone()),
+            result_snapshot,
+        } => (
+            None,
+            *exit_code,
+            trace_path.clone(),
+            result_snapshot.clone(),
+        ),
         EventType::SessionFailed {
             reason,
             exit_code,
             trace_path,
-        } => (Some(reason.clone()), *exit_code, trace_path.clone()),
-        _ => (None, None, None),
+            result_snapshot,
+        } => (
+            Some(reason.clone()),
+            *exit_code,
+            trace_path.clone(),
+            result_snapshot.clone(),
+        ),
+        _ => (None, None, None, None),
     };
     // `version` first by convention so a consumer scanning the head of
     // the line can branch on it before touching the rest. The field set
@@ -321,6 +343,8 @@ fn build_event_json(ty: &EventType, session: &Session) -> String {
         "reason": reason,
         "exit_code": exit_code,
         "trace_path": trace_path,
+        "result_snapshot": result_snapshot,
+        "base_snapshot": session.base_snapshot,
     })
     .to_string()
 }
@@ -410,6 +434,7 @@ mod tests {
                 EventType::SessionCompleted {
                     exit_code: Some(0),
                     trace_path: Some("rustic://x".into()),
+                    result_snapshot: Some("snap-abc".into()),
                 },
                 &s,
             );
@@ -419,6 +444,7 @@ mod tests {
                     reason: "agent panic".into(),
                     exit_code: Some(42),
                     trace_path: None,
+                    result_snapshot: None,
                 },
                 &s,
             );
@@ -526,6 +552,7 @@ mod tests {
                 reason: "x".into(),
                 exit_code: Some(1),
                 trace_path: Some("y".into()),
+                result_snapshot: Some("z".into()),
             },
             &s,
         );

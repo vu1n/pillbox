@@ -136,6 +136,11 @@ impl SandboxBackend for RemoteE2bSandbox {
         let label = opts.label.clone();
         let detach = opts.detach;
         let json = opts.json;
+        // Pre-compute the absolute expiration timestamp from the
+        // `--ttl` duration; storing the resolved instant (not the raw
+        // duration) keeps the meaning unambiguous regardless of when
+        // `session prune` runs.
+        let expires_at = opts.ttl_seconds.map(session::expires_at_from_ttl);
         run_attach(
             resolved,
             &self.remote.name,
@@ -145,6 +150,7 @@ impl SandboxBackend for RemoteE2bSandbox {
             &blob,
             detach,
             json,
+            expires_at,
         )
     }
 }
@@ -170,6 +176,7 @@ fn run_attach(
     blob: &VaultStdinBlob,
     detach: bool,
     json: bool,
+    expires_at: Option<String>,
 ) -> Result<()> {
     let blob_bytes = blob.to_bytes()?;
     // `tempfile()` creates the file atomically via `O_CREAT | O_EXCL`
@@ -259,6 +266,7 @@ fn run_attach(
                 label,
                 &pumped,
                 &session_id,
+                expires_at.clone(),
             )?;
             if json {
                 // Machine-readable: matches `pillbox session info --json`
@@ -286,6 +294,7 @@ fn run_attach(
                 label,
                 &pumped,
                 &session_id,
+                expires_at.clone(),
             )?;
             eprintln!(
                 "pillbox: detached. reattach with `pillbox session attach {}`",
@@ -436,6 +445,7 @@ pub(crate) fn kill_session(resolved: &Pillbox, session: &Session) -> Result<()> 
 /// step with persistence the next time we add a third detach-shaped
 /// outcome. `attached_pid` is always `None` on initial detach — both
 /// arms are post-helper-exit, so by definition nothing is attached.
+#[allow(clippy::too_many_arguments)]
 fn persist_and_emit_started(
     resolved: &Pillbox,
     remote_name: &str,
@@ -443,6 +453,7 @@ fn persist_and_emit_started(
     label: Option<String>,
     pump: &PumpOutcome,
     pre_minted_id: &str,
+    expires_at: Option<String>,
 ) -> Result<Session> {
     let session = persist_session_from_pump(
         resolved,
@@ -452,6 +463,7 @@ fn persist_and_emit_started(
         pump,
         None,
         pre_minted_id,
+        expires_at,
     )?;
     crate::events::emit_session_event(
         resolved,
@@ -475,6 +487,7 @@ fn persist_session_from_pump(
     pump: &PumpOutcome,
     attached_pid: Option<i64>,
     pre_minted_id: &str,
+    expires_at: Option<String>,
 ) -> Result<Session> {
     let sandbox_id = pump.sandbox_id.clone().ok_or_else(|| {
         PillboxError::runtime(
@@ -498,6 +511,7 @@ fn persist_session_from_pump(
         attached_pid,
         base_snapshot: crate::workspace::latest_snapshot_handle(resolved),
         result_snapshot: None,
+        expires_at,
     };
     session::write(resolved, &session)?;
     Ok(session)

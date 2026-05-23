@@ -185,6 +185,17 @@ enum Command {
         /// this pillbox invocation).
         #[arg(long = "events-webhook", value_name = "URL")]
         events_webhook: Option<String>,
+        /// Retention TTL — duration after which `pillbox session prune`
+        /// will tear this session down (sandbox kill + record delete).
+        /// Format: `30m`, `24h`, `7d` (`s`/`m`/`h`/`d` units only).
+        /// Captures per-session retention intent at spawn time so
+        /// different sessions can have different lifetimes — failed
+        /// experiments 1h, prod runs 7d. Only meaningful with
+        /// `--detach` (interactive runs don't persist a record).
+        /// Pillbox does NOT auto-prune; the user / orchestrator runs
+        /// `pillbox session prune` from cron or by hand.
+        #[arg(long, value_name = "DURATION", requires = "detach")]
+        ttl: Option<String>,
         /// Args forwarded to the agent CLI inside the sandbox.
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
@@ -502,6 +513,18 @@ enum SessionAction {
         #[arg(long, value_name = "DIR")]
         to: Option<PathBuf>,
     },
+    /// Tear down every session whose `expires_at` is in the past.
+    /// Drives `session rm` for each — sandbox killed, record deleted.
+    /// Sessions with no `expires_at` (no `--ttl` at spawn) are left
+    /// alone forever; the user / orchestrator owns the policy.
+    /// Intended for cron / orchestrator schedules; pillbox doesn't
+    /// auto-prune on every invocation.
+    Prune {
+        /// List what would be pruned without actually pruning. Useful
+        /// for sanity-checking a cron entry before turning it on.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+    },
     /// Mark a session done, emitting `session.completed` or
     /// `session.failed` to every configured sink (JSONL + webhook +
     /// OTel). Invoked manually for orchestrator-driven completion, or
@@ -627,6 +650,7 @@ fn run(cli: Cli) -> Result<()> {
             label,
             json,
             events_webhook,
+            ttl,
             args,
         } => {
             let resolved = Pillbox::resolve(pillbox_arg)?;
@@ -661,6 +685,15 @@ fn run(cli: Cli) -> Result<()> {
                     std::env::set_var("PILLBOX_EVENTS_WEBHOOK", &validated);
                 }
             }
+            // Parse `--ttl 30m` / `24h` / `7d` at the CLI boundary.
+            // Stored as seconds on `RunOpts` so the backend converts
+            // to an absolute RFC3339 `expires_at` close to the actual
+            // session-write time (no clock drift between parse and
+            // persist).
+            let ttl_seconds = match ttl {
+                Some(s) => Some(session::parse_ttl_seconds(&s)?),
+                None => None,
+            };
             dispatch_run(
                 &resolved,
                 agent,
@@ -677,6 +710,7 @@ fn run(cli: Cli) -> Result<()> {
                     detach,
                     label,
                     json,
+                    ttl_seconds,
                 },
             )
         }
@@ -852,6 +886,7 @@ fn dispatch_session(resolved: &Pillbox, action: SessionAction) -> Result<()> {
             result_snapshot,
         ),
         SessionAction::Pull { id, to } => session_pull(resolved, &id, to.as_deref()),
+        SessionAction::Prune { dry_run } => session_prune(resolved, dry_run),
     }
 }
 
@@ -1100,6 +1135,46 @@ fn session_pull(resolved: &Pillbox, id: &str, to: Option<&std::path::Path>) -> R
         handle.short(),
         target.display()
     );
+    Ok(())
+}
+
+fn session_prune(resolved: &Pillbox, dry_run: bool) -> Result<()> {
+    let all = session::list(resolved)?;
+    let expired: Vec<session::Session> = all.into_iter().filter(session::is_expired).collect();
+    if expired.is_empty() {
+        println!("pillbox: no sessions past their TTL — nothing to prune.");
+        return Ok(());
+    }
+    if dry_run {
+        println!(
+            "pillbox: would prune {} session(s) (--dry-run):",
+            expired.len()
+        );
+        for s in &expired {
+            let exp = s.expires_at.as_deref().unwrap_or("(none)");
+            println!("  {}  expires_at={exp}  remote={}", s.id, s.remote);
+        }
+        return Ok(());
+    }
+    // Drive `session rm` per record. Each call kills the sandbox and
+    // deletes the local record. Errors are logged but don't abort the
+    // loop — a single bad record shouldn't prevent pruning the rest.
+    let mut pruned = 0usize;
+    let mut failed = 0usize;
+    for s in &expired {
+        match session_rm(resolved, &s.id) {
+            Ok(()) => pruned += 1,
+            Err(e) => {
+                eprintln!("pillbox: prune {}: {e}", s.id);
+                failed += 1;
+            }
+        }
+    }
+    if failed > 0 {
+        eprintln!("pillbox: pruned {pruned}, {failed} failed (see above)");
+    } else {
+        println!("pillbox: ✓ pruned {pruned} session(s).");
+    }
     Ok(())
 }
 

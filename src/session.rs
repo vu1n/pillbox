@@ -164,6 +164,17 @@ pub(crate) struct Session {
     /// rehydrates this snapshot for post-mortem inspection.
     #[serde(default)]
     pub(crate) result_snapshot: Option<String>,
+    /// Absolute RFC3339 timestamp after which `pillbox session prune`
+    /// will tear this session down. Set by `pillbox run --ttl
+    /// DURATION` at spawn time so per-session retention intent is
+    /// captured at creation (different sessions can have different
+    /// TTLs — failed experiments 1h, prod runs 7d, etc.). `None`
+    /// means no TTL: the session lives until explicit `session rm`.
+    /// Pillbox does NOT auto-prune on every invocation; `session
+    /// prune` is the explicit one-shot the user/orchestrator
+    /// schedules.
+    #[serde(default)]
+    pub(crate) expires_at: Option<String>,
 }
 
 impl Session {
@@ -205,6 +216,7 @@ impl Session {
             attached_pid: None,
             base_snapshot: None,
             result_snapshot: None,
+            expires_at: None,
         }
     }
 
@@ -244,6 +256,13 @@ impl Session {
         o.insert(
             "result_snapshot".into(),
             self.result_snapshot
+                .clone()
+                .map(serde_json::Value::String)
+                .unwrap_or(serde_json::Value::Null),
+        );
+        o.insert(
+            "expires_at".into(),
+            self.expires_at
                 .clone()
                 .map(serde_json::Value::String)
                 .unwrap_or(serde_json::Value::Null),
@@ -384,6 +403,88 @@ pub(crate) fn mark_detached(pb: &Pillbox, id: &str) -> Result<()> {
     }
     s.attached_pid = None;
     write(pb, &s)
+}
+
+/// Parse a `--ttl` duration like `30m`, `24h`, `7d`. Returns the
+/// number of seconds. Rejects empty / negative / >365d / malformed
+/// inputs. Hand-rolled because pillbox doesn't depend on
+/// `humantime` and the surface is tiny.
+pub(crate) fn parse_ttl_seconds(s: &str) -> Result<u64> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err(PillboxError::usage("--ttl", "empty duration").into());
+    }
+    let (num_part, unit) =
+        trimmed.split_at(trimmed.find(|c: char| c.is_alphabetic()).ok_or_else(|| {
+            PillboxError::usage(
+                "--ttl",
+                format!("missing unit in `{s}` (use `30m`, `24h`, `7d`)"),
+            )
+        })?);
+    let n: u64 = num_part.parse().map_err(|_| {
+        PillboxError::usage("--ttl", format!("invalid number `{num_part}` in `{s}`"))
+    })?;
+    if n == 0 {
+        return Err(PillboxError::usage("--ttl", "duration must be > 0").into());
+    }
+    let secs_per_unit = match unit {
+        "s" => 1u64,
+        "m" => 60,
+        "h" => 60 * 60,
+        "d" => 60 * 60 * 24,
+        other => {
+            return Err(PillboxError::usage(
+                "--ttl",
+                format!("unsupported unit `{other}` (use `s`, `m`, `h`, or `d`)"),
+            )
+            .into())
+        }
+    };
+    let total = n.checked_mul(secs_per_unit).ok_or_else(|| {
+        PillboxError::usage("--ttl", format!("`{s}` overflows duration arithmetic"))
+    })?;
+    // 365 days cap — sessions are runtime artifacts, not archival.
+    // A higher cap would still work but anything past a year is
+    // almost certainly a typo.
+    let one_year = 60 * 60 * 24 * 365;
+    if total > one_year {
+        return Err(PillboxError::usage(
+            "--ttl",
+            format!("`{s}` exceeds 365d cap; use `session rm` for permanent records"),
+        )
+        .into());
+    }
+    Ok(total)
+}
+
+/// Compute an RFC3339 `expires_at` timestamp from a TTL in seconds,
+/// based on the current wall clock. Separated from
+/// [`parse_ttl_seconds`] so tests can hold time constant.
+pub(crate) fn expires_at_from_ttl(ttl_seconds: u64) -> String {
+    use time::format_description::well_known::Rfc3339;
+    let now = time::OffsetDateTime::now_utc();
+    let expires = now + time::Duration::seconds(ttl_seconds as i64);
+    expires
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+/// True if `expires_at` is in the past (strict — equal-to-now counts
+/// as not-yet-expired so we don't race the wall clock). Returns
+/// `false` for sessions with no `expires_at` (no TTL = never
+/// expires).
+pub(crate) fn is_expired(session: &Session) -> bool {
+    let Some(exp) = &session.expires_at else {
+        return false;
+    };
+    use time::format_description::well_known::Rfc3339;
+    let Ok(when) = time::OffsetDateTime::parse(exp, &Rfc3339) else {
+        // Malformed timestamp → treat as never-expires; the prune
+        // command will surface the malformed value via `session
+        // info` and the user can fix it manually.
+        return false;
+    };
+    when < time::OffsetDateTime::now_utc()
 }
 
 /// RFC3339 timestamp for the `started_at` field. Pulled into a function
@@ -550,5 +651,76 @@ mod tests {
         let _: &str = BACKEND_E2B;
         let _: &str = BACKEND_SSH;
         let _: &str = SESSIONS_DIR;
+    }
+
+    #[test]
+    fn parse_ttl_accepts_supported_units() {
+        assert_eq!(parse_ttl_seconds("30s").unwrap(), 30);
+        assert_eq!(parse_ttl_seconds("5m").unwrap(), 300);
+        assert_eq!(parse_ttl_seconds("2h").unwrap(), 7200);
+        assert_eq!(parse_ttl_seconds("7d").unwrap(), 604_800);
+    }
+
+    #[test]
+    fn parse_ttl_trims_whitespace() {
+        assert_eq!(parse_ttl_seconds("  24h  ").unwrap(), 86_400);
+    }
+
+    #[test]
+    fn parse_ttl_rejects_zero() {
+        let err = parse_ttl_seconds("0h").unwrap_err().to_string();
+        assert!(err.contains("> 0"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_ttl_rejects_missing_unit() {
+        let err = parse_ttl_seconds("42").unwrap_err().to_string();
+        assert!(err.contains("missing unit"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_ttl_rejects_unknown_unit() {
+        let err = parse_ttl_seconds("5y").unwrap_err().to_string();
+        assert!(err.contains("unsupported unit"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_ttl_rejects_over_one_year() {
+        let err = parse_ttl_seconds("400d").unwrap_err().to_string();
+        assert!(err.contains("365d cap"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_ttl_rejects_empty() {
+        assert!(parse_ttl_seconds("").is_err());
+        assert!(parse_ttl_seconds("   ").is_err());
+    }
+
+    #[test]
+    fn is_expired_handles_none_and_past_and_future() {
+        let mut s = Session::test_fixture();
+        // No expires_at → never expires.
+        s.expires_at = None;
+        assert!(!is_expired(&s));
+        // Far past → expired.
+        s.expires_at = Some("2000-01-01T00:00:00Z".into());
+        assert!(is_expired(&s));
+        // Far future → not expired.
+        s.expires_at = Some("2099-01-01T00:00:00Z".into());
+        assert!(!is_expired(&s));
+        // Malformed → treated as not-expired (manual fix-up by the
+        // user; prune doesn't drop records it can't parse).
+        s.expires_at = Some("not a timestamp".into());
+        assert!(!is_expired(&s));
+    }
+
+    #[test]
+    fn expires_at_from_ttl_is_rfc3339_in_the_future() {
+        use time::format_description::well_known::Rfc3339;
+        let before = time::OffsetDateTime::now_utc();
+        let exp = expires_at_from_ttl(3600);
+        let parsed = time::OffsetDateTime::parse(&exp, &Rfc3339).unwrap();
+        assert!(parsed > before);
+        assert!(parsed - before <= time::Duration::seconds(3601));
     }
 }

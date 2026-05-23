@@ -52,6 +52,30 @@ fn plant_session_with_attached(
     fs::write(dir.join(format!("{id}.toml")), body).unwrap();
 }
 
+/// Plant a session with an explicit `expires_at` timestamp. Used by
+/// `session prune` tests so we can deterministically place records in
+/// the past or future without sleeping.
+fn plant_session_with_expiry(
+    home: &std::path::Path,
+    id: &str,
+    remote: &str,
+    expires_at: &str,
+) {
+    let dir = home.join(".pillbox/global/sessions");
+    fs::create_dir_all(&dir).unwrap();
+    let body = format!(
+        "id = \"{id}\"\n\
+         remote = \"{remote}\"\n\
+         backend = \"e2b\"\n\
+         sandbox_id = \"sb_test_{id}\"\n\
+         pty_pid = 42\n\
+         agent_id = \"claude\"\n\
+         started_at = \"2026-05-21T00:00:00Z\"\n\
+         expires_at = \"{expires_at}\"\n",
+    );
+    fs::write(dir.join(format!("{id}.toml")), body).unwrap();
+}
+
 #[test]
 fn list_empty_emits_friendly_message() {
     let home = TempDir::new().unwrap();
@@ -253,6 +277,78 @@ fn session_done_persists_result_snapshot_on_record() {
     let last_line = body.lines().last().expect("at least one event");
     let event: serde_json::Value = serde_json::from_str(last_line).expect("json");
     assert_eq!(event["result_snapshot"], "snap-deadbeef");
+}
+
+#[test]
+fn session_prune_dry_run_lists_expired_only() {
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let out = run(home.path(), cwd.path(), &["init"]);
+    assert_ok(&out, "init");
+    // One past, one future, one with no expiry — only the past one
+    // is expired.
+    plant_session_with_expiry(home.path(), "expired00aaaa", "cloud", "2000-01-01T00:00:00Z");
+    plant_session_with_expiry(home.path(), "future0000bbbb", "cloud", "2099-01-01T00:00:00Z");
+    plant_session(home.path(), "noexpiry000cc", "cloud", None);
+
+    let out = run(home.path(), cwd.path(), &["session", "prune", "--dry-run"]);
+    assert_ok(&out, "session prune --dry-run");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("would prune 1 session"), "got: {stdout}");
+    assert!(stdout.contains("expired00aaaa"), "got: {stdout}");
+    assert!(
+        !stdout.contains("future0000bbbb"),
+        "future shouldn't be in dry-run output: {stdout}"
+    );
+    assert!(
+        !stdout.contains("noexpiry000cc"),
+        "no-expiry shouldn't be in dry-run output: {stdout}"
+    );
+}
+
+#[test]
+fn session_prune_empty_is_friendly() {
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let out = run(home.path(), cwd.path(), &["init"]);
+    assert_ok(&out, "init");
+    // Only future + no-expiry sessions — nothing to prune.
+    plant_session_with_expiry(home.path(), "future0000bbbb", "cloud", "2099-01-01T00:00:00Z");
+    plant_session(home.path(), "noexpiry000cc", "cloud", None);
+
+    let out = run(home.path(), cwd.path(), &["session", "prune"]);
+    assert_ok(&out, "session prune");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("nothing to prune"),
+        "got: {stdout}"
+    );
+}
+
+#[test]
+fn run_ttl_rejects_malformed_duration() {
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let out = run(home.path(), cwd.path(), &["new", "--name", "proj"]);
+    assert_ok(&out, "new");
+
+    let out = run(
+        home.path(),
+        cwd.path(),
+        &[
+            "run",
+            "--remote",
+            "nope",
+            "--detach",
+            "--ttl",
+            "5y",
+            "--",
+            "ignored",
+        ],
+    );
+    assert!(!out.status.success(), "5y unit should fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unsupported unit"), "got: {stderr}");
 }
 
 #[test]

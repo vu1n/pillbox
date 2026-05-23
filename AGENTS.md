@@ -88,7 +88,8 @@ global pillbox regardless of where you are.
 | `pillbox session attach ID` | Reattach to a detached session. Detach again with Ctrl-A + D or `pillbox session detach ID` from another shell. v0.6 PR 6: e2b:// remotes only. |
 | `pillbox session detach ID` | Signal a currently-attached pillbox to detach (SIGTERM, no-op if already detached). |
 | `pillbox session rm ID` | Tear down the backend (kill sandbox) and remove the session record. |
-| `pillbox session done ID --status ok\|failed [--reason TEXT] [--exit-code N] [--trace-path PATH]` | Emit `session.completed` / `session.failed` to every configured sink. Invoked automatically by the in-sandbox wrapper after the agent exits; can also be called manually for orchestrator-driven completion. Does NOT tear down the sandbox — use `session rm` for that. |
+| `pillbox session done ID --status ok\|failed [--reason TEXT] [--exit-code N] [--trace-path PATH] [--result-snapshot HANDLE]` | Emit `session.completed` / `session.failed` to every configured sink. Invoked automatically by the in-sandbox wrapper after the agent exits (also passes `--result-snapshot` from the post-agent push); can also be called manually. Does NOT tear down the sandbox — use `session rm` for that. |
+| `pillbox session pull ID [--to DIR]` | Rehydrate a session's result workspace into a directory. Reads `result_snapshot` from the session record; errors clearly if the agent hasn't finished. Default `DIR` is `./session-<id>`. |
 | `pillbox session events [--follow] [--json]` | Tail the local events stream (`<pillbox>/events.jsonl`). |
 | `pillbox doctor [--json]` | Diagnose Docker, image, perms, `$HOME`. |
 | `pillbox version` | Print pillbox + runner image versions. |

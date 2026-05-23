@@ -211,6 +211,73 @@ fn session_done_failed_carries_reason_and_exit_code() {
 }
 
 #[test]
+fn session_done_persists_result_snapshot_on_record() {
+    // When `--result-snapshot HANDLE` is passed AND the session
+    // record exists, the record is mutated so future `session pull`
+    // / `session info` can find the snapshot. Stub-mode (no record)
+    // skips the persist — covered by the next test.
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let out = run(home.path(), cwd.path(), &["init"]);
+    assert_ok(&out, "init");
+    plant_session(home.path(), "abcdef333333", "cloud", None);
+
+    let out = run(
+        home.path(),
+        cwd.path(),
+        &[
+            "session",
+            "done",
+            "abcdef333333",
+            "--status",
+            "ok",
+            "--result-snapshot",
+            "snap-deadbeef",
+        ],
+    );
+    assert_ok(&out, "session done with result-snapshot");
+
+    let out = run(
+        home.path(),
+        cwd.path(),
+        &["session", "info", "abcdef333333", "--json"],
+    );
+    assert_ok(&out, "session info");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("json");
+    assert_eq!(parsed["session"]["result_snapshot"], "snap-deadbeef");
+
+    // Also verify the event payload carries it.
+    let events_path = home.path().join(".pillbox/global/events.jsonl");
+    let body = fs::read_to_string(&events_path).expect("events.jsonl exists");
+    let last_line = body.lines().last().expect("at least one event");
+    let event: serde_json::Value = serde_json::from_str(last_line).expect("json");
+    assert_eq!(event["result_snapshot"], "snap-deadbeef");
+}
+
+#[test]
+fn session_pull_errors_without_result_snapshot() {
+    // Default state: session record exists but the agent hasn't
+    // finished (or `session done --result-snapshot` was never
+    // called). `session pull` should error with an actionable hint
+    // rather than silently doing nothing.
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let out = run(home.path(), cwd.path(), &["init"]);
+    assert_ok(&out, "init");
+    plant_session(home.path(), "abcdef444444", "cloud", None);
+
+    let out = run(
+        home.path(),
+        cwd.path(),
+        &["session", "pull", "abcdef444444"],
+    );
+    assert!(!out.status.success(), "should fail without result_snapshot");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("result_snapshot"), "got: {stderr}");
+}
+
+#[test]
 fn session_done_works_without_registry_record() {
     // Sandbox-side use case: there's no local session record (the host
     // owns it), but `session done` should still emit the event so it
@@ -232,8 +299,19 @@ fn session_done_works_without_registry_record() {
     let event: serde_json::Value = serde_json::from_str(body.trim()).expect("json");
     assert_eq!(event["event"], "session.completed");
     assert_eq!(event["session_id"], "deadbeefcafe");
-    // Stub fields are empty strings (the host has the real data).
-    assert_eq!(event["remote"], "");
+    // Sandbox-side path has no local record: the session-derived
+    // fields render as JSON null, NOT empty strings. Empty strings
+    // would be a lie (the agent's remote is not literally ""); null
+    // honestly says "we don't know this from here, correlate via
+    // session_id against the host's session.started".
+    assert!(event["remote"].is_null(), "got: {:?}", event["remote"]);
+    assert!(event["backend"].is_null(), "got: {:?}", event["backend"]);
+    assert!(event["agent_id"].is_null(), "got: {:?}", event["agent_id"]);
+    assert!(
+        event["started_at"].is_null(),
+        "got: {:?}",
+        event["started_at"]
+    );
 }
 
 #[test]

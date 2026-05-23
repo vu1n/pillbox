@@ -149,6 +149,21 @@ pub(crate) struct Session {
     /// `pillbox session detach <id>` sends `SIGTERM` to this pid.
     #[serde(default)]
     pub(crate) attached_pid: Option<i64>,
+    /// Workspace snapshot the session forked from. Captured at session
+    /// create time (the latest snapshot in the pillbox's rustic repo).
+    /// `None` if the workspace had no snapshots yet — first run against
+    /// an empty repo. Used by `session diff` (PR 1b) to compute what
+    /// the agent changed relative to its starting point.
+    #[serde(default)]
+    pub(crate) base_snapshot: Option<String>,
+    /// Workspace snapshot of the agent's result, captured by the
+    /// in-sandbox wrapper after the agent exits and passed to
+    /// `pillbox session done --result-snapshot HANDLE`. `None` until
+    /// the session finishes (or never set for runs that crashed
+    /// before the wrapper could push). `pillbox session pull <id>`
+    /// rehydrates this snapshot for post-mortem inspection.
+    #[serde(default)]
+    pub(crate) result_snapshot: Option<String>,
 }
 
 impl Session {
@@ -161,34 +176,10 @@ impl Session {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    /// Build a Session record from JUST an id, with empty defaults for
-    /// every other field. Used by the sandbox-side `pillbox session
-    /// done` path where the session record lives on the *host*, not in
-    /// the sandbox — we still want to emit a valid event payload with
-    /// the session id, even though we can't look up the rest of the
-    /// record. The webhook + OTel sinks carry the event to the host /
-    /// orchestrator, which correlates against its own
-    /// `session.started` event via the shared id.
-    ///
-    /// **Consumer note:** an event built from a stub carries empty
-    /// strings (not nulls) for `remote`, `backend`, `agent_id`, and
-    /// `started_at`. Orchestrators should treat the matching
-    /// `session.started` event as the source of truth for those fields
-    /// and key off `session_id` to correlate.
-    pub(crate) fn stub_from_id(id: &str) -> Self {
-        Self {
-            id: id.to_string(),
-            label: None,
-            remote: String::new(),
-            backend: String::new(),
-            sandbox_id: String::new(),
-            pty_pid: 0,
-            agent_id: String::new(),
-            started_at: String::new(),
-            attached_pid: None,
-        }
-    }
-
+    // `stub_from_id` removed — `emit_session_event` now takes
+    // `Option<&Session>` directly. Sandbox-side callers pass `None`;
+    // host-side callers pass the record. Empty-strings-as-stub-flag
+    // was a typed-state smell.
     /// Fixed-shape test fixture — same `Session` every call so tests
     /// across modules (`session`, `events`, future consumers) agree
     /// on the field values they're asserting against. Override fields
@@ -212,6 +203,8 @@ impl Session {
             agent_id: "claude".to_string(),
             started_at: "2026-05-23T13:37:00Z".to_string(),
             attached_pid: None,
+            base_snapshot: None,
+            result_snapshot: None,
         }
     }
 
@@ -240,6 +233,20 @@ impl Session {
                 Some(p) => serde_json::Value::from(p),
                 None => serde_json::Value::Null,
             },
+        );
+        o.insert(
+            "base_snapshot".into(),
+            self.base_snapshot
+                .clone()
+                .map(serde_json::Value::String)
+                .unwrap_or(serde_json::Value::Null),
+        );
+        o.insert(
+            "result_snapshot".into(),
+            self.result_snapshot
+                .clone()
+                .map(serde_json::Value::String)
+                .unwrap_or(serde_json::Value::Null),
         );
         serde_json::Value::Object(o)
     }

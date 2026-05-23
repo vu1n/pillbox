@@ -135,6 +135,7 @@ impl SandboxBackend for RemoteE2bSandbox {
         let blob = build_vault_stdin_blob(spec, &opts, resolved, "run --remote (e2b)")?;
         let label = opts.label.clone();
         let detach = opts.detach;
+        let json = opts.json;
         run_attach(
             resolved,
             &self.remote.name,
@@ -143,6 +144,7 @@ impl SandboxBackend for RemoteE2bSandbox {
             &e2b,
             &blob,
             detach,
+            json,
         )
     }
 }
@@ -167,6 +169,7 @@ fn run_attach(
     e2b: &E2bRef,
     blob: &VaultStdinBlob,
     detach: bool,
+    json: bool,
 ) -> Result<()> {
     let blob_bytes = blob.to_bytes()?;
     // `tempfile()` creates the file atomically via `O_CREAT | O_EXCL`
@@ -228,19 +231,28 @@ fn run_attach(
         // exited. Persist the session so the user can reattach.
         (true, Some("detached"), true) => {
             let session =
-                persist_session_from_pump(resolved, remote_name, agent_id, label, &pumped, None)?;
-            println!(
-                "pillbox: ✓ session `{}` started in background (sandbox `{}`).",
-                session.id, session.sandbox_id
-            );
-            println!("         pillbox session attach {}  # reattach", session.id);
+                persist_and_emit_started(resolved, remote_name, agent_id, label, &pumped)?;
+            if json {
+                // Machine-readable: matches `pillbox session info --json`
+                // so orchestrators can use the same parsing path.
+                println!(
+                    "{}",
+                    crate::paths::json_v1(vec![("session", session.to_json_value())])
+                );
+            } else {
+                println!(
+                    "pillbox: ✓ session `{}` started in background (sandbox `{}`).",
+                    session.id, session.sandbox_id
+                );
+                println!("         pillbox session attach {}  # reattach", session.id);
+            }
             Ok(())
         }
         // Interactive Ctrl-A D — helper exited 100 with `detach-pressed`.
         // Persist the session and tell the user how to come back.
         (false, Some("detach-pressed"), false) if status.code() == Some(DETACH_EXIT_CODE) => {
             let session =
-                persist_session_from_pump(resolved, remote_name, agent_id, label, &pumped, None)?;
+                persist_and_emit_started(resolved, remote_name, agent_id, label, &pumped)?;
             eprintln!(
                 "pillbox: detached. reattach with `pillbox session attach {}`",
                 session.id
@@ -366,12 +378,35 @@ pub(crate) fn kill_session(resolved: &Pillbox, session: &Session) -> Result<()> 
     if let Err(e) = outcome.as_ref() {
         eprintln!("pillbox: warning: sandbox kill failed: {e}");
     }
+    // Emit the lifecycle event BEFORE deleting the record so the event
+    // payload can reference a still-valid `Session`. Best-effort — a
+    // failed emit only logs to stderr.
+    crate::events::emit_session_event(resolved, crate::events::EventType::SessionDropped, session);
     session::delete(resolved, &session.id)?;
     println!(
         "pillbox: ✓ session `{}` removed (sandbox `{}` killed).",
         session.id, session.sandbox_id
     );
     Ok(())
+}
+
+/// Persist a freshly-started session and emit the `session.started`
+/// lifecycle event in one call. The two `run_attach` happy-path arms
+/// (`--detach` and Ctrl-A D) both need the exact same pair, in the same
+/// order; bundling them here keeps event emission from drifting out of
+/// step with persistence the next time we add a third detach-shaped
+/// outcome. `attached_pid` is always `None` on initial detach — both
+/// arms are post-helper-exit, so by definition nothing is attached.
+fn persist_and_emit_started(
+    resolved: &Pillbox,
+    remote_name: &str,
+    agent_id: &'static str,
+    label: Option<String>,
+    pump: &PumpOutcome,
+) -> Result<Session> {
+    let session = persist_session_from_pump(resolved, remote_name, agent_id, label, pump, None)?;
+    crate::events::emit_session_event(resolved, crate::events::EventType::SessionStarted, &session);
+    Ok(session)
 }
 
 /// Build a [`Session`] from the data we learned during the helper run,

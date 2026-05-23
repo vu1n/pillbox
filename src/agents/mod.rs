@@ -236,6 +236,12 @@ pub(crate) struct RunOpts {
     /// `--label TEXT` — human label for a detached session, surfaced
     /// in `pillbox session list`. Only meaningful with `--detach`.
     pub(crate) label: Option<String>,
+    /// `--json` — when `--detach` succeeds, emit the new session as
+    /// `{"version":1,"session":{...}}` on stdout instead of the human
+    /// "session started" banner. Lets orchestrators capture the id
+    /// with `jq -r '.session.id'` instead of regex-scraping the
+    /// banner. Only meaningful with `--detach`.
+    pub(crate) json: bool,
 }
 
 #[allow(dead_code)]
@@ -413,6 +419,7 @@ mod tests {
             remote_name: None,
             detach: false,
             label: None,
+            json: false,
         }
     }
 

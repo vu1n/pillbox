@@ -26,6 +26,7 @@ mod docker;
 mod doctor;
 mod envs;
 mod errors;
+mod events;
 mod paths;
 mod pillbox;
 mod registry;
@@ -168,6 +169,12 @@ enum Command {
         /// flag without it instead of silently dropping the value.
         #[arg(long, value_name = "TEXT", requires = "detach")]
         label: Option<String>,
+        /// Emit the started session as a JSON object on stdout instead
+        /// of the human "session started" banner. Useful for
+        /// orchestrators: `pillbox run --detach --json | jq -r
+        /// .session.id`. Only meaningful with `--detach`.
+        #[arg(long, requires = "detach")]
+        json: bool,
         /// Args forwarded to the agent CLI inside the sandbox.
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
@@ -463,6 +470,21 @@ enum SessionAction {
     /// Tear down the backend resources (kill the sandbox) and remove
     /// the session record. Idempotent.
     Rm { id: String },
+    /// Stream session lifecycle events as JSONL on stdout.
+    ///
+    /// v0.7 spike emits `session.started` and `session.dropped` only;
+    /// PR 2 adds `completed`/`failed` + webhook + OTel sinks. The
+    /// `--json` flag is reserved for compat — every line is already
+    /// JSON today; the flag exists so PR 2 can introduce a human
+    /// default without breaking orchestrator callers.
+    Events {
+        /// Keep streaming as new events arrive (`tail -f` shape).
+        #[arg(long)]
+        follow: bool,
+        /// Reserved for compat. v0.7 spike output is always JSONL.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -533,6 +555,7 @@ fn run(cli: Cli) -> Result<()> {
             vault_stdin,
             detach,
             label,
+            json,
             args,
         } => {
             let resolved = Pillbox::resolve(pillbox_arg)?;
@@ -558,6 +581,7 @@ fn run(cli: Cli) -> Result<()> {
                     remote_name: remote,
                     detach,
                     label,
+                    json,
                 },
             )
         }
@@ -715,6 +739,7 @@ fn dispatch_session(resolved: &Pillbox, action: SessionAction) -> Result<()> {
         SessionAction::Attach { id } => session_attach(resolved, &id),
         SessionAction::Detach { id } => session_detach(resolved, &id),
         SessionAction::Rm { id } => session_rm(resolved, &id),
+        SessionAction::Events { follow, json } => events::dispatch_events(resolved, follow, json),
     }
 }
 

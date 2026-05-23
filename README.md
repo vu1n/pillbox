@@ -1,10 +1,11 @@
 # pillbox
 
-**Sandboxed coding agents, bundled.** A pillbox is a self-contained
-unit of (workspace + code + vault + config) that an agent runs
-against. Make one for your machine, one per project, and launch
-`claude` or `codex` inside it — local Docker, a registered VPS over
-SSH, or an E2B managed sandbox.
+**Sandboxed coding agents that travel with their state.** A pillbox
+bundles a workspace, code, credentials, and vault config into one
+self-contained unit. Make one for your machine, one per project, and
+launch `claude` or `codex` against it — locally in Docker, on a
+registered VPS over SSH, or in an E2B managed sandbox. Same bundle,
+three runtimes.
 
 ```sh
 pillbox init                          # one-time: create the global pillbox

@@ -135,6 +135,7 @@ impl SandboxBackend for RemoteE2bSandbox {
         let blob = build_vault_stdin_blob(spec, &opts, resolved, "run --remote (e2b)")?;
         let label = opts.label.clone();
         let detach = opts.detach;
+        let json = opts.json;
         run_attach(
             resolved,
             &self.remote.name,
@@ -143,6 +144,7 @@ impl SandboxBackend for RemoteE2bSandbox {
             &e2b,
             &blob,
             detach,
+            json,
         )
     }
 }
@@ -167,6 +169,7 @@ fn run_attach(
     e2b: &E2bRef,
     blob: &VaultStdinBlob,
     detach: bool,
+    json: bool,
 ) -> Result<()> {
     let blob_bytes = blob.to_bytes()?;
     // `tempfile()` creates the file atomically via `O_CREAT | O_EXCL`
@@ -229,11 +232,25 @@ fn run_attach(
         (true, Some("detached"), true) => {
             let session =
                 persist_session_from_pump(resolved, remote_name, agent_id, label, &pumped, None)?;
-            println!(
-                "pillbox: ✓ session `{}` started in background (sandbox `{}`).",
-                session.id, session.sandbox_id
+            crate::events::emit_session_event(
+                resolved,
+                crate::events::EventType::SessionStarted,
+                &session,
             );
-            println!("         pillbox session attach {}  # reattach", session.id);
+            if json {
+                // Machine-readable: matches `pillbox session info --json`
+                // so orchestrators can use the same parsing path.
+                println!(
+                    "{}",
+                    crate::paths::json_v1(vec![("session", session.to_json_value())])
+                );
+            } else {
+                println!(
+                    "pillbox: ✓ session `{}` started in background (sandbox `{}`).",
+                    session.id, session.sandbox_id
+                );
+                println!("         pillbox session attach {}  # reattach", session.id);
+            }
             Ok(())
         }
         // Interactive Ctrl-A D — helper exited 100 with `detach-pressed`.
@@ -241,6 +258,11 @@ fn run_attach(
         (false, Some("detach-pressed"), false) if status.code() == Some(DETACH_EXIT_CODE) => {
             let session =
                 persist_session_from_pump(resolved, remote_name, agent_id, label, &pumped, None)?;
+            crate::events::emit_session_event(
+                resolved,
+                crate::events::EventType::SessionStarted,
+                &session,
+            );
             eprintln!(
                 "pillbox: detached. reattach with `pillbox session attach {}`",
                 session.id
@@ -366,6 +388,10 @@ pub(crate) fn kill_session(resolved: &Pillbox, session: &Session) -> Result<()> 
     if let Err(e) = outcome.as_ref() {
         eprintln!("pillbox: warning: sandbox kill failed: {e}");
     }
+    // Emit the lifecycle event BEFORE deleting the record so the event
+    // payload can reference a still-valid `Session`. Best-effort — a
+    // failed emit only logs to stderr.
+    crate::events::emit_session_event(resolved, crate::events::EventType::SessionDropped, session);
     session::delete(resolved, &session.id)?;
     println!(
         "pillbox: ✓ session `{}` removed (sandbox `{}` killed).",

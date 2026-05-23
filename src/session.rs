@@ -161,6 +161,28 @@ impl Session {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
+    /// Build a Session record from JUST an id, with empty defaults for
+    /// every other field. Used by the sandbox-side `pillbox session
+    /// done` path where the session record lives on the *host*, not in
+    /// the sandbox — we still want to emit a valid event payload with
+    /// the session id, even though we can't look up the rest of the
+    /// record. The webhook + OTel sinks carry the event to the host /
+    /// orchestrator, which correlates against its own
+    /// `session.started` event via the shared id.
+    pub(crate) fn stub_from_id(id: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            label: None,
+            remote: String::new(),
+            backend: String::new(),
+            sandbox_id: String::new(),
+            pty_pid: 0,
+            agent_id: String::new(),
+            started_at: String::new(),
+            attached_pid: None,
+        }
+    }
+
     /// Fixed-shape test fixture — same `Session` every call so tests
     /// across modules (`session`, `events`, future consumers) agree
     /// on the field values they're asserting against. Override fields

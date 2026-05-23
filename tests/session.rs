@@ -140,6 +140,103 @@ fn info_rejects_ambiguous_prefix() {
 }
 
 #[test]
+fn session_done_emits_completed_event() {
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let out = run(home.path(), cwd.path(), &["init"]);
+    assert_ok(&out, "init");
+    plant_session(home.path(), "abcdef111111", "cloud", None);
+
+    let out = run(
+        home.path(),
+        cwd.path(),
+        &[
+            "session",
+            "done",
+            "abcdef111111",
+            "--status",
+            "ok",
+            "--exit-code",
+            "0",
+        ],
+    );
+    assert_ok(&out, "session done");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("marked completed"), "got: {stdout}");
+
+    // The event should have landed in events.jsonl.
+    let events_path = home.path().join(".pillbox/global/events.jsonl");
+    let body = fs::read_to_string(&events_path).expect("events.jsonl exists");
+    let last_line = body.lines().last().expect("at least one event");
+    let event: serde_json::Value = serde_json::from_str(last_line).expect("json");
+    assert_eq!(event["event"], "session.completed");
+    assert_eq!(event["session_id"], "abcdef111111");
+    assert_eq!(event["status"], "ok");
+    assert_eq!(event["exit_code"], 0);
+}
+
+#[test]
+fn session_done_failed_carries_reason_and_exit_code() {
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let out = run(home.path(), cwd.path(), &["init"]);
+    assert_ok(&out, "init");
+    plant_session(home.path(), "abcdef222222", "cloud", None);
+
+    let out = run(
+        home.path(),
+        cwd.path(),
+        &[
+            "session",
+            "done",
+            "abcdef222222",
+            "--status",
+            "failed",
+            "--reason",
+            "agent panic at line 42",
+            "--exit-code",
+            "139",
+        ],
+    );
+    assert_ok(&out, "session done failed");
+
+    let events_path = home.path().join(".pillbox/global/events.jsonl");
+    let body = fs::read_to_string(&events_path).expect("events.jsonl exists");
+    let last_line = body.lines().last().expect("at least one event");
+    let event: serde_json::Value = serde_json::from_str(last_line).expect("json");
+    assert_eq!(event["event"], "session.failed");
+    assert_eq!(event["status"], "error");
+    assert_eq!(event["reason"], "agent panic at line 42");
+    assert_eq!(event["exit_code"], 139);
+}
+
+#[test]
+fn session_done_works_without_registry_record() {
+    // Sandbox-side use case: there's no local session record (the host
+    // owns it), but `session done` should still emit the event so it
+    // can ferry through the configured sinks (webhook / OTel).
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let out = run(home.path(), cwd.path(), &["init"]);
+    assert_ok(&out, "init");
+
+    let out = run(
+        home.path(),
+        cwd.path(),
+        &["session", "done", "deadbeefcafe", "--status", "ok"],
+    );
+    assert_ok(&out, "session done stub");
+
+    let events_path = home.path().join(".pillbox/global/events.jsonl");
+    let body = fs::read_to_string(&events_path).expect("events.jsonl exists");
+    let event: serde_json::Value = serde_json::from_str(body.trim()).expect("json");
+    assert_eq!(event["event"], "session.completed");
+    assert_eq!(event["session_id"], "deadbeefcafe");
+    // Stub fields are empty strings (the host has the real data).
+    assert_eq!(event["remote"], "");
+}
+
+#[test]
 fn detach_already_detached_is_noop() {
     let home = TempDir::new().unwrap();
     let cwd = TempDir::new().unwrap();

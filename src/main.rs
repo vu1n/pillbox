@@ -175,6 +175,14 @@ enum Command {
         /// .session.id`. Only meaningful with `--detach`.
         #[arg(long, requires = "detach")]
         json: bool,
+        /// POST every lifecycle event to URL as JSON. Forwarded to the
+        /// in-sandbox wrapper so its `pillbox session done` call can
+        /// reach the same URL — orchestrators that subscribe to the
+        /// webhook see started + completed/failed end-to-end without
+        /// pillbox running a daemon. Equivalent to setting
+        /// `$PILLBOX_EVENTS_WEBHOOK` in the environment.
+        #[arg(long = "events-webhook", value_name = "URL")]
+        events_webhook: Option<String>,
         /// Args forwarded to the agent CLI inside the sandbox.
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
@@ -445,6 +453,14 @@ enum RemoteAction {
     },
 }
 
+/// Terminal status passed to `pillbox session done <id>`. Maps to the
+/// `session.completed` / `session.failed` event types in `events.rs`.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum DoneStatus {
+    Ok,
+    Failed,
+}
+
 #[derive(Subcommand, Debug)]
 enum SessionAction {
     /// List sessions started from this pillbox (oldest first).
@@ -470,6 +486,37 @@ enum SessionAction {
     /// Tear down the backend resources (kill the sandbox) and remove
     /// the session record. Idempotent.
     Rm { id: String },
+    /// Mark a session done, emitting `session.completed` or
+    /// `session.failed` to every configured sink (JSONL + webhook +
+    /// OTel). Invoked manually for orchestrator-driven completion, or
+    /// automatically by the in-sandbox wrapper script after the agent
+    /// exits. Does NOT tear down the sandbox — use `session rm` for
+    /// that.
+    ///
+    /// Sandbox-side use: when called from inside an E2B sandbox where
+    /// the session record doesn't exist locally, builds a stub
+    /// payload from the id and relies on webhook / OTel sinks to ferry
+    /// the event to the host or orchestrator.
+    Done {
+        id: String,
+        /// `ok` → emits `session.completed`. `failed` → emits
+        /// `session.failed`.
+        #[arg(long, value_enum)]
+        status: DoneStatus,
+        /// Free-text reason. Only meaningful with `--status failed`;
+        /// surfaced in the event payload + via OTel `status.message`.
+        #[arg(long, value_name = "TEXT")]
+        reason: Option<String>,
+        /// Exit code of the agent process, if known. Surfaced in the
+        /// event payload + as an OTel attribute on the span.
+        #[arg(long = "exit-code", value_name = "N")]
+        exit_code: Option<i32>,
+        /// Path (rustic snapshot URL or local file) to the agent's
+        /// captured tool-call trace. Carried verbatim through to event
+        /// consumers; pillbox doesn't dereference it today.
+        #[arg(long = "trace-path", value_name = "PATH")]
+        trace_path: Option<String>,
+    },
     /// Stream session lifecycle events as JSONL on stdout.
     ///
     /// v0.7 spike emits `session.started` and `session.dropped` only;
@@ -556,6 +603,7 @@ fn run(cli: Cli) -> Result<()> {
             detach,
             label,
             json,
+            events_webhook,
             args,
         } => {
             let resolved = Pillbox::resolve(pillbox_arg)?;
@@ -565,6 +613,19 @@ fn run(cli: Cli) -> Result<()> {
             // + `--vault-stdin` together, so no further check needed.
             if vault_stdin {
                 return crate::sandbox::remote_ssh::dispatch_vault_stdin(&resolved);
+            }
+            // `--events-webhook URL` sets the env var for the duration of
+            // this process so every downstream `emit_session_event` call
+            // (here and threaded through to the helper subprocess) picks
+            // it up uniformly. Equivalent to `PILLBOX_EVENTS_WEBHOOK=URL
+            // pillbox run …`; either form works.
+            // SAFETY: single-threaded at this point — Cli::parse hasn't
+            // spawned any threads, and the backends downstream use the
+            // env var read-only.
+            if let Some(url) = &events_webhook {
+                unsafe {
+                    std::env::set_var("PILLBOX_EVENTS_WEBHOOK", url);
+                }
             }
             dispatch_run(
                 &resolved,
@@ -740,6 +801,13 @@ fn dispatch_session(resolved: &Pillbox, action: SessionAction) -> Result<()> {
         SessionAction::Detach { id } => session_detach(resolved, &id),
         SessionAction::Rm { id } => session_rm(resolved, &id),
         SessionAction::Events { follow, json } => events::dispatch_events(resolved, follow, json),
+        SessionAction::Done {
+            id,
+            status,
+            reason,
+            exit_code,
+            trace_path,
+        } => session_done(resolved, &id, status, reason, exit_code, trace_path),
     }
 }
 
@@ -955,6 +1023,42 @@ fn session_rm(resolved: &Pillbox, id: &str) -> Result<()> {
         )
         .into()),
     }
+}
+
+fn session_done(
+    resolved: &Pillbox,
+    id: &str,
+    status: DoneStatus,
+    reason: Option<String>,
+    exit_code: Option<i32>,
+    trace_path: Option<String>,
+) -> Result<()> {
+    // Try the registry first, but fall back to a stub if we can't find
+    // the session. Sandbox-side invocations (from the e2b template's
+    // wrapper script) have no local registry entry — the host owns the
+    // record. We still want to emit a valid event payload with the id;
+    // the webhook / OTel sinks carry it to the orchestrator, which
+    // correlates against its own `session.started` event.
+    let session =
+        session::resolve(resolved, id).unwrap_or_else(|_| session::Session::stub_from_id(id));
+    let event = match status {
+        DoneStatus::Ok => events::EventType::SessionCompleted {
+            exit_code,
+            trace_path,
+        },
+        DoneStatus::Failed => events::EventType::SessionFailed {
+            reason: reason.unwrap_or_else(|| "agent failed".to_string()),
+            exit_code,
+            trace_path,
+        },
+    };
+    events::emit_session_event(resolved, event, &session);
+    let label = match status {
+        DoneStatus::Ok => "completed",
+        DoneStatus::Failed => "failed",
+    };
+    println!("pillbox: ✓ session `{}` marked {}", session.id, label);
+    Ok(())
 }
 
 fn dispatch_secret(resolved: &Pillbox, action: SecretAction) -> Result<()> {

@@ -41,6 +41,18 @@ rand = "0.9"
 # pillbox process. Direct dep so a `cargo audit` flags advisories
 # instead of hiding behind a transitive resolution.
 libc = "0.2"
+# Webhook sink for the events stream (`pillbox session done` POSTs to
+# `$PILLBOX_EVENTS_WEBHOOK`). The `blocking` feature lets us call from
+# sync code paths without dragging a tokio runtime through every
+# event-emit. Already in the tree transitively via hudsucker; direct
+# dep so a `cargo audit` flags advisories.
+reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-features = false }
+# OTel exporter is the planned follow-up (PR 2b). The JSONL schema +
+# webhook sink ship in this PR; the OTel deps add ~3-4 MB binary
+# growth + the SDK's tokio-runtime bootstrap, which is enough surface
+# to deserve its own focused PR. JSONL field names are already
+# OTel-shaped so the future exporter is a thin shim, not a re-
+# instrumentation.
 # rustic_core re-exposes timestamps as jiff::Zoned — depend on jiff
 # directly so the helper that normalizes to strict RFC3339 doesn't
 # look at types it can't name.

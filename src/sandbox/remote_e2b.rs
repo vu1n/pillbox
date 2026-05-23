@@ -200,6 +200,15 @@ fn run_attach(
         eprintln!("pillbox: detach with Ctrl-A D to keep the sandbox running.");
     }
 
+    // Pre-mint the session id so the sandbox-side wrapper can bake it
+    // into the `pillbox session done` call. Without pre-minting, the id
+    // wouldn't exist until after the helper handshake — too late for
+    // the wrapper to know what to reference. The same id gets written
+    // into the registry once the handshake completes; if the helper
+    // fails before then, the id is orphaned (no record persists), which
+    // is fine — id collisions are astronomically unlikely.
+    let session_id = Session::new_id();
+
     let mut cmd = Command::new("node");
     cmd.arg(&helper)
         .arg("attach")
@@ -208,9 +217,22 @@ fn run_attach(
         .arg("--name")
         .arg(remote_name)
         .arg("--blob-file")
-        .arg(tmp.path());
+        .arg(tmp.path())
+        .arg("--session-id")
+        .arg(&session_id);
     if detach {
         cmd.arg("--detach");
+    }
+    // Forward the events webhook to the sandbox-side wrapper so its
+    // `pillbox session done` call can POST the terminal event back.
+    // Read from process env (set either by the user's shell or by the
+    // `--events-webhook URL` flag below; we don't gate on detach
+    // because attached runs also want completion events for their
+    // observability story).
+    if let Ok(url) = std::env::var("PILLBOX_EVENTS_WEBHOOK") {
+        if !url.is_empty() {
+            cmd.arg("--events-webhook").arg(&url);
+        }
     }
     let (status, pumped) = run_helper(cmd, "run --remote (e2b)")?;
     drop(tmp);
@@ -230,8 +252,14 @@ fn run_attach(
         // `--detach` path: helper emitted `detached` after launch and
         // exited. Persist the session so the user can reattach.
         (true, Some("detached"), true) => {
-            let session =
-                persist_and_emit_started(resolved, remote_name, agent_id, label, &pumped)?;
+            let session = persist_and_emit_started(
+                resolved,
+                remote_name,
+                agent_id,
+                label,
+                &pumped,
+                &session_id,
+            )?;
             if json {
                 // Machine-readable: matches `pillbox session info --json`
                 // so orchestrators can use the same parsing path.
@@ -251,8 +279,14 @@ fn run_attach(
         // Interactive Ctrl-A D — helper exited 100 with `detach-pressed`.
         // Persist the session and tell the user how to come back.
         (false, Some("detach-pressed"), false) if status.code() == Some(DETACH_EXIT_CODE) => {
-            let session =
-                persist_and_emit_started(resolved, remote_name, agent_id, label, &pumped)?;
+            let session = persist_and_emit_started(
+                resolved,
+                remote_name,
+                agent_id,
+                label,
+                &pumped,
+                &session_id,
+            )?;
             eprintln!(
                 "pillbox: detached. reattach with `pillbox session attach {}`",
                 session.id
@@ -403,8 +437,17 @@ fn persist_and_emit_started(
     agent_id: &'static str,
     label: Option<String>,
     pump: &PumpOutcome,
+    pre_minted_id: &str,
 ) -> Result<Session> {
-    let session = persist_session_from_pump(resolved, remote_name, agent_id, label, pump, None)?;
+    let session = persist_session_from_pump(
+        resolved,
+        remote_name,
+        agent_id,
+        label,
+        pump,
+        None,
+        pre_minted_id,
+    )?;
     crate::events::emit_session_event(resolved, crate::events::EventType::SessionStarted, &session);
     Ok(session)
 }
@@ -413,6 +456,7 @@ fn persist_and_emit_started(
 /// persist it, and return it. Pulled out so `run_attach` doesn't grow
 /// duplicate "did we have a sandbox_id and pid? then write a record"
 /// blocks at each happy path.
+#[allow(clippy::too_many_arguments)]
 fn persist_session_from_pump(
     resolved: &Pillbox,
     remote_name: &str,
@@ -420,6 +464,7 @@ fn persist_session_from_pump(
     label: Option<String>,
     pump: &PumpOutcome,
     attached_pid: Option<i64>,
+    pre_minted_id: &str,
 ) -> Result<Session> {
     let sandbox_id = pump.sandbox_id.clone().ok_or_else(|| {
         PillboxError::runtime(
@@ -427,8 +472,12 @@ fn persist_session_from_pump(
             "helper exited successfully but never sent the sandbox-up handshake",
         )
     })?;
+    // The id was minted at the top of `run_attach` so the sandbox-side
+    // wrapper script could bake it into the `pillbox session done` call.
+    // Pull it through here so the registry entry matches what the
+    // wrapper will reference.
     let session = Session {
-        id: Session::new_id(),
+        id: pre_minted_id.to_string(),
         label,
         remote: remote_name.to_string(),
         backend: BACKEND_E2B.to_string(),

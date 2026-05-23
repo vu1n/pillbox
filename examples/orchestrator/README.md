@@ -50,10 +50,12 @@ PR 2 ships these as stable.
 
 | Event | When emitted | Payload fields |
 |---|---|---|
-| `session.started` | After the sandbox + PTY are up and the agent has been launched | `session_id`, `parent_session_id?`, `agent_id`, `remote`, `backend`, `started_at` |
-| `session.completed` | Agent finished successfully (or `pillbox session done <id>`) | `session_id`, `started_at`, `ended_at`, `status: "ok"`, `trace_path?` |
-| `session.failed` | Agent exited non-zero, sandbox died, or `pillbox session done <id> --status=failed` | `session_id`, `started_at`, `ended_at`, `status: "error"`, `reason`, `trace_path?` |
-| `session.dropped` | `pillbox session rm <id>` — sandbox killed, record removed | `session_id`, `at` |
+| `session.started` | After the sandbox + PTY are up and the agent has been launched (host-side) | `session_id`, `agent_id`, `remote`, `backend`, `started_at` |
+| `session.completed` | Agent process exits 0 — emitted by the in-sandbox wrapper via `pillbox session done <id> --status ok` | `session_id`, `ended_at`, `status: "ok"`, `exit_code`, `trace_path?` |
+| `session.failed` | Agent exits non-zero — same wrapper path, `--status failed --reason ...` | `session_id`, `ended_at`, `status: "error"`, `reason`, `exit_code`, `trace_path?` |
+| `session.dropped` | `pillbox session rm <id>` — sandbox killed, record removed (host-side) | `session_id`, `ended_at` |
+
+**Important:** `session.completed` / `session.failed` come from the sandbox-side `pillbox` invocation, not the host. The host must configure a webhook (`--events-webhook URL` or `$PILLBOX_EVENTS_WEBHOOK`) for these events to reach back — there's no daemon polling the sandbox. For runs without a webhook, only `started` + `dropped` land in the host's events.jsonl; the orchestrator wouldn't see when the agent finished.
 
 OTel-shaped field names from day one — `session_id` becomes the
 OTel `span_id`, `parent_session_id` becomes `parent_span_id`,

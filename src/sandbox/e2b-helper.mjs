@@ -94,6 +94,8 @@ function parseArgs(argv) {
 		detach: false,
 		sandboxId: null,
 		pid: null,
+		sessionId: null,
+		eventsWebhook: null,
 	};
 	for (let i = 1; i < argv.length; i++) {
 		const flag = argv[i];
@@ -122,6 +124,28 @@ function parseArgs(argv) {
 				out.pid = Number.parseInt(val ?? "", 10);
 				i++;
 				break;
+			case "--session-id":
+				// Host pre-mints the id and passes it through so the
+				// sandbox-side wrapper can bake it into the
+				// `pillbox session done <id>` call after the agent
+				// exits. Validated alphanumeric-only on the host side
+				// (`Session::new_id` produces hex), so safe to drop
+				// into the shell wrapper without further escaping.
+				out.sessionId = val;
+				i++;
+				break;
+			case "--events-webhook":
+				// Forwarded to the sandbox env so the wrapper's
+				// `pillbox session done` can POST the terminal event
+				// back. URL is validated at the host CLI level
+				// (`validate_events_webhook_url` in src/main.rs:
+				// http(s):// scheme, no whitespace / control chars,
+				// http-to-non-loopback warns) before reaching here;
+				// we still `shellEscape` on the wrapper-line side as
+				// defense in depth.
+				out.eventsWebhook = val;
+				i++;
+				break;
 			default:
 				fail(`unknown flag: ${flag}`);
 		}
@@ -129,6 +153,7 @@ function parseArgs(argv) {
 	if (mode === "attach") {
 		if (!out.template) fail("--template is required for `attach`");
 		if (!out.blobFile) fail("--blob-file is required for `attach`");
+		if (!out.sessionId) fail("--session-id is required for `attach`");
 	}
 	if (mode === "reattach") {
 		if (!out.sandboxId) fail("--sandbox-id is required for `reattach`");
@@ -142,6 +167,21 @@ function parseArgs(argv) {
 
 function notifyRust(payload) {
 	process.stderr.write(`${JSON.stringify(payload)}\n`);
+}
+
+/// Bourne-shell single-quote escape. POSIX shells treat single-quoted
+/// strings literally except for `'` itself, which we close-out, switch
+/// to a literal `"'"`, and re-open. Used on every user-influenced value
+/// spliced into the PTY launch line below. The Rust host already
+/// validates URLs + session ids before they reach here, but defense-in-
+/// depth: if a `'` ever sneaks through, we want the wrapper to fail to
+/// parse cleanly, not silently execute injected commands.
+///
+/// Mirrors `shellEscape` in lum's `apps/desktop/scripts/e2b-provider.mjs`
+/// — the two helpers diverged from a shared spike, and keeping the
+/// idiom byte-identical makes drift easy to spot.
+function shellEscape(value) {
+	return `'${String(value).replaceAll("'", `'"'"'`)}'`;
 }
 
 async function readBlob(path) {
@@ -366,9 +406,29 @@ async function runAttach(args) {
 		pid,
 	});
 
+	// Build the wrapper around `pillbox run --vault-stdin`. After the
+	// agent exits, capture its exit code and call `pillbox session
+	// done` with the pre-minted id so the terminal event (completed /
+	// failed) reaches whatever sinks the env exposes — webhook in
+	// particular, since detached runs have no other path back to the
+	// host. The webhook URL is `shellEscape`d defensively even though
+	// the host validates URL shape; if the URL ever contained shell
+	// metacharacters we'd want to know via clean fail, not via
+	// surprise command injection.
+	const sessionIdEsc = shellEscape(args.sessionId);
+	const webhookExport = args.eventsWebhook
+		? `export PILLBOX_EVENTS_WEBHOOK=${shellEscape(args.eventsWebhook)}; `
+		: "";
 	const launch =
 		`stty -echo raw 2>/dev/null; printf '%s\\n' '${BOOT_MARKER}'; ` +
-		`pillbox run --vault-stdin < ${blobRemote}; rm -f ${blobRemote}\n`;
+		`${webhookExport}` +
+		`pillbox run --vault-stdin < ${shellEscape(blobRemote)}; ` +
+		`PB_EXIT=$?; ` +
+		`pillbox session done ${sessionIdEsc} ` +
+		`--status "$([ $PB_EXIT = 0 ] && echo ok || echo failed)" ` +
+		`--exit-code "$PB_EXIT" ` +
+		`--reason "$([ $PB_EXIT = 0 ] && echo agent-completed || echo "agent exited $PB_EXIT")"; ` +
+		`rm -f ${shellEscape(blobRemote)}\n`;
 	try {
 		await sandbox.pty.sendInput(pid, Buffer.from(launch));
 	} catch (e) {

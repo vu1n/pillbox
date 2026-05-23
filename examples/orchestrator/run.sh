@@ -26,6 +26,13 @@ if [[ -z "$REMOTE" ]]; then
 	exit 64
 fi
 
+# Webhook URL the sandbox-side `pillbox session done` POSTs to. The
+# orchestrator IS the listener — without this, terminal events
+# (completed/failed) never reach back from a detached sandbox. The
+# orchestrator script (in a real impl) would run a small HTTP server on
+# this URL; the spec here just plumbs it through.
+WEBHOOK_URL="${PILLBOX_EVENTS_WEBHOOK:-}"
+
 REPORT_DIR="${PILLBOX_REPORT_DIR:-./reports}"
 mkdir -p "$REPORT_DIR"
 
@@ -35,6 +42,7 @@ TASK_SESSION=$(pillbox run \
 	--remote "$REMOTE" \
 	--detach \
 	--label "task: ${TASK:0:60}" \
+	${WEBHOOK_URL:+--events-webhook "$WEBHOOK_URL"} \
 	--json -- "$TASK" | jq -r '.session.id')
 echo "  → session: $TASK_SESSION"
 
@@ -107,6 +115,7 @@ ANALYZER_SESSION=$(pillbox run \
 	--detach \
 	--mount "$FAILED_DIR:/failed:ro" \
 	--label "analyze: ${TASK:0:50}" \
+	${WEBHOOK_URL:+--events-webhook "$WEBHOOK_URL"} \
 	--json -- "$ANALYZER_PROMPT" | jq -r '.session.id')
 echo "  → analyzer: $ANALYZER_SESSION"
 

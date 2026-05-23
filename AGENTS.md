@@ -88,6 +88,8 @@ global pillbox regardless of where you are.
 | `pillbox session attach ID` | Reattach to a detached session. Detach again with Ctrl-A + D or `pillbox session detach ID` from another shell. v0.6 PR 6: e2b:// remotes only. |
 | `pillbox session detach ID` | Signal a currently-attached pillbox to detach (SIGTERM, no-op if already detached). |
 | `pillbox session rm ID` | Tear down the backend (kill sandbox) and remove the session record. |
+| `pillbox session done ID --status ok\|failed [--reason TEXT] [--exit-code N] [--trace-path PATH]` | Emit `session.completed` / `session.failed` to every configured sink. Invoked automatically by the in-sandbox wrapper after the agent exits; can also be called manually for orchestrator-driven completion. Does NOT tear down the sandbox — use `session rm` for that. |
+| `pillbox session events [--follow] [--json]` | Tail the local events stream (`<pillbox>/events.jsonl`). |
 | `pillbox doctor [--json]` | Diagnose Docker, image, perms, `$HOME`. |
 | `pillbox version` | Print pillbox + runner image versions. |
 | `pillbox push [--tag T] [--message M] [--json]` | Snapshot cwd into the pillbox's rustic repo. |
@@ -111,6 +113,7 @@ global pillbox regardless of where you are.
 | `--vault` | — | Route agent traffic through the stub-swap proxy. |
 | `--remote NAME` | — | Run on a registered remote (`ssh://` or `e2b://`) instead of locally. Requires an S3-shaped workspace backend. For `e2b://` remotes: `node` + `npm i -g e2b` must be installed locally and `E2B_API_KEY` must be available in the environment. |
 | `--detach` | — | Start the session and immediately return — the agent keeps running in the background; reattach with `pillbox session attach <id>`. Requires `--remote`. v0.6 PR 6: e2b:// remotes only. |
+| `--events-webhook URL` | — | POST every lifecycle event to URL as JSON. Forwarded to the in-sandbox wrapper so terminal events (`session.completed`/`failed`) reach back to the orchestrator. Equivalent to `$PILLBOX_EVENTS_WEBHOOK`. |
 | `--label TEXT` | — | Human label for a detached session, surfaced in `pillbox session list`. Only meaningful with `--detach`. |
 
 Env composition order (later layers override earlier):

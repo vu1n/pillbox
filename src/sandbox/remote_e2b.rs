@@ -231,12 +231,7 @@ fn run_attach(
         // exited. Persist the session so the user can reattach.
         (true, Some("detached"), true) => {
             let session =
-                persist_session_from_pump(resolved, remote_name, agent_id, label, &pumped, None)?;
-            crate::events::emit_session_event(
-                resolved,
-                crate::events::EventType::SessionStarted,
-                &session,
-            );
+                persist_and_emit_started(resolved, remote_name, agent_id, label, &pumped)?;
             if json {
                 // Machine-readable: matches `pillbox session info --json`
                 // so orchestrators can use the same parsing path.
@@ -257,12 +252,7 @@ fn run_attach(
         // Persist the session and tell the user how to come back.
         (false, Some("detach-pressed"), false) if status.code() == Some(DETACH_EXIT_CODE) => {
             let session =
-                persist_session_from_pump(resolved, remote_name, agent_id, label, &pumped, None)?;
-            crate::events::emit_session_event(
-                resolved,
-                crate::events::EventType::SessionStarted,
-                &session,
-            );
+                persist_and_emit_started(resolved, remote_name, agent_id, label, &pumped)?;
             eprintln!(
                 "pillbox: detached. reattach with `pillbox session attach {}`",
                 session.id
@@ -398,6 +388,25 @@ pub(crate) fn kill_session(resolved: &Pillbox, session: &Session) -> Result<()> 
         session.id, session.sandbox_id
     );
     Ok(())
+}
+
+/// Persist a freshly-started session and emit the `session.started`
+/// lifecycle event in one call. The two `run_attach` happy-path arms
+/// (`--detach` and Ctrl-A D) both need the exact same pair, in the same
+/// order; bundling them here keeps event emission from drifting out of
+/// step with persistence the next time we add a third detach-shaped
+/// outcome. `attached_pid` is always `None` on initial detach — both
+/// arms are post-helper-exit, so by definition nothing is attached.
+fn persist_and_emit_started(
+    resolved: &Pillbox,
+    remote_name: &str,
+    agent_id: &'static str,
+    label: Option<String>,
+    pump: &PumpOutcome,
+) -> Result<Session> {
+    let session = persist_session_from_pump(resolved, remote_name, agent_id, label, pump, None)?;
+    crate::events::emit_session_event(resolved, crate::events::EventType::SessionStarted, &session);
+    Ok(session)
 }
 
 /// Build a [`Session`] from the data we learned during the helper run,

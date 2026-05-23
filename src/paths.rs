@@ -89,6 +89,29 @@ pub(crate) fn write_private_file(path: &Path, body: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Append `body` to `path` with 0600 perms (create if absent, never
+/// truncate). Companion to [`write_private_file`] for append-only
+/// records — today's only caller is the lifecycle events JSONL stream
+/// ([`crate::events`]). Keeps the "private-on-disk = 0600" invariant
+/// in one place so future append callers don't re-discover `mode(0o600)`.
+///
+/// Note: `mode(0o600)` only applies at *create* time. If the file
+/// already exists with looser perms (user `chmod`'d it), this won't
+/// tighten them — that's the same trade-off [`write_private_file`]
+/// makes. If we ever need re-tighten-on-write, the right move is to
+/// add a `chmod` after `open()` in both helpers, not just here.
+pub(crate) fn append_private_file(path: &Path, body: &[u8]) -> Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("open {} for append", path.display()))?;
+    file.write_all(body)
+        .with_context(|| format!("append to {}", path.display()))?;
+    Ok(())
+}
+
 /// Serialize a pillbox JSON output with the standard `version: 1`
 /// envelope. Every `--json` payload goes through this so consumers can
 /// pin against the version field. Bump the constant on a breaking change.

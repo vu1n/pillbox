@@ -52,7 +52,19 @@ SAW_STARTED=$(jq -c "select(.session_id == \"$SESSION\" and .event == \"session.
 SAW_DROPPED=$(jq -c "select(.session_id == \"$SESSION\" and .event == \"session.dropped\")" "$EVENTS_LOG" | wc -l | tr -d ' ')
 
 PASS=0
-[[ "$SAW_STARTED" -ge 1 ]] && echo "  ✓ session.started observed" || { echo "  ✗ session.started MISSING"; PASS=1; }
-[[ "$SAW_DROPPED" -ge 1 ]] && echo "  ✓ session.dropped observed" || { echo "  ✗ session.dropped MISSING"; PASS=1; }
+# Plain if/else (not `A && B || C`) — `echo` could theoretically fail
+# (closed stdout, EIO) and silently flip the assertion. Shellcheck SC2015.
+if [[ "$SAW_STARTED" -ge 1 ]]; then
+	echo "  ✓ session.started observed"
+else
+	echo "  ✗ session.started MISSING"
+	PASS=1
+fi
+if [[ "$SAW_DROPPED" -ge 1 ]]; then
+	echo "  ✓ session.dropped observed"
+else
+	echo "  ✗ session.dropped MISSING"
+	PASS=1
+fi
 
 exit "$PASS"

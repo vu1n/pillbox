@@ -161,6 +161,32 @@ impl Session {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
+    /// Fixed-shape test fixture — same `Session` every call so tests
+    /// across modules (`session`, `events`, future consumers) agree
+    /// on the field values they're asserting against. Override fields
+    /// after construction for test-specific shapes:
+    ///
+    /// ```ignore
+    /// let mut s = Session::test_fixture();
+    /// s.remote = "other-remote".into();
+    /// ```
+    ///
+    /// Kept `#[cfg(test)]` to keep the production binary slim.
+    #[cfg(test)]
+    pub(crate) fn test_fixture() -> Self {
+        Self {
+            id: "abc123def456".to_string(),
+            label: Some("test".to_string()),
+            remote: "test-remote".to_string(),
+            backend: BACKEND_E2B.to_string(),
+            sandbox_id: "sb_test".to_string(),
+            pty_pid: 0,
+            agent_id: "claude".to_string(),
+            started_at: "2026-05-23T13:37:00Z".to_string(),
+            attached_pid: None,
+        }
+    }
+
     /// Stable JSON shape used by both `session list` (as an array
     /// element) and `session info`. Keep this method (not raw serde
     /// derive) as the single point of truth for the on-wire field set
@@ -342,17 +368,18 @@ mod tests {
     use crate::test_util::with_isolated_home;
 
     fn make(remote: &str, backend: &str) -> Session {
-        Session {
-            id: Session::new_id(),
-            label: None,
-            remote: remote.to_string(),
-            backend: backend.to_string(),
-            sandbox_id: "sb_test".to_string(),
-            pty_pid: 42,
-            agent_id: "claude".to_string(),
-            started_at: now_rfc3339(),
-            attached_pid: None,
-        }
+        // Per-call overrides (id, remote, backend, started_at) on top
+        // of the shared `Session::test_fixture()`. Keeps the
+        // ambiguous-prefix / list-ordering tests deterministic where
+        // the fixture's stable fields wouldn't fit.
+        let mut s = Session::test_fixture();
+        s.id = Session::new_id();
+        s.label = None;
+        s.remote = remote.to_string();
+        s.backend = backend.to_string();
+        s.pty_pid = 42;
+        s.started_at = now_rfc3339();
+        s
     }
 
     #[test]

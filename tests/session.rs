@@ -55,12 +55,7 @@ fn plant_session_with_attached(
 /// Plant a session with an explicit `expires_at` timestamp. Used by
 /// `session prune` tests so we can deterministically place records in
 /// the past or future without sleeping.
-fn plant_session_with_expiry(
-    home: &std::path::Path,
-    id: &str,
-    remote: &str,
-    expires_at: &str,
-) {
+fn plant_session_with_expiry(home: &std::path::Path, id: &str, remote: &str, expires_at: &str) {
     let dir = home.join(".pillbox/global/sessions");
     fs::create_dir_all(&dir).unwrap();
     let body = format!(
@@ -287,8 +282,18 @@ fn session_prune_dry_run_lists_expired_only() {
     assert_ok(&out, "init");
     // One past, one future, one with no expiry — only the past one
     // is expired.
-    plant_session_with_expiry(home.path(), "expired00aaaa", "cloud", "2000-01-01T00:00:00Z");
-    plant_session_with_expiry(home.path(), "future0000bbbb", "cloud", "2099-01-01T00:00:00Z");
+    plant_session_with_expiry(
+        home.path(),
+        "expired00aaaa",
+        "cloud",
+        "2000-01-01T00:00:00Z",
+    );
+    plant_session_with_expiry(
+        home.path(),
+        "future0000bbbb",
+        "cloud",
+        "2099-01-01T00:00:00Z",
+    );
     plant_session(home.path(), "noexpiry000cc", "cloud", None);
 
     let out = run(home.path(), cwd.path(), &["session", "prune", "--dry-run"]);
@@ -313,15 +318,44 @@ fn session_prune_empty_is_friendly() {
     let out = run(home.path(), cwd.path(), &["init"]);
     assert_ok(&out, "init");
     // Only future + no-expiry sessions — nothing to prune.
-    plant_session_with_expiry(home.path(), "future0000bbbb", "cloud", "2099-01-01T00:00:00Z");
+    plant_session_with_expiry(
+        home.path(),
+        "future0000bbbb",
+        "cloud",
+        "2099-01-01T00:00:00Z",
+    );
     plant_session(home.path(), "noexpiry000cc", "cloud", None);
 
     let out = run(home.path(), cwd.path(), &["session", "prune"]);
     assert_ok(&out, "session prune");
     let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("nothing to prune"), "got: {stdout}");
+}
+
+#[test]
+fn session_prune_warns_on_malformed_expires_at() {
+    // A corrupt `expires_at` should NOT be silently dropped (could
+    // leak records forever), but should be surfaced so the user can
+    // fix the record manually. Prune walks the malformed value into
+    // stderr and continues with the rest.
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let out = run(home.path(), cwd.path(), &["init"]);
+    assert_ok(&out, "init");
+    plant_session_with_expiry(home.path(), "garbage000eee", "cloud", "not a timestamp");
+
+    let out = run(home.path(), cwd.path(), &["session", "prune", "--dry-run"]);
+    assert_ok(&out, "session prune --dry-run");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("malformed expires_at") && stderr.contains("garbage000eee"),
+        "expected malformed warning in stderr, got: {stderr}"
+    );
+    // And the record stays put — prune didn't drop it.
+    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("nothing to prune"),
-        "got: {stdout}"
+        "malformed record should not be pruned, got: {stdout}"
     );
 }
 
@@ -336,14 +370,7 @@ fn run_ttl_rejects_malformed_duration() {
         home.path(),
         cwd.path(),
         &[
-            "run",
-            "--remote",
-            "nope",
-            "--detach",
-            "--ttl",
-            "5y",
-            "--",
-            "ignored",
+            "run", "--remote", "nope", "--detach", "--ttl", "5y", "--", "ignored",
         ],
     );
     assert!(!out.status.success(), "5y unit should fail");

@@ -194,6 +194,12 @@ enum Command {
         /// `--detach` (interactive runs don't persist a record).
         /// Pillbox does NOT auto-prune; the user / orchestrator runs
         /// `pillbox session prune` from cron or by hand.
+        /// Caveats: the TTL anchor is the moment the sandbox-spawn
+        /// helper returns (potentially seconds after you press
+        /// enter), not CLI dispatch time — irrelevant for hour/day
+        /// TTLs, occasionally surprising for `--ttl 30s` tests.
+        /// And `expires_at` is computed against the local system
+        /// clock, so badly skewed clocks (no NTP) skew expirations.
         #[arg(long, value_name = "DURATION", requires = "detach")]
         ttl: Option<String>,
         /// Args forwarded to the agent CLI inside the sandbox.
@@ -1140,6 +1146,22 @@ fn session_pull(resolved: &Pillbox, id: &str, to: Option<&std::path::Path>) -> R
 
 fn session_prune(resolved: &Pillbox, dry_run: bool) -> Result<()> {
     let all = session::list(resolved)?;
+    // Surface records with unparseable `expires_at` so a corrupt
+    // timestamp can't silently keep a record alive forever. We warn
+    // and continue — prune itself ignores malformed records (same
+    // policy as `is_expired`) so a single bad record can't gate the
+    // rest. The user fixes manually via `session info` / file edit.
+    for s in &all {
+        if let Some(exp) = &s.expires_at {
+            if !session::is_valid_expires_at(exp) {
+                eprintln!(
+                    "pillbox: warning: session `{}` has malformed expires_at \
+                     `{exp}`; leaving in place (fix the record manually).",
+                    s.id
+                );
+            }
+        }
+    }
     let expired: Vec<session::Session> = all.into_iter().filter(session::is_expired).collect();
     if expired.is_empty() {
         println!("pillbox: no sessions past their TTL — nothing to prune.");

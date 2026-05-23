@@ -421,6 +421,17 @@ pub(crate) fn parse_ttl_seconds(s: &str) -> Result<u64> {
                 format!("missing unit in `{s}` (use `30m`, `24h`, `7d`)"),
             )
         })?);
+    // Strict-digit guard: `u64::from_str` accepts a leading `+`
+    // (so `+30m` would silently parse as 30) and would obviously
+    // accept other non-decimal noise if we ever switched parsers.
+    // Reject anything that isn't a non-empty run of ASCII digits
+    // up front so the contract is "digits + unit", not "whatever
+    // FromStr happens to accept this week".
+    if num_part.is_empty() || !num_part.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(
+            PillboxError::usage("--ttl", format!("invalid number `{num_part}` in `{s}`")).into(),
+        );
+    }
     let n: u64 = num_part.parse().map_err(|_| {
         PillboxError::usage("--ttl", format!("invalid number `{num_part}` in `{s}`"))
     })?;
@@ -461,12 +472,8 @@ pub(crate) fn parse_ttl_seconds(s: &str) -> Result<u64> {
 /// based on the current wall clock. Separated from
 /// [`parse_ttl_seconds`] so tests can hold time constant.
 pub(crate) fn expires_at_from_ttl(ttl_seconds: u64) -> String {
-    use time::format_description::well_known::Rfc3339;
-    let now = time::OffsetDateTime::now_utc();
-    let expires = now + time::Duration::seconds(ttl_seconds as i64);
-    expires
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+    let expires = time::OffsetDateTime::now_utc() + time::Duration::seconds(ttl_seconds as i64);
+    format_rfc3339(expires)
 }
 
 /// True if `expires_at` is in the past (strict — equal-to-now counts
@@ -479,21 +486,37 @@ pub(crate) fn is_expired(session: &Session) -> bool {
     };
     use time::format_description::well_known::Rfc3339;
     let Ok(when) = time::OffsetDateTime::parse(exp, &Rfc3339) else {
-        // Malformed timestamp → treat as never-expires; the prune
-        // command will surface the malformed value via `session
-        // info` and the user can fix it manually.
+        // Malformed timestamp → treat as never-expires so a corrupt
+        // record can't be silently dropped. `session prune` calls
+        // `is_valid_expires_at` separately to surface the bad value
+        // as a warning so the user can fix it manually.
         return false;
     };
     when < time::OffsetDateTime::now_utc()
+}
+
+/// True if `exp` parses as an RFC3339 timestamp. Used by `session
+/// prune` to surface (but not auto-drop) records with corrupt
+/// `expires_at` values.
+pub(crate) fn is_valid_expires_at(exp: &str) -> bool {
+    use time::format_description::well_known::Rfc3339;
+    time::OffsetDateTime::parse(exp, &Rfc3339).is_ok()
 }
 
 /// RFC3339 timestamp for the `started_at` field. Pulled into a function
 /// so tests can stub it (today they just take whatever wall clock
 /// gives them).
 pub(crate) fn now_rfc3339() -> String {
+    format_rfc3339(time::OffsetDateTime::now_utc())
+}
+
+/// Format an [`OffsetDateTime`] as RFC3339. Centralised so
+/// `now_rfc3339`, `expires_at_from_ttl`, and any future timestamp
+/// writers share one fallback policy on the (effectively
+/// unreachable) format error.
+fn format_rfc3339(dt: time::OffsetDateTime) -> String {
     use time::format_description::well_known::Rfc3339;
-    time::OffsetDateTime::now_utc()
-        .format(&Rfc3339)
+    dt.format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
@@ -697,6 +720,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_ttl_rejects_signed_numbers() {
+        // Defense against `u64::from_str` accepting a leading `+`
+        // (and to make a future negative-shaped input fail loudly).
+        let err = parse_ttl_seconds("+30m").unwrap_err().to_string();
+        assert!(err.contains("invalid number"), "got: {err}");
+        let err = parse_ttl_seconds("-5m").unwrap_err().to_string();
+        assert!(err.contains("invalid number"), "got: {err}");
+    }
+
+    #[test]
     fn is_expired_handles_none_and_past_and_future() {
         let mut s = Session::test_fixture();
         // No expires_at → never expires.
@@ -712,6 +745,20 @@ mod tests {
         // user; prune doesn't drop records it can't parse).
         s.expires_at = Some("not a timestamp".into());
         assert!(!is_expired(&s));
+    }
+
+    #[test]
+    fn is_valid_expires_at_round_trips_with_is_expired() {
+        // Anything `is_expired` would parse must validate; anything
+        // it rejects as malformed must fail to validate. Keeps the
+        // two helpers in lock-step (prune relies on this — a record
+        // that validates but doesn't parse would be invisible).
+        assert!(is_valid_expires_at("2000-01-01T00:00:00Z"));
+        assert!(is_valid_expires_at("2099-12-31T23:59:59Z"));
+        assert!(!is_valid_expires_at("not a timestamp"));
+        assert!(!is_valid_expires_at(""));
+        // Truncated / wrong-shape — RFC3339 requires the full form.
+        assert!(!is_valid_expires_at("2099-01-01"));
     }
 
     #[test]

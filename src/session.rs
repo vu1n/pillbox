@@ -169,6 +169,12 @@ impl Session {
     /// record. The webhook + OTel sinks carry the event to the host /
     /// orchestrator, which correlates against its own
     /// `session.started` event via the shared id.
+    ///
+    /// **Consumer note:** an event built from a stub carries empty
+    /// strings (not nulls) for `remote`, `backend`, `agent_id`, and
+    /// `started_at`. Orchestrators should treat the matching
+    /// `session.started` event as the source of truth for those fields
+    /// and key off `session_id` to correlate.
     pub(crate) fn stub_from_id(id: &str) -> Self {
         Self {
             id: id.to_string(),

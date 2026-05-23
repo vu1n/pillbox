@@ -180,7 +180,9 @@ enum Command {
         /// reach the same URL — orchestrators that subscribe to the
         /// webhook see started + completed/failed end-to-end without
         /// pillbox running a daemon. Equivalent to setting
-        /// `$PILLBOX_EVENTS_WEBHOOK` in the environment.
+        /// `$PILLBOX_EVENTS_WEBHOOK` in the environment; when both are
+        /// set, the flag wins (it overwrites the env for the rest of
+        /// this pillbox invocation).
         #[arg(long = "events-webhook", value_name = "URL")]
         events_webhook: Option<String>,
         /// Args forwarded to the agent CLI inside the sandbox.
@@ -618,13 +620,24 @@ fn run(cli: Cli) -> Result<()> {
             // this process so every downstream `emit_session_event` call
             // (here and threaded through to the helper subprocess) picks
             // it up uniformly. Equivalent to `PILLBOX_EVENTS_WEBHOOK=URL
-            // pillbox run …`; either form works.
-            // SAFETY: single-threaded at this point — Cli::parse hasn't
-            // spawned any threads, and the backends downstream use the
-            // env var read-only.
+            // pillbox run …`; either form works. When both the flag and
+            // the env are set, the flag wins (the `set_var` below
+            // overwrites the inherited env for this process tree).
+            //
+            // SAFETY: `std::env::set_var` is `unsafe` in edition 2024
+            // because concurrent `env::var` reads in other threads can
+            // observe a torn pointer. At this call site we're still on
+            // the main thread — `Cli::parse` doesn't spawn, and the
+            // first downstream `std::thread::spawn` (the stderr pump in
+            // `spawn_and_pump`) happens strictly after this `set_var`
+            // returns. We never mutate `PILLBOX_EVENTS_WEBHOOK` again,
+            // so subsequent `env::var` reads (from the pump thread,
+            // from `emit_session_event`, from the helper subprocess)
+            // race only against this single completed write.
             if let Some(url) = &events_webhook {
+                let validated = validate_events_webhook_url(url)?;
                 unsafe {
-                    std::env::set_var("PILLBOX_EVENTS_WEBHOOK", url);
+                    std::env::set_var("PILLBOX_EVENTS_WEBHOOK", &validated);
                 }
             }
             dispatch_run(
@@ -1033,6 +1046,15 @@ fn session_done(
     exit_code: Option<i32>,
     trace_path: Option<String>,
 ) -> Result<()> {
+    // Defense-in-depth on the id arg. `Session::new_id` produces 12
+    // ascii-hex chars; the registry-resolve path enforces this via
+    // length checks + filename lookup. The sandbox-side stub path
+    // (no registry record) skips that gate, so the id flows straight
+    // into the event payload and gets printed to stdout. Reject
+    // anything that isn't ascii-alphanumeric (or `-` for forward-compat
+    // with longer ids) and bound the length so a hostile orchestrator
+    // can't make us emit a multi-megabyte "id" field.
+    validate_session_id(id)?;
     // Try the registry first, but fall back to a stub if we can't find
     // the session. Sandbox-side invocations (from the e2b template's
     // wrapper script) have no local registry entry — the host owns the
@@ -1058,6 +1080,97 @@ fn session_done(
         DoneStatus::Failed => "failed",
     };
     println!("pillbox: ✓ session `{}` marked {}", session.id, label);
+    Ok(())
+}
+
+/// Validate an `--events-webhook URL`:
+///   - non-empty after trim
+///   - no embedded whitespace or control chars (so it can't smuggle
+///     newlines into `Host:` headers or escape the shell wrapper)
+///   - scheme is `http://` or `https://` (no `file://`, `gopher://`, …)
+///   - warns to stderr if scheme is `http://` and the host isn't a
+///     loopback / `.local` address — events contain session ids + exit
+///     codes; in-cluster collectors are fine over plain HTTP, but a
+///     remote cleartext endpoint is almost always a misconfig
+///
+/// Returns the trimmed URL ready to stash in the env var.
+fn validate_events_webhook_url(url: &str) -> Result<String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() || trimmed.bytes().any(|b| b.is_ascii_whitespace() || b < 0x20) {
+        return Err(PillboxError::usage(
+            "run",
+            "--events-webhook URL must be a single URL with no whitespace \
+             or control characters",
+        )
+        .into());
+    }
+    let (scheme, rest) = if let Some(r) = trimmed.strip_prefix("https://") {
+        ("https", r)
+    } else if let Some(r) = trimmed.strip_prefix("http://") {
+        ("http", r)
+    } else {
+        return Err(PillboxError::usage(
+            "run",
+            format!(
+                "--events-webhook URL must start with http:// or https:// \
+                 (got `{trimmed}`)"
+            ),
+        )
+        .into());
+    };
+    if scheme == "http" {
+        // Best-effort host extraction: split on the first `/` or `?` or
+        // `#`, then strip an optional `user@`, then strip an optional
+        // `:port`. Good enough to decide loopback-or-not; we're not
+        // parsing the URL semantically.
+        let host_port = rest
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or("")
+            .rsplit('@')
+            .next()
+            .unwrap_or("");
+        let host = host_port
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(host_port);
+        let is_loopback = matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
+            || host.starts_with("127.")
+            || host.ends_with(".localhost");
+        if !is_loopback {
+            eprintln!(
+                "pillbox: warning: --events-webhook is http:// to a non-loopback \
+                 host (`{host}`); session events will traverse the network in \
+                 cleartext. Use https:// in production."
+            );
+        }
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Validate a session id passed on the command line. Accepts the
+/// 12-hex-char form `Session::new_id` mints today, and tolerates up to
+/// 64 chars of `[A-Za-z0-9-]` for forward compatibility with longer
+/// ids. Anything outside that bucket is a usage error.
+fn validate_session_id(id: &str) -> Result<()> {
+    const MAX_LEN: usize = 64;
+    if id.is_empty() {
+        return Err(PillboxError::usage("session", "session id is empty").into());
+    }
+    if id.len() > MAX_LEN {
+        return Err(PillboxError::usage(
+            "session",
+            format!("session id is {} chars, max {MAX_LEN}", id.len()),
+        )
+        .into());
+    }
+    if !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        return Err(PillboxError::usage(
+            "session",
+            format!("session id `{id}` contains characters outside [A-Za-z0-9-]"),
+        )
+        .into());
+    }
     Ok(())
 }
 
@@ -1681,4 +1794,91 @@ fn snapshot_value(snap: &crate::workspace::Snapshot) -> serde_json::Value {
 
 fn snapshot_json(snap: &crate::workspace::Snapshot) -> String {
     paths::json_v1(vec![("snapshot", snapshot_value(snap))])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_events_webhook_accepts_https() {
+        let out = validate_events_webhook_url("https://collector.example.com/events").unwrap();
+        assert_eq!(out, "https://collector.example.com/events");
+    }
+
+    #[test]
+    fn validate_events_webhook_trims_whitespace() {
+        let out = validate_events_webhook_url("  https://x/y  ").unwrap();
+        assert_eq!(out, "https://x/y");
+    }
+
+    #[test]
+    fn validate_events_webhook_rejects_embedded_whitespace() {
+        let err = validate_events_webhook_url("https://x/y\nHost: evil").unwrap_err();
+        assert!(format!("{err}").contains("whitespace"));
+    }
+
+    #[test]
+    fn validate_events_webhook_rejects_non_http_scheme() {
+        let err = validate_events_webhook_url("file:///etc/passwd").unwrap_err();
+        assert!(format!("{err}").contains("http://"));
+        let err = validate_events_webhook_url("//collector.example.com").unwrap_err();
+        assert!(format!("{err}").contains("http://"));
+    }
+
+    #[test]
+    fn validate_events_webhook_accepts_http_loopback_silently() {
+        // 127.0.0.1, ::1, localhost, *.localhost — all valid http
+        // collector targets for development; no warning emitted.
+        for url in [
+            "http://127.0.0.1:8080/events",
+            "http://localhost:9000",
+            "http://collector.localhost/x",
+            "http://[::1]:9000/events",
+        ] {
+            let out = validate_events_webhook_url(url).unwrap();
+            assert_eq!(out, url);
+        }
+    }
+
+    #[test]
+    fn validate_events_webhook_accepts_http_non_loopback() {
+        // Plain http to a remote is allowed but warns on stderr (not
+        // captured here). The function still returns Ok — pillbox
+        // doesn't refuse the URL, just nudges the user.
+        let url = "http://collector.example.com/events";
+        let out = validate_events_webhook_url(url).unwrap();
+        assert_eq!(out, url);
+    }
+
+    #[test]
+    fn validate_session_id_accepts_minted_form() {
+        // `Session::new_id` produces 12 hex chars.
+        validate_session_id("abcdef012345").unwrap();
+    }
+
+    #[test]
+    fn validate_session_id_rejects_empty_and_too_long() {
+        assert!(validate_session_id("").is_err());
+        let too_long = "a".repeat(65);
+        assert!(validate_session_id(&too_long).is_err());
+    }
+
+    #[test]
+    fn validate_session_id_rejects_shell_metacharacters() {
+        // The id flows into the sandbox-side shell wrapper line. Any
+        // of these would be a problem (or at minimum, weird) — reject
+        // at the host CLI rather than relying on shellEscape alone.
+        for bad in [
+            "abc def",
+            "abc;rm -rf /",
+            "abc$IFS",
+            "abc'foo",
+            "abc`whoami`",
+            "../../../../etc/passwd",
+            "abc\n",
+        ] {
+            assert!(validate_session_id(bad).is_err(), "should reject `{bad}`");
+        }
+    }
 }

@@ -137,10 +137,12 @@ function parseArgs(argv) {
 			case "--events-webhook":
 				// Forwarded to the sandbox env so the wrapper's
 				// `pillbox session done` can POST the terminal event
-				// back. URL is validated at the host CLI level (well-
-				// formed http(s)://) before reaching here; we still
-				// shellEscape on the wrapper-line side as defense in
-				// depth.
+				// back. URL is validated at the host CLI level
+				// (`validate_events_webhook_url` in src/main.rs:
+				// http(s):// scheme, no whitespace / control chars,
+				// http-to-non-loopback warns) before reaching here;
+				// we still `shellEscape` on the wrapper-line side as
+				// defense in depth.
 				out.eventsWebhook = val;
 				i++;
 				break;
@@ -168,14 +170,18 @@ function notifyRust(payload) {
 }
 
 /// Bourne-shell single-quote escape. POSIX shells treat single-quoted
-/// strings literally except for `'` itself, which we close-out, escape,
-/// and re-open. Used on every user-influenced value spliced into the
-/// PTY launch line below. The Rust host already validates URLs +
-/// session ids before they reach here, but defense-in-depth: if a URL
-/// ever sneaks a `'` through, we want the wrapper to fail to parse
-/// cleanly, not silently execute injected commands.
+/// strings literally except for `'` itself, which we close-out, switch
+/// to a literal `"'"`, and re-open. Used on every user-influenced value
+/// spliced into the PTY launch line below. The Rust host already
+/// validates URLs + session ids before they reach here, but defense-in-
+/// depth: if a `'` ever sneaks through, we want the wrapper to fail to
+/// parse cleanly, not silently execute injected commands.
+///
+/// Mirrors `shellEscape` in lum's `apps/desktop/scripts/e2b-provider.mjs`
+/// — the two helpers diverged from a shared spike, and keeping the
+/// idiom byte-identical makes drift easy to spot.
 function shellEscape(value) {
-	return `'${String(value).replaceAll("'", `'\\''`)}'`;
+	return `'${String(value).replaceAll("'", `'"'"'`)}'`;
 }
 
 async function readBlob(path) {

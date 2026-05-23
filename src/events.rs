@@ -67,6 +67,7 @@ use std::{
     fs,
     io::{self, Seek, SeekFrom, Write},
     path::PathBuf,
+    sync::OnceLock,
     thread,
     time::Duration,
 };
@@ -176,26 +177,27 @@ const EVENT_FIELDS: &[&str] = &[
 /// broken sink doesn't kill the run.
 pub(crate) fn emit_session_event(pb: &Pillbox, ty: EventType, session: &Session) {
     let payload = build_event_json(&ty, session);
+    let name = ty.as_str();
     // JSONL is the always-on sink. Failures fall through to a warning;
     // we don't want a missing state dir to abort the agent run.
-    if let Err(e) = jsonl_sink_emit(pb, &payload) {
-        eprintln!(
-            "pillbox: warning: jsonl sink failed for {}: {e}",
-            ty.as_str()
-        );
-    }
+    warn_on_sink_error("jsonl", name, jsonl_sink_emit(pb, &payload));
     // Webhook sink — only fires if the env var is set. Sandbox-side
     // pillbox uses this to ferry terminal events back to whoever is
     // listening (typically the orchestrator).
     if let Ok(url) = std::env::var("PILLBOX_EVENTS_WEBHOOK") {
         if !url.is_empty() {
-            if let Err(e) = webhook_sink_emit(&url, &payload) {
-                eprintln!(
-                    "pillbox: warning: webhook sink failed for {}: {e}",
-                    ty.as_str()
-                );
-            }
+            warn_on_sink_error("webhook", name, webhook_sink_emit(&url, &payload));
         }
+    }
+}
+
+/// One-place warning formatter so adding the OTel sink (PR 2b) only
+/// adds a `warn_on_sink_error("otel", …)` line, not another bespoke
+/// `if let Err(e)` block. Per-sink failures stay independent — a slow
+/// webhook can't suppress the JSONL append, etc.
+fn warn_on_sink_error(sink: &str, event: &str, result: Result<()>) {
+    if let Err(e) = result {
+        eprintln!("pillbox: warning: {sink} sink failed for {event}: {e}");
     }
 }
 
@@ -225,15 +227,22 @@ fn jsonl_sink_emit(pb: &Pillbox, payload: &str) -> Result<()> {
     Ok(())
 }
 
+/// Shared blocking HTTP client for the webhook sink. Built once on
+/// first use and reused for every subsequent emit so a session's 2-4
+/// terminal events don't pay the TLS-context setup cost on each call.
+/// `reqwest::blocking::Client` is `Send + Sync` and internally pools
+/// connections, which is the whole point of caching it.
+static WEBHOOK_CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+
 /// POST one event line to the configured webhook URL. Body is the JSON
 /// payload (without trailing newline). Pillbox uses `reqwest::blocking`
 /// because emit is called from sync code paths; a short request timeout
 /// keeps a slow webhook from blocking the run.
 fn webhook_sink_emit(url: &str, payload: &str) -> Result<()> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .context("build webhook http client")?;
+    // First-call build is the only path that can fail (e.g. native TLS
+    // backend missing). Subsequent calls reuse the cached client, so the
+    // `?` here only short-circuits the first attempt per process.
+    let client = webhook_client()?;
     let resp = client
         .post(url)
         .header("content-type", "application/json")
@@ -247,6 +256,32 @@ fn webhook_sink_emit(url: &str, payload: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// 2s per request — long enough for a healthy collector on the same
+/// continent, short enough that a stuck endpoint doesn't dominate a
+/// session's runtime. A full lifecycle (started + completed + dropped)
+/// is 3 emits, so worst case a dead webhook adds ~6s to a run. The
+/// emit is best-effort; on timeout the call site logs and continues.
+const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Lazy-init the shared client. `get_or_try_init` would let us bubble the
+/// `build` error through `OnceLock`, but it's still nightly-only on
+/// stable Rust; fall back to building, caching on success, and surfacing
+/// the error directly otherwise. Two threads racing here both build a
+/// client; whichever one calls `set` first wins — the loser's client is
+/// dropped harmlessly. Worth the simpler code given how rare a build
+/// failure is.
+fn webhook_client() -> Result<&'static reqwest::blocking::Client> {
+    if let Some(c) = WEBHOOK_CLIENT.get() {
+        return Ok(c);
+    }
+    let built = reqwest::blocking::Client::builder()
+        .timeout(WEBHOOK_TIMEOUT)
+        .build()
+        .context("build webhook http client")?;
+    let _ = WEBHOOK_CLIENT.set(built);
+    Ok(WEBHOOK_CLIENT.get().expect("set or already-set"))
 }
 
 fn build_event_json(ty: &EventType, session: &Session) -> String {

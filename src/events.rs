@@ -181,12 +181,23 @@ const EVENT_FIELDS: &[&str] = &[
     "base_snapshot",
 ];
 
-/// Emit one event for a session lifecycle transition. Routes through
-/// every configured sink (JSONL always; webhook + OTel if env / flags
-/// set). Never panics; per-sink errors are logged to stderr so a
-/// broken sink doesn't kill the run.
-pub(crate) fn emit_session_event(pb: &Pillbox, ty: EventType, session: &Session) {
-    let payload = build_event_json(&ty, session);
+/// Emit one event for a session lifecycle transition. `session` is
+/// optional — `Some` when emitted from the host (full record), `None`
+/// when emitted from inside a sandbox where only the id is known.
+/// Missing fields render as JSON nulls in the payload (not empty
+/// strings); consumers correlate sandbox-side events with the host's
+/// `session.started` via the shared `session_id`.
+///
+/// Routes through every configured sink (JSONL always; webhook + OTel
+/// if env / flags set). Never panics; per-sink errors are logged to
+/// stderr so a broken sink doesn't kill the run.
+pub(crate) fn emit_session_event(
+    pb: &Pillbox,
+    ty: EventType,
+    session_id: &str,
+    session: Option<&Session>,
+) {
+    let payload = build_event_json(&ty, session_id, session);
     let name = ty.as_str();
     // JSONL is the always-on sink. Failures fall through to a warning;
     // we don't want a missing state dir to abort the agent run.
@@ -294,7 +305,7 @@ fn webhook_client() -> Result<&'static reqwest::blocking::Client> {
     Ok(WEBHOOK_CLIENT.get().expect("set or already-set"))
 }
 
-fn build_event_json(ty: &EventType, session: &Session) -> String {
+fn build_event_json(ty: &EventType, session_id: &str, session: Option<&Session>) -> String {
     let now = session::now_rfc3339();
     let ended_at = if ty.is_terminal() || matches!(ty, EventType::SessionDropped) {
         serde_json::Value::String(now)
@@ -325,6 +336,25 @@ fn build_event_json(ty: &EventType, session: &Session) -> String {
         ),
         _ => (None, None, None, None),
     };
+    // Session-derived fields render as JSON null when no record is
+    // available (sandbox-side path). Empty strings would be a lie —
+    // `agent_id: ""` reads as "the agent's name is the empty string",
+    // not "we don't know the agent". `as_opt_str` collapses both
+    // None and Some("") to Null so a stub upstream gets the same
+    // treatment as a missing record.
+    let session_str = |f: fn(&Session) -> &str| -> serde_json::Value {
+        session
+            .map(f)
+            .filter(|s| !s.is_empty())
+            .map(|s| serde_json::Value::String(s.to_string()))
+            .unwrap_or(serde_json::Value::Null)
+    };
+    let session_opt_str = |f: fn(&Session) -> Option<&str>| -> serde_json::Value {
+        session
+            .and_then(f)
+            .map(|s| serde_json::Value::String(s.to_string()))
+            .unwrap_or(serde_json::Value::Null)
+    };
     // `version` first by convention so a consumer scanning the head of
     // the line can branch on it before touching the rest. The field set
     // is mirrored in `EVENT_FIELDS` — the schema test guards that both
@@ -332,19 +362,19 @@ fn build_event_json(ty: &EventType, session: &Session) -> String {
     serde_json::json!({
         "version": EVENT_SCHEMA_VERSION,
         "event": ty.as_str(),
-        "session_id": session.id,
-        "started_at": session.started_at,
+        "session_id": session_id,
+        "started_at": session_str(|s| &s.started_at),
         "ended_at": ended_at,
-        "agent_id": session.agent_id,
-        "remote": session.remote,
-        "backend": session.backend,
-        "label": session.label,
+        "agent_id": session_str(|s| &s.agent_id),
+        "remote": session_str(|s| &s.remote),
+        "backend": session_str(|s| &s.backend),
+        "label": session_opt_str(|s| s.label.as_deref()),
         "status": ty.status_code(),
         "reason": reason,
         "exit_code": exit_code,
         "trace_path": trace_path,
         "result_snapshot": result_snapshot,
-        "base_snapshot": session.base_snapshot,
+        "base_snapshot": session_opt_str(|s| s.base_snapshot.as_deref()),
     })
     .to_string()
 }
@@ -428,7 +458,7 @@ mod tests {
         with_isolated_home("events-emit-all", || {
             let pb = pillbox::global();
             let s = Session::test_fixture();
-            emit_session_event(&pb, EventType::SessionStarted, &s);
+            emit_session_event(&pb, EventType::SessionStarted, &s.id, Some(&s));
             emit_session_event(
                 &pb,
                 EventType::SessionCompleted {
@@ -436,7 +466,8 @@ mod tests {
                     trace_path: Some("rustic://x".into()),
                     result_snapshot: Some("snap-abc".into()),
                 },
-                &s,
+                &s.id,
+                Some(&s),
             );
             emit_session_event(
                 &pb,
@@ -446,9 +477,10 @@ mod tests {
                     trace_path: None,
                     result_snapshot: None,
                 },
-                &s,
+                &s.id,
+                Some(&s),
             );
-            emit_session_event(&pb, EventType::SessionDropped, &s);
+            emit_session_event(&pb, EventType::SessionDropped, &s.id, Some(&s));
             let content = fs::read_to_string(events_path(&pb)).unwrap();
             let lines: Vec<&str> = content.lines().collect();
             assert_eq!(lines.len(), 4);
@@ -554,7 +586,8 @@ mod tests {
                 trace_path: Some("y".into()),
                 result_snapshot: Some("z".into()),
             },
-            &s,
+            &s.id,
+            Some(&s),
         );
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         // OTel-shaped names — verify the field set is what the OTel

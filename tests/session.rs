@@ -299,8 +299,19 @@ fn session_done_works_without_registry_record() {
     let event: serde_json::Value = serde_json::from_str(body.trim()).expect("json");
     assert_eq!(event["event"], "session.completed");
     assert_eq!(event["session_id"], "deadbeefcafe");
-    // Stub fields are empty strings (the host has the real data).
-    assert_eq!(event["remote"], "");
+    // Sandbox-side path has no local record: the session-derived
+    // fields render as JSON null, NOT empty strings. Empty strings
+    // would be a lie (the agent's remote is not literally ""); null
+    // honestly says "we don't know this from here, correlate via
+    // session_id against the host's session.started".
+    assert!(event["remote"].is_null(), "got: {:?}", event["remote"]);
+    assert!(event["backend"].is_null(), "got: {:?}", event["backend"]);
+    assert!(event["agent_id"].is_null(), "got: {:?}", event["agent_id"]);
+    assert!(
+        event["started_at"].is_null(),
+        "got: {:?}",
+        event["started_at"]
+    );
 }
 
 #[test]

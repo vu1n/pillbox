@@ -1122,27 +1122,25 @@ fn session_done(
     // with longer ids) and bound the length so a hostile orchestrator
     // can't make us emit a multi-megabyte "id" field.
     validate_session_id(id)?;
-    // Try the registry first, but fall back to a stub if we can't find
-    // the session. Sandbox-side invocations (from the e2b template's
-    // wrapper script) have no local registry entry — the host owns the
-    // record. We still want to emit a valid event payload with the id;
-    // the webhook / OTel sinks carry it to the orchestrator, which
-    // correlates against its own `session.started` event.
-    let mut session =
-        session::resolve(resolved, id).unwrap_or_else(|_| session::Session::stub_from_id(id));
-    // If the caller passed a `--result-snapshot` AND the session has a
-    // real registry entry (not a sandbox-side stub), persist the
-    // snapshot onto the record so a later `pillbox session pull <id>`
-    // can rehydrate it without round-tripping through the event
-    // stream. Stubs have empty `remote` — that's the cheapest tell
-    // that we built it from id alone.
-    if let Some(snap) = &result_snapshot {
-        if !session.remote.is_empty() {
-            session.result_snapshot = Some(snap.clone());
-            // Best-effort: a write failure here doesn't void the event.
-            if let Err(e) = session::write(resolved, &session) {
-                eprintln!("pillbox: warning: result_snapshot not persisted to session record: {e}");
-            }
+    // Two paths sharing a CLI surface:
+    //   - host-side: registry has the record. Persist
+    //     `--result-snapshot` onto it so later `session pull <id>`
+    //     can rehydrate without round-tripping through the event
+    //     stream.
+    //   - sandbox-side: no record locally (the host owns it). Persist
+    //     is skipped; the event still fires with the snapshot in the
+    //     payload, and an orchestrator's webhook listener can call
+    //     `session done` on the host to update the registry there.
+    //
+    // `Option<Session>` carries the host-vs-sandbox distinction
+    // through the event-emit boundary cleanly — no empty-string
+    // stub-detection hack, no "is this real?" probes downstream.
+    let mut record = session::read(resolved, id)?;
+    if let (Some(snap), Some(s)) = (&result_snapshot, &mut record) {
+        s.result_snapshot = Some(snap.clone());
+        // Best-effort: a write failure here doesn't void the event.
+        if let Err(e) = session::write(resolved, s) {
+            eprintln!("pillbox: warning: result_snapshot not persisted to session record: {e}");
         }
     }
     let event = match status {
@@ -1158,12 +1156,12 @@ fn session_done(
             result_snapshot,
         },
     };
-    events::emit_session_event(resolved, event, &session);
+    events::emit_session_event(resolved, event, id, record.as_ref());
     let label = match status {
         DoneStatus::Ok => "completed",
         DoneStatus::Failed => "failed",
     };
-    println!("pillbox: ✓ session `{}` marked {}", session.id, label);
+    println!("pillbox: ✓ session `{id}` marked {label}");
     Ok(())
 }
 

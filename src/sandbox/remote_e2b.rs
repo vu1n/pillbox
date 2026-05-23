@@ -415,7 +415,12 @@ pub(crate) fn kill_session(resolved: &Pillbox, session: &Session) -> Result<()> 
     // Emit the lifecycle event BEFORE deleting the record so the event
     // payload can reference a still-valid `Session`. Best-effort — a
     // failed emit only logs to stderr.
-    crate::events::emit_session_event(resolved, crate::events::EventType::SessionDropped, session);
+    crate::events::emit_session_event(
+        resolved,
+        crate::events::EventType::SessionDropped,
+        &session.id,
+        Some(session),
+    );
     session::delete(resolved, &session.id)?;
     println!(
         "pillbox: ✓ session `{}` removed (sandbox `{}` killed).",
@@ -448,7 +453,12 @@ fn persist_and_emit_started(
         None,
         pre_minted_id,
     )?;
-    crate::events::emit_session_event(resolved, crate::events::EventType::SessionStarted, &session);
+    crate::events::emit_session_event(
+        resolved,
+        crate::events::EventType::SessionStarted,
+        &session.id,
+        Some(&session),
+    );
     Ok(session)
 }
 
@@ -486,25 +496,11 @@ fn persist_session_from_pump(
         agent_id: agent_id.to_string(),
         started_at: session::now_rfc3339(),
         attached_pid,
-        base_snapshot: latest_snapshot_handle(resolved),
+        base_snapshot: crate::workspace::latest_snapshot_handle(resolved),
         result_snapshot: None,
     };
     session::write(resolved, &session)?;
     Ok(session)
-}
-
-/// Best-effort latest-snapshot lookup for `base_snapshot` capture. A
-/// fresh pillbox (no snapshots yet) is fine — `None` lands in the
-/// record. A workspace-backend failure is also fine: PR 1a wants
-/// fork tracking when the data's there, not to gate the run on it
-/// (the agent might still produce useful work without a recorded
-/// base, and `session pull` falls back to "latest" when the field
-/// is missing).
-fn latest_snapshot_handle(resolved: &Pillbox) -> Option<String> {
-    use crate::workspace::WorkspaceBackend;
-    let backend = resolved.workspace().ok()?;
-    let mut snaps = backend.snapshots().ok()?;
-    snaps.pop().map(|s| s.handle.as_str().to_string())
 }
 
 /// Run a pre-configured helper command with full stdio inheritance

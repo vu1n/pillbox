@@ -36,6 +36,7 @@ mod secrets;
 mod session;
 #[cfg(test)]
 mod test_util;
+mod url_safety;
 mod vault;
 mod workspace;
 
@@ -1285,11 +1286,7 @@ fn validate_events_webhook_url(url: &str) -> Result<String> {
         )
         .into());
     }
-    let (scheme, rest) = if let Some(r) = trimmed.strip_prefix("https://") {
-        ("https", r)
-    } else if let Some(r) = trimmed.strip_prefix("http://") {
-        ("http", r)
-    } else {
+    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
         return Err(PillboxError::usage(
             "run",
             format!(
@@ -1298,33 +1295,13 @@ fn validate_events_webhook_url(url: &str) -> Result<String> {
             ),
         )
         .into());
-    };
-    if scheme == "http" {
-        // Best-effort host extraction: split on the first `/` or `?` or
-        // `#`, then strip an optional `user@`, then strip an optional
-        // `:port`. Good enough to decide loopback-or-not; we're not
-        // parsing the URL semantically.
-        let host_port = rest
-            .split(['/', '?', '#'])
-            .next()
-            .unwrap_or("")
-            .rsplit('@')
-            .next()
-            .unwrap_or("");
-        let host = host_port
-            .rsplit_once(':')
-            .map(|(h, _)| h)
-            .unwrap_or(host_port);
-        let is_loopback = matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
-            || host.starts_with("127.")
-            || host.ends_with(".localhost");
-        if !is_loopback {
-            eprintln!(
-                "pillbox: warning: --events-webhook is http:// to a non-loopback \
-                 host (`{host}`); session events will traverse the network in \
-                 cleartext. Use https:// in production."
-            );
-        }
+    }
+    if let Some(host) = url_safety::plaintext_non_loopback_host(trimmed) {
+        eprintln!(
+            "pillbox: warning: --events-webhook is http:// to a non-loopback \
+             host (`{host}`); session events will traverse the network in \
+             cleartext. Use https:// in production."
+        );
     }
     Ok(trimmed.to_string())
 }

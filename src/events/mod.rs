@@ -1,0 +1,451 @@
+//! Lifecycle events stream — JSONL append to `<pillbox>/events.jsonl`.
+//!
+//! ## Event taxonomy
+//!
+//! Four lifecycle events, all OTel-shaped:
+//!
+//! | Event              | Emitted by         | When                                        |
+//! |--------------------|--------------------|---------------------------------------------|
+//! | `session.started`  | host pillbox       | Sandbox + PTY are up, agent launched        |
+//! | `session.completed`| `session done`     | Agent finished successfully                 |
+//! | `session.failed`   | `session done`     | Agent exited non-zero / errored             |
+//! | `session.dropped`  | host pillbox       | `session rm` torn the sandbox down          |
+//!
+//! `started` and `dropped` fire from the host. `completed`/`failed`
+//! come from inside the sandbox: a wrapper around the agent calls
+//! `pillbox session done <id> --status ok|failed` after the agent
+//! exits, and the sandbox-side pillbox emits the event via whichever
+//! sink the env exposes (`PILLBOX_EVENTS_WEBHOOK`,
+//! `OTEL_EXPORTER_OTLP_ENDPOINT`). For detached runs without a
+//! configured sink, the host won't see the terminal event — documented
+//! limitation, the trade-off for avoiding a daemon.
+//!
+//! ## Field shape (per JSONL line)
+//!
+//! ```jsonc
+//! {
+//!   "version": 1,                          // bump on breaking field-set change
+//!   "event": "session.completed",
+//!   "session_id": "abc123def456",          // → OTel span_id
+//!   "parent_session_id": "789...",         // → OTel parent_span_id (forks)
+//!   "started_at": "2026-05-23T13:37:00Z",  // → OTel span.start_time
+//!   "ended_at":   "2026-05-23T13:42:11Z",  // → OTel span.end_time (terminal only)
+//!   "agent_id": "claude",
+//!   "remote": "prod-cloud",
+//!   "backend": "e2b",
+//!   "label": null,
+//!   // Terminal-event-only fields (null on started / dropped):
+//!   "status": "ok",                        // → OTel status.code ("ok" | "error")
+//!   "reason": null,                        // free-text on failed
+//!   "exit_code": 0,
+//!   "trace_path": "rustic://snapshot/.../trace.jsonl"
+//! }
+//! ```
+//!
+//! ## Sinks
+//!
+//! Three sinks, each in its own submodule
+//! ([`jsonl`], [`webhook`], [`otel`]), all driven by the same
+//! [`emit_session_event`] call site. Each is best-effort
+//! independently — a failed webhook POST doesn't prevent the JSONL
+//! append from succeeding.
+//!
+//! - **JSONL** — appends to `<pillbox>/events.jsonl` (0600). Always
+//!   active on the host. Sandbox-side pillbox also writes here but the
+//!   file is ephemeral with the sandbox.
+//! - **Webhook** — POSTs each event to `--events-webhook URL` (or
+//!   `$PILLBOX_EVENTS_WEBHOOK`). Used to ferry sandbox-side events
+//!   back to the orchestrator without pillbox running a daemon.
+//! - **OTel** — emits one OTLP log record per event to whichever
+//!   collector `$OTEL_EXPORTER_OTLP_ENDPOINT` points at. Default
+//!   transport is HTTP/protobuf via the blocking reqwest client (no
+//!   tokio runtime drag — matches the webhook sink's sync model).
+//!   Optional gRPC behind the `otel-grpc` cargo feature. Spans land
+//!   in the v0.7 PR 2c follow-up once the dual `session.started`
+//!   event provides real durations to span over — emitting zero-
+//!   duration spans on the current taxonomy would be structurally
+//!   worse than no spans at all.
+//!
+//! Best-effort writes: a failed sink emit logs a warning and
+//! continues. The agent run is more important than the event log; the
+//! orchestrator can tolerate a missed event.
+
+use std::{
+    fs,
+    io::{self, Seek, SeekFrom, Write},
+    path::PathBuf,
+    thread,
+    time::Duration,
+};
+
+use anyhow::{Context, Result};
+
+use crate::pillbox::Pillbox;
+use crate::session::{self, Session};
+
+mod jsonl;
+mod otel;
+mod webhook;
+
+/// Filename under `<pillbox>/state_dir/`. Append-only JSONL.
+pub(crate) const EVENTS_FILE: &str = "events.jsonl";
+
+/// Per-event schema version. Bumped on a breaking field-set change so
+/// consumers can pin against it (`select(.version == 1)`). Mirrors the
+/// discipline `paths::json_v1` applies to one-shot `--json` payloads;
+/// stamped per-line here because JSONL has no envelope to carry it.
+const EVENT_SCHEMA_VERSION: u32 = 1;
+
+/// Polling interval for `--follow` mode. 200ms is fast enough for
+/// human-paced session lifecycles and slow enough not to spin CPU.
+/// Real PR 2 will use inotify / kqueue.
+const FOLLOW_POLL_MS: u64 = 200;
+
+/// One lifecycle event variant. Terminal events (`SessionCompleted` /
+/// `SessionFailed`) carry the variant-specific payload inline so
+/// [`build_attributes`] can be exhaustive at compile time. Lost
+/// `Copy` (vs. the spike's unit-only enum) because the variants now
+/// own `String`s — accept the move-by-value cost since emission is
+/// one-shot per call site.
+///
+/// `Session` prefix on every variant is intentional — events are
+/// scoped to sessions today, and the prefix matches the wire name
+/// (`session.started` etc.). Clippy's `enum_variant_names` lint
+/// suggests trimming the prefix, but doing so would decouple the
+/// variant name from the on-wire `event` string.
+#[allow(clippy::enum_variant_names)]
+#[derive(Debug, Clone)]
+pub(crate) enum EventType {
+    SessionStarted,
+    SessionCompleted {
+        exit_code: Option<i32>,
+        trace_path: Option<String>,
+        /// Rustic snapshot handle of the agent's result workspace,
+        /// pushed by the in-sandbox wrapper after the agent exits.
+        /// Consumers correlate with `base_snapshot` (on the session
+        /// record + future `session.started` event) to compute the
+        /// fork's diff. `session pull <id>` rehydrates from this
+        /// handle.
+        result_snapshot: Option<String>,
+    },
+    SessionFailed {
+        reason: String,
+        exit_code: Option<i32>,
+        trace_path: Option<String>,
+        result_snapshot: Option<String>,
+    },
+    SessionDropped,
+}
+
+impl EventType {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            EventType::SessionStarted => "session.started",
+            EventType::SessionCompleted { .. } => "session.completed",
+            EventType::SessionFailed { .. } => "session.failed",
+            EventType::SessionDropped => "session.dropped",
+        }
+    }
+
+    /// `ok` / `error` per OTel `status.code` semantics. Started / dropped
+    /// are non-terminal — `unset` per the OTel default.
+    pub(crate) fn status_code(&self) -> &'static str {
+        match self {
+            EventType::SessionCompleted { .. } => "ok",
+            EventType::SessionFailed { .. } => "error",
+            _ => "unset",
+        }
+    }
+
+    pub(crate) fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            EventType::SessionCompleted { .. } | EventType::SessionFailed { .. }
+        )
+    }
+}
+
+/// One attribute value. The JSONL and OTel sinks each map this onto
+/// their wire format; consolidating to a single type means a new
+/// event field is a one-line addition to [`build_attributes`] instead
+/// of edits coordinated across the JSONL renderer + OTel record
+/// filler. `String` and `i64` are the only shapes the current event
+/// taxonomy uses; widening is a one-variant change.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum AttrValue {
+    Str(String),
+    Int(i64),
+}
+
+/// Emit one event for a session lifecycle transition. `session` is
+/// optional — `Some` when emitted from the host (full record), `None`
+/// when emitted from inside a sandbox where only the id is known.
+/// Missing fields render as JSON nulls in the payload (not empty
+/// strings); consumers correlate sandbox-side events with the host's
+/// `session.started` via the shared `session_id`.
+///
+/// Routes through every configured sink (JSONL always; webhook + OTel
+/// if env / flags set). Never panics; per-sink errors are logged to
+/// stderr so a broken sink doesn't kill the run.
+pub(crate) fn emit_session_event(
+    pb: &Pillbox,
+    ty: EventType,
+    session_id: &str,
+    session: Option<&Session>,
+) {
+    let payload = jsonl::build_event_json(&ty, session_id, session);
+    let name = ty.as_str();
+    // JSONL is the always-on sink. Failures fall through to a warning;
+    // we don't want a missing state dir to abort the agent run.
+    warn_on_sink_error("jsonl", name, jsonl::sink_emit(pb, &payload));
+    // Webhook sink — only fires if the env var is set. Sandbox-side
+    // pillbox uses this to ferry terminal events back to whoever is
+    // listening (typically the orchestrator).
+    if let Ok(url) = std::env::var("PILLBOX_EVENTS_WEBHOOK") {
+        if !url.is_empty() {
+            warn_on_sink_error("webhook", name, webhook::sink_emit(&url, &payload));
+        }
+    }
+    // OTel sink — only fires if OTEL_EXPORTER_OTLP_ENDPOINT is set.
+    // Configured at first use; cached for the rest of the process.
+    // Emits one log record per event with attributes mirroring the
+    // JSONL field set so consumers can correlate.
+    warn_on_sink_error("otel", name, otel::sink_emit(&ty, session_id, session));
+}
+
+/// One-place warning formatter so each sink only adds a
+/// `warn_on_sink_error("name", …)` line, not another bespoke
+/// `if let Err(e)` block. Per-sink failures stay independent — a slow
+/// webhook can't suppress the JSONL append, etc.
+fn warn_on_sink_error(sink: &str, event: &str, result: Result<()>) {
+    if let Err(e) = result {
+        eprintln!("pillbox: warning: {sink} sink failed for {event}: {e}");
+    }
+}
+
+/// Single source of truth for "what attributes does this event
+/// carry." Both the JSONL renderer and the OTel record filler
+/// consume from this list — adding a new field is a one-line edit
+/// here, not three coordinated changes.
+///
+/// `None` values exist (vs. omission) because the JSONL format does
+/// distinguish present-but-null from absent — every event line has
+/// the same key set so consumers can do positional decoding. The
+/// OTel sink filters out `None` since attribute bags have no notion
+/// of "present with null value."
+///
+/// Ordering is stable + matches the historical JSONL layout (version
+/// first so a consumer can branch on schema before parsing the
+/// rest); changing it is a v=2 schema bump.
+pub(crate) fn build_attributes(
+    ty: &EventType,
+    session_id: &str,
+    session: Option<&Session>,
+) -> Vec<(&'static str, Option<AttrValue>)> {
+    let ended_at = (ty.is_terminal() || matches!(ty, EventType::SessionDropped))
+        .then(|| AttrValue::Str(session::now_rfc3339()));
+    let (reason, exit_code, trace_path, result_snapshot) = match ty {
+        EventType::SessionCompleted {
+            exit_code,
+            trace_path,
+            result_snapshot,
+        } => (
+            None,
+            *exit_code,
+            trace_path.clone(),
+            result_snapshot.clone(),
+        ),
+        EventType::SessionFailed {
+            reason,
+            exit_code,
+            trace_path,
+            result_snapshot,
+        } => (
+            Some(reason.clone()),
+            *exit_code,
+            trace_path.clone(),
+            result_snapshot.clone(),
+        ),
+        _ => (None, None, None, None),
+    };
+    // Session-derived fields collapse Some("") and None to None — an
+    // empty `agent_id` would be a lie ("the agent's name is the
+    // empty string"), not "we don't know the agent".
+    let s_str = |f: fn(&Session) -> &str| -> Option<AttrValue> {
+        session
+            .map(f)
+            .filter(|s| !s.is_empty())
+            .map(|s| AttrValue::Str(s.to_string()))
+    };
+    let s_opt = |f: fn(&Session) -> Option<&str>| -> Option<AttrValue> {
+        session.and_then(f).map(|s| AttrValue::Str(s.to_string()))
+    };
+    vec![
+        ("version", Some(AttrValue::Int(EVENT_SCHEMA_VERSION as i64))),
+        ("event", Some(AttrValue::Str(ty.as_str().to_string()))),
+        ("session_id", Some(AttrValue::Str(session_id.to_string()))),
+        ("started_at", s_str(|s| &s.started_at)),
+        ("ended_at", ended_at),
+        ("agent_id", s_str(|s| &s.agent_id)),
+        ("remote", s_str(|s| &s.remote)),
+        ("backend", s_str(|s| &s.backend)),
+        ("label", s_opt(|s| s.label.as_deref())),
+        ("status", Some(AttrValue::Str(ty.status_code().to_string()))),
+        ("reason", reason.map(AttrValue::Str)),
+        ("exit_code", exit_code.map(|c| AttrValue::Int(c as i64))),
+        ("trace_path", trace_path.map(AttrValue::Str)),
+        ("result_snapshot", result_snapshot.map(AttrValue::Str)),
+        ("base_snapshot", s_opt(|s| s.base_snapshot.as_deref())),
+    ]
+}
+
+pub(crate) fn events_path(pb: &Pillbox) -> PathBuf {
+    pb.state_dir.join(EVENTS_FILE)
+}
+
+/// Implementation of `pillbox session events [--follow] [--json]`.
+///
+/// `--json` is currently a no-op — every event is already JSONL —
+/// but the flag is reserved so PR 2 can add a human-readable default
+/// mode without breaking the orchestrator's `--json` callers.
+pub(crate) fn dispatch_events(resolved: &Pillbox, follow: bool, _json: bool) -> Result<()> {
+    let path = events_path(resolved);
+    // Print existing events first (so `--follow` includes history, not
+    // just new lines — useful when an orchestrator starts mid-loop).
+    // Stream via `io::copy` instead of slurping into a `String`: a
+    // long-lived pillbox can accumulate megabytes of history in PR 2 /
+    // PR 3 once `session.completed` + per-tool-call events arrive, and
+    // we don't want a 100MB allocation just to print history once.
+    let mut last_size: u64 = 0;
+    if path.exists() {
+        let mut file = fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
+        let mut stdout = io::stdout();
+        // `io::copy` returns the exact byte count it transferred. Use
+        // that as the tail's resume point instead of trusting a
+        // separately-stat'd size: writes between the stat and the copy
+        // would cause us to either miss bytes or print them twice.
+        last_size = io::copy(&mut file, &mut stdout)
+            .with_context(|| format!("stream {} to stdout", path.display()))?;
+        stdout.flush().ok();
+    }
+    if !follow {
+        return Ok(());
+    }
+    // Naive polling tail. Honest about the choice: fine for human-paced
+    // session lifecycles. Real PR 2 will use inotify / kqueue.
+    loop {
+        thread::sleep(Duration::from_millis(FOLLOW_POLL_MS));
+        let size = match path.metadata() {
+            Ok(m) => m.len(),
+            Err(_) => continue,
+        };
+        if size > last_size {
+            let mut file =
+                fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
+            file.seek(SeekFrom::Start(last_size))
+                .with_context(|| "seek events file")?;
+            let mut stdout = io::stdout();
+            let copied =
+                io::copy(&mut file, &mut stdout).with_context(|| "stream events to stdout")?;
+            stdout.flush().ok();
+            // Advance by the actual byte count copied rather than the
+            // pre-copy `size` stat: a concurrent emit between the stat
+            // and the copy would otherwise either skip the new bytes
+            // (advance past them) or replay them on the next poll.
+            last_size += copied;
+        } else if size < last_size {
+            // File rotated / truncated externally; re-read from start.
+            last_size = 0;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pillbox;
+    use crate::test_util::with_isolated_home;
+
+    #[test]
+    fn emit_appends_jsonl_line_for_all_event_types() {
+        with_isolated_home("events-emit-all", || {
+            let pb = pillbox::global();
+            let s = Session::test_fixture();
+            emit_session_event(&pb, EventType::SessionStarted, &s.id, Some(&s));
+            emit_session_event(
+                &pb,
+                EventType::SessionCompleted {
+                    exit_code: Some(0),
+                    trace_path: Some("rustic://x".into()),
+                    result_snapshot: Some("snap-abc".into()),
+                },
+                &s.id,
+                Some(&s),
+            );
+            emit_session_event(
+                &pb,
+                EventType::SessionFailed {
+                    reason: "agent panic".into(),
+                    exit_code: Some(42),
+                    trace_path: None,
+                    result_snapshot: None,
+                },
+                &s.id,
+                Some(&s),
+            );
+            emit_session_event(&pb, EventType::SessionDropped, &s.id, Some(&s));
+            let content = fs::read_to_string(events_path(&pb)).unwrap();
+            let lines: Vec<&str> = content.lines().collect();
+            assert_eq!(lines.len(), 4);
+
+            let started: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+            assert_eq!(started["event"], "session.started");
+            assert_eq!(started["session_id"], "abc123def456");
+            assert_eq!(started["ended_at"], serde_json::Value::Null);
+            assert_eq!(started["status"], "unset");
+            assert_eq!(started["version"], EVENT_SCHEMA_VERSION);
+
+            let completed: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+            assert_eq!(completed["event"], "session.completed");
+            assert_eq!(completed["status"], "ok");
+            assert_eq!(completed["exit_code"], 0);
+            assert_eq!(completed["trace_path"], "rustic://x");
+            assert!(!completed["ended_at"].is_null());
+
+            let failed: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+            assert_eq!(failed["event"], "session.failed");
+            assert_eq!(failed["status"], "error");
+            assert_eq!(failed["reason"], "agent panic");
+            assert_eq!(failed["exit_code"], 42);
+            assert!(failed["trace_path"].is_null());
+
+            let dropped: serde_json::Value = serde_json::from_str(lines[3]).unwrap();
+            assert_eq!(dropped["event"], "session.dropped");
+            assert!(!dropped["ended_at"].is_null());
+        });
+    }
+
+    #[test]
+    fn jsonl_and_otel_share_the_same_field_set() {
+        // Single source of truth: both sinks consume `build_attributes`,
+        // so the JSONL object keys are exactly the attribute keys. This
+        // test pins that the JSONL renderer doesn't accidentally drop
+        // or rename a field — adding one to `build_attributes` is the
+        // only way to grow the set.
+        let s = Session::test_fixture();
+        let ty = EventType::SessionFailed {
+            reason: "x".into(),
+            exit_code: Some(1),
+            trace_path: Some("y".into()),
+            result_snapshot: Some("z".into()),
+        };
+        let attrs = build_attributes(&ty, &s.id, Some(&s));
+        let raw = jsonl::build_event_json(&ty, &s.id, Some(&s));
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let json_keys: std::collections::BTreeSet<String> =
+            v.as_object().expect("object").keys().cloned().collect();
+        let attr_keys: std::collections::BTreeSet<String> =
+            attrs.iter().map(|(k, _)| k.to_string()).collect();
+        assert_eq!(json_keys, attr_keys, "JSONL keys must match attribute keys");
+    }
+}

@@ -47,16 +47,28 @@ libc = "0.2"
 # event-emit. Already in the tree transitively via hudsucker; direct
 # dep so a `cargo audit` flags advisories.
 reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-features = false }
-# OTel exporter is the planned follow-up (PR 2b). The JSONL schema +
-# webhook sink ship in this PR; the OTel deps add ~3-4 MB binary
-# growth + the SDK's tokio-runtime bootstrap, which is enough surface
-# to deserve its own focused PR. JSONL field names are already
-# OTel-shaped so the future exporter is a thin shim, not a re-
-# instrumentation.
+# OTel logs sink — per-event OTLP log records to whichever collector
+# `OTEL_EXPORTER_OTLP_ENDPOINT` points at. Default transport is
+# HTTP/protobuf via the blocking reqwest client (no tokio runtime
+# drag — emit is sync, matching the webhook sink's model). Spans
+# land in the v0.7 PR 2c follow-up once the dual `session.started`
+# event provides real durations to span over; emitting zero-duration
+# spans today would be structurally worse than no spans at all.
+opentelemetry = "0.30"
+opentelemetry_sdk = { version = "0.30", default-features = false, features = ["logs"] }
+opentelemetry-otlp = { version = "0.30", default-features = false, features = ["logs", "http-proto", "reqwest-blocking-client"] }
 # rustic_core re-exposes timestamps as jiff::Zoned — depend on jiff
 # directly so the helper that normalizes to strict RFC3339 doesn't
 # look at types it can't name.
 jiff = "0.2"
+
+[features]
+# Opt-in OTLP/gRPC transport for the OTel logs sink. Adds tonic +
+# prost to the binary; the sandbox runtime image build leaves it off
+# to keep the in-sandbox pillbox lean (HTTP/protobuf is the default
+# everywhere). Host-side users who run a gRPC-only collector enable
+# this with `cargo install pillbox --features otel-grpc`.
+otel-grpc = ["opentelemetry-otlp/grpc-tonic"]
 
 [profile.release]
 strip = true

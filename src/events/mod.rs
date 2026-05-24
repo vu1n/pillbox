@@ -63,15 +63,15 @@
 //! - **Webhook** — POSTs each event to `--events-webhook URL` (or
 //!   `$PILLBOX_EVENTS_WEBHOOK`). Used to ferry sandbox-side events
 //!   back to the orchestrator without pillbox running a daemon.
-//! - **OTel** — emits one OTLP log record per event to whichever
+//! - **OTel** — emits one OTLP log record per event AND (sandbox-
+//!   side, terminal-only) one OTLP span per session to whichever
 //!   collector `$OTEL_EXPORTER_OTLP_ENDPOINT` points at. Default
 //!   transport is HTTP/protobuf via the blocking reqwest client (no
 //!   tokio runtime drag — matches the webhook sink's sync model).
-//!   Optional gRPC behind the `otel-grpc` cargo feature. Spans land
-//!   in the v0.7 PR 2c follow-up once the dual `session.started`
-//!   event provides real durations to span over — emitting zero-
-//!   duration spans on the current taxonomy would be structurally
-//!   worse than no spans at all.
+//!   Optional gRPC behind the `otel-grpc` cargo feature. Span
+//!   emission is gated on `PILLBOX_SESSION_STARTED_AT` being set by
+//!   the wrapper so `span.start_time` is meaningful — without it the
+//!   log record still ships, the span doesn't.
 //!
 //! Best-effort writes: a failed sink emit logs a warning and
 //! continues. The agent run is more important than the event log; the
@@ -315,11 +315,11 @@ pub(crate) fn emit_session_event(
     warn_on_sink_error(
         "otel-span",
         name,
-        otel::span_emit_if_terminal_sandbox(&ty, session_id, &attrs, current_emitter()),
+        otel::span_sink_emit(&ty, session_id, &attrs, current_emitter()),
     );
     // OTel log sink — fires if OTEL_EXPORTER_OTLP_ENDPOINT is set.
     // Consumes `attrs` (last sink to touch them).
-    warn_on_sink_error("otel", name, otel::sink_emit(&ty, attrs));
+    warn_on_sink_error("otel", name, otel::log_sink_emit(&ty, attrs));
 }
 
 /// One-place warning formatter so each sink only adds a

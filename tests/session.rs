@@ -13,7 +13,7 @@ use std::fs;
 
 use tempfile::TempDir;
 
-use common::{assert_ok, run};
+use common::{assert_ok, run, run_with_env};
 
 /// Drop a synthetic session record into a freshly-`init`-ed pillbox so
 /// the registry-side commands have something to chew on. The record
@@ -434,6 +434,89 @@ fn session_done_works_without_registry_record() {
         event["started_at"].is_null(),
         "got: {:?}",
         event["started_at"]
+    );
+}
+
+#[test]
+fn session_started_emits_event_with_sandbox_observed_timestamp() {
+    // Sandbox-side wrapper invokes this before launching the agent.
+    // The event payload is intentionally minimal — only session_id +
+    // started_at + emitter — because the host's prior session.started
+    // already carries the full record. Consumers join on session_id
+    // and read the cold-start latency from the timestamp delta.
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let out = run(home.path(), cwd.path(), &["init"]);
+    assert_ok(&out, "init");
+
+    let out = run_with_env(
+        home.path(),
+        cwd.path(),
+        &[("PILLBOX_SANDBOX_SIDE", "1")],
+        &["session", "started", "deadbeef0001"],
+    );
+    assert_ok(&out, "session started");
+
+    let events_path = home.path().join(".pillbox/global/events.jsonl");
+    let body = fs::read_to_string(&events_path).expect("events.jsonl exists");
+    let event: serde_json::Value = serde_json::from_str(body.trim()).expect("json");
+    assert_eq!(event["event"], "session.started");
+    assert_eq!(event["session_id"], "deadbeef0001");
+    assert_eq!(event["emitter"], "sandbox");
+    // Wrapper sets PILLBOX_SANDBOX_SIDE so this CLI fires inside the
+    // box; `started_at` is the sandbox's view, not the host's.
+    assert!(
+        event["started_at"].is_string(),
+        "started_at should be a non-null RFC3339 string, got: {:?}",
+        event["started_at"]
+    );
+    // ended_at only fires on terminal / dropped events.
+    assert!(event["ended_at"].is_null());
+    // parent_session_id arrives via PR 2c.3's --parent flag.
+    assert!(event["parent_session_id"].is_null());
+}
+
+#[test]
+fn session_started_without_sandbox_env_renders_host_emitter() {
+    // Defends the inverse of the test above: without
+    // PILLBOX_SANDBOX_SIDE, the same CLI call defaults to
+    // emitter=host. Confirms the env-toggle is the only knob that
+    // flips the emitter — no other implicit signal sneaks in.
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let out = run(home.path(), cwd.path(), &["init"]);
+    assert_ok(&out, "init");
+
+    let out = run(
+        home.path(),
+        cwd.path(),
+        &["session", "started", "deadbeef0002"],
+    );
+    assert_ok(&out, "session started without env");
+
+    let events_path = home.path().join(".pillbox/global/events.jsonl");
+    let body = fs::read_to_string(&events_path).expect("events.jsonl exists");
+    let event: serde_json::Value = serde_json::from_str(body.trim()).expect("json");
+    assert_eq!(event["emitter"], "host");
+}
+
+#[test]
+fn session_started_rejects_malformed_id() {
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let out = run(home.path(), cwd.path(), &["init"]);
+    assert_ok(&out, "init");
+
+    let out = run(
+        home.path(),
+        cwd.path(),
+        &["session", "started", "bad id with spaces"],
+    );
+    assert!(!out.status.success(), "should reject malformed id");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("contains characters outside"),
+        "got: {stderr}"
     );
 }
 

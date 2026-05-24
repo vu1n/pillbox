@@ -6,4 +6,11 @@
 //! Each submodule exposes a `dispatch(resolved, action)` entry that
 //! main.rs's `Command::*` match arms call into.
 
+pub(crate) mod auth;
+pub(crate) mod env;
+pub(crate) mod remote;
+pub(crate) mod secret;
 pub(crate) mod session;
+pub(crate) mod sidecar;
+pub(crate) mod vault;
+pub(crate) mod workspace;

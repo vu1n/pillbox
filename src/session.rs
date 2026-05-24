@@ -476,31 +476,46 @@ pub(crate) fn expires_at_from_ttl(ttl_seconds: u64) -> String {
     format_rfc3339(expires)
 }
 
-/// True if `expires_at` is in the past (strict — equal-to-now counts
-/// as not-yet-expired so we don't race the wall clock). Returns
-/// `false` for sessions with no `expires_at` (no TTL = never
-/// expires).
-pub(crate) fn is_expired(session: &Session) -> bool {
-    let Some(exp) = &session.expires_at else {
-        return false;
-    };
-    use time::format_description::well_known::Rfc3339;
-    let Ok(when) = time::OffsetDateTime::parse(exp, &Rfc3339) else {
-        // Malformed timestamp → treat as never-expires so a corrupt
-        // record can't be silently dropped. `session prune` calls
-        // `is_valid_expires_at` separately to surface the bad value
-        // as a warning so the user can fix it manually.
-        return false;
-    };
-    when < time::OffsetDateTime::now_utc()
+/// Classification of a session's `expires_at` field, computed against
+/// the current wall clock. Exhaustive so callers can dispatch by match
+/// rather than juggling two boolean predicates (`is_expired` +
+/// `is_valid_expires_at`) that each re-parse the same string and
+/// each forget the malformed case differently.
+///
+/// `'a` borrows the malformed string from the source record so the
+/// warning emitter can surface the exact value without an alloc.
+#[derive(Debug)]
+pub(crate) enum ExpiryStatus<'a> {
+    /// `expires_at` is absent. Session has no TTL; never expires.
+    NotSet,
+    /// `expires_at` parsed and is in the future (or equal-to-now,
+    /// which we treat as "not yet" to avoid racing the wall clock).
+    Active,
+    /// `expires_at` parsed and is in the past. `session prune` will
+    /// drop this record.
+    Expired,
+    /// `expires_at` is present but not parseable as RFC3339. Surfaced
+    /// as a warning by `session prune`; the record is left in place
+    /// so a corrupt timestamp doesn't silently drop user data.
+    Malformed(&'a str),
 }
 
-/// True if `exp` parses as an RFC3339 timestamp. Used by `session
-/// prune` to surface (but not auto-drop) records with corrupt
-/// `expires_at` values.
-pub(crate) fn is_valid_expires_at(exp: &str) -> bool {
-    use time::format_description::well_known::Rfc3339;
-    time::OffsetDateTime::parse(exp, &Rfc3339).is_ok()
+impl Session {
+    /// Single-pass classification of `expires_at` against the current
+    /// wall clock. Used by `session prune` to dispatch all three
+    /// terminal cases (warn / drop / leave alone) without re-parsing
+    /// or scanning twice.
+    pub(crate) fn expiry_status(&self) -> ExpiryStatus<'_> {
+        use time::format_description::well_known::Rfc3339;
+        let Some(exp) = &self.expires_at else {
+            return ExpiryStatus::NotSet;
+        };
+        match time::OffsetDateTime::parse(exp, &Rfc3339) {
+            Err(_) => ExpiryStatus::Malformed(exp),
+            Ok(when) if when < time::OffsetDateTime::now_utc() => ExpiryStatus::Expired,
+            Ok(_) => ExpiryStatus::Active,
+        }
+    }
 }
 
 /// RFC3339 timestamp for the `started_at` field. Pulled into a function
@@ -730,35 +745,22 @@ mod tests {
     }
 
     #[test]
-    fn is_expired_handles_none_and_past_and_future() {
+    fn expiry_status_covers_all_four_cases() {
         let mut s = Session::test_fixture();
-        // No expires_at → never expires.
         s.expires_at = None;
-        assert!(!is_expired(&s));
-        // Far past → expired.
+        assert!(matches!(s.expiry_status(), ExpiryStatus::NotSet));
         s.expires_at = Some("2000-01-01T00:00:00Z".into());
-        assert!(is_expired(&s));
-        // Far future → not expired.
+        assert!(matches!(s.expiry_status(), ExpiryStatus::Expired));
         s.expires_at = Some("2099-01-01T00:00:00Z".into());
-        assert!(!is_expired(&s));
-        // Malformed → treated as not-expired (manual fix-up by the
-        // user; prune doesn't drop records it can't parse).
+        assert!(matches!(s.expiry_status(), ExpiryStatus::Active));
         s.expires_at = Some("not a timestamp".into());
-        assert!(!is_expired(&s));
-    }
-
-    #[test]
-    fn is_valid_expires_at_round_trips_with_is_expired() {
-        // Anything `is_expired` would parse must validate; anything
-        // it rejects as malformed must fail to validate. Keeps the
-        // two helpers in lock-step (prune relies on this — a record
-        // that validates but doesn't parse would be invisible).
-        assert!(is_valid_expires_at("2000-01-01T00:00:00Z"));
-        assert!(is_valid_expires_at("2099-12-31T23:59:59Z"));
-        assert!(!is_valid_expires_at("not a timestamp"));
-        assert!(!is_valid_expires_at(""));
-        // Truncated / wrong-shape — RFC3339 requires the full form.
-        assert!(!is_valid_expires_at("2099-01-01"));
+        match s.expiry_status() {
+            ExpiryStatus::Malformed(v) => assert_eq!(v, "not a timestamp"),
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+        // RFC3339 requires the full date-time form.
+        s.expires_at = Some("2099-01-01".into());
+        assert!(matches!(s.expiry_status(), ExpiryStatus::Malformed(_)));
     }
 
     #[test]

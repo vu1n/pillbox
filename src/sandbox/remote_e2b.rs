@@ -260,13 +260,15 @@ fn run_attach(
         // exited. Persist the session so the user can reattach.
         (true, Some("detached"), true) => {
             let session = persist_and_emit_started(
-                resolved,
-                remote_name,
-                agent_id,
-                label,
+                PersistArgs {
+                    resolved,
+                    remote_name,
+                    agent_id,
+                    label,
+                    pre_minted_id: &session_id,
+                    expires_at: expires_at.clone(),
+                },
                 &pumped,
-                &session_id,
-                expires_at.clone(),
             )?;
             if json {
                 // Machine-readable: matches `pillbox session info --json`
@@ -288,13 +290,15 @@ fn run_attach(
         // Persist the session and tell the user how to come back.
         (false, Some("detach-pressed"), false) if status.code() == Some(DETACH_EXIT_CODE) => {
             let session = persist_and_emit_started(
-                resolved,
-                remote_name,
-                agent_id,
-                label,
+                PersistArgs {
+                    resolved,
+                    remote_name,
+                    agent_id,
+                    label,
+                    pre_minted_id: &session_id,
+                    expires_at: expires_at.clone(),
+                },
                 &pumped,
-                &session_id,
-                expires_at.clone(),
             )?;
             eprintln!(
                 "pillbox: detached. reattach with `pillbox session attach {}`",
@@ -438,6 +442,20 @@ pub(crate) fn kill_session(resolved: &Pillbox, session: &Session) -> Result<()> 
     Ok(())
 }
 
+/// Everything `persist_session_from_pump` and `persist_and_emit_started`
+/// need beyond what the dynamic `PumpOutcome` already carries. Kept as
+/// a struct so the two `run_attach` call sites stay readable (named
+/// fields, not positional bag-of-args) and so adding another field
+/// only touches one signature.
+pub(super) struct PersistArgs<'a> {
+    pub(super) resolved: &'a Pillbox,
+    pub(super) remote_name: &'a str,
+    pub(super) agent_id: &'static str,
+    pub(super) label: Option<String>,
+    pub(super) pre_minted_id: &'a str,
+    pub(super) expires_at: Option<String>,
+}
+
 /// Persist a freshly-started session and emit the `session.started`
 /// lifecycle event in one call. The two `run_attach` happy-path arms
 /// (`--detach` and Ctrl-A D) both need the exact same pair, in the same
@@ -445,26 +463,9 @@ pub(crate) fn kill_session(resolved: &Pillbox, session: &Session) -> Result<()> 
 /// step with persistence the next time we add a third detach-shaped
 /// outcome. `attached_pid` is always `None` on initial detach — both
 /// arms are post-helper-exit, so by definition nothing is attached.
-#[allow(clippy::too_many_arguments)]
-fn persist_and_emit_started(
-    resolved: &Pillbox,
-    remote_name: &str,
-    agent_id: &'static str,
-    label: Option<String>,
-    pump: &PumpOutcome,
-    pre_minted_id: &str,
-    expires_at: Option<String>,
-) -> Result<Session> {
-    let session = persist_session_from_pump(
-        resolved,
-        remote_name,
-        agent_id,
-        label,
-        pump,
-        None,
-        pre_minted_id,
-        expires_at,
-    )?;
+fn persist_and_emit_started(args: PersistArgs<'_>, pump: &PumpOutcome) -> Result<Session> {
+    let resolved = args.resolved;
+    let session = persist_session_from_pump(args, pump, None)?;
     crate::events::emit_session_event(
         resolved,
         crate::events::EventType::SessionStarted,
@@ -478,16 +479,10 @@ fn persist_and_emit_started(
 /// persist it, and return it. Pulled out so `run_attach` doesn't grow
 /// duplicate "did we have a sandbox_id and pid? then write a record"
 /// blocks at each happy path.
-#[allow(clippy::too_many_arguments)]
 fn persist_session_from_pump(
-    resolved: &Pillbox,
-    remote_name: &str,
-    agent_id: &'static str,
-    label: Option<String>,
+    args: PersistArgs<'_>,
     pump: &PumpOutcome,
     attached_pid: Option<i64>,
-    pre_minted_id: &str,
-    expires_at: Option<String>,
 ) -> Result<Session> {
     let sandbox_id = pump.sandbox_id.clone().ok_or_else(|| {
         PillboxError::runtime(
@@ -500,20 +495,20 @@ fn persist_session_from_pump(
     // Pull it through here so the registry entry matches what the
     // wrapper will reference.
     let session = Session {
-        id: pre_minted_id.to_string(),
-        label,
-        remote: remote_name.to_string(),
+        id: args.pre_minted_id.to_string(),
+        label: args.label,
+        remote: args.remote_name.to_string(),
         backend: BACKEND_E2B.to_string(),
         sandbox_id,
         pty_pid: pump.pid.unwrap_or(0),
-        agent_id: agent_id.to_string(),
+        agent_id: args.agent_id.to_string(),
         started_at: session::now_rfc3339(),
         attached_pid,
-        base_snapshot: crate::workspace::latest_snapshot_handle(resolved),
+        base_snapshot: crate::workspace::latest_snapshot_handle(args.resolved),
         result_snapshot: None,
-        expires_at,
+        expires_at: args.expires_at,
     };
-    session::write(resolved, &session)?;
+    session::write(args.resolved, &session)?;
     Ok(session)
 }
 

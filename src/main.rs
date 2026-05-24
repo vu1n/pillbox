@@ -1145,24 +1145,26 @@ fn session_pull(resolved: &Pillbox, id: &str, to: Option<&std::path::Path>) -> R
 }
 
 fn session_prune(resolved: &Pillbox, dry_run: bool) -> Result<()> {
-    let all = session::list(resolved)?;
-    // Surface records with unparseable `expires_at` so a corrupt
-    // timestamp can't silently keep a record alive forever. We warn
-    // and continue — prune itself ignores malformed records (same
-    // policy as `is_expired`) so a single bad record can't gate the
-    // rest. The user fixes manually via `session info` / file edit.
-    for s in &all {
-        if let Some(exp) = &s.expires_at {
-            if !session::is_valid_expires_at(exp) {
+    // Single-pass classification: `Session::expiry_status` parses
+    // `expires_at` once and returns a typed enum. We collect the
+    // expired records and warn on malformed in the same loop — no
+    // double scan, no two-predicate drift, no duplicate RFC3339
+    // parse per session. Malformed records are left in place
+    // (corrupt timestamp shouldn't silently drop user data).
+    let mut expired: Vec<session::Session> = Vec::new();
+    for s in session::list(resolved)? {
+        match s.expiry_status() {
+            session::ExpiryStatus::Malformed(value) => {
                 eprintln!(
                     "pillbox: warning: session `{}` has malformed expires_at \
-                     `{exp}`; leaving in place (fix the record manually).",
+                     `{value}`; leaving in place (fix the record manually).",
                     s.id
                 );
             }
+            session::ExpiryStatus::Expired => expired.push(s),
+            session::ExpiryStatus::Active | session::ExpiryStatus::NotSet => {}
         }
     }
-    let expired: Vec<session::Session> = all.into_iter().filter(session::is_expired).collect();
     if expired.is_empty() {
         println!("pillbox: no sessions past their TTL — nothing to prune.");
         return Ok(());

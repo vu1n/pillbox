@@ -165,30 +165,17 @@ impl EventType {
     }
 }
 
-/// The OTel-shaped field set every event carries. Compiled in for the
-/// schema-shape test ([`tests::build_event_includes_otel_shaped_fields`])
-/// so adding a key to `build_event_json` without updating this list (or
-/// vice-versa) is caught by `cargo test`. Kept `#[cfg(test)]` because
-/// production code uses the field names directly via the `json!` macro;
-/// indirecting through this slice at runtime would buy nothing.
-#[cfg(test)]
-const EVENT_FIELDS: &[&str] = &[
-    "version",
-    "event",
-    "session_id",
-    "started_at",
-    "ended_at",
-    "agent_id",
-    "remote",
-    "backend",
-    "label",
-    "status",
-    "reason",
-    "exit_code",
-    "trace_path",
-    "result_snapshot",
-    "base_snapshot",
-];
+/// One attribute value. The JSONL and OTel sinks each map this onto
+/// their wire format; consolidating to a single type means a new
+/// event field is a one-line addition to [`build_attributes`] instead
+/// of edits coordinated across the JSONL renderer + OTel record
+/// filler. `String` and `i64` are the only shapes the current event
+/// taxonomy uses; widening is a one-variant change.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum AttrValue {
+    Str(String),
+    Int(i64),
+}
 
 /// Emit one event for a session lifecycle transition. `session` is
 /// optional — `Some` when emitted from the host (full record), `None`
@@ -487,11 +474,11 @@ fn build_otel_logger(
     Ok(provider.logger("pillbox"))
 }
 
-/// Fill a freshly-created [`LogRecord`] with the same field set the
-/// JSONL line carries. Kept separate from `otel_sink_emit` so the
-/// attribute-shape test can exercise it without touching the global
-/// logger cache (which would require env-var manipulation and break
-/// test parallelism).
+/// Fill a freshly-created [`LogRecord`] from the shared attribute
+/// list. `None` values are omitted (OTel attribute bags have no
+/// notion of "present with null value"). Kept separate from
+/// `otel_sink_emit` so the attribute-shape test can exercise it
+/// without touching the global logger cache.
 fn fill_log_record<R: opentelemetry::logs::LogRecord>(
     record: &mut R,
     ty: &EventType,
@@ -507,12 +494,18 @@ fn fill_log_record<R: opentelemetry::logs::LogRecord>(
     // body keeps single-line tail-style log viewers readable without
     // duplicating the structured fields.
     record.set_body(opentelemetry::logs::AnyValue::String(ty.as_str().into()));
-    record.add_attribute("version", EVENT_SCHEMA_VERSION as i64);
-    record.add_attribute("event", ty.as_str());
-    record.add_attribute("session_id", session_id.to_string());
-    record.add_attribute("status", ty.status_code());
-    add_terminal_attributes(record, ty);
-    add_session_attributes(record, session);
+    for (key, value) in build_attributes(ty, session_id, session) {
+        if let Some(v) = value {
+            record.add_attribute(key, attr_to_otel(v));
+        }
+    }
+}
+
+fn attr_to_otel(v: AttrValue) -> opentelemetry::logs::AnyValue {
+    match v {
+        AttrValue::Str(s) => opentelemetry::logs::AnyValue::String(s.into()),
+        AttrValue::Int(i) => opentelemetry::logs::AnyValue::Int(i),
+    }
 }
 
 /// Map a lifecycle event to its (`Severity`, severity-text) pair.
@@ -526,84 +519,27 @@ fn severity_for(ty: &EventType) -> (opentelemetry::logs::Severity, &'static str)
     }
 }
 
-fn add_terminal_attributes<R: opentelemetry::logs::LogRecord>(record: &mut R, ty: &EventType) {
-    match ty {
-        EventType::SessionCompleted {
-            exit_code,
-            trace_path,
-            result_snapshot,
-        } => {
-            if let Some(code) = exit_code {
-                record.add_attribute("exit_code", *code as i64);
-            }
-            if let Some(path) = trace_path {
-                record.add_attribute("trace_path", path.clone());
-            }
-            if let Some(snap) = result_snapshot {
-                record.add_attribute("result_snapshot", snap.clone());
-            }
-        }
-        EventType::SessionFailed {
-            reason,
-            exit_code,
-            trace_path,
-            result_snapshot,
-        } => {
-            record.add_attribute("reason", reason.clone());
-            if let Some(code) = exit_code {
-                record.add_attribute("exit_code", *code as i64);
-            }
-            if let Some(path) = trace_path {
-                record.add_attribute("trace_path", path.clone());
-            }
-            if let Some(snap) = result_snapshot {
-                record.add_attribute("result_snapshot", snap.clone());
-            }
-        }
-        EventType::SessionStarted | EventType::SessionDropped => {}
-    }
-}
-
-/// Empty / missing fields are *omitted* rather than emitted as
-/// explicit nulls — OTel attribute bags have no notion of "present
-/// with null value" (it's either there or not). The JSONL sink
-/// renders the same fields as JSON `null` because JSON objects do
-/// carry that distinction. Same semantic ("we don't have this"),
-/// representation per format.
-fn add_session_attributes<R: opentelemetry::logs::LogRecord>(
-    record: &mut R,
+/// Single source of truth for "what attributes does this event
+/// carry." Both the JSONL renderer and the OTel record filler
+/// consume from this list — adding a new field is a one-line edit
+/// here, not three coordinated changes.
+///
+/// `None` values exist (vs. omission) because the JSONL format does
+/// distinguish present-but-null from absent — every event line has
+/// the same key set so consumers can do positional decoding. The
+/// OTel sink filters out `None` since attribute bags have no notion
+/// of "present with null value."
+///
+/// Ordering is stable + matches the historical JSONL layout (version
+/// first so a consumer can branch on schema before parsing the
+/// rest); changing it is a v=2 schema bump.
+pub(crate) fn build_attributes(
+    ty: &EventType,
+    session_id: &str,
     session: Option<&Session>,
-) {
-    let Some(s) = session else {
-        return;
-    };
-    if !s.started_at.is_empty() {
-        record.add_attribute("started_at", s.started_at.clone());
-    }
-    if !s.agent_id.is_empty() {
-        record.add_attribute("agent_id", s.agent_id.clone());
-    }
-    if !s.remote.is_empty() {
-        record.add_attribute("remote", s.remote.clone());
-    }
-    if !s.backend.is_empty() {
-        record.add_attribute("backend", s.backend.clone());
-    }
-    if let Some(label) = &s.label {
-        record.add_attribute("label", label.clone());
-    }
-    if let Some(snap) = &s.base_snapshot {
-        record.add_attribute("base_snapshot", snap.clone());
-    }
-}
-
-fn build_event_json(ty: &EventType, session_id: &str, session: Option<&Session>) -> String {
-    let now = session::now_rfc3339();
-    let ended_at = if ty.is_terminal() || matches!(ty, EventType::SessionDropped) {
-        serde_json::Value::String(now)
-    } else {
-        serde_json::Value::Null
-    };
+) -> Vec<(&'static str, Option<AttrValue>)> {
+    let ended_at = (ty.is_terminal() || matches!(ty, EventType::SessionDropped))
+        .then(|| AttrValue::Str(session::now_rfc3339()));
     let (reason, exit_code, trace_path, result_snapshot) = match ty {
         EventType::SessionCompleted {
             exit_code,
@@ -628,47 +564,51 @@ fn build_event_json(ty: &EventType, session_id: &str, session: Option<&Session>)
         ),
         _ => (None, None, None, None),
     };
-    // Session-derived fields render as JSON null when no record is
-    // available (sandbox-side path). Empty strings would be a lie —
-    // `agent_id: ""` reads as "the agent's name is the empty string",
-    // not "we don't know the agent". `as_opt_str` collapses both
-    // None and Some("") to Null so a stub upstream gets the same
-    // treatment as a missing record.
-    let session_str = |f: fn(&Session) -> &str| -> serde_json::Value {
+    // Session-derived fields collapse Some("") and None to None — an
+    // empty `agent_id` would be a lie ("the agent's name is the
+    // empty string"), not "we don't know the agent".
+    let s_str = |f: fn(&Session) -> &str| -> Option<AttrValue> {
         session
             .map(f)
             .filter(|s| !s.is_empty())
-            .map(|s| serde_json::Value::String(s.to_string()))
-            .unwrap_or(serde_json::Value::Null)
+            .map(|s| AttrValue::Str(s.to_string()))
     };
-    let session_opt_str = |f: fn(&Session) -> Option<&str>| -> serde_json::Value {
-        session
-            .and_then(f)
-            .map(|s| serde_json::Value::String(s.to_string()))
-            .unwrap_or(serde_json::Value::Null)
+    let s_opt = |f: fn(&Session) -> Option<&str>| -> Option<AttrValue> {
+        session.and_then(f).map(|s| AttrValue::Str(s.to_string()))
     };
-    // `version` first by convention so a consumer scanning the head of
-    // the line can branch on it before touching the rest. The field set
-    // is mirrored in `EVENT_FIELDS` — the schema test guards that both
-    // stay in sync.
-    serde_json::json!({
-        "version": EVENT_SCHEMA_VERSION,
-        "event": ty.as_str(),
-        "session_id": session_id,
-        "started_at": session_str(|s| &s.started_at),
-        "ended_at": ended_at,
-        "agent_id": session_str(|s| &s.agent_id),
-        "remote": session_str(|s| &s.remote),
-        "backend": session_str(|s| &s.backend),
-        "label": session_opt_str(|s| s.label.as_deref()),
-        "status": ty.status_code(),
-        "reason": reason,
-        "exit_code": exit_code,
-        "trace_path": trace_path,
-        "result_snapshot": result_snapshot,
-        "base_snapshot": session_opt_str(|s| s.base_snapshot.as_deref()),
-    })
-    .to_string()
+    vec![
+        ("version", Some(AttrValue::Int(EVENT_SCHEMA_VERSION as i64))),
+        ("event", Some(AttrValue::Str(ty.as_str().to_string()))),
+        ("session_id", Some(AttrValue::Str(session_id.to_string()))),
+        ("started_at", s_str(|s| &s.started_at)),
+        ("ended_at", ended_at),
+        ("agent_id", s_str(|s| &s.agent_id)),
+        ("remote", s_str(|s| &s.remote)),
+        ("backend", s_str(|s| &s.backend)),
+        ("label", s_opt(|s| s.label.as_deref())),
+        ("status", Some(AttrValue::Str(ty.status_code().to_string()))),
+        ("reason", reason.map(AttrValue::Str)),
+        ("exit_code", exit_code.map(|c| AttrValue::Int(c as i64))),
+        ("trace_path", trace_path.map(AttrValue::Str)),
+        ("result_snapshot", result_snapshot.map(AttrValue::Str)),
+        ("base_snapshot", s_opt(|s| s.base_snapshot.as_deref())),
+    ]
+}
+
+fn build_event_json(ty: &EventType, session_id: &str, session: Option<&Session>) -> String {
+    let map: serde_json::Map<String, serde_json::Value> = build_attributes(ty, session_id, session)
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), attr_to_json(v)))
+        .collect();
+    serde_json::Value::Object(map).to_string()
+}
+
+fn attr_to_json(v: Option<AttrValue>) -> serde_json::Value {
+    match v {
+        Some(AttrValue::Str(s)) => serde_json::Value::String(s),
+        Some(AttrValue::Int(i)) => serde_json::Value::Number(i.into()),
+        None => serde_json::Value::Null,
+    }
 }
 
 pub(crate) fn events_path(pb: &Pillbox) -> PathBuf {
@@ -999,28 +939,26 @@ mod tests {
     }
 
     #[test]
-    fn build_event_includes_otel_shaped_fields() {
+    fn jsonl_and_otel_share_the_same_field_set() {
+        // Single source of truth: both sinks consume `build_attributes`,
+        // so the JSONL object keys are exactly the attribute keys. This
+        // test pins that the JSONL renderer doesn't accidentally drop
+        // or rename a field — adding one to `build_attributes` is the
+        // only way to grow the set.
         let s = Session::test_fixture();
-        // Render a terminal event so the schema includes every field
-        // (started / dropped leave the terminal-only fields null but
-        // still present in the JSON object).
-        let raw = build_event_json(
-            &EventType::SessionFailed {
-                reason: "x".into(),
-                exit_code: Some(1),
-                trace_path: Some("y".into()),
-                result_snapshot: Some("z".into()),
-            },
-            &s.id,
-            Some(&s),
-        );
+        let ty = EventType::SessionFailed {
+            reason: "x".into(),
+            exit_code: Some(1),
+            trace_path: Some("y".into()),
+            result_snapshot: Some("z".into()),
+        };
+        let attrs = build_attributes(&ty, &s.id, Some(&s));
+        let raw = build_event_json(&ty, &s.id, Some(&s));
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        // OTel-shaped names — verify the field set is what the OTel
-        // exporter will consume without re-mapping. The list lives on
-        // `EVENT_FIELDS` so adding a field to one place forces the
-        // other.
-        for field in EVENT_FIELDS {
-            assert!(v.get(field).is_some(), "missing field: {field}");
-        }
+        let json_keys: std::collections::BTreeSet<String> =
+            v.as_object().expect("object").keys().cloned().collect();
+        let attr_keys: std::collections::BTreeSet<String> =
+            attrs.iter().map(|(k, _)| k.to_string()).collect();
+        assert_eq!(json_keys, attr_keys, "JSONL keys must match attribute keys");
     }
 }

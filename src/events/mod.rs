@@ -195,6 +195,21 @@ impl EventType {
 /// must not treat `emitter == "host"` as a trust boundary.
 const SANDBOX_SIDE_ENV: &str = "PILLBOX_SANDBOX_SIDE";
 
+/// Env var the host's `pillbox run --parent <id>` sets so both the
+/// host's own `session.started` emit and the sandbox-side
+/// `session started` CLI (via the helper's bash export) can pick up
+/// the parent reference without re-threading through call signatures.
+pub(crate) const PARENT_SESSION_ID_ENV: &str = "PILLBOX_PARENT_SESSION_ID";
+
+/// Read [`PARENT_SESSION_ID_ENV`] and normalize empty → None. Shared
+/// chokepoint so the host and sandbox paths can't drift on env-name
+/// or empty-string handling.
+pub(crate) fn parent_session_id_from_env() -> Option<String> {
+    std::env::var(PARENT_SESSION_ID_ENV)
+        .ok()
+        .filter(|v| !v.is_empty())
+}
+
 /// Which side of the host/sandbox split emitted this event. Lets
 /// consumers tell apart the two `session.started` lines (host's
 /// "I saw the sandbox come up" vs. sandbox's "I'm running the

@@ -201,6 +201,21 @@ const SANDBOX_SIDE_ENV: &str = "PILLBOX_SANDBOX_SIDE";
 /// the parent reference without re-threading through call signatures.
 pub(crate) const PARENT_SESSION_ID_ENV: &str = "PILLBOX_PARENT_SESSION_ID";
 
+/// Env var the wrapper script captures via `date -u -Iseconds` so the
+/// sandbox-side `session started` and `session done` invocations
+/// (different processes) read the SAME timestamp for the session's
+/// start. Used by `started_at` on the started event AND
+/// `span.start_time` on the terminal event's span — pinning both to
+/// one wall-clock read avoids microsecond skew between the two
+/// emitter paths.
+///
+/// Like the other PILLBOX_* env vars, this is observability tagging
+/// only — anything that can write the process env can backdate the
+/// span. Consumers must not treat `span.start_time` as a trust
+/// boundary; it's a self-reported timestamp from the agent's
+/// execution context.
+pub(crate) const SESSION_STARTED_AT_ENV: &str = "PILLBOX_SESSION_STARTED_AT";
+
 /// Read [`PARENT_SESSION_ID_ENV`] and normalize empty → None. Shared
 /// chokepoint so the host and sandbox paths can't drift on env-name
 /// or empty-string handling.
@@ -210,12 +225,19 @@ pub(crate) fn parent_session_id_from_env() -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// Read [`SESSION_STARTED_AT_ENV`] and normalize empty → None.
+pub(crate) fn session_started_at_from_env() -> Option<String> {
+    std::env::var(SESSION_STARTED_AT_ENV)
+        .ok()
+        .filter(|v| !v.is_empty())
+}
+
 /// Which side of the host/sandbox split emitted this event. Lets
 /// consumers tell apart the two `session.started` lines (host's
 /// "I saw the sandbox come up" vs. sandbox's "I'm running the
 /// agent now") — and any other event that ends up emitted from
 /// both sides — without inventing distinct event names.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Emitter {
     Host,
     Sandbox,
@@ -268,11 +290,10 @@ pub(crate) fn emit_session_event(
     session_id: &str,
     session: Option<&Session>,
 ) {
-    // Compute attrs ONCE so the JSONL and OTel sinks render from the
-    // same snapshot — otherwise the per-sink `now_rfc3339()` calls
-    // would produce `ended_at` values that differ by microseconds and
-    // a downstream consumer correlating across sinks would see a
-    // false drift.
+    // Compute attrs ONCE so all sinks render from the same snapshot —
+    // otherwise per-sink `now_rfc3339()` calls would produce
+    // `ended_at` values differing by microseconds and downstream
+    // consumers correlating across sinks would see false drift.
     let attrs = build_attributes(&ty, session_id, session);
     let payload = jsonl::render(&attrs);
     let name = ty.as_str();
@@ -287,9 +308,17 @@ pub(crate) fn emit_session_event(
             warn_on_sink_error("webhook", name, webhook::sink_emit(&url, &payload));
         }
     }
-    // OTel sink — only fires if OTEL_EXPORTER_OTLP_ENDPOINT is set.
-    // Configured at first use; cached for the rest of the process.
-    // Consumes `attrs` (last sink to touch it).
+    // OTel span sink — sandbox-only, terminal-only, requires
+    // SESSION_STARTED_AT_ENV. Fires BEFORE the log sink so a
+    // synchronous exporter failure surfaces as a warning before the
+    // log line claims success. Borrows `attrs` (log sink consumes).
+    warn_on_sink_error(
+        "otel-span",
+        name,
+        otel::span_emit_if_terminal_sandbox(&ty, session_id, &attrs, current_emitter()),
+    );
+    // OTel log sink — fires if OTEL_EXPORTER_OTLP_ENDPOINT is set.
+    // Consumes `attrs` (last sink to touch them).
     warn_on_sink_error("otel", name, otel::sink_emit(&ty, attrs));
 }
 

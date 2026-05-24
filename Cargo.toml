@@ -47,16 +47,16 @@ libc = "0.2"
 # event-emit. Already in the tree transitively via hudsucker; direct
 # dep so a `cargo audit` flags advisories.
 reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-features = false }
-# OTel logs sink — per-event OTLP log records to whichever collector
-# `OTEL_EXPORTER_OTLP_ENDPOINT` points at. Default transport is
-# HTTP/protobuf via the blocking reqwest client (no tokio runtime
-# drag — emit is sync, matching the webhook sink's model). Spans
-# land in the v0.7 PR 2c follow-up once the dual `session.started`
-# event provides real durations to span over; emitting zero-duration
-# spans today would be structurally worse than no spans at all.
+# OTel sinks — per-event OTLP log records + per-session OTLP spans
+# to whichever collector `OTEL_EXPORTER_OTLP_ENDPOINT` points at.
+# Default transport is HTTP/protobuf via the blocking reqwest client
+# (no tokio runtime drag — emit is sync, matching the webhook sink's
+# model). Spans are sandbox-only and only emitted at terminal events
+# when the wrapper has exported `PILLBOX_SESSION_STARTED_AT` so
+# span.start_time is meaningful.
 opentelemetry = "0.30"
-opentelemetry_sdk = { version = "0.30", default-features = false, features = ["logs"] }
-opentelemetry-otlp = { version = "0.30", default-features = false, features = ["logs", "http-proto", "reqwest-blocking-client"] }
+opentelemetry_sdk = { version = "0.30", default-features = false, features = ["logs", "trace"] }
+opentelemetry-otlp = { version = "0.30", default-features = false, features = ["logs", "trace", "http-proto", "reqwest-blocking-client"] }
 # rustic_core re-exposes timestamps as jiff::Zoned — depend on jiff
 # directly so the helper that normalizes to strict RFC3339 doesn't
 # look at types it can't name.

@@ -1248,12 +1248,19 @@ fn session_prune(resolved: &Pillbox, dry_run: bool) -> Result<()> {
 
 fn session_started(resolved: &Pillbox, id: &str) -> Result<()> {
     validate_session_id(id)?;
-    // Sandbox inherits PARENT_SESSION_ID_ENV from the wrapper's bash
-    // export (helper sets it from the host-passed `--parent` arg to
-    // `pillbox run`). Shape was validated at the host's CLI boundary;
-    // the env hop is privileged so we trust the value.
+    // Both PARENT_SESSION_ID_ENV and SESSION_STARTED_AT_ENV come from
+    // the wrapper's bash exports. Shape was validated at the host's
+    // CLI boundary; the env hop is privileged so we trust the values.
     let parent_session_id = events::parent_session_id_from_env();
-    let stub = session::Session::sandbox_stub(id);
+    let mut stub = session::Session::sandbox_stub(id);
+    // Prefer the wrapper-captured timestamp so the sandbox-side
+    // `started_at` matches what `session done` will use as
+    // span.start_time — single wall-clock read, no skew. Direct CLI
+    // invocations without the env keep the now() fallback baked into
+    // `sandbox_stub`.
+    if let Some(env_started_at) = events::session_started_at_from_env() {
+        stub.started_at = env_started_at;
+    }
     events::emit_session_event(
         resolved,
         events::EventType::SessionStarted { parent_session_id },

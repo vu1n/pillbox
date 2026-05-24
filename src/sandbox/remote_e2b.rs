@@ -241,6 +241,15 @@ fn run_attach(
             cmd.arg("--events-webhook").arg(&url);
         }
     }
+    // Forward the parent session id (`pillbox run --parent <id>`) so
+    // the wrapper can `export PILLBOX_PARENT_SESSION_ID=…` for the
+    // sandbox-side `pillbox session started` invocation to consume.
+    // Host-side `persist_and_emit_started` reads the same env via the
+    // shared `events::parent_session_id_from_env` helper, so we don't
+    // re-thread the value through `PersistArgs`.
+    if let Some(id) = crate::events::parent_session_id_from_env() {
+        cmd.arg("--parent").arg(&id);
+    }
     let (status, pumped) = run_helper(cmd, "run --remote (e2b)")?;
     drop(tmp);
 
@@ -469,7 +478,7 @@ fn persist_and_emit_started(args: PersistArgs<'_>, pump: &PumpOutcome) -> Result
     crate::events::emit_session_event(
         resolved,
         crate::events::EventType::SessionStarted {
-            parent_session_id: None,
+            parent_session_id: crate::events::parent_session_id_from_env(),
         },
         &session.id,
         Some(&session),

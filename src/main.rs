@@ -203,6 +203,17 @@ enum Command {
         /// clock, so badly skewed clocks (no NTP) skew expirations.
         #[arg(long, value_name = "DURATION", requires = "detach")]
         ttl: Option<String>,
+        /// Reference to the session this run was forked from. Carried
+        /// through to the lifecycle event payload as
+        /// `parent_session_id` and to OTel as `parent_span_id`, so a
+        /// consumer can stitch a forked trace tree even when the
+        /// parent lives in a different pillbox. Shape-validated via
+        /// `validate_session_id` (alphanumeric + hyphen, max 64
+        /// chars), but pillbox does NOT require the parent to exist
+        /// in this pillbox's registry — the field is observability
+        /// metadata; consumers reconcile.
+        #[arg(long, value_name = "ID")]
+        parent: Option<String>,
         /// Args forwarded to the agent CLI inside the sandbox.
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
@@ -671,6 +682,7 @@ fn run(cli: Cli) -> Result<()> {
             json,
             events_webhook,
             ttl,
+            parent,
             args,
         } => {
             let resolved = Pillbox::resolve(pillbox_arg)?;
@@ -703,6 +715,23 @@ fn run(cli: Cli) -> Result<()> {
                 let validated = validate_events_webhook_url(url)?;
                 unsafe {
                     std::env::set_var("PILLBOX_EVENTS_WEBHOOK", &validated);
+                }
+            }
+            // `--parent <id>` plumbing mirrors the webhook flow: shape-
+            // validate, stash in `PILLBOX_PARENT_SESSION_ID`, and let
+            // both the host's `session.started` emit and the sandbox-
+            // side `session started` CLI (via the helper's bash export)
+            // pick it up off the env. Shape-only validation: the parent
+            // may live in another pillbox's registry, so we don't
+            // reject "unknown" ids — the field is observability
+            // metadata; consumers reconcile.
+            //
+            // SAFETY: same single-threaded justification as the
+            // PILLBOX_EVENTS_WEBHOOK `set_var` above.
+            if let Some(id) = &parent {
+                validate_session_id(id)?;
+                unsafe {
+                    std::env::set_var(events::PARENT_SESSION_ID_ENV, id);
                 }
             }
             // Parse `--ttl 30m` / `24h` / `7d` at the CLI boundary.
@@ -1219,12 +1248,15 @@ fn session_prune(resolved: &Pillbox, dry_run: bool) -> Result<()> {
 
 fn session_started(resolved: &Pillbox, id: &str) -> Result<()> {
     validate_session_id(id)?;
+    // Sandbox inherits PARENT_SESSION_ID_ENV from the wrapper's bash
+    // export (helper sets it from the host-passed `--parent` arg to
+    // `pillbox run`). Shape was validated at the host's CLI boundary;
+    // the env hop is privileged so we trust the value.
+    let parent_session_id = events::parent_session_id_from_env();
     let stub = session::Session::sandbox_stub(id);
     events::emit_session_event(
         resolved,
-        events::EventType::SessionStarted {
-            parent_session_id: None,
-        },
+        events::EventType::SessionStarted { parent_session_id },
         id,
         Some(&stub),
     );

@@ -501,6 +501,70 @@ fn session_started_without_sandbox_env_renders_host_emitter() {
 }
 
 #[test]
+fn session_started_picks_up_parent_from_env() {
+    // Wrapper script `export PILLBOX_PARENT_SESSION_ID=…` propagates
+    // into the sandbox-side `pillbox session started` invocation; the
+    // CLI handler reads the env (no explicit flag needed). End-to-end
+    // proof that the --parent flag on `pillbox run` lands on the
+    // sandbox event's `parent_session_id` attribute.
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let out = run(home.path(), cwd.path(), &["init"]);
+    assert_ok(&out, "init");
+
+    let out = run_with_env(
+        home.path(),
+        cwd.path(),
+        &[
+            ("PILLBOX_SANDBOX_SIDE", "1"),
+            ("PILLBOX_PARENT_SESSION_ID", "parentabcd01"),
+        ],
+        &["session", "started", "deadbeef0003"],
+    );
+    assert_ok(&out, "session started with parent env");
+
+    let events_path = home.path().join(".pillbox/global/events.jsonl");
+    let body = fs::read_to_string(&events_path).expect("events.jsonl exists");
+    let event: serde_json::Value = serde_json::from_str(body.trim()).expect("json");
+    assert_eq!(event["event"], "session.started");
+    assert_eq!(event["emitter"], "sandbox");
+    assert_eq!(event["parent_session_id"], "parentabcd01");
+}
+
+#[test]
+fn session_started_treats_empty_parent_env_as_unset() {
+    // Setting the env to empty string is the POSIX-valid "this var
+    // is set but blank" state. The events module already normalizes
+    // empty → unset for other fields; the parent env follows the
+    // same rule so a misconfigured wrapper (`export PILLBOX_PARENT_…=`)
+    // doesn't smuggle a "" parent id into the trace.
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let out = run(home.path(), cwd.path(), &["init"]);
+    assert_ok(&out, "init");
+
+    let out = run_with_env(
+        home.path(),
+        cwd.path(),
+        &[
+            ("PILLBOX_SANDBOX_SIDE", "1"),
+            ("PILLBOX_PARENT_SESSION_ID", ""),
+        ],
+        &["session", "started", "deadbeef0004"],
+    );
+    assert_ok(&out, "session started with empty parent env");
+
+    let events_path = home.path().join(".pillbox/global/events.jsonl");
+    let body = fs::read_to_string(&events_path).expect("events.jsonl exists");
+    let event: serde_json::Value = serde_json::from_str(body.trim()).expect("json");
+    assert!(
+        event["parent_session_id"].is_null(),
+        "empty env should render as null, got: {:?}",
+        event["parent_session_id"]
+    );
+}
+
+#[test]
 fn session_started_rejects_malformed_id() {
     let home = TempDir::new().unwrap();
     let cwd = TempDir::new().unwrap();

@@ -146,6 +146,15 @@ function parseArgs(argv) {
 				out.eventsWebhook = val;
 				i++;
 				break;
+			case "--parent":
+				// Forwarded to the sandbox env so the wrapper's
+				// `pillbox session started` picks it up (host's CLI
+				// already shape-validated via `validate_session_id`).
+				// `shellEscape`d again at splice time as
+				// defense-in-depth against future loosening.
+				out.parentSessionId = val;
+				i++;
+				break;
 			default:
 				fail(`unknown flag: ${flag}`);
 		}
@@ -419,6 +428,9 @@ async function runAttach(args) {
 	const webhookExport = args.eventsWebhook
 		? `export PILLBOX_EVENTS_WEBHOOK=${shellEscape(args.eventsWebhook)}; `
 		: "";
+	const parentExport = args.parentSessionId
+		? `export PILLBOX_PARENT_SESSION_ID=${shellEscape(args.parentSessionId)}; `
+		: "";
 	// After the agent exits, snapshot the modified workspace into the
 	// shared rustic repo (`pillbox push --tag session-<id> --json`) and
 	// extract the snapshot handle from the JSON output. The handle gets
@@ -447,6 +459,7 @@ async function runAttach(args) {
 		`stty -echo raw 2>/dev/null; printf '%s\\n' '${BOOT_MARKER}'; ` +
 		`export PILLBOX_SANDBOX_SIDE=1; ` +
 		`${webhookExport}` +
+		`${parentExport}` +
 		`pillbox session started ${sessionIdEsc}; ` +
 		`pillbox run --vault-stdin < ${shellEscape(blobRemote)}; ` +
 		`PB_EXIT=$?; ` +

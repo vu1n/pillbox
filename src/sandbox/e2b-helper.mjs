@@ -458,6 +458,14 @@ async function runAttach(args) {
 	const launch =
 		`stty -echo raw 2>/dev/null; printf '%s\\n' '${BOOT_MARKER}'; ` +
 		`export PILLBOX_SANDBOX_SIDE=1; ` +
+		// PILLBOX_SESSION_STARTED_AT is captured ONCE at the top of
+		// the launch line via `date -u -Iseconds` (POSIX RFC3339). Both
+		// `pillbox session started` and `pillbox session done` read it:
+		// the former so its emitted started_at matches what the latter
+		// will use as span.start_time (no microsecond skew between the
+		// two read sites). If `date` isn't available the export expands
+		// to empty and pillbox falls back to its own `now_rfc3339`.
+		`export PILLBOX_SESSION_STARTED_AT="$(date -u -Iseconds 2>/dev/null)"; ` +
 		`${webhookExport}` +
 		`${parentExport}` +
 		`pillbox session started ${sessionIdEsc}; ` +

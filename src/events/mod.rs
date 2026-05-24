@@ -78,6 +78,13 @@ use std::{
     time::Duration,
 };
 
+/// Per-sink network budget. A slow collector / webhook shouldn't
+/// dominate a session's runtime: a full lifecycle is ~3 emits, so
+/// worst case a dead endpoint adds ~6s to a run. Both webhook and
+/// OTel sinks honor this; the OTLP-standard
+/// `OTEL_EXPORTER_OTLP_TIMEOUT` env overrides it for OTel.
+pub(super) const EVENTS_SINK_TIMEOUT: Duration = Duration::from_secs(2);
+
 use anyhow::{Context, Result};
 
 use crate::pillbox::Pillbox;
@@ -171,8 +178,8 @@ impl EventType {
 /// of edits coordinated across the JSONL renderer + OTel record
 /// filler. `String` and `i64` are the only shapes the current event
 /// taxonomy uses; widening is a one-variant change.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum AttrValue {
+#[derive(Debug)]
+pub(super) enum AttrValue {
     Str(String),
     Int(i64),
 }
@@ -193,7 +200,13 @@ pub(crate) fn emit_session_event(
     session_id: &str,
     session: Option<&Session>,
 ) {
-    let payload = jsonl::build_event_json(&ty, session_id, session);
+    // Compute attrs ONCE so the JSONL and OTel sinks render from the
+    // same snapshot — otherwise the per-sink `now_rfc3339()` calls
+    // would produce `ended_at` values that differ by microseconds and
+    // a downstream consumer correlating across sinks would see a
+    // false drift.
+    let attrs = build_attributes(&ty, session_id, session);
+    let payload = jsonl::render(&attrs);
     let name = ty.as_str();
     // JSONL is the always-on sink. Failures fall through to a warning;
     // we don't want a missing state dir to abort the agent run.
@@ -208,9 +221,8 @@ pub(crate) fn emit_session_event(
     }
     // OTel sink — only fires if OTEL_EXPORTER_OTLP_ENDPOINT is set.
     // Configured at first use; cached for the rest of the process.
-    // Emits one log record per event with attributes mirroring the
-    // JSONL field set so consumers can correlate.
-    warn_on_sink_error("otel", name, otel::sink_emit(&ty, session_id, session));
+    // Consumes `attrs` (last sink to touch it).
+    warn_on_sink_error("otel", name, otel::sink_emit(&ty, attrs));
 }
 
 /// One-place warning formatter so each sink only adds a
@@ -440,7 +452,7 @@ mod tests {
             result_snapshot: Some("z".into()),
         };
         let attrs = build_attributes(&ty, &s.id, Some(&s));
-        let raw = jsonl::build_event_json(&ty, &s.id, Some(&s));
+        let raw = jsonl::render(&attrs);
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let json_keys: std::collections::BTreeSet<String> =
             v.as_object().expect("object").keys().cloned().collect();

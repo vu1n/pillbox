@@ -7,9 +7,16 @@
 
 /// If `url` is plaintext HTTP to a non-loopback host, return that
 /// host slice for the caller's warning message. `None` covers every
-/// "no warning needed" case: HTTPS, loopback (`localhost`,
-/// `127.0.0.1`, `::1`, `127.x.y.z`, `*.localhost`, `*.local`), or a
-/// non-http(s) URL we won't POST to anyway.
+/// "no warning needed" case: HTTPS, loopback (`localhost`, IPv4
+/// `127.0.0.0/8`, IPv6 `::1`, `*.localhost`), or a non-http(s) URL
+/// we won't POST to anyway.
+///
+/// Loopback set deliberately *excludes* mDNS `.local` (RFC 6762):
+/// link-local names can resolve to routable LAN addresses, so
+/// `attacker.local:9000` would silently bypass the warning if we
+/// matched on the suffix. Users running inside a container that
+/// names sidecars `*.local` can use `localhost` / `127.0.0.1` or
+/// accept the (correct) plaintext warning.
 ///
 /// Host extraction is intentionally string-level — we're not parsing
 /// the URL semantically, just deciding loopback-or-not. The lifetime
@@ -30,8 +37,7 @@ pub(crate) fn plaintext_non_loopback_host(url: &str) -> Option<&str> {
         .unwrap_or(host_port);
     let is_loopback = matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
         || host.starts_with("127.")
-        || host.ends_with(".localhost")
-        || host.ends_with(".local");
+        || host.ends_with(".localhost");
     if is_loopback || host.is_empty() {
         None
     } else {
@@ -52,11 +58,22 @@ mod tests {
             "http://127.5.5.5/",
             "http://[::1]:8080/path",
             "http://collector.localhost/y",
-            "http://collector.local/y",
             "http://user@127.0.0.1:9999/api",
         ] {
             assert_eq!(plaintext_non_loopback_host(url), None, "url: {url}");
         }
+    }
+
+    #[test]
+    fn mdns_local_is_not_loopback() {
+        // RFC 6762 .local can resolve to a routable LAN address —
+        // treating it as loopback would silently let `attacker.local`
+        // bypass the plaintext-HTTP warning. See the rationale on
+        // `plaintext_non_loopback_host`.
+        assert_eq!(
+            plaintext_non_loopback_host("http://collector.local/y"),
+            Some("collector.local")
+        );
     }
 
     #[test]

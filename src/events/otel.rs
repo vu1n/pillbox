@@ -8,15 +8,15 @@
 //! spans on the current four-event taxonomy would be structurally
 //! worse than no spans at all.
 
-use std::{collections::HashMap, sync::OnceLock, time::Duration};
+use std::{collections::HashMap, sync::OnceLock};
 
 use anyhow::{Context, Result};
 use opentelemetry::logs::{Logger, LoggerProvider};
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::logs::SdkLogger;
 
-use super::{build_attributes, AttrValue, EventType};
-use crate::session::Session;
+use super::{AttrValue, EventType, EVENTS_SINK_TIMEOUT};
+use crate::url_safety::plaintext_non_loopback_host;
 
 /// Cached per process so the TLS-context + exporter setup costs land
 /// on the first event of the run, not every emit. The inner `Option`
@@ -24,12 +24,6 @@ use crate::session::Session;
 /// unset at first call, so we skip the sink for the lifetime of the
 /// process (env-var flipping mid-process isn't a supported workflow).
 static OTEL_LOGGER: OnceLock<Option<SdkLogger>> = OnceLock::new();
-
-/// 2s per export — matches the webhook sink's budget for the same
-/// reason: a slow collector shouldn't dominate a session's runtime.
-/// Setting via the OTel-standard `OTEL_EXPORTER_OTLP_TIMEOUT` env
-/// (in milliseconds) overrides this, per the OTLP spec.
-const OTEL_EXPORT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Default `service.name` resource attribute when `OTEL_SERVICE_NAME`
 /// isn't set. Spec-recommended fallback chain is OTEL_SERVICE_NAME →
@@ -40,13 +34,17 @@ const OTEL_DEFAULT_SERVICE_NAME: &str = "pillbox";
 /// Build one OTLP log record per event and emit through the cached
 /// SDK logger. Returns `Ok(())` (best-effort skip) when the env var
 /// isn't set; otherwise propagates exporter-build failures so the
-/// caller's `warn_on_sink_error` can surface them.
-pub(super) fn sink_emit(ty: &EventType, session_id: &str, session: Option<&Session>) -> Result<()> {
+/// caller's `warn_on_sink_error` can surface them. Consumes `attrs`
+/// because this is the last sink to touch them.
+pub(super) fn sink_emit(
+    ty: &EventType,
+    attrs: Vec<(&'static str, Option<AttrValue>)>,
+) -> Result<()> {
     let Some(logger) = logger() else {
         return Ok(());
     };
     let mut record = logger.create_log_record();
-    fill_log_record(&mut record, ty, session_id, session);
+    fill_log_record(&mut record, ty, attrs);
     logger.emit(record);
     Ok(())
 }
@@ -141,7 +139,7 @@ fn parse_otel_headers(raw: &str) -> HashMap<String, String> {
 /// misconfig. Mirrors the webhook sink's posture (same threat model,
 /// same shared helper).
 fn warn_if_plaintext_to_non_loopback(endpoint: &str) {
-    if let Some(host) = crate::url_safety::plaintext_non_loopback_host(endpoint) {
+    if let Some(host) = plaintext_non_loopback_host(endpoint) {
         eprintln!(
             "pillbox: warning: OTel endpoint `{endpoint}` is plaintext HTTP to a non-loopback host \
              (`{host}`) — events include session ids + user-supplied labels. Prefer https:// for remote collectors."
@@ -170,7 +168,7 @@ fn build_otel_logger(
         .with_http()
         .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
         .with_endpoint(endpoint)
-        .with_timeout(OTEL_EXPORT_TIMEOUT);
+        .with_timeout(EVENTS_SINK_TIMEOUT);
     if !headers.is_empty() {
         builder = builder.with_headers(headers);
     }
@@ -193,8 +191,7 @@ fn build_otel_logger(
 fn fill_log_record<R: opentelemetry::logs::LogRecord>(
     record: &mut R,
     ty: &EventType,
-    session_id: &str,
-    session: Option<&Session>,
+    attrs: Vec<(&'static str, Option<AttrValue>)>,
 ) {
     let (severity_number, severity_text) = severity_for(ty);
     record.set_severity_number(severity_number);
@@ -205,7 +202,7 @@ fn fill_log_record<R: opentelemetry::logs::LogRecord>(
     // body keeps single-line tail-style log viewers readable without
     // duplicating the structured fields.
     record.set_body(opentelemetry::logs::AnyValue::String(ty.as_str().into()));
-    for (key, value) in build_attributes(ty, session_id, session) {
+    for (key, value) in attrs {
         if let Some(v) = value {
             record.add_attribute(key, attr_to_otel(v));
         }
@@ -238,7 +235,11 @@ mod tests {
         net::TcpListener,
         sync::{Arc, Mutex},
         thread,
+        time::Duration,
     };
+
+    use super::super::build_attributes;
+    use crate::session::Session;
 
     #[test]
     fn severity_for_event_type() {
@@ -352,12 +353,10 @@ mod tests {
         let logger = build_otel_logger(&endpoint, HashMap::new(), "pillbox-test")
             .expect("build OTel logger");
         let mut record = logger.create_log_record();
-        fill_log_record(
-            &mut record,
-            &EventType::SessionStarted,
-            "abc123def456",
-            Some(&Session::test_fixture()),
-        );
+        let session = Session::test_fixture();
+        let ty = EventType::SessionStarted;
+        let attrs = build_attributes(&ty, "abc123def456", Some(&session));
+        fill_log_record(&mut record, &ty, attrs);
         logger.emit(record);
 
         server.join().expect("server thread");

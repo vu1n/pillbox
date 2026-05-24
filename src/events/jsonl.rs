@@ -8,10 +8,9 @@ use std::fs;
 
 use anyhow::{Context, Result};
 
-use super::{build_attributes, events_path, AttrValue, EventType};
+use super::{events_path, AttrValue};
 use crate::paths;
 use crate::pillbox::Pillbox;
-use crate::session::Session;
 
 pub(super) fn sink_emit(pb: &Pillbox, payload: &str) -> Result<()> {
     let path = events_path(pb);
@@ -39,22 +38,20 @@ pub(super) fn sink_emit(pb: &Pillbox, payload: &str) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn build_event_json(
-    ty: &EventType,
-    session_id: &str,
-    session: Option<&Session>,
-) -> String {
-    let map: serde_json::Map<String, serde_json::Value> = build_attributes(ty, session_id, session)
-        .into_iter()
-        .map(|(k, v)| (k.to_string(), attr_to_json(v)))
+/// Render the pre-computed attribute list to a single JSONL line.
+/// Borrows so the OTel sink can also consume `attrs` afterwards.
+pub(super) fn render(attrs: &[(&'static str, Option<AttrValue>)]) -> String {
+    let map: serde_json::Map<String, serde_json::Value> = attrs
+        .iter()
+        .map(|(k, v)| (k.to_string(), attr_to_json(v.as_ref())))
         .collect();
     serde_json::Value::Object(map).to_string()
 }
 
-fn attr_to_json(v: Option<AttrValue>) -> serde_json::Value {
+fn attr_to_json(v: Option<&AttrValue>) -> serde_json::Value {
     match v {
-        Some(AttrValue::Str(s)) => serde_json::Value::String(s),
-        Some(AttrValue::Int(i)) => serde_json::Value::Number(i.into()),
+        Some(AttrValue::Str(s)) => serde_json::Value::String(s.clone()),
+        Some(AttrValue::Int(i)) => serde_json::Value::Number((*i).into()),
         None => serde_json::Value::Null,
     }
 }

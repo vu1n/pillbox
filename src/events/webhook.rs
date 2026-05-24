@@ -6,9 +6,11 @@
 //! shape; a 2s timeout per request keeps a stuck endpoint from
 //! dominating session runtime.
 
-use std::{sync::OnceLock, time::Duration};
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
+
+use super::EVENTS_SINK_TIMEOUT;
 
 /// Shared blocking HTTP client. Built once on first use and reused
 /// for every subsequent emit so a session's 2-4 terminal events
@@ -16,13 +18,6 @@ use anyhow::{Context, Result};
 /// `reqwest::blocking::Client` is `Send + Sync` and internally pools
 /// connections, which is the whole point of caching it.
 static WEBHOOK_CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
-
-/// 2s per request — long enough for a healthy collector on the same
-/// continent, short enough that a stuck endpoint doesn't dominate a
-/// session's runtime. A full lifecycle (started + completed + dropped)
-/// is 3 emits, so worst case a dead webhook adds ~6s to a run. The
-/// emit is best-effort; on timeout the call site logs and continues.
-const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// POST one event line to the configured webhook URL. Body is the
 /// JSON payload (without trailing newline) produced by the JSONL
@@ -60,7 +55,7 @@ fn client() -> Result<&'static reqwest::blocking::Client> {
         return Ok(c);
     }
     let built = reqwest::blocking::Client::builder()
-        .timeout(WEBHOOK_TIMEOUT)
+        .timeout(EVENTS_SINK_TIMEOUT)
         .build()
         .context("build webhook http client")?;
     let _ = WEBHOOK_CLIENT.set(built);
@@ -75,6 +70,7 @@ mod tests {
         net::TcpListener,
         sync::{Arc, Mutex},
         thread,
+        time::Duration,
     };
 
     #[test]

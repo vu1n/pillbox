@@ -468,7 +468,9 @@ fn persist_and_emit_started(args: PersistArgs<'_>, pump: &PumpOutcome) -> Result
     let session = persist_session_from_pump(args, pump, None)?;
     crate::events::emit_session_event(
         resolved,
-        crate::events::EventType::SessionStarted,
+        crate::events::EventType::SessionStarted {
+            parent_session_id: None,
+        },
         &session.id,
         Some(&session),
     );

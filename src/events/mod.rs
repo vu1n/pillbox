@@ -2,17 +2,21 @@
 //!
 //! ## Event taxonomy
 //!
-//! Four lifecycle events, all OTel-shaped:
+//! Four lifecycle events, all OTel-shaped. The `emitter` attribute
+//! (`"host"` / `"sandbox"`) on every event disambiguates which side
+//! originated the line — `session.started` is the canonical case
+//! (host emits when the sandbox handshake completes; sandbox emits
+//! when it's running the agent), and the delta gives cold-start
+//! latency.
 //!
-//! | Event              | Emitted by         | When                                        |
-//! |--------------------|--------------------|---------------------------------------------|
-//! | `session.started`  | host pillbox       | Sandbox + PTY are up, agent launched        |
-//! | `session.completed`| `session done`     | Agent finished successfully                 |
-//! | `session.failed`   | `session done`     | Agent exited non-zero / errored             |
-//! | `session.dropped`  | host pillbox       | `session rm` torn the sandbox down          |
+//! | Event              | Emitted by                | When                                        |
+//! |--------------------|---------------------------|---------------------------------------------|
+//! | `session.started`  | host pillbox + sandbox    | Host: sandbox handshake; Sandbox: self-init |
+//! | `session.completed`| sandbox (`session done`)  | Agent finished successfully                 |
+//! | `session.failed`   | sandbox (`session done`)  | Agent exited non-zero / errored             |
+//! | `session.dropped`  | host pillbox              | `session rm` torn the sandbox down          |
 //!
-//! `started` and `dropped` fire from the host. `completed`/`failed`
-//! come from inside the sandbox: a wrapper around the agent calls
+//! Sandbox-side events: a wrapper around the agent calls
 //! `pillbox session done <id> --status ok|failed` after the agent
 //! exits, and the sandbox-side pillbox emits the event via whichever
 //! sink the env exposes (`PILLBOX_EVENTS_WEBHOOK`,
@@ -26,8 +30,11 @@
 //! {
 //!   "version": 1,                          // bump on breaking field-set change
 //!   "event": "session.completed",
+//!   "emitter": "sandbox",                  // "host" or "sandbox" — disambiguates
+//!                                          //  the dual session.started lines
 //!   "session_id": "abc123def456",          // → OTel span_id
-//!   "parent_session_id": "789...",         // → OTel parent_span_id (forks)
+//!   "parent_session_id": "789...",         // → OTel parent_span_id (forks);
+//!                                          //  only set on session.started
 //!   "started_at": "2026-05-23T13:37:00Z",  // → OTel span.start_time
 //!   "ended_at":   "2026-05-23T13:42:11Z",  // → OTel span.end_time (terminal only)
 //!   "agent_id": "claude",
@@ -74,16 +81,10 @@ use std::{
     fs,
     io::{self, Seek, SeekFrom, Write},
     path::PathBuf,
+    sync::OnceLock,
     thread,
     time::Duration,
 };
-
-/// Per-sink network budget. A slow collector / webhook shouldn't
-/// dominate a session's runtime: a full lifecycle is ~3 emits, so
-/// worst case a dead endpoint adds ~6s to a run. Both webhook and
-/// OTel sinks honor this; the OTLP-standard
-/// `OTEL_EXPORTER_OTLP_TIMEOUT` env overrides it for OTel.
-pub(super) const EVENTS_SINK_TIMEOUT: Duration = Duration::from_secs(2);
 
 use anyhow::{Context, Result};
 
@@ -108,6 +109,13 @@ const EVENT_SCHEMA_VERSION: u32 = 1;
 /// Real PR 2 will use inotify / kqueue.
 const FOLLOW_POLL_MS: u64 = 200;
 
+/// Per-sink network budget. A slow collector / webhook shouldn't
+/// dominate a session's runtime: a full lifecycle is ~3 emits, so
+/// worst case a dead endpoint adds ~6s to a run. Both webhook and
+/// OTel sinks honor this; the OTLP-standard
+/// `OTEL_EXPORTER_OTLP_TIMEOUT` env overrides it for OTel.
+pub(super) const EVENTS_SINK_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// One lifecycle event variant. Terminal events (`SessionCompleted` /
 /// `SessionFailed`) carry the variant-specific payload inline so
 /// [`build_attributes`] can be exhaustive at compile time. Lost
@@ -123,15 +131,21 @@ const FOLLOW_POLL_MS: u64 = 200;
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone)]
 pub(crate) enum EventType {
-    SessionStarted,
+    SessionStarted {
+        /// Optional reference to the parent session id when this run
+        /// was forked from another. Maps to OTel `parent_span_id` and
+        /// the wire field `parent_session_id`; `None` for root
+        /// sessions.
+        parent_session_id: Option<String>,
+    },
     SessionCompleted {
         exit_code: Option<i32>,
         trace_path: Option<String>,
         /// Rustic snapshot handle of the agent's result workspace,
         /// pushed by the in-sandbox wrapper after the agent exits.
         /// Consumers correlate with `base_snapshot` (on the session
-        /// record + future `session.started` event) to compute the
-        /// fork's diff. `session pull <id>` rehydrates from this
+        /// record + the host's `session.started` event) to compute
+        /// the fork's diff. `session pull <id>` rehydrates from this
         /// handle.
         result_snapshot: Option<String>,
     },
@@ -147,7 +161,7 @@ pub(crate) enum EventType {
 impl EventType {
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
-            EventType::SessionStarted => "session.started",
+            EventType::SessionStarted { .. } => "session.started",
             EventType::SessionCompleted { .. } => "session.completed",
             EventType::SessionFailed { .. } => "session.failed",
             EventType::SessionDropped => "session.dropped",
@@ -170,6 +184,45 @@ impl EventType {
             EventType::SessionCompleted { .. } | EventType::SessionFailed { .. }
         )
     }
+}
+
+/// Env var the in-sandbox wrapper script sets so the sandbox-side
+/// pillbox binary can self-identify on event emission. Host pillbox
+/// never sets it.
+///
+/// Note: this is an observability tag, not an access-control signal.
+/// Anything that can write the process env can set this, so consumers
+/// must not treat `emitter == "host"` as a trust boundary.
+const SANDBOX_SIDE_ENV: &str = "PILLBOX_SANDBOX_SIDE";
+
+/// Which side of the host/sandbox split emitted this event. Lets
+/// consumers tell apart the two `session.started` lines (host's
+/// "I saw the sandbox come up" vs. sandbox's "I'm running the
+/// agent now") — and any other event that ends up emitted from
+/// both sides — without inventing distinct event names.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum Emitter {
+    Host,
+    Sandbox,
+}
+
+impl Emitter {
+    pub(super) fn as_str(&self) -> &'static str {
+        match self {
+            Emitter::Host => "host",
+            Emitter::Sandbox => "sandbox",
+        }
+    }
+}
+
+/// Process-level emitter, detected once on first call from
+/// [`SANDBOX_SIDE_ENV`]. Cached so per-emit cost is one atomic load.
+pub(super) fn current_emitter() -> Emitter {
+    static DETECTED: OnceLock<Emitter> = OnceLock::new();
+    *DETECTED.get_or_init(|| match std::env::var(SANDBOX_SIDE_ENV).ok().as_deref() {
+        Some(v) if !v.is_empty() => Emitter::Sandbox,
+        _ => Emitter::Host,
+    })
 }
 
 /// One attribute value. The JSONL and OTel sinks each map this onto
@@ -256,6 +309,11 @@ pub(crate) fn build_attributes(
 ) -> Vec<(&'static str, Option<AttrValue>)> {
     let ended_at = (ty.is_terminal() || matches!(ty, EventType::SessionDropped))
         .then(|| AttrValue::Str(session::now_rfc3339()));
+    let parent_session_id = if let EventType::SessionStarted { parent_session_id } = ty {
+        parent_session_id.clone()
+    } else {
+        None
+    };
     let (reason, exit_code, trace_path, result_snapshot) = match ty {
         EventType::SessionCompleted {
             exit_code,
@@ -295,7 +353,12 @@ pub(crate) fn build_attributes(
     vec![
         ("version", Some(AttrValue::Int(EVENT_SCHEMA_VERSION as i64))),
         ("event", Some(AttrValue::Str(ty.as_str().to_string()))),
+        (
+            "emitter",
+            Some(AttrValue::Str(current_emitter().as_str().to_string())),
+        ),
         ("session_id", Some(AttrValue::Str(session_id.to_string()))),
+        ("parent_session_id", parent_session_id.map(AttrValue::Str)),
         ("started_at", s_str(|s| &s.started_at)),
         ("ended_at", ended_at),
         ("agent_id", s_str(|s| &s.agent_id)),
@@ -383,7 +446,14 @@ mod tests {
         with_isolated_home("events-emit-all", || {
             let pb = pillbox::global();
             let s = Session::test_fixture();
-            emit_session_event(&pb, EventType::SessionStarted, &s.id, Some(&s));
+            emit_session_event(
+                &pb,
+                EventType::SessionStarted {
+                    parent_session_id: Some("parent12345".into()),
+                },
+                &s.id,
+                Some(&s),
+            );
             emit_session_event(
                 &pb,
                 EventType::SessionCompleted {
@@ -413,9 +483,13 @@ mod tests {
             let started: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
             assert_eq!(started["event"], "session.started");
             assert_eq!(started["session_id"], "abc123def456");
+            assert_eq!(started["parent_session_id"], "parent12345");
             assert_eq!(started["ended_at"], serde_json::Value::Null);
             assert_eq!(started["status"], "unset");
             assert_eq!(started["version"], EVENT_SCHEMA_VERSION);
+            // emitter is always present; defaults to "host" outside
+            // a sandbox-side process. Tests run on the host side.
+            assert_eq!(started["emitter"], "host");
 
             let completed: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
             assert_eq!(completed["event"], "session.completed");
@@ -435,6 +509,16 @@ mod tests {
             assert_eq!(dropped["event"], "session.dropped");
             assert!(!dropped["ended_at"].is_null());
         });
+    }
+
+    #[test]
+    fn emitter_wire_strings_are_stable() {
+        // The "host" / "sandbox" strings are the wire contract for
+        // the `emitter` event attribute; consumers branch on them.
+        // Pin them here so a typo refactor on `Emitter::as_str`
+        // surfaces as a test failure rather than a silent break.
+        assert_eq!(Emitter::Host.as_str(), "host");
+        assert_eq!(Emitter::Sandbox.as_str(), "sandbox");
     }
 
     #[test]

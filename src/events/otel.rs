@@ -257,7 +257,9 @@ mod tests {
         assert_eq!(text, "ERROR");
 
         for ty in [
-            EventType::SessionStarted,
+            EventType::SessionStarted {
+                parent_session_id: None,
+            },
             EventType::SessionCompleted {
                 exit_code: None,
                 trace_path: None,
@@ -354,7 +356,9 @@ mod tests {
             .expect("build OTel logger");
         let mut record = logger.create_log_record();
         let session = Session::test_fixture();
-        let ty = EventType::SessionStarted;
+        let ty = EventType::SessionStarted {
+            parent_session_id: None,
+        };
         let attrs = build_attributes(&ty, "abc123def456", Some(&session));
         fill_log_record(&mut record, &ty, attrs);
         logger.emit(record);

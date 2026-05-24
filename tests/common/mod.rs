@@ -20,12 +20,26 @@ pub fn pillbox_bin() -> PathBuf {
 /// to `cwd`. Returns the captured `Output` for the caller to assert on.
 #[allow(dead_code)] // each test binary uses a subset of this module
 pub fn run(home: &std::path::Path, cwd: &std::path::Path, args: &[&str]) -> Output {
-    Command::new(pillbox_bin())
-        .env("HOME", home)
-        .current_dir(cwd)
-        .args(args)
-        .output()
-        .expect("spawn pillbox")
+    run_with_env(home, cwd, &[], args)
+}
+
+/// Like [`run`] but with additional environment variables overlaid on
+/// top of the parent's env. Used to exercise env-driven code paths
+/// (e.g. `PILLBOX_SANDBOX_SIDE=1` for sandbox-side emitter detection)
+/// without polluting the test process's own env or racing siblings.
+#[allow(dead_code)]
+pub fn run_with_env(
+    home: &std::path::Path,
+    cwd: &std::path::Path,
+    envs: &[(&str, &str)],
+    args: &[&str],
+) -> Output {
+    let mut cmd = Command::new(pillbox_bin());
+    cmd.env("HOME", home).current_dir(cwd);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    cmd.args(args).output().expect("spawn pillbox")
 }
 
 /// Panic with a structured dump if `out` is a non-zero exit. `label`

@@ -532,6 +532,19 @@ enum SessionAction {
         #[arg(long = "dry-run")]
         dry_run: bool,
     },
+    /// Emit a sandbox-side `session.started` event. Mirror of
+    /// [`Done`] for the front of the lifecycle: the in-sandbox
+    /// wrapper script calls this right before launching the agent
+    /// so consumers can compute cold-start latency from
+    /// `host.started_at` → `sandbox.started_at` (distinguished by
+    /// the `emitter` attribute on each event).
+    ///
+    /// No-op cost when no sink is configured. The event payload is
+    /// minimal — `session_id` + `started_at` + `emitter=sandbox` —
+    /// because the host's prior `session.started` already carries
+    /// the full record (agent_id, remote, backend, label, …);
+    /// consumers correlate by `session_id`.
+    Started { id: String },
     /// Mark a session done, emitting `session.completed` or
     /// `session.failed` to every configured sink (JSONL + webhook +
     /// OTel). Invoked manually for orchestrator-driven completion, or
@@ -876,6 +889,7 @@ fn dispatch_session(resolved: &Pillbox, action: SessionAction) -> Result<()> {
         SessionAction::Detach { id } => session_detach(resolved, &id),
         SessionAction::Rm { id } => session_rm(resolved, &id),
         SessionAction::Events { follow, json } => events::dispatch_events(resolved, follow, json),
+        SessionAction::Started { id } => session_started(resolved, &id),
         SessionAction::Done {
             id,
             status,
@@ -1200,6 +1214,21 @@ fn session_prune(resolved: &Pillbox, dry_run: bool) -> Result<()> {
     } else {
         println!("pillbox: ✓ pruned {pruned} session(s).");
     }
+    Ok(())
+}
+
+fn session_started(resolved: &Pillbox, id: &str) -> Result<()> {
+    validate_session_id(id)?;
+    let stub = session::Session::sandbox_stub(id);
+    events::emit_session_event(
+        resolved,
+        events::EventType::SessionStarted {
+            parent_session_id: None,
+        },
+        id,
+        Some(&stub),
+    );
+    println!("pillbox: ✓ session `{id}` started");
     Ok(())
 }
 

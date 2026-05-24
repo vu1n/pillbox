@@ -433,9 +433,21 @@ async function runAttach(args) {
 	// is dropped from the `session done` call (the if-non-empty guard
 	// at the bottom of the line). That keeps the failure path clean —
 	// terminal event still fires, just without a result_snapshot.
+	// PILLBOX_SANDBOX_SIDE flips the emitter detection so events
+	// render with `emitter=sandbox`. Set once at the top so every
+	// pillbox call below picks it up. See SANDBOX_SIDE_ENV docs in
+	// src/events/mod.rs for the trust-model rationale.
+	//
+	// `pillbox session started` fires immediately after the export so
+	// the timestamp reflects sandbox-side-ready, not host-side-saw-
+	// handshake. The delta between this event and the host's
+	// `session.started` is the cold-start latency consumers care
+	// about.
 	const launch =
 		`stty -echo raw 2>/dev/null; printf '%s\\n' '${BOOT_MARKER}'; ` +
+		`export PILLBOX_SANDBOX_SIDE=1; ` +
 		`${webhookExport}` +
+		`pillbox session started ${sessionIdEsc}; ` +
 		`pillbox run --vault-stdin < ${shellEscape(blobRemote)}; ` +
 		`PB_EXIT=$?; ` +
 		`RESULT_SNAPSHOT=$(pillbox push --tag ${shellEscape(`session-${args.sessionId}`)} --message ${shellEscape(`agent result for session ${args.sessionId}`)} --json 2>/dev/null | jq -r '.snapshot.handle // empty' 2>/dev/null); ` +

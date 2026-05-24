@@ -242,6 +242,13 @@ pub(crate) struct RunOpts {
     /// with `jq -r '.session.id'` instead of regex-scraping the
     /// banner. Only meaningful with `--detach`.
     pub(crate) json: bool,
+    /// `--ttl DURATION` — session-retention TTL in seconds. Parsed
+    /// from `30m`/`24h`/`7d` shapes at the CLI boundary via
+    /// `session::parse_ttl_seconds`. Recorded on the session record
+    /// as an absolute `expires_at` RFC3339 timestamp (not the raw
+    /// duration), so `pillbox session prune` doesn't have to recompute
+    /// from creation time. Only meaningful with `--detach`.
+    pub(crate) ttl_seconds: Option<u64>,
 }
 
 #[allow(dead_code)]
@@ -420,6 +427,7 @@ mod tests {
             detach: false,
             label: None,
             json: false,
+            ttl_seconds: None,
         }
     }
 

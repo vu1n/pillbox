@@ -440,31 +440,13 @@ fn parse_otel_headers(raw: &str) -> HashMap<String, String> {
 /// to a non-loopback host. Event attributes can carry user-supplied
 /// `label` text + session ids; in-cluster collectors over plain HTTP
 /// are fine, but a remote cleartext endpoint is almost always a
-/// misconfig. Mirrors the webhook sink's posture (the same threat
-/// model applies — event payloads are equivalent).
+/// misconfig. Mirrors the webhook sink's posture (same threat model,
+/// same shared helper).
 fn warn_if_plaintext_to_non_loopback(endpoint: &str) {
-    let Some(rest) = endpoint.strip_prefix("http://") else {
-        return;
-    };
-    let host_port = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or("")
-        .rsplit('@')
-        .next()
-        .unwrap_or("");
-    let host = host_port
-        .rsplit_once(':')
-        .map(|(h, _)| h)
-        .unwrap_or(host_port);
-    let is_loopback = matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
-        || host.starts_with("127.")
-        || host.ends_with(".localhost")
-        || host.ends_with(".local");
-    if !is_loopback {
+    if let Some(host) = crate::url_safety::plaintext_non_loopback_host(endpoint) {
         eprintln!(
             "pillbox: warning: OTel endpoint `{endpoint}` is plaintext HTTP to a non-loopback host \
-             — events include session ids + user-supplied labels. Prefer https:// for remote collectors."
+             (`{host}`) — events include session ids + user-supplied labels. Prefer https:// for remote collectors."
         );
     }
 }

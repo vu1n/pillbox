@@ -64,6 +64,21 @@ impl SandboxBackend for LocalDocker {
 
         let env_vars = resolve_run_env(resolved, &opts, &withs_resolved, vault_session.as_mut())?;
 
+        // Bind `mcp` (rather than letting the expression be the
+        // tail of an if-let in the args build) so the tempfile
+        // inside `McpInjection` lives until docker exits.
+        let mcp = if opts.mcps.is_empty() {
+            None
+        } else {
+            let inject = spec.mcp_inject.ok_or_else(|| {
+                PillboxError::usage(
+                    "run",
+                    format!("--mcp is not supported for agent `{}`", spec.id),
+                )
+            })?;
+            Some(inject(&opts.mcps)?)
+        };
+
         let mut args = base_docker_args();
         args.extend([
             "-v".into(),
@@ -76,6 +91,10 @@ impl SandboxBackend for LocalDocker {
         for m in &opts.mounts {
             args.push("-v".into());
             args.push(m.clone());
+        }
+        if let Some(mcp) = &mcp {
+            args.push("-v".into());
+            args.push(mcp.docker_mount.clone());
         }
         for (k, v) in &env_vars {
             args.push("-e".into());
@@ -91,6 +110,9 @@ impl SandboxBackend for LocalDocker {
         }
         args.push(docker::RUNNER_IMAGE.into());
         args.extend(spec.run_argv.iter().map(|s| s.to_string()));
+        if let Some(mcp) = &mcp {
+            args.extend(mcp.extra_argv.iter().cloned());
+        }
         args.extend(opts.args);
 
         let status = docker::run_interactive(&args)?;

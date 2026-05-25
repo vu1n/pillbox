@@ -88,6 +88,39 @@ through unchanged. The sandbox already gets `--add-host=
 host.docker.internal:host-gateway` for the vault, so the alias
 resolves on Linux too.
 
+## Gotcha: DNS-rebinding protection on the server
+
+Most MCP server libraries (FastMCP, Starlette/uvicorn-based servers,
+many Express-based ones) ship with DNS-rebinding protection that
+allows the `Host` header to be `localhost` or `127.0.0.1` *only*.
+Pillbox rewrites the URL to `host.docker.internal` so the sandbox
+can reach the host, which means the request arrives with
+`Host: host.docker.internal:<port>` and the server rejects it.
+
+The symptom on the Claude side is `/mcp` showing the server as
+**failed** with a body like:
+
+```
+Streamable HTTP error: Error POSTing to endpoint: Invalid Host header
+```
+
+Pillbox can't fix this from the client side — the `Host` header is
+derived from the URL by spec and no widely-used HTTP client honors a
+user-set override. **The fix lives in the MCP server's config.** A
+few common recipes:
+
+| Server stack                 | Fix                                                                                  |
+|------------------------------|--------------------------------------------------------------------------------------|
+| FastMCP (Python)             | `FastMCP(..., transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))` — or pass `allowed_hosts=["host.docker.internal", "localhost", "127.0.0.1"]` to scope it |
+| Starlette / uvicorn (direct) | Drop `TrustedHostMiddleware`, or add `host.docker.internal` to its `allowed_hosts`   |
+| Express + helmet             | Remove `helmet.hostCheck()` or extend its allowlist                                  |
+| Custom Node/Go/Rust          | Whatever your `Host`-header allowlist is, add `host.docker.internal` to it           |
+
+If the server you're attaching is third-party and you can't change
+its config, the workaround is to run a thin reverse proxy (caddy,
+nginx, socat) on the host that rewrites the `Host` header before
+forwarding. Out of scope for pillbox.
+
 ## The cross-pillbox channel
 
 Shared MCP = cross-sandbox channel by construction. Anything a

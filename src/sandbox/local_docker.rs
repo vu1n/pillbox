@@ -92,9 +92,9 @@ impl SandboxBackend for LocalDocker {
             args.push("-v".into());
             args.push(m.clone());
         }
-        if let Some(mcp) = &mcp {
+        if let Some(mount) = mcp.as_ref().and_then(|m| m.docker_mount.as_ref()) {
             args.push("-v".into());
-            args.push(mcp.docker_mount.clone());
+            args.push(mount.clone());
         }
         for (k, v) in &env_vars {
             args.push("-e".into());

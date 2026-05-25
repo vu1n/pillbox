@@ -21,8 +21,17 @@ use anyhow::{anyhow, Context, Result};
 use crate::pillbox::{self, Pillbox};
 use crate::{docker, errors::PillboxError};
 
+pub(crate) mod mcp;
+
+pub(crate) use mcp::{McpAttachment, McpInjection};
+
 pub(crate) const GUEST_HOME: &str = "/home/lum";
 pub(crate) const GUEST_WORKSPACE: &str = "/workspace";
+
+/// Per-agent MCP config builder. Returns a fully-formed injection
+/// (live tempfile + docker mount + extra argv); `None` on
+/// `AgentSpec` means the agent doesn't support `--mcp` yet.
+pub(crate) type McpInjectFn = fn(&[McpAttachment]) -> Result<McpInjection>;
 
 #[derive(Clone, Copy)]
 pub struct AgentSpec {
@@ -33,6 +42,13 @@ pub struct AgentSpec {
     pub(crate) oauth_port: Option<u16>,
     pub(crate) post_login_finalize: Option<fn(&Path) -> Result<()>>,
     pub(crate) vault_capable: bool,
+    /// Build a per-run MCP config injection from `--mcp` flags.
+    /// `None` means this agent doesn't support `--mcp` yet —
+    /// the backend hard-errors at run time. Per-agent config-file
+    /// mechanics differ enough (Claude `.mcp.json` vs Codex
+    /// `config.toml`) that the rendering lives in the `mcp` module
+    /// rather than in shared run code.
+    pub(crate) mcp_inject: Option<McpInjectFn>,
 }
 
 pub const CLAUDE: AgentSpec = AgentSpec {
@@ -43,6 +59,7 @@ pub const CLAUDE: AgentSpec = AgentSpec {
     oauth_port: Some(54545),
     post_login_finalize: Some(finalize_claude_onboarding),
     vault_capable: true,
+    mcp_inject: Some(mcp::claude_inject),
 };
 
 pub const CODEX: AgentSpec = AgentSpec {
@@ -53,6 +70,7 @@ pub const CODEX: AgentSpec = AgentSpec {
     oauth_port: None,
     post_login_finalize: None,
     vault_capable: true,
+    mcp_inject: None,
 };
 
 pub const ALL: &[&AgentSpec] = &[&CLAUDE, &CODEX];
@@ -221,6 +239,10 @@ pub(crate) struct RunOpts {
     pub(crate) env_files: Vec<PathBuf>,
     /// `--vault` — route API traffic through the pillbox stub-swap proxy.
     pub(crate) vault: bool,
+    /// `--mcp NAME=URL` shared-MCP attachments, parsed at the CLI
+    /// boundary. v0: Claude only — the sandbox backend hard-errors
+    /// if the resolved agent has no `mcp_inject` and this is non-empty.
+    pub(crate) mcps: Vec<McpAttachment>,
     pub(crate) args: Vec<String>,
     /// Remote name (`--remote NAME`). Resolved to a `Remote` record in
     /// `dispatch_run` and threaded through to the sandbox backend. Kept
@@ -375,6 +397,12 @@ pub(crate) fn base_docker_args() -> Vec<String> {
     vec![
         "-it".into(),
         "--rm".into(),
+        // Make `host.docker.internal` resolve on Linux. Docker Desktop
+        // already provides this alias and ignores the flag; vault and
+        // `--mcp` (and any future host-reachable feature) all rely on
+        // it being there unconditionally.
+        "--add-host".into(),
+        "host.docker.internal:host-gateway".into(),
         "-e".into(),
         format!("HOME={GUEST_HOME}"),
         "-e".into(),
@@ -422,6 +450,7 @@ mod tests {
             env_bundles: Vec::new(),
             env_files: Vec::new(),
             vault: false,
+            mcps: Vec::new(),
             args: Vec::new(),
             remote_name: None,
             detach: false,

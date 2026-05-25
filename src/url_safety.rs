@@ -5,44 +5,61 @@
 //! in-cluster collector, almost always a misconfig when sent
 //! cleartext across the public internet.
 
-/// If `url` is plaintext HTTP to a non-loopback host, return that
-/// host slice for the caller's warning message. `None` covers every
-/// "no warning needed" case: HTTPS, loopback (`localhost`, IPv4
-/// `127.0.0.0/8`, IPv6 `::1`, `*.localhost`), or a non-http(s) URL
-/// we won't POST to anyway.
-///
-/// Loopback set deliberately *excludes* mDNS `.local` (RFC 6762):
-/// link-local names can resolve to routable LAN addresses, so
-/// `attacker.local:9000` would silently bypass the warning if we
-/// matched on the suffix. Users running inside a container that
-/// names sidecars `*.local` can use `localhost` / `127.0.0.1` or
-/// accept the (correct) plaintext warning.
-///
-/// Host extraction is intentionally string-level — we're not parsing
-/// the URL semantically, just deciding loopback-or-not. The lifetime
-/// keeps the returned host borrowed from `url` so the caller can
-/// interpolate it without an alloc.
-pub(crate) fn plaintext_non_loopback_host(url: &str) -> Option<&str> {
-    let rest = url.strip_prefix("http://")?;
-    let host_port = rest
+/// Extract the host component from a URL of the form
+/// `scheme://[user@]host[:port][/path][?query][#frag]`. String-level
+/// only — we're not validating the URL semantically. Returns the
+/// borrowed host slice from `url`; `None` when the URL has no
+/// `://`, or when the resulting host is empty.
+pub(crate) fn host_of(url: &str) -> Option<&str> {
+    let (_scheme, rest) = url.split_once("://")?;
+    let after_userinfo = rest
         .split(['/', '?', '#'])
         .next()
         .unwrap_or("")
         .rsplit('@')
         .next()
         .unwrap_or("");
-    let host = host_port
-        .rsplit_once(':')
-        .map(|(h, _)| h)
-        .unwrap_or(host_port);
-    let is_loopback = matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
-        || host.starts_with("127.")
-        || host.ends_with(".localhost");
-    if is_loopback || host.is_empty() {
-        None
+    // IPv6 literals are bracketed (`[::1]`, `[::1]:8080`); the brackets
+    // are part of the host and the colon-port split has to ignore the
+    // colons inside them. Plain `rsplit_once(':')` would mangle
+    // `[::1]` into host=`[::`. Hostnames + IPv4 keep the simple split.
+    let host = if after_userinfo.starts_with('[') {
+        match after_userinfo.find(']') {
+            Some(end) => &after_userinfo[..=end],
+            None => after_userinfo,
+        }
     } else {
-        Some(host)
+        after_userinfo
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(after_userinfo)
+    };
+    (!host.is_empty()).then_some(host)
+}
+
+/// True for hosts the sandbox should treat as "the host machine":
+/// `localhost`, IPv4 `127.0.0.0/8`, IPv6 `::1` / `[::1]`, and
+/// `*.localhost`.
+///
+/// Deliberately *excludes* mDNS `.local` (RFC 6762): link-local
+/// names can resolve to routable LAN addresses, so `attacker.local`
+/// would silently slip past any loopback-only check.
+pub(crate) fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
+        || host.starts_with("127.")
+        || host.ends_with(".localhost")
+}
+
+/// If `url` is plaintext HTTP to a non-loopback host, return that
+/// host slice for the caller's warning message. `None` covers every
+/// "no warning needed" case: HTTPS, loopback (see [`is_loopback_host`]),
+/// or a non-http(s) URL we won't POST to anyway.
+pub(crate) fn plaintext_non_loopback_host(url: &str) -> Option<&str> {
+    if !url.starts_with("http://") {
+        return None;
     }
+    let host = host_of(url)?;
+    (!is_loopback_host(host)).then_some(host)
 }
 
 #[cfg(test)]

@@ -114,15 +114,15 @@ impl VaultSession {
     /// mount.
     pub(crate) fn docker_extras(&self, guest_home: &str) -> Vec<String> {
         let port = self.listen_addr.port();
-        // host.docker.internal works on Docker Desktop (macOS/Windows). Linux
-        // needs --add-host=host.docker.internal:host-gateway; we add it
-        // unconditionally — Docker Desktop ignores it harmlessly.
+        // The `--add-host host.docker.internal:host-gateway` line that
+        // makes this alias resolve on Linux lives in `base_docker_args`
+        // (Docker Desktop ignores it harmlessly), so vault + MCP + any
+        // future host-reachable feature all get it without each having
+        // to remember.
         let proxy_url = format!("http://host.docker.internal:{port}");
         let guest_ca = "/etc/pillbox-ca.crt";
 
         let mut out = vec![
-            "--add-host".into(),
-            "host.docker.internal:host-gateway".into(),
             "-v".into(),
             format!("{}:{guest_ca}:ro", self.ca_cert_path.display()),
         ];

@@ -148,6 +148,14 @@ enum Command {
         /// Route the agent's API traffic through pillbox's vault proxy.
         #[arg(long)]
         vault: bool,
+        /// Attach a shared MCP server to the sandbox. NAME is the
+        /// identifier the agent sees in its tool list; URL must be
+        /// http:// or https://. `localhost` / `127.0.0.1` are
+        /// rewritten to `host.docker.internal` so the sandbox can
+        /// reach host-bound servers. Repeatable.
+        /// v0: Claude only. Not supported with `--remote`.
+        #[arg(long = "mcp", value_name = "NAME=URL", conflicts_with = "remote")]
+        mcps: Vec<agents::McpAttachment>,
         /// Run on a registered remote VPS (`pillbox remote add NAME …`).
         /// The agent launches inside a pillbox sandbox on the remote;
         /// the local terminal proxies the remote PTY.
@@ -676,6 +684,7 @@ fn run(cli: Cli) -> Result<()> {
             env_bundles,
             env_files,
             vault,
+            mcps,
             remote,
             vault_stdin,
             detach,
@@ -755,6 +764,7 @@ fn run(cli: Cli) -> Result<()> {
                     env_bundles,
                     env_files,
                     vault,
+                    mcps,
                     args,
                     remote_name: remote,
                     detach,

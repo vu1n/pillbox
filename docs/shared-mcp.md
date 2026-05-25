@@ -66,10 +66,10 @@ For each `--mcp NAME=URL`:
 
 Per-agent details:
 
-| Agent  | Flag                                | Notes                                  |
-|--------|-------------------------------------|----------------------------------------|
-| Claude | `--mcp-config /etc/pillbox/mcp.json` | Additive with persistent config. Use `--strict-mcp-config` later if reproducibility demands it. |
-| Codex  | _not yet wired_                     | Planned: `CODEX_HOME=<tmpdir>` overlay with seeded `config.toml`. |
+| Agent  | Mechanism                                              | Notes                                                                                          |
+|--------|--------------------------------------------------------|------------------------------------------------------------------------------------------------|
+| Claude | tempfile + `--mcp-config /etc/pillbox/mcp.json`        | Additive with persistent config. Use `--strict-mcp-config` later if reproducibility demands it. |
+| Codex  | `-c mcp_servers.NAME.url="URL"` per attachment        | No tempfile, no mount — codex's `-c` flag merges into `~/.codex/config.toml` at runtime, highest precedence. URL never lands on disk. |
 
 The injection contract lives in the agent adapter (`src/agents/`),
 not in shared run code — each agent has different per-run config
@@ -138,22 +138,21 @@ attachment. Mitigations are operational, not technical:
 ## v0 scope
 
 - HTTP-transport MCP only
-- Claude only (Codex deferred)
-- `--mcp NAME=URL` flag, repeatable
-- `localhost` → `host.docker.internal` rewrite
+- Both agents wired: Claude (file-based) + Codex (`-c` flag)
+- `--mcp NAME=URL` flag, repeatable. NAME is `[A-Za-z][A-Za-z0-9_-]*`
+- `localhost` / `127.0.0.0/8` / `::1` / `*.localhost` → `host.docker.internal`
 - Additive with persistent agent config (no `--strict-mcp-config`)
 - `--mcp` + `--remote` rejected with a helpful error
 - No supervision, no manifests, no scope registry, no lookup keys
 
 ## Not v0
 
-- Codex injection (different config-file mechanics; needs its
-  own pass)
 - Per-attachment bearer tokens (mem0 OpenMemory local doesn't
-  need them; add when a real consumer does)
-- `--mcp NAME=URL --mcp-token NAME=SECRET_NAME` for stored-secret
-  bearer auth
-- `--strict-mcp-config` mode for reproducibility
+  need them; add when a real consumer does). Codex's
+  `bearer_token_env_var` field lines up with a future
+  `--mcp-token NAME=SECRET_NAME` flow via the existing `--with`
+  machinery.
+- `--strict-mcp-config` mode for Claude reproducibility
 - `--remote` support (remote-side attachment + URL reachability
   is its own design)
 - Stdio MCP (escape hatch: provider author ships an HTTP wrapper)

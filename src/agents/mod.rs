@@ -70,7 +70,7 @@ pub const CODEX: AgentSpec = AgentSpec {
     oauth_port: None,
     post_login_finalize: None,
     vault_capable: true,
-    mcp_inject: None,
+    mcp_inject: Some(mcp::codex_inject),
 };
 
 pub const ALL: &[&AgentSpec] = &[&CLAUDE, &CODEX];

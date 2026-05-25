@@ -28,9 +28,9 @@ impl McpAttachment {
     /// URL rewritten to `host.docker.internal` if the host
     /// component was `localhost` or `127.0.0.1`.
     pub(crate) fn parse(raw: &str) -> Result<Self> {
-        let (name, url) = raw.split_once('=').ok_or_else(|| {
-            PillboxError::usage("run", format!("--mcp `{raw}` must be NAME=URL"))
-        })?;
+        let (name, url) = raw
+            .split_once('=')
+            .ok_or_else(|| PillboxError::usage("run", format!("--mcp `{raw}` must be NAME=URL")))?;
         if name.is_empty() {
             return Err(PillboxError::usage(
                 "run",
@@ -188,9 +188,7 @@ mod tests {
         );
         // IPv6 loopback, bracketed with port.
         assert_eq!(
-            McpAttachment::parse("x=http://[::1]:8080/mcp")
-                .unwrap()
-                .url,
+            McpAttachment::parse("x=http://[::1]:8080/mcp").unwrap().url,
             "http://host.docker.internal:8080/mcp"
         );
         // IPv6 loopback, bracketed, no port.
@@ -216,7 +214,9 @@ mod tests {
             "http://canopy.internal:9000/"
         );
         assert_eq!(
-            McpAttachment::parse("x=https://api.mem0.ai/mcp").unwrap().url,
+            McpAttachment::parse("x=https://api.mem0.ai/mcp")
+                .unwrap()
+                .url,
             "https://api.mem0.ai/mcp"
         );
     }

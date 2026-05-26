@@ -53,6 +53,26 @@ impl SandboxBackend for LocalDocker {
 
         let withs_resolved = resolve_with_entries(resolved, &opts.withs)?;
         let any_vaulted = withs_resolved.iter().any(|w| w.meta.is_some());
+        // A vaulted `--with` secret routes through the stub-swap proxy
+        // exactly like `--vault`; an agent that can't reach the proxy
+        // would receive the stub and ship it to the provider. Reject
+        // here too, not just on the explicit `--vault` flag above.
+        if any_vaulted && !spec.vault_capable {
+            let names: Vec<&str> = withs_resolved
+                .iter()
+                .filter(|w| w.meta.is_some())
+                .map(|w| w.secret_name.as_str())
+                .collect();
+            return Err(PillboxError::usage(
+                "run",
+                format!(
+                    "agent `{}` does not support the vault proxy, so it can't use vaulted secret(s): {}",
+                    spec.id,
+                    names.join(", ")
+                ),
+            )
+            .into());
+        }
         let mut vault_session = if opts.vault || any_vaulted {
             let oauth = if opts.vault {
                 Some(crate::vault::OAuthAgent {

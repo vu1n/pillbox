@@ -104,6 +104,24 @@ pub(crate) fn resolve_tokens(
     mut attachments: Vec<McpAttachment>,
     tokens: &[McpTokenSpec],
 ) -> Result<Vec<McpAttachment>> {
+    // Reject duplicate `--mcp NAME` up front. Every adapter keys its
+    // config by NAME (a JSON object key for Claude/OpenCode, a TOML
+    // table segment for Codex), so a repeated name would silently
+    // last-write-win — and worse, a `--mcp-token` would attach to the
+    // first entry only to have it overwritten by the un-tokened
+    // duplicate. Fail loudly instead.
+    let mut name_seen: std::collections::HashSet<&str> =
+        std::collections::HashSet::with_capacity(attachments.len());
+    for a in &attachments {
+        if !name_seen.insert(a.name.as_str()) {
+            return Err(PillboxError::usage(
+                "run",
+                format!("--mcp NAME `{}` given more than once", a.name),
+            )
+            .into());
+        }
+    }
+
     // Codex needs each token in a distinct env var. The transform
     // `NAME → uppercase + '-' → '_'` can collide (`code-search`
     // vs `code_search`); detect that early so the user gets a
@@ -145,7 +163,7 @@ pub(crate) fn resolve_tokens(
             PillboxError::runtime("run", format!("secret `{}` not found", t.secret_name))
                 .with_next(format!("pillbox secret add {}", t.secret_name))
         })?;
-        target.token = Some(value.trim_end_matches('\n').to_string());
+        target.token = Some(value.trim().to_string());
     }
     Ok(attachments)
 }
@@ -300,9 +318,11 @@ pub(crate) fn codex_inject(attachments: &[McpAttachment]) -> Result<McpInjection
 /// Adapter for OpenCode: write `--mcp` attachments to a tempfile as an
 /// `opencode.json` config with `mcp` entries, mount it read-only, and
 /// set `OPENCODE_CONFIG` env var to point at the guest path. OpenCode
-/// merges configs from multiple locations so this is additive with any
-/// persistent `~/.config/opencode/opencode.json` the user's home may
-/// already contain.
+/// merges configs rather than replacing them, so this is additive with
+/// the user's global `~/.config/opencode/opencode.json` (which loads at
+/// lower precedence). Caveat: a project `opencode.json` in the mounted
+/// workspace loads at *higher* precedence than `OPENCODE_CONFIG`, so a
+/// workspace MCP entry sharing a `--mcp` NAME would override ours.
 pub(crate) fn opencode_inject(attachments: &[McpAttachment]) -> Result<McpInjection> {
     let guest_path = "/etc/pillbox/opencode-mcp.json";
     let mut tempfile = tempfile::Builder::new()
@@ -343,6 +363,8 @@ pub(crate) fn opencode_config_bytes(attachments: &[McpAttachment]) -> Vec<u8> {
         servers.insert(a.name.clone(), Value::Object(entry));
     }
     let config: Value = json!({ "mcp": Value::Object(servers) });
+    // serde_json on a Map<String, Value> only fails on non-string keys
+    // (we have none) or a writer error (in-memory Vec doesn't fail).
     serde_json::to_vec_pretty(&config).expect("in-memory JSON serialization is infallible")
 }
 
@@ -676,6 +698,29 @@ mod tests {
             }];
             let resolved = resolve_tokens(&g, attachments, &tokens).unwrap();
             assert_eq!(resolved[0].token.as_deref(), Some("raw-secret-value"));
+        });
+    }
+
+    #[test]
+    fn resolve_tokens_errors_on_duplicate_mcp_name() {
+        use crate::pillbox;
+        use crate::test_util::with_isolated_home;
+        with_isolated_home("mcp-resolve-tokens-dup", || {
+            let g = pillbox::global();
+            let attachments = vec![
+                McpAttachment {
+                    name: "mem0".into(),
+                    url: "http://x:1/".into(),
+                    token: None,
+                },
+                McpAttachment {
+                    name: "mem0".into(),
+                    url: "http://x:2/".into(),
+                    token: None,
+                },
+            ];
+            let err = resolve_tokens(&g, attachments, &[]).unwrap_err();
+            assert!(err.to_string().contains("given more than once"), "{err}");
         });
     }
 

@@ -76,7 +76,7 @@ pub const CODEX: AgentSpec = AgentSpec {
 pub const OPENCODE: AgentSpec = AgentSpec {
     id: "opencode",
     cred_sentinel: ".local/share/opencode/auth.json",
-    login_argv: &["opencode", "providers", "login"],
+    login_argv: &["opencode", "auth", "login"],
     run_argv: &["opencode"],
     oauth_port: None,
     post_login_finalize: None,

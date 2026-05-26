@@ -193,7 +193,7 @@ pub(crate) enum EnvAction {
 pub(crate) enum AuthAction {
     /// Run the OAuth flow inside a one-shot sandbox.
     Login {
-        /// Agent to authenticate (`claude` | `codex`).
+        /// Agent to authenticate (`claude` | `codex` | `opencode`).
         #[arg(long, value_name = "AGENT")]
         agent: String,
         /// Reserved — v0.6 PR 2 always writes to global. Pass for

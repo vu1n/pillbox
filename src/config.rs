@@ -9,7 +9,7 @@
 //! name = "my-project"
 //!
 //! # optional — default agent for `pillbox run`
-//! agent = "claude"          # or "codex"
+//! agent = "claude"          # or "codex" or "opencode"
 //!
 //! [workspace]
 //! backend = "local"        # or "s3"

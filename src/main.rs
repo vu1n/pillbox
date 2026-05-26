@@ -79,7 +79,7 @@ enum Command {
         /// Display name for the pillbox. Defaults to the cwd's basename.
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
-        /// Default agent for `pillbox run` (`claude` | `codex`).
+        /// Default agent for `pillbox run` (`claude` | `codex` | `opencode`).
         #[arg(long, value_name = "AGENT")]
         agent: Option<String>,
         /// Workspace backend variant. `local` (default) stores the
@@ -130,7 +130,7 @@ enum Command {
     },
     /// Launch an agent against the current pillbox.
     Run {
-        /// Agent to launch (`claude` | `codex`). Defaults to the current
+        /// Agent to launch (`claude` | `codex` | `opencode`). Defaults to the current
         /// pillbox's `agent =` field, or `claude` if unset.
         #[arg(long, value_name = "AGENT")]
         agent: Option<String>,

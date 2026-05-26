@@ -73,7 +73,18 @@ pub const CODEX: AgentSpec = AgentSpec {
     mcp_inject: Some(mcp::codex_inject),
 };
 
-pub const ALL: &[&AgentSpec] = &[&CLAUDE, &CODEX];
+pub const OPENCODE: AgentSpec = AgentSpec {
+    id: "opencode",
+    cred_sentinel: ".local/share/opencode/auth.json",
+    login_argv: &["opencode", "providers", "login"],
+    run_argv: &["opencode"],
+    oauth_port: None,
+    post_login_finalize: None,
+    vault_capable: false,
+    mcp_inject: Some(mcp::opencode_inject),
+};
+
+pub const ALL: &[&AgentSpec] = &[&CLAUDE, &CODEX, &OPENCODE];
 
 /// Look up an agent spec by id, or return a usage error listing the
 /// known ids. Centralized so every CLI surface that takes an

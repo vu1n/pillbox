@@ -4,10 +4,14 @@
 //! - **exec** (`exec`): run a one-off command. `--json` emits
 //!   `ExecStarted`/`ExecOutput`/`ExecExit` as JSONL; plain passes raw bytes
 //!   through and mirrors the exit code.
-//! - **agent** (`agent`): run a headless agent turn. The shared driver execs
-//!   the harness's `run_argv`, streams its stdout JSON-lines through the
-//!   harness adapter's normalizer, and emits contract events (`--json`) or a
-//!   human trace. Requires the sandbox to be spawned `--agent`.
+//! - **agent** (`agent`): run a headless agent turn, emitting contract events
+//!   (`--json`) or a human trace. Requires the sandbox to be spawned
+//!   `--agent`. Two driver flavours, picked by which adapter the agent has:
+//!     - `AgentDriver` (stdout) — execs the harness's `run_argv` (claude `-p`,
+//!       pi) and streams its stdout JSON-lines through the normalizer.
+//!     - `ServeDriver` (HTTP/SSE) — for harnesses with no headless stdout mode
+//!       (opencode): brings up `opencode serve` in the sandbox, POSTs the
+//!       prompt, and streams its SSE events through the normalizer.
 
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -15,11 +19,12 @@ use std::path::PathBuf;
 use anyhow::Result;
 use base64::Engine as _;
 
-use crate::agents::harness::{self, HarnessAdapter, HarnessState};
+use crate::agents::harness::{self, HarnessAdapter, HarnessState, ServeAdapter};
 use crate::agents::{workspace_mount_name, GUEST_HOME, GUEST_WORKSPACE};
 use crate::cli::SandboxAction;
 use crate::contract::{
-    Event, EventSink, ExecExit, ExecOutput, ExecStarted, JsonlSink, Payload, StdStream, ToolStatus,
+    Event, EventSink, ExecExit, ExecOutput, ExecStarted, JsonlSink, Payload, RunFinished,
+    RunStarted, StdStream, ToolStatus,
 };
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
@@ -130,9 +135,9 @@ fn spawn(
 }
 
 /// The agent channel: run a headless agent turn in `id` and stream its
-/// normalized contract events. The driver is harness-agnostic — it execs the
-/// adapter's `run_argv`, buffers stdout into JSON lines, and feeds each to the
-/// adapter's `parse_line`. opencode's HTTP-serve model would be a second driver.
+/// normalized contract events. Dispatches to one of two harness-agnostic
+/// drivers by the agent's adapter kind: `AgentDriver` for stdout-streaming
+/// harnesses (claude/pi), `ServeDriver` for serve harnesses (opencode).
 fn agent(resolved: &Pillbox, id: &str, json: bool, prompt: Vec<String>) -> Result<()> {
     let prompt = prompt.join(" ");
     if prompt.trim().is_empty() {
@@ -155,30 +160,41 @@ fn agent(resolved: &Pillbox, id: &str, json: bool, prompt: Vec<String>) -> Resul
         )
         .with_next("pillbox sandbox spawn --agent claude")
     })?;
-    let adapter = harness::lookup(&agent_id).ok_or_else(|| {
-        PillboxError::usage(
-            "sandbox agent",
-            format!("no harness adapter for `{agent_id}`"),
-        )
-    })?;
 
     let sink: Box<dyn EventSink> = if json {
         Box::new(JsonlSink::new(io::stdout()))
     } else {
         Box::new(HumanSink)
     };
-    let argv = adapter.run_argv(&prompt);
-    let mut driver = AgentDriver::new(adapter, sink, record.id.clone());
 
-    docker::exec_streamed(&record.backend_ref, &argv, |is_stderr, bytes| {
-        // the harness emits its protocol on stdout; stderr is diagnostics
-        if is_stderr {
-            Ok(())
-        } else {
-            driver.feed(bytes)
-        }
-    })?;
-    driver.finish()
+    // Two driver flavours behind one verb. Stdout-streaming harnesses
+    // (claude `-p`, pi) use the shared `AgentDriver`: exec the harness, feed
+    // its stdout JSON-lines through the normalizer. Serve harnesses
+    // (opencode) use `ServeDriver`: bring up `opencode serve` in the sandbox,
+    // POST the prompt, and feed its SSE stream through the normalizer. Same
+    // contract events out either way.
+    if let Some(adapter) = harness::lookup(&agent_id) {
+        let argv = adapter.run_argv(&prompt);
+        let mut driver = AgentDriver::new(adapter, sink, record.id.clone());
+        docker::exec_streamed(&record.backend_ref, &argv, |is_stderr, bytes| {
+            // the harness emits its protocol on stdout; stderr is diagnostics
+            if is_stderr {
+                Ok(())
+            } else {
+                driver.feed(bytes)
+            }
+        })?;
+        return driver.finish();
+    }
+    if let Some(adapter) = harness::lookup_serve(&agent_id) {
+        let mut driver = ServeDriver::new(adapter, sink, record.id.clone());
+        return driver.run(&record.backend_ref, &prompt);
+    }
+    Err(PillboxError::usage(
+        "sandbox agent",
+        format!("no harness adapter for `{agent_id}`"),
+    )
+    .into())
 }
 
 /// The shared agent-channel driver: buffers a harness's stdout into JSON
@@ -238,6 +254,233 @@ impl AgentDriver {
         }
         Ok(())
     }
+}
+
+/// The serve-channel driver — the opencode counterpart to [`AgentDriver`].
+///
+/// opencode has no headless stdout-JSON mode; it runs an HTTP server. So this
+/// driver:
+///   1. starts `opencode serve` in the sandbox (detached `docker exec -d`),
+///   2. waits for `GET /global/health` to answer,
+///   3. creates a session (`POST /session`) and emits a synthetic `RunStarted`
+///      (opencode's `session.created` predates our subscription),
+///   4. fires the prompt (`POST /session/{id}/prompt_async`) on a background
+///      thread after a short delay, so the subscription attaches first, and
+///   5. consumes the SSE stream (`GET /event`) on the main thread, feeding
+///      each event through the [`ServeAdapter`] normalizer.
+///
+/// Every REST call and the SSE subscription run as `curl` *inside* the
+/// container (`docker exec`), so the transport reuses the existing docker
+/// plumbing — no host↔container port publishing on a long-lived sandbox, and
+/// the server stays bound to the container's loopback. The driver stops when
+/// the adapter reports a terminal event (`session.idle`).
+struct ServeDriver {
+    adapter: Box<dyn ServeAdapter>,
+    sink: Box<dyn EventSink>,
+    state: HarnessState,
+    sandbox_id: String,
+    run_id: String,
+    seq: u64,
+    /// Set once a terminal event (`session.idle` → `RunFinished`) is emitted,
+    /// so `run` can synthesize a `RunFinished` fallback if the stream ends
+    /// (server died, connection dropped) without one.
+    terminal_seen: bool,
+}
+
+/// Loopback port for the in-sandbox `opencode serve`. Fixed (not published to
+/// the host) — one agent turn per sandbox at a time, server bound to the
+/// container's own loopback.
+const SERVE_PORT: u16 = 47821;
+
+impl ServeDriver {
+    fn new(adapter: Box<dyn ServeAdapter>, sink: Box<dyn EventSink>, sandbox_id: String) -> Self {
+        Self {
+            adapter,
+            sink,
+            state: HarnessState::default(),
+            sandbox_id,
+            run_id: crate::registry::new_id(),
+            seq: 0,
+            terminal_seen: false,
+        }
+    }
+
+    /// Emit one payload to the sink, assigning the next durable seq and the
+    /// driver's run id. Mirrors `AgentDriver::emit_line`'s per-payload emit.
+    fn emit(&mut self, payload: Payload) -> Result<()> {
+        self.seq += 1;
+        self.sink
+            .emit(&Event::durable(self.seq, &self.sandbox_id, payload).with_run(&self.run_id))
+    }
+
+    fn run(&mut self, container: &str, prompt: &str) -> Result<()> {
+        let base = format!("http://127.0.0.1:{SERVE_PORT}");
+
+        // 1. Bring up the server in the sandbox (detached).
+        docker::exec_detached(container, &self.adapter.serve_argv(SERVE_PORT))?;
+
+        // 2. Wait for it to answer. opencode boots in well under a second
+        // normally; poll up to ~15s before giving up.
+        Self::wait_ready(container, &base)?;
+
+        // 3. Create a session.
+        let session_id = Self::create_session(container, &base)?;
+
+        // Synthesize RunStarted: opencode's `session.created` fires before our
+        // SSE subscription attaches (step 5), so we'd miss it. The driver owns
+        // the run boundary anyway, so emit it here once the session exists.
+        self.emit(Payload::RunStarted(RunStarted {
+            agent: "opencode".into(),
+            parent_run_id: String::new(),
+            base_snapshot: String::new(),
+        }))?;
+
+        // 4. Fire the prompt on a background thread *after* a short delay, so
+        // the foreground SSE subscription (step 5) is attached first —
+        // opencode replays no history to a late subscriber, so events emitted
+        // before `/event` is connected would be missed. Only `Send` data
+        // (strings) crosses the boundary; the non-`Send` sink + normalizer
+        // stay on the main thread with the SSE loop.
+        let prompt_body = serde_json::json!({
+            "parts": [{ "type": "text", "text": prompt }]
+        })
+        .to_string();
+        let prompt_url = format!("{base}/session/{session_id}/prompt_async");
+        let container_owned = container.to_string();
+        let prompter = std::thread::spawn(move || -> Result<()> {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            let (code, out) = docker::exec_capture(
+                &container_owned,
+                &curl_argv(&[
+                    "-s",
+                    "-X",
+                    "POST",
+                    "-H",
+                    "content-type: application/json",
+                    "-d",
+                    &prompt_body,
+                    &prompt_url,
+                ]),
+            )?;
+            if code != 0 {
+                return Err(PillboxError::runtime(
+                    "sandbox agent",
+                    format!("opencode prompt POST failed (curl exit {code}): {out}"),
+                )
+                .into());
+            }
+            Ok(())
+        });
+
+        // 5. Consume the SSE stream on the main thread until `session.idle`.
+        let stream_argv = curl_argv(&["-sN", &format!("{base}/event")]);
+        let stream_result =
+            docker::exec_stream_lines(container, &stream_argv, |line| self.on_sse_line(line));
+
+        // Surface a prompt-POST failure ahead of a stream error — a failed
+        // prompt is the more actionable diagnostic (e.g. unauthenticated).
+        match prompter.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(PillboxError::runtime(
+                    "sandbox agent",
+                    "opencode prompt thread panicked".to_string(),
+                )
+                .into())
+            }
+        }
+        stream_result?;
+
+        // The stream ended without a terminal `session.idle` (server died /
+        // connection dropped). Synthesize a non-zero RunFinished so consumers
+        // always see a run boundary and can tell the turn didn't complete
+        // cleanly.
+        if !self.terminal_seen {
+            self.emit(Payload::RunFinished(RunFinished {
+                result_snapshot: String::new(),
+                exit_code: 1,
+            }))?;
+        }
+        Ok(())
+    }
+
+    /// Feed one raw SSE line. Returns `Ok(true)` to stop the stream (terminal
+    /// event seen). Non-`data:` lines (SSE comments, blank separators) are
+    /// skipped.
+    fn on_sse_line(&mut self, line: &str) -> Result<bool> {
+        let Some(json) = line
+            .strip_prefix("data: ")
+            .or_else(|| line.strip_prefix("data:"))
+        else {
+            return Ok(false);
+        };
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(json.trim()) else {
+            return Ok(false); // tolerate keep-alive / non-JSON noise
+        };
+        for payload in self.adapter.parse_event(&event, &mut self.state) {
+            match payload {
+                // The driver already synthesized RunStarted (the adapter's
+                // `session.created` may also fire if we catch it); don't
+                // double-emit.
+                Payload::RunStarted(_) => continue,
+                Payload::RunFinished(_) => self.terminal_seen = true,
+                _ => {}
+            }
+            self.emit(payload)?;
+        }
+        Ok(self.adapter.is_terminal(&event))
+    }
+
+    fn wait_ready(container: &str, base: &str) -> Result<()> {
+        let url = format!("{base}/global/health");
+        for _ in 0..75 {
+            if let Ok((0, _)) =
+                docker::exec_capture(container, &curl_argv(&["-sf", "-o", "/dev/null", &url]))
+            {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        Err(PillboxError::runtime(
+            "sandbox agent",
+            "opencode serve did not become ready within ~15s".to_string(),
+        )
+        .with_next("pillbox sandbox exec <id> -- opencode serve  # check it starts manually")
+        .into())
+    }
+
+    fn create_session(container: &str, base: &str) -> Result<String> {
+        let (code, out) = docker::exec_capture(
+            container,
+            &curl_argv(&["-s", "-X", "POST", "-d", "{}", &format!("{base}/session")]),
+        )?;
+        if code != 0 {
+            return Err(PillboxError::runtime(
+                "sandbox agent",
+                format!("opencode session create failed (curl exit {code}): {out}"),
+            )
+            .into());
+        }
+        serde_json::from_str::<serde_json::Value>(&out)
+            .ok()
+            .and_then(|v| v.get("id").and_then(|i| i.as_str()).map(str::to_string))
+            .ok_or_else(|| {
+                PillboxError::runtime(
+                    "sandbox agent",
+                    format!("opencode session create returned no id: {out}"),
+                )
+                .into()
+            })
+    }
+}
+
+/// Build a `curl` argv. Centralized so every in-sandbox REST/SSE call shares
+/// the same base flags.
+fn curl_argv(extra: &[&str]) -> Vec<String> {
+    let mut argv = vec!["curl".to_string()];
+    argv.extend(extra.iter().map(|s| s.to_string()));
+    argv
 }
 
 /// Human-readable rendering of the agent event stream (the non-`--json` path):

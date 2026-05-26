@@ -21,6 +21,7 @@ use anyhow::{anyhow, Context, Result};
 use crate::pillbox::{self, Pillbox};
 use crate::{docker, errors::PillboxError};
 
+pub(crate) mod harness;
 pub(crate) mod mcp;
 
 pub(crate) use mcp::{McpAttachment, McpInjection, McpTokenSpec};

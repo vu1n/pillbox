@@ -863,14 +863,21 @@ mod tests {
         let injection = opencode_inject(&attachments).unwrap();
         assert!(injection.docker_mount.is_some());
         assert!(
-            injection.docker_mount.as_ref().unwrap().contains("/etc/pillbox/opencode-mcp.json"),
+            injection
+                .docker_mount
+                .as_ref()
+                .unwrap()
+                .contains("/etc/pillbox/opencode-mcp.json"),
             "mount should target guest path: {:?}",
             injection.docker_mount
         );
         assert_eq!(injection.extra_argv, Vec::<String>::new());
         assert_eq!(
             injection.env_vars,
-            vec![("OPENCODE_CONFIG".into(), "/etc/pillbox/opencode-mcp.json".into())]
+            vec![(
+                "OPENCODE_CONFIG".into(),
+                "/etc/pillbox/opencode-mcp.json".into()
+            )]
         );
     }
 }

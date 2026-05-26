@@ -72,12 +72,30 @@ pub(crate) enum SandboxAction {
         /// Runner image (default: the pillbox runner image).
         #[arg(long, value_name = "IMAGE")]
         image: Option<String>,
+        /// Provision for an agent harness (`claude` | `codex` | `opencode`):
+        /// mounts its auth and runs the container non-root so the agent
+        /// channel can drive it headlessly. Omit for a bare exec-only sandbox.
+        #[arg(long, value_name = "AGENT")]
+        agent: Option<String>,
         /// Host directory to mount as the workspace (default: cwd).
         #[arg(long, value_name = "PATH")]
         workspace: Option<PathBuf>,
         /// Human label, surfaced in `sandbox list`.
         #[arg(long, value_name = "TEXT")]
         label: Option<String>,
+    },
+    /// Run an agent turn in a sandbox (the agent channel). Streams the agent's
+    /// activity as contract events; `--json` emits them as JSONL, otherwise a
+    /// human-readable trace. The sandbox must have been spawned `--agent`.
+    Agent {
+        /// Sandbox id (or unique prefix ≥ 4 chars).
+        id: String,
+        /// Emit contract events as JSONL instead of a human trace.
+        #[arg(long)]
+        json: bool,
+        /// The prompt, after `--`.
+        #[arg(trailing_var_arg = true, value_name = "PROMPT")]
+        prompt: Vec<String>,
     },
     /// Run a command in a sandbox (PTY-free). Default streams raw output and
     /// mirrors the exit code; `--json` emits structured exec events as JSONL.

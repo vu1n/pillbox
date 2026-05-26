@@ -38,6 +38,10 @@ pub(crate) struct Sandbox {
     pub(crate) backend_ref: String,
     /// Runner image the container was started from.
     pub(crate) image: String,
+    /// Agent harness this sandbox is provisioned for (auth mounted, non-root),
+    /// or `None` for a bare exec-only sandbox.
+    #[serde(default)]
+    pub(crate) agent: Option<String>,
     /// Host path mounted as the workspace.
     pub(crate) workspace: String,
     /// Optional human label, surfaced in `sandbox list`.
@@ -114,6 +118,7 @@ mod tests {
             backend: BACKEND_DOCKER.into(),
             backend_ref: "container-abc".into(),
             image: "pillbox:latest".into(),
+            agent: None,
             workspace: "/work/app".into(),
             label: None,
             created_at: crate::session::now_rfc3339(),

@@ -153,9 +153,23 @@ enum Command {
         /// http:// or https://. `localhost` / `127.0.0.1` are
         /// rewritten to `host.docker.internal` so the sandbox can
         /// reach host-bound servers. Repeatable.
-        /// v0: Claude only. Not supported with `--remote`.
+        /// Not supported with `--remote`.
         #[arg(long = "mcp", value_name = "NAME=URL", conflicts_with = "remote")]
         mcps: Vec<agents::McpAttachment>,
+        /// Attach a bearer token to a `--mcp NAME=URL` from the
+        /// pillbox secret store. NAME must match a `--mcp` entry;
+        /// SECRET_NAME is the name passed to `pillbox secret add`.
+        /// Claude folds it into a 0600 tempfile as
+        /// `headers.Authorization: Bearer <value>`; Codex stashes
+        /// it in an env var and references it via
+        /// `bearer_token_env_var`. Token values never land in argv
+        /// or shell history. Repeatable.
+        #[arg(
+            long = "mcp-token",
+            value_name = "NAME=SECRET_NAME",
+            conflicts_with = "remote"
+        )]
+        mcp_tokens: Vec<agents::McpTokenSpec>,
         /// Run on a registered remote VPS (`pillbox remote add NAME …`).
         /// The agent launches inside a pillbox sandbox on the remote;
         /// the local terminal proxies the remote PTY.
@@ -685,6 +699,7 @@ fn run(cli: Cli) -> Result<()> {
             env_files,
             vault,
             mcps,
+            mcp_tokens,
             remote,
             vault_stdin,
             detach,
@@ -765,6 +780,7 @@ fn run(cli: Cli) -> Result<()> {
                     env_files,
                     vault,
                     mcps,
+                    mcp_tokens,
                     args,
                     remote_name: remote,
                     detach,

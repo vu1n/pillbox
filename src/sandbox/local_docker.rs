@@ -68,6 +68,13 @@ impl SandboxBackend for LocalDocker {
         // tail of an if-let in the args build) so the tempfile
         // inside `McpInjection` lives until docker exits.
         let mcp = if opts.mcps.is_empty() {
+            if !opts.mcp_tokens.is_empty() {
+                return Err(PillboxError::usage(
+                    "run",
+                    "--mcp-token requires at least one --mcp NAME=URL",
+                )
+                .into());
+            }
             None
         } else {
             let inject = spec.mcp_inject.ok_or_else(|| {
@@ -76,7 +83,9 @@ impl SandboxBackend for LocalDocker {
                     format!("--mcp is not supported for agent `{}`", spec.id),
                 )
             })?;
-            Some(inject(&opts.mcps)?)
+            let resolved_mcps =
+                crate::agents::mcp::resolve_tokens(resolved, opts.mcps.clone(), &opts.mcp_tokens)?;
+            Some(inject(&resolved_mcps)?)
         };
 
         let mut args = base_docker_args();
@@ -99,6 +108,12 @@ impl SandboxBackend for LocalDocker {
         for (k, v) in &env_vars {
             args.push("-e".into());
             args.push(format!("{k}={v}"));
+        }
+        if let Some(mcp) = &mcp {
+            for (k, v) in &mcp.env_vars {
+                args.push("-e".into());
+                args.push(format!("{k}={v}"));
+            }
         }
         if let Some(session) = &vault_session {
             args.extend(session.docker_extras(GUEST_HOME));

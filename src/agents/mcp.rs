@@ -16,11 +16,24 @@ use serde_json::{json, Value};
 use crate::errors::PillboxError;
 use crate::url_safety;
 
-/// One `--mcp NAME=URL` after parsing + URL rewriting.
+/// One `--mcp NAME=URL` after parsing + URL rewriting. `token` is
+/// `None` at CLI-parse time and gets populated by
+/// [`resolve_tokens`] when a matching `--mcp-token NAME=SECRET_NAME`
+/// is present, by reading the value from the pillbox secret store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct McpAttachment {
     pub(crate) name: String,
     pub(crate) url: String,
+    pub(crate) token: Option<String>,
+}
+
+/// One `--mcp-token NAME=SECRET_NAME` after parsing. `mcp_name`
+/// must match a `--mcp NAME=URL`; `secret_name` is looked up in
+/// the pillbox secret store at run time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct McpTokenSpec {
+    pub(crate) mcp_name: String,
+    pub(crate) secret_name: String,
 }
 
 impl McpAttachment {
@@ -43,8 +56,113 @@ impl McpAttachment {
         Ok(Self {
             name: name.to_string(),
             url: rewrite_localhost(url),
+            token: None,
         })
     }
+}
+
+impl McpTokenSpec {
+    pub(crate) fn parse(raw: &str) -> Result<Self> {
+        let (mcp_name, secret_name) = raw.split_once('=').ok_or_else(|| {
+            PillboxError::usage(
+                "run",
+                format!("--mcp-token `{raw}` must be NAME=SECRET_NAME"),
+            )
+        })?;
+        validate_name(mcp_name)
+            .map_err(|e| PillboxError::usage("run", format!("--mcp-token `{raw}` {e}")))?;
+        if secret_name.is_empty() {
+            return Err(PillboxError::usage(
+                "run",
+                format!("--mcp-token `{raw}` SECRET_NAME must be non-empty"),
+            )
+            .into());
+        }
+        Ok(Self {
+            mcp_name: mcp_name.to_string(),
+            secret_name: secret_name.to_string(),
+        })
+    }
+}
+
+impl FromStr for McpTokenSpec {
+    type Err = String;
+
+    fn from_str(raw: &str) -> std::result::Result<Self, Self::Err> {
+        Self::parse(raw).map_err(|e| e.to_string())
+    }
+}
+
+/// Resolve `--mcp-token NAME=SECRET_NAME` specs against the
+/// `--mcp NAME=URL` set: validate every token references a real
+/// attachment, look up secret values from the pillbox store, and
+/// return a new attachment list with `token` populated where
+/// applicable. Errors on unmatched mcp_name, unknown secret, or
+/// env-var-name collision in the codex transform.
+pub(crate) fn resolve_tokens(
+    resolved: &crate::pillbox::Pillbox,
+    mut attachments: Vec<McpAttachment>,
+    tokens: &[McpTokenSpec],
+) -> Result<Vec<McpAttachment>> {
+    // Codex needs each token in a distinct env var. The transform
+    // `NAME → uppercase + '-' → '_'` can collide (`code-search`
+    // vs `code_search`); detect that early so the user gets a
+    // clear error instead of a silent overwrite at run time.
+    let mut env_var_seen: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for t in tokens {
+        let env = codex_env_var_name(&t.mcp_name);
+        if let Some(other) = env_var_seen.insert(env.clone(), t.mcp_name.clone()) {
+            if other != t.mcp_name {
+                return Err(PillboxError::usage(
+                    "run",
+                    format!(
+                        "--mcp-token names `{}` and `{}` both collapse to env var `{env}` \
+                         in the codex injection — pick one or rename so they differ after \
+                         uppercasing and `-`→`_` substitution",
+                        other, t.mcp_name
+                    ),
+                )
+                .into());
+            }
+        }
+    }
+
+    for t in tokens {
+        let target = attachments
+            .iter_mut()
+            .find(|a| a.name == t.mcp_name)
+            .ok_or_else(|| {
+                PillboxError::usage(
+                    "run",
+                    format!(
+                        "--mcp-token `{}={}` doesn't match any --mcp NAME=URL",
+                        t.mcp_name, t.secret_name
+                    ),
+                )
+            })?;
+        let value = crate::secrets::read(resolved, &t.secret_name)?.ok_or_else(|| {
+            PillboxError::runtime("run", format!("secret `{}` not found", t.secret_name))
+                .with_next(format!("pillbox secret add {}", t.secret_name))
+        })?;
+        target.token = Some(value.trim_end_matches('\n').to_string());
+    }
+    Ok(attachments)
+}
+
+/// Env var name codex's `bearer_token_env_var` references and that
+/// pillbox sets in the container env. Uppercases NAME and maps
+/// `-` to `_` so the result is a portable env-var identifier.
+fn codex_env_var_name(name: &str) -> String {
+    let mut out = String::with_capacity("PILLBOX_MCP_TOKEN_".len() + name.len());
+    out.push_str("PILLBOX_MCP_TOKEN_");
+    for c in name.chars() {
+        out.push(match c {
+            '-' => '_',
+            other => other.to_ascii_uppercase(),
+        });
+    }
+    out
 }
 
 /// NAME is used unquoted in agent-side config keys — JSON object
@@ -90,6 +208,12 @@ pub(crate) struct McpInjection {
     _tempfile: Option<tempfile::NamedTempFile>,
     pub(crate) docker_mount: Option<String>,
     pub(crate) extra_argv: Vec<String>,
+    /// Container env vars the backend should `-e K=V`. Used by the
+    /// codex adapter to land bearer tokens out-of-band so they
+    /// never appear in argv (and so `ps` on the host can't see
+    /// them). Claude folds tokens into the 0600 tempfile JSON
+    /// directly and leaves this empty.
+    pub(crate) env_vars: Vec<(String, String)>,
 }
 
 /// Adapter for Claude: write `--mcp` attachments to a tempfile, mount
@@ -116,6 +240,7 @@ pub(crate) fn claude_inject(attachments: &[McpAttachment]) -> Result<McpInjectio
         docker_mount: Some(format!("{}:{guest_path}:ro", tempfile.path().display())),
         extra_argv: vec!["--mcp-config".into(), guest_path.into()],
         _tempfile: Some(tempfile),
+        env_vars: Vec::new(),
     })
 }
 
@@ -131,6 +256,7 @@ pub(crate) fn claude_inject(attachments: &[McpAttachment]) -> Result<McpInjectio
 /// natively, no extra plumbing needed.
 pub(crate) fn codex_inject(attachments: &[McpAttachment]) -> Result<McpInjection> {
     let mut extra_argv = Vec::with_capacity(attachments.len() * 2);
+    let mut env_vars = Vec::new();
     for a in attachments {
         // The URL goes into a TOML basic string at codex's `-c`
         // parser. Bare HTTP URLs don't contain `"`, `\`, or control
@@ -148,11 +274,26 @@ pub(crate) fn codex_inject(attachments: &[McpAttachment]) -> Result<McpInjection
         }
         extra_argv.push("-c".into());
         extra_argv.push(format!(r#"mcp_servers.{}.url="{}""#, a.name, a.url));
+        if let Some(token) = &a.token {
+            // Stash the token in an env var instead of inlining it
+            // in `-c http_headers.Authorization="Bearer …"` — the
+            // env-var-indirection keeps the secret out of `ps` argv
+            // on the host. The env var name is unique per
+            // attachment (collision-checked in `resolve_tokens`).
+            let env = codex_env_var_name(&a.name);
+            extra_argv.push("-c".into());
+            extra_argv.push(format!(
+                r#"mcp_servers.{}.bearer_token_env_var="{}""#,
+                a.name, env
+            ));
+            env_vars.push((env, token.clone()));
+        }
     }
     Ok(McpInjection {
         _tempfile: None,
         docker_mount: None,
         extra_argv,
+        env_vars,
     })
 }
 
@@ -182,17 +323,26 @@ fn rewrite_localhost(url: &str) -> String {
 
 /// JSON config Claude loads via `--mcp-config <path>`. Format
 /// per Claude Code's documented `mcpServers` schema; HTTP
-/// transport entries take `type: "http"` and `url`.
+/// transport entries take `type: "http"` and `url`. When an
+/// attachment carries a token, it's folded into a `headers`
+/// map as `Authorization: Bearer <value>` — the tempfile is
+/// 0600 so the token stays off-disk-for-other-users and
+/// out-of-argv.
 pub(crate) fn claude_config_bytes(attachments: &[McpAttachment]) -> Vec<u8> {
     let mut servers = serde_json::Map::new();
     for a in attachments {
-        servers.insert(
-            a.name.clone(),
-            json!({
-                "type": "http",
-                "url": a.url,
-            }),
-        );
+        let mut entry = serde_json::Map::new();
+        entry.insert("type".into(), Value::String("http".into()));
+        entry.insert("url".into(), Value::String(a.url.clone()));
+        if let Some(token) = &a.token {
+            let mut headers = serde_json::Map::new();
+            headers.insert(
+                "Authorization".into(),
+                Value::String(format!("Bearer {token}")),
+            );
+            entry.insert("headers".into(), Value::Object(headers));
+        }
+        servers.insert(a.name.clone(), Value::Object(entry));
     }
     let config: Value = json!({ "mcpServers": Value::Object(servers) });
     // serde_json on a Map<String, Value> only fails on non-string keys
@@ -310,10 +460,12 @@ mod tests {
             McpAttachment {
                 name: "smoke".into(),
                 url: "http://host.docker.internal:8000/mcp/".into(),
+                token: None,
             },
             McpAttachment {
                 name: "mem0".into(),
                 url: "http://host.docker.internal:7777".into(),
+                token: None,
             },
         ];
         let injection = codex_inject(&attachments).unwrap();
@@ -337,9 +489,193 @@ mod tests {
         let bad = vec![McpAttachment {
             name: "x".into(),
             url: r#"http://host"injected.toml=1/"#.into(),
+            token: None,
         }];
         let err = codex_inject(&bad).unwrap_err();
         assert!(err.to_string().contains("codex `-c`"), "{err}");
+    }
+
+    #[test]
+    fn token_spec_parse_valid_and_invalid() {
+        let ok = McpTokenSpec::parse("mem0=MEM0_API_KEY").unwrap();
+        assert_eq!(ok.mcp_name, "mem0");
+        assert_eq!(ok.secret_name, "MEM0_API_KEY");
+
+        for bad in [
+            "missing-equals",
+            "=NO_NAME",
+            "ok-name=", // empty SECRET_NAME
+            "9bad=X",   // NAME must start with letter
+            "bad.name=X",
+        ] {
+            assert!(McpTokenSpec::parse(bad).is_err(), "{bad} should fail");
+        }
+    }
+
+    #[test]
+    fn codex_env_var_name_uppercases_and_dashes_to_underscores() {
+        assert_eq!(codex_env_var_name("smoke"), "PILLBOX_MCP_TOKEN_SMOKE");
+        assert_eq!(codex_env_var_name("mem0"), "PILLBOX_MCP_TOKEN_MEM0");
+        assert_eq!(
+            codex_env_var_name("code-search"),
+            "PILLBOX_MCP_TOKEN_CODE_SEARCH"
+        );
+        // Underscore stays as-is and collides with hyphen form — the
+        // resolver catches that as an explicit error.
+        assert_eq!(
+            codex_env_var_name("code_search"),
+            "PILLBOX_MCP_TOKEN_CODE_SEARCH"
+        );
+    }
+
+    #[test]
+    fn claude_config_includes_authorization_header_when_token_present() {
+        let attachments = vec![
+            McpAttachment {
+                name: "with_token".into(),
+                url: "http://host.docker.internal:7777".into(),
+                token: Some("sk-test-1234".into()),
+            },
+            McpAttachment {
+                name: "no_token".into(),
+                url: "http://host.docker.internal:8888".into(),
+                token: None,
+            },
+        ];
+        let bytes = claude_config_bytes(&attachments);
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let servers = parsed["mcpServers"].as_object().unwrap();
+        assert_eq!(
+            servers["with_token"]["headers"]["Authorization"],
+            "Bearer sk-test-1234"
+        );
+        assert!(
+            servers["no_token"].get("headers").is_none(),
+            "no_token must not get a headers field"
+        );
+    }
+
+    #[test]
+    fn codex_inject_with_token_emits_bearer_env_var_and_arg() {
+        let attachments = vec![McpAttachment {
+            name: "mem0".into(),
+            url: "http://host.docker.internal:7777".into(),
+            token: Some("sk-test-1234".into()),
+        }];
+        let injection = codex_inject(&attachments).unwrap();
+        // Argv has url override AND bearer_token_env_var override.
+        assert!(
+            injection
+                .extra_argv
+                .iter()
+                .any(|s| s.contains(r#"mcp_servers.mem0.url="#)),
+            "argv missing url override: {:?}",
+            injection.extra_argv
+        );
+        assert!(
+            injection
+                .extra_argv
+                .iter()
+                .any(|s| s
+                    .contains(r#"mcp_servers.mem0.bearer_token_env_var="PILLBOX_MCP_TOKEN_MEM0""#)),
+            "argv missing bearer_token_env_var override: {:?}",
+            injection.extra_argv
+        );
+        // The token value lands in env_vars, NOT in argv.
+        assert_eq!(
+            injection.env_vars,
+            vec![(
+                "PILLBOX_MCP_TOKEN_MEM0".to_string(),
+                "sk-test-1234".to_string()
+            )]
+        );
+        for arg in &injection.extra_argv {
+            assert!(
+                !arg.contains("sk-test-1234"),
+                "token leaked into argv: {arg}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_tokens_populates_matching_attachment() {
+        use crate::pillbox;
+        use crate::secrets::{self, AddSource, WriteScope};
+        use crate::test_util::with_isolated_home;
+        with_isolated_home("mcp-resolve-tokens-ok", || {
+            let g = pillbox::global();
+            std::env::set_var("__PB_TEST_MCP_TOKEN", "raw-secret-value");
+            secrets::add(
+                &g,
+                WriteScope::Resolved,
+                "MEM0_TOKEN",
+                AddSource::EnvVar("__PB_TEST_MCP_TOKEN".into()),
+                false,
+                None,
+            )
+            .unwrap();
+            std::env::remove_var("__PB_TEST_MCP_TOKEN");
+
+            let attachments = vec![McpAttachment {
+                name: "mem0".into(),
+                url: "http://host.docker.internal:7777".into(),
+                token: None,
+            }];
+            let tokens = vec![McpTokenSpec {
+                mcp_name: "mem0".into(),
+                secret_name: "MEM0_TOKEN".into(),
+            }];
+            let resolved = resolve_tokens(&g, attachments, &tokens).unwrap();
+            assert_eq!(resolved[0].token.as_deref(), Some("raw-secret-value"));
+        });
+    }
+
+    #[test]
+    fn resolve_tokens_errors_on_unknown_mcp_name() {
+        use crate::pillbox;
+        use crate::test_util::with_isolated_home;
+        with_isolated_home("mcp-resolve-tokens-unknown", || {
+            let g = pillbox::global();
+            let tokens = vec![McpTokenSpec {
+                mcp_name: "ghost".into(),
+                secret_name: "X".into(),
+            }];
+            let err = resolve_tokens(&g, Vec::new(), &tokens).unwrap_err();
+            assert!(err.to_string().contains("doesn't match any --mcp"), "{err}");
+        });
+    }
+
+    #[test]
+    fn resolve_tokens_errors_on_env_var_collision() {
+        use crate::pillbox;
+        use crate::test_util::with_isolated_home;
+        with_isolated_home("mcp-resolve-tokens-collision", || {
+            let g = pillbox::global();
+            let attachments = vec![
+                McpAttachment {
+                    name: "code-search".into(),
+                    url: "http://x:1/".into(),
+                    token: None,
+                },
+                McpAttachment {
+                    name: "code_search".into(),
+                    url: "http://x:2/".into(),
+                    token: None,
+                },
+            ];
+            let tokens = vec![
+                McpTokenSpec {
+                    mcp_name: "code-search".into(),
+                    secret_name: "A".into(),
+                },
+                McpTokenSpec {
+                    mcp_name: "code_search".into(),
+                    secret_name: "B".into(),
+                },
+            ];
+            let err = resolve_tokens(&g, attachments, &tokens).unwrap_err();
+            assert!(err.to_string().contains("collapse to env var"), "{err}");
+        });
     }
 
     #[test]
@@ -356,10 +692,12 @@ mod tests {
             McpAttachment {
                 name: "mem0".into(),
                 url: "http://host.docker.internal:7777".into(),
+                token: None,
             },
             McpAttachment {
                 name: "canopy".into(),
                 url: "http://host.docker.internal:7000".into(),
+                token: None,
             },
         ];
         let bytes = claude_config_bytes(&attachments);

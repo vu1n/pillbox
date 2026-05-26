@@ -23,7 +23,7 @@ use crate::{docker, errors::PillboxError};
 
 pub(crate) mod mcp;
 
-pub(crate) use mcp::{McpAttachment, McpInjection};
+pub(crate) use mcp::{McpAttachment, McpInjection, McpTokenSpec};
 
 pub(crate) const GUEST_HOME: &str = "/home/lum";
 pub(crate) const GUEST_WORKSPACE: &str = "/workspace";
@@ -240,9 +240,14 @@ pub(crate) struct RunOpts {
     /// `--vault` — route API traffic through the pillbox stub-swap proxy.
     pub(crate) vault: bool,
     /// `--mcp NAME=URL` shared-MCP attachments, parsed at the CLI
-    /// boundary. v0: Claude only — the sandbox backend hard-errors
-    /// if the resolved agent has no `mcp_inject` and this is non-empty.
+    /// boundary. Resolved against `mcp_tokens` in the sandbox
+    /// backend; the backend hard-errors if non-empty and the
+    /// resolved agent has no `mcp_inject`.
     pub(crate) mcps: Vec<McpAttachment>,
+    /// `--mcp-token NAME=SECRET_NAME` entries. Each references a
+    /// `--mcp NAME=URL` and a pillbox-stored secret; values are
+    /// read at run time, never inlined at CLI parse.
+    pub(crate) mcp_tokens: Vec<McpTokenSpec>,
     pub(crate) args: Vec<String>,
     /// Remote name (`--remote NAME`). Resolved to a `Remote` record in
     /// `dispatch_run` and threaded through to the sandbox backend. Kept
@@ -451,6 +456,7 @@ mod tests {
             env_files: Vec::new(),
             vault: false,
             mcps: Vec::new(),
+            mcp_tokens: Vec::new(),
             args: Vec::new(),
             remote_name: None,
             detach: false,

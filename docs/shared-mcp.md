@@ -1,7 +1,7 @@
 # Shared MCP attachments (`--mcp`)
 
-**Status:** v0 — Claude only. Codex injection is a documented
-follow-up.
+**Status:** v0 — supported for `claude`, `codex`, and `opencode`
+(each agent has its own injection adapter).
 
 Pillbox can point a sandboxed agent at one or more HTTP MCP
 servers running on the host. The "shared" property falls out for

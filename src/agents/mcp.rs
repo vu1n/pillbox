@@ -104,6 +104,24 @@ pub(crate) fn resolve_tokens(
     mut attachments: Vec<McpAttachment>,
     tokens: &[McpTokenSpec],
 ) -> Result<Vec<McpAttachment>> {
+    // Reject duplicate `--mcp NAME` up front. Every adapter keys its
+    // config by NAME (a JSON object key for Claude/OpenCode, a TOML
+    // table segment for Codex), so a repeated name would silently
+    // last-write-win — and worse, a `--mcp-token` would attach to the
+    // first entry only to have it overwritten by the un-tokened
+    // duplicate. Fail loudly instead.
+    let mut name_seen: std::collections::HashSet<&str> =
+        std::collections::HashSet::with_capacity(attachments.len());
+    for a in &attachments {
+        if !name_seen.insert(a.name.as_str()) {
+            return Err(PillboxError::usage(
+                "run",
+                format!("--mcp NAME `{}` given more than once", a.name),
+            )
+            .into());
+        }
+    }
+
     // Codex needs each token in a distinct env var. The transform
     // `NAME → uppercase + '-' → '_'` can collide (`code-search`
     // vs `code_search`); detect that early so the user gets a
@@ -145,7 +163,7 @@ pub(crate) fn resolve_tokens(
             PillboxError::runtime("run", format!("secret `{}` not found", t.secret_name))
                 .with_next(format!("pillbox secret add {}", t.secret_name))
         })?;
-        target.token = Some(value.trim_end_matches('\n').to_string());
+        target.token = Some(value.trim().to_string());
     }
     Ok(attachments)
 }
@@ -295,6 +313,59 @@ pub(crate) fn codex_inject(attachments: &[McpAttachment]) -> Result<McpInjection
         extra_argv,
         env_vars,
     })
+}
+
+/// Adapter for OpenCode: write `--mcp` attachments to a tempfile as an
+/// `opencode.json` config with `mcp` entries, mount it read-only, and
+/// set `OPENCODE_CONFIG` env var to point at the guest path. OpenCode
+/// merges configs rather than replacing them, so this is additive with
+/// the user's global `~/.config/opencode/opencode.json` (which loads at
+/// lower precedence). Caveat: a project `opencode.json` in the mounted
+/// workspace loads at *higher* precedence than `OPENCODE_CONFIG`, so a
+/// workspace MCP entry sharing a `--mcp` NAME would override ours.
+pub(crate) fn opencode_inject(attachments: &[McpAttachment]) -> Result<McpInjection> {
+    let guest_path = "/etc/pillbox/opencode-mcp.json";
+    let mut tempfile = tempfile::Builder::new()
+        .prefix("pillbox-opencode-mcp-")
+        .suffix(".json")
+        .tempfile()
+        .context("create per-run OpenCode MCP config tempfile")?;
+    tempfile
+        .as_file_mut()
+        .write_all(&opencode_config_bytes(attachments))
+        .context("write per-run OpenCode MCP config")?;
+    Ok(McpInjection {
+        docker_mount: Some(format!("{}:{guest_path}:ro", tempfile.path().display())),
+        extra_argv: Vec::new(),
+        _tempfile: Some(tempfile),
+        env_vars: vec![("OPENCODE_CONFIG".into(), guest_path.into())],
+    })
+}
+
+/// JSON config OpenCode loads via `OPENCODE_CONFIG`. Remote MCP
+/// entries take `type: "remote"`, `url`, and optional `headers`.
+/// When an attachment carries a token, it's folded into
+/// `headers.Authorization: Bearer <value>`.
+pub(crate) fn opencode_config_bytes(attachments: &[McpAttachment]) -> Vec<u8> {
+    let mut servers = serde_json::Map::new();
+    for a in attachments {
+        let mut entry = serde_json::Map::new();
+        entry.insert("type".into(), Value::String("remote".into()));
+        entry.insert("url".into(), Value::String(a.url.clone()));
+        if let Some(token) = &a.token {
+            let mut headers = serde_json::Map::new();
+            headers.insert(
+                "Authorization".into(),
+                Value::String(format!("Bearer {token}")),
+            );
+            entry.insert("headers".into(), Value::Object(headers));
+        }
+        servers.insert(a.name.clone(), Value::Object(entry));
+    }
+    let config: Value = json!({ "mcp": Value::Object(servers) });
+    // serde_json on a Map<String, Value> only fails on non-string keys
+    // (we have none) or a writer error (in-memory Vec doesn't fail).
+    serde_json::to_vec_pretty(&config).expect("in-memory JSON serialization is infallible")
 }
 
 /// Rewrite a loopback host in `url` to `host.docker.internal` so
@@ -631,6 +702,29 @@ mod tests {
     }
 
     #[test]
+    fn resolve_tokens_errors_on_duplicate_mcp_name() {
+        use crate::pillbox;
+        use crate::test_util::with_isolated_home;
+        with_isolated_home("mcp-resolve-tokens-dup", || {
+            let g = pillbox::global();
+            let attachments = vec![
+                McpAttachment {
+                    name: "mem0".into(),
+                    url: "http://x:1/".into(),
+                    token: None,
+                },
+                McpAttachment {
+                    name: "mem0".into(),
+                    url: "http://x:2/".into(),
+                    token: None,
+                },
+            ];
+            let err = resolve_tokens(&g, attachments, &[]).unwrap_err();
+            assert!(err.to_string().contains("given more than once"), "{err}");
+        });
+    }
+
+    #[test]
     fn resolve_tokens_errors_on_unknown_mcp_name() {
         use crate::pillbox;
         use crate::test_util::with_isolated_home;
@@ -707,5 +801,83 @@ mod tests {
         assert_eq!(servers["mem0"]["type"], "http");
         assert_eq!(servers["mem0"]["url"], "http://host.docker.internal:7777");
         assert_eq!(servers["canopy"]["url"], "http://host.docker.internal:7000");
+    }
+
+    #[test]
+    fn opencode_config_shape() {
+        let attachments = vec![
+            McpAttachment {
+                name: "mem0".into(),
+                url: "http://host.docker.internal:7777".into(),
+                token: None,
+            },
+            McpAttachment {
+                name: "canopy".into(),
+                url: "http://host.docker.internal:7000".into(),
+                token: None,
+            },
+        ];
+        let bytes = opencode_config_bytes(&attachments);
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let servers = parsed.get("mcp").unwrap().as_object().unwrap();
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers["mem0"]["type"], "remote");
+        assert_eq!(servers["mem0"]["url"], "http://host.docker.internal:7777");
+        assert_eq!(servers["canopy"]["url"], "http://host.docker.internal:7000");
+    }
+
+    #[test]
+    fn opencode_config_includes_authorization_header_when_token_present() {
+        let attachments = vec![
+            McpAttachment {
+                name: "with_token".into(),
+                url: "http://host.docker.internal:7777".into(),
+                token: Some("sk-test-1234".into()),
+            },
+            McpAttachment {
+                name: "no_token".into(),
+                url: "http://host.docker.internal:8888".into(),
+                token: None,
+            },
+        ];
+        let bytes = opencode_config_bytes(&attachments);
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let servers = parsed["mcp"].as_object().unwrap();
+        assert_eq!(
+            servers["with_token"]["headers"]["Authorization"],
+            "Bearer sk-test-1234"
+        );
+        assert!(
+            servers["no_token"].get("headers").is_none(),
+            "no_token must not get a headers field"
+        );
+    }
+
+    #[test]
+    fn opencode_inject_sets_opencode_config_env_and_mount() {
+        let attachments = vec![McpAttachment {
+            name: "smoke".into(),
+            url: "http://host.docker.internal:8000/mcp/".into(),
+            token: None,
+        }];
+        let injection = opencode_inject(&attachments).unwrap();
+        assert!(injection.docker_mount.is_some());
+        assert!(
+            injection
+                .docker_mount
+                .as_ref()
+                .unwrap()
+                .contains("/etc/pillbox/opencode-mcp.json"),
+            "mount should target guest path: {:?}",
+            injection.docker_mount
+        );
+        assert_eq!(injection.extra_argv, Vec::<String>::new());
+        assert_eq!(
+            injection.env_vars,
+            vec![(
+                "OPENCODE_CONFIG".into(),
+                "/etc/pillbox/opencode-mcp.json".into()
+            )]
+        );
     }
 }

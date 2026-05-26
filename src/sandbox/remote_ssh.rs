@@ -325,6 +325,25 @@ pub(super) fn build_vault_stdin_blob(
         )
         .into());
     }
+    // A vaulted `--with` secret drives the stub-swap proxy just like
+    // `--vault`; reject it for agents that can't reach the proxy so the
+    // stub never ships to the provider.
+    let vaulted: Vec<&str> = withs
+        .iter()
+        .filter(|w| w.meta.is_some())
+        .map(|w| w.secret_name.as_str())
+        .collect();
+    if !vaulted.is_empty() && !spec.vault_capable {
+        return Err(PillboxError::usage(
+            action,
+            format!(
+                "agent `{}` does not support the vault proxy, so it can't use vaulted secret(s): {}",
+                spec.id,
+                vaulted.join(", ")
+            ),
+        )
+        .into());
+    }
 
     let mut secrets = Vec::with_capacity(withs.len());
     for w in &withs {

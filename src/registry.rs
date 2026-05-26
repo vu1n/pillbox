@@ -43,7 +43,9 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use rand::RngCore;
 
+use crate::errors::PillboxError;
 use crate::paths::{validate_name, write_private_file};
 use crate::pillbox::{Pillbox, Scope};
 
@@ -281,6 +283,102 @@ pub(crate) fn write_record<R: Registry>(pb: &Pillbox, name: &str, body: &[u8]) -
     validate_name(R::read_action(), name)?;
     let path = R::path(pb, name)?;
     write_private_file(&path, body)
+}
+
+/// Mint a 12-hex-char record id (48 bits) — unique enough at per-pillbox
+/// scale. Shared by the id-keyed registries ([`IdRegistry`]).
+pub(crate) fn new_id() -> String {
+    let mut bytes = [0u8; 6];
+    rand::rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Registries keyed by a minted hex id (sessions, sandboxes) rather than a
+/// user-chosen name (secrets, env, remotes). Adds flat single-scope listing
+/// and id-prefix resolution — the bits session and sandbox used to each
+/// hand-roll.
+pub(crate) trait IdRegistry: Registry {
+    /// Entity word for resolve errors / next-step hints ("session", "sandbox").
+    const ENTITY: &'static str;
+    /// Borrow the id field of a parsed record.
+    fn record_id(record: &Self::Record) -> &str;
+}
+
+/// Every record in a single pillbox scope, unsorted. Callers sort by
+/// whatever timestamp they track (`started_at` / `created_at`).
+pub(crate) fn list_all<R: IdRegistry>(pb: &Pillbox) -> Result<Vec<R::Record>> {
+    let dir = R::dir_read(pb);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let fname = match entry.file_name().into_string() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if decode_name::<R>(&fname).is_none() {
+            continue;
+        }
+        let raw = fs::read_to_string(entry.path())
+            .with_context(|| format!("read {}", entry.path().display()))?;
+        out.push(R::parse(&raw, &entry.path())?);
+    }
+    Ok(out)
+}
+
+/// Resolve an exact id or a unique prefix (>= 4 chars). Mirrors the
+/// `snapshot show HANDLE` ergonomics shared by the id-keyed registries.
+pub(crate) fn resolve_id<R: IdRegistry>(pb: &Pillbox, id_or_prefix: &str) -> Result<R::Record> {
+    if id_or_prefix.is_empty() {
+        return Err(PillboxError::usage(R::ENTITY, format!("empty {} id", R::ENTITY)).into());
+    }
+    // Fast path: exact full id (most common — copied from `<entity> list`).
+    if id_or_prefix.len() == 12 {
+        if let Some(rec) = R::read_one(pb, id_or_prefix)? {
+            return Ok(rec);
+        }
+    }
+    if id_or_prefix.len() < 4 {
+        return Err(PillboxError::usage(
+            R::ENTITY,
+            format!("id prefix `{id_or_prefix}` is too short (need >= 4 chars)"),
+        )
+        .into());
+    }
+    let mut matches: Vec<R::Record> = list_all::<R>(pb)?
+        .into_iter()
+        .filter(|r| R::record_id(r).starts_with(id_or_prefix))
+        .collect();
+    match matches.len() {
+        0 => Err(PillboxError::runtime(
+            R::ENTITY,
+            format!("no {} matches `{id_or_prefix}`", R::ENTITY),
+        )
+        .with_next(format!("pillbox {} list", R::ENTITY))
+        .into()),
+        1 => Ok(matches.pop().unwrap()),
+        n => {
+            let mut ids: Vec<String> = matches
+                .iter()
+                .map(|r| R::record_id(r).to_string())
+                .collect();
+            ids.sort();
+            Err(PillboxError::usage(
+                R::ENTITY,
+                format!(
+                    "prefix `{id_or_prefix}` matches {n} {} records — disambiguate: {}",
+                    R::ENTITY,
+                    ids.join(", ")
+                ),
+            )
+            .into())
+        }
+    }
 }
 
 #[cfg(test)]

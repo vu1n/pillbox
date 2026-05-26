@@ -50,15 +50,14 @@
 //! will only signal whichever pid landed last. Detect by reading the
 //! file after attach if you need certainty.
 
-use std::{fs, path::Path};
+use std::path::Path;
 
-use anyhow::{Context, Result};
-use rand::RngCore;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
-use crate::registry::{self as reg, Registry};
+use crate::registry::{self as reg, IdRegistry, Registry};
 
 /// Subdirectory under a pillbox's state dir holding session records.
 /// Mirrors `remotes/` and `secrets/` — one file per record, easy to
@@ -83,6 +82,12 @@ impl Registry for SessionRegistry {
         toml::from_str(raw).map_err(|e| {
             PillboxError::config("session read", format!("{}: {e}", source.display())).into()
         })
+    }
+}
+impl IdRegistry for SessionRegistry {
+    const ENTITY: &'static str = "session";
+    fn record_id(record: &Session) -> &str {
+        &record.id
     }
 }
 
@@ -182,9 +187,7 @@ impl Session {
     /// scale; collisions across a user's lifetime of sessions are
     /// astronomically unlikely.
     pub(crate) fn new_id() -> String {
-        let mut bytes = [0u8; 6];
-        rand::rng().fill_bytes(&mut bytes);
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
+        reg::new_id()
     }
 
     // `stub_from_id` removed — `emit_session_event` now takes
@@ -317,80 +320,13 @@ impl Session {
 /// session record; the caller can use `session.id` for any further
 /// writes back to the registry.
 pub(crate) fn resolve(pb: &Pillbox, id_or_prefix: &str) -> Result<Session> {
-    if id_or_prefix.is_empty() {
-        return Err(PillboxError::usage("session", "empty session id").into());
-    }
-    // Fast path: exact full id (most common — copied from `session list`).
-    if id_or_prefix.len() == 12 {
-        if let Some(s) = read(pb, id_or_prefix)? {
-            return Ok(s);
-        }
-    }
-    if id_or_prefix.len() < 4 {
-        return Err(PillboxError::usage(
-            "session",
-            format!("id prefix `{id_or_prefix}` is too short (need >= 4 chars)"),
-        )
-        .into());
-    }
-    let matches: Vec<Session> = list(pb)?
-        .into_iter()
-        .filter(|s| s.id.starts_with(id_or_prefix))
-        .collect();
-    match matches.len() {
-        0 => Err(
-            PillboxError::runtime("session", format!("no session matches `{id_or_prefix}`"))
-                .with_next("pillbox session list")
-                .into(),
-        ),
-        1 => Ok(matches.into_iter().next().unwrap()),
-        n => {
-            // List the ids so the user can pick one without a second
-            // `session list` round-trip. Sorted by id for stable
-            // output across runs (the `list` order is by `started_at`
-            // which is good for browsing but noisy in an error msg).
-            let mut ids: Vec<String> = matches.into_iter().map(|s| s.id).collect();
-            ids.sort();
-            Err(PillboxError::usage(
-                "session",
-                format!(
-                    "prefix `{id_or_prefix}` matches {n} sessions — disambiguate: {}",
-                    ids.join(", ")
-                ),
-            )
-            .into())
-        }
-    }
+    reg::resolve_id::<SessionRegistry>(pb, id_or_prefix)
 }
 
 /// All sessions in the current pillbox, sorted by `started_at` (oldest
 /// first so `session list` is stable across re-runs).
-///
-/// Sessions are no-inheritance — single-scope only — so we walk this
-/// pillbox's `sessions/` directly rather than going through
-/// `registry::list_merged`.
 pub(crate) fn list(pb: &Pillbox) -> Result<Vec<Session>> {
-    let dir = SessionRegistry::dir_read(pb);
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut out: Vec<Session> = Vec::new();
-    for entry in fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
-        let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
-        let path = entry.path();
-        let fname = match entry.file_name().into_string() {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        if fname.strip_suffix(".toml").is_none() {
-            continue;
-        }
-        let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        out.push(SessionRegistry::parse(&raw, &path)?);
-    }
+    let mut out = reg::list_all::<SessionRegistry>(pb)?;
     out.sort_by(|a, b| a.started_at.cmp(&b.started_at));
     Ok(out)
 }
@@ -567,6 +503,7 @@ mod tests {
     use super::*;
     use crate::pillbox;
     use crate::test_util::with_isolated_home;
+    use std::fs;
 
     fn make(remote: &str, backend: &str) -> Session {
         // Per-call overrides (id, remote, backend, started_at) on top

@@ -2631,6 +2631,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
  "clap",
  "clap_complete",
  "http-body-util",

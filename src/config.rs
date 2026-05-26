@@ -9,7 +9,7 @@
 //! name = "my-project"
 //!
 //! # optional — default agent for `pillbox run`
-//! agent = "claude"          # or "codex"
+//! agent = "claude"          # or "codex" or "opencode"
 //!
 //! [workspace]
 //! backend = "local"        # or "s3"
@@ -113,7 +113,7 @@ pub(crate) struct Config {
     /// enforces presence — see `Config::load_from`).
     #[serde(default)]
     pub(crate) name: Option<String>,
-    /// Default agent for `pillbox run` (`claude` | `codex`). `None` falls
+    /// Default agent for `pillbox run` (`claude` | `codex` | `opencode`). `None` falls
     /// back to a built-in default at run time.
     #[serde(default)]
     pub(crate) agent: Option<String>,

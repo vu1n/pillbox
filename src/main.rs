@@ -25,6 +25,7 @@ mod bookmarks;
 mod cli;
 mod commands;
 mod config;
+mod contract;
 mod docker;
 mod doctor;
 mod envs;
@@ -35,6 +36,7 @@ mod pillbox;
 mod registry;
 mod remote;
 mod sandbox;
+mod sandboxes;
 mod secrets;
 mod session;
 #[cfg(test)]
@@ -45,8 +47,8 @@ mod workspace;
 
 use agents::RunOpts;
 use cli::{
-    AuthAction, BookmarkAction, EnvAction, RemoteAction, SecretAction, SessionAction,
-    SnapshotAction, VaultAction, WorkspaceAction,
+    AuthAction, BookmarkAction, EnvAction, RemoteAction, SandboxAction, SecretAction,
+    SessionAction, SnapshotAction, VaultAction, WorkspaceAction,
 };
 use errors::PillboxError;
 use pillbox::Pillbox;
@@ -77,7 +79,7 @@ enum Command {
         /// Display name for the pillbox. Defaults to the cwd's basename.
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
-        /// Default agent for `pillbox run` (`claude` | `codex`).
+        /// Default agent for `pillbox run` (`claude` | `codex` | `opencode`).
         #[arg(long, value_name = "AGENT")]
         agent: Option<String>,
         /// Workspace backend variant. `local` (default) stores the
@@ -128,7 +130,7 @@ enum Command {
     },
     /// Launch an agent against the current pillbox.
     Run {
-        /// Agent to launch (`claude` | `codex`). Defaults to the current
+        /// Agent to launch (`claude` | `codex` | `opencode`). Defaults to the current
         /// pillbox's `agent =` field, or `claude` if unset.
         #[arg(long, value_name = "AGENT")]
         agent: Option<String>,
@@ -331,6 +333,11 @@ enum Command {
     Bookmark {
         #[command(subcommand)]
         action: BookmarkAction,
+    },
+    /// Spawn / exec / destroy long-lived sandboxes (PTY-free container I/O).
+    Sandbox {
+        #[command(subcommand)]
+        action: SandboxAction,
     },
     /// Workspace-level operations (rekey, …).
     Workspace {
@@ -547,6 +554,10 @@ fn run(cli: Cli) -> Result<()> {
         Command::Bookmark { action } => {
             let resolved = Pillbox::resolve(pillbox_arg)?;
             commands::bookmark::dispatch(&resolved, action)
+        }
+        Command::Sandbox { action } => {
+            let resolved = Pillbox::resolve(pillbox_arg)?;
+            commands::sandbox::dispatch(&resolved, action)
         }
         Command::Completions { shell } => {
             // `Cli::command()` materializes the clap definition without

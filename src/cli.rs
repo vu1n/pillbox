@@ -65,6 +65,47 @@ pub(crate) enum BookmarkAction {
 }
 
 #[derive(Subcommand, Debug)]
+pub(crate) enum SandboxAction {
+    /// Spawn a long-lived container with the workspace mounted, kept idle so
+    /// commands can be `exec`'d into it. Prints the sandbox id on stdout.
+    Spawn {
+        /// Runner image (default: the pillbox runner image).
+        #[arg(long, value_name = "IMAGE")]
+        image: Option<String>,
+        /// Host directory to mount as the workspace (default: cwd).
+        #[arg(long, value_name = "PATH")]
+        workspace: Option<PathBuf>,
+        /// Human label, surfaced in `sandbox list`.
+        #[arg(long, value_name = "TEXT")]
+        label: Option<String>,
+    },
+    /// Run a command in a sandbox (PTY-free). Default streams raw output and
+    /// mirrors the exit code; `--json` emits structured exec events as JSONL.
+    Exec {
+        /// Sandbox id (or unique prefix ≥ 4 chars).
+        id: String,
+        /// Emit `ExecStarted`/`ExecOutput`/`ExecExit` as JSONL instead of
+        /// passing raw bytes through to the terminal.
+        #[arg(long)]
+        json: bool,
+        /// Command and arguments, after `--`.
+        #[arg(trailing_var_arg = true, value_name = "ARGV")]
+        argv: Vec<String>,
+    },
+    /// Tear down a sandbox — kill the container and remove the record.
+    Destroy {
+        /// Sandbox id (or unique prefix ≥ 4 chars).
+        id: String,
+    },
+    /// List sandboxes in the current pillbox.
+    List {
+        /// Emit JSON. Stable schema — pin against `version: 1`.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 pub(crate) enum WorkspaceAction {
     /// Rotate the repository encryption password.
     Rekey,

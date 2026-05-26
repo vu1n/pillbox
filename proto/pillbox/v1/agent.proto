@@ -1,0 +1,364 @@
+syntax = "proto3";
+
+// pillbox container I/O contract.
+//
+// pillbox is the PRODUCER/SUBSTRATE: it runs a container (local docker /
+// e2b / ssh), gives it a vault-proxied egress + a content-addressed
+// workspace, and exposes a PTY-free, structured, bidirectional channel to
+// whatever runs inside. Consumers (orchestrators, Slack/chat, hermes, lum)
+// own their own threads, identity, and UIs — they only speak this contract.
+//
+// Two channels into one sandbox:
+//   • agent  — talk to a coding agent (claude/codex/opencode). pillbox
+//              normalizes each agent's native protocol (claude stream-json,
+//              opencode serve, codex proto) into the events below. Fidelity
+//              is uneven by agent (codex ≈ lifecycle-only today); consumers
+//              must degrade gracefully.
+//   • exec   — run one-off commands (`python foo.py`). Maps to the backend's
+//              native exec (docker exec / e2b commands.run / ssh exec). No
+//              PTY, stays inside the vault/workspace/audit envelope.
+//
+// Interactive PTY (a human drilling into a live shell/agent) is deliberately
+// OUT of this schema — it uses pillbox's existing attach transport. This
+// contract is the PTY-free surface; that's the whole point.
+//
+// Transports: this rides gRPC natively, and JSON-over-{REST,WebSocket,
+// webhook} via protobuf's canonical JSON mapping. Intended to live in a
+// shared schema package both pillbox and its consumers codegen from.
+
+package pillbox.v1;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/struct.proto"; // arbitrary JSON: tool I/O, custom payloads
+
+// ────────────────────────────────────────────────────────────────────────
+// Service
+// ────────────────────────────────────────────────────────────────────────
+service Pillbox {
+  // Container lifecycle. Spawn provisions a sandbox and OPTIONALLY starts an
+  // agent run in it (omit `agent` for a bare container you only `Exec` into).
+  rpc Spawn   (SpawnRequest)   returns (SpawnResponse);
+  rpc Destroy (DestroyRequest) returns (Ack);
+
+  // Agent channel.
+  rpc SendInput         (SendInputRequest)         returns (Ack);
+  rpc ResolvePermission (ResolvePermissionRequest) returns (Ack);
+  rpc Cancel            (CancelRequest)            returns (Ack);
+
+  // Exec channel. Output flows on the event stream as ExecOutput/ExecExit
+  // (one output path for all consumers). Exec returns the id immediately.
+  rpc Exec          (ExecRequest)      returns (ExecResponse);
+  rpc SendExecStdin (ExecStdinRequest) returns (Ack); // optional streamed stdin
+
+  // Query + stream.
+  rpc ListSandboxes (ListSandboxesRequest) returns (ListSandboxesResponse);
+  rpc GetSandbox    (GetSandboxRequest)    returns (Sandbox);
+  rpc Subscribe     (SubscribeRequest)     returns (stream Event);
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Model
+//   Sandbox — the container.
+//   Run     — one agent execution in a sandbox. `parent_run_id` chains runs
+//             into lineage; a consumer's "thread"/conversation = a run chain
+//             it assembles. pillbox does NOT own threads.
+//   Exec    — one command in a sandbox, sibling to any agent run.
+// ────────────────────────────────────────────────────────────────────────
+
+message SpawnRequest {
+  string pillbox          = 1;  // tenant/scope (which pillbox)
+  string remote           = 2;  // "" = local docker; else registered remote (e2b://, ssh://)
+  string image            = 3;  // optional runner image override
+  oneof base {                  // workspace starting point
+    string from_bookmark  = 4;
+    string from_snapshot  = 5;
+  }
+  optional bool vault     = 6;  // explicit presence: unset ≠ false. Server defaults
+                                // ON (egress proxied); set false to opt out.
+  map<string,string> env  = 7;
+
+  // Agent run (optional — omit for a bare container).
+  string agent            = 8;  // "claude" | "codex" | "opencode"
+  string prompt           = 9;  // initial prompt (headless)
+  repeated string args    = 10; // extra agent CLI args
+  PermissionMode perm_mode= 11; // how tool permissions are handled (see enum)
+
+  string label            = 12;
+  string ttl              = 13; // "30m" | "24h" | "7d"
+  EventDelivery delivery  = 14;
+  string idempotency_key  = 15;
+}
+message SpawnResponse {
+  string sandbox_id = 1;
+  string run_id     = 2; // empty if no agent was started
+}
+
+message DestroyRequest { string sandbox_id = 1; }
+
+// New turn or live input to an agent. AUTO: pipe to the attached run if one
+// is live, else start a fresh lineage run from the last result snapshot.
+message SendInputRequest {
+  string sandbox_id      = 1;
+  string run_id          = 2; // optional; AUTO resolves it
+  string text            = 3;
+  InputMode mode         = 4; // AUTO | LIVE | TURN
+  string idempotency_key = 5;
+}
+
+message ResolvePermissionRequest {
+  string sandbox_id    = 1;
+  string permission_id = 2;
+  PermissionDecision decision = 3;
+  string note          = 4;
+}
+
+message CancelRequest {
+  string sandbox_id = 1;
+  string run_id     = 2; // optional; empty = cancel whatever run is active
+  bool teardown     = 3; // also destroy the sandbox
+}
+
+message ExecRequest {
+  string sandbox_id      = 1;
+  repeated string argv   = 2; // e.g. ["python", "foo.py"]
+  string cwd             = 3;
+  map<string,string> env = 4;
+  bytes stdin            = 5; // initial stdin; stream more via SendExecStdin
+  uint32 timeout_ms      = 6;
+  string idempotency_key = 7;
+}
+message ExecResponse { string exec_id = 1; }
+
+message ExecStdinRequest {
+  string sandbox_id = 1;
+  string exec_id    = 2;
+  bytes data        = 3;
+  bool close        = 4; // EOF on stdin
+}
+
+message SubscribeRequest {
+  string sandbox_id        = 1; // "" = all sandboxes in scope
+  uint64 from_seq          = 2; // replay cursor; 0 = live tail
+  repeated EventType types = 3; // filter (empty = all durable)
+  bool include_ephemeral   = 4;
+}
+
+message ListSandboxesRequest { string pillbox = 1; }
+message ListSandboxesResponse { repeated Sandbox sandboxes = 1; }
+message GetSandboxRequest { string sandbox_id = 1; }
+
+message Sandbox {
+  string sandbox_id = 1;
+  string pillbox    = 2;
+  string remote     = 3;
+  string agent      = 4; // "" = bare container
+  SandboxStatus status = 5;
+  string label      = 6;
+  google.protobuf.Timestamp created_at = 7;
+}
+
+message Ack { bool ok = 1; string detail = 2; }
+
+// How a consumer receives a sandbox's events.
+message EventDelivery {
+  oneof sink {
+    bool   stream      = 1; // consume via Subscribe()
+    string webhook_url = 2; // POST each Event here (at-least-once + retry)
+  }
+  repeated EventType types = 3; // filter (empty = all durable)
+  bool include_ephemeral   = 4;
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Event stream
+// ────────────────────────────────────────────────────────────────────────
+message Event {
+  uint64 seq                   = 1; // monotonic per pillbox, DURABLE events only
+                                    // (ephemeral carry seq=0) → replay cursor
+  string sandbox_id            = 2;
+  string run_id                = 3; // set for agent-run events
+  string exec_id               = 4; // set for exec events
+  google.protobuf.Timestamp at = 5;
+  bool ephemeral               = 6; // true = telemetry; not persisted/replayable
+  oneof payload {
+    // sandbox lifecycle
+    SandboxProvisioned  sandbox_provisioned  = 10;
+    SandboxReady        sandbox_ready        = 11;
+    SandboxDestroyed    sandbox_destroyed    = 12;
+    // agent run lifecycle
+    RunStarted          run_started          = 20;
+    RunFinished         run_finished         = 21;
+    RunFailed           run_failed           = 22;
+    // agent output (normalized union of stream-json / serve / proto)
+    MessageStart        message_start        = 30;
+    MessageDelta        message_delta        = 31;
+    MessageEnd          message_end          = 32;
+    ToolCall            tool_call            = 33;
+    // ephemeral card telemetry (e.g. from claude hooks)
+    PhaseChanged        phase_changed        = 40;
+    TodosUpdated        todos_updated        = 41;
+    // human-in-the-loop
+    PermissionRequested permission_requested = 50;
+    PermissionResolved  permission_resolved  = 51;
+    AttentionRequired   attention_required   = 52;
+    // workspace (pillbox differentiator)
+    Checkpoint          checkpoint           = 60;
+    ResultReady         result_ready         = 61;
+    // exec channel
+    ExecStarted         exec_started         = 70;
+    ExecOutput          exec_output          = 71;
+    ExecExit            exec_exit            = 72;
+    // extension valve — no schema bump for consumer-specific data
+    Custom              custom               = 90;
+  }
+}
+
+message SandboxProvisioned { string remote = 1; string image = 2; }
+message SandboxReady       { }
+message SandboxDestroyed   { string reason = 1; }
+
+message RunStarted  { string agent = 1; string parent_run_id = 2; string base_snapshot = 3; }
+message RunFinished { string result_snapshot = 1; int32 exit_code = 2; }
+message RunFailed   { string reason = 1; int32 exit_code = 2; }
+
+message MessageStart { string message_id = 1; Role role = 2; }
+message MessageDelta { string message_id = 1; string text = 2; } // incremental
+message MessageEnd   { string message_id = 1; }
+
+message ToolCall {
+  string tool_call_id = 1;
+  string name         = 2;          // "Read" | "Bash" | "Edit" | …
+  ToolStatus status   = 3;          // RUNNING → COMPLETED | ERROR
+  google.protobuf.Struct input = 4; // present at RUNNING
+  string output       = 5;          // present at COMPLETED/ERROR
+  string title        = 6;          // human one-liner for a card/thread
+}
+
+message PhaseChanged { AgentPhase phase = 1; }
+message Todo         { string text = 1; TodoStatus status = 2; }
+message TodosUpdated { repeated Todo todos = 1; }
+
+message PermissionRequested {
+  string permission_id = 1;
+  string tool          = 2;
+  string description   = 3;
+  google.protobuf.Struct input = 4;
+}
+message PermissionResolved { string permission_id = 1; PermissionDecision decision = 2; }
+message AttentionRequired  { AttentionReason reason = 1; string message = 2; }
+
+message Checkpoint  { string snapshot_handle = 1; string message = 2; }
+message ResultReady { string snapshot_handle = 1; }
+
+message ExecStarted { repeated string argv = 1; }
+// `data` is base64-encoded under protobuf-JSON (REST/WS/webhook) — decode
+// before display. Raw bytes (not string) so binary output survives.
+message ExecOutput  { StdStream stream = 1; bytes data = 2; }
+message ExecExit    { int32 code = 1; }
+
+message Custom { string name = 1; google.protobuf.Struct payload = 2; }
+
+// ────────────────────────────────────────────────────────────────────────
+// Enums. Proto enum values share the *package* namespace (C++ scoping), so
+// every value is prefixed with its enum name — otherwise a bare value
+// (RUNNING, READY, ERROR, DONE…) collides the moment another enum reuses it.
+// ────────────────────────────────────────────────────────────────────────
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_ASSISTANT   = 1;
+  ROLE_USER        = 2;
+  ROLE_SYSTEM      = 3;
+}
+enum ToolStatus {
+  TOOL_STATUS_UNSPECIFIED = 0;
+  TOOL_STATUS_RUNNING     = 1;
+  TOOL_STATUS_COMPLETED   = 2;
+  TOOL_STATUS_ERROR       = 3;
+}
+enum AgentPhase {
+  AGENT_PHASE_UNSPECIFIED   = 0;
+  AGENT_PHASE_QUEUED        = 1;
+  AGENT_PHASE_THINKING      = 2;
+  AGENT_PHASE_EDITING       = 3;
+  AGENT_PHASE_RUNNING_TOOL  = 4;
+  AGENT_PHASE_WAITING_INPUT = 5;
+  AGENT_PHASE_DONE          = 6;
+}
+enum TodoStatus {
+  TODO_STATUS_UNSPECIFIED = 0;
+  TODO_STATUS_PENDING     = 1;
+  TODO_STATUS_IN_PROGRESS = 2;
+  TODO_STATUS_COMPLETED   = 3;
+}
+enum StdStream {
+  STD_STREAM_UNSPECIFIED = 0;
+  STD_STREAM_STDOUT      = 1;
+  STD_STREAM_STDERR      = 2;
+}
+enum InputMode {
+  INPUT_MODE_UNSPECIFIED = 0;
+  INPUT_MODE_AUTO        = 1;
+  INPUT_MODE_LIVE        = 2;
+  INPUT_MODE_TURN        = 3;
+}
+enum SandboxStatus {
+  SANDBOX_STATUS_UNSPECIFIED  = 0;
+  SANDBOX_STATUS_PROVISIONING = 1;
+  SANDBOX_STATUS_READY        = 2;
+  SANDBOX_STATUS_DESTROYED    = 3;
+}
+enum AttentionReason {
+  ATTENTION_REASON_UNSPECIFIED   = 0;
+  ATTENTION_REASON_NEEDS_INPUT   = 1;
+  ATTENTION_REASON_ERROR_STALLED = 2;
+  ATTENTION_REASON_PERMISSION    = 3;
+}
+
+// How tool-permission prompts are handled for a run.
+//   AUTO_ALLOW  — headless, fire-and-collect (v1 default; no routing needed).
+//   AUTO_DENY   — deny everything not pre-approved.
+//   INTERACTIVE — route prompts out as PermissionRequested; the consumer
+//                 answers via ResolvePermission. Requires the in-sandbox
+//                 permission-prompt routing (phase 2).
+enum PermissionMode {
+  PERMISSION_MODE_UNSPECIFIED = 0;
+  PERMISSION_MODE_AUTO_ALLOW  = 1;
+  PERMISSION_MODE_AUTO_DENY   = 2;
+  PERMISSION_MODE_INTERACTIVE = 3;
+}
+
+// A consumer's answer to a PermissionRequested event (INTERACTIVE mode).
+enum PermissionDecision {
+  PERMISSION_DECISION_UNSPECIFIED  = 0;
+  PERMISSION_DECISION_ALLOW        = 1;
+  PERMISSION_DECISION_ALLOW_ALWAYS = 2;
+  PERMISSION_DECISION_DENY         = 3;
+}
+
+// Subscription filter for Event payloads. Values are INDEPENDENT of the
+// Event oneof field tags on purpose — renumbering a oneof field must not
+// silently repoint a filter.
+enum EventType {
+  EVENT_TYPE_UNSPECIFIED         = 0;
+  EVENT_TYPE_SANDBOX_PROVISIONED = 1;
+  EVENT_TYPE_SANDBOX_READY       = 2;
+  EVENT_TYPE_SANDBOX_DESTROYED   = 3;
+  EVENT_TYPE_RUN_STARTED         = 4;
+  EVENT_TYPE_RUN_FINISHED        = 5;
+  EVENT_TYPE_RUN_FAILED          = 6;
+  EVENT_TYPE_MESSAGE_START       = 7;
+  EVENT_TYPE_MESSAGE_DELTA       = 8;
+  EVENT_TYPE_MESSAGE_END         = 9;
+  EVENT_TYPE_TOOL_CALL           = 10;
+  EVENT_TYPE_PHASE_CHANGED       = 11;
+  EVENT_TYPE_TODOS_UPDATED       = 12;
+  EVENT_TYPE_PERMISSION_REQUESTED = 13;
+  EVENT_TYPE_PERMISSION_RESOLVED = 14;
+  EVENT_TYPE_ATTENTION_REQUIRED  = 15;
+  EVENT_TYPE_CHECKPOINT          = 16;
+  EVENT_TYPE_RESULT_READY        = 17;
+  EVENT_TYPE_EXEC_STARTED        = 18;
+  EVENT_TYPE_EXEC_OUTPUT         = 19;
+  EVENT_TYPE_EXEC_EXIT           = 20;
+  EVENT_TYPE_CUSTOM              = 21;
+}

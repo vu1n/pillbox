@@ -37,6 +37,9 @@ tempfile = "3"
 rustic_core = "0.11"
 rustic_backend = { version = "0.6", default-features = false, features = ["opendal"] }
 rand = "0.9"
+# Base64 for the exec channel's ExecOutput.data (matches the proto `bytes`
+# field's protobuf-JSON encoding so binary stdout survives the wire).
+base64 = "0.22"
 # Unix-only: `pillbox session detach <id>` SIGTERMs the attached
 # pillbox process. Direct dep so a `cargo audit` flags advisories
 # instead of hiding behind a transitive resolution.

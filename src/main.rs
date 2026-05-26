@@ -25,6 +25,7 @@ mod bookmarks;
 mod cli;
 mod commands;
 mod config;
+mod contract;
 mod docker;
 mod doctor;
 mod envs;
@@ -35,6 +36,7 @@ mod pillbox;
 mod registry;
 mod remote;
 mod sandbox;
+mod sandboxes;
 mod secrets;
 mod session;
 #[cfg(test)]
@@ -45,8 +47,8 @@ mod workspace;
 
 use agents::RunOpts;
 use cli::{
-    AuthAction, BookmarkAction, EnvAction, RemoteAction, SecretAction, SessionAction,
-    SnapshotAction, VaultAction, WorkspaceAction,
+    AuthAction, BookmarkAction, EnvAction, RemoteAction, SandboxAction, SecretAction,
+    SessionAction, SnapshotAction, VaultAction, WorkspaceAction,
 };
 use errors::PillboxError;
 use pillbox::Pillbox;
@@ -332,6 +334,11 @@ enum Command {
         #[command(subcommand)]
         action: BookmarkAction,
     },
+    /// Spawn / exec / destroy long-lived sandboxes (PTY-free container I/O).
+    Sandbox {
+        #[command(subcommand)]
+        action: SandboxAction,
+    },
     /// Workspace-level operations (rekey, …).
     Workspace {
         #[command(subcommand)]
@@ -547,6 +554,10 @@ fn run(cli: Cli) -> Result<()> {
         Command::Bookmark { action } => {
             let resolved = Pillbox::resolve(pillbox_arg)?;
             commands::bookmark::dispatch(&resolved, action)
+        }
+        Command::Sandbox { action } => {
+            let resolved = Pillbox::resolve(pillbox_arg)?;
+            commands::sandbox::dispatch(&resolved, action)
         }
         Command::Completions { shell } => {
             // `Cli::command()` materializes the clap definition without

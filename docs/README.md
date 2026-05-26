@@ -9,6 +9,7 @@ Topic-organized deep dives. For the agent-facing command reference, see
 | [config.md](./config.md) | Per-project `pillbox.toml` — schema, discovery, merge rules |
 | [vault.md](./vault.md) | `--vault` MITM proxy that swaps stub creds for real ones |
 | [remotes.md](./remotes.md) | Remote backends (`ssh://`, `e2b://`) + detached sessions |
+| [mesa-workspace-review.md](./mesa-workspace-review.md) | Evaluation of Mesa as a workspace/forking backend |
 | [recipes.md](./recipes.md) | Copy-paste flows for common tasks |
 | [security.md](./security.md) | Threat model, file layout, what pillbox does and doesn't defend against |
 

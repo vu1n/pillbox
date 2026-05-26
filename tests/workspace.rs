@@ -13,7 +13,6 @@
 
 mod common;
 
-use std::path::PathBuf;
 use std::process::Command;
 
 use tempfile::TempDir;
@@ -166,6 +165,48 @@ fn push_then_snapshot_list_returns_one() {
 }
 
 #[test]
+fn bookmark_set_show_and_pull_round_trip() {
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    assert_ok(
+        &run(home.path(), cwd.path(), &["new", "--name", "bm"]),
+        "new",
+    );
+    std::fs::write(cwd.path().join("app.txt"), b"bookmarked").unwrap();
+    assert_ok(&run(home.path(), cwd.path(), &["push"]), "push");
+
+    let out = run(
+        home.path(),
+        cwd.path(),
+        &["bookmark", "set", "main", "latest"],
+    );
+    assert_ok(&out, "bookmark set");
+
+    let out = run(
+        home.path(),
+        cwd.path(),
+        &["bookmark", "show", "main", "--json"],
+    );
+    assert_ok(&out, "bookmark show");
+    let shown: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let handle = shown["bookmark"]["snapshot"].as_str().unwrap();
+    assert_eq!(handle.len(), 64);
+
+    std::fs::write(cwd.path().join("app.txt"), b"mutated").unwrap();
+    assert_ok(
+        &run(home.path(), cwd.path(), &["pull", "--bookmark", "main"]),
+        "pull bookmark",
+    );
+    let body = std::fs::read(cwd.path().join("app.txt")).unwrap();
+    assert_eq!(body, b"bookmarked");
+
+    let out = run(home.path(), cwd.path(), &["bookmark", "list", "--json"]);
+    assert_ok(&out, "bookmark list");
+    let listed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(listed["bookmarks"][0]["name"], "main");
+}
+
+#[test]
 fn push_pull_round_trips_the_workspace() {
     let home = TempDir::new().unwrap();
     let cwd = TempDir::new().unwrap();
@@ -176,35 +217,12 @@ fn push_pull_round_trips_the_workspace() {
     std::fs::write(cwd.path().join("greeting.txt"), b"original").unwrap();
     assert_ok(&run(home.path(), cwd.path(), &["push"]), "push");
 
-    // Mutate the file, then pull from latest snapshot. The file
-    // should be restored back to "original" — the restore writes
-    // under the absolute source path inside cwd, mimicking restic.
+    // Mutate the file, then pull from latest snapshot. The file should be
+    // restored back to "original" directly in the workspace root.
     std::fs::write(cwd.path().join("greeting.txt"), b"mutated").unwrap();
     assert_ok(&run(home.path(), cwd.path(), &["pull"]), "pull");
 
-    // Locate the restored greeting.txt anywhere in cwd.
-    let mut stack = vec![cwd.path().to_path_buf()];
-    let mut found: Option<PathBuf> = None;
-    while let Some(p) = stack.pop() {
-        for e in std::fs::read_dir(&p).unwrap().flatten() {
-            let path = e.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path
-                .file_name()
-                .map(|n| n == "greeting.txt")
-                .unwrap_or(false)
-            {
-                // Skip the one we mutated at the workspace root — that
-                // one is the input, not the restore target.
-                if path.parent() != Some(cwd.path()) {
-                    found = Some(path);
-                }
-            }
-        }
-    }
-    let restored = found.expect("restored greeting.txt");
-    let body = std::fs::read(&restored).unwrap();
+    let body = std::fs::read(cwd.path().join("greeting.txt")).unwrap();
     assert_eq!(body, b"original");
 }
 

@@ -21,6 +21,8 @@ use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 
 mod agents;
+mod bookmarks;
+mod cli;
 mod commands;
 mod config;
 mod docker;
@@ -42,6 +44,10 @@ mod vault;
 mod workspace;
 
 use agents::RunOpts;
+use cli::{
+    AuthAction, BookmarkAction, EnvAction, RemoteAction, SecretAction, SessionAction,
+    SnapshotAction, VaultAction, WorkspaceAction,
+};
 use errors::PillboxError;
 use pillbox::Pillbox;
 use secrets::WriteScope;
@@ -237,6 +243,12 @@ enum Command {
         /// metadata; consumers reconcile.
         #[arg(long, value_name = "ID")]
         parent: Option<String>,
+        /// Start the run from a named snapshot bookmark. For remote
+        /// runs this selects the base snapshot hydrated into the remote
+        /// workspace. Without this flag, remote runs snapshot the current
+        /// workspace at launch time and fork from that.
+        #[arg(long = "from-bookmark", value_name = "NAME")]
+        from_bookmark: Option<String>,
         /// Args forwarded to the agent CLI inside the sandbox.
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
@@ -304,13 +316,21 @@ enum Command {
     Pull {
         /// Snapshot to restore. Accepts a unique prefix (≥ 4 hex chars)
         /// or the full handle. Omit to restore the latest snapshot.
-        #[arg(long, value_name = "HANDLE")]
+        #[arg(long, value_name = "HANDLE", conflicts_with = "bookmark")]
         snapshot: Option<String>,
+        /// Bookmark to restore. Mutually exclusive with `--snapshot`.
+        #[arg(long, value_name = "NAME", conflicts_with = "snapshot")]
+        bookmark: Option<String>,
     },
     /// Inspect / manage the pillbox's snapshots.
     Snapshot {
         #[command(subcommand)]
         action: SnapshotAction,
+    },
+    /// Manage named bookmarks that point at snapshots.
+    Bookmark {
+        #[command(subcommand)]
+        action: BookmarkAction,
     },
     /// Workspace-level operations (rekey, …).
     Workspace {
@@ -323,326 +343,6 @@ enum Command {
         /// Shell to generate completions for.
         #[arg(value_name = "SHELL")]
         shell: clap_complete::Shell,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum SnapshotAction {
-    /// List every snapshot in the pillbox's repository.
-    List {
-        /// Emit a JSON array of snapshot records on stdout. Stable
-        /// schema — pin against `version: 1`.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Show one snapshot's metadata. Accepts a unique prefix.
-    Show {
-        /// Snapshot handle (full hex ID or a unique prefix ≥ 4 chars).
-        handle: String,
-        /// Emit the snapshot record as JSON on stdout.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Remove one snapshot. Data packs survive until a future `prune`.
-    Rm {
-        /// Snapshot handle (full hex ID or a unique prefix ≥ 4 chars).
-        handle: String,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum WorkspaceAction {
-    /// Rotate the repository encryption password.
-    Rekey,
-}
-
-#[derive(Subcommand, Debug)]
-enum SecretAction {
-    /// Store a secret value (reads from stdin by default).
-    Add {
-        name: String,
-        #[arg(long, value_name = "VAR")]
-        from_env: Option<String>,
-        #[arg(long)]
-        if_not_exists: bool,
-        /// Write to the global pillbox instead of the resolved one.
-        #[arg(long)]
-        global: bool,
-        /// Mark this secret as vaulted (stub-swap at injection time).
-        #[arg(long)]
-        vault: bool,
-        #[arg(long, value_name = "KNOWN_NAME", requires = "vault",
-              conflicts_with_all = ["host", "header_scheme", "prefix"])]
-        maps_to: Option<String>,
-        #[arg(long, value_name = "HOST", requires = "vault")]
-        host: Option<String>,
-        #[arg(long = "header-scheme", value_name = "SCHEME", requires = "vault")]
-        header_scheme: Option<String>,
-        #[arg(long, value_name = "PREFIX", requires = "vault")]
-        prefix: Option<String>,
-    },
-    /// List stored secret names (project + global, deduplicated).
-    List {
-        #[arg(long)]
-        json: bool,
-    },
-    /// Show a secret's value (masked by default).
-    Show {
-        name: String,
-        #[arg(long)]
-        reveal: bool,
-        #[arg(long, requires = "reveal")]
-        to_stdout: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Delete a stored secret from the resolved scope (or `--global`).
-    Rm {
-        name: String,
-        #[arg(long)]
-        global: bool,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum EnvAction {
-    Load {
-        name: String,
-        path: PathBuf,
-        #[arg(long)]
-        if_not_exists: bool,
-        #[arg(long)]
-        global: bool,
-    },
-    List {
-        #[arg(long)]
-        json: bool,
-    },
-    Show {
-        name: String,
-        #[arg(long)]
-        reveal: bool,
-        #[arg(long, requires = "reveal")]
-        to_stdout: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    Rm {
-        name: String,
-        #[arg(long)]
-        global: bool,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum AuthAction {
-    /// Run the OAuth flow inside a one-shot sandbox.
-    Login {
-        /// Agent to authenticate (`claude` | `codex`).
-        #[arg(long, value_name = "AGENT")]
-        agent: String,
-        /// Reserved — v0.6 PR 2 always writes to global. Pass for
-        /// forward compatibility; identical to default behavior today.
-        #[arg(long)]
-        global: bool,
-    },
-    /// Show which agents have authenticated state.
-    List {
-        #[arg(long)]
-        json: bool,
-        #[arg(long)]
-        global: bool,
-    },
-    /// Remove an agent's persistent state.
-    Rm {
-        provider: String,
-        #[arg(long)]
-        global: bool,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum RemoteAction {
-    /// Register a remote VPS for use with `pillbox run --remote NAME`.
-    ///
-    /// Two positional args: `NAME URL`, matching `git remote add`. The
-    /// long `--url` spelling is accepted as a hidden alias so scripts
-    /// written against earlier drafts of this PR keep working.
-    Add {
-        /// Display name. Used as `pillbox run --remote NAME`.
-        name: String,
-        /// SSH destination URL: `ssh://user@host[:port]`. Either
-        /// positional or via `--url`; exactly one form is required.
-        url: Option<String>,
-        /// Hidden alias for the positional URL — see the command docs.
-        #[arg(long = "url", value_name = "URL", hide = true, conflicts_with = "url")]
-        url_flag: Option<String>,
-        /// Default agent for runs against this remote (overrides the
-        /// pillbox's own `agent` field). Optional.
-        #[arg(long, value_name = "AGENT")]
-        agent: Option<String>,
-        /// Fail if the remote already exists in the chosen scope.
-        #[arg(long)]
-        if_not_exists: bool,
-        /// Write to the global pillbox instead of the resolved one.
-        #[arg(long)]
-        global: bool,
-    },
-    /// List remotes visible from the current pillbox (project + global).
-    List {
-        #[arg(long)]
-        json: bool,
-    },
-    /// Remove a registered remote from the resolved scope (or `--global`).
-    Rm {
-        name: String,
-        #[arg(long)]
-        global: bool,
-    },
-    /// Show details for one remote (with inheritance).
-    Info {
-        name: String,
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-/// Terminal status passed to `pillbox session done <id>`. Maps to the
-/// `session.completed` / `session.failed` event types in `events.rs`.
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
-enum DoneStatus {
-    Ok,
-    Failed,
-}
-
-#[derive(Subcommand, Debug)]
-enum SessionAction {
-    /// List sessions started from this pillbox (oldest first).
-    List {
-        /// Emit a JSON array of session records. Pin to `version: 1`.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Show one session (accepts a unique id prefix ≥ 4 chars).
-    Info {
-        id: String,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Reattach to a detached session. Streams the remote PTY back
-    /// into the current terminal. Detach again with Ctrl-A + D or by
-    /// running `pillbox session detach <id>` from another shell.
-    Attach { id: String },
-    /// Signal a currently-attached pillbox process to detach. The
-    /// session record is left in place; the backend keeps running.
-    /// Idempotent — no error if the session is already detached.
-    Detach { id: String },
-    /// Tear down the backend resources (kill the sandbox) and remove
-    /// the session record. Idempotent.
-    Rm { id: String },
-    /// Rehydrate a session's result workspace into a directory. Reads
-    /// `result_snapshot` from the session record (set by `session done
-    /// --result-snapshot`) and asks the workspace backend to pull it.
-    /// Used by orchestrators for post-mortem inspection of a failed
-    /// fork: analyzer agents read the failed session's workspace
-    /// without having to re-run anything.
-    Pull {
-        id: String,
-        /// Destination directory. Created if missing. Defaults to
-        /// `./session-<id>` so two sequential pulls don't clobber each
-        /// other.
-        #[arg(long, value_name = "DIR")]
-        to: Option<PathBuf>,
-    },
-    /// Tear down every session whose `expires_at` is in the past.
-    /// Drives `session rm` for each — sandbox killed, record deleted.
-    /// Sessions with no `expires_at` (no `--ttl` at spawn) are left
-    /// alone forever; the user / orchestrator owns the policy.
-    /// Intended for cron / orchestrator schedules; pillbox doesn't
-    /// auto-prune on every invocation.
-    Prune {
-        /// List what would be pruned without actually pruning. Useful
-        /// for sanity-checking a cron entry before turning it on.
-        #[arg(long = "dry-run")]
-        dry_run: bool,
-    },
-    /// Emit a sandbox-side `session.started` event. Mirror of
-    /// [`Done`] for the front of the lifecycle: the in-sandbox
-    /// wrapper script calls this right before launching the agent
-    /// so consumers can compute cold-start latency from
-    /// `host.started_at` → `sandbox.started_at` (distinguished by
-    /// the `emitter` attribute on each event).
-    ///
-    /// No-op cost when no sink is configured. The event payload is
-    /// minimal — `session_id` + `started_at` + `emitter=sandbox` —
-    /// because the host's prior `session.started` already carries
-    /// the full record (agent_id, remote, backend, label, …);
-    /// consumers correlate by `session_id`.
-    Started { id: String },
-    /// Mark a session done, emitting `session.completed` or
-    /// `session.failed` to every configured sink (JSONL + webhook +
-    /// OTel). Invoked manually for orchestrator-driven completion, or
-    /// automatically by the in-sandbox wrapper script after the agent
-    /// exits. Does NOT tear down the sandbox — use `session rm` for
-    /// that.
-    ///
-    /// Sandbox-side use: when called from inside an E2B sandbox where
-    /// the session record doesn't exist locally, builds a stub
-    /// payload from the id and relies on webhook / OTel sinks to ferry
-    /// the event to the host or orchestrator.
-    Done {
-        id: String,
-        /// `ok` → emits `session.completed`. `failed` → emits
-        /// `session.failed`.
-        #[arg(long, value_enum)]
-        status: DoneStatus,
-        /// Free-text reason. Only meaningful with `--status failed`;
-        /// surfaced in the event payload + via OTel `status.message`.
-        #[arg(long, value_name = "TEXT")]
-        reason: Option<String>,
-        /// Exit code of the agent process, if known. Surfaced in the
-        /// event payload + as an OTel attribute on the span.
-        #[arg(long = "exit-code", value_name = "N")]
-        exit_code: Option<i32>,
-        /// Path (rustic snapshot URL or local file) to the agent's
-        /// captured tool-call trace. Carried verbatim through to event
-        /// consumers; pillbox doesn't dereference it today.
-        #[arg(long = "trace-path", value_name = "PATH")]
-        trace_path: Option<String>,
-        /// Rustic snapshot handle of the agent's result workspace,
-        /// captured by the in-sandbox wrapper (`pillbox push --tag
-        /// session-<id>`) after the agent exits. Recorded on the
-        /// session record so `pillbox session pull <id>` can rehydrate
-        /// it later; also included in the terminal-event payload.
-        #[arg(long = "result-snapshot", value_name = "HANDLE")]
-        result_snapshot: Option<String>,
-    },
-    /// Stream session lifecycle events as JSONL on stdout.
-    ///
-    /// v0.7 spike emits `session.started` and `session.dropped` only;
-    /// PR 2 adds `completed`/`failed` + webhook + OTel sinks. The
-    /// `--json` flag is reserved for compat — every line is already
-    /// JSON today; the flag exists so PR 2 can introduce a human
-    /// default without breaking orchestrator callers.
-    Events {
-        /// Keep streaming as new events arrive (`tail -f` shape).
-        #[arg(long)]
-        follow: bool,
-        /// Reserved for compat. v0.7 spike output is always JSONL.
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum VaultAction {
-    Ca {
-        #[arg(long)]
-        json: bool,
-    },
-    Status {
-        #[arg(long)]
-        json: bool,
     },
 }
 
@@ -708,6 +408,7 @@ fn run(cli: Cli) -> Result<()> {
             events_webhook,
             ttl,
             parent,
+            from_bookmark,
             args,
         } => {
             let resolved = Pillbox::resolve(pillbox_arg)?;
@@ -787,6 +488,7 @@ fn run(cli: Cli) -> Result<()> {
                     label,
                     json,
                     ttl_seconds,
+                    from_bookmark,
                 },
             )
         }
@@ -834,13 +536,17 @@ fn run(cli: Cli) -> Result<()> {
             let resolved = Pillbox::resolve(pillbox_arg)?;
             commands::workspace::push(&resolved, tag, message, json)
         }
-        Command::Pull { snapshot } => {
+        Command::Pull { snapshot, bookmark } => {
             let resolved = Pillbox::resolve(pillbox_arg)?;
-            commands::workspace::pull(&resolved, snapshot)
+            commands::workspace::pull(&resolved, snapshot, bookmark)
         }
         Command::Snapshot { action } => {
             let resolved = Pillbox::resolve(pillbox_arg)?;
             commands::workspace::snapshot_dispatch(&resolved, action)
+        }
+        Command::Bookmark { action } => {
+            let resolved = Pillbox::resolve(pillbox_arg)?;
+            commands::bookmark::dispatch(&resolved, action)
         }
         Command::Completions { shell } => {
             // `Cli::command()` materializes the clap definition without

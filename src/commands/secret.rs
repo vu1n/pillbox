@@ -4,10 +4,11 @@
 
 use anyhow::Result;
 
+use crate::cli::SecretAction;
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
 use crate::WriteScope;
-use crate::{secrets, vault, SecretAction};
+use crate::{secrets, vault};
 
 pub(crate) fn dispatch(resolved: &Pillbox, action: SecretAction) -> Result<()> {
     match action {

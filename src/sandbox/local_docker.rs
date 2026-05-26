@@ -13,6 +13,7 @@ use crate::agents::{
     RunOpts, GUEST_HOME, GUEST_WORKSPACE,
 };
 use crate::pillbox::Pillbox;
+use crate::workspace::WorkspaceBackend;
 use crate::{docker, errors::PillboxError};
 
 pub(crate) struct LocalDocker;
@@ -35,6 +36,10 @@ impl SandboxBackend for LocalDocker {
             Some(p) => p.clone(),
             None => std::env::current_dir().context("resolve current working directory")?,
         };
+        if let Some(name) = opts.from_bookmark.as_deref() {
+            let handle = crate::bookmarks::resolve_existing(resolved, name)?;
+            resolved.workspace()?.pull(&workspace_host, Some(&handle))?;
+        }
         let workspace_name = workspace_mount_name(&workspace_host, opts.name.as_deref())?;
         let guest_workspace = format!("{GUEST_WORKSPACE}/{workspace_name}");
 

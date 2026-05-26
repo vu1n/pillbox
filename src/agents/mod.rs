@@ -276,6 +276,10 @@ pub(crate) struct RunOpts {
     /// duration), so `pillbox session prune` doesn't have to recompute
     /// from creation time. Only meaningful with `--detach`.
     pub(crate) ttl_seconds: Option<u64>,
+    /// `--from-bookmark NAME` — select the snapshot bookmark used as
+    /// the run's workspace base. Local Docker restores it before launch;
+    /// remote backends hydrate it into the remote temp workspace.
+    pub(crate) from_bookmark: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -463,6 +467,7 @@ mod tests {
             label: None,
             json: false,
             ttl_seconds: None,
+            from_bookmark: None,
         }
     }
 

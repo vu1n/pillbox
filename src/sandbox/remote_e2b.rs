@@ -276,6 +276,7 @@ fn run_attach(
                     label,
                     pre_minted_id: &session_id,
                     expires_at: expires_at.clone(),
+                    base_snapshot: blob.workspace.base_snapshot.clone(),
                 },
                 &pumped,
             )?;
@@ -306,6 +307,7 @@ fn run_attach(
                     label,
                     pre_minted_id: &session_id,
                     expires_at: expires_at.clone(),
+                    base_snapshot: blob.workspace.base_snapshot.clone(),
                 },
                 &pumped,
             )?;
@@ -463,6 +465,7 @@ pub(super) struct PersistArgs<'a> {
     pub(super) label: Option<String>,
     pub(super) pre_minted_id: &'a str,
     pub(super) expires_at: Option<String>,
+    pub(super) base_snapshot: Option<String>,
 }
 
 /// Persist a freshly-started session and emit the `session.started`
@@ -515,7 +518,7 @@ fn persist_session_from_pump(
         agent_id: args.agent_id.to_string(),
         started_at: session::now_rfc3339(),
         attached_pid,
-        base_snapshot: crate::workspace::latest_snapshot_handle(args.resolved),
+        base_snapshot: args.base_snapshot,
         result_snapshot: None,
         expires_at: args.expires_at,
     };

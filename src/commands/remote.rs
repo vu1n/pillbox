@@ -3,10 +3,11 @@
 
 use anyhow::Result;
 
+use crate::cli::RemoteAction;
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
+use crate::remote;
 use crate::WriteScope;
-use crate::{remote, RemoteAction};
 
 pub(crate) fn dispatch(resolved: &Pillbox, action: RemoteAction) -> Result<()> {
     match action {

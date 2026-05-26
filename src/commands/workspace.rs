@@ -9,11 +9,11 @@
 
 use anyhow::Result;
 
+use crate::cli::{SnapshotAction, WorkspaceAction};
 use crate::errors::PillboxError;
 use crate::paths;
 use crate::pillbox::Pillbox;
 use crate::workspace::{PushOptions, Snapshot, SnapshotHandle, WorkspaceBackend};
-use crate::{SnapshotAction, WorkspaceAction};
 
 pub(crate) fn push(
     resolved: &Pillbox,
@@ -56,11 +56,26 @@ pub(crate) fn push(
     Ok(())
 }
 
-pub(crate) fn pull(resolved: &Pillbox, snapshot: Option<String>) -> Result<()> {
+pub(crate) fn pull(
+    resolved: &Pillbox,
+    snapshot: Option<String>,
+    bookmark: Option<String>,
+) -> Result<()> {
     let backend = resolved.workspace()?;
     let cwd = std::env::current_dir()
         .map_err(|e| PillboxError::runtime("pull", format!("could not resolve cwd: {e}")))?;
-    let handle = snapshot.as_ref().map(|s| SnapshotHandle::new(s.clone()));
+    let handle = match (snapshot, bookmark) {
+        (Some(_), Some(_)) => {
+            return Err(PillboxError::usage(
+                "pull",
+                "--snapshot and --bookmark are mutually exclusive",
+            )
+            .into());
+        }
+        (Some(s), None) => Some(SnapshotHandle::new(s)),
+        (None, Some(name)) => Some(crate::bookmarks::resolve_existing(resolved, &name)?),
+        (None, None) => None,
+    };
     backend.pull(&cwd, handle.as_ref())?;
     let label = handle
         .as_ref()

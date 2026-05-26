@@ -8,9 +8,10 @@
 
 use anyhow::Result;
 
+use crate::cli::{DoneStatus, SessionAction};
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
-use crate::{events, remote, sandbox, session, DoneStatus, SessionAction};
+use crate::{events, remote, sandbox, session};
 
 pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> {
     match action {

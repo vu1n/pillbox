@@ -88,17 +88,21 @@ global pillbox regardless of where you are.
 | `pillbox session attach ID` | Reattach to a detached session. Detach again with Ctrl-A + D or `pillbox session detach ID` from another shell. v0.6 PR 6: e2b:// remotes only. |
 | `pillbox session detach ID` | Signal a currently-attached pillbox to detach (SIGTERM, no-op if already detached). |
 | `pillbox session rm ID` | Tear down the backend (kill sandbox) and remove the session record. |
-| `pillbox session done ID --status ok\|failed [--reason TEXT] [--exit-code N] [--trace-path PATH] [--result-snapshot HANDLE]` | Emit `session.completed` / `session.failed` to every configured sink. Invoked automatically by the in-sandbox wrapper after the agent exits (also passes `--result-snapshot` from the post-agent push); can also be called manually. Does NOT tear down the sandbox — use `session rm` for that. |
+| `pillbox session done ID --status ok\|failed [--reason TEXT] [--exit-code N] [--trace-path PATH] [--result-snapshot HANDLE]` | Emit `session.completed` / `session.failed` to every configured sink. Invoked automatically by the in-sandbox wrapper after the agent exits (also passes `--result-snapshot` from the remote workspace push); can also be called manually. Does NOT tear down the sandbox — use `session rm` for that. |
 | `pillbox session pull ID [--to DIR]` | Rehydrate a session's result workspace into a directory. Reads `result_snapshot` from the session record; errors clearly if the agent hasn't finished. Default `DIR` is `./session-<id>`. |
 | `pillbox session prune [--dry-run]` | Tear down every session whose `expires_at` is in the past (calls `session rm` per record). Sessions without `--ttl` are left alone. Intended for cron/orchestrator schedules; pillbox doesn't auto-prune. |
 | `pillbox session events [--follow] [--json]` | Tail the local events stream (`<pillbox>/events.jsonl`). |
 | `pillbox doctor [--json]` | Diagnose Docker, image, perms, `$HOME`. |
 | `pillbox version` | Print pillbox + runner image versions. |
 | `pillbox push [--tag T] [--message M] [--json]` | Snapshot cwd into the pillbox's rustic repo. |
-| `pillbox pull [--snapshot HANDLE]` | Restore cwd from a snapshot (defaults to latest). |
+| `pillbox pull [--snapshot HANDLE \| --bookmark NAME]` | Restore cwd from a snapshot (defaults to latest) or bookmark. |
 | `pillbox snapshot list [--json]` | List every snapshot in the pillbox's repo. |
 | `pillbox snapshot show HANDLE [--json]` | Show one snapshot (HANDLE may be a unique prefix). |
 | `pillbox snapshot rm HANDLE` | Forget a snapshot (data packs survive until prune). |
+| `pillbox bookmark list [--json]` | List named snapshot bookmarks. |
+| `pillbox bookmark show NAME [--json]` | Show one bookmark. |
+| `pillbox bookmark set NAME [HANDLE\|latest]` | Point a bookmark at a snapshot (defaults to latest). |
+| `pillbox bookmark rm NAME` | Remove a bookmark; the underlying snapshot is untouched. |
 | `pillbox workspace rekey` | Rotate the rustic repo password. **Caveat:** rustic_core 0.11 has no public API to delete the prior key; both passwords keep working until upstream lands deletion. Treat the old password as compromised. |
 
 ### `pillbox run` flags
@@ -113,7 +117,8 @@ global pillbox regardless of where you are.
 | `--env BUNDLE` | — | Inject every variable from a stored env bundle. |
 | `--env-file PATH` | — | Inject every variable from a `.env` on disk. |
 | `--vault` | — | Route agent traffic through the stub-swap proxy. |
-| `--remote NAME` | — | Run on a registered remote (`ssh://` or `e2b://`) instead of locally. Requires an S3-shaped workspace backend. For `e2b://` remotes: `node` + `npm i -g e2b` must be installed locally and `E2B_API_KEY` must be available in the environment. |
+| `--remote NAME` | — | Run on a registered remote (`ssh://` or `e2b://`) instead of locally. Requires an S3-shaped workspace backend. The launch path snapshots the current workspace as the remote base unless `--from-bookmark` is passed. For `e2b://` remotes: `node` + `npm i -g e2b` must be installed locally and `E2B_API_KEY` must be available in the environment. |
+| `--from-bookmark NAME` | — | Start from a named snapshot bookmark. Local runs first restore that bookmark into the workspace; remote runs hydrate from it instead of auto-snapshotting cwd. |
 | `--detach` | — | Start the session and immediately return — the agent keeps running in the background; reattach with `pillbox session attach <id>`. Requires `--remote`. v0.6 PR 6: e2b:// remotes only. |
 | `--events-webhook URL` | — | POST every lifecycle event to URL as JSON. Forwarded to the in-sandbox wrapper so terminal events (`session.completed`/`failed`) reach back to the orchestrator. Equivalent to `$PILLBOX_EVENTS_WEBHOOK`. |
 | `--ttl DURATION` | — | Per-session retention TTL — `30m` / `24h` / `7d` (`s`/`m`/`h`/`d` units only, max 365d). Writes `expires_at` to the record. `pillbox session prune` drops expired sessions. Requires `--detach`. |
@@ -317,6 +322,24 @@ future releases; the version bumps on restructure. Pin against
   "snapshot": { "handle": "...", "short": "...", "created_at": "...",
                 "tag": null, "message": null,
                 "git_anchor": null, "git_dirty": false, "bytes": 0 }
+}
+
+// pillbox bookmark list --json
+{
+  "version": 1,
+  "pillbox": "myapp",
+  "bookmarks": [
+    { "name": "main", "snapshot": "<64-char hex>", "short": "<first 8>",
+      "created_at": "2026-05-20T17:30:00Z",
+      "updated_at": "2026-05-21T09:00:00Z" }
+  ]
+}
+
+// pillbox bookmark show NAME --json
+{
+  "version": 1,
+  "bookmark": { "name": "main", "snapshot": "<64-char hex>", "short": "<first 8>",
+                "created_at": "...", "updated_at": "..." }
 }
 
 // pillbox vault status --json

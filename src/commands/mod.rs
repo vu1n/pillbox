@@ -7,6 +7,7 @@
 //! main.rs's `Command::*` match arms call into.
 
 pub(crate) mod auth;
+pub(crate) mod bookmark;
 pub(crate) mod env;
 pub(crate) mod remote;
 pub(crate) mod secret;

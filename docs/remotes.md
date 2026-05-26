@@ -42,11 +42,21 @@ Both backends use the same internal "vault-stdin blob" shape:
 
 ```jsonc
 {
-  "version": 1,
+  "version": 2,
   "agent_id": "claude",
   "agent_args": ["--continue"],
   "workspace_mount_name": "my-app",
   "vault": true,
+  "workspace": {
+    "endpoint": "https://acct.r2.cloudflarestorage.com",
+    "region": "auto",
+    "bucket": "my-snapshots",
+    "prefix": "pillbox/",
+    "access_key": "<resolved value>",
+    "secret_key": "<resolved value>",
+    "repo_password": "<rustic repo password>",
+    "base_snapshot": "<64-char handle>"
+  },
   "secrets": [
     { "name": "ANTHROPIC_API_KEY",
       "env_var": "ANTHROPIC_API_KEY",
@@ -58,7 +68,9 @@ Both backends use the same internal "vault-stdin blob" shape:
 ```
 
 - SSH: blob is fed over `ssh`'s stdin (encrypted channel) into
-  `pillbox run --vault-stdin` on the remote. Never on disk.
+  `pillbox run --vault-stdin` on the remote. The blob itself is not
+  persisted; the remote writes the repo password to a 0600 temp file
+  while hydrating/pushing the workspace.
 - E2B: blob is uploaded to the sandbox's `/tmp` via the E2B Files API
   (mode 600), unlinked by the launch line as soon as the in-sandbox
   pillbox reads it. The local pillbox stages a 0600 tempfile to pass
@@ -68,17 +80,24 @@ Both backends use the same internal "vault-stdin blob" shape:
 The blob format is versioned and shared between backends. A mismatch
 (`version != BLOB_VERSION`) fails the parse loudly so a newer client
 paired with an older remote can't silently drop required fields.
-`Debug` is implemented by hand on both `VaultStdinBlob` and
-`InlineSecret` so a stray `dbg!` or `tracing::debug!(?blob)` never
-leaks secret material to logs.
+`Debug` is implemented by hand on `VaultStdinBlob`, `InlineSecret`,
+and `InlineWorkspace` so a stray `dbg!` or `tracing::debug!(?blob)`
+never leaks secret material to logs.
 
 ## Workspace handoff
 
-v0.6 supports remote runs only against an S3-shaped workspace backend
-— the local pillbox and the remote share the same bucket / endpoint
-config, so no workspace bytes have to cross the helper subprocess.
-Both sides use `rustic_core` against the same repo; the
-encryption password stays local (`<state_dir>/repo-password`, 0600).
+v0.6 supports remote runs only against an S3-shaped workspace backend.
+At launch, the local side either snapshots the current workspace or
+resolves `--from-bookmark NAME`, then sends that base snapshot plus
+the S3/R2 repo coordinates and repo password in the blob. The remote
+side restores the base into an isolated temp workspace before running
+Docker, then pushes the result workspace back to the same repo after
+the agent exits.
+
+Both sides use `rustic_core` against the same repo. The durable
+encryption password stays in the local pillbox state
+(`<state_dir>/repo-password`, 0600); remote runners receive it only as
+per-run material.
 
 A local-rustic workspace errors out with an actionable pointer
 (`pillbox new --workspace-backend s3 …`). Tarball transport over the

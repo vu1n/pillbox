@@ -12,10 +12,10 @@
 //!    pillbox's `remotes/` registry (with global fallback).
 //! 2. Resolve `--with` entries locally (same code path as a local run):
 //!    real secret values + vault metadata.
-//! 3. Refuse if the pillbox's workspace backend is `local` — PR 4 only
-//!    supports S3-shaped backends (the remote uses the same config to
-//!    pull from the same bucket; no data crosses SSH). Local-rustic
-//!    via tarball is a PR 4.1 follow-up.
+//! 3. Refuse if the pillbox's workspace backend is `local` — remote
+//!    runs require an S3/R2-shaped rustic repo. The local side snapshots
+//!    the requested base and sends the repo coordinates + password in
+//!    the encrypted protocol blob.
 //! 4. Build a [`VaultStdinBlob`] (JSON; schema doc-commented below) and
 //!    feed it via stdin to `pillbox run --vault-stdin` on the remote.
 //! 5. Inherit stdout / stderr from the SSH session so the local terminal
@@ -28,18 +28,32 @@
 //! [`VaultStdinBlob`], then dispatches a normal LocalDocker run with
 //! pre-resolved [`InlineSecret`] entries injected directly into the env
 //! (and into the vault session for vaulted secrets) — bypassing the
-//! local `secrets` store on the remote. The blob is the only place
-//! real secret material lives on the remote: it's not written to disk.
+//! local `secrets` store on the remote. Before Docker starts, the
+//! remote side restores the base snapshot into an isolated temp
+//! workspace and mounts that directory. After Docker exits, it pushes
+//! the result workspace back to the same repo.
 //!
 //! ## Vault-stdin blob schema (internal — `pillbox run --vault-stdin`)
 //!
 //! ```jsonc
 //! {
-//!   "version": 1,
+//!   "version": 2,
 //!   "agent_id": "claude",
 //!   "agent_args": ["--continue"],          // forwarded to the agent CLI
 //!   "workspace_mount_name": "my-app",      // /workspace/<name> on the remote
 //!   "vault": true,                          // route through pillbox vault proxy?
+//!   "workspace": {
+//!     "s3": {                                 // RusticVariant::S3 config, verbatim
+//!       "endpoint": "https://acct.r2.cloudflarestorage.com",
+//!       "region": "auto",
+//!       "bucket": "my-bucket",
+//!       "prefix": "pillbox/",
+//!       "access_key": "<resolved value>",
+//!       "secret_key": "<resolved value>"
+//!     },
+//!     "repo_password": "<rustic repo password>",
+//!     "base_snapshot": "<64-char handle>"
+//!   },
 //!   "secrets": [
 //!     { "name": "ANTHROPIC_API_KEY",
 //!       "env_var": "ANTHROPIC_API_KEY",
@@ -55,11 +69,13 @@
 //! `version` integer, by contrast, IS enforced — a mismatch fails the
 //! parse loudly so a semantic-breaking schema change can't silently
 //! drop required state. Bump `BLOB_VERSION` only for breaking changes.
-//! The blob never touches disk on either side.
+//! The blob is secret-bearing. SSH streams it over stdin; E2B stages it
+//! through 0600 temp files because the PTY channel carries user input.
 
 use std::{
-    fmt,
+    fmt, fs,
     io::{Read, Write},
+    path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 
@@ -76,6 +92,8 @@ use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
 use crate::remote::{parse_ssh_url, Remote};
 use crate::vault::{OAuthAgent, VaultMeta, VaultSession};
+use crate::workspace::rustic::{RusticBackend, RusticVariant, S3Config, PASSWORD_FILE};
+use crate::workspace::{PushOptions, SnapshotHandle, WorkspaceBackend};
 
 /// Wire format for `pillbox run --vault-stdin`. See module docs.
 ///
@@ -94,6 +112,7 @@ pub(crate) struct VaultStdinBlob {
     pub(crate) secrets: Vec<InlineSecret>,
     #[serde(default)]
     pub(crate) env: std::collections::BTreeMap<String, String>,
+    pub(crate) workspace: InlineWorkspace,
 }
 
 impl fmt::Debug for VaultStdinBlob {
@@ -106,6 +125,33 @@ impl fmt::Debug for VaultStdinBlob {
             .field("vault", &self.vault)
             .field("secrets", &self.secrets)
             .field("env_keys", &self.env.keys().collect::<Vec<_>>())
+            .field("workspace", &self.workspace)
+            .finish()
+    }
+}
+
+/// Workspace material needed by a remote host to hydrate and publish through
+/// the same S3/R2 rustic repository as the local pillbox.
+///
+/// `s3` is the repo config verbatim — it slots straight back into a
+/// [`RusticBackend`] on the remote, no field-by-field copy. This is
+/// secret-bearing (`s3` credentials + `repo_password` are real values,
+/// not env var names); `Debug` redacts them.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct InlineWorkspace {
+    pub(crate) s3: S3Config,
+    pub(crate) repo_password: String,
+    #[serde(default)]
+    pub(crate) base_snapshot: Option<String>,
+}
+
+impl fmt::Debug for InlineWorkspace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `s3` redacts its own credentials via its `Debug` impl.
+        f.debug_struct("InlineWorkspace")
+            .field("s3", &self.s3)
+            .field("repo_password", &"<redacted>")
+            .field("base_snapshot", &self.base_snapshot)
             .finish()
     }
 }
@@ -141,7 +187,9 @@ impl fmt::Debug for InlineSecret {
 /// remote combo fails loudly instead of silently dropping required
 /// fields. Unknown JSON keys WITHIN a known version are still tolerated
 /// (serde default) — version bumps are reserved for semantic changes.
-pub(crate) const BLOB_VERSION: u32 = 1;
+pub(crate) const BLOB_VERSION: u32 = 2;
+
+pub(crate) const RESULT_SNAPSHOT_FILE_ENV: &str = "PILLBOX_RESULT_SNAPSHOT_FILE";
 
 impl VaultStdinBlob {
     pub(crate) fn to_bytes(&self) -> Result<Vec<u8>> {
@@ -322,6 +370,7 @@ pub(super) fn build_vault_stdin_blob(
         None => std::env::current_dir().context("resolve current working directory")?,
     };
     let workspace_name = workspace_mount_name(&workspace_host, opts.name.as_deref())?;
+    let workspace = build_inline_workspace(resolved, opts, &workspace_host, action)?;
 
     Ok(VaultStdinBlob {
         version: BLOB_VERSION,
@@ -331,7 +380,64 @@ pub(super) fn build_vault_stdin_blob(
         vault: opts.vault,
         secrets,
         env,
+        workspace,
     })
+}
+
+fn build_inline_workspace(
+    resolved: &Pillbox,
+    opts: &RunOpts,
+    workspace_host: &Path,
+    action: &'static str,
+) -> Result<InlineWorkspace> {
+    let backend = resolved.workspace()?;
+    let s3 = match &backend.variant {
+        RusticVariant::S3(cfg) => cfg.clone(),
+        RusticVariant::Local { .. } => {
+            return Err(PillboxError::usage(
+                action,
+                "remote runs require an S3-shaped workspace backend",
+            )
+            .into());
+        }
+    };
+    let repo_password = fs::read_to_string(&backend.password_file)
+        .with_context(|| format!("read {}", backend.password_file.display()))?
+        .trim_end()
+        .to_string();
+    let base_snapshot = resolve_base_snapshot(resolved, opts, &backend, workspace_host)?;
+    Ok(InlineWorkspace {
+        s3,
+        repo_password,
+        base_snapshot,
+    })
+}
+
+/// The snapshot a remote run forks from: an explicit `--from-bookmark`,
+/// or — by default — a fresh snapshot of the current workspace pushed to
+/// the shared repo. The default branch performs a `push` (a write), so
+/// this is kept separate from the credential-gathering above.
+fn resolve_base_snapshot(
+    resolved: &Pillbox,
+    opts: &RunOpts,
+    backend: &RusticBackend,
+    workspace_host: &Path,
+) -> Result<Option<String>> {
+    let handle = match opts.from_bookmark.as_deref() {
+        Some(name) => crate::bookmarks::resolve_existing(resolved, name)?,
+        None => {
+            backend
+                .push(
+                    workspace_host,
+                    PushOptions {
+                        tag: Some("remote-base".into()),
+                        message: Some("remote run base".into()),
+                    },
+                )?
+                .handle
+        }
+    };
+    Ok(Some(handle.as_str().to_string()))
 }
 
 /// Connect, send the blob over stdin, proxy stdout/stderr/exit-status
@@ -427,8 +533,8 @@ pub(crate) fn dispatch_vault_stdin(resolved: &Pillbox) -> Result<()> {
         .into());
     }
 
-    let workspace_host =
-        std::env::current_dir().context("resolve current working directory on remote")?;
+    let remote_workspace = hydrate_remote_workspace(&blob.workspace)?;
+    let workspace_host = remote_workspace.workspace_dir.clone();
     let guest_workspace = format!("{GUEST_WORKSPACE}/{}", blob.workspace_mount_name);
 
     let any_vaulted = blob.secrets.iter().any(|s| s.vault_meta.is_some());
@@ -494,7 +600,26 @@ pub(crate) fn dispatch_vault_stdin(resolved: &Pillbox) -> Result<()> {
     args.extend(blob.agent_args.clone());
 
     let status = docker::run_interactive(&args)?;
+    let result_snapshot = remote_workspace.backend.push(
+        &workspace_host,
+        PushOptions {
+            tag: Some("remote-result".into()),
+            message: Some("remote run result".into()),
+        },
+    )?;
     drop(vault_session);
+    if let Some(path) = std::env::var_os(RESULT_SNAPSHOT_FILE_ENV) {
+        fs::write(&path, result_snapshot.handle.as_str()).map_err(|e| {
+            PillboxError::runtime(
+                "run --vault-stdin",
+                format!("write {}: {e}", PathBuf::from(path).display()),
+            )
+        })?;
+    }
+    eprintln!(
+        "pillbox: result snapshot {}",
+        result_snapshot.handle.short()
+    );
     if !status.success() {
         return Err(PillboxError::runtime(
             "run --vault-stdin",
@@ -505,10 +630,58 @@ pub(crate) fn dispatch_vault_stdin(resolved: &Pillbox) -> Result<()> {
     Ok(())
 }
 
+struct RemoteWorkspace {
+    _tempdir: tempfile::TempDir,
+    workspace_dir: PathBuf,
+    backend: RusticBackend,
+}
+
+fn hydrate_remote_workspace(workspace: &InlineWorkspace) -> Result<RemoteWorkspace> {
+    let tempdir = tempfile::Builder::new()
+        .prefix("pillbox-remote-workspace-")
+        .tempdir()
+        .map_err(|e| PillboxError::runtime("run --vault-stdin", format!("create tempdir: {e}")))?;
+    let password_file = tempdir.path().join(PASSWORD_FILE);
+    let mut password = workspace.repo_password.clone();
+    password.push('\n');
+    crate::paths::write_private_file(&password_file, password.as_bytes())?;
+    let workspace_dir = tempdir.path().join("workspace");
+    fs::create_dir_all(&workspace_dir)
+        .with_context(|| format!("create {}", workspace_dir.display()))?;
+    let backend = RusticBackend {
+        variant: RusticVariant::S3(workspace.s3.clone()),
+        password_file,
+    };
+    if let Some(base) = workspace.base_snapshot.as_deref() {
+        let handle = SnapshotHandle::new(base.to_string());
+        backend.pull(&workspace_dir, Some(&handle))?;
+    }
+    Ok(RemoteWorkspace {
+        _tempdir: tempdir,
+        workspace_dir,
+        backend,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::vault::HeaderScheme;
+
+    fn test_workspace() -> InlineWorkspace {
+        InlineWorkspace {
+            s3: S3Config {
+                endpoint: "https://r2.example".into(),
+                region: "auto".into(),
+                bucket: "bucket".into(),
+                prefix: "pillbox/".into(),
+                access_key: "access".into(),
+                secret_key: "secret".into(),
+            },
+            repo_password: "repo-password".into(),
+            base_snapshot: Some("a".repeat(64)),
+        }
+    }
 
     #[test]
     fn blob_round_trips_through_json() {
@@ -539,6 +712,7 @@ mod tests {
             env: [("LOG_LEVEL".to_string(), "debug".to_string())]
                 .into_iter()
                 .collect(),
+            workspace: test_workspace(),
         };
         let bytes = blob.to_bytes().unwrap();
         let back = VaultStdinBlob::from_bytes(&bytes).unwrap();
@@ -551,6 +725,11 @@ mod tests {
         assert!(back.secrets[0].vault_meta.is_none());
         assert!(back.secrets[1].vault_meta.is_some());
         assert_eq!(back.env.get("LOG_LEVEL").map(String::as_str), Some("debug"));
+        assert_eq!(back.workspace.s3.bucket, "bucket");
+        assert_eq!(
+            back.workspace.base_snapshot.as_deref().map(str::len),
+            Some(64)
+        );
     }
 
     #[test]
@@ -564,13 +743,14 @@ mod tests {
         // Forward compatibility: a newer pillbox writing extra fields
         // shouldn't break older deserialize paths.
         let raw = serde_json::json!({
-            "version": 1,
+            "version": BLOB_VERSION,
             "agent_id": "claude",
             "agent_args": [],
             "workspace_mount_name": "x",
             "vault": false,
             "secrets": [],
             "env": {},
+            "workspace": test_workspace(),
             "future_field": {"nested": true},
         });
         let bytes = serde_json::to_vec(&raw).unwrap();
@@ -584,9 +764,10 @@ mod tests {
         // deserialize cleanly so trivial agent runs don't need to write
         // empty arrays/objects.
         let raw = serde_json::json!({
-            "version": 1,
+            "version": BLOB_VERSION,
             "agent_id": "codex",
             "workspace_mount_name": "p",
+            "workspace": test_workspace(),
         });
         let bytes = serde_json::to_vec(&raw).unwrap();
         let back = VaultStdinBlob::from_bytes(&bytes).unwrap();

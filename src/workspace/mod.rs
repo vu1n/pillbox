@@ -138,17 +138,3 @@ pub(crate) trait WorkspaceBackend {
     /// the prior key. Subsequent operations use the new password.
     fn rekey(&self) -> Result<()>;
 }
-
-/// Best-effort latest-snapshot lookup. Used by session-fork machinery
-/// (`Session.base_snapshot` capture, future `--from-fork` resolution)
-/// to record what state an agent forked off from.
-///
-/// Returns `None` for any failure mode — fresh pillbox with no
-/// snapshots, workspace-backend config missing, IO error, etc. The
-/// caller treats a missing base as "we don't know"; doesn't gate the
-/// agent run on it.
-pub(crate) fn latest_snapshot_handle(pb: &crate::pillbox::Pillbox) -> Option<String> {
-    let backend = pb.workspace().ok()?;
-    let mut snaps = backend.snapshots().ok()?;
-    snaps.pop().map(|s| s.handle.as_str().to_string())
-}

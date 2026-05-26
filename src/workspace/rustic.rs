@@ -19,7 +19,7 @@
 //! Cohesion wins.
 
 use std::{
-    fs,
+    fmt, fs,
     path::{Path, PathBuf},
 };
 
@@ -31,6 +31,7 @@ use rustic_core::{
     LocalDestination, LsOptions, PathList, Repository, RepositoryOptions, RestoreOptions,
     SnapshotOptions,
 };
+use serde::{Deserialize, Serialize};
 
 use super::{git_inflow, PushOptions, Snapshot, SnapshotHandle, WorkspaceBackend};
 use crate::errors::PillboxError;
@@ -59,17 +60,37 @@ pub(crate) enum RusticVariant {
     /// Rustic repository in an S3-compatible bucket. `endpoint` is
     /// required so the same code path covers R2 / MinIO / Backblaze
     /// via opendal's S3 driver.
-    S3 {
-        endpoint: String,
-        region: String,
-        bucket: String,
-        prefix: String,
-        /// Resolved access key value (NOT the env var name) — the
-        /// caller is responsible for reading the env var when
-        /// constructing this struct.
-        access_key: String,
-        secret_key: String,
-    },
+    S3(S3Config),
+}
+
+/// S3-compatible repository coordinates + resolved credentials.
+///
+/// `Serialize`/`Deserialize` so it can travel verbatim in the remote
+/// run protocol blob (see `InlineWorkspace`); the same struct is the
+/// repo config for the local backend, so no field shuffling is needed
+/// across the boundary. `access_key`/`secret_key` are resolved values
+/// (NOT env var names) — `Debug` redacts them.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct S3Config {
+    pub(crate) endpoint: String,
+    pub(crate) region: String,
+    pub(crate) bucket: String,
+    pub(crate) prefix: String,
+    pub(crate) access_key: String,
+    pub(crate) secret_key: String,
+}
+
+impl fmt::Debug for S3Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("S3Config")
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("bucket", &self.bucket)
+            .field("prefix", &self.prefix)
+            .field("access_key", &"<redacted>")
+            .field("secret_key", &"<redacted>")
+            .finish()
+    }
 }
 
 /// The configured backend for a single pillbox. Holds the variant + the
@@ -163,25 +184,18 @@ impl RusticBackend {
                 opts.to_backends()
                     .map_err(|e| rustic_err("workspace backend", e).into())
             }
-            RusticVariant::S3 {
-                endpoint,
-                region,
-                bucket,
-                prefix,
-                access_key,
-                secret_key,
-            } => {
+            RusticVariant::S3(cfg) => {
                 // opendal's S3 driver wants flat key/value options; the
                 // repository URL is `opendal:s3` (type=opendal, path=s3).
                 let mut options = std::collections::BTreeMap::new();
-                options.insert("endpoint".into(), endpoint.clone());
-                options.insert("region".into(), region.clone());
-                options.insert("bucket".into(), bucket.clone());
-                if !prefix.is_empty() {
-                    options.insert("root".into(), normalize_prefix(prefix));
+                options.insert("endpoint".into(), cfg.endpoint.clone());
+                options.insert("region".into(), cfg.region.clone());
+                options.insert("bucket".into(), cfg.bucket.clone());
+                if !cfg.prefix.is_empty() {
+                    options.insert("root".into(), normalize_prefix(&cfg.prefix));
                 }
-                options.insert("access_key_id".into(), access_key.clone());
-                options.insert("secret_access_key".into(), secret_key.clone());
+                options.insert("access_key_id".into(), cfg.access_key.clone());
+                options.insert("secret_access_key".into(), cfg.secret_key.clone());
                 let opts = BackendOptions::default()
                     .repository("opendal:s3".to_string())
                     .options(options);
@@ -308,7 +322,12 @@ impl WorkspaceBackend for RusticBackend {
             .to_snapshot()
             .map_err(|e| rustic_err("workspace push", e))?;
 
-        let backup_opts = BackupOptions::default();
+        let mut backup_opts = BackupOptions::default();
+        // Store the workspace as a relative tree instead of baking the
+        // host's absolute cwd into the snapshot. Older snapshots may still
+        // carry absolute paths, but new pushes can be restored directly into
+        // a remote mount directory without creating `/tmp/...` prefixes.
+        backup_opts.as_path = Some(PathBuf::from("."));
         let snap = repo
             .backup(&backup_opts, &source, snap)
             .map_err(|e| rustic_err("workspace push", e))?;
@@ -321,12 +340,22 @@ impl WorkspaceBackend for RusticBackend {
         // to indexed for the restore. Going via `resolve_snapshot`
         // would open a second time and pay scrypt twice.
         let open = self.open()?;
-        let snap_spec = match snapshot {
-            Some(h) => resolve_in(&open, h)?.id.to_hex().as_str().to_string(),
-            // `latest` is rustic's reserved alias; `node_from_snapshot_path`
-            // handles it for us.
-            None => "latest".to_string(),
+        let snap = match snapshot {
+            Some(h) => resolve_in(&open, h)?,
+            None => {
+                let mut snaps = open
+                    .get_all_snapshots()
+                    .map_err(|e| rustic_err("workspace pull", e))?;
+                snaps.sort_by(|a, b| a.time.cmp(&b.time));
+                snaps.pop().ok_or_else(|| {
+                    PillboxError::runtime(
+                        "workspace pull",
+                        "no snapshots exist yet; run `pillbox push` first",
+                    )
+                })?
+            }
         };
+        let snap_spec = restore_spec_for_snapshot(&snap);
         let repo = open
             .to_indexed()
             .map_err(|e| rustic_err("workspace pull", e))?;
@@ -408,6 +437,18 @@ impl WorkspaceBackend for RusticBackend {
 }
 
 // ── helpers ────────────────────────────────────────────────────────────────
+
+fn restore_spec_for_snapshot(snap: &SnapshotFile) -> String {
+    let id = snap.id.to_hex().as_str().to_string();
+    let Some(path) = snap.paths.iter().next() else {
+        return id;
+    };
+    if path == "." || path == "/" || path.is_empty() {
+        id
+    } else {
+        format!("{id}:{path}")
+    }
+}
 
 /// Borrow `cwd` as a UTF-8 string for rustic's `PathList` /
 /// `LocalDestination` APIs (both want `&str`). On non-UTF-8 cwd —

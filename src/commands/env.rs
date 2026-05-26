@@ -3,9 +3,9 @@
 
 use anyhow::Result;
 
+use crate::cli::EnvAction;
 use crate::envs;
 use crate::pillbox::Pillbox;
-use crate::EnvAction;
 use crate::WriteScope;
 
 pub(crate) fn dispatch(resolved: &Pillbox, action: EnvAction) -> Result<()> {

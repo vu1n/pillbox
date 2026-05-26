@@ -249,6 +249,13 @@ pillbox pull
 # Restore a specific snapshot by handle prefix.
 pillbox pull --snapshot abcd
 
+# Bookmark a snapshot and restore from the bookmark later.
+pillbox bookmark set main latest
+pillbox pull --bookmark main
+
+# Start a remote run from a bookmark instead of snapshotting cwd first.
+pillbox run --remote cloud --from-bookmark main
+
 # Rotate the encryption password (old key still works until upstream
 # lands deletion — treat as compromised).
 pillbox workspace rekey

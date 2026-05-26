@@ -4,9 +4,10 @@
 
 use anyhow::Result;
 
+use crate::cli::VaultAction;
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
-use crate::{paths, vault, VaultAction};
+use crate::{paths, vault};
 
 pub(crate) fn dispatch(resolved: &Pillbox, action: VaultAction) -> Result<()> {
     match action {

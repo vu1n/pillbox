@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::{BackendKind, WorkspaceConfig};
 use crate::errors::PillboxError;
 use crate::paths::{detect_legacy_subdirs, ensure_mode_0700, pillbox_root, write_private_file};
-use crate::workspace::rustic::{RusticBackend, RusticVariant, PASSWORD_FILE, REPO_DIR};
+use crate::workspace::rustic::{RusticBackend, RusticVariant, S3Config, PASSWORD_FILE, REPO_DIR};
 use crate::workspace::WorkspaceBackend;
 
 /// The descriptor file that marks a directory as a project pillbox.
@@ -179,14 +179,14 @@ impl Pillbox {
                 let secret_key_env = require_field(w.secret_key_env.as_deref(), "secret_key_env")?;
                 let access_key = read_env_or_err(&access_key_env)?;
                 let secret_key = read_env_or_err(&secret_key_env)?;
-                RusticVariant::S3 {
+                RusticVariant::S3(S3Config {
                     endpoint,
                     region,
                     bucket,
                     prefix,
                     access_key,
                     secret_key,
-                }
+                })
             }
         };
         Ok(RusticBackend {

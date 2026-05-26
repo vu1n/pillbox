@@ -36,9 +36,16 @@ so the sandbox can reach it).
 
 ```
 --mcp NAME=URL                  Repeatable. Adds a shared MCP server.
-                                NAME: identifier shown to the agent.
+                                NAME: identifier shown to the agent
+                                      ([A-Za-z][A-Za-z0-9_-]*).
                                 URL: must be HTTP/HTTPS. host.docker.internal
                                 is substituted for localhost/127.0.0.1.
+
+--mcp-token NAME=SECRET_NAME    Repeatable. Attaches a bearer token to a
+                                --mcp NAME=URL. SECRET_NAME refers to a
+                                value stored via `pillbox secret add`.
+                                Token values never appear in argv or
+                                shell history; see "Token handling" below.
 ```
 
 Combinations:
@@ -66,10 +73,12 @@ For each `--mcp NAME=URL`:
 
 Per-agent details:
 
-| Agent  | Mechanism                                              | Notes                                                                                          |
+| Agent  | URL mechanism                                          | Token mechanism (`--mcp-token`)                                                                |
 |--------|--------------------------------------------------------|------------------------------------------------------------------------------------------------|
-| Claude | tempfile + `--mcp-config /etc/pillbox/mcp.json`        | Additive with persistent config. Use `--strict-mcp-config` later if reproducibility demands it. |
-| Codex  | `-c mcp_servers.NAME.url="URL"` per attachment        | No tempfile, no mount — codex's `-c` flag merges into `~/.codex/config.toml` at runtime, highest precedence. URL never lands on disk. |
+| Claude | tempfile + `--mcp-config /etc/pillbox/mcp.json`        | Folded into the same 0600 tempfile JSON as `headers.Authorization: "Bearer <value>"`.          |
+| Codex  | `-c mcp_servers.NAME.url="URL"` per attachment        | Env-var indirection: `PILLBOX_MCP_TOKEN_<NAME>=<value>` set via `-e`, referenced via `-c mcp_servers.NAME.bearer_token_env_var=…`. Token value never lands in argv. |
+
+The codex path uses env-var indirection (vs inline `http_headers.Authorization` in argv) so `ps` on the host can't see the token. Symmetric with Claude's "token-in-0600-tempfile, not-in-argv" stance.
 
 The injection contract lives in the agent adapter (`src/agents/`),
 not in shared run code — each agent has different per-run config
@@ -135,11 +144,34 @@ attachment. Mitigations are operational, not technical:
   pretend to add a security layer it cannot enforce on a process
   it didn't start.
 
+## Token handling
+
+`--mcp-token NAME=SECRET_NAME` sources the value from the same
+secret store as `--with`. Tokens are designed to stay off the host
+process listing:
+
+- **Claude**: token folded into the 0600 tempfile JSON
+  (`headers.Authorization: "Bearer <value>"`). Argv is token-free.
+- **Codex**: token lands in the container env as
+  `PILLBOX_MCP_TOKEN_<NAME>=<value>` (set via docker `-e`). The
+  argv carries only the env var *name* via
+  `-c mcp_servers.NAME.bearer_token_env_var=…`.
+
+Codex's NAME → env var transform is uppercase + `-`→`_`:
+`code-search` → `PILLBOX_MCP_TOKEN_CODE_SEARCH`. The resolver
+detects and rejects collisions (e.g. `code-search` and
+`code_search` collapsing to the same env var) with a clear error.
+
+If `--mcp-token` is passed without a matching `--mcp NAME=URL`,
+or the referenced secret is missing, pillbox errors at the CLI
+boundary before launching the sandbox.
+
 ## v0 scope
 
 - HTTP-transport MCP only
 - Both agents wired: Claude (file-based) + Codex (`-c` flag)
 - `--mcp NAME=URL` flag, repeatable. NAME is `[A-Za-z][A-Za-z0-9_-]*`
+- `--mcp-token NAME=SECRET_NAME` for bearer auth, secret-store sourced
 - `localhost` / `127.0.0.0/8` / `::1` / `*.localhost` → `host.docker.internal`
 - Additive with persistent agent config (no `--strict-mcp-config`)
 - `--mcp` + `--remote` rejected with a helpful error
@@ -147,13 +179,10 @@ attachment. Mitigations are operational, not technical:
 
 ## Not v0
 
-- Per-attachment bearer tokens (mem0 OpenMemory local doesn't
-  need them; add when a real consumer does). Codex's
-  `bearer_token_env_var` field lines up with a future
-  `--mcp-token NAME=SECRET_NAME` flow via the existing `--with`
-  machinery.
 - `--strict-mcp-config` mode for Claude reproducibility
 - `--remote` support (remote-side attachment + URL reachability
   is its own design)
 - Stdio MCP (escape hatch: provider author ships an HTTP wrapper)
 - Auto-discovery / persistent `pillbox.toml` MCP declarations
+- Vault stub-swap for `--mcp-token` (third-party MCP tokens
+  aren't worth proxying through the Anthropic-shaped vault)

@@ -108,7 +108,7 @@ to bypass discovery and operate on a specific named pillbox.
 | Command | What it does |
 |---|---|
 | `pillbox run [opts] [-- args]` | Launch the agent against the current pillbox (local Docker by default). |
-| `pillbox run --remote NAME` | Launch on a registered remote VPS (`ssh://`) or E2B sandbox (`e2b://`). |
+| `pillbox run --remote NAME [--from-bookmark B]` | Launch on a registered remote VPS (`ssh://`) or E2B sandbox (`e2b://`). |
 | `pillbox run --remote NAME --detach [--label TEXT]` | Start the session in the background; print the reattach id. |
 | `pillbox remote add NAME URL [--agent A]` | Register a remote — `ssh://user@host[:port]` or `e2b://TEMPLATE_ID`. |
 | `pillbox remote list/info/rm` | Manage the remote registry. |
@@ -133,8 +133,9 @@ to bypass discovery and operate on a specific named pillbox.
 | Command | What it does |
 |---|---|
 | `pillbox push [--tag T] [--message M] [--json]` | Snapshot cwd into the pillbox's rustic repository. |
-| `pillbox pull [--snapshot HANDLE]` | Restore cwd from a snapshot (defaults to latest). |
+| `pillbox pull [--snapshot HANDLE \| --bookmark NAME]` | Restore cwd from a snapshot or bookmark (defaults to latest). |
 | `pillbox snapshot list/show/rm` | Manage snapshots in the pillbox's repo. |
+| `pillbox bookmark list/show/set/rm` | Manage named bookmarks that point at snapshots. |
 | `pillbox workspace rekey` | Rotate the rustic repo encryption password. |
 
 ### Other
@@ -186,14 +187,16 @@ pillbox session rm abc123def456         # kill sandbox + remove record
 
 **Workspace handoff:** remote runs require an S3-shaped workspace
 backend in v0.6 — the local pillbox and the remote share the same
-bucket / endpoint. Local-rustic transport over the wire is a planned
-PR 4.1.
+bucket / endpoint. The launch path snapshots cwd as the remote base
+unless `--from-bookmark` is passed; the remote hydrates that snapshot
+before the agent starts and pushes a result snapshot after it exits.
+Local-rustic transport over the wire is a planned PR 4.1.
 
 **Vault handoff:** real secret values cross the network once, over
 the encrypted channel (SSH stdin or the E2B Files API), into the
 remote pillbox's vault session memory. The blob is never written to
-disk on either side (E2B stages to sandbox `/tmp` and unlinks
-immediately after the in-sandbox pillbox reads it).
+disk on the SSH path; E2B stages it through 0600 temp files locally
+and in sandbox `/tmp`, then unlinks after the in-sandbox pillbox reads it.
 
 **SSH vs E2B parity:** v0.6 PR 6 ships sessions for E2B only (E2B's
 `sandbox.pty.connect` is the clean reattach primitive). SSH session

@@ -431,20 +431,16 @@ async function runAttach(args) {
 	const parentExport = args.parentSessionId
 		? `export PILLBOX_PARENT_SESSION_ID=${shellEscape(args.parentSessionId)}; `
 		: "";
-	// After the agent exits, snapshot the modified workspace into the
-	// shared rustic repo (`pillbox push --tag session-<id> --json`) and
-	// extract the snapshot handle from the JSON output. The handle gets
-	// passed to `pillbox session done --result-snapshot HANDLE` so the
-	// host record can be updated by an orchestrator (or by a manual
-	// `session done` invocation on the host).
+	// `pillbox run --vault-stdin` owns remote workspace hydration and the
+	// post-agent rustic push. It writes the result handle to this sandbox
+	// file when `PILLBOX_RESULT_SNAPSHOT_FILE` is set. The wrapper reads it
+	// after the command exits and forwards it to `session done`.
+	const resultRemote = `/tmp/pillbox-result-${args.sessionId}.txt`;
 	//
-	// `jq -r .snapshot.handle` is the canonical extraction — pillbox's
-	// own `--json` output keeps that shape stable. `2>/dev/null` on the
-	// push hides the human banner (we already have JSON); if push or
-	// jq fail, `RESULT_SNAPSHOT` stays empty and `--result-snapshot`
-	// is dropped from the `session done` call (the if-non-empty guard
-	// at the bottom of the line). That keeps the failure path clean —
-	// terminal event still fires, just without a result_snapshot.
+	// If hydration, push, or result-file writing fails, `RESULT_SNAPSHOT`
+	// stays empty and `--result-snapshot` is dropped from the
+	// `session done` call. The terminal event still fires with the agent
+	// exit code.
 	// PILLBOX_SANDBOX_SIDE flips the emitter detection so events
 	// render with `emitter=sandbox`. Set once at the top so every
 	// pillbox call below picks it up. See SANDBOX_SIDE_ENV docs in
@@ -468,16 +464,18 @@ async function runAttach(args) {
 		`export PILLBOX_SESSION_STARTED_AT="$(date -u -Iseconds 2>/dev/null)"; ` +
 		`${webhookExport}` +
 		`${parentExport}` +
+		`export PILLBOX_RESULT_SNAPSHOT_FILE=${shellEscape(resultRemote)}; ` +
+		`rm -f ${shellEscape(resultRemote)}; ` +
 		`pillbox session started ${sessionIdEsc}; ` +
 		`pillbox run --vault-stdin < ${shellEscape(blobRemote)}; ` +
 		`PB_EXIT=$?; ` +
-		`RESULT_SNAPSHOT=$(pillbox push --tag ${shellEscape(`session-${args.sessionId}`)} --message ${shellEscape(`agent result for session ${args.sessionId}`)} --json 2>/dev/null | jq -r '.snapshot.handle // empty' 2>/dev/null); ` +
+		`RESULT_SNAPSHOT=$(cat ${shellEscape(resultRemote)} 2>/dev/null || true); ` +
 		`pillbox session done ${sessionIdEsc} ` +
 		`--status "$([ $PB_EXIT = 0 ] && echo ok || echo failed)" ` +
 		`--exit-code "$PB_EXIT" ` +
 		`--reason "$([ $PB_EXIT = 0 ] && echo agent-completed || echo "agent exited $PB_EXIT")" ` +
 		`$([ -n "$RESULT_SNAPSHOT" ] && echo --result-snapshot "$RESULT_SNAPSHOT"); ` +
-		`rm -f ${shellEscape(blobRemote)}\n`;
+		`rm -f ${shellEscape(blobRemote)} ${shellEscape(resultRemote)}\n`;
 	try {
 		await sandbox.pty.sendInput(pid, Buffer.from(launch));
 	} catch (e) {

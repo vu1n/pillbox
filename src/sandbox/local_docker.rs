@@ -13,6 +13,7 @@ use crate::agents::{
     RunOpts, GUEST_HOME, GUEST_WORKSPACE,
 };
 use crate::pillbox::Pillbox;
+use crate::workspace::WorkspaceBackend;
 use crate::{docker, errors::PillboxError};
 
 pub(crate) struct LocalDocker;
@@ -35,6 +36,10 @@ impl SandboxBackend for LocalDocker {
             Some(p) => p.clone(),
             None => std::env::current_dir().context("resolve current working directory")?,
         };
+        if let Some(name) = opts.from_bookmark.as_deref() {
+            let handle = crate::bookmarks::resolve_existing(resolved, name)?;
+            resolved.workspace()?.pull(&workspace_host, Some(&handle))?;
+        }
         let workspace_name = workspace_mount_name(&workspace_host, opts.name.as_deref())?;
         let guest_workspace = format!("{GUEST_WORKSPACE}/{workspace_name}");
 
@@ -68,6 +73,13 @@ impl SandboxBackend for LocalDocker {
         // tail of an if-let in the args build) so the tempfile
         // inside `McpInjection` lives until docker exits.
         let mcp = if opts.mcps.is_empty() {
+            if !opts.mcp_tokens.is_empty() {
+                return Err(PillboxError::usage(
+                    "run",
+                    "--mcp-token requires at least one --mcp NAME=URL",
+                )
+                .into());
+            }
             None
         } else {
             let inject = spec.mcp_inject.ok_or_else(|| {
@@ -76,7 +88,9 @@ impl SandboxBackend for LocalDocker {
                     format!("--mcp is not supported for agent `{}`", spec.id),
                 )
             })?;
-            Some(inject(&opts.mcps)?)
+            let resolved_mcps =
+                crate::agents::mcp::resolve_tokens(resolved, opts.mcps.clone(), &opts.mcp_tokens)?;
+            Some(inject(&resolved_mcps)?)
         };
 
         let mut args = base_docker_args();
@@ -99,6 +113,12 @@ impl SandboxBackend for LocalDocker {
         for (k, v) in &env_vars {
             args.push("-e".into());
             args.push(format!("{k}={v}"));
+        }
+        if let Some(mcp) = &mcp {
+            for (k, v) in &mcp.env_vars {
+                args.push("-e".into());
+                args.push(format!("{k}={v}"));
+            }
         }
         if let Some(session) = &vault_session {
             args.extend(session.docker_extras(GUEST_HOME));

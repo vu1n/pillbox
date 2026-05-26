@@ -4,9 +4,10 @@
 
 use anyhow::Result;
 
+use crate::cli::AuthAction;
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
-use crate::{agents, paths, AuthAction};
+use crate::{agents, paths};
 
 pub(crate) fn dispatch(resolved: &Pillbox, action: AuthAction) -> Result<()> {
     match action {

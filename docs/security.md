@@ -140,12 +140,14 @@ the security-relevant pieces:
 
 ### What crosses the wire
 
-Real secret values cross the network **once**, at session start, as
-a versioned JSON blob:
+Real secret values, S3/R2 workspace credentials, and the rustic repo
+password cross the network **once**, at session start, as a versioned
+JSON blob:
 
 - **ssh://** — blob piped over `ssh`'s stdin (encrypted channel) to
-  `pillbox run --vault-stdin` on the remote. Never on disk on
-  either side.
+  `pillbox run --vault-stdin` on the remote. The blob itself is not
+  persisted; the remote writes the repo password to a 0600 temp file
+  for the duration of workspace hydration/result push.
 - **e2b://** — blob staged to a 0600 tempfile locally (atomic
   `O_EXCL` via `tempfile::Builder`, unlinked on exit), then
   uploaded into the sandbox's `/tmp` via the E2B Files API and
@@ -158,8 +160,8 @@ The blob schema is versioned and forward-compat: unknown JSON keys
 within a known version are tolerated, but a `version` mismatch
 fails the parse loudly so a newer client paired with an older
 remote can't silently drop required fields. `Debug` is implemented
-by hand on `VaultStdinBlob` and `InlineSecret` so a stray `dbg!` /
-`tracing::debug!(?blob)` never prints secret values.
+by hand on `VaultStdinBlob`, `InlineSecret`, and `InlineWorkspace` so
+a stray `dbg!` / `tracing::debug!(?blob)` never prints secret values.
 
 ### Helper subprocess (E2B)
 

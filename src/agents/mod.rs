@@ -85,7 +85,31 @@ pub const OPENCODE: AgentSpec = AgentSpec {
     mcp_inject: Some(mcp::opencode_inject),
 };
 
-pub const ALL: &[&AgentSpec] = &[&CLAUDE, &CODEX, &OPENCODE];
+pub const PI: AgentSpec = AgentSpec {
+    id: "pi",
+    // pi (npm `@earendil-works/pi-coding-agent`) stores provider credentials —
+    // OAuth tokens or API keys saved via `/login` — at `~/.pi/agent/auth.json`
+    // (config dir `~/.pi`, agent subdir `agent`). Verified against pi 0.75.5.
+    cred_sentinel: ".pi/agent/auth.json",
+    // pi has no headless `login` subcommand; authentication is the interactive
+    // `/login` slash command inside the TUI. Launching bare `pi` boots that TUI
+    // in the sandbox so the user can run `/login` (the login path execs this
+    // with a PTY, same as the other agents). The anthropic OAuth flow listens
+    // on 127.0.0.1:53692 for its callback (verified in pi-ai's oauth module).
+    login_argv: &["pi"],
+    run_argv: &["pi"],
+    oauth_port: Some(53692),
+    post_login_finalize: None,
+    // Not wired into the vault stub-swap proxy (no custom-CA / proxy routing
+    // integration yet) — mirrors opencode. `--vault` and vaulted secrets are
+    // rejected for pi until that lands.
+    vault_capable: false,
+    // No `--mcp` config injection for pi yet; the sandbox backend hard-errors
+    // if `--mcp` is passed with `--agent pi`.
+    mcp_inject: None,
+};
+
+pub const ALL: &[&AgentSpec] = &[&CLAUDE, &CODEX, &OPENCODE, &PI];
 
 /// Look up an agent spec by id, or return a usage error listing the
 /// known ids. Centralized so every CLI surface that takes an

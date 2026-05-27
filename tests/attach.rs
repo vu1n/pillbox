@@ -256,11 +256,15 @@ fn ssh_transport_propagates_output_and_exit_code() {
     }
 
     // Launch the pty-host detached so it survives this ssh exec closing.
-    // The agent prints a marker, then `pwd`-free here (no docker), sleeps,
-    // and exits 7 so we can assert exit-code propagation.
+    // The agent prints a marker, sleeps, then exits 7 so we can assert
+    // exit-code propagation. The sleep must outlast the *relay's* ssh
+    // connection latency (a fresh ssh handshake to a real host is often
+    // 2-3s) — otherwise the agent exits and the host tears down before
+    // the relay connects, and we'd see zero frames. (docker exec is
+    // instant, so the docker test gets away with a short sleep; ssh isn't.)
     let launch = format!(
         "setsid {pb} pty-host --sock '{sock}' -- \
-         bash -c \"printf 'PILLBOXPHASE2OK\\n'; sleep 1; exit 7\" \
+         bash -c \"printf 'PILLBOXPHASE2OK\\n'; sleep 8; exit 7\" \
          </dev/null >/tmp/pb-ssh-it-host.log 2>&1 &",
         pb = remote_pillbox,
         sock = sock,

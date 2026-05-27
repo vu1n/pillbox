@@ -28,21 +28,30 @@
 //!    keystroke channel.
 //! 5. Launch the remote pty-host detached so it outlives the launch ssh
 //!    session ([`launch_pty_host`]): `setsid pillbox pty-host --sock S --
-//!    pillbox run --vault-stdin --blob-file B`.
+//!    bash -lc <wrapper>`, where `<wrapper>` brackets `pillbox run
+//!    --vault-stdin --blob-file B` with `session started` / `session
+//!    done`.
 //! 6. Interactive: attach the pump over `pillbox pty-relay` and tear the
 //!    host down on exit. `--detach`: persist a [`Session`] and return.
 //!
 //! ## Flow (remote side)
 //!
-//! The pty-host's child is `pillbox run --vault-stdin`, the **same**
+//! The pty-host's child wraps `pillbox run --vault-stdin` — the **same**
 //! remote entrypoint the e2b backend uses: it reads the blob, provisions
 //! a vault session, restores the base snapshot into an isolated temp
 //! workspace, runs the agent under LocalDocker, and pushes the result
-//! workspace back. Phase 4 reuses this verbatim — vault + workspace
-//! parity comes for free, no ssh-specific re-implementation. The only
-//! difference from the e2b path is `--blob-file` (vs `< blob`): the inner
-//! `docker run -it` needs a TTY on stdin, so the blob is read from a file
-//! and the child's stdin stays the pty-host's PTY.
+//! workspace back. We reuse this verbatim — vault + workspace parity
+//! comes for free, no ssh-specific re-implementation. Two ssh-specific
+//! wrinkles:
+//!   - `--blob-file` (vs e2b's `< blob`): the inner `docker run -it`
+//!     needs a TTY on stdin, so the blob is read from a file and the
+//!     child's stdin stays the pty-host's PTY.
+//!   - The child is a `bash -lc` wrapper ([`build_wrapper`]) that mirrors
+//!     e2b's sandbox-side wrapper — `session started` before the run,
+//!     `session done` (with the captured exit code + result snapshot)
+//!     after — so detached ssh runs emit the same terminal events +
+//!     result-snapshot handle e2b does. Without it, `session pull` and
+//!     the `session.completed`/`failed` webhook had no data to work from.
 //!
 //! ## Vault-stdin blob schema (internal — `pillbox run --vault-stdin`)
 //!
@@ -312,7 +321,7 @@ impl SandboxBackend for RemoteSshSandbox {
         // keystrokes) so it goes over a separate, non-PTY ssh exec —
         // mirroring the e2b backend's "file, not stdin" reasoning.
         stage_blob(&url, &remote, &blob)?;
-        launch_pty_host(&url, &remote, spec)?;
+        launch_pty_host(&url, &remote, spec, &session_id)?;
 
         if opts.detach {
             let s = Session {
@@ -374,14 +383,17 @@ impl SandboxBackend for RemoteSshSandbox {
 }
 
 /// Per-session remote paths. The sock is the addressable handle stored in
-/// the `Session` record (`sandbox_id`); blob + log are derived from the
-/// same id so `kill_session` can scrub them all without persisting three
-/// fields. Kept private and constructed only from a validated session id
-/// (12 ascii-hex chars), so the paths can never carry shell metacharacters.
+/// the `Session` record (`sandbox_id`); blob + log + result are derived
+/// from the same id so `kill_session` can scrub them all without
+/// persisting four fields. Kept private and constructed only from a
+/// validated session id (12 ascii-hex chars), so the paths can never
+/// carry shell metacharacters. `result` is the file the wrapper points
+/// `PILLBOX_RESULT_SNAPSHOT_FILE` at (the result-snapshot round-trip).
 struct RemoteSession {
     sock: String,
     blob: String,
     log: String,
+    result: String,
 }
 
 impl RemoteSession {
@@ -390,29 +402,36 @@ impl RemoteSession {
             sock: format!("/tmp/pillbox-attach-{session_id}.sock"),
             blob: format!("/tmp/pillbox-blob-{session_id}.json"),
             log: format!("/tmp/pillbox-host-{session_id}.log"),
+            result: format!("/tmp/pillbox-result-{session_id}.txt"),
         }
     }
 
     /// Reconstruct from a stored `Session.sandbox_id` (the sock path).
-    /// The blob is already consumed + unlinked by launch time, so only
-    /// the sock + log matter for reattach / kill; derive the log from
-    /// the id embedded in the sock path. Falls back to a sock-derived
-    /// log name if the shape is unexpected (hand-edited record).
+    /// The blob + result are already consumed + unlinked by the wrapper,
+    /// so only the sock + log matter for reattach / kill; derive them
+    /// from the id embedded in the sock path. Falls back to sock-derived
+    /// names if the shape is unexpected (hand-edited record).
     fn from_sock(sock: &str) -> Self {
         let id = sock
             .strip_prefix("/tmp/pillbox-attach-")
             .and_then(|s| s.strip_suffix(".sock"));
-        let (blob, log) = match id {
+        let (blob, log, result) = match id {
             Some(id) => (
                 format!("/tmp/pillbox-blob-{id}.json"),
                 format!("/tmp/pillbox-host-{id}.log"),
+                format!("/tmp/pillbox-result-{id}.txt"),
             ),
-            None => (format!("{sock}.blob"), format!("{sock}.log")),
+            None => (
+                format!("{sock}.blob"),
+                format!("{sock}.log"),
+                format!("{sock}.result"),
+            ),
         };
         Self {
             sock: sock.to_string(),
             blob,
             log,
+            result,
         }
     }
 }
@@ -483,32 +502,160 @@ fn stage_blob(url: &SshUrl, remote: &RemoteSession, blob: &VaultStdinBlob) -> Re
     Ok(())
 }
 
+/// POSIX single-quote escape for one value spliced into a `sh -c` /
+/// `bash -lc` command string. Mirrors `shellEscape` in `e2b-helper.mjs`
+/// (and lum's `e2b-provider.mjs`): close the single quote, emit a
+/// literal `'` as `"'"`, reopen. The result is a single token that any
+/// POSIX shell unquotes back to `value` verbatim — no metacharacter can
+/// escape it.
+///
+/// Used at BOTH shell boundaries of the ssh launch (see
+/// [`launch_pty_host`]): once around values inside the inner wrapper that
+/// `bash -lc` evaluates, and once more around the whole wrapper for the
+/// outer login shell that `ssh dest '<line>'` runs it under. Applying it
+/// consistently at each level is what keeps the nested quoting correct.
+fn sh_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+/// Build the inner wrapper — the script `bash -lc` evaluates on the
+/// remote (a SINGLE shell level). Every interpolated value is
+/// [`sh_quote`]d once for THIS level. Mirrors the e2b helper's `launch`
+/// (minus the PTY-typing `stty`/BOOT_MARKER bits, which are e2b-only:
+/// there the line is *typed into* a PTY, whereas pty-host exec's this
+/// argv directly). The one wire-protocol difference from e2b is
+/// `--blob-file` (vs `< blob`): it keeps the child's stdin the PTY so the
+/// inner `docker run -it` gets a TTY.
+///
+/// `webhook` / `parent` are the host-env values (already filtered to
+/// non-empty); `None` drops the corresponding `export`.
+fn build_wrapper(
+    remote: &RemoteSession,
+    session_id: &str,
+    webhook: Option<&str>,
+    parent: Option<&str>,
+) -> String {
+    let id_q = sh_quote(session_id);
+    let blob_q = sh_quote(&remote.blob);
+    let result_q = sh_quote(&remote.result);
+
+    let webhook_export = match webhook {
+        Some(u) => format!("export PILLBOX_EVENTS_WEBHOOK={}; ", sh_quote(u)),
+        None => String::new(),
+    };
+    let parent_export = match parent {
+        Some(id) => format!("export PILLBOX_PARENT_SESSION_ID={}; ", sh_quote(id)),
+        None => String::new(),
+    };
+
+    format!(
+        "export PILLBOX_SANDBOX_SIDE=1; \
+         export PILLBOX_SESSION_STARTED_AT=\"$(date -u -Iseconds 2>/dev/null)\"; \
+         {webhook_export}{parent_export}\
+         export PILLBOX_RESULT_SNAPSHOT_FILE={result_q}; \
+         rm -f {result_q}; \
+         {pillbox} session started {id_q}; \
+         {pillbox} run --vault-stdin --blob-file {blob_q}; \
+         PB_EXIT=$?; \
+         RESULT_SNAPSHOT=$(cat {result_q} 2>/dev/null || true); \
+         {pillbox} session done {id_q} \
+         --status \"$([ $PB_EXIT = 0 ] && echo ok || echo failed)\" \
+         --exit-code \"$PB_EXIT\" \
+         --reason \"$([ $PB_EXIT = 0 ] && echo agent-completed || echo \"agent exited $PB_EXIT\")\" \
+         $([ -n \"$RESULT_SNAPSHOT\" ] && echo --result-snapshot \"$RESULT_SNAPSHOT\"); \
+         rm -f {blob_q} {result_q}",
+        pillbox = REMOTE_PILLBOX,
+    )
+}
+
+/// Build the full `setsid … pty-host … -- bash -lc <wrapper> … &` launch
+/// line for [`launch_pty_host`]. Pure (no I/O, no env reads) so the
+/// nested quoting is unit-testable without an ssh round-trip — the
+/// reviewer caveat is that this round-trip can't run in the sandbox, so
+/// the quoting correctness is locked in by tests here instead.
+///
+/// The outer launch line is evaluated by the remote login shell that
+/// `ssh dest '<line>'` runs (ONE shell level). The child argv is `bash
+/// -lc <wrapper>`; the whole [`build_wrapper`] result is `sh_quote`d once
+/// MORE for this level — consistent escaping at each boundary, no
+/// hand-nested quotes. Sock + log are `sh_quote`d the same way. `setsid`
+/// + `&` background the host so it outlives the launch ssh session.
+fn build_launch_line(
+    remote: &RemoteSession,
+    session_id: &str,
+    webhook: Option<&str>,
+    parent: Option<&str>,
+) -> String {
+    let wrapper = build_wrapper(remote, session_id, webhook, parent);
+    format!(
+        "setsid {pillbox} pty-host --sock {sock} -- \
+         bash -lc {wrapper} \
+         </dev/null >{log} 2>&1 &",
+        pillbox = REMOTE_PILLBOX,
+        sock = sh_quote(&remote.sock),
+        wrapper = sh_quote(&wrapper),
+        log = sh_quote(&remote.log),
+    )
+}
+
 /// Launch the in-remote pty-host as a persistent background process that
 /// outlives the launch ssh session. `setsid` detaches it from the ssh
 /// controlling terminal so closing the launch connection (or detaching)
 /// doesn't SIGHUP the host; output goes to a per-session log for
-/// post-mortem. The host runs `pillbox run --vault-stdin --blob-file
-/// <blob>` under the PTY — reusing the *entire* existing remote-side flow
-/// (workspace hydrate, vault session, `docker run -it`, result push), so
-/// vault/workspace parity falls out for free.
-fn launch_pty_host(url: &SshUrl, remote: &RemoteSession, spec: &AgentSpec) -> Result<()> {
-    // The child argv for the pty-host: the remote pillbox re-runs itself
-    // in `--vault-stdin` mode against the staged blob. `--blob-file`
-    // keeps the child's stdin as the PTY so the inner `docker run -it`
-    // gets a TTY.
-    //
-    // All interpolated values are pillbox-controlled (a fixed binary
-    // path, a session-id-derived sock/blob path); none come from user
-    // input, so single-quoting is belt-and-suspenders.
-    let launch = format!(
-        "setsid {pillbox} pty-host --sock '{sock}' -- \
-         {pillbox} run --vault-stdin --blob-file '{blob}' \
-         </dev/null >'{log}' 2>&1 &",
-        pillbox = REMOTE_PILLBOX,
-        sock = remote.sock,
-        blob = remote.blob,
-        log = remote.log,
-    );
+/// post-mortem.
+///
+/// The pty-host's child is a `bash -lc` wrapper around `pillbox run
+/// --vault-stdin --blob-file <blob>` (NOT the bare run): it mirrors the
+/// e2b sandbox-side wrapper so detached ssh sessions get the SAME
+/// result-snapshot capture + terminal-event wiring e2b has. The wrapper
+///   1. exports `PILLBOX_SESSION_STARTED_AT` (one `date` read shared by
+///      both `session started` and `session done`, no skew),
+///   2. forwards `PILLBOX_EVENTS_WEBHOOK` + `PILLBOX_PARENT_SESSION_ID`
+///      off the host env (so terminal events reach the orchestrator),
+///   3. sets `PILLBOX_RESULT_SNAPSHOT_FILE` so `dispatch_vault_stdin`
+///      writes the result handle there,
+///   4. `pillbox session started <id>`,
+///   5. runs `pillbox run --vault-stdin --blob-file <blob>` (`--blob-file`
+///      keeps the child's stdin the PTY so the inner `docker run -it`
+///      gets a TTY — the one wire-protocol difference from e2b's `< blob`),
+///   6. captures `$?` + the result handle, then
+///   7. `pillbox session done <id> --status … --exit-code … --reason …
+///      [--result-snapshot …]` so the `session.completed`/`failed`
+///      terminal event fires for every detached run.
+///
+/// `pillbox run --vault-stdin` still owns the full remote flow (workspace
+/// hydrate, vault session, `docker run -it`, result push); the wrapper
+/// only adds the started/done bookends.
+///
+/// ## Quoting (two shell levels — the trap)
+///
+/// The whole `setsid … &` line is evaluated by ONE outer login shell
+/// (`ssh dest '<line>'`). Inside it, `bash -lc <wrapper>` evaluates the
+/// wrapper as a SECOND shell level. So every interpolated value is
+/// [`sh_quote`]d once for the inner wrapper, and the entire wrapper is
+/// `sh_quote`d once more for the outer shell — consistent escaping at
+/// each boundary, no hand-nested quotes. The session id is validated hex
+/// and the sock/blob/log paths derive from it; only the webhook URL +
+/// parent id are user-influenced, and they're escaped like everything
+/// else.
+fn launch_pty_host(
+    url: &SshUrl,
+    remote: &RemoteSession,
+    spec: &AgentSpec,
+    session_id: &str,
+) -> Result<()> {
+    // Forward the events webhook + parent session id off the HOST env —
+    // the same source the e2b backend reads (the `--events-webhook` flag
+    // / `--parent` flag both `set_var` into this process env in main.rs
+    // before the backend runs). Empty / unset → the export is omitted and
+    // the corresponding sink is simply absent. Reading them here keeps
+    // [`build_launch_line`] a pure, unit-testable function.
+    let webhook = std::env::var("PILLBOX_EVENTS_WEBHOOK")
+        .ok()
+        .filter(|u| !u.is_empty());
+    let parent = crate::events::parent_session_id_from_env();
+    let launch = build_launch_line(remote, session_id, webhook.as_deref(), parent.as_deref());
+
     let mut cmd = ssh_base(url);
     cmd.arg(launch);
     cmd.stdin(Stdio::null());
@@ -567,14 +714,17 @@ fn attach_via_ssh(url: &SshUrl, remote: &RemoteSession, detach_enabled: bool) ->
 
 /// Kill the remote pty-host process and scrub its per-session files.
 /// Best-effort: `pkill` matches the unique sock path in the host's argv;
-/// the `rm -f` cleans the sock + log (the blob is already unlinked by the
-/// remote run, but remove it too in case the run never started).
+/// the `rm -f` cleans the sock + log + blob + result (the blob + result
+/// are normally unlinked by the wrapper, but remove them too in case the
+/// run was killed before the wrapper's own cleanup ran).
 fn kill_pty_host(url: &SshUrl, remote: &RemoteSession) -> Result<()> {
     let cmd_line = format!(
-        "pkill -f 'pty-host --sock {sock}' 2>/dev/null; rm -f '{sock}' '{blob}' '{log}'",
+        "pkill -f 'pty-host --sock {sock}' 2>/dev/null; rm -f {sock_q} {blob_q} {log_q} {result_q}",
         sock = remote.sock,
-        blob = remote.blob,
-        log = remote.log,
+        sock_q = sh_quote(&remote.sock),
+        blob_q = sh_quote(&remote.blob),
+        log_q = sh_quote(&remote.log),
+        result_q = sh_quote(&remote.result),
     );
     let mut cmd = ssh_base(url);
     cmd.arg(cmd_line);
@@ -1081,10 +1231,11 @@ mod tests {
         assert_eq!(rs.sock, "/tmp/pillbox-attach-abcdef012345.sock");
         assert_eq!(rs.blob, "/tmp/pillbox-blob-abcdef012345.json");
         assert_eq!(rs.log, "/tmp/pillbox-host-abcdef012345.log");
+        assert_eq!(rs.result, "/tmp/pillbox-result-abcdef012345.txt");
         // No shell metacharacters in any path — they're interpolated into
         // ssh command lines, so this guards against a future id format
         // that could break out of the single quotes.
-        for p in [&rs.sock, &rs.blob, &rs.log] {
+        for p in [&rs.sock, &rs.blob, &rs.log, &rs.result] {
             assert!(
                 p.bytes()
                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.')),
@@ -1103,6 +1254,7 @@ mod tests {
         assert_eq!(recovered.sock, minted.sock);
         assert_eq!(recovered.blob, minted.blob);
         assert_eq!(recovered.log, minted.log);
+        assert_eq!(recovered.result, minted.result);
     }
 
     #[test]
@@ -1114,6 +1266,131 @@ mod tests {
         assert_eq!(rs.sock, "/custom/path.sock");
         assert_eq!(rs.blob, "/custom/path.sock.blob");
         assert_eq!(rs.log, "/custom/path.sock.log");
+        assert_eq!(rs.result, "/custom/path.sock.result");
+    }
+
+    #[test]
+    fn sh_quote_wraps_plain_value() {
+        // A value with no single quotes is just single-quoted whole.
+        assert_eq!(sh_quote("plain-value_1.2"), "'plain-value_1.2'");
+        // Spaces / metacharacters live safely inside the single quotes.
+        assert_eq!(sh_quote("a b; rm -rf /"), "'a b; rm -rf /'");
+    }
+
+    #[test]
+    fn sh_quote_escapes_embedded_single_quote() {
+        // The classic close-quote / literal-quote / reopen idiom: a lone
+        // `'` becomes `'"'"'`. This is what makes a hostile value (e.g. a
+        // hand-edited webhook URL) fail to parse cleanly instead of
+        // breaking out of the quotes and injecting a command.
+        assert_eq!(sh_quote("it's"), r#"'it'"'"'s'"#);
+        assert_eq!(
+            sh_quote("'; touch pwned; '"),
+            r#"''"'"'; touch pwned; '"'"''"#
+        );
+    }
+
+    #[test]
+    fn build_wrapper_has_started_done_and_result_wiring() {
+        // The inner wrapper is what `bash -lc` evaluates — assert on its
+        // (single-shell-level) text directly.
+        let rs = RemoteSession::new("abcdef012345");
+        let w = build_wrapper(&rs, "abcdef012345", None, None);
+        // Pre-minted id is baked into BOTH bookends.
+        assert!(w.contains("session started 'abcdef012345'"));
+        assert!(w.contains("session done 'abcdef012345'"));
+        // Result-snapshot round-trip: file exported, read back, forwarded.
+        assert!(w.contains(
+            "export PILLBOX_RESULT_SNAPSHOT_FILE='/tmp/pillbox-result-abcdef012345.txt'"
+        ));
+        assert!(w.contains("--result-snapshot"));
+        // The inner command is the real run, via --blob-file (NOT < blob)
+        // so the child's stdin stays the PTY for the inner `docker run -it`.
+        assert!(w.contains("run --vault-stdin --blob-file '/tmp/pillbox-blob-abcdef012345.json'"));
+        // Terminal status is derived from the captured exit code.
+        assert!(w.contains("--exit-code \"$PB_EXIT\""));
+        assert!(w.contains("echo ok || echo failed"));
+        // Sandbox-side emitter tag so events render with emitter=sandbox.
+        assert!(w.contains("export PILLBOX_SANDBOX_SIDE=1"));
+        // No webhook / parent exports when neither is set.
+        assert!(!w.contains("PILLBOX_EVENTS_WEBHOOK"));
+        assert!(!w.contains("PILLBOX_PARENT_SESSION_ID"));
+    }
+
+    #[test]
+    fn build_launch_line_wraps_the_child_in_bash() {
+        // The outer line: `bash -lc <quoted-wrapper>`, backgrounded under
+        // setsid. The wrapper is double-quoted (outer level) so its inner
+        // single quotes don't appear verbatim here — only the structure.
+        let rs = RemoteSession::new("abcdef012345");
+        let line = build_launch_line(&rs, "abcdef012345", None, None);
+        assert!(line.contains("setsid"));
+        assert!(line.contains("pty-host --sock '/tmp/pillbox-attach-abcdef012345.sock'"));
+        assert!(line.contains("-- bash -lc "));
+        assert!(line.contains(">'/tmp/pillbox-host-abcdef012345.log'"));
+        assert!(line.trim_end().ends_with('&'));
+    }
+
+    #[test]
+    fn build_wrapper_threads_webhook_and_parent() {
+        let rs = RemoteSession::new("0011aabbccdd");
+        let w = build_wrapper(
+            &rs,
+            "0011aabbccdd",
+            Some("https://hook.example/e"),
+            Some("00112233"),
+        );
+        assert!(w.contains("export PILLBOX_EVENTS_WEBHOOK='https://hook.example/e'"));
+        assert!(w.contains("export PILLBOX_PARENT_SESSION_ID='00112233'"));
+    }
+
+    #[test]
+    fn build_wrapper_quotes_a_hostile_webhook() {
+        // Belt-and-suspenders: the host validates the URL shape, but if a
+        // `'` ever slipped through it must stay quoted inside the wrapper,
+        // not break out into a second command.
+        let rs = RemoteSession::new("0011aabbccdd");
+        let w = build_wrapper(&rs, "0011aabbccdd", Some("h'; rm -rf /; '"), None);
+        // The hostile quote is neutralized via the `'"'"'` idiom — the
+        // literal `rm -rf /` is data, never a standalone command token.
+        assert!(w.contains(r#"export PILLBOX_EVENTS_WEBHOOK='h'"'"'; rm -rf /; '"'"''"#));
+    }
+
+    /// Prove the nested two-level quoting actually unquotes correctly by
+    /// running the real outer + inner shells. We can't do the full ssh
+    /// round-trip in the sandbox, but the quoting is the part that bit a
+    /// prior reviewer; this exercises it end-to-end with `bash`.
+    ///
+    /// We replace the un-runnable bits (`setsid`, the absolute remote
+    /// pillbox path, `pty-host`) — the test only validates that a hostile
+    /// webhook value survives BOTH shell levels as a single literal token
+    /// rather than splitting into an injected command.
+    #[test]
+    fn nested_quoting_round_trips_through_two_real_shells() {
+        let rs = RemoteSession::new("abcdef012345");
+        let hostile = "h'; touch /tmp/pillbox-pwned-$$; '";
+        // Build just the webhook export at the inner level, then wrap the
+        // whole thing in the same outer `bash -lc <sh_quote(wrapper)>`
+        // shape `build_launch_line` produces.
+        let inner = format!(
+            "export PILLBOX_EVENTS_WEBHOOK={}; printf '%s' \"$PILLBOX_EVENTS_WEBHOOK\"",
+            sh_quote(hostile)
+        );
+        let _ = &rs; // RemoteSession constructed to mirror the real call shape.
+        let outer = format!("bash -lc {}", sh_quote(&inner));
+        // Run the OUTER line through a real shell (stand-in for the ssh
+        // remote login shell). If quoting is wrong, the `touch` would run
+        // and/or the echoed value would be truncated.
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&outer)
+            .output()
+            .expect("run nested shell");
+        assert!(out.status.success(), "stderr: {:?}", out.stderr);
+        let echoed = String::from_utf8_lossy(&out.stdout);
+        // The value survives both shell levels verbatim — proof the
+        // hostile `'` was data, not a quote-breakout.
+        assert_eq!(echoed, hostile);
     }
 
     #[test]

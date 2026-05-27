@@ -10,21 +10,60 @@ use std::sync::mpsc;
 use anyhow::{Context, Result};
 
 use crate::errors::PillboxError;
+use crate::pillbox::Pillbox;
 
-/// Published runner image tag. For v0.1 this is the locally-built lum image
-/// (named `pillbox` in this session). v0.2 publishes to GHCR.
-pub const RUNNER_IMAGE: &str = "pillbox:latest";
+/// Built-in default runner image tag. Bumped per CLI release so a
+/// fresh pillbox install picks up a matching pre-published runner.
+/// Override at three levels (highest precedence first):
+///   1. `PILLBOX_RUNNER_IMAGE` env var
+///   2. `[runner] image = "…"` in pillbox.toml
+///   3. this default
+pub const DEFAULT_RUNNER_IMAGE: &str = "ghcr.io/vu1n/pillbox-runner:latest";
 
-/// Confirm Docker is reachable and the runner image is available. One
+/// Env-var override key. Documented so `pillbox doctor` can name it
+/// in its "source" attribution.
+pub const RUNNER_IMAGE_ENV: &str = "PILLBOX_RUNNER_IMAGE";
+
+/// Resolve the runner image without a [`Pillbox`] in hand — env var
+/// or [`DEFAULT_RUNNER_IMAGE`]. Used by surfaces that pre-date or
+/// don't carry pillbox-resolution context (doctor, version banner).
+pub fn default_runner_image() -> String {
+    std::env::var(RUNNER_IMAGE_ENV).unwrap_or_else(|_| DEFAULT_RUNNER_IMAGE.to_string())
+}
+
+/// Resolve the runner image for a specific pillbox: env var wins,
+/// then `pillbox.toml [runner] image`, then the built-in default.
+/// The toml read happens on demand (per `pillbox run`) so editing
+/// `pillbox.toml` takes effect immediately — no meta.json rewrite
+/// dance — and the parse cost is negligible against the docker
+/// spawn that follows.
+pub fn resolve_runner_image(resolved: &Pillbox) -> String {
+    if let Ok(env) = std::env::var(RUNNER_IMAGE_ENV) {
+        return env;
+    }
+    if let crate::pillbox::Scope::Project { source_dir, .. } = &resolved.scope {
+        let toml_path = source_dir.join("pillbox.toml");
+        if let Ok(cfg) = crate::config::Config::load_from(&toml_path) {
+            if let Some(image) = cfg.runner.image {
+                if !image.trim().is_empty() {
+                    return image;
+                }
+            }
+        }
+    }
+    DEFAULT_RUNNER_IMAGE.to_string()
+}
+
+/// Confirm Docker is reachable and `image` is available. One
 /// subprocess call instead of two: `docker image inspect` fails with a
 /// clear "Cannot connect to Docker daemon" message if the daemon is
 /// down, and with a clear "No such image" message if the image is
 /// missing — we just translate each into a more actionable hint.
-pub fn check_ready() -> Result<()> {
+pub fn check_ready(image: &str) -> Result<()> {
     let out = Command::new("docker")
         .arg("image")
         .arg("inspect")
-        .arg(RUNNER_IMAGE)
+        .arg(image)
         .arg("--format")
         .arg("{{.Id}}")
         .output()
@@ -43,11 +82,9 @@ pub fn check_ready() -> Result<()> {
     if stderr.contains("No such image") || stderr.contains("Error response from daemon") {
         return Err(PillboxError::resource(
             "docker pre-flight",
-            format!("runner image `{RUNNER_IMAGE}` not found locally"),
+            format!("runner image `{image}` not found locally"),
         )
-        .with_next(
-            "cd ~/code/lum && bun run build:runtime-image:pillbox  # GHCR publish lands in v0.4",
-        )
+        .with_next(format!("docker pull {image}"))
         .into());
     }
     Err(PillboxError::resource("docker pre-flight", stderr.into_owned()).into())

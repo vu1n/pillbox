@@ -535,7 +535,7 @@ fn run(cli: Cli) -> Result<()> {
             println!(
                 "pillbox {} (runner image: {})",
                 env!("CARGO_PKG_VERSION"),
-                docker::RUNNER_IMAGE
+                docker::default_runner_image()
             );
             Ok(())
         }

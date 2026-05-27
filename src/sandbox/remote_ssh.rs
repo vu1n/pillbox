@@ -537,7 +537,8 @@ pub(crate) fn dispatch_vault_stdin(resolved: &Pillbox) -> Result<()> {
             )
         })?;
 
-    docker::check_ready()?;
+    let runner_image = docker::resolve_runner_image(resolved);
+    docker::check_ready(&runner_image)?;
 
     let home = spec.home_dir(resolved)?;
     if !home.join(spec.cred_sentinel).exists() {
@@ -614,7 +615,7 @@ pub(crate) fn dispatch_vault_stdin(resolved: &Pillbox) -> Result<()> {
             session.ca_cert_path().display()
         );
     }
-    args.push(docker::RUNNER_IMAGE.into());
+    args.push(runner_image);
     args.extend(spec.run_argv.iter().map(|s| s.to_string()));
     args.extend(blob.agent_args.clone());
 

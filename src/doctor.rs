@@ -154,14 +154,14 @@ fn check_docker_daemon() -> Check {
 
 fn check_runner_image() -> Check {
     let name = "runner_image";
+    let image = docker::default_runner_image();
+    let source = if std::env::var(docker::RUNNER_IMAGE_ENV).is_ok() {
+        format!(" [from ${}]", docker::RUNNER_IMAGE_ENV)
+    } else {
+        String::new()
+    };
     match Command::new("docker")
-        .args([
-            "image",
-            "inspect",
-            docker::RUNNER_IMAGE,
-            "--format",
-            "{{.Id}}",
-        ])
+        .args(["image", "inspect", &image, "--format", "{{.Id}}"])
         .output()
     {
         Ok(out) if out.status.success() => {
@@ -171,13 +171,13 @@ fn check_runner_image() -> Check {
                 .chars()
                 .take(12)
                 .collect::<String>();
-            Check::ok(name, format!("{} ({id})", docker::RUNNER_IMAGE))
+            Check::ok(name, format!("{image} ({id}){source}"))
         }
         Ok(_) => Check::fail(
             name,
             format!(
-                "{} not found locally — see pillbox README for image build instructions",
-                docker::RUNNER_IMAGE
+                "{image} not found locally{source} — `docker pull {image}` or set {}",
+                docker::RUNNER_IMAGE_ENV
             ),
         ),
         Err(_) => Check::fail(name, "cannot check — docker CLI unavailable"),

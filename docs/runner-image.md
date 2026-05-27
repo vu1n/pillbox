@@ -21,6 +21,14 @@ Plus the system tooling agents tend to reach for: `bash`,
 `bubblewrap`, `ca-certificates`, `curl`, `gh`, `git`, `jq`,
 `openssl`, `python3`, `ripgrep`, `tmux`, `xz-utils`, Node 22 LTS.
 
+And **`pillbox` itself** at `/usr/local/bin/pillbox`, compiled from the
+repo in a multi-stage build. The in-sandbox pillbox runs the interactive
+attach pty-host (`pillbox pty-host`), the per-attach relay (`pillbox
+pty-relay`), and the event emitter / `session done` wrapper — the same
+in-sandbox role the e2b/ssh backends already rely on. Because the image
+embeds the binary, it is rebuilt when `src/**` or `Cargo.{toml,lock}`
+change, not only on `runner/Dockerfile` edits.
+
 ## Picking which image pillbox uses
 
 Resolution order (highest precedence first):
@@ -46,10 +54,12 @@ Resolution order (highest precedence first):
 ## Build it yourself
 
 ```sh
+# Context is the repo root (the build compiles the in-sandbox pillbox);
+# point -f at the Dockerfile.
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
   -t my-team/pillbox-runner:custom \
-  runner/
+  -f runner/Dockerfile .
 
 PILLBOX_RUNNER_IMAGE=my-team/pillbox-runner:custom pillbox run
 ```
@@ -88,6 +98,10 @@ image, pillbox CLI assumes:
 - `HOME` is set by the caller (pillbox sets `HOME=/home/lum`
   and bind-mounts the agent's persistent auth state there);
   the image doesn't need to pre-create that path.
+- `pillbox` on `$PATH` — the interactive attach transport launches
+  `pillbox pty-host` / `pillbox pty-relay` inside the sandbox. A
+  version skew between host and in-sandbox pillbox is tolerated within
+  a frame `PROTO_VERSION`; layer on the canonical image to stay matched.
 
 ## Harness updates
 

@@ -1,14 +1,22 @@
 name: runner-image
+# The image now compiles the in-sandbox `pillbox` binary (multi-stage
+# build), so it depends on the Rust sources too — rebuild when they change.
 on:
   pull_request:
     paths:
       - runner/Dockerfile
       - .github/workflows/runner-image.yml
+      - 'src/**'
+      - Cargo.toml
+      - Cargo.lock
   push:
     branches: [main]
     paths:
       - runner/Dockerfile
       - .github/workflows/runner-image.yml
+      - 'src/**'
+      - Cargo.toml
+      - Cargo.lock
     tags: ['v*']
 
 permissions:
@@ -58,7 +66,9 @@ jobs:
 
       - uses: docker/build-push-action@v6
         with:
-          context: runner
+          # Context is the repo root: the multi-stage build compiles the
+          # in-sandbox pillbox binary from Cargo.{toml,lock} + src/.
+          context: .
           file: runner/Dockerfile
           platforms: linux/amd64,linux/arm64
           # PRs build to verify the Dockerfile + Renovate bumps still

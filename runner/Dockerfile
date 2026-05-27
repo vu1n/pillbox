@@ -24,7 +24,23 @@
 # To layer your own tools, FROM this image and apt-get / npm-install on top:
 #   FROM ghcr.io/vu1n/pillbox-runner:vX.Y.Z
 #   RUN apt-get update && apt-get install -y my-tool && rm -rf /var/lib/apt/lists/*
+#
+# NOTE: the build context is the REPO ROOT (not runner/), because the
+# pillbox binary is compiled in-image below:
+#   docker buildx build -f runner/Dockerfile .
 
+# ---- build stage: compile the in-sandbox pillbox binary ----------------
+# The runner ships `pillbox` itself: the interactive attach pty-host
+# (`pillbox pty-host`) and the in-sandbox emitter / `session done` wrapper
+# all run *inside* the sandbox, matching what the e2b/ssh backends already
+# assume. Same glibc (bookworm) as the runtime stage below.
+FROM rust:1-bookworm AS pillbox-build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo build --release --locked && cp target/release/pillbox /pillbox
+
+# ---- runtime stage -----------------------------------------------------
 FROM debian:bookworm-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -82,6 +98,9 @@ RUN curl -fsSL https://claude.ai/install.sh -o /tmp/claude-install.sh \
 	&& cp -L /opt/claude-install/.local/bin/claude /usr/local/bin/claude \
 	&& chmod +x /usr/local/bin/claude \
 	&& rm /tmp/claude-install.sh
+
+# The in-sandbox pillbox: pty-host, event emitter, session-done wrapper.
+COPY --from=pillbox-build /pillbox /usr/local/bin/pillbox
 
 WORKDIR /workspace
 

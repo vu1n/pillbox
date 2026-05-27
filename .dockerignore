@@ -1,0 +1,13 @@
+# Build context for runner/Dockerfile is the repo root (it compiles the
+# pillbox binary in-image). Keep the context small: only Cargo.* + src/ are
+# COPYed, but excluding the heavy/irrelevant dirs speeds the context upload
+# and avoids cache busting on unrelated churn.
+target/
+.git/
+.github/
+docs/
+tests/
+runner/
+.claude/
+*.md
+.env*

@@ -24,34 +24,81 @@ pub const DEFAULT_RUNNER_IMAGE: &str = "ghcr.io/vu1n/pillbox-runner:latest";
 /// in its "source" attribution.
 pub const RUNNER_IMAGE_ENV: &str = "PILLBOX_RUNNER_IMAGE";
 
-/// Resolve the runner image without a [`Pillbox`] in hand — env var
-/// or [`DEFAULT_RUNNER_IMAGE`]. Used by surfaces that pre-date or
-/// don't carry pillbox-resolution context (doctor, version banner).
-pub fn default_runner_image() -> String {
-    std::env::var(RUNNER_IMAGE_ENV).unwrap_or_else(|_| DEFAULT_RUNNER_IMAGE.to_string())
+/// Where a resolved runner-image string came from. Surfaced by
+/// `pillbox doctor` so users can tell at a glance whether their
+/// override is being picked up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunnerImageSource {
+    /// `PILLBOX_RUNNER_IMAGE` env var.
+    Env,
+    /// `[runner] image` in the pillbox's `pillbox.toml`.
+    ProjectToml,
+    /// Built-in [`DEFAULT_RUNNER_IMAGE`].
+    Default,
 }
 
-/// Resolve the runner image for a specific pillbox: env var wins,
-/// then `pillbox.toml [runner] image`, then the built-in default.
-/// The toml read happens on demand (per `pillbox run`) so editing
-/// `pillbox.toml` takes effect immediately — no meta.json rewrite
-/// dance — and the parse cost is negligible against the docker
-/// spawn that follows.
-pub fn resolve_runner_image(resolved: &Pillbox) -> String {
+impl RunnerImageSource {
+    /// Short label for human-facing output (e.g. doctor's
+    /// `[from pillbox.toml]` suffix).
+    pub fn human(&self) -> &'static str {
+        match self {
+            Self::Env => "$PILLBOX_RUNNER_IMAGE",
+            Self::ProjectToml => "pillbox.toml",
+            Self::Default => "default",
+        }
+    }
+}
+
+/// Resolve the runner image without a [`Pillbox`] in hand — env var
+/// or [`DEFAULT_RUNNER_IMAGE`]. Used by surfaces that don't carry
+/// pillbox-resolution context (e.g. `pillbox version` banner).
+pub fn default_runner_image() -> String {
+    resolve_env_or_default().0
+}
+
+/// Resolve the runner image for a specific pillbox plus its source.
+/// Precedence: env var > `pillbox.toml [runner] image` > built-in
+/// default. The toml read happens on demand (per `pillbox run`) so
+/// editing `pillbox.toml` takes effect immediately — no meta.json
+/// rewrite dance — and the parse cost is negligible against the
+/// docker spawn that follows.
+///
+/// The toml step is a no-op for the global pillbox (no descriptor
+/// file to read).
+pub fn resolve_runner_image(resolved: &Pillbox) -> (String, RunnerImageSource) {
     if let Ok(env) = std::env::var(RUNNER_IMAGE_ENV) {
-        return env;
+        return (env, RunnerImageSource::Env);
     }
     if let crate::pillbox::Scope::Project { source_dir, .. } = &resolved.scope {
         let toml_path = source_dir.join("pillbox.toml");
         if let Ok(cfg) = crate::config::Config::load_from(&toml_path) {
             if let Some(image) = cfg.runner.image {
                 if !image.trim().is_empty() {
-                    return image;
+                    return (image, RunnerImageSource::ProjectToml);
                 }
             }
         }
     }
-    DEFAULT_RUNNER_IMAGE.to_string()
+    (DEFAULT_RUNNER_IMAGE.to_string(), RunnerImageSource::Default)
+}
+
+/// Shared env-or-default lookup so [`default_runner_image`] and
+/// [`resolve_runner_image`]'s env arm don't drift.
+fn resolve_env_or_default() -> (String, RunnerImageSource) {
+    match std::env::var(RUNNER_IMAGE_ENV) {
+        Ok(v) => (v, RunnerImageSource::Env),
+        Err(_) => (DEFAULT_RUNNER_IMAGE.to_string(), RunnerImageSource::Default),
+    }
+}
+
+/// Resolve + pre-flight the runner image for `resolved`, returning
+/// the resolved image string. Combines [`resolve_runner_image`] and
+/// [`check_ready`] so the four backends that launch docker can't
+/// accidentally check one image and `docker run` another.
+pub fn check_ready_for(resolved: &Pillbox) -> Result<String> {
+    let (image, _src) = resolve_runner_image(resolved);
+    check_ready(&image)?;
+    Ok(image)
 }
 
 /// Confirm Docker is reachable and `image` is available. One

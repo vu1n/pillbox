@@ -40,9 +40,11 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # Tag scheme:
-      #   PR             → ghcr.io/vu1n/pillbox-runner:pr-NN  (build-only, never pushed)
-      #   push to main   → ghcr.io/vu1n/pillbox-runner:rolling
-      #   tag vX.Y.Z     → ghcr.io/vu1n/pillbox-runner:vX.Y.Z + :latest
+      #   PR              → ghcr.io/vu1n/pillbox-runner:pr-NN  (build-only, never pushed)
+      #   push to main    → ghcr.io/vu1n/pillbox-runner:rolling
+      #   tag vX.Y.Z      → ghcr.io/vu1n/pillbox-runner:vX.Y.Z
+      #   stable semver   → also moves :latest (handled by flavor=auto,
+      #                     which skips prereleases like v0.1.0-alpha.2)
       - id: meta
         uses: docker/metadata-action@v5
         with:
@@ -51,7 +53,8 @@ jobs:
             type=ref,event=pr,prefix=pr-
             type=raw,value=rolling,enable={{is_default_branch}}
             type=semver,pattern={{version}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+          flavor: |
+            latest=auto
 
       - uses: docker/build-push-action@v6
         with:

@@ -537,8 +537,7 @@ pub(crate) fn dispatch_vault_stdin(resolved: &Pillbox) -> Result<()> {
             )
         })?;
 
-    let runner_image = docker::resolve_runner_image(resolved);
-    docker::check_ready(&runner_image)?;
+    let runner_image = docker::check_ready_for(resolved)?;
 
     let home = spec.home_dir(resolved)?;
     if !home.join(spec.cred_sentinel).exists() {

@@ -53,8 +53,13 @@ fn spawn(
     workspace: Option<PathBuf>,
     label: Option<String>,
 ) -> Result<()> {
-    let image = image.unwrap_or_else(|| docker::resolve_runner_image(resolved));
-    docker::check_ready(&image)?;
+    let image = match image {
+        Some(i) => {
+            docker::check_ready(&i)?;
+            i
+        }
+        None => docker::check_ready_for(resolved)?,
+    };
     let workspace_host = match workspace {
         Some(p) => p,
         None => std::env::current_dir()

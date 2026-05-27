@@ -187,8 +187,7 @@ impl AgentSpec {
     }
 
     pub(crate) fn login(&self, resolved: &Pillbox) -> Result<()> {
-        let image = docker::resolve_runner_image(resolved);
-        docker::check_ready(&image)?;
+        let image = docker::check_ready_for(resolved)?;
 
         let home = self.home_dir(resolved)?;
 

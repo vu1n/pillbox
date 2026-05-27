@@ -530,7 +530,10 @@ fn run(cli: Cli) -> Result<()> {
             let resolved = Pillbox::resolve(pillbox_arg)?;
             commands::sidecar::run(&resolved, bind, json)
         }
-        Command::Doctor { json } => doctor::run(json),
+        Command::Doctor { json } => {
+            let resolved = Pillbox::resolve(pillbox_arg)?;
+            doctor::run(json, &resolved)
+        }
         Command::Version => {
             println!(
                 "pillbox {} (runner image: {})",

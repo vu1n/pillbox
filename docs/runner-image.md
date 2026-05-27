@@ -95,7 +95,7 @@ image, pillbox CLI assumes:
 - `/workspace` exists and is writable (bind-mount target).
 - `/etc` writable for the `--mcp-config` bind mount.
 - A shell.
-- `HOME` is set by the caller (pillbox sets `HOME=/home/lum`
+- `HOME` is set by the caller (pillbox sets `HOME=/home/pillbox`
   and bind-mounts the agent's persistent auth state there);
   the image doesn't need to pre-create that path.
 - `pillbox` on `$PATH` — the interactive attach transport launches

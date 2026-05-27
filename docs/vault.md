@@ -101,7 +101,7 @@ collide because each provider has its own prefix.
 ```
    host                                       guest (docker)
   ┌─────────────────────────┐              ┌──────────────────────────┐
-  │ ~/.pillbox/global/auth/claude/ │ ──mount──▶   │ /home/lum/.claude/       │
+  │ ~/.pillbox/global/auth/claude/ │ ──mount──▶   │ /home/pillbox/.claude/   │
   │  .claude/               │              │  (real creds.json file)  │
   │   .credentials.json     │              │                          │
   │   (real OAuth tokens)   │              │                          │
@@ -111,7 +111,7 @@ collide because each provider has its own prefix.
   ┌─────────────────────────┐              ┌──────────────────────────┐
   │ vault Server            │              │ stub creds.json (tmp)    │
   │ + per-sandbox lease     │ ──mount──▶   │ overlaid via -v file:    │
-  │ + stub JSON → tempfile  │              │  /home/lum/.claude/      │
+  │ + stub JSON → tempfile  │              │  /home/pillbox/.claude/  │
   └──────────────┬──────────┘              │  .credentials.json:ro    │
                  │                         └──────────────────────────┘
                  │

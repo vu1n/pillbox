@@ -237,7 +237,7 @@ pub(crate) struct McpInjection {
 /// Adapter for Claude: write `--mcp` attachments to a tempfile, mount
 /// at `/etc/pillbox/mcp.json`, point `claude` at it with
 /// `--mcp-config`. Additive with the persistent `~/.claude.json`
-/// config Claude loads from `/home/lum`.
+/// config Claude loads from `/home/pillbox`.
 ///
 /// The tempfile defaults to mode 0600 (mkstemp); today's
 /// `--mcp NAME=URL` values don't carry secrets, but a future

@@ -17,7 +17,7 @@
 #   - Agent binaries are on $PATH (verified by `pillbox doctor`)
 #   - /workspace exists and is writable (bind-mount target)
 #   - /etc is writable for the --mcp-config bind mount
-#   - HOME is set by the caller (pillbox sets HOME=/home/lum at runtime
+#   - HOME is set by the caller (pillbox sets HOME=/home/pillbox at runtime
 #     and bind-mounts the agent's persistent auth state there)
 #   - A shell is available
 #

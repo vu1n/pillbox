@@ -6,7 +6,7 @@
 //! expose a per-project auth override if real signal materializes.
 //!
 //! Storage shape: `<auth_pillbox>/auth/<provider>/`. That directory is
-//! bind-mounted at `/home/lum` (the guest's HOME) for both login and run.
+//! bind-mounted at `/home/pillbox` (the guest's HOME) for both login and run.
 //! Whatever the agent writes — `.credentials.json`, settings, refresh
 //! tokens — persists there naturally.
 
@@ -26,7 +26,7 @@ pub(crate) mod mcp;
 
 pub(crate) use mcp::{McpAttachment, McpInjection, McpTokenSpec};
 
-pub(crate) const GUEST_HOME: &str = "/home/lum";
+pub(crate) const GUEST_HOME: &str = "/home/pillbox";
 pub(crate) const GUEST_WORKSPACE: &str = "/workspace";
 
 /// Per-agent MCP config builder. Returns a fully-formed injection

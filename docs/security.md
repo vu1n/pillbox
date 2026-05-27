@@ -116,7 +116,7 @@ Same model for `pillbox env show`.
 Each `pillbox run` invocation launches a fresh container with:
 
 - `--rm` so it's deleted on exit. No state persists in the container.
-- A clean `/home/lum` populated by bind-mounting the resolved auth
+- A clean `/home/pillbox` populated by bind-mounting the resolved auth
   pillbox's `auth/<agent>/` directory (e.g.
   `~/.pillbox/global/auth/claude/`). The agent only sees its OWN
   persistent HOME, not the user's real `~/.claude` / `~/.codex`.

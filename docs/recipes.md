@@ -102,7 +102,7 @@ If you want hard failure on conflict, drop the `|| true`.
 
 ```sh
 # Read-only AWS creds
-pillbox run --mount ~/.aws:/home/lum/.aws:ro
+pillbox run --mount ~/.aws:/home/pillbox/.aws:ro
 
 # Sibling repo at /workspace/sibling (in addition to cwd)
 pillbox run --mount ~/work/sibling-repo:/workspace/sibling

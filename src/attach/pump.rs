@@ -21,6 +21,52 @@ use super::frame::Frame;
 
 const CTRL_A: u8 = 0x01;
 
+/// Write end of the SIGTERM self-pipe; read by [`install_sigterm_detach`]'s
+/// thread. -1 until installed. A signal handler may only touch
+/// async-signal-safe state, so we stash a raw fd here and `write()` to it.
+#[cfg(unix)]
+static SIGTERM_PIPE_W: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+#[cfg(unix)]
+extern "C" fn handle_sigterm(_sig: libc::c_int) {
+    let fd = SIGTERM_PIPE_W.load(Ordering::Relaxed);
+    if fd >= 0 {
+        let byte = [1u8];
+        // SAFETY: write() is async-signal-safe; one byte to our own pipe.
+        unsafe { libc::write(fd, byte.as_ptr() as *const libc::c_void, 1) };
+    }
+}
+
+/// Make SIGTERM resolve the pump as [`Outcome::Detached`] rather than the
+/// default (terminate). `pillbox session detach <id>` SIGTERMs the attached
+/// pillbox; routing it through the normal return path means the terminal is
+/// restored (raw mode off, alt screen left) instead of abandoned mid-render.
+#[cfg(unix)]
+fn install_sigterm_detach(otx: mpsc::Sender<Outcome>) {
+    let mut fds = [0i32; 2];
+    // SAFETY: pipe() fills the 2-element array; we check the return code.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return;
+    }
+    let (read_fd, write_fd) = (fds[0], fds[1]);
+    SIGTERM_PIPE_W.store(write_fd, Ordering::Relaxed);
+    // SAFETY: install our async-signal-safe handler for SIGTERM. Cast via a
+    // typed fn pointer first (a direct item→integer cast is a clippy lint).
+    let handler = handle_sigterm as extern "C" fn(libc::c_int);
+    unsafe { libc::signal(libc::SIGTERM, handler as libc::sighandler_t) };
+    thread::spawn(move || {
+        let mut buf = [0u8; 1];
+        // SAFETY: blocking read on our own pipe's read end.
+        let n = unsafe { libc::read(read_fd, buf.as_mut_ptr() as *mut libc::c_void, 1) };
+        if n > 0 {
+            let _ = otx.send(Outcome::Detached);
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn install_sigterm_detach(_otx: mpsc::Sender<Outcome>) {}
+
 /// How an attached session ended.
 pub(crate) enum Outcome {
     /// The agent/PTY exited with this code.
@@ -101,6 +147,8 @@ where
     }
 
     crossterm::terminal::enable_raw_mode().ok();
+    // SIGTERM (from `pillbox session detach <id>`) resolves as a clean detach.
+    install_sigterm_detach(otx.clone());
     // stdin runs in its own thread: when the agent exits, the reader resolves
     // the outcome immediately rather than waiting for the next keypress.
     {

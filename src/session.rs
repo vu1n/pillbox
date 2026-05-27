@@ -98,6 +98,7 @@ impl IdRegistry for SessionRegistry {
 /// stringly path each time.
 pub(crate) const BACKEND_E2B: &str = "e2b";
 pub(crate) const BACKEND_SSH: &str = "ssh";
+pub(crate) const BACKEND_DOCKER: &str = "docker";
 
 /// Typed view of the on-disk `backend` string. Returned by
 /// [`Backend::parse`]; `None` means a backend label this binary doesn't
@@ -107,6 +108,9 @@ pub(crate) const BACKEND_SSH: &str = "ssh";
 pub(crate) enum Backend {
     E2b,
     Ssh,
+    /// Local Docker — a detached `pillbox run --detach` session. `remote`
+    /// is the sentinel "local"; `sandbox_id` is the container id.
+    Docker,
 }
 
 impl Backend {
@@ -114,6 +118,7 @@ impl Backend {
         match label {
             BACKEND_E2B => Some(Backend::E2b),
             BACKEND_SSH => Some(Backend::Ssh),
+            BACKEND_DOCKER => Some(Backend::Docker),
             _ => None,
         }
     }
@@ -652,7 +657,16 @@ mod tests {
     fn known_backend_labels_are_constants() {
         let _: &str = BACKEND_E2B;
         let _: &str = BACKEND_SSH;
+        let _: &str = BACKEND_DOCKER;
         let _: &str = SESSIONS_DIR;
+    }
+
+    #[test]
+    fn backend_parse_round_trips_known_labels() {
+        assert_eq!(Backend::parse(BACKEND_E2B), Some(Backend::E2b));
+        assert_eq!(Backend::parse(BACKEND_SSH), Some(Backend::Ssh));
+        assert_eq!(Backend::parse(BACKEND_DOCKER), Some(Backend::Docker));
+        assert_eq!(Backend::parse("nope"), None);
     }
 
     #[test]

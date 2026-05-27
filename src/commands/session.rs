@@ -120,18 +120,22 @@ fn session_info(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
 
 fn session_attach(resolved: &Pillbox, id: &str) -> Result<()> {
     let s = session::resolve(resolved, id)?;
-    let remote = remote::read(resolved, &s.remote)?.ok_or_else(|| {
-        PillboxError::runtime(
-            "session attach",
-            format!(
-                "remote `{}` is no longer registered — session record is orphaned",
-                s.remote
-            ),
-        )
-        .with_next(format!("pillbox session rm {}", s.id))
-    })?;
     match session::Backend::parse(&s.backend) {
-        Some(session::Backend::E2b) => sandbox::remote_e2b::reattach(resolved, &remote, &s),
+        // Local Docker has no remote registry entry — attach directly.
+        Some(session::Backend::Docker) => sandbox::local_docker::reattach(resolved, &s),
+        Some(session::Backend::E2b) => {
+            let remote = remote::read(resolved, &s.remote)?.ok_or_else(|| {
+                PillboxError::runtime(
+                    "session attach",
+                    format!(
+                        "remote `{}` is no longer registered — session record is orphaned",
+                        s.remote
+                    ),
+                )
+                .with_next(format!("pillbox session rm {}", s.id))
+            })?;
+            sandbox::remote_e2b::reattach(resolved, &remote, &s)
+        }
         Some(session::Backend::Ssh) => Err(PillboxError::usage(
             "session attach",
             "ssh session attach is not yet implemented (tmux integration lands next)",
@@ -243,6 +247,7 @@ fn session_detach(resolved: &Pillbox, id: &str) -> Result<()> {
 fn session_rm(resolved: &Pillbox, id: &str) -> Result<()> {
     let s = session::resolve(resolved, id)?;
     match session::Backend::parse(&s.backend) {
+        Some(session::Backend::Docker) => sandbox::local_docker::kill_session(resolved, &s),
         Some(session::Backend::E2b) => sandbox::remote_e2b::kill_session(resolved, &s),
         Some(session::Backend::Ssh) => Err(PillboxError::usage(
             "session rm",

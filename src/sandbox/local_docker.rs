@@ -14,6 +14,7 @@ use crate::agents::{
 };
 use crate::attach::pump::{self, Outcome};
 use crate::pillbox::Pillbox;
+use crate::session::{self, Session, BACKEND_DOCKER};
 use crate::workspace::WorkspaceBackend;
 use crate::{docker, errors::PillboxError};
 
@@ -78,6 +79,17 @@ impl SandboxBackend for LocalDocker {
             )
             .into());
         }
+        // Local --detach can't use the vault: the stub-swap proxy runs on the
+        // host and would die the moment this CLI returns, leaving the detached
+        // agent with dead credentials. Reject early with a pointer.
+        if opts.detach && (opts.vault || any_vaulted) {
+            return Err(PillboxError::usage(
+                "run",
+                "--detach does not support the vault locally (the proxy can't outlive the CLI)",
+            )
+            .with_next("run without --vault, or use --remote for a vaulted detached session")
+            .into());
+        }
         let mut vault_session = if opts.vault || any_vaulted {
             let oauth = if opts.vault {
                 Some(crate::vault::OAuthAgent {
@@ -117,16 +129,6 @@ impl SandboxBackend for LocalDocker {
                 crate::agents::mcp::resolve_tokens(resolved, opts.mcps.clone(), &opts.mcp_tokens)?;
             Some(inject(&resolved_mcps)?)
         };
-
-        // Local --detach (a persisted session) isn't wired yet — it stays
-        // remote-only, matching today's contract. Sessions land next.
-        if opts.detach {
-            return Err(
-                PillboxError::usage("run", "--detach is not supported for local runs yet")
-                    .with_next("pillbox run --detach --remote <name>")
-                    .into(),
-            );
-        }
 
         // Detached container so the pty-host outlives the client; we attach
         // over a docker-exec relay and tear it down explicitly.
@@ -182,6 +184,50 @@ impl SandboxBackend for LocalDocker {
         args.extend(opts.args);
 
         let container = docker::run_detached(&args)?;
+
+        if opts.detach {
+            // vault was rejected above, so there's no host-side proxy to keep
+            // alive: record the session and return. Reattach later with the
+            // same docker-exec relay via `pillbox session attach <id>`.
+            let session = Session {
+                id: Session::new_id(),
+                label: opts.label.clone(),
+                remote: "local".to_string(),
+                backend: BACKEND_DOCKER.to_string(),
+                sandbox_id: container,
+                pty_pid: 0,
+                agent_id: spec.id.to_string(),
+                started_at: session::now_rfc3339(),
+                attached_pid: None,
+                base_snapshot: None,
+                result_snapshot: None,
+                expires_at: opts.ttl_seconds.map(session::expires_at_from_ttl),
+            };
+            session::write(resolved, &session)?;
+            crate::events::emit_session_event(
+                resolved,
+                crate::events::EventType::SessionStarted {
+                    parent_session_id: crate::events::parent_session_id_from_env(),
+                },
+                &session.id,
+                Some(&session),
+            );
+            if opts.json {
+                println!(
+                    "{}",
+                    crate::paths::json_v1(vec![("session", session.to_json_value())])
+                );
+            } else {
+                let short = &session.sandbox_id[..session.sandbox_id.len().min(12)];
+                println!(
+                    "pillbox: ✓ session `{}` started in background (container `{short}`).",
+                    session.id
+                );
+                println!("         pillbox session attach {}  # reattach", session.id);
+            }
+            return Ok(());
+        }
+
         let outcome = attach_via_exec(&container);
         // The vault proxy must stay up for the whole attached session.
         drop(vault_session);
@@ -218,4 +264,53 @@ fn attach_via_exec(container: &str) -> Result<Outcome> {
     let _ = child.kill();
     let _ = child.wait();
     Ok(outcome)
+}
+
+/// `pillbox session attach <id>` for a local Docker session: re-open the
+/// docker-exec relay to the still-running pty-host container and pump.
+pub(crate) fn reattach(resolved: &Pillbox, session: &Session) -> Result<()> {
+    let short = &session.sandbox_id[..session.sandbox_id.len().min(12)];
+    eprintln!(
+        "pillbox: reattaching to session `{}` (container `{short}`) …",
+        session.id
+    );
+    eprintln!("pillbox: detach with Ctrl-A D (the container keeps running).");
+
+    session::mark_attached(resolved, &session.id, std::process::id() as i64)?;
+    let outcome = attach_via_exec(&session.sandbox_id);
+    // Always clear the attached stamp; the record is still valid.
+    let _ = session::mark_detached(resolved, &session.id);
+
+    match outcome? {
+        Outcome::Detached => {
+            eprintln!(
+                "pillbox: detached. reattach with `pillbox session attach {}`",
+                session.id
+            );
+            Ok(())
+        }
+        Outcome::Exited(code) => {
+            // The agent exited, so the pty-host (container PID 1) stopped too.
+            // Leave the record for `session rm` / inspection.
+            eprintln!(
+                "pillbox: agent exited ({code}). `pillbox session rm {}` to clean up.",
+                session.id
+            );
+            Ok(())
+        }
+        Outcome::Disconnected => {
+            eprintln!("pillbox: session connection closed.");
+            Ok(())
+        }
+    }
+}
+
+/// `pillbox session rm <id>` for a local Docker session: force-remove the
+/// container, then drop the record (unconditionally — a failed remove
+/// shouldn't strand the record; the container may already be gone).
+pub(crate) fn kill_session(resolved: &Pillbox, session: &Session) -> Result<()> {
+    let _ = docker::rm_force(&session.sandbox_id);
+    session::delete(resolved, &session.id)?;
+    println!("pillbox: ✓ session `{}` removed.", session.id);
+    Ok(())
 }

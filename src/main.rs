@@ -191,11 +191,12 @@ enum Command {
         /// internal and may change between releases.
         #[arg(long = "vault-stdin", hide = true)]
         vault_stdin: bool,
-        /// Start the agent and immediately return — keeps the remote
-        /// session alive in the background. Reattach later with
-        /// `pillbox session attach <id>`. v0.6 PR 6: e2b:// remotes
-        /// only (ssh:// detach lands in a follow-up).
-        #[arg(long, requires = "remote")]
+        /// Start the agent and immediately return — keeps the session
+        /// alive in the background. Reattach later with `pillbox session
+        /// attach <id>`. Works for local Docker and e2b:// remotes;
+        /// ssh:// detach lands in a follow-up. (Local --detach doesn't
+        /// support --vault: the proxy can't outlive the CLI.)
+        #[arg(long)]
         detach: bool,
         /// Human label for the detached session (surfaced in `session
         /// list`). Only meaningful with `--detach` — clap rejects the

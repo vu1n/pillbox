@@ -284,8 +284,8 @@ remote backends + sessions). Roadmap:
 ## Build
 
 ```sh
-# Build the runner image (pillbox publishes its own to GHCR in a follow-up)
-cd ~/code/lum && bun run build:runtime-image:pillbox
+# Pull the canonical runner image (or build your own — see docs/runner-image.md)
+docker pull ghcr.io/vu1n/pillbox-runner:latest
 
 # Build + install the CLI
 cd ~/code/pillbox && cargo install --path .
@@ -297,6 +297,17 @@ pillbox auth login --agent claude
 cd ~/work/my-project && pillbox new && pillbox run
 ```
 
+To use a custom image (extra tools, newer harnesses):
+
+```sh
+PILLBOX_RUNNER_IMAGE=my-team/pillbox-runner:custom pillbox run
+# or pin per-pillbox in pillbox.toml's [runner] table
+```
+
+See [docs/runner-image.md](docs/runner-image.md) for the image
+contract, build recipe, and how Renovate keeps the harnesses
+current.
+
 ## Documentation
 
 - [AGENTS.md](./AGENTS.md) — agent-facing command reference (machine-readable)
@@ -305,7 +316,9 @@ cd ~/work/my-project && pillbox new && pillbox run
   - [config.md](./docs/config.md) — `pillbox.toml` descriptor + discovery
   - [secrets.md](./docs/secrets.md) — pillbox-scoped secrets + env bundles
   - [vault.md](./docs/vault.md) — per-pillbox credential vault
+  - [shared-mcp.md](./docs/shared-mcp.md) — `--mcp NAME=URL` shared-MCP attachments
   - [remotes.md](./docs/remotes.md) — remote backends + sessions
+  - [runner-image.md](./docs/runner-image.md) — the runner image, overrides, custom builds
   - [recipes.md](./docs/recipes.md) — copy-paste flows
   - [security.md](./docs/security.md) — threat model
 - [SECURITY.md](./SECURITY.md) — vulnerability reporting

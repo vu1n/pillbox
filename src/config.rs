@@ -104,6 +104,28 @@ impl WorkspaceConfig {
     }
 }
 
+/// `[runner]` table — selects the docker image pillbox launches
+/// sandboxes from. Pinned per-pillbox so a project that needs a
+/// newer harness can bump independently of `pillbox` releases.
+///
+/// Deliberately **not** mirrored into `meta.json` the way
+/// [`WorkspaceConfig`] is. The runner image is an operational
+/// choice that should take effect the moment the user edits
+/// `pillbox.toml` — no `pillbox upgrade-meta` step, no "edited
+/// toml but old meta wins" footgun. We pay one TOML re-parse per
+/// `pillbox run`, which is invisible against the docker spawn
+/// that follows. `Deserialize`-only for the same reason: the
+/// value flows in from the descriptor and never back out.
+#[derive(Debug, Default, Deserialize, Clone, PartialEq, Eq)]
+pub(crate) struct RunnerConfig {
+    /// Docker image reference (e.g. `ghcr.io/vu1n/pillbox-runner:vX.Y.Z`
+    /// or a locally-built `pillbox:latest`). `None` falls back to the
+    /// CLI default — see [`crate::docker::default_runner_image`].
+    /// Overridden by the `PILLBOX_RUNNER_IMAGE` env var.
+    #[serde(default)]
+    pub(crate) image: Option<String>,
+}
+
 #[derive(Debug, Default, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 #[allow(dead_code)] // `agent`, `workspace`, `source` consumed by PR 3 + later
@@ -120,6 +142,9 @@ pub(crate) struct Config {
     /// Workspace backend selector (`local` | `s3`). See [`WorkspaceConfig`].
     #[serde(default)]
     pub(crate) workspace: WorkspaceConfig,
+    /// Per-pillbox runner image override. See [`RunnerConfig`].
+    #[serde(default)]
+    pub(crate) runner: RunnerConfig,
 
     /// Path the config was loaded from. Useful for `info` output.
     #[serde(skip)]

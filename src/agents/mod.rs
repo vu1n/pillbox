@@ -187,7 +187,7 @@ impl AgentSpec {
     }
 
     pub(crate) fn login(&self, resolved: &Pillbox) -> Result<()> {
-        docker::check_ready()?;
+        let image = docker::check_ready_for(resolved)?;
 
         let home = self.home_dir(resolved)?;
 
@@ -198,7 +198,7 @@ impl AgentSpec {
         }
         args.push("-v".into());
         args.push(format!("{}:{GUEST_HOME}", home.display()));
-        args.push(docker::RUNNER_IMAGE.into());
+        args.push(image);
         args.extend(self.login_argv.iter().map(|s| s.to_string()));
 
         println!("pillbox: starting {} login inside a sandbox.", self.id);

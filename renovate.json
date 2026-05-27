@@ -1,0 +1,36 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", ":dependencyDashboard"],
+  "labels": ["dependencies"],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/runner/Dockerfile$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>.*?) depName=(?<depName>.*?)\\s+ARG \\S+?=(?<currentValue>\\S+)"
+      ]
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Auto-merge harness patch + minor bumps once CI is green",
+      "matchManagers": ["custom.regex"],
+      "matchUpdateTypes": ["patch", "minor"],
+      "automerge": true,
+      "automergeType": "pr",
+      "platformAutomerge": true
+    },
+    {
+      "description": "Major bumps hold for human review",
+      "matchManagers": ["custom.regex"],
+      "matchUpdateTypes": ["major"],
+      "automerge": false
+    },
+    {
+      "description": "Cargo dependencies group into one PR weekly",
+      "matchManagers": ["cargo"],
+      "schedule": ["before 6am on monday"],
+      "groupName": "cargo dependencies"
+    }
+  ]
+}

@@ -20,7 +20,7 @@ pub(crate) struct LocalDocker;
 
 impl SandboxBackend for LocalDocker {
     fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
-        docker::check_ready()?;
+        let runner_image = docker::check_ready_for(resolved)?;
 
         let home = spec.home_dir(resolved)?;
         if !home.join(spec.cred_sentinel).exists() {
@@ -148,7 +148,7 @@ impl SandboxBackend for LocalDocker {
                 session.ca_cert_path().display()
             );
         }
-        args.push(docker::RUNNER_IMAGE.into());
+        args.push(runner_image);
         args.extend(spec.run_argv.iter().map(|s| s.to_string()));
         if let Some(mcp) = &mcp {
             args.extend(mcp.extra_argv.iter().cloned());

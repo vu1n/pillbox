@@ -6,7 +6,8 @@ use std::{os::unix::fs::PermissionsExt, path::PathBuf, process::Command, thread}
 
 use anyhow::Result;
 
-use crate::docker;
+use crate::docker::{self, RunnerImageSource};
+use crate::pillbox::Pillbox;
 
 #[derive(Debug)]
 struct Check {
@@ -32,8 +33,8 @@ impl Check {
     }
 }
 
-pub(crate) fn run(json: bool) -> Result<()> {
-    let checks = collect_checks();
+pub(crate) fn run(json: bool, resolved: &Pillbox) -> Result<()> {
+    let checks = collect_checks(resolved);
     let overall_ok = checks.iter().all(|c| c.ok);
     if json {
         println!("{}", to_json(&checks, overall_ok));
@@ -52,11 +53,12 @@ pub(crate) fn run(json: bool) -> Result<()> {
     Ok(())
 }
 
-fn collect_checks() -> Vec<Check> {
+fn collect_checks(resolved: &Pillbox) -> Vec<Check> {
     // Two docker subprocesses each cost ~200ms cold; run them in
     // parallel with the cheap checks.
+    let (image, source) = docker::resolve_runner_image(resolved);
     let docker_thread = thread::spawn(check_docker_daemon);
-    let image_thread = thread::spawn(check_runner_image);
+    let image_thread = thread::spawn(move || check_runner_image(&image, source));
     vec![
         check_home_resolvable(),
         check_data_dir_perms(),
@@ -152,16 +154,14 @@ fn check_docker_daemon() -> Check {
     }
 }
 
-fn check_runner_image() -> Check {
+fn check_runner_image(image: &str, source: RunnerImageSource) -> Check {
     let name = "runner_image";
+    let suffix = match source {
+        RunnerImageSource::Default => String::new(),
+        other => format!(" [from {}]", other.human()),
+    };
     match Command::new("docker")
-        .args([
-            "image",
-            "inspect",
-            docker::RUNNER_IMAGE,
-            "--format",
-            "{{.Id}}",
-        ])
+        .args(["image", "inspect", image, "--format", "{{.Id}}"])
         .output()
     {
         Ok(out) if out.status.success() => {
@@ -171,13 +171,13 @@ fn check_runner_image() -> Check {
                 .chars()
                 .take(12)
                 .collect::<String>();
-            Check::ok(name, format!("{} ({id})", docker::RUNNER_IMAGE))
+            Check::ok(name, format!("{image} ({id}){suffix}"))
         }
         Ok(_) => Check::fail(
             name,
             format!(
-                "{} not found locally — see pillbox README for image build instructions",
-                docker::RUNNER_IMAGE
+                "{image} not found locally{suffix} — `docker pull {image}` or set ${}",
+                docker::RUNNER_IMAGE_ENV
             ),
         ),
         Err(_) => Check::fail(name, "cannot check — docker CLI unavailable"),

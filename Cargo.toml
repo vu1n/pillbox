@@ -64,6 +64,12 @@ opentelemetry-otlp = { version = "0.30", default-features = false, features = ["
 # directly so the helper that normalizes to strict RFC3339 doesn't
 # look at types it can't name.
 jiff = "0.2"
+# Interactive attach transport — the in-sandbox pty-host keeps a vt100
+# screen model so reattach can serve a bounded ANSI snapshot of current
+# state. state_formatted()+contents_formatted() round-trips modes the
+# way orca's xterm-headless + SerializeAddon does, minus the hand-rolled
+# mouse-mode mirroring. See docs/attach-transport.md.
+vt100 = "0.15"
 
 [features]
 # Opt-in OTLP/gRPC transport for the OTel logs sink. Adds tonic +

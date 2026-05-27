@@ -21,6 +21,7 @@ use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 
 mod agents;
+mod attach;
 mod bookmarks;
 mod cli;
 mod commands;

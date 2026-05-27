@@ -24,6 +24,18 @@ pub(crate) struct LocalDocker;
 /// `docker exec`) connects to the same path. One pty-host per container.
 const ATTACH_SOCK: &str = "/tmp/pillbox-attach.sock";
 
+/// Force-removes its container on drop. Used only on the foreground run
+/// path so the `-d` container is torn down on every normal/early-return/
+/// panic exit (a detached session deliberately outlives the CLI and is
+/// reaped by `session rm` instead).
+struct ContainerGuard(String);
+
+impl Drop for ContainerGuard {
+    fn drop(&mut self) {
+        let _ = docker::rm_force(&self.0);
+    }
+}
+
 impl SandboxBackend for LocalDocker {
     fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
         let runner_image = docker::check_ready_for(resolved)?;
@@ -184,7 +196,6 @@ impl SandboxBackend for LocalDocker {
         args.extend(opts.args);
 
         let container = docker::run_detached(&args)?;
-        // Foreground interactive run: no persisted session, so detach is off.
 
         if opts.detach {
             // vault was rejected above, so there's no host-side proxy to keep
@@ -229,11 +240,15 @@ impl SandboxBackend for LocalDocker {
             return Ok(());
         }
 
+        // Foreground run: rm the container on every exit path — including an
+        // early `?`-return from attach or a panic — via a drop guard, not a
+        // single explicit call a mid-run failure could skip. (An external
+        // SIGKILL still bypasses Drop; that residual orphan is the lifecycle
+        // follow-up, alongside the ssh remote-container reap.)
+        let _container = ContainerGuard(container.clone());
         let outcome = attach_via_exec(&container, false);
         // The vault proxy must stay up for the whole attached session.
         drop(vault_session);
-        // Foreground run: tear the container down regardless of outcome.
-        let _ = docker::rm_force(&container);
 
         match outcome? {
             Outcome::Exited(0) | Outcome::Detached | Outcome::Disconnected => Ok(()),
@@ -313,6 +328,15 @@ pub(crate) fn reattach(resolved: &Pillbox, session: &Session) -> Result<()> {
 /// shouldn't strand the record; the container may already be gone).
 pub(crate) fn kill_session(resolved: &Pillbox, session: &Session) -> Result<()> {
     let _ = docker::rm_force(&session.sandbox_id);
+    // Emit the lifecycle event before deleting so the payload can reference a
+    // still-valid record — parity with the e2b/ssh backends (orchestrators
+    // tailing the events stream must see docker teardowns too).
+    crate::events::emit_session_event(
+        resolved,
+        crate::events::EventType::SessionDropped,
+        &session.id,
+        Some(session),
+    );
     session::delete(resolved, &session.id)?;
     println!("pillbox: ✓ session `{}` removed.", session.id);
     Ok(())

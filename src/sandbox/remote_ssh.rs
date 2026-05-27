@@ -585,9 +585,15 @@ fn kill_pty_host(url: &SshUrl, remote: &RemoteSession) -> Result<()> {
         .status()
         .map_err(|e| PillboxError::resource("session rm", format!("could not spawn ssh: {e}")))?;
     if !status.success() {
-        // pkill exits non-zero when nothing matched (host already gone);
-        // that's not an error for teardown.
-        return Ok(());
+        // The trailing `rm -f` succeeds even when `pkill` matched nothing, so
+        // a non-zero status here is the ssh exec itself failing (host
+        // unreachable / auth) — the teardown did NOT run. Surface it so the
+        // caller warns instead of silently assuming the host was reaped.
+        return Err(PillboxError::runtime(
+            "session rm",
+            format!("remote teardown over ssh exited with status {status} (host unreachable?)"),
+        )
+        .into());
     }
     Ok(())
 }
@@ -646,8 +652,14 @@ pub(crate) fn reattach(resolved: &Pillbox, remote: &Remote, session: &Session) -
 /// `pillbox session rm <id>` for an ssh session: kill the remote pty-host
 /// and scrub its files, then drop the local record unconditionally (a
 /// failed kill shouldn't strand the record; the host may already be gone).
-/// Mirrors `local_docker::kill_session`.
-pub(crate) fn kill_session(resolved: &Pillbox, remote: &Remote, session: &Session) -> Result<()> {
+/// Mirrors `local_docker::kill_session`. `remote` is `None` when it has been
+/// deregistered — we can't reach the host to kill the pty-host, but we still
+/// drop the local record (never strand it).
+pub(crate) fn kill_session(
+    resolved: &Pillbox,
+    remote: Option<&Remote>,
+    session: &Session,
+) -> Result<()> {
     if session::Backend::parse(&session.backend) != Some(session::Backend::Ssh) {
         return Err(PillboxError::usage(
             "session rm",
@@ -658,17 +670,28 @@ pub(crate) fn kill_session(resolved: &Pillbox, remote: &Remote, session: &Sessio
         )
         .into());
     }
-    let rs = RemoteSession::from_sock(&session.sandbox_id);
-    match parse_ssh_url(&remote.url) {
-        Ok(url) => {
-            if let Err(e) = kill_pty_host(&url, &rs) {
-                eprintln!("pillbox: warning: remote pty-host teardown failed: {e}");
+    match remote {
+        Some(remote) => {
+            let rs = RemoteSession::from_sock(&session.sandbox_id);
+            match parse_ssh_url(&remote.url) {
+                Ok(url) => {
+                    if let Err(e) = kill_pty_host(&url, &rs) {
+                        eprintln!("pillbox: warning: remote pty-host teardown failed: {e}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "pillbox: warning: remote `{}` url unparseable ({e}); skipping remote teardown.",
+                        remote.name
+                    );
+                }
             }
         }
-        Err(e) => {
+        None => {
             eprintln!(
-                "pillbox: warning: remote `{}` url unparseable ({e}); skipping remote teardown.",
-                remote.name
+                "pillbox: warning: remote `{}` is no longer registered — dropping the record \
+                 without remote teardown; kill the remote pty-host by hand if it's still running.",
+                session.remote
             );
         }
     }

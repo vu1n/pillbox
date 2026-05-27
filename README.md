@@ -47,7 +47,7 @@ Mixing those into one bundle gives you:
 │   ├── auth/{claude,codex}/               # agent OAuth state (always global today)
 │   ├── vault/                             # CA + key for vault sessions
 │   ├── remotes/                           # registered VPS / E2B remotes
-│   └── sessions/                          # detached session records (E2B today)
+│   └── sessions/                          # detached session records (local Docker, E2B, SSH)
 ├── projects/
 │   └── -Users-vuln-work-foo/              # `/Users/vuln/work/foo` with `/` → `-`
 │       ├── meta.json                      # { name, created_at, agent_default, workspace }
@@ -109,7 +109,7 @@ to bypass discovery and operate on a specific named pillbox.
 |---|---|
 | `pillbox run [opts] [-- args]` | Launch the agent against the current pillbox (local Docker by default). |
 | `pillbox run --remote NAME [--from-bookmark B]` | Launch on a registered remote VPS (`ssh://`) or E2B sandbox (`e2b://`). |
-| `pillbox run --remote NAME --detach [--label TEXT]` | Start the session in the background; print the reattach id. |
+| `pillbox run --detach [--remote NAME] [--label TEXT]` | Start the session in the background; print the reattach id. Works locally and on `ssh://` / `e2b://` remotes. |
 | `pillbox remote add NAME URL [--agent A]` | Register a remote — `ssh://user@host[:port]` or `e2b://TEMPLATE_ID`. |
 | `pillbox remote list/info/rm` | Manage the remote registry. |
 | `pillbox session list [--json]` | Sessions started from this pillbox. |
@@ -198,15 +198,16 @@ remote pillbox's vault session memory. The blob is never written to
 disk on the SSH path; E2B stages it through 0600 temp files locally
 and in sandbox `/tmp`, then unlinks after the in-sandbox pillbox reads it.
 
-**SSH vs E2B parity:** v0.6 PR 6 ships sessions for E2B only (E2B's
-`sandbox.pty.connect` is the clean reattach primitive). SSH session
-persistence (tmux-on-the-remote) is the next stop.
+**SSH vs E2B parity:** detached sessions (`--detach`,
+`session attach`/`detach`/`rm`) work uniformly across local Docker,
+E2B, and SSH remotes — each carries the attach-transport frames over
+its own byte pipe (docker exec, E2B's `pty.connect`, ssh stdio).
 
 ## Sessions and the detach hotkey
 
 When you attach to a session (initial run OR `pillbox session
-attach`), the local terminal proxies the remote PTY. To detach
-**without killing the session**:
+attach`), the local terminal proxies the session's PTY (local Docker,
+e2b, or ssh). To detach **without killing the session**:
 
 - **Ctrl-A then D** — works from the attached terminal.
 - `pillbox session detach <id>` — works from any shell.
@@ -275,11 +276,11 @@ remote backends + sessions). Roadmap:
 - **v0.6 PR 3** ✅ Workspace backends (`rustic_core` — local + S3/R2).
 - **v0.6 PR 4** ✅ RemoteSsh backend.
 - **v0.6 PR 5** ✅ RemoteE2b backend.
-- **v0.6 PR 6** ✅ Sessions (list/attach/detach) — E2B.
+- **v0.6 PR 6** ✅ Sessions (list/attach/detach) across local Docker,
+  E2B, and SSH.
 - **v0.6 PR 7** ✅ Polish + docs/README rewrite (this one).
-- **v0.7+** SSH session persistence (tmux), local-rustic workspace
-  handoff over the wire (PR 4.1), `PerPillboxRegistry<T>` lift,
-  optional cloud sidecar for the vault.
+- **v0.7+** local-rustic workspace handoff over the wire (PR 4.1),
+  `PerPillboxRegistry<T>` lift, optional cloud sidecar for the vault.
 
 ## Build
 

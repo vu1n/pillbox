@@ -380,14 +380,6 @@ enum Command {
         #[arg(last = true, value_name = "CMD")]
         argv: Vec<String>,
     },
-    /// Internal: attach a real terminal to a local pty-host socket. The
-    /// human front-end of the attach transport (Ctrl-A D to detach).
-    #[command(hide = true)]
-    PtyAttach {
-        /// Unix socket a `pty-host` is listening on.
-        #[arg(long, value_name = "PATH")]
-        sock: String,
-    },
     /// Internal: verbatim byte pump between a pty-host socket and stdio.
     /// Run inside a sandbox by the per-attach transport (docker exec / ssh)
     /// so one client's frames reach the pty-host. See docs/attach-transport.md.
@@ -629,7 +621,6 @@ fn run(cli: Cli) -> Result<()> {
         // Internal attach-transport commands. No pillbox resolution: they
         // operate on a raw PTY + socket and are invoked by pillbox itself.
         Command::PtyHost { sock, argv } => attach::host::run(&sock, &argv),
-        Command::PtyAttach { sock } => attach::pump::attach_unix(&sock).map(|_| ()),
         Command::PtyRelay { sock } => attach::relay::run(&sock),
     }
 }

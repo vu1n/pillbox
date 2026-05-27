@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use super::frame::Frame;
 
@@ -37,15 +37,6 @@ pub(crate) enum Outcome {
     Detached,
     /// The pipe closed without an Exit frame (host gone / transport dropped).
     Disconnected,
-}
-
-/// Connect a real terminal to a pty-host listening on a local unix socket.
-/// This is an explicit attach, so detach is enabled.
-pub(crate) fn attach_unix(sock: &str) -> Result<Outcome> {
-    let stream = std::os::unix::net::UnixStream::connect(sock)
-        .with_context(|| format!("connecting to pty-host at {sock}"))?;
-    let read_half = stream.try_clone().context("cloning socket read half")?;
-    attach_terminal(read_half, stream, true)
 }
 
 /// Attach a real terminal and pump until the agent exits or the user

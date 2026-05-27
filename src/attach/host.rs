@@ -57,6 +57,12 @@ pub(crate) fn run(sock: &str, argv: &[String]) -> Result<()> {
 
     let mut cmd = CommandBuilder::new(program);
     cmd.args(args);
+    // CommandBuilder defaults cwd to $HOME when unset — but the agent must
+    // start in the workspace (the backend sets the host process's cwd, e.g.
+    // docker `-w /workspace/<name>`). Inherit it explicitly.
+    if let Ok(cwd) = std::env::current_dir() {
+        cmd.cwd(cwd);
+    }
     // portable-pty switches to explicit-env mode the moment we set any var,
     // so inherit the full environment first (the agent needs HOME, PATH,
     // and the secrets/env the backend injected via `docker run -e`), then

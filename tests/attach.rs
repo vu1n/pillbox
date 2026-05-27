@@ -145,9 +145,21 @@ fn docker_transport_propagates_output_and_exit_code() {
     let cid = String::from_utf8(
         Command::new("docker")
             .args([
-                "run", "-d", &image, "pillbox", "pty-host", "--sock", &sock, "--", "bash", "-c",
+                "run",
+                "-d",
+                "-w",
+                "/workspace",
+                &image,
+                "pillbox",
+                "pty-host",
+                "--sock",
+                &sock,
+                "--",
+                "bash",
+                "-c",
             ])
-            .arg("printf 'PILLBOXPHASE2OK\\n'; sleep 1; exit 7")
+            // `pwd` proves the agent inherits the host's cwd (not $HOME).
+            .arg("pwd; printf 'PILLBOXPHASE2OK\\n'; sleep 1; exit 7")
             .output()
             .expect("docker run")
             .stdout,
@@ -190,6 +202,10 @@ fn docker_transport_propagates_output_and_exit_code() {
     assert!(
         acc.windows(MARKER.len()).any(|w| w == MARKER),
         "agent output did not propagate through the docker transport"
+    );
+    assert!(
+        acc.windows(b"/workspace".len()).any(|w| w == b"/workspace"),
+        "agent did not start in the workspace cwd (got $HOME instead?)"
     );
     assert_eq!(
         exit_code,

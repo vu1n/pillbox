@@ -132,8 +132,10 @@ sanitized for ANSI/control escapes first.
 
 A session is created when:
 
-1. `pillbox run --remote NAME --detach` succeeds, OR
-2. (Future) the user presses Ctrl-A D during an interactive remote run.
+1. `pillbox run --detach` succeeds (locally or with `--remote NAME`), OR
+2. (Future) the user presses Ctrl-A D during an interactive run — a
+   foreground run currently passes Ctrl-A through and has no persisted
+   record to leave behind.
 
 The record lives at `<pillbox>/sessions/<id>.toml`. ID is 12 hex
 chars (48 bits). Per-pillbox, no inheritance — a session is concrete
@@ -158,7 +160,7 @@ When attached, **Ctrl-A** is the prefix:
 | Sequence | Effect |
 |---|---|
 | Ctrl-A D | Detach from the session. Sandbox keeps running. |
-| Ctrl-A Ctrl-A | Sends a literal Ctrl-A to the remote PTY (so readline beginning-of-line still works inside the sandbox). |
+| Ctrl-A Ctrl-A | Sends a literal Ctrl-A to the session PTY (so readline beginning-of-line still works inside the sandbox). |
 
 Detach can also come from another shell: `pillbox session detach
 <id>` reads `attached_pid` from the record and SIGTERMs that
@@ -177,18 +179,19 @@ process. The attached pillbox catches SIGTERM via the helper's
 
 ### Backend coverage today
 
-| Operation | ssh:// | e2b:// |
-|---|---|---|
-| `run --remote` interactive | ✅ | ✅ |
-| `run --remote --detach` | ❌ (not yet) | ✅ |
-| `session attach` | ❌ (not yet) | ✅ |
-| `session detach` | ✅ (kills attached pillbox) | ✅ |
-| `session rm` | ❌ (not yet) | ✅ |
-| `session list` / `info` | ✅ (records, if any) | ✅ |
+| Operation | local docker | ssh:// | e2b:// |
+|---|---|---|---|
+| `run` / `run --remote` interactive | ✅ | ✅ | ✅ |
+| `run --detach` | ✅ | ✅ | ✅ |
+| `session attach` | ✅ | ✅ | ✅ |
+| `session detach` | ✅ (kills attached pillbox) | ✅ | ✅ |
+| `session rm` | ✅ | ✅ | ✅ |
+| `session list` / `info` | ✅ | ✅ | ✅ |
 
-SSH session persistence needs a tmux-on-the-remote integration. Today
-the SSH backend errors loudly on `--detach` with the not-yet-
-implemented hint; landing in a follow-up.
+Each backend carries the same attach-transport frames over its own
+byte pipe: docker exec stdio (local), ssh stdio (ssh), and E2B's
+`pty.connect` stream (e2b). Local `--detach` does NOT support
+`--vault` — the host-side stub-swap proxy can't outlive the CLI.
 
 ## Forward compatibility
 

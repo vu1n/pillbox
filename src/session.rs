@@ -15,10 +15,11 @@
 //!
 //! ## Backend coverage
 //!
-//! Only `e2b` backed sessions exist today — E2B's `sandbox.pty.connect`
-//! gives us a clean reattach primitive. SSH-backed sessions error
-//! loudly on `--detach` / `session attach`; the tmux-based path lands
-//! in a follow-up.
+//! `e2b`, `docker`, and `ssh` backends all mint sessions today. They
+//! reattach through the same shared attach transport (frame protocol +
+//! pump): e2b over `sandbox.pty.connect`, docker over `docker exec`, ssh
+//! over an ssh-exec'd `pty-relay` to a persistent remote pty-host. The
+//! `backend` string drives dispatch in `commands::session`.
 //!
 //! ## Threat model
 //!
@@ -139,14 +140,17 @@ pub(crate) struct Session {
     /// Name of the remote this session lives on (resolved via the
     /// remote registry on reattach so per-host details aren't stale).
     pub(crate) remote: String,
-    /// Backend kind — one of [`BACKEND_E2B`], [`BACKEND_SSH`].
+    /// Backend kind — one of [`BACKEND_E2B`], [`BACKEND_SSH`],
+    /// [`BACKEND_DOCKER`].
     pub(crate) backend: String,
     /// Opaque handle the backend uses to find this session again.
-    /// For E2B: the sandbox id (`sb_xxx`). For SSH (future): the tmux
-    /// session name.
+    /// For E2B: the sandbox id (`sb_xxx`). For Docker: the container id.
+    /// For SSH: the remote pty-host's unix socket path (the per-session
+    /// `/tmp/pillbox-attach-<id>.sock`).
     pub(crate) sandbox_id: String,
     /// PTY process id inside the backend. For E2B: the pid returned by
-    /// `sandbox.pty.create`. For SSH (future): 0 (tmux finds by name).
+    /// `sandbox.pty.create`. For Docker / SSH: 0 — the relay finds the
+    /// pty-host by socket path, not pid.
     #[serde(default)]
     pub(crate) pty_pid: i64,
     /// Agent that's running inside (`claude` | `codex` | …).

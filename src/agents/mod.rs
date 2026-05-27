@@ -291,10 +291,10 @@ pub(crate) struct RunOpts {
     /// inputs (proxy URL, detach flag, etc.) can be added without
     /// expanding the trait's signature.
     pub(crate) remote_name: Option<String>,
-    /// `--detach` — start the remote session and exit. The session is
-    /// recorded in the per-pillbox registry and the user reattaches
-    /// with `pillbox session attach <id>`. v0.6: e2b:// remotes only
-    /// (ssh:// is hard-errored by the SSH backend).
+    /// `--detach` — start the session and exit. The session is recorded
+    /// in the per-pillbox registry and the user reattaches with `pillbox
+    /// session attach <id>`. Supported on local Docker, e2b://, and
+    /// ssh:// backends (each persists the in-sandbox pty-host).
     pub(crate) detach: bool,
     /// `--label TEXT` — human label for a detached session, surfaced
     /// in `pillbox session list`. Only meaningful with `--detach`.

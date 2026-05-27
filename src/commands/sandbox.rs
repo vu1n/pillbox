@@ -23,8 +23,8 @@ use crate::agents::harness::{self, HarnessAdapter, ServeAdapter};
 use crate::agents::{workspace_mount_name, GUEST_HOME, GUEST_WORKSPACE};
 use crate::cli::SandboxAction;
 use crate::contract::{
-    Event, EventSink, ExecExit, ExecOutput, ExecStarted, JsonlSink, Payload, RunFinished,
-    RunStarted, StdStream, ToolStatus,
+    Correlation, Event, EventEmitter, EventSink, ExecExit, ExecOutput, ExecStarted, JsonlSink,
+    Payload, RunFinished, RunStarted, StdStream, ToolStatus,
 };
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
@@ -202,21 +202,16 @@ fn agent(resolved: &Pillbox, id: &str, json: bool, prompt: Vec<String>) -> Resul
 /// events to a sink — independent of which harness or sink is in play.
 struct AgentDriver {
     adapter: Box<dyn HarnessAdapter>,
-    sink: Box<dyn EventSink>,
-    sandbox_id: String,
-    run_id: String,
-    seq: u64,
+    emitter: EventEmitter,
     buf: Vec<u8>,
 }
 
 impl AgentDriver {
     fn new(adapter: Box<dyn HarnessAdapter>, sink: Box<dyn EventSink>, sandbox_id: String) -> Self {
+        let run_id = crate::registry::new_id();
         Self {
             adapter,
-            sink,
-            sandbox_id,
-            run_id: crate::registry::new_id(),
-            seq: 0,
+            emitter: EventEmitter::new(sink, sandbox_id, Correlation::Run(run_id)),
             buf: Vec::new(),
         }
     }
@@ -245,10 +240,7 @@ impl AgentDriver {
             return Ok(()); // tolerate non-JSON noise on the stream
         };
         for payload in self.adapter.parse_line(&value) {
-            self.seq += 1;
-            self.sink.emit(
-                &Event::durable(self.seq, &self.sandbox_id, payload).with_run(&self.run_id),
-            )?;
+            self.emitter.emit(payload)?;
         }
         Ok(())
     }
@@ -274,10 +266,7 @@ impl AgentDriver {
 /// the adapter reports a terminal event (`session.idle`).
 struct ServeDriver {
     adapter: Box<dyn ServeAdapter>,
-    sink: Box<dyn EventSink>,
-    sandbox_id: String,
-    run_id: String,
-    seq: u64,
+    emitter: EventEmitter,
     /// Set once a terminal event (`session.idle` → `RunFinished`) is emitted,
     /// so `run` can synthesize a `RunFinished` fallback if the stream ends
     /// (server died, connection dropped) without one.
@@ -291,22 +280,17 @@ const SERVE_PORT: u16 = 47821;
 
 impl ServeDriver {
     fn new(adapter: Box<dyn ServeAdapter>, sink: Box<dyn EventSink>, sandbox_id: String) -> Self {
+        let run_id = crate::registry::new_id();
         Self {
             adapter,
-            sink,
-            sandbox_id,
-            run_id: crate::registry::new_id(),
-            seq: 0,
+            emitter: EventEmitter::new(sink, sandbox_id, Correlation::Run(run_id)),
             terminal_seen: false,
         }
     }
 
-    /// Emit one payload to the sink, assigning the next durable seq and the
-    /// driver's run id. Mirrors `AgentDriver::emit_line`'s per-payload emit.
+    /// Emit one payload through the shared emitter (durable seq + run id).
     fn emit(&mut self, payload: Payload) -> Result<()> {
-        self.seq += 1;
-        self.sink
-            .emit(&Event::durable(self.seq, &self.sandbox_id, payload).with_run(&self.run_id))
+        self.emitter.emit(payload)
     }
 
     fn run(&mut self, container: &str, prompt: &str) -> Result<()> {
@@ -529,38 +513,30 @@ fn exec(resolved: &Pillbox, id: &str, json: bool, argv: Vec<String>) -> Result<(
 /// Structured mode: emit the contract's exec events as JSONL on stdout.
 /// pillbox exits 0 here — the command's exit code rides in `ExecExit`.
 fn exec_json(record: &Sandbox, argv: &[String]) -> Result<()> {
-    let stdout = io::stdout();
-    let mut sink = JsonlSink::new(stdout.lock());
-    // Distinct from the sandbox id so a consumer can correlate concurrent
-    // execs on the same sandbox.
+    // A distinct per-exec id (≠ sandbox id) so a consumer can correlate
+    // concurrent execs on the same sandbox.
     let exec_id = crate::registry::new_id();
-    let mut seq = 0u64;
-    let mut emit = |sink: &mut JsonlSink<_>, payload| {
-        seq += 1;
-        sink.emit(&Event::durable(seq, &record.id, payload).with_exec(&exec_id))
-    };
+    let mut emitter = EventEmitter::new(
+        Box::new(JsonlSink::new(io::stdout())),
+        record.id.clone(),
+        Correlation::Exec(exec_id),
+    );
 
-    emit(
-        &mut sink,
-        Payload::ExecStarted(ExecStarted {
-            argv: argv.to_vec(),
-        }),
-    )?;
+    emitter.emit(Payload::ExecStarted(ExecStarted {
+        argv: argv.to_vec(),
+    }))?;
     let code = docker::exec_streamed(&record.backend_ref, argv, |is_stderr, bytes| {
         let stream = if is_stderr {
             StdStream::Stderr
         } else {
             StdStream::Stdout
         };
-        emit(
-            &mut sink,
-            Payload::ExecOutput(ExecOutput {
-                stream,
-                data: base64::engine::general_purpose::STANDARD.encode(bytes),
-            }),
-        )
+        emitter.emit(Payload::ExecOutput(ExecOutput {
+            stream,
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        }))
     })?;
-    emit(&mut sink, Payload::ExecExit(ExecExit { code }))?;
+    emitter.emit(Payload::ExecExit(ExecExit { code }))?;
     Ok(())
 }
 

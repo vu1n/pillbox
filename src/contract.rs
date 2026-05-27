@@ -359,6 +359,48 @@ impl<W: Write> EventSink for JsonlSink<W> {
     }
 }
 
+/// What a run's events correlate to — an agent `run` or a one-off `exec`.
+/// Selects which id the emitter stamps on each [`Event`].
+pub(crate) enum Correlation {
+    Run(String),
+    Exec(String),
+}
+
+/// Per-run event emission: assigns the monotonic durable `seq`, stamps the
+/// sandbox + correlation id, and pushes to a sink. The single place that
+/// logic lives — shared by the exec path and both agent drivers.
+pub(crate) struct EventEmitter {
+    sink: Box<dyn EventSink>,
+    sandbox_id: String,
+    correlation: Correlation,
+    seq: u64,
+}
+
+impl EventEmitter {
+    pub(crate) fn new(
+        sink: Box<dyn EventSink>,
+        sandbox_id: String,
+        correlation: Correlation,
+    ) -> Self {
+        Self {
+            sink,
+            sandbox_id,
+            correlation,
+            seq: 0,
+        }
+    }
+
+    pub(crate) fn emit(&mut self, payload: Payload) -> Result<()> {
+        self.seq += 1;
+        let event = Event::durable(self.seq, &self.sandbox_id, payload);
+        let event = match &self.correlation {
+            Correlation::Run(id) => event.with_run(id),
+            Correlation::Exec(id) => event.with_exec(id),
+        };
+        self.sink.emit(&event)
+    }
+}
+
 fn is_false(b: &bool) -> bool {
     !*b
 }

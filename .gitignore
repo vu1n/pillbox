@@ -2,3 +2,8 @@
 
 # Agent worktrees created by the Claude Code harness (locked, ephemeral).
 .claude/worktrees/
+
+# Local-only env (secrets like E2B_API_KEY for dev/test). Never commit.
+.env
+.env.local
+.env.*.local

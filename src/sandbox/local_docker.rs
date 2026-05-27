@@ -184,6 +184,7 @@ impl SandboxBackend for LocalDocker {
         args.extend(opts.args);
 
         let container = docker::run_detached(&args)?;
+        // Foreground interactive run: no persisted session, so detach is off.
 
         if opts.detach {
             // vault was rejected above, so there's no host-side proxy to keep
@@ -228,7 +229,7 @@ impl SandboxBackend for LocalDocker {
             return Ok(());
         }
 
-        let outcome = attach_via_exec(&container);
+        let outcome = attach_via_exec(&container, false);
         // The vault proxy must stay up for the whole attached session.
         drop(vault_session);
         // Foreground run: tear the container down regardless of outcome.
@@ -246,8 +247,10 @@ impl SandboxBackend for LocalDocker {
 }
 
 /// Attach the terminal pump to a running pty-host container by execing the
-/// per-attach relay and pumping over its stdio.
-fn attach_via_exec(container: &str) -> Result<Outcome> {
+/// per-attach relay and pumping over its stdio. `detach_enabled` is false
+/// for a foreground `run` (no session to leave behind, so Ctrl-A passes
+/// through and SIGTERM terminates) and true for `session attach`.
+fn attach_via_exec(container: &str, detach_enabled: bool) -> Result<Outcome> {
     let mut child = docker::exec_attach(
         container,
         &[
@@ -259,7 +262,7 @@ fn attach_via_exec(container: &str) -> Result<Outcome> {
     )?;
     let stdout = child.stdout.take().context("docker exec relay stdout")?;
     let stdin = child.stdin.take().context("docker exec relay stdin")?;
-    let outcome = pump::attach_terminal(stdout, stdin)?;
+    let outcome = pump::attach_terminal(stdout, stdin, detach_enabled)?;
     // Don't leave the relay exec lingering.
     let _ = child.kill();
     let _ = child.wait();
@@ -277,7 +280,7 @@ pub(crate) fn reattach(resolved: &Pillbox, session: &Session) -> Result<()> {
     eprintln!("pillbox: detach with Ctrl-A D (the container keeps running).");
 
     session::mark_attached(resolved, &session.id, std::process::id() as i64)?;
-    let outcome = attach_via_exec(&session.sandbox_id);
+    let outcome = attach_via_exec(&session.sandbox_id, true);
     // Always clear the attached stamp; the record is still valid.
     let _ = session::mark_detached(resolved, &session.id);
 

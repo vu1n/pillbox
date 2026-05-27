@@ -11,8 +11,9 @@
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::mpsc::{channel, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
@@ -22,6 +23,16 @@ use super::screen::ScreenModel;
 
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
+
+/// Count of client writer threads still draining; the reader waits on this
+/// (bounded) after broadcasting the Exit frame so the exit code actually
+/// reaches clients before the host process tears down. `(count, condvar)`.
+type WriterGate = Arc<(Mutex<usize>, Condvar)>;
+
+/// Upper bound on how long the reader waits for writers to flush the Exit
+/// frame before exiting anyway — covers a wedged/slow client that would
+/// otherwise hang teardown forever.
+const EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// What the broadcast carries to each client's writer thread.
 enum Out {
@@ -88,11 +99,12 @@ pub(crate) fn run(sock: &str, argv: &[String]) -> Result<()> {
         screen: ScreenModel::new(DEFAULT_COLS, DEFAULT_ROWS),
         clients: Vec::new(),
     }));
+    let gate: WriterGate = Arc::new((Mutex::new(0usize), Condvar::new()));
 
     // PTY reader: feed the screen model + fan out raw bytes to clients.
     // Owns the child so it can read the exit code on EOF.
     {
-        let hub = hub.clone();
+        let (hub, gate) = (hub.clone(), gate.clone());
         thread::spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
@@ -110,23 +122,37 @@ pub(crate) fn run(sock: &str, argv: &[String]) -> Result<()> {
             // Child exited. Broadcast its code as an Exit frame so attached
             // clients can propagate it (e.g. a non-detached `pillbox run`
             // returns the agent's status), then exit so the container stops.
-            let code = child.wait().map(|s| s.exit_code() as i32).unwrap_or(0);
+            // A wait() error means we couldn't determine the status — treat
+            // that as failure (1), never silently as success (0).
+            let code = child.wait().map(|s| s.exit_code() as i32).unwrap_or(1);
             {
                 let mut h = hub.lock().unwrap();
                 h.clients.retain(|c| c.send(Out::Exit(code)).is_ok());
             }
-            // Give the per-client writer threads a moment to encode the Exit
-            // frame (each shuts its own socket right after) before the host
-            // process tears down.
-            thread::sleep(std::time::Duration::from_millis(250));
+            // Wait for the per-client writers to actually encode + flush the
+            // Exit frame (each then shuts its socket), instead of guessing
+            // with a fixed sleep that loses the code under output backlog.
+            // Bounded so a wedged client can't hang teardown forever.
+            let (count, cvar) = &*gate;
+            let mut n = count.lock().unwrap();
+            let deadline = Instant::now() + EXIT_DRAIN_TIMEOUT;
+            while *n > 0 {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                n = cvar.wait_timeout(n, remaining).unwrap().0;
+            }
+            drop(n);
             std::process::exit(0);
         });
     }
 
     let listener = UnixListener::bind(sock).with_context(|| format!("binding {sock}"))?;
     for stream in listener.incoming().flatten() {
-        let (hub, writer, master) = (hub.clone(), writer.clone(), master.clone());
-        thread::spawn(move || handle_client(stream, hub, writer, master));
+        let (hub, writer, master, gate) =
+            (hub.clone(), writer.clone(), master.clone(), gate.clone());
+        thread::spawn(move || handle_client(stream, hub, writer, master, gate));
     }
     Ok(())
 }
@@ -136,6 +162,7 @@ fn handle_client(
     hub: Arc<Mutex<Hub>>,
     writer: SharedWriter,
     master: SharedMaster,
+    gate: WriterGate,
 ) {
     let mut wstream = match stream.try_clone() {
         Ok(s) => s,
@@ -158,9 +185,13 @@ fn handle_client(
 
     // Writer thread: broadcast -> Data/Exit frames. On Exit, flush then
     // shut the socket down so the client sees the exit code followed by a
-    // clean EOF immediately — independent of how fast the host process
-    // tears down afterwards (otherwise the Exit frame can race the
-    // reader thread's process::exit and be lost).
+    // clean EOF immediately. The reader's teardown waits on `gate` until
+    // this thread finishes, so the Exit frame can't be lost to a race.
+    {
+        let mut count = gate.0.lock().unwrap();
+        *count += 1;
+    }
+    let writer_gate = gate.clone();
     thread::spawn(move || {
         while let Ok(out) = rx.recv() {
             let (frame, is_exit) = match out {
@@ -175,6 +206,9 @@ fn handle_client(
                 break;
             }
         }
+        let (count, cvar) = &*writer_gate;
+        *count.lock().unwrap() -= 1;
+        cvar.notify_all();
     });
 
     // This thread: client -> Input / Resize / Hello.

@@ -355,9 +355,11 @@ impl SandboxBackend for RemoteSshSandbox {
 
         // Interactive: attach the terminal pump over an ssh relay exec,
         // then tear the remote host down regardless of how it ended
-        // (mirrors `local_docker::run`'s foreground path).
-        eprintln!("pillbox: detach with Ctrl-A D (the session keeps running).");
-        let outcome = attach_via_ssh(&url, &remote);
+        // (mirrors `local_docker::run`'s foreground path). Detach is OFF for
+        // a foreground run — there's no persisted session to reattach to, so
+        // we must NOT advertise or honor Ctrl-A D here (it would silently
+        // destroy the run); Ctrl-A passes through to the agent instead.
+        let outcome = attach_via_ssh(&url, &remote, false);
         let _ = kill_pty_host(&url, &remote);
 
         match outcome? {
@@ -535,7 +537,7 @@ fn launch_pty_host(url: &SshUrl, remote: &RemoteSession, spec: &AgentSpec) -> Re
 /// `local_docker::attach_via_exec` — the only difference is the transport
 /// (ssh exec vs docker exec). NO `-t`: the relay speaks binary frames, so
 /// the pipe must stay byte-clean.
-fn attach_via_ssh(url: &SshUrl, remote: &RemoteSession) -> Result<Outcome> {
+fn attach_via_ssh(url: &SshUrl, remote: &RemoteSession, detach_enabled: bool) -> Result<Outcome> {
     let mut cmd = ssh_base(url);
     cmd.arg(format!(
         "{REMOTE_PILLBOX} pty-relay --sock '{}'",
@@ -556,7 +558,7 @@ fn attach_via_ssh(url: &SshUrl, remote: &RemoteSession) -> Result<Outcome> {
         .stdin
         .take()
         .context("ssh relay stdin unexpectedly closed")?;
-    let outcome = pump::attach_terminal(stdout, stdin)?;
+    let outcome = pump::attach_terminal(stdout, stdin, detach_enabled)?;
     // Don't leave the relay ssh exec lingering once the pump returns.
     let _ = child.kill();
     let _ = child.wait();
@@ -616,7 +618,7 @@ pub(crate) fn reattach(resolved: &Pillbox, remote: &Remote, session: &Session) -
     eprintln!("pillbox: detach with Ctrl-A D (the session keeps running).");
 
     session::mark_attached(resolved, &session.id, std::process::id() as i64)?;
-    let outcome = attach_via_ssh(&url, &rs);
+    let outcome = attach_via_ssh(&url, &rs, true);
     let _ = session::mark_detached(resolved, &session.id);
 
     match outcome? {

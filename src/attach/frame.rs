@@ -7,6 +7,13 @@
 
 use std::io::{self, Read, Write};
 
+/// Hard cap on a single frame's payload. The length prefix is attacker- /
+/// peer-controlled (a buggy or hostile client on the pty-host socket, or a
+/// corrupt transport), so `decode` must refuse oversized frames instead of
+/// pre-allocating `vec![0u8; len]` for up to 4 GiB. 64 MiB is far above any
+/// real snapshot/scrollback yet bounds a single bad header to a clean error.
+const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
+
 // Frame type tags. Stable across a PROTO_VERSION; add new tags at the end.
 const T_HELLO: u8 = 1;
 const T_SNAPSHOT: u8 = 2;
@@ -67,6 +74,11 @@ impl Frame {
             Err(e) => return Err(e),
         }
         let len = u32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]) as usize;
+        if len > MAX_FRAME_LEN {
+            return Err(invalid(&format!(
+                "frame length {len} exceeds cap {MAX_FRAME_LEN}"
+            )));
+        }
         let mut payload = vec![0u8; len];
         r.read_exact(&mut payload)?;
         Ok(Some(Frame::from_wire(hdr[0], payload)?))
@@ -217,5 +229,14 @@ mod tests {
         buf.extend_from_slice(&10u32.to_be_bytes()); // claims 10 bytes
         buf.extend_from_slice(b"only4"); // but supplies 5
         assert!(Frame::decode(&mut buf.as_slice()).is_err());
+    }
+
+    #[test]
+    fn oversized_length_is_rejected_without_allocating() {
+        // A header claiming ~4 GiB must error, not attempt the allocation.
+        let mut buf = vec![T_DATA];
+        buf.extend_from_slice(&u32::MAX.to_be_bytes());
+        let err = Frame::decode(&mut buf.as_slice()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

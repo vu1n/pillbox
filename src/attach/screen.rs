@@ -46,8 +46,10 @@ impl ScreenModel {
         if screen.alternate_screen() {
             out.extend_from_slice(b"\x1b[?1049h");
         }
+        // state_formatted() already writes the grid (contents_formatted) plus
+        // the input modes + title — it's a superset, so we must NOT also
+        // append contents_formatted() or the whole screen ships twice.
         out.extend_from_slice(&screen.state_formatted());
-        out.extend_from_slice(&screen.contents_formatted());
         out
     }
 }

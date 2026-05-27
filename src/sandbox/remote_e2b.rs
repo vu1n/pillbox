@@ -38,7 +38,7 @@
 
 use std::{
     io::{self, BufRead, BufReader, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
 };
 
@@ -196,7 +196,7 @@ fn run_attach(
         PillboxError::runtime("run --remote (e2b)", format!("flush staged blob: {e}"))
     })?;
 
-    let helper = ensure_helper_extracted()?;
+    let helper = prepare_helper()?;
     eprintln!(
         "pillbox: connecting to `{remote_name}` (e2b://{}) …",
         e2b.template
@@ -349,7 +349,7 @@ pub(crate) fn reattach(resolved: &Pillbox, remote: &Remote, session: &Session) -
         )
         .into());
     }
-    let helper = ensure_helper_extracted()?;
+    let helper = prepare_helper()?;
     eprintln!(
         "pillbox: reattaching to `{}` (sandbox `{}`) …",
         remote.name, session.sandbox_id
@@ -423,7 +423,7 @@ pub(crate) fn kill_session(resolved: &Pillbox, session: &Session) -> Result<()> 
         )
         .into());
     }
-    let helper = ensure_helper_extracted()?;
+    let helper = prepare_helper()?;
     let mut cmd = Command::new("node");
     cmd.arg(&helper)
         .arg("kill")
@@ -613,6 +613,62 @@ pub(crate) fn ensure_helper_extracted() -> Result<PathBuf> {
             .with_context(|| format!("write {}", path.display()))?;
     }
     Ok(path)
+}
+
+/// Extract the helper *and* make its `e2b` import resolvable — the full
+/// prep the run paths need before spawning node. Kept separate from
+/// [`ensure_helper_extracted`] (which only writes the script) so unit
+/// tests can exercise extraction without requiring the `e2b` SDK to be
+/// installed on the test machine.
+fn prepare_helper() -> Result<PathBuf> {
+    let path = ensure_helper_extracted()?;
+    let cache_dir = path.parent().expect("helper path always has a parent dir");
+    ensure_e2b_module_linked(cache_dir)?;
+    Ok(path)
+}
+
+/// Make the helper's bare `import { Sandbox } from "e2b"` resolve.
+///
+/// The helper runs from `~/.pillbox/cache/`, where node's ESM resolver
+/// finds no `node_modules` — and the SDK is installed *globally* (`npm i
+/// -g e2b`), which ESM resolution ignores (NODE_PATH only affects CJS).
+/// So symlink the global package into the cache's `node_modules`; node
+/// then resolves the bare specifier the normal way. Without this the
+/// helper dies with `ERR_MODULE_NOT_FOUND` before it can do anything.
+fn ensure_e2b_module_linked(cache_dir: &Path) -> Result<()> {
+    let out = Command::new("npm")
+        .args(["root", "-g"])
+        .output()
+        .context("running `npm root -g` — is Node/npm installed?")?;
+    if !out.status.success() {
+        return Err(PillboxError::resource(
+            "run --remote (e2b)",
+            "couldn't locate the global npm modules directory",
+        )
+        .with_next("install Node.js, then `npm i -g e2b`")
+        .into());
+    }
+    let global_e2b = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()).join("e2b");
+    if !global_e2b.exists() {
+        return Err(PillboxError::resource(
+            "run --remote (e2b)",
+            "the `e2b` SDK isn't installed globally",
+        )
+        .with_next("npm i -g e2b")
+        .into());
+    }
+    let node_modules = cache_dir.join("node_modules");
+    std::fs::create_dir_all(&node_modules)
+        .with_context(|| format!("create {}", node_modules.display()))?;
+    let link = node_modules.join("e2b");
+    // Idempotent: leave it if it already points at the current global SDK.
+    if link.read_link().is_ok_and(|t| t == global_e2b) {
+        return Ok(());
+    }
+    let _ = std::fs::remove_file(&link); // clear a stale link/file, if any
+    std::os::unix::fs::symlink(&global_e2b, &link)
+        .with_context(|| format!("symlink {} -> {}", link.display(), global_e2b.display()))?;
+    Ok(())
 }
 
 /// Hard cap on a single helper stderr line we'll buffer in memory.
@@ -836,6 +892,28 @@ mod tests {
             let p = ensure_helper_extracted().unwrap();
             let stem = p.file_stem().unwrap().to_str().unwrap();
             assert!(stem.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
+        });
+    }
+
+    // Needs the `e2b` SDK installed globally (`npm i -g e2b`), so it's not
+    // part of the default suite. Run: `cargo test --bin pillbox -- --ignored
+    // links_e2b_module`. Proves the symlink that makes the helper's
+    // `import "e2b"` resolve actually lands and points at the global SDK.
+    #[test]
+    #[ignore = "requires `npm i -g e2b`"]
+    fn links_e2b_module_into_cache() {
+        with_isolated_home("e2b-module-link", || {
+            let path = prepare_helper().unwrap();
+            let link = path.parent().unwrap().join("node_modules").join("e2b");
+            let target = link.read_link().expect("e2b should be symlinked");
+            assert!(
+                target.ends_with("e2b"),
+                "symlink should point at the e2b package"
+            );
+            assert!(
+                target.join("package.json").exists(),
+                "target must be the real SDK"
+            );
         });
     }
 

@@ -1,37 +1,48 @@
 //! Remote-SSH sandbox backend — `pillbox run --remote NAME`.
 //!
 //! Pillbox doesn't deploy itself; the user has already installed pillbox
-//! on the VPS (`brew install pillbox` / `cargo install pillbox`). PR 4
-//! just teaches the local pillbox how to (a) ship one run-worth of state
-//! over the wire and (b) re-spawn the agent on the remote inside its own
-//! LocalDocker sandbox.
+//! on the VPS (`brew install pillbox` / `cargo install pillbox`) at
+//! [`REMOTE_PILLBOX`]. This backend teaches the local pillbox how to
+//! (a) ship one run-worth of state over the wire and (b) drive an
+//! interactive, reattachable agent session on the remote.
 //!
-//! ## Flow (local side)
+//! ## Transport (phase 4 — the attach pty-host model)
+//!
+//! Mirrors `local_docker` over ssh instead of docker. The remote runs a
+//! persistent `pillbox pty-host` that owns the agent's PTY + screen
+//! model; the local terminal attaches over an ssh-exec'd `pillbox
+//! pty-relay` and the shared [`crate::attach::pump`]. Because the frame
+//! protocol + pump are shared across backends, ssh `--detach` /
+//! `session attach` / `session rm` fall out of the same primitives the
+//! docker + e2b backends use.
 //!
 //! 1. Parse `--remote NAME`, look up the [`Remote`] from the resolved
 //!    pillbox's `remotes/` registry (with global fallback).
-//! 2. Resolve `--with` entries locally (same code path as a local run):
-//!    real secret values + vault metadata.
+//! 2. Resolve `--with` entries + the workspace base into a
+//!    [`VaultStdinBlob`] (schema doc-commented below).
 //! 3. Refuse if the pillbox's workspace backend is `local` — remote
-//!    runs require an S3/R2-shaped rustic repo. The local side snapshots
-//!    the requested base and sends the repo coordinates + password in
-//!    the encrypted protocol blob.
-//! 4. Build a [`VaultStdinBlob`] (JSON; schema doc-commented below) and
-//!    feed it via stdin to `pillbox run --vault-stdin` on the remote.
-//! 5. Inherit stdout / stderr from the SSH session so the local terminal
-//!    sees the agent's PTY output (the remote turns interactive too —
-//!    openssh's `-tt` allocates a remote TTY).
+//!    runs require an S3/R2-shaped rustic repo (the remote rustic_core
+//!    needs the same bucket/endpoint).
+//! 4. Stage the secret-bearing blob to a remote 0600 temp file over a
+//!    non-PTY ssh exec ([`stage_blob`]) — it can't ride the relay's
+//!    keystroke channel.
+//! 5. Launch the remote pty-host detached so it outlives the launch ssh
+//!    session ([`launch_pty_host`]): `setsid pillbox pty-host --sock S --
+//!    pillbox run --vault-stdin --blob-file B`.
+//! 6. Interactive: attach the pump over `pillbox pty-relay` and tear the
+//!    host down on exit. `--detach`: persist a [`Session`] and return.
 //!
 //! ## Flow (remote side)
 //!
-//! `pillbox run --vault-stdin` reads the blob, decodes it into a
-//! [`VaultStdinBlob`], then dispatches a normal LocalDocker run with
-//! pre-resolved [`InlineSecret`] entries injected directly into the env
-//! (and into the vault session for vaulted secrets) — bypassing the
-//! local `secrets` store on the remote. Before Docker starts, the
-//! remote side restores the base snapshot into an isolated temp
-//! workspace and mounts that directory. After Docker exits, it pushes
-//! the result workspace back to the same repo.
+//! The pty-host's child is `pillbox run --vault-stdin`, the **same**
+//! remote entrypoint the e2b backend uses: it reads the blob, provisions
+//! a vault session, restores the base snapshot into an isolated temp
+//! workspace, runs the agent under LocalDocker, and pushes the result
+//! workspace back. Phase 4 reuses this verbatim — vault + workspace
+//! parity comes for free, no ssh-specific re-implementation. The only
+//! difference from the e2b path is `--blob-file` (vs `< blob`): the inner
+//! `docker run -it` needs a TTY on stdin, so the blob is read from a file
+//! and the child's stdin stays the pty-host's PTY.
 //!
 //! ## Vault-stdin blob schema (internal — `pillbox run --vault-stdin`)
 //!
@@ -86,14 +97,23 @@ use super::SandboxBackend;
 use crate::agents::{
     base_docker_args, workspace_mount_name, AgentSpec, RunOpts, GUEST_HOME, GUEST_WORKSPACE,
 };
+use crate::attach::pump::{self, Outcome};
 use crate::config::BackendKind;
 use crate::docker;
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
-use crate::remote::{parse_ssh_url, Remote};
+use crate::remote::{parse_ssh_url, Remote, SshUrl};
+use crate::session::{self, Session, BACKEND_SSH};
 use crate::vault::{OAuthAgent, VaultMeta, VaultSession};
 use crate::workspace::rustic::{RusticBackend, RusticVariant, S3Config, PASSWORD_FILE};
 use crate::workspace::{PushOptions, SnapshotHandle, WorkspaceBackend};
+
+/// Absolute path to the remote `pillbox` binary. The user installs it
+/// separately (package / `cargo install`); we don't deploy it. Hard-coded
+/// rather than relying on the remote shell's `$PATH` because the launch
+/// runs through `ssh <dest> <command>` (a non-login shell on many hosts,
+/// where `/usr/local/bin` may be absent from `$PATH`).
+const REMOTE_PILLBOX: &str = "/usr/local/bin/pillbox";
 
 /// Wire format for `pillbox run --vault-stdin`. See module docs.
 ///
@@ -236,19 +256,6 @@ impl RemoteSshSandbox {
 
 impl SandboxBackend for RemoteSshSandbox {
     fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
-        // Session list/attach/detach is E2B-only today; the SSH path
-        // needs tmux-on-the-remote wiring for persistence (follow-up).
-        // Hard-error now so a user who tries `--detach` against an
-        // ssh:// remote gets a clear message instead of a half-detached
-        // run.
-        if opts.detach {
-            return Err(PillboxError::usage(
-                "run --remote --detach",
-                "ssh:// detached sessions are not yet implemented (tmux integration lands next). \
-                 Use `e2b://` remotes for `--detach` / `session attach` today, or run interactively against ssh.",
-            )
-            .into());
-        }
         // Workspace handoff rule: S3-shaped backends only. The remote
         // runs its own pillbox against the SAME `[workspace]` config —
         // bucket, endpoint, prefix all match, so no data has to cross
@@ -282,7 +289,6 @@ impl SandboxBackend for RemoteSshSandbox {
                 format!("remote `{}`: {e}", self.remote.name),
             )
         })?;
-        let destination = url.destination();
 
         // User-facing reassurance: SSH dial-up can stall for tens of
         // seconds on a cold connection, and the local terminal otherwise
@@ -293,8 +299,386 @@ impl SandboxBackend for RemoteSshSandbox {
             self.remote.name, self.remote.url
         );
 
-        run_over_ssh(&destination, &blob)
+        // Pre-mint the session id so the per-session remote sock / blob /
+        // log paths are unique and so a `--detach` record (and the kill
+        // path) reference a stable handle. Mirrors the e2b backend.
+        let session_id = Session::new_id();
+        let remote = RemoteSession::new(&session_id);
+
+        // Stage the blob to a remote 0600 temp file, then launch the
+        // pty-host as a persistent background process running
+        // `pillbox run --vault-stdin --blob-file <blob>` under the PTY.
+        // The blob can't ride the relay pipe (that carries user
+        // keystrokes) so it goes over a separate, non-PTY ssh exec —
+        // mirroring the e2b backend's "file, not stdin" reasoning.
+        stage_blob(&url, &remote, &blob)?;
+        launch_pty_host(&url, &remote, spec)?;
+
+        if opts.detach {
+            let s = Session {
+                id: session_id.clone(),
+                label: opts.label.clone(),
+                remote: self.remote.name.clone(),
+                backend: BACKEND_SSH.to_string(),
+                sandbox_id: remote.sock.clone(),
+                pty_pid: 0,
+                agent_id: spec.id.to_string(),
+                started_at: session::now_rfc3339(),
+                attached_pid: None,
+                base_snapshot: blob.workspace.base_snapshot.clone(),
+                result_snapshot: None,
+                expires_at: opts.ttl_seconds.map(session::expires_at_from_ttl),
+            };
+            session::write(resolved, &s)?;
+            crate::events::emit_session_event(
+                resolved,
+                crate::events::EventType::SessionStarted {
+                    parent_session_id: crate::events::parent_session_id_from_env(),
+                },
+                &s.id,
+                Some(&s),
+            );
+            if opts.json {
+                println!(
+                    "{}",
+                    crate::paths::json_v1(vec![("session", s.to_json_value())])
+                );
+            } else {
+                println!(
+                    "pillbox: ✓ session `{}` started in background on `{}`.",
+                    s.id, self.remote.name
+                );
+                println!("         pillbox session attach {}  # reattach", s.id);
+            }
+            return Ok(());
+        }
+
+        // Interactive: attach the terminal pump over an ssh relay exec,
+        // then tear the remote host down regardless of how it ended
+        // (mirrors `local_docker::run`'s foreground path).
+        eprintln!("pillbox: detach with Ctrl-A D (the session keeps running).");
+        let outcome = attach_via_ssh(&url, &remote);
+        let _ = kill_pty_host(&url, &remote);
+
+        match outcome? {
+            Outcome::Exited(0) | Outcome::Detached | Outcome::Disconnected => Ok(()),
+            Outcome::Exited(code) => Err(PillboxError::runtime(
+                "run --remote",
+                format!("{} exited with status {code}", spec.id),
+            )
+            .into()),
+        }
     }
+}
+
+/// Per-session remote paths. The sock is the addressable handle stored in
+/// the `Session` record (`sandbox_id`); blob + log are derived from the
+/// same id so `kill_session` can scrub them all without persisting three
+/// fields. Kept private and constructed only from a validated session id
+/// (12 ascii-hex chars), so the paths can never carry shell metacharacters.
+struct RemoteSession {
+    sock: String,
+    blob: String,
+    log: String,
+}
+
+impl RemoteSession {
+    fn new(session_id: &str) -> Self {
+        Self {
+            sock: format!("/tmp/pillbox-attach-{session_id}.sock"),
+            blob: format!("/tmp/pillbox-blob-{session_id}.json"),
+            log: format!("/tmp/pillbox-host-{session_id}.log"),
+        }
+    }
+
+    /// Reconstruct from a stored `Session.sandbox_id` (the sock path).
+    /// The blob is already consumed + unlinked by launch time, so only
+    /// the sock + log matter for reattach / kill; derive the log from
+    /// the id embedded in the sock path. Falls back to a sock-derived
+    /// log name if the shape is unexpected (hand-edited record).
+    fn from_sock(sock: &str) -> Self {
+        let id = sock
+            .strip_prefix("/tmp/pillbox-attach-")
+            .and_then(|s| s.strip_suffix(".sock"));
+        let (blob, log) = match id {
+            Some(id) => (
+                format!("/tmp/pillbox-blob-{id}.json"),
+                format!("/tmp/pillbox-host-{id}.log"),
+            ),
+            None => (format!("{sock}.blob"), format!("{sock}.log")),
+        };
+        Self {
+            sock: sock.to_string(),
+            blob,
+            log,
+        }
+    }
+}
+
+/// Common base for every short-lived ssh exec: keep the connection from
+/// being culled mid-run by aggressive NATs / firewalls, and disable
+/// pseudo-terminal allocation (`-T`) so the relay/stage pipes stay
+/// binary-clean. The destination + remote command are appended by the
+/// caller.
+fn ssh_base(url: &SshUrl) -> Command {
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-T").arg("-o").arg("ServerAliveInterval=30");
+    match url.port {
+        // A `user@host:port` positional destination isn't portable across
+        // openssh versions, so pass the port via `-p` and the bare
+        // `user@host` (which `destination()` returns when port is None)
+        // as the destination.
+        Some(port) => {
+            cmd.arg("-p")
+                .arg(port.to_string())
+                .arg(format!("{}@{}", url.user, url.host));
+        }
+        None => {
+            cmd.arg(url.destination());
+        }
+    }
+    cmd
+}
+
+/// Stage the secret-bearing blob into a 0600 file on the remote, piped
+/// over a non-PTY ssh exec (so it never crosses the relay's keystroke
+/// channel). `umask 077` makes the redirect-created file private before
+/// any bytes land.
+fn stage_blob(url: &SshUrl, remote: &RemoteSession, blob: &VaultStdinBlob) -> Result<()> {
+    let bytes = blob.to_bytes()?;
+    let mut cmd = ssh_base(url);
+    // `cat > file` with a leading `umask 077` keeps the staged blob
+    // private. The path is built from a validated session id so it
+    // carries no shell metacharacters; still single-quote it defensively.
+    cmd.arg(format!("umask 077; cat > '{}'", remote.blob));
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::inherit());
+    cmd.stderr(Stdio::inherit());
+
+    let mut child = cmd.spawn().map_err(|e| {
+        PillboxError::resource("run --remote", format!("could not spawn ssh: {e}"))
+            .with_next("ensure the openssh client is on PATH (`which ssh`)")
+    })?;
+    {
+        let stdin = child.stdin.as_mut().ok_or_else(|| {
+            PillboxError::runtime("run --remote", "ssh child stdin unexpectedly closed")
+        })?;
+        stdin
+            .write_all(&bytes)
+            .map_err(|e| PillboxError::runtime("run --remote", format!("stage blob: {e}")))?;
+    }
+    drop(child.stdin.take());
+    let status = child
+        .wait()
+        .map_err(|e| PillboxError::runtime("run --remote", format!("wait on ssh: {e}")))?;
+    if !status.success() {
+        return Err(PillboxError::runtime(
+            "run --remote",
+            format!("staging the blob over ssh failed (status {status})"),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Launch the in-remote pty-host as a persistent background process that
+/// outlives the launch ssh session. `setsid` detaches it from the ssh
+/// controlling terminal so closing the launch connection (or detaching)
+/// doesn't SIGHUP the host; output goes to a per-session log for
+/// post-mortem. The host runs `pillbox run --vault-stdin --blob-file
+/// <blob>` under the PTY — reusing the *entire* existing remote-side flow
+/// (workspace hydrate, vault session, `docker run -it`, result push), so
+/// vault/workspace parity falls out for free.
+fn launch_pty_host(url: &SshUrl, remote: &RemoteSession, spec: &AgentSpec) -> Result<()> {
+    // The child argv for the pty-host: the remote pillbox re-runs itself
+    // in `--vault-stdin` mode against the staged blob. `--blob-file`
+    // keeps the child's stdin as the PTY so the inner `docker run -it`
+    // gets a TTY.
+    //
+    // All interpolated values are pillbox-controlled (a fixed binary
+    // path, a session-id-derived sock/blob path); none come from user
+    // input, so single-quoting is belt-and-suspenders.
+    let launch = format!(
+        "setsid {pillbox} pty-host --sock '{sock}' -- \
+         {pillbox} run --vault-stdin --blob-file '{blob}' \
+         </dev/null >'{log}' 2>&1 &",
+        pillbox = REMOTE_PILLBOX,
+        sock = remote.sock,
+        blob = remote.blob,
+        log = remote.log,
+    );
+    let mut cmd = ssh_base(url);
+    cmd.arg(launch);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::inherit());
+    cmd.stderr(Stdio::inherit());
+    let status = cmd
+        .status()
+        .map_err(|e| PillboxError::resource("run --remote", format!("could not spawn ssh: {e}")))?;
+    if !status.success() {
+        return Err(PillboxError::runtime(
+            "run --remote",
+            format!(
+                "launching the remote pty-host failed (status {status}); \
+                 is `{REMOTE_PILLBOX}` installed on the remote?"
+            ),
+        )
+        .with_next("install pillbox on the remote host (package / `cargo install`)")
+        .into());
+    }
+    let _ = spec; // spec drives the blob's agent_id; argv is fixed here.
+    Ok(())
+}
+
+/// Attach the terminal pump to a running remote pty-host by execing the
+/// per-attach relay over ssh and pumping its stdio. Direct analogue of
+/// `local_docker::attach_via_exec` — the only difference is the transport
+/// (ssh exec vs docker exec). NO `-t`: the relay speaks binary frames, so
+/// the pipe must stay byte-clean.
+fn attach_via_ssh(url: &SshUrl, remote: &RemoteSession) -> Result<Outcome> {
+    let mut cmd = ssh_base(url);
+    cmd.arg(format!(
+        "{REMOTE_PILLBOX} pty-relay --sock '{}'",
+        remote.sock
+    ));
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::inherit());
+    let mut child = cmd.spawn().map_err(|e| {
+        PillboxError::resource("run --remote", format!("could not spawn ssh: {e}"))
+            .with_next("ensure the openssh client is on PATH (`which ssh`)")
+    })?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("ssh relay stdout unexpectedly closed")?;
+    let stdin = child
+        .stdin
+        .take()
+        .context("ssh relay stdin unexpectedly closed")?;
+    let outcome = pump::attach_terminal(stdout, stdin)?;
+    // Don't leave the relay ssh exec lingering once the pump returns.
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(outcome)
+}
+
+/// Kill the remote pty-host process and scrub its per-session files.
+/// Best-effort: `pkill` matches the unique sock path in the host's argv;
+/// the `rm -f` cleans the sock + log (the blob is already unlinked by the
+/// remote run, but remove it too in case the run never started).
+fn kill_pty_host(url: &SshUrl, remote: &RemoteSession) -> Result<()> {
+    let cmd_line = format!(
+        "pkill -f 'pty-host --sock {sock}' 2>/dev/null; rm -f '{sock}' '{blob}' '{log}'",
+        sock = remote.sock,
+        blob = remote.blob,
+        log = remote.log,
+    );
+    let mut cmd = ssh_base(url);
+    cmd.arg(cmd_line);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::inherit());
+    cmd.stderr(Stdio::inherit());
+    let status = cmd
+        .status()
+        .map_err(|e| PillboxError::resource("session rm", format!("could not spawn ssh: {e}")))?;
+    if !status.success() {
+        // pkill exits non-zero when nothing matched (host already gone);
+        // that's not an error for teardown.
+        return Ok(());
+    }
+    Ok(())
+}
+
+/// `pillbox session attach <id>` for an ssh session: re-open the relay to
+/// the still-running remote pty-host and pump. Mirrors
+/// `local_docker::reattach` and `remote_e2b::reattach`.
+pub(crate) fn reattach(resolved: &Pillbox, remote: &Remote, session: &Session) -> Result<()> {
+    if session::Backend::parse(&session.backend) != Some(session::Backend::Ssh) {
+        return Err(PillboxError::usage(
+            "session attach",
+            format!(
+                "session `{}` is backed by `{}`, not ssh",
+                session.id, session.backend
+            ),
+        )
+        .into());
+    }
+    let url = parse_ssh_url(&remote.url).map_err(|e| {
+        PillboxError::config("session attach", format!("remote `{}`: {e}", remote.name))
+    })?;
+    let rs = RemoteSession::from_sock(&session.sandbox_id);
+
+    eprintln!(
+        "pillbox: reattaching to session `{}` on `{}` …",
+        session.id, remote.name
+    );
+    eprintln!("pillbox: detach with Ctrl-A D (the session keeps running).");
+
+    session::mark_attached(resolved, &session.id, std::process::id() as i64)?;
+    let outcome = attach_via_ssh(&url, &rs);
+    let _ = session::mark_detached(resolved, &session.id);
+
+    match outcome? {
+        Outcome::Detached => {
+            eprintln!(
+                "pillbox: detached. reattach with `pillbox session attach {}`",
+                session.id
+            );
+            Ok(())
+        }
+        Outcome::Exited(code) => {
+            eprintln!(
+                "pillbox: agent exited ({code}). `pillbox session rm {}` to clean up.",
+                session.id
+            );
+            Ok(())
+        }
+        Outcome::Disconnected => {
+            eprintln!("pillbox: session connection closed.");
+            Ok(())
+        }
+    }
+}
+
+/// `pillbox session rm <id>` for an ssh session: kill the remote pty-host
+/// and scrub its files, then drop the local record unconditionally (a
+/// failed kill shouldn't strand the record; the host may already be gone).
+/// Mirrors `local_docker::kill_session`.
+pub(crate) fn kill_session(resolved: &Pillbox, remote: &Remote, session: &Session) -> Result<()> {
+    if session::Backend::parse(&session.backend) != Some(session::Backend::Ssh) {
+        return Err(PillboxError::usage(
+            "session rm",
+            format!(
+                "session `{}` is backed by `{}`, not ssh",
+                session.id, session.backend
+            ),
+        )
+        .into());
+    }
+    let rs = RemoteSession::from_sock(&session.sandbox_id);
+    match parse_ssh_url(&remote.url) {
+        Ok(url) => {
+            if let Err(e) = kill_pty_host(&url, &rs) {
+                eprintln!("pillbox: warning: remote pty-host teardown failed: {e}");
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "pillbox: warning: remote `{}` url unparseable ({e}); skipping remote teardown.",
+                remote.name
+            );
+        }
+    }
+    crate::events::emit_session_event(
+        resolved,
+        crate::events::EventType::SessionDropped,
+        &session.id,
+        Some(session),
+    );
+    session::delete(resolved, &session.id)?;
+    println!("pillbox: ✓ session `{}` removed.", session.id);
+    Ok(())
 }
 
 /// Build a [`VaultStdinBlob`] from `RunOpts` against the resolved pillbox.
@@ -459,71 +843,35 @@ fn resolve_base_snapshot(
     Ok(Some(handle.as_str().to_string()))
 }
 
-/// Connect, send the blob over stdin, proxy stdout/stderr/exit-status
-/// back to the parent shell. Uses the `ssh` binary directly (single
-/// short-lived subprocess). The user's `~/.ssh/config`, known_hosts,
-/// agent forwarding, etc. apply transparently. When PR 6 needs
-/// persistent multiplexed sessions for `session attach/detach`,
-/// switching to the `openssh` crate is local to this function.
-fn run_over_ssh(destination: &str, blob: &VaultStdinBlob) -> Result<()> {
-    let blob_bytes = blob.to_bytes()?;
-
-    // `-tt` forces a remote TTY even though our local stdin is a pipe.
-    // Without it the agent CLI can't enter raw mode for keystroke input.
-    // `-o ServerAliveInterval=30` keeps the connection from being culled
-    // mid-run by aggressive NATs / firewalls.
-    let mut cmd = Command::new("ssh");
-    cmd.arg("-tt")
-        .arg("-o")
-        .arg("ServerAliveInterval=30")
-        .arg(destination)
-        .arg("pillbox")
-        .arg("run")
-        .arg("--vault-stdin");
-    cmd.stdin(Stdio::piped());
-    cmd.stdout(Stdio::inherit());
-    cmd.stderr(Stdio::inherit());
-
-    let mut child = cmd.spawn().map_err(|e| {
-        PillboxError::resource("run --remote", format!("could not spawn ssh: {e}"))
-            .with_next("ensure the openssh client is on PATH (`which ssh`)")
-    })?;
-
-    {
-        let stdin = child.stdin.as_mut().ok_or_else(|| {
-            PillboxError::runtime("run --remote", "ssh child stdin unexpectedly closed")
-        })?;
-        stdin
-            .write_all(&blob_bytes)
-            .map_err(|e| PillboxError::runtime("run --remote", format!("send blob: {e}")))?;
-    }
-    // Closing stdin signals EOF to the remote so it can stop reading
-    // and proceed with the agent launch. We do this by dropping the
-    // handle (only way `std::process::ChildStdin` supports half-close).
-    drop(child.stdin.take());
-
-    let status = child
-        .wait()
-        .map_err(|e| PillboxError::runtime("run --remote", format!("wait on ssh: {e}")))?;
-    if !status.success() {
-        return Err(PillboxError::runtime(
-            "run --remote",
-            format!("ssh exited with status {status}"),
-        )
-        .into());
-    }
-    Ok(())
-}
-
 /// `pillbox run --vault-stdin` entry point — invoked by the local pillbox
-/// over SSH. Reads the blob from stdin, provisions a vault session for
+/// over SSH (and by the e2b sandbox-side wrapper). Reads the blob (from
+/// `blob_file` when set, else stdin), provisions a vault session for
 /// vaulted secrets, then runs the agent under the existing LocalDocker
-/// sandbox path. This is the **remote** half of the protocol.
-pub(crate) fn dispatch_vault_stdin(resolved: &Pillbox) -> Result<()> {
-    let mut buf = Vec::new();
-    std::io::stdin()
-        .read_to_end(&mut buf)
-        .map_err(|e| PillboxError::runtime("run --vault-stdin", format!("read stdin: {e}")))?;
+/// sandbox path. This is the **remote** half of the protocol — unchanged
+/// by phase 4, so the pty-host transport reuses the full workspace /
+/// vault / docker flow verbatim.
+///
+/// `blob_file` is set by the ssh pty-host transport ([`launch_pty_host`]):
+/// the inner `docker run -it` needs a TTY on stdin, so the blob can't ride
+/// stdin there — the launch path stages it to a remote temp file and
+/// points `--blob-file` at it. The e2b wrapper still pipes the blob
+/// through stdin (`< blob`), so that path passes `None`.
+pub(crate) fn dispatch_vault_stdin(resolved: &Pillbox, blob_file: Option<&Path>) -> Result<()> {
+    let buf = match blob_file {
+        Some(path) => fs::read(path).map_err(|e| {
+            PillboxError::runtime(
+                "run --vault-stdin",
+                format!("read blob file {}: {e}", path.display()),
+            )
+        })?,
+        None => {
+            let mut buf = Vec::new();
+            std::io::stdin().read_to_end(&mut buf).map_err(|e| {
+                PillboxError::runtime("run --vault-stdin", format!("read stdin: {e}"))
+            })?;
+            buf
+        }
+    };
     let blob = VaultStdinBlob::from_bytes(&buf)?;
 
     let spec = crate::agents::ALL
@@ -700,6 +1048,87 @@ mod tests {
             repo_password: "repo-password".into(),
             base_snapshot: Some("a".repeat(64)),
         }
+    }
+
+    #[test]
+    fn remote_session_paths_are_session_scoped() {
+        let rs = RemoteSession::new("abcdef012345");
+        assert_eq!(rs.sock, "/tmp/pillbox-attach-abcdef012345.sock");
+        assert_eq!(rs.blob, "/tmp/pillbox-blob-abcdef012345.json");
+        assert_eq!(rs.log, "/tmp/pillbox-host-abcdef012345.log");
+        // No shell metacharacters in any path — they're interpolated into
+        // ssh command lines, so this guards against a future id format
+        // that could break out of the single quotes.
+        for p in [&rs.sock, &rs.blob, &rs.log] {
+            assert!(
+                p.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.')),
+                "unexpected char in remote path `{p}`"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_session_from_sock_recovers_sibling_paths() {
+        // `session attach` / `session rm` reconstruct blob + log from the
+        // stored sock (the only handle persisted on the record), so a
+        // freshly-minted session and a round-tripped one must agree.
+        let minted = RemoteSession::new("0011aabbccdd");
+        let recovered = RemoteSession::from_sock(&minted.sock);
+        assert_eq!(recovered.sock, minted.sock);
+        assert_eq!(recovered.blob, minted.blob);
+        assert_eq!(recovered.log, minted.log);
+    }
+
+    #[test]
+    fn remote_session_from_sock_tolerates_unexpected_shape() {
+        // A hand-edited / older record might not match the minting
+        // pattern; `from_sock` must still produce *some* sibling paths
+        // for the kill path rather than panic.
+        let rs = RemoteSession::from_sock("/custom/path.sock");
+        assert_eq!(rs.sock, "/custom/path.sock");
+        assert_eq!(rs.blob, "/custom/path.sock.blob");
+        assert_eq!(rs.log, "/custom/path.sock.log");
+    }
+
+    #[test]
+    fn ssh_base_uses_dash_p_for_ported_hosts() {
+        // Port must go through `-p`, not a `user@host:port` positional
+        // (not portable across openssh versions). Inspect the rendered
+        // argv via the `Debug` form of the built `Command`.
+        let url = SshUrl {
+            user: "root".into(),
+            host: "152.53.188.221".into(),
+            port: Some(2222),
+        };
+        let cmd = ssh_base(&url);
+        let rendered = format!("{cmd:?}");
+        assert!(rendered.contains("-p"), "missing -p: {rendered}");
+        assert!(rendered.contains("2222"), "missing port: {rendered}");
+        assert!(
+            rendered.contains("root@152.53.188.221"),
+            "missing bare user@host: {rendered}"
+        );
+        assert!(
+            !rendered.contains("152.53.188.221:2222"),
+            "port leaked into destination: {rendered}"
+        );
+    }
+
+    #[test]
+    fn ssh_base_uses_bare_destination_when_no_port() {
+        let url = SshUrl {
+            user: "root".into(),
+            host: "152.53.188.221".into(),
+            port: None,
+        };
+        let cmd = ssh_base(&url);
+        let rendered = format!("{cmd:?}");
+        assert!(
+            rendered.contains("root@152.53.188.221"),
+            "missing destination: {rendered}"
+        );
+        assert!(!rendered.contains("-p"), "unexpected -p without a port");
     }
 
     #[test]

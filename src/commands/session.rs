@@ -136,11 +136,19 @@ fn session_attach(resolved: &Pillbox, id: &str) -> Result<()> {
             })?;
             sandbox::remote_e2b::reattach(resolved, &remote, &s)
         }
-        Some(session::Backend::Ssh) => Err(PillboxError::usage(
-            "session attach",
-            "ssh session attach is not yet implemented (tmux integration lands next)",
-        )
-        .into()),
+        Some(session::Backend::Ssh) => {
+            let remote = remote::read(resolved, &s.remote)?.ok_or_else(|| {
+                PillboxError::runtime(
+                    "session attach",
+                    format!(
+                        "remote `{}` is no longer registered — session record is orphaned",
+                        s.remote
+                    ),
+                )
+                .with_next(format!("pillbox session rm {}", s.id))
+            })?;
+            sandbox::remote_ssh::reattach(resolved, &remote, &s)
+        }
         None => Err(PillboxError::config(
             "session attach",
             format!("unknown session backend `{}`", s.backend),
@@ -249,11 +257,25 @@ fn session_rm(resolved: &Pillbox, id: &str) -> Result<()> {
     match session::Backend::parse(&s.backend) {
         Some(session::Backend::Docker) => sandbox::local_docker::kill_session(resolved, &s),
         Some(session::Backend::E2b) => sandbox::remote_e2b::kill_session(resolved, &s),
-        Some(session::Backend::Ssh) => Err(PillboxError::usage(
-            "session rm",
-            "ssh session rm is not yet implemented (tmux integration lands next)",
-        )
-        .into()),
+        Some(session::Backend::Ssh) => {
+            // Unlike e2b, ssh teardown needs the registered remote to
+            // know how to reach the host. If the remote was removed we
+            // can't kill the remote pty-host, but we still drop the
+            // local record so the user isn't stranded with a dangling
+            // session entry (mirrors e2b's "drop record regardless").
+            let remote = remote::read(resolved, &s.remote)?.ok_or_else(|| {
+                PillboxError::runtime(
+                    "session rm",
+                    format!(
+                        "remote `{}` is no longer registered — can't reach the remote pty-host. \
+                         Re-add it (`pillbox remote add {} ssh://…`) then retry, or kill the \
+                         remote process by hand and edit the session record out.",
+                        s.remote, s.remote
+                    ),
+                )
+            })?;
+            sandbox::remote_ssh::kill_session(resolved, &remote, &s)
+        }
         None => Err(PillboxError::config(
             "session rm",
             format!("unknown session backend `{}`", s.backend),

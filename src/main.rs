@@ -191,11 +191,25 @@ enum Command {
         /// internal and may change between releases.
         #[arg(long = "vault-stdin", hide = true)]
         vault_stdin: bool,
+        /// Hidden: companion to `--vault-stdin`. When set, the blob is
+        /// read from this file instead of stdin. The ssh pty-host
+        /// transport uses this so the child's stdin stays the PTY (the
+        /// inner `docker run -it` needs a TTY on stdin); the launch path
+        /// stages the blob to a remote temp file and points here. Only
+        /// meaningful with `--vault-stdin`.
+        #[arg(
+            long = "blob-file",
+            value_name = "PATH",
+            hide = true,
+            requires = "vault_stdin"
+        )]
+        blob_file: Option<PathBuf>,
         /// Start the agent and immediately return — keeps the session
         /// alive in the background. Reattach later with `pillbox session
-        /// attach <id>`. Works for local Docker and e2b:// remotes;
-        /// ssh:// detach lands in a follow-up. (Local --detach doesn't
-        /// support --vault: the proxy can't outlive the CLI.)
+        /// attach <id>`. Works for local Docker, e2b:// remotes, and
+        /// ssh:// remotes (the remote pty-host outlives the launch ssh
+        /// session). (Local --detach doesn't support --vault: the proxy
+        /// can't outlive the CLI.)
         #[arg(long)]
         detach: bool,
         /// Human label for the detached session (surfaced in `session
@@ -441,6 +455,7 @@ fn run(cli: Cli) -> Result<()> {
             mcp_tokens,
             remote,
             vault_stdin,
+            blob_file,
             detach,
             label,
             json,
@@ -456,7 +471,10 @@ fn run(cli: Cli) -> Result<()> {
             // ignored. clap's `conflicts_with` already rejects `--remote`
             // + `--vault-stdin` together, so no further check needed.
             if vault_stdin {
-                return crate::sandbox::remote_ssh::dispatch_vault_stdin(&resolved);
+                return crate::sandbox::remote_ssh::dispatch_vault_stdin(
+                    &resolved,
+                    blob_file.as_deref(),
+                );
             }
             // `--events-webhook URL` sets the env var for the duration of
             // this process so every downstream `emit_session_event` call

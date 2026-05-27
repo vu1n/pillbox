@@ -1,1 +1,4 @@
 /target
+
+# Agent worktrees created by the Claude Code harness (locked, ephemeral).
+.claude/worktrees/

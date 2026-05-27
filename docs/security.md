@@ -59,7 +59,7 @@ disk encryption for at-rest defense. Pillbox does the same.
 │       ├── repo-password            # 0600 — rustic encryption password (local-only)
 │       └── repo/                    # local rustic repository (local backend only)
 └── cache/                           # 0700 — versioned helper scripts
-    └── e2b-helper-v0.1.0-alpha.1.mjs   # written by ensure_helper_extracted
+    └── e2b-helper-v0.1.0.mjs           # written by ensure_helper_extracted
 ```
 
 Every directory under `~/.pillbox/` is created via the paths helpers

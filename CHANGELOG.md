@@ -1,9 +1,11 @@
 # Changelog
 
 All notable changes to pillbox. Format loosely follows
-[Keep a Changelog](https://keepachangelog.com/). Pillbox is
-pre-alpha — version numbers track the design milestone (`v0.6`),
-not the published Cargo crate (`0.1.0-alpha.*`).
+[Keep a Changelog](https://keepachangelog.com/). Section headings track
+the design milestone (`v0.6`); the published Cargo crate / runner image
+are versioned separately. `0.1.0` is the first non-prerelease crate — it
+moves the `:latest` runner image and ships the interactive attach
+transport (in-sandbox pty-host + frame protocol; local detach/reattach).
 
 ## v0.6 — pillbox-as-bundle + remote backends
 

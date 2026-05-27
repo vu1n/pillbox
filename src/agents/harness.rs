@@ -34,39 +34,46 @@ use crate::contract::{
     TodosUpdated, ToolCall, ToolStatus,
 };
 
-/// Cross-line state a normalizer accumulates within one run — chiefly the
-/// `tool_use_id → name` map, since a harness's tool-*result* line usually
-/// carries only the id, not the tool name. Shared by both driver flavours
-/// (stdout-line and serve-SSE): a serve adapter accumulates the same id→name
-/// and emitted-status maps a stdout adapter does.
+// Per-run normalizer state — each adapter owns its own. The adapters are
+// stateful (`parse_*` takes `&mut self`); a fresh adapter per run starts clean.
+
+/// ClaudeAdapter state: tool id→name, so a `tool_result` (which carries only
+/// the id) can recover the tool name.
 #[derive(Debug, Default)]
-pub(crate) struct HarnessState {
+struct ClaudeState {
     tool_names: HashMap<String, String>,
-    /// (pi) Message ids for which a `MessageStart` has already been emitted —
-    /// pi streams assistant text as deltas with no terminal "id", so the
+}
+
+/// PiAdapter state.
+#[derive(Debug, Default)]
+struct PiState {
+    tool_names: HashMap<String, String>,
+    /// Message ids for which a `MessageStart` has already been emitted — pi
+    /// streams assistant text as deltas with no terminal "id", so the
     /// normalizer synthesizes an id and emits `MessageStart` once per message.
     open_messages: HashSet<String>,
-    /// (pi) Whether any assistant message terminated with an error stop-reason;
-    /// pi reports failure on the message, not the terminal `agent_end`, so this
+    /// Whether any assistant message terminated with an error stop-reason; pi
+    /// reports failure on the message, not the terminal `agent_end`, so this
     /// carries forward to set a non-zero `RunFinished.exit_code`.
     saw_error: bool,
-    /// Last `ToolStatus` emitted per tool call id. The serve normalizer sees
-    /// the *same* tool part re-delivered as its `state` advances
-    /// (pending→running→completed); this dedupes so a status change emits
-    /// exactly one event and an unchanged re-delivery emits none.
+}
+
+/// OpencodeAdapter state. opencode redelivers whole parts and overlapping
+/// event families, so the normalizer dedupes against this.
+#[derive(Debug, Default)]
+struct OpencodeState {
+    tool_names: HashMap<String, String>,
+    /// Last `ToolStatus` emitted per tool call id, so a status change emits one
+    /// event and an unchanged re-delivery emits none.
     tool_status: HashMap<String, ToolStatus>,
     /// Message ids we've already emitted a `MessageStart` for, so repeated
-    /// `message.part.updated` deliveries for the same text part don't restart
-    /// the message.
-    started_messages: std::collections::HashSet<String>,
+    /// `message.part.updated` deliveries for the same text part don't restart it.
+    started_messages: HashSet<String>,
     /// Per-text-part last-emitted full text, so a re-delivered part only emits
     /// the *new* suffix as a `MessageDelta` (opencode redelivers the whole
-    /// accumulated text on each `message.part.updated`).
+    /// accumulated text each `message.part.updated`).
     part_text: HashMap<String, String>,
-    /// opencode `message.updated` carries `{info:{id, role}}`; a
-    /// `message.part.updated` carries only the part's `messageID`, not its
-    /// role. We record id→role here (the `message.updated` for a message
-    /// arrives before its parts — verified against the runner image) so text
+    /// id→role (`message.updated` arrives before a message's parts) so text
     /// parts of the *user's own prompt* aren't re-emitted as assistant output.
     message_roles: HashMap<String, Role>,
 }
@@ -81,8 +88,9 @@ pub(crate) trait HarnessAdapter {
     fn run_argv(&self, prompt: &str) -> Vec<String>;
 
     /// Map one line of the harness's structured stdout to zero or more
-    /// contract events. `state` persists across lines within a run.
-    fn parse_line(&self, line: &Value, state: &mut HarnessState) -> Vec<Payload>;
+    /// contract events. The adapter carries its own state across lines, so a
+    /// fresh adapter is one run.
+    fn parse_line(&mut self, line: &Value) -> Vec<Payload>;
 }
 
 /// A coding-harness integration that runs an **HTTP server** (`opencode
@@ -91,7 +99,8 @@ pub(crate) trait HarnessAdapter {
 ///
 /// The transport differs (HTTP/SSE, not a pipe) but the *normalizer* concept
 /// is identical to [`HarnessAdapter::parse_line`]: one harness event →
-/// zero-or-more contract [`Payload`]s, with `state` carried across events.
+/// zero-or-more contract [`Payload`]s, with the adapter carrying state across
+/// events.
 pub(crate) trait ServeAdapter {
     /// argv that starts the harness's HTTP server inside the sandbox, bound to
     /// `port` on loopback. The `ServeDriver` runs this detached and then
@@ -99,8 +108,8 @@ pub(crate) trait ServeAdapter {
     fn serve_argv(&self, port: u16) -> Vec<String>;
 
     /// Map one harness SSE event (`{id, type, properties}`) to zero or more
-    /// contract events. `state` persists across events within a run.
-    fn parse_event(&self, event: &Value, state: &mut HarnessState) -> Vec<Payload>;
+    /// contract events. The adapter carries its own state across events.
+    fn parse_event(&mut self, event: &Value) -> Vec<Payload>;
 
     /// Did this event signal the agent turn is complete? `ServeDriver` stops
     /// consuming the stream once a terminal event arrives. (opencode's
@@ -111,8 +120,8 @@ pub(crate) trait ServeAdapter {
 /// Resolve a stdout-streaming harness adapter by agent id.
 pub(crate) fn lookup(id: &str) -> Option<Box<dyn HarnessAdapter>> {
     match id {
-        "claude" => Some(Box::new(ClaudeAdapter)),
-        "pi" => Some(Box::new(PiAdapter)),
+        "claude" => Some(Box::new(ClaudeAdapter::default())),
+        "pi" => Some(Box::new(PiAdapter::default())),
         _ => None,
     }
 }
@@ -120,14 +129,17 @@ pub(crate) fn lookup(id: &str) -> Option<Box<dyn HarnessAdapter>> {
 /// Resolve a serve-based harness adapter by agent id.
 pub(crate) fn lookup_serve(id: &str) -> Option<Box<dyn ServeAdapter>> {
     match id {
-        "opencode" => Some(Box::new(OpencodeAdapter)),
+        "opencode" => Some(Box::new(OpencodeAdapter::default())),
         _ => None,
     }
 }
 
 /// Claude Code via `claude -p … --output-format stream-json`. Schema verified
 /// empirically against Claude Code 2.1.143.
-pub(crate) struct ClaudeAdapter;
+#[derive(Default)]
+pub(crate) struct ClaudeAdapter {
+    state: ClaudeState,
+}
 
 impl HarnessAdapter for ClaudeAdapter {
     fn run_argv(&self, prompt: &str) -> Vec<String> {
@@ -145,7 +157,7 @@ impl HarnessAdapter for ClaudeAdapter {
         ]
     }
 
-    fn parse_line(&self, line: &Value, state: &mut HarnessState) -> Vec<Payload> {
+    fn parse_line(&mut self, line: &Value) -> Vec<Payload> {
         match str_field(line, "type") {
             "system" if str_field(line, "subtype") == "init" => {
                 vec![Payload::RunStarted(RunStarted {
@@ -154,8 +166,8 @@ impl HarnessAdapter for ClaudeAdapter {
                     base_snapshot: String::new(),
                 })]
             }
-            "assistant" => assistant_blocks(line, state),
-            "user" => tool_results(line, state),
+            "assistant" => assistant_blocks(line, &mut self.state),
+            "user" => tool_results(line, &mut self.state),
             "result" => {
                 let is_error = line
                     .get("is_error")
@@ -189,7 +201,7 @@ impl HarnessAdapter for ClaudeAdapter {
 
 /// Assistant message → text blocks become MessageStart/Delta/End; tool_use
 /// blocks become a `running` ToolCall (and we remember the id→name).
-fn assistant_blocks(line: &Value, state: &mut HarnessState) -> Vec<Payload> {
+fn assistant_blocks(line: &Value, state: &mut ClaudeState) -> Vec<Payload> {
     let msg = &line["message"];
     let message_id = msg
         .get("id")
@@ -250,7 +262,7 @@ fn assistant_blocks(line: &Value, state: &mut HarnessState) -> Vec<Payload> {
 }
 
 /// User message → tool_result blocks close the matching ToolCall.
-fn tool_results(line: &Value, state: &mut HarnessState) -> Vec<Payload> {
+fn tool_results(line: &Value, state: &mut ClaudeState) -> Vec<Payload> {
     let mut out = Vec::new();
     for b in line["message"]
         .get("content")
@@ -334,7 +346,10 @@ fn str_field<'a>(v: &'a Value, key: &str) -> &'a str {
 ///     account is available, capture `pi -p --mode json "edit a file"` and
 ///     re-confirm `text_delta.delta`, `tool_execution_end.result` content
 ///     flattening, and the `agent_end` exit semantics against these fixtures.
-pub(crate) struct PiAdapter;
+#[derive(Default)]
+pub(crate) struct PiAdapter {
+    state: PiState,
+}
 
 impl HarnessAdapter for PiAdapter {
     fn run_argv(&self, prompt: &str) -> Vec<String> {
@@ -356,7 +371,7 @@ impl HarnessAdapter for PiAdapter {
         ]
     }
 
-    fn parse_line(&self, line: &Value, state: &mut HarnessState) -> Vec<Payload> {
+    fn parse_line(&mut self, line: &Value) -> Vec<Payload> {
         match str_field(line, "type") {
             // The first line of `--mode json` output. It anchors the run.
             "session" => vec![Payload::RunStarted(RunStarted {
@@ -368,19 +383,19 @@ impl HarnessAdapter for PiAdapter {
             // `text_delta`s on `message_update`; the assistant `message_start`
             // carries empty content, so we drive Start/Delta/End off the inner
             // `assistantMessageEvent` text lifecycle instead.
-            "message_update" => pi_message_update(line, state),
+            "message_update" => pi_message_update(line, &mut self.state),
             // `message_end` for an assistant message: close any open text
             // message and record an error stop-reason for the final exit code.
-            "message_end" => pi_message_end(line, state),
+            "message_end" => pi_message_end(line, &mut self.state),
             // Tool execution — start opens a `running` ToolCall (and remembers
             // id→name), end closes it as completed/error with flattened output.
-            "tool_execution_start" => pi_tool_start(line, state),
-            "tool_execution_end" => pi_tool_end(line, state),
+            "tool_execution_start" => pi_tool_start(line, &mut self.state),
+            "tool_execution_end" => pi_tool_end(line, &mut self.state),
             // Terminal event for the whole run.
             "agent_end" => {
                 vec![Payload::RunFinished(RunFinished {
                     result_snapshot: String::new(),
-                    exit_code: if state.saw_error { 1 } else { 0 },
+                    exit_code: if self.state.saw_error { 1 } else { 0 },
                 })]
             }
             // Auto-retry around a transient provider error — surface it as a
@@ -417,7 +432,7 @@ fn pi_message_id(line: &Value) -> String {
 /// `assistantMessageEvent`. `text_start` opens the message, each `text_delta`
 /// streams a chunk, `text_end` closes it. We emit a `MessageStart` lazily on
 /// the first text event for a message id (some providers emit only deltas).
-fn pi_message_update(line: &Value, state: &mut HarnessState) -> Vec<Payload> {
+fn pi_message_update(line: &Value, state: &mut PiState) -> Vec<Payload> {
     let event = match line.get("assistantMessageEvent") {
         Some(e) => e,
         None => return Vec::new(),
@@ -461,7 +476,7 @@ fn pi_message_update(line: &Value, state: &mut HarnessState) -> Vec<Payload> {
 /// `message_end` for an assistant message. Close any still-open text message
 /// (defensive: covers providers that stream deltas without a `text_end`), and
 /// record an error stop-reason so `agent_end` yields a non-zero exit code.
-fn pi_message_end(line: &Value, state: &mut HarnessState) -> Vec<Payload> {
+fn pi_message_end(line: &Value, state: &mut PiState) -> Vec<Payload> {
     let msg = match line.get("message") {
         Some(m) if str_field(m, "role") == "assistant" => m,
         _ => return Vec::new(),
@@ -490,7 +505,7 @@ fn pi_message_end(line: &Value, state: &mut HarnessState) -> Vec<Payload> {
 
 /// `tool_execution_start` → a `running` ToolCall; remember id→name so the
 /// matching `tool_execution_end` can recover the name.
-fn pi_tool_start(line: &Value, state: &mut HarnessState) -> Vec<Payload> {
+fn pi_tool_start(line: &Value, state: &mut PiState) -> Vec<Payload> {
     let id = str_field(line, "toolCallId").to_string();
     let name = str_field(line, "toolName").to_string();
     state.tool_names.insert(id.clone(), name.clone());
@@ -507,7 +522,7 @@ fn pi_tool_start(line: &Value, state: &mut HarnessState) -> Vec<Payload> {
 /// `tool_execution_end` → close the matching ToolCall. `result` is an
 /// `AgentToolResult` (`{content:[…], details, …}`); flatten its `content`
 /// blocks to a display string. `isError` drives the status.
-fn pi_tool_end(line: &Value, state: &mut HarnessState) -> Vec<Payload> {
+fn pi_tool_end(line: &Value, state: &mut PiState) -> Vec<Payload> {
     let id = str_field(line, "toolCallId").to_string();
     let name = if str_field(line, "toolName").is_empty() {
         state.tool_names.get(&id).cloned().unwrap_or_default()
@@ -582,7 +597,10 @@ fn pi_tool_output(result: Option<&Value>) -> String {
 ///     alongside, the snapshot family). These map one-to-one onto the
 ///     contract's message/tool events. Tool ids (`callID`) are stable, so the
 ///     same dedup keeps a tool from being emitted twice if both families fire.
-pub(crate) struct OpencodeAdapter;
+#[derive(Default)]
+pub(crate) struct OpencodeAdapter {
+    state: OpencodeState,
+}
 
 impl ServeAdapter for OpencodeAdapter {
     fn serve_argv(&self, port: u16) -> Vec<String> {
@@ -600,7 +618,8 @@ impl ServeAdapter for OpencodeAdapter {
         str_field(event, "type") == "session.idle"
     }
 
-    fn parse_event(&self, event: &Value, state: &mut HarnessState) -> Vec<Payload> {
+    fn parse_event(&mut self, event: &Value) -> Vec<Payload> {
+        let state = &mut self.state;
         let props = event.get("properties").unwrap_or(event);
         match str_field(event, "type") {
             "session.created" => vec![Payload::RunStarted(RunStarted {
@@ -756,7 +775,7 @@ impl ServeAdapter for OpencodeAdapter {
 /// and reasoning parts become message start/delta/end (diffed against state so
 /// a re-delivered part only emits the new suffix); tool parts become a
 /// ToolCall whose status tracks the part's `state.status`.
-fn opencode_part(part: Option<&Value>, state: &mut HarnessState) -> Vec<Payload> {
+fn opencode_part(part: Option<&Value>, state: &mut OpencodeState) -> Vec<Payload> {
     let Some(part) = part else {
         return Vec::new();
     };
@@ -840,7 +859,7 @@ fn opencode_part(part: Option<&Value>, state: &mut HarnessState) -> Vec<Payload>
 /// stdout adapter's "running → completed" pairing but for the serve transport
 /// where the same tool is re-delivered as its state advances.
 fn tool_event(
-    state: &mut HarnessState,
+    state: &mut OpencodeState,
     call_id: &str,
     name: &str,
     status: ToolStatus,
@@ -964,12 +983,8 @@ mod tests {
     // Fixtures are the exact shapes captured from Claude Code 2.1.143
     // (`claude -p … --output-format stream-json`).
     fn run(lines: &[Value]) -> Vec<Payload> {
-        let a = ClaudeAdapter;
-        let mut st = HarnessState::default();
-        lines
-            .iter()
-            .flat_map(|l| a.parse_line(l, &mut st))
-            .collect()
+        let mut a = ClaudeAdapter::default();
+        lines.iter().flat_map(|l| a.parse_line(l)).collect()
     }
 
     #[test]
@@ -1075,12 +1090,8 @@ mod tests {
     // a successful text/tool turn could not be captured live. See the
     // `PiAdapter` doc-comment for the validation gap.
     fn pi_run(lines: &[Value]) -> Vec<Payload> {
-        let a = PiAdapter;
-        let mut st = HarnessState::default();
-        lines
-            .iter()
-            .flat_map(|l| a.parse_line(l, &mut st))
-            .collect()
+        let mut a = PiAdapter::default();
+        lines.iter().flat_map(|l| a.parse_line(l)).collect()
     }
 
     #[test]
@@ -1284,12 +1295,8 @@ mod tests {
         use super::*;
 
         fn run(events: &[Value]) -> Vec<Payload> {
-            let a = OpencodeAdapter;
-            let mut st = HarnessState::default();
-            events
-                .iter()
-                .flat_map(|e| a.parse_event(e, &mut st))
-                .collect()
+            let mut a = OpencodeAdapter::default();
+            events.iter().flat_map(|e| a.parse_event(e)).collect()
         }
 
         #[test]
@@ -1303,7 +1310,7 @@ mod tests {
 
         #[test]
         fn session_idle_is_terminal_and_finishes_the_run() {
-            let a = OpencodeAdapter;
+            let a = OpencodeAdapter::default();
             let idle = json!({"id":"e","type":"session.idle","properties":{"sessionID":"ses_a"}});
             assert!(a.is_terminal(&idle));
             let out = run(&[idle]);

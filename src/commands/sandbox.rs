@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use base64::Engine as _;
 
-use crate::agents::harness::{self, HarnessAdapter, HarnessState, ServeAdapter};
+use crate::agents::harness::{self, HarnessAdapter, ServeAdapter};
 use crate::agents::{workspace_mount_name, GUEST_HOME, GUEST_WORKSPACE};
 use crate::cli::SandboxAction;
 use crate::contract::{
@@ -203,7 +203,6 @@ fn agent(resolved: &Pillbox, id: &str, json: bool, prompt: Vec<String>) -> Resul
 struct AgentDriver {
     adapter: Box<dyn HarnessAdapter>,
     sink: Box<dyn EventSink>,
-    state: HarnessState,
     sandbox_id: String,
     run_id: String,
     seq: u64,
@@ -215,7 +214,6 @@ impl AgentDriver {
         Self {
             adapter,
             sink,
-            state: HarnessState::default(),
             sandbox_id,
             run_id: crate::registry::new_id(),
             seq: 0,
@@ -246,7 +244,7 @@ impl AgentDriver {
         let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
             return Ok(()); // tolerate non-JSON noise on the stream
         };
-        for payload in self.adapter.parse_line(&value, &mut self.state) {
+        for payload in self.adapter.parse_line(&value) {
             self.seq += 1;
             self.sink.emit(
                 &Event::durable(self.seq, &self.sandbox_id, payload).with_run(&self.run_id),
@@ -277,7 +275,6 @@ impl AgentDriver {
 struct ServeDriver {
     adapter: Box<dyn ServeAdapter>,
     sink: Box<dyn EventSink>,
-    state: HarnessState,
     sandbox_id: String,
     run_id: String,
     seq: u64,
@@ -297,7 +294,6 @@ impl ServeDriver {
         Self {
             adapter,
             sink,
-            state: HarnessState::default(),
             sandbox_id,
             run_id: crate::registry::new_id(),
             seq: 0,
@@ -418,7 +414,7 @@ impl ServeDriver {
         let Ok(event) = serde_json::from_str::<serde_json::Value>(json.trim()) else {
             return Ok(false); // tolerate keep-alive / non-JSON noise
         };
-        for payload in self.adapter.parse_event(&event, &mut self.state) {
+        for payload in self.adapter.parse_event(&event) {
             match payload {
                 // The driver already synthesized RunStarted (the adapter's
                 // `session.created` may also fire if we catch it); don't
@@ -690,7 +686,7 @@ mod tests {
 
         let collected = Rc::new(RefCell::new(Vec::new()));
         let mut driver = AgentDriver::new(
-            Box::new(ClaudeAdapter),
+            Box::new(ClaudeAdapter::default()),
             Box::new(CollectSink(collected.clone())),
             "sb-test".into(),
         );

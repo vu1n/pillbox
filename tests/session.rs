@@ -688,10 +688,11 @@ fn rm_unknown_session_errors() {
 }
 
 #[test]
-fn run_remote_detach_rejects_ssh_backend() {
-    // PR 6 only supports detach for E2B remotes. Make sure the SSH
-    // path emits the actionable not-yet-implemented error rather than
-    // silently dropping to a half-detached run.
+fn run_remote_detach_requires_s3_workspace() {
+    // ssh --detach is supported now (the pty-host runs on the remote), but
+    // ALL remote runs require an S3-shaped workspace backend so the remote
+    // restores from the same bucket. A default (local-rustic) pillbox must be
+    // rejected loudly at that gate rather than silently half-detaching.
     let home = TempDir::new().unwrap();
     let cwd = TempDir::new().unwrap();
     let out = run(home.path(), cwd.path(), &["new", "--name", "proj"]);
@@ -708,10 +709,12 @@ fn run_remote_detach_rejects_ssh_backend() {
         cwd.path(),
         &["run", "--remote", "vps", "--detach"],
     );
-    assert!(!out.status.success(), "ssh+detach should fail loudly");
+    assert!(
+        !out.status.success(),
+        "ssh+detach on a local-rustic workspace should fail loudly"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("ssh:// detached"), "got: {stderr}");
-    assert!(stderr.contains("e2b://"), "got: {stderr}");
+    assert!(stderr.contains("S3-shaped workspace"), "got: {stderr}");
 }
 
 #[test]

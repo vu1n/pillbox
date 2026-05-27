@@ -116,16 +116,17 @@ The helper has three modes:
 
 | Mode | Args | Used for |
 |---|---|---|
-| `attach` | `--template T --blob-file F [--name N] [--detach]` | Initial run; creates sandbox + PTY, launches agent. |
-| `reattach` | `--sandbox-id S --pid P` | `pillbox session attach <id>`; calls `sandbox.pty.connect`. |
+| `attach` | `--template T --blob-file F --session-id ID [--name N] [--detach]` | Initial run; launches an in-sandbox `pty-host` (which runs the agent under a real PTY) and relays its frames. |
+| `reattach` | `--sandbox-id S --session-id ID` | `pillbox session attach <id>`; connects a fresh `pty-relay` to the still-running pty-host (socket derived from the session id). |
 | `kill` | `--sandbox-id S` | `pillbox session rm <id>`; calls `sandbox.kill`. |
 
 Pillbox parses a single line of JSON from the helper's stderr — a
-`sandbox-up` handshake with `protoVersion`, `sandboxId`, `pid` —
-before any other output. Version mismatches print
-`rm ~/.pillbox/cache/e2b-helper-*` as the fix-it. Subsequent JSON
-event lines (`detached`, `detach-pressed`) drive the session
-lifecycle; anything else is passed through to the user's stderr,
+`sandbox-up` handshake with `protoVersion` + `sandboxId` — before any
+other output. Version mismatches print
+`rm ~/.pillbox/cache/e2b-helper-*` as the fix-it. An `attach --detach`
+launch then emits a `detached` line; interactive detach (Ctrl-A D /
+SIGTERM) is resolved by the host pump, not the helper. Anything else is
+passed through to the user's stderr,
 sanitized for ANSI/control escapes first.
 
 ## Sessions
@@ -164,8 +165,9 @@ When attached, **Ctrl-A** is the prefix:
 
 Detach can also come from another shell: `pillbox session detach
 <id>` reads `attached_pid` from the record and SIGTERMs that
-process. The attached pillbox catches SIGTERM via the helper's
-`detach-pressed` path and exits cleanly without killing the sandbox.
+process. The attached pillbox's pump catches SIGTERM (its
+detach-enabled handler resolves the session as detached) and exits
+cleanly without killing the sandbox.
 
 ### Session detach safety
 
@@ -189,8 +191,8 @@ process. The attached pillbox catches SIGTERM via the helper's
 | `session list` / `info` | ✅ | ✅ | ✅ |
 
 Each backend carries the same attach-transport frames over its own
-byte pipe: docker exec stdio (local), ssh stdio (ssh), and E2B's
-`pty.connect` stream (e2b). Local `--detach` does NOT support
+byte pipe: docker exec stdio (local), ssh stdio (ssh), and an E2B
+raw-pty `pty-relay` (e2b). Local `--detach` does NOT support
 `--vault` — the host-side stub-swap proxy can't outlive the CLI.
 
 ## Forward compatibility

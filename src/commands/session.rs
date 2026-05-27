@@ -166,12 +166,12 @@ fn session_detach(resolved: &Pillbox, id: &str) -> Result<()> {
             return Ok(());
         }
     };
-    // SIGTERM the attached pillbox process. Its helper handles SIGTERM
-    // → emits `detach-pressed` → exits 100 → that pillbox sees the
-    // exit code, marks the session detached, and prints the reattach
-    // hint. We clear the attached_pid field below as a belt-and-
-    // suspenders — if the attached pillbox has crashed already, its
-    // cleanup never ran.
+    // SIGTERM the attached pillbox process. Its attach pump installs a
+    // SIGTERM handler (detach_enabled) that resolves the session as
+    // `Detached` → the reattach path marks the session detached and prints
+    // the reattach hint (then tears down its own transport). We clear the
+    // attached_pid field below as a belt-and-suspenders — if the attached
+    // pillbox has crashed already, its cleanup never ran.
     //
     // The session record is user-writable TOML — `attached_pid` could
     // be hand-edited (or stale after a pillbox crash + pid reuse).

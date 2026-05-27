@@ -1,19 +1,43 @@
 #!/usr/bin/env node
 //
 // pillbox-e2b-helper — Node subprocess that bridges local pillbox to an
-// E2B sandbox PTY.
+// E2B sandbox running the attach-transport frame protocol.
+//
+// ## What this is (and what it is NOT)
+//
+// This helper is a **dumb byte shuttle**. It owns the E2B sandbox
+// lifecycle (create / connect / kill) and nothing else. It does NOT
+// parse the frame protocol, interpret Ctrl-A, manage raw mode, or track
+// terminal size — all of that lives in the Rust `attach::pump`
+// (`attach_terminal`), which runs on the host over THIS helper's
+// stdin/stdout. The helper just carries bytes between its own stdio and
+// the in-sandbox `pillbox pty-relay`, exactly the way the docker and ssh
+// backends carry the identical protocol over `docker exec` / `ssh`
+// stdio. See `docs/attach-transport.md`.
+//
+//   host terminal ─ Rust attach::pump ─ helper stdio ─┐
+//                                                      │ (raw E2B pty)
+//   agent ─ pty-host (unix sock) ─ pty-relay ──────────┘
+//
+//   - `pillbox pty-host` runs via `commands.run({background})`. It owns
+//     the agent's real PTY (via portable-pty) and serves the frame
+//     protocol on a unix socket. Its own stdout/stderr are just logs.
+//   - `pillbox pty-relay` runs under a raw E2B `pty.create`. It bridges
+//     the pty-host socket to its stdio; the raw pty keeps the binary
+//     frames intact (E2B's `commands.run` string-decodes and would
+//     corrupt them — that's why the relay needs a pty).
 //
 // Wire (set by the Rust caller in src/sandbox/remote_e2b.rs):
 //   - argv (one of):
-//       attach   --template TEMPLATE_ID --blob-file PATH [--name N] [--detach]
-//       reattach --sandbox-id ID --pid N
+//       attach   --template TEMPLATE_ID --blob-file PATH --session-id ID
+//                [--name N] [--detach] [--events-webhook URL] [--parent ID]
+//       reattach --sandbox-id ID --session-id ID
 //       kill     --sandbox-id ID
-//   - env:   E2B_API_KEY=...   (read by the @e2b/code-interpreter SDK)
-//   - stdin: forwarded to the sandbox PTY as user keystrokes. Ctrl-A
-//            (0x01) is the detach prefix — Ctrl-A D requests detach,
-//            Ctrl-A Ctrl-A sends a literal Ctrl-A through to the PTY.
-//   - stdout: PTY output → local terminal.
-//   - stderr: helper diagnostics + JSON handshake lines.
+//   - env:   E2B_API_KEY=...   (read by the `e2b` SDK)
+//   - stdin: raw attach-transport frames from the host pump → forwarded
+//            verbatim to the relay's PTY. NO Ctrl-A interpretation here.
+//   - stdout: raw attach-transport frames from the relay → host pump.
+//   - stderr: helper diagnostics + the JSON handshake (below).
 //
 // ## Wire (stderr handshake)
 //
@@ -22,28 +46,25 @@
 // diagnostics so the Rust side can distinguish protocol from noise.
 //
 //   {type:"sandbox-up", protoVersion, sandboxId, pid?}
-//       Sent after Sandbox.create / pty.create succeed. `pid` is set
-//       in attach/reattach modes; absent in `kill`. The Rust side
-//       echoes the sandbox id to the user and persists the session
-//       record (for `attach --detach` only).
-//   {type:"detach-pressed"}
-//       Sent by an interactive attach when the user types Ctrl-A D.
-//       The Rust side prints "detached. reattach with: pillbox
-//       session attach <id>" and exits with success.
+//       Sent once the pty-host socket is listening (attach/reattach) or
+//       the sandbox is connected (kill). The Rust side echoes the id and
+//       persists the session record (for `attach --detach` only). `pid`
+//       is vestigial — reattach derives the pty-host socket path from the
+//       session id, so the record's `pty_pid` is no longer used.
 //   {type:"detached"}
-//       Sent when `attach --detach` finishes its launch (sandbox + PTY
-//       up, agent command sent) and is about to exit. Treated the same
-//       as `detach-pressed` on the Rust side.
+//       Sent when `attach --detach` finishes launching the pty-host and
+//       is about to exit without killing the sandbox.
+//
+// Detach (Ctrl-A D) is NO LONGER signalled by this helper: the host pump
+// detects it and tears the helper down via SIGTERM. See the teardown
+// matrix in `wireRelay` below.
 //
 // ## Why a temp file (not stdin) for the blob
 //
-// The PTY echoes input by default and turning echo off only takes
-// effect after the shell runs `stty`. If we sent the blob through the
-// PTY before then, the user's terminal would briefly display tens of
-// kilobytes of JSON (including secret material). Staging to a sandbox
-// /tmp file via the Files API keeps secrets off the user-visible
-// display path. The file is unlinked by the launch line as soon as
-// `pillbox run --vault-stdin` has read it.
+// stdin is the frame channel, so it can't also carry the vault blob.
+// The host stages the blob to a local temp file and we upload it into
+// the sandbox via the Files API; the pty-host wrapper reads it with
+// `pillbox run --vault-stdin < FILE` and unlinks it.
 //
 // ## Why a Node helper and not a Rust HTTP client
 //
@@ -58,21 +79,29 @@ import { randomBytes } from "node:crypto";
 
 const PROTO_VERSION = 1;
 const SANDBOX_TIMEOUT_MS = 3_600_000;
-const BOOT_MARKER = "__PILLBOX_BOOT__";
 
-// Detach hotkey: Ctrl-A (0x01) + D / d. Mirrors GNU screen's default.
-// Ctrl-A Ctrl-A sends a literal Ctrl-A through to the PTY so users
-// can still use readline's beginning-of-line in shells inside the
-// sandbox. Exit code 100 distinguishes intentional detach from
-// SIGINT (130) and SIGTERM (143).
-const DETACH_PREFIX = 0x01;
-const DETACH_KEY_LOWER = 0x64; // 'd'
-const DETACH_KEY_UPPER = 0x44; // 'D'
-const DETACH_EXIT_CODE = 100;
+// Control-byte marker printed by the relay launch line once the PTY is in
+// raw mode, just before `exec pillbox pty-relay`. The helper streams
+// everything AFTER this marker verbatim to stdout; everything before is
+// the shell's cooked echo of the launch line and must be dropped (it
+// would otherwise corrupt the host pump's frame decoder). RS (0x1e) bytes
+// don't appear in that echo — the echo shows the literal text `\036`, not
+// the byte — so there's no false match.
+const RELAY_MARKER = Buffer.from([0x1e, 0x1e, 0x50, 0x42, 0x1e, 0x1e]); // \x1e\x1ePB\x1e\x1e
+
+// Upper bound on each network teardown call (`pty.kill` / `sandbox.kill`).
+// The host blocks in `child.wait()` until we exit, so a hung E2B API call
+// during teardown must not wedge pillbox forever — we exit regardless once
+// this elapses.
+const TEARDOWN_TIMEOUT_MS = 5_000;
 
 function fail(msg) {
 	process.stderr.write(`pillbox-e2b-helper: ${msg}\n`);
 	process.exit(1);
+}
+
+function notifyRust(payload) {
+	process.stderr.write(`${JSON.stringify(payload)}\n`);
 }
 
 // All flags here are part of the **internal** wire between pillbox and
@@ -93,9 +122,9 @@ function parseArgs(argv) {
 		blobFile: null,
 		detach: false,
 		sandboxId: null,
-		pid: null,
 		sessionId: null,
 		eventsWebhook: null,
+		parentSessionId: null,
 	};
 	for (let i = 1; i < argv.length; i++) {
 		const flag = argv[i];
@@ -120,38 +149,31 @@ function parseArgs(argv) {
 				out.sandboxId = val;
 				i++;
 				break;
-			case "--pid":
-				out.pid = Number.parseInt(val ?? "", 10);
-				i++;
-				break;
 			case "--session-id":
-				// Host pre-mints the id and passes it through so the
-				// sandbox-side wrapper can bake it into the
-				// `pillbox session done <id>` call after the agent
-				// exits. Validated alphanumeric-only on the host side
-				// (`Session::new_id` produces hex), so safe to drop
-				// into the shell wrapper without further escaping.
+				// Host pre-mints the id. attach: baked into the sandbox-side
+				// `pillbox session done <id>` wrapper AND used to derive the
+				// pty-host socket path. reattach: re-derives the same socket
+				// path to reconnect a fresh relay. Validated alphanumeric-only
+				// on the host side (`Session::new_id` produces hex), so safe to
+				// drop into the shell wrapper / socket path without escaping.
 				out.sessionId = val;
 				i++;
 				break;
 			case "--events-webhook":
 				// Forwarded to the sandbox env so the wrapper's
-				// `pillbox session done` can POST the terminal event
-				// back. URL is validated at the host CLI level
-				// (`validate_events_webhook_url` in src/main.rs:
-				// http(s):// scheme, no whitespace / control chars,
-				// http-to-non-loopback warns) before reaching here;
-				// we still `shellEscape` on the wrapper-line side as
-				// defense in depth.
+				// `pillbox session done` can POST the terminal event back. URL
+				// is validated at the host CLI level
+				// (`validate_events_webhook_url`) before reaching here; we
+				// still `shellEscape` on the wrapper-line side as defense in
+				// depth.
 				out.eventsWebhook = val;
 				i++;
 				break;
 			case "--parent":
 				// Forwarded to the sandbox env so the wrapper's
-				// `pillbox session started` picks it up (host's CLI
-				// already shape-validated via `validate_session_id`).
-				// `shellEscape`d again at splice time as
-				// defense-in-depth against future loosening.
+				// `pillbox session started` picks it up (host's CLI already
+				// shape-validated via `validate_session_id`). `shellEscape`d
+				// again at splice time as defense-in-depth.
 				out.parentSessionId = val;
 				i++;
 				break;
@@ -166,16 +188,12 @@ function parseArgs(argv) {
 	}
 	if (mode === "reattach") {
 		if (!out.sandboxId) fail("--sandbox-id is required for `reattach`");
-		if (!Number.isFinite(out.pid)) fail("--pid is required for `reattach`");
+		if (!out.sessionId) fail("--session-id is required for `reattach`");
 	}
 	if (mode === "kill") {
 		if (!out.sandboxId) fail("--sandbox-id is required for `kill`");
 	}
 	return out;
-}
-
-function notifyRust(payload) {
-	process.stderr.write(`${JSON.stringify(payload)}\n`);
 }
 
 /// Bourne-shell single-quote escape. POSIX shells treat single-quoted
@@ -201,52 +219,12 @@ async function readBlob(path) {
 	}
 }
 
-function sizeFromStdout() {
-	const cols = Number.isFinite(process.stdout.columns) ? process.stdout.columns : 80;
-	const rows = Number.isFinite(process.stdout.rows) ? process.stdout.rows : 24;
-	return { cols: Math.max(1, cols), rows: Math.max(1, rows) };
-}
-
-/// Stream stdin → PTY with the Ctrl-A detach prefix interpreted. Returns
-/// a function that detaches the listener (used by callers that need to
-/// suspend forwarding before exiting).
-function wireStdinToPty(sandbox, pid, onDetach) {
-	let prefixSeen = false;
-	process.stdin.setRawMode?.(true);
-	const handler = (chunk) => {
-		const bytes = chunk instanceof Uint8Array ? chunk : Buffer.from(chunk);
-		const out = [];
-		for (const byte of bytes) {
-			if (prefixSeen) {
-				prefixSeen = false;
-				if (byte === DETACH_KEY_LOWER || byte === DETACH_KEY_UPPER) {
-					if (out.length > 0) {
-						void sandbox.pty.sendInput(pid, Buffer.from(out)).catch(() => {});
-					}
-					onDetach();
-					return;
-				}
-				// Any other byte after the prefix sends Ctrl-A + that byte
-				// literally — `Ctrl-A Ctrl-A` thus delivers a single Ctrl-A
-				// through to the sandbox so users keep readline's
-				// beginning-of-line / similar bindings.
-				out.push(DETACH_PREFIX);
-				out.push(byte);
-			} else if (byte === DETACH_PREFIX) {
-				prefixSeen = true;
-			} else {
-				out.push(byte);
-			}
-		}
-		if (out.length > 0) {
-			void sandbox.pty.sendInput(pid, Buffer.from(out)).catch(() => {});
-		}
-	};
-	process.stdin.on("data", handler);
-	return () => {
-		process.stdin.off("data", handler);
-		process.stdin.setRawMode?.(false);
-	};
+/// Deterministic pty-host socket path for a session. The host pre-mints
+/// the session id and both `attach` (launches the pty-host here) and
+/// `reattach` (connects a fresh relay here) derive the same path — so the
+/// session record needs no socket/pid bookkeeping to reconnect.
+function sockForSession(sessionId) {
+	return `/tmp/pillbox-pty-${sessionId}.sock`;
 }
 
 /// Connect to an existing sandbox by id (used by reattach + kill modes).
@@ -258,172 +236,16 @@ async function connectSandbox(sandboxId) {
 	}
 }
 
-/// Mode: `kill` — tear the sandbox down. Stand-alone: no PTY, no stdin
-/// forwarding. Used by `pillbox session rm <id>`.
-async function runKill(args) {
-	const sandbox = await connectSandbox(args.sandboxId);
-	try {
-		await sandbox.kill();
-	} catch (e) {
-		fail(`sandbox.kill failed: ${e?.message ?? e}`);
-	}
-	notifyRust({ type: "sandbox-up", protoVersion: PROTO_VERSION, sandboxId: args.sandboxId });
-	process.exit(0);
-}
-
-/// Mode: `reattach` — connect to an existing sandbox's PTY by pid and
-/// stream like a normal attach. Ctrl-A D detaches without killing.
-async function runReattach(args) {
-	const sandbox = await connectSandbox(args.sandboxId);
-	const size = sizeFromStdout();
-
-	let detaching = false;
-	const detach = (reason) => {
-		if (detaching) return;
-		detaching = true;
-		notifyRust({ type: reason });
-		// Reattach never owns the sandbox lifecycle — we never call
-		// sandbox.kill(). `pillbox session rm <id>` is the explicit
-		// teardown path.
-		process.exit(DETACH_EXIT_CODE);
-	};
-	process.on("SIGTERM", () => detach("detach-pressed"));
-	process.on("SIGINT", () => detach("detach-pressed"));
-
-	let handle;
-	try {
-		handle = await sandbox.pty.connect(args.pid, {
-			timeoutMs: 0,
-			onData: (data) => process.stdout.write(Buffer.from(data)),
-		});
-	} catch (e) {
-		fail(`pty.connect(${args.pid}) failed: ${e?.message ?? e}`);
-	}
-
-	notifyRust({
-		type: "sandbox-up",
-		protoVersion: PROTO_VERSION,
-		sandboxId: args.sandboxId,
-		pid: args.pid,
-	});
-	// Re-assert PTY dimensions to match the local terminal — the
-	// remote may have been opened from a different-sized client.
-	try {
-		await sandbox.pty.resize(args.pid, size);
-	} catch {
-		// non-fatal — the remote PTY may have its own state and
-		// resize is a hint anyway.
-	}
-
-	wireStdinToPty(sandbox, args.pid, () => detach("detach-pressed"));
-	process.stdin.on("end", () => detach("detach-pressed"));
-	process.stdout.on("resize", () => {
-		const { cols, rows } = sizeFromStdout();
-		void sandbox.pty.resize(args.pid, { cols, rows }).catch(() => {});
-	});
-
-	try {
-		await handle.wait();
-	} catch (e) {
-		if (!detaching) fail(`pty wait: ${e?.message ?? e}`);
-	}
-	// Process inside the PTY exited (e.g. user typed `exit`) — the
-	// sandbox is empty but still alive. Same as detach: leave it.
-	process.exit(0);
-}
-
-/// Mode: `attach` — create a new sandbox + PTY, launch
-/// `pillbox run --vault-stdin` inside, optionally exit immediately
-/// after launch (`--detach`) so the local pillbox can record the
-/// session and return.
-async function runAttach(args) {
-	const blobBytes = await readBlob(args.blobFile);
-
-	let sandbox;
-	try {
-		sandbox = await Sandbox.create(args.template, {
-			timeoutMs: SANDBOX_TIMEOUT_MS,
-			metadata: args.name ? { pillboxRemote: args.name } : undefined,
-		});
-	} catch (e) {
-		fail(`Sandbox.create failed: ${e?.message ?? e}`);
-	}
-
-	let cleaning = false;
-	let keepAliveOnExit = false;
-	const cleanup = async (code = 0) => {
-		if (cleaning) return;
-		cleaning = true;
-		if (!keepAliveOnExit) {
-			try {
-				await sandbox.kill();
-			} catch {
-				// best-effort
-			}
-		}
-		process.exit(code);
-	};
-	process.on("SIGTERM", () => void cleanup(143));
-	process.on("SIGINT", () => void cleanup(130));
-
-	// Stage the blob inside the sandbox.
-	const blobName = `pillbox-blob-${randomBytes(6).toString("hex")}.json`;
-	const blobRemote = `/tmp/${blobName}`;
-	try {
-		await sandbox.files.write(blobRemote, blobBytes);
-	} catch (e) {
-		await cleanup(1);
-		fail(`write vault blob into sandbox: ${e?.message ?? e}`);
-	}
-
-	const size = sizeFromStdout();
-	let booted = false;
-	let bootBuffer = "";
-
-	let handle;
-	try {
-		handle = await sandbox.pty.create({
-			...size,
-			cwd: "/root",
-			envs: { TERM: "xterm-256color", COLORTERM: "truecolor", LANG: "C.UTF-8" },
-			timeoutMs: 0,
-			onData: (data) => {
-				const text = Buffer.from(data).toString();
-				if (!booted) {
-					bootBuffer += text;
-					const idx = bootBuffer.indexOf(BOOT_MARKER);
-					if (idx === -1) return;
-					booted = true;
-					const tail = bootBuffer.slice(idx + BOOT_MARKER.length).replace(/^\r?\n/, "");
-					bootBuffer = "";
-					if (tail.length > 0 && !args.detach) process.stdout.write(tail);
-					return;
-				}
-				if (!args.detach) process.stdout.write(text);
-			},
-		});
-	} catch (e) {
-		await cleanup(1);
-		fail(`pty.create failed: ${e?.message ?? e}`);
-	}
-	const pid = handle.pid;
-
-	notifyRust({
-		type: "sandbox-up",
-		protoVersion: PROTO_VERSION,
-		sandboxId: sandbox.sandboxId,
-		pid,
-	});
-
-	// Build the wrapper around `pillbox run --vault-stdin`. After the
-	// agent exits, capture its exit code and call `pillbox session
-	// done` with the pre-minted id so the terminal event (completed /
-	// failed) reaches whatever sinks the env exposes — webhook in
-	// particular, since detached runs have no other path back to the
-	// host. The webhook URL is `shellEscape`d defensively even though
-	// the host validates URL shape; if the URL ever contained shell
-	// metacharacters we'd want to know via clean fail, not via
-	// surprise command injection.
+/// The sandbox-side wrapper around `pillbox run`. pty-host runs this as
+/// its PTY child (`bash -lc <wrapper>`); pty-host owns the PTY and serves
+/// frames, so the wrapper never touches `stty`/markers — that's the
+/// relay's job, not the agent's. After the agent exits the wrapper calls
+/// `pillbox session done` so the terminal event reaches the configured
+/// sinks (webhook in particular — a detached run has no other path home),
+/// then `exit "$PB_EXIT"` so the pty-host's child-exit (and thus the
+/// Exit frame the host pump reads) carries the AGENT's status, not the
+/// trailing `rm`'s.
+function buildWrapper(args, blobRemote, resultRemote) {
 	const sessionIdEsc = shellEscape(args.sessionId);
 	const webhookExport = args.eventsWebhook
 		? `export PILLBOX_EVENTS_WEBHOOK=${shellEscape(args.eventsWebhook)}; `
@@ -431,36 +253,14 @@ async function runAttach(args) {
 	const parentExport = args.parentSessionId
 		? `export PILLBOX_PARENT_SESSION_ID=${shellEscape(args.parentSessionId)}; `
 		: "";
-	// `pillbox run --vault-stdin` owns remote workspace hydration and the
-	// post-agent rustic push. It writes the result handle to this sandbox
-	// file when `PILLBOX_RESULT_SNAPSHOT_FILE` is set. The wrapper reads it
-	// after the command exits and forwards it to `session done`.
-	const resultRemote = `/tmp/pillbox-result-${args.sessionId}.txt`;
-	//
-	// If hydration, push, or result-file writing fails, `RESULT_SNAPSHOT`
-	// stays empty and `--result-snapshot` is dropped from the
-	// `session done` call. The terminal event still fires with the agent
-	// exit code.
-	// PILLBOX_SANDBOX_SIDE flips the emitter detection so events
-	// render with `emitter=sandbox`. Set once at the top so every
-	// pillbox call below picks it up. See SANDBOX_SIDE_ENV docs in
-	// src/events/mod.rs for the trust-model rationale.
-	//
-	// `pillbox session started` fires immediately after the export so
-	// the timestamp reflects sandbox-side-ready, not host-side-saw-
-	// handshake. The delta between this event and the host's
-	// `session.started` is the cold-start latency consumers care
-	// about.
-	const launch =
-		`stty -echo raw 2>/dev/null; printf '%s\\n' '${BOOT_MARKER}'; ` +
+	return (
+		// PILLBOX_SANDBOX_SIDE flips emitter detection so events render with
+		// `emitter=sandbox`. See SANDBOX_SIDE_ENV docs in src/events/mod.rs.
 		`export PILLBOX_SANDBOX_SIDE=1; ` +
-		// PILLBOX_SESSION_STARTED_AT is captured ONCE at the top of
-		// the launch line via `date -u -Iseconds` (POSIX RFC3339). Both
-		// `pillbox session started` and `pillbox session done` read it:
-		// the former so its emitted started_at matches what the latter
-		// will use as span.start_time (no microsecond skew between the
-		// two read sites). If `date` isn't available the export expands
-		// to empty and pillbox falls back to its own `now_rfc3339`.
+		// Captured ONCE here via `date -u -Iseconds` (POSIX RFC3339); both
+		// `session started` and `session done` read it so their timestamps
+		// agree (no skew between the two read sites). If `date` is missing
+		// the export expands empty and pillbox falls back to `now_rfc3339`.
 		`export PILLBOX_SESSION_STARTED_AT="$(date -u -Iseconds 2>/dev/null)"; ` +
 		`${webhookExport}` +
 		`${parentExport}` +
@@ -475,50 +275,267 @@ async function runAttach(args) {
 		`--exit-code "$PB_EXIT" ` +
 		`--reason "$([ $PB_EXIT = 0 ] && echo agent-completed || echo "agent exited $PB_EXIT")" ` +
 		`$([ -n "$RESULT_SNAPSHOT" ] && echo --result-snapshot "$RESULT_SNAPSHOT"); ` +
-		`rm -f ${shellEscape(blobRemote)} ${shellEscape(resultRemote)}\n`;
-	try {
-		await sandbox.pty.sendInput(pid, Buffer.from(launch));
-	} catch (e) {
-		await cleanup(1);
-		fail(`send launch line: ${e?.message ?? e}`);
-	}
+		`rm -f ${shellEscape(blobRemote)} ${shellEscape(resultRemote)}; ` +
+		`exit "$PB_EXIT"`
+	);
+}
 
-	if (args.detach) {
-		// Detached mode: the sandbox + PTY are up, the agent command is
-		// in the PTY's stdin. We exit without killing — the caller
-		// (`pillbox run --remote NAME --detach`) writes the session
-		// record from the handshake. `pillbox session attach <id>` is
-		// the reconnect path.
-		keepAliveOnExit = true;
-		notifyRust({ type: "detached" });
-		process.exit(0);
-	}
+/// Launch the in-sandbox pty-host in the background and wait for its
+/// socket to appear. `commands.run({background})` returns as soon as the
+/// process starts; the socket-readiness poll is what tells us the
+/// pty-host actually came up (vs. e.g. `pillbox` missing from the
+/// template). Returns true if the socket appeared within the timeout.
+/// THROWS on a `commands.run` failure (rather than `fail()`-exiting) so
+/// the caller's teardown path runs — otherwise a launch error would
+/// `process.exit` with the just-created sandbox still alive.
+async function launchPtyHost(sandbox, sock, wrapper) {
+	const cmd =
+		`pillbox pty-host --sock ${shellEscape(sock)} ` +
+		`-- bash -lc ${shellEscape(wrapper)}`;
+	await sandbox.commands.run(cmd, { background: true });
+	return waitForSock(sandbox, sock, 15_000);
+}
 
-	let detaching = false;
-	const detach = () => {
-		if (detaching) return;
-		detaching = true;
-		keepAliveOnExit = true;
-		notifyRust({ type: "detach-pressed" });
-		process.exit(DETACH_EXIT_CODE);
+async function waitForSock(sandbox, sock, timeoutMs) {
+	const deadline = Date.now() + timeoutMs;
+	const test = `test -S ${shellEscape(sock)}`;
+	while (Date.now() < deadline) {
+		try {
+			const r = await sandbox.commands.run(test);
+			if (r.exitCode === 0) return true;
+		} catch {
+			// commands.run throws on non-zero exit — socket not there yet.
+		}
+		await new Promise((res) => setTimeout(res, 150));
+	}
+	return false;
+}
+
+/// Race `p` against a `ms` timeout so a hung network call can't wedge the
+/// helper — and thus the host's `child.wait()` — forever. Errors and
+/// timeouts are swallowed: teardown is best-effort by nature.
+function withTimeout(p, ms) {
+	return Promise.race([
+		Promise.resolve(p).catch(() => {}),
+		new Promise((res) => setTimeout(res, ms)),
+	]);
+}
+
+/// A teardown context owns the sandbox lifecycle for one helper run. It's
+/// created right after the sandbox exists so its SIGTERM/SIGINT handlers
+/// cover the ENTIRE run — including the launch window before any relay —
+/// so a stray signal (e.g. `--detach` Ctrl-C, which the host's raw-mode
+/// pump isn't there to swallow) can't orphan a billable sandbox.
+///
+///   - `killSandbox`: true for a foreground `attach` (ephemeral — nuke on
+///     exit); false for `reattach` (the run owns the sandbox, we only kill
+///     our own relay PTY so no orphan relay lingers).
+///   - `keepAlive`: flips true on `--detach` success so teardown leaves
+///     the pty-host + agent running for a later `session attach`.
+///   - `relayPid`: set once a relay PTY exists; teardown kills it.
+function makeSession(sandbox, { killSandbox }) {
+	const ctx = { sandbox, killSandbox, keepAlive: false, relayPid: null, tearing: false };
+	ctx.teardown = async (code) => {
+		if (ctx.tearing) return;
+		ctx.tearing = true;
+		if (ctx.relayPid !== null) {
+			await withTimeout(sandbox.pty.kill(ctx.relayPid), TEARDOWN_TIMEOUT_MS);
+		}
+		if (ctx.killSandbox && !ctx.keepAlive) {
+			await withTimeout(sandbox.kill(), TEARDOWN_TIMEOUT_MS);
+		}
+		process.exit(code);
+	};
+	process.on("SIGTERM", () => void ctx.teardown(143));
+	process.on("SIGINT", () => void ctx.teardown(130));
+	return ctx;
+}
+
+/// Connect a `pillbox pty-relay` over a raw E2B PTY and shuttle frames
+/// between it and this process's stdio until the session ends, then tear
+/// down. The host pump (running over our stdio) owns the protocol, raw
+/// mode, resize, and Ctrl-A; we only carry bytes verbatim and drop the
+/// relay's cooked-echo preamble up to RELAY_MARKER. Never returns — it
+/// `process.exit`s via `teardown`.
+async function streamRelay(ctx, sock) {
+	const { sandbox } = ctx;
+	let booted = false;
+	let pre = Buffer.alloc(0);
+	const stdinBacklog = [];
+	const sendInput = (buf) => void sandbox.pty.sendInput(ctx.relayPid, buf).catch(() => {});
+	const flushBacklog = () => {
+		while (stdinBacklog.length > 0) sendInput(stdinBacklog.shift());
 	};
 
-	wireStdinToPty(sandbox, pid, detach);
-	process.stdin.on("end", () => void cleanup(0));
-	process.stdout.on("resize", () => {
-		const { cols, rows } = sizeFromStdout();
-		void sandbox.pty.resize(pid, { cols, rows }).catch(() => {});
+	let handle;
+	try {
+		handle = await sandbox.pty.create({
+			cols: 80,
+			rows: 24,
+			cwd: "/root",
+			envs: { TERM: "xterm-256color", COLORTERM: "truecolor", LANG: "C.UTF-8" },
+			timeoutMs: 0,
+			onData: (data) => {
+				const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+				if (booted) {
+					process.stdout.write(buf);
+					return;
+				}
+				pre = pre.length > 0 ? Buffer.concat([pre, buf]) : buf;
+				const idx = pre.indexOf(RELAY_MARKER);
+				if (idx === -1) {
+					// Bound memory: the marker is 6 bytes, so a tail of a few
+					// bytes is enough to catch one straddling a chunk boundary.
+					if (pre.length > 4096) pre = pre.subarray(pre.length - 8);
+					return;
+				}
+				booted = true;
+				const tail = pre.subarray(idx + RELAY_MARKER.length);
+				pre = Buffer.alloc(0);
+				// Relay is live now — release any frames the host pump sent
+				// (e.g. the opening Hello) while the PTY shell was still
+				// booting, in order.
+				flushBacklog();
+				if (tail.length > 0) process.stdout.write(tail);
+			},
+		});
+	} catch (e) {
+		process.stderr.write(`pillbox-e2b-helper: pty.create (relay) failed: ${e?.message ?? e}\n`);
+		await ctx.teardown(1);
+		return;
+	}
+	ctx.relayPid = handle.pid;
+
+	// stdin (host pump frames) → relay PTY, verbatim. Buffer until the
+	// relay marker so nothing is delivered to a half-booted shell.
+	process.stdin.on("data", (chunk) => {
+		const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+		if (!booted) {
+			stdinBacklog.push(buf);
+			return;
+		}
+		sendInput(buf);
 	});
+	process.stdin.on("end", () => void ctx.teardown(0));
+
+	// Kick the relay: raw mode, emit the marker, then exec the relay so it
+	// inherits the PTY's stdio (the shell is replaced, not forked).
+	const launch =
+		`stty -echo raw 2>/dev/null; printf '\\036\\036PB\\036\\036'; ` +
+		`exec pillbox pty-relay --sock ${shellEscape(sock)}\n`;
+	try {
+		await sandbox.pty.sendInput(ctx.relayPid, Buffer.from(launch));
+	} catch (e) {
+		process.stderr.write(`pillbox-e2b-helper: relay launch failed: ${e?.message ?? e}\n`);
+		await ctx.teardown(1);
+		return;
+	}
 
 	try {
 		await handle.wait();
-	} catch (e) {
-		if (!cleaning && !detaching) {
-			await cleanup(1);
-			fail(`pty wait: ${e?.message ?? e}`);
-		}
+	} catch {
+		// Relay PTY ended (peer death / agent exit) — fall through to
+		// teardown; the host pump has already resolved its own outcome.
 	}
-	await cleanup(0);
+	await ctx.teardown(0);
+}
+
+/// Mode: `attach` — create a sandbox, stage the blob, launch the pty-host
+/// (which runs the agent under its PTY), then either stream frames back
+/// via a relay (interactive) or exit after launch (`--detach`).
+async function runAttach(args) {
+	const blobBytes = await readBlob(args.blobFile);
+
+	let sandbox;
+	try {
+		sandbox = await Sandbox.create(args.template, {
+			timeoutMs: SANDBOX_TIMEOUT_MS,
+			metadata: args.name ? { pillboxRemote: args.name } : undefined,
+		});
+	} catch (e) {
+		fail(`Sandbox.create failed: ${e?.message ?? e}`);
+	}
+
+	// Own the sandbox lifecycle from here. `killSandbox: true` — a
+	// foreground run is ephemeral and writes no record, so any exit path
+	// (signal, error, or clean finish) must tear the sandbox down.
+	const ctx = makeSession(sandbox, { killSandbox: true });
+
+	try {
+		const blobName = `pillbox-blob-${randomBytes(6).toString("hex")}.json`;
+		const blobRemote = `/tmp/${blobName}`;
+		await sandbox.files.write(blobRemote, blobBytes);
+
+		const resultRemote = `/tmp/pillbox-result-${args.sessionId}.txt`;
+		const sock = sockForSession(args.sessionId);
+		const wrapper = buildWrapper(args, blobRemote, resultRemote);
+
+		const up = await launchPtyHost(sandbox, sock, wrapper);
+		if (!up) {
+			process.stderr.write(
+				`pillbox-e2b-helper: pty-host did not come up (socket ${sock} never appeared). ` +
+					"Is `pillbox` baked into the template image?\n",
+			);
+			await ctx.teardown(1);
+			return;
+		}
+
+		notifyRust({
+			type: "sandbox-up",
+			protoVersion: PROTO_VERSION,
+			sandboxId: sandbox.sandboxId,
+		});
+
+		if (args.detach) {
+			// Detached: the pty-host + agent are running headless. Leave the
+			// sandbox up (the host records the session; `pillbox session
+			// attach <id>` connects a relay later) and exit.
+			ctx.keepAlive = true;
+			notifyRust({ type: "detached" });
+			process.exit(0);
+		}
+
+		await streamRelay(ctx, sock);
+	} catch (e) {
+		process.stderr.write(`pillbox-e2b-helper: attach failed: ${e?.message ?? e}\n`);
+		await ctx.teardown(1);
+	}
+}
+
+/// Mode: `reattach` — connect to an existing sandbox and stream a fresh
+/// relay to the still-running pty-host (socket derived from the session
+/// id). `killSandbox: false` — the run owns the sandbox; teardown only
+/// kills our own relay PTY.
+async function runReattach(args) {
+	const sandbox = await connectSandbox(args.sandboxId);
+	const sock = sockForSession(args.sessionId);
+	const ctx = makeSession(sandbox, { killSandbox: false });
+
+	notifyRust({
+		type: "sandbox-up",
+		protoVersion: PROTO_VERSION,
+		sandboxId: args.sandboxId,
+	});
+
+	try {
+		await streamRelay(ctx, sock);
+	} catch (e) {
+		process.stderr.write(`pillbox-e2b-helper: reattach failed: ${e?.message ?? e}\n`);
+		await ctx.teardown(1);
+	}
+}
+
+/// Mode: `kill` — tear the sandbox down. Stand-alone: no PTY, no stdio
+/// shuttling. Used by `pillbox session rm <id>`.
+async function runKill(args) {
+	const sandbox = await connectSandbox(args.sandboxId);
+	try {
+		await sandbox.kill();
+	} catch (e) {
+		fail(`sandbox.kill failed: ${e?.message ?? e}`);
+	}
+	notifyRust({ type: "sandbox-up", protoVersion: PROTO_VERSION, sandboxId: args.sandboxId });
+	process.exit(0);
 }
 
 async function main() {

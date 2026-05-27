@@ -14,6 +14,23 @@ The v0.6 reshape: a pillbox is a self-contained bundle of (workspace
 removes. Per-project state, shared agent auth, and a path to remote
 execution that travels with the pillbox.
 
+### interactive attach transport (in-sandbox pty-host + frame protocol)
+
+- The agent now runs under an in-sandbox `pillbox pty-host` (owns the
+  PTY + a `vt100` screen model, serves a binary frame protocol on a unix
+  socket) across ALL backends: local Docker, ssh, and e2b. Attaching
+  speaks the same `frame.rs` codec over each backend's byte pipe —
+  `docker exec` stdio, ssh stdio, and (e2b) a raw-pty `pty-relay`
+  bridged through the Node helper's stdio.
+- Attach replays a bounded ANSI **snapshot** of current screen state, so
+  a fresh client repaints without a full-history replay.
+- The host-side `attach::pump` owns raw mode, resize, and the Ctrl-A D
+  detach for every backend; the e2b Node helper shrank to a dumb byte
+  shuttle (no more cooked-text streaming or Ctrl-A handling). e2b
+  reattach derives the pty-host socket from the session id (no `--pid`).
+- Detach is session-only: a foreground `run` passes Ctrl-A through and
+  has no destructive detach.
+
 ### v0.6 PR 7 — polish + docs
 
 - Full README rewrite reflecting the post-PR-6 surface.
@@ -36,9 +53,9 @@ execution that travels with the pillbox.
 - Detach hotkey: Ctrl-A D (Ctrl-A Ctrl-A sends a literal Ctrl-A so
   shell readline still works inside the sandbox). Also detachable
   from another shell via `pillbox session detach <id>`.
-- Helper grew `reattach --sandbox-id S --pid P` (uses
-  `sandbox.pty.connect`) and `kill --sandbox-id S` modes. Two new
-  stderr event types (`detached`, `detach-pressed`).
+- Helper grew `reattach` and `kill --sandbox-id S` modes (the e2b
+  attach wire was later reshaped onto the frame protocol — see the
+  interactive-attach-transport entry above).
 - `session_detach` SIGTERM is guarded against pid reuse + reserved
   pids + self-pid (kill(pid, 0) liveness probe first).
 - ANSI-escape sanitizer on every helper-stderr passthrough.

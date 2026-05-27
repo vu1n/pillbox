@@ -201,7 +201,7 @@ and in sandbox `/tmp`, then unlinks after the in-sandbox pillbox reads it.
 **SSH vs E2B parity:** detached sessions (`--detach`,
 `session attach`/`detach`/`rm`) work uniformly across local Docker,
 E2B, and SSH remotes — each carries the attach-transport frames over
-its own byte pipe (docker exec, E2B's `pty.connect`, ssh stdio).
+its own byte pipe (docker exec, an E2B raw-pty `pty-relay`, ssh stdio).
 
 ## Sessions and the detach hotkey
 

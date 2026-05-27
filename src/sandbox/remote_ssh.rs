@@ -520,12 +520,12 @@ fn sh_quote(value: &str) -> String {
 
 /// Build the inner wrapper — the script `bash -lc` evaluates on the
 /// remote (a SINGLE shell level). Every interpolated value is
-/// [`sh_quote`]d once for THIS level. Mirrors the e2b helper's `launch`
-/// (minus the PTY-typing `stty`/BOOT_MARKER bits, which are e2b-only:
-/// there the line is *typed into* a PTY, whereas pty-host exec's this
-/// argv directly). The one wire-protocol difference from e2b is
-/// `--blob-file` (vs `< blob`): it keeps the child's stdin the PTY so the
-/// inner `docker run -it` gets a TTY.
+/// [`sh_quote`]d once for THIS level. Mirrors the e2b helper's
+/// `buildWrapper`: both are `exec`'d as the pty-host's child argv (the
+/// pty-host owns the PTY + raw mode + frame protocol, so the wrapper
+/// itself never touches `stty` or markers). The one wire-protocol
+/// difference from e2b is `--blob-file` (vs e2b's `< blob`): it keeps the
+/// child's stdin the PTY so the inner `docker run -it` gets a TTY.
 ///
 /// `webhook` / `parent` are the host-env values (already filtered to
 /// non-empty); `None` drops the corresponding `export`.

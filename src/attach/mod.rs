@@ -13,8 +13,9 @@
 //!     used to serve a bounded ANSI snapshot on attach.
 //!
 //! Backends carry the identical [`frame::Frame`] codec over their own byte
-//! pipe — docker exec stdio (local), ssh stdio (ssh), E2B's `pty.connect`
-//! stream (e2b) — driving it with the shared pump in [`pump`]. The session
+//! pipe — docker exec stdio (local), ssh stdio (ssh), a raw-pty `pty-relay`
+//! bridged through the Node helper (e2b) — driving it with the shared pump
+//! in [`pump`]. The session
 //! lifecycle is implemented per-backend as free functions
 //! (`reattach`/`kill_session` in `sandbox/*`), not a trait.
 

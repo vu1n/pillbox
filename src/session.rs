@@ -17,8 +17,9 @@
 //!
 //! `e2b`, `docker`, and `ssh` backends all mint sessions today. They
 //! reattach through the same shared attach transport (frame protocol +
-//! pump): e2b over `sandbox.pty.connect`, docker over `docker exec`, ssh
-//! over an ssh-exec'd `pty-relay` to a persistent remote pty-host. The
+//! pump): e2b over a raw-pty `pty-relay` bridged through the Node helper,
+//! docker over `docker exec`, ssh over an ssh-exec'd `pty-relay` to a
+//! persistent remote pty-host. The
 //! `backend` string drives dispatch in `commands::session`.
 //!
 //! ## Threat model

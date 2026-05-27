@@ -27,12 +27,13 @@ docker / e2b / ssh with one interface.
   resident service, preserving the "self-contained bundle, no daemons"
   identity.
 - **One frame protocol over any byte pipe.** A backend supplies only a
-  bidirectional byte pipe (`FramePipe`); the *frames* on it are identical
-  everywhere. local = `docker exec`/attach, e2b = `pty.connect`, ssh =
-  ssh stdio. SSH (and tmux) may be the transport/host *under* the protocol
-  on the ssh backend, but are never the cross-backend interface — same
-  rule the proto applies to ssh ("transport … never the primitive").
-- **The snapshot is ours, not the backend's.** E2B's `pty.connect` is a
+  bidirectional byte pipe; the *frames* on it are identical everywhere.
+  local = `docker exec`/attach stdio, e2b = a raw-pty `pty-relay` bridged
+  through the Node helper's stdio, ssh = ssh stdio. SSH (and tmux) may be
+  the transport/host *under* the protocol on the ssh backend, but are
+  never the cross-backend interface — same rule the proto applies to ssh
+  ("transport … never the primitive").
+- **The snapshot is ours, not the backend's.** E2B's PTY stream is a
   thin client over envd's `Connect` RPC and does not promise screen
   replay; even raw byte replay ≠ a reconstructed screen. So screen
   reconstruction is pillbox's layer. The snapshot is the PTY analogue of
@@ -156,7 +157,7 @@ This lifts today's e2b-only free functions (`reattach`, `kill_session` in
 | Concern | local docker | e2b | ssh VPS |
 |---|---|---|---|
 | pty-host location | host process (or in-container) | inside sandbox (`pillbox` mode) | on VPS (`pillbox` mode) |
-| `FramePipe` transport | `docker exec` stdio | `pty.connect` stream | ssh stdio |
+| frame transport | `docker exec` stdio | raw-pty `pty-relay` via Node helper stdio | ssh stdio |
 | snapshot | `ScreenModel` (vt100) | `ScreenModel` (vt100) | `ScreenModel` (vt100), or tmux |
 | ssh-detach today | n/a | works | **falls out for free** |
 
@@ -177,7 +178,7 @@ This lifts today's e2b-only free functions (`reattach`, `kill_session` in
 2. **Multi-client** — N simultaneous viewers per session (orca: desktop +
    mobile). Host structure supports it; untested concurrently.
 3. **Real remote transport binding** — run the host *inside* an e2b/ssh
-   sandbox with the pipe being `pty.connect`/ssh stdio (prototype proved
+   sandbox with the pipe being a raw-pty `pty-relay`/ssh stdio (prototype proved
    only the local-socket case; the protocol is transport-agnostic by
    design but the binding is unproven). Local docker (phase 2b) is the
    first real binding: host inside the container, pipe = `docker exec`.
@@ -191,9 +192,9 @@ This lifts today's e2b-only free functions (`reattach`, `kill_session` in
    with unit tests (fidelity + frame round-trip). No backend wiring.
 2. **Local backend** — pty-host subcommand + `docker exec` transport; route
    `pillbox run` (interactive) and `session attach` through the shared pump.
-3. **e2b binding** — `e2b-helper.mjs` shrinks to a `pty.connect`↔host-stdio
-   bridge; detach/handshake logic moves into the framed protocol
-   (`PROTO_VERSION` bump for in-flight sessions).
+3. **e2b binding** — `e2b-helper.mjs` shrinks to a byte shuttle between
+   host stdio and an in-sandbox raw-pty `pty-relay`; detach/handshake
+   logic moves into the framed protocol (host pump owns Ctrl-A + SIGTERM).
 4. **ssh binding** — same host over ssh stdio; ssh detach lands for free.
 5. **Embedder front-end** — `pillbox session attach --protocol frames` +
    reference TS client; add flow control + multi-client.

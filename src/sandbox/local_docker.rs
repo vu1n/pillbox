@@ -9,14 +9,19 @@ use anyhow::{Context, Result};
 
 use super::SandboxBackend;
 use crate::agents::{
-    base_docker_args, resolve_run_env, resolve_with_entries, workspace_mount_name, AgentSpec,
-    RunOpts, GUEST_HOME, GUEST_WORKSPACE,
+    base_docker_args_detached, resolve_run_env, resolve_with_entries, workspace_mount_name,
+    AgentSpec, RunOpts, GUEST_HOME, GUEST_WORKSPACE,
 };
+use crate::attach::pump::{self, Outcome};
 use crate::pillbox::Pillbox;
 use crate::workspace::WorkspaceBackend;
 use crate::{docker, errors::PillboxError};
 
 pub(crate) struct LocalDocker;
+
+/// Where the in-container pty-host listens; the per-attach relay (run via
+/// `docker exec`) connects to the same path. One pty-host per container.
+const ATTACH_SOCK: &str = "/tmp/pillbox-attach.sock";
 
 impl SandboxBackend for LocalDocker {
     fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
@@ -113,7 +118,19 @@ impl SandboxBackend for LocalDocker {
             Some(inject(&resolved_mcps)?)
         };
 
-        let mut args = base_docker_args();
+        // Local --detach (a persisted session) isn't wired yet — it stays
+        // remote-only, matching today's contract. Sessions land next.
+        if opts.detach {
+            return Err(
+                PillboxError::usage("run", "--detach is not supported for local runs yet")
+                    .with_next("pillbox run --detach --remote <name>")
+                    .into(),
+            );
+        }
+
+        // Detached container so the pty-host outlives the client; we attach
+        // over a docker-exec relay and tear it down explicitly.
+        let mut args = base_docker_args_detached();
         args.extend([
             "-v".into(),
             format!("{}:{GUEST_HOME}", home.display()),
@@ -149,21 +166,56 @@ impl SandboxBackend for LocalDocker {
             );
         }
         args.push(runner_image);
+        // Run the agent under the in-sandbox pty-host instead of directly,
+        // so the same frame protocol carries it as the remote backends.
+        args.extend([
+            "pillbox".into(),
+            "pty-host".into(),
+            "--sock".into(),
+            ATTACH_SOCK.into(),
+            "--".into(),
+        ]);
         args.extend(spec.run_argv.iter().map(|s| s.to_string()));
         if let Some(mcp) = &mcp {
             args.extend(mcp.extra_argv.iter().cloned());
         }
         args.extend(opts.args);
 
-        let status = docker::run_interactive(&args)?;
+        let container = docker::run_detached(&args)?;
+        let outcome = attach_via_exec(&container);
+        // The vault proxy must stay up for the whole attached session.
         drop(vault_session);
-        if !status.success() {
-            return Err(PillboxError::runtime(
+        // Foreground run: tear the container down regardless of outcome.
+        let _ = docker::rm_force(&container);
+
+        match outcome? {
+            Outcome::Exited(0) | Outcome::Detached | Outcome::Disconnected => Ok(()),
+            Outcome::Exited(code) => Err(PillboxError::runtime(
                 "run",
-                format!("{} exited with status {status}", spec.id),
+                format!("{} exited with status {code}", spec.id),
             )
-            .into());
+            .into()),
         }
-        Ok(())
     }
+}
+
+/// Attach the terminal pump to a running pty-host container by execing the
+/// per-attach relay and pumping over its stdio.
+fn attach_via_exec(container: &str) -> Result<Outcome> {
+    let mut child = docker::exec_attach(
+        container,
+        &[
+            "pillbox".into(),
+            "pty-relay".into(),
+            "--sock".into(),
+            ATTACH_SOCK.into(),
+        ],
+    )?;
+    let stdout = child.stdout.take().context("docker exec relay stdout")?;
+    let stdin = child.stdin.take().context("docker exec relay stdin")?;
+    let outcome = pump::attach_terminal(stdout, stdin)?;
+    // Don't leave the relay exec lingering.
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(outcome)
 }

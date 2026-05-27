@@ -23,10 +23,16 @@ use super::screen::ScreenModel;
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
 
+/// What the broadcast carries to each client's writer thread.
+enum Out {
+    Data(Vec<u8>),
+    Exit(i32),
+}
+
 struct Hub {
     screen: ScreenModel,
-    /// Per-client senders of raw PTY chunks; pruned when a send fails.
-    clients: Vec<Sender<Vec<u8>>>,
+    /// Per-client senders; pruned when a send fails.
+    clients: Vec<Sender<Out>>,
 }
 
 type SharedWriter = Arc<Mutex<Box<dyn std::io::Write + Send>>>;
@@ -59,7 +65,7 @@ pub(crate) fn run(sock: &str, argv: &[String]) -> Result<()> {
         cmd.env(k, v);
     }
     cmd.env("TERM", "xterm-256color");
-    let _child = pair
+    let mut child = pair
         .slave
         .spawn_command(cmd)
         .context("spawning agent under PTY")?;
@@ -78,6 +84,7 @@ pub(crate) fn run(sock: &str, argv: &[String]) -> Result<()> {
     }));
 
     // PTY reader: feed the screen model + fan out raw bytes to clients.
+    // Owns the child so it can read the exit code on EOF.
     {
         let hub = hub.clone();
         thread::spawn(move || {
@@ -89,12 +96,23 @@ pub(crate) fn run(sock: &str, argv: &[String]) -> Result<()> {
                         let chunk = buf[..n].to_vec();
                         let mut h = hub.lock().unwrap();
                         h.screen.feed(&chunk);
-                        h.clients.retain(|c| c.send(chunk.clone()).is_ok());
+                        h.clients
+                            .retain(|c| c.send(Out::Data(chunk.clone())).is_ok());
                     }
                 }
             }
-            // Child exited: the host's job is done. Real backends key
-            // teardown off this; locally we just exit.
+            // Child exited. Broadcast its code as an Exit frame so attached
+            // clients can propagate it (e.g. a non-detached `pillbox run`
+            // returns the agent's status), then exit so the container stops.
+            let code = child.wait().map(|s| s.exit_code() as i32).unwrap_or(0);
+            {
+                let mut h = hub.lock().unwrap();
+                h.clients.retain(|c| c.send(Out::Exit(code)).is_ok());
+            }
+            // Give the per-client writer threads a moment to encode the Exit
+            // frame (each shuts its own socket right after) before the host
+            // process tears down.
+            thread::sleep(std::time::Duration::from_millis(250));
             std::process::exit(0);
         });
     }
@@ -121,7 +139,7 @@ fn handle_client(
     // Register + snapshot atomically so no live byte is missed or doubled:
     // the snapshot reflects exactly the state up to this client's first
     // queued chunk.
-    let (tx, rx) = channel::<Vec<u8>>();
+    let (tx, rx) = channel::<Out>();
     let snapshot = {
         let mut h = hub.lock().unwrap();
         let snap = h.screen.snapshot();
@@ -132,10 +150,22 @@ fn handle_client(
         return;
     }
 
-    // Writer thread: broadcast chunks -> Data frames.
+    // Writer thread: broadcast -> Data/Exit frames. On Exit, flush then
+    // shut the socket down so the client sees the exit code followed by a
+    // clean EOF immediately — independent of how fast the host process
+    // tears down afterwards (otherwise the Exit frame can race the
+    // reader thread's process::exit and be lost).
     thread::spawn(move || {
-        while let Ok(chunk) = rx.recv() {
-            if Frame::Data(chunk).encode(&mut wstream).is_err() {
+        while let Ok(out) = rx.recv() {
+            let (frame, is_exit) = match out {
+                Out::Data(chunk) => (Frame::Data(chunk), false),
+                Out::Exit(code) => (Frame::Exit(code), true),
+            };
+            if frame.encode(&mut wstream).is_err() {
+                break;
+            }
+            if is_exit {
+                let _ = wstream.shutdown(std::net::Shutdown::Both);
                 break;
             }
         }

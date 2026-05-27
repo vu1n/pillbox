@@ -438,10 +438,13 @@ pub(crate) fn resolve_run_env(
     Ok(env)
 }
 
-pub(crate) fn base_docker_args() -> Vec<String> {
-    vec![
-        "-it".into(),
-        "--rm".into(),
+/// `docker run` args common to every local launch: host-gateway alias +
+/// the HOME/TERM/PATH env scaffolding. `stdio_prefix` is the per-mode head:
+/// `["-it", "--rm"]` for a foreground run, `["-d"]` for the detached
+/// attach-transport flow.
+fn base_docker_args_with(stdio_prefix: &[&str]) -> Vec<String> {
+    let mut v: Vec<String> = stdio_prefix.iter().map(|s| (*s).into()).collect();
+    v.extend([
         // Make `host.docker.internal` resolve on Linux. Docker Desktop
         // already provides this alias and ignores the flag; vault and
         // `--mcp` (and any future host-reachable feature) all rely on
@@ -454,7 +457,19 @@ pub(crate) fn base_docker_args() -> Vec<String> {
         "TERM=xterm-256color".into(),
         "-e".into(),
         format!("PATH=/usr/local/bin:/usr/bin:/bin:{GUEST_HOME}/.local/bin"),
-    ]
+    ]);
+    v
+}
+
+pub(crate) fn base_docker_args() -> Vec<String> {
+    base_docker_args_with(&["-it", "--rm"])
+}
+
+/// Detached base args for the attach-transport flow: `-d`, no `--rm`, so the
+/// pty-host container outlives the client and can be `docker exec`'d into
+/// and explicitly removed.
+pub(crate) fn base_docker_args_detached() -> Vec<String> {
+    base_docker_args_with(&["-d"])
 }
 
 pub(crate) fn workspace_mount_name(host: &Path, override_name: Option<&str>) -> Result<String> {

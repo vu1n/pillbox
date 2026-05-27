@@ -610,7 +610,7 @@ fn run(cli: Cli) -> Result<()> {
         // Internal attach-transport commands. No pillbox resolution: they
         // operate on a raw PTY + socket and are invoked by pillbox itself.
         Command::PtyHost { sock, argv } => attach::host::run(&sock, &argv),
-        Command::PtyAttach { sock } => attach::pump::attach_unix(&sock),
+        Command::PtyAttach { sock } => attach::pump::attach_unix(&sock).map(|_| ()),
         Command::PtyRelay { sock } => attach::relay::run(&sock),
     }
 }

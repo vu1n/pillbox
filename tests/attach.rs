@@ -27,14 +27,18 @@ fn unique_sock() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("pb-attach-{}-{}.sock", std::process::id(), nanos))
 }
 
-/// Read one framed payload: 5-byte header + body. `None` on EOF/short read.
-fn read_frame<R: Read>(r: &mut R) -> Option<Vec<u8>> {
+/// Read one frame: 5-byte header + body. `None` on EOF/short read.
+fn read_typed<R: Read>(r: &mut R) -> Option<(u8, Vec<u8>)> {
     let mut hdr = [0u8; 5];
     r.read_exact(&mut hdr).ok()?;
     let len = u32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]) as usize;
     let mut payload = vec![0u8; len];
     r.read_exact(&mut payload).ok()?;
-    Some(payload)
+    Some((hdr[0], payload))
+}
+
+fn read_frame<R: Read>(r: &mut R) -> Option<Vec<u8>> {
+    read_typed(r).map(|(_, p)| p)
 }
 
 /// Accumulate frame payloads from `r` until the marker appears (or the
@@ -122,5 +126,74 @@ fn pty_relay_bridges_socket_to_stdio() {
     assert!(
         found,
         "pty-relay never bridged the host's framed output to stdio"
+    );
+}
+
+/// Full local-docker transport: launch the pty-host inside a real container,
+/// attach over a `docker exec` relay, and assert the agent's output + exit
+/// code propagate as frames. Ignored by default — needs docker + the runner
+/// image. Run: `cargo test --test attach -- --ignored`
+/// (override the image with `PILLBOX_TEST_RUNNER_IMAGE`).
+#[test]
+#[ignore = "requires docker + the runner image"]
+fn docker_transport_propagates_output_and_exit_code() {
+    const FRAME_EXIT: u8 = 8;
+    let image =
+        std::env::var("PILLBOX_TEST_RUNNER_IMAGE").unwrap_or_else(|_| "pillbox-runner:dev".into());
+    let sock = format!("/tmp/pb-it-{}.sock", std::process::id());
+
+    let cid = String::from_utf8(
+        Command::new("docker")
+            .args([
+                "run", "-d", &image, "pillbox", "pty-host", "--sock", &sock, "--", "bash", "-c",
+            ])
+            .arg("printf 'PILLBOXPHASE2OK\\n'; sleep 1; exit 7")
+            .output()
+            .expect("docker run")
+            .stdout,
+    )
+    .expect("utf8 container id")
+    .trim()
+    .to_string();
+    assert!(!cid.is_empty(), "docker run -d produced no container id");
+
+    struct RmContainer(String);
+    impl Drop for RmContainer {
+        fn drop(&mut self) {
+            let _ = Command::new("docker").args(["rm", "-f", &self.0]).output();
+        }
+    }
+    let _rm = RmContainer(cid.clone());
+
+    // Relay over docker exec. Keep stdin open (hold the child) so the relay
+    // stays connected until the host closes after the Exit frame.
+    let mut relay = Command::new("docker")
+        .args(["exec", "-i", &cid, "pillbox", "pty-relay", "--sock", &sock])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("docker exec relay");
+    let mut stdout = relay.stdout.take().expect("relay stdout");
+    let _relay = KillOnDrop(relay);
+
+    let mut acc = Vec::new();
+    let mut exit_code = None;
+    while let Some((typ, payload)) = read_typed(&mut stdout) {
+        if typ == FRAME_EXIT && payload.len() == 4 {
+            exit_code = Some(i32::from_be_bytes([
+                payload[0], payload[1], payload[2], payload[3],
+            ]));
+        }
+        acc.extend_from_slice(&payload);
+    }
+
+    assert!(
+        acc.windows(MARKER.len()).any(|w| w == MARKER),
+        "agent output did not propagate through the docker transport"
+    );
+    assert_eq!(
+        exit_code,
+        Some(7),
+        "agent exit code did not propagate as an Exit frame"
     );
 }

@@ -109,6 +109,17 @@ per client (orca's `acknowledgeDataEvent`). A slow or stalled client never
 OOMs the host. The screen model is always fed every byte regardless, so a
 re-snapshot is always correct.
 
+Orca's relay protocol (confirmed from its design notes) puts **seq + ack
+in every frame header** (13-byte header: type, id/seq, ack, length) so
+flow control and reconnect-resync are intrinsic, plus a 5 s **KeepAlive**
+frame for liveness and a **version handshake** (mismatch = hard, non-retry
+error). Our v1 header is leaner (`type + length`); phase 5 should adopt
+seq/ack + a `Hello` version field rather than inventing a separate scheme.
+Orca also keeps a **raw replay ring buffer (last ~100 KB)** *alongside*
+the screen snapshot — the snapshot repaints the visible screen, the ring
+buffer restores recent scrollback. Our `ScreenModel` is screen-only today;
+the ring buffer is the scrollback upgrade.
+
 ## Rust surface (pillbox-core)
 
 Library-first, matching the contract doc. New module `src/attach/`:
@@ -168,7 +179,11 @@ This lifts today's e2b-only free functions (`reattach`, `kill_session` in
 3. **Real remote transport binding** — run the host *inside* an e2b/ssh
    sandbox with the pipe being `pty.connect`/ssh stdio (prototype proved
    only the local-socket case; the protocol is transport-agnostic by
-   design but the binding is unproven).
+   design but the binding is unproven). Local docker (phase 2b) is the
+   first real binding: host inside the container, pipe = `docker exec`.
+4. **Protocol hardening** (orca-confirmed) — seq/ack frame header for
+   reconnect-resync, a `Hello` version handshake, KeepAlive frames, and a
+   raw replay ring buffer for scrollback alongside the screen snapshot.
 
 ## Phasing
 

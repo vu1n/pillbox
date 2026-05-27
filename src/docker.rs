@@ -150,6 +150,36 @@ pub fn run_interactive(args: &[String]) -> Result<ExitStatus> {
     Ok(status)
 }
 
+/// `docker rm -f <container>` — force-remove (kills if running). Best-effort
+/// teardown for the attach-transport flow; errors are the caller's to ignore.
+pub fn rm_force(container: &str) -> Result<()> {
+    Command::new("docker")
+        .arg("rm")
+        .arg("-f")
+        .arg(container)
+        .output()
+        .context("invoking `docker rm -f`")?;
+    Ok(())
+}
+
+/// `docker exec -i <container> <argv...>` with stdin + stdout piped (no TTY,
+/// so the byte stream is binary-clean for the attach-transport frames) and
+/// stderr inherited for diagnostics. Returns the live [`Child`]; the caller
+/// takes its stdin/stdout to drive the pump. Used to attach to an
+/// in-container `pillbox pty-relay`.
+pub fn exec_attach(container: &str, argv: &[String]) -> Result<std::process::Child> {
+    Command::new("docker")
+        .arg("exec")
+        .arg("-i")
+        .arg(container)
+        .args(argv)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("invoking `docker exec -i`")
+}
+
 /// `docker run <args...>` detached. `args` must include `-d` and the image +
 /// command. Returns the container id (stdout, trimmed).
 pub fn run_detached(args: &[String]) -> Result<String> {

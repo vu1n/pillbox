@@ -373,6 +373,15 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         sock: String,
     },
+    /// Internal: verbatim byte pump between a pty-host socket and stdio.
+    /// Run inside a sandbox by the per-attach transport (docker exec / ssh)
+    /// so one client's frames reach the pty-host. See docs/attach-transport.md.
+    #[command(hide = true)]
+    PtyRelay {
+        /// Unix socket the in-sandbox `pty-host` is listening on.
+        #[arg(long, value_name = "PATH")]
+        sock: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -602,6 +611,7 @@ fn run(cli: Cli) -> Result<()> {
         // operate on a raw PTY + socket and are invoked by pillbox itself.
         Command::PtyHost { sock, argv } => attach::host::run(&sock, &argv),
         Command::PtyAttach { sock } => attach::pump::attach_unix(&sock),
+        Command::PtyRelay { sock } => attach::relay::run(&sock),
     }
 }
 

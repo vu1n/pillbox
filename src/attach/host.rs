@@ -51,6 +51,13 @@ pub(crate) fn run(sock: &str, argv: &[String]) -> Result<()> {
 
     let mut cmd = CommandBuilder::new(program);
     cmd.args(args);
+    // portable-pty switches to explicit-env mode the moment we set any var,
+    // so inherit the full environment first (the agent needs HOME, PATH,
+    // and the secrets/env the backend injected via `docker run -e`), then
+    // ensure a sane TERM.
+    for (k, v) in std::env::vars() {
+        cmd.env(k, v);
+    }
     cmd.env("TERM", "xterm-256color");
     let _child = pair
         .slave

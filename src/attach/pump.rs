@@ -29,12 +29,14 @@ pub(crate) fn attach_unix(sock: &str) -> Result<()> {
     attach_terminal(read_half, stream)
 }
 
-/// Attach a real terminal to `pipe` and pump until the agent exits or the
-/// user detaches (Ctrl-A D). `pipe` must be cloneable into independent
-/// read/write halves (UnixStream and the transport stdios all are).
-pub(crate) fn attach_terminal<P>(read_half: P, write_half: P) -> Result<()>
+/// Attach a real terminal and pump until the agent exits or the user
+/// detaches (Ctrl-A D). The read/write halves are separate types so this
+/// serves both a cloned `UnixStream` pair (local) and a child process's
+/// `stdout`/`stdin` (docker exec / ssh transports).
+pub(crate) fn attach_terminal<R, W>(read_half: R, write_half: W) -> Result<()>
 where
-    P: Read + Write + Send + 'static,
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
 {
     let writer = Arc::new(Mutex::new(write_half));
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -99,8 +101,8 @@ where
 
 /// stdin -> Input frames, with the Ctrl-A detach prefix interpreted
 /// (Ctrl-A D detaches; Ctrl-A Ctrl-A sends a literal Ctrl-A through).
-fn pump_stdin<P: Read + Write + Send + 'static>(
-    writer: &Arc<Mutex<P>>,
+fn pump_stdin<W: Write + Send + 'static>(
+    writer: &Arc<Mutex<W>>,
     done: &Arc<AtomicBool>,
 ) -> Result<()> {
     let mut inp = stdin();
@@ -132,6 +134,6 @@ fn pump_stdin<P: Read + Write + Send + 'static>(
     Ok(())
 }
 
-fn send<P: Write>(writer: &Arc<Mutex<P>>, frame: Frame) {
+fn send<W: Write>(writer: &Arc<Mutex<W>>, frame: Frame) {
     let _ = frame.encode(&mut *writer.lock().unwrap());
 }

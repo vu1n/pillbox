@@ -20,6 +20,8 @@
 //! the shared pump arrives in later phases (see `docs/attach-transport.md`).
 
 pub(crate) mod frame;
+pub(crate) mod host;
+pub(crate) mod pump;
 pub(crate) mod screen;
 
 use std::io::{Read, Write};

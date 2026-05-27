@@ -352,6 +352,27 @@ enum Command {
         #[arg(value_name = "SHELL")]
         shell: clap_complete::Shell,
     },
+    /// Internal: run the interactive attach pty-host. Owns the agent's
+    /// PTY + a screen model and serves the attach-transport frame
+    /// protocol on a unix socket. Invoked by pillbox inside a sandbox
+    /// (or locally); not a user-facing command. See docs/attach-transport.md.
+    #[command(hide = true)]
+    PtyHost {
+        /// Unix socket to listen on for attach clients.
+        #[arg(long, value_name = "PATH")]
+        sock: String,
+        /// Command to run under the PTY: everything after `--`.
+        #[arg(last = true, value_name = "CMD")]
+        argv: Vec<String>,
+    },
+    /// Internal: attach a real terminal to a local pty-host socket. The
+    /// human front-end of the attach transport (Ctrl-A D to detach).
+    #[command(hide = true)]
+    PtyAttach {
+        /// Unix socket a `pty-host` is listening on.
+        #[arg(long, value_name = "PATH")]
+        sock: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -577,6 +598,10 @@ fn run(cli: Cli) -> Result<()> {
             let resolved = Pillbox::resolve(pillbox_arg)?;
             commands::workspace::dispatch(&resolved, action)
         }
+        // Internal attach-transport commands. No pillbox resolution: they
+        // operate on a raw PTY + socket and are invoked by pillbox itself.
+        Command::PtyHost { sock, argv } => attach::host::run(&sock, &argv),
+        Command::PtyAttach { sock } => attach::pump::attach_unix(&sock),
     }
 }
 

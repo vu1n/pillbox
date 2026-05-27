@@ -70,6 +70,12 @@ jiff = "0.2"
 # way orca's xterm-headless + SerializeAddon does, minus the hand-rolled
 # mouse-mode mirroring. See docs/attach-transport.md.
 vt100 = "0.15"
+# portable-pty: the in-sandbox pty-host owns the agent's PTY through this
+# (spawn under a PTY, read/write, resize). Runs sandbox-side.
+portable-pty = "0.8"
+# crossterm: host-side only — the terminal front-end pump (`pty-attach`)
+# uses it for raw mode + terminal size. Never runs in the sandbox.
+crossterm = "0.27"
 
 [features]
 # Opt-in OTLP/gRPC transport for the OTel logs sink. Adds tonic +

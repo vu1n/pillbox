@@ -372,7 +372,10 @@ async function streamRelay(ctx, sock) {
 		handle = await sandbox.pty.create({
 			cols: 80,
 			rows: 24,
-			cwd: "/root",
+			// No cwd: the relay just execs `pillbox pty-relay` over the
+			// socket, so its working dir is irrelevant — and E2B runs the
+			// sandbox as a non-root `user` (uid 1000), so a hardcoded
+			// `/root` (mode 700) fails the pty spawn with EACCES.
 			envs: { TERM: "xterm-256color", COLORTERM: "truecolor", LANG: "C.UTF-8" },
 			timeoutMs: 0,
 			onData: (data) => {

@@ -99,13 +99,14 @@ them is sandbox cold-start latency.
   `message_delta` events). Envelope attrs — status, latency, error
   rate — are still captured uniformly. Adding a JSON-body fallback
   is a follow-up.
-- **`gen_ai` span parenting only kicks in when `session_id` is
-  plumbed.** The vault accepts it via `ServerConfig.session_id`,
-  but the sandbox-resident vault path (`pillbox run --remote ssh/e2b`)
-  doesn't carry session_id through its stdin blob yet. Those runs
-  still produce gen_ai traces — just rooted per sandbox lease
-  instead of under the session span. Plumbing session_id through
-  the blob is a follow-up.
+- **`gen_ai` span parenting kicks in for SSH + e2b remote runs.**
+  The launcher mints `session_id`, bakes it into the VaultStdinBlob,
+  and the sandbox-resident vault uses it to parent gen_ai spans
+  under the session span. **Local-docker foreground runs still
+  produce sandbox-id-rooted traces** — that path has no
+  host-side session_id today (no wrapper, no session.* events), so
+  there's nothing to parent under. Minting one for foreground runs
+  is a small follow-up if and when local-docker grows a wrapper.
 - **`gen_ai.request.model` not emitted.** We extract
   `gen_ai.response.model` from the SSE `message_start` event — the
   model the server actually served, which is usually what you want.
@@ -184,11 +185,13 @@ on a private network, sketchy for a cleartext public endpoint. Prefer
 
 ## What's next
 
-- **Plumb `session_id` through VaultStdinBlob.** Cross-trace
-  correlation infrastructure already lands gen_ai spans under the
-  session span — but only the in-process VaultSession path actually
-  has session_id today. Add it to the stdin blob so SSH / e2b
-  sandbox-resident vaults light up too.
+- **Workspace transcript tail + emit.** Read agent-native JSONL
+  transcripts (`~/.claude/projects/**/*.jsonl`,
+  `~/.codex/sessions/**/*.jsonl`) live as they're appended,
+  normalize, and emit as OTLP child spans of the session span. The
+  universal third source — works for harnesses that have no hook
+  story (Codex), captures harness-internal state the wire can't see
+  (tool dispatch, user prompts, file edits).
 - **JSON-body fallback for non-streaming responses.** Mirror the SSE
   tap with a JSON-body parser for endpoints called with
   `stream: false` so usage attrs land uniformly.

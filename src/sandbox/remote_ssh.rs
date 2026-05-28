@@ -142,6 +142,14 @@ pub(crate) struct VaultStdinBlob {
     pub(crate) secrets: Vec<InlineSecret>,
     #[serde(default)]
     pub(crate) env: std::collections::BTreeMap<String, String>,
+    /// Pillbox-run session id. The launcher mints this on the host,
+    /// bakes it into the wrapper script's `pillbox session started`
+    /// / `done` calls, and ships it here so the sandbox-resident
+    /// vault can correlate its gen_ai spans with the session span
+    /// (one OTel trace per run). `#[serde(default)]` keeps the wire
+    /// backward-compatible with older host binaries that don't set it.
+    #[serde(default)]
+    pub(crate) session_id: Option<String>,
     pub(crate) workspace: InlineWorkspace,
     /// Files copied from the host's `<auth_pillbox>/auth/<agent_id>/`,
     /// to be re-materialized under the agent's `$HOME` on the receiver.
@@ -357,7 +365,17 @@ impl SandboxBackend for RemoteSshSandbox {
             .into());
         }
 
-        let blob = build_vault_stdin_blob(spec, &opts, resolved, "run --remote")?;
+        // Pre-mint the session id so the per-session remote sock / blob /
+        // log paths are unique, the `--detach` record references a
+        // stable handle, AND the vault correlates its gen_ai spans
+        // with the session span via the blob (see VaultStdinBlob.
+        // session_id). Minted before the blob is built so it can be
+        // baked in.
+        let session_id = Session::new_id();
+        let remote = RemoteSession::new(&session_id);
+
+        let mut blob = build_vault_stdin_blob(spec, &opts, resolved, "run --remote")?;
+        blob.session_id = Some(session_id.clone());
 
         // Sanity-check the URL once more before connecting — the registry
         // validates on add, but a hand-edited file could slip through.
@@ -376,12 +394,6 @@ impl SandboxBackend for RemoteSshSandbox {
             "pillbox: connecting to `{}` ({}) …",
             self.remote.name, self.remote.url
         );
-
-        // Pre-mint the session id so the per-session remote sock / blob /
-        // log paths are unique and so a `--detach` record (and the kill
-        // path) reference a stable handle. Mirrors the e2b backend.
-        let session_id = Session::new_id();
-        let remote = RemoteSession::new(&session_id);
 
         // Stage the blob to a remote 0600 temp file, then launch the
         // pty-host as a persistent background process running
@@ -1141,6 +1153,10 @@ pub(super) fn build_vault_stdin_blob(
         vault: opts.vault,
         secrets,
         env,
+        // Filled in by the launcher after `build_vault_stdin_blob`
+        // returns — separation lets the builder stay pure (no
+        // dependency on the run-id generator).
+        session_id: None,
         workspace,
         agent_auth,
     })
@@ -1346,10 +1362,11 @@ pub(crate) fn dispatch_vault_stdin(resolved: &Pillbox, blob_file: Option<&Path>)
             agent_id: spec.id,
             agent_home: &home,
         });
-        // session_id isn't on VaultStdinBlob yet — sandbox-resident
-        // vaults emit sandbox_id-rooted gen_ai traces for now.
-        // Plumbing session_id through the blob is a follow-up.
-        Some(VaultSession::start(oauth, resolved, None)?)
+        Some(VaultSession::start(
+            oauth,
+            resolved,
+            blob.session_id.clone(),
+        )?)
     } else {
         None
     };
@@ -1450,9 +1467,11 @@ pub(crate) fn dispatch_vault_stdin_direct(
             agent_id: spec.id,
             agent_home: &home_dir,
         });
-        // session_id isn't on VaultStdinBlob yet — see the SSH-shelled
-        // dispatcher above for the same rationale.
-        Some(VaultSession::start(oauth, resolved, None)?)
+        Some(VaultSession::start(
+            oauth,
+            resolved,
+            blob.session_id.clone(),
+        )?)
     } else {
         None
     };
@@ -1881,6 +1900,7 @@ mod tests {
             env: [("LOG_LEVEL".to_string(), "debug".to_string())]
                 .into_iter()
                 .collect(),
+            session_id: Some("sess-abc123".into()),
             workspace: test_workspace(),
             agent_auth: vec![AuthFile {
                 rel_path: ".claude/.credentials.json".into(),
@@ -1901,6 +1921,7 @@ mod tests {
         assert_eq!(back.agent_args, vec!["--continue"]);
         assert_eq!(back.workspace_mount_name, "my-app");
         assert!(back.vault);
+        assert_eq!(back.session_id.as_deref(), Some("sess-abc123"));
         assert_eq!(back.secrets.len(), 2);
         assert!(back.secrets[0].vault_meta.is_none());
         assert!(back.secrets[1].vault_meta.is_some());

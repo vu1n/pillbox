@@ -130,7 +130,15 @@ impl SandboxBackend for RemoteE2bSandbox {
             }
         };
 
-        let blob = build_vault_stdin_blob(spec, &opts, resolved, "run --remote (e2b)")?;
+        // Pre-mint the session id BEFORE building the blob so it
+        // can be baked into the blob — the sandbox-resident vault
+        // reads it back to correlate gen_ai spans with the session
+        // span. Also reused by `run_attach`'s wrapper invocation
+        // (single source of truth for the run's id).
+        let session_id = Session::new_id();
+        let mut blob = build_vault_stdin_blob(spec, &opts, resolved, "run --remote (e2b)")?;
+        blob.session_id = Some(session_id.clone());
+
         let label = opts.label.clone();
         let detach = opts.detach;
         let json = opts.json;
@@ -146,6 +154,7 @@ impl SandboxBackend for RemoteE2bSandbox {
             label,
             &e2b,
             &blob,
+            &session_id,
             detach,
             json,
             expires_at,
@@ -173,6 +182,7 @@ fn run_attach(
     label: Option<String>,
     e2b: &E2bRef,
     blob: &VaultStdinBlob,
+    session_id: &str,
     detach: bool,
     json: bool,
     expires_at: Option<String>,
@@ -206,14 +216,11 @@ fn run_attach(
         eprintln!("pillbox: detach with Ctrl-A D to keep the sandbox running.");
     }
 
-    // Pre-mint the session id so the sandbox-side wrapper can bake it
-    // into the `pillbox session done` call. Without pre-minting, the id
-    // wouldn't exist until after the helper handshake — too late for
-    // the wrapper to know what to reference. The same id gets written
-    // into the registry once the handshake completes; if the helper
-    // fails before then, the id is orphaned (no record persists), which
-    // is fine — id collisions are astronomically unlikely.
-    let session_id = Session::new_id();
+    // `session_id` is minted by the caller (see the launch path's
+    // pre-mint) so it can be baked into the blob before staging.
+    // Borrow as an owned String for the legacy uses below that
+    // expected a local binding.
+    let session_id = session_id.to_string();
 
     let mut cmd = Command::new("node");
     cmd.arg(&helper)

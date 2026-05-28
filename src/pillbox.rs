@@ -149,6 +149,18 @@ impl Pillbox {
         matches!(self.scope, Scope::Global)
     }
 
+    /// Stable identifier for the pillbox suitable for use as a
+    /// telemetry attribute (e.g. `pillbox.workspace_id` on gen_ai
+    /// spans). Project pillboxes return the path-encoded key
+    /// (`-Users-vuln-code-foo`); the global pillbox returns
+    /// `"global"`. The encoding is already URL- and label-safe.
+    pub(crate) fn workspace_id(&self) -> &str {
+        match &self.scope {
+            Scope::Global => GLOBAL_NAME,
+            Scope::Project { key, .. } => key,
+        }
+    }
+
     /// Resolve the configured workspace backend. Reads from
     /// `meta.json.workspace` (populated by `pillbox new`) so we don't
     /// re-parse `pillbox.toml` every time. Returns `None` for the

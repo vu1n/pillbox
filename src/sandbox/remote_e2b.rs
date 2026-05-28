@@ -138,6 +138,8 @@ impl SandboxBackend for RemoteE2bSandbox {
         let session_id = Session::new_id();
         let mut blob = build_vault_stdin_blob(spec, &opts, resolved, "run --remote (e2b)")?;
         blob.session_id = Some(session_id.clone());
+        blob.mode = Some(super::remote_ssh::orchestration_mode_for(opts.detach).to_string());
+        blob.workspace_id = Some(resolved.workspace_id().to_string());
 
         let label = opts.label.clone();
         let detach = opts.detach;

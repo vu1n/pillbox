@@ -111,11 +111,17 @@ impl SandboxBackend for LocalDocker {
             } else {
                 None
             };
-            // Foreground local-docker runs don't mint a host-side
-            // session_id (no wrapper, no session.* events). Pass None
-            // so gen_ai spans root per sandbox lease, matching the
-            // existing host-side observability shape for this path.
-            Some(crate::vault::VaultSession::start(oauth, resolved, None)?)
+            // Foreground local-docker has no host-side session_id
+            // (no wrapper, no session.* events) — gen_ai spans root
+            // per sandbox lease. Mode + workspace_id still surface,
+            // so eval consumers can group these traces by project /
+            // attentiveness regime even without a session anchor.
+            let context = crate::vault::RunContext {
+                session_id: None,
+                mode: Some("interactive".to_string()),
+                workspace_id: Some(resolved.workspace_id().to_string()),
+            };
+            Some(crate::vault::VaultSession::start(oauth, resolved, context)?)
         } else {
             None
         };

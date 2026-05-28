@@ -42,6 +42,32 @@ use super::{
 };
 use crate::events::{emit_genai_call_span, GenAiCallSpan};
 
+/// Per-run context surfaced as attributes on telemetry spans the
+/// vault emits. Each field is `Option<String>` so callers without a
+/// value (test fixtures, the ad-hoc `sidecar` command) just leave it
+/// — the attribute is omitted from emitted spans, not emitted as
+/// empty.
+///
+/// Threaded through [`ServerConfig`] / [`super::VaultSession::start`]
+/// / [`crate::sandbox::remote_ssh::VaultStdinBlob`] so every place a
+/// vault gets stood up surfaces the same fields uniformly.
+#[derive(Debug, Default, Clone)]
+pub struct RunContext {
+    /// Pillbox-run session id. When `Some`, gen_ai spans share a
+    /// trace with the sandbox-side session span (same
+    /// `derive_trace_id`) and parent it.
+    pub session_id: Option<String>,
+    /// Orchestration mode — `"interactive"` (foreground attach),
+    /// `"detached"` (run-and-detach), future modes as we grow them.
+    /// Surfaces as `pillbox.mode` on gen_ai spans; lets eval
+    /// scoring stratify by attentiveness regime.
+    pub mode: Option<String>,
+    /// Path-encoded pillbox key (e.g. `-Users-vuln-code-foo`) or
+    /// `"global"`. Surfaces as `pillbox.workspace_id`; lets
+    /// consumers group runs by project.
+    pub workspace_id: Option<String>,
+}
+
 /// Configuration for [`Server::start`].
 #[derive(Debug)]
 pub struct ServerConfig {
@@ -49,14 +75,8 @@ pub struct ServerConfig {
     pub bind: Option<SocketAddr>,
     /// Directory the CA cert + key are persisted in.
     pub ca_dir: PathBuf,
-    /// Pillbox-run session id, used as the trace_id seed for
-    /// gen_ai spans emitted from this server. When `Some`, gen_ai
-    /// spans share a trace with the sandbox-side session span (same
-    /// `derive_trace_id(session_id)`) and parent it. When `None`,
-    /// gen_ai spans fall back to a sandbox_id-rooted trace per
-    /// lease — useful when the caller doesn't have a session id
-    /// (e.g. test fixtures).
-    pub session_id: Option<String>,
+    /// Per-run context surfaced as attributes on gen_ai spans.
+    pub context: RunContext,
 }
 
 /// In-memory shared state. Handler clones share the registry behind a
@@ -66,8 +86,8 @@ pub(crate) struct ServerInner {
     ca: Ca,
     registry: Mutex<Registry>,
     providers: Vec<Arc<dyn VaultProvider>>,
-    /// See [`ServerConfig::session_id`].
-    session_id: Option<String>,
+    /// See [`ServerConfig::context`].
+    context: RunContext,
     /// Sender side of a shutdown signal. Dropping this triggers proxy
     /// graceful shutdown via the receiver held by the spawned task.
     shutdown_tx: tokio::sync::watch::Sender<bool>,
@@ -94,8 +114,8 @@ impl ServerInner {
         self.providers.iter().find(|p| p.id() == id)
     }
 
-    pub(crate) fn session_id(&self) -> Option<&str> {
-        self.session_id.as_deref()
+    pub(crate) fn context(&self) -> &RunContext {
+        &self.context
     }
 }
 
@@ -135,7 +155,7 @@ impl Server {
             ca,
             registry: Mutex::new(Registry::new()),
             providers,
-            session_id: config.session_id,
+            context: config.context,
             shutdown_tx,
         });
 
@@ -440,12 +460,14 @@ impl VaultHandler {
         };
 
         let status_code = res.status().as_u16();
-        let session_id = self.server.session_id().map(str::to_owned);
+        let ctx = self.server.context().clone();
         let (parts, body) = res.into_parts();
         let tapped = TappedBody::new(body, move |usage| {
             emit_genai_call_span(GenAiCallSpan {
                 sandbox_id,
-                session_id,
+                session_id: ctx.session_id,
+                mode: ctx.mode,
+                workspace_id: ctx.workspace_id,
                 start: call.start,
                 end: SystemTime::now(),
                 host: call.host,

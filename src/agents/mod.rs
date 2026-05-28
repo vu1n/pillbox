@@ -565,7 +565,9 @@ mod tests {
             .unwrap();
             std::env::remove_var("__PILLBOX_TEST_VAULTED");
 
-            let mut session = VaultSession::start(None::<OAuthAgent>, &g, None).unwrap();
+            let mut session =
+                VaultSession::start(None::<OAuthAgent>, &g, crate::vault::RunContext::default())
+                    .unwrap();
             let opts = run_opts_with_withs(vec!["VAULTED_KEY"]);
             let withs = resolve_with_entries(&g, &opts.withs).unwrap();
             let env = resolve_run_env(&g, &opts, &withs, Some(&mut session)).unwrap();
@@ -607,7 +609,9 @@ mod tests {
             .unwrap();
             std::env::remove_var("__PILLBOX_TEST_MIX_V");
 
-            let mut session = VaultSession::start(None::<OAuthAgent>, &g, None).unwrap();
+            let mut session =
+                VaultSession::start(None::<OAuthAgent>, &g, crate::vault::RunContext::default())
+                    .unwrap();
             let opts = run_opts_with_withs(vec!["MIX_PLAIN", "MIX_VAULTED=GITHUB_TOKEN"]);
             let withs = resolve_with_entries(&g, &opts.withs).unwrap();
             let env = resolve_run_env(&g, &opts, &withs, Some(&mut session)).unwrap();

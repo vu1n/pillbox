@@ -69,6 +69,10 @@ them is sandbox cold-start latency.
     - Envelope: `gen_ai.system`, `gen_ai.operation.name`,
       `server.address`, `http.request.method`, `url.path`,
       `http.response.status_code`, `pillbox.sandbox_id`
+    - Orchestration: `pillbox.mode` (`"interactive"` /
+      `"detached"`), `pillbox.workspace_id` (path-encoded pillbox
+      key or `"global"`). Lets eval scoring stratify by
+      attentiveness regime + group by project.
     - Body-derived (parsed from the SSE response stream as it passes
       through to the guest): `gen_ai.response.model`,
       `gen_ai.response.id`, `gen_ai.response.finish_reasons`,

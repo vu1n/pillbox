@@ -37,11 +37,18 @@ pub(crate) struct CallSpan {
     /// when `session_id` is absent.
     pub(crate) sandbox_id: String,
     /// Pillbox-run session id when the orchestrator plumbed one
-    /// through (see [`crate::vault::ServerConfig::session_id`]).
-    /// When `Some`, the span shares a trace with the session span
-    /// emitted by [`super::spans`] and parents it; when `None`, the
-    /// span roots its own trace per sandbox lease.
+    /// through (see [`crate::vault::RunContext`]). When `Some`, the
+    /// span shares a trace with the session span emitted by
+    /// [`super::spans`] and parents it; when `None`, the span roots
+    /// its own trace per sandbox lease.
     pub(crate) session_id: Option<String>,
+    /// `pillbox.mode` attribute — orchestration regime
+    /// (`"interactive"`, `"detached"`, future modes). Omitted when
+    /// `None`.
+    pub(crate) mode: Option<String>,
+    /// `pillbox.workspace_id` attribute — path-encoded pillbox key
+    /// or `"global"`. Omitted when `None`.
+    pub(crate) workspace_id: Option<String>,
     pub(crate) start: SystemTime,
     pub(crate) end: SystemTime,
     pub(crate) host: String,
@@ -143,6 +150,12 @@ fn build_attributes(call: &CallSpan) -> Vec<KeyValue> {
         KeyValue::new("http.response.status_code", call.status_code as i64),
         KeyValue::new("pillbox.sandbox_id", call.sandbox_id.clone()),
     ];
+    if let Some(mode) = call.mode.as_deref() {
+        attrs.push(KeyValue::new("pillbox.mode", mode.to_string()));
+    }
+    if let Some(ws) = call.workspace_id.as_deref() {
+        attrs.push(KeyValue::new("pillbox.workspace_id", ws.to_string()));
+    }
     push_usage_attrs(&mut attrs, &call.usage);
     attrs
 }
@@ -204,6 +217,8 @@ mod tests {
         CallSpan {
             sandbox_id: "abc123def456".into(),
             session_id: None,
+            mode: Some("interactive".into()),
+            workspace_id: Some("-Users-vuln-code-foo".into()),
             start: now,
             end: now,
             host: "api.anthropic.com".into(),
@@ -240,9 +255,24 @@ mod tests {
             "http.request.method",
             "http.response.status_code",
             "pillbox.sandbox_id",
+            "pillbox.mode",
+            "pillbox.workspace_id",
         ] {
             assert!(keys.contains(&expected), "missing attr: {expected}");
         }
+    }
+
+    #[test]
+    fn build_attributes_omits_orchestration_attrs_when_absent() {
+        let mut call = sample_call();
+        call.mode = None;
+        call.workspace_id = None;
+        let attrs = build_attributes(&call);
+        let keys: Vec<&str> = attrs.iter().map(|kv| kv.key.as_str()).collect();
+        assert!(!keys.contains(&"pillbox.mode"));
+        assert!(!keys.contains(&"pillbox.workspace_id"));
+        // Envelope still there.
+        assert!(keys.contains(&"pillbox.sandbox_id"));
     }
 
     #[test]

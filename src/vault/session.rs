@@ -19,7 +19,7 @@ use anyhow::Result;
 
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
-use crate::vault::{providers, SandboxLease, Server, ServerConfig, VaultMeta};
+use crate::vault::{providers, RunContext, SandboxLease, Server, ServerConfig, VaultMeta};
 
 /// One OAuth-credentials swap mounted into the guest. Owns the temp file
 /// holding the stub creds plus its mount-target path. `VaultSession`
@@ -75,15 +75,16 @@ impl VaultSession {
     /// FOO --vault`-flagged secrets that need stub swapping — pillbox
     /// still needs a proxy + CA + leases for those.
     ///
-    /// `session_id`, when `Some`, threads the pillbox-run session id
-    /// into the vault so gen_ai spans emitted by the MITM correlate
-    /// with the sandbox-side session span (one trace per run). `None`
-    /// leaves gen_ai spans rooted per sandbox lease — used by tests
-    /// and ad-hoc paths without a session.
+    /// `context` carries the orchestration-level signals that
+    /// downstream telemetry consumers care about — `session_id` for
+    /// trace correlation, `mode` / `workspace_id` as attributes on
+    /// the gen_ai spans this server emits. Pass
+    /// [`RunContext::default()`] when no signals are available
+    /// (tests, the ad-hoc `sidecar` command).
     pub(crate) fn start(
         oauth: Option<OAuthAgent<'_>>,
         pillbox: &Pillbox,
-        session_id: Option<String>,
+        context: RunContext,
     ) -> Result<Self> {
         let ca_dir = pillbox.subdir("vault")?;
 
@@ -96,7 +97,7 @@ impl VaultSession {
             .block_on(Server::start(ServerConfig {
                 bind: Some(SocketAddr::from(([0, 0, 0, 0], 0))),
                 ca_dir: ca_dir.clone(),
-                session_id,
+                context,
             }))
             .map_err(|e| PillboxError::runtime("vault", format!("start proxy: {e}")))?;
 

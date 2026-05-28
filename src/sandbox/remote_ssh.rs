@@ -150,6 +150,14 @@ pub(crate) struct VaultStdinBlob {
     /// backward-compatible with older host binaries that don't set it.
     #[serde(default)]
     pub(crate) session_id: Option<String>,
+    /// Orchestration mode (`"interactive"` / `"detached"`). Surfaces
+    /// as `pillbox.mode` on gen_ai spans. See [`crate::vault::RunContext`].
+    #[serde(default)]
+    pub(crate) mode: Option<String>,
+    /// Path-encoded pillbox key for grouping runs by project.
+    /// Surfaces as `pillbox.workspace_id` on gen_ai spans.
+    #[serde(default)]
+    pub(crate) workspace_id: Option<String>,
     pub(crate) workspace: InlineWorkspace,
     /// Files copied from the host's `<auth_pillbox>/auth/<agent_id>/`,
     /// to be re-materialized under the agent's `$HOME` on the receiver.
@@ -376,6 +384,8 @@ impl SandboxBackend for RemoteSshSandbox {
 
         let mut blob = build_vault_stdin_blob(spec, &opts, resolved, "run --remote")?;
         blob.session_id = Some(session_id.clone());
+        blob.mode = Some(orchestration_mode_for(opts.detach).to_string());
+        blob.workspace_id = Some(resolved.workspace_id().to_string());
 
         // Sanity-check the URL once more before connecting — the registry
         // validates on add, but a hand-edited file could slip through.
@@ -581,6 +591,30 @@ fn stage_blob(url: &SshUrl, remote: &RemoteSession, blob: &VaultStdinBlob) -> Re
         .into());
     }
     Ok(())
+}
+
+/// Map a `--detach`-or-not run option to the `pillbox.mode`
+/// attribute string. Centralized so SSH and e2b launchers don't
+/// drift on the wire-name. Adding `"attached"` (re-attaching to a
+/// detached session) etc. lands here.
+pub(crate) fn orchestration_mode_for(detach: bool) -> &'static str {
+    if detach {
+        "detached"
+    } else {
+        "interactive"
+    }
+}
+
+/// Project a [`VaultStdinBlob`]'s run-context fields onto a
+/// [`crate::vault::RunContext`]. Each blob field is already
+/// optional; this helper exists so the dispatchers stay one-line
+/// at the call site and the projection has one source of truth.
+fn run_context_from(blob: &VaultStdinBlob) -> crate::vault::RunContext {
+    crate::vault::RunContext {
+        session_id: blob.session_id.clone(),
+        mode: blob.mode.clone(),
+        workspace_id: blob.workspace_id.clone(),
+    }
 }
 
 /// POSIX single-quote escape for one value spliced into a `sh -c` /
@@ -1153,10 +1187,13 @@ pub(super) fn build_vault_stdin_blob(
         vault: opts.vault,
         secrets,
         env,
-        // Filled in by the launcher after `build_vault_stdin_blob`
-        // returns — separation lets the builder stay pure (no
-        // dependency on the run-id generator).
+        // Run-context fields are filled in by the launcher after
+        // `build_vault_stdin_blob` returns — separation lets the
+        // builder stay pure (no dependency on the run-id generator
+        // or per-launcher opts).
         session_id: None,
+        mode: None,
+        workspace_id: None,
         workspace,
         agent_auth,
     })
@@ -1365,7 +1402,7 @@ pub(crate) fn dispatch_vault_stdin(resolved: &Pillbox, blob_file: Option<&Path>)
         Some(VaultSession::start(
             oauth,
             resolved,
-            blob.session_id.clone(),
+            run_context_from(&blob),
         )?)
     } else {
         None
@@ -1470,7 +1507,7 @@ pub(crate) fn dispatch_vault_stdin_direct(
         Some(VaultSession::start(
             oauth,
             resolved,
-            blob.session_id.clone(),
+            run_context_from(&blob),
         )?)
     } else {
         None
@@ -1901,6 +1938,8 @@ mod tests {
                 .into_iter()
                 .collect(),
             session_id: Some("sess-abc123".into()),
+            mode: Some("interactive".into()),
+            workspace_id: Some("-test-workspace".into()),
             workspace: test_workspace(),
             agent_auth: vec![AuthFile {
                 rel_path: ".claude/.credentials.json".into(),
@@ -1922,6 +1961,8 @@ mod tests {
         assert_eq!(back.workspace_mount_name, "my-app");
         assert!(back.vault);
         assert_eq!(back.session_id.as_deref(), Some("sess-abc123"));
+        assert_eq!(back.mode.as_deref(), Some("interactive"));
+        assert_eq!(back.workspace_id.as_deref(), Some("-test-workspace"));
         assert_eq!(back.secrets.len(), 2);
         assert!(back.secrets[0].vault_meta.is_none());
         assert!(back.secrets[1].vault_meta.is_some());

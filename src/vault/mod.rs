@@ -33,5 +33,5 @@ mod session;
 pub(crate) use ca::{cert_path_in as ca_cert_path_in, Ca};
 pub(crate) use known_secrets::{HeaderScheme, VaultMeta};
 pub(crate) use lease::SandboxLease;
-pub(crate) use server::{Server, ServerConfig};
+pub(crate) use server::{RunContext, Server, ServerConfig};
 pub(crate) use session::{OAuthAgent, VaultSession};

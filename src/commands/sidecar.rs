@@ -32,9 +32,9 @@ pub(crate) fn run(resolved: &Pillbox, bind: Option<String>, json: bool) -> Resul
             bind: bind_addr,
             ca_dir,
             // The sidecar serves vault traffic for ad-hoc invocations
-            // outside a pillbox run, so there's no session_id to plumb.
-            // gen_ai spans from this server root at sandbox_id.
-            session_id: None,
+            // outside a pillbox run — no session/mode/workspace to
+            // surface. gen_ai spans root per sandbox lease.
+            context: vault::RunContext::default(),
         }))
         .map_err(|e| PillboxError::runtime("sidecar", format!("start vault server: {e}")))?;
 

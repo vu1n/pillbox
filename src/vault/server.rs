@@ -21,6 +21,7 @@ use std::{
     time::SystemTime,
 };
 
+use http_body_util::combinators::BoxBody;
 use hudsucker::{
     certificate_authority::RcgenAuthority,
     hyper::{Request, Response},
@@ -31,6 +32,7 @@ use tokio::net::TcpListener;
 
 use super::{
     ca::Ca,
+    genai_tap::TappedBody,
     known_secrets::VaultMeta,
     lease::SandboxLease,
     providers::{
@@ -368,11 +370,11 @@ impl HttpHandler for VaultHandler {
 
     async fn handle_response(&mut self, _ctx: &HttpContext, res: Response<Body>) -> Response<Body> {
         // Dispatch first so the gen_ai span sees the *final* status
-        // code (after any provider-side response rewriting). Telemetry
-        // emission then consumes the in-flight capture.
+        // code (after any provider-side response rewriting). The body
+        // is then wrapped to tap SSE usage events as they stream past
+        // to the guest; the span fires when the wrapped body ends.
         let res = self.dispatch_response(res).await;
-        self.emit_in_flight_span(&res);
-        res
+        self.wrap_for_telemetry(res)
     }
 }
 
@@ -402,13 +404,16 @@ impl VaultHandler {
         }
     }
 
-    /// Emit a `gen_ai` span for the call we just finished serving.
-    /// Skipped when the captured auth stub doesn't resolve to a sandbox
-    /// (legitimate `--with`'d real key, missing header, lease already
-    /// dropped) — we don't emit anonymous spans we can't attribute.
-    fn emit_in_flight_span(&mut self, res: &Response<Body>) {
+    /// Wrap the response body in a [`TappedBody`] so SSE usage events
+    /// flowing to the guest are also parsed into a [`GenAiCallSpan`].
+    /// The span fires when the wrapped body ends (natural completion
+    /// or consumer drop). Returns the response unchanged when the
+    /// captured auth stub doesn't resolve to a sandbox (legitimate
+    /// `--with`'d real key, missing header, lease already dropped) —
+    /// we don't emit anonymous spans we can't attribute.
+    fn wrap_for_telemetry(&mut self, res: Response<Body>) -> Response<Body> {
         let Some(call) = self.in_flight.take() else {
-            return;
+            return res;
         };
         let Some(sandbox_id) = call.auth_stub.as_deref().and_then(|stub| {
             self.server
@@ -416,18 +421,24 @@ impl VaultHandler {
                 .sandbox_for_stub(stub)
                 .map(str::to_owned)
         }) else {
-            return;
+            return res;
         };
-        emit_genai_call_span(GenAiCallSpan {
-            sandbox_id,
-            start: call.start,
-            end: SystemTime::now(),
-            host: call.host,
-            method: call.method,
-            path: call.path,
-            status_code: res.status().as_u16(),
-            request_model: None,
+
+        let status_code = res.status().as_u16();
+        let (parts, body) = res.into_parts();
+        let tapped = TappedBody::new(body, move |usage| {
+            emit_genai_call_span(GenAiCallSpan {
+                sandbox_id,
+                start: call.start,
+                end: SystemTime::now(),
+                host: call.host,
+                method: call.method,
+                path: call.path,
+                status_code,
+                usage,
+            });
         });
+        Response::from_parts(parts, Body::from(BoxBody::new(tapped)))
     }
 }
 

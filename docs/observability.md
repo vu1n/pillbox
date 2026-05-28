@@ -65,12 +65,19 @@ them is sandbox cold-start latency.
   status maps `completed → Ok`, `failed → Error(reason)`.
 - **`gen_ai` spans:** host-side, one per intercepted LLM API call
   (when `--vault` is on). Emitted from the vault MITM proxy with OTel
-  GenAI semantic-convention attributes — `gen_ai.system`,
-  `gen_ai.operation.name`, `server.address`, `http.request.method`,
-  `url.path`, `http.response.status_code`, `pillbox.sandbox_id`. Calls
-  within the same sandbox lease share a `trace_id` derived from the
-  sandbox id, so Workshop and friends group them under one trace per
-  agent run.
+  GenAI semantic-convention attributes:
+    - Envelope: `gen_ai.system`, `gen_ai.operation.name`,
+      `server.address`, `http.request.method`, `url.path`,
+      `http.response.status_code`, `pillbox.sandbox_id`
+    - Body-derived (parsed from the SSE response stream as it passes
+      through to the guest): `gen_ai.response.model`,
+      `gen_ai.response.id`, `gen_ai.response.finish_reasons`,
+      `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`,
+      `gen_ai.usage.cache_read_input_tokens`,
+      `gen_ai.usage.cache_creation_input_tokens`
+  Calls within the same sandbox lease share a `trace_id` derived
+  from the sandbox id, so Workshop and friends group them under one
+  trace per agent run.
 - **Log records:** one per lifecycle event regardless of emitter.
   Severity matches the event type. Attributes mirror the JSONL field
   set 1:1 (`session_id`, `emitter`, `agent_id`, `backend`, `remote`,
@@ -82,22 +89,28 @@ them is sandbox cold-start latency.
 
 ### Limitations today
 
-- **`gen_ai.request.model` not yet emitted.** The first cut of MITM
-  spans deliberately doesn't read request bodies, so model name is
-  absent. Status, latency, error rate, and call counts per agent run
-  are all there — token usage and model arrive in a follow-up that
-  taps Anthropic's SSE stream for the `message_start` / `message_delta`
-  usage events.
+- **Body-derived attrs only land for Anthropic SSE responses.**
+  Non-streaming JSON responses pass through fine but the SSE parser
+  produces no usage data for them (it sees no `message_start` /
+  `message_delta` events). Envelope attrs — status, latency, error
+  rate — are still captured uniformly. Adding a JSON-body fallback
+  is a follow-up.
 - **`gen_ai` spans aren't yet children of the session span.** The
   vault knows `sandbox_id`, not `session_id`. They land in their own
   trace per sandbox lease. Plumbing session_id into the vault is a
   separate, larger change.
+- **`gen_ai.request.model` not emitted.** We extract
+  `gen_ai.response.model` from the SSE `message_start` event — the
+  model the server actually served, which is usually what you want.
+  The requested model (which may differ if a fallback fired) would
+  require reading the request body and isn't on the roadmap unless a
+  consumer asks for it.
 - **Workshop accepts traces only** (`POST /v1/traces`). Pillbox will
-  still try to ship log records to `/v1/logs`; Workshop returns 404 and
-  the log sink logs a warning. The spans land regardless. Use a real
-  collector if you want logs and traces in one place.
-- **Session spans require `PILLBOX_SESSION_STARTED_AT`** to be set by
-  the in-sandbox wrapper — without it the span would have
+  still try to ship log records to `/v1/logs`; Workshop returns 404
+  and the log sink logs a warning. The spans land regardless. Use a
+  real collector if you want logs and traces in one place.
+- **Session spans require `PILLBOX_SESSION_STARTED_AT`** to be set
+  by the in-sandbox wrapper — without it the span would have
   `start == end` and the sink skips emission. The session.* log
   records and the `gen_ai` spans still ship.
 
@@ -164,14 +177,16 @@ on a private network, sketchy for a cleartext public endpoint. Prefer
 
 ## What's next
 
-- **Token usage + model on `gen_ai` spans.** Tap the SSE response
-  stream to extract `message_start.usage` (input tokens, cache stats)
-  and `message_delta.usage` (output tokens). Adds the
-  `gen_ai.usage.*_tokens` attributes Workshop's adapters expect and
-  unblocks per-call cost dashboards.
 - **Cross-trace correlation.** Plumb `session_id` through the vault
   so `gen_ai` spans become children of the session span instead of
-  rooting their own traces.
+  rooting their own traces per sandbox lease.
+- **JSON-body fallback for non-streaming responses.** Mirror the SSE
+  tap with a JSON-body parser for endpoints called with
+  `stream: false` so usage attrs land uniformly.
+- **Sandbox + orchestration context.** Resource / span attrs for
+  `pillbox.mode`, `pillbox.concurrent_sandboxes`, `pillbox.fan_out`,
+  `pillbox.workspace_id` — eval scoring stratified by attentiveness
+  regime, and the wedge for multi-agent orchestration eval.
 - **Hook-derived tool-call spans.** Optional per-harness layer that
   complements the universal MITM floor — picks up tool dispatch,
   subagent lifecycle, file edits, etc. Only available for harnesses

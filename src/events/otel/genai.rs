@@ -35,10 +35,39 @@ pub(crate) struct CallSpan {
     pub(crate) method: String,
     pub(crate) path: String,
     pub(crate) status_code: u16,
-    /// `model` field from the request body, when the body was a
-    /// POST and parsed as JSON containing a string `"model"`. None
-    /// for non-POSTs and for endpoints that don't carry a model.
-    pub(crate) request_model: Option<String>,
+    /// GenAI body-derived signals — populated by the response-body
+    /// SSE tap (Anthropic streaming) or by parsing the response body
+    /// JSON (non-streaming). All-`None` for endpoints that don't
+    /// carry these fields (e.g. `GET /v1/models`) or for error
+    /// responses with no usage block.
+    pub(crate) usage: GenAiUsage,
+}
+
+/// Body-derived gen_ai signals. Lives separately from the envelope
+/// because its source differs: the envelope is what the proxy
+/// handler observes directly; this is what the SSE parser
+/// accumulates as the response body streams through.
+#[derive(Debug, Default)]
+pub(crate) struct GenAiUsage {
+    /// The model the server actually served. `gen_ai.response.model`.
+    pub(crate) response_model: Option<String>,
+    /// Server-assigned response id (e.g. Anthropic `msg_…`).
+    /// `gen_ai.response.id`.
+    pub(crate) response_id: Option<String>,
+    /// `gen_ai.usage.input_tokens` — non-cached input tokens billed.
+    pub(crate) input_tokens: Option<u64>,
+    /// `gen_ai.usage.output_tokens` — tokens generated.
+    pub(crate) output_tokens: Option<u64>,
+    /// `gen_ai.usage.cache_read_input_tokens` — Anthropic prompt-
+    /// cache hit count. Non-standard OTel attr, but Workshop /
+    /// Raindrop adapters key on this name.
+    pub(crate) cache_read_input_tokens: Option<u64>,
+    /// `gen_ai.usage.cache_creation_input_tokens` — Anthropic
+    /// prompt-cache miss count (tokens written to cache).
+    pub(crate) cache_creation_input_tokens: Option<u64>,
+    /// `gen_ai.response.finish_reasons` — single-entry list with the
+    /// stop_reason from `message_delta.delta.stop_reason`.
+    pub(crate) finish_reason: Option<String>,
 }
 
 /// Emit one OTLP span for a completed LLM API call. Best-effort skip
@@ -50,7 +79,7 @@ pub(crate) fn emit_call_span(call: CallSpan) {
     let Some(tracer) = tracer() else {
         return;
     };
-    let span_name = match call.request_model.as_deref() {
+    let span_name = match call.usage.response_model.as_deref() {
         Some(model) => format!("chat {model}"),
         None => "chat".to_string(),
     };
@@ -80,10 +109,46 @@ fn build_attributes(call: &CallSpan) -> Vec<KeyValue> {
         KeyValue::new("http.response.status_code", call.status_code as i64),
         KeyValue::new("pillbox.sandbox_id", call.sandbox_id.clone()),
     ];
-    if let Some(model) = call.request_model.as_deref() {
-        attrs.push(KeyValue::new("gen_ai.request.model", model.to_string()));
-    }
+    push_usage_attrs(&mut attrs, &call.usage);
     attrs
+}
+
+/// Fan out the optional [`GenAiUsage`] fields into attrs. Each
+/// `Some(_)` becomes one `KeyValue`; `None` is omitted (vs. emitted
+/// as zero) because consumers distinguish "missing" from
+/// "explicitly zero" — a 0-token call is a real signal, an unknown
+/// is silent.
+fn push_usage_attrs(attrs: &mut Vec<KeyValue>, usage: &GenAiUsage) {
+    if let Some(v) = usage.response_model.as_deref() {
+        attrs.push(KeyValue::new("gen_ai.response.model", v.to_string()));
+    }
+    if let Some(v) = usage.response_id.as_deref() {
+        attrs.push(KeyValue::new("gen_ai.response.id", v.to_string()));
+    }
+    if let Some(v) = usage.input_tokens {
+        attrs.push(KeyValue::new("gen_ai.usage.input_tokens", v as i64));
+    }
+    if let Some(v) = usage.output_tokens {
+        attrs.push(KeyValue::new("gen_ai.usage.output_tokens", v as i64));
+    }
+    if let Some(v) = usage.cache_read_input_tokens {
+        attrs.push(KeyValue::new(
+            "gen_ai.usage.cache_read_input_tokens",
+            v as i64,
+        ));
+    }
+    if let Some(v) = usage.cache_creation_input_tokens {
+        attrs.push(KeyValue::new(
+            "gen_ai.usage.cache_creation_input_tokens",
+            v as i64,
+        ));
+    }
+    if let Some(v) = usage.finish_reason.as_deref() {
+        attrs.push(KeyValue::new(
+            "gen_ai.response.finish_reasons",
+            v.to_string(),
+        ));
+    }
 }
 
 fn status_for(status_code: u16) -> Status {
@@ -110,7 +175,15 @@ mod tests {
             method: "POST".into(),
             path: "/v1/messages".into(),
             status_code: 200,
-            request_model: Some("claude-sonnet-4-5-20250929".into()),
+            usage: GenAiUsage {
+                response_model: Some("claude-sonnet-4-5-20250929".into()),
+                response_id: Some("msg_abc".into()),
+                input_tokens: Some(1247),
+                output_tokens: Some(89),
+                cache_read_input_tokens: Some(8431),
+                cache_creation_input_tokens: Some(0),
+                finish_reason: Some("end_turn".into()),
+            },
         }
     }
 
@@ -118,22 +191,44 @@ mod tests {
     fn build_attributes_includes_genai_semconv_keys() {
         let attrs = build_attributes(&sample_call());
         let keys: Vec<&str> = attrs.iter().map(|kv| kv.key.as_str()).collect();
-        assert!(keys.contains(&"gen_ai.system"));
-        assert!(keys.contains(&"gen_ai.operation.name"));
-        assert!(keys.contains(&"gen_ai.request.model"));
-        assert!(keys.contains(&"server.address"));
-        assert!(keys.contains(&"http.request.method"));
-        assert!(keys.contains(&"http.response.status_code"));
-        assert!(keys.contains(&"pillbox.sandbox_id"));
+        for expected in [
+            "gen_ai.system",
+            "gen_ai.operation.name",
+            "gen_ai.response.model",
+            "gen_ai.response.id",
+            "gen_ai.usage.input_tokens",
+            "gen_ai.usage.output_tokens",
+            "gen_ai.usage.cache_read_input_tokens",
+            "gen_ai.usage.cache_creation_input_tokens",
+            "gen_ai.response.finish_reasons",
+            "server.address",
+            "http.request.method",
+            "http.response.status_code",
+            "pillbox.sandbox_id",
+        ] {
+            assert!(keys.contains(&expected), "missing attr: {expected}");
+        }
     }
 
     #[test]
-    fn build_attributes_omits_model_when_absent() {
+    fn build_attributes_omits_usage_fields_when_absent() {
         let mut call = sample_call();
-        call.request_model = None;
+        call.usage = GenAiUsage::default();
         let attrs = build_attributes(&call);
         let keys: Vec<&str> = attrs.iter().map(|kv| kv.key.as_str()).collect();
-        assert!(!keys.contains(&"gen_ai.request.model"));
+        // Envelope attrs always present; usage attrs all absent.
+        assert!(keys.contains(&"http.response.status_code"));
+        for absent in [
+            "gen_ai.response.model",
+            "gen_ai.response.id",
+            "gen_ai.usage.input_tokens",
+            "gen_ai.usage.output_tokens",
+            "gen_ai.usage.cache_read_input_tokens",
+            "gen_ai.usage.cache_creation_input_tokens",
+            "gen_ai.response.finish_reasons",
+        ] {
+            assert!(!keys.contains(&absent), "unexpected attr: {absent}");
+        }
     }
 
     #[test]

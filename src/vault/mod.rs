@@ -23,6 +23,7 @@
 //!    and the server (graceful proxy shutdown).
 
 mod ca;
+mod genai_tap;
 pub(crate) mod known_secrets;
 mod lease;
 pub(crate) mod providers;

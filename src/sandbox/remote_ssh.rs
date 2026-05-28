@@ -1215,41 +1215,118 @@ fn resolve_base_snapshot(
 /// stdin there — the launch path stages it to a remote temp file and
 /// points `--blob-file` at it. The e2b wrapper still pipes the blob
 /// through stdin (`< blob`), so that path passes `None`.
-pub(crate) fn dispatch_vault_stdin(resolved: &Pillbox, blob_file: Option<&Path>) -> Result<()> {
+/// Bookkeeping shared by both vault-stdin dispatchers. Reading the blob,
+/// resolving the agent, layering env + secret leases, and finalizing the
+/// run (push result, write the snapshot handle, propagate non-zero exit)
+/// is byte-identical between the docker-shelled and direct-exec paths;
+/// only the agent-execution step differs. Extracting these here keeps
+/// the two dispatchers as straight-line code that reads "set up → run →
+/// finalize" without ~70 lines of repeated boilerplate each.
+fn read_blob(blob_file: Option<&Path>, action: &'static str) -> Result<VaultStdinBlob> {
     let buf = match blob_file {
         Some(path) => fs::read(path).map_err(|e| {
-            PillboxError::runtime(
-                "run --vault-stdin",
-                format!("read blob file {}: {e}", path.display()),
-            )
+            PillboxError::runtime(action, format!("read blob file {}: {e}", path.display()))
         })?,
         None => {
             let mut buf = Vec::new();
-            std::io::stdin().read_to_end(&mut buf).map_err(|e| {
-                PillboxError::runtime("run --vault-stdin", format!("read stdin: {e}"))
-            })?;
+            std::io::stdin()
+                .read_to_end(&mut buf)
+                .map_err(|e| PillboxError::runtime(action, format!("read stdin: {e}")))?;
             buf
         }
     };
-    let blob = VaultStdinBlob::from_bytes(&buf)?;
+    VaultStdinBlob::from_bytes(&buf)
+}
 
-    let spec = crate::agents::ALL
+fn resolve_blob_spec(blob: &VaultStdinBlob, action: &'static str) -> Result<&'static AgentSpec> {
+    crate::agents::ALL
         .iter()
         .copied()
         .find(|s| s.id() == blob.agent_id)
         .ok_or_else(|| {
-            PillboxError::usage(
-                "run --vault-stdin",
-                format!("unknown agent `{}` in blob", blob.agent_id),
+            PillboxError::usage(action, format!("unknown agent `{}` in blob", blob.agent_id)).into()
+        })
+}
+
+/// Layer `blob.env` with `--with` secret values, leasing vaulted entries
+/// through the active `VaultSession` (so the stub the agent sees never
+/// matches the real value the upstream API will see). Returns the env
+/// map the caller hands to the agent process.
+fn build_blob_env(
+    blob: &VaultStdinBlob,
+    mut vault_session: Option<&mut VaultSession>,
+    action: &'static str,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut env = blob.env.clone();
+    for s in &blob.secrets {
+        let injected = match (&s.vault_meta, vault_session.as_deref_mut()) {
+            (Some(meta), Some(session)) => session.lease_api_key(&s.name, &s.value, meta)?,
+            (Some(_), None) => {
+                return Err(PillboxError::runtime(
+                    action,
+                    format!(
+                        "secret `{}` is marked vaulted but no vault session is active",
+                        s.name
+                    ),
+                )
+                .into());
+            }
+            (None, _) => s.value.clone(),
+        };
+        env.insert(s.env_var.clone(), injected);
+    }
+    Ok(env)
+}
+
+/// Push the (possibly-mutated) workspace back as the result snapshot,
+/// surface the handle to `RESULT_SNAPSHOT_FILE_ENV` if set, and translate
+/// a non-zero agent exit into a runtime error. Consumes the
+/// `RemoteWorkspace` so its tempdir is dropped at function return.
+fn finalize_blob_run(
+    remote_workspace: RemoteWorkspace,
+    status: std::process::ExitStatus,
+    spec_id: &str,
+    action: &'static str,
+) -> Result<()> {
+    let result_snapshot = remote_workspace.backend.push(
+        &remote_workspace.workspace_dir,
+        PushOptions {
+            tag: Some("remote-result".into()),
+            message: Some("remote run result".into()),
+        },
+    )?;
+    if let Some(path) = std::env::var_os(RESULT_SNAPSHOT_FILE_ENV) {
+        fs::write(&path, result_snapshot.handle.as_str()).map_err(|e| {
+            PillboxError::runtime(
+                action,
+                format!("write {}: {e}", PathBuf::from(path).display()),
             )
         })?;
+    }
+    eprintln!(
+        "pillbox: result snapshot {}",
+        result_snapshot.handle.short()
+    );
+    if !status.success() {
+        return Err(PillboxError::runtime(
+            action,
+            format!("{spec_id} exited with status {status}"),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+pub(crate) fn dispatch_vault_stdin(resolved: &Pillbox, blob_file: Option<&Path>) -> Result<()> {
+    let action: &'static str = "run --vault-stdin";
+    let blob = read_blob(blob_file, action)?;
+    let spec = resolve_blob_spec(&blob, action)?;
 
     let runner_image = docker::check_ready_for(resolved)?;
-
     let home = spec.home_dir(resolved)?;
     if !home.join(spec.cred_sentinel).exists() {
         return Err(PillboxError::runtime(
-            "run --vault-stdin",
+            action,
             format!("no stored credentials for `{}` on this remote", spec.id),
         )
         .with_next(format!(
@@ -1265,40 +1342,16 @@ pub(crate) fn dispatch_vault_stdin(resolved: &Pillbox, blob_file: Option<&Path>)
 
     let any_vaulted = blob.secrets.iter().any(|s| s.vault_meta.is_some());
     let mut vault_session = if blob.vault || any_vaulted {
-        let oauth = if blob.vault {
-            Some(OAuthAgent {
-                agent_id: spec.id,
-                agent_home: &home,
-            })
-        } else {
-            None
-        };
+        let oauth = blob.vault.then_some(OAuthAgent {
+            agent_id: spec.id,
+            agent_home: &home,
+        });
         Some(VaultSession::start(oauth, resolved)?)
     } else {
         None
     };
 
-    // Resolve --with entries using the inline real values instead of the
-    // local secrets store. Vaulted entries are leased through the local
-    // vault session (the stub never leaves this host).
-    let mut env = blob.env.clone();
-    for s in &blob.secrets {
-        let injected = match (&s.vault_meta, vault_session.as_mut()) {
-            (Some(meta), Some(session)) => session.lease_api_key(&s.name, &s.value, meta)?,
-            (Some(_), None) => {
-                return Err(PillboxError::runtime(
-                    "run --vault-stdin",
-                    format!(
-                        "secret `{}` is marked vaulted but no vault session is active",
-                        s.name
-                    ),
-                )
-                .into());
-            }
-            (None, _) => s.value.clone(),
-        };
-        env.insert(s.env_var.clone(), injected);
-    }
+    let env = build_blob_env(&blob, vault_session.as_mut(), action)?;
 
     let mut args = base_docker_args();
     args.extend([
@@ -1326,34 +1379,8 @@ pub(crate) fn dispatch_vault_stdin(resolved: &Pillbox, blob_file: Option<&Path>)
     args.extend(blob.agent_args.clone());
 
     let status = docker::run_interactive(&args)?;
-    let result_snapshot = remote_workspace.backend.push(
-        &workspace_host,
-        PushOptions {
-            tag: Some("remote-result".into()),
-            message: Some("remote run result".into()),
-        },
-    )?;
     drop(vault_session);
-    if let Some(path) = std::env::var_os(RESULT_SNAPSHOT_FILE_ENV) {
-        fs::write(&path, result_snapshot.handle.as_str()).map_err(|e| {
-            PillboxError::runtime(
-                "run --vault-stdin",
-                format!("write {}: {e}", PathBuf::from(path).display()),
-            )
-        })?;
-    }
-    eprintln!(
-        "pillbox: result snapshot {}",
-        result_snapshot.handle.short()
-    );
-    if !status.success() {
-        return Err(PillboxError::runtime(
-            "run --vault-stdin",
-            format!("{} exited with status {status}", spec.id),
-        )
-        .into());
-    }
-    Ok(())
+    finalize_blob_run(remote_workspace, status, spec.id, action)
 }
 
 /// Sandbox-side sibling of [`dispatch_vault_stdin`] for environments that
@@ -1379,27 +1406,8 @@ pub(crate) fn dispatch_vault_stdin_direct(
     blob_file: Option<&Path>,
 ) -> Result<()> {
     let action: &'static str = "run --vault-stdin-direct";
-    let buf = match blob_file {
-        Some(path) => fs::read(path).map_err(|e| {
-            PillboxError::runtime(action, format!("read blob file {}: {e}", path.display()))
-        })?,
-        None => {
-            let mut buf = Vec::new();
-            std::io::stdin()
-                .read_to_end(&mut buf)
-                .map_err(|e| PillboxError::runtime(action, format!("read stdin: {e}")))?;
-            buf
-        }
-    };
-    let blob = VaultStdinBlob::from_bytes(&buf)?;
-
-    let spec = crate::agents::ALL
-        .iter()
-        .copied()
-        .find(|s| s.id() == blob.agent_id)
-        .ok_or_else(|| {
-            PillboxError::usage(action, format!("unknown agent `{}` in blob", blob.agent_id))
-        })?;
+    let blob = read_blob(blob_file, action)?;
+    let spec = resolve_blob_spec(&blob, action)?;
 
     // The Docker path piggybacks on a remote-host login; the direct path
     // can't. If the host pillbox is too old to populate `agent_auth`, the
@@ -1415,8 +1423,6 @@ pub(crate) fn dispatch_vault_stdin_direct(
         .with_next("upgrade the host pillbox; the direct path requires agent_auth in the blob")
         .into());
     }
-
-    let any_vaulted = blob.secrets.iter().any(|s| s.vault_meta.is_some());
 
     // Resolve $HOME inside the sandbox; auth files write under it and the
     // agent inherits it on exec. Required (e2b sandboxes set HOME for the
@@ -1435,42 +1441,18 @@ pub(crate) fn dispatch_vault_stdin_direct(
     // hand us stub values to inject. Kept alive across `cmd.status()`;
     // its `Drop` order tears down leases → server → runtime → stub files
     // (see `vault/session.rs`).
+    let any_vaulted = blob.secrets.iter().any(|s| s.vault_meta.is_some());
     let mut vault_session = if blob.vault || any_vaulted {
-        let oauth = if blob.vault {
-            Some(OAuthAgent {
-                agent_id: spec.id,
-                agent_home: &home_dir,
-            })
-        } else {
-            None
-        };
+        let oauth = blob.vault.then_some(OAuthAgent {
+            agent_id: spec.id,
+            agent_home: &home_dir,
+        });
         Some(VaultSession::start(oauth, resolved)?)
     } else {
         None
     };
 
-    // Layer blob env on top of the sandbox's existing env (HOME, PATH,
-    // USER, LANG, TERM, …). Inheriting matches `docker run`'s practical
-    // behavior (docker provides those defaults plus `-e` overrides) and
-    // gives the agent the normal shell-shaped env it expects.
-    let mut env = blob.env.clone();
-    for s in &blob.secrets {
-        let injected = match (&s.vault_meta, vault_session.as_mut()) {
-            (Some(meta), Some(session)) => session.lease_api_key(&s.name, &s.value, meta)?,
-            (Some(_), None) => {
-                return Err(PillboxError::runtime(
-                    action,
-                    format!(
-                        "secret `{}` is marked vaulted but no vault session is active",
-                        s.name
-                    ),
-                )
-                .into());
-            }
-            (None, _) => s.value.clone(),
-        };
-        env.insert(s.env_var.clone(), injected);
-    }
+    let mut env = build_blob_env(&blob, vault_session.as_mut(), action)?;
 
     // If a vault session is up, lay down its OAuth stub (overwriting the
     // real OAuth we materialized earlier — the proxy now owns the real
@@ -1512,37 +1494,8 @@ pub(crate) fn dispatch_vault_stdin_direct(
     let status = cmd
         .status()
         .map_err(|e| PillboxError::runtime(action, format!("spawn `{}`: {e}", spec.id)))?;
-
-    // Push the (possibly mutated) workspace back regardless of agent exit
-    // status — even a failed run is worth capturing so the host can pull
-    // partial results. Mirrors `dispatch_vault_stdin`.
-    let result_snapshot = remote_workspace.backend.push(
-        &workspace_host,
-        PushOptions {
-            tag: Some("remote-result".into()),
-            message: Some("remote run result".into()),
-        },
-    )?;
-    if let Some(path) = std::env::var_os(RESULT_SNAPSHOT_FILE_ENV) {
-        fs::write(&path, result_snapshot.handle.as_str()).map_err(|e| {
-            PillboxError::runtime(
-                action,
-                format!("write {}: {e}", PathBuf::from(path).display()),
-            )
-        })?;
-    }
-    eprintln!(
-        "pillbox: result snapshot {}",
-        result_snapshot.handle.short()
-    );
-    if !status.success() {
-        return Err(PillboxError::runtime(
-            action,
-            format!("{} exited with status {status}", spec.id),
-        )
-        .into());
-    }
-    Ok(())
+    drop(vault_session);
+    finalize_blob_run(remote_workspace, status, spec.id, action)
 }
 
 /// Write every [`AuthFile`] from the blob under `home`, creating parent
@@ -1840,6 +1793,58 @@ mod tests {
             "missing destination: {rendered}"
         );
         assert!(!rendered.contains("-p"), "unexpected -p without a port");
+    }
+
+    #[test]
+    fn materialize_agent_auth_rejects_unsafe_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        // `..` would escape HOME — must reject.
+        let dot_dot = vec![AuthFile {
+            rel_path: "../escape.json".into(),
+            mode: 0o600,
+            contents: b"x".to_vec(),
+        }];
+        assert!(materialize_agent_auth(home, &dot_dot, "test").is_err());
+        // Absolute path — must reject.
+        let abs = vec![AuthFile {
+            rel_path: "/etc/passwd".into(),
+            mode: 0o600,
+            contents: b"x".to_vec(),
+        }];
+        assert!(materialize_agent_auth(home, &abs, "test").is_err());
+        // Empty — must reject.
+        let empty = vec![AuthFile {
+            rel_path: "".into(),
+            mode: 0o600,
+            contents: b"x".to_vec(),
+        }];
+        assert!(materialize_agent_auth(home, &empty, "test").is_err());
+        // Nested ".." midway — must reject (a Normal+ParentDir sequence
+        // is rejected as a whole because every component is checked).
+        let mid = vec![AuthFile {
+            rel_path: ".claude/../../escape".into(),
+            mode: 0o600,
+            contents: b"x".to_vec(),
+        }];
+        assert!(materialize_agent_auth(home, &mid, "test").is_err());
+        // Confirm the rejected paths didn't actually land anywhere.
+        assert!(!home.join("escape.json").exists());
+        assert!(!home.parent().unwrap().join("escape.json").exists());
+
+        // Sanity: a well-formed nested path under HOME is accepted.
+        let ok = vec![AuthFile {
+            rel_path: ".claude/.credentials.json".into(),
+            mode: 0o600,
+            contents: br#"{"k":"v"}"#.to_vec(),
+        }];
+        materialize_agent_auth(home, &ok, "test").unwrap();
+        let written = home.join(".claude").join(".credentials.json");
+        assert!(written.exists());
+        assert_eq!(std::fs::read(&written).unwrap(), br#"{"k":"v"}"#);
+        // 0o600 on the written file (mode includes file-type bits; mask).
+        let mode = std::fs::metadata(&written).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]

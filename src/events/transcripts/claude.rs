@@ -23,7 +23,8 @@
 
 use std::time::SystemTime;
 
-use super::{AssistantUsage, EventKind, TranscriptEvent};
+use super::super::otel::genai::GenAiUsage;
+use super::{EventKind, TranscriptEvent};
 
 /// Parse one JSONL line into zero-or-more [`TranscriptEvent`]s. A
 /// single Claude Code line can fan out: an assistant message with
@@ -191,14 +192,19 @@ fn parse_assistant(
     out
 }
 
-fn parse_usage(v: &serde_json::Value) -> AssistantUsage {
-    AssistantUsage {
+/// Lift Claude Code's persisted `message.usage` into the shared
+/// [`GenAiUsage`] shape. Only token-count fields are populated here;
+/// `response_model` / `response_id` / `finish_reason` come from
+/// elsewhere on the line and are filled in by the call site.
+fn parse_usage(v: &serde_json::Value) -> GenAiUsage {
+    GenAiUsage {
         input_tokens: v.get("input_tokens").and_then(|v| v.as_u64()),
         output_tokens: v.get("output_tokens").and_then(|v| v.as_u64()),
         cache_read_input_tokens: v.get("cache_read_input_tokens").and_then(|v| v.as_u64()),
         cache_creation_input_tokens: v
             .get("cache_creation_input_tokens")
             .and_then(|v| v.as_u64()),
+        ..Default::default()
     }
 }
 

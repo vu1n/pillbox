@@ -67,7 +67,7 @@ pub(crate) struct CallSpan {
 /// because its source differs: the envelope is what the proxy
 /// handler observes directly; this is what the SSE parser
 /// accumulates as the response body streams through.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct GenAiUsage {
     /// The model the server actually served. `gen_ai.response.model`.
     pub(crate) response_model: Option<String>,
@@ -165,7 +165,12 @@ fn build_attributes(call: &CallSpan) -> Vec<KeyValue> {
 /// as zero) because consumers distinguish "missing" from
 /// "explicitly zero" — a 0-token call is a real signal, an unknown
 /// is silent.
-fn push_usage_attrs(attrs: &mut Vec<KeyValue>, usage: &GenAiUsage) {
+///
+/// Visible to sibling sinks so the transcript emitter can attach
+/// the same usage shape it gets from the agent's per-message
+/// `usage` block — keeps `gen_ai.usage.*` attribute names in one
+/// place so a future semconv change can't drift between sources.
+pub(in crate::events) fn push_usage_attrs(attrs: &mut Vec<KeyValue>, usage: &GenAiUsage) {
     if let Some(v) = usage.response_model.as_deref() {
         attrs.push(KeyValue::new("gen_ai.response.model", v.to_string()));
     }

@@ -34,6 +34,7 @@ use opentelemetry::trace::{
 use opentelemetry::Context as OtelContext;
 use opentelemetry::KeyValue;
 
+use super::otel::genai::{push_usage_attrs, GenAiUsage};
 use super::otel::spans::{derive_session_span_id, derive_trace_id, tracer};
 
 mod claude;
@@ -96,7 +97,12 @@ pub(crate) enum EventKind {
     AssistantText {
         text: String,
         model: Option<String>,
-        usage: Option<AssistantUsage>,
+        /// Per-message token usage from the harness's persisted
+        /// `usage` block. Reuses [`GenAiUsage`] so the transcript
+        /// emitter ships the *same* `gen_ai.usage.*` attribute
+        /// shape as the vault MITM — one trace can carry both
+        /// sources without naming drift.
+        usage: Option<GenAiUsage>,
         stop_reason: Option<String>,
     },
     AssistantThinking {
@@ -112,18 +118,6 @@ pub(crate) enum EventKind {
         content: String,
         is_error: bool,
     },
-}
-
-/// Per-message token usage from `message_start` / `message_delta`,
-/// mirrored on the assistant-message span so consumers don't have
-/// to join transcript spans with vault MITM spans to get per-message
-/// cost.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct AssistantUsage {
-    pub input_tokens: Option<u64>,
-    pub output_tokens: Option<u64>,
-    pub cache_read_input_tokens: Option<u64>,
-    pub cache_creation_input_tokens: Option<u64>,
 }
 
 /// Drain one transcript file using `harness`'s parser and emit
@@ -172,7 +166,7 @@ pub(super) fn emit_event_span(event: &TranscriptEvent, session_id: &str) {
         .with_trace_id(trace_id)
         .with_start_time(event.timestamp)
         .with_end_time(event.timestamp)
-        .with_attributes(build_attrs(event, session_id));
+        .with_attributes(build_attributes(event));
     let mut span = tracer.build_with_context(builder, &parent_ctx);
     span.end();
 }
@@ -193,10 +187,14 @@ fn span_name(kind: &EventKind) -> String {
 /// payload on long-context assistant turns.
 const MAX_BODY_BYTES: usize = 4096;
 
-fn build_attrs(event: &TranscriptEvent, session_id: &str) -> Vec<KeyValue> {
+/// Build the OTel `KeyValue` attribute list for one transcript
+/// event. `pillbox.session_id` is intentionally absent — the span's
+/// `trace_id` is derived from session_id (see
+/// [`derive_trace_id`]) so the binding is already encoded; adding
+/// it as an attribute would be duplicate noise on every span.
+fn build_attributes(event: &TranscriptEvent) -> Vec<KeyValue> {
     let mut attrs = vec![
         KeyValue::new("gen_ai.system", "anthropic"),
-        KeyValue::new("pillbox.session_id", session_id.to_string()),
         KeyValue::new("pillbox.transcript.uuid", event.uuid.clone()),
     ];
     if let Some(p) = event.parent_uuid.as_deref() {
@@ -262,33 +260,6 @@ fn build_attrs(event: &TranscriptEvent, session_id: &str) -> Vec<KeyValue> {
         }
     }
     attrs
-}
-
-/// Mirror the gen_ai usage attrs the vault MITM emits, so an
-/// assistant-message span shows the same numbers without joining
-/// against the wire-level span by request id. Attr names are
-/// duplicated rather than imported because the vault path's
-/// usage shape lives behind `pub(crate)` re-exports — keep this
-/// in sync with `events::otel::genai::push_usage_attrs`.
-fn push_usage_attrs(attrs: &mut Vec<KeyValue>, u: &AssistantUsage) {
-    if let Some(n) = u.input_tokens {
-        attrs.push(KeyValue::new("gen_ai.usage.input_tokens", n as i64));
-    }
-    if let Some(n) = u.output_tokens {
-        attrs.push(KeyValue::new("gen_ai.usage.output_tokens", n as i64));
-    }
-    if let Some(n) = u.cache_read_input_tokens {
-        attrs.push(KeyValue::new(
-            "gen_ai.usage.cache_read_input_tokens",
-            n as i64,
-        ));
-    }
-    if let Some(n) = u.cache_creation_input_tokens {
-        attrs.push(KeyValue::new(
-            "gen_ai.usage.cache_creation_input_tokens",
-            n as i64,
-        ));
-    }
 }
 
 /// Cap large strings at [`MAX_BODY_BYTES`]; append a single `…` so
@@ -369,7 +340,7 @@ mod tests {
     }
 
     #[test]
-    fn build_attrs_carries_all_user_prompt_fields() {
+    fn build_attributes_carries_all_user_prompt_fields() {
         let event = TranscriptEvent {
             uuid: "u1".into(),
             parent_uuid: Some("p1".into()),
@@ -378,17 +349,20 @@ mod tests {
                 content: "hello".into(),
             },
         };
-        let attrs = build_attrs(&event, "sess-xyz");
+        let attrs = build_attributes(&event);
         let keys: Vec<&str> = attrs.iter().map(|kv| kv.key.as_str()).collect();
         for expected in [
             "gen_ai.system",
             "gen_ai.prompt",
-            "pillbox.session_id",
             "pillbox.transcript.uuid",
             "pillbox.transcript.parent_uuid",
         ] {
             assert!(keys.contains(&expected), "missing {expected}");
         }
+        // pillbox.session_id is intentionally NOT on the span — the
+        // trace_id encodes it. Pin that so a future "let's just
+        // re-add it" change has to defend the choice.
+        assert!(!keys.contains(&"pillbox.session_id"));
     }
 
     #[test]

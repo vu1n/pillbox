@@ -52,9 +52,20 @@ impl TappedBody {
     /// has accumulated so far. Called on both natural end-of-stream
     /// and on drop (so a canceled stream still produces telemetry
     /// for the bytes that did make it through).
+    ///
+    /// **Off-runtime**: the callback runs on a fresh `std::thread`
+    /// rather than inline. The OTel exporter uses
+    /// `reqwest-blocking-client`, which creates a nested tokio
+    /// runtime inside the blocking call. If we fired `on_end` inline,
+    /// that nested runtime would be created *and dropped* on a tokio
+    /// worker thread — Tokio panics on "Cannot drop a runtime in a
+    /// context where blocking is not allowed." Spawning a real OS
+    /// thread isolates the blocking export from the proxy's async
+    /// context. Cost: one short-lived thread per intercepted call.
     fn fire_end(&mut self) {
         if let Some(on_end) = self.on_end.take() {
-            on_end(std::mem::take(&mut self.parser).into_usage());
+            let usage = std::mem::take(&mut self.parser).into_usage();
+            std::thread::spawn(move || on_end(usage));
         }
     }
 }
@@ -280,7 +291,8 @@ fn try_json_fallback(body: &[u8], usage: &mut GenAiUsage) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::time::Duration;
 
     use http_body_util::BodyExt;
 
@@ -429,20 +441,28 @@ data: {\"type\":\"message_stop\"}\n\
         assert_eq!(u.output_tokens, Some(89));
     }
 
+    /// Receive the on_end usage from the spawned worker thread.
+    /// The callback runs off-runtime (see `TappedBody::fire_end`),
+    /// so tests use a channel + bounded recv_timeout to wait for
+    /// it rather than racing on a Mutex<Option<_>>.
+    fn wait_for_usage(rx: &mpsc::Receiver<GenAiUsage>) -> GenAiUsage {
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("on_end fired within 2s")
+    }
+
     #[tokio::test]
     async fn tapped_body_forwards_bytes_and_fires_end_callback() {
         let inner = Body::from(sample_sse().to_vec());
-        let captured: Arc<Mutex<Option<GenAiUsage>>> = Arc::default();
-        let cap_clone = Arc::clone(&captured);
+        let (tx, rx) = mpsc::channel();
         let tapped = TappedBody::new(inner, move |usage| {
-            *cap_clone.lock().unwrap() = Some(usage);
+            let _ = tx.send(usage);
         });
         let collected = tapped.collect().await.expect("collect tapped body");
         let bytes = collected.to_bytes();
         // Bytes pass through unchanged.
         assert_eq!(&bytes[..], sample_sse());
         // End callback fired with the parsed usage.
-        let u = captured.lock().unwrap().take().expect("on_end ran");
+        let u = wait_for_usage(&rx);
         assert_eq!(u.response_model.as_deref(), Some("claude-sonnet-4-5"));
         assert_eq!(u.input_tokens, Some(1247));
         assert_eq!(u.output_tokens, Some(89));
@@ -454,15 +474,44 @@ data: {\"type\":\"message_stop\"}\n\
         // Drop impl should still fire so we don't silently lose
         // telemetry on canceled streams.
         let inner = Body::from(sample_sse().to_vec());
-        let captured: Arc<Mutex<Option<GenAiUsage>>> = Arc::default();
-        let cap_clone = Arc::clone(&captured);
+        let (tx, rx) = mpsc::channel();
         let tapped = TappedBody::new(inner, move |usage| {
-            *cap_clone.lock().unwrap() = Some(usage);
+            let _ = tx.send(usage);
         });
         drop(tapped);
-        let u = captured.lock().unwrap().take().expect("on_end ran on drop");
+        let u = wait_for_usage(&rx);
         // No bytes were parsed, so usage is empty — but the callback
         // still ran, which is the contract.
         assert!(u.input_tokens.is_none());
+    }
+
+    #[tokio::test]
+    async fn tapped_body_does_not_drop_runtime_from_async_context() {
+        // Regression guard for the "Cannot drop a runtime in a
+        // context where blocking is not allowed" panic. The on_end
+        // callback simulates the real-world OTel exporter (which
+        // creates+drops a nested runtime via reqwest::blocking).
+        // Done inline this would panic on the tokio worker; the
+        // std::thread::spawn in fire_end isolates it.
+        let inner = Body::from(sample_sse().to_vec());
+        let (tx, rx) = mpsc::channel();
+        let tapped = TappedBody::new(inner, move |usage| {
+            // Build a tiny tokio runtime and drop it — mirrors what
+            // reqwest::blocking does under the hood. Must succeed
+            // because we're on a fresh OS thread, not a worker.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build inner runtime");
+            drop(rt);
+            let _ = tx.send(usage);
+        });
+        let _ = tapped.collect().await.expect("collect");
+        let u = match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(u) => u,
+            Err(RecvTimeoutError::Timeout) => panic!("on_end did not complete"),
+            Err(e) => panic!("recv: {e}"),
+        };
+        assert_eq!(u.input_tokens, Some(1247));
     }
 }

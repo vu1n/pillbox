@@ -296,6 +296,17 @@ async fn handle_oauth_request(
     parts
         .headers
         .insert("content-length", HeaderValue::from(new_len));
+    // Force the upstream OAuth response back uncompressed so our
+    // response-side `handle_response` can `serde_json::from_slice`
+    // it. Anthropic gzips `/oauth/token` responses when the client
+    // advertises `Accept-Encoding: gzip` (Claude Code does); the
+    // vault used to log "oauth response not JSON; passing through"
+    // and the agent ended up with raw tokens that the registry
+    // didn't recognize on subsequent API calls → 401.
+    parts.headers.remove("accept-encoding");
+    parts
+        .headers
+        .insert("accept-encoding", HeaderValue::from_static("identity"));
     Request::from_parts(parts, Body::from(new_body)).into()
 }
 

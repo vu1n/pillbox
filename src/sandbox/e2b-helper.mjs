@@ -104,6 +104,19 @@ function notifyRust(payload) {
 	process.stderr.write(`${JSON.stringify(payload)}\n`);
 }
 
+// Absorb EPIPE on our pipes to Rust. Once the host pump reads the agent's
+// `Exit` frame it returns + drops its read end, but pty-host may emit one
+// more `Data`/diagnostic before its child fully tears down; that lands in
+// our `onData`/`notifyRust` → `process.stdout.write` / `stderr.write` and
+// trips Node's default "throw on unhandled stream error" path. Swallow
+// EPIPE everywhere; any other write error still propagates.
+for (const stream of [process.stdout, process.stderr]) {
+	stream.on("error", (err) => {
+		if (err && err.code === "EPIPE") return;
+		throw err;
+	});
+}
+
 // All flags here are part of the **internal** wire between pillbox and
 // this helper — the user never types them. If you're reading this from
 // the cache (`~/.pillbox/cache/`), DON'T run it directly; the pillbox
@@ -267,7 +280,12 @@ function buildWrapper(args, blobRemote, resultRemote) {
 		`export PILLBOX_RESULT_SNAPSHOT_FILE=${shellEscape(resultRemote)}; ` +
 		`rm -f ${shellEscape(resultRemote)}; ` +
 		`pillbox session started ${sessionIdEsc}; ` +
-		`pillbox run --vault-stdin < ${shellEscape(blobRemote)}; ` +
+		// `--vault-stdin-direct`: the e2b sandbox IS the isolation
+		// boundary, so the in-sandbox bootstrap materializes the forwarded
+		// agent auth + hydrates the workspace + execs the agent DIRECTLY
+		// (no nested Docker, no pre-existing remote login). The SSH path
+		// uses the docker-shelled `--vault-stdin` sibling.
+		`pillbox run --vault-stdin-direct < ${shellEscape(blobRemote)}; ` +
 		`PB_EXIT=$?; ` +
 		`RESULT_SNAPSHOT=$(cat ${shellEscape(resultRemote)} 2>/dev/null || true); ` +
 		`pillbox session done ${sessionIdEsc} ` +

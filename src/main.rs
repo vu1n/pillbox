@@ -182,27 +182,32 @@ enum Command {
         /// Run on a registered remote VPS (`pillbox remote add NAME …`).
         /// The agent launches inside a pillbox sandbox on the remote;
         /// the local terminal proxies the remote PTY.
-        #[arg(long, value_name = "NAME", conflicts_with = "vault_stdin")]
+        #[arg(long, value_name = "NAME", conflicts_with_all = ["vault_stdin", "vault_stdin_direct"])]
         remote: Option<String>,
         /// Hidden: invoked by the remote side of `pillbox run --remote`.
         /// Reads a [`crate::sandbox::remote_ssh::VaultStdinBlob`] from
         /// stdin and runs the agent locally with the pre-resolved
-        /// state. Not for direct user consumption — the protocol is
-        /// internal and may change between releases.
-        #[arg(long = "vault-stdin", hide = true)]
+        /// state. The SSH / VPS path: assumes Docker is available on the
+        /// remote and the agent is already `pillbox auth login`'d there;
+        /// runs the agent inside a nested runner-image container. Not for
+        /// direct user consumption — the protocol is internal.
+        #[arg(long = "vault-stdin", hide = true, conflicts_with = "vault_stdin_direct")]
         vault_stdin: bool,
-        /// Hidden: companion to `--vault-stdin`. When set, the blob is
-        /// read from this file instead of stdin. The ssh pty-host
-        /// transport uses this so the child's stdin stays the PTY (the
-        /// inner `docker run -it` needs a TTY on stdin); the launch path
-        /// stages the blob to a remote temp file and points here. Only
-        /// meaningful with `--vault-stdin`.
-        #[arg(
-            long = "blob-file",
-            value_name = "PATH",
-            hide = true,
-            requires = "vault_stdin"
-        )]
+        /// Hidden: sandbox-side sibling of `--vault-stdin` for environments
+        /// that already ARE an isolation boundary (e2b sandboxes). Reads
+        /// the same blob, materializes the forwarded agent auth into
+        /// `$HOME`, hydrates the workspace, and `exec`s the agent
+        /// DIRECTLY — no nested Docker, no pre-existing login required.
+        /// Selected by the e2b helper's wrapper.
+        #[arg(long = "vault-stdin-direct", hide = true)]
+        vault_stdin_direct: bool,
+        /// Hidden: companion to `--vault-stdin` / `--vault-stdin-direct`.
+        /// When set, the blob is read from this file instead of stdin. The
+        /// ssh pty-host transport uses this so the child's stdin stays the
+        /// PTY (the inner `docker run -it` needs a TTY on stdin); the
+        /// launch path stages the blob to a remote temp file and points
+        /// here. Meaningful only with one of the two vault-stdin flags.
+        #[arg(long = "blob-file", value_name = "PATH", hide = true)]
         blob_file: Option<PathBuf>,
         /// Start the agent and immediately return — keeps the session
         /// alive in the background. Reattach later with `pillbox session
@@ -447,6 +452,7 @@ fn run(cli: Cli) -> Result<()> {
             mcp_tokens,
             remote,
             vault_stdin,
+            vault_stdin_direct,
             blob_file,
             detach,
             label,
@@ -458,12 +464,18 @@ fn run(cli: Cli) -> Result<()> {
             args,
         } => {
             let resolved = Pillbox::resolve(pillbox_arg)?;
-            // Hidden remote-side handler. The blob carries everything we
-            // need (agent id, args, env, secrets); the rest of `--run` is
-            // ignored. clap's `conflicts_with` already rejects `--remote`
-            // + `--vault-stdin` together, so no further check needed.
+            // Hidden remote-side handlers. The blob carries everything we
+            // need (agent id, args, env, secrets, auth); the rest of `run`
+            // is ignored. clap rejects `--remote` + `--vault-stdin*` and
+            // the two vault-stdin variants from being combined.
             if vault_stdin {
                 return crate::sandbox::remote_ssh::dispatch_vault_stdin(
+                    &resolved,
+                    blob_file.as_deref(),
+                );
+            }
+            if vault_stdin_direct {
+                return crate::sandbox::remote_ssh::dispatch_vault_stdin_direct(
                     &resolved,
                     blob_file.as_deref(),
                 );

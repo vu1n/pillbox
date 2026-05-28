@@ -95,6 +95,7 @@
 use std::{
     fmt, fs,
     io::{Read, Write},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -142,10 +143,20 @@ pub(crate) struct VaultStdinBlob {
     #[serde(default)]
     pub(crate) env: std::collections::BTreeMap<String, String>,
     pub(crate) workspace: InlineWorkspace,
+    /// Files copied from the host's `<auth_pillbox>/auth/<agent_id>/`,
+    /// to be re-materialized under the agent's `$HOME` on the receiver.
+    /// Populated for the direct-exec path ([`dispatch_vault_stdin_direct`])
+    /// where the sandbox has no pre-existing agent login; Docker-shelled
+    /// receivers (the SSH backend's [`dispatch_vault_stdin`]) ignore it
+    /// because they mount `home_dir` directly. `#[serde(default)]` keeps
+    /// the wire backward-compatible.
+    #[serde(default)]
+    pub(crate) agent_auth: Vec<AuthFile>,
 }
 
 impl fmt::Debug for VaultStdinBlob {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let auth_bytes: usize = self.agent_auth.iter().map(|f| f.contents.len()).sum();
         f.debug_struct("VaultStdinBlob")
             .field("version", &self.version)
             .field("agent_id", &self.agent_id)
@@ -155,6 +166,10 @@ impl fmt::Debug for VaultStdinBlob {
             .field("secrets", &self.secrets)
             .field("env_keys", &self.env.keys().collect::<Vec<_>>())
             .field("workspace", &self.workspace)
+            .field(
+                "agent_auth",
+                &format_args!("<{} files, {}B redacted>", self.agent_auth.len(), auth_bytes),
+            )
             .finish()
     }
 }
@@ -208,6 +223,53 @@ impl fmt::Debug for InlineSecret {
             .field("value", &"<redacted>")
             .field("vault_meta", &self.vault_meta)
             .finish()
+    }
+}
+
+/// One file lifted from the LOCAL host's `<auth_pillbox>/auth/<agent_id>/`
+/// and serialized into the blob so the receiving sandbox can rehydrate the
+/// agent's `$HOME` before exec. `rel_path` is normalized to forward slashes
+/// and validated against `..` / absolute components — the receiver joins it
+/// onto `$HOME` directly.
+///
+/// `Debug` redacts `contents` so accidental tracing of the blob doesn't
+/// surface OAuth tokens / session keys.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct AuthFile {
+    pub(crate) rel_path: String,
+    /// 0o600 (single-file) / 0o700 (directory) on extract. Mode 0o644 is
+    /// upcast to 0o600; we never widen perms relative to the source dir.
+    pub(crate) mode: u32,
+    #[serde(with = "base64_bytes")]
+    pub(crate) contents: Vec<u8>,
+}
+
+impl fmt::Debug for AuthFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthFile")
+            .field("rel_path", &self.rel_path)
+            .field("mode", &format_args!("0o{:o}", self.mode))
+            .field("contents", &format_args!("<{}B redacted>", self.contents.len()))
+            .finish()
+    }
+}
+
+/// Bytes ↔ base64 (standard alphabet, padded) for the JSON wire. The
+/// receiver doesn't need to interpret these — `from_bytes` just decodes
+/// and writes back — so we use the standard engine, not the URL variant.
+mod base64_bytes {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(b: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&STANDARD.encode(b))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let raw = String::deserialize(d)?;
+        STANDARD
+            .decode(raw.as_bytes())
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -867,6 +929,113 @@ pub(crate) fn kill_session(
 /// `action` is the diagnostic label threaded into error messages (e.g.
 /// `"run --remote"` vs `"run --remote (e2b)"`) so the user sees which
 /// backend they were on when a `--with` / `--env` resolution failed.
+/// Defense-in-depth cap on total forwarded auth bytes. The narrowed walk
+/// below (non-recursive over `cred_sentinel`'s parent dir) keeps real
+/// auth state well under this — typical case is a few hundred KB — but a
+/// pathological config-file size should error loudly rather than smuggle
+/// the agent's whole dir into the sandbox blob.
+const AGENT_AUTH_MAX_BYTES: u64 = 10 * 1024 * 1024;
+/// Per-file ceiling (matches `AGENT_AUTH_MAX_BYTES` for now): a single
+/// runaway config file would dominate the blob just as badly as many.
+const AGENT_AUTH_MAX_FILE_BYTES: u64 = AGENT_AUTH_MAX_BYTES;
+
+/// Collect the agent's canonical auth state from `home` for forwarding to
+/// a sandbox without a pre-existing login. The walk is intentionally
+/// narrow: only **regular files in `cred_sentinel`'s parent directory**,
+/// non-recursive. That covers
+///
+///   - claude:   `.claude/.credentials.json` + sibling config(s)
+///   - codex:    `.codex/auth.json` + sibling config(s)
+///   - opencode: `.local/share/opencode/auth.json` + siblings
+///   - pi:       `.pi/agent/auth.json` + siblings
+///
+/// and excludes the noisy cache/history subdirs adjacent to it (e.g.
+/// `.claude/projects/` per-project session histories, easily many MiB)
+/// which a fresh remote `-p`-style run does not need. Symlinks are
+/// skipped so a hostile link can't pull in arbitrary host bytes.
+fn collect_agent_auth(
+    home: &Path,
+    cred_sentinel: &str,
+    action: &'static str,
+) -> Result<Vec<AuthFile>> {
+    let sentinel_rel = Path::new(cred_sentinel);
+    let parent_rel = sentinel_rel.parent().ok_or_else(|| {
+        PillboxError::runtime(
+            action,
+            format!("cred_sentinel `{cred_sentinel}` has no parent directory"),
+        )
+    })?;
+    let parent_abs = home.join(parent_rel);
+    if !parent_abs.exists() {
+        // No login on this host yet — return empty; the receiving direct
+        // dispatcher decides whether that's an error for its mode.
+        return Ok(Vec::new());
+    }
+
+    let mut out = Vec::new();
+    let mut total: u64 = 0;
+    let entries = fs::read_dir(&parent_abs)
+        .with_context(|| format!("read agent auth dir {}", parent_abs.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("walk {}", parent_abs.display()))?;
+        // `DirEntry::metadata` is `lstat`-equivalent on Unix — does NOT
+        // follow symlinks, so a symlink check skips them safely.
+        let meta = entry
+            .metadata()
+            .with_context(|| format!("stat {}", entry.path().display()))?;
+        let ty = meta.file_type();
+        if ty.is_symlink() || !ty.is_file() {
+            continue;
+        }
+        if meta.len() > AGENT_AUTH_MAX_FILE_BYTES {
+            return Err(PillboxError::runtime(
+                action,
+                format!(
+                    "agent auth file {} exceeds {} MiB",
+                    entry.path().display(),
+                    AGENT_AUTH_MAX_FILE_BYTES / (1024 * 1024)
+                ),
+            )
+            .into());
+        }
+        total = total.saturating_add(meta.len());
+        if total > AGENT_AUTH_MAX_BYTES {
+            return Err(PillboxError::runtime(
+                action,
+                format!(
+                    "agent auth dir {} exceeds {} MiB across forwarded files",
+                    parent_abs.display(),
+                    AGENT_AUTH_MAX_BYTES / (1024 * 1024)
+                ),
+            )
+            .into());
+        }
+        // rel_path is relative to `home` (the agent's mounted HOME on the
+        // receiver) so the sandbox writes back at the canonical location.
+        let rel = parent_rel.join(entry.file_name());
+        let rel_str = rel
+            .to_str()
+            .ok_or_else(|| {
+                PillboxError::runtime(
+                    action,
+                    format!("non-UTF8 path in agent auth dir: {}", rel.display()),
+                )
+            })?
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        let contents = fs::read(entry.path())
+            .with_context(|| format!("read {}", entry.path().display()))?;
+        // Don't widen perms on extract: 0o600 for every forwarded file —
+        // a fresh sandbox HOME shouldn't carry group/world-readable agent
+        // state even if the local file was loose.
+        out.push(AuthFile {
+            rel_path: rel_str,
+            mode: 0o600,
+            contents,
+        });
+    }
+    Ok(out)
+}
+
 pub(super) fn build_vault_stdin_blob(
     spec: &AgentSpec,
     opts: &RunOpts,
@@ -949,6 +1118,13 @@ pub(super) fn build_vault_stdin_blob(
     };
     let workspace_name = workspace_mount_name(&workspace_host, opts.name.as_deref())?;
     let workspace = build_inline_workspace(resolved, opts, &workspace_host, action)?;
+    // Forward the agent's local auth state (OAuth tokens, config) so a
+    // sandbox without a pre-existing login (e.g. e2b) can rehydrate it
+    // before exec. The Docker-shelled path ignores `agent_auth` and mounts
+    // `home_dir` directly, so this is wasted bytes for SSH today — small
+    // enough not to fight about, and unifying on the forward keeps a
+    // future "ssh without pre-login" path open.
+    let agent_auth = collect_agent_auth(&spec.home_dir(resolved)?, spec.cred_sentinel, action)?;
 
     Ok(VaultStdinBlob {
         version: BLOB_VERSION,
@@ -959,6 +1135,7 @@ pub(super) fn build_vault_stdin_blob(
         secrets,
         env,
         workspace,
+        agent_auth,
     })
 }
 
@@ -1168,6 +1345,178 @@ pub(crate) fn dispatch_vault_stdin(resolved: &Pillbox, blob_file: Option<&Path>)
             format!("{} exited with status {status}", spec.id),
         )
         .into());
+    }
+    Ok(())
+}
+
+/// Sandbox-side sibling of [`dispatch_vault_stdin`] for environments that
+/// ARE the isolation boundary (e2b sandboxes). The diff vs. that function:
+///
+///   - **No Docker**, no nested runner-image. The agent is `exec`d
+///     directly in this process — the sandbox is already isolated.
+///   - **Auth comes from the blob**, not a pre-existing `pillbox auth
+///     login` on the host. We materialize `blob.agent_auth` into `$HOME`
+///     so the agent finds its credentials at the canonical paths.
+///   - **No vault proxy** (initial drop). The stub-swap proxy is host-side
+///     and can't be reached from inside an e2b sandbox; refuse `--vault`
+///     and any vaulted `--with` until that path is built.
+///
+/// Everything else (workspace hydrate from S3, env layering, result push +
+/// `RESULT_SNAPSHOT_FILE_ENV` write, non-zero-exit propagation) mirrors
+/// `dispatch_vault_stdin` exactly.
+pub(crate) fn dispatch_vault_stdin_direct(
+    // Unused: the direct path's state lives entirely in the blob (auth +
+    // workspace creds + env). Kept symmetric with `dispatch_vault_stdin`'s
+    // signature so the CLI dispatch site stays uniform.
+    _resolved: &Pillbox,
+    blob_file: Option<&Path>,
+) -> Result<()> {
+    let action: &'static str = "run --vault-stdin-direct";
+    let buf = match blob_file {
+        Some(path) => fs::read(path).map_err(|e| {
+            PillboxError::runtime(action, format!("read blob file {}: {e}", path.display()))
+        })?,
+        None => {
+            let mut buf = Vec::new();
+            std::io::stdin()
+                .read_to_end(&mut buf)
+                .map_err(|e| PillboxError::runtime(action, format!("read stdin: {e}")))?;
+            buf
+        }
+    };
+    let blob = VaultStdinBlob::from_bytes(&buf)?;
+
+    let spec = crate::agents::ALL
+        .iter()
+        .copied()
+        .find(|s| s.id() == blob.agent_id)
+        .ok_or_else(|| {
+            PillboxError::usage(action, format!("unknown agent `{}` in blob", blob.agent_id))
+        })?;
+
+    // The Docker path piggybacks on a remote-host login; the direct path
+    // can't. If the host pillbox is too old to populate `agent_auth`, the
+    // sandbox has no way to authenticate the agent.
+    if blob.agent_auth.is_empty() {
+        return Err(PillboxError::config(
+            action,
+            format!(
+                "blob carries no forwarded agent auth (agent `{}`) — the direct path needs it",
+                spec.id
+            ),
+        )
+        .with_next("upgrade the host pillbox; the direct path requires agent_auth in the blob")
+        .into());
+    }
+
+    // Vault stub-swap is host-side; deferring its sandbox port to a follow-up.
+    let any_vaulted = blob.secrets.iter().any(|s| s.vault_meta.is_some());
+    if blob.vault || any_vaulted {
+        return Err(PillboxError::usage(
+            action,
+            "--vault / vaulted --with not yet supported on the direct sandbox path",
+        )
+        .with_next("rerun without --vault for now; the e2b vault path lands in a follow-up")
+        .into());
+    }
+
+    // Resolve $HOME inside the sandbox; auth files write under it and the
+    // agent inherits it on exec. Required (e2b sandboxes set HOME for the
+    // run user); refuse if absent rather than guess.
+    let home_env = std::env::var("HOME").map_err(|_| {
+        PillboxError::runtime(action, "HOME is not set in the sandbox environment")
+    })?;
+    let home_dir = PathBuf::from(&home_env);
+    materialize_agent_auth(&home_dir, &blob.agent_auth, action)?;
+
+    let remote_workspace = hydrate_remote_workspace(&blob.workspace)?;
+    let workspace_host = remote_workspace.workspace_dir.clone();
+
+    // Layer blob env on top of the sandbox's existing env (HOME, PATH, USER,
+    // LANG, TERM, …). Inheriting matches `docker run`'s practical behavior
+    // (docker provides those defaults plus `-e` overrides) and gives the
+    // agent the normal shell-shaped env it expects. The sandbox is already
+    // the isolation boundary; there's no host env to keep out.
+    let mut env = blob.env.clone();
+    for s in &blob.secrets {
+        env.insert(s.env_var.clone(), s.value.clone());
+    }
+
+    let mut cmd = std::process::Command::new(spec.run_argv[0]);
+    if spec.run_argv.len() > 1 {
+        cmd.args(&spec.run_argv[1..]);
+    }
+    cmd.args(&blob.agent_args);
+    cmd.current_dir(&workspace_host);
+    for (k, v) in &env {
+        cmd.env(k, v);
+    }
+    let status = cmd
+        .status()
+        .map_err(|e| PillboxError::runtime(action, format!("spawn `{}`: {e}", spec.id)))?;
+
+    // Push the (possibly mutated) workspace back regardless of agent exit
+    // status — even a failed run is worth capturing so the host can pull
+    // partial results. Mirrors `dispatch_vault_stdin`.
+    let result_snapshot = remote_workspace.backend.push(
+        &workspace_host,
+        PushOptions {
+            tag: Some("remote-result".into()),
+            message: Some("remote run result".into()),
+        },
+    )?;
+    if let Some(path) = std::env::var_os(RESULT_SNAPSHOT_FILE_ENV) {
+        fs::write(&path, result_snapshot.handle.as_str()).map_err(|e| {
+            PillboxError::runtime(action, format!("write {}: {e}", PathBuf::from(path).display()))
+        })?;
+    }
+    eprintln!(
+        "pillbox: result snapshot {}",
+        result_snapshot.handle.short()
+    );
+    if !status.success() {
+        return Err(
+            PillboxError::runtime(action, format!("{} exited with status {status}", spec.id))
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// Write every [`AuthFile`] from the blob under `home`, creating parent
+/// dirs at 0o700 and files at the stated mode. Rejects path components
+/// that would escape `home` (`..`, absolute paths) so a hostile blob can't
+/// scribble outside the agent's HOME.
+fn materialize_agent_auth(home: &Path, files: &[AuthFile], action: &'static str) -> Result<()> {
+    for f in files {
+        // Reject `..` / absolute / empty / drive-prefixed paths. `Path`
+        // does the heavy lifting; we just refuse anything that resolves to
+        // a non-`Normal` component.
+        let rel = Path::new(&f.rel_path);
+        if rel.as_os_str().is_empty() {
+            return Err(PillboxError::config(action, "empty rel_path in agent_auth").into());
+        }
+        for c in rel.components() {
+            use std::path::Component;
+            if !matches!(c, Component::Normal(_)) {
+                return Err(PillboxError::config(
+                    action,
+                    format!("unsafe rel_path `{}` in agent_auth", f.rel_path),
+                )
+                .into());
+            }
+        }
+        let target = home.join(rel);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("mkdir {}", parent.display()))?;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("chmod 0o700 {}", parent.display()))?;
+        }
+        fs::write(&target, &f.contents)
+            .with_context(|| format!("write {}", target.display()))?;
+        fs::set_permissions(&target, fs::Permissions::from_mode(f.mode))
+            .with_context(|| format!("chmod {:o} {}", f.mode, target.display()))?;
     }
     Ok(())
 }
@@ -1463,11 +1812,19 @@ mod tests {
                 .into_iter()
                 .collect(),
             workspace: test_workspace(),
+            agent_auth: vec![AuthFile {
+                rel_path: ".claude/.credentials.json".into(),
+                mode: 0o600,
+                contents: br#"{"oauth_token":"redacted"}"#.to_vec(),
+            }],
         };
         let bytes = blob.to_bytes().unwrap();
         let back = VaultStdinBlob::from_bytes(&bytes).unwrap();
         assert_eq!(back.version, BLOB_VERSION);
         assert_eq!(back.agent_id, "claude");
+        assert_eq!(back.agent_auth.len(), 1);
+        assert_eq!(back.agent_auth[0].rel_path, ".claude/.credentials.json");
+        assert_eq!(back.agent_auth[0].contents, br#"{"oauth_token":"redacted"}"#);
         assert_eq!(back.agent_args, vec!["--continue"]);
         assert_eq!(back.workspace_mount_name, "my-app");
         assert!(back.vault);

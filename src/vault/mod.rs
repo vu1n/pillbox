@@ -27,6 +27,7 @@ mod genai_tap;
 pub(crate) mod known_secrets;
 mod lease;
 pub(crate) mod providers;
+mod refresh;
 mod server;
 mod session;
 

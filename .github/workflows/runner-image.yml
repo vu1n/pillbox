@@ -1,23 +1,15 @@
 name: runner-image
-# The image now compiles the in-sandbox `pillbox` binary (multi-stage
-# build), so it depends on the Rust sources too — rebuild when they change.
+# Triggers narrowed during prerelease iteration: only build the published
+# image on an explicit version tag (or a manual `workflow_dispatch`).
+# Local musl builds + manual `e2b template build` cover the dev loop, so
+# rebuilding the GHCR image on every `src/**` push to main was burning
+# minutes for no consumer. When we're ready to publish more frequently,
+# restore the `push: branches: [main]` trigger (and ideally split arm64
+# onto a native runner).
 on:
-  pull_request:
-    paths:
-      - runner/Dockerfile
-      - .github/workflows/runner-image.yml
-      - 'src/**'
-      - Cargo.toml
-      - Cargo.lock
   push:
-    branches: [main]
-    paths:
-      - runner/Dockerfile
-      - .github/workflows/runner-image.yml
-      - 'src/**'
-      - Cargo.toml
-      - Cargo.lock
     tags: ['v*']
+  workflow_dispatch:
 
 permissions:
   contents: read

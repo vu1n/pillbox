@@ -244,7 +244,7 @@ mod tests {
         let mid = full.len() / 2;
         {
             let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-            f.write_all(full[..mid].as_bytes()).unwrap();
+            f.write_all(&full.as_bytes()[..mid]).unwrap();
         }
         assert_eq!(tailer.pump().unwrap(), 0, "partial line emits nothing");
 
@@ -254,7 +254,7 @@ mod tests {
                 .append(true)
                 .open(&path)
                 .unwrap();
-            f.write_all(full[mid..].as_bytes()).unwrap();
+            f.write_all(&full.as_bytes()[mid..]).unwrap();
             f.write_all(b"\n").unwrap();
         }
         assert_eq!(tailer.pump().unwrap(), 1, "completed line emits one event",);

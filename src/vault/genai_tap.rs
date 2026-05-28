@@ -115,6 +115,12 @@ struct AnthropicSseParser {
     /// spec, multiple `data:` lines join with `\n`; Anthropic uses
     /// one per event but we handle the general case.
     current_data: String,
+    /// Full raw body, accumulated so [`Self::into_usage`] can fall
+    /// back to a one-shot JSON parse when the response wasn't SSE
+    /// (`stream: false` POSTs to `/v1/messages`). Cleared on the
+    /// first successful SSE event so streaming responses don't pay
+    /// the memory cost.
+    raw_body: Vec<u8>,
     usage: GenAiUsage,
 }
 
@@ -123,6 +129,11 @@ impl AnthropicSseParser {
     /// `buf` accumulates until a newline lands.
     fn feed(&mut self, chunk: &[u8]) {
         self.buf.extend_from_slice(chunk);
+        // Mirror into raw_body for the non-streaming JSON fallback.
+        // First successful SSE event clears this — so SSE responses
+        // only hold this buffer until message_start lands (a few
+        // hundred bytes), not for the lifetime of the response.
+        self.raw_body.extend_from_slice(chunk);
         while let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
             let line_owned: Vec<u8> = self.buf.drain(..=nl).collect();
             let mut line: &[u8] = &line_owned;
@@ -163,7 +174,13 @@ impl AnthropicSseParser {
             return;
         };
         match value.get("type").and_then(|v| v.as_str()) {
-            Some("message_start") => self.handle_message_start(&value),
+            Some("message_start") => {
+                self.handle_message_start(&value);
+                // Once we know it's SSE, drop the raw-body buffer —
+                // the JSON fallback would never run anyway, and
+                // long-context responses can be hundreds of KB.
+                self.raw_body = Vec::new();
+            }
             Some("message_delta") => self.handle_message_delta(&value),
             _ => {}
         }
@@ -211,8 +228,53 @@ impl AnthropicSseParser {
         }
     }
 
-    fn into_usage(self) -> GenAiUsage {
+    fn into_usage(mut self) -> GenAiUsage {
+        // If no SSE events landed (non-streaming response, or an
+        // error response with a JSON body), try parsing the
+        // accumulated body as a single Anthropic Messages response.
+        // Same usage shape as the SSE message_start / message_delta
+        // events, just collapsed.
+        if !self.raw_body.is_empty() {
+            try_json_fallback(&self.raw_body, &mut self.usage);
+        }
         self.usage
+    }
+}
+
+/// Parse a non-streaming Anthropic `/v1/messages` response body and
+/// fold its `model` / `id` / `usage` / `stop_reason` into `usage`.
+/// Best-effort: non-JSON, error-shaped JSON, and partial JSON all
+/// quietly leave `usage` as-is.
+fn try_json_fallback(body: &[u8], usage: &mut GenAiUsage) {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return;
+    };
+    if let Some(s) = v.get("model").and_then(|v| v.as_str()) {
+        usage.response_model = Some(s.to_string());
+    }
+    if let Some(s) = v.get("id").and_then(|v| v.as_str()) {
+        usage.response_id = Some(s.to_string());
+    }
+    if let Some(s) = v.get("stop_reason").and_then(|v| v.as_str()) {
+        usage.finish_reason = Some(s.to_string());
+    }
+    let Some(u) = v.get("usage") else {
+        return;
+    };
+    if let Some(n) = u.get("input_tokens").and_then(|v| v.as_u64()) {
+        usage.input_tokens = Some(n);
+    }
+    if let Some(n) = u.get("output_tokens").and_then(|v| v.as_u64()) {
+        usage.output_tokens = Some(n);
+    }
+    if let Some(n) = u.get("cache_read_input_tokens").and_then(|v| v.as_u64()) {
+        usage.cache_read_input_tokens = Some(n);
+    }
+    if let Some(n) = u
+        .get("cache_creation_input_tokens")
+        .and_then(|v| v.as_u64())
+    {
+        usage.cache_creation_input_tokens = Some(n);
     }
 }
 
@@ -277,12 +339,61 @@ data: {\"type\":\"message_stop\"}\n\
 
     #[test]
     fn parser_ignores_non_sse_input() {
-        // Random JSON body without SSE framing produces no usage.
+        // Random JSON body without SSE framing AND without an
+        // Anthropic-shaped envelope produces no usage.
         let mut p = AnthropicSseParser::default();
         p.feed(b"{\"some\":\"object\"}\n");
         let u = p.into_usage();
         assert!(u.input_tokens.is_none());
         assert!(u.response_model.is_none());
+    }
+
+    #[test]
+    fn parser_falls_back_to_json_for_non_streaming_response() {
+        // `stream: false` POST /v1/messages returns a single JSON
+        // body (not SSE). The fallback parses the same `model` +
+        // `id` + `usage` + `stop_reason` fields the streaming
+        // events would otherwise emit.
+        let body = br#"{"id":"msg_xyz","model":"claude-opus-4-7","stop_reason":"end_turn","usage":{"input_tokens":500,"output_tokens":42,"cache_read_input_tokens":1024,"cache_creation_input_tokens":0}}"#;
+        let mut p = AnthropicSseParser::default();
+        p.feed(body);
+        let u = p.into_usage();
+        assert_eq!(u.response_model.as_deref(), Some("claude-opus-4-7"));
+        assert_eq!(u.response_id.as_deref(), Some("msg_xyz"));
+        assert_eq!(u.input_tokens, Some(500));
+        assert_eq!(u.output_tokens, Some(42));
+        assert_eq!(u.cache_read_input_tokens, Some(1024));
+        assert_eq!(u.finish_reason.as_deref(), Some("end_turn"));
+    }
+
+    #[test]
+    fn parser_falls_back_with_chunked_json_body() {
+        // The fallback must work even when the JSON arrives across
+        // multiple chunks (real-world: large prompt responses
+        // exceeding the TCP MSS).
+        let body = br#"{"id":"msg_xyz","model":"claude-opus-4-7","usage":{"input_tokens":99}}"#;
+        let mut p = AnthropicSseParser::default();
+        // Feed in three chunks.
+        let third = body.len() / 3;
+        p.feed(&body[..third]);
+        p.feed(&body[third..2 * third]);
+        p.feed(&body[2 * third..]);
+        let u = p.into_usage();
+        assert_eq!(u.response_model.as_deref(), Some("claude-opus-4-7"));
+        assert_eq!(u.input_tokens, Some(99));
+    }
+
+    #[test]
+    fn sse_path_does_not_trigger_json_fallback() {
+        // Sanity check: when SSE successfully parses, the raw_body
+        // buffer gets cleared so the JSON fallback can't see any
+        // stale bytes and accidentally overwrite a streaming value.
+        let mut p = AnthropicSseParser::default();
+        p.feed(sample_sse());
+        let u = p.into_usage();
+        // Output tokens came from message_delta (89), not from any
+        // accidental JSON re-parse — pin it.
+        assert_eq!(u.output_tokens, Some(89));
     }
 
     #[test]

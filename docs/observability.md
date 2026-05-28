@@ -129,12 +129,15 @@ them is sandbox cold-start latency.
 
 ### Limitations today
 
-- **Body-derived attrs only land for Anthropic SSE responses.**
-  Non-streaming JSON responses pass through fine but the SSE parser
-  produces no usage data for them (it sees no `message_start` /
-  `message_delta` events). Envelope attrs — status, latency, error
-  rate — are still captured uniformly. Adding a JSON-body fallback
-  is a follow-up.
+- **Body-derived attrs cover both SSE and non-streaming responses.**
+  The SSE parser handles `stream: true` (Claude Code's default).
+  When no SSE events are seen by end-of-stream, the parser falls
+  back to a one-shot JSON parse of the accumulated body —
+  populating the same `gen_ai.response.{model,id}` /
+  `gen_ai.usage.*` / `gen_ai.response.finish_reasons` attrs from a
+  non-streaming `/v1/messages` response. The raw-body buffer is
+  dropped on the first successful SSE event so streaming responses
+  don't pay the fallback's memory cost.
 - **`gen_ai` span parenting kicks in for SSH + e2b remote runs.**
   The launcher mints `session_id`, bakes it into the VaultStdinBlob,
   and the sandbox-resident vault uses it to parent gen_ai spans
@@ -227,7 +230,8 @@ on a private network, sketchy for a cleartext public endpoint. Prefer
   path, spawn a Tailer per session, tear down at sandbox exit)
   makes transcripts auto-stream without the user knowing the
   file path. Local-docker first; remote SSH/e2b need a
-  sandbox-side relay.
+  sandbox-side relay. This is the last major chunk before the
+  observability stack reaches "everything works automatically."
 - **JSON-body fallback for non-streaming responses.** Mirror the SSE
   tap with a JSON-body parser for endpoints called with
   `stream: false` so usage attrs land uniformly.

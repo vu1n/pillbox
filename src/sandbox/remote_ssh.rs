@@ -1365,10 +1365,10 @@ pub(crate) fn dispatch_vault_stdin(resolved: &Pillbox, blob_file: Option<&Path>)
 /// `RESULT_SNAPSHOT_FILE_ENV` write, non-zero-exit propagation) mirrors
 /// `dispatch_vault_stdin` exactly.
 pub(crate) fn dispatch_vault_stdin_direct(
-    // Unused: the direct path's state lives entirely in the blob (auth +
-    // workspace creds + env). Kept symmetric with `dispatch_vault_stdin`'s
-    // signature so the CLI dispatch site stays uniform.
-    _resolved: &Pillbox,
+    // `resolved` is the sandbox-side pillbox resolution (typically global —
+    // the sandbox has no project pillbox.toml). Used only by the vault
+    // session to anchor its CA directory.
+    resolved: &Pillbox,
     blob_file: Option<&Path>,
 ) -> Result<()> {
     let action: &'static str = "run --vault-stdin-direct";
@@ -1409,16 +1409,7 @@ pub(crate) fn dispatch_vault_stdin_direct(
         .into());
     }
 
-    // Vault stub-swap is host-side; deferring its sandbox port to a follow-up.
     let any_vaulted = blob.secrets.iter().any(|s| s.vault_meta.is_some());
-    if blob.vault || any_vaulted {
-        return Err(PillboxError::usage(
-            action,
-            "--vault / vaulted --with not yet supported on the direct sandbox path",
-        )
-        .with_next("rerun without --vault for now; the e2b vault path lands in a follow-up")
-        .into());
-    }
 
     // Resolve $HOME inside the sandbox; auth files write under it and the
     // agent inherits it on exec. Required (e2b sandboxes set HOME for the
@@ -1432,14 +1423,75 @@ pub(crate) fn dispatch_vault_stdin_direct(
     let remote_workspace = hydrate_remote_workspace(&blob.workspace)?;
     let workspace_host = remote_workspace.workspace_dir.clone();
 
-    // Layer blob env on top of the sandbox's existing env (HOME, PATH, USER,
-    // LANG, TERM, …). Inheriting matches `docker run`'s practical behavior
-    // (docker provides those defaults plus `-e` overrides) and gives the
-    // agent the normal shell-shaped env it expects. The sandbox is already
-    // the isolation boundary; there's no host env to keep out.
+    // Vault session: in-process here, so the proxy listens on the
+    // sandbox's 127.0.0.1 and the agent reaches it without any host
+    // round-trip. We start it BEFORE building env so lease_api_key can
+    // hand us stub values to inject. Kept alive across `cmd.status()`;
+    // its `Drop` order tears down leases → server → runtime → stub files
+    // (see `vault/session.rs`).
+    let mut vault_session = if blob.vault || any_vaulted {
+        let oauth = if blob.vault {
+            Some(OAuthAgent {
+                agent_id: spec.id,
+                agent_home: &home_dir,
+            })
+        } else {
+            None
+        };
+        Some(VaultSession::start(oauth, resolved)?)
+    } else {
+        None
+    };
+
+    // Layer blob env on top of the sandbox's existing env (HOME, PATH,
+    // USER, LANG, TERM, …). Inheriting matches `docker run`'s practical
+    // behavior (docker provides those defaults plus `-e` overrides) and
+    // gives the agent the normal shell-shaped env it expects.
     let mut env = blob.env.clone();
     for s in &blob.secrets {
-        env.insert(s.env_var.clone(), s.value.clone());
+        let injected = match (&s.vault_meta, vault_session.as_mut()) {
+            (Some(meta), Some(session)) => session.lease_api_key(&s.name, &s.value, meta)?,
+            (Some(_), None) => {
+                return Err(PillboxError::runtime(
+                    action,
+                    format!(
+                        "secret `{}` is marked vaulted but no vault session is active",
+                        s.name
+                    ),
+                )
+                .into());
+            }
+            (None, _) => s.value.clone(),
+        };
+        env.insert(s.env_var.clone(), injected);
+    }
+
+    // If a vault session is up, lay down its OAuth stub (overwriting the
+    // real OAuth we materialized earlier — the proxy now owns the real
+    // value in memory) and inject the proxy env. The agent reads stub
+    // creds from $HOME, sends outbound to 127.0.0.1:<port>, and our
+    // CA-backed MITM swaps the stub for the real value in flight.
+    if let Some(session) = &vault_session {
+        let extras = session.direct_extras();
+        for stub in &extras.oauth_stub_writes {
+            let target = home_dir.join(&stub.creds_rel);
+            fs::copy(&stub.stub_source, &target).map_err(|e| {
+                PillboxError::runtime(
+                    action,
+                    format!("install OAuth stub at {}: {e}", target.display()),
+                )
+            })?;
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("chmod 0o600 {}", target.display()))?;
+        }
+        for (k, v) in extras.env {
+            env.insert(k, v);
+        }
+        eprintln!(
+            "pillbox: vault proxy listening on {} (ca: {})",
+            session.listen_addr(),
+            session.ca_cert_path().display()
+        );
     }
 
     let mut cmd = std::process::Command::new(spec.run_argv[0]);

@@ -33,6 +33,12 @@ const PROVIDER_ID: &str = "claude";
 
 const API_HOST: &str = "api.anthropic.com";
 const CONSOLE_HOST: &str = "console.anthropic.com";
+/// Newer Anthropic OAuth host — claude code refreshes its access token
+/// against `platform.claude.com/oauth/token`. Without this in the
+/// intercept list the stub refresh token passes through to the real host,
+/// gets rejected, and the access-token swap on `api.anthropic.com` then
+/// fails with 401 "Invalid authentication credentials" downstream.
+const PLATFORM_HOST: &str = "platform.claude.com";
 const OAUTH_TOKEN_PATH_SUFFIX: &str = "/oauth/token";
 const CREDS_PATH: &str = ".claude/.credentials.json";
 
@@ -53,7 +59,7 @@ impl VaultProvider for AnthropicProvider {
     }
 
     fn intercept(&self, host: &str) -> bool {
-        host == API_HOST || host == CONSOLE_HOST
+        host == API_HOST || host == CONSOLE_HOST || host == PLATFORM_HOST
     }
 
     fn creds_path(&self) -> &'static Path {
@@ -118,10 +124,15 @@ impl VaultProvider for AnthropicProvider {
         pending: &mut Option<PendingFlow>,
     ) -> RequestOrResponse {
         let host = host_from_uri(&req).unwrap_or_default();
-        if host == CONSOLE_HOST && req.uri().path().ends_with(OAUTH_TOKEN_PATH_SUFFIX) {
+        // OAuth refresh (`/oauth/token`) needs JSON-body rewriting on
+        // both the legacy console host and the newer platform host. Plain
+        // bearer-token endpoints (everything else under our intercept
+        // set) get the Authorization-header swap.
+        let is_oauth_path = req.uri().path().ends_with(OAUTH_TOKEN_PATH_SUFFIX);
+        if is_oauth_path && (host == CONSOLE_HOST || host == PLATFORM_HOST) {
             return handle_oauth_request(req, server, pending).await;
         }
-        if host == API_HOST {
+        if host == API_HOST || host == PLATFORM_HOST {
             return handle_api_request(req, server).await;
         }
         req.into()
@@ -450,11 +461,13 @@ mod tests {
     }
 
     #[test]
-    fn intercept_matches_two_hosts_only() {
+    fn intercept_matches_anthropic_hosts_only() {
         let p = AnthropicProvider;
         assert!(p.intercept("api.anthropic.com"));
         assert!(p.intercept("console.anthropic.com"));
+        assert!(p.intercept("platform.claude.com"));
         assert!(!p.intercept("anthropic.com"));
+        assert!(!p.intercept("claude.com"));
         assert!(!p.intercept("chatgpt.com"));
     }
 

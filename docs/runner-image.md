@@ -102,6 +102,15 @@ image, pillbox CLI assumes:
   `pillbox pty-host` / `pillbox pty-relay` inside the sandbox. A
   version skew between host and in-sandbox pillbox is tolerated within
   a frame `PROTO_VERSION`; layer on the canonical image to stay matched.
+- `update-ca-certificates` available **and** an entrypoint that runs
+  it when a CA is mounted at
+  `/usr/local/share/ca-certificates/pillbox-vault.crt`. Pillbox's
+  vault session bind-mounts the per-run CA there so non-Node agents
+  (Codex's reqwest, future Rust/Go agents) honor the MITM cert via
+  the system trust store. Node agents go through
+  `NODE_EXTRA_CA_CERTS` and don't need this. The canonical image
+  ships `runner/entrypoint.sh` as `ENTRYPOINT` — custom images
+  should either copy the same script or replicate its behavior.
 
 ## Harness updates
 

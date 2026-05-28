@@ -102,6 +102,29 @@ impl Registry {
         self.by_stub.get(stub).map(String::as_str)
     }
 
+    /// Find the unique sandbox provisioned by `provider_id`. Used by
+    /// the OAuth handler to attribute *authorization-code* grant
+    /// responses (Claude Code's `/login`) — those requests carry a
+    /// `code`, not a refresh_token, so [`Self::sandbox_for_stub`]
+    /// can't resolve them. Returns `None` when zero or multiple
+    /// sandboxes match; pillbox v0 has one OAuth sandbox per
+    /// `pillbox run --vault` so ambiguity isn't a concern, but the
+    /// conservative `None` signal lets a multi-tenant future extend
+    /// without silently misattributing tokens.
+    pub(crate) fn unique_sandbox_for_provider(&self, provider_id: &'static str) -> Option<String> {
+        let mut found = None;
+        for (id, data) in &self.by_sandbox {
+            if data.provider_id != provider_id {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = Some(id.clone());
+        }
+        found
+    }
+
     pub(crate) fn real(&self, sandbox_id: &str) -> Option<&serde_json::Value> {
         self.by_sandbox.get(sandbox_id).map(|d| &d.real)
     }

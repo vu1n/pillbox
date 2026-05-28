@@ -137,10 +137,14 @@ impl VaultSession {
     }
 
     /// Extra docker args to layer onto a normal `<agent> run`:
-    /// `-v cacert:/etc/pillbox-ca.crt:ro`,
-    /// `-e NODE_EXTRA_CA_CERTS=...`, `-e HTTPS_PROXY=...`,
-    /// `-e HTTP_PROXY=...`, plus one `-v stubfile:<creds>:ro` per OAuth
-    /// mount.
+    /// `-v cacert:/etc/pillbox-ca.crt:ro` (the path
+    /// `NODE_EXTRA_CA_CERTS` points at, for Node-based agents),
+    /// `-v cacert:/usr/local/share/ca-certificates/pillbox-vault.crt:ro`
+    /// (the path the runner-image entrypoint feeds to
+    /// `update-ca-certificates`, putting the cert into the system
+    /// trust store for Rust/Go agents like Codex), env wiring
+    /// (`NODE_EXTRA_CA_CERTS`, `HTTPS_PROXY`, `HTTP_PROXY`), plus
+    /// one `-v stubfile:<creds>:ro` per OAuth mount.
     pub(crate) fn docker_extras(&self, guest_home: &str) -> Vec<String> {
         let port = self.listen_addr.port();
         // The `--add-host host.docker.internal:host-gateway` line that
@@ -150,10 +154,19 @@ impl VaultSession {
         // to remember.
         let proxy_url = format!("http://host.docker.internal:{port}");
         let guest_ca = "/etc/pillbox-ca.crt";
+        // Bind the same source file at the path the runner image's
+        // entrypoint scans on boot. Codex's reqwest / native-tls
+        // doesn't honor NODE_EXTRA_CA_CERTS — it only reads the
+        // system CA bundle — so without this mount it presents
+        // `invalid peer certificate: UnknownIssuer` whenever the
+        // vault MITMs chatgpt.com.
+        let system_trust_ca = "/usr/local/share/ca-certificates/pillbox-vault.crt";
 
         let mut out = vec![
             "-v".into(),
             format!("{}:{guest_ca}:ro", self.ca_cert_path.display()),
+            "-v".into(),
+            format!("{}:{system_trust_ca}:ro", self.ca_cert_path.display()),
         ];
         for mount in &self.oauth_mounts {
             let guest_creds = format!("{guest_home}/{}", mount.creds_path.display());

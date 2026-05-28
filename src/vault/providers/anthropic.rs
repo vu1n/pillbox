@@ -262,6 +262,23 @@ async fn handle_oauth_request(
         }
     };
 
+    // Two grant types reach /oauth/token:
+    //
+    // 1. `grant_type=refresh_token` — the agent's normal token refresh.
+    //    Body carries a `refresh_token` that's one of our minted stubs;
+    //    we look up the sandbox by stub, swap stub → real on the way
+    //    out, and the response will return rotated tokens.
+    //
+    // 2. `grant_type=authorization_code` — Claude Code's `/login`
+    //    flow. Body carries a one-time `code` from the user's
+    //    browser-side OAuth dance; no stub to look up. We still must
+    //    intercept the *response* because that's where the freshly-
+    //    minted real tokens come back — without rewriting them to
+    //    stubs, the agent stores real bearers and every subsequent
+    //    API call 401s when the vault sees an unknown stub.
+    //
+    // Either way, set `pending` so handle_response runs; the
+    // identification path differs.
     let stub_refresh = value
         .get("refresh_token")
         .and_then(|v| v.as_str())
@@ -283,6 +300,20 @@ async fn handle_oauth_request(
             .and_then(|v| v.as_str())
             .map(str::to_owned)
     } else {
+        // Authorization-code grant: identify the sandbox by the
+        // unique anthropic OAuth lease in the registry. Pass the
+        // request body through unchanged — the code itself isn't
+        // ours to rewrite, and the upstream needs it verbatim to
+        // mint the new token pair.
+        let sandbox_id = server
+            .registry_lock()
+            .unique_sandbox_for_provider(PROVIDER_ID);
+        if let Some(sandbox_id) = sandbox_id {
+            *pending = Some(PendingFlow {
+                provider_id: PROVIDER_ID,
+                sandbox_id,
+            });
+        }
         None
     };
 
@@ -762,6 +793,65 @@ mod tests {
         let flow = pending.expect("pending should be set for oauth refresh");
         assert_eq!(flow.provider_id, "claude");
         assert_eq!(flow.sandbox_id, "sbx-oauth");
+
+        drop(_lease);
+        cleanup(server, dir);
+    }
+
+    #[tokio::test]
+    async fn oauth_authorization_code_grant_sets_pending_for_unique_sandbox() {
+        // Claude Code's `/login` flow does grant_type=authorization_code
+        // with a `code` instead of a refresh_token. The vault still needs
+        // to intercept the response (which carries the freshly-minted
+        // real tokens) so it can rotate vault state + swap real → stub
+        // in the body — otherwise the agent stores real bearers and
+        // every subsequent API call 401s when the vault sees an unknown
+        // stub. Regression guard for that path.
+        let (server, dir) = fresh_server().await;
+        let _lease = server
+            .lease("claude", "sbx-fresh-login", sample_anthropic_real())
+            .expect("lease");
+
+        let body_json_in = serde_json::json!({
+            "grant_type": "authorization_code",
+            "code": "oauth_code_from_browser",
+            "client_id": "claude_code",
+            "redirect_uri": "http://localhost:54321/callback",
+        });
+        let body_bytes_in = serde_json::to_vec(&body_json_in).unwrap();
+        let len = body_bytes_in.len();
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://console.anthropic.com/oauth/token")
+            .header("content-type", "application/json")
+            .header("content-length", len)
+            .body(Body::from(body_bytes_in.clone()))
+            .unwrap();
+
+        let mut pending: Option<PendingFlow> = None;
+        let out = AnthropicProvider
+            .handle_request(req, server.inner_for_test(), &mut pending)
+            .await;
+        let out_req = expect_request(out, "oauth authorization-code request");
+
+        // The request body passes through unchanged — we don't own
+        // the authorization code and the upstream needs it verbatim.
+        let bytes = body_bytes(out_req.into_body()).await;
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body.get("grant_type").and_then(|v| v.as_str()),
+            Some("authorization_code")
+        );
+        assert_eq!(
+            body.get("code").and_then(|v| v.as_str()),
+            Some("oauth_code_from_browser")
+        );
+
+        // But pending MUST be set so handle_response runs and swaps the
+        // real tokens to stubs on the way back to the agent.
+        let flow = pending.expect("pending should be set for authorization_code grant");
+        assert_eq!(flow.provider_id, "claude");
+        assert_eq!(flow.sandbox_id, "sbx-fresh-login");
 
         drop(_lease);
         cleanup(server, dir);

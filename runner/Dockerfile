@@ -102,8 +102,19 @@ RUN curl -fsSL https://claude.ai/install.sh -o /tmp/claude-install.sh \
 # The in-sandbox pillbox: pty-host, event emitter, session-done wrapper.
 COPY --from=pillbox-build /pillbox /usr/local/bin/pillbox
 
+# Boot hook that installs the vault CA into the system trust store when
+# pillbox bind-mounts one — required for non-Node agents (Codex's
+# reqwest, future Rust/Go agents) to honor the MITM cert. Node agents
+# go through `NODE_EXTRA_CA_CERTS` and don't need this. See
+# `runner/entrypoint.sh` for the full rationale; the script is a
+# no-op on non-vaulted runs.
+COPY runner/entrypoint.sh /usr/local/bin/pillbox-entrypoint.sh
+RUN chmod +x /usr/local/bin/pillbox-entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/pillbox-entrypoint.sh"]
+
 WORKDIR /workspace
 
 # `sleep infinity` for `docker exec`-style consumers; pillbox CLI
 # overrides with the agent command via `docker run … claude` etc.
+# The entrypoint above runs first, then execs whatever CMD lands here.
 CMD ["sleep", "infinity"]

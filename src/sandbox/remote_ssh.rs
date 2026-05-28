@@ -142,22 +142,16 @@ pub(crate) struct VaultStdinBlob {
     pub(crate) secrets: Vec<InlineSecret>,
     #[serde(default)]
     pub(crate) env: std::collections::BTreeMap<String, String>,
-    /// Pillbox-run session id. The launcher mints this on the host,
-    /// bakes it into the wrapper script's `pillbox session started`
-    /// / `done` calls, and ships it here so the sandbox-resident
-    /// vault can correlate its gen_ai spans with the session span
-    /// (one OTel trace per run). `#[serde(default)]` keeps the wire
-    /// backward-compatible with older host binaries that don't set it.
-    #[serde(default)]
-    pub(crate) session_id: Option<String>,
-    /// Orchestration mode (`"interactive"` / `"detached"`). Surfaces
-    /// as `pillbox.mode` on gen_ai spans. See [`crate::vault::RunContext`].
-    #[serde(default)]
-    pub(crate) mode: Option<String>,
-    /// Path-encoded pillbox key for grouping runs by project.
-    /// Surfaces as `pillbox.workspace_id` on gen_ai spans.
-    #[serde(default)]
-    pub(crate) workspace_id: Option<String>,
+    /// Per-run telemetry context (session_id, mode, workspace_id).
+    /// `#[serde(flatten)]` keeps the wire shape identical to the
+    /// previous one-field-each layout — older host binaries that
+    /// only knew `session_id` still produce a wire-compatible blob,
+    /// and new context fields land here automatically as
+    /// [`crate::vault::RunContext`] grows. The sandbox-resident
+    /// vault reads this back out via [`Self::run_context`] to seed
+    /// its gen_ai span emission.
+    #[serde(flatten)]
+    pub(crate) context: crate::vault::RunContext,
     pub(crate) workspace: InlineWorkspace,
     /// Files copied from the host's `<auth_pillbox>/auth/<agent_id>/`,
     /// to be re-materialized under the agent's `$HOME` on the receiver.
@@ -383,9 +377,11 @@ impl SandboxBackend for RemoteSshSandbox {
         let remote = RemoteSession::new(&session_id);
 
         let mut blob = build_vault_stdin_blob(spec, &opts, resolved, "run --remote")?;
-        blob.session_id = Some(session_id.clone());
-        blob.mode = Some(orchestration_mode_for(opts.detach).to_string());
-        blob.workspace_id = Some(resolved.workspace_id().to_string());
+        blob.context = crate::vault::RunContext {
+            session_id: Some(session_id.clone()),
+            mode: Some(crate::vault::RunContext::mode_for(opts.detach).to_string()),
+            workspace_id: Some(resolved.workspace_id().to_string()),
+        };
 
         // Sanity-check the URL once more before connecting — the registry
         // validates on add, but a hand-edited file could slip through.
@@ -591,30 +587,6 @@ fn stage_blob(url: &SshUrl, remote: &RemoteSession, blob: &VaultStdinBlob) -> Re
         .into());
     }
     Ok(())
-}
-
-/// Map a `--detach`-or-not run option to the `pillbox.mode`
-/// attribute string. Centralized so SSH and e2b launchers don't
-/// drift on the wire-name. Adding `"attached"` (re-attaching to a
-/// detached session) etc. lands here.
-pub(crate) fn orchestration_mode_for(detach: bool) -> &'static str {
-    if detach {
-        "detached"
-    } else {
-        "interactive"
-    }
-}
-
-/// Project a [`VaultStdinBlob`]'s run-context fields onto a
-/// [`crate::vault::RunContext`]. Each blob field is already
-/// optional; this helper exists so the dispatchers stay one-line
-/// at the call site and the projection has one source of truth.
-fn run_context_from(blob: &VaultStdinBlob) -> crate::vault::RunContext {
-    crate::vault::RunContext {
-        session_id: blob.session_id.clone(),
-        mode: blob.mode.clone(),
-        workspace_id: blob.workspace_id.clone(),
-    }
 }
 
 /// POSIX single-quote escape for one value spliced into a `sh -c` /
@@ -1187,13 +1159,10 @@ pub(super) fn build_vault_stdin_blob(
         vault: opts.vault,
         secrets,
         env,
-        // Run-context fields are filled in by the launcher after
-        // `build_vault_stdin_blob` returns — separation lets the
-        // builder stay pure (no dependency on the run-id generator
-        // or per-launcher opts).
-        session_id: None,
-        mode: None,
-        workspace_id: None,
+        // Run context is filled in by the launcher after this
+        // returns — separation keeps the builder pure (no
+        // dependency on the run-id generator or per-launcher opts).
+        context: crate::vault::RunContext::default(),
         workspace,
         agent_auth,
     })
@@ -1399,11 +1368,7 @@ pub(crate) fn dispatch_vault_stdin(resolved: &Pillbox, blob_file: Option<&Path>)
             agent_id: spec.id,
             agent_home: &home,
         });
-        Some(VaultSession::start(
-            oauth,
-            resolved,
-            run_context_from(&blob),
-        )?)
+        Some(VaultSession::start(oauth, resolved, blob.context.clone())?)
     } else {
         None
     };
@@ -1504,11 +1469,7 @@ pub(crate) fn dispatch_vault_stdin_direct(
             agent_id: spec.id,
             agent_home: &home_dir,
         });
-        Some(VaultSession::start(
-            oauth,
-            resolved,
-            run_context_from(&blob),
-        )?)
+        Some(VaultSession::start(oauth, resolved, blob.context.clone())?)
     } else {
         None
     };
@@ -1937,9 +1898,11 @@ mod tests {
             env: [("LOG_LEVEL".to_string(), "debug".to_string())]
                 .into_iter()
                 .collect(),
-            session_id: Some("sess-abc123".into()),
-            mode: Some("interactive".into()),
-            workspace_id: Some("-test-workspace".into()),
+            context: crate::vault::RunContext {
+                session_id: Some("sess-abc123".into()),
+                mode: Some("interactive".into()),
+                workspace_id: Some("-test-workspace".into()),
+            },
             workspace: test_workspace(),
             agent_auth: vec![AuthFile {
                 rel_path: ".claude/.credentials.json".into(),
@@ -1960,9 +1923,20 @@ mod tests {
         assert_eq!(back.agent_args, vec!["--continue"]);
         assert_eq!(back.workspace_mount_name, "my-app");
         assert!(back.vault);
-        assert_eq!(back.session_id.as_deref(), Some("sess-abc123"));
-        assert_eq!(back.mode.as_deref(), Some("interactive"));
-        assert_eq!(back.workspace_id.as_deref(), Some("-test-workspace"));
+        assert_eq!(back.context.session_id.as_deref(), Some("sess-abc123"));
+        assert_eq!(back.context.mode.as_deref(), Some("interactive"));
+        assert_eq!(
+            back.context.workspace_id.as_deref(),
+            Some("-test-workspace"),
+        );
+        // Wire format stays flat (the three context fields appear
+        // at the top level via `#[serde(flatten)]`). Pin that so a
+        // future struct refactor can't silently break older host
+        // binaries reading the JSON.
+        let raw: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(raw["session_id"], "sess-abc123");
+        assert_eq!(raw["mode"], "interactive");
+        assert_eq!(raw["workspace_id"], "-test-workspace");
         assert_eq!(back.secrets.len(), 2);
         assert!(back.secrets[0].vault_meta.is_none());
         assert!(back.secrets[1].vault_meta.is_some());

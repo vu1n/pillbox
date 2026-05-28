@@ -31,7 +31,13 @@ use super::{AssistantUsage, EventKind, TranscriptEvent};
 /// timestamp and `parent_uuid`. Returns `vec![]` for envelope-only
 /// types and for malformed input — best-effort parsing so a single
 /// bad line doesn't break draining.
-pub(super) fn parse_line(line: &str) -> Vec<TranscriptEvent> {
+///
+/// `_line_idx` is accepted to match the cross-harness parser
+/// signature ([`super::codex::parse_line`] uses it to synthesize
+/// uuids for events that have no stable id); Claude Code's own
+/// per-line `uuid` field already serves that purpose so it goes
+/// unused here.
+pub(super) fn parse_line(line: &str, _line_idx: usize) -> Vec<TranscriptEvent> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
         return vec![];
     };
@@ -226,7 +232,7 @@ mod tests {
     #[test]
     fn parses_user_string_prompt_as_user_prompt() {
         let line = r#"{"type":"user","uuid":"u1","parentUuid":null,"timestamp":"2026-05-28T10:00:00Z","message":{"role":"user","content":"hello world"}}"#;
-        let events = parse_line(line);
+        let events = parse_line(line, 0);
         assert_eq!(events.len(), 1);
         let e = &events[0];
         assert_eq!(e.uuid, "u1");
@@ -240,7 +246,7 @@ mod tests {
     #[test]
     fn parses_user_content_array_as_tool_results() {
         let line = r#"{"type":"user","uuid":"u2","parentUuid":"u1","timestamp":"2026-05-28T10:00:01Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_abc","content":"output text","is_error":false}]}}"#;
-        let events = parse_line(line);
+        let events = parse_line(line, 0);
         assert_eq!(events.len(), 1);
         match &events[0].kind {
             EventKind::ToolResult {
@@ -262,7 +268,7 @@ mod tests {
     #[test]
     fn parses_assistant_blocks_into_one_event_each() {
         let line = r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","timestamp":"2026-05-28T10:00:02Z","message":{"model":"claude-opus-4-7","role":"assistant","content":[{"type":"thinking","thinking":"reasoning bits"},{"type":"text","text":"here you go"},{"type":"tool_use","id":"tu_xyz","name":"Bash","input":{"command":"ls"}}],"stop_reason":"tool_use","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":1000,"cache_creation_input_tokens":0}}}"#;
-        let events = parse_line(line);
+        let events = parse_line(line, 0);
         assert_eq!(events.len(), 3);
 
         match &events[0].kind {
@@ -320,15 +326,18 @@ mod tests {
         ] {
             let line =
                 format!(r#"{{"type":"{ty}","uuid":"x","timestamp":"2026-05-28T10:00:00Z"}}"#);
-            assert!(parse_line(&line).is_empty(), "expected empty for type {ty}",);
+            assert!(
+                parse_line(&line, 0).is_empty(),
+                "expected empty for type {ty}",
+            );
         }
     }
 
     #[test]
     fn malformed_input_returns_empty() {
-        assert!(parse_line("").is_empty());
-        assert!(parse_line("not json").is_empty());
-        assert!(parse_line("{}").is_empty()); // missing uuid + type
-        assert!(parse_line(r#"{"type":"user"}"#).is_empty()); // no uuid
+        assert!(parse_line("", 0).is_empty());
+        assert!(parse_line("not json", 0).is_empty());
+        assert!(parse_line("{}", 0).is_empty()); // missing uuid + type
+        assert!(parse_line(r#"{"type":"user"}"#, 0).is_empty()); // no uuid
     }
 }

@@ -65,15 +65,27 @@ them is sandbox cold-start latency.
   status maps `completed → Ok`, `failed → Error(reason)`.
 - **Transcript spans (drain-mode):** one OTLP child span per
   agent-native transcript event, emitted by
-  `pillbox session transcript <FILE> --session-id <ID>`. Reads
-  Claude Code's per-session JSONL
-  (`~/.claude/projects/<encoded>/<uuid>.jsonl`), renders one span
-  per user prompt / assistant text / assistant thinking / tool use /
-  tool result. Children parent the session span via shared
-  `trace_id` so Workshop renders one trace per pillbox run with
-  prompts, tool calls, and assistant turns as named child spans.
-  Envelope-only events (mode changes, permission prompts, file
-  history snapshots) are dropped.
+  `pillbox session transcript <FILE> --session-id <ID> [--agent claude|codex]`.
+  Harness auto-detected from path; `--agent` overrides.
+
+  Supported harnesses:
+  - **Claude Code** (`~/.claude/projects/<encoded>/<uuid>.jsonl`):
+    `user` / `assistant` lines, content blocks (text, thinking,
+    tool_use), `tool_result` blocks inside user content. Carries
+    per-message model + usage + stop_reason on `assistant.text`
+    spans.
+  - **Codex** (`~/.codex/sessions/<y>/<m>/<d>/rollout-*.jsonl`):
+    `response_item` lines with payload types `message` (user /
+    assistant), `function_call`, `function_call_output`,
+    `reasoning`. `function_call_output` spans chain to their
+    `function_call` via `parent_uuid` for future exact-chain
+    visualization.
+
+  Children parent the session span via shared `trace_id` so
+  Workshop renders one trace per pillbox run with prompts, tool
+  calls, and assistant turns as named child spans. Envelope-only
+  events (Claude: mode/permission/attachment/file-history-snapshot;
+  Codex: session_meta/turn_context/event_msg) are dropped.
 
   Live tailing — bind-mount the sandbox transcript dir, watch with
   `notify`, emit as lines append — is a follow-up. Drain-mode
@@ -209,11 +221,9 @@ on a private network, sketchy for a cleartext public endpoint. Prefer
 - **Live transcript tailing.** Drain-mode is shipped; the next
   layer is bind-mounting the sandbox's transcript dir to a
   host-visible path, watching with `notify`, and emitting spans as
-  new lines append. Same parser + emitter; the tailer just feeds
-  it `drain_lines(buffer)` instead of `drain_file(path)`.
-- **Codex transcript parser.** Add `src/events/transcripts/codex.rs`
-  for `~/.codex/sessions/**/*.jsonl`. Same `TranscriptEvent` shape
-  so emit_event_span is harness-agnostic.
+  new lines append. Same parsers + emitter; the tailer just feeds
+  them `parse_line(buffered_line, idx)` instead of reading the
+  whole file at once.
 - **JSON-body fallback for non-streaming responses.** Mirror the SSE
   tap with a JSON-body parser for endpoints called with
   `stream: false` so usage attrs land uniformly.

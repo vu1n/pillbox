@@ -423,7 +423,19 @@ pub(crate) enum SessionAction {
         /// transcript spans should parent under.
         #[arg(long = "session-id", value_name = "ID")]
         session_id: String,
+        /// Harness that wrote the file (`claude` or `codex`).
+        /// Auto-detected from path when omitted: `~/.claude/...`
+        /// → claude, `~/.codex/...` → codex.
+        #[arg(long, value_enum)]
+        agent: Option<TranscriptAgent>,
     },
+}
+
+/// Harness selector for `pillbox session transcript --agent`.
+#[derive(clap::ValueEnum, Debug, Clone, Copy)]
+pub(crate) enum TranscriptAgent {
+    Claude,
+    Codex,
 }
 
 #[derive(Subcommand, Debug)]

@@ -40,15 +40,29 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> 
         ),
         SessionAction::Pull { id, to } => session_pull(resolved, &id, to.as_deref()),
         SessionAction::Prune { dry_run } => session_prune(resolved, dry_run),
-        SessionAction::Transcript { file, session_id } => session_transcript(&file, &session_id),
+        SessionAction::Transcript {
+            file,
+            session_id,
+            agent,
+        } => session_transcript(&file, &session_id, agent),
     }
 }
 
-fn session_transcript(file: &std::path::Path, session_id: &str) -> Result<()> {
-    let count = events::transcripts::drain_file(file, session_id)?;
+fn session_transcript(
+    file: &std::path::Path,
+    session_id: &str,
+    agent: Option<crate::cli::TranscriptAgent>,
+) -> Result<()> {
+    use crate::cli::TranscriptAgent;
+    let harness = match agent {
+        Some(TranscriptAgent::Claude) => events::transcripts::Harness::Claude,
+        Some(TranscriptAgent::Codex) => events::transcripts::Harness::Codex,
+        None => events::transcripts::Harness::from_path(file),
+    };
+    let count = events::transcripts::drain_file_as(file, session_id, harness)?;
     eprintln!(
-        "pillbox: drained {} transcript event(s) from {} → session_id={session_id}",
-        count,
+        "pillbox: drained {count} transcript event(s) from {} → session_id={session_id} \
+         (harness={harness:?})",
         file.display(),
     );
     Ok(())

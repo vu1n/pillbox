@@ -37,6 +37,33 @@ use opentelemetry::KeyValue;
 use super::otel::spans::{derive_session_span_id, derive_trace_id, tracer};
 
 mod claude;
+mod codex;
+
+/// Which agent harness wrote the transcript. Drives which per-line
+/// parser [`drain_file`] uses; auto-detected from the file path,
+/// overridable via the CLI's `--agent` flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Harness {
+    Claude,
+    Codex,
+}
+
+impl Harness {
+    /// Best-effort harness detection from a transcript path. Looks
+    /// for the canonical state-dir segments (`.claude/projects/`,
+    /// `.codex/sessions/`); falls back to [`Harness::Claude`] for
+    /// anything else (Claude Code is the bigger installed base —
+    /// less surprising default). Callers who care override via
+    /// [`drain_file_as`].
+    pub(crate) fn from_path(p: &Path) -> Self {
+        let s = p.to_string_lossy();
+        if s.contains("/.codex/") || s.contains("\\.codex\\") {
+            Self::Codex
+        } else {
+            Self::Claude
+        }
+    }
+}
 
 /// One parsed transcript line, in a harness-agnostic shape so a
 /// future Codex parser can produce the same kind of events.
@@ -96,19 +123,25 @@ pub(crate) struct AssistantUsage {
     pub cache_creation_input_tokens: Option<u64>,
 }
 
-/// Drain one transcript file and emit one OTLP child span per
-/// rendered event. Returns the number of spans emitted (zero when
-/// the OTel tracer isn't configured — the parser still runs,
-/// produces no observable side effects).
-pub(crate) fn drain_file(path: &Path, session_id: &str) -> Result<usize> {
+/// Drain one transcript file using `harness`'s parser and emit
+/// one OTLP child span per rendered event. Returns the number of
+/// spans emitted (zero when the OTel tracer isn't configured —
+/// the parser still runs, producing no observable side effects;
+/// useful for counting parses dry-run). Callers without a
+/// preference resolve `harness` via [`Harness::from_path`] first.
+pub(crate) fn drain_file_as(path: &Path, session_id: &str, harness: Harness) -> Result<usize> {
     let contents =
         std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let mut count = 0;
-    for line in contents.lines() {
+    for (idx, line) in contents.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        for event in claude::parse_line(line) {
+        let events = match harness {
+            Harness::Claude => claude::parse_line(line, idx),
+            Harness::Codex => codex::parse_line(line, idx),
+        };
+        for event in events {
             emit_event_span(&event, session_id);
             count += 1;
         }
@@ -271,6 +304,24 @@ fn truncate(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn harness_detection_picks_codex_for_codex_paths() {
+        assert_eq!(
+            Harness::from_path(Path::new("/home/u/.codex/sessions/2026/05/foo.jsonl")),
+            Harness::Codex,
+        );
+        assert_eq!(
+            Harness::from_path(Path::new("/home/u/.claude/projects/x/foo.jsonl")),
+            Harness::Claude,
+        );
+        // Unknown path defaults to Claude — bigger installed base,
+        // less surprising.
+        assert_eq!(
+            Harness::from_path(Path::new("/some/random/transcript.jsonl")),
+            Harness::Claude,
+        );
+    }
 
     #[test]
     fn span_names_use_dotted_namespace() {

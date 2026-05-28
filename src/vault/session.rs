@@ -265,7 +265,7 @@ fn provision_oauth_mount(server: &Server, agent: OAuthAgent<'_>) -> Result<OAuth
             format!("pillbox {} login   # refresh credentials", agent.agent_id),
         )
     })?;
-    let real: serde_json::Value = serde_json::from_slice(&real_bytes).map_err(|e| {
+    let mut real: serde_json::Value = serde_json::from_slice(&real_bytes).map_err(|e| {
         PillboxError::runtime("vault", format!("parse {}: {e}", creds_path.display())).with_next(
             format!(
                 "pillbox {} login   # credentials file is malformed",
@@ -273,6 +273,24 @@ fn provision_oauth_mount(server: &Server, agent: OAuthAgent<'_>) -> Result<OAuth
             ),
         )
     })?;
+
+    // Proactively refresh if the stored access token is past expiry.
+    // Matches Claude Code's local-machine behavior: when you run claude
+    // on your laptop, you never see a 401 because Claude Code reads
+    // ~/.claude/.credentials.json, sees the token's expired, refreshes,
+    // and persists the new tokens — all transparent. In the sandbox the
+    // stub-file mount is read-only and the agent can't persist anything
+    // across sessions, so pillbox does the refresh + persist itself.
+    // Failure is non-fatal: we fall back to the stored tokens and let
+    // the vault swap + agent retry handle it (one wasted 401 per
+    // session, same as before this lands).
+    if let Err(e) = refresh_real_if_expired(&mut real, agent.agent_id, &creds_path) {
+        eprintln!(
+            "pillbox: warning: vault token pre-refresh failed for `{}`: {e}; \
+             agent will fall back to its own retry-on-401",
+            agent.agent_id,
+        );
+    }
 
     let sandbox_id = uuid::Uuid::now_v7().to_string();
     let lease = server
@@ -305,5 +323,146 @@ fn write_private(path: &Path, content: &str) -> Result<()> {
         .map_err(|e| PillboxError::runtime("vault", format!("open {}: {e}", path.display())))?;
     f.write_all(content.as_bytes())
         .map_err(|e| PillboxError::runtime("vault", format!("write {}: {e}", path.display())))?;
+    Ok(())
+}
+
+/// Anthropic OAuth `client_id` for the Claude Code CLI flow. The same
+/// value Claude Code itself sends when *it* refreshes. Hardcoded
+/// because there's no public API to discover it; pillbox just needs
+/// the canonical one Anthropic expects.
+const CLAUDE_OAUTH_CLIENT_ID: &str = "claude_code";
+
+/// Anthropic OAuth `/oauth/token` endpoint Claude Code's current
+/// release talks to. The vault provider intercepts both this and the
+/// legacy `console.anthropic.com` host; the pre-refresh path goes
+/// straight to the canonical host so it can run *before* the proxy is
+/// even up.
+const CLAUDE_OAUTH_ENDPOINT: &str = "https://platform.claude.com/oauth/token";
+
+/// Refresh the stored `claudeAiOauth` tokens in `real` if `expiresAt`
+/// has passed (or is within a 5-minute safety buffer), and persist the
+/// new pair to `creds_path` so subsequent sessions also start fresh.
+/// No-op for non-Claude agents — Codex / OpenAI / GitHub each have
+/// their own refresh shapes and we haven't generalized this yet.
+///
+/// All failures bubble up; the caller logs and falls back to the
+/// stored tokens (the vault's stub-swap still works as long as the
+/// access token is somehow valid OR the agent's own retry-on-401
+/// triggers a fresh refresh through the proxy).
+fn refresh_real_if_expired(
+    real: &mut serde_json::Value,
+    agent_id: &str,
+    creds_path: &Path,
+) -> Result<()> {
+    if agent_id != "claude" {
+        return Ok(());
+    }
+    let Some(expires_at) = real
+        .pointer("/claudeAiOauth/expiresAt")
+        .and_then(|v| v.as_u64())
+    else {
+        return Ok(());
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    // Claude Code stores expiresAt in milliseconds (Node Date.now()
+    // convention). Older / hand-rolled credential files might be in
+    // seconds; normalize by scaling anything that fits in the seconds
+    // range up to milliseconds. The boundary (1e11 ms ≈ year 5138)
+    // is far enough out that no real seconds-encoded timestamp will
+    // ever pass it.
+    let expires_at_ms = if expires_at < 100_000_000_000 {
+        expires_at.saturating_mul(1000)
+    } else {
+        expires_at
+    };
+    // 5-minute pre-expiry buffer so we don't race a near-expiry token
+    // against round-trip latency.
+    if expires_at_ms.saturating_sub(5 * 60 * 1000) > now_ms {
+        return Ok(());
+    }
+
+    let refresh_token = real
+        .pointer("/claudeAiOauth/refreshToken")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| PillboxError::runtime("vault", "no refreshToken in claudeAiOauth block"))?
+        .to_string();
+
+    let body = serde_json::to_vec(&serde_json::json!({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": CLAUDE_OAUTH_CLIENT_ID,
+    }))
+    .map_err(|e| PillboxError::runtime("vault", format!("serialize refresh body: {e}")))?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| PillboxError::runtime("vault", format!("build refresh client: {e}")))?;
+    let resp = client
+        .post(CLAUDE_OAUTH_ENDPOINT)
+        .header("content-type", "application/json")
+        .header("accept-encoding", "identity") // see anthropic.rs gzip note
+        .body(body)
+        .send()
+        .map_err(|e| PillboxError::runtime("vault", format!("refresh request: {e}")))?;
+
+    let status = resp.status();
+    let resp_bytes = resp
+        .bytes()
+        .map_err(|e| PillboxError::runtime("vault", format!("refresh response read: {e}")))?;
+    if !status.is_success() {
+        return Err(PillboxError::runtime(
+            "vault",
+            format!(
+                "refresh returned HTTP {status}: {}",
+                String::from_utf8_lossy(&resp_bytes)
+            ),
+        )
+        .with_next("pillbox auth login --agent claude   # re-authenticate".to_string())
+        .into());
+    }
+    let resp_value: serde_json::Value = serde_json::from_slice(&resp_bytes)
+        .map_err(|e| PillboxError::runtime("vault", format!("refresh response not JSON: {e}")))?;
+
+    let new_access = resp_value
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| PillboxError::runtime("vault", "refresh response missing access_token"))?
+        .to_string();
+    // Anthropic may or may not rotate the refresh token; preserve the
+    // old one if the response doesn't include a new one.
+    let new_refresh = resp_value
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&refresh_token)
+        .to_string();
+    let expires_in = resp_value
+        .get("expires_in")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(3600);
+    let new_expires_at_ms = now_ms.saturating_add(expires_in.saturating_mul(1000));
+
+    let oauth = real
+        .get_mut("claudeAiOauth")
+        .and_then(|v| v.as_object_mut())
+        .ok_or_else(|| PillboxError::runtime("vault", "claudeAiOauth block disappeared"))?;
+    oauth.insert(
+        "accessToken".to_string(),
+        serde_json::Value::String(new_access),
+    );
+    oauth.insert(
+        "refreshToken".to_string(),
+        serde_json::Value::String(new_refresh),
+    );
+    oauth.insert(
+        "expiresAt".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(new_expires_at_ms)),
+    );
+
+    let new_bytes = serde_json::to_string_pretty(real)
+        .map_err(|e| PillboxError::runtime("vault", format!("serialize refreshed creds: {e}")))?;
+    write_private(creds_path, &new_bytes)?;
     Ok(())
 }

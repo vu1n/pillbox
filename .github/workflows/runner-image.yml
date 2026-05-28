@@ -35,7 +35,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: docker/setup-qemu-action@v3
+      # No `setup-qemu-action` — we build a single linux/amd64 image, so
+      # the runner's native arch is the target arch. Restoring multi-arch
+      # would mean re-adding qemu OR (better) matrix-splitting per arch
+      # onto native runners (`ubuntu-24.04-arm` for arm64).
       - uses: docker/setup-buildx-action@v3
 
       # Authenticate to GHCR only on push events; PRs from forks don't
@@ -70,7 +73,13 @@ jobs:
           # in-sandbox pillbox binary from Cargo.{toml,lock} + src/.
           context: .
           file: runner/Dockerfile
-          platforms: linux/amd64,linux/arm64
+          # linux/amd64 only — e2b sandboxes are x86_64, Apple Silicon
+          # Docker Desktop can run amd64 via Rosetta/emulation, and the
+          # QEMU-emulated arm64 `cargo build --release` was dominating
+          # the wall clock (~100 min on ubuntu-latest). When a real
+          # native arm64 consumer shows up, restore via a matrix on
+          # `ubuntu-24.04-arm` rather than re-enabling QEMU cross-build.
+          platforms: linux/amd64
           # PRs build to verify the Dockerfile + Renovate bumps still
           # produce a valid image, but don't push (no GHCR creds).
           push: ${{ github.event_name != 'pull_request' }}

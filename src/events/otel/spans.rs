@@ -68,7 +68,7 @@ pub(in crate::events) fn sink_emit(
     Ok(())
 }
 
-pub(super) fn tracer() -> Option<&'static SdkTracer> {
+pub(in crate::events) fn tracer() -> Option<&'static SdkTracer> {
     OTEL_TRACER
         .get_or_init(|| {
             let endpoint =
@@ -162,7 +162,7 @@ fn span_attributes(attrs: &[(&'static str, Option<AttrValue>)]) -> Vec<KeyValue>
 /// spans emitted from the vault MITM — they share the trace via this
 /// same derivation, so the gen_ai spans become children of the
 /// session span without any out-of-band lookup.
-pub(super) fn derive_trace_id(session_id: &str) -> TraceId {
+pub(in crate::events) fn derive_trace_id(session_id: &str) -> TraceId {
     TraceId::from_bytes(pack_id_bytes::<16>(session_id))
 }
 
@@ -170,7 +170,7 @@ pub(super) fn derive_trace_id(session_id: &str) -> TraceId {
 /// set this as their `parent_span_id` to nest under the session span
 /// without needing the session span to have been emitted first —
 /// Workshop / collectors stitch the link by id alone.
-pub(super) fn derive_session_span_id(session_id: &str) -> SpanId {
+pub(in crate::events) fn derive_session_span_id(session_id: &str) -> SpanId {
     SpanId::from_bytes(pack_id_bytes::<8>(session_id))
 }
 

@@ -93,6 +93,7 @@ use crate::session::{self, Session};
 
 mod jsonl;
 mod otel;
+pub(crate) mod transcripts;
 mod webhook;
 
 pub(crate) use otel::genai::{

@@ -63,6 +63,23 @@ them is sandbox cold-start latency.
   terminal event. `trace_id` derives deterministically from the session
   id so host and sandbox views correlate without a lookup table. Span
   status maps `completed → Ok`, `failed → Error(reason)`.
+- **Transcript spans (drain-mode):** one OTLP child span per
+  agent-native transcript event, emitted by
+  `pillbox session transcript <FILE> --session-id <ID>`. Reads
+  Claude Code's per-session JSONL
+  (`~/.claude/projects/<encoded>/<uuid>.jsonl`), renders one span
+  per user prompt / assistant text / assistant thinking / tool use /
+  tool result. Children parent the session span via shared
+  `trace_id` so Workshop renders one trace per pillbox run with
+  prompts, tool calls, and assistant turns as named child spans.
+  Envelope-only events (mode changes, permission prompts, file
+  history snapshots) are dropped.
+
+  Live tailing — bind-mount the sandbox transcript dir, watch with
+  `notify`, emit as lines append — is a follow-up. Drain-mode
+  already proves the parser + emit shape end-to-end on real
+  transcripts.
+
 - **`gen_ai` spans:** host-side, one per intercepted LLM API call
   (when `--vault` is on). Emitted from the vault MITM proxy with OTel
   GenAI semantic-convention attributes:
@@ -189,13 +206,14 @@ on a private network, sketchy for a cleartext public endpoint. Prefer
 
 ## What's next
 
-- **Workspace transcript tail + emit.** Read agent-native JSONL
-  transcripts (`~/.claude/projects/**/*.jsonl`,
-  `~/.codex/sessions/**/*.jsonl`) live as they're appended,
-  normalize, and emit as OTLP child spans of the session span. The
-  universal third source — works for harnesses that have no hook
-  story (Codex), captures harness-internal state the wire can't see
-  (tool dispatch, user prompts, file edits).
+- **Live transcript tailing.** Drain-mode is shipped; the next
+  layer is bind-mounting the sandbox's transcript dir to a
+  host-visible path, watching with `notify`, and emitting spans as
+  new lines append. Same parser + emitter; the tailer just feeds
+  it `drain_lines(buffer)` instead of `drain_file(path)`.
+- **Codex transcript parser.** Add `src/events/transcripts/codex.rs`
+  for `~/.codex/sessions/**/*.jsonl`. Same `TranscriptEvent` shape
+  so emit_event_span is harness-agnostic.
 - **JSON-body fallback for non-streaming responses.** Mirror the SSE
   tap with a JSON-body parser for endpoints called with
   `stream: false` so usage attrs land uniformly.

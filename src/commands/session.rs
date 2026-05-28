@@ -40,7 +40,18 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> 
         ),
         SessionAction::Pull { id, to } => session_pull(resolved, &id, to.as_deref()),
         SessionAction::Prune { dry_run } => session_prune(resolved, dry_run),
+        SessionAction::Transcript { file, session_id } => session_transcript(&file, &session_id),
     }
+}
+
+fn session_transcript(file: &std::path::Path, session_id: &str) -> Result<()> {
+    let count = events::transcripts::drain_file(file, session_id)?;
+    eprintln!(
+        "pillbox: drained {} transcript event(s) from {} → session_id={session_id}",
+        count,
+        file.display(),
+    );
+    Ok(())
 }
 
 fn session_list(resolved: &Pillbox, json: bool) -> Result<()> {

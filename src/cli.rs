@@ -405,6 +405,25 @@ pub(crate) enum SessionAction {
         #[arg(long)]
         json: bool,
     },
+    /// Drain an agent-native transcript file (e.g. Claude Code's
+    /// `~/.claude/projects/<encoded>/<uuid>.jsonl`) and emit one
+    /// OTLP child span per rendered event, parented under the
+    /// session span derived from `--session-id`. Requires
+    /// `OTEL_EXPORTER_OTLP_ENDPOINT` to be set to actually ship
+    /// the spans — the parser still runs without it (useful for
+    /// counting parses dry-run).
+    ///
+    /// First cut is drain-mode only (read a completed file, emit
+    /// each event). Live tailing against a sandbox-bind-mounted
+    /// transcript dir lands in a follow-up.
+    Transcript {
+        /// Path to the .jsonl transcript file.
+        file: PathBuf,
+        /// Pillbox-run session id whose session span the emitted
+        /// transcript spans should parent under.
+        #[arg(long = "session-id", value_name = "ID")]
+        session_id: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]

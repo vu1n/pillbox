@@ -87,10 +87,13 @@ them is sandbox cold-start latency.
   events (Claude: mode/permission/attachment/file-history-snapshot;
   Codex: session_meta/turn_context/event_msg) are dropped.
 
-  Live tailing — bind-mount the sandbox transcript dir, watch with
-  `notify`, emit as lines append — is a follow-up. Drain-mode
-  already proves the parser + emit shape end-to-end on real
-  transcripts.
+  **Live tailing** is shipped: add `--follow` to either harness and
+  pillbox blocks waiting on `notify` events, emitting spans as the
+  agent harness appends new lines. Robust to partial-line writes
+  (buffers the trailing fragment between FS events), file
+  truncation (rewinds), and missing-file-at-start (idles until it
+  exists). The bind-mount + auto-launch path that wires this into
+  every sandbox automatically is the next layer.
 
 - **`gen_ai` spans:** host-side, one per intercepted LLM API call
   (when `--vault` is on). Emitted from the vault MITM proxy with OTel
@@ -218,12 +221,13 @@ on a private network, sketchy for a cleartext public endpoint. Prefer
 
 ## What's next
 
-- **Live transcript tailing.** Drain-mode is shipped; the next
-  layer is bind-mounting the sandbox's transcript dir to a
-  host-visible path, watching with `notify`, and emitting spans as
-  new lines append. Same parsers + emitter; the tailer just feeds
-  them `parse_line(buffered_line, idx)` instead of reading the
-  whole file at once.
+- **Bind-mount + auto-tail in the sandbox launchers.** The
+  `--follow` tailer is the user-facing driver; wiring it into
+  `pillbox run` (mount the sandbox's transcript dir to a host
+  path, spawn a Tailer per session, tear down at sandbox exit)
+  makes transcripts auto-stream without the user knowing the
+  file path. Local-docker first; remote SSH/e2b need a
+  sandbox-side relay.
 - **JSON-body fallback for non-streaming responses.** Mirror the SSE
   tap with a JSON-body parser for endpoints called with
   `stream: false` so usage attrs land uniformly.

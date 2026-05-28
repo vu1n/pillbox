@@ -44,7 +44,8 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> 
             file,
             session_id,
             agent,
-        } => session_transcript(&file, &session_id, agent),
+            follow,
+        } => session_transcript(&file, &session_id, agent, follow),
     }
 }
 
@@ -52,6 +53,7 @@ fn session_transcript(
     file: &std::path::Path,
     session_id: &str,
     agent: Option<crate::cli::TranscriptAgent>,
+    follow: bool,
 ) -> Result<()> {
     use crate::cli::TranscriptAgent;
     let harness = match agent {
@@ -59,12 +61,23 @@ fn session_transcript(
         Some(TranscriptAgent::Codex) => events::transcripts::Harness::Codex,
         None => events::transcripts::Harness::from_path(file),
     };
-    let count = events::transcripts::drain_file_as(file, session_id, harness)?;
-    eprintln!(
-        "pillbox: drained {count} transcript event(s) from {} → session_id={session_id} \
-         (harness={harness:?})",
-        file.display(),
-    );
+    if follow {
+        let mut tailer =
+            events::transcripts::Tailer::new(file.to_path_buf(), session_id.into(), harness);
+        eprintln!(
+            "pillbox: tailing {} → session_id={session_id} (harness={harness:?}); Ctrl-C to stop",
+            file.display(),
+        );
+        let total = tailer.follow()?;
+        eprintln!("pillbox: emitted {total} transcript event(s) before exit");
+    } else {
+        let count = events::transcripts::drain_file_as(file, session_id, harness)?;
+        eprintln!(
+            "pillbox: drained {count} transcript event(s) from {} → session_id={session_id} \
+             (harness={harness:?})",
+            file.display(),
+        );
+    }
     Ok(())
 }
 

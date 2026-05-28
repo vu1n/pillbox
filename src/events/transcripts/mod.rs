@@ -38,6 +38,9 @@ use super::otel::spans::{derive_session_span_id, derive_trace_id, tracer};
 
 mod claude;
 mod codex;
+mod tailer;
+
+pub(crate) use tailer::Tailer;
 
 /// Which agent harness wrote the transcript. Drives which per-line
 /// parser [`drain_file`] uses; auto-detected from the file path,
@@ -153,7 +156,7 @@ pub(crate) fn drain_file_as(path: &Path, session_id: &str, harness: Harness) -> 
 /// Skips silently when no OTel endpoint is configured (the parser
 /// still ran — useful for `drain_file`'s count when the user wants
 /// to verify the parse without standing up a collector).
-fn emit_event_span(event: &TranscriptEvent, session_id: &str) {
+pub(super) fn emit_event_span(event: &TranscriptEvent, session_id: &str) {
     let Some(tracer) = tracer() else {
         return;
     };

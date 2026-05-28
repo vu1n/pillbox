@@ -405,17 +405,18 @@ pub(crate) enum SessionAction {
         #[arg(long)]
         json: bool,
     },
-    /// Drain an agent-native transcript file (e.g. Claude Code's
-    /// `~/.claude/projects/<encoded>/<uuid>.jsonl`) and emit one
-    /// OTLP child span per rendered event, parented under the
-    /// session span derived from `--session-id`. Requires
+    /// Drain (or `--follow`) an agent-native transcript file
+    /// (Claude Code's `~/.claude/projects/<encoded>/<uuid>.jsonl`
+    /// or Codex's `~/.codex/sessions/<y>/<m>/<d>/rollout-*.jsonl`)
+    /// and emit one OTLP child span per rendered event, parented
+    /// under the session span derived from `--session-id`. Requires
     /// `OTEL_EXPORTER_OTLP_ENDPOINT` to be set to actually ship
     /// the spans — the parser still runs without it (useful for
     /// counting parses dry-run).
     ///
-    /// First cut is drain-mode only (read a completed file, emit
-    /// each event). Live tailing against a sandbox-bind-mounted
-    /// transcript dir lands in a follow-up.
+    /// Auto-emit-on-sandbox-launch (bind-mount the transcript dir,
+    /// auto-spawn the tailer) is a follow-up; today the tail is
+    /// driven by hand.
     Transcript {
         /// Path to the .jsonl transcript file.
         file: PathBuf,
@@ -428,6 +429,13 @@ pub(crate) enum SessionAction {
         /// → claude, `~/.codex/...` → codex.
         #[arg(long, value_enum)]
         agent: Option<TranscriptAgent>,
+        /// After draining existing content, block waiting on FS
+        /// notifications and emit spans for each appended line.
+        /// Exit with Ctrl-C. Designed for "watch your agent think"
+        /// — point it at a live transcript and watch Workshop
+        /// stream as the agent runs.
+        #[arg(long)]
+        follow: bool,
     },
 }
 

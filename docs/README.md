@@ -8,6 +8,7 @@ Topic-organized deep dives. For the agent-facing command reference, see
 | [secrets.md](./secrets.md) | Storing API keys + `.env` bundles, lifecycle, precedence rules |
 | [config.md](./config.md) | Per-project `pillbox.toml` — schema, discovery, merge rules |
 | [vault.md](./vault.md) | `--vault` MITM proxy that swaps stub creds for real ones |
+| [observability.md](./observability.md) | OTLP telemetry — pointing pillbox at Workshop or any collector |
 | [remotes.md](./remotes.md) | Remote backends (`ssh://`, `e2b://`) + detached sessions |
 | [mesa-workspace-review.md](./mesa-workspace-review.md) | Evaluation of Mesa as a workspace/forking backend |
 | [recipes.md](./recipes.md) | Copy-paste flows for common tasks |

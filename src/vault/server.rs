@@ -18,6 +18,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::{Arc, Mutex, MutexGuard},
+    time::SystemTime,
 };
 
 use hudsucker::{
@@ -33,10 +34,11 @@ use super::{
     known_secrets::VaultMeta,
     lease::SandboxLease,
     providers::{
-        self, host_from_uri, mint_stub, PendingFlow, Registry, SandboxData, VaultProvider,
-        API_KEY_PROVIDER_ID,
+        self, extract_inbound_stub, host_from_uri, mint_stub, PendingFlow, Registry, SandboxData,
+        VaultProvider, API_KEY_PROVIDER_ID,
     },
 };
+use crate::events::{emit_genai_call_span, GenAiCallSpan};
 
 /// Configuration for [`Server::start`].
 #[derive(Debug)]
@@ -123,6 +125,7 @@ impl Server {
         let handler = VaultHandler {
             server: Arc::clone(&inner),
             pending: None,
+            in_flight: None,
         };
 
         let shutdown_signal = async move {
@@ -302,6 +305,29 @@ struct VaultHandler {
     /// In-flight provider flow set by `handle_request` and consumed by
     /// `handle_response`. Lives one request/response pair.
     pending: Option<PendingFlow>,
+    /// Telemetry shadow of the in-flight request. Captures wall-clock
+    /// start + the inbound auth stub so `handle_response` can emit a
+    /// `gen_ai` span tagged with the resolved sandbox_id. Independent
+    /// of `pending` — bearer-token calls (the hot path for chat) don't
+    /// set `pending` but we still want a span for them.
+    in_flight: Option<InFlightCall>,
+}
+
+/// Per-request telemetry capture. Lives one request/response pair on
+/// the handler instance; cleared by `handle_response` after the span
+/// is emitted.
+#[derive(Clone, Debug)]
+struct InFlightCall {
+    start: SystemTime,
+    host: String,
+    method: String,
+    path: String,
+    /// Stub token extracted from `Authorization: Bearer …` /
+    /// `Authorization: token …` / `x-api-key` *before* the provider
+    /// rewrites it. `handle_response` resolves this to a sandbox_id
+    /// via the registry; if the lookup fails (legitimate `--with`'d
+    /// real key, no header at all) the span is skipped.
+    auth_stub: Option<String>,
 }
 
 impl HttpHandler for VaultHandler {
@@ -323,30 +349,85 @@ impl HttpHandler for VaultHandler {
             Some(p) => Arc::clone(p),
             None => return req.into(),
         };
+
+        // Capture the in-flight shape BEFORE the provider rewrites the
+        // Authorization header — we need the *stub* value to resolve
+        // sandbox_id at response time.
+        self.in_flight = Some(InFlightCall {
+            start: SystemTime::now(),
+            host,
+            method: req.method().as_str().to_string(),
+            path: req.uri().path().to_string(),
+            auth_stub: extract_inbound_stub(&req),
+        });
+
         provider
             .handle_request(req, &self.server, &mut self.pending)
             .await
     }
 
     async fn handle_response(&mut self, _ctx: &HttpContext, res: Response<Body>) -> Response<Body> {
-        let provider_id = match &self.pending {
-            Some(flow) => flow.provider_id,
-            None => return res,
+        // Dispatch first so the gen_ai span sees the *final* status
+        // code (after any provider-side response rewriting). Telemetry
+        // emission then consumes the in-flight capture.
+        let res = self.dispatch_response(res).await;
+        self.emit_in_flight_span(&res);
+        res
+    }
+}
+
+impl VaultHandler {
+    /// Run the response through the provider that claimed a pending
+    /// flow on the request side. No-op when no provider needs response-
+    /// side rewriting (the bearer/api-key swap path doesn't set
+    /// `pending`).
+    async fn dispatch_response(&mut self, res: Response<Body>) -> Response<Body> {
+        let Some(provider_id) = self.pending.as_ref().map(|p| p.provider_id) else {
+            return res;
         };
-        let provider = match self.server.provider_by_id(provider_id) {
-            Some(p) => Arc::clone(p),
+        match self.server.provider_by_id(provider_id) {
+            Some(p) => {
+                Arc::clone(p)
+                    .handle_response(res, &self.server, &mut self.pending)
+                    .await
+            }
             None => {
                 // Provider disappeared (shouldn't happen — registry is
                 // fixed for the server's lifetime). Drop the pending
                 // flow so it doesn't poison the next response and pass
                 // the body through.
                 self.pending = None;
-                return res;
+                res
             }
+        }
+    }
+
+    /// Emit a `gen_ai` span for the call we just finished serving.
+    /// Skipped when the captured auth stub doesn't resolve to a sandbox
+    /// (legitimate `--with`'d real key, missing header, lease already
+    /// dropped) — we don't emit anonymous spans we can't attribute.
+    fn emit_in_flight_span(&mut self, res: &Response<Body>) {
+        let Some(call) = self.in_flight.take() else {
+            return;
         };
-        provider
-            .handle_response(res, &self.server, &mut self.pending)
-            .await
+        let Some(sandbox_id) = call.auth_stub.as_deref().and_then(|stub| {
+            self.server
+                .registry_lock()
+                .sandbox_for_stub(stub)
+                .map(str::to_owned)
+        }) else {
+            return;
+        };
+        emit_genai_call_span(GenAiCallSpan {
+            sandbox_id,
+            start: call.start,
+            end: SystemTime::now(),
+            host: call.host,
+            method: call.method,
+            path: call.path,
+            status_code: res.status().as_u16(),
+            request_model: None,
+        });
     }
 }
 

@@ -23,6 +23,7 @@ use std::collections::HashMap;
 
 use crate::url_safety::plaintext_non_loopback_host;
 
+pub(crate) mod genai;
 pub(super) mod logs;
 pub(super) mod spans;
 

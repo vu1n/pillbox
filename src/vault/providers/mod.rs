@@ -18,7 +18,10 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use hudsucker::{
-    hyper::{header::HeaderValue, Request, Response, StatusCode},
+    hyper::{
+        header::{HeaderValue, AUTHORIZATION},
+        Request, Response, StatusCode,
+    },
     Body, RequestOrResponse,
 };
 
@@ -214,6 +217,35 @@ pub(crate) fn provider_for(id: &str) -> Option<Box<dyn VaultProvider>> {
 // providers stay focused on their host-specific JSON shape; the proxy-
 // level mechanics (host extraction, error response shape, stub minting)
 // have one source of truth.
+
+/// Extract the inbound stub from any of the provider-recognized auth
+/// header shapes. Sibling of [`swap_bearer_style`] / [`swap_raw_header`]
+/// for callers that need the stub value *before* a swap happens (e.g.
+/// the central handler's gen_ai span emission, which resolves
+/// stub→sandbox_id without owning the swap).
+///
+/// Tries each family the registered providers accept, in this order:
+/// `Authorization: Bearer …` (Anthropic/codex OAuth, OpenAI / modern
+/// GitHub PATs), `Authorization: token …` (legacy GitHub), then the
+/// raw `x-api-key` header (Anthropic API key, OpenAI alternate). New
+/// auth families land here next to the swap helpers, not in callers.
+pub(crate) fn extract_inbound_stub(req: &Request<Body>) -> Option<String> {
+    if let Some(auth) = req
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+    {
+        for prefix in ["Bearer ", "token "] {
+            if let Some(stub) = auth.strip_prefix(prefix) {
+                return Some(stub.to_string());
+            }
+        }
+    }
+    req.headers()
+        .get("x-api-key")
+        .and_then(|h| h.to_str().ok())
+        .map(str::to_owned)
+}
 
 /// Extract the host for an inbound request. Prefers the URI authority
 /// (set on tunnelled HTTPS) and falls back to the `Host` header (set on

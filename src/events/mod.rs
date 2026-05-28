@@ -95,6 +95,8 @@ mod jsonl;
 mod otel;
 mod webhook;
 
+pub(crate) use otel::genai::{emit_call_span as emit_genai_call_span, CallSpan as GenAiCallSpan};
+
 /// Filename under `<pillbox>/state_dir/`. Append-only JSONL.
 pub(crate) const EVENTS_FILE: &str = "events.jsonl";
 

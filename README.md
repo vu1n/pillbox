@@ -317,6 +317,7 @@ current.
   - [config.md](./docs/config.md) — `pillbox.toml` descriptor + discovery
   - [secrets.md](./docs/secrets.md) — pillbox-scoped secrets + env bundles
   - [vault.md](./docs/vault.md) — per-pillbox credential vault
+  - [observability.md](./docs/observability.md) — OTLP telemetry + Workshop integration
   - [shared-mcp.md](./docs/shared-mcp.md) — `--mcp NAME=URL` shared-MCP attachments
   - [remotes.md](./docs/remotes.md) — remote backends + sessions
   - [runner-image.md](./docs/runner-image.md) — the runner image, overrides, custom builds

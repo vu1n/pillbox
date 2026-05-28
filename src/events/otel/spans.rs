@@ -68,7 +68,7 @@ pub(in crate::events) fn sink_emit(
     Ok(())
 }
 
-fn tracer() -> Option<&'static SdkTracer> {
+pub(super) fn tracer() -> Option<&'static SdkTracer> {
     OTEL_TRACER
         .get_or_init(|| {
             let endpoint =
@@ -164,7 +164,7 @@ fn span_attributes(attrs: &[(&'static str, Option<AttrValue>)]) -> Vec<KeyValue>
 /// message), `span_id` will need a per-span derivation while
 /// `trace_id` stays anchored to the session. Until then the symmetry
 /// keeps correlation trivial.
-fn derive_trace_id(session_id: &str) -> TraceId {
+pub(super) fn derive_trace_id(session_id: &str) -> TraceId {
     TraceId::from_bytes(pack_id_bytes::<16>(session_id))
 }
 

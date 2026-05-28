@@ -191,7 +191,11 @@ enum Command {
         /// remote and the agent is already `pillbox auth login`'d there;
         /// runs the agent inside a nested runner-image container. Not for
         /// direct user consumption — the protocol is internal.
-        #[arg(long = "vault-stdin", hide = true, conflicts_with = "vault_stdin_direct")]
+        #[arg(
+            long = "vault-stdin",
+            hide = true,
+            conflicts_with = "vault_stdin_direct"
+        )]
         vault_stdin: bool,
         /// Hidden: sandbox-side sibling of `--vault-stdin` for environments
         /// that already ARE an isolation boundary (e2b sandboxes). Reads

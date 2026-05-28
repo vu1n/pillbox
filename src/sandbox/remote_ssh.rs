@@ -168,7 +168,11 @@ impl fmt::Debug for VaultStdinBlob {
             .field("workspace", &self.workspace)
             .field(
                 "agent_auth",
-                &format_args!("<{} files, {}B redacted>", self.agent_auth.len(), auth_bytes),
+                &format_args!(
+                    "<{} files, {}B redacted>",
+                    self.agent_auth.len(),
+                    auth_bytes
+                ),
             )
             .finish()
     }
@@ -249,7 +253,10 @@ impl fmt::Debug for AuthFile {
         f.debug_struct("AuthFile")
             .field("rel_path", &self.rel_path)
             .field("mode", &format_args!("0o{:o}", self.mode))
-            .field("contents", &format_args!("<{}B redacted>", self.contents.len()))
+            .field(
+                "contents",
+                &format_args!("<{}B redacted>", self.contents.len()),
+            )
             .finish()
     }
 }
@@ -1022,8 +1029,8 @@ fn collect_agent_auth(
                 )
             })?
             .replace(std::path::MAIN_SEPARATOR, "/");
-        let contents = fs::read(entry.path())
-            .with_context(|| format!("read {}", entry.path().display()))?;
+        let contents =
+            fs::read(entry.path()).with_context(|| format!("read {}", entry.path().display()))?;
         // Don't widen perms on extract: 0o600 for every forwarded file —
         // a fresh sandbox HOME shouldn't carry group/world-readable agent
         // state even if the local file was loose.
@@ -1414,9 +1421,8 @@ pub(crate) fn dispatch_vault_stdin_direct(
     // Resolve $HOME inside the sandbox; auth files write under it and the
     // agent inherits it on exec. Required (e2b sandboxes set HOME for the
     // run user); refuse if absent rather than guess.
-    let home_env = std::env::var("HOME").map_err(|_| {
-        PillboxError::runtime(action, "HOME is not set in the sandbox environment")
-    })?;
+    let home_env = std::env::var("HOME")
+        .map_err(|_| PillboxError::runtime(action, "HOME is not set in the sandbox environment"))?;
     let home_dir = PathBuf::from(&home_env);
     materialize_agent_auth(&home_dir, &blob.agent_auth, action)?;
 
@@ -1519,7 +1525,10 @@ pub(crate) fn dispatch_vault_stdin_direct(
     )?;
     if let Some(path) = std::env::var_os(RESULT_SNAPSHOT_FILE_ENV) {
         fs::write(&path, result_snapshot.handle.as_str()).map_err(|e| {
-            PillboxError::runtime(action, format!("write {}: {e}", PathBuf::from(path).display()))
+            PillboxError::runtime(
+                action,
+                format!("write {}: {e}", PathBuf::from(path).display()),
+            )
         })?;
     }
     eprintln!(
@@ -1527,10 +1536,11 @@ pub(crate) fn dispatch_vault_stdin_direct(
         result_snapshot.handle.short()
     );
     if !status.success() {
-        return Err(
-            PillboxError::runtime(action, format!("{} exited with status {status}", spec.id))
-                .into(),
-        );
+        return Err(PillboxError::runtime(
+            action,
+            format!("{} exited with status {status}", spec.id),
+        )
+        .into());
     }
     Ok(())
 }
@@ -1560,13 +1570,11 @@ fn materialize_agent_auth(home: &Path, files: &[AuthFile], action: &'static str)
         }
         let target = home.join(rel);
         if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("mkdir {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| format!("mkdir {}", parent.display()))?;
             fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
                 .with_context(|| format!("chmod 0o700 {}", parent.display()))?;
         }
-        fs::write(&target, &f.contents)
-            .with_context(|| format!("write {}", target.display()))?;
+        fs::write(&target, &f.contents).with_context(|| format!("write {}", target.display()))?;
         fs::set_permissions(&target, fs::Permissions::from_mode(f.mode))
             .with_context(|| format!("chmod {:o} {}", f.mode, target.display()))?;
     }
@@ -1876,7 +1884,10 @@ mod tests {
         assert_eq!(back.agent_id, "claude");
         assert_eq!(back.agent_auth.len(), 1);
         assert_eq!(back.agent_auth[0].rel_path, ".claude/.credentials.json");
-        assert_eq!(back.agent_auth[0].contents, br#"{"oauth_token":"redacted"}"#);
+        assert_eq!(
+            back.agent_auth[0].contents,
+            br#"{"oauth_token":"redacted"}"#
+        );
         assert_eq!(back.agent_args, vec!["--continue"]);
         assert_eq!(back.workspace_mount_name, "my-app");
         assert!(back.vault);

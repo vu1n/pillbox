@@ -466,6 +466,7 @@ pub(crate) mod test_support {
         let server = Server::start(ServerConfig {
             bind: None,
             ca_dir: dir.clone(),
+            session_id: None,
         })
         .await
         .expect("server start");

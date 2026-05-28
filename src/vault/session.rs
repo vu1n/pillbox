@@ -74,7 +74,17 @@ impl VaultSession {
     /// itself isn't `vault_capable` but the run still has `--with
     /// FOO --vault`-flagged secrets that need stub swapping — pillbox
     /// still needs a proxy + CA + leases for those.
-    pub(crate) fn start(oauth: Option<OAuthAgent<'_>>, pillbox: &Pillbox) -> Result<Self> {
+    ///
+    /// `session_id`, when `Some`, threads the pillbox-run session id
+    /// into the vault so gen_ai spans emitted by the MITM correlate
+    /// with the sandbox-side session span (one trace per run). `None`
+    /// leaves gen_ai spans rooted per sandbox lease — used by tests
+    /// and ad-hoc paths without a session.
+    pub(crate) fn start(
+        oauth: Option<OAuthAgent<'_>>,
+        pillbox: &Pillbox,
+        session_id: Option<String>,
+    ) -> Result<Self> {
         let ca_dir = pillbox.subdir("vault")?;
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -86,6 +96,7 @@ impl VaultSession {
             .block_on(Server::start(ServerConfig {
                 bind: Some(SocketAddr::from(([0, 0, 0, 0], 0))),
                 ca_dir: ca_dir.clone(),
+                session_id,
             }))
             .map_err(|e| PillboxError::runtime("vault", format!("start proxy: {e}")))?;
 

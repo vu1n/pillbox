@@ -31,6 +31,10 @@ pub(crate) fn run(resolved: &Pillbox, bind: Option<String>, json: bool) -> Resul
         .block_on(vault::Server::start(vault::ServerConfig {
             bind: bind_addr,
             ca_dir,
+            // The sidecar serves vault traffic for ad-hoc invocations
+            // outside a pillbox run, so there's no session_id to plumb.
+            // gen_ai spans from this server root at sandbox_id.
+            session_id: None,
         }))
         .map_err(|e| PillboxError::runtime("sidecar", format!("start vault server: {e}")))?;
 

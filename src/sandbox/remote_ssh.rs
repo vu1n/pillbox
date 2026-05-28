@@ -1346,7 +1346,10 @@ pub(crate) fn dispatch_vault_stdin(resolved: &Pillbox, blob_file: Option<&Path>)
             agent_id: spec.id,
             agent_home: &home,
         });
-        Some(VaultSession::start(oauth, resolved)?)
+        // session_id isn't on VaultStdinBlob yet — sandbox-resident
+        // vaults emit sandbox_id-rooted gen_ai traces for now.
+        // Plumbing session_id through the blob is a follow-up.
+        Some(VaultSession::start(oauth, resolved, None)?)
     } else {
         None
     };
@@ -1447,7 +1450,9 @@ pub(crate) fn dispatch_vault_stdin_direct(
             agent_id: spec.id,
             agent_home: &home_dir,
         });
-        Some(VaultSession::start(oauth, resolved)?)
+        // session_id isn't on VaultStdinBlob yet — see the SSH-shelled
+        // dispatcher above for the same rationale.
+        Some(VaultSession::start(oauth, resolved, None)?)
     } else {
         None
     };

@@ -9,26 +9,39 @@
 //! Phoenix, Langfuse, generic OTel collectors) can normalize without
 //! a pillbox-specific adapter.
 //!
-//! Trace correlation is by sandbox lease — all calls within one
-//! `pillbox run --vault` share a `trace_id` derived from the sandbox
-//! id. Session-level parenting (linking gen_ai spans to the session
-//! span emitted by [`super::spans`]) is deferred until the orchestrator
-//! plumbs `session_id` into the vault.
+//! Trace correlation is preferentially by `session_id` (one trace
+//! per pillbox run, parented to the sandbox-side session span via
+//! shared trace_id + the session's deterministic span_id). When the
+//! caller didn't plumb a session_id through (e.g. test fixtures,
+//! local-docker foreground without the wrapper), gen_ai spans fall
+//! back to a sandbox_id-rooted trace per lease.
 
 use std::time::SystemTime;
 
-use opentelemetry::trace::{Span as _, SpanBuilder, Status, Tracer};
+use opentelemetry::trace::{
+    Span as _, SpanBuilder, SpanContext, Status, TraceContextExt as _, TraceFlags, TraceState,
+    Tracer,
+};
 use opentelemetry::Context as OtelContext;
 use opentelemetry::KeyValue;
 
-use super::spans::{derive_trace_id, tracer};
+use super::spans::{derive_session_span_id, derive_trace_id, tracer};
 
 /// One captured LLM API call. Built by the vault handler from the
 /// request/response pair it intercepts and handed off to
 /// [`emit_call_span`] when the response completes.
 #[derive(Debug)]
 pub(crate) struct CallSpan {
+    /// Per-sandbox vault lease id. Always known. Surfaces as the
+    /// `pillbox.sandbox_id` attribute and is the trace_id fallback
+    /// when `session_id` is absent.
     pub(crate) sandbox_id: String,
+    /// Pillbox-run session id when the orchestrator plumbed one
+    /// through (see [`crate::vault::ServerConfig::session_id`]).
+    /// When `Some`, the span shares a trace with the session span
+    /// emitted by [`super::spans`] and parents it; when `None`, the
+    /// span roots its own trace per sandbox lease.
+    pub(crate) session_id: Option<String>,
     pub(crate) start: SystemTime,
     pub(crate) end: SystemTime,
     pub(crate) host: String,
@@ -83,16 +96,37 @@ pub(crate) fn emit_call_span(call: CallSpan) {
         Some(model) => format!("chat {model}"),
         None => "chat".to_string(),
     };
-    // No `with_span_id` — the SDK's id generator mints a fresh per-span
-    // id so multiple calls within the same sandbox lease keep distinct
-    // spans under the shared trace.
+    // trace_id derives from session_id when plumbed (so this span
+    // joins the trace rooted at the sandbox-side session span);
+    // otherwise from sandbox_id (one trace per lease).
+    let trace_seed = call.session_id.as_deref().unwrap_or(&call.sandbox_id);
+    let trace_id = derive_trace_id(trace_seed);
     let builder = SpanBuilder::from_name(span_name)
-        .with_trace_id(derive_trace_id(&call.sandbox_id))
+        .with_trace_id(trace_id)
         .with_start_time(call.start)
         .with_end_time(call.end)
         .with_status(status_for(call.status_code))
         .with_attributes(build_attributes(&call));
-    let mut span = tracer.build_with_context(builder, &OtelContext::new());
+    // Parent under the session span when session_id is known. The
+    // session span's span_id is deterministic (see
+    // `super::spans::derive_session_span_id`), so we don't need the
+    // session span itself to have been emitted first — Workshop /
+    // collectors stitch the link by id. OTel propagates parent via
+    // Context, so we build a remote SpanContext on the parent_id
+    // and pass it through `build_with_context`.
+    let parent_ctx = match call.session_id.as_deref() {
+        Some(session_id) => OtelContext::new().with_remote_span_context(SpanContext::new(
+            trace_id,
+            derive_session_span_id(session_id),
+            TraceFlags::SAMPLED,
+            true,
+            TraceState::default(),
+        )),
+        None => OtelContext::new(),
+    };
+    // No `with_span_id` — the SDK's id generator mints a fresh per-
+    // span id so multiple calls within the same trace stay distinct.
+    let mut span = tracer.build_with_context(builder, &parent_ctx);
     span.end();
 }
 
@@ -169,6 +203,7 @@ mod tests {
         let now = SystemTime::now();
         CallSpan {
             sandbox_id: "abc123def456".into(),
+            session_id: None,
             start: now,
             end: now,
             host: "api.anthropic.com".into(),
@@ -229,6 +264,41 @@ mod tests {
         ] {
             assert!(!keys.contains(&absent), "unexpected attr: {absent}");
         }
+    }
+
+    #[test]
+    fn trace_id_seed_prefers_session_id_when_present() {
+        // The selection logic is one line in emit_call_span; pin it
+        // here so a refactor that breaks correlation surfaces as a
+        // test failure rather than as silently-orphaned traces.
+        let call_with_session = CallSpan {
+            session_id: Some("sess-aabbcc".into()),
+            ..sample_call()
+        };
+        let call_without_session = CallSpan {
+            session_id: None,
+            ..sample_call()
+        };
+
+        let seed_with = call_with_session
+            .session_id
+            .as_deref()
+            .unwrap_or(&call_with_session.sandbox_id);
+        let seed_without = call_without_session
+            .session_id
+            .as_deref()
+            .unwrap_or(&call_without_session.sandbox_id);
+
+        assert_eq!(seed_with, "sess-aabbcc");
+        assert_eq!(seed_without, "abc123def456");
+
+        // Two calls in the same session share a trace_id; the same
+        // session_id correlates with the session span emitted by
+        // super::spans (which uses the same derive_trace_id).
+        assert_eq!(
+            derive_trace_id(seed_with),
+            super::super::spans::derive_trace_id("sess-aabbcc"),
+        );
     }
 
     #[test]

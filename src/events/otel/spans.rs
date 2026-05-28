@@ -55,7 +55,7 @@ pub(in crate::events) fn sink_emit(
     };
     let span_builder = SpanBuilder::from_name("session")
         .with_trace_id(derive_trace_id(session_id))
-        .with_span_id(derive_span_id(session_id))
+        .with_span_id(derive_session_span_id(session_id))
         .with_start_time(start_time)
         .with_end_time(SystemTime::now())
         .with_status(otel_status_for(ty))
@@ -158,18 +158,19 @@ fn span_attributes(attrs: &[(&'static str, Option<AttrValue>)]) -> Vec<KeyValue>
 /// Hyphens are stripped; the remaining hex (or hash fallback for
 /// non-hex shapes) is right-aligned into the 32-hex trace id.
 ///
-/// Today's model is one-span-per-session: `trace_id` and `span_id`
-/// both derive from the session id so the trace tree has a single
-/// span. If a future PR adds child spans (per-tool-call, per-
-/// message), `span_id` will need a per-span derivation while
-/// `trace_id` stays anchored to the session. Until then the symmetry
-/// keeps correlation trivial.
+/// Used by both the session span (its trace anchor) and by gen_ai
+/// spans emitted from the vault MITM — they share the trace via this
+/// same derivation, so the gen_ai spans become children of the
+/// session span without any out-of-band lookup.
 pub(super) fn derive_trace_id(session_id: &str) -> TraceId {
     TraceId::from_bytes(pack_id_bytes::<16>(session_id))
 }
 
-/// Same packing as [`derive_trace_id`] but for the 64-bit span id.
-fn derive_span_id(session_id: &str) -> SpanId {
+/// Deterministic span_id for *the session span itself*. gen_ai spans
+/// set this as their `parent_span_id` to nest under the session span
+/// without needing the session span to have been emitted first —
+/// Workshop / collectors stitch the link by id alone.
+pub(super) fn derive_session_span_id(session_id: &str) -> SpanId {
     SpanId::from_bytes(pack_id_bytes::<8>(session_id))
 }
 
@@ -234,8 +235,8 @@ mod tests {
         // calls producing the same bytes for the same session id;
         // pin that here so a future refactor of `pack_id_bytes` can't
         // silently break cross-emitter span stitching.
-        let a = derive_span_id("abc123def456");
-        let b = derive_span_id("abc123def456");
+        let a = derive_session_span_id("abc123def456");
+        let b = derive_session_span_id("abc123def456");
         assert_eq!(format!("{a:?}"), format!("{b:?}"));
         let t1 = derive_trace_id("abc123def456");
         let t2 = derive_trace_id("abc123def456");
@@ -243,8 +244,8 @@ mod tests {
         // Different sessions → different ids (sanity check that the
         // packing isn't trivially folding everything to zero).
         assert_ne!(
-            format!("{:?}", derive_span_id("abc123def456")),
-            format!("{:?}", derive_span_id("111122223333"))
+            format!("{:?}", derive_session_span_id("abc123def456")),
+            format!("{:?}", derive_session_span_id("111122223333"))
         );
     }
 
@@ -255,8 +256,8 @@ mod tests {
         // exact bytes (the hash function is an implementation
         // detail) — only that the result is stable and non-zero so
         // OTel doesn't reject the id as invalid.
-        let span = derive_span_id("ZZZZyyyy----");
-        let again = derive_span_id("ZZZZyyyy----");
+        let span = derive_session_span_id("ZZZZyyyy----");
+        let again = derive_session_span_id("ZZZZyyyy----");
         assert_eq!(format!("{span:?}"), format!("{again:?}"));
         assert_ne!(
             format!("{span:?}"),
@@ -374,7 +375,7 @@ mod tests {
         let span_start = SystemTime::now() - Duration::from_secs(2);
         let builder = SpanBuilder::from_name("session")
             .with_trace_id(derive_trace_id("abc123def456"))
-            .with_span_id(derive_span_id("abc123def456"))
+            .with_span_id(derive_session_span_id("abc123def456"))
             .with_start_time(span_start)
             .with_end_time(SystemTime::now())
             .with_status(Status::Ok);

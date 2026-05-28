@@ -111,7 +111,11 @@ impl SandboxBackend for LocalDocker {
             } else {
                 None
             };
-            Some(crate::vault::VaultSession::start(oauth, resolved)?)
+            // Foreground local-docker runs don't mint a host-side
+            // session_id (no wrapper, no session.* events). Pass None
+            // so gen_ai spans root per sandbox lease, matching the
+            // existing host-side observability shape for this path.
+            Some(crate::vault::VaultSession::start(oauth, resolved, None)?)
         } else {
             None
         };

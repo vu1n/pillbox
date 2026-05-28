@@ -49,6 +49,14 @@ pub struct ServerConfig {
     pub bind: Option<SocketAddr>,
     /// Directory the CA cert + key are persisted in.
     pub ca_dir: PathBuf,
+    /// Pillbox-run session id, used as the trace_id seed for
+    /// gen_ai spans emitted from this server. When `Some`, gen_ai
+    /// spans share a trace with the sandbox-side session span (same
+    /// `derive_trace_id(session_id)`) and parent it. When `None`,
+    /// gen_ai spans fall back to a sandbox_id-rooted trace per
+    /// lease — useful when the caller doesn't have a session id
+    /// (e.g. test fixtures).
+    pub session_id: Option<String>,
 }
 
 /// In-memory shared state. Handler clones share the registry behind a
@@ -58,6 +66,8 @@ pub(crate) struct ServerInner {
     ca: Ca,
     registry: Mutex<Registry>,
     providers: Vec<Arc<dyn VaultProvider>>,
+    /// See [`ServerConfig::session_id`].
+    session_id: Option<String>,
     /// Sender side of a shutdown signal. Dropping this triggers proxy
     /// graceful shutdown via the receiver held by the spawned task.
     shutdown_tx: tokio::sync::watch::Sender<bool>,
@@ -82,6 +92,10 @@ impl ServerInner {
 
     fn provider_by_id(&self, id: &str) -> Option<&Arc<dyn VaultProvider>> {
         self.providers.iter().find(|p| p.id() == id)
+    }
+
+    pub(crate) fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
     }
 }
 
@@ -121,6 +135,7 @@ impl Server {
             ca,
             registry: Mutex::new(Registry::new()),
             providers,
+            session_id: config.session_id,
             shutdown_tx,
         });
 
@@ -425,10 +440,12 @@ impl VaultHandler {
         };
 
         let status_code = res.status().as_u16();
+        let session_id = self.server.session_id().map(str::to_owned);
         let (parts, body) = res.into_parts();
         let tapped = TappedBody::new(body, move |usage| {
             emit_genai_call_span(GenAiCallSpan {
                 sandbox_id,
+                session_id,
                 start: call.start,
                 end: SystemTime::now(),
                 host: call.host,

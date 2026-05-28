@@ -75,9 +75,13 @@ them is sandbox cold-start latency.
       `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`,
       `gen_ai.usage.cache_read_input_tokens`,
       `gen_ai.usage.cache_creation_input_tokens`
-  Calls within the same sandbox lease share a `trace_id` derived
-  from the sandbox id, so Workshop and friends group them under one
-  trace per agent run.
+  When the orchestrator threads a `session_id` through the vault,
+  the gen_ai span's `trace_id` is derived from `session_id` and its
+  `parent_span_id` from the session span — so all LLM calls nest
+  under the session span as one trace per run. When `session_id`
+  isn't available (sandbox-resident vaults, the ad-hoc `sidecar`
+  command), the span falls back to a sandbox-id-rooted trace per
+  lease.
 - **Log records:** one per lifecycle event regardless of emitter.
   Severity matches the event type. Attributes mirror the JSONL field
   set 1:1 (`session_id`, `emitter`, `agent_id`, `backend`, `remote`,
@@ -95,10 +99,13 @@ them is sandbox cold-start latency.
   `message_delta` events). Envelope attrs — status, latency, error
   rate — are still captured uniformly. Adding a JSON-body fallback
   is a follow-up.
-- **`gen_ai` spans aren't yet children of the session span.** The
-  vault knows `sandbox_id`, not `session_id`. They land in their own
-  trace per sandbox lease. Plumbing session_id into the vault is a
-  separate, larger change.
+- **`gen_ai` span parenting only kicks in when `session_id` is
+  plumbed.** The vault accepts it via `ServerConfig.session_id`,
+  but the sandbox-resident vault path (`pillbox run --remote ssh/e2b`)
+  doesn't carry session_id through its stdin blob yet. Those runs
+  still produce gen_ai traces — just rooted per sandbox lease
+  instead of under the session span. Plumbing session_id through
+  the blob is a follow-up.
 - **`gen_ai.request.model` not emitted.** We extract
   `gen_ai.response.model` from the SSE `message_start` event — the
   model the server actually served, which is usually what you want.
@@ -177,9 +184,11 @@ on a private network, sketchy for a cleartext public endpoint. Prefer
 
 ## What's next
 
-- **Cross-trace correlation.** Plumb `session_id` through the vault
-  so `gen_ai` spans become children of the session span instead of
-  rooting their own traces per sandbox lease.
+- **Plumb `session_id` through VaultStdinBlob.** Cross-trace
+  correlation infrastructure already lands gen_ai spans under the
+  session span — but only the in-process VaultSession path actually
+  has session_id today. Add it to the stdin blob so SSH / e2b
+  sandbox-resident vaults light up too.
 - **JSON-body fallback for non-streaming responses.** Mirror the SSE
   tap with a JSON-body parser for endpoints called with
   `stream: false` so usage attrs land uniformly.

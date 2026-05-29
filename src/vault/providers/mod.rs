@@ -214,6 +214,39 @@ pub(crate) trait VaultProvider: Send + Sync + 'static {
         server: &ServerInner,
         pending: &mut Option<PendingFlow>,
     ) -> Response<Body>;
+
+    /// Whether this provider wants the request body captured for gen_ai
+    /// *conversation* telemetry — i.e. is `(method, path)` this
+    /// provider's chat endpoint? Default `false` so the proxy only
+    /// buffers bodies for providers that opt in (buffering is otherwise
+    /// avoided on the hot path). Anthropic returns true for
+    /// `POST /v1/messages`; Codex/OpenAI is a future drop-in (different
+    /// endpoint + body shape) — see [`Self::parse_chat_input`].
+    fn captures_chat_input(&self, _method: &str, _path: &str) -> bool {
+        false
+    }
+
+    /// Parse a captured chat-request body into OTel GenAI semconv
+    /// conversation content. Called only after [`Self::captures_chat_input`]
+    /// returned true. Default `None` (no-op for providers that don't opt
+    /// in). The emitted attributes (`gen_ai.input.messages`,
+    /// `gen_ai.system_instructions`) are provider-agnostic; only this
+    /// extraction is provider-shaped.
+    fn parse_chat_input(&self, _body: &[u8]) -> Option<ChatInput> {
+        None
+    }
+}
+
+/// Conversation content extracted from a chat request body, in OTel
+/// GenAI semantic-convention shape. JSON-encoded so the emitter attaches
+/// it verbatim as span attributes.
+#[derive(Debug, Clone)]
+pub(crate) struct ChatInput {
+    /// JSON array of `{role, content}` — the request's `messages`.
+    pub(crate) input_messages: String,
+    /// JSON-encoded `system` prompt (string or content-block array),
+    /// when present.
+    pub(crate) system_instructions: Option<String>,
 }
 
 /// Build the full provider list. The list is fixed at compile-time —

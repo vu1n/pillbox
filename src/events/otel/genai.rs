@@ -61,6 +61,16 @@ pub(crate) struct CallSpan {
     /// carry these fields (e.g. `GET /v1/models`) or for error
     /// responses with no usage block.
     pub(crate) usage: GenAiUsage,
+    /// Request-side conversation, captured from the `/v1/messages`
+    /// request body by the proxy: JSON array of `{role, content}` in
+    /// Anthropic's native shape, emitted as `gen_ai.input.messages`
+    /// (OTel GenAI semconv). `None` for non-chat endpoints or when
+    /// body capture is off. Lets a collector render the conversation
+    /// (Raindrop Workshop's "Overview"), not just the span envelope.
+    pub(crate) input_messages: Option<String>,
+    /// Request `system` prompt (string or content-block array), JSON-
+    /// encoded, emitted as `gen_ai.system_instructions`.
+    pub(crate) system_instructions: Option<String>,
 }
 
 /// Body-derived gen_ai signals. Lives separately from the envelope
@@ -88,6 +98,11 @@ pub(crate) struct GenAiUsage {
     /// `gen_ai.response.finish_reasons` — single-entry list with the
     /// stop_reason from `message_delta.delta.stop_reason`.
     pub(crate) finish_reason: Option<String>,
+    /// Assistant reply, accumulated from the SSE `content_block_delta`
+    /// text deltas: JSON `[{"role":"assistant","content":"…"}]`,
+    /// emitted as `gen_ai.output.messages`. `None` when the response
+    /// carried no text (tool-only turn, error, non-chat endpoint).
+    pub(crate) output_messages: Option<String>,
 }
 
 /// Emit one OTLP span for a completed LLM API call. Best-effort skip
@@ -156,6 +171,16 @@ fn build_attributes(call: &CallSpan) -> Vec<KeyValue> {
     if let Some(ws) = call.workspace_id.as_deref() {
         attrs.push(KeyValue::new("pillbox.workspace_id", ws.to_string()));
     }
+    // Conversation content (OTel GenAI semconv, current shape). Lets a
+    // collector reconstruct the chat — Anthropic's `messages` array is
+    // already `[{role, content}]` (content string or content-blocks),
+    // which the consumer's gen_ai adapter reads directly.
+    if let Some(msgs) = call.input_messages.as_deref() {
+        attrs.push(KeyValue::new("gen_ai.input.messages", msgs.to_string()));
+    }
+    if let Some(sys) = call.system_instructions.as_deref() {
+        attrs.push(KeyValue::new("gen_ai.system_instructions", sys.to_string()));
+    }
     push_usage_attrs(&mut attrs, &call.usage);
     attrs
 }
@@ -201,6 +226,9 @@ pub(in crate::events) fn push_usage_attrs(attrs: &mut Vec<KeyValue>, usage: &Gen
             v.to_string(),
         ));
     }
+    if let Some(v) = usage.output_messages.as_deref() {
+        attrs.push(KeyValue::new("gen_ai.output.messages", v.to_string()));
+    }
 }
 
 fn status_for(status_code: u16) -> Status {
@@ -238,7 +266,10 @@ mod tests {
                 cache_read_input_tokens: Some(8431),
                 cache_creation_input_tokens: Some(0),
                 finish_reason: Some("end_turn".into()),
+                output_messages: Some(r#"[{"role":"assistant","content":"hi"}]"#.into()),
             },
+            input_messages: Some(r#"[{"role":"user","content":"hello"}]"#.into()),
+            system_instructions: Some(r#""be terse""#.into()),
         }
     }
 
@@ -256,6 +287,9 @@ mod tests {
             "gen_ai.usage.cache_read_input_tokens",
             "gen_ai.usage.cache_creation_input_tokens",
             "gen_ai.response.finish_reasons",
+            "gen_ai.input.messages",
+            "gen_ai.system_instructions",
+            "gen_ai.output.messages",
             "server.address",
             "http.request.method",
             "http.response.status_code",
@@ -265,6 +299,21 @@ mod tests {
         ] {
             assert!(keys.contains(&expected), "missing attr: {expected}");
         }
+    }
+
+    #[test]
+    fn build_attributes_omits_conversation_attrs_when_absent() {
+        // A non-chat call (e.g. GET /v1/models) carries no messages —
+        // the conversation attrs must be absent, not emitted empty.
+        let mut call = sample_call();
+        call.input_messages = None;
+        call.system_instructions = None;
+        call.usage.output_messages = None;
+        let attrs = build_attributes(&call);
+        let keys: Vec<&str> = attrs.iter().map(|kv| kv.key.as_str()).collect();
+        assert!(!keys.contains(&"gen_ai.input.messages"));
+        assert!(!keys.contains(&"gen_ai.system_instructions"));
+        assert!(!keys.contains(&"gen_ai.output.messages"));
     }
 
     #[test]

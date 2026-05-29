@@ -22,6 +22,7 @@ use std::{
 };
 
 use http_body_util::combinators::BoxBody;
+use http_body_util::BodyExt;
 use hudsucker::{
     certificate_authority::RcgenAuthority,
     hyper::{Request, Response},
@@ -395,6 +396,11 @@ struct InFlightCall {
     /// via the registry; if the lookup fails (legitimate `--with`'d
     /// real key, no header at all) the span is skipped.
     auth_stub: Option<String>,
+    /// Conversation captured from the chat request body (when the
+    /// provider opts in via `captures_chat_input`): `gen_ai.input.messages`
+    /// + `gen_ai.system_instructions` JSON. `None` for non-chat requests.
+    input_messages: Option<String>,
+    system_instructions: Option<String>,
 }
 
 impl HttpHandler for VaultHandler {
@@ -419,14 +425,53 @@ impl HttpHandler for VaultHandler {
 
         // Capture the in-flight shape BEFORE the provider rewrites the
         // Authorization header — we need the *stub* value to resolve
-        // sandbox_id at response time.
+        // sandbox_id at response time. Set synchronously (no await
+        // before it) so the request→response pairing matches the
+        // pre-existing model: an `await` here would widen the window in
+        // which an interleaved request (HTTP/2 multiplexes chat calls on
+        // one connection) overwrites this slot before our response lands.
+        let method = req.method().as_str().to_string();
+        let path = req.uri().path().to_string();
+        let captures = provider.captures_chat_input(&method, &path);
         self.in_flight = Some(InFlightCall {
             start: SystemTime::now(),
             host,
-            method: req.method().as_str().to_string(),
-            path: req.uri().path().to_string(),
+            method,
+            path,
             auth_stub: extract_inbound_stub(&req),
+            input_messages: None,
+            system_instructions: None,
         });
+
+        // Capture conversation content from the chat endpoint's request
+        // body (provider opt-in). Buffering the body is the unavoidable
+        // cost — gated to exactly the chat endpoint so OAuth / other
+        // POSTs and every non-opted-in provider keep streaming
+        // untouched. We update the slot we just set (rather than build it
+        // after the await) to keep the envelope's pairing tight. On a
+        // collect error the body is unrecoverable, so forward empty and
+        // let the upstream reject (the agent retries).
+        let req = if captures {
+            let (parts, body) = req.into_parts();
+            match body.collect().await {
+                Ok(collected) => {
+                    let bytes = collected.to_bytes();
+                    if let Some(c) = provider.parse_chat_input(&bytes) {
+                        if let Some(flight) = self.in_flight.as_mut() {
+                            flight.input_messages = Some(c.input_messages);
+                            flight.system_instructions = c.system_instructions;
+                        }
+                    }
+                    Request::from_parts(parts, Body::from(bytes))
+                }
+                Err(error) => {
+                    eprintln!("pillbox: vault: failed to collect chat request body: {error}");
+                    Request::from_parts(parts, Body::empty())
+                }
+            }
+        } else {
+            req
+        };
 
         provider
             .handle_request(req, &self.server, &mut self.pending)
@@ -505,6 +550,8 @@ impl VaultHandler {
                 path: call.path,
                 status_code,
                 usage,
+                input_messages: call.input_messages,
+                system_instructions: call.system_instructions,
             });
         });
         Response::from_parts(parts, Body::from(BoxBody::new(tapped)))

@@ -88,11 +88,20 @@ impl Drop for VaultSession {
     /// that loop (mirrors how Orca reads back + persists CLI-rotated
     /// tokens). Best-effort: a failure only costs a stale token
     /// (recoverable via `pillbox auth login`), so warn, never panic.
+    ///
+    /// Guarded against the concurrent-session clobber: two vault sessions
+    /// for the same agent share one global creds file, so a session that
+    /// started earlier (older token) must not overwrite a fresher token a
+    /// later/overlapping session already persisted. We only write back
+    /// when the registry's token is at least as fresh as what's on disk.
     fn drop(&mut self) {
         for mount in &self.oauth_mounts {
             let Some(real) = self.server.snapshot_real(&mount.sandbox_id) else {
                 continue;
             };
+            if !is_at_least_as_fresh(&real, &mount.host_creds_path) {
+                continue;
+            }
             match serde_json::to_string_pretty(&real) {
                 Ok(body) => {
                     if let Err(e) = write_private(&mount.host_creds_path, &body) {
@@ -107,6 +116,31 @@ impl Drop for VaultSession {
                 }
             }
         }
+    }
+}
+
+/// Whether the in-registry `real` creds are at least as fresh as what's
+/// currently on disk at `creds_path`, by comparing
+/// `claudeAiOauth.expiresAt`. Returns `true` (persist) when either side
+/// lacks the field (non-Claude shapes, malformed/absent file) — there's
+/// no freshness signal to defer to, so preserve the unconditional
+/// write-back. Returns `false` only when both timestamps are present and
+/// disk is strictly newer, i.e. an overlapping session already wrote a
+/// fresher token that this older session would otherwise clobber.
+fn is_at_least_as_fresh(real: &serde_json::Value, creds_path: &Path) -> bool {
+    let real_exp = real
+        .pointer("/claudeAiOauth/expiresAt")
+        .and_then(serde_json::Value::as_u64);
+    let disk_exp = fs::read(creds_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| {
+            v.pointer("/claudeAiOauth/expiresAt")
+                .and_then(serde_json::Value::as_u64)
+        });
+    match (real_exp, disk_exp) {
+        (Some(real_exp), Some(disk_exp)) => real_exp >= disk_exp,
+        _ => true,
     }
 }
 
@@ -371,4 +405,49 @@ pub(super) fn write_private(path: &Path, content: &str) -> Result<()> {
     f.write_all(content.as_bytes())
         .map_err(|e| PillboxError::runtime("vault", format!("write {}: {e}", path.display())))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_creds(dir: &std::path::Path, expires_at: Option<u64>) -> PathBuf {
+        let path = dir.join(".credentials.json");
+        let body = match expires_at {
+            Some(e) => format!(r#"{{"claudeAiOauth":{{"expiresAt":{e}}}}}"#),
+            None => r#"{"claudeAiOauth":{}}"#.to_string(),
+        };
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    fn real_with(expires_at: u64) -> serde_json::Value {
+        serde_json::json!({ "claudeAiOauth": { "expiresAt": expires_at } })
+    }
+
+    #[test]
+    fn fresh_guard_blocks_older_token_from_clobbering_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_creds(dir.path(), Some(2_000));
+        // Registry token is OLDER than disk (an overlapping session
+        // already wrote a fresher one) → must not persist.
+        assert!(!is_at_least_as_fresh(&real_with(1_000), &path));
+        // Equal or newer → persist.
+        assert!(is_at_least_as_fresh(&real_with(2_000), &path));
+        assert!(is_at_least_as_fresh(&real_with(3_000), &path));
+    }
+
+    #[test]
+    fn fresh_guard_persists_when_no_timestamp_to_compare() {
+        let dir = tempfile::tempdir().unwrap();
+        // Disk has no expiresAt → no signal → persist (preserve the
+        // unconditional write-back for non-Claude shapes).
+        let path = write_creds(dir.path(), None);
+        assert!(is_at_least_as_fresh(&real_with(1_000), &path));
+        // Missing file entirely → persist.
+        let missing = dir.path().join("nope.json");
+        assert!(is_at_least_as_fresh(&real_with(1_000), &missing));
+        // Registry real lacks the field → persist.
+        assert!(is_at_least_as_fresh(&serde_json::json!({}), &path));
+    }
 }

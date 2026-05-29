@@ -19,8 +19,8 @@ use hudsucker::{
 use serde::Deserialize;
 
 use super::{
-    host_from_uri, mint_stub, swap_raw_header, unauthorized, ApiKeySwap, PendingFlow, Registry,
-    SandboxData, VaultProvider,
+    host_from_uri, mint_stub, swap_raw_header, unauthorized, ApiKeySwap, ChatInput, PendingFlow,
+    Registry, SandboxData, VaultProvider,
 };
 use crate::vault::server::ServerInner;
 
@@ -228,6 +228,32 @@ impl VaultProvider for AnthropicProvider {
             .headers
             .insert("content-length", HeaderValue::from(new_len));
         Response::from_parts(parts, Body::from(new_body))
+    }
+
+    /// Anthropic's chat endpoint is `POST /v1/messages` (on both
+    /// `api.anthropic.com` and the platform host the handler already
+    /// matched). The request body carries the full conversation.
+    fn captures_chat_input(&self, method: &str, path: &str) -> bool {
+        method == "POST" && path.ends_with("/v1/messages")
+    }
+
+    /// Pull `messages` + `system` out of the Anthropic Messages request
+    /// body. Both are emitted verbatim (JSON-encoded) as OTel GenAI
+    /// conversation attributes — Anthropic's `messages` are already
+    /// `[{role, content}]` with content as a string or content-block
+    /// array, which the consumer's gen_ai adapter reads directly.
+    /// Best-effort: a non-JSON / message-less body yields `None`.
+    fn parse_chat_input(&self, body: &[u8]) -> Option<ChatInput> {
+        let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+        let messages = value.get("messages").filter(|m| m.is_array())?;
+        let input_messages = serde_json::to_string(messages).ok()?;
+        let system_instructions = value
+            .get("system")
+            .map(|s| serde_json::to_string(s).unwrap_or_default());
+        Some(ChatInput {
+            input_messages,
+            system_instructions,
+        })
     }
 }
 

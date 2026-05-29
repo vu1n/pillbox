@@ -132,6 +132,12 @@ struct AnthropicSseParser {
     /// first successful SSE event so streaming responses don't pay
     /// the memory cost.
     raw_body: Vec<u8>,
+    /// Assistant text accumulated from `content_block_delta` →
+    /// `text_delta` events. Folded into `usage.output_messages` (OTel
+    /// `gen_ai.output.messages`) at [`Self::into_usage`] so a collector
+    /// can render the reply. Thinking/tool_use block deltas are skipped
+    /// — only the user-visible answer text is captured.
+    output_text: String,
     usage: GenAiUsage,
 }
 
@@ -193,7 +199,20 @@ impl AnthropicSseParser {
                 self.raw_body = Vec::new();
             }
             Some("message_delta") => self.handle_message_delta(&value),
+            Some("content_block_delta") => self.handle_content_block_delta(&value),
             _ => {}
+        }
+    }
+
+    /// Accumulate assistant answer text from a `content_block_delta`.
+    /// Only `text_delta` is captured (the user-visible reply); thinking
+    /// (`thinking_delta`) and tool input (`input_json_delta`) deltas are
+    /// intentionally skipped from the rendered output message.
+    fn handle_content_block_delta(&mut self, v: &serde_json::Value) {
+        if v.pointer("/delta/type").and_then(|t| t.as_str()) == Some("text_delta") {
+            if let Some(text) = v.pointer("/delta/text").and_then(|t| t.as_str()) {
+                self.output_text.push_str(text);
+            }
         }
     }
 
@@ -244,12 +263,26 @@ impl AnthropicSseParser {
         // error response with a JSON body), try parsing the
         // accumulated body as a single Anthropic Messages response.
         // Same usage shape as the SSE message_start / message_delta
-        // events, just collapsed.
+        // events, just collapsed. This also fills output_messages from
+        // the response's `content` text blocks.
         if !self.raw_body.is_empty() {
             try_json_fallback(&self.raw_body, &mut self.usage);
         }
+        // Streaming path: fold the accumulated text deltas into the
+        // output message. (Skipped when the JSON fallback above already
+        // set it from a non-streaming body.)
+        if self.usage.output_messages.is_none() && !self.output_text.is_empty() {
+            self.usage.output_messages = Some(output_messages_json(&self.output_text));
+        }
         self.usage
     }
+}
+
+/// Wrap assistant reply text in the OTel `gen_ai.output.messages`
+/// shape: a one-element `[{"role":"assistant","content":"…"}]`. Uses
+/// `serde_json` so the text is escaped correctly.
+fn output_messages_json(text: &str) -> String {
+    serde_json::json!([{ "role": "assistant", "content": text }]).to_string()
 }
 
 /// Parse a non-streaming Anthropic `/v1/messages` response body and
@@ -268,6 +301,18 @@ fn try_json_fallback(body: &[u8], usage: &mut GenAiUsage) {
     }
     if let Some(s) = v.get("stop_reason").and_then(|v| v.as_str()) {
         usage.finish_reason = Some(s.to_string());
+    }
+    // Concatenate the `content[].text` blocks into the output message.
+    if let Some(blocks) = v.get("content").and_then(|c| c.as_array()) {
+        let text: String = blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("");
+        if !text.is_empty() {
+            usage.output_messages = Some(output_messages_json(&text));
+        }
     }
     let Some(u) = v.get("usage") else {
         return;
@@ -308,6 +353,12 @@ data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_abc\",\"model\":\"cl
 event: content_block_start\n\
 data: {\"type\":\"content_block_start\"}\n\
 \n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\
+\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\" world\"}}\n\
+\n\
 event: message_delta\n\
 data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":89}}\n\
 \n\
@@ -328,6 +379,28 @@ data: {\"type\":\"message_stop\"}\n\
         assert_eq!(u.cache_read_input_tokens, Some(8431));
         assert_eq!(u.cache_creation_input_tokens, Some(0));
         assert_eq!(u.finish_reason.as_deref(), Some("end_turn"));
+        // text_delta events accumulate into gen_ai.output.messages.
+        assert_eq!(
+            u.output_messages.as_deref(),
+            Some(r#"[{"content":"Hello world","role":"assistant"}]"#),
+        );
+    }
+
+    #[test]
+    fn non_streaming_response_yields_output_message_from_content_blocks() {
+        // stream:false POST — single JSON body, no SSE framing. The
+        // fallback extracts model/usage AND concatenates content text.
+        let body = br#"{"id":"msg_x","model":"claude-sonnet-4-5","stop_reason":"end_turn",
+            "content":[{"type":"text","text":"part one. "},{"type":"text","text":"part two."}],
+            "usage":{"input_tokens":10,"output_tokens":5}}"#;
+        let mut p = AnthropicSseParser::default();
+        p.feed(body);
+        let u = p.into_usage();
+        assert_eq!(u.response_model.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(
+            u.output_messages.as_deref(),
+            Some(r#"[{"content":"part one. part two.","role":"assistant"}]"#),
+        );
     }
 
     #[test]

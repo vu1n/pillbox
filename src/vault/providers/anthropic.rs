@@ -375,7 +375,17 @@ async fn handle_oauth_request(
 ///
 /// We dispatch by which header is present. If neither carries one of
 /// ours, we pass through (lets unvaulted `--with` requests keep working).
-async fn handle_api_request(req: Request<Body>, server: &ServerInner) -> RequestOrResponse {
+async fn handle_api_request(mut req: Request<Body>, server: &ServerInner) -> RequestOrResponse {
+    // Force identity encoding so the gen_ai response tap reads plaintext
+    // SSE. Anthropic gzips `/v1/messages` responses when the client sends
+    // `accept-encoding: gzip` (Claude Code does), which leaves the tap
+    // parsing compressed bytes — no usage, no output messages. Requesting
+    // identity is invisible to the agent (any client accepts uncompressed)
+    // and is the same trick the OAuth path already uses.
+    req.headers_mut().remove("accept-encoding");
+    req.headers_mut()
+        .insert("accept-encoding", HeaderValue::from_static("identity"));
+
     let has_x_api_key = req.headers().get(X_API_KEY_HEADER).is_some();
     if has_x_api_key {
         return handle_api_request_x_api_key(req, server).await;

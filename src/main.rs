@@ -431,9 +431,16 @@ fn init_vault_trace() {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("hudsucker=debug,pillbox=debug"));
+    // Per-event writer: clone the handle, falling back to a sink rather
+    // than panicking — a debug logging facility must never crash the CLI.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_writer(move || file.try_clone().expect("clone trace file"))
+        .with_writer(move || -> Box<dyn std::io::Write> {
+            match file.try_clone() {
+                Ok(f) => Box::new(f),
+                Err(_) => Box::new(std::io::sink()),
+            }
+        })
         .with_ansi(false)
         .try_init();
 }

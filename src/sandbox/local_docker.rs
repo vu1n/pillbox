@@ -5,6 +5,8 @@
 //! global; vault state lives per-pillbox so a project's leases never
 //! collide with another's.
 
+use std::time::SystemTime;
+
 use anyhow::{Context, Result};
 
 use super::SandboxBackend;
@@ -60,6 +62,9 @@ impl SandboxBackend for LocalDocker {
         }
         let workspace_name = workspace_mount_name(&workspace_host, opts.name.as_deref())?;
         let guest_workspace = format!("{GUEST_WORKSPACE}/{workspace_name}");
+        // Kept for the transcript tailer's scope-dir derivation; the
+        // original is moved into the docker args below.
+        let guest_cwd = guest_workspace.clone();
 
         if opts.vault && !spec.vault_capable {
             return Err(PillboxError::usage(
@@ -102,6 +107,14 @@ impl SandboxBackend for LocalDocker {
             .with_next("run without --vault, or use --remote for a vaulted detached session")
             .into());
         }
+        // One session id for the whole foreground run: it anchors the
+        // OTLP trace (root session span below), parents the vault MITM
+        // gen_ai spans, and parents the host-side transcript tailer's
+        // thread spans — all three correlate by deriving from it. The
+        // detach branch returns before reaching the span/tailer wiring
+        // and mints its own record id, so this is unused there.
+        let session_id = Session::new_id();
+
         let mut vault_session = if opts.vault || any_vaulted {
             let oauth = if opts.vault {
                 Some(crate::vault::OAuthAgent {
@@ -111,13 +124,12 @@ impl SandboxBackend for LocalDocker {
             } else {
                 None
             };
-            // Foreground local-docker has no host-side session_id
-            // (no wrapper, no session.* events) — gen_ai spans root
-            // per sandbox lease. Mode + workspace_id still surface,
-            // so eval consumers can group these traces by project /
-            // attentiveness regime even without a session anchor.
+            // Thread the session id through so gen_ai spans nest under
+            // the host-emitted session span instead of rooting per
+            // lease. Mode + workspace_id let eval consumers group
+            // traces by project / attentiveness regime.
             let context = crate::vault::RunContext {
-                session_id: None,
+                session_id: Some(session_id.clone()),
                 mode: Some("interactive".to_string()),
                 workspace_id: Some(resolved.workspace_id().to_string()),
             };
@@ -205,6 +217,7 @@ impl SandboxBackend for LocalDocker {
         }
         args.extend(opts.args);
 
+        let run_started = SystemTime::now();
         let container = docker::run_detached(&args)?;
 
         if opts.detach {
@@ -256,9 +269,50 @@ impl SandboxBackend for LocalDocker {
         // SIGKILL still bypasses Drop; that residual orphan is the lifecycle
         // follow-up, alongside the ssh remote-container reap.)
         let _container = ContainerGuard(container.clone());
+
+        // Live transcript streaming: the agent's `$HOME` is bind-mounted
+        // from the host (above), so its `~/.claude/projects/<uuid>.jsonl`
+        // lands on a host path we can tail straight into the operator's
+        // collector — no sandbox egress hop. Gated on a configured OTLP
+        // traces endpoint so a plain run spawns no watcher thread. Agents
+        // without a transcript parser (opencode, pi) get session + gen_ai
+        // spans but no thread spans yet.
+        let tailer = crate::events::otlp_traces_configured()
+            .then(|| crate::events::transcripts::Harness::for_agent(spec.id))
+            .flatten()
+            .map(|harness| {
+                let (watch_root, scope_dir) = harness.transcript_roots(&home, &guest_cwd);
+                crate::events::transcripts::spawn_local_tailer(
+                    watch_root,
+                    scope_dir,
+                    harness,
+                    session_id.clone(),
+                )
+            });
+
         let outcome = attach_via_exec(&container, false);
         // The vault proxy must stay up for the whole attached session.
         drop(vault_session);
+        // Stop the tailer (final drain of the agent's last lines) before
+        // closing the root span so all children land inside its window.
+        if let Some(tailer) = tailer {
+            tailer.shutdown();
+        }
+
+        // Host-emitted root `session` span: the parent the gen_ai +
+        // transcript children stitch under. Status reflects the agent's
+        // real exit. No-op without a collector, so emitted unconditionally.
+        let (ok, reason): (bool, Option<String>) = match &outcome {
+            Ok(Outcome::Exited(0)) | Ok(Outcome::Detached) | Ok(Outcome::Disconnected) => {
+                (true, None)
+            }
+            Ok(Outcome::Exited(code)) => (
+                false,
+                Some(format!("{} exited with status {code}", spec.id)),
+            ),
+            Err(e) => (false, Some(format!("{e:#}"))),
+        };
+        crate::events::emit_local_session_span(&session_id, run_started, ok, reason.as_deref());
 
         match outcome? {
             Outcome::Exited(0) | Outcome::Detached | Outcome::Disconnected => Ok(()),

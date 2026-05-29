@@ -24,7 +24,7 @@
 //! result as one trace per pillbox run with user prompts, assistant
 //! messages, tool invocations as named children.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
@@ -39,8 +39,10 @@ use super::otel::spans::{derive_session_span_id, derive_trace_id, tracer};
 
 mod claude;
 mod codex;
+mod local;
 mod tailer;
 
+pub(crate) use local::spawn_local_tailer;
 pub(crate) use tailer::Tailer;
 
 /// Which agent harness wrote the transcript. Drives which per-line
@@ -67,6 +69,53 @@ impl Harness {
             Self::Claude
         }
     }
+
+    /// Agent id → transcript harness, for the host-side local tailer.
+    /// `None` for agents without a transcript parser yet (opencode, pi)
+    /// — they still get session + gen_ai spans, just no thread spans.
+    pub(crate) fn for_agent(agent_id: &str) -> Option<Self> {
+        match agent_id {
+            "claude" => Some(Self::Claude),
+            "codex" => Some(Self::Codex),
+            _ => None,
+        }
+    }
+
+    /// `(watch_root, scope_dir)` for this run, both under the agent's
+    /// `$HOME` (`home`). `watch_root` is the harness's transcript tree;
+    /// `scope_dir`, when `Some`, narrows discovery to *this run's own*
+    /// transcript directory so concurrent pillbox runs sharing the
+    /// global auth home don't grab each other's file. `None` discovers
+    /// across the whole tree (Codex buckets by date, not cwd, so it has
+    /// no per-run dir — concurrent Codex runs can still race; rare).
+    pub(crate) fn transcript_roots(
+        &self,
+        home: &Path,
+        guest_cwd: &str,
+    ) -> (PathBuf, Option<PathBuf>) {
+        match self {
+            Self::Claude => {
+                let projects = home.join(".claude/projects");
+                let scope = projects.join(claude_project_dir_name(guest_cwd));
+                (projects, Some(scope))
+            }
+            Self::Codex => (home.join(".codex/sessions"), None),
+        }
+    }
+}
+
+/// Claude Code's project-dir encoding of the agent cwd: every
+/// non-alphanumeric character becomes `-` (mirrors Claude Code's
+/// `cwd.replace(/[^a-zA-Z0-9]/g, '-')`). For the guest cwd
+/// `/workspace/<name>` this yields `-workspace-<name>` — verified
+/// against a live run. Used to scope the local tailer to one run's
+/// transcript dir; an exact match matters, so this must track Claude
+/// Code's transform, not pillbox's looser `/`-only path key.
+fn claude_project_dir_name(guest_cwd: &str) -> String {
+    guest_cwd
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
 }
 
 /// One parsed transcript line, in a harness-agnostic shape so a
@@ -278,6 +327,41 @@ fn truncate(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_project_dir_name_replaces_all_non_alnum() {
+        // Must match Claude Code's cwd.replace(/[^a-zA-Z0-9]/g,'-').
+        assert_eq!(
+            claude_project_dir_name("/workspace/pb-threadverify"),
+            "-workspace-pb-threadverify",
+        );
+        // Dots, underscores, etc. all fold to '-' (the reason pillbox's
+        // '/'-only path key can't be reused here).
+        assert_eq!(
+            claude_project_dir_name("/workspace/my.app_v2"),
+            "-workspace-my-app-v2",
+        );
+    }
+
+    #[test]
+    fn transcript_roots_scopes_claude_but_not_codex() {
+        let home = Path::new("/home/pillbox");
+        let (root, scope) = Harness::Claude.transcript_roots(home, "/workspace/app");
+        assert_eq!(root, home.join(".claude/projects"));
+        assert_eq!(scope, Some(home.join(".claude/projects/-workspace-app")));
+
+        let (root, scope) = Harness::Codex.transcript_roots(home, "/workspace/app");
+        assert_eq!(root, home.join(".codex/sessions"));
+        assert_eq!(scope, None);
+    }
+
+    #[test]
+    fn for_agent_maps_known_harnesses_only() {
+        assert_eq!(Harness::for_agent("claude"), Some(Harness::Claude));
+        assert_eq!(Harness::for_agent("codex"), Some(Harness::Codex));
+        assert_eq!(Harness::for_agent("opencode"), None);
+        assert_eq!(Harness::for_agent("pi"), None);
+    }
 
     #[test]
     fn harness_detection_picks_codex_for_codex_paths() {

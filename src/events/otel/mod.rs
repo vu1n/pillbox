@@ -28,6 +28,7 @@ pub(super) mod logs;
 pub(super) mod spans;
 
 pub(super) use logs::sink_emit as log_sink_emit;
+pub(super) use spans::emit_local_root_span;
 pub(super) use spans::sink_emit as span_sink_emit;
 
 /// Default `service.name` resource attribute when `OTEL_SERVICE_NAME`

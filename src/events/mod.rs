@@ -100,6 +100,28 @@ pub(crate) use otel::genai::{
     emit_call_span as emit_genai_call_span, CallSpan as GenAiCallSpan, GenAiUsage,
 };
 
+/// Emit the root `session` span for a local-docker foreground run from
+/// the host (see [`otel::emit_local_root_span`] for why the host owns
+/// it). gen_ai + transcript child spans nest under it by shared
+/// trace/span id. No-op when no OTLP traces endpoint is configured.
+pub(crate) fn emit_local_session_span(
+    session_id: &str,
+    start: std::time::SystemTime,
+    ok: bool,
+    reason: Option<&str>,
+) {
+    otel::emit_local_root_span(session_id, start, ok, reason);
+}
+
+/// Whether an OTLP traces endpoint is configured (either the signal-
+/// specific `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` or the base
+/// `OTEL_EXPORTER_OTLP_ENDPOINT`). The local-docker backend gates the
+/// host-side transcript tailer + root span on this so a plain run with
+/// no collector doesn't spawn a watcher thread for nothing.
+pub(crate) fn otlp_traces_configured() -> bool {
+    otel::resolve_signal_endpoint("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "v1/traces").is_some()
+}
+
 /// Filename under `<pillbox>/state_dir/`. Append-only JSONL.
 pub(crate) const EVENTS_FILE: &str = "events.jsonl";
 

@@ -50,22 +50,65 @@ pub(in crate::events) fn sink_emit(
         // record carry the terminal signal alone.
         return Ok(());
     };
+    emit_session_span(
+        session_id,
+        start_time,
+        otel_status_for(ty),
+        span_attributes(attrs),
+    );
+    Ok(())
+}
+
+/// Build + export one `session` span with the deterministic trace/span
+/// id derived from `session_id`, ending now. Shared by the sandbox-side
+/// terminal-event path ([`sink_emit`]) and the host-side local root
+/// ([`emit_local_root_span`]) so the span shape stays identical across
+/// emitters. No-op when the tracer is unconfigured.
+///
+/// The SDK's simple span processor exports on `.end()`, so building +
+/// dropping the span here triggers the export inline (matches the log
+/// sink's sync emit model).
+fn emit_session_span(session_id: &str, start: SystemTime, status: Status, attrs: Vec<KeyValue>) {
     let Some(tracer) = tracer() else {
-        return Ok(());
+        return;
     };
     let span_builder = SpanBuilder::from_name("session")
         .with_trace_id(derive_trace_id(session_id))
         .with_span_id(derive_session_span_id(session_id))
-        .with_start_time(start_time)
+        .with_start_time(start)
         .with_end_time(SystemTime::now())
-        .with_status(otel_status_for(ty))
-        .with_attributes(span_attributes(attrs));
-    // SDK's simple span processor exports on `.end()`. Building +
-    // immediately dropping the span at scope exit triggers that
-    // export inline (matches our log sink's sync emit model).
+        .with_status(status)
+        .with_attributes(attrs);
     let mut span = tracer.build_with_context(span_builder, &OtelContext::new());
     span.end();
-    Ok(())
+}
+
+/// Emit a root `session` span from the HOST for a local-docker
+/// foreground run. The sandbox-only [`sink_emit`] path can't serve
+/// this case: foreground local runs have no wrapper, so no
+/// `PILLBOX_SESSION_STARTED_AT` and no `Emitter::Sandbox` terminal
+/// event. But the host owns this lifecycle directly — it knows the
+/// real start instant and the agent's exit status — so it emits the
+/// parent span itself. gen_ai spans (vault MITM) and transcript spans
+/// (host tailer) nest under it via the shared [`derive_trace_id`] /
+/// [`derive_session_span_id`], same as the remote path.
+///
+/// No-op when the tracer is unconfigured. `reason` annotates the
+/// error status on a non-zero exit.
+pub(in crate::events) fn emit_local_root_span(
+    session_id: &str,
+    start: SystemTime,
+    ok: bool,
+    reason: Option<&str>,
+) {
+    let status = if ok {
+        Status::Ok
+    } else {
+        Status::Error {
+            description: reason.unwrap_or("agent exited non-zero").to_string().into(),
+        }
+    };
+    emit_session_span(session_id, start, status, Vec::new());
 }
 
 pub(in crate::events) fn tracer() -> Option<&'static SdkTracer> {

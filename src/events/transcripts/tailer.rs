@@ -18,6 +18,7 @@
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -124,10 +125,25 @@ impl Tailer {
     /// the watcher is dropped by the runtime). Performs an initial
     /// pump first so existing content is drained before tailing.
     ///
-    /// Falls back to a polling tick (`debounce`) so a missed
-    /// notification — possible on macOS during very fast appends
-    /// where coalescing eats events — doesn't strand new lines.
+    /// The CLI `--follow` path runs until the process is signalled;
+    /// the in-process local tailer wants a clean stop when the agent
+    /// exits, so this delegates to [`Tailer::follow_until`] with a
+    /// flag that never trips.
     pub(crate) fn follow(&mut self) -> Result<usize> {
+        let never = AtomicBool::new(false);
+        self.follow_until(&never)
+    }
+
+    /// Like [`Tailer::follow`], but also returns once `stop` is set —
+    /// after a final [`Tailer::pump`] so the agent's last appended
+    /// lines aren't stranded. The in-process local-docker tailer flips
+    /// `stop` when the agent exits.
+    ///
+    /// Falls back to a polling tick so a missed notification —
+    /// possible on macOS during very fast appends where coalescing
+    /// eats events, or a stop signalled while we're blocked on
+    /// `recv` — doesn't strand new lines or wedge teardown.
+    pub(crate) fn follow_until(&mut self, stop: &AtomicBool) -> Result<usize> {
         use notify::{RecursiveMode, Watcher};
 
         let mut total = self.pump()?;
@@ -149,10 +165,17 @@ impl Tailer {
             .watch(&watch_dir, RecursiveMode::NonRecursive)
             .with_context(|| format!("watch {}", watch_dir.display()))?;
 
-        // Block on the channel; poll the file periodically as a
-        // safety net.
+        // Block on the channel; poll the file periodically both as a
+        // safety net for missed FS events and to bound how long a
+        // `stop` request waits (≤ one poll interval).
         let poll = Duration::from_millis(500);
         loop {
+            if stop.load(Ordering::Relaxed) {
+                // Final drain: catch anything the agent flushed between
+                // the last pump and exit.
+                total += self.pump()?;
+                break;
+            }
             match rx.recv_timeout(poll) {
                 Ok(Ok(_event)) => {
                     total += self.pump()?;

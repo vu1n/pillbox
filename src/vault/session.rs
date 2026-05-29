@@ -128,20 +128,33 @@ impl Drop for VaultSession {
 /// disk is strictly newer, i.e. an overlapping session already wrote a
 /// fresher token that this older session would otherwise clobber.
 fn is_at_least_as_fresh(real: &serde_json::Value, creds_path: &Path) -> bool {
-    let real_exp = real
-        .pointer("/claudeAiOauth/expiresAt")
-        .and_then(serde_json::Value::as_u64);
+    let real_exp = expires_at_ms(real);
     let disk_exp = fs::read(creds_path)
         .ok()
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .and_then(|v| {
-            v.pointer("/claudeAiOauth/expiresAt")
-                .and_then(serde_json::Value::as_u64)
-        });
+        .and_then(|v| expires_at_ms(&v));
     match (real_exp, disk_exp) {
         (Some(real_exp), Some(disk_exp)) => real_exp >= disk_exp,
         _ => true,
     }
+}
+
+/// Read `claudeAiOauth.expiresAt`, normalized to milliseconds. Creds
+/// files appear both seconds- and ms-encoded in the wild (Claude Code
+/// writes ms via `Date.now()`; hand-rolled files sometimes use seconds),
+/// so the two sides of a freshness comparison must be on the same scale
+/// or the `>=` inverts. Mirrors `refresh::is_expired`'s normalization.
+fn expires_at_ms(creds: &serde_json::Value) -> Option<u64> {
+    /// 1e11 ms ≈ year 5138 — anything smaller is certainly seconds.
+    const SECONDS_BOUNDARY_MS: u64 = 100_000_000_000;
+    let raw = creds
+        .pointer("/claudeAiOauth/expiresAt")
+        .and_then(serde_json::Value::as_u64)?;
+    Some(if raw < SECONDS_BOUNDARY_MS {
+        raw.saturating_mul(1000)
+    } else {
+        raw
+    })
 }
 
 impl VaultSession {
@@ -435,6 +448,20 @@ mod tests {
         // Equal or newer → persist.
         assert!(is_at_least_as_fresh(&real_with(2_000), &path));
         assert!(is_at_least_as_fresh(&real_with(3_000), &path));
+    }
+
+    #[test]
+    fn fresh_guard_normalizes_seconds_vs_ms_before_comparing() {
+        let dir = tempfile::tempdir().unwrap();
+        // Disk ms-encoded, registry seconds-encoded, SAME instant. Without
+        // normalization real(1.7e9) < disk(1.7e12) → wrongly blocks a
+        // legitimate write-back; with it both normalize to 1.7e12 → equal
+        // → persist.
+        let path = write_creds(dir.path(), Some(1_716_000_000_000)); // ms
+        let real_seconds = serde_json::json!({
+            "claudeAiOauth": { "expiresAt": 1_716_000_000_u64 } // seconds, same instant
+        });
+        assert!(is_at_least_as_fresh(&real_seconds, &path));
     }
 
     #[test]

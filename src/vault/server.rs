@@ -461,7 +461,7 @@ impl HttpHandler for VaultHandler {
         // collect error the body is unrecoverable, so forward empty and
         // let the upstream reject (the agent retries).
         let req = if is_chat {
-            let (parts, body) = req.into_parts();
+            let (mut parts, body) = req.into_parts();
             match body.collect().await {
                 Ok(collected) => {
                     let bytes = collected.to_bytes();
@@ -475,6 +475,11 @@ impl HttpHandler for VaultHandler {
                 }
                 Err(error) => {
                     eprintln!("pillbox: vault: failed to collect chat request body: {error}");
+                    // Drop the stale content-length: forwarding an empty body
+                    // while advertising the original N bytes makes the upstream
+                    // block waiting for bytes that never arrive. Without it the
+                    // upstream rejects fast and the agent retries.
+                    parts.headers.remove("content-length");
                     Request::from_parts(parts, Body::empty())
                 }
             }

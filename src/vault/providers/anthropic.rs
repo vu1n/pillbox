@@ -241,11 +241,12 @@ impl VaultProvider for AnthropicProvider {
     }
 
     /// Pull `messages` + `system` out of the Anthropic Messages request
-    /// body. Both are emitted verbatim (JSON-encoded) as OTel GenAI
-    /// conversation attributes — Anthropic's `messages` are already
-    /// `[{role, content}]` with content as a string or content-block
-    /// array, which the consumer's gen_ai adapter reads directly.
-    /// Best-effort: a non-JSON / message-less body yields `None`.
+    /// body, re-encoded as JSON for the OTel GenAI conversation
+    /// attributes. Anthropic's `messages` are `[{role, content}]` with
+    /// content as a string or content-block array — the value/shape is
+    /// preserved (object key *order* is normalized by serde, which
+    /// key-based gen_ai adapters don't care about). Best-effort: a
+    /// non-JSON / message-less body yields `None`.
     fn parse_chat_input(&self, body: &[u8]) -> Option<ChatInput> {
         let value: serde_json::Value = serde_json::from_slice(body).ok()?;
         let messages = value.get("messages").filter(|m| m.is_array())?;
@@ -379,15 +380,21 @@ async fn handle_oauth_request(
 /// We dispatch by which header is present. If neither carries one of
 /// ours, we pass through (lets unvaulted `--with` requests keep working).
 async fn handle_api_request(mut req: Request<Body>, server: &ServerInner) -> RequestOrResponse {
-    // Force identity encoding so the gen_ai response tap reads plaintext
-    // SSE. Anthropic gzips `/v1/messages` responses when the client sends
-    // `accept-encoding: gzip` (Claude Code does), which leaves the tap
-    // parsing compressed bytes — no usage, no output messages. Requesting
-    // identity is invisible to the agent (any client accepts uncompressed)
-    // and is the same trick the OAuth path already uses.
-    req.headers_mut().remove("accept-encoding");
-    req.headers_mut()
-        .insert("accept-encoding", HeaderValue::from_static("identity"));
+    // Force identity encoding ONLY on the generation endpoint, so the
+    // gen_ai response tap reads plaintext SSE. Anthropic gzips
+    // `/v1/messages` responses when the client sends `accept-encoding:
+    // gzip` (Claude Code does), which leaves the tap parsing compressed
+    // bytes — no usage, no output messages. Requesting identity is
+    // invisible to the agent (any client accepts uncompressed) and is the
+    // same trick the OAuth path uses. Gated to the chat endpoint so
+    // unrelated traffic (count_tokens, models, plain `--with` API-key
+    // calls the tap never inspects) keeps whatever compression it
+    // negotiated.
+    if req.method().as_str() == "POST" && req.uri().path().ends_with("/v1/messages") {
+        req.headers_mut().remove("accept-encoding");
+        req.headers_mut()
+            .insert("accept-encoding", HeaderValue::from_static("identity"));
+    }
 
     let has_x_api_key = req.headers().get(X_API_KEY_HEADER).is_some();
     if has_x_api_key {

@@ -215,19 +215,23 @@ pub(crate) trait VaultProvider: Send + Sync + 'static {
         pending: &mut Option<PendingFlow>,
     ) -> Response<Body>;
 
-    /// Whether this provider wants the request body captured for gen_ai
-    /// *conversation* telemetry — i.e. is `(method, path)` this
-    /// provider's chat endpoint? Default `false` so the proxy only
-    /// buffers bodies for providers that opt in (buffering is otherwise
-    /// avoided on the hot path). Anthropic returns true for
+    /// Whether `(method, path)` is this provider's chat/generation
+    /// endpoint. Gates two things: (1) capturing the request body for
+    /// gen_ai conversation telemetry, and (2) emitting a `gen_ai` span at
+    /// all — the proxy sees many non-generation calls to the same host
+    /// (telemetry batches, bootstrap, MCP registry, `count_tokens`), and
+    /// emitting a `chat` span for those mislabels them as LLM generations
+    /// with empty messages/usage. Default `false` (no span, no capture)
+    /// so a provider only produces gen_ai spans for endpoints it
+    /// recognizes as generations. Anthropic returns true for
     /// `POST /v1/messages`; Codex/OpenAI is a future drop-in (different
     /// endpoint + body shape) — see [`Self::parse_chat_input`].
-    fn captures_chat_input(&self, _method: &str, _path: &str) -> bool {
+    fn is_chat_request(&self, _method: &str, _path: &str) -> bool {
         false
     }
 
     /// Parse a captured chat-request body into OTel GenAI semconv
-    /// conversation content. Called only after [`Self::captures_chat_input`]
+    /// conversation content. Called only after [`Self::is_chat_request`]
     /// returned true. Default `None` (no-op for providers that don't opt
     /// in). The emitted attributes (`gen_ai.input.messages`,
     /// `gen_ai.system_instructions`) are provider-agnostic; only this

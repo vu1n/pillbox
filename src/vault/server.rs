@@ -396,9 +396,17 @@ struct InFlightCall {
     /// via the registry; if the lookup fails (legitimate `--with`'d
     /// real key, no header at all) the span is skipped.
     auth_stub: Option<String>,
-    /// Conversation captured from the chat request body (when the
-    /// provider opts in via `captures_chat_input`): `gen_ai.input.messages`
-    /// + `gen_ai.system_instructions` JSON. `None` for non-chat requests.
+    /// Whether this request is the provider's chat/generation endpoint
+    /// (`is_chat_request`). Gates BOTH input capture and gen_ai span
+    /// emission: the proxy sees many non-generation calls to the same
+    /// host (telemetry batches, bootstrap, MCP registry, count_tokens),
+    /// and emitting a `chat` span for those mislabels them as LLM
+    /// generations with empty messages/usage. We only emit for real
+    /// generations.
+    is_chat: bool,
+    /// Conversation captured from the chat request body (when `is_chat`):
+    /// `gen_ai.input.messages` + `gen_ai.system_instructions` JSON.
+    /// `None` for non-chat requests.
     input_messages: Option<String>,
     system_instructions: Option<String>,
 }
@@ -432,13 +440,14 @@ impl HttpHandler for VaultHandler {
         // one connection) overwrites this slot before our response lands.
         let method = req.method().as_str().to_string();
         let path = req.uri().path().to_string();
-        let captures = provider.captures_chat_input(&method, &path);
+        let is_chat = provider.is_chat_request(&method, &path);
         self.in_flight = Some(InFlightCall {
             start: SystemTime::now(),
             host,
             method,
             path,
             auth_stub: extract_inbound_stub(&req),
+            is_chat,
             input_messages: None,
             system_instructions: None,
         });
@@ -451,7 +460,7 @@ impl HttpHandler for VaultHandler {
         // after the await) to keep the envelope's pairing tight. On a
         // collect error the body is unrecoverable, so forward empty and
         // let the upstream reject (the agent retries).
-        let req = if captures {
+        let req = if is_chat {
             let (parts, body) = req.into_parts();
             match body.collect().await {
                 Ok(collected) => {
@@ -517,14 +526,21 @@ impl VaultHandler {
     /// Wrap the response body in a [`TappedBody`] so SSE usage events
     /// flowing to the guest are also parsed into a [`GenAiCallSpan`].
     /// The span fires when the wrapped body ends (natural completion
-    /// or consumer drop). Returns the response unchanged when the
-    /// captured auth stub doesn't resolve to a sandbox (legitimate
-    /// `--with`'d real key, missing header, lease already dropped) —
-    /// we don't emit anonymous spans we can't attribute.
+    /// or consumer drop). Returns the response unchanged when:
+    ///  - the request wasn't the provider's chat/generation endpoint
+    ///    (`is_chat`) — the proxy sees many non-generation calls to the
+    ///    same host and emitting a `chat` gen_ai span for those mislabels
+    ///    them as LLM generations with empty messages/usage; or
+    ///  - the captured auth stub doesn't resolve to a sandbox (legitimate
+    ///    `--with`'d real key, missing header, lease already dropped) —
+    ///    we don't emit anonymous spans we can't attribute.
     fn wrap_for_telemetry(&mut self, res: Response<Body>) -> Response<Body> {
         let Some(call) = self.in_flight.take() else {
             return res;
         };
+        if !call.is_chat {
+            return res;
+        }
         let Some(sandbox_id) = call.auth_stub.as_deref().and_then(|stub| {
             self.server
                 .registry_lock()

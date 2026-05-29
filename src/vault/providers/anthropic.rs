@@ -230,10 +230,13 @@ impl VaultProvider for AnthropicProvider {
         Response::from_parts(parts, Body::from(new_body))
     }
 
-    /// Anthropic's chat endpoint is `POST /v1/messages` (on both
+    /// Anthropic's generation endpoint is `POST /v1/messages` (on both
     /// `api.anthropic.com` and the platform host the handler already
-    /// matched). The request body carries the full conversation.
-    fn captures_chat_input(&self, method: &str, path: &str) -> bool {
+    /// matched). `ends_with` matches the streaming + non-streaming
+    /// generation calls and excludes `…/v1/messages/count_tokens` and
+    /// `…/batches`, which aren't generations. The request body carries
+    /// the full conversation.
+    fn is_chat_request(&self, method: &str, path: &str) -> bool {
         method == "POST" && path.ends_with("/v1/messages")
     }
 

@@ -2830,6 +2830,7 @@ dependencies = [
  "time",
  "tokio",
  "toml",
+ "tracing-subscriber",
  "uuid",
  "vt100",
 ]

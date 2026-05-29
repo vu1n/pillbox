@@ -22,9 +22,23 @@ toml = "0.8"
 # Credential vault — MITM HTTPS proxy that swaps stub creds for real
 # ones at the host boundary. Anthropic + codex providers as of v0.5.
 # See src/vault/.
-hudsucker = { version = "0.24", default-features = true, features = ["http2"] }
+# NOTE: deliberately NOT enabling the `http2` feature. With it on, the
+# MITM's server-side TLS advertises `h2` in ALPN; an agent whose client
+# speaks HTTP/2 (codex) then negotiates h2 to the proxy, and a WebSocket
+# upgrade — HTTP/1.1-only; hyper_tungstenite has no RFC 8441 (WS-over-h2)
+# — can no longer happen, so codex's WS dies and it falls back to HTTPS.
+# Pinning the proxy to HTTP/1.1 makes the vault WebSocket-capable for any
+# agent. Anthropic/OpenAI + SSE all work over 1.1; the lost h2
+# multiplexing is irrelevant for a single agent's traffic.
+hudsucker = { version = "0.24", default-features = true }
 async-trait = "0.1"
 rcgen = "0.14"
+# Opt-in debug logging for the vault proxy. hudsucker emits its internal
+# errors (TLS, WebSocket upgrade/relay) via `tracing`; with no subscriber
+# they're dropped. `PILLBOX_VAULT_TRACE=<file>` installs an fmt subscriber
+# that writes them to a file (a file, not stderr, so an attached agent's
+# raw-mode TUI isn't corrupted). Already in the tree transitively.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "sync", "time"] }
 http-body-util = "0.1"
 time = "0.3"

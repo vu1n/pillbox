@@ -415,7 +415,7 @@ impl HttpHandler for VaultHandler {
     async fn handle_request(
         &mut self,
         _ctx: &HttpContext,
-        req: Request<Body>,
+        mut req: Request<Body>,
     ) -> RequestOrResponse {
         let Some(host) = host_from_uri(&req) else {
             return req.into();
@@ -424,6 +424,19 @@ impl HttpHandler for VaultHandler {
             Some(p) => Arc::clone(p),
             None => return req.into(),
         };
+
+        // Refuse permessage-deflate on any WebSocket we intercept. The
+        // MITM terminates and *re-frames* the WS (separate tungstenite
+        // handshakes client↔proxy and proxy↔upstream), and this relay
+        // path has no deflate support — so if we forwarded the client's
+        // `Sec-WebSocket-Extensions: permessage-deflate` upstream, the
+        // server would send RSV1-compressed frames the relay can't
+        // decode ("Reserved bits are non-zero") and the socket dies.
+        // Dropping the header negotiates an uncompressed WS on both hops.
+        // Harmless on non-upgrade requests (header simply absent). This
+        // is what makes codex's WebSocket transport work through the
+        // vault instead of falling back to HTTPS.
+        req.headers_mut().remove("sec-websocket-extensions");
 
         // Capture the in-flight shape BEFORE the provider rewrites the
         // Authorization header — we need the *stub* value to resolve

@@ -401,12 +401,41 @@ enum Command {
 }
 
 fn main() -> ExitCode {
+    init_vault_trace();
     let cli = Cli::parse();
     let result = run(cli);
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => errors::report(&e),
     }
+}
+
+/// Install a file-backed `tracing` subscriber when `PILLBOX_VAULT_TRACE`
+/// names a path, so hudsucker's internal proxy errors (TLS / WebSocket)
+/// become visible for debugging. Writes to a file rather than stderr so
+/// an attached agent's raw-mode terminal isn't corrupted. Filter comes
+/// from `RUST_LOG`, defaulting to everything hudsucker + pillbox emit at
+/// debug. No-op (and zero overhead) when the var is unset.
+fn init_vault_trace() {
+    let Ok(path) = std::env::var("PILLBOX_VAULT_TRACE") else {
+        return;
+    };
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        eprintln!("pillbox: warning: could not open PILLBOX_VAULT_TRACE file `{path}`");
+        return;
+    };
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("hudsucker=debug,pillbox=debug"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(move || file.try_clone().expect("clone trace file"))
+        .with_ansi(false)
+        .try_init();
 }
 
 fn run(cli: Cli) -> Result<()> {

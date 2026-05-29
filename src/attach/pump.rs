@@ -137,42 +137,101 @@ where
 /// stdin -> Input frames. When `detach_enabled`, `Ctrl-A D` detaches and
 /// `Ctrl-A Ctrl-A` sends a literal Ctrl-A; returns true on detach. When
 /// disabled, every byte (including Ctrl-A) passes straight through.
+///
+/// Reads a buffer at a time (not byte-at-a-time) and coalesces each read
+/// into as few frames as possible — see [`fold_input`] for why that
+/// matters for multi-byte sequences.
 fn pump_stdin<W: Write + Send + 'static>(
     writer: &Arc<Mutex<W>>,
     done: &Arc<AtomicBool>,
     detach_enabled: bool,
 ) -> bool {
     let mut inp = stdin();
-    let mut byte = [0u8; 1];
+    let mut buf = [0u8; 4096];
     let mut pending_ctrl_a = false;
     while !done.load(Ordering::SeqCst) {
-        match inp.read(&mut byte) {
+        match inp.read(&mut buf) {
             Ok(0) | Err(_) => return false,
-            Ok(_) => {
-                let b = byte[0];
-                if !detach_enabled {
-                    send(writer, Frame::Input(vec![b]));
-                    continue;
+            Ok(n) => {
+                let batch = fold_input(&buf[..n], &mut pending_ctrl_a, detach_enabled);
+                for frame in batch.frames {
+                    send(writer, frame);
                 }
-                if pending_ctrl_a {
-                    pending_ctrl_a = false;
-                    match b {
-                        b'd' | b'D' => {
-                            send(writer, Frame::Signal("detach".into()));
-                            return true;
-                        }
-                        CTRL_A => send(writer, Frame::Input(vec![CTRL_A])),
-                        other => send(writer, Frame::Input(vec![CTRL_A, other])),
-                    }
-                } else if b == CTRL_A {
-                    pending_ctrl_a = true;
-                } else {
-                    send(writer, Frame::Input(vec![b]));
+                if batch.detached {
+                    return true;
                 }
             }
         }
     }
     false
+}
+
+/// Frames produced from one stdin read, plus whether a detach was triggered.
+struct InputBatch {
+    frames: Vec<Frame>,
+    detached: bool,
+}
+
+/// Fold a stdin chunk into Input/Signal frames, keeping a read's bytes
+/// together in one `Input` frame wherever possible.
+///
+/// Why coalesce: a terminal delivers a *response* to an app's capability
+/// query (Device Attributes, cursor-position report, Kitty-keyboard,
+/// `OSC 11`) as a single escape sequence like `\x1b[?64;1;2c`. If those
+/// bytes reach the agent one frame — hence one PTY write — at a time, a
+/// crossterm-style parser (codex) sees a lone `\x1b`, times out waiting
+/// for the rest, decides it was a bare Escape key, and renders the tail
+/// (`[?64;1;2c`) as literal text. Forwarding the whole read as one frame
+/// keeps the sequence intact. Same win for pasted text and multi-byte
+/// UTF-8 keystrokes. `pending_ctrl_a` carries the Ctrl-A-prefix state
+/// across reads (a chunk can end mid-`Ctrl-A` `<key>`).
+fn fold_input(chunk: &[u8], pending_ctrl_a: &mut bool, detach_enabled: bool) -> InputBatch {
+    // No detach key to scan for — forward the read verbatim, intact.
+    if !detach_enabled {
+        return InputBatch {
+            frames: vec![Frame::Input(chunk.to_vec())],
+            detached: false,
+        };
+    }
+
+    let mut frames = Vec::new();
+    let mut out = Vec::with_capacity(chunk.len());
+    for &b in chunk {
+        if *pending_ctrl_a {
+            *pending_ctrl_a = false;
+            match b {
+                b'd' | b'D' => {
+                    // Flush bytes seen before the Ctrl-A D, then detach.
+                    if !out.is_empty() {
+                        frames.push(Frame::Input(std::mem::take(&mut out)));
+                    }
+                    frames.push(Frame::Signal("detach".into()));
+                    return InputBatch {
+                        frames,
+                        detached: true,
+                    };
+                }
+                // Ctrl-A Ctrl-A -> one literal Ctrl-A (readline start-of-line).
+                CTRL_A => out.push(CTRL_A),
+                // Ctrl-A <other> -> pass both through.
+                other => {
+                    out.push(CTRL_A);
+                    out.push(other);
+                }
+            }
+        } else if b == CTRL_A {
+            *pending_ctrl_a = true;
+        } else {
+            out.push(b);
+        }
+    }
+    if !out.is_empty() {
+        frames.push(Frame::Input(out));
+    }
+    InputBatch {
+        frames,
+        detached: false,
+    }
 }
 
 fn send<W: Write>(writer: &Arc<Mutex<W>>, frame: Frame) {
@@ -251,4 +310,69 @@ fn install_sigterm_detach(otx: mpsc::Sender<Outcome>) -> Option<SigtermGuard> {
         write_fd,
         reader: Some(reader),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fold(chunk: &[u8], detach: bool) -> InputBatch {
+        let mut pending = false;
+        fold_input(chunk, &mut pending, detach)
+    }
+
+    #[test]
+    fn escape_sequence_stays_in_one_frame() {
+        // A terminal's DA response must reach the agent as one write, not
+        // split into a lone ESC + literal tail (the codex random-chars bug).
+        let resp = b"\x1b[?64;1;2c";
+        let batch = fold(resp, true);
+        assert_eq!(batch.frames, vec![Frame::Input(resp.to_vec())]);
+        assert!(!batch.detached);
+    }
+
+    #[test]
+    fn detach_disabled_forwards_chunk_verbatim() {
+        // Foreground run: Ctrl-A passes straight through, whole read intact.
+        let chunk = b"\x01abc";
+        let batch = fold(chunk, false);
+        assert_eq!(batch.frames, vec![Frame::Input(chunk.to_vec())]);
+        assert!(!batch.detached);
+    }
+
+    #[test]
+    fn ctrl_a_d_detaches_and_flushes_preceding_bytes() {
+        let batch = fold(b"hi\x01d", true);
+        assert_eq!(
+            batch.frames,
+            vec![Frame::Input(b"hi".to_vec()), Frame::Signal("detach".into())]
+        );
+        assert!(batch.detached);
+    }
+
+    #[test]
+    fn ctrl_a_ctrl_a_is_one_literal_ctrl_a() {
+        let batch = fold(b"\x01\x01x", true);
+        assert_eq!(batch.frames, vec![Frame::Input(vec![CTRL_A, b'x'])]);
+        assert!(!batch.detached);
+    }
+
+    #[test]
+    fn ctrl_a_other_passes_both_through() {
+        let batch = fold(b"\x01z", true);
+        assert_eq!(batch.frames, vec![Frame::Input(vec![CTRL_A, b'z'])]);
+    }
+
+    #[test]
+    fn pending_ctrl_a_carries_across_reads() {
+        // A read ending in Ctrl-A, then the next read beginning with D,
+        // must still detach (state persists across chunks).
+        let mut pending = false;
+        let first = fold_input(b"ab\x01", &mut pending, true);
+        assert_eq!(first.frames, vec![Frame::Input(b"ab".to_vec())]);
+        assert!(pending);
+        let second = fold_input(b"d", &mut pending, true);
+        assert_eq!(second.frames, vec![Frame::Signal("detach".into())]);
+        assert!(second.detached);
+    }
 }

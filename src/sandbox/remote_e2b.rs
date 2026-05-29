@@ -671,12 +671,34 @@ pub(crate) fn ensure_helper_extracted() -> Result<PathBuf> {
     // invariant uniform so a future `chmod` audit doesn't surface a
     // stray 0755.
     ensure_mode_0700(&dir)?;
-    let path = dir.join(format!("e2b-helper-v{}.mjs", env!("CARGO_PKG_VERSION")));
+    // Content-address the cache file: the name carries a hash of the
+    // embedded script, so ANY edit to e2b-helper.mjs lands a new file
+    // and is picked up immediately. (Keying on CARGO_PKG_VERSION alone
+    // masked helper edits during a release cycle — the version rarely
+    // bumps mid-dev, and we only write when the file is absent.) Old
+    // hashes linger until a future cache cleanup; that's by design.
+    let path = dir.join(format!(
+        "e2b-helper-v{}-{:016x}.mjs",
+        env!("CARGO_PKG_VERSION"),
+        fnv1a(HELPER_SCRIPT.as_bytes())
+    ));
     if !path.exists() {
         std::fs::write(&path, HELPER_SCRIPT.as_bytes())
             .with_context(|| format!("write {}", path.display()))?;
     }
     Ok(path)
+}
+
+/// FNV-1a over `bytes` — a small, stable (build-independent) hash for
+/// content-addressing the cached helper file. Not cryptographic; just
+/// needs to change whenever the embedded script changes.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// Extract the helper *and* make its `e2b` import resolvable — the full

@@ -616,11 +616,41 @@ fn sh_quote(value: &str) -> String {
 ///
 /// `webhook` / `parent` are the host-env values (already filtered to
 /// non-empty); `None` drops the corresponding `export`.
+/// The OTLP env vars the events/otel layer reads, in spec-canonical
+/// form. Forwarded verbatim into the sandbox so the sandbox-side tailer
+/// streams to the same collector the host would. Only set + non-empty
+/// vars are carried (an unset var stays unset in the sandbox, so
+/// `otlp_traces_configured()` there matches the host's intent).
+const FORWARDED_OTEL_VARS: &[&str] = &[
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "OTEL_EXPORTER_OTLP_TIMEOUT",
+    "OTEL_SERVICE_NAME",
+];
+
+/// Read [`FORWARDED_OTEL_VARS`] off the host env. Kept out of
+/// [`build_wrapper`]/[`build_launch_line`] so those stay pure +
+/// unit-testable (mirrors how the webhook/parent are read at the call
+/// site).
+fn forwarded_otel_env() -> Vec<(String, String)> {
+    FORWARDED_OTEL_VARS
+        .iter()
+        .filter_map(|k| {
+            std::env::var(k)
+                .ok()
+                .filter(|v| !v.is_empty())
+                .map(|v| (k.to_string(), v))
+        })
+        .collect()
+}
+
 fn build_wrapper(
     remote: &RemoteSession,
     session_id: &str,
     webhook: Option<&str>,
     parent: Option<&str>,
+    otel: &[(String, String)],
 ) -> String {
     let id_q = sh_quote(session_id);
     let blob_q = sh_quote(&remote.blob);
@@ -634,11 +664,19 @@ fn build_wrapper(
         Some(id) => format!("export PILLBOX_PARENT_SESSION_ID={}; ", sh_quote(id)),
         None => String::new(),
     };
+    // Forward the operator's OTLP config so the sandbox-side tailer emits
+    // spans straight to their collector. Reachability of that collector
+    // from the sandbox is the operator's responsibility (it's a separate
+    // product) — we just carry the env across.
+    let otel_exports: String = otel
+        .iter()
+        .map(|(k, v)| format!("export {k}={}; ", sh_quote(v)))
+        .collect();
 
     format!(
         "export PILLBOX_SANDBOX_SIDE=1; \
          export PILLBOX_SESSION_STARTED_AT=\"$(date -u -Iseconds 2>/dev/null)\"; \
-         {webhook_export}{parent_export}\
+         {webhook_export}{parent_export}{otel_exports}\
          export PILLBOX_RESULT_SNAPSHOT_FILE={result_q}; \
          rm -f {result_q}; \
          {pillbox} session started {id_q}; \
@@ -672,8 +710,9 @@ fn build_launch_line(
     session_id: &str,
     webhook: Option<&str>,
     parent: Option<&str>,
+    otel: &[(String, String)],
 ) -> String {
-    let wrapper = build_wrapper(remote, session_id, webhook, parent);
+    let wrapper = build_wrapper(remote, session_id, webhook, parent, otel);
     format!(
         "setsid {pillbox} pty-host --sock {sock} -- \
          bash -lc {wrapper} \
@@ -741,7 +780,14 @@ fn launch_pty_host(
         .ok()
         .filter(|u| !u.is_empty());
     let parent = crate::events::parent_session_id_from_env();
-    let launch = build_launch_line(remote, session_id, webhook.as_deref(), parent.as_deref());
+    let otel = forwarded_otel_env();
+    let launch = build_launch_line(
+        remote,
+        session_id,
+        webhook.as_deref(),
+        parent.as_deref(),
+        &otel,
+    );
 
     let mut cmd = ssh_base(url);
     cmd.arg(launch);
@@ -1382,7 +1428,7 @@ pub(crate) fn dispatch_vault_stdin(resolved: &Pillbox, blob_file: Option<&Path>)
         "-v".into(),
         format!("{}:{guest_workspace}", workspace_host.display()),
         "-w".into(),
-        guest_workspace,
+        guest_workspace.clone(),
     ]);
     for (k, v) in &env {
         args.push("-e".into());
@@ -1399,6 +1445,24 @@ pub(crate) fn dispatch_vault_stdin(resolved: &Pillbox, blob_file: Option<&Path>)
     args.push(runner_image);
     args.extend(spec.run_argv.iter().map(|s| s.to_string()));
     args.extend(blob.agent_args.clone());
+
+    // Live observability, sandbox-side: the agent's transcript lands in
+    // this remote's bind-mounted $HOME (local to this process), so the
+    // tailer reads it and streams OTLP straight to the operator's
+    // collector — the OTEL env was forwarded by the wrapper. The agent
+    // runs in the nested container, but its transcript dir is keyed off
+    // the in-container cwd (`guest_workspace`). Held until the agent
+    // exits; dropped after `finalize_blob_run` for a final drain.
+    let _obs = blob.context.session_id.as_deref().and_then(|sid| {
+        crate::events::transcripts::spawn_session_observability(
+            sid,
+            spec.id,
+            &home,
+            &guest_workspace,
+            blob.vault || any_vaulted,
+            std::time::SystemTime::now(),
+        )
+    });
 
     let status = docker::run_interactive(&args)?;
     drop(vault_session);
@@ -1513,6 +1577,23 @@ pub(crate) fn dispatch_vault_stdin_direct(
     for (k, v) in &env {
         cmd.env(k, v);
     }
+    // Live observability, sandbox-side: the agent runs directly in this
+    // e2b sandbox (no nested docker), writing its transcript under our
+    // own $HOME. The tailer reads it and streams OTLP to the operator's
+    // collector (OTEL env forwarded by the e2b helper wrapper). The
+    // agent's cwd is `workspace_host`, which keys its transcript dir.
+    // Held until the agent exits; dropped after finalize for a final drain.
+    let _obs = blob.context.session_id.as_deref().and_then(|sid| {
+        crate::events::transcripts::spawn_session_observability(
+            sid,
+            spec.id,
+            &home_dir,
+            &workspace_host.to_string_lossy(),
+            blob.vault || any_vaulted,
+            std::time::SystemTime::now(),
+        )
+    });
+
     let status = cmd
         .status()
         .map_err(|e| PillboxError::runtime(action, format!("spawn `{}`: {e}", spec.id)))?;
@@ -1679,7 +1760,7 @@ mod tests {
         // The inner wrapper is what `bash -lc` evaluates — assert on its
         // (single-shell-level) text directly.
         let rs = RemoteSession::new("abcdef012345");
-        let w = build_wrapper(&rs, "abcdef012345", None, None);
+        let w = build_wrapper(&rs, "abcdef012345", None, None, &[]);
         // Pre-minted id is baked into BOTH bookends.
         assert!(w.contains("session started 'abcdef012345'"));
         assert!(w.contains("session done 'abcdef012345'"));
@@ -1707,7 +1788,7 @@ mod tests {
         // setsid. The wrapper is double-quoted (outer level) so its inner
         // single quotes don't appear verbatim here — only the structure.
         let rs = RemoteSession::new("abcdef012345");
-        let line = build_launch_line(&rs, "abcdef012345", None, None);
+        let line = build_launch_line(&rs, "abcdef012345", None, None, &[]);
         assert!(line.contains("setsid"));
         assert!(line.contains("pty-host --sock '/tmp/pillbox-attach-abcdef012345.sock'"));
         assert!(line.contains("-- bash -lc "));
@@ -1723,9 +1804,33 @@ mod tests {
             "0011aabbccdd",
             Some("https://hook.example/e"),
             Some("00112233"),
+            &[],
         );
         assert!(w.contains("export PILLBOX_EVENTS_WEBHOOK='https://hook.example/e'"));
         assert!(w.contains("export PILLBOX_PARENT_SESSION_ID='00112233'"));
+    }
+
+    #[test]
+    fn build_wrapper_forwards_otel_env() {
+        let rs = RemoteSession::new("0011aabbccdd");
+        let otel = vec![
+            (
+                "OTEL_EXPORTER_OTLP_ENDPOINT".to_string(),
+                "https://collector.example:4318".to_string(),
+            ),
+            (
+                "OTEL_EXPORTER_OTLP_HEADERS".to_string(),
+                "authorization=Bearer xyz".to_string(),
+            ),
+        ];
+        let w = build_wrapper(&rs, "0011aabbccdd", None, None, &otel);
+        assert!(w.contains("export OTEL_EXPORTER_OTLP_ENDPOINT='https://collector.example:4318'"));
+        // Header value (with `=` and a space) survives as one quoted token.
+        assert!(w.contains("export OTEL_EXPORTER_OTLP_HEADERS='authorization=Bearer xyz'"));
+        // OTEL exports precede the run, so the tailer the run spawns sees them.
+        let otel_pos = w.find("OTEL_EXPORTER_OTLP_ENDPOINT").unwrap();
+        let run_pos = w.find("run --vault-stdin").unwrap();
+        assert!(otel_pos < run_pos, "otel export must come before the run");
     }
 
     #[test]
@@ -1734,7 +1839,7 @@ mod tests {
         // `'` ever slipped through it must stay quoted inside the wrapper,
         // not break out into a second command.
         let rs = RemoteSession::new("0011aabbccdd");
-        let w = build_wrapper(&rs, "0011aabbccdd", Some("h'; rm -rf /; '"), None);
+        let w = build_wrapper(&rs, "0011aabbccdd", Some("h'; rm -rf /; '"), None, &[]);
         // The hostile quote is neutralized via the `'"'"'` idiom — the
         // literal `rm -rf /` is data, never a standalone command token.
         assert!(w.contains(r#"export PILLBOX_EVENTS_WEBHOOK='h'"'"'; rm -rf /; '"'"''"#));

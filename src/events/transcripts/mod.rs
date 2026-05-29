@@ -43,7 +43,7 @@ mod local;
 mod synth;
 mod tailer;
 
-pub(crate) use local::spawn_local_tailer;
+pub(crate) use local::spawn_session_observability;
 pub(crate) use tailer::Tailer;
 
 /// Which agent harness wrote the transcript. Drives which per-line

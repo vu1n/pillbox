@@ -270,47 +270,24 @@ impl SandboxBackend for LocalDocker {
         // follow-up, alongside the ssh remote-container reap.)
         let _container = ContainerGuard(container.clone());
 
-        // Open the root `session` span up-front: the parent that the
-        // gen_ai (vault MITM) + transcript (host tailer) children stitch
-        // under via the shared session-id-derived trace. Must precede the
-        // children — a collector names a run from the first span it sees,
-        // and a root emitted at exit also loses the export-vs-teardown
-        // race (see emit_local_root_span). No-op without a collector.
-        crate::events::emit_local_session_span(&session_id, run_started);
-
-        // Live transcript streaming: the agent's `$HOME` is bind-mounted
-        // from the host (above), so its `~/.claude/projects/<uuid>.jsonl`
-        // lands on a host path we can tail straight into the operator's
-        // collector — no sandbox egress hop. Gated on a configured OTLP
-        // traces endpoint so a plain run spawns no watcher thread. Agents
-        // without a transcript parser (opencode, pi) get session + gen_ai
-        // spans but no thread spans yet.
-        //
-        // The transcript is the conversation source for *every* harness
-        // (it's what Raindrop itself reads), so we always synthesize the
-        // whole-chat spans for Workshop's Overview. The vault MITM no
-        // longer captures conversation — only token usage off the wire,
-        // which is the more complete billing source (it counts sub-agent
-        // / retry / cancelled calls the transcript misses). So when the
-        // proxy is up for Claude (`--vault` or a vaulted `--with`), the
-        // synthesizer omits usage to avoid double-counting against the
-        // MITM; otherwise the transcript usage rides along.
+        // Open the root `session` span up-front + start live transcript
+        // streaming. The agent's `$HOME` is bind-mounted from the host
+        // (above), so its `~/.claude/projects/<uuid>.jsonl` lands on a
+        // host path the tailer reads straight into the operator's
+        // collector — no egress hop. The session span must precede the
+        // children (a collector names a run from the first span it sees).
+        // Shared with the remote backends, which run the same bootstrap
+        // sandbox-side. See spawn_session_observability for the
+        // include_usage / MITM-double-count reasoning.
         let proxy_active = opts.vault || any_vaulted;
-        let tailer = crate::events::otlp_traces_configured()
-            .then(|| crate::events::transcripts::Harness::for_agent(spec.id))
-            .flatten()
-            .map(|harness| {
-                let mitm_emits_usage =
-                    matches!(harness, crate::events::transcripts::Harness::Claude) && proxy_active;
-                let (watch_root, scope_dir) = harness.transcript_roots(&home, &guest_cwd);
-                crate::events::transcripts::spawn_local_tailer(
-                    watch_root,
-                    scope_dir,
-                    harness,
-                    session_id.clone(),
-                    !mitm_emits_usage,
-                )
-            });
+        let tailer = crate::events::transcripts::spawn_session_observability(
+            &session_id,
+            spec.id,
+            &home,
+            &guest_cwd,
+            proxy_active,
+            run_started,
+        );
 
         let outcome = attach_via_exec(&container, false);
         // The vault proxy must stay up for the whole attached session.

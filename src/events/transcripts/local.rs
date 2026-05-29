@@ -120,6 +120,48 @@ pub(crate) fn spawn_local_tailer(
     }
 }
 
+/// Open the run's root `session` span and, when a collector is
+/// configured and the agent has a transcript parser, spawn the live
+/// tailer — the shared observability bootstrap every backend runs once
+/// it's at the point where the agent's transcript will be local to the
+/// *current* process's filesystem (local-docker: bind-mounted host home;
+/// remote: the sandbox-side pillbox's own home). Returns the tailer
+/// handle (or `None` when there's nothing to tail) for the caller to
+/// shut down after the agent exits.
+///
+/// `home` + `guest_cwd` locate the transcript: `guest_cwd` is the
+/// directory the *agent* runs in (Claude encodes it into its project-dir
+/// name). `proxy_active` is whether the vault MITM is in front of this
+/// run — when it is and the harness is Claude, the MITM supplies
+/// wire-observed token usage, so the synthesizer omits transcript usage
+/// to avoid double-counting (`include_usage = !(claude && proxy_active)`).
+/// The session span is emitted unconditionally (a no-op without a
+/// collector) so it precedes any child spans.
+pub(crate) fn spawn_session_observability(
+    session_id: &str,
+    agent_id: &str,
+    home: &Path,
+    guest_cwd: &str,
+    proxy_active: bool,
+    run_started: std::time::SystemTime,
+) -> Option<LocalTailerHandle> {
+    crate::events::emit_local_session_span(session_id, run_started);
+    crate::events::otlp_traces_configured()
+        .then(|| Harness::for_agent(agent_id))
+        .flatten()
+        .map(|harness| {
+            let mitm_emits_usage = matches!(harness, Harness::Claude) && proxy_active;
+            let (watch_root, scope_dir) = harness.transcript_roots(home, guest_cwd);
+            spawn_local_tailer(
+                watch_root,
+                scope_dir,
+                harness,
+                session_id.to_string(),
+                !mitm_emits_usage,
+            )
+        })
+}
+
 /// All `*.jsonl` paths under `root` (recursive). Empty if `root`
 /// doesn't exist or can't be read — discovery tolerates a not-yet-
 /// created transcript dir.

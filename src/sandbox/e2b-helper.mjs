@@ -80,6 +80,17 @@ import { randomBytes } from "node:crypto";
 const PROTO_VERSION = 1;
 const SANDBOX_TIMEOUT_MS = 3_600_000;
 
+// OTLP env vars forwarded off our inherited host env into the sandbox
+// wrapper so the sandbox-side tailer streams spans to the operator's
+// collector. Keep in sync with FORWARDED_OTEL_VARS in remote_ssh.rs.
+const OTEL_FORWARD_VARS = [
+	"OTEL_EXPORTER_OTLP_ENDPOINT",
+	"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+	"OTEL_EXPORTER_OTLP_HEADERS",
+	"OTEL_EXPORTER_OTLP_TIMEOUT",
+	"OTEL_SERVICE_NAME",
+];
+
 // Control-byte marker printed by the relay launch line once the PTY is in
 // raw mode, just before `exec pillbox pty-relay`. The helper streams
 // everything AFTER this marker verbatim to stdout; everything before is
@@ -266,6 +277,14 @@ function buildWrapper(args, blobRemote, resultRemote) {
 	const parentExport = args.parentSessionId
 		? `export PILLBOX_PARENT_SESSION_ID=${shellEscape(args.parentSessionId)}; `
 		: "";
+	// Forward the operator's OTLP config off our inherited env so the
+	// sandbox-side tailer (spawned by `pillbox run --vault-stdin-direct`)
+	// emits spans straight to their collector. Keep this list in sync with
+	// FORWARDED_OTEL_VARS in src/sandbox/remote_ssh.rs. Reachability of the
+	// collector from the sandbox is the operator's responsibility.
+	const otelExport = OTEL_FORWARD_VARS.filter((k) => process.env[k])
+		.map((k) => `export ${k}=${shellEscape(process.env[k])}; `)
+		.join("");
 	return (
 		// PILLBOX_SANDBOX_SIDE flips emitter detection so events render with
 		// `emitter=sandbox`. See SANDBOX_SIDE_ENV docs in src/events/mod.rs.
@@ -277,6 +296,7 @@ function buildWrapper(args, blobRemote, resultRemote) {
 		`export PILLBOX_SESSION_STARTED_AT="$(date -u -Iseconds 2>/dev/null)"; ` +
 		`${webhookExport}` +
 		`${parentExport}` +
+		`${otelExport}` +
 		`export PILLBOX_RESULT_SNAPSHOT_FILE=${shellEscape(resultRemote)}; ` +
 		`rm -f ${shellEscape(resultRemote)}; ` +
 		`pillbox session started ${sessionIdEsc}; ` +

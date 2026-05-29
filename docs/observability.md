@@ -59,10 +59,12 @@ them is sandbox cold-start latency.
 
 ### OTLP shape
 
-- **Session spans:** sandbox-only, one per session, emitted at the
-  terminal event. `trace_id` derives deterministically from the session
-  id so host and sandbox views correlate without a lookup table. Span
-  status maps `completed → Ok`, `failed → Error(reason)`.
+- **Session spans:** one per run, opened up-front by whichever pillbox
+  launches the agent — **host-side** for local-docker, **sandbox-side**
+  for remotes — so the transcript / gen_ai children have a parent to
+  nest under from the first span (a collector names a run from the first
+  span it sees). `trace_id` derives deterministically from the session
+  id so host and sandbox views correlate without a lookup table.
 - **Transcript spans (drain-mode):** one OTLP child span per
   agent-native transcript event, emitted by
   `pillbox session transcript <FILE> --session-id <ID> [--agent claude|codex]`.
@@ -92,8 +94,28 @@ them is sandbox cold-start latency.
   agent harness appends new lines. Robust to partial-line writes
   (buffers the trailing fragment between FS events), file
   truncation (rewinds), and missing-file-at-start (idles until it
-  exists). The bind-mount + auto-launch path that wires this into
-  every sandbox automatically is the next layer.
+  exists).
+
+  **Auto-wired into every run.** You don't have to invoke
+  `session transcript` by hand — when an OTLP traces endpoint is
+  configured, every `pillbox run` spawns this tailer automatically
+  (alongside a whole-chat *conversation* synthesizer that feeds
+  Workshop's Overview). It runs wherever the agent's transcript is
+  local to the launching pillbox: **host-side** for local-docker (the
+  agent's `$HOME` is bind-mounted to a host path), and **sandbox-side**
+  for `e2b://` / `ssh://` remotes (the sandbox-resident pillbox tails
+  its own filesystem). For remote runs pillbox forwards the
+  `OTEL_EXPORTER_OTLP_*` + `OTEL_SERVICE_NAME` env into the sandbox so
+  the in-sandbox tailer exports directly.
+
+  > **Remote collector reachability is yours to arrange.** A remote
+  > sandbox emits OTLP *from inside the sandbox*, so the endpoint must
+  > be reachable *from there* — an e2b cloud sandbox or a VPS cannot
+  > see your laptop's `localhost:5899`. Point `OTEL_EXPORTER_OTLP_ENDPOINT`
+  > at a sandbox-reachable collector (a hosted/VPS Workshop, your team
+  > collector), or tunnel your local one (e.g. `ssh -R`, `ngrok`).
+  > Pillbox deliberately does not relay spans back through the host —
+  > the collector is a separate concern we keep out of pillbox's path.
 
 - **`gen_ai` spans:** host-side, one per intercepted LLM API call
   (when `--vault` is on). Emitted from the vault MITM proxy with OTel

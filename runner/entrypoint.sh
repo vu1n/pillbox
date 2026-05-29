@@ -26,7 +26,13 @@ set -e
 
 PILLBOX_CA=/usr/local/share/ca-certificates/pillbox-vault.crt
 if [ -r "$PILLBOX_CA" ]; then
-    update-ca-certificates >/dev/null 2>&1 || \
+    # `update-ca-certificates` lives in /usr/sbin, but pillbox sets a
+    # container-wide PATH for the agent that omits /usr/sbin — so the
+    # bare command resolved to "not found" and the CA install silently
+    # failed (codex then rejected the vault MITM cert with
+    # `UnknownIssuer`). Prepend the sbin dirs so it resolves regardless
+    # of the inherited PATH.
+    PATH="/usr/sbin:/sbin:$PATH" update-ca-certificates >/dev/null 2>&1 || \
         echo "pillbox: warning: update-ca-certificates failed; non-Node agents (Codex etc.) may reject the vault TLS cert" >&2
 fi
 

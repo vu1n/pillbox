@@ -270,6 +270,14 @@ impl SandboxBackend for LocalDocker {
         // follow-up, alongside the ssh remote-container reap.)
         let _container = ContainerGuard(container.clone());
 
+        // Open the root `session` span up-front: the parent that the
+        // gen_ai (vault MITM) + transcript (host tailer) children stitch
+        // under via the shared session-id-derived trace. Must precede the
+        // children — a collector names a run from the first span it sees,
+        // and a root emitted at exit also loses the export-vs-teardown
+        // race (see emit_local_root_span). No-op without a collector.
+        crate::events::emit_local_session_span(&session_id, run_started);
+
         // Live transcript streaming: the agent's `$HOME` is bind-mounted
         // from the host (above), so its `~/.claude/projects/<uuid>.jsonl`
         // lands on a host path we can tail straight into the operator's
@@ -293,26 +301,10 @@ impl SandboxBackend for LocalDocker {
         let outcome = attach_via_exec(&container, false);
         // The vault proxy must stay up for the whole attached session.
         drop(vault_session);
-        // Stop the tailer (final drain of the agent's last lines) before
-        // closing the root span so all children land inside its window.
+        // Stop the tailer with a final drain of the agent's last lines.
         if let Some(tailer) = tailer {
             tailer.shutdown();
         }
-
-        // Host-emitted root `session` span: the parent the gen_ai +
-        // transcript children stitch under. Status reflects the agent's
-        // real exit. No-op without a collector, so emitted unconditionally.
-        let (ok, reason): (bool, Option<String>) = match &outcome {
-            Ok(Outcome::Exited(0)) | Ok(Outcome::Detached) | Ok(Outcome::Disconnected) => {
-                (true, None)
-            }
-            Ok(Outcome::Exited(code)) => (
-                false,
-                Some(format!("{} exited with status {code}", spec.id)),
-            ),
-            Err(e) => (false, Some(format!("{e:#}"))),
-        };
-        crate::events::emit_local_session_span(&session_id, run_started, ok, reason.as_deref());
 
         match outcome? {
             Outcome::Exited(0) | Outcome::Detached | Outcome::Disconnected => Ok(()),

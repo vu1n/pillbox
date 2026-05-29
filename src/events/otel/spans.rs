@@ -1,12 +1,16 @@
-//! OTLP spans sink — sandbox-only, one span per session, built
-//! atomically at the terminal event and exported via OTLP/HTTP.
+//! OTLP spans sink — one `session` span per session, exported via
+//! OTLP/HTTP. Two emitters:
 //!
-//! The host emits `session.dropped` after the sandbox is gone — the
-//! sandbox's terminal event already closed the span, so the host
-//! never produces duplicate spans here. Emission is also gated on
-//! `PILLBOX_SESSION_STARTED_AT` being set by the wrapper so the
-//! span has real duration; without it the log record still ships,
-//! the span doesn't.
+//! - **Sandbox terminal event** ([`sink_emit`]): the remote/sandbox
+//!   path builds the span at the terminal event with the real exit
+//!   status. Gated on `PILLBOX_SESSION_STARTED_AT` (set by the
+//!   wrapper) so it has real duration; without it the log record
+//!   still ships, the span doesn't. The host's later `session.dropped`
+//!   is not a duplicate — the sandbox already closed the span.
+//! - **Host root, up-front** ([`emit_local_root_span`]): local-docker
+//!   foreground runs have no wrapper, so the host opens the root span
+//!   itself at session start (Unset status) — see that fn for why
+//!   up-front rather than at exit.
 
 use std::{collections::HashMap, sync::OnceLock, time::SystemTime};
 
@@ -83,32 +87,28 @@ fn emit_session_span(session_id: &str, start: SystemTime, status: Status, attrs:
     span.end();
 }
 
-/// Emit a root `session` span from the HOST for a local-docker
-/// foreground run. The sandbox-only [`sink_emit`] path can't serve
-/// this case: foreground local runs have no wrapper, so no
-/// `PILLBOX_SESSION_STARTED_AT` and no `Emitter::Sandbox` terminal
-/// event. But the host owns this lifecycle directly — it knows the
-/// real start instant and the agent's exit status — so it emits the
-/// parent span itself. gen_ai spans (vault MITM) and transcript spans
+/// Emit the root `session` span from the HOST for a local-docker
+/// foreground run, at session *start*. The sandbox-only [`sink_emit`]
+/// path can't serve this case: foreground local runs have no wrapper,
+/// so no `PILLBOX_SESSION_STARTED_AT` and no `Emitter::Sandbox`
+/// terminal event. The host owns this lifecycle directly, so it emits
+/// the parent itself; gen_ai spans (vault MITM) and transcript spans
 /// (host tailer) nest under it via the shared [`derive_trace_id`] /
-/// [`derive_session_span_id`], same as the remote path.
+/// [`derive_session_span_id`].
 ///
-/// No-op when the tracer is unconfigured. `reason` annotates the
-/// error status on a non-zero exit.
-pub(in crate::events) fn emit_local_root_span(
-    session_id: &str,
-    start: SystemTime,
-    ok: bool,
-    reason: Option<&str>,
-) {
-    let status = if ok {
-        Status::Ok
-    } else {
-        Status::Error {
-            description: reason.unwrap_or("agent exited non-zero").to_string().into(),
-        }
-    };
-    emit_session_span(session_id, start, status, Vec::new());
+/// Emitted up-front, not at exit, for two reasons: a collector creates
+/// its run/trace from the *first* span it sees, so the root must arrive
+/// before the children to name the run `session` and anchor it; and a
+/// span emitted in the last instant before process teardown is the one
+/// most exposed to the export-vs-exit race. Status is therefore
+/// `Unset` (the run is still open) — run-level success/failure surfaces
+/// via the child spans and the `session.*` log records, and collectors
+/// derive run duration from the child span extent, so this marker's
+/// near-zero own-duration doesn't distort it.
+///
+/// No-op when the tracer is unconfigured.
+pub(in crate::events) fn emit_local_root_span(session_id: &str, start: SystemTime) {
+    emit_session_span(session_id, start, Status::Unset, Vec::new());
 }
 
 pub(in crate::events) fn tracer() -> Option<&'static SdkTracer> {
@@ -198,8 +198,6 @@ fn span_attributes(attrs: &[(&'static str, Option<AttrValue>)]) -> Vec<KeyValue>
 
 /// Deterministically pack a session id into an OTel 128-bit trace id
 /// so events for the same session correlate without a lookup table.
-/// Hyphens are stripped; the remaining hex (or hash fallback for
-/// non-hex shapes) is right-aligned into the 32-hex trace id.
 ///
 /// Used by both the session span (its trace anchor) and by gen_ai
 /// spans emitted from the vault MITM — they share the trace via this
@@ -217,47 +215,34 @@ pub(in crate::events) fn derive_session_span_id(session_id: &str) -> SpanId {
     SpanId::from_bytes(pack_id_bytes::<8>(session_id))
 }
 
-/// Right-align the hex characters of `id` into `N` bytes. For the
-/// 12-char hex shape `Session::new_id` mints today, the result is
-/// just the parsed value padded with leading zeros. For ids that
-/// somehow contain non-hex characters (forward-compat per
-/// `validate_session_id`), we fold them via a tiny FNV-1a so the
-/// result is still deterministic across processes — required for
-/// host-side ↔ sandbox-side span_id correlation on the same session.
+/// Fold a session id into `N` well-distributed, non-zero bytes via
+/// FNV-1a (with a per-width domain separator so the trace id and span
+/// id derived from the same session don't share a suffix). Pure and
+/// deterministic, so host, sandbox, and the host-side transcript
+/// thread all derive identical ids for the same session — that's what
+/// stitches gen_ai + transcript spans under the session span.
+///
+/// Why hash rather than embed the hex: `Session::new_id` mints a short
+/// 12-hex id (6 bytes). Right-aligning that into a 16-byte trace id
+/// left the leading bytes zero, and collectors that key/label runs on
+/// the *leading* hex (Raindrop Workshop shows `00000000…`) then render
+/// every pillbox run as the same indistinguishable trace. Spreading the
+/// entropy across all bytes gives each session a distinct, real-looking
+/// id. Hyphens are stripped first (the only non-alphanumeric char
+/// `validate_session_id` allows); the value is otherwise opaque.
 fn pack_id_bytes<const N: usize>(id: &str) -> [u8; N] {
-    let mut out = [0u8; N];
-    // Strip hyphens; everything else passes `validate_session_id`'s
-    // alphanumeric gate.
-    let cleaned: String = id.chars().filter(|c| *c != '-').collect();
-    if cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
-        // Hex fast path: parse the cleaned id as a big-endian integer
-        // and right-align into the output buffer.
-        let want = N * 2;
-        let padded = if cleaned.len() >= want {
-            cleaned[cleaned.len() - want..].to_string()
-        } else {
-            format!("{cleaned:0>want$}")
-        };
-        for (i, chunk) in padded.as_bytes().chunks_exact(2).enumerate() {
-            // Each chunk is two ASCII hex digits; the parse only fails
-            // on non-hex input which we already gated against above.
-            out[i] =
-                u8::from_str_radix(std::str::from_utf8(chunk).unwrap_or("00"), 16).unwrap_or(0);
-        }
-        return out;
-    }
-    // Non-hex fallback: FNV-1a fold. Produces a stable mapping for
-    // arbitrary alphanumeric session ids without pulling in a hash
-    // crate; collision probability is high enough at 64/128 bits to
-    // be acceptable for the "this shouldn't happen in practice" path.
-    let mut hash: u128 = 0xcbf29ce484222325;
-    for b in cleaned.bytes() {
+    // FNV-1a 128-bit. Seed the offset basis with N so a 16-byte trace
+    // id and an 8-byte span id from the same session aren't prefixes of
+    // each other.
+    let mut hash: u128 = 0xcbf29ce484222325 ^ (N as u128);
+    for b in id.bytes().filter(|b| *b != b'-') {
         hash ^= b as u128;
         hash = hash.wrapping_mul(0x100000001b3);
     }
     let bytes = hash.to_be_bytes();
+    let mut out = [0u8; N];
     let take = N.min(16);
-    out[N - take..].copy_from_slice(&bytes[16 - take..]);
+    out[..take].copy_from_slice(&bytes[..take]);
     out
 }
 

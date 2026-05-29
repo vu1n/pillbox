@@ -101,16 +101,12 @@ pub(crate) use otel::genai::{
 };
 
 /// Emit the root `session` span for a local-docker foreground run from
-/// the host (see [`otel::emit_local_root_span`] for why the host owns
-/// it). gen_ai + transcript child spans nest under it by shared
-/// trace/span id. No-op when no OTLP traces endpoint is configured.
-pub(crate) fn emit_local_session_span(
-    session_id: &str,
-    start: std::time::SystemTime,
-    ok: bool,
-    reason: Option<&str>,
-) {
-    otel::emit_local_root_span(session_id, start, ok, reason);
+/// the host, at session start (see [`otel::emit_local_root_span`] for
+/// why up-front and why the host owns it). gen_ai + transcript child
+/// spans nest under it by shared trace/span id. No-op when no OTLP
+/// traces endpoint is configured.
+pub(crate) fn emit_local_session_span(session_id: &str, start: std::time::SystemTime) {
+    otel::emit_local_root_span(session_id, start);
 }
 
 /// Whether an OTLP traces endpoint is configured (either the signal-

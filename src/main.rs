@@ -675,6 +675,14 @@ fn dispatch_run(resolved: &Pillbox, agent: Option<String>, mut opts: RunOpts) ->
         None => None,
     };
 
+    // Local runs only: nudge if Raindrop Workshop is installed but no
+    // OTLP endpoint is set, so a silent "no events" doesn't surprise the
+    // user. Remote sandboxes can't reach Workshop's localhost endpoint
+    // anyway, so the hint would mislead there.
+    if remote_record.is_none() {
+        crate::events::hint_workshop_if_unconfigured();
+    }
+
     let backend = crate::sandbox::select_backend(remote_record);
     backend.run(spec, opts, resolved)
 }

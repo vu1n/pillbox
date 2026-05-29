@@ -118,6 +118,38 @@ pub(crate) fn otlp_traces_configured() -> bool {
     otel::resolve_signal_endpoint("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "v1/traces").is_some()
 }
 
+/// Default OTLP/HTTP port the Raindrop Workshop daemon listens on.
+const WORKSHOP_ENDPOINT: &str = "http://localhost:5899";
+
+/// One-line stderr nudge when a Raindrop Workshop install is present but
+/// no OTLP endpoint is configured — otherwise a local `pillbox run`
+/// silently streams nothing and the user is left wondering why Workshop
+/// is empty.
+///
+/// Detection is a filesystem `stat` of `~/.raindrop` (the installer's
+/// data dir), deliberately NOT a TCP probe of the daemon port: a probe
+/// risks adding startup latency or hanging when nothing is listening,
+/// whereas a `stat` is instant and costs nothing for users who never
+/// installed Raindrop. The hint self-resolves the moment `OTEL_*` is
+/// set. Caller restricts this to local runs (Workshop's `localhost`
+/// endpoint isn't reachable from a remote sandbox).
+pub(crate) fn hint_workshop_if_unconfigured() {
+    if otlp_traces_configured() {
+        return;
+    }
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    if !std::path::Path::new(&home).join(".raindrop").is_dir() {
+        return;
+    }
+    eprintln!(
+        "pillbox: note: Raindrop Workshop is installed but telemetry is off — \
+         this run streams nothing.\n         \
+         Set OTEL_EXPORTER_OTLP_ENDPOINT={WORKSHOP_ENDPOINT} to stream it live."
+    );
+}
+
 /// Filename under `<pillbox>/state_dir/`. Append-only JSONL.
 pub(crate) const EVENTS_FILE: &str = "events.jsonl";
 

@@ -29,7 +29,7 @@
 
 use std::time::SystemTime;
 
-use super::{EventKind, TranscriptEvent};
+use super::{EventKind, Harness, TranscriptEvent};
 use crate::events::{emit_genai_call_span, GenAiCallSpan, GenAiUsage};
 
 struct Msg {
@@ -41,6 +41,14 @@ struct Msg {
 /// one whole-chat gen_ai span per completed assistant turn.
 pub(super) struct ChatSynthesizer {
     session_id: String,
+    harness: Harness,
+    /// Whether to attach token usage (from the transcript) to the
+    /// synthesized spans. `false` when the vault MITM already emits
+    /// wire-observed usage for this run (Claude + proxy) — the wire is
+    /// the more complete billing source (it counts sub-agent / retry
+    /// calls the transcript misses), so we leave usage to it and keep
+    /// the synthesized spans to conversation only, avoiding double counts.
+    include_usage: bool,
     history: Vec<Msg>,
     pending: Option<Pending>,
 }
@@ -53,9 +61,11 @@ struct Pending {
 }
 
 impl ChatSynthesizer {
-    pub(super) fn new(session_id: String) -> Self {
+    pub(super) fn new(session_id: String, harness: Harness, include_usage: bool) -> Self {
         Self {
             session_id,
+            harness,
+            include_usage,
             history: Vec::new(),
             pending: None,
         }
@@ -72,34 +82,80 @@ impl ChatSynthesizer {
                 });
             }
             EventKind::AssistantText {
-                text, model, usage, ..
-            } => match &mut self.pending {
-                // Multiple content blocks in one assistant message arrive
-                // as separate events — concatenate them into one reply.
-                Some(p) => {
-                    if !p.text.is_empty() && !text.is_empty() {
-                        p.text.push('\n');
+                text,
+                model,
+                usage,
+                stop_reason,
+            } => {
+                match &mut self.pending {
+                    // The assistant's text for one user turn can span
+                    // multiple messages (text → tool_use → text …);
+                    // those arrive as separate events with tool events
+                    // (ignored here) between them, and the non-terminal
+                    // ones (stop_reason `tool_use`) don't flush — so they
+                    // accumulate into one reply. (Edge case: two text
+                    // blocks in a *single* terminal message emit as two
+                    // spans, since the first flushes on its terminal
+                    // stop_reason before the second is seen. No text is
+                    // lost; eager flush and cross-block merge are in
+                    // tension — see `turn_ended`. Claude Code emits one
+                    // text block per message in practice.)
+                    Some(p) => {
+                        if !p.text.is_empty() && !text.is_empty() {
+                            p.text.push('\n');
+                        }
+                        p.text.push_str(text);
+                        if usage.is_some() {
+                            p.usage = usage.clone();
+                        }
+                        if model.is_some() {
+                            p.model = model.clone();
+                        }
+                        p.ts = event.timestamp;
                     }
-                    p.text.push_str(text);
-                    if usage.is_some() {
-                        p.usage = usage.clone();
+                    None => {
+                        self.pending = Some(Pending {
+                            text: text.clone(),
+                            model: model.clone(),
+                            usage: usage.clone(),
+                            ts: event.timestamp,
+                        });
                     }
-                    if model.is_some() {
-                        p.model = model.clone();
-                    }
-                    p.ts = event.timestamp;
                 }
-                None => {
-                    self.pending = Some(Pending {
-                        text: text.clone(),
-                        model: model.clone(),
-                        usage: usage.clone(),
-                        ts: event.timestamp,
-                    });
+                // Flush as soon as the assistant yields the turn back to
+                // the user, rather than waiting for the next prompt —
+                // otherwise the most recent reply never reaches Overview
+                // until another prompt (or session end) arrives, so a
+                // quick "say hi" / "say bye" looks like the second turn
+                // was dropped. An end-of-turn message can't be followed
+                // by more tool calls in the same turn, so it's safe to
+                // emit here.
+                if self.turn_ended(stop_reason.as_deref()) {
+                    self.flush();
                 }
-            },
+            }
             // tool_use / tool_result / thinking stay in the Span Tree.
             _ => {}
+        }
+    }
+
+    /// Whether the just-seen assistant message handed the turn back to
+    /// the user (so the pending reply is complete and can be emitted now).
+    ///
+    /// - Claude carries a message-level `stop_reason`: `tool_use` means
+    ///   the turn continues (a tool call follows); any other terminal
+    ///   reason (`end_turn`, `stop_sequence`, `max_tokens`) ends it. A
+    ///   missing reason is treated as "not yet" — we wait for the next
+    ///   prompt rather than risk splitting a turn.
+    /// - Codex's rollout has no per-message stop_reason, but each
+    ///   assistant `message` item *is* a completed Responses-API output,
+    ///   so every one ends a (sub-)turn. Worst case a tool-using turn
+    ///   emits one span per assistant message — still valid whole-chat
+    ///   spans with growing history.
+    fn turn_ended(&self, stop_reason: Option<&str>) -> bool {
+        match self.harness {
+            Harness::Claude => stop_reason.is_some_and(|r| r != "tool_use"),
+            Harness::Codex => true,
         }
     }
 
@@ -116,7 +172,14 @@ impl ChatSynthesizer {
             return;
         };
         let input_messages = messages_json(&self.history);
-        let mut usage = p.usage.unwrap_or_default();
+        // Conversation content (messages + model) always rides along; the
+        // token counts only when the wire MITM isn't already supplying
+        // them for this run (see `include_usage`).
+        let mut usage = if self.include_usage {
+            p.usage.unwrap_or_default()
+        } else {
+            GenAiUsage::default()
+        };
         usage.output_messages = Some(assistant_output_json(&p.text));
         if usage.response_model.is_none() {
             usage.response_model = p.model.clone();
@@ -172,6 +235,9 @@ mod tests {
         }
     }
     fn assistant(t: &str) -> TranscriptEvent {
+        assistant_with(t, None)
+    }
+    fn assistant_with(t: &str, stop_reason: Option<&str>) -> TranscriptEvent {
         TranscriptEvent {
             uuid: "a".into(),
             parent_uuid: None,
@@ -180,14 +246,14 @@ mod tests {
                 text: t.into(),
                 model: Some("gpt-5.5".into()),
                 usage: None,
-                stop_reason: None,
+                stop_reason: stop_reason.map(str::to_owned),
             },
         }
     }
 
     #[test]
     fn history_grows_into_whole_chat_input() {
-        let mut s = ChatSynthesizer::new("sess".into());
+        let mut s = ChatSynthesizer::new("sess".into(), Harness::Claude, true);
         s.on_event(&user("hi"));
         s.on_event(&assistant("hello"));
         // Reply not folded into history until the turn flushes.
@@ -209,7 +275,7 @@ mod tests {
 
     #[test]
     fn assistant_blocks_concatenate_into_one_reply() {
-        let mut s = ChatSynthesizer::new("sess".into());
+        let mut s = ChatSynthesizer::new("sess".into(), Harness::Claude, true);
         s.on_event(&user("q"));
         s.on_event(&assistant("part one"));
         s.on_event(&assistant("part two"));
@@ -218,6 +284,31 @@ mod tests {
         let last = s.history.last().unwrap();
         assert_eq!(last.role, "assistant");
         assert_eq!(last.content, "part one\npart two");
+    }
+
+    #[test]
+    fn claude_flushes_eagerly_on_end_turn_not_next_prompt() {
+        let mut s = ChatSynthesizer::new("sess".into(), Harness::Claude, true);
+        s.on_event(&user("hi"));
+        // tool_use does NOT end the turn — reply stays pending.
+        s.on_event(&assistant_with("let me check", Some("tool_use")));
+        assert!(s.pending.is_some());
+        // end_turn ends it — flushed now, without waiting for a prompt.
+        s.on_event(&assistant_with("hello", Some("end_turn")));
+        assert!(s.pending.is_none());
+        // The reply (both text parts) is already folded into history.
+        assert_eq!(s.history.last().unwrap().content, "let me check\nhello");
+    }
+
+    #[test]
+    fn codex_flushes_each_assistant_message() {
+        // Codex has no stop_reason; each assistant message completes a
+        // response, so it flushes without waiting for the next prompt.
+        let mut s = ChatSynthesizer::new("sess".into(), Harness::Codex, true);
+        s.on_event(&user("hi"));
+        s.on_event(&assistant("hello"));
+        assert!(s.pending.is_none());
+        assert_eq!(s.history.last().unwrap().content, "hello");
     }
 
     #[test]

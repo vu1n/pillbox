@@ -22,7 +22,6 @@ use std::{
 };
 
 use http_body_util::combinators::BoxBody;
-use http_body_util::BodyExt;
 use hudsucker::{
     certificate_authority::RcgenAuthority,
     hyper::{Request, Response},
@@ -404,11 +403,6 @@ struct InFlightCall {
     /// generations with empty messages/usage. We only emit for real
     /// generations.
     is_chat: bool,
-    /// Conversation captured from the chat request body (when `is_chat`):
-    /// `gen_ai.input.messages` + `gen_ai.system_instructions` JSON.
-    /// `None` for non-chat requests.
-    input_messages: Option<String>,
-    system_instructions: Option<String>,
 }
 
 impl HttpHandler for VaultHandler {
@@ -440,6 +434,12 @@ impl HttpHandler for VaultHandler {
         // one connection) overwrites this slot before our response lands.
         let method = req.method().as_str().to_string();
         let path = req.uri().path().to_string();
+        // `is_chat` gates the gen_ai span to the provider's generation
+        // endpoint (so telemetry/bootstrap/etc. calls don't become "chat"
+        // spans). The span carries the wire-observed USAGE (tokens/model);
+        // the *conversation* now comes from the transcript synthesizer
+        // (see `transcripts::synth`), so the proxy no longer buffers or
+        // parses the request body — it streams through untouched.
         let is_chat = provider.is_chat_request(&method, &path);
         self.in_flight = Some(InFlightCall {
             start: SystemTime::now(),
@@ -448,44 +448,7 @@ impl HttpHandler for VaultHandler {
             path,
             auth_stub: extract_inbound_stub(&req),
             is_chat,
-            input_messages: None,
-            system_instructions: None,
         });
-
-        // Capture conversation content from the chat endpoint's request
-        // body (provider opt-in). Buffering the body is the unavoidable
-        // cost — gated to exactly the chat endpoint so OAuth / other
-        // POSTs and every non-opted-in provider keep streaming
-        // untouched. We update the slot we just set (rather than build it
-        // after the await) to keep the envelope's pairing tight. On a
-        // collect error the body is unrecoverable, so forward empty and
-        // let the upstream reject (the agent retries).
-        let req = if is_chat {
-            let (mut parts, body) = req.into_parts();
-            match body.collect().await {
-                Ok(collected) => {
-                    let bytes = collected.to_bytes();
-                    if let Some(c) = provider.parse_chat_input(&bytes) {
-                        if let Some(flight) = self.in_flight.as_mut() {
-                            flight.input_messages = Some(c.input_messages);
-                            flight.system_instructions = c.system_instructions;
-                        }
-                    }
-                    Request::from_parts(parts, Body::from(bytes))
-                }
-                Err(error) => {
-                    eprintln!("pillbox: vault: failed to collect chat request body: {error}");
-                    // Drop the stale content-length: forwarding an empty body
-                    // while advertising the original N bytes makes the upstream
-                    // block waiting for bytes that never arrive. Without it the
-                    // upstream rejects fast and the agent retries.
-                    parts.headers.remove("content-length");
-                    Request::from_parts(parts, Body::empty())
-                }
-            }
-        } else {
-            req
-        };
 
         provider
             .handle_request(req, &self.server, &mut self.pending)
@@ -571,8 +534,10 @@ impl VaultHandler {
                 path: call.path,
                 status_code,
                 usage,
-                input_messages: call.input_messages,
-                system_instructions: call.system_instructions,
+                // Conversation comes from the transcript synthesizer now;
+                // the MITM span carries only the wire-observed usage.
+                input_messages: None,
+                system_instructions: None,
             });
         });
         Response::from_parts(parts, Body::from(BoxBody::new(tapped)))

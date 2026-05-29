@@ -216,41 +216,17 @@ pub(crate) trait VaultProvider: Send + Sync + 'static {
     ) -> Response<Body>;
 
     /// Whether `(method, path)` is this provider's chat/generation
-    /// endpoint. Gates two things: (1) capturing the request body for
-    /// gen_ai conversation telemetry, and (2) emitting a `gen_ai` span at
-    /// all — the proxy sees many non-generation calls to the same host
-    /// (telemetry batches, bootstrap, MCP registry, `count_tokens`), and
-    /// emitting a `chat` span for those mislabels them as LLM generations
-    /// with empty messages/usage. Default `false` (no span, no capture)
-    /// so a provider only produces gen_ai spans for endpoints it
-    /// recognizes as generations. Anthropic returns true for
-    /// `POST /v1/messages`; Codex/OpenAI is a future drop-in (different
-    /// endpoint + body shape) — see [`Self::parse_chat_input`].
+    /// endpoint. Gates emitting a `gen_ai` *usage* span: the proxy sees
+    /// many non-generation calls to the same host (telemetry batches,
+    /// bootstrap, MCP registry, `count_tokens`), and a `chat` span for
+    /// those would mislabel them as LLM generations with empty usage.
+    /// Default `false` so a provider only produces gen_ai spans for
+    /// endpoints it recognizes as generations. Conversation content is
+    /// reconstructed from the transcript (see `transcripts::synth`), not
+    /// captured here.
     fn is_chat_request(&self, _method: &str, _path: &str) -> bool {
         false
     }
-
-    /// Parse a captured chat-request body into OTel GenAI semconv
-    /// conversation content. Called only after [`Self::is_chat_request`]
-    /// returned true. Default `None` (no-op for providers that don't opt
-    /// in). The emitted attributes (`gen_ai.input.messages`,
-    /// `gen_ai.system_instructions`) are provider-agnostic; only this
-    /// extraction is provider-shaped.
-    fn parse_chat_input(&self, _body: &[u8]) -> Option<ChatInput> {
-        None
-    }
-}
-
-/// Conversation content extracted from a chat request body, in OTel
-/// GenAI semantic-convention shape. JSON-encoded so the emitter attaches
-/// it verbatim as span attributes.
-#[derive(Debug, Clone)]
-pub(crate) struct ChatInput {
-    /// JSON array of `{role, content}` — the request's `messages`.
-    pub(crate) input_messages: String,
-    /// JSON-encoded `system` prompt (string or content-block array),
-    /// when present.
-    pub(crate) system_instructions: Option<String>,
 }
 
 /// Build the full provider list. The list is fixed at compile-time —

@@ -285,18 +285,22 @@ impl SandboxBackend for LocalDocker {
         // traces endpoint so a plain run spawns no watcher thread. Agents
         // without a transcript parser (opencode, pi) get session + gen_ai
         // spans but no thread spans yet.
-        // When the vault proxy is up (`--vault` or a vaulted `--with`),
-        // the MITM already emits whole-chat gen_ai spans for Claude
-        // (api.anthropic.com is plain SSE we tap). Don't also synthesize
-        // them from the transcript or ChatFlow sees every turn twice.
-        // Codex never gets usable MITM chat spans (WebSocket + Responses
-        // API), so it always synthesizes; same for any non-vault run.
+        //
+        // The transcript is the conversation source for *every* harness
+        // (it's what Raindrop itself reads), so we always synthesize the
+        // whole-chat spans for Workshop's Overview. The vault MITM no
+        // longer captures conversation — only token usage off the wire,
+        // which is the more complete billing source (it counts sub-agent
+        // / retry / cancelled calls the transcript misses). So when the
+        // proxy is up for Claude (`--vault` or a vaulted `--with`), the
+        // synthesizer omits usage to avoid double-counting against the
+        // MITM; otherwise the transcript usage rides along.
         let proxy_active = opts.vault || any_vaulted;
         let tailer = crate::events::otlp_traces_configured()
             .then(|| crate::events::transcripts::Harness::for_agent(spec.id))
             .flatten()
             .map(|harness| {
-                let mitm_emits_chat =
+                let mitm_emits_usage =
                     matches!(harness, crate::events::transcripts::Harness::Claude) && proxy_active;
                 let (watch_root, scope_dir) = harness.transcript_roots(&home, &guest_cwd);
                 crate::events::transcripts::spawn_local_tailer(
@@ -304,7 +308,7 @@ impl SandboxBackend for LocalDocker {
                     scope_dir,
                     harness,
                     session_id.clone(),
-                    !mitm_emits_chat,
+                    !mitm_emits_usage,
                 )
             });
 

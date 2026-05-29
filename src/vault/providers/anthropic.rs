@@ -19,8 +19,8 @@ use hudsucker::{
 use serde::Deserialize;
 
 use super::{
-    host_from_uri, mint_stub, swap_raw_header, unauthorized, ApiKeySwap, ChatInput, PendingFlow,
-    Registry, SandboxData, VaultProvider,
+    host_from_uri, mint_stub, swap_raw_header, unauthorized, ApiKeySwap, PendingFlow, Registry,
+    SandboxData, VaultProvider,
 };
 use crate::vault::server::ServerInner;
 
@@ -234,30 +234,11 @@ impl VaultProvider for AnthropicProvider {
     /// `api.anthropic.com` and the platform host the handler already
     /// matched). `ends_with` matches the streaming + non-streaming
     /// generation calls and excludes `…/v1/messages/count_tokens` and
-    /// `…/batches`, which aren't generations. The request body carries
-    /// the full conversation.
+    /// `…/batches`, which aren't generations. Gates the gen_ai *usage*
+    /// span to real generation calls. (Conversation content comes from
+    /// the transcript synthesizer, not this provider.)
     fn is_chat_request(&self, method: &str, path: &str) -> bool {
         method == "POST" && path.ends_with("/v1/messages")
-    }
-
-    /// Pull `messages` + `system` out of the Anthropic Messages request
-    /// body, re-encoded as JSON for the OTel GenAI conversation
-    /// attributes. Anthropic's `messages` are `[{role, content}]` with
-    /// content as a string or content-block array — the value/shape is
-    /// preserved (object key *order* is normalized by serde, which
-    /// key-based gen_ai adapters don't care about). Best-effort: a
-    /// non-JSON / message-less body yields `None`.
-    fn parse_chat_input(&self, body: &[u8]) -> Option<ChatInput> {
-        let value: serde_json::Value = serde_json::from_slice(body).ok()?;
-        let messages = value.get("messages").filter(|m| m.is_array())?;
-        let input_messages = serde_json::to_string(messages).ok()?;
-        let system_instructions = value
-            .get("system")
-            .map(|s| serde_json::to_string(s).unwrap_or_default());
-        Some(ChatInput {
-            input_messages,
-            system_instructions,
-        })
     }
 }
 

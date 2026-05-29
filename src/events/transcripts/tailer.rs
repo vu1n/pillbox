@@ -36,11 +36,13 @@ pub(crate) struct Tailer {
     offset: u64,
     line_idx: usize,
     leftover: String,
-    /// When `Some`, also reconstruct whole-chat gen_ai spans from the
-    /// events (for Workshop's Overview). `None` when the MITM already
-    /// emits chat spans for this run (Claude + `--vault`) — see
-    /// [`super::synth`].
-    synth: Option<super::synth::ChatSynthesizer>,
+    /// Reconstructs whole-chat gen_ai spans from the events for
+    /// Workshop's Overview. Always present — the transcript is the
+    /// conversation source for every harness. `include_usage` (threaded
+    /// in at construction) controls only whether token counts ride
+    /// along, since the vault MITM supplies wire-observed usage for
+    /// Claude + `--vault` runs — see [`super::synth`].
+    synth: super::synth::ChatSynthesizer,
 }
 
 impl Tailer {
@@ -48,9 +50,9 @@ impl Tailer {
         path: PathBuf,
         session_id: String,
         harness: Harness,
-        synthesize_chat: bool,
+        include_usage: bool,
     ) -> Self {
-        let synth = synthesize_chat.then(|| super::synth::ChatSynthesizer::new(session_id.clone()));
+        let synth = super::synth::ChatSynthesizer::new(session_id.clone(), harness, include_usage);
         Self {
             path,
             session_id,
@@ -124,9 +126,7 @@ impl Tailer {
             let events = parse_with(self.harness, line, self.line_idx);
             for event in &events {
                 emit_event_span(event, &self.session_id);
-                if let Some(synth) = self.synth.as_mut() {
-                    synth.on_event(event);
-                }
+                self.synth.on_event(event);
                 emitted += 1;
             }
             self.line_idx += 1;
@@ -208,9 +208,7 @@ impl Tailer {
         }
         // Emit the last assistant turn (it's only flushed lazily on the
         // next user prompt, which never comes for the final exchange).
-        if let Some(synth) = self.synth.as_mut() {
-            synth.finish();
-        }
+        self.synth.finish();
         Ok(total)
     }
 }

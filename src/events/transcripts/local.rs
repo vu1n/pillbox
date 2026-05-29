@@ -90,6 +90,7 @@ pub(crate) fn spawn_local_tailer(
     scope_dir: Option<PathBuf>,
     harness: Harness,
     session_id: String,
+    synthesize_chat: bool,
 ) -> LocalTailerHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = Arc::clone(&stop);
@@ -107,7 +108,7 @@ pub(crate) fn spawn_local_tailer(
             }
             std::thread::sleep(Duration::from_millis(200));
         };
-        let mut tailer = Tailer::new(path, session_id, harness);
+        let mut tailer = Tailer::new(path, session_id, harness, synthesize_chat);
         if let Err(e) = tailer.follow_until(&stop_thread) {
             eprintln!("pillbox: warning: transcript tailer stopped: {e:#}");
         }

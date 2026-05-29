@@ -285,16 +285,26 @@ impl SandboxBackend for LocalDocker {
         // traces endpoint so a plain run spawns no watcher thread. Agents
         // without a transcript parser (opencode, pi) get session + gen_ai
         // spans but no thread spans yet.
+        // When the vault proxy is up (`--vault` or a vaulted `--with`),
+        // the MITM already emits whole-chat gen_ai spans for Claude
+        // (api.anthropic.com is plain SSE we tap). Don't also synthesize
+        // them from the transcript or ChatFlow sees every turn twice.
+        // Codex never gets usable MITM chat spans (WebSocket + Responses
+        // API), so it always synthesizes; same for any non-vault run.
+        let proxy_active = opts.vault || any_vaulted;
         let tailer = crate::events::otlp_traces_configured()
             .then(|| crate::events::transcripts::Harness::for_agent(spec.id))
             .flatten()
             .map(|harness| {
+                let mitm_emits_chat =
+                    matches!(harness, crate::events::transcripts::Harness::Claude) && proxy_active;
                 let (watch_root, scope_dir) = harness.transcript_roots(&home, &guest_cwd);
                 crate::events::transcripts::spawn_local_tailer(
                     watch_root,
                     scope_dir,
                     harness,
                     session_id.clone(),
+                    !mitm_emits_chat,
                 )
             });
 

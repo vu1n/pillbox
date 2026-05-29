@@ -62,8 +62,10 @@ fn session_transcript(
         None => events::transcripts::Harness::from_path(file),
     };
     if follow {
+        // Manual drain (`session transcript`) synthesizes chat spans too,
+        // so Workshop's Overview renders — there's no MITM here to do it.
         let mut tailer =
-            events::transcripts::Tailer::new(file.to_path_buf(), session_id.into(), harness);
+            events::transcripts::Tailer::new(file.to_path_buf(), session_id.into(), harness, true);
         eprintln!(
             "pillbox: tailing {} → session_id={session_id} (harness={harness:?}); Ctrl-C to stop",
             file.display(),

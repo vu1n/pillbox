@@ -36,10 +36,21 @@ pub(crate) struct Tailer {
     offset: u64,
     line_idx: usize,
     leftover: String,
+    /// When `Some`, also reconstruct whole-chat gen_ai spans from the
+    /// events (for Workshop's Overview). `None` when the MITM already
+    /// emits chat spans for this run (Claude + `--vault`) — see
+    /// [`super::synth`].
+    synth: Option<super::synth::ChatSynthesizer>,
 }
 
 impl Tailer {
-    pub(crate) fn new(path: PathBuf, session_id: String, harness: Harness) -> Self {
+    pub(crate) fn new(
+        path: PathBuf,
+        session_id: String,
+        harness: Harness,
+        synthesize_chat: bool,
+    ) -> Self {
+        let synth = synthesize_chat.then(|| super::synth::ChatSynthesizer::new(session_id.clone()));
         Self {
             path,
             session_id,
@@ -47,6 +58,7 @@ impl Tailer {
             offset: 0,
             line_idx: 0,
             leftover: String::new(),
+            synth,
         }
     }
 
@@ -112,6 +124,9 @@ impl Tailer {
             let events = parse_with(self.harness, line, self.line_idx);
             for event in &events {
                 emit_event_span(event, &self.session_id);
+                if let Some(synth) = self.synth.as_mut() {
+                    synth.on_event(event);
+                }
                 emitted += 1;
             }
             self.line_idx += 1;
@@ -191,6 +206,11 @@ impl Tailer {
                 }
             }
         }
+        // Emit the last assistant turn (it's only flushed lazily on the
+        // next user prompt, which never comes for the final exchange).
+        if let Some(synth) = self.synth.as_mut() {
+            synth.finish();
+        }
         Ok(total)
     }
 }
@@ -236,7 +256,7 @@ mod tests {
             writeln!(f, "{}", fixture_line("u2", "second")).unwrap();
         }
 
-        let mut tailer = Tailer::new(path.clone(), "sess".into(), Harness::Claude);
+        let mut tailer = Tailer::new(path.clone(), "sess".into(), Harness::Claude, false);
         let first = tailer.pump().expect("pump");
         assert_eq!(first, 2, "initial pump should drain both seeded lines");
 
@@ -260,7 +280,7 @@ mod tests {
     fn pump_buffers_partial_lines_across_calls() {
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         let path = tmp.path().to_path_buf();
-        let mut tailer = Tailer::new(path.clone(), "sess".into(), Harness::Claude);
+        let mut tailer = Tailer::new(path.clone(), "sess".into(), Harness::Claude, false);
 
         // Write half a line (no trailing \n yet).
         let full = fixture_line("u1", "split-line");
@@ -287,7 +307,7 @@ mod tests {
     fn pump_handles_file_truncation_by_rewinding() {
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         let path = tmp.path().to_path_buf();
-        let mut tailer = Tailer::new(path.clone(), "sess".into(), Harness::Claude);
+        let mut tailer = Tailer::new(path.clone(), "sess".into(), Harness::Claude, false);
 
         {
             let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
@@ -313,7 +333,7 @@ mod tests {
             "/tmp/pillbox-tailer-missing-{}.jsonl",
             uuid::Uuid::now_v7(),
         ));
-        let mut tailer = Tailer::new(path, "sess".into(), Harness::Claude);
+        let mut tailer = Tailer::new(path, "sess".into(), Harness::Claude, false);
         assert_eq!(tailer.pump().unwrap(), 0);
     }
 

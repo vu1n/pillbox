@@ -40,6 +40,7 @@ use super::otel::spans::{derive_session_span_id, derive_trace_id, tracer};
 mod claude;
 mod codex;
 mod local;
+mod synth;
 mod tailer;
 
 pub(crate) use local::spawn_local_tailer;

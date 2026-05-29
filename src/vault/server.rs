@@ -319,6 +319,16 @@ impl Server {
         self.lease_api_key(name, real, &meta)
     }
 
+    /// Snapshot the current real credentials for `sandbox_id`, cloned out
+    /// of the registry. Returns `None` if no lease for that sandbox is
+    /// live. Used at session teardown to persist tokens the in-proxy
+    /// refresh rotated during the run (the registry holds the rotated
+    /// values; the on-disk creds file would otherwise keep the stale —
+    /// and, post-rotation, invalidated — refresh token).
+    pub(crate) fn snapshot_real(&self, sandbox_id: &str) -> Option<serde_json::Value> {
+        self.inner.registry_lock().real(sandbox_id).cloned()
+    }
+
     /// Test-only: borrow the inner registry mutex. Use `inner_for_test`
     /// from tests in this module; downstream tests use the lease's
     /// observable side-effects instead.
@@ -553,6 +563,44 @@ mod tests {
             let registry = server.registry_lock_for_test();
             assert!(registry.real("sbx-1").is_none());
         }
+
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn snapshot_real_returns_rotated_tokens_until_lease_drops() {
+        // The teardown persist path (VaultSession::drop) reads the
+        // registry's real creds via snapshot_real and writes them back
+        // to disk. Pin that it reflects an in-proxy rotation and goes
+        // None once the lease is gone.
+        let (server, dir) = fresh_server().await;
+        let lease = server
+            .lease("claude", "sbx-rot", sample_anthropic_real())
+            .expect("lease");
+
+        // Simulate the in-proxy refresh rotating the stored refresh token.
+        server.inner_for_test().registry_lock().rotate_real_field(
+            "sbx-rot",
+            "/claudeAiOauth/refreshToken",
+            "ROTATED_REFRESH".to_string(),
+        );
+
+        let snap = server.snapshot_real("sbx-rot").expect("snapshot");
+        assert_eq!(
+            snap.pointer("/claudeAiOauth/refreshToken")
+                .and_then(|v| v.as_str()),
+            Some("ROTATED_REFRESH"),
+            "snapshot must reflect the rotation the teardown persist will write back"
+        );
+        // Unknown sandbox → None (nothing to persist).
+        assert!(server.snapshot_real("sbx-missing").is_none());
+
+        drop(lease);
+        assert!(
+            server.snapshot_real("sbx-rot").is_none(),
+            "after the lease drops the registry entry is gone — teardown must persist before drop"
+        );
 
         drop(server);
         let _ = std::fs::remove_dir_all(&dir);

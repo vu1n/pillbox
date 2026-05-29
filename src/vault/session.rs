@@ -32,6 +32,14 @@ struct OAuthMount {
     /// `.claude/.credentials.json` or `.codex/auth.json`). The agent
     /// provider tells us where.
     creds_path: PathBuf,
+    /// Host-absolute path to the real credentials file this mount
+    /// shadows (the global auth store). At teardown we persist the
+    /// registry's real creds back here so an in-proxy token rotation
+    /// during the run survives to the next session.
+    host_creds_path: PathBuf,
+    /// Registry key for this mount's real creds, so teardown can read
+    /// the (possibly rotated) tokens back out of the server.
+    sandbox_id: String,
     _lease: SandboxLease,
 }
 
@@ -63,6 +71,43 @@ pub(crate) struct VaultSession {
     _runtime: tokio::runtime::Runtime,
     ca_cert_path: PathBuf,
     listen_addr: SocketAddr,
+}
+
+impl Drop for VaultSession {
+    /// Persist any in-proxy-rotated real credentials back to the host
+    /// auth store. Runs before the fields drop (a manual `Drop` fires
+    /// ahead of field destruction), so the leases haven't yet removed
+    /// their registry entries and `snapshot_real` still sees them.
+    ///
+    /// Why this exists: Anthropic rotates refresh tokens single-use. If
+    /// the agent refreshes mid-session through the proxy, the new token
+    /// lands only in the in-memory registry — the on-disk creds file
+    /// keeps the old one, which the rotation just invalidated. The next
+    /// run's pre-refresh then sends a dead token and 401s, recurring
+    /// every session. Flushing the registry's real creds here closes
+    /// that loop (mirrors how Orca reads back + persists CLI-rotated
+    /// tokens). Best-effort: a failure only costs a stale token
+    /// (recoverable via `pillbox auth login`), so warn, never panic.
+    fn drop(&mut self) {
+        for mount in &self.oauth_mounts {
+            let Some(real) = self.server.snapshot_real(&mount.sandbox_id) else {
+                continue;
+            };
+            match serde_json::to_string_pretty(&real) {
+                Ok(body) => {
+                    if let Err(e) = write_private(&mount.host_creds_path, &body) {
+                        eprintln!(
+                            "pillbox: warning: failed to persist refreshed credentials to {}: {e}",
+                            mount.host_creds_path.display()
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("pillbox: warning: failed to serialize refreshed credentials: {e}")
+                }
+            }
+        }
+    }
 }
 
 impl VaultSession {
@@ -304,6 +349,8 @@ fn provision_oauth_mount(server: &Server, agent: OAuthAgent<'_>) -> Result<OAuth
     Ok(OAuthMount {
         stub_file,
         creds_path: creds_rel,
+        host_creds_path: creds_path,
+        sandbox_id,
         _lease: lease,
     })
 }

@@ -114,13 +114,17 @@ Practically, phase 1 first extracts a workspace-I/O seam from
 `local_docker.rs` (which assumes bind-mount today) before the remote
 daemon can reuse it.
 
-**The tar-cp path needs a real contract** (it's net-new, no prior art in the
-tree): exclusion rules (respect `.gitignore`; never ship `.env`/secrets/`.git`/
-`node_modules`), a size threshold that falls back to S3/rustic, transfer
-atomicity, and the result-pull-vs-local-change policy. For the *interactive*
-live-sync mode, **Mutagen** is the standard answer (bidirectional low-latency
-sync) behind a flag; keep tar-cp as the correct default for autonomous/detached,
-and rustic for content-addressed versioning.
+**The ingest contract is now built** (`workspace/ingest.rs`): a **secret
+*denylist*, not a `.gitignore` allowlist** — the refinement that `.gitignore`
+answers "what's not committed," not "what's secret," so conflating them leaks or
+breaks. Secret files/dirs (`.env`-family minus shared templates like
+`.env.example`) are dropped, derived dirs (`node_modules`/`target`) are kept on
+purpose, every drop is **surfaced via `IngestPlan.excluded_secrets` (never
+silent)**, and a 256 MiB ceiling falls back to S3/rustic. The `tar → docker cp`
+*execution* (and the result-pull-vs-local-change policy) land in a follow-on
+slice. For *interactive* live-sync, **Mutagen** is the standard answer behind a
+flag; tar-cp stays the correct default for autonomous/detached, rustic for
+content-addressed versioning.
 
 ### The transport is already abstracted
 

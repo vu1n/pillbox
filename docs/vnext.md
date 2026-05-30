@@ -209,6 +209,15 @@ CRDT. Do *not* copy sshx's E2E encryption: it forecloses the server-side screen
 > cross-user pooling behind a privacy design + an independent verifier. Treat
 > "bacchus's jj engine is the hard 80%" as an *assumption to validate against
 > bacchus's actual scope*, not a given.
+>
+> **Factoring (cf. aithy / Ax / RLM-style flow):** push the deterministic work
+> — parsing, filtering, retrieval, dedup, tool-routing — into *code*; let the
+> model do only language + judgment. That's *why* this layer's optimization
+> surface stays small and tractable (DSPy/GEPA tune only the judgment prompts,
+> not the scaffold), and it's the same "deterministic routing before the agent"
+> the gateway broker already does. The substrate exposes the deterministic
+> primitives (retrieval, snapshots, tool routing); the optimizer tunes the thin
+> judgment layer on top.
 
 The layer that turns the bundle into something that *compounds* — the first
 piece of vNext with a durable moat rather than parity. It is a **separate
@@ -328,7 +337,7 @@ multi-human surface.**
 
 | # | Step | Why here / deps | Workstream |
 |---|---|---|---|
-| 1 | **Remotes collapse — `docker://` + cold-host DX contract** (URL-accept, remote preflight, tar-cp secret-exclusion, version-skew, pull progress) | Cheapest big win; a *deletion* onto Docker contexts; fixes the documented product failure. **Independent of §0** — detach keys off the durable `Session.id`. | remotes + dx |
+| 1 | **Remotes collapse — `docker://` + cold-host DX contract** *(in progress: URL-accept ✓, secret-denylist ingest ✓, endpoint preflight ✓; remaining: execution path, version-skew, pull-progress)* | Cheapest big win; a *deletion* onto Docker contexts; fixes the documented product failure. **Independent of §0** — detach keys off the durable `Session.id`. | remotes + dx |
 | 2 | **Approval loop — `session.blocked` + `session approve\|deny\|answer`** (+ real HITL sink arms) | Makes detached/remote usable; **thin over *shipped* plumbing** — a new event on today's sink path + verbs over the Input-frame channel (d590a2d). Not gated on the full §0 spine. | dx + event-log |
 | 3 | **§0 spine + LOCAL subscribe surface** — envelope + `sessionId` + `actor` + gateway sequencer, and expose `Subscribe(from_seq)` **locally, zero-config** (not OTLP-only) + local JSONL persist | The keystone. The substrate's local stream **every** consumer reads — unblocks the inner-loop readout, fleet triage, lum, *and* all multiplayer. | event-log + gateway + dx |
 | 4 | **`session list` status + `session diagnose`** + a thin `pillbox watch` reference reader | Falls out of §0 (the log). Makes a swarm triageable and gives the cheapest "watch your agent" demo — a *consumer over the public tap, not a UI*. | dx |

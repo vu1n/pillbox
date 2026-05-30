@@ -101,33 +101,35 @@ Acceptance: a dev types the doc's headline (`pillbox run --remote
 docker://user@host`) on a fresh host and either it works or the **first error
 is true and actionable**.
 
-- **The headline command must parse.** `docker://` has **0 hits in src** —
-  `--remote` is a registry-name lookup; `parse_remote_url` accepts only
-  `ssh://`/`e2b://`. Until URL-accept lands (phase 3), route URL-shaped values
-  to a clean "docker:// not yet supported" config error (exit 3) with a real
-  `Next:` — never the current double dead-end (`remote not found` → a
-  `remote add` recovery that is itself rejected). **The `Next:` affordance must
-  never lie.**
-- **Remote readiness preflight** *before* snapshot/pull (`pillbox doctor
-  --remote …` / `remote check`): classify auth / unreachable / no-docker / TLS,
-  non-zero with a real `Next:`. `doctor` probes only the local daemon today, so
-  it reports all-green into a uniformly-failing remote. Reference: Coder /
-  DevPod / Daytona preflight.
-- **"started" means "reachable."** Echo the **exact user-supplied endpoint**
-  (never a normalized host); emit one shadow-note when flag / `docker context`
-  / `DOCKER_HOST` disagree.
-- **Pull gets first-class progress** + two-tier (clean / `--verbose`) output +
-  failure classification (auth / no-such-image / registry-unreachable /
-  daemon-gone), each with its own `Next:`. The ~1GB figure is unmeasured —
-  add a CI image-size check.
-- **Graded version-skew** wired into the `doctor` runner_image check:
-  minor → WARN, major → fail-with-upgrade-command.
-- **tar-cp is a real contract before it ships** (it's net-new — no `docker cp`
-  path exists; the workspace travels via inline-blob/S3 today): hard exclusion
-  list (`.git`/`.env`/secrets/`node_modules` + `.gitignore`), **REFUSE on
-  unignored secret-bearing files**, size-threshold S3 fallback, transfer
-  atomicity. The acute risk is a **silent secret-leak** — shipping a `.env` to
-  a remote host with no warning.
+Status (reconciled 2026-05-30 against the built docker integration):
+
+- **URL-accept — DONE.** `docker://[user@]host[:port]` parses end-to-end
+  (`RemoteUrl::Docker`, `parse_remote_url`); `--remote` takes it directly. The
+  not-yet-built execution path returns an **honest** pointed error ("the
+  docker:// backend is not built yet — would target `DOCKER_HOST=…`") with a
+  real `Next:` (use `ssh://` for now) — the earlier lying double dead-end is
+  gone.
+- **Secret-safe ingest — DONE (sharper than first specced).** `workspace/ingest.rs`
+  ships a **secret *denylist*, not a `.gitignore` allowlist** — the team's
+  correction that `.gitignore` answers "what's not committed," not "what's
+  secret," so conflating them leaks or breaks. `.env`-family secrets (minus
+  shared templates like `.env.example`) + secret dirs are dropped, derived dirs
+  (`node_modules`/`target`) are kept on purpose, and `IngestPlan.excluded_secrets`
+  **surfaces every drop — never silent**, with a 256 MiB ceiling → S3 fallback.
+  The "silent `.env` leak" risk is closed at the planning layer; the remaining
+  piece is the `tar → docker cp` execution slice honoring it.
+- **Remote preflight — PARTIAL.** `check_ready_at(endpoint, image)` is now
+  endpoint-aware (preflights the *remote* daemon, not just local). Remaining: a
+  user-facing `pillbox doctor --remote …` / `remote check` + richer failure
+  classification (auth / unreachable / no-docker / TLS), each with its own
+  `Next:`. Reference: Coder / DevPod / Daytona.
+- **Still open:** the execution path itself (container lifecycle + workspace
+  materialization); "started means reachable" (echo the exact user-supplied
+  endpoint; shadow-note on flag / `docker context` / `DOCKER_HOST` disagreement);
+  pull-progress + two-tier verbose output + failure classification (~1GB is
+  still an estimate — add a CI image-size check; the runner is 3GB→2GB
+  post-cleanup); graded version-skew (minor→WARN, major→fail-with-upgrade) on
+  the doctor `runner_image` check.
 
 ## The profile primitive (currently 0% surface)
 
@@ -178,8 +180,9 @@ clean config delta.
 - Local-run pre-handoff banner symmetric with the remote "connecting to …"
   line: `pillbox: running claude against myapp (local docker) — /workspace/
   myapp, vault: off`. Closes the silent mis-targeting footgun (~10 lines).
-- `docker://` URL-shaped value → clean "not yet supported" config error, not a
-  lying `Next:`.
+- ~~`docker://` URL-shaped value → clean "not yet supported" config error, not
+  a lying `Next:`.~~ **DONE** — `run()` returns an honest pointed error with a
+  real `Next:` (use `ssh://`).
 - Give `HumanSink`/`JsonlSink` real arms for the three HITL payloads (today
   `_ => {}`) so even an attached terminal shows "agent is blocked: <reason>".
 - `pillbox session events --session ID` per-session projection of the firehose.

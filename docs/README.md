@@ -28,6 +28,7 @@ Start with the umbrella; the rest are deep specs it indexes.
 | [gateway.md](./gateway.md) | The per-session sequencer + broker + attach endpoint §0 gates on (the no-daemon reconciliation) |
 | [remotes-redesign.md](./remotes-redesign.md) | Backend collapse onto Docker contexts; BYO free / managed paid |
 | [dx.md](./dx.md) | The developer-experience contract — the three inner loops + the zero-config-local principle |
+| [swarm-memory.md](./swarm-memory.md) | Optimization/memory loops (external consumer): GEPA + ACE swarm memory over MCP, the privacy gate |
 
 ## Substrate specs (the contracts the vNext design builds on)
 

@@ -143,6 +143,13 @@ attachment. Mitigations are operational, not technical:
   splits live in the MCP server, not in pillbox. Pillbox does not
   pretend to add a security layer it cannot enforce on a process
   it didn't start.
+- **Auth-granularity gap (for shared swarm memory)** — `--mcp-token`
+  attaches **one bearer per attachment**, so every agent sharing one
+  memory server shares one identity: no per-actor write attribution,
+  no read-scoping. A shared swarm-memory server (see
+  [swarm-memory.md](./swarm-memory.md)) that pools across users needs
+  per-session/per-actor scoped tokens minted on the launch path — a
+  prerequisite pillbox-side change. Single-tenant only until then.
 
 ## Token handling
 

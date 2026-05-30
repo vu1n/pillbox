@@ -14,7 +14,8 @@ Deep specs:
 - [dx.md](./dx.md) — the developer-experience contract (the bundle is the
   product): the three inner loops + the zero-config-local principle.
 - *orchestrator / optimization layer* — a **separate project** that consumes
-  the pillbox contract (not in this repo); its own deep spec is TODO. See
+  the pillbox contract (not in this repo); the run-time half is specced in
+  [swarm-memory.md](./swarm-memory.md). See
   *Optimization & collective intelligence* below.
 
 ## Why vNext exists
@@ -200,8 +201,13 @@ CRDT. Do *not* copy sshx's E2E encryption: it forecloses the server-side screen
 > piece already ships: `stanford-iris-lab/meta-harness` is open-source —
 > **wrap it**, don't rebuild; cost-routing is commoditized (RouteLLM / LiteLLM
 > / OpenRouter / native model routers) — **consume LiteLLM**, don't build a
-> router; DSPy/GEPA need a labeled scalar reward open-ended coding lacks — use
-> GEPA only where a *verifiable* reward exists. The real hard part and real moat
+> router; **GEPA needs a coarse *verifiable score*, not a labeled scalar** —
+> rich textual feedback (stderr / failing tests / diffs / traces from the event
+> log) carries the gradient, so MIPROv2's labeled-scalar regime is what
+> open-ended coding lacks and GEPA sidesteps. The catch: the score must be
+> **externally graded, never the self-reported `session.completed`**, and use the
+> standalone `gepa` library / `optimize_anything` (not `dspy.GEPA`, which only
+> tunes DSPy predictor fields — your scaffold is non-DSPy text). The real moat
 > is **privacy** of cross-user pooling (cf. FedPOB), not the optimizer — naive
 > pooling leaks exactly the code/prompts pillbox exists to isolate. **pillbox's
 > role is the trace-rich, reproducible, secret-isolated substrate the loop runs
@@ -383,11 +389,14 @@ to keep that contract solid.
   opt-in contribution, quality-gated inclusion; *never* required-to-consume.
   Open knob: what the contributor carrot is (lean: premium routing on the
   managed tier). (optimization §Data principles.)
-- **Optimization metric** — adopt **Harbor as the eval *interface*** (Terminal-
-  Bench 2.0 / SWE-bench / DeepSWE are datasets run *through* it, not
-  alternatives). Optimize against contamination-resistant sets (SWE-rebench
-  date-gated); SWE-bench Verified is sanity-only (contaminated). Reward must be
-  independently verifiable — never `session.completed`.
+- **Optimization metric / reward channel** — adopt **Harbor as the eval
+  *interface*** (Terminal-Bench 2.0 / SWE-bench / DeepSWE are datasets run
+  *through* it, not alternatives). Optimize against contamination-resistant sets
+  (SWE-rebench date-gated); SWE-bench Verified is sanity-only (contaminated). The
+  **verifiable reward is a *substrate primitive* pillbox must ship** — an
+  external grader scoring the rustic **result-snapshot + exit code** — and it
+  **gates the entire compile-time loop**. Never the self-reported
+  `session.completed` (`session.rs`). See [swarm-memory.md](./swarm-memory.md).
 - **Vault egress is a correctness gap, not a feature** — the proxy passes
   *non-matched* hosts through unmodified (`vault/server.rs:6`), so an agent can
   POST any other secret to an arbitrary host. Add strict-deny egress (403 on

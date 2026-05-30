@@ -185,4 +185,42 @@ mod tests {
         assert!(!present("/ws/.env"), ".env must be excluded");
         assert!(!present("/ws/tls.key"), "key material must be excluded");
     }
+
+    /// Prove the docker:// launch ordering on the wire: `docker create` (not
+    /// started) → stage the workspace into the created container → `docker
+    /// start` → the running container's processes see the staged files. This
+    /// is the ordering the real backend depends on (stage *before* the agent
+    /// starts), distinct from the stage-into-a-running-container test above.
+    #[test]
+    #[ignore = "requires docker + the runner image"]
+    fn create_then_stage_then_start_makes_workspace_visible() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("hello.txt"), b"hi").unwrap();
+        std::fs::write(root.path().join(".env"), b"SECRET=1").unwrap();
+
+        let ep = DockerEndpoint::local();
+        // create (NOT run) — container exists, nothing running yet.
+        let cid = docker::create_at(&ep, &[test_image(), "sleep".into(), "120".into()])
+            .expect("docker create");
+        let _rm = RmContainer(cid.clone());
+
+        // Stage into the created container's /tmp (exists in the image; no
+        // exec/mkdir possible before start).
+        stage_workspace(&ep, &cid, root.path(), "/tmp").expect("stage into created container");
+
+        // Now start it and confirm the staged file is visible to its processes.
+        docker::start_at(&ep, &cid).expect("docker start");
+        let seen = Command::new("docker")
+            .args(["exec", &cid, "test", "-e", "/tmp/hello.txt"])
+            .status()
+            .expect("test -e")
+            .success();
+        assert!(seen, "staged file must be visible after create→stage→start");
+        let secret_blocked = !Command::new("docker")
+            .args(["exec", &cid, "test", "-e", "/tmp/.env"])
+            .status()
+            .expect("test -e")
+            .success();
+        assert!(secret_blocked, ".env must not be staged");
+    }
 }

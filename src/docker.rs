@@ -259,6 +259,52 @@ pub fn exec_attach_at(
         .context("invoking `docker exec -i`")
 }
 
+/// `docker create <args...>` on `endpoint`'s daemon — provision a container
+/// WITHOUT starting it. The docker:// path needs this so the workspace can be
+/// `docker cp`'d in *before* the agent runs: the ordering is
+/// **create → stage → start** (you can't cp into a not-yet-created container,
+/// and `run` would start the agent before its workspace exists). `args` must
+/// include the image + command. Returns the container id (stdout, trimmed).
+// Wired by the docker:// container lifecycle (next slice); exercised now by the
+// workspace-staging ordering test.
+#[allow(dead_code)]
+pub fn create_at(endpoint: &DockerEndpoint, args: &[String]) -> Result<String> {
+    let out = endpoint
+        .command()
+        .arg("create")
+        .args(args)
+        .output()
+        .context("invoking `docker create`")?;
+    if !out.status.success() {
+        return Err(PillboxError::resource(
+            "sandbox create",
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        )
+        .into());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// `docker start <container>` on `endpoint`'s daemon — start a container
+/// provisioned by [`create_at`], after its workspace has been staged in.
+#[allow(dead_code)]
+pub fn start_at(endpoint: &DockerEndpoint, container: &str) -> Result<()> {
+    let out = endpoint
+        .command()
+        .arg("start")
+        .arg(container)
+        .output()
+        .context("invoking `docker start`")?;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(PillboxError::resource(
+        "sandbox start",
+        String::from_utf8_lossy(&out.stderr).trim().to_string(),
+    )
+    .into())
+}
+
 /// `docker run <args...>` detached on the ambient daemon. See
 /// [`run_detached_at`].
 pub fn run_detached(args: &[String]) -> Result<String> {

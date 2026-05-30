@@ -173,8 +173,8 @@ message EventDelivery {
 // Event stream
 // ────────────────────────────────────────────────────────────────────────
 message Event {
-  uint64 seq                   = 1; // monotonic per pillbox, DURABLE events only
-                                    // (ephemeral carry seq=0) → replay cursor
+  uint64 seq                   = 1; // monotonic per emitter (per run/exec),
+                                    // DURABLE events only (ephemeral seq=0) → replay cursor
   string sandbox_id            = 2;
   string run_id                = 3; // set for agent-run events
   string exec_id               = 4; // set for exec events

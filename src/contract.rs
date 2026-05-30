@@ -23,8 +23,10 @@ use serde_json::Value;
 
 /// One event on a sandbox's stream. Envelope + a typed payload.
 ///
-/// `seq` is monotonic per pillbox and assigned to DURABLE events only;
-/// ephemeral telemetry carries `seq == 0` and is excluded from replay.
+/// `seq` is monotonic per *emitter* (the per-run/exec `EventEmitter` counter,
+/// not pillbox-wide) and assigned to DURABLE events only; ephemeral telemetry
+/// carries `seq == 0` and is excluded from replay. (vNext moves this to a
+/// per-session, gateway-assigned seq — see docs/session-event-log.md.)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Event {

@@ -61,11 +61,12 @@ pub(crate) struct CallSpan {
     /// carry these fields (e.g. `GET /v1/models`) or for error
     /// responses with no usage block.
     pub(crate) usage: GenAiUsage,
-    /// Request-side conversation, captured from the `/v1/messages`
-    /// request body by the proxy: JSON array of `{role, content}` in
-    /// Anthropic's native shape, emitted as `gen_ai.input.messages`
-    /// (OTel GenAI semconv). `None` for non-chat endpoints or when
-    /// body capture is off. Lets a collector render the conversation
+    /// Request-side conversation as a JSON array of `{role, content}` in
+    /// Anthropic's native shape, emitted as `gen_ai.input.messages` (OTel
+    /// GenAI semconv). Populated by the **transcript synth** (`synth.rs`) from
+    /// the agent's transcript history — NOT by the MITM proxy, which sets this
+    /// `None` (it no longer captures request bodies; see `vault/server.rs` and
+    /// `vault/genai_tap.rs`). Lets a collector render the conversation
     /// (Raindrop Workshop's "Overview"), not just the span envelope.
     pub(crate) input_messages: Option<String>,
     /// Request `system` prompt (string or content-block array), JSON-

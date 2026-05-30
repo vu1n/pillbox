@@ -87,7 +87,10 @@ RUN npm install -g \
 		@openai/codex@${CODEX_VERSION} \
 		@ampcode/cli@latest \
 		opencode-ai@${OPENCODE_VERSION} \
-		@earendil-works/pi-coding-agent@${PI_VERSION}
+		@earendil-works/pi-coding-agent@${PI_VERSION} \
+	&& npm cache clean --force
+	# ^ the global install leaves a populated npm cache (~/.npm) in the
+	#   layer that nothing reads at runtime — drop it.
 
 # Claude Code: official native installer. Run with HOME pointed at a
 # stable /opt path so the installer's writes don't get shadowed if a
@@ -97,7 +100,12 @@ RUN curl -fsSL https://claude.ai/install.sh -o /tmp/claude-install.sh \
 	&& HOME=/opt/claude-install bash /tmp/claude-install.sh \
 	&& cp -L /opt/claude-install/.local/bin/claude /usr/local/bin/claude \
 	&& chmod +x /usr/local/bin/claude \
-	&& rm /tmp/claude-install.sh
+	&& rm /tmp/claude-install.sh \
+	&& rm -rf /opt/claude-install
+	# ^ the installer's scratch HOME is a full second copy of Claude Code
+	#   (its bundled runtime + node_modules, ~250MB). We've copied the
+	#   resolved binary into /usr/local/bin, so drop the scratch dir —
+	#   otherwise it rides along dead in the layer.
 
 # The in-sandbox pillbox: pty-host, event emitter, session-done wrapper.
 COPY --from=pillbox-build /pillbox /usr/local/bin/pillbox

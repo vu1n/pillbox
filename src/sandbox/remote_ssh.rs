@@ -152,7 +152,19 @@ pub(crate) struct VaultStdinBlob {
     /// its gen_ai span emission.
     #[serde(flatten)]
     pub(crate) context: crate::vault::RunContext,
-    pub(crate) workspace: InlineWorkspace,
+    /// S3/rustic workspace material for the **hydrate-from-S3** receivers
+    /// (e2b/ssh): the sandbox pulls the base snapshot and pushes the result
+    /// through the shared repo. `None` for the **docker://** path, which
+    /// pre-stages the workspace via tar-cp ([`workspace_dir`]) and pulls
+    /// results back host-side — no S3. `#[serde(default)]` keeps the wire
+    /// backward-compatible; exactly one of `workspace` / `workspace_dir` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) workspace: Option<InlineWorkspace>,
+    /// Container path of a workspace pre-staged via tar-cp (the docker://
+    /// path). When set, the direct dispatch runs the agent against it and
+    /// skips S3 hydrate + S3 result-push (results come back host-side).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) workspace_dir: Option<String>,
     /// Files copied from the host's `<auth_pillbox>/auth/<agent_id>/`,
     /// to be re-materialized under the agent's `$HOME` on the receiver.
     /// Populated for the direct-exec path ([`dispatch_vault_stdin_direct`])
@@ -176,6 +188,7 @@ impl fmt::Debug for VaultStdinBlob {
             .field("secrets", &self.secrets)
             .field("env_keys", &self.env.keys().collect::<Vec<_>>())
             .field("workspace", &self.workspace)
+            .field("workspace_dir", &self.workspace_dir)
             .field(
                 "agent_auth",
                 &format_args!(
@@ -376,7 +389,13 @@ impl SandboxBackend for RemoteSshSandbox {
         let session_id = Session::new_id();
         let remote = RemoteSession::new(&session_id);
 
-        let mut blob = build_vault_stdin_blob(spec, &opts, resolved, "run --remote")?;
+        let mut blob = build_vault_stdin_blob(
+            spec,
+            &opts,
+            resolved,
+            "run --remote",
+            WorkspaceProvision::S3,
+        )?;
         blob.context = crate::vault::RunContext {
             session_id: Some(session_id.clone()),
             mode: Some(crate::vault::RunContext::mode_for(opts.detach).to_string()),
@@ -421,7 +440,10 @@ impl SandboxBackend for RemoteSshSandbox {
                 agent_id: spec.id.to_string(),
                 started_at: session::now_rfc3339(),
                 attached_pid: None,
-                base_snapshot: blob.workspace.base_snapshot.clone(),
+                base_snapshot: blob
+                    .workspace
+                    .as_ref()
+                    .and_then(|w| w.base_snapshot.clone()),
                 result_snapshot: None,
                 expires_at: opts.ttl_seconds.map(session::expires_at_from_ttl),
             };
@@ -1107,11 +1129,26 @@ fn collect_agent_auth(
     Ok(out)
 }
 
+/// How the receiving sandbox gets its workspace — the one axis that differs
+/// between the S3-hydrate backends and docker://.
+pub(super) enum WorkspaceProvision {
+    /// e2b/ssh: build the S3/rustic [`InlineWorkspace`] so the sandbox
+    /// hydrates the base snapshot and pushes the result through the shared
+    /// repo. Errors if the pillbox isn't on an S3-shaped backend.
+    S3,
+    /// docker://: the workspace is tar-cp'd into the container at this path;
+    /// no S3, results pulled host-side. Carries the container workspace path.
+    // Constructed by `RemoteDockerSandbox::run` (the next slice).
+    #[allow(dead_code)]
+    PreStaged { container_dir: String },
+}
+
 pub(super) fn build_vault_stdin_blob(
     spec: &AgentSpec,
     opts: &RunOpts,
     resolved: &Pillbox,
     action: &'static str,
+    provision: WorkspaceProvision,
 ) -> Result<VaultStdinBlob> {
     // Resolve --with entries locally. Real secret values come from THIS
     // host's vault; only the resolved values cross the wire (once, into
@@ -1188,7 +1225,20 @@ pub(super) fn build_vault_stdin_blob(
         None => std::env::current_dir().context("resolve current working directory")?,
     };
     let workspace_name = workspace_mount_name(&workspace_host, opts.name.as_deref())?;
-    let workspace = build_inline_workspace(resolved, opts, &workspace_host, action)?;
+    // The S3 path snapshots cwd as the base (a write); the pre-staged path
+    // does no S3 work at all — the host tar-cp's the cwd into the container.
+    let (workspace, workspace_dir) = match provision {
+        WorkspaceProvision::S3 => (
+            Some(build_inline_workspace(
+                resolved,
+                opts,
+                &workspace_host,
+                action,
+            )?),
+            None,
+        ),
+        WorkspaceProvision::PreStaged { container_dir } => (None, Some(container_dir)),
+    };
     // Forward the agent's local auth state (OAuth tokens, config) so a
     // sandbox without a pre-existing login (e.g. e2b) can rehydrate it
     // before exec. The Docker-shelled path ignores `agent_auth` and mounts
@@ -1210,6 +1260,7 @@ pub(super) fn build_vault_stdin_blob(
         // dependency on the run-id generator or per-launcher opts).
         context: crate::vault::RunContext::default(),
         workspace,
+        workspace_dir,
         agent_auth,
     })
 }
@@ -1375,6 +1426,18 @@ fn finalize_blob_run(
         "pillbox: result snapshot {}",
         result_snapshot.handle.short()
     );
+    propagate_blob_exit(status, spec_id, action)
+}
+
+/// Translate a non-zero agent exit into a runtime error. The pre-staged
+/// (docker://) path uses this directly — its result snapshot is taken
+/// host-side after the container is reaped, so there's no in-sandbox push to
+/// do, just the exit-code contract.
+fn propagate_blob_exit(
+    status: std::process::ExitStatus,
+    spec_id: &str,
+    action: &'static str,
+) -> Result<()> {
     if !status.success() {
         return Err(PillboxError::runtime(
             action,
@@ -1404,7 +1467,15 @@ pub(crate) fn dispatch_vault_stdin(resolved: &Pillbox, blob_file: Option<&Path>)
         .into());
     }
 
-    let remote_workspace = hydrate_remote_workspace(&blob.workspace)?;
+    // The nested-docker ssh path is S3-only — it has no pre-staged tar-cp
+    // mode (that's docker://). A blob without an S3 workspace can't run here.
+    let workspace = blob.workspace.as_ref().ok_or_else(|| {
+        PillboxError::config(
+            action,
+            "the ssh path requires an S3 workspace in the blob (no pre-staged mode)",
+        )
+    })?;
+    let remote_workspace = hydrate_remote_workspace(workspace)?;
     let workspace_host = remote_workspace.workspace_dir.clone();
     let guest_workspace = format!("{GUEST_WORKSPACE}/{}", blob.workspace_mount_name);
 
@@ -1518,8 +1589,24 @@ pub(crate) fn dispatch_vault_stdin_direct(
     let home_dir = PathBuf::from(&home_env);
     materialize_agent_auth(&home_dir, &blob.agent_auth, action)?;
 
-    let remote_workspace = hydrate_remote_workspace(&blob.workspace)?;
-    let workspace_host = remote_workspace.workspace_dir.clone();
+    // Workspace: pre-staged (docker://, tar-cp'd into the container, no S3)
+    // vs hydrate-from-S3 (e2b). `remote_workspace` (the S3 tempdir) is `None`
+    // for pre-staged — the container path persists with the container, and
+    // the host pulls results back via `docker cp` after exit.
+    let (workspace_host, remote_workspace) = match (&blob.workspace_dir, &blob.workspace) {
+        (Some(dir), _) => (PathBuf::from(dir), None),
+        (None, Some(ws)) => {
+            let rw = hydrate_remote_workspace(ws)?;
+            (rw.workspace_dir.clone(), Some(rw))
+        }
+        (None, None) => {
+            return Err(PillboxError::config(
+                action,
+                "blob carries neither an S3 workspace nor a pre-staged workspace_dir",
+            )
+            .into());
+        }
+    };
 
     // Vault session: in-process here, so the proxy listens on the
     // sandbox's 127.0.0.1 and the agent reaches it without any host
@@ -1598,7 +1685,13 @@ pub(crate) fn dispatch_vault_stdin_direct(
         .status()
         .map_err(|e| PillboxError::runtime(action, format!("spawn `{}`: {e}", spec.id)))?;
     drop(vault_session);
-    finalize_blob_run(remote_workspace, status, spec.id, action)
+    match remote_workspace {
+        // e2b: push the mutated workspace back through the shared S3 repo.
+        Some(rw) => finalize_blob_run(rw, status, spec.id, action),
+        // Pre-staged (docker://): the host pulls results via `docker cp` once
+        // the container exits — no in-sandbox push, just the exit-code contract.
+        None => propagate_blob_exit(status, spec.id, action),
+    }
 }
 
 /// Write every [`AuthFile`] from the blob under `home`, creating parent
@@ -2008,7 +2101,8 @@ mod tests {
                 mode: Some("interactive".into()),
                 workspace_id: Some("-test-workspace".into()),
             },
-            workspace: test_workspace(),
+            workspace: Some(test_workspace()),
+            workspace_dir: None,
             agent_auth: vec![AuthFile {
                 rel_path: ".claude/.credentials.json".into(),
                 mode: 0o600,
@@ -2046,11 +2140,42 @@ mod tests {
         assert!(back.secrets[0].vault_meta.is_none());
         assert!(back.secrets[1].vault_meta.is_some());
         assert_eq!(back.env.get("LOG_LEVEL").map(String::as_str), Some("debug"));
-        assert_eq!(back.workspace.s3.bucket, "bucket");
-        assert_eq!(
-            back.workspace.base_snapshot.as_deref().map(str::len),
-            Some(64)
+        let ws = back.workspace.as_ref().expect("S3 workspace present");
+        assert_eq!(ws.s3.bucket, "bucket");
+        assert_eq!(ws.base_snapshot.as_deref().map(str::len), Some(64));
+        assert!(
+            back.workspace_dir.is_none(),
+            "S3 blob has no pre-staged dir"
         );
+    }
+
+    /// The docker:// shape: a pre-staged `workspace_dir`, no S3 workspace.
+    /// `skip_serializing_if` keeps the absent `workspace` off the wire.
+    #[test]
+    fn blob_round_trips_pre_staged_workspace() {
+        let blob = VaultStdinBlob {
+            version: BLOB_VERSION,
+            agent_id: "claude".into(),
+            agent_args: vec![],
+            workspace_mount_name: "my-app".into(),
+            vault: false,
+            secrets: vec![],
+            env: Default::default(),
+            context: crate::vault::RunContext::default(),
+            workspace: None,
+            workspace_dir: Some("/workspace/my-app".into()),
+            agent_auth: vec![],
+        };
+        let bytes = blob.to_bytes().unwrap();
+        let raw: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            raw.get("workspace").is_none(),
+            "absent S3 workspace is omitted"
+        );
+        assert_eq!(raw["workspace_dir"], "/workspace/my-app");
+        let back = VaultStdinBlob::from_bytes(&bytes).unwrap();
+        assert!(back.workspace.is_none());
+        assert_eq!(back.workspace_dir.as_deref(), Some("/workspace/my-app"));
     }
 
     #[test]

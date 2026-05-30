@@ -48,7 +48,7 @@ use anyhow::{Context, Result};
 
 use crate::attach::pump::{self, Outcome};
 
-use super::remote_ssh::{build_vault_stdin_blob, VaultStdinBlob};
+use super::remote_ssh::{build_vault_stdin_blob, VaultStdinBlob, WorkspaceProvision};
 use super::SandboxBackend;
 use crate::agents::{AgentSpec, RunOpts};
 use crate::config::BackendKind;
@@ -136,7 +136,13 @@ impl SandboxBackend for RemoteE2bSandbox {
         // span. Also reused by `run_attach`'s wrapper invocation
         // (single source of truth for the run's id).
         let session_id = Session::new_id();
-        let mut blob = build_vault_stdin_blob(spec, &opts, resolved, "run --remote (e2b)")?;
+        let mut blob = build_vault_stdin_blob(
+            spec,
+            &opts,
+            resolved,
+            "run --remote (e2b)",
+            WorkspaceProvision::S3,
+        )?;
         blob.context = crate::vault::RunContext {
             session_id: Some(session_id.clone()),
             mode: Some(crate::vault::RunContext::mode_for(opts.detach).to_string()),
@@ -278,7 +284,10 @@ fn run_attach(
                 label,
                 pre_minted_id: &session_id,
                 expires_at: expires_at.clone(),
-                base_snapshot: blob.workspace.base_snapshot.clone(),
+                base_snapshot: blob
+                    .workspace
+                    .as_ref()
+                    .and_then(|w| w.base_snapshot.clone()),
             },
             &pumped,
         )?;

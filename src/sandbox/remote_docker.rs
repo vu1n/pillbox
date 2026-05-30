@@ -93,12 +93,17 @@ impl SandboxBackend for RemoteDockerSandbox {
         // host / missing image fails with a pointed error before we build the
         // secret-bearing blob.
         let runner_image = docker::check_ready_for_at(resolved, &endpoint).map_err(|e| {
-            // The image must exist on the *remote* daemon; the generic hint
-            // says `docker pull <image>` — make it endpoint-aware.
-            let host = endpoint.host_override().unwrap_or("the remote daemon");
-            PillboxError::resource(ACTION, format!("{e}")).with_next(format!(
-                "DOCKER_HOST=ssh://{host} docker pull <runner-image>  # ensure the image is on the remote"
-            ))
+            // The image must exist on the *remote* daemon; make the generic
+            // `docker pull <image>` hint endpoint-aware. `host_override()`
+            // already carries the full `ssh://…` DOCKER_HOST value — don't
+            // re-prefix it.
+            let next = match endpoint.host_override() {
+                Some(docker_host) => format!(
+                    "DOCKER_HOST={docker_host} docker pull <runner-image>  # put the image on the remote daemon"
+                ),
+                None => "docker pull <runner-image>".to_string(),
+            };
+            PillboxError::resource(ACTION, format!("{e}")).with_next(next)
         })?;
 
         // Auth is forwarded into the container via the blob (the direct path

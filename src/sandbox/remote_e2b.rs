@@ -48,7 +48,7 @@ use anyhow::{Context, Result};
 
 use crate::attach::pump::{self, Outcome};
 
-use super::remote_ssh::{build_vault_stdin_blob, VaultStdinBlob, WorkspaceProvision};
+use super::vault_stdin::{build_vault_stdin_blob, VaultStdinBlob, WorkspaceProvision};
 use super::SandboxBackend;
 use crate::agents::{AgentSpec, RunOpts};
 use crate::config::BackendKind;

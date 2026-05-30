@@ -22,6 +22,7 @@ pub(crate) mod local_docker;
 pub(crate) mod remote_docker;
 pub(crate) mod remote_e2b;
 pub(crate) mod remote_ssh;
+pub(crate) mod vault_stdin;
 pub(crate) mod workspace_stage;
 
 use anyhow::Result;

@@ -361,6 +361,35 @@ pub fn cp_stdin_at(
     .into())
 }
 
+/// `docker cp <src> <container>:<dest>` on `endpoint`'s daemon — copy a single
+/// host file into the container (e.g. the staged vault/auth blob). Distinct
+/// from [`cp_stdin_at`], which extracts a tar archive from stdin; this is the
+/// plain file-in form.
+// Wired by the docker:// run assembly (next slice) to stage the blob.
+#[allow(dead_code)]
+pub fn cp_file_at(
+    endpoint: &DockerEndpoint,
+    src: &std::path::Path,
+    container: &str,
+    dest: &str,
+) -> Result<()> {
+    let out = endpoint
+        .command()
+        .arg("cp")
+        .arg(src)
+        .arg(format!("{container}:{dest}"))
+        .output()
+        .context("invoking `docker cp <file>`")?;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(PillboxError::resource(
+        "workspace stage",
+        String::from_utf8_lossy(&out.stderr).trim().to_string(),
+    )
+    .into())
+}
+
 /// `docker exec <container> <argv...>`, streaming output in real time.
 /// `on_chunk(is_stderr, bytes)` fires per read; returns the command's exit
 /// code. stdout and stderr are pumped on separate threads into one ordered

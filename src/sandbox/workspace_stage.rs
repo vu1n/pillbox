@@ -75,14 +75,23 @@ pub(crate) fn stage_workspace(
     let list = tempfile::NamedTempFile::new().context("creating tar manifest tempfile")?;
     std::fs::write(list.path(), &manifest).context("writing tar manifest")?;
 
-    // `tar -C root --null -T manifest -c -f -`: archive exactly the planned
-    // files (relative to root) to stdout, which we pipe into `docker cp -`.
+    // `tar -C root --null -T manifest --no-xattrs -c -f -`: archive exactly the
+    // planned files (relative to root) to stdout, which we pipe into
+    // `docker cp -`. `--no-xattrs` (accepted by both GNU tar and macOS bsdtar)
+    // keeps the archive free of extended attributes — without it, a macOS host
+    // embeds Apple xattrs (`com.apple.provenance`) that make `docker cp`
+    // extraction on a Linux container fail with `lsetxattr ... not supported`.
+    // `COPYFILE_DISABLE=1` additionally suppresses macOS's `._*` AppleDouble
+    // sidecar files (GNU tar ignores the env). xattrs aren't part of a
+    // workspace transfer's contract, so dropping them is correct.
     let mut tar = Command::new("tar")
+        .env("COPYFILE_DISABLE", "1")
         .arg("-C")
         .arg(root)
         .arg("--null")
         .arg("-T")
         .arg(list.path())
+        .arg("--no-xattrs")
         .arg("-c")
         .arg("-f")
         .arg("-")

@@ -10,7 +10,11 @@ disk encryption for at-rest defense. Pillbox does the same.
 > [remotes-redesign.md](./remotes-redesign.md)): (1) the vault MITMs only
 > Anthropic/OpenAI/GitHub and **passes all other hosts through unmodified**
 > (`vault/server.rs:6`) — an agent can exfiltrate any other secret to an
-> unmatched host; the planned fix is strict-deny egress filtering. (2) the
+> unmatched host; the planned fix is strict-deny egress filtering (403 on
+> unmatched). This also bounds the [swarm-memory](./swarm-memory.md) privacy
+> scrub: exact-match against vaulted secrets is **zero-false-negative only for
+> known-provider hosts under strict-deny**, making strict-deny a **prerequisite
+> for any cross-user pooling**. (2) the
 > proposed per-session **blob store of raw, unredacted LLM bodies (incl.
 > reasoning)** is a new at-rest sensitive surface not yet in this threat model —
 > add it before that capture path ships.

@@ -102,6 +102,14 @@ shareable *artifacts* (tuned instructions, policy params) are a third thing
 the optimizer produces, not log events — they get their own scrub gate
 (exclude few-shot demos).
 
+> **Tracked deliverable, not just spec.** The `class` field is **absent from
+> `src` today** and is load-bearing for safe-by-schema pooling — it is one of
+> the substrate primitives the optimization/[swarm-memory](./swarm-memory.md)
+> loops depend on, alongside the two other unbuilt pieces: **persisted traces**
+> (Harden #2 `raw_body`, dropped today at `genai_tap.rs:193`) and the
+> **per-session sequencer** (seq is per-emitter today). None of the loops are
+> safe to pool across users until `class` ships.
+
 ### Ingestion is format-pluggable from day one
 
 The trainset adapter and live producers must parse **foreign trace shapes**,

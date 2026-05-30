@@ -18,6 +18,14 @@ collide across pillboxes.
 > Infisical Agent Vault / Cloudflare Sandbox Outbound) is the planned fix; see
 > [security.md](./security.md). For container backends the vault runs
 > sandbox-side once remotes phase-1 lands.
+>
+> **Consequence for the swarm-memory scrub** ([swarm-memory.md](./swarm-memory.md)):
+> that pipeline exact-matches outbound content against the vault's *real* secret
+> values to strip them before pooling — but that is **zero-false-negative only
+> for secrets sent to known-provider hosts, and only once strict-deny lands**. A
+> secret exfiltrated to an *unmatched* host never transits an inspected path, so
+> the scrub never sees it. Strict-deny egress is therefore a **prerequisite for
+> cross-user pooling**, not just hardening.
 
 For the command reference, see [../AGENTS.md](../AGENTS.md).
 

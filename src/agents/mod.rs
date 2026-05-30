@@ -472,6 +472,14 @@ pub(crate) fn base_docker_args_detached() -> Vec<String> {
     base_docker_args_with(&["-d"])
 }
 
+/// Base args for `docker create` (no stdio prefix): the docker:// path
+/// creates the container, stages the workspace + blob into it, then starts
+/// it — so it can't use the `-d` (run-only) prefix. The pty-host owns the
+/// PTY and the attach relay provides the client TTY, so no `-it` either.
+pub(crate) fn base_docker_args_create() -> Vec<String> {
+    base_docker_args_with(&[])
+}
+
 pub(crate) fn workspace_mount_name(host: &Path, override_name: Option<&str>) -> Result<String> {
     if let Some(name) = override_name {
         if name.is_empty() || name.contains('/') || name.contains('\0') {

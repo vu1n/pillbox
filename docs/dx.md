@@ -147,6 +147,11 @@ in the terminal, watches it think, finds results in cwd when it's done, and
 vaulted secrets just work — with **no** `remote add`, no per-host login, no
 `--vault` ceremony — and the **second** run is not flakier than the first.
 
+The control flow that delivers this — and the three ordering invariants it must
+not violate (stage-before-start, result-before-complete, **creds-persisted-
+before-teardown**) — is the run-assembly lifecycle state machine in
+[remotes-redesign.md](./remotes-redesign.md#run-assembly-lifecycle-the-docker-control-flow).
+
 Parity table (local behavior → what remote must match):
 
 | Transparent behavior | Local today | Remote must match | Status |

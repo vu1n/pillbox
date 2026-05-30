@@ -492,3 +492,74 @@ doesn't). A small, **targeted** Alloy/TLA+ model of the ref-promotion +
 result-durability protocol earns its keep **only if/when multi-master arrives**
 (multi-region managed, offline-first multi-device writes) — and even then scoped
 to I2/I3/I4, not the whole system.
+
+## Run-assembly lifecycle (the docker:// control flow)
+
+The snapshot-lifecycle machine above tracks the *workspace data*; this tracks the
+*run* — the docker:// container control flow the run-assembly slice implements,
+against the [dx.md](./dx.md) "remote feels like local" parity contract. Stating
+it surfaces **three ordering invariants whose violation is a silent footgun**.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Resolved: --remote → DockerEndpoint
+    Resolved --> Preflight: check_ready_at (remote daemon + image)
+    Preflight --> Failed: unreachable / no image / TLS (actionable Next:)
+    Preflight --> BlobBuilt: stage auth (materialize_agent_auth) + vault cfg + run ctx
+    BlobBuilt --> Created: docker create (pty-host + agent), NOT started
+    Created --> Staged: stage_workspace + auth blob INTO the created container
+    Created --> Failed: create error → reap
+    Staged --> Started: docker start → vault sidecar up, agent on 127.0.0.1
+    Staged --> Failed: stage error → reap the created container
+    Started --> Attached: interactive (pty pump over docker exec)
+    Started --> Detached: --detach → write session record, return (container lives on)
+    Detached --> [*]: CLI returns; reattach re-enters at Attached
+    Attached --> Running
+    Running --> Running: live-sync cwd↔container (interactive) / checkpoint (evictable)
+    Running --> AgentExited: agent process exits (code captured)
+    AgentExited --> ResultCaptured: snapshot result → child; cwd already synced (interactive)
+    ResultCaptured --> CredsPersisted: read refreshed tokens back → global store
+    CredsPersisted --> Completed: emit session.completed / .failed
+    Completed --> TornDown: reap container (foreground drop-guard / session rm)
+    TornDown --> [*]
+```
+
+Textual: `Resolved → Preflight → BlobBuilt → Created → Staged → Started →
+{Attached | Detached} → Running → AgentExited → ResultCaptured → CredsPersisted →
+Completed → TornDown`.
+
+### The three ordering invariants (the bases this covers)
+
+1. **Stage before Start** (`Created → Staged → Started`). You can't `docker cp`
+   into a not-yet-created container, and `docker run` would start the agent
+   *before* its workspace + auth exist. Proven on the wire (the workspace_stage
+   ordering test).
+2. **ResultCaptured before Completed** (the event-log **I3** durability
+   invariant): the result snapshot must be durable *before* the run counts done —
+   else a crash in the gap loses the agent's work. On evictable compute
+   (Cloudflare no-SLA) this also forces the `Running → Running` **checkpoint**
+   self-loop (cross-ref the snapshot-SM `Checkpoint` state).
+3. **CredsPersisted before TornDown** (the **2nd-run-401 footgun**). The proxy
+   refreshes OAuth tokens *inside* the container; teardown reaps that container.
+   Read the rotated tokens back to the global store **before** reaping, or run #2
+   gets stale creds → 401 — the read-back-persist contract. It sits on **both**
+   the success and failure exits once the proxy is up (Started onward), not just
+   the happy path.
+
+### Failure + detach edges (don't strand state)
+
+- **Any failure after Created reaps the container** (no orphan): create/stage
+  errors reap immediately; an interactive CLI death reaps via the drop-guard.
+- **A detached container deliberately survives** the CLI — reaped only by
+  `session rm` (which runs TornDown); `session attach` re-enters at Attached. So
+  Detached's exit is **not** TornDown.
+- **Failure after Started still runs CredsPersisted** before teardown (tokens may
+  have rotated) and still emits `session.failed` — a non-zero `AgentExited` is a
+  Failed-Completed, not a skipped path.
+
+### Parity-contract mapping
+
+The dx.md transparent behaviors *are* states here: **terminal** = Attached,
+**watch-it-think** = Running (sandbox tailer), **files-in-cwd** = ResultCaptured
+(detached) or the Running live-sync loop (interactive), **credentials** =
+BlobBuilt (staged in) + CredsPersisted (rotated back).

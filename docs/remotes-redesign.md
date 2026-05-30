@@ -121,8 +121,9 @@ breaks. Secret files/dirs (`.env`-family minus shared templates like
 `.env.example`) are dropped, derived dirs (`node_modules`/`target`) are kept on
 purpose, every drop is **surfaced via `IngestPlan.excluded_secrets` (never
 silent)**, and a 256 MiB ceiling falls back to S3/rustic. The `tar → docker cp`
-*execution* (and the result-pull-vs-local-change policy) land in a follow-on
-slice. For *interactive* live-sync, **Mutagen** is the standard answer behind a
+staging *execution* is built (`workspace_stage.rs` — streamed, NUL-manifest,
+live-tested); the container lifecycle that calls it (+ the per-run overlay-CoW
+fast path and result-pull policy) land in follow-on slices. For *interactive* live-sync, **Mutagen** is the standard answer behind a
 flag; tar-cp stays the correct default for autonomous/detached, rustic for
 content-addressed versioning.
 

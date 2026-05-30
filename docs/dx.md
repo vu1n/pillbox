@@ -116,15 +116,18 @@ Status (reconciled 2026-05-30 against the built docker integration):
   shared templates like `.env.example`) + secret dirs are dropped, derived dirs
   (`node_modules`/`target`) are kept on purpose, and `IngestPlan.excluded_secrets`
   **surfaces every drop — never silent**, with a 256 MiB ceiling → S3 fallback.
-  The "silent `.env` leak" risk is closed at the planning layer; the remaining
-  piece is the `tar → docker cp` execution slice honoring it.
+  The "silent `.env` leak" risk is closed and the staging execution that honors
+  it is built too (`workspace_stage.rs`: `tar → docker cp -`, streamed, live-
+  tested against a real daemon — kept files + `.git` land, `.env`/keys excluded
+  on the wire).
 - **Remote preflight — PARTIAL.** `check_ready_at(endpoint, image)` is now
   endpoint-aware (preflights the *remote* daemon, not just local). Remaining: a
   user-facing `pillbox doctor --remote …` / `remote check` + richer failure
   classification (auth / unreachable / no-docker / TLS), each with its own
   `Next:`. Reference: Coder / DevPod / Daytona.
-- **Still open:** the execution path itself (container lifecycle + workspace
-  materialization); "started means reachable" (echo the exact user-supplied
+- **Still open:** the container lifecycle that wires staging into a run (staging
+  itself is done) + the per-run overlay-CoW fast path; "started means reachable"
+  (echo the exact user-supplied
   endpoint; shadow-note on flag / `docker context` / `DOCKER_HOST` disagreement);
   pull-progress + two-tier verbose output + failure classification (~1GB is
   still an estimate — add a CI image-size check; the runner is 3GB→2GB

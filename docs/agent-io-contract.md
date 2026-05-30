@@ -2,6 +2,13 @@
 
 Status: draft (2026-05-26). Schema: [`proto/pillbox/v1/agent.proto`](../proto/pillbox/v1/agent.proto).
 
+> Extended by [session-event-log.md](./session-event-log.md), which folds this
+> `Event` vocabulary into a per-session durable log (adds a `sessionId`
+> partition key, `actor`, `causationId`, a `Payload::Unknown` fallback). Kept
+> separate — this is the proto-level contract consumers codegen against. Note:
+> the "monotonic per pillbox" `seq` comment is **inaccurate** — `seq` is
+> per-emitter (resets per run/exec).
+
 The primitive: **a PTY-free, structured, bidirectional I/O channel to a
 containerized agent.** pillbox runs the container; consumers
 (orchestrators, Slack/chat, hermes, lum) send JSON and receive JSON and

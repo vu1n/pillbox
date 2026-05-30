@@ -1,33 +1,47 @@
 # Remote backends + sessions
 
+> **Describes shipped v0.6 behavior** (`ssh://` + `e2b://`, S3-backed
+> workspace), plus the first slice of the successor model: `docker://` URLs
+> are now **accepted** (parsed, registered, inline) and dispatch to a
+> dedicated backend, though that backend's execution path is still being
+> built. The full successor model — container-is-primitive, Docker-contexts
+> placement, S3-optional, **e2b deprecated** — is designed in
+> [remotes-redesign.md](./remotes-redesign.md). This doc becomes a thin pointer
+> once `docker://` proves out and e2b is removed.
+
 For the command reference, see [../AGENTS.md](../AGENTS.md). This doc
 covers the design of the remote-execution path: how pillbox decides
 which backend to use, what crosses the wire, and how detached
 sessions are tracked.
 
-## Two backends, one CLI
+## The backends, one CLI
 
 | URL scheme | Backend | What it gets you |
 |---|---|---|
+| `docker://[user@]host[:port]` | `RemoteDockerSandbox` | A remote Docker daemon over SSH transport (`DOCKER_HOST=ssh://…`). The container-is-primitive successor; see [remotes-redesign.md](./remotes-redesign.md). **Status: URL accepted (parse/register/inline); execution path not yet built — `run` errors honestly with the resolved `DOCKER_HOST`.** |
 | `ssh://user@host[:port]` | `RemoteSshSandbox` | Your own VPS. Persistent. You administer the host. |
-| `e2b://TEMPLATE_ID` | `RemoteE2bSandbox` | E2B managed microVM. Ephemeral. Hardware-isolated. |
+| `e2b://TEMPLATE_ID` | `RemoteE2bSandbox` | E2B managed microVM. Ephemeral. Hardware-isolated. (Deprecated — see redesign.) |
 
 ```sh
 pillbox remote add prod-vps   ssh://deploy@vps.example.com
 pillbox remote add prod-cloud e2b://my-pillbox-template
 
-pillbox run --remote prod-vps           # interactive
+pillbox run --remote prod-vps                       # interactive, registered
 pillbox run --remote prod-cloud --detach --label "nightly"
+pillbox run --remote docker://deploy@vps.example    # inline URL, no `remote add`
 ```
 
 The URL string is the discriminator. `Remote::parsed_url` picks the
 backend; everything else (workspace, vault, blob) is identical
-across the two paths.
+across the paths. A `--remote` value containing `://` is treated as an
+**inline URL** (no `remote add` needed); anything else is a registered
+remote name.
 
 ## Distribution requirements
 
 | Backend | Requires |
 |---|---|
+| docker:// | `docker` + `ssh` on PATH locally; the remote host runs `dockerd` and accepts SSH from you. No remote pillbox install — the runner *image* is pulled by the remote daemon. (Execution path pending; see status note above.) |
 | ssh:// | `ssh` on PATH locally (the OpenSSH client). Pillbox itself installed on the remote — we don't deploy binaries. |
 | e2b:// | `node` on PATH locally. `npm i -g e2b` (or `bun add -g e2b`). `E2B_API_KEY` exported. Pillbox baked into the E2B template image. |
 

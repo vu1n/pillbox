@@ -12,6 +12,13 @@ own CA + key at `<state_dir>/vault/`. A run inside project `myapp` uses
 `--pillbox global` uses `~/.pillbox/global/vault/`. Leases never
 collide across pillboxes.
 
+> **Egress note:** the proxy MITMs only matched hosts (Anthropic/OpenAI/GitHub)
+> and **passes non-matched hosts through unmodified** — so it is not a general
+> exfiltration guard today. Strict-deny egress filtering (403 on unmatched, à la
+> Infisical Agent Vault / Cloudflare Sandbox Outbound) is the planned fix; see
+> [security.md](./security.md). For container backends the vault runs
+> sandbox-side once remotes phase-1 lands.
+
 For the command reference, see [../AGENTS.md](../AGENTS.md).
 
 ## When to use it

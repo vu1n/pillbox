@@ -5,6 +5,12 @@ from. Source lives in [`runner/Dockerfile`](../runner/Dockerfile);
 canonical builds are published to GitHub Container Registry on
 every tagged CLI release.
 
+> **Forward note:** image size is currently an *estimate* (nothing measures it —
+> add a CI image-size check). Image slimming (Wolfi/distroless + eStargz/SOCI
+> lazy-pull) and a `doctor` host↔image version-compat check are on the
+> [remotes-redesign](./remotes-redesign.md) roadmap; the cold `docker pull` is
+> the BYO first-run cost to beat.
+
 ## What's in it
 
 Five agent CLIs preinstalled at known paths:

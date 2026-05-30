@@ -6,6 +6,15 @@ class: `gh`, `aws`, `docker`, `kubectl`. They all store credentials as
 plaintext files at 0600 under the user's home, and rely on the host's
 disk encryption for at-rest defense. Pillbox does the same.
 
+> **Two gaps the vNext work must address** (tracked in [vnext.md](./vnext.md) /
+> [remotes-redesign.md](./remotes-redesign.md)): (1) the vault MITMs only
+> Anthropic/OpenAI/GitHub and **passes all other hosts through unmodified**
+> (`vault/server.rs:6`) — an agent can exfiltrate any other secret to an
+> unmatched host; the planned fix is strict-deny egress filtering. (2) the
+> proposed per-session **blob store of raw, unredacted LLM bodies (incl.
+> reasoning)** is a new at-rest sensitive surface not yet in this threat model —
+> add it before that capture path ships.
+
 ## What pillbox defends against
 
 | Threat | How pillbox mitigates |

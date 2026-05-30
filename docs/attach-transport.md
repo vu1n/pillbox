@@ -12,6 +12,15 @@ at a shell). The two are siblings, not alternatives — `agent.proto` line
 21 already carves this out: "Interactive PTY … uses pillbox's existing
 attach transport." This document **is** that transport, formalized.
 
+> Built on by the vNext design: [remotes-redesign.md](./remotes-redesign.md)
+> treats this `Frame` protocol as the cross-backend interface (docker-exec / ssh
+> / k8s-exec are transports against the same pump);
+> [session-event-log.md](./session-event-log.md) adds periodic `pty_snapshot`
+> events sourced from `Frame::Snapshot`. **Gap to close before web fan-out:** the
+> v1 `Frame` header is `type+len` only — adopt `sshx`'s per-stream `seq`/`ack` +
+> catch-up shape and a bounded broadcast window first (`host.rs` broadcast is
+> currently unbounded).
+
 pillbox owns the sandbox-side screen model so an embedder can treat a
 remote agent session as a **local renderable object**: connect, get the
 current screen, stream input/output, resize, detach, reconnect — across

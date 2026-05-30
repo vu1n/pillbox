@@ -5,6 +5,12 @@ any specific backend. Point it at [Raindrop Workshop][workshop] for a
 local-first debugger UI, at your team's collector for production-grade
 storage, or at both — the wire format is the same.
 
+> **Forward note:** the [event-log redesign](./session-event-log.md) will unify
+> these sinks onto **one per-session log** (the sinks become exporters that
+> *read* the log) and replace the self-reported `emitter` tag with an
+> authenticated `actor`; `events.jsonl` becomes a lifecycle-only projection.
+> This doc describes shipped behavior until that lands.
+
 For the command reference, see [../AGENTS.md](../AGENTS.md).
 
 [workshop]: https://github.com/raindrop-ai/workshop

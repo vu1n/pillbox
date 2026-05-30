@@ -798,9 +798,24 @@ pub(crate) fn kill_session(
 
 fn read_blob(blob_file: Option<&Path>, action: &'static str) -> Result<VaultStdinBlob> {
     let buf = match blob_file {
-        Some(path) => fs::read(path).map_err(|e| {
-            PillboxError::runtime(action, format!("read blob file {}: {e}", path.display()))
-        })?,
+        Some(path) => {
+            let buf = fs::read(path).map_err(|e| {
+                PillboxError::runtime(action, format!("read blob file {}: {e}", path.display()))
+            })?;
+            // SECURITY: the blob carries real OAuth + `--with` secret values.
+            // We've now read it fully into memory, so scrub it from the sandbox
+            // immediately — otherwise it lingers on disk (e.g. docker://'s
+            // `/tmp/pillbox-blob-<id>.json`) where an untrusted agent, running
+            // as root in its own container, could read the real credentials the
+            // vault exists to withhold. The e2b/ssh wrappers also `rm` it, but
+            // doing it here is backend-agnostic (covers docker://, which has no
+            // wrapper) and survives a wrapper whose trailing `rm` never runs.
+            // Truncate before unlink so the content is gone even if the unlink
+            // fails; both are best-effort (cleanup must not abort a valid run).
+            let _ = fs::write(path, b"");
+            let _ = fs::remove_file(path);
+            buf
+        }
         None => {
             let mut buf = Vec::new();
             std::io::stdin()
@@ -1221,6 +1236,41 @@ fn hydrate_remote_workspace(workspace: &InlineWorkspace) -> Result<RemoteWorkspa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SECURITY regression: `read_blob` must scrub the on-disk blob (real
+    /// OAuth + secrets) the moment it's read, so it can't linger in the
+    /// sandbox for an untrusted agent to recover. Guards the docker:// vault
+    /// bypass (the blob is `docker cp`'d to a predictable container path with
+    /// no shell wrapper to `rm` it).
+    #[test]
+    fn read_blob_unlinks_the_file() {
+        use std::io::Write as _;
+        let blob = VaultStdinBlob {
+            version: crate::sandbox::vault_stdin::BLOB_VERSION,
+            agent_id: "claude".into(),
+            agent_args: vec![],
+            workspace_mount_name: "w".into(),
+            vault: false,
+            secrets: vec![],
+            env: Default::default(),
+            context: crate::vault::RunContext::default(),
+            workspace: None,
+            workspace_dir: Some("/workspace".into()),
+            agent_auth: vec![],
+        };
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(&blob.to_bytes().unwrap()).unwrap();
+        let path = tmp.path().to_path_buf();
+        assert!(path.exists());
+
+        let back = read_blob(Some(&path), "test").expect("read");
+        assert_eq!(back.agent_id, "claude");
+        assert!(
+            !path.exists(),
+            "blob must be unlinked after read so creds don't linger in the sandbox"
+        );
+        drop(tmp); // its Drop tolerates the already-removed file
+    }
 
     #[test]
     fn remote_session_paths_are_session_scoped() {

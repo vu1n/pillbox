@@ -282,7 +282,18 @@ pub fn create_at(endpoint: &DockerEndpoint, args: &[String]) -> Result<String> {
         )
         .into());
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if id.is_empty() {
+        // Guard the "failure-after-Created reaps" invariant: an empty id would
+        // make staging/start operate on `":dest"` and the reap a no-op, leaking
+        // any container that was actually created.
+        return Err(PillboxError::resource(
+            "sandbox create",
+            "docker create reported success but returned no container id",
+        )
+        .into());
+    }
+    Ok(id)
 }
 
 /// `docker start <container>` on `endpoint`'s daemon — start a container

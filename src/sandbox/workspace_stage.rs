@@ -16,6 +16,7 @@
 //! mechanism against a real daemon now.
 #![allow(dead_code)]
 
+use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -90,24 +91,36 @@ pub(crate) fn stage_workspace(
         .spawn()
         .context("invoking `tar` to stage workspace")?;
     let tar_stdout = tar.stdout.take().expect("piped tar stdout");
+    // Drain tar's stderr on a thread. Otherwise a chatty tar (a per-file
+    // warning like "file changed as we read it" on an active tree) fills the
+    // stderr pipe buffer, tar blocks writing it, stops producing stdout, and
+    // docker — still reading stdin — deadlocks. Draining concurrently is the
+    // only safe way to consume two pipes from one child.
+    let mut tar_stderr = tar.stderr.take().expect("piped tar stderr");
+    let stderr_drain = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = tar_stderr.read_to_end(&mut buf);
+        buf
+    });
 
     let cp = docker::cp_stdin_at(endpoint, container, dest, Stdio::from(tar_stdout));
+    let tar_status = tar.wait().context("waiting on `tar`")?;
+    let tar_stderr = stderr_drain.join().unwrap_or_default();
 
-    // Reap tar regardless of how docker fared, then surface the more useful
-    // error: a `tar` failure (e.g. a vanished file) explains a docker cp that
-    // received a truncated stream.
-    let tar_out = tar.wait_with_output().context("waiting on `tar`")?;
-    if !tar_out.status.success() {
+    // A docker cp failure is the root cause (e.g. `dest` missing) — surface it,
+    // not the EPIPE tar gets when docker closes the stream early. Only when
+    // docker succeeded do we treat a non-zero tar as the failure.
+    cp?;
+    if !tar_status.success() {
         return Err(PillboxError::runtime(
             "workspace stage",
             format!(
                 "tar failed: {}",
-                String::from_utf8_lossy(&tar_out.stderr).trim()
+                String::from_utf8_lossy(&tar_stderr).trim()
             ),
         )
         .into());
     }
-    cp?;
 
     Ok(StageReport {
         files: plan.files.len(),

@@ -285,6 +285,36 @@ pub fn run_detached_at(endpoint: &DockerEndpoint, args: &[String]) -> Result<Str
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// `docker cp - <container>:<dest>` on `endpoint`'s daemon, reading a tar
+/// archive from `stdin` and extracting it under `dest` (which must already
+/// exist in the container). This is how a workspace is staged into a
+/// container *without* a bind-mount — the docker:// / remote path, where the
+/// daemon can't see the host's cwd. `stdin` is typically the piped stdout of
+/// a `tar` child, so the transfer streams rather than buffering the tree.
+pub fn cp_stdin_at(
+    endpoint: &DockerEndpoint,
+    container: &str,
+    dest: &str,
+    stdin: Stdio,
+) -> Result<()> {
+    let out = endpoint
+        .command()
+        .arg("cp")
+        .arg("-")
+        .arg(format!("{container}:{dest}"))
+        .stdin(stdin)
+        .output()
+        .context("invoking `docker cp -`")?;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(PillboxError::resource(
+        "workspace stage",
+        String::from_utf8_lossy(&out.stderr).trim().to_string(),
+    )
+    .into())
+}
+
 /// `docker exec <container> <argv...>`, streaming output in real time.
 /// `on_chunk(is_stderr, bytes)` fires per read; returns the command's exit
 /// code. stdout and stderr are pumped on separate threads into one ordered

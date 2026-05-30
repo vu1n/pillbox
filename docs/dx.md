@@ -134,6 +134,87 @@ Status (reconciled 2026-05-30 against the built docker integration):
   post-cleanup); graded version-skew (minor→WARN, major→fail-with-upgrade) on
   the doctor `runner_image` check.
 
+## Remote feels like local — the parity contract
+
+Journey 3 gets a docker:// run to *start*; this is the contract for how the
+*running* experience must match local. **The principle: placement is invisible.**
+Same command, same four transparent behaviors — terminal, files-in-cwd,
+credentials, watch-it-think — the user never thinks about *where* it runs, how
+auth got there, or that the vault is sandbox-side.
+
+Acceptance: a dev runs `pillbox run --remote docker://host`, watches the agent
+in the terminal, watches it think, finds results in cwd when it's done, and
+vaulted secrets just work — with **no** `remote add`, no per-host login, no
+`--vault` ceremony — and the **second** run is not flakier than the first.
+
+Parity table (local behavior → what remote must match):
+
+| Transparent behavior | Local today | Remote must match | Status |
+|---|---|---|---|
+| Command | `pillbox run` | `--remote docker://host`, inline | ✅ |
+| Terminal (PTY) | direct | `docker exec` over `DOCKER_HOST` | ✅ transport |
+| Watch it think | host tailer on `~/.claude` | sandbox-side tailer streams spans (eff5489) | ✅ reuse |
+| Files in cwd | bind-mount, live | live-sync (interactive) / snapshot (detached) | ⬜ run-assembly |
+| Credentials | host proxy + `$HOME` mount | sandbox-side proxy + staged auth, transparent | ⬜ run-assembly |
+| Auth setup | `~/.pillbox` mounted | staged from global, no per-host login | ⬜ run-assembly |
+
+### The workspace rule: the *interaction model* picks the strategy (no flag)
+
+Local bind-mount is live; the naive remote path is push-run-pull, which traps
+the agent's edits in the container. Resolve it the way local already splits
+live-vs-detached — **automatically, by interaction model**:
+
+- **Interactive `pillbox run --remote`** → **live-sync** (cwd↔container): edits
+  appear in the user's editor as the agent makes them, results are already in
+  cwd on exit. The "feels like local" path.
+- **`--detach` / autonomous / fleet** → **snapshot-fork** (overlay-CoW over the
+  rustic base): results land via snapshot→pull; this is where fork-from-store
+  earns its keep (fan out N agents from one base).
+
+Crucially, **liveness and materialization are orthogonal layers**, not competing
+models: live-sync is the interactive overlay *on top of* the same container +
+vault + attach stack; the on-exit snapshot still captures cwd→store (host-side
+authority, the single-ref-writer invariant from
+[remotes-redesign.md](./remotes-redesign.md) intact). The user never picks; the
+mode follows interactive-vs-`--detach`.
+
+### Vault just works — and docker:// is *cleaner* than e2b
+
+Three requirements, one of them subtle:
+
+1. **Real container localhost.** A docker:// container is a normal container, so
+   the stub-swap proxy runs as a **sidecar inside it** and the agent hits
+   `127.0.0.1` — no e2b-style command-API relay hop ("strictly simpler than
+   e2b," per remotes-redesign).
+2. **No flags.** Vaulted secrets auto-wire the sandbox-side proxy (the same
+   `any_vaulted` trigger as local), carried in the blob — the user never types
+   `--vault-stdin-direct` (internal) or even `--vault`.
+3. **The token round-trip (the 2nd-run correctness bit).** Creds are staged in
+   via the blob; the agent refreshes them *inside* the container; on teardown
+   the refreshed tokens must be **read back and persisted to the global store**
+   — the same read-back-persist as the recurring-401 fix. Stage-in *and*
+   persist-back, or run #1 works and run #2 gets stale tokens → 401, which reads
+   as "vault is flaky."
+
+Bonus: because the proxy lives in the container, **remote `--detach` + vault
+works** — which local detach cannot (the host proxy can't outlive the CLI). On
+this axis remote is *better* than local.
+
+### Build tiering
+
+- **Tier 1 — the run-assembly slice (most of "feels like local"):** stage auth
+  from global (no per-host login) + sandbox-side vault auto-wired + results
+  auto-land in cwd on a foreground run. Terminal + watch-it-think already work;
+  this closes the rest of the run→review loop. Note this is mostly the **same
+  run-assembly slice already scoped next** — it just sets the *defaults* (vault
+  on, results land, auth transparent) instead of exposing flags.
+- **Tier 2 — polish:** live container→host file tailing during interactive runs
+  — lean toward a **sandbox-side inotify watcher streaming changed files back
+  over the existing frame protocol** (one-way, no new daemon dependency) over
+  adopting **Mutagen** (bidirectional, heavier); + **cold-pull progress** (the
+  one latency cliff worth surfacing so a fresh-host `docker pull` doesn't read as
+  a hang).
+
 ## The profile primitive (currently 0% surface)
 
 vNext leans on "pillbox already has profiles" for Aquifer-parity and the

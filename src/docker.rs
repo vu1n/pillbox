@@ -401,6 +401,31 @@ pub fn cp_file_at(
     .into())
 }
 
+/// `docker inspect` the container's run state on `endpoint`'s daemon.
+/// Returns `Some(exit_code)` if it has exited, `None` if it's still running
+/// (or the inspect failed). Lets the docker:// backend report a fast-exiting
+/// agent's real status when the attach relay couldn't reach a container that
+/// already stopped.
+#[allow(dead_code)]
+pub fn container_exit_code_at(endpoint: &DockerEndpoint, container: &str) -> Option<i32> {
+    let out = endpoint
+        .command()
+        .arg("inspect")
+        .arg("-f")
+        .arg("{{.State.Running}} {{.State.ExitCode}}")
+        .arg(container)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut fields = stdout.split_whitespace();
+    let running = fields.next()? == "true";
+    let code: i32 = fields.next()?.parse().ok()?;
+    (!running).then_some(code)
+}
+
 /// `docker exec <container> <argv...>`, streaming output in real time.
 /// `on_chunk(is_stderr, bytes)` fires per read; returns the command's exit
 /// code. stdout and stderr are pumped on separate threads into one ordered

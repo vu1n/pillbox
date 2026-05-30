@@ -210,6 +210,24 @@ impl SandboxBackend for RemoteDockerSandbox {
         //   container's refreshed auth out → persist to the global store, or a
         //   second run gets stale tokens → 401. Must run BEFORE the guard reaps.
 
+        // A fast, non-interactive agent (e.g. `claude -p`) can exit before the
+        // attach relay connects; the relay then can't reach a stopped container
+        // and the pump sees an immediate `Disconnected`. The container's own
+        // exit code is the authoritative result in that case — prefer it over
+        // the pump outcome so the run reports the agent's status, not a relay
+        // hiccup. (Streaming a fast agent's *output* is the deferred
+        // result-capture path; headless docker:// will surface it via pull.)
+        if let Some(code) = docker::container_exit_code_at(&endpoint, &container) {
+            return match code {
+                0 => Ok(()),
+                c => Err(PillboxError::runtime(
+                    ACTION,
+                    format!("{} exited with status {c}", spec.id),
+                )
+                .into()),
+            };
+        }
+
         match outcome? {
             Outcome::Exited(0) | Outcome::Detached | Outcome::Disconnected => Ok(()),
             Outcome::Exited(code) => Err(PillboxError::runtime(

@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # Runner image for pillbox sandboxes.
 #
 # Five agent harnesses preinstalled at known paths:
@@ -38,7 +39,14 @@ FROM rust:1-bookworm AS pillbox-build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --release --locked && cp target/release/pillbox /pillbox
+# Cache mounts keep the cargo registry + compiled deps on the build daemon, so
+# a rebuild on the same host only recompiles changed crates (minutes → seconds
+# on iteration — the BYO/on-target build loop). The `runner` profile skips
+# release LTO for a much faster compile (see Cargo.toml). `cp` runs inside the
+# same RUN so it grabs the binary before the target cache mount detaches.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --profile runner --locked && cp target/runner/pillbox /pillbox
 
 # ---- runtime stage -----------------------------------------------------
 FROM debian:bookworm-slim

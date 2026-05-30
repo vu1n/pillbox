@@ -109,3 +109,13 @@ otel-grpc = ["opentelemetry-otlp/grpc-tonic"]
 strip = true
 lto = "thin"
 codegen-units = 1
+
+# Profile for the in-sandbox pillbox baked into the runner image. That binary
+# is `pty-host` + the vault proxy + blob plumbing — I/O-bound, not a hot path —
+# so it doesn't need release LTO/single-codegen-unit. Trading those for a much
+# faster compile (the runner image rebuilds on every BYO/on-target build).
+[profile.runner]
+inherits = "release"
+opt-level = 1
+lto = false
+codegen-units = 16

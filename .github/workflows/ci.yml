@@ -41,3 +41,7 @@ jobs:
       - run: cargo test --all-targets
       - if: matrix.os == 'ubuntu-latest'
         run: cargo clippy --all-targets -- -D warnings
+      # NOTE: the docker:// mechanism tests (workspace staging + container
+      # lifecycle, `#[ignore]`d) deliberately do NOT run here — a docker job
+      # burns the free-minutes allocation. Run them locally / on a self-hosted
+      # box with `scripts/test-docker-mechanism.sh` (needs a Docker daemon).

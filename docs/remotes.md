@@ -50,6 +50,46 @@ remote name.
 backends themselves (they fail loudly on first use with an
 actionable hint).
 
+## Verifying docker:// (two tiers)
+
+The docker:// path is verified at two levels — both **local / on-demand**, not
+GitHub CI (a docker job there burns the free-minutes allocation; the full
+agent+vault round-trip also needs `pillbox auth login` creds + a real host):
+
+- **Mechanism (`scripts/test-docker-mechanism.sh`).** Runs the workspace-staging
+  + container-lifecycle `#[ignore]` tests against a real daemon using a tiny
+  image (`busybox` — they only need `tar`/`sleep`/`test`). Guards the
+  **create → stage → start** ordering and the **secret-denylist** on the wire.
+  Run locally or on a self-hosted box; point at a remote daemon with
+  `DOCKER_HOST=ssh://… scripts/test-docker-mechanism.sh`.
+- **Agent + vault (on-demand runbook).** `scripts/verify-remote-docker.sh`
+  exercises the real round-trip against a host you provide. It builds the
+  from-branch runner image **natively on the target** (the version-skew-safe
+  pattern — a laptop-built image is the wrong arch for an amd64 host), runs a
+  headless agent, and asserts the agent completed (vault round-trip) and the
+  workspace `.env` was excluded (I6). Run it before releases / when the
+  docker:// path changes:
+
+  > **Image delivery, BYO.** Building over `DOCKER_HOST=ssh://` is convenient
+  > but **buildkit-over-ssh is flaky** (intermittent "no active session" /
+  > "context deadline exceeded" — the harness retries). For production BYO,
+  > prefer **publishing a prebuilt multi-arch image and `docker pull`ing it on
+  > the host**: the host pulls over its datacenter link (fast) and you avoid the
+  > ssh-buildkit session entirely. Build-on-target is the dev/branch path. The
+  > runner image itself builds fast on a warm daemon — BuildKit cache mounts
+  > keep cargo deps compiled, and the in-image binary uses a lighter
+  > `runner` profile (no release LTO) — so iteration is cheap once the cache
+  > is warm.
+
+  ```sh
+  pillbox auth login --agent claude               # once — Tier 3 needs creds
+  REMOTE=docker://user@host scripts/verify-remote-docker.sh
+  ```
+
+  (Streaming a fast headless agent's *output* awaits the result-capture slice —
+  the agent exits before the PTY attach connects; the harness asserts exit
+  status + the I6 exclusion note instead.)
+
 ## What crosses the wire
 
 Both backends use the same internal "vault-stdin blob" shape:

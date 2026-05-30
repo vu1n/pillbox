@@ -121,7 +121,7 @@ impl SandboxBackend for RemoteE2bSandbox {
             )
         })? {
             RemoteUrl::E2b(e) => e,
-            RemoteUrl::Ssh(_) => {
+            RemoteUrl::Ssh(_) | RemoteUrl::Docker(_) => {
                 return Err(PillboxError::config(
                     "run --remote (e2b)",
                     format!("remote `{}` is not an e2b:// URL", self.remote.name),

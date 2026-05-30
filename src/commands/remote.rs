@@ -25,8 +25,9 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: RemoteAction) -> Result<()> {
             let url = url.or(url_flag).ok_or_else(|| {
                 PillboxError::usage(
                     "remote add",
-                    "missing SSH URL — pass it positionally: \
-                     `pillbox remote add NAME ssh://user@host`",
+                    "missing remote URL — pass it positionally: \
+                     `pillbox remote add NAME docker://user@host` \
+                     (or ssh://… / e2b://TEMPLATE_ID)",
                 )
             })?;
             remote::add(

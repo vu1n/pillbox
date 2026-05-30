@@ -236,7 +236,7 @@ pub(crate) enum AuthAction {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum RemoteAction {
-    /// Register a remote VPS for use with `pillbox run --remote NAME`.
+    /// Register a remote for use with `pillbox run --remote NAME`.
     ///
     /// Two positional args: `NAME URL`, matching `git remote add`. The
     /// long `--url` spelling is accepted as a hidden alias so scripts
@@ -244,8 +244,10 @@ pub(crate) enum RemoteAction {
     Add {
         /// Display name. Used as `pillbox run --remote NAME`.
         name: String,
-        /// SSH destination URL: `ssh://user@host[:port]`. Either
-        /// positional or via `--url`; exactly one form is required.
+        /// Remote URL: `docker://[user@]host[:port]` (remote Docker daemon
+        /// over SSH), `ssh://user@host[:port]` (VPS over openssh), or
+        /// `e2b://TEMPLATE_ID` (E2B managed sandbox). Either positional or
+        /// via `--url`; exactly one form is required.
         url: Option<String>,
         /// Hidden alias for the positional URL — see the command docs.
         #[arg(long = "url", value_name = "URL", hide = true, conflicts_with = "url")]

@@ -23,8 +23,12 @@
 //!
 //! ## URL shapes
 //!
-//! - `ssh://user@host[:port]` → VPS over openssh.
-//! - `e2b://TEMPLATE_ID`      → E2B managed sandbox.
+//! - `ssh://user@host[:port]`        → VPS over openssh (legacy backend).
+//! - `e2b://TEMPLATE_ID`             → E2B managed sandbox (deprecated).
+//! - `docker://[user@]host[:port]`   → remote Docker daemon over SSH
+//!   transport (`DOCKER_HOST=ssh://…`); runs the runner image there. The
+//!   container-is-the-primitive backend the ssh/e2b paths collapse onto —
+//!   see [docs/remotes-redesign.md](../docs/remotes-redesign.md).
 //!
 //! [`parse_remote_url`] is the single dispatch point; the on-disk shape
 //! never grew a `kind` field — keeping `url` as the discriminator means
@@ -52,8 +56,9 @@ pub(crate) const REMOTES_DIR: &str = "remotes";
 pub(crate) struct Remote {
     /// Display name. Must match the file stem (`<name>.toml`).
     pub(crate) name: String,
-    /// Remote URL — `ssh://user@host[:port]` or `e2b://TEMPLATE_ID`.
-    /// Parsed by [`parse_remote_url`] at register and connect time.
+    /// Remote URL — `docker://[user@]host[:port]`, `ssh://user@host[:port]`,
+    /// or `e2b://TEMPLATE_ID`. Parsed by [`parse_remote_url`] at register
+    /// and connect time.
     pub(crate) url: String,
     /// Default agent for `pillbox run --remote NAME` (overrides the
     /// pillbox's own `agent` field). Optional.
@@ -70,6 +75,9 @@ pub(crate) enum RemoteUrl {
     Ssh(SshUrl),
     /// E2B managed cloud sandbox keyed by template id.
     E2b(E2bRef),
+    /// Remote Docker daemon reached over SSH transport
+    /// (`DOCKER_HOST=ssh://…`). The container-is-the-primitive backend.
+    Docker(DockerUrl),
 }
 
 impl RemoteUrl {
@@ -78,6 +86,7 @@ impl RemoteUrl {
         match self {
             RemoteUrl::Ssh(_) => "ssh",
             RemoteUrl::E2b(_) => "e2b",
+            RemoteUrl::Docker(_) => "docker",
         }
     }
 }
@@ -126,6 +135,41 @@ pub(crate) struct E2bRef {
     pub(crate) template: String,
 }
 
+/// Decomposed `docker://[user@]host[:port]` URL — a remote Docker daemon
+/// reached over Docker's SSH transport. The backend sets
+/// `DOCKER_HOST=ssh://[user@]host[:port]` and runs the runner image on
+/// that daemon, so the placement axis is a first-class Docker feature
+/// rather than the 2101 LOC `remote_ssh.rs` hand-rolls (see
+/// [docs/remotes-redesign.md](../docs/remotes-redesign.md)).
+///
+/// `user` is optional: a bare `docker://host` defers to SSH's own default
+/// user (`~/.ssh/config` / `$USER`), matching `docker -H ssh://host`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DockerUrl {
+    pub(crate) user: Option<String>,
+    pub(crate) host: String,
+    pub(crate) port: Option<u16>,
+}
+
+impl DockerUrl {
+    /// Render the `DOCKER_HOST` value Docker's SSH transport accepts —
+    /// `ssh://[user@]host[:port]`. This is the env var the backend exports
+    /// so every `docker` invocation targets the remote daemon.
+    pub(crate) fn docker_host(&self) -> String {
+        let mut out = String::from("ssh://");
+        if let Some(u) = &self.user {
+            out.push_str(u);
+            out.push('@');
+        }
+        out.push_str(&self.host);
+        if let Some(p) = self.port {
+            out.push(':');
+            out.push_str(&p.to_string());
+        }
+        out
+    }
+}
+
 /// Dispatch on URL scheme. The only public validator the registry uses
 /// on write / read; backend-specific parsers ([`parse_ssh_url`] /
 /// [`parse_e2b_url`]) are kept around for callers (e.g. the SSH backend
@@ -138,8 +182,11 @@ pub(crate) fn parse_remote_url(url: &str) -> Result<RemoteUrl, String> {
     if url.starts_with("e2b://") {
         return parse_e2b_url(url).map(RemoteUrl::E2b);
     }
+    if url.starts_with("docker://") {
+        return parse_docker_url(url).map(RemoteUrl::Docker);
+    }
     Err(format!(
-        "unsupported URL scheme in `{url}` (expected `ssh://user@host[:port]` or `e2b://TEMPLATE_ID`)"
+        "unsupported URL scheme in `{url}` (expected `docker://[user@]host[:port]`, `ssh://user@host[:port]`, or `e2b://TEMPLATE_ID`)"
     ))
 }
 
@@ -172,6 +219,52 @@ pub(crate) fn parse_e2b_url(url: &str) -> Result<E2bRef, String> {
     })
 }
 
+/// Validate + parse a `docker://[user@]host[:port]` URL into the pieces
+/// the Docker SSH transport needs. Unlike [`parse_ssh_url`], the `user@`
+/// segment is optional — Docker (and openssh) fall back to the default
+/// user when it's omitted, so `docker://host` is the common BYO form.
+/// Richer transport config (identity files, jump hosts) belongs in
+/// `~/.ssh/config`, not the registry.
+pub(crate) fn parse_docker_url(url: &str) -> Result<DockerUrl, String> {
+    let rest = url
+        .strip_prefix("docker://")
+        .ok_or_else(|| format!("expected `docker://[user@]host[:port]`, got `{url}`"))?;
+    if rest.is_empty() {
+        return Err(format!(
+            "missing host in `{url}` (expected `docker://[user@]host[:port]`)"
+        ));
+    }
+    let (user, host_port) = match rest.split_once('@') {
+        Some(("", _)) => return Err(format!("empty user in `{url}`")),
+        Some((u, hp)) => (Some(u.to_string()), hp),
+        None => (None, rest),
+    };
+    let (host, port) = split_host_port(host_port, url)?;
+    Ok(DockerUrl { user, host, port })
+}
+
+/// Split the `host[:port]` tail shared by the `ssh://` and `docker://`
+/// parsers: validate the port and reject an empty host. The two scheme
+/// parsers differ only in their (required vs optional) user handling — this
+/// is the common tail, so a future fix (IPv6 brackets, a max-port message)
+/// lands in one place.
+fn split_host_port(host_port: &str, url: &str) -> Result<(String, Option<u16>), String> {
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((h, p)) => (
+            h,
+            Some(
+                p.parse::<u16>()
+                    .map_err(|_| format!("invalid port `{p}` in `{url}`"))?,
+            ),
+        ),
+        None => (host_port, None),
+    };
+    if host.is_empty() {
+        return Err(format!("empty host in `{url}`"));
+    }
+    Ok((host.to_string(), port))
+}
+
 /// Validate + parse an `ssh://user@host[:port]` URL. Richer schemes
 /// (key path overrides, etc.) can go through `~/.ssh/config` instead
 /// of being baked into the registry.
@@ -185,21 +278,10 @@ pub(crate) fn parse_ssh_url(url: &str) -> Result<SshUrl, String> {
     if user.is_empty() {
         return Err(format!("empty user in `{url}`"));
     }
-    let (host, port) = match host_port.rsplit_once(':') {
-        Some((h, p)) => {
-            let parsed: u16 = p
-                .parse()
-                .map_err(|_| format!("invalid port `{p}` in `{url}`"))?;
-            (h, Some(parsed))
-        }
-        None => (host_port, None),
-    };
-    if host.is_empty() {
-        return Err(format!("empty host in `{url}`"));
-    }
+    let (host, port) = split_host_port(host_port, url)?;
     Ok(SshUrl {
         user: user.to_string(),
-        host: host.to_string(),
+        host,
         port,
     })
 }
@@ -244,6 +326,37 @@ pub(crate) fn read_inherited(resolved: &Pillbox, name: &str) -> Result<Option<(R
 /// Same as [`read_inherited`] but only returns the [`Remote`].
 pub(crate) fn read(resolved: &Pillbox, name: &str) -> Result<Option<Remote>> {
     Ok(read_inherited(resolved, name)?.map(|(r, _)| r))
+}
+
+/// Resolve a `--remote` value to a [`Remote`]. The single home for
+/// run-target resolution policy so `pillbox run` (and, later, `session
+/// attach/rm` re-resolution) don't each re-derive the name-vs-URL split:
+///
+/// - A value containing `://` is an **inline URL** — validated and used
+///   directly, no `remote add` required. A registered name can never
+///   contain `://` ([`validate_name`] rejects it), so the scheme marker is
+///   an unambiguous discriminator. The URL doubles as the `name` (there's
+///   no registry entry to borrow one from).
+/// - Anything else is a **registered remote name**, looked up with
+///   project→global inheritance.
+///
+/// NOTE: a detached run against an inline URL records the URL as its
+/// `remote`; re-resolving inline-URL sessions for `session attach/rm` is a
+/// follow-on (phase 3).
+pub(crate) fn resolve_run_target(resolved: &Pillbox, target: &str) -> Result<Remote> {
+    if target.contains("://") {
+        parse_remote_url(target).map_err(|e| PillboxError::usage("run --remote", e))?;
+        return Ok(Remote {
+            name: target.to_string(),
+            url: target.to_string(),
+            default_agent: None,
+        });
+    }
+    read(resolved, target)?.ok_or_else(|| {
+        PillboxError::runtime("run", format!("remote `{target}` not found"))
+            .with_next(format!("pillbox remote add {target} docker://user@host"))
+            .into()
+    })
 }
 
 /// One remote, with the scope it came from. Used by `pillbox remote list`.
@@ -322,6 +435,7 @@ pub(crate) fn list(resolved: &Pillbox, json: bool) -> Result<()> {
         println!("(no remotes registered for `{}`)", resolved.display_name());
         println!();
         println!("Add one with:");
+        println!("  pillbox remote add NAME docker://user@host    # remote Docker daemon over SSH");
         println!("  pillbox remote add NAME ssh://user@host       # VPS over openssh");
         println!("  pillbox remote add NAME e2b://TEMPLATE_ID     # E2B managed sandbox");
         return Ok(());
@@ -354,7 +468,7 @@ pub(crate) fn list(resolved: &Pillbox, json: bool) -> Result<()> {
 pub(crate) fn info(resolved: &Pillbox, name: &str, json: bool) -> Result<()> {
     let (remote, source) = read_inherited(resolved, name)?.ok_or_else(|| {
         PillboxError::runtime("remote info", format!("`{name}` not found")).with_next(format!(
-            "pillbox remote add {name} ssh://user@host  # or e2b://TEMPLATE_ID"
+            "pillbox remote add {name} docker://user@host  # or ssh://… / e2b://TEMPLATE_ID"
         ))
     })?;
     if json {
@@ -455,7 +569,7 @@ mod tests {
         assert_eq!(url.kind(), "ssh");
         match url {
             RemoteUrl::Ssh(s) => assert_eq!(s.destination(), "alice@example.com:2222"),
-            RemoteUrl::E2b(_) => panic!("expected ssh"),
+            _ => panic!("expected ssh"),
         }
     }
 
@@ -465,7 +579,7 @@ mod tests {
         assert_eq!(url.kind(), "e2b");
         match url {
             RemoteUrl::E2b(e) => assert_eq!(e.template, "pillbox-default-template"),
-            RemoteUrl::Ssh(_) => panic!("expected e2b"),
+            _ => panic!("expected e2b"),
         }
     }
 
@@ -495,6 +609,77 @@ mod tests {
     fn parse_e2b_url_rejects_punctuation() {
         let err = parse_remote_url("e2b://bad/template").unwrap_err();
         assert!(err.contains("invalid character"));
+    }
+
+    #[test]
+    fn parse_remote_url_docker() {
+        let url = parse_remote_url("docker://deploy@vps.example:2222").unwrap();
+        assert_eq!(url.kind(), "docker");
+        match url {
+            RemoteUrl::Docker(d) => {
+                assert_eq!(d.user.as_deref(), Some("deploy"));
+                assert_eq!(d.host, "vps.example");
+                assert_eq!(d.port, Some(2222));
+                assert_eq!(d.docker_host(), "ssh://deploy@vps.example:2222");
+            }
+            _ => panic!("expected docker"),
+        }
+    }
+
+    #[test]
+    fn parse_docker_url_userless_and_portless() {
+        // The common BYO form: bare host, default ssh user + port.
+        let d = parse_docker_url("docker://vps.example").unwrap();
+        assert_eq!(d.user, None);
+        assert_eq!(d.host, "vps.example");
+        assert_eq!(d.port, None);
+        assert_eq!(d.docker_host(), "ssh://vps.example");
+    }
+
+    #[test]
+    fn parse_docker_url_user_no_port() {
+        let d = parse_docker_url("docker://deploy@10.0.0.5").unwrap();
+        assert_eq!(d.user.as_deref(), Some("deploy"));
+        assert_eq!(d.host, "10.0.0.5");
+        assert_eq!(d.port, None);
+        assert_eq!(d.docker_host(), "ssh://deploy@10.0.0.5");
+    }
+
+    #[test]
+    fn parse_docker_url_host_with_port_no_user() {
+        let d = parse_docker_url("docker://10.0.0.5:2376").unwrap();
+        assert_eq!(d.user, None);
+        assert_eq!(d.host, "10.0.0.5");
+        assert_eq!(d.port, Some(2376));
+        assert_eq!(d.docker_host(), "ssh://10.0.0.5:2376");
+    }
+
+    #[test]
+    fn parse_docker_url_rejects_empty_host() {
+        assert!(parse_docker_url("docker://").is_err());
+        assert!(parse_docker_url("docker://deploy@").is_err());
+    }
+
+    #[test]
+    fn parse_docker_url_rejects_empty_user() {
+        assert!(parse_docker_url("docker://@vps.example").is_err());
+    }
+
+    #[test]
+    fn parse_docker_url_rejects_bad_port() {
+        assert!(parse_docker_url("docker://host:notaport").is_err());
+        assert!(parse_docker_url("docker://host:99999").is_err());
+    }
+
+    #[test]
+    fn parse_docker_url_rejects_missing_scheme() {
+        assert!(parse_docker_url("deploy@vps.example").is_err());
+    }
+
+    #[test]
+    fn unknown_scheme_error_names_docker() {
+        let err = parse_remote_url("http://example.com").unwrap_err();
+        assert!(err.contains("docker://"));
     }
 
     #[test]
@@ -807,6 +992,36 @@ mod tests {
             std::fs::write(dir.join("bad.toml"), b"not valid toml = !!!").unwrap();
             let err = read(&g, "bad").unwrap_err();
             assert!(format!("{err}").contains("remote read"));
+        });
+    }
+
+    #[test]
+    fn resolve_run_target_accepts_inline_url() {
+        with_isolated_home("remote-resolve-inline", || {
+            let g = pillbox::global();
+            let r = resolve_run_target(&g, "docker://deploy@vps:2222").unwrap();
+            // The URL doubles as the name for an inline (unregistered) remote.
+            assert_eq!(r.name, "docker://deploy@vps:2222");
+            assert_eq!(r.url, "docker://deploy@vps:2222");
+            assert_eq!(r.default_agent, None);
+        });
+    }
+
+    #[test]
+    fn resolve_run_target_rejects_bad_inline_scheme() {
+        with_isolated_home("remote-resolve-badscheme", || {
+            let g = pillbox::global();
+            let err = resolve_run_target(&g, "ftp://nope").unwrap_err();
+            assert!(format!("{err}").contains("unsupported URL scheme"));
+        });
+    }
+
+    #[test]
+    fn resolve_run_target_unknown_name_errors() {
+        with_isolated_home("remote-resolve-missing", || {
+            let g = pillbox::global();
+            let err = resolve_run_target(&g, "no-such-remote").unwrap_err();
+            assert!(format!("{err}").contains("not found"));
         });
     }
 }

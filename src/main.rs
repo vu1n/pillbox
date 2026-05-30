@@ -179,10 +179,13 @@ enum Command {
             conflicts_with = "remote"
         )]
         mcp_tokens: Vec<agents::McpTokenSpec>,
-        /// Run on a registered remote VPS (`pillbox remote add NAME …`).
-        /// The agent launches inside a pillbox sandbox on the remote;
-        /// the local terminal proxies the remote PTY.
-        #[arg(long, value_name = "NAME", conflicts_with_all = ["vault_stdin", "vault_stdin_direct"])]
+        /// Run on a remote: either a registered name (`pillbox remote add
+        /// NAME …`) or an inline URL — `docker://[user@]host[:port]`,
+        /// `ssh://user@host[:port]`, or `e2b://TEMPLATE_ID`. A value
+        /// containing `://` is treated as an inline URL (no `remote add`
+        /// needed). The agent launches inside a pillbox sandbox on the
+        /// remote; the local terminal proxies the remote PTY.
+        #[arg(long, value_name = "NAME|URL", conflicts_with_all = ["vault_stdin", "vault_stdin_direct"])]
         remote: Option<String>,
         /// Hidden: invoked by the remote side of `pillbox run --remote`.
         /// Reads a [`crate::sandbox::remote_ssh::VaultStdinBlob`] from
@@ -280,7 +283,7 @@ enum Command {
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
     },
-    /// Manage remotes (SSH VPSes + E2B sandboxes) for `pillbox run --remote NAME`.
+    /// Manage remotes (docker:// daemons, SSH VPSes, E2B sandboxes) for `pillbox run --remote NAME`.
     Remote {
         #[command(subcommand)]
         action: RemoteAction,
@@ -703,13 +706,13 @@ fn dispatch_run(resolved: &Pillbox, agent: Option<String>, mut opts: RunOpts) ->
         }
     }
 
-    let remote_record = match opts.remote_name.as_deref() {
-        Some(name) => Some(remote::read(resolved, name)?.ok_or_else(|| {
-            PillboxError::runtime("run", format!("remote `{name}` not found"))
-                .with_next(format!("pillbox remote add {name} ssh://user@host"))
-        })?),
-        None => None,
-    };
+    // Resolve `--remote` (an inline URL or a registered name) to a record;
+    // the name-vs-URL policy lives in the canonical `remote` module.
+    let remote_record = opts
+        .remote_name
+        .as_deref()
+        .map(|target| remote::resolve_run_target(resolved, target))
+        .transpose()?;
 
     // Local runs only: nudge if Raindrop Workshop is installed but no
     // OTLP endpoint is set, so a silent "no events" doesn't surprise the

@@ -96,18 +96,78 @@ fn resolve_env_or_default() -> (String, RunnerImageSource) {
 /// [`check_ready`] so the four backends that launch docker can't
 /// accidentally check one image and `docker run` another.
 pub fn check_ready_for(resolved: &Pillbox) -> Result<String> {
+    check_ready_for_at(resolved, &DockerEndpoint::local())
+}
+
+/// Endpoint-aware [`check_ready_for`]: resolve the runner image for
+/// `resolved`, then preflight it on `endpoint`'s daemon. The `docker://`
+/// backend passes a remote endpoint so a missing image is caught against
+/// the daemon that will actually run it, not the local one.
+pub fn check_ready_for_at(resolved: &Pillbox, endpoint: &DockerEndpoint) -> Result<String> {
     let (image, _src) = resolve_runner_image(resolved);
-    check_ready(&image)?;
+    check_ready_at(endpoint, &image)?;
     Ok(image)
 }
 
-/// Confirm Docker is reachable and `image` is available. One
-/// subprocess call instead of two: `docker image inspect` fails with a
-/// clear "Cannot connect to Docker daemon" message if the daemon is
-/// down, and with a clear "No such image" message if the image is
-/// missing — we just translate each into a more actionable hint.
+/// Which Docker daemon a command targets — the **placement axis** of the
+/// remotes redesign (see docs/remotes-redesign.md), expressed as one env
+/// override. `local()` uses the ambient daemon (local socket, or whatever
+/// `DOCKER_HOST`/`docker context` the user already has). `remote(host)`
+/// points `DOCKER_HOST` at a daemon over SSH transport — the `docker://`
+/// backend passes `ssh://[user@]host[:port]`. Container lifecycle is
+/// otherwise identical: "run the runner image somewhere, attach over an
+/// exec channel," parameterized only by where the daemon lives.
+#[derive(Debug, Clone, Default)]
+pub struct DockerEndpoint(Option<String>);
+
+impl DockerEndpoint {
+    /// The ambient daemon — no `DOCKER_HOST` override. Behaves exactly as
+    /// the bare `docker` CLI would for this shell.
+    pub fn local() -> Self {
+        Self(None)
+    }
+
+    /// A remote daemon reached by exporting `DOCKER_HOST` (e.g.
+    /// `ssh://user@host:port`) for the spawned `docker` process.
+    pub fn remote(docker_host: impl Into<String>) -> Self {
+        Self(Some(docker_host.into()))
+    }
+
+    /// The `DOCKER_HOST` override this endpoint exports (`Some` for remote,
+    /// `None` for local) — for diagnostics / preflight messages. Named
+    /// distinctly from [`crate::remote::DockerUrl::docker_host`], which
+    /// *renders* an `ssh://…` string.
+    pub fn host_override(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
+
+    /// Build a `docker` command, exporting `DOCKER_HOST` for the remote
+    /// case so every invocation in the lifecycle targets the same daemon.
+    /// The single place the endpoint turns into a process — keeps the
+    /// `*_at` helpers from each re-deriving the env.
+    fn command(&self) -> Command {
+        let mut c = Command::new("docker");
+        if let Some(host) = &self.0 {
+            c.env("DOCKER_HOST", host);
+        }
+        c
+    }
+}
+
+/// Confirm Docker is reachable and `image` is available on the **ambient**
+/// daemon. See [`check_ready_at`] for the endpoint-aware form.
 pub fn check_ready(image: &str) -> Result<()> {
-    let out = Command::new("docker")
+    check_ready_at(&DockerEndpoint::local(), image)
+}
+
+/// Confirm Docker is reachable and `image` is available on `endpoint`'s
+/// daemon. One subprocess call instead of two: `docker image inspect`
+/// fails with a clear "Cannot connect to Docker daemon" message if the
+/// daemon is down, and with a clear "No such image" message if the image
+/// is missing — we just translate each into a more actionable hint.
+pub fn check_ready_at(endpoint: &DockerEndpoint, image: &str) -> Result<()> {
+    let out = endpoint
+        .command()
         .arg("image")
         .arg("inspect")
         .arg(image)
@@ -150,10 +210,17 @@ pub fn run_interactive(args: &[String]) -> Result<ExitStatus> {
     Ok(status)
 }
 
-/// `docker rm -f <container>` — force-remove (kills if running). Best-effort
-/// teardown for the attach-transport flow; errors are the caller's to ignore.
+/// `docker rm -f <container>` on the ambient daemon. See [`rm_force_at`].
 pub fn rm_force(container: &str) -> Result<()> {
-    Command::new("docker")
+    rm_force_at(&DockerEndpoint::local(), container)
+}
+
+/// `docker rm -f <container>` on `endpoint`'s daemon — force-remove (kills
+/// if running). Best-effort teardown for the attach-transport flow; errors
+/// are the caller's to ignore.
+pub fn rm_force_at(endpoint: &DockerEndpoint, container: &str) -> Result<()> {
+    endpoint
+        .command()
         .arg("rm")
         .arg("-f")
         .arg(container)
@@ -168,7 +235,19 @@ pub fn rm_force(container: &str) -> Result<()> {
 /// takes its stdin/stdout to drive the pump. Used to attach to an
 /// in-container `pillbox pty-relay`.
 pub fn exec_attach(container: &str, argv: &[String]) -> Result<std::process::Child> {
-    Command::new("docker")
+    exec_attach_at(&DockerEndpoint::local(), container, argv)
+}
+
+/// Endpoint-aware [`exec_attach`] — attach to a pty-relay in a container on
+/// `endpoint`'s daemon. For `docker://`, `DOCKER_HOST=ssh://…` makes the
+/// exec stream ride the SSH transport back to the host pump unchanged.
+pub fn exec_attach_at(
+    endpoint: &DockerEndpoint,
+    container: &str,
+    argv: &[String],
+) -> Result<std::process::Child> {
+    endpoint
+        .command()
         .arg("exec")
         .arg("-i")
         .arg(container)
@@ -180,10 +259,18 @@ pub fn exec_attach(container: &str, argv: &[String]) -> Result<std::process::Chi
         .context("invoking `docker exec -i`")
 }
 
-/// `docker run <args...>` detached. `args` must include `-d` and the image +
-/// command. Returns the container id (stdout, trimmed).
+/// `docker run <args...>` detached on the ambient daemon. See
+/// [`run_detached_at`].
 pub fn run_detached(args: &[String]) -> Result<String> {
-    let out = Command::new("docker")
+    run_detached_at(&DockerEndpoint::local(), args)
+}
+
+/// `docker run <args...>` detached on `endpoint`'s daemon. `args` must
+/// include `-d` and the image + command. Returns the container id (stdout,
+/// trimmed).
+pub fn run_detached_at(endpoint: &DockerEndpoint, args: &[String]) -> Result<String> {
+    let out = endpoint
+        .command()
         .arg("run")
         .args(args)
         .output()
@@ -353,5 +440,36 @@ fn pump<R: Read>(mut reader: R, is_stderr: bool, tx: &mpsc::Sender<(bool, Vec<u8
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `local()` must not inject a `DOCKER_HOST` — the command behaves
+    /// exactly as the bare `docker` CLI for the user's shell.
+    #[test]
+    fn local_endpoint_sets_no_docker_host() {
+        let cmd = DockerEndpoint::local().command();
+        assert!(cmd
+            .get_envs()
+            .all(|(k, _)| k != std::ffi::OsStr::new("DOCKER_HOST")));
+        assert_eq!(DockerEndpoint::local().host_override(), None);
+    }
+
+    /// `remote(host)` exports `DOCKER_HOST` so every lifecycle call in the
+    /// `docker://` path targets the same remote daemon.
+    #[test]
+    fn remote_endpoint_exports_docker_host() {
+        let ep = DockerEndpoint::remote("ssh://deploy@vps:2222");
+        assert_eq!(ep.host_override(), Some("ssh://deploy@vps:2222"));
+        let cmd = ep.command();
+        let dh = cmd
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new("DOCKER_HOST"))
+            .and_then(|(_, v)| v)
+            .expect("DOCKER_HOST set");
+        assert_eq!(dh, std::ffi::OsStr::new("ssh://deploy@vps:2222"));
     }
 }

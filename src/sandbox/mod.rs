@@ -6,14 +6,19 @@
 //! remotely (SSH to a VPS, E2B managed cloud).
 //!
 //! - [`local_docker::LocalDocker`] — host Docker daemon.
+//! - [`remote_docker::RemoteDockerSandbox`] — a remote Docker daemon over
+//!   SSH transport (`DOCKER_HOST=ssh://…`). Selected for the `docker://`
+//!   scheme; the container-is-the-primitive backend the ssh/e2b paths
+//!   collapse onto (see docs/remotes-redesign.md).
 //! - [`remote_ssh::RemoteSshSandbox`] — ssh into a registered VPS,
 //!   run a pillbox sandbox there, proxy stdio back.
 //! - [`remote_e2b::RemoteE2bSandbox`] — spawn an E2B managed sandbox
 //!   via the `@e2b/code-interpreter` JS SDK (bundled Node helper).
-//!   Selected when the remote URL has the `e2b://` scheme; everything
-//!   else routes to SSH.
+//!   Selected when the remote URL has the `e2b://` scheme; an unknown /
+//!   hand-edited scheme falls through to SSH.
 
 pub(crate) mod local_docker;
+pub(crate) mod remote_docker;
 pub(crate) mod remote_e2b;
 pub(crate) mod remote_ssh;
 
@@ -49,6 +54,7 @@ pub(crate) fn select_backend(remote: Option<Remote>) -> Box<dyn SandboxBackend> 
     // ever taken on hand-edited TOML.
     match r.parsed_url() {
         Ok(RemoteUrl::E2b(_)) => Box::new(remote_e2b::RemoteE2bSandbox::new(r)),
+        Ok(RemoteUrl::Docker(_)) => Box::new(remote_docker::RemoteDockerSandbox::new(r)),
         Ok(RemoteUrl::Ssh(_)) | Err(_) => Box::new(remote_ssh::RemoteSshSandbox::new(r)),
     }
 }

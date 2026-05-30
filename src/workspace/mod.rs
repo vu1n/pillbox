@@ -32,6 +32,7 @@
 //! wants. For PR 3 every backend operates on a host cwd.
 
 pub(crate) mod git_inflow;
+pub(crate) mod ingest;
 pub(crate) mod rustic;
 
 use std::path::Path;

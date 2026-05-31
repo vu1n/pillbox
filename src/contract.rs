@@ -221,6 +221,20 @@ pub(crate) struct MessageEnd {
     pub(crate) stop_reason: String,
 }
 
+impl MessageEnd {
+    /// End a message with no metadata — the common case for the live stream
+    /// parsers, whose wire format doesn't carry model/stop_reason at end-of-
+    /// message (only the post-hoc transcript does, and it builds the full
+    /// struct directly).
+    pub(crate) fn new(message_id: impl Into<String>) -> Self {
+        Self {
+            message_id: message_id.into(),
+            model: String::new(),
+            stop_reason: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ToolCall {

@@ -179,11 +179,7 @@ impl ServeAdapter for OpencodeAdapter {
                         text: str_field(props, "text").to_string(),
                     }));
                 }
-                out.push(Payload::MessageEnd(MessageEnd {
-                    message_id: mid,
-                    model: String::new(),
-                    stop_reason: String::new(),
-                }));
+                out.push(Payload::MessageEnd(MessageEnd::new(mid)));
                 out
             }
             "session.next.tool.input.started" => {

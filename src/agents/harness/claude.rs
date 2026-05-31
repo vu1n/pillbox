@@ -115,11 +115,7 @@ fn assistant_blocks(line: &Value, state: &mut ClaudeState) -> Vec<Payload> {
                     message_id: message_id.clone(),
                     text,
                 }));
-                out.push(Payload::MessageEnd(MessageEnd {
-                    message_id: message_id.clone(),
-                    model: String::new(),
-                    stop_reason: String::new(),
-                }));
+                out.push(Payload::MessageEnd(MessageEnd::new(message_id.clone())));
             }
             "tool_use" => {
                 let id = b

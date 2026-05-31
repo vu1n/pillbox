@@ -171,11 +171,7 @@ fn pi_message_update(line: &Value, state: &mut PiState) -> Vec<Payload> {
         }
         "text_end" => {
             state.open_messages.remove(&message_id);
-            out.push(Payload::MessageEnd(MessageEnd {
-                message_id,
-                model: String::new(),
-                stop_reason: String::new(),
-            }));
+            out.push(Payload::MessageEnd(MessageEnd::new(message_id)));
         }
         // text_start only needs the (already-emitted) MessageStart.
         _ => {}
@@ -208,11 +204,7 @@ fn pi_message_end(line: &Value, state: &mut PiState) -> Vec<Payload> {
     let mut out = Vec::new();
     for id in still_open {
         state.open_messages.remove(&id);
-        out.push(Payload::MessageEnd(MessageEnd {
-            message_id: id,
-            model: String::new(),
-            stop_reason: String::new(),
-        }));
+        out.push(Payload::MessageEnd(MessageEnd::new(id)));
     }
     out
 }

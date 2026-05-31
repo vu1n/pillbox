@@ -127,6 +127,11 @@ impl Tailer {
         combined.push_str(text);
 
         let mut emitted = 0;
+        // Accumulate this pump's durable events and append them in one write
+        // (one file open per pump, not per event) — matters on the initial
+        // drain / catch-up burst. OTLP + synth stay per-event (independent).
+        let logging = self.log.is_some();
+        let mut durable: Vec<Event> = Vec::new();
         let (complete, partial) = split_trailing_partial(&combined);
         for line in complete.lines() {
             if line.is_empty() {
@@ -134,23 +139,26 @@ impl Tailer {
             }
             let events = parse_with(self.harness, line, self.line_idx);
             for event in &events {
-                // Durable spine (when host-side): map to the contract and
-                // append. Best-effort + loud — a log write failure must not
-                // strand the rest of the tail or the OTLP emit.
-                if let Some(log) = &mut self.log {
-                    let durable: Vec<Event> = contract_map::to_payloads(event)
-                        .into_iter()
-                        .map(|p| Event::session(&self.session_id, p))
-                        .collect();
-                    if let Err(e) = log.append(&durable) {
-                        eprintln!("pillbox: warning: session log append failed: {e:#}");
-                    }
+                if logging {
+                    durable.extend(
+                        contract_map::to_payloads(event)
+                            .into_iter()
+                            .map(|p| Event::session(&self.session_id, p)),
+                    );
                 }
                 emit_event_span(event, &self.session_id);
                 self.synth.on_event(event);
                 emitted += 1;
             }
             self.line_idx += 1;
+        }
+        // Durable spine append — best-effort + loud: a write failure must not
+        // strand the OTLP/synth emits above or the tail's progress. (`append`
+        // is a no-op on an empty batch.)
+        if let Some(log) = &mut self.log {
+            if let Err(e) = log.append(&durable) {
+                eprintln!("pillbox: warning: session log append failed: {e:#}");
+            }
         }
         self.leftover = partial.to_string();
         Ok(emitted)

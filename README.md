@@ -1,11 +1,9 @@
 # pillbox
 
-**Sandboxed coding agents that travel with their state.** A pillbox
-bundles a workspace, code, credentials, and vault config into one
-self-contained unit. Make one for your machine, one per project, and
-launch `claude` or `codex` against it — locally in Docker, on a
-registered VPS over SSH, or in an E2B managed sandbox. Same bundle,
-three runtimes.
+**A secure, fast-loading sandbox for coding agents.** Run `claude`, `codex`,
+`opencode`, or `pi` in a hardened container that hands the agent credentials it
+can *use but never see* — then put a nice frontend on top, or just drive it
+from your terminal.
 
 ```sh
 pillbox init                          # one-time: create the global pillbox
@@ -17,6 +15,24 @@ pillbox run                           # sandbox + claude + cwd mounted
 ```
 
 That's the happy path. The rest of this file is reference.
+
+## What pillbox is
+
+A **local-first** tool. The sauce is on your machine: a coding agent in a fast,
+hardened Docker sandbox, with credentials it can't leak and a live session you
+can build on. No cloud, no account, no platform required.
+
+- **Multi-agent.** One surface over `claude`, `codex`, `opencode`, and `pi`.
+  Swap the agent, keep the workflow, the vault, and the session stream.
+- **Secure by construction.** The agent runs sandboxed, and the **vault**
+  stub-swaps secrets at the egress — the agent sends a key it never sees, so a
+  leaked or prompt-injected credential is worthless.
+- **A frontend on top, or use it directly.** Every session is a durable, live
+  event stream you can drive: `session send` pushes input, `session subscribe`
+  streams it to a UI / bot / orchestrator, `session watch` reads it in your
+  terminal. Build a frontend on the exact surface you use by hand.
+- **Remote when you want it.** The same bundle runs on a remote backend
+  (`--remote`) — extra, not required. Local is the whole product on its own.
 
 ## Why "pillbox-as-bundle"
 
@@ -31,11 +47,10 @@ Mixing those into one bundle gives you:
   project's leases never collide with another's.
 - **Shared agent auth.** A single `pillbox auth login --agent claude`
   lives in the global pillbox and is reused across every project.
-- **Local or remote, same surface.** Add a remote with
-  `pillbox remote add NAME ssh://user@host` (or `e2b://TEMPLATE_ID`),
-  then `pillbox run --remote NAME`. The pillbox is the unit that
-  travels — workspace pulled from an S3-shaped store, vault material
-  delivered once over the encrypted channel.
+- **Local-first; travels when you want.** The whole thing runs on your machine
+  with zero cloud dependency. When you do want it elsewhere, `pillbox run
+  --remote NAME` sends the same bundle — workspace, vault material, config —
+  to a remote backend behind the placement trait. Extra, not required.
 
 ## Where state lives
 
@@ -116,6 +131,9 @@ to bypass discovery and operate on a specific named pillbox.
 | `pillbox session info ID [--json]` | One session (accepts unique id prefix ≥ 4 chars). |
 | `pillbox session attach ID` | Reattach to a detached session. Detach again with **Ctrl-A D**. |
 | `pillbox session detach ID` | Signal a currently-attached pillbox to detach (no-op if already detached). |
+| `pillbox session send ID TEXT` | **Drive** a detached session — push TEXT to the agent's PTY as if typed (orchestrator / bot / IDE). |
+| `pillbox session subscribe ID [--from SEQ]` | **Read (machine):** stream the durable event log over WebSocket, one JSON Event per frame. |
+| `pillbox session watch ID [--from SEQ]` | **Read (human):** render the event stream to this terminal — messages, tools, thinking, the attention signal. |
 | `pillbox session rm ID` | Tear down the backend (kill sandbox) and remove the record. |
 
 ### Secrets / env / auth / vault
@@ -278,9 +296,12 @@ remote backends + sessions). Roadmap:
 - **v0.6 PR 5** ✅ RemoteE2b backend.
 - **v0.6 PR 6** ✅ Sessions (list/attach/detach) across local Docker,
   E2B, and SSH.
-- **v0.6 PR 7** ✅ Polish + docs/README rewrite (this one).
-- **v0.7+** local-rustic workspace handoff over the wire (PR 4.1),
-  `PerPillboxRegistry<T>` lift, optional cloud sidecar for the vault.
+- **v0.6 PR 7** ✅ Polish + docs/README rewrite.
+- **v0.6 PR 8** ✅ `docker://` remote (run an OCI runner image on any
+  reachable daemon) + the **drive/read surface** (`session send` /
+  `subscribe` / `watch`) — the interactive event substrate, live-verified.
+- **v0.7+** the §0 event substrate as a first-class gateway; additional
+  placement backends.
 
 ## Build
 

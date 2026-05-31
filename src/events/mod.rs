@@ -93,6 +93,7 @@ use crate::session::{self, Session};
 
 mod jsonl;
 pub(crate) mod log;
+pub(crate) mod opencode;
 mod otel;
 pub(crate) mod status;
 pub(crate) mod transcripts;

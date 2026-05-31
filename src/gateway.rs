@@ -38,9 +38,9 @@ pub(crate) fn serve_session_ws(
     from: u64,
     bind: Option<&str>,
 ) -> Result<()> {
-    // Probe up front so a bad session id fails before we bind/announce.
-    SessionLog::open(pb, session_id).context("open session log")?;
-
+    // `session_id` is already resolved (the caller ran `resolve_logged`, which
+    // confirmed the log exists), so we open a fresh read view per connection
+    // and don't probe up front.
     let addr = bind.unwrap_or(DEFAULT_BIND);
     let listener = TcpListener::bind(addr).with_context(|| format!("bind {addr}"))?;
     let local = listener.local_addr().context("resolve bound address")?;
@@ -54,18 +54,23 @@ pub(crate) fn serve_session_ws(
     let shutdown = Arc::new(AtomicBool::new(false));
 
     for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => match SessionLog::open(pb, session_id) {
-                // A fresh read view per connection (each subscriber tails
-                // independently from its own `from`).
-                Ok(log) => {
-                    let stop = Arc::clone(&shutdown);
-                    std::thread::spawn(move || serve_one(stream, log, from, &stop));
-                }
-                Err(e) => eprintln!("pillbox: warning: reopen session log failed: {e:#}"),
-            },
-            Err(e) => eprintln!("pillbox: warning: accept failed: {e}"),
-        }
+        let stream = match stream {
+            Ok(stream) => stream,
+            Err(e) => {
+                eprintln!("pillbox: warning: accept failed: {e}");
+                continue;
+            }
+        };
+        // A fresh read view per connection — each subscriber tails from its own seq.
+        let log = match SessionLog::open(pb, session_id) {
+            Ok(log) => log,
+            Err(e) => {
+                eprintln!("pillbox: warning: reopen session log failed: {e:#}");
+                continue;
+            }
+        };
+        let stop = Arc::clone(&shutdown);
+        std::thread::spawn(move || serve_one(stream, log, from, &stop));
     }
     Ok(())
 }

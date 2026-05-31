@@ -41,6 +41,9 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -123,7 +126,45 @@ impl SessionLog {
             Ok(out)
         })
     }
+
+    /// Stream events with `seq >= from` to `sink`, then keep tailing the log,
+    /// invoking `sink` for each newly-appended event as it lands. Returns when
+    /// `stop` is set or `sink` returns `false` ("I've seen enough"). This is
+    /// the live read side of the spine — what a WS/gRPC gateway adapter sits on
+    /// to relay a running session to a remote consumer.
+    ///
+    /// Polls (like [`crate::events::dispatch_events`]) rather than wiring
+    /// `notify`: simpler, dependency-free, and fast enough for human-paced
+    /// sessions. Each wake re-reads the tail via [`read_from`](Self::read_from)
+    /// — fine at per-session scale; the byte-offset/`head` incremental read is
+    /// the deferred optimization (see the module docs).
+    pub(crate) fn subscribe(
+        &self,
+        from: u64,
+        stop: &AtomicBool,
+        mut sink: impl FnMut(&Event) -> bool,
+    ) -> Result<()> {
+        let mut next = from;
+        loop {
+            for ev in self.read_from(next)? {
+                next = ev.seq + 1;
+                if !sink(&ev) {
+                    return Ok(());
+                }
+            }
+            // Drain before checking `stop` so events appended right before the
+            // stop signal still reach the subscriber.
+            if stop.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            thread::sleep(SUBSCRIBE_POLL);
+        }
+    }
 }
+
+/// Poll interval for [`SessionLog::subscribe`]. Matches the lifecycle stream's
+/// tail cadence — responsive at human pace without spinning the CPU.
+const SUBSCRIBE_POLL: Duration = Duration::from_millis(150);
 
 /// Fold over the non-empty JSONL lines of `path`, returning `init` unchanged
 /// when the file doesn't exist (an empty / never-written log). Shared by replay
@@ -277,6 +318,55 @@ mod tests {
             let log = SessionLog::open(&pb, "sess-never-written").unwrap();
             assert_eq!(log.last_seq(), 0);
             assert!(log.read_from(0).unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn subscribe_drains_from_seq_then_returns_when_stopped() {
+        with_isolated_home("log-subscribe-stop", || {
+            let pb = crate::pillbox::global();
+            let mut log = SessionLog::open(&pb, "sess-sub").unwrap();
+            log.append(&[
+                Event::session("sess-sub", tool_call("a")),
+                Event::session("sess-sub", tool_call("b")),
+                Event::session("sess-sub", tool_call("c")),
+            ])
+            .unwrap();
+            // Pre-stopped: subscribe drains the requested tail once, then the
+            // stop check returns before any poll-sleep. A late-joiner caught up
+            // through seq 1 gets exactly 2 and 3.
+            let stop = AtomicBool::new(true);
+            let mut seen = Vec::new();
+            log.subscribe(2, &stop, |ev| {
+                seen.push(ev.seq);
+                true
+            })
+            .unwrap();
+            assert_eq!(seen, vec![2, 3]);
+        });
+    }
+
+    #[test]
+    fn subscribe_returns_when_sink_signals_enough() {
+        with_isolated_home("log-subscribe-sink-stop", || {
+            let pb = crate::pillbox::global();
+            let mut log = SessionLog::open(&pb, "sess-sink").unwrap();
+            log.append(&[
+                Event::session("sess-sink", tool_call("a")),
+                Event::session("sess-sink", tool_call("b")),
+            ])
+            .unwrap();
+            // `stop` never trips; the sink returning false is what ends it,
+            // after exactly one event — proving the early-out doesn't depend on
+            // the stop flag (and never reaches a poll-sleep).
+            let stop = AtomicBool::new(false);
+            let mut count = 0;
+            log.subscribe(0, &stop, |_ev| {
+                count += 1;
+                false
+            })
+            .unwrap();
+            assert_eq!(count, 1);
         });
     }
 

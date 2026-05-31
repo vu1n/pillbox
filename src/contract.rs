@@ -142,6 +142,16 @@ pub(crate) enum Payload {
     ExecExit(ExecExit),
     // extension valve
     Custom(Custom),
+    /// Forward/foreign-compat catch-all: any payload `type` this binary
+    /// doesn't know deserializes here instead of failing the whole line, so a
+    /// newer or foreign producer can't break replay/decode of the rest of the
+    /// log (see docs/session-event-log.md §Versioning). Unit + `#[serde(other)]`
+    /// is the only shape serde permits for an internally-tagged catch-all, so
+    /// the original tag + body are *not* preserved on round-trip yet (it
+    /// re-serializes as `{"type":"unknown"}`); body-preserving Unknown is the
+    /// upgrade that lands with foreign-trace re-export.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -565,6 +575,17 @@ mod tests {
         assert_eq!(correlated.session_id, "sess-abc");
         assert_eq!(correlated.sandbox_id, "sb-1");
         assert_eq!(reparse(&correlated), correlated);
+    }
+
+    #[test]
+    fn unknown_payload_type_decodes_to_unknown_not_error() {
+        // A newer/foreign producer emits a payload type this binary doesn't
+        // know. It must decode (to Unknown) rather than fail the whole event —
+        // the forward-compat guarantee the durable log relies on for replay.
+        let line = r#"{"seq":5,"sessionId":"s","at":"2026-05-31T00:00:00Z","payload":{"type":"some_future_event","detail":"x"}}"#;
+        let ev: Event = serde_json::from_str(line).expect("unknown type must not break decode");
+        assert_eq!(ev.seq, 5);
+        assert!(matches!(ev.payload, Payload::Unknown));
     }
 
     #[test]

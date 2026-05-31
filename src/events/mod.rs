@@ -92,6 +92,7 @@ use crate::pillbox::Pillbox;
 use crate::session::{self, Session};
 
 mod jsonl;
+pub(crate) mod log;
 mod otel;
 pub(crate) mod transcripts;
 mod webhook;

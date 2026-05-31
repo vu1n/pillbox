@@ -10,7 +10,9 @@
 //! the gRPC `serve` path's job (later, feature-gated), not this one.
 //!
 //! Producers build [`Event`]s and push them to an [`EventSink`]. The
-//! sandbox/exec runtime (next slice) is the first producer.
+//! `pillbox sandbox` runtime (`commands::sandbox`) is the per-emitter producer
+//! today; the per-session [`crate::events::log::SessionLog`] is the durable
+//! spine new producers target (see docs/session-event-log.md).
 
 // Contract surface lands ahead of its first producer (contract-first).
 #![allow(dead_code)]
@@ -21,16 +23,25 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// One event on a sandbox's stream. Envelope + a typed payload.
+/// One event on a session's durable log. Envelope + a typed payload.
 ///
-/// `seq` is monotonic per *emitter* (the per-run/exec `EventEmitter` counter,
-/// not pillbox-wide) and assigned to DURABLE events only; ephemeral telemetry
-/// carries `seq == 0` and is excluded from replay. (vNext moves this to a
-/// per-session, gateway-assigned seq — see docs/session-event-log.md.)
+/// `session_id` is the **partition key** — the durable identity that outlives
+/// the sandboxes/runs/execs a session spans (see docs/session-event-log.md).
+/// `sandbox_id`/`run_id`/`exec_id` demote to optional *correlation*: which
+/// sandbox/run/exec a given line happened in.
+///
+/// `seq` is monotonic **per session** and assigned by the session log on
+/// append (the log is the seq authority), to DURABLE events only; ephemeral
+/// telemetry carries `seq == 0` and is excluded from replay. Producers build
+/// events via [`Event::session`] with `seq == 0` and let
+/// [`crate::events::log::SessionLog::append`] stamp it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Event {
     pub(crate) seq: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) session_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) sandbox_id: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) run_id: String,
@@ -44,17 +55,46 @@ pub(crate) struct Event {
 }
 
 impl Event {
-    /// Durable event (`seq` assigned by the caller's counter).
-    pub(crate) fn durable(seq: u64, sandbox_id: impl Into<String>, payload: Payload) -> Self {
+    /// Shared field defaults, timestamped now; the durable builders set only
+    /// their partition/correlation key + `seq` on top.
+    fn at_now(seq: u64, payload: Payload) -> Self {
         Self {
             seq,
-            sandbox_id: sandbox_id.into(),
+            session_id: String::new(),
+            sandbox_id: String::new(),
             run_id: String::new(),
             exec_id: String::new(),
             at: crate::session::now_rfc3339(),
             ephemeral: false,
             payload,
         }
+    }
+
+    /// A durable, session-partitioned event with `seq` left at 0 for the
+    /// session log to assign on append (the log is the seq authority — see
+    /// docs/session-event-log.md). `session_id` is the partition key;
+    /// sandbox/run/exec correlation is layered on via the `with_*` builders.
+    pub(crate) fn session(session_id: impl Into<String>, payload: Payload) -> Self {
+        Self {
+            session_id: session_id.into(),
+            ..Self::at_now(0, payload)
+        }
+    }
+
+    /// Legacy builder for non-session-partitioned events: the caller's counter
+    /// assigns `seq` and `session_id` stays empty. Used by the per-emitter
+    /// [`EventEmitter`] path (`commands::sandbox`); new session-log producers
+    /// use [`Event::session`] and let the log assign `seq`.
+    pub(crate) fn durable(seq: u64, sandbox_id: impl Into<String>, payload: Payload) -> Self {
+        Self {
+            sandbox_id: sandbox_id.into(),
+            ..Self::at_now(seq, payload)
+        }
+    }
+
+    pub(crate) fn with_sandbox(mut self, sandbox_id: impl Into<String>) -> Self {
+        self.sandbox_id = sandbox_id.into();
+        self
     }
 
     pub(crate) fn with_run(mut self, run_id: impl Into<String>) -> Self {
@@ -495,6 +535,36 @@ mod tests {
         for line in lines {
             serde_json::from_str::<Event>(line).unwrap();
         }
+    }
+
+    #[test]
+    fn session_event_carries_partition_key_and_unassigned_seq() {
+        // The session-partitioned builder: seq stays 0 (the log assigns it),
+        // session_id is the partition key, sandbox/run/exec are absent until
+        // correlated. Round-trips with sandbox_id omitted from the wire.
+        let ev = Event::session(
+            "sess-abc",
+            Payload::ToolCall(ToolCall {
+                tool_call_id: "tc-1".into(),
+                name: "Bash".into(),
+                status: ToolStatus::Running,
+                input: None,
+                output: String::new(),
+                title: String::new(),
+            }),
+        );
+        assert_eq!(ev.seq, 0, "log assigns seq, not the producer");
+        assert_eq!(ev.session_id, "sess-abc");
+        let s = serde_json::to_string(&ev).unwrap();
+        assert!(s.contains(r#""sessionId":"sess-abc""#), "{s}");
+        assert!(!s.contains("sandboxId"), "empty correlation omitted: {s}");
+        assert_eq!(reparse(&ev), ev);
+
+        // Correlation layers on without disturbing the partition key.
+        let correlated = ev.clone().with_sandbox("sb-1").with_run("run-1");
+        assert_eq!(correlated.session_id, "sess-abc");
+        assert_eq!(correlated.sandbox_id, "sb-1");
+        assert_eq!(reparse(&correlated), correlated);
     }
 
     #[test]

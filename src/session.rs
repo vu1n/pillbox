@@ -52,12 +52,14 @@
 //! will only signal whichever pid landed last. Detect by reading the
 //! file after attach if you need certainty.
 
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::errors::PillboxError;
+use crate::paths::ensure_mode_0700;
 use crate::pillbox::Pillbox;
 use crate::registry::{self as reg, IdRegistry, Registry};
 
@@ -66,6 +68,19 @@ use crate::registry::{self as reg, IdRegistry, Registry};
 /// grep, easy to `rm -f` if something goes sideways. Module-private;
 /// callers go through `list` / `read` / `write` / `delete`.
 const SESSIONS_DIR: &str = "sessions";
+
+/// The per-session state directory `<pillbox>/sessions/<id>/`, created 0700.
+/// Owns the session-id level of the storage layout — the `<id>.toml` record
+/// (written by the registry) is its sibling, and the durable event log
+/// ([`crate::events::log`]) lives under here. Centralizing it here keeps the
+/// session-storage layout in the module that owns the session concept, rather
+/// than having callers reach into `sessions/` directly.
+pub(crate) fn session_dir(pb: &Pillbox, id: &str) -> Result<PathBuf> {
+    let dir = pb.subdir(SESSIONS_DIR)?.join(id);
+    fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    ensure_mode_0700(&dir)?;
+    Ok(dir)
+}
 
 /// Registry plumbing for sessions. No-inheritance — a session is
 /// concrete runtime state tied to the pillbox that started it, so we

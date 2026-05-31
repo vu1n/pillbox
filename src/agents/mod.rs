@@ -55,10 +55,11 @@ pub struct AgentSpec {
     /// permission posture (e.g. claude `--permission-mode auto`) — the user's
     /// own `-- args` come after and override (claude takes the last value).
     pub(crate) sandbox_args: &'static [&'static str],
-    /// Per-run prep on the (bind-mounted) agent home before launch, given the
-    /// home and the guest workspace path. Used to pre-accept claude's workspace
-    /// trust dialog so an interactive run doesn't stall on it. `None` = nothing
-    /// to prepare.
+    /// Per-run prep on the agent home before launch, given the home and the
+    /// guest workspace path. Used to pre-accept claude's workspace trust dialog
+    /// and mark first-run onboarding complete so an interactive run doesn't
+    /// stall on either gate (see [`pretrust_claude_workspace`]). `None` =
+    /// nothing to prepare.
     pub(crate) prepare_workspace: Option<fn(&Path, &str) -> Result<()>>,
 }
 
@@ -170,11 +171,20 @@ fn finalize_claude_onboarding(home: &Path) -> Result<()> {
 }
 
 /// Pre-accept claude's workspace trust dialog for `guest_workspace` by seeding
-/// its `~/.claude.json` project entry. pillbox owns the mounted workspace (the
-/// user pointed `run` at it), so an interactive session shouldn't stall on the
-/// trust gate — which `-p` auto-skips but a PTY-attached interactive run shows,
-/// and `--dangerously-skip-permissions` can't bypass as root. Merges into any
-/// existing entry; creates the file + `projects` map as needed.
+/// its `~/.claude.json` project entry, AND mark global onboarding complete so a
+/// fresh sandbox `$HOME` doesn't drop into the first-run wizard (theme picker)
+/// before the chat prompt. pillbox owns the mounted workspace (the user pointed
+/// `run` at it), so an interactive session shouldn't stall on either gate —
+/// which `-p` auto-skips but a PTY-attached interactive run shows, and
+/// `--dangerously-skip-permissions` can't bypass as root.
+///
+/// `hasCompletedOnboarding` is the same flag [`finalize_claude_onboarding`]
+/// sets at login. Local docker inherits it via the bind-mounted global home,
+/// but the remote backends materialize only `.claude/` (auth) from the blob —
+/// `~/.claude.json` is a sibling, never forwarded — so a remote container would
+/// otherwise hit the wizard. Setting it here (every launch, every backend) is
+/// idempotent and backend-agnostic. Merges into any existing entry; creates the
+/// file + `projects` map as needed.
 /// Get `key` from `obj` as a mutable object, inserting an empty one if absent.
 /// Errors if `key` is present but not a JSON object.
 fn get_or_create_object<'a>(
@@ -198,6 +208,9 @@ fn pretrust_claude_workspace(home: &Path, guest_workspace: &str) -> Result<()> {
     let root = value
         .as_object_mut()
         .ok_or_else(|| anyhow!("expected top-level JSON object in {}", path.display()))?;
+    // Global first-run gate (suppresses the theme-picker wizard); set before
+    // drilling into the per-project entry below.
+    root.insert("hasCompletedOnboarding".into(), true.into());
     let entry = get_or_create_object(get_or_create_object(root, "projects")?, guest_workspace)?;
     entry.insert("hasTrustDialogAccepted".into(), true.into());
     entry.insert("hasCompletedProjectOnboarding".into(), true.into());
@@ -820,6 +833,9 @@ mod tests {
             v["projects"]["/workspace/app"]["hasCompletedProjectOnboarding"],
             true
         );
+        // Global onboarding is marked complete (suppresses the fresh-HOME
+        // first-run wizard on the remote backends).
+        assert_eq!(v["hasCompletedOnboarding"], true);
         // Pre-existing global key + sibling project survive untouched.
         assert_eq!(v["someGlobal"], 1);
         assert_eq!(v["projects"]["/workspace/other"]["foo"], "bar");
@@ -837,5 +853,6 @@ mod tests {
             v["projects"]["/workspace/app"]["hasTrustDialogAccepted"],
             true
         );
+        assert_eq!(v["hasCompletedOnboarding"], true);
     }
 }

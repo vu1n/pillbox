@@ -359,7 +359,7 @@ multi-human surface.**
 | # | Step | Why here / deps | Workstream |
 |---|---|---|---|
 | 1 | **Remotes collapse — `docker://` + cold-host DX contract** *(foreground run + ingest + result-extraction + sandbox-side vault ✓ live-verified; remaining: `--detach`, version-skew, pull-progress)* | Cheapest big win; a *deletion* onto Docker contexts; fixes the documented product failure. **Independent of §0** — detach keys off the durable `Session.id`. | remotes + dx |
-| 2 | **Approval loop — `session.blocked` + `session approve\|deny\|answer`** (+ real HITL sink arms) | Makes detached/remote usable; **thin over *shipped* plumbing** — a new event on today's sink path + verbs over the Input-frame channel (d590a2d). Not gated on the full §0 spine. | dx + event-log |
+| 2 | **Approval loop — reframed to a signal *producer*; ✓ done for the single-player automated context.** `AttentionRequired{NeedsInput}` on transcript `end_turn` → log/`subscribe`/webhook; front-ends respond via `session send`. In-pillbox `approve\|deny\|answer` verbs reframed away; the mid-tool blocked sub-signal is closed as **not hook-viable** (Notification suppressed in the automated context — reading vt100 is the only reliable path if ever wanted). | dx + event-log |
 | 3 | **§0 LOCAL SUBSTRATE — ✓ DONE + live-verified** — `sessionId` + durable per-session log + co-located sequencer + zero-config `Subscribe(from_seq)` (`notify` tail) + a producer. *Re-scoped: `actor` / event-system-merge / network-seq → multiplayer; cross-sandbox `Session` → migration; `class` → pooling — NOT §0.* | The keystone. The substrate's local stream **every** consumer reads — inner-loop readout, fleet triage, lum, *and* (later) multiplayer. | event-log + gateway + dx |
 | 4 | **Reader bits** — `session watch` ✓ (thin human reader, `docker logs` model); remaining: `session diagnose` + `session list` status-from-log | Falls out of §0 (the log). Makes a swarm triageable + the cheapest "watch your agent" — a *consumer over the public tap, not a UI*. | dx |
 | 5 | **Harden #1/#3** (transcript+MITM source of truth; native secondary). #2 `raw_body` deferred | Cheap; off the critical path. | harden |
@@ -447,6 +447,16 @@ Reconciled against the sequence above; commits on `main` (origin synced).
     error-stall case proves worth a dedicated probe. **Not OSC** either (Claude
     emits no native idle/permission OSC; orca's OSC 9999 is itself hook-authored,
     so it would hit the same suppression).
+  - **If the blocked signal is ever wanted:** the reliable path is **reading the
+    PTY**, not a hook. In gating mode (`--permission-mode default`) the block is
+    visible — the permission dialog paints on the terminal and claude idles for a
+    y/n keystroke — and pillbox already snapshots vt100 for the drive surface. So
+    a blocked signal, if pursued, is a vt100-content detector, not a hook.
+  - **Status:** Step 2 is therefore **as complete as it can be for the
+    single-player automated context** — the producer ships and fans out (below);
+    the in-pillbox `approve|deny|answer` verbs were reframed away (front-ends
+    respond via `session send`); the blocked sub-signal is closed as not
+    hook-viable. No remaining hook work.
 - **Fan-out architecture (decided 2026-05-31, after an adversarial review).**
   "One signal → all subscription types" is realized as **the per-session log is
   the bus; every consumer is a read-side tailer of it** — NOT a producer-side

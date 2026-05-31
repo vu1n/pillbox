@@ -83,11 +83,6 @@ pub(crate) fn endpoint_for(remote: &Remote) -> Result<DockerEndpoint> {
 /// `docker exec` over the endpoint) connects to the same path.
 const ATTACH_SOCK: &str = "/tmp/pillbox-attach.sock";
 
-/// `$HOME` inside the runner container (it runs as root). The agent writes its
-/// transcript under here (`~/.claude/projects/…`), so the read path derives the
-/// container-side transcript scope from this + the recorded `guest_cwd`.
-const GUEST_HOME: &str = "/root";
-
 /// Force-removes its container on drop, on the *endpoint's* daemon — so a
 /// foreground run's container is reaped on every exit path (normal, early
 /// `?`-return, panic). Mirrors `local_docker::ContainerGuard` but
@@ -385,11 +380,6 @@ pub(crate) fn send_input(endpoint: &DockerEndpoint, container: &str, bytes: &[u8
         .context("drive the session's pty-relay")
 }
 
-/// Single-quote a string for safe interpolation into a `sh -c` script.
-fn sh_single_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
 /// Stream a detached docker:// session's transcript out of the container into
 /// the host's durable [`SessionLog`] — the *read* half of the drive surface, so
 /// `session subscribe`/`watch` work on a remote session exactly like a local
@@ -418,16 +408,18 @@ pub(crate) fn spawn_transcript_stream(
     use crate::events::transcripts::{Harness, Tailer};
 
     let harness = Harness::for_agent(agent_id)?;
-    // Container-side transcript root: same path math as the host tailer, rooted
-    // at the container's `$HOME`. Claude narrows to this run's project dir;
-    // Codex has none, so we watch the whole sessions tree.
-    let (watch_root, scope_dir) = harness.transcript_roots(Path::new(GUEST_HOME), guest_cwd);
-    let root = scope_dir.unwrap_or(watch_root);
+    // Container-side transcript root, RELATIVE to the agent's `$HOME` — the
+    // runner's run user is `/home/pillbox`, not `/root`, and a future image
+    // could change it, so we resolve `$HOME` in the container shell rather than
+    // hardcode a path. The relative segment (`.claude/projects/<scope>` for
+    // Claude; `.codex/sessions` for Codex) is dash-encoded → safe unquoted.
+    let (watch_root, scope_dir) = harness.transcript_roots(Path::new(""), guest_cwd);
+    let rel = scope_dir.unwrap_or(watch_root);
     let script = format!(
-        "root={root}; while :; do f=$(find \"$root\" -name '*.jsonl' -type f -printf '%T@ %p\\n' \
-         2>/dev/null | sort -rn | head -n1 | cut -d' ' -f2-); [ -n \"$f\" ] && break; \
-         sleep 0.3; done; exec tail -n +1 -F \"$f\"",
-        root = sh_single_quote(&root.to_string_lossy()),
+        "root=\"$HOME/{rel}\"; while :; do f=$(find \"$root\" -name '*.jsonl' -type f \
+         -printf '%T@ %p\\n' 2>/dev/null | sort -rn | head -n1 | cut -d' ' -f2-); \
+         [ -n \"$f\" ] && break; sleep 0.3; done; exec tail -n +1 -F \"$f\"",
+        rel = rel.to_string_lossy(),
     );
 
     let mut child =

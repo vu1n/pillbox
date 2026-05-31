@@ -535,6 +535,39 @@ pub(crate) fn dispatch_events(resolved: &Pillbox, follow: bool, _json: bool) -> 
     }
 }
 
+/// Read-side webhook export — the fan-out the architecture review prescribes:
+/// a CONSUMER of the per-session log, off the producer's append path, so a slow
+/// webhook can't stall the agent. Tails `log` and POSTs notification-worthy
+/// events to `url` as JSON. Today that's `AttentionRequired` ("the agent needs
+/// you") — the rich signal that only lives on the per-session log; lifecycle
+/// events (started/completed/…) already reach the webhook via
+/// [`emit_session_event`], so this doesn't duplicate them.
+///
+/// Starts **live** (from the log's current head — a notification channel
+/// shouldn't replay past signals). Runs on a detached thread for the caller's
+/// (the gateway's) lifetime; process exit reaps it. Best-effort + loud.
+pub(crate) fn spawn_webhook_log_exporter(log: log::SessionLog, url: String) {
+    use crate::contract::Payload;
+    use std::sync::atomic::AtomicBool;
+
+    let from = log.last_seq() + 1;
+    std::thread::spawn(move || {
+        let never = AtomicBool::new(false);
+        let _ = log.subscribe(from, &never, |event| {
+            if matches!(event.payload, Payload::AttentionRequired(_)) {
+                if let Ok(json) = serde_json::to_string(event) {
+                    warn_on_sink_error(
+                        "webhook-export",
+                        "attention_required",
+                        webhook::sink_emit(&url, &json),
+                    );
+                }
+            }
+            true // never stops on its own; the process owns the lifetime
+        });
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

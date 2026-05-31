@@ -94,14 +94,29 @@ replaced container must not look like a lost session. (This is the
 session-vs-container reconciliation the remotes doc flags as an open
 question; it is *resolved here* and the specs inherit it.)
 
-**§0 is bigger than "promote the envelope."** Today the agent-I/O `Event` has
-no `sessionId` (everything is `sandbox_id`-keyed) and the `Session` record
-embeds exactly one `sandbox_id` (1:1 with a sandbox). So §0 = (a) add
-`sessionId` to the Event, (b) merge the two orthogonally-split systems
-(rich-but-sandbox-keyed `contract.rs` vs lifecycle-`sessionId`-but-seqless
-`events/mod.rs`), and (c) **re-model `Session` from 1:1-with-a-sandbox into a
-cross-sandbox spine.** (c) is the hardest part — the "session migrates local →
-docker:// → managed" claim depends on it; it does not fall out of "promotion."
+**§0 is the local substrate — done. The structural re-model is a
+multiplayer/migration prerequisite, re-scoped OUT of §0 (2026-05-31).** §0 as
+*built* is: `sessionId` on the Event + the durable per-session log + the
+co-located single-writer sequencer + the zero-config local `Subscribe(from_seq)`
+surface + a producer. That's the part every consumer reads, and it's complete +
+live-verified. Three harder pieces were *originally* lumped into §0; they have
+**no consumer in the single-player product** and are reclassified to land with
+their drivers:
+- **(b) merge the two event systems** (rich `contract.rs` vs lifecycle
+  `events/mod.rs`) + **`actor` on the envelope** + **gateway as network
+  seq-authority** → **Multiplayer** (the attributed multi-writer thread is what
+  needs them). The fan-out review confirmed: until then, the per-session log is
+  the bus and consumers are read-side exporters; folding lifecycle onto the seq
+  spine would force the deferred host↔sandbox seq handoff for no current gain.
+- **(c) re-model `Session` from 1:1-with-a-sandbox into a cross-sandbox spine**
+  → **Remotes / managed migration** ("session migrates local → docker:// →
+  managed"). Detach/reattach + the per-session log already key off the durable
+  `Session.id`, so the 1:1 record is fine until a session genuinely spans
+  sandboxes.
+- **`class: content|signal`** → the pooling/optimization track.
+
+Net: don't build the structural §0 preemptively; it ships with multiplayer
+(b/actor/seq) or migration (c). §0-the-substrate is closed.
 
 **The gateway is one *role* — but the hardest net-new build, not "build it
 once and done."** Sequencer + broker + attach can be one process, but none of
@@ -345,8 +360,8 @@ multi-human surface.**
 |---|---|---|---|
 | 1 | **Remotes collapse — `docker://` + cold-host DX contract** *(foreground run + ingest + result-extraction + sandbox-side vault ✓ live-verified; remaining: `--detach`, version-skew, pull-progress)* | Cheapest big win; a *deletion* onto Docker contexts; fixes the documented product failure. **Independent of §0** — detach keys off the durable `Session.id`. | remotes + dx |
 | 2 | **Approval loop — `session.blocked` + `session approve\|deny\|answer`** (+ real HITL sink arms) | Makes detached/remote usable; **thin over *shipped* plumbing** — a new event on today's sink path + verbs over the Input-frame channel (d590a2d). Not gated on the full §0 spine. | dx + event-log |
-| 3 | **§0 spine + LOCAL subscribe surface** — envelope + `sessionId` + `actor` + gateway sequencer, and expose `Subscribe(from_seq)` **locally, zero-config** (not OTLP-only) + local JSONL persist *(local substrate ✓ live-verified: log/seq/replay/`subscribe`/`Payload::Unknown`/producer/WS gateway + `sessionId`; remaining structural §0: `actor`, lifecycle-merge, cross-sandbox `Session`, gateway authority — see Built so far)* | The keystone. The substrate's local stream **every** consumer reads — unblocks the inner-loop readout, fleet triage, lum, *and* all multiplayer. | event-log + gateway + dx |
-| 4 | **`session list` status + `session diagnose`** + a thin `pillbox watch` reference reader | Falls out of §0 (the log). Makes a swarm triageable and gives the cheapest "watch your agent" demo — a *consumer over the public tap, not a UI*. | dx |
+| 3 | **§0 LOCAL SUBSTRATE — ✓ DONE + live-verified** — `sessionId` + durable per-session log + co-located sequencer + zero-config `Subscribe(from_seq)` (`notify` tail) + a producer. *Re-scoped: `actor` / event-system-merge / network-seq → multiplayer; cross-sandbox `Session` → migration; `class` → pooling — NOT §0.* | The keystone. The substrate's local stream **every** consumer reads — inner-loop readout, fleet triage, lum, *and* (later) multiplayer. | event-log + gateway + dx |
+| 4 | **Reader bits** — `session watch` ✓ (thin human reader, `docker logs` model); remaining: `session diagnose` + `session list` status-from-log | Falls out of §0 (the log). Makes a swarm triageable + the cheapest "watch your agent" — a *consumer over the public tap, not a UI*. | dx |
 | 5 | **Harden #1/#3** (transcript+MITM source of truth; native secondary). #2 `raw_body` deferred | Cheap; off the critical path. | harden |
 | 6 | **Multiplayer web-attach** (the multi-human circulation demo) — needs `Frame` seq/ack + bounded `DataAck` + WS endpoint + `session share` | **Demoted** below the cheap local-visibility + approval work: the §0 spine already gives single-player "watch," and the share-a-link demo is heavier. Still the multi-human artifact for orca / the gsv builder. | multiplayer |
 | 7 | **Multiplayer input / roles / join links** | Governed multi-writer; defer until web-attach shows pull. | multiplayer |
@@ -380,20 +395,18 @@ Reconciled against the sequence above; commits on `main` (origin synced).
   secret-denylist ingest, result extraction, sandbox-side vault, the
   blob-scrub security fix — **done + live-verified**. Open: `docker://`
   `--detach`, version-skew, pull-progress.
-- **Step 3 — §0: the LOCAL-SUBSTRATE half is done + live-verified; the
-  STRUCTURAL half is not.**
-  - *Done:* durable per-session log (`events/log.rs::SessionLog` →
+- **Step 3 — §0 (local substrate): DONE + live-verified** (and re-scoped — the
+  structural bits moved out of §0, see "§0 is the local substrate" above).
+  - durable per-session log (`events/log.rs::SessionLog` →
     `<pillbox>/sessions/<id>/log.jsonl`), per-session monotonic seq (the log is
     the **co-located single-writer sequencer**, recovered on open), `read_from`
-    replay, `subscribe(from,stop,sink)`, `Payload::Unknown`; `sessionId` on the
-    Event (§0a); the first producer (transcripts→log, always-on, **lossless** —
-    added `Usage`/`Thinking`/`model`/`stop_reason` to proto + Rust); the
+    replay, `subscribe(from,stop,sink)` (`notify` tail), `Payload::Unknown`;
+    `sessionId` on the Event; the first producer (transcripts→log, always-on,
+    **lossless** — `Usage`/`Thinking`/`model`/`stop_reason` in proto + Rust); the
     zero-config local subscribe surface as a **WS gateway** (`session subscribe`).
-  - *Not done (the harder structural §0):* **`actor`** on the envelope; **(b)**
-    merge the lifecycle stream (`events/mod.rs` / `events.jsonl`) into the log;
-    **(c)** re-model `Session` from 1:1-with-a-sandbox into the cross-sandbox
-    spine; the **gateway as network seq-authority + actor-auth** (no resident
-    broker today); the content/signal **`class`** field (deferred to pooling).
+  - *Re-scoped OUT of §0 (land with their drivers):* `actor` + (b) event-system
+    merge + network seq-authority → **multiplayer**; (c) cross-sandbox `Session`
+    → **migration**; `class` → **pooling**. No current single-player consumer.
 - **Ahead of sequence (Step 7 input / dx):** the **drive surface** — `session
   send` (SendInput → pty-host) + **tail-while-serving** (`session subscribe` on
   a live session tails its transcript→log while serving) — closes the
@@ -407,8 +420,17 @@ Reconciled against the sequence above; commits on `main` (origin synced).
   `AttentionRequired{ NeedsInput }` on the transcript's explicit `stop_reason ==
   "end_turn"` → the durable log / `subscribe` stream, for a front-end (orca /
   lum / Slack) to flash / seek-input; respond via `session send`. Live-verified.
-  Remaining: the mid-tool **blocked/permission** signal (the OSC/hook status
-  channel — a timer can't tell "blocked" from a slow tool).
+  Remaining: the mid-tool **blocked/permission** signal — researched
+  (2026-05-31): use Claude Code's **`Notification` hook** (`notification_type`
+  discriminates `idle_prompt` vs `permission_prompt` vs `elicitation_dialog`) +
+  **`StopFailure`** (auth/rate-limit/billing stalls → `ErrorStalled`), **not OSC**
+  (Claude emits no native idle/permission OSC; orca's OSC 9999 is itself
+  hook-authored). pillbox pre-seeds `~/.claude/settings.json` (the same
+  bind-mount lever as trust) with a hook whose handler appends `AttentionRequired`
+  to the **co-located** per-session log (sandbox-side for remote, host for local
+  — the existing tailer/log spine carries it; no daemon). Maps idle_prompt→
+  NeedsInput, permission_prompt/elicitation→Permission, StopFailure→ErrorStalled.
+  Keep the transcript `end_turn`→NeedsInput as the backstop.
 - **Fan-out architecture (decided 2026-05-31, after an adversarial review).**
   "One signal → all subscription types" is realized as **the per-session log is
   the bus; every consumer is a read-side tailer of it** — NOT a producer-side
@@ -425,14 +447,19 @@ Reconciled against the sequence above; commits on `main` (origin synced).
   **projection** of the per-session logs; **defer** the `EventType`→`Payload`
   fold + routing lifecycle through the seq authority until multiplayer needs the
   unified actor/seq thread *and* the seq handoff is designed.
-- **Not started:** Step 4's reader bits (`pillbox watch`, `session diagnose`,
-  `session list` status-from-log — the WS subscribe surface exists, the thin
-  reference reader + status projection don't); Steps 5–9.
+- **Step 4 — reader bits, started:** **`session watch`** ships (the thin
+  human-facing reader — renders the event stream to the terminal, the `docker
+  logs` model; `subscribe` is the machine/WS sibling). Remaining: **`session
+  diagnose`** (collector-free post-mortem from the log) + **`session list`
+  status-from-log** (running / idle / done, not just attached/detached).
+- **Not started:** Steps 5–9 (Harden #1/#3, multiplayer web-attach, input/roles,
+  k8s/managed, profiles).
 
-**Net:** §0 as a *usable local substrate* (watch + drive your agent, no
-collector) is **done**. §0 as the *multiplayer / migration spine* — `actor`,
-unified lifecycle, cross-sandbox `Session`, gateway authority — is the
-remaining structural work, and it's what Steps 2/4/6–9 build on.
+**Net:** §0 *as the usable local substrate* (watch + drive your agent, no
+collector) is **done and re-scoped to that**. The structural pieces once lumped
+into §0 — `actor`, the event-system merge, cross-sandbox `Session`, gateway
+authority — are **not** §0; they land with their drivers (multiplayer /
+migration / pooling) and are deliberately unbuilt until then.
 
 ## Cross-cutting decisions (the genuine forks)
 

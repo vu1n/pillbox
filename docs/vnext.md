@@ -408,8 +408,23 @@ Reconciled against the sequence above; commits on `main` (origin synced).
   "end_turn"` → the durable log / `subscribe` stream, for a front-end (orca /
   lum / Slack) to flash / seek-input; respond via `session send`. Live-verified.
   Remaining: the mid-tool **blocked/permission** signal (the OSC/hook status
-  channel — a timer can't tell "blocked" from a slow tool) + an
-  `events.jsonl`/webhook sink arm for non-`subscribe` consumers.
+  channel — a timer can't tell "blocked" from a slow tool).
+- **Fan-out architecture (decided 2026-05-31, after an adversarial review).**
+  "One signal → all subscription types" is realized as **the per-session log is
+  the bus; every consumer is a read-side tailer of it** — NOT a producer-side
+  push bus + lifecycle-`EventType`-fold (reviewed and rejected: the file is the
+  cross-process IPC even in-process, so push buys nothing the detached path can
+  use; network sinks on the append path would stall the agent; and the fold
+  drags in the deferred host↔sandbox seq handoff — see the gateway spec). Built:
+  `subscribe` now uses a **`notify` tail** (file stays the single bus, every
+  reader improves); a **read-side webhook exporter** (`events::
+  spawn_webhook_log_exporter`) tails the log and POSTs `AttentionRequired` to
+  `$PILLBOX_EVENTS_WEBHOOK` off the producer's path. **Live-verified:** one
+  `attention_required` produced once fans to both the WS `subscribe` stream and
+  the webhook. Remaining on this track: make `events.jsonl` a read-side
+  **projection** of the per-session logs; **defer** the `EventType`→`Payload`
+  fold + routing lifecycle through the seq authority until multiplayer needs the
+  unified actor/seq thread *and* the seq handoff is designed.
 - **Not started:** Step 4's reader bits (`pillbox watch`, `session diagnose`,
   `session list` status-from-log — the WS subscribe surface exists, the thin
   reference reader + status projection don't); Steps 5–9.

@@ -13,6 +13,13 @@ use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
 use crate::{events, remote, sandbox, session};
 
+/// A `Backend::Docker` session whose `remote` marks it local (the host daemon),
+/// vs a `docker://` remote session (a remote name / inline URL to re-resolve).
+/// Empty is treated as local for forward-compat with pre-`LOCAL_REMOTE` records.
+fn is_local_docker(remote: &str) -> bool {
+    remote == session::LOCAL_REMOTE || remote.is_empty()
+}
+
 pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> {
     match action {
         SessionAction::List { json } => session_list(resolved, json),
@@ -299,8 +306,16 @@ fn session_diagnose(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
 fn session_attach(resolved: &Pillbox, id: &str) -> Result<()> {
     let s = session::resolve(resolved, id)?;
     match session::Backend::parse(&s.backend) {
-        // Local Docker has no remote registry entry — attach directly.
-        Some(session::Backend::Docker) => sandbox::local_docker::reattach(resolved, &s),
+        // Both local and docker:// sessions are `Backend::Docker` (a container
+        // either way); the `remote` field disambiguates. Local attaches to the
+        // host daemon directly; docker:// re-resolves the endpoint.
+        Some(session::Backend::Docker) if is_local_docker(&s.remote) => {
+            sandbox::local_docker::reattach(resolved, &s)
+        }
+        Some(session::Backend::Docker) => {
+            let remote = remote::resolve_run_target(resolved, &s.remote)?;
+            sandbox::remote_docker::reattach(resolved, &remote, &s)
+        }
         Some(session::Backend::E2b) => {
             let remote = remote::read(resolved, &s.remote)?.ok_or_else(|| {
                 PillboxError::runtime(
@@ -433,7 +448,15 @@ fn session_detach(resolved: &Pillbox, id: &str) -> Result<()> {
 fn session_rm(resolved: &Pillbox, id: &str) -> Result<()> {
     let s = session::resolve(resolved, id)?;
     match session::Backend::parse(&s.backend) {
-        Some(session::Backend::Docker) => sandbox::local_docker::kill_session(resolved, &s),
+        Some(session::Backend::Docker) if is_local_docker(&s.remote) => {
+            sandbox::local_docker::kill_session(resolved, &s)
+        }
+        Some(session::Backend::Docker) => {
+            // `.ok()` (not `?`): a deregistered remote must not strand the
+            // local record — kill_session drops it either way.
+            let remote = remote::resolve_run_target(resolved, &s.remote).ok();
+            sandbox::remote_docker::kill_session(resolved, remote.as_ref(), &s)
+        }
         Some(session::Backend::E2b) => sandbox::remote_e2b::kill_session(resolved, &s),
         Some(session::Backend::Ssh) => {
             // ssh teardown needs the registered remote to reach the host, but

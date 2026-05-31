@@ -12,13 +12,27 @@
 //! start → attach lifecycle from the run-assembly state machine in
 //! remotes-redesign.md.
 //!
-//! **Status (milestone 1):** foreground runs execute the agent in the remote
-//! container with auth + vault forwarded via the blob, attach over the
-//! endpoint, and reap on exit. Deferred (clearly-marked follow-ons): host-side
-//! **result extraction** (`docker cp` the workspace out → cwd + snapshot — the
-//! `ResultCaptured` state), **creds read-back** (the `CredsPersisted`-before-
-//! `TornDown` invariant / 2nd-run-401 guard), `--detach` (+ `session
-//! attach/rm` re-resolution), and OTEL env forwarding for sandbox-side obs.
+//! **Status:** foreground runs execute the agent in the remote container with
+//! auth + vault forwarded via the blob, attach over the endpoint, and reap on
+//! exit. `--detach` records a [`Session`] and leaves the container running;
+//! [`reattach`] re-opens the exec relay over the re-resolved endpoint and
+//! [`kill_session`] force-removes it (`session attach/rm` route here on the
+//! `remote` field, which works for both registered and inline docker:// URLs).
+//! The lifecycle — create → record → list → teardown-over-endpoint — is
+//! live-verified against a real VPS.
+//!
+//! **Known gap (the agent doesn't stay interactive yet).** A detached docker://
+//! agent currently *runs and exits* — the direct-vault launch behaves headless,
+//! the same family as the foreground "fast `claude -p` exits before the relay
+//! connects" note — so a reattach finds a finished container, not a live prompt.
+//! Making the detached agent stay alive for reattach + drive (`session
+//! send`/`subscribe`, today local-docker only) is the follow-on that turns this
+//! from "records the run" into the drivable detached session §0 wants.
+//!
+//! Other deferred (clearly-marked) follow-ons: host-side **result extraction
+//! for a detached session** (`docker cp` out via `session pull`; foreground
+//! already pulls on exit), **creds read-back** (the `CredsPersisted`-before-
+//! `TornDown` invariant / 2nd-run-401 guard), and OTEL env forwarding.
 
 use anyhow::{Context, Result};
 
@@ -31,9 +45,27 @@ use crate::docker::{self, DockerEndpoint};
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
 use crate::remote::{Remote, RemoteUrl};
-use crate::session::Session;
+use crate::session::{self, Session, BACKEND_DOCKER};
 
 const ACTION: &str = "run --remote (docker)";
+
+/// Resolve a docker:// remote to its `DOCKER_HOST` endpoint, re-parsing the URL
+/// (not caching) so a hand-edited remote surfaces a pointed error. Shared by
+/// `run`, `reattach`, and `kill_session` so they agree on how a docker:// remote
+/// maps to a daemon — and reject a non-docker URL the same way.
+fn endpoint_for(remote: &Remote) -> Result<DockerEndpoint> {
+    match remote
+        .parsed_url()
+        .map_err(|e| PillboxError::config(ACTION, format!("remote `{}`: {e}", remote.name)))?
+    {
+        RemoteUrl::Docker(d) => Ok(DockerEndpoint::remote(d.docker_host())),
+        RemoteUrl::Ssh(_) | RemoteUrl::E2b(_) => Err(PillboxError::config(
+            ACTION,
+            format!("remote `{}` is not a docker:// URL", remote.name),
+        )
+        .into()),
+    }
+}
 
 /// Where the in-container pty-host listens; the per-attach relay (run via
 /// `docker exec` over the endpoint) connects to the same path.
@@ -66,28 +98,7 @@ impl SandboxBackend for RemoteDockerSandbox {
         // Re-parse here (not at construction) so a hand-edited TOML surfaces a
         // pointed error rather than a generic connect failure — mirrors the
         // ssh/e2b backends' belt-and-suspenders re-validation.
-        let endpoint = match self.remote.parsed_url().map_err(|e| {
-            PillboxError::config(ACTION, format!("remote `{}`: {e}", self.remote.name))
-        })? {
-            RemoteUrl::Docker(d) => DockerEndpoint::remote(d.docker_host()),
-            RemoteUrl::Ssh(_) | RemoteUrl::E2b(_) => {
-                return Err(PillboxError::config(
-                    ACTION,
-                    format!("remote `{}` is not a docker:// URL", self.remote.name),
-                )
-                .into());
-            }
-        };
-
-        // Milestone 1 is foreground-only. Detach (and `session attach/rm`
-        // re-resolution for inline-URL docker:// sessions) is a follow-on.
-        if opts.detach {
-            return Err(
-                PillboxError::usage(ACTION, "--detach is not supported for docker:// yet")
-                    .with_next("run docker:// in the foreground for now")
-                    .into(),
-            );
-        }
+        let endpoint = endpoint_for(&self.remote)?;
 
         // Preflight the REMOTE daemon + image (over the endpoint), so a cold
         // host / missing image fails with a pointed error before we build the
@@ -203,8 +214,56 @@ impl SandboxBackend for RemoteDockerSandbox {
             );
         }
 
-        // Foreground: reap the container on every exit path. (A future
-        // `--detach` keeps it alive + records a Session instead.)
+        // Detached: record the session and leave the container running — no
+        // `ContainerGuard`, so it outlives this process. Reattach later over the
+        // same endpoint with `pillbox session attach <id>`; tear down with
+        // `session rm`. (Result extraction for a detached docker:// session —
+        // `docker cp` out over the endpoint via `session pull` — is a follow-on;
+        // foreground already pulls on exit below.)
+        if opts.detach {
+            let session = Session {
+                id: session_id.clone(),
+                label: opts.label.clone(),
+                remote: self.remote.name.clone(),
+                backend: BACKEND_DOCKER.to_string(),
+                sandbox_id: container.clone(),
+                pty_pid: 0,
+                agent_id: spec.id.to_string(),
+                started_at: session::now_rfc3339(),
+                attached_pid: None,
+                base_snapshot: None,
+                result_snapshot: None,
+                expires_at: opts.ttl_seconds.map(session::expires_at_from_ttl),
+                // A remote session's transcript is sandbox-side (no bind-mount),
+                // so the host can't tail it into the durable log — empty, like
+                // the ssh/e2b backends.
+                guest_cwd: String::new(),
+            };
+            session::write(resolved, &session)?;
+            crate::events::emit_session_event(
+                resolved,
+                crate::events::EventType::SessionStarted {
+                    parent_session_id: crate::events::parent_session_id_from_env(),
+                },
+                &session.id,
+                Some(&session),
+            );
+            if opts.json {
+                println!(
+                    "{}",
+                    crate::paths::json_v1(vec![("session", session.to_json_value())])
+                );
+            } else {
+                println!(
+                    "pillbox: ✓ session `{}` started in background on `{}`.",
+                    session.id, self.remote.name
+                );
+                println!("         pillbox session attach {}  # reattach", session.id);
+            }
+            return Ok(());
+        }
+
+        // Foreground: reap the container on every exit path.
         let _guard = ContainerGuard(endpoint.clone(), container.clone());
 
         let outcome = attach_via_exec_at(&endpoint, &container, false);
@@ -283,4 +342,101 @@ fn attach_via_exec_at(
     let _ = child.kill();
     let _ = child.wait();
     Ok(outcome)
+}
+
+/// `pillbox session attach <id>` for a docker:// session: re-open the
+/// docker-exec relay to the still-running remote container and pump. Mirrors
+/// `local_docker::reattach` / `remote_ssh::reattach`, but endpoint-aware.
+pub(crate) fn reattach(resolved: &Pillbox, remote: &Remote, session: &Session) -> Result<()> {
+    if session::Backend::parse(&session.backend) != Some(session::Backend::Docker) {
+        return Err(PillboxError::usage(
+            "session attach",
+            format!(
+                "session `{}` is backed by `{}`, not docker",
+                session.id, session.backend
+            ),
+        )
+        .into());
+    }
+    let endpoint = endpoint_for(remote)?;
+    let short = &session.sandbox_id[..session.sandbox_id.len().min(12)];
+    eprintln!(
+        "pillbox: reattaching to session `{}` (container `{short}`) on `{}` …",
+        session.id, remote.name
+    );
+    eprintln!("pillbox: detach with Ctrl-A D (the container keeps running).");
+
+    session::mark_attached(resolved, &session.id, std::process::id() as i64)?;
+    let outcome = attach_via_exec_at(&endpoint, &session.sandbox_id, true);
+    let _ = session::mark_detached(resolved, &session.id);
+
+    match outcome? {
+        Outcome::Detached => {
+            eprintln!(
+                "pillbox: detached. reattach with `pillbox session attach {}`",
+                session.id
+            );
+            Ok(())
+        }
+        Outcome::Exited(code) => {
+            eprintln!(
+                "pillbox: agent exited ({code}). `pillbox session rm {}` to clean up.",
+                session.id
+            );
+            Ok(())
+        }
+        Outcome::Disconnected => {
+            eprintln!("pillbox: session connection closed.");
+            Ok(())
+        }
+    }
+}
+
+/// `pillbox session rm <id>` for a docker:// session: force-remove the remote
+/// container over the endpoint, then drop the local record unconditionally (a
+/// failed remove must not strand the record; the container may already be
+/// gone). `remote` is `None` when it's been deregistered — we can't reach the
+/// daemon to remove the container, but we still drop the local record.
+pub(crate) fn kill_session(
+    resolved: &Pillbox,
+    remote: Option<&Remote>,
+    session: &Session,
+) -> Result<()> {
+    if session::Backend::parse(&session.backend) != Some(session::Backend::Docker) {
+        return Err(PillboxError::usage(
+            "session rm",
+            format!(
+                "session `{}` is backed by `{}`, not docker",
+                session.id, session.backend
+            ),
+        )
+        .into());
+    }
+    match remote {
+        Some(remote) => match endpoint_for(remote) {
+            Ok(endpoint) => {
+                if let Err(e) = docker::rm_force_at(&endpoint, &session.sandbox_id) {
+                    eprintln!("pillbox: warning: remote container teardown failed: {e}");
+                }
+            }
+            Err(e) => eprintln!(
+                "pillbox: warning: remote `{}` url unusable ({e}); skipping remote teardown.",
+                remote.name
+            ),
+        },
+        None => eprintln!(
+            "pillbox: warning: remote `{}` is no longer registered — dropping the record without \
+             remote teardown; remove the container by hand if it's still running.",
+            session.remote
+        ),
+    }
+    crate::events::emit_session_event(
+        resolved,
+        crate::events::EventType::SessionDropped,
+        &session.id,
+        Some(session),
+    );
+    session::delete(resolved, &session.id)?;
+    println!("pillbox: ✓ session `{}` removed.", session.id);
+    Ok(())
 }

@@ -124,6 +124,12 @@ pub(crate) const BACKEND_E2B: &str = "e2b";
 pub(crate) const BACKEND_SSH: &str = "ssh";
 pub(crate) const BACKEND_DOCKER: &str = "docker";
 
+/// The `remote` field value a *local* Docker session records. Both local and
+/// `docker://` remote sessions use [`BACKEND_DOCKER`] (a container either way),
+/// so `session attach/rm` disambiguates on this: `remote == LOCAL_REMOTE` →
+/// local daemon; anything else is a remote name / inline URL to re-resolve.
+pub(crate) const LOCAL_REMOTE: &str = "local";
+
 /// Typed view of the on-disk `backend` string. Returned by
 /// [`Backend::parse`]; `None` means a backend label this binary doesn't
 /// know about (older or hand-edited record). Callers report the raw

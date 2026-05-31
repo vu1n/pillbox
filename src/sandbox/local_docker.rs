@@ -235,7 +235,7 @@ impl SandboxBackend for LocalDocker {
             let session = Session {
                 id: Session::new_id(),
                 label: opts.label.clone(),
-                remote: "local".to_string(),
+                remote: session::LOCAL_REMOTE.to_string(),
                 backend: BACKEND_DOCKER.to_string(),
                 sandbox_id: container,
                 pty_pid: 0,

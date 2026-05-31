@@ -378,7 +378,10 @@ pub(crate) fn reattach(resolved: &Pillbox, remote: &Remote, session: &Session) -
     let _ = session::mark_detached(resolved, &session.id);
 
     match outcome? {
-        Outcome::Detached => {
+        // Clean detach (Ctrl-A D) or a dropped transport — either way the
+        // container keeps running and the record is left in place, so the
+        // session is still reattachable. Tell the user how.
+        Outcome::Detached | Outcome::Disconnected => {
             eprintln!(
                 "pillbox: detached. reattach with `pillbox session attach {}`",
                 session.id
@@ -390,10 +393,6 @@ pub(crate) fn reattach(resolved: &Pillbox, remote: &Remote, session: &Session) -
                 "pillbox: agent exited ({code}). `pillbox session rm {}` to clean up.",
                 session.id
             );
-            Ok(())
-        }
-        Outcome::Disconnected => {
-            eprintln!("pillbox: session connection closed.");
             Ok(())
         }
     }

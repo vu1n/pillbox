@@ -315,6 +315,15 @@ pub(crate) enum SessionAction {
     /// Tear down the backend resources (kill the sandbox) and remove
     /// the session record. Idempotent.
     Rm { id: String },
+    /// Drive a running (detached) session: push text to its agent's PTY as if
+    /// typed — the programmatic SendInput half (pair with `session subscribe`
+    /// to read the response). Bytes are sent as-is; add a trailing newline to
+    /// submit a prompt to a TUI agent. Local Docker sessions today.
+    Send {
+        id: String,
+        /// Text to send (as-is). Include a trailing newline/`\r` to submit.
+        text: String,
+    },
     /// Stream a session's durable event log to WebSocket subscribers as
     /// JSON (one Event per text frame, in seq order). The §0 read surface a
     /// chat bridge / orchestrator / browser connects to without a shell.

@@ -20,6 +20,7 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> 
         SessionAction::Attach { id } => session_attach(resolved, &id),
         SessionAction::Detach { id } => session_detach(resolved, &id),
         SessionAction::Rm { id } => session_rm(resolved, &id),
+        SessionAction::Send { id, text } => session_send(resolved, &id, &text),
         SessionAction::Subscribe { id, from, bind } => {
             session_subscribe(resolved, &id, from, bind.as_deref())
         }
@@ -316,6 +317,36 @@ fn session_rm(resolved: &Pillbox, id: &str) -> Result<()> {
         }
         None => Err(PillboxError::config(
             "session rm",
+            format!("unknown session backend `{}`", s.backend),
+        )
+        .into()),
+    }
+}
+
+fn session_send(resolved: &Pillbox, id: &str, text: &str) -> Result<()> {
+    // Drive targets a RUNNING session (a pty-host to write to), so resolve
+    // against the session registry — not `resolve_logged` (the read side's
+    // foreground log dirs).
+    let s = session::resolve(resolved, id)?;
+    match session::Backend::parse(&s.backend) {
+        Some(session::Backend::Docker) => {
+            sandbox::local_docker::send_input(&s.sandbox_id, text.as_bytes())?;
+            eprintln!("pillbox: sent {} byte(s) to session `{}`", text.len(), s.id);
+            Ok(())
+        }
+        // The same relay-exec pattern extends to e2b/ssh (mirroring their
+        // reattach transport); not wired yet.
+        Some(_) => Err(PillboxError::usage(
+            "session send",
+            format!(
+                "send isn't supported for `{}` sessions yet (local docker only)",
+                s.backend
+            ),
+        )
+        .with_next(format!("pillbox session attach {}", s.id))
+        .into()),
+        None => Err(PillboxError::config(
+            "session send",
             format!("unknown session backend `{}`", s.backend),
         )
         .into()),

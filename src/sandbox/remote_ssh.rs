@@ -995,12 +995,8 @@ pub(crate) fn dispatch_vault_stdin(resolved: &Pillbox, blob_file: Option<&Path>)
 
     // Pre-accept the agent's workspace trust dialog (claude) on the
     // bind-mounted home before the nested container starts — claude runs with
-    // cwd `guest_workspace`, so that's the project key. Best-effort + loud.
-    if let Some(prepare) = spec.prepare_workspace {
-        if let Err(e) = prepare(&home, &guest_workspace) {
-            eprintln!("pillbox: warning: workspace pre-trust failed: {e:#}");
-        }
-    }
+    // cwd `guest_workspace`, so that's the project key.
+    spec.prepare_workspace_or_warn(&home, &guest_workspace);
 
     // Live observability, sandbox-side: the agent's transcript lands in
     // this remote's bind-mounted $HOME (local to this process), so the
@@ -1146,13 +1142,8 @@ pub(crate) fn dispatch_vault_stdin_direct(
 
     // Pre-accept the agent's workspace trust dialog (claude): the agent runs
     // with cwd `workspace_host`, so that's the project key in its $HOME's
-    // ~/.claude.json. Best-effort + loud.
-    if let Some(prepare) = spec.prepare_workspace {
-        let ws_key = workspace_host.to_string_lossy();
-        if let Err(e) = prepare(&home_dir, &ws_key) {
-            eprintln!("pillbox: warning: workspace pre-trust failed: {e:#}");
-        }
-    }
+    // ~/.claude.json.
+    spec.prepare_workspace_or_warn(&home_dir, &workspace_host.to_string_lossy());
 
     let mut cmd = std::process::Command::new(spec.run_argv[0]);
     if spec.run_argv.len() > 1 {

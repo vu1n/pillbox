@@ -175,6 +175,18 @@ fn finalize_claude_onboarding(home: &Path) -> Result<()> {
 /// trust gate — which `-p` auto-skips but a PTY-attached interactive run shows,
 /// and `--dangerously-skip-permissions` can't bypass as root. Merges into any
 /// existing entry; creates the file + `projects` map as needed.
+/// Get `key` from `obj` as a mutable object, inserting an empty one if absent.
+/// Errors if `key` is present but not a JSON object.
+fn get_or_create_object<'a>(
+    obj: &'a mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<&'a mut serde_json::Map<String, serde_json::Value>> {
+    obj.entry(key.to_string())
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("`{key}` is not a JSON object in .claude.json"))
+}
+
 fn pretrust_claude_workspace(home: &Path, guest_workspace: &str) -> Result<()> {
     let path = home.join(".claude.json");
     let mut value: serde_json::Value = if path.exists() {
@@ -183,26 +195,12 @@ fn pretrust_claude_workspace(home: &Path, guest_workspace: &str) -> Result<()> {
     } else {
         serde_json::json!({})
     };
-    let projects = value
+    let root = value
         .as_object_mut()
-        .ok_or_else(|| anyhow!("expected top-level JSON object in {}", path.display()))?
-        .entry("projects")
-        .or_insert_with(|| serde_json::json!({}))
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("`projects` is not an object in {}", path.display()))?;
-    let entry = projects
-        .entry(guest_workspace.to_string())
-        .or_insert_with(|| serde_json::json!({}))
-        .as_object_mut()
-        .ok_or_else(|| anyhow!("project entry is not an object in {}", path.display()))?;
-    entry.insert(
-        "hasTrustDialogAccepted".into(),
-        serde_json::Value::Bool(true),
-    );
-    entry.insert(
-        "hasCompletedProjectOnboarding".into(),
-        serde_json::Value::Bool(true),
-    );
+        .ok_or_else(|| anyhow!("expected top-level JSON object in {}", path.display()))?;
+    let entry = get_or_create_object(get_or_create_object(root, "projects")?, guest_workspace)?;
+    entry.insert("hasTrustDialogAccepted".into(), true.into());
+    entry.insert("hasCompletedProjectOnboarding".into(), true.into());
     let serialized = serde_json::to_string_pretty(&value)
         .with_context(|| format!("serialize {}", path.display()))?;
     fs::write(&path, serialized).with_context(|| format!("write {}", path.display()))?;
@@ -212,6 +210,18 @@ fn pretrust_claude_workspace(home: &Path, guest_workspace: &str) -> Result<()> {
 impl AgentSpec {
     pub(crate) fn id(&self) -> &'static str {
         self.id
+    }
+
+    /// Run [`prepare_workspace`](Self::prepare_workspace) if set, warning (not
+    /// failing) on error — the gate it pre-accepts just reappears in-session, so
+    /// a prep failure must never abort the run. Shared by every backend launch
+    /// path so the best-effort-and-loud contract lives in one place.
+    pub(crate) fn prepare_workspace_or_warn(&self, home: &Path, guest_cwd: &str) {
+        if let Some(prepare) = self.prepare_workspace {
+            if let Err(e) = prepare(home, guest_cwd) {
+                eprintln!("pillbox: warning: workspace pre-trust failed: {e:#}");
+            }
+        }
     }
 
     /// Resolve the auth pillbox for this agent. PR 2: always global. PR 3+

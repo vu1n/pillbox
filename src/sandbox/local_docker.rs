@@ -222,13 +222,8 @@ impl SandboxBackend for LocalDocker {
 
         // Pre-accept the agent's workspace trust dialog (claude) on the
         // bind-mounted home before the container starts, so an interactive run
-        // doesn't stall on the gate. Best-effort + loud: a prep failure
-        // shouldn't abort the run (the dialog just reappears in-session).
-        if let Some(prepare) = spec.prepare_workspace {
-            if let Err(e) = prepare(&home, &guest_cwd) {
-                eprintln!("pillbox: warning: workspace pre-trust failed: {e:#}");
-            }
-        }
+        // doesn't stall on the gate (claude runs with cwd `guest_cwd`).
+        spec.prepare_workspace_or_warn(&home, &guest_cwd);
 
         let run_started = SystemTime::now();
         let container = docker::run_detached(&args)?;
@@ -338,8 +333,11 @@ impl SandboxBackend for LocalDocker {
 /// per-attach relay and pumping over its stdio. `detach_enabled` is false
 /// for a foreground `run` (no session to leave behind, so Ctrl-A passes
 /// through and SIGTERM terminates) and true for `session attach`.
-fn attach_via_exec(container: &str, detach_enabled: bool) -> Result<Outcome> {
-    let mut child = docker::exec_attach(
+/// Spawn a one-shot docker-exec `pty-relay` to a container's pty-host socket —
+/// the shared transport for the interactive pump ([`attach_via_exec`]) and the
+/// one-shot driver ([`send_input`]). The caller takes stdin/stdout off the child.
+fn exec_relay(container: &str) -> Result<std::process::Child> {
+    docker::exec_attach(
         container,
         &[
             "pillbox".into(),
@@ -347,7 +345,11 @@ fn attach_via_exec(container: &str, detach_enabled: bool) -> Result<Outcome> {
             "--sock".into(),
             ATTACH_SOCK.into(),
         ],
-    )?;
+    )
+}
+
+fn attach_via_exec(container: &str, detach_enabled: bool) -> Result<Outcome> {
+    let mut child = exec_relay(container)?;
     let stdout = child.stdout.take().context("docker exec relay stdout")?;
     let stdin = child.stdin.take().context("docker exec relay stdin")?;
     let outcome = pump::attach_terminal(stdout, stdin, detach_enabled)?;
@@ -370,15 +372,7 @@ fn attach_via_exec(container: &str, detach_enabled: bool) -> Result<Outcome> {
 pub(crate) fn send_input(container: &str, bytes: &[u8]) -> Result<()> {
     use std::io::Write as _;
 
-    let mut child = docker::exec_attach(
-        container,
-        &[
-            "pillbox".into(),
-            "pty-relay".into(),
-            "--sock".into(),
-            ATTACH_SOCK.into(),
-        ],
-    )?;
+    let mut child = exec_relay(container)?;
     let mut stdin = child.stdin.take().context("docker exec relay stdin")?;
     crate::attach::driver::send_input(&mut stdin, bytes)
         .context("write Input frame to the relay")?;

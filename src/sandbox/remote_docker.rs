@@ -36,9 +36,6 @@
 //! already pulls on exit), **creds read-back** (the `CredsPersisted`-before-
 //! `TornDown` invariant / 2nd-run-401 guard), `session send`/`subscribe` for
 //! remote docker (today local-docker only), and OTEL env forwarding.
-//! for a detached session** (`docker cp` out via `session pull`; foreground
-//! already pulls on exit), **creds read-back** (the `CredsPersisted`-before-
-//! `TornDown` invariant / 2nd-run-401 guard), and OTEL env forwarding.
 
 use anyhow::{Context, Result};
 
@@ -51,7 +48,7 @@ use crate::docker::{self, DockerEndpoint};
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
 use crate::remote::{Remote, RemoteUrl};
-use crate::session::{self, Session, BACKEND_DOCKER};
+use crate::session::{self, Session, BACKEND_REMOTE_DOCKER};
 
 const ACTION: &str = "run --remote (docker)";
 
@@ -235,7 +232,7 @@ impl SandboxBackend for RemoteDockerSandbox {
                 id: session_id.clone(),
                 label: opts.label.clone(),
                 remote: self.remote.name.clone(),
-                backend: BACKEND_DOCKER.to_string(),
+                backend: BACKEND_REMOTE_DOCKER.to_string(),
                 sandbox_id: container.clone(),
                 pty_pid: 0,
                 agent_id: spec.id.to_string(),
@@ -358,11 +355,11 @@ fn attach_via_exec_at(
 /// docker-exec relay to the still-running remote container and pump. Mirrors
 /// `local_docker::reattach` / `remote_ssh::reattach`, but endpoint-aware.
 pub(crate) fn reattach(resolved: &Pillbox, remote: &Remote, session: &Session) -> Result<()> {
-    if session::Backend::parse(&session.backend) != Some(session::Backend::Docker) {
+    if session::Backend::parse(&session.backend) != Some(session::Backend::RemoteDocker) {
         return Err(PillboxError::usage(
             "session attach",
             format!(
-                "session `{}` is backed by `{}`, not docker",
+                "session `{}` is backed by `{}`, not a remote docker",
                 session.id, session.backend
             ),
         )
@@ -412,11 +409,11 @@ pub(crate) fn kill_session(
     remote: Option<&Remote>,
     session: &Session,
 ) -> Result<()> {
-    if session::Backend::parse(&session.backend) != Some(session::Backend::Docker) {
+    if session::Backend::parse(&session.backend) != Some(session::Backend::RemoteDocker) {
         return Err(PillboxError::usage(
             "session rm",
             format!(
-                "session `{}` is backed by `{}`, not docker",
+                "session `{}` is backed by `{}`, not a remote docker",
                 session.id, session.backend
             ),
         )

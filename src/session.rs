@@ -123,11 +123,11 @@ impl IdRegistry for SessionRegistry {
 pub(crate) const BACKEND_E2B: &str = "e2b";
 pub(crate) const BACKEND_SSH: &str = "ssh";
 pub(crate) const BACKEND_DOCKER: &str = "docker";
+pub(crate) const BACKEND_REMOTE_DOCKER: &str = "remote-docker";
 
-/// The `remote` field value a *local* Docker session records. Both local and
-/// `docker://` remote sessions use [`BACKEND_DOCKER`] (a container either way),
-/// so `session attach/rm` disambiguates on this: `remote == LOCAL_REMOTE` →
-/// local daemon; anything else is a remote name / inline URL to re-resolve.
+/// The `remote` field value a *local* Docker session records — a display label
+/// (it has no registered remote). Placement is carried by [`Backend`] (local
+/// `Docker` vs `RemoteDocker`), so this is never a dispatch key.
 pub(crate) const LOCAL_REMOTE: &str = "local";
 
 /// Typed view of the on-disk `backend` string. Returned by
@@ -138,9 +138,16 @@ pub(crate) const LOCAL_REMOTE: &str = "local";
 pub(crate) enum Backend {
     E2b,
     Ssh,
-    /// Local Docker — a detached `pillbox run --detach` session. `remote`
-    /// is the sentinel "local"; `sandbox_id` is the container id.
+    /// Local Docker — a detached `pillbox run --detach` against the host
+    /// daemon. `sandbox_id` is the container id; attach/rm act on the local
+    /// daemon directly (no remote to re-resolve).
     Docker,
+    /// Remote Docker — a `docker://` detached session. `sandbox_id` is the
+    /// container id on the remote daemon; attach/rm re-resolve the endpoint
+    /// from `remote` (a registered name or inline `docker://` URL). A distinct
+    /// variant (not `Docker` + a "is the remote field 'local'?" check) so the
+    /// placement is typed and a remote literally named "local" can't misroute.
+    RemoteDocker,
 }
 
 impl Backend {
@@ -149,6 +156,7 @@ impl Backend {
             BACKEND_E2B => Some(Backend::E2b),
             BACKEND_SSH => Some(Backend::Ssh),
             BACKEND_DOCKER => Some(Backend::Docker),
+            BACKEND_REMOTE_DOCKER => Some(Backend::RemoteDocker),
             _ => None,
         }
     }

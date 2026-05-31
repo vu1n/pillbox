@@ -13,13 +13,6 @@ use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
 use crate::{events, remote, sandbox, session};
 
-/// A `Backend::Docker` session whose `remote` marks it local (the host daemon),
-/// vs a `docker://` remote session (a remote name / inline URL to re-resolve).
-/// Empty is treated as local for forward-compat with pre-`LOCAL_REMOTE` records.
-fn is_local_docker(remote: &str) -> bool {
-    remote == session::LOCAL_REMOTE || remote.is_empty()
-}
-
 pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> {
     match action {
         SessionAction::List { json } => session_list(resolved, json),
@@ -101,6 +94,20 @@ fn session_transcript(
     Ok(())
 }
 
+/// `Session::to_json_value` with the derived `status` merged on top — `status`
+/// isn't a stored field, so this is the single shape `list`/`info`/`diagnose`
+/// all emit (and `diagnose` then layers its extra fields).
+fn session_json_with_status(
+    s: &session::Session,
+    status: events::status::SessionStatus,
+) -> serde_json::Value {
+    let mut v = s.to_json_value();
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("status".into(), status.label().into());
+    }
+    v
+}
+
 fn session_list(resolved: &Pillbox, json: bool) -> Result<()> {
     let entries = session::list(resolved)?;
     // One pass over the shared lifecycle sink for every session's terminal
@@ -114,11 +121,7 @@ fn session_list(resolved: &Pillbox, json: bool) -> Result<()> {
             .iter()
             .map(|s| {
                 let status = events::status::derive(resolved, s, terminal.get(&s.id))?;
-                let mut v = s.to_json_value();
-                if let Some(obj) = v.as_object_mut() {
-                    obj.insert("status".into(), status.label().into());
-                }
-                Ok(v)
+                Ok(session_json_with_status(s, status))
             })
             .collect::<Result<_>>()?;
         println!(
@@ -167,10 +170,7 @@ fn session_info(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
     let s = session::resolve(resolved, id)?;
     let status = events::status::derive_one(resolved, &s)?;
     if json {
-        let mut v = s.to_json_value();
-        if let Some(obj) = v.as_object_mut() {
-            obj.insert("status".into(), status.label().into());
-        }
+        let v = session_json_with_status(&s, status);
         println!("{}", crate::paths::json_v1(vec![("session", v)]));
         return Ok(());
     }
@@ -200,49 +200,28 @@ fn session_info(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
 /// derived status, the terminal failure detail, and an activity summary from
 /// the durable log into one readout.
 fn session_diagnose(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
-    use crate::contract::{Payload, Role, ToolStatus};
-
     let s = session::resolve(resolved, id)?;
     let terminals = events::status::terminal_outcomes(resolved)?;
     let terminal = terminals.get(&s.id);
-    let status = events::status::derive(resolved, &s, terminal)?;
-
-    // Activity summary, folded from the per-session durable log (read-only).
-    let log = events::log::read_log(resolved, &s.id, 0)?;
-    let seq = log.last().map(|e| e.seq).unwrap_or(0);
-    let mut assistant_turns = 0u64;
-    let mut tool_calls = 0u64;
-    let mut last_at = String::new();
-    for ev in &log {
-        if !ev.at.is_empty() {
-            last_at = ev.at.clone();
-        }
-        match &ev.payload {
-            Payload::MessageStart(m) if m.role == Role::Assistant => assistant_turns += 1,
-            // A tool call lands twice (Running, then its correlated result);
-            // count the Running side so the number is invocations, not events.
-            Payload::ToolCall(t) if matches!(t.status, ToolStatus::Running) => tool_calls += 1,
-            _ => {}
-        }
-    }
+    // One fold (shared with `list`/`info`): status + activity counts.
+    let d = events::status::summarize(resolved, &s, terminal)?;
 
     let (fail_reason, exit_code) = match terminal {
         Some(events::status::Terminal::Failed { reason, exit_code }) => {
-            (Some(reason.clone()), *exit_code)
+            (Some(reason.as_str()), *exit_code)
         }
         Some(events::status::Terminal::Done { exit_code }) => (None, *exit_code),
         None => (None, None),
     };
 
     if json {
-        let mut v = s.to_json_value();
+        let mut v = session_json_with_status(&s, d.status);
         if let Some(obj) = v.as_object_mut() {
-            obj.insert("status".into(), status.label().into());
-            obj.insert("log_seq".into(), seq.into());
-            obj.insert("assistant_turns".into(), assistant_turns.into());
-            obj.insert("tool_calls".into(), tool_calls.into());
-            if !last_at.is_empty() {
-                obj.insert("last_event_at".into(), last_at.into());
+            obj.insert("log_seq".into(), d.log_seq.into());
+            obj.insert("assistant_turns".into(), d.assistant_turns.into());
+            obj.insert("tool_calls".into(), d.tool_calls.into());
+            if !d.last_at.is_empty() {
+                obj.insert("last_event_at".into(), d.last_at.clone().into());
             }
             if let Some(r) = fail_reason {
                 obj.insert("failure_reason".into(), r.into());
@@ -255,8 +234,8 @@ fn session_diagnose(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
         return Ok(());
     }
 
-    println!("Session {} — {}", s.id, status.label());
-    if let Some(r) = &fail_reason {
+    println!("Session {} — {}", s.id, d.status.label());
+    if let Some(r) = fail_reason {
         let suffix = exit_code
             .map(|c| format!(" (exit {c})"))
             .unwrap_or_default();
@@ -264,7 +243,7 @@ fn session_diagnose(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
     } else if let Some(c) = exit_code {
         println!("  exit_code:    {c}");
     }
-    if status == events::status::SessionStatus::NeedsInput {
+    if d.status == events::status::SessionStatus::NeedsInput {
         println!(
             "  awaiting:     input — the agent ended its turn; drive it with `pillbox session send {} …`",
             s.id
@@ -290,14 +269,15 @@ fn session_diagnose(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
             .unwrap_or("(none — not finished, or no result pushed)")
     );
     println!("Activity (durable log):");
-    if log.is_empty() {
+    if d.log_seq == 0 {
         println!("  (no host-visible log — a remote session streams its transcript sandbox-side)");
     } else {
         println!(
-            "  {assistant_turns} assistant turn(s), {tool_calls} tool call(s), {seq} event(s)"
+            "  {} assistant turn(s), {} tool call(s), {} event(s)",
+            d.assistant_turns, d.tool_calls, d.log_seq
         );
-        if !last_at.is_empty() {
-            println!("  last event at {last_at}");
+        if !d.last_at.is_empty() {
+            println!("  last event at {}", d.last_at);
         }
     }
     Ok(())
@@ -306,13 +286,10 @@ fn session_diagnose(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
 fn session_attach(resolved: &Pillbox, id: &str) -> Result<()> {
     let s = session::resolve(resolved, id)?;
     match session::Backend::parse(&s.backend) {
-        // Both local and docker:// sessions are `Backend::Docker` (a container
-        // either way); the `remote` field disambiguates. Local attaches to the
-        // host daemon directly; docker:// re-resolves the endpoint.
-        Some(session::Backend::Docker) if is_local_docker(&s.remote) => {
-            sandbox::local_docker::reattach(resolved, &s)
-        }
-        Some(session::Backend::Docker) => {
+        // Local Docker attaches to the host daemon directly (no remote);
+        // docker:// re-resolves the endpoint from `remote`.
+        Some(session::Backend::Docker) => sandbox::local_docker::reattach(resolved, &s),
+        Some(session::Backend::RemoteDocker) => {
             let remote = remote::resolve_run_target(resolved, &s.remote)?;
             sandbox::remote_docker::reattach(resolved, &remote, &s)
         }
@@ -448,10 +425,8 @@ fn session_detach(resolved: &Pillbox, id: &str) -> Result<()> {
 fn session_rm(resolved: &Pillbox, id: &str) -> Result<()> {
     let s = session::resolve(resolved, id)?;
     match session::Backend::parse(&s.backend) {
-        Some(session::Backend::Docker) if is_local_docker(&s.remote) => {
-            sandbox::local_docker::kill_session(resolved, &s)
-        }
-        Some(session::Backend::Docker) => {
+        Some(session::Backend::Docker) => sandbox::local_docker::kill_session(resolved, &s),
+        Some(session::Backend::RemoteDocker) => {
             // `.ok()` (not `?`): a deregistered remote must not strand the
             // local record — kill_session drops it either way.
             let remote = remote::resolve_run_target(resolved, &s.remote).ok();

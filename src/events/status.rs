@@ -16,7 +16,7 @@
 //! session emits its terminal event sandbox-side, so until that reaches the
 //! host (a webhook listener replaying `session done`, or `session pull`
 //! persisting `result_snapshot`) the host genuinely can't know it finished —
-//! such a session reads `Running`/`Starting`, not a guessed `Done`. The
+//! such a session reads `Running` (it launched), not a guessed `Done`. The
 //! per-session log likewise only exists host-side for live-tailed local runs.
 //! The deriver never overclaims past what the host can see.
 
@@ -25,18 +25,19 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::contract::{AttentionReason, Payload};
+use crate::contract::{AttentionReason, Payload, Role, ToolStatus};
 use crate::events::{events_path, log};
 use crate::pillbox::Pillbox;
 use crate::session::Session;
 
-/// What a session is doing, in precedence order (terminal wins).
+/// What a session is doing, in precedence order (terminal wins). There's no
+/// distinct "starting" — a session only has a record once it's launched, so the
+/// resting non-terminal state is `Running` (a remote session the host can't see
+/// into reads `Running` until its terminal event arrives — honest, not a
+/// guessed "done").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SessionStatus {
-    /// A record exists but no activity is host-visible yet (just spawned, or a
-    /// remote session whose log + terminal event live sandbox-side).
-    Starting,
-    /// Producing output / running tools, or has a terminal attached.
+    /// Producing output / running tools (or launched-but-host-opaque).
     Running,
     /// The agent ended a turn awaiting input (`end_turn`→`NeedsInput`) and
     /// hasn't resumed — the front-end's cue to flash / seek input.
@@ -52,13 +53,25 @@ impl SessionStatus {
     /// Stable lower-kebab label for the CLI column and the `--json` field.
     pub(crate) fn label(self) -> &'static str {
         match self {
-            SessionStatus::Starting => "starting",
             SessionStatus::Running => "running",
             SessionStatus::NeedsInput => "needs-input",
             SessionStatus::Done => "done",
             SessionStatus::Failed => "failed",
         }
     }
+}
+
+/// One session's folded view: its [`SessionStatus`] plus the activity counts
+/// `session diagnose` renders. Produced by a single pass over the durable log
+/// ([`summarize`]) so status and counts can never disagree about what a "turn"
+/// or "tool call" is — the classification lives in exactly one place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Diagnosis {
+    pub(crate) status: SessionStatus,
+    pub(crate) assistant_turns: u64,
+    pub(crate) tool_calls: u64,
+    pub(crate) last_at: String,
+    pub(crate) log_seq: u64,
 }
 
 /// A host-visible terminal outcome for a session, with the detail `diagnose`
@@ -125,61 +138,80 @@ pub(crate) fn terminal_outcomes(pb: &Pillbox) -> Result<HashMap<String, Terminal
     Ok(out)
 }
 
-/// Derive one session's status given its terminal outcome (looked up from
-/// [`terminal_outcomes`] for a batch, or `None`). Reads the per-session log
-/// read-only — never creates the session dir.
+/// Fold a session in one read-only pass over its durable log (never creates the
+/// session dir): activity counts + whether its last turn left the agent
+/// awaiting input, combined with its `terminal` outcome (looked up from
+/// [`terminal_outcomes`], or `None`) into a [`Diagnosis`]. The single classifier
+/// `list` (status only), `info`, and `diagnose` (full counts) all read.
+pub(crate) fn summarize(
+    pb: &Pillbox,
+    session: &Session,
+    terminal: Option<&Terminal>,
+) -> Result<Diagnosis> {
+    // `pending_input` tracks the last turn's resting state: set by the
+    // `end_turn`→NeedsInput signal, cleared the moment the agent resumes. A
+    // `MessageStart` always precedes the `Delta`/`End` of its turn, so it alone
+    // covers "the agent is producing again" — Delta/End add nothing.
+    let mut pending_input = false;
+    let mut assistant_turns = 0;
+    let mut tool_calls = 0;
+    let mut last_at = String::new();
+    let mut log_seq = 0;
+    for ev in log::read_log(pb, &session.id)? {
+        log_seq = ev.seq;
+        if !ev.at.is_empty() {
+            last_at = ev.at;
+        }
+        match ev.payload {
+            Payload::AttentionRequired(a) if a.reason == AttentionReason::NeedsInput => {
+                pending_input = true;
+            }
+            Payload::MessageStart(m) => {
+                pending_input = false;
+                if m.role == Role::Assistant {
+                    assistant_turns += 1;
+                }
+            }
+            // A tool call lands twice (Running, then its correlated result);
+            // count the Running side so the number is invocations, not events.
+            Payload::ToolCall(t) if t.status == ToolStatus::Running => {
+                pending_input = false;
+                tool_calls += 1;
+            }
+            Payload::Thinking(_) => pending_input = false,
+            _ => {}
+        }
+    }
+
+    // Precedence: a host-visible terminal (or persisted result snapshot — the
+    // agent finished + pushed its result host-side) wins; else the log's last
+    // turn decides needs-input vs running.
+    let status = match terminal {
+        Some(Terminal::Failed { .. }) => SessionStatus::Failed,
+        Some(Terminal::Done { .. }) => SessionStatus::Done,
+        None if session.result_snapshot.is_some() => SessionStatus::Done,
+        None if pending_input => SessionStatus::NeedsInput,
+        None => SessionStatus::Running,
+    };
+    Ok(Diagnosis {
+        status,
+        assistant_turns,
+        tool_calls,
+        last_at,
+        log_seq,
+    })
+}
+
+/// Status-only view for `list`/`info` — [`summarize`] then the status.
 pub(crate) fn derive(
     pb: &Pillbox,
     session: &Session,
     terminal: Option<&Terminal>,
 ) -> Result<SessionStatus> {
-    // 1. A host-visible terminal outcome wins outright.
-    match terminal {
-        Some(Terminal::Failed { .. }) => return Ok(SessionStatus::Failed),
-        Some(Terminal::Done { .. }) => return Ok(SessionStatus::Done),
-        None => {}
-    }
-    // A persisted result snapshot means the agent finished and pushed its
-    // result (host-side `session done --result-snapshot`) — terminal even if
-    // the lifecycle event never reached this host's sink.
-    if session.result_snapshot.is_some() {
-        return Ok(SessionStatus::Done);
-    }
-
-    // 2. Fold the per-session durable log: is the last turn awaiting input, and
-    //    is there any activity at all? `NeedsInput` is sticky until the agent
-    //    resumes (a later message/tool clears it).
-    let mut pending_input = false;
-    let mut activity = false;
-    for ev in log::read_log(pb, &session.id, 0)? {
-        match ev.payload {
-            Payload::AttentionRequired(a) if a.reason == AttentionReason::NeedsInput => {
-                pending_input = true;
-                activity = true;
-            }
-            Payload::MessageStart(_)
-            | Payload::MessageDelta(_)
-            | Payload::MessageEnd(_)
-            | Payload::ToolCall(_)
-            | Payload::Thinking(_) => {
-                pending_input = false;
-                activity = true;
-            }
-            _ => {}
-        }
-    }
-
-    Ok(if pending_input {
-        SessionStatus::NeedsInput
-    } else if activity || session.attached_pid.is_some() {
-        SessionStatus::Running
-    } else {
-        SessionStatus::Starting
-    })
+    Ok(summarize(pb, session, terminal)?.status)
 }
 
-/// Convenience for the single-session callers (`info` / `diagnose`): fold the
-/// sink for just this id, then [`derive`].
+/// Single-session convenience (`info`): fold the sink for just this id.
 pub(crate) fn derive_one(pb: &Pillbox, session: &Session) -> Result<SessionStatus> {
     let terminal = terminal_outcomes(pb)?;
     derive(pb, session, terminal.get(&session.id))
@@ -204,6 +236,23 @@ mod tests {
             reason: AttentionReason::NeedsInput,
             message: String::new(),
         })
+    }
+
+    fn tool(status: ToolStatus) -> Payload {
+        Payload::ToolCall(crate::contract::ToolCall {
+            tool_call_id: "tc".into(),
+            name: "Bash".into(),
+            status,
+            input: None,
+            output: String::new(),
+            title: String::new(),
+        })
+    }
+    fn tool_running() -> Payload {
+        tool(ToolStatus::Running)
+    }
+    fn tool_done() -> Payload {
+        tool(ToolStatus::Completed)
     }
 
     fn sess(id: &str) -> Session {
@@ -263,21 +312,38 @@ mod tests {
     }
 
     #[test]
-    fn no_activity_no_attach_is_starting() {
-        with_isolated_home("status-starting", || {
+    fn a_recorded_session_with_no_host_signal_is_running() {
+        // No log activity, no terminal — e.g. a remote session the host can't
+        // see into. It launched (it has a record), so the honest resting state
+        // is `Running`, not a guessed "done" or a stuck "starting".
+        with_isolated_home("status-running-default", || {
             let pb = crate::pillbox::global();
             let s = sess("dddd11112222");
-            assert_eq!(derive(&pb, &s, None).unwrap(), SessionStatus::Starting);
+            assert_eq!(derive(&pb, &s, None).unwrap(), SessionStatus::Running);
         });
     }
 
     #[test]
-    fn an_attached_session_with_no_log_is_running() {
-        with_isolated_home("status-attached", || {
+    fn summarize_counts_turns_and_tool_calls_in_one_pass() {
+        with_isolated_home("status-counts", || {
             let pb = crate::pillbox::global();
-            let mut s = sess("eeee11112222");
-            s.attached_pid = Some(1234);
-            assert_eq!(derive(&pb, &s, None).unwrap(), SessionStatus::Running);
+            let s = sess("eeee11112222");
+            let mut log = SessionLog::open(&pb, &s.id).unwrap();
+            log.append(&[
+                Event::session(&s.id, msg(Role::Assistant)),
+                Event::session(&s.id, tool_running()),
+                Event::session(&s.id, tool_done()), // the result half — not double-counted
+                Event::session(&s.id, msg(Role::Assistant)),
+            ])
+            .unwrap();
+            let d = summarize(&pb, &s, None).unwrap();
+            assert_eq!(d.assistant_turns, 2);
+            assert_eq!(
+                d.tool_calls, 1,
+                "the Running half counts, the result doesn't"
+            );
+            assert_eq!(d.log_seq, 4);
+            assert_eq!(d.status, SessionStatus::Running);
         });
     }
 

@@ -190,9 +190,9 @@ const SUBSCRIBE_POLL: Duration = Duration::from_millis(500);
 /// side effect). For status derivation that folds many sessions' logs during a
 /// read command (`session list` / `diagnose`) — a read must not mutate state,
 /// and a remote session whose log lives sandbox-side simply reads empty.
-pub(crate) fn read_log(pb: &Pillbox, session_id: &str, from: u64) -> Result<Vec<Event>> {
+pub(crate) fn read_log(pb: &Pillbox, session_id: &str) -> Result<Vec<Event>> {
     let path = crate::session::session_dir_path(pb, session_id).join(LOG_FILE);
-    read_events_at(&path, from)
+    read_events_at(&path, 0)
 }
 
 /// Parse the tail (`seq >= from`) of a log file. Shared by [`SessionLog::

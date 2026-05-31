@@ -136,7 +136,7 @@ pub fn check_runner_protocol_at(endpoint: &DockerEndpoint, image: &str) -> Resul
         .output()
         .context("probing runner-image protocol")?;
     let stderr = String::from_utf8_lossy(&out.stderr);
-    if is_protocol_skew(&stderr) {
+    if is_protocol_skew(out.status.code(), &stderr) {
         return Err(PillboxError::resource(
             "docker pre-flight",
             format!(
@@ -153,12 +153,16 @@ pub fn check_runner_protocol_at(endpoint: &DockerEndpoint, image: &str) -> Resul
     Ok(())
 }
 
-/// Does this probe stderr show the runner's pillbox rejecting
-/// `--vault-stdin-direct` as an unknown flag (clap's "unexpected argument")?
-/// A current pillbox instead fails on the missing probe blob — flag recognized,
-/// protocol fine. Pure so the match is unit-tested without a daemon.
-fn is_protocol_skew(stderr: &str) -> bool {
-    stderr.contains("unexpected argument") && stderr.contains("vault-stdin-direct")
+/// Did the probe show the runner's pillbox rejecting `--vault-stdin-direct` as
+/// an unknown flag? clap exits **2** on any arg-parse failure; a current pillbox
+/// parses the flag and fails later on the missing probe blob (exit 1, a runtime
+/// error). Keying on the exit code — not clap's English "unexpected argument"
+/// prose, which is version/locale-dependent and would fail *open* into the very
+/// silent-death this guards against — is the robust signal; we still scope to
+/// our flag name so an unrelated usage error can't masquerade as skew. Pure so
+/// the match is unit-tested without a daemon.
+fn is_protocol_skew(exit_code: Option<i32>, stderr: &str) -> bool {
+    exit_code == Some(2) && stderr.contains("vault-stdin-direct")
 }
 
 /// Which Docker daemon a command targets — the **placement axis** of the
@@ -677,16 +681,26 @@ mod tests {
     /// fails on the probe's missing blob — flag recognized). Strings are the
     /// actual captured outputs from a stale vs current runner image.
     #[test]
-    fn protocol_skew_matches_unknown_flag_only() {
-        let stale = "error: unexpected argument '--vault-stdin-direct' found\n\n  tip: a similar argument exists: '--vault-stdin'\n";
-        let current =
-            "pillbox: run --vault-stdin-direct failed. read blob file /nope: No such file or directory (os error 2)\n";
-        assert!(is_protocol_skew(stale), "stale image should be detected");
+    fn protocol_skew_keys_on_clap_exit_code() {
+        // Stale image: clap rejects the unknown flag → exit 2, flag named.
+        let stale = "error: unexpected argument '--vault-stdin-direct' found\n";
         assert!(
-            !is_protocol_skew(current),
-            "current image (blob-not-found) must not be flagged as skew"
+            is_protocol_skew(Some(2), stale),
+            "stale image (clap exit 2) should be detected"
         );
-        assert!(!is_protocol_skew(""), "empty stderr is not skew");
+        // Current image: flag parsed, fails on the missing probe blob → exit 1.
+        let current =
+            "pillbox: run --vault-stdin-direct failed. read blob file /nope: No such file or directory\n";
+        assert!(
+            !is_protocol_skew(Some(1), current),
+            "current image (runtime exit 1) must not be flagged"
+        );
+        // An unrelated usage error (exit 2) that doesn't name our flag isn't skew.
+        assert!(!is_protocol_skew(
+            Some(2),
+            "error: unexpected argument '--bogus'\n"
+        ));
+        assert!(!is_protocol_skew(None, ""), "no exit code is not skew");
     }
 
     /// `local()` must not inject a `DOCKER_HOST` — the command behaves

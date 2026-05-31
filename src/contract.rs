@@ -126,6 +126,8 @@ pub(crate) enum Payload {
     MessageDelta(MessageDelta),
     MessageEnd(MessageEnd),
     ToolCall(ToolCall),
+    Thinking(Thinking),
+    Usage(Usage),
     // ephemeral card telemetry
     PhaseChanged(PhaseChanged),
     TodosUpdated(TodosUpdated),
@@ -210,6 +212,13 @@ pub(crate) struct MessageDelta {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MessageEnd {
     pub(crate) message_id: String,
+    /// The model that served the message; empty when unknown (e.g. a user
+    /// turn or a harness that doesn't record it).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) model: String,
+    /// Why the message stopped (`end_turn`, `tool_use`, …); empty when unknown.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) stop_reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -224,6 +233,35 @@ pub(crate) struct ToolCall {
     pub(crate) output: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) title: String,
+}
+
+/// Reasoning/thinking content the harness surfaced for a turn. First-class
+/// semantic output (the transcript exposes it discretely), `content`-class and
+/// local-only. Distinct from the MITM raw thinking body (blob-stored).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Thinking {
+    pub(crate) text: String,
+}
+
+/// Token accounting for a turn, correlated to its message by `message_id`.
+/// `source` distinguishes the harness's persisted counts ([`UsageSource::Native`])
+/// from MITM wire-observed counts ([`UsageSource::Wire`]) so a consumer can
+/// dedupe across producers. Token fields are `Option` so "0 tokens" is
+/// distinguishable from "not reported".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Usage {
+    pub(crate) message_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cache_read_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cache_creation_input_tokens: Option<u64>,
+    pub(crate) source: UsageSource,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -331,6 +369,16 @@ pub(crate) enum ToolStatus {
     Running,
     Completed,
     Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum UsageSource {
+    Unspecified,
+    /// MITM wire-observed.
+    Wire,
+    /// Harness-persisted (transcript).
+    Native,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

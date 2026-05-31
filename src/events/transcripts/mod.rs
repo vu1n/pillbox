@@ -39,6 +39,7 @@ use super::otel::spans::{derive_session_span_id, derive_trace_id, tracer};
 
 mod claude;
 mod codex;
+mod contract_map;
 mod local;
 mod synth;
 mod tailer;

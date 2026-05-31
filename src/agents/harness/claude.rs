@@ -117,6 +117,8 @@ fn assistant_blocks(line: &Value, state: &mut ClaudeState) -> Vec<Payload> {
                 }));
                 out.push(Payload::MessageEnd(MessageEnd {
                     message_id: message_id.clone(),
+                    model: String::new(),
+                    stop_reason: String::new(),
                 }));
             }
             "tool_use" => {

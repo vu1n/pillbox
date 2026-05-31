@@ -24,7 +24,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use super::{claude, codex, emit_event_span, Harness, TranscriptEvent};
+use super::{claude, codex, contract_map, emit_event_span, Harness, TranscriptEvent};
+use crate::contract::Event;
+use crate::events::log::SessionLog;
 
 /// Stateful tail position for one transcript file. Reusable across
 /// pumps so partial lines and the line-index counter survive between
@@ -43,6 +45,11 @@ pub(crate) struct Tailer {
     /// along, since the vault MITM supplies wire-observed usage for
     /// Claude + `--vault` runs — see [`super::synth`].
     synth: super::synth::ChatSynthesizer,
+    /// The durable per-session log this tailer feeds (the spine's first real
+    /// producer). `None` when there's no host-side log to write — remote
+    /// sandbox-side runs and the manual `session transcript` drain — in which
+    /// case the tailer is OTLP-only, as before.
+    log: Option<SessionLog>,
 }
 
 impl Tailer {
@@ -51,6 +58,7 @@ impl Tailer {
         session_id: String,
         harness: Harness,
         include_usage: bool,
+        log: Option<SessionLog>,
     ) -> Self {
         let synth = super::synth::ChatSynthesizer::new(session_id.clone(), harness, include_usage);
         Self {
@@ -61,6 +69,7 @@ impl Tailer {
             line_idx: 0,
             leftover: String::new(),
             synth,
+            log,
         }
     }
 
@@ -125,6 +134,18 @@ impl Tailer {
             }
             let events = parse_with(self.harness, line, self.line_idx);
             for event in &events {
+                // Durable spine (when host-side): map to the contract and
+                // append. Best-effort + loud — a log write failure must not
+                // strand the rest of the tail or the OTLP emit.
+                if let Some(log) = &mut self.log {
+                    let durable: Vec<Event> = contract_map::to_payloads(event)
+                        .into_iter()
+                        .map(|p| Event::session(&self.session_id, p))
+                        .collect();
+                    if let Err(e) = log.append(&durable) {
+                        eprintln!("pillbox: warning: session log append failed: {e:#}");
+                    }
+                }
                 emit_event_span(event, &self.session_id);
                 self.synth.on_event(event);
                 emitted += 1;
@@ -242,6 +263,45 @@ mod tests {
         )
     }
 
+    /// The producer wiring end-to-end: a pumped transcript line lands in the
+    /// durable per-session log as the mapped contract payloads (a user prompt →
+    /// the MessageStart/Delta/End triple), readable back via a fresh handle.
+    #[test]
+    fn pump_feeds_the_durable_session_log() {
+        crate::test_util::with_isolated_home("tailer-feeds-log", || {
+            use crate::contract::Payload;
+            let pb = crate::pillbox::global();
+            let log = SessionLog::open(&pb, "sess-tail").expect("open log");
+
+            let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+            let path = tmp.path().to_path_buf();
+            {
+                let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                writeln!(f, "{}", fixture_line("u1", "hello")).unwrap();
+            }
+
+            let mut tailer =
+                Tailer::new(path, "sess-tail".into(), Harness::Claude, false, Some(log));
+            assert_eq!(tailer.pump().expect("pump"), 1, "one transcript event");
+
+            // Read the log back through a fresh handle (appends are flushed).
+            let events = SessionLog::open(&pb, "sess-tail")
+                .unwrap()
+                .read_from(0)
+                .unwrap();
+            assert_eq!(events.len(), 3, "user prompt → start/delta/end");
+            assert_eq!(events[0].session_id, "sess-tail");
+            assert!(matches!(events[0].payload, Payload::MessageStart(_)));
+            assert!(matches!(&events[1].payload, Payload::MessageDelta(d) if d.text == "hello"));
+            assert!(matches!(events[2].payload, Payload::MessageEnd(_)));
+            // The log assigned the per-session seq, not the producer.
+            assert_eq!(
+                events.iter().map(|e| e.seq).collect::<Vec<_>>(),
+                vec![1, 2, 3]
+            );
+        });
+    }
+
     #[test]
     fn pump_drains_existing_lines_then_emits_only_appended() {
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
@@ -254,7 +314,7 @@ mod tests {
             writeln!(f, "{}", fixture_line("u2", "second")).unwrap();
         }
 
-        let mut tailer = Tailer::new(path.clone(), "sess".into(), Harness::Claude, false);
+        let mut tailer = Tailer::new(path.clone(), "sess".into(), Harness::Claude, false, None);
         let first = tailer.pump().expect("pump");
         assert_eq!(first, 2, "initial pump should drain both seeded lines");
 
@@ -278,7 +338,7 @@ mod tests {
     fn pump_buffers_partial_lines_across_calls() {
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         let path = tmp.path().to_path_buf();
-        let mut tailer = Tailer::new(path.clone(), "sess".into(), Harness::Claude, false);
+        let mut tailer = Tailer::new(path.clone(), "sess".into(), Harness::Claude, false, None);
 
         // Write half a line (no trailing \n yet).
         let full = fixture_line("u1", "split-line");
@@ -305,7 +365,7 @@ mod tests {
     fn pump_handles_file_truncation_by_rewinding() {
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         let path = tmp.path().to_path_buf();
-        let mut tailer = Tailer::new(path.clone(), "sess".into(), Harness::Claude, false);
+        let mut tailer = Tailer::new(path.clone(), "sess".into(), Harness::Claude, false, None);
 
         {
             let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
@@ -331,7 +391,7 @@ mod tests {
             "/tmp/pillbox-tailer-missing-{}.jsonl",
             uuid::Uuid::now_v7(),
         ));
-        let mut tailer = Tailer::new(path, "sess".into(), Harness::Claude, false);
+        let mut tailer = Tailer::new(path, "sess".into(), Harness::Claude, false, None);
         assert_eq!(tailer.pump().unwrap(), 0);
     }
 

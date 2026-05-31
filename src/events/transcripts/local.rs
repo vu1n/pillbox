@@ -37,6 +37,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use super::{Harness, Tailer};
+use crate::events::log::SessionLog;
 
 /// Owns the background tailer thread for one local foreground run.
 /// Stopping is idempotent and happens on either [`shutdown`](Self::shutdown)
@@ -86,6 +87,7 @@ impl Drop for LocalTailerHandle {
 /// discovery to this run's own transcript directory (see module docs);
 /// `None` discovers across the whole `watch_root` tree.
 pub(crate) fn spawn_local_tailer(
+    log: Option<SessionLog>,
     watch_root: PathBuf,
     scope_dir: Option<PathBuf>,
     harness: Harness,
@@ -108,7 +110,7 @@ pub(crate) fn spawn_local_tailer(
             }
             std::thread::sleep(Duration::from_millis(200));
         };
-        let mut tailer = Tailer::new(path, session_id, harness, include_usage);
+        let mut tailer = Tailer::new(path, session_id, harness, include_usage, log);
         if let Err(e) = tailer.follow_until(&stop_thread) {
             eprintln!("pillbox: warning: transcript tailer stopped: {e:#}");
         }
@@ -138,6 +140,7 @@ pub(crate) fn spawn_local_tailer(
 /// The session span is emitted unconditionally (a no-op without a
 /// collector) so it precedes any child spans.
 pub(crate) fn spawn_session_observability(
+    log: Option<SessionLog>,
     session_id: &str,
     agent_id: &str,
     home: &Path,
@@ -146,20 +149,23 @@ pub(crate) fn spawn_session_observability(
     run_started: std::time::SystemTime,
 ) -> Option<LocalTailerHandle> {
     crate::events::emit_local_session_span(session_id, run_started);
-    crate::events::otlp_traces_configured()
-        .then(|| Harness::for_agent(agent_id))
-        .flatten()
-        .map(|harness| {
-            let mitm_emits_usage = matches!(harness, Harness::Claude) && proxy_active;
-            let (watch_root, scope_dir) = harness.transcript_roots(home, guest_cwd);
-            spawn_local_tailer(
-                watch_root,
-                scope_dir,
-                harness,
-                session_id.to_string(),
-                !mitm_emits_usage,
-            )
-        })
+    // Tail when there's anywhere for events to go: the durable log (always, on
+    // host-side runs) OR an OTLP collector. A harness with no parser produces
+    // no events, so there's nothing to tail regardless of the sinks.
+    if log.is_none() && !crate::events::otlp_traces_configured() {
+        return None;
+    }
+    let harness = Harness::for_agent(agent_id)?;
+    let mitm_emits_usage = matches!(harness, Harness::Claude) && proxy_active;
+    let (watch_root, scope_dir) = harness.transcript_roots(home, guest_cwd);
+    Some(spawn_local_tailer(
+        log,
+        watch_root,
+        scope_dir,
+        harness,
+        session_id.to_string(),
+        !mitm_emits_usage,
+    ))
 }
 
 /// All `*.jsonl` paths under `root` (recursive). Empty if `root`

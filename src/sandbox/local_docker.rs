@@ -280,7 +280,19 @@ impl SandboxBackend for LocalDocker {
         // sandbox-side. See spawn_session_observability for the
         // include_usage / MITM-double-count reasoning.
         let proxy_active = opts.vault || any_vaulted;
+        // Open the durable per-session log (the spine's first producer). The
+        // agent's $HOME is host-bind-mounted, so the transcript — and thus the
+        // log — is written host-side and persists in ~/.pillbox. Best-effort:
+        // a log-open failure must not abort the run, so fall back to OTLP-only.
+        let log = match crate::events::log::SessionLog::open(resolved, &session_id) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                eprintln!("pillbox: warning: couldn't open session log: {e:#}");
+                None
+            }
+        };
         let tailer = crate::events::transcripts::spawn_session_observability(
+            log,
             &session_id,
             spec.id,
             &home,

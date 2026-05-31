@@ -996,6 +996,10 @@ pub(crate) fn dispatch_vault_stdin(resolved: &Pillbox, blob_file: Option<&Path>)
     // exits; dropped after `finalize_blob_run` for a final drain.
     let _obs = blob.context.session_id.as_deref().and_then(|sid| {
         crate::events::transcripts::spawn_session_observability(
+            // No host-side durable log for remote runs: the transcript is
+            // written sandbox-side (ephemeral with the sandbox) and remote
+            // sequencing is deferred — OTLP-only here, as before.
+            None,
             sid,
             spec.id,
             &home,
@@ -1142,6 +1146,8 @@ pub(crate) fn dispatch_vault_stdin_direct(
     // Held until the agent exits; dropped after finalize for a final drain.
     let _obs = blob.context.session_id.as_deref().and_then(|sid| {
         crate::events::transcripts::spawn_session_observability(
+            // No host-side durable log for remote runs (see the ssh path).
+            None,
             sid,
             spec.id,
             &home_dir,

@@ -194,6 +194,8 @@ message Event {
     MessageDelta        message_delta        = 31;
     MessageEnd          message_end          = 32;
     ToolCall            tool_call            = 33;
+    Thinking            thinking             = 34;
+    Usage               usage                = 35;
     // ephemeral card telemetry (e.g. from claude hooks)
     PhaseChanged        phase_changed        = 40;
     TodosUpdated        todos_updated        = 41;
@@ -223,7 +225,26 @@ message RunFailed   { string reason = 1; int32 exit_code = 2; }
 
 message MessageStart { string message_id = 1; Role role = 2; }
 message MessageDelta { string message_id = 1; string text = 2; } // incremental
-message MessageEnd   { string message_id = 1; }
+// `model`/`stop_reason` describe the completed message (the model that served
+// it + why it stopped); empty when unknown (e.g. a user turn).
+message MessageEnd   { string message_id = 1; string model = 2; string stop_reason = 3; }
+
+// Reasoning/thinking content the harness surfaced for a turn. First-class
+// semantic output (the transcript exposes it discretely); `content`-class,
+// local-only. Distinct from the MITM raw thinking body, which is blob-stored.
+message Thinking { string text = 1; }
+
+// Token accounting for a turn, correlated to its message by `message_id`.
+// `source` distinguishes the harness's persisted counts (NATIVE) from the
+// MITM wire-observed counts (WIRE) so a consumer can dedupe across producers.
+message Usage {
+  string message_id = 1;
+  optional uint64 input_tokens                 = 2;
+  optional uint64 output_tokens                = 3;
+  optional uint64 cache_read_input_tokens      = 4;
+  optional uint64 cache_creation_input_tokens  = 5;
+  UsageSource source = 6;
+}
 
 message ToolCall {
   string tool_call_id = 1;
@@ -268,6 +289,11 @@ enum Role {
   ROLE_ASSISTANT   = 1;
   ROLE_USER        = 2;
   ROLE_SYSTEM      = 3;
+}
+enum UsageSource {
+  USAGE_SOURCE_UNSPECIFIED = 0;
+  USAGE_SOURCE_WIRE        = 1;  // MITM wire-observed
+  USAGE_SOURCE_NATIVE      = 2;  // harness-persisted (transcript)
 }
 enum ToolStatus {
   TOOL_STATUS_UNSPECIFIED = 0;

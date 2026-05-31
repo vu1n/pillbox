@@ -402,10 +402,17 @@ Reconciled against the sequence above; commits on `main` (origin synced).
   auto`** (local + remote) so seeded/driven interactive doesn't stall on the
   trust dialog / per-tool prompts. Initial-prompt seeding works via the agent's
   positional prompt (`run -- "prompt"`), no code.
-- **Not started:** Step 2 (approval loop / `session.blocked`); Step 4's reader
-  bits (`pillbox watch`, `session diagnose`, `session list` status-from-log — the
-  WS subscribe surface exists, the thin reference reader + status projection
-  don't); Steps 5–9.
+- **Step 2 — approval loop, reframed + first piece done:** it's a signal
+  **producer**, not per-tool gating or in-pillbox UX. pillbox emits
+  `AttentionRequired{ NeedsInput }` on the transcript's explicit `stop_reason ==
+  "end_turn"` → the durable log / `subscribe` stream, for a front-end (orca /
+  lum / Slack) to flash / seek-input; respond via `session send`. Live-verified.
+  Remaining: the mid-tool **blocked/permission** signal (the OSC/hook status
+  channel — a timer can't tell "blocked" from a slow tool) + an
+  `events.jsonl`/webhook sink arm for non-`subscribe` consumers.
+- **Not started:** Step 4's reader bits (`pillbox watch`, `session diagnose`,
+  `session list` status-from-log — the WS subscribe surface exists, the thin
+  reference reader + status projection don't); Steps 5–9.
 
 **Net:** §0 as a *usable local substrate* (watch + drive your agent, no
 collector) is **done**. §0 as the *multiplayer / migration spine* — `actor`,

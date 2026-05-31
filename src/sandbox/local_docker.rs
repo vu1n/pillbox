@@ -250,6 +250,7 @@ impl SandboxBackend for LocalDocker {
                 base_snapshot: None,
                 result_snapshot: None,
                 expires_at: opts.ttl_seconds.map(session::expires_at_from_ttl),
+                guest_cwd: guest_cwd.clone(),
             };
             session::write(resolved, &session)?;
             crate::events::emit_session_event(

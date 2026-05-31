@@ -94,18 +94,67 @@ pub(crate) fn spawn_local_tailer(
     session_id: String,
     include_usage: bool,
 ) -> LocalTailerHandle {
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_thread = Arc::clone(&stop);
-    // Snapshot pre-existing transcripts so we tail only the one this
+    // Run path: snapshot pre-existing transcripts so we tail only the one this
     // run creates, not a prior session's file in the same project dir.
     let preexisting = snapshot_jsonl(&watch_root);
+    spawn_tailer(
+        log,
+        watch_root,
+        scope_dir,
+        harness,
+        session_id,
+        include_usage,
+        preexisting,
+    )
+}
+
+/// Tail an already-running session's transcript into `log` — for the gateway
+/// (`session subscribe`) to fill + stream a *detached* session's events while
+/// it serves, closing the drive (`session send`) + read loop on one session.
+/// Unlike [`spawn_local_tailer`] it does NOT exclude pre-existing files: the
+/// transcript may already be on disk (the agent's been running) or appear once
+/// a driver sends the first input. Host-side only (the transcript is on a
+/// bind-mounted home); `None` if the agent has no transcript parser.
+pub(crate) fn spawn_attach_tailer(
+    log: SessionLog,
+    home: &Path,
+    agent_id: &str,
+    guest_cwd: &str,
+    session_id: &str,
+) -> Option<LocalTailerHandle> {
+    let harness = Harness::for_agent(agent_id)?;
+    let (watch_root, scope_dir) = harness.transcript_roots(home, guest_cwd);
+    Some(spawn_tailer(
+        Some(log),
+        watch_root,
+        scope_dir,
+        harness,
+        session_id.to_string(),
+        true,
+        HashSet::new(), // include existing — the session may already be running
+    ))
+}
+
+/// Shared spawn: discover the transcript under `watch_root`/`scope_dir` (the
+/// newest not in `exclude`), then follow it into the sinks until stopped.
+fn spawn_tailer(
+    log: Option<SessionLog>,
+    watch_root: PathBuf,
+    scope_dir: Option<PathBuf>,
+    harness: Harness,
+    session_id: String,
+    include_usage: bool,
+    exclude: HashSet<PathBuf>,
+) -> LocalTailerHandle {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = Arc::clone(&stop);
 
     let join = std::thread::spawn(move || {
         let path = loop {
             if stop_thread.load(Ordering::Relaxed) {
-                return; // asked to stop before the agent wrote anything
+                return; // asked to stop before the transcript appeared
             }
-            if let Some(p) = find_new_jsonl(&watch_root, scope_dir.as_deref(), &preexisting) {
+            if let Some(p) = find_new_jsonl(&watch_root, scope_dir.as_deref(), &exclude) {
                 break p;
             }
             std::thread::sleep(Duration::from_millis(200));

@@ -354,9 +354,36 @@ fn session_send(resolved: &Pillbox, id: &str, text: &str) -> Result<()> {
 }
 
 fn session_subscribe(resolved: &Pillbox, id: &str, from: u64, bind: Option<&str>) -> Result<()> {
-    // Resolve against the durable LOG dirs, not the session registry: a
-    // foreground run writes a log but no `.toml` record, so `session::resolve`
-    // (records) wouldn't find it.
+    // A live session record (detached/running): tail its transcript into the
+    // durable log *while we serve*, so a session driven via `session send` is
+    // also readable over WS — the drive+read loop closed on one session. The
+    // tailer handle lives for the gateway's lifetime (serve_session_ws blocks).
+    if let Ok(s) = session::resolve(resolved, id) {
+        let _tailer = match session::Backend::parse(&s.backend) {
+            Some(session::Backend::Docker) => {
+                let spec = crate::agents::lookup("session subscribe", &s.agent_id)?;
+                let home = spec.home_dir(resolved)?;
+                let log = crate::events::log::SessionLog::open(resolved, &s.id)?;
+                crate::events::transcripts::spawn_attach_tailer(
+                    log,
+                    &home,
+                    &s.agent_id,
+                    &s.guest_cwd,
+                    &s.id,
+                )
+            }
+            _ => {
+                eprintln!(
+                    "pillbox: note: live event tailing is local-docker only \
+                     (a remote session's transcript is sandbox-side); serving the existing log"
+                );
+                None
+            }
+        };
+        return crate::gateway::serve_session_ws(resolved, &s.id, from, bind);
+    }
+    // Otherwise a foreground/historical run: it wrote a durable LOG but no
+    // `.toml` record, so resolve against the log dirs and serve what's there.
     let session_id = session::resolve_logged(resolved, id)?;
     crate::gateway::serve_session_ws(resolved, &session_id, from, bind)
 }

@@ -205,6 +205,13 @@ pub(crate) struct Session {
     /// schedules.
     #[serde(default)]
     pub(crate) expires_at: Option<String>,
+    /// The agent's guest working directory (`/workspace/<name>`) — the project
+    /// key its transcript is written under. Lets `session subscribe` locate and
+    /// tail a live session's transcript into the durable log while it serves
+    /// (so a driven detached session is also readable). Empty for records that
+    /// predate the field or remote backends whose transcript is sandbox-side.
+    #[serde(default)]
+    pub(crate) guest_cwd: String,
 }
 
 impl Session {
@@ -245,6 +252,7 @@ impl Session {
             base_snapshot: None,
             result_snapshot: None,
             expires_at: None,
+            guest_cwd: String::new(),
         }
     }
 
@@ -336,6 +344,7 @@ impl Session {
             base_snapshot: None,
             result_snapshot: None,
             expires_at: None,
+            guest_cwd: String::new(),
         }
     }
 }

@@ -231,6 +231,9 @@ impl SandboxBackend for RemoteSshSandbox {
                     .and_then(|w| w.base_snapshot.clone()),
                 result_snapshot: None,
                 expires_at: opts.ttl_seconds.map(session::expires_at_from_ttl),
+                // Empty: a remote session's transcript is sandbox-side, so the
+                // host gateway can't tail it (live tailing is local-docker only).
+                guest_cwd: String::new(),
             };
             session::write(resolved, &s)?;
             crate::events::emit_session_event(

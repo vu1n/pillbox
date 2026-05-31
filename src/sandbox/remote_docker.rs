@@ -18,18 +18,24 @@
 //! [`reattach`] re-opens the exec relay over the re-resolved endpoint and
 //! [`kill_session`] force-removes it (`session attach/rm` route here on the
 //! `remote` field, which works for both registered and inline docker:// URLs).
-//! The lifecycle — create → record → list → teardown-over-endpoint — is
-//! live-verified against a real VPS.
+//! The lifecycle — create → record → list → reattach → teardown-over-endpoint,
+//! **with the detached agent staying alive for reattach** — is live-verified
+//! against a real VPS.
 //!
-//! **Known gap (the agent doesn't stay interactive yet).** A detached docker://
-//! agent currently *runs and exits* — the direct-vault launch behaves headless,
-//! the same family as the foreground "fast `claude -p` exits before the relay
-//! connects" note — so a reattach finds a finished container, not a live prompt.
-//! Making the detached agent stay alive for reattach + drive (`session
-//! send`/`subscribe`, today local-docker only) is the follow-on that turns this
-//! from "records the run" into the drivable detached session §0 wants.
+//! **Version skew (host ↔ runner image).** The host launches the in-container
+//! agent via `pillbox run --vault-stdin-direct`; a runner image baked from a
+//! pillbox older than that flag rejects it (clap "unexpected argument") and the
+//! agent's pty-host child exits on the parse error — which looks like "the
+//! agent starts then instantly dies." [`docker::check_runner_protocol_at`]
+//! probes for exactly this in preflight and fails loudly with a "rebuild/pull a
+//! current image" hint instead. Keep the deployed runner image current with the
+//! host pillbox whenever the launch protocol changes.
 //!
-//! Other deferred (clearly-marked) follow-ons: host-side **result extraction
+//! Deferred (clearly-marked) follow-ons: host-side **result extraction
+//! for a detached session** (`docker cp` out via `session pull`; foreground
+//! already pulls on exit), **creds read-back** (the `CredsPersisted`-before-
+//! `TornDown` invariant / 2nd-run-401 guard), `session send`/`subscribe` for
+//! remote docker (today local-docker only), and OTEL env forwarding.
 //! for a detached session** (`docker cp` out via `session pull`; foreground
 //! already pulls on exit), **creds read-back** (the `CredsPersisted`-before-
 //! `TornDown` invariant / 2nd-run-401 guard), and OTEL env forwarding.
@@ -116,6 +122,10 @@ impl SandboxBackend for RemoteDockerSandbox {
             };
             PillboxError::resource(ACTION, format!("{e}")).with_next(next)
         })?;
+        // Catch host↔image version skew loudly: an older runner image's pillbox
+        // rejects `--vault-stdin-direct` and the agent silently dies. Probe the
+        // protocol before building the secret-bearing blob / launching.
+        docker::check_runner_protocol_at(&endpoint, &runner_image)?;
 
         // Auth is forwarded into the container via the blob (the direct path
         // has no pre-existing login). Check host-side credentials up front so

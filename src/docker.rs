@@ -109,6 +109,58 @@ pub fn check_ready_for_at(resolved: &Pillbox, endpoint: &DockerEndpoint) -> Resu
     Ok(image)
 }
 
+/// Probe whether the runner `image`'s **in-container** pillbox speaks the
+/// `--vault-stdin-direct` launch protocol the docker:// backend uses. A runner
+/// image baked from a pillbox older than that flag rejects it (clap: "unexpected
+/// argument"), so the container's pty-host child exits on the parse error and
+/// the agent appears to "start then immediately die" — a silent, baffling
+/// failure. Catching the skew here turns it into one actionable message.
+///
+/// Cheap and conservative: pillbox's arg parse exits in milliseconds (only the
+/// container spin-up costs anything), and we fail **only** on the specific
+/// unknown-flag signal — any other probe outcome (the expected "blob file not
+/// found", or success) means the flag is recognized, so the protocol is fine.
+pub fn check_runner_protocol_at(endpoint: &DockerEndpoint, image: &str) -> Result<()> {
+    let out = endpoint
+        .command()
+        .args([
+            "run",
+            "--rm",
+            image,
+            "pillbox",
+            "run",
+            "--vault-stdin-direct",
+            "--blob-file",
+            "/nonexistent-pillbox-skew-probe",
+        ])
+        .output()
+        .context("probing runner-image protocol")?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if is_protocol_skew(&stderr) {
+        return Err(PillboxError::resource(
+            "docker pre-flight",
+            format!(
+                "runner image `{image}` is too old — its pillbox doesn't support the \
+                 `--vault-stdin-direct` launch protocol, so the agent would start and \
+                 immediately exit"
+            ),
+        )
+        .with_next(format!(
+            "rebuild/pull a current runner image on the daemon (e.g. `docker pull {image}`)"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+/// Does this probe stderr show the runner's pillbox rejecting
+/// `--vault-stdin-direct` as an unknown flag (clap's "unexpected argument")?
+/// A current pillbox instead fails on the missing probe blob — flag recognized,
+/// protocol fine. Pure so the match is unit-tested without a daemon.
+fn is_protocol_skew(stderr: &str) -> bool {
+    stderr.contains("unexpected argument") && stderr.contains("vault-stdin-direct")
+}
+
 /// Which Docker daemon a command targets — the **placement axis** of the
 /// remotes redesign (see docs/remotes-redesign.md), expressed as one env
 /// override. `local()` uses the ambient daemon (local socket, or whatever
@@ -619,6 +671,23 @@ fn pump<R: Read>(mut reader: R, is_stderr: bool, tx: &mpsc::Sender<(bool, Vec<u8
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The skew predicate fires on the real clap "unexpected argument" stderr a
+    /// stale runner image emits, and stays quiet for a current image (which
+    /// fails on the probe's missing blob — flag recognized). Strings are the
+    /// actual captured outputs from a stale vs current runner image.
+    #[test]
+    fn protocol_skew_matches_unknown_flag_only() {
+        let stale = "error: unexpected argument '--vault-stdin-direct' found\n\n  tip: a similar argument exists: '--vault-stdin'\n";
+        let current =
+            "pillbox: run --vault-stdin-direct failed. read blob file /nope: No such file or directory (os error 2)\n";
+        assert!(is_protocol_skew(stale), "stale image should be detected");
+        assert!(
+            !is_protocol_skew(current),
+            "current image (blob-not-found) must not be flagged as skew"
+        );
+        assert!(!is_protocol_skew(""), "empty stderr is not skew");
+    }
 
     /// `local()` must not inject a `DOCKER_HOST` — the command behaves
     /// exactly as the bare `docker` CLI for the user's shell.

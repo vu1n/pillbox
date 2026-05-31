@@ -82,6 +82,13 @@ pub(crate) fn session_dir(pb: &Pillbox, id: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Read-only path to a session's directory — no `mkdir`, no `chmod` (the
+/// counterpart to [`session_dir`]). Read commands that fold a session's log
+/// for status (`session list` / `diagnose`) use this so a `list` never writes.
+pub(crate) fn session_dir_path(pb: &Pillbox, id: &str) -> PathBuf {
+    pb.subdir_path(SESSIONS_DIR).join(id)
+}
+
 /// Registry plumbing for sessions. No-inheritance — a session is
 /// concrete runtime state tied to the pillbox that started it, so we
 /// implement [`Registry`] but not `InheritedRegistry`.

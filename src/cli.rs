@@ -304,6 +304,14 @@ pub(crate) enum SessionAction {
         #[arg(long)]
         json: bool,
     },
+    /// Diagnose one session: derived status, failure detail, and an activity
+    /// summary from the durable log — the "what happened / why is it stuck"
+    /// companion to `info`. Accepts a unique id prefix ≥ 4 chars.
+    Diagnose {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Reattach to a detached session. Streams the remote PTY back
     /// into the current terminal. Detach again with Ctrl-A + D or by
     /// running `pillbox session detach <id>` from another shell.

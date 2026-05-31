@@ -17,6 +17,7 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> 
     match action {
         SessionAction::List { json } => session_list(resolved, json),
         SessionAction::Info { id, json } => session_info(resolved, &id, json),
+        SessionAction::Diagnose { id, json } => session_diagnose(resolved, &id, json),
         SessionAction::Attach { id } => session_attach(resolved, &id),
         SessionAction::Detach { id } => session_detach(resolved, &id),
         SessionAction::Rm { id } => session_rm(resolved, &id),
@@ -95,13 +96,24 @@ fn session_transcript(
 
 fn session_list(resolved: &Pillbox, json: bool) -> Result<()> {
     let entries = session::list(resolved)?;
+    // One pass over the shared lifecycle sink for every session's terminal
+    // outcome, then derive each status from that + its per-session log.
+    let terminal = events::status::terminal_outcomes(resolved)?;
     if json {
         // Single source of truth for the on-wire shape lives on
-        // `Session::to_json_value` so list + info stay in lockstep.
+        // `Session::to_json_value` so list + info stay in lockstep; the
+        // derived `status` is merged on top (it's not a stored field).
         let arr: Vec<serde_json::Value> = entries
             .iter()
-            .map(session::Session::to_json_value)
-            .collect();
+            .map(|s| {
+                let status = events::status::derive(resolved, s, terminal.get(&s.id))?;
+                let mut v = s.to_json_value();
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("status".into(), status.label().into());
+                }
+                Ok(v)
+            })
+            .collect::<Result<_>>()?;
         println!(
             "{}",
             crate::paths::json_v1(vec![
@@ -118,10 +130,11 @@ fn session_list(resolved: &Pillbox, json: bool) -> Result<()> {
         return Ok(());
     }
     println!(
-        "Sessions in `{}` (id        attached?  agent    remote          started_at):",
+        "Sessions in `{}` (id        status       attached?  agent    remote          started_at):",
         resolved.display_name()
     );
-    for s in entries {
+    for s in &entries {
+        let status = events::status::derive(resolved, s, terminal.get(&s.id))?;
         let attached = match s.attached_pid {
             Some(_) => "active  ",
             None => "detached",
@@ -132,8 +145,12 @@ fn session_list(resolved: &Pillbox, json: bool) -> Result<()> {
             .map(|l| format!(" [{l}]"))
             .unwrap_or_default();
         println!(
-            "  {}  {attached}  {:<7}  {:<14}  {}{label}",
-            s.id, s.agent_id, s.remote, s.started_at
+            "  {}  {:<11}  {attached}  {:<7}  {:<14}  {}{label}",
+            s.id,
+            status.label(),
+            s.agent_id,
+            s.remote,
+            s.started_at
         );
     }
     Ok(())
@@ -141,14 +158,17 @@ fn session_list(resolved: &Pillbox, json: bool) -> Result<()> {
 
 fn session_info(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
     let s = session::resolve(resolved, id)?;
+    let status = events::status::derive_one(resolved, &s)?;
     if json {
-        println!(
-            "{}",
-            crate::paths::json_v1(vec![("session", s.to_json_value())])
-        );
+        let mut v = s.to_json_value();
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("status".into(), status.label().into());
+        }
+        println!("{}", crate::paths::json_v1(vec![("session", v)]));
         return Ok(());
     }
     println!("Session: {}", s.id);
+    println!("  status:       {}", status.label());
     if let Some(label) = &s.label {
         println!("  label:        {label}");
     }
@@ -165,6 +185,114 @@ fn session_info(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
             None => "(detached)".to_string(),
         }
     );
+    Ok(())
+}
+
+/// `pillbox session diagnose ID` — the "what happened / why is it stuck"
+/// companion to `session info` (which just dumps the record). Folds the
+/// derived status, the terminal failure detail, and an activity summary from
+/// the durable log into one readout.
+fn session_diagnose(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
+    use crate::contract::{Payload, Role, ToolStatus};
+
+    let s = session::resolve(resolved, id)?;
+    let terminals = events::status::terminal_outcomes(resolved)?;
+    let terminal = terminals.get(&s.id);
+    let status = events::status::derive(resolved, &s, terminal)?;
+
+    // Activity summary, folded from the per-session durable log (read-only).
+    let log = events::log::read_log(resolved, &s.id, 0)?;
+    let seq = log.last().map(|e| e.seq).unwrap_or(0);
+    let mut assistant_turns = 0u64;
+    let mut tool_calls = 0u64;
+    let mut last_at = String::new();
+    for ev in &log {
+        if !ev.at.is_empty() {
+            last_at = ev.at.clone();
+        }
+        match &ev.payload {
+            Payload::MessageStart(m) if m.role == Role::Assistant => assistant_turns += 1,
+            // A tool call lands twice (Running, then its correlated result);
+            // count the Running side so the number is invocations, not events.
+            Payload::ToolCall(t) if matches!(t.status, ToolStatus::Running) => tool_calls += 1,
+            _ => {}
+        }
+    }
+
+    let (fail_reason, exit_code) = match terminal {
+        Some(events::status::Terminal::Failed { reason, exit_code }) => {
+            (Some(reason.clone()), *exit_code)
+        }
+        Some(events::status::Terminal::Done { exit_code }) => (None, *exit_code),
+        None => (None, None),
+    };
+
+    if json {
+        let mut v = s.to_json_value();
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("status".into(), status.label().into());
+            obj.insert("log_seq".into(), seq.into());
+            obj.insert("assistant_turns".into(), assistant_turns.into());
+            obj.insert("tool_calls".into(), tool_calls.into());
+            if !last_at.is_empty() {
+                obj.insert("last_event_at".into(), last_at.into());
+            }
+            if let Some(r) = fail_reason {
+                obj.insert("failure_reason".into(), r.into());
+            }
+            if let Some(c) = exit_code {
+                obj.insert("exit_code".into(), c.into());
+            }
+        }
+        println!("{}", crate::paths::json_v1(vec![("session", v)]));
+        return Ok(());
+    }
+
+    println!("Session {} — {}", s.id, status.label());
+    if let Some(r) = &fail_reason {
+        let suffix = exit_code
+            .map(|c| format!(" (exit {c})"))
+            .unwrap_or_default();
+        println!("  failure:      {r}{suffix}");
+    } else if let Some(c) = exit_code {
+        println!("  exit_code:    {c}");
+    }
+    if status == events::status::SessionStatus::NeedsInput {
+        println!(
+            "  awaiting:     input — the agent ended its turn; drive it with `pillbox session send {} …`",
+            s.id
+        );
+    }
+    println!("  agent:        {}", s.agent_id);
+    println!("  remote:       {} ({})", s.remote, s.backend);
+    println!("  started_at:   {}", s.started_at);
+    println!(
+        "  attached:     {}",
+        match s.attached_pid {
+            Some(p) => format!("yes (pid {p})"),
+            None => "no (detached)".to_string(),
+        }
+    );
+    if let Some(e) = &s.expires_at {
+        println!("  expires_at:   {e}");
+    }
+    println!(
+        "  result_snap:  {}",
+        s.result_snapshot
+            .as_deref()
+            .unwrap_or("(none — not finished, or no result pushed)")
+    );
+    println!("Activity (durable log):");
+    if log.is_empty() {
+        println!("  (no host-visible log — a remote session streams its transcript sandbox-side)");
+    } else {
+        println!(
+            "  {assistant_turns} assistant turn(s), {tool_calls} tool call(s), {seq} event(s)"
+        );
+        if !last_at.is_empty() {
+            println!("  last event at {last_at}");
+        }
+    }
     Ok(())
 }
 

@@ -94,6 +94,7 @@ use crate::session::{self, Session};
 mod jsonl;
 pub(crate) mod log;
 mod otel;
+pub(crate) mod status;
 pub(crate) mod transcripts;
 mod webhook;
 

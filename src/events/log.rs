@@ -116,15 +116,7 @@ impl SessionLog {
     /// full log; `read_from(last_seq + 1)` is "nothing new yet". Returns an
     /// empty vec when the log doesn't exist (a session with no events).
     pub(crate) fn read_from(&self, from: u64) -> Result<Vec<Event>> {
-        let path = self.log_path();
-        fold_lines(&path, Vec::new(), |mut out, line| {
-            let ev: Event = serde_json::from_str(line)
-                .with_context(|| format!("parse log line in {}", path.display()))?;
-            if ev.seq >= from {
-                out.push(ev);
-            }
-            Ok(out)
-        })
+        read_events_at(&self.log_path(), from)
     }
 
     /// Stream events with `seq >= from` to `sink`, then keep tailing the log,
@@ -192,6 +184,29 @@ impl SessionLog {
 /// real low-latency relaying; this just bounds how long a missed FS event (or
 /// a `stop` set while we're parked on `recv`) can stall, so it can be lazy.
 const SUBSCRIBE_POLL: Duration = Duration::from_millis(500);
+
+/// Read-only replay of a session's durable log **without creating its
+/// directory** (unlike [`SessionLog::open`], which `mkdir`s as a write-side
+/// side effect). For status derivation that folds many sessions' logs during a
+/// read command (`session list` / `diagnose`) — a read must not mutate state,
+/// and a remote session whose log lives sandbox-side simply reads empty.
+pub(crate) fn read_log(pb: &Pillbox, session_id: &str, from: u64) -> Result<Vec<Event>> {
+    let path = crate::session::session_dir_path(pb, session_id).join(LOG_FILE);
+    read_events_at(&path, from)
+}
+
+/// Parse the tail (`seq >= from`) of a log file. Shared by [`SessionLog::
+/// read_from`] (writer-side, dir already open) and [`read_log`] (read-only).
+fn read_events_at(path: &Path, from: u64) -> Result<Vec<Event>> {
+    fold_lines(path, Vec::new(), |mut out, line| {
+        let ev: Event = serde_json::from_str(line)
+            .with_context(|| format!("parse log line in {}", path.display()))?;
+        if ev.seq >= from {
+            out.push(ev);
+        }
+        Ok(out)
+    })
+}
 
 /// Fold over the non-empty JSONL lines of `path`, returning `init` unchanged
 /// when the file doesn't exist (an empty / never-written log). Shared by replay

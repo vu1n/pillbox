@@ -1,10 +1,22 @@
 # Session gateway — design spec
 
-Status: design / proposed (2026-05-30). The primitive [vnext.md](./vnext.md)
-§0 actually gates on, pulled out of the layering's "one component, build it
-once" hand-wave. Sibling to [session-event-log.md](./session-event-log.md)
-(the log it writes) and [attach-transport.md](./attach-transport.md) (the
-frame channel it serves).
+Status: design / proposed (2026-05-30); **partially realized** (2026-05-31).
+The primitive [vnext.md](./vnext.md) §0 actually gates on, pulled out of the
+layering's "one component, build it once" hand-wave. Sibling to
+[session-event-log.md](./session-event-log.md) (the log it writes) and
+[attach-transport.md](./attach-transport.md) (the frame channel it serves).
+
+**Built so far:** the **sequencer** exists as the *co-located single-writer*
+`events/log.rs::SessionLog` (assigns the per-session `seq` on append) — not yet
+a network process holding an append lock. The **attach endpoint**'s read side
+ships as `src/gateway.rs` (`session subscribe` — a sync `tungstenite` WS server
+streaming `Subscribe(from_seq)` as JSON), plus `session send` for input and
+tail-while-serving (the gateway tails a live session's transcript→log while it
+serves). **Not built:** the **broker** (participant auth / roster /
+driver-token arbitration / the `actor` it stamps) — net-new; the submit→seq
+*network* wire contract + the in-sandbox producer token + the host↔sandbox
+seq-authority handoff. Today's gateway is single-writer, single-session,
+localhost, unauthenticated.
 
 **Not** the swarm orchestrator. The orchestrator is an *external* consumer that
 decomposes goals and routes across many pillboxes over the proto contract; the

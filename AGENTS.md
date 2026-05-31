@@ -87,6 +87,8 @@ global pillbox regardless of where you are.
 | `pillbox session info ID [--json]` | Show one session (accepts unique id prefix ≥ 4 chars). |
 | `pillbox session attach ID` | Reattach to a detached session. Detach again with Ctrl-A + D or `pillbox session detach ID` from another shell. Works for local Docker, e2b, and ssh sessions. |
 | `pillbox session detach ID` | Signal a currently-attached pillbox to detach (SIGTERM, no-op if already detached). |
+| `pillbox session send ID TEXT` | Drive a running (detached) session: push TEXT to the agent's PTY as if typed — the programmatic SendInput half (pair with `session subscribe` to read the response). Bytes sent as-is; add a trailing newline/`\r` to submit a prompt to a TUI agent. Local Docker sessions today. |
+| `pillbox session subscribe ID [--from SEQ] [--bind ADDR]` | Stream a session's durable event log to WebSocket subscribers as JSON (one Event per text frame, in seq order from `--from`). For a **live** (detached) session it also tails the transcript→log while serving, so a driven detached session is readable; for a foreground/historical session it serves the existing log. Binds localhost (`--bind`, default `127.0.0.1:0` — printed) until Ctrl-C. The §0 local read surface a chat bridge / orchestrator / browser connects to without a shell. |
 | `pillbox session rm ID` | Tear down the backend (kill sandbox) and remove the session record. |
 | `pillbox session done ID --status ok\|failed [--reason TEXT] [--exit-code N] [--trace-path PATH] [--result-snapshot HANDLE]` | Emit `session.completed` / `session.failed` to every configured sink. Invoked automatically by the in-sandbox wrapper after the agent exits (also passes `--result-snapshot` from the remote workspace push); can also be called manually. Does NOT tear down the sandbox — use `session rm` for that. |
 | `pillbox session pull ID [--to DIR]` | Rehydrate a session's result workspace into a directory. Reads `result_snapshot` from the session record; errors clearly if the agent hasn't finished. Default `DIR` is `./session-<id>`. |
@@ -137,6 +139,19 @@ stderr:
 ```
 pillbox: note: ANTHROPIC_API_KEY shadowed by --with
 ```
+
+#### Agent sandbox defaults (claude)
+
+The sandbox is the isolation boundary, so a `claude` run is launched
+non-interactive-friendly by default: pillbox **pre-trusts** the mounted
+workspace (seeds `~/.claude.json` so the trust dialog doesn't block) and passes
+**`--permission-mode auto`** (so per-tool prompts don't stall a seeded or
+driven session). Override the mode by passing your own after `--` (e.g.
+`pillbox run -- --permission-mode plan`); it wins. Seed an interactive turn with
+the agent's positional prompt: `pillbox run --agent claude -- "your prompt"`
+(interactive, *not* `-p`). Full `--dangerously-skip-permissions` is refused by
+claude as root (the runner runs as root); `auto` is the strongest mode that
+works today.
 
 ### `pillbox secret add` flags
 

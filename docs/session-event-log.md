@@ -1,9 +1,27 @@
 # Session event log (vNext keystone)
 
-Status: design spec. Supersedes the split between the lifecycle stream
-(`src/events/mod.rs`, `events.jsonl`) and the agent I/O contract
-(`src/contract.rs`, `proto/pillbox/v1/agent.proto`) by unifying them on a
-single per-session durable log.
+Status: **partially built** (2026-05-31) — the local-substrate core is shipped
++ live-verified; the unification + multiplayer envelope below are still design.
+
+- **Built:** `src/events/log.rs::SessionLog` — per-session `log.jsonl`,
+  per-session monotonic seq (the log is the **co-located single-writer**
+  authority, recovered on open — not a network gateway), `read_from(seq)`
+  replay, `subscribe(from, stop, sink)`. `contract.rs::Event` gained `sessionId`
+  (partition key) + `Payload::Unknown` (forward-compat). First producer: the
+  transcript tailer → `events/transcripts/contract_map.rs` → the log (always-on,
+  decoupled from the OTLP gate; **lossless** — `Usage`/`Thinking`/`model`/
+  `stop_reason` added to proto + Rust). Local subscribe surface = the `session
+  subscribe` WS gateway (`src/gateway.rs`) + `session send` (the drive half).
+- **Deferred (the unification this doc specs):** `actor` on the envelope +
+  gateway-assigned seq / actor-auth; folding the lifecycle stream
+  (`events/mod.rs` / `events.jsonl`) into the log (still a separate stream, not
+  a projection of it); the content/signal `class` field; the blob store +
+  `raw_body` + `pty_snapshot`; the `head` fast-resume file.
+
+Supersedes the split between the lifecycle stream (`src/events/mod.rs`,
+`events.jsonl`) and the agent I/O contract (`src/contract.rs`,
+`proto/pillbox/v1/agent.proto`) by unifying them on a single per-session
+durable log.
 
 Part of [vnext.md](./vnext.md), which owns the layering (session > run >
 container) and the unified sequence. This spec is layer 1 — the session

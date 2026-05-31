@@ -13,8 +13,8 @@
 
 use super::{EventKind, TranscriptEvent};
 use crate::contract::{
-    MessageDelta, MessageEnd, MessageStart, Payload, Role, Thinking, ToolCall, ToolStatus, Usage,
-    UsageSource,
+    AttentionReason, AttentionRequired, MessageDelta, MessageEnd, MessageStart, Payload, Role,
+    Thinking, ToolCall, ToolStatus, Usage, UsageSource,
 };
 use crate::events::otel::genai::GenAiUsage;
 
@@ -40,6 +40,19 @@ pub(super) fn to_payloads(event: &TranscriptEvent) -> Vec<Payload> {
             );
             if let Some(u) = usage {
                 out.push(Payload::Usage(usage_payload(id, u)));
+            }
+            // `end_turn` is the harness's explicit "I finished my turn, awaiting
+            // input" marker — the attention signal a front-end (orca / lum /
+            // Slack) flashes or seeks-input on. pillbox only *produces* it onto
+            // the log/`subscribe` stream; the front-end owns how to surface it.
+            // (The ambiguous mid-tool "blocked on permission" case — which a
+            // quiescence timer can't tell from a slow tool — is the OSC/hook
+            // channel's job, deferred.)
+            if stop_reason.as_deref() == Some("end_turn") {
+                out.push(Payload::AttentionRequired(AttentionRequired {
+                    reason: AttentionReason::NeedsInput,
+                    message: String::new(),
+                }));
             }
             out
         }
@@ -163,8 +176,8 @@ mod tests {
             usage: Some(usage),
             stop_reason: Some("end_turn".into()),
         }));
-        // start, delta, end, usage — the lossless turn.
-        assert_eq!(out.len(), 4);
+        // start, delta, end, usage, + the end_turn attention signal.
+        assert_eq!(out.len(), 5);
         let Payload::MessageEnd(e) = &out[2] else {
             panic!("expected MessageEnd at [2]: {out:?}");
         };
@@ -178,6 +191,35 @@ mod tests {
         assert_eq!(u.cache_read_input_tokens, Some(7));
         assert_eq!(u.source, UsageSource::Native);
         assert_eq!(u.message_id, "u1");
+    }
+
+    #[test]
+    fn end_turn_produces_a_needs_input_attention_signal() {
+        // `end_turn` = the agent finished and awaits input → the signal a
+        // front-end flashes on. A non-terminal stop reason must NOT emit it.
+        let ended = to_payloads(&event(EventKind::AssistantText {
+            text: "done".into(),
+            model: None,
+            usage: None,
+            stop_reason: Some("end_turn".into()),
+        }));
+        assert!(matches!(
+            ended.last(),
+            Some(Payload::AttentionRequired(a)) if a.reason == AttentionReason::NeedsInput
+        ));
+
+        let mid_turn = to_payloads(&event(EventKind::AssistantText {
+            text: "let me run that".into(),
+            model: None,
+            usage: None,
+            stop_reason: Some("tool_use".into()),
+        }));
+        assert!(
+            !mid_turn
+                .iter()
+                .any(|p| matches!(p, Payload::AttentionRequired(_))),
+            "no attention signal mid-turn (tool_use): {mid_turn:?}"
+        );
     }
 
     #[test]

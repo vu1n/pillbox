@@ -209,8 +209,22 @@ impl SandboxBackend for RemoteDockerSandbox {
 
         let outcome = attach_via_exec_at(&endpoint, &container, false);
 
-        // TODO(result extraction — `ResultCaptured`): `docker cp`
-        //   <container>:GUEST_WORKSPACE out → land in cwd + snapshot host-side.
+        // Result extraction (the SM's `ResultCaptured`): pull the agent's
+        // workspace back over the host cwd so the run "feels like local" — your
+        // directory reflects what the agent did, like a local bind-mount. Runs
+        // on the stopped-but-not-yet-reaped container (docker cp works on a
+        // stopped container; the guard reaps only after we return), so it also
+        // covers a fast headless agent that exited before the attach connected.
+        // Best-effort + loud: a failed pull must not mask the agent's exit code,
+        // but the user has to know if their work didn't come back.
+        if let Err(e) = docker::cp_out_at(&endpoint, &container, GUEST_WORKSPACE, &workspace_host) {
+            eprintln!(
+                "pillbox: warning: couldn't pull the remote workspace back to {}: {e}",
+                workspace_host.display()
+            );
+            eprintln!("pillbox: the agent's changes are lost when the container is reaped.");
+        }
+
         // TODO(creds read-back — `CredsPersisted` before `TornDown`): copy the
         //   container's refreshed auth out → persist to the global store, or a
         //   second run gets stale tokens → 401. Must run BEFORE the guard reaps.

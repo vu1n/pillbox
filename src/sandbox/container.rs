@@ -109,4 +109,48 @@ mod tests {
         assert!(present("/tmp/hello.txt"), "staged file visible after start");
         assert!(!present("/tmp/.env"), ".env must not be staged");
     }
+
+    /// Result extraction: `docker cp` the container's workspace back to the
+    /// host so the run "feels like local" — what the agent wrote in the
+    /// container lands in cwd. Works on a stopped container (the docker://
+    /// flow extracts before reap). Deterministic (no agent): we write the
+    /// file ourselves, then pull it.
+    #[test]
+    #[ignore = "requires docker + the runner image"]
+    fn cp_out_pulls_container_workspace_to_host() {
+        use crate::docker;
+        let ep = DockerEndpoint::local();
+        let cid = String::from_utf8(
+            Command::new("docker")
+                .args(["run", "-d", &test_image(), "sleep", "120"])
+                .output()
+                .expect("docker run")
+                .stdout,
+        )
+        .expect("utf8 cid")
+        .trim()
+        .to_string();
+        let _rm = RmContainer(cid.clone());
+        // The container writes a file under /workspace (mimicking the agent).
+        let wrote = Command::new("docker")
+            .args([
+                "exec",
+                &cid,
+                "sh",
+                "-c",
+                "mkdir -p /workspace && printf agent-wrote-this > /workspace/RESULT.txt",
+            ])
+            .status()
+            .expect("write in container");
+        assert!(wrote.success());
+
+        let host = tempfile::tempdir().unwrap();
+        docker::cp_out_at(&ep, &cid, "/workspace", host.path()).expect("cp out");
+        let pulled = std::fs::read_to_string(host.path().join("RESULT.txt")).expect("RESULT.txt");
+        assert_eq!(
+            pulled.trim(),
+            "agent-wrote-this",
+            "the container's workspace edit must land on the host"
+        );
+    }
 }

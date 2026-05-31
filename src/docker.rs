@@ -197,6 +197,38 @@ pub fn check_ready_at(endpoint: &DockerEndpoint, image: &str) -> Result<()> {
     Err(PillboxError::resource("docker pre-flight", stderr.into_owned()).into())
 }
 
+/// `docker cp <container>:<src>/. <host_dest>` on `endpoint`'s daemon — copy
+/// the *contents* of a container directory back to a host path (the
+/// result-extraction direction; the reverse of [`cp_file_at`] /
+/// [`cp_stdin_at`]). Works on a stopped container, so docker:// can pull the
+/// agent's final workspace out before the container is reaped. The trailing
+/// `/.` copies the directory's contents into `host_dest` rather than nesting a
+/// `<src>` subdir; matching files are overwritten.
+// Wired by the docker:// run assembly's result-extraction step.
+#[allow(dead_code)]
+pub fn cp_out_at(
+    endpoint: &DockerEndpoint,
+    container: &str,
+    src: &str,
+    host_dest: &std::path::Path,
+) -> Result<()> {
+    let out = endpoint
+        .command()
+        .arg("cp")
+        .arg(format!("{container}:{src}/."))
+        .arg(host_dest)
+        .output()
+        .context("invoking `docker cp` (out)")?;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(PillboxError::resource(
+        "result extraction",
+        String::from_utf8_lossy(&out.stderr).trim().to_string(),
+    )
+    .into())
+}
+
 /// Run `docker run <args...>` with stdio inherited from the parent.
 pub fn run_interactive(args: &[String]) -> Result<ExitStatus> {
     let status = Command::new("docker")

@@ -151,7 +151,11 @@ impl SessionLog {
         use notify::{RecursiveMode, Watcher};
 
         // Watch the session dir (the log file may not exist yet) before the
-        // first drain, so an append between drain and wait isn't missed.
+        // first drain, so an append between drain and wait isn't missed. The
+        // dir, not the parent: `log.jsonl` is append-only (never rotated/
+        // renamed), so a direct watch catches every append — unlike the
+        // transcript `Tailer`, which watches the parent because a harness can
+        // atomically rename its transcript.
         let (tx, rx) = mpsc::channel();
         let mut watcher = notify::recommended_watcher(move |res| {
             let _ = tx.send(res);

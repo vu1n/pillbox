@@ -373,12 +373,14 @@ fn session_subscribe(resolved: &Pillbox, id: &str, from: u64, bind: Option<&str>
                 );
                 // Read-side fan-out: if a notification webhook is configured,
                 // tail the same log and POST attention signals to it — a
-                // consumer of the log, off the tailer's producer path.
-                if let Ok(url) = std::env::var("PILLBOX_EVENTS_WEBHOOK") {
-                    if !url.is_empty() {
-                        if let Ok(elog) = crate::events::log::SessionLog::open(resolved, &s.id) {
-                            crate::events::spawn_webhook_log_exporter(elog, url);
-                        }
+                // consumer of the log (its own read view), off the tailer's
+                // producer path.
+                if let Some(url) = std::env::var("PILLBOX_EVENTS_WEBHOOK")
+                    .ok()
+                    .filter(|u| !u.is_empty())
+                {
+                    if let Ok(elog) = crate::events::log::SessionLog::open(resolved, &s.id) {
+                        crate::events::spawn_webhook_log_exporter(elog, url);
                     }
                 }
                 tailer

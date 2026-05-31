@@ -324,6 +324,16 @@ pub(crate) enum SessionAction {
         /// Text to send (as-is). Include a trailing newline/`\r` to submit.
         text: String,
     },
+    /// Watch a session's event stream rendered to this terminal — the
+    /// human-facing reader over the durable log (the `docker logs` model;
+    /// `subscribe` is the machine/WS sibling). For a live session it tails the
+    /// transcript→log as the agent works. Ctrl-C to stop. Accepts an id prefix.
+    Watch {
+        id: String,
+        /// Start from this seq (0 = full history from the top, the default).
+        #[arg(long, default_value_t = 0)]
+        from: u64,
+    },
     /// Stream a session's durable event log to WebSocket subscribers as
     /// JSON (one Event per text frame, in seq order). The §0 read surface a
     /// chat bridge / orchestrator / browser connects to without a shell.

@@ -24,6 +24,7 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> 
         SessionAction::Subscribe { id, from, bind } => {
             session_subscribe(resolved, &id, from, bind.as_deref())
         }
+        SessionAction::Watch { id, from } => session_watch(resolved, &id, from),
         SessionAction::Events { follow, json } => events::dispatch_events(resolved, follow, json),
         SessionAction::Started { id } => session_started(resolved, &id),
         SessionAction::Done {
@@ -353,52 +354,136 @@ fn session_send(resolved: &Pillbox, id: &str, text: &str) -> Result<()> {
     }
 }
 
-fn session_subscribe(resolved: &Pillbox, id: &str, from: u64, bind: Option<&str>) -> Result<()> {
-    // A live session record (detached/running): tail its transcript into the
-    // durable log *while we serve*, so a session driven via `session send` is
-    // also readable over WS — the drive+read loop closed on one session. The
-    // tailer handle lives for the gateway's lifetime (serve_session_ws blocks).
+/// Resolve a session id/prefix for streaming and ensure its log is being
+/// filled. A live local-docker record → spawn the transcript→log tailer
+/// (returned as a guard the caller holds for the stream's lifetime, so a
+/// `session send`-driven session is readable as it runs); a remote record →
+/// note that live tailing is host-unavailable (transcript is sandbox-side); a
+/// foreground/historical run → resolve the log dir. Shared by `session
+/// subscribe` (serves WS) and `session watch` (renders to the terminal).
+fn resolve_streaming_session(
+    resolved: &Pillbox,
+    id: &str,
+    action: &'static str,
+) -> Result<(String, Option<events::transcripts::LocalTailerHandle>)> {
     if let Ok(s) = session::resolve(resolved, id) {
-        let _tailer = match session::Backend::parse(&s.backend) {
+        let tailer = match session::Backend::parse(&s.backend) {
             Some(session::Backend::Docker) => {
-                let spec = crate::agents::lookup("session subscribe", &s.agent_id)?;
+                let spec = crate::agents::lookup(action, &s.agent_id)?;
                 let home = spec.home_dir(resolved)?;
                 let log = crate::events::log::SessionLog::open(resolved, &s.id)?;
-                let tailer = crate::events::transcripts::spawn_attach_tailer(
+                events::transcripts::spawn_attach_tailer(
                     log,
                     &home,
                     &s.agent_id,
                     &s.guest_cwd,
                     &s.id,
-                );
-                // Read-side fan-out: if a notification webhook is configured,
-                // tail the same log and POST attention signals to it — a
-                // consumer of the log (its own read view), off the tailer's
-                // producer path.
-                if let Some(url) = std::env::var("PILLBOX_EVENTS_WEBHOOK")
-                    .ok()
-                    .filter(|u| !u.is_empty())
-                {
-                    if let Ok(elog) = crate::events::log::SessionLog::open(resolved, &s.id) {
-                        crate::events::spawn_webhook_log_exporter(elog, url);
-                    }
-                }
-                tailer
+                )
             }
             _ => {
                 eprintln!(
-                    "pillbox: note: live event tailing is local-docker only \
-                     (a remote session's transcript is sandbox-side); serving the existing log"
+                    "pillbox: note: live event tailing is local-docker only (a remote \
+                     session's transcript is sandbox-side); reading the existing log"
                 );
                 None
             }
         };
-        return crate::gateway::serve_session_ws(resolved, &s.id, from, bind);
+        return Ok((s.id, tailer));
     }
-    // Otherwise a foreground/historical run: it wrote a durable LOG but no
-    // `.toml` record, so resolve against the log dirs and serve what's there.
-    let session_id = session::resolve_logged(resolved, id)?;
-    crate::gateway::serve_session_ws(resolved, &session_id, from, bind)
+    // Foreground/historical run: a durable LOG but no `.toml` record.
+    Ok((session::resolve_logged(resolved, id)?, None))
+}
+
+fn session_subscribe(resolved: &Pillbox, id: &str, from: u64, bind: Option<&str>) -> Result<()> {
+    let (sid, _tailer) = resolve_streaming_session(resolved, id, "session subscribe")?;
+    // Read-side fan-out: while the log is being filled (live session), if a
+    // notification webhook is configured, tail the log and POST attention
+    // signals to it — a consumer of the log (its own read view), off the
+    // tailer's producer path.
+    if _tailer.is_some() {
+        if let Some(url) = std::env::var("PILLBOX_EVENTS_WEBHOOK")
+            .ok()
+            .filter(|u| !u.is_empty())
+        {
+            if let Ok(elog) = crate::events::log::SessionLog::open(resolved, &sid) {
+                crate::events::spawn_webhook_log_exporter(elog, url);
+            }
+        }
+    }
+    // `_tailer` lives for the gateway's lifetime (serve_session_ws blocks).
+    crate::gateway::serve_session_ws(resolved, &sid, from, bind)
+}
+
+fn session_watch(resolved: &Pillbox, id: &str, from: u64) -> Result<()> {
+    use std::sync::atomic::AtomicBool;
+    let (sid, _tailer) = resolve_streaming_session(resolved, id, "session watch")?;
+    eprintln!("pillbox: watching session {sid} (Ctrl-C to stop)");
+    let log = crate::events::log::SessionLog::open(resolved, &sid)?;
+    // Never set: Ctrl-C ends the process; `_tailer` lives until then.
+    let stop = AtomicBool::new(false);
+    let mut role = crate::contract::Role::Unspecified;
+    log.subscribe(from, &stop, |ev| {
+        render_watch_event(ev, &mut role);
+        true
+    })
+}
+
+/// Render one event to the terminal for `session watch` — a readable view of
+/// the agent's stream (messages by role, tools, thinking, the attention
+/// signal), not raw JSON. Ephemeral telemetry (usage, lifecycle) is skipped.
+fn render_watch_event(ev: &crate::contract::Event, role: &mut crate::contract::Role) {
+    use crate::contract::{Payload, Role, ToolStatus};
+    match &ev.payload {
+        Payload::MessageStart(m) => *role = m.role,
+        Payload::MessageDelta(d) => {
+            let who = match *role {
+                Role::User => "you",
+                Role::Assistant => "claude",
+                Role::System => "system",
+                Role::Unspecified => "agent",
+            };
+            println!("{who}: {}", d.text.trim_end());
+        }
+        Payload::ToolCall(t) if t.status == ToolStatus::Running => {
+            let arg = t.input.as_ref().map(summarize_one_line).unwrap_or_default();
+            println!("  ⚙ {} {arg}", t.name);
+        }
+        Payload::ToolCall(t) => {
+            let mark = if t.status == ToolStatus::Error {
+                "✗"
+            } else {
+                "✓"
+            };
+            let out = first_line(&t.output);
+            println!(
+                "  {mark} {}",
+                if out.is_empty() { "(done)".into() } else { out }
+            );
+        }
+        Payload::Thinking(th) => println!("  · {}", first_line(&th.text)),
+        Payload::AttentionRequired(a) => println!("⏳ needs attention ({:?})", a.reason),
+        _ => {} // usage / lifecycle / unknown — not rendered
+    }
+}
+
+/// First non-empty line of `s`, char-safely capped for a terminal line.
+fn first_line(s: &str) -> String {
+    let line = s
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    let capped: String = line.chars().take(100).collect();
+    if line.chars().count() > 100 {
+        format!("{capped}…")
+    } else {
+        capped
+    }
+}
+
+/// A compact one-line view of a tool's JSON input.
+fn summarize_one_line(v: &serde_json::Value) -> String {
+    first_line(&v.to_string())
 }
 
 fn session_pull(resolved: &Pillbox, id: &str, to: Option<&std::path::Path>) -> Result<()> {

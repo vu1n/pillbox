@@ -420,17 +420,33 @@ Reconciled against the sequence above; commits on `main` (origin synced).
   `AttentionRequired{ NeedsInput }` on the transcript's explicit `stop_reason ==
   "end_turn"` → the durable log / `subscribe` stream, for a front-end (orca /
   lum / Slack) to flash / seek-input; respond via `session send`. Live-verified.
-  Remaining: the mid-tool **blocked/permission** signal — researched
-  (2026-05-31): use Claude Code's **`Notification` hook** (`notification_type`
-  discriminates `idle_prompt` vs `permission_prompt` vs `elicitation_dialog`) +
-  **`StopFailure`** (auth/rate-limit/billing stalls → `ErrorStalled`), **not OSC**
-  (Claude emits no native idle/permission OSC; orca's OSC 9999 is itself
-  hook-authored). pillbox pre-seeds `~/.claude/settings.json` (the same
-  bind-mount lever as trust) with a hook whose handler appends `AttentionRequired`
-  to the **co-located** per-session log (sandbox-side for remote, host for local
-  — the existing tailer/log spine carries it; no daemon). Maps idle_prompt→
-  NeedsInput, permission_prompt/elicitation→Permission, StopFailure→ErrorStalled.
-  Keep the transcript `end_turn`→NeedsInput as the backstop.
+  Remaining: the mid-tool **blocked/permission** signal — **researched then
+  empirically falsified (2026-05-31).** The doc-based plan (Claude Code's
+  **`Notification` hook**, `notification_type` ∈ idle_prompt/permission_prompt/
+  elicitation_dialog) was built as a producer (pre-seed a hook into the
+  bind-mounted home; fold the marker into `AttentionRequired`) and **probed
+  against a real detached session before wiring the consumer.** Findings:
+  - **`Notification` hooks do NOT fire** in pillbox's detached/automated
+    pty-host context. `idle_prompt` no-showed after 80s idle (it should fire
+    immediately if notifications were live); `permission_prompt` no-showed in
+    gating mode (`--permission-mode default`) on a tool-using prompt. Claude's
+    `Notification` channel is the *"ding a human at a terminal"* mechanism and
+    is suppressed when there's no interactive user — exactly pillbox's case.
+  - **Lifecycle hooks DO fire** (`Stop` wrote its marker in the same detached
+    session) — but only via a **`~/.claude/settings.json` file**; inline
+    **`--settings` hooks are ignored in the interactive TUI** (they fire under
+    `claude -p`, which misled the isolated test). And `Stop` == turn-end ==
+    **redundant with the shipped `end_turn`→NeedsInput signal**, so it buys
+    nothing.
+  - **Verdict:** reverted the non-firing producer (the `--settings` plumbing).
+    `end_turn`→NeedsInput stays as *the* attention signal. The mid-tool
+    blocked/permission signal is an **open limitation in the automated context**
+    — Claude exposes no hook that fires there for it. `StopFailure` (error-stall
+    → `ErrorStalled`) is lifecycle-class so it *may* fire, but it's untested
+    (needs a real API error to trigger) and niche; revisit only if the
+    error-stall case proves worth a dedicated probe. **Not OSC** either (Claude
+    emits no native idle/permission OSC; orca's OSC 9999 is itself hook-authored,
+    so it would hit the same suppression).
 - **Fan-out architecture (decided 2026-05-31, after an adversarial review).**
   "One signal → all subscription types" is realized as **the per-session log is
   the bus; every consumer is a read-side tailer of it** — NOT a producer-side

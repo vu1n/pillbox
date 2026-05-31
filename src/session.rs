@@ -348,6 +348,48 @@ pub(crate) fn resolve(pb: &Pillbox, id_or_prefix: &str) -> Result<Session> {
     reg::resolve_id::<SessionRegistry>(pb, id_or_prefix)
 }
 
+/// Resolve an id-or-prefix to a session that has a durable event log, scanning
+/// the per-session log dirs (`sessions/<id>/log.jsonl`) rather than the `.toml`
+/// registry: a foreground run writes a log but no record, so [`resolve`] can't
+/// find it. Errors on no match or an ambiguous prefix. Min prefix length 4
+/// (matches the registry) so a typo can't silently latch onto a session.
+pub(crate) fn resolve_logged(pb: &Pillbox, id_or_prefix: &str) -> Result<String> {
+    const MIN_PREFIX: usize = 4;
+    if id_or_prefix.len() < MIN_PREFIX {
+        return Err(PillboxError::usage(
+            "session subscribe",
+            format!("`{id_or_prefix}` is too short — use at least {MIN_PREFIX} characters"),
+        )
+        .into());
+    }
+    let dir = pb.subdir_path(SESSIONS_DIR);
+    let mut matches: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if name.starts_with(id_or_prefix) && entry.path().join("log.jsonl").is_file() {
+                matches.push(name);
+            }
+        }
+    }
+    match matches.len() {
+        1 => Ok(matches.pop().unwrap()),
+        0 => Err(PillboxError::runtime(
+            "session subscribe",
+            format!("no session with a durable log matches `{id_or_prefix}`"),
+        )
+        .with_next(format!("ls {}", dir.display()))
+        .into()),
+        n => Err(PillboxError::runtime(
+            "session subscribe",
+            format!("`{id_or_prefix}` is ambiguous — {n} sessions match"),
+        )
+        .into()),
+    }
+}
+
 /// All sessions in the current pillbox, sorted by `started_at` (oldest
 /// first so `session list` is stable across re-runs).
 pub(crate) fn list(pb: &Pillbox) -> Result<Vec<Session>> {

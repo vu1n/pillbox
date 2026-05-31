@@ -60,6 +60,13 @@ base64 = "0.22"
 # the same Tailer struct will back the bind-mount-tailed auto-emit
 # path once that ships. v8 is the most-recent stable.
 notify = "8"
+# Sync WebSocket server for the per-session event gateway
+# (`pillbox session subscribe`): streams the durable event log to WS
+# subscribers as JSON. Sync + thread-per-connection — no tokio runtime
+# (matches pillbox's model: async only for the vault proxy). Already in
+# the tree transitively via hudsucker; `handshake` is all we need (no TLS
+# — the gateway binds localhost ws://). Direct dep so `cargo audit` sees it.
+tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
 # Unix-only: `pillbox session detach <id>` SIGTERMs the attached
 # pillbox process. Direct dep so a `cargo audit` flags advisories
 # instead of hiding behind a transitive resolution.

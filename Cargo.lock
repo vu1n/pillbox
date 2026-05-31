@@ -2831,6 +2831,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing-subscriber",
+ "tungstenite",
  "uuid",
  "vt100",
 ]

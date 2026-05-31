@@ -315,6 +315,20 @@ pub(crate) enum SessionAction {
     /// Tear down the backend resources (kill the sandbox) and remove
     /// the session record. Idempotent.
     Rm { id: String },
+    /// Stream a session's durable event log to WebSocket subscribers as
+    /// JSON (one Event per text frame, in seq order). The §0 read surface a
+    /// chat bridge / orchestrator / browser connects to without a shell.
+    /// Serves localhost until Ctrl-C. Accepts a unique id prefix.
+    Subscribe {
+        id: String,
+        /// Start from this seq (0 = full replay from the top, the default).
+        #[arg(long, default_value_t = 0)]
+        from: u64,
+        /// Address to bind (default `127.0.0.1:0` — an ephemeral port,
+        /// printed on start).
+        #[arg(long)]
+        bind: Option<String>,
+    },
     /// Rehydrate a session's result workspace into a directory. Reads
     /// `result_snapshot` from the session record (set by `session done
     /// --result-snapshot`) and asks the workspace backend to pull it.

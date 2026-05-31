@@ -32,6 +32,7 @@ mod doctor;
 mod envs;
 mod errors;
 mod events;
+mod gateway;
 mod paths;
 mod pillbox;
 mod registry;

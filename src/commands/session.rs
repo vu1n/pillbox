@@ -20,6 +20,9 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> 
         SessionAction::Attach { id } => session_attach(resolved, &id),
         SessionAction::Detach { id } => session_detach(resolved, &id),
         SessionAction::Rm { id } => session_rm(resolved, &id),
+        SessionAction::Subscribe { id, from, bind } => {
+            session_subscribe(resolved, &id, from, bind.as_deref())
+        }
         SessionAction::Events { follow, json } => events::dispatch_events(resolved, follow, json),
         SessionAction::Started { id } => session_started(resolved, &id),
         SessionAction::Done {
@@ -317,6 +320,14 @@ fn session_rm(resolved: &Pillbox, id: &str) -> Result<()> {
         )
         .into()),
     }
+}
+
+fn session_subscribe(resolved: &Pillbox, id: &str, from: u64, bind: Option<&str>) -> Result<()> {
+    // Resolve against the durable LOG dirs, not the session registry: a
+    // foreground run writes a log but no `.toml` record, so `session::resolve`
+    // (records) wouldn't find it.
+    let session_id = session::resolve_logged(resolved, id)?;
+    crate::gateway::serve_session_ws(resolved, &session_id, from, bind)
 }
 
 fn session_pull(resolved: &Pillbox, id: &str, to: Option<&std::path::Path>) -> Result<()> {

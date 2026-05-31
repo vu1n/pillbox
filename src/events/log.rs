@@ -42,7 +42,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -133,9 +133,13 @@ impl SessionLog {
     /// the live read side of the spine — what a WS/gRPC gateway adapter sits on
     /// to relay a running session to a remote consumer.
     ///
-    /// Polls (like [`crate::events::dispatch_events`]) rather than wiring
-    /// `notify`: simpler, dependency-free, and fast enough for human-paced
-    /// sessions. Each wake re-reads the tail via [`read_from`](Self::read_from)
+    /// Wakes on an `notify` FS event for the session dir, so an append — by
+    /// this process or another (the file is the cross-process bus) — is
+    /// relayed promptly, with a poll as a fallback for coalesced/missed events
+    /// (macOS). Mirrors the transcript [`Tailer`](crate::events::transcripts)'s
+    /// follow loop; the file stays the single bus (no in-process push channel),
+    /// so every reader — local WS, a future gRPC/SSE adapter — improves
+    /// uniformly. Each wake re-reads the tail via [`read_from`](Self::read_from)
     /// — fine at per-session scale; the byte-offset/`head` incremental read is
     /// the deferred optimization (see the module docs).
     pub(crate) fn subscribe(
@@ -144,6 +148,19 @@ impl SessionLog {
         stop: &AtomicBool,
         mut sink: impl FnMut(&Event) -> bool,
     ) -> Result<()> {
+        use notify::{RecursiveMode, Watcher};
+
+        // Watch the session dir (the log file may not exist yet) before the
+        // first drain, so an append between drain and wait isn't missed.
+        let (tx, rx) = mpsc::channel();
+        let mut watcher = notify::recommended_watcher(move |res| {
+            let _ = tx.send(res);
+        })
+        .context("build subscribe watcher")?;
+        watcher
+            .watch(&self.dir, RecursiveMode::NonRecursive)
+            .with_context(|| format!("watch {}", self.dir.display()))?;
+
         let mut next = from;
         loop {
             for ev in self.read_from(next)? {
@@ -157,14 +174,20 @@ impl SessionLog {
             if stop.load(Ordering::Relaxed) {
                 return Ok(());
             }
-            thread::sleep(SUBSCRIBE_POLL);
+            match rx.recv_timeout(SUBSCRIBE_POLL) {
+                // FS event (Ok/Err) or the poll fallback: loop and drain.
+                Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                // Watcher dropped/channel closed — nothing more will wake us.
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            }
         }
     }
 }
 
-/// Poll interval for [`SessionLog::subscribe`]. Matches the lifecycle stream's
-/// tail cadence — responsive at human pace without spinning the CPU.
-const SUBSCRIBE_POLL: Duration = Duration::from_millis(150);
+/// Fallback poll interval for [`SessionLog::subscribe`] — `notify` does the
+/// real low-latency relaying; this just bounds how long a missed FS event (or
+/// a `stop` set while we're parked on `recv`) can stall, so it can be lazy.
+const SUBSCRIBE_POLL: Duration = Duration::from_millis(500);
 
 /// Fold over the non-empty JSONL lines of `path`, returning `init` unchanged
 /// when the file doesn't exist (an empty / never-written log). Shared by replay

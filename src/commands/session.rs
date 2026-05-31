@@ -461,12 +461,19 @@ fn session_send(resolved: &Pillbox, id: &str, text: &str) -> Result<()> {
             eprintln!("pillbox: sent {} byte(s) to session `{}`", text.len(), s.id);
             Ok(())
         }
-        // The same relay-exec pattern extends to e2b/ssh (mirroring their
-        // reattach transport); not wired yet.
+        Some(session::Backend::RemoteDocker) => {
+            let remote = remote::resolve_run_target(resolved, &s.remote)?;
+            let endpoint = sandbox::remote_docker::endpoint_for(&remote)?;
+            sandbox::remote_docker::send_input(&endpoint, &s.sandbox_id, text.as_bytes())?;
+            eprintln!("pillbox: sent {} byte(s) to session `{}`", text.len(), s.id);
+            Ok(())
+        }
+        // e2b/ssh nest the agent in a remote-host container; the same relay-exec
+        // drive extends there (mirroring their reattach transport), not wired yet.
         Some(_) => Err(PillboxError::usage(
             "session send",
             format!(
-                "send isn't supported for `{}` sessions yet (local docker only)",
+                "send isn't supported for `{}` sessions yet (docker only)",
                 s.backend
             ),
         )
@@ -491,7 +498,7 @@ fn resolve_streaming_session(
     resolved: &Pillbox,
     id: &str,
     action: &'static str,
-) -> Result<(String, Option<events::transcripts::LocalTailerHandle>)> {
+) -> Result<(String, Option<events::transcripts::TailerHandle>)> {
     if let Ok(s) = session::resolve(resolved, id) {
         let tailer = match session::Backend::parse(&s.backend) {
             Some(session::Backend::Docker) => {
@@ -506,10 +513,43 @@ fn resolve_streaming_session(
                     &s.id,
                 )
             }
+            // docker:// is the one remote whose transcript is reachable
+            // host-side (the container is directly `docker exec`-able): tail it
+            // over the endpoint into the durable log, so subscribe/watch read a
+            // remote session collector-free, same as local.
+            Some(session::Backend::RemoteDocker) => {
+                match remote::resolve_run_target(resolved, &s.remote)
+                    .and_then(|r| sandbox::remote_docker::endpoint_for(&r))
+                {
+                    Ok(endpoint) => {
+                        let log = crate::events::log::SessionLog::open(resolved, &s.id)?;
+                        sandbox::remote_docker::spawn_transcript_stream(
+                            &endpoint,
+                            &s.sandbox_id,
+                            &s.agent_id,
+                            &s.guest_cwd,
+                            &s.id,
+                            log,
+                        )
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "pillbox: note: can't reach remote `{}` to tail its transcript \
+                             ({e}); reading the existing log",
+                            s.remote
+                        );
+                        None
+                    }
+                }
+            }
+            // e2b/ssh write their transcript inside an ephemeral sandbox with no
+            // host-reachable handle; their live view is the sandbox-side OTLP
+            // tailer (needs a collector). Read the existing host log here.
             _ => {
                 eprintln!(
-                    "pillbox: note: live event tailing is local-docker only (a remote \
-                     session's transcript is sandbox-side); reading the existing log"
+                    "pillbox: note: live event tailing isn't available for `{}` sessions \
+                     (transcript is sandbox-side); reading the existing log",
+                    s.backend
                 );
                 None
             }

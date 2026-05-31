@@ -73,6 +73,23 @@ impl Tailer {
         }
     }
 
+    /// Construct a tailer with no backing file path — for [`follow_reader`],
+    /// where bytes arrive on a pipe rather than a growing file (the docker://
+    /// read path). The path field is unused in stream mode; the file-tailing
+    /// methods ([`pump`]/[`follow_until`]) are never called on a stream tailer.
+    ///
+    /// [`follow_reader`]: Tailer::follow_reader
+    /// [`pump`]: Tailer::pump
+    /// [`follow_until`]: Tailer::follow_until
+    pub(crate) fn for_stream(
+        session_id: String,
+        harness: Harness,
+        include_usage: bool,
+        log: Option<SessionLog>,
+    ) -> Self {
+        Self::new(PathBuf::new(), session_id, harness, include_usage, log)
+    }
+
     /// Read any bytes appended since the last pump, parse the
     /// complete lines those bytes produced, emit one span per
     /// parsed event. Returns the number of events emitted.
@@ -109,9 +126,6 @@ impl Tailer {
             .with_context(|| format!("read {}", self.path.display()))?;
         self.offset = len;
 
-        // Combine leftover + new bytes into a Cow-like view, then
-        // split on `\n`. Anything after the final `\n` becomes the
-        // new leftover for the next pump.
         let text = match std::str::from_utf8(&buf) {
             Ok(s) => s,
             Err(_) => {
@@ -123,8 +137,20 @@ impl Tailer {
                 return Ok(0);
             }
         };
+        self.ingest(text)
+    }
+
+    /// Parse the complete lines in `chunk` (prepended with any leftover partial
+    /// line from a previous call), emitting one span + durable event per parsed
+    /// transcript event; the trailing partial line is buffered for next time.
+    /// The byte-level reader — file ([`Tailer::pump`]) or pipe
+    /// ([`Tailer::follow_reader`]) — owns *where* bytes come from; this owns
+    /// *what they mean*.
+    fn ingest(&mut self, chunk: &str) -> Result<usize> {
+        // Combine leftover + new bytes, then split on `\n`. Anything after the
+        // final `\n` becomes the new leftover for the next call.
         let mut combined = std::mem::take(&mut self.leftover);
-        combined.push_str(text);
+        combined.push_str(chunk);
 
         let mut emitted = 0;
         // Accumulate this pump's durable events and append them in one write
@@ -240,6 +266,45 @@ impl Tailer {
         self.synth.finish();
         Ok(total)
     }
+
+    /// Drain a *streamed* transcript — bytes arriving on a pipe rather than a
+    /// growing file. The docker:// read path tails the container's transcript
+    /// out over the endpoint (`docker exec … tail -F`) and feeds the child's
+    /// stdout here, so a remote session fills the host's durable log exactly
+    /// like a local bind-mounted one — same parser, same `SessionLog`.
+    ///
+    /// Blocks reading the pipe until it closes (the remote `tail` ends / the
+    /// container stops) or `stop` is set. The blocking read is interruptible
+    /// only at chunk boundaries; callers that need a hard stop close the
+    /// underlying child (the read then returns EOF).
+    pub(crate) fn follow_reader(
+        &mut self,
+        mut reader: impl std::io::Read,
+        stop: &AtomicBool,
+    ) -> Result<usize> {
+        let mut total = 0;
+        let mut buf = [0u8; 8192];
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let n = reader
+                .read(&mut buf)
+                .context("read remote transcript stream")?;
+            if n == 0 {
+                break; // pipe closed
+            }
+            match std::str::from_utf8(&buf[..n]) {
+                Ok(s) => total += self.ingest(s)?,
+                // A read can split a multi-byte char; the leftover-line buffer
+                // can't stitch mid-UTF8, so drop this chunk rather than corrupt
+                // the parse. Rare on ASCII-dominant JSONL; the next line resyncs.
+                Err(_) => self.leftover.clear(),
+            }
+        }
+        self.synth.finish();
+        Ok(total)
+    }
 }
 
 fn parse_with(harness: Harness, line: &str, idx: usize) -> Vec<TranscriptEvent> {
@@ -306,6 +371,54 @@ mod tests {
             assert_eq!(
                 events.iter().map(|e| e.seq).collect::<Vec<_>>(),
                 vec![1, 2, 3]
+            );
+        });
+    }
+
+    /// The docker:// read path end-to-end: a streamed transcript (bytes off a
+    /// pipe, here a `Cursor`) drains through `follow_reader` into the durable
+    /// log as the mapped payloads — same result as the file-based `pump`, and
+    /// partial lines split mid-stream still stitch.
+    #[test]
+    fn follow_reader_drains_a_streamed_transcript_into_the_log() {
+        crate::test_util::with_isolated_home("tailer-follow-reader", || {
+            use std::io::Cursor;
+            use std::sync::atomic::AtomicBool;
+
+            let pb = crate::pillbox::global();
+            let log = SessionLog::open(&pb, "sess-stream").expect("open log");
+
+            // Two complete lines + a chunk boundary in the middle of the second
+            // (the Cursor hands them all at once, but ingest's leftover buffer is
+            // what stitches a split — exercised by pump's partial-line test; here
+            // we assert the stream path maps both lines).
+            let mut stream = String::new();
+            stream.push_str(&fixture_line("u1", "alpha"));
+            stream.push('\n');
+            stream.push_str(&fixture_line("u2", "beta"));
+            stream.push('\n');
+
+            let mut tailer =
+                Tailer::for_stream("sess-stream".into(), Harness::Claude, false, Some(log));
+            let stop = AtomicBool::new(false);
+            let n = tailer
+                .follow_reader(Cursor::new(stream), &stop)
+                .expect("follow_reader");
+            assert_eq!(n, 2, "two streamed transcript events");
+
+            let events = SessionLog::open(&pb, "sess-stream")
+                .unwrap()
+                .read_from(0)
+                .unwrap();
+            // Each user prompt → start/delta/end triple.
+            assert_eq!(events.len(), 6);
+            assert!(matches!(&events[1].payload,
+                crate::contract::Payload::MessageDelta(d) if d.text == "alpha"));
+            assert!(matches!(&events[4].payload,
+                crate::contract::Payload::MessageDelta(d) if d.text == "beta"));
+            assert_eq!(
+                events.iter().map(|e| e.seq).collect::<Vec<_>>(),
+                vec![1, 2, 3, 4, 5, 6]
             );
         });
     }

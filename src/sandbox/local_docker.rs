@@ -361,27 +361,13 @@ fn attach_via_exec(container: &str, detach_enabled: bool) -> Result<Outcome> {
 
 /// Push one `Input` frame to a running session's in-container pty-host via a
 /// one-shot docker-exec relay — the same transport `attach` uses, but driven
-/// programmatically (`driver::send_input`, no pump). The `SendInput` half of
-/// the drive surface: bytes in, as if typed. `pillbox session send <id>`.
-///
-/// No `DataAck` in the frame protocol yet, so after writing we EOF the relay
-/// (it forwards the buffered frame, then sees end-of-input) and wait a bounded
-/// beat for the pty-host to apply it to the PTY before tearing the exec down —
-/// a timed best-effort, not a delivery confirmation. A future ack frame turns
-/// this into a real round-trip.
+/// programmatically (no pump). The `SendInput` half of the drive surface: bytes
+/// in, as if typed. `pillbox session send <id>`. The relay-spawn is the only
+/// docker-specific bit; the frame/EOF/bounded-wait protocol lives in
+/// [`crate::attach::driver::drive_once`] (shared with the docker:// backend).
 pub(crate) fn send_input(container: &str, bytes: &[u8]) -> Result<()> {
-    use std::io::Write as _;
-
-    let mut child = exec_relay(container)?;
-    let mut stdin = child.stdin.take().context("docker exec relay stdin")?;
-    crate::attach::driver::send_input(&mut stdin, bytes)
-        .context("write Input frame to the relay")?;
-    stdin.flush().ok();
-    drop(stdin); // EOF the relay once it has read the buffered frame
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    let _ = child.kill();
-    let _ = child.wait();
-    Ok(())
+    crate::attach::driver::drive_once(exec_relay(container)?, bytes)
+        .context("drive the session's pty-relay")
 }
 
 /// `pillbox session attach <id>` for a local Docker session: re-open the

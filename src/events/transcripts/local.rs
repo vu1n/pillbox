@@ -13,8 +13,8 @@
 //! before launch, then poll for the first file that wasn't there. The
 //! freshly-started agent creates exactly one. Once found, the standard
 //! [`Tailer`] drives it in follow mode until the agent exits, at which
-//! point dropping the [`LocalTailerHandle`] (or calling
-//! [`LocalTailerHandle::shutdown`]) flips the stop flag and joins —
+//! point dropping the [`TailerHandle`] (or calling
+//! [`TailerHandle::shutdown`]) flips the stop flag and joins —
 //! a final drain catches the agent's last lines.
 //!
 //! Concurrency: the agent's `$HOME` is the *shared* global auth dir, so
@@ -46,30 +46,57 @@ use crate::events::log::SessionLog;
 /// lines are emitted regardless of which path runs. `shutdown` exists
 /// only to make the stop point explicit at the call site (and force the
 /// drop there rather than at end of scope).
-pub(crate) struct LocalTailerHandle {
+pub(crate) struct TailerHandle {
     stop: Arc<AtomicBool>,
+    /// The streaming variant (docker:// read path) tails a `docker exec …
+    /// tail -F` whose stdout the thread blocks reading; a stop flag alone can't
+    /// unblock that read, so the child is killed to EOF the pipe. `None` for the
+    /// file-based local tailer, which self-stops via its poll timeout.
+    child: Option<std::process::Child>,
     join: Option<JoinHandle<()>>,
 }
 
-impl LocalTailerHandle {
+impl TailerHandle {
+    /// Wrap a tailer thread spawned elsewhere (the docker:// read path, which
+    /// tails the container's transcript over the endpoint into
+    /// [`Tailer::follow_reader`]) so it shares this handle's stop-and-join
+    /// lifecycle. `stop` is the flag the thread observes between reads; `child`
+    /// is the `docker exec` whose stdout the thread reads — killed on stop to
+    /// unblock a read parked waiting for more transcript bytes.
+    pub(crate) fn from_stream(
+        stop: Arc<AtomicBool>,
+        child: std::process::Child,
+        join: JoinHandle<()>,
+    ) -> Self {
+        Self {
+            stop,
+            child: Some(child),
+            join: Some(join),
+        }
+    }
+
     pub(crate) fn shutdown(self) {
         // Drop does the work; this just names the intent + forces it here.
     }
 
-    /// Flip the stop flag and join the tailer thread. Idempotent via
-    /// `join.take()`, so a later `Drop` after `shutdown` is a no-op.
-    /// The thread observes `stop` within one poll interval, does a
-    /// final drain, and exits; a tailer still in discovery (agent
-    /// exited before writing a transcript) returns immediately.
+    /// Flip the stop flag, kill the streaming child (if any) so a parked pipe
+    /// read returns EOF, and join the tailer thread. Idempotent via
+    /// `take()`, so a later `Drop` after `shutdown` is a no-op. The file-based
+    /// tailer observes `stop` within one poll interval, does a final drain, and
+    /// exits; a tailer still in discovery returns immediately.
     fn stop_and_join(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
     }
 }
 
-impl Drop for LocalTailerHandle {
+impl Drop for TailerHandle {
     fn drop(&mut self) {
         self.stop_and_join();
     }
@@ -93,7 +120,7 @@ pub(crate) fn spawn_local_tailer(
     harness: Harness,
     session_id: String,
     include_usage: bool,
-) -> LocalTailerHandle {
+) -> TailerHandle {
     // Run path: snapshot pre-existing transcripts so we tail only the one this
     // run creates, not a prior session's file in the same project dir.
     let preexisting = snapshot_jsonl(&watch_root);
@@ -121,7 +148,7 @@ pub(crate) fn spawn_attach_tailer(
     agent_id: &str,
     guest_cwd: &str,
     session_id: &str,
-) -> Option<LocalTailerHandle> {
+) -> Option<TailerHandle> {
     let harness = Harness::for_agent(agent_id)?;
     let (watch_root, scope_dir) = harness.transcript_roots(home, guest_cwd);
     Some(spawn_tailer(
@@ -145,7 +172,7 @@ fn spawn_tailer(
     session_id: String,
     include_usage: bool,
     exclude: HashSet<PathBuf>,
-) -> LocalTailerHandle {
+) -> TailerHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = Arc::clone(&stop);
 
@@ -165,8 +192,9 @@ fn spawn_tailer(
         }
     });
 
-    LocalTailerHandle {
+    TailerHandle {
         stop,
+        child: None,
         join: Some(join),
     }
 }
@@ -196,7 +224,7 @@ pub(crate) fn spawn_session_observability(
     guest_cwd: &str,
     proxy_active: bool,
     run_started: std::time::SystemTime,
-) -> Option<LocalTailerHandle> {
+) -> Option<TailerHandle> {
     crate::events::emit_local_session_span(session_id, run_started);
     // Tail when there's anywhere for events to go: the durable log (always, on
     // host-side runs) OR an OTLP collector. A harness with no parser produces

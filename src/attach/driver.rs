@@ -32,6 +32,28 @@ pub(crate) fn send_input(w: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
     Frame::Input(bytes.to_vec()).encode(w)
 }
 
+/// One-shot `SendInput` over an already-spawned pty-relay child (a
+/// `docker exec … pillbox pty-relay`, local or endpoint-aware): write one
+/// `Input` frame, then EOF the relay so it forwards the buffered frame and
+/// exits. The transport (which daemon, which endpoint) is the caller's job;
+/// this owns the *protocol*: there's no `DataAck` frame yet, so after EOF we
+/// wait a bounded beat for the pty-host to apply the bytes to the PTY before
+/// tearing the exec down — a timed best-effort, not a delivery confirmation. A
+/// future ack frame turns this into a real round-trip. `pillbox session send`.
+pub(crate) fn drive_once(mut child: std::process::Child, bytes: &[u8]) -> io::Result<()> {
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "relay stdin unavailable"))?;
+    send_input(&mut stdin, bytes)?;
+    stdin.flush().ok();
+    drop(stdin); // EOF the relay once it has read the buffered frame
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(())
+}
+
 /// Stream the agent's output — the `Subscribe` half. Decodes frames and hands
 /// each `Snapshot`/`Data` chunk to `sink`; `sink` returns `false` to stop
 /// reading (e.g. the driver saw enough / the turn went quiescent). Returns

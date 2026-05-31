@@ -31,11 +31,20 @@
 //! current image" hint instead. Keep the deployed runner image current with the
 //! host pillbox whenever the launch protocol changes.
 //!
+//! The **drive + read surface** reaches a detached docker:// session like a
+//! local one: [`send_input`] drives its pty-host over the endpoint (`session
+//! send`), and [`spawn_transcript_stream`] tails the container's transcript out
+//! over the endpoint into the host's durable log so `session subscribe`/`watch`
+//! read it collector-free (the §0 surface; the sandbox-side OTLP tailer is the
+//! with-collector path). docker:// is the one remote whose transcript is
+//! host-reachable, since the container is directly `docker exec`-able.
+//!
 //! Deferred (clearly-marked) follow-ons: host-side **result extraction
 //! for a detached session** (`docker cp` out via `session pull`; foreground
 //! already pulls on exit), **creds read-back** (the `CredsPersisted`-before-
-//! `TornDown` invariant / 2nd-run-401 guard), `session send`/`subscribe` for
-//! remote docker (today local-docker only), and OTEL env forwarding.
+//! `TornDown` invariant / 2nd-run-401 guard), and OTEL env forwarding.
+
+use std::path::Path;
 
 use anyhow::{Context, Result};
 
@@ -56,7 +65,7 @@ const ACTION: &str = "run --remote (docker)";
 /// (not caching) so a hand-edited remote surfaces a pointed error. Shared by
 /// `run`, `reattach`, and `kill_session` so they agree on how a docker:// remote
 /// maps to a daemon — and reject a non-docker URL the same way.
-fn endpoint_for(remote: &Remote) -> Result<DockerEndpoint> {
+pub(crate) fn endpoint_for(remote: &Remote) -> Result<DockerEndpoint> {
     match remote
         .parsed_url()
         .map_err(|e| PillboxError::config(ACTION, format!("remote `{}`: {e}", remote.name)))?
@@ -73,6 +82,11 @@ fn endpoint_for(remote: &Remote) -> Result<DockerEndpoint> {
 /// Where the in-container pty-host listens; the per-attach relay (run via
 /// `docker exec` over the endpoint) connects to the same path.
 const ATTACH_SOCK: &str = "/tmp/pillbox-attach.sock";
+
+/// `$HOME` inside the runner container (it runs as root). The agent writes its
+/// transcript under here (`~/.claude/projects/…`), so the read path derives the
+/// container-side transcript scope from this + the recorded `guest_cwd`.
+const GUEST_HOME: &str = "/root";
 
 /// Force-removes its container on drop, on the *endpoint's* daemon — so a
 /// foreground run's container is reaped on every exit path (normal, early
@@ -241,10 +255,12 @@ impl SandboxBackend for RemoteDockerSandbox {
                 base_snapshot: None,
                 result_snapshot: None,
                 expires_at: opts.ttl_seconds.map(session::expires_at_from_ttl),
-                // A remote session's transcript is sandbox-side (no bind-mount),
-                // so the host can't tail it into the durable log — empty, like
-                // the ssh/e2b backends.
-                guest_cwd: String::new(),
+                // The agent's in-container cwd — keys the transcript scope dir so
+                // the read side (`session subscribe`/`watch`) can locate and tail
+                // it out of the container over the endpoint. Unlike ssh/e2b (whose
+                // transcript is unreachable host-side), a docker:// container is
+                // directly `docker exec`-able, so this is host-readable.
+                guest_cwd: GUEST_WORKSPACE.to_string(),
             };
             session::write(resolved, &session)?;
             crate::events::emit_session_event(
@@ -328,12 +344,12 @@ impl SandboxBackend for RemoteDockerSandbox {
 /// relay over the endpoint and pumping its stdio. Mirrors
 /// `local_docker::attach_via_exec` but endpoint-aware (the exec stream rides
 /// `DOCKER_HOST=ssh://…` back to the host pump unchanged).
-fn attach_via_exec_at(
-    endpoint: &DockerEndpoint,
-    container: &str,
-    detach_enabled: bool,
-) -> Result<Outcome> {
-    let mut child = docker::exec_attach_at(
+/// Spawn a one-shot endpoint-aware `docker exec … pillbox pty-relay` to the
+/// container's pty-host socket — the shared transport for the interactive pump
+/// ([`attach_via_exec_at`]) and the one-shot driver ([`send_input`]). Mirrors
+/// `local_docker::exec_relay`, but on `endpoint`'s daemon.
+fn exec_relay_at(endpoint: &DockerEndpoint, container: &str) -> Result<std::process::Child> {
+    docker::exec_attach_at(
         endpoint,
         container,
         &[
@@ -342,13 +358,99 @@ fn attach_via_exec_at(
             "--sock".into(),
             ATTACH_SOCK.into(),
         ],
-    )?;
+    )
+}
+
+fn attach_via_exec_at(
+    endpoint: &DockerEndpoint,
+    container: &str,
+    detach_enabled: bool,
+) -> Result<Outcome> {
+    let mut child = exec_relay_at(endpoint, container)?;
     let stdout = child.stdout.take().context("docker exec relay stdout")?;
     let stdin = child.stdin.take().context("docker exec relay stdin")?;
     let outcome = pump::attach_terminal(stdout, stdin, detach_enabled)?;
     let _ = child.kill();
     let _ = child.wait();
     Ok(outcome)
+}
+
+/// Push one `Input` frame to a running docker:// session's pty-host over the
+/// endpoint — the `SendInput` half of the drive surface (`pillbox session
+/// send`). Mirrors `local_docker::send_input` but endpoint-aware: the relay
+/// exec rides `DOCKER_HOST=ssh://…` to the remote daemon, then the shared
+/// frame/EOF protocol ([`crate::attach::driver::drive_once`]) drives it.
+pub(crate) fn send_input(endpoint: &DockerEndpoint, container: &str, bytes: &[u8]) -> Result<()> {
+    crate::attach::driver::drive_once(exec_relay_at(endpoint, container)?, bytes)
+        .context("drive the session's pty-relay")
+}
+
+/// Single-quote a string for safe interpolation into a `sh -c` script.
+fn sh_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Stream a detached docker:// session's transcript out of the container into
+/// the host's durable [`SessionLog`] — the *read* half of the drive surface, so
+/// `session subscribe`/`watch` work on a remote session exactly like a local
+/// one, **collector-free** (the §0 surface; the sandbox-side OTLP tailer is the
+/// with-collector path). The container's transcript is unreachable as a file,
+/// but a docker:// container is directly `docker exec`-able, so we tail it over
+/// the endpoint and feed the bytes through the same [`Tailer`] the bind-mounted
+/// local path uses.
+///
+/// The transcript uuid isn't known ahead of time, so the in-container shell
+/// waits for the newest `*.jsonl` under the harness scope dir, then `tail -F`s
+/// it; the host thread parses that stream into `log`. Returns `None` for an
+/// agent with no transcript parser (the caller then just reads the existing
+/// log). Held by a [`TailerHandle`] for the stream's lifetime.
+pub(crate) fn spawn_transcript_stream(
+    endpoint: &DockerEndpoint,
+    container: &str,
+    agent_id: &str,
+    guest_cwd: &str,
+    session_id: &str,
+    log: crate::events::log::SessionLog,
+) -> Option<crate::events::transcripts::TailerHandle> {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    use crate::events::transcripts::{Harness, Tailer};
+
+    let harness = Harness::for_agent(agent_id)?;
+    // Container-side transcript root: same path math as the host tailer, rooted
+    // at the container's `$HOME`. Claude narrows to this run's project dir;
+    // Codex has none, so we watch the whole sessions tree.
+    let (watch_root, scope_dir) = harness.transcript_roots(Path::new(GUEST_HOME), guest_cwd);
+    let root = scope_dir.unwrap_or(watch_root);
+    let script = format!(
+        "root={root}; while :; do f=$(find \"$root\" -name '*.jsonl' -type f -printf '%T@ %p\\n' \
+         2>/dev/null | sort -rn | head -n1 | cut -d' ' -f2-); [ -n \"$f\" ] && break; \
+         sleep 0.3; done; exec tail -n +1 -F \"$f\"",
+        root = sh_single_quote(&root.to_string_lossy()),
+    );
+
+    let mut child =
+        docker::exec_attach_at(endpoint, container, &["sh".into(), "-c".into(), script])
+            .map_err(|e| eprintln!("pillbox: warning: couldn't tail the remote transcript: {e:#}"))
+            .ok()?;
+    let stdout = child.stdout.take()?;
+
+    // The handle owns the child so stopping the stream can kill the exec (which
+    // EOFs the pipe and unblocks the thread's parked read); the thread only
+    // reads stdout + observes `stop` between reads.
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = Arc::clone(&stop);
+    let sid = session_id.to_string();
+    let join = std::thread::spawn(move || {
+        let mut tailer = Tailer::for_stream(sid, harness, true, Some(log));
+        if let Err(e) = tailer.follow_reader(stdout, &stop_thread) {
+            eprintln!("pillbox: warning: remote transcript stream stopped: {e:#}");
+        }
+    });
+    Some(crate::events::transcripts::TailerHandle::from_stream(
+        stop, child, join,
+    ))
 }
 
 /// `pillbox session attach <id>` for a docker:// session: re-open the

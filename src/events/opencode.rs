@@ -31,9 +31,10 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use crate::contract::{
-    AttentionReason, AttentionRequired, MessageDelta, MessageEnd, MessageStart, Payload, Role,
-    Thinking, ToolCall, ToolStatus,
+    AttentionReason, AttentionRequired, Event, MessageDelta, MessageEnd, MessageStart, Payload,
+    Role, Thinking, ToolCall, ToolStatus,
 };
+use crate::events::log::SessionLog;
 
 /// Stateful opencode-event → §0-payload mapper. One per session stream.
 #[derive(Default)]
@@ -194,6 +195,80 @@ fn error_message(props: &Value) -> String {
     }
 }
 
+/// Drain an opencode `/event` SSE stream into the durable [`SessionLog`],
+/// mapping each event through [`EventMapper`]. The transport-agnostic core: the
+/// caller hands a reader (a live HTTP body, or a `Cursor` in tests) and a stop
+/// flag; we parse SSE frames (`data:` lines terminated by a blank line),
+/// map each JSON envelope, and append the resulting §0 events.
+///
+/// Blocks reading the stream until it closes or `stop` is set (observed between
+/// frames — a live caller closes the connection to unblock). Non-JSON `data:`
+/// payloads and unmapped event types are skipped, not errored, so a stray frame
+/// can't wedge the stream. Returns the number of §0 events appended.
+pub(crate) fn drain_sse<R: std::io::Read>(
+    reader: R,
+    session_id: &str,
+    log: &mut SessionLog,
+    stop: &std::sync::atomic::AtomicBool,
+) -> anyhow::Result<usize> {
+    use std::io::BufRead as _;
+    use std::sync::atomic::Ordering;
+
+    let mut mapper = EventMapper::new();
+    let mut data = String::new();
+    let mut total = 0;
+    let mut lines = std::io::BufReader::new(reader).lines();
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let Some(line) = lines.next() else { break };
+        let line = line?;
+        if let Some(rest) = line.strip_prefix("data:") {
+            // SSE allows one optional space after the colon; multiple `data:`
+            // lines in a frame join with newlines.
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+        } else if line.is_empty() {
+            // Blank line ends the frame.
+            total += flush_frame(&mut mapper, &mut data, session_id, log)?;
+        }
+        // `event:` / `id:` / `retry:` / `:comment` lines carry no payload here.
+    }
+    // A stream that closed mid-frame (no trailing blank line) still flushes.
+    total += flush_frame(&mut mapper, &mut data, session_id, log)?;
+    Ok(total)
+}
+
+/// Map one accumulated SSE `data` payload (cleared afterward) into §0 events and
+/// append them. A non-JSON or unmapped frame appends nothing.
+fn flush_frame(
+    mapper: &mut EventMapper,
+    data: &mut String,
+    session_id: &str,
+    log: &mut SessionLog,
+) -> anyhow::Result<usize> {
+    if data.is_empty() {
+        return Ok(0);
+    }
+    let parsed: Result<Value, _> = serde_json::from_str(data);
+    data.clear();
+    let Ok(value) = parsed else { return Ok(0) };
+    let events: Vec<Event> = mapper
+        .on_event(&value)
+        .into_iter()
+        .map(|p| Event::session(session_id, p))
+        .collect();
+    if events.is_empty() {
+        return Ok(0);
+    }
+    let n = events.len();
+    log.append(&events)?;
+    Ok(n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,5 +404,57 @@ mod tests {
                 "{ty} should map to nothing"
             );
         }
+    }
+
+    /// End-to-end transport: a raw `/event` SSE byte stream (a text turn that
+    /// goes idle) drains into the durable log as the mapped §0 events — the same
+    /// sink `session watch`/`subscribe` read, so opencode lights up there with
+    /// no transcript file.
+    #[test]
+    fn drain_sse_feeds_the_durable_log() {
+        use std::io::Cursor;
+        use std::sync::atomic::AtomicBool;
+
+        crate::test_util::with_isolated_home("opencode-drain-sse", || {
+            let pb = crate::pillbox::global();
+            let mut log = SessionLog::open(&pb, "ses-oc").expect("open log");
+
+            // Two `data:` frames are one server.connected (ignored) then a full
+            // text turn + idle; blank lines are SSE frame boundaries.
+            let stream = "\
+data: {\"id\":\"e0\",\"type\":\"server.connected\",\"properties\":{}}\n\
+\n\
+data: {\"id\":\"e1\",\"type\":\"session.next.text.started\",\"properties\":{\"sessionID\":\"ses_oc\"}}\n\
+\n\
+data: {\"id\":\"e2\",\"type\":\"session.next.text.delta\",\"properties\":{\"sessionID\":\"ses_oc\",\"delta\":\"hi \"}}\n\
+\n\
+data: {\"id\":\"e3\",\"type\":\"session.next.text.delta\",\"properties\":{\"sessionID\":\"ses_oc\",\"delta\":\"there\"}}\n\
+\n\
+data: {\"id\":\"e4\",\"type\":\"session.next.text.ended\",\"properties\":{\"sessionID\":\"ses_oc\",\"text\":\"hi there\"}}\n\
+\n\
+data: {\"id\":\"e5\",\"type\":\"session.idle\",\"properties\":{\"sessionID\":\"ses_oc\"}}\n\
+\n";
+
+            let stop = AtomicBool::new(false);
+            let n = drain_sse(Cursor::new(stream), "ses-oc", &mut log, &stop).expect("drain");
+            assert_eq!(n, 5, "start + 2 deltas + end + attention");
+
+            let events = SessionLog::open(&pb, "ses-oc")
+                .unwrap()
+                .read_from(0)
+                .unwrap();
+            use crate::contract::Payload as P;
+            assert!(matches!(events[0].payload, P::MessageStart(_)));
+            assert!(matches!(&events[1].payload, P::MessageDelta(d) if d.text == "hi "));
+            assert!(matches!(&events[2].payload, P::MessageDelta(d) if d.text == "there"));
+            assert!(matches!(events[3].payload, P::MessageEnd(_)));
+            assert!(matches!(&events[4].payload,
+                P::AttentionRequired(a) if a.reason == AttentionReason::NeedsInput));
+            // Log assigned monotonic seq across the appended batch(es).
+            assert_eq!(
+                events.iter().map(|e| e.seq).collect::<Vec<_>>(),
+                vec![1, 2, 3, 4, 5]
+            );
+        });
     }
 }

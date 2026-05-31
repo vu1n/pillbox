@@ -19,6 +19,7 @@
 //! lifecycle is implemented per-backend as free functions
 //! (`reattach`/`kill_session` in `sandbox/*`), not a trait.
 
+pub(crate) mod driver;
 pub(crate) mod frame;
 pub(crate) mod host;
 pub(crate) mod pump;

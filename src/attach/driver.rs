@@ -21,8 +21,23 @@
 #![allow(dead_code)]
 
 use std::io::{self, Read, Write};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use super::frame::Frame;
+
+/// How long to wait for the relay to connect to the pty-host (signalled by the
+/// host's on-connect `Snapshot` frame) before giving up. Generous because the
+/// relay rides the attach transport — for `docker://` that's `docker exec` over
+/// an SSH tunnel (`docker system dial-stdio`), whose per-call cold-start was
+/// measured at ~13s against a real VPS. 30s leaves headroom without hanging a
+/// dead session forever. (An SSH `ControlMaster` on the endpoint would collapse
+/// this to a local exec's latency — a separate transport optimization.)
+const DRIVE_CONNECT_DEADLINE: Duration = Duration::from_secs(30);
+/// After the relay is connected, how long to let the buffered `Input` traverse
+/// relay → socket → pty-host → PTY before tearing the exec down. All in-sandbox
+/// once connected, so this is short.
+const DRIVE_SETTLE: Duration = Duration::from_millis(300);
 
 /// Push bytes to the agent's stdin — the `SendInput` half. Encodes one
 /// `Frame::Input`; the pty-host writes it straight to the PTY, exactly as if a
@@ -33,24 +48,55 @@ pub(crate) fn send_input(w: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
 }
 
 /// One-shot `SendInput` over an already-spawned pty-relay child (a
-/// `docker exec … pillbox pty-relay`, local or endpoint-aware): write one
-/// `Input` frame, then EOF the relay so it forwards the buffered frame and
-/// exits. The transport (which daemon, which endpoint) is the caller's job;
-/// this owns the *protocol*: there's no `DataAck` frame yet, so after EOF we
-/// wait a bounded beat for the pty-host to apply the bytes to the PTY before
-/// tearing the exec down — a timed best-effort, not a delivery confirmation. A
-/// future ack frame turns this into a real round-trip. `pillbox session send`.
+/// `docker exec … pillbox pty-relay`, local or endpoint-aware): buffer one
+/// `Input` frame, wait until the relay has actually connected to the pty-host,
+/// let the frame land, then tear the exec down. The transport (which daemon,
+/// which endpoint) is the caller's job; this owns the *protocol*.
+///
+/// The relay forwards our buffered frame only once its `connect_retry` to the
+/// pty-host socket succeeds, so we can't tear down on a blind timer — over an
+/// SSH-tunnelled `docker exec` (docker://) the relay can take well over a second
+/// just to start and connect, and killing it first drops the input on the
+/// floor. Instead we gate on the pty-host's **on-connect `Snapshot` frame**:
+/// once we've read it, the relay is connected and its stdin→socket pump is live,
+/// so the buffered `Input` is (or is about to be) forwarded — a short settle
+/// then covers the in-sandbox relay→socket→PTY hop. There's no `DataAck` yet, so
+/// this is delivery-confirmed-to-connect, not confirmed-to-PTY; a future ack
+/// frame would close that gap. `pillbox session send`.
 pub(crate) fn drive_once(mut child: std::process::Child, bytes: &[u8]) -> io::Result<()> {
     let mut stdin = child
         .stdin
         .take()
         .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "relay stdin unavailable"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "relay stdout unavailable"))?;
+
+    // Buffer the frame; the relay forwards it once connected. Keep stdin open so
+    // a slow-to-connect relay isn't EOF'd (and killed) before it forwards.
     send_input(&mut stdin, bytes)?;
     stdin.flush().ok();
-    drop(stdin); // EOF the relay once it has read the buffered frame
-    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    // Wait for the host's on-connect Snapshot via a reader thread — std's
+    // blocking read has no timeout, so a dead session would otherwise hang. The
+    // thread keeps draining afterward so the relay's socket→stdout side never
+    // blocks on a full pipe (claude redraws a screenful on input) during the
+    // settle; it ends when we kill the child below (stdout closes → read EOF).
+    let (tx, rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut r = stdout;
+        let _ = tx.send(matches!(Frame::decode(&mut r), Ok(Some(_))));
+        let mut buf = [0u8; 8192];
+        while r.read(&mut buf).map(|n| n > 0).unwrap_or(false) {}
+    });
+    let _connected = rx.recv_timeout(DRIVE_CONNECT_DEADLINE).unwrap_or(false);
+
+    std::thread::sleep(DRIVE_SETTLE);
+    drop(stdin);
     let _ = child.kill();
     let _ = child.wait();
+    let _ = reader.join();
     Ok(())
 }
 

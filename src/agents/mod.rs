@@ -50,6 +50,16 @@ pub struct AgentSpec {
     /// `config.toml`) that the rendering lives in the `mcp` module
     /// rather than in shared run code.
     pub(crate) mcp_inject: Option<McpInjectFn>,
+    /// Args injected before the user's `-- args` on every sandboxed run. The
+    /// sandbox is the isolation boundary, so we default to a less-interactive
+    /// permission posture (e.g. claude `--permission-mode auto`) — the user's
+    /// own `-- args` come after and override (claude takes the last value).
+    pub(crate) sandbox_args: &'static [&'static str],
+    /// Per-run prep on the (bind-mounted) agent home before launch, given the
+    /// home and the guest workspace path. Used to pre-accept claude's workspace
+    /// trust dialog so an interactive run doesn't stall on it. `None` = nothing
+    /// to prepare.
+    pub(crate) prepare_workspace: Option<fn(&Path, &str) -> Result<()>>,
 }
 
 pub const CLAUDE: AgentSpec = AgentSpec {
@@ -61,6 +71,13 @@ pub const CLAUDE: AgentSpec = AgentSpec {
     post_login_finalize: Some(finalize_claude_onboarding),
     vault_capable: true,
     mcp_inject: Some(mcp::claude_inject),
+    // The sandbox is the boundary: default to auto-accepting actions so a
+    // driven/interactive session isn't stalled on per-tool prompts. (Full
+    // `bypassPermissions`/`--dangerously-skip-permissions` is refused by claude
+    // as root, which the runner runs as; `auto` is the strongest mode that
+    // works without dropping to a non-root user — a future image change.)
+    sandbox_args: &["--permission-mode", "auto"],
+    prepare_workspace: Some(pretrust_claude_workspace),
 };
 
 pub const CODEX: AgentSpec = AgentSpec {
@@ -72,6 +89,8 @@ pub const CODEX: AgentSpec = AgentSpec {
     post_login_finalize: None,
     vault_capable: true,
     mcp_inject: Some(mcp::codex_inject),
+    sandbox_args: &[],
+    prepare_workspace: None,
 };
 
 pub const OPENCODE: AgentSpec = AgentSpec {
@@ -83,6 +102,8 @@ pub const OPENCODE: AgentSpec = AgentSpec {
     post_login_finalize: None,
     vault_capable: false,
     mcp_inject: Some(mcp::opencode_inject),
+    sandbox_args: &[],
+    prepare_workspace: None,
 };
 
 pub const PI: AgentSpec = AgentSpec {
@@ -107,6 +128,8 @@ pub const PI: AgentSpec = AgentSpec {
     // No `--mcp` config injection for pi yet; the sandbox backend hard-errors
     // if `--mcp` is passed with `--agent pi`.
     mcp_inject: None,
+    sandbox_args: &[],
+    prepare_workspace: None,
 };
 
 pub const ALL: &[&AgentSpec] = &[&CLAUDE, &CODEX, &OPENCODE, &PI];
@@ -138,6 +161,46 @@ fn finalize_claude_onboarding(home: &Path) -> Result<()> {
         .ok_or_else(|| anyhow!("expected top-level JSON object in {}", path.display()))?;
     obj.insert(
         "hasCompletedOnboarding".to_string(),
+        serde_json::Value::Bool(true),
+    );
+    let serialized = serde_json::to_string_pretty(&value)
+        .with_context(|| format!("serialize {}", path.display()))?;
+    fs::write(&path, serialized).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+/// Pre-accept claude's workspace trust dialog for `guest_workspace` by seeding
+/// its `~/.claude.json` project entry. pillbox owns the mounted workspace (the
+/// user pointed `run` at it), so an interactive session shouldn't stall on the
+/// trust gate — which `-p` auto-skips but a PTY-attached interactive run shows,
+/// and `--dangerously-skip-permissions` can't bypass as root. Merges into any
+/// existing entry; creates the file + `projects` map as needed.
+fn pretrust_claude_workspace(home: &Path, guest_workspace: &str) -> Result<()> {
+    let path = home.join(".claude.json");
+    let mut value: serde_json::Value = if path.exists() {
+        let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))?
+    } else {
+        serde_json::json!({})
+    };
+    let projects = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("expected top-level JSON object in {}", path.display()))?
+        .entry("projects")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("`projects` is not an object in {}", path.display()))?;
+    let entry = projects
+        .entry(guest_workspace.to_string())
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("project entry is not an object in {}", path.display()))?;
+    entry.insert(
+        "hasTrustDialogAccepted".into(),
+        serde_json::Value::Bool(true),
+    );
+    entry.insert(
+        "hasCompletedProjectOnboarding".into(),
         serde_json::Value::Bool(true),
     );
     let serialized = serde_json::to_string_pretty(&value)
@@ -719,5 +782,50 @@ mod tests {
                 let _ = std::env::set_current_dir(c);
             }
         });
+    }
+
+    #[test]
+    fn pretrust_seeds_workspace_and_preserves_existing_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        // Pre-existing config: an unrelated global key + a sibling project.
+        // Pre-trust must merge, not clobber.
+        std::fs::write(
+            home.join(".claude.json"),
+            r#"{"someGlobal":1,"projects":{"/workspace/other":{"hasTrustDialogAccepted":true,"foo":"bar"}}}"#,
+        )
+        .unwrap();
+
+        pretrust_claude_workspace(home, "/workspace/app").unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(home.join(".claude.json")).unwrap())
+                .unwrap();
+        // The mounted workspace is now trusted + onboarded.
+        assert_eq!(
+            v["projects"]["/workspace/app"]["hasTrustDialogAccepted"],
+            true
+        );
+        assert_eq!(
+            v["projects"]["/workspace/app"]["hasCompletedProjectOnboarding"],
+            true
+        );
+        // Pre-existing global key + sibling project survive untouched.
+        assert_eq!(v["someGlobal"], 1);
+        assert_eq!(v["projects"]["/workspace/other"]["foo"], "bar");
+    }
+
+    #[test]
+    fn pretrust_creates_claude_json_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        pretrust_claude_workspace(dir.path(), "/workspace/app").unwrap();
+        let v: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(".claude.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            v["projects"]["/workspace/app"]["hasTrustDialogAccepted"],
+            true
+        );
     }
 }

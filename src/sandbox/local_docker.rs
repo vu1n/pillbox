@@ -215,7 +215,20 @@ impl SandboxBackend for LocalDocker {
         if let Some(mcp) = &mcp {
             args.extend(mcp.extra_argv.iter().cloned());
         }
+        // Sandbox defaults (e.g. claude `--permission-mode auto`) before the
+        // user's `-- args`, so the user can still override.
+        args.extend(spec.sandbox_args.iter().map(|s| s.to_string()));
         args.extend(opts.args);
+
+        // Pre-accept the agent's workspace trust dialog (claude) on the
+        // bind-mounted home before the container starts, so an interactive run
+        // doesn't stall on the gate. Best-effort + loud: a prep failure
+        // shouldn't abort the run (the dialog just reappears in-session).
+        if let Some(prepare) = spec.prepare_workspace {
+            if let Err(e) = prepare(&home, &guest_cwd) {
+                eprintln!("pillbox: warning: workspace pre-trust failed: {e:#}");
+            }
+        }
 
         let run_started = SystemTime::now();
         let container = docker::run_detached(&args)?;

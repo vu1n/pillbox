@@ -566,14 +566,36 @@ Docker untouched until step 8. Slices (each its own commit, default build green)
     `start_enter`, netspike's shape), not the parent — `start_enter` is in the
     child. On macOS/HVF libkrun's default **TSI does not carry egress** (the L3
     `ConnectionRefused`), so smoltcp+virtio-net is the *only* egress path, not an
-    optimization. **New beyond the step-5 spike:** netspike terminated + gated +
-    MITM'd but never **NAT-forwarded** to real upstreams (it synthesized a 200);
-    permissive egress needs a userspace NAT-forward + DNS. Sub-slices:
-      - **L5a egress transport + NAT-forward (permissive)** — virtio-net in the
-        child → smoltcp → forward guest TCP to real hosts + DNS. Unblocks the
-        agent's network (the L3 `ConnectionRefused`).
-      - **L5b vault-v2 gate** — DNS-fence + DNS-pin (`PinTable`, per-sandbox) +
-        MITM + the in-repo `VaultProvider` swap, on top of L5a.
+    optimization.
+    **Direction decision (own the MITM; don't pin on hudsucker).** The vault is
+    built on **smoltcp + rustls** in-repo, *not* by reusing the existing hudsucker
+    proxy (a proxy-over-vsock reuse was considered + rejected). Reasons: (1)
+    dep-health — hudsucker is a single-maintainer crate; smoltcp + rustls are
+    well-supported; (2) own-the-substrate (the pivot's thesis); (3) this is the
+    *go-forward* vault — hudsucker **retires with the deprecated docker/ssh/e2b
+    backends**, so there's no two-impls-forever tax, just a transition. The
+    netspike spike already proved the hard half (rustls `ServerConnection` off the
+    smoltcp poll loop + SNI parse + stub→real swap); what's reimplemented is what
+    hudsucker did for us: cert forging (reuse the pillbox CA + `rcgen`), the HTTP
+    swap, and the forward leg. **h2 risk + sidestep:** hand-rolling HTTP/2 rewrite
+    is nasty (hyper gave it free) — so the MITM advertises **only `http/1.1` in
+    its ALPN**, the guest negotiates down to h1 with *us* (we only parse h1 to
+    swap), and we speak h1/h2 to the real upstream independently.
+    **Two scopes — keep them separate:**
+      - **Vault forward (bounded)** — terminate + swap + forward to the
+        *allowlisted provider hosts* only. Tractable: open a host socket to the
+        pinned provider IP and relay. This is L5b's core.
+      - **General egress (arbitrary NAT)** — git/npm/MCP to *any* host. The hard
+        userspace-NAT piece netspike never did; **deferrable**. The locked profile
+        denies it (no route off the allowlist); standard/permissive's arbitrary
+        NAT (or gvproxy/passt, or TSI if it turns out to work) is future work.
+    Sub-slices:
+      - **L5a egress transport** — virtio-net in the child → smoltcp Device + poll
+        loop (graduate netspike). The substrate L5b's MITM sits on; brings the
+        guest's interface up (no arbitrary NAT yet).
+      - **L5b vault (own MITM)** — DNS-fence + DNS-pin (`PinTable`, per-sandbox) +
+        rustls terminate (CA-minted cert, ALPN-pinned h1) + the in-repo
+        `VaultProvider` swap + forward to the bounded provider allowlist.
       - **L5c §0 producer** — guest emits `Event` NDJSON over a 2nd vsock port →
         parent drains to `SessionLog`.
     **Env fork — secrets go to the vault, not the VM env** (lands with L5b; this is

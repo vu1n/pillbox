@@ -112,6 +112,12 @@ crossterm = "0.27"
 # this with `cargo install pillbox --features otel-grpc`.
 otel-grpc = ["opentelemetry-otlp/grpc-tonic"]
 
+# Experimental local microVM backend (libkrun). OFF by default — the default
+# build, CI, and every dev without libkrun installed are unaffected. Enabling
+# needs libkrun + libkrunfw present, and the binary codesigned with the
+# hypervisor entitlement (macOS/HVF). Select at runtime: `PILLBOX_BACKEND=libkrun`.
+libkrun = []
+
 [profile.release]
 strip = true
 lto = "thin"

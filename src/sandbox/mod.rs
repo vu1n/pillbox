@@ -18,6 +18,8 @@
 //!   hand-edited scheme falls through to SSH.
 
 pub(crate) mod container;
+#[cfg(feature = "libkrun")]
+pub(crate) mod libkrun;
 pub(crate) mod local_docker;
 pub(crate) mod opencode;
 pub(crate) mod remote_docker;
@@ -50,6 +52,12 @@ pub(crate) trait SandboxBackend {
 /// not connect".
 pub(crate) fn select_backend(remote: Option<Remote>) -> Box<dyn SandboxBackend> {
     let Some(r) = remote else {
+        // Local run. The experimental libkrun microVM backend opts in via env
+        // (feature-gated); everyone else gets the default Docker backend.
+        #[cfg(feature = "libkrun")]
+        if std::env::var_os("PILLBOX_BACKEND").is_some_and(|v| v == "libkrun") {
+            return Box::new(libkrun::LibkrunBackend);
+        }
         return Box::new(local_docker::LocalDocker);
     };
     // Unknown / malformed URL → fall through to SSH so the backend's own

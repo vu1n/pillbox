@@ -347,6 +347,26 @@ frame transport + userspace TCP termination + MITM + swap + dest-verify — is
 proven end to end. Profiles (`locked`/`standard`/`permissive`) are allowlist
 contents over this same gate.
 
+**In-repo-landing checklist (flagged by a 2026-06-01 quality review; deferred
+off the throwaway spike, mandatory for the port):**
+- **Split `drive_mitm` into seams.** The spike packs TLS-pump (smoltcp↔rustls),
+  the SNI gate, the credential swap, and dest-verify into one ~90-line function.
+  The port wants three: **(A)** a transport-only TLS pump, **(B)** the policy
+  gate (SNI → allow/deny + the verified host), **(C)** request-transform (swap +
+  verify + response) where `VaultProvider` injects. Gate runs before the
+  plaintext drain so only ALLOW paths pay it.
+- **Model the connection as a `MitmPhase` enum**, not the spike's
+  `gated`/`handled` bool pair — adding a phase (drain, await-vault) shouldn't mean
+  another negated-conjunction check.
+- **Non-blocking upstream verify.** The spike's `verify_upstream` does a blocking
+  TLS handshake *inside the poll loop*, stalling every other connection. The port
+  must verify off-loop (cache verified anchors / async) so the listener pool's
+  concurrency is real.
+- **Event-driven wakeup**, not the spike's fixed 2 ms poll-loop sleep (drive off
+  the rx-queue / smoltcp `poll_at`).
+- The **destination-verify already checks the gated host** (`Mitm.host`), not a
+  constant — keep that property when generalizing past a one-host allowlist.
+
 ## Build order (proof-first)
 
 1. ✅ **Boot proof** — done. FFI = hand-written; rootfs = OCI/Alpine dir;

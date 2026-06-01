@@ -460,6 +460,27 @@ the guest's `pillbox-init ws` branch:
   docker `tar-cp`/bind-mount materialization, not the store.
 - overlayfs CoW for Linux hosts (`clonefile` is APFS/macOS); the fork-N fan-out.
 
+**The fork primitive moves layers by placement; the snapshot layer doesn't.**
+The workspace *contract* is placement-independent — `materialize base → isolated
+run → capture result`. Only the *fork/materialize mechanism* swaps. **rustic is
+the through-line** (the one snapshot layer everywhere; R2 is just its cloud
+backend, S3-compatible, and rustic already targets S3-shaped backends). CoW is a
+**local-only** optimization of the fork step; on a managed/Cloudflare tier that
+step is served by **hydrating from the rustic/R2 snapshot** instead — *fork-from-
+store* (see `pillbox-workspace-fork-substrate`). Snapshotting itself is rustic's
+job in both; `clonefile` is an instant *fork*, not a managed snapshot (no
+catalog/identity/history) — you `rustic push` the clone to get a milestone.
+
+| | Sandbox | Fork primitive | Durable store |
+|---|---|---|---|
+| **Local (libkrun)** | our microVM (CoW + virtio-fs + our smoltcp vault) | `clonefile` FS-CoW (~370µs, ephemeral) | rustic → local disk |
+| **Managed (Cloudflare)** | their Sandbox SDK (their R2-fs + Outbound egress) | store-hydrate from an R2 snapshot | rustic → R2 |
+
+Caveat: the managed tier rents their sandbox + egress, so the step-5 vault and
+the CoW fork are **local differentiators** you partly give up there — the local
+libkrun tier is where pillbox owns the substrate; Cloudflare is convenience
+placement behind the same `SandboxBackend` trait + workspace/snapshot contract.
+
 ## Build order (proof-first)
 
 1. ✅ **Boot proof** — done. FFI = hand-written; rootfs = OCI/Alpine dir;

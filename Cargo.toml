@@ -104,6 +104,11 @@ portable-pty = "0.8"
 # uses it for raw mode + terminal size. Never runs in the sandbox.
 crossterm = "0.27"
 
+# Userspace TCP/IP stack for the libkrun backend's egress termination point
+# (virtio-net in the VMM child). Optional — pulled in only by the `libkrun`
+# feature; the default build never compiles it.
+smoltcp = { version = "0.12", optional = true, default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp"] }
+
 [features]
 # Opt-in OTLP/gRPC transport for the OTel logs sink. Adds tonic +
 # prost to the binary; the sandbox runtime image build leaves it off
@@ -116,7 +121,8 @@ otel-grpc = ["opentelemetry-otlp/grpc-tonic"]
 # build, CI, and every dev without libkrun installed are unaffected. Enabling
 # needs libkrun + libkrunfw present, and the binary codesigned with the
 # hypervisor entitlement (macOS/HVF). Select at runtime: `PILLBOX_BACKEND=libkrun`.
-libkrun = []
+# Pulls smoltcp for the in-VMM-child userspace egress stack (virtio-net).
+libkrun = ["dep:smoltcp"]
 
 [profile.release]
 strip = true

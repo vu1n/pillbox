@@ -300,10 +300,11 @@ filesystem sibling, kept separate.
 An untrusted repo **cannot widen** its own profile (brood-box's non-negotiable
 rule) — the profile is set by the invoker, not the workspace.
 
-### Step-5 spike (proven) ✅ — the substrate; vault layer rides on top
+### Step-5 spike (proven) ✅ — egress substrate + vault-v2 mechanics
 
-The egress termination point exists on HVF. Proof binary `netspike` + the guest's
-`pillbox-init net` branch (proof crate at `~/code/libkrun-boot`):
+The egress termination point AND the vault-v2 gates exist on HVF, end to end.
+Proof binary `netspike` + the guest's `pillbox-init net` branch (proof crate at
+`~/code/libkrun-boot`):
 
 - **Phase 1 — frame transport (the make-or-break unknown):** `krun_add_net_unixstream(ctx,
   NULL, fd, mac, features=0, flags=0)` with `fd` one end of a `socketpair`.
@@ -317,21 +318,34 @@ The egress termination point exists on HVF. Proof binary `netspike` + the guest'
   ones back (passt-framed). It owns the gateway IP `10.0.2.2/24` + a gateway MAC,
   answers ARP, and **terminates the guest's TCP** — a real in-guest
   `TcpStream::connect` completes against the userspace stack.
-- **Phase 3 — the three-tier gate:** the stack reads the TLS **ClientHello SNI**
-  (the routing key) off the terminated connection and decides — **ALLOW** an
-  allowlisted host (`api.anthropic.com` → graceful close; a real allow splices to
-  the verified upstream), **RST** a denied host (`evil.example.com` → `abort()`),
-  and **default-deny by-IP** (a connect to an IP the stack doesn't own,
-  `10.0.2.99`, gets no SYN-ACK and the guest's connect fails). A pool of listeners
-  keeps a free acceptor for sequential connections (a handled one is in `TIME_WAIT`).
+- **Phase 3 — the egress gate + MITM:** the stack drives a
+  `rustls::ServerConnection` off the smoltcp poll loop
+  (`read_tls`/`process_new_packets`/`write_tls`) and gates on rustls's own
+  **SNI** — **ALLOW** an allowlisted host (`api.anthropic.com`), **RST** a denied
+  host (`evil.example.com` → `abort()`), **default-deny by-IP** (a connect to an
+  IP the stack doesn't own, `10.0.2.99`, gets no SYN-ACK → the guest's connect
+  fails). For an allowed host it **MITM-terminates the guest's real TLS** — the
+  guest's busybox `wget`+`ssl_client` does a **CA-verified** handshake (trusting
+  our MITM CA written to `/etc/spike-ca.pem`, `SSL_CERT_FILE`), and the stack
+  decrypts `GET /v1/ping`, **swaps the `x-api-key` stub→real** (the real never
+  reaches the guest — where the in-repo `VaultProvider` plugs in), and
+  **destination-verifies** the upstream (its own webpki-checked TLS to the real
+  `api.anthropic.com` chains to a public root) before authorizing release.
+- **Self-replenishing listener pool:** holds "≥ `POOL_MIN_FREE` sockets in
+  LISTEN, capped at `POOL_MAX`" — tops up when a SYN takes a listener, recycles
+  fully-closed ones. Scales to the many concurrent egress connections a real
+  agent opens, instead of a fixed count + `TIME_WAIT` luck.
 
-**Deferred to the next iteration (explicit):** full **TLS-MITM termination** + the
-existing `VaultProvider` stub→real swap, and the **destination-verified** upstream
-connect. Those need the async hyper stack bridged onto smoltcp sockets; the
-providers are already proven in-repo and hyper-level (transport-agnostic), so the
-spike stops at *"we have the SNI and can gate."* The substrate they ride — frame
-transport + userspace TCP termination + the SNI routing key — is proven. Profiles
-(`locked`/`standard`/`permissive`) are allowlist contents over this same gate.
+**Crypto:** `ring`-backed `rustls` + pre-generated test PKI (`certs/`, loaded via
+`rustls-pemfile`) — no cmake/aws-lc/C toolchain, no rcgen API churn.
+
+**Still in-repo work (not a substrate unknown):** re-host the *exact* in-repo
+`VaultProvider` trait + hudsucker request/response handlers here (hyper-level,
+already proven) and **splice** the swapped request to the verified upstream (the
+spike synthesizes a `200` instead of forwarding). The substrate they ride —
+frame transport + userspace TCP termination + MITM + swap + dest-verify — is
+proven end to end. Profiles (`locked`/`standard`/`permissive`) are allowlist
+contents over this same gate.
 
 ## Build order (proof-first)
 
@@ -345,10 +359,12 @@ transport + userspace TCP termination + the SNI routing key — is proven. Profi
 4. ✅ **§0 producer** — done. `contract::Event` NDJSON streams over a second
    concurrent vsock port → host seq-authority → durable `log.jsonl` → replay
    verified. Real contract types vendored both ends. Recipe above.
-5. **Egress + vault v2** — substrate ✅ spiked (virtio-net→socketpair, smoltcp TCP
-   termination, SNI gate: ALLOW/RST/default-deny-by-IP — see [§ Step-5 spike](#step-5-spike-proven----the-substrate-vault-layer-rides-on-top)).
-   Next: TLS-MITM termination + re-host the existing `VaultProvider` swap on the
-   stack + destination-verified upstream + the profile matrix.
+5. **Egress + vault v2** — ✅ spiked end to end (virtio-net→socketpair, smoltcp TCP
+   termination, SNI gate ALLOW/RST/default-deny-by-IP, **MITM-terminate + credential
+   swap + destination-verified upstream** with the guest doing CA-verified TLS — see
+   [§ Step-5 spike](#step-5-spike-proven----egress-substrate--vault-v2-mechanics)).
+   In-repo landing: re-host the exact `VaultProvider`/hudsucker handlers + splice to
+   the verified upstream (vs the spike's synthesized 200) + the profile matrix.
 6. **Workspace** — COW snapshot + non-negotiable secret-file exclusion.
 7. **opencode** — repoint the bridge transport to the control channel, and pay
    down the structural debt a 2026-06-01 review flagged (deferred then because

@@ -270,7 +270,10 @@ impl SandboxBackend for LibkrunBackend {
                 host_sock: attach_sock.to_string_lossy().into_owned(),
             }),
             egress: Some(EgressSpec {
-                allowlist: crate::vault::known_secrets::known_hosts()
+                // The vault providers' full intercept set (API + OAuth/platform
+                // hosts) — so the agent can reach its provider *and* refresh a
+                // token. api-only (known_secrets) fenced claude's OAuth refresh.
+                allowlist: crate::vault::providers::intercepted_hosts()
                     .into_iter()
                     .map(str::to_string)
                     .collect(),

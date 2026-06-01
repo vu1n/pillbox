@@ -62,6 +62,10 @@ impl VaultProvider for AnthropicProvider {
         host == API_HOST || host == CONSOLE_HOST || host == PLATFORM_HOST
     }
 
+    fn hosts(&self) -> &'static [&'static str] {
+        &[API_HOST, CONSOLE_HOST, PLATFORM_HOST]
+    }
+
     fn creds_path(&self) -> &'static Path {
         Path::new(CREDS_PATH)
     }

@@ -132,13 +132,6 @@ const ALIASES: &[(&str, &str)] = &[
     ("GH_TOKEN", "GITHUB_TOKEN"),
 ];
 
-/// Hosts of every built-in known secret — the default DNS-fence allowlist for a
-/// sandbox (the provider endpoints the agent legitimately talks to).
-#[cfg(feature = "libkrun")]
-pub(crate) fn known_hosts() -> Vec<&'static str> {
-    KNOWN.iter().map(|k| k.host).collect()
-}
-
 /// Look up a known secret by name (or alias).
 pub(crate) fn lookup(name: &str) -> Option<KnownSecret> {
     let canonical = ALIASES

@@ -40,6 +40,10 @@ impl VaultProvider for OpenAiApiKeyProvider {
         host == API_HOST
     }
 
+    fn hosts(&self) -> &'static [&'static str] {
+        &[API_HOST]
+    }
+
     fn creds_path(&self) -> &'static Path {
         Path::new(API_KEY_UNUSED_CREDS_PATH)
     }

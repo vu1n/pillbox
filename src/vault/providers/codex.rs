@@ -80,6 +80,13 @@ impl VaultProvider for CodexProvider {
             || host == AUTH_OPENAI_HOST
     }
 
+    /// Concrete hosts for the DNS-fence allowlist. The `*.chatgpt.com` wildcard
+    /// `intercept` also matches isn't enumerable for an exact-match DNS allowlist
+    /// — a known gap for codex subdomains (claude/the api hosts are exact).
+    fn hosts(&self) -> &'static [&'static str] {
+        &[CHATGPT_HOST, CHAT_OPENAI_HOST, AUTH_OPENAI_HOST]
+    }
+
     fn creds_path(&self) -> &'static Path {
         Path::new(CREDS_PATH)
     }

@@ -551,8 +551,16 @@ Docker untouched until step 8. Slices (each its own commit, default build green)
     and the base `HOME`/`PATH`/`TERM` env (drift hazard vs `base_docker_args_with`)
     → a shared `base_agent_env`. Do as one extraction pass once the libkrun
     backend stabilizes (post-L5) — the shared boundary is still forming.*
-  - **L4 Attach** — guest pty-host + the real `attach::frame`/`pump` over vsock
-    (parent connects to the control socket the `__krun-vmm` child bridges).
+  - ✅ **L4 Attach** — the agent runs under the in-guest `pillbox pty-host
+    --vsock-port` serving the real `attach::frame` protocol; the parent runs
+    `attach::pump`. **Direction: guest dials the host** (`VMADDR_CID_HOST`,
+    default `krun_add_vsock_port`) — the parent binds the listener before boot and
+    `accept()`s, so there's no connect-before-ready race (the `port2 listen=true`
+    "guest listens" direction *did* race — first cut failed there). A vsock fd
+    wraps as `UnixStream` → `handle_client` reused unchanged; `host.rs` factored
+    into `spawn_pty_session` so unix (docker/ssh) + vsock share it. Verified:
+    `--version` output reached the host pump over vsock. **Needs a runner image
+    built from this src** (the guest pillbox must have `--vsock-port`).
   - **L5 §0 + vault-v2 + egress** — the §0 producer + the smoltcp egress stack
     (the L3 ConnectionRefused is the entry point; `PinTable`, per-sandbox
     invariant). **Env fork — secrets go to the vault, not the VM env** (this is

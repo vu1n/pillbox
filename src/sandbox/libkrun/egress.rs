@@ -30,7 +30,7 @@ use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
 
-use super::vault::Vault;
+use super::vault::{Upstream, Vault};
 
 /// Guest NIC MAC (handed to `krun_add_net_unixstream`) and the gateway MAC the
 /// stack answers as. The addressing is fixed per microVM — one stack, one guest.
@@ -187,20 +187,17 @@ struct Listener {
     conn: Option<Conn>,
 }
 
-/// Per-connection MITM state: the rustls server terminating the guest's TLS and
-/// the accumulated decrypted request head. `host` is the pinned SNI, set once the
-/// gate passes — empty means the gate hasn't run yet (the deny path aborts the
-/// socket, so a gated-but-empty state never persists).
+/// Per-connection MITM state. `host` is the pinned SNI, set once the gate passes
+/// — empty means the gate hasn't run yet (the deny path aborts the socket, so a
+/// gated-but-empty state never persists). `upstream` is opened after the gate;
+/// the pump then relays plaintext between the guest TLS and the upstream TLS.
 struct Conn {
     tls: ServerConnection,
     host: String,
-    plaintext: Vec<u8>,
-    done: bool,
+    upstream: Option<Upstream>,
+    req_logged: bool,
+    closing: bool,
 }
-
-/// Cap the accumulated request head — a head that never terminates (`\r\n\r\n`)
-/// would otherwise grow `plaintext` without bound (a slowloris-style guest).
-const MAX_REQUEST_HEAD: usize = 64 * 1024;
 
 /// Keep `POOL_MIN_FREE` listening sockets ready (up to `POOL_MAX`), adding new
 /// ones as accepted connections consume the free pool.
@@ -245,8 +242,9 @@ fn drive_listeners(
                         l.conn = Some(Conn {
                             tls,
                             host: String::new(),
-                            plaintext: Vec::new(),
-                            done: false,
+                            upstream: None,
+                            req_logged: false,
+                            closing: false,
                         })
                     }
                     Err(_) => sock.abort(),
@@ -264,14 +262,19 @@ fn drive_listeners(
     }
 }
 
-/// Pump one MITM session: smoltcp rx → rustls, gate on the DNS-pin (the allowlist
-/// is already enforced by the cert resolver — a non-allowlisted SNI never got a
-/// cert), decrypt the request, hand it to the vault, rustls → smoltcp tx.
+/// Pump one MITM session: smoltcp rx → guest rustls, gate on the DNS-pin (the
+/// allowlist is already enforced by the cert resolver — a non-allowlisted SNI
+/// never got a cert), then relay decrypted bytes to/from the upstream TLS, guest
+/// rustls → smoltcp tx. Split-borrows the connection's fields so the guest and
+/// upstream sessions can be driven in the same call.
 fn drive_conn(sock: &mut tcp::Socket, c: &mut Conn, vault: &Vault, pins: &PinTable, diag: &Diag) {
+    let Conn { tls, host, upstream, req_logged, closing } = c;
+
+    // smoltcp rx → guest rustls
     while sock.can_recv() {
         let mut got = 0usize;
         let _ = sock.recv(|data| {
-            got = c.tls.read_tls(&mut std::io::Cursor::new(data)).unwrap_or(0);
+            got = tls.read_tls(&mut std::io::Cursor::new(data)).unwrap_or(0);
             (got, ())
         });
         if got == 0 {
@@ -279,7 +282,7 @@ fn drive_conn(sock: &mut tcp::Socket, c: &mut Conn, vault: &Vault, pins: &PinTab
         }
         // A handshake failure lands here — including a non-allowlisted SNI, whose
         // cert the resolver refused to mint. Log the RST (the only place we see it).
-        if let Err(e) = c.tls.process_new_packets() {
+        if let Err(e) = tls.process_new_packets() {
             diag.log(&format!("krun-egress: [mitm] TLS error → RST ({e})"));
             sock.abort();
             return;
@@ -290,8 +293,8 @@ fn drive_conn(sock: &mut tcp::Socket, c: &mut Conn, vault: &Vault, pins: &PinTab
     // have resolved this exact host through our resolver — a hardcoded-IP +
     // forged-SNI connection that skipped DNS isn't pinned, so it's denied. `host`
     // empty = gate not yet run; setting it (only on ALLOW) marks the gate passed.
-    if c.host.is_empty() {
-        if let Some(sni) = c.tls.server_name() {
+    if host.is_empty() {
+        if let Some(sni) = tls.server_name() {
             let sni = sni.to_string();
             if !pins.contains(&sni) {
                 diag.log(&format!(
@@ -301,61 +304,72 @@ fn drive_conn(sock: &mut tcp::Socket, c: &mut Conn, vault: &Vault, pins: &PinTab
                 return;
             }
             diag.log(&format!("krun-egress: [mitm] ALLOW sni={sni:?} → DNS-pinned, terminating"));
-            c.host = sni;
+            *host = sni;
         }
     }
 
-    // Accumulate the decrypted request head until it's complete. Stop once we've
-    // responded (`done`) so a large request body doesn't grow `plaintext`
-    // unbounded; L5b-2's forward leg will stream the body instead.
-    if !c.done {
+    // Open the forward connection once the gate passes (the agent gets the real
+    // upstream, validated against the Mozilla roots).
+    if !host.is_empty() && upstream.is_none() && !*closing {
+        match vault.connect_upstream(host) {
+            Ok(up) => *upstream = Some(up),
+            Err(e) => {
+                diag.log(&format!("krun-egress: [mitm] upstream {host} failed → RST ({e})"));
+                sock.abort();
+                return;
+            }
+        }
+    }
+
+    // Relay decrypted bytes both ways: guest request → upstream, upstream response
+    // → guest. L5b-3 will intercept + swap the credential before the upstream send.
+    if let Some(up) = upstream.as_mut() {
         let mut buf = [0u8; 4096];
         loop {
-            match c.tls.reader().read(&mut buf) {
+            match tls.reader().read(&mut buf) {
                 Ok(0) => break,
-                Ok(n) => c.plaintext.extend_from_slice(&buf[..n]),
+                Ok(n) => {
+                    if !*req_logged {
+                        let head = String::from_utf8_lossy(&buf[..n]);
+                        diag.log(&format!(
+                            "krun-egress: [mitm] {:?} → {host} (forwarding)",
+                            head.lines().next().unwrap_or("")
+                        ));
+                        *req_logged = true;
+                    }
+                    up.send(&buf[..n]);
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(_) => break,
             }
         }
-        if c.plaintext.len() > MAX_REQUEST_HEAD {
-            diag.log("krun-egress: [mitm] request head too large → RST");
-            sock.abort();
-            return;
+        let alive = up.pump();
+        let mut resp = Vec::new();
+        up.recv_into(&mut resp);
+        if !resp.is_empty() {
+            let _ = tls.writer().write_all(&resp);
+        }
+        if !alive {
+            *closing = true;
+            *upstream = None;
         }
     }
 
-    // Once the full request head arrives, hand it to the vault for a response.
-    // L5b-1 synthesizes a 200 (proves terminate); L5b-2 forwards to the upstream.
-    if !c.host.is_empty() && !c.done && contains(&c.plaintext, b"\r\n\r\n") {
-        let line = String::from_utf8_lossy(&c.plaintext);
-        diag.log(&format!(
-            "krun-egress: [mitm] decrypted {:?} for {}",
-            line.lines().next().unwrap_or(""),
-            c.host
-        ));
-        let resp = vault.synthesize(&c.plaintext);
-        let _ = c.tls.writer().write_all(&resp);
-        c.done = true;
-    }
-
-    while c.tls.wants_write() && sock.can_send() {
+    // guest rustls → smoltcp tx
+    while tls.wants_write() && sock.can_send() {
         let mut wrote = 0usize;
         let _ = sock.send(|mut b| {
-            wrote = c.tls.write_tls(&mut b).unwrap_or(0);
+            wrote = tls.write_tls(&mut b).unwrap_or(0);
             (wrote, ())
         });
         if wrote == 0 {
             break;
         }
     }
-    if c.done && !c.tls.wants_write() {
+    // Close the guest side once the upstream is gone and its response is flushed.
+    if *closing && !tls.wants_write() {
         sock.close();
     }
-}
-
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 // ── smoltcp Device over the passt socketpair ────────────────────────────────

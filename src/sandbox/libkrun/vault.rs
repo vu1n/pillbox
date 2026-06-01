@@ -13,19 +13,26 @@
 //! non-allowlisted SNI gets no cert, so the handshake fails). The *pin* gate (the
 //! name was DNS-resolved through our resolver, catching a hardcoded-IP + forged
 //! SNI that skipped DNS) is applied in [`super::egress`] where the live `PinTable`
-//! lives. ALPN is pinned to `http/1.1` so we only ever parse h1 to swap. The
-//! swap and the forward leg are L5b-2/3; for now [`Vault::synthesize`] returns a
-//! canned OK response (like the step-5 spike), proving the guest's TLS terminates.
+//! lives. ALPN is pinned to `http/1.1` so we only ever parse h1 to swap.
+//!
+//! **Forward leg (L5b-2):** [`Vault::connect_upstream`] opens a *real* host socket
+//! to the pinned provider, validates its real cert against the Mozilla roots, and
+//! the egress pump relays decrypted bytes between the two TLS sessions
+//! transparently. The credential swap (parse h1 head → substitute the auth header)
+//! is L5b-3, inserted between the guest decrypt and the upstream send.
 
 use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
+use std::time::Duration as StdDuration;
 
 use anyhow::{anyhow, Context, Result};
 use rcgen::{CertificateParams, DnType, Issuer, KeyPair};
-use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
-use rustls::{ServerConfig, ServerConnection};
+use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection};
 use time::{Duration, OffsetDateTime};
 
 /// Leaf validity. Short — minted per run, never persisted; the only verifier is
@@ -37,11 +44,13 @@ const LEAF_VALIDITY_DAYS: i64 = 7;
 /// child; `new_conn` hands out a fresh [`ServerConnection`] per accepted socket.
 pub(super) struct Vault {
     config: Arc<ServerConfig>,
+    client_config: Arc<ClientConfig>,
 }
 
 impl Vault {
     /// Load the vault CA from `ca_dir` (host-side; the key stays out of the guest)
-    /// and build a `ServerConfig` that mints leaves for the `allowlist` hosts.
+    /// and build the guest-side `ServerConfig` (mints leaves for `allowlist`) plus
+    /// the upstream-side `ClientConfig` (validates real provider certs).
     pub(super) fn new(ca_dir: &str, allowlist: Vec<String>) -> Result<Vault> {
         let ca = crate::vault::Ca::ensure(std::path::Path::new(ca_dir))
             .map_err(|e| anyhow!("load vault CA from {ca_dir}: {e}"))?;
@@ -52,7 +61,7 @@ impl Vault {
             cache: Mutex::new(HashMap::new()),
         });
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-        let mut config = ServerConfig::builder_with_provider(provider)
+        let mut config = ServerConfig::builder_with_provider(provider.clone())
             .with_safe_default_protocol_versions()
             .context("rustls protocol versions")?
             .with_no_client_auth()
@@ -60,7 +69,22 @@ impl Vault {
         // h1-pin: the guest negotiates HTTP/1.1 with us, so the swap parser never
         // has to handle h2 framing (we speak h1/h2 to the real upstream).
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
-        Ok(Vault { config: Arc::new(config) })
+
+        // Upstream side: validate the real provider cert against the Mozilla roots
+        // (so we aren't ourselves MITM'd), h1 to match the guest.
+        let mut roots = RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let mut client_config = ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .context("rustls client protocol versions")?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+        Ok(Vault {
+            config: Arc::new(config),
+            client_config: Arc::new(client_config),
+        })
     }
 
     /// A fresh server-side TLS connection for an accepted socket.
@@ -68,11 +92,75 @@ impl Vault {
         ServerConnection::new(self.config.clone()).map_err(|e| anyhow!("rustls server conn: {e}"))
     }
 
-    /// Handle a decrypted HTTP/1.1 request head. L5b-1: log nothing here (the
-    /// caller logs the gate) and return a canned 200 so the terminate is provable
-    /// without a forward leg. L5b-2 forwards; L5b-3 swaps the credential first.
-    pub(super) fn synthesize(&self, _request_head: &[u8]) -> Vec<u8> {
-        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok".to_vec()
+    /// Open a forward connection to the real `host` (port 443): resolve host-side,
+    /// connect (bounded), and start a rustls client validating the real cert. The
+    /// socket is non-blocking so the egress poll loop can drive it in-thread.
+    pub(super) fn connect_upstream(&self, host: &str) -> Result<Upstream> {
+        let addr = (host, 443u16)
+            .to_socket_addrs()
+            .with_context(|| format!("resolve {host}"))?
+            .next()
+            .ok_or_else(|| anyhow!("no address for {host}"))?;
+        let sock = TcpStream::connect_timeout(&addr, StdDuration::from_secs(10))
+            .with_context(|| format!("connect {host}"))?;
+        sock.set_nonblocking(true).context("set upstream non-blocking")?;
+        let server_name = ServerName::try_from(host.to_string())
+            .with_context(|| format!("invalid upstream name {host}"))?;
+        let tls = ClientConnection::new(self.client_config.clone(), server_name)
+            .map_err(|e| anyhow!("rustls client conn: {e}"))?;
+        Ok(Upstream { sock, tls })
+    }
+}
+
+/// The forward (upstream) half of a MITM session: a real non-blocking host socket
+/// with a rustls client validating the provider's real cert. The egress poll loop
+/// bridges plaintext between this and the guest-side `ServerConnection`.
+pub(super) struct Upstream {
+    sock: TcpStream,
+    tls: ClientConnection,
+}
+
+impl Upstream {
+    /// Queue decrypted request bytes (from the guest) to send to the upstream.
+    pub(super) fn send(&mut self, buf: &[u8]) {
+        let _ = self.tls.writer().write_all(buf);
+    }
+
+    /// Drive the socket: flush queued ciphertext out, pull any response ciphertext
+    /// in. Returns `false` when the upstream has closed or errored.
+    pub(super) fn pump(&mut self) -> bool {
+        while self.tls.wants_write() {
+            match self.tls.write_tls(&mut self.sock) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => return false,
+            }
+        }
+        match self.tls.read_tls(&mut self.sock) {
+            Ok(0) => return false, // upstream closed
+            Ok(_) => {
+                if self.tls.process_new_packets().is_err() {
+                    return false;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => return false,
+        }
+        true
+    }
+
+    /// Drain decrypted response bytes (from the upstream) into `out`.
+    pub(super) fn recv_into(&mut self, out: &mut Vec<u8>) {
+        let mut buf = [0u8; 4096];
+        loop {
+            match self.tls.reader().read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
     }
 }
 
@@ -148,7 +236,6 @@ mod tests {
         let (vault, dir) = test_vault(&["api.anthropic.com"]);
         let conn = vault.new_conn().expect("server conn");
         assert!(conn.wants_read()); // a fresh server connection awaits the ClientHello
-        assert!(vault.synthesize(b"GET / HTTP/1.1\r\n\r\n").starts_with(b"HTTP/1.1 200"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

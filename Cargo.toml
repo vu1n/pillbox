@@ -113,6 +113,10 @@ smoltcp = { version = "0.12", optional = true, default-features = false, feature
 # already compiled transitively, so the `dep:rustls` gate adds nothing to the
 # default build. rcgen (a normal dep, used by the vault CA) mints the leaf.
 rustls = { version = "0.23", optional = true }
+# Mozilla root bundle to validate the *real* upstream's cert on the forward leg
+# (L5b-2). Already in the tree transitively; the `dep:` gate keeps it off the
+# default build.
+webpki-roots = { version = "0.26", optional = true }
 
 [features]
 # Opt-in OTLP/gRPC transport for the OTel logs sink. Adds tonic +
@@ -127,8 +131,8 @@ otel-grpc = ["opentelemetry-otlp/grpc-tonic"]
 # needs libkrun + libkrunfw present, and the binary codesigned with the
 # hypervisor entitlement (macOS/HVF). Select at runtime: `PILLBOX_BACKEND=libkrun`.
 # Pulls smoltcp for the in-VMM-child userspace egress stack (virtio-net) +
-# rustls for the vault MITM (L5b).
-libkrun = ["dep:smoltcp", "dep:rustls"]
+# rustls + webpki-roots for the vault MITM (L5b).
+libkrun = ["dep:smoltcp", "dep:rustls", "dep:webpki-roots"]
 
 [profile.release]
 strip = true

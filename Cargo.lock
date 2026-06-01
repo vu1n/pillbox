@@ -2908,6 +2908,7 @@ dependencies = [
  "tungstenite",
  "uuid",
  "vt100",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

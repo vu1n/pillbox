@@ -447,9 +447,18 @@ the guest's `pillbox-init ws` branch:
 - **Phase 4 — diff/flush:** `diff(clone, base)` = the guest's `RESULT.txt` — the
   result surface a driven run flushes/snapshots, with the base as the fork point.
 
-**In-repo landing:** rustic snapshot of the result (the durable/cross-machine
-store; CoW is the fast *local* fork — they compose); overlayfs CoW for Linux
-hosts (`clonefile` is APFS/macOS); the fork-N fan-out from one base.
+**In-repo landing:**
+- **Reuse the canonical denylist** — the spike hand-rolled a crude `is_secret`;
+  the repo already has `workspace::ingest` (`is_secret_dir` / `is_secret_basename`
+  / `IngestPlan`) from the docker:// ingest work, which is *better* (covers
+  `.gnupg`, spares `.env.example`/`.env.sample` templates, and *reports* dropped
+  secrets — no silent caps). The CoW path must call it, not duplicate it.
+- **Compose with rustic, don't replace it** — the flow is `rustic pull` (or cwd)
+  → scrub → `clonefile` fork → virtio-fs share → run → `rustic push` (result).
+  rustic (`workspace::rustic`) is the durable/cross-machine store and survives
+  the pivot unchanged; CoW is the fast *local* fork. CoW replaces the old
+  docker `tar-cp`/bind-mount materialization, not the store.
+- overlayfs CoW for Linux hosts (`clonefile` is APFS/macOS); the fork-N fan-out.
 
 ## Build order (proof-first)
 

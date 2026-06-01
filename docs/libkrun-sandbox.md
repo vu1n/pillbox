@@ -421,13 +421,28 @@ off the throwaway spike, mandatory for the port):**
 4. ✅ **§0 producer** — done. `contract::Event` NDJSON streams over a second
    concurrent vsock port → host seq-authority → durable `log.jsonl` → replay
    verified. Real contract types vendored both ends. Recipe above.
-5. **Egress + vault v2** — ✅ spiked end to end (virtio-net→socketpair, smoltcp TCP
-   termination, SNI gate ALLOW/RST/default-deny-by-IP, **MITM-terminate + credential
-   swap + destination-verified upstream** with the guest doing CA-verified TLS — see
-   [§ Step-5 spike](#step-5-spike-proven----egress-substrate--vault-v2-mechanics)).
-   In-repo landing: re-host the exact `VaultProvider`/hudsucker handlers + splice to
-   the verified upstream (vs the spike's synthesized 200) + the profile matrix.
-6. **Workspace** — COW snapshot + non-negotiable secret-file exclusion.
+5. **Egress + vault v2** — ✅ substrate spiked end to end (virtio-net→socketpair,
+   smoltcp TCP termination, SNI gate, MITM-terminate + credential swap + the guest
+   doing CA-verified TLS — see [§ Step-5 spike](#step-5-spike-proven----egress-substrate--vault-v2-mechanics)).
+   **The in-repo landing is not "done" until every security deliverable below ships
+   — they are acceptance criteria, not polish** (full rationale: [§ Why MITM](#why-mitm-at-all--substitute-vs-fence-2026-06-01-review),
+   [§ hardening gates](#the-two-hardening-gates-v2-adds-over-todays-blind-swap)):
+   - [ ] **Default-deny egress** — closed unless the profile allows it (the
+     exfiltration guard; also the cross-user-pooling prerequisite).
+   - [ ] **Fence the non-provider tiers** (brood-box): DNS-snoop allowlist →
+     NXDOMAIN + TTL-bounded IP rules + conntrack. MITM is scoped to provider hosts.
+   - [ ] **DNS-pin credential release** (microsandbox): inject the real key only on
+     SNI-allowlisted **AND** dest-IP-in-the-sandbox's-DNS-answer-set. Replaces the
+     spike's blocking `verify_upstream`.
+   - [ ] **Re-host the exact `VaultProvider`/hudsucker handlers** + splice the
+     swapped request to the verified upstream (vs the spike's synthesized 200).
+   - [ ] **Egress profiles** `permissive`/`standard`/`locked`, and an **untrusted
+     repo cannot widen** its own profile (set by the invoker, not the workspace).
+   - [ ] **No silent MITM bypass** — a cert-pinned/unmatched host is denied or
+     explicitly bypass-listed, never silently passed through with a real cred.
+6. **Workspace** — COW snapshot + **non-negotiable secret-file exclusion**
+   (`.env*`, `*.pem`, `.ssh/`, `.aws/`, credentials — an untrusted repo's config
+   cannot negate it; the filesystem half of "untrusted repo cannot widen").
 7. **opencode** — repoint the bridge transport to the control channel, and pay
    down the structural debt a 2026-06-01 review flagged (deferred then because
    fixing it on the *docker* path = polishing code we're deleting):

@@ -409,6 +409,15 @@ enum Command {
 }
 
 fn main() -> ExitCode {
+    // Internal re-exec entrypoint: the libkrun VMM child *becomes* the microVM.
+    // `krun_start_enter` doesn't return — it `exit()`s with the guest's code when
+    // the VM shuts down — so the backend spawns this hidden subprocess and
+    // supervises it from the parent (which keeps a live process for attach +
+    // cleanup). Not a user-facing command; argv is set by the backend.
+    #[cfg(feature = "libkrun")]
+    if std::env::args().nth(1).as_deref() == Some("__krun-vmm") {
+        crate::sandbox::libkrun::vmm_child_main(); // never returns
+    }
     init_vault_trace();
     let cli = Cli::parse();
     let result = run(cli);

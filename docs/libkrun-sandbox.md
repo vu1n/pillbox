@@ -628,10 +628,18 @@ Docker untouched until step 8. Slices (each its own commit, default build green)
         gets stubs. The guest trusts the CA via `NODE_EXTRA_CA_CERTS` + the system
         bundle (no `HTTPS_PROXY` — we're transparent via the DNS redirect, not a
         proxy). Sub-slices:
-          - **L5b-1 terminate + gate** — TCP listener at the gateway:443 →
-            rustls terminate with a CA-minted leaf (the guest now trusts it) →
-            gate on SNI ∈ allowlist ∩ `PinTable`. Synthesize a response (no
-            forward yet); proves the guest's TLS lands at our MITM decrypted.
+          - **L5b-1 terminate + gate ✅** — TCP listener pool at the gateway:443
+            (`egress.rs`) → rustls terminate (`vault.rs`: per-SNI leaf minted from
+            the reused CA via a `ResolvesServerCert` that gates the allowlist at
+            cert selection) → pin gate (SNI ∈ `PinTable`) in the pump. Guest trusts
+            the CA via `NODE_EXTRA_CA_CERTS` + `update-ca-certificates`. Synthesizes
+            a `200` (no forward yet). **Live-verified** (`pillbox-runner:l5a`): the
+            guest trusted our leaf and we **decrypted claude's real requests** —
+            `POST /v1/messages`, `/api/claude_cli/bootstrap`, `/v1/mcp_servers` —
+            all `ALLOW sni=api.anthropic.com`, while the fence NXDOMAIN'd the rest.
+            **Finding:** a raw multi-line CA PEM in the exec argv trips libkrun's
+            cmdline encoder (`InvalidAscii` on the newlines) → base64 it single-line
+            + `base64 -d` in the guest.
           - **L5b-2 forward leg** — open a host socket to the pinned upstream +
             relay. The agent actually authenticates + gets a real response.
           - **L5b-3 swap + env-fork** — vault blob (reals → child, stubs → guest)

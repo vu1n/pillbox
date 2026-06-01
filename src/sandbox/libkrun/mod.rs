@@ -118,6 +118,9 @@ struct EgressSpec {
     /// Optional host-side diagnostics file (the guest console eats the child's
     /// stderr). Set from `PILLBOX_KRUN_EGRESS_LOG`; `None` falls back to stderr.
     log_path: Option<String>,
+    /// Host path of the vault CA dir. When set, the child loads the CA (key stays
+    /// host-side) to mint per-SNI MITM leaves; `None` = DNS-fence only.
+    ca_dir: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -195,6 +198,16 @@ impl SandboxBackend for LibkrunBackend {
         ];
         guest_env.extend(composed);
 
+        // ── vault MITM trust: ensure the per-pillbox CA, trust its (public) cert
+        // in the guest, and tell the VMM child where to load the CA from to mint
+        // leaves. The CA *key* stays host-side (the child reads it); only the cert
+        // reaches the guest. No HTTPS_PROXY — we're transparent via the DNS fence.
+        let vault_ca_dir = resolved.subdir("vault")?;
+        let ca = crate::vault::Ca::ensure(&vault_ca_dir)
+            .map_err(|e| anyhow::anyhow!("ensure vault CA: {e}"))?;
+        let ca_cert_pem = std::fs::read_to_string(ca.cert_path()).context("read vault CA cert")?;
+        guest_env.push(("NODE_EXTRA_CA_CERTS".into(), GUEST_CA_PATH.into()));
+
         // Pre-accept the agent's workspace-trust dialog on the live auth home
         // before boot (claude); operates on host paths, like the docker path.
         spec.prepare_workspace_or_warn(&home, &guest_workspace);
@@ -221,10 +234,20 @@ impl SandboxBackend for LibkrunBackend {
             .collect::<Vec<_>>()
             .join(" ");
         // Egress: bring up the guest NIC + route DNS/egress through the userspace
-        // stack the VMM child runs (the DNS fence allows only the provider hosts).
+        // stack the VMM child runs (the DNS fence allows only the provider hosts),
+        // then trust the vault CA so the MITM's leaves validate.
         let net = egress::guest_net_commands();
+        // base64 the PEM: a raw multi-line cert in the exec argv trips libkrun's
+        // cmdline encoder (`InvalidAscii` on the newlines). Single-line b64 →
+        // decode in the guest.
+        let ca_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &ca_cert_pem);
+        let ca_setup = format!(
+            "printf '%s' {b64} | base64 -d > {GUEST_CA_PATH}; \
+             update-ca-certificates >/dev/null 2>&1 || true",
+            b64 = shell_quote(&ca_b64),
+        );
         let script = format!(
-            "set -e; {net}; mkdir -p {home_q}; mount -t virtiofs creds {home_q}; \
+            "set -e; {net}; {ca_setup}; mkdir -p {home_q}; mount -t virtiofs creds {home_q}; \
              mkdir -p {gw_q}; mount -t virtiofs workspace {gw_q}; cd {gw_q}; \
              exec pillbox pty-host --vsock-port {ATTACH_PORT} -- {agent}",
         );
@@ -252,6 +275,7 @@ impl SandboxBackend for LibkrunBackend {
                     .map(str::to_string)
                     .collect(),
                 log_path: std::env::var("PILLBOX_KRUN_EGRESS_LOG").ok(),
+                ca_dir: Some(vault_ca_dir.to_string_lossy().into_owned()),
             }),
         };
         let spec_file = tempfile::Builder::new()
@@ -300,6 +324,10 @@ impl SandboxBackend for LibkrunBackend {
 
 /// vsock port the guest pty-host dials for the attach channel.
 const ATTACH_PORT: u32 = 1024;
+
+/// Where the guest writes the vault CA cert (system trust dir → `update-ca-certificates`;
+/// also `NODE_EXTRA_CA_CERTS` for Node agents). The cert is public — the key never leaves the host.
+const GUEST_CA_PATH: &str = "/usr/local/share/ca-certificates/pillbox-vault.crt";
 
 /// Accept the guest pty-host's attach connection on the pre-bound listener,
 /// waiting across VM boot. Fails fast if the VMM child dies first.
@@ -379,14 +407,27 @@ pub(crate) fn vmm_child_main() -> ! {
         .collect();
     let vsock = spec.vsock.as_ref().map(|v| (v.port, cstr(&v.host_sock)));
     // Egress: a passt socketpair — one end to libkrun's virtio-net, the other to
-    // our userspace stack. `(libkrun_fd, host_fd, allowlist)`.
-    let net: Option<(c_int, c_int, Vec<String>, Option<String>)> = spec.egress.as_ref().map(|e| {
+    // our userspace stack (which the child runs in a thread beside the VM).
+    struct NetAttach {
+        libkrun_fd: c_int,
+        host_fd: c_int,
+        allowlist: Vec<String>,
+        ca_dir: Option<String>,
+        log_path: Option<String>,
+    }
+    let net: Option<NetAttach> = spec.egress.as_ref().map(|e| {
         let mut fds = [0 as c_int; 2];
         if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) } != 0 {
             eprintln!("krun-vmm: egress socketpair: {}", std::io::Error::last_os_error());
             std::process::exit(1);
         }
-        (fds[0], fds[1], e.allowlist.clone(), e.log_path.clone())
+        NetAttach {
+            libkrun_fd: fds[0],
+            host_fd: fds[1],
+            allowlist: e.allowlist.clone(),
+            ca_dir: e.ca_dir.clone(),
+            log_path: e.log_path.clone(),
+        }
     });
 
     unsafe {
@@ -408,11 +449,11 @@ pub(crate) fn vmm_child_main() -> ! {
             // proven direction; the parent's accept() waits for us — no race.)
             rc = rc.min(ffi::krun_add_vsock_port(ctx, *port, host_sock.as_ptr()));
         }
-        if let Some((libkrun_fd, _, _, _)) = net.as_ref() {
+        if let Some(n) = net.as_ref() {
             rc = rc.min(ffi::krun_add_net_unixstream(
                 ctx,
                 std::ptr::null(),
-                *libkrun_fd,
+                n.libkrun_fd,
                 egress::GUEST_MAC.as_ptr(),
                 0,
                 0,
@@ -426,8 +467,10 @@ pub(crate) fn vmm_child_main() -> ! {
         // Run the userspace egress stack on our end of the socketpair before the
         // VM boots, so it's servicing frames the moment the guest's NIC comes up.
         // The thread dies when start_enter exit()s this process on VM shutdown.
-        if let Some((_, host_fd, allowlist, log_path)) = net {
-            std::thread::spawn(move || egress::run(host_fd, allowlist, log_path));
+        if let Some(n) = net {
+            std::thread::spawn(move || {
+                egress::run(n.host_fd, n.allowlist, n.ca_dir, n.log_path)
+            });
         }
         let rc = ffi::krun_start_enter(ctx);
         eprintln!("krun-vmm: start_enter returned {rc} (pre-boot config error)");

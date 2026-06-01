@@ -126,11 +126,37 @@ ports by swapping only the bottom:
 - The Docker **runner image** framing in [runner-image.md](./runner-image.md) →
   microVM rootfs (OCI still usable).
 
+## Proven recipe — macOS boot (2026-06-01) ✅
+
+Step 1 done: a Linux 6.12.76 microVM boots on macOS 26 (Apple Silicon, HVF) via
+Rust→libkrun FFI and runs a command in an Alpine rootfs. The working recipe
+(proof crate at `~/code/libkrun-boot`, kept out of this repo until it graduates
+into a `pillbox-krun` backend):
+
+- **Install:** `brew install slp/krun/libkrun` (bottled; pulls `libkrunfw`).
+- **FFI:** hand-written `extern "C"` — no bindgen needed for the minimal surface:
+  `krun_create_ctx` → `krun_set_vm_config(ctx, vcpus, ram_mib)` →
+  `krun_set_root(ctx, rootfs_dir)` → `krun_set_workdir` →
+  `krun_set_exec(ctx, path, argv_after_0, envp)` → `krun_start_enter` (never
+  returns; guest stdout streams to the host; process exits with the guest's status).
+- **Rootfs:** a plain directory works as the virtio-fs root — an extracted OCI/
+  Alpine `minirootfs` tarball is enough (OCI-image-as-rootfs confirmed viable).
+- **macOS gotcha (the time-sink):** libkrun `dlopen`s a *bare* `libkrunfw.5.dylib`
+  via `libloading`. macOS 26 does **not** resolve it via `DYLD_LIBRARY_PATH`
+  (stripped/ignored even for linker-adhoc binaries) nor the `$HOME/lib` fallback.
+  It resolves against the **main executable's `LC_RPATH`** — so the consumer
+  binary needs `-Wl,-rpath,/opt/homebrew/lib` (this is exactly how `krunai`
+  works). Build it in `build.rs`.
+- **HVF entitlement:** the binary must be codesigned with
+  `com.apple.security.hypervisor`:
+  `codesign -f --entitlements ent.plist -s - <binary>` (ad-hoc is fine; `cargo`
+  re-signs the binary each build, so re-sign after every `cargo build`).
+- **vsock-on-HVF:** NOT yet tested — that's the open question for step 2.
+
 ## Build order (proof-first)
 
-1. **Boot proof** — libkrun FFI → microVM on the Mac → virtio-fs workspace → run
-   a command (krunai-style). Decide: FFI binding (bindgen vs hand-written),
-   OCI-rootfs vs custom.
+1. ✅ **Boot proof** — done (see recipe above). FFI = hand-written; rootfs =
+   OCI/Alpine dir; macOS = rpath + hypervisor entitlement.
 2. **`pillbox-init` + control echo** — PID 1, echo a `Frame` over vsock (or the
    fallback socket); settle the channel question.
 3. **Attach port** — frame protocol / `session attach` over the control channel.

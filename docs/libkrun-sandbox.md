@@ -424,6 +424,33 @@ off the throwaway spike, mandatory for the port):**
   sandboxes) is a *separate* design — per-tenant pin/vault + fair scheduling +
   multi-threaded — not this single-sandbox loop scaled up.
 
+### Step-6 spike (proven) ✅ — CoW workspace + secret exclusion
+
+The filesystem half of the sandbox, end to end on HVF. Proof binary `wsspike` +
+the guest's `pillbox-init ws` branch:
+
+- **Phase 1 — virtio-fs second share (the substrate unknown):**
+  `krun_add_virtiofs(ctx, "workspace", host_dir)` attaches a second share; the
+  guest mounts it with `mount(2)` fstype `virtiofs` at `/workspace`, reads the
+  shared files, and writes back. (The root is the first virtio-fs; this is a
+  second, mounted explicitly by the guest.)
+- **Phase 2 — CoW clone:** the host shares a **`clonefile(2)`** copy-on-write
+  clone of the base workspace, **not the base**. Measured **370µs** — genuinely
+  CoW, not a deep copy, so "fork N agents from one base" is ~free. The guest's
+  `RESULT.txt` write landed in the clone; the base was untouched (its `.env`
+  still there, no `RESULT.txt`).
+- **Phase 3 — non-negotiable secret-scrub:** before sharing, the host removes
+  `.env*` / `*.pem` / `.ssh/` / `.aws/` from the clone. The denylist is
+  pillbox-controlled and **read from nothing in the workspace** — the base's
+  `.pillboxinclude` asking to keep `.env` was visible to the guest but had **zero
+  effect** (the `.env` was gone). Kept files (`src/app.py`, `README.md`) survived.
+- **Phase 4 — diff/flush:** `diff(clone, base)` = the guest's `RESULT.txt` — the
+  result surface a driven run flushes/snapshots, with the base as the fork point.
+
+**In-repo landing:** rustic snapshot of the result (the durable/cross-machine
+store; CoW is the fast *local* fork — they compose); overlayfs CoW for Linux
+hosts (`clonefile` is APFS/macOS); the fork-N fan-out from one base.
+
 ## Build order (proof-first)
 
 1. ✅ **Boot proof** — done. FFI = hand-written; rootfs = OCI/Alpine dir;
@@ -456,9 +483,13 @@ off the throwaway spike, mandatory for the port):**
      repo cannot widen** its own profile (set by the invoker, not the workspace).
    - [ ] **No silent MITM bypass** — a cert-pinned/unmatched host is denied or
      explicitly bypass-listed, never silently passed through with a real cred.
-6. **Workspace** — COW snapshot + **non-negotiable secret-file exclusion**
-   (`.env*`, `*.pem`, `.ssh/`, `.aws/`, credentials — an untrusted repo's config
-   cannot negate it; the filesystem half of "untrusted repo cannot widen").
+6. **Workspace** — ✅ spiked (see [§ Step-6 spike](#step-6-spike-proven----cow-workspace--secret-exclusion)).
+   `clonefile(2)` CoW clone (370µs — fork-N is ~free), **non-negotiable secret-file
+   exclusion** (`.env*`/`*.pem`/`.ssh/`/`.aws/` scrubbed from the clone; a repo
+   file asking to keep them is ignored), shared into the guest over a second
+   **virtio-fs** mount; guest writes land in the clone, base stays the immutable
+   fork point. In-repo landing: rustic snapshot of the result (flush/pull);
+   overlayfs CoW on Linux hosts (clonefile is APFS-only); the fork-N fan-out.
 7. **opencode** — repoint the bridge transport to the control channel, and pay
    down the structural debt a 2026-06-01 review flagged (deferred then because
    fixing it on the *docker* path = polishing code we're deleting):

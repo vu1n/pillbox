@@ -404,11 +404,25 @@ off the throwaway spike, mandatory for the port):**
   non-provider hosts to the real upstream (the spike doesn't forward).
 - **Event-driven wakeup**, not the spike's fixed 2 ms poll-loop sleep (drive off
   the rx-queue / smoltcp `poll_at`).
-- **Make the DNS resolver + pin table its own unit**, not a third concern wedged
-  into the TCP poll loop sharing a loose `pins: HashSet`. The pin table is the
-  contract between the resolver and the gate; model it explicitly (it also needs
-  TTL eviction + the IP-level binding) rather than as a bare set the god-loop
-  mutates on one iteration and reads on the next.
+- **Give the pin table a type (`PinTable`), not a loose `pins: HashSet`.** It's
+  the contract between the resolver and the gate; model it explicitly with
+  `record(name, ips, ttl)` / `authorized(sni, dest_ip, now)` / `evict_expired` —
+  which also *is* the TTL + IP-level-binding upgrade. The single poll loop is
+  **correct** for smoltcp (one `poll()` advances all sockets) — don't split it
+  into threads; just lift the pin table out of the loop body into its own type.
+  The DNS-before-gate ordering is fail-closed (an unpinned SNI is RST), so it's
+  safe, not a hazard.
+- **The egress stack is per-sandbox, and the sandbox is the trust unit.** One
+  stack + one `PinTable` + one vault + one poll loop per microVM. This is what
+  makes multiplayer safe *and* scalable: fork-N = N independent loops (horizontal,
+  no contention), and the trust boundary lines up with the credential/pin
+  boundary. **Never share one egress stack across trust domains** — that both
+  leaks A's pins/creds to B's connections *and* creates the only real god-loop
+  bottleneck. Multiplayer-in-one-box = mutually-trusting collaborators sharing a
+  workspace + its creds; mutual distrust = separate sandboxes (free under this
+  model). A **managed multi-tenant tier** (a shared egress gateway fronting many
+  sandboxes) is a *separate* design — per-tenant pin/vault + fair scheduling +
+  multi-threaded — not this single-sandbox loop scaled up.
 
 ## Build order (proof-first)
 

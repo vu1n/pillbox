@@ -1,6 +1,6 @@
 # Remote backends, redesigned: the container *is* the primitive
 
-> **⚠️ SUPERSEDED (2026-06-01) — see [libkrun-sandbox.md](./libkrun-sandbox.md).**
+> **⚠️ SUPERSEDED (2026-06-01) — see [libkrun-sandbox.md](../libkrun-sandbox.md).**
 > This doc designed the Docker-context backend collapse (ssh/e2b → `docker://`,
 > BYO-free/managed-paid). Two decisions retired it: (1) "remote" resolved to
 > *Cloudflare-managed* or *pillbox-local-on-the-box*, not an SSH-driven remote
@@ -13,7 +13,7 @@
 Status: ~~design / proposed~~ **superseded**. Originally superseded the
 e2b-centric remote model in [remotes.md](./remotes.md).
 
-Part of [vnext.md](./vnext.md), which owns the layering and the unified
+Part of [vnext.md](../vnext.md), which owns the layering and the unified
 sequence. This is the Container/placement layer; the session-vs-container
 identity invariant (session outlives the container) is resolved there.
 
@@ -290,7 +290,7 @@ user's concern (unchanged decision).
   Move pull-progress UX (and ideally a slim base, currently phase 7)
   earlier, or qualify the claim for cold hosts.
 - **Session vs. container identity.** This doc calls the container the
-  primitive; the [session event log](./session-event-log.md) makes the
+  primitive; the [session event log](../session-event-log.md) makes the
   *session* the durable identity that outlives containers (a session can
   migrate local → `docker://` → managed). Reconcile: container = execution
   primitive, session = identity primitive. Detach/reattach and result-pull
@@ -507,7 +507,7 @@ to I2/I3/I4, not the whole system.
 
 The snapshot-lifecycle machine above tracks the *workspace data*; this tracks the
 *run* — the docker:// container control flow the run-assembly slice implements,
-against the [dx.md](./dx.md) "remote feels like local" parity contract. Stating
+against the [dx.md](../dx.md) "remote feels like local" parity contract. Stating
 it surfaces **three ordering invariants whose violation is a silent footgun**.
 
 ```mermaid

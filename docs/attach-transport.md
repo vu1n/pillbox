@@ -1,5 +1,11 @@
 # Interactive attach transport — design notes
 
+> **Note (2026-06-01):** the `Frame` protocol + pump/relay design here stands and
+> is transport-agnostic. The **carrier** below (`docker exec`, ssh-exec, the e2b
+> helper) is **deprecated** — under the [libkrun pivot](./libkrun-sandbox.md) the
+> frames ride a **vsock** (or forwarded-socket) channel to `pillbox-init`. The
+> protocol is unchanged; only what carries the bytes moves.
+
 Status: draft (2026-05-27). Sibling to
 [`agent-io-contract.md`](./agent-io-contract.md).
 
@@ -12,7 +18,7 @@ at a shell). The two are siblings, not alternatives — `agent.proto` line
 21 already carves this out: "Interactive PTY … uses pillbox's existing
 attach transport." This document **is** that transport, formalized.
 
-> Built on by the vNext design: [remotes-redesign.md](./remotes-redesign.md)
+> Built on by the vNext design: [remotes-redesign.md](./archive/remotes-redesign.md)
 > treats this `Frame` protocol as the cross-backend interface (docker-exec / ssh
 > / k8s-exec are transports against the same pump);
 > [session-event-log.md](./session-event-log.md) adds periodic `pty_snapshot`

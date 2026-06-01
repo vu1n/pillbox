@@ -1,5 +1,9 @@
 # Recipes
 
+> **Note (2026-06-01):** recipes using `--remote` / `docker://` / `e2b://` /
+> `ssh://` are **deprecated** (remote → Cloudflare-managed / local-on-box; local
+> runtime → [libkrun](./libkrun-sandbox.md)). Local recipes are unaffected.
+
 Copy-paste flows for common tasks. For the full command reference see
 [AGENTS.md](../AGENTS.md); for the why behind secrets see
 [secrets.md](./secrets.md).

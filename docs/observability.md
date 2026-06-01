@@ -1,5 +1,11 @@
 # Observability
 
+> **Note (2026-06-01):** the OTLP + §0 event-log model stands. The **remote**
+> telemetry paths (sandbox-side OTLP for e2b/ssh/`docker://`) are **deprecated**
+> with the remote backends; under the [libkrun pivot](./libkrun-sandbox.md) the
+> guest's events ride the `pillbox-init` vsock channel to the host, which exports
+> to the §0 log / OTLP. Telemetry is a headline differentiator — see the spec.
+
 Pillbox emits lifecycle telemetry as OTLP without taking a dependency on
 any specific backend. Point it at [Raindrop Workshop][workshop] for a
 local-first debugger UI, at your team's collector for production-grade

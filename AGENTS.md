@@ -7,6 +7,14 @@ screen and documents every command an agent might need to run.
 If you're a human, the README is friendlier. If you're an agent, this is
 what you want.
 
+> **⚠️ Direction note (2026-06-01).** The **remote** commands below
+> (`remote add`, `--remote`, `ssh://`/`e2b://`/`docker://`) still work but are
+> **deprecated** — "remote" is becoming Cloudflare-managed or pillbox-running-
+> locally-on-the-box, and the local sandbox runtime is pivoting **Docker →
+> libkrun microVM** (`docs/libkrun-sandbox.md`). Use local `pillbox run`; don't
+> build new automation on `--remote`. Everything else (run, secrets, env, auth,
+> vault, sessions, snapshots) is current.
+
 ---
 
 ## Mental model — one concept

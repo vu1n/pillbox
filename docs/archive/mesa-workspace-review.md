@@ -2,7 +2,7 @@
 
 > **Archived ADR (2026-05-30).** Decision ("keep rustic; don't adopt Mesa for
 > the remote story") still holds and is now absorbed into
-> [remotes-redesign.md](../remotes-redesign.md) — see its "Rustic isn't going
+> [remotes-redesign.md](./remotes-redesign.md) — see its "Rustic isn't going
 > away — it was doing two jobs" section. Kept for the record; not active docs.
 
 Reviewed: 2026-05-26

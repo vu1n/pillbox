@@ -50,8 +50,8 @@ authoritative.** When a design doc and a banner disagree, the banner (newer) win
 
 | File | Status |
 |---|---|
-| [remotes-redesign.md](./remotes-redesign.md) | **Superseded** by libkrun-sandbox.md (the Docker-context backend collapse is retired). Fork-from-store reasoning carries forward. |
-| [remotes.md](./remotes.md) | **Deprecated direction** — `ssh://`/`e2b://`/`docker://` still ship but are on the way out (remote → Cloudflare/local-on-box). |
+| [remotes-redesign.md](./archive/remotes-redesign.md) | **Superseded** by libkrun-sandbox.md (the Docker-context backend collapse is retired). Fork-from-store reasoning carries forward. |
+| [remotes.md](./archive/remotes.md) | **Deprecated direction** — `ssh://`/`e2b://`/`docker://` still ship but are on the way out (remote → Cloudflare/local-on-box). |
 
 Archived decision records: [`archive/`](./archive/).
 

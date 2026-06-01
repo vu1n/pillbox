@@ -4,7 +4,7 @@
 > (`ssh://`, `e2b://`, `docker://`) is being retired: "remote" is now
 > *Cloudflare-managed* or *pillbox-running-locally-on-the-box*, and the local
 > runtime is pivoting Docker → **libkrun microVM**. See
-> [libkrun-sandbox.md](./libkrun-sandbox.md) for the direction. The behavior
+> [libkrun-sandbox.md](../libkrun-sandbox.md) for the direction. The behavior
 > below **still ships** (the code is present) but is on the way out — don't
 > build new work against it.
 
@@ -13,7 +13,7 @@
 > detach + drive/read live-verified). The Docker-context successor model was
 > designed in [remotes-redesign.md](./remotes-redesign.md) (now also superseded).
 
-For the command reference, see [../AGENTS.md](../AGENTS.md). This doc
+For the command reference, see [../AGENTS.md](../../AGENTS.md). This doc
 covers the design of the remote-execution path: how pillbox decides
 which backend to use, what crosses the wire, and how detached
 sessions are tracked.
@@ -267,6 +267,6 @@ raw-pty `pty-relay` (e2b). Local `--detach` does NOT support
 
 ## See also
 
-- [security.md](./security.md) — threat model including remote
+- [security.md](../security.md) — threat model including remote
   backends and the vault-stdin handoff.
-- [../AGENTS.md](../AGENTS.md) — agent-facing command reference.
+- [../AGENTS.md](../../AGENTS.md) — agent-facing command reference.

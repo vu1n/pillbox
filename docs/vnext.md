@@ -10,7 +10,7 @@
 >    VPS*. The SSH/e2b/`docker://` remote backends are **deprecated**.
 > 2. **Substrate: Docker → libkrun microVM.** The local runtime pivots to
 >    [libkrun-sandbox.md](./libkrun-sandbox.md) (secure VM boundary, fast, no
->    daemon, macOS-native). [remotes-redesign.md](./remotes-redesign.md) (the
+>    daemon, macOS-native). [remotes-redesign.md](./archive/remotes-redesign.md) (the
 >    Docker-context collapse) is **superseded** by it.
 >
 > What stands from the body below: the **§0 event spine + gateway** (the
@@ -30,8 +30,8 @@ Deep specs:
   session spine (keystone).
 - [gateway.md](./gateway.md) — the per-session sequencer + broker + attach
   endpoint that §0 actually gates on.
-- [remotes-redesign.md](./remotes-redesign.md) — container-is-the-primitive
-  backend collapse + BYO/managed tiers.
+- ~~remotes-redesign.md~~ — *superseded, archived*; the Docker-context backend
+  collapse is retired (see the banner above + [libkrun-sandbox.md](./libkrun-sandbox.md)).
 - [dx.md](./dx.md) — the developer-experience contract (the bundle is the
   product): the three inner loops + the zero-config-local principle.
 - *orchestrator / optimization layer* — a **separate project** that consumes
@@ -67,10 +67,12 @@ An adversarial review (every code-claim verified against the source + OSS
 prior-art) kept the direction but reordered confidence. The *sequencing and
 scope* change:
 
-- **Remotes collapse — BUILD FIRST.** Highest ROI and it's a *deletion*, not a
-  rewrite: lean on Docker contexts; `remote_ssh.rs`'s **2101 LOC** is
-  superseded. Decoupled from the event-log keystone — detach already keys off
-  the durable `Session.id`.
+- **~~Remotes collapse — BUILD FIRST~~ → RETIRED.** This said "lean on Docker
+  contexts; collapse ssh/e2b onto `docker://`." Both halves are dead: the local
+  runtime pivots to **libkrun** ([libkrun-sandbox.md](./libkrun-sandbox.md)), and
+  "remote" is now Cloudflare-managed / pillbox-local-on-the-box, not an
+  SSH-driven daemon. **BUILD FIRST is now the libkrun substrate** (proof-first
+  boot → `pillbox-init` → port §0/attach onto vsock).
 - **Harden #1 (transcript+MITM source of truth) + #3 (native secondary) —
   BUILD.** Cheap, real.
 - **Harden #2 (`raw_body` blob store) — DEFER.** Net-new infra that *reverses*
@@ -91,10 +93,10 @@ scope* change:
   (meta-harness is OSS; routing is commoditized; DSPy-for-coding is unproven).
   pillbox's role is the substrate the loop runs *on* — which it already is.
 
-Minimal path that proves the thesis: the `docker://` consolidation + the §0
+Minimal path that proves the thesis: the **libkrun substrate** + the §0
 **local subscribe surface** + a thin `pillbox watch` reader (the cheapest "watch
-your agent"). The multi-human web-attach demo follows; everything else earns its
-place after that.
+your agent") + drive-from-chat. The multi-human web-attach demo follows;
+everything else earns its place after that.
 
 ## The layering (what makes the specs cohere)
 
@@ -106,7 +108,7 @@ is the primitive") — both true, at different layers.
 |---|---|---|---|
 | **Session** | durable identity; the event-log spine; partition key | outlives everything | event-log |
 | **Run / sandbox** | one agent execution; lineage via `parent_run_id`; `base → result` snapshots | per task | event-log + rustic |
-| **Container / placement** | *where* it runs: local / `docker://` / `k8s://` / managed | disposable | remotes |
+| **Container / placement** | *where* it runs: local **libkrun microVM** (default) / managed (Cloudflare). ~~`docker://`/`k8s://`~~ retired | disposable | [libkrun-sandbox](./libkrun-sandbox.md) |
 | **Gateway** | the convergence point — **sequencer** (assigns `seq`) + **participant broker** (auth / roster / input arbitration) + **placement attach** | per session | multiplayer |
 
 **Invariant:** session > run > container in lifetime. Detach/reattach,

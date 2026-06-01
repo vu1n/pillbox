@@ -18,8 +18,7 @@ That's the happy path. The rest of this file is reference.
 
 ## What pillbox is
 
-A **local-first** tool. The sauce is on your machine: a coding agent in a fast,
-hardened Docker sandbox, with credentials it can't leak and a live session you
+A **local-first** tool. The sauce is on your machine: a coding agent in a fast, hardened sandbox, with credentials it can't leak and a live session you
 can build on. No cloud, no account, no platform required.
 
 - **Multi-agent.** One surface over `claude`, `codex`, `opencode`, and `pi`.
@@ -182,7 +181,14 @@ A project pillbox always sees the global pillbox as a fallback for
 secrets / env / remotes. Sessions are runtime state and stay tied to
 the pillbox that started them.
 
-## Remote backends
+## Remote backends (deprecated)
+
+> **⚠️ Deprecated direction (2026-06-01).** `--remote` (`ssh://`, `e2b://`,
+> `docker://`) still ships but is on the way out. "Remote" is now
+> *Cloudflare-managed* or *pillbox running locally on the VPS*; the local runtime
+> is pivoting Docker → **libkrun microVM** (see
+> [docs/libkrun-sandbox.md](docs/libkrun-sandbox.md)). Don't build new work on
+> the remote backends.
 
 ```sh
 # SSH to a VPS you already installed pillbox on:
@@ -300,8 +306,10 @@ remote backends + sessions). Roadmap:
 - **v0.6 PR 8** ✅ `docker://` remote (run an OCI runner image on any
   reachable daemon) + the **drive/read surface** (`session send` /
   `subscribe` / `watch`) — the interactive event substrate, live-verified.
-- **v0.7+** the §0 event substrate as a first-class gateway; additional
-  placement backends.
+- **v0.7+** the §0 event substrate as a first-class gateway; **substrate pivot
+  Docker → libkrun microVM** ([docs/libkrun-sandbox.md](docs/libkrun-sandbox.md))
+  — secure VM boundary, no daemon, macOS-native; the remote backends deprecate
+  out as "remote" becomes Cloudflare-managed / local-on-box.
 
 ## Build
 
@@ -340,7 +348,7 @@ current.
   - [vault.md](./docs/vault.md) — per-pillbox credential vault
   - [observability.md](./docs/observability.md) — OTLP telemetry + Workshop integration
   - [shared-mcp.md](./docs/shared-mcp.md) — `--mcp NAME=URL` shared-MCP attachments
-  - [remotes.md](./docs/remotes.md) — remote backends + sessions
+  - [remotes.md](./docs/archive/remotes.md) — remote backends + sessions
   - [runner-image.md](./docs/runner-image.md) — the runner image, overrides, custom builds
   - [recipes.md](./docs/recipes.md) — copy-paste flows
   - [security.md](./docs/security.md) — threat model

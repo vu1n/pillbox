@@ -1,8 +1,8 @@
 # libkrun sandbox — the substrate pivot (Docker → microVM)
 
 **Status:** direction / spec (not yet built). Supersedes the Docker-daemon local
-backend and the whole remote-backend line ([remotes-redesign.md](./remotes-redesign.md),
-[remotes.md](./remotes.md) — now deprecated).
+backend and the whole remote-backend line ([remotes-redesign.md](./archive/remotes-redesign.md),
+[remotes.md](./archive/remotes.md) — now deprecated).
 
 ## Why
 
@@ -120,7 +120,7 @@ ports by swapping only the bottom:
 - **Local Docker backend** (`sandbox/local_docker.rs`, `docker.rs`) → a libkrun
   backend. Code currently ships; deprecated in direction.
 - **Remote backends** — `docker://`, `ssh://`, `e2b://` (`remote_docker`,
-  `remote_ssh`, `remote_e2b`) and [remotes-redesign.md](./remotes-redesign.md).
+  `remote_ssh`, `remote_e2b`) and [remotes-redesign.md](./archive/remotes-redesign.md).
   "Remote" is now Cloudflare-managed or pillbox-local-on-the-box; the SSH-driven-
   daemon model is retired. Code currently ships; deprecated in direction.
 - The Docker **runner image** framing in [runner-image.md](./runner-image.md) →

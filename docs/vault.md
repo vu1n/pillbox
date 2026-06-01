@@ -1,5 +1,11 @@
 # Credential vault (`--vault`)
 
+> **Note (2026-06-01):** this describes the shipped stub-swap MITM. The
+> [libkrun pivot](./libkrun-sandbox.md) hardens it to **vault v2**: the real key
+> is substituted only on a **TLS handshake verified to an allowlisted host**
+> (binds the credential to the destination), with **default-deny egress**, living
+> in the guest's userspace egress stack instead of a per-container sidecar.
+
 The vault keeps real Anthropic OAuth tokens on the host while the
 sandboxed claude sees stubs. A pillbox-managed MITM HTTPS proxy swaps
 stub → real on outbound requests to `api.anthropic.com` and

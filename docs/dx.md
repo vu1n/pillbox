@@ -1,5 +1,11 @@
 # Developer experience — the bundle is the product
 
+> **⚠️ Partially superseded (2026-06-01).** The local-first inner loops + the
+> drive/§0 surface stand. The **"remote feels like local" parity contract** (the
+> `docker://` journey) is **deprecated** — remote is now Cloudflare-managed /
+> pillbox-local-on-the-box, and the local runtime pivots to
+> [libkrun-sandbox.md](./libkrun-sandbox.md). Read remote-parity sections as historical.
+
 Status: design / proposed (2026-05-30). Sibling to [vnext.md](./vnext.md).
 
 vNext's own thesis: **there is no single-feature moat, so the integrated
@@ -150,7 +156,7 @@ vaulted secrets just work — with **no** `remote add`, no per-host login, no
 The control flow that delivers this — and the three ordering invariants it must
 not violate (stage-before-start, result-before-complete, **creds-persisted-
 before-teardown**) — is the run-assembly lifecycle state machine in
-[remotes-redesign.md](./remotes-redesign.md#run-assembly-lifecycle-the-docker-control-flow).
+[remotes-redesign.md](./archive/remotes-redesign.md#run-assembly-lifecycle-the-docker-control-flow).
 
 Parity table (local behavior → what remote must match):
 
@@ -180,7 +186,7 @@ Crucially, **liveness and materialization are orthogonal layers**, not competing
 models: live-sync is the interactive overlay *on top of* the same container +
 vault + attach stack; the on-exit snapshot still captures cwd→store (host-side
 authority, the single-ref-writer invariant from
-[remotes-redesign.md](./remotes-redesign.md) intact). The user never picks; the
+[remotes-redesign.md](./archive/remotes-redesign.md) intact). The user never picks; the
 mode follows interactive-vs-`--detach`.
 
 ### Vault just works — and docker:// is *cleaner* than e2b

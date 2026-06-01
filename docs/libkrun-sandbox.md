@@ -197,6 +197,31 @@ the docker→vsock swap is the bottom byte-pipe only; codec + lifecycle unchange
   so it proves the guest shell *evaluated* the input (full bidirectional path),
   not that the terminal echoed it. `exit_code=0`, clean teardown.
 
+### §0 producer (step 4, proven) ✅
+
+The structured §0 control plane streams over a **second, concurrent** vsock port
+(1025) alongside the attach data plane (1024) — the two-channel design the
+architecture diagram calls for, now proven to coexist on libkrun.
+
+- **Two ports, concurrent:** the host calls `krun_add_vsock_port` per port; the
+  guest dials both. The binary `Frame` PTY stream and the §0 NDJSON stream
+  interleave on the wire without interference (separate streams) — that was the
+  open transport question, now closed.
+- **Real contract types, both ends:** `src/contract.rs`'s `Event`/`Payload` are
+  vendored into `shared/contract.rs`; the guest serializes via the real
+  `Event::session(...)` builder, the host deserializes into the real types. The
+  wire is the exact production shape (camelCase fields, snake_case `type` tags,
+  RFC3339 `at` from the `time` crate).
+- **Host is the seq authority:** producers emit `seq == 0`; the host stamps the
+  monotonic per-session `seq` on append, mirroring `SessionLog::append`.
+- **Durable spine round-trips:** the host persists `log.jsonl` (byte-for-byte the
+  `SessionLog` on-disk form — droppable at `<pillbox>/sessions/<id>/log.jsonl`
+  and `session watch`/`subscribe` read it unchanged), then replays it: 8 events
+  re-parse, seqs gap-free `1..N`. That's the read surface the gateway sits on.
+- **What changes at graduation:** swap the proof's flat-file drain for the real
+  `SessionLog` (seq + notify-follow already built, transport-agnostic); the guest
+  half is the event mapper (`drain_sse` / transcript tailer) feeding this port.
+
 ## Build order (proof-first)
 
 1. ✅ **Boot proof** — done. FFI = hand-written; rootfs = OCI/Alpine dir;
@@ -206,7 +231,9 @@ the docker→vsock swap is the bottom byte-pipe only; codec + lifecycle unchange
 3. ✅ **Attach port** — done. Production `Frame` protocol (Hello/Snapshot/Data/
    Input/Resize/Exit) round-trips bidirectionally over vsock; guest pty-host +
    host pump, codec vendored verbatim. Recipe above.
-4. **§0 producer** — events over the control channel → durable log (watch/subscribe).
+4. ✅ **§0 producer** — done. `contract::Event` NDJSON streams over a second
+   concurrent vsock port → host seq-authority → durable `log.jsonl` → replay
+   verified. Real contract types vendored both ends. Recipe above.
 5. **Egress + vault v2** — smoltcp stack: TLS-verified credential substitution +
    default-deny egress + profiles + network telemetry.
 6. **Workspace** — COW snapshot + non-negotiable secret-file exclusion.

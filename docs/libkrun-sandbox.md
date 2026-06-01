@@ -185,7 +185,26 @@ into a `pillbox-krun` backend):
 5. **Egress + vault v2** — smoltcp stack: TLS-verified credential substitution +
    default-deny egress + profiles + network telemetry.
 6. **Workspace** — COW snapshot + non-negotiable secret-file exclusion.
-7. **opencode** — repoint the bridge transport to the control channel.
+7. **opencode** — repoint the bridge transport to the control channel, and pay
+   down the structural debt a 2026-06-01 review flagged (deferred then because
+   fixing it on the *docker* path = polishing code we're deleting):
+   - Server-mode is currently modeled as a type (`Integration`) but wired as
+     scattered branches (`is_server_agent` / `== Server` in `local_docker::run`,
+     `session_send`, `resolve_streaming_session`) grafted onto the local-docker
+     PTY backend. Make `Integration` the **dispatch axis**: carry it on the
+     `Session` record (typed, like `Backend`), `match` on it exhaustively at
+     selection/drive/read, and lift `run_server` out of `local_docker.rs` (it
+     isn't "local docker") into its own backend.
+   - **Type the bridge on a transport trait, not `DockerEndpoint`.** Today
+     `sandbox/opencode.rs` (`send_prompt`/`wait_ready`/`create_session`/
+     `spawn_event_bridge`) + `opencode_endpoint` are hard-typed on
+     `DockerEndpoint` + `docker exec curl`. Define a small `SandboxExec` seam
+     ("run a command in the sandbox / stream its stdout") that docker implements
+     today and the libkrun vsock transport implements here — then the swap is the
+     1-liner this doc promised, not a cross-file rewrite. The `message.*` mapper +
+     `drain_sse` already survive unchanged.
+   - Fold the opencode-only `Session` fields (`agent_session_id`, `model`) into a
+     typed optional sub-struct so PTY backends stop carrying a `None, None` tail.
 8. **Deprecate Docker** — remove the docker/remote backends once libkrun is at parity.
 
 ## References

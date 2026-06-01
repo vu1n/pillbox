@@ -613,11 +613,31 @@ Docker untouched until step 8. Slices (each its own commit, default build green)
         allowlist holds `api.github.com`, so bare `github.com` is (correctly)
         fenced — the L5b allowlist should track the *vaulted secrets in play*, not
         a static provider list.
-      - **L5b vault (own MITM)** — rustls terminate (CA-minted cert, ALPN-pinned
-        h1) on a TCP listener at the gateway + the in-repo `VaultProvider` swap +
-        forward to the bounded provider allowlist, gated on the L5a DNS-pin
-        (`PinTable::contains`). Adds the IP-level pin (dest must match the name's
-        resolved IP) on top of the name-level pin L5a populates.
+      - **L5b vault (own MITM)** — sub-sliced (large). **Reuse map** (from the
+        vault evidence scan): the **CA is reused as-is** — the VMM child is a host
+        process, so it loads `vault::ca::Ca::ensure(ca_dir)` + `.issuer()` from
+        disk directly (the CA key never nears the guest; only the *path* travels
+        in `VmSpec`). **Leaf minting is reimplemented** (hudsucker's
+        `RcgenAuthority` owns it): rcgen `CertificateParams::new([sni]).signed_by(
+        &issuer)` → a rustls `ServerConfig` (rustls **0.23**, match hudsucker's;
+        aws-lc-rs provider; ALPN-pinned `http/1.1`). `Registry` / `mint_stub` /
+        `rotate_real_field` / `snapshot_real` reuse as-is (pure Rust); the
+        `anthropic.rs` swap is `Request<Body>`-coupled → extract as pure fns over
+        parsed h1 headers + JSON. **Env fork channel:** real creds reach the child
+        out-of-band (the `VaultStdinBlob` pattern), NOT the guest env; the guest
+        gets stubs. The guest trusts the CA via `NODE_EXTRA_CA_CERTS` + the system
+        bundle (no `HTTPS_PROXY` — we're transparent via the DNS redirect, not a
+        proxy). Sub-slices:
+          - **L5b-1 terminate + gate** — TCP listener at the gateway:443 →
+            rustls terminate with a CA-minted leaf (the guest now trusts it) →
+            gate on SNI ∈ allowlist ∩ `PinTable`. Synthesize a response (no
+            forward yet); proves the guest's TLS lands at our MITM decrypted.
+          - **L5b-2 forward leg** — open a host socket to the pinned upstream +
+            relay. The agent actually authenticates + gets a real response.
+          - **L5b-3 swap + env-fork** — vault blob (reals → child, stubs → guest)
+            + the extracted `VaultProvider` swap + token-rotation read-back at
+            teardown. Adds the IP-level pin (dest = the name's resolved IP) on top
+            of the L5a name-level pin.
       - **L5c §0 producer** — guest emits `Event` NDJSON over a 2nd vsock port →
         parent drains to `SessionLog`.
     **Env fork — secrets go to the vault, not the VM env** (lands with L5b; this is

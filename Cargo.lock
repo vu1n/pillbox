@@ -2896,6 +2896,7 @@ dependencies = [
  "reqwest",
  "rustic_backend",
  "rustic_core",
+ "rustls",
  "serde",
  "serde_json",
  "smoltcp",

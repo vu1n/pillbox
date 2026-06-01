@@ -37,6 +37,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 mod egress;
+mod vault;
 
 use super::SandboxBackend;
 use crate::attach::pump;

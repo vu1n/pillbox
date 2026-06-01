@@ -108,6 +108,11 @@ crossterm = "0.27"
 # (virtio-net in the VMM child). Optional — pulled in only by the `libkrun`
 # feature; the default build never compiles it.
 smoltcp = { version = "0.12", optional = true, default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp"] }
+# rustls for the libkrun vault MITM (L5b) — terminate the guest's TLS on the
+# smoltcp stack. Pinned to 0.23 to match hudsucker (one rustls in the tree);
+# already compiled transitively, so the `dep:rustls` gate adds nothing to the
+# default build. rcgen (a normal dep, used by the vault CA) mints the leaf.
+rustls = { version = "0.23", optional = true }
 
 [features]
 # Opt-in OTLP/gRPC transport for the OTel logs sink. Adds tonic +
@@ -121,8 +126,9 @@ otel-grpc = ["opentelemetry-otlp/grpc-tonic"]
 # build, CI, and every dev without libkrun installed are unaffected. Enabling
 # needs libkrun + libkrunfw present, and the binary codesigned with the
 # hypervisor entitlement (macOS/HVF). Select at runtime: `PILLBOX_BACKEND=libkrun`.
-# Pulls smoltcp for the in-VMM-child userspace egress stack (virtio-net).
-libkrun = ["dep:smoltcp"]
+# Pulls smoltcp for the in-VMM-child userspace egress stack (virtio-net) +
+# rustls for the vault MITM (L5b).
+libkrun = ["dep:smoltcp", "dep:rustls"]
 
 [profile.release]
 strip = true

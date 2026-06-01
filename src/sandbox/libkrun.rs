@@ -43,9 +43,12 @@ use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
 use crate::workspace::WorkspaceBackend;
 
-/// libkrun C API bindings (header: `/opt/homebrew/include/libkrun.h`; linked +
-/// rpath'd by `build.rs` under the `libkrun` feature). vsock / virtio-net land
-/// with the attach + egress slices that use them.
+/// libkrun C API bindings — the single home for the `unsafe extern "C"`
+/// signatures (header: `/opt/homebrew/include/libkrun.h`; linked + rpath'd by
+/// `build.rs` under the `libkrun` feature). `krun_add_vsock_port` (attach, L4)
+/// and `krun_add_net_unixstream` (egress, L5) are declared ahead of the slices
+/// that consume them — the same contract-first stance as `contract.rs`.
+#[allow(dead_code)]
 pub(crate) mod ffi {
     use std::os::raw::{c_char, c_int};
 
@@ -55,6 +58,15 @@ pub(crate) mod ffi {
         pub fn krun_set_vm_config(ctx_id: u32, num_vcpus: u8, ram_mib: u32) -> c_int;
         pub fn krun_set_root(ctx_id: u32, root_path: *const c_char) -> c_int;
         pub fn krun_set_workdir(ctx_id: u32, workdir: *const c_char) -> c_int;
+        pub fn krun_add_vsock_port(ctx_id: u32, port: u32, c_filepath: *const c_char) -> c_int;
+        pub fn krun_add_net_unixstream(
+            ctx_id: u32,
+            c_path: *const c_char,
+            fd: c_int,
+            c_mac: *const u8,
+            features: u32,
+            flags: u32,
+        ) -> c_int;
         pub fn krun_add_virtiofs(ctx_id: u32, c_tag: *const c_char, c_path: *const c_char)
             -> c_int;
         pub fn krun_set_exec(

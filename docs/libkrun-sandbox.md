@@ -550,7 +550,23 @@ Docker untouched until step 8. Slices (each its own commit, default build green)
     (parent connects to the control socket the `__krun-vmm` child bridges).
   - **L5 §0 + vault-v2 + egress** — the §0 producer + the smoltcp egress stack
     (the L3 ConnectionRefused is the entry point; `PinTable`, per-sandbox
-    invariant). Then step 7 (opencode seam) + step 8 (deprecate Docker).
+    invariant). **Env fork — secrets go to the vault, not the VM env** (this is
+    the whole point of vault-v2; a secret in the VM's env is readable by the
+    agent via `/proc/self/environ` and exfiltrable by a prompt injection). L3
+    injects everything directly (matches Docker's non-vault path) only because
+    the egress stack to swap at doesn't exist yet; L5 splits it:
+      - **config (non-secret)** → directly into the VM env (fine).
+      - **vaultable secret** (known destination — provider keys, or a custom one
+        with `--host`/`--header-scheme`/`--maps-to`) → real value in the host
+        vault registry; the VM env gets a **stub**; the smoltcp egress swaps
+        stub→real only on a DNS-pinned, TLS-verified request to the allowlisted
+        host. The agent never holds the real value.
+      - **non-vaultable secret** → direct (with a warning), but **default-deny
+        egress is the backstop** — a leaked stub or a real value can't reach a
+        non-allowlisted host. Lean harder than Docker toward **stubs-only in the
+        VM**: nudge users to `--host`/`--maps-to` so a secret *can* be vaulted.
+    Owning the egress (smoltcp) is what makes default-deny structural — Docker's
+    vault passed unmatched hosts through. Then step 7 (opencode seam) + step 8.
 
 7. **opencode** — repoint the bridge transport to the control channel, and pay
    down the structural debt a 2026-06-01 review flagged (deferred then because

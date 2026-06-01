@@ -151,14 +151,35 @@ into a `pillbox-krun` backend):
   `com.apple.security.hypervisor`:
   `codesign -f --entitlements ent.plist -s - <binary>` (ad-hoc is fine; `cargo`
   re-signs the binary each build, so re-sign after every `cargo build`).
-- **vsock-on-HVF:** NOT yet tested — that's the open question for step 2.
+- **vsock-on-HVF: WORKS** (step 2, below) — no SSH fallback needed.
+
+### Control channel (step 2, proven) ✅
+
+`pillbox-init` (the guest workload) → host frame round-trip over vsock, on HVF:
+
+- **Host:** `krun_add_vsock_port(ctx, PORT, "/tmp/pillbox-ctrl.sock")` — default
+  direction is *guest connects out, host listens*. The host `UnixListener::bind`s
+  that path **before** `krun_start_enter`; libkrun connects to it when the guest
+  dials the vsock port. (`krun_add_vsock_port2(..., listen=true)` flips it: guest
+  listens, host initiates — use that later if the host should attach on demand.)
+- **Guest:** `socket(AF_VSOCK)` → `connect({ cid: VMADDR_CID_HOST=2, port: PORT })`
+  → write the length-prefixed frame. Retry the connect (~5s) since the host
+  listener races boot.
+- **Guest binary:** `pillbox-init`, cross-compiled to
+  `aarch64-unknown-linux-musl` (static, `libc` for AF_VSOCK) with
+  `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld` — no external gcc;
+  copied into the rootfs and set as `krun_set_exec` target.
+- **Note:** the exec'd binary is the guest *workload*, not literally PID 1 —
+  libkrun runs its own internal init and spawns our process as a child. So
+  `pillbox-init` doesn't need full-init duties; it just owns the agent + the
+  control channel and parks while serving.
 
 ## Build order (proof-first)
 
-1. ✅ **Boot proof** — done (see recipe above). FFI = hand-written; rootfs =
-   OCI/Alpine dir; macOS = rpath + hypervisor entitlement.
-2. **`pillbox-init` + control echo** — PID 1, echo a `Frame` over vsock (or the
-   fallback socket); settle the channel question.
+1. ✅ **Boot proof** — done. FFI = hand-written; rootfs = OCI/Alpine dir;
+   macOS = rpath + hypervisor entitlement.
+2. ✅ **`pillbox-init` + control channel** — done. vsock works on HVF; a frame
+   flows guest→host over `krun_add_vsock_port`'s unix-socket bridge.
 3. **Attach port** — frame protocol / `session attach` over the control channel.
 4. **§0 producer** — events over the control channel → durable log (watch/subscribe).
 5. **Egress + vault v2** — smoltcp stack: TLS-verified credential substitution +

@@ -187,16 +187,20 @@ struct Listener {
     conn: Option<Conn>,
 }
 
-/// Per-connection MITM state: the rustls server terminating the guest's TLS, the
-/// accumulated decrypted request head, and progress flags. `host` is the pinned
-/// SNI captured at the gate.
+/// Per-connection MITM state: the rustls server terminating the guest's TLS and
+/// the accumulated decrypted request head. `host` is the pinned SNI, set once the
+/// gate passes — empty means the gate hasn't run yet (the deny path aborts the
+/// socket, so a gated-but-empty state never persists).
 struct Conn {
     tls: ServerConnection,
-    gated: bool,
     host: String,
     plaintext: Vec<u8>,
     done: bool,
 }
+
+/// Cap the accumulated request head — a head that never terminates (`\r\n\r\n`)
+/// would otherwise grow `plaintext` without bound (a slowloris-style guest).
+const MAX_REQUEST_HEAD: usize = 64 * 1024;
 
 /// Keep `POOL_MIN_FREE` listening sockets ready (up to `POOL_MAX`), adding new
 /// ones as accepted connections consume the free pool.
@@ -214,10 +218,11 @@ fn replenish_listeners(listeners: &mut Vec<Listener>, sockets: &mut SocketSet) {
             tcp::SocketBuffer::new(vec![0u8; 65535]),
         );
         let handle = sockets.add(s);
-        sockets
-            .get_mut::<tcp::Socket>(handle)
-            .listen(PROXY_PORT)
-            .expect("listen :443");
+        let sock = sockets.get_mut::<tcp::Socket>(handle);
+        // Reclaim incomplete/idle connections (no ClientHello, slowloris) so they
+        // can't pin a pool slot until the VM dies.
+        sock.set_timeout(Some(smoltcp::time::Duration::from_secs(30)));
+        sock.listen(PROXY_PORT).expect("listen :443");
         listeners.push(Listener { handle, conn: None });
     }
 }
@@ -239,7 +244,6 @@ fn drive_listeners(
                     Ok(tls) => {
                         l.conn = Some(Conn {
                             tls,
-                            gated: false,
                             host: String::new(),
                             plaintext: Vec::new(),
                             done: false,
@@ -273,7 +277,10 @@ fn drive_conn(sock: &mut tcp::Socket, c: &mut Conn, vault: &Vault, pins: &PinTab
         if got == 0 {
             break;
         }
-        if c.tls.process_new_packets().is_err() {
+        // A handshake failure lands here — including a non-allowlisted SNI, whose
+        // cert the resolver refused to mint. Log the RST (the only place we see it).
+        if let Err(e) = c.tls.process_new_packets() {
+            diag.log(&format!("krun-egress: [mitm] TLS error → RST ({e})"));
             sock.abort();
             return;
         }
@@ -281,11 +288,11 @@ fn drive_conn(sock: &mut tcp::Socket, c: &mut Conn, vault: &Vault, pins: &PinTab
 
     // Pin gate (SNI available once the ClientHello is processed): the guest must
     // have resolved this exact host through our resolver — a hardcoded-IP +
-    // forged-SNI connection that skipped DNS isn't pinned, so it's denied.
-    if !c.gated {
+    // forged-SNI connection that skipped DNS isn't pinned, so it's denied. `host`
+    // empty = gate not yet run; setting it (only on ALLOW) marks the gate passed.
+    if c.host.is_empty() {
         if let Some(sni) = c.tls.server_name() {
             let sni = sni.to_string();
-            c.gated = true;
             if !pins.contains(&sni) {
                 diag.log(&format!(
                     "krun-egress: [mitm] DENY sni={sni:?} → RST (SNI not resolved via our resolver)"
@@ -298,19 +305,29 @@ fn drive_conn(sock: &mut tcp::Socket, c: &mut Conn, vault: &Vault, pins: &PinTab
         }
     }
 
-    let mut buf = [0u8; 4096];
-    loop {
-        match c.tls.reader().read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => c.plaintext.extend_from_slice(&buf[..n]),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(_) => break,
+    // Accumulate the decrypted request head until it's complete. Stop once we've
+    // responded (`done`) so a large request body doesn't grow `plaintext`
+    // unbounded; L5b-2's forward leg will stream the body instead.
+    if !c.done {
+        let mut buf = [0u8; 4096];
+        loop {
+            match c.tls.reader().read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => c.plaintext.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+        if c.plaintext.len() > MAX_REQUEST_HEAD {
+            diag.log("krun-egress: [mitm] request head too large → RST");
+            sock.abort();
+            return;
         }
     }
 
     // Once the full request head arrives, hand it to the vault for a response.
     // L5b-1 synthesizes a 200 (proves terminate); L5b-2 forwards to the upstream.
-    if c.gated && !c.done && contains(&c.plaintext, b"\r\n\r\n") {
+    if !c.host.is_empty() && !c.done && contains(&c.plaintext, b"\r\n\r\n") {
         let line = String::from_utf8_lossy(&c.plaintext);
         diag.log(&format!(
             "krun-egress: [mitm] decrypted {:?} for {}",

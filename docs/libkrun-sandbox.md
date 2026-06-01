@@ -88,10 +88,13 @@ the substrate rather than rent a sandbox SDK.
 Adopt by axis; the two references are strong on different ones:
 
 - **Network / credentials → microsandbox's model** (vault v2): default-deny
-  egress allowlist + **credential substitution only on a verified TLS handshake
-  to an allowlisted host** (the real key is swapped in only when the connection
-  provably goes to the right place; the agent never sees it). A direct upgrade to
-  today's blind stub-swap, living in the smoltcp egress stack.
+  egress allowlist + **credential substitution gated on SNI + DNS-pin** (the real
+  key is swapped in only when the SNI is allowlisted AND the destination IP is in
+  the sandbox's own DNS-answer set for that host; the agent never sees the key).
+  A direct upgrade to today's blind stub-swap, living in the smoltcp egress
+  stack. (Confirmed 2026-06-01: this is microsandbox's exact mechanism; we MITM
+  for *substitution*, fence à la brood-box for non-provider egress — see
+  [§ Why MITM](#why-mitm-at-all--substitute-vs-fence-2026-06-01-review).)
 - **Filesystem / workspace → brood-box's model**: COW snapshot + **non-
   negotiable secret-file exclusion** (`.env*`, `*.pem`, `.ssh/`, `.aws/` — an
   untrusted repo's config cannot negate it) + multi-layer policy where an
@@ -278,12 +281,49 @@ whatever that host resolves to. v2 adds:
   for cross-user pooling**: the [swarm-memory](./swarm-memory.md) scrub is
   zero-false-negative only when *all* egress is inspected, which only holds once
   unmatched hosts can't slip out (see [security.md](./security.md)).
-- **Destination-verified credential release** — the real key is injected only
-  after pillbox's *own* outbound TLS connection to the upstream verifies the
-  cert chains to the real CA for the allowlisted host. Binds the credential to a
-  **proven** destination, defeating DNS spoofing / a hijacked `api.anthropic.com`
-  / a malicious upstream. Today's MITM trusts the system roots implicitly; v2
-  makes destination-pinning an explicit precondition of release.
+- **Destination-pinned credential release (DNS-pin)** — the real key is injected
+  only when **the TLS SNI matches an allowlisted host AND the connection's
+  destination IP is in the DNS-answer set the *sandbox's own* lookup returned for
+  that host**. Binds the credential to a **proven** destination, defeating DNS
+  spoofing / a hijacked `api.anthropic.com` / "spoof the SNI, connect to an
+  attacker IP". This is **microsandbox's exact model** (verified 2026-06-01 — they
+  do the same SNI+DNS-pin dual check on a smoltcp stack), and it **supersedes the
+  spike's `verify_upstream`** (a second, blocking TLS handshake to the real host —
+  which the quality review flagged for stalling the poll loop). DNS-pin is
+  cheaper (no second handshake), non-blocking, and equally strong: snoop the
+  guest's DNS answers at the stack, pin the IPs (TTL-bounded), gate on them.
+
+### Why MITM at all — substitute vs. fence (2026-06-01 review)
+
+There is **no credential-injection route that avoids terminating TLS** — the
+credential lives in the encrypted body, so rewriting it is inherently
+decrypt-modify-re-encrypt. The genuine architectural fork is **substitute** vs.
+**fence**, and the field splits exactly along threat model:
+
+- **Substitute (MITM)** — the guest only ever sees a stub; rotation never reaches
+  it. What **microsandbox** (our nearest sibling: also libkrun+smoltcp),
+  **Cloudflare Sandbox / Claude Managed Agents** (per-instance ephemeral CA), and
+  **Infisical Agent Vault** all do for *agent containment*. Cost: CA injection
+  into the guest trust store; cert-pinned clients need an explicit bypass list.
+- **Fence (no substitution)** — what **brood-box** does: real creds live in the
+  guest, safety comes purely from default-deny egress + DNS-pinned allowlist +
+  secret-file exclusion. Simpler, no CA, immune to pinning — but the agent's
+  process holds the real key and rotated OAuth tokens reach the guest.
+
+**Decision: MITM stays**, scoped to provider hosts (tier 1). Pillbox's threat
+model is an untrusted/prompt-injected agent making *arbitrary* egress, and the
+**subscription/OAuth keystone requires that refresh-token rotation never leak
+back to the guest** — both point to substitution. We adopt brood-box's *fence*
+as the floor for **non-provider** hosts (tiers 2–3), so it isn't either/or:
+fence everything, MITM only where a credential is injected.
+
+**Considered and deferred — base-URL override** (CF AI Gateway BYOK / the
+"phantom-token" pattern): point the agent's `ANTHROPIC_BASE_URL` at an explicit
+local injecting proxy — no CA spoofing, no cert-pinning risk. Viable since
+pillbox already injects per-agent env, but it covers only cooperating SDKs/known
+hosts (not the agent's `curl`/git/MCP egress) and the OAuth refresh path is
+messier. A per-agent friction-reducer layered on the MITM+fence base, not a
+replacement.
 
 ### Egress profiles (from brood-box)
 
@@ -358,14 +398,16 @@ off the throwaway spike, mandatory for the port):**
 - **Model the connection as a `MitmPhase` enum**, not the spike's
   `gated`/`handled` bool pair — adding a phase (drain, await-vault) shouldn't mean
   another negated-conjunction check.
-- **Non-blocking upstream verify.** The spike's `verify_upstream` does a blocking
-  TLS handshake *inside the poll loop*, stalling every other connection. The port
-  must verify off-loop (cache verified anchors / async) so the listener pool's
-  concurrency is real.
+- **Replace `verify_upstream` with DNS-pin** (microsandbox's model — see [§ two
+  hardening gates](#the-two-hardening-gates-v2-adds-over-todays-blind-swap)). The
+  spike's second blocking TLS handshake stalls the whole poll loop; DNS-pinning
+  (snoop the guest's DNS answers, gate on SNI + dest-IP-in-pin-set) is
+  non-blocking and strictly stronger. This subsumes the old "non-blocking verify"
+  item.
 - **Event-driven wakeup**, not the spike's fixed 2 ms poll-loop sleep (drive off
   the rx-queue / smoltcp `poll_at`).
-- The **destination-verify already checks the gated host** (`Mitm.host`), not a
-  constant — keep that property when generalizing past a one-host allowlist.
+- **Fence the non-provider tiers** (brood-box: DNS-snoop allowlist → NXDOMAIN +
+  TTL-bounded IP rules + conntrack) so MITM stays scoped to provider hosts.
 
 ## Build order (proof-first)
 

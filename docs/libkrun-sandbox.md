@@ -546,6 +546,11 @@ Docker untouched until step 8. Slices (each its own commit, default build green)
     script; no secrets). **Finding for L5:** the run then failed at network
     egress (`ConnectionRefused`) — libkrun's default TSI did *not* carry it. So
     L5 wires virtio-net + smoltcp egress; don't rely on TSI.
+    *Deferred dedup (review): the creds/workspace preamble (copy-pasted across
+    libkrun + `local_docker::run`×2 + `remote_ssh`) → a shared `resolve_run_inputs`,
+    and the base `HOME`/`PATH`/`TERM` env (drift hazard vs `base_docker_args_with`)
+    → a shared `base_agent_env`. Do as one extraction pass once the libkrun
+    backend stabilizes (post-L5) — the shared boundary is still forming.*
   - **L4 Attach** — guest pty-host + the real `attach::frame`/`pump` over vsock
     (parent connects to the control socket the `__krun-vmm` child bridges).
   - **L5 §0 + vault-v2 + egress** — the §0 producer + the smoltcp egress stack

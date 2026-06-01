@@ -537,10 +537,9 @@ migration / pooling) and are deliberately unbuilt until then.
   `session.completed` (`session.rs`). See [swarm-memory.md](./swarm-memory.md).
 - **Vault egress is a correctness gap, not a feature** — the proxy passes
   *non-matched* hosts through unmodified (`vault/server.rs:6`), so an agent can
-  POST any other secret to an arbitrary host. Add strict-deny egress (403 on
-  unmatched) before/with the managed tier. Infisical Agent Vault + Cloudflare
-  Sandbox Outbound both ship this — convergence that *reinforces* "bundle is the
-  moat, not the vault."
+  POST any other secret to an arbitrary host. Add strict-deny egress (deny on
+  unmatched) before/with the managed tier — table-stakes hardening that
+  *reinforces* "bundle is the moat, not the vault."
 
 ## What this is NOT
 

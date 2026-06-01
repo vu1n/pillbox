@@ -25,13 +25,11 @@ local runtime is free to be the *best* one instead of the most *compatible* one.
   hidden Linux VM running containers; libkrun is the leaner direct path).
 
 **We own it, we don't fork it.** libkrun is an LGPL *library*; we FFI its C API
-(`include/libkrun.h`) + depend on the `libkrunfw` kernel artifact — the same way
-[brood-box](https://github.com/stacklok/brood-box),
-[microsandbox](https://github.com/superradcompany/microsandbox), and
-[krunai](https://github.com/slp/krunai) all link it. We are a *sibling* of those
-projects, not a fork of any. The sandbox is table-stakes; **the layer above —
-drive-from-chat + great telemetry — is what's ours**, and owning the substrate
-is what keeps that layer's channel clean (see [§ Channels](#channels)).
+(`include/libkrun.h`) and depend on the `libkrunfw` kernel artifact — a normal
+library dependency, no vendored or forked third-party code. The sandbox is
+table-stakes; **the layer above — drive-from-chat + great telemetry — is what's
+ours**, and owning the substrate is what keeps that layer's channel clean (see
+[§ Channels](#channels)).
 
 ## Architecture
 
@@ -48,8 +46,7 @@ host: pillbox  ──FFI──▶ libkrun (KVM/HVF microVM)
 
 - **`pillbox-init`** — a small Rust binary, PID 1 in the guest. Boots, execs the
   agent (or `opencode serve`), and exposes the control channel. The natural home
-  for the in-guest half of the frame protocol + the §0 event producer (the role
-  `bbox-init` plays for brood-box, but ours, in Rust, over vsock).
+  for the in-guest half of the frame protocol + the §0 event producer.
 - **Rootfs** — an OCI image works as the microVM rootfs (krunvm/crun-krun
   style), so the existing runner-image artifact survives the pivot; a slimmer
   custom rootfs is an option later.
@@ -64,15 +61,13 @@ Two **separate** channels — do not conflate:
 
 - **Control (`pillbox-init` ↔ host): frame protocol + §0 events → vsock.**
   virtio-vsock is the purpose-built host↔guest pipe, independent of the guest's
-  internet. *Open question:* vsock-on-HVF via libkrun may be finicky — both
-  macOS references (brood-box, krunai) used SSH-over-the-guest-network instead.
-  Prototype vsock first; fall back to a forwarded localhost socket if needed.
-  `pillbox-init` doesn't care which.
-- **Egress (the agent's internet) → a userspace TCP stack (smoltcp).** libkrun
-  offers TSI (zero-config socket impersonation, simplest boot, little control)
-  vs **virtio-net + a host-side userspace stack** — which is where microsandbox
-  uses **[smoltcp](https://github.com/smoltcp-rs/smoltcp)** to *terminate the
-  guest's connections in userspace*. That termination point is exactly where the
+  internet. *Open question (resolved):* vsock-on-HVF via libkrun could have been
+  finicky — prototype it first, fall back to a forwarded localhost socket if
+  needed. `pillbox-init` doesn't care which. (It worked; see step 2.)
+- **Egress (the agent's internet) → a userspace TCP stack ([smoltcp](https://github.com/smoltcp-rs/smoltcp)).**
+  libkrun offers TSI (zero-config socket impersonation, simplest boot, little
+  control) vs **virtio-net + a host-side userspace stack** that **terminates the
+  guest's connections in userspace**. That termination point is exactly where the
   **vault, the egress firewall, and network telemetry** live, so owning it
   serves all three priorities. Boot on TSI; move egress to smoltcp when wiring
   vault/egress/telemetry (i.e. early).
@@ -83,27 +78,25 @@ control → agent (drive); agent events → control → host → §0 log / OTLP
 (telemetry). One owned channel, both jobs. That is the concrete reason to own
 the substrate rather than rent a sandbox SDK.
 
-## Security model (union of the two references)
+## Security model (by axis)
 
-Adopt by axis; the two references are strong on different ones:
-
-- **Network / credentials → microsandbox's model** (vault v2): default-deny
-  egress allowlist + **credential substitution gated on SNI + DNS-pin** (the real
-  key is swapped in only when the SNI is allowlisted AND the destination IP is in
-  the sandbox's own DNS-answer set for that host; the agent never sees the key).
-  A direct upgrade to today's blind stub-swap, living in the smoltcp egress
-  stack. (Confirmed 2026-06-01: this is microsandbox's exact mechanism; we MITM
-  for *substitution*, fence à la brood-box for non-provider egress — see
-  [§ Why MITM](#why-mitm-at-all--substitute-vs-fence-2026-06-01-review).)
-- **Filesystem / workspace → brood-box's model**: COW snapshot + **non-
-  negotiable secret-file exclusion** (`.env*`, `*.pem`, `.ssh/`, `.aws/` — an
-  untrusted repo's config cannot negate it) + multi-layer policy where an
-  untrusted repo **cannot widen** egress or loosen a security setting.
-- **Egress profiles** (steal from brood-box): `permissive` / `standard` /
-  `locked` — great UX, orthogonal to the review gate.
-- **Diff-review-before-flush is OPTIONAL.** brood-box's blocking human gate
-  before every flush fights pillbox's driven/chat/autonomous priority.
-  *Interactive* mode may offer it; *driven* mode uses COW + snapshot-and-pull.
+- **Network / credentials** (vault v2): default-deny egress allowlist +
+  **credential substitution gated on SNI + DNS-pin** (the real key is swapped in
+  only when the SNI is allowlisted AND the destination IP is in the sandbox's own
+  DNS-answer set for that host; the agent never sees the key). A direct upgrade to
+  today's blind stub-swap, living in the smoltcp egress stack. We **MITM for
+  *substitution*** (provider hosts) and **fence** (default-deny + DNS) for
+  non-provider egress — see
+  [§ Why MITM](#why-mitm-at-all--substitute-vs-fence-2026-06-01-review).
+- **Filesystem / workspace**: COW snapshot + **non-negotiable secret-file
+  exclusion** (`.env*`, `*.pem`, `.ssh/`, `.aws/` — an untrusted repo's config
+  cannot negate it) + multi-layer policy where an untrusted repo **cannot widen**
+  egress or loosen a security setting.
+- **Egress profiles**: `permissive` / `standard` / `locked` — great UX,
+  orthogonal to the review gate.
+- **Diff-review-before-flush is OPTIONAL** — a blocking human gate before every
+  flush fights pillbox's driven/chat/autonomous priority. *Interactive* mode may
+  offer it; *driven* mode uses COW + snapshot-and-pull.
 
 ## What survives the pivot (most of the recent work)
 
@@ -148,8 +141,7 @@ into a `pillbox-krun` backend):
   via `libloading`. macOS 26 does **not** resolve it via `DYLD_LIBRARY_PATH`
   (stripped/ignored even for linker-adhoc binaries) nor the `$HOME/lib` fallback.
   It resolves against the **main executable's `LC_RPATH`** — so the consumer
-  binary needs `-Wl,-rpath,/opt/homebrew/lib` (this is exactly how `krunai`
-  works). Build it in `build.rs`.
+  binary needs `-Wl,-rpath,/opt/homebrew/lib`. Build it in `build.rs`.
 - **HVF entitlement:** the binary must be codesigned with
   `com.apple.security.hypervisor`:
   `codesign -f --entitlements ent.plist -s - <binary>` (ad-hoc is fine; `cargo`
@@ -244,7 +236,7 @@ libkrun offers two ways to give the guest a network:
 - **virtio-net + a host-side userspace TCP stack ([smoltcp](https://github.com/smoltcp-rs/smoltcp))**
   — the guest sees a real NIC; its packets land in a stack **pillbox owns and
   terminates in userspace**. That termination point is the single control plane
-  for all three priorities (gate, vault, telemetry). This is microsandbox's model.
+  for all three priorities (gate, vault, telemetry).
 
 **Decision:** boot on TSI (steps 1–4 don't need egress); switch to
 virtio-net + smoltcp *in this step*, because every vault-v2 control lives at
@@ -286,46 +278,42 @@ whatever that host resolves to. v2 adds:
   destination IP is in the DNS-answer set the *sandbox's own* lookup returned for
   that host**. Binds the credential to a **proven** destination, defeating DNS
   spoofing / a hijacked `api.anthropic.com` / "spoof the SNI, connect to an
-  attacker IP". This is **microsandbox's exact model** (verified 2026-06-01 — they
-  do the same SNI+DNS-pin dual check on a smoltcp stack), and it **supersedes the
-  spike's `verify_upstream`** (a second, blocking TLS handshake to the real host —
-  which the quality review flagged for stalling the poll loop). DNS-pin is
-  cheaper (no second handshake), non-blocking, and equally strong: snoop the
-  guest's DNS answers at the stack, pin the IPs (TTL-bounded), gate on them.
+  attacker IP". It **supersedes the spike's `verify_upstream`** (a second,
+  blocking TLS handshake to the real host — which the quality review flagged for
+  stalling the poll loop): DNS-pin is cheaper (no second handshake), non-blocking,
+  and equally strong — snoop the guest's DNS answers at the stack, pin the IPs
+  (TTL-bounded), gate on them.
 
-### Why MITM at all — substitute vs. fence (2026-06-01 review)
+### Why MITM at all — substitute vs. fence
 
 There is **no credential-injection route that avoids terminating TLS** — the
 credential lives in the encrypted body, so rewriting it is inherently
 decrypt-modify-re-encrypt. The genuine architectural fork is **substitute** vs.
-**fence**, and the field splits exactly along threat model:
+**fence**:
 
 - **Substitute (MITM)** — the guest only ever sees a stub; rotation never reaches
-  it. What **microsandbox** (our nearest sibling: also libkrun+smoltcp),
-  **Cloudflare Sandbox / Claude Managed Agents** (per-instance ephemeral CA), and
-  **Infisical Agent Vault** all do for *agent containment*. Cost: CA injection
-  into the guest trust store; cert-pinned clients need an explicit bypass list.
-- **Fence (no substitution)** — what **brood-box** does: real creds live in the
-  guest, safety comes purely from default-deny egress + DNS-pinned allowlist +
-  secret-file exclusion. Simpler, no CA, immune to pinning — but the agent's
-  process holds the real key and rotated OAuth tokens reach the guest.
+  it. Cost: CA injection into the guest trust store; cert-pinned clients need an
+  explicit bypass list.
+- **Fence (no substitution)** — real creds live in the guest, safety comes purely
+  from default-deny egress + DNS-pinned allowlist + secret-file exclusion.
+  Simpler, no CA, immune to pinning — but the agent's process holds the real key
+  and rotated OAuth tokens reach the guest.
 
 **Decision: MITM stays**, scoped to provider hosts (tier 1). Pillbox's threat
 model is an untrusted/prompt-injected agent making *arbitrary* egress, and the
 **subscription/OAuth keystone requires that refresh-token rotation never leak
-back to the guest** — both point to substitution. We adopt brood-box's *fence*
-as the floor for **non-provider** hosts (tiers 2–3), so it isn't either/or:
-fence everything, MITM only where a credential is injected.
+back to the guest** — both point to substitution. We use the *fence* as the floor
+for **non-provider** hosts (tiers 2–3), so it isn't either/or: fence everything,
+MITM only where a credential is injected.
 
-**Considered and deferred — base-URL override** (CF AI Gateway BYOK / the
-"phantom-token" pattern): point the agent's `ANTHROPIC_BASE_URL` at an explicit
-local injecting proxy — no CA spoofing, no cert-pinning risk. Viable since
-pillbox already injects per-agent env, but it covers only cooperating SDKs/known
-hosts (not the agent's `curl`/git/MCP egress) and the OAuth refresh path is
-messier. A per-agent friction-reducer layered on the MITM+fence base, not a
-replacement.
+**Considered and deferred — base-URL override**: point the agent's
+`ANTHROPIC_BASE_URL` at an explicit local injecting proxy — no CA spoofing, no
+cert-pinning risk. Viable since pillbox already injects per-agent env, but it
+covers only cooperating SDKs/known hosts (not the agent's `curl`/git/MCP egress)
+and the OAuth refresh path is messier. A per-agent friction-reducer layered on
+the MITM+fence base, not a replacement.
 
-### Egress profiles (from brood-box)
+### Egress profiles
 
 Orthogonal UX over the allowlist; the secret-file exclusion (step 6) is the
 filesystem sibling, kept separate.
@@ -337,8 +325,8 @@ filesystem sibling, kept separate.
 - **`permissive`** — all egress allowed, but provider hosts are *still*
   MITM+swapped (≈ today's posture). For code you trust.
 
-An untrusted repo **cannot widen** its own profile (brood-box's non-negotiable
-rule) — the profile is set by the invoker, not the workspace.
+An untrusted repo **cannot widen** its own profile (non-negotiable) — the
+profile is set by the invoker, not the workspace.
 
 ### Step-5 spike (proven) ✅ — egress substrate + vault-v2 mechanics
 
@@ -359,12 +347,12 @@ Proof binary `netspike` + the guest's `pillbox-init net` branch (proof crate at
   answers ARP, and **terminates the guest's TCP** — a real in-guest
   `TcpStream::connect` completes against the userspace stack.
 - **Phase 3 — DNS-fence + MITM + DNS-pin (the hardened gate):**
-  - **DNS fence (brood-box's mechanism):** the stack runs a **DNS resolver** on
+  - **DNS fence:** the stack runs a **DNS resolver** on
     UDP `:53` (the guest's `resolv.conf` → `10.0.2.2`). A non-allowlisted name
     gets **NXDOMAIN** — verified: `evil.example.com` → NXDOMAIN, the guest can't
     even resolve it. An allowlisted name resolves (to the proxy IP) and is
     **pinned**.
-  - **DNS-pin credential gate (microsandbox's mechanism):** on TLS, the stack
+  - **DNS-pin credential gate:** on TLS, the stack
     drives a `rustls::ServerConnection` off the poll loop and gates on **SNI ∈
     allowlist AND SNI ∈ the DNS-pin set** — a forged-SNI / hardcoded-IP
     connection that skipped our resolver is RST. This **replaced the spike's
@@ -411,7 +399,7 @@ off the throwaway spike, mandatory for the port):**
   to their *real* addresses and gate on dest-IP-in-the-resolved-set (the spike
   answers the proxy IP for every allowlisted name, so its pin is name-level).
 - ✅ **DNS fence done in the spike** (NXDOMAIN for non-allowlisted names). In-repo,
-  add **TTL-bounded IP rules + conntrack** for non-provider tiers (brood-box) so
+  add **TTL-bounded IP rules + conntrack** for non-provider tiers so
   MITM stays scoped to provider hosts, plus **NAT-forward** allowlisted
   non-provider hosts to the real upstream (the spike doesn't forward).
 - **Event-driven wakeup**, not the spike's fixed 2 ms poll-loop sleep (drive off
@@ -443,9 +431,9 @@ off the throwaway spike, mandatory for the port):**
    - [~] **Default-deny egress** — closed unless the profile allows it (the
      exfiltration guard; also the cross-user-pooling prerequisite). *Spiked via the
      DNS fence (NXDOMAIN) + by-IP drop; in-repo: enforce at the IP/conntrack layer.*
-   - [~] **Fence the non-provider tiers** (brood-box): DNS-snoop allowlist →
+   - [~] **Fence the non-provider tiers**: DNS-snoop allowlist →
      NXDOMAIN (✅ spiked) + TTL-bounded IP rules + conntrack + NAT-forward (in-repo).
-   - [~] **DNS-pin credential release** (microsandbox): inject the real key only on
+   - [~] **DNS-pin credential release**: inject the real key only on
      SNI-allowlisted **AND** dest-IP-in-the-sandbox's-DNS-answer-set. *Spiked at
      name-level (replaced `verify_upstream`); in-repo: upgrade to real-IP pin.*
    - [ ] **Re-host the exact `VaultProvider`/hudsucker handlers** + splice the
@@ -479,8 +467,19 @@ off the throwaway spike, mandatory for the port):**
      typed optional sub-struct so PTY backends stop carrying a `None, None` tail.
 8. **Deprecate Docker** — remove the docker/remote backends once libkrun is at parity.
 
-## References
+## Dependencies
 
-- [brood-box](https://github.com/stacklok/brood-box) — the security model blueprint.
-- [microsandbox](https://github.com/superradcompany/microsandbox) — SDK shape + the credential-proxy / smoltcp egress model.
-- [krunai](https://github.com/slp/krunai) — minimal libkrun mechanics (boot, virtio-fs, gvproxy/passt, SSH).
+- [libkrun](https://github.com/containers/libkrun) — the microVM library we FFI
+  (LGPL) + its `libkrunfw` kernel artifact.
+- [smoltcp](https://github.com/smoltcp-rs/smoltcp) — the userspace TCP/IP stack
+  crate for the egress termination point.
+- [rustls](https://github.com/rustls/rustls) — TLS for the MITM termination.
+
+## Prior art
+
+Other libkrun-based agent sandboxes, for readers comparing approaches:
+[microsandbox](https://github.com/microsandbox/microsandbox),
+[brood-box](https://github.com/stacklok/brood-box),
+[krunai](https://github.com/slp/krunai). pillbox's substrate, vault, and
+§0/attach layers are its own design and implementation; these are credited as
+related work in the space, not sources we vendor or fork.

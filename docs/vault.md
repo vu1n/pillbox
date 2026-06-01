@@ -20,8 +20,8 @@ collide across pillboxes.
 
 > **Egress note:** the proxy MITMs only matched hosts (Anthropic/OpenAI/GitHub)
 > and **passes non-matched hosts through unmodified** — so it is not a general
-> exfiltration guard today. Strict-deny egress filtering (403 on unmatched, à la
-> Infisical Agent Vault / Cloudflare Sandbox Outbound) is the planned fix; see
+> exfiltration guard today. Strict-deny egress filtering (deny on unmatched) is
+> the planned fix; see
 > [security.md](./security.md). For container backends the vault runs
 > sandbox-side once remotes phase-1 lands.
 >

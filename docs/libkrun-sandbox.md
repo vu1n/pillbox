@@ -300,18 +300,38 @@ filesystem sibling, kept separate.
 An untrusted repo **cannot widen** its own profile (brood-box's non-negotiable
 rule) — the profile is set by the invoker, not the workspace.
 
-### What the step-5 spike proves (proof-first, like 1–4)
+### Step-5 spike (proven) ✅ — the substrate; vault layer rides on top
 
-1. Guest boots on **virtio-net** (not TSI) with a default route to the host stack.
-2. A **smoltcp** userspace stack on the host terminates the guest's TCP.
-3. One **outbound TLS** connection from the guest (e.g. `curl https://api.anthropic.com`)
-   is **MITM-terminated** at the stack and its `x-api-key` stub→real swap runs
-   through the **existing `AnthropicProvider`** — proving the provider stack
-   re-hosts on smoltcp untouched.
-4. A connection to a **non-allowlisted** host gets **RST at connect** (default-deny).
+The egress termination point exists on HVF. Proof binary `netspike` + the guest's
+`pillbox-init net` branch (proof crate at `~/code/libkrun-boot`):
 
-Vault v2's destination-verification + the full profile matrix layer on once that
-pipe is green — same "transport first, policy on top" cadence as the attach port.
+- **Phase 1 — frame transport (the make-or-break unknown):** `krun_add_net_unixstream(ctx,
+  NULL, fd, mac, features=0, flags=0)` with `fd` one end of a `socketpair`.
+  libkrun drives the guest's virtio-net as **passt-protocol** frames —
+  `[u32 BE len][raw Ethernet frame]` — to our end. `features=0` disables offloads
+  (TSO/CSUM) so each frame is one real ≤MTU Ethernet frame. The guest's ARP
+  who-has for the gateway arrived intact. **This is the analogue of "does vsock
+  work on HVF" for step 2 — and it does.**
+- **Phase 2 — userspace termination:** a host-side **smoltcp** `Interface` over a
+  `phy::Device` that pops inbound frames off the socketpair and writes outbound
+  ones back (passt-framed). It owns the gateway IP `10.0.2.2/24` + a gateway MAC,
+  answers ARP, and **terminates the guest's TCP** — a real in-guest
+  `TcpStream::connect` completes against the userspace stack.
+- **Phase 3 — the three-tier gate:** the stack reads the TLS **ClientHello SNI**
+  (the routing key) off the terminated connection and decides — **ALLOW** an
+  allowlisted host (`api.anthropic.com` → graceful close; a real allow splices to
+  the verified upstream), **RST** a denied host (`evil.example.com` → `abort()`),
+  and **default-deny by-IP** (a connect to an IP the stack doesn't own,
+  `10.0.2.99`, gets no SYN-ACK and the guest's connect fails). A pool of listeners
+  keeps a free acceptor for sequential connections (a handled one is in `TIME_WAIT`).
+
+**Deferred to the next iteration (explicit):** full **TLS-MITM termination** + the
+existing `VaultProvider` stub→real swap, and the **destination-verified** upstream
+connect. Those need the async hyper stack bridged onto smoltcp sockets; the
+providers are already proven in-repo and hyper-level (transport-agnostic), so the
+spike stops at *"we have the SNI and can gate."* The substrate they ride — frame
+transport + userspace TCP termination + the SNI routing key — is proven. Profiles
+(`locked`/`standard`/`permissive`) are allowlist contents over this same gate.
 
 ## Build order (proof-first)
 
@@ -325,10 +345,10 @@ pipe is green — same "transport first, policy on top" cadence as the attach po
 4. ✅ **§0 producer** — done. `contract::Event` NDJSON streams over a second
    concurrent vsock port → host seq-authority → durable `log.jsonl` → replay
    verified. Real contract types vendored both ends. Recipe above.
-5. **Egress + vault v2** — design done (see [§ Egress + vault v2](#egress--vault-v2-step-5--design));
-   spike next: virtio-net + smoltcp termination, three egress tiers, the existing
-   `VaultProvider` stack re-hosted on the stack, default-deny RST. Then layer
-   destination-verification + the profile matrix.
+5. **Egress + vault v2** — substrate ✅ spiked (virtio-net→socketpair, smoltcp TCP
+   termination, SNI gate: ALLOW/RST/default-deny-by-IP — see [§ Step-5 spike](#step-5-spike-proven----the-substrate-vault-layer-rides-on-top)).
+   Next: TLS-MITM termination + re-host the existing `VaultProvider` swap on the
+   stack + destination-verified upstream + the profile matrix.
 6. **Workspace** — COW snapshot + non-negotiable secret-file exclusion.
 7. **opencode** — repoint the bridge transport to the control channel, and pay
    down the structural debt a 2026-06-01 review flagged (deferred then because

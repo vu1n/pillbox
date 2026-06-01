@@ -174,13 +174,38 @@ into a `pillbox-krun` backend):
   `pillbox-init` doesn't need full-init duties; it just owns the agent + the
   control channel and parks while serving.
 
+### Attach port (step 3, proven) ✅
+
+The **real** `Frame` attach protocol round-trips over the vsock channel on HVF —
+the docker→vsock swap is the bottom byte-pipe only; codec + lifecycle unchanged.
+
+- **Codec is production, not a stand-in:** `src/attach/frame.rs` is vendored
+  *verbatim* into the proof crate (`shared/frame.rs`) and compiled by both ends.
+- **Guest = pty-host role** (mirrors `src/attach/host.rs`): `pillbox-init`
+  `forkpty`s `/bin/sh`, sends a `Snapshot` on connect, streams PTY output as
+  `Data`, applies `Input`→PTY and `Resize`/`Hello`→`TIOCSWINSZ`, and reaps the
+  child to send `Exit(code)`. No new deps — raw `libc::forkpty` (cross-builds to
+  aarch64-musl with rust-lld, no gcc).
+- **Host = pump role** (mirrors `src/attach/pump.rs`): `Hello` → read
+  `Snapshot`/`Data` → send one `Input` → read `Exit`.
+- **fd-type gotcha:** the vsock fd is a real `SOCK_STREAM` socket, so wrapping it
+  in `UnixStream::from_raw_fd` works (std uses `recv`/`send`). The **PTY master
+  is not a socket** — wrap it in `File` (uses `read`/`write`); a `UnixStream`
+  there `ENOTSOCK`s.
+- **Proof asserts execution, not echo:** the host types `echo READY-$((6*7));
+  exit` and asserts `READY-42` comes back — `42` is absent from the typed line,
+  so it proves the guest shell *evaluated* the input (full bidirectional path),
+  not that the terminal echoed it. `exit_code=0`, clean teardown.
+
 ## Build order (proof-first)
 
 1. ✅ **Boot proof** — done. FFI = hand-written; rootfs = OCI/Alpine dir;
    macOS = rpath + hypervisor entitlement.
 2. ✅ **`pillbox-init` + control channel** — done. vsock works on HVF; a frame
    flows guest→host over `krun_add_vsock_port`'s unix-socket bridge.
-3. **Attach port** — frame protocol / `session attach` over the control channel.
+3. ✅ **Attach port** — done. Production `Frame` protocol (Hello/Snapshot/Data/
+   Input/Resize/Exit) round-trips bidirectionally over vsock; guest pty-host +
+   host pump, codec vendored verbatim. Recipe above.
 4. **§0 producer** — events over the control channel → durable log (watch/subscribe).
 5. **Egress + vault v2** — smoltcp stack: TLS-verified credential substitution +
    default-deny egress + profiles + network telemetry.

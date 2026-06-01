@@ -1,13 +1,17 @@
 # Remote backends + sessions
 
+> **⚠️ DEPRECATED DIRECTION (2026-06-01).** The whole remote-backend line
+> (`ssh://`, `e2b://`, `docker://`) is being retired: "remote" is now
+> *Cloudflare-managed* or *pillbox-running-locally-on-the-box*, and the local
+> runtime is pivoting Docker → **libkrun microVM**. See
+> [libkrun-sandbox.md](./libkrun-sandbox.md) for the direction. The behavior
+> below **still ships** (the code is present) but is on the way out — don't
+> build new work against it.
+
 > **Describes shipped v0.6 behavior** (`ssh://` + `e2b://`, S3-backed
-> workspace), plus the first slice of the successor model: `docker://` URLs
-> are now **accepted** (parsed, registered, inline) and dispatch to a
-> dedicated backend, though that backend's execution path is still being
-> built. The full successor model — container-is-primitive, Docker-contexts
-> placement, S3-optional, **e2b deprecated** — is designed in
-> [remotes-redesign.md](./remotes-redesign.md). This doc becomes a thin pointer
-> once `docker://` proves out and e2b is removed.
+> workspace), plus `docker://` (parsed, registered, inline; foreground +
+> detach + drive/read live-verified). The Docker-context successor model was
+> designed in [remotes-redesign.md](./remotes-redesign.md) (now also superseded).
 
 For the command reference, see [../AGENTS.md](../AGENTS.md). This doc
 covers the design of the remote-execution path: how pillbox decides

@@ -1,7 +1,17 @@
 # Remote backends, redesigned: the container *is* the primitive
 
-Status: design / proposed. Supersedes the e2b-centric remote model in
-[remotes.md](./remotes.md) once accepted.
+> **⚠️ SUPERSEDED (2026-06-01) — see [libkrun-sandbox.md](./libkrun-sandbox.md).**
+> This doc designed the Docker-context backend collapse (ssh/e2b → `docker://`,
+> BYO-free/managed-paid). Two decisions retired it: (1) "remote" resolved to
+> *Cloudflare-managed* or *pillbox-local-on-the-box*, not an SSH-driven remote
+> daemon; (2) the local runtime pivoted Docker → **libkrun microVM**. Kept (not
+> archived) for the reasoning that **carries forward**: workspace-as-unit
+> *fork-from-store*, the snapshot-lifecycle state machine, and the placement×store
+> matrix — those inform libkrun's COW workspace. The Docker/SSH transport design
+> here is dead.
+
+Status: ~~design / proposed~~ **superseded**. Originally superseded the
+e2b-centric remote model in [remotes.md](./remotes.md).
 
 Part of [vnext.md](./vnext.md), which owns the layering and the unified
 sequence. This is the Container/placement layer; the session-vs-container

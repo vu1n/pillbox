@@ -1,10 +1,31 @@
 # pillbox vNext — the multiplayer substrate
 
+> **⚠️ DIRECTION UPDATE (2026-06-01) — read this first.** Two strategic moves
+> postdate most of this doc; where the body conflicts, these win:
+> 1. **Local is the sauce; remote is extra.** pillbox is a *local-first* tool —
+>    a secure, fast-loading sandbox you run on your machine and drive from chat,
+>    with great telemetry. "Remote" is now *Cloudflare-managed* (their Sandbox
+>    SDK / Claude Managed Agents own the managed substrate — see memory
+>    `pillbox-cloudflare-shipped-the-stack`) or *pillbox-running-locally-on-the-
+>    VPS*. The SSH/e2b/`docker://` remote backends are **deprecated**.
+> 2. **Substrate: Docker → libkrun microVM.** The local runtime pivots to
+>    [libkrun-sandbox.md](./libkrun-sandbox.md) (secure VM boundary, fast, no
+>    daemon, macOS-native). [remotes-redesign.md](./remotes-redesign.md) (the
+>    Docker-context collapse) is **superseded** by it.
+>
+> What stands from the body below: the **§0 event spine + gateway** (the
+> keystone), the **drive surface** (`session send/watch/subscribe`), and
+> agent-agnostic multi-agent support — all transport-agnostic, so they port onto
+> libkrun unchanged. The differentiators are **drive-from-chat + telemetry**, not
+> the sandbox itself.
+
 Status: umbrella / roadmap. Owns the strategic frame, the layering model,
 and the **one** unified sequence. Indexes the deep specs; does not
 duplicate them.
 
 Deep specs:
+- [libkrun-sandbox.md](./libkrun-sandbox.md) — **the substrate** (libkrun
+  microVM; supersedes the Docker/remote line).
 - [session-event-log.md](./session-event-log.md) — the durable, attributed
   session spine (keystone).
 - [gateway.md](./gateway.md) — the per-session sequencer + broker + attach

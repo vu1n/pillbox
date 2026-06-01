@@ -186,11 +186,18 @@ impl SandboxBackend for LibkrunBackend {
             .chain(spec.sandbox_args.iter().map(|s| s.to_string()))
             .chain(opts.args.iter().cloned())
             .collect();
+        // Quote every interpolated path — the workspace name can legitimately
+        // contain a space (and must never be shell-evaluated).
+        let home_q = shell_quote(GUEST_HOME);
+        let gw_q = shell_quote(&guest_workspace);
+        let agent = agent_argv
+            .iter()
+            .map(|a| shell_quote(a))
+            .collect::<Vec<_>>()
+            .join(" ");
         let script = format!(
-            "set -e; mkdir -p {GUEST_HOME}; mount -t virtiofs creds {GUEST_HOME}; \
-             mkdir -p {gw}; mount -t virtiofs workspace {gw}; cd {gw}; exec {agent}",
-            gw = guest_workspace,
-            agent = agent_argv.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" "),
+            "set -e; mkdir -p {home_q}; mount -t virtiofs creds {home_q}; \
+             mkdir -p {gw_q}; mount -t virtiofs workspace {gw_q}; cd {gw_q}; exec {agent}",
         );
 
         let vmspec = VmSpec {
@@ -230,10 +237,13 @@ impl SandboxBackend for LibkrunBackend {
 }
 
 /// The VMM child (`pillbox __krun-vmm <spec.json>`). Reads the [`VmSpec`],
-/// configures a libkrun context (root + virtio-fs shares + exec, env forwarded
-/// from this process's own environment), and enters it. `krun_start_enter` does
-/// not return — it `exit()`s with the guest's code; only returns on a pre-boot
-/// error.
+/// configures a libkrun context (root + virtio-fs shares + exec), and enters it.
+///
+/// **This process's environment IS the guest environment**: the parent spawns it
+/// with `env_clear().envs(guest_env)`, so `std::env::vars()` here is exactly the
+/// composed guest env (config + any secrets) and is forwarded to `krun_set_exec`.
+/// `krun_start_enter` does not return — it `exit()`s with the guest's code; only
+/// returns on a pre-boot config error.
 pub(crate) fn vmm_child_main() -> ! {
     let spec_path = match std::env::args().nth(2) {
         Some(p) => p,
@@ -242,16 +252,24 @@ pub(crate) fn vmm_child_main() -> ! {
             std::process::exit(2);
         }
     };
-    let spec: VmSpec = match std::fs::read_to_string(&spec_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-    {
-        Some(s) => s,
-        None => {
-            eprintln!("krun-vmm: unreadable/invalid spec {spec_path}");
+    let raw = match std::fs::read_to_string(&spec_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("krun-vmm: read spec {spec_path}: {e}");
             std::process::exit(2);
         }
     };
+    let spec: VmSpec = match serde_json::from_str(&raw) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("krun-vmm: parse spec {spec_path}: {e}");
+            std::process::exit(2);
+        }
+    };
+    if spec.exec.is_empty() {
+        eprintln!("krun-vmm: spec.exec is empty");
+        std::process::exit(2);
+    }
 
     // Keep every CString alive until after start_enter.
     let rootfs = cstr(&spec.rootfs);
@@ -311,7 +329,9 @@ fn cow_clone_and_scrub(src: &Path) -> Result<PathBuf> {
     let clone_c = cstr(&clone.to_string_lossy());
     let rc = unsafe { clonefile(src_c.as_ptr(), clone_c.as_ptr(), 0) };
     if rc != 0 {
-        bail!("clonefile {} → {} failed (APFS only)", src.display(), clone.display());
+        let err = std::io::Error::last_os_error();
+        let _ = std::fs::remove_dir_all(&clone); // don't leave a half clone behind
+        bail!("clonefile {} → {} failed: {err} (APFS only)", src.display(), clone.display());
     }
     // Reuse the canonical walker + denylist; delete what it flags as secret.
     let plan = crate::workspace::ingest::plan_ingest(&clone)?;
@@ -377,8 +397,16 @@ fn materialize_rootfs(resolved: &Pillbox) -> Result<PathBuf> {
     let _ = Command::new("docker").args(["rm", "-f", &cid]).status();
     match export {
         Ok(s) if s.success() => {}
-        Ok(s) => bail!("rootfs export failed (status {:?})", s.code()),
-        Err(e) => bail!("rootfs export failed: {e}"),
+        // Clear the half-populated cache so the next run retries from scratch
+        // (the marker is written only on success, but leave nothing partial).
+        Ok(s) => {
+            let _ = std::fs::remove_dir_all(&cache);
+            bail!("rootfs export failed (status {:?})", s.code());
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&cache);
+            bail!("rootfs export failed: {e}");
+        }
     }
     std::fs::write(&marker, image.as_bytes()).context("write rootfs cache marker")?;
     Ok(cache)

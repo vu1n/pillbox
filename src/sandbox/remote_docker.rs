@@ -256,6 +256,8 @@ impl SandboxBackend for RemoteDockerSandbox {
                 // transcript is unreachable host-side), a docker:// container is
                 // directly `docker exec`-able, so this is host-readable.
                 guest_cwd: GUEST_WORKSPACE.to_string(),
+                agent_session_id: None,
+                model: None,
             };
             session::write(resolved, &session)?;
             crate::events::emit_session_event(

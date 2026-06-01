@@ -32,9 +32,6 @@
 //! ids we've opened as assistant (emit `MessageStart` once each); a tool's
 //! status is emitted only when it *changes* (`pending`→`running`→`completed`)
 //! so a chatty input-stream doesn't flood the log with duplicate `ToolCall`s.
-//!
-//! Wired by the `serve`-mode run path (the next slice); allowed dead until then.
-#![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet};
 

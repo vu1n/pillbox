@@ -234,6 +234,8 @@ impl SandboxBackend for RemoteSshSandbox {
                 // Empty: a remote session's transcript is sandbox-side, so the
                 // host gateway can't tail it (live tailing is local-docker only).
                 guest_cwd: String::new(),
+                agent_session_id: None,
+                model: None,
             };
             session::write(resolved, &s)?;
             crate::events::emit_session_event(

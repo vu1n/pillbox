@@ -233,6 +233,17 @@ pub(crate) struct Session {
     /// predate the field or remote backends whose transcript is sandbox-side.
     #[serde(default)]
     pub(crate) guest_cwd: String,
+    /// For a `Server`-integration agent (opencode), the agent-native session id
+    /// its HTTP API uses (`ses_…`), distinct from this record's pillbox id. The
+    /// drive (`session send` → POST `/prompt_async`) and the event bridge target
+    /// it. `None` for PTY agents.
+    #[serde(default)]
+    pub(crate) agent_session_id: Option<String>,
+    /// For a `Server`-integration agent, the `providerID/modelID` to drive with
+    /// (resolved from `--model` or a default at run time, reused by every
+    /// `session send`). `None` for PTY agents.
+    #[serde(default)]
+    pub(crate) model: Option<String>,
 }
 
 impl Session {
@@ -274,6 +285,8 @@ impl Session {
             result_snapshot: None,
             expires_at: None,
             guest_cwd: String::new(),
+            agent_session_id: None,
+            model: None,
         }
     }
 
@@ -366,6 +379,8 @@ impl Session {
             result_snapshot: None,
             expires_at: None,
             guest_cwd: String::new(),
+            agent_session_id: None,
+            model: None,
         }
     }
 }

@@ -34,9 +34,24 @@ pub(crate) const GUEST_WORKSPACE: &str = "/workspace";
 /// `AgentSpec` means the agent doesn't support `--mcp` yet.
 pub(crate) type McpInjectFn = fn(&[McpAttachment]) -> Result<McpInjection>;
 
+/// How pillbox talks to an agent. Most agents are a TUI we wrap in a PTY and
+/// observe by scraping their transcript file ([`Integration::Pty`]); a few
+/// (opencode) run as a headless server with a structured event stream + a
+/// prompt API, which pillbox drives/reads directly ([`Integration::Server`]) —
+/// cleaner and bidirectional. See `events::opencode` + `sandbox::opencode`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Integration {
+    /// PTY + transcript-file scrape (claude, codex, pi today).
+    Pty,
+    /// Headless HTTP server + SSE event stream + prompt API (opencode).
+    Server,
+}
+
 #[derive(Clone, Copy)]
 pub struct AgentSpec {
     pub(crate) id: &'static str,
+    /// How pillbox runs + observes this agent (PTY-and-scrape vs server-API).
+    pub(crate) integration: Integration,
     pub(crate) cred_sentinel: &'static str,
     pub(crate) login_argv: &'static [&'static str],
     pub(crate) run_argv: &'static [&'static str],
@@ -65,6 +80,7 @@ pub struct AgentSpec {
 
 pub const CLAUDE: AgentSpec = AgentSpec {
     id: "claude",
+    integration: Integration::Pty,
     cred_sentinel: ".claude/.credentials.json",
     login_argv: &["claude", "auth", "login", "--claudeai"],
     run_argv: &["claude"],
@@ -83,6 +99,7 @@ pub const CLAUDE: AgentSpec = AgentSpec {
 
 pub const CODEX: AgentSpec = AgentSpec {
     id: "codex",
+    integration: Integration::Pty,
     cred_sentinel: ".codex/auth.json",
     login_argv: &["codex", "login", "--device-auth"],
     run_argv: &["codex"],
@@ -96,6 +113,7 @@ pub const CODEX: AgentSpec = AgentSpec {
 
 pub const OPENCODE: AgentSpec = AgentSpec {
     id: "opencode",
+    integration: Integration::Server,
     cred_sentinel: ".local/share/opencode/auth.json",
     login_argv: &["opencode", "auth", "login"],
     run_argv: &["opencode"],
@@ -109,6 +127,7 @@ pub const OPENCODE: AgentSpec = AgentSpec {
 
 pub const PI: AgentSpec = AgentSpec {
     id: "pi",
+    integration: Integration::Pty,
     // pi (npm `@earendil-works/pi-coding-agent`) stores provider credentials —
     // OAuth tokens or API keys saved via `/login` — at `~/.pi/agent/auth.json`
     // (config dir `~/.pi`, agent subdir `agent`). Verified against pi 0.75.5.
@@ -402,6 +421,11 @@ pub(crate) struct RunOpts {
     /// the run's workspace base. Local Docker restores it before launch;
     /// remote backends hydrate it into the remote temp workspace.
     pub(crate) from_bookmark: Option<String>,
+    /// `--model PROVIDER/MODEL` — for a `Server`-integration agent (opencode),
+    /// the model to drive with (e.g. `zai-coding-plan/glm-4.5-air`). Recorded on
+    /// the session and reused by every `session send`. `None` → a default.
+    /// Ignored by PTY agents (they pick their own model interactively).
+    pub(crate) model: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -613,6 +637,7 @@ mod tests {
             json: false,
             ttl_seconds: None,
             from_bookmark: None,
+            model: None,
         }
     }
 

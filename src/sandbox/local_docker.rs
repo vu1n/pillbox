@@ -12,11 +12,12 @@ use anyhow::{Context, Result};
 use super::SandboxBackend;
 use crate::agents::{
     base_docker_args_detached, resolve_run_env, resolve_with_entries, workspace_mount_name,
-    AgentSpec, RunOpts, GUEST_HOME, GUEST_WORKSPACE,
+    AgentSpec, Integration, RunOpts, GUEST_HOME, GUEST_WORKSPACE,
 };
 use crate::attach::pump::{self, Outcome};
+use crate::docker::DockerEndpoint;
 use crate::pillbox::Pillbox;
-use crate::session::{self, Session, BACKEND_DOCKER};
+use crate::session::{self, Session, BACKEND_DOCKER, LOCAL_REMOTE};
 use crate::workspace::WorkspaceBackend;
 use crate::{docker, errors::PillboxError};
 
@@ -40,6 +41,12 @@ impl Drop for ContainerGuard {
 
 impl SandboxBackend for LocalDocker {
     fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
+        // Server-integration agents (opencode) run headless + are driven/read
+        // over their HTTP API — a distinct path with no PTY. Keep it off the
+        // PTY path entirely so claude/codex are untouched.
+        if spec.integration == Integration::Server {
+            return run_server(spec, opts, resolved);
+        }
         let runner_image = docker::check_ready_for(resolved)?;
 
         let home = spec.home_dir(resolved)?;
@@ -246,6 +253,8 @@ impl SandboxBackend for LocalDocker {
                 result_snapshot: None,
                 expires_at: opts.ttl_seconds.map(session::expires_at_from_ttl),
                 guest_cwd: guest_cwd.clone(),
+                agent_session_id: None,
+                model: None,
             };
             session::write(resolved, &session)?;
             crate::events::emit_session_event(
@@ -327,6 +336,154 @@ impl SandboxBackend for LocalDocker {
             .into()),
         }
     }
+}
+
+/// Run a `Server`-integration agent (opencode) on the local daemon: launch
+/// `opencode serve` headless (no pty-host, no vault — opencode isn't
+/// vault-capable), record a session keyed to the opencode session id, optionally
+/// send an initial prompt, and return. There's no PTY to attach; the user reads
+/// with `session watch`/`subscribe` (which spawn the event bridge) and drives
+/// with `session send`. Always "background server" — `--detach` is implicit.
+fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
+    let action = "run";
+    let runner_image = docker::check_ready_for(resolved)?;
+
+    let home = spec.home_dir(resolved)?;
+    if !home.join(spec.cred_sentinel).exists() {
+        return Err(PillboxError::runtime(
+            action,
+            format!("no stored credentials for `{}`", spec.id),
+        )
+        .with_next(format!("pillbox auth login --agent {}", spec.id))
+        .into());
+    }
+    // opencode has no vault integration (`vault_capable: false`); refuse rather
+    // than silently hand the agent a stub it would ship to the provider.
+    if opts.vault {
+        return Err(PillboxError::usage(
+            action,
+            format!("--vault is not supported for `{}`", spec.id),
+        )
+        .into());
+    }
+    let withs_resolved = resolve_with_entries(resolved, &opts.withs)?;
+    if withs_resolved.iter().any(|w| w.meta.is_some()) {
+        return Err(PillboxError::usage(
+            action,
+            format!("vaulted secrets are not supported for `{}`", spec.id),
+        )
+        .into());
+    }
+
+    let workspace_host = match &opts.workspace {
+        Some(p) => p.clone(),
+        None => std::env::current_dir().context("resolve current working directory")?,
+    };
+    if let Some(name) = opts.from_bookmark.as_deref() {
+        let handle = crate::bookmarks::resolve_existing(resolved, name)?;
+        resolved.workspace()?.pull(&workspace_host, Some(&handle))?;
+    }
+    let workspace_name = workspace_mount_name(&workspace_host, opts.name.as_deref())?;
+    let guest_workspace = format!("{GUEST_WORKSPACE}/{workspace_name}");
+    let env_vars = resolve_run_env(resolved, &opts, &withs_resolved, None)?;
+
+    // Detached container (no `-d` reap guard — the server outlives the CLI and
+    // is reaped by `session rm`). No pty-host: the command IS `opencode serve`.
+    let mut args = base_docker_args_detached();
+    args.extend([
+        "-v".into(),
+        format!("{}:{GUEST_HOME}", home.display()),
+        "-v".into(),
+        format!("{}:{guest_workspace}", workspace_host.display()),
+        "-w".into(),
+        guest_workspace.clone(),
+    ]);
+    for m in &opts.mounts {
+        args.push("-v".into());
+        args.push(m.clone());
+    }
+    for (k, v) in &env_vars {
+        args.push("-e".into());
+        args.push(format!("{k}={v}"));
+    }
+    args.push(runner_image);
+    args.extend(super::opencode::serve_args());
+
+    let container = docker::run_detached(&args)?;
+    let endpoint = DockerEndpoint::local();
+    let model = opts
+        .model
+        .clone()
+        .unwrap_or_else(|| super::opencode::DEFAULT_MODEL.to_string());
+    let prompt = opts.args.join(" ").trim().to_string();
+
+    // Everything after launch can fail; reap the container if it does so a
+    // failed bring-up doesn't leak a server.
+    let built = (|| -> Result<Session> {
+        super::opencode::wait_ready(&endpoint, &container)?;
+        let ocid = super::opencode::create_session(&endpoint, &container)?;
+        let session = Session {
+            id: Session::new_id(),
+            label: opts.label.clone(),
+            remote: LOCAL_REMOTE.to_string(),
+            backend: BACKEND_DOCKER.to_string(),
+            sandbox_id: container.clone(),
+            pty_pid: 0,
+            agent_id: spec.id.to_string(),
+            started_at: session::now_rfc3339(),
+            attached_pid: None,
+            base_snapshot: None,
+            result_snapshot: None,
+            expires_at: opts.ttl_seconds.map(session::expires_at_from_ttl),
+            guest_cwd: guest_workspace.clone(),
+            agent_session_id: Some(ocid.clone()),
+            model: Some(model.clone()),
+        };
+        session::write(resolved, &session)?;
+        crate::events::emit_session_event(
+            resolved,
+            crate::events::EventType::SessionStarted {
+                parent_session_id: crate::events::parent_session_id_from_env(),
+            },
+            &session.id,
+            Some(&session),
+        );
+        if !prompt.is_empty() {
+            super::opencode::send_prompt(&endpoint, &container, &ocid, &prompt, &model)?;
+        }
+        Ok(session)
+    })();
+    let session = match built {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = docker::rm_force(&container);
+            return Err(e);
+        }
+    };
+
+    if opts.json {
+        println!(
+            "{}",
+            crate::paths::json_v1(vec![("session", session.to_json_value())])
+        );
+    } else {
+        println!(
+            "pillbox: ✓ opencode session `{}` started ({}).",
+            session.id, model
+        );
+        if !prompt.is_empty() {
+            println!("         (sent your prompt; watch for the reply)");
+        }
+        println!(
+            "         pillbox session watch {}    # read the stream",
+            session.id
+        );
+        println!(
+            "         pillbox session send {} \"…\"  # drive it",
+            session.id
+        );
+    }
+    Ok(())
 }
 
 /// Attach the terminal pump to a running pty-host container by execing the

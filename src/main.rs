@@ -280,6 +280,10 @@ enum Command {
         /// workspace at launch time and fork from that.
         #[arg(long = "from-bookmark", value_name = "NAME")]
         from_bookmark: Option<String>,
+        /// Model for a server-integration agent (opencode): `PROVIDER/MODEL`,
+        /// e.g. `zai-coding-plan/glm-4.5-air`. Ignored by PTY agents.
+        #[arg(long, value_name = "PROVIDER/MODEL")]
+        model: Option<String>,
         /// Args forwarded to the agent CLI inside the sandbox.
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
@@ -505,6 +509,7 @@ fn run(cli: Cli) -> Result<()> {
             ttl,
             parent,
             from_bookmark,
+            model,
             args,
         } => {
             let resolved = Pillbox::resolve(pillbox_arg)?;
@@ -594,6 +599,7 @@ fn run(cli: Cli) -> Result<()> {
                     json,
                     ttl_seconds,
                     from_bookmark,
+                    model,
                 },
             )
         }

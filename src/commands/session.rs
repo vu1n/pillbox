@@ -8,10 +8,40 @@
 
 use anyhow::Result;
 
+use crate::agents::Integration;
 use crate::cli::{DoneStatus, SessionAction};
+use crate::docker::DockerEndpoint;
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
 use crate::{events, remote, sandbox, session};
+
+/// Is this agent a `Server`-integration agent (opencode) — driven/read over its
+/// HTTP API rather than a PTY? Defaults to `false` for an unknown agent id.
+fn is_server_agent(agent_id: &str) -> bool {
+    crate::agents::lookup("session", agent_id)
+        .map(|spec| spec.integration == Integration::Server)
+        .unwrap_or(false)
+}
+
+/// The docker endpoint hosting a server-mode session's container — local for a
+/// `Docker` session, the re-resolved remote for a `RemoteDocker` one.
+fn opencode_endpoint(resolved: &Pillbox, s: &session::Session) -> Result<DockerEndpoint> {
+    match session::Backend::parse(&s.backend) {
+        Some(session::Backend::Docker) => Ok(DockerEndpoint::local()),
+        Some(session::Backend::RemoteDocker) => {
+            let remote = remote::resolve_run_target(resolved, &s.remote)?;
+            sandbox::remote_docker::endpoint_for(&remote)
+        }
+        _ => Err(PillboxError::usage(
+            "session",
+            format!(
+                "opencode server sessions need a docker backend (got `{}`)",
+                s.backend
+            ),
+        )
+        .into()),
+    }
+}
 
 pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> {
     match action {
@@ -455,6 +485,24 @@ fn session_send(resolved: &Pillbox, id: &str, text: &str) -> Result<()> {
     // against the session registry — not `resolve_logged` (the read side's
     // foreground log dirs).
     let s = session::resolve(resolved, id)?;
+    // Server-integration agents (opencode) are driven over their HTTP prompt
+    // API, not a pty-relay: `session send` = a structured prompt, not keystrokes.
+    if is_server_agent(&s.agent_id) {
+        let endpoint = opencode_endpoint(resolved, &s)?;
+        let ocid = s.agent_session_id.as_deref().ok_or_else(|| {
+            PillboxError::config(
+                "session send",
+                format!("session `{}` has no opencode session id", s.id),
+            )
+        })?;
+        let model = s
+            .model
+            .as_deref()
+            .unwrap_or(sandbox::opencode::DEFAULT_MODEL);
+        sandbox::opencode::send_prompt(&endpoint, &s.sandbox_id, ocid, text, model)?;
+        eprintln!("pillbox: sent prompt to opencode session `{}`", s.id);
+        return Ok(());
+    }
     match session::Backend::parse(&s.backend) {
         Some(session::Backend::Docker) => {
             sandbox::local_docker::send_input(&s.sandbox_id, text.as_bytes())?;
@@ -500,6 +548,24 @@ fn resolve_streaming_session(
     action: &'static str,
 ) -> Result<(String, Option<events::transcripts::TailerHandle>)> {
     if let Ok(s) = session::resolve(resolved, id) {
+        // Server-integration agents (opencode) have no transcript file — read
+        // their HTTP `/event` stream into the log via the bridge instead.
+        if is_server_agent(&s.agent_id) {
+            let tailer = match opencode_endpoint(resolved, &s) {
+                Ok(endpoint) => {
+                    let log = crate::events::log::SessionLog::open(resolved, &s.id)?;
+                    sandbox::opencode::spawn_event_bridge(&endpoint, &s.sandbox_id, &s.id, log)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "pillbox: note: can't reach the opencode server ({e}); \
+                         reading the existing log"
+                    );
+                    None
+                }
+            };
+            return Ok((s.id, tailer));
+        }
         let tailer = match session::Backend::parse(&s.backend) {
             Some(session::Backend::Docker) => {
                 let spec = crate::agents::lookup(action, &s.agent_id)?;
@@ -604,7 +670,7 @@ fn render_watch_event(ev: &crate::contract::Event, role: &mut crate::contract::R
         Payload::MessageDelta(d) => {
             let who = match *role {
                 Role::User => "you",
-                Role::Assistant => "claude",
+                Role::Assistant => "assistant",
                 Role::System => "system",
                 Role::Unspecified => "agent",
             };

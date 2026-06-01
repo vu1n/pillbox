@@ -548,6 +548,8 @@ fn persist_session_from_pump(
         expires_at: args.expires_at,
         // Empty: e2b's transcript is sandbox-side (live tailing is local-docker only).
         guest_cwd: String::new(),
+        agent_session_id: None,
+        model: None,
     };
     session::write(args.resolved, &session)?;
     Ok(session)

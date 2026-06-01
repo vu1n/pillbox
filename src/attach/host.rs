@@ -49,14 +49,98 @@ struct Hub {
 type SharedWriter = Arc<Mutex<Box<dyn std::io::Write + Send>>>;
 type SharedMaster = Arc<Mutex<Box<dyn MasterPty + Send>>>;
 
-/// Run the pty-host: spawn `argv` under a PTY and serve frames on `sock`
-/// until the child exits. `argv[0]` is the program; the rest are args.
+/// Run the pty-host on a unix socket: spawn `argv` under a PTY and serve frames
+/// on `sock` until the child exits. `argv[0]` is the program; the rest are args.
 pub(crate) fn run(sock: &str, argv: &[String]) -> Result<()> {
+    let session = spawn_pty_session(argv)?;
+    let _ = std::fs::remove_file(sock);
+    let listener = UnixListener::bind(sock).with_context(|| format!("binding {sock}"))?;
+    for stream in listener.incoming().flatten() {
+        session.serve(stream);
+    }
+    Ok(())
+}
+
+/// Run the pty-host over **vsock** (guest-side, for the libkrun backend): the
+/// guest **dials the host** (`VMADDR_CID_HOST`) on `port`; libkrun bridges to the
+/// parent's pre-bound listener, which `accept()`s only once we're up — so there's
+/// no connect-before-ready race (the proven libkrun vsock direction). A vsock
+/// connection is a `SOCK_STREAM` fd, so it wraps as a `UnixStream` and reuses
+/// [`handle_client`] unchanged. Reconnects after a client leaves (reattach).
+/// Linux-only — the host (macOS) never runs this; it pumps the bridged socket.
+#[cfg(target_os = "linux")]
+pub(crate) fn run_vsock(port: u32, argv: &[String]) -> Result<()> {
+    use std::os::unix::io::FromRawFd;
+    use std::time::Duration;
+
+    const VMADDR_CID_HOST: u32 = 2;
+    let session = spawn_pty_session(argv)?;
+    loop {
+        let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) };
+        if fd < 0 {
+            anyhow::bail!("AF_VSOCK socket: {}", std::io::Error::last_os_error());
+        }
+        let mut addr: libc::sockaddr_vm = unsafe { std::mem::zeroed() };
+        addr.svm_family = libc::AF_VSOCK as libc::sa_family_t;
+        addr.svm_port = port;
+        addr.svm_cid = VMADDR_CID_HOST;
+        let alen = std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t;
+        let rc = unsafe { libc::connect(fd, &addr as *const _ as *const libc::sockaddr, alen) };
+        if rc != 0 {
+            unsafe { libc::close(fd) };
+            std::thread::sleep(Duration::from_millis(100)); // host listener not up yet
+            continue;
+        }
+        // Serve this client inline (blocks until it disconnects), then loop to
+        // accept the next attach. The reader-on-child-exit exits the process.
+        session.serve_blocking(unsafe { UnixStream::from_raw_fd(fd) });
+    }
+}
+
+/// The running PTY session: the agent's PTY behind the hub/screen, ready to
+/// serve attach clients. Built once; each accepted connection (unix or vsock)
+/// is handed to [`Self::serve`].
+struct PtySession {
+    hub: Arc<Mutex<Hub>>,
+    writer: SharedWriter,
+    master: SharedMaster,
+    gate: WriterGate,
+}
+
+impl PtySession {
+    /// Serve one attach client connection on its own thread.
+    fn serve(&self, stream: UnixStream) {
+        let (hub, writer, master, gate) = (
+            self.hub.clone(),
+            self.writer.clone(),
+            self.master.clone(),
+            self.gate.clone(),
+        );
+        thread::spawn(move || handle_client(stream, hub, writer, master, gate));
+    }
+
+    /// Serve one client on the calling thread (blocks until it disconnects).
+    /// Used by the connect-out vsock loop, which dials a fresh connection per
+    /// client rather than accepting on a listener.
+    #[cfg(target_os = "linux")]
+    fn serve_blocking(&self, stream: UnixStream) {
+        handle_client(
+            stream,
+            self.hub.clone(),
+            self.writer.clone(),
+            self.master.clone(),
+            self.gate.clone(),
+        );
+    }
+}
+
+/// Spawn `argv` under a PTY and start the reader→clients fan-out, returning the
+/// [`PtySession`] the transport-specific accept loop serves clients from.
+fn spawn_pty_session(argv: &[String]) -> Result<PtySession> {
     let (program, args) = argv
         .split_first()
         .context("pty-host requires a command after `--`")?;
 
-    let _ = std::fs::remove_file(sock);
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: DEFAULT_ROWS,
@@ -148,13 +232,12 @@ pub(crate) fn run(sock: &str, argv: &[String]) -> Result<()> {
         });
     }
 
-    let listener = UnixListener::bind(sock).with_context(|| format!("binding {sock}"))?;
-    for stream in listener.incoming().flatten() {
-        let (hub, writer, master, gate) =
-            (hub.clone(), writer.clone(), master.clone(), gate.clone());
-        thread::spawn(move || handle_client(stream, hub, writer, master, gate));
-    }
-    Ok(())
+    Ok(PtySession {
+        hub,
+        writer,
+        master,
+        gate,
+    })
 }
 
 fn handle_client(

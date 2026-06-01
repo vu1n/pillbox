@@ -390,9 +390,12 @@ enum Command {
     /// (or locally); not a user-facing command. See docs/attach-transport.md.
     #[command(hide = true)]
     PtyHost {
-        /// Unix socket to listen on for attach clients.
+        /// Unix socket to listen on for attach clients (docker / ssh backends).
         #[arg(long, value_name = "PATH")]
-        sock: String,
+        sock: Option<String>,
+        /// vsock port to listen on instead (libkrun guest backend; Linux-only).
+        #[arg(long, value_name = "PORT")]
+        vsock_port: Option<u32>,
         /// Command to run under the PTY: everything after `--`.
         #[arg(last = true, value_name = "CMD")]
         argv: Vec<String>,
@@ -691,7 +694,19 @@ fn run(cli: Cli) -> Result<()> {
         }
         // Internal attach-transport commands. No pillbox resolution: they
         // operate on a raw PTY + socket and are invoked by pillbox itself.
-        Command::PtyHost { sock, argv } => attach::host::run(&sock, &argv),
+        Command::PtyHost {
+            sock,
+            vsock_port,
+            argv,
+        } => match (sock, vsock_port) {
+            (Some(s), None) => attach::host::run(&s, &argv),
+            (None, Some(port)) => pty_host_vsock(port, &argv),
+            _ => Err(PillboxError::usage(
+                "pty-host",
+                "exactly one of --sock or --vsock-port is required",
+            )
+            .into()),
+        },
         Command::PtyRelay { sock } => attach::relay::run(&sock),
     }
 }
@@ -755,6 +770,18 @@ fn dispatch_run(resolved: &Pillbox, agent: Option<String>, mut opts: RunOpts) ->
 
     let backend = crate::sandbox::select_backend(remote_record);
     backend.run(spec, opts, resolved)
+}
+
+/// Dispatch `pty-host --vsock-port` — Linux-only. The libkrun guest serves the
+/// attach frame protocol over vsock; the macOS host never runs this (it connects
+/// to the bridged socket and pumps).
+#[cfg(target_os = "linux")]
+fn pty_host_vsock(port: u32, argv: &[String]) -> Result<()> {
+    attach::host::run_vsock(port, argv)
+}
+#[cfg(not(target_os = "linux"))]
+fn pty_host_vsock(_port: u32, _argv: &[String]) -> Result<()> {
+    Err(PillboxError::usage("pty-host", "--vsock-port is Linux-only (the libkrun guest)").into())
 }
 
 /// Validate an `--events-webhook URL`:

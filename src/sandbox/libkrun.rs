@@ -28,13 +28,16 @@
 
 use std::ffi::CString;
 use std::os::raw::c_char;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use super::SandboxBackend;
+use crate::attach::pump;
 use crate::agents::{
     resolve_run_env, resolve_with_entries, workspace_mount_name, AgentSpec, Integration, RunOpts,
     GUEST_HOME, GUEST_WORKSPACE,
@@ -97,12 +100,21 @@ struct VmSpec {
     shares: Vec<Share>,
     /// Guest entrypoint argv (`exec[0]` is the path).
     exec: Vec<String>,
+    /// Attach channel: the guest pty-host listens on this vsock port, the parent
+    /// connects via the host unix socket (`krun_add_vsock_port2`, listen=true).
+    vsock: Option<VsockAttach>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct Share {
     tag: String,
     host_path: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct VsockAttach {
+    port: u32,
+    host_sock: String,
 }
 
 /// The local microVM backend. Selected for a local run when the `libkrun`
@@ -180,7 +192,10 @@ impl SandboxBackend for LibkrunBackend {
             .chain(opts.args.iter().cloned())
             .collect();
         // Quote every interpolated path — the workspace name can legitimately
-        // contain a space (and must never be shell-evaluated).
+        // contain a space (and must never be shell-evaluated). The agent runs
+        // under the in-guest pty-host serving the Frame protocol over vsock (the
+        // same attach transport the docker/ssh backends use, just a different
+        // pipe), which the parent attaches to and pumps below.
         let home_q = shell_quote(GUEST_HOME);
         let gw_q = shell_quote(&guest_workspace);
         let agent = agent_argv
@@ -190,8 +205,13 @@ impl SandboxBackend for LibkrunBackend {
             .join(" ");
         let script = format!(
             "set -e; mkdir -p {home_q}; mount -t virtiofs creds {home_q}; \
-             mkdir -p {gw_q}; mount -t virtiofs workspace {gw_q}; cd {gw_q}; exec {agent}",
+             mkdir -p {gw_q}; mount -t virtiofs workspace {gw_q}; cd {gw_q}; \
+             exec pillbox pty-host --vsock-port {ATTACH_PORT} -- {agent}",
         );
+
+        let attach_sock = krun_cache_dir()?
+            .join(format!("attach-{}.sock", uuid::Uuid::now_v7().simple()));
+        let _ = std::fs::remove_file(&attach_sock);
 
         let vmspec = VmSpec {
             rootfs: rootfs.to_string_lossy().into_owned(),
@@ -202,6 +222,10 @@ impl SandboxBackend for LibkrunBackend {
                 Share { tag: "workspace".into(), host_path: clone.to_string_lossy().into_owned() },
             ],
             exec: vec!["/bin/sh".into(), "-c".into(), script],
+            vsock: Some(VsockAttach {
+                port: ATTACH_PORT,
+                host_sock: attach_sock.to_string_lossy().into_owned(),
+            }),
         };
         let spec_file = tempfile::Builder::new()
             .prefix("pillbox-krun-spec-")
@@ -215,17 +239,60 @@ impl SandboxBackend for LibkrunBackend {
             spec.id
         );
         let exe = std::env::current_exe().context("locate the pillbox binary to re-exec as VMM")?;
-        // Secrets travel as the child's environment (not argv/file); env_clear so
-        // only the composed guest env reaches the VM, then forwarded by the child.
-        let status = Command::new(&exe)
+        // Spawn (don't block): the child boots the VM + the guest pty-host listens
+        // on the vsock attach port; the parent attaches over the bridged socket and
+        // pumps the terminal, then reaps the VM. Secrets travel as the child's env
+        // (env_clear so only the composed guest env reaches the VM).
+        // Bind the attach listener BEFORE booting: libkrun (in the child) dials it
+        // when the guest pty-host connects out, so it must already exist.
+        let listener = UnixListener::bind(&attach_sock)
+            .with_context(|| format!("bind attach socket {}", attach_sock.display()))?;
+        listener.set_nonblocking(true).ok();
+
+        let mut child = Command::new(&exe)
             .arg("__krun-vmm")
             .arg(spec_file.path())
             .env_clear()
             .envs(guest_env)
-            .status()
+            .spawn()
             .context("spawn the libkrun VMM subprocess")?;
-        eprintln!("pillbox: libkrun microVM exited (guest status {:?})", status.code());
-        Ok(())
+
+        // Wait for the guest pty-host to dial in (accept blocks until it's up),
+        // then run the shared terminal pump. Reaps the VM on return.
+        let stream = accept_attach(&listener, &mut child)?;
+        let write_half = stream.try_clone().context("clone attach stream")?;
+        let outcome = pump::attach_terminal(stream, write_half, false)?;
+        let _ = child.wait();
+        match outcome {
+            pump::Outcome::Exited(code) if code != 0 => std::process::exit(code),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// vsock port the guest pty-host dials for the attach channel.
+const ATTACH_PORT: u32 = 1024;
+
+/// Accept the guest pty-host's attach connection on the pre-bound listener,
+/// waiting across VM boot. Fails fast if the VMM child dies first.
+fn accept_attach(listener: &UnixListener, child: &mut std::process::Child) -> Result<UnixStream> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        match listener.accept() {
+            Ok((s, _)) => {
+                s.set_nonblocking(false).ok();
+                return Ok(s);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e).context("accept attach connection"),
+        }
+        if let Some(status) = child.try_wait().context("poll VMM child")? {
+            bail!("libkrun VMM exited before attach was ready (status {:?})", status.code());
+        }
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for the guest pty-host to connect");
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -282,6 +349,7 @@ pub(crate) fn vmm_child_main() -> ! {
         .iter()
         .map(|s| (cstr(&s.tag), cstr(&s.host_path)))
         .collect();
+    let vsock = spec.vsock.as_ref().map(|v| (v.port, cstr(&v.host_sock)));
 
     unsafe {
         let ctx = ffi::krun_create_ctx();
@@ -295,6 +363,12 @@ pub(crate) fn vmm_child_main() -> ! {
         rc = rc.min(ffi::krun_set_workdir(ctx, workdir.as_ptr()));
         for (tag, host) in &shares {
             rc = rc.min(ffi::krun_add_virtiofs(ctx, tag.as_ptr(), host.as_ptr()));
+        }
+        if let Some((port, host_sock)) = &vsock {
+            // Default direction: the guest pty-host dials `port`, libkrun bridges
+            // to the parent's listener at `host_sock`. (Guest-connects-out is the
+            // proven direction; the parent's accept() waits for us — no race.)
+            rc = rc.min(ffi::krun_add_vsock_port(ctx, *port, host_sock.as_ptr()));
         }
         rc = rc.min(ffi::krun_set_exec(ctx, exec.as_ptr(), argv_ptrs.as_ptr(), envp.as_ptr()));
         if rc < 0 {

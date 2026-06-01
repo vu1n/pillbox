@@ -721,6 +721,21 @@ fn dispatch_run(resolved: &Pillbox, agent: Option<String>, mut opts: RunOpts) ->
         .map(|target| remote::resolve_run_target(resolved, target))
         .transpose()?;
 
+    // Server-integration agents (opencode) run headless + are driven/read over
+    // their HTTP API by the LocalDocker server path; the remote backends only
+    // know the PTY launch, so `--remote` would silently pty-host `opencode serve`
+    // and misbehave. Reject loudly here (the canonical dispatch point) rather
+    // than let a wrong-path run through. Local-only until a server-mode remote
+    // backend exists (the libkrun/managed work).
+    if spec.integration == crate::agents::Integration::Server && remote_record.is_some() {
+        return Err(PillboxError::usage(
+            "run",
+            format!("`{}` runs as a headless server and is local-only today", spec.id),
+        )
+        .with_next(format!("drop --remote: pillbox run --agent {}", spec.id))
+        .into());
+    }
+
     // Local runs only: nudge if Raindrop Workshop is installed but no
     // OTLP endpoint is set, so a silent "no events" doesn't surprise the
     // user. Remote sandboxes can't reach Workshop's localhost endpoint

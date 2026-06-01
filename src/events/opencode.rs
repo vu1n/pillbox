@@ -33,7 +33,7 @@
 //! status is emitted only when it *changes* (`pending`→`running`→`completed`)
 //! so a chatty input-stream doesn't flood the log with duplicate `ToolCall`s.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use serde_json::Value;
 
@@ -46,10 +46,11 @@ use crate::events::log::SessionLog;
 /// Stateful opencode-event → §0-payload mapper. One per session stream.
 #[derive(Default)]
 pub(crate) struct EventMapper {
-    /// Assistant message ids we've already emitted a `MessageStart` for
-    /// (`message.updated` fires repeatedly for the same message).
-    started: HashSet<String>,
-    /// The currently-open assistant message id, ended on `session.idle`.
+    /// The currently-open assistant message id (set on the first `message.updated`
+    /// for an assistant message, cleared on `session.idle`). `message.updated`
+    /// fires repeatedly for the same message; comparing against this suppresses
+    /// duplicate `MessageStart`s without an ever-growing seen-set, since opencode
+    /// opens exactly one assistant message per turn (a new id only after idle).
     open_msg: Option<String>,
     /// `callID → last emitted tool status`, so we only emit a `ToolCall` when a
     /// tool's status actually changes, not on every input-stream tick. Keyed on
@@ -101,7 +102,7 @@ impl EventMapper {
         let info = p.get("info").unwrap_or(&Value::Null);
         let role = info.get("role").and_then(Value::as_str).unwrap_or_default();
         let id = info.get("id").and_then(Value::as_str).unwrap_or_default();
-        if role != "assistant" || id.is_empty() || !self.started.insert(id.to_string()) {
+        if role != "assistant" || id.is_empty() || self.open_msg.as_deref() == Some(id) {
             return vec![];
         }
         self.open_msg = Some(id.to_string());
@@ -124,12 +125,17 @@ impl EventMapper {
             })],
             // Default to text (the common case; opencode's deltas are `text`).
             _ => {
-                let message_id = p
+                // Attach to the delta's own messageID, falling back to the open
+                // assistant message. If neither exists there's nothing to attach
+                // to — drop it rather than emit a delta with an empty id.
+                let Some(message_id) = p
                     .get("messageID")
                     .and_then(Value::as_str)
-                    .or(self.open_msg.as_deref())
-                    .unwrap_or_default()
-                    .to_string();
+                    .map(str::to_string)
+                    .or_else(|| self.open_msg.clone())
+                else {
+                    return vec![];
+                };
                 vec![Payload::MessageDelta(MessageDelta {
                     message_id,
                     text: delta.to_string(),

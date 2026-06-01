@@ -27,7 +27,7 @@
 //! runtime with `PILLBOX_BACKEND=libkrun`.
 
 use std::ffi::CString;
-use std::os::raw::c_char;
+use std::os::raw::{c_char, c_int};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -35,6 +35,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+
+mod egress;
 
 use super::SandboxBackend;
 use crate::attach::pump;
@@ -103,6 +105,18 @@ struct VmSpec {
     /// Attach channel: the guest pty-host listens on this vsock port, the parent
     /// connects via the host unix socket (`krun_add_vsock_port2`, listen=true).
     vsock: Option<VsockAttach>,
+    /// Egress: when set, the child attaches a virtio-net device and runs the
+    /// userspace stack (DNS fence over `allowlist`). Policy only — non-secret.
+    egress: Option<EgressSpec>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct EgressSpec {
+    /// DNS-fence allowlist: only these hosts resolve; everything else NXDOMAINs.
+    allowlist: Vec<String>,
+    /// Optional host-side diagnostics file (the guest console eats the child's
+    /// stderr). Set from `PILLBOX_KRUN_EGRESS_LOG`; `None` falls back to stderr.
+    log_path: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -120,10 +134,12 @@ struct VsockAttach {
 /// The local microVM backend. Selected for a local run when the `libkrun`
 /// feature is built in and `PILLBOX_BACKEND=libkrun` is set.
 ///
-/// Slice 3 (this): mirror `local_docker::run`'s creds + workspace + env pipeline
-/// — share the agent's auth home, CoW-clone + secret-scrub the workspace, compose
-/// the run env — and launch the agent in the microVM (libkrun's native console
-/// for I/O). Attach over vsock (the `Frame` protocol) + §0 + vault-v2 are next.
+/// Mirrors `local_docker::run`'s creds + workspace + env pipeline (share the
+/// agent's auth home, CoW-clone + secret-scrub the workspace, compose the run
+/// env), launches the agent under an in-guest pty-host serving the `Frame`
+/// protocol over vsock (L4), and attaches a userspace egress stack with a DNS
+/// fence (L5a). The vault-v2 MITM (terminate + cred swap + forward) and §0 are
+/// the remaining slices — L5b consumes the DNS-pin this egress stack populates.
 pub(crate) struct LibkrunBackend;
 
 impl SandboxBackend for LibkrunBackend {
@@ -203,8 +219,11 @@ impl SandboxBackend for LibkrunBackend {
             .map(|a| shell_quote(a))
             .collect::<Vec<_>>()
             .join(" ");
+        // Egress: bring up the guest NIC + route DNS/egress through the userspace
+        // stack the VMM child runs (the DNS fence allows only the provider hosts).
+        let net = egress::guest_net_commands();
         let script = format!(
-            "set -e; mkdir -p {home_q}; mount -t virtiofs creds {home_q}; \
+            "set -e; {net}; mkdir -p {home_q}; mount -t virtiofs creds {home_q}; \
              mkdir -p {gw_q}; mount -t virtiofs workspace {gw_q}; cd {gw_q}; \
              exec pillbox pty-host --vsock-port {ATTACH_PORT} -- {agent}",
         );
@@ -225,6 +244,13 @@ impl SandboxBackend for LibkrunBackend {
             vsock: Some(VsockAttach {
                 port: ATTACH_PORT,
                 host_sock: attach_sock.to_string_lossy().into_owned(),
+            }),
+            egress: Some(EgressSpec {
+                allowlist: crate::vault::known_secrets::known_hosts()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                log_path: std::env::var("PILLBOX_KRUN_EGRESS_LOG").ok(),
             }),
         };
         let spec_file = tempfile::Builder::new()
@@ -351,6 +377,16 @@ pub(crate) fn vmm_child_main() -> ! {
         .map(|s| (cstr(&s.tag), cstr(&s.host_path)))
         .collect();
     let vsock = spec.vsock.as_ref().map(|v| (v.port, cstr(&v.host_sock)));
+    // Egress: a passt socketpair — one end to libkrun's virtio-net, the other to
+    // our userspace stack. `(libkrun_fd, host_fd, allowlist)`.
+    let net: Option<(c_int, c_int, Vec<String>, Option<String>)> = spec.egress.as_ref().map(|e| {
+        let mut fds = [0 as c_int; 2];
+        if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) } != 0 {
+            eprintln!("krun-vmm: egress socketpair: {}", std::io::Error::last_os_error());
+            std::process::exit(1);
+        }
+        (fds[0], fds[1], e.allowlist.clone(), e.log_path.clone())
+    });
 
     unsafe {
         let ctx = ffi::krun_create_ctx();
@@ -371,10 +407,26 @@ pub(crate) fn vmm_child_main() -> ! {
             // proven direction; the parent's accept() waits for us — no race.)
             rc = rc.min(ffi::krun_add_vsock_port(ctx, *port, host_sock.as_ptr()));
         }
+        if let Some((libkrun_fd, _, _, _)) = net.as_ref() {
+            rc = rc.min(ffi::krun_add_net_unixstream(
+                ctx,
+                std::ptr::null(),
+                *libkrun_fd,
+                egress::GUEST_MAC.as_ptr(),
+                0,
+                0,
+            ));
+        }
         rc = rc.min(ffi::krun_set_exec(ctx, exec.as_ptr(), argv_ptrs.as_ptr(), envp.as_ptr()));
         if rc < 0 {
             eprintln!("krun-vmm: configuration failed (rc={rc})");
             std::process::exit(1);
+        }
+        // Run the userspace egress stack on our end of the socketpair before the
+        // VM boots, so it's servicing frames the moment the guest's NIC comes up.
+        // The thread dies when start_enter exit()s this process on VM shutdown.
+        if let Some((_, host_fd, allowlist, log_path)) = net {
+            std::thread::spawn(move || egress::run(host_fd, allowlist, log_path));
         }
         let rc = ffi::krun_start_enter(ctx);
         eprintln!("krun-vmm: start_enter returned {rc} (pre-boot config error)");

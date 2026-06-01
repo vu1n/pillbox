@@ -561,6 +561,14 @@ Docker untouched until step 8. Slices (each its own commit, default build green)
     into `spawn_pty_session` so unix (docker/ssh) + vsock share it. Verified:
     `--version` output reached the host pump over vsock. **Needs a runner image
     built from this src** (the guest pillbox must have `--vsock-port`).
+  - ✅ **L5a Egress transport + DNS fence** — virtio-net socketpair in the VMM
+    child → `egress::run` (smoltcp `Device` + poll loop + DNS responder), spawned
+    beside `start_enter`. DNS fence: `known_secrets` provider hosts resolve to the
+    gateway + get **pinned**; everything else NXDOMAINs (default-deny). Guest NIC
+    up via `ip` (`iproute2` added to the runner). **Live-verified**
+    (`pillbox-runner:l5a`): claude pinned `api.anthropic.com`; `platform.claude.com`
+    / `downloads.claude.ai` / datadog all fenced. Host-side diagnostics → a file
+    (libkrun eats the child's stderr; see the L5 phase notes below).
   - **L5 §0 + vault-v2 + egress** — a *phase*, sub-sliced. **Architecture:** the
     smoltcp egress stack runs in the **VMM child** (a thread alongside
     `start_enter`, netspike's shape), not the parent — `start_enter` is in the
@@ -590,12 +598,26 @@ Docker untouched until step 8. Slices (each its own commit, default build green)
         denies it (no route off the allowlist); standard/permissive's arbitrary
         NAT (or gvproxy/passt, or TSI if it turns out to work) is future work.
     Sub-slices:
-      - **L5a egress transport** — virtio-net in the child → smoltcp Device + poll
-        loop (graduate netspike). The substrate L5b's MITM sits on; brings the
-        guest's interface up (no arbitrary NAT yet).
-      - **L5b vault (own MITM)** — DNS-fence + DNS-pin (`PinTable`, per-sandbox) +
-        rustls terminate (CA-minted cert, ALPN-pinned h1) + the in-repo
-        `VaultProvider` swap + forward to the bounded provider allowlist.
+      - **L5a egress transport + DNS fence ✅** — virtio-net in the VMM child →
+        smoltcp `Device` + poll loop (`sandbox/libkrun/egress.rs`, graduated from
+        netspike) + a DNS responder: allowlisted (the `known_secrets` provider
+        hosts) → A=gateway + **pinned**; everything else → NXDOMAIN (default-deny
+        at the name layer). Guest NIC configured via `ip` (added `iproute2` to the
+        runner). **Live-verified** (`pillbox-runner:l5a`): claude resolved
+        `api.anthropic.com` (pinned) and its telemetry/update hosts
+        (`platform.claude.com`, `downloads.claude.ai`, datadog) were all fenced.
+        *Two findings:* (1) **libkrun wires the guest console to the VMM child's
+        stdio**, so the egress thread's stderr is swallowed — host-side egress
+        diagnostics go to a file (`PILLBOX_KRUN_EGRESS_LOG`, carried via `VmSpec`
+        past the child's `env_clear`) until L5c routes them as §0 events. (2) the
+        allowlist holds `api.github.com`, so bare `github.com` is (correctly)
+        fenced — the L5b allowlist should track the *vaulted secrets in play*, not
+        a static provider list.
+      - **L5b vault (own MITM)** — rustls terminate (CA-minted cert, ALPN-pinned
+        h1) on a TCP listener at the gateway + the in-repo `VaultProvider` swap +
+        forward to the bounded provider allowlist, gated on the L5a DNS-pin
+        (`PinTable::contains`). Adds the IP-level pin (dest must match the name's
+        resolved IP) on top of the name-level pin L5a populates.
       - **L5c §0 producer** — guest emits `Event` NDJSON over a 2nd vsock port →
         parent drains to `SessionLog`.
     **Env fork — secrets go to the vault, not the VM env** (lands with L5b; this is

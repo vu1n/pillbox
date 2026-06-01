@@ -64,6 +64,7 @@ RUN apt-get update \
 		curl \
 		gh \
 		git \
+		iproute2 \
 		jq \
 		openssl \
 		python3 \

@@ -6,7 +6,26 @@ opencode `serve` is a headless HTTP server with a typed `/event` SSE stream and
 a prompt API — *literally* "an agent-as-a-service you put a frontend on." This
 doc tracks wiring them in. See memory `pillbox-opencode-pi-structured-integration`.
 
-## Done + verified (committed)
+## Status: opencode is wired + live-verified ✅ (commit `1765e6b`)
+
+The full loop runs against local docker with z.ai GLM auth: `pillbox run --agent
+opencode -- "…"` brings up `opencode serve`, creates a session, sends the prompt;
+`pillbox session watch <id>` streamed the GLM reply (`B`/`AN`/`ANA` → `BANANA`)
+plus the `NeedsInput` attention signal; `pillbox session send <id> "…"` drove a
+follow-up turn. `AgentSpec.integration = {Pty, Server}` is the one fork
+(opencode=Server); claude/codex/pi keep the PTY path. Server-mode run launches
+headless (no PTY, no vault — opencode isn't vault-capable), records a session
+with the opencode session id + model, and the user drives via `session send`
+(→ `prompt_async`) / reads via `session watch`/`subscribe` (→ the `/event`
+bridge). `--model PROVIDER/MODEL`, default `zai-coding-plan/glm-4.5-air`.
+
+**Follow-ups:** the run-time initial prompt streams *before* any `watch`
+connects the bridge, so that first turn isn't captured host-side — drive-then-
+watch or watch-then-send both work; capturing the initial turn wants the bridge
+spawned at run time (or an inline stream-until-idle mode). **pi** (`--mode rpc`)
+is the remaining sibling. `opencode acp` could generalize the adapter.
+
+## The core (committed earlier)
 
 The hard core — opencode's event stream → pillbox's §0 — is built and tested:
 
@@ -55,29 +74,24 @@ and POSTs there fall through to the SPA HTML.
 - **Models:** `GET /api/model`. zai-coding-plan ids are GLM-5 era now
   (`glm-5.1`, `glm-4.7`, `glm-4.5-air`, …) — not `glm-4.6`.
 
-## Remaining wiring (mechanical, scoped)
+## Wiring — done (commit `1765e6b`)
 
-1. **`AgentSpec` integration mode** — add `integration: Integration { Pty, Server }`;
-   opencode → `Server`, claude/codex/pi → `Pty`. A const serve port.
-2. **The event bridge** — `docker exec <c> curl -sN localhost:<P>/event` →
-   `events::opencode::drain_sse` in a thread → host `SessionLog`. Mirror
-   `remote_docker::spawn_transcript_stream` exactly (reuse `docker::exec_attach_at`
-   + `TailerHandle::from_stream`); works for local *and* remote docker uniformly.
-3. **Run path** (`local_docker::run`, guarded by `integration == Server`): launch
-   `opencode serve` (not `pty-host`), spawn the bridge, record the session, print
-   "server up — drive with `session send` / read with `session watch`". **Server
-   mode has no PTY**, so this is a distinct path — claude/codex/pi keep the PTY
-   path untouched. This is the invasive bit; do it guarded + run the full suite.
-4. **Session commands fork on integration** — `session send` (Server) → `docker
-   exec <c> curl -X POST /session/{id}/prompt_async` with the parts+model body
-   (not the pty-relay); `session watch`/`subscribe` already work (they read the
-   log the bridge fills); `attach` has no PTY meaning for Server mode (decide:
-   error with a pointer to `watch`, or attach = `watch`+`send`). The model
-   (`providerID`/`modelID`) needs a source — pillbox default, `pillbox.toml`, or
-   a `run` flag.
-5. **pi** — sibling over `pi --mode rpc` / `--mode json` (structured stdio, not
-   HTTP). Investigate its RPC schema first, then a stdio adapter feeding the same
-   `SessionLog`. Different transport, same §0 sink.
+1. ✅ `AgentSpec.integration {Pty, Server}` — opencode=Server, others=Pty.
+2. ✅ Event bridge — `sandbox::opencode::spawn_event_bridge` (`docker exec curl
+   -N /event` → `drain_sse` → log, `TailerHandle`-managed; local + remote docker).
+3. ✅ Run path — `local_docker::run_server` (guarded; no PTY, no vault; records
+   session w/ ocid + model; optional initial prompt; prints watch/send hints).
+4. ✅ Session forks — `session send` (Server) → `prompt_async`;
+   `resolve_streaming_session` (Server) → the bridge. `attach` still PTY-only
+   (Server users `watch`+`send`). Model via `--model`, default in `sandbox::opencode`.
+5. ⬜ **pi** — sibling over `pi --mode rpc` / `--mode json` (structured stdio,
+   not HTTP). Investigate its RPC schema first, then a stdio adapter feeding the
+   same `SessionLog`. Different transport, same §0 sink.
+
+⬜ **Initial-prompt capture:** the run-time prompt streams before any `watch`
+connects the bridge → that first turn isn't in the host log. Fix: spawn the
+bridge at run time, or an inline stream-until-idle run mode. Drive-then-watch /
+watch-then-send both capture fine today.
 
 ## Auth: prefer device/API-key, not browser-loopback (verified)
 

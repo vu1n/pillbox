@@ -358,33 +358,40 @@ Proof binary `netspike` + the guest's `pillbox-init net` branch (proof crate at
   ones back (passt-framed). It owns the gateway IP `10.0.2.2/24` + a gateway MAC,
   answers ARP, and **terminates the guest's TCP** — a real in-guest
   `TcpStream::connect` completes against the userspace stack.
-- **Phase 3 — the egress gate + MITM:** the stack drives a
-  `rustls::ServerConnection` off the smoltcp poll loop
-  (`read_tls`/`process_new_packets`/`write_tls`) and gates on rustls's own
-  **SNI** — **ALLOW** an allowlisted host (`api.anthropic.com`), **RST** a denied
-  host (`evil.example.com` → `abort()`), **default-deny by-IP** (a connect to an
-  IP the stack doesn't own, `10.0.2.99`, gets no SYN-ACK → the guest's connect
-  fails). For an allowed host it **MITM-terminates the guest's real TLS** — the
-  guest's busybox `wget`+`ssl_client` does a **CA-verified** handshake (trusting
-  our MITM CA written to `/etc/spike-ca.pem`, `SSL_CERT_FILE`), and the stack
-  decrypts `GET /v1/ping`, **swaps the `x-api-key` stub→real** (the real never
-  reaches the guest — where the in-repo `VaultProvider` plugs in), and
-  **destination-verifies** the upstream (its own webpki-checked TLS to the real
-  `api.anthropic.com` chains to a public root) before authorizing release.
+- **Phase 3 — DNS-fence + MITM + DNS-pin (the hardened gate):**
+  - **DNS fence (brood-box's mechanism):** the stack runs a **DNS resolver** on
+    UDP `:53` (the guest's `resolv.conf` → `10.0.2.2`). A non-allowlisted name
+    gets **NXDOMAIN** — verified: `evil.example.com` → NXDOMAIN, the guest can't
+    even resolve it. An allowlisted name resolves (to the proxy IP) and is
+    **pinned**.
+  - **DNS-pin credential gate (microsandbox's mechanism):** on TLS, the stack
+    drives a `rustls::ServerConnection` off the poll loop and gates on **SNI ∈
+    allowlist AND SNI ∈ the DNS-pin set** — a forged-SNI / hardcoded-IP
+    connection that skipped our resolver is RST. This **replaced the spike's
+    blocking `verify_upstream`** (the 2nd-handshake the review flagged): the pin
+    is non-blocking and proves the guest legitimately resolved that exact host.
+  - **MITM + swap (kept):** for an allowed+pinned host the guest's busybox
+    `wget`+`ssl_client` does a **CA-verified** handshake (trusting our MITM CA at
+    `/etc/spike-ca.pem`), the stack decrypts `GET /v1/ping` and **swaps the
+    `x-api-key` stub→real** (real never reaches the guest — where the in-repo
+    `VaultProvider` plugs in). Guest got `200 ok`, exit 0.
+  - **default-deny by-IP (kept):** a direct connect to an IP the stack doesn't
+    own (`10.0.2.99`) gets no SYN-ACK → the guest's connect fails.
 - **Self-replenishing listener pool:** holds "≥ `POOL_MIN_FREE` sockets in
   LISTEN, capped at `POOL_MAX`" — tops up when a SYN takes a listener, recycles
-  fully-closed ones. Scales to the many concurrent egress connections a real
-  agent opens, instead of a fixed count + `TIME_WAIT` luck.
+  fully-closed ones. Scales to concurrent egress connections, not a fixed count.
 
 **Crypto:** `ring`-backed `rustls` + pre-generated test PKI (`certs/`, loaded via
 `rustls-pemfile`) — no cmake/aws-lc/C toolchain, no rcgen API churn.
 
 **Still in-repo work (not a substrate unknown):** re-host the *exact* in-repo
-`VaultProvider` trait + hudsucker request/response handlers here (hyper-level,
-already proven) and **splice** the swapped request to the verified upstream (the
-spike synthesizes a `200` instead of forwarding). The substrate they ride —
-frame transport + userspace TCP termination + MITM + swap + dest-verify — is
-proven end to end. Profiles (`locked`/`standard`/`permissive`) are allowlist
+`VaultProvider` trait + hudsucker request/response handlers (hyper-level, already
+proven); **NAT-forward + splice** the swapped request to the *real* upstream (the
+spike resolves allowlisted names to the proxy IP and synthesizes a `200` rather
+than forwarding); and **IP-level pin** to the real resolved address (the spike's
+pin is name-level — it answers the proxy IP for all allowlisted names). The
+mechanics this proves — DNS fence + DNS-pin + MITM + swap on the owned stack —
+are end-to-end green. Profiles (`locked`/`standard`/`permissive`) are allowlist
 contents over this same gate.
 
 **In-repo-landing checklist (flagged by a 2026-06-01 quality review; deferred
@@ -398,16 +405,17 @@ off the throwaway spike, mandatory for the port):**
 - **Model the connection as a `MitmPhase` enum**, not the spike's
   `gated`/`handled` bool pair — adding a phase (drain, await-vault) shouldn't mean
   another negated-conjunction check.
-- **Replace `verify_upstream` with DNS-pin** (microsandbox's model — see [§ two
-  hardening gates](#the-two-hardening-gates-v2-adds-over-todays-blind-swap)). The
-  spike's second blocking TLS handshake stalls the whole poll loop; DNS-pinning
-  (snoop the guest's DNS answers, gate on SNI + dest-IP-in-pin-set) is
-  non-blocking and strictly stronger. This subsumes the old "non-blocking verify"
-  item.
+- ✅ **DNS-pin replaced `verify_upstream`** (done in the spike: a UDP `:53`
+  resolver pins allowlisted names, the TLS gate requires SNI ∈ pin set,
+  non-blocking). In-repo, **upgrade to IP-level pin** — resolve allowlisted names
+  to their *real* addresses and gate on dest-IP-in-the-resolved-set (the spike
+  answers the proxy IP for every allowlisted name, so its pin is name-level).
+- ✅ **DNS fence done in the spike** (NXDOMAIN for non-allowlisted names). In-repo,
+  add **TTL-bounded IP rules + conntrack** for non-provider tiers (brood-box) so
+  MITM stays scoped to provider hosts, plus **NAT-forward** allowlisted
+  non-provider hosts to the real upstream (the spike doesn't forward).
 - **Event-driven wakeup**, not the spike's fixed 2 ms poll-loop sleep (drive off
   the rx-queue / smoltcp `poll_at`).
-- **Fence the non-provider tiers** (brood-box: DNS-snoop allowlist → NXDOMAIN +
-  TTL-bounded IP rules + conntrack) so MITM stays scoped to provider hosts.
 
 ## Build order (proof-first)
 
@@ -421,19 +429,20 @@ off the throwaway spike, mandatory for the port):**
 4. ✅ **§0 producer** — done. `contract::Event` NDJSON streams over a second
    concurrent vsock port → host seq-authority → durable `log.jsonl` → replay
    verified. Real contract types vendored both ends. Recipe above.
-5. **Egress + vault v2** — ✅ substrate spiked end to end (virtio-net→socketpair,
-   smoltcp TCP termination, SNI gate, MITM-terminate + credential swap + the guest
-   doing CA-verified TLS — see [§ Step-5 spike](#step-5-spike-proven----egress-substrate--vault-v2-mechanics)).
+5. **Egress + vault v2** — ✅ spiked incl. hardening (virtio-net→socketpair, smoltcp
+   TCP termination, **DNS fence (NXDOMAIN) + DNS-pin gate + MITM + credential swap**
+   with the guest doing CA-verified TLS — see [§ Step-5 spike](#step-5-spike-proven----egress-substrate--vault-v2-mechanics)).
    **The in-repo landing is not "done" until every security deliverable below ships
    — they are acceptance criteria, not polish** (full rationale: [§ Why MITM](#why-mitm-at-all--substitute-vs-fence-2026-06-01-review),
    [§ hardening gates](#the-two-hardening-gates-v2-adds-over-todays-blind-swap)):
-   - [ ] **Default-deny egress** — closed unless the profile allows it (the
-     exfiltration guard; also the cross-user-pooling prerequisite).
-   - [ ] **Fence the non-provider tiers** (brood-box): DNS-snoop allowlist →
-     NXDOMAIN + TTL-bounded IP rules + conntrack. MITM is scoped to provider hosts.
-   - [ ] **DNS-pin credential release** (microsandbox): inject the real key only on
-     SNI-allowlisted **AND** dest-IP-in-the-sandbox's-DNS-answer-set. Replaces the
-     spike's blocking `verify_upstream`.
+   - [~] **Default-deny egress** — closed unless the profile allows it (the
+     exfiltration guard; also the cross-user-pooling prerequisite). *Spiked via the
+     DNS fence (NXDOMAIN) + by-IP drop; in-repo: enforce at the IP/conntrack layer.*
+   - [~] **Fence the non-provider tiers** (brood-box): DNS-snoop allowlist →
+     NXDOMAIN (✅ spiked) + TTL-bounded IP rules + conntrack + NAT-forward (in-repo).
+   - [~] **DNS-pin credential release** (microsandbox): inject the real key only on
+     SNI-allowlisted **AND** dest-IP-in-the-sandbox's-DNS-answer-set. *Spiked at
+     name-level (replaced `verify_upstream`); in-repo: upgrade to real-IP pin.*
    - [ ] **Re-host the exact `VaultProvider`/hudsucker handlers** + splice the
      swapped request to the verified upstream (vs the spike's synthesized 200).
    - [ ] **Egress profiles** `permissive`/`standard`/`locked`, and an **untrusted

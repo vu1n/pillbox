@@ -520,6 +520,29 @@ placement behind the same `SandboxBackend` trait + workspace/snapshot contract.
    **virtio-fs** mount; guest writes land in the clone, base stays the immutable
    fork point. In-repo landing: rustic snapshot of the result (flush/pull);
    overlayfs CoW on Linux hosts (clonefile is APFS-only); the fork-N fan-out.
+
+**In-repo landing (graduation) — IN PROGRESS.** Moving the proof crate into the
+pillbox repo behind `SandboxBackend`, feature-gated (`libkrun`, OFF by default),
+Docker untouched until step 8. Slices (each its own commit, default build green):
+  - ✅ **L1 Foundation** — `[features] libkrun`, a conditional `build.rs` (links
+    krun only under the feature, no-op otherwise), `sandbox/libkrun.rs` + the FFI,
+    selectable for a local run via `PILLBOX_BACKEND=libkrun`. Default build/tests
+    unaffected.
+  - ✅ **L2 Boot + agent** — `LibkrunBackend::run` boots a microVM and ran Claude
+    Code (`2.1.157`) *inside it*, from the real codesigned pillbox binary.
+    **Invariant: `krun_start_enter` does NOT return** — it `exit()`s with the
+    guest's code — so the backend re-execs a hidden `__krun-vmm` child that
+    *becomes* the VM while the parent supervises (and reads the child's exit code =
+    the guest's). This subprocess split is the spine for attach + §0. `krun/
+    entitlements.plist` + re-codesign after each build. `materialize_rootfs` =
+    `docker export` → cached `~/.pillbox/krun/rootfs/<image>` (virtio-fs root).
+  - **L3 Creds + workspace + env** — mirror `local_docker::run`'s pipeline; CoW
+    workspace (step 6) sharing the clone over virtio-fs; reuse `workspace::ingest`.
+  - **L4 Attach** — guest pty-host + the real `attach::frame`/`pump` over vsock
+    (parent connects to the control socket the `__krun-vmm` child bridges).
+  - **L5 §0 + vault-v2** — the §0 producer + the smoltcp egress stack (`PinTable`,
+    per-sandbox invariant). Then step 7 (opencode seam) + step 8 (deprecate Docker).
+
 7. **opencode** — repoint the bridge transport to the control channel, and pay
    down the structural debt a 2026-06-01 review flagged (deferred then because
    fixing it on the *docker* path = polishing code we're deleting):

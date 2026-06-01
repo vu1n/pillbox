@@ -27,14 +27,21 @@
 //! runtime with `PILLBOX_BACKEND=libkrun`.
 
 use std::ffi::CString;
-use std::path::PathBuf;
+use std::os::raw::c_char;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 
 use super::SandboxBackend;
-use crate::agents::{AgentSpec, RunOpts};
+use crate::agents::{
+    resolve_run_env, resolve_with_entries, workspace_mount_name, AgentSpec, Integration, RunOpts,
+    GUEST_HOME, GUEST_WORKSPACE,
+};
+use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
+use crate::workspace::WorkspaceBackend;
 
 /// libkrun C API bindings — the single home for the `unsafe extern "C"`
 /// signatures (header: `/opt/homebrew/include/libkrun.h`; linked + rpath'd by
@@ -79,62 +86,192 @@ pub(crate) mod ffi {
     }
 }
 
+// macOS APFS copy-on-write clone (recursive for directories), from libSystem.
+extern "C" {
+    fn clonefile(src: *const c_char, dst: *const c_char, flags: u32) -> std::os::raw::c_int;
+}
+
+/// The microVM spec the parent hands the VMM child (via a temp file — paths,
+/// not secrets). The guest env (incl. any `--with` secrets) travels separately
+/// as the child process's *environment*, which the child forwards to the guest
+/// — never on argv or in this file.
+#[derive(Serialize, Deserialize)]
+struct VmSpec {
+    rootfs: String,
+    vcpus: u8,
+    ram_mib: u32,
+    /// virtio-fs shares: host dir → guest tag (mounted by the exec script).
+    shares: Vec<Share>,
+    /// Guest entrypoint argv (`exec[0]` is the path).
+    exec: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Share {
+    tag: String,
+    host_path: String,
+}
+
 /// The local microVM backend. Selected for a local run when the `libkrun`
 /// feature is built in and `PILLBOX_BACKEND=libkrun` is set.
 ///
-/// Slice 2 (this): boot the runner rootfs as a microVM and smoke-run the agent
-/// binary, proving boot from the real (codesigned) pillbox binary via the
-/// subprocess VMM. Creds/workspace/env + attach over vsock + §0 layer on next.
+/// Slice 3 (this): mirror `local_docker::run`'s creds + workspace + env pipeline
+/// — share the agent's auth home, CoW-clone + secret-scrub the workspace, compose
+/// the run env — and launch the agent in the microVM (libkrun's native console
+/// for I/O). Attach over vsock (the `Frame` protocol) + §0 + vault-v2 are next.
 pub(crate) struct LibkrunBackend;
 
 impl SandboxBackend for LibkrunBackend {
-    fn run(&self, spec: &AgentSpec, _opts: RunOpts, resolved: &Pillbox) -> Result<()> {
+    fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
+        // Deferred to later slices — reject loudly rather than silently misbehave.
+        if spec.integration == Integration::Server {
+            return Err(unsupported(spec, "server-mode agents (opencode)"));
+        }
+        if opts.vault {
+            return Err(unsupported(spec, "--vault (egress + vault v2 is a later slice)"));
+        }
+        if opts.detach {
+            return Err(unsupported(spec, "--detach (session lifecycle is a later slice)"));
+        }
+
         let rootfs = materialize_rootfs(resolved)?;
-        let exe = std::env::current_exe().context("locate the pillbox binary to re-exec as VMM")?;
+
+        // ── creds: the agent's auth home, shared live at GUEST_HOME ──
+        let home = spec.home_dir(resolved)?;
+        if !home.join(spec.cred_sentinel).exists() {
+            return Err(PillboxError::runtime(
+                "run",
+                format!("no stored credentials for `{}`", spec.id),
+            )
+            .with_next(format!("pillbox auth login --agent {}", spec.id))
+            .into());
+        }
+
+        // ── workspace: CoW clone + secret-scrub, shared at GUEST_WORKSPACE/<name> ──
+        let workspace_host = match &opts.workspace {
+            Some(p) => p.clone(),
+            None => std::env::current_dir().context("resolve current working directory")?,
+        };
+        if let Some(name) = opts.from_bookmark.as_deref() {
+            let handle = crate::bookmarks::resolve_existing(resolved, name)?;
+            resolved.workspace()?.pull(&workspace_host, Some(&handle))?;
+        }
+        let workspace_name = workspace_mount_name(&workspace_host, opts.name.as_deref())?;
+        let guest_workspace = format!("{GUEST_WORKSPACE}/{workspace_name}");
+        let clone = cow_clone_and_scrub(&workspace_host)?;
+
+        // ── env: the canonical composer (bundles → env-file → --with), no vault ──
+        let withs = resolve_with_entries(resolved, &opts.withs)?;
+        let composed = resolve_run_env(resolved, &opts, &withs, None)?;
+        let mut guest_env: Vec<(String, String)> = vec![
+            ("HOME".into(), GUEST_HOME.into()),
+            ("TERM".into(), "xterm-256color".into()),
+            (
+                "PATH".into(),
+                format!("/usr/local/bin:/usr/bin:/bin:{GUEST_HOME}/.local/bin"),
+            ),
+        ];
+        guest_env.extend(composed);
+
+        // Pre-accept the agent's workspace-trust dialog on the live auth home
+        // before boot (claude); operates on host paths, like the docker path.
+        spec.prepare_workspace_or_warn(&home, &guest_workspace);
+
+        // The guest entrypoint: mount the shares, cd into the workspace, exec the
+        // agent (run_argv + sandbox defaults + user `-- args`).
+        let agent_argv: Vec<String> = spec
+            .run_argv
+            .iter()
+            .map(|s| s.to_string())
+            .chain(spec.sandbox_args.iter().map(|s| s.to_string()))
+            .chain(opts.args.iter().cloned())
+            .collect();
+        let script = format!(
+            "set -e; mkdir -p {GUEST_HOME}; mount -t virtiofs creds {GUEST_HOME}; \
+             mkdir -p {gw}; mount -t virtiofs workspace {gw}; cd {gw}; exec {agent}",
+            gw = guest_workspace,
+            agent = agent_argv.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" "),
+        );
+
+        let vmspec = VmSpec {
+            rootfs: rootfs.to_string_lossy().into_owned(),
+            vcpus: 2,
+            ram_mib: 2048,
+            shares: vec![
+                Share { tag: "creds".into(), host_path: home.to_string_lossy().into_owned() },
+                Share { tag: "workspace".into(), host_path: clone.to_string_lossy().into_owned() },
+            ],
+            exec: vec!["/bin/sh".into(), "-c".into(), script],
+        };
+        let spec_file = tempfile::Builder::new()
+            .prefix("pillbox-krun-spec-")
+            .suffix(".json")
+            .tempfile()
+            .context("create VMM spec tempfile")?;
+        serde_json::to_writer(&spec_file, &vmspec).context("write VMM spec")?;
 
         eprintln!(
-            "pillbox: libkrun backend (experimental) — booting microVM, rootfs {}",
-            rootfs.display()
-        );
-        // Smoke: prove the agent binary runs inside the booted runner rootfs.
-        // The full run (creds + workspace + env + attach) is the next slice.
-        let smoke = format!(
-            "{} --version 2>&1 || true; echo PILLBOX-KRUN-SMOKE-OK; uname -sm",
+            "pillbox: libkrun backend (experimental) — launching `{}` in a microVM",
             spec.id
         );
+        let exe = std::env::current_exe().context("locate the pillbox binary to re-exec as VMM")?;
+        // Secrets travel as the child's environment (not argv/file); env_clear so
+        // only the composed guest env reaches the VM, then forwarded by the child.
         let status = Command::new(&exe)
             .arg("__krun-vmm")
-            .arg(&rootfs)
-            .args(["/bin/sh", "-c", &smoke])
+            .arg(spec_file.path())
+            .env_clear()
+            .envs(guest_env)
             .status()
             .context("spawn the libkrun VMM subprocess")?;
-
-        // The VMM child `exit()`s with the guest's code, so the child's status IS
-        // the guest's exit code.
         eprintln!("pillbox: libkrun microVM exited (guest status {:?})", status.code());
         Ok(())
     }
 }
 
-/// The VMM child (`pillbox __krun-vmm <rootfs> <exec> [args…]`). Configures a
-/// libkrun context and enters it — `krun_start_enter` does not return; it
-/// `exit()`s with the guest's exit code. Only returns on a pre-boot error.
+/// The VMM child (`pillbox __krun-vmm <spec.json>`). Reads the [`VmSpec`],
+/// configures a libkrun context (root + virtio-fs shares + exec, env forwarded
+/// from this process's own environment), and enters it. `krun_start_enter` does
+/// not return — it `exit()`s with the guest's code; only returns on a pre-boot
+/// error.
 pub(crate) fn vmm_child_main() -> ! {
-    let argv: Vec<String> = std::env::args().collect();
-    if argv.len() < 4 {
-        eprintln!("krun-vmm: usage: pillbox __krun-vmm <rootfs> <exec> [args…]");
-        std::process::exit(2);
-    }
-    let rootfs = cstr(&argv[2]);
+    let spec_path = match std::env::args().nth(2) {
+        Some(p) => p,
+        None => {
+            eprintln!("krun-vmm: usage: pillbox __krun-vmm <spec.json>");
+            std::process::exit(2);
+        }
+    };
+    let spec: VmSpec = match std::fs::read_to_string(&spec_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+    {
+        Some(s) => s,
+        None => {
+            eprintln!("krun-vmm: unreadable/invalid spec {spec_path}");
+            std::process::exit(2);
+        }
+    };
+
+    // Keep every CString alive until after start_enter.
+    let rootfs = cstr(&spec.rootfs);
     let workdir = cstr("/");
-    let exec = cstr(&argv[3]);
-    // krun_set_exec's argv is the args *after* argv[0]; keep the CStrings alive
-    // for the duration of the call, then build a null-terminated pointer array.
-    let arg_cstrs: Vec<CString> = argv[4..].iter().map(|s| cstr(s)).collect();
-    let mut argv_ptrs: Vec<*const std::os::raw::c_char> =
-        arg_cstrs.iter().map(|c| c.as_ptr()).collect();
+    let exec = cstr(&spec.exec[0]);
+    let arg_cstrs: Vec<CString> = spec.exec[1..].iter().map(|s| cstr(s)).collect();
+    let mut argv_ptrs: Vec<*const c_char> = arg_cstrs.iter().map(|c| c.as_ptr()).collect();
     argv_ptrs.push(std::ptr::null());
-    let envp: [*const std::os::raw::c_char; 1] = [std::ptr::null()];
+    // Forward this process's env to the guest (the parent set it via env_clear +
+    // envs, so it's exactly the composed guest env — including any secrets).
+    let env_cstrs: Vec<CString> = std::env::vars()
+        .map(|(k, v)| cstr(&format!("{k}={v}")))
+        .collect();
+    let mut envp: Vec<*const c_char> = env_cstrs.iter().map(|c| c.as_ptr()).collect();
+    envp.push(std::ptr::null());
+    let shares: Vec<(CString, CString)> = spec
+        .shares
+        .iter()
+        .map(|s| (cstr(&s.tag), cstr(&s.host_path)))
+        .collect();
 
     unsafe {
         let ctx = ffi::krun_create_ctx();
@@ -143,19 +280,64 @@ pub(crate) fn vmm_child_main() -> ! {
             std::process::exit(1);
         }
         let ctx = ctx as u32;
-        let cfg = ffi::krun_set_vm_config(ctx, 2, 1024)
-            .min(ffi::krun_set_root(ctx, rootfs.as_ptr()))
-            .min(ffi::krun_set_workdir(ctx, workdir.as_ptr()))
-            .min(ffi::krun_set_exec(ctx, exec.as_ptr(), argv_ptrs.as_ptr(), envp.as_ptr()));
-        if cfg < 0 {
-            eprintln!("krun-vmm: configuration failed (rc={cfg})");
+        let mut rc = ffi::krun_set_vm_config(ctx, spec.vcpus, spec.ram_mib);
+        rc = rc.min(ffi::krun_set_root(ctx, rootfs.as_ptr()));
+        rc = rc.min(ffi::krun_set_workdir(ctx, workdir.as_ptr()));
+        for (tag, host) in &shares {
+            rc = rc.min(ffi::krun_add_virtiofs(ctx, tag.as_ptr(), host.as_ptr()));
+        }
+        rc = rc.min(ffi::krun_set_exec(ctx, exec.as_ptr(), argv_ptrs.as_ptr(), envp.as_ptr()));
+        if rc < 0 {
+            eprintln!("krun-vmm: configuration failed (rc={rc})");
             std::process::exit(1);
         }
-        // Enters the microVM; exits the process with the guest's status.
         let rc = ffi::krun_start_enter(ctx);
         eprintln!("krun-vmm: start_enter returned {rc} (pre-boot config error)");
         std::process::exit(1);
     }
+}
+
+/// CoW-clone the workspace (so the base is the immutable fork point) and scrub
+/// secret files from the clone using the canonical `workspace::ingest` denylist
+/// — never the spike's hand-rolled list. Returns the clone dir to share.
+fn cow_clone_and_scrub(src: &Path) -> Result<PathBuf> {
+    let clone = krun_cache_dir()?
+        .join("ws")
+        .join(format!("{}", uuid::Uuid::now_v7().simple()));
+    if let Some(parent) = clone.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let src_c = cstr(&src.to_string_lossy());
+    let clone_c = cstr(&clone.to_string_lossy());
+    let rc = unsafe { clonefile(src_c.as_ptr(), clone_c.as_ptr(), 0) };
+    if rc != 0 {
+        bail!("clonefile {} → {} failed (APFS only)", src.display(), clone.display());
+    }
+    // Reuse the canonical walker + denylist; delete what it flags as secret.
+    let plan = crate::workspace::ingest::plan_ingest(&clone)?;
+    for rel in &plan.excluded_secrets {
+        let p = clone.join(rel);
+        let _ = if p.is_dir() {
+            std::fs::remove_dir_all(&p)
+        } else {
+            std::fs::remove_file(&p)
+        };
+    }
+    Ok(clone)
+}
+
+/// Single-quote a shell argument (`'` → `'\''`).
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn unsupported(spec: &AgentSpec, what: &str) -> anyhow::Error {
+    PillboxError::usage(
+        "run",
+        format!("libkrun backend: {what} not supported yet (running `{}`)", spec.id),
+    )
+    .with_next("unset PILLBOX_BACKEND to use the default backend")
+    .into()
 }
 
 /// Materialize the runner OCI image into a cached on-disk directory usable as a

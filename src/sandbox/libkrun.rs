@@ -43,11 +43,9 @@ use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
 use crate::workspace::WorkspaceBackend;
 
-/// libkrun C API bindings — the single home for the `unsafe extern "C"`
-/// signatures (header: `/opt/homebrew/include/libkrun.h`; linked + rpath'd by
-/// `build.rs` under the `libkrun` feature). Surface lands ahead of the boot/
-/// attach wiring that consumes it.
-#[allow(dead_code)]
+/// libkrun C API bindings (header: `/opt/homebrew/include/libkrun.h`; linked +
+/// rpath'd by `build.rs` under the `libkrun` feature). vsock / virtio-net land
+/// with the attach + egress slices that use them.
 pub(crate) mod ffi {
     use std::os::raw::{c_char, c_int};
 
@@ -57,15 +55,6 @@ pub(crate) mod ffi {
         pub fn krun_set_vm_config(ctx_id: u32, num_vcpus: u8, ram_mib: u32) -> c_int;
         pub fn krun_set_root(ctx_id: u32, root_path: *const c_char) -> c_int;
         pub fn krun_set_workdir(ctx_id: u32, workdir: *const c_char) -> c_int;
-        pub fn krun_add_vsock_port(ctx_id: u32, port: u32, c_filepath: *const c_char) -> c_int;
-        pub fn krun_add_net_unixstream(
-            ctx_id: u32,
-            c_path: *const c_char,
-            fd: c_int,
-            c_mac: *const u8,
-            features: u32,
-            flags: u32,
-        ) -> c_int;
         pub fn krun_add_virtiofs(ctx_id: u32, c_tag: *const c_char, c_path: *const c_char)
             -> c_int;
         pub fn krun_set_exec(
@@ -75,14 +64,6 @@ pub(crate) mod ffi {
             envp: *const *const c_char,
         ) -> c_int;
         pub fn krun_start_enter(ctx_id: u32) -> c_int;
-    }
-
-    /// Map a negative libkrun return (`-errno`) to an error.
-    pub fn check(rc: c_int, what: &str) -> anyhow::Result<()> {
-        if rc < 0 {
-            anyhow::bail!("{what} failed: rc={rc} (-errno)");
-        }
-        Ok(())
     }
 }
 
@@ -278,8 +259,7 @@ pub(crate) fn vmm_child_main() -> ! {
     let arg_cstrs: Vec<CString> = spec.exec[1..].iter().map(|s| cstr(s)).collect();
     let mut argv_ptrs: Vec<*const c_char> = arg_cstrs.iter().map(|c| c.as_ptr()).collect();
     argv_ptrs.push(std::ptr::null());
-    // Forward this process's env to the guest (the parent set it via env_clear +
-    // envs, so it's exactly the composed guest env — including any secrets).
+    // Forward this process's env (= the guest env; see the doc above) to the VM.
     let env_cstrs: Vec<CString> = std::env::vars()
         .map(|(k, v)| cstr(&format!("{k}={v}")))
         .collect();
@@ -316,12 +296,12 @@ pub(crate) fn vmm_child_main() -> ! {
 }
 
 /// CoW-clone the workspace (so the base is the immutable fork point) and scrub
-/// secret files from the clone using the canonical `workspace::ingest` denylist
-/// — never the spike's hand-rolled list. Returns the clone dir to share.
+/// secret files from the clone using the canonical `workspace::ingest` denylist.
+/// Returns the clone dir to share.
 fn cow_clone_and_scrub(src: &Path) -> Result<PathBuf> {
     let clone = krun_cache_dir()?
         .join("ws")
-        .join(format!("{}", uuid::Uuid::now_v7().simple()));
+        .join(uuid::Uuid::now_v7().simple().to_string());
     if let Some(parent) = clone.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }

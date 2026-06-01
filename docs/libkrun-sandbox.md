@@ -561,9 +561,22 @@ Docker untouched until step 8. Slices (each its own commit, default build green)
     into `spawn_pty_session` so unix (docker/ssh) + vsock share it. Verified:
     `--version` output reached the host pump over vsock. **Needs a runner image
     built from this src** (the guest pillbox must have `--vsock-port`).
-  - **L5 §0 + vault-v2 + egress** — the §0 producer + the smoltcp egress stack
-    (the L3 ConnectionRefused is the entry point; `PinTable`, per-sandbox
-    invariant). **Env fork — secrets go to the vault, not the VM env** (this is
+  - **L5 §0 + vault-v2 + egress** — a *phase*, sub-sliced. **Architecture:** the
+    smoltcp egress stack runs in the **VMM child** (a thread alongside
+    `start_enter`, netspike's shape), not the parent — `start_enter` is in the
+    child. On macOS/HVF libkrun's default **TSI does not carry egress** (the L3
+    `ConnectionRefused`), so smoltcp+virtio-net is the *only* egress path, not an
+    optimization. **New beyond the step-5 spike:** netspike terminated + gated +
+    MITM'd but never **NAT-forwarded** to real upstreams (it synthesized a 200);
+    permissive egress needs a userspace NAT-forward + DNS. Sub-slices:
+      - **L5a egress transport + NAT-forward (permissive)** — virtio-net in the
+        child → smoltcp → forward guest TCP to real hosts + DNS. Unblocks the
+        agent's network (the L3 `ConnectionRefused`).
+      - **L5b vault-v2 gate** — DNS-fence + DNS-pin (`PinTable`, per-sandbox) +
+        MITM + the in-repo `VaultProvider` swap, on top of L5a.
+      - **L5c §0 producer** — guest emits `Event` NDJSON over a 2nd vsock port →
+        parent drains to `SessionLog`.
+    **Env fork — secrets go to the vault, not the VM env** (lands with L5b; this is
     the whole point of vault-v2; a secret in the VM's env is readable by the
     agent via `/proc/self/environ` and exfiltrable by a prompt injection). L3
     injects everything directly (matches Docker's non-vault path) only because

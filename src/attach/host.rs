@@ -52,8 +52,8 @@ type SharedMaster = Arc<Mutex<Box<dyn MasterPty + Send>>>;
 /// Run the pty-host on a unix socket: spawn `argv` under a PTY and serve frames
 /// on `sock` until the child exits. `argv[0]` is the program; the rest are args.
 pub(crate) fn run(sock: &str, argv: &[String]) -> Result<()> {
+    let _ = std::fs::remove_file(sock); // clear a stale socket before binding
     let session = spawn_pty_session(argv)?;
-    let _ = std::fs::remove_file(sock);
     let listener = UnixListener::bind(sock).with_context(|| format!("binding {sock}"))?;
     for stream in listener.incoming().flatten() {
         session.serve(stream);
@@ -66,8 +66,9 @@ pub(crate) fn run(sock: &str, argv: &[String]) -> Result<()> {
 /// parent's pre-bound listener, which `accept()`s only once we're up — so there's
 /// no connect-before-ready race (the proven libkrun vsock direction). A vsock
 /// connection is a `SOCK_STREAM` fd, so it wraps as a `UnixStream` and reuses
-/// [`handle_client`] unchanged. Reconnects after a client leaves (reattach).
-/// Linux-only — the host (macOS) never runs this; it pumps the bridged socket.
+/// [`handle_client`] unchanged. Linux-only — the host (macOS) never runs this; it
+/// pumps the bridged socket. Single foreground client; reattach (re-dial after a
+/// client leaves) lands with `--detach`, alongside the parent re-`accept()`.
 #[cfg(target_os = "linux")]
 pub(crate) fn run_vsock(port: u32, argv: &[String]) -> Result<()> {
     use std::os::unix::io::FromRawFd;
@@ -75,7 +76,9 @@ pub(crate) fn run_vsock(port: u32, argv: &[String]) -> Result<()> {
 
     const VMADDR_CID_HOST: u32 = 2;
     let session = spawn_pty_session(argv)?;
-    loop {
+    // Dial the host, retrying only until the bridge + parent listener are ready
+    // (the guest boots well after the parent binds, so this connects promptly).
+    let stream = loop {
         let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) };
         if fd < 0 {
             anyhow::bail!("AF_VSOCK socket: {}", std::io::Error::last_os_error());
@@ -85,16 +88,16 @@ pub(crate) fn run_vsock(port: u32, argv: &[String]) -> Result<()> {
         addr.svm_port = port;
         addr.svm_cid = VMADDR_CID_HOST;
         let alen = std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t;
-        let rc = unsafe { libc::connect(fd, &addr as *const _ as *const libc::sockaddr, alen) };
-        if rc != 0 {
-            unsafe { libc::close(fd) };
-            std::thread::sleep(Duration::from_millis(100)); // host listener not up yet
-            continue;
+        if unsafe { libc::connect(fd, &addr as *const _ as *const libc::sockaddr, alen) } == 0 {
+            break unsafe { UnixStream::from_raw_fd(fd) };
         }
-        // Serve this client inline (blocks until it disconnects), then loop to
-        // accept the next attach. The reader-on-child-exit exits the process.
-        session.serve_blocking(unsafe { UnixStream::from_raw_fd(fd) });
-    }
+        unsafe { libc::close(fd) };
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    // Serve the foreground client (blocks until it disconnects); on agent exit the
+    // reader thread exits the process, so there's no client to reattach yet.
+    session.serve_blocking(stream);
+    Ok(())
 }
 
 /// The running PTY session: the agent's PTY behind the hub/screen, ready to

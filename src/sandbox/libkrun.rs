@@ -257,12 +257,13 @@ impl SandboxBackend for LibkrunBackend {
             .spawn()
             .context("spawn the libkrun VMM subprocess")?;
 
-        // Wait for the guest pty-host to dial in (accept blocks until it's up),
+        // Poll the listener until the guest pty-host dials in (across VM boot),
         // then run the shared terminal pump. Reaps the VM on return.
         let stream = accept_attach(&listener, &mut child)?;
         let write_half = stream.try_clone().context("clone attach stream")?;
         let outcome = pump::attach_terminal(stream, write_half, false)?;
         let _ = child.wait();
+        let _ = std::fs::remove_file(&attach_sock); // don't litter ~/.pillbox/krun
         match outcome {
             pump::Outcome::Exited(code) if code != 0 => std::process::exit(code),
             _ => Ok(()),

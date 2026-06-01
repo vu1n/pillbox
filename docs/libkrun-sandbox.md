@@ -536,12 +536,21 @@ Docker untouched until step 8. Slices (each its own commit, default build green)
     the guest's). This subprocess split is the spine for attach + §0. `krun/
     entitlements.plist` + re-codesign after each build. `materialize_rootfs` =
     `docker export` → cached `~/.pillbox/krun/rootfs/<image>` (virtio-fs root).
-  - **L3 Creds + workspace + env** — mirror `local_docker::run`'s pipeline; CoW
-    workspace (step 6) sharing the clone over virtio-fs; reuse `workspace::ingest`.
+  - ✅ **L3 Creds + workspace + env** — `run()` mirrors `local_docker::run`:
+    shares the auth home live at `GUEST_HOME` (cred check + pretrust seed), CoW-
+    clones the workspace + scrubs it via the **canonical `workspace::ingest`**
+    denylist (verified: `.env` scrubbed, `app.py` kept), composes env via
+    `resolve_run_env`, forwards it as the child's environment (not argv/file).
+    Verified: claude launched in the VM with creds + scrubbed workspace + env.
+    The parent hands the child a temp-file `VmSpec` (rootfs + shares + exec
+    script; no secrets). **Finding for L5:** the run then failed at network
+    egress (`ConnectionRefused`) — libkrun's default TSI did *not* carry it. So
+    L5 wires virtio-net + smoltcp egress; don't rely on TSI.
   - **L4 Attach** — guest pty-host + the real `attach::frame`/`pump` over vsock
     (parent connects to the control socket the `__krun-vmm` child bridges).
-  - **L5 §0 + vault-v2** — the §0 producer + the smoltcp egress stack (`PinTable`,
-    per-sandbox invariant). Then step 7 (opencode seam) + step 8 (deprecate Docker).
+  - **L5 §0 + vault-v2 + egress** — the §0 producer + the smoltcp egress stack
+    (the L3 ConnectionRefused is the entry point; `PinTable`, per-sandbox
+    invariant). Then step 7 (opencode seam) + step 8 (deprecate Docker).
 
 7. **opencode** — repoint the bridge transport to the control channel, and pay
    down the structural debt a 2026-06-01 review flagged (deferred then because

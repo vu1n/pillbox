@@ -416,6 +416,11 @@ off the throwaway spike, mandatory for the port):**
   non-provider hosts to the real upstream (the spike doesn't forward).
 - **Event-driven wakeup**, not the spike's fixed 2 ms poll-loop sleep (drive off
   the rx-queue / smoltcp `poll_at`).
+- **Make the DNS resolver + pin table its own unit**, not a third concern wedged
+  into the TCP poll loop sharing a loose `pins: HashSet`. The pin table is the
+  contract between the resolver and the gate; model it explicitly (it also needs
+  TTL eviction + the IP-level binding) rather than as a bare set the god-loop
+  mutates on one iteration and reads on the next.
 
 ## Build order (proof-first)
 

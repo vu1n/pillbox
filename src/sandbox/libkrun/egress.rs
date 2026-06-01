@@ -17,6 +17,7 @@
 
 use std::collections::VecDeque;
 use std::io::Write;
+use std::net::Ipv4Addr;
 use std::os::raw::c_int;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -34,8 +35,8 @@ pub(super) const GUEST_MAC: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee];
 const GATEWAY_MAC: [u8; 6] = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0x01];
 /// The gateway = the proxy = our DNS server, all on this address. Allowlisted
 /// names resolve here so their TLS terminates at our MITM (L5b).
-const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
-const GUEST_IP: [u8; 4] = [10, 0, 2, 15];
+const GATEWAY_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 2);
+const GUEST_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
 const PREFIX_LEN: u8 = 24;
 const DNS_PORT: u16 = 53;
 
@@ -43,14 +44,11 @@ const DNS_PORT: u16 = 53;
 /// and route DNS + egress through this stack. Kept here so the addressing lives
 /// in one place; `mod.rs` splices the string into the guest entrypoint.
 pub(super) fn guest_net_commands() -> String {
-    let g = GUEST_IP;
-    let gw = GATEWAY_IP;
     format!(
         "ip link set eth0 up; \
-         ip addr add {}.{}.{}.{}/{PREFIX_LEN} dev eth0; \
-         ip route add default via {}.{}.{}.{}; \
-         printf 'nameserver {}.{}.{}.{}\\n' > /etc/resolv.conf",
-        g[0], g[1], g[2], g[3], gw[0], gw[1], gw[2], gw[3], gw[0], gw[1], gw[2], gw[3],
+         ip addr add {GUEST_IP}/{PREFIX_LEN} dev eth0; \
+         ip route add default via {GATEWAY_IP}; \
+         printf 'nameserver {GATEWAY_IP}\\n' > /etc/resolv.conf"
     )
 }
 
@@ -121,7 +119,7 @@ pub(super) fn run(fd: c_int, allowlist: Vec<String>, diag_path: Option<String>) 
     config.random_seed = 0x5a94_efe4;
     let mut iface = Interface::new(config, &mut device, now(start));
     iface.update_ip_addrs(|addrs| {
-        let g = GATEWAY_IP;
+        let g = GATEWAY_IP.octets();
         addrs
             .push(IpCidr::new(IpAddress::v4(g[0], g[1], g[2], g[3]), PREFIX_LEN))
             .unwrap();
@@ -293,7 +291,7 @@ fn build_dns_response(q: &[u8], allowlist: &[String]) -> Option<(Vec<u8>, DnsOut
         r.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
         r.extend_from_slice(&60u32.to_be_bytes()); // TTL
         r.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH
-        r.extend_from_slice(&GATEWAY_IP); // RDATA
+        r.extend_from_slice(&GATEWAY_IP.octets()); // RDATA
     }
 
     let outcome = if rcode_nx {
@@ -329,9 +327,13 @@ fn read_frame(fd: c_int) -> Option<Vec<u8>> {
 }
 
 fn write_frame(fd: c_int, frame: &[u8]) {
+    // Don't emit a body without its length header — a half-written frame would
+    // desync the passt stream. On a write failure the peer is gone (the VM is
+    // shutting down), so dropping the frame is safe: the stream dies with it.
     let hdr = (frame.len() as u32).to_be_bytes();
-    write_all(fd, &hdr);
-    write_all(fd, frame);
+    if write_all(fd, &hdr) {
+        let _ = write_all(fd, frame);
+    }
 }
 
 fn read_exact(fd: c_int, buf: &mut [u8]) -> bool {
@@ -339,25 +341,37 @@ fn read_exact(fd: c_int, buf: &mut [u8]) -> bool {
     while off < buf.len() {
         let n =
             unsafe { libc::read(fd, buf[off..].as_mut_ptr() as *mut libc::c_void, buf.len() - off) };
-        if n <= 0 {
-            return false;
+        if n > 0 {
+            off += n as usize;
+        } else if n < 0 && interrupted() {
+            continue; // signal mid-read — retry rather than tear the stream down
+        } else {
+            return false; // EOF (0) or a hard error
         }
-        off += n as usize;
     }
     true
 }
 
-fn write_all(fd: c_int, buf: &[u8]) {
+fn write_all(fd: c_int, buf: &[u8]) -> bool {
     let mut off = 0;
     while off < buf.len() {
         let n = unsafe {
             libc::write(fd, buf[off..].as_ptr() as *const libc::c_void, buf.len() - off)
         };
-        if n <= 0 {
-            return;
+        if n > 0 {
+            off += n as usize;
+        } else if n < 0 && interrupted() {
+            continue;
+        } else {
+            return false; // peer gone or hard error
         }
-        off += n as usize;
     }
+    true
+}
+
+/// Whether the last syscall failed with `EINTR` (interrupted by a signal).
+fn interrupted() -> bool {
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
 }
 
 #[cfg(test)]
@@ -383,7 +397,7 @@ mod tests {
         assert!(matches!(outcome, DnsOutcome::Pinned(ref n) if n == "api.anthropic.com"));
         // ANCOUNT == 1, RDATA == gateway IP at the tail.
         assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 1);
-        assert_eq!(&resp[resp.len() - 4..], &GATEWAY_IP);
+        assert_eq!(resp[resp.len() - 4..], GATEWAY_IP.octets());
         assert_eq!(resp[3] & 0x0f, 0); // NOERROR
     }
 

@@ -30,7 +30,7 @@ use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
 
-use super::vault::{Upstream, Vault};
+use super::vault::{StubSwap, Upstream, Vault};
 
 /// Guest NIC MAC (handed to `krun_add_net_unixstream`) and the gateway MAC the
 /// stack answers as. The addressing is fixed per microVM — one stack, one guest.
@@ -114,6 +114,7 @@ pub(super) fn run(
     fd: c_int,
     allowlist: Vec<String>,
     ca_dir: Option<String>,
+    swap_pairs: Vec<(Vec<u8>, Vec<u8>)>,
     diag_path: Option<String>,
 ) {
     let diag = Diag::open(diag_path);
@@ -171,7 +172,7 @@ pub(super) fn run(
         iface.poll(now(start), &mut device, &mut sockets);
         serve_dns(sockets.get_mut::<udp::Socket>(dns), &allowlist, &mut pins, &diag);
         if let Some(vault) = &vault {
-            drive_listeners(&mut listeners, &mut sockets, vault, &pins, &diag);
+            drive_listeners(&mut listeners, &mut sockets, vault, &pins, &swap_pairs, &diag);
             replenish_listeners(&mut listeners, &mut sockets);
         }
         thread::sleep(Duration::from_millis(2));
@@ -195,6 +196,8 @@ struct Conn {
     tls: ServerConnection,
     host: String,
     upstream: Option<Upstream>,
+    /// Stub→real credential substitution applied to the guest→upstream stream.
+    swap: StubSwap,
     req_logged: bool,
     closing: bool,
 }
@@ -231,6 +234,7 @@ fn drive_listeners(
     sockets: &mut SocketSet,
     vault: &Vault,
     pins: &PinTable,
+    swap_pairs: &[(Vec<u8>, Vec<u8>)],
     diag: &Diag,
 ) {
     for l in listeners.iter_mut() {
@@ -243,6 +247,7 @@ fn drive_listeners(
                             tls,
                             host: String::new(),
                             upstream: None,
+                            swap: StubSwap::new(swap_pairs.to_vec()),
                             req_logged: false,
                             closing: false,
                         })
@@ -268,7 +273,7 @@ fn drive_listeners(
 /// rustls → smoltcp tx. Split-borrows the connection's fields so the guest and
 /// upstream sessions can be driven in the same call.
 fn drive_conn(sock: &mut tcp::Socket, c: &mut Conn, vault: &Vault, pins: &PinTable, diag: &Diag) {
-    let Conn { tls, host, upstream, req_logged, closing } = c;
+    let Conn { tls, host, upstream, swap, req_logged, closing } = c;
 
     // smoltcp rx → guest rustls
     while sock.can_recv() {
@@ -322,26 +327,35 @@ fn drive_conn(sock: &mut tcp::Socket, c: &mut Conn, vault: &Vault, pins: &PinTab
     }
 
     // Relay decrypted bytes both ways: guest request → upstream, upstream response
-    // → guest. L5b-3 will intercept + swap the credential before the upstream send.
+    // → guest. The env-fork swap (stub→real credential) is applied to the guest's
+    // request stream before it reaches the upstream.
     if let Some(up) = upstream.as_mut() {
+        let mut plain = Vec::new();
         let mut buf = [0u8; 4096];
         loop {
             match tls.reader().read(&mut buf) {
                 Ok(0) => break,
-                Ok(n) => {
-                    if !*req_logged {
-                        let head = String::from_utf8_lossy(&buf[..n]);
-                        diag.log(&format!(
-                            "krun-egress: [mitm] {:?} → {host} (forwarding)",
-                            head.lines().next().unwrap_or("")
-                        ));
-                        *req_logged = true;
-                    }
-                    up.send(&buf[..n]);
-                }
+                Ok(n) => plain.extend_from_slice(&buf[..n]),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(_) => break,
             }
+        }
+        if !plain.is_empty() {
+            if !*req_logged {
+                let head = String::from_utf8_lossy(&plain);
+                diag.log(&format!(
+                    "krun-egress: [mitm] {:?} → {host} (forwarding{})",
+                    head.lines().next().unwrap_or(""),
+                    if swap.is_noop() { "" } else { ", cred swapped" }
+                ));
+                *req_logged = true;
+            }
+            // Substitute stub→real; flush per drain so no partial-stub tail is held
+            // back across ticks (the credential lands in the request head, which
+            // arrives whole in one drain).
+            let mut out = swap.push(&plain);
+            out.extend(swap.flush());
+            up.send(&out);
         }
         let alive = up.pump();
         let mut resp = Vec::new();

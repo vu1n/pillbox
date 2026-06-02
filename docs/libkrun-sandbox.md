@@ -653,13 +653,30 @@ Docker untouched until step 8. Slices (each its own commit, default build green)
             (`console.anthropic.com`, `platform.claude.com`) are **fenced** — the
             allowlist is api-only (`known_secrets`), so a stale token can't
             refresh. That's L5b-3's job (full provider host set + the swap).
-          - **L5b-3 swap + env-fork** — widen the allowlist to the provider's full
-            intercept set (api + console + platform for Anthropic; not a static
-            api-only list); vault blob (reals → child, stubs → guest) + the
-            extracted `VaultProvider` swap + OAuth token-rotation read-back at
-            teardown (the recurring-401 root cause, [[pillbox-vault-token-refresh]]).
-            Adds the IP-level pin (dest = the name's resolved IP) on top of the
-            L5a name-level pin.
+          - **L5b-3a allowlist ✅** — the egress fence sources its allowlist from
+            `providers::intercepted_hosts()` (added `hosts()` to the
+            `VaultProvider` trait — Anthropic: api+console+platform), not api-only
+            `known_secrets`. Verified: claude reaches `platform.claude.com` + issues
+            a real `POST /v1/oauth/token` (was fenced).
+          - **L5b-3b env-fork swap ✅** — the guest mounts **stubbed** creds (a CoW
+            clone of the auth home with the OAuth access+refresh tokens replaced by
+            stubs), the reals reach the child **out-of-band on stdin** (never the
+            guest env/argv/VmSpec), and `vault::StubSwap` does a streaming byte
+            substitution stub→real on the guest→upstream plaintext (auth-mode-
+            agnostic; carries across TLS-record boundaries; unit-tested). **Live-
+            verified** (fresh creds): claude completed a turn, `cred swapped` on all
+            13 requests, and the guest's `.credentials.json` holds only
+            `sk-ant-oat01-pllbxstub…` — **zero real-token body in the VM**.
+            **Caught in verification:** the first `mint_stub` used `rsplit_once('-')`
+            and leaked most of the real token into the stub (OAuth bodies contain
+            hyphens) — fixed to keep only the fixed type prefix + a unit test.
+          - **L5b-3 remaining** — **response-side real→stub** (a token *refresh*
+            mid-run returns real tokens the guest then stores — re-leaks until the
+            response is stubbed too; fresh-creds short runs don't trigger it); the
+            **`--with --vault` API-key path** (reuse the same `StubSwap`; needs the
+            secret-resolution-with-`VaultMeta` integration + unblock `--vault`);
+            the **IP-level pin** (dest = the name's resolved IP) on top of L5a's
+            name-level pin; clone cleanup (the CoW `creds/`+`ws/` dirs accumulate).
       - **L5c §0 producer** — guest emits `Event` NDJSON over a 2nd vsock port →
         parent drains to `SessionLog`.
     **Env fork — secrets go to the vault, not the VM env** (lands with L5b; this is

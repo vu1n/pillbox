@@ -164,6 +164,77 @@ impl Upstream {
     }
 }
 
+/// Streaming stub→real credential substitution for the guest→upstream plaintext.
+///
+/// The env fork puts a **stub** secret in the guest (its env, or a stubbed creds
+/// file) so the real value never enters the VM. The agent sends the stub in its
+/// auth header on every request; this replaces the stub bytes with the real value
+/// as the decrypted stream flows to the upstream — auth-mode-agnostic (works for
+/// `x-api-key`, `Authorization: Bearer`, keep-alive, h1 or otherwise) because it
+/// matches the high-entropy stub token wherever it appears, not the HTTP framing.
+///
+/// Stubs can straddle TLS-record boundaries, so [`push`](Self::push) holds back a
+/// tail that could begin a partial match and emits it once resolved (or at
+/// [`flush`](Self::flush)).
+pub(super) struct StubSwap {
+    /// `(stub, real)` byte pairs. Empty → a transparent pass-through.
+    pairs: Vec<(Vec<u8>, Vec<u8>)>,
+    carry: Vec<u8>,
+    max_stub: usize,
+}
+
+impl StubSwap {
+    pub(super) fn new(pairs: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
+        let max_stub = pairs.iter().map(|(s, _)| s.len()).max().unwrap_or(0);
+        Self { pairs, carry: Vec::new(), max_stub }
+    }
+
+    /// Whether any substitution is configured (else the relay can skip the copy).
+    pub(super) fn is_noop(&self) -> bool {
+        self.pairs.is_empty()
+    }
+
+    /// Feed a decrypted chunk; return the bytes safe to forward now (a possible
+    /// partial-stub tail is held in `carry` until the next chunk or `flush`).
+    pub(super) fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
+        self.carry.extend_from_slice(chunk);
+        // Everything before `safe` cannot be the start of a stub that only
+        // completes in a later chunk, so it's final; keep the tail as carry.
+        let safe = self.carry.len().saturating_sub(self.max_stub.saturating_sub(1));
+        let (out, rest) = self.scan(safe);
+        self.carry = rest;
+        out
+    }
+
+    /// Flush the held tail at end-of-stream (no more bytes can complete a stub).
+    pub(super) fn flush(&mut self) -> Vec<u8> {
+        let (out, _) = self.scan(self.carry.len());
+        self.carry.clear();
+        out
+    }
+
+    /// Replace stubs in `carry[..limit]`, returning `(emitted, leftover_carry)`.
+    /// A stub straddling `limit` is matched in full (it's wholly in `carry`).
+    fn scan(&self, limit: usize) -> (Vec<u8>, Vec<u8>) {
+        let mut out = Vec::with_capacity(limit);
+        let mut i = 0;
+        while i < limit {
+            if let Some((stub, real)) = self
+                .pairs
+                .iter()
+                .find(|(s, _)| self.carry[i..].starts_with(s))
+            {
+                out.extend_from_slice(real);
+                i += stub.len();
+            } else {
+                out.push(self.carry[i]);
+                i += 1;
+            }
+        }
+        (out, self.carry[i..].to_vec())
+    }
+}
+
 /// Mints + caches a leaf (signed by the vault CA) for each **allowlisted** SNI;
 /// returns `None` otherwise, so a handshake for a non-allowlisted host fails for
 /// want of a cert. This is the allowlist gate, enforced at cert selection.
@@ -220,6 +291,54 @@ fn mint_certified_key(issuer: &Issuer<'_, KeyPair>, sni: &str) -> Result<Certifi
 mod tests {
     use super::*;
     use crate::vault::Ca;
+
+    fn swap(pairs: &[(&str, &str)], chunks: &[&[u8]]) -> Vec<u8> {
+        let mut s = StubSwap::new(
+            pairs.iter().map(|(a, b)| (a.as_bytes().to_vec(), b.as_bytes().to_vec())).collect(),
+        );
+        let mut out = Vec::new();
+        for c in chunks {
+            out.extend(s.push(c));
+        }
+        out.extend(s.flush());
+        out
+    }
+
+    #[test]
+    fn stub_swap_replaces_in_a_single_chunk() {
+        let out = swap(&[("STUB123", "real-key")], &[b"x-api-key: STUB123\r\n"]);
+        assert_eq!(out, b"x-api-key: real-key\r\n");
+    }
+
+    #[test]
+    fn stub_swap_matches_across_a_chunk_boundary() {
+        // The stub is split across two pushes — the carry must bridge it.
+        let out = swap(&[("STUB123", "real-key")], &[b"Bearer STU", b"B123 done"]);
+        assert_eq!(out, b"Bearer real-key done");
+    }
+
+    #[test]
+    fn stub_swap_passes_through_when_no_match() {
+        let out = swap(&[("STUB123", "real-key")], &[b"no secret here", b", really"]);
+        assert_eq!(out, b"no secret here, really");
+    }
+
+    #[test]
+    fn stub_swap_handles_multiple_pairs_and_repeats() {
+        let out = swap(
+            &[("AAA", "1"), ("BBB", "22")],
+            &[b"AAA BBB AAA"],
+        );
+        assert_eq!(out, b"1 22 1");
+    }
+
+    #[test]
+    fn stub_swap_noop_is_transparent() {
+        let mut s = StubSwap::new(vec![]);
+        assert!(s.is_noop());
+        assert_eq!(s.push(b"anything at all"), b"anything at all");
+        assert!(s.flush().is_empty());
+    }
 
     fn test_vault(allowlist: &[&str]) -> (Vault, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("pillbox-krun-vault-{}", uuid::Uuid::now_v7()));

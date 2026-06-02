@@ -129,6 +129,15 @@ struct Share {
     host_path: String,
 }
 
+/// A stub→real credential substitution the MITM applies to the guest→upstream
+/// stream. Passed parent→child on **stdin** (out-of-band): the real value never
+/// touches the guest env, argv, or the VmSpec file.
+#[derive(Serialize, Deserialize)]
+struct SwapPair {
+    stub: String,
+    real: String,
+}
+
 #[derive(Serialize, Deserialize)]
 struct VsockAttach {
     port: u32,
@@ -212,6 +221,12 @@ impl SandboxBackend for LibkrunBackend {
         // before boot (claude); operates on host paths, like the docker path.
         spec.prepare_workspace_or_warn(&home, &guest_workspace);
 
+        // Env fork: CoW the auth home and stub its OAuth tokens (after the seed so
+        // the clone inherits it). The guest mounts the *stubbed* creds — the real
+        // tokens never enter the VM; the MITM swaps stub→real on the wire. The
+        // reals reach the child out-of-band on stdin (not env/argv/VmSpec).
+        let (creds_share, swap_pairs) = stub_oauth_creds(&home, spec.cred_sentinel)?;
+
         // The guest entrypoint: mount the shares, cd into the workspace, exec the
         // agent (run_argv + sandbox defaults + user `-- args`).
         let agent_argv: Vec<String> = spec
@@ -261,7 +276,7 @@ impl SandboxBackend for LibkrunBackend {
             vcpus: 2,
             ram_mib: 2048,
             shares: vec![
-                Share { tag: "creds".into(), host_path: home.to_string_lossy().into_owned() },
+                Share { tag: "creds".into(), host_path: creds_share.to_string_lossy().into_owned() },
                 Share { tag: "workspace".into(), host_path: clone.to_string_lossy().into_owned() },
             ],
             exec: vec!["/bin/sh".into(), "-c".into(), script],
@@ -308,8 +323,18 @@ impl SandboxBackend for LibkrunBackend {
             .arg(spec_file.path())
             .env_clear()
             .envs(guest_env)
+            .stdin(std::process::Stdio::piped())
             .spawn()
             .context("spawn the libkrun VMM subprocess")?;
+
+        // Hand the real credentials to the child's MITM out-of-band on stdin — the
+        // reals never touch the guest env, argv, or the VmSpec file. Closing the
+        // pipe (drop) signals EOF so the child's read completes.
+        if let Some(mut sin) = child.stdin.take() {
+            let blob = serde_json::to_string(&swap_pairs).unwrap_or_else(|_| "[]".into());
+            use std::io::Write as _;
+            let _ = sin.write_all(blob.as_bytes());
+        }
 
         // Poll the listener until the guest pty-host dials in (across VM boot),
         // then run the shared terminal pump. Reaps the VM on return.
@@ -432,6 +457,9 @@ pub(crate) fn vmm_child_main() -> ! {
             log_path: e.log_path.clone(),
         }
     });
+    // Read the stub→real credential pairs the parent pipes on stdin (the env-fork
+    // channel — reals arrive out-of-band, never in the guest env/argv/VmSpec).
+    let swap_pairs = if net.is_some() { read_swap_pairs() } else { Vec::new() };
 
     unsafe {
         let ctx = ffi::krun_create_ctx();
@@ -472,7 +500,7 @@ pub(crate) fn vmm_child_main() -> ! {
         // The thread dies when start_enter exit()s this process on VM shutdown.
         if let Some(n) = net {
             std::thread::spawn(move || {
-                egress::run(n.host_fd, n.allowlist, n.ca_dir, n.log_path)
+                egress::run(n.host_fd, n.allowlist, n.ca_dir, swap_pairs, n.log_path)
             });
         }
         let rc = ffi::krun_start_enter(ctx);
@@ -510,6 +538,74 @@ fn cow_clone_and_scrub(src: &Path) -> Result<PathBuf> {
         };
     }
     Ok(clone)
+}
+
+/// Read the stub→real pairs the parent piped on stdin (JSON `[{stub,real}]`). The
+/// env-fork channel: reals arrive here, never via the guest env/argv/VmSpec.
+fn read_swap_pairs() -> Vec<(Vec<u8>, Vec<u8>)> {
+    use std::io::Read;
+    let mut buf = String::new();
+    if std::io::stdin().read_to_string(&mut buf).is_err() || buf.trim().is_empty() {
+        return Vec::new();
+    }
+    serde_json::from_str::<Vec<SwapPair>>(&buf)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| (p.stub.into_bytes(), p.real.into_bytes()))
+        .collect()
+}
+
+/// CoW-clone the agent's auth home and replace its OAuth tokens with stubs, so the
+/// guest mounts *stubbed* creds — the real tokens never enter the VM; the MITM
+/// swaps stub→real on the wire. Returns the stubbed-creds dir to mount + the
+/// (stub, real) pairs. Anthropic-shaped (`claudeAiOauth` in the credentials file);
+/// other agents get the home cloned as-is + no pairs (transparent relay).
+fn stub_oauth_creds(home: &Path, sentinel: &str) -> Result<(PathBuf, Vec<SwapPair>)> {
+    let clone = krun_cache_dir()?
+        .join("creds")
+        .join(uuid::Uuid::now_v7().simple().to_string());
+    if let Some(parent) = clone.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let src_c = cstr(&home.to_string_lossy());
+    let clone_c = cstr(&clone.to_string_lossy());
+    if unsafe { clonefile(src_c.as_ptr(), clone_c.as_ptr(), 0) } != 0 {
+        let err = std::io::Error::last_os_error();
+        let _ = std::fs::remove_dir_all(&clone);
+        bail!("clonefile creds {} → {} failed: {err} (APFS only)", home.display(), clone.display());
+    }
+
+    let mut pairs = Vec::new();
+    let creds_file = clone.join(sentinel);
+    if let Ok(text) = std::fs::read_to_string(&creds_file) {
+        if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(oauth) = json.get_mut("claudeAiOauth").and_then(|v| v.as_object_mut()) {
+                for field in ["accessToken", "refreshToken"] {
+                    let real = oauth.get(field).and_then(|v| v.as_str()).map(str::to_string);
+                    if let Some(real) = real.filter(|s| !s.is_empty()) {
+                        let stub = mint_stub(&real);
+                        oauth.insert(field.to_string(), serde_json::Value::String(stub.clone()));
+                        pairs.push(SwapPair { stub, real });
+                    }
+                }
+                let body = serde_json::to_string(&json).context("reserialize stubbed creds")?;
+                // The clone's file is already 0600 (clonefile preserves perms) and
+                // `write` truncates in place without changing them.
+                std::fs::write(&creds_file, body).context("write stubbed creds")?;
+            }
+        }
+    }
+    Ok((clone, pairs))
+}
+
+/// A unique stub shaped like `real` so a format check passes. **Keeps only the
+/// fixed type prefix** — the first 3 hyphen segments (e.g. `sk-ant-oat01`) — and
+/// drops the rest: the token body is the secret and must NOT leak into the stub
+/// (which lands in the guest's creds). High-entropy uuid suffix so the byte-level
+/// swap never false-matches on other content.
+fn mint_stub(real: &str) -> String {
+    let prefix = real.splitn(4, '-').take(3).collect::<Vec<_>>().join("-");
+    format!("{prefix}-pllbxstub{}", uuid::Uuid::now_v7().simple())
 }
 
 /// Single-quote a shell argument (`'` → `'\''`).
@@ -593,4 +689,23 @@ fn sanitize(image: &str) -> String {
 
 fn cstr(s: &str) -> CString {
     CString::new(s).expect("rootfs/exec path contains an interior NUL")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mint_stub;
+
+    #[test]
+    fn mint_stub_keeps_type_prefix_not_the_secret_body() {
+        // Anthropic OAuth tokens are sk-ant-oat01-<base64url> and the body can
+        // contain hyphens — the stub must keep only the type prefix, never the body.
+        let real = "sk-ant-oat01-3WY-itf8QpVP38ipXjip-SECRETBODYxyz";
+        let stub = mint_stub(real);
+        assert!(stub.starts_with("sk-ant-oat01-pllbxstub"), "stub leaked shape: {stub}");
+        assert!(!stub.contains("3WY"), "stub leaked body: {stub}");
+        assert!(!stub.contains("SECRETBODYxyz"), "stub leaked body: {stub}");
+        assert_ne!(stub, real);
+        // Distinct each call (uuid suffix).
+        assert_ne!(mint_stub(real), stub);
+    }
 }

@@ -176,70 +176,14 @@ impl SandboxBackend for LibkrunBackend {
 
         let run_started = std::time::SystemTime::now();
         let session_id = crate::session::Session::new_id();
-        let rootfs = materialize_rootfs(resolved)?;
 
-        // ── creds: the agent's auth home, shared live at GUEST_HOME ──
-        let home = spec.home_dir(resolved)?;
-        if !home.join(spec.cred_sentinel).exists() {
-            return Err(PillboxError::runtime(
-                "run",
-                format!("no stored credentials for `{}`", spec.id),
-            )
-            .with_next(format!("pillbox auth login --agent {}", spec.id))
-            .into());
-        }
+        // Build the launch packet (rootfs, CoW workspace + creds, env, CA, script,
+        // VmSpec). The env-fork guard fails fast inside if a real credential leaked.
+        let launch = prepare_launch(spec, &opts, resolved)?;
 
-        // ── workspace: CoW clone + secret-scrub, shared at GUEST_WORKSPACE/<name> ──
-        let workspace_host = match &opts.workspace {
-            Some(p) => p.clone(),
-            None => std::env::current_dir().context("resolve current working directory")?,
-        };
-        if let Some(name) = opts.from_bookmark.as_deref() {
-            let handle = crate::bookmarks::resolve_existing(resolved, name)?;
-            resolved.workspace()?.pull(&workspace_host, Some(&handle))?;
-        }
-        let workspace_name = workspace_mount_name(&workspace_host, opts.name.as_deref())?;
-        let guest_workspace = format!("{GUEST_WORKSPACE}/{workspace_name}");
-        let clone = cow_clone_and_scrub(&workspace_host)?;
-
-        // ── env: the canonical composer (bundles → env-file → --with), no vault ──
-        let withs = resolve_with_entries(resolved, &opts.withs)?;
-        let composed = resolve_run_env(resolved, &opts, &withs, None)?;
-        let mut guest_env: Vec<(String, String)> = vec![
-            ("HOME".into(), GUEST_HOME.into()),
-            ("TERM".into(), "xterm-256color".into()),
-            (
-                "PATH".into(),
-                format!("/usr/local/bin:/usr/bin:/bin:{GUEST_HOME}/.local/bin"),
-            ),
-        ];
-        guest_env.extend(composed);
-
-        // ── vault MITM trust: ensure the per-pillbox CA, trust its (public) cert
-        // in the guest, and tell the VMM child where to load the CA from to mint
-        // leaves. The CA *key* stays host-side (the child reads it); only the cert
-        // reaches the guest. No HTTPS_PROXY — we're transparent via the DNS fence.
-        let vault_ca_dir = resolved.subdir("vault")?;
-        let ca = crate::vault::Ca::ensure(&vault_ca_dir)
-            .map_err(|e| anyhow::anyhow!("ensure vault CA: {e}"))?;
-        let ca_cert_pem = std::fs::read_to_string(ca.cert_path()).context("read vault CA cert")?;
-        guest_env.push(("NODE_EXTRA_CA_CERTS".into(), GUEST_CA_PATH.into()));
-
-        // Pre-accept the agent's workspace-trust dialog on the live auth home
-        // before boot (claude); operates on host paths, like the docker path.
-        spec.prepare_workspace_or_warn(&home, &guest_workspace);
-
-        // Env fork: CoW the auth home and stub its OAuth tokens (after the seed so
-        // the clone inherits it). The guest mounts the *stubbed* creds — the real
-        // tokens never enter the VM; the MITM swaps stub→real on the wire. The
-        // reals reach the child out-of-band on stdin (not env/argv/VmSpec).
-        let (creds_share, swap_pairs) = stub_oauth_creds(&home, spec.cred_sentinel)?;
-
-        // §0: the agent writes its transcript into the RW-mounted home, so it lands
-        // in the host-side creds clone — tail it into the durable SessionLog with
-        // the same producer the docker/ssh backends use (no guest emitter, no 2nd
-        // vsock port). proxy_active=false: our MITM doesn't tap gen_ai usage, so the
-        // transcript is the usage source and must not be suppressed.
+        // §0: tail the agent's transcript from the host-side creds clone into the
+        // durable SessionLog (the same producer docker/ssh use; no guest emitter).
+        // Spawned before the child so it's ready when the agent first writes.
         let log = match crate::events::log::SessionLog::open(resolved, &session_id) {
             Ok(l) => Some(l),
             Err(e) => {
@@ -251,125 +195,31 @@ impl SandboxBackend for LibkrunBackend {
             log,
             &session_id,
             spec.id,
-            &creds_share,
-            &guest_workspace,
+            &launch.creds_share,
+            &launch.guest_workspace,
             false,
             run_started,
         );
 
-        // The guest entrypoint: mount the shares, cd into the workspace, exec the
-        // agent (run_argv + sandbox defaults + user `-- args`).
-        let agent_argv: Vec<String> = spec
-            .run_argv
-            .iter()
-            .map(|s| s.to_string())
-            .chain(spec.sandbox_args.iter().map(|s| s.to_string()))
-            .chain(opts.args.iter().cloned())
-            .collect();
-        // Quote every interpolated path — the workspace name can legitimately
-        // contain a space (and must never be shell-evaluated). The agent runs
-        // under the in-guest pty-host serving the Frame protocol over vsock (the
-        // same attach transport the docker/ssh backends use, just a different
-        // pipe), which the parent attaches to and pumps below.
-        let home_q = shell_quote(GUEST_HOME);
-        let gw_q = shell_quote(&guest_workspace);
-        let agent = agent_argv
-            .iter()
-            .map(|a| shell_quote(a))
-            .collect::<Vec<_>>()
-            .join(" ");
-        // Egress: bring up the guest NIC + route DNS/egress through the userspace
-        // stack the VMM child runs (the DNS fence allows only the provider hosts),
-        // then trust the vault CA so the MITM's leaves validate.
-        let net = egress::guest_net_commands();
-        // base64 the PEM: a raw multi-line cert in the exec argv trips libkrun's
-        // cmdline encoder (`InvalidAscii` on the newlines). Single-line b64 →
-        // decode in the guest.
-        let ca_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &ca_cert_pem);
-        let ca_setup = format!(
-            "printf '%s' {b64} | base64 -d > {GUEST_CA_PATH}; \
-             update-ca-certificates >/dev/null 2>&1 || true",
-            b64 = shell_quote(&ca_b64),
-        );
-        let script = format!(
-            "set -e; {net}; {ca_setup}; mkdir -p {home_q}; mount -t virtiofs creds {home_q}; \
-             mkdir -p {gw_q}; mount -t virtiofs workspace {gw_q}; cd {gw_q}; \
-             exec pillbox pty-host --vsock-port {ATTACH_PORT} -- {agent}",
-        );
-
-        // ── env-fork invariant (the security thesis, guarded) ──
-        // Three channels into the VM, and the real credential belongs to exactly
-        // one of them: non-secret config → the guest env (`guest_env` → envp) and
-        // the exec `script`/VmSpec (a host-readable tempfile); the real credential
-        // → ONLY the MITM swap, delivered out-of-band on the child's stdin and held
-        // in the VMM child's memory. A real that reaches a guest-readable channel
-        // (env, script, or argv) is exfiltratable by a prompt-injected agent. Fail
-        // fast here rather than silently leak if a future change crosses channels.
-        for pair in &swap_pairs {
-            if guest_env.iter().any(|(_, v)| v.contains(&pair.real)) || script.contains(&pair.real) {
-                bail!(
-                    "libkrun env-fork violated: a real credential reached a guest-readable \
-                     channel (env/script) — it must travel only via the MITM stdin swap"
-                );
-            }
-        }
-
-        let attach_sock = krun_cache_dir()?
-            .join(format!("attach-{}.sock", uuid::Uuid::now_v7().simple()));
-        let _ = std::fs::remove_file(&attach_sock);
-
-        let vmspec = VmSpec {
-            rootfs: rootfs.to_string_lossy().into_owned(),
-            vcpus: 2,
-            ram_mib: 2048,
-            shares: vec![
-                Share { tag: "creds".into(), host_path: creds_share.to_string_lossy().into_owned() },
-                Share { tag: "workspace".into(), host_path: clone.to_string_lossy().into_owned() },
-            ],
-            exec: vec!["/bin/sh".into(), "-c".into(), script],
-            vsock: Some(VsockAttach {
-                port: ATTACH_PORT,
-                host_sock: attach_sock.to_string_lossy().into_owned(),
-            }),
-            egress: Some(EgressSpec {
-                // The vault providers' full intercept set (API + OAuth/platform
-                // hosts) — so the agent can reach its provider *and* refresh a
-                // token. api-only (known_secrets) fenced claude's OAuth refresh.
-                allowlist: crate::vault::providers::intercepted_hosts()
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-                log_path: std::env::var("PILLBOX_KRUN_EGRESS_LOG").ok(),
-                ca_dir: Some(vault_ca_dir.to_string_lossy().into_owned()),
-            }),
-        };
-        let spec_file = tempfile::Builder::new()
-            .prefix("pillbox-krun-spec-")
-            .suffix(".json")
-            .tempfile()
-            .context("create VMM spec tempfile")?;
-        serde_json::to_writer(&spec_file, &vmspec).context("write VMM spec")?;
-
+        // Spawn the VMM child (it becomes the VM), attach over vsock + pump the
+        // terminal, then reap + tear down. `env_clear` so only the composed guest
+        // env reaches the VM; the real creds go out-of-band on stdin.
         eprintln!(
             "pillbox: libkrun backend (experimental) — launching `{}` in a microVM",
             spec.id
         );
         let exe = std::env::current_exe().context("locate the pillbox binary to re-exec as VMM")?;
-        // Spawn (don't block): the child boots the VM + the guest pty-host listens
-        // on the vsock attach port; the parent attaches over the bridged socket and
-        // pumps the terminal, then reaps the VM. Secrets travel as the child's env
-        // (env_clear so only the composed guest env reaches the VM).
         // Bind the attach listener BEFORE booting: libkrun (in the child) dials it
         // when the guest pty-host connects out, so it must already exist.
-        let listener = UnixListener::bind(&attach_sock)
-            .with_context(|| format!("bind attach socket {}", attach_sock.display()))?;
+        let listener = UnixListener::bind(&launch.attach_sock)
+            .with_context(|| format!("bind attach socket {}", launch.attach_sock.display()))?;
         listener.set_nonblocking(true).ok();
 
         let mut child = Command::new(&exe)
             .arg("__krun-vmm")
-            .arg(spec_file.path())
+            .arg(launch.spec_file.path())
             .env_clear()
-            .envs(guest_env)
+            .envs(launch.guest_env)
             .stdin(std::process::Stdio::piped())
             .spawn()
             .context("spawn the libkrun VMM subprocess")?;
@@ -378,15 +228,14 @@ impl SandboxBackend for LibkrunBackend {
         // reals never touch the guest env, argv, or the VmSpec file. Closing the
         // pipe (drop) signals EOF so the child's read completes.
         if let Some(mut sin) = child.stdin.take() {
-            let blob = serde_json::to_string(&swap_pairs).unwrap_or_else(|_| "[]".into());
+            let blob = serde_json::to_string(&launch.swap_pairs).unwrap_or_else(|_| "[]".into());
             use std::io::Write as _;
             let _ = sin.write_all(blob.as_bytes());
         }
 
-        // Poll the listener until the guest pty-host dials in (across VM boot),
-        // then run the shared terminal pump. Capture the result rather than `?`
-        // so teardown below runs on every path (a failed accept/pump must not
-        // leak the CoW clones).
+        // Poll the listener until the guest pty-host dials in (across VM boot), then
+        // run the shared terminal pump. Capture the result rather than `?` so the
+        // teardown runs on every path (a failed accept/pump must not leak clones).
         let outcome = accept_attach(&listener, &mut child).and_then(|stream| {
             let write_half = stream.try_clone().context("clone attach stream")?;
             pump::attach_terminal(stream, write_half, false)
@@ -396,16 +245,182 @@ impl SandboxBackend for LibkrunBackend {
         if let Some(tailer) = tailer {
             tailer.shutdown();
         }
-        // Teardown on every path (the §0 events are persisted in the SessionLog,
-        // so the CoW clones can go). Runs before the exit-code propagation below.
-        let _ = std::fs::remove_file(&attach_sock);
-        let _ = std::fs::remove_dir_all(&creds_share);
-        let _ = std::fs::remove_dir_all(&clone);
+        // Teardown on every path (the §0 events are persisted, so the clones go).
+        let _ = std::fs::remove_file(&launch.attach_sock);
+        let _ = std::fs::remove_dir_all(&launch.creds_share);
+        let _ = std::fs::remove_dir_all(&launch.workspace_clone);
         match outcome? {
             pump::Outcome::Exited(code) if code != 0 => std::process::exit(code),
             _ => Ok(()),
         }
     }
+}
+
+/// The artifacts [`prepare_launch`] builds for [`LibkrunBackend::run`] to spawn +
+/// supervise. `spec_file` (the VmSpec tempfile) must outlive the child's read, so
+/// it stays owned here; the CoW clones are torn down after the run.
+struct Launch {
+    spec_file: tempfile::NamedTempFile,
+    attach_sock: PathBuf,
+    guest_env: Vec<(String, String)>,
+    swap_pairs: Vec<SwapPair>,
+    creds_share: PathBuf,
+    workspace_clone: PathBuf,
+    guest_workspace: String,
+}
+
+/// Build everything needed to boot the microVM: materialize the rootfs, CoW +
+/// secret-scrub the workspace, compose the guest env, ensure + trust the vault CA,
+/// stub the agent's creds (the env-fork), assemble the guest entrypoint, and write
+/// the VmSpec. The env-fork guard fails fast here if a real credential reached a
+/// guest-readable channel (the env or the script).
+fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Result<Launch> {
+    let rootfs = materialize_rootfs(resolved)?;
+
+    // ── creds: the agent's auth home (stubbed + shared at GUEST_HOME below) ──
+    let home = spec.home_dir(resolved)?;
+    if !home.join(spec.cred_sentinel).exists() {
+        return Err(PillboxError::runtime(
+            "run",
+            format!("no stored credentials for `{}`", spec.id),
+        )
+        .with_next(format!("pillbox auth login --agent {}", spec.id))
+        .into());
+    }
+
+    // ── workspace: CoW clone + secret-scrub, shared at GUEST_WORKSPACE/<name> ──
+    let workspace_host = match &opts.workspace {
+        Some(p) => p.clone(),
+        None => std::env::current_dir().context("resolve current working directory")?,
+    };
+    if let Some(name) = opts.from_bookmark.as_deref() {
+        let handle = crate::bookmarks::resolve_existing(resolved, name)?;
+        resolved.workspace()?.pull(&workspace_host, Some(&handle))?;
+    }
+    let workspace_name = workspace_mount_name(&workspace_host, opts.name.as_deref())?;
+    let guest_workspace = format!("{GUEST_WORKSPACE}/{workspace_name}");
+    let clone = cow_clone_and_scrub(&workspace_host)?;
+
+    // ── env: the canonical composer (bundles → env-file → --with), no vault ──
+    let withs = resolve_with_entries(resolved, &opts.withs)?;
+    let composed = resolve_run_env(resolved, opts, &withs, None)?;
+    let mut guest_env: Vec<(String, String)> = vec![
+        ("HOME".into(), GUEST_HOME.into()),
+        ("TERM".into(), "xterm-256color".into()),
+        (
+            "PATH".into(),
+            format!("/usr/local/bin:/usr/bin:/bin:{GUEST_HOME}/.local/bin"),
+        ),
+    ];
+    guest_env.extend(composed);
+
+    // ── vault MITM trust: ensure the per-pillbox CA, trust its (public) cert in
+    // the guest. The CA *key* stays host-side (the child reads it); only the cert
+    // reaches the guest. No HTTPS_PROXY — we're transparent via the DNS fence.
+    let vault_ca_dir = resolved.subdir("vault")?;
+    let ca = crate::vault::Ca::ensure(&vault_ca_dir)
+        .map_err(|e| anyhow::anyhow!("ensure vault CA: {e}"))?;
+    let ca_cert_pem = std::fs::read_to_string(ca.cert_path()).context("read vault CA cert")?;
+    guest_env.push(("NODE_EXTRA_CA_CERTS".into(), GUEST_CA_PATH.into()));
+
+    // Pre-accept the agent's workspace-trust dialog on the live auth home before
+    // boot (claude); operates on host paths, like the docker path.
+    spec.prepare_workspace_or_warn(&home, &guest_workspace);
+
+    // Env fork: CoW the auth home and stub its OAuth tokens (after the seed so the
+    // clone inherits it). The guest mounts the *stubbed* creds — the real tokens
+    // never enter the VM; the MITM swaps stub→real on the wire. The reals reach the
+    // child out-of-band on stdin (not env/argv/VmSpec).
+    let (creds_share, swap_pairs) = stub_oauth_creds(&home, spec.cred_sentinel)?;
+
+    // The guest entrypoint: bring up the NIC + trust the CA, mount the shares, cd
+    // into the workspace, exec the agent under the in-guest pty-host (Frame over
+    // vsock). Quote every interpolated path (a workspace name may contain a space).
+    let agent_argv: Vec<String> = spec
+        .run_argv
+        .iter()
+        .map(|s| s.to_string())
+        .chain(spec.sandbox_args.iter().map(|s| s.to_string()))
+        .chain(opts.args.iter().cloned())
+        .collect();
+    let home_q = shell_quote(GUEST_HOME);
+    let gw_q = shell_quote(&guest_workspace);
+    let agent = agent_argv.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
+    let net = egress::guest_net_commands();
+    // base64 the PEM: a raw multi-line cert in the exec argv trips libkrun's cmdline
+    // encoder (`InvalidAscii` on the newlines). Single-line b64 → decode in-guest.
+    let ca_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &ca_cert_pem);
+    let ca_setup = format!(
+        "printf '%s' {b64} | base64 -d > {GUEST_CA_PATH}; \
+         update-ca-certificates >/dev/null 2>&1 || true",
+        b64 = shell_quote(&ca_b64),
+    );
+    let script = format!(
+        "set -e; {net}; {ca_setup}; mkdir -p {home_q}; mount -t virtiofs creds {home_q}; \
+         mkdir -p {gw_q}; mount -t virtiofs workspace {gw_q}; cd {gw_q}; \
+         exec pillbox pty-host --vsock-port {ATTACH_PORT} -- {agent}",
+    );
+
+    // ── env-fork invariant (the security thesis, guarded) ──
+    // Three channels into the VM, and the real credential belongs to exactly one:
+    // non-secret config → the guest env (`guest_env` → envp) and the exec
+    // `script`/VmSpec (a host-readable tempfile); the real credential → ONLY the
+    // MITM swap, out-of-band on the child's stdin + held in the VMM child's memory.
+    // A real in a guest-readable channel is exfiltratable by a prompt-injected agent
+    // — fail fast rather than silently leak if a future change crosses channels.
+    for pair in &swap_pairs {
+        if guest_env.iter().any(|(_, v)| v.contains(&pair.real)) || script.contains(&pair.real) {
+            bail!(
+                "libkrun env-fork violated: a real credential reached a guest-readable \
+                 channel (env/script) — it must travel only via the MITM stdin swap"
+            );
+        }
+    }
+
+    let attach_sock = krun_cache_dir()?
+        .join(format!("attach-{}.sock", uuid::Uuid::now_v7().simple()));
+    let _ = std::fs::remove_file(&attach_sock);
+
+    let vmspec = VmSpec {
+        rootfs: rootfs.to_string_lossy().into_owned(),
+        vcpus: 2,
+        ram_mib: 2048,
+        shares: vec![
+            Share { tag: "creds".into(), host_path: creds_share.to_string_lossy().into_owned() },
+            Share { tag: "workspace".into(), host_path: clone.to_string_lossy().into_owned() },
+        ],
+        exec: vec!["/bin/sh".into(), "-c".into(), script],
+        vsock: Some(VsockAttach {
+            port: ATTACH_PORT,
+            host_sock: attach_sock.to_string_lossy().into_owned(),
+        }),
+        egress: Some(EgressSpec {
+            // The vault providers' full intercept set (API + OAuth/platform hosts)
+            // — so the agent can reach its provider *and* refresh a token.
+            allowlist: crate::vault::providers::intercepted_hosts()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            log_path: std::env::var("PILLBOX_KRUN_EGRESS_LOG").ok(),
+            ca_dir: Some(vault_ca_dir.to_string_lossy().into_owned()),
+        }),
+    };
+    let spec_file = tempfile::Builder::new()
+        .prefix("pillbox-krun-spec-")
+        .suffix(".json")
+        .tempfile()
+        .context("create VMM spec tempfile")?;
+    serde_json::to_writer(&spec_file, &vmspec).context("write VMM spec")?;
+
+    Ok(Launch {
+        spec_file,
+        attach_sock,
+        guest_env,
+        swap_pairs,
+        creds_share,
+        workspace_clone: clone,
+        guest_workspace,
+    })
 }
 
 /// vsock port the guest pty-host dials for the attach channel.

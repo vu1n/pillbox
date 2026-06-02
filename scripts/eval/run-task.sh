@@ -23,9 +23,19 @@ MAX_WAIT="${MAX_WAIT:-120}"
 export PILLBOX_BACKEND=libkrun
 task="$(basename "$task_dir")"
 
+# `condition` selects the injected profile (prepended to the prompt):
+#   baseline           → nothing
+#   memory             → memory/playbook.md (the curated bullets)
+#   <path to a file>   → that file (the meta-harness injects candidate profiles)
 prompt="$(cat "$task_dir/prompt.txt")"
-if [ "$condition" = "memory" ]; then
-  prompt="$(cat "$here/memory/playbook.md")"$'\n\n'"$prompt"
+profile=""
+case "$condition" in
+  baseline) : ;;
+  memory)   profile="$here/memory/playbook.md" ;;
+  *)        profile="$condition" ;;
+esac
+if [ -n "$profile" ] && [ -f "$profile" ]; then
+  prompt="$(cat "$profile")"$'\n\n'"$prompt"
 fi
 
 # A fresh copy of the starting workspace per run (the agent mutates a CoW clone
@@ -62,5 +72,33 @@ verdict="fail"
 if "$PILLBOX" session score "$sid" --cmd "sh grade.sh" --workspace "$clone" 2>&1 | grep -q 'passed'; then
   verdict="pass"
 fi
+
+# FAILDIR: on a fail, capture a failure report (task + what the agent produced +
+# why it failed) — the input the meta-harness's `propose` step reflects on.
+if [ "$verdict" = fail ] && [ -n "${FAILDIR:-}" ]; then
+  mkdir -p "$FAILDIR"
+  {
+    echo "## TASK: $task"; echo; cat "$task_dir/prompt.txt"; echo
+    echo "## THE AGENT PRODUCED:"
+    for f in "$task_dir"/workspace/*; do
+      b="$(basename "$f")"; echo "--- $b ---"; cat "$clone/$b" 2>/dev/null; echo
+    done
+    echo "## GRADER FEEDBACK (why it failed):"
+    python3 - "$sid" <<'PY'
+import json, os, sys
+log = os.path.expanduser(f"~/.pillbox/global/sessions/{sys.argv[1]}/log.jsonl")
+fb = ""
+for line in open(log):
+    try:
+        p = json.loads(line).get("payload", {})
+    except Exception:
+        continue
+    if p.get("type") == "scored":
+        fb = p.get("feedback", "")
+print(fb[-2000:])
+PY
+  } > "$FAILDIR/$task.md" 2>/dev/null
+fi
+
 "$PILLBOX" session rm "$sid" >/dev/null 2>&1 || true
 echo "$task	$condition	$verdict"

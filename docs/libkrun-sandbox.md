@@ -578,10 +578,14 @@ Docker untouched until step 8. Slices (each its own commit, default build green)
     (rootfs…VmSpec) + a ~90-line supervise orchestrator; (b) ✅ the L7 TLS pump
     split out of `egress.rs` into `mitm.rs` (egress.rs 462 / mitm.rs 229 / vault.rs
     392). Both behavior-preserving + re-verified live (smoltcp up, cred swaps, §0).
-    **Still deferred to L6:** (c) threaded/non-blocking upstream
-    connect (today's blocking `connect_timeout` stalls the poll loop on a hung
-    upstream — bounded to 5s); (d) response-side real→stub for mid-run token refresh
-    (AnthropicProvider's bidirectional OAuth); (e) the `--with --vault` API-key path
+    **Done in L6:** (c) ✅ threaded/non-blocking upstream connect — `vault::
+    spawn_connect` runs the 10s `connect_timeout` on its own thread and the pump
+    polls an `mpsc::Receiver`, so a hung upstream no longer stalls the smoltcp
+    poll loop (re-verified live: 12 swaps, 0 connect failures); (h) ✅ `--detach`
+    + session reattach/kill — see the [L6 slice](#l6-detach--sessions) below.
+    **Still deferred:** (d) response-side real→stub for mid-run token refresh
+    (AnthropicProvider's bidirectional OAuth — the A1 single-player-persist /
+    multiplayer-vault question); (e) the `--with --vault` API-key path
     (same `StubSwap`); (f) codex `*.chatgpt.com` wildcard in the DNS fence; (g)
     foreground session records (the sessions-organization polish). **Architecture:** the
     smoltcp egress stack runs in the **VMM child** (a thread alongside
@@ -704,6 +708,41 @@ Docker untouched until step 8. Slices (each its own commit, default build green)
         `delta`/`end`, user + assistant) — what `session watch`/`subscribe`
         consume. `proxy_active=false` (our MITM doesn't tap gen_ai usage, so the
         transcript stays the usage source).
+  - <a name="l6-detach--sessions"></a>✅ **L6 `--detach` + sessions** — a libkrun
+    run can be backgrounded and reattached, **including vaulted** (unlike local
+    docker `--detach`, where the host-side proxy can't outlive the CLI). This
+    works *because the MITM lives in the VMM child, not the parent* — the parent
+    can return while the child keeps the agent + egress stack + vault alive.
+    - **Attach direction flips for detach.** Foreground = **guest dials host**
+      (`krun_add_vsock_port`; parent binds+accepts before boot → no race). Detach
+      = **guest listens** (`krun_add_vsock_port2(port, host_sock, listen=true)`;
+      libkrun binds a *persistent* unix socket the reattaching pillbox dials).
+      The L4 race (port2 raced the foreground initial attach) doesn't recur:
+      reattach happens when the guest is already up, so there's nothing to race.
+      `prepare_launch` splices `--vsock-listen` into the guest pty-host command +
+      sets `VsockAttach.listen` when `opts.detach`; `pty-host --vsock-listen`
+      (`attach/host.rs`) binds `AF_VSOCK`/`VMADDR_CID_ANY` and serves an accept
+      loop (a dropped client doesn't kill the live agent).
+    - **`run_detached`** persists the `VmSpec` tempfile (the child reads it *after*
+      the parent returns), spawns the `__krun-vmm` child with null stdio (don't
+      wait — it reparents to init), pipes the real creds to its stdin (the
+      env-fork channel, unchanged), and writes a `Session` whose `sandbox_id` is a
+      JSON `LibkrunHandle { sock, pid, creds, workspace, spec }`. No cleanup on
+      return — the child owns the VM.
+    - **`reattach`** decodes the handle, `UnixStream::connect`s the persistent
+      sock, and runs the normal `pump::attach_terminal` (detach-enabled). **`kill_
+      session`** `SIGKILL`s `handle.pid` + scrubs the sock/spec/creds/workspace
+      clones + drops the record. Dispatched from `commands/session.rs`
+      (`Backend::Libkrun` arms, cfg-gated).
+    - **Live-verified** (`pillbox-runner:l6`): `run --detach` returned immediately
+      with a live VMM child; `session list` showed `running/detached`; `session
+      attach` connected over the port2-listen sock and rendered claude's UI **with
+      the agent's reply** (so the detached VM booted claude *and authenticated
+      through the in-child MITM* — the env-fork works detached); `Ctrl-A D`
+      detached cleanly leaving the child alive; `session rm` killed the child +
+      dropped the record. **Skew note:** the runner's in-guest pillbox must have
+      `--vsock-listen` — an older image fails detach (rebuild the runner when the
+      launch protocol changes — the same version-skew preflight docker:// added).
     **Env fork — secrets go to the vault, not the VM env** (lands with L5b; this is
     the whole point of vault-v2; a secret in the VM's env is readable by the
     agent via `/proc/self/environ` and exfiltrable by a prompt injection). L3

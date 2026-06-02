@@ -61,21 +61,57 @@ pub(crate) fn run(sock: &str, argv: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Run the pty-host over **vsock** (guest-side, for the libkrun backend): the
-/// guest **dials the host** (`VMADDR_CID_HOST`) on `port`; libkrun bridges to the
-/// parent's pre-bound listener, which `accept()`s only once we're up — so there's
-/// no connect-before-ready race (the proven libkrun vsock direction). A vsock
-/// connection is a `SOCK_STREAM` fd, so it wraps as a `UnixStream` and reuses
-/// [`handle_client`] unchanged. Linux-only — the host (macOS) never runs this; it
-/// pumps the bridged socket. Single foreground client; reattach (re-dial after a
-/// client leaves) lands with `--detach`, alongside the parent re-`accept()`.
+/// Run the pty-host over **vsock** (guest-side, for the libkrun backend), reusing
+/// [`handle_client`] over the vsock fd wrapped as a `UnixStream`. Linux-only — the
+/// host (macOS) never runs this; it pumps the bridged socket. Two directions:
+///
+/// - `listen=false` (**foreground**): the guest **dials the host**
+///   (`VMADDR_CID_HOST`) on `port`; libkrun bridges to the parent's pre-bound
+///   listener, which `accept()`s once we're up — no connect-before-ready race.
+///   One client; the agent's exit ends the process.
+/// - `listen=true` (**detach**): the guest **listens** on `port` and accepts
+///   reattach clients one at a time (the agent + screen persist across them via
+///   the [`PtySession`]); libkrun binds the host socket so it survives the parent
+///   returning. The agent's exit (the reader thread) ends the process.
 #[cfg(target_os = "linux")]
-pub(crate) fn run_vsock(port: u32, argv: &[String]) -> Result<()> {
+pub(crate) fn run_vsock(port: u32, listen: bool, argv: &[String]) -> Result<()> {
     use std::os::unix::io::FromRawFd;
     use std::time::Duration;
 
     const VMADDR_CID_HOST: u32 = 2;
+    const VMADDR_CID_ANY: u32 = 0xffff_ffff;
     let session = spawn_pty_session(argv)?;
+
+    if listen {
+        let lfd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) };
+        if lfd < 0 {
+            anyhow::bail!("AF_VSOCK socket: {}", std::io::Error::last_os_error());
+        }
+        let mut addr: libc::sockaddr_vm = unsafe { std::mem::zeroed() };
+        addr.svm_family = libc::AF_VSOCK as libc::sa_family_t;
+        addr.svm_port = port;
+        addr.svm_cid = VMADDR_CID_ANY;
+        let alen = std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t;
+        if unsafe { libc::bind(lfd, &addr as *const _ as *const libc::sockaddr, alen) } != 0 {
+            anyhow::bail!("bind vsock :{port}: {}", std::io::Error::last_os_error());
+        }
+        if unsafe { libc::listen(lfd, 4) } != 0 {
+            anyhow::bail!("listen vsock :{port}: {}", std::io::Error::last_os_error());
+        }
+        // Accept reattach clients one at a time; the agent (and its screen) live in
+        // `session` across them. On an accept error, back off + retry rather than
+        // return — returning here would drop `session` and kill a live agent; the
+        // agent's own exit (reader thread → process::exit) is the real terminator.
+        loop {
+            let cfd = unsafe { libc::accept(lfd, std::ptr::null_mut(), std::ptr::null_mut()) };
+            if cfd < 0 {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            session.serve_blocking(unsafe { UnixStream::from_raw_fd(cfd) });
+        }
+    }
+
     // Dial the host, retrying only until the bridge + parent listener are ready
     // (the guest boots well after the parent binds, so this connects promptly).
     let stream = loop {

@@ -349,11 +349,29 @@ fn session_attach(resolved: &Pillbox, id: &str) -> Result<()> {
             })?;
             sandbox::remote_ssh::reattach(resolved, &remote, &s)
         }
+        Some(session::Backend::Libkrun) => libkrun_reattach(resolved, &s),
         None => Err(PillboxError::config(
             "session attach",
             format!("unknown session backend `{}`", s.backend),
         )
         .into()),
+    }
+}
+
+/// Dispatch a libkrun reattach (feature-gated). A `libkrun` session record can
+/// exist on disk even in a build without the feature; fail clearly there.
+fn libkrun_reattach(_resolved: &Pillbox, _s: &session::Session) -> Result<()> {
+    #[cfg(feature = "libkrun")]
+    {
+        sandbox::libkrun::reattach(_resolved, _s)
+    }
+    #[cfg(not(feature = "libkrun"))]
+    {
+        Err(PillboxError::usage(
+            "session attach",
+            "this is a libkrun session but this build wasn't compiled with the `libkrun` feature",
+        )
+        .into())
     }
 }
 
@@ -472,11 +490,27 @@ fn session_rm(resolved: &Pillbox, id: &str) -> Result<()> {
             let remote = remote::read(resolved, &s.remote)?;
             sandbox::remote_ssh::kill_session(resolved, remote.as_ref(), &s)
         }
+        Some(session::Backend::Libkrun) => libkrun_kill_session(resolved, &s),
         None => Err(PillboxError::config(
             "session rm",
             format!("unknown session backend `{}`", s.backend),
         )
         .into()),
+    }
+}
+
+/// Dispatch a libkrun teardown (feature-gated; see [`libkrun_reattach`]). Without
+/// the feature we can't kill the VM, but still drop the orphaned record.
+fn libkrun_kill_session(resolved: &Pillbox, s: &session::Session) -> Result<()> {
+    #[cfg(feature = "libkrun")]
+    {
+        sandbox::libkrun::kill_session(resolved, s)
+    }
+    #[cfg(not(feature = "libkrun"))]
+    {
+        eprintln!("pillbox: warning: libkrun feature not built — can't kill the VM; dropping the record only");
+        session::delete(resolved, &s.id)?;
+        Ok(())
     }
 }
 

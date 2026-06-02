@@ -124,6 +124,7 @@ pub(crate) const BACKEND_E2B: &str = "e2b";
 pub(crate) const BACKEND_SSH: &str = "ssh";
 pub(crate) const BACKEND_DOCKER: &str = "docker";
 pub(crate) const BACKEND_REMOTE_DOCKER: &str = "remote-docker";
+pub(crate) const BACKEND_LIBKRUN: &str = "libkrun";
 
 /// The `remote` field value a *local* Docker session records — a display label
 /// (it has no registered remote). Placement is carried by [`Backend`] (local
@@ -148,6 +149,12 @@ pub(crate) enum Backend {
     /// variant (not `Docker` + a "is the remote field 'local'?" check) so the
     /// placement is typed and a remote literally named "local" can't misroute.
     RemoteDocker,
+    /// Local libkrun microVM — a detached `pillbox run --detach` (feature-gated
+    /// `libkrun`). `sandbox_id` carries the persistent attach socket path + the
+    /// VMM child PID; attach dials that socket, rm kills the child + scrubs the
+    /// CoW clones. Detach keeps the vault (the MITM lives in the child, not the
+    /// parent — unlike local Docker, which can't keep a host-side proxy alive).
+    Libkrun,
 }
 
 impl Backend {
@@ -157,6 +164,7 @@ impl Backend {
             BACKEND_SSH => Some(Backend::Ssh),
             BACKEND_DOCKER => Some(Backend::Docker),
             BACKEND_REMOTE_DOCKER => Some(Backend::RemoteDocker),
+            BACKEND_LIBKRUN => Some(Backend::Libkrun),
             _ => None,
         }
     }

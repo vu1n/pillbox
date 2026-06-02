@@ -393,9 +393,14 @@ enum Command {
         /// Unix socket to listen on for attach clients (docker / ssh backends).
         #[arg(long, value_name = "PATH")]
         sock: Option<String>,
-        /// vsock port to listen on instead (libkrun guest backend; Linux-only).
+        /// vsock port instead (libkrun guest backend; Linux-only). Default
+        /// direction is guest-dials-host (foreground); `--vsock-listen` flips it
+        /// to guest-listens for `--detach` (so the socket persists for reattach).
         #[arg(long, value_name = "PORT")]
         vsock_port: Option<u32>,
+        /// With `--vsock-port`: the guest *listens* (detach), instead of dialing.
+        #[arg(long)]
+        vsock_listen: bool,
         /// Command to run under the PTY: everything after `--`.
         #[arg(last = true, value_name = "CMD")]
         argv: Vec<String>,
@@ -697,10 +702,11 @@ fn run(cli: Cli) -> Result<()> {
         Command::PtyHost {
             sock,
             vsock_port,
+            vsock_listen,
             argv,
         } => match (sock, vsock_port) {
             (Some(s), None) => attach::host::run(&s, &argv),
-            (None, Some(port)) => pty_host_vsock(port, &argv),
+            (None, Some(port)) => pty_host_vsock(port, vsock_listen, &argv),
             _ => Err(PillboxError::usage(
                 "pty-host",
                 "exactly one of --sock or --vsock-port is required",
@@ -776,11 +782,11 @@ fn dispatch_run(resolved: &Pillbox, agent: Option<String>, mut opts: RunOpts) ->
 /// attach frame protocol over vsock; the macOS host never runs this (it connects
 /// to the bridged socket and pumps).
 #[cfg(target_os = "linux")]
-fn pty_host_vsock(port: u32, argv: &[String]) -> Result<()> {
-    attach::host::run_vsock(port, argv)
+fn pty_host_vsock(port: u32, listen: bool, argv: &[String]) -> Result<()> {
+    attach::host::run_vsock(port, listen, argv)
 }
 #[cfg(not(target_os = "linux"))]
-fn pty_host_vsock(_port: u32, _argv: &[String]) -> Result<()> {
+fn pty_host_vsock(_port: u32, _listen: bool, _argv: &[String]) -> Result<()> {
     Err(PillboxError::usage("pty-host", "--vsock-port is Linux-only (the libkrun guest)").into())
 }
 

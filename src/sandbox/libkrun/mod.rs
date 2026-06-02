@@ -71,6 +71,17 @@ pub(crate) mod ffi {
         pub fn krun_set_root(ctx_id: u32, root_path: *const c_char) -> c_int;
         pub fn krun_set_workdir(ctx_id: u32, workdir: *const c_char) -> c_int;
         pub fn krun_add_vsock_port(ctx_id: u32, port: u32, c_filepath: *const c_char) -> c_int;
+        /// `listen=false`: guest dials `port`, libkrun bridges to the host unix
+        /// socket (host listens) — the foreground attach. `listen=true`: the guest
+        /// listens on `port`, libkrun binds the host unix socket (a host client
+        /// dials it) — the **detach** direction, so the socket persists for reattach
+        /// after the parent returns.
+        pub fn krun_add_vsock_port2(
+            ctx_id: u32,
+            port: u32,
+            c_filepath: *const c_char,
+            listen: bool,
+        ) -> c_int;
         pub fn krun_add_net_unixstream(
             ctx_id: u32,
             c_path: *const c_char,
@@ -148,6 +159,24 @@ struct SwapPair {
 struct VsockAttach {
     port: u32,
     host_sock: String,
+    /// `false`: guest dials the host (foreground — parent binds + accepts).
+    /// `true`: guest listens, libkrun binds `host_sock` (detach — it persists for
+    /// reattach after the parent returns). Selects `krun_add_vsock_port{,2}`.
+    #[serde(default)]
+    listen: bool,
+}
+
+/// What a detached libkrun session stores in `Session::sandbox_id` (as JSON): the
+/// persistent attach socket (libkrun-bound for the guest's listen) to reattach to,
+/// the VMM child PID to signal on `rm`, and the CoW clones + spec file to scrub on
+/// `rm`. The detached child + these artifacts outlive the launching CLI.
+#[derive(Serialize, Deserialize)]
+struct LibkrunHandle {
+    sock: String,
+    pid: i32,
+    creds: String,
+    workspace: String,
+    spec: String,
 }
 
 /// The local microVM backend. Selected for a local run when the `libkrun`
@@ -170,9 +199,6 @@ impl SandboxBackend for LibkrunBackend {
         if opts.vault {
             return Err(unsupported(spec, "--vault (egress + vault v2 is a later slice)"));
         }
-        if opts.detach {
-            return Err(unsupported(spec, "--detach (session lifecycle is a later slice)"));
-        }
 
         let run_started = std::time::SystemTime::now();
         let session_id = crate::session::Session::new_id();
@@ -180,6 +206,14 @@ impl SandboxBackend for LibkrunBackend {
         // Build the launch packet (rootfs, CoW workspace + creds, env, CA, script,
         // VmSpec). The env-fork guard fails fast inside if a real credential leaked.
         let launch = prepare_launch(spec, &opts, resolved)?;
+
+        // Detach: spawn the VM to outlive the CLI + record the session, then return.
+        // libkrun keeps the vault on detach (the MITM lives in the child, not the
+        // parent), unlike local Docker. Reattach/teardown go through the session
+        // record. Foreground (below) supervises + pumps the terminal inline.
+        if opts.detach {
+            return run_detached(spec, resolved, &session_id, &opts, launch);
+        }
 
         // §0: tail the agent's transcript from the host-side creds clone into the
         // durable SessionLog (the same producer docker/ssh use; no guest emitter).
@@ -355,10 +389,13 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
          update-ca-certificates >/dev/null 2>&1 || true",
         b64 = shell_quote(&ca_b64),
     );
+    // Detach: the guest pty-host *listens* (so the attach socket persists for
+    // reattach after the parent returns); foreground: it dials the parent.
+    let vsock_flag = if opts.detach { " --vsock-listen" } else { "" };
     let script = format!(
         "set -e; {net}; {ca_setup}; mkdir -p {home_q}; mount -t virtiofs creds {home_q}; \
          mkdir -p {gw_q}; mount -t virtiofs workspace {gw_q}; cd {gw_q}; \
-         exec pillbox pty-host --vsock-port {ATTACH_PORT} -- {agent}",
+         exec pillbox pty-host --vsock-port {ATTACH_PORT}{vsock_flag} -- {agent}",
     );
 
     // ── env-fork invariant (the security thesis, guarded) ──
@@ -393,6 +430,7 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
         vsock: Some(VsockAttach {
             port: ATTACH_PORT,
             host_sock: attach_sock.to_string_lossy().into_owned(),
+            listen: opts.detach,
         }),
         egress: Some(EgressSpec {
             // The vault providers' full intercept set (API + OAuth/platform hosts)
@@ -421,6 +459,126 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
         workspace_clone: clone,
         guest_workspace,
     })
+}
+
+/// Start the microVM detached: spawn the VMM child so it outlives the CLI (it's
+/// reparented to init), hand it the reals on stdin, record the session, return.
+/// No pump, no §0 tailer (that spawns on `reattach`), no teardown (the clones +
+/// spec persist for the running VM; `kill_session` scrubs them). The guest
+/// pty-host listens (set by `prepare_launch` when `opts.detach`), so libkrun's
+/// bound socket persists for reattach.
+fn run_detached(
+    spec: &AgentSpec,
+    resolved: &Pillbox,
+    session_id: &str,
+    opts: &RunOpts,
+    launch: Launch,
+) -> Result<()> {
+    // The child reads the spec at startup, *after* we return — so persist it (a
+    // `NamedTempFile` would delete on drop); `kill_session` removes it.
+    let (_, spec_path) = launch.spec_file.keep().context("persist VMM spec for detach")?;
+
+    let exe = std::env::current_exe().context("locate the pillbox binary to re-exec as VMM")?;
+    let mut child = Command::new(&exe)
+        .arg("__krun-vmm")
+        .arg(&spec_path)
+        .env_clear()
+        .envs(launch.guest_env)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("spawn the detached libkrun VMM subprocess")?;
+
+    // Env fork: hand the reals to the child's MITM on stdin (out-of-band), as the
+    // foreground path does, then drop the pipe (EOF).
+    if let Some(mut sin) = child.stdin.take() {
+        let blob = serde_json::to_string(&launch.swap_pairs).unwrap_or_else(|_| "[]".into());
+        use std::io::Write as _;
+        let _ = sin.write_all(blob.as_bytes());
+    }
+
+    let handle = LibkrunHandle {
+        sock: launch.attach_sock.to_string_lossy().into_owned(),
+        pid: child.id() as i32,
+        creds: launch.creds_share.to_string_lossy().into_owned(),
+        workspace: launch.workspace_clone.to_string_lossy().into_owned(),
+        spec: spec_path.to_string_lossy().into_owned(),
+    };
+    let session = crate::session::Session {
+        id: session_id.to_string(),
+        label: opts.label.clone(),
+        remote: crate::session::LOCAL_REMOTE.to_string(),
+        backend: crate::session::BACKEND_LIBKRUN.to_string(),
+        sandbox_id: serde_json::to_string(&handle).context("encode libkrun handle")?,
+        pty_pid: 0,
+        agent_id: spec.id.to_string(),
+        started_at: crate::session::now_rfc3339(),
+        attached_pid: None,
+        base_snapshot: None,
+        result_snapshot: None,
+        expires_at: opts.ttl_seconds.map(crate::session::expires_at_from_ttl),
+        guest_cwd: launch.guest_workspace,
+        agent_session_id: None,
+        model: None,
+    };
+    crate::session::write(resolved, &session)?;
+    // Don't wait: the child (VM + egress + MITM, with the vault) is reparented to
+    // init and keeps running.
+    println!("pillbox: ✓ session `{}` started in background (libkrun)", session.id);
+    println!("  Next: pillbox session attach {}", session.id);
+    Ok(())
+}
+
+/// Reattach to a detached libkrun session: dial the persistent attach socket
+/// libkrun bound for the guest's listening pty-host, and pump the terminal (with
+/// the detach hotkey enabled). The agent + its screen persisted in the VM.
+pub(crate) fn reattach(resolved: &Pillbox, session: &crate::session::Session) -> Result<()> {
+    let handle: LibkrunHandle =
+        serde_json::from_str(&session.sandbox_id).context("decode libkrun session handle")?;
+    eprintln!("pillbox: reattaching to session `{}` …", session.id);
+    eprintln!("pillbox: detach with Ctrl-A D");
+    crate::session::mark_attached(resolved, &session.id, std::process::id() as i64)?;
+    let outcome = (|| -> Result<pump::Outcome> {
+        let stream = UnixStream::connect(&handle.sock)
+            .with_context(|| format!("connect attach socket {}", handle.sock))?;
+        let write_half = stream.try_clone().context("clone attach stream")?;
+        pump::attach_terminal(stream, write_half, true)
+    })();
+    let _ = crate::session::mark_detached(resolved, &session.id);
+    match outcome? {
+        pump::Outcome::Detached | pump::Outcome::Disconnected => {
+            eprintln!("pillbox: detached. reattach with `pillbox session attach {}`", session.id);
+            Ok(())
+        }
+        pump::Outcome::Exited(code) => {
+            eprintln!("pillbox: agent exited ({code}). `pillbox session rm {}` to clean up.", session.id);
+            Ok(())
+        }
+    }
+}
+
+/// Tear down a detached libkrun session: kill the VMM child (the VM + egress +
+/// MITM go with it), scrub the persisted socket/spec/CoW clones, drop the record.
+pub(crate) fn kill_session(resolved: &Pillbox, session: &crate::session::Session) -> Result<()> {
+    let handle: LibkrunHandle =
+        serde_json::from_str(&session.sandbox_id).context("decode libkrun session handle")?;
+    if handle.pid > 0 {
+        unsafe { libc::kill(handle.pid, libc::SIGKILL) };
+    }
+    let _ = std::fs::remove_file(&handle.sock);
+    let _ = std::fs::remove_file(&handle.spec);
+    let _ = std::fs::remove_dir_all(&handle.creds);
+    let _ = std::fs::remove_dir_all(&handle.workspace);
+    crate::events::emit_session_event(
+        resolved,
+        crate::events::EventType::SessionDropped,
+        &session.id,
+        Some(session),
+    );
+    crate::session::delete(resolved, &session.id)?;
+    println!("pillbox: ✓ session `{}` removed.", session.id);
+    Ok(())
 }
 
 /// vsock port the guest pty-host dials for the attach channel.
@@ -506,7 +664,7 @@ pub(crate) fn vmm_child_main() -> ! {
         .iter()
         .map(|s| (cstr(&s.tag), cstr(&s.host_path)))
         .collect();
-    let vsock = spec.vsock.as_ref().map(|v| (v.port, cstr(&v.host_sock)));
+    let vsock = spec.vsock.as_ref().map(|v| (v.port, cstr(&v.host_sock), v.listen));
     // Egress: a passt socketpair — one end to libkrun's virtio-net, the other to
     // our userspace stack (which the child runs in a thread beside the VM).
     struct NetAttach {
@@ -547,11 +705,17 @@ pub(crate) fn vmm_child_main() -> ! {
         for (tag, host) in &shares {
             rc = rc.min(ffi::krun_add_virtiofs(ctx, tag.as_ptr(), host.as_ptr()));
         }
-        if let Some((port, host_sock)) = &vsock {
-            // Default direction: the guest pty-host dials `port`, libkrun bridges
-            // to the parent's listener at `host_sock`. (Guest-connects-out is the
-            // proven direction; the parent's accept() waits for us — no race.)
-            rc = rc.min(ffi::krun_add_vsock_port(ctx, *port, host_sock.as_ptr()));
+        if let Some((port, host_sock, listen)) = &vsock {
+            // Foreground (listen=false): the guest pty-host dials `port`, libkrun
+            // bridges to the parent's pre-bound listener at `host_sock` — no race
+            // (the parent's accept waits for us). Detach (listen=true): the guest
+            // listens, libkrun binds `host_sock` so it persists for reattach after
+            // the parent returns.
+            rc = rc.min(if *listen {
+                ffi::krun_add_vsock_port2(ctx, *port, host_sock.as_ptr(), true)
+            } else {
+                ffi::krun_add_vsock_port(ctx, *port, host_sock.as_ptr())
+            });
         }
         if let Some(n) = net.as_ref() {
             rc = rc.min(ffi::krun_add_net_unixstream(

@@ -674,25 +674,88 @@ pub(crate) fn opencode_events_file(
 /// return `(exit_code, combined_output)`. Backs `session score --in-sandbox`:
 /// real repos' tests need the image's toolchain, which host-side grading lacks.
 ///
-/// The grader-VM is deliberately bare — NO vsock, NO egress (offline), NO creds:
-/// the grade must be reproducible and secret-free, and a fresh env (vs the
-/// agent's still-running VM with its ad-hoc `pip install`s) keeps the verdict
+/// By default the grader-VM is deliberately bare — NO vsock, NO egress (offline),
+/// NO creds: the grade must be reproducible and secret-free, and a fresh env (vs
+/// the agent's still-running VM with its ad-hoc `pip install`s) keeps the verdict
 /// honest. The grader is responsible for its own setup; deps it can't fetch
-/// (no network) must be vendored or in the image. `krun_start_enter` exits the
-/// child with the guest's code, so the child's exit IS the grader's exit, and
-/// the guest console (merged via `2>&1`) is the child's stdout.
+/// (no network) must be vendored or in the image.
+///
+/// `egress_allow` (from `--grader-egress`) opts a *single grade* into network
+/// for the listed hosts only — so a real repo's tests can `pip install` /
+/// `npm install` deps. It reuses the run path's egress exactly: DNS-fence
+/// (only these hosts resolve) → MITM terminate-and-forward with an **empty
+/// swap** (no credential substitution — the grader holds no creds), and the
+/// guest trusts the MITM leaf via the CA preamble. This trades the offline
+/// reproducibility guarantee for reachability; the caller notes it in feedback.
+///
+/// `krun_start_enter` exits the child with the guest's code, so the child's exit
+/// IS the grader's exit, and the guest console (merged via `2>&1`) is the
+/// child's stdout.
 pub(crate) fn score_in_sandbox(
     resolved: &Pillbox,
     workspace: &Path,
     cmd: &str,
+    egress_allow: &[String],
 ) -> Result<(i32, String)> {
     use std::io::Read as _;
     let rootfs = materialize_rootfs(resolved)?;
-    // Mount the workspace, cd in, run the grader with stderr merged to the
-    // console. `&&` so a failed mount/cd surfaces; the grader's exit is the last.
-    let script = format!(
-        "mkdir -p /grade && mount -t virtiofs grade /grade && cd /grade && {{ {cmd} ; }} 2>&1"
-    );
+
+    // Egress is opt-in: an empty allowlist keeps the bare/offline grader. When
+    // hosts are declared, prepend the NIC-up + CA-trust preamble (so the guest's
+    // TLS clients accept the MITM leaf) and route through the same fence as a run.
+    let (egress, env_extra, script) = if egress_allow.is_empty() {
+        // Mount the workspace, cd in, run the grader with stderr merged to the
+        // console. `&&` so a failed mount/cd surfaces; the grader's exit is last.
+        let script = format!(
+            "mkdir -p /grade && mount -t virtiofs grade /grade && cd /grade && {{ {cmd} ; }} 2>&1"
+        );
+        (None, Vec::new(), script)
+    } else {
+        let vault_ca_dir = resolved.subdir("vault")?;
+        let ca = crate::vault::Ca::ensure(&vault_ca_dir)
+            .map_err(|e| anyhow::anyhow!("ensure vault CA: {e}"))?;
+        let ca_pem = std::fs::read_to_string(ca.cert_path()).context("read vault CA cert")?;
+        let ca_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            ca_pem.as_bytes(),
+        );
+        let net = egress::guest_net_commands();
+        // `exec 2>&1` so setup output (a dep-fetch failure) lands in feedback too;
+        // `set -e` aborts loudly on a setup failure; `set +e` before the grader so
+        // its own exit code (not set -e) is the verdict, captured as the script's.
+        // Write the CA where the cert envs below point — no `update-ca-certificates`
+        // merge needed (it's not even on the grader's PATH), since the fence is
+        // all-MITM: every allowlisted host terminates at our CA-signed leaf, so
+        // trusting that one cert is sufficient (the same single-cert trust agents
+        // use via NODE_EXTRA_CA_CERTS).
+        let script = format!(
+            "exec 2>&1; set -e; {net}; \
+             printf '%s' {ca_b64q} | base64 -d > {GUEST_CA_PATH}; \
+             mkdir -p /grade; mount -t virtiofs grade /grade; cd /grade; \
+             set +e; {cmd}",
+            ca_b64q = shell_quote(&ca_b64),
+        );
+        let egress = Some(EgressSpec {
+            // Only the invoker-declared hosts resolve — the tightest fence (no
+            // provider/standard-egress union; the grader reaches deps, nothing else).
+            allowlist: egress_allow.to_vec(),
+            log_path: std::env::var("PILLBOX_KRUN_EGRESS_LOG").ok(),
+            ca_dir: Some(vault_ca_dir.to_string_lossy().into_owned()),
+        });
+        // Point every TLS client at the single MITM CA cert. pip/curl/openssl/
+        // requests ignore the system store by default; Node reads NODE_EXTRA_CA_CERTS.
+        // All point at GUEST_CA_PATH (not the system bundle) so trust doesn't depend
+        // on an `update-ca-certificates` merge.
+        let env_extra = vec![
+            ("NODE_EXTRA_CA_CERTS", GUEST_CA_PATH),
+            ("PIP_CERT", GUEST_CA_PATH),
+            ("REQUESTS_CA_BUNDLE", GUEST_CA_PATH),
+            ("SSL_CERT_FILE", GUEST_CA_PATH),
+            ("CURL_CA_BUNDLE", GUEST_CA_PATH),
+        ];
+        (egress, env_extra, script)
+    };
+
     let vmspec = VmSpec {
         rootfs: rootfs.to_string_lossy().into_owned(),
         vcpus: 2,
@@ -703,7 +766,7 @@ pub(crate) fn score_in_sandbox(
         }],
         exec: vec!["/bin/sh".into(), "-c".into(), script],
         vsock: None,
-        egress: None,
+        egress,
     };
     let spec_file = tempfile::Builder::new()
         .prefix("pillbox-grade-spec-")
@@ -716,11 +779,15 @@ pub(crate) fn score_in_sandbox(
     let mut child = Command::new(&exe)
         .arg("__krun-vmm")
         .arg(spec_file.path())
-        // No secrets reach the grader — only a minimal guest env for the toolchain.
+        // No secrets reach the grader — only a minimal guest env for the toolchain
+        // (plus CA-bundle pointers when egress is on; all non-secret).
         .env_clear()
         .env("HOME", "/root")
         .env("TERM", "xterm-256color")
         .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .envs(env_extra.iter().copied())
+        // Empty stdin: the VMM child reads swap pairs from stdin when egress is on
+        // — null → EOF → empty swap (the MITM forwards untouched). No creds.
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null()) // VMM diagnostics; the grade's output is the guest console (stdout)

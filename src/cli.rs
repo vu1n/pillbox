@@ -395,9 +395,18 @@ pub(crate) enum SessionAction {
         /// Run the grader inside a one-shot microVM (the runner image's
         /// toolchain) against the workspace, instead of on the host — for real
         /// repos whose tests need the image's deps. Requires the `libkrun`
-        /// feature. The grader-VM is offline (no network) + secret-free.
+        /// feature. The grader-VM is offline (no network) + secret-free by
+        /// default; opt into network with `--grader-egress`.
         #[arg(long = "in-sandbox")]
         in_sandbox: bool,
+        /// Let the `--in-sandbox` grader reach these hosts (repeatable) so a real
+        /// repo's tests can fetch deps — e.g. `--grader-egress pypi.org
+        /// --grader-egress files.pythonhosted.org` (pip) or `registry.npmjs.org`
+        /// (npm). Routed through the same DNS-fence + MITM (empty swap, no creds)
+        /// as a vault run; every other host stays fenced. Trades the offline
+        /// reproducibility guarantee for reachability. Only valid with `--in-sandbox`.
+        #[arg(long = "grader-egress", value_name = "HOST")]
+        grader_egress: Vec<String>,
     },
     /// Tear down every session whose `expires_at` is in the past.
     /// Drives `session rm` for each — sandbox killed, record deleted.

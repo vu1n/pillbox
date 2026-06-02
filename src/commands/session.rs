@@ -110,14 +110,16 @@ fn libkrun_score_in_sandbox(
     resolved: &Pillbox,
     workspace: &std::path::Path,
     cmd: &str,
+    egress_allow: &[String],
 ) -> Result<(i32, String)> {
-    sandbox::libkrun::score_in_sandbox(resolved, workspace, cmd)
+    sandbox::libkrun::score_in_sandbox(resolved, workspace, cmd, egress_allow)
 }
 #[cfg(not(feature = "libkrun"))]
 fn libkrun_score_in_sandbox(
     _resolved: &Pillbox,
     _workspace: &std::path::Path,
     _cmd: &str,
+    _egress_allow: &[String],
 ) -> Result<(i32, String)> {
     Err(PillboxError::usage(
         "session score",
@@ -164,6 +166,7 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> 
             snapshot,
             workspace,
             in_sandbox,
+            grader_egress,
         } => session_score(
             resolved,
             &id,
@@ -171,6 +174,7 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> 
             snapshot.as_deref(),
             workspace.as_deref(),
             in_sandbox,
+            &grader_egress,
         ),
         SessionAction::Prune { dry_run } => session_prune(resolved, dry_run),
         SessionAction::Transcript {
@@ -912,8 +916,19 @@ fn session_score(
     snapshot: Option<&str>,
     workspace: Option<&std::path::Path>,
     in_sandbox: bool,
+    grader_egress: &[String],
 ) -> Result<()> {
     use crate::workspace::{SnapshotHandle, WorkspaceBackend};
+
+    // Egress is a property of the in-sandbox grader-VM's network fence; on the
+    // host grader there's nothing to fence (it already has the host's network).
+    if !grader_egress.is_empty() && !in_sandbox {
+        return Err(PillboxError::usage(
+            "session score",
+            "--grader-egress only applies to --in-sandbox (the host grader uses the host network)",
+        )
+        .into());
+    }
     let session = session::resolve(resolved, id)?;
 
     // Resolve the dir to grade. --workspace wins; else rehydrate a snapshot into
@@ -949,7 +964,7 @@ fn session_score(
     // it reports, never the agent's claim. `--in-sandbox` runs it in a one-shot
     // microVM (the runner toolchain) instead of on the host.
     let (code, feedback) = if in_sandbox {
-        let (c, raw) = libkrun_score_in_sandbox(resolved, &grade_dir, cmd)?;
+        let (c, raw) = libkrun_score_in_sandbox(resolved, &grade_dir, cmd, grader_egress)?;
         (c, score_feedback(raw.as_bytes(), &[]))
     } else {
         let out = std::process::Command::new("sh")

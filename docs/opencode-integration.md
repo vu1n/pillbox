@@ -6,24 +6,34 @@ opencode `serve` is a headless HTTP server with a typed `/event` SSE stream and
 a prompt API — *literally* "an agent-as-a-service you put a frontend on." This
 doc tracks wiring them in. See memory `pillbox-opencode-pi-structured-integration`.
 
-## Status: opencode is wired + live-verified ✅ (commit `1765e6b`)
+## Status: opencode is FIRST-CLASS ✅ — on docker AND libkrun
 
-The full loop runs against local docker with z.ai GLM auth: `pillbox run --agent
-opencode -- "…"` brings up `opencode serve`, creates a session, sends the prompt;
-`pillbox session watch <id>` streamed the GLM reply (`B`/`AN`/`ANA` → `BANANA`)
-plus the `NeedsInput` attention signal; `pillbox session send <id> "…"` drove a
-follow-up turn. `AgentSpec.integration = {Pty, Server}` is the one fork
-(opencode=Server); claude/codex/pi keep the PTY path. Server-mode run launches
-headless (no PTY, no vault — opencode isn't vault-capable), records a session
-with the opencode session id + model, and the user drives via `session send`
-(→ `prompt_async`) / reads via `session watch`/`subscribe` (→ the `/event`
-bridge). `--model PROVIDER/MODEL`, default `zai-coding-plan/glm-4.5-air`.
+opencode is a first-class run target alongside claude/codex on both the docker
+and the (go-forward) **libkrun** backend: `run` (→ a *ready* session) / drive
+(`session send` → `prompt_async`) / read (`session watch`/`subscribe`) /
+teardown, any model provider (the standard egress profile + `--egress-allow`).
+`AgentSpec.integration = {Pty, Server}` is the one fork (opencode=Server);
+claude/codex/pi keep the PTY path. The bridge is backend-agnostic via the
+`SandboxHttp` seam (docker = `docker exec curl`; libkrun = HTTP/1.1 over a vsock
+port-forward). `--model PROVIDER/MODEL`, default `zai-coding-plan/glm-4.5-air`.
+Architecture + the full step-7 history: [libkrun-sandbox.md](./libkrun-sandbox.md)
+(§ step 7); memory `pillbox-opencode-pi-structured-integration`.
 
-**Follow-ups:** the run-time initial prompt streams *before* any `watch`
-connects the bridge, so that first turn isn't captured host-side — drive-then-
-watch or watch-then-send both work; capturing the initial turn wants the bridge
-spawned at run time (or an inline stream-until-idle mode). **pi** (`--mode rpc`)
-is the remaining sibling. `opencode acp` could generalize the adapter.
+**`run` does NOT auto-send** the initial prompt (opencode has a real readiness
+endpoint, so the PTY-era send-on-start workaround is moot — and it was the
+source of the first-turn-not-captured gap): it brings up a ready session; the
+first prompt goes through `session send` like every turn, captured by a
+subscribed watch. A passed prompt pre-fills the send hint.
+
+**§0 capture is complete + gateway-free** on libkrun: the guest appends raw
+`/event` SSE to a persistent file in the shared home; the host drains it
+(replay + follow via `FollowReader`) on watch/subscribe, so a *late* watcher
+still gets the whole history — no daemon. (docker keeps the live `/event` bridge,
+which only captures while watched; it's deprecated-in-direction.)
+
+**Remaining:** **pi** (`--mode rpc`) is the backlogged sibling; opencode OAuth
+port-forward for non-API-key providers; `opencode acp` could generalize the
+adapter.
 
 ## The core (committed earlier)
 

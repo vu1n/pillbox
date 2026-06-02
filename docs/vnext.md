@@ -12,6 +12,13 @@
 >    [libkrun-sandbox.md](./libkrun-sandbox.md) (secure VM boundary, fast, no
 >    daemon, macOS-native). [remotes-redesign.md](./archive/remotes-redesign.md) (the
 >    Docker-context collapse) is **superseded** by it.
+> 3. **Terminology (2026-06-02): "gateway" ≠ "meta-harness".** Two *orthogonal,
+>    optional* layers over the standalone §0 substrate, neither required for the
+>    other: the **gateway** is the multiplayer broker (sequencer + roster +
+>    driver-token + attach fan-out — content-agnostic; serves a bare harness with
+>    zero optimization; see [gateway.md](./gateway.md)); the **meta-harness** is
+>    the optimization layer (DSPy/GEPA/RLM — online grows the vault MITM into a
+>    router/rewriter, offline consumes §0 traces). Don't fold them together.
 >
 > What stands from the body below: the **§0 event spine + gateway** (the
 > keystone), the **drive surface** (`session send/watch/subscribe`), and

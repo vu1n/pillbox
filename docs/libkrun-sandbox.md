@@ -574,9 +574,11 @@ Docker untouched until step 8. Slices (each its own commit, default build green)
     (a real agent runs in the microVM with default-deny egress, owned TLS MITM, and
     its credential never in the guest). Reviewed (thermo-nuclear/simplify/code-review)
     + hardened: `mint_stub` body-leak guard, teardown-on-every-path, connect bound.
-    **Deferred to a future consolidation/L6 pass:** (a) extract `run()` into
-    build-vmspec + supervise; (b) split the L7 TLS pump out of `egress.rs` into a
-    `mitm.rs` (the L3 stack vs L7 MITM seam); (c) threaded/non-blocking upstream
+    **Consolidation pass done:** (a) ✅ `run()` extracted into `prepare_launch`
+    (rootfs…VmSpec) + a ~90-line supervise orchestrator; (b) ✅ the L7 TLS pump
+    split out of `egress.rs` into `mitm.rs` (egress.rs 462 / mitm.rs 229 / vault.rs
+    392). Both behavior-preserving + re-verified live (smoltcp up, cred swaps, §0).
+    **Still deferred to L6:** (c) threaded/non-blocking upstream
     connect (today's blocking `connect_timeout` stalls the poll loop on a hung
     upstream — bounded to 5s); (d) response-side real→stub for mid-run token refresh
     (AnthropicProvider's bidirectional OAuth); (e) the `--with --vault` API-key path

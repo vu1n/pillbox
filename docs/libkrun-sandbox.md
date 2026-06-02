@@ -761,26 +761,43 @@ Docker untouched until step 8. Slices (each its own commit, default build green)
     Owning the egress (smoltcp) is what makes default-deny structural — Docker's
     vault passed unmatched hosts through. Then step 7 (opencode seam) + step 8.
 
-7. **opencode** — repoint the bridge transport to the control channel, and pay
-   down the structural debt a 2026-06-01 review flagged (deferred then because
-   fixing it on the *docker* path = polishing code we're deleting):
-   - Server-mode is currently modeled as a type (`Integration`) but wired as
-     scattered branches (`is_server_agent` / `== Server` in `local_docker::run`,
-     `session_send`, `resolve_streaming_session`) grafted onto the local-docker
-     PTY backend. Make `Integration` the **dispatch axis**: carry it on the
-     `Session` record (typed, like `Backend`), `match` on it exhaustively at
-     selection/drive/read, and lift `run_server` out of `local_docker.rs` (it
-     isn't "local docker") into its own backend.
-   - **Type the bridge on a transport trait, not `DockerEndpoint`.** Today
-     `sandbox/opencode.rs` (`send_prompt`/`wait_ready`/`create_session`/
-     `spawn_event_bridge`) + `opencode_endpoint` are hard-typed on
-     `DockerEndpoint` + `docker exec curl`. Define a small `SandboxExec` seam
-     ("run a command in the sandbox / stream its stdout") that docker implements
-     today and the libkrun vsock transport implements here — then the swap is the
-     1-liner this doc promised, not a cross-file rewrite. The `message.*` mapper +
-     `drain_sse` already survive unchanged.
-   - Fold the opencode-only `Session` fields (`agent_session_id`, `model`) into a
-     typed optional sub-struct so PTY backends stop carrying a `None, None` tail.
+7. **opencode** — bring `Integration::Server` onto the libkrun substrate. This is
+   the strategic move (not just a transport repoint): opencode's `serve` mode is a
+   cleaner substrate than claude/codex — a real prompt API + a structured `/event`
+   stream, no PTY-scrape — which is exactly what the gateway (sequencer/broker) and
+   the optimization loops (ACE/GEPA over the event stream) consume, and where the
+   multiplayer + DSPy/GEPA/RLM layer *above* opencode is the daylight.
+   - ✅ **7a — `Integration` as the typed dispatch axis** (`563a00e`). Replaced the
+     stringly `is_server_agent` scatter with `Session::integration()` (derived from
+     the registry, not stored — no derivable-state dup); exhaustive typed checks at
+     send/subscribe/watch.
+   - ✅ **7b/7c-1 — the transport seam** (`563a00e`/`d4a85da`). Not "run a command"
+     (docker parity is no reason — docker dies at step 8) but **`SandboxHttp`**
+     (`request` + `open_stream`): the use cases want HTTP to the in-guest server
+     (proxy the API, fan `/event` out to remote participants). `sandbox/opencode.rs`
+     speaks HTTP; docker realizes it via `docker exec curl`, libkrun via a real
+     client. The `message.*` mapper + `drain_sse` survive unchanged.
+   - ✅ **7c-2/7c-3 — libkrun over an HTTP-vsock forward** (`121104f`). Guest
+     `pillbox vsock-forward` bridges a vsock port → `127.0.0.1:4096` (exposes ONLY
+     the opencode port, no exec surface; reuses the detach port2-listen mechanism);
+     host `LibkrunHttp` speaks HTTP/1.1 over it (de-chunks the `/event` SSE — curl
+     hid the chunking on docker). `run_server` boots `opencode serve` + the relay
+     (creds CoW-cloned **unstubbed** — opencode is non-vault; the MITM forwards
+     allowlisted hosts with an empty swap), brings it up, records the Session.
+     **Verified live** (`pillbox-runner:l7`): opencode booted in the µVM; the host
+     drove it over the forward (`/doc` 200, `/session`→`ses_`, `/prompt_async` 204,
+     multi-connection vsock); `session list`/`rm` work. **Pending:** the `/event`→
+     `SessionLog`→`watch` render — the raw transport delivers the mapped event
+     types (a probe saw `message.updated`/`message.part.updated`), but the Rust
+     `open_stream`→`drain_sse`→log path logged nothing, confounded by the fenced
+     model (opencode's provider `api.z.ai` + `models.dev` are NXDOMAIN'd → no clean
+     turn). **Next: the egress-allow** (the documented "standard profile" — allow
+     the configured provider host) so a real turn renders, then settle the render.
+   - ☐ **7d** — fold the opencode-only `Session` fields (`agent_session_id`,
+     `model`) into a typed optional sub-struct so PTY backends stop carrying a
+     `None, None` tail. (`run_server` lift out of `local_docker.rs` also still open —
+     the docker bring-up is genuinely docker; the shared post-start handshake could
+     extract once both backends are stable.)
 8. **Deprecate Docker** — remove the docker/remote backends once libkrun is at parity.
 
 ## Dependencies

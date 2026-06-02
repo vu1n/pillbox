@@ -249,6 +249,10 @@ pub(crate) fn drain_sse<R: std::io::Read>(
         }
         let Some(line) = lines.next() else { break };
         let line = line?;
+        // `lines()` strips `\n` but keeps a `\r` — tolerate CRLF SSE so a blank
+        // `\r` line still terminates a frame and a `data:…\r` doesn't carry the
+        // `\r` into the JSON. (opencode emits bare `\n` today; this is a guard.)
+        let line = line.trim_end_matches('\r');
         if let Some(rest) = line.strip_prefix("data:") {
             // SSE allows one optional space after the colon; multiple `data:`
             // lines in a frame join with newlines.
@@ -297,39 +301,68 @@ fn flush_frame(
 /// A [`Read`](std::io::Read) over a growing file that **blocks at EOF** (polling)
 /// instead of ending — so `drain_sse` follows the in-sandbox `/event` capture
 /// file like `tail -F` (replay everything already there, then stream appends).
-/// Returns `Ok(0)` (real EOF → ends the drain) only once `stop` is set, so the
-/// owning [`TailerHandle`](crate::events::transcripts::TailerHandle) shuts it
-/// down within one poll interval. Reading a file being appended is safe: at EOF
-/// the offset holds, and a later read returns bytes written past it. (Consumed
-/// by the libkrun file path; docker §0 still uses the live bridge.)
+/// Reading a file being appended is safe: at EOF the offset holds, and a later
+/// read returns bytes written past it. (Consumed by the libkrun file path;
+/// docker §0 still uses the live bridge.)
+///
+/// Two subtleties the obvious version gets wrong:
+/// - **Opens lazily by path.** The guest creates the file only when opencode
+///   emits its first SSE line, so a `watch` right after `run` can beat it; we
+///   poll for the file to appear rather than giving up (which would silently
+///   capture nothing for the run-then-watch ordering).
+/// - **Reads before checking `stop`.** On stop we do a final read first, so any
+///   frames the guest flushed during the last poll sleep are still drained
+///   (mirrors the file tailer's final-pump); only a genuine EOF *and* `stop`
+///   ends the drain.
 #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) struct FollowReader {
-    file: std::fs::File,
+    path: std::path::PathBuf,
+    file: Option<std::fs::File>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl FollowReader {
     #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) fn new(
-        file: std::fs::File,
+        path: std::path::PathBuf,
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
-        Self { file, stop }
+        Self {
+            path,
+            file: None,
+            stop,
+        }
     }
 }
 
 impl std::io::Read for FollowReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         use std::sync::atomic::Ordering;
+        let nap = std::time::Duration::from_millis(200);
         loop {
-            if self.stop.load(Ordering::Relaxed) {
-                return Ok(0);
+            // Lazy open: wait for the guest to create the file (first SSE line).
+            if self.file.is_none() {
+                if self.stop.load(Ordering::Relaxed) {
+                    return Ok(0);
+                }
+                match std::fs::File::open(&self.path) {
+                    Ok(f) => self.file = Some(f),
+                    Err(_) => {
+                        std::thread::sleep(nap);
+                        continue;
+                    }
+                }
             }
-            let n = self.file.read(buf)?;
+            // Read FIRST, then decide on `stop` — so a final read after stop is
+            // observed still drains frames flushed during the previous nap.
+            let n = self.file.as_mut().expect("opened above").read(buf)?;
             if n > 0 {
                 return Ok(n);
             }
-            std::thread::sleep(std::time::Duration::from_millis(200));
+            if self.stop.load(Ordering::Relaxed) {
+                return Ok(0);
+            }
+            std::thread::sleep(nap);
         }
     }
 }

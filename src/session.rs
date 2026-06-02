@@ -244,6 +244,10 @@ pub(crate) struct Session {
     /// Server-integration (opencode) state — `Some` iff the agent is a `Server`
     /// integration, `None` for PTY agents (claude/codex). Grouped so a PTY record
     /// can't carry a half-populated `(agent_session_id, model)` tail.
+    ///
+    /// MUST stay the LAST field: it serializes to a TOML `[server]` table, and
+    /// any scalar field declared after it would be parsed *into* that table on
+    /// read. New scalar fields go above; new table/struct fields go below.
     #[serde(default)]
     pub(crate) server: Option<ServerSession>,
 }

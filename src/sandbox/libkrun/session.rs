@@ -608,9 +608,13 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
     let session = match built {
         Ok(s) => s,
         Err(e) => {
-            if pid > 0 {
-                unsafe { libc::kill(pid, libc::SIGKILL) };
-            }
+            // Bring-up failed: kill AND reap the VMM child (we still own it — it
+            // hasn't reparented to init yet) before scrubbing the CoW clones, so
+            // we don't leave a zombie and don't race the dying child's virtio-fs
+            // mounts on the clones we're removing. (The success path leaves the
+            // child running, reparented; `kill_session` reaps that one by pid.)
+            let _ = child.kill();
+            let _ = child.wait();
             let _ = std::fs::remove_file(&host_sock);
             let _ = std::fs::remove_file(&spec_path);
             let _ = std::fs::remove_dir_all(&creds_share);

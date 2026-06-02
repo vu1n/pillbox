@@ -79,28 +79,15 @@ fn libkrun_opencode_file_tailer(
     let path = sandbox::libkrun::opencode_events_file(s)
         .map_err(|e| eprintln!("pillbox: note: can't locate the opencode events file ({e})"))
         .ok()?;
-    // The guest creates the file ~at boot; a watch right after run can race it.
-    let mut file = None;
-    for _ in 0..15 {
-        if let Ok(f) = std::fs::File::open(&path) {
-            file = Some(f);
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
-    let file = file.or_else(|| {
-        eprintln!(
-            "pillbox: note: opencode events file not present at {}",
-            path.display()
-        );
-        None
-    })?;
+    // FollowReader opens the path lazily — it waits for the guest to create the
+    // file (first SSE line), so a `watch` right after `run` (before any events)
+    // doesn't miss it. Terminating is the shared `stop` flag's job.
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = Arc::clone(&stop);
     let sid = s.id.clone();
     let join = std::thread::spawn(move || {
         let mut log = log;
-        let reader = crate::events::opencode::FollowReader::new(file, Arc::clone(&stop_thread));
+        let reader = crate::events::opencode::FollowReader::new(path, Arc::clone(&stop_thread));
         if let Err(e) = crate::events::opencode::drain_sse(reader, &sid, &mut log, &stop_thread) {
             eprintln!("pillbox: warning: opencode events drain stopped: {e:#}");
         }

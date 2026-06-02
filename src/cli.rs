@@ -408,6 +408,19 @@ pub(crate) enum SessionAction {
         #[arg(long = "grader-egress", value_name = "HOST")]
         grader_egress: Vec<String>,
     },
+    /// Drain a session's durable raw §0 capture (its persisted `/event` stream)
+    /// into the canonical `log.jsonl`, post-hoc and idempotent. For headless /
+    /// batch runs (the optimization loop) where no live `subscribe`/`watch` ran
+    /// to fill the log: the reparented guest outlives `run`, so a host-side live
+    /// tailer can't persist for it, but the guest's capture file does — so the
+    /// full agent trajectory lands in the §0 log without racing the session.
+    /// libkrun opencode today; docker/PTY sessions drain live via
+    /// `session subscribe`/`watch`. Re-running is a no-op (already ingested).
+    Ingest {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Tear down every session whose `expires_at` is in the past.
     /// Drives `session rm` for each — sandbox killed, record deleted.
     /// Sessions with no `expires_at` (no `--ttl` at spawn) are left

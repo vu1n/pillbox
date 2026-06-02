@@ -65,6 +65,12 @@ for _ in $(seq 1 "$((MAX_WAIT / 2))"); do
   grep -aq 'session.idle' "$events" 2>/dev/null && break
 done
 
+# Drain the agent's full §0 trajectory into the durable log (post-hoc, idempotent)
+# BEFORE scoring, so the failure report reflects on HOW the agent worked — its
+# real tool trajectory — not just the final artifact + verdict. `scored` is
+# appended after, keeping seq order (trajectory → score).
+"$PILLBOX" session ingest "$sid" >/dev/null 2>&1 || true
+
 # Inject the hidden grader into the agent's edited clone, THEN grade — so the
 # verifier ran against the agent's solution + an untampered test it never saw.
 cp -R "$task_dir/grader/." "$clone"/
@@ -83,18 +89,34 @@ if [ "$verdict" = fail ] && [ -n "${FAILDIR:-}" ]; then
     for f in "$task_dir"/workspace/*; do
       b="$(basename "$f")"; echo "--- $b ---"; cat "$clone/$b" 2>/dev/null; echo
     done
-    echo "## GRADER FEEDBACK (why it failed):"
+    # Trajectory (from the ingested §0 log) + grader feedback — both from the
+    # real session log, the GEPA-style textual gradient `propose` reflects on.
     python3 - "$sid" <<'PY'
 import json, os, sys
 log = os.path.expanduser(f"~/.pillbox/global/sessions/{sys.argv[1]}/log.jsonl")
-fb = ""
+order, status, fb = [], {}, ""
 for line in open(log):
     try:
         p = json.loads(line).get("payload", {})
     except Exception:
         continue
-    if p.get("type") == "scored":
+    t = p.get("type")
+    if t == "tool_call":
+        cid = p.get("toolCallId") or p.get("name") or str(len(order))
+        if cid not in status:
+            order.append(cid)
+        status[cid] = (p.get("name", "?"), p.get("status", ""))
+    elif t == "scored":
         fb = p.get("feedback", "")
+print("## AGENT TRAJECTORY (tools, in order):")
+if order:
+    for cid in order:
+        name, st = status[cid]
+        print(f"- {name} [{st}]")
+else:
+    print("(no tool calls captured)")
+print()
+print("## GRADER FEEDBACK (why it failed):")
 print(fb[-2000:])
 PY
   } > "$FAILDIR/$task.md" 2>/dev/null

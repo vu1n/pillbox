@@ -128,6 +128,27 @@ fn libkrun_score_in_sandbox(
     .into())
 }
 
+/// Drain a libkrun opencode session's persisted `/event` capture file into its
+/// durable log (feature-gated). Plain `File` → `drain_sse` reads to EOF (it
+/// final-flushes a trailing partial frame) and returns; the never-set `stop`
+/// flag is only meaningful on the follow path. Returns the §0 event count.
+#[cfg(feature = "libkrun")]
+fn libkrun_ingest_events_file(resolved: &Pillbox, s: &session::Session) -> Result<usize> {
+    use std::sync::atomic::AtomicBool;
+    let path = sandbox::libkrun::opencode_events_file(s)?;
+    let file = std::fs::File::open(&path).map_err(|e| {
+        PillboxError::runtime("session ingest", format!("open events file {}: {e}", path.display()))
+            .with_next("the session may not have produced any §0 events yet")
+    })?;
+    let mut log = crate::events::log::SessionLog::open(resolved, &s.id)?;
+    let stop = AtomicBool::new(false);
+    crate::events::opencode::drain_sse(file, &s.id, &mut log, &stop)
+}
+#[cfg(not(feature = "libkrun"))]
+fn libkrun_ingest_events_file(_resolved: &Pillbox, _s: &session::Session) -> Result<usize> {
+    Err(PillboxError::usage("session ingest", "this libkrun session needs the libkrun feature built").into())
+}
+
 pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> {
     match action {
         SessionAction::List { json } => session_list(resolved, json),
@@ -176,6 +197,7 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> 
             in_sandbox,
             &grader_egress,
         ),
+        SessionAction::Ingest { id, json } => session_ingest(resolved, &id, json),
         SessionAction::Prune { dry_run } => session_prune(resolved, dry_run),
         SessionAction::Transcript {
             file,
@@ -898,6 +920,69 @@ fn session_pull(resolved: &Pillbox, id: &str, to: Option<&std::path::Path>) -> R
         handle.short(),
         target.display()
     );
+    Ok(())
+}
+
+/// Drain a session's durable raw §0 capture into its `log.jsonl`, post-hoc and
+/// idempotent — the "§0 drain" for headless/batch runs (the optimization loop)
+/// where no live `watch`/`subscribe` filled the log. The reparented guest
+/// outlives `run`, so a host-side live tailer can't persist for it; but the
+/// guest's `/event` capture file does, so we read it to EOF after the turn and
+/// the full trajectory lands in the canonical log. Idempotent via a `.ingested`
+/// marker: a second call is a no-op (re-draining would duplicate, since the log
+/// stamps fresh seqs). Run BEFORE `session score` so trajectory events precede
+/// the `scored` event in seq order.
+fn session_ingest(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
+    let session = session::resolve(resolved, id)?;
+    let marker = session::session_dir(resolved, &session.id)?.join(".ingested");
+    if marker.exists() {
+        if json {
+            println!(
+                r#"{{"version":1,"session":"{}","ingested":0,"status":"already-ingested"}}"#,
+                session.id
+            );
+        } else {
+            println!("pillbox: session `{}` already ingested (no-op)", session.id);
+        }
+        return Ok(());
+    }
+
+    // Only the file-capture path is supported: libkrun opencode persists `/event`
+    // to a guest-home file we can read post-hoc. docker server sessions drain
+    // live through the HTTP bridge, and PTY agents through the transcript tailer
+    // — both via `session subscribe`/`watch`, which fill the same log.
+    let is_libkrun = matches!(
+        session::Backend::parse(&session.backend),
+        Some(session::Backend::Libkrun)
+    );
+    if !is_libkrun || session.integration() != Integration::Server {
+        return Err(PillboxError::usage(
+            "session ingest",
+            format!(
+                "ingest currently supports libkrun opencode (server) sessions; \
+                 `{}`/{:?} drains live via `session subscribe`/`watch`",
+                session.backend,
+                session.integration()
+            ),
+        )
+        .into());
+    }
+
+    let n = libkrun_ingest_events_file(resolved, &session)?;
+    std::fs::write(&marker, b"").map_err(|e| {
+        PillboxError::runtime("session ingest", format!("write ingest marker: {e}"))
+    })?;
+    if json {
+        println!(
+            r#"{{"version":1,"session":"{}","ingested":{n},"status":"ok"}}"#,
+            session.id
+        );
+    } else {
+        println!(
+            "pillbox: ✓ drained {n} §0 event(s) into session `{}` log",
+            session.id
+        );
+    }
     Ok(())
 }
 

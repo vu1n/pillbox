@@ -35,7 +35,9 @@ cp "$faildir"/*.md "$ws/failures/" 2>/dev/null || { echo "no failure reports in 
 read -r -d '' TASK <<'EOF' || true
 You are improving the INSTRUCTION PROFILE for a coding agent. The files in
 failures/ are tasks the agent just FAILED — each shows the task, what the agent
-produced, and the grader feedback (why it was rejected). current_profile.md, if
+produced, its TRAJECTORY (the tools it called, in order — how it approached the
+problem), and the grader feedback (why it was rejected). Use the trajectory to
+diagnose the PROCESS failure, not just the wrong output. current_profile.md, if
 present, is the agent's current guidance.
 
 Write an improved instruction profile into PROFILE.md: a short list of GENERAL

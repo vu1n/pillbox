@@ -294,6 +294,46 @@ fn flush_frame(
     Ok(n)
 }
 
+/// A [`Read`](std::io::Read) over a growing file that **blocks at EOF** (polling)
+/// instead of ending — so `drain_sse` follows the in-sandbox `/event` capture
+/// file like `tail -F` (replay everything already there, then stream appends).
+/// Returns `Ok(0)` (real EOF → ends the drain) only once `stop` is set, so the
+/// owning [`TailerHandle`](crate::events::transcripts::TailerHandle) shuts it
+/// down within one poll interval. Reading a file being appended is safe: at EOF
+/// the offset holds, and a later read returns bytes written past it.
+// Used by the libkrun file-based §0 path; docker §0 still uses the live bridge.
+#[allow(dead_code)]
+pub(crate) struct FollowReader {
+    file: std::fs::File,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl FollowReader {
+    #[allow(dead_code)] // libkrun-only consumer (see the struct)
+    pub(crate) fn new(
+        file: std::fs::File,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self { file, stop }
+    }
+}
+
+impl std::io::Read for FollowReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::sync::atomic::Ordering;
+        loop {
+            if self.stop.load(Ordering::Relaxed) {
+                return Ok(0);
+            }
+            let n = self.file.read(buf)?;
+            if n > 0 {
+                return Ok(n);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

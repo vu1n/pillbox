@@ -625,10 +625,23 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
          update-ca-certificates >/dev/null 2>&1 || true",
         b64 = shell_quote(&ca_b64),
     );
+    // §0 producer: a co-located, persistent `/event` capture (raw SSE → a file
+    // in the shared/CoW home, so it persists + is host-readable). The host drains
+    // this file on watch/subscribe (replay + follow) — complete capture, no host
+    // daemon. curl holds one long-lived SSE connection open, so we re-open the
+    // file per line (`printf >> file` opens+writes+closes) to force a virtio-fs
+    // flush to the host backing on every line — otherwise the appends sit in the
+    // guest's page cache (file stays open) and the host sees 0 bytes. The outer
+    // loop reconnects if the stream drops.
+    let events_q = shell_quote(&format!("{GUEST_HOME}/{}", opencode::EVENTS_FILE));
     let script = format!(
         "set -e; {net}; {ca_setup}; mkdir -p {home_q}; mount -t virtiofs creds {home_q}; \
          mkdir -p {gw_q}; mount -t virtiofs workspace {gw_q}; cd {gw_q}; \
-         {serve} & exec pillbox vsock-forward --vsock-port {FORWARD_PORT} --to-port {port}",
+         {serve} & \
+         ( while :; do curl -sN http://127.0.0.1:{port}/event 2>/dev/null \
+             | while IFS= read -r l; do printf '%s\\n' \"$l\" >> {events_q}; done; \
+           sleep 1; done ) & \
+         exec pillbox vsock-forward --vsock-port {FORWARD_PORT} --to-port {port}",
         port = opencode::SERVE_PORT,
     );
 
@@ -780,6 +793,17 @@ pub(crate) fn opencode_http(
     let handle: LibkrunHandle =
         serde_json::from_str(&session.sandbox_id).context("decode libkrun session handle")?;
     Ok(Box::new(http::LibkrunHttp::new(PathBuf::from(handle.sock))))
+}
+
+/// Host-side path of a libkrun server session's `/event` capture file (inside
+/// the CoW creds clone the guest mounts at its home). The §0 read drains this
+/// for `watch`/`subscribe`. See [`crate::sandbox::opencode::EVENTS_FILE`].
+pub(crate) fn opencode_events_file(
+    session: &crate::session::Session,
+) -> Result<PathBuf> {
+    let handle: LibkrunHandle =
+        serde_json::from_str(&session.sandbox_id).context("decode libkrun session handle")?;
+    Ok(PathBuf::from(handle.creds).join(crate::sandbox::opencode::EVENTS_FILE))
 }
 
 /// Reattach to a detached libkrun session: dial the persistent attach socket

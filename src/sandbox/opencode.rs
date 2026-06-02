@@ -38,6 +38,17 @@ pub(crate) const SERVE_PORT: u16 = 4096;
 /// supply one; override with `pillbox run --agent opencode --model …`.
 pub(crate) const DEFAULT_MODEL: &str = "zai-coding-plan/glm-4.5-air";
 
+/// Filename (under the agent home) the in-sandbox `/event` capture is appended
+/// to — opencode's durable, gateway-free §0 transcript. A guest-side `curl -N
+/// /event` loop writes raw SSE here; because it lives in the shared/CoW home it
+/// persists + is host-readable, so the host drains it (replay + follow) on
+/// `watch`/`subscribe` and captures completely even for a late reader — the same
+/// file-transcript shape claude/codex use, no always-on host process. See
+/// [`crate::events::opencode::FollowReader`].
+// Used by the libkrun file-based §0 path; docker §0 still uses the live bridge.
+#[allow(dead_code)]
+pub(crate) const EVENTS_FILE: &str = ".pillbox-opencode-events.sse";
+
 /// The in-sandbox command: a headless opencode server bound to localhost.
 pub(crate) fn serve_args() -> Vec<String> {
     [

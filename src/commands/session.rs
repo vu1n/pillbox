@@ -65,6 +65,62 @@ fn libkrun_opencode_http(
     Err(PillboxError::usage("session", "this libkrun session needs the libkrun feature built").into())
 }
 
+/// §0 read for a libkrun server session: drain its persistent `/event` capture
+/// file (replay everything + follow appends via [`FollowReader`]) into the log.
+/// The gateway-free, complete-capture source — unlike the live bridge, a late
+/// watcher still gets the whole history because the file persisted.
+#[cfg(feature = "libkrun")]
+fn libkrun_opencode_file_tailer(
+    s: &session::Session,
+    log: crate::events::log::SessionLog,
+) -> Option<events::transcripts::TailerHandle> {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    let path = sandbox::libkrun::opencode_events_file(s)
+        .map_err(|e| eprintln!("pillbox: note: can't locate the opencode events file ({e})"))
+        .ok()?;
+    // The guest creates the file ~at boot; a watch right after run can race it.
+    let mut file = None;
+    for _ in 0..15 {
+        if let Ok(f) = std::fs::File::open(&path) {
+            file = Some(f);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let file = file.or_else(|| {
+        eprintln!(
+            "pillbox: note: opencode events file not present at {}",
+            path.display()
+        );
+        None
+    })?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = Arc::clone(&stop);
+    let sid = s.id.clone();
+    let join = std::thread::spawn(move || {
+        let mut log = log;
+        let reader = crate::events::opencode::FollowReader::new(file, Arc::clone(&stop_thread));
+        if let Err(e) = crate::events::opencode::drain_sse(reader, &sid, &mut log, &stop_thread) {
+            eprintln!("pillbox: warning: opencode events drain stopped: {e:#}");
+        }
+    });
+    // The shared `stop` flag terminates the FollowReader (→ drain ends); the
+    // stopper is a no-op (no child/socket to kill).
+    Some(events::transcripts::TailerHandle::from_stopper(
+        stop,
+        Box::new(|| {}),
+        join,
+    ))
+}
+#[cfg(not(feature = "libkrun"))]
+fn libkrun_opencode_file_tailer(
+    _s: &session::Session,
+    _log: crate::events::log::SessionLog,
+) -> Option<events::transcripts::TailerHandle> {
+    None
+}
+
 pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> {
     match action {
         SessionAction::List { json } => session_list(resolved, json),
@@ -616,18 +672,23 @@ fn resolve_streaming_session(
         // Server-integration agents (opencode) have no transcript file — read
         // their HTTP `/event` stream into the log via the bridge instead.
         if s.integration() == Integration::Server {
-            let tailer = match opencode_http(resolved, &s) {
-                Ok(http) => {
-                    let log = crate::events::log::SessionLog::open(resolved, &s.id)?;
-                    sandbox::opencode::spawn_event_bridge(&*http, &s.id, log)
-                }
-                Err(e) => {
-                    eprintln!(
-                        "pillbox: note: can't reach the opencode server ({e}); \
-                         reading the existing log"
-                    );
-                    None
-                }
+            let log = crate::events::log::SessionLog::open(resolved, &s.id)?;
+            // libkrun captures /event to a persistent file in the shared home, so
+            // drain THAT (replay + follow) — complete even for a late watcher, no
+            // host daemon. Other backends (docker, deprecated) read the live
+            // /event bridge, which only captures while watched.
+            let tailer = match session::Backend::parse(&s.backend) {
+                Some(session::Backend::Libkrun) => libkrun_opencode_file_tailer(&s, log),
+                _ => match opencode_http(resolved, &s) {
+                    Ok(http) => sandbox::opencode::spawn_event_bridge(&*http, &s.id, log),
+                    Err(e) => {
+                        eprintln!(
+                            "pillbox: note: can't reach the opencode server ({e}); \
+                             reading the existing log"
+                        );
+                        None
+                    }
+                },
             };
             return Ok((s.id, tailer));
         }

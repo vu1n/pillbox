@@ -370,6 +370,29 @@ pub(crate) enum SessionAction {
         #[arg(long, value_name = "DIR")]
         to: Option<PathBuf>,
     },
+    /// Externally grade a session's result — the **verifiable, non-self-
+    /// reported reward channel** the optimization loops gate on. Runs `--cmd`
+    /// (the verifier) with cwd = the rehydrated result-snapshot (or
+    /// `--workspace`/`--snapshot`), captures its **exit code + output**, and
+    /// appends a `scored` §0 event (exit 0 → passed/score 1.0, else 0.0; output
+    /// → feedback). Distinct from `session done --status`, which is the agent's
+    /// self-report (Goodhart-banned as a reward). The grader runs on the host.
+    Score {
+        id: String,
+        /// Verifier command, run via `sh -c` with cwd = the graded workspace.
+        /// Its exit status is the verifiable pass/fail; its output is the
+        /// feedback gradient (e.g. `pytest -q`, `cargo test`, a scoring script).
+        #[arg(long, value_name = "CMD")]
+        cmd: String,
+        /// Grade this snapshot (rehydrated) instead of the session's
+        /// `result_snapshot`.
+        #[arg(long, value_name = "HANDLE")]
+        snapshot: Option<String>,
+        /// Grade this directory directly (skip snapshot rehydration) — for a
+        /// session whose result is already on disk.
+        #[arg(long, value_name = "DIR")]
+        workspace: Option<PathBuf>,
+    },
     /// Tear down every session whose `expires_at` is in the past.
     /// Drives `session rm` for each — sandbox killed, record deleted.
     /// Sessions with no `expires_at` (no `--ttl` at spawn) are left

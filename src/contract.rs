@@ -138,6 +138,8 @@ pub(crate) enum Payload {
     // workspace
     Checkpoint(Checkpoint),
     ResultReady(ResultReady),
+    // reward (external, verifiable grade — see `Scored`)
+    Scored(Scored),
     // exec channel
     ExecStarted(ExecStarted),
     ExecOutput(ExecOutput),
@@ -334,6 +336,27 @@ pub(crate) struct Checkpoint {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ResultReady {
     pub(crate) snapshot_handle: String,
+}
+
+/// An **external, verifiable** grade of a session's result — produced by running
+/// a grader against the result-snapshot (`pillbox session score --cmd …`), NOT
+/// self-reported by the agent. (`RunFinished` / `session done --status` is
+/// self-stamped → Goodhart-banned as a reward.) This is the substrate primitive
+/// the optimization loops gate on: GEPA needs a coarse verifiable score, and the
+/// `feedback` carries the textual gradient (test output, stderr, diff) that does
+/// the actual optimizing — not just the scalar.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Scored {
+    /// What produced the grade — the verifier command line (or a grader id).
+    pub(crate) grader: String,
+    /// Verifiable pass/fail = the grader's exit status (0 → `true`).
+    pub(crate) passed: bool,
+    /// Normalized score in `[0,1]`. v0: `passed` → 1.0, else 0.0 (a richer
+    /// grader-emitted score is a post-v0 upgrade).
+    pub(crate) score: f64,
+    /// The grader's captured output (the gradient, not just the scalar).
+    pub(crate) feedback: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -544,6 +567,26 @@ mod tests {
         assert!(s.contains(r#""type":"exec_output""#), "{s}");
         assert!(s.contains(r#""stream":"stdout""#), "{s}");
         assert!(s.contains(r#""execId":"ex-1""#), "{s}");
+        assert_eq!(reparse(&ev), ev);
+    }
+
+    #[test]
+    fn scored_serializes_as_the_reward_contract() {
+        let ev = Event::session(
+            "s",
+            Payload::Scored(Scored {
+                grader: "pytest -q".into(),
+                passed: false,
+                score: 0.0,
+                feedback: "1 failed, 3 passed".into(),
+            }),
+        );
+        let s = serde_json::to_string(&ev).unwrap();
+        assert!(s.contains(r#""type":"scored""#), "{s}");
+        assert!(s.contains(r#""grader":"pytest -q""#), "{s}");
+        assert!(s.contains(r#""passed":false"#), "{s}");
+        assert!(s.contains(r#""score":0.0"#), "{s}");
+        assert!(s.contains(r#""feedback":"1 failed, 3 passed""#), "{s}");
         assert_eq!(reparse(&ev), ev);
     }
 

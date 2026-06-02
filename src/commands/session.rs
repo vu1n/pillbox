@@ -136,6 +136,18 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> 
             result_snapshot,
         ),
         SessionAction::Pull { id, to } => session_pull(resolved, &id, to.as_deref()),
+        SessionAction::Score {
+            id,
+            cmd,
+            snapshot,
+            workspace,
+        } => session_score(
+            resolved,
+            &id,
+            &cmd,
+            snapshot.as_deref(),
+            workspace.as_deref(),
+        ),
         SessionAction::Prune { dry_run } => session_prune(resolved, dry_run),
         SessionAction::Transcript {
             file,
@@ -861,6 +873,110 @@ fn session_pull(resolved: &Pillbox, id: &str, to: Option<&std::path::Path>) -> R
     Ok(())
 }
 
+/// Externally grade a session's result and record it as a verifiable `scored`
+/// §0 event — the reward channel the optimization loops gate on. Runs `cmd`
+/// (via `sh -c`) with cwd = the graded workspace: `workspace` if given, else a
+/// rehydrated snapshot (`snapshot`, or the session's `result_snapshot`). The
+/// grader's **exit status** is the verifiable pass/fail (NOT the agent's
+/// `session done` self-report); its combined output is the feedback gradient.
+/// The grader runs on the HOST — it's the invoker's own `--cmd`, like a Makefile
+/// target; a sandboxed grader is a future upgrade.
+fn session_score(
+    resolved: &Pillbox,
+    id: &str,
+    cmd: &str,
+    snapshot: Option<&str>,
+    workspace: Option<&std::path::Path>,
+) -> Result<()> {
+    use crate::workspace::{SnapshotHandle, WorkspaceBackend};
+    let session = session::resolve(resolved, id)?;
+
+    // Resolve the dir to grade. --workspace wins; else rehydrate a snapshot into
+    // a tempdir that must outlive the grader, so keep it bound until fn end.
+    let mut _grade_tmp: Option<tempfile::TempDir> = None;
+    let grade_dir: std::path::PathBuf = if let Some(ws) = workspace {
+        ws.to_path_buf()
+    } else {
+        let handle_str = snapshot
+            .map(str::to_string)
+            .or_else(|| session.result_snapshot.clone())
+            .ok_or_else(|| {
+                PillboxError::usage(
+                    "session score",
+                    format!("session `{}` has no result_snapshot to grade", session.id),
+                )
+                .with_next(format!(
+                    "pillbox session score {} --cmd \"…\" --workspace DIR",
+                    session.id
+                ))
+            })?;
+        let tmp = tempfile::tempdir()
+            .map_err(|e| PillboxError::runtime("session score", format!("temp dir: {e}")))?;
+        resolved
+            .workspace()?
+            .pull(tmp.path(), Some(&SnapshotHandle::new(handle_str)))?;
+        let p = tmp.path().to_path_buf();
+        _grade_tmp = Some(tmp);
+        p
+    };
+
+    // The grader's exit status IS the verifiable grade — we run it + record what
+    // it reports, never the agent's claim.
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(&grade_dir)
+        .output()
+        .map_err(|e| PillboxError::runtime("session score", format!("run grader `{cmd}`: {e}")))?;
+    let passed = out.status.success();
+    let score = if passed { 1.0 } else { 0.0 };
+    let feedback = score_feedback(&out.stdout, &out.stderr);
+
+    // Record on the durable §0 log — the source of truth the meta-harness reads.
+    let mut log = crate::events::log::SessionLog::open(resolved, &session.id)?;
+    log.append(&[crate::contract::Event::session(
+        &session.id,
+        crate::contract::Payload::Scored(crate::contract::Scored {
+            grader: cmd.to_string(),
+            passed,
+            score,
+            feedback,
+        }),
+    )])?;
+
+    let mark = if passed { "✓" } else { "✗" };
+    println!(
+        "pillbox: {mark} session `{}` scored {score:.2} ({})",
+        session.id,
+        if passed { "passed" } else { "failed" }
+    );
+    println!("  grader: {cmd}");
+    Ok(())
+}
+
+/// Combine a grader's stdout+stderr into the `feedback` gradient, capped (keeping
+/// the TAIL — pytest/cargo-test put the failure summary last) so one grade can't
+/// bloat a §0 log line.
+fn score_feedback(stdout: &[u8], stderr: &[u8]) -> String {
+    const CAP: usize = 32 * 1024;
+    let mut s = String::from_utf8_lossy(stdout).into_owned();
+    let err = String::from_utf8_lossy(stderr);
+    if !err.trim().is_empty() {
+        if !s.is_empty() {
+            s.push('\n');
+        }
+        s.push_str(&err);
+    }
+    if s.len() > CAP {
+        let mut cut = s.len() - CAP;
+        while !s.is_char_boundary(cut) {
+            cut += 1;
+        }
+        s = format!("…[truncated {cut} leading bytes]\n{}", &s[cut..]);
+    }
+    s
+}
+
 fn session_prune(resolved: &Pillbox, dry_run: bool) -> Result<()> {
     // Single-pass classification: `Session::expiry_status` parses
     // `expires_at` once and returns a typed enum. We collect the
@@ -1044,6 +1160,23 @@ mod tests {
     fn validate_session_id_accepts_minted_form() {
         // `Session::new_id` produces 12 hex chars.
         validate_session_id("abcdef012345").unwrap();
+    }
+
+    #[test]
+    fn score_feedback_combines_streams() {
+        let f = score_feedback(b"out", b"err");
+        assert_eq!(f, "out\nerr");
+        assert_eq!(score_feedback(b"only-out", b""), "only-out");
+        assert_eq!(score_feedback(b"", b"only-err"), "only-err");
+    }
+
+    #[test]
+    fn score_feedback_keeps_the_tail_when_capped() {
+        let big = "x".repeat(40 * 1024) + "TAIL-VERDICT";
+        let f = score_feedback(big.as_bytes(), b"");
+        assert!(f.starts_with("…[truncated"), "{}", &f[..40]);
+        assert!(f.ends_with("TAIL-VERDICT"), "tail kept");
+        assert!(f.len() < 34 * 1024, "capped near 32K, got {}", f.len());
     }
 
     #[test]

@@ -48,29 +48,48 @@ use crate::events::log::SessionLog;
 /// drop there rather than at end of scope).
 pub(crate) struct TailerHandle {
     stop: Arc<AtomicBool>,
-    /// The streaming variant (docker:// read path) tails a `docker exec …
-    /// tail -F` whose stdout the thread blocks reading; a stop flag alone can't
-    /// unblock that read, so the child is killed to EOF the pipe. `None` for the
-    /// file-based local tailer, which self-stops via its poll timeout.
-    child: Option<std::process::Child>,
+    /// The streaming variants tail a transport whose stdout the thread blocks
+    /// reading (docker `exec … tail -F`, opencode `exec curl -N /event`, a
+    /// libkrun vsock exec); a stop flag alone can't unblock that read, so this
+    /// closure tears the transport down (kill the exec / close the socket) to
+    /// EOF the read. `None` for the file-based local tailer, which self-stops
+    /// via its poll timeout.
+    stopper: Option<Box<dyn FnOnce() + Send>>,
     join: Option<JoinHandle<()>>,
 }
 
 impl TailerHandle {
-    /// Wrap a tailer thread spawned elsewhere (the docker:// read path, which
-    /// tails the container's transcript over the endpoint into
-    /// [`Tailer::follow_reader`]) so it shares this handle's stop-and-join
-    /// lifecycle. `stop` is the flag the thread observes between reads; `child`
-    /// is the `docker exec` whose stdout the thread reads — killed on stop to
-    /// unblock a read parked waiting for more transcript bytes.
+    /// Wrap a tailer thread that reads a `docker exec` child's stdout (the
+    /// docker:// transcript read path) so it shares this handle's
+    /// stop-and-join lifecycle — the child is killed on stop to unblock a
+    /// parked read. Thin wrapper over [`from_stopper`](Self::from_stopper).
     pub(crate) fn from_stream(
         stop: Arc<AtomicBool>,
         child: std::process::Child,
         join: JoinHandle<()>,
     ) -> Self {
+        Self::from_stopper(
+            stop,
+            Box::new(move || {
+                let mut child = child;
+                let _ = child.kill();
+                let _ = child.wait();
+            }),
+            join,
+        )
+    }
+
+    /// Wrap a tailer thread spawned elsewhere, given an explicit `stopper` that
+    /// tears down whatever transport the thread is reading (a killed exec, a
+    /// closed vsock). `stop` is the flag the thread observes between reads.
+    pub(crate) fn from_stopper(
+        stop: Arc<AtomicBool>,
+        stopper: Box<dyn FnOnce() + Send>,
+        join: JoinHandle<()>,
+    ) -> Self {
         Self {
             stop,
-            child: Some(child),
+            stopper: Some(stopper),
             join: Some(join),
         }
     }
@@ -79,16 +98,15 @@ impl TailerHandle {
         // Drop does the work; this just names the intent + forces it here.
     }
 
-    /// Flip the stop flag, kill the streaming child (if any) so a parked pipe
-    /// read returns EOF, and join the tailer thread. Idempotent via
+    /// Flip the stop flag, tear down the streaming transport (if any) so a
+    /// parked read returns EOF, and join the tailer thread. Idempotent via
     /// `take()`, so a later `Drop` after `shutdown` is a no-op. The file-based
     /// tailer observes `stop` within one poll interval, does a final drain, and
     /// exits; a tailer still in discovery returns immediately.
     fn stop_and_join(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Some(stopper) = self.stopper.take() {
+            stopper();
         }
         if let Some(join) = self.join.take() {
             let _ = join.join();
@@ -194,7 +212,7 @@ fn spawn_tailer(
 
     TailerHandle {
         stop,
-        child: None,
+        stopper: None,
         join: Some(join),
     }
 }

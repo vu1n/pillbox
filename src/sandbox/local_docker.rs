@@ -410,7 +410,7 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
     args.extend(super::opencode::serve_args());
 
     let container = docker::run_detached(&args)?;
-    let endpoint = DockerEndpoint::local();
+    let exec = super::exec::DockerExec::new(DockerEndpoint::local(), container.clone());
     let model = opts
         .model
         .clone()
@@ -420,8 +420,8 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
     // Everything after launch can fail; reap the container if it does so a
     // failed bring-up doesn't leak a server.
     let built = (|| -> Result<Session> {
-        super::opencode::wait_ready(&endpoint, &container)?;
-        let ocid = super::opencode::create_session(&endpoint, &container)?;
+        super::opencode::wait_ready(&exec)?;
+        let ocid = super::opencode::create_session(&exec)?;
         let session = Session {
             id: Session::new_id(),
             label: opts.label.clone(),
@@ -449,7 +449,7 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
             Some(&session),
         );
         if !prompt.is_empty() {
-            super::opencode::send_prompt(&endpoint, &container, &ocid, &prompt, &model)?;
+            super::opencode::send_prompt(&exec, &ocid, &prompt, &model)?;
         }
         Ok(session)
     })();

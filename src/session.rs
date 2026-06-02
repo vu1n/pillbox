@@ -599,6 +599,19 @@ impl Session {
             Ok(_) => ExpiryStatus::Active,
         }
     }
+
+    /// How pillbox drives/reads this session's agent — the dispatch axis for
+    /// `send`/`subscribe`/`watch`. Derived from the agent registry (not a
+    /// stored field: the integration is a property of the agent id, so storing
+    /// it would duplicate derivable state and risk drift). An unknown agent id
+    /// (registry change after the record was written) falls back to `Pty`, the
+    /// conservative default — server-mode dispatch then fails loud at the
+    /// transport rather than mis-driving a PTY as an HTTP server.
+    pub(crate) fn integration(&self) -> crate::agents::Integration {
+        crate::agents::lookup("session", &self.agent_id)
+            .map(|spec| spec.integration)
+            .unwrap_or(crate::agents::Integration::Pty)
+    }
 }
 
 /// RFC3339 timestamp for the `started_at` field. Pulled into a function

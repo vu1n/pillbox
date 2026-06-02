@@ -15,14 +15,6 @@ use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
 use crate::{events, remote, sandbox, session};
 
-/// Is this agent a `Server`-integration agent (opencode) — driven/read over its
-/// HTTP API rather than a PTY? Defaults to `false` for an unknown agent id.
-fn is_server_agent(agent_id: &str) -> bool {
-    crate::agents::lookup("session", agent_id)
-        .map(|spec| spec.integration == Integration::Server)
-        .unwrap_or(false)
-}
-
 /// The docker endpoint hosting a server-mode session's container — local for a
 /// `Docker` session, the re-resolved remote for a `RemoteDocker` one.
 fn opencode_endpoint(resolved: &Pillbox, s: &session::Session) -> Result<DockerEndpoint> {
@@ -521,8 +513,9 @@ fn session_send(resolved: &Pillbox, id: &str, text: &str) -> Result<()> {
     let s = session::resolve(resolved, id)?;
     // Server-integration agents (opencode) are driven over their HTTP prompt
     // API, not a pty-relay: `session send` = a structured prompt, not keystrokes.
-    if is_server_agent(&s.agent_id) {
+    if s.integration() == Integration::Server {
         let endpoint = opencode_endpoint(resolved, &s)?;
+        let exec = sandbox::exec::DockerExec::new(endpoint, s.sandbox_id.clone());
         let ocid = s.agent_session_id.as_deref().ok_or_else(|| {
             PillboxError::config(
                 "session send",
@@ -533,7 +526,7 @@ fn session_send(resolved: &Pillbox, id: &str, text: &str) -> Result<()> {
             .model
             .as_deref()
             .unwrap_or(sandbox::opencode::DEFAULT_MODEL);
-        sandbox::opencode::send_prompt(&endpoint, &s.sandbox_id, ocid, text, model)?;
+        sandbox::opencode::send_prompt(&exec, ocid, text, model)?;
         eprintln!("pillbox: sent prompt to opencode session `{}`", s.id);
         return Ok(());
     }
@@ -584,11 +577,12 @@ fn resolve_streaming_session(
     if let Ok(s) = session::resolve(resolved, id) {
         // Server-integration agents (opencode) have no transcript file — read
         // their HTTP `/event` stream into the log via the bridge instead.
-        if is_server_agent(&s.agent_id) {
+        if s.integration() == Integration::Server {
             let tailer = match opencode_endpoint(resolved, &s) {
                 Ok(endpoint) => {
+                    let exec = sandbox::exec::DockerExec::new(endpoint, s.sandbox_id.clone());
                     let log = crate::events::log::SessionLog::open(resolved, &s.id)?;
-                    sandbox::opencode::spawn_event_bridge(&endpoint, &s.sandbox_id, &s.id, log)
+                    sandbox::opencode::spawn_event_bridge(&exec, &s.id, log)
                 }
                 Err(e) => {
                     eprintln!(

@@ -12,22 +12,10 @@ use anyhow::{Context, Result};
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
 
-/// Built-in default runner image tag. Override at three levels (highest
-/// precedence first):
-///   1. `PILLBOX_RUNNER_IMAGE` env var
-///   2. `[runner] image = "…"` in pillbox.toml
-///   3. this default
-///
-/// Points at `:rolling`, not `:latest`: CI moves `:latest` only on a STABLE
-/// semver release, so pre-1.0 it stays frozen (the bug that shipped installs
-/// without iproute2/pip — egress broken). `:rolling` is the deliberate dev
-/// build — `runner-image.yml` builds only on `v*` tags + a manual
-/// `workflow_dispatch` (deliberately NOT on every push, to avoid churning a
-/// ~2GB rebuild), and a dispatch run publishes `:rolling`. So a fresh install
-/// tracks the last intentionally-published runner. Repin to `:latest` at the
-/// first stable release. NOTE: publishing is deliberate — run that workflow
-/// (`workflow_dispatch`) or build+push from a dev box; it never happens on push.
-pub const DEFAULT_RUNNER_IMAGE: &str = "ghcr.io/vu1n/pillbox-runner:rolling";
+/// Default runner image (stable tag). Override with `PILLBOX_RUNNER_IMAGE` or
+/// `[runner] image` in pillbox.toml — e.g. `:rolling` for the latest dev build,
+/// or a pinned `:vX.Y.Z`. Tag scheme + publishing: docs/runner-image.md.
+pub const DEFAULT_RUNNER_IMAGE: &str = "ghcr.io/vu1n/pillbox-runner:latest";
 
 /// Env-var override key. Documented so `pillbox doctor` can name it
 /// in its "source" attribution.

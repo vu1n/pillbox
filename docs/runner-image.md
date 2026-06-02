@@ -49,14 +49,9 @@ Resolution order (highest precedence first):
    invocation, scriptable from CI.
 2. **`[runner] image = "…"` in `pillbox.toml`** — per-pillbox
    pin, checked into the repo.
-3. **Built-in default** — `ghcr.io/vu1n/pillbox-runner:rolling`
-   during prerelease. CI only moves `:latest` on a *stable* semver
-   release, so pre-1.0 `:latest` stays frozen at an old build (the bug
-   that shipped installs without iproute2/pip — egress broken).
-   `:rolling` is the deliberate dev build, published by a manual
-   `workflow_dispatch` (see below), so a fresh install tracks the last
-   intentionally-published runner. Repin to `:latest` at the first
-   stable release.
+3. **Built-in default** — `ghcr.io/vu1n/pillbox-runner:latest`
+   today. Bumps per pillbox-CLI release so a fresh install picks
+   up a matching pre-published image.
 
 `pillbox doctor` shows the resolved image + the source.
 
@@ -65,8 +60,8 @@ Resolution order (highest precedence first):
 | Tag | Cadence | Notes |
 |---|---|---|
 | `vX.Y.Z` | per CLI release | matches `CARGO_PKG_VERSION`. Most stable. |
-| `latest` | stable semver release only | alias for the most recent *stable* `vX.Y.Z`. Frozen during prerelease — not the default until 1.0. |
-| `rolling` | per manual `workflow_dispatch` | the deliberate dev build (a dispatch runs from `main` → publishes `:rolling`). **The prerelease default.** Not auto-rebuilt — run the workflow when you want a fresh image. |
+| `latest` | per CLI release | alias for the most recent `vX.Y.Z`. The default. |
+| `rolling` | per Dockerfile merge to main | rebuilt anytime Renovate bumps a harness version. Bleeding edge — opt in via override. |
 
 ## Build it yourself
 
@@ -133,13 +128,10 @@ image, pillbox CLI assumes:
 
 Renovate watches the npm packages pinned in `runner/Dockerfile`
 (via `# renovate:` hint comments) and opens PRs on upstream
-bumps. The image is NOT auto-rebuilt on those PRs (or on merge to
-main) — `runner-image.yml` triggers only on `v*` tags + a manual
-`workflow_dispatch`, deliberately, since per-push rebuilds of the
-~2GB image were churning for no consumer.
+bumps. CI rebuilds the image on the PR for verification. Patch
++ minor bumps auto-merge on green; major bumps hold for human
+review.
 
-To publish a fresh image: run the `runner-image` workflow manually
-(`workflow_dispatch` → `:rolling`) or push a `v*` tag (→ `:vX.Y.Z`,
-plus `:latest` on a stable release). Or build + push from a dev box
-(`DOCKER_HOST=ssh://… docker buildx build -f runner/Dockerfile
---push -t ghcr.io/vu1n/pillbox-runner:rolling .`).
+After merge to `main`, the `:rolling` tag is republished. The
+next CLI release picks up whatever's on `:rolling` and stamps
+it as `:vX.Y.Z` + `:latest`.

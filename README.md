@@ -315,8 +315,7 @@ remote backends + sessions). Roadmap:
 
 ```sh
 # Pull the canonical runner image (or build your own — see docs/runner-image.md)
-# `:rolling` is the prerelease default (`:latest` only moves on a stable release)
-docker pull ghcr.io/vu1n/pillbox-runner:rolling
+docker pull ghcr.io/vu1n/pillbox-runner:latest
 
 # Build + install the CLI
 cd ~/code/pillbox && cargo install --path .

@@ -168,6 +168,8 @@ impl SandboxBackend for LibkrunBackend {
             return Err(unsupported(spec, "--detach (session lifecycle is a later slice)"));
         }
 
+        let run_started = std::time::SystemTime::now();
+        let session_id = crate::session::Session::new_id();
         let rootfs = materialize_rootfs(resolved)?;
 
         // ── creds: the agent's auth home, shared live at GUEST_HOME ──
@@ -226,6 +228,28 @@ impl SandboxBackend for LibkrunBackend {
         // tokens never enter the VM; the MITM swaps stub→real on the wire. The
         // reals reach the child out-of-band on stdin (not env/argv/VmSpec).
         let (creds_share, swap_pairs) = stub_oauth_creds(&home, spec.cred_sentinel)?;
+
+        // §0: the agent writes its transcript into the RW-mounted home, so it lands
+        // in the host-side creds clone — tail it into the durable SessionLog with
+        // the same producer the docker/ssh backends use (no guest emitter, no 2nd
+        // vsock port). proxy_active=false: our MITM doesn't tap gen_ai usage, so the
+        // transcript is the usage source and must not be suppressed.
+        let log = match crate::events::log::SessionLog::open(resolved, &session_id) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                eprintln!("pillbox: warning: couldn't open session log: {e:#}");
+                None
+            }
+        };
+        let tailer = crate::events::transcripts::spawn_session_observability(
+            log,
+            &session_id,
+            spec.id,
+            &creds_share,
+            &guest_workspace,
+            false,
+            run_started,
+        );
 
         // The guest entrypoint: mount the shares, cd into the workspace, exec the
         // agent (run_argv + sandbox defaults + user `-- args`).
@@ -342,7 +366,15 @@ impl SandboxBackend for LibkrunBackend {
         let write_half = stream.try_clone().context("clone attach stream")?;
         let outcome = pump::attach_terminal(stream, write_half, false)?;
         let _ = child.wait();
-        let _ = std::fs::remove_file(&attach_sock); // don't litter ~/.pillbox/krun
+        // Final drain of the agent's last transcript lines into the SessionLog.
+        if let Some(tailer) = tailer {
+            tailer.shutdown();
+        }
+        // Cleanup (before any exit-code propagation below). The §0 events are
+        // persisted in the SessionLog, so the CoW clones can go.
+        let _ = std::fs::remove_file(&attach_sock);
+        let _ = std::fs::remove_dir_all(&creds_share);
+        let _ = std::fs::remove_dir_all(&clone);
         match outcome {
             pump::Outcome::Exited(code) if code != 0 => std::process::exit(code),
             _ => Ok(()),

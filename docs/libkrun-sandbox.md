@@ -670,15 +670,26 @@ Docker untouched until step 8. Slices (each its own commit, default build green)
             **Caught in verification:** the first `mint_stub` used `rsplit_once('-')`
             and leaked most of the real token into the stub (OAuth bodies contain
             hyphens) — fixed to keep only the fixed type prefix + a unit test.
-          - **L5b-3 remaining** — **response-side real→stub** (a token *refresh*
+          - **L5b-3 hardening** — ✅ **clone cleanup**: `run()` removes the CoW
+            `creds/`+`ws/` clones on exit (verified: 0 left after a clean
+            `--version` run; only SIGKILL'd test runs skip it). ✅ **IP-level pin
+            is inherent** to the MITM-forward model — `connect_upstream` resolves
+            the *pinned SNI host* itself and forwards to that real IP; there's no
+            arbitrary-dst NAT to pin (the netspike IP-pin was for a NAT model).
+            *Still deferred:* **response-side real→stub** (a token *refresh*
             mid-run returns real tokens the guest then stores — re-leaks until the
-            response is stubbed too; fresh-creds short runs don't trigger it); the
+            response is stubbed too; fresh-creds short runs don't trigger it; this
+            is the AnthropicProvider's bidirectional OAuth logic) and the
             **`--with --vault` API-key path** (reuse the same `StubSwap`; needs the
-            secret-resolution-with-`VaultMeta` integration + unblock `--vault`);
-            the **IP-level pin** (dest = the name's resolved IP) on top of L5a's
-            name-level pin; clone cleanup (the CoW `creds/`+`ws/` dirs accumulate).
-      - **L5c §0 producer** — guest emits `Event` NDJSON over a 2nd vsock port →
-        parent drains to `SessionLog`.
+            secret-resolution-with-`VaultMeta` integration + unblock `--vault`).
+      - **L5c §0 producer ✅** — no 2nd vsock port needed: the agent writes its
+        transcript into the RW-mounted home, so it lands in the **host-side CoW
+        creds clone**, and `run()` tails it into the durable `SessionLog` via the
+        reused `spawn_session_observability` (the same producer docker/ssh use).
+        **Live-verified:** the log filled with the conversation (`message_start`/
+        `delta`/`end`, user + assistant) — what `session watch`/`subscribe`
+        consume. `proxy_active=false` (our MITM doesn't tap gen_ai usage, so the
+        transcript stays the usage source).
     **Env fork — secrets go to the vault, not the VM env** (lands with L5b; this is
     the whole point of vault-v2; a secret in the VM's env is readable by the
     agent via `/proc/self/environ` and exfiltrable by a prompt injection). L3

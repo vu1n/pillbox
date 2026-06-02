@@ -121,7 +121,16 @@ pub(crate) fn send_prompt(
 /// capture the id) or the human banner with the watch/send next-steps. Shared by
 /// every backend's `run_server` (the bring-up is identical; only the sandbox
 /// lifecycle around it differs). Reads the model from the record's server state.
-pub(crate) fn print_started(session: &crate::session::Session, json: bool, prompt_sent: bool) {
+///
+/// `run` does **not** auto-send an initial prompt for server agents — the server
+/// comes up ready and prompts are driven through `session send` (so the turn is
+/// captured by a subscribed `watch`/`subscribe`, not streamed to no one at
+/// start). If the user passed a prompt, the send hint pre-fills it.
+pub(crate) fn print_started(
+    session: &crate::session::Session,
+    json: bool,
+    pending_prompt: Option<&str>,
+) {
     if json {
         println!(
             "{}",
@@ -135,14 +144,17 @@ pub(crate) fn print_started(session: &crate::session::Session, json: bool, promp
         .map(|s| s.model.as_str())
         .unwrap_or("?");
     println!(
-        "pillbox: ✓ opencode session `{}` started ({model}).",
+        "pillbox: ✓ opencode session `{}` ready ({model}).",
         session.id
     );
-    if prompt_sent {
-        println!("         (sent your prompt; watch for the reply)");
-    }
     println!("         pillbox session watch {}    # read the stream", session.id);
-    println!("         pillbox session send {} \"…\"  # drive it", session.id);
+    match pending_prompt {
+        Some(p) => println!(
+            "         pillbox session send {} {p:?}  # send your prompt",
+            session.id
+        ),
+        None => println!("         pillbox session send {} \"…\"  # drive it", session.id),
+    }
 }
 
 /// Stream the server's `/event` SSE into the durable [`SessionLog`] — the

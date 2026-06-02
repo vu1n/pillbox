@@ -749,9 +749,6 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
             &session.id,
             Some(&session),
         );
-        if !prompt.is_empty() {
-            opencode::send_prompt(&http, &ocid, &prompt, &model)?;
-        }
         Ok(session)
     })();
     let session = match built {
@@ -768,7 +765,10 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
         }
     };
 
-    opencode::print_started(&session, opts.json, !prompt.is_empty());
+    // No auto-send: opencode comes up ready (wait_ready), so the first prompt
+    // goes through `session send` — captured by a subscribed watch, not streamed
+    // to no one at start.
+    opencode::print_started(&session, opts.json, (!prompt.is_empty()).then_some(prompt.as_str()));
     Ok(())
 }
 

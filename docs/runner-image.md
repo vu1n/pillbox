@@ -49,9 +49,13 @@ Resolution order (highest precedence first):
    invocation, scriptable from CI.
 2. **`[runner] image = "…"` in `pillbox.toml`** — per-pillbox
    pin, checked into the repo.
-3. **Built-in default** — `ghcr.io/vu1n/pillbox-runner:latest`
-   today. Bumps per pillbox-CLI release so a fresh install picks
-   up a matching pre-published image.
+3. **Built-in default** — `ghcr.io/vu1n/pillbox-runner:rolling`
+   during prerelease. CI only moves `:latest` on a *stable* semver
+   release, so while we're pre-1.0 `:latest` would stay frozen at an
+   old build (which left fresh installs without iproute2/pip — egress
+   broken). `:rolling` moves on every merge to main, so a fresh
+   install tracks the current runner. Repin to `:latest` at the first
+   stable release.
 
 `pillbox doctor` shows the resolved image + the source.
 
@@ -60,8 +64,8 @@ Resolution order (highest precedence first):
 | Tag | Cadence | Notes |
 |---|---|---|
 | `vX.Y.Z` | per CLI release | matches `CARGO_PKG_VERSION`. Most stable. |
-| `latest` | per CLI release | alias for the most recent `vX.Y.Z`. The default. |
-| `rolling` | per Dockerfile merge to main | rebuilt anytime Renovate bumps a harness version. Bleeding edge — opt in via override. |
+| `latest` | stable semver release only | alias for the most recent *stable* `vX.Y.Z`. Frozen during prerelease — not the default until 1.0. |
+| `rolling` | per merge to main | rebuilt on every main push (incl. Renovate harness bumps). **The prerelease default** — tracks current. |
 
 ## Build it yourself
 

@@ -12,13 +12,21 @@ use anyhow::{Context, Result};
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
 
-/// Built-in default runner image tag. Bumped per CLI release so a
-/// fresh pillbox install picks up a matching pre-published runner.
-/// Override at three levels (highest precedence first):
+/// Built-in default runner image tag. Override at three levels (highest
+/// precedence first):
 ///   1. `PILLBOX_RUNNER_IMAGE` env var
 ///   2. `[runner] image = "…"` in pillbox.toml
 ///   3. this default
-pub const DEFAULT_RUNNER_IMAGE: &str = "ghcr.io/vu1n/pillbox-runner:latest";
+///
+/// Points at `:rolling`, NOT `:latest`, during prerelease: CI
+/// (`.github/workflows/runner-image.yml`) only moves `:latest` on a STABLE
+/// semver release, so while we're pre-1.0 it stays frozen at an old build —
+/// which left off-the-shelf installs without iproute2/pip (egress broken).
+/// `:rolling` moves on every push to main, so a fresh install tracks the
+/// current runner. Repin to `:latest` (or a pinned `:vX.Y.Z`) at the first
+/// stable release, when `:latest` starts moving and rolling's churn is a
+/// liability rather than the only fresh tag.
+pub const DEFAULT_RUNNER_IMAGE: &str = "ghcr.io/vu1n/pillbox-runner:rolling";
 
 /// Env-var override key. Documented so `pillbox doctor` can name it
 /// in its "source" attribution.

@@ -146,7 +146,7 @@ mod tests {
     /// default (it's what a docker:// run uses); override for CI.
     fn test_image() -> String {
         std::env::var("PILLBOX_TEST_RUNNER_IMAGE")
-            .unwrap_or_else(|_| "ghcr.io/vu1n/pillbox-runner:latest".into())
+            .unwrap_or_else(|_| crate::docker::DEFAULT_RUNNER_IMAGE.to_string())
     }
 
     struct RmContainer(String);

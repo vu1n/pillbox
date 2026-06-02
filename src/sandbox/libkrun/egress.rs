@@ -1,4 +1,4 @@
-//! Userspace egress stack for the libkrun backend (the L5a transport slice).
+//! The L3/L5 egress stack for the libkrun backend (virtio-net + smoltcp + DNS).
 //!
 //! libkrun drives the guest's virtio-net L2 frames to a socketpair we own (the
 //! passt protocol: `[u32 BE len][Ethernet frame]`). This module runs a
@@ -7,13 +7,13 @@
 //! `krun_start_enter`, which never returns), so when the VM shuts down and the
 //! child `exit()`s, this thread goes with it.
 //!
-//! **This slice (L5a): transport + the DNS fence.** The stack brings the guest's
-//! link up and answers DNS (UDP :53): an allowlisted name resolves to the gateway
-//! (so its later TLS would land at our MITM) and is **pinned**; anything else gets
-//! **NXDOMAIN** — default-deny at the name layer. The TLS MITM that terminates the
-//! pinned connection, swaps the credential against the in-repo `VaultProvider`
-//! registry, and forwards to the real upstream is **L5b** — it consumes the
-//! [`PinTable`] this slice populates.
+//! **What lives here:** the transport (the `PasstDevice` + the poll loop) and the
+//! **DNS fence** — an allowlisted name resolves to the gateway (so its TLS lands
+//! at our MITM) and is **pinned** in [`PinTable`]; anything else gets **NXDOMAIN**
+//! (default-deny at the name layer). The L7 TLS MITM that terminates the pinned
+//! connection on these sockets, swaps the credential, and forwards to the real
+//! upstream is [`super::mitm`] — the poll loop drives it, and it consumes the
+//! `PinTable` populated here.
 
 use std::collections::VecDeque;
 use std::io::Write;
@@ -69,8 +69,9 @@ impl PinTable {
         self.names.insert(name.to_ascii_lowercase())
     }
 
-    /// Whether `name` was resolved through our resolver (L5b's gate consumes this).
-    #[allow(dead_code)] // consumed by the L5b MITM gate
+    /// Whether `name` was resolved through our resolver — [`super::mitm`]'s pin
+    /// gate consumes this to deny a hardcoded-IP/forged-SNI connection that
+    /// skipped DNS.
     pub(super) fn contains(&self, name: &str) -> bool {
         self.names.contains(&name.to_ascii_lowercase())
     }

@@ -414,6 +414,19 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         sock: String,
     },
+    /// Internal: guest-side opencode port-forward relay (libkrun; Linux-only).
+    /// Listens on a vsock port and bridges each connection to an in-guest TCP
+    /// port (the headless `opencode serve`), so the host speaks HTTP to a
+    /// `Server`-mode agent over vsock. Not user-facing.
+    #[command(hide = true)]
+    VsockForward {
+        /// vsock port the guest listens on (libkrun binds the host side).
+        #[arg(long, value_name = "PORT")]
+        vsock_port: u32,
+        /// In-guest TCP port to forward each connection to (e.g. opencode 4096).
+        #[arg(long, value_name = "PORT")]
+        to_port: u16,
+    },
 }
 
 fn main() -> ExitCode {
@@ -714,6 +727,10 @@ fn run(cli: Cli) -> Result<()> {
             .into()),
         },
         Command::PtyRelay { sock } => attach::relay::run(&sock),
+        Command::VsockForward {
+            vsock_port,
+            to_port,
+        } => vsock_forward(vsock_port, to_port),
     }
 }
 
@@ -788,6 +805,18 @@ fn pty_host_vsock(port: u32, listen: bool, argv: &[String]) -> Result<()> {
 #[cfg(not(target_os = "linux"))]
 fn pty_host_vsock(_port: u32, _listen: bool, _argv: &[String]) -> Result<()> {
     Err(PillboxError::usage("pty-host", "--vsock-port is Linux-only (the libkrun guest)").into())
+}
+
+/// Dispatch `vsock-forward` — Linux-only (the libkrun guest). Forwards a vsock
+/// port to an in-guest TCP port so the host can reach a `Server`-mode agent's
+/// HTTP API over vsock.
+#[cfg(target_os = "linux")]
+fn vsock_forward(vsock_port: u32, to_port: u16) -> Result<()> {
+    attach::host::run_vsock_forward(vsock_port, to_port)
+}
+#[cfg(not(target_os = "linux"))]
+fn vsock_forward(_vsock_port: u32, _to_port: u16) -> Result<()> {
+    Err(PillboxError::usage("vsock-forward", "Linux-only (the libkrun guest)").into())
 }
 
 /// Validate an `--events-webhook URL`:

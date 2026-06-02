@@ -42,6 +42,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 mod egress;
+mod http;
 mod mitm;
 mod vault;
 
@@ -192,9 +193,11 @@ pub(crate) struct LibkrunBackend;
 
 impl SandboxBackend for LibkrunBackend {
     fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
-        // Deferred to later slices — reject loudly rather than silently misbehave.
+        // Server-integration agents (opencode) run headless + are driven/read over
+        // their HTTP API through a vsock port-forward — a distinct path with no PTY
+        // (mirrors local_docker's split). Keep claude/codex on the PTY path below.
         if spec.integration == Integration::Server {
-            return Err(unsupported(spec, "server-mode agents (opencode)"));
+            return run_server(spec, opts, resolved);
         }
         if opts.vault {
             return Err(unsupported(spec, "--vault (egress + vault v2 is a later slice)"));
@@ -530,6 +533,266 @@ fn run_detached(
     Ok(())
 }
 
+/// Run a `Server`-integration agent (opencode) in a microVM: boot the VM
+/// running `opencode serve` + a vsock port-forward relay, then drive/read it
+/// over its HTTP API through that forward. The VM is detached (the server
+/// outlives the CLI, reaped by `session rm`) — `run` returns after creating the
+/// opencode session + sending the prompt, like the docker server path.
+///
+/// Differences from the PTY path ([`prepare_launch`]): the creds clone is *not*
+/// stubbed (opencode is non-vault — its real key must reach the provider; the
+/// MITM still terminates+forwards the allowlisted hosts, with an empty swap
+/// set), the guest entrypoint is `opencode serve` + `pillbox vsock-forward`
+/// (not `pty-host`), and the vsock port carries HTTP, not the attach protocol.
+///
+/// NOTE (deliberate duplication): this shares ~30 lines of launch scaffolding
+/// with `prepare_launch` (rootfs / workspace clone / env / CA / NIC / VmSpec).
+/// Server mode is a genuinely different launch (creds, script, bring-up), so a
+/// branch-laden shared builder would be worse; extract a shared prep helper once
+/// both paths are stable (same call the L3 dedup note made).
+fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
+    use crate::sandbox::opencode;
+
+    // opencode is non-vault: refuse --vault / vaulted --with rather than hand it
+    // a stub it would ship to the provider.
+    let withs = resolve_with_entries(resolved, &opts.withs)?;
+    if opts.vault || withs.iter().any(|w| w.meta.is_some()) {
+        return Err(unsupported(spec, "the vault (opencode is not vault-capable)"));
+    }
+
+    let rootfs = materialize_rootfs(resolved)?;
+    let home = spec.home_dir(resolved)?;
+    if !home.join(spec.cred_sentinel).exists() {
+        return Err(PillboxError::runtime(
+            "run",
+            format!("no stored credentials for `{}`", spec.id),
+        )
+        .with_next(format!("pillbox auth login --agent {}", spec.id))
+        .into());
+    }
+
+    // Workspace: CoW clone + secret-scrub (same as the PTY path).
+    let workspace_host = match &opts.workspace {
+        Some(p) => p.clone(),
+        None => std::env::current_dir().context("resolve current working directory")?,
+    };
+    if let Some(name) = opts.from_bookmark.as_deref() {
+        let handle = crate::bookmarks::resolve_existing(resolved, name)?;
+        resolved.workspace()?.pull(&workspace_host, Some(&handle))?;
+    }
+    let workspace_name = workspace_mount_name(&workspace_host, opts.name.as_deref())?;
+    let guest_workspace = format!("{GUEST_WORKSPACE}/{workspace_name}");
+    let clone = cow_clone_and_scrub(&workspace_host)?;
+
+    // Creds: CoW clone the *real* auth home (no stub — opencode authenticates to
+    // its provider directly; the MITM forwards it untouched).
+    let creds_share = cow_clone_home(&home)?;
+
+    // Env (no vault layer).
+    let composed = resolve_run_env(resolved, &opts, &withs, None)?;
+    let mut guest_env: Vec<(String, String)> = vec![
+        ("HOME".into(), GUEST_HOME.into()),
+        ("TERM".into(), "xterm-256color".into()),
+        (
+            "PATH".into(),
+            format!("/usr/local/bin:/usr/bin:/bin:{GUEST_HOME}/.local/bin"),
+        ),
+    ];
+    guest_env.extend(composed);
+
+    // CA trust so the MITM can terminate+forward opencode's provider TLS (empty
+    // swap = transparent forward). The CA key stays host-side.
+    let vault_ca_dir = resolved.subdir("vault")?;
+    let ca = crate::vault::Ca::ensure(&vault_ca_dir)
+        .map_err(|e| anyhow::anyhow!("ensure vault CA: {e}"))?;
+    let ca_cert_pem = std::fs::read_to_string(ca.cert_path()).context("read vault CA cert")?;
+    guest_env.push(("NODE_EXTRA_CA_CERTS".into(), GUEST_CA_PATH.into()));
+
+    // Guest entrypoint: NIC + CA + mounts, then `opencode serve` (background) and
+    // the vsock forward relay (foreground — the script's main process).
+    let home_q = shell_quote(GUEST_HOME);
+    let gw_q = shell_quote(&guest_workspace);
+    let serve = opencode::serve_args()
+        .iter()
+        .map(|a| shell_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let net = egress::guest_net_commands();
+    let ca_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &ca_cert_pem);
+    let ca_setup = format!(
+        "printf '%s' {b64} | base64 -d > {GUEST_CA_PATH}; \
+         update-ca-certificates >/dev/null 2>&1 || true",
+        b64 = shell_quote(&ca_b64),
+    );
+    let script = format!(
+        "set -e; {net}; {ca_setup}; mkdir -p {home_q}; mount -t virtiofs creds {home_q}; \
+         mkdir -p {gw_q}; mount -t virtiofs workspace {gw_q}; cd {gw_q}; \
+         {serve} & exec pillbox vsock-forward --vsock-port {FORWARD_PORT} --to-port {port}",
+        port = opencode::SERVE_PORT,
+    );
+
+    let host_sock =
+        krun_cache_dir()?.join(format!("opencode-{}.sock", uuid::Uuid::now_v7().simple()));
+    let _ = std::fs::remove_file(&host_sock);
+
+    let vmspec = VmSpec {
+        rootfs: rootfs.to_string_lossy().into_owned(),
+        vcpus: 2,
+        ram_mib: 2048,
+        shares: vec![
+            Share {
+                tag: "creds".into(),
+                host_path: creds_share.to_string_lossy().into_owned(),
+            },
+            Share {
+                tag: "workspace".into(),
+                host_path: clone.to_string_lossy().into_owned(),
+            },
+        ],
+        exec: vec!["/bin/sh".into(), "-c".into(), script],
+        // Guest listens; the host dials `host_sock` once per HTTP request.
+        vsock: Some(VsockAttach {
+            port: FORWARD_PORT,
+            host_sock: host_sock.to_string_lossy().into_owned(),
+            listen: true,
+        }),
+        egress: Some(EgressSpec {
+            // TODO(egress): opencode's model provider must be in this set or the
+            // DNS fence NXDOMAINs it. intercepted_hosts() covers anthropic/openai
+            // (an anthropic-backed model works out of the box); other providers
+            // (e.g. GLM/zai) need an egress-allow — the documented "standard"
+            // profile. The HTTP transport (this slice) works regardless, since it
+            // rides the in-guest localhost port, not egress.
+            allowlist: crate::vault::providers::intercepted_hosts()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            log_path: std::env::var("PILLBOX_KRUN_EGRESS_LOG").ok(),
+            ca_dir: Some(vault_ca_dir.to_string_lossy().into_owned()),
+        }),
+    };
+    let spec_file = tempfile::Builder::new()
+        .prefix("pillbox-krun-spec-")
+        .suffix(".json")
+        .tempfile()
+        .context("create VMM spec tempfile")?;
+    serde_json::to_writer(&spec_file, &vmspec).context("write VMM spec")?;
+    // The child reads the spec after we return (detached) — persist it.
+    let (_, spec_path) = spec_file.keep().context("persist VMM spec")?;
+
+    // Spawn the VM detached (it runs the server + relay, reparented to init).
+    let exe = std::env::current_exe().context("locate the pillbox binary to re-exec as VMM")?;
+    let mut child = Command::new(&exe)
+        .arg("__krun-vmm")
+        .arg(&spec_path)
+        .env_clear()
+        .envs(guest_env)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("spawn the libkrun VMM subprocess")?;
+    // No swap pairs (non-vault): hand the child's MITM an empty set + EOF.
+    if let Some(mut sin) = child.stdin.take() {
+        use std::io::Write as _;
+        let _ = sin.write_all(b"[]");
+    }
+    let pid = child.id() as i32;
+
+    let session_id = crate::session::Session::new_id();
+    let http = http::LibkrunHttp::new(host_sock.clone());
+    let model = opts
+        .model
+        .clone()
+        .unwrap_or_else(|| opencode::DEFAULT_MODEL.to_string());
+    let prompt = opts.args.join(" ").trim().to_string();
+
+    // Bring-up over the forward; capture the result so a failure tears the VM
+    // down rather than leaking it + the clones.
+    let built = (|| -> Result<crate::session::Session> {
+        opencode::wait_ready(&http)?;
+        let ocid = opencode::create_session(&http)?;
+        let handle = LibkrunHandle {
+            sock: host_sock.to_string_lossy().into_owned(),
+            pid,
+            creds: creds_share.to_string_lossy().into_owned(),
+            workspace: clone.to_string_lossy().into_owned(),
+            spec: spec_path.to_string_lossy().into_owned(),
+        };
+        let session = crate::session::Session {
+            id: session_id.clone(),
+            label: opts.label.clone(),
+            remote: crate::session::LOCAL_REMOTE.to_string(),
+            backend: crate::session::BACKEND_LIBKRUN.to_string(),
+            sandbox_id: serde_json::to_string(&handle).context("encode libkrun handle")?,
+            pty_pid: 0,
+            agent_id: spec.id.to_string(),
+            started_at: crate::session::now_rfc3339(),
+            attached_pid: None,
+            base_snapshot: None,
+            result_snapshot: None,
+            expires_at: opts.ttl_seconds.map(crate::session::expires_at_from_ttl),
+            guest_cwd: guest_workspace.clone(),
+            agent_session_id: Some(ocid.clone()),
+            model: Some(model.clone()),
+        };
+        crate::session::write(resolved, &session)?;
+        crate::events::emit_session_event(
+            resolved,
+            crate::events::EventType::SessionStarted {
+                parent_session_id: crate::events::parent_session_id_from_env(),
+            },
+            &session.id,
+            Some(&session),
+        );
+        if !prompt.is_empty() {
+            opencode::send_prompt(&http, &ocid, &prompt, &model)?;
+        }
+        Ok(session)
+    })();
+    let session = match built {
+        Ok(s) => s,
+        Err(e) => {
+            if pid > 0 {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            let _ = std::fs::remove_file(&host_sock);
+            let _ = std::fs::remove_file(&spec_path);
+            let _ = std::fs::remove_dir_all(&creds_share);
+            let _ = std::fs::remove_dir_all(&clone);
+            return Err(e);
+        }
+    };
+
+    if opts.json {
+        println!(
+            "{}",
+            crate::paths::json_v1(vec![("session", session.to_json_value())])
+        );
+    } else {
+        println!(
+            "pillbox: ✓ opencode session `{}` started in a microVM ({}).",
+            session.id, model
+        );
+        if !prompt.is_empty() {
+            println!("         (sent your prompt; watch for the reply)");
+        }
+        println!("         pillbox session watch {}    # read the stream", session.id);
+        println!("         pillbox session send {} \"…\"  # drive it", session.id);
+    }
+    Ok(())
+}
+
+/// `SandboxHttp` to a libkrun server session's in-guest opencode server, decoded
+/// from its [`LibkrunHandle`]. Used by `session send`/`watch`/`subscribe`.
+pub(crate) fn opencode_http(
+    session: &crate::session::Session,
+) -> Result<Box<dyn crate::sandbox::http::SandboxHttp>> {
+    let handle: LibkrunHandle =
+        serde_json::from_str(&session.sandbox_id).context("decode libkrun session handle")?;
+    Ok(Box::new(http::LibkrunHttp::new(PathBuf::from(handle.sock))))
+}
+
 /// Reattach to a detached libkrun session: dial the persistent attach socket
 /// libkrun bound for the guest's listening pty-host, and pump the terminal (with
 /// the detach hotkey enabled). The agent + its screen persisted in the VM.
@@ -583,6 +846,10 @@ pub(crate) fn kill_session(resolved: &Pillbox, session: &crate::session::Session
 
 /// vsock port the guest pty-host dials for the attach channel.
 const ATTACH_PORT: u32 = 1024;
+
+/// vsock port the guest's opencode port-forward relay listens on (server mode);
+/// the host dials it per HTTP request. Distinct from [`ATTACH_PORT`].
+const FORWARD_PORT: u32 = 1025;
 
 /// Where the guest writes the vault CA cert (system trust dir → `update-ca-certificates`;
 /// also `NODE_EXTRA_CA_CERTS` for Node agents). The cert is public — the key never leaves the host.
@@ -797,7 +1064,7 @@ fn read_swap_pairs() -> Vec<vault::CredSwap> {
 /// swaps stub→real on the wire. Returns the stubbed-creds dir to mount + the
 /// (stub, real) pairs. Anthropic-shaped (`claudeAiOauth` in the credentials file);
 /// other agents get the home cloned as-is + no pairs (transparent relay).
-fn stub_oauth_creds(home: &Path, sentinel: &str) -> Result<(PathBuf, Vec<SwapPair>)> {
+fn cow_clone_home(home: &Path) -> Result<PathBuf> {
     let clone = krun_cache_dir()?
         .join("creds")
         .join(uuid::Uuid::now_v7().simple().to_string());
@@ -811,7 +1078,16 @@ fn stub_oauth_creds(home: &Path, sentinel: &str) -> Result<(PathBuf, Vec<SwapPai
         let _ = std::fs::remove_dir_all(&clone);
         bail!("clonefile creds {} → {} failed: {err} (APFS only)", home.display(), clone.display());
     }
+    Ok(clone)
+}
 
+/// CoW-clone the auth home and replace its OAuth tokens with stubs (the
+/// env-fork): the guest mounts the stubbed clone, the reals reach the MITM
+/// out-of-band. Returns the clone + the stub→real swap pairs. Server-mode
+/// agents (opencode, non-vault) skip this and mount [`cow_clone_home`] as-is —
+/// their real key must reach the provider, so there's nothing to swap.
+fn stub_oauth_creds(home: &Path, sentinel: &str) -> Result<(PathBuf, Vec<SwapPair>)> {
+    let clone = cow_clone_home(home)?;
     let mut pairs = Vec::new();
     let creds_file = clone.join(sentinel);
     if let Ok(text) = std::fs::read_to_string(&creds_file) {

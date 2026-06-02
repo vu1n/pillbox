@@ -15,24 +15,54 @@ use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
 use crate::{events, remote, sandbox, session};
 
-/// The docker endpoint hosting a server-mode session's container — local for a
-/// `Docker` session, the re-resolved remote for a `RemoteDocker` one.
-fn opencode_endpoint(resolved: &Pillbox, s: &session::Session) -> Result<DockerEndpoint> {
+/// A [`SandboxHttp`](sandbox::http::SandboxHttp) to a server-mode session's
+/// in-sandbox opencode server — `docker exec curl` for a (local/remote) docker
+/// session, an HTTP-over-vsock client for a libkrun one. The dispatch axis for
+/// `session send`/`subscribe`/`watch` on a `Server`-integration agent.
+fn opencode_http(
+    resolved: &Pillbox,
+    s: &session::Session,
+) -> Result<Box<dyn sandbox::http::SandboxHttp>> {
+    let port = sandbox::opencode::SERVE_PORT;
     match session::Backend::parse(&s.backend) {
-        Some(session::Backend::Docker) => Ok(DockerEndpoint::local()),
+        Some(session::Backend::Docker) => Ok(Box::new(sandbox::http::DockerHttp::new(
+            DockerEndpoint::local(),
+            s.sandbox_id.clone(),
+            port,
+        ))),
         Some(session::Backend::RemoteDocker) => {
             let remote = remote::resolve_run_target(resolved, &s.remote)?;
-            sandbox::remote_docker::endpoint_for(&remote)
+            let endpoint = sandbox::remote_docker::endpoint_for(&remote)?;
+            Ok(Box::new(sandbox::http::DockerHttp::new(
+                endpoint,
+                s.sandbox_id.clone(),
+                port,
+            )))
         }
+        Some(session::Backend::Libkrun) => libkrun_opencode_http(s),
         _ => Err(PillboxError::usage(
             "session",
             format!(
-                "opencode server sessions need a docker backend (got `{}`)",
+                "opencode server sessions need a docker or libkrun backend (got `{}`)",
                 s.backend
             ),
         )
         .into()),
     }
+}
+
+/// libkrun opencode HTTP transport (feature-gated; see [`opencode_http`]).
+#[cfg(feature = "libkrun")]
+fn libkrun_opencode_http(
+    s: &session::Session,
+) -> Result<Box<dyn sandbox::http::SandboxHttp>> {
+    sandbox::libkrun::opencode_http(s)
+}
+#[cfg(not(feature = "libkrun"))]
+fn libkrun_opencode_http(
+    _s: &session::Session,
+) -> Result<Box<dyn sandbox::http::SandboxHttp>> {
+    Err(PillboxError::usage("session", "this libkrun session needs the libkrun feature built").into())
 }
 
 pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> {
@@ -307,6 +337,19 @@ fn session_diagnose(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
 
 fn session_attach(resolved: &Pillbox, id: &str) -> Result<()> {
     let s = session::resolve(resolved, id)?;
+    // Server-integration agents (opencode) have no PTY to attach — they're
+    // driven/read over HTTP. Point at the right verbs instead of pumping
+    // garbage frames over the HTTP transport.
+    if s.integration() == Integration::Server {
+        return Err(PillboxError::usage(
+            "session attach",
+            format!("`{}` is a server-mode session (no PTY)", s.agent_id),
+        )
+        .with_next(format!(
+            "pillbox session watch {id}   # read it    ·   pillbox session send {id} \"…\"   # drive it"
+        ))
+        .into());
+    }
     match session::Backend::parse(&s.backend) {
         // Local Docker attaches to the host daemon directly (no remote);
         // docker:// re-resolves the endpoint from `remote`.
@@ -514,12 +557,7 @@ fn session_send(resolved: &Pillbox, id: &str, text: &str) -> Result<()> {
     // Server-integration agents (opencode) are driven over their HTTP prompt
     // API, not a pty-relay: `session send` = a structured prompt, not keystrokes.
     if s.integration() == Integration::Server {
-        let endpoint = opencode_endpoint(resolved, &s)?;
-        let http = sandbox::http::DockerHttp::new(
-            endpoint,
-            s.sandbox_id.clone(),
-            sandbox::opencode::SERVE_PORT,
-        );
+        let http = opencode_http(resolved, &s)?;
         let ocid = s.agent_session_id.as_deref().ok_or_else(|| {
             PillboxError::config(
                 "session send",
@@ -530,7 +568,7 @@ fn session_send(resolved: &Pillbox, id: &str, text: &str) -> Result<()> {
             .model
             .as_deref()
             .unwrap_or(sandbox::opencode::DEFAULT_MODEL);
-        sandbox::opencode::send_prompt(&http, ocid, text, model)?;
+        sandbox::opencode::send_prompt(&*http, ocid, text, model)?;
         eprintln!("pillbox: sent prompt to opencode session `{}`", s.id);
         return Ok(());
     }
@@ -582,15 +620,10 @@ fn resolve_streaming_session(
         // Server-integration agents (opencode) have no transcript file — read
         // their HTTP `/event` stream into the log via the bridge instead.
         if s.integration() == Integration::Server {
-            let tailer = match opencode_endpoint(resolved, &s) {
-                Ok(endpoint) => {
-                    let http = sandbox::http::DockerHttp::new(
-                        endpoint,
-                        s.sandbox_id.clone(),
-                        sandbox::opencode::SERVE_PORT,
-                    );
+            let tailer = match opencode_http(resolved, &s) {
+                Ok(http) => {
                     let log = crate::events::log::SessionLog::open(resolved, &s.id)?;
-                    sandbox::opencode::spawn_event_bridge(&http, &s.id, log)
+                    sandbox::opencode::spawn_event_bridge(&*http, &s.id, log)
                 }
                 Err(e) => {
                     eprintln!(

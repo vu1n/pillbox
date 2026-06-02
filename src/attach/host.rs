@@ -79,25 +79,10 @@ pub(crate) fn run_vsock(port: u32, listen: bool, argv: &[String]) -> Result<()> 
     use std::time::Duration;
 
     const VMADDR_CID_HOST: u32 = 2;
-    const VMADDR_CID_ANY: u32 = 0xffff_ffff;
     let session = spawn_pty_session(argv)?;
 
     if listen {
-        let lfd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) };
-        if lfd < 0 {
-            anyhow::bail!("AF_VSOCK socket: {}", std::io::Error::last_os_error());
-        }
-        let mut addr: libc::sockaddr_vm = unsafe { std::mem::zeroed() };
-        addr.svm_family = libc::AF_VSOCK as libc::sa_family_t;
-        addr.svm_port = port;
-        addr.svm_cid = VMADDR_CID_ANY;
-        let alen = std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t;
-        if unsafe { libc::bind(lfd, &addr as *const _ as *const libc::sockaddr, alen) } != 0 {
-            anyhow::bail!("bind vsock :{port}: {}", std::io::Error::last_os_error());
-        }
-        if unsafe { libc::listen(lfd, 4) } != 0 {
-            anyhow::bail!("listen vsock :{port}: {}", std::io::Error::last_os_error());
-        }
+        let lfd = vsock_listen(port)?;
         // Accept reattach clients one at a time; the agent (and its screen) live in
         // `session` across them. On an accept error, back off + retry rather than
         // return — returning here would drop `session` and kill a live agent; the
@@ -134,6 +119,81 @@ pub(crate) fn run_vsock(port: u32, listen: bool, argv: &[String]) -> Result<()> 
     // reader thread exits the process, so there's no client to reattach yet.
     session.serve_blocking(stream);
     Ok(())
+}
+
+/// Bind + listen a guest-side vsock listener on `port` (CID_ANY). libkrun binds
+/// the host side (`krun_add_vsock_port2` listen=true); the host dials it.
+/// Shared by the detach reattach loop ([`run_vsock`]) and the opencode
+/// port-forward relay ([`run_vsock_forward`]).
+#[cfg(target_os = "linux")]
+fn vsock_listen(port: u32) -> Result<i32> {
+    const VMADDR_CID_ANY: u32 = 0xffff_ffff;
+    let lfd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) };
+    if lfd < 0 {
+        anyhow::bail!("AF_VSOCK socket: {}", std::io::Error::last_os_error());
+    }
+    let mut addr: libc::sockaddr_vm = unsafe { std::mem::zeroed() };
+    addr.svm_family = libc::AF_VSOCK as libc::sa_family_t;
+    addr.svm_port = port;
+    addr.svm_cid = VMADDR_CID_ANY;
+    let alen = std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t;
+    if unsafe { libc::bind(lfd, &addr as *const _ as *const libc::sockaddr, alen) } != 0 {
+        anyhow::bail!("bind vsock :{port}: {}", std::io::Error::last_os_error());
+    }
+    if unsafe { libc::listen(lfd, 4) } != 0 {
+        anyhow::bail!("listen vsock :{port}: {}", std::io::Error::last_os_error());
+    }
+    Ok(lfd)
+}
+
+/// Guest-side opencode port-forward relay: listen on vsock `port` and bridge
+/// each accepted connection to `127.0.0.1:<to_port>` (the in-guest `opencode
+/// serve`). The host opens one connection per HTTP request and speaks HTTP over
+/// the relayed byte stream ([`LibkrunHttp`](crate::sandbox::libkrun)). Unlike a
+/// generic exec channel this exposes ONLY the opencode port — no command-exec
+/// surface in the guest. Blocks forever (the VM teardown kills it).
+#[cfg(target_os = "linux")]
+pub(crate) fn run_vsock_forward(port: u32, to_port: u16) -> Result<()> {
+    use std::os::unix::io::FromRawFd;
+    let lfd = vsock_listen(port)?;
+    loop {
+        let cfd = unsafe { libc::accept(lfd, std::ptr::null_mut(), std::ptr::null_mut()) };
+        if cfd < 0 {
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        let client = unsafe { UnixStream::from_raw_fd(cfd) };
+        thread::spawn(move || forward_conn(client, to_port));
+    }
+}
+
+/// Bridge one client connection to `127.0.0.1:<to_port>`, copying both ways
+/// until either side closes. Errors are logged, not propagated — one failed
+/// connection mustn't kill the relay.
+#[cfg(target_os = "linux")]
+fn forward_conn(client: UnixStream, to_port: u16) {
+    use std::net::Shutdown;
+    let upstream = match std::net::TcpStream::connect(("127.0.0.1", to_port)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("pillbox: vsock-forward: connect 127.0.0.1:{to_port}: {e}");
+            return;
+        }
+    };
+    // Each direction needs its own handle to both sockets.
+    let (Ok(mut client_rd), Ok(mut upstream_wr)) = (client.try_clone(), upstream.try_clone())
+    else {
+        return;
+    };
+    // client → upstream on a thread; upstream → client on this one.
+    let up = thread::spawn(move || {
+        let _ = std::io::copy(&mut client_rd, &mut upstream_wr);
+        let _ = upstream_wr.shutdown(Shutdown::Write);
+    });
+    let (mut up_rd, mut client_wr) = (upstream, client);
+    let _ = std::io::copy(&mut up_rd, &mut client_wr);
+    let _ = client_wr.shutdown(Shutdown::Write);
+    let _ = up.join();
 }
 
 /// The running PTY session: the agent's PTY behind the hub/screen, ready to

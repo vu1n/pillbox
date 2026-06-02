@@ -54,6 +54,33 @@ pub(super) fn guest_net_commands() -> String {
     )
 }
 
+/// Model-provider API hosts a non-vault agent (opencode) may egress to — the
+/// "standard" egress profile. These are allowed through the DNS fence and the
+/// MITM terminates + forwards them with an **empty swap** (no credential
+/// substitution — opencode holds its own real key and authenticates directly).
+/// Distinct from the vault `intercepted_hosts()`, where the MITM swaps a stub
+/// for the real credential; `api.openai.com`/`api.anthropic.com` live there, so
+/// they're not repeated here.
+///
+/// Best-effort, extend freely — covers the providers opencode users reach. A
+/// host not listed is fenced (NXDOMAIN); a future `--egress-allow HOST` flag
+/// will let a user declare a custom/self-hosted endpoint.
+pub(super) fn standard_egress_hosts() -> &'static [&'static str] {
+    &[
+        "openrouter.ai",                     // OpenRouter (aggregator)
+        "api.deepseek.com",                  // DeepSeek
+        "api.moonshot.cn",                   // Kimi / Moonshot (CN)
+        "api.moonshot.ai",                   // Kimi / Moonshot (intl)
+        "api.x.ai",                          // Grok (xAI)
+        "generativelanguage.googleapis.com", // Gemini (Google AI Studio)
+        "api.z.ai",                          // GLM (z.ai)
+        "open.bigmodel.cn",                  // GLM (Zhipu / BigModel)
+        "api.mistral.ai",                    // Mistral
+        "api.groq.com",                      // Groq
+        "models.dev",                        // opencode's model registry
+    ]
+}
+
 /// Names the guest resolved through our allowlisted resolver. Credential release
 /// (L5b) requires the SNI be in here — a forged-SNI / hardcoded-IP connection
 /// that skipped DNS can't be, which is the **name-level DNS-pin**. One table per

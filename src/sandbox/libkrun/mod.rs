@@ -657,14 +657,14 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
             listen: true,
         }),
         egress: Some(EgressSpec {
-            // TODO(egress): opencode's model provider must be in this set or the
-            // DNS fence NXDOMAINs it. intercepted_hosts() covers anthropic/openai
-            // (an anthropic-backed model works out of the box); other providers
-            // (e.g. GLM/zai) need an egress-allow — the documented "standard"
-            // profile. The HTTP transport (this slice) works regardless, since it
-            // rides the in-guest localhost port, not egress.
+            // opencode is non-vault: allow the vault-intercepted hosts (so an
+            // anthropic/openai-backed model works + gets the swap) UNION the
+            // "standard" model-provider set (openrouter/deepseek/kimi/grok/
+            // gemini/glm/… — terminated + forwarded with an empty swap, since
+            // opencode holds its own key). Anything else is fenced (NXDOMAIN).
             allowlist: crate::vault::providers::intercepted_hosts()
                 .into_iter()
+                .chain(egress::standard_egress_hosts().iter().copied())
                 .map(str::to_string)
                 .collect(),
             log_path: std::env::var("PILLBOX_KRUN_EGRESS_LOG").ok(),

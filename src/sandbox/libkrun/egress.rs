@@ -16,21 +16,20 @@
 //! [`PinTable`] this slice populates.
 
 use std::collections::VecDeque;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::Ipv4Addr;
 use std::os::raw::c_int;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rustls::ServerConnection;
-use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
+use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
-use smoltcp::socket::{tcp, udp};
+use smoltcp::socket::udp;
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
 
-use super::vault::{CredSwap, StubSwap, Upstream, Vault};
+use super::vault::{CredSwap, Vault};
 
 /// Guest NIC MAC (handed to `krun_add_net_unixstream`) and the gateway MAC the
 /// stack answers as. The addressing is fixed per microVM — one stack, one guest.
@@ -42,11 +41,6 @@ const GATEWAY_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 2);
 const GUEST_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
 const PREFIX_LEN: u8 = 24;
 const DNS_PORT: u16 = 53;
-/// The MITM listens here; allowlisted names resolve to the gateway, so their TLS
-/// lands on these sockets. A self-replenishing pool keeps free listeners ready.
-const PROXY_PORT: u16 = 443;
-const POOL_MIN_FREE: usize = 8;
-const POOL_MAX: usize = 32;
 
 /// Shell commands the guest runs (before exec'ing the agent) to bring its NIC up
 /// and route DNS + egress through this stack. Kept here so the addressing lives
@@ -85,8 +79,8 @@ impl PinTable {
 /// Host-side diagnostics sink. libkrun wires the guest console to the VMM child's
 /// stdio, so the egress thread's `eprintln` is swallowed — write to a file when
 /// one is configured (`PILLBOX_KRUN_EGRESS_LOG`), else fall back to stderr. (A
-/// stopgap until L5c routes these as §0 events.)
-struct Diag(Option<Mutex<std::fs::File>>);
+/// stopgap until L5c routes these as §0 events.) Shared with [`super::mitm`].
+pub(super) struct Diag(Option<Mutex<std::fs::File>>);
 
 impl Diag {
     fn open(path: Option<String>) -> Self {
@@ -95,7 +89,7 @@ impl Diag {
         }).map(Mutex::new))
     }
 
-    fn log(&self, msg: &str) {
+    pub(super) fn log(&self, msg: &str) {
         match &self.0 {
             Some(f) => {
                 let _ = writeln!(f.lock().unwrap(), "{msg}");
@@ -159,230 +153,23 @@ pub(super) fn run(
     sockets.get_mut::<udp::Socket>(dns).bind(DNS_PORT).expect("bind :53");
 
     let mut pins = PinTable::default();
-    let mut listeners: Vec<Listener> = Vec::new();
+    let mut listeners: Vec<super::mitm::Listener> = Vec::new();
     if vault.is_some() {
-        replenish_listeners(&mut listeners, &mut sockets);
+        super::mitm::replenish_listeners(&mut listeners, &mut sockets);
     }
     diag.log(&format!(
         "krun-egress: smoltcp up (gw 10.0.2.2, dns :{DNS_PORT}, mitm :{}); fence allowlist={allowlist:?}",
-        if vault.is_some() { PROXY_PORT.to_string() } else { "off".into() }
+        if vault.is_some() { "443" } else { "off" }
     ));
 
     loop {
         iface.poll(now(start), &mut device, &mut sockets);
         serve_dns(sockets.get_mut::<udp::Socket>(dns), &allowlist, &mut pins, &diag);
         if let Some(vault) = &vault {
-            drive_listeners(&mut listeners, &mut sockets, vault, &pins, &swap_pairs, &diag);
-            replenish_listeners(&mut listeners, &mut sockets);
+            super::mitm::drive_listeners(&mut listeners, &mut sockets, vault, &pins, &swap_pairs, &diag);
+            super::mitm::replenish_listeners(&mut listeners, &mut sockets);
         }
         thread::sleep(Duration::from_millis(2));
-    }
-}
-
-// ── TLS MITM listener pool ──────────────────────────────────────────────────
-
-/// One pooled TCP socket listening on `:443`, plus the rustls session driving any
-/// connection accepted on it.
-struct Listener {
-    handle: SocketHandle,
-    conn: Option<Conn>,
-}
-
-/// Per-connection MITM state. `host` is the pinned SNI, set once the gate passes
-/// — empty means the gate hasn't run yet (the deny path aborts the socket, so a
-/// gated-but-empty state never persists). `upstream` is opened after the gate;
-/// the pump then relays plaintext between the guest TLS and the upstream TLS.
-struct Conn {
-    tls: ServerConnection,
-    host: String,
-    upstream: Option<Upstream>,
-    /// Stub→real credential substitution applied to the guest→upstream stream.
-    swap: StubSwap,
-    req_logged: bool,
-    closing: bool,
-}
-
-/// Keep `POOL_MIN_FREE` listening sockets ready (up to `POOL_MAX`), adding new
-/// ones as accepted connections consume the free pool.
-fn replenish_listeners(listeners: &mut Vec<Listener>, sockets: &mut SocketSet) {
-    let free = listeners
-        .iter()
-        .filter(|l| sockets.get::<tcp::Socket>(l.handle).state() == tcp::State::Listen)
-        .count();
-    for _ in free..POOL_MIN_FREE {
-        if listeners.len() >= POOL_MAX {
-            break;
-        }
-        let s = tcp::Socket::new(
-            tcp::SocketBuffer::new(vec![0u8; 65535]),
-            tcp::SocketBuffer::new(vec![0u8; 65535]),
-        );
-        let handle = sockets.add(s);
-        let sock = sockets.get_mut::<tcp::Socket>(handle);
-        // Reclaim incomplete/idle connections (no ClientHello, slowloris) so they
-        // can't pin a pool slot until the VM dies.
-        sock.set_timeout(Some(smoltcp::time::Duration::from_secs(30)));
-        sock.listen(PROXY_PORT).expect("listen :443");
-        listeners.push(Listener { handle, conn: None });
-    }
-}
-
-/// Drive every pooled listener: start a rustls session on a fresh connection,
-/// pump it, and reset the socket back to listening when it closes.
-fn drive_listeners(
-    listeners: &mut [Listener],
-    sockets: &mut SocketSet,
-    vault: &Vault,
-    pins: &PinTable,
-    swap_pairs: &[CredSwap],
-    diag: &Diag,
-) {
-    for l in listeners.iter_mut() {
-        let sock = sockets.get_mut::<tcp::Socket>(l.handle);
-        if l.conn.is_some() || sock.can_recv() {
-            if l.conn.is_none() {
-                match vault.new_conn() {
-                    Ok(tls) => {
-                        l.conn = Some(Conn {
-                            tls,
-                            host: String::new(),
-                            upstream: None,
-                            swap: StubSwap::new(swap_pairs.to_vec()),
-                            req_logged: false,
-                            closing: false,
-                        })
-                    }
-                    Err(_) => sock.abort(),
-                }
-            }
-            if let Some(c) = l.conn.as_mut() {
-                drive_conn(sock, c, vault, pins, diag);
-            }
-        }
-        let sock = sockets.get_mut::<tcp::Socket>(l.handle);
-        if sock.state() == tcp::State::Closed {
-            l.conn = None;
-            let _ = sock.listen(PROXY_PORT);
-        }
-    }
-}
-
-/// Pump one MITM session: smoltcp rx → guest rustls, gate on the DNS-pin (the
-/// allowlist is already enforced by the cert resolver — a non-allowlisted SNI
-/// never got a cert), then relay decrypted bytes to/from the upstream TLS, guest
-/// rustls → smoltcp tx. Split-borrows the connection's fields so the guest and
-/// upstream sessions can be driven in the same call.
-fn drive_conn(sock: &mut tcp::Socket, c: &mut Conn, vault: &Vault, pins: &PinTable, diag: &Diag) {
-    let Conn { tls, host, upstream, swap, req_logged, closing } = c;
-
-    // smoltcp rx → guest rustls
-    while sock.can_recv() {
-        let mut got = 0usize;
-        let _ = sock.recv(|data| {
-            got = tls.read_tls(&mut std::io::Cursor::new(data)).unwrap_or(0);
-            (got, ())
-        });
-        if got == 0 {
-            break;
-        }
-        // A handshake failure lands here — including a non-allowlisted SNI, whose
-        // cert the resolver refused to mint. Log the RST (the only place we see it).
-        if let Err(e) = tls.process_new_packets() {
-            diag.log(&format!("krun-egress: [mitm] TLS error → RST ({e})"));
-            sock.abort();
-            return;
-        }
-    }
-
-    // Pin gate (SNI available once the ClientHello is processed): the guest must
-    // have resolved this exact host through our resolver — a hardcoded-IP +
-    // forged-SNI connection that skipped DNS isn't pinned, so it's denied. `host`
-    // empty = gate not yet run; setting it (only on ALLOW) marks the gate passed.
-    if host.is_empty() {
-        if let Some(sni) = tls.server_name() {
-            let sni = sni.to_string();
-            if !pins.contains(&sni) {
-                diag.log(&format!(
-                    "krun-egress: [mitm] DENY sni={sni:?} → RST (SNI not resolved via our resolver)"
-                ));
-                sock.abort();
-                return;
-            }
-            diag.log(&format!("krun-egress: [mitm] ALLOW sni={sni:?} → DNS-pinned, terminating"));
-            *host = sni;
-        }
-    }
-
-    // Open the forward connection once the gate passes (the agent gets the real
-    // upstream, validated against the Mozilla roots).
-    if !host.is_empty() && upstream.is_none() && !*closing {
-        match vault.connect_upstream(host) {
-            Ok(up) => *upstream = Some(up),
-            Err(e) => {
-                diag.log(&format!("krun-egress: [mitm] upstream {host} failed → RST ({e})"));
-                sock.abort();
-                return;
-            }
-        }
-    }
-
-    // Relay decrypted bytes both ways: guest request → upstream, upstream response
-    // → guest. The env-fork swap (stub→real credential) is applied to the guest's
-    // request stream before it reaches the upstream.
-    if let Some(up) = upstream.as_mut() {
-        let mut plain = Vec::new();
-        let mut buf = [0u8; 4096];
-        loop {
-            match tls.reader().read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => plain.extend_from_slice(&buf[..n]),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(_) => break,
-            }
-        }
-        if !plain.is_empty() {
-            if !*req_logged {
-                let head = String::from_utf8_lossy(&plain);
-                diag.log(&format!(
-                    "krun-egress: [mitm] {:?} → {host} (forwarding{})",
-                    head.lines().next().unwrap_or(""),
-                    if swap.is_noop() { "" } else { ", cred swapped" }
-                ));
-                *req_logged = true;
-            }
-            // Substitute stub→real; flush per drain so no partial-stub tail is held
-            // back across ticks (the credential lands in the request head, which
-            // arrives whole in one drain).
-            let mut out = swap.push(&plain);
-            out.extend(swap.flush());
-            up.send(&out);
-        }
-        let alive = up.pump();
-        let mut resp = Vec::new();
-        up.recv_into(&mut resp);
-        if !resp.is_empty() {
-            let _ = tls.writer().write_all(&resp);
-        }
-        if !alive {
-            *closing = true;
-            *upstream = None;
-        }
-    }
-
-    // guest rustls → smoltcp tx
-    while tls.wants_write() && sock.can_send() {
-        let mut wrote = 0usize;
-        let _ = sock.send(|mut b| {
-            wrote = tls.write_tls(&mut b).unwrap_or(0);
-            (wrote, ())
-        });
-        if wrote == 0 {
-            break;
-        }
-    }
-    // Close the guest side once the upstream is gone and its response is flushed.
-    if *closing && !tls.wants_write() {
-        sock.close();
     }
 }
 

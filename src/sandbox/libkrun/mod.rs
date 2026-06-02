@@ -42,6 +42,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 mod egress;
+mod mitm;
 mod vault;
 
 use super::SandboxBackend;

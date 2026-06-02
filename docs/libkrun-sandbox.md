@@ -806,9 +806,16 @@ Docker untouched until step 8. Slices (each its own commit, default build green)
      `run_server` bodies stay per-backend (docker container vs libkrun VMM lifecycle
      genuinely differ — the shared bring-up is already in the `opencode::` fns).
      Verified live (the 7d server-record round-trips through run→send→watch).
+   - ✅ **ready-not-prompted** (`4162fe3`). `run --agent opencode` no longer
+     auto-sends an initial prompt — it brings up a *ready* session (wait_ready) and
+     returns; the first prompt goes through `session send` like every other turn,
+     so it's captured by a subscribed `watch` instead of streamed to no one at
+     start. (Auto-send was a PTY-readiness workaround; opencode's `/doc` makes it
+     moot — and it was the source of the first-turn-not-captured gap.) A passed
+     prompt pre-fills the send hint.
    - **opencode is now first-class alongside claude/codex** on both docker and
-     libkrun: run / drive (`session send`) / read (`watch`/`subscribe`) / teardown,
-     any model provider via the standard profile + `--egress-allow`.
+     libkrun: run (→ ready) / drive (`session send`) / read (`watch`/`subscribe`) /
+     teardown, any model provider via the standard profile + `--egress-allow`.
 8. **Deprecate Docker** — remove the docker/remote backends once libkrun is at parity.
 
 ## Dependencies

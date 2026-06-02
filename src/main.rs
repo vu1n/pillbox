@@ -284,6 +284,10 @@ enum Command {
         /// e.g. `zai-coding-plan/glm-4.5-air`. Ignored by PTY agents.
         #[arg(long, value_name = "PROVIDER/MODEL")]
         model: Option<String>,
+        /// Extra host to allow through the libkrun egress fence (repeatable),
+        /// for a custom/self-hosted model endpoint beyond the built-in set.
+        #[arg(long = "egress-allow", value_name = "HOST")]
+        egress_allow: Vec<String>,
         /// Args forwarded to the agent CLI inside the sandbox.
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
@@ -540,6 +544,7 @@ fn run(cli: Cli) -> Result<()> {
             parent,
             from_bookmark,
             model,
+            egress_allow,
             args,
         } => {
             let resolved = Pillbox::resolve(pillbox_arg)?;
@@ -630,6 +635,7 @@ fn run(cli: Cli) -> Result<()> {
                     ttl_seconds,
                     from_bookmark,
                     model,
+                    egress_allow,
                 },
             )
         }

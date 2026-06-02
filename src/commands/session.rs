@@ -558,17 +558,13 @@ fn session_send(resolved: &Pillbox, id: &str, text: &str) -> Result<()> {
     // API, not a pty-relay: `session send` = a structured prompt, not keystrokes.
     if s.integration() == Integration::Server {
         let http = opencode_http(resolved, &s)?;
-        let ocid = s.agent_session_id.as_deref().ok_or_else(|| {
+        let server = s.server.as_ref().ok_or_else(|| {
             PillboxError::config(
                 "session send",
-                format!("session `{}` has no opencode session id", s.id),
+                format!("session `{}` has no opencode server state", s.id),
             )
         })?;
-        let model = s
-            .model
-            .as_deref()
-            .unwrap_or(sandbox::opencode::DEFAULT_MODEL);
-        sandbox::opencode::send_prompt(&*http, ocid, text, model)?;
+        sandbox::opencode::send_prompt(&*http, &server.agent_session_id, text, &server.model)?;
         eprintln!("pillbox: sent prompt to opencode session `{}`", s.id);
         return Ok(());
     }

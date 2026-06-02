@@ -117,6 +117,34 @@ pub(crate) fn send_prompt(
     }
 }
 
+/// Report a freshly-started server session — `--json` (for orchestrators to
+/// capture the id) or the human banner with the watch/send next-steps. Shared by
+/// every backend's `run_server` (the bring-up is identical; only the sandbox
+/// lifecycle around it differs). Reads the model from the record's server state.
+pub(crate) fn print_started(session: &crate::session::Session, json: bool, prompt_sent: bool) {
+    if json {
+        println!(
+            "{}",
+            crate::paths::json_v1(vec![("session", session.to_json_value())])
+        );
+        return;
+    }
+    let model = session
+        .server
+        .as_ref()
+        .map(|s| s.model.as_str())
+        .unwrap_or("?");
+    println!(
+        "pillbox: ✓ opencode session `{}` started ({model}).",
+        session.id
+    );
+    if prompt_sent {
+        println!("         (sent your prompt; watch for the reply)");
+    }
+    println!("         pillbox session watch {}    # read the stream", session.id);
+    println!("         pillbox session send {} \"…\"  # drive it", session.id);
+}
+
 /// Stream the server's `/event` SSE into the durable [`SessionLog`] — the
 /// `Server`-mode analog of the transcript tailer. The transport's `/event`
 /// stream feeds [`drain_sse`] on a thread; the returned handle stops the stream

@@ -426,6 +426,16 @@ pub(crate) struct RunOpts {
     /// the session and reused by every `session send`. `None` → a default.
     /// Ignored by PTY agents (they pick their own model interactively).
     pub(crate) model: Option<String>,
+    /// `--egress-allow HOST` (repeatable) — extra hosts to allow through the
+    /// libkrun egress fence beyond the built-in set (the vault-intercepted
+    /// providers + the standard model-provider profile). The invoker's escape
+    /// hatch for a custom / self-hosted model endpoint; the MITM terminates +
+    /// forwards them (empty swap). Invoker-set, so an untrusted workspace can't
+    /// widen its own egress. No effect on the docker backends (unfenced).
+    // Read only under the `libkrun` feature (the only backend with an egress
+    // fence); unused on a default build.
+    #[allow(dead_code)]
+    pub(crate) egress_allow: Vec<String>,
 }
 
 #[allow(dead_code)]
@@ -638,6 +648,7 @@ mod tests {
             ttl_seconds: None,
             from_bookmark: None,
             model: None,
+            egress_allow: Vec::new(),
         }
     }
 

@@ -241,17 +241,24 @@ pub(crate) struct Session {
     /// predate the field or remote backends whose transcript is sandbox-side.
     #[serde(default)]
     pub(crate) guest_cwd: String,
-    /// For a `Server`-integration agent (opencode), the agent-native session id
-    /// its HTTP API uses (`ses_…`), distinct from this record's pillbox id. The
-    /// drive (`session send` → POST `/prompt_async`) and the event bridge target
-    /// it. `None` for PTY agents.
+    /// Server-integration (opencode) state — `Some` iff the agent is a `Server`
+    /// integration, `None` for PTY agents (claude/codex). Grouped so a PTY record
+    /// can't carry a half-populated `(agent_session_id, model)` tail.
     #[serde(default)]
-    pub(crate) agent_session_id: Option<String>,
-    /// For a `Server`-integration agent, the `providerID/modelID` to drive with
-    /// (resolved from `--model` or a default at run time, reused by every
-    /// `session send`). `None` for PTY agents.
-    #[serde(default)]
-    pub(crate) model: Option<String>,
+    pub(crate) server: Option<ServerSession>,
+}
+
+/// The agent-native state a `Server`-integration agent (opencode) needs to be
+/// driven/read over its HTTP API — both fields are always set together.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ServerSession {
+    /// The agent-native session id its HTTP API uses (`ses_…`), distinct from
+    /// this record's pillbox id. `session send` (→ POST `/prompt_async`) and the
+    /// event bridge target it.
+    pub(crate) agent_session_id: String,
+    /// The `providerID/modelID` to drive with (resolved from `--model` or a
+    /// default at run time, reused by every `session send`).
+    pub(crate) model: String,
 }
 
 impl Session {
@@ -293,8 +300,7 @@ impl Session {
             result_snapshot: None,
             expires_at: None,
             guest_cwd: String::new(),
-            agent_session_id: None,
-            model: None,
+            server: None,
         }
     }
 
@@ -387,8 +393,7 @@ impl Session {
             result_snapshot: None,
             expires_at: None,
             guest_cwd: String::new(),
-            agent_session_id: None,
-            model: None,
+            server: None,
         }
     }
 }

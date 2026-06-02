@@ -437,10 +437,12 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
         }),
         egress: Some(EgressSpec {
             // The vault providers' full intercept set (API + OAuth/platform hosts)
-            // — so the agent can reach its provider *and* refresh a token.
+            // — so the agent can reach its provider *and* refresh a token — plus
+            // any invoker-declared `--egress-allow` hosts (forwarded, no swap).
             allowlist: crate::vault::providers::intercepted_hosts()
                 .into_iter()
                 .map(str::to_string)
+                .chain(opts.egress_allow.iter().cloned())
                 .collect(),
             log_path: std::env::var("PILLBOX_KRUN_EGRESS_LOG").ok(),
             ca_dir: Some(vault_ca_dir.to_string_lossy().into_owned()),
@@ -522,8 +524,7 @@ fn run_detached(
         result_snapshot: None,
         expires_at: opts.ttl_seconds.map(crate::session::expires_at_from_ttl),
         guest_cwd: launch.guest_workspace,
-        agent_session_id: None,
-        model: None,
+        server: None,
     };
     crate::session::write(resolved, &session)?;
     // Don't wait: the child (VM + egress + MITM, with the vault) is reparented to
@@ -666,6 +667,7 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
                 .into_iter()
                 .chain(egress::standard_egress_hosts().iter().copied())
                 .map(str::to_string)
+                .chain(opts.egress_allow.iter().cloned())
                 .collect(),
             log_path: std::env::var("PILLBOX_KRUN_EGRESS_LOG").ok(),
             ca_dir: Some(vault_ca_dir.to_string_lossy().into_owned()),
@@ -733,8 +735,10 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
             result_snapshot: None,
             expires_at: opts.ttl_seconds.map(crate::session::expires_at_from_ttl),
             guest_cwd: guest_workspace.clone(),
-            agent_session_id: Some(ocid.clone()),
-            model: Some(model.clone()),
+            server: Some(crate::session::ServerSession {
+                agent_session_id: ocid.clone(),
+                model: model.clone(),
+            }),
         };
         crate::session::write(resolved, &session)?;
         crate::events::emit_session_event(
@@ -764,22 +768,7 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
         }
     };
 
-    if opts.json {
-        println!(
-            "{}",
-            crate::paths::json_v1(vec![("session", session.to_json_value())])
-        );
-    } else {
-        println!(
-            "pillbox: ✓ opencode session `{}` started in a microVM ({}).",
-            session.id, model
-        );
-        if !prompt.is_empty() {
-            println!("         (sent your prompt; watch for the reply)");
-        }
-        println!("         pillbox session watch {}    # read the stream", session.id);
-        println!("         pillbox session send {} \"…\"  # drive it", session.id);
-    }
+    opencode::print_started(&session, opts.json, !prompt.is_empty());
     Ok(())
 }
 

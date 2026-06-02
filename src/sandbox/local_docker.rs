@@ -253,8 +253,7 @@ impl SandboxBackend for LocalDocker {
                 result_snapshot: None,
                 expires_at: opts.ttl_seconds.map(session::expires_at_from_ttl),
                 guest_cwd: guest_cwd.clone(),
-                agent_session_id: None,
-                model: None,
+                server: None,
             };
             session::write(resolved, &session)?;
             crate::events::emit_session_event(
@@ -440,8 +439,10 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
             result_snapshot: None,
             expires_at: opts.ttl_seconds.map(session::expires_at_from_ttl),
             guest_cwd: guest_workspace.clone(),
-            agent_session_id: Some(ocid.clone()),
-            model: Some(model.clone()),
+            server: Some(session::ServerSession {
+                agent_session_id: ocid.clone(),
+                model: model.clone(),
+            }),
         };
         session::write(resolved, &session)?;
         crate::events::emit_session_event(
@@ -465,28 +466,7 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
         }
     };
 
-    if opts.json {
-        println!(
-            "{}",
-            crate::paths::json_v1(vec![("session", session.to_json_value())])
-        );
-    } else {
-        println!(
-            "pillbox: ✓ opencode session `{}` started ({}).",
-            session.id, model
-        );
-        if !prompt.is_empty() {
-            println!("         (sent your prompt; watch for the reply)");
-        }
-        println!(
-            "         pillbox session watch {}    # read the stream",
-            session.id
-        );
-        println!(
-            "         pillbox session send {} \"…\"  # drive it",
-            session.id
-        );
-    }
+    super::opencode::print_started(&session, opts.json, !prompt.is_empty());
     Ok(())
 }
 

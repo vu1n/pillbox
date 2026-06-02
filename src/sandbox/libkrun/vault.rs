@@ -94,14 +94,20 @@ impl Vault {
 
     /// Open a forward connection to the real `host` (port 443): resolve host-side,
     /// connect (bounded), and start a rustls client validating the real cert. The
-    /// socket is non-blocking so the egress poll loop can drive it in-thread.
+    /// socket is non-blocking so the egress poll loop can drive the *I/O* in-thread.
+    ///
+    /// **Limitation:** the resolve + `connect_timeout` here are *blocking* and run
+    /// on the egress poll-loop thread, so a slow/hung upstream stalls the guest's
+    /// whole stack (DNS + other connections) for up to the timeout. Bounded short
+    /// to cap that; the proper fix (a threaded/non-blocking connect with a pending
+    /// state on `Conn`) is a follow-up — the providers connect in ms in practice.
     pub(super) fn connect_upstream(&self, host: &str) -> Result<Upstream> {
         let addr = (host, 443u16)
             .to_socket_addrs()
             .with_context(|| format!("resolve {host}"))?
             .next()
             .ok_or_else(|| anyhow!("no address for {host}"))?;
-        let sock = TcpStream::connect_timeout(&addr, StdDuration::from_secs(10))
+        let sock = TcpStream::connect_timeout(&addr, StdDuration::from_secs(5))
             .with_context(|| format!("connect {host}"))?;
         sock.set_nonblocking(true).context("set upstream non-blocking")?;
         let server_name = ServerName::try_from(host.to_string())

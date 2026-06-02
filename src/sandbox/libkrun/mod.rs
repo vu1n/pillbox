@@ -361,21 +361,24 @@ impl SandboxBackend for LibkrunBackend {
         }
 
         // Poll the listener until the guest pty-host dials in (across VM boot),
-        // then run the shared terminal pump. Reaps the VM on return.
-        let stream = accept_attach(&listener, &mut child)?;
-        let write_half = stream.try_clone().context("clone attach stream")?;
-        let outcome = pump::attach_terminal(stream, write_half, false)?;
+        // then run the shared terminal pump. Capture the result rather than `?`
+        // so teardown below runs on every path (a failed accept/pump must not
+        // leak the CoW clones).
+        let outcome = accept_attach(&listener, &mut child).and_then(|stream| {
+            let write_half = stream.try_clone().context("clone attach stream")?;
+            pump::attach_terminal(stream, write_half, false)
+        });
         let _ = child.wait();
         // Final drain of the agent's last transcript lines into the SessionLog.
         if let Some(tailer) = tailer {
             tailer.shutdown();
         }
-        // Cleanup (before any exit-code propagation below). The §0 events are
-        // persisted in the SessionLog, so the CoW clones can go.
+        // Teardown on every path (the §0 events are persisted in the SessionLog,
+        // so the CoW clones can go). Runs before the exit-code propagation below.
         let _ = std::fs::remove_file(&attach_sock);
         let _ = std::fs::remove_dir_all(&creds_share);
         let _ = std::fs::remove_dir_all(&clone);
-        match outcome {
+        match outcome? {
             pump::Outcome::Exited(code) if code != 0 => std::process::exit(code),
             _ => Ok(()),
         }
@@ -632,11 +635,17 @@ fn stub_oauth_creds(home: &Path, sentinel: &str) -> Result<(PathBuf, Vec<SwapPai
 
 /// A unique stub shaped like `real` so a format check passes. **Keeps only the
 /// fixed type prefix** — the first 3 hyphen segments (e.g. `sk-ant-oat01`) — and
-/// drops the rest: the token body is the secret and must NOT leak into the stub
-/// (which lands in the guest's creds). High-entropy uuid suffix so the byte-level
-/// swap never false-matches on other content.
+/// only when the token clearly has a body *beyond* that prefix (≥4 segments, the
+/// Anthropic `sk-ant-oat01-<body>` shape). The body is the secret and must NEVER
+/// leak into the stub (which lands in the guest's creds), so a short/odd token
+/// (<4 segments) gets a fully synthetic prefix instead. High-entropy uuid suffix
+/// so the byte-level swap never false-matches on other content.
 fn mint_stub(real: &str) -> String {
-    let prefix = real.splitn(4, '-').take(3).collect::<Vec<_>>().join("-");
+    let prefix = if real.split('-').count() >= 4 {
+        real.splitn(4, '-').take(3).collect::<Vec<_>>().join("-")
+    } else {
+        "pllbx".to_string()
+    };
     format!("{prefix}-pllbxstub{}", uuid::Uuid::now_v7().simple())
 }
 
@@ -739,5 +748,16 @@ mod tests {
         assert_ne!(stub, real);
         // Distinct each call (uuid suffix).
         assert_ne!(mint_stub(real), stub);
+    }
+
+    #[test]
+    fn mint_stub_does_not_leak_short_or_odd_tokens() {
+        // A token with <4 hyphen segments has no clear type/body split, so the
+        // prefix must be synthetic — never any of the real bytes.
+        for real in ["sk-secret", "justonesecretword", "sk-ant-secretbody"] {
+            let stub = mint_stub(real);
+            assert!(stub.starts_with("pllbx-pllbxstub"), "short token leaked shape: {stub}");
+            assert!(!stub.contains("secret"), "short token leaked body: {stub}");
+        }
     }
 }

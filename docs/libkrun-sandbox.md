@@ -569,7 +569,19 @@ Docker untouched until step 8. Slices (each its own commit, default build green)
     (`pillbox-runner:l5a`): claude pinned `api.anthropic.com`; `platform.claude.com`
     / `downloads.claude.ai` / datadog all fenced. Host-side diagnostics → a file
     (libkrun eats the child's stderr; see the L5 phase notes below).
-  - **L5 §0 + vault-v2 + egress** — a *phase*, sub-sliced. **Architecture:** the
+  - **L5 §0 + vault-v2 + egress** — a *phase*, sub-sliced. **STATUS: CLOSED** —
+    substrate + security (env-fork) + observability (§0) all landed + live-verified
+    (a real agent runs in the microVM with default-deny egress, owned TLS MITM, and
+    its credential never in the guest). Reviewed (thermo-nuclear/simplify/code-review)
+    + hardened: `mint_stub` body-leak guard, teardown-on-every-path, connect bound.
+    **Deferred to a future consolidation/L6 pass:** (a) extract `run()` into
+    build-vmspec + supervise; (b) split the L7 TLS pump out of `egress.rs` into a
+    `mitm.rs` (the L3 stack vs L7 MITM seam); (c) threaded/non-blocking upstream
+    connect (today's blocking `connect_timeout` stalls the poll loop on a hung
+    upstream — bounded to 5s); (d) response-side real→stub for mid-run token refresh
+    (AnthropicProvider's bidirectional OAuth); (e) the `--with --vault` API-key path
+    (same `StubSwap`); (f) codex `*.chatgpt.com` wildcard in the DNS fence; (g)
+    foreground session records (the sessions-organization polish). **Architecture:** the
     smoltcp egress stack runs in the **VMM child** (a thread alongside
     `start_enter`, netspike's shape), not the parent — `start_enter` is in the
     child. On macOS/HVF libkrun's default **TSI does not carry egress** (the L3

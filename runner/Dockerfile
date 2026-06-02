@@ -11,7 +11,9 @@
 # System tooling chosen to cover the agents' subagent + shell needs:
 # bubblewrap (codex/claude subagent sandboxing), git/gh (vcs ops),
 # ripgrep (search), tmux (multi-pane TUI), jq (json scripting),
-# python3 (script runner), openssl (vault CA verification),
+# python3 + pip/venv (script runner; grader test-deps via `session score
+# --grader-egress` — bookworm pip is PEP-668 externally-managed, so graders
+# use a venv), openssl (vault CA verification),
 # curl/ca-certificates (pulls + TLS).
 #
 # Contract assumed by pillbox CLI:
@@ -68,6 +70,8 @@ RUN apt-get update \
 		jq \
 		openssl \
 		python3 \
+		python3-pip \
+		python3-venv \
 		ripgrep \
 		tmux \
 		xz-utils \

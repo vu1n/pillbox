@@ -23,7 +23,7 @@ recorded as a verifiable `scored` §0 event). `run-ab.sh` tabulates pass rates.
 ```sh
 # build + sign the libkrun binary first (see docs/libkrun-sandbox.md), then
 # populate tasks/ from a benchmark and A/B it:
-python3 scripts/eval/import-humaneval.py --limit 20
+python3 scripts/eval/import-aider-polyglot.py --limit 20   # recommended set
 PILLBOX_RUNNER_IMAGE=pillbox-runner:l7 scripts/eval/run-ab.sh 5
 ```
 
@@ -42,18 +42,25 @@ no signal).
 
 ## Populating tasks from a benchmark
 
-`import-humaneval.py` pulls HumanEval into the layout above (one dir per problem,
-hidden grader). Generated `tasks/he_*` / `tasks/ap_*` are gitignored — regenerate
-them, don't commit them.
+Two importers emit the layout above (one dir per problem, hidden grader).
+Generated `tasks/he_*` / `tasks/ap_*` + the `.cache/` clone are gitignored —
+regenerate them, don't commit.
 
-⚠️ **Benchmark choice drives signal.** HumanEval is heavily contaminated (models
-memorized it) and its tests are weak — fine for proving the harness *runs* an
-A/B, but the baseline is inflated so memory has little room to help. For a
-trustworthy signal graduate to a less-contaminated, agentic set: **Aider
-polyglot** (Exercism problems, `unittest`-graded, host-runnable — the next
-importer) or, with a sandboxed grader + a capable model, **SWE-rebench /
-SWE-bench-CL** (the continual-learning bench — the closest analog to the memory
-loop). The dir layout is identical; only the importer swaps.
+- **`import-aider-polyglot.py`** (recommended) — the Aider polyglot **Python**
+  track (Exercism problems, `unittest`-graded on the host via `python3 -m
+  unittest discover`). Less contaminated + more agentic than HumanEval, and
+  non-trivial (`beer_song` baseline fails GLM — room for memory to help). Clones
+  Aider-AI/polyglot-benchmark to `.cache/` on first run.
+- **`import-humaneval.py`** — HumanEval (function-completion, the problem's own
+  `check()` as grader). Easiest to fetch, but ⚠️ **heavily contaminated** + weak
+  tests → the baseline is inflated, so memory has little room to move it. Use it
+  to prove the harness *runs*, not for a trustworthy signal.
+
+For the rigorous run — **SWE-rebench / SWE-bench-CL** (the continual-learning
+bench, the closest analog to the memory loop) — you need a **sandboxed grader**
+(those tasks grade inside a per-task env; `session score` runs host-side today)
++ a capable model (GLM-4.5-air floors them). The dir layout is identical; only
+the importer + the grader location change.
 
 ## Status / findings (2026-06-02)
 

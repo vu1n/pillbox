@@ -813,9 +813,22 @@ Docker untouched until step 8. Slices (each its own commit, default build green)
      start. (Auto-send was a PTY-readiness workaround; opencode's `/doc` makes it
      moot — and it was the source of the first-turn-not-captured gap.) A passed
      prompt pre-fills the send hint.
+   - ✅ **complete, gateway-free §0** (`ef758a5`). The trace log is the substrate
+     the **meta-harness** (DSPy/GEPA/RLM) consumes, so it must be complete *and*
+     captured with no daemon. The live `/event` bridge only captured while
+     watched; fixed to the PTY-agent shape — the libkrun guest appends raw `/event`
+     SSE to a persistent file in the shared/CoW home (`EVENTS_FILE`), and the host
+     drains it on `watch`/`subscribe` via a `FollowReader` (blocks at EOF, `tail
+     -F`) + the existing `drain_sse` (replay + follow). A late watcher gets the
+     full history; nothing outlives `run`. Gotcha: a long-lived `curl -sN` holds
+     the file open so virtio-fs never flushes — re-open per line (`read | printf >>
+     file`) forces it. **Verified:** a turn sent *unwatched* was fully captured +
+     replayed to a late watcher. (docker, deprecated, keeps the live bridge.)
    - **opencode is now first-class alongside claude/codex** on both docker and
-     libkrun: run (→ ready) / drive (`session send`) / read (`watch`/`subscribe`) /
-     teardown, any model provider via the standard profile + `--egress-allow`.
+     libkrun: run (→ ready) / drive (`session send`) / read (`watch`/`subscribe`,
+     complete capture) / teardown, any model provider via the standard profile +
+     `--egress-allow`. This closes substrate primitive #1 (complete persisted
+     traces) — the meta-harness's next gate is the **verifiable reward channel**.
 8. **Deprecate Docker** — remove the docker/remote backends once libkrun is at parity.
 
 ## Dependencies

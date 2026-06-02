@@ -515,7 +515,11 @@ fn session_send(resolved: &Pillbox, id: &str, text: &str) -> Result<()> {
     // API, not a pty-relay: `session send` = a structured prompt, not keystrokes.
     if s.integration() == Integration::Server {
         let endpoint = opencode_endpoint(resolved, &s)?;
-        let exec = sandbox::exec::DockerExec::new(endpoint, s.sandbox_id.clone());
+        let http = sandbox::http::DockerHttp::new(
+            endpoint,
+            s.sandbox_id.clone(),
+            sandbox::opencode::SERVE_PORT,
+        );
         let ocid = s.agent_session_id.as_deref().ok_or_else(|| {
             PillboxError::config(
                 "session send",
@@ -526,7 +530,7 @@ fn session_send(resolved: &Pillbox, id: &str, text: &str) -> Result<()> {
             .model
             .as_deref()
             .unwrap_or(sandbox::opencode::DEFAULT_MODEL);
-        sandbox::opencode::send_prompt(&exec, ocid, text, model)?;
+        sandbox::opencode::send_prompt(&http, ocid, text, model)?;
         eprintln!("pillbox: sent prompt to opencode session `{}`", s.id);
         return Ok(());
     }
@@ -580,9 +584,13 @@ fn resolve_streaming_session(
         if s.integration() == Integration::Server {
             let tailer = match opencode_endpoint(resolved, &s) {
                 Ok(endpoint) => {
-                    let exec = sandbox::exec::DockerExec::new(endpoint, s.sandbox_id.clone());
+                    let http = sandbox::http::DockerHttp::new(
+                        endpoint,
+                        s.sandbox_id.clone(),
+                        sandbox::opencode::SERVE_PORT,
+                    );
                     let log = crate::events::log::SessionLog::open(resolved, &s.id)?;
-                    sandbox::opencode::spawn_event_bridge(&exec, &s.id, log)
+                    sandbox::opencode::spawn_event_bridge(&http, &s.id, log)
                 }
                 Err(e) => {
                     eprintln!(

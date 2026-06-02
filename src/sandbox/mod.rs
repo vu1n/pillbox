@@ -18,7 +18,7 @@
 //!   hand-edited scheme falls through to SSH.
 
 pub(crate) mod container;
-pub(crate) mod exec;
+pub(crate) mod http;
 #[cfg(feature = "libkrun")]
 pub(crate) mod libkrun;
 pub(crate) mod local_docker;

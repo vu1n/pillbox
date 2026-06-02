@@ -306,6 +306,26 @@ struct Launch {
     guest_workspace: String,
 }
 
+/// The guest entrypoint preamble shared by every libkrun launch (PTY agents and
+/// the opencode server): bring the NIC up, install the vault CA, mount the creds
+/// and workspace virtio-fs shares, and `cd` into the workspace. The caller
+/// appends its own exec. `home_q`/`gw_q` are pre-[`shell_quote`]d (a workspace
+/// name may contain a space). The CA travels as single-line base64 decoded
+/// in-guest — a raw multi-line PEM in the exec argv trips libkrun's cmdline
+/// encoder (`InvalidAscii` on the newlines).
+fn guest_launch_preamble(ca_cert_pem: &str, home_q: &str, gw_q: &str) -> String {
+    let net = egress::guest_net_commands();
+    let ca_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, ca_cert_pem);
+    format!(
+        "set -e; {net}; \
+         printf '%s' {ca_b64q} | base64 -d > {GUEST_CA_PATH}; \
+         update-ca-certificates >/dev/null 2>&1 || true; \
+         mkdir -p {home_q}; mount -t virtiofs creds {home_q}; \
+         mkdir -p {gw_q}; mount -t virtiofs workspace {gw_q}; cd {gw_q}",
+        ca_b64q = shell_quote(&ca_b64),
+    )
+}
+
 /// Build everything needed to boot the microVM: materialize the rootfs, CoW +
 /// secret-scrub the workspace, compose the guest env, ensure + trust the vault CA,
 /// stub the agent's creds (the env-fork), assemble the guest entrypoint, and write
@@ -383,21 +403,12 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
     let home_q = shell_quote(GUEST_HOME);
     let gw_q = shell_quote(&guest_workspace);
     let agent = agent_argv.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
-    let net = egress::guest_net_commands();
-    // base64 the PEM: a raw multi-line cert in the exec argv trips libkrun's cmdline
-    // encoder (`InvalidAscii` on the newlines). Single-line b64 → decode in-guest.
-    let ca_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &ca_cert_pem);
-    let ca_setup = format!(
-        "printf '%s' {b64} | base64 -d > {GUEST_CA_PATH}; \
-         update-ca-certificates >/dev/null 2>&1 || true",
-        b64 = shell_quote(&ca_b64),
-    );
+    let preamble = guest_launch_preamble(&ca_cert_pem, &home_q, &gw_q);
     // Detach: the guest pty-host *listens* (so the attach socket persists for
     // reattach after the parent returns); foreground: it dials the parent.
     let vsock_flag = if opts.detach { " --vsock-listen" } else { "" };
     let script = format!(
-        "set -e; {net}; {ca_setup}; mkdir -p {home_q}; mount -t virtiofs creds {home_q}; \
-         mkdir -p {gw_q}; mount -t virtiofs workspace {gw_q}; cd {gw_q}; \
+        "{preamble}; \
          exec pillbox pty-host --vsock-port {ATTACH_PORT}{vsock_flag} -- {agent}",
     );
 
@@ -534,23 +545,18 @@ fn run_detached(
     Ok(())
 }
 
-/// Run a `Server`-integration agent (opencode) in a microVM: boot the VM
-/// running `opencode serve` + a vsock port-forward relay, then drive/read it
-/// over its HTTP API through that forward. The VM is detached (the server
-/// outlives the CLI, reaped by `session rm`) — `run` returns after creating the
-/// opencode session + sending the prompt, like the docker server path.
+/// Run a `Server`-integration agent (opencode) in a microVM: boot the VM running
+/// `opencode serve` + a vsock port-forward relay, then drive/read it over its
+/// HTTP API through that forward. The VM is detached (the server outlives the
+/// CLI, reaped by `session rm`); `run` returns once the opencode session exists
+/// — it does NOT auto-send (see [`opencode::print_started`]).
 ///
-/// Differences from the PTY path ([`prepare_launch`]): the creds clone is *not*
-/// stubbed (opencode is non-vault — its real key must reach the provider; the
-/// MITM still terminates+forwards the allowlisted hosts, with an empty swap
-/// set), the guest entrypoint is `opencode serve` + `pillbox vsock-forward`
-/// (not `pty-host`), and the vsock port carries HTTP, not the attach protocol.
-///
-/// NOTE (deliberate duplication): this shares ~30 lines of launch scaffolding
-/// with `prepare_launch` (rootfs / workspace clone / env / CA / NIC / VmSpec).
-/// Server mode is a genuinely different launch (creds, script, bring-up), so a
-/// branch-laden shared builder would be worse; extract a shared prep helper once
-/// both paths are stable (same call the L3 dedup note made).
+/// Differs from the PTY path ([`prepare_launch`]) at the inline-commented sites:
+/// creds cloned *unstubbed* (opencode is non-vault), entrypoint is `opencode
+/// serve` + the forward relay (not `pty-host`), vsock carries HTTP. Shares the
+/// launch preamble via [`guest_launch_preamble`]; the rest stays per-backend (a
+/// branch-laden shared builder would be worse) — factor further only once both
+/// paths are stable.
 fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
     use crate::sandbox::opencode;
 
@@ -618,13 +624,7 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
         .map(|a| shell_quote(a))
         .collect::<Vec<_>>()
         .join(" ");
-    let net = egress::guest_net_commands();
-    let ca_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &ca_cert_pem);
-    let ca_setup = format!(
-        "printf '%s' {b64} | base64 -d > {GUEST_CA_PATH}; \
-         update-ca-certificates >/dev/null 2>&1 || true",
-        b64 = shell_quote(&ca_b64),
-    );
+    let preamble = guest_launch_preamble(&ca_cert_pem, &home_q, &gw_q);
     // §0 producer: a co-located, persistent `/event` capture (raw SSE → a file
     // in the shared/CoW home, so it persists + is host-readable). The host drains
     // this file on watch/subscribe (replay + follow) — complete capture, no host
@@ -635,8 +635,7 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
     // loop reconnects if the stream drops.
     let events_q = shell_quote(&format!("{GUEST_HOME}/{}", opencode::EVENTS_FILE));
     let script = format!(
-        "set -e; {net}; {ca_setup}; mkdir -p {home_q}; mount -t virtiofs creds {home_q}; \
-         mkdir -p {gw_q}; mount -t virtiofs workspace {gw_q}; cd {gw_q}; \
+        "{preamble}; \
          {serve} & \
          ( while :; do curl -sN http://127.0.0.1:{port}/event 2>/dev/null \
              | while IFS= read -r l; do printf '%s\\n' \"$l\" >> {events_q}; done; \

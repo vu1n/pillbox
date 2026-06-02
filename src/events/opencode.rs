@@ -300,16 +300,16 @@ fn flush_frame(
 /// Returns `Ok(0)` (real EOF → ends the drain) only once `stop` is set, so the
 /// owning [`TailerHandle`](crate::events::transcripts::TailerHandle) shuts it
 /// down within one poll interval. Reading a file being appended is safe: at EOF
-/// the offset holds, and a later read returns bytes written past it.
-// Used by the libkrun file-based §0 path; docker §0 still uses the live bridge.
-#[allow(dead_code)]
+/// the offset holds, and a later read returns bytes written past it. (Consumed
+/// by the libkrun file path; docker §0 still uses the live bridge.)
+#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) struct FollowReader {
     file: std::fs::File,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl FollowReader {
-    #[allow(dead_code)] // libkrun-only consumer (see the struct)
+    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) fn new(
         file: std::fs::File,
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,

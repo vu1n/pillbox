@@ -44,9 +44,9 @@ pub(crate) const DEFAULT_MODEL: &str = "zai-coding-plan/glm-4.5-air";
 /// persists + is host-readable, so the host drains it (replay + follow) on
 /// `watch`/`subscribe` and captures completely even for a late reader — the same
 /// file-transcript shape claude/codex use, no always-on host process. See
-/// [`crate::events::opencode::FollowReader`].
-// Used by the libkrun file-based §0 path; docker §0 still uses the live bridge.
-#[allow(dead_code)]
+/// [`crate::events::opencode::FollowReader`]. (Consumed by the libkrun file
+/// path; docker §0 still uses the live bridge.)
+#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) const EVENTS_FILE: &str = ".pillbox-opencode-events.sse";
 
 /// The in-sandbox command: a headless opencode server bound to localhost.

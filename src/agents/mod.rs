@@ -432,9 +432,7 @@ pub(crate) struct RunOpts {
     /// hatch for a custom / self-hosted model endpoint; the MITM terminates +
     /// forwards them (empty swap). Invoker-set, so an untrusted workspace can't
     /// widen its own egress. No effect on the docker backends (unfenced).
-    // Read only under the `libkrun` feature (the only backend with an egress
-    // fence); unused on a default build.
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))] // libkrun-only consumer
     pub(crate) egress_allow: Vec<String>,
 }
 

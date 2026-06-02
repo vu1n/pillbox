@@ -105,13 +105,9 @@ fn libkrun_opencode_file_tailer(
             eprintln!("pillbox: warning: opencode events drain stopped: {e:#}");
         }
     });
-    // The shared `stop` flag terminates the FollowReader (→ drain ends); the
-    // stopper is a no-op (no child/socket to kill).
-    Some(events::transcripts::TailerHandle::from_stopper(
-        stop,
-        Box::new(|| {}),
-        join,
-    ))
+    // The shared `stop` flag terminates the FollowReader (→ the drain ends), so
+    // there's nothing to tear down beyond flipping it.
+    Some(events::transcripts::TailerHandle::from_flag(stop, join))
 }
 #[cfg(not(feature = "libkrun"))]
 fn libkrun_opencode_file_tailer(

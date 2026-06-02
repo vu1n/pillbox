@@ -94,6 +94,20 @@ impl TailerHandle {
         }
     }
 
+    /// Wrap a tailer thread whose reader **self-terminates on the shared `stop`
+    /// flag** (a poll-based follow reader, e.g. the libkrun opencode `/event`
+    /// file drain) — there's no transport to tear down, so stop-and-join just
+    /// flips the flag and joins. Truer than handing [`from_stopper`](Self::from_stopper)
+    /// a no-op closure.
+    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))] // only the libkrun file-drain uses it
+    pub(crate) fn from_flag(stop: Arc<AtomicBool>, join: JoinHandle<()>) -> Self {
+        Self {
+            stop,
+            stopper: None,
+            join: Some(join),
+        }
+    }
+
     pub(crate) fn shutdown(self) {
         // Drop does the work; this just names the intent + forces it here.
     }

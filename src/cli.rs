@@ -392,6 +392,12 @@ pub(crate) enum SessionAction {
         /// session whose result is already on disk.
         #[arg(long, value_name = "DIR")]
         workspace: Option<PathBuf>,
+        /// Run the grader inside a one-shot microVM (the runner image's
+        /// toolchain) against the workspace, instead of on the host — for real
+        /// repos whose tests need the image's deps. Requires the `libkrun`
+        /// feature. The grader-VM is offline (no network) + secret-free.
+        #[arg(long = "in-sandbox")]
+        in_sandbox: bool,
     },
     /// Tear down every session whose `expires_at` is in the past.
     /// Drives `session rm` for each — sandbox killed, record deleted.

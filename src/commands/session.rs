@@ -104,6 +104,28 @@ fn libkrun_opencode_file_tailer(
     None
 }
 
+/// Run a grader in a one-shot microVM (`session score --in-sandbox`); feature-gated.
+#[cfg(feature = "libkrun")]
+fn libkrun_score_in_sandbox(
+    resolved: &Pillbox,
+    workspace: &std::path::Path,
+    cmd: &str,
+) -> Result<(i32, String)> {
+    sandbox::libkrun::score_in_sandbox(resolved, workspace, cmd)
+}
+#[cfg(not(feature = "libkrun"))]
+fn libkrun_score_in_sandbox(
+    _resolved: &Pillbox,
+    _workspace: &std::path::Path,
+    _cmd: &str,
+) -> Result<(i32, String)> {
+    Err(PillboxError::usage(
+        "session score",
+        "--in-sandbox requires the libkrun feature (host grading: drop --in-sandbox)",
+    )
+    .into())
+}
+
 pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> {
     match action {
         SessionAction::List { json } => session_list(resolved, json),
@@ -141,12 +163,14 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> 
             cmd,
             snapshot,
             workspace,
+            in_sandbox,
         } => session_score(
             resolved,
             &id,
             &cmd,
             snapshot.as_deref(),
             workspace.as_deref(),
+            in_sandbox,
         ),
         SessionAction::Prune { dry_run } => session_prune(resolved, dry_run),
         SessionAction::Transcript {
@@ -887,6 +911,7 @@ fn session_score(
     cmd: &str,
     snapshot: Option<&str>,
     workspace: Option<&std::path::Path>,
+    in_sandbox: bool,
 ) -> Result<()> {
     use crate::workspace::{SnapshotHandle, WorkspaceBackend};
     let session = session::resolve(resolved, id)?;
@@ -921,16 +946,27 @@ fn session_score(
     };
 
     // The grader's exit status IS the verifiable grade — we run it + record what
-    // it reports, never the agent's claim.
-    let out = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .current_dir(&grade_dir)
-        .output()
-        .map_err(|e| PillboxError::runtime("session score", format!("run grader `{cmd}`: {e}")))?;
-    let passed = out.status.success();
+    // it reports, never the agent's claim. `--in-sandbox` runs it in a one-shot
+    // microVM (the runner toolchain) instead of on the host.
+    let (code, feedback) = if in_sandbox {
+        let (c, raw) = libkrun_score_in_sandbox(resolved, &grade_dir, cmd)?;
+        (c, score_feedback(raw.as_bytes(), &[]))
+    } else {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .current_dir(&grade_dir)
+            .output()
+            .map_err(|e| {
+                PillboxError::runtime("session score", format!("run grader `{cmd}`: {e}"))
+            })?;
+        (
+            out.status.code().unwrap_or(-1),
+            score_feedback(&out.stdout, &out.stderr),
+        )
+    };
+    let passed = code == 0;
     let score = if passed { 1.0 } else { 0.0 };
-    let feedback = score_feedback(&out.stdout, &out.stderr);
 
     // Record on the durable §0 log — the source of truth the meta-harness reads.
     let mut log = crate::events::log::SessionLog::open(resolved, &session.id)?;

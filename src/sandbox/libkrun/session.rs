@@ -8,7 +8,7 @@
 //! the CoW/stub/rootfs helpers stay in [`super`] (shared with `vmm_child_main`).
 
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -667,6 +667,75 @@ pub(crate) fn opencode_events_file(
 ) -> Result<PathBuf> {
     let handle = LibkrunHandle::decode(session)?;
     Ok(PathBuf::from(handle.creds).join(crate::sandbox::opencode::EVENTS_FILE))
+}
+
+/// Run a grader command in a one-shot microVM (the same runner rootfs/toolchain
+/// the agent had) against `workspace` (the agent's edited tree, mounted), and
+/// return `(exit_code, combined_output)`. Backs `session score --in-sandbox`:
+/// real repos' tests need the image's toolchain, which host-side grading lacks.
+///
+/// The grader-VM is deliberately bare — NO vsock, NO egress (offline), NO creds:
+/// the grade must be reproducible and secret-free, and a fresh env (vs the
+/// agent's still-running VM with its ad-hoc `pip install`s) keeps the verdict
+/// honest. The grader is responsible for its own setup; deps it can't fetch
+/// (no network) must be vendored or in the image. `krun_start_enter` exits the
+/// child with the guest's code, so the child's exit IS the grader's exit, and
+/// the guest console (merged via `2>&1`) is the child's stdout.
+pub(crate) fn score_in_sandbox(
+    resolved: &Pillbox,
+    workspace: &Path,
+    cmd: &str,
+) -> Result<(i32, String)> {
+    use std::io::Read as _;
+    let rootfs = materialize_rootfs(resolved)?;
+    // Mount the workspace, cd in, run the grader with stderr merged to the
+    // console. `&&` so a failed mount/cd surfaces; the grader's exit is the last.
+    let script = format!(
+        "mkdir -p /grade && mount -t virtiofs grade /grade && cd /grade && {{ {cmd} ; }} 2>&1"
+    );
+    let vmspec = VmSpec {
+        rootfs: rootfs.to_string_lossy().into_owned(),
+        vcpus: 2,
+        ram_mib: 2048,
+        shares: vec![Share {
+            tag: "grade".into(),
+            host_path: workspace.to_string_lossy().into_owned(),
+        }],
+        exec: vec!["/bin/sh".into(), "-c".into(), script],
+        vsock: None,
+        egress: None,
+    };
+    let spec_file = tempfile::Builder::new()
+        .prefix("pillbox-grade-spec-")
+        .suffix(".json")
+        .tempfile()
+        .context("create grader VMM spec tempfile")?;
+    serde_json::to_writer(&spec_file, &vmspec).context("write grader VMM spec")?;
+
+    let exe = std::env::current_exe().context("locate the pillbox binary to re-exec as VMM")?;
+    let mut child = Command::new(&exe)
+        .arg("__krun-vmm")
+        .arg(spec_file.path())
+        // No secrets reach the grader — only a minimal guest env for the toolchain.
+        .env_clear()
+        .env("HOME", "/root")
+        .env("TERM", "xterm-256color")
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null()) // VMM diagnostics; the grade's output is the guest console (stdout)
+        .spawn()
+        .context("spawn the grader VMM subprocess")?;
+    let mut out = String::new();
+    if let Some(mut so) = child.stdout.take() {
+        so.read_to_string(&mut out).ok();
+    }
+    let code = child
+        .wait()
+        .context("await grader VMM")?
+        .code()
+        .unwrap_or(-1);
+    Ok((code, out))
 }
 
 /// Reattach to a detached libkrun session: dial the persistent attach socket

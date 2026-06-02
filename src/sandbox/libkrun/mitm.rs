@@ -11,6 +11,8 @@
 
 use std::io::{Read, Write};
 
+use std::sync::mpsc;
+
 use smoltcp::iface::{SocketHandle, SocketSet};
 use smoltcp::socket::tcp;
 
@@ -38,6 +40,9 @@ struct Conn {
     tls: rustls::ServerConnection,
     host: String,
     upstream: Option<Upstream>,
+    /// The in-flight upstream connect (spawned off the poll loop, polled each tick
+    /// until it yields the `Upstream`). `None` once connected (or before the gate).
+    connecting: Option<mpsc::Receiver<Result<Upstream, String>>>,
     /// Stub→real credential substitution applied to the guest→upstream stream.
     swap: StubSwap,
     req_logged: bool,
@@ -89,6 +94,7 @@ pub(super) fn drive_listeners(
                             tls,
                             host: String::new(),
                             upstream: None,
+                            connecting: None,
                             swap: StubSwap::new(swap_pairs.to_vec()),
                             req_logged: false,
                             closing: false,
@@ -115,7 +121,7 @@ pub(super) fn drive_listeners(
 /// rustls → smoltcp tx. Split-borrows the connection's fields so the guest and
 /// upstream sessions can be driven in the same call.
 fn drive_conn(sock: &mut tcp::Socket, c: &mut Conn, vault: &Vault, pins: &PinTable, diag: &Diag) {
-    let Conn { tls, host, upstream, swap, req_logged, closing } = c;
+    let Conn { tls, host, upstream, connecting, swap, req_logged, closing } = c;
 
     // smoltcp rx → guest rustls
     while sock.can_recv() {
@@ -155,13 +161,27 @@ fn drive_conn(sock: &mut tcp::Socket, c: &mut Conn, vault: &Vault, pins: &PinTab
         }
     }
 
-    // Open the forward connection once the gate passes (the agent gets the real
-    // upstream, validated against the Mozilla roots).
+    // Open the forward connection once the gate passes — on a background thread so
+    // the blocking resolve/connect doesn't stall the poll loop. Spawn once, then
+    // poll the receiver each tick until the upstream (validated against the Mozilla
+    // roots) is ready.
     if !host.is_empty() && upstream.is_none() && !*closing {
-        match vault.connect_upstream(host) {
-            Ok(up) => *upstream = Some(up),
-            Err(e) => {
+        if connecting.is_none() {
+            *connecting = Some(vault.spawn_connect(host.clone()));
+        }
+        match connecting.as_ref().unwrap().try_recv() {
+            Ok(Ok(up)) => {
+                *upstream = Some(up);
+                *connecting = None;
+            }
+            Ok(Err(e)) => {
                 diag.log(&format!("krun-egress: [mitm] upstream {host} failed → RST ({e})"));
+                sock.abort();
+                return;
+            }
+            Err(mpsc::TryRecvError::Empty) => {} // still connecting — poll next tick
+            Err(mpsc::TryRecvError::Disconnected) => {
+                diag.log(&format!("krun-egress: [mitm] upstream {host} connect thread died → RST"));
                 sock.abort();
                 return;
             }

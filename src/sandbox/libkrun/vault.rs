@@ -24,7 +24,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration as StdDuration;
 
 use anyhow::{anyhow, Context, Result};
@@ -92,30 +92,37 @@ impl Vault {
         ServerConnection::new(self.config.clone()).map_err(|e| anyhow!("rustls server conn: {e}"))
     }
 
-    /// Open a forward connection to the real `host` (port 443): resolve host-side,
-    /// connect (bounded), and start a rustls client validating the real cert. The
-    /// socket is non-blocking so the egress poll loop can drive the *I/O* in-thread.
-    ///
-    /// **Limitation:** the resolve + `connect_timeout` here are *blocking* and run
-    /// on the egress poll-loop thread, so a slow/hung upstream stalls the guest's
-    /// whole stack (DNS + other connections) for up to the timeout. Bounded short
-    /// to cap that; the proper fix (a threaded/non-blocking connect with a pending
-    /// state on `Conn`) is a follow-up — the providers connect in ms in practice.
-    pub(super) fn connect_upstream(&self, host: &str) -> Result<Upstream> {
-        let addr = (host, 443u16)
-            .to_socket_addrs()
-            .with_context(|| format!("resolve {host}"))?
-            .next()
-            .ok_or_else(|| anyhow!("no address for {host}"))?;
-        let sock = TcpStream::connect_timeout(&addr, StdDuration::from_secs(5))
-            .with_context(|| format!("connect {host}"))?;
-        sock.set_nonblocking(true).context("set upstream non-blocking")?;
-        let server_name = ServerName::try_from(host.to_string())
-            .with_context(|| format!("invalid upstream name {host}"))?;
-        let tls = ClientConnection::new(self.client_config.clone(), server_name)
-            .map_err(|e| anyhow!("rustls client conn: {e}"))?;
-        Ok(Upstream { sock, tls })
+    /// Connect to the real `host` on a **background thread** and return a receiver
+    /// the egress poll loop polls each tick. The resolve + `connect_timeout` are
+    /// blocking; running them off the poll-loop thread keeps a slow/hung upstream
+    /// from stalling the guest's whole stack (DNS + other connections).
+    pub(super) fn spawn_connect(&self, host: String) -> mpsc::Receiver<Result<Upstream, String>> {
+        let client_config = self.client_config.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(connect_upstream(client_config, &host).map_err(|e| format!("{e:#}")));
+        });
+        rx
     }
+}
+
+/// Resolve + connect to `host:443` and start a rustls client validating the real
+/// cert. Blocking — run off the poll loop via [`Vault::spawn_connect`]. The socket
+/// is left non-blocking so the poll loop can then drive its I/O in-thread.
+fn connect_upstream(client_config: Arc<ClientConfig>, host: &str) -> Result<Upstream> {
+    let addr = (host, 443u16)
+        .to_socket_addrs()
+        .with_context(|| format!("resolve {host}"))?
+        .next()
+        .ok_or_else(|| anyhow!("no address for {host}"))?;
+    let sock = TcpStream::connect_timeout(&addr, StdDuration::from_secs(10))
+        .with_context(|| format!("connect {host}"))?;
+    sock.set_nonblocking(true).context("set upstream non-blocking")?;
+    let server_name = ServerName::try_from(host.to_string())
+        .with_context(|| format!("invalid upstream name {host}"))?;
+    let tls = ClientConnection::new(client_config, server_name)
+        .map_err(|e| anyhow!("rustls client conn: {e}"))?;
+    Ok(Upstream { sock, tls })
 }
 
 /// The forward (upstream) half of a MITM session: a real non-blocking host socket

@@ -182,16 +182,25 @@ impl Upstream {
 /// Stubs can straddle TLS-record boundaries, so [`push`](Self::push) holds back a
 /// tail that could begin a partial match and emits it once resolved (or at
 /// [`flush`](Self::flush)).
+/// One credential substitution: the agent sends `stub`, the MITM puts `real` on
+/// the wire. Named fields (not a `(Vec, Vec)` tuple) so the direction can't be
+/// transposed — swapping them would replace the real *backward* into the guest.
+#[derive(Clone)]
+pub(super) struct CredSwap {
+    pub(super) stub: Vec<u8>,
+    pub(super) real: Vec<u8>,
+}
+
 pub(super) struct StubSwap {
-    /// `(stub, real)` byte pairs. Empty → a transparent pass-through.
-    pairs: Vec<(Vec<u8>, Vec<u8>)>,
+    /// The substitutions. Empty → a transparent pass-through.
+    pairs: Vec<CredSwap>,
     carry: Vec<u8>,
     max_stub: usize,
 }
 
 impl StubSwap {
-    pub(super) fn new(pairs: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
-        let max_stub = pairs.iter().map(|(s, _)| s.len()).max().unwrap_or(0);
+    pub(super) fn new(pairs: Vec<CredSwap>) -> Self {
+        let max_stub = pairs.iter().map(|p| p.stub.len()).max().unwrap_or(0);
         Self { pairs, carry: Vec::new(), max_stub }
     }
 
@@ -225,13 +234,9 @@ impl StubSwap {
         let mut out = Vec::with_capacity(limit);
         let mut i = 0;
         while i < limit {
-            if let Some((stub, real)) = self
-                .pairs
-                .iter()
-                .find(|(s, _)| self.carry[i..].starts_with(s))
-            {
-                out.extend_from_slice(real);
-                i += stub.len();
+            if let Some(p) = self.pairs.iter().find(|p| self.carry[i..].starts_with(&p.stub)) {
+                out.extend_from_slice(&p.real);
+                i += p.stub.len();
             } else {
                 out.push(self.carry[i]);
                 i += 1;
@@ -300,7 +305,10 @@ mod tests {
 
     fn swap(pairs: &[(&str, &str)], chunks: &[&[u8]]) -> Vec<u8> {
         let mut s = StubSwap::new(
-            pairs.iter().map(|(a, b)| (a.as_bytes().to_vec(), b.as_bytes().to_vec())).collect(),
+            pairs
+                .iter()
+                .map(|(stub, real)| CredSwap { stub: stub.as_bytes().to_vec(), real: real.as_bytes().to_vec() })
+                .collect(),
         );
         let mut out = Vec::new();
         for c in chunks {

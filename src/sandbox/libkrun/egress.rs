@@ -30,7 +30,7 @@ use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
 
-use super::vault::{StubSwap, Upstream, Vault};
+use super::vault::{CredSwap, StubSwap, Upstream, Vault};
 
 /// Guest NIC MAC (handed to `krun_add_net_unixstream`) and the gateway MAC the
 /// stack answers as. The addressing is fixed per microVM — one stack, one guest.
@@ -114,7 +114,7 @@ pub(super) fn run(
     fd: c_int,
     allowlist: Vec<String>,
     ca_dir: Option<String>,
-    swap_pairs: Vec<(Vec<u8>, Vec<u8>)>,
+    swap_pairs: Vec<CredSwap>,
     diag_path: Option<String>,
 ) {
     let diag = Diag::open(diag_path);
@@ -234,7 +234,7 @@ fn drive_listeners(
     sockets: &mut SocketSet,
     vault: &Vault,
     pins: &PinTable,
-    swap_pairs: &[(Vec<u8>, Vec<u8>)],
+    swap_pairs: &[CredSwap],
     diag: &Diag,
 ) {
     for l in listeners.iter_mut() {

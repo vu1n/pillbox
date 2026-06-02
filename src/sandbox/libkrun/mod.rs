@@ -1,12 +1,17 @@
 //! Local microVM backend (libkrun) — **experimental, feature-gated** (`libkrun`).
 //!
-//! The graduation of the `libkrun-boot` proof crate (steps 1–6: boot, vsock
-//! control channel, frame attach, §0, egress + vault v2, CoW workspace) into a
-//! real [`SandboxBackend`]. This first slice establishes the seam — the libkrun
-//! FFI bindings + a runtime-selectable backend — with the default build and the
-//! Docker path untouched. Boot → agent run → attach (the `Frame` protocol over
-//! vsock) land in the following slices; [`LibkrunBackend::run`] errors clearly
-//! until then.
+//! The graduation of the `libkrun-boot` proof crate into a real [`SandboxBackend`]
+//! (feature-gated; the default build + Docker path stay untouched).
+//! [`LibkrunBackend::run`] boots a microVM and runs the agent end-to-end: a
+//! CoW-cloned + secret-scrubbed workspace and the agent's auth home; the agent
+//! under an in-guest `pillbox pty-host` serving the `Frame` protocol over vsock
+//! (the parent attaches + pumps the terminal); a userspace egress stack in the
+//! VMM child ([`egress`]) — virtio-net + smoltcp with a default-deny DNS fence;
+//! an owned TLS MITM ([`vault`]) that terminates the allowlisted providers,
+//! **swaps a stubbed credential for the real one** (the env-fork — the real never
+//! enters the VM; see the guard in `run`), and forwards to the real upstream; and
+//! §0 transcript events tailed into the `SessionLog`. Design + the deferred
+//! consolidation items: `docs/libkrun-sandbox.md` (L1–L5).
 //!
 //! **Subprocess VMM (the load-bearing shape).** `krun_start_enter` does *not*
 //! return — the VMM takes over the calling process and `exit()`s with the
@@ -290,6 +295,23 @@ impl SandboxBackend for LibkrunBackend {
              mkdir -p {gw_q}; mount -t virtiofs workspace {gw_q}; cd {gw_q}; \
              exec pillbox pty-host --vsock-port {ATTACH_PORT} -- {agent}",
         );
+
+        // ── env-fork invariant (the security thesis, guarded) ──
+        // Three channels into the VM, and the real credential belongs to exactly
+        // one of them: non-secret config → the guest env (`guest_env` → envp) and
+        // the exec `script`/VmSpec (a host-readable tempfile); the real credential
+        // → ONLY the MITM swap, delivered out-of-band on the child's stdin and held
+        // in the VMM child's memory. A real that reaches a guest-readable channel
+        // (env, script, or argv) is exfiltratable by a prompt-injected agent. Fail
+        // fast here rather than silently leak if a future change crosses channels.
+        for pair in &swap_pairs {
+            if guest_env.iter().any(|(_, v)| v.contains(&pair.real)) || script.contains(&pair.real) {
+                bail!(
+                    "libkrun env-fork violated: a real credential reached a guest-readable \
+                     channel (env/script) — it must travel only via the MITM stdin swap"
+                );
+            }
+        }
 
         let attach_sock = krun_cache_dir()?
             .join(format!("attach-{}.sock", uuid::Uuid::now_v7().simple()));
@@ -577,7 +599,7 @@ fn cow_clone_and_scrub(src: &Path) -> Result<PathBuf> {
 
 /// Read the stub→real pairs the parent piped on stdin (JSON `[{stub,real}]`). The
 /// env-fork channel: reals arrive here, never via the guest env/argv/VmSpec.
-fn read_swap_pairs() -> Vec<(Vec<u8>, Vec<u8>)> {
+fn read_swap_pairs() -> Vec<vault::CredSwap> {
     use std::io::Read;
     let mut buf = String::new();
     if std::io::stdin().read_to_string(&mut buf).is_err() || buf.trim().is_empty() {
@@ -586,7 +608,7 @@ fn read_swap_pairs() -> Vec<(Vec<u8>, Vec<u8>)> {
     serde_json::from_str::<Vec<SwapPair>>(&buf)
         .unwrap_or_default()
         .into_iter()
-        .map(|p| (p.stub.into_bytes(), p.real.into_bytes()))
+        .map(|p| vault::CredSwap { stub: p.stub.into_bytes(), real: p.real.into_bytes() })
         .collect()
 }
 

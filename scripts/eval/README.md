@@ -21,27 +21,47 @@ task's `grade.sh` is run against the result by `session score` (exit 0 → pass,
 recorded as a verifiable `scored` §0 event). `run-ab.sh` tabulates pass rates.
 
 ```sh
-# build + sign the libkrun binary first (see docs/libkrun-sandbox.md), then:
+# build + sign the libkrun binary first (see docs/libkrun-sandbox.md), then
+# populate tasks/ from a benchmark and A/B it:
+python3 scripts/eval/import-humaneval.py --limit 20
 PILLBOX_RUNNER_IMAGE=pillbox-runner:l7 scripts/eval/run-ab.sh 5
 ```
 
 ## A task = a directory under `tasks/`
 
-- `prompt.txt` — the instruction sent to the agent.
-- `grade.sh` — the verifier (cwd = the edited workspace; exit 0 = pass; stdout
-  is the feedback gradient). Use only host-available tools.
-- the starting workspace files (e.g. `solution.py`) — copied pristine per run.
+- `workspace/` — the agent's starting tree (e.g. `solution.py`), copied pristine
+  per run. **This is all the agent sees.**
+- `grader/` — the verifier, **hidden from the agent** (injected into the edited
+  clone only at grade time, so it can't read the test and hardcode). `grade.sh`
+  is the entry point: cwd = the edited workspace, exit 0 = pass, stdout is the
+  feedback gradient. Use only host-available tools.
+- `prompt.txt` — the instruction (no test leaked).
 
 The bundled `add` task is a **plumbing smoke** (trivial → both conditions pass →
-no signal). Real signal needs tasks where a playbook bullet addresses a gotcha
-the baseline agent actually trips on — that curation (your domain) is the
-experiment's real work, not the plumbing.
+no signal).
+
+## Populating tasks from a benchmark
+
+`import-humaneval.py` pulls HumanEval into the layout above (one dir per problem,
+hidden grader). Generated `tasks/he_*` / `tasks/ap_*` are gitignored — regenerate
+them, don't commit them.
+
+⚠️ **Benchmark choice drives signal.** HumanEval is heavily contaminated (models
+memorized it) and its tests are weak — fine for proving the harness *runs* an
+A/B, but the baseline is inflated so memory has little room to help. For a
+trustworthy signal graduate to a less-contaminated, agentic set: **Aider
+polyglot** (Exercism problems, `unittest`-graded, host-runnable — the next
+importer) or, with a sandboxed grader + a capable model, **SWE-rebench /
+SWE-bench-CL** (the continual-learning bench — the closest analog to the memory
+loop). The dir layout is identical; only the importer swaps.
 
 ## Status / findings (2026-06-02)
 
-- ✅ **Atomic unit verified live**: task → opencode edits the workspace in the
-  VM → `session score` grades the real edited clone → verifiable pass/fail in
-  the §0 log.
+- ✅ **Full harness verified live on a real benchmark task**: `import-humaneval`
+  → opencode completed `has_close_elements` in the VM → the hidden grader
+  (injected at grade time) verified it → `session score` → verifiable pass in
+  the §0 log (`run-task.sh he_HumanEval_0 baseline` → pass). The agent never saw
+  the test.
 - ⚠️ **Trace persistence is watcher-dependent** (matters for the *optimization*
   step, not this pass-rate A/B): the libkrun §0 conversation trace is drained
   into `log.jsonl` only while a `watch`/`subscribe` is attached. A batch

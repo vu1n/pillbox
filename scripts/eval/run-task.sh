@@ -29,10 +29,11 @@ if [ "$condition" = "memory" ]; then
 fi
 
 # A fresh copy of the starting workspace per run (the agent mutates a CoW clone
-# of THIS dir, so each run must start from a pristine tree).
+# of THIS dir, so each run must start from a pristine tree). The agent sees ONLY
+# task/workspace/ — never task/grader/, so it can't read the test and hardcode.
 ws="$(mktemp -d)"
 trap 'rm -rf "$ws"' EXIT
-cp "$task_dir"/* "$ws"/
+cp -R "$task_dir/workspace/." "$ws"/
 
 sid="$("$PILLBOX" run --agent opencode --workspace "$ws" 2>&1 | grep -oE '[0-9a-f]{12}' | head -1)"
 [ -n "$sid" ] || { echo "$task	$condition	fail(no-session)"; exit 0; }
@@ -51,8 +52,9 @@ for _ in $(seq 1 "$((MAX_WAIT / 2))"); do
   grep -aq 'session.idle' "$events" 2>/dev/null && break
 done
 
-# Grade the agent's edited clone. `session score` records the verifiable
-# `scored` §0 event; we read its exit verdict from the printed line.
+# Inject the hidden grader into the agent's edited clone, THEN grade — so the
+# verifier ran against the agent's solution + an untampered test it never saw.
+cp -R "$task_dir/grader/." "$clone"/
 verdict="fail"
 if "$PILLBOX" session score "$sid" --cmd "sh grade.sh" --workspace "$clone" 2>&1 | grep -q 'passed'; then
   verdict="pass"

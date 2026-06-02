@@ -140,7 +140,6 @@ main) — `runner-image.yml` triggers only on `v*` tags + a manual
 
 To publish a fresh image: run the `runner-image` workflow manually
 (`workflow_dispatch` → `:rolling`) or push a `v*` tag (→ `:vX.Y.Z`,
-plus `:latest` on a stable release). **Actions is currently
-disabled on the repo** — re-enable it to dispatch, or build + push
-from a dev box (`DOCKER_HOST=ssh://… docker buildx build -f
-runner/Dockerfile --push -t ghcr.io/vu1n/pillbox-runner:rolling .`).
+plus `:latest` on a stable release). Or build + push from a dev box
+(`DOCKER_HOST=ssh://… docker buildx build -f runner/Dockerfile
+--push -t ghcr.io/vu1n/pillbox-runner:rolling .`).

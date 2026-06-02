@@ -22,11 +22,11 @@ use crate::pillbox::Pillbox;
 /// semver release, so pre-1.0 it stays frozen (the bug that shipped installs
 /// without iproute2/pip — egress broken). `:rolling` is the deliberate dev
 /// build — `runner-image.yml` builds only on `v*` tags + a manual
-/// `workflow_dispatch` (NOT on every push; that churn is why Actions is off),
-/// and a dispatch run publishes `:rolling`. So a fresh install tracks the last
-/// intentionally-published runner. Repin to `:latest` at the first stable
-/// release. NOTE: publishing is deliberate — run that workflow (Actions must be
-/// re-enabled) or build+push from the VPS; it does not happen automatically.
+/// `workflow_dispatch` (deliberately NOT on every push, to avoid churning a
+/// ~2GB rebuild), and a dispatch run publishes `:rolling`. So a fresh install
+/// tracks the last intentionally-published runner. Repin to `:latest` at the
+/// first stable release. NOTE: publishing is deliberate — run that workflow
+/// (`workflow_dispatch`) or build+push from a dev box; it never happens on push.
 pub const DEFAULT_RUNNER_IMAGE: &str = "ghcr.io/vu1n/pillbox-runner:rolling";
 
 /// Env-var override key. Documented so `pillbox doctor` can name it

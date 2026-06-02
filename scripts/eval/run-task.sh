@@ -35,7 +35,10 @@ ws="$(mktemp -d)"
 trap 'rm -rf "$ws"' EXIT
 cp -R "$task_dir/workspace/." "$ws"/
 
-sid="$("$PILLBOX" run --agent opencode --workspace "$ws" 2>&1 | grep -oE '[0-9a-f]{12}' | head -1)"
+# MODEL (provider/modelID) overrides opencode's default — set it to a capable
+# model so the baseline lands in a measurable band (GLM-4.5-air floors hard sets,
+# leaving no headroom to detect a memory delta).
+sid="$("$PILLBOX" run --agent opencode --workspace "$ws" ${MODEL:+--model "$MODEL"} 2>&1 | grep -oE '[0-9a-f]{12}' | head -1)"
 [ -n "$sid" ] || { echo "$task	$condition	fail(no-session)"; exit 0; }
 
 # The agent mutates the CoW clone recorded in the session handle, not $ws.

@@ -137,9 +137,14 @@ shared pool of scrubbed+validated abstracted bullets, retrieved by embedding.
 
 The loops are external; pillbox's only obligation is the contract. Verified gaps:
 
-1. **Verifiable, non-self-reported reward channel** — external grader on the
-   rustic result-snapshot + exit code. `session.completed` is self-stamped
-   (`session.rs`), Goodhart-banned. *Gates the whole compile-time loop.*
+1. ✅ **Verifiable, non-self-reported reward channel** — **LANDED (v0).**
+   `pillbox session score <id> --cmd "<verifier>"` runs an external grader (cwd =
+   the rehydrated result-snapshot or `--workspace`), captures its exit code +
+   output, and appends a `contract::Payload::Scored { grader, passed, score,
+   feedback }` §0 event — the verifier's exit/output is the truth, not the agent's
+   self-stamped `session done --status` (Goodhart-banned). `feedback` carries the
+   textual gradient. *Post-v0: built-in/sandboxed graders, finer grader-emitted
+   scores.* (Gated the whole compile-time loop — now unblocked.)
 2. **Persisted traces** — Harden #2 `raw_body` blob store; bodies incl. reasoning
    are *dropped* today (`genai_tap.rs:193`), so "the log is an ASI source" is
    aspirational until it lands.

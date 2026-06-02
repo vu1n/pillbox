@@ -786,13 +786,18 @@ Docker untouched until step 8. Slices (each its own commit, default build green)
      allowlisted hosts with an empty swap), brings it up, records the Session.
      **Verified live** (`pillbox-runner:l7`): opencode booted in the µVM; the host
      drove it over the forward (`/doc` 200, `/session`→`ses_`, `/prompt_async` 204,
-     multi-connection vsock); `session list`/`rm` work. **Pending:** the `/event`→
-     `SessionLog`→`watch` render — the raw transport delivers the mapped event
-     types (a probe saw `message.updated`/`message.part.updated`), but the Rust
-     `open_stream`→`drain_sse`→log path logged nothing, confounded by the fenced
-     model (opencode's provider `api.z.ai` + `models.dev` are NXDOMAIN'd → no clean
-     turn). **Next: the egress-allow** (the documented "standard profile" — allow
-     the configured provider host) so a real turn renders, then settle the render.
+     multi-connection vsock); `session list`/`rm` work.
+   - ✅ **standard egress profile** (`bbfe66a`). opencode is non-vault and reaches
+     its provider directly, but the fence only allowed the vault-intercepted hosts.
+     `egress::standard_egress_hosts()` (openrouter/deepseek/kimi/grok/gemini/glm/
+     mistral/groq + `models.dev`) unions into the server-path allowlist; the MITM
+     terminates + forwards them with an **empty swap** (opencode holds its own
+     key). **This settled the `/event` render** — never a pipeline bug, just the
+     fenced model leaving no real turn. **Verified end-to-end:** `run --agent
+     opencode` (GLM) → `session send` → `session watch` rendered the reply
+     *streaming* through §0 (`open_stream` de-chunk → `drain_sse` → `SessionLog`,
+     59 events), egress log showing `POST …/chat/completions → api.z.ai
+     (forwarding)`. Follow-up: a `--egress-allow HOST` flag for custom endpoints.
    - ☐ **7d** — fold the opencode-only `Session` fields (`agent_session_id`,
      `model`) into a typed optional sub-struct so PTY backends stop carrying a
      `None, None` tail. (`run_server` lift out of `local_docker.rs` also still open —

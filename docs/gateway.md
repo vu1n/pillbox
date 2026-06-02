@@ -23,6 +23,18 @@ decomposes goals and routes across many pillboxes over the proto contract; the
 gateway is *internal*, **one per live session**, and the thing the orchestrator
 (and lum, and a human at a shell) talk *to*.
 
+**Not the meta-harness, either (terminology — 2026-06-02).** "Gateway" here means
+the **multiplayer broker**: the I/O / collaboration plane (sequencer + roster +
+driver-token + fan-out attach) — content-agnostic, multiplexing participants over
+a session. It **must serve a bare coding harness with zero optimization**
+(collaborating on a plain claude/opencode run is first-class). The
+**meta-harness** is a *separate, orthogonal* layer — the optimization / behavior
+plane (DSPy / GEPA / RLM / cost-routing / ACE memory) that changes what the agent
+does (online: grows the vault MITM into a model router/rewriter; offline: a batch
+consumer of the §0 trace log). Both compose over the standalone §0 substrate;
+neither requires the other (all four of {bare, meta-harness} × {solo, multiplayer}
+are valid). Don't fold them into one component.
+
 ## What it is — three roles, one process
 
 | Role | What it does | Replaces today |

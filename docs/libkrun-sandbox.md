@@ -798,11 +798,17 @@ Docker untouched until step 8. Slices (each its own commit, default build green)
      *streaming* through §0 (`open_stream` de-chunk → `drain_sse` → `SessionLog`,
      59 events), egress log showing `POST …/chat/completions → api.z.ai
      (forwarding)`. Follow-up: a `--egress-allow HOST` flag for custom endpoints.
-   - ☐ **7d** — fold the opencode-only `Session` fields (`agent_session_id`,
-     `model`) into a typed optional sub-struct so PTY backends stop carrying a
-     `None, None` tail. (`run_server` lift out of `local_docker.rs` also still open —
-     the docker bring-up is genuinely docker; the shared post-start handshake could
-     extract once both backends are stable.)
+   - ✅ **7d + first-class finish** (`db87d61`). Folded the opencode-only Session
+     fields into `Session.server: Option<ServerSession>` (typed both-or-neither, no
+     more `None, None` tail). Added **`--egress-allow HOST`** (invoker escape hatch
+     for a custom/self-hosted endpoint; threads into both libkrun allowlists, no-op
+     on docker). Extracted the shared `opencode::print_started` banner; the
+     `run_server` bodies stay per-backend (docker container vs libkrun VMM lifecycle
+     genuinely differ — the shared bring-up is already in the `opencode::` fns).
+     Verified live (the 7d server-record round-trips through run→send→watch).
+   - **opencode is now first-class alongside claude/codex** on both docker and
+     libkrun: run / drive (`session send`) / read (`watch`/`subscribe`) / teardown,
+     any model provider via the standard profile + `--egress-allow`.
 8. **Deprecate Docker** — remove the docker/remote backends once libkrun is at parity.
 
 ## Dependencies

@@ -18,14 +18,15 @@ use crate::pillbox::Pillbox;
 ///   2. `[runner] image = "…"` in pillbox.toml
 ///   3. this default
 ///
-/// Points at `:rolling`, NOT `:latest`, during prerelease: CI
-/// (`.github/workflows/runner-image.yml`) only moves `:latest` on a STABLE
-/// semver release, so while we're pre-1.0 it stays frozen at an old build —
-/// which left off-the-shelf installs without iproute2/pip (egress broken).
-/// `:rolling` moves on every push to main, so a fresh install tracks the
-/// current runner. Repin to `:latest` (or a pinned `:vX.Y.Z`) at the first
-/// stable release, when `:latest` starts moving and rolling's churn is a
-/// liability rather than the only fresh tag.
+/// Points at `:rolling`, not `:latest`: CI moves `:latest` only on a STABLE
+/// semver release, so pre-1.0 it stays frozen (the bug that shipped installs
+/// without iproute2/pip — egress broken). `:rolling` is the deliberate dev
+/// build — `runner-image.yml` builds only on `v*` tags + a manual
+/// `workflow_dispatch` (NOT on every push; that churn is why Actions is off),
+/// and a dispatch run publishes `:rolling`. So a fresh install tracks the last
+/// intentionally-published runner. Repin to `:latest` at the first stable
+/// release. NOTE: publishing is deliberate — run that workflow (Actions must be
+/// re-enabled) or build+push from the VPS; it does not happen automatically.
 pub const DEFAULT_RUNNER_IMAGE: &str = "ghcr.io/vu1n/pillbox-runner:rolling";
 
 /// Env-var override key. Documented so `pillbox doctor` can name it

@@ -352,10 +352,33 @@ pub(crate) struct Scored {
     pub(crate) grader: String,
     /// Verifiable pass/fail = the grader's exit status (0 → `true`).
     pub(crate) passed: bool,
-    /// Normalized score in `[0,1]`. v0: `passed` → 1.0, else 0.0 (a richer
-    /// grader-emitted score is a post-v0 upgrade).
+    /// Normalized score in `[0,1]`. A plain `--cmd` grade is binary
+    /// (`passed` → 1.0, else 0.0); a `--rubric` grade is the fraction of
+    /// criteria that passed — a real gradient, not just the scalar.
     pub(crate) score: f64,
-    /// The grader's captured output (the gradient, not just the scalar).
+    /// The grader's captured output (the gradient, not just the scalar). For a
+    /// rubric grade, a rendered per-criterion summary; `criteria` carries the
+    /// structured detail.
+    pub(crate) feedback: String,
+    /// Per-criterion verdicts from a `--rubric` grade — the rich,
+    /// decomposed feedback an optimizer reflects on (which criterion failed and
+    /// why), vs the single `feedback` blob. Empty for a plain `--cmd` grade.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) criteria: Vec<Criterion>,
+}
+
+/// One rubric criterion's verdict: a named, independently-verifiable check
+/// (its own command exit) plus its captured output. The structured unit a
+/// `--rubric` grade decomposes into.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Criterion {
+    pub(crate) name: String,
+    /// The criterion's command exited 0.
+    pub(crate) passed: bool,
+    /// The criterion command's combined output, tail-capped. Empty when it
+    /// produced none (e.g. a silent passing check).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) feedback: String,
 }
 
@@ -579,6 +602,7 @@ mod tests {
                 passed: false,
                 score: 0.0,
                 feedback: "1 failed, 3 passed".into(),
+                criteria: Vec::new(),
             }),
         );
         let s = serde_json::to_string(&ev).unwrap();
@@ -587,6 +611,8 @@ mod tests {
         assert!(s.contains(r#""passed":false"#), "{s}");
         assert!(s.contains(r#""score":0.0"#), "{s}");
         assert!(s.contains(r#""feedback":"1 failed, 3 passed""#), "{s}");
+        // Empty criteria are omitted — the plain --cmd reward shape is unchanged.
+        assert!(!s.contains("criteria"), "{s}");
         assert_eq!(reparse(&ev), ev);
     }
 

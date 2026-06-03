@@ -23,6 +23,8 @@ here="$(cd "$(dirname "$0")" && pwd)"
 PILLBOX="${PILLBOX:-$here/../../target/debug/pillbox}"
 MAX_WAIT="${MAX_WAIT:-160}"
 export PILLBOX_BACKEND=libkrun
+# shellcheck source=../eval/lib.sh
+. "$here/../eval/lib.sh"  # pb_run_session / pb_workspace / pb_drive_and_wait
 
 # The reflection workspace: the failures (+ the current profile) for the agent to
 # read, and PROFILE.md for it to write.
@@ -48,13 +50,11 @@ details; fold in the still-useful parts of current_profile.md; aim for under ~10
 crisp bullets. Edit PROFILE.md only.
 EOF
 
-sid="$("$PILLBOX" run --agent opencode --workspace "$ws" ${MODEL:+--model "$MODEL"} 2>&1 | grep -oE '[0-9a-f]{12}' | head -1)"
+sid="$(pb_run_session "$ws")"
 [ -n "$sid" ] || { echo "propose: no session" >&2; exit 1; }
-# Result-workspace path from the JSON surface (not the internal session record).
-clone="$("$PILLBOX" session info "$sid" --json 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin)["session"].get("workspace",""))')"
+clone="$(pb_workspace "$sid")"
 [ -n "$clone" ] || { echo "propose: no workspace" >&2; "$PILLBOX" session rm "$sid" >/dev/null 2>&1; exit 1; }
-"$PILLBOX" session send "$sid" "$TASK" >/dev/null 2>&1
-"$PILLBOX" session wait-idle "$sid" --timeout "$MAX_WAIT" >/dev/null 2>&1 || true
+pb_drive_and_wait "$sid" "$TASK"
 
 if [ -s "$clone/PROFILE.md" ]; then
   cp "$clone/PROFILE.md" "$out"

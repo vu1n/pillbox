@@ -25,6 +25,8 @@ PILLBOX="${PILLBOX:-$here/../../target/debug/pillbox}"
 MAX_WAIT="${MAX_WAIT:-120}"
 EVALS_PILLBOX="${EVALS_PILLBOX:-evals}"
 export PILLBOX_BACKEND=libkrun
+# shellcheck source=lib.sh
+. "$here/lib.sh"  # pb_run_session / pb_workspace / pb_drive_and_wait
 
 # Resolve the task source. A directory is used in place (legacy / un-frozen).
 # Otherwise it's a frozen-snapshot bookmark (<set>/<split>/<id>) in the evals
@@ -70,22 +72,17 @@ cp -R "$task_dir/workspace/." "$ws"/
 # MODEL (provider/modelID) overrides opencode's default — set it to a capable
 # model so the baseline lands in a measurable band (GLM-4.5-air floors hard sets,
 # leaving no headroom to detect a memory delta).
-sid="$("$PILLBOX" run --agent opencode --workspace "$ws" ${MODEL:+--model "$MODEL"} 2>&1 | grep -oE '[0-9a-f]{12}' | head -1)"
+sid="$(pb_run_session "$ws")"
 [ -n "$sid" ] || { echo "$task	$condition	fail(no-session)"; exit 0; }
 
-# The agent edits its result-workspace (a CoW clone), not $ws. Read its path
-# from the JSON surface — not by parsing pillbox's internal session record.
-clone="$("$PILLBOX" session info "$sid" --json 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin)["session"].get("workspace",""))')"
+# The agent edits its result-workspace (a CoW clone), not $ws.
+clone="$(pb_workspace "$sid")"
 [ -n "$clone" ] || { echo "$task	$condition	fail(no-workspace)"; "$PILLBOX" session rm "$sid" >/dev/null 2>&1; exit 0; }
 
-"$PILLBOX" session send "$sid" "$prompt" >/dev/null 2>&1
-
-# Block until the turn goes idle (the §0 NeedsInput signal) — the drive-surface
-# primitive, replacing the old grep-the-capture-file poll. It also drains the
-# full §0 trajectory into the durable log while waiting, so the failure report
-# reflects on HOW the agent worked (no separate `session ingest` needed). A
-# timeout is treated as a fail (we still grade whatever landed).
-"$PILLBOX" session wait-idle "$sid" --timeout "$MAX_WAIT" >/dev/null 2>&1 || true
+# Drive the turn + block until idle, draining the §0 trajectory into the log
+# meanwhile (so the failure report reflects on HOW the agent worked). A timeout
+# is treated as a fail — we still grade whatever landed.
+pb_drive_and_wait "$sid" "$prompt"
 
 # Inject the hidden grader into the agent's edited clone, THEN grade — so the
 # verifier ran against the agent's solution + an untampered test it never saw.

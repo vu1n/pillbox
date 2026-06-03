@@ -95,11 +95,12 @@ the importer + the grader location change.
   (injected at grade time) verified it → `session score` → verifiable pass in
   the §0 log (`run-task.sh he_HumanEval_0 baseline` → pass). The agent never saw
   the test.
-- ✅ **§0 trace drain closed** (was watcher-dependent): `session ingest` drains
-  the libkrun `/event` capture into `log.jsonl` post-hoc + idempotent, so a batch
-  `run→send→ingest→score` persists the full trajectory without a live watcher.
-  `run-task.sh` calls it before scoring; the failure report includes the real
-  tool trajectory (the GEPA-style textual gradient).
+- ✅ **§0 trace drain closed** (was watcher-dependent): `run-task.sh` drives
+  `run→send→wait-idle→score`, where `session wait-idle` blocks until the turn's
+  §0 idle signal AND drains the trajectory into `log.jsonl` while waiting — so the
+  full trajectory persists without a live watcher, and the failure report gets the
+  real tool trajectory (the GEPA-style textual gradient). (`session ingest` remains
+  the standalone post-hoc drain for sessions nobody waited on.)
 - ✅ **Frozen eval contexts** (2026-06-03): `freeze-task.sh` + `run-task.sh`
   bookmark-pull give reproducible reruns from immutable snapshots (verified:
   freeze→two pulls identical, matches source). Composes existing primitives.

@@ -93,9 +93,18 @@ cp -R "$task_dir/grader/." "$clone"/
 # (empty/malformed JSON) is a non-pass, not a harness crash — the batch must
 # score the next task, not abort under `set -e`. The verdict schema reads live
 # in lib.sh (pb_passed/pb_feedback), single-sourced across the orchestrators.
-score_json="$("$PILLBOX" session score "$sid" --cmd "sh grade.sh" --workspace "$clone" --json 2>/dev/null || true)"
+# Prefer the per-criterion rubric (graded fraction + which tests failed) when the
+# task ships one; else the binary grade.sh. The rubric file is host-side
+# (`--rubric`); its criteria run in the clone against the injected test module.
+if [ -f "$task_dir/grader/rubric.txt" ]; then
+  grade=(--rubric "$task_dir/grader/rubric.txt")
+else
+  grade=(--cmd "sh grade.sh")
+fi
+score_json="$("$PILLBOX" session score "$sid" "${grade[@]}" --workspace "$clone" --json 2>/dev/null || true)"
 verdict="$(printf '%s' "$score_json" | pb_passed)"
 feedback="$(printf '%s' "$score_json" | pb_feedback)"
+score_val="$(printf '%s' "$score_json" | pb_score_value)"
 
 # FAILDIR: on a fail, capture a failure report (task + what the agent produced +
 # why it failed) — the input the meta-harness's `propose` step reflects on.
@@ -140,4 +149,6 @@ else:
 fi
 
 "$PILLBOX" session rm "$sid" >/dev/null 2>&1 || true
-echo "$task	$condition	$verdict"
+# TSV: task, condition, pass/fail (all criteria), fractional score [0,1]. The
+# gate averages the score column — the low-noise metric a rubric buys over binary.
+echo "$task	$condition	$verdict	${score_val:-0}"

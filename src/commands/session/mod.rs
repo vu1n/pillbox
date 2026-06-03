@@ -228,6 +228,12 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> 
             json,
         ),
         SessionAction::Ingest { id, json } => session_ingest(resolved, &id, json),
+        SessionAction::Log {
+            id,
+            r#type,
+            last,
+            from,
+        } => session_log(resolved, &id, &r#type, last, from.unwrap_or(0)),
         SessionAction::WaitIdle { id, timeout, from } => {
             stream::session_wait_idle(resolved, &id, timeout, from)
         }
@@ -837,6 +843,79 @@ fn session_ingest(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Read a session's durable §0 log (`log.jsonl`), filtered by payload `--type`
+/// and/or trimmed to the `--last` match, as JSONL on stdout — the structured §0
+/// read that replaces opening the on-disk log by hand. Filtering is on the
+/// serialized payload `type` tag (not a 25-arm enum match that would drift from
+/// `Payload`); a missing log reads as empty (see [`SessionLog::read_from`]).
+fn session_log(
+    resolved: &Pillbox,
+    id: &str,
+    types: &[String],
+    last: bool,
+    from: u64,
+) -> Result<()> {
+    use std::io::Write;
+
+    let session = session::resolve(resolved, id)?;
+    let log = crate::events::log::SessionLog::open(resolved, &session.id)?;
+    let matched = select_log_events(log.read_from(from)?, types, last)?;
+
+    // One writer, one flush — a large trajectory dump shouldn't pay a syscall
+    // per line. BrokenPipe (downstream `head`/`grep -q` closed early) is a clean
+    // exit, not an error.
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    for v in &matched {
+        if let Err(e) = writeln!(out, "{v}") {
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                return Ok(());
+            }
+            return Err(PillboxError::runtime("session log", format!("write: {e}")).into());
+        }
+    }
+    out.flush().ok();
+    Ok(())
+}
+
+/// Serialize + filter §0 events for `session log`: keep those whose payload
+/// `type` is in `types` (empty = keep all), then trim to the last match if
+/// `last`. Pure (no I/O) so the `--type`/`--last` semantics are unit-testable.
+fn select_log_events(
+    events: Vec<crate::contract::Event>,
+    types: &[String],
+    last: bool,
+) -> Result<Vec<serde_json::Value>> {
+    let want: Option<std::collections::HashSet<&str>> = if types.is_empty() {
+        None
+    } else {
+        Some(types.iter().map(String::as_str).collect())
+    };
+
+    let mut matched: Vec<serde_json::Value> = Vec::new();
+    for ev in events {
+        let v = serde_json::to_value(&ev)
+            .map_err(|e| PillboxError::runtime("session log", format!("serialize event: {e}")))?;
+        if let Some(want) = &want {
+            // `Unknown` re-serializes without a real tag; treat a missing tag as
+            // unmatchable so a `--type` filter never silently includes it.
+            match v
+                .get("payload")
+                .and_then(|p| p.get("type"))
+                .and_then(serde_json::Value::as_str)
+            {
+                Some(t) if want.contains(t) => {}
+                _ => continue,
+            }
+        }
+        matched.push(v);
+    }
+    if last && matched.len() > 1 {
+        matched.drain(..matched.len() - 1);
+    }
+    Ok(matched)
+}
+
 /// Externally grade a session's result and record it as a verifiable `scored`
 /// §0 event — the reward channel the optimization loops gate on. Runs `cmd`
 /// (via `sh -c`) with cwd = the graded workspace: `workspace` if given, else a
@@ -1212,6 +1291,50 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(parsed["feedback"], nasty);
         assert_eq!(parsed["passed"], false);
+    }
+
+    #[test]
+    fn select_log_events_filters_by_type_and_last() {
+        use crate::contract::{Event, Payload, Scored, ToolCall, ToolStatus};
+        let ev = |p: Payload| Event::session("s", p);
+        let tool = |name: &str| {
+            ev(Payload::ToolCall(ToolCall {
+                tool_call_id: name.into(),
+                name: name.into(),
+                status: ToolStatus::Completed,
+                input: None,
+                output: String::new(),
+                title: String::new(),
+            }))
+        };
+        let scored = |s: f64| {
+            ev(Payload::Scored(Scored {
+                grader: "g".into(),
+                passed: s >= 1.0,
+                score: s,
+                feedback: String::new(),
+            }))
+        };
+        let events = vec![tool("read"), scored(0.0), tool("edit"), scored(1.0)];
+
+        // No filter → all four, in order.
+        let all = select_log_events(events.clone(), &[], false).unwrap();
+        assert_eq!(all.len(), 4);
+
+        // --type tool_call → just the two tool calls.
+        let tools = select_log_events(events.clone(), &["tool_call".into()], false).unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["payload"]["name"], "read");
+
+        // --type scored --last → only the final scored event.
+        let last = select_log_events(events.clone(), &["scored".into()], true).unwrap();
+        assert_eq!(last.len(), 1);
+        assert_eq!(last[0]["payload"]["score"], 1.0);
+
+        // Unknown tag matches nothing (typo → empty, not error).
+        assert!(select_log_events(events, &["nope".into()], false)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

@@ -41,6 +41,7 @@ use serde::{Deserialize, Serialize};
 
 mod egress;
 mod http;
+mod local_forward;
 mod mitm;
 mod session;
 mod vault;
@@ -138,6 +139,12 @@ struct EgressSpec {
     /// Host path of the vault CA dir. When set, the child loads the CA (key stays
     /// host-side) to mint per-SNI MITM leaves; `None` = DNS-fence only.
     ca_dir: Option<String>,
+    /// Opt-in local-model forward: relay `gateway:PORT` → host `127.0.0.1:PORT`
+    /// (e.g. ollama on 11434), so a guest agent reaches a model the host runs.
+    /// Deliberately punches the default-deny fence; set only when a local worker
+    /// is requested. `None` = no forward. See [`super::local_forward`].
+    #[serde(default)]
+    local_forward_port: Option<u16>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -246,6 +253,7 @@ pub(crate) fn vmm_child_main() -> ! {
         allowlist: Vec<String>,
         ca_dir: Option<String>,
         log_path: Option<String>,
+        local_forward_port: Option<u16>,
     }
     let net: Option<NetAttach> = spec.egress.as_ref().map(|e| {
         let mut fds = [0 as c_int; 2];
@@ -262,6 +270,7 @@ pub(crate) fn vmm_child_main() -> ! {
             allowlist: e.allowlist.clone(),
             ca_dir: e.ca_dir.clone(),
             log_path: e.log_path.clone(),
+            local_forward_port: e.local_forward_port,
         }
     });
     // Read the stub→real credential pairs the parent pipes on stdin (the env-fork
@@ -322,7 +331,14 @@ pub(crate) fn vmm_child_main() -> ! {
         // The thread dies when start_enter exit()s this process on VM shutdown.
         if let Some(n) = net {
             std::thread::spawn(move || {
-                egress::run(n.host_fd, n.allowlist, n.ca_dir, swap_pairs, n.log_path)
+                egress::run(
+                    n.host_fd,
+                    n.allowlist,
+                    n.ca_dir,
+                    swap_pairs,
+                    n.log_path,
+                    n.local_forward_port,
+                )
             });
         }
         let rc = ffi::krun_start_enter(ctx);

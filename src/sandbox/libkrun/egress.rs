@@ -145,6 +145,7 @@ pub(super) fn run(
     ca_dir: Option<String>,
     swap_pairs: Vec<CredSwap>,
     diag_path: Option<String>,
+    local_forward_port: Option<u16>,
 ) {
     let diag = Diag::open(diag_path);
     let vault = match ca_dir {
@@ -198,9 +199,14 @@ pub(super) fn run(
     if vault.is_some() {
         super::mitm::replenish_listeners(&mut listeners, &mut sockets);
     }
+    let mut forwarders: Vec<super::local_forward::Forwarder> = Vec::new();
+    if let Some(port) = local_forward_port {
+        super::local_forward::replenish(&mut forwarders, &mut sockets, port);
+    }
     diag.log(&format!(
-        "krun-egress: smoltcp up (gw 10.0.2.2, dns :{DNS_PORT}, mitm :{}); fence allowlist={allowlist:?}",
-        if vault.is_some() { "443" } else { "off" }
+        "krun-egress: smoltcp up (gw 10.0.2.2, dns :{DNS_PORT}, mitm :{}, local-fwd :{}); fence allowlist={allowlist:?}",
+        if vault.is_some() { "443" } else { "off" },
+        local_forward_port.map_or_else(|| "off".to_string(), |p| p.to_string()),
     ));
 
     loop {
@@ -221,6 +227,10 @@ pub(super) fn run(
                 &diag,
             );
             super::mitm::replenish_listeners(&mut listeners, &mut sockets);
+        }
+        if let Some(port) = local_forward_port {
+            super::local_forward::drive(&mut forwarders, &mut sockets, port, &diag);
+            super::local_forward::replenish(&mut forwarders, &mut sockets, port);
         }
         thread::sleep(Duration::from_millis(2));
     }

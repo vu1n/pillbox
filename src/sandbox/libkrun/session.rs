@@ -344,6 +344,7 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
                 .collect(),
             log_path: std::env::var("PILLBOX_KRUN_EGRESS_LOG").ok(),
             ca_dir: Some(vault_ca_dir.to_string_lossy().into_owned()),
+            local_forward_port: None, // vaulted agents: no local-model forward
         }),
     };
     let spec_file = tempfile::Builder::new()
@@ -547,6 +548,11 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
                 .collect(),
             log_path: std::env::var("PILLBOX_KRUN_EGRESS_LOG").ok(),
             ca_dir: Some(vault_ca_dir.to_string_lossy().into_owned()),
+            // Opt-in local-model forward: PILLBOX_LOCAL_MODEL_PORT=11434 lets the
+            // guest reach a host-run ollama at gateway:PORT (the local-worker path).
+            local_forward_port: std::env::var("PILLBOX_LOCAL_MODEL_PORT")
+                .ok()
+                .and_then(|s| s.parse::<u16>().ok()),
         }),
     };
     let spec_file = tempfile::Builder::new()
@@ -773,6 +779,7 @@ pub(crate) fn score_in_sandbox(
             allowlist: egress_allow.to_vec(),
             log_path: std::env::var("PILLBOX_KRUN_EGRESS_LOG").ok(),
             ca_dir: Some(vault_ca_dir.to_string_lossy().into_owned()),
+            local_forward_port: None, // grader: tightest fence, no local forward
         });
         // Point every TLS client at the single MITM CA cert. pip/curl/openssl/
         // requests ignore the system store by default; Node reads NODE_EXTRA_CA_CERTS.

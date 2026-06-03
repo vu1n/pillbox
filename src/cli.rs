@@ -407,6 +407,12 @@ pub(crate) enum SessionAction {
         /// reproducibility guarantee for reachability. Only valid with `--in-sandbox`.
         #[arg(long = "grader-egress", value_name = "HOST")]
         grader_egress: Vec<String>,
+        /// Emit the verdict as JSON on stdout — `{version, session, grader,
+        /// passed, score, feedback, seq}` — so a caller reads the structured
+        /// result directly instead of scraping stdout text or the §0 log. The
+        /// `scored` event is still appended either way; `seq` is its log seq.
+        #[arg(long)]
+        json: bool,
     },
     /// Drain a session's durable raw §0 capture (its persisted `/event` stream)
     /// into the canonical `log.jsonl`, post-hoc and idempotent. For headless /

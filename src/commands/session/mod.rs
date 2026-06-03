@@ -216,6 +216,7 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> 
             workspace,
             in_sandbox,
             grader_egress,
+            json,
         } => session_score(
             resolved,
             &id,
@@ -224,6 +225,7 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> 
             workspace.as_deref(),
             in_sandbox,
             &grader_egress,
+            json,
         ),
         SessionAction::Ingest { id, json } => session_ingest(resolved, &id, json),
         SessionAction::WaitIdle { id, timeout, from } => {
@@ -851,6 +853,7 @@ fn session_score(
     workspace: Option<&std::path::Path>,
     in_sandbox: bool,
     grader_egress: &[String],
+    json: bool,
 ) -> Result<()> {
     use crate::workspace::{SnapshotHandle, WorkspaceBackend};
 
@@ -919,24 +922,56 @@ fn session_score(
 
     // Record on the durable §0 log — the source of truth the meta-harness reads.
     let mut log = crate::events::log::SessionLog::open(resolved, &session.id)?;
-    log.append(&[crate::contract::Event::session(
+    let seq = log.append(&[crate::contract::Event::session(
         &session.id,
         crate::contract::Payload::Scored(crate::contract::Scored {
             grader: cmd.to_string(),
             passed,
             score,
-            feedback,
+            // `feedback` is moved into the event; clone for the --json echo so
+            // the caller gets the gradient without re-reading the §0 log.
+            feedback: feedback.clone(),
         }),
     )])?;
 
-    let mark = if passed { "✓" } else { "✗" };
-    println!(
-        "pillbox: {mark} session `{}` scored {score:.2} ({})",
-        session.id,
-        if passed { "passed" } else { "failed" }
-    );
-    println!("  grader: {cmd}");
+    if json {
+        println!(
+            "{}",
+            score_verdict_json(&session.id, cmd, passed, score, &feedback, seq)
+        );
+    } else {
+        let mark = if passed { "✓" } else { "✗" };
+        println!(
+            "pillbox: {mark} session `{}` scored {score:.2} ({})",
+            session.id,
+            if passed { "passed" } else { "failed" }
+        );
+        println!("  grader: {cmd}");
+    }
     Ok(())
+}
+
+/// The `score --json` verdict — the structured result a caller reads instead of
+/// scraping stdout or the §0 log. Built via serde_json (not a format string) so
+/// arbitrary grader `feedback` — newlines, quotes, control bytes — is escaped
+/// correctly. `seq` is the appended `scored` event's log seq, for a §0 follow-up.
+fn score_verdict_json(
+    session_id: &str,
+    grader: &str,
+    passed: bool,
+    score: f64,
+    feedback: &str,
+    seq: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "version": 1,
+        "session": session_id,
+        "grader": grader,
+        "passed": passed,
+        "score": score,
+        "feedback": feedback,
+        "seq": seq,
+    })
 }
 
 /// Combine a grader's stdout+stderr into the `feedback` gradient, capped (keeping
@@ -1153,6 +1188,30 @@ mod tests {
         assert_eq!(f, "out\nerr");
         assert_eq!(score_feedback(b"only-out", b""), "only-out");
         assert_eq!(score_feedback(b"", b"only-err"), "only-err");
+    }
+
+    #[test]
+    fn score_verdict_json_is_the_documented_shape() {
+        let v = score_verdict_json("abc123", "pytest -q", true, 1.0, "5 passed", 7);
+        assert_eq!(v["version"], 1);
+        assert_eq!(v["session"], "abc123");
+        assert_eq!(v["grader"], "pytest -q");
+        assert_eq!(v["passed"], true);
+        assert_eq!(v["score"], 1.0);
+        assert_eq!(v["feedback"], "5 passed");
+        assert_eq!(v["seq"], 7);
+    }
+
+    #[test]
+    fn score_verdict_json_escapes_arbitrary_feedback() {
+        // Grader output with quotes/newlines must round-trip as one JSON value —
+        // the whole reason for serde over a format string.
+        let nasty = "line1\n\"quoted\"\ttab \\ backslash";
+        let v = score_verdict_json("s", "g", false, 0.0, nasty, 1);
+        let s = v.to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed["feedback"], nasty);
+        assert_eq!(parsed["passed"], false);
     }
 
     #[test]

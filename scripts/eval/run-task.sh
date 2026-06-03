@@ -86,11 +86,19 @@ pb_drive_and_wait "$sid" "$prompt"
 
 # Inject the hidden grader into the agent's edited clone, THEN grade — so the
 # verifier ran against the agent's solution + an untampered test it never saw.
+# Read the verdict from the JSON surface (`passed`/`feedback`) — no stdout-scrape,
+# no reach into the §0 log for the `scored` event.
 cp -R "$task_dir/grader/." "$clone"/
-verdict="fail"
-if "$PILLBOX" session score "$sid" --cmd "sh grade.sh" --workspace "$clone" 2>&1 | grep -q 'passed'; then
-  verdict="pass"
-fi
+# `|| true` + the python `except → fail`: a grader that couldn't run (empty/
+# malformed JSON) is a non-pass, not a harness crash — the batch must score the
+# next task, not abort under `set -e`.
+score_json="$("$PILLBOX" session score "$sid" --cmd "sh grade.sh" --workspace "$clone" --json 2>/dev/null || true)"
+verdict="$(printf '%s' "$score_json" | python3 -c 'import json,sys
+try: print("pass" if json.load(sys.stdin)["passed"] else "fail")
+except Exception: print("fail")')"
+feedback="$(printf '%s' "$score_json" | python3 -c 'import json,sys
+try: sys.stdout.write(json.load(sys.stdin).get("feedback",""))
+except Exception: pass')"
 
 # FAILDIR: on a fail, capture a failure report (task + what the agent produced +
 # why it failed) — the input the meta-harness's `propose` step reflects on.
@@ -102,25 +110,23 @@ if [ "$verdict" = fail ] && [ -n "${FAILDIR:-}" ]; then
     for f in "$task_dir"/workspace/*; do
       b="$(basename "$f")"; echo "--- $b ---"; cat "$clone/$b" 2>/dev/null; echo
     done
-    # Trajectory (from the ingested §0 log) + grader feedback — both from the
-    # real session log, the GEPA-style textual gradient `propose` reflects on.
+    # Trajectory (tool calls, in order) from the ingested §0 log — the GEPA-style
+    # textual gradient `propose` reflects on. Grader feedback comes from the
+    # `score --json` verdict above, not a second pass over the log.
     python3 - "$sid" <<'PY'
 import json, os, sys
 log = os.path.expanduser(f"~/.pillbox/global/sessions/{sys.argv[1]}/log.jsonl")
-order, status, fb = [], {}, ""
+order, status = [], {}
 for line in open(log):
     try:
         p = json.loads(line).get("payload", {})
     except Exception:
         continue
-    t = p.get("type")
-    if t == "tool_call":
+    if p.get("type") == "tool_call":
         cid = p.get("toolCallId") or p.get("name") or str(len(order))
         if cid not in status:
             order.append(cid)
         status[cid] = (p.get("name", "?"), p.get("status", ""))
-    elif t == "scored":
-        fb = p.get("feedback", "")
 print("## AGENT TRAJECTORY (tools, in order):")
 if order:
     for cid in order:
@@ -128,10 +134,12 @@ if order:
         print(f"- {name} [{st}]")
 else:
     print("(no tool calls captured)")
-print()
-print("## GRADER FEEDBACK (why it failed):")
-print(fb[-2000:])
 PY
+    echo
+    echo "## GRADER FEEDBACK (why it failed):"
+    # tail -c, not ${var: -N} — macOS bash 3.2 has no negative substring offset.
+    printf '%s' "$feedback" | tail -c 2000
+    echo
   } > "$FAILDIR/$task.md" 2>/dev/null
 fi
 

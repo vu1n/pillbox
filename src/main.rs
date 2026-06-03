@@ -346,6 +346,11 @@ enum Command {
         /// Free-form snapshot message (analogous to a commit message).
         #[arg(long, short = 'm', value_name = "TEXT")]
         message: Option<String>,
+        /// Also point a bookmark at the new snapshot — atomic snapshot+name,
+        /// binding the bookmark to *this* push (avoids the handle-copy and the
+        /// `latest` race of a separate `bookmark set`). Requires a project pillbox.
+        #[arg(long, value_name = "NAME")]
+        bookmark: Option<String>,
         /// Emit the snapshot record as JSON on stdout. Stable schema —
         /// pin against `version: 1`.
         #[arg(long)]
@@ -682,9 +687,9 @@ fn run(cli: Cli) -> Result<()> {
             );
             Ok(())
         }
-        Command::Push { tag, message, json } => {
+        Command::Push { tag, message, bookmark, json } => {
             let resolved = Pillbox::resolve(pillbox_arg)?;
-            commands::workspace::push(&resolved, tag, message, json)
+            commands::workspace::push(&resolved, tag, message, bookmark, json)
         }
         Command::Pull { snapshot, bookmark } => {
             let resolved = Pillbox::resolve(pillbox_arg)?;

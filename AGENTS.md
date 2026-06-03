@@ -108,7 +108,7 @@ global pillbox regardless of where you are.
 | `pillbox session transcript FILE --session-id ID [--agent claude\|codex] [--follow]` | Drain an agent-native transcript (Claude Code `~/.claude/projects/<encoded>/<uuid>.jsonl` or Codex `~/.codex/sessions/<y>/<m>/<d>/rollout-*.jsonl`) and emit one OTLP child span per rendered event, parented under the session span derived from `ID`. Harness auto-detected from path; `--agent` overrides. `--follow` drains then blocks waiting on FS notifications and emits spans for each appended line (Ctrl-C to stop) — the "watch your agent think" mode. Requires `OTEL_EXPORTER_OTLP_ENDPOINT` to actually ship; parser runs regardless and reports the event count. See [docs/observability.md](./docs/observability.md). |
 | `pillbox doctor [--json]` | Diagnose Docker, image, perms, `$HOME`. |
 | `pillbox version` | Print pillbox + runner image versions. |
-| `pillbox push [--tag T] [--message M] [--json]` | Snapshot cwd into the pillbox's rustic repo. |
+| `pillbox push [--tag T] [--message M] [--bookmark NAME] [--json]` | Snapshot cwd into the pillbox's rustic repo. `--bookmark NAME` also points a bookmark at the new snapshot atomically (snapshot+name in one call, bound to this push — no handle-copy or `latest` race; needs a project pillbox). |
 | `pillbox pull [--snapshot HANDLE \| --bookmark NAME]` | Restore cwd from a snapshot (defaults to latest) or bookmark. |
 | `pillbox snapshot list [--json]` | List every snapshot in the pillbox's repo. |
 | `pillbox snapshot show HANDLE [--json]` | Show one snapshot (HANDLE may be a unique prefix). |

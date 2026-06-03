@@ -19,14 +19,21 @@ pub(crate) fn push(
     resolved: &Pillbox,
     tag: Option<String>,
     message: Option<String>,
+    bookmark: Option<String>,
     json: bool,
 ) -> Result<()> {
     let backend = resolved.workspace()?;
     let cwd = std::env::current_dir()
         .map_err(|e| PillboxError::runtime("push", format!("could not resolve cwd: {e}")))?;
     let snap = backend.push(&cwd, PushOptions { tag, message })?;
+    // Bind the bookmark to THIS snapshot by handle (not `latest`) so a concurrent
+    // push can't shift it. The snapshot already exists, so a bookmark failure
+    // (e.g. global pillbox — bookmarks need a project) doesn't lose the snapshot.
+    if let Some(name) = bookmark.as_deref() {
+        crate::bookmarks::set(resolved, name, Some(snap.handle.as_str()))?;
+    }
     if json {
-        println!("{}", snapshot_json(&snap));
+        println!("{}", snapshot_json_with_bookmark(&snap, bookmark.as_deref()));
     } else {
         println!(
             "pillbox: ✓ snapshot {} ({})",
@@ -52,6 +59,9 @@ pub(crate) fn push(
             println!("  git anchor: {a}{dirty}");
         }
         println!("  created:    {}", snap.created_at);
+        if let Some(name) = bookmark.as_deref() {
+            println!("  bookmark:   {name}");
+        }
     }
     Ok(())
 }
@@ -261,4 +271,12 @@ fn snapshot_value(snap: &Snapshot) -> serde_json::Value {
 
 fn snapshot_json(snap: &Snapshot) -> String {
     paths::json_v1(vec![("snapshot", snapshot_value(snap))])
+}
+
+/// `push --json`, including the bookmark it set (null when `--bookmark` absent).
+fn snapshot_json_with_bookmark(snap: &Snapshot, bookmark: Option<&str>) -> String {
+    let bm = bookmark
+        .map(|s| serde_json::Value::String(s.to_string()))
+        .unwrap_or(serde_json::Value::Null);
+    paths::json_v1(vec![("snapshot", snapshot_value(snap)), ("bookmark", bm)])
 }

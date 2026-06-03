@@ -33,3 +33,61 @@ pb_drive_and_wait() {
   "$PILLBOX" session send "$1" "$2" >/dev/null 2>&1
   "$PILLBOX" session wait-idle "$1" --timeout "$MAX_WAIT" >/dev/null 2>&1 || true
 }
+
+# --- `session score --json` readers ---------------------------------------
+# Single-source the verdict schema (field names like .criteria/.score/.passed)
+# so a `score --json` change touches THIS file, not every orchestrator. Each
+# reads the score JSON on stdin: `printf '%s' "$json" | pb_<reader>`. The loop
+# *policy* (state→action, max-iter, feedback wording) stays in the caller.
+
+# Plain --cmd verdict: echo `pass` or `fail` (fail on parse failure).
+pb_passed() {
+  python3 -c 'import json,sys
+try: print("pass" if json.load(sys.stdin).get("passed") else "fail")
+except Exception: print("fail")'
+}
+
+# The grader `feedback` string (empty on parse failure).
+pb_feedback() {
+  python3 -c 'import json,sys
+try: sys.stdout.write(json.load(sys.stdin).get("feedback",""))
+except Exception: pass'
+}
+
+# Rubric verdict classified from .criteria:
+#   satisfied | needs_revision | rubric_failed (no criteria) | grader_error (unparseable)
+pb_score_state() {
+  python3 -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print("grader_error"); sys.exit()
+c=d.get("criteria",[])
+print("rubric_failed" if not c else "satisfied" if all(x.get("passed") for x in c) else "needs_revision")'
+}
+
+# Numeric .score in [0,1] to 3dp (0 on parse failure).
+pb_score_value() {
+  python3 -c 'import json,sys
+try: print("%.3f"%json.load(sys.stdin).get("score",0))
+except Exception: print("0")'
+}
+
+# The .criteria array as JSON (`[]` on parse failure).
+pb_criteria() {
+  python3 -c 'import json,sys
+try: print(json.dumps(json.load(sys.stdin).get("criteria",[])))
+except Exception: print("[]")'
+}
+
+# A feedback message naming the FAILED criteria (.name + .feedback). The schema
+# read is here; the caller decides whether/how to inject it.
+pb_failed_feedback() {
+  python3 -c 'import json,sys
+d=json.load(sys.stdin); c=d.get("criteria",[])
+fails=[x for x in c if not x.get("passed")]
+out=["Your solution does not yet pass all checks (%d/%d). Fix ONLY these failing"
+     " criteria, then stop and wait:"%(len(c)-len(fails),len(c))]
+for x in fails:
+    fb=(x.get("feedback") or "").strip()
+    out.append("\n\n- %s%s"%(x["name"], (":\n"+fb) if fb else ""))
+sys.stdout.write("".join(out))'
+}

@@ -31,6 +31,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from statistics import mean
@@ -58,6 +59,8 @@ class Config:
     runner_image: str = "pillbox-runner:l7"
     playbook: str = ""
     out: str = "gate-run.json"
+    parallel: int = 1   # serial by default; >1 only for LOCAL models (hosted plans throttle concurrent reqs → corrupts scores)
+    limit: int = 0      # 0 = all; else cap tasks per split (fast iteration)
 
 
 class PillboxError(RuntimeError):
@@ -192,20 +195,29 @@ def distill(pb: Pillbox, failures: list[dict], reflector_model: str) -> str:
 
 
 def eval_arm(pb: Pillbox, label: str, refs: list[str], profile: str, model: str,
-             tmp: str, trials: int, capture_failures: bool = False) -> dict:
-    """Score `model`+`profile` over `refs` (×trials). Returns per-task results + mean +
-    (optionally) the failure reports for the reflector."""
-    results, failures = [], []
-    for ref in refs:
-        td = _task_dir(pb, ref, tmp)
-        task = ref.split("/")[-1]
-        for t in range(trials):
-            r = graded_run(pb, td, profile, model)
-            results.append({"task": task, "trial": t, **r})
+             tmp: str, trials: int, parallel: int = 4, capture_failures: bool = False) -> dict:
+    """Score `model`+`profile` over `refs` (×trials), `parallel` tasks at once. Tasks are
+    independent (own VM + own workspace clone), so they fan out; teardown stays per-`sid`.
+    Returns per-task results + mean + (optionally) the failure reports for the reflector."""
+    # Pre-pull each ref once, serially (no VM, fast) — graded_run copies from it read-only,
+    # so concurrent jobs can share the pulled dir without a pull race.
+    dirs = {ref: _task_dir(pb, ref, tmp) for ref in refs}
+    jobs = [(ref, t) for ref in refs for t in range(trials)]
+
+    def work(job):
+        ref, t = job
+        r = graded_run(pb, dirs[ref], profile, model)
+        return {"task": ref.split("/")[-1], "trial": t, **r}
+
+    results = []
+    with ThreadPoolExecutor(max_workers=max(1, parallel)) as ex:
+        for fut in as_completed([ex.submit(work, j) for j in jobs]):
+            r = fut.result()
+            results.append(r)
             tag = "ERR" if r["error"] else f"{r['score']:.3f}"
-            print(f"  [{label}] {task} → {tag}")
-            if capture_failures and not r["passed"]:
-                failures.append({"task": task, "feedback": r["feedback"]})
+            print(f"  [{label}] {r['task']} → {tag}", flush=True)
+    failures = [{"task": r["task"], "feedback": r["feedback"]}
+                for r in results if capture_failures and not r["passed"]]
     m = mean(r["score"] for r in results) if results else 0.0
     return {"label": label, "mean": round(m, 3), "results": results, "failures": failures}
 
@@ -221,23 +233,26 @@ def run_gate(cfg: Config, run_id: str, ts: str) -> dict:
     held = bookmarks(pb, cfg.task_set, "held-out")
     if not train or not held:
         raise PillboxError(f"need frozen {cfg.task_set}/{{train,held-out}}/* in '{cfg.evals_pillbox}'")
-    print(f"frozen '{cfg.task_set}': train={len(train)} held={len(held)} | "
-          f"worker={cfg.worker_model} reflector={cfg.reflector_model} trials={cfg.trials}")
+    if cfg.limit:  # fast-iteration tier: cap tasks per split
+        train, held = train[:cfg.limit], held[:cfg.limit]
+    print(f"frozen '{cfg.task_set}': train={len(train)} held={len(held)} | worker={cfg.worker_model} "
+          f"reflector={cfg.reflector_model} trials={cfg.trials} parallel={cfg.parallel}")
     playbook = open(cfg.playbook).read() if cfg.playbook and os.path.exists(cfg.playbook) else ""
+    P = cfg.parallel
 
     with tempfile.TemporaryDirectory() as tmp:
         print("== baseline (held) ==")
-        baseline = eval_arm(pb, "base", held, "", cfg.worker_model, tmp, cfg.trials)
+        baseline = eval_arm(pb, "base", held, "", cfg.worker_model, tmp, cfg.trials, P)
         print("== train (capture failures for the reflector) ==")
-        tr = eval_arm(pb, "train", train, "", cfg.worker_model, tmp, cfg.trials, capture_failures=True)
+        tr = eval_arm(pb, "train", train, "", cfg.worker_model, tmp, cfg.trials, P, capture_failures=True)
         print(f"== distill profile (reflector={cfg.reflector_model}) from {len(tr['failures'])} failures ==")
         profile = distill(pb, tr["failures"], cfg.reflector_model)
         print("== GEPA (held) ==")
-        gepa = eval_arm(pb, "gepa", held, profile, cfg.worker_model, tmp, cfg.trials)
+        gepa = eval_arm(pb, "gepa", held, profile, cfg.worker_model, tmp, cfg.trials, P)
         ace = None
         if playbook:
             print("== ACE / playbook (held) ==")
-            ace = eval_arm(pb, "ace", held, playbook, cfg.worker_model, tmp, cfg.trials)
+            ace = eval_arm(pb, "ace", held, playbook, cfg.worker_model, tmp, cfg.trials, P)
 
     return {
         "run_id": run_id, "timestamp": ts, "config": asdict(cfg),
@@ -268,6 +283,8 @@ def main():
     ap.add_argument("--evals-pillbox", default="evals")
     ap.add_argument("--trials", type=int, default=1)
     ap.add_argument("--max-wait", type=int, default=240)
+    ap.add_argument("--parallel", type=int, default=1, help="concurrent worker VMs (>1 only for LOCAL models; hosted plans throttle)")
+    ap.add_argument("--limit", type=int, default=0, help="cap tasks per split (0=all; fast iteration)")
     ap.add_argument("--in-sandbox", action="store_true")
     ap.add_argument("--runner-image", default=os.environ.get("PILLBOX_RUNNER_IMAGE", "pillbox-runner:l7"))
     ap.add_argument("--playbook", default="")
@@ -275,11 +292,17 @@ def main():
     ap.add_argument("--run-id", default="gate")
     ap.add_argument("--timestamp", default="", help="ISO stamp for the artifact (caller-supplied)")
     args = ap.parse_args()
+    # Line-buffer stdout so progress is observable when redirected to a file/pipe
+    # (Python block-buffers a non-TTY by default — otherwise a long run looks dead).
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
     cfg = Config(
         pillbox=args.pillbox, worker_model=args.worker_model, reflector_model=args.reflector_model,
         task_set=args.task_set, evals_pillbox=args.evals_pillbox, trials=args.trials,
         max_wait=args.max_wait, in_sandbox=args.in_sandbox, runner_image=args.runner_image,
-        playbook=args.playbook, out=args.out,
+        playbook=args.playbook, out=args.out, parallel=args.parallel, limit=args.limit,
     )
     artifact = run_gate(cfg, args.run_id, args.timestamp)
     with open(cfg.out, "w") as f:

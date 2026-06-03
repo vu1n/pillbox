@@ -4,8 +4,10 @@
 # it"). Zero pillbox code: this CONSUMES `run` / `session send` / `session
 # score` externally.
 #
-# Usage: run-task.sh <task-dir> <baseline|memory>
-#   task-dir: holds prompt.txt + grade.sh (+ the starting workspace files)
+# Usage: run-task.sh <task-dir|frozen-bookmark> <baseline|memory>
+#   task source: a dir (prompt.txt + workspace/ + grader/), OR a frozen-snapshot
+#                bookmark <set>/<split>/<id> in the evals pillbox (freeze-task.sh)
+#                — pulled back so every run starts from the identical tree.
 #   condition: `memory` prepends scripts/eval/memory/playbook.md to the prompt
 #
 # Prints one TSV line: "<task>\t<condition>\t<pass|fail>". The verifiable score
@@ -15,13 +17,33 @@
 #      MAX_WAIT (seconds to wait for the turn, default 120).
 set -euo pipefail
 
-task_dir="${1:?usage: run-task.sh <task-dir> <baseline|memory>}"
-condition="${2:?usage: run-task.sh <task-dir> <baseline|memory>}"
+u="usage: run-task.sh <task-dir|frozen-bookmark> <baseline|memory>"
+task_ref="${1:?$u}"
+condition="${2:?$u}"
 here="$(cd "$(dirname "$0")" && pwd)"
 PILLBOX="${PILLBOX:-$here/../../target/debug/pillbox}"
 MAX_WAIT="${MAX_WAIT:-120}"
+EVALS_PILLBOX="${EVALS_PILLBOX:-evals}"
 export PILLBOX_BACKEND=libkrun
-task="$(basename "$task_dir")"
+
+# Resolve the task source. A directory is used in place (legacy / un-frozen).
+# Otherwise it's a frozen-snapshot bookmark (<set>/<split>/<id>) in the evals
+# pillbox: pull it back so every run starts from the IDENTICAL immutable tree —
+# the dogfooded freeze (`pillbox push --bookmark` froze it). $frozen is cleaned
+# by the trap below alongside the agent's working copy.
+frozen=""
+if [ -d "$task_ref" ]; then
+  task_dir="$task_ref"
+else
+  frozen="$(mktemp -d)"
+  if ! ( cd "$frozen" && "$PILLBOX" --pillbox "$EVALS_PILLBOX" pull --bookmark "$task_ref" ) >/dev/null 2>&1; then
+    rm -rf "$frozen"
+    echo "$(basename "$task_ref")	$condition	fail(no-frozen-task:$task_ref)"
+    exit 0
+  fi
+  task_dir="$frozen"
+fi
+task="$(basename "$task_ref")"
 
 # `condition` selects the injected profile (prepended to the prompt):
 #   baseline           → nothing
@@ -42,7 +64,7 @@ fi
 # of THIS dir, so each run must start from a pristine tree). The agent sees ONLY
 # task/workspace/ — never task/grader/, so it can't read the test and hardcode.
 ws="$(mktemp -d)"
-trap 'rm -rf "$ws"' EXIT
+trap 'rm -rf "$ws" "$frozen"' EXIT
 cp -R "$task_dir/workspace/." "$ws"/
 
 # MODEL (provider/modelID) overrides opencode's default — set it to a capable

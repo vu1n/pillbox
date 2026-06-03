@@ -40,6 +40,32 @@ PILLBOX_RUNNER_IMAGE=pillbox-runner:l7 scripts/eval/run-ab.sh 5
 The bundled `add` task is a **plumbing smoke** (trivial → both conditions pass →
 no signal).
 
+## Freezing eval contexts (reproducible reruns)
+
+A task dir is mutable — edit `tasks/` and an eval from last week is no longer
+comparable. To make reruns apples-to-apples (and to enable any optimizer), freeze
+the task as an immutable snapshot and run against that, not the dir. This is the
+"ShopSnap" idea, dogfooding pillbox's own snapshot/bookmark primitives.
+
+```sh
+# one-time: a project pillbox to hold frozen tasks (bookmarks need a project;
+# the dir is just the registry key — `--name` is what `--pillbox evals` resolves)
+mkdir -p ~/.pillbox-evalstore && (cd ~/.pillbox-evalstore && pillbox new --name evals)
+
+# freeze a task → snapshot + bookmark <set>/<split>/<id> (composes push --bookmark)
+scripts/eval/freeze-task.sh tasks/ap_beer_song aider-mini train
+scripts/eval/freeze-task.sh tasks/ap_bowling   aider-mini held-out
+
+# run against the FROZEN task (pulled back identical every time)
+scripts/eval/run-task.sh aider-mini/held-out/ap_bowling baseline
+```
+
+`run-task.sh` takes either a dir (legacy) or a `<set>/<split>/<id>` bookmark
+(pulled from the evals pillbox). The snapshot freezes `workspace/` + `grader/` +
+`prompt.txt` together, so the verifier can't drift from the starting tree. Pair
+with `session score --in-sandbox` for a hermetic (offline) grade — frozen world +
+offline verifier = fully reproducible. `EVALS_PILLBOX` overrides the store name.
+
 ## Populating tasks from a benchmark
 
 Two importers emit the layout above (one dir per problem, hidden grader).
@@ -69,12 +95,13 @@ the importer + the grader location change.
   (injected at grade time) verified it → `session score` → verifiable pass in
   the §0 log (`run-task.sh he_HumanEval_0 baseline` → pass). The agent never saw
   the test.
-- ⚠️ **Trace persistence is watcher-dependent** (matters for the *optimization*
-  step, not this pass-rate A/B): the libkrun §0 conversation trace is drained
-  into `log.jsonl` only while a `watch`/`subscribe` is attached. A batch
-  `run→send→score` leaves the conversation in the raw `/event` capture file but
-  not the durable log. GEPA/ACE want the trace persisted without a live watcher
-  — the "always-on §0 drain" gap. The reward (score) is unaffected (it's
-  appended directly).
+- ✅ **§0 trace drain closed** (was watcher-dependent): `session ingest` drains
+  the libkrun `/event` capture into `log.jsonl` post-hoc + idempotent, so a batch
+  `run→send→ingest→score` persists the full trajectory without a live watcher.
+  `run-task.sh` calls it before scoring; the failure report includes the real
+  tool trajectory (the GEPA-style textual gradient).
+- ✅ **Frozen eval contexts** (2026-06-03): `freeze-task.sh` + `run-task.sh`
+  bookmark-pull give reproducible reruns from immutable snapshots (verified:
+  freeze→two pulls identical, matches source). Composes existing primitives.
 - The A/B's bottleneck is now **task curation + model budget**, not pillbox
   plumbing.

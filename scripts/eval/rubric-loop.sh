@@ -105,42 +105,24 @@ for i in $(seq 1 "$max_iter"); do
   rm -rf "$scoredir"
   last_sj="$sj"
 
-  # Classify the verdict from the structured §0 result (no stdout scrape).
-  state="$(printf '%s' "$sj" | python3 -c 'import json,sys
-try: d=json.load(sys.stdin)
-except Exception: print("grader_error"); sys.exit()
-c=d.get("criteria",[])
-if not c: print("rubric_failed")
-elif all(x.get("passed") for x in c): print("satisfied")
-else: print("needs_revision")')"
-  score="$(printf '%s' "$sj" | python3 -c 'import json,sys
-try: print("%.3f"%json.load(sys.stdin).get("score",0))
-except Exception: print("0")')"
+  # Classify the verdict via the §0-schema readers in lib.sh (no inline parsing).
+  state="$(printf '%s' "$sj" | pb_score_state)"
+  score="$(printf '%s' "$sj" | pb_score_value)"
   note "  score=${score} state=${state}"
 
   case "$state" in
     satisfied|rubric_failed|grader_error) break;;
     needs_revision)
-      # Build the next prompt from the FAILED criteria — the targeted, per-
-      # criterion gradient RubricMiddleware injects, not a bare "try again".
-      prompt="$(printf '%s' "$sj" | python3 -c 'import json,sys
-d=json.load(sys.stdin); c=d.get("criteria",[])
-fails=[x for x in c if not x.get("passed")]
-out=["Your solution does not yet pass all checks (%d/%d). Fix ONLY these failing"
-     " criteria, then stop and wait:"%(len(c)-len(fails),len(c))]
-for x in fails:
-    fb=(x.get("feedback") or "").strip()
-    out.append("\n\n- %s%s"%(x["name"], (":\n"+fb) if fb else ""))
-sys.stdout.write("".join(out))')"
+      # Re-drive with the failed-criteria feedback — the targeted, per-criterion
+      # gradient (RubricMiddleware-style), not a bare "try again".
+      prompt="$(printf '%s' "$sj" | pb_failed_feedback)"
       ;;
     *) state=grader_error; break;;
   esac
 done
 
 # Map the loop exit to a terminal verdict + final criteria snapshot.
-criteria="$(printf '%s' "$last_sj" | python3 -c 'import json,sys
-try: print(json.dumps(json.load(sys.stdin).get("criteria",[])))
-except Exception: print("[]")')"
+criteria="$(printf '%s' "$last_sj" | pb_criteria)"
 case "${state:-}" in
   satisfied|rubric_failed|grader_error) emit_verdict "$state" "$iters" "$score" "$criteria";;
   *) emit_verdict max_iterations "$iters" "$score" "$criteria";;

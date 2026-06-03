@@ -89,16 +89,13 @@ pb_drive_and_wait "$sid" "$prompt"
 # Read the verdict from the JSON surface (`passed`/`feedback`) — no stdout-scrape,
 # no reach into the §0 log for the `scored` event.
 cp -R "$task_dir/grader/." "$clone"/
-# `|| true` + the python `except → fail`: a grader that couldn't run (empty/
-# malformed JSON) is a non-pass, not a harness crash — the batch must score the
-# next task, not abort under `set -e`.
+# `|| true` + the readers' `except → fail/empty`: a grader that couldn't run
+# (empty/malformed JSON) is a non-pass, not a harness crash — the batch must
+# score the next task, not abort under `set -e`. The verdict schema reads live
+# in lib.sh (pb_passed/pb_feedback), single-sourced across the orchestrators.
 score_json="$("$PILLBOX" session score "$sid" --cmd "sh grade.sh" --workspace "$clone" --json 2>/dev/null || true)"
-verdict="$(printf '%s' "$score_json" | python3 -c 'import json,sys
-try: print("pass" if json.load(sys.stdin)["passed"] else "fail")
-except Exception: print("fail")')"
-feedback="$(printf '%s' "$score_json" | python3 -c 'import json,sys
-try: sys.stdout.write(json.load(sys.stdin).get("feedback",""))
-except Exception: pass')"
+verdict="$(printf '%s' "$score_json" | pb_passed)"
+feedback="$(printf '%s' "$score_json" | pb_feedback)"
 
 # FAILDIR: on a fail, capture a failure report (task + what the agent produced +
 # why it failed) — the input the meta-harness's `propose` step reflects on.

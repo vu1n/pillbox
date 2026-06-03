@@ -371,19 +371,30 @@ pub(crate) enum SessionAction {
         to: Option<PathBuf>,
     },
     /// Externally grade a session's result — the **verifiable, non-self-
-    /// reported reward channel** the optimization loops gate on. Runs `--cmd`
-    /// (the verifier) with cwd = the rehydrated result-snapshot (or
-    /// `--workspace`/`--snapshot`), captures its **exit code + output**, and
-    /// appends a `scored` §0 event (exit 0 → passed/score 1.0, else 0.0; output
-    /// → feedback). Distinct from `session done --status`, which is the agent's
-    /// self-report (Goodhart-banned as a reward). The grader runs on the host.
+    /// reported reward channel** the optimization loops gate on. Runs the grader
+    /// with cwd = the rehydrated result-snapshot (or `--workspace`/`--snapshot`),
+    /// captures its **exit code + output**, and appends a `scored` §0 event.
+    /// `--cmd` is one verifier (exit 0 → passed/score 1.0, else 0.0; output →
+    /// feedback); `--rubric FILE` is N named criteria → per-criterion verdicts
+    /// (`criteria[]`) + a fractional score. Distinct from `session done
+    /// --status`, the agent's self-report (Goodhart-banned as a reward).
+    #[command(group(clap::ArgGroup::new("grader").required(true).args(["cmd", "rubric"])))]
     Score {
         id: String,
         /// Verifier command, run via `sh -c` with cwd = the graded workspace.
         /// Its exit status is the verifiable pass/fail; its output is the
         /// feedback gradient (e.g. `pytest -q`, `cargo test`, a scoring script).
+        /// Mutually exclusive with `--rubric`.
         #[arg(long, value_name = "CMD")]
-        cmd: String,
+        cmd: Option<String>,
+        /// Grade against a rubric file instead of one `--cmd`: each non-blank,
+        /// non-`#` line is `NAME :: COMMAND`, a named criterion run via `sh -c`
+        /// in the graded workspace. The `scored` event gains per-criterion
+        /// verdicts (`criteria[]`) and `score` becomes the passed fraction — the
+        /// rich, decomposed feedback an optimizer reflects on. Mutually exclusive
+        /// with `--cmd`.
+        #[arg(long, value_name = "FILE")]
+        rubric: Option<PathBuf>,
         /// Grade this snapshot (rehydrated) instead of the session's
         /// `result_snapshot`.
         #[arg(long, value_name = "HANDLE")]

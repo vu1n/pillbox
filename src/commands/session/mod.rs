@@ -212,6 +212,7 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> 
         SessionAction::Score {
             id,
             cmd,
+            rubric,
             snapshot,
             workspace,
             in_sandbox,
@@ -220,7 +221,8 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> 
         } => session_score(
             resolved,
             &id,
-            &cmd,
+            cmd.as_deref(),
+            rubric.as_deref(),
             snapshot.as_deref(),
             workspace.as_deref(),
             in_sandbox,
@@ -916,18 +918,131 @@ fn select_log_events(
     Ok(matched)
 }
 
+/// `\x1e` (RECORD SEPARATOR) prefix for rubric frame markers — a control byte
+/// that won't collide with real test output, so we can frame each criterion's
+/// stdout/stderr inline without base64 or temp files.
+const RUBRIC_START: &str = "\u{1e}PBCRIT-START\t";
+const RUBRIC_END: &str = "\u{1e}PBCRIT-END\t";
+
+/// Parse a rubric file into `(name, command)` criteria: each non-blank, non-`#`
+/// line is `NAME :: COMMAND`. Names can't carry a tab/newline/sentinel (they'd
+/// corrupt the frame markers) — reject loudly rather than emit a broken script.
+fn parse_rubric(text: &str) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for (i, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (name, command) = line.split_once("::").ok_or_else(|| {
+            PillboxError::usage(
+                "session score",
+                format!("rubric line {} is not `NAME :: COMMAND`: {line}", i + 1),
+            )
+        })?;
+        let (name, command) = (name.trim(), command.trim());
+        if name.is_empty() || command.is_empty() {
+            return Err(PillboxError::usage(
+                "session score",
+                format!("rubric line {} has an empty name or command", i + 1),
+            )
+            .into());
+        }
+        if name.contains(['\t', '\n', '\u{1e}']) {
+            return Err(PillboxError::usage(
+                "session score",
+                format!(
+                    "rubric criterion name on line {} contains a reserved control character",
+                    i + 1
+                ),
+            )
+            .into());
+        }
+        out.push((name.to_string(), command.to_string()));
+    }
+    if out.is_empty() {
+        return Err(PillboxError::usage("session score", "rubric file has no criteria").into());
+    }
+    Ok(out)
+}
+
+/// Single-quote `s` for `sh` (wrap in `'…'`, escaping embedded quotes as `'\''`).
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Compile criteria into ONE shell script: per criterion, frame its combined
+/// output with START/END markers and capture the real exit (the `\n` before each
+/// marker guarantees it lands at line start even when a command's output has no
+/// trailing newline). Exits nonzero iff any criterion failed — so the existing
+/// `passed = code == 0` still holds. Runs through the unchanged executor, so
+/// `--in-sandbox`/`--grader-egress` work for free.
+fn compile_rubric(criteria: &[(String, String)]) -> String {
+    let mut script = String::from("__pb_fail=0\n");
+    for (name, command) in criteria {
+        script.push_str(&format!(
+            "printf '\\n\\036PBCRIT-START\\t%s\\n' {}\n\
+             sh -c {} 2>&1; __pb_rc=$?\n\
+             printf '\\n\\036PBCRIT-END\\t%s\\n' \"$__pb_rc\"\n\
+             [ \"$__pb_rc\" -eq 0 ] || __pb_fail=1\n",
+            sh_quote(name),
+            sh_quote(command),
+        ));
+    }
+    script.push_str("exit \"$__pb_fail\"\n");
+    script
+}
+
+/// Parse a compiled rubric's framed output into per-criterion verdicts: text
+/// between a START(name) and END(exit) marker is that criterion's feedback;
+/// `passed` = exit 0. Each criterion's feedback is tail-capped so N criteria
+/// can't bloat the §0 line.
+fn parse_rubric_output(raw: &str) -> Vec<crate::contract::Criterion> {
+    const PER_CRIT_CAP: usize = 8 * 1024;
+    let mut crits = Vec::new();
+    let mut cur: Option<(String, Vec<&str>)> = None;
+    for line in raw.lines() {
+        if let Some(name) = line.strip_prefix(RUBRIC_START) {
+            cur = Some((name.to_string(), Vec::new()));
+        } else if let Some(exit) = line.strip_prefix(RUBRIC_END) {
+            if let Some((name, body)) = cur.take() {
+                crits.push(crate::contract::Criterion {
+                    name,
+                    passed: exit.trim() == "0",
+                    feedback: cap_tail(body.join("\n").trim().to_string(), PER_CRIT_CAP),
+                });
+            }
+        } else if let Some((_, body)) = cur.as_mut() {
+            body.push(line);
+        }
+    }
+    crits
+}
+
+/// A short human/`feedback`-field summary of a rubric grade — one `✓/✗ name`
+/// line per criterion. The structured detail lives in `criteria[]`.
+fn render_rubric_summary(criteria: &[crate::contract::Criterion]) -> String {
+    criteria
+        .iter()
+        .map(|c| format!("{} {}", if c.passed { "✓" } else { "✗" }, c.name))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Externally grade a session's result and record it as a verifiable `scored`
-/// §0 event — the reward channel the optimization loops gate on. Runs `cmd`
+/// §0 event — the reward channel the optimization loops gate on. Runs the grader
 /// (via `sh -c`) with cwd = the graded workspace: `workspace` if given, else a
 /// rehydrated snapshot (`snapshot`, or the session's `result_snapshot`). The
 /// grader's **exit status** is the verifiable pass/fail (NOT the agent's
 /// `session done` self-report); its combined output is the feedback gradient.
-/// The grader runs on the HOST — it's the invoker's own `--cmd`, like a Makefile
-/// target; a sandboxed grader is a future upgrade.
+/// `--cmd` is one command; `--rubric FILE` is N named criteria → per-criterion
+/// verdicts + a fractional score. `--in-sandbox` runs it in a one-shot microVM.
+#[allow(clippy::too_many_arguments)] // a CLI leaf handler — args mirror parsed flags 1:1
 fn session_score(
     resolved: &Pillbox,
     id: &str,
-    cmd: &str,
+    cmd: Option<&str>,
+    rubric: Option<&std::path::Path>,
     snapshot: Option<&str>,
     workspace: Option<&std::path::Path>,
     in_sandbox: bool,
@@ -945,6 +1060,36 @@ fn session_score(
         )
         .into());
     }
+
+    // Resolve the grader to a single executable command + a label for the §0
+    // event. A rubric compiles to one script (so the executor below is identical
+    // for both modes); `is_rubric` switches how its output is scored. clap's
+    // ArgGroup guarantees exactly one of --cmd/--rubric, so the final arm is
+    // unreachable — but we surface it rather than `unreachable!`.
+    let (exec_cmd, grader_label, is_rubric) = match (cmd, rubric) {
+        (Some(c), None) => (c.to_string(), c.to_string(), false),
+        (None, Some(path)) => {
+            let text = std::fs::read_to_string(path).map_err(|e| {
+                PillboxError::runtime(
+                    "session score",
+                    format!("read rubric {}: {e}", path.display()),
+                )
+            })?;
+            let criteria = parse_rubric(&text)?;
+            (
+                compile_rubric(&criteria),
+                format!("rubric:{}", path.display()),
+                true,
+            )
+        }
+        _ => {
+            return Err(PillboxError::usage(
+                "session score",
+                "provide exactly one of --cmd or --rubric",
+            )
+            .into())
+        }
+    };
     let session = session::resolve(resolved, id)?;
 
     // Resolve the dir to grade. --workspace wins; else rehydrate a snapshot into
@@ -977,46 +1122,76 @@ fn session_score(
     };
 
     // The grader's exit status IS the verifiable grade — we run it + record what
-    // it reports, never the agent's claim. `--in-sandbox` runs it in a one-shot
-    // microVM (the runner toolchain) instead of on the host.
-    let (code, feedback) = if in_sandbox {
-        let (c, raw) = libkrun_score_in_sandbox(resolved, &grade_dir, cmd, grader_egress)?;
-        (c, score_feedback(raw.as_bytes(), &[]))
+    // it reports, never the agent's claim. Keep the output RAW (uncapped): a
+    // rubric's frame markers are interspersed, so capping here (tail-only) could
+    // drop early criteria. `--in-sandbox` runs it in a one-shot microVM.
+    let (code, raw) = if in_sandbox {
+        libkrun_score_in_sandbox(resolved, &grade_dir, &exec_cmd, grader_egress)?
     } else {
         let out = std::process::Command::new("sh")
             .arg("-c")
-            .arg(cmd)
+            .arg(&exec_cmd)
             .current_dir(&grade_dir)
             .output()
-            .map_err(|e| {
-                PillboxError::runtime("session score", format!("run grader `{cmd}`: {e}"))
-            })?;
+            .map_err(|e| PillboxError::runtime("session score", format!("run grader: {e}")))?;
         (
             out.status.code().unwrap_or(-1),
-            score_feedback(&out.stdout, &out.stderr),
+            combine_streams(&out.stdout, &out.stderr),
         )
     };
+
     let passed = code == 0;
-    let score = if passed { 1.0 } else { 0.0 };
+    // A rubric scores as the passed fraction (a real gradient); `feedback` is the
+    // summary, `criteria[]` the structured detail. A plain --cmd stays binary.
+    let (score, feedback, criteria) = if is_rubric {
+        let criteria = parse_rubric_output(&raw);
+        if criteria.is_empty() {
+            // No frames parsed → the compiled script itself failed before any
+            // criterion (e.g. a shell error). Surface the raw output, score 0.
+            (0.0, cap_tail(raw, FEEDBACK_CAP), criteria)
+        } else {
+            let hits = criteria.iter().filter(|c| c.passed).count();
+            (
+                hits as f64 / criteria.len() as f64,
+                render_rubric_summary(&criteria),
+                criteria,
+            )
+        }
+    } else {
+        (
+            if passed { 1.0 } else { 0.0 },
+            cap_tail(raw, FEEDBACK_CAP),
+            Vec::new(),
+        )
+    };
 
     // Record on the durable §0 log — the source of truth the meta-harness reads.
     let mut log = crate::events::log::SessionLog::open(resolved, &session.id)?;
     let seq = log.append(&[crate::contract::Event::session(
         &session.id,
         crate::contract::Payload::Scored(crate::contract::Scored {
-            grader: cmd.to_string(),
+            grader: grader_label.clone(),
             passed,
             score,
-            // `feedback` is moved into the event; clone for the --json echo so
-            // the caller gets the gradient without re-reading the §0 log.
+            // Cloned for the --json echo so the caller gets the gradient without
+            // re-reading the §0 log.
             feedback: feedback.clone(),
+            criteria: criteria.clone(),
         }),
     )])?;
 
     if json {
         println!(
             "{}",
-            score_verdict_json(&session.id, cmd, passed, score, &feedback, seq)
+            score_verdict_json(
+                &session.id,
+                &grader_label,
+                passed,
+                score,
+                &feedback,
+                &criteria,
+                seq
+            )
         );
     } else {
         let mark = if passed { "✓" } else { "✗" };
@@ -1025,7 +1200,11 @@ fn session_score(
             session.id,
             if passed { "passed" } else { "failed" }
         );
-        println!("  grader: {cmd}");
+        println!("  grader: {grader_label}");
+        // List each criterion for a rubric grade — the at-a-glance "which failed".
+        for c in &criteria {
+            println!("  {} {}", if c.passed { "✓" } else { "✗" }, c.name);
+        }
     }
     Ok(())
 }
@@ -1040,9 +1219,10 @@ fn score_verdict_json(
     passed: bool,
     score: f64,
     feedback: &str,
+    criteria: &[crate::contract::Criterion],
     seq: u64,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut v = serde_json::json!({
         "version": 1,
         "session": session_id,
         "grader": grader,
@@ -1050,14 +1230,20 @@ fn score_verdict_json(
         "score": score,
         "feedback": feedback,
         "seq": seq,
-    })
+    });
+    // Only present for a rubric grade — keep the plain --cmd verdict shape stable.
+    if !criteria.is_empty() {
+        v["criteria"] = serde_json::to_value(criteria).unwrap_or(serde_json::Value::Null);
+    }
+    v
 }
 
-/// Combine a grader's stdout+stderr into the `feedback` gradient, capped (keeping
-/// the TAIL — pytest/cargo-test put the failure summary last) so one grade can't
-/// bloat a §0 log line.
-fn score_feedback(stdout: &[u8], stderr: &[u8]) -> String {
-    const CAP: usize = 32 * 1024;
+/// Default §0 feedback cap — one grade can't bloat a log line.
+const FEEDBACK_CAP: usize = 32 * 1024;
+
+/// Combine a grader's stdout+stderr into one feedback string (uncapped). The raw
+/// gradient; cap with [`cap_tail`] before it lands on a §0 line.
+fn combine_streams(stdout: &[u8], stderr: &[u8]) -> String {
     let mut s = String::from_utf8_lossy(stdout).into_owned();
     let err = String::from_utf8_lossy(stderr);
     if !err.trim().is_empty() {
@@ -1066,8 +1252,15 @@ fn score_feedback(stdout: &[u8], stderr: &[u8]) -> String {
         }
         s.push_str(&err);
     }
-    if s.len() > CAP {
-        let mut cut = s.len() - CAP;
+    s
+}
+
+/// Keep the TAIL of `s` within `cap` bytes (pytest/cargo-test put the failure
+/// summary last), on a char boundary. The single capping primitive — applied to
+/// a whole-grade feedback blob and to each rubric criterion's output.
+fn cap_tail(mut s: String, cap: usize) -> String {
+    if s.len() > cap {
+        let mut cut = s.len() - cap;
         while !s.is_char_boundary(cut) {
             cut += 1;
         }
@@ -1262,16 +1455,15 @@ mod tests {
     }
 
     #[test]
-    fn score_feedback_combines_streams() {
-        let f = score_feedback(b"out", b"err");
-        assert_eq!(f, "out\nerr");
-        assert_eq!(score_feedback(b"only-out", b""), "only-out");
-        assert_eq!(score_feedback(b"", b"only-err"), "only-err");
+    fn combine_streams_joins_nonempty() {
+        assert_eq!(combine_streams(b"out", b"err"), "out\nerr");
+        assert_eq!(combine_streams(b"only-out", b""), "only-out");
+        assert_eq!(combine_streams(b"", b"only-err"), "only-err");
     }
 
     #[test]
     fn score_verdict_json_is_the_documented_shape() {
-        let v = score_verdict_json("abc123", "pytest -q", true, 1.0, "5 passed", 7);
+        let v = score_verdict_json("abc123", "pytest -q", true, 1.0, "5 passed", &[], 7);
         assert_eq!(v["version"], 1);
         assert_eq!(v["session"], "abc123");
         assert_eq!(v["grader"], "pytest -q");
@@ -1279,6 +1471,8 @@ mod tests {
         assert_eq!(v["score"], 1.0);
         assert_eq!(v["feedback"], "5 passed");
         assert_eq!(v["seq"], 7);
+        // No criteria for a plain --cmd grade — keep the legacy shape stable.
+        assert!(v.get("criteria").is_none());
     }
 
     #[test]
@@ -1286,11 +1480,32 @@ mod tests {
         // Grader output with quotes/newlines must round-trip as one JSON value —
         // the whole reason for serde over a format string.
         let nasty = "line1\n\"quoted\"\ttab \\ backslash";
-        let v = score_verdict_json("s", "g", false, 0.0, nasty, 1);
+        let v = score_verdict_json("s", "g", false, 0.0, nasty, &[], 1);
         let s = v.to_string();
         let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(parsed["feedback"], nasty);
         assert_eq!(parsed["passed"], false);
+    }
+
+    #[test]
+    fn score_verdict_json_includes_criteria_for_a_rubric() {
+        let criteria = vec![crate::contract::Criterion {
+            name: "tests pass".into(),
+            passed: false,
+            feedback: "1 failed".into(),
+        }];
+        let v = score_verdict_json(
+            "s",
+            "rubric:r.txt",
+            false,
+            0.5,
+            "✗ tests pass",
+            &criteria,
+            3,
+        );
+        assert_eq!(v["criteria"][0]["name"], "tests pass");
+        assert_eq!(v["criteria"][0]["passed"], false);
+        assert_eq!(v["score"], 0.5);
     }
 
     #[test]
@@ -1313,6 +1528,7 @@ mod tests {
                 passed: s >= 1.0,
                 score: s,
                 feedback: String::new(),
+                criteria: Vec::new(),
             }))
         };
         let events = vec![tool("read"), scored(0.0), tool("edit"), scored(1.0)];
@@ -1338,12 +1554,67 @@ mod tests {
     }
 
     #[test]
-    fn score_feedback_keeps_the_tail_when_capped() {
+    fn cap_tail_keeps_the_tail() {
         let big = "x".repeat(40 * 1024) + "TAIL-VERDICT";
-        let f = score_feedback(big.as_bytes(), b"");
+        let f = cap_tail(big, 32 * 1024);
         assert!(f.starts_with("…[truncated"), "{}", &f[..40]);
         assert!(f.ends_with("TAIL-VERDICT"), "tail kept");
         assert!(f.len() < 34 * 1024, "capped near 32K, got {}", f.len());
+    }
+
+    #[test]
+    fn parse_rubric_reads_named_criteria_and_skips_noise() {
+        let r =
+            parse_rubric("# header\n\nAll tests pass :: pytest -q\nhas fn :: grep -q def f.py\n")
+                .unwrap();
+        assert_eq!(r.len(), 2);
+        assert_eq!(
+            r[0],
+            ("All tests pass".to_string(), "pytest -q".to_string())
+        );
+        assert_eq!(r[1].1, "grep -q def f.py");
+    }
+
+    #[test]
+    fn parse_rubric_rejects_malformed_and_empty() {
+        assert!(parse_rubric("no separator here").is_err());
+        assert!(parse_rubric(":: command with no name").is_err());
+        assert!(parse_rubric("# only comments\n\n").is_err());
+        // A tab in a name would corrupt the frame marker.
+        assert!(parse_rubric("bad\tname :: echo hi").is_err());
+    }
+
+    #[test]
+    fn compile_then_parse_rubric_roundtrips_verdicts() {
+        // Compile a 2-criterion rubric (one passes, one fails), run it through a
+        // real shell, and confirm the framed output parses back to per-criterion
+        // verdicts — the end-to-end marker contract without a session/VM.
+        let script = compile_rubric(&[
+            ("says hi".into(), "echo hi".into()),
+            ("fails".into(), "echo boom; exit 3".into()),
+        ]);
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .unwrap();
+        // The script exits nonzero iff any criterion failed.
+        assert_ne!(out.status.code(), Some(0));
+        let raw = combine_streams(&out.stdout, &out.stderr);
+        let crits = parse_rubric_output(&raw);
+        assert_eq!(crits.len(), 2);
+        assert_eq!(crits[0].name, "says hi");
+        assert!(crits[0].passed);
+        assert_eq!(crits[0].feedback, "hi");
+        assert_eq!(crits[1].name, "fails");
+        assert!(!crits[1].passed);
+        assert!(crits[1].feedback.contains("boom"));
+    }
+
+    #[test]
+    fn sh_quote_escapes_embedded_single_quote() {
+        assert_eq!(sh_quote("plain"), "'plain'");
+        assert_eq!(sh_quote("it's"), "'it'\\''s'");
     }
 
     #[test]

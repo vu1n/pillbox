@@ -10,11 +10,10 @@
 #
 # `--json` makes `run` emit `{version:1,session:{id,…}}` on stdout instead of the
 # human banner, so we parse the id structurally — no `grep`-the-banner scrape.
-# `--detach` is only here to satisfy --json's clap gate: opencode is server-mode,
-# so the run is already reparented and `--detach` is a functional no-op (run_server
-# is reached before the detach branch). Relaxing that clap coupling is a follow-up.
+# opencode is server-mode, so `run --json` is valid without `--detach` (the run
+# persists a session record regardless).
 pb_run_session() {
-  "$PILLBOX" run --agent opencode --detach --json --workspace "$1" ${MODEL:+--model "$MODEL"} 2>/dev/null \
+  "$PILLBOX" run --agent opencode --json --workspace "$1" ${MODEL:+--model "$MODEL"} 2>/dev/null \
     | python3 -c 'import json,sys
 try: print(json.load(sys.stdin)["session"]["id"])
 except Exception: pass'

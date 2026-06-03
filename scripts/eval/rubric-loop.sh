@@ -45,6 +45,7 @@ while [ $# -gt 0 ]; do case "$1" in
   *) task="$1"; shift;;
 esac; done
 [ -n "$task" ] || { echo "usage: rubric-loop.sh <task-dir> [--max-iter N] [--json]" >&2; exit 2; }
+case "$max_iter" in ''|*[!0-9]*|0) echo "--max-iter must be a positive integer" >&2; exit 2;; esac
 rubric="$task/rubric.txt"
 { [ -f "$task/prompt.txt" ] && [ -d "$task/workspace" ] && [ -f "$rubric" ]; } || {
   echo "task dir must contain prompt.txt + workspace/ + rubric.txt" >&2; exit 2; }
@@ -70,12 +71,16 @@ print(json.dumps({"verdict":sys.argv[1],"iterations":int(sys.argv[2]),
 # clone; we keep the source tree clean for reproducibility).
 ws="$(mktemp -d)"; trap 'rm -rf "$ws"' EXIT
 cp -R "$task/workspace/." "$ws"/
-sid="$(pb_run_session "$ws")"
+# `|| true`: pb_run_session is a `pillbox | python3` pipeline; under `set -o
+# pipefail` a failed launch makes the assignment nonzero, which `set -e` would
+# abort on BEFORE the guard below — so tolerate it and let the guard emit the
+# grader_error verdict (the loop's documented contract).
+sid="$(pb_run_session "$ws")" || true
 [ -n "$sid" ] || emit_verdict grader_error 0 0 '[]'
 # From here, always tear the session down on exit.
 trap '"$PILLBOX" session rm "$sid" >/dev/null 2>&1 || true; rm -rf "$ws"' EXIT
 
-clone="$(pb_workspace "$sid")"
+clone="$(pb_workspace "$sid")" || true
 [ -n "$clone" ] || emit_verdict grader_error 0 0 '[]'
 
 prompt="$(cat "$task/prompt.txt")"

@@ -7,9 +7,17 @@
 
 # Start an opencode session against workspace $1; echo the 12-hex session id (or
 # empty on failure, which the caller guards). MODEL overrides opencode's default.
+#
+# `--json` makes `run` emit `{version:1,session:{id,…}}` on stdout instead of the
+# human banner, so we parse the id structurally — no `grep`-the-banner scrape.
+# `--detach` is only here to satisfy --json's clap gate: opencode is server-mode,
+# so the run is already reparented and `--detach` is a functional no-op (run_server
+# is reached before the detach branch). Relaxing that clap coupling is a follow-up.
 pb_run_session() {
-  "$PILLBOX" run --agent opencode --workspace "$1" ${MODEL:+--model "$MODEL"} 2>&1 \
-    | grep -oE '[0-9a-f]{12}' | head -1
+  "$PILLBOX" run --agent opencode --detach --json --workspace "$1" ${MODEL:+--model "$MODEL"} 2>/dev/null \
+    | python3 -c 'import json,sys
+try: print(json.load(sys.stdin)["session"]["id"])
+except Exception: pass'
 }
 
 # Echo the host path of session $1's result-workspace (the agent's CoW clone),

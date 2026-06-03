@@ -899,8 +899,10 @@ fn select_log_events(
         let v = serde_json::to_value(&ev)
             .map_err(|e| PillboxError::runtime("session log", format!("serialize event: {e}")))?;
         if let Some(want) = &want {
-            // `Unknown` re-serializes without a real tag; treat a missing tag as
-            // unmatchable so a `--type` filter never silently includes it.
+            // Match on the serialized payload `type` tag. A foreign/forward
+            // payload lands as `Payload::Unknown`, which re-serializes as
+            // `{"type":"unknown"}` — so `--type unknown` deliberately selects it;
+            // a missing tag (shouldn't happen) is unmatchable.
             match v
                 .get("payload")
                 .and_then(|p| p.get("type"))
@@ -918,15 +920,19 @@ fn select_log_events(
     Ok(matched)
 }
 
-/// `\x1e` (RECORD SEPARATOR) prefix for rubric frame markers — a control byte
-/// that won't collide with real test output, so we can frame each criterion's
-/// stdout/stderr inline without base64 or temp files.
-const RUBRIC_START: &str = "\u{1e}PBCRIT-START\t";
-const RUBRIC_END: &str = "\u{1e}PBCRIT-END\t";
+/// `\x1e` (RECORD SEPARATOR) prefixed marker line emitted once per criterion:
+/// `\x1ePBCRIT\t<exit>\t<name-b64>\t<output-b64>`. The verdict (`<exit>`) is the
+/// shell's `$?`, and the name/output are base64 — so a criterion's OWN output
+/// (which the graded agent controls) is inert: it can't forge a marker line or
+/// flip a verdict. This is the reward-channel integrity boundary — see
+/// [`compile_rubric`]/[`parse_rubric_output`] and the forge-resistance test.
+const RUBRIC_MARKER: &str = "\u{1e}PBCRIT\t";
 
 /// Parse a rubric file into `(name, command)` criteria: each non-blank, non-`#`
-/// line is `NAME :: COMMAND`. Names can't carry a tab/newline/sentinel (they'd
-/// corrupt the frame markers) — reject loudly rather than emit a broken script.
+/// line is `NAME :: COMMAND`, split on the FIRST ` :: ` (space-padded, matching
+/// the documented form). So a name may contain `::` and a command may contain a
+/// later ` :: `; only the first separator binds. Names are base64-framed
+/// downstream, so any name content is safe.
 fn parse_rubric(text: &str) -> Result<Vec<(String, String)>> {
     let mut out = Vec::new();
     for (i, raw) in text.lines().enumerate() {
@@ -934,7 +940,7 @@ fn parse_rubric(text: &str) -> Result<Vec<(String, String)>> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let (name, command) = line.split_once("::").ok_or_else(|| {
+        let (name, command) = line.split_once(" :: ").ok_or_else(|| {
             PillboxError::usage(
                 "session score",
                 format!("rubric line {} is not `NAME :: COMMAND`: {line}", i + 1),
@@ -945,16 +951,6 @@ fn parse_rubric(text: &str) -> Result<Vec<(String, String)>> {
             return Err(PillboxError::usage(
                 "session score",
                 format!("rubric line {} has an empty name or command", i + 1),
-            )
-            .into());
-        }
-        if name.contains(['\t', '\n', '\u{1e}']) {
-            return Err(PillboxError::usage(
-                "session score",
-                format!(
-                    "rubric criterion name on line {} contains a reserved control character",
-                    i + 1
-                ),
             )
             .into());
         }
@@ -971,21 +967,24 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Compile criteria into ONE shell script: per criterion, frame its combined
-/// output with START/END markers and capture the real exit (the `\n` before each
-/// marker guarantees it lands at line start even when a command's output has no
-/// trailing newline). Exits nonzero iff any criterion failed — so the existing
-/// `passed = code == 0` still holds. Runs through the unchanged executor, so
-/// `--in-sandbox`/`--grader-egress` work for free.
+/// Compile criteria into ONE shell script. Per criterion: capture combined output
+/// into `$__pb_o` and the REAL exit into `$__pb_rc` (`$?`), then emit a single
+/// marker line with the exit + base64(name) + base64(output). The command's
+/// output never reaches the script's stdout directly (it's captured, then
+/// base64-re-emitted), so a malicious criterion can't forge a marker or flip its
+/// own verdict — the exit is the shell's, not anything the agent can print. Exits
+/// nonzero iff any criterion failed, so `passed = code == 0` still holds. Runs
+/// through the unchanged executor, so `--in-sandbox`/`--grader-egress` are free.
 fn compile_rubric(criteria: &[(String, String)]) -> String {
+    use base64::Engine as _;
     let mut script = String::from("__pb_fail=0\n");
     for (name, command) in criteria {
+        let name_b64 = base64::engine::general_purpose::STANDARD.encode(name);
         script.push_str(&format!(
-            "printf '\\n\\036PBCRIT-START\\t%s\\n' {}\n\
-             sh -c {} 2>&1; __pb_rc=$?\n\
-             printf '\\n\\036PBCRIT-END\\t%s\\n' \"$__pb_rc\"\n\
+            "__pb_o=$(sh -c {} 2>&1); __pb_rc=$?\n\
+             printf '\\036PBCRIT\\t%s\\t%s\\t%s\\n' \"$__pb_rc\" '{name_b64}' \
+             \"$(printf %s \"$__pb_o\" | base64 | tr -d '\\n')\"\n\
              [ \"$__pb_rc\" -eq 0 ] || __pb_fail=1\n",
-            sh_quote(name),
             sh_quote(command),
         ));
     }
@@ -993,28 +992,38 @@ fn compile_rubric(criteria: &[(String, String)]) -> String {
     script
 }
 
-/// Parse a compiled rubric's framed output into per-criterion verdicts: text
-/// between a START(name) and END(exit) marker is that criterion's feedback;
-/// `passed` = exit 0. Each criterion's feedback is tail-capped so N criteria
-/// can't bloat the §0 line.
+/// Parse a compiled rubric's marker lines into per-criterion verdicts. Each
+/// `RUBRIC_MARKER` line is `<exit>\t<name-b64>\t<output-b64>`; `passed` = exit 0,
+/// feedback = base64-decoded output (tail-capped so N criteria can't bloat the §0
+/// line). Non-marker lines are ignored — only our framing is trusted (the forge
+/// boundary; see [`RUBRIC_MARKER`]). A missing `base64` tool in the grader env
+/// degrades feedback to empty but leaves the exit-derived verdict intact.
 fn parse_rubric_output(raw: &str) -> Vec<crate::contract::Criterion> {
+    use base64::Engine as _;
     const PER_CRIT_CAP: usize = 8 * 1024;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let decode = |s: &str| {
+        b64.decode(s.trim())
+            .ok()
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+    };
     let mut crits = Vec::new();
-    let mut cur: Option<(String, Vec<&str>)> = None;
     for line in raw.lines() {
-        if let Some(name) = line.strip_prefix(RUBRIC_START) {
-            cur = Some((name.to_string(), Vec::new()));
-        } else if let Some(exit) = line.strip_prefix(RUBRIC_END) {
-            if let Some((name, body)) = cur.take() {
-                crits.push(crate::contract::Criterion {
-                    name,
-                    passed: exit.trim() == "0",
-                    feedback: cap_tail(body.join("\n").trim().to_string(), PER_CRIT_CAP),
-                });
-            }
-        } else if let Some((_, body)) = cur.as_mut() {
-            body.push(line);
-        }
+        let Some(rest) = line.strip_prefix(RUBRIC_MARKER) else {
+            continue;
+        };
+        let mut fields = rest.splitn(3, '\t');
+        let (Some(exit), Some(name_b64)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let feedback = fields.next().and_then(decode).unwrap_or_default();
+        crits.push(crate::contract::Criterion {
+            // A name we emitted is always valid base64; fall back to the raw field
+            // only if somehow not, so a criterion never silently vanishes.
+            name: decode(name_b64).unwrap_or_else(|| name_b64.to_string()),
+            passed: exit.trim() == "0",
+            feedback: cap_tail(feedback.trim().to_string(), PER_CRIT_CAP),
+        });
     }
     crits
 }
@@ -1165,44 +1174,34 @@ fn session_score(
         )
     };
 
+    let scored = crate::contract::Scored {
+        grader: grader_label,
+        passed,
+        score,
+        feedback,
+        criteria,
+    };
+
     // Record on the durable §0 log — the source of truth the meta-harness reads.
     let mut log = crate::events::log::SessionLog::open(resolved, &session.id)?;
     let seq = log.append(&[crate::contract::Event::session(
         &session.id,
-        crate::contract::Payload::Scored(crate::contract::Scored {
-            grader: grader_label.clone(),
-            passed,
-            score,
-            // Cloned for the --json echo so the caller gets the gradient without
-            // re-reading the §0 log.
-            feedback: feedback.clone(),
-            criteria: criteria.clone(),
-        }),
+        crate::contract::Payload::Scored(scored.clone()),
     )])?;
 
     if json {
-        println!(
-            "{}",
-            score_verdict_json(
-                &session.id,
-                &grader_label,
-                passed,
-                score,
-                &feedback,
-                &criteria,
-                seq
-            )
-        );
+        println!("{}", score_verdict_json(&session.id, &scored, seq));
     } else {
-        let mark = if passed { "✓" } else { "✗" };
+        let mark = if scored.passed { "✓" } else { "✗" };
         println!(
-            "pillbox: {mark} session `{}` scored {score:.2} ({})",
+            "pillbox: {mark} session `{}` scored {:.2} ({})",
             session.id,
-            if passed { "passed" } else { "failed" }
+            scored.score,
+            if scored.passed { "passed" } else { "failed" }
         );
-        println!("  grader: {grader_label}");
+        println!("  grader: {}", scored.grader);
         // List each criterion for a rubric grade — the at-a-glance "which failed".
-        for c in &criteria {
+        for c in &scored.criteria {
             println!("  {} {}", if c.passed { "✓" } else { "✗" }, c.name);
         }
     }
@@ -1210,30 +1209,22 @@ fn session_score(
 }
 
 /// The `score --json` verdict — the structured result a caller reads instead of
-/// scraping stdout or the §0 log. Built via serde_json (not a format string) so
-/// arbitrary grader `feedback` — newlines, quotes, control bytes — is escaped
-/// correctly. `seq` is the appended `scored` event's log seq, for a §0 follow-up.
+/// scraping stdout or the §0 log. The verdict body IS the `Scored` event —
+/// serialize it once (so the `--json` surface and the §0 log event can't diverge,
+/// and `Scored`'s `skip_serializing_if` rules carry through, e.g. empty `criteria`
+/// omitted), then add the `version`/`session`/`seq` envelope. serde-built (not a
+/// format string), so arbitrary `feedback` is escaped correctly. `seq` is the
+/// appended event's log seq, for a §0 follow-up.
 fn score_verdict_json(
     session_id: &str,
-    grader: &str,
-    passed: bool,
-    score: f64,
-    feedback: &str,
-    criteria: &[crate::contract::Criterion],
+    scored: &crate::contract::Scored,
     seq: u64,
 ) -> serde_json::Value {
-    let mut v = serde_json::json!({
-        "version": 1,
-        "session": session_id,
-        "grader": grader,
-        "passed": passed,
-        "score": score,
-        "feedback": feedback,
-        "seq": seq,
-    });
-    // Only present for a rubric grade — keep the plain --cmd verdict shape stable.
-    if !criteria.is_empty() {
-        v["criteria"] = serde_json::to_value(criteria).unwrap_or(serde_json::Value::Null);
+    let mut v = serde_json::to_value(scored).unwrap_or(serde_json::Value::Null);
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("version".into(), serde_json::json!(1));
+        obj.insert("session".into(), serde_json::json!(session_id));
+        obj.insert("seq".into(), serde_json::json!(seq));
     }
     v
 }
@@ -1461,9 +1452,19 @@ mod tests {
         assert_eq!(combine_streams(b"", b"only-err"), "only-err");
     }
 
+    fn scored(grader: &str, passed: bool, score: f64, feedback: &str) -> crate::contract::Scored {
+        crate::contract::Scored {
+            grader: grader.into(),
+            passed,
+            score,
+            feedback: feedback.into(),
+            criteria: Vec::new(),
+        }
+    }
+
     #[test]
     fn score_verdict_json_is_the_documented_shape() {
-        let v = score_verdict_json("abc123", "pytest -q", true, 1.0, "5 passed", &[], 7);
+        let v = score_verdict_json("abc123", &scored("pytest -q", true, 1.0, "5 passed"), 7);
         assert_eq!(v["version"], 1);
         assert_eq!(v["session"], "abc123");
         assert_eq!(v["grader"], "pytest -q");
@@ -1480,7 +1481,7 @@ mod tests {
         // Grader output with quotes/newlines must round-trip as one JSON value —
         // the whole reason for serde over a format string.
         let nasty = "line1\n\"quoted\"\ttab \\ backslash";
-        let v = score_verdict_json("s", "g", false, 0.0, nasty, &[], 1);
+        let v = score_verdict_json("s", &scored("g", false, 0.0, nasty), 1);
         let s = v.to_string();
         let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(parsed["feedback"], nasty);
@@ -1489,20 +1490,13 @@ mod tests {
 
     #[test]
     fn score_verdict_json_includes_criteria_for_a_rubric() {
-        let criteria = vec![crate::contract::Criterion {
+        let mut s = scored("rubric:r.txt", false, 0.5, "✗ tests pass");
+        s.criteria = vec![crate::contract::Criterion {
             name: "tests pass".into(),
             passed: false,
             feedback: "1 failed".into(),
         }];
-        let v = score_verdict_json(
-            "s",
-            "rubric:r.txt",
-            false,
-            0.5,
-            "✗ tests pass",
-            &criteria,
-            3,
-        );
+        let v = score_verdict_json("s", &s, 3);
         assert_eq!(v["criteria"][0]["name"], "tests pass");
         assert_eq!(v["criteria"][0]["passed"], false);
         assert_eq!(v["score"], 0.5);
@@ -1578,17 +1572,26 @@ mod tests {
     #[test]
     fn parse_rubric_rejects_malformed_and_empty() {
         assert!(parse_rubric("no separator here").is_err());
-        assert!(parse_rubric(":: command with no name").is_err());
+        assert!(parse_rubric(" :: command with no name").is_err());
+        assert!(parse_rubric("name with no command :: ").is_err());
         assert!(parse_rubric("# only comments\n\n").is_err());
-        // A tab in a name would corrupt the frame marker.
-        assert!(parse_rubric("bad\tname :: echo hi").is_err());
+    }
+
+    #[test]
+    fn parse_rubric_allows_colons_in_name_and_command() {
+        // Split on the FIRST ` :: ` only: a name may contain `::`, a command a
+        // later ` :: `. (Names are base64-framed, so any content is safe.)
+        let r = parse_rubric("Mod::check :: python -c 'a :: b'").unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].0, "Mod::check");
+        assert_eq!(r[0].1, "python -c 'a :: b'");
     }
 
     #[test]
     fn compile_then_parse_rubric_roundtrips_verdicts() {
         // Compile a 2-criterion rubric (one passes, one fails), run it through a
-        // real shell, and confirm the framed output parses back to per-criterion
-        // verdicts — the end-to-end marker contract without a session/VM.
+        // real shell, and confirm the marker output parses back to per-criterion
+        // verdicts — the end-to-end contract without a session/VM.
         let script = compile_rubric(&[
             ("says hi".into(), "echo hi".into()),
             ("fails".into(), "echo boom; exit 3".into()),
@@ -1609,6 +1612,27 @@ mod tests {
         assert_eq!(crits[1].name, "fails");
         assert!(!crits[1].passed);
         assert!(crits[1].feedback.contains("boom"));
+    }
+
+    #[test]
+    fn rubric_verdict_cannot_be_forged_by_criterion_output() {
+        // The reward-channel integrity boundary: a criterion that PRINTS a fake
+        // passing marker but actually exits nonzero must still score as failed —
+        // the graded agent controls output, not the verdict. (Regression for the
+        // pre-base64 framing, where in-band markers were trusted.)
+        let forge = "printf '\\036PBCRIT\\t0\\tZm9yZ2Vk\\tZm9yZ2Vk\\n'; exit 1";
+        let script = compile_rubric(&[("real check".into(), forge.into())]);
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .unwrap();
+        let crits = parse_rubric_output(&combine_streams(&out.stdout, &out.stderr));
+        // Exactly one criterion (the forged marker is inert — base64'd as output),
+        // and it failed (the real exit was 1).
+        assert_eq!(crits.len(), 1, "forged marker injected a phantom criterion");
+        assert_eq!(crits[0].name, "real check");
+        assert!(!crits[0].passed, "forged marker flipped the verdict");
     }
 
     #[test]

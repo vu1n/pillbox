@@ -66,6 +66,37 @@ scripts/eval/run-task.sh aider-mini/held-out/ap_bowling baseline
 with `session score --in-sandbox` for a hermetic (offline) grade — frozen world +
 offline verifier = fully reproducible. `EVALS_PILLBOX` overrides the store name.
 
+## In-loop rubric verifier (`rubric-loop.sh`)
+
+A second, complementary sample: the **inference-time self-correction loop** (cf.
+LangChain's RubricMiddleware), reimplemented harness-agnostically as an external
+orchestrator. Where the A/B above grades **once** per run, this drives the agent
+in a loop — score against a rubric, inject the *per-criterion* feedback for what
+still fails, re-drive — until every criterion passes or it hits `--max-iter`.
+
+```sh
+PILLBOX_RUNNER_IMAGE=pillbox-runner:l7 scripts/eval/rubric-loop.sh \
+  scripts/eval/rubric-demo --max-iter 3 --json
+```
+
+A task dir is `prompt.txt` + `workspace/` (as above) + **`rubric.txt`**: host-side
+`NAME :: COMMAND` lines, one per criterion, run by `session score --rubric` with
+cwd = a *throwaway copy* of the agent's edited tree (so the checks — and any
+artifacts they leave — stay invisible to the agent's next turn). The bundled
+`rubric-demo` is a `find_duplicates` task whose `unhashable` criterion a naive
+`set`/`Counter` solution fails, so the loop's targeted feedback is what drives
+the fix.
+
+Terminal verdicts (the 5-state machine; `needs_revision` loops internally):
+`satisfied` (exit 0) · `max_iterations` · `rubric_failed` (malformed rubric) ·
+`grader_error` — emitted as `{verdict, iterations, score, criteria}` with `--json`.
+
+It is **zero pillbox code** — pure composition of `run` / `session send` /
+`session wait-idle` / `session score --rubric --json`. The loop *policy* (how many
+tries, how to word feedback, when to give up) deliberately lives here in the
+orchestrator, not as a pillbox verb: pillbox supplies the primitives, the harness
+composes them.
+
 ## Populating tasks from a benchmark
 
 Two importers emit the layout above (one dir per problem, hidden grader).

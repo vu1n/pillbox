@@ -687,7 +687,12 @@ fn run(cli: Cli) -> Result<()> {
             );
             Ok(())
         }
-        Command::Push { tag, message, bookmark, json } => {
+        Command::Push {
+            tag,
+            message,
+            bookmark,
+            json,
+        } => {
             let resolved = Pillbox::resolve(pillbox_arg)?;
             commands::workspace::push(&resolved, tag, message, bookmark, json)
         }
@@ -788,7 +793,10 @@ fn dispatch_run(resolved: &Pillbox, agent: Option<String>, mut opts: RunOpts) ->
     if spec.integration == crate::agents::Integration::Server && remote_record.is_some() {
         return Err(PillboxError::usage(
             "run",
-            format!("`{}` runs as a headless server and is local-only today", spec.id),
+            format!(
+                "`{}` runs as a headless server and is local-only today",
+                spec.id
+            ),
         )
         .with_next(format!("drop --remote: pillbox run --agent {}", spec.id))
         .into());

@@ -466,7 +466,11 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
     // No auto-send: opencode comes up ready (wait_ready), so the first prompt
     // goes through `session send` like every other — captured by a subscribed
     // watch instead of streamed to no one at start.
-    super::opencode::print_started(&session, opts.json, (!prompt.is_empty()).then_some(prompt.as_str()));
+    super::opencode::print_started(
+        &session,
+        opts.json,
+        (!prompt.is_empty()).then_some(prompt.as_str()),
+    );
     Ok(())
 }
 

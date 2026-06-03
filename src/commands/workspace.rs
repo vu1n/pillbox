@@ -33,7 +33,10 @@ pub(crate) fn push(
         crate::bookmarks::set(resolved, name, Some(snap.handle.as_str()))?;
     }
     if json {
-        println!("{}", snapshot_json_with_bookmark(&snap, bookmark.as_deref()));
+        println!(
+            "{}",
+            snapshot_json_with_bookmark(&snap, bookmark.as_deref())
+        );
     } else {
         println!(
             "pillbox: ✓ snapshot {} ({})",

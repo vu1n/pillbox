@@ -46,8 +46,7 @@ impl LibkrunHttp {
 /// server closes after the body and `read_to_end` terminates. (The SSE stream
 /// builds its own keep-alive request inline in `open_stream`.)
 fn request_head(method: &str, path: &str, json_body: Option<&str>) -> String {
-    let mut req =
-        format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n");
+    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n");
     if let Some(b) = json_body {
         req.push_str(&format!(
             "Content-Type: application/json\r\nContent-Length: {}\r\n",
@@ -168,8 +167,9 @@ impl<R: BufRead> Read for ChunkedReader<R> {
                 return Ok(0);
             }
             let hex = line.trim().split(';').next().unwrap_or("").trim();
-            let size = usize::from_str_radix(hex, 16)
-                .map_err(|_| Error::new(ErrorKind::InvalidData, format!("bad chunk size: {line:?}")))?;
+            let size = usize::from_str_radix(hex, 16).map_err(|_| {
+                Error::new(ErrorKind::InvalidData, format!("bad chunk size: {line:?}"))
+            })?;
             if size == 0 {
                 self.done = true; // last chunk; trailing CRLF/trailers ignored
                 return Ok(0);

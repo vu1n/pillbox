@@ -117,7 +117,8 @@ fn connect_upstream(client_config: Arc<ClientConfig>, host: &str) -> Result<Upst
         .ok_or_else(|| anyhow!("no address for {host}"))?;
     let sock = TcpStream::connect_timeout(&addr, StdDuration::from_secs(10))
         .with_context(|| format!("connect {host}"))?;
-    sock.set_nonblocking(true).context("set upstream non-blocking")?;
+    sock.set_nonblocking(true)
+        .context("set upstream non-blocking")?;
     let server_name = ServerName::try_from(host.to_string())
         .with_context(|| format!("invalid upstream name {host}"))?;
     let tls = ClientConnection::new(client_config, server_name)
@@ -208,7 +209,11 @@ pub(super) struct StubSwap {
 impl StubSwap {
     pub(super) fn new(pairs: Vec<CredSwap>) -> Self {
         let max_stub = pairs.iter().map(|p| p.stub.len()).max().unwrap_or(0);
-        Self { pairs, carry: Vec::new(), max_stub }
+        Self {
+            pairs,
+            carry: Vec::new(),
+            max_stub,
+        }
     }
 
     /// Whether any substitution is configured (else the relay can skip the copy).
@@ -222,7 +227,10 @@ impl StubSwap {
         self.carry.extend_from_slice(chunk);
         // Everything before `safe` cannot be the start of a stub that only
         // completes in a later chunk, so it's final; keep the tail as carry.
-        let safe = self.carry.len().saturating_sub(self.max_stub.saturating_sub(1));
+        let safe = self
+            .carry
+            .len()
+            .saturating_sub(self.max_stub.saturating_sub(1));
         let (out, rest) = self.scan(safe);
         self.carry = rest;
         out
@@ -241,7 +249,11 @@ impl StubSwap {
         let mut out = Vec::with_capacity(limit);
         let mut i = 0;
         while i < limit {
-            if let Some(p) = self.pairs.iter().find(|p| self.carry[i..].starts_with(&p.stub)) {
+            if let Some(p) = self
+                .pairs
+                .iter()
+                .find(|p| self.carry[i..].starts_with(&p.stub))
+            {
                 out.extend_from_slice(&p.real);
                 i += p.stub.len();
             } else {
@@ -264,7 +276,9 @@ struct CertResolver {
 
 impl std::fmt::Debug for CertResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CertResolver").field("allowlist", &self.allowlist).finish()
+        f.debug_struct("CertResolver")
+            .field("allowlist", &self.allowlist)
+            .finish()
     }
 }
 
@@ -314,7 +328,10 @@ mod tests {
         let mut s = StubSwap::new(
             pairs
                 .iter()
-                .map(|(stub, real)| CredSwap { stub: stub.as_bytes().to_vec(), real: real.as_bytes().to_vec() })
+                .map(|(stub, real)| CredSwap {
+                    stub: stub.as_bytes().to_vec(),
+                    real: real.as_bytes().to_vec(),
+                })
                 .collect(),
         );
         let mut out = Vec::new();
@@ -340,16 +357,16 @@ mod tests {
 
     #[test]
     fn stub_swap_passes_through_when_no_match() {
-        let out = swap(&[("STUB123", "real-key")], &[b"no secret here", b", really"]);
+        let out = swap(
+            &[("STUB123", "real-key")],
+            &[b"no secret here", b", really"],
+        );
         assert_eq!(out, b"no secret here, really");
     }
 
     #[test]
     fn stub_swap_handles_multiple_pairs_and_repeats() {
-        let out = swap(
-            &[("AAA", "1"), ("BBB", "22")],
-            &[b"AAA BBB AAA"],
-        );
+        let out = swap(&[("AAA", "1"), ("BBB", "22")], &[b"AAA BBB AAA"]);
         assert_eq!(out, b"1 22 1");
     }
 
@@ -392,8 +409,14 @@ mod tests {
         let ck1 = mint_certified_key(&resolver.issuer, "api.anthropic.com").expect("mint");
         assert!(!ck1.cert.is_empty());
         // Case-insensitive allowlist membership (resolver gate uses the same check).
-        assert!(resolver.allowlist.iter().any(|h| h.eq_ignore_ascii_case("API.ANTHROPIC.COM")));
-        assert!(!resolver.allowlist.iter().any(|h| h.eq_ignore_ascii_case("evil.example")));
+        assert!(resolver
+            .allowlist
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case("API.ANTHROPIC.COM")));
+        assert!(!resolver
+            .allowlist
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case("evil.example")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

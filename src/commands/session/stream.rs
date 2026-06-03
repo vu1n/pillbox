@@ -108,7 +108,12 @@ fn resolve_streaming_session(
     Ok((session::resolve_logged(resolved, id)?, None))
 }
 
-pub(super) fn session_subscribe(resolved: &Pillbox, id: &str, from: u64, bind: Option<&str>) -> Result<()> {
+pub(super) fn session_subscribe(
+    resolved: &Pillbox,
+    id: &str,
+    from: u64,
+    bind: Option<&str>,
+) -> Result<()> {
     let (sid, _tailer) = resolve_streaming_session(resolved, id, "session subscribe")?;
     // Read-side fan-out: while the log is being filled (live session), if a
     // notification webhook is configured, tail the log and POST attention

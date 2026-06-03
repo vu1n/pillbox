@@ -121,7 +121,15 @@ pub(super) fn drive_listeners(
 /// rustls → smoltcp tx. Split-borrows the connection's fields so the guest and
 /// upstream sessions can be driven in the same call.
 fn drive_conn(sock: &mut tcp::Socket, c: &mut Conn, vault: &Vault, pins: &PinTable, diag: &Diag) {
-    let Conn { tls, host, upstream, connecting, swap, req_logged, closing } = c;
+    let Conn {
+        tls,
+        host,
+        upstream,
+        connecting,
+        swap,
+        req_logged,
+        closing,
+    } = c;
 
     // smoltcp rx → guest rustls
     while sock.can_recv() {
@@ -156,7 +164,9 @@ fn drive_conn(sock: &mut tcp::Socket, c: &mut Conn, vault: &Vault, pins: &PinTab
                 sock.abort();
                 return;
             }
-            diag.log(&format!("krun-egress: [mitm] ALLOW sni={sni:?} → DNS-pinned, terminating"));
+            diag.log(&format!(
+                "krun-egress: [mitm] ALLOW sni={sni:?} → DNS-pinned, terminating"
+            ));
             *host = sni;
         }
     }
@@ -175,13 +185,17 @@ fn drive_conn(sock: &mut tcp::Socket, c: &mut Conn, vault: &Vault, pins: &PinTab
                 *connecting = None;
             }
             Ok(Err(e)) => {
-                diag.log(&format!("krun-egress: [mitm] upstream {host} failed → RST ({e})"));
+                diag.log(&format!(
+                    "krun-egress: [mitm] upstream {host} failed → RST ({e})"
+                ));
                 sock.abort();
                 return;
             }
             Err(mpsc::TryRecvError::Empty) => {} // still connecting — poll next tick
             Err(mpsc::TryRecvError::Disconnected) => {
-                diag.log(&format!("krun-egress: [mitm] upstream {host} connect thread died → RST"));
+                diag.log(&format!(
+                    "krun-egress: [mitm] upstream {host} connect thread died → RST"
+                ));
                 sock.abort();
                 return;
             }

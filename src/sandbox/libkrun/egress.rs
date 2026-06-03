@@ -112,9 +112,16 @@ pub(super) struct Diag(Option<Mutex<std::fs::File>>);
 
 impl Diag {
     fn open(path: Option<String>) -> Self {
-        Self(path.and_then(|p| {
-            std::fs::OpenOptions::new().create(true).append(true).open(p).ok()
-        }).map(Mutex::new))
+        Self(
+            path.and_then(|p| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(p)
+                    .ok()
+            })
+            .map(Mutex::new),
+        )
     }
 
     pub(super) fn log(&self, msg: &str) {
@@ -171,14 +178,20 @@ pub(super) fn run(
     iface.update_ip_addrs(|addrs| {
         let g = GATEWAY_IP.octets();
         addrs
-            .push(IpCidr::new(IpAddress::v4(g[0], g[1], g[2], g[3]), PREFIX_LEN))
+            .push(IpCidr::new(
+                IpAddress::v4(g[0], g[1], g[2], g[3]),
+                PREFIX_LEN,
+            ))
             .unwrap();
     });
 
     let mut sockets = SocketSet::new(vec![]);
     let dns_buf = || udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0u8; 4096]);
     let dns = sockets.add(udp::Socket::new(dns_buf(), dns_buf()));
-    sockets.get_mut::<udp::Socket>(dns).bind(DNS_PORT).expect("bind :53");
+    sockets
+        .get_mut::<udp::Socket>(dns)
+        .bind(DNS_PORT)
+        .expect("bind :53");
 
     let mut pins = PinTable::default();
     let mut listeners: Vec<super::mitm::Listener> = Vec::new();
@@ -192,9 +205,21 @@ pub(super) fn run(
 
     loop {
         iface.poll(now(start), &mut device, &mut sockets);
-        serve_dns(sockets.get_mut::<udp::Socket>(dns), &allowlist, &mut pins, &diag);
+        serve_dns(
+            sockets.get_mut::<udp::Socket>(dns),
+            &allowlist,
+            &mut pins,
+            &diag,
+        );
         if let Some(vault) = &vault {
-            super::mitm::drive_listeners(&mut listeners, &mut sockets, vault, &pins, &swap_pairs, &diag);
+            super::mitm::drive_listeners(
+                &mut listeners,
+                &mut sockets,
+                vault,
+                &pins,
+                &swap_pairs,
+                &diag,
+            );
             super::mitm::replenish_listeners(&mut listeners, &mut sockets);
         }
         thread::sleep(Duration::from_millis(2));
@@ -273,11 +298,15 @@ fn serve_dns(sock: &mut udp::Socket, allowlist: &[String], pins: &mut PinTable, 
         match outcome {
             DnsOutcome::Pinned(name) => {
                 if pins.pin(&name) {
-                    diag.log(&format!("krun-egress: [dns] {name} → A 10.0.2.2 (allowlisted, pinned)"));
+                    diag.log(&format!(
+                        "krun-egress: [dns] {name} → A 10.0.2.2 (allowlisted, pinned)"
+                    ));
                 }
             }
             DnsOutcome::NxDomain(name) => {
-                diag.log(&format!("krun-egress: [dns] NXDOMAIN {name} (not on allowlist — fenced)"));
+                diag.log(&format!(
+                    "krun-egress: [dns] NXDOMAIN {name} (not on allowlist — fenced)"
+                ));
             }
             DnsOutcome::Empty => {}
         }
@@ -398,8 +427,13 @@ fn write_frame(fd: c_int, frame: &[u8]) {
 fn read_exact(fd: c_int, buf: &mut [u8]) -> bool {
     let mut off = 0;
     while off < buf.len() {
-        let n =
-            unsafe { libc::read(fd, buf[off..].as_mut_ptr() as *mut libc::c_void, buf.len() - off) };
+        let n = unsafe {
+            libc::read(
+                fd,
+                buf[off..].as_mut_ptr() as *mut libc::c_void,
+                buf.len() - off,
+            )
+        };
         if n > 0 {
             off += n as usize;
         } else if n < 0 && interrupted() {
@@ -415,7 +449,11 @@ fn write_all(fd: c_int, buf: &[u8]) -> bool {
     let mut off = 0;
     while off < buf.len() {
         let n = unsafe {
-            libc::write(fd, buf[off..].as_ptr() as *const libc::c_void, buf.len() - off)
+            libc::write(
+                fd,
+                buf[off..].as_ptr() as *const libc::c_void,
+                buf.len() - off,
+            )
         };
         if n > 0 {
             off += n as usize;

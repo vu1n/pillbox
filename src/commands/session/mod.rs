@@ -55,16 +55,16 @@ fn opencode_http(
 
 /// libkrun opencode HTTP transport (feature-gated; see [`opencode_http`]).
 #[cfg(feature = "libkrun")]
-fn libkrun_opencode_http(
-    s: &session::Session,
-) -> Result<Box<dyn sandbox::http::SandboxHttp>> {
+fn libkrun_opencode_http(s: &session::Session) -> Result<Box<dyn sandbox::http::SandboxHttp>> {
     sandbox::libkrun::opencode_http(s)
 }
 #[cfg(not(feature = "libkrun"))]
-fn libkrun_opencode_http(
-    _s: &session::Session,
-) -> Result<Box<dyn sandbox::http::SandboxHttp>> {
-    Err(PillboxError::usage("session", "this libkrun session needs the libkrun feature built").into())
+fn libkrun_opencode_http(_s: &session::Session) -> Result<Box<dyn sandbox::http::SandboxHttp>> {
+    Err(PillboxError::usage(
+        "session",
+        "this libkrun session needs the libkrun feature built",
+    )
+    .into())
 }
 
 /// §0 read for a libkrun server session: drain its persistent `/event` capture
@@ -139,8 +139,11 @@ fn libkrun_ingest_events_file(resolved: &Pillbox, s: &session::Session) -> Resul
     use std::sync::atomic::AtomicBool;
     let path = sandbox::libkrun::opencode_events_file(s)?;
     let file = std::fs::File::open(&path).map_err(|e| {
-        PillboxError::runtime("session ingest", format!("open events file {}: {e}", path.display()))
-            .with_next("the session may not have produced any §0 events yet")
+        PillboxError::runtime(
+            "session ingest",
+            format!("open events file {}: {e}", path.display()),
+        )
+        .with_next("the session may not have produced any §0 events yet")
     })?;
     let mut log = crate::events::log::SessionLog::open(resolved, &s.id)?;
     let stop = AtomicBool::new(false);
@@ -148,14 +151,21 @@ fn libkrun_ingest_events_file(resolved: &Pillbox, s: &session::Session) -> Resul
 }
 #[cfg(not(feature = "libkrun"))]
 fn libkrun_ingest_events_file(_resolved: &Pillbox, _s: &session::Session) -> Result<usize> {
-    Err(PillboxError::usage("session ingest", "this libkrun session needs the libkrun feature built").into())
+    Err(PillboxError::usage(
+        "session ingest",
+        "this libkrun session needs the libkrun feature built",
+    )
+    .into())
 }
 
 /// Host path of a libkrun session's result-workspace (the agent's CoW clone),
 /// or None for other backends / non-libkrun builds. Feature-gated.
 #[cfg(feature = "libkrun")]
 fn libkrun_workspace_path(s: &session::Session) -> Option<String> {
-    if !matches!(session::Backend::parse(&s.backend), Some(session::Backend::Libkrun)) {
+    if !matches!(
+        session::Backend::parse(&s.backend),
+        Some(session::Backend::Libkrun)
+    ) {
         return None;
     }
     sandbox::libkrun::workspace_path(s)

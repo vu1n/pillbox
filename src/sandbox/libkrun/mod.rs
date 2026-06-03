@@ -234,7 +234,10 @@ pub(crate) fn vmm_child_main() -> ! {
         .iter()
         .map(|s| (cstr(&s.tag), cstr(&s.host_path)))
         .collect();
-    let vsock = spec.vsock.as_ref().map(|v| (v.port, cstr(&v.host_sock), v.listen));
+    let vsock = spec
+        .vsock
+        .as_ref()
+        .map(|v| (v.port, cstr(&v.host_sock), v.listen));
     // Egress: a passt socketpair — one end to libkrun's virtio-net, the other to
     // our userspace stack (which the child runs in a thread beside the VM).
     struct NetAttach {
@@ -247,7 +250,10 @@ pub(crate) fn vmm_child_main() -> ! {
     let net: Option<NetAttach> = spec.egress.as_ref().map(|e| {
         let mut fds = [0 as c_int; 2];
         if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) } != 0 {
-            eprintln!("krun-vmm: egress socketpair: {}", std::io::Error::last_os_error());
+            eprintln!(
+                "krun-vmm: egress socketpair: {}",
+                std::io::Error::last_os_error()
+            );
             std::process::exit(1);
         }
         NetAttach {
@@ -260,7 +266,11 @@ pub(crate) fn vmm_child_main() -> ! {
     });
     // Read the stub→real credential pairs the parent pipes on stdin (the env-fork
     // channel — reals arrive out-of-band, never in the guest env/argv/VmSpec).
-    let swap_pairs = if net.is_some() { read_swap_pairs() } else { Vec::new() };
+    let swap_pairs = if net.is_some() {
+        read_swap_pairs()
+    } else {
+        Vec::new()
+    };
 
     unsafe {
         let ctx = ffi::krun_create_ctx();
@@ -297,7 +307,12 @@ pub(crate) fn vmm_child_main() -> ! {
                 0,
             ));
         }
-        rc = rc.min(ffi::krun_set_exec(ctx, exec.as_ptr(), argv_ptrs.as_ptr(), envp.as_ptr()));
+        rc = rc.min(ffi::krun_set_exec(
+            ctx,
+            exec.as_ptr(),
+            argv_ptrs.as_ptr(),
+            envp.as_ptr(),
+        ));
         if rc < 0 {
             eprintln!("krun-vmm: configuration failed (rc={rc})");
             std::process::exit(1);
@@ -332,7 +347,11 @@ fn cow_clone_and_scrub(src: &Path) -> Result<PathBuf> {
     if rc != 0 {
         let err = std::io::Error::last_os_error();
         let _ = std::fs::remove_dir_all(&clone); // don't leave a half clone behind
-        bail!("clonefile {} → {} failed: {err} (APFS only)", src.display(), clone.display());
+        bail!(
+            "clonefile {} → {} failed: {err} (APFS only)",
+            src.display(),
+            clone.display()
+        );
     }
     // Reuse the canonical walker + denylist; delete what it flags as secret.
     let plan = crate::workspace::ingest::plan_ingest(&clone)?;
@@ -358,7 +377,10 @@ fn read_swap_pairs() -> Vec<vault::CredSwap> {
     serde_json::from_str::<Vec<SwapPair>>(&buf)
         .unwrap_or_default()
         .into_iter()
-        .map(|p| vault::CredSwap { stub: p.stub.into_bytes(), real: p.real.into_bytes() })
+        .map(|p| vault::CredSwap {
+            stub: p.stub.into_bytes(),
+            real: p.real.into_bytes(),
+        })
         .collect()
 }
 
@@ -379,7 +401,11 @@ fn cow_clone_home(home: &Path) -> Result<PathBuf> {
     if unsafe { clonefile(src_c.as_ptr(), clone_c.as_ptr(), 0) } != 0 {
         let err = std::io::Error::last_os_error();
         let _ = std::fs::remove_dir_all(&clone);
-        bail!("clonefile creds {} → {} failed: {err} (APFS only)", home.display(), clone.display());
+        bail!(
+            "clonefile creds {} → {} failed: {err} (APFS only)",
+            home.display(),
+            clone.display()
+        );
     }
     Ok(clone)
 }
@@ -395,9 +421,15 @@ fn stub_oauth_creds(home: &Path, sentinel: &str) -> Result<(PathBuf, Vec<SwapPai
     let creds_file = clone.join(sentinel);
     if let Ok(text) = std::fs::read_to_string(&creds_file) {
         if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&text) {
-            if let Some(oauth) = json.get_mut("claudeAiOauth").and_then(|v| v.as_object_mut()) {
+            if let Some(oauth) = json
+                .get_mut("claudeAiOauth")
+                .and_then(|v| v.as_object_mut())
+            {
                 for field in ["accessToken", "refreshToken"] {
-                    let real = oauth.get(field).and_then(|v| v.as_str()).map(str::to_string);
+                    let real = oauth
+                        .get(field)
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
                     if let Some(real) = real.filter(|s| !s.is_empty()) {
                         let stub = mint_stub(&real);
                         oauth.insert(field.to_string(), serde_json::Value::String(stub.clone()));
@@ -438,7 +470,10 @@ fn shell_quote(s: &str) -> String {
 fn unsupported(spec: &AgentSpec, what: &str) -> anyhow::Error {
     PillboxError::usage(
         "run",
-        format!("libkrun backend: {what} not supported yet (running `{}`)", spec.id),
+        format!(
+            "libkrun backend: {what} not supported yet (running `{}`)",
+            spec.id
+        ),
     )
     .with_next("unset PILLBOX_BACKEND to use the default backend")
     .into()
@@ -523,7 +558,10 @@ mod tests {
         // contain hyphens — the stub must keep only the type prefix, never the body.
         let real = "sk-ant-oat01-3WY-itf8QpVP38ipXjip-SECRETBODYxyz";
         let stub = mint_stub(real);
-        assert!(stub.starts_with("sk-ant-oat01-pllbxstub"), "stub leaked shape: {stub}");
+        assert!(
+            stub.starts_with("sk-ant-oat01-pllbxstub"),
+            "stub leaked shape: {stub}"
+        );
         assert!(!stub.contains("3WY"), "stub leaked body: {stub}");
         assert!(!stub.contains("SECRETBODYxyz"), "stub leaked body: {stub}");
         assert_ne!(stub, real);
@@ -537,7 +575,10 @@ mod tests {
         // prefix must be synthetic — never any of the real bytes.
         for real in ["sk-secret", "justonesecretword", "sk-ant-secretbody"] {
             let stub = mint_stub(real);
-            assert!(stub.starts_with("pllbx-pllbxstub"), "short token leaked shape: {stub}");
+            assert!(
+                stub.starts_with("pllbx-pllbxstub"),
+                "short token leaked shape: {stub}"
+            );
             assert!(!stub.contains("secret"), "short token leaked body: {stub}");
         }
     }

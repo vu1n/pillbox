@@ -83,7 +83,10 @@ pub(crate) fn create_session(http: &dyn SandboxHttp) -> Result<String> {
     let resp = http.request("POST", "/session", Some("{}"))?;
     let body = resp.body.trim();
     let value: serde_json::Value = serde_json::from_str(body).map_err(|_| {
-        PillboxError::runtime(ACTION, format!("create session: unexpected response: {body}"))
+        PillboxError::runtime(
+            ACTION,
+            format!("create session: unexpected response: {body}"),
+        )
     })?;
     value
         .get("id")
@@ -158,13 +161,19 @@ pub(crate) fn print_started(
         "pillbox: ✓ opencode session `{}` ready ({model}).",
         session.id
     );
-    println!("         pillbox session watch {}    # read the stream", session.id);
+    println!(
+        "         pillbox session watch {}    # read the stream",
+        session.id
+    );
     match pending_prompt {
         Some(p) => println!(
             "         pillbox session send {} {p:?}  # send your prompt",
             session.id
         ),
-        None => println!("         pillbox session send {} \"…\"  # drive it", session.id),
+        None => println!(
+            "         pillbox session send {} \"…\"  # drive it",
+            session.id
+        ),
     }
 }
 

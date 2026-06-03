@@ -255,7 +255,10 @@ pub(crate) fn registry() -> Vec<Box<dyn VaultProvider>> {
 /// reach its provider *and* refresh a token; everything else is default-denied).
 #[cfg(feature = "libkrun")]
 pub(crate) fn intercepted_hosts() -> Vec<&'static str> {
-    registry().iter().flat_map(|p| p.hosts().iter().copied()).collect()
+    registry()
+        .iter()
+        .flat_map(|p| p.hosts().iter().copied())
+        .collect()
 }
 
 /// Look up a provider by id (for `VaultSession::start`, which is called

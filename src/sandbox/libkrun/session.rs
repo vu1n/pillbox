@@ -15,7 +15,6 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::sandbox::SandboxBackend;
 use crate::agents::{
     resolve_run_env, resolve_with_entries, workspace_mount_name, AgentSpec, Integration, RunOpts,
     GUEST_HOME, GUEST_WORKSPACE,
@@ -23,6 +22,7 @@ use crate::agents::{
 use crate::attach::pump;
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
+use crate::sandbox::SandboxBackend;
 use crate::workspace::WorkspaceBackend;
 
 // VMM substrate kept in the parent module (used here AND by `vmm_child_main`):
@@ -42,7 +42,10 @@ impl SandboxBackend for LibkrunBackend {
             return run_server(spec, opts, resolved);
         }
         if opts.vault {
-            return Err(unsupported(spec, "--vault (egress + vault v2 is a later slice)"));
+            return Err(unsupported(
+                spec,
+                "--vault (egress + vault v2 is a later slice)",
+            ));
         }
 
         let run_started = std::time::SystemTime::now();
@@ -276,7 +279,11 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
         .collect();
     let home_q = shell_quote(GUEST_HOME);
     let gw_q = shell_quote(&guest_workspace);
-    let agent = agent_argv.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
+    let agent = agent_argv
+        .iter()
+        .map(|a| shell_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ");
     let preamble = guest_launch_preamble(&ca_cert_pem, &home_q, &gw_q);
     // Detach: the guest pty-host *listens* (so the attach socket persists for
     // reattach after the parent returns); foreground: it dials the parent.
@@ -302,8 +309,8 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
         }
     }
 
-    let attach_sock = krun_cache_dir()?
-        .join(format!("attach-{}.sock", uuid::Uuid::now_v7().simple()));
+    let attach_sock =
+        krun_cache_dir()?.join(format!("attach-{}.sock", uuid::Uuid::now_v7().simple()));
     let _ = std::fs::remove_file(&attach_sock);
 
     let vmspec = VmSpec {
@@ -311,8 +318,14 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
         vcpus: 2,
         ram_mib: 2048,
         shares: vec![
-            Share { tag: "creds".into(), host_path: creds_share.to_string_lossy().into_owned() },
-            Share { tag: "workspace".into(), host_path: clone.to_string_lossy().into_owned() },
+            Share {
+                tag: "creds".into(),
+                host_path: creds_share.to_string_lossy().into_owned(),
+            },
+            Share {
+                tag: "workspace".into(),
+                host_path: clone.to_string_lossy().into_owned(),
+            },
         ],
         exec: vec!["/bin/sh".into(), "-c".into(), script],
         vsock: Some(VsockAttach {
@@ -366,7 +379,10 @@ fn run_detached(
 ) -> Result<()> {
     // The child reads the spec at startup, *after* we return — so persist it (a
     // `NamedTempFile` would delete on drop); `kill_session` removes it.
-    let (_, spec_path) = launch.spec_file.keep().context("persist VMM spec for detach")?;
+    let (_, spec_path) = launch
+        .spec_file
+        .keep()
+        .context("persist VMM spec for detach")?;
 
     let exe = std::env::current_exe().context("locate the pillbox binary to re-exec as VMM")?;
     let mut child = Command::new(&exe)
@@ -414,7 +430,10 @@ fn run_detached(
     crate::session::write(resolved, &session)?;
     // Don't wait: the child (VM + egress + MITM, with the vault) is reparented to
     // init and keeps running.
-    println!("pillbox: ✓ session `{}` started in background (libkrun)", session.id);
+    println!(
+        "pillbox: ✓ session `{}` started in background (libkrun)",
+        session.id
+    );
     println!("  Next: pillbox session attach {}", session.id);
     Ok(())
 }
@@ -440,7 +459,10 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
     // (the shared base would otherwise compose them into the guest env).
     let withs = resolve_with_entries(resolved, &opts.withs)?;
     if opts.vault || withs.iter().any(|w| w.meta.is_some()) {
-        return Err(unsupported(spec, "the vault (opencode is not vault-capable)"));
+        return Err(unsupported(
+            spec,
+            "the vault (opencode is not vault-capable)",
+        ));
     }
 
     let LaunchBase {
@@ -626,7 +648,11 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
     // No auto-send: opencode comes up ready (wait_ready), so the first prompt
     // goes through `session send` — captured by a subscribed watch, not streamed
     // to no one at start.
-    opencode::print_started(&session, opts.json, (!prompt.is_empty()).then_some(prompt.as_str()));
+    opencode::print_started(
+        &session,
+        opts.json,
+        (!prompt.is_empty()).then_some(prompt.as_str()),
+    );
     Ok(())
 }
 
@@ -662,9 +688,7 @@ pub(crate) fn opencode_http(
 /// Host-side path of a libkrun server session's `/event` capture file (inside
 /// the CoW creds clone the guest mounts at its home). The §0 read drains this
 /// for `watch`/`subscribe`. See [`crate::sandbox::opencode::EVENTS_FILE`].
-pub(crate) fn opencode_events_file(
-    session: &crate::session::Session,
-) -> Result<PathBuf> {
+pub(crate) fn opencode_events_file(session: &crate::session::Session) -> Result<PathBuf> {
     let handle = LibkrunHandle::decode(session)?;
     Ok(PathBuf::from(handle.creds).join(crate::sandbox::opencode::EVENTS_FILE))
 }
@@ -830,11 +854,17 @@ pub(crate) fn reattach(resolved: &Pillbox, session: &crate::session::Session) ->
     let _ = crate::session::mark_detached(resolved, &session.id);
     match outcome? {
         pump::Outcome::Detached | pump::Outcome::Disconnected => {
-            eprintln!("pillbox: detached. reattach with `pillbox session attach {}`", session.id);
+            eprintln!(
+                "pillbox: detached. reattach with `pillbox session attach {}`",
+                session.id
+            );
             Ok(())
         }
         pump::Outcome::Exited(code) => {
-            eprintln!("pillbox: agent exited ({code}). `pillbox session rm {}` to clean up.", session.id);
+            eprintln!(
+                "pillbox: agent exited ({code}). `pillbox session rm {}` to clean up.",
+                session.id
+            );
             Ok(())
         }
     }
@@ -883,7 +913,10 @@ fn accept_attach(listener: &UnixListener, child: &mut std::process::Child) -> Re
             Err(e) => return Err(e).context("accept attach connection"),
         }
         if let Some(status) = child.try_wait().context("poll VMM child")? {
-            bail!("libkrun VMM exited before attach was ready (status {:?})", status.code());
+            bail!(
+                "libkrun VMM exited before attach was ready (status {:?})",
+                status.code()
+            );
         }
         if Instant::now() >= deadline {
             bail!("timed out waiting for the guest pty-host to connect");

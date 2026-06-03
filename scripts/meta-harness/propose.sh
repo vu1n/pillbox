@@ -50,11 +50,11 @@ EOF
 
 sid="$("$PILLBOX" run --agent opencode --workspace "$ws" ${MODEL:+--model "$MODEL"} 2>&1 | grep -oE '[0-9a-f]{12}' | head -1)"
 [ -n "$sid" ] || { echo "propose: no session" >&2; exit 1; }
-rec="$HOME/.pillbox/global/sessions/$sid.toml"
-clone="$(python3 -c "import json,re;r=open('$rec').read();m=re.search(r'sandbox_id = (.+)',r);print(json.loads(eval(m.group(1)))['workspace'])")"
-events="$(python3 -c "import json,re;r=open('$rec').read();m=re.search(r'sandbox_id = (.+)',r);print(json.loads(eval(m.group(1)))['creds']+'/.pillbox-opencode-events.sse')")"
+# Result-workspace path from the JSON surface (not the internal session record).
+clone="$("$PILLBOX" session info "$sid" --json 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin)["session"].get("workspace",""))')"
+[ -n "$clone" ] || { echo "propose: no workspace" >&2; "$PILLBOX" session rm "$sid" >/dev/null 2>&1; exit 1; }
 "$PILLBOX" session send "$sid" "$TASK" >/dev/null 2>&1
-for _ in $(seq 1 "$((MAX_WAIT / 2))"); do sleep 2; grep -aq 'session.idle' "$events" 2>/dev/null && break; done
+"$PILLBOX" session wait-idle "$sid" --timeout "$MAX_WAIT" >/dev/null 2>&1 || true
 
 if [ -s "$clone/PROFILE.md" ]; then
   cp "$clone/PROFILE.md" "$out"

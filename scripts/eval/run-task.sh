@@ -73,25 +73,19 @@ cp -R "$task_dir/workspace/." "$ws"/
 sid="$("$PILLBOX" run --agent opencode --workspace "$ws" ${MODEL:+--model "$MODEL"} 2>&1 | grep -oE '[0-9a-f]{12}' | head -1)"
 [ -n "$sid" ] || { echo "$task	$condition	fail(no-session)"; exit 0; }
 
-# The agent mutates the CoW clone recorded in the session handle, not $ws.
-rec="$HOME/.pillbox/global/sessions/$sid.toml"
-clone="$(python3 -c "import json,re;r=open('$rec').read();m=re.search(r'sandbox_id = (.+)',r);print(json.loads(eval(m.group(1)))['workspace'])")"
-events="$(python3 -c "import json,re;r=open('$rec').read();m=re.search(r'sandbox_id = (.+)',r);print(json.loads(eval(m.group(1)))['creds']+'/.pillbox-opencode-events.sse')")"
+# The agent edits its result-workspace (a CoW clone), not $ws. Read its path
+# from the JSON surface — not by parsing pillbox's internal session record.
+clone="$("$PILLBOX" session info "$sid" --json 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin)["session"].get("workspace",""))')"
+[ -n "$clone" ] || { echo "$task	$condition	fail(no-workspace)"; "$PILLBOX" session rm "$sid" >/dev/null 2>&1; exit 0; }
 
 "$PILLBOX" session send "$sid" "$prompt" >/dev/null 2>&1
 
-# Wait for the turn to go idle (opencode emits session.idle on the /event
-# stream the guest captures to $events), capped by MAX_WAIT.
-for _ in $(seq 1 "$((MAX_WAIT / 2))"); do
-  sleep 2
-  grep -aq 'session.idle' "$events" 2>/dev/null && break
-done
-
-# Drain the agent's full §0 trajectory into the durable log (post-hoc, idempotent)
-# BEFORE scoring, so the failure report reflects on HOW the agent worked — its
-# real tool trajectory — not just the final artifact + verdict. `scored` is
-# appended after, keeping seq order (trajectory → score).
-"$PILLBOX" session ingest "$sid" >/dev/null 2>&1 || true
+# Block until the turn goes idle (the §0 NeedsInput signal) — the drive-surface
+# primitive, replacing the old grep-the-capture-file poll. It also drains the
+# full §0 trajectory into the durable log while waiting, so the failure report
+# reflects on HOW the agent worked (no separate `session ingest` needed). A
+# timeout is treated as a fail (we still grade whatever landed).
+"$PILLBOX" session wait-idle "$sid" --timeout "$MAX_WAIT" >/dev/null 2>&1 || true
 
 # Inject the hidden grader into the agent's edited clone, THEN grade — so the
 # verifier ran against the agent's solution + an untampered test it never saw.

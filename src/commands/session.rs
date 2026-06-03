@@ -149,6 +149,22 @@ fn libkrun_ingest_events_file(_resolved: &Pillbox, _s: &session::Session) -> Res
     Err(PillboxError::usage("session ingest", "this libkrun session needs the libkrun feature built").into())
 }
 
+/// Host path of a libkrun session's result-workspace (the agent's CoW clone),
+/// or None for other backends / non-libkrun builds. Feature-gated.
+#[cfg(feature = "libkrun")]
+fn libkrun_workspace_path(s: &session::Session) -> Option<String> {
+    if !matches!(session::Backend::parse(&s.backend), Some(session::Backend::Libkrun)) {
+        return None;
+    }
+    sandbox::libkrun::workspace_path(s)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+#[cfg(not(feature = "libkrun"))]
+fn libkrun_workspace_path(_s: &session::Session) -> Option<String> {
+    None
+}
+
 pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> {
     match action {
         SessionAction::List { json } => session_list(resolved, json),
@@ -198,6 +214,9 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> 
             &grader_egress,
         ),
         SessionAction::Ingest { id, json } => session_ingest(resolved, &id, json),
+        SessionAction::WaitIdle { id, timeout, from } => {
+            session_wait_idle(resolved, &id, timeout, from)
+        }
         SessionAction::Prune { dry_run } => session_prune(resolved, dry_run),
         SessionAction::Transcript {
             file,
@@ -323,7 +342,13 @@ fn session_info(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
     let s = session::resolve(resolved, id)?;
     let status = events::status::derive_one(resolved, &s)?;
     if json {
-        let v = session_json_with_status(&s, status);
+        let mut v = session_json_with_status(&s, status);
+        // Expose the host path of the result-workspace when the backend has one
+        // (libkrun: the agent's CoW clone) — so graders/orchestrators read it
+        // from this surface instead of parsing the session record.
+        if let (Some(obj), Some(ws)) = (v.as_object_mut(), libkrun_workspace_path(&s)) {
+            obj.insert("workspace".into(), ws.into());
+        }
         println!("{}", crate::paths::json_v1(vec![("session", v)]));
         return Ok(());
     }
@@ -984,6 +1009,70 @@ fn session_ingest(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Block until the session's current turn goes idle — the drive-surface "turn
+/// done" primitive (an orchestrator `send`s a prompt, then `wait-idle` instead of
+/// polling). Spawns the same live drain `watch`/`subscribe` use, so the turn's
+/// events — including the idle signal — land in the durable log as the agent
+/// works (the trajectory is then already persisted; a later `session ingest` is
+/// redundant). "Idle" = the §0 `AttentionRequired` signal (the agent yielded for
+/// input) or a terminal `RunFinished`/`RunFailed`. Returns Err (exit 1) on timeout.
+fn session_wait_idle(
+    resolved: &Pillbox,
+    id: &str,
+    timeout: Option<u64>,
+    from: Option<u64>,
+) -> Result<()> {
+    use crate::contract::Payload;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    // Capture the log tail BEFORE the drain spawns, so the default "wait for the
+    // next idle" can't race the tailer: events it appends get seq > baseline, and
+    // subscribing from baseline+1 catches them (computing last_seq after spawn
+    // could skip an already-drained idle). Default = next idle, not a stale one.
+    let s = session::resolve(resolved, id)?;
+    let baseline = crate::events::log::SessionLog::open(resolved, &s.id)?.last_seq();
+    let from = from.unwrap_or(baseline + 1);
+
+    // The tailer drains the §0 capture into the log while we wait; it stops when
+    // `_tailer` drops at fn return (TailerHandle's Drop joins it).
+    let (sid, _tailer) = resolve_streaming_session(resolved, id, "session wait-idle")?;
+    let log = crate::events::log::SessionLog::open(resolved, &sid)?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    if let Some(secs) = timeout {
+        // Watchdog: flip `stop` after the deadline, which ends `subscribe`'s wait.
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            stop.store(true, Ordering::Relaxed);
+        });
+    }
+
+    let mut idle = false;
+    log.subscribe(from, &stop, |ev| {
+        let done = matches!(
+            ev.payload,
+            Payload::AttentionRequired(_) | Payload::RunFinished(_) | Payload::RunFailed(_)
+        );
+        if done {
+            idle = true;
+        }
+        !done // keep subscribing until a turn-done event (or `stop`/timeout)
+    })?;
+
+    if idle {
+        println!("pillbox: session `{sid}` idle");
+        Ok(())
+    } else {
+        Err(PillboxError::runtime(
+            "session wait-idle",
+            format!("session `{sid}` did not go idle within the timeout"),
+        )
+        .into())
+    }
 }
 
 /// Externally grade a session's result and record it as a verifiable `scored`

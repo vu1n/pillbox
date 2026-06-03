@@ -669,6 +669,14 @@ pub(crate) fn opencode_events_file(
     Ok(PathBuf::from(handle.creds).join(crate::sandbox::opencode::EVENTS_FILE))
 }
 
+/// Host path of a libkrun session's result-workspace — the CoW clone the guest
+/// mounted and the agent edited. Exposed via `session info --json` so consumers
+/// (graders, the eval harness) get it from a stable surface instead of parsing
+/// the session record.
+pub(crate) fn workspace_path(session: &crate::session::Session) -> Result<PathBuf> {
+    Ok(PathBuf::from(LibkrunHandle::decode(session)?.workspace))
+}
+
 /// Run a grader command in a one-shot microVM (the same runner rootfs/toolchain
 /// the agent had) against `workspace` (the agent's edited tree, mounted), and
 /// return `(exit_code, combined_output)`. Backs `session score --in-sandbox`:

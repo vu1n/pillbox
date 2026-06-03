@@ -421,6 +421,23 @@ pub(crate) enum SessionAction {
         #[arg(long)]
         json: bool,
     },
+    /// Block until the session's current turn goes idle — the agent finished and
+    /// is waiting for input (the §0 `AttentionRequired{NeedsInput}` signal, or a
+    /// terminal `RunFinished`). The drive-surface "turn done" primitive: an
+    /// orchestrator `session send`s a prompt, then `wait-idle` instead of polling.
+    /// Drains the §0 capture into the durable log WHILE waiting (so the trajectory
+    /// lands too — a later `session ingest` is then redundant). Exits 0 when idle,
+    /// 1 on `--timeout`. Reads new events from the current log tail (or `--from SEQ`).
+    WaitIdle {
+        id: String,
+        /// Give up after this many seconds (exit 1). Omit to wait indefinitely.
+        #[arg(long, value_name = "SECS")]
+        timeout: Option<u64>,
+        /// Wait for an idle event with `seq >= FROM` (default: only events after
+        /// the current log tail — i.e. the turn you just triggered).
+        #[arg(long, value_name = "SEQ")]
+        from: Option<u64>,
+    },
     /// Tear down every session whose `expires_at` is in the past.
     /// Drives `session rm` for each — sandbox killed, record deleted.
     /// Sessions with no `expires_at` (no `--ttl` at spawn) are left

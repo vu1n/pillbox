@@ -1,0 +1,10 @@
+# Host-side rubric: NAME :: COMMAND, run with cwd = the agent's edited workspace.
+# Never copied into the workspace, so the agent can't read these and hardcode.
+# The "unhashable" criterion is the one a naive set/Counter solution fails — so
+# the loop's per-criterion feedback drives the fix.
+
+defines find_duplicates :: grep -q 'def find_duplicates' solution.py
+basic duplicates in order :: python3 -c 'import solution; assert solution.find_duplicates([1,2,2,3,3,3]) == [2,3]'
+each duplicate once :: python3 -c 'import solution; assert solution.find_duplicates([4,4,4,4]) == [4]'
+no false positives :: python3 -c 'import solution; assert solution.find_duplicates([1,2,3]) == []'
+handles unhashable elements :: python3 -c 'import solution; assert solution.find_duplicates([[1],[1],[2]]) == [[1]]'

@@ -232,9 +232,13 @@ enum Command {
         label: Option<String>,
         /// Emit the started session as a JSON object on stdout instead
         /// of the human "session started" banner. Useful for
-        /// orchestrators: `pillbox run --detach --json | jq -r
-        /// .session.id`. Only meaningful with `--detach`.
-        #[arg(long, requires = "detach")]
+        /// orchestrators: `pillbox run --json | jq -r .session.id`.
+        /// Needs a persisted session record: a `--detach` run (any
+        /// agent) or a server-mode agent (opencode, always reparented).
+        /// A foreground PTY run has nothing to emit — rejected at
+        /// dispatch (not a clap `requires`, since server-mode validity
+        /// depends on the resolved agent, not a flag).
+        #[arg(long)]
         json: bool,
         /// POST every lifecycle event to URL as JSON. Forwarded to the
         /// in-sandbox wrapper so its `pillbox session done` call can
@@ -774,6 +778,20 @@ fn dispatch_run(resolved: &Pillbox, agent: Option<String>, mut opts: RunOpts) ->
         if opts.name.is_none() {
             opts.name = Some(meta.name.clone());
         }
+    }
+
+    // `--json` emits the started-session record; only `--detach` runs and
+    // server-mode agents (opencode, always reparented) persist one. A foreground
+    // PTY run has nothing to emit, so reject loudly here rather than print
+    // nothing. (Can't be a clap `requires` — server-mode validity depends on the
+    // resolved agent, not a flag.)
+    if opts.json && !opts.detach && spec.integration != crate::agents::Integration::Server {
+        return Err(PillboxError::usage(
+            "run",
+            "--json needs a persisted session: add --detach, or run a server-mode agent (opencode)",
+        )
+        .with_next(format!("pillbox run --agent {} --detach --json", spec.id))
+        .into());
     }
 
     // Resolve `--remote` (an inline URL or a registered name) to a record;

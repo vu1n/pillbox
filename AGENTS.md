@@ -139,6 +139,7 @@ global pillbox regardless of where you are.
 | `--events-webhook URL` | — | POST every lifecycle event to URL as JSON. Forwarded to the in-sandbox wrapper so terminal events (`session.completed`/`failed`) reach back to the orchestrator. Equivalent to `$PILLBOX_EVENTS_WEBHOOK`. See [docs/observability.md](./docs/observability.md) for the full sink reference (JSONL / webhook / OTLP via `$OTEL_EXPORTER_OTLP_ENDPOINT`). |
 | `--ttl DURATION` | — | Per-session retention TTL — `30m` / `24h` / `7d` (`s`/`m`/`h`/`d` units only, max 365d). Writes `expires_at` to the record. `pillbox session prune` drops expired sessions. Requires `--detach`. |
 | `--label TEXT` | — | Human label for a detached session, surfaced in `pillbox session list`. Only meaningful with `--detach`. |
+| `--json` | — | Emit the started session as `{version:1, session:{id,…}}` on stdout instead of the human banner — `pillbox run --json \| jq -r .session.id`. Needs a persisted session: a `--detach` run (any agent) or a server-mode agent (`opencode`, always reparented). A foreground PTY run has nothing to emit and is rejected at dispatch. |
 
 Env composition order (later layers override earlier):
 

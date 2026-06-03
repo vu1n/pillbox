@@ -30,7 +30,7 @@ const RELAY_BUF: usize = 65535;
 pub(super) struct Forwarder {
     handle: SocketHandle,
     host: Option<TcpStream>,
-    to_host: Vec<u8>,  // guest→host bytes awaiting a (possibly WouldBlock) host write
+    to_host: Vec<u8>, // guest→host bytes awaiting a (possibly WouldBlock) host write
     to_guest: Vec<u8>, // host→guest bytes awaiting smoltcp send-buffer space
     host_eof: bool,
     closing: bool,
@@ -78,7 +78,9 @@ pub(super) fn drive(forwarders: &mut [Forwarder], sockets: &mut SocketSet, port:
             match TcpStream::connect(("127.0.0.1", port)) {
                 Ok(s) => {
                     let _ = s.set_nonblocking(true);
-                    diag.log(&format!("krun-egress: [local-fwd] guest connected → 127.0.0.1:{port}"));
+                    diag.log(&format!(
+                        "krun-egress: [local-fwd] guest connected → 127.0.0.1:{port}"
+                    ));
                     f.host = Some(s);
                 }
                 Err(e) => {

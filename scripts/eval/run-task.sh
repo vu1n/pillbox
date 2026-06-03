@@ -110,23 +110,22 @@ if [ "$verdict" = fail ] && [ -n "${FAILDIR:-}" ]; then
     for f in "$task_dir"/workspace/*; do
       b="$(basename "$f")"; echo "--- $b ---"; cat "$clone/$b" 2>/dev/null; echo
     done
-    # Trajectory (tool calls, in order) from the ingested §0 log — the GEPA-style
-    # textual gradient `propose` reflects on. Grader feedback comes from the
+    # Trajectory (tool calls, in order) via `session log --type tool_call` — the
+    # GEPA-style textual gradient `propose` reflects on. Read through the §0 CLI
+    # surface, NOT by opening the on-disk log path. Grader feedback comes from the
     # `score --json` verdict above, not a second pass over the log.
-    python3 - "$sid" <<'PY'
-import json, os, sys
-log = os.path.expanduser(f"~/.pillbox/global/sessions/{sys.argv[1]}/log.jsonl")
+    "$PILLBOX" session log "$sid" --type tool_call 2>/dev/null | python3 -c '
+import json, sys
 order, status = [], {}
-for line in open(log):
+for line in sys.stdin:
     try:
         p = json.loads(line).get("payload", {})
     except Exception:
         continue
-    if p.get("type") == "tool_call":
-        cid = p.get("toolCallId") or p.get("name") or str(len(order))
-        if cid not in status:
-            order.append(cid)
-        status[cid] = (p.get("name", "?"), p.get("status", ""))
+    cid = p.get("toolCallId") or p.get("name") or str(len(order))
+    if cid not in status:
+        order.append(cid)
+    status[cid] = (p.get("name", "?"), p.get("status", ""))
 print("## AGENT TRAJECTORY (tools, in order):")
 if order:
     for cid in order:
@@ -134,7 +133,7 @@ if order:
         print(f"- {name} [{st}]")
 else:
     print("(no tool calls captured)")
-PY
+'
     echo
     echo "## GRADER FEEDBACK (why it failed):"
     # tail -c, not ${var: -N} — macOS bash 3.2 has no negative substring offset.

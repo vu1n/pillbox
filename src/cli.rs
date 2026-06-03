@@ -427,6 +427,26 @@ pub(crate) enum SessionAction {
         #[arg(long)]
         json: bool,
     },
+    /// Read a session's durable §0 log (`log.jsonl`) — the per-session event
+    /// stream `score`/`ingest`/`wait-idle` write. The structured §0 read an
+    /// orchestrator uses instead of opening the on-disk log by hand. Emits one
+    /// event JSON per line (seq order). Distinct from `session events`, which is
+    /// the pillbox-wide *lifecycle* stream (`session.started`/`dropped`).
+    Log {
+        id: String,
+        /// Keep only events whose payload `type` is one of these (repeatable;
+        /// snake_case tags, e.g. `tool_call`, `scored`, `message_end`). Unknown
+        /// tags simply match nothing — a typo yields empty output, not an error.
+        #[arg(long = "type", value_name = "TYPE")]
+        r#type: Vec<String>,
+        /// Emit only the last matching event (after `--type` filtering) — the
+        /// "what's the latest scored/idle verdict" read.
+        #[arg(long)]
+        last: bool,
+        /// Start from this seq, inclusive (default 0 = the whole log).
+        #[arg(long, value_name = "SEQ")]
+        from: Option<u64>,
+    },
     /// Block until the session's current turn goes idle — the agent finished and
     /// is waiting for input (the §0 `AttentionRequired{NeedsInput}` signal, or a
     /// terminal `RunFinished`). The drive-surface "turn done" primitive: an

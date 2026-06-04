@@ -188,7 +188,14 @@ def distill(pb: Pillbox, failures: list[dict], reflector_model: str) -> str:
             with pb.session(ws, reflector_model) as (sid, clone):
                 pb.drive(sid, REFLECT_PROMPT)
                 prof = os.path.join(clone, "PROFILE.md")
-                return open(prof).read().strip() if os.path.exists(prof) else ""
+                text = open(prof).read().strip() if os.path.exists(prof) else ""
+                if not text:
+                    # Loud: the reflector session ran but wrote no profile (didn't
+                    # follow the instruction, timed out mid-write, or empty file).
+                    # Caller must NOT treat a profile-less GEPA arm as a real result.
+                    print(f"  distill: reflector wrote NO profile (PROFILE.md "
+                          f"{'missing' if not os.path.exists(prof) else 'empty'}) — GEPA arm will be skipped")
+                return text
         except (PillboxError, subprocess.TimeoutExpired) as e:
             print(f"  distill failed: {e}")
             return ""
@@ -247,8 +254,16 @@ def run_gate(cfg: Config, run_id: str, ts: str) -> dict:
         tr = eval_arm(pb, "train", train, "", cfg.worker_model, tmp, cfg.trials, P, capture_failures=True)
         print(f"== distill profile (reflector={cfg.reflector_model}) from {len(tr['failures'])} failures ==")
         profile = distill(pb, tr["failures"], cfg.reflector_model)
-        print("== GEPA (held) ==")
-        gepa = eval_arm(pb, "gepa", held, profile, cfg.worker_model, tmp, cfg.trials, P)
+        gepa = None
+        if profile.strip():
+            print("== GEPA (held) ==")
+            gepa = eval_arm(pb, "gepa", held, profile, cfg.worker_model, tmp, cfg.trials, P)
+        else:
+            # CRITICAL: an empty profile means the GEPA arm would run the WORKER with
+            # nothing prepended — identical to baseline — and any "lift" would be pure
+            # run-to-run noise reported as a real result. Skip it loudly; never fabricate.
+            print("== GEPA: SKIPPED — distill produced an EMPTY profile (reflector wrote none). "
+                  "Refusing to run a profile-less arm and mislabel the noise as a lift. ==")
         ace = None
         if playbook:
             print("== ACE / playbook (held) ==")
@@ -257,9 +272,16 @@ def run_gate(cfg: Config, run_id: str, ts: str) -> dict:
     return {
         "run_id": run_id, "timestamp": ts, "config": asdict(cfg),
         "profile": profile,
-        "arms": {"baseline": baseline, "gepa": gepa, **({"ace": ace} if ace else {})},
-        "lift": {"gepa_over_baseline": round(gepa["mean"] - baseline["mean"], 3),
-                 **({"ace_over_baseline": round(ace["mean"] - baseline["mean"], 3)} if ace else {})},
+        "distill_ok": bool(profile.strip()),
+        "arms": {
+            "baseline": baseline,
+            **({"gepa": gepa} if gepa else {}),
+            **({"ace": ace} if ace else {}),
+        },
+        "lift": {
+            **({"gepa_over_baseline": round(gepa["mean"] - baseline["mean"], 3)} if gepa else {}),
+            **({"ace_over_baseline": round(ace["mean"] - baseline["mean"], 3)} if ace else {}),
+        },
     }
 
 
@@ -269,9 +291,12 @@ def report(artifact: dict):
           f"(worker={artifact['config']['worker_model']}, trials={artifact['config']['trials']}) ===")
     for k, arm in a.items():
         print(f"  {k:9s}: {arm['mean']:.3f}")
-    lift = artifact["lift"]["gepa_over_baseline"]
-    print(f"lift (GEPA − baseline): {lift:+.3f}  → "
-          f"{'GEPA helps' if lift > 0.05 else 'no meaningful lift (noise)'}")
+    if "gepa_over_baseline" in artifact["lift"]:
+        lift = artifact["lift"]["gepa_over_baseline"]
+        print(f"lift (GEPA − baseline): {lift:+.3f}  → "
+              f"{'GEPA helps' if lift > 0.05 else 'no meaningful lift (noise)'}")
+    else:
+        print("GEPA arm: SKIPPED (distill produced no profile) — no lift to report.")
 
 
 def main():

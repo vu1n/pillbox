@@ -44,14 +44,18 @@ from gate import Pillbox, _task_dir, bookmarks, graded_run  # noqa: E402
 
 # Relative cost per task-run by model — the knob the router optimizes against.
 # Local ≈ compute-only; hosted tiers are illustrative $ ratios (tune to reality).
-# A model not listed defaults to MID.
 COST = {
     "ollama/qwen3.6:35b-a3b-coding-nvfp4": 0.1,  # local: electricity + time, no API $
     "zai-coding-plan/glm-4.5-air": 1.0,          # cheap hosted
     "zai-coding-plan/glm-5.1": 4.0,              # frontier-tier (most capable we have)
 }
-DEFAULT_COST = 1.0
-THRESHOLD = 1.0  # cascade escalates while score < THRESHOLD (i.e., not all criteria pass)
+DEFAULT_COST = 1.0  # untabled model → placeholder cost (its run still scores/fails normally)
+# cascade escalates while score < THRESHOLD (i.e., not all criteria pass). CAVEAT (measured,
+# ghost v1): a strict threshold + a cheap tier that never clears it makes cascade cost-DOMINATED
+# — every task pays the cheap attempt AND escalates anyway (cost 5 > glm-5.1's 4 at equal
+# quality). Cheap-first only pays when the cheap tier actually passes a real fraction of tasks;
+# otherwise the lever is PREDICTIVE routing (pick the tier upfront), not try-then-escalate.
+THRESHOLD = 1.0
 
 
 def cost_of(model: str) -> float:
@@ -59,7 +63,7 @@ def cost_of(model: str) -> float:
 
 
 def run_policy(pb: Pillbox, policy: str, task_dir: str) -> dict:
-    """Route + run one task under `policy`; return {score, cost, models, attempts}.
+    """Route + run one task under `policy`; return {score, cost, models, error}.
     Score = best rubric score across attempts; cost = sum of every attempt's model cost."""
     kind, _, arg = policy.partition(":")
     if kind == "always":

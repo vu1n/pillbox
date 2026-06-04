@@ -25,6 +25,9 @@ from typing import Protocol
 
 _MAX = 800  # claim/observation content cap — claims are distilled, not transcripts
 
+# Mirror of store.TYPES — kept local so importing distill doesn't pull store's turso dep.
+VALID_TYPES = ("fact", "preference", "decision", "procedure", "artifact", "hypothesis", "pitfall")
+
 
 @dataclass
 class Action:
@@ -163,6 +166,98 @@ LLM_DISTILL_PROMPT = (
     "no clear, reusable subject."
 )
 
+_SCHEMA = (
+    'Output ONLY a JSON array, no prose. Each element: {"type": one of '
+    "fact|preference|decision|procedure|artifact|hypothesis|pitfall, "
+    '"subject": a short noun phrase, "content": the durable lesson, "confidence": 0.0-1.0, '
+    '"code_refs": [{"symbol":"…","path":"…","query":"…"}] (omit or [] when not about specific code)}. '
+    "Return [] if nothing durable."
+)
+
+
+class LLMDistiller:
+    """Distiller backed by a BYO `complete(prompt)->str`. Renders the full Trace as RICH text (the
+    trajectory, failures, and per-criterion verdict — research says feed traces, not a scalar), asks
+    the model for claims, and parses the JSON. Unlike HeuristicDistiller it can generalize — success
+    procedures, cross-failure lessons — but its OUTPUT still flows through the same store governance
+    (candidates, model-agnostic strip, provenance). The backend is the caller's: local ollama
+    (`ollama_complete`), `claude -p`, or an API — distill only needs str→str."""
+
+    def __init__(self, complete, *, max_claims: int = 8):
+        self.complete = complete
+        self.max_claims = max_claims
+
+    def distill(self, trace: Trace) -> list[ClaimDraft]:
+        return self.parse(self.complete(self.render_prompt(trace)))[: self.max_claims]
+
+    def render_prompt(self, trace: Trace) -> str:
+        lines = [LLM_DISTILL_PROMPT, "", _SCHEMA, "", "## Session"]
+        if trace.task:
+            lines.append(f"task: {trace.task}")
+        v = trace.verdict
+        if v:
+            lines.append(f"verdict: {'pass' if v.passed else 'fail'} score={v.score} grader={v.grader}")
+            for c in v.criteria:
+                if not c.get("passed", True):
+                    lines.append(f"  FAILED {c.get('name', '?')}: {_clip(c.get('feedback') or '', 200)}")
+        if trace.run_failed:
+            lines.append(f"run failed: {trace.run_failed}")
+        lines.append("## Actions")
+        for i, a in enumerate(trace.actions[:60], 1):
+            path = ""
+            if isinstance(a.input, dict):
+                p = a.input.get("file_path") or a.input.get("path")
+                path = f"({p})" if isinstance(p, str) else ""
+            lines.append(f"{i}. [{'error' if a.failed else 'ok'}] {a.name}{path}: {_clip(a.output or a.title, 200)}")
+        if len(trace.actions) > 60:
+            lines.append(f"… {len(trace.actions) - 60} more actions")
+        return "\n".join(lines)
+
+    @staticmethod
+    def parse(raw: str) -> list[ClaimDraft]:
+        """Extract the JSON array from the completion (tolerating a ```fence``` or surrounding prose),
+        validate each item, drop the unusable. Raises if no JSON is present (loud, not silent)."""
+        text = (raw or "").strip()
+        obj, arr = text.find("{"), text.find("[")
+        start = arr if arr != -1 and (obj == -1 or arr < obj) else obj
+        end = text.rfind("]") if start == arr else text.rfind("}")
+        if start == -1 or end == -1 or end < start:
+            raise ValueError(f"distiller returned no JSON: {text[:200]!r}")
+        data = json.loads(text[start:end + 1])
+        items = data.get("claims", []) if isinstance(data, dict) else data
+        drafts: list[ClaimDraft] = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            subject, content = (it.get("subject") or "").strip(), (it.get("content") or "").strip()
+            if not subject or not content:
+                continue  # no clear subject/content → the arbiter would reject it anyway
+            typ = it.get("type") if it.get("type") in VALID_TYPES else "fact"
+            try:
+                conf = max(0.0, min(1.0, float(it.get("confidence", 0.7))))
+            except (TypeError, ValueError):
+                conf = 0.7
+            refs = it.get("code_refs")
+            refs = [r for r in refs if isinstance(r, dict)] if isinstance(refs, list) else []
+            drafts.append(ClaimDraft(typ, subject, _trunc(content), conf, refs))
+        return drafts
+
+
+def ollama_complete(model: str, host: str = "http://127.0.0.1:11434", *, temperature: float = 0.0):
+    """A BYO `complete` over a local ollama server (the libkrun local-model forward target). Use:
+    `LLMDistiller(ollama_complete('qwen3'))`. temperature 0 for reproducible distillation."""
+    import urllib.request
+
+    def complete(prompt: str) -> str:
+        body = json.dumps({"model": model, "prompt": prompt, "stream": False,
+                           "options": {"temperature": temperature}}).encode()
+        req = urllib.request.Request(host + "/api/generate", data=body,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=180) as r:
+            return json.loads(r.read())["response"]
+
+    return complete
+
 
 def distill_session(events: list[dict], store, *, project: str, scope: str = "project",
                     task: str = "", distiller: Distiller | None = None, actor: str = "distill") -> list[str]:
@@ -187,6 +282,11 @@ def distill_session(events: list[dict], store, *, project: str, scope: str = "pr
 def _trunc(s: str) -> str:
     s = (s or "").strip()
     return s if len(s) <= _MAX else s[:_MAX] + "…"
+
+
+def _clip(s: str, n: int) -> str:
+    s = " ".join((s or "").split())  # collapse whitespace for compact prompt lines
+    return s if len(s) <= n else s[:n] + "…"
 
 
 def _refs_from(inp: dict | None) -> list[dict]:
@@ -279,3 +379,40 @@ if __name__ == "__main__":
 
     print(f"OK — distilled {len(ids)} pitfall candidate(s) from a {len(events)}-event §0 trace: "
           f"{sorted(kinds)}; failure-mined + model-agnostic + sourced")
+
+    # --- LLM distiller (stub backend — deterministic, no live model) ---
+    canned = """Sure, here are the claims:
+```json
+[
+  {"type":"decision","subject":"book discount pricing","content":"price groups by distinct-title count; balance group sizes rather than maximizing each group","confidence":0.8},
+  {"type":"pitfall","subject":"greedy grouping overcharges","content":"a greedy max-group strategy on glm-4.6 overcharges vs balanced groups","confidence":0.7,"code_refs":[{"symbol":"price","path":"src/bookstore.py"}]},
+  {"type":"fact","subject":"","content":"no subject -> must be skipped"},
+  {"type":"bogus","subject":"weird type","content":"unknown type coerces to fact"}
+]
+```
+done."""
+
+    def stub_complete(prompt):
+        assert "## Actions" in prompt and "task:" in prompt, "prompt missing rendered trace"
+        return canned
+
+    dl = LLMDistiller(stub_complete)
+    drafts = dl.distill(build_trace(events, task="price books"))
+    assert [d.subject for d in drafts] == ["book discount pricing", "greedy grouping overcharges",
+                                           "weird type"], [d.subject for d in drafts]  # blank-subject dropped
+    assert drafts[2].type == "fact"  # unknown type coerced
+
+    db2 = "/tmp/distill-llm-selftest.db"
+    for f in glob.glob(db2 + "*"):
+        try: os.remove(f)
+        except OSError: pass
+    s2 = MemoryStore(db2)
+    ev2 = events + [{"sessionId": "sess2", "payload": {"type": "message_end", "messageId": "x", "model": "glm-4.6"}}]
+    ids2 = distill_session(ev2, s2, project="pillbox", task="price books", distiller=dl)
+    got = {c.subject: c for c in s2.recall("discount pricing greedy grouping", project="pillbox", include_candidates=True)}
+    assert got["book discount pricing"].status == "accepted", "type=decision auto-accepts"
+    pit = got["greedy grouping overcharges"]
+    assert pit.status == "candidate" and "glm-4.6" not in pit.content and "<model>" in pit.content, pit.content
+    assert pit.code_refs and pit.code_refs[0]["path"] == "src/bookstore.py"
+    print(f"OK — LLM distiller (stub): parsed {len(drafts)} drafts (fence+prose stripped, blank dropped, "
+          f"bad type coerced), wrote {len(ids2)}; decision auto-accepted, pitfall model-agnostic + code-anchored")

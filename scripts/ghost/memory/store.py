@@ -16,9 +16,10 @@ anchors (symbol / path / search-recipe), resolved against the agent's CURRENT tr
 optional CodeResolver — ripgrep by default (no index, no daemon, no setup); an AST/BM25 index
 (ast-grep, canopy) drops in behind the same seam only when a repo is large enough to pay for it.
 
-Research refinements: `pitfall` type (failure-mining); shared (`global`/`project`) claims must be
-MODEL-AGNOSTIC distilled (the MemCollab cross-model landmine — enforced by the distill step upstream);
-source attribution + code refs = provenance/grounding. Embeddings are BYO (inject an `embed` fn —
+Research refinements: `pitfall` type (failure-mining); shared (`global`/`project`) claims should be
+MODEL-AGNOSTIC distilled (the MemCollab cross-model landmine) — that stripping is applied by
+distill_session on the distill path; a direct `claim()` caller is trusted to keep content agnostic,
+not enforced by the store. source attribution + code refs = provenance/grounding. Embeddings are BYO (inject an `embed` fn —
 the model choice is separate); with no embedder, recall degrades to LIKE keyword.
 """
 from __future__ import annotations
@@ -34,8 +35,7 @@ from typing import Callable, Protocol
 
 import turso  # pyturso — the tursodb engine (concurrent writes + native vectors)
 
-SCOPES = ("user", "project", "agent", "global")
-TYPES = ("fact", "preference", "decision", "procedure", "artifact", "hypothesis", "pitfall")
+from vocab import SCOPES, TYPES  # single-sourced vocabulary (turso-free leaf), shared with distill.py
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS observations (
@@ -262,7 +262,7 @@ class MemoryStore:
         cols = [d[0] for d in cur.description]
         claims = [self._claim(dict(zip(cols, r))) for r in rows]
         resolver = self.resolver
-        if resolver is not None and getattr(resolver, "available", True):
+        if resolver is not None and resolver.available:  # CodeResolver declares `available` — no default
             for c in claims:
                 if c.code_refs:
                     c.grounding = [resolver.resolve(ref) for ref in c.code_refs]

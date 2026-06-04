@@ -23,10 +23,9 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Protocol
 
-_MAX = 800  # claim/observation content cap — claims are distilled, not transcripts
+from vocab import TYPES  # single-sourced vocabulary (turso-free leaf), shared with store.py
 
-# Mirror of store.TYPES — kept local so importing distill doesn't pull store's turso dep.
-VALID_TYPES = ("fact", "preference", "decision", "procedure", "artifact", "hypothesis", "pitfall")
+_MAX = 800  # claim/observation content cap — claims are distilled, not transcripts
 
 
 @dataclass
@@ -228,7 +227,7 @@ class LLMDistiller:
             subject, content = (it.get("subject") or "").strip(), (it.get("content") or "").strip()
             if not subject or not content:
                 continue  # no clear subject/content → the arbiter would reject it anyway
-            typ = it.get("type") if it.get("type") in VALID_TYPES else "fact"
+            typ = it.get("type") if it.get("type") in TYPES else "fact"
             try:
                 conf = max(0.0, min(1.0, float(it.get("confidence", 0.7))))
             except (TypeError, ValueError):

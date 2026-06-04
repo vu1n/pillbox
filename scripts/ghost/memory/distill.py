@@ -252,9 +252,12 @@ class LLMDistiller:
         return drafts
 
 
-def ollama_complete(model: str, host: str = "http://127.0.0.1:11434", *, temperature: float = 0.0):
+def ollama_complete(model: str, host: str = "http://127.0.0.1:11434", *,
+                    temperature: float = 0.0, timeout: float = 300):
     """A BYO `complete` over a local ollama server (the libkrun local-model forward target). Use:
-    `LLMDistiller(ollama_complete('qwen3'))`. temperature 0 for reproducible distillation."""
+    `LLMDistiller(ollama_complete('qwen3'))`. temperature 0 for reproducible distillation. timeout is
+    generous — a large local model (e.g. 35B) can take >3min/call; on a genuine stall FallbackDistiller
+    catches the timeout and uses the heuristic floor."""
     import urllib.request
 
     def complete(prompt: str) -> str:
@@ -262,7 +265,7 @@ def ollama_complete(model: str, host: str = "http://127.0.0.1:11434", *, tempera
                            "options": {"temperature": temperature}}).encode()
         req = urllib.request.Request(host + "/api/generate", data=body,
                                      headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=180) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read())["response"]
 
     return complete
@@ -293,7 +296,8 @@ def distiller_from_env() -> Distiller:
     if not model:
         return HeuristicDistiller()
     host = os.environ.get("GHOST_OLLAMA_HOST", "http://127.0.0.1:11434")
-    return FallbackDistiller(LLMDistiller(ollama_complete(model, host)), HeuristicDistiller())
+    timeout = float(os.environ.get("GHOST_OLLAMA_TIMEOUT", "300"))
+    return FallbackDistiller(LLMDistiller(ollama_complete(model, host, timeout=timeout)), HeuristicDistiller())
 
 
 def distill_session(events: list[dict], store, *, project: str, scope: str = "project",

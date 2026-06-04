@@ -23,7 +23,7 @@ import sys
 from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from distill import build_trace, distill_session, read_log  # noqa: E402 — sibling, path set above
+from distill import build_trace, distill_session, distiller_from_env, read_log  # noqa: E402 — sibling
 from store import MemoryStore, store_from_env  # noqa: E402
 
 _FB = 400  # outcome-feedback cap in an observation (the raw record, not the full grader dump)
@@ -95,7 +95,9 @@ def main():
 
     store = store_from_env()
     oids = observe_events(events, store, project=args.project)
-    cids = distill_session(events, store, project=args.project, task=args.task) if args.distill else []
+    # --distill picks the configured distiller (GHOST_DISTILL_MODEL → LLM+heuristic fallback, else heuristic)
+    cids = (distill_session(events, store, project=args.project, task=args.task,
+                            distiller=distiller_from_env()) if args.distill else [])
     if logpath:
         open(logpath + ".ghost-observed", "w").close()  # idempotency marker (matches `session ingest`)
 

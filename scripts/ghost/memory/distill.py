@@ -19,7 +19,9 @@ richer trajectory→claims later — same interface.
 from __future__ import annotations
 
 import json
+import os
 import re
+import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -266,6 +268,34 @@ def ollama_complete(model: str, host: str = "http://127.0.0.1:11434", *, tempera
     return complete
 
 
+class FallbackDistiller:
+    """Compose distillers: try `primary` (e.g. the LLM), fall back to `fallback` (e.g. heuristic) when
+    it raises — so a flaky or absent model never drops a session to zero claims (the heuristic is the
+    verifiable floor). The fallback is RECORDED to stderr, not silently swallowed."""
+
+    def __init__(self, primary: Distiller, fallback: Distiller):
+        self.primary, self.fallback = primary, fallback
+
+    def distill(self, trace: Trace) -> list[ClaimDraft]:
+        try:
+            return self.primary.distill(trace)
+        except Exception as e:  # LLM backends fail many ways (connect/timeout/parse) — degrade, don't drop
+            print(f"distill: {type(self.primary).__name__} failed ({type(e).__name__}: {str(e)[:120]}); "
+                  f"using {type(self.fallback).__name__}", file=sys.stderr)
+            return self.fallback.distill(trace)
+
+
+def distiller_from_env() -> Distiller:
+    """The configured distiller for the capture loop. GHOST_DISTILL_MODEL set → the LLM (ollama) with
+    a heuristic fallback; unset → heuristic only. GHOST_OLLAMA_HOST overrides the server. The seam-
+    config analog of store.store_from_env."""
+    model = os.environ.get("GHOST_DISTILL_MODEL")
+    if not model:
+        return HeuristicDistiller()
+    host = os.environ.get("GHOST_OLLAMA_HOST", "http://127.0.0.1:11434")
+    return FallbackDistiller(LLMDistiller(ollama_complete(model, host)), HeuristicDistiller())
+
+
 def distill_session(events: list[dict], store, *, project: str, scope: str = "project",
                     task: str = "", distiller: Distiller | None = None, actor: str = "distill") -> list[str]:
     """Compact a session's §0 events, mine claims, write them with provenance. The trace is recorded
@@ -331,8 +361,6 @@ def _trace_summary(t: Trace) -> str:
 
 if __name__ == "__main__":
     import glob
-    import os
-    import sys
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from store import MemoryStore
@@ -418,6 +446,19 @@ done."""
 
     dl = LLMDistiller(stub_complete)
     drafts = dl.distill(build_trace(events, task="price books"))
+
+    # FallbackDistiller: primary raises → heuristic floor runs (never zero claims); primary OK → wins.
+    class _Boom:
+        def distill(self, _trace): raise RuntimeError("model down")
+    assert FallbackDistiller(_Boom(), HeuristicDistiller()).distill(build_trace(events)), "fallback floor"
+    assert FallbackDistiller(dl, HeuristicDistiller()).distill(build_trace(events, task="t"))[0].subject \
+        == "book discount pricing", "primary wins when it succeeds"
+    # distiller_from_env: model unset → heuristic; set → LLM-with-fallback
+    os.environ.pop("GHOST_DISTILL_MODEL", None)
+    assert isinstance(distiller_from_env(), HeuristicDistiller)
+    os.environ["GHOST_DISTILL_MODEL"] = "fake-model"
+    assert isinstance(distiller_from_env(), FallbackDistiller)
+    os.environ.pop("GHOST_DISTILL_MODEL", None)
     assert [d.subject for d in drafts] == ["book discount pricing", "greedy grouping overcharges",
                                            "weird type"], [d.subject for d in drafts]  # blank-subject dropped
     assert drafts[2].type == "fact"  # unknown type coerced

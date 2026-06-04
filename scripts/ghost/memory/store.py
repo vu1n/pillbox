@@ -37,7 +37,7 @@ from typing import Callable, Protocol
 
 import turso  # pyturso — the tursodb engine (concurrent writes + native vectors)
 
-from vocab import SCOPES, TYPES  # single-sourced vocabulary (turso-free leaf), shared with distill.py
+from vocab import SCOPES, STATUSES, TYPES  # single-sourced vocabulary (turso-free leaf)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS observations (
@@ -226,6 +226,14 @@ class MemoryStore:
             (cid, type, subject, content, scope, project, agent, status, confidence,
              json.dumps(source_ids or []), json.dumps(code_refs or []), now, now))])
         return cid
+
+    # --- set_status = the arbiter's write (supersede / accept / reject) -----
+    def set_status(self, claim_id: str, status: str) -> None:
+        """Transition a claim's lifecycle status. NEVER deletes — superseded/rejected rows stay
+        (recall already excludes them) so history is preserved. The arbiter's only write."""
+        _require(status in STATUSES, f"bad status {status!r}")
+        self._write([("UPDATE memory_claims SET status=?, updated_at=? WHERE id=?",
+                      (status, _now(), claim_id))])
 
     # --- recall = load/pull -------------------------------------------------
     def recall(self, query: str, project: str | None = None, scope: str | None = None,

@@ -5,3 +5,4 @@ correctness bug (a type valid in one but rejected by the other)."""
 
 SCOPES = ("user", "project", "agent", "global")
 TYPES = ("fact", "preference", "decision", "procedure", "artifact", "hypothesis", "pitfall")
+STATUSES = ("candidate", "accepted", "superseded", "rejected")  # claim lifecycle (spec status field)

@@ -11,3 +11,7 @@
 # Node deps (wrangler/opencode dev tooling) — never commit; a stray `npm i`
 # once swept the whole tree (incl. a 100MB+ workerd binary) into history.
 node_modules/
+
+# Python bytecode (scripts/ghost/*)
+__pycache__/
+*.pyc

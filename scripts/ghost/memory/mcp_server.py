@@ -18,7 +18,9 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from store import MemoryStore, RipgrepResolver, store_from_env  # noqa: E402 — sibling, path set above
+from arbiter import consolidate as _consolidate  # noqa: E402 — sibling, path set above
+from arbiter import resolve_conflicts as _resolve_conflicts  # noqa: E402
+from store import MemoryStore, RipgrepResolver, store_from_env  # noqa: E402
 
 
 def _claim_dict(c) -> dict:
@@ -76,6 +78,19 @@ def build_mcp(store, project: str, *, name: str = "ghost-memory"):
         """Record an ACCEPTED procedure — a reusable how-to. Returns the claim id."""
         return store.claim("procedure", subject, content, scope="project", project=project,
                            source_ids=source_ids, accept=True)
+
+    @mcp.tool()
+    def consolidate(subject: str = "", dry_run: bool = False) -> dict:
+        """Dedup memory: group claims by subject and SUPERSEDE all but the strongest (accepted >
+        confident > more-evidenced > newer). subject="" consolidates the whole project; dry_run=true
+        previews the plan without writing. Superseded claims are kept for history but excluded from recall."""
+        return _consolidate(store, project=project, subject=subject or None, dry_run=dry_run)
+
+    @mcp.tool()
+    def resolve_conflicts(subject: str) -> dict:
+        """Show a subject's live claims grouped by status, with the recommended survivor (read-only;
+        apply the recommendation with consolidate)."""
+        return _resolve_conflicts(store, subject, project=project)
 
     return mcp
 

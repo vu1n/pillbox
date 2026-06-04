@@ -25,6 +25,7 @@ the model choice is separate); with no embedder, recall degrades to LIKE keyword
 from __future__ import annotations
 
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -140,7 +141,7 @@ class RipgrepResolver:
         cmd = [self.binary, "-H", "-n", "--no-heading", "-m", "1"]
         if fixed:
             cmd.append("-F")
-        cmd += [pattern, path or "."]
+        cmd += ["--", pattern, path or "."]  # -- so a symbol/query starting with '-' isn't a flag
         try:
             p = subprocess.run(cmd, capture_output=True, text=True, timeout=10, cwd=self.root)
         except (OSError, subprocess.SubprocessError):
@@ -240,15 +241,20 @@ class MemoryStore:
         if types:
             where.append("type IN (%s)" % ",".join("?" * len(types))); params.extend(types)
         cur = self.db.cursor()
-        if self.embed:
-            # semantic recall: cosine distance to the query embedding (linear scan — fine at bootstrap)
-            qv = self._vec(query)
-            order = f"vector_distance_cos(embedding, vector32('{qv}'))"
+        qv = self._vec(query) if self.embed else None
+        if qv:
+            # semantic recall: cosine distance to the query embedding (linear scan — fine at bootstrap).
+            # Claims with NO embedding (written before an embedder was wired) still return — the CASE
+            # gives them NULL distance, sorted last — so attaching an embedder never makes prior claims
+            # unrecallable. The CASE is load-bearing: vector_distance_cos(NULL, …) THROWS, not NULL.
+            order = (f"CASE WHEN embedding IS NULL THEN NULL "
+                     f"ELSE vector_distance_cos(embedding, vector32('{qv}')) END")
             rows = cur.execute(
-                f"SELECT *, ({order}) AS _d FROM memory_claims WHERE embedding IS NOT NULL AND "
-                + " AND ".join(where) + " ORDER BY _d LIMIT ?", params + [limit]).fetchall()
+                f"SELECT *, ({order}) AS _d FROM memory_claims WHERE " + " AND ".join(where)
+                + " ORDER BY _d IS NULL, _d, (status='accepted') DESC, confidence DESC LIMIT ?",
+                params + [limit]).fetchall()
         else:
-            # keyword recall (LIKE) until BM25-over-code (Tantivy) is enabled — same seam.
+            # keyword recall (LIKE) — no embedder wired (or the query produced no embedding).
             terms = re.findall(r"[A-Za-z0-9_]+", query)
             like = " OR ".join(["(subject LIKE ? OR content LIKE ?)"] * len(terms)) or "1"
             lp = []
@@ -269,16 +275,28 @@ class MemoryStore:
         return claims
 
     # --- helpers ------------------------------------------------------------
-    def _vec(self, text: str) -> str:
-        return "[" + ",".join(f"{x:.6f}" for x in self.embed(text)) + "]"
+    def _vec(self, text: str) -> str | None:
+        """Encode the BYO embedder's output as a vector32 literal, or None for an empty embedding
+        (stored as NULL, not vector32('[]')). The values are interpolated into SQL, so a non-numeric /
+        NaN / Inf from a buggy embedder fails LOUD here rather than as a malformed query or injection."""
+        vals = self.embed(text)
+        if not vals:
+            return None
+        out = []
+        for x in vals:
+            f = float(x)  # non-numeric → TypeError (loud), never interpolated as text
+            _require(math.isfinite(f), f"embedder returned non-finite component {x!r}")
+            out.append(f"{f:.6f}")
+        return "[" + ",".join(out) + "]"
 
     @staticmethod
     def _claim(r: dict) -> Claim:
+        conf = r["confidence"]
         return Claim(
             id=r["id"], type=r["type"], subject=r["subject"], content=r["content"], scope=r["scope"],
-            status=r["status"], confidence=r["confidence"], source_ids=json.loads(r["source_ids"]),
+            status=r["status"], confidence=conf, source_ids=json.loads(r["source_ids"]),
             code_refs=json.loads(r.get("code_refs") or "[]"), project=r["project"], agent=r["agent"],
-            low_confidence=r["confidence"] < 0.5)
+            low_confidence=(conf or 0) < 0.5)
 
 
 def _require(cond: bool, msg: str):
@@ -323,6 +341,27 @@ if __name__ == "__main__":
         g = MemoryStore(db, resolver=rg).recall("libkrun rebuild feature codesign", project="pillbox")[0].grounding
         assert g and g[0]["status"] == "grounded" and g[0]["location"]["line"] == 1, g
         grounded = f"; grounded → {g[0]['location']['path']}:{g[0]['location']['line']}"
+
+    # embedder branch (the LIKE→embedder upgrade path the prod code will hit). A toy 1-D embedder; the
+    # claims above were written WITHOUT one (embedding=NULL). Recalling under an embedder must still
+    # return them (regression: a prior `embedding IS NOT NULL` filter made NULL-embedding claims vanish).
+    def toy_embed(text: str) -> list[float]:
+        t = text.lower()
+        return [float("libkrun" in t), float("docker" in t), 1.0]  # 3-D, non-zero (cosine needs magnitude)
+    me = MemoryStore(db, embed=toy_embed)
+    me.claim("fact", "embedded note", "a libkrun note stored with an embedding",
+             scope="project", project="pillbox", accept=True)
+    vh = me.recall("libkrun", project="pillbox")
+    assert any(h.subject == "libkrun rebuild" for h in vh), "NULL-embedding claim must still recall"
+    assert any(h.subject == "embedded note" for h in vh), vh
+    # buggy embedder fails LOUD, not silently / via injection; empty embedding → NULL (no crash)
+    try:
+        MemoryStore(db, embed=lambda _t: [float("nan")]).claim("fact", "x", "y", scope="project", project="pillbox")
+        raise AssertionError("non-finite embedding should have raised")
+    except ValueError:
+        pass
+    MemoryStore(db, embed=lambda _t: []).claim("fact", "empty emb", "z", scope="project", project="pillbox")
+
     print(f"OK — tursodb store: recalled [{hits[0].type}] {hits[0].subject} → "
           f"code {hits[0].code_refs[0]['path']}:{hits[0].code_refs[0]['symbol']}; "
-          f"governance + provenance + concurrent observe all hold{grounded}")
+          f"governance + provenance + concurrent observe + embedder-upgrade-recall all hold{grounded}")

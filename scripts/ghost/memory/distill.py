@@ -19,6 +19,7 @@ richer trajectory→claims later — same interface.
 from __future__ import annotations
 
 import json
+import re
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -137,7 +138,7 @@ class HeuristicDistiller:
                         _trunc(c.get("feedback") or f"the rubric criterion {name!r} failed"), 0.6))
         if trace.run_failed:
             drafts.append(ClaimDraft("pitfall", "run failed", _trunc(trace.run_failed), 0.5))
-        errs = Counter(a.name for a in trace.actions if a.failed)
+        errs = Counter(a.name for a in trace.actions if a.failed and a.name)
         for name, n in errs.items():
             if n >= 2:
                 sample = next(a for a in trace.actions if a.failed and a.name == name)
@@ -210,16 +211,27 @@ class LLMDistiller:
 
     @staticmethod
     def parse(raw: str) -> list[ClaimDraft]:
-        """Extract the JSON array from the completion (tolerating a ```fence``` or surrounding prose),
-        validate each item, drop the unusable. Raises if no JSON is present (loud, not silent)."""
+        """Extract the JSON from the completion, validate each item, drop the unusable. Raises (loud,
+        not silent) when no parseable JSON is present. Prefers a fenced ```json block — models usually
+        emit one, and it's robust against prose that itself contains brackets (e.g. "see [below]:")."""
         text = (raw or "").strip()
-        obj, arr = text.find("{"), text.find("[")
-        start = arr if arr != -1 and (obj == -1 or arr < obj) else obj
-        end = text.rfind("]") if start == arr else text.rfind("}")
-        if start == -1 or end == -1 or end < start:
-            raise ValueError(f"distiller returned no JSON: {text[:200]!r}")
-        data = json.loads(text[start:end + 1])
+        fence = re.search(r"```(?:json)?\s*(.+?)```", text, re.DOTALL)
+        if fence:
+            blob = fence.group(1).strip()
+        else:
+            obj, arr = text.find("{"), text.find("[")
+            start = arr if arr != -1 and (obj == -1 or arr < obj) else obj
+            end = text.rfind("]") if start == arr else text.rfind("}")
+            if start == -1 or end == -1 or end < start:
+                raise ValueError(f"distiller returned no JSON: {text[:200]!r}")
+            blob = text[start:end + 1]
+        try:
+            data = json.loads(blob)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"distiller returned unparseable JSON: {e}; {blob[:200]!r}") from e
         items = data.get("claims", []) if isinstance(data, dict) else data
+        if not isinstance(items, list):
+            raise ValueError(f"distiller JSON is not a claim list: {type(items).__name__}")
         drafts: list[ClaimDraft] = []
         for it in items:
             if not isinstance(it, dict):
@@ -298,7 +310,9 @@ def _model_agnostic(content: str, models: list[str], scope: str) -> str:
     if scope in ("project", "global"):
         for m in models:
             if m:
-                content = content.replace(m, "<model>")
+                # word-boundary replace: strip the model id as a token, not as a substring inside an
+                # unrelated word (a short/family id like "o1"/"pi" inside "4o1ms"/"pipeline").
+                content = re.sub(rf"\b{re.escape(m)}\b", "<model>", content)
     return content
 
 
@@ -390,6 +404,17 @@ done."""
     def stub_complete(prompt):
         assert "## Actions" in prompt and "task:" in prompt, "prompt missing rendered trace"
         return canned
+
+    # parse robustness: prose containing brackets before a fenced array (the find/rfind heuristic
+    # would mis-slice; the fence path handles it), and a non-list payload raises loud.
+    prose = "See the items [below] for details:\n```json\n[{\"type\":\"fact\",\"subject\":\"s\",\"content\":\"c\"}]\n```"
+    assert [d.subject for d in LLMDistiller.parse(prose)] == ["s"], "fenced array after prose brackets"
+    for bad in ('```json\n42\n```', "not json at all"):
+        try:
+            LLMDistiller.parse(bad)
+            raise AssertionError(f"expected ValueError for {bad!r}")
+        except ValueError:
+            pass
 
     dl = LLMDistiller(stub_complete)
     drafts = dl.distill(build_trace(events, task="price books"))

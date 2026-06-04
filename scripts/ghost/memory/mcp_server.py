@@ -124,13 +124,13 @@ elif __name__ == "__main__":
     # self-test: exercise the do_* logic directly (the MCP layer is thin glue over these), no SDK
     # needed. Set GHOST_MCP_SERVE=1 to actually run the stdio server instead.
     import glob
+    import shutil
 
     db = "/tmp/ghost-mcp-selftest.db"
     for f in glob.glob(db + "*"):
         try: os.remove(f)
         except OSError: pass
     repo = "/tmp/ghost-mcp-selftest-repo"
-    import shutil
     shutil.rmtree(repo, ignore_errors=True)
     os.makedirs(os.path.join(repo, "src", "sandbox"))
     with open(os.path.join(repo, "src", "sandbox", "mod.rs"), "w") as fh:

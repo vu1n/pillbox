@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS memory_claims (
   id TEXT PRIMARY KEY, type TEXT NOT NULL, subject TEXT NOT NULL, content TEXT NOT NULL,
   scope TEXT NOT NULL, project TEXT, agent TEXT, status TEXT NOT NULL DEFAULT 'candidate',
   confidence REAL DEFAULT 0.7, source_ids TEXT DEFAULT '[]',
-  code_refs TEXT DEFAULT '[]',          -- [{path, symbol?, repo?, commit?}] — memory that points to code
+  code_refs TEXT DEFAULT '[]',          -- [{symbol?, path?, query?, repo?, commit?}] durable anchor, re-resolved at recall
   embedding BLOB,                        -- vector32 of subject+content (when an embedder is wired)
   valid_from TEXT, valid_to TEXT, metadata TEXT DEFAULT '{}',
   created_at TEXT NOT NULL, updated_at TEXT NOT NULL

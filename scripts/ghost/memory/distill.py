@@ -149,13 +149,9 @@ class HeuristicDistiller:
         return drafts
 
 
-# Contract for an LLM-backed Distiller (the next slice): same seam, richer judgment. The model reads
-# the full Trace and emits ClaimDraft JSON. Non-negotiables baked into the prompt:
-#   - mine LESSONS not events: durable, reusable guidance (a future agent acts on it), never chatter;
-#   - failure-first (what went wrong + the fix), but success→`procedure` is allowed WITH judgment;
-#   - MODEL-AGNOSTIC content for shared scopes (no model names / model-specific phrasing);
-#   - GROUND to code via code_refs (symbol/path/recipe) when the lesson is about specific code;
-#   - one tight subject + content per claim; set type ∈ store.TYPES and a calibrated confidence.
+# LLM_DISTILL_PROMPT + _SCHEMA are what the model is ASKED for (model-agnostic, code-grounded claims).
+# The guarantees don't trust it to comply: distill_session strips model identity and parse() validates
+# type/shape downstream. Prompt = best-effort; the store path = enforcement.
 LLM_DISTILL_PROMPT = (
     "You are distilling a coding-agent session trace into durable memory claims for a swarm of "
     "agents. Emit JSON: a list of {type, subject, content, confidence, code_refs}. Mine reusable "

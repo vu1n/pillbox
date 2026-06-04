@@ -81,6 +81,7 @@ class Claim:
     grounding: list[dict] = field(default_factory=list)  # live pointers, populated by recall
     project: str | None = None
     agent: str | None = None
+    updated_at: str = ""  # recency — the arbiter ranks on it; recall orders by it
     low_confidence: bool = False
 
 
@@ -239,14 +240,11 @@ class MemoryStore:
     def recall(self, query: str, project: str | None = None, scope: str | None = None,
                types: list[str] | None = None, include_candidates: bool = False,
                limit: int = 10) -> list[Claim]:
-        where = ["status NOT IN ('rejected','superseded')"]
-        params: list = []
+        where, params = self._base_where(project)
         if not include_candidates:
             where.append("status = 'accepted'")
         if scope:
             where.append("scope = ?"); params.append(scope)
-        if project:
-            where.append("(project = ? OR scope = 'global')"); params.append(project)
         if types:
             where.append("type IN (%s)" % ",".join("?" * len(types))); params.extend(types)
         cur = self.db.cursor()
@@ -283,7 +281,30 @@ class MemoryStore:
                     c.grounding = [resolver.resolve(ref) for ref in c.code_refs]
         return claims
 
+    def live_claims(self, project: str | None = None, subject: str | None = None) -> list[Claim]:
+        """Claims eligible for arbitration — everything not superseded/rejected (candidate-INCLUSIVE,
+        unlike recall's accepted view). The arbiter consumes Claim objects, so the query + governance
+        predicate live HERE, not re-hand-rolled against the table in arbiter."""
+        where, params = self._base_where(project)
+        if subject:
+            where.append("subject = ?"); params.append(subject)
+        cur = self.db.cursor()
+        rows = cur.execute("SELECT * FROM memory_claims WHERE " + " AND ".join(where), params).fetchall()
+        cols = [d[0] for d in cur.description]
+        return [self._claim(dict(zip(cols, r))) for r in rows]
+
     # --- helpers ------------------------------------------------------------
+    @staticmethod
+    def _base_where(project: str | None) -> tuple[list[str], list]:
+        """The governance predicate shared by recall + live_claims: never surface superseded/rejected,
+        and a project sees its own claims + global. Single-sourced so the two readers can't drift."""
+        where = ["status NOT IN ('rejected','superseded')"]
+        params: list = []
+        if project:
+            where.append("(project = ? OR scope = 'global')")
+            params.append(project)
+        return where, params
+
     def _vec(self, text: str) -> str | None:
         """Encode the BYO embedder's output as a vector32 literal, or None for an empty embedding
         (stored as NULL, not vector32('[]')). The values are interpolated into SQL, so a non-numeric /
@@ -305,7 +326,7 @@ class MemoryStore:
             id=r["id"], type=r["type"], subject=r["subject"], content=r["content"], scope=r["scope"],
             status=r["status"], confidence=conf, source_ids=json.loads(r["source_ids"]),
             code_refs=json.loads(r.get("code_refs") or "[]"), project=r["project"], agent=r["agent"],
-            low_confidence=(conf or 0) < 0.5)
+            updated_at=r.get("updated_at") or "", low_confidence=(conf or 0) < 0.5)
 
 
 def _require(cond: bool, msg: str):

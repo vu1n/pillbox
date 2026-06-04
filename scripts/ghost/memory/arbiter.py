@@ -12,34 +12,17 @@ newer. This also implements decision supersession (a newer decision on the same 
 """
 from __future__ import annotations
 
-import json
 import os
 import sys
 from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from store import MemoryStore, store_from_env  # noqa: E402 — sibling, path set above
+from store import Claim, MemoryStore, store_from_env  # noqa: E402 — sibling, path set above
 
 
-def _rank(r: dict) -> tuple:
+def _rank(c: Claim) -> tuple:
     """Sort key, higher = stronger survivor: accepted first, then confidence, evidence, recency."""
-    return (r["status"] == "accepted", r["confidence"] or 0,
-            len(json.loads(r["source_ids"] or "[]")), r["updated_at"] or "")
-
-
-def _live_claims(store, project: str | None, subject: str | None) -> list[dict]:
-    """Claims eligible for arbitration — everything not already superseded/rejected (NOT recall's
-    accepted-only view; the arbiter weighs candidates too)."""
-    where = ["status NOT IN ('superseded','rejected')"]
-    params: list = []
-    if project:
-        where.append("(project = ? OR scope = 'global')"); params.append(project)
-    if subject:
-        where.append("subject = ?"); params.append(subject)
-    cur = store.db.cursor()
-    rows = cur.execute("SELECT * FROM memory_claims WHERE " + " AND ".join(where), params).fetchall()
-    cols = [d[0] for d in cur.description]
-    return [dict(zip(cols, r)) for r in rows]
+    return (c.status == "accepted", c.confidence or 0, len(c.source_ids), c.updated_at)
 
 
 def consolidate(store, *, project: str | None = None, subject: str | None = None,
@@ -47,17 +30,17 @@ def consolidate(store, *, project: str | None = None, subject: str | None = None
     """Group live claims by (subject, scope, project); in each group of >1, keep the strongest and
     supersede the rest. dry_run returns the plan without writing. Returns {groups, superseded,
     dry_run, plan:[{subject, survivor, superseded:[ids]}]}."""
-    groups: dict[tuple, list[dict]] = defaultdict(list)
-    for r in _live_claims(store, project, subject):
-        groups[(r["subject"], r["scope"], r["project"])].append(r)
+    groups: dict[tuple, list[Claim]] = defaultdict(list)
+    for c in store.live_claims(project, subject):
+        groups[(c.subject, c.scope, c.project)].append(c)
 
     plan = []
     for (subj, _scope, _project), members in groups.items():
         if len(members) < 2:
             continue
         survivor, *losers = sorted(members, key=_rank, reverse=True)
-        plan.append({"subject": subj, "survivor": survivor["id"],
-                     "superseded": [m["id"] for m in losers]})
+        plan.append({"subject": subj, "survivor": survivor.id,
+                     "superseded": [m.id for m in losers]})
 
     if not dry_run:
         for p in plan:
@@ -71,13 +54,13 @@ def consolidate(store, *, project: str | None = None, subject: str | None = None
 def resolve_conflicts(store, subject: str, *, project: str | None = None) -> dict:
     """Read-only: a subject's live claims grouped by status, with the recommended survivor. Apply via
     consolidate."""
-    members = _live_claims(store, project, subject)
+    members = store.live_claims(project, subject)
     by_status: dict[str, list] = defaultdict(list)
     for m in members:
-        by_status[m["status"]].append({"id": m["id"], "content": m["content"],
-                                       "confidence": m["confidence"], "updated_at": m["updated_at"]})
+        by_status[m.status].append({"id": m.id, "content": m.content,
+                                     "confidence": m.confidence, "updated_at": m.updated_at})
     return {"subject": subject, "count": len(members), "by_status": dict(by_status),
-            "recommend": max(members, key=_rank)["id"] if members else None}
+            "recommend": max(members, key=_rank).id if members else None}
 
 
 def main():

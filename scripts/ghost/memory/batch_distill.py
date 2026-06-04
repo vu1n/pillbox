@@ -31,10 +31,10 @@ def task_signature(trace) -> str:
     return "solo:" + trace.session_id
 
 
-def plan_corpus(log_glob: str) -> list[tuple[str, str, float | None]]:
+def plan_corpus(log_glob: str) -> tuple[list[tuple[str, str, float | None]], int]:
     """Pass 1 (cheap — parse, keep only sig/score/path, discard events): group sessions by task and
-    pick one representative each (closest to a partial score). Returns [(sig, path, score)],
-    most-learnable first."""
+    pick one representative each (closest to a partial score). Returns (reps, total_session_count),
+    reps = [(sig, path, score)] most-learnable first."""
     groups: dict[str, list[tuple[float | None, str]]] = {}
     for lp in glob.glob(log_glob):
         try:

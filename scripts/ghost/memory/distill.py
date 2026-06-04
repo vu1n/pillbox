@@ -52,6 +52,12 @@ class Verdict:
     feedback: str
     criteria: list[dict]  # [{name, passed, feedback}] — the decomposed, verifiable gradient
 
+    @property
+    def failed_criteria(self) -> list[dict]:
+        """The one definition of 'a criterion failed' (absent `passed` ⇒ passed). Read by both
+        distillers and wire's observe_events — never re-spell the `.get("passed", True)` predicate."""
+        return [c for c in self.criteria if not c.get("passed", True)]
+
 
 @dataclass
 class Trace:
@@ -62,6 +68,12 @@ class Trace:
     run_failed: str | None
     verdict: Verdict | None
     event_count: int
+
+    @property
+    def tool_failures(self) -> Counter:
+        """Named tool errors tallied by tool — the one definition, read by the heuristic distiller and
+        wire's observe_events. (Unnamed failed actions are excluded — nothing to attribute.)"""
+        return Counter(a.name for a in self.actions if a.failed and a.name)
 
 
 @dataclass
@@ -121,7 +133,7 @@ class HeuristicDistiller:
     def distill(self, trace: Trace) -> list[ClaimDraft]:
         drafts: list[ClaimDraft] = []
         if trace.verdict:
-            failed = [c for c in trace.verdict.criteria if not c.get("passed", True)]
+            failed = trace.verdict.failed_criteria
             total = len(trace.verdict.criteria)
             if len(failed) > 3:
                 # Broad failure → ONE distilled pitfall. One-per-criterion here is a raw failure
@@ -140,8 +152,7 @@ class HeuristicDistiller:
                         _trunc(c.get("feedback") or f"the rubric criterion {name!r} failed"), 0.6))
         if trace.run_failed:
             drafts.append(ClaimDraft("pitfall", "run failed", _trunc(trace.run_failed), 0.5))
-        errs = Counter(a.name for a in trace.actions if a.failed and a.name)
-        for name, n in errs.items():
+        for name, n in trace.tool_failures.items():
             if n >= 2:
                 sample = next(a for a in trace.actions if a.failed and a.name == name)
                 drafts.append(ClaimDraft(
@@ -195,9 +206,8 @@ class LLMDistiller:
         v = trace.verdict
         if v:
             lines.append(f"verdict: {'pass' if v.passed else 'fail'} score={v.score} grader={v.grader}")
-            for c in v.criteria:
-                if not c.get("passed", True):
-                    lines.append(f"  FAILED {c.get('name', '?')}: {_clip(c.get('feedback') or '', 200)}")
+            for c in v.failed_criteria:
+                lines.append(f"  FAILED {c.get('name', '?')}: {_clip(c.get('feedback') or '', 200)}")
         if trace.run_failed:
             lines.append(f"run failed: {trace.run_failed}")
         lines.append("## Actions")

@@ -20,7 +20,6 @@ import glob
 import json
 import os
 import sys
-from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from distill import build_trace, distill_session, distiller_from_env, read_log  # noqa: E402 — sibling
@@ -41,7 +40,7 @@ def observe_events(events: list[dict], store, *, project: str, scope: str = "pro
 
     if t.verdict:
         v = t.verdict
-        failed = [c.get("name", "?") for c in v.criteria if not c.get("passed", True)]
+        failed = [c.get("name", "?") for c in v.failed_criteria]
         content = f"graded {'PASS' if v.passed else 'FAIL'} score={v.score} ({v.grader})"
         if failed:
             content += f"; failed: {', '.join(failed[:5])}" + (" …" if len(failed) > 5 else "")
@@ -53,7 +52,7 @@ def observe_events(events: list[dict], store, *, project: str, scope: str = "pro
     if t.run_failed:
         oids.append(store.observe(actor, f"run failed: {t.run_failed}", scope=scope, project=project,
                                   source=src, confidence=0.8, metadata={"kind": "run_failed"}))
-    fails = Counter(a.name for a in t.actions if a.failed and a.name)
+    fails = t.tool_failures
     if fails:
         tally = ", ".join(f"{n}×{name}" for name, n in fails.most_common())
         oids.append(store.observe(actor, f"{sum(fails.values())} tool failures: {tally}", scope=scope,

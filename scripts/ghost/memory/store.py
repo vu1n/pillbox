@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -304,9 +305,16 @@ def _require(cond: bool, msg: str):
         raise ValueError(msg)
 
 
+def store_from_env(embed: Callable[[str], list[float]] | None = None) -> MemoryStore:
+    """Build a store from the ghost CLI env — the shared constructor for the MCP server and wire CLI.
+    GHOST_MEMORY_DB = db path; GHOST_REPO_ROOT = the repo the default RipgrepResolver grounds against."""
+    db = os.environ.get("GHOST_MEMORY_DB", os.path.expanduser("~/.pillbox/ghost/swarm-memory.db"))
+    os.makedirs(os.path.dirname(db), exist_ok=True)
+    return MemoryStore(db, embed=embed, resolver=RipgrepResolver(root=os.environ.get("GHOST_REPO_ROOT", ".")))
+
+
 if __name__ == "__main__":
     import glob
-    import os
     db = "/tmp/swarm-memory-selftest.db"
     for f in glob.glob(db + "*"):  # db + WAL/SHM + the MVCC logical-log sidecar
         try: os.remove(f)

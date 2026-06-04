@@ -18,7 +18,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from store import MemoryStore, RipgrepResolver  # noqa: E402 — sibling import, path set above
+from store import MemoryStore, RipgrepResolver, store_from_env  # noqa: E402 — sibling, path set above
 
 
 def _claim_dict(c) -> dict:
@@ -81,12 +81,8 @@ def build_mcp(store, project: str, *, name: str = "ghost-memory"):
 
 
 def main():
-    db = os.environ.get("GHOST_MEMORY_DB", os.path.expanduser("~/.pillbox/ghost/swarm-memory.db"))
     project = os.environ.get("GHOST_PROJECT", "default")
-    root = os.environ.get("GHOST_REPO_ROOT", ".")
-    os.makedirs(os.path.dirname(db), exist_ok=True)
-    store = MemoryStore(db, resolver=RipgrepResolver(root=root))
-    build_mcp(store, project).run()  # FastMCP default transport: stdio
+    build_mcp(store_from_env(), project).run()  # FastMCP default transport: stdio
 
 
 if __name__ == "__main__" and os.environ.get("GHOST_MCP_SERVE"):

@@ -24,7 +24,7 @@ from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from distill import build_trace, distill_session, read_log  # noqa: E402 — sibling, path set above
-from store import MemoryStore, RipgrepResolver  # noqa: E402
+from store import MemoryStore, store_from_env  # noqa: E402
 
 _FB = 400  # outcome-feedback cap in an observation (the raw record, not the full grader dump)
 
@@ -85,7 +85,7 @@ def main():
     if args.source == "-":
         events = [json.loads(line) for line in sys.stdin if line.strip()]
     else:
-        logpath = args.source or resolve_session_log(args.session) if (args.source or args.session) else None
+        logpath = args.source or (resolve_session_log(args.session) if args.session else None)
         if not logpath:
             ap.error("need a log path, - for stdin, or --session ID")
         if os.path.exists(logpath + ".ghost-observed"):
@@ -93,11 +93,7 @@ def main():
             return
         events = read_log(logpath)
 
-    db = os.environ.get("GHOST_MEMORY_DB", os.path.expanduser("~/.pillbox/ghost/swarm-memory.db"))
-    root = os.environ.get("GHOST_REPO_ROOT", ".")
-    os.makedirs(os.path.dirname(db), exist_ok=True)
-    store = MemoryStore(db, resolver=RipgrepResolver(root=root))
-
+    store = store_from_env()
     oids = observe_events(events, store, project=args.project)
     cids = distill_session(events, store, project=args.project, task=args.task) if args.distill else []
     if logpath:

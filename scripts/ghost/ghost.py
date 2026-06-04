@@ -133,7 +133,37 @@ def run_ghost(cfg: GhostConfig, policies: list[str]) -> dict:
         for p in policies:
             print(f"== {p} ==")
             arms.append(eval_policy(pb, p, held, tmp, cfg.trials))
-    return {"task_set": cfg.task_set, "trials": cfg.trials, "n_held": len(held), "arms": arms}
+    oracle = oracle_from_arms(arms)
+    return {"task_set": cfg.task_set, "trials": cfg.trials, "n_held": len(held),
+            "arms": arms, **({"oracle": oracle} if oracle else {})}
+
+
+def oracle_from_arms(arms: list[dict]) -> dict | None:
+    """The routing CEILING: per task, the cheapest model that MATCHES the best score any model
+    achieved on it. Bounds the opportunity — if this barely beats always-frontier on cost, no
+    router (learned or not) is worth building (the measure-before-optimize discipline). Also the
+    DSPy router's training target: per-task `picks` = the label (the model the router should
+    predict). Computed post-hoc from the always:* arms (>=2 needed); no extra runs."""
+    always = [a for a in arms if a["policy"].startswith("always:")]
+    if len(always) < 2:
+        return None
+    by_task: dict[str, dict[str, float]] = {}  # task → {model: mean score across trials}
+    for a in always:
+        model = a["policy"].split(":", 1)[1]
+        per: dict[str, list[float]] = {}
+        for r in a["results"]:
+            per.setdefault(r["task"], []).append(r["score"])
+        for task, scores in per.items():
+            by_task.setdefault(task, {})[model] = mean(scores)
+    q, c, picks = [], [], {}
+    for task, scores in by_task.items():
+        best = max(scores.values())
+        winner = min((m for m, s in scores.items() if s >= best - 1e-9), key=cost_of)
+        q.append(best)
+        c.append(cost_of(winner))
+        picks[task] = winner
+    return {"policy": "oracle:cheapest-match-best", "quality": round(mean(q), 3),
+            "cost": round(mean(c), 2), "picks": picks}
 
 
 def report(out: dict):
@@ -143,6 +173,22 @@ def report(out: dict):
         qpc = a["quality"] / a["cost"] if a["cost"] else 0.0
         print(f"  {a['policy'][:46]:46} {a['quality']:>8.3f} {a['cost']:>7.2f} {qpc:>8.3f}")
     print("\nrouter wins if it matches the top quality at materially lower cost.")
+
+    o = out.get("oracle")
+    if o:
+        # Best single model = the always:* arm with the top quality (the "frontier" play).
+        always = [a for a in out["arms"] if a["policy"].startswith("always:")]
+        best = max(always, key=lambda a: a["quality"])
+        print(f"\n  {'⌜ ORACLE ceiling (perfect routing) ⌟':46} {o['quality']:>8.3f} {o['cost']:>7.2f}")
+        gap = best["cost"] - o["cost"]
+        print(f"opportunity: perfect routing reaches quality {o['quality']:.3f} at cost {o['cost']:.2f} vs "
+              f"{best['policy'].split('/')[-1]} {best['quality']:.3f} @ {best['cost']:.2f}.")
+        if gap <= 0.5:
+            print("  → oracle cost ≈ frontier cost: routing CAN'T help much (most tasks need the top model). "
+                  "Don't build the learned router on this set.")
+        else:
+            print(f"  → ~{gap:.1f} cost/task of headroom at equal-or-better quality — a learned router has room "
+                  "to close. Worth the DSPy build; oracle 'picks' are its training labels.")
 
 
 def main():

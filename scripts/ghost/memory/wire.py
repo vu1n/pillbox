@@ -71,39 +71,66 @@ def resolve_session_log(sid: str) -> str | None:
     return None
 
 
+# Terminal §0 payloads — a session is "complete" (safe to capture) once one appears. Autocapture
+# gates on this so it never distills an in-flight trace (no verdict yet).
+_TERMINAL = {"scored", "run_finished", "run_failed"}
+
+
+def _is_complete(events: list[dict]) -> bool:
+    return any((e.get("payload") or {}).get("type") in _TERMINAL for e in events)
+
+
+def capture_events(events: list[dict], store, *, project: str, task: str = "", distiller=None) -> dict:
+    """The capture core (shared by the CLI, autocapture, and any future pillbox hook): record outcome
+    observations + optionally distill claims. Returns {observations, claims}."""
+    oids = observe_events(events, store, project=project)
+    cids = distill_session(events, store, project=project, task=task, distiller=distiller) if distiller else []
+    return {"observations": len(oids), "claims": len(cids)}
+
+
+def capture_log_file(path: str, store, *, project: str, task: str = "", distiller=None,
+                     require_complete: bool = False) -> dict | None:
+    """Capture one session log, idempotent via a .ghost-observed marker (matches `session ingest`).
+    Returns None — leaving the log unmarked for a later pass — if already captured, or if
+    require_complete and the session is still in-flight (no terminal event yet)."""
+    if os.path.exists(path + ".ghost-observed"):
+        return None
+    events = read_log(path)
+    if require_complete and not _is_complete(events):
+        return None
+    res = capture_events(events, store, project=project, task=task, distiller=distiller)
+    open(path + ".ghost-observed", "w").close()
+    return res
+
+
 def main():
     ap = argparse.ArgumentParser(description="bridge a session's §0 log into the memory store")
     ap.add_argument("source", nargs="?", help="path to a §0 log.jsonl, or - for stdin (e.g. `pillbox session log ID | wire.py -`)")
     ap.add_argument("--session", help="resolve a session id (or prefix) to its log under ~/.pillbox")
     ap.add_argument("--project", default=os.environ.get("GHOST_PROJECT", "default"))
     ap.add_argument("--task", default="", help="the session's prompt (context for --distill)")
-    ap.add_argument("--distill", action="store_true", help="also distill claims (heuristic) in the same pass")
+    ap.add_argument("--distill", action="store_true", help="also distill claims in the same pass")
     args = ap.parse_args()
 
-    logpath = None
-    if args.source == "-":
+    store = store_from_env()
+    distiller = distiller_from_env() if args.distill else None
+
+    if args.source == "-":  # streaming source has no path/marker — capture inline
         events = [json.loads(line) for line in sys.stdin if line.strip()]
+        res = capture_events(events, store, project=args.project, task=args.task, distiller=distiller)
     else:
         logpath = args.source or (resolve_session_log(args.session) if args.session else None)
         if not logpath:
             ap.error("need a log path, - for stdin, or --session ID")
-        if os.path.exists(logpath + ".ghost-observed"):
+        res = capture_log_file(logpath, store, project=args.project, task=args.task, distiller=distiller)
+        if res is None:
             print(f"already observed: {logpath}")
             return
-        events = read_log(logpath)
 
-    store = store_from_env()
-    oids = observe_events(events, store, project=args.project)
-    # --distill picks the configured distiller (GHOST_DISTILL_MODEL → LLM+heuristic fallback, else heuristic)
-    cids = (distill_session(events, store, project=args.project, task=args.task,
-                            distiller=distiller_from_env()) if args.distill else [])
-    if logpath:
-        open(logpath + ".ghost-observed", "w").close()  # idempotency marker (matches `session ingest`)
-
-    msg = f"observed {len(oids)} outcome signal(s)"
+    msg = f"observed {res['observations']} outcome signal(s)"
     if args.distill:
-        msg += f", distilled {len(cids)} claim(s)"
-    print(f"{msg} from {len(events)} §0 events → project {args.project!r}")
+        msg += f", distilled {res['claims']} claim(s)"
+    print(f"{msg} → project {args.project!r}")
 
 
 if __name__ == "__main__" and len(sys.argv) > 1:

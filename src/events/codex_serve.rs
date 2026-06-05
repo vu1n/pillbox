@@ -9,6 +9,17 @@
 //! a capture file. This module is the pure mapping core the host drains that
 //! file through; the NDJSON transport + the bridge live in the run path.
 //!
+//! ## Verification status
+//!
+//! Captured live from `codex app-server` 0.137.0 through the bridge (so
+//! turn-verified): the handshake, `thread/started`, `turn/started`,
+//! `item/started`/`item/completed` for `userMessage`, and `error`. The
+//! assistant-output items (`agentMessage`, `commandExecution`, `fileChange`,
+//! `mcpToolCall`) and `turn/completed` need an *authenticated* turn to fire, so
+//! those branches are schema-verified (the `generate-json-schema` shapes) but
+//! not yet turn-verified — same status opencode's `session.next.*` family
+//! carries.
+//!
 //! ## The notification envelope
 //!
 //! A notification is `{"method":"<resource>/<verb>","params":{…}}` (no `id`).

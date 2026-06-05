@@ -446,6 +446,26 @@ enum Command {
         #[arg(long, value_name = "PORT")]
         to_port: u16,
     },
+    /// Internal: guest-side `codex app-server` bridge (libkrun codex-serve).
+    /// Spawns `codex app-server`, does the JSON-RPC `initialize` + `thread/start`
+    /// handshake, captures every notification line to `--events-file` (the §0
+    /// source the host drains), auto-accepts approval requests (the sandbox is
+    /// the boundary), and serves a small one-shot HTTP API on `--port`
+    /// (`GET /health`, `POST /session`, `POST /turn`) the host drives over the
+    /// vsock forward. Not user-facing. See `sandbox::appserver`.
+    #[command(hide = true)]
+    AppserverHost {
+        /// Loopback TCP port to serve the host-facing HTTP API on.
+        #[arg(long, value_name = "PORT")]
+        port: u16,
+        /// File to append each codex notification line to (NDJSON, the §0 source).
+        #[arg(long, value_name = "PATH")]
+        events_file: String,
+        /// The `codex app-server` command to spawn: everything after `--`.
+        /// Defaults to `codex app-server` when omitted.
+        #[arg(last = true, value_name = "CMD")]
+        argv: Vec<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -759,6 +779,11 @@ fn run(cli: Cli) -> Result<()> {
             vsock_port,
             to_port,
         } => vsock_forward(vsock_port, to_port),
+        Command::AppserverHost {
+            port,
+            events_file,
+            argv,
+        } => sandbox::appserver::run_host(port, &events_file, &argv),
     }
 }
 

@@ -17,6 +17,7 @@
 //!   Selected when the remote URL has the `e2b://` scheme; an unknown /
 //!   hand-edited scheme falls through to SSH.
 
+pub(crate) mod appserver;
 pub(crate) mod container;
 pub(crate) mod http;
 #[cfg(feature = "libkrun")]

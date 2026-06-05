@@ -125,7 +125,7 @@ global pillbox regardless of where you are.
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--agent A` | `pillbox.toml` `agent` field, then `claude` | Agent to launch (`claude` \| `codex`). |
+| `--agent A` | `pillbox.toml` `agent` field, then `claude` | Agent to launch (`claude` \| `codex` \| `codex-serve` \| `opencode` \| `pi`). `codex-serve` drives `codex app-server` (codex's structured JSON-RPC protocol) as a server-mode agent — libkrun-only, shares `codex`'s auth (one `auth login --agent codex`), driven via `session send` + read via `session watch`/`subscribe`. The PTY `codex` is the default and unaffected. |
 | `--workspace PATH` | cwd | Host directory to mount. |
 | `--name NAME` | `pillbox.toml` `name`, else basename(workspace) | Mount-point name (`/workspace/NAME`). |
 | `--mount HOST:GUEST` | — | Extra bind mount. Repeatable. |

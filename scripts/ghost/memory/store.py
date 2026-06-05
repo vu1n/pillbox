@@ -334,11 +334,32 @@ def _require(cond: bool, msg: str):
         raise ValueError(msg)
 
 
+def ollama_embed(model: str, host: str = "http://127.0.0.1:11434", *, timeout: float = 60):
+    """A BYO `embed` over a local ollama server (the store's vector-recall seam) — e.g.
+    MemoryStore(db, embed=ollama_embed('nomic-embed-text')). Returns the embedding vector for a text.
+    NOTE: all claims in one store must share an embedder — vector_distance_cos errors on a dimension
+    mismatch, so changing GHOST_EMBED_MODEL requires re-embedding (mixing dims corrupts vector recall)."""
+    import urllib.request
+
+    def embed(text: str) -> list[float]:
+        body = json.dumps({"model": model, "prompt": text}).encode()
+        req = urllib.request.Request(host + "/api/embeddings", data=body,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read())["embedding"]
+
+    return embed
+
+
 def store_from_env(embed: Callable[[str], list[float]] | None = None) -> MemoryStore:
     """Build a store from the ghost CLI env — the shared constructor for the MCP server and wire CLI.
-    GHOST_MEMORY_DB = db path; GHOST_REPO_ROOT = the repo the default RipgrepResolver grounds against."""
+    GHOST_MEMORY_DB = db path; GHOST_REPO_ROOT = the RipgrepResolver's repo; GHOST_EMBED_MODEL set →
+    semantic vector recall via ollama (GHOST_OLLAMA_HOST overrides), else keyword (LIKE) recall."""
     db = os.environ.get("GHOST_MEMORY_DB", os.path.expanduser("~/.pillbox/ghost/swarm-memory.db"))
     os.makedirs(os.path.dirname(db), exist_ok=True)
+    if embed is None and os.environ.get("GHOST_EMBED_MODEL"):
+        host = os.environ.get("GHOST_OLLAMA_HOST", "http://127.0.0.1:11434")
+        embed = ollama_embed(os.environ["GHOST_EMBED_MODEL"], host)
     return MemoryStore(db, embed=embed, resolver=RipgrepResolver(root=os.environ.get("GHOST_REPO_ROOT", ".")))
 
 
@@ -398,6 +419,13 @@ if __name__ == "__main__":
     except ValueError:
         pass
     MemoryStore(db, embed=lambda _t: []).claim("fact", "empty emb", "z", scope="project", project="pillbox")
+
+    # store_from_env wires the embedder from GHOST_EMBED_MODEL (semantic recall) when set, else None
+    os.environ["GHOST_MEMORY_DB"], os.environ["GHOST_EMBED_MODEL"] = db, "fake-embed"
+    assert store_from_env().embed is not None, "GHOST_EMBED_MODEL should wire an embedder"
+    os.environ.pop("GHOST_EMBED_MODEL")
+    assert store_from_env().embed is None, "no model → keyword recall"
+    os.environ.pop("GHOST_MEMORY_DB")
 
     print(f"OK — tursodb store: recalled [{hits[0].type}] {hits[0].subject} → "
           f"code {hits[0].code_refs[0]['path']}:{hits[0].code_refs[0]['symbol']}; "

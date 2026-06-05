@@ -93,7 +93,7 @@ impl SandboxBackend for LibkrunBackend {
         // terminal, then reap + tear down. `env_clear` so only the composed guest
         // env reaches the VM; the real creds go out-of-band on stdin.
         eprintln!(
-            "pillbox: libkrun backend (experimental) — launching `{}` in a microVM",
+            "pillbox: libkrun backend — launching `{}` in a microVM",
             spec.id
         );
         let exe = std::env::current_exe().context("locate the pillbox binary to re-exec as VMM")?;

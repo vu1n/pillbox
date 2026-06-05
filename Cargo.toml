@@ -126,10 +126,11 @@ webpki-roots = { version = "0.26", optional = true }
 # this with `cargo install pillbox --features otel-grpc`.
 otel-grpc = ["opentelemetry-otlp/grpc-tonic"]
 
-# Experimental local microVM backend (libkrun). OFF by default — the default
-# build, CI, and every dev without libkrun installed are unaffected. Enabling
-# needs libkrun + libkrunfw present, and the binary codesigned with the
-# hypervisor entitlement (macOS/HVF). Select at runtime: `PILLBOX_BACKEND=libkrun`.
+# Local microVM backend (libkrun) — Linux/KVM + macOS/HVF. OFF by default so the
+# default build + CI (no libkrun toolchain) are unaffected; opt in at runtime via
+# `PILLBOX_BACKEND=libkrun`. Enabling needs libkrun + libkrunfw installed (link dir
+# from `$LIBKRUN_LIB_DIR` or the per-OS default in build.rs); on macOS the binary
+# must also be codesigned with the hypervisor entitlement (no codesign on Linux/KVM).
 # Pulls smoltcp for the in-VMM-child userspace egress stack (virtio-net) +
 # rustls + webpki-roots for the vault MITM (L5b).
 libkrun = ["dep:smoltcp", "dep:rustls", "dep:webpki-roots"]

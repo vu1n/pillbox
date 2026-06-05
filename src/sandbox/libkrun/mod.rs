@@ -1,4 +1,4 @@
-//! Local microVM backend (libkrun) — **experimental, feature-gated** (`libkrun`).
+//! Local microVM backend (libkrun) — **feature-gated** (`libkrun`); Linux/KVM + macOS/HVF.
 //!
 //! The graduation of the `libkrun-boot` proof crate into a real [`SandboxBackend`]
 //! (feature-gated; the default build + Docker path stay untouched).
@@ -22,7 +22,7 @@
 //! (and, in later slices, connects to the control sockets the child sets up for
 //! attach + §0). The child's process exit code IS the guest's exit code.
 //!
-//! Build + run (macOS/HVF):
+//! Build + run (macOS/HVF; on Linux/KVM drop the codesign step — KVM needs no entitlement):
 //! ```text
 //! cargo build --features libkrun
 //! codesign --entitlements krun/entitlements.plist -f -s - target/debug/pillbox

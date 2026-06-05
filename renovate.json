@@ -7,7 +7,7 @@
       "customType": "regex",
       "managerFilePatterns": ["/runner/Dockerfile$/"],
       "matchStrings": [
-        "# renovate: datasource=(?<datasource>.*?) depName=(?<depName>.*?)\\s+ARG \\S+?=(?<currentValue>\\S+)"
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: extractVersion=(?<extractVersion>\\S+))?\\s+ARG \\S+?=(?<currentValue>\\S+)"
       ]
     }
   ],

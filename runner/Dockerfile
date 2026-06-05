@@ -3,7 +3,7 @@
 #
 # Five agent harnesses preinstalled at known paths:
 #   - claude  (Anthropic's native installer → /usr/local/bin/claude)
-#   - codex   (npm: @openai/codex)
+#   - codex   (OpenAI's official installer → /usr/local/bin/codex)
 #   - amp     (npm: @ampcode/cli)
 #   - opencode (npm: opencode-ai)
 #   - pi      (npm: @earendil-works/pi-coding-agent)
@@ -11,6 +11,8 @@
 # System tooling chosen to cover the agents' subagent + shell needs:
 # bubblewrap (codex/claude subagent sandboxing), git/gh (vcs ops),
 # ripgrep (search), tmux (multi-pane TUI), jq (json scripting),
+# gawk (codex installer's SHA256 manifest check uses interval regexes
+# that Debian's default mawk doesn't support),
 # python3 + pip/venv (script runner; grader test-deps via `session score
 # --grader-egress` — bookworm pip is PEP-668 externally-managed, so graders
 # use a venv), openssl (vault CA verification),
@@ -64,6 +66,7 @@ RUN apt-get update \
 		bubblewrap \
 		ca-certificates \
 		curl \
+		gawk \
 		gh \
 		git \
 		iproute2 \
@@ -89,21 +92,34 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 # and opens PRs on upstream bumps. amp stays on @latest because its
 # publish scheme is timestamp+sha (e.g. 0.0.1779836786-gb003ec),
 # which Renovate's semver matcher can't compare meaningfully.
-# renovate: datasource=npm depName=@openai/codex
-ARG CODEX_VERSION=0.134.0
+# renovate: datasource=github-releases depName=openai/codex extractVersion=^rust-v(?<version>.*)$
+ARG CODEX_VERSION=0.137.0
 # renovate: datasource=npm depName=opencode-ai
 ARG OPENCODE_VERSION=1.15.10
 # renovate: datasource=npm depName=@earendil-works/pi-coding-agent
 ARG PI_VERSION=0.75.5
 
 RUN npm install -g \
-		@openai/codex@${CODEX_VERSION} \
 		@ampcode/cli@latest \
 		opencode-ai@${OPENCODE_VERSION} \
 		@earendil-works/pi-coding-agent@${PI_VERSION} \
 	&& npm cache clean --force
 	# ^ the global install leaves a populated npm cache (~/.npm) in the
 	#   layer that nothing reads at runtime — drop it.
+
+# Codex: official standalone installer (native binary; the npm wrapper is
+# no longer how upstream ships protocol-bearing builds like `app-server`).
+# Same scratch-HOME pattern as Claude below: the installer symlinks
+# ~/.local/bin/codex into $CODEX_HOME/packages/standalone/releases/<ver>,
+# so resolve the link with `cp -L` into /usr/local/bin and drop the
+# scratch tree.
+RUN curl -fsSL https://chatgpt.com/codex/install.sh -o /tmp/codex-install.sh \
+	&& HOME=/opt/codex-install CODEX_RELEASE=${CODEX_VERSION} CODEX_NON_INTERACTIVE=1 \
+		sh /tmp/codex-install.sh \
+	&& cp -L /opt/codex-install/.local/bin/codex /usr/local/bin/codex \
+	&& chmod +x /usr/local/bin/codex \
+	&& rm /tmp/codex-install.sh \
+	&& rm -rf /opt/codex-install
 
 # Claude Code: official native installer. Run with HOME pointed at a
 # stable /opt path so the installer's writes don't get shadowed if a

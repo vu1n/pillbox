@@ -80,11 +80,14 @@ def build_mcp(store, project: str, *, name: str = "ghost-memory"):
                            source_ids=source_ids, accept=True)
 
     @mcp.tool()
-    def consolidate(subject: str = "", dry_run: bool = False) -> dict:
+    def consolidate(subject: str = "", dry_run: bool = False, semantic: float = 0.0) -> dict:
         """Dedup memory: group claims by subject and SUPERSEDE all but the strongest (accepted >
         confident > more-evidenced > newer). subject="" consolidates the whole project; dry_run=true
-        previews the plan without writing. Superseded claims are kept for history but excluded from recall."""
-        return _consolidate(store, project=project, subject=subject or None, dry_run=dry_run)
+        previews the plan without writing. semantic>0 (a cosine distance — calibrate per embedder,
+        ~0.25 for nomic-embed-text) ALSO merges different-subject near-duplicates (needs an embedder).
+        Superseded claims are kept for history but excluded from recall."""
+        return _consolidate(store, project=project, subject=subject or None, dry_run=dry_run,
+                            semantic=semantic or None)
 
     @mcp.tool()
     def resolve_conflicts(subject: str) -> dict:

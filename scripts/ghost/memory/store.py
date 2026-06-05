@@ -293,6 +293,25 @@ class MemoryStore:
         cols = [d[0] for d in cur.description]
         return [self._claim(dict(zip(cols, r))) for r in rows]
 
+    def similar_pairs(self, project: str | None = None, *, max_distance: float = 0.15) -> list[tuple[str, str]]:
+        """Pairs of live, DIFFERENT-subject claims (same scope+project) within `max_distance` cosine —
+        the semantic near-dup candidates the arbiter clusters (the LLM-distiller case: distinct subjects,
+        same lesson). Empty when claims aren't embedded; exact-subject dups are handled by grouping, not
+        here. Closest first. `max_distance` is embedder-dependent — calibrate it (~0.25 for
+        nomic-embed-text; the default is illustrative, not universal)."""
+        cur = self.db.cursor()
+        rows = cur.execute(
+            "SELECT a.id, b.id FROM memory_claims a JOIN memory_claims b"
+            "  ON a.id < b.id AND a.scope = b.scope AND a.subject <> b.subject"
+            "  AND (a.project = b.project OR (a.project IS NULL AND b.project IS NULL))"
+            " WHERE a.embedding IS NOT NULL AND b.embedding IS NOT NULL"
+            "  AND a.status NOT IN ('superseded','rejected') AND b.status NOT IN ('superseded','rejected')"
+            "  AND (a.project = ? OR a.scope = 'global')"
+            "  AND vector_distance_cos(a.embedding, b.embedding) < ?"
+            " ORDER BY vector_distance_cos(a.embedding, b.embedding)",
+            (project, max_distance)).fetchall()
+        return [(r[0], r[1]) for r in rows]
+
     # --- helpers ------------------------------------------------------------
     @staticmethod
     def _base_where(project: str | None) -> tuple[list[str], list]:

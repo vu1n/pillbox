@@ -25,30 +25,63 @@ def _rank(c: Claim) -> tuple:
     return (c.status == "accepted", c.confidence or 0, len(c.source_ids), c.updated_at)
 
 
-def consolidate(store, *, project: str | None = None, subject: str | None = None,
-                dry_run: bool = False) -> dict:
-    """Group live claims by (subject, scope, project); in each group of >1, keep the strongest and
-    supersede the rest. dry_run returns the plan without writing. Returns {groups, superseded,
-    dry_run, plan:[{subject, survivor, superseded:[ids]}]}."""
-    groups: dict[tuple, list[Claim]] = defaultdict(list)
-    for c in store.live_claims(project, subject):
-        groups[(c.subject, c.scope, c.project)].append(c)
-
+def _plan_groups(groups: list[list[Claim]]) -> list[dict]:
+    """For each group of >1, keep the strongest (by _rank) and supersede the rest."""
     plan = []
-    for (subj, _scope, _project), members in groups.items():
+    for members in groups:
         if len(members) < 2:
             continue
         survivor, *losers = sorted(members, key=_rank, reverse=True)
-        plan.append({"subject": subj, "survivor": survivor.id,
+        plan.append({"subject": survivor.subject, "survivor": survivor.id,
                      "superseded": [m.id for m in losers]})
+    return plan
+
+
+def _semantic_clusters(pairs: list[tuple[str, str]], alive: dict[str, Claim]) -> list[list[Claim]]:
+    """Union-find the near-dup pairs (restricted to still-alive ids) into clusters of >1."""
+    parent: dict[str, str] = {}
+
+    def find(x: str) -> str:
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for a, b in pairs:
+        if a in alive and b in alive:
+            parent[find(a)] = find(b)
+    clusters: dict[str, list[Claim]] = defaultdict(list)
+    for cid in parent:
+        clusters[find(cid)].append(alive[cid])
+    return [c for c in clusters.values() if len(c) > 1]
+
+
+def consolidate(store, *, project: str | None = None, subject: str | None = None,
+                dry_run: bool = False, semantic: float | None = None) -> dict:
+    """Phase 1: group live claims by exact (subject, scope, project); keep the strongest, supersede the
+    rest. Phase 2 (when `semantic` is a cosine max-distance AND claims are embedded): cluster the
+    SURVIVORS' different-subject near-duplicates and dedup those too — the LLM-distiller case, where
+    each lesson gets a distinct subject but many mean the same thing. dry_run returns the plan without
+    writing. Returns {groups, superseded, dry_run, plan:[{subject, survivor, superseded:[ids]}]}."""
+    claims = store.live_claims(project, subject)
+    by_subject: dict[tuple, list[Claim]] = defaultdict(list)
+    for c in claims:
+        by_subject[(c.subject, c.scope, c.project)].append(c)
+    plan = _plan_groups(list(by_subject.values()))
+    superseded = {cid for p in plan for cid in p["superseded"]}
+
+    if semantic is not None:
+        alive = {c.id: c for c in claims if c.id not in superseded}
+        sem_plan = _plan_groups(_semantic_clusters(store.similar_pairs(project, max_distance=semantic), alive))
+        plan += sem_plan
+        superseded |= {cid for p in sem_plan for cid in p["superseded"]}
 
     if not dry_run:
-        for p in plan:
-            for cid in p["superseded"]:
-                store.set_status(cid, "superseded")
+        for cid in superseded:
+            store.set_status(cid, "superseded")
 
-    return {"groups": len(plan), "superseded": sum(len(p["superseded"]) for p in plan),
-            "dry_run": dry_run, "plan": plan}
+    return {"groups": len(plan), "superseded": len(superseded), "dry_run": dry_run, "plan": plan}
 
 
 def resolve_conflicts(store, subject: str, *, project: str | None = None) -> dict:
@@ -70,10 +103,13 @@ def main():
     ap.add_argument("--project", default=os.environ.get("GHOST_PROJECT", "default"))
     ap.add_argument("--subject", help="limit to one subject (default: whole project)")
     ap.add_argument("--dry-run", action="store_true", help="show the plan, write nothing")
+    ap.add_argument("--semantic", type=float, default=None, metavar="DIST",
+                    help="also merge different-subject near-dups within this cosine distance — "
+                         "calibrate per embedder (~0.25 for nomic-embed-text); needs GHOST_EMBED_MODEL")
     args = ap.parse_args()
 
     result = consolidate(store_from_env(), project=args.project, subject=args.subject,
-                         dry_run=args.dry_run)
+                         dry_run=args.dry_run, semantic=args.semantic)
     verb = "would supersede" if args.dry_run else "superseded"
     print(f"{result['groups']} duplicate group(s); {verb} {result['superseded']} claim(s) "
           f"in project {args.project!r}")
@@ -121,3 +157,28 @@ elif __name__ == "__main__":
 
     print(f"OK — arbiter: consolidated 3 dupes → 1 survivor ({strong[:8]}, the accepted claim); "
           f"2 superseded (history kept, recall excludes); singleton untouched; idempotent")
+
+    # semantic dedup: DIFFERENT subjects, ~identical embeddings → merged (the LLM-distiller case).
+    db2 = "/tmp/arbiter-sem-selftest.db"
+    for f in glob.glob(db2 + "*"):
+        try: os.remove(f)
+        except OSError: pass
+
+    def toy(text):  # bag-of-keywords: the two "python interpreter" claims land on the same vector
+        t = text.lower()
+        return [float("python" in t), float("interpret" in t or "execut" in t), float("test" in t), 1.0]
+
+    s2 = MemoryStore(db2, embed=toy)
+    s2.claim("procedure", "Python interpreter execution", "run the python interpreter to execute",
+             scope="project", project="p", accept=True)
+    s2.claim("procedure", "Python interpreter availability", "check the python interpreter is present",
+             scope="project", project="p", confidence=0.5)
+    s2.claim("pitfall", "Domino chain validation", "validate the domino chain endpoints match",
+             scope="project", project="p", accept=True)
+    assert consolidate(s2, project="p", dry_run=True)["superseded"] == 0, "exact pass: subjects all distinct"
+    res2 = consolidate(s2, project="p", semantic=0.05)
+    live2 = {c.subject for c in s2.live_claims("p")}
+    assert res2["superseded"] == 1 and "Domino chain validation" in live2, (res2, live2)
+    assert sum("Python" in s for s in live2) == 1, live2  # the two near-dup subjects → one survivor
+    print(f"OK — arbiter semantic: 2 different-subject near-dups merged via embeddings → "
+          f"{sorted(live2)}; the distinct claim untouched")

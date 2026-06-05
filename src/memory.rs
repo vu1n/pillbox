@@ -14,22 +14,47 @@ use std::time::SystemTime;
 /// positional prompt (the `pillbox run -- "task"` shape). Skips when the shape is ambiguous — 0
 /// positionals (a bare interactive run) silently, >1 (flags after `--`) with a note — since there's
 /// no unambiguous prompt to prepend to; mid-task recall (the MCP attach) covers those cases.
-pub(crate) fn brief_into_args(args: &mut [String], project: &str) {
+/// Returns the claim handles it briefed (for usage provenance), empty on every skip path.
+pub(crate) fn brief_into_args(args: &mut [String], project: &str) -> Vec<String> {
     match positionals(args).as_slice() {
         [i] => {
             if let Some(digest) = briefing(project) {
+                let handles = parse_handles(&digest);
                 args[*i] = format!(
                     "## Project memory (kypp)\n{digest}\n\n## Task\n{}",
                     args[*i]
                 );
+                handles
+            } else {
+                Vec::new()
             }
         }
-        [] => {} // bare interactive run — nothing to prepend to; mid-task recall covers it
-        more => eprintln!(
-            "pillbox: note: --memory briefing skipped ({} positional args; needs one prompt)",
-            more.len()
-        ),
+        [] => Vec::new(), // bare interactive run — nothing to prepend to; mid-task recall covers it
+        more => {
+            eprintln!(
+                "pillbox: note: --memory briefing skipped ({} positional args; needs one prompt)",
+                more.len()
+            );
+            Vec::new()
+        }
     }
+}
+
+/// The claim handles in a `kypp briefing` digest: per non-empty line, the first whitespace-delimited
+/// token, kept only if it has the compact-line handle shape (lowercase hex, ≥4 chars). Lines that
+/// don't lead with a handle (blanks, headers, prose) contribute nothing.
+fn parse_handles(digest: &str) -> Vec<String> {
+    digest
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|tok| {
+            tok.len() >= 4
+                && tok
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        })
+        .map(str::to_string)
+        .collect()
 }
 
 /// Indices of the non-flag args (the prompt candidates). The prompt is unambiguous only when there's
@@ -62,6 +87,43 @@ pub(crate) fn capture_run(sessions_root: &Path, project: &str, since: SystemTime
     }
 }
 
+/// Record usage provenance for the claims this run was briefed with — one `kypp usage` row per
+/// handle, per run-window session — so a later credit-assignment step can attribute the run's
+/// verifiable score to the claims it saw. No-op when nothing was briefed. Best-effort (like
+/// capture_run): a missing/erroring kypp just skips the row. Session id = the log's parent dir name.
+pub(crate) fn record_brief_usage(
+    sessions_root: &Path,
+    project: &str,
+    since: SystemTime,
+    handles: &[String],
+) {
+    if handles.is_empty() {
+        return;
+    }
+    for log in run_window_logs(sessions_root, since) {
+        let Some(id) = log
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|s| s.to_str())
+        else {
+            continue;
+        };
+        let mut args = vec![
+            "usage".to_string(),
+            "--record".to_string(),
+            "--session".to_string(),
+            id.to_string(),
+            "--surface".to_string(),
+            "briefing".to_string(),
+        ];
+        for h in handles {
+            args.push("--claim".to_string());
+            args.push(h.clone());
+        }
+        let _ = run_kypp_args(&args, project);
+    }
+}
+
 /// The `<sessions_root>/<id>/log.jsonl` files modified at/after `since` — i.e. this run's, not the
 /// pre-existing backlog. (mtime is the run-window signal; the log is finalized when the agent exits.)
 fn run_window_logs(sessions_root: &Path, since: SystemTime) -> Vec<PathBuf> {
@@ -80,6 +142,21 @@ fn run_window_logs(sessions_root: &Path, since: SystemTime) -> Vec<PathBuf> {
 }
 
 fn run_kypp(args: &[&str], project: &str) -> Option<String> {
+    run_kypp_inner(args.iter().map(|s| s.as_ref()), args[0], project)
+}
+
+/// Owned/var-arg sibling of `run_kypp` (for callers that build args dynamically, like usage rows).
+/// Shares the single spawn path so error-note shape stays identical.
+fn run_kypp_args(args: &[String], project: &str) -> Option<String> {
+    let verb = args.first().map(String::as_str).unwrap_or("");
+    run_kypp_inner(args.iter().map(String::as_str), verb, project)
+}
+
+fn run_kypp_inner<'a>(
+    args: impl IntoIterator<Item = &'a str>,
+    verb: &str,
+    project: &str,
+) -> Option<String> {
     match Command::new("kypp")
         .args(args)
         .env("KYPP_PROJECT", project)
@@ -88,8 +165,8 @@ fn run_kypp(args: &[&str], project: &str) -> Option<String> {
         Ok(o) if o.status.success() => Some(String::from_utf8_lossy(&o.stdout).into_owned()),
         Ok(o) => {
             eprintln!(
-                "pillbox: note: `kypp {}` exited {} — memory step skipped",
-                args[0], o.status
+                "pillbox: note: `kypp {verb}` exited {} — memory step skipped",
+                o.status
             );
             None
         }
@@ -104,7 +181,7 @@ fn run_kypp(args: &[&str], project: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{positionals, run_window_logs};
+    use super::{parse_handles, positionals, run_window_logs};
     use std::time::{Duration, SystemTime};
 
     fn v(args: &[&str]) -> Vec<String> {
@@ -121,6 +198,27 @@ mod tests {
         assert_eq!(
             positionals(&v(&["--permission-mode", "plan", "task"])),
             vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn parse_handles_keeps_only_compact_handle_lines() {
+        let digest = "\
+a1b2c3 fixed the flaky retry test
+deadbeef avoid global mutable config
+this line has no leading handle
+   \n\
+00ff prefer explicit errors";
+        // first token per line, kept iff it's lowercase hex ≥4 chars
+        assert_eq!(
+            parse_handles(digest),
+            vec!["a1b2c3", "deadbeef", "00ff"],
+            "prose/blank lines drop; handle-led lines keep their handle"
+        );
+        // a bare header / no-handle digest yields nothing
+        assert_eq!(
+            parse_handles("Project memory\n\nxyz notes"),
+            Vec::<String>::new()
         );
     }
 

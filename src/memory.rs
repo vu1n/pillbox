@@ -68,10 +68,10 @@ fn run_kypp(args: &[&str], project: &str) -> Option<String> {
             );
             None
         }
-        Err(_) => {
-            eprintln!(
-                "pillbox: note: `kypp` not found — --memory step skipped. Install: github.com/vu1n/kypp"
-            );
+        Err(e) => {
+            // Usually ENOENT (kypp not installed), but surface the real error — a permission/spawn
+            // failure shouldn't masquerade as "not found".
+            eprintln!("pillbox: note: `kypp` unavailable ({e}) — --memory skipped. Install: github.com/vu1n/kypp");
             None
         }
     }
@@ -87,9 +87,11 @@ mod tests {
 
     #[test]
     fn positionals_isolates_the_single_prompt() {
-        assert_eq!(positionals(&v(&["task"])), vec![0]); // `pillbox run -- "task"` → inject
-        assert_eq!(positionals(&v(&[])), Vec::<usize>::new()); // bare interactive → skip silently
-                                                               // flags after `--` make the prompt ambiguous (>1 positional) → skip with a note
+        // `pillbox run -- "task"` → one positional → inject
+        assert_eq!(positionals(&v(&["task"])), vec![0]);
+        // bare interactive (no prompt) → none → skip silently
+        assert_eq!(positionals(&v(&[])), Vec::<usize>::new());
+        // flags after `--` make it ambiguous (>1 positional) → skip with a note
         assert_eq!(
             positionals(&v(&["--permission-mode", "plan", "task"])),
             vec![1, 2]

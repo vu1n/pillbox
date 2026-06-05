@@ -75,7 +75,13 @@ impl SessionLog {
     /// dir. Recovers `last_seq` from the existing log so appends continue the
     /// sequence across process restarts and reattaches.
     pub(crate) fn open(pb: &Pillbox, session_id: &str) -> Result<Self> {
-        let dir = crate::session::session_dir(pb, session_id)?;
+        Self::open_at(crate::session::session_dir(pb, session_id)?)
+    }
+
+    /// Open the log at an already-resolved session directory — for a caller that
+    /// has the path but not a [`Pillbox`] (the detached §0 producer, re-exec'd as
+    /// a bare subprocess, is handed the dir on argv). Same seq recovery as `open`.
+    pub(crate) fn open_at(dir: PathBuf) -> Result<Self> {
         let last_seq = recover_last_seq(&dir.join(LOG_FILE))?;
         Ok(Self { dir, last_seq })
     }

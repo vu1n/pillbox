@@ -642,6 +642,11 @@ fn launch_server_vm(
                 );
             }
         }
+        // Reparented: nothing host-side supervises this agent, so spawn the detached §0 PRODUCER —
+        // it tails the guest capture → durable log forever, keeping the log live for every consumer
+        // (list/diagnose/subscribe + telemetry exporters) with no explicit drain. Killed by
+        // kill_session. The libkrun analog of docker's always-on transcript tailer.
+        spawn_session_tailer(resolved, &session, spec);
         crate::events::emit_session_event(
             resolved,
             crate::events::EventType::SessionStarted {
@@ -810,6 +815,35 @@ pub(crate) fn server_events_file(session: &crate::session::Session) -> Result<Pa
         .with_context(|| format!("`{}` is not a server-mode agent", session.agent_id))?;
     let handle = LibkrunHandle::decode(session)?;
     Ok(PathBuf::from(handle.creds).join(profile.events_file))
+}
+
+/// Spawn the detached §0 producer for a reparented server session: a re-exec'd
+/// `pillbox __session-tailer` that tails the guest capture → durable log forever,
+/// so the log stays live for every consumer with no explicit drain. Best-effort —
+/// a failed spawn just falls back to drain-on-demand (`ingest`/`subscribe`).
+fn spawn_session_tailer(resolved: &Pillbox, session: &crate::session::Session, spec: &AgentSpec) {
+    let Some(profile) = spec.server.as_ref() else {
+        return; // not a server agent — no capture to tail
+    };
+    let (Ok(dir), Ok(capture)) = (
+        crate::session::session_dir(resolved, &session.id),
+        server_events_file(session),
+    ) else {
+        return;
+    };
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let _ = Command::new(exe)
+        .arg("__session-tailer")
+        .arg(&dir)
+        .arg(&capture)
+        .arg(profile.events_format.as_str())
+        .arg(&session.id)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 /// Host path of a libkrun session's result-workspace — the CoW clone the guest
@@ -993,6 +1027,17 @@ pub(crate) fn reattach(resolved: &Pillbox, session: &crate::session::Session) ->
 /// Tear down a detached libkrun session: kill the VMM child (the VM + egress +
 /// MITM go with it), scrub the persisted socket/spec/CoW clones, drop the record.
 pub(crate) fn kill_session(resolved: &Pillbox, session: &crate::session::Session) -> Result<()> {
+    // Stop the detached §0 producer (if any) BEFORE scrubbing the dir/log it writes to, so it
+    // doesn't error mid-append or race the removal. Pid lives in the session dir's tailer file.
+    let tailer_pid = crate::session::session_dir_path(resolved, &session.id)
+        .join(crate::commands::session::TAILER_PID_FILE);
+    if let Ok(raw) = std::fs::read_to_string(&tailer_pid) {
+        if let Ok(pid) = raw.trim().parse::<i32>() {
+            if pid > 0 {
+                unsafe { libc::kill(pid, libc::SIGTERM) };
+            }
+        }
+    }
     let handle = LibkrunHandle::decode(session)?;
     if handle.pid > 0 {
         unsafe { libc::kill(handle.pid, libc::SIGKILL) };

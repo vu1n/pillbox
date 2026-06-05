@@ -119,6 +119,25 @@ pub(crate) enum EventsFormat {
     Ndjson,
 }
 
+#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+impl EventsFormat {
+    /// Stable token for passing the format over argv to the detached §0 producer.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            EventsFormat::Sse => "sse",
+            EventsFormat::Ndjson => "ndjson",
+        }
+    }
+
+    pub(crate) fn from_token(s: &str) -> Option<Self> {
+        match s {
+            "sse" => Some(EventsFormat::Sse),
+            "ndjson" => Some(EventsFormat::Ndjson),
+            _ => None,
+        }
+    }
+}
+
 /// Drain a server agent's persisted capture (`reader`) into its durable log,
 /// dispatching on the capture [`EventsFormat`] — the single home for the
 /// format→drain mapping, shared by the live tailer and the post-hoc `ingest`.

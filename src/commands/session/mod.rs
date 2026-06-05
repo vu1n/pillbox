@@ -18,6 +18,58 @@ use crate::{events, remote, sandbox, session};
 mod grader;
 mod stream;
 
+/// Pid file a detached §0 producer ([`run_detached_tailer`]) writes in the session
+/// dir, so teardown can SIGTERM it and live readers can tell a producer is keeping
+/// the log fresh (and skip their own drain — the single-producer invariant).
+pub(crate) const TAILER_PID_FILE: &str = ".tailer.pid";
+
+/// The detached §0 PRODUCER for a reparented server session (the libkrun analog of
+/// docker's always-on transcript tailer). Re-exec'd as a bare subprocess at
+/// bring-up (`pillbox __session-tailer <dir> <capture> <format> <sid>`), it tails
+/// the guest's persistent capture file → maps → appends to the durable log
+/// FOREVER (until SIGTERM on teardown). This keeps the log continuously live for a
+/// reparented agent the CLI doesn't supervise, so EVERY consumer — `list`/
+/// `diagnose`/`subscribe` and the webhook/OTLP exporters — reads fresh data with
+/// no explicit drain. Takes paths (not a `Pillbox`) since the child has no cwd
+/// context. Sole producer: `subscribe`/`ingest` defer while it's alive.
+pub(crate) fn run_detached_tailer(
+    session_dir: std::path::PathBuf,
+    capture: std::path::PathBuf,
+    format: events::EventsFormat,
+    sid: String,
+) -> Result<()> {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    // Claim sole-producer: our pid lets teardown stop us and signals readers a
+    // producer is live (so they don't double-drain into the log).
+    let _ = std::fs::write(
+        session_dir.join(TAILER_PID_FILE),
+        std::process::id().to_string(),
+    );
+    let mut log = events::log::SessionLog::open_at(session_dir)?;
+    // `stop` is never set in-process — the producer runs until the process is
+    // SIGTERM'd by `kill_session`. FollowReader blocks waiting for appends, so
+    // the drain naturally idles when the agent is quiet and resumes on activity.
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader = events::opencode::FollowReader::new(capture, Arc::clone(&stop));
+    events::drain_server_capture(format, reader, &sid, &mut log, &stop)?;
+    Ok(())
+}
+
+/// Is a detached §0 producer currently alive for this session? Reads the pid file
+/// then does a signal-0 liveness probe. Readers (`subscribe`/`ingest`) use it to
+/// DEFER their own drain — only one writer may append to the log or events double.
+fn detached_tailer_alive(resolved: &Pillbox, s: &session::Session) -> bool {
+    let pid_path = session::session_dir_path(resolved, &s.id).join(TAILER_PID_FILE);
+    let Ok(raw) = std::fs::read_to_string(&pid_path) else {
+        return false;
+    };
+    let Ok(pid) = raw.trim().parse::<i32>() else {
+        return false;
+    };
+    pid > 0 && unsafe { libc::kill(pid, 0) } == 0
+}
+
 /// A [`SandboxHttp`](sandbox::http::SandboxHttp) to a server-mode session's
 /// in-sandbox HTTP server — `docker exec curl` for a (local/remote) docker
 /// session, an HTTP-over-vsock client for a libkrun one. The dispatch axis for
@@ -863,7 +915,13 @@ fn session_ingest(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
         .into());
     }
 
-    let n = libkrun_ingest_events_file(resolved, &session)?;
+    // A live detached §0 producer has already drained the capture into the log; re-draining here
+    // would double-write. Defer to it (the log is already current); else do the post-hoc drain.
+    let n = if detached_tailer_alive(resolved, &session) {
+        0
+    } else {
+        libkrun_ingest_events_file(resolved, &session)?
+    };
     // The §0 log is now drained — if this was a `--memory` server run, capture it into kypp + record
     // briefed-claim usage (the brief the bring-up stashed). No-op otherwise. Before the marker so a
     // failed capture can retry on a re-ingest; the marker then makes the whole step run once.

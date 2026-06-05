@@ -102,6 +102,20 @@ fn auth_rm(resolved: &Pillbox, provider: &str) -> Result<()> {
             PillboxError::usage("auth rm", format!("unknown provider `{provider}`"))
                 .with_next("pillbox auth list  # see what's available")
         })?;
+    // An alias agent (e.g. `codex-serve`) shares its owner's (`codex`) auth home,
+    // so `forget` here would wipe the OWNER's credential store — the same footgun
+    // the auth-list filter avoids. Refuse and point at the owner instead.
+    if !spec.owns_auth_home() {
+        return Err(PillboxError::usage(
+            "auth rm",
+            format!(
+                "`{provider}` shares `{}`'s credentials — remove the owner",
+                spec.auth_id
+            ),
+        )
+        .with_next(format!("pillbox auth rm {}", spec.auth_id))
+        .into());
+    }
     if spec.forget(resolved)? {
         println!("Removed {provider} state.");
     } else {

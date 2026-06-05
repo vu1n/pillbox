@@ -42,11 +42,19 @@ use serde_json::{json, Value};
 /// (the README asks integrations to identify themselves).
 const CLIENT_NAME: &str = "pillbox";
 
-/// One pending request awaiting its response, keyed by the JSON-RPC id. The
-/// reader thread fills `result` and notifies; the caller parks on the condvar.
+/// Pending JSON-RPC responses keyed by request id, plus a `closed` tripwire. The
+/// reader thread fills `responses` (or, on codex's stdout EOF, sets `closed`) and
+/// notifies; the caller parks on the condvar until its id lands or the connection
+/// closes — so a request can't hang forever if codex dies mid-handshake/turn.
+#[derive(Default)]
+struct PendingState {
+    responses: HashMap<i64, Value>,
+    closed: bool,
+}
+
 #[derive(Default)]
 struct Pending {
-    result: Mutex<HashMap<i64, Value>>,
+    state: Mutex<PendingState>,
     cv: Condvar,
 }
 
@@ -80,13 +88,17 @@ impl Client {
     /// Send a request and block until the reader thread routes back the matching
     /// response, returning its `result` (or the `error` object). The reader runs
     /// on another thread, so this parks on the condvar rather than reading stdout.
+    /// Returns an error (not a hang) if codex closes its stdout before answering.
     fn request(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.write_msg(&json!({ "id": id, "method": method, "params": params }))?;
-        let mut guard = self.pending.result.lock().expect("pending mutex");
+        let mut guard = self.pending.state.lock().expect("pending mutex");
         loop {
-            if let Some(v) = guard.remove(&id) {
+            if let Some(v) = guard.responses.remove(&id) {
                 return Ok(v);
+            }
+            if guard.closed {
+                bail!("codex app-server closed before responding to `{method}`");
             }
             guard = self.pending.cv.wait(guard).expect("pending condvar");
         }
@@ -211,8 +223,8 @@ fn read_loop(stdout: impl Read, client: Arc<Client>, events_file: &str) -> Resul
                     .cloned()
                     .or_else(|| msg.get("error").map(|e| json!({ "error": e })))
                     .unwrap_or(Value::Null);
-                let mut map = client.pending.result.lock().expect("pending mutex");
-                map.insert(id, payload);
+                let mut st = client.pending.state.lock().expect("pending mutex");
+                st.responses.insert(id, payload);
                 client.pending.cv.notify_all();
             }
             MsgKind::ServerRequest(id, method) => {
@@ -225,19 +237,22 @@ fn read_loop(stdout: impl Read, client: Arc<Client>, events_file: &str) -> Resul
             MsgKind::Notification => {
                 // Append the raw line (the host mapper re-parses it). A write
                 // error here loses §0 capture but mustn't kill the bridge.
-                // The intent is to make each line visible to the host's
-                // FollowReader live; `writeln!` already issues the write()
-                // syscall and `flush()` is a no-op on this unbuffered File, so
-                // host-side visibility relies on the virtio-fs cache mode, not
-                // this flush. The opencode path forces visibility by
-                // reopen-per-line instead — UNVERIFIED whether codex-serve needs
-                // the same (sync_data) for live tail; confirm on a real VM boot.
+                // `sync_data` forces the append out to the host backing each line
+                // (a FUSE flush), so the host's `FollowReader` sees it live — the
+                // codex analog of opencode's reopen-per-line; a held-open File's
+                // appends otherwise sit in the guest page cache and the host reads
+                // 0 bytes. (Still pending a live VM boot to confirm end-to-end.)
                 let _ = writeln!(events, "{trimmed}");
-                let _ = events.flush();
+                let _ = events.sync_data();
             }
             MsgKind::Other => {}
         }
     }
+    // codex's stdout hit EOF (the child exited): wake every parked `request`
+    // caller with `closed` so they fail loudly instead of hanging forever.
+    let mut st = client.pending.state.lock().expect("pending mutex");
+    st.closed = true;
+    client.pending.cv.notify_all();
     Ok(())
 }
 

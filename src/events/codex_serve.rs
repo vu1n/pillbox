@@ -106,10 +106,7 @@ impl CodexServeMapper {
             "item/started" => self.on_item(p, false),
             "item/completed" => self.on_item(p, true),
             "turn/completed" => self.on_turn_completed(p),
-            "error" => vec![Payload::AttentionRequired(AttentionRequired {
-                reason: AttentionReason::ErrorStalled,
-                message: turn_error_message(p.get("error")),
-            })],
+            "error" => self.on_error(p),
             _ => vec![],
         }
     }
@@ -240,6 +237,26 @@ impl CodexServeMapper {
         out.push(Payload::AttentionRequired(AttentionRequired {
             reason,
             message: String::new(),
+        }));
+        out
+    }
+
+    /// `error` — surface the stall. A **terminal** error (`willRetry == false`)
+    /// also closes any open assistant message, so a turn that dies mid-stream
+    /// without a following `turn/completed` doesn't leave a dangling `MessageStart`
+    /// (an unbalanced §0 stream the next turn would never reconcile). A retriable
+    /// error leaves the message open — the same item resumes after reconnect.
+    fn on_error(&mut self, p: &Value) -> Vec<Payload> {
+        let mut out = Vec::new();
+        let terminal = !p.get("willRetry").and_then(Value::as_bool).unwrap_or(false);
+        if terminal {
+            if let Some(open) = self.open_msg.take() {
+                out.push(Payload::MessageEnd(MessageEnd::new(open)));
+            }
+        }
+        out.push(Payload::AttentionRequired(AttentionRequired {
+            reason: AttentionReason::ErrorStalled,
+            message: turn_error_message(p.get("error")),
         }));
         out
     }
@@ -588,6 +605,40 @@ mod tests {
                 assert_eq!(a.message, "model overloaded");
             }
             other => panic!("expected AttentionRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn terminal_error_closes_open_message_retriable_leaves_it() {
+        // A retriable error mid-stream must NOT close the message (the item
+        // resumes after reconnect) — just the stall signal.
+        let out = run(&[
+            json!({"method":"item/agentMessage/delta","params":{
+                "itemId":"it_e","delta":"par","threadId":"th","turnId":"tu"}}),
+            json!({"method":"error","params":{
+                "threadId":"th","turnId":"tu","willRetry":true,
+                "error":{"message":"Reconnecting... 1/5"}}}),
+        ]);
+        assert!(
+            !out.iter().any(|p| matches!(p, Payload::MessageEnd(_))),
+            "retriable error must not close the message: {out:?}"
+        );
+
+        // A terminal error closes the dangling message so the §0 stream balances.
+        let out = run(&[
+            json!({"method":"item/agentMessage/delta","params":{
+                "itemId":"it_t","delta":"half","threadId":"th","turnId":"tu"}}),
+            json!({"method":"error","params":{
+                "threadId":"th","turnId":"tu","willRetry":false,
+                "error":{"message":"fatal"}}}),
+        ]);
+        match out.as_slice() {
+            [Payload::MessageStart(_), Payload::MessageDelta(_), Payload::MessageEnd(e), Payload::AttentionRequired(a)] =>
+            {
+                assert_eq!(e.message_id, "it_t");
+                assert_eq!(a.reason, AttentionReason::ErrorStalled);
+            }
+            other => panic!("expected start/delta/end + stall, got {other:?}"),
         }
     }
 

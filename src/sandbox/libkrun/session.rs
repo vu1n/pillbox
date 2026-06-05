@@ -729,8 +729,11 @@ fn run_codex_serve(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Resul
     let launch = ServerLaunch {
         vault_refusal: "the vault (codex-serve v1 is non-vault: app-server's model egress is \
                         api.openai.com over WebSocket, which the codex provider doesn't yet intercept)",
-        // codex talks only to OpenAI: + api.openai.com (the wss model endpoint the
-        // codex provider's host list omits — it's the API-key path). Empty-swap.
+        // codex talks only to OpenAI: + api.openai.com (the app-server's wss model
+        // endpoint). The codex vault provider omits it, but the openai API-key
+        // provider already puts it in `intercepted_hosts`; list it explicitly here
+        // so codex-serve's egress doesn't silently depend on that unrelated
+        // provider staying registered. Terminated + forwarded empty-swap.
         egress_extra: vec!["api.openai.com".to_string()],
         local_forward_port: None,
         model,

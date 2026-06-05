@@ -56,18 +56,24 @@ pub(crate) fn run_detached_tailer(
     Ok(())
 }
 
-/// Is a detached §0 producer currently alive for this session? Reads the pid file
-/// then does a signal-0 liveness probe. Readers (`subscribe`/`ingest`) use it to
-/// DEFER their own drain — only one writer may append to the log or events double.
+/// The pid of a session's detached §0 producer, if its pid file is present, parseable, and positive.
+/// THE one reader of the `.tailer.pid` contract — `detached_tailer_alive` (signal-0 probe) and
+/// `kill_session` (SIGTERM on teardown) both go through it, so the format lives in one place.
+pub(crate) fn tailer_pid(session_dir: &std::path::Path) -> Option<i32> {
+    let pid = std::fs::read_to_string(session_dir.join(TAILER_PID_FILE))
+        .ok()?
+        .trim()
+        .parse::<i32>()
+        .ok()?;
+    (pid > 0).then_some(pid)
+}
+
+/// Is a detached §0 producer currently alive for this session? Pid file + a signal-0 liveness probe.
+/// Readers (`subscribe`/`ingest`) use it to DEFER their own drain — only one writer may append to the
+/// log or events double.
 fn detached_tailer_alive(resolved: &Pillbox, s: &session::Session) -> bool {
-    let pid_path = session::session_dir_path(resolved, &s.id).join(TAILER_PID_FILE);
-    let Ok(raw) = std::fs::read_to_string(&pid_path) else {
-        return false;
-    };
-    let Ok(pid) = raw.trim().parse::<i32>() else {
-        return false;
-    };
-    pid > 0 && unsafe { libc::kill(pid, 0) } == 0
+    tailer_pid(&session::session_dir_path(resolved, &s.id))
+        .is_some_and(|pid| unsafe { libc::kill(pid, 0) } == 0)
 }
 
 /// A [`SandboxHttp`](sandbox::http::SandboxHttp) to a server-mode session's

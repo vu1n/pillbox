@@ -1028,15 +1028,10 @@ pub(crate) fn reattach(resolved: &Pillbox, session: &crate::session::Session) ->
 /// MITM go with it), scrub the persisted socket/spec/CoW clones, drop the record.
 pub(crate) fn kill_session(resolved: &Pillbox, session: &crate::session::Session) -> Result<()> {
     // Stop the detached §0 producer (if any) BEFORE scrubbing the dir/log it writes to, so it
-    // doesn't error mid-append or race the removal. Pid lives in the session dir's tailer file.
-    let tailer_pid = crate::session::session_dir_path(resolved, &session.id)
-        .join(crate::commands::session::TAILER_PID_FILE);
-    if let Ok(raw) = std::fs::read_to_string(&tailer_pid) {
-        if let Ok(pid) = raw.trim().parse::<i32>() {
-            if pid > 0 {
-                unsafe { libc::kill(pid, libc::SIGTERM) };
-            }
-        }
+    // doesn't error mid-append or race the removal.
+    let session_dir = crate::session::session_dir_path(resolved, &session.id);
+    if let Some(pid) = crate::commands::session::tailer_pid(&session_dir) {
+        unsafe { libc::kill(pid, libc::SIGTERM) };
     }
     let handle = LibkrunHandle::decode(session)?;
     if handle.pid > 0 {

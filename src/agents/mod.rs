@@ -50,6 +50,12 @@ pub(crate) enum Integration {
 #[derive(Clone, Copy)]
 pub struct AgentSpec {
     pub(crate) id: &'static str,
+    /// Auth-home owner. Normally equals [`id`](Self::id), so each agent has its
+    /// own `auth/<id>/`. An alias agent that drives the *same* underlying CLI a
+    /// different way (`codex-serve` → `codex`'s `app-server`) points this at the
+    /// owner's id so one `auth login` covers both and the alias never needs its
+    /// own credential store. [`home_dir`](Self::home_dir) keys on this.
+    pub(crate) auth_id: &'static str,
     /// How pillbox runs + observes this agent (PTY-and-scrape vs server-API).
     pub(crate) integration: Integration,
     pub(crate) cred_sentinel: &'static str,
@@ -80,6 +86,7 @@ pub struct AgentSpec {
 
 pub const CLAUDE: AgentSpec = AgentSpec {
     id: "claude",
+    auth_id: "claude",
     integration: Integration::Pty,
     cred_sentinel: ".claude/.credentials.json",
     login_argv: &["claude", "auth", "login", "--claudeai"],
@@ -99,6 +106,7 @@ pub const CLAUDE: AgentSpec = AgentSpec {
 
 pub const CODEX: AgentSpec = AgentSpec {
     id: "codex",
+    auth_id: "codex",
     integration: Integration::Pty,
     cred_sentinel: ".codex/auth.json",
     login_argv: &["codex", "login", "--device-auth"],
@@ -111,8 +119,41 @@ pub const CODEX: AgentSpec = AgentSpec {
     prepare_workspace: None,
 };
 
+/// codex driven through `codex app-server` (its JSON-RPC-over-stdio protocol,
+/// the channel the VS Code extension uses) instead of the interactive TUI — a
+/// structured [`Integration::Server`] sibling of [`CODEX`], the way `opencode`
+/// is a server agent. Shares `codex`'s auth home ([`auth_id`](AgentSpec::auth_id)
+/// `= "codex"`): one `pillbox auth login --agent codex` covers both. The PTY
+/// `codex` stays the default; this is opt-in via `--agent codex-serve`, so if
+/// upstream ever closes the app-server surface the TUI path is unaffected.
+///
+/// libkrun-only today (the server bring-up lives in the microVM run path); the
+/// docker backend rejects it. Vault-capable: same ChatGPT-OAuth stub+MITM swap
+/// as the TUI codex (the app-server's backend calls hit `chatgpt.com`, which the
+/// [`codex` vault provider](crate::vault::providers) already intercepts).
+pub const CODEX_SERVE: AgentSpec = AgentSpec {
+    id: "codex-serve",
+    auth_id: "codex",
+    integration: Integration::Server,
+    cred_sentinel: ".codex/auth.json",
+    // No standalone login: shares codex's auth home, so `auth login --agent
+    // codex` is the path. Point login_argv at codex's flow for the rare direct
+    // `auth login --agent codex-serve` (writes the same shared home).
+    login_argv: &["codex", "login", "--device-auth"],
+    // Unused for a Server agent (the guest entrypoint runs `codex app-server`
+    // via the appserver-host bridge, not this argv) — kept honest, not launched.
+    run_argv: &["codex", "app-server"],
+    oauth_port: None,
+    post_login_finalize: None,
+    vault_capable: true,
+    mcp_inject: Some(mcp::codex_inject),
+    sandbox_args: &[],
+    prepare_workspace: None,
+};
+
 pub const OPENCODE: AgentSpec = AgentSpec {
     id: "opencode",
+    auth_id: "opencode",
     integration: Integration::Server,
     cred_sentinel: ".local/share/opencode/auth.json",
     login_argv: &["opencode", "auth", "login"],
@@ -127,6 +168,7 @@ pub const OPENCODE: AgentSpec = AgentSpec {
 
 pub const PI: AgentSpec = AgentSpec {
     id: "pi",
+    auth_id: "pi",
     integration: Integration::Pty,
     // pi (npm `@earendil-works/pi-coding-agent`) stores provider credentials —
     // OAuth tokens or API keys saved via `/login` — at `~/.pi/agent/auth.json`
@@ -152,7 +194,7 @@ pub const PI: AgentSpec = AgentSpec {
     prepare_workspace: None,
 };
 
-pub const ALL: &[&AgentSpec] = &[&CLAUDE, &CODEX, &OPENCODE, &PI];
+pub const ALL: &[&AgentSpec] = &[&CLAUDE, &CODEX, &CODEX_SERVE, &OPENCODE, &PI];
 
 /// Look up an agent spec by id, or return a usage error listing the
 /// known ids. Centralized so every CLI surface that takes an
@@ -244,6 +286,13 @@ impl AgentSpec {
         self.id
     }
 
+    /// True when this agent owns its auth home rather than sharing another's
+    /// (`auth_id == id`). An alias like `codex-serve` (`auth_id == "codex"`)
+    /// returns false, so auth-list surfaces only own one row per credential store.
+    pub(crate) fn owns_auth_home(&self) -> bool {
+        self.auth_id == self.id
+    }
+
     /// Run [`prepare_workspace`](Self::prepare_workspace) if set, warning (not
     /// failing) on error — the gate it pre-accepts just reappears in-session, so
     /// a prep failure must never abort the run. Shared by every backend launch
@@ -263,11 +312,13 @@ impl AgentSpec {
         pillbox::global()
     }
 
-    /// `<auth_pillbox>/auth/<id>/` — created on first use, 0700.
+    /// `<auth_pillbox>/auth/<auth_id>/` — created on first use, 0700. Keyed on
+    /// [`auth_id`](Self::auth_id) (not `id`) so an alias agent (`codex-serve`)
+    /// shares the owning agent's (`codex`) credential store.
     pub(crate) fn home_dir(&self, resolved: &Pillbox) -> Result<PathBuf> {
         let auth = self.auth_pillbox(resolved);
         let auth_root = auth.subdir("auth")?;
-        let dir = auth_root.join(self.id);
+        let dir = auth_root.join(self.auth_id);
         fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
             .with_context(|| format!("chmod {} 0700", dir.display()))?;

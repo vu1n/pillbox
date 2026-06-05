@@ -53,7 +53,9 @@ fn auth_list(resolved: &Pillbox, json: bool) -> Result<()> {
         auth_pb.display_name()
     );
     let mut any = false;
-    for spec in agents::ALL {
+    // Owners only: an alias agent (codex-serve) shares its owner's (codex) auth
+    // home, so listing it would duplicate the same credential store row.
+    for spec in agents::ALL.iter().filter(|s| s.owns_auth_home()) {
         let home = spec.home_dir(resolved)?;
         if spec.is_authenticated(resolved) {
             println!("  {:<10} ✓ ({})", spec.id(), home.display());
@@ -71,6 +73,7 @@ fn auth_list(resolved: &Pillbox, json: bool) -> Result<()> {
 fn build_auth_list_json(resolved: &Pillbox) -> String {
     let arr: Vec<serde_json::Value> = agents::ALL
         .iter()
+        .filter(|s| s.owns_auth_home())
         .map(|spec| {
             let home = spec
                 .home_dir(resolved)

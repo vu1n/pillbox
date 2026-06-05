@@ -391,7 +391,7 @@ multi-human surface.**
 | 1 | **Remotes collapse — `docker://` + cold-host DX contract** *(foreground run + ingest + result-extraction + sandbox-side vault ✓ live-verified; **`--detach` lifecycle + agent-stays-alive ✓ live-verified** — record/list/reattach/teardown-over-endpoint, detached agent runs + is reattachable; **version-skew detection ✓** — preflight probe fails loud if the runner image's pillbox is too old for the launch protocol, the real cause of an earlier "agent instantly dies"; **drive + read parity ✓** — `session send` drives a detached docker:// session's pty-host over the endpoint, and `session subscribe`/`watch` tail the container transcript out over `docker exec` into the host log (collector-free, the §0 surface); remaining: detached result-extraction, pull-progress)* | Cheapest big win; a *deletion* onto Docker contexts; fixes the documented product failure. **Independent of §0** — detach keys off the durable `Session.id`. | remotes + dx |
 | 2 | **Approval loop — reframed to a signal *producer*; ✓ done for the single-player automated context.** `AttentionRequired{NeedsInput}` on transcript `end_turn` → log/`subscribe`/webhook; front-ends respond via `session send`. In-pillbox `approve\|deny\|answer` verbs reframed away; the mid-tool blocked sub-signal is closed as **not hook-viable** (Notification suppressed in the automated context — reading vt100 is the only reliable path if ever wanted). | dx + event-log |
 | 3 | **§0 LOCAL SUBSTRATE — ✓ DONE + live-verified** — `sessionId` + durable per-session log + co-located sequencer + zero-config `Subscribe(from_seq)` (`notify` tail) + a producer. *Re-scoped: `actor` / event-system-merge / network-seq → multiplayer; cross-sandbox `Session` → migration; `class` → pooling — NOT §0.* | The keystone. The substrate's local stream **every** consumer reads — inner-loop readout, fleet triage, lum, *and* (later) multiplayer. | event-log + gateway + dx |
-| 4 | **Reader bits — ✓ DONE** — `session watch` (thin human reader, `docker logs` model); **`session list` status-from-log + `session diagnose`** (status = fold the events.jsonl terminal sink + per-session log → starting/running/needs-input/done/failed; honest about host-visible reach). | Falls out of §0 (the log). Makes a swarm triageable + the cheapest "watch your agent" — a *consumer over the public tap, not a UI*. | dx |
+| 4 | **Reader bits — ✓ DONE** — `session watch` (thin human reader, `docker logs` model); **`session list` status-from-log + `session diagnose`** (status = fold the events.jsonl terminal sink + per-session log → running/needs-input/done/failed; honest about host-visible reach). A **detached §0 producer** keeps reparented (libkrun) logs live so these read fresh with no drain call (see Built-so-far). | Falls out of §0 (the log). Makes a swarm triageable + the cheapest "watch your agent" — a *consumer over the public tap, not a UI*. | dx |
 | 5 | **Harden #1/#3** (transcript+MITM source of truth; native secondary). #2 `raw_body` deferred | Cheap; off the critical path. | harden |
 | 6 | **Multiplayer web-attach** (the multi-human circulation demo) — needs `Frame` seq/ack + bounded `DataAck` + WS endpoint + `session share` | **Demoted** below the cheap local-visibility + approval work: the §0 spine already gives single-player "watch," and the share-a-link demo is heavier. Still the multi-human artifact for orca / the gsv builder. | multiplayer |
 | 7 | **Multiplayer input / roles / join links** | Governed multi-writer; defer until web-attach shows pull. | multiplayer |
@@ -417,14 +417,17 @@ scope verdict, CUT from this repo. If pursued elsewhere it merely *consumes* the
 contract (`Subscribe`/`from_seq` + outcome events); pillbox's only obligation is
 to keep that contract solid.
 
-## Built so far (2026-05-31)
+## Built so far (2026-05-31; reconciled 2026-06-06)
 
 Reconciled against the sequence above; commits on `main` (origin synced).
 
 - **Step 1 — remotes / `docker://`:** foreground run-assembly, tar-cp
   secret-denylist ingest, result extraction, sandbox-side vault, the
-  blob-scrub security fix — **done + live-verified**. Open: `docker://`
-  `--detach`, version-skew, pull-progress.
+  blob-scrub security fix, plus `--detach` lifecycle, version-skew detection, and
+  drive+read parity — **done + live-verified**. Open: detached result-extraction,
+  pull-progress. (Note: `docker://`/ssh/e2b remote backends are now
+  **deprecated in direction** — libkrun is the local substrate, "remote" →
+  Cloudflare-managed/local; see `libkrun-sandbox.md`.)
 - **Step 3 — §0 (local substrate): DONE + live-verified** (and re-scoped — the
   structural bits moved out of §0, see "§0 is the local substrate" above).
   - durable per-session log (`events/log.rs::SessionLog` →
@@ -434,6 +437,20 @@ Reconciled against the sequence above; commits on `main` (origin synced).
     `sessionId` on the Event; the first producer (transcripts→log, always-on,
     **lossless** — `Usage`/`Thinking`/`model`/`stop_reason` in proto + Rust); the
     zero-config local subscribe surface as a **WS gateway** (`session subscribe`).
+  - **detached §0 producer for reparented sessions (libkrun server — opencode/
+    codex-serve): DONE + live-verified.** The transcripts→log producer is
+    docker/foreground-only; a reparented libkrun agent has no host supervisor, so
+    its `/event` capture only reached the log on an explicit drain
+    (`ingest`/`wait-idle`/`subscribe`) — leaving one-shot readers *and* the
+    webhook/OTLP exporters stale (`list` read "running" for a session at
+    needs-input). Fixed with a re-exec'd `pillbox __session-tailer` (spawned at
+    bring-up, pid in `<dir>/.tailer.pid`, SIGTERM'd by `kill_session`) that tails
+    the host-visible capture → durable log **forever**, so the log is the live bus
+    for *every* consumer with no drain call — the libkrun analog of docker's
+    always-on tailer. **Single-producer invariant:** `subscribe`/`watch`/`ingest`
+    defer to a live producer (`detached_tailer_alive`) so the log isn't
+    double-written. (commits `064de1b`, `d0544de`; also fixes `--memory`'s
+    empty-log capture.)
   - *Re-scoped OUT of §0 (land with their drivers):* `actor` + (b) event-system
     merge + network seq-authority → **multiplayer**; (c) cross-sandbox `Session`
     → **migration**; `class` → **pooling**. No current single-player consumer.
@@ -503,11 +520,14 @@ Reconciled against the sequence above; commits on `main` (origin synced).
   **projection** of the per-session logs; **defer** the `EventType`→`Payload`
   fold + routing lifecycle through the seq authority until multiplayer needs the
   unified actor/seq thread *and* the seq handoff is designed.
-- **Step 4 — reader bits, started:** **`session watch`** ships (the thin
-  human-facing reader — renders the event stream to the terminal, the `docker
-  logs` model; `subscribe` is the machine/WS sibling). Remaining: **`session
-  diagnose`** (collector-free post-mortem from the log) + **`session list`
-  status-from-log** (running / idle / done, not just attached/detached).
+- **Step 4 — reader bits: DONE + live-verified.** All three ship: **`session
+  watch`** (thin terminal reader, `docker logs` model; `subscribe` is the
+  machine/WS sibling), **`session list` status-from-log** and **`session
+  diagnose`** (collector-free post-mortem) — both fold `events::status::derive`
+  (the events.jsonl terminal sink + per-session log → running/needs-input/done/
+  failed + activity counts), the single classifier `list`/`info`/`diagnose`
+  share. Live-verified on libkrun, fresh without a drain thanks to the §0 producer
+  above (`list` flips running→needs-input on its own).
 - **Not started:** Steps 5–9 (Harden #1/#3, multiplayer web-attach, input/roles,
   k8s/managed, profiles).
 

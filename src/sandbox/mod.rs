@@ -18,6 +18,7 @@
 //!   hand-edited scheme falls through to SSH.
 
 pub(crate) mod appserver;
+pub(crate) mod appserver_client;
 pub(crate) mod container;
 pub(crate) mod http;
 #[cfg(feature = "libkrun")]

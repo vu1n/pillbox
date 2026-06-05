@@ -41,13 +41,17 @@ impl Drop for ContainerGuard {
 
 impl SandboxBackend for LocalDocker {
     fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
-        // codex-serve (the `codex app-server` bridge) is libkrun-only today — its
-        // run path lives in the microVM backend. Reject on docker rather than
-        // mis-routing it through the opencode server path below.
-        if spec.id == crate::agents::CODEX_SERVE.id {
+        // Some server agents (codex-serve) only run on the libkrun backend — their
+        // run path lives in the microVM. Reject on docker rather than mis-routing
+        // through the opencode server path below. Keyed on the capability, not the
+        // id, so a future libkrun-only server agent is covered without a new branch.
+        if spec.server.is_some_and(|p| p.libkrun_only) {
             return Err(PillboxError::usage(
                 "run",
-                "`codex-serve` runs on the libkrun backend only (build --features libkrun)",
+                format!(
+                    "`{}` runs on the libkrun backend only (build --features libkrun)",
+                    spec.id
+                ),
             )
             .with_next("pillbox run --agent codex   # the docker-capable PTY codex")
             .into());

@@ -72,12 +72,27 @@ fn libkrun_opencode_http(_s: &session::Session) -> Result<Box<dyn sandbox::http:
     .into())
 }
 
+/// The capture wire format for a server session's agent, from its
+/// [`ServerProfile`](crate::agents::ServerProfile) — the drain-dispatch axis,
+/// resolved from the agent id rather than re-matched at each drain site.
+#[cfg(feature = "libkrun")]
+fn server_events_format(s: &session::Session) -> Result<crate::events::EventsFormat> {
+    let spec = crate::agents::lookup("session", &s.agent_id)?;
+    spec.server.map(|p| p.events_format).ok_or_else(|| {
+        PillboxError::usage(
+            "session",
+            format!("`{}` is not a server-mode agent", s.agent_id),
+        )
+        .into()
+    })
+}
+
 /// §0 read for a libkrun server session: drain its persistent event-capture file
 /// (replay everything + follow appends via [`FollowReader`]) into the log. The
 /// gateway-free, complete-capture source — unlike the live bridge, a late watcher
-/// still gets the whole history because the file persisted. The capture format is
-/// per-agent: opencode's SSE (`drain_sse`) or the codex bridge's NDJSON
-/// (`drain_ndjson`); both wrap the same format-agnostic `FollowReader`.
+/// still gets the whole history because the file persisted. The capture format
+/// (SSE vs NDJSON) is selected by [`crate::events::drain_server_capture`] from the
+/// agent's profile; both wrap the same format-agnostic `FollowReader`.
 #[cfg(feature = "libkrun")]
 fn libkrun_server_file_tailer(
     s: &session::Session,
@@ -88,22 +103,21 @@ fn libkrun_server_file_tailer(
     let path = sandbox::libkrun::server_events_file(s)
         .map_err(|e| eprintln!("pillbox: note: can't locate the server events file ({e})"))
         .ok()?;
+    let format = server_events_format(s)
+        .map_err(|e| eprintln!("pillbox: note: {e}"))
+        .ok()?;
     // FollowReader opens the path lazily — it waits for the guest to create the
     // file (first event line), so a `watch` right after `run` (before any events)
     // doesn't miss it. Terminating is the shared `stop` flag's job.
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = Arc::clone(&stop);
     let sid = s.id.clone();
-    let is_codex = s.agent_id == crate::agents::CODEX_SERVE.id;
     let join = std::thread::spawn(move || {
         let mut log = log;
         let reader = crate::events::opencode::FollowReader::new(path, Arc::clone(&stop_thread));
-        let res = if is_codex {
-            crate::events::codex_serve::drain_ndjson(reader, &sid, &mut log, &stop_thread)
-        } else {
-            crate::events::opencode::drain_sse(reader, &sid, &mut log, &stop_thread)
-        };
-        if let Err(e) = res {
+        if let Err(e) =
+            crate::events::drain_server_capture(format, reader, &sid, &mut log, &stop_thread)
+        {
             eprintln!("pillbox: warning: server events drain stopped: {e:#}");
         }
     });
@@ -146,12 +160,13 @@ fn libkrun_score_in_sandbox(
 /// Drain a libkrun server session's persisted event-capture file into its
 /// durable log (feature-gated). Plain `File` → the drain reads to EOF (it
 /// final-flushes a trailing partial frame) and returns; the never-set `stop`
-/// flag is only meaningful on the follow path. The format is per-agent: codex's
-/// NDJSON (`drain_ndjson`) or opencode's SSE (`drain_sse`). Returns the §0 count.
+/// flag is only meaningful on the follow path. The format (NDJSON vs SSE) is
+/// selected by [`crate::events::drain_server_capture`]. Returns the §0 count.
 #[cfg(feature = "libkrun")]
 fn libkrun_ingest_events_file(resolved: &Pillbox, s: &session::Session) -> Result<usize> {
     use std::sync::atomic::AtomicBool;
     let path = sandbox::libkrun::server_events_file(s)?;
+    let format = server_events_format(s)?;
     let file = std::fs::File::open(&path).map_err(|e| {
         PillboxError::runtime(
             "session ingest",
@@ -161,11 +176,7 @@ fn libkrun_ingest_events_file(resolved: &Pillbox, s: &session::Session) -> Resul
     })?;
     let mut log = crate::events::log::SessionLog::open(resolved, &s.id)?;
     let stop = AtomicBool::new(false);
-    if s.agent_id == crate::agents::CODEX_SERVE.id {
-        crate::events::codex_serve::drain_ndjson(file, &s.id, &mut log, &stop)
-    } else {
-        crate::events::opencode::drain_sse(file, &s.id, &mut log, &stop)
-    }
+    crate::events::drain_server_capture(format, file, &s.id, &mut log, &stop)
 }
 #[cfg(not(feature = "libkrun"))]
 fn libkrun_ingest_events_file(_resolved: &Pillbox, _s: &session::Session) -> Result<usize> {
@@ -728,7 +739,7 @@ fn session_send(resolved: &Pillbox, id: &str, text: &str) -> Result<()> {
     if s.integration() == Integration::Server {
         let http = server_http(resolved, &s)?;
         if s.agent_id == crate::agents::CODEX_SERVE.id {
-            sandbox::appserver::send_turn(&*http, text)?;
+            sandbox::appserver_client::send_turn(&*http, text)?;
         } else {
             let server = s.server.as_ref().ok_or_else(|| {
                 PillboxError::config(

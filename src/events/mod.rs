@@ -107,6 +107,35 @@ pub(crate) use otel::genai::{
     emit_call_span as emit_genai_call_span, CallSpan as GenAiCallSpan, GenAiUsage,
 };
 
+/// Wire format of a server-mode agent's §0 capture file — the axis that selects
+/// the drain function. opencode's `/event` stream is SSE; the codex app-server
+/// bridge writes newline-delimited JSON. Carried on the agent's
+/// [`ServerProfile`](crate::agents::ServerProfile) so the drain sites
+/// (`session watch`/`subscribe`/`ingest`) dispatch on data, not on the agent id.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+pub(crate) enum EventsFormat {
+    Sse,
+    Ndjson,
+}
+
+/// Drain a server agent's persisted capture (`reader`) into its durable log,
+/// dispatching on the capture [`EventsFormat`] — the single home for the
+/// format→drain mapping, shared by the live tailer and the post-hoc `ingest`.
+#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+pub(crate) fn drain_server_capture<R: std::io::Read>(
+    format: EventsFormat,
+    reader: R,
+    session_id: &str,
+    log: &mut log::SessionLog,
+    stop: &std::sync::atomic::AtomicBool,
+) -> anyhow::Result<usize> {
+    match format {
+        EventsFormat::Sse => opencode::drain_sse(reader, session_id, log, stop),
+        EventsFormat::Ndjson => codex_serve::drain_ndjson(reader, session_id, log, stop),
+    }
+}
+
 /// Emit the root `session` span for a local-docker foreground run from
 /// the host, at session start (see [`otel::emit_local_root_span`] for
 /// why up-front and why the host owns it). gen_ai + transcript child

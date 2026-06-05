@@ -47,6 +47,26 @@ pub(crate) enum Integration {
     Server,
 }
 
+/// The per-agent data a [`Integration::Server`] agent needs, beyond the common
+/// [`AgentSpec`] fields — the §0 capture filename + its wire format, and whether
+/// the agent only runs on the libkrun backend. `Some` iff `integration == Server`.
+/// Carrying these here (rather than re-deriving `if agent_id == "…"` at each
+/// dispatch site) keeps the events-file name, drain-format selection, and
+/// docker-capability as one source of truth.
+#[derive(Clone, Copy)]
+pub(crate) struct ServerProfile {
+    /// Capture filename under the agent home (the §0 source the host drains).
+    /// Consumed by the libkrun §0 read path; dead on a non-libkrun build.
+    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+    pub(crate) events_file: &'static str,
+    /// Wire format of that capture → selects the drain function. Consumed by the
+    /// libkrun §0 read path; dead on a non-libkrun build.
+    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+    pub(crate) events_format: crate::events::EventsFormat,
+    /// True for server agents that only run on libkrun (docker rejects them).
+    pub(crate) libkrun_only: bool,
+}
+
 #[derive(Clone, Copy)]
 pub struct AgentSpec {
     pub(crate) id: &'static str,
@@ -82,6 +102,10 @@ pub struct AgentSpec {
     /// stall on either gate (see [`pretrust_claude_workspace`]). `None` =
     /// nothing to prepare.
     pub(crate) prepare_workspace: Option<fn(&Path, &str) -> Result<()>>,
+    /// Server-mode data ([`ServerProfile`]). `Some` iff `integration == Server`;
+    /// `None` for PTY agents. The capture-file + drain-format + backend-capability
+    /// dispatch reads this instead of matching on `id`.
+    pub(crate) server: Option<ServerProfile>,
 }
 
 pub const CLAUDE: AgentSpec = AgentSpec {
@@ -102,6 +126,7 @@ pub const CLAUDE: AgentSpec = AgentSpec {
     // works without dropping to a non-root user — a future image change.)
     sandbox_args: &["--permission-mode", "auto"],
     prepare_workspace: Some(pretrust_claude_workspace),
+    server: None,
 };
 
 pub const CODEX: AgentSpec = AgentSpec {
@@ -117,6 +142,7 @@ pub const CODEX: AgentSpec = AgentSpec {
     mcp_inject: Some(mcp::codex_inject),
     sandbox_args: &[],
     prepare_workspace: None,
+    server: None,
 };
 
 /// codex driven through `codex app-server` (its JSON-RPC-over-stdio protocol,
@@ -127,10 +153,13 @@ pub const CODEX: AgentSpec = AgentSpec {
 /// `codex` stays the default; this is opt-in via `--agent codex-serve`, so if
 /// upstream ever closes the app-server surface the TUI path is unaffected.
 ///
-/// libkrun-only today (the server bring-up lives in the microVM run path); the
-/// docker backend rejects it. Vault-capable: same ChatGPT-OAuth stub+MITM swap
-/// as the TUI codex (the app-server's backend calls hit `chatgpt.com`, which the
-/// [`codex` vault provider](crate::vault::providers) already intercepts).
+/// libkrun-only today (the server bring-up lives in the microVM run path; docker
+/// rejects it via [`ServerProfile::libkrun_only`]). **Non-vault v1**: the
+/// app-server's model egress is `wss://api.openai.com/v1/responses` (WebSocket,
+/// `api.openai.com`), which the [`codex` vault provider](crate::vault::providers)
+/// (chatgpt.com only) doesn't intercept — so `--vault` is rejected until that
+/// interception lands. `vault_capable` stays `true` (the intent); the run path
+/// gates the rejection.
 pub const CODEX_SERVE: AgentSpec = AgentSpec {
     id: "codex-serve",
     auth_id: "codex",
@@ -149,6 +178,11 @@ pub const CODEX_SERVE: AgentSpec = AgentSpec {
     mcp_inject: Some(mcp::codex_inject),
     sandbox_args: &[],
     prepare_workspace: None,
+    server: Some(ServerProfile {
+        events_file: crate::sandbox::appserver_client::EVENTS_FILE,
+        events_format: crate::events::EventsFormat::Ndjson,
+        libkrun_only: true,
+    }),
 };
 
 pub const OPENCODE: AgentSpec = AgentSpec {
@@ -164,6 +198,11 @@ pub const OPENCODE: AgentSpec = AgentSpec {
     mcp_inject: Some(mcp::opencode_inject),
     sandbox_args: &[],
     prepare_workspace: None,
+    server: Some(ServerProfile {
+        events_file: crate::sandbox::opencode::EVENTS_FILE,
+        events_format: crate::events::EventsFormat::Sse,
+        libkrun_only: false,
+    }),
 };
 
 pub const PI: AgentSpec = AgentSpec {
@@ -192,6 +231,7 @@ pub const PI: AgentSpec = AgentSpec {
     mcp_inject: None,
     sandbox_args: &[],
     prepare_workspace: None,
+    server: None,
 };
 
 pub const ALL: &[&AgentSpec] = &[&CLAUDE, &CODEX, &CODEX_SERVE, &OPENCODE, &PI];

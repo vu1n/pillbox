@@ -304,6 +304,13 @@ fn read_loop(stdout: impl Read, client: Arc<Client>, events_file: &str) -> Resul
             MsgKind::Notification => {
                 // Append the raw line (the host mapper re-parses it). A write
                 // error here loses §0 capture but mustn't kill the bridge.
+                // The intent is to make each line visible to the host's
+                // FollowReader live; `writeln!` already issues the write()
+                // syscall and `flush()` is a no-op on this unbuffered File, so
+                // host-side visibility relies on the virtio-fs cache mode, not
+                // this flush. The opencode path forces visibility by
+                // reopen-per-line instead — UNVERIFIED whether codex-serve needs
+                // the same (sync_data) for live tail; confirm on a real VM boot.
                 let _ = writeln!(events, "{trimmed}");
                 let _ = events.flush();
             }

@@ -271,22 +271,18 @@ fn map_item_status(s: &str) -> ToolStatus {
 /// A display name for a tool item. commandExecution/fileChange have no name
 /// field — use the kind; mcp/dynamic tool calls carry a `tool`/`name`.
 fn tool_name(item: &Value, item_type: &str) -> String {
-    match item_type {
-        "mcpToolCall" | "dynamicToolCall" => {
-            let name = str_field(item, "tool");
-            let name = if name.is_empty() {
-                str_field(item, "name")
-            } else {
-                name
-            };
-            if name.is_empty() {
-                item_type.to_string()
-            } else {
-                name.to_string()
-            }
-        }
-        _ => item_type.to_string(),
+    if !matches!(item_type, "mcpToolCall" | "dynamicToolCall") {
+        return item_type.to_string();
     }
+    // mcp/dynamic calls name the tool in `tool` (or `name`); fall back to the
+    // item kind when neither is present.
+    for key in ["tool", "name"] {
+        let name = str_field(item, key);
+        if !name.is_empty() {
+            return name.to_string();
+        }
+    }
+    item_type.to_string()
 }
 
 /// The tool item's structured input, when the item shape carries one (the

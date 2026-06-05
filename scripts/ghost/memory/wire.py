@@ -10,8 +10,8 @@ The §0 event contract is src/contract.rs (camelCase envelope, payload tagged on
 distill.build_trace to parse it, so the two stay in lockstep. Observing is idempotent per log file via
 a `.ghost-observed` marker (re-running a finished session's log is a no-op), matching `session ingest`.
 
-Source is decoupled from sink: any list of §0 event dicts feeds observe_events — a file, stdin JSONL,
-or a future `session subscribe` WebSocket adapter.
+Source is decoupled from sink: capture_events takes any list of §0 event dicts; capture_log_file adds
+the idempotency marker + a completeness gate, and autocapture.py sweeps completed logs through it.
 """
 from __future__ import annotations
 
@@ -93,13 +93,14 @@ def capture_log_file(path: str, store, *, project: str, task: str = "", distille
     """Capture one session log, idempotent via a .ghost-observed marker (matches `session ingest`).
     Returns None — leaving the log unmarked for a later pass — if already captured, or if
     require_complete and the session is still in-flight (no terminal event yet)."""
-    if os.path.exists(path + ".ghost-observed"):
+    marker = path + ".ghost-observed"
+    if os.path.exists(marker):
         return None
     events = read_log(path)
     if require_complete and not _is_complete(events):
         return None
     res = capture_events(events, store, project=project, task=task, distiller=distiller)
-    open(path + ".ghost-observed", "w").close()
+    open(marker, "w").close()
     return res
 
 

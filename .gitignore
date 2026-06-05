@@ -12,6 +12,7 @@
 # once swept the whole tree (incl. a 100MB+ workerd binary) into history.
 node_modules/
 
-# Python bytecode (scripts/ghost/*)
+# Python bytecode + uv venvs (scripts/ghost/*)
 __pycache__/
 *.pyc
+.venv/

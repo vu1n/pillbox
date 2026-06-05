@@ -21,9 +21,8 @@ import json
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from distill import build_trace, distill_session, distiller_from_env, read_log  # noqa: E402 — sibling
-from store import MemoryStore, store_from_env  # noqa: E402
+from .distill import build_trace, distill_session, distiller_from_env, read_log
+from .store import MemoryStore, store_from_env
 
 _FB = 400  # outcome-feedback cap in an observation (the raw record, not the full grader dump)
 

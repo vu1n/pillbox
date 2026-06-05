@@ -17,10 +17,9 @@ import os
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from arbiter import consolidate  # noqa: E402 — siblings, path set above
-from distill import build_trace, distill_session, distiller_from_env, read_log  # noqa: E402
-from store import store_from_env  # noqa: E402
+from .arbiter import consolidate
+from .distill import build_trace, distill_session, distiller_from_env, read_log
+from .store import store_from_env
 
 
 def task_signature(trace) -> str:

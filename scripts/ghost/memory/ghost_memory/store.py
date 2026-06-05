@@ -37,7 +37,7 @@ from typing import Callable, Protocol
 
 import turso  # pyturso — the tursodb engine (concurrent writes + native vectors)
 
-from vocab import SCOPES, STATUSES, TYPES  # single-sourced vocabulary (turso-free leaf)
+from .vocab import SCOPES, STATUSES, TYPES  # single-sourced vocabulary (turso-free leaf)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS observations (

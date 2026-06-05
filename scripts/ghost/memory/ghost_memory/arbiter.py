@@ -16,8 +16,7 @@ import os
 import sys
 from collections import defaultdict
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from store import Claim, MemoryStore, store_from_env  # noqa: E402 — sibling, path set above
+from .store import Claim, MemoryStore, store_from_env
 
 
 def _rank(c: Claim) -> tuple:

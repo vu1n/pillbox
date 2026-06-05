@@ -1,0 +1,16 @@
+[project]
+name = "ghost-memory"
+version = "0.1.0"
+description = "Swarm memory engine for coding agents — observe / distill / recall / consolidate over a shared store."
+requires-python = ">=3.10"
+dependencies = [
+    "pyturso",  # embedded tursodb: concurrent writes + native vector search
+    "mcp",      # the MCP SDK (only the `serve` command needs it; imported lazily)
+]
+
+[project.scripts]
+ghost-memory = "ghost_memory.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

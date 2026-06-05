@@ -26,7 +26,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from vocab import TYPES  # single-sourced vocabulary (turso-free leaf), shared with store.py
+from .vocab import TYPES  # single-sourced vocabulary (turso-free leaf), shared with store.py
 
 _MAX = 800  # claim/observation content cap — claims are distilled, not transcripts
 
@@ -376,8 +376,7 @@ def _trace_summary(t: Trace) -> str:
 if __name__ == "__main__":
     import glob
 
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from store import MemoryStore
+    from .store import MemoryStore
 
     db = "/tmp/distill-selftest.db"
     for f in glob.glob(db + "*"):

@@ -18,10 +18,9 @@ import glob
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from distill import distiller_from_env  # noqa: E402 — siblings, path set above
-from store import store_from_env  # noqa: E402
-from wire import capture_log_file  # noqa: E402
+from .distill import distiller_from_env
+from .store import store_from_env
+from .wire import capture_log_file
 
 DEFAULT_LOGS = "~/.pillbox/*/sessions/*/log.jsonl"
 
@@ -62,8 +61,8 @@ elif __name__ == "__main__":
     import json
     import shutil
 
-    from distill import HeuristicDistiller
-    from store import MemoryStore
+    from .distill import HeuristicDistiller
+    from .store import MemoryStore
 
     root = "/tmp/autocap-selftest"
     shutil.rmtree(root, ignore_errors=True)

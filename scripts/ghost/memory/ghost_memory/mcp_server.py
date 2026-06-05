@@ -15,12 +15,10 @@ serving needs it.
 from __future__ import annotations
 
 import os
-import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from arbiter import consolidate as _consolidate  # noqa: E402 — sibling, path set above
-from arbiter import resolve_conflicts as _resolve_conflicts  # noqa: E402
-from store import MemoryStore, RipgrepResolver, store_from_env  # noqa: E402
+from .arbiter import consolidate as _consolidate
+from .arbiter import resolve_conflicts as _resolve_conflicts
+from .store import MemoryStore, RipgrepResolver, store_from_env
 
 
 def _claim_dict(c) -> dict:

@@ -49,7 +49,7 @@ mod vault;
 // The launch/attach/detach/reattach/teardown choreography lives in `session`;
 // `commands::session` reaches these accessors through the backend module.
 pub(crate) use session::{
-    kill_session, opencode_events_file, opencode_http, reattach, score_in_sandbox, workspace_path,
+    kill_session, opencode_http, reattach, score_in_sandbox, server_events_file, workspace_path,
 };
 
 use crate::agents::AgentSpec;

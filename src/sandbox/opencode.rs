@@ -158,8 +158,8 @@ pub(crate) fn print_started(
         .map(|s| s.model.as_str())
         .unwrap_or("?");
     println!(
-        "pillbox: ✓ opencode session `{}` ready ({model}).",
-        session.id
+        "pillbox: ✓ {} session `{}` ready ({model}).",
+        session.agent_id, session.id
     );
     println!(
         "         pillbox session watch {}    # read the stream",

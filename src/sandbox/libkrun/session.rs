@@ -35,9 +35,14 @@ use super::{
 
 impl SandboxBackend for LibkrunBackend {
     fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
-        // Server-integration agents (opencode) run headless + are driven/read over
-        // their HTTP API through a vsock port-forward — a distinct path with no PTY
-        // (mirrors local_docker's split). Keep claude/codex on the PTY path below.
+        // Server-integration agents run headless + are driven/read over their HTTP
+        // API through a vsock port-forward — a distinct path with no PTY (mirrors
+        // local_docker's split). codex-serve drives `codex app-server` through the
+        // in-guest bridge; opencode runs `opencode serve`. Keep claude/codex on the
+        // PTY path below.
+        if spec.id == crate::agents::CODEX_SERVE.id {
+            return run_codex_serve(spec, opts, resolved);
+        }
         if spec.integration == Integration::Server {
             return run_server(spec, opts, resolved);
         }
@@ -662,6 +667,205 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
     Ok(())
 }
 
+/// Run codex via `codex app-server` (the codex-serve agent) in a microVM: boot
+/// the VM running the in-guest [`appserver-host`](crate::sandbox::appserver)
+/// bridge (which owns the `codex app-server` stdio and re-exposes it as HTTP) +
+/// a vsock port-forward, then create/drive/read it over that forward — the codex
+/// analog of [`run_server`].
+///
+/// v1 is **non-vault** (real creds in the guest, like opencode): the live finding
+/// is that app-server's model egress is `wss://api.openai.com/v1/responses`
+/// (WebSocket, `api.openai.com`), which the [`codex` vault provider](crate::vault::providers)
+/// (chatgpt.com only) doesn't intercept — so a stub+MITM swap wouldn't reach the
+/// model calls. `--vault` is rejected here until that interception (api.openai.com
+/// + WS-MITM) lands; the egress fence still confines the VM to OpenAI's hosts.
+fn run_codex_serve(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
+    use crate::sandbox::appserver;
+
+    // Non-vault v1: refuse --vault / vaulted --with rather than hand codex a stub
+    // the un-intercepted api.openai.com path would ship unswapped (→ 401).
+    let withs = resolve_with_entries(resolved, &opts.withs)?;
+    if opts.vault || withs.iter().any(|w| w.meta.is_some()) {
+        return Err(unsupported(
+            spec,
+            "the vault (codex-serve v1 is non-vault: app-server's model egress is \
+             api.openai.com over WebSocket, which the codex provider doesn't yet intercept)",
+        ));
+    }
+
+    let LaunchBase {
+        rootfs,
+        home,
+        workspace_clone: clone,
+        guest_workspace,
+        guest_env,
+        ca_cert_pem,
+        vault_ca_dir,
+    } = launch_base(spec, &opts, resolved)?;
+
+    // Creds: CoW clone the *real* codex auth home (no stub in v1 — codex
+    // authenticates to OpenAI directly; the MITM forwards it untouched).
+    let creds_share = cow_clone_home(&home)?;
+
+    // Guest entrypoint: NIC + CA + mounts, then the appserver-host bridge
+    // (background — it spawns `codex app-server`, captures notifications to the
+    // events file, serves HTTP on BRIDGE_PORT) and the vsock forward relay
+    // (foreground — the script's main process, bridging FORWARD_PORT → the bridge).
+    let home_q = shell_quote(GUEST_HOME);
+    let gw_q = shell_quote(&guest_workspace);
+    let preamble = guest_launch_preamble(&ca_cert_pem, &home_q, &gw_q);
+    let events_q = shell_quote(&format!("{GUEST_HOME}/{}", appserver::EVENTS_FILE));
+    let script = format!(
+        "{preamble}; \
+         pillbox appserver-host --port {bridge} --events-file {events_q} & \
+         exec pillbox vsock-forward --vsock-port {FORWARD_PORT} --to-port {bridge}",
+        bridge = appserver::BRIDGE_PORT,
+    );
+
+    let host_sock = krun_cache_dir()?.join(format!(
+        "codex-serve-{}.sock",
+        uuid::Uuid::now_v7().simple()
+    ));
+    let _ = std::fs::remove_file(&host_sock);
+
+    let vmspec = VmSpec {
+        rootfs: rootfs.to_string_lossy().into_owned(),
+        vcpus: 2,
+        ram_mib: 2048,
+        shares: vec![
+            Share {
+                tag: "creds".into(),
+                host_path: creds_share.to_string_lossy().into_owned(),
+            },
+            Share {
+                tag: "workspace".into(),
+                host_path: clone.to_string_lossy().into_owned(),
+            },
+        ],
+        exec: vec!["/bin/sh".into(), "-c".into(), script],
+        // Guest listens; the host dials `host_sock` once per HTTP request.
+        vsock: Some(VsockAttach {
+            port: FORWARD_PORT,
+            host_sock: host_sock.to_string_lossy().into_owned(),
+            listen: true,
+        }),
+        egress: Some(EgressSpec {
+            // codex talks only to OpenAI: the codex provider's intercept set
+            // (chatgpt.com / chat.openai.com / auth.openai.com) PLUS api.openai.com
+            // — the app-server's `wss://api.openai.com/v1/responses` model endpoint,
+            // which the provider's host list omits (it's the API-key path). All
+            // terminate + forward with an empty swap (non-vault), so the agent
+            // reaches the model; everything else is fenced. Plus invoker
+            // `--egress-allow` hosts.
+            allowlist: crate::vault::providers::intercepted_hosts()
+                .into_iter()
+                .chain(std::iter::once("api.openai.com"))
+                .map(str::to_string)
+                .chain(opts.egress_allow.iter().cloned())
+                .collect(),
+            log_path: std::env::var("PILLBOX_KRUN_EGRESS_LOG").ok(),
+            ca_dir: Some(vault_ca_dir.to_string_lossy().into_owned()),
+            local_forward_port: None,
+        }),
+    };
+    let spec_file = tempfile::Builder::new()
+        .prefix("pillbox-krun-spec-")
+        .suffix(".json")
+        .tempfile()
+        .context("create VMM spec tempfile")?;
+    serde_json::to_writer(&spec_file, &vmspec).context("write VMM spec")?;
+    let (_, spec_path) = spec_file.keep().context("persist VMM spec")?;
+
+    // Spawn the VM detached (it runs the bridge + relay, reparented to init).
+    let exe = std::env::current_exe().context("locate the pillbox binary to re-exec as VMM")?;
+    let mut child = Command::new(&exe)
+        .arg("__krun-vmm")
+        .arg(&spec_path)
+        .env_clear()
+        .envs(guest_env)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("spawn the libkrun VMM subprocess")?;
+    // No swap pairs (non-vault): hand the child's MITM an empty set + EOF.
+    if let Some(mut sin) = child.stdin.take() {
+        use std::io::Write as _;
+        let _ = sin.write_all(b"[]");
+    }
+    let pid = child.id() as i32;
+
+    let session_id = crate::session::Session::new_id();
+    let http = http::LibkrunHttp::new(host_sock.clone());
+    let prompt = opts.args.join(" ").trim().to_string();
+
+    // Bring-up over the forward; capture the result so a failure tears the VM
+    // down rather than leaking it + the clones.
+    let built = (|| -> Result<crate::session::Session> {
+        appserver::wait_ready(&http)?;
+        let thread_id = appserver::create_session(&http)?;
+        let handle = LibkrunHandle {
+            sock: host_sock.to_string_lossy().into_owned(),
+            pid,
+            creds: creds_share.to_string_lossy().into_owned(),
+            workspace: clone.to_string_lossy().into_owned(),
+            spec: spec_path.to_string_lossy().into_owned(),
+        };
+        let session = crate::session::Session {
+            id: session_id.clone(),
+            label: opts.label.clone(),
+            remote: crate::session::LOCAL_REMOTE.to_string(),
+            backend: crate::session::BACKEND_LIBKRUN.to_string(),
+            sandbox_id: serde_json::to_string(&handle).context("encode libkrun handle")?,
+            pty_pid: 0,
+            agent_id: spec.id.to_string(),
+            started_at: crate::session::now_rfc3339(),
+            attached_pid: None,
+            base_snapshot: None,
+            result_snapshot: None,
+            expires_at: opts.ttl_seconds.map(crate::session::expires_at_from_ttl),
+            guest_cwd: guest_workspace.clone(),
+            server: Some(crate::session::ServerSession {
+                agent_session_id: thread_id,
+                // codex-serve picks its model from codex config, not a host flag;
+                // record the override when given, else a marker.
+                model: opts.model.clone().unwrap_or_else(|| "codex-default".into()),
+            }),
+        };
+        crate::session::write(resolved, &session)?;
+        crate::events::emit_session_event(
+            resolved,
+            crate::events::EventType::SessionStarted {
+                parent_session_id: crate::events::parent_session_id_from_env(),
+            },
+            &session.id,
+            Some(&session),
+        );
+        Ok(session)
+    })();
+    let session = match built {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&host_sock);
+            let _ = std::fs::remove_file(&spec_path);
+            let _ = std::fs::remove_dir_all(&creds_share);
+            let _ = std::fs::remove_dir_all(&clone);
+            return Err(e);
+        }
+    };
+
+    // No auto-send: the bridge comes up ready (wait_ready), so the first prompt
+    // goes through `session send` — captured by a subscribed watch.
+    crate::sandbox::opencode::print_started(
+        &session,
+        opts.json,
+        (!prompt.is_empty()).then_some(prompt.as_str()),
+    );
+    Ok(())
+}
+
 /// What a detached libkrun session stores in `Session::sandbox_id` (as JSON): the
 /// persistent attach socket (libkrun-bound for the guest's listen) to reattach to,
 /// the VMM child PID to signal on `rm`, and the CoW clones + spec file to scrub on
@@ -691,12 +895,19 @@ pub(crate) fn opencode_http(
     Ok(Box::new(http::LibkrunHttp::new(PathBuf::from(handle.sock))))
 }
 
-/// Host-side path of a libkrun server session's `/event` capture file (inside
-/// the CoW creds clone the guest mounts at its home). The §0 read drains this
-/// for `watch`/`subscribe`. See [`crate::sandbox::opencode::EVENTS_FILE`].
-pub(crate) fn opencode_events_file(session: &crate::session::Session) -> Result<PathBuf> {
+/// Host-side path of a libkrun server session's event-capture file (inside the
+/// CoW creds clone the guest mounts at its home). The §0 read drains this for
+/// `watch`/`subscribe`/`ingest`. The filename is per-agent: opencode's SSE
+/// capture ([`crate::sandbox::opencode::EVENTS_FILE`]) or the codex bridge's
+/// NDJSON capture ([`crate::sandbox::appserver::EVENTS_FILE`]).
+pub(crate) fn server_events_file(session: &crate::session::Session) -> Result<PathBuf> {
+    let filename = if session.agent_id == crate::agents::CODEX_SERVE.id {
+        crate::sandbox::appserver::EVENTS_FILE
+    } else {
+        crate::sandbox::opencode::EVENTS_FILE
+    };
     let handle = LibkrunHandle::decode(session)?;
-    Ok(PathBuf::from(handle.creds).join(crate::sandbox::opencode::EVENTS_FILE))
+    Ok(PathBuf::from(handle.creds).join(filename))
 }
 
 /// Host path of a libkrun session's result-workspace — the CoW clone the guest

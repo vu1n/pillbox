@@ -19,10 +19,14 @@ mod grader;
 mod stream;
 
 /// A [`SandboxHttp`](sandbox::http::SandboxHttp) to a server-mode session's
-/// in-sandbox opencode server — `docker exec curl` for a (local/remote) docker
+/// in-sandbox HTTP server — `docker exec curl` for a (local/remote) docker
 /// session, an HTTP-over-vsock client for a libkrun one. The dispatch axis for
-/// `session send`/`subscribe`/`watch` on a `Server`-integration agent.
-fn opencode_http(
+/// `session send`/`subscribe`/`watch` on any `Server`-integration agent
+/// (opencode's `serve`, or the codex `appserver-host` bridge). The libkrun
+/// transport is port-free (the guest's vsock forward already targets the right
+/// in-guest port), so it serves both; the `port` only matters for the docker
+/// `curl` variant, which codex-serve never uses (libkrun-only).
+fn server_http(
     resolved: &Pillbox,
     s: &session::Session,
 ) -> Result<Box<dyn sandbox::http::SandboxHttp>> {
@@ -54,7 +58,7 @@ fn opencode_http(
     }
 }
 
-/// libkrun opencode HTTP transport (feature-gated; see [`opencode_http`]).
+/// libkrun server-agent HTTP transport (feature-gated; see [`server_http`]).
 #[cfg(feature = "libkrun")]
 fn libkrun_opencode_http(s: &session::Session) -> Result<Box<dyn sandbox::http::SandboxHttp>> {
     sandbox::libkrun::opencode_http(s)
@@ -68,31 +72,39 @@ fn libkrun_opencode_http(_s: &session::Session) -> Result<Box<dyn sandbox::http:
     .into())
 }
 
-/// §0 read for a libkrun server session: drain its persistent `/event` capture
-/// file (replay everything + follow appends via [`FollowReader`]) into the log.
-/// The gateway-free, complete-capture source — unlike the live bridge, a late
-/// watcher still gets the whole history because the file persisted.
+/// §0 read for a libkrun server session: drain its persistent event-capture file
+/// (replay everything + follow appends via [`FollowReader`]) into the log. The
+/// gateway-free, complete-capture source — unlike the live bridge, a late watcher
+/// still gets the whole history because the file persisted. The capture format is
+/// per-agent: opencode's SSE (`drain_sse`) or the codex bridge's NDJSON
+/// (`drain_ndjson`); both wrap the same format-agnostic `FollowReader`.
 #[cfg(feature = "libkrun")]
-fn libkrun_opencode_file_tailer(
+fn libkrun_server_file_tailer(
     s: &session::Session,
     log: crate::events::log::SessionLog,
 ) -> Option<events::transcripts::TailerHandle> {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
-    let path = sandbox::libkrun::opencode_events_file(s)
-        .map_err(|e| eprintln!("pillbox: note: can't locate the opencode events file ({e})"))
+    let path = sandbox::libkrun::server_events_file(s)
+        .map_err(|e| eprintln!("pillbox: note: can't locate the server events file ({e})"))
         .ok()?;
     // FollowReader opens the path lazily — it waits for the guest to create the
-    // file (first SSE line), so a `watch` right after `run` (before any events)
+    // file (first event line), so a `watch` right after `run` (before any events)
     // doesn't miss it. Terminating is the shared `stop` flag's job.
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = Arc::clone(&stop);
     let sid = s.id.clone();
+    let is_codex = s.agent_id == crate::agents::CODEX_SERVE.id;
     let join = std::thread::spawn(move || {
         let mut log = log;
         let reader = crate::events::opencode::FollowReader::new(path, Arc::clone(&stop_thread));
-        if let Err(e) = crate::events::opencode::drain_sse(reader, &sid, &mut log, &stop_thread) {
-            eprintln!("pillbox: warning: opencode events drain stopped: {e:#}");
+        let res = if is_codex {
+            crate::events::codex_serve::drain_ndjson(reader, &sid, &mut log, &stop_thread)
+        } else {
+            crate::events::opencode::drain_sse(reader, &sid, &mut log, &stop_thread)
+        };
+        if let Err(e) = res {
+            eprintln!("pillbox: warning: server events drain stopped: {e:#}");
         }
     });
     // The shared `stop` flag terminates the FollowReader (→ the drain ends), so
@@ -100,7 +112,7 @@ fn libkrun_opencode_file_tailer(
     Some(events::transcripts::TailerHandle::from_flag(stop, join))
 }
 #[cfg(not(feature = "libkrun"))]
-fn libkrun_opencode_file_tailer(
+fn libkrun_server_file_tailer(
     _s: &session::Session,
     _log: crate::events::log::SessionLog,
 ) -> Option<events::transcripts::TailerHandle> {
@@ -131,14 +143,15 @@ fn libkrun_score_in_sandbox(
     .into())
 }
 
-/// Drain a libkrun opencode session's persisted `/event` capture file into its
-/// durable log (feature-gated). Plain `File` → `drain_sse` reads to EOF (it
+/// Drain a libkrun server session's persisted event-capture file into its
+/// durable log (feature-gated). Plain `File` → the drain reads to EOF (it
 /// final-flushes a trailing partial frame) and returns; the never-set `stop`
-/// flag is only meaningful on the follow path. Returns the §0 event count.
+/// flag is only meaningful on the follow path. The format is per-agent: codex's
+/// NDJSON (`drain_ndjson`) or opencode's SSE (`drain_sse`). Returns the §0 count.
 #[cfg(feature = "libkrun")]
 fn libkrun_ingest_events_file(resolved: &Pillbox, s: &session::Session) -> Result<usize> {
     use std::sync::atomic::AtomicBool;
-    let path = sandbox::libkrun::opencode_events_file(s)?;
+    let path = sandbox::libkrun::server_events_file(s)?;
     let file = std::fs::File::open(&path).map_err(|e| {
         PillboxError::runtime(
             "session ingest",
@@ -148,7 +161,11 @@ fn libkrun_ingest_events_file(resolved: &Pillbox, s: &session::Session) -> Resul
     })?;
     let mut log = crate::events::log::SessionLog::open(resolved, &s.id)?;
     let stop = AtomicBool::new(false);
-    crate::events::opencode::drain_sse(file, &s.id, &mut log, &stop)
+    if s.agent_id == crate::agents::CODEX_SERVE.id {
+        crate::events::codex_serve::drain_ndjson(file, &s.id, &mut log, &stop)
+    } else {
+        crate::events::opencode::drain_sse(file, &s.id, &mut log, &stop)
+    }
 }
 #[cfg(not(feature = "libkrun"))]
 fn libkrun_ingest_events_file(_resolved: &Pillbox, _s: &session::Session) -> Result<usize> {
@@ -703,18 +720,25 @@ fn session_send(resolved: &Pillbox, id: &str, text: &str) -> Result<()> {
     // against the session registry — not `resolve_logged` (the read side's
     // foreground log dirs).
     let s = session::resolve(resolved, id)?;
-    // Server-integration agents (opencode) are driven over their HTTP prompt
-    // API, not a pty-relay: `session send` = a structured prompt, not keystrokes.
+    // Server-integration agents (opencode, codex-serve) are driven over their
+    // HTTP API, not a pty-relay: `session send` = a structured prompt, not
+    // keystrokes. Both reach their in-guest server through the same transport;
+    // only the route shape differs (opencode's prompt_async vs the codex bridge's
+    // /turn, which already holds the thread id).
     if s.integration() == Integration::Server {
-        let http = opencode_http(resolved, &s)?;
-        let server = s.server.as_ref().ok_or_else(|| {
-            PillboxError::config(
-                "session send",
-                format!("session `{}` has no opencode server state", s.id),
-            )
-        })?;
-        sandbox::opencode::send_prompt(&*http, &server.agent_session_id, text, &server.model)?;
-        eprintln!("pillbox: sent prompt to opencode session `{}`", s.id);
+        let http = server_http(resolved, &s)?;
+        if s.agent_id == crate::agents::CODEX_SERVE.id {
+            sandbox::appserver::send_turn(&*http, text)?;
+        } else {
+            let server = s.server.as_ref().ok_or_else(|| {
+                PillboxError::config(
+                    "session send",
+                    format!("session `{}` has no server state", s.id),
+                )
+            })?;
+            sandbox::opencode::send_prompt(&*http, &server.agent_session_id, text, &server.model)?;
+        }
+        eprintln!("pillbox: sent prompt to session `{}`", s.id);
         return Ok(());
     }
     match session::Backend::parse(&s.backend) {

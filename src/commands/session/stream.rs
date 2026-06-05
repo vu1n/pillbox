@@ -34,8 +34,8 @@ fn resolve_streaming_session(
             // host daemon. Other backends (docker, deprecated) read the live
             // /event bridge, which only captures while watched.
             let tailer = match session::Backend::parse(&s.backend) {
-                Some(session::Backend::Libkrun) => super::libkrun_opencode_file_tailer(&s, log),
-                _ => match super::opencode_http(resolved, &s) {
+                Some(session::Backend::Libkrun) => super::libkrun_server_file_tailer(&s, log),
+                _ => match super::server_http(resolved, &s) {
                     Ok(http) => sandbox::opencode::spawn_event_bridge(&*http, &s.id, log),
                     Err(e) => {
                         eprintln!(

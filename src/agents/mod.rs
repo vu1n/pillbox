@@ -280,12 +280,11 @@ fn finalize_claude_onboarding(home: &Path) -> Result<()> {
 /// `--dangerously-skip-permissions` can't bypass as root.
 ///
 /// `hasCompletedOnboarding` is the same flag [`finalize_claude_onboarding`]
-/// sets at login. Local docker inherits it via the bind-mounted global home,
-/// but the remote backends materialize only `.claude/` (auth) from the blob —
-/// `~/.claude.json` is a sibling, never forwarded — so a remote container would
-/// otherwise hit the wizard. Setting it here (every launch, every backend) is
-/// idempotent and backend-agnostic. Merges into any existing entry; creates the
-/// file + `projects` map as needed.
+/// sets at login. Local docker inherits it via the bind-mounted global home;
+/// a libkrun guest with a fresh `$HOME` would otherwise hit the wizard.
+/// Setting it here (every launch, every backend) is idempotent and
+/// backend-agnostic. Merges into any existing entry; creates the file +
+/// `projects` map as needed.
 /// Get `key` from `obj` as a mutable object, inserting an empty one if absent.
 /// Errors if `key` is present but not a JSON object.
 fn get_or_create_object<'a>(
@@ -489,16 +488,10 @@ pub(crate) struct RunOpts {
     /// read at run time, never inlined at CLI parse.
     pub(crate) mcp_tokens: Vec<McpTokenSpec>,
     pub(crate) args: Vec<String>,
-    /// Remote name (`--remote NAME`). Resolved to a `Remote` record in
-    /// `dispatch_run` and threaded through to the sandbox backend. Kept
-    /// on `RunOpts` rather than the trait method so other v0.6+ runtime
-    /// inputs (proxy URL, detach flag, etc.) can be added without
-    /// expanding the trait's signature.
-    pub(crate) remote_name: Option<String>,
     /// `--detach` — start the session and exit. The session is recorded
     /// in the per-pillbox registry and the user reattaches with `pillbox
-    /// session attach <id>`. Supported on local Docker, e2b://, and
-    /// ssh:// backends (each persists the in-sandbox pty-host).
+    /// session attach <id>`. Supported on local Docker + libkrun backends
+    /// (each persists the in-sandbox pty-host).
     pub(crate) detach: bool,
     /// `--label TEXT` — human label for a detached session, surfaced
     /// in `pillbox session list`. Only meaningful with `--detach`.
@@ -517,8 +510,7 @@ pub(crate) struct RunOpts {
     /// from creation time. Only meaningful with `--detach`.
     pub(crate) ttl_seconds: Option<u64>,
     /// `--from-bookmark NAME` — select the snapshot bookmark used as
-    /// the run's workspace base. Local Docker restores it before launch;
-    /// remote backends hydrate it into the remote temp workspace.
+    /// the run's workspace base, restored into the workspace before launch.
     pub(crate) from_bookmark: Option<String>,
     /// `--model PROVIDER/MODEL` — for a `Server`-integration agent (opencode),
     /// the model to drive with (e.g. `zai-coding-plan/glm-4.5-air`). Recorded on
@@ -696,14 +688,6 @@ pub(crate) fn base_docker_args_detached() -> Vec<String> {
     base_docker_args_with(&["-d"])
 }
 
-/// Base args for `docker create` (no stdio prefix): the docker:// path
-/// creates the container, stages the workspace + blob into it, then starts
-/// it — so it can't use the `-d` (run-only) prefix. The pty-host owns the
-/// PTY and the attach relay provides the client TTY, so no `-it` either.
-pub(crate) fn base_docker_args_create() -> Vec<String> {
-    base_docker_args_with(&[])
-}
-
 pub(crate) fn workspace_mount_name(host: &Path, override_name: Option<&str>) -> Result<String> {
     if let Some(name) = override_name {
         if name.is_empty() || name.contains('/') || name.contains('\0') {
@@ -747,7 +731,6 @@ mod tests {
             mcps: Vec::new(),
             mcp_tokens: Vec::new(),
             args: Vec::new(),
-            remote_name: None,
             detach: false,
             label: None,
             json: false,
@@ -976,7 +959,7 @@ mod tests {
             true
         );
         // Global onboarding is marked complete (suppresses the fresh-HOME
-        // first-run wizard on the remote backends).
+        // first-run wizard on a fresh guest home).
         assert_eq!(v["hasCompletedOnboarding"], true);
         // Pre-existing global key + sibling project survive untouched.
         assert_eq!(v["someGlobal"], 1);

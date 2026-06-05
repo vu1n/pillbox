@@ -126,7 +126,7 @@ impl SandboxBackend for LocalDocker {
                 "run",
                 "--detach does not support the vault locally (the proxy can't outlive the CLI)",
             )
-            .with_next("run without --vault, or use --remote for a vaulted detached session")
+            .with_next("run without --vault, or use the libkrun backend (PILLBOX_BACKEND=libkrun), which keeps the vault on detach")
             .into());
         }
         // One session id for the whole foreground run: it anchors the

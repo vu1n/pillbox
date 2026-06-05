@@ -59,26 +59,6 @@ pub(crate) struct TailerHandle {
 }
 
 impl TailerHandle {
-    /// Wrap a tailer thread that reads a `docker exec` child's stdout (the
-    /// docker:// transcript read path) so it shares this handle's
-    /// stop-and-join lifecycle — the child is killed on stop to unblock a
-    /// parked read. Thin wrapper over [`from_stopper`](Self::from_stopper).
-    pub(crate) fn from_stream(
-        stop: Arc<AtomicBool>,
-        child: std::process::Child,
-        join: JoinHandle<()>,
-    ) -> Self {
-        Self::from_stopper(
-            stop,
-            Box::new(move || {
-                let mut child = child;
-                let _ = child.kill();
-                let _ = child.wait();
-            }),
-            join,
-        )
-    }
-
     /// Wrap a tailer thread spawned elsewhere, given an explicit `stopper` that
     /// tears down whatever transport the thread is reading (a killed exec, a
     /// closed vsock). `stop` is the flag the thread observes between reads.

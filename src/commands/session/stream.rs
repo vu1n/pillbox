@@ -10,7 +10,7 @@ use anyhow::Result;
 use crate::agents::Integration;
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
-use crate::{events, remote, sandbox, session};
+use crate::{events, sandbox, session};
 
 /// Resolve a session id/prefix for streaming and ensure its log is being
 /// filled. A live local-docker record → spawn the transcript→log tailer
@@ -31,14 +31,16 @@ fn resolve_streaming_session(
             let log = crate::events::log::SessionLog::open(resolved, &s.id)?;
             // libkrun captures /event to a persistent file in the shared home, so
             // drain THAT (replay + follow) — complete even for a late watcher, no
-            // host daemon. Other backends (docker, deprecated) read the live
-            // /event bridge, which only captures while watched.
+            // host daemon. Docker reads the live /event bridge, which only captures
+            // while watched.
             let tailer = match session::Backend::parse(&s.backend) {
                 // A detached §0 producer already keeps the log live — just follow it (a second
                 // drainer would double-write). Else this reader is the drainer (no producer).
-                Some(session::Backend::Libkrun) if super::detached_tailer_alive(resolved, &s) => None,
+                Some(session::Backend::Libkrun) if super::detached_tailer_alive(resolved, &s) => {
+                    None
+                }
                 Some(session::Backend::Libkrun) => super::libkrun_server_file_tailer(&s, log),
-                _ => match super::server_http(resolved, &s) {
+                _ => match super::server_http(&s) {
                     Ok(http) => sandbox::opencode::spawn_event_bridge(&*http, &s.id, log),
                     Err(e) => {
                         eprintln!(
@@ -64,42 +66,12 @@ fn resolve_streaming_session(
                     &s.id,
                 )
             }
-            // docker:// is the one remote whose transcript is reachable
-            // host-side (the container is directly `docker exec`-able): tail it
-            // over the endpoint into the durable log, so subscribe/watch read a
-            // remote session collector-free, same as local.
-            Some(session::Backend::RemoteDocker) => {
-                match remote::resolve_run_target(resolved, &s.remote)
-                    .and_then(|r| sandbox::remote_docker::endpoint_for(&r))
-                {
-                    Ok(endpoint) => {
-                        let log = crate::events::log::SessionLog::open(resolved, &s.id)?;
-                        sandbox::remote_docker::spawn_transcript_stream(
-                            &endpoint,
-                            &s.sandbox_id,
-                            &s.agent_id,
-                            &s.guest_cwd,
-                            &s.id,
-                            log,
-                        )
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "pillbox: note: can't reach remote `{}` to tail its transcript \
-                             ({e}); reading the existing log",
-                            s.remote
-                        );
-                        None
-                    }
-                }
-            }
-            // e2b/ssh write their transcript inside an ephemeral sandbox with no
-            // host-reachable handle; their live view is the sandbox-side OTLP
-            // tailer (needs a collector). Read the existing host log here.
+            // A libkrun PTY session's transcript tailing isn't wired here yet;
+            // read the existing host log.
             _ => {
                 eprintln!(
-                    "pillbox: note: live event tailing isn't available for `{}` sessions \
-                     (transcript is sandbox-side); reading the existing log",
+                    "pillbox: note: live event tailing isn't available for `{}` sessions; \
+                     reading the existing log",
                     s.backend
                 );
                 None

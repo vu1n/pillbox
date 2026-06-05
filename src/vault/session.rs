@@ -43,23 +43,6 @@ struct OAuthMount {
     _lease: SandboxLease,
 }
 
-/// What [`VaultSession::direct_extras`] returns: env vars to set on the
-/// spawned agent + OAuth stub files to lay down before spawn. Symmetric
-/// to the data behind `docker_extras`, just shaped for in-process exec.
-pub(crate) struct DirectVaultExtras {
-    pub(crate) env: Vec<(String, String)>,
-    pub(crate) oauth_stub_writes: Vec<DirectOAuthStub>,
-}
-
-/// One stub-file overwrite the direct-exec caller must perform before
-/// spawning the agent: copy `stub_source`'s contents over
-/// `$HOME/<creds_rel>`, replacing the real OAuth credentials we
-/// materialized into the sandbox HOME earlier.
-pub(crate) struct DirectOAuthStub {
-    pub(crate) creds_rel: PathBuf,
-    pub(crate) stub_source: PathBuf,
-}
-
 pub(crate) struct VaultSession {
     // Drop order matters — see module doc. `api_key_leases` and
     // `oauth_mounts` both hold `SandboxLease`s that remove their entries
@@ -285,52 +268,6 @@ impl VaultSession {
 
     pub(crate) fn ca_cert_path(&self) -> &Path {
         &self.ca_cert_path
-    }
-
-    /// Direct-exec sibling of [`Self::docker_extras`] for environments
-    /// where the agent runs in the **same process tree** as the vault
-    /// session (e.g. inside an e2b sandbox via `dispatch_vault_stdin_direct`).
-    /// Returns the env vars to layer onto the spawned agent and the
-    /// stub-file → cred-path copies the caller must perform before
-    /// spawning (overwriting the materialized real OAuth with the stub).
-    ///
-    ///   - `NODE_EXTRA_CA_CERTS` points at the session's CA on disk
-    ///     directly (no docker bind mount).
-    ///   - `HTTPS_PROXY` / `HTTP_PROXY` point at `127.0.0.1:<port>` — same
-    ///     host, so no `host.docker.internal` indirection.
-    ///   - Each `oauth_stub_writes` entry tells the caller to overwrite
-    ///     `$HOME/<creds_rel>` with `stub_source`'s bytes; the stub keeps
-    ///     the file shape the agent expects while the proxy holds the
-    ///     real value in memory.
-    pub(crate) fn direct_extras(&self) -> DirectVaultExtras {
-        let proxy = format!("http://127.0.0.1:{}", self.listen_addr.port());
-        let env = vec![
-            (
-                "NODE_EXTRA_CA_CERTS".into(),
-                self.ca_cert_path.display().to_string(),
-            ),
-            ("HTTPS_PROXY".into(), proxy.clone()),
-            ("HTTP_PROXY".into(), proxy),
-            // Node 22+'s default fetch (undici) IGNORES `HTTPS_PROXY` unless
-            // the runtime is told to honor env. Without this an agent's
-            // outbound `fetch` bypasses the proxy → real server sees the
-            // stub token → 401. (Recognized by Node 24+; older Nodes
-            // ignore it harmlessly. Agents using non-fetch clients that
-            // already read `HTTPS_PROXY` get the same behavior twice.)
-            ("NODE_USE_ENV_PROXY".into(), "1".into()),
-        ];
-        let oauth_stub_writes = self
-            .oauth_mounts
-            .iter()
-            .map(|m| DirectOAuthStub {
-                creds_rel: m.creds_path.clone(),
-                stub_source: m.stub_file.path().to_path_buf(),
-            })
-            .collect();
-        DirectVaultExtras {
-            env,
-            oauth_stub_writes,
-        }
     }
 }
 

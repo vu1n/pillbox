@@ -1,4 +1,4 @@
-//! Session registry — durable handles for `pillbox run --remote --detach`
+//! Session registry — durable handles for `pillbox run --detach`
 //! runs that the user wants to reattach to later.
 //!
 //! ## Storage
@@ -15,12 +15,10 @@
 //!
 //! ## Backend coverage
 //!
-//! `e2b`, `docker`, and `ssh` backends all mint sessions today. They
+//! The local `docker` and `libkrun` backends mint sessions today. They
 //! reattach through the same shared attach transport (frame protocol +
-//! pump): e2b over a raw-pty `pty-relay` bridged through the Node helper,
-//! docker over `docker exec`, ssh over an ssh-exec'd `pty-relay` to a
-//! persistent remote pty-host. The
-//! `backend` string drives dispatch in `commands::session`.
+//! pump): docker over `docker exec`, libkrun over the persistent attach
+//! socket. The `backend` string drives dispatch in `commands::session`.
 //!
 //! ## Threat model
 //!
@@ -29,15 +27,14 @@
 //! Co-tenants on the same machine cannot read or write them.
 //!
 //! The fields, by sensitivity:
-//!   - `sandbox_id` (e.g. `sb_xxx`): an opaque E2B resource handle.
-//!     Not a secret in isolation — leaking it does **not** grant
-//!     access without a valid `E2B_API_KEY`. Treated as
+//!   - `sandbox_id`: an opaque local backend handle (a Docker container
+//!     id, or a libkrun attach-socket path + VMM pid). Not a secret;
 //!     low-confidentiality config, not credential material.
 //!   - `attached_pid`: a local process id; not a secret. See the
 //!     hardening in `main.rs::session_detach` for why we still
 //!     validate it (pid 0/1/-1/self are rejected, ESRCH is treated
 //!     as already-detached).
-//!   - `remote`, `backend`, `agent_id`, `started_at`, `label`:
+//!   - `backend`, `agent_id`, `started_at`, `label`:
 //!     user-supplied or derived metadata.
 //!
 //! No credentials live in this file. The vault path stays where
@@ -126,15 +123,11 @@ impl IdRegistry for SessionRegistry {
 /// still read older sessions. Dispatch goes through [`Backend::parse`]
 /// so callers can match on a typed enum without resurrecting the
 /// stringly path each time.
-pub(crate) const BACKEND_E2B: &str = "e2b";
-pub(crate) const BACKEND_SSH: &str = "ssh";
 pub(crate) const BACKEND_DOCKER: &str = "docker";
-pub(crate) const BACKEND_REMOTE_DOCKER: &str = "remote-docker";
 pub(crate) const BACKEND_LIBKRUN: &str = "libkrun";
 
 /// The `remote` field value a *local* Docker session records — a display label
-/// (it has no registered remote). Placement is carried by [`Backend`] (local
-/// `Docker` vs `RemoteDocker`), so this is never a dispatch key.
+/// (it has no registered remote). Carried for display only; never a dispatch key.
 pub(crate) const LOCAL_REMOTE: &str = "local";
 
 /// Typed view of the on-disk `backend` string. Returned by
@@ -143,18 +136,10 @@ pub(crate) const LOCAL_REMOTE: &str = "local";
 /// label in the error so the user can grep for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Backend {
-    E2b,
-    Ssh,
     /// Local Docker — a detached `pillbox run --detach` against the host
     /// daemon. `sandbox_id` is the container id; attach/rm act on the local
-    /// daemon directly (no remote to re-resolve).
+    /// daemon directly.
     Docker,
-    /// Remote Docker — a `docker://` detached session. `sandbox_id` is the
-    /// container id on the remote daemon; attach/rm re-resolve the endpoint
-    /// from `remote` (a registered name or inline `docker://` URL). A distinct
-    /// variant (not `Docker` + a "is the remote field 'local'?" check) so the
-    /// placement is typed and a remote literally named "local" can't misroute.
-    RemoteDocker,
     /// Local libkrun microVM — a detached `pillbox run --detach` (feature-gated
     /// `libkrun`). `sandbox_id` carries the persistent attach socket path + the
     /// VMM child PID; attach dials that socket, rm kills the child + scrubs the
@@ -166,10 +151,7 @@ pub(crate) enum Backend {
 impl Backend {
     pub(crate) fn parse(label: &str) -> Option<Self> {
         match label {
-            BACKEND_E2B => Some(Backend::E2b),
-            BACKEND_SSH => Some(Backend::Ssh),
             BACKEND_DOCKER => Some(Backend::Docker),
-            BACKEND_REMOTE_DOCKER => Some(Backend::RemoteDocker),
             BACKEND_LIBKRUN => Some(Backend::Libkrun),
             _ => None,
         }
@@ -184,24 +166,20 @@ pub(crate) struct Session {
     /// Short hex id — 12 chars. Used as the registry filename and as
     /// the `pillbox session attach <id>` argument.
     pub(crate) id: String,
-    /// Optional human label (`pillbox run --remote NAME --detach --label foo`).
+    /// Optional human label (`pillbox run --detach --label foo`).
     /// Surfaced in `session list` next to the id.
     #[serde(default)]
     pub(crate) label: Option<String>,
-    /// Name of the remote this session lives on (resolved via the
-    /// remote registry on reattach so per-host details aren't stale).
+    /// Display label for where this session lives (always `local` today).
     pub(crate) remote: String,
-    /// Backend kind — one of [`BACKEND_E2B`], [`BACKEND_SSH`],
-    /// [`BACKEND_DOCKER`].
+    /// Backend kind — one of [`BACKEND_DOCKER`], [`BACKEND_LIBKRUN`].
     pub(crate) backend: String,
     /// Opaque handle the backend uses to find this session again.
-    /// For E2B: the sandbox id (`sb_xxx`). For Docker: the container id.
-    /// For SSH: the remote pty-host's unix socket path (the per-session
-    /// `/tmp/pillbox-attach-<id>.sock`).
+    /// For Docker: the container id. For libkrun: the persistent attach
+    /// socket path + VMM child PID.
     pub(crate) sandbox_id: String,
-    /// PTY process id inside the backend. For E2B: the pid returned by
-    /// `sandbox.pty.create`. For Docker / SSH: 0 — the relay finds the
-    /// pty-host by socket path, not pid.
+    /// PTY process id inside the backend. For Docker: 0 — the relay finds
+    /// the pty-host by socket path, not pid.
     #[serde(default)]
     pub(crate) pty_pid: i64,
     /// Agent that's running inside (`claude` | `codex` | …).
@@ -300,7 +278,7 @@ impl Session {
             id: "abc123def456".to_string(),
             label: Some("test".to_string()),
             remote: "test-remote".to_string(),
-            backend: BACKEND_E2B.to_string(),
+            backend: BACKEND_DOCKER.to_string(),
             sandbox_id: "sb_test".to_string(),
             pty_pid: 0,
             agent_id: "claude".to_string(),
@@ -679,12 +657,12 @@ mod tests {
     fn write_and_read_round_trip() {
         with_isolated_home("session-rt", || {
             let g = pillbox::global();
-            let s = make("vps1", BACKEND_E2B);
+            let s = make("vps1", BACKEND_DOCKER);
             write(&g, &s).unwrap();
             let back = read(&g, &s.id).unwrap().expect("present");
             assert_eq!(back.id, s.id);
             assert_eq!(back.remote, "vps1");
-            assert_eq!(back.backend, BACKEND_E2B);
+            assert_eq!(back.backend, BACKEND_DOCKER);
             assert_eq!(back.pty_pid, 42);
             assert!(back.attached_pid.is_none());
         });
@@ -694,9 +672,9 @@ mod tests {
     fn list_is_stable_by_started_at() {
         with_isolated_home("session-list", || {
             let g = pillbox::global();
-            let mut a = make("r", BACKEND_E2B);
+            let mut a = make("r", BACKEND_DOCKER);
             a.started_at = "2026-01-01T00:00:00Z".into();
-            let mut b = make("r", BACKEND_E2B);
+            let mut b = make("r", BACKEND_DOCKER);
             b.started_at = "2026-02-01T00:00:00Z".into();
             write(&g, &b).unwrap(); // write newer first
             write(&g, &a).unwrap();
@@ -711,7 +689,7 @@ mod tests {
     fn resolve_accepts_prefix() {
         with_isolated_home("session-resolve", || {
             let g = pillbox::global();
-            let s = make("r", BACKEND_E2B);
+            let s = make("r", BACKEND_DOCKER);
             write(&g, &s).unwrap();
             let prefix = &s.id[..6];
             let found = resolve(&g, prefix).unwrap();
@@ -723,7 +701,7 @@ mod tests {
     fn resolve_rejects_short_prefix() {
         with_isolated_home("session-short", || {
             let g = pillbox::global();
-            let s = make("r", BACKEND_E2B);
+            let s = make("r", BACKEND_DOCKER);
             write(&g, &s).unwrap();
             let err = resolve(&g, "abc").unwrap_err().to_string();
             assert!(err.contains("too short"), "got: {err}");
@@ -736,9 +714,9 @@ mod tests {
             let g = pillbox::global();
             // Mint two ids that collide on a known prefix to make the test
             // deterministic.
-            let mut a = make("r", BACKEND_E2B);
+            let mut a = make("r", BACKEND_DOCKER);
             a.id = "abcdef000001".into();
-            let mut b = make("r", BACKEND_E2B);
+            let mut b = make("r", BACKEND_DOCKER);
             b.id = "abcdef000002".into();
             write(&g, &a).unwrap();
             write(&g, &b).unwrap();
@@ -755,7 +733,7 @@ mod tests {
     fn mark_attached_then_detached_roundtrips() {
         with_isolated_home("session-attach", || {
             let g = pillbox::global();
-            let s = make("r", BACKEND_E2B);
+            let s = make("r", BACKEND_DOCKER);
             write(&g, &s).unwrap();
             mark_attached(&g, &s.id, 12345).unwrap();
             assert_eq!(read(&g, &s.id).unwrap().unwrap().attached_pid, Some(12345));
@@ -768,7 +746,7 @@ mod tests {
     fn delete_is_idempotent() {
         with_isolated_home("session-del", || {
             let g = pillbox::global();
-            let s = make("r", BACKEND_E2B);
+            let s = make("r", BACKEND_DOCKER);
             write(&g, &s).unwrap();
             delete(&g, &s.id).unwrap();
             assert!(read(&g, &s.id).unwrap().is_none());
@@ -785,7 +763,7 @@ mod tests {
         // in place by checking mtime stability.
         with_isolated_home("session-detach-noop", || {
             let g = pillbox::global();
-            let s = make("r", BACKEND_E2B);
+            let s = make("r", BACKEND_DOCKER);
             write(&g, &s).unwrap();
             let path = SessionRegistry::path_read(&g, &s.id);
             let mtime_a = fs::metadata(&path).unwrap().modified().unwrap();
@@ -798,17 +776,15 @@ mod tests {
 
     #[test]
     fn known_backend_labels_are_constants() {
-        let _: &str = BACKEND_E2B;
-        let _: &str = BACKEND_SSH;
         let _: &str = BACKEND_DOCKER;
+        let _: &str = BACKEND_LIBKRUN;
         let _: &str = SESSIONS_DIR;
     }
 
     #[test]
     fn backend_parse_round_trips_known_labels() {
-        assert_eq!(Backend::parse(BACKEND_E2B), Some(Backend::E2b));
-        assert_eq!(Backend::parse(BACKEND_SSH), Some(Backend::Ssh));
         assert_eq!(Backend::parse(BACKEND_DOCKER), Some(Backend::Docker));
+        assert_eq!(Backend::parse(BACKEND_LIBKRUN), Some(Backend::Libkrun));
         assert_eq!(Backend::parse("nope"), None);
     }
 

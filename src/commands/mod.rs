@@ -9,7 +9,6 @@
 pub(crate) mod auth;
 pub(crate) mod bookmark;
 pub(crate) mod env;
-pub(crate) mod remote;
 pub(crate) mod sandbox;
 pub(crate) mod secret;
 pub(crate) mod session;

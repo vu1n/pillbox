@@ -13,7 +13,7 @@ use crate::cli::{DoneStatus, SessionAction};
 use crate::docker::DockerEndpoint;
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
-use crate::{events, remote, sandbox, session};
+use crate::{events, sandbox, session};
 
 mod grader;
 mod stream;
@@ -77,17 +77,14 @@ fn detached_tailer_alive(resolved: &Pillbox, s: &session::Session) -> bool {
 }
 
 /// A [`SandboxHttp`](sandbox::http::SandboxHttp) to a server-mode session's
-/// in-sandbox HTTP server — `docker exec curl` for a (local/remote) docker
-/// session, an HTTP-over-vsock client for a libkrun one. The dispatch axis for
+/// in-sandbox HTTP server — `docker exec curl` for a local docker session, an
+/// HTTP-over-vsock client for a libkrun one. The dispatch axis for
 /// `session send`/`subscribe`/`watch` on any `Server`-integration agent
 /// (opencode's `serve`, or the codex `appserver-host` bridge). The libkrun
 /// transport is port-free (the guest's vsock forward already targets the right
 /// in-guest port), so it serves both; the `port` only matters for the docker
 /// `curl` variant, which codex-serve never uses (libkrun-only).
-fn server_http(
-    resolved: &Pillbox,
-    s: &session::Session,
-) -> Result<Box<dyn sandbox::http::SandboxHttp>> {
+fn server_http(s: &session::Session) -> Result<Box<dyn sandbox::http::SandboxHttp>> {
     let port = sandbox::opencode::SERVE_PORT;
     match session::Backend::parse(&s.backend) {
         Some(session::Backend::Docker) => Ok(Box::new(sandbox::http::DockerHttp::new(
@@ -95,15 +92,6 @@ fn server_http(
             s.sandbox_id.clone(),
             port,
         ))),
-        Some(session::Backend::RemoteDocker) => {
-            let remote = remote::resolve_run_target(resolved, &s.remote)?;
-            let endpoint = sandbox::remote_docker::endpoint_for(&remote)?;
-            Ok(Box::new(sandbox::http::DockerHttp::new(
-                endpoint,
-                s.sandbox_id.clone(),
-                port,
-            )))
-        }
         Some(session::Backend::Libkrun) => libkrun_opencode_http(s),
         _ => Err(PillboxError::usage(
             "session",
@@ -417,7 +405,7 @@ fn session_list(resolved: &Pillbox, json: bool) -> Result<()> {
     if entries.is_empty() {
         println!("(no sessions in `{}`)", resolved.display_name());
         println!();
-        println!("Start one with: pillbox run --remote NAME --detach");
+        println!("Start one with: pillbox run --detach");
         return Ok(());
     }
     println!(
@@ -586,39 +574,7 @@ fn session_attach(resolved: &Pillbox, id: &str) -> Result<()> {
         .into());
     }
     match session::Backend::parse(&s.backend) {
-        // Local Docker attaches to the host daemon directly (no remote);
-        // docker:// re-resolves the endpoint from `remote`.
         Some(session::Backend::Docker) => sandbox::local_docker::reattach(resolved, &s),
-        Some(session::Backend::RemoteDocker) => {
-            let remote = remote::resolve_run_target(resolved, &s.remote)?;
-            sandbox::remote_docker::reattach(resolved, &remote, &s)
-        }
-        Some(session::Backend::E2b) => {
-            let remote = remote::read(resolved, &s.remote)?.ok_or_else(|| {
-                PillboxError::runtime(
-                    "session attach",
-                    format!(
-                        "remote `{}` is no longer registered — session record is orphaned",
-                        s.remote
-                    ),
-                )
-                .with_next(format!("pillbox session rm {}", s.id))
-            })?;
-            sandbox::remote_e2b::reattach(resolved, &remote, &s)
-        }
-        Some(session::Backend::Ssh) => {
-            let remote = remote::read(resolved, &s.remote)?.ok_or_else(|| {
-                PillboxError::runtime(
-                    "session attach",
-                    format!(
-                        "remote `{}` is no longer registered — session record is orphaned",
-                        s.remote
-                    ),
-                )
-                .with_next(format!("pillbox session rm {}", s.id))
-            })?;
-            sandbox::remote_ssh::reattach(resolved, &remote, &s)
-        }
         Some(session::Backend::Libkrun) => libkrun_reattach(resolved, &s),
         None => Err(PillboxError::config(
             "session attach",
@@ -744,22 +700,6 @@ fn session_rm(resolved: &Pillbox, id: &str) -> Result<()> {
     let s = session::resolve(resolved, id)?;
     match session::Backend::parse(&s.backend) {
         Some(session::Backend::Docker) => sandbox::local_docker::kill_session(resolved, &s),
-        Some(session::Backend::RemoteDocker) => {
-            // `.ok()` (not `?`): a deregistered remote must not strand the
-            // local record — kill_session drops it either way.
-            let remote = remote::resolve_run_target(resolved, &s.remote).ok();
-            sandbox::remote_docker::kill_session(resolved, remote.as_ref(), &s)
-        }
-        Some(session::Backend::E2b) => sandbox::remote_e2b::kill_session(resolved, &s),
-        Some(session::Backend::Ssh) => {
-            // ssh teardown needs the registered remote to reach the host, but
-            // a missing remote must NOT strand the local record. Pass it
-            // through as Option and let kill_session drop the record either
-            // way (warning if it couldn't reach the host) — mirrors e2b's
-            // "drop the record regardless".
-            let remote = remote::read(resolved, &s.remote)?;
-            sandbox::remote_ssh::kill_session(resolved, remote.as_ref(), &s)
-        }
         Some(session::Backend::Libkrun) => libkrun_kill_session(resolved, &s),
         None => Err(PillboxError::config(
             "session rm",
@@ -795,7 +735,7 @@ fn session_send(resolved: &Pillbox, id: &str, text: &str) -> Result<()> {
     // only the route shape differs (opencode's prompt_async vs the codex bridge's
     // /turn, which already holds the thread id).
     if s.integration() == Integration::Server {
-        let http = server_http(resolved, &s)?;
+        let http = server_http(&s)?;
         if s.agent_id == crate::agents::CODEX_SERVE.id {
             sandbox::appserver_client::send_turn(&*http, text)?;
         } else {
@@ -816,15 +756,7 @@ fn session_send(resolved: &Pillbox, id: &str, text: &str) -> Result<()> {
             eprintln!("pillbox: sent {} byte(s) to session `{}`", text.len(), s.id);
             Ok(())
         }
-        Some(session::Backend::RemoteDocker) => {
-            let remote = remote::resolve_run_target(resolved, &s.remote)?;
-            let endpoint = sandbox::remote_docker::endpoint_for(&remote)?;
-            sandbox::remote_docker::send_input(&endpoint, &s.sandbox_id, text.as_bytes())?;
-            eprintln!("pillbox: sent {} byte(s) to session `{}`", text.len(), s.id);
-            Ok(())
-        }
-        // e2b/ssh nest the agent in a remote-host container; the same relay-exec
-        // drive extends there (mirroring their reattach transport), not wired yet.
+        // A libkrun PTY session's drive transport isn't wired for `send` yet.
         Some(_) => Err(PillboxError::usage(
             "session send",
             format!(

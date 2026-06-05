@@ -234,54 +234,6 @@ pub(crate) enum AuthAction {
     },
 }
 
-#[derive(Subcommand, Debug)]
-pub(crate) enum RemoteAction {
-    /// Register a remote for use with `pillbox run --remote NAME`.
-    ///
-    /// Two positional args: `NAME URL`, matching `git remote add`. The
-    /// long `--url` spelling is accepted as a hidden alias so scripts
-    /// written against earlier drafts of this PR keep working.
-    Add {
-        /// Display name. Used as `pillbox run --remote NAME`.
-        name: String,
-        /// Remote URL: `docker://[user@]host[:port]` (remote Docker daemon
-        /// over SSH), `ssh://user@host[:port]` (VPS over openssh), or
-        /// `e2b://TEMPLATE_ID` (E2B managed sandbox). Either positional or
-        /// via `--url`; exactly one form is required.
-        url: Option<String>,
-        /// Hidden alias for the positional URL — see the command docs.
-        #[arg(long = "url", value_name = "URL", hide = true, conflicts_with = "url")]
-        url_flag: Option<String>,
-        /// Default agent for runs against this remote (overrides the
-        /// pillbox's own `agent` field). Optional.
-        #[arg(long, value_name = "AGENT")]
-        agent: Option<String>,
-        /// Fail if the remote already exists in the chosen scope.
-        #[arg(long)]
-        if_not_exists: bool,
-        /// Write to the global pillbox instead of the resolved one.
-        #[arg(long)]
-        global: bool,
-    },
-    /// List remotes visible from the current pillbox (project + global).
-    List {
-        #[arg(long)]
-        json: bool,
-    },
-    /// Remove a registered remote from the resolved scope (or `--global`).
-    Rm {
-        name: String,
-        #[arg(long)]
-        global: bool,
-    },
-    /// Show details for one remote (with inheritance).
-    Info {
-        name: String,
-        #[arg(long)]
-        json: bool,
-    },
-}
-
 /// Terminal status passed to `pillbox session done <id>`. Maps to the
 /// `session.completed` / `session.failed` event types in `events.rs`.
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -312,7 +264,7 @@ pub(crate) enum SessionAction {
         #[arg(long)]
         json: bool,
     },
-    /// Reattach to a detached session. Streams the remote PTY back
+    /// Reattach to a detached session. Streams the session's PTY back
     /// into the current terminal. Detach again with Ctrl-A + D or by
     /// running `pillbox session detach <id>` from another shell.
     Attach { id: String },

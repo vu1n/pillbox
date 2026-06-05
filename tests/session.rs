@@ -1,11 +1,8 @@
 //! End-to-end tests for `pillbox session {list,info,attach,detach,rm}`
-//! and the `--detach` flag on `pillbox run --remote`.
+//! and the `--detach` flag on `pillbox run`.
 //!
-//! Live E2B isn't reachable from CI, so we cover the registry surface
-//! (list / info / detach / rm) by planting a session TOML on disk and
-//! invoking the real binary against it. The attach / kill helper
-//! subprocess paths are exercised by the unit-test suite in
-//! `src/sandbox/remote_e2b.rs`.
+//! We cover the registry surface (list / info / detach / rm) by planting
+//! a session TOML on disk and invoking the real binary against it.
 
 mod common;
 
@@ -369,9 +366,7 @@ fn run_ttl_rejects_malformed_duration() {
     let out = run(
         home.path(),
         cwd.path(),
-        &[
-            "run", "--remote", "nope", "--detach", "--ttl", "5y", "--", "ignored",
-        ],
+        &["run", "--detach", "--ttl", "5y", "--", "ignored"],
     );
     assert!(!out.status.success(), "5y unit should fail");
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -685,49 +680,6 @@ fn rm_unknown_session_errors() {
     assert!(!out.status.success(), "should fail on unknown id");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("no session matches"), "got: {stderr}");
-}
-
-#[test]
-fn run_remote_detach_requires_s3_workspace() {
-    // ssh --detach is supported now (the pty-host runs on the remote), but
-    // ALL remote runs require an S3-shaped workspace backend so the remote
-    // restores from the same bucket. A default (local-rustic) pillbox must be
-    // rejected loudly at that gate rather than silently half-detaching.
-    let home = TempDir::new().unwrap();
-    let cwd = TempDir::new().unwrap();
-    let out = run(home.path(), cwd.path(), &["new", "--name", "proj"]);
-    assert_ok(&out, "new");
-    let out = run(
-        home.path(),
-        cwd.path(),
-        &["remote", "add", "vps", "ssh://a@h"],
-    );
-    assert_ok(&out, "remote add ssh");
-
-    let out = run(
-        home.path(),
-        cwd.path(),
-        &["run", "--remote", "vps", "--detach"],
-    );
-    assert!(
-        !out.status.success(),
-        "ssh+detach on a local-rustic workspace should fail loudly"
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("S3-shaped workspace"), "got: {stderr}");
-}
-
-#[test]
-fn detach_requires_remote() {
-    // `--detach` without `--remote` is meaningless; clap enforces the
-    // requires = "remote" constraint at parse time.
-    let home = TempDir::new().unwrap();
-    let cwd = TempDir::new().unwrap();
-    let out = run(home.path(), cwd.path(), &["run", "--detach"]);
-    assert!(
-        !out.status.success(),
-        "--detach without --remote should fail"
-    );
 }
 
 #[test]

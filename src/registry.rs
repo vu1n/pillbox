@@ -37,7 +37,6 @@
 //!   helpers simply don't exist for sessions.
 
 use std::{
-    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -47,7 +46,7 @@ use rand::RngCore;
 
 use crate::errors::PillboxError;
 use crate::paths::{validate_name, write_private_file};
-use crate::pillbox::{Pillbox, Scope};
+use crate::pillbox::Pillbox;
 
 /// One on-disk file under a pillbox-scoped registry directory.
 ///
@@ -170,87 +169,6 @@ pub(crate) fn read_inherited<R: InheritedRegistry>(
         }
     }
     Ok(None)
-}
-
-/// One entry in the merged listing — the record plus where it came
-/// from. Project entries shadow global ones; `from_project` tells
-/// `list` callers whether to print `[project]` or `[global]`.
-#[derive(Debug, Clone)]
-pub(crate) struct MergedEntry<T> {
-    /// Logical name of the record (filename minus the registry's
-    /// suffix). Exposed for callers that want to render the name
-    /// without poking inside the typed `record`; the registry
-    /// integration tests rely on it. Not all release-build call sites
-    /// dereference it today — kept on the struct because the
-    /// alternative is forcing every caller to know the per-record
-    /// naming convention.
-    #[allow(dead_code)]
-    pub(crate) name: String,
-    pub(crate) record: T,
-    pub(crate) scope: String,
-    pub(crate) from_project: bool,
-}
-
-/// All records visible from `resolved`, deduplicated by name with
-/// project entries shadowing global ones. Names without a matching
-/// filename pattern (e.g. sidecar `.meta.json` files for secrets) are
-/// filtered by the consumer's `filename`/`name_from_file` impl — see
-/// the `MERGED_NAME_FILTER` discussion below.
-///
-/// **Filename → name decoding**: the trait's `filename(name)` is a
-/// one-way function. We invert it heuristically: a record file's name
-/// is its full filename minus any extension produced by `filename(""
-/// )` — but that's fragile. Instead we accept any filename and let the
-/// consumer's `parse` reject mismatches at read time. The merged-entry
-/// `name` field is the raw filename with the suffix stripped if the
-/// suffix is statically known (`.toml`); secrets / env bundles use
-/// the raw filename because their `filename(name)` is just `name`.
-pub(crate) fn list_merged<R: InheritedRegistry>(
-    resolved: &Pillbox,
-) -> Result<Vec<MergedEntry<R::Record>>> {
-    let mut map: BTreeMap<String, MergedEntry<R::Record>> = BTreeMap::new();
-    for pb in resolved.read_chain() {
-        let dir = R::dir_read(&pb);
-        if !dir.exists() {
-            continue;
-        }
-        let from_project = matches!(pb.scope, Scope::Project { .. });
-        for entry in fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
-            let entry = entry?;
-            if !entry.file_type()?.is_file() {
-                continue;
-            }
-            let fname = match entry.file_name().into_string() {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            // Skip files that don't match the registry's filename
-            // shape. We discover the suffix by probing `filename("")`
-            // — every consumer either appends nothing or a constant
-            // suffix (`.toml`), so this matches the live convention.
-            let Some(name) = decode_name::<R>(&fname) else {
-                continue;
-            };
-            if map.contains_key(&name) {
-                // Already populated from the project (earlier in
-                // read_chain) — global must not clobber.
-                continue;
-            }
-            let raw = fs::read_to_string(entry.path())
-                .with_context(|| format!("read {}", entry.path().display()))?;
-            let record = R::parse(&raw, &entry.path())?;
-            map.insert(
-                name.clone(),
-                MergedEntry {
-                    name,
-                    record,
-                    scope: pb.display_name().to_string(),
-                    from_project,
-                },
-            );
-        }
-    }
-    Ok(map.into_values().collect())
 }
 
 /// Inverse of `R::filename`. Returns `None` for filenames that don't
@@ -415,40 +333,6 @@ mod tests {
             assert!(Toy::read_one(&g, "alpha").unwrap().is_none());
             // Idempotent.
             assert!(!Toy::delete(&g, "alpha").unwrap());
-        });
-    }
-
-    #[test]
-    fn list_merged_dedupes_with_project_shadowing_global() {
-        with_isolated_home("registry-merged", || {
-            let tmp = tempfile::tempdir().unwrap();
-            let saved = std::env::current_dir().ok();
-            std::env::set_current_dir(tmp.path()).unwrap();
-            pillbox::new(
-                Some("proj".into()),
-                None,
-                pillbox::NewWorkspaceArgs::default(),
-            )
-            .unwrap();
-            let proj = Pillbox::resolve(None).unwrap();
-            let g = pillbox::global();
-            write_record::<Toy>(&g, "g_only", b"g").unwrap();
-            write_record::<Toy>(&proj, "p_only", b"p").unwrap();
-            write_record::<Toy>(&g, "both", b"g-both").unwrap();
-            write_record::<Toy>(&proj, "both", b"p-both").unwrap();
-
-            let entries = list_merged::<Toy>(&proj).unwrap();
-            let g_only = entries.iter().find(|e| e.name == "g_only").unwrap();
-            let p_only = entries.iter().find(|e| e.name == "p_only").unwrap();
-            let both = entries.iter().find(|e| e.name == "both").unwrap();
-            assert!(!g_only.from_project);
-            assert!(p_only.from_project);
-            assert!(both.from_project, "project shadows global");
-            assert_eq!(both.record, "p-both");
-
-            if let Some(c) = saved {
-                let _ = std::env::set_current_dir(c);
-            }
         });
     }
 

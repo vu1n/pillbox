@@ -49,11 +49,8 @@ use crate::events::{emit_genai_call_span, GenAiCallSpan};
 /// — the attribute is omitted from emitted spans, not emitted as
 /// empty.
 ///
-/// Threaded through [`ServerConfig`] / [`super::VaultSession::start`]
-/// and `#[serde(flatten)]`'d into
-/// [`crate::sandbox::remote_ssh::VaultStdinBlob`] so the wire shape
-/// gains a new field automatically when [`RunContext`] does, without
-/// per-launcher / per-dispatcher updates.
+/// Threaded through [`ServerConfig`] / [`super::VaultSession::start`] so
+/// the run context reaches the vault session without per-launcher updates.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct RunContext {
     /// Pillbox-run session id. When `Some`, gen_ai spans share a
@@ -72,20 +69,6 @@ pub struct RunContext {
     /// consumers group runs by project.
     #[serde(default)]
     pub workspace_id: Option<String>,
-}
-
-impl RunContext {
-    /// Wire string for the `pillbox.mode` attribute, derived from the
-    /// `--detach` flag. Centralized here so launchers across all
-    /// sandbox backends share the same vocabulary (no `"detach"` vs
-    /// `"detached"` drift).
-    pub(crate) fn mode_for(detach: bool) -> &'static str {
-        if detach {
-            "detached"
-        } else {
-            "interactive"
-        }
-    }
 }
 
 /// Configuration for [`Server::start`].

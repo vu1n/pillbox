@@ -37,7 +37,6 @@ mod memory;
 mod paths;
 mod pillbox;
 mod registry;
-mod remote;
 mod sandbox;
 mod sandboxes;
 mod secrets;
@@ -50,8 +49,8 @@ mod workspace;
 
 use agents::RunOpts;
 use cli::{
-    AuthAction, BookmarkAction, EnvAction, RemoteAction, SandboxAction, SecretAction,
-    SessionAction, SnapshotAction, VaultAction, WorkspaceAction,
+    AuthAction, BookmarkAction, EnvAction, SandboxAction, SecretAction, SessionAction,
+    SnapshotAction, VaultAction, WorkspaceAction,
 };
 use errors::PillboxError;
 use pillbox::Pillbox;
@@ -169,8 +168,7 @@ enum Command {
         /// http:// or https://. `localhost` / `127.0.0.1` are
         /// rewritten to `host.docker.internal` so the sandbox can
         /// reach host-bound servers. Repeatable.
-        /// Not supported with `--remote`.
-        #[arg(long = "mcp", value_name = "NAME=URL", conflicts_with = "remote")]
+        #[arg(long = "mcp", value_name = "NAME=URL")]
         mcps: Vec<agents::McpAttachment>,
         /// Attach a bearer token to a `--mcp NAME=URL` from the
         /// pillbox secret store. NAME must match a `--mcp` entry;
@@ -180,55 +178,13 @@ enum Command {
         /// it in an env var and references it via
         /// `bearer_token_env_var`. Token values never land in argv
         /// or shell history. Repeatable.
-        #[arg(
-            long = "mcp-token",
-            value_name = "NAME=SECRET_NAME",
-            conflicts_with = "remote"
-        )]
+        #[arg(long = "mcp-token", value_name = "NAME=SECRET_NAME")]
         mcp_tokens: Vec<agents::McpTokenSpec>,
-        /// Run on a remote: either a registered name (`pillbox remote add
-        /// NAME …`) or an inline URL — `docker://[user@]host[:port]`,
-        /// `ssh://user@host[:port]`, or `e2b://TEMPLATE_ID`. A value
-        /// containing `://` is treated as an inline URL (no `remote add`
-        /// needed). The agent launches inside a pillbox sandbox on the
-        /// remote; the local terminal proxies the remote PTY.
-        #[arg(long, value_name = "NAME|URL", conflicts_with_all = ["vault_stdin", "vault_stdin_direct"])]
-        remote: Option<String>,
-        /// Hidden: invoked by the remote side of `pillbox run --remote`.
-        /// Reads a [`crate::sandbox::remote_ssh::VaultStdinBlob`] from
-        /// stdin and runs the agent locally with the pre-resolved
-        /// state. The SSH / VPS path: assumes Docker is available on the
-        /// remote and the agent is already `pillbox auth login`'d there;
-        /// runs the agent inside a nested runner-image container. Not for
-        /// direct user consumption — the protocol is internal.
-        #[arg(
-            long = "vault-stdin",
-            hide = true,
-            conflicts_with = "vault_stdin_direct"
-        )]
-        vault_stdin: bool,
-        /// Hidden: sandbox-side sibling of `--vault-stdin` for environments
-        /// that already ARE an isolation boundary (e2b sandboxes). Reads
-        /// the same blob, materializes the forwarded agent auth into
-        /// `$HOME`, hydrates the workspace, and `exec`s the agent
-        /// DIRECTLY — no nested Docker, no pre-existing login required.
-        /// Selected by the e2b helper's wrapper.
-        #[arg(long = "vault-stdin-direct", hide = true)]
-        vault_stdin_direct: bool,
-        /// Hidden: companion to `--vault-stdin` / `--vault-stdin-direct`.
-        /// When set, the blob is read from this file instead of stdin. The
-        /// ssh pty-host transport uses this so the child's stdin stays the
-        /// PTY (the inner `docker run -it` needs a TTY on stdin); the
-        /// launch path stages the blob to a remote temp file and points
-        /// here. Meaningful only with one of the two vault-stdin flags.
-        #[arg(long = "blob-file", value_name = "PATH", hide = true)]
-        blob_file: Option<PathBuf>,
         /// Start the agent and immediately return — keeps the session
         /// alive in the background. Reattach later with `pillbox session
-        /// attach <id>`. Works for local Docker, e2b:// remotes, and
-        /// ssh:// remotes (the remote pty-host outlives the launch ssh
-        /// session). (Local --detach doesn't support --vault: the proxy
-        /// can't outlive the CLI.)
+        /// attach <id>`. Local Docker / libkrun only today. (Local
+        /// --detach doesn't support --vault: the proxy can't outlive the
+        /// CLI; libkrun keeps the vault in the VMM child.)
         #[arg(long)]
         detach: bool,
         /// Human label for the detached session (surfaced in `session
@@ -284,10 +240,8 @@ enum Command {
         /// metadata; consumers reconcile.
         #[arg(long, value_name = "ID")]
         parent: Option<String>,
-        /// Start the run from a named snapshot bookmark. For remote
-        /// runs this selects the base snapshot hydrated into the remote
-        /// workspace. Without this flag, remote runs snapshot the current
-        /// workspace at launch time and fork from that.
+        /// Start the run from a named snapshot bookmark — restore it into
+        /// the workspace before launching the agent.
         #[arg(long = "from-bookmark", value_name = "NAME")]
         from_bookmark: Option<String>,
         /// Model for a server-integration agent (opencode): `PROVIDER/MODEL`,
@@ -302,12 +256,7 @@ enum Command {
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
     },
-    /// Manage remotes (docker:// daemons, SSH VPSes, E2B sandboxes) for `pillbox run --remote NAME`.
-    Remote {
-        #[command(subcommand)]
-        action: RemoteAction,
-    },
-    /// Manage detached sessions started with `pillbox run --remote NAME --detach`.
+    /// Manage detached sessions started with `pillbox run --detach`.
     Session {
         #[command(subcommand)]
         action: SessionAction,
@@ -506,7 +455,9 @@ fn main() -> ExitCode {
                 }
             }
             _ => {
-                eprintln!("pillbox __session-tailer: usage: <session_dir> <capture> <format> <sid>");
+                eprintln!(
+                    "pillbox __session-tailer: usage: <session_dir> <capture> <format> <sid>"
+                );
                 2
             }
         };
@@ -602,10 +553,6 @@ fn run(cli: Cli) -> Result<()> {
             memory,
             mcps,
             mcp_tokens,
-            remote,
-            vault_stdin,
-            vault_stdin_direct,
-            blob_file,
             detach,
             label,
             json,
@@ -618,22 +565,6 @@ fn run(cli: Cli) -> Result<()> {
             args,
         } => {
             let resolved = Pillbox::resolve(pillbox_arg)?;
-            // Hidden remote-side handlers. The blob carries everything we
-            // need (agent id, args, env, secrets, auth); the rest of `run`
-            // is ignored. clap rejects `--remote` + `--vault-stdin*` and
-            // the two vault-stdin variants from being combined.
-            if vault_stdin {
-                return crate::sandbox::remote_ssh::dispatch_vault_stdin(
-                    &resolved,
-                    blob_file.as_deref(),
-                );
-            }
-            if vault_stdin_direct {
-                return crate::sandbox::remote_ssh::dispatch_vault_stdin_direct(
-                    &resolved,
-                    blob_file.as_deref(),
-                );
-            }
             // `--events-webhook URL` sets the env var for the duration of
             // this process so every downstream `emit_session_event` call
             // (here and threaded through to the helper subprocess) picks
@@ -700,7 +631,6 @@ fn run(cli: Cli) -> Result<()> {
                     mcps,
                     mcp_tokens,
                     args,
-                    remote_name: remote,
                     detach,
                     label,
                     json,
@@ -710,10 +640,6 @@ fn run(cli: Cli) -> Result<()> {
                     egress_allow,
                 },
             )
-        }
-        Command::Remote { action } => {
-            let resolved = Pillbox::resolve(pillbox_arg)?;
-            commands::remote::dispatch(&resolved, action)
         }
         Command::Session { action } => {
             let resolved = Pillbox::resolve(pillbox_arg)?;
@@ -862,41 +788,11 @@ fn dispatch_run(resolved: &Pillbox, agent: Option<String>, mut opts: RunOpts) ->
         .into());
     }
 
-    // Resolve `--remote` (an inline URL or a registered name) to a record;
-    // the name-vs-URL policy lives in the canonical `remote` module.
-    let remote_record = opts
-        .remote_name
-        .as_deref()
-        .map(|target| remote::resolve_run_target(resolved, target))
-        .transpose()?;
+    // Nudge if Raindrop Workshop is installed but no OTLP endpoint is set, so a
+    // silent "no events" doesn't surprise the user.
+    crate::events::hint_workshop_if_unconfigured();
 
-    // Server-integration agents (opencode) run headless + are driven/read over
-    // their HTTP API by the LocalDocker server path; the remote backends only
-    // know the PTY launch, so `--remote` would silently pty-host `opencode serve`
-    // and misbehave. Reject loudly here (the canonical dispatch point) rather
-    // than let a wrong-path run through. Local-only until a server-mode remote
-    // backend exists (the libkrun/managed work).
-    if spec.integration == crate::agents::Integration::Server && remote_record.is_some() {
-        return Err(PillboxError::usage(
-            "run",
-            format!(
-                "`{}` runs as a headless server and is local-only today",
-                spec.id
-            ),
-        )
-        .with_next(format!("drop --remote: pillbox run --agent {}", spec.id))
-        .into());
-    }
-
-    // Local runs only: nudge if Raindrop Workshop is installed but no
-    // OTLP endpoint is set, so a silent "no events" doesn't surprise the
-    // user. Remote sandboxes can't reach Workshop's localhost endpoint
-    // anyway, so the hint would mislead there.
-    if remote_record.is_none() {
-        crate::events::hint_workshop_if_unconfigured();
-    }
-
-    let backend = crate::sandbox::select_backend(remote_record);
+    let backend = crate::sandbox::select_backend();
     if !opts.memory {
         return backend.run(spec, opts, resolved);
     }

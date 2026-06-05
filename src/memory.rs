@@ -87,9 +87,37 @@ fn briefing(project: &str) -> Option<String> {
 pub(crate) fn capture_run(sessions_root: &Path, project: &str, since: SystemTime) {
     for log in run_window_logs(sessions_root, since) {
         if let Some(path) = log.to_str() {
-            let _ = run_kypp(&["capture", path, "--distill"], project);
+            capture_log(path, project);
         }
     }
+}
+
+/// The one `kypp capture --distill` invocation (distill a drained §0 log into claims) — shared by the
+/// run-window sweep and the deferred per-session capture so the verb/flags can't drift. Best-effort.
+fn capture_log(log_path: &str, project: &str) {
+    let _ = run_kypp(&["capture", log_path, "--distill"], project);
+}
+
+/// The one `kypp usage --record` invocation (record that `session_id` was shown `handles` via the
+/// briefing surface) — shared by the foreground (dispatch) and server (ingest) paths so the verb/flags
+/// can't drift. No-op on empty handles. Best-effort.
+fn record_usage(session_id: &str, project: &str, handles: &[String]) {
+    if handles.is_empty() {
+        return;
+    }
+    let mut args = vec![
+        "usage".to_string(),
+        "--record".to_string(),
+        "--session".to_string(),
+        session_id.to_string(),
+        "--surface".to_string(),
+        "briefing".to_string(),
+    ];
+    for h in handles {
+        args.push("--claim".to_string());
+        args.push(h.clone());
+    }
+    let _ = run_kypp_args(&args, project);
 }
 
 /// Record usage provenance for the claims this run was briefed with — one `kypp usage` row per
@@ -106,26 +134,13 @@ pub(crate) fn record_brief_usage(
         return;
     }
     for log in run_window_logs(sessions_root, since) {
-        let Some(id) = log
+        if let Some(id) = log
             .parent()
             .and_then(Path::file_name)
             .and_then(|s| s.to_str())
-        else {
-            continue;
-        };
-        let mut args = vec![
-            "usage".to_string(),
-            "--record".to_string(),
-            "--session".to_string(),
-            id.to_string(),
-            "--surface".to_string(),
-            "briefing".to_string(),
-        ];
-        for h in handles {
-            args.push("--claim".to_string());
-            args.push(h.clone());
+        {
+            record_usage(id, project, handles);
         }
-        let _ = run_kypp_args(&args, project);
     }
 }
 
@@ -154,27 +169,16 @@ pub(crate) fn capture_session(session_dir: &Path, session_id: &str) {
     };
     let mut lines = body.lines();
     let Some(project) = lines.next() else { return };
-    let handles: Vec<&str> = lines.filter(|l| !l.is_empty()).collect();
+    let handles: Vec<String> = lines
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
 
     let log = session_dir.join("log.jsonl");
     if let Some(path) = log.to_str() {
-        let _ = run_kypp(&["capture", path, "--distill"], project);
+        capture_log(path, project);
     }
-    if !handles.is_empty() {
-        let mut args = vec![
-            "usage",
-            "--record",
-            "--session",
-            session_id,
-            "--surface",
-            "briefing",
-        ];
-        for h in &handles {
-            args.push("--claim");
-            args.push(h);
-        }
-        let _ = run_kypp(&args, project);
-    }
+    record_usage(session_id, project, &handles);
 }
 
 /// The `<sessions_root>/<id>/log.jsonl` files modified at/after `since` — i.e. this run's, not the

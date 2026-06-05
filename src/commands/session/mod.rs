@@ -864,6 +864,12 @@ fn session_ingest(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
     }
 
     let n = libkrun_ingest_events_file(resolved, &session)?;
+    // The §0 log is now drained — if this was a `--memory` server run, capture it into kypp + record
+    // briefed-claim usage (the brief the bring-up stashed). No-op otherwise. Before the marker so a
+    // failed capture can retry on a re-ingest; the marker then makes the whole step run once.
+    if let Ok(dir) = session::session_dir(resolved, &session.id) {
+        crate::memory::capture_session(&dir, &session.id);
+    }
     std::fs::write(&marker, b"").map_err(|e| {
         PillboxError::runtime("session ingest", format!("write ingest marker: {e}"))
     })?;

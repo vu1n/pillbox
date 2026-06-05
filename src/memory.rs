@@ -10,6 +10,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
+/// Side-file in a session dir carrying a REPARENTED run's brief (project + briefed handles) so the
+/// deferred `session ingest` capture can run after the §0 log drains. Line 1 = project, lines 2+ =
+/// claim handles. (Server agents' logs don't exist at dispatch-time, so capture can't run there.)
+const BRIEF_FILE: &str = ".kypp-brief";
+
 /// Brief the agent from project memory by PREPENDING kypp's session-start digest to the run's single
 /// positional prompt (the `pillbox run -- "task"` shape). Skips when the shape is ambiguous — 0
 /// positionals (a bare interactive run) silently, >1 (flags after `--`) with a note — since there's
@@ -121,6 +126,54 @@ pub(crate) fn record_brief_usage(
             args.push(h.clone());
         }
         let _ = run_kypp_args(&args, project);
+    }
+}
+
+/// Stash a REPARENTED server run's brief so `session ingest` can capture + record usage AFTER its §0
+/// log drains (the log doesn't exist at dispatch-time, so capture can't run there). Writes
+/// `<session_dir>/.kypp-brief` (line 1 = project, lines 2+ = handles). Best-effort.
+#[cfg_attr(not(feature = "libkrun"), allow(dead_code))] // only the libkrun server bring-up stashes
+pub(crate) fn stash_brief(session_dir: &Path, project: &str, briefed: &[String]) {
+    let mut body = String::with_capacity(64);
+    body.push_str(project);
+    body.push('\n');
+    for h in briefed {
+        body.push_str(h);
+        body.push('\n');
+    }
+    let _ = std::fs::write(session_dir.join(BRIEF_FILE), body);
+}
+
+/// Capture a now-drained reparented session into kypp — the deferred sibling of the dispatch-time
+/// capture, called from `session ingest`. Reads the `.kypp-brief` stash (no-op if absent → not a
+/// --memory run): distills the drained §0 log into claims AND records briefed-claim usage for this
+/// session. Best-effort; `session ingest`'s `.ingested` marker makes the whole thing run once.
+pub(crate) fn capture_session(session_dir: &Path, session_id: &str) {
+    let Ok(body) = std::fs::read_to_string(session_dir.join(BRIEF_FILE)) else {
+        return; // no stash → this run didn't use --memory
+    };
+    let mut lines = body.lines();
+    let Some(project) = lines.next() else { return };
+    let handles: Vec<&str> = lines.filter(|l| !l.is_empty()).collect();
+
+    let log = session_dir.join("log.jsonl");
+    if let Some(path) = log.to_str() {
+        let _ = run_kypp(&["capture", path, "--distill"], project);
+    }
+    if !handles.is_empty() {
+        let mut args = vec![
+            "usage",
+            "--record",
+            "--session",
+            session_id,
+            "--surface",
+            "briefing",
+        ];
+        for h in &handles {
+            args.push("--claim");
+            args.push(h);
+        }
+        let _ = run_kypp(&args, project);
     }
 }
 

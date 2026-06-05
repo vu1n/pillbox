@@ -628,6 +628,20 @@ fn launch_server_vm(
             }),
         };
         crate::session::write(resolved, &session)?;
+        // --memory + server: this session is reparented, so its §0 log drains on `session ingest`,
+        // AFTER bring-up returns — dispatch-time capture would race an empty log. Stash the brief in
+        // the session dir for ingest to capture + record briefed-claim usage from. Best-effort.
+        if opts.memory {
+            if let Ok(dir) = crate::session::session_dir(resolved, &session.id) {
+                crate::memory::stash_brief(
+                    &dir,
+                    &opts
+                        .memory_project()
+                        .unwrap_or_else(|| "default".to_string()),
+                    &opts.memory_briefed,
+                );
+            }
+        }
         crate::events::emit_session_event(
             resolved,
             crate::events::EventType::SessionStarted {

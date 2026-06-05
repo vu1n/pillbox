@@ -475,6 +475,10 @@ pub(crate) struct RunOpts {
     /// brief the agent from project memory at start, capture the §0 log after. pillbox attaches,
     /// doesn't own; see `crate::memory`.
     pub(crate) memory: bool,
+    /// Claim handles `--memory` briefed this run with (set by `dispatch_run` from kypp's digest).
+    /// The data channel into the backend so a reparented server agent's bring-up can stash it on the
+    /// session for the post-drain usage capture (`session ingest`). Empty when --memory is off/empty.
+    pub(crate) memory_briefed: Vec<String>,
     /// `--mcp NAME=URL` shared-MCP attachments, parsed at the CLI
     /// boundary. Resolved against `mcp_tokens` in the sandbox
     /// backend; the backend hard-errors if non-empty and the
@@ -533,6 +537,13 @@ pub(crate) struct RunOpts {
 
 #[allow(dead_code)]
 impl RunOpts {
+    /// The kypp project for `--memory` (the pillbox name, else "default"); `None` when --memory is
+    /// off. Single-sources the derivation shared by `dispatch_run` and the server bring-up's stash.
+    pub(crate) fn memory_project(&self) -> Option<String> {
+        self.memory
+            .then(|| self.name.clone().unwrap_or_else(|| "default".to_string()))
+    }
+
     /// In v0.6 PR 2, the only pillbox.toml field that backs a RunOpts
     /// default is `name`. Multi-value defaults from v0.5 (`with`, `mount`,
     /// `env_file`, `env`) are dropped — they didn't carry their weight
@@ -732,6 +743,7 @@ mod tests {
             env_files: Vec::new(),
             vault: false,
             memory: false,
+            memory_briefed: Vec::new(),
             mcps: Vec::new(),
             mcp_tokens: Vec::new(),
             args: Vec::new(),

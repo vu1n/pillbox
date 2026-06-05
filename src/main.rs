@@ -662,6 +662,7 @@ fn run(cli: Cli) -> Result<()> {
                     env_files,
                     vault,
                     memory,
+                    memory_briefed: Vec::new(), // dispatch_run fills this from the kypp briefing
                     mcps,
                     mcp_tokens,
                     args,
@@ -869,11 +870,16 @@ fn dispatch_run(resolved: &Pillbox, agent: Option<String>, mut opts: RunOpts) ->
     // best-effort. Detached runs skip the post-capture — the agent outlives this call, so the §0 log
     // isn't complete yet; a scheduled `kypp sweep` (cron) catches them. Project scope = pillbox name.
     let project = opts.name.clone().unwrap_or_else(|| "default".to_string());
+    let is_server = spec.integration == crate::agents::Integration::Server;
     let capture_after = !opts.detach;
     let briefed = crate::memory::brief_into_args(&mut opts.args, &project);
+    opts.memory_briefed = briefed.clone(); // carried into the backend so a server bring-up can stash it
     let started = std::time::SystemTime::now(); // run-window start: capture only logs written after this
     let result = backend.run(spec, opts, resolved);
-    if capture_after {
+    // A FOREGROUND (PTY) agent finalizes its §0 log before `run` returns → capture now. A SERVER agent
+    // (opencode) is reparented: the log drains LATER, so capturing here would race an empty log —
+    // `session ingest` does the capture instead, from the brief the bring-up stashed (crate::memory).
+    if capture_after && !is_server {
         let sessions = crate::session::sessions_root_path(resolved);
         crate::memory::capture_run(&sessions, &project, started);
         // record which briefed claims this run saw, for later credit assignment

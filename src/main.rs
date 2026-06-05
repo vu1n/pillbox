@@ -840,15 +840,17 @@ fn dispatch_run(resolved: &Pillbox, agent: Option<String>, mut opts: RunOpts) ->
     if !opts.memory {
         return backend.run(spec, opts, resolved);
     }
-    // --memory: brief the agent from kypp at start, capture the §0 log after. Host-side + best-effort.
-    // Detached runs skip the post-sweep — the agent outlives this call, so the §0 log isn't complete
-    // yet; a scheduled `kypp sweep` (cron) catches them. Project scope = the resolved pillbox name.
+    // --memory: brief the agent from kypp at start, capture THIS run's §0 log after. Host-side +
+    // best-effort. Detached runs skip the post-capture — the agent outlives this call, so the §0 log
+    // isn't complete yet; a scheduled `kypp sweep` (cron) catches them. Project scope = pillbox name.
     let project = opts.name.clone().unwrap_or_else(|| "default".to_string());
-    let sweep_after = !opts.detach;
+    let capture_after = !opts.detach;
     crate::memory::brief_into_args(&mut opts.args, &project);
+    let started = std::time::SystemTime::now(); // run-window start: capture only logs written after this
     let result = backend.run(spec, opts, resolved);
-    if sweep_after {
-        crate::memory::sweep(&project);
+    if capture_after {
+        let sessions = crate::session::sessions_root_path(resolved);
+        crate::memory::capture_run(&sessions, &project, started);
     }
     result
 }

@@ -89,6 +89,12 @@ pub(crate) fn session_dir_path(pb: &Pillbox, id: &str) -> PathBuf {
     pb.subdir_path(SESSIONS_DIR).join(id)
 }
 
+/// Read-only path to the sessions root `<pillbox>/sessions/` (no mkdir). The post-run `--memory`
+/// capture scans it for the run's freshly-written log(s) — see [`crate::memory::capture_run`].
+pub(crate) fn sessions_root_path(pb: &Pillbox) -> PathBuf {
+    pb.subdir_path(SESSIONS_DIR)
+}
+
 /// Registry plumbing for sessions. No-inheritance — a session is
 /// concrete runtime state tied to the pillbox that started it, so we
 /// implement [`Registry`] but not `InheritedRegistry`.

@@ -91,6 +91,7 @@ use anyhow::{Context, Result};
 use crate::pillbox::Pillbox;
 use crate::session::{self, Session};
 
+pub(crate) mod codex_serve;
 mod jsonl;
 pub(crate) mod log;
 pub(crate) mod opencode;

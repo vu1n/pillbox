@@ -33,6 +33,7 @@ mod envs;
 mod errors;
 mod events;
 mod gateway;
+mod memory;
 mod paths;
 mod pillbox;
 mod registry;
@@ -158,6 +159,11 @@ enum Command {
         /// Route the agent's API traffic through pillbox's vault proxy.
         #[arg(long)]
         vault: bool,
+        /// Wire in swarm memory (the external `kypp` engine, attached not owned): brief the agent
+        /// from project memory at start and capture this session's §0 log after. Host-side, best-
+        /// effort — a missing/erroring `kypp` warns, never fails the run. See github.com/vu1n/kypp.
+        #[arg(long)]
+        memory: bool,
         /// Attach a shared MCP server to the sandbox. NAME is the
         /// identifier the agent sees in its tool list; URL must be
         /// http:// or https://. `localhost` / `127.0.0.1` are
@@ -539,6 +545,7 @@ fn run(cli: Cli) -> Result<()> {
             env_bundles,
             env_files,
             vault,
+            memory,
             mcps,
             mcp_tokens,
             remote,
@@ -634,6 +641,7 @@ fn run(cli: Cli) -> Result<()> {
                     env_bundles,
                     env_files,
                     vault,
+                    memory,
                     mcps,
                     mcp_tokens,
                     args,
@@ -829,7 +837,20 @@ fn dispatch_run(resolved: &Pillbox, agent: Option<String>, mut opts: RunOpts) ->
     }
 
     let backend = crate::sandbox::select_backend(remote_record);
-    backend.run(spec, opts, resolved)
+    if !opts.memory {
+        return backend.run(spec, opts, resolved);
+    }
+    // --memory: brief the agent from kypp at start, capture the §0 log after. Host-side + best-effort.
+    // Detached runs skip the post-sweep — the agent outlives this call, so the §0 log isn't complete
+    // yet; a scheduled `kypp sweep` (cron) catches them. Project scope = the resolved pillbox name.
+    let project = opts.name.clone().unwrap_or_else(|| "default".to_string());
+    let sweep_after = !opts.detach;
+    crate::memory::brief_into_args(&mut opts.args, &project);
+    let result = backend.run(spec, opts, resolved);
+    if sweep_after {
+        crate::memory::sweep(&project);
+    }
+    result
 }
 
 /// Dispatch `pty-host --vsock-port` — Linux-only. The libkrun guest serves the

@@ -380,6 +380,10 @@ pub(crate) struct RunOpts {
     pub(crate) env_files: Vec<PathBuf>,
     /// `--vault` — route API traffic through the pillbox stub-swap proxy.
     pub(crate) vault: bool,
+    /// `--memory` — wire in the external `kypp` swarm-memory engine (host-side, best-effort):
+    /// brief the agent from project memory at start, capture the §0 log after. pillbox attaches,
+    /// doesn't own; see `crate::memory`.
+    pub(crate) memory: bool,
     /// `--mcp NAME=URL` shared-MCP attachments, parsed at the CLI
     /// boundary. Resolved against `mcp_tokens` in the sandbox
     /// backend; the backend hard-errors if non-empty and the
@@ -636,6 +640,7 @@ mod tests {
             env_bundles: Vec::new(),
             env_files: Vec::new(),
             vault: false,
+            memory: false,
             mcps: Vec::new(),
             mcp_tokens: Vec::new(),
             args: Vec::new(),

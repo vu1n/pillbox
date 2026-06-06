@@ -211,98 +211,84 @@ impl VaultSession {
         Ok(stub)
     }
 
-    /// Extra docker args to layer onto a normal `<agent> run`:
-    /// `-v cacert:/etc/pillbox-ca.crt:ro` (the path
-    /// `NODE_EXTRA_CA_CERTS` points at, for Node-based agents),
-    /// `-v cacert:/usr/local/share/ca-certificates/pillbox-vault.crt:ro`
-    /// (the path the runner-image entrypoint feeds to
-    /// `update-ca-certificates`, putting the cert into the system
-    /// trust store for Rust/Go agents like Codex), env wiring
-    /// (`NODE_EXTRA_CA_CERTS`, `HTTPS_PROXY`, `HTTP_PROXY`), plus
-    /// one `-v stubfile:<creds>:ro` per OAuth mount.
-    pub(crate) fn docker_extras(&self, guest_home: &str) -> Vec<String> {
-        let port = self.listen_addr.port();
-        // The `--add-host host.docker.internal:host-gateway` line that
-        // makes this alias resolve on Linux lives in `base_docker_args`
-        // (Docker Desktop ignores it harmlessly), so vault + MCP + any
-        // future host-reachable feature all get it without each having
-        // to remember.
-        let proxy_url = format!("http://host.docker.internal:{port}");
-        let guest_ca = "/etc/pillbox-ca.crt";
-        // Bind the same source file at the path the runner image's
-        // entrypoint scans on boot. Codex's reqwest / native-tls
-        // doesn't honor NODE_EXTRA_CA_CERTS — it only reads the
-        // system CA bundle — so without this mount it presents
-        // `invalid peer certificate: UnknownIssuer` whenever the
-        // vault MITMs chatgpt.com.
-        let system_trust_ca = "/usr/local/share/ca-certificates/pillbox-vault.crt";
+    /// Guest path `NODE_EXTRA_CA_CERTS` points at (Node-based agents).
+    const GUEST_CA: &'static str = "/etc/pillbox-ca.crt";
+    /// Path the runner-image entrypoint feeds to `update-ca-certificates`
+    /// (system trust). Codex's reqwest/native-tls only reads the system bundle,
+    /// not `NODE_EXTRA_CA_CERTS`, so without this the vault MITM presents
+    /// `invalid peer certificate: UnknownIssuer` whenever it intercepts e.g.
+    /// chatgpt.com.
+    const GUEST_SYSTEM_TRUST_CA: &'static str =
+        "/usr/local/share/ca-certificates/pillbox-vault.crt";
 
-        let mut out = vec![
-            "-v".into(),
-            format!("{}:{guest_ca}:ro", self.ca_cert_path.display()),
-            "-v".into(),
-            format!("{}:{system_trust_ca}:ro", self.ca_cert_path.display()),
+    /// Backend-agnostic vault mounts as `(host_src, guest_dest)` pairs: the CA
+    /// cert at both the `NODE_EXTRA_CA_CERTS` path and the system-trust path,
+    /// plus one OAuth stub-creds file per mount. Each backend formats these into
+    /// its own mount flag (docker adds `:ro`; smolvm doesn't wire mount options).
+    fn vault_mounts(&self, guest_home: &str) -> Vec<(String, String)> {
+        let ca = self.ca_cert_path.display().to_string();
+        let mut mounts = vec![
+            (ca.clone(), Self::GUEST_CA.to_string()),
+            (ca, Self::GUEST_SYSTEM_TRUST_CA.to_string()),
         ];
         for mount in &self.oauth_mounts {
-            let guest_creds = format!("{guest_home}/{}", mount.creds_path.display());
-            out.push("-v".into());
-            out.push(format!(
-                "{}:{guest_creds}:ro",
-                mount.stub_file.path().display()
+            mounts.push((
+                mount.stub_file.path().display().to_string(),
+                format!("{guest_home}/{}", mount.creds_path.display()),
             ));
         }
-        out.extend([
-            "-e".into(),
-            format!("NODE_EXTRA_CA_CERTS={guest_ca}"),
-            "-e".into(),
-            format!("HTTPS_PROXY={proxy_url}"),
-            "-e".into(),
-            format!("HTTP_PROXY={proxy_url}"),
-        ]);
+        mounts
+    }
+
+    /// Backend-agnostic env that routes the guest agent through the proxy: the
+    /// CA path for Node + `HTTP(S)_PROXY` at `proxy_url`. Each backend formats
+    /// these into its own env flag.
+    fn proxy_env(proxy_url: &str) -> [(String, String); 3] {
+        [
+            (
+                "NODE_EXTRA_CA_CERTS".to_string(),
+                Self::GUEST_CA.to_string(),
+            ),
+            ("HTTPS_PROXY".to_string(), proxy_url.to_string()),
+            ("HTTP_PROXY".to_string(), proxy_url.to_string()),
+        ]
+    }
+
+    /// Extra docker args to layer onto a normal `<agent> run`: the vault CA +
+    /// OAuth-stub mounts (`-v …:ro`) and the proxy env (`-e …`). The
+    /// `--add-host host.docker.internal:host-gateway` that makes the proxy alias
+    /// resolve on Linux lives in `base_docker_args` (Docker Desktop ignores it
+    /// harmlessly), so every host-reachable feature inherits it.
+    pub(crate) fn docker_extras(&self, guest_home: &str) -> Vec<String> {
+        let proxy_url = format!("http://host.docker.internal:{}", self.listen_addr.port());
+        let mut out = Vec::new();
+        for (host, guest) in self.vault_mounts(guest_home) {
+            out.push("-v".into());
+            out.push(format!("{host}:{guest}:ro"));
+        }
+        for (k, v) in Self::proxy_env(&proxy_url) {
+            out.push("-e".into());
+            out.push(format!("{k}={v}"));
+        }
         out
     }
 
     /// smolvm equivalent of [`Self::docker_extras`] (SPIKE — see
-    /// `sandbox/smolvm.rs`): the same **explicit-proxy broker** wiring — CA
-    /// mounts + `NODE_EXTRA_CA_CERTS`/`HTTPS_PROXY`/`HTTP_PROXY` pointing the
-    /// guest agent at the host-side MITM proxy + the OAuth stub mounts. The real
-    /// credential stays in the host proxy; the guest only ever sees a stub + the
-    /// proxy URL (cred-never-in-guest, no transparent network interception, so
-    /// no smolvm change needed for proxy-honoring agents).
-    ///
+    /// `sandbox/smolvm.rs`): the same explicit-proxy broker wiring (real key
+    /// never enters the guest; the guest gets a stub + the proxy URL).
     /// `proxy_host` is how the guest addresses the host — the one smolvm-specific
     /// unknown vs docker's `host.docker.internal` alias (live-verify point).
-    /// `:ro` mount enforcement is omitted (smolvm virtiofs mount options aren't
-    /// wired in the spike). Duplicates `docker_extras`; a shared
-    /// proxy-env/CA-mount builder is the ship-review collapse.
     pub(crate) fn smolvm_extras(&self, guest_home: &str, proxy_host: &str) -> Vec<String> {
-        let port = self.listen_addr.port();
-        let proxy_url = format!("http://{proxy_host}:{port}");
-        let guest_ca = "/etc/pillbox-ca.crt";
-        let system_trust_ca = "/usr/local/share/ca-certificates/pillbox-vault.crt";
-
-        let mut out = vec![
-            "-v".into(),
-            format!("{}:{guest_ca}", self.ca_cert_path.display()),
-            "-v".into(),
-            format!("{}:{system_trust_ca}", self.ca_cert_path.display()),
-        ];
-        for mount in &self.oauth_mounts {
-            let guest_creds = format!("{guest_home}/{}", mount.creds_path.display());
+        let proxy_url = format!("http://{proxy_host}:{}", self.listen_addr.port());
+        let mut out = Vec::new();
+        for (host, guest) in self.vault_mounts(guest_home) {
             out.push("-v".into());
-            out.push(format!(
-                "{}:{guest_creds}",
-                mount.stub_file.path().display()
-            ));
+            out.push(format!("{host}:{guest}"));
         }
-        out.extend([
-            "-e".into(),
-            format!("NODE_EXTRA_CA_CERTS={guest_ca}"),
-            "-e".into(),
-            format!("HTTPS_PROXY={proxy_url}"),
-            "-e".into(),
-            format!("HTTP_PROXY={proxy_url}"),
-        ]);
+        for (k, v) in Self::proxy_env(&proxy_url) {
+            out.push("-e".into());
+            out.push(format!("{k}={v}"));
+        }
         out
     }
 

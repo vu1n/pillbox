@@ -57,7 +57,7 @@ fn status(resolved: &Pillbox, json: bool) -> Result<()> {
                 (
                     "ca_mode",
                     serde_json::Value::String(
-                        if exists { "stable" } else { "per-run" }.to_string()
+                        (if exists { "stable" } else { "per-run" }).to_string()
                     )
                 ),
                 (

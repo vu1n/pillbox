@@ -1,20 +1,22 @@
-import { DurableObject } from "cloudflare:workers";
+import { Agent, type Connection, type ConnectionContext, type WSMessage } from "agents";
 import type { Event, Payload } from "./contract.js";
 import type { Env } from "./worker.js";
 
-// Per-connection state persisted across hibernation. `cursor` = highest seq
-// already delivered to this subscriber, so a woken DO knows where to resume.
-interface WsAttach {
-  role: "subscriber";
-  cursor: number;
-}
+// Per-connection state (the subscriber's replay cursor), persisted across
+// hibernation via `connection.setState` — the Agents-SDK replacement for raw
+// `serializeAttachment`. NOTE: this is per-connection state, NOT the global
+// `this.setState`. We deliberately NEVER call global `this.setState`: it is
+// last-write-wins whole-object sync, structurally incompatible with an ordered
+// append-only log keyed by monotonic `seq` (it'd lose ordering, replay, and
+// per-event actor attribution). The §0 log lives in `this.ctx.storage.sql`; the
+// cursor lives here. (This is the exact split GSV runs in production.)
+type WsState = { role: "subscriber"; cursor: number };
 
-export class SessionGateway extends DurableObject<Env> {
-  constructor(ctx: DurableObjectState, env: Env) {
-    super(ctx, env);
-    // Schema. seq is the PK and the sole authority; `at` + `payloadJson`
-    // hold the rest of the envelope. Bounded per session (10GB cap).
-    ctx.storage.sql.exec(`
+export class SessionGateway extends Agent<Env> {
+  // Agents-SDK lifecycle hook (replaces the constructor's table create). The §0
+  // log is our own SQLite table, not Agent state — full control, no sync.
+  onStart(): void {
+    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS log(
         seq         INTEGER PRIMARY KEY,
         at          TEXT NOT NULL,
@@ -24,24 +26,11 @@ export class SessionGateway extends DurableObject<Env> {
     `);
   }
 
-  async fetch(req: Request): Promise<Response> {
-    const url = new URL(req.url);
-    switch (url.pathname) {
-      case "/event":
-        return this.handleEvent(req);
-      case "/input":
-        return this.handleInput(req);
-      case "/subscribe":
-        return this.handleSubscribe(req);
-      default:
-        return new Response("not found\n", { status: 404 });
-    }
-  }
-
   // ── append + seq authority ────────────────────────────────────────────
-  // The single load-bearing primitive. transactionSync + single-threaded-
-  // per-id => seq is strictly monotonic with no lock. Seq is derived from
-  // storage (MAX), never an in-memory counter, so it survives eviction.
+  // UNCHANGED from the raw-DO spike: transactionSync + single-threaded-per-id =>
+  // seq is strictly monotonic with no lock. Seq is derived from storage (MAX),
+  // never an in-memory counter, so it survives eviction. This is a DO primitive
+  // the Agent class inherits, so adopting `Agent` costs the keystone nothing.
   private append(at: string, actor: unknown, payload: Payload): Event {
     const seq = this.ctx.storage.transactionSync(() => {
       const row = this.ctx.storage.sql
@@ -57,17 +46,28 @@ export class SessionGateway extends DurableObject<Env> {
       );
       return next;
     });
-    const ev: Event = { v: 1, seq, sessionId: this.idName(), at, payload };
+    // `this.name` is the Agent instance name (the sessionId) — resolves the
+    // raw-DO spike's `ctx.id.name` readback caveat for free.
+    const ev: Event = { v: 1, seq, sessionId: this.name, at, payload };
     if (actor) ev.actor = actor as Event["actor"];
     this.fanout(ev);
     return ev;
   }
 
+  // HTTP: POST /event and /input both land here (routeAgentRequest forwards the
+  // request; WS upgrades go to onConnect instead). Dispatch on the trailing path.
+  async onRequest(req: Request): Promise<Response> {
+    const path = new URL(req.url).pathname;
+    if (path.endsWith("/event")) return this.handleEvent(req);
+    if (path.endsWith("/input")) return this.handleInput(req);
+    return new Response("not found\n", { status: 404 });
+  }
+
   private async handleEvent(req: Request): Promise<Response> {
     const body = (await req.json()) as Partial<Event>;
     if (!body.payload) return json({ error: "missing payload" }, 400);
-    // STUB: actor is taken from the body, NOT authenticated. Milestone 1
-    // stamps it from the connection. TODO: trust boundary.
+    // STUB: actor taken from the body, NOT authenticated. Milestone 1 stamps it
+    // from the connection in onConnect (the trust boundary). TODO.
     const ev = this.append(body.at ?? nowRfc3339(), body.actor, body.payload as Payload);
     return json({ seq: ev.seq, head: this.head() });
   }
@@ -82,79 +82,59 @@ export class SessionGateway extends DurableObject<Env> {
       mode: (body.mode as "live" | "turn") ?? "turn",
     };
     // STUB: no driver-token arbitration (milestone 4); no sandbox forward.
-    // TODO: arbitrate target:pty via driver-token; forward to container PTY/exec.
+    // TODO: arbitrate target:pty via driver-token; forward to the Sandbox DO's PTY/exec.
     const ev = this.append(nowRfc3339(), body.actor, payload);
     return json({ seq: ev.seq, head: this.head() });
   }
 
-  // ── Subscribe(from_seq) = replay then tail, over hibernatable WS ───────
-  private async handleSubscribe(req: Request): Promise<Response> {
-    if (req.headers.get("Upgrade") !== "websocket")
-      return new Response("expected websocket\n", { status: 426 });
-
-    const from = Number(new URL(req.url).searchParams.get("from") ?? "0");
-
-    const pair = new WebSocketPair();
-    const [client, server] = Object.values(pair);
-
-    // Hibernation: acceptWebSocket (NOT server.accept) lets the DO evict
-    // from memory while this connection stays open => cheap many-subscriber.
-    this.ctx.acceptWebSocket(server, ["subscriber"]);
-
-    // Replay everything from `from` synchronously, tracking the cursor.
+  // ── Subscribe(from_seq) = replay then tail ────────────────────────────
+  // The Agents SDK accepts + hibernates the WebSocket for us (no WebSocketPair /
+  // acceptWebSocket / 101 plumbing). We just replay from `from` and record the
+  // cursor on the connection.
+  async onConnect(connection: Connection<WsState>, ctx: ConnectionContext): Promise<void> {
+    const from = Number(new URL(ctx.request.url).searchParams.get("from") ?? "0");
+    // MILESTONE 1: stamp `actor` here from the authenticated ctx.request — the
+    // trust boundary the raw-DO spike couldn't reach. TODO.
     let cursor = from - 1;
     for (const ev of this.readFrom(from)) {
-      server.send(JSON.stringify(ev));
+      connection.send(JSON.stringify(ev));
       cursor = ev.seq;
     }
-    // Persist resume point so a woken DO tails from the right place and a
-    // reconnect-from-seq lands cleanly (deploy/migration story).
-    const attach: WsAttach = { role: "subscriber", cursor };
-    server.serializeAttachment(attach);
-
-    return new Response(null, { status: 101, webSocket: client });
+    connection.setState({ role: "subscriber", cursor });
   }
 
-  // Live tail: every append calls this. Sends only events past each
-  // subscriber's cursor (handles the replay/tail boundary with no gap/dup).
-  private fanout(ev: Event): void {
-    for (const ws of this.ctx.getWebSockets("subscriber")) {
-      const a = (ws.deserializeAttachment() as WsAttach | null) ?? { role: "subscriber", cursor: 0 };
-      if (ev.seq > a.cursor) {
-        try {
-          ws.send(JSON.stringify(ev));
-          ws.serializeAttachment({ ...a, cursor: ev.seq });
-        } catch {
-          // best-effort fan-out; a dead socket gets cleaned on close.
-        }
-      }
-    }
-  }
-
-  // Hibernation handlers. Subscribers are read-only in the spike; messages
-  // are accepted (e.g. {"from":N} re-replay) but the primary path is the URL.
-  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+  // Optional re-replay on a {"from":N} client message (reconnect-from-seq).
+  async onMessage(connection: Connection<WsState>, message: WSMessage): Promise<void> {
     if (typeof message !== "string") return;
     try {
       const msg = JSON.parse(message);
       if (typeof msg.from === "number") {
         let cursor = msg.from - 1;
         for (const ev of this.readFrom(msg.from)) {
-          ws.send(JSON.stringify(ev));
+          connection.send(JSON.stringify(ev));
           cursor = ev.seq;
         }
-        ws.serializeAttachment({ role: "subscriber", cursor });
+        connection.setState({ role: "subscriber", cursor });
       }
     } catch {
       /* ignore non-JSON pings */
     }
   }
 
-  async webSocketClose(ws: WebSocket, code: number, _reason: string, _clean: boolean): Promise<void> {
-    try {
-      ws.close(code, "bye");
-    } catch {
-      /* already closed */
+  // Live tail: every append fans out to each subscriber past its cursor (closes
+  // the replay/tail boundary with no gap/dup). `getConnections()` replaces the
+  // raw `getWebSockets(tag)`.
+  private fanout(ev: Event): void {
+    for (const conn of this.getConnections<WsState>()) {
+      const a = conn.state ?? { role: "subscriber" as const, cursor: 0 };
+      if (ev.seq > a.cursor) {
+        try {
+          conn.send(JSON.stringify(ev));
+          conn.setState({ ...a, cursor: ev.seq });
+        } catch {
+          // best-effort fan-out; a dead socket is cleaned on close.
+        }
+      }
     }
   }
 
@@ -168,7 +148,7 @@ export class SessionGateway extends DurableObject<Env> {
       const ev: Event = {
         v: 1,
         seq: r.seq,
-        sessionId: this.idName(),
+        sessionId: this.name,
         at: r.at,
         payload: JSON.parse(r.payloadJson) as Payload,
       };
@@ -179,13 +159,6 @@ export class SessionGateway extends DurableObject<Env> {
 
   private head(): number {
     return (this.ctx.storage.sql.exec("SELECT COALESCE(MAX(seq), 0) AS m FROM log").one() as { m: number }).m;
-  }
-
-  // The DO doesn't natively know its idFromName key; in the spike we don't
-  // need the literal sessionId in the envelope for the smoke, but keep the
-  // field populated for contract parity. (Milestone 0 passes it in at spawn.)
-  private idName(): string {
-    return this.ctx.id.name ?? this.ctx.id.toString();
   }
 }
 

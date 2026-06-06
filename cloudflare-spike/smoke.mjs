@@ -3,10 +3,13 @@
 const base = process.argv[2] ?? "http://127.0.0.1:8787";
 const sid = process.argv[3] ?? "spike-sess-1";
 
-const wsUrl = base.replace(/^http/, "ws") + `/s/${sid}/subscribe?from=1`;
+// Agents-SDK route convention: /agents/<kebab-class>/<instance-name>/*
+// routeAgentRequest forwards HTTP → onRequest, WS upgrade → onConnect.
+const agent = `/agents/session-gateway/${sid}`;
+const wsUrl = base.replace(/^http/, "ws") + `${agent}/subscribe?from=1`;
 
 async function post(op, body) {
-  const r = await fetch(`${base}/s/${sid}/${op}`, {
+  const r = await fetch(`${base}${agent}/${op}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),

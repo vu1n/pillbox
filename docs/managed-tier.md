@@ -55,6 +55,38 @@ local consumer** become load-bearing *exactly* here, and only here.
 So "start the managed tier" and "land the §0 multiplayer keystone" are **one
 move**, on the substrate where the keystone first earns its keep.
 
+### Build on the Agents SDK `Agent` class, not raw `DurableObject`
+
+The Session DO **extends the Cloudflare Agents SDK `Agent`** (GA Apr 2026), not a
+bare `DurableObject`. The `Agent` *is* a DO subclass — a strict superset — so it
+gives the hibernatable WebSocket lifecycle (`onConnect`/`onMessage`),
+per-connection state (`connection.setState`), `getConnections()`/broadcast, and
+`this.schedule()` (the container idle-TTL primitive) for free, while the keystone
+`transactionSync` + `MAX(seq)+1` append survives **verbatim** (a DO primitive the
+Agent inherits — adopting `Agent` costs the sequencer nothing).
+
+**Not a bet — proven in-house:** GSV (`~/code/gsv`) runs this exact pattern in
+production (`Kernel`/`Process extends Agent`, custom `ctx.storage.sql` Store
+classes, `connection.setState` per-connection, **never** global `this.setState`).
+Copy its DO skeleton + `this.schedule`/connect-auth shape.
+
+**The one conflict, declined:** the Agents SDK's global `this.setState` is
+last-write-wins, whole-object, auto-synced — structurally incompatible with an
+ordered append-only log keyed by monotonic `seq` (it'd lose ordering, replay, and
+per-event `actor`). So the §0 log lives in `ctx.storage.sql` (our table, no sync),
+the subscriber cursor in `connection.setState` (per-connection, no global sync),
+and `this.setState` is **never called**. The SDK helps everywhere and fights only
+on the convention we opt out of. (Spike: `cloudflare-spike/`.)
+
+**Other CF primitives** (behind existing seams): **Workflows / Agent Fibers** for
+the durable optimization loop (consumers *of* the §0 log, never the append path);
+**AI Gateway** for managed-tier observability/usage + caching (complements, does
+*not* replace, the credential boundary — it observes, doesn't scrub); **Workers
+AI + Vectorize** for the small-model-worker tier + kypp memory (behind kypp's
+swappable store seam). **Coordinate with GSV's CF account/auth/deploy** rather than
+drifting two stacks — but respect the divergence: GSV runs its agent loop *in* the
+DO; pillbox keeps the agent in a **Container** (a DO can't host a PTY).
+
 ---
 
 ## Verdict — research-backed

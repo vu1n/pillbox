@@ -2,9 +2,10 @@ name = "pillbox-do-spike"
 main = "src/worker.ts"
 compatibility_date = "2026-06-01"
 
-# One Durable Object class = the per-session §0 gateway.
+# One Durable Object class = the per-session §0 gateway. Binding name matches the
+# class so routeAgentRequest resolves /agents/session-gateway/<sessionId>/*.
 [[durable_objects.bindings]]
-name = "SESSION"
+name = "SessionGateway"
 class_name = "SessionGateway"
 
 # SQLite-backed storage migration (GA). `new_sqlite_classes` is required

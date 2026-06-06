@@ -8,6 +8,9 @@
     "smoke": "node smoke.mjs",
     "deploy": "wrangler deploy"
   },
+  "dependencies": {
+    "agents": "^0.10.2"
+  },
   "devDependencies": {
     "wrangler": "^4.20.0",
     "@cloudflare/workers-types": "^4.20260601.0",

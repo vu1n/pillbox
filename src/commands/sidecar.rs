@@ -35,6 +35,7 @@ pub(crate) fn run(resolved: &Pillbox, bind: Option<String>, json: bool) -> Resul
             // outside a pillbox run — no session/mode/workspace to
             // surface. gen_ai spans root per sandbox lease.
             context: vault::RunContext::default(),
+            egress: vault::EgressPolicy::default(),
         }))
         .map_err(|e| PillboxError::runtime("sidecar", format!("start vault server: {e}")))?;
 

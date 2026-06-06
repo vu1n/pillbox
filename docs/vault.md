@@ -18,10 +18,12 @@ own CA + key at `<state_dir>/vault/`. A run inside project `myapp` uses
 `--pillbox global` uses `~/.pillbox/global/vault/`. Leases never
 collide across pillboxes.
 
-> **Egress note:** the proxy MITMs only matched hosts (Anthropic/OpenAI/GitHub)
-> and **passes non-matched hosts through unmodified** — so it is not a general
-> exfiltration guard today. Strict-deny egress filtering (deny on unmatched) is
-> the planned fix; see
+> **Egress note:** by default the proxy MITMs only matched hosts
+> (Anthropic/OpenAI/GitHub) and **passes non-matched hosts through unmodified** —
+> so out of the box it is not a general exfiltration guard. The fix is the
+> **default-deny broker** ([§Broker model](#broker-model-v2--the-policy-bound-egress-broker)):
+> the decision layer is built (`src/vault/egress.rs`, off by default), with CLI
+> enablement + the backend egress fence as the next slices. See also
 > [security.md](./security.md). The vault runs **on the host** today:
 > the MITM proxy is an in-process server bound to a localhost port that
 > the sandbox reaches over the loopback bridge. Because it lives in the
@@ -99,6 +101,92 @@ Two vault flavors:
 Both kinds coexist in the same run — e.g. `pillbox run --vault --with ANTHROPIC_API_KEY` runs the agent with vaulted OAuth tokens AND a vaulted API key on the same `api.anthropic.com` host. AnthropicProvider branches by header (`Authorization: Bearer` → OAuth, `x-api-key` → API key).
 
 Running `--vault` for an agent that isn't `vault_capable` errors with exit 2.
+
+## Broker model (v2 — the policy-bound egress broker)
+
+> **Status:** the decision core is **built** (`src/vault/egress.rs`, default
+> permissive so nothing changes until enabled); CLI enablement + per-run CA are
+> the next slices. Design validated by a deep-research pass (`wmh2zb1y4`) — see
+> [§Prior art](#prior-art--adopt-vs-build).
+
+Today's vault is *stub-swap-on-known-host*: it MITMs provider hosts and **passes
+everything else through**. That swaps credentials safely but is **not an
+exfiltration guard** — a compromised agent can POST your code to `evil.example`
+and the proxy waves it by. The broker reframe (per a review): the real
+credential is released **only when session-identity + declared-secret +
+destination-host + protocol all match policy**, and *unmatched egress doesn't
+leave at all*.
+
+### The decision — one chokepoint, three outcomes
+
+Every outbound request resolves to exactly one of (`src/vault/egress.rs`,
+`EgressPolicy::decide`):
+
+| Decision | When | What happens |
+|---|---|---|
+| **Swap** | a provider intercepts the host | MITM + stub→real swap, **bound to that host** (the only path that releases a real secret) |
+| **AllowPassthrough** | host on the explicit allowlist, *or* permissive mode (legacy) | tunnel unmodified, no MITM |
+| **Deny** | default-deny on + no provider + not allowlisted | **blocked** — the request never leaves; agent gets a 403 |
+
+`should_intercept` MITMs only Swap/Deny hosts (allowed hosts are tunnelled, *not*
+MITM-everything); `handle_request` returns the 403 on Deny.
+
+### The pieces (keep / refine / build)
+
+- **Default-deny egress** — *the real security line.* Off by default today; when
+  on, unmatched + un-allowlisted egress is denied. **Defense-in-depth, not a
+  complete control**: SNI/Host filtering is bypassable (IP-literal, DoH, ECH
+  blinds SNI, domain-fronting), so it must be paired with the backend egress
+  fence (below) and DNS/IP controls. **Built (gated).**
+- **Destination-bound release** — a stub is only swapped on the host it's bound
+  to (a provider intercepts only its own host(s); a leased `--with` secret
+  records its `vault.host`). A stub replayed on `evil.example` is never swapped
+  *and* (under default-deny) blocked. **Already true; default-deny closes the
+  exfil channel.**
+- **Network-layer enforcement (two modes)** — (a) **explicit-proxy** (`HTTPS_PROXY`
+  + injected CA) for proxy-honoring clients (claude/codex/node) — *shipped*; (b)
+  for clients that ignore proxy env, the security comes from the **backend egress
+  fence set to sole-egress = the broker** (libkrun smoltcp fence / a sandbox
+  allowlist): direct dials to anything but the broker are dropped, so traffic is
+  *forced* through it or fails closed. A transparent redirect is a convenience,
+  not a requirement. **Backend-fence integration: planned.**
+- **Per-run CA** — replace the per-pillbox CA with a per-run ephemeral CA/key to
+  shrink blast radius (the guest only needs to trust it for that run; injected
+  via `NODE_EXTRA_CA_CERTS` + the system store). **Planned.**
+- **Capability stubs** — stubs are high-entropy and looked up server-side.
+  Caveat-based tokens (macaroons/biscuit) would bind {destination,session,expiry}
+  cryptographically, but since pillbox keeps **all release decisions host-side**
+  (no offline delegation), opaque-hashed stubs + server-side checks suffice;
+  caveats are deferred unless delegation is ever wanted.
+
+### Threat model — robust to a *fully*-compromised agent
+
+The boundary is only real if **network-enforced**, not just an in-band token
+check: the agent holds stubs and (under default-deny + sole-egress-to-broker) has
+no other way out; the host broker holds the real creds and the network. Known
+gap (Pluto Security): a secret-injecting proxy still leaves env vars, mounted
+files, and the system prompt visible *inside* the sandbox — the vault protects
+*vault-managed* credentials on the wire, not everything in the box.
+
+### Prior art — adopt vs build
+
+- **Adopt the shape of [iron-proxy](https://github.com/ironsh/iron-proxy)** — the
+  closest shipping system: stub→real swap + default-deny (403 on unmatched) +
+  per-host rules + an SSRF/DNS-rebinding guard (refuses to dial an allowlisted
+  host that resolves into a denied CIDR — *we should add this*). Confirm its
+  license before reusing code vs. design.
+- **Precedent: CyberArk Secretless Broker** (Apache-2.0) — "secret never reaches
+  the workload." Protocol-specific connectors, so not a drop-in for
+  destination-bound HTTPS release (that's our build).
+- **SPIFFE/SPIRE** = identity only (no release decision); optional identity layer.
+
+### Cheapest validating experiment
+
+Turn default-deny on for a vaulted run and assert: (1) a replayed stub on
+`evil.example` is **not** swapped and the request is **denied**; (2) unmatched
+egress returns 403; (3) the real provider call still succeeds. The
+`EgressPolicy::decide` unit tests cover the classification; the live assertion is
+the next slice.
 
 ## Architecture
 

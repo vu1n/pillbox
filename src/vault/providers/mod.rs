@@ -523,6 +523,7 @@ pub(crate) mod test_support {
             bind: None,
             ca_dir: dir.clone(),
             context: super::super::server::RunContext::default(),
+            egress: super::super::egress::EgressPolicy::default(),
         })
         .await
         .expect("server start");

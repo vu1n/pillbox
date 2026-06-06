@@ -173,6 +173,9 @@ impl VaultSession {
                 bind: Some(SocketAddr::from(([0, 0, 0, 0], 0))),
                 ca_dir: ca_dir.clone(),
                 context,
+                // Permissive for now — the broker (default-deny) is wired but
+                // off until the run path opts in. See docs/vault.md.
+                egress: crate::vault::EgressPolicy::default(),
             }))
             .map_err(|e| PillboxError::runtime("vault", format!("start proxy: {e}")))?;
 

@@ -24,7 +24,7 @@ use std::{
 use http_body_util::combinators::BoxBody;
 use hudsucker::{
     certificate_authority::RcgenAuthority,
-    hyper::{Request, Response},
+    hyper::{Request, Response, StatusCode},
     rustls::crypto::aws_lc_rs,
     Body, HttpContext, HttpHandler, Proxy, RequestOrResponse,
 };
@@ -33,6 +33,7 @@ use tokio::net::TcpListener;
 
 use super::{
     ca::Ca,
+    egress::{EgressDecision, EgressPolicy},
     genai_tap::TappedBody,
     known_secrets::VaultMeta,
     lease::SandboxLease,
@@ -80,6 +81,9 @@ pub struct ServerConfig {
     pub ca_dir: PathBuf,
     /// Per-run context surfaced as attributes on gen_ai spans.
     pub context: RunContext,
+    /// Egress policy — default-deny + allowlist. Default is permissive (legacy
+    /// stub-swap-only; unmatched hosts pass through). See [`EgressPolicy`].
+    pub egress: EgressPolicy,
 }
 
 /// In-memory shared state. Handler clones share the registry behind a
@@ -89,6 +93,8 @@ pub(crate) struct ServerInner {
     ca: Ca,
     registry: Mutex<Registry>,
     providers: Vec<Arc<dyn VaultProvider>>,
+    /// See [`ServerConfig::egress`].
+    egress: EgressPolicy,
     /// See [`ServerConfig::context`].
     context: RunContext,
     /// Sender side of a shutdown signal. Dropping this triggers proxy
@@ -111,6 +117,15 @@ impl ServerInner {
 
     fn provider_for_host(&self, host: &str) -> Option<&Arc<dyn VaultProvider>> {
         self.providers.iter().find(|p| p.intercept(host))
+    }
+
+    /// Broker decision for an outbound `host`: swap (a provider claims it),
+    /// pass through (allowlisted, or permissive mode), or deny (default-deny +
+    /// unmatched). The single chokepoint `should_intercept` + `handle_request`
+    /// both consult.
+    fn egress_decision(&self, host: &str) -> EgressDecision {
+        self.egress
+            .decide(host, self.provider_for_host(host).is_some())
     }
 
     fn provider_by_id(&self, id: &str) -> Option<&Arc<dyn VaultProvider>> {
@@ -158,6 +173,7 @@ impl Server {
             ca,
             registry: Mutex::new(Registry::new()),
             providers,
+            egress: config.egress,
             context: config.context,
             shutdown_tx,
         });
@@ -388,11 +404,32 @@ struct InFlightCall {
     is_chat: bool,
 }
 
+/// A 403 returned to the guest when the broker denies egress (default-deny:
+/// the host has no credential provider and isn't on the allowlist). The request
+/// never reaches the network — this is the exfiltration guard.
+fn denied_response(host: &str) -> RequestOrResponse {
+    let body = format!(
+        "pillbox vault: egress to `{host}` denied — no credential provider for \
+         this host and it is not on the egress allowlist (default-deny).\n"
+    );
+    let res = Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(Body::from(body))
+        .expect("static 403 response always builds");
+    RequestOrResponse::Response(res)
+}
+
 impl HttpHandler for VaultHandler {
     async fn should_intercept(&mut self, _ctx: &HttpContext, req: &Request<Body>) -> bool {
         // CONNECT requests use authority form: host:port in the URI.
         let host = req.uri().host().map(str::to_owned).unwrap_or_default();
-        self.server.provider_for_host(&host).is_some()
+        // Intercept (MITM) when we need to swap a stub OR to deny — both require
+        // terminating the connection. Pass-through hosts are tunneled (no MITM).
+        matches!(
+            self.server.egress_decision(&host),
+            EgressDecision::Swap | EgressDecision::Deny
+        )
     }
 
     async fn handle_request(
@@ -403,7 +440,17 @@ impl HttpHandler for VaultHandler {
         let Some(host) = host_from_uri(&req) else {
             return req.into();
         };
+        // Broker decision: deny (block egress), pass through, or fall through to
+        // the provider swap below.
+        match self.server.egress_decision(&host) {
+            EgressDecision::Deny => return denied_response(&host),
+            EgressDecision::AllowPassthrough => return req.into(),
+            EgressDecision::Swap => {}
+        }
         let provider = match self.server.provider_for_host(&host) {
+            // `Swap` implies a provider claims the host; the None arm is purely
+            // defensive (a race between decision and lookup can't happen — both
+            // read the same immutable provider set).
             Some(p) => Arc::clone(p),
             None => return req.into(),
         };

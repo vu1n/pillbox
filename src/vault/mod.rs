@@ -23,6 +23,7 @@
 //!    and the server (graceful proxy shutdown).
 
 mod ca;
+mod egress;
 mod genai_tap;
 pub(crate) mod known_secrets;
 mod lease;
@@ -32,6 +33,7 @@ mod server;
 mod session;
 
 pub(crate) use ca::{cert_path_in as ca_cert_path_in, Ca};
+pub(crate) use egress::EgressPolicy;
 pub(crate) use known_secrets::{HeaderScheme, VaultMeta};
 pub(crate) use lease::SandboxLease;
 pub(crate) use server::{RunContext, Server, ServerConfig};

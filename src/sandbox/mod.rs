@@ -17,6 +17,8 @@ pub(crate) mod http;
 #[cfg(feature = "libkrun")]
 pub(crate) mod libkrun;
 pub(crate) mod opencode;
+#[cfg(feature = "smolvm")]
+pub(crate) mod smolvm;
 
 use anyhow::Result;
 
@@ -40,6 +42,12 @@ pub(crate) fn select_backend() -> Box<dyn SandboxBackend> {
     #[cfg(feature = "libkrun")]
     if std::env::var_os("PILLBOX_BACKEND").is_some_and(|v| v == "libkrun") {
         return Box::new(libkrun::LibkrunBackend);
+    }
+    // SPIKE: adopt smol-machines/smolvm as the local microVM substrate. Opt in
+    // with `PILLBOX_BACKEND=smolvm`. See docs/managed-tier.md (leverage list).
+    #[cfg(feature = "smolvm")]
+    if std::env::var_os("PILLBOX_BACKEND").is_some_and(|v| v == "smolvm") {
+        return Box::new(smolvm::SmolvmBackend);
     }
     Box::new(docker::DockerBackend)
 }

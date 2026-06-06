@@ -41,6 +41,8 @@ mod sandbox;
 mod sandboxes;
 mod secrets;
 mod session;
+#[cfg(feature = "smolvm")]
+mod smolvm;
 #[cfg(test)]
 mod test_util;
 mod url_safety;

@@ -135,6 +135,12 @@ otel-grpc = ["opentelemetry-otlp/grpc-tonic"]
 # rustls + webpki-roots for the vault MITM (L5b).
 libkrun = ["dep:smoltcp", "dep:rustls", "dep:webpki-roots"]
 
+# SPIKE: adopt smol-machines/smolvm (Apache-2.0) as the local microVM substrate,
+# shelling out to its CLI (no extra deps — pure feature gate). Opt in at runtime
+# via `PILLBOX_BACKEND=smolvm`. Evaluates retiring our hand-rolled libkrun L1–L7;
+# see docs/managed-tier.md (leverage list) + docs/libkrun-sandbox.md.
+smolvm = []
+
 [profile.release]
 strip = true
 lto = "thin"

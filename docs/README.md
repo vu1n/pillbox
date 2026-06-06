@@ -18,6 +18,7 @@ authoritative.** When a design doc and a banner disagree, the banner (newer) win
 |---|---|
 | [session-event-log.md](./session-event-log.md) | The durable, attributed per-session event log — the keystone every consumer reads. |
 | [gateway.md](./gateway.md) | The per-session sequencer + broker + attach endpoint §0 gates on. |
+| [managed-tier.md](./managed-tier.md) | **Proposed.** The managed/Cloudflare tier: a Durable Object *is* the §0 gateway; a Container runs the agent. Placement behind the `SandboxBackend` trait. |
 | [agent-io-contract.md](./agent-io-contract.md) | The PTY-free structured I/O contract (`agent.proto`). |
 | [attach-transport.md](./attach-transport.md) | The interactive `Frame` transport. (Transport-agnostic surface; the `docker exec` carrier moves to vsock under libkrun.) |
 

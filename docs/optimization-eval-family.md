@@ -156,7 +156,9 @@ parallelism for more trials, or smaller-granularity tasks), not the optimizer. C
 | Drive spine (run→send→wait-idle) | **built** — `lib.sh`, `run-task.sh` |
 | Token/cost from §0 log | **built** — `pb_usage` in `scripts/eval/lib.sh` folds `session log --type usage` → tokens + `$cost` (per-1M-token env prices); the log's emission-time wire/native precedence means no double-count |
 | Temp-0 worker decoding | **needs wiring** (`MODEL` override exists; set provider temp 0) |
-| Paired comparison + bootstrap CIs + manifest | **not built** — replace `gate.py`'s mean-of-independent-runs (small Python tool) |
+| Paired comparison + bootstrap CIs + σ̂ | **built** — `scripts/eval/paired-stats.py` (paired per-task diff, seeded bootstrap CI over tasks, pooled within-cell σ̂, `--self-test` recovers a planted lift / refuses high-σ + null) |
+| Temp-0 (greedy) decoding | **built** — `pillbox run --temperature` (server agents), `TEMPERATURE` env in the rig |
+| Sensitivity-check runner (§5) | **built** — `scripts/eval/sensitivity-check.sh` (baseline vs planted-oracle × trials at temp-0 → score+cost JSONL → paired-stats). Verified end-to-end on synthetic records; live run needs a codesigned libkrun+opencode box |
 | 3-split (train/val/**test-locked**) | **convention** — enforce in the freeze step |
 | Headroom pre-screen | **not built** — one baseline pass dropping floor/ceiling tasks |
 | Option-A microtask curation (revert real fixes) | **not built** — the main human cost |

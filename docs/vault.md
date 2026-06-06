@@ -110,10 +110,11 @@ Running `--vault` for an agent that isn't `vault_capable` errors with exit 2.
 > **Status:** the decision core + CLI are **built** — `pillbox run --vault
 > --egress-deny [--egress-allow HOST]…` enforces default-deny at the proxy
 > (`src/vault/egress.rs`; off unless `--egress-deny`). The **libkrun backend
-> fence** is already sole-egress, and the **SSRF/DNS-rebind guard** on its MITM
-> forward leg is built. Remaining: the **docker** container-network fence + its
-> forward-leg SSRF guard (hudsucker owns the dial), and a **per-run CA**. Design
-> validated by a deep-research pass (`wmh2zb1y4`) — see
+> fence** is already sole-egress, and the **SSRF/DNS-rebind guard** is built on
+> **both** forward legs (libkrun's MITM and the docker broker's hudsucker dial),
+> as is the **per-run CA** (both backends). Remaining: only the **docker**
+> container-network fence (by design, not a TODO — see below). Design validated
+> by a deep-research pass (`wmh2zb1y4`) — see
 > [§Prior art](#prior-art--adopt-vs-build).
 
 Today's vault is *stub-swap-on-known-host*: it MITMs provider hosts and **passes
@@ -168,15 +169,25 @@ MITM-everything); `handle_request` returns the 403 on Deny.
 - **SSRF / DNS-rebind guard** — refuse to forward to a real-upstream IP in a
   private/loopback/link-local/CGNAT/ULA range (cloud metadata `169.254.169.254`,
   `10.0.0.0/8`, a LAN box, `::1`) — an allowlisted *name* that resolves inward.
-  **Built on the libkrun MITM forward leg** (`is_denied_egress_ip`, unit-tested);
-  the docker broker's forward leg is hudsucker's connector, so that one's the gap.
-- **Per-run CA** — **Built (default).** `--vault` runs now mint a fresh CA in a
-  tempdir per run and discard it after, so a leaked CA is valid only for that one
-  run. The guest installs the cert per-boot regardless (`NODE_EXTRA_CA_CERTS` +
-  the system store), so ephemeral costs nothing. A **stable** CA is opt-in
-  (`pillbox vault ca`, e.g. to pre-trust in a browser): if one exists at
-  `<pillbox>/vault/`, runs reuse it. `pillbox vault status` reports which mode is
-  in effect. (libkrun's MITM CA still uses the per-pillbox dir — a follow-up.)
+  **Built on both forward legs** from one shared helper
+  (`crate::vault::is_denied_egress_ip`, unit-tested): libkrun's MITM
+  `connect_upstream`, and the docker broker's connector — a filtering DNS
+  resolver wired into hudsucker via `with_http_connector` (`src/vault/forward.rs`)
+  so the dial drops denied IPs before connecting (no TOCTOU). The check sits at
+  the resolved IP, so the filtered set is exactly what gets dialed. (Docker's
+  *passthrough-tunnel* leg — non-intercepted CONNECT — is hudsucker's own raw
+  dial and stays unguarded; the airtight path is libkrun's network fence.)
+- **Per-run CA** — **Built (default), both backends.** A `--vault` run mints a
+  fresh CA in a tempdir and discards it after, so a leaked CA is valid only for
+  that one run. The guest installs the cert per-boot regardless
+  (`NODE_EXTRA_CA_CERTS` + the system store), so ephemeral costs nothing. A
+  **stable** CA is opt-in (`pillbox vault ca`, e.g. to pre-trust in a browser):
+  if one exists at `<pillbox>/vault/`, runs reuse it. `pillbox vault status`
+  reports which mode is in effect. On libkrun, only **host-supervised**
+  (foreground) runs and in-sandbox graders get the ephemeral CA; a **reparented**
+  VM (`--detach` / server-mode) outlives the CLI, so a host tempdir would vanish
+  under it — those keep the persistent dir (the same trade as docker `--detach`,
+  which doesn't support `--vault`).
 - **Capability stubs** — stubs are high-entropy and looked up server-side.
   Caveat-based tokens (macaroons/biscuit) would bind {destination,session,expiry}
   cryptographically, but since pillbox keeps **all release decisions host-side**

@@ -17,7 +17,7 @@
 
 use std::collections::VecDeque;
 use std::io::Write;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::Ipv4Addr;
 use std::os::raw::c_int;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -293,36 +293,6 @@ fn allowlisted(allowlist: &[String], name: &str) -> bool {
     allowlist.iter().any(|h| h.eq_ignore_ascii_case(name))
 }
 
-/// SSRF / DNS-rebinding guard for the MITM forward leg ([`super::vault`]'s
-/// `connect_upstream`): refuse to forward to a real-upstream IP in a private,
-/// loopback, link-local, CGNAT, or ULA range. The DNS fence already pins names
-/// to the gateway so the guest can't dial an internal IP *directly*; this closes
-/// the complementary hole where an allowlisted *name* itself resolves (host-side)
-/// to something internal — cloud metadata (169.254.169.254), `10.0.0.0/8`, a LAN
-/// box, `::1`. Global/public addresses pass. (iron-proxy's guard; see docs/vault.md.)
-pub(super) fn is_denied_egress_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            v4.is_private() // 10/8, 172.16/12, 192.168/16
-                || v4.is_loopback() // 127/8
-                || v4.is_link_local() // 169.254/16 (incl. the 169.254.169.254 metadata endpoint)
-                || v4.is_broadcast()
-                || v4.is_unspecified() // 0.0.0.0
-                || v4.is_documentation()
-                // 100.64.0.0/10 — carrier-grade NAT (std's is_shared() is unstable).
-                || matches!(v4.octets(), [100, b, ..] if (64..=127).contains(&b))
-        }
-        IpAddr::V6(v6) => {
-            v6.is_loopback() // ::1
-                || v6.is_unspecified() // ::
-                || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
-                || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
-                // IPv4-mapped (::ffff:a.b.c.d) — re-check the embedded v4.
-                || v6.to_ipv4_mapped().is_some_and(|m| is_denied_egress_ip(IpAddr::V4(m)))
-        }
-    }
-}
-
 /// DNS resolver: NXDOMAIN for non-allowlisted names (the default-deny fence); for
 /// an allowlisted name, answer A=gateway-IP and **pin** it (so L5b's TLS gate can
 /// check the SNI against what the guest legitimately resolved).
@@ -554,40 +524,6 @@ mod tests {
         assert!(matches!(outcome, DnsOutcome::Empty));
         assert_eq!(resp[3] & 0x0f, 0); // NOERROR
         assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 0); // no answers (AAAA)
-    }
-
-    #[test]
-    fn ssrf_guard_denies_internal_addrs() {
-        let denied = [
-            "169.254.169.254", // cloud metadata
-            "127.0.0.1",       // loopback
-            "10.1.2.3",        // private
-            "172.16.5.5",      // private
-            "192.168.1.1",     // private
-            "100.64.0.1",      // CGNAT
-            "0.0.0.0",         // unspecified
-            "::1",             // v6 loopback
-            "fc00::1",         // v6 ULA
-            "fe80::1",         // v6 link-local
-            "::ffff:10.0.0.1", // v4-mapped private
-        ];
-        for s in denied {
-            assert!(
-                is_denied_egress_ip(s.parse().unwrap()),
-                "{s} should be denied"
-            );
-        }
-    }
-
-    #[test]
-    fn ssrf_guard_allows_public_addrs() {
-        let allowed = ["8.8.8.8", "1.1.1.1", "104.18.0.1", "2606:4700::1111"];
-        for s in allowed {
-            assert!(
-                !is_denied_egress_ip(s.parse().unwrap()),
-                "{s} should be allowed"
-            );
-        }
     }
 
     #[test]

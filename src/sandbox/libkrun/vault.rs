@@ -118,7 +118,7 @@ fn connect_upstream(client_config: Arc<ClientConfig>, host: &str) -> Result<Upst
     // SSRF / DNS-rebind guard: an allowlisted name that resolves to an internal
     // address (cloud metadata, LAN, loopback) must not be forwarded to. The DNS
     // fence stops direct-to-IP dials; this stops the name itself pointing inward.
-    if super::egress::is_denied_egress_ip(addr.ip()) {
+    if crate::vault::is_denied_egress_ip(addr.ip()) {
         return Err(anyhow!(
             "refusing to forward {host} → {} (private/internal address; SSRF guard)",
             addr.ip()

@@ -155,6 +155,9 @@ struct Launch {
     creds_share: PathBuf,
     workspace_clone: PathBuf,
     guest_workspace: String,
+    /// The run's vault CA — held so its per-run ephemeral backing dir (if any)
+    /// outlives the supervised VMM child and is dropped after the run.
+    _ca: VaultCa,
 }
 
 /// The guest entrypoint preamble shared by every libkrun launch (PTY agents and
@@ -190,11 +193,66 @@ struct LaunchBase {
     workspace_clone: PathBuf,
     guest_workspace: String,
     guest_env: Vec<(String, String)>,
-    ca_cert_pem: String,
-    vault_ca_dir: PathBuf,
+    ca: VaultCa,
 }
 
-fn launch_base(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Result<LaunchBase> {
+/// The CA a libkrun run's MITM uses, with its on-disk lifetime bundled in. `dir`
+/// is what the VMM child reads (forging leaf certs throughout the run); `_tempdir`
+/// is its backing store for the per-run ephemeral case (`Some`) — held in the same
+/// value so the dir can't outlive the guard. The supervising caller keeps the
+/// whole `VaultCa` alive (in [`Launch`] / a local) until the VM exits.
+struct VaultCa {
+    dir: PathBuf,
+    cert_pem: String,
+    _tempdir: Option<tempfile::TempDir>,
+}
+
+/// Whether a run's caller can host a per-run ephemeral CA. The discriminator is
+/// *who supervises the VM*, not the user's `--detach` flag: a `Persistent` caller
+/// reparents the VMM past this process (detached PTY, or server-mode — which
+/// reparents regardless of `--detach`), so a host tempdir would vanish under the
+/// still-running child; an `Ephemeral` caller supervises the VM to completion, so
+/// the tempdir lives exactly as long as it's needed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CaLifetime {
+    Ephemeral,
+    Persistent,
+}
+
+/// Provision the vault CA for a libkrun run. If a stable CA has been pinned
+/// (`pillbox vault ca` wrote one under `<pillbox>/vault/`), reuse it. Otherwise an
+/// `Ephemeral` caller mints a per-run CA in a tempdir discarded after the run —
+/// the guest reinstalls the cert every boot, so a stable CA buys it nothing, and
+/// ephemeral shrinks a leaked CA key's blast radius to a single run. A
+/// `Persistent` caller falls back to the per-pillbox dir (same trade as docker
+/// `--detach`, which doesn't support `--vault`).
+fn provision_vault_ca(resolved: &Pillbox, lifetime: CaLifetime) -> Result<VaultCa> {
+    let persistent = resolved.subdir_path("vault");
+    let pinned = crate::vault::ca_cert_path_in(&persistent).exists();
+    let (dir, tempdir) = if pinned || lifetime == CaLifetime::Persistent {
+        (resolved.subdir("vault")?, None) // subdir (not the probe path) creates + chmods 0700
+    } else {
+        let td = tempfile::Builder::new()
+            .prefix("pillbox-vault-ca-")
+            .tempdir()
+            .context("create per-run vault CA dir")?;
+        (td.path().to_path_buf(), Some(td))
+    };
+    let ca = crate::vault::Ca::ensure(&dir).map_err(|e| anyhow::anyhow!("ensure vault CA: {e}"))?;
+    let cert_pem = std::fs::read_to_string(ca.cert_path()).context("read vault CA cert")?;
+    Ok(VaultCa {
+        dir,
+        cert_pem,
+        _tempdir: tempdir,
+    })
+}
+
+fn launch_base(
+    spec: &AgentSpec,
+    opts: &RunOpts,
+    resolved: &Pillbox,
+    ca_lifetime: CaLifetime,
+) -> Result<LaunchBase> {
     let rootfs = materialize_rootfs(resolved)?;
 
     let home = spec.home_dir(resolved)?;
@@ -231,10 +289,7 @@ fn launch_base(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Result<L
     ];
     guest_env.extend(composed);
 
-    let vault_ca_dir = resolved.subdir("vault")?;
-    let ca = crate::vault::Ca::ensure(&vault_ca_dir)
-        .map_err(|e| anyhow::anyhow!("ensure vault CA: {e}"))?;
-    let ca_cert_pem = std::fs::read_to_string(ca.cert_path()).context("read vault CA cert")?;
+    let ca = provision_vault_ca(resolved, ca_lifetime)?;
     guest_env.push(("NODE_EXTRA_CA_CERTS".into(), GUEST_CA_PATH.into()));
 
     Ok(LaunchBase {
@@ -243,8 +298,7 @@ fn launch_base(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Result<L
         workspace_clone,
         guest_workspace,
         guest_env,
-        ca_cert_pem,
-        vault_ca_dir,
+        ca,
     })
 }
 
@@ -253,15 +307,20 @@ fn launch_base(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Result<L
 /// `pty-host` entrypoint, and write the VmSpec. The env-fork guard fails fast here
 /// if a real credential reached a guest-readable channel (the env or the script).
 fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Result<Launch> {
+    // Foreground supervises the VM (ephemeral CA ok); `--detach` reparents it.
+    let ca_lifetime = if opts.detach {
+        CaLifetime::Persistent
+    } else {
+        CaLifetime::Ephemeral
+    };
     let LaunchBase {
         rootfs,
         home,
         workspace_clone: clone,
         guest_workspace,
         guest_env,
-        ca_cert_pem,
-        vault_ca_dir,
-    } = launch_base(spec, opts, resolved)?;
+        ca,
+    } = launch_base(spec, opts, resolved, ca_lifetime)?;
 
     // Pre-accept the agent's workspace-trust dialog on the live auth home before
     // boot (claude); operates on host paths, like the docker path.
@@ -290,7 +349,7 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
         .map(|a| shell_quote(a))
         .collect::<Vec<_>>()
         .join(" ");
-    let preamble = guest_launch_preamble(&ca_cert_pem, &home_q, &gw_q);
+    let preamble = guest_launch_preamble(&ca.cert_pem, &home_q, &gw_q);
     // Detach: the guest pty-host *listens* (so the attach socket persists for
     // reattach after the parent returns); foreground: it dials the parent.
     let vsock_flag = if opts.detach { " --vsock-listen" } else { "" };
@@ -349,7 +408,7 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
                 .chain(opts.egress_allow.iter().cloned())
                 .collect(),
             log_path: std::env::var("PILLBOX_KRUN_EGRESS_LOG").ok(),
-            ca_dir: Some(vault_ca_dir.to_string_lossy().into_owned()),
+            ca_dir: Some(ca.dir.to_string_lossy().into_owned()),
             local_forward_port: None, // vaulted agents: no local-model forward
         }),
     };
@@ -368,6 +427,7 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
         creds_share,
         workspace_clone: clone,
         guest_workspace,
+        _ca: ca,
     })
 }
 
@@ -498,15 +558,16 @@ fn launch_server_vm(
         .server
         .expect("launch_server_vm requires a Server-integration agent");
 
+    // Server-mode VMs always reparent (regardless of `--detach`), so the CA must
+    // outlive this process — `Persistent`, never a host tempdir.
     let LaunchBase {
         rootfs,
         home,
         workspace_clone: clone,
         guest_workspace,
         guest_env,
-        ca_cert_pem,
-        vault_ca_dir,
-    } = launch_base(spec, &opts, resolved)?;
+        ca,
+    } = launch_base(spec, &opts, resolved, CaLifetime::Persistent)?;
 
     // Creds: CoW clone the *real* auth home (no stub — the agent authenticates to
     // its provider directly; the MITM forwards it untouched, empty swap).
@@ -516,7 +577,7 @@ fn launch_server_vm(
     // own server + the vsock forward relay (the per-agent script).
     let home_q = shell_quote(GUEST_HOME);
     let gw_q = shell_quote(&guest_workspace);
-    let preamble = guest_launch_preamble(&ca_cert_pem, &home_q, &gw_q);
+    let preamble = guest_launch_preamble(&ca.cert_pem, &home_q, &gw_q);
     let events_q = shell_quote(&format!("{GUEST_HOME}/{}", profile.events_file));
     let script = (launch.build_script)(&preamble, &events_q);
 
@@ -560,7 +621,7 @@ fn launch_server_vm(
                 .chain(opts.egress_allow.iter().cloned())
                 .collect(),
             log_path: std::env::var("PILLBOX_KRUN_EGRESS_LOG").ok(),
-            ca_dir: Some(vault_ca_dir.to_string_lossy().into_owned()),
+            ca_dir: Some(ca.dir.to_string_lossy().into_owned()),
             local_forward_port: launch.local_forward_port,
         }),
     };
@@ -886,21 +947,22 @@ pub(crate) fn score_in_sandbox(
     // Egress is opt-in: an empty allowlist keeps the bare/offline grader. When
     // hosts are declared, prepend the NIC-up + CA-trust preamble (so the guest's
     // TLS clients accept the MITM leaf) and route through the same fence as a run.
-    let (egress, env_extra, script) = if egress_allow.is_empty() {
+    // `_grade_ca` (bound here, not inside the egress branch) must outlive
+    // `child.wait()` below — the VMM reads the per-run CA while the grader runs.
+    let (egress, env_extra, script, _grade_ca) = if egress_allow.is_empty() {
         // Mount the workspace, cd in, run the grader with stderr merged to the
         // console. `&&` so a failed mount/cd surfaces; the grader's exit is last.
         let script = format!(
             "mkdir -p /grade && mount -t virtiofs grade /grade && cd /grade && {{ {cmd} ; }} 2>&1"
         );
-        (None, Vec::new(), script)
+        (None, Vec::new(), script, None)
     } else {
-        let vault_ca_dir = resolved.subdir("vault")?;
-        let ca = crate::vault::Ca::ensure(&vault_ca_dir)
-            .map_err(|e| anyhow::anyhow!("ensure vault CA: {e}"))?;
-        let ca_pem = std::fs::read_to_string(ca.cert_path()).context("read vault CA cert")?;
+        // Supervised one-shot (`child.wait()` below), so a per-run ephemeral CA
+        // is safe; the whole VaultCa is returned from this branch to outlive the grader.
+        let ca = provision_vault_ca(resolved, CaLifetime::Ephemeral)?;
         let ca_b64 = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
-            ca_pem.as_bytes(),
+            ca.cert_pem.as_bytes(),
         );
         let net = egress::guest_net_commands();
         // `exec 2>&1` so setup output (a dep-fetch failure) lands in feedback too;
@@ -923,7 +985,7 @@ pub(crate) fn score_in_sandbox(
             // provider/standard-egress union; the grader reaches deps, nothing else).
             allowlist: egress_allow.to_vec(),
             log_path: std::env::var("PILLBOX_KRUN_EGRESS_LOG").ok(),
-            ca_dir: Some(vault_ca_dir.to_string_lossy().into_owned()),
+            ca_dir: Some(ca.dir.to_string_lossy().into_owned()),
             local_forward_port: None, // grader: tightest fence, no local forward
         });
         // Point every TLS client at the single MITM CA cert. pip/curl/openssl/
@@ -937,7 +999,7 @@ pub(crate) fn score_in_sandbox(
             ("SSL_CERT_FILE", GUEST_CA_PATH),
             ("CURL_CA_BUNDLE", GUEST_CA_PATH),
         ];
-        (egress, env_extra, script)
+        (egress, env_extra, script, Some(ca))
     };
 
     let vmspec = VmSpec {

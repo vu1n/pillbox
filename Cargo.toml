@@ -108,15 +108,23 @@ crossterm = "0.27"
 # (virtio-net in the VMM child). Optional — pulled in only by the `libkrun`
 # feature; the default build never compiles it.
 smoltcp = { version = "0.12", optional = true, default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp"] }
-# rustls for the libkrun vault MITM (L5b) — terminate the guest's TLS on the
-# smoltcp stack. Pinned to 0.23 to match hudsucker (one rustls in the tree);
-# already compiled transitively, so the `dep:rustls` gate adds nothing to the
-# default build. rcgen (a normal dep, used by the vault CA) mints the leaf.
-rustls = { version = "0.23", optional = true }
-# Mozilla root bundle to validate the *real* upstream's cert on the forward leg
-# (L5b-2). Already in the tree transitively; the `dep:` gate keeps it off the
-# default build.
-webpki-roots = { version = "0.26", optional = true }
+# rustls + Mozilla roots for the vault MITM forward leg. Two consumers:
+# libkrun (L5b — terminate the guest's TLS on the smoltcp stack, validate the
+# real upstream's cert) and the docker broker's forward connector (the SSRF
+# guard rebuilds hudsucker's rustls connector around a filtering resolver — see
+# src/vault/server.rs). Pinned to 0.23 to match hudsucker (one rustls in the
+# tree) and already compiled transitively (reqwest/hudsucker), so naming them
+# directly adds no crates. rcgen (the vault CA) mints the leaf.
+rustls = "0.23"
+webpki-roots = "0.26"
+# hyper-rustls + tower-service: the docker forward leg's SSRF guard wraps a
+# custom DNS resolver in an HttpConnector and re-wraps it with rustls TLS
+# (HttpsConnectorBuilder::wrap_connector), then feeds it to hudsucker via
+# with_http_connector. Both are already in the default tree (reqwest/hyper-util).
+# default-features off on hyper-rustls so we don't pull a second crypto provider
+# (we pass our own aws-lc-rs ClientConfig).
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1"] }
+tower-service = "0.3"
 
 [features]
 # Opt-in OTLP/gRPC transport for the OTel logs sink. Adds tonic +
@@ -133,7 +141,7 @@ otel-grpc = ["opentelemetry-otlp/grpc-tonic"]
 # must also be codesigned with the hypervisor entitlement (no codesign on Linux/KVM).
 # Pulls smoltcp for the in-VMM-child userspace egress stack (virtio-net) +
 # rustls + webpki-roots for the vault MITM (L5b).
-libkrun = ["dep:smoltcp", "dep:rustls", "dep:webpki-roots"]
+libkrun = ["dep:smoltcp"]
 
 [profile.release]
 strip = true

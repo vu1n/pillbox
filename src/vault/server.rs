@@ -189,10 +189,16 @@ impl Server {
             let _ = shutdown_rx.changed().await;
         };
 
+        // SSRF-guarded forward connector instead of hudsucker's stock
+        // `with_rustls_connector`: the docker backend has no network fence, so
+        // the dial is the only block on a rebound/internal upstream. See
+        // super::forward.
+        let (https, ws_connector) = super::forward::guarded_connector();
         let proxy = Proxy::builder()
             .with_listener(listener)
             .with_ca(authority)
-            .with_rustls_connector(aws_lc_rs::default_provider())
+            .with_http_connector(https)
+            .with_websocket_connector(ws_connector)
             .with_http_handler(handler)
             .with_graceful_shutdown(shutdown_signal)
             .build()

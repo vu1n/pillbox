@@ -595,10 +595,15 @@ Docker untouched until step 8. Slices (each its own commit, default build green)
     polls an `mpsc::Receiver`, so a hung upstream no longer stalls the smoltcp
     poll loop (re-verified live: 12 swaps, 0 connect failures); (h) ✅ `--detach`
     + session reattach/kill — see the [L6 slice](#l6-detach--sessions) below.
-    **Still deferred:** (d) response-side real→stub for mid-run token refresh
-    (AnthropicProvider's bidirectional OAuth — the A1 single-player-persist /
-    multiplayer-vault question); (e) the `--with --vault` API-key path
-    (same `StubSwap`); (f) codex `*.chatgpt.com` wildcard in the DNS fence; (g)
+    **(e) ✅ `--with --vault` API-key path (A3)** — a vaulted `--with` secret now
+    stub-swaps through the in-child MITM (stub→guest env, real→stdin blob, host→
+    egress allowlist), the same env-fork as OAuth; auto-enables like docker, and
+    bare `--vault` is accepted as a no-op (OAuth is always vaulted here). The stub
+    is minted from the secret's *declared* `VaultMeta.prefix` (never derived from
+    the real), so no key-body bytes reach the guest. **Still deferred:** (d)
+    response-side real→stub for mid-run token refresh (AnthropicProvider's
+    bidirectional OAuth — the A1 single-player-persist / multiplayer-vault
+    question); (f) codex `*.chatgpt.com` wildcard in the DNS fence; (g)
     foreground session records (the sessions-organization polish). **Architecture:** the
     smoltcp egress stack runs in the **VMM child** (a thread alongside
     `start_enter`, netspike's shape), not the parent — `start_enter` is in the
@@ -710,9 +715,10 @@ Docker untouched until step 8. Slices (each its own commit, default build green)
             *Still deferred:* **response-side real→stub** (a token *refresh*
             mid-run returns real tokens the guest then stores — re-leaks until the
             response is stubbed too; fresh-creds short runs don't trigger it; this
-            is the AnthropicProvider's bidirectional OAuth logic) and the
-            **`--with --vault` API-key path** (reuse the same `StubSwap`; needs the
-            secret-resolution-with-`VaultMeta` integration + unblock `--vault`).
+            is the AnthropicProvider's bidirectional OAuth logic). The
+            **`--with --vault` API-key path is ✅ done (A3)** — vaulted `--with`
+            stub-swaps via the same `StubSwap` (stub minted from `VaultMeta.prefix`,
+            real→stdin blob, host→allowlist); `--vault` is now a no-op, not refused.
       - **L5c §0 producer ✅** — no 2nd vsock port needed: the agent writes its
         transcript into the RW-mounted home, so it lands in the **host-side CoW
         creds clone**, and `run()` tails it into the durable `SessionLog` via the

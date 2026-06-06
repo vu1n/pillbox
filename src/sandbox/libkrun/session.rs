@@ -47,12 +47,11 @@ impl SandboxBackend for LibkrunBackend {
                 run_server(spec, opts, resolved)
             };
         }
-        if opts.vault {
-            return Err(unsupported(
-                spec,
-                "--vault (egress + vault v2 is a later slice)",
-            ));
-        }
+        // `--vault` is a no-op on libkrun (accepted for CLI parity with docker):
+        // OAuth creds are *always* env-forked + MITM-swapped here, and egress is
+        // always sole-fenced — there's no non-vault mode to switch on. A vaulted
+        // `--with` (handled in `prepare_launch`) auto-enables the API-key swap on
+        // its own, exactly like docker, no `--vault` required.
 
         let run_started = std::time::SystemTime::now();
         let session_id = crate::session::Session::new_id();
@@ -194,6 +193,19 @@ struct LaunchBase {
     guest_workspace: String,
     guest_env: Vec<(String, String)>,
     ca: VaultCa,
+    /// Stub→real swaps for vaulted `--with` secrets (empty unless the run has
+    /// any). The caller feeds `swap` into `swap_pairs` (the in-child MITM blob)
+    /// and `host` into the egress allowlist — the host gate is what binds each
+    /// release to its destination. Always empty on the server path (it refuses
+    /// vaulted `--with` before reaching [`launch_base`]).
+    with_vault: Vec<WithSwap>,
+}
+
+/// One vaulted `--with` secret's MITM material: the byte-substitution pair and
+/// the host whose egress must be allowlisted for the swap to fire.
+struct WithSwap {
+    swap: SwapPair,
+    host: String,
 }
 
 /// The CA a libkrun run's MITM uses, with its on-disk lifetime bundled in. `dir`
@@ -277,8 +289,28 @@ fn launch_base(
     let guest_workspace = format!("{GUEST_WORKSPACE}/{workspace_name}");
     let workspace_clone = cow_clone_and_scrub(&workspace_host)?;
 
-    let withs = resolve_with_entries(resolved, &opts.withs)?;
-    let composed = resolve_run_env(resolved, opts, &withs, None)?;
+    // Split vaulted `--with` (stub-swapped through the MITM) from plain entries
+    // (real value straight into the env). Plain entries + bundles/env-file compose
+    // via the shared resolver with no vault session; the vaulted ones are handled
+    // libkrun-style below (the docker path routes them through a host-side
+    // `VaultSession` proxy, which libkrun has no equivalent of — its MITM lives in
+    // the VMM child and is fed swaps over stdin).
+    let (vaulted, plain): (Vec<_>, Vec<_>) = resolve_with_entries(resolved, &opts.withs)?
+        .into_iter()
+        .partition(|w| w.meta.is_some());
+    if !vaulted.is_empty() && !spec.vault_capable {
+        let names: Vec<&str> = vaulted.iter().map(|w| w.secret_name.as_str()).collect();
+        return Err(PillboxError::usage(
+            "run",
+            format!(
+                "agent `{}` does not support the vault, so it can't use vaulted secret(s): {}",
+                spec.id,
+                names.join(", ")
+            ),
+        )
+        .into());
+    }
+    let composed = resolve_run_env(resolved, opts, &plain, None)?;
     let mut guest_env: Vec<(String, String)> = vec![
         ("HOME".into(), GUEST_HOME.into()),
         ("TERM".into(), "xterm-256color".into()),
@@ -288,6 +320,34 @@ fn launch_base(
         ),
     ];
     guest_env.extend(composed);
+
+    // Vaulted `--with`: inject a STUB into the env (never the real key), and carry
+    // the {stub→real} swap + host out for the MITM. Same env-fork as OAuth — the
+    // real reaches only the in-child MITM via stdin; the host allowlist binds the
+    // swap to its destination (the guard in `prepare_launch` fails loud otherwise).
+    let mut with_vault = Vec::with_capacity(vaulted.len());
+    for w in &vaulted {
+        let real = crate::secrets::read(resolved, &w.secret_name)?
+            .ok_or_else(|| {
+                PillboxError::runtime("run", format!("secret `{}` not found", w.secret_name))
+                    .with_next(format!("pillbox secret add {}", w.secret_name))
+            })?
+            .trim_end()
+            .to_string();
+        let meta = w.meta.as_ref().expect("partitioned into vaulted");
+        // Mint the stub from the secret's *declared* prefix, never from the real
+        // value: deriving a prefix off `real` would copy body bytes into the stub
+        // for keys whose public prefix isn't exactly 3 hyphen-segments (OpenAI
+        // `sk-proj-…`, `sk-svcacct-…`), and that stub lands in the guest env. The
+        // curated prefix also keeps the stub format-valid (e.g. GitHub `ghp_…`) so
+        // in-guest SDK validators accept it. (Matches the docker host-side path.)
+        let stub = crate::vault::providers::mint_stub(&meta.vault.prefix, spec.id);
+        guest_env.push((w.env_var.clone(), stub.clone()));
+        with_vault.push(WithSwap {
+            swap: SwapPair { stub, real },
+            host: meta.vault.host.clone(),
+        });
+    }
 
     let ca = provision_vault_ca(resolved, ca_lifetime)?;
     guest_env.push(("NODE_EXTRA_CA_CERTS".into(), GUEST_CA_PATH.into()));
@@ -299,6 +359,7 @@ fn launch_base(
         guest_workspace,
         guest_env,
         ca,
+        with_vault,
     })
 }
 
@@ -320,6 +381,7 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
         guest_workspace,
         guest_env,
         ca,
+        with_vault,
     } = launch_base(spec, opts, resolved, ca_lifetime)?;
 
     // Pre-accept the agent's workspace-trust dialog on the live auth home before
@@ -330,7 +392,16 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
     // clone inherits it). The guest mounts the *stubbed* creds — the real tokens
     // never enter the VM; the MITM swaps stub→real on the wire. The reals reach the
     // child out-of-band on stdin (not env/argv/VmSpec).
-    let (creds_share, swap_pairs) = stub_oauth_creds(&home, spec.cred_sentinel)?;
+    let (creds_share, mut swap_pairs) = stub_oauth_creds(&home, spec.cred_sentinel)?;
+    // Fold the vaulted `--with` swaps in alongside the OAuth ones (one MITM blob),
+    // and collect their hosts for the egress allowlist below.
+    let with_hosts: Vec<String> = with_vault
+        .into_iter()
+        .map(|w| {
+            swap_pairs.push(w.swap);
+            w.host
+        })
+        .collect();
 
     // The guest entrypoint: bring up the NIC + trust the CA, mount the shares, cd
     // into the workspace, exec the agent under the in-guest pty-host (Frame over
@@ -406,6 +477,7 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
                 .into_iter()
                 .map(str::to_string)
                 .chain(opts.egress_allow.iter().cloned())
+                .chain(with_hosts.iter().cloned()) // vaulted --with hosts (the swap's destination)
                 .collect(),
             log_path: std::env::var("PILLBOX_KRUN_EGRESS_LOG").ok(),
             ca_dir: Some(ca.dir.to_string_lossy().into_owned()),
@@ -567,6 +639,7 @@ fn launch_server_vm(
         guest_workspace,
         guest_env,
         ca,
+        with_vault: _, // server agents refuse vaulted --with above; always empty here
     } = launch_base(spec, &opts, resolved, CaLifetime::Persistent)?;
 
     // Creds: CoW clone the *real* auth home (no stub — the agent authenticates to

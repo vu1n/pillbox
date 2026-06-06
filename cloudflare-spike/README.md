@@ -19,9 +19,10 @@ partition" doesn't arise; the DO is the sole writer.
 ## Built on the Cloudflare Agents SDK (not raw DurableObject)
 
 `SessionGateway extends Agent<Env>` (`agents` SDK, GA Apr 2026), routed via
-`routeAgentRequest`. **This is the "use Cloudflare to its best" decision, and it
-is not a bet:** the user's own GSV gateway (`~/code/gsv`) runs this exact pattern
-in production — `Kernel`/`Process extends Agent`, custom `this.ctx.storage.sql`
+`routeAgentRequest`. **This is the "use Cloudflare to its best" decision**, backed
+by the CF Agents docs + the SDK design, and corroborated by external prior art:
+GSV (a third-party gateway checked out at `~/code/gsv` — *not* ours) runs this
+exact pattern — `Kernel`/`Process extends Agent`, custom `this.ctx.storage.sql`
 stores, `connection.setState` per-connection, and crucially **never the global
 `this.setState`**. The Agent class is a DurableObject subclass, so it's a strict
 superset of the raw spike: it gives the hibernatable WebSocket lifecycle
@@ -52,7 +53,7 @@ reached via `routeAgentRequest` at `/agents/session-gateway/<sessionId>/*`:
 - **Workflows / Agent "Fibers"** — the durable optimization/eval loop (consumers *of* the §0 log; keep them OUT of the synchronous append path).
 - **AI Gateway** — managed-tier observability/usage capture + caching. Complements, does NOT replace, the credential boundary (it observes/caches, doesn't scrub secrets).
 - **Workers AI + Vectorize** — the small/local-model-worker tier + the kypp memory vector store, each behind kypp's swappable store seam (Vectorize splits storage local↔managed — only when kypp goes managed).
-- **Coordinate with GSV**: both are `wrangler` + DO + R2 stacks on the Agents SDK — decide the shared account/auth/deploy story rather than letting two CF stacks drift. (Respect the divergence: GSV runs its agent loop *in* the DO; pillbox keeps the agent in a Container — a DO can't host a PTY.)
+- **GSV is reference prior art, not shared infra** (it's a third-party project, not ours — nothing to coordinate or merge). Useful only as a worked example of `extends Agent` + custom `ctx.storage.sql` + never-`this.setState`. Note the divergence: GSV runs its agent loop *in* the DO; pillbox keeps the agent in a Container — a DO can't host a PTY.
 
 ## Run the local smoke (no CF account, no deploy)
 

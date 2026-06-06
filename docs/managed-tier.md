@@ -65,10 +65,12 @@ per-connection state (`connection.setState`), `getConnections()`/broadcast, and
 `transactionSync` + `MAX(seq)+1` append survives **verbatim** (a DO primitive the
 Agent inherits — adopting `Agent` costs the sequencer nothing).
 
-**Not a bet — proven in-house:** GSV (`~/code/gsv`) runs this exact pattern in
-production (`Kernel`/`Process extends Agent`, custom `ctx.storage.sql` Store
-classes, `connection.setState` per-connection, **never** global `this.setState`).
-Copy its DO skeleton + `this.schedule`/connect-auth shape.
+**Backed by the CF Agents docs + corroborated by external prior art:** GSV (a
+third-party gateway at `~/code/gsv` — *not* ours) runs this exact pattern
+(`Kernel`/`Process extends Agent`, custom `ctx.storage.sql` Store classes,
+`connection.setState` per-connection, **never** global `this.setState`) — a
+useful worked example to crib the DO skeleton + `this.schedule`/connect-auth shape
+from, nothing to coordinate with.
 
 **The one conflict, declined:** the Agents SDK's global `this.setState` is
 last-write-wins, whole-object, auto-synced — structurally incompatible with an
@@ -83,9 +85,9 @@ the durable optimization loop (consumers *of* the §0 log, never the append path
 **AI Gateway** for managed-tier observability/usage + caching (complements, does
 *not* replace, the credential boundary — it observes, doesn't scrub); **Workers
 AI + Vectorize** for the small-model-worker tier + kypp memory (behind kypp's
-swappable store seam). **Coordinate with GSV's CF account/auth/deploy** rather than
-drifting two stacks — but respect the divergence: GSV runs its agent loop *in* the
-DO; pillbox keeps the agent in a **Container** (a DO can't host a PTY).
+swappable store seam). (GSV is third-party reference prior art, not shared infra —
+note the divergence: GSV runs its agent loop *in* the DO; pillbox keeps the agent
+in a **Container**, since a DO can't host a PTY.)
 
 ---
 

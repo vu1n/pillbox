@@ -104,10 +104,12 @@ Running `--vault` for an agent that isn't `vault_capable` errors with exit 2.
 
 ## Broker model (v2 — the policy-bound egress broker)
 
-> **Status:** the decision core is **built** (`src/vault/egress.rs`, default
-> permissive so nothing changes until enabled); CLI enablement + per-run CA are
-> the next slices. Design validated by a deep-research pass (`wmh2zb1y4`) — see
-> [§Prior art](#prior-art--adopt-vs-build).
+> **Status:** the decision core + CLI are **built** — `pillbox run --vault
+> --egress-deny [--egress-allow HOST]…` enforces default-deny at the proxy
+> (`src/vault/egress.rs`; off unless `--egress-deny`). The **backend egress
+> fence** (sole-egress = the broker, for proxy-ignoring clients) + **per-run CA**
+> are the next slices. Design validated by a deep-research pass (`wmh2zb1y4`) —
+> see [§Prior art](#prior-art--adopt-vs-build).
 
 Today's vault is *stub-swap-on-known-host*: it MITMs provider hosts and **passes
 everything else through**. That swaps credentials safely but is **not an
@@ -137,7 +139,7 @@ MITM-everything); `handle_request` returns the 403 on Deny.
   on, unmatched + un-allowlisted egress is denied. **Defense-in-depth, not a
   complete control**: SNI/Host filtering is bypassable (IP-literal, DoH, ECH
   blinds SNI, domain-fronting), so it must be paired with the backend egress
-  fence (below) and DNS/IP controls. **Built (gated).**
+  fence (below) and DNS/IP controls. **Built — `--vault --egress-deny`.**
 - **Destination-bound release** — a stub is only swapped on the host it's bound
   to (a provider intercepts only its own host(s); a leased `--with` secret
   records its `vault.host`). A stub replayed on `evil.example` is never swapped
@@ -182,7 +184,7 @@ files, and the system prompt visible *inside* the sandbox — the vault protects
 
 ### Cheapest validating experiment
 
-Turn default-deny on for a vaulted run and assert: (1) a replayed stub on
+`pillbox run --vault --egress-deny` and assert: (1) a replayed stub on
 `evil.example` is **not** swapped and the request is **denied**; (2) unmatched
 egress returns 403; (3) the real provider call still succeeds. The
 `EgressPolicy::decide` unit tests cover the classification; the live assertion is

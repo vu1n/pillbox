@@ -154,8 +154,20 @@ impl SandboxBackend for DockerBackend {
                 mode: Some("interactive".to_string()),
                 workspace_id: Some(resolved.workspace_id().to_string()),
             };
-            Some(crate::vault::VaultSession::start(oauth, resolved, context)?)
+            let egress = crate::vault::EgressPolicy {
+                default_deny: opts.egress_deny,
+                allow_hosts: opts.egress_allow.clone(),
+            };
+            Some(crate::vault::VaultSession::start(
+                oauth, resolved, context, egress,
+            )?)
         } else {
+            if opts.egress_deny {
+                eprintln!(
+                    "pillbox: note: --egress-deny has no effect without --vault \
+                     (or a vaulted --with) — the proxy that enforces it isn't running."
+                );
+            }
             None
         };
 

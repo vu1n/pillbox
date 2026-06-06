@@ -248,10 +248,18 @@ enum Command {
         /// e.g. `zai-coding-plan/glm-4.5-air`. Ignored by PTY agents.
         #[arg(long, value_name = "PROVIDER/MODEL")]
         model: Option<String>,
-        /// Extra host to allow through the libkrun egress fence (repeatable),
-        /// for a custom/self-hosted model endpoint beyond the built-in set.
+        /// Allow a host through egress (repeatable): the libkrun egress fence
+        /// AND the vault broker's default-deny allowlist (see `--egress-deny`).
+        /// Exact match, or `.suffix` for subdomains. For a custom/self-hosted
+        /// model endpoint or a package registry a build needs.
         #[arg(long = "egress-allow", value_name = "HOST")]
         egress_allow: Vec<String>,
+        /// Deny outbound to any host that has no credential provider and isn't
+        /// on `--egress-allow` — the vault broker's default-deny line. Enforced
+        /// at the vault proxy, so it needs `--vault` (or a vaulted `--with`) to
+        /// take effect; without one it warns and is a no-op. See docs/vault.md.
+        #[arg(long = "egress-deny")]
+        egress_deny: bool,
         /// Args forwarded to the agent CLI inside the sandbox.
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
@@ -562,6 +570,7 @@ fn run(cli: Cli) -> Result<()> {
             from_bookmark,
             model,
             egress_allow,
+            egress_deny,
             args,
         } => {
             let resolved = Pillbox::resolve(pillbox_arg)?;
@@ -638,6 +647,7 @@ fn run(cli: Cli) -> Result<()> {
                     from_bookmark,
                     model,
                     egress_allow,
+                    egress_deny,
                 },
             )
         }

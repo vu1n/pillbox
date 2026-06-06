@@ -517,14 +517,17 @@ pub(crate) struct RunOpts {
     /// the session and reused by every `session send`. `None` → a default.
     /// Ignored by PTY agents (they pick their own model interactively).
     pub(crate) model: Option<String>,
-    /// `--egress-allow HOST` (repeatable) — extra hosts to allow through the
-    /// libkrun egress fence beyond the built-in set (the vault-intercepted
-    /// providers + the standard model-provider profile). The invoker's escape
-    /// hatch for a custom / self-hosted model endpoint; the MITM terminates +
-    /// forwards them (empty swap). Invoker-set, so an untrusted workspace can't
-    /// widen its own egress. No effect on the docker backends (unfenced).
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))] // libkrun-only consumer
+    /// `--egress-allow HOST` (repeatable) — hosts allowed through egress beyond
+    /// the built-in set (the vault-intercepted providers + the standard
+    /// model-provider profile). Two consumers: the libkrun egress fence, and the
+    /// vault broker's default-deny allowlist (`egress_deny`). Invoker-set, so an
+    /// untrusted workspace can't widen its own egress.
     pub(crate) egress_allow: Vec<String>,
+    /// `--egress-deny` — turn on the vault broker's default-deny line: an
+    /// outbound host with no credential provider and not on `egress_allow` is
+    /// blocked at the proxy. Enforced only when a vault session runs (`--vault`
+    /// or a vaulted `--with`); a no-op (with a warning) otherwise.
+    pub(crate) egress_deny: bool,
 }
 
 #[allow(dead_code)]
@@ -738,6 +741,7 @@ mod tests {
             from_bookmark: None,
             model: None,
             egress_allow: Vec::new(),
+            egress_deny: false,
         }
     }
 
@@ -784,9 +788,13 @@ mod tests {
             .unwrap();
             std::env::remove_var("__PILLBOX_TEST_VAULTED");
 
-            let mut session =
-                VaultSession::start(None::<OAuthAgent>, &g, crate::vault::RunContext::default())
-                    .unwrap();
+            let mut session = VaultSession::start(
+                None::<OAuthAgent>,
+                &g,
+                crate::vault::RunContext::default(),
+                crate::vault::EgressPolicy::default(),
+            )
+            .unwrap();
             let opts = run_opts_with_withs(vec!["VAULTED_KEY"]);
             let withs = resolve_with_entries(&g, &opts.withs).unwrap();
             let env = resolve_run_env(&g, &opts, &withs, Some(&mut session)).unwrap();
@@ -828,9 +836,13 @@ mod tests {
             .unwrap();
             std::env::remove_var("__PILLBOX_TEST_MIX_V");
 
-            let mut session =
-                VaultSession::start(None::<OAuthAgent>, &g, crate::vault::RunContext::default())
-                    .unwrap();
+            let mut session = VaultSession::start(
+                None::<OAuthAgent>,
+                &g,
+                crate::vault::RunContext::default(),
+                crate::vault::EgressPolicy::default(),
+            )
+            .unwrap();
             let opts = run_opts_with_withs(vec!["MIX_PLAIN", "MIX_VAULTED=GITHUB_TOKEN"]);
             let withs = resolve_with_entries(&g, &opts.withs).unwrap();
             let env = resolve_run_env(&g, &opts, &withs, Some(&mut session)).unwrap();

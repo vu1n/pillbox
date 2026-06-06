@@ -240,7 +240,8 @@ only the daylight.**
 
 | Player | Tier / what it is | Leverage | Tag |
 |---|---|---|---|
-| **smolvm** (smol-machines, Apache-2.0, 3.5k★) | our libkrun substrate as OSS — libkrun-FFI + smoltcp 0.13 + a **vsock guest-agent** control plane + OCI (no daemon) + egress allowlist + ssh-agent forwarding (keys never enter guest) + GPU (Venus) + an **embeddable Rust crate** (`EmbeddedRuntime`: create/start/connect/exec/`exec_streaming_with(ExecEvent)`/read+write_file/ports) | **Adopt as the local microVM backend** behind `SandboxBackend` → retire hand-rolled libkrun L1–L7 (they solved the libkrunfw build + codesign + GPU we hand-rolled). Gate: run our pty-host + §0 producer over their vsock/exec/port channel (their guest-agent is theirs; §0/attach/vault stay ours). `.smolmachine` = rootfs/layer pack, **not** a live snapshot → rustic stays our fork-from-store. Same worldview (local-first, library-not-daemon, isolation-default) — **soul brother: collaborate/partner.** | adopt + partner |
+| **smolvm** (smol-machines, Apache-2.0, 3.5k★) | our libkrun substrate as OSS — libkrun-FFI + smoltcp 0.13 + a **vsock guest-agent** control plane + OCI (no daemon) + egress allowlist + ssh-agent forwarding (keys never enter guest) + GPU (Venus) + an **embeddable Rust crate** (`EmbeddedRuntime`: create/start/connect/exec/`exec_streaming_with(ExecEvent)`/read+write_file/ports) | **Adopt as the local microVM backend** behind `SandboxBackend` → retire hand-rolled libkrun L1–L7 (they solved the libkrunfw build + codesign + GPU we hand-rolled). Gate: run our pty-host + §0 producer over their vsock/exec/port channel (their guest-agent is theirs; §0/attach/vault stay ours). `.smolmachine` = rootfs/layer pack (not a live snapshot), but **`machine fork` IS a live CoW fork** (memfd RAM + qcow2 overlay) — a primitive we lack and gain (see Two forks below). Same worldview (local-first, library-not-daemon, isolation-default) — **soul brother: collaborate/partner.** | adopt + partner |
+| **Workspace / FS** (ours: rustic store · smolvm: virtiofs + qcow2 overlay + `machine fork`) | rustic = content-addressed *project* store (`push`/`pull`/`snapshot`/`bookmark`, local **or R2**) — a layer **above** the VM. smolvm = the VM-disk **substrate**: rw virtiofs bind-mount + overlay rootfs + live CoW fork | **Keep rustic** — it's daylight (cross-backend workspace portability: local + managed via R2; already rides the spike's `from_bookmark` pull). **Adopt** smolvm's virtiofs mount + the `machine fork` CoW we never built. Two complementary forks (below). | keep + adopt |
 | **e2b** (Apache-2.0, Firecracker) | raw sandbox + pause/resume (fs+mem) + `connect()` reconnect; self-hostable infra repo | Alt self-hostable sandbox+snapshot primitive behind the trait | integrate |
 | **Morph** (proprietary) | sandbox + branch/snapshot + browser remote-desktop | Managed fork primitive only; "sub-250ms snapshot" claim **unverified** | monitor |
 | **AWS Bedrock AgentCore** (closed) | **closest competitor** — Runtime + Memory + Observability + Harness | Adopt its OTEL per-step trace/span schema; exploit gap = local-first + cross-backend + **true multiplayer-attach** (it's per-session isolation, not multi-human watch-and-drive) | monitor + adopt-schema |
@@ -256,6 +257,24 @@ multiplayer §0 log, cross-backend §0 portability (local Docker/libkrun/smolvm 
 managed), and the eval/optimization loop over the log. Cheapest ship into the
 daylight: adopt AG-UI vocab + OTEL semconv + a durable engine, and stand on
 smolvm/e2b for the substrate, spending the build budget only on the daylight.
+
+### Two complementary forks
+
+Adopting smolvm gives pillbox **two fork primitives at different layers** — not a
+duplicate. The workspace store (rustic) lives *above* the VM and rides any
+backend untouched; the VM-fork lives *below* it.
+
+| | **rustic fork-from-store** | **smolvm `machine fork`** |
+|---|---|---|
+| Layer | the workspace/project store (above the VM) | the running VM (below the workspace) |
+| What forks | a content-addressed snapshot → restored into a fresh workspace | a *live* VM — memfd-CoW RAM + qcow2 overlay disk |
+| Lifetime | durable, portable, **cross-machine** (local + managed via R2) | fast, ephemeral, **same-host** |
+| Use | the `pillbox fork` verb; managed-tier portability; reproducible bases | branch-and-explore: parallel eval fan-out, a multiplayer "fork this session" move |
+
+Keep rustic for durability/portability (it's the cross-backend workspace seam,
+local→managed); **gain** smolvm-fork for live parallelism — a capability the
+workspace-fork-substrate plan called "overlayfs-CoW materialization" and never
+built. They compose: rustic restores a base, smolvm-fork branches it live.
 
 > **Scan caveats.** Mostly vendor docs, not at-scale postmortems; some claims are
 > prove-a-negative. **Genuinely-open:** the multiplayer-attach UX of

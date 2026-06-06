@@ -56,7 +56,8 @@ impl EgressPolicy {
     pub(crate) fn decide(&self, host: &str, intercepted: bool) -> EgressDecision {
         if intercepted {
             EgressDecision::Swap
-        } else if self.allows(host) || !self.default_deny {
+        } else if !self.default_deny || self.allows(host) {
+            // Permissive (the default) short-circuits before the allowlist scan.
             EgressDecision::AllowPassthrough
         } else {
             EgressDecision::Deny

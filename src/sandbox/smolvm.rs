@@ -35,6 +35,11 @@ use crate::pillbox::Pillbox;
 use crate::workspace::WorkspaceBackend;
 use crate::{docker, smolvm};
 
+/// The runner image's ENTRYPOINT (installs the vault CA into the system trust
+/// store, then `exec`s the CMD). smolvm runs the CMD as PID 1 and skips the
+/// image ENTRYPOINT, so we invoke it explicitly — see the call site.
+const GUEST_ENTRYPOINT: &str = "/usr/local/bin/pillbox-entrypoint.sh";
+
 pub(crate) struct SmolvmBackend;
 
 impl SandboxBackend for SmolvmBackend {
@@ -108,14 +113,19 @@ impl SandboxBackend for SmolvmBackend {
         };
         let env_vars = resolve_run_env(resolved, &opts, &withs_resolved, vault_session.as_mut())?;
 
-        // `smolvm machine run -it -I <image> -v ... -e ... -- <agent argv>`.
+        // `smolvm machine run -it --workdir <ws> -I <image> -v ... -e ... -- …`.
         // `--net` opens egress (no fence in the spike — egress-fence + vault are
         // the libkrun/managed path's job). `-v host:guest` matches docker's form.
+        // `--workdir` sets the agent's cwd to the mounted workspace — docker gets
+        // this from `-w`; smolvm runs the command as PID 1 so we must set it (and
+        // it must match the trust-seed path below, or claude re-shows the dialog).
         let mut args: Vec<String> = vec![
             "machine".into(),
             "run".into(),
             "-it".into(),
             "--net".into(),
+            "--workdir".into(),
+            guest_workspace.clone(),
             "-I".into(),
             runner_image,
             "-v".into(),
@@ -145,6 +155,13 @@ impl SandboxBackend for SmolvmBackend {
             );
         }
         args.push("--".into());
+        // smolvm runs the command verbatim as PID 1, bypassing the image
+        // ENTRYPOINT — so invoke the runner entrypoint explicitly. It installs
+        // the vault CA into the system trust store (`update-ca-certificates`,
+        // which native-tls agents like codex need — Node honors
+        // NODE_EXTRA_CA_CERTS without it) then `exec`s the agent. Docker gets
+        // this for free (it prepends ENTRYPOINT to the CMD).
+        args.push(GUEST_ENTRYPOINT.into());
         args.extend(spec.run_argv.iter().map(|s| s.to_string()));
         args.extend(spec.sandbox_args.iter().map(|s| s.to_string()));
         args.extend(opts.args);

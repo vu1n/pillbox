@@ -85,9 +85,59 @@ the durable optimization loop (consumers *of* the §0 log, never the append path
 **AI Gateway** for managed-tier observability/usage + caching (complements, does
 *not* replace, the credential boundary — it observes, doesn't scrub); **Workers
 AI + Vectorize** for the small-model-worker tier + kypp memory (behind kypp's
-swappable store seam). (GSV is third-party reference prior art, not shared infra —
-note the divergence: GSV runs its agent loop *in* the DO; pillbox keeps the agent
-in a **Container**, since a DO can't host a PTY.)
+swappable store seam).
+
+### Cribbed from GSV (third-party prior art — `deathbyknowledge/gsv`)
+
+GSV is the closest worked example on this exact substrate (`Kernel`/`Process
+extends Agent`, custom `ctx.storage.sql` stores, `connection.setState`, never
+`this.setState`, `this.schedule`). Reviewed @ `4b71a789` (v0.2.3). It is *not*
+ours and *not* shared infra — study-only. Two kinds of signal:
+
+- **Negative evidence = our daylight, confirmed.** GSV has **no §0 analog** — no
+  append-only log, no monotonic seq authority, no replay-from-cursor, no
+  per-event `actor`, no driver-token. Durability is per-`Process` conversation
+  state (replaced/compacted, not appended-with-replay) + ephemeral `sig` pub/sub
+  (no persistence, no replay). So the sequenced + attributed + replayable
+  multiplayer log is genuinely unclaimed even here — pillbox builds it; GSV is no
+  shortcut, only confirmation it's the daylight.
+- **Patterns to adopt** (each ties to a milestone):
+  - **Hibernate-safe pending-op routing table** (GSV `kernel/routing.ts`): persist
+    every in-flight cross-boundary call `(id → origin, target, expiresAt)` in DO
+    SQLite + a drop-sweep that *fails* pending ops when a connection/device dies
+    or the DO is evicted mid-call. This is the discipline the **DO↔Container hop**
+    needs and Milestone 0/1 currently hand-waves — a driven `session send` whose
+    container reply is in flight at hibernation must be reaped + failed loudly, not
+    just retried under `idempotencyKey`. **Add to Milestone 0/1.**
+  - **Versioned SQL migrations** (GSV `kernel/schema/runner`) over inline `CREATE
+    TABLE IF NOT EXISTS`: the §0 log table *will* gain `actor`/`class`/blob-refs/
+    `idempotencyKey`. A tiny migration runner in `onStart()` now avoids later
+    `IF NOT EXISTS` archaeology. (See [session-event-log.md](./session-event-log.md) §Versioning.)
+  - **Typed `req/res/sig` frame envelope** (GSV `protocol/frames.ts`): typed
+    args-by-call-name for `/input` + `/event` instead of `body as {...}` casts;
+    drive = `req`→`res` (correlation id + retryable error codes), §0 fan-out = the
+    `sig` channel. (See [gateway.md](./gateway.md) §Submit-wire-contract.)
+  - **App-session multi-client model** (GSV `app-session.ts`: one session, N
+    clients, per-client secret, `active|detached|…`) for `session share`/roster
+    (Milestone 4); **run-queue-while-busy** (GSV `Process` `message_queue` + run
+    phases) for the turn-queue half of driver arbitration; **capability-glob authz**
+    keyed off the authenticated `actor` (who may drive/approve/join);
+    **signal-watch-with-TTL** (GSV `SignalWatchStore`) for off-session attention
+    fan-out (the `dx.md` detached-approval loop) without a resident socket.
+  - **Compaction-to-R2 with generation pointers** (GSV `Process` archives cold
+    segments to R2) validates Milestone 3's "DO keeps seq + recent tail, cold
+    segments → R2".
+
+**The defining divergence — do NOT crib:** GSV has **no sandbox/container at
+all.** It runs the agent loop in the `Process` DO and dispatches tool calls
+(`shell`/`fs`) as syscalls over WebSocket to the *user's own connected devices*
+(BYO-trusted-machine OS). pillbox is the opposite: a **disposable, isolated CF
+Container** running `claude`/`codex`/`opencode` under a real PTY (the runner
+image + libkrun/Docker isolation + the MITM vault + snapshots), with the DO as
+sequencer-only. GSV is therefore positive evidence for the DO-as-Agent skeleton
+and the cribs above, but **no guide for the sandbox/PTY/credential layer** — and a
+cautionary tale on scope (its `kernel/do.ts` is a ~2900-line god-DO spanning
+identity/pkg/apps/git; keep the Session DO single-purpose: log + seq + roster).
 
 ---
 

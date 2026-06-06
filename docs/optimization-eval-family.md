@@ -154,7 +154,7 @@ parallelism for more trials, or smaller-granularity tasks), not the optimizer. C
 | Content-addressed freeze (workspace+grader+prompt) | **built** — `freeze-task.sh`, `push --bookmark`/`pull` |
 | Verifiable graded reward + per-criterion feedback | **built** — `session score --rubric`, `Scored`/`Criterion` |
 | Drive spine (run→send→wait-idle) | **built** — `lib.sh`, `run-task.sh` |
-| Token/cost from §0 log | **data present** (`Usage` event) — needs a small cost-summer |
+| Token/cost from §0 log | **built** — `pb_usage` in `scripts/eval/lib.sh` folds `session log --type usage` → tokens + `$cost` (per-1M-token env prices); the log's emission-time wire/native precedence means no double-count |
 | Temp-0 worker decoding | **needs wiring** (`MODEL` override exists; set provider temp 0) |
 | Paired comparison + bootstrap CIs + manifest | **not built** — replace `gate.py`'s mean-of-independent-runs (small Python tool) |
 | 3-split (train/val/**test-locked**) | **convention** — enforce in the freeze step |

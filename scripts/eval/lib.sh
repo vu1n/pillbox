@@ -78,6 +78,38 @@ try: print(json.dumps(json.load(sys.stdin).get("criteria",[])))
 except Exception: print("[]")'
 }
 
+# --- cost / usage reader (the cost-adjusted-quality metric's denominator) -----
+# Fold a session's durable §0 `usage` events into total tokens + a $cost, read
+# via `session log <id> --type usage` (one Event JSON per line; payload fields
+# are camelCase). The log already applies wire/native source precedence at
+# emission — exactly one source's usage per message — so summing every event
+# never double-counts. Prices are per-1M-token env overrides (default to Claude
+# Sonnet list; set them to the eval model's rate). Emits compact JSON:
+#   {"input":N,"output":N,"cacheRead":N,"cacheCreation":N,"costUsd":F}
+# Call: pb_usage <session-id>
+pb_usage() {
+  "$PILLBOX" session log "$1" --type usage 2>/dev/null | python3 -c '
+import json, os, sys
+pin  = float(os.environ.get("PRICE_IN_PER_M", "3.0"))
+pout = float(os.environ.get("PRICE_OUT_PER_M", "15.0"))
+pcr  = float(os.environ.get("PRICE_CACHE_READ_PER_M", "0.30"))
+pcc  = float(os.environ.get("PRICE_CACHE_CREATION_PER_M", "3.75"))
+i=o=cr=cc=0
+for line in sys.stdin:
+    line=line.strip()
+    if not line: continue
+    try: p=json.loads(line)["payload"]
+    except Exception: continue
+    if p.get("type")!="usage": continue
+    i  += p.get("inputTokens") or 0
+    o  += p.get("outputTokens") or 0
+    cr += p.get("cacheReadInputTokens") or 0
+    cc += p.get("cacheCreationInputTokens") or 0
+cost = (i*pin + o*pout + cr*pcr + cc*pcc)/1_000_000
+print(json.dumps({"input":i,"output":o,"cacheRead":cr,"cacheCreation":cc,"costUsd":round(cost,6)}))
+'
+}
+
 # A feedback message naming the FAILED criteria (.name + .feedback). The schema
 # read is here; the caller decides whether/how to inject it.
 pb_failed_feedback() {

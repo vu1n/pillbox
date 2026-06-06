@@ -30,6 +30,10 @@ fn ca(resolved: &Pillbox, json: bool) -> Result<()> {
         );
     } else {
         println!("{}", ca.cert_path().display());
+        eprintln!(
+            "pillbox: pinned a stable vault CA — `--vault` runs will now reuse it \
+             instead of minting a per-run ephemeral one."
+        );
     }
     Ok(())
 }
@@ -48,6 +52,14 @@ fn status(resolved: &Pillbox, json: bool) -> Result<()> {
             "{}",
             paths::json_v1(vec![
                 ("ca_exists", serde_json::Value::Bool(exists)),
+                // Which trust root `--vault` runs use: a persisted stable CA if
+                // present, else a fresh per-run ephemeral one.
+                (
+                    "ca_mode",
+                    serde_json::Value::String(
+                        if exists { "stable" } else { "per-run" }.to_string()
+                    )
+                ),
                 (
                     "ca_dir",
                     serde_json::Value::String(ca_dir.display().to_string())
@@ -63,17 +75,20 @@ fn status(resolved: &Pillbox, json: bool) -> Result<()> {
     }
     if exists {
         println!(
-            "CA for `{}` exists at {}",
+            "Stable vault CA for `{}` at {}",
             resolved.display_name(),
             ca_cert.display()
         );
-        println!();
-        println!("Run `pillbox run --vault` to route agent traffic through the proxy.");
+        println!("`--vault` runs reuse it. (Delete it to switch to per-run ephemeral CAs.)");
     } else {
-        println!("No vault CA on disk yet for `{}`.", resolved.display_name());
+        println!(
+            "`--vault` runs for `{}` use a per-run ephemeral CA (the default).",
+            resolved.display_name()
+        );
         println!();
-        println!("The CA is created lazily on first `pillbox run --vault`,");
-        println!("or eagerly with `pillbox vault ca`.");
+        println!("A fresh CA is minted per run and discarded after — a leaked CA is");
+        println!("valid only for that run. To pin a stable CA instead (e.g. to");
+        println!("pre-trust it in a browser for debugging), run `pillbox vault ca`.");
     }
     Ok(())
 }

@@ -855,6 +855,46 @@ mod tests {
     }
 
     #[test]
+    fn vault_uses_per_run_ca_unless_a_stable_one_is_pinned() {
+        with_isolated_home("agents-perrun-ca", || {
+            let g = pillbox::global();
+            let vault_dir = g.subdir("vault").unwrap();
+
+            // No pinned CA → per-run ephemeral: the cert exists but lives in a
+            // tempdir, NOT under the pillbox's vault dir.
+            let s1 = VaultSession::start(
+                None::<OAuthAgent>,
+                &g,
+                crate::vault::RunContext::default(),
+                crate::vault::EgressPolicy::default(),
+            )
+            .unwrap();
+            assert!(s1.ca_cert_path().exists());
+            assert!(
+                !s1.ca_cert_path().starts_with(&vault_dir),
+                "ephemeral CA must not persist in the pillbox vault dir: {}",
+                s1.ca_cert_path().display()
+            );
+            drop(s1);
+
+            // Pin a stable CA → runs reuse it (cert path is inside the vault dir).
+            crate::vault::Ca::ensure(&vault_dir).unwrap();
+            let s2 = VaultSession::start(
+                None::<OAuthAgent>,
+                &g,
+                crate::vault::RunContext::default(),
+                crate::vault::EgressPolicy::default(),
+            )
+            .unwrap();
+            assert!(
+                s2.ca_cert_path().starts_with(&vault_dir),
+                "a pinned stable CA must be reused: {}",
+                s2.ca_cert_path().display()
+            );
+        });
+    }
+
+    #[test]
     fn resolve_run_env_vaulted_without_session_errors_loudly() {
         with_isolated_home("agents-novault", || {
             let g = pillbox::global();

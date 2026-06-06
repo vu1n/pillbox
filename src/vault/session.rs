@@ -54,6 +54,11 @@ pub(crate) struct VaultSession {
     _runtime: tokio::runtime::Runtime,
     ca_cert_path: PathBuf,
     listen_addr: SocketAddr,
+    /// Holds the per-run ephemeral CA's tempdir alive until teardown (the cert
+    /// file is bind-mounted into the guest for the run's duration). `None` when a
+    /// stable persistent CA is in use. Last field → dropped last, after the
+    /// server, so the cert outlives anything reading it.
+    _ca_tempdir: Option<tempfile::TempDir>,
 }
 
 impl Drop for VaultSession {
@@ -165,7 +170,20 @@ impl VaultSession {
         context: RunContext,
         egress: crate::vault::EgressPolicy,
     ) -> Result<Self> {
-        let ca_dir = pillbox.subdir("vault")?;
+        // Per-run ephemeral CA by default: a leaked CA is then valid only for
+        // this one run, not every future one. If the user opted into a *stable*
+        // CA (`pillbox vault ca`, e.g. to pre-trust it in a browser for
+        // debugging) — or a legacy one is already on disk — reuse it. The guest
+        // installs the cert per-boot either way (`update-ca-certificates` /
+        // `NODE_EXTRA_CA_CERTS`), so ephemeral costs nothing on the reuse side.
+        let persistent_dir = pillbox.subdir("vault")?;
+        let (ca_dir, ca_tempdir) = if crate::vault::ca_cert_path_in(&persistent_dir).exists() {
+            (persistent_dir, None)
+        } else {
+            let td = tempfile::tempdir()
+                .map_err(|e| PillboxError::runtime("vault", format!("ca tempdir: {e}")))?;
+            (td.path().to_path_buf(), Some(td))
+        };
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -175,7 +193,7 @@ impl VaultSession {
         let server = runtime
             .block_on(Server::start(ServerConfig {
                 bind: Some(SocketAddr::from(([0, 0, 0, 0], 0))),
-                ca_dir: ca_dir.clone(),
+                ca_dir,
                 context,
                 egress,
             }))
@@ -196,6 +214,7 @@ impl VaultSession {
             _runtime: runtime,
             ca_cert_path,
             listen_addr,
+            _ca_tempdir: ca_tempdir,
         })
     }
 

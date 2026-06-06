@@ -12,11 +12,14 @@ stub → real on outbound requests to `api.anthropic.com` and
 `console.anthropic.com`, and swaps real → stub on inbound responses
 (so rotated tokens never reach the guest).
 
-**v0.6 scope:** vault state is **per-pillbox**. Each pillbox gets its
-own CA + key at `<state_dir>/vault/`. A run inside project `myapp` uses
-`~/.pillbox/projects/<key>/vault/pillbox-vault-ca.crt`; a run with
-`--pillbox global` uses `~/.pillbox/global/vault/`. Leases never
-collide across pillboxes.
+**v0.6 scope:** vault state is **per-pillbox**, and the CA is **per-run by
+default** — each `--vault` run mints an ephemeral CA in a tempdir and discards it
+after (blast radius = one run). An *opt-in stable* CA persists at
+`<state_dir>/vault/` if you run `pillbox vault ca` (e.g. to pre-trust it); when
+present, runs reuse it. A run inside project `myapp` would persist a stable CA at
+`~/.pillbox/projects/<key>/vault/pillbox-vault-ca.crt`; `--pillbox global` uses
+`~/.pillbox/global/vault/`. Leases never collide across pillboxes. See
+[§Broker model](#broker-model-v2--the-policy-bound-egress-broker).
 
 > **Egress note:** by default the proxy MITMs only matched hosts
 > (Anthropic/OpenAI/GitHub) and **passes non-matched hosts through unmodified** —
@@ -167,9 +170,13 @@ MITM-everything); `handle_request` returns the 403 on Deny.
   `10.0.0.0/8`, a LAN box, `::1`) — an allowlisted *name* that resolves inward.
   **Built on the libkrun MITM forward leg** (`is_denied_egress_ip`, unit-tested);
   the docker broker's forward leg is hudsucker's connector, so that one's the gap.
-- **Per-run CA** — replace the per-pillbox CA with a per-run ephemeral CA/key to
-  shrink blast radius (the guest only needs to trust it for that run; injected
-  via `NODE_EXTRA_CA_CERTS` + the system store). **Planned.**
+- **Per-run CA** — **Built (default).** `--vault` runs now mint a fresh CA in a
+  tempdir per run and discard it after, so a leaked CA is valid only for that one
+  run. The guest installs the cert per-boot regardless (`NODE_EXTRA_CA_CERTS` +
+  the system store), so ephemeral costs nothing. A **stable** CA is opt-in
+  (`pillbox vault ca`, e.g. to pre-trust in a browser): if one exists at
+  `<pillbox>/vault/`, runs reuse it. `pillbox vault status` reports which mode is
+  in effect. (libkrun's MITM CA still uses the per-pillbox dir — a follow-up.)
 - **Capability stubs** — stubs are high-entropy and looked up server-side.
   Caveat-based tokens (macaroons/biscuit) would bind {destination,session,expiry}
   cryptographically, but since pillbox keeps **all release decisions host-side**

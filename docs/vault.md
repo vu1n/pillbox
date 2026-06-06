@@ -155,8 +155,13 @@ MITM-everything); `handle_request` returns the 403 on Deny.
   name, allowlisted names resolve only to the in-VMM MITM gateway, and a
   hardcoded-IP / forged-SNI dial fails the pin gate — so all egress is *forced*
   through the broker or fails closed. On **docker** only the proxy-level
-  default-deny applies today (the container network isn't fenced — gap). A
-  transparent redirect is a convenience, not a requirement.
+  default-deny applies — and *by design, not as a TODO*: docker's network can't
+  be cleanly egress-fenced (Docker Desktop runs containers in a LinuxKit VM with
+  no reachable host iptables; `--internal` severs the proxy path; DNS-only is
+  bypassable via IP-literals). So a proxy-ignoring/compromised agent on docker
+  *can* still dial direct — the run warns, and **libkrun is the airtight vaulted
+  backend** (it owns the egress leg). A transparent redirect is a convenience,
+  not a requirement.
 - **SSRF / DNS-rebind guard** — refuse to forward to a real-upstream IP in a
   private/loopback/link-local/CGNAT/ULA range (cloud metadata `169.254.169.254`,
   `10.0.0.0/8`, a LAN box, `::1`) — an allowlisted *name* that resolves inward.

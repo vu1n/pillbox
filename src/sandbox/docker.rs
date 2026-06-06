@@ -158,6 +158,19 @@ impl SandboxBackend for DockerBackend {
                 default_deny: opts.egress_deny,
                 allow_hosts: opts.egress_allow.clone(),
             };
+            if opts.egress_deny {
+                // Honest about the boundary: docker's network can't be cleanly
+                // egress-fenced (Docker Desktop runs containers in a LinuxKit VM
+                // with no reachable host iptables), so default-deny here is
+                // proxy-level only — it constrains proxy-honoring clients
+                // (claude/codex/node) but a client that ignores HTTPS_PROXY can
+                // still dial direct. libkrun owns its egress stack and fences at
+                // DNS, so it's the airtight path. See docs/vault.md.
+                eprintln!(
+                    "pillbox: note: --egress-deny on docker is proxy-level only — it does \
+                     not network-fence direct dials. For sole-egress, use PILLBOX_BACKEND=libkrun."
+                );
+            }
             Some(crate::vault::VaultSession::start(
                 oauth, resolved, context, egress,
             )?)

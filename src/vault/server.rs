@@ -589,10 +589,52 @@ impl VaultHandler {
 
 #[cfg(test)]
 mod tests {
+    use super::{EgressPolicy, RunContext, Server, ServerConfig};
     use crate::vault::providers::{
         anthropic, codex,
         test_support::{fresh_server, sample_anthropic_real, sample_codex_real},
     };
+
+    /// The broker's default-deny returns a 403 (not a forward) for a host with no
+    /// credential provider — exercised through the real proxy `handle_request`
+    /// path via an HTTP request routed through the proxy. The host (`.invalid`,
+    /// unresolvable) is never dialed: the 403 short-circuits before any forward,
+    /// which is the point — the request can't leave. (HTTP, not HTTPS, so the
+    /// deny is observed directly at `handle_request` without the CONNECT/TLS
+    /// dance; HTTPS denied hosts are also blocked but surface as a failed tunnel
+    /// rather than a clean 403, and docker's proxy-level deny is best-effort vs
+    /// libkrun's DNS-fence — see docs/vault.md.)
+    #[tokio::test]
+    async fn default_deny_returns_403_for_unmatched_host() {
+        let dir = std::env::temp_dir().join(format!("pillbox-vault-deny-{}", uuid::Uuid::now_v7()));
+        let server = Server::start(ServerConfig {
+            bind: None,
+            ca_dir: dir.clone(),
+            context: RunContext::default(),
+            egress: EgressPolicy {
+                default_deny: true,
+                allow_hosts: vec![],
+            },
+        })
+        .await
+        .expect("server start");
+
+        let proxy_url = format!("http://{}", server.listen_addr());
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(&proxy_url).unwrap())
+            .build()
+            .unwrap();
+
+        let resp = client
+            .get("http://blocked.invalid/")
+            .send()
+            .await
+            .expect("proxy answers (no upstream dial)");
+        assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[tokio::test]
     async fn server_binds_and_writes_ca_cert() {

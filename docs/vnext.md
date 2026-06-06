@@ -84,7 +84,12 @@ scope* change:
   SSH-driven daemon. **BUILD FIRST is now the libkrun substrate** (proof-first
   boot → `pillbox-init` → port §0/attach onto vsock).
 - **Harden #1 (transcript+MITM source of truth) + #3 (native secondary) —
-  BUILD.** Cheap, real.
+  ✅ DONE.** The `Usage` event carries `UsageSource::{Wire,Native}`; the
+  transcript tailer emits `Native` usage *except* when the MITM taps `Wire`
+  usage (Claude + active vault) — `mitm_emits_usage` in `transcripts/local.rs`,
+  regression-tested. Native is the sole source on every libkrun run and every
+  no-vault run. (Native LoC/edit-stats enrichment is the only unbuilt #3 bit;
+  marginal — deferred.)
 - **Harden #2 (`raw_body` blob store) — DEFER.** Net-new infra that *reverses*
   a deliberate memory-discard (`genai_tap.rs:193`); its only consumer is the
   externalized optimization layer.
@@ -534,8 +539,10 @@ Reconciled against the sequence above; commits on `main` (origin synced).
   failed + activity counts), the single classifier `list`/`info`/`diagnose`
   share. Live-verified on libkrun, fresh without a drain thanks to the §0 producer
   above (`list` flips running→needs-input on its own).
-- **Not started:** Steps 5–9 (Harden #1/#3, multiplayer web-attach, input/roles,
-  k8s/managed, profiles).
+- **Not started:** Steps 6–9 (multiplayer web-attach, input/roles, k8s/managed,
+  profiles). **Step 5 Harden #1/#3 is ✅ DONE** (Usage source-of-truth +
+  wire/native precedence, regression-tested); #2 `raw_body` + native LoC remain
+  deferred by design.
 
 **Net:** §0 *as the usable local substrate* (watch + drive your agent, no
 collector) is **done and re-scoped to that**. The structural pieces once lumped

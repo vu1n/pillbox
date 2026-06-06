@@ -245,7 +245,6 @@ pub(crate) fn spawn_session_observability(
         return None;
     }
     let harness = Harness::for_agent(agent_id)?;
-    let mitm_emits_usage = matches!(harness, Harness::Claude) && proxy_active;
     let (watch_root, scope_dir) = harness.transcript_roots(home, guest_cwd);
     Some(spawn_local_tailer(
         log,
@@ -253,8 +252,19 @@ pub(crate) fn spawn_session_observability(
         scope_dir,
         harness,
         session_id.to_string(),
-        !mitm_emits_usage,
+        !mitm_emits_usage(harness, proxy_active),
     ))
+}
+
+/// Whether the MITM already emits `Wire`-sourced [`crate::contract::Usage`] for
+/// this run, so the transcript tailer must suppress its `Native` usage to avoid
+/// double-counting. Only Claude's vault path taps gen_ai usage on the wire;
+/// codex's MITM doesn't, and a no-vault run (incl. every libkrun run today) has
+/// no wire tap — in those cases the transcript is the *only* usage source and
+/// must emit it. The cost-adjusted eval metric folds these `Usage` events, so a
+/// double-count here would corrupt it.
+fn mitm_emits_usage(harness: Harness, proxy_active: bool) -> bool {
+    matches!(harness, Harness::Claude) && proxy_active
 }
 
 /// All `*.jsonl` paths under `root` (recursive). Empty if `root`
@@ -319,6 +329,20 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+
+    #[test]
+    fn native_usage_suppressed_only_when_the_mitm_taps_wire_usage() {
+        // Claude + active vault MITM → wire usage is emitted, so the transcript
+        // must NOT also emit native usage (double-count guard).
+        assert!(mitm_emits_usage(Harness::Claude, true));
+        // Claude with no vault (every libkrun run today) → no wire tap, so the
+        // transcript is the only usage source and must emit native.
+        assert!(!mitm_emits_usage(Harness::Claude, false));
+        // Codex's MITM doesn't tap gen_ai usage even under --vault, so native
+        // stays the source regardless of the proxy.
+        assert!(!mitm_emits_usage(Harness::Codex, true));
+        assert!(!mitm_emits_usage(Harness::Codex, false));
+    }
 
     #[test]
     fn find_new_jsonl_ignores_preexisting_and_picks_fresh_file() {

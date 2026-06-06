@@ -106,10 +106,12 @@ Running `--vault` for an agent that isn't `vault_capable` errors with exit 2.
 
 > **Status:** the decision core + CLI are **built** — `pillbox run --vault
 > --egress-deny [--egress-allow HOST]…` enforces default-deny at the proxy
-> (`src/vault/egress.rs`; off unless `--egress-deny`). The **backend egress
-> fence** (sole-egress = the broker, for proxy-ignoring clients) + **per-run CA**
-> are the next slices. Design validated by a deep-research pass (`wmh2zb1y4`) —
-> see [§Prior art](#prior-art--adopt-vs-build).
+> (`src/vault/egress.rs`; off unless `--egress-deny`). The **libkrun backend
+> fence** is already sole-egress, and the **SSRF/DNS-rebind guard** on its MITM
+> forward leg is built. Remaining: the **docker** container-network fence + its
+> forward-leg SSRF guard (hudsucker owns the dial), and a **per-run CA**. Design
+> validated by a deep-research pass (`wmh2zb1y4`) — see
+> [§Prior art](#prior-art--adopt-vs-build).
 
 Today's vault is *stub-swap-on-known-host*: it MITMs provider hosts and **passes
 everything else through**. That swaps credentials safely but is **not an
@@ -148,10 +150,18 @@ MITM-everything); `handle_request` returns the 403 on Deny.
 - **Network-layer enforcement (two modes)** — (a) **explicit-proxy** (`HTTPS_PROXY`
   + injected CA) for proxy-honoring clients (claude/codex/node) — *shipped*; (b)
   for clients that ignore proxy env, the security comes from the **backend egress
-  fence set to sole-egress = the broker** (libkrun smoltcp fence / a sandbox
-  allowlist): direct dials to anything but the broker are dropped, so traffic is
-  *forced* through it or fails closed. A transparent redirect is a convenience,
-  not a requirement. **Backend-fence integration: planned.**
+  fence set to sole-egress = the broker**. On **libkrun this is already the model**
+  (`src/sandbox/libkrun/egress.rs`): the DNS fence NXDOMAINs every non-allowlisted
+  name, allowlisted names resolve only to the in-VMM MITM gateway, and a
+  hardcoded-IP / forged-SNI dial fails the pin gate — so all egress is *forced*
+  through the broker or fails closed. On **docker** only the proxy-level
+  default-deny applies today (the container network isn't fenced — gap). A
+  transparent redirect is a convenience, not a requirement.
+- **SSRF / DNS-rebind guard** — refuse to forward to a real-upstream IP in a
+  private/loopback/link-local/CGNAT/ULA range (cloud metadata `169.254.169.254`,
+  `10.0.0.0/8`, a LAN box, `::1`) — an allowlisted *name* that resolves inward.
+  **Built on the libkrun MITM forward leg** (`is_denied_egress_ip`, unit-tested);
+  the docker broker's forward leg is hudsucker's connector, so that one's the gap.
 - **Per-run CA** — replace the per-pillbox CA with a per-run ephemeral CA/key to
   shrink blast radius (the guest only needs to trust it for that run; injected
   via `NODE_EXTRA_CA_CERTS` + the system store). **Planned.**

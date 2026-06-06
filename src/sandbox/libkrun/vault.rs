@@ -115,6 +115,15 @@ fn connect_upstream(client_config: Arc<ClientConfig>, host: &str) -> Result<Upst
         .with_context(|| format!("resolve {host}"))?
         .next()
         .ok_or_else(|| anyhow!("no address for {host}"))?;
+    // SSRF / DNS-rebind guard: an allowlisted name that resolves to an internal
+    // address (cloud metadata, LAN, loopback) must not be forwarded to. The DNS
+    // fence stops direct-to-IP dials; this stops the name itself pointing inward.
+    if super::egress::is_denied_egress_ip(addr.ip()) {
+        return Err(anyhow!(
+            "refusing to forward {host} → {} (private/internal address; SSRF guard)",
+            addr.ip()
+        ));
+    }
     let sock = TcpStream::connect_timeout(&addr, StdDuration::from_secs(10))
         .with_context(|| format!("connect {host}"))?;
     sock.set_nonblocking(true)

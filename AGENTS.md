@@ -7,13 +7,14 @@ screen and documents every command an agent might need to run.
 If you're a human, the README is friendlier. If you're an agent, this is
 what you want.
 
-> **⚠️ Direction note (2026-06-01).** The **remote** commands below
-> (`remote add`, `--remote`, `ssh://`/`e2b://`/`docker://`) still work but are
-> **deprecated** — "remote" is becoming Cloudflare-managed or pillbox-running-
-> locally-on-the-box, and the local sandbox runtime is pivoting **Docker →
-> libkrun microVM** (`docs/libkrun-sandbox.md`). Use local `pillbox run`; don't
-> build new automation on `--remote`. Everything else (run, secrets, env, auth,
-> vault, sessions, snapshots) is current.
+> **⚠️ Direction note.** The **remote** backend plane has been **removed**:
+> the `remote add/list/info/rm` commands, `pillbox run --remote`, and the
+> `ssh://`/`e2b://`/`docker://` URL backends are gone. pillbox is now
+> **local-only**, with two local backends: **Docker** (default, cross-platform)
+> and **libkrun** (a local microVM, opt-in via `PILLBOX_BACKEND=libkrun`).
+> "Remote" returns later as the managed/Cloudflare tier, with a different shape.
+> Everything else (run, secrets, env, auth, vault, sessions, snapshots — and
+> local detach/reattach) is current.
 
 ---
 
@@ -87,19 +88,15 @@ global pillbox regardless of where you are.
 | `pillbox auth list/rm` | List/remove agent OAuth state. |
 | `pillbox vault ca/status [--json]` | Inspect the per-pillbox vault CA. |
 | `pillbox sidecar [--bind] [--json]` | Standalone vault sidecar process. |
-| `pillbox remote add NAME URL [--agent A] [--global]` | Register a remote for `pillbox run --remote NAME`. URL is `ssh://user@host[:port]` (VPS) or `e2b://TEMPLATE_ID` (E2B managed sandbox). The remote-side `pillbox` must already be installed on the VPS / baked into the E2B template image (we don't deploy binaries). |
-| `pillbox remote list [--json]` | List remotes visible from the current pillbox (project + global, deduplicated). |
-| `pillbox remote info NAME [--json]` | Show one remote (with inheritance). |
-| `pillbox remote rm NAME [--global]` | Remove a registered remote. |
 | `pillbox session list [--json]` | List sessions started from this pillbox (oldest first). |
 | `pillbox session info ID [--json]` | Show one session (accepts unique id prefix ≥ 4 chars). |
-| `pillbox session attach ID` | Reattach to a detached session. Detach again with Ctrl-A + D or `pillbox session detach ID` from another shell. Works for local Docker, e2b, and ssh sessions. |
+| `pillbox session attach ID` | Reattach to a detached session. Detach again with Ctrl-A + D or `pillbox session detach ID` from another shell. Works for the local Docker and libkrun backends. |
 | `pillbox session detach ID` | Signal a currently-attached pillbox to detach (SIGTERM, no-op if already detached). |
 | `pillbox session send ID TEXT` | Drive a running (detached) session: push TEXT to the agent's PTY as if typed — the programmatic SendInput half (pair with `session subscribe` to read the response). Bytes sent as-is; add a trailing newline/`\r` to submit a prompt to a TUI agent. Local Docker sessions today. |
 | `pillbox session subscribe ID [--from SEQ] [--bind ADDR]` | Stream a session's durable event log to WebSocket subscribers as JSON (one Event per text frame, in seq order from `--from`). For a **live** (detached) session it also tails the transcript→log while serving, so a driven detached session is readable; for a foreground/historical session it serves the existing log. Binds localhost (`--bind`, default `127.0.0.1:0` — printed) until Ctrl-C. The §0 local read surface a chat bridge / orchestrator / browser connects to without a shell. If `$PILLBOX_EVENTS_WEBHOOK` is set, also POSTs attention signals to it (read-side). |
 | `pillbox session watch ID [--from SEQ]` | Render a session's event stream to **this terminal** — messages by role, tools (⚙/✓/✗), thinking, the ⏳ attention signal — the human-facing reader (`docker logs` model; `subscribe` is the machine/WS sibling). Tails a live session as it works. Ctrl-C to stop. Accepts an id prefix. |
 | `pillbox session rm ID` | Tear down the backend (kill sandbox) and remove the session record. |
-| `pillbox session done ID --status ok\|failed [--reason TEXT] [--exit-code N] [--trace-path PATH] [--result-snapshot HANDLE]` | Emit `session.completed` / `session.failed` to every configured sink. Invoked automatically by the in-sandbox wrapper after the agent exits (also passes `--result-snapshot` from the remote workspace push); can also be called manually. Does NOT tear down the sandbox — use `session rm` for that. |
+| `pillbox session done ID --status ok\|failed [--reason TEXT] [--exit-code N] [--trace-path PATH] [--result-snapshot HANDLE]` | Emit `session.completed` / `session.failed` to every configured sink. Invoked automatically by the in-sandbox wrapper after the agent exits (also passes `--result-snapshot` from the result workspace push); can also be called manually. Does NOT tear down the sandbox — use `session rm` for that. |
 | `pillbox session pull ID [--to DIR]` | Rehydrate a session's result workspace into a directory. Reads `result_snapshot` from the session record; errors clearly if the agent hasn't finished. Default `DIR` is `./session-<id>`. |
 | `pillbox session score ID (--cmd "VERIFIER" \| --rubric FILE) [--snapshot HANDLE \| --workspace DIR] [--in-sandbox] [--grader-egress HOST]… [--json]` | **Externally grade** a session's result — the verifiable, non-self-reported reward channel (vs `session done --status`, which is the agent's self-report, Goodhart-banned). `--cmd VERIFIER` runs one command via `sh -c` with cwd = the rehydrated `result_snapshot` (or `--snapshot`/`--workspace`), captures its **exit code + output**, and appends a `scored` §0 event (exit 0 → passed/score 1.0, else 0.0; combined output → `feedback`, tail-capped at 32K). **`--rubric FILE`** (mutually exclusive with `--cmd`) grades against a checklist — each non-blank, non-`#` line is `NAME :: COMMAND`, a named criterion run in the same workspace — and the `scored` event gains **per-criterion verdicts** (`criteria: [{name, passed, feedback}]`) with `score` = the passed fraction (a real gradient; the decomposed feedback an optimizer reflects on). Default runs on the host; **`--in-sandbox`** runs it in a one-shot microVM (the runner toolchain, offline + secret-free) — for real repos whose tests need the image's deps (libkrun feature). **`--grader-egress HOST`** (repeatable, in-sandbox only) opens the grader's DNS-fence to the listed hosts so its tests can fetch deps (`--grader-egress pypi.org --grader-egress files.pythonhosted.org` for pip; `registry.npmjs.org` for npm) — same MITM-with-empty-swap path as a vault run, no creds, every other host fenced; trades offline reproducibility for reachability. **`--json`** emits the verdict (`{version, session, grader, passed, score, feedback, seq}`) on stdout so a loop reads the result directly — no stdout-scrape, no §0-log reach-in; `seq` is the `scored` event's log seq. Otherwise read back via the session's §0 log (`session subscribe`/`watch` or the log file); the optimization loops consume these. |
 | `pillbox session ingest ID [--json]` | Drain a session's durable raw §0 capture (its persisted `/event` stream) into the canonical `log.jsonl`, **post-hoc and idempotent**. For headless/batch runs (the optimization loop) where no live `subscribe`/`watch` filled the log: the reparented guest outlives `run`, so a host-side live tailer can't persist for it, but the guest's capture file does — so the full agent **trajectory** (messages + tool calls) lands in the §0 log without racing the session. Run it BEFORE `session score` so trajectory events precede the `scored` event in seq order. Re-running is a no-op (`.ingested` marker). **libkrun opencode today**; docker/PTY sessions drain live via `session subscribe`/`watch`. No VM boot — pure file read + log append. |
@@ -133,9 +130,8 @@ global pillbox regardless of where you are.
 | `--env BUNDLE` | — | Inject every variable from a stored env bundle. |
 | `--env-file PATH` | — | Inject every variable from a `.env` on disk. |
 | `--vault` | — | Route agent traffic through the stub-swap proxy. |
-| `--remote NAME` | — | Run on a registered remote (`ssh://` or `e2b://`) instead of locally. Requires an S3-shaped workspace backend. The launch path snapshots the current workspace as the remote base unless `--from-bookmark` is passed. For `e2b://` remotes: `node` + `npm i -g e2b` must be installed locally and `E2B_API_KEY` must be available in the environment. |
-| `--from-bookmark NAME` | — | Start from a named snapshot bookmark. Local runs first restore that bookmark into the workspace; remote runs hydrate from it instead of auto-snapshotting cwd. |
-| `--detach` | — | Start the session and immediately return — the agent keeps running in the background; reattach with `pillbox session attach <id>`. Works for local Docker, e2b, and ssh remotes. Local `--detach` does NOT support `--vault` (the host-side proxy can't outlive the CLI). |
+| `--from-bookmark NAME` | — | Start from a named snapshot bookmark — restore that bookmark into the workspace before launching the agent. |
+| `--detach` | — | Start the session and immediately return — the agent keeps running in the background; reattach with `pillbox session attach <id>`. Works for both local backends (Docker and libkrun). Local `--detach` does NOT support `--vault` (the host-side proxy can't outlive the CLI). |
 | `--events-webhook URL` | — | POST every lifecycle event to URL as JSON. Forwarded to the in-sandbox wrapper so terminal events (`session.completed`/`failed`) reach back to the orchestrator. Equivalent to `$PILLBOX_EVENTS_WEBHOOK`. See [docs/observability.md](./docs/observability.md) for the full sink reference (JSONL / webhook / OTLP via `$OTEL_EXPORTER_OTLP_ENDPOINT`). |
 | `--ttl DURATION` | — | Per-session retention TTL — `30m` / `24h` / `7d` (`s`/`m`/`h`/`d` units only, max 365d). Writes `expires_at` to the record. `pillbox session prune` drops expired sessions. Requires `--detach`. |
 | `--label TEXT` | — | Human label for a detached session, surfaced in `pillbox session list`. Only meaningful with `--detach`. |
@@ -181,16 +177,15 @@ works today.
 ### Sessions — detach + reattach
 
 A `pillbox run --detach` session can be left running and reconnected to
-later. This works for local Docker runs, `e2b://` remotes, and `ssh://`
-remotes. Local `--detach` does NOT support `--vault` (the host-side
-proxy can't outlive the CLI); remote runs (e2b + ssh) require an
-S3-shaped workspace backend.
+later. This works for both local backends (Docker and libkrun). Local
+`--detach` does NOT support `--vault` (the host-side proxy can't outlive
+the CLI).
 
 | Action | How |
 |---|---|
-| Start in the background | `pillbox run --detach [--remote NAME] [--label TEXT]` — prints the new session id, agent keeps running. |
+| Start in the background | `pillbox run --detach [--label TEXT]` — prints the new session id, agent keeps running. |
 | Detach from an interactive run | `Ctrl-A D` from the local terminal. Sandbox keeps running; pillbox returns. |
-| List | `pillbox session list` — id, attached/detached, agent, remote, started_at, label. |
+| List | `pillbox session list` — id, attached/detached, agent, started_at, label. |
 | Reattach | `pillbox session attach ID` (id or unique ≥4-char prefix). |
 | Detach from another shell | `pillbox session detach ID` — SIGTERMs the local pillbox that's attached. Exits 0 if already detached. |
 | Tear down | `pillbox session rm ID` — kills the sandbox and removes the local record. |
@@ -211,7 +206,6 @@ only its own sessions; the global pillbox's list shows global ones.
 |---|---|---|
 | Secrets | project + global, project wins on conflict | resolved pillbox (or `--global`) |
 | Env bundles | project + global, project wins on conflict | resolved pillbox (or `--global`) |
-| Remotes | project + global, project wins on conflict | resolved pillbox (or `--global`) |
 | Agent auth | global only | global only |
 | Vault state | per-pillbox | per-pillbox |
 | Sessions | per-pillbox (no inheritance) | resolved pillbox |
@@ -426,6 +420,6 @@ v0.5 command shapes that break in v0.6:
 
 ## Pillbox version this guide describes
 
-v0.6 (through PR 6 — pillbox-as-bundle reshape + workspace versioning +
-remote backends + sessions). If `pillbox version` reports something
-else, command shapes may differ.
+v0.6 (pillbox-as-bundle reshape + workspace versioning + sessions,
+local-only). If `pillbox version` reports something else, command shapes
+may differ.

@@ -30,8 +30,10 @@ can build on. No cloud, no account, no platform required.
   event stream you can drive: `session send` pushes input, `session subscribe`
   streams it to a UI / bot / orchestrator, `session watch` reads it in your
   terminal. Build a frontend on the exact surface you use by hand.
-- **Remote when you want it.** The same bundle runs on a remote backend
-  (`--remote`) — extra, not required. Local is the whole product on its own.
+- **Local-only, two backends.** Runs against **Docker** (the default,
+  cross-platform) or **libkrun** (a local microVM, opt-in via
+  `PILLBOX_BACKEND=libkrun`). A managed/Cloudflare "remote" tier is on the
+  roadmap but not shipped today.
 
 ## Why "pillbox-as-bundle"
 
@@ -46,10 +48,9 @@ Mixing those into one bundle gives you:
   project's leases never collide with another's.
 - **Shared agent auth.** A single `pillbox auth login --agent claude`
   lives in the global pillbox and is reused across every project.
-- **Local-first; travels when you want.** The whole thing runs on your machine
-  with zero cloud dependency. When you do want it elsewhere, `pillbox run
-  --remote NAME` sends the same bundle — workspace, vault material, config —
-  to a remote backend behind the placement trait. Extra, not required.
+- **Local-first.** The whole thing runs on your machine with zero cloud
+  dependency. A managed/Cloudflare tier for running the same bundle elsewhere
+  is planned, but pillbox is local-only today.
 
 ## Where state lives
 
@@ -60,8 +61,7 @@ Mixing those into one bundle gives you:
 │   ├── env/                               # cross-project env bundles
 │   ├── auth/{claude,codex}/               # agent OAuth state (always global today)
 │   ├── vault/                             # CA + key for vault sessions
-│   ├── remotes/                           # registered VPS / E2B remotes
-│   └── sessions/                          # detached session records (local Docker, E2B, SSH)
+│   └── sessions/                          # detached session records (local Docker / libkrun)
 ├── projects/
 │   └── -Users-vuln-work-foo/              # `/Users/vuln/work/foo` with `/` → `-`
 │       ├── meta.json                      # { name, created_at, agent_default, workspace }
@@ -69,11 +69,10 @@ Mixing those into one bundle gives you:
 │       ├── env/
 │       ├── auth/                          # reserved (per-project auth → v0.7)
 │       ├── vault/
-│       ├── remotes/                       # per-pillbox remote overrides
 │       ├── sessions/                      # sessions started from this pillbox
 │       ├── repo-password                  # 0600 — rustic repo encryption password
 │       └── repo/                          # local rustic repository (local backend only)
-└── cache/                                 # versioned helper scripts (e.g. e2b-helper-vX.mjs)
+└── cache/                                 # versioned helper scripts
 ```
 
 The state-dir key is the absolute path of the directory holding
@@ -117,15 +116,12 @@ to bypass discovery and operate on a specific named pillbox.
 | `pillbox rm NAME` | Delete a project pillbox by name or key. Refuses `global`. |
 | `pillbox info [--json]` | Show the current pillbox. |
 
-### Run + remotes + sessions
+### Run + sessions
 
 | Command | What it does |
 |---|---|
-| `pillbox run [opts] [-- args]` | Launch the agent against the current pillbox (local Docker by default). |
-| `pillbox run --remote NAME [--from-bookmark B]` | Launch on a registered remote VPS (`ssh://`) or E2B sandbox (`e2b://`). |
-| `pillbox run --detach [--remote NAME] [--label TEXT]` | Start the session in the background; print the reattach id. Works locally and on `ssh://` / `e2b://` remotes. |
-| `pillbox remote add NAME URL [--agent A]` | Register a remote — `ssh://user@host[:port]` or `e2b://TEMPLATE_ID`. |
-| `pillbox remote list/info/rm` | Manage the remote registry. |
+| `pillbox run [opts] [-- args]` | Launch the agent against the current pillbox (local Docker by default; `PILLBOX_BACKEND=libkrun` for the microVM). |
+| `pillbox run --detach [--label TEXT]` | Start the session in the background; print the reattach id. Works on both local backends. |
 | `pillbox session list [--json]` | Sessions started from this pillbox. |
 | `pillbox session info ID [--json]` | One session (accepts unique id prefix ≥ 4 chars). |
 | `pillbox session attach ID` | Reattach to a detached session. Detach again with **Ctrl-A D**. |
@@ -172,66 +168,35 @@ override cwd-based discovery.
 |---|---|---|---|
 | Secrets | project + global (project wins) | resolved pillbox | force global |
 | Env bundles | project + global (project wins) | resolved pillbox | force global |
-| Remotes | project + global (project wins) | resolved pillbox | force global |
 | Auth | global | global | (implicit; accepted for fwd-compat) |
 | Vault | per-pillbox | per-pillbox | n/a |
 | Sessions | per-pillbox (no inheritance) | resolved pillbox | n/a |
 
 A project pillbox always sees the global pillbox as a fallback for
-secrets / env / remotes. Sessions are runtime state and stay tied to
-the pillbox that started them.
+secrets / env. Sessions are runtime state and stay tied to the pillbox
+that started them.
 
-## Remote backends (deprecated)
+## Local backends
 
-> **⚠️ Deprecated direction (2026-06-01).** `--remote` (`ssh://`, `e2b://`,
-> `docker://`) still ships but is on the way out. "Remote" is now
-> *Cloudflare-managed* or *pillbox running locally on the VPS*; the local runtime
-> is pivoting Docker → **libkrun microVM** (see
-> [docs/libkrun-sandbox.md](docs/libkrun-sandbox.md)). Don't build new work on
-> the remote backends.
+pillbox runs locally against one of two backends:
 
-```sh
-# SSH to a VPS you already installed pillbox on:
-pillbox remote add prod-vps ssh://deploy@vps.example.com
-pillbox run --remote prod-vps
+- **Docker** (default, cross-platform) — the agent runs in the runner
+  container on your local daemon.
+- **libkrun** (opt-in via `PILLBOX_BACKEND=libkrun`) — a local microVM
+  (macOS/HVF, Linux/KVM); feature-gated, needs libkrun installed (plus a
+  codesign on macOS). See [docs/libkrun-sandbox.md](docs/libkrun-sandbox.md).
 
-# E2B managed sandbox (requires `node` + `npm i -g e2b` + $E2B_API_KEY):
-pillbox remote add prod-cloud e2b://my-pillbox-template
-pillbox run --remote prod-cloud
+Both backends support the full session surface, including detach/reattach.
 
-# Backgrounded session — reattach later from any shell:
-pillbox run --remote prod-cloud --detach --label "nightly-build"
-# pillbox: ✓ session `abc123def456` started in background.
-#          pillbox session attach abc123def456  # reattach
-
-pillbox session attach abc123def456     # streams the PTY back; Ctrl-A D detaches
-pillbox session detach abc123def456     # from another shell
-pillbox session rm abc123def456         # kill sandbox + remove record
-```
-
-**Workspace handoff:** remote runs require an S3-shaped workspace
-backend in v0.6 — the local pillbox and the remote share the same
-bucket / endpoint. The launch path snapshots cwd as the remote base
-unless `--from-bookmark` is passed; the remote hydrates that snapshot
-before the agent starts and pushes a result snapshot after it exits.
-Local-rustic transport over the wire is a planned PR 4.1.
-
-**Vault handoff:** real secret values cross the network once, over
-the encrypted channel (SSH stdin or the E2B Files API), into the
-remote pillbox's vault session memory. The blob is never written to
-disk on the SSH path; E2B stages it through 0600 temp files locally
-and in sandbox `/tmp`, then unlinks after the in-sandbox pillbox reads it.
-
-**SSH vs E2B parity:** detached sessions (`--detach`,
-`session attach`/`detach`/`rm`) work uniformly across local Docker,
-E2B, and SSH remotes — each carries the attach-transport frames over
-its own byte pipe (docker exec, an E2B raw-pty `pty-relay`, ssh stdio).
+A managed/Cloudflare **remote** tier — running the same bundle off your
+machine — is on the roadmap but not shipped today; it will return with a
+different shape than the old `--remote` backends.
 
 ## Sessions and the detach hotkey
 
 When you attach to a session (initial run OR `pillbox session
-attach`), the local terminal proxies the session's PTY (local Docker,
-e2b, or ssh). To detach **without killing the session**:
+attach`), the local terminal proxies the session's PTY. To detach
+**without killing the session**:
 
 - **Ctrl-A then D** — works from the attached terminal.
 - `pillbox session detach <id>` — works from any shell.
@@ -281,9 +246,10 @@ Pillbox **does not** defend against:
 - Stolen unencrypted disk / backups. Files are plaintext at 0600.
   Disk encryption (FileVault / LUKS / BitLocker) is the at-rest
   defense.
-- Container escape or kernel attacks on the local Docker backend.
-  Remote backends (E2B microVMs, VPSes) move execution to a
-  hardware-isolated host when this is the wrong trust boundary.
+- Container escape or kernel attacks on the local Docker backend. The
+  libkrun backend (`PILLBOX_BACKEND=libkrun`) moves execution into a
+  microVM with a hardware-isolated boundary when this is the wrong trust
+  boundary for the Docker backend.
 
 Same posture as `gh`, `aws`, `docker`, `kubectl`. Pillbox is a
 sandbox runner, not a secrets manager.
@@ -291,25 +257,20 @@ sandbox runner, not a secrets manager.
 ## Status
 
 Pre-alpha. v0.6 is the major reshape (pillbox-as-bundle identity +
-remote backends + sessions). Roadmap:
+sessions), local-only. Roadmap:
 
 - **v0.1–v0.5** ✅ Claude / Codex sandboxing, secrets + env bundles,
   pillbox.toml v1, credential vault (Anthropic + Codex + API keys), CI.
-- **v0.6 PR 1** ✅ `SandboxBackend` trait + sidecar mode.
-- **v0.6 PR 2** ✅ Pillbox-as-bundle CLI redesign.
-- **v0.6 PR 3** ✅ Workspace backends (`rustic_core` — local + S3/R2).
-- **v0.6 PR 4** ✅ RemoteSsh backend.
-- **v0.6 PR 5** ✅ RemoteE2b backend.
-- **v0.6 PR 6** ✅ Sessions (list/attach/detach) across local Docker,
-  E2B, and SSH.
-- **v0.6 PR 7** ✅ Polish + docs/README rewrite.
-- **v0.6 PR 8** ✅ `docker://` remote (run an OCI runner image on any
-  reachable daemon) + the **drive/read surface** (`session send` /
-  `subscribe` / `watch`) — the interactive event substrate, live-verified.
-- **v0.7+** the §0 event substrate as a first-class gateway; **substrate pivot
-  Docker → libkrun microVM** ([docs/libkrun-sandbox.md](docs/libkrun-sandbox.md))
-  — secure VM boundary, no daemon, macOS-native; the remote backends deprecate
-  out as "remote" becomes Cloudflare-managed / local-on-box.
+- **v0.6** ✅ `SandboxBackend` trait + sidecar mode; pillbox-as-bundle
+  CLI redesign; workspace backends (`rustic_core` — local + S3/R2);
+  sessions (list/attach/detach) on the local backends; the **drive/read
+  surface** (`session send` / `subscribe` / `watch`) — the interactive
+  event substrate, live-verified.
+- **libkrun backend** ✅ local microVM (`PILLBOX_BACKEND=libkrun`) — a
+  secure VM boundary, no daemon, macOS-native
+  ([docs/libkrun-sandbox.md](docs/libkrun-sandbox.md)).
+- **v0.7+** the §0 event substrate as a first-class gateway; a
+  managed/Cloudflare **remote** tier for running the bundle off-box.
 
 ## Build
 
@@ -348,7 +309,6 @@ current.
   - [vault.md](./docs/vault.md) — per-pillbox credential vault
   - [observability.md](./docs/observability.md) — OTLP telemetry + Workshop integration
   - [shared-mcp.md](./docs/shared-mcp.md) — `--mcp NAME=URL` shared-MCP attachments
-  - [remotes.md](./docs/archive/remotes.md) — remote backends + sessions
   - [runner-image.md](./docs/runner-image.md) — the runner image, overrides, custom builds
   - [recipes.md](./docs/recipes.md) — copy-paste flows
   - [security.md](./docs/security.md) — threat model

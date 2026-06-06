@@ -1,8 +1,10 @@
 # Recipes
 
-> **Note (2026-06-01):** recipes using `--remote` / `docker://` / `e2b://` /
-> `ssh://` are **deprecated** (remote → Cloudflare-managed / local-on-box; local
-> runtime → [libkrun](./libkrun-sandbox.md)). Local recipes are unaffected.
+> **Note:** pillbox is **local-only**. The old remote recipes (`--remote` /
+> `docker://` / `e2b://` / `ssh://`) have been removed; "remote" returns later
+> as a managed/Cloudflare tier with a different shape. Local runs use the Docker
+> backend by default, or the [libkrun](./libkrun-sandbox.md) microVM via
+> `PILLBOX_BACKEND=libkrun`.
 
 Copy-paste flows for common tasks. For the full command reference see
 [AGENTS.md](../AGENTS.md); for the why behind secrets see
@@ -165,54 +167,26 @@ pillbox doctor --json | jq '.overall_ok'
 Every `--json` payload includes a top-level `version: 1`. Pin against
 that — fields will be added freely, the version bumps on restructure.
 
-## Running on a registered VPS over SSH
+## Running on the libkrun microVM backend
+
+By default `pillbox run` uses the local Docker backend. To run inside a
+local microVM instead, opt in with `PILLBOX_BACKEND=libkrun` (needs
+libkrun installed, plus a codesign on macOS):
 
 ```sh
-# One-time: install pillbox on the VPS (we don't deploy binaries).
-ssh deploy@vps.example.com 'cargo install --git https://github.com/vu1n/pillbox'
-
-# Register it locally.
-pillbox remote add prod-vps ssh://deploy@vps.example.com
-
-# A remote run needs an S3-shaped workspace backend; the VPS pulls
-# from the same bucket, so no workspace bytes cross SSH.
-pillbox new --workspace-backend s3 \
-  --bucket my-snapshots --endpoint https://acct.r2.cloudflarestorage.com \
-  --access-key-env R2_ACCESS_KEY --secret-key-env R2_SECRET_KEY
-
-pillbox run --remote prod-vps
+PILLBOX_BACKEND=libkrun pillbox run
 ```
 
-Real secret values cross the network once over the SSH-encrypted
-channel, into the remote pillbox's vault session memory. Nothing is
-written to disk on the remote.
-
-## Running on an E2B managed sandbox
-
-```sh
-# Prereqs (one-time, local machine):
-brew install node               # or use your OS package manager
-npm i -g e2b                    # the JS SDK; pillbox spawns it via Node
-export E2B_API_KEY="e2b_…"      # or pillbox secret add E2B_API_KEY
-
-# Register the template (you've baked pillbox into the image yourself).
-pillbox remote add prod-cloud e2b://my-pillbox-template
-
-pillbox run --remote prod-cloud
-```
-
-The first remote run extracts the embedded Node helper to
-`~/.pillbox/cache/e2b-helper-v<pkg>.mjs` (0700) and uses it for
-subsequent runs. `pillbox version` upgrades replace the cached
-helper automatically — older versioned files sit on disk until you
-`rm ~/.pillbox/cache/e2b-helper-*`.
+Everything else — secrets, env, vault, the session surface,
+detach/reattach — works the same. See
+[libkrun-sandbox.md](./libkrun-sandbox.md) for setup details.
 
 ## Detached background session + reattach
 
 ```sh
 # Start, immediately return — agent keeps running in the background.
-pillbox run --remote prod-cloud --detach --label "nightly-refactor"
-# pillbox: ✓ session `abc123def456` started in background (sandbox `sb_xxx`).
+pillbox run --detach --label "nightly-refactor"
+# pillbox: ✓ session `abc123def456` started in background.
 #          pillbox session attach abc123def456  # reattach
 
 # Browse:
@@ -257,8 +231,8 @@ pillbox pull --snapshot abcd
 pillbox bookmark set main latest
 pillbox pull --bookmark main
 
-# Start a remote run from a bookmark instead of snapshotting cwd first.
-pillbox run --remote cloud --from-bookmark main
+# Start a run from a bookmark instead of the current cwd contents.
+pillbox run --from-bookmark main
 
 # Rotate the encryption password (old key still works until upstream
 # lands deletion — treat as compromised).
@@ -303,8 +277,7 @@ pillbox auth list --json                             # 2. anyone authenticated?
 
 pillbox secret list --json                           # 3. what secrets exist?
 pillbox env list --json                              # 4. what bundles exist?
-pillbox remote list --json                           # 5. any registered remotes?
-pillbox session list --json                          # 6. any detached sessions?
+pillbox session list --json                          # 5. any detached sessions?
 ```
 
 From there, build the right `pillbox run` invocation. If a needed

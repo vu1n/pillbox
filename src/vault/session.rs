@@ -262,6 +262,50 @@ impl VaultSession {
         out
     }
 
+    /// smolvm equivalent of [`Self::docker_extras`] (SPIKE — see
+    /// `sandbox/smolvm.rs`): the same **explicit-proxy broker** wiring — CA
+    /// mounts + `NODE_EXTRA_CA_CERTS`/`HTTPS_PROXY`/`HTTP_PROXY` pointing the
+    /// guest agent at the host-side MITM proxy + the OAuth stub mounts. The real
+    /// credential stays in the host proxy; the guest only ever sees a stub + the
+    /// proxy URL (cred-never-in-guest, no transparent network interception, so
+    /// no smolvm change needed for proxy-honoring agents).
+    ///
+    /// `proxy_host` is how the guest addresses the host — the one smolvm-specific
+    /// unknown vs docker's `host.docker.internal` alias (live-verify point).
+    /// `:ro` mount enforcement is omitted (smolvm virtiofs mount options aren't
+    /// wired in the spike). Duplicates `docker_extras`; a shared
+    /// proxy-env/CA-mount builder is the ship-review collapse.
+    pub(crate) fn smolvm_extras(&self, guest_home: &str, proxy_host: &str) -> Vec<String> {
+        let port = self.listen_addr.port();
+        let proxy_url = format!("http://{proxy_host}:{port}");
+        let guest_ca = "/etc/pillbox-ca.crt";
+        let system_trust_ca = "/usr/local/share/ca-certificates/pillbox-vault.crt";
+
+        let mut out = vec![
+            "-v".into(),
+            format!("{}:{guest_ca}", self.ca_cert_path.display()),
+            "-v".into(),
+            format!("{}:{system_trust_ca}", self.ca_cert_path.display()),
+        ];
+        for mount in &self.oauth_mounts {
+            let guest_creds = format!("{guest_home}/{}", mount.creds_path.display());
+            out.push("-v".into());
+            out.push(format!(
+                "{}:{guest_creds}",
+                mount.stub_file.path().display()
+            ));
+        }
+        out.extend([
+            "-e".into(),
+            format!("NODE_EXTRA_CA_CERTS={guest_ca}"),
+            "-e".into(),
+            format!("HTTPS_PROXY={proxy_url}"),
+            "-e".into(),
+            format!("HTTP_PROXY={proxy_url}"),
+        ]);
+        out
+    }
+
     pub(crate) fn listen_addr(&self) -> SocketAddr {
         self.listen_addr
     }

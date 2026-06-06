@@ -3,15 +3,21 @@
 //! substrate and retire our hand-rolled libkrun L1–L7, spending the freed
 //! budget on the §0/session/multiplayer layer smolvm doesn't have.
 //!
-//! Scope of this spike: the **foreground, non-vault, interactive** path only —
-//! boot the runner image in an ephemeral smolvm machine with the workspace +
-//! agent home bind-mounted, run the agent under smolvm's own `-it` PTY, inherit
-//! exit. Deliberately NOT here (the parts that decide adopt-vs-maintain — see
-//! the module-level analysis in docs/managed-tier.md):
-//!   - **vault** — smolvm has no host-side MITM-of-guest-egress hook (only
-//!     allowlist + secret-injection-into-guest), so the "real credential never
-//!     enters the guest" boundary (our L5/L6) can't ride smolvm as-is. This is
-//!     the one capability that argues for keeping our own libkrun.
+//! Scope of this spike: the **foreground interactive** path — boot the runner
+//! image in an ephemeral smolvm machine with the workspace + agent home
+//! bind-mounted, run the agent under smolvm's own `-it` PTY, inherit exit.
+//!
+//! **Vault works** via the **explicit-proxy broker** — the same model as docker
+//! (`HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS` → a host-side MITM proxy; the real key
+//! never enters the guest, only a stub). This needs **no transparent network
+//! interception**, so no smolvm change is required for proxy-honoring agents
+//! (claude/codex/node — what we target). The one unverified bit is
+//! `PILLBOX_SMOLVM_HOST_ADDR`: how the guest addresses the host proxy (docker
+//! uses `host.docker.internal`; defaults to 127.0.0.1). A *transparent*
+//! egress-redirect (for traffic that ignores `HTTP_PROXY`) is the only case that
+//! would want the upstream `tcp_relay` hook or our own libkrun — not v1.
+//!
+//! Deliberately NOT here:
 //!   - **§0 / pty-host / attach / detach** — the daylight; layered over any
 //!     backend via a guest-side pty-host reachable on a smolvm port-mapping.
 //!
@@ -40,14 +46,19 @@ impl SandboxBackend for SmolvmBackend {
                 "server-mode agents (opencode/codex-serve) — §0 path",
             ));
         }
-        if opts.vault || opts.detach || opts.memory {
+        if opts.detach || opts.memory {
             return Err(unsupported(
-                "vault / detach / memory — the §0 + MITM-vault work, not in the substrate spike",
+                "detach / memory — the §0 path, not in the substrate spike",
             ));
         }
         let withs_resolved = resolve_with_entries(resolved, &opts.withs)?;
-        if withs_resolved.iter().any(|w| w.meta.is_some()) {
-            return Err(unsupported("vaulted `--with` secrets — same as --vault"));
+        let any_vaulted = withs_resolved.iter().any(|w| w.meta.is_some());
+        if (opts.vault || any_vaulted) && !spec.vault_capable {
+            return Err(PillboxError::usage(
+                "run",
+                format!("--vault is not supported for `{}`", spec.id),
+            )
+            .into());
         }
 
         // Image: same OCI ref the docker/libkrun backends use; smolvm pulls it
@@ -75,7 +86,27 @@ impl SandboxBackend for SmolvmBackend {
         let workspace_name = workspace_mount_name(&workspace_host, opts.name.as_deref())?;
         let guest_workspace = format!("{GUEST_WORKSPACE}/{workspace_name}");
 
-        let env_vars = resolve_run_env(resolved, &opts, &withs_resolved, None)?;
+        // Vault via the explicit-proxy broker (same model as docker): start a
+        // host-side MITM proxy, stub the credentials, and point the guest at it
+        // with HTTPS_PROXY + the trusted CA (see `smolvm_extras` below). The real
+        // key never enters the guest — no transparent interception, so no smolvm
+        // change is needed for proxy-honoring agents. Detach is rejected above, so
+        // the host proxy always outlives the run (same constraint docker has).
+        let mut vault_session = if opts.vault || any_vaulted {
+            let oauth = opts.vault.then_some(crate::vault::OAuthAgent {
+                agent_id: spec.id,
+                agent_home: &home,
+            });
+            let context = crate::vault::RunContext {
+                session_id: None,
+                mode: Some("interactive".to_string()),
+                workspace_id: Some(resolved.workspace_id().to_string()),
+            };
+            Some(crate::vault::VaultSession::start(oauth, resolved, context)?)
+        } else {
+            None
+        };
+        let env_vars = resolve_run_env(resolved, &opts, &withs_resolved, vault_session.as_mut())?;
 
         // `smolvm machine run -it -I <image> -v ... -e ... -- <agent argv>`.
         // `--net` opens egress (no fence in the spike — egress-fence + vault are
@@ -99,6 +130,19 @@ impl SandboxBackend for SmolvmBackend {
         for (k, v) in &env_vars {
             args.push("-e".into());
             args.push(format!("{k}={v}"));
+        }
+        if let Some(vs) = &vault_session {
+            // How the guest addresses the host proxy — the one live-verify
+            // unknown vs docker's `host.docker.internal` alias. With `--net`
+            // (open egress) above, reaching it needs no extra allowlist.
+            let proxy_host = std::env::var("PILLBOX_SMOLVM_HOST_ADDR")
+                .unwrap_or_else(|_| "127.0.0.1".to_string());
+            args.extend(vs.smolvm_extras(GUEST_HOME, &proxy_host));
+            eprintln!(
+                "pillbox: [smolvm spike] vault proxy on {} (guest reaches host at {proxy_host}; ca {})",
+                vs.listen_addr(),
+                vs.ca_cert_path().display()
+            );
         }
         args.push("--".into());
         args.extend(spec.run_argv.iter().map(|s| s.to_string()));

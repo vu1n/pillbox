@@ -39,7 +39,8 @@ fn ca(resolved: &Pillbox, json: bool) -> Result<()> {
 }
 
 fn status(resolved: &Pillbox, json: bool) -> Result<()> {
-    let ca_dir = resolved.subdir("vault")?;
+    // Read-only command — `subdir_path` so inspecting status never creates the dir.
+    let ca_dir = resolved.subdir_path("vault");
     let ca_cert = vault::ca_cert_path_in(&ca_dir);
     let exists = ca_cert.exists();
     if json {

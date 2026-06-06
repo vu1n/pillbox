@@ -176,7 +176,10 @@ impl VaultSession {
         // debugging) — or a legacy one is already on disk — reuse it. The guest
         // installs the cert per-boot either way (`update-ca-certificates` /
         // `NODE_EXTRA_CA_CERTS`), so ephemeral costs nothing on the reuse side.
-        let persistent_dir = pillbox.subdir("vault")?;
+        // `subdir_path` (not `subdir`): just probe for a pinned CA — don't create
+        // an empty `<pillbox>/vault/` on the ephemeral path. `Ca::ensure` creates
+        // the dir when a stable CA is actually written.
+        let persistent_dir = pillbox.subdir_path("vault");
         let (ca_dir, ca_tempdir) = if crate::vault::ca_cert_path_in(&persistent_dir).exists() {
             (persistent_dir, None)
         } else {

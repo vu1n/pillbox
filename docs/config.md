@@ -95,14 +95,8 @@ encoding so two paths to the same directory collapse to one key.
 ├── env/               # 0700
 ├── auth/              # reserved (v0.7 per-project auth override)
 ├── vault/             # 0700
-├── remotes/           # 0700 — registered ssh:// + e2b:// remotes
 └── sessions/          # 0700 — detached-session records
 ```
-
-Plus a sibling cache directory at `~/.pillbox/cache/` (0700) that
-holds versioned helper scripts the binary extracts on first use
-(e.g. `e2b-helper-vX.mjs`). Safe to delete — it'll be rewritten on
-the next `pillbox run --remote NAME` for an `e2b://` remote.
 
 `meta.json` is rewritten by pillbox; don't edit it directly. To change
 the pillbox's name, edit `pillbox.toml`'s `name = ` field and pillbox

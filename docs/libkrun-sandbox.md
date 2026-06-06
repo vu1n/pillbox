@@ -109,16 +109,16 @@ ports by swapping only the bottom:
 | frame protocol, `session send/watch/subscribe`, pump | ✅ surface | transport: `docker exec` → vsock |
 | opencode integration | ✅ the `message.*` mapper (the brain) | bridge: `docker exec curl` → vsock / guest-net |
 | vault | ✅ concept | sidecar-in-container → smoltcp egress proxy (vault v2) |
-| sandbox backend | — | `local_docker` + `docker::` → a `libkrun` backend |
+| sandbox backend | — | `sandbox::docker` → a `libkrun` backend |
 
 ## Superseded / deprecated by this pivot
 
-- **Local Docker backend** (`sandbox/local_docker.rs`, `docker.rs`) → a libkrun
-  backend. Code currently ships; deprecated in direction.
-- **Remote backends** — `docker://`, `ssh://`, `e2b://` (`remote_docker`,
-  `remote_ssh`, `remote_e2b`) and [remotes-redesign.md](./archive/remotes-redesign.md).
-  "Remote" is now Cloudflare-managed or pillbox-local-on-the-box; the SSH-driven-
-  daemon model is retired. Code currently ships; deprecated in direction.
+- **Local Docker backend** (`sandbox/docker.rs`) → a libkrun backend. Code
+  currently ships (the default local backend); deprecated in direction.
+- **Remote backends** — `docker://`, `ssh://`, `e2b://` and
+  [remotes-redesign.md](./archive/remotes-redesign.md). Already **removed** from
+  the codebase: "remote" is now Cloudflare-managed or pillbox-local-on-the-box;
+  the SSH-driven-daemon model is retired.
 - The Docker **runner image** framing in [runner-image.md](./runner-image.md) →
   microVM rootfs (OCI still usable).
 
@@ -450,7 +450,7 @@ the guest's `pillbox-init ws` branch:
 **In-repo landing:**
 - **Reuse the canonical denylist** — the spike hand-rolled a crude `is_secret`;
   the repo already has `workspace::ingest` (`is_secret_dir` / `is_secret_basename`
-  / `IngestPlan`) from the docker:// ingest work, which is *better* (covers
+  / `IngestPlan`) from the workspace-ingest work, which is *better* (covers
   `.gnupg`, spares `.env.example`/`.env.sample` templates, and *reports* dropped
   secrets — no silent caps). The CoW path must call it, not duplicate it.
 - **Compose with rustic, don't replace it** — the flow is `rustic pull` (or cwd)
@@ -536,7 +536,7 @@ Docker untouched until step 8. Slices (each its own commit, default build green)
     the guest's). This subprocess split is the spine for attach + §0. `krun/
     entitlements.plist` + re-codesign after each build. `materialize_rootfs` =
     `docker export` → cached `~/.pillbox/krun/rootfs/<image>` (virtio-fs root).
-  - ✅ **L3 Creds + workspace + env** — `run()` mirrors `local_docker::run`:
+  - ✅ **L3 Creds + workspace + env** — `run()` mirrors `sandbox::docker::run`:
     shares the auth home live at `GUEST_HOME` (cred check + pretrust seed), CoW-
     clones the workspace + scrubs it via the **canonical `workspace::ingest`**
     denylist (verified: `.env` scrubbed, `app.py` kept), composes env via
@@ -547,7 +547,7 @@ Docker untouched until step 8. Slices (each its own commit, default build green)
     egress (`ConnectionRefused`) — libkrun's default TSI did *not* carry it. So
     L5 wires virtio-net + smoltcp egress; don't rely on TSI.
     *Deferred dedup (review): the creds/workspace preamble (copy-pasted across
-    libkrun + `local_docker::run`×2 + `remote_ssh`) → a shared `resolve_run_inputs`,
+    libkrun + `sandbox::docker::run`×2) → a shared `resolve_run_inputs`,
     and the base `HOME`/`PATH`/`TERM` env (drift hazard vs `base_docker_args_with`)
     → a shared `base_agent_env`. Do as one extraction pass once the libkrun
     backend stabilizes (post-L5) — the shared boundary is still forming.*
@@ -598,8 +598,9 @@ Docker untouched until step 8. Slices (each its own commit, default build green)
     proxy (a proxy-over-vsock reuse was considered + rejected). Reasons: (1)
     dep-health — hudsucker is a single-maintainer crate; smoltcp + rustls are
     well-supported; (2) own-the-substrate (the pivot's thesis); (3) this is the
-    *go-forward* vault — hudsucker **retires with the deprecated docker/ssh/e2b
-    backends**, so there's no two-impls-forever tax, just a transition. The
+    *go-forward* vault — hudsucker **retires with the legacy backends** (the
+    deprecated-in-direction local Docker backend; the removed ssh/e2b ones are
+    already gone), so there's no two-impls-forever tax, just a transition. The
     netspike spike already proved the hard half (rustls `ServerConnection` off the
     smoltcp poll loop + SNI parse + stub→real swap); what's reimplemented is what
     hudsucker did for us: cert forging (reuse the pillbox CA + `rcgen`), the HTTP
@@ -742,7 +743,7 @@ Docker untouched until step 8. Slices (each its own commit, default build green)
       detached cleanly leaving the child alive; `session rm` killed the child +
       dropped the record. **Skew note:** the runner's in-guest pillbox must have
       `--vsock-listen` — an older image fails detach (rebuild the runner when the
-      launch protocol changes — the same version-skew preflight docker:// added).
+      launch protocol changes — a version-skew preflight catches this).
     **Env fork — secrets go to the vault, not the VM env** (lands with L5b; this is
     the whole point of vault-v2; a secret in the VM's env is readable by the
     agent via `/proc/self/environ` and exfiltrable by a prompt injection). L3
@@ -829,7 +830,7 @@ Docker untouched until step 8. Slices (each its own commit, default build green)
      complete capture) / teardown, any model provider via the standard profile +
      `--egress-allow`. This closes substrate primitive #1 (complete persisted
      traces) — the meta-harness's next gate is the **verifiable reward channel**.
-8. **Deprecate Docker** — remove the docker/remote backends once libkrun is at parity.
+8. **Deprecate Docker** — remove the Docker backend once libkrun is at parity (the remote backends are already gone).
 
 ## Dependencies
 

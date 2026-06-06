@@ -22,8 +22,12 @@ collide across pillboxes.
 > and **passes non-matched hosts through unmodified** — so it is not a general
 > exfiltration guard today. Strict-deny egress filtering (deny on unmatched) is
 > the planned fix; see
-> [security.md](./security.md). For container backends the vault runs
-> sandbox-side once remotes phase-1 lands.
+> [security.md](./security.md). The vault runs **on the host** today:
+> the MITM proxy is an in-process server bound to a localhost port that
+> the sandbox reaches over the loopback bridge. Because it lives in the
+> CLI process, a vaulted run must stay in the foreground —
+> `--detach` + `--vault` is unsupported (the proxy can't outlive the
+> CLI).
 >
 > **Consequence for the swarm-memory scrub** ([swarm-memory.md](./swarm-memory.md)):
 > that pipeline exact-matches outbound content against the vault's *real* secret

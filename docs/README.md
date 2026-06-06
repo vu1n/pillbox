@@ -46,7 +46,7 @@ authoritative.** When a design doc and a banner disagree, the banner (newer) win
 | File | Status |
 |---|---|
 | [remotes-redesign.md](./archive/remotes-redesign.md) | **Superseded** by libkrun-sandbox.md (the Docker-context backend collapse is retired). Fork-from-store reasoning carries forward. |
-| [remotes.md](./archive/remotes.md) | **Deprecated direction** — `ssh://`/`e2b://`/`docker://` still ship but are on the way out (remote → Cloudflare/local-on-box). |
+| [remotes.md](./archive/remotes.md) | **Removed** — the `ssh://`/`e2b://`/`docker://` URL backends and `--remote` are gone. pillbox is local-only; "remote" returns later as a managed/Cloudflare tier. |
 
 Archived decision records: [`archive/`](./archive/).
 

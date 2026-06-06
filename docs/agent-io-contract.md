@@ -30,8 +30,7 @@ never touch a terminal.
 - **Two channels, one sandbox.** `agent` (talk to the agent) and `exec` (run
   one-off commands, e.g. `python foo.py`). Both PTY-free. Interactive PTY (a
   human drilling into a live shell) is deliberately *outside* this schema — it
-  uses the existing attach transport. SSH is the ssh:// backend's transport
-  and an optional human escape hatch, never the primitive (it bypasses the
+  uses the existing attach transport, never the primitive (it bypasses the
   vault/workspace/audit envelope; structured `exec` doesn't).
 
 ## Why "no PTY" is real

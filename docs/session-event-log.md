@@ -227,12 +227,14 @@ byte stream. (`pty_resize` optional.)
   gateway/broker. Co-located producers *submit*; the gateway assigns `seq` on
   append → total order, deterministic replay. The multi-writer problem is easy
   **only here**.
-- **Remote-disconnect case (hard; defer + scope):** when the producer is in a
-  remote sandbox and the host gateway can disconnect, sandbox-side `seq` is
-  provisional and must be reconciled — that is distributed total-order-under-
-  partition, the hardest form; it does **not** "disappear." Until reconciliation
-  is designed, **gate remote multiplayer on host-side-only sequencing** and
-  document that a host disconnect drops the ordering authority.
+- **Managed-placement disconnect case (future; hard — defer + scope):** when the
+  producer is in a remote placement (the managed tier) and the host gateway can
+  disconnect, the placement-side `seq` is provisional and must be reconciled —
+  that is distributed total-order-under-partition, the hardest form; it does
+  **not** "disappear." Until reconciliation is designed, **gate managed-tier
+  multiplayer on host-side-only sequencing** and document that a host disconnect
+  drops the ordering authority. (Both local backends are co-located, so this case
+  does not arise today.)
 - **No sequencer exists today.** `EventEmitter` assigns `seq` per-*emitter*
   (resets to 1 per run/exec). §0 must make the gateway the sole seq authority
   and define how host- and sandbox-side lifecycle events (both emit
@@ -263,8 +265,8 @@ trait EventLog {
 }
 ```
 
-Local-jsonl default (local-first, greppable). A Postgres impl lands for
-team/remote mode (Aquifer parity) without changing producers. This extends
+Local-jsonl default (local-first, greppable). A Postgres impl could land for the
+future team/managed tier (Aquifer parity) without changing producers. This extends
 the existing `EventSink` trait with read/replay.
 
 The global `events.jsonl` becomes a **lifecycle-only projection** derived from
@@ -323,9 +325,10 @@ The table is the *target*, not the *transition*. Required before building:
 
 ## Open decisions
 
-1. **Gateway placement for remote sandboxes** — host-side sequencer (simple,
-   one authority) vs. sandbox-side provisional seq reconciled at the host
-   (resilient to host disconnects, more complex). Recommend host-side first.
+1. **Gateway placement for distributed (managed-tier) placements** — host-side
+   sequencer (simple, one authority) vs. placement-side provisional seq reconciled
+   at the host (resilient to host disconnects, more complex). Recommend host-side
+   first. (Moot for the co-located local backends today.)
 2. **Keep or retire the global `events.jsonl`** — recommend keep as a
    lifecycle projection for back-compat, source-of-truth moves to per-session.
 3. **Blob GC** — raw bodies/snapshots grow unbounded; tie retention to the

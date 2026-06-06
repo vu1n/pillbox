@@ -36,8 +36,8 @@ Plus the system tooling agents tend to reach for: `bash`,
 And **`pillbox` itself** at `/usr/local/bin/pillbox`, compiled from the
 repo in a multi-stage build. The in-sandbox pillbox runs the interactive
 attach pty-host (`pillbox pty-host`), the per-attach relay (`pillbox
-pty-relay`), and the event emitter / `session done` wrapper — the same
-in-sandbox role the e2b/ssh backends already rely on. Because the image
+pty-relay`), and the event emitter / `session done` wrapper — the
+in-sandbox role both local backends rely on. Because the image
 embeds the binary, it is rebuilt when `src/**` or `Cargo.{toml,lock}`
 change, not only on `runner/Dockerfile` edits.
 

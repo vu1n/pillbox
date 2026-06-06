@@ -88,8 +88,8 @@ and POSTs there fall through to the SPA HTML.
 
 1. ✅ `AgentSpec.integration {Pty, Server}` — opencode=Server, others=Pty.
 2. ✅ Event bridge — `sandbox::opencode::spawn_event_bridge` (`docker exec curl
-   -N /event` → `drain_sse` → log, `TailerHandle`-managed; local + remote docker).
-3. ✅ Run path — `local_docker::run_server` (guarded; no PTY, no vault; records
+   -N /event` → `drain_sse` → log, `TailerHandle`-managed; Docker + libkrun).
+3. ✅ Run path — `sandbox::docker::run_server` (guarded; no PTY, no vault; records
    session w/ ocid + model; optional initial prompt; prints watch/send hints).
 4. ✅ Session forks — `session send` (Server) → `prompt_async`;
    `resolve_streaming_session` (Server) → the bridge. `attach` still PTY-only

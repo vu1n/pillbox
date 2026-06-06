@@ -54,9 +54,9 @@ Combinations:
   (`~/.claude.json` etc) — per-run servers extend, they don't
   replace. The persistent home is bind-mounted; pillbox doesn't
   touch it.
-- `--mcp` + `--remote` → **rejected**. Remote sandboxes can't see
-  a host-local MCP URL on the caller's machine. v1 follow-up may
-  add remote-side attachment.
+- `--mcp` URLs are resolved against the **caller's machine** (a
+  host-local MCP server reachable from the sandbox). The managed
+  tier, when it lands, will need its own URL-reachability design.
 
 ## How it's wired
 
@@ -181,14 +181,13 @@ boundary before launching the sandbox.
 - `--mcp-token NAME=SECRET_NAME` for bearer auth, secret-store sourced
 - `localhost` / `127.0.0.0/8` / `::1` / `*.localhost` → `host.docker.internal`
 - Additive with persistent agent config (no `--strict-mcp-config`)
-- `--mcp` + `--remote` rejected with a helpful error
 - No supervision, no manifests, no scope registry, no lookup keys
 
 ## Not v0
 
 - `--strict-mcp-config` mode for Claude reproducibility
-- `--remote` support (remote-side attachment + URL reachability
-  is its own design)
+- Managed-tier support (URL reachability from a hosted sandbox is
+  its own design)
 - Stdio MCP (escape hatch: provider author ships an HTTP wrapper)
 - Auto-discovery / persistent `pillbox.toml` MCP declarations
 - Vault stub-swap for `--mcp-token` (third-party MCP tokens

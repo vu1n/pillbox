@@ -76,12 +76,15 @@ moves with the live side.
 |---|---|---|---|
 | Local foreground | the `pillbox run` process | that process | dies with the run; trivial single-writer |
 | Local detached | a per-session background process (extends today's detached path) | that process | reattach connects to its unix socket |
-| Remote, attached | **host** `pillbox` | host | in-sandbox producer submits *to* the host (below) |
-| Remote, detached | **sandbox-side** `pillbox` | sandbox | host exited; sandbox is the live side |
+| Managed, attached *(future)* | **host** `pillbox` | host | in-sandbox producer submits *to* the host (below) |
+| Managed, detached *(future)* | **placement-side** `pillbox` | placement | host exited; the placement is the live side |
 
-The hard transitions are **remote attach↔detach**, where authority *moves*
-between host and sandbox. That is the one place distributed ordering bites
-(see *Sequencing*); everywhere else there is exactly one writer at a time.
+The hard transitions are the **managed attach↔detach** case *(future tier)*,
+where authority *moves* between the host and a remote placement. That is the one
+place distributed ordering bites (see *Sequencing*); everywhere else — including
+both local backends today — there is exactly one writer at a time. (The local
+backends are co-located, so the distributed handoff does not arise today; it is
+specced ahead for the managed tier.)
 
 ## Submit → seq wire contract
 
@@ -126,14 +129,14 @@ trust boundary — anything that can write the env sets it). Per connection:
 | Participant | Authenticates via | Becomes |
 |---|---|---|
 | Local human (owner) | unix-socket **peer credentials** (uid) — owns the process | `actor.kind=human`, owner role |
-| In-sandbox producer (agent driver) | a **per-session producer token** injected at spawn over the *same delivery path as the vault stdin blob* | `actor.kind=agent` |
+| In-sandbox producer (agent driver) | a **per-session producer token** injected at spawn over the *same delivery path the vault uses to inject secrets into the sandbox* | `actor.kind=agent` |
 | Remote human (web/2nd attach) | a **join token** (scoped, TTL) minted by the owner/gateway | `actor.kind=human`, granted role |
 | Service / sub-agent / CI | a **service token** | `actor.kind=service` |
 
 The in-sandbox producer is the subtle one: it is itself a remote actor relative
 to a host gateway, so it cannot be trusted by placement. It gets a secret at
-spawn time (the vault already proves this delivery path —
-`dispatch_vault_stdin_direct`) and presents it on `Submit`. The gateway maps
+spawn time (the vault already proves this delivery path — secrets are injected
+into the sandbox at launch) and presents it on `Submit`. The gateway maps
 token → `actor`; a forged or absent token is rejected, not trusted as "sandbox."
 
 ## Broker — input arbitration
@@ -150,17 +153,18 @@ emits its decisions as log events so they replay:
   authenticated connection, not a claim in the payload). Tool-approval routing
   (`permission_*`) flows through the same auth.
 
-## Sequencing — co-located vs. remote-disconnect
+## Sequencing — co-located vs. managed-placement disconnect
 
 - **Co-located (ship first):** one process holds the append lock → one writer →
-  total order is trivial. This covers local (all modes) and remote-while-the-
-  authority-side-is-stable.
-- **Remote disconnect (hard; defer + scope explicitly):** when authority must
-  move host↔sandbox on attach/detach, use a **lease + fencing token**: the
+  total order is trivial. This covers **both local backends (Docker + libkrun),
+  all modes**, and the managed case while the authority side is stable.
+- **Managed-placement disconnect (future; hard — defer + scope explicitly):**
+  when authority must move host↔placement on attach/detach, use a **lease +
+  fencing token**: the
   session record holds a monotonically-increasing `seq_epoch`; the side taking
   authority bumps it; appends carry the epoch; a stale writer (old epoch) is
-  fenced off. On reattach the host **pulls the sandbox's appended tail** before
-  resuming. Until this is built, **gate remote multiplayer on host-side-only
+  fenced off. On reattach the host **pulls the placement's appended tail** before
+  resuming. Until this is built, **gate managed-tier multiplayer on host-side-only
   sequencing** and document that a host disconnect drops the ordering authority
   for the duration.
 
@@ -191,9 +195,9 @@ producers retry under their `idempotencyKey`.
    `events/mod.rs` lifecycle-but-seqless) onto the one log.
 
 Items 1–4 are the gateway proper; 5–6 are the spine it writes to. None of it
-exists today — which is why §0 is the gate, and why the remotes collapse
-(which needs none of it — detach already keys off the durable `Session.id`)
-should ship *first*.
+exists today — which is why §0 is the gate, and why the local-substrate
+detach/reattach work (which needs none of it — detach already keys off the
+durable `Session.id`) shipped *first*.
 
 ## Open questions
 
@@ -203,8 +207,8 @@ should ship *first*.
    (Note: local detached already forgoes `--vault` because the host proxy can't
    outlive the CLI — the gateway has the same "who stays alive" question.)
 2. **Lock primitive** — OS file lock (`flock`) on `head` vs. a lockfile with
-   pid/epoch. File locks don't survive across hosts (remote handoff needs the
-   epoch fencing regardless).
+   pid/epoch. File locks don't survive across hosts (the managed-placement
+   handoff needs the epoch fencing regardless).
 3. **Submit transport** — a real gRPC `Submit`, or fold writes into the existing
    control channel the frame protocol already multiplexes? The latter avoids a
    second listener but couples write-plane to attach-plane lifetime.

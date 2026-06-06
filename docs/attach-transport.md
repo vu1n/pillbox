@@ -164,8 +164,9 @@ pub(crate) trait SessionBackend {
 }
 ```
 
-This lifts today's e2b-only free functions (`reattach`, `kill_session` in
-`sandbox/remote_e2b.rs`) into a cross-backend contract and adds `launch`.
+This generalizes the per-backend reattach/kill plumbing into a single
+cross-backend contract (against the local Docker and libkrun backends)
+and adds `launch`.
 
 ### Backend mapping
 

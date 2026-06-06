@@ -7,7 +7,10 @@
 >    with great telemetry. "Remote" is now *Cloudflare-managed* (their Sandbox
 >    SDK / Claude Managed Agents own the managed substrate — see memory
 >    `pillbox-cloudflare-shipped-the-stack`) or *pillbox-running-locally-on-the-
->    VPS*. The SSH/e2b/`docker://` remote backends are **deprecated**.
+>    VPS*. The SSH/e2b/`docker://` remote backends have been **removed** (the
+>    `remote` commands and `pillbox run --remote` are gone); pillbox is
+>    **local-only** today (Docker default + libkrun opt-in), and "remote"
+>    returns later as the managed tier.
 > 2. **Substrate: Docker → libkrun microVM.** The local runtime pivots to
 >    [libkrun-sandbox.md](./libkrun-sandbox.md) (secure VM boundary, fast, no
 >    daemon, macOS-native). [remotes-redesign.md](./archive/remotes-redesign.md) (the
@@ -139,8 +142,8 @@ their drivers:
   the bus and consumers are read-side exporters; folding lifecycle onto the seq
   spine would force the deferred host↔sandbox seq handoff for no current gain.
 - **(c) re-model `Session` from 1:1-with-a-sandbox into a cross-sandbox spine**
-  → **Remotes / managed migration** ("session migrates local → docker:// →
-  managed"). Detach/reattach + the per-session log already key off the durable
+  → **managed migration** ("session migrates local → managed placement tier").
+  Detach/reattach + the per-session log already key off the durable
   `Session.id`, so the 1:1 record is fine until a session genuinely spans
   sandboxes.
 - **`class: content|signal`** → the pooling/optimization track.
@@ -166,8 +169,10 @@ only while a session is live), and the host↔sandbox seq-authority handoff.
 2. **Session event log** — the keystone spine. → `session-event-log.md`
 3. **Multiplayer** — actor, attributed input, participant/role/driver, the
    gateway, topologies. Roadmap below.
-4. **Remotes** — container-is-primitive; BYO free / managed paid.
-   → `remotes-redesign.md`
+4. **Managed tier (future)** — container-is-primitive; BYO free / managed paid.
+   The remote backend plane (ssh/e2b/`docker://`) was removed; "remote" returns
+   as the managed/placement tier. → ~~`remotes-redesign.md`~~ *(superseded/archived;
+   see [libkrun-sandbox.md](./libkrun-sandbox.md))*
 5. **Optimization & collective intelligence** — DSPy + meta-harness,
    cost-routing, the data flywheel. A separate project that consumes the
    contract. Section below.
@@ -388,14 +393,14 @@ multi-human surface.**
 
 | # | Step | Why here / deps | Workstream |
 |---|---|---|---|
-| 1 | **Remotes collapse — `docker://` + cold-host DX contract** *(foreground run + ingest + result-extraction + sandbox-side vault ✓ live-verified; **`--detach` lifecycle + agent-stays-alive ✓ live-verified** — record/list/reattach/teardown-over-endpoint, detached agent runs + is reattachable; **version-skew detection ✓** — preflight probe fails loud if the runner image's pillbox is too old for the launch protocol, the real cause of an earlier "agent instantly dies"; **drive + read parity ✓** — `session send` drives a detached docker:// session's pty-host over the endpoint, and `session subscribe`/`watch` tail the container transcript out over `docker exec` into the host log (collector-free, the §0 surface); remaining: detached result-extraction, pull-progress)* | Cheapest big win; a *deletion* onto Docker contexts; fixes the documented product failure. **Independent of §0** — detach keys off the durable `Session.id`. | remotes + dx |
+| 1 | **Local substrate (Docker + libkrun) + cold-start DX contract** *(foreground run + ingest + result-extraction + sandbox-side vault ✓ live-verified; **`--detach` lifecycle + agent-stays-alive ✓ live-verified** — record/list/reattach/teardown, detached agent runs + is reattachable on both local backends; **version-skew detection ✓** — preflight probe fails loud if the runner image's pillbox is too old for the launch protocol, the real cause of an earlier "agent instantly dies"; **drive + read parity ✓** — `session send` drives a detached local session's pty-host, and `session subscribe`/`watch` tail the container transcript into the host log (collector-free, the §0 surface); remaining: detached result-extraction, pull-progress)*. *(The original "remotes collapse onto `docker://`" plan is **retired**: the remote backend plane — ssh/e2b/`docker://` URL backends and `--remote` — was removed; pillbox is local-only, and "remote" returns later as the managed/placement tier. See the banner.)* | Cheap; fixes the documented product failure. **Independent of §0** — detach keys off the durable `Session.id`. | dx |
 | 2 | **Approval loop — reframed to a signal *producer*; ✓ done for the single-player automated context.** `AttentionRequired{NeedsInput}` on transcript `end_turn` → log/`subscribe`/webhook; front-ends respond via `session send`. In-pillbox `approve\|deny\|answer` verbs reframed away; the mid-tool blocked sub-signal is closed as **not hook-viable** (Notification suppressed in the automated context — reading vt100 is the only reliable path if ever wanted). | dx + event-log |
 | 3 | **§0 LOCAL SUBSTRATE — ✓ DONE + live-verified** — `sessionId` + durable per-session log + co-located sequencer + zero-config `Subscribe(from_seq)` (`notify` tail) + a producer. *Re-scoped: `actor` / event-system-merge / network-seq → multiplayer; cross-sandbox `Session` → migration; `class` → pooling — NOT §0.* | The keystone. The substrate's local stream **every** consumer reads — inner-loop readout, fleet triage, lum, *and* (later) multiplayer. | event-log + gateway + dx |
 | 4 | **Reader bits — ✓ DONE** — `session watch` (thin human reader, `docker logs` model); **`session list` status-from-log + `session diagnose`** (status = fold the events.jsonl terminal sink + per-session log → running/needs-input/done/failed; honest about host-visible reach). A **detached §0 producer** keeps reparented (libkrun) logs live so these read fresh with no drain call (see Built-so-far). | Falls out of §0 (the log). Makes a swarm triageable + the cheapest "watch your agent" — a *consumer over the public tap, not a UI*. | dx |
 | 5 | **Harden #1/#3** (transcript+MITM source of truth; native secondary). #2 `raw_body` deferred | Cheap; off the critical path. | harden |
 | 6 | **Multiplayer web-attach** (the multi-human circulation demo) — needs `Frame` seq/ack + bounded `DataAck` + WS endpoint + `session share` | **Demoted** below the cheap local-visibility + approval work: the §0 spine already gives single-player "watch," and the share-a-link demo is heavier. Still the multi-human artifact for orca / the gsv builder. | multiplayer |
 | 7 | **Multiplayer input / roles / join links** | Governed multi-writer; defer until web-attach shows pull. | multiplayer |
-| 8 | **Remotes: `k8s://` + managed tier** | Second transport + the paid bundle-as-a-service. | remotes |
+| 8 | **Managed tier (future)** | The paid bundle-as-a-service (Cloudflare-managed / placement); a second backend behind the local trait. | managed |
 | 9 | **Profiles (net-new typed object) + topologies** | Profiles = prerequisite for the (external) optimization layer; net-new, not "already there." | multiplayer + dx |
 
 **Why this order.** Steps 1–2 need almost no new infrastructure (a deletion; a
@@ -409,7 +414,7 @@ your agent think" single-player — the cheaper demo and the inner-loop unblocke
 (seq/ack, bounded `DataAck`, WS, `share`) are in.
 
 (Note: **"§0" names the event-log keystone throughout the spec set** —
-gateway.md, session-event-log.md, remotes-redesign.md — sequenced 3rd here; the
+gateway.md, session-event-log.md — sequenced 3rd here; the
 "#" column is ordinal order, not a §-label.)
 
 **Optimization is a parallel external track, not a pillbox step** — and per the
@@ -421,13 +426,14 @@ to keep that contract solid.
 
 Reconciled against the sequence above; commits on `main` (origin synced).
 
-- **Step 1 — remotes / `docker://`:** foreground run-assembly, tar-cp
-  secret-denylist ingest, result extraction, sandbox-side vault, the
+- **Step 1 — local substrate (Docker + libkrun):** foreground run-assembly,
+  tar-cp secret-denylist ingest, result extraction, sandbox-side vault, the
   blob-scrub security fix, plus `--detach` lifecycle, version-skew detection, and
   drive+read parity — **done + live-verified**. Open: detached result-extraction,
-  pull-progress. (Note: `docker://`/ssh/e2b remote backends are now
-  **deprecated in direction** — libkrun is the local substrate, "remote" →
-  Cloudflare-managed/local; see `libkrun-sandbox.md`.)
+  pull-progress. (Note: the **remote backend plane was removed** — the ssh/e2b/
+  `docker://` URL backends and `--remote` are gone; libkrun is the opt-in local
+  microVM alongside default Docker, and "remote" returns later as the
+  Cloudflare-managed/placement tier; see `libkrun-sandbox.md`.)
 - **Step 3 — §0 (local substrate): DONE + live-verified** (and re-scoped — the
   structural bits moved out of §0, see "§0 is the local substrate" above).
   - durable per-session log (`events/log.rs::SessionLog` →
@@ -542,14 +548,14 @@ migration / pooling) and are deliberately unbuilt until then.
 - **Input arbitration** — driver-token vs turn-queue. Default:
   **driver-token + a queue for programmatic inputs**. (event-log §Open 4,
   multiplayer.)
-- **Gateway placement for remote** — host-side sequencer first (simpler,
-  one authority); sandbox-side provisional seq reconciled later if host
-  disconnects bite. (event-log §Open 1.)
+- **Gateway placement for distributed (managed) placement** — host-side
+  sequencer first (simpler, one authority); sandbox-side provisional seq
+  reconciled later if host disconnects bite. (event-log §Open 1.)
 - **Global `events.jsonl`** — keep as a lifecycle-only projection of the
   per-session logs; source of truth moves per-session. (event-log §Open 2.)
 - **Managed detach = billing while detached** — needs an idle-timeout /
   default TTL policy on the paid tier; reuse `--ttl` / `session prune`.
-  (remotes §Open.)
+  (managed-tier open question.)
 - **Collective-intelligence governance** — default: open consumption,
   opt-in contribution, quality-gated inclusion; *never* required-to-consume.
   Open knob: what the contributor carrot is (lean: premium routing on the

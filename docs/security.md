@@ -68,8 +68,7 @@ disk encryption for at-rest defense. Pillbox does the same.
 │   │           ├── auth.json
 │   │           └── config.toml
 │   ├── vault/                       # 0700 — CA + key for vault sessions
-│   ├── remotes/                     # 0700 — registered ssh:// + e2b:// remotes
-│   └── sessions/                    # 0700 — detached-session records (e2b)
+│   └── sessions/                    # 0700 — detached-session records
 ├── projects/                        # 0700
 │   └── -Users-x-work-myapp/         # 0700 — one per project pillbox
 │       ├── meta.json                # 0600 — descriptor mirror (incl. workspace)
@@ -77,12 +76,10 @@ disk encryption for at-rest defense. Pillbox does the same.
 │       ├── env/
 │       ├── auth/                    # reserved (v0.7 per-project override)
 │       ├── vault/                   # 0700 — CA + key
-│       ├── remotes/                 # per-pillbox remote overrides
 │       ├── sessions/                # sessions started here
-│       ├── repo-password            # 0600 — rustic encryption password (local-only)
-│       └── repo/                    # local rustic repository (local backend only)
-└── cache/                           # 0700 — versioned helper scripts
-    └── e2b-helper-v0.1.0.mjs           # written by ensure_helper_extracted
+│       ├── repo-password            # 0600 — rustic encryption password
+│       └── repo/                    # local rustic repository
+└── cache/                           # 0700
 ```
 
 Every directory under `~/.pillbox/` is created via the paths helpers
@@ -154,52 +151,14 @@ The login flow is the same shape, except no workspace mount and no
 secret/env injection — it's just `pillbox auth login --agent <agent>`
 running the agent's OAuth flow in a one-shot container.
 
-## Remote backends (v0.6 PR 4 / 5 / 6)
+## Sessions (detach + reattach)
 
-`pillbox run --remote NAME` adds two new threat boundaries — the
-local helper subprocess (E2B) or `ssh` client, and the remote
-sandbox itself. The full design is in [remotes.md](./archive/remotes.md);
-the security-relevant pieces:
-
-### What crosses the wire
-
-Real secret values, S3/R2 workspace credentials, and the rustic repo
-password cross the network **once**, at session start, as a versioned
-JSON blob:
-
-- **ssh://** — blob piped over `ssh`'s stdin (encrypted channel) to
-  `pillbox run --vault-stdin` on the remote. The blob itself is not
-  persisted; the remote writes the repo password to a 0600 temp file
-  for the duration of workspace hydration/result push.
-- **e2b://** — blob staged to a 0600 tempfile locally (atomic
-  `O_EXCL` via `tempfile::Builder`, unlinked on exit), then
-  uploaded into the sandbox's `/tmp` via the E2B Files API and
-  consumed + `rm -f`'d by the in-sandbox `pillbox run
-  --vault-stdin`. The local tempfile path is visible to other local
-  users via `ps -ef`; the file itself is 0600 so they can't read
-  it, but assume the path is leak-prone on a multi-user host.
-
-The blob schema is versioned and forward-compat: unknown JSON keys
-within a known version are tolerated, but a `version` mismatch
-fails the parse loudly so a newer client paired with an older
-remote can't silently drop required fields. `Debug` is implemented
-by hand on `VaultStdinBlob`, `InlineSecret`, and `InlineWorkspace` so
-a stray `dbg!` / `tracing::debug!(?blob)` never prints secret values.
-
-### Helper subprocess (E2B)
-
-There's no usable Rust SDK for E2B today, so pillbox embeds a small
-Node helper (`src/sandbox/e2b-helper.mjs`) and spawns it as a
-subprocess. Risks + mitigations:
-
-| Risk | Mitigation |
-|---|---|
-| Stale cached helper from an older pillbox accepted by a newer one | Helper emits `{type:"sandbox-up", protoVersion}` on stderr first; Rust verifies against `HELPER_PROTO_VERSION` and refuses to proceed on mismatch with a `rm ~/.pillbox/cache/e2b-helper-*` hint. |
-| ANSI escape injection from helper SDK errors / unknown event types | Every untrusted helper-stderr passthrough runs through `sanitize_terminal_line` (ESC / BEL / C0 → caret notation) before the user's terminal sees it. |
-| `serde_json` parser leak of stdin bytes on malformed blob | `VaultStdinBlob::from_bytes` maps any parse error to a fixed `"invalid JSON blob on stdin"` string. |
-| Helper trust | We bundle the helper into the pillbox binary via `include_str!` — auditable in-tree; `npm i -g e2b` brings in the JS SDK from npm under the user's standard Node trust boundary. |
-
-### Sessions (detach + reattach)
+A detached session runs entirely on the local host — a long-lived
+sandbox (Docker container or libkrun microVM) plus a local session
+record. There is no remote host and nothing crosses the network at
+session start. `--detach` does not support `--vault`: the host-side
+MITM proxy can't outlive the CLI, so a vaulted run must stay in the
+foreground.
 
 `pillbox session detach <id>` SIGTERMs the `attached_pid` recorded
 in the session TOML. The recorded pid is validated before
@@ -215,9 +174,10 @@ signalling:
 
 Session records themselves contain only opaque resource handles
 (sandbox ids, pids) — no credentials, no secrets. The threat from
-exposure of a session record is "can co-tenant on the host hijack
-the session?" — they'd need the E2B API key, which is not in the
-record.
+exposure of a session record is "can a co-tenant on the host hijack
+the session?" — they'd need access to the local Docker socket /
+libkrun process the sandbox runs under, which the host's own perms
+gate; the record alone grants nothing.
 
 ## Threat model honesty
 
@@ -228,8 +188,9 @@ will. Pillbox makes this harder by:
 
 - Not handing the agent the host's credentials (only its own).
 - Stripping host env vars by default.
-- Mediating egress through the lum MITM proxy when running under lum
-  (not yet wired up in the standalone CLI — v0.4).
+- Optionally mediating egress through the local `--vault` MITM
+  stub-swap proxy, which keeps real OAuth tokens / API keys on the
+  host and hands the sandbox stubs (see [vault.md](./vault.md)).
 
 But ultimately: **don't run untrusted prompts against an agent that
 holds production credentials**. That's a policy decision pillbox

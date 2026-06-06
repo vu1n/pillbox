@@ -1,10 +1,11 @@
 # Observability
 
-> **Note (2026-06-01):** the OTLP + §0 event-log model stands. The **remote**
-> telemetry paths (sandbox-side OTLP for e2b/ssh/`docker://`) are **deprecated**
-> with the remote backends; under the [libkrun pivot](./libkrun-sandbox.md) the
-> guest's events ride the `pillbox-init` vsock channel to the host, which exports
-> to the §0 log / OTLP. Telemetry is a headline differentiator — see the spec.
+> **Note:** the OTLP + §0 event-log model stands. Pillbox is local-only;
+> the emitters are the local sandboxes — the **Docker** container (default)
+> and the **libkrun** microVM. Under the [libkrun pivot](./libkrun-sandbox.md)
+> the guest's events ride the `pillbox-init` vsock channel to the host, which
+> exports to the §0 log / OTLP. Telemetry is a headline differentiator — see
+> the spec.
 
 Pillbox emits lifecycle telemetry as OTLP without taking a dependency on
 any specific backend. Point it at [Raindrop Workshop][workshop] for a
@@ -72,11 +73,12 @@ them is sandbox cold-start latency.
 ### OTLP shape
 
 - **Session spans:** one per run, opened up-front by whichever pillbox
-  launches the agent — **host-side** for local-docker, **sandbox-side**
-  for remotes — so the transcript / gen_ai children have a parent to
+  launches the agent — **host-side** for Docker, **guest-side** for the
+  libkrun microVM (whose §0 events ride the vsock channel back to the
+  host exporter) — so the transcript / gen_ai children have a parent to
   nest under from the first span (a collector names a run from the first
   span it sees). `trace_id` derives deterministically from the session
-  id so host and sandbox views correlate without a lookup table.
+  id so the host and guest views correlate without a lookup table.
 - **Transcript spans (drain-mode):** one OTLP child span per
   agent-native transcript event, emitted by
   `pillbox session transcript <FILE> --session-id <ID> [--agent claude|codex]`.
@@ -112,22 +114,13 @@ them is sandbox cold-start latency.
   `session transcript` by hand — when an OTLP traces endpoint is
   configured, every `pillbox run` spawns this tailer automatically
   (alongside a whole-chat *conversation* synthesizer that feeds
-  Workshop's Overview). It runs wherever the agent's transcript is
-  local to the launching pillbox: **host-side** for local-docker (the
-  agent's `$HOME` is bind-mounted to a host path), and **sandbox-side**
-  for `e2b://` / `ssh://` remotes (the sandbox-resident pillbox tails
-  its own filesystem). For remote runs pillbox forwards the
-  `OTEL_EXPORTER_OTLP_*` + `OTEL_SERVICE_NAME` env into the sandbox so
-  the in-sandbox tailer exports directly.
-
-  > **Remote collector reachability is yours to arrange.** A remote
-  > sandbox emits OTLP *from inside the sandbox*, so the endpoint must
-  > be reachable *from there* — an e2b cloud sandbox or a VPS cannot
-  > see your laptop's `localhost:5899`. Point `OTEL_EXPORTER_OTLP_ENDPOINT`
-  > at a sandbox-reachable collector (a hosted/VPS Workshop, your team
-  > collector), or tunnel your local one (e.g. `ssh -R`, `ngrok`).
-  > Pillbox deliberately does not relay spans back through the host —
-  > the collector is a separate concern we keep out of pillbox's path.
+  Workshop's Overview). For the Docker backend the agent's `$HOME` is
+  bind-mounted to a host path, so the tailer runs **host-side** against
+  that path. For the libkrun microVM the guest tails its own filesystem
+  and streams the rendered §0 events back to the host over the vsock
+  channel; the host exporter ships them. Either way the collector is
+  reached from the host, so a local `localhost:5899` Workshop works
+  without any tunnel.
 
 - **`gen_ai` spans:** host-side, one per intercepted LLM API call
   (when `--vault` is on). Emitted from the vault MITM proxy with OTel
@@ -172,14 +165,15 @@ them is sandbox cold-start latency.
   non-streaming `/v1/messages` response. The raw-body buffer is
   dropped on the first successful SSE event so streaming responses
   don't pay the fallback's memory cost.
-- **`gen_ai` span parenting kicks in for SSH + e2b remote runs.**
-  The launcher mints `session_id`, bakes it into the VaultStdinBlob,
-  and the sandbox-resident vault uses it to parent gen_ai spans
-  under the session span. **Local-docker foreground runs still
-  produce sandbox-id-rooted traces** — that path has no
-  host-side session_id today (no wrapper, no session.* events), so
-  there's nothing to parent under. Minting one for foreground runs
-  is a small follow-up if and when local-docker grows a wrapper.
+- **`gen_ai` span parenting requires a threaded `session_id`.**
+  When the launcher mints a `session_id` and threads it through the
+  vault (the detached / server-mode paths that carry a session
+  record), the vault parents gen_ai spans under the session span.
+  **Foreground Docker PTY runs still produce sandbox-id-rooted
+  traces** — that path has no host-side session_id today (no wrapper,
+  no session.* events), so there's nothing to parent under. Minting
+  one for foreground runs is a small follow-up if and when that path
+  grows a wrapper.
 - **`gen_ai.request.model` not emitted.** We extract
   `gen_ai.response.model` from the SSE `message_start` event — the
   model the server actually served, which is usually what you want.
@@ -263,9 +257,10 @@ on a private network, sketchy for a cleartext public endpoint. Prefer
   `pillbox run` (mount the sandbox's transcript dir to a host
   path, spawn a Tailer per session, tear down at sandbox exit)
   makes transcripts auto-stream without the user knowing the
-  file path. Local-docker first; remote SSH/e2b need a
-  sandbox-side relay. This is the last major chunk before the
-  observability stack reaches "everything works automatically."
+  file path. Docker (host bind-mount) is wired first; the libkrun
+  microVM streams its rendered events back over vsock. This is the
+  last major chunk before the observability stack reaches
+  "everything works automatically."
 - **JSON-body fallback for non-streaming responses.** Mirror the SSE
   tap with a JSON-body parser for endpoints called with
   `stream: false` so usage attrs land uniformly.

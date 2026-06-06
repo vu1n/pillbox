@@ -248,6 +248,11 @@ enum Command {
         /// e.g. `zai-coding-plan/glm-4.5-air`. Ignored by PTY agents.
         #[arg(long, value_name = "PROVIDER/MODEL")]
         model: Option<String>,
+        /// Sampling temperature for a server-integration agent (opencode), sent
+        /// on every `session send`. `0` = greedy/deterministic decoding — the
+        /// variance-reduction knob the eval rig needs. Ignored by PTY agents.
+        #[arg(long, value_name = "FLOAT")]
+        temperature: Option<f64>,
         /// Allow a host through egress (repeatable): the libkrun egress fence
         /// AND the vault broker's default-deny allowlist (see `--egress-deny`).
         /// Exact match, or `.suffix` for subdomains. For a custom/self-hosted
@@ -569,6 +574,7 @@ fn run(cli: Cli) -> Result<()> {
             parent,
             from_bookmark,
             model,
+            temperature,
             egress_allow,
             egress_deny,
             args,
@@ -646,6 +652,7 @@ fn run(cli: Cli) -> Result<()> {
                     ttl_seconds,
                     from_bookmark,
                     model,
+                    temperature,
                     egress_allow,
                     egress_deny,
                 },

@@ -757,6 +757,7 @@ fn launch_server_vm(
             server: Some(crate::session::ServerSession {
                 agent_session_id,
                 model: launch.model.clone(),
+                temperature: opts.temperature,
             }),
         };
         crate::session::write(resolved, &session)?;

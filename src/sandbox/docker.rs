@@ -475,6 +475,7 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
             server: Some(session::ServerSession {
                 agent_session_id: ocid.clone(),
                 model: model.clone(),
+                temperature: opts.temperature,
             }),
         };
         session::write(resolved, &session)?;

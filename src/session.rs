@@ -157,7 +157,8 @@ impl Backend {
 /// On-disk shape. Forward-compatible: serde will ignore unknown fields
 /// so a future binary writing extra metadata (e.g. a "last seen"
 /// timestamp) doesn't break older readers.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+// No `Eq`: `ServerSession.temperature` is an `f64` (PartialEq only).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct Session {
     /// Short hex id — 12 chars. Used as the registry filename and as
     /// the `pillbox session attach <id>` argument.
@@ -232,7 +233,7 @@ pub(crate) struct Session {
 
 /// The agent-native state a `Server`-integration agent (opencode) needs to be
 /// driven/read over its HTTP API — both fields are always set together.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ServerSession {
     /// The agent-native session id its HTTP API uses (`ses_…`), distinct from
     /// this record's pillbox id. `session send` (→ POST `/prompt_async`) and the
@@ -241,6 +242,10 @@ pub(crate) struct ServerSession {
     /// The `providerID/modelID` to drive with (resolved from `--model` or a
     /// default at run time, reused by every `session send`).
     pub(crate) model: String,
+    /// Sampling temperature (`--temperature`) sent on every `session send`.
+    /// `None` → the model/provider default. `Some(0.0)` = greedy decoding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) temperature: Option<f64>,
 }
 
 impl Session {

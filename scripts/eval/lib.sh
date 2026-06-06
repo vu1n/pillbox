@@ -3,7 +3,9 @@
 # a command rename) touches ONE place, not every caller. Sourced by run-task.sh
 # and meta-harness/propose.sh. Functions read the caller's env: PILLBOX (binary),
 # MAX_WAIT (idle-wait cap, seconds), MODEL (optional provider/modelID override).
-# No side effects on source beyond defining functions.
+# No side effects on source beyond defining functions. Optional env: MODEL
+# (provider/modelID), TEMPERATURE (sampling temp; set 0 for greedy/deterministic
+# decoding — the variance knob), PRICE_*_PER_M (cost-summer pricing).
 
 # Start an opencode session against workspace $1; echo the 12-hex session id (or
 # empty on failure, which the caller guards). MODEL overrides opencode's default.
@@ -13,7 +15,8 @@
 # opencode is server-mode, so `run --json` is valid without `--detach` (the run
 # persists a session record regardless).
 pb_run_session() {
-  "$PILLBOX" run --agent opencode --json --workspace "$1" ${MODEL:+--model "$MODEL"} 2>/dev/null \
+  "$PILLBOX" run --agent opencode --json --workspace "$1" \
+    ${MODEL:+--model "$MODEL"} ${TEMPERATURE:+--temperature "$TEMPERATURE"} 2>/dev/null \
     | python3 -c 'import json,sys
 try: print(json.load(sys.stdin)["session"]["id"])
 except Exception: pass'

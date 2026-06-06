@@ -517,6 +517,11 @@ pub(crate) struct RunOpts {
     /// the session and reused by every `session send`. `None` → a default.
     /// Ignored by PTY agents (they pick their own model interactively).
     pub(crate) model: Option<String>,
+    /// `--temperature FLOAT` — sampling temperature for a `Server`-integration
+    /// agent (opencode), recorded on the session and sent on every `session
+    /// send`. `Some(0.0)` = greedy decoding (the eval's variance knob). `None` →
+    /// the model/provider default. Ignored by PTY agents.
+    pub(crate) temperature: Option<f64>,
     /// `--egress-allow HOST` (repeatable) — hosts allowed through egress beyond
     /// the built-in set (the vault-intercepted providers + the standard
     /// model-provider profile). Two consumers: the libkrun egress fence, and the
@@ -740,6 +745,7 @@ mod tests {
             ttl_seconds: None,
             from_bookmark: None,
             model: None,
+            temperature: None,
             egress_allow: Vec::new(),
             egress_deny: false,
         }

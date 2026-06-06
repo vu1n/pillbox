@@ -105,6 +105,7 @@ pub(crate) fn send_prompt(
     opencode_session: &str,
     text: &str,
     model: &str,
+    temperature: Option<f64>,
 ) -> Result<()> {
     let (provider, model_id) = model.split_once('/').ok_or_else(|| {
         PillboxError::usage(
@@ -112,11 +113,19 @@ pub(crate) fn send_prompt(
             format!("--model must be `provider/modelID` (got `{model}`)"),
         )
     })?;
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "parts": [{ "type": "text", "text": text }],
         "model": { "providerID": provider, "modelID": model_id },
-    })
-    .to_string();
+    });
+    // Top-level `temperature` on the prompt request (opencode forwards model
+    // options to the provider). Only set when requested, so a `None` run keeps
+    // the model default. NOTE: whether opencode honors per-prompt temperature is
+    // verified empirically by the eval's σ̂ measurement — if it silently no-ops,
+    // variance stays high and the sensitivity check reports "rig not sensitive".
+    if let Some(t) = temperature {
+        body["temperature"] = serde_json::json!(t);
+    }
+    let body = body.to_string();
     let path = format!("/session/{opencode_session}/prompt_async");
     let resp = http.request("POST", &path, Some(&body))?;
     // Any 2xx is success (prompt_async returns 204).

@@ -750,7 +750,13 @@ fn session_send(resolved: &Pillbox, id: &str, text: &str) -> Result<()> {
                     format!("session `{}` has no server state", s.id),
                 )
             })?;
-            sandbox::opencode::send_prompt(&*http, &server.agent_session_id, text, &server.model)?;
+            sandbox::opencode::send_prompt(
+                &*http,
+                &server.agent_session_id,
+                text,
+                &server.model,
+                server.temperature,
+            )?;
         }
         eprintln!("pillbox: sent prompt to session `{}`", s.id);
         return Ok(());

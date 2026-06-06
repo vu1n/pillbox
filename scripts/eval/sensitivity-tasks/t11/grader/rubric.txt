@@ -1,0 +1,4 @@
+nth_smallest [3, 1, 2]=2 :: python3 -c 'import sys;sys.path.insert(0,".");from solution import nth_smallest as f;assert f([3, 1, 2])==2'
+nth_smallest [5, 5, 9]=5 :: python3 -c 'import sys;sys.path.insert(0,".");from solution import nth_smallest as f;assert f([5, 5, 9])==5'
+nth_smallest [8, 2, 4, 2]=2 :: python3 -c 'import sys;sys.path.insert(0,".");from solution import nth_smallest as f;assert f([8, 2, 4, 2])==2'
+nth_smallest []=-1 :: python3 -c 'import sys;sys.path.insert(0,".");from solution import nth_smallest as f;assert f([])==-1'

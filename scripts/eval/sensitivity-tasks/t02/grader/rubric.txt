@@ -1,0 +1,4 @@
+product [2, 3, 4]=24 :: python3 -c 'import sys;sys.path.insert(0,".");from solution import product as f;assert f([2, 3, 4])==24'
+product [5]=5 :: python3 -c 'import sys;sys.path.insert(0,".");from solution import product as f;assert f([5])==5'
+product [-1, 6]=-6 :: python3 -c 'import sys;sys.path.insert(0,".");from solution import product as f;assert f([-1, 6])==-6'
+product []=-1 :: python3 -c 'import sys;sys.path.insert(0,".");from solution import product as f;assert f([])==-1'

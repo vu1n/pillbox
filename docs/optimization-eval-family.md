@@ -161,7 +161,8 @@ parallelism for more trials, or smaller-granularity tasks), not the optimizer. C
 | Sensitivity-check runner (§5) | **built** — `scripts/eval/sensitivity-check.sh` (baseline vs planted-oracle × trials at temp-0 → score+cost JSONL → paired-stats). Verified end-to-end on synthetic records; live run needs a codesigned libkrun+opencode box |
 | 3-split (train/val/**test-locked**) | **convention** — enforce in the freeze step |
 | Headroom pre-screen | **not built** — one baseline pass dropping floor/ceiling tasks |
-| Option-A microtask curation (revert real fixes) | **not built** — the main human cost |
+| Sensitivity-check task family (Option-C synthetic) | **built** — `scripts/eval/gen-sensitivity-tasks.py` emits 12 microtasks + a uniform `oracle.md`; each prompt OMITS the same arbitrary "empty→-1" contract the hidden rubric checks → a structurally-guaranteed, uniform planted lift (validated: correct→4/4, baseline→3/4, so lift = 1 criterion/task). `--self-test` certifies it. Generated under `scripts/eval/sensitivity-tasks/` |
+| Option-A microtask curation (revert real fixes) | **not built** — the *bakeoff* family (the real human cost); the synthetic family above is only for the rig-sensitivity check |
 | Grader-leak redaction in any memory arm | **fixed in kypp** (`4c62a3d`); re-verify new injection paths |
 
 The substrate is done. What's missing is **discipline** (3 splits, headroom screen,

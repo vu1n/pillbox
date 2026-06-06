@@ -1,0 +1,4 @@
+Implement `second_largest(xs)` in `solution.py`: return the second-largest DISTINCT value in `xs` (assume xs has ≥2 distinct values when non-empty).
+
+`xs` is a list of integers. Edit ONLY `solution.py`. Keep the function name and
+signature exactly as given.

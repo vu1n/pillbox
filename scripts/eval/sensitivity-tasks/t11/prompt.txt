@@ -1,0 +1,4 @@
+Implement `nth_smallest(xs)` in `solution.py`: return the 2nd-smallest value in `xs` (assume xs has ≥2 values when non-empty; duplicates count).
+
+`xs` is a list of integers. Edit ONLY `solution.py`. Keep the function name and
+signature exactly as given.

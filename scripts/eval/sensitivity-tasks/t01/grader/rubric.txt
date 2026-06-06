@@ -1,0 +1,4 @@
+sum_all [1, 2, 3]=6 :: python3 -c 'import sys;sys.path.insert(0,".");from solution import sum_all as f;assert f([1, 2, 3])==6'
+sum_all [10]=10 :: python3 -c 'import sys;sys.path.insert(0,".");from solution import sum_all as f;assert f([10])==10'
+sum_all [-2, 2, 5]=5 :: python3 -c 'import sys;sys.path.insert(0,".");from solution import sum_all as f;assert f([-2, 2, 5])==5'
+sum_all []=-1 :: python3 -c 'import sys;sys.path.insert(0,".");from solution import sum_all as f;assert f([])==-1'

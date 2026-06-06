@@ -1,0 +1,4 @@
+balanced_diff [1, 2, 3]=2 :: python3 -c 'import sys;sys.path.insert(0,".");from solution import balanced_diff as f;assert f([1, 2, 3])==2'
+balanced_diff [10, 4]=6 :: python3 -c 'import sys;sys.path.insert(0,".");from solution import balanced_diff as f;assert f([10, 4])==6'
+balanced_diff [5]=5 :: python3 -c 'import sys;sys.path.insert(0,".");from solution import balanced_diff as f;assert f([5])==5'
+balanced_diff []=-1 :: python3 -c 'import sys;sys.path.insert(0,".");from solution import balanced_diff as f;assert f([])==-1'

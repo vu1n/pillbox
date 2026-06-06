@@ -1,0 +1,4 @@
+abs_max [1, -7, 3]=-7 :: python3 -c 'import sys;sys.path.insert(0,".");from solution import abs_max as f;assert f([1, -7, 3])==-7'
+abs_max [2, 2]=2 :: python3 -c 'import sys;sys.path.insert(0,".");from solution import abs_max as f;assert f([2, 2])==2'
+abs_max [-1, -1, 4]=4 :: python3 -c 'import sys;sys.path.insert(0,".");from solution import abs_max as f;assert f([-1, -1, 4])==4'
+abs_max []=-1 :: python3 -c 'import sys;sys.path.insert(0,".");from solution import abs_max as f;assert f([])==-1'

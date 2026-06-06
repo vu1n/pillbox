@@ -1,0 +1,4 @@
+Implement `range_span(xs)` in `solution.py`: return the difference between the largest and smallest number in `xs`.
+
+`xs` is a list of integers. Edit ONLY `solution.py`. Keep the function name and
+signature exactly as given.

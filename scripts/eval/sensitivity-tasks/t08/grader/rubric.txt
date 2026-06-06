@@ -1,0 +1,4 @@
+alternating_sum [1, 2, 3]=2 :: python3 -c 'import sys;sys.path.insert(0,".");from solution import alternating_sum as f;assert f([1, 2, 3])==2'
+alternating_sum [10, 1]=9 :: python3 -c 'import sys;sys.path.insert(0,".");from solution import alternating_sum as f;assert f([10, 1])==9'
+alternating_sum [5]=5 :: python3 -c 'import sys;sys.path.insert(0,".");from solution import alternating_sum as f;assert f([5])==5'
+alternating_sum []=-1 :: python3 -c 'import sys;sys.path.insert(0,".");from solution import alternating_sum as f;assert f([])==-1'

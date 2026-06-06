@@ -574,7 +574,7 @@ fn session_attach(resolved: &Pillbox, id: &str) -> Result<()> {
         .into());
     }
     match session::Backend::parse(&s.backend) {
-        Some(session::Backend::Docker) => sandbox::local_docker::reattach(resolved, &s),
+        Some(session::Backend::Docker) => sandbox::docker::reattach(resolved, &s),
         Some(session::Backend::Libkrun) => libkrun_reattach(resolved, &s),
         None => Err(PillboxError::config(
             "session attach",
@@ -699,7 +699,7 @@ fn session_detach(resolved: &Pillbox, id: &str) -> Result<()> {
 fn session_rm(resolved: &Pillbox, id: &str) -> Result<()> {
     let s = session::resolve(resolved, id)?;
     match session::Backend::parse(&s.backend) {
-        Some(session::Backend::Docker) => sandbox::local_docker::kill_session(resolved, &s),
+        Some(session::Backend::Docker) => sandbox::docker::kill_session(resolved, &s),
         Some(session::Backend::Libkrun) => libkrun_kill_session(resolved, &s),
         None => Err(PillboxError::config(
             "session rm",
@@ -752,7 +752,7 @@ fn session_send(resolved: &Pillbox, id: &str, text: &str) -> Result<()> {
     }
     match session::Backend::parse(&s.backend) {
         Some(session::Backend::Docker) => {
-            sandbox::local_docker::send_input(&s.sandbox_id, text.as_bytes())?;
+            sandbox::docker::send_input(&s.sandbox_id, text.as_bytes())?;
             eprintln!("pillbox: sent {} byte(s) to session `{}`", text.len(), s.id);
             Ok(())
         }

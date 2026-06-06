@@ -21,7 +21,7 @@ use crate::session::{self, Session, BACKEND_DOCKER, LOCAL_REMOTE};
 use crate::workspace::WorkspaceBackend;
 use crate::{docker, errors::PillboxError};
 
-pub(crate) struct LocalDocker;
+pub(crate) struct DockerBackend;
 
 /// Where the in-container pty-host listens; the per-attach relay (run via
 /// `docker exec`) connects to the same path. One pty-host per container.
@@ -39,7 +39,7 @@ impl Drop for ContainerGuard {
     }
 }
 
-impl SandboxBackend for LocalDocker {
+impl SandboxBackend for DockerBackend {
     fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
         // Some server agents (codex-serve) only run on the libkrun backend — their
         // run path lives in the microVM. Reject on docker rather than mis-routing

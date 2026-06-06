@@ -214,7 +214,7 @@ impl FromStr for McpAttachment {
     }
 }
 
-/// What an agent adapter hands back to `LocalDocker` when `--mcp …`
+/// What an agent adapter hands back to `DockerBackend` when `--mcp …`
 /// flags were passed. The shape covers both file-based loaders
 /// (Claude reads a JSON config file, so the adapter produces a
 /// tempfile + docker mount + `--mcp-config` argv) and CLI-flag

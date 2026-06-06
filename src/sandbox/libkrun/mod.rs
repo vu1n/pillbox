@@ -176,7 +176,7 @@ struct VsockAttach {
 /// The local microVM backend. Selected for a local run when the `libkrun`
 /// feature is built in and `PILLBOX_BACKEND=libkrun` is set.
 ///
-/// Mirrors `local_docker::run`'s creds + workspace + env pipeline (share the
+/// Mirrors `docker::run`'s creds + workspace + env pipeline (share the
 /// agent's auth home, CoW-clone + secret-scrub the workspace, compose the run
 /// env), launches the agent under an in-guest pty-host serving the `Frame`
 /// protocol over vsock (L4), and attaches a userspace egress stack with a DNS

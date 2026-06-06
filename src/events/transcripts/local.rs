@@ -2,7 +2,7 @@
 //!
 //! Unlike the remote backends — where the transcript jsonl lives
 //! inside an ephemeral sandbox — local-docker bind-mounts the agent's
-//! `$HOME` from the host (see `sandbox::local_docker`). So the
+//! `$HOME` from the host (see `sandbox::docker`). So the
 //! harness's `~/.claude/projects/<encoded>/<uuid>.jsonl` (Codex:
 //! `~/.codex/sessions/.../rollout-*.jsonl`) is written straight to a
 //! host path, and the host can tail it live and ship spans to the

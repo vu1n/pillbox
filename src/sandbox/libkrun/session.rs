@@ -37,7 +37,7 @@ impl SandboxBackend for LibkrunBackend {
     fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
         // Server-integration agents run headless + are driven/read over their HTTP
         // API through a vsock port-forward — a distinct path with no PTY (mirrors
-        // local_docker's split). The two share `launch_server_vm`; this picks the
+        // docker's split). The two share `launch_server_vm`; this picks the
         // per-agent builder (codex-serve drives `codex app-server` via the in-guest
         // bridge; opencode runs `opencode serve`). PTY agents fall through below.
         if spec.integration == Integration::Server {

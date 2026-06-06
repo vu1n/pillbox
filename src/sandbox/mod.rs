@@ -6,7 +6,7 @@
 //! (ssh/docker/e2b) were removed in the libkrun pivot — "remote" is
 //! becoming the managed/Cloudflare tier; until then pillbox is local-only.
 //!
-//! - [`local_docker::LocalDocker`] — host Docker daemon (the default).
+//! - [`docker::DockerBackend`] — host Docker daemon (the default).
 //! - [`libkrun::LibkrunBackend`] — a local libkrun microVM (feature-gated
 //!   `libkrun`; opt in via `PILLBOX_BACKEND=libkrun`).
 
@@ -15,7 +15,7 @@ pub(crate) mod appserver_client;
 pub(crate) mod http;
 #[cfg(feature = "libkrun")]
 pub(crate) mod libkrun;
-pub(crate) mod local_docker;
+pub(crate) mod docker;
 pub(crate) mod opencode;
 
 use anyhow::Result;
@@ -41,5 +41,5 @@ pub(crate) fn select_backend() -> Box<dyn SandboxBackend> {
     if std::env::var_os("PILLBOX_BACKEND").is_some_and(|v| v == "libkrun") {
         return Box::new(libkrun::LibkrunBackend);
     }
-    Box::new(local_docker::LocalDocker)
+    Box::new(docker::DockerBackend)
 }

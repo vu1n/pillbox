@@ -1,0 +1,17 @@
+name = "pillbox-do-spike"
+main = "src/worker.ts"
+compatibility_date = "2026-06-01"
+
+# One Durable Object class = the per-session §0 gateway.
+[[durable_objects.bindings]]
+name = "SESSION"
+class_name = "SessionGateway"
+
+# SQLite-backed storage migration (GA). `new_sqlite_classes` is required
+# for ctx.storage.sql to be available on the class.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SessionGateway"]
+
+[observability]
+enabled = true

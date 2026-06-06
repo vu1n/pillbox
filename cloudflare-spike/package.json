@@ -1,0 +1,16 @@
+{
+  "name": "pillbox-do-spike",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "smoke": "node smoke.mjs",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.20.0",
+    "@cloudflare/workers-types": "^4.20260601.0",
+    "typescript": "^5.5.0"
+  }
+}

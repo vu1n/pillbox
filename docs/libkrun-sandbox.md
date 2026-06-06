@@ -4,6 +4,18 @@
 backend and the whole remote-backend line ([remotes-redesign.md](./archive/remotes-redesign.md),
 [remotes.md](./archive/remotes.md) — now deprecated).
 
+> **Adopt-vs-maintain (2026-06-06).** [smolvm](https://github.com/smol-machines/smolvm)
+> (smol-machines, Apache-2.0, 3.5k★) is an independent OSS implementation of
+> *essentially this exact design* — libkrun-FFI + smoltcp + a vsock guest-agent
+> control plane + OCI-no-daemon + egress allowlist + ssh-agent forwarding +
+> GPU + an **embeddable Rust crate** (`EmbeddedRuntime`, streaming exec). Before
+> sinking more into our hand-rolled L1–L7, weigh **standing on smolvm as the
+> local microVM backend** (behind `SandboxBackend`) and spending the budget on
+> the §0/session/multiplayer layer it *doesn't* have. The substrate is now
+> commoditized in OSS, not just by Cloudflare — see the leverage list in
+> [managed-tier.md](./managed-tier.md). `.smolmachine` is a rootfs/layer pack,
+> not a live snapshot, so rustic stays our fork-from-store.
+
 ## Why
 
 Docker was chosen for one reason: **VPS ubiquity for the remote plane.** That

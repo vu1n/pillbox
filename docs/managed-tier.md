@@ -226,6 +226,46 @@ distributed seq-reconciliation hard case (below) in v1.
 
 ---
 
+## Competitive map & leverage list
+
+Two deep-research passes (`wfg349iml` CF/sync; `w41xdzm8y` competitors) plus the
+**smolvm** find converge on one read: **the substrate is triple-commoditized**
+— Cloudflare (managed), Claude Managed Agents (the vault as a product), and now
+**smolvm**, an Apache-2.0 OSS libkrun stack that is essentially pillbox's own
+L1–L7 — while the **single-writer-sequenced + per-event-actor-attributed +
+multiplayer-attach log for coding agents is contested-but-UNCLAIMED**: confirmed
+absent in the leading event vocabulary (AG-UI), the closest competitor (AWS
+Bedrock AgentCore), and smolvm. So: **rent everything below the daylight; build
+only the daylight.**
+
+| Player | Tier / what it is | Leverage | Tag |
+|---|---|---|---|
+| **smolvm** (smol-machines, Apache-2.0, 3.5k★) | our libkrun substrate as OSS — libkrun-FFI + smoltcp 0.13 + a **vsock guest-agent** control plane + OCI (no daemon) + egress allowlist + ssh-agent forwarding (keys never enter guest) + GPU (Venus) + an **embeddable Rust crate** (`EmbeddedRuntime`: create/start/connect/exec/`exec_streaming_with(ExecEvent)`/read+write_file/ports) | **Adopt as the local microVM backend** behind `SandboxBackend` → retire hand-rolled libkrun L1–L7 (they solved the libkrunfw build + codesign + GPU we hand-rolled). Gate: run our pty-host + §0 producer over their vsock/exec/port channel (their guest-agent is theirs; §0/attach/vault stay ours). `.smolmachine` = rootfs/layer pack, **not** a live snapshot → rustic stays our fork-from-store. Same worldview (local-first, library-not-daemon, isolation-default) — **soul brother: collaborate/partner.** | adopt + partner |
+| **e2b** (Apache-2.0, Firecracker) | raw sandbox + pause/resume (fs+mem) + `connect()` reconnect; self-hostable infra repo | Alt self-hostable sandbox+snapshot primitive behind the trait | integrate |
+| **Morph** (proprietary) | sandbox + branch/snapshot + browser remote-desktop | Managed fork primitive only; "sub-250ms snapshot" claim **unverified** | monitor |
+| **AWS Bedrock AgentCore** (closed) | **closest competitor** — Runtime + Memory + Observability + Harness | Adopt its OTEL per-step trace/span schema; exploit gap = local-first + cross-backend + **true multiplayer-attach** (it's per-session isolation, not multi-human watch-and-drive) | monitor + adopt-schema |
+| **DBOS Transact** (MIT, embeddable) | durable-execution engine (Postgres-checkpointed, auto-resume from last step) | Embed under managed runs for resumability without a separate orchestrator | integrate |
+| **CF Workflows** (GA) / **LangGraph `BaseCheckpointSaver`** | durable execution / checkpointer interface | CF Workflows for the managed tier; conform §0 to `BaseCheckpointSaver` (put/get_tuple/list/…) → consumable by LangGraph persistence | integrate / adopt-iface |
+| **AG-UI** (MIT, CopilotKit; adopted by Google/AWS/MS/LangChain) | agent↔user event protocol, transport-agnostic (WS/SSE) | Adopt the ~16–25 typed event taxonomy (Lifecycle / Text / ToolCall / Reasoning / State) for the §0 payload vocab — but it has **no seq, no per-event actor, no multiplayer** (exactly our daylight, confirmed absent) | adopt-vocab |
+| **OTEL GenAI semconv** | observability standard | Emit §0 as OTEL GenAI so it's consumable by Langfuse / Phoenix / Jaeger — no silo | adopt |
+| **Zed ACP** | cross-agent editor protocol (Claude/Codex/opencode/…) | Cross-agent portability — but **local/stdio only**, NOT a remote-attach envelope (the remote-attach claim was refuted) | monitor |
+| **Inspect / LangSmith / Braintrust** | eval / trajectory-replay | Emit a schema they ingest → the **§0-log-as-eval-dataset** (our other daylight) consumable, not siloed | adopt-schema |
+
+**Net — keep three things ours, rent the rest:** the sequenced + attributed +
+multiplayer §0 log, cross-backend §0 portability (local Docker/libkrun/smolvm +
+managed), and the eval/optimization loop over the log. Cheapest ship into the
+daylight: adopt AG-UI vocab + OTEL semconv + a durable engine, and stand on
+smolvm/e2b for the substrate, spending the build budget only on the daylight.
+
+> **Scan caveats.** Mostly vendor docs, not at-scale postmortems; some claims are
+> prove-a-negative. **Genuinely-open:** the multiplayer-attach UX of
+> Devin/Factory/Cursor/Replit/Amp/OpenHands (a Devin "async-PR-only" claim was
+> *refuted* — don't assume async-PR is universal), the exact eval-ingestion
+> schema, and Temporal/Inngest/Restate/Convex embeddability. Worth a focused
+> follow-up before betting the multiplayer UX.
+
+---
+
 ## The sequencing model — narrower than the spec feared
 
 The §0 spec braced for the "managed-placement disconnect case … distributed

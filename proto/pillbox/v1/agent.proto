@@ -215,7 +215,7 @@ message Event {
   }
 }
 
-message SandboxProvisioned { string remote = 1; string image = 2; }
+message SandboxProvisioned { reserved 1; reserved "remote"; string image = 2; }
 message SandboxReady       { }
 message SandboxDestroyed   { string reason = 1; }
 

@@ -161,7 +161,6 @@ pub(crate) enum Payload {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SandboxProvisioned {
-    pub(crate) remote: String,
     pub(crate) image: String,
 }
 

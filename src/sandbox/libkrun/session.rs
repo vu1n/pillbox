@@ -421,7 +421,6 @@ fn run_detached(
     let session = crate::session::Session {
         id: session_id.to_string(),
         label: opts.label.clone(),
-        remote: crate::session::LOCAL_REMOTE.to_string(),
         backend: crate::session::BACKEND_LIBKRUN.to_string(),
         sandbox_id: serde_json::to_string(&handle).context("encode libkrun handle")?,
         pty_pid: 0,
@@ -611,7 +610,6 @@ fn launch_server_vm(
         let session = crate::session::Session {
             id: session_id.clone(),
             label: opts.label.clone(),
-            remote: crate::session::LOCAL_REMOTE.to_string(),
             backend: crate::session::BACKEND_LIBKRUN.to_string(),
             sandbox_id: serde_json::to_string(&handle).context("encode libkrun handle")?,
             pty_pid: 0,

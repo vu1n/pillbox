@@ -38,8 +38,7 @@
 //!   "started_at": "2026-05-23T13:37:00Z",  // → OTel span.start_time
 //!   "ended_at":   "2026-05-23T13:42:11Z",  // → OTel span.end_time (terminal only)
 //!   "agent_id": "claude",
-//!   "remote": "prod-cloud",
-//!   "backend": "e2b",
+//!   "backend": "docker",
 //!   "label": null,
 //!   // Terminal-event-only fields (null on started / dropped):
 //!   "status": "ok",                        // → OTel status.code ("ok" | "error")
@@ -516,7 +515,6 @@ pub(crate) fn build_attributes(
         ("started_at", s_str(|s| &s.started_at)),
         ("ended_at", ended_at),
         ("agent_id", s_str(|s| &s.agent_id)),
-        ("remote", s_str(|s| &s.remote)),
         ("backend", s_str(|s| &s.backend)),
         ("label", s_opt(|s| s.label.as_deref())),
         ("status", Some(AttrValue::Str(ty.status_code().to_string()))),

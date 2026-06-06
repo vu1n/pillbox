@@ -21,7 +21,7 @@ use std::io::Read;
 
 use anyhow::{Context, Result};
 
-use crate::docker::{self, DockerEndpoint};
+use crate::docker;
 
 /// One HTTP response from an in-sandbox server.
 pub(crate) struct HttpResponse {
@@ -51,23 +51,17 @@ pub(crate) trait SandboxHttp {
     fn open_stream(&self, path: &str) -> Result<SandboxStream>;
 }
 
-/// `SandboxHttp` over a docker daemon: every call is a `docker exec curl` to
-/// `127.0.0.1:<port>` on `endpoint` (local, or a `docker://` remote where
-/// `DOCKER_HOST=ssh://…` carries the exec stream back over SSH). No port
-/// publishing — curl runs inside the same container as the server.
+/// `SandboxHttp` over the local docker daemon: every call is a `docker exec
+/// curl` to `127.0.0.1:<port>` in the container. No port publishing — curl
+/// runs inside the same container as the server.
 pub(crate) struct DockerHttp {
-    endpoint: DockerEndpoint,
     container: String,
     port: u16,
 }
 
 impl DockerHttp {
-    pub(crate) fn new(endpoint: DockerEndpoint, container: String, port: u16) -> Self {
-        Self {
-            endpoint,
-            container,
-            port,
-        }
+    pub(crate) fn new(container: String, port: u16) -> Self {
+        Self { container, port }
     }
 
     fn url(&self, path: &str) -> String {
@@ -78,7 +72,7 @@ impl DockerHttp {
     fn spawn_curl(&self, args: &[&str]) -> Result<std::process::Child> {
         let mut argv = vec!["curl".to_string()];
         argv.extend(args.iter().map(|s| s.to_string()));
-        let mut child = docker::exec_attach_at(&self.endpoint, &self.container, &argv)?;
+        let mut child = docker::exec_attach(&self.container, &argv)?;
         drop(child.stdin.take());
         Ok(child)
     }

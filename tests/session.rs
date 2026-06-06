@@ -13,11 +13,12 @@ use tempfile::TempDir;
 use common::{assert_ok, run, run_with_env};
 
 /// Drop a synthetic session record into a freshly-`init`-ed pillbox so
-/// the registry-side commands have something to chew on. The record
-/// shape mirrors what `RemoteE2bSandbox::run` would write, minus an
-/// `attached_pid` (the session starts detached).
-fn plant_session(home: &std::path::Path, id: &str, remote: &str, label: Option<&str>) {
-    plant_session_with_attached(home, id, remote, label, None);
+/// the registry-side commands have something to chew on. Records a
+/// legacy `backend = "e2b"` (a since-removed remote backend) so these
+/// fixtures also cover the orphaned-record path; starts detached (no
+/// `attached_pid`).
+fn plant_session(home: &std::path::Path, id: &str, label: Option<&str>) {
+    plant_session_with_attached(home, id, label, None);
 }
 
 /// Like [`plant_session`] but also stamps an `attached_pid` so detach-
@@ -25,7 +26,6 @@ fn plant_session(home: &std::path::Path, id: &str, remote: &str, label: Option<&
 fn plant_session_with_attached(
     home: &std::path::Path,
     id: &str,
-    remote: &str,
     label: Option<&str>,
     attached_pid: Option<i64>,
 ) {
@@ -39,7 +39,6 @@ fn plant_session_with_attached(
         .unwrap_or_default();
     let body = format!(
         "id = \"{id}\"\n\
-         remote = \"{remote}\"\n\
          backend = \"e2b\"\n\
          sandbox_id = \"sb_test_{id}\"\n\
          pty_pid = 42\n\
@@ -52,12 +51,11 @@ fn plant_session_with_attached(
 /// Plant a session with an explicit `expires_at` timestamp. Used by
 /// `session prune` tests so we can deterministically place records in
 /// the past or future without sleeping.
-fn plant_session_with_expiry(home: &std::path::Path, id: &str, remote: &str, expires_at: &str) {
+fn plant_session_with_expiry(home: &std::path::Path, id: &str, expires_at: &str) {
     let dir = home.join(".pillbox/global/sessions");
     fs::create_dir_all(&dir).unwrap();
     let body = format!(
         "id = \"{id}\"\n\
-         remote = \"{remote}\"\n\
          backend = \"e2b\"\n\
          sandbox_id = \"sb_test_{id}\"\n\
          pty_pid = 42\n\
@@ -88,7 +86,7 @@ fn list_json_is_stable_v1() {
     let cwd = TempDir::new().unwrap();
     let out = run(home.path(), cwd.path(), &["init"]);
     assert_ok(&out, "init");
-    plant_session(home.path(), "abc123def456", "cloud", Some("nightly"));
+    plant_session(home.path(), "abc123def456", Some("nightly"));
 
     let out = run(home.path(), cwd.path(), &["session", "list", "--json"]);
     assert_ok(&out, "session list --json");
@@ -109,7 +107,7 @@ fn info_resolves_by_prefix() {
     let cwd = TempDir::new().unwrap();
     let out = run(home.path(), cwd.path(), &["init"]);
     assert_ok(&out, "init");
-    plant_session(home.path(), "abcdef123456", "cloud", None);
+    plant_session(home.path(), "abcdef123456", None);
 
     let out = run(
         home.path(),
@@ -132,7 +130,7 @@ fn info_rejects_short_prefix() {
     let cwd = TempDir::new().unwrap();
     let out = run(home.path(), cwd.path(), &["init"]);
     assert_ok(&out, "init");
-    plant_session(home.path(), "abcdef123456", "cloud", None);
+    plant_session(home.path(), "abcdef123456", None);
 
     let out = run(home.path(), cwd.path(), &["session", "info", "abc"]);
     assert!(!out.status.success(), "should reject 3-char prefix");
@@ -146,8 +144,8 @@ fn info_rejects_ambiguous_prefix() {
     let cwd = TempDir::new().unwrap();
     let out = run(home.path(), cwd.path(), &["init"]);
     assert_ok(&out, "init");
-    plant_session(home.path(), "abcdef000001", "cloud", None);
-    plant_session(home.path(), "abcdef000002", "cloud", None);
+    plant_session(home.path(), "abcdef000001", None);
+    plant_session(home.path(), "abcdef000002", None);
 
     let out = run(home.path(), cwd.path(), &["session", "info", "abcdef"]);
     assert!(!out.status.success(), "should reject ambiguous prefix");
@@ -161,7 +159,7 @@ fn session_done_emits_completed_event() {
     let cwd = TempDir::new().unwrap();
     let out = run(home.path(), cwd.path(), &["init"]);
     assert_ok(&out, "init");
-    plant_session(home.path(), "abcdef111111", "cloud", None);
+    plant_session(home.path(), "abcdef111111", None);
 
     let out = run(
         home.path(),
@@ -197,7 +195,7 @@ fn session_done_failed_carries_reason_and_exit_code() {
     let cwd = TempDir::new().unwrap();
     let out = run(home.path(), cwd.path(), &["init"]);
     assert_ok(&out, "init");
-    plant_session(home.path(), "abcdef222222", "cloud", None);
+    plant_session(home.path(), "abcdef222222", None);
 
     let out = run(
         home.path(),
@@ -236,7 +234,7 @@ fn session_done_persists_result_snapshot_on_record() {
     let cwd = TempDir::new().unwrap();
     let out = run(home.path(), cwd.path(), &["init"]);
     assert_ok(&out, "init");
-    plant_session(home.path(), "abcdef333333", "cloud", None);
+    plant_session(home.path(), "abcdef333333", None);
 
     let out = run(
         home.path(),
@@ -279,19 +277,9 @@ fn session_prune_dry_run_lists_expired_only() {
     assert_ok(&out, "init");
     // One past, one future, one with no expiry — only the past one
     // is expired.
-    plant_session_with_expiry(
-        home.path(),
-        "expired00aaaa",
-        "cloud",
-        "2000-01-01T00:00:00Z",
-    );
-    plant_session_with_expiry(
-        home.path(),
-        "future0000bbbb",
-        "cloud",
-        "2099-01-01T00:00:00Z",
-    );
-    plant_session(home.path(), "noexpiry000cc", "cloud", None);
+    plant_session_with_expiry(home.path(), "expired00aaaa", "2000-01-01T00:00:00Z");
+    plant_session_with_expiry(home.path(), "future0000bbbb", "2099-01-01T00:00:00Z");
+    plant_session(home.path(), "noexpiry000cc", None);
 
     let out = run(home.path(), cwd.path(), &["session", "prune", "--dry-run"]);
     assert_ok(&out, "session prune --dry-run");
@@ -315,13 +303,8 @@ fn session_prune_empty_is_friendly() {
     let out = run(home.path(), cwd.path(), &["init"]);
     assert_ok(&out, "init");
     // Only future + no-expiry sessions — nothing to prune.
-    plant_session_with_expiry(
-        home.path(),
-        "future0000bbbb",
-        "cloud",
-        "2099-01-01T00:00:00Z",
-    );
-    plant_session(home.path(), "noexpiry000cc", "cloud", None);
+    plant_session_with_expiry(home.path(), "future0000bbbb", "2099-01-01T00:00:00Z");
+    plant_session(home.path(), "noexpiry000cc", None);
 
     let out = run(home.path(), cwd.path(), &["session", "prune"]);
     assert_ok(&out, "session prune");
@@ -339,7 +322,7 @@ fn session_prune_warns_on_malformed_expires_at() {
     let cwd = TempDir::new().unwrap();
     let out = run(home.path(), cwd.path(), &["init"]);
     assert_ok(&out, "init");
-    plant_session_with_expiry(home.path(), "garbage000eee", "cloud", "not a timestamp");
+    plant_session_with_expiry(home.path(), "garbage000eee", "not a timestamp");
 
     let out = run(home.path(), cwd.path(), &["session", "prune", "--dry-run"]);
     assert_ok(&out, "session prune --dry-run");
@@ -383,7 +366,7 @@ fn session_pull_errors_without_result_snapshot() {
     let cwd = TempDir::new().unwrap();
     let out = run(home.path(), cwd.path(), &["init"]);
     assert_ok(&out, "init");
-    plant_session(home.path(), "abcdef444444", "cloud", None);
+    plant_session(home.path(), "abcdef444444", None);
 
     let out = run(
         home.path(),
@@ -419,10 +402,9 @@ fn session_done_works_without_registry_record() {
     assert_eq!(event["session_id"], "deadbeefcafe");
     // Sandbox-side path has no local record: the session-derived
     // fields render as JSON null, NOT empty strings. Empty strings
-    // would be a lie (the agent's remote is not literally ""); null
+    // would be a lie (the agent's backend is not literally ""); null
     // honestly says "we don't know this from here, correlate via
     // session_id against the host's session.started".
-    assert!(event["remote"].is_null(), "got: {:?}", event["remote"]);
     assert!(event["backend"].is_null(), "got: {:?}", event["backend"]);
     assert!(event["agent_id"].is_null(), "got: {:?}", event["agent_id"]);
     assert!(
@@ -585,7 +567,7 @@ fn detach_already_detached_is_noop() {
     let cwd = TempDir::new().unwrap();
     let out = run(home.path(), cwd.path(), &["init"]);
     assert_ok(&out, "init");
-    plant_session(home.path(), "abcdef123456", "cloud", None);
+    plant_session(home.path(), "abcdef123456", None);
 
     let out = run(
         home.path(),
@@ -608,7 +590,7 @@ fn detach_refuses_reserved_pids() {
         let cwd = TempDir::new().unwrap();
         let out = run(home.path(), cwd.path(), &["init"]);
         assert_ok(&out, "init");
-        plant_session_with_attached(home.path(), "abcdef111111", "cloud", None, Some(bad_pid));
+        plant_session_with_attached(home.path(), "abcdef111111", None, Some(bad_pid));
 
         let out = run(
             home.path(),
@@ -640,13 +622,7 @@ fn detach_clears_stamp_when_pid_is_gone() {
     // Pick a pid we're confident is unused on this host. 0x7FFFFFFE
     // sits below i32::MAX so it always fits libc::pid_t; it's also
     // outside the default pid_max on every platform we ship to.
-    plant_session_with_attached(
-        home.path(),
-        "abcdef222222",
-        "cloud",
-        None,
-        Some(0x7FFF_FFFE),
-    );
+    plant_session_with_attached(home.path(), "abcdef222222", None, Some(0x7FFF_FFFE));
 
     let out = run(
         home.path(),
@@ -680,6 +656,29 @@ fn rm_unknown_session_errors() {
     assert!(!out.status.success(), "should fail on unknown id");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("no session matches"), "got: {stderr}");
+}
+
+#[test]
+fn rm_unsupported_backend_drops_orphaned_record() {
+    // A pre-pivot remote session (e2b/ssh/remote-docker — backends since
+    // removed) must still be removable: we can't reach its sandbox, but
+    // `session rm` should drop the orphaned record with a warning, not error.
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    let out = run(home.path(), cwd.path(), &["init"]);
+    assert_ok(&out, "init");
+    plant_session(home.path(), "abcdef555555", None); // planted with backend = "e2b"
+
+    let record = home
+        .path()
+        .join(".pillbox/global/sessions/abcdef555555.toml");
+    assert!(record.exists(), "fixture record should exist");
+
+    let out = run(home.path(), cwd.path(), &["session", "rm", "abcdef555555"]);
+    assert_ok(&out, "session rm of unsupported-backend record");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unsupported backend"), "got: {stderr}");
+    assert!(!record.exists(), "orphaned record should be dropped");
 }
 
 #[test]

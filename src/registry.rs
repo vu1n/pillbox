@@ -1,19 +1,19 @@
 //! Per-pillbox single-file registries — shared scaffolding for
-//! `secrets/`, `env/`, `remotes/`, and `sessions/`.
+//! `secrets/`, `env/`, and `sessions/`.
 //!
 //! Each registry is a directory under a `Pillbox`'s state dir holding
-//! one file per record (filename keyed by name / id). The four
-//! consumers each had their own near-identical `dir / dir_read /
-//! path / path_read` helpers and — for inherited registries — an
-//! identical `read_inherited` walking [`Pillbox::read_chain`]. The
-//! flagging-of-this-four-times in code review prompted the lift.
+//! one file per record (filename keyed by name / id). The consumers
+//! each had their own near-identical `dir / dir_read / path /
+//! path_read` helpers and — for inherited registries — an identical
+//! `read_inherited` walking [`Pillbox::read_chain`]. The repetition
+//! flagged in code review prompted the lift.
 //!
 //! ## Trait split
 //!
 //! - [`Registry`] — path layout + parse/serialize for a record type.
 //!   Single-scope reads/writes only. Implemented by every consumer.
 //! - [`InheritedRegistry`] — marker trait that opts a registry into
-//!   the project→global walk plus the [`merged`] listing. Sessions
+//!   the project→global walk ([`read_inherited`]). Sessions
 //!   intentionally don't implement it: a session is concrete runtime
 //!   state tied to the pillbox that started it, not config to inherit.
 //!
@@ -28,13 +28,9 @@
 //!   disk are the raw file content (a `String`); the KV parse happens
 //!   at the caller. So `EnvBundle::parse` returns `String` and callers
 //!   pass it to `parse_dotenv` when they need the map.
-//! - **Remotes' URL re-validation in `parse_remote`** lives inside the
-//!   record's `parse` impl — exactly where it should: a malformed URL
-//!   on disk turns into a config error at read time. The trait surface
-//!   doesn't need a separate hook for it.
 //! - **Sessions' no-inheritance** is encoded by not implementing
-//!   `InheritedRegistry`. The `read_inherited` and `list_merged`
-//!   helpers simply don't exist for sessions.
+//!   [`InheritedRegistry`], so the project→global `read_inherited`
+//!   walk never applies to them.
 
 use std::{
     fs,

@@ -15,9 +15,8 @@ use crate::agents::{
     AgentSpec, Integration, RunOpts, GUEST_HOME, GUEST_WORKSPACE,
 };
 use crate::attach::pump::{self, Outcome};
-use crate::docker::DockerEndpoint;
 use crate::pillbox::Pillbox;
-use crate::session::{self, Session, BACKEND_DOCKER, LOCAL_REMOTE};
+use crate::session::{self, Session, BACKEND_DOCKER};
 use crate::workspace::WorkspaceBackend;
 use crate::{docker, errors::PillboxError};
 
@@ -257,7 +256,6 @@ impl SandboxBackend for DockerBackend {
             let session = Session {
                 id: Session::new_id(),
                 label: opts.label.clone(),
-                remote: session::LOCAL_REMOTE.to_string(),
                 backend: BACKEND_DOCKER.to_string(),
                 sandbox_id: container,
                 pty_pid: 0,
@@ -424,11 +422,7 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
     args.extend(super::opencode::serve_args());
 
     let container = docker::run_detached(&args)?;
-    let http = super::http::DockerHttp::new(
-        DockerEndpoint::local(),
-        container.clone(),
-        super::opencode::SERVE_PORT,
-    );
+    let http = super::http::DockerHttp::new(container.clone(), super::opencode::SERVE_PORT);
     let model = opts
         .model
         .clone()
@@ -443,7 +437,6 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
         let session = Session {
             id: Session::new_id(),
             label: opts.label.clone(),
-            remote: LOCAL_REMOTE.to_string(),
             backend: BACKEND_DOCKER.to_string(),
             sandbox_id: container.clone(),
             pty_pid: 0,

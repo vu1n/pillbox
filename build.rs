@@ -19,7 +19,7 @@ fn main() {
     let lib_dir = std::env::var("LIBKRUN_LIB_DIR").unwrap_or_else(|_| {
         match std::env::var("CARGO_CFG_TARGET_OS").as_deref() {
             Ok("macos") => "/opt/homebrew/lib".to_string(), // slp/krun Homebrew tap
-            _ => "/usr/local/lib".to_string(),              // libkrun `make install` default on Linux
+            _ => "/usr/local/lib".to_string(), // libkrun `make install` default on Linux
         }
     });
     println!("cargo:rustc-link-search=native={lib_dir}");

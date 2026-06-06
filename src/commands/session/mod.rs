@@ -10,7 +10,6 @@ use anyhow::Result;
 
 use crate::agents::Integration;
 use crate::cli::{DoneStatus, SessionAction};
-use crate::docker::DockerEndpoint;
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
 use crate::{events, sandbox, session};
@@ -88,7 +87,6 @@ fn server_http(s: &session::Session) -> Result<Box<dyn sandbox::http::SandboxHtt
     let port = sandbox::opencode::SERVE_PORT;
     match session::Backend::parse(&s.backend) {
         Some(session::Backend::Docker) => Ok(Box::new(sandbox::http::DockerHttp::new(
-            DockerEndpoint::local(),
             s.sandbox_id.clone(),
             port,
         ))),
@@ -409,7 +407,7 @@ fn session_list(resolved: &Pillbox, json: bool) -> Result<()> {
         return Ok(());
     }
     println!(
-        "Sessions in `{}` (id        status       attached?  agent    remote          started_at):",
+        "Sessions in `{}` (id        status       attached?  agent    started_at):",
         resolved.display_name()
     );
     for s in &entries {
@@ -424,11 +422,10 @@ fn session_list(resolved: &Pillbox, json: bool) -> Result<()> {
             .map(|l| format!(" [{l}]"))
             .unwrap_or_default();
         println!(
-            "  {}  {:<11}  {attached}  {:<7}  {:<14}  {}{label}",
+            "  {}  {:<11}  {attached}  {:<7}  {}{label}",
             s.id,
             status.label(),
             s.agent_id,
-            s.remote,
             s.started_at
         );
     }
@@ -454,7 +451,6 @@ fn session_info(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
     if let Some(label) = &s.label {
         println!("  label:        {label}");
     }
-    println!("  remote:       {}", s.remote);
     println!("  backend:      {}", s.backend);
     println!("  sandbox_id:   {}", s.sandbox_id);
     println!("  pty_pid:      {}", s.pty_pid);
@@ -525,7 +521,7 @@ fn session_diagnose(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
         );
     }
     println!("  agent:        {}", s.agent_id);
-    println!("  remote:       {} ({})", s.remote, s.backend);
+    println!("  backend:      {}", s.backend);
     println!("  started_at:   {}", s.started_at);
     println!(
         "  attached:     {}",
@@ -701,11 +697,20 @@ fn session_rm(resolved: &Pillbox, id: &str) -> Result<()> {
     match session::Backend::parse(&s.backend) {
         Some(session::Backend::Docker) => sandbox::docker::kill_session(resolved, &s),
         Some(session::Backend::Libkrun) => libkrun_kill_session(resolved, &s),
-        None => Err(PillboxError::config(
-            "session rm",
-            format!("unknown session backend `{}`", s.backend),
-        )
-        .into()),
+        // Unknown backend = a pre-pivot remote session (e2b/ssh/remote-docker,
+        // whose backends were removed). We can't tear down a sandbox this binary
+        // no longer knows how to reach, but the orphaned record should still be
+        // removable — mirror libkrun-not-built: drop the record with a warning.
+        None => {
+            eprintln!(
+                "pillbox: warning: session `{}` has an unsupported backend `{}` \
+                 (likely a pre-pivot remote session); dropping the orphaned record only.",
+                s.id, s.backend
+            );
+            session::delete(resolved, &s.id)?;
+            println!("pillbox: ✓ session `{}` removed.", s.id);
+            Ok(())
+        }
     }
 }
 
@@ -1134,7 +1139,7 @@ fn session_prune(resolved: &Pillbox, dry_run: bool) -> Result<()> {
         );
         for s in &expired {
             let exp = s.expires_at.as_deref().unwrap_or("(none)");
-            println!("  {}  expires_at={exp}  remote={}", s.id, s.remote);
+            println!("  {}  expires_at={exp}  backend={}", s.id, s.backend);
         }
         return Ok(());
     }

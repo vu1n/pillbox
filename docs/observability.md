@@ -154,7 +154,7 @@ them is sandbox cold-start latency.
   lease.
 - **Log records:** one per lifecycle event regardless of emitter.
   Severity matches the event type. Attributes mirror the JSONL field
-  set 1:1 (`session_id`, `emitter`, `agent_id`, `backend`, `remote`,
+  set 1:1 (`session_id`, `emitter`, `agent_id`, `backend`,
   `label`, `status`, `exit_code`, `trace_path`, `result_snapshot`, …).
 - **Resource:** `service.name = pillbox` by default, override with
   `OTEL_SERVICE_NAME`.

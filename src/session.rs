@@ -126,10 +126,6 @@ impl IdRegistry for SessionRegistry {
 pub(crate) const BACKEND_DOCKER: &str = "docker";
 pub(crate) const BACKEND_LIBKRUN: &str = "libkrun";
 
-/// The `remote` field value a *local* Docker session records — a display label
-/// (it has no registered remote). Carried for display only; never a dispatch key.
-pub(crate) const LOCAL_REMOTE: &str = "local";
-
 /// Typed view of the on-disk `backend` string. Returned by
 /// [`Backend::parse`]; `None` means a backend label this binary doesn't
 /// know about (older or hand-edited record). Callers report the raw
@@ -170,8 +166,6 @@ pub(crate) struct Session {
     /// Surfaced in `session list` next to the id.
     #[serde(default)]
     pub(crate) label: Option<String>,
-    /// Display label for where this session lives (always `local` today).
-    pub(crate) remote: String,
     /// Backend kind — one of [`BACKEND_DOCKER`], [`BACKEND_LIBKRUN`].
     pub(crate) backend: String,
     /// Opaque handle the backend uses to find this session again.
@@ -268,7 +262,7 @@ impl Session {
     ///
     /// ```ignore
     /// let mut s = Session::test_fixture();
-    /// s.remote = "other-remote".into();
+    /// s.backend = BACKEND_LIBKRUN.into();
     /// ```
     ///
     /// Kept `#[cfg(test)]` to keep the production binary slim.
@@ -277,7 +271,6 @@ impl Session {
         Self {
             id: "abc123def456".to_string(),
             label: Some("test".to_string()),
-            remote: "test-remote".to_string(),
             backend: BACKEND_DOCKER.to_string(),
             sandbox_id: "sb_test".to_string(),
             pty_pid: 0,
@@ -305,7 +298,6 @@ impl Session {
         if let Some(label) = &self.label {
             o.insert("label".into(), label.clone().into());
         }
-        o.insert("remote".into(), self.remote.clone().into());
         o.insert("backend".into(), self.backend.clone().into());
         o.insert("sandbox_id".into(), self.sandbox_id.clone().into());
         o.insert("pty_pid".into(), self.pty_pid.into());
@@ -370,7 +362,6 @@ impl Session {
         Self {
             id: id.to_string(),
             label: None,
-            remote: String::new(),
             backend: String::new(),
             sandbox_id: String::new(),
             pty_pid: 0,
@@ -631,15 +622,14 @@ mod tests {
     use crate::test_util::with_isolated_home;
     use std::fs;
 
-    fn make(remote: &str, backend: &str) -> Session {
-        // Per-call overrides (id, remote, backend, started_at) on top
-        // of the shared `Session::test_fixture()`. Keeps the
-        // ambiguous-prefix / list-ordering tests deterministic where
-        // the fixture's stable fields wouldn't fit.
+    fn make(backend: &str) -> Session {
+        // Per-call overrides (id, backend, started_at) on top of the
+        // shared `Session::test_fixture()`. Keeps the ambiguous-prefix /
+        // list-ordering tests deterministic where the fixture's stable
+        // fields wouldn't fit.
         let mut s = Session::test_fixture();
         s.id = Session::new_id();
         s.label = None;
-        s.remote = remote.to_string();
         s.backend = backend.to_string();
         s.pty_pid = 42;
         s.started_at = now_rfc3339();
@@ -657,11 +647,10 @@ mod tests {
     fn write_and_read_round_trip() {
         with_isolated_home("session-rt", || {
             let g = pillbox::global();
-            let s = make("vps1", BACKEND_DOCKER);
+            let s = make(BACKEND_DOCKER);
             write(&g, &s).unwrap();
             let back = read(&g, &s.id).unwrap().expect("present");
             assert_eq!(back.id, s.id);
-            assert_eq!(back.remote, "vps1");
             assert_eq!(back.backend, BACKEND_DOCKER);
             assert_eq!(back.pty_pid, 42);
             assert!(back.attached_pid.is_none());
@@ -672,9 +661,9 @@ mod tests {
     fn list_is_stable_by_started_at() {
         with_isolated_home("session-list", || {
             let g = pillbox::global();
-            let mut a = make("r", BACKEND_DOCKER);
+            let mut a = make(BACKEND_DOCKER);
             a.started_at = "2026-01-01T00:00:00Z".into();
-            let mut b = make("r", BACKEND_DOCKER);
+            let mut b = make(BACKEND_DOCKER);
             b.started_at = "2026-02-01T00:00:00Z".into();
             write(&g, &b).unwrap(); // write newer first
             write(&g, &a).unwrap();
@@ -689,7 +678,7 @@ mod tests {
     fn resolve_accepts_prefix() {
         with_isolated_home("session-resolve", || {
             let g = pillbox::global();
-            let s = make("r", BACKEND_DOCKER);
+            let s = make(BACKEND_DOCKER);
             write(&g, &s).unwrap();
             let prefix = &s.id[..6];
             let found = resolve(&g, prefix).unwrap();
@@ -701,7 +690,7 @@ mod tests {
     fn resolve_rejects_short_prefix() {
         with_isolated_home("session-short", || {
             let g = pillbox::global();
-            let s = make("r", BACKEND_DOCKER);
+            let s = make(BACKEND_DOCKER);
             write(&g, &s).unwrap();
             let err = resolve(&g, "abc").unwrap_err().to_string();
             assert!(err.contains("too short"), "got: {err}");
@@ -714,9 +703,9 @@ mod tests {
             let g = pillbox::global();
             // Mint two ids that collide on a known prefix to make the test
             // deterministic.
-            let mut a = make("r", BACKEND_DOCKER);
+            let mut a = make(BACKEND_DOCKER);
             a.id = "abcdef000001".into();
-            let mut b = make("r", BACKEND_DOCKER);
+            let mut b = make(BACKEND_DOCKER);
             b.id = "abcdef000002".into();
             write(&g, &a).unwrap();
             write(&g, &b).unwrap();
@@ -733,7 +722,7 @@ mod tests {
     fn mark_attached_then_detached_roundtrips() {
         with_isolated_home("session-attach", || {
             let g = pillbox::global();
-            let s = make("r", BACKEND_DOCKER);
+            let s = make(BACKEND_DOCKER);
             write(&g, &s).unwrap();
             mark_attached(&g, &s.id, 12345).unwrap();
             assert_eq!(read(&g, &s.id).unwrap().unwrap().attached_pid, Some(12345));
@@ -746,7 +735,7 @@ mod tests {
     fn delete_is_idempotent() {
         with_isolated_home("session-del", || {
             let g = pillbox::global();
-            let s = make("r", BACKEND_DOCKER);
+            let s = make(BACKEND_DOCKER);
             write(&g, &s).unwrap();
             delete(&g, &s.id).unwrap();
             assert!(read(&g, &s.id).unwrap().is_none());
@@ -763,7 +752,7 @@ mod tests {
         // in place by checking mtime stability.
         with_isolated_home("session-detach-noop", || {
             let g = pillbox::global();
-            let s = make("r", BACKEND_DOCKER);
+            let s = make(BACKEND_DOCKER);
             write(&g, &s).unwrap();
             let path = SessionRegistry::path_read(&g, &s.id);
             let mtime_a = fs::metadata(&path).unwrap().modified().unwrap();

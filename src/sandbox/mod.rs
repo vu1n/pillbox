@@ -12,10 +12,10 @@
 
 pub(crate) mod appserver;
 pub(crate) mod appserver_client;
+pub(crate) mod docker;
 pub(crate) mod http;
 #[cfg(feature = "libkrun")]
 pub(crate) mod libkrun;
-pub(crate) mod docker;
 pub(crate) mod opencode;
 
 use anyhow::Result;

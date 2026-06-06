@@ -9,13 +9,22 @@
 //!
 //! **Vault works** via the **explicit-proxy broker** — the same model as docker
 //! (`HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS` → a host-side MITM proxy; the real key
-//! never enters the guest, only a stub). This needs **no transparent network
-//! interception**, so no smolvm change is required for proxy-honoring agents
-//! (claude/codex/node — what we target). The one unverified bit is
-//! `PILLBOX_SMOLVM_HOST_ADDR`: how the guest addresses the host proxy (docker
-//! uses `host.docker.internal`; defaults to 127.0.0.1). A *transparent*
-//! egress-redirect (for traffic that ignores `HTTP_PROXY`) is the only case that
-//! would want the upstream `tcp_relay` hook or our own libkrun — not v1.
+//! never enters the guest, only a stub). No transparent network interception, so
+//! no smolvm change is required for proxy-honoring agents (claude/codex/node —
+//! what we target). Live-verified on smolvm v1.0.1: boot, virtiofs RW write-back,
+//! `--workdir`, and guest→host loopback (`PILLBOX_SMOLVM_HOST_ADDR`, default
+//! 127.0.0.1 — smolvm relays the guest's 127.0.0.1 to the host's, reaching the
+//! proxy) all work.
+//!
+//! Two smolvm quirks the smoke surfaced, handled here:
+//!   - smolvm runs the CMD as PID 1, bypassing the image ENTRYPOINT (no cwd, no
+//!     CA install) — so we pass `--workdir` and inline `update-ca-certificates`
+//!     for vaulted runs (the call site).
+//!   - smolvm v1.0.1 **drops `pillbox-entrypoint.sh`** (and a few files) from the
+//!     2GB runner image on extraction — an upstream layer-extraction bug; the
+//!     inline CA step sidesteps it. A *transparent* egress-redirect (for traffic
+//!     that ignores `HTTP_PROXY`) is the only case that would want the upstream
+//!     `tcp_relay` hook or our own libkrun — not v1.
 //!
 //! Deliberately NOT here:
 //!   - **§0 / pty-host / attach / detach** — the daylight; layered over any
@@ -34,11 +43,6 @@ use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
 use crate::workspace::WorkspaceBackend;
 use crate::{docker, smolvm};
-
-/// The runner image's ENTRYPOINT (installs the vault CA into the system trust
-/// store, then `exec`s the CMD). smolvm runs the CMD as PID 1 and skips the
-/// image ENTRYPOINT, so we invoke it explicitly — see the call site.
-const GUEST_ENTRYPOINT: &str = "/usr/local/bin/pillbox-entrypoint.sh";
 
 pub(crate) struct SmolvmBackend;
 
@@ -155,13 +159,20 @@ impl SandboxBackend for SmolvmBackend {
             );
         }
         args.push("--".into());
-        // smolvm runs the command verbatim as PID 1, bypassing the image
-        // ENTRYPOINT — so invoke the runner entrypoint explicitly. It installs
-        // the vault CA into the system trust store (`update-ca-certificates`,
-        // which native-tls agents like codex need — Node honors
-        // NODE_EXTRA_CA_CERTS without it) then `exec`s the agent. Docker gets
-        // this for free (it prepends ENTRYPOINT to the CMD).
-        args.push(GUEST_ENTRYPOINT.into());
+        // smolvm runs the CMD as PID 1, bypassing the image ENTRYPOINT — and
+        // (smolvm v1.0.1, live-verified) drops the entrypoint *file* itself from
+        // this image on extraction, so we can't invoke it. For a vaulted run,
+        // inline the one thing the entrypoint does that matters: install the
+        // mounted CA into the system trust store for native-tls agents (codex;
+        // Node honors NODE_EXTRA_CA_CERTS without it), then `exec` the agent.
+        // `update-ca-certificates` is a base-image binary (present even when the
+        // entrypoint file isn't). Non-vault runs skip the wrap.
+        if vault_session.is_some() {
+            args.push("sh".into());
+            args.push("-c".into());
+            args.push("update-ca-certificates >/dev/null 2>&1 || true; exec \"$@\"".into());
+            args.push("pillbox-smolvm".into()); // $0 for `sh -c`; agent argv is $@
+        }
         args.extend(spec.run_argv.iter().map(|s| s.to_string()));
         args.extend(spec.sandbox_args.iter().map(|s| s.to_string()));
         args.extend(opts.args);

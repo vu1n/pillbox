@@ -1,6 +1,11 @@
 //! Integration tests for the attach transport (phase 2). They drive the
 //! real `pillbox` binary and assert the framed snapshot/stream carries the
-//! agent's output:
+//! agent's output. **All `#[ignore]`d** — they spawn real subprocesses and are
+//! timing-sensitive, so they flake when the full `cargo test` suite saturates
+//! the CPU; run them deliberately on an idle machine with
+//! `cargo test --test attach -- --ignored` (the docker/ssh ones also need their
+//! external deps). They do not gate routine `cargo test`.
+//!
 //!   - direct: a client on the pty-host's unix socket.
 //!   - relayed: a `pty-relay` child bridging that socket to its stdio (the
 //!     in-sandbox half of the docker/ssh transport, exercised without docker).
@@ -56,7 +61,10 @@ fn marker_seen<R: Read + Send + 'static>(mut r: R) -> bool {
         }
         let _ = tx.send(false);
     });
-    rx.recv_timeout(Duration::from_secs(5)).unwrap_or(false)
+    // Generous so the marker has time to arrive even when the suite saturates
+    // the CPU in parallel (same cold-load reasoning as connect_retry — only
+    // costs wall-time on a genuine no-marker failure).
+    rx.recv_timeout(Duration::from_secs(30)).unwrap_or(false)
 }
 
 struct KillOnDrop(Child);
@@ -84,7 +92,14 @@ fn spawn_host(sock: &std::path::Path) -> KillOnDrop {
 }
 
 fn connect_retry(sock: &std::path::Path) -> UnixStream {
-    for _ in 0..200 {
+    // ~30s budget (returns as soon as connect succeeds — normally <1s). The
+    // generous ceiling is for cold-start under load: this spawns the real
+    // `pillbox` binary as a subprocess, and when the full suite runs in parallel
+    // (the bin's unit tests + every integration binary, so threads can exceed
+    // cores) the process spawn + socket bind can take many seconds under CPU
+    // contention. 4s then 15s both flaked under oversubscription; a timeout only
+    // costs time on a genuine hang, so the ceiling is generous. See git log.
+    for _ in 0..1500 {
         if let Ok(s) = UnixStream::connect(sock) {
             return s;
         }
@@ -93,7 +108,14 @@ fn connect_retry(sock: &std::path::Path) -> UnixStream {
     panic!("pty-host never started listening on {}", sock.display());
 }
 
+// Heavyweight + timing-sensitive: spawns the real `pillbox` binary (+ bash + the
+// agent) as subprocesses and waits on wall-clock windows. Reliable on an idle
+// machine, but flakes when the full `cargo test` suite saturates the CPU (the
+// subprocesses get starved past even the generous timeouts above). So it's
+// `#[ignore]`d — like the docker/ssh transport tests below — and run deliberately:
+// `cargo test --test attach -- --ignored`. It does NOT gate routine `cargo test`.
 #[test]
+#[ignore = "heavyweight + timing-sensitive; run with `cargo test --test attach -- --ignored`"]
 fn direct_socket_attach_carries_agent_output() {
     let sock = unique_sock();
     let _host = spawn_host(&sock);
@@ -106,7 +128,10 @@ fn direct_socket_attach_carries_agent_output() {
     );
 }
 
+// Same as above — heavyweight, timing-sensitive, `#[ignore]`d out of the routine
+// gate; run with `cargo test --test attach -- --ignored`.
 #[test]
+#[ignore = "heavyweight + timing-sensitive; run with `cargo test --test attach -- --ignored`"]
 fn pty_relay_bridges_socket_to_stdio() {
     let sock = unique_sock();
     let _host = spawn_host(&sock);

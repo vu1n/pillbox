@@ -73,7 +73,20 @@ not the target.
 - **Option C — synthetic with known-difficulty knobs.** Not a bakeoff family
   (optimizer wins on toy tasks don't transfer — the exact false signal the verdict
   warns against), but the **ideal substrate for the §5 sanity check** because
-  difficulty is a dial.
+  difficulty is a dial. (Built: `gen-sensitivity-tasks.py`.)
+
+**Ready tooling for the bakeoff family** — the rig already ships importers that
+produce the hidden-grader task layout, so curating Option-A/B is *using* these,
+not hand-writing tasks: `import-aider-polyglot.py` (Exercism-derived, less
+contaminated, stdlib-unittest host-graded = light + agentic — the better A/B set,
+the one the gate used), `import-swebench.py` (the real **in-repo** slice =
+Option-A; in-sandbox grade + `--grader-egress` to pypi; **switch it to date-gated
+SWE-rebench** — SWE-bench-Lite is contaminated, sanity-only), `import-humaneval.py`
+(contaminated + weak tests → harness-mechanism only). Freeze a materialized set
+into the 3 splits with **`freeze-split.sh <tasks-root> <set> [train:val:test]`** —
+a stable-hash partition (a task keeps its split for life → no train↔test leakage
+when the set grows) over `freeze-task.sh`. Gated behind the §5 verdict: don't
+invest in the real family until the rig proves it can see a planted lift.
 
 **Recommendation:** start with **A**, sourced by reverting real one-commit fixes; use
 **C** only for the §5 sanity check; keep **B** as the post-validation generalization
@@ -159,7 +172,7 @@ parallelism for more trials, or smaller-granularity tasks), not the optimizer. C
 | Paired comparison + bootstrap CIs + σ̂ | **built** — `scripts/eval/paired-stats.py` (paired per-task diff, seeded bootstrap CI over tasks, pooled within-cell σ̂, `--self-test` recovers a planted lift / refuses high-σ + null) |
 | Temp-0 (greedy) decoding | **built** — `pillbox run --temperature` (server agents), `TEMPERATURE` env in the rig |
 | Sensitivity-check runner (§5) | **built** — `scripts/eval/sensitivity-check.sh` (baseline vs planted-oracle × trials at temp-0 → score+cost JSONL → paired-stats). Verified end-to-end on synthetic records; live run needs a codesigned libkrun+opencode box |
-| 3-split (train/val/**test-locked**) | **convention** — enforce in the freeze step |
+| 3-split (train/val/**test-locked**) | **built** — `freeze-split.sh` stable-hash-partitions a task-dir set into train/val/test bookmarks (stable under growth; ratios approximate for small N, printed counts authoritative) |
 | Headroom pre-screen | **not built** — one baseline pass dropping floor/ceiling tasks |
 | Sensitivity-check task family (Option-C synthetic) | **built** — `scripts/eval/gen-sensitivity-tasks.py` emits 12 microtasks + a uniform `oracle.md`; each prompt OMITS the same arbitrary "empty→-1" contract the hidden rubric checks → a structurally-guaranteed, uniform planted lift (validated: correct→4/4, baseline→3/4, so lift = 1 criterion/task). `--self-test` certifies it. Generated under `scripts/eval/sensitivity-tasks/` |
 | Option-A microtask curation (revert real fixes) | **not built** — the *bakeoff* family (the real human cost); the synthetic family above is only for the rig-sensitivity check |

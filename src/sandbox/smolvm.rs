@@ -132,9 +132,9 @@ impl SandboxBackend for SmolvmBackend {
             args.push(format!("{k}={v}"));
         }
         if let Some(vs) = &vault_session {
-            // How the guest addresses the host proxy — the one live-verify
-            // unknown vs docker's `host.docker.internal` alias. With `--net`
-            // (open egress) above, reaching it needs no extra allowlist.
+            // `--net` (open egress) above means reaching the host proxy needs no
+            // extra allowlist; the addr itself is the live-verify unknown (see
+            // `smolvm_extras`).
             let proxy_host = std::env::var("PILLBOX_SMOLVM_HOST_ADDR")
                 .unwrap_or_else(|_| "127.0.0.1".to_string());
             args.extend(vs.smolvm_extras(GUEST_HOME, &proxy_host));

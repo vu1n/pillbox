@@ -459,10 +459,10 @@ pub(crate) enum SessionAction {
     /// exits. Does NOT tear down the sandbox — use `session rm` for
     /// that.
     ///
-    /// Sandbox-side use: when called from inside an E2B sandbox where
-    /// the session record doesn't exist locally, builds a stub
-    /// payload from the id and relies on webhook / OTel sinks to ferry
-    /// the event to the host or orchestrator.
+    /// Sandbox-side use: when called from inside a sandbox where the
+    /// session record doesn't exist locally, builds a stub payload from
+    /// the id and relies on webhook / OTel sinks to ferry the event to
+    /// the host or orchestrator.
     Done {
         id: String,
         /// `ok` → emits `session.completed`. `failed` → emits

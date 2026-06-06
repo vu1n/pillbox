@@ -222,7 +222,7 @@ pub(crate) struct Session {
     /// key its transcript is written under. Lets `session subscribe` locate and
     /// tail a live session's transcript into the durable log while it serves
     /// (so a driven detached session is also readable). Empty for records that
-    /// predate the field or remote backends whose transcript is sandbox-side.
+    /// predate the field.
     #[serde(default)]
     pub(crate) guest_cwd: String,
     /// Server-integration (opencode) state — `Some` iff the agent is a `Server`

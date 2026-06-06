@@ -96,10 +96,9 @@ pub fn check_ready_for(resolved: &Pillbox) -> Result<String> {
     check_ready_for_at(resolved, &DockerEndpoint::local())
 }
 
-/// Endpoint-aware [`check_ready_for`]: resolve the runner image for
-/// `resolved`, then preflight it on `endpoint`'s daemon. The `docker://`
-/// backend passes a remote endpoint so a missing image is caught against
-/// the daemon that will actually run it, not the local one.
+/// Endpoint-aware [`check_ready_for`]: resolve the runner image for `resolved`,
+/// then preflight it on `endpoint`'s daemon. (`endpoint` is always local now that
+/// the remote backends are gone — the `_at` layer is vestigial; see ship-review.)
 pub fn check_ready_for_at(resolved: &Pillbox, endpoint: &DockerEndpoint) -> Result<String> {
     let (image, _src) = resolve_runner_image(resolved);
     check_ready_at(endpoint, &image)?;
@@ -216,8 +215,8 @@ pub fn exec_attach(container: &str, argv: &[String]) -> Result<std::process::Chi
 }
 
 /// Endpoint-aware [`exec_attach`] — attach to a pty-relay in a container on
-/// `endpoint`'s daemon. For `docker://`, `DOCKER_HOST=ssh://…` makes the
-/// exec stream ride the SSH transport back to the host pump unchanged.
+/// `endpoint`'s daemon. (`endpoint` is always local now; the `_at` layer is
+/// vestigial since the remote backends were removed — see ship-review.)
 pub fn exec_attach_at(
     endpoint: &DockerEndpoint,
     container: &str,
@@ -260,58 +259,6 @@ pub fn run_detached_at(endpoint: &DockerEndpoint, args: &[String]) -> Result<Str
         .into());
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-/// `docker cp <src> <container>:<dest>` on `endpoint`'s daemon — copy a single
-/// host file into the container (e.g. the staged vault/auth blob).
-// Wired by the docker:// run assembly (next slice) to stage the blob.
-#[allow(dead_code)]
-pub fn cp_file_at(
-    endpoint: &DockerEndpoint,
-    src: &std::path::Path,
-    container: &str,
-    dest: &str,
-) -> Result<()> {
-    let out = endpoint
-        .command()
-        .arg("cp")
-        .arg(src)
-        .arg(format!("{container}:{dest}"))
-        .output()
-        .context("invoking `docker cp <file>`")?;
-    if out.status.success() {
-        return Ok(());
-    }
-    Err(PillboxError::resource(
-        "workspace stage",
-        String::from_utf8_lossy(&out.stderr).trim().to_string(),
-    )
-    .into())
-}
-
-/// `docker inspect` the container's run state on `endpoint`'s daemon.
-/// Returns `Some(exit_code)` if it has exited, `None` if it's still running
-/// (or the inspect failed). Lets the docker:// backend report a fast-exiting
-/// agent's real status when the attach relay couldn't reach a container that
-/// already stopped.
-#[allow(dead_code)]
-pub fn container_exit_code_at(endpoint: &DockerEndpoint, container: &str) -> Option<i32> {
-    let out = endpoint
-        .command()
-        .arg("inspect")
-        .arg("-f")
-        .arg("{{.State.Running}} {{.State.ExitCode}}")
-        .arg(container)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let mut fields = stdout.split_whitespace();
-    let running = fields.next()? == "true";
-    let code: i32 = fields.next()?.parse().ok()?;
-    (!running).then_some(code)
 }
 
 /// `docker exec <container> <argv...>`, streaming output in real time.

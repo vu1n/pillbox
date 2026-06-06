@@ -358,7 +358,7 @@ enum Command {
     /// (or locally); not a user-facing command. See docs/attach-transport.md.
     #[command(hide = true)]
     PtyHost {
-        /// Unix socket to listen on for attach clients (docker / ssh backends).
+        /// Unix socket to listen on for attach clients (the in-sandbox pty-host).
         #[arg(long, value_name = "PATH")]
         sock: Option<String>,
         /// vsock port instead (libkrun guest backend; Linux-only). Default

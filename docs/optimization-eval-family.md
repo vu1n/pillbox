@@ -160,6 +160,32 @@ lift is invisible → **stop; do not run the bakeoff** — iterate on the rig (l
 parallelism for more trials, or smaller-granularity tasks), not the optimizer. Cost:
 ~12 tasks × 2 arms × 3 trials ≈ 72 rollouts, one model, hours.
 
+### RESULT (live run, 2026-06-07) — PASSES literally, but too clean to be informative
+
+Ran live on codesigned libkrun + `pillbox-runner:l7` + opencode `zai-coding-plan/glm-4.5-air`
+(12 tasks × baseline/oracle × 2 trials @ temp-0): **σ̂=0.0, mean_d=0.25 (=the planted
+lift exactly), CI=[0.25,0.25], `sensitive:true`** — every baseline cell 0.75 (missed
+the empty contract), every oracle 1.0, both trials identical. So: the rig detects a
+known lift, the stats machinery is sound, and the whole pipeline runs end-to-end. **But
+the result clears the bar so cleanly it punts the hard questions**, which the synthetic
+family is too clean to answer:
+- **σ̂=0.0 is the floor, not the regime that mattered.** These pure-function microtasks
+  have ~zero agentic branch points; they don't exercise the path-divergence variance
+  that killed the three prior real runs. Validates the *rig*, not real-task variance.
+- **temp-0's effect isn't isolated** — the tasks are deterministic even at default temp,
+  so same-condition determinism is *consistent with* temp-0 but doesn't prove it tames
+  variance (none to tame here).
+- **Cost denominator empty** — `pb_usage` found **no `usage` events** in the
+  libkrun-opencode §0 log (all cells $0); the cost-adjusted metric can't be computed on
+  this path (the §0 producer-fragmentation gap — opencode's SSE→§0 mapper doesn't emit
+  `Usage`, or `wait-idle` doesn't drain it).
+
+**The question moves from "can the rig measure lift?" (✅ yes) to two still-open follow-ups
+before the bakeoff:** (a) re-run this harness on a small **Option-A real-bug set** (importers
++ `freeze-split.sh` are built) to measure σ̂ in the agentic regime; (b) fix the
+libkrun-opencode **usage producer** so the cost half populates. The synthetic pass is the
+green light to invest in (a).
+
 ## Appendix — built vs. needed
 
 | Need | Status |
@@ -171,7 +197,7 @@ parallelism for more trials, or smaller-granularity tasks), not the optimizer. C
 | Temp-0 worker decoding | **needs wiring** (`MODEL` override exists; set provider temp 0) |
 | Paired comparison + bootstrap CIs + σ̂ | **built** — `scripts/eval/paired-stats.py` (paired per-task diff, seeded bootstrap CI over tasks, pooled within-cell σ̂, `--self-test` recovers a planted lift / refuses high-σ + null) |
 | Temp-0 (greedy) decoding | **built** — `pillbox run --temperature` (server agents), `TEMPERATURE` env in the rig |
-| Sensitivity-check runner (§5) | **built** — `scripts/eval/sensitivity-check.sh` (baseline vs planted-oracle × trials at temp-0 → score+cost JSONL → paired-stats). Verified end-to-end on synthetic records; live run needs a codesigned libkrun+opencode box |
+| Sensitivity-check runner (§5) | **built + RUN LIVE (2026-06-07)** — `scripts/eval/sensitivity-check.sh`; verdict `sensitive:true` (σ̂=0.0, lift=0.25, CI excludes 0) on libkrun+opencode. Rig validated; see §5 RESULT for the caveats (synthetic floor, cost denominator empty) + the two follow-ups |
 | 3-split (train/val/**test-locked**) | **built** — `freeze-split.sh` stable-hash-partitions a task-dir set into train/val/test bookmarks (stable under growth; ratios approximate for small N, printed counts authoritative) |
 | Headroom pre-screen | **not built** — one baseline pass dropping floor/ceiling tasks |
 | Sensitivity-check task family (Option-C synthetic) | **built** — `scripts/eval/gen-sensitivity-tasks.py` emits 12 microtasks + a uniform `oracle.md`; each prompt OMITS the same arbitrary "empty→-1" contract the hidden rubric checks → a structurally-guaranteed, uniform planted lift (validated: correct→4/4, baseline→3/4, so lift = 1 criterion/task). `--self-test` certifies it. Generated under `scripts/eval/sensitivity-tasks/` |

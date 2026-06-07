@@ -91,7 +91,7 @@ export class SessionGateway extends Agent<Env> {
     // free/§0-only deploy there's no Sandbox binding, so `/input` is append-only
     // — the attributed-input §0 path still works, just without the exec hop.
     if (this.env.Sandbox) {
-      await this.driveSandbox(inEv.seq, body.text ?? "");
+      await this.driveSandbox(this.env.Sandbox, inEv.seq, body.text ?? "");
     }
     return json({ seq: inEv.seq, head: this.head() });
   }
@@ -102,9 +102,15 @@ export class SessionGateway extends Agent<Env> {
   // tailer POSTing /event back with seq=0 — is the next sub-slice; this proves
   // the hop + the round-trip first.) `getSandbox` is the Sandbox-SDK handle to
   // the sibling container DO.
-  private async driveSandbox(inputSeq: number, cmd: string): Promise<void> {
+  // Takes the binding explicitly (non-optional) so the precondition "only with a
+  // container bound" is in the type, not just the caller's guard.
+  private async driveSandbox(
+    sandboxNs: NonNullable<Env["Sandbox"]>,
+    inputSeq: number,
+    cmd: string,
+  ): Promise<void> {
     const opId = `exec-${inputSeq}`;
-    const sandbox = getSandbox(this.env.Sandbox, this.name);
+    const sandbox = getSandbox(sandboxNs, this.name);
     // Cold-start: the container DO boots on first use and `exec` throws a
     // transient "Container is starting" until it's up. Retry that case with a
     // short backoff; surface any non-transient error as-is.
@@ -113,13 +119,7 @@ export class SessionGateway extends Agent<Env> {
       try {
         const res = await sandbox.exec(cmd);
         const out = [res.stdout, res.stderr].filter(Boolean).join("\n");
-        this.append(nowRfc3339(), undefined, {
-          type: "tool_call",
-          toolCallId: opId,
-          name: "exec",
-          status: res.success ? "completed" : "failed",
-          output: out,
-        });
+        this.appendExec(opId, res.success ? "completed" : "failed", out);
         return;
       } catch (e) {
         lastErr = String(e);
@@ -127,12 +127,17 @@ export class SessionGateway extends Agent<Env> {
         await new Promise((r) => setTimeout(r, 1000)); // container cold-start backoff
       }
     }
+    this.appendExec(opId, "error", lastErr);
+  }
+
+  // Append the container exec's outcome as a §0 tool_call event (fans out to subscribers).
+  private appendExec(opId: string, status: string, output: string): void {
     this.append(nowRfc3339(), undefined, {
       type: "tool_call",
       toolCallId: opId,
       name: "exec",
-      status: "error",
-      output: lastErr,
+      status,
+      output,
     });
   }
 

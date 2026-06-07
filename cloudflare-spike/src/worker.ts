@@ -17,8 +17,10 @@ export interface Env {
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     // Container preview/port-proxy URLs — only when the container is bound.
+    // Re-spread with the narrowed (defined) Sandbox so proxyToSandbox's env type
+    // is satisfied without a cast (TS narrows `env.Sandbox`, not `env`).
     if (env.Sandbox) {
-      const proxied = await proxyToSandbox(req, env);
+      const proxied = await proxyToSandbox(req, { ...env, Sandbox: env.Sandbox });
       if (proxied) return proxied;
     }
     // Route to the per-session §0 gateway Agent (works with or without a container).

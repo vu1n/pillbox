@@ -22,9 +22,11 @@ class_name = "Sandbox"
 [[containers]]
 class_name = "Sandbox"
 image = "./Dockerfile"
-# One container per session (addressed by sessionId); cap a few for the spike's
-# concurrent smokes. Production sizes this to the concurrent-session budget.
-max_instances = 5
+# Cost guard for the deployed spike: ONE smallest-tier container. Idle containers
+# auto-sleep (no idle billing); we tear the deploy down after validating. Prod
+# sizes max_instances to the concurrent-session budget.
+max_instances = 1
+instance_type = "lite"
 
 # SQLite-backed storage migration (GA). Both DO classes are SQLite-backed.
 [[migrations]]

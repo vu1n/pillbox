@@ -206,6 +206,9 @@ impl Upstream {
 pub(super) struct CredSwap {
     pub(super) stub: Vec<u8>,
     pub(super) real: Vec<u8>,
+    /// Destination hosts this swap is bound to (the connection's pinned SNI must
+    /// be one of these for the swap to fire). See [`super::SwapPair::hosts`].
+    pub(super) hosts: Vec<String>,
 }
 
 pub(super) struct StubSwap {
@@ -340,6 +343,7 @@ mod tests {
                 .map(|(stub, real)| CredSwap {
                     stub: stub.as_bytes().to_vec(),
                     real: real.as_bytes().to_vec(),
+                    hosts: Vec::new(), // byte-substitution unit test — host filtering tested separately
                 })
                 .collect(),
         );

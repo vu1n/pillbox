@@ -101,8 +101,15 @@ scope* change:
 - **Multiplayer input / roles / topologies — DEFER** until fan-out shows pull
   (users are overwhelmingly solo; multi-writer keystroke arbitration solves a
   problem almost nobody has yet).
-- **Managed tier — DEFER.** One thin adapter behind the existing trait, gated on
-  demonstrated demand; the value is the bundle, the compute is commodity resale.
+- **Managed tier — DEFER (still).** One thin adapter behind the existing trait,
+  gated on demonstrated demand; the value is the bundle, the compute is commodity
+  resale. **A milestone-0 spike exists** (`cloudflare-spike/` + [managed-tier.md](./managed-tier.md))
+  — the DO-as-§0-gateway, built *only* to validate the elegant "DO IS the
+  sequencer" insight and harvest the Agents-SDK/GSV learnings (it was cheap:
+  milestone-0-minus-the-container). **This is not a reversal of the defer:** the
+  tier stays frozen at the spike — do NOT build the container hop / broker / the
+  rest until the product-vs-artifact decision is made *and* demand is shown. The
+  spike is reference, not a commitment.
 - **Optimization & collective intelligence — CUT from this repo** (honor the
   doc's own "separate project" scoping). Each piece ships externally
   (meta-harness is OSS; routing is commoditized; DSPy-for-coding is unproven).

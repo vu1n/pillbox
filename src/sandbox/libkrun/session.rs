@@ -344,7 +344,12 @@ fn launch_base(
         let stub = crate::vault::providers::mint_stub(&meta.vault.prefix, spec.id);
         guest_env.push((w.env_var.clone(), stub.clone()));
         with_vault.push(WithSwap {
-            swap: SwapPair { stub, real },
+            swap: SwapPair {
+                stub,
+                real,
+                // Bound to this secret's declared host — the swap fires only there.
+                hosts: vec![meta.vault.host.clone()],
+            },
             host: meta.vault.host.clone(),
         });
     }
@@ -392,7 +397,14 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
     // clone inherits it). The guest mounts the *stubbed* creds — the real tokens
     // never enter the VM; the MITM swaps stub→real on the wire. The reals reach the
     // child out-of-band on stdin (not env/argv/VmSpec).
-    let (creds_share, mut swap_pairs) = stub_oauth_creds(&home, spec.cred_sentinel)?;
+    // OAuth tokens are bound to the agent's provider hosts (its API + OAuth/refresh
+    // endpoints) — the swap fires only there, never on a `--with` or `--egress-allow`
+    // host, so a leaked OAuth stub can't be replayed elsewhere for the real token.
+    let oauth_hosts: Vec<String> = crate::vault::providers::intercepted_hosts()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let (creds_share, mut swap_pairs) = stub_oauth_creds(&home, spec.cred_sentinel, &oauth_hosts)?;
     // Fold the vaulted `--with` swaps in alongside the OAuth ones (one MITM blob),
     // and collect their hosts for the egress allowlist below.
     let with_hosts: Vec<String> = with_vault

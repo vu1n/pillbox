@@ -95,7 +95,10 @@ pub(super) fn drive_listeners(
                             host: String::new(),
                             upstream: None,
                             connecting: None,
-                            swap: StubSwap::new(swap_pairs.to_vec()),
+                            // Empty until the SNI pins — then rebuilt with only the
+                            // pairs bound to this host (destination-bound release).
+                            // No plaintext is relayed before the gate, so this is safe.
+                            swap: StubSwap::new(Vec::new()),
                             req_logged: false,
                             closing: false,
                         })
@@ -104,7 +107,7 @@ pub(super) fn drive_listeners(
                 }
             }
             if let Some(c) = l.conn.as_mut() {
-                drive_conn(sock, c, vault, pins, diag);
+                drive_conn(sock, c, vault, pins, swap_pairs, diag);
             }
         }
         let sock = sockets.get_mut::<tcp::Socket>(l.handle);
@@ -115,12 +118,34 @@ pub(super) fn drive_listeners(
     }
 }
 
+/// Build the per-connection swap from only the pairs bound to `host` (the pinned
+/// SNI) — destination-bound release. A pair with no `hosts` is unbound and applies
+/// everywhere (back-compat / tests); a bound pair applies only on its host(s),
+/// case-insensitively. This is what stops a guest-held stub from being replayed to
+/// a different allowlisted host to extract the real credential.
+fn host_bound_swap(swap_pairs: &[CredSwap], host: &str) -> StubSwap {
+    StubSwap::new(
+        swap_pairs
+            .iter()
+            .filter(|p| p.hosts.is_empty() || p.hosts.iter().any(|h| h.eq_ignore_ascii_case(host)))
+            .cloned()
+            .collect(),
+    )
+}
+
 /// Pump one MITM session: smoltcp rx → guest rustls, gate on the DNS-pin (the
 /// allowlist is already enforced by the cert resolver — a non-allowlisted SNI
 /// never got a cert), then relay decrypted bytes to/from the upstream TLS, guest
 /// rustls → smoltcp tx. Split-borrows the connection's fields so the guest and
 /// upstream sessions can be driven in the same call.
-fn drive_conn(sock: &mut tcp::Socket, c: &mut Conn, vault: &Vault, pins: &PinTable, diag: &Diag) {
+fn drive_conn(
+    sock: &mut tcp::Socket,
+    c: &mut Conn,
+    vault: &Vault,
+    pins: &PinTable,
+    swap_pairs: &[CredSwap],
+    diag: &Diag,
+) {
     let Conn {
         tls,
         host,
@@ -168,6 +193,10 @@ fn drive_conn(sock: &mut tcp::Socket, c: &mut Conn, vault: &Vault, pins: &PinTab
                 "krun-egress: [mitm] ALLOW sni={sni:?} → DNS-pinned, terminating"
             ));
             *host = sni;
+            // Destination-bound release: apply only the credential swaps bound to
+            // THIS host, so a stub the guest holds can't be replayed to a different
+            // allowlisted host to extract the real.
+            *swap = host_bound_swap(swap_pairs, host);
         }
     }
 
@@ -259,5 +288,70 @@ fn drive_conn(sock: &mut tcp::Socket, c: &mut Conn, vault: &Vault, pins: &PinTab
     // Close the guest side once the upstream is gone and its response is flushed.
     if *closing && !tls.wants_write() {
         sock.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pair(stub: &str, hosts: &[&str]) -> CredSwap {
+        CredSwap {
+            stub: stub.as_bytes().to_vec(),
+            real: b"REAL".to_vec(),
+            hosts: hosts.iter().map(|h| h.to_string()).collect(),
+        }
+    }
+
+    // Full swap output for one input (push then flush — push alone holds a carry
+    // tail for stubs that might straddle the next chunk).
+    fn full(mut s: StubSwap, input: &[u8]) -> Vec<u8> {
+        let mut out = s.push(input);
+        out.extend(s.flush());
+        out
+    }
+
+    // Destination-bound release: a pair fires only on a connection whose pinned
+    // SNI is in its host set — a stub bound to host A must NOT be applied on host B.
+    #[test]
+    fn host_bound_swap_applies_only_matching_pairs() {
+        let pairs = vec![
+            pair("oauthstub", &["api.anthropic.com", "console.anthropic.com"]),
+            pair("ghstub", &["api.github.com"]),
+        ];
+
+        // On the github connection, only the github pair is live — the OAuth stub
+        // cannot be swapped here (the exfil hole this closes).
+        assert_eq!(
+            full(host_bound_swap(&pairs, "api.github.com"), b"oauthstub here"),
+            b"oauthstub here" // NOT swapped — oauth pair isn't loaded on this host
+        );
+        assert_eq!(
+            full(host_bound_swap(&pairs, "api.github.com"), b"ghstub here"),
+            b"REAL here" // swapped (its bound host)
+        );
+
+        // On an Anthropic host, the OAuth pair is live, the github pair is not.
+        assert_eq!(
+            full(
+                host_bound_swap(&pairs, "api.anthropic.com"),
+                b"oauthstub here"
+            ),
+            b"REAL here"
+        );
+        assert_eq!(
+            full(host_bound_swap(&pairs, "api.anthropic.com"), b"ghstub here"),
+            b"ghstub here" // github pair not loaded on an anthropic host
+        );
+    }
+
+    #[test]
+    fn host_match_is_case_insensitive_and_unbound_applies_everywhere() {
+        let bound = vec![pair("s", &["API.Anthropic.COM"])];
+        assert!(!host_bound_swap(&bound, "api.anthropic.com").is_noop());
+        assert!(host_bound_swap(&bound, "evil.example").is_noop());
+        // a pair with no hosts is unbound → applies on any host (back-compat).
+        let unbound = vec![pair("s", &[])];
+        assert!(!host_bound_swap(&unbound, "evil.example").is_noop());
     }
 }

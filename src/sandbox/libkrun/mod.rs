@@ -160,6 +160,13 @@ struct Share {
 struct SwapPair {
     stub: String,
     real: String,
+    /// Hosts this credential is bound to — the MITM applies the swap ONLY on a
+    /// connection whose pinned SNI is in this set, so a stub leaked into the guest
+    /// can't be replayed to a *different* allowlisted host to extract the real
+    /// (destination-bound release). OAuth → the provider's intercept set; a
+    /// vaulted `--with` → its declared `vault.host`.
+    #[serde(default)]
+    hosts: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -396,6 +403,7 @@ fn read_swap_pairs() -> Vec<vault::CredSwap> {
         .map(|p| vault::CredSwap {
             stub: p.stub.into_bytes(),
             real: p.real.into_bytes(),
+            hosts: p.hosts,
         })
         .collect()
 }
@@ -431,7 +439,11 @@ fn cow_clone_home(home: &Path) -> Result<PathBuf> {
 /// out-of-band. Returns the clone + the stub→real swap pairs. Server-mode
 /// agents (opencode, non-vault) skip this and mount [`cow_clone_home`] as-is —
 /// their real key must reach the provider, so there's nothing to swap.
-fn stub_oauth_creds(home: &Path, sentinel: &str) -> Result<(PathBuf, Vec<SwapPair>)> {
+fn stub_oauth_creds(
+    home: &Path,
+    sentinel: &str,
+    hosts: &[String],
+) -> Result<(PathBuf, Vec<SwapPair>)> {
     let clone = cow_clone_home(home)?;
     let mut pairs = Vec::new();
     let creds_file = clone.join(sentinel);
@@ -447,9 +459,13 @@ fn stub_oauth_creds(home: &Path, sentinel: &str) -> Result<(PathBuf, Vec<SwapPai
                         .and_then(|v| v.as_str())
                         .map(str::to_string);
                     if let Some(real) = real.filter(|s| !s.is_empty()) {
-                        let stub = mint_stub(&real);
+                        let stub = mint_oauth_stub(&real);
                         oauth.insert(field.to_string(), serde_json::Value::String(stub.clone()));
-                        pairs.push(SwapPair { stub, real });
+                        pairs.push(SwapPair {
+                            stub,
+                            real,
+                            hosts: hosts.to_vec(),
+                        });
                     }
                 }
                 let body = serde_json::to_string(&json).context("reserialize stubbed creds")?;
@@ -462,14 +478,18 @@ fn stub_oauth_creds(home: &Path, sentinel: &str) -> Result<(PathBuf, Vec<SwapPai
     Ok((clone, pairs))
 }
 
-/// A unique stub shaped like `real` so a format check passes. **Keeps only the
-/// fixed type prefix** — the first 3 hyphen segments (e.g. `sk-ant-oat01`) — and
-/// only when the token clearly has a body *beyond* that prefix (≥4 segments, the
-/// Anthropic `sk-ant-oat01-<body>` shape). The body is the secret and must NEVER
-/// leak into the stub (which lands in the guest's creds), so a short/odd token
-/// (<4 segments) gets a fully synthetic prefix instead. High-entropy uuid suffix
-/// so the byte-level swap never false-matches on other content.
-fn mint_stub(real: &str) -> String {
+/// Mint a stub for an **OAuth token** (the `claudeAiOauth` `access`/`refreshToken`,
+/// shaped `sk-ant-{oat01,ort01}-<body>` — a fixed 3-hyphen-segment type prefix).
+/// Derives the stub prefix from `real` (the two token types differ, so a single
+/// curated prefix can't serve both), keeping ONLY the first 3 segments — for the
+/// OAuth shape that's exactly the public type marker, never the body.
+///
+/// **Only for OAuth-shaped tokens.** For an arbitrary `--with` secret use the
+/// curated `crate::vault::providers::mint_stub(prefix, …)` instead: a key whose
+/// public prefix is <3 segments (OpenAI `sk-proj-<body>`) would leak a body chunk
+/// through this derivation. The ≥4-segment guard only protects short/odd tokens
+/// (synthetic fallback), NOT 2-segment-prefix keys — hence the OAuth-only contract.
+fn mint_oauth_stub(real: &str) -> String {
     let prefix = if real.split('-').count() >= 4 {
         real.splitn(4, '-').take(3).collect::<Vec<_>>().join("-")
     } else {
@@ -566,14 +586,14 @@ fn cstr(s: &str) -> CString {
 
 #[cfg(test)]
 mod tests {
-    use super::mint_stub;
+    use super::mint_oauth_stub;
 
     #[test]
     fn mint_stub_keeps_type_prefix_not_the_secret_body() {
         // Anthropic OAuth tokens are sk-ant-oat01-<base64url> and the body can
         // contain hyphens — the stub must keep only the type prefix, never the body.
         let real = "sk-ant-oat01-3WY-itf8QpVP38ipXjip-SECRETBODYxyz";
-        let stub = mint_stub(real);
+        let stub = mint_oauth_stub(real);
         assert!(
             stub.starts_with("sk-ant-oat01-pllbxstub"),
             "stub leaked shape: {stub}"
@@ -582,7 +602,7 @@ mod tests {
         assert!(!stub.contains("SECRETBODYxyz"), "stub leaked body: {stub}");
         assert_ne!(stub, real);
         // Distinct each call (uuid suffix).
-        assert_ne!(mint_stub(real), stub);
+        assert_ne!(mint_oauth_stub(real), stub);
     }
 
     #[test]
@@ -590,7 +610,7 @@ mod tests {
         // A token with <4 hyphen segments has no clear type/body split, so the
         // prefix must be synthetic — never any of the real bytes.
         for real in ["sk-secret", "justonesecretword", "sk-ant-secretbody"] {
-            let stub = mint_stub(real);
+            let stub = mint_oauth_stub(real);
             assert!(
                 stub.starts_with("pllbx-pllbxstub"),
                 "short token leaked shape: {stub}"

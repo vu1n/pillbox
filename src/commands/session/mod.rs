@@ -259,6 +259,9 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> 
         SessionAction::Detach { id } => session_detach(resolved, &id),
         SessionAction::Rm { id } => session_rm(resolved, &id),
         SessionAction::Send { id, text } => session_send(resolved, &id, &text),
+        SessionAction::Annotate { id, text, anchor } => {
+            session_annotate(resolved, &id, &text, anchor.as_deref())
+        }
         SessionAction::Subscribe { id, from, bind } => {
             stream::session_subscribe(resolved, &id, from, bind.as_deref())
         }
@@ -823,6 +826,28 @@ fn record_input(
         }
         Err(e) => eprintln!("pillbox: warning: couldn't open the §0 log to record input: {e:#}"),
     }
+}
+
+/// Record an attributed §0 [`Annotation`](crate::contract::Annotation) — the async,
+/// keyboard-free "chime in" that does NOT drive the agent (unlike `session send`).
+/// Stamped `human(<os user>)`; an orchestrator may later inject it as agent context.
+/// Hard-errors on append failure: recording the annotation IS this command's job
+/// (vs `record_input`, a side-effect of an already-succeeded send). Shares
+/// `record_input`'s single-writer seq caveat (a second `SessionLog` opener) —
+/// fine locally; the managed/multiplayer path sequences through the resident DO.
+fn session_annotate(resolved: &Pillbox, id: &str, text: &str, anchor: Option<&str>) -> Result<()> {
+    let s = session::resolve(resolved, id)?;
+    let ev = crate::contract::Event::session(
+        &s.id,
+        crate::contract::Payload::Annotation(crate::contract::Annotation {
+            text: text.to_string(),
+            anchor: anchor.unwrap_or_default().to_string(),
+        }),
+    )
+    .with_actor(crate::contract::Actor::human(local_user()));
+    crate::events::log::SessionLog::open(resolved, &s.id)?.append(&[ev])?;
+    eprintln!("pillbox: annotated session `{}`", s.id);
+    Ok(())
 }
 
 /// The local human identity for §0 actor attribution — the OS user, else `local`.

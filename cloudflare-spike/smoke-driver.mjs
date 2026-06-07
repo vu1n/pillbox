@@ -29,6 +29,13 @@ console.log("A /input (claim) →", a1.status, "(expect 200)");
 const a2 = await input(tokA);
 console.log("A /input (again) →", a2.status, "(expect 200)");
 
+// 2b. B (NOT the driver) can still annotate — the peanut gallery chimes in
+// without holding the slot. And a producer can't forge an annotation via /event.
+const ann = await post("/annotation", tokB, { text: "watch the edge case", anchor: "calc.py:2" });
+console.log("B /annotation (non-driver) →", ann.status, "(expect 200)");
+const forgeAnn = await post("/event", tokA, { payload: { type: "annotation", text: "forged" } });
+console.log("forged annotation /event →", forgeAnn.status, "(expect 403)");
+
 // 3. B's /input is rejected — A holds the slot.
 const b1 = await input(tokB);
 const b1body = await b1.json().catch(() => ({}));
@@ -79,9 +86,19 @@ const driverChanges = events.filter((e) => e.payload.type === "driver_changed").
 }));
 console.log("driver_changed events →", JSON.stringify(driverChanges, null, 2));
 
+const annEvent = events.find((e) => e.payload.type === "annotation");
+console.log(
+  "annotation event →",
+  JSON.stringify({ text: annEvent?.payload.text, anchor: annEvent?.payload.anchor, actor: annEvent?.actor?.id }),
+);
+
 const ok =
   a1.status === 200 &&
   a2.status === 200 &&
+  ann.status === 200 &&
+  forgeAnn.status === 403 &&
+  annEvent?.actor?.id === "u:bob" &&
+  annEvent?.payload.anchor === "calc.py:2" &&
   b1.status === 409 &&
   b1body.driver?.id === "u:alice" &&
   b2.status === 200 &&
@@ -101,5 +118,5 @@ const ok =
   driverChanges[3].to === "u:alice" &&
   driverChanges.every((d) => d.actorKind === "system");
 
-console.log(ok ? "DRIVER SMOKE PASS ✓ (one driver; claim/steal/release arbitrated)" : "DRIVER SMOKE FAIL ✗");
+console.log(ok ? "DRIVER SMOKE PASS ✓ (one driver arbitrated; non-driver annotation attributed)" : "DRIVER SMOKE FAIL ✗");
 process.exit(ok ? 0 : 1);

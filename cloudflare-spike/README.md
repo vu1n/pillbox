@@ -170,6 +170,7 @@ the DO verifies it server-side and stamps the *verified* actor.
 |---|---|---|
 | `POST /event` | `Authorization: Bearer <token>` | write requires a valid token (401); body `actor` ignored; **control payload types rejected (403)** — `driver_changed`/`input`/`scored` have their own authoritative paths, so the open producer channel can't forge them |
 | `POST /input` | `Authorization: Bearer <token>` | write requires a valid token (401); body `actor` ignored; gated by driver arbitration (below) |
+| `POST /annotation` | `Authorization: Bearer <token>` | the async "chime in" — attributed (401 without a token), but **NOT** driver-gated: any participant may annotate without holding the slot (the peanut gallery) |
 | `subscribe` (WS) | `?token=<token>` on the upgrade | open to anonymous readers; a valid token binds the actor to the connection (`WsState.actor`) for future socket-driven input |
 | container-hop exec result | — | stamped `system` (the gateway originated it) |
 

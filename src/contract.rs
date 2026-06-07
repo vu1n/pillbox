@@ -199,6 +199,9 @@ pub(crate) enum Payload {
     // multiplayer: the durable, attributed steer (distinct from the live,
     // ephemeral PTY keystroke frame) — `session send` records one per drive.
     Input(Input),
+    // multiplayer: an attributed comment that does NOT drive the agent (the
+    // async "chime in"; `session annotate`) — orchestrators may inject it as context.
+    Annotation(Annotation),
     // workspace
     Checkpoint(Checkpoint),
     ResultReady(ResultReady),
@@ -407,6 +410,20 @@ pub(crate) enum InputTarget {
     Agent,
     Pty,
     Exec,
+}
+
+/// An attributed, durable comment on a session that does NOT drive the agent —
+/// the async, keyboard-free "chime in" (Slack-thread style). Unlike [`Input`] it
+/// carries no driver semantics (anyone may annotate, no arbitration), so it's how
+/// a non-driver participates; an orchestrator may optionally inject it as agent
+/// context. `anchor` is a free-form reference to what it's about (a seq, a path, a
+/// message id).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Annotation {
+    pub(crate) text: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) anchor: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -694,6 +711,36 @@ mod tests {
             "{s}"
         );
         assert_eq!(reparse(&ev), ev);
+    }
+
+    #[test]
+    fn annotation_round_trips_and_omits_empty_anchor() {
+        let ev = Event::session(
+            "s",
+            Payload::Annotation(Annotation {
+                text: "lgtm, but check the empty case".into(),
+                anchor: "path/to/x.rs:42".into(),
+            }),
+        )
+        .with_actor(Actor::human("bob"));
+        let s = serde_json::to_string(&ev).unwrap();
+        assert!(s.contains(r#""type":"annotation""#), "{s}");
+        assert!(s.contains(r#""anchor":"path/to/x.rs:42""#), "{s}");
+        assert!(
+            s.contains(r#""actor":{"kind":"human","id":"u:bob"}"#),
+            "{s}"
+        );
+        assert_eq!(reparse(&ev), ev);
+        // anchor omitted from the wire when empty.
+        let bare = serde_json::to_string(&Event::session(
+            "s",
+            Payload::Annotation(Annotation {
+                text: "hi".into(),
+                anchor: String::new(),
+            }),
+        ))
+        .unwrap();
+        assert!(!bare.contains("anchor"), "{bare}");
     }
 
     #[test]

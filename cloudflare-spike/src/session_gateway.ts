@@ -20,10 +20,11 @@ type WsState = { role: "subscriber"; cursor: number; actor?: Actor };
 // exec result), as opposed to a producer- or human-submitted event.
 const SYSTEM_ACTOR: Actor = { kind: "system", id: "pillbox" };
 
-// Payload types a producer may NOT submit via /event — each has its own
-// authoritative path (arbitration / the /input driver gate / the grader), so
-// accepting them on the open producer channel would let a token forge them.
-const PRODUCER_FORBIDDEN = new Set(["driver_changed", "input", "scored"]);
+// Payload types a producer may NOT submit via /event — each is a human/gateway
+// action with its own authenticated route (arbitration / /input / /annotation /
+// the grader), so accepting them on the open producer channel would let a token
+// forge them.
+const PRODUCER_FORBIDDEN = new Set(["driver_changed", "input", "annotation", "scored"]);
 
 export class SessionGateway extends Agent<Env> {
   // Agents-SDK lifecycle hook (replaces the constructor's table create). The §0
@@ -73,13 +74,14 @@ export class SessionGateway extends Agent<Env> {
     return ev;
   }
 
-  // HTTP: POST /event, /input and /driver/release land here (routeAgentRequest
-  // forwards the request; WS upgrades go to onConnect instead). Dispatch on the
-  // trailing path.
+  // HTTP: POST /event, /input, /annotation and /driver/release land here
+  // (routeAgentRequest forwards the request; WS upgrades go to onConnect instead).
+  // Dispatch on the trailing path.
   async onRequest(req: Request): Promise<Response> {
     const path = new URL(req.url).pathname;
     if (path.endsWith("/event")) return this.handleEvent(req);
     if (path.endsWith("/input")) return this.handleInput(req);
+    if (path.endsWith("/annotation")) return this.handleAnnotation(req);
     if (path.endsWith("/driver/release")) return this.handleRelease(req);
     return new Response("not found\n", { status: 404 });
   }
@@ -214,6 +216,20 @@ export class SessionGateway extends Agent<Env> {
       await this.driveSandbox(this.env.Sandbox, inEv.seq, body.text ?? "");
     }
     return json({ seq: inEv.seq, head: this.head() });
+  }
+
+  // The async "chime in": an attributed comment that does NOT drive. Authenticated
+  // (stamped with the verified actor, body-supplied actor ignored), but — unlike
+  // /input — NOT driver-gated: any participant may annotate without holding the
+  // driver slot. This is how the peanut gallery contributes; an orchestrator may
+  // inject these as agent context.
+  private async handleAnnotation(req: Request): Promise<Response> {
+    const actor = await this.requireActor(req);
+    if (actor instanceof Response) return actor;
+    const body = (await req.json()) as { text?: string; anchor?: string };
+    const payload: Payload = { type: "annotation", text: body.text ?? "", anchor: body.anchor };
+    const ev = this.append(nowRfc3339(), actor, payload);
+    return json({ seq: ev.seq, head: this.head() });
   }
 
   // The DO↔container hop. One container per session (addressed by the same

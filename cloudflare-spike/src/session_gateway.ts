@@ -68,13 +68,37 @@ export class SessionGateway extends Agent<Env> {
     return ev;
   }
 
-  // HTTP: POST /event and /input both land here (routeAgentRequest forwards the
-  // request; WS upgrades go to onConnect instead). Dispatch on the trailing path.
+  // HTTP: POST /event, /input and /driver/release land here (routeAgentRequest
+  // forwards the request; WS upgrades go to onConnect instead). Dispatch on the
+  // trailing path.
   async onRequest(req: Request): Promise<Response> {
     const path = new URL(req.url).pathname;
     if (path.endsWith("/event")) return this.handleEvent(req);
     if (path.endsWith("/input")) return this.handleInput(req);
+    if (path.endsWith("/driver/release")) return this.handleRelease(req);
     return new Response("not found\n", { status: 404 });
+  }
+
+  // ── driver arbitration (authZ over authN) ─────────────────────────────
+  // auth.ts answers "who are you" (authN — the verified actor). This answers "are
+  // you ALLOWED to drive" (authZ): §0 permits one driver at a time, so the
+  // attributed-input path must gate on whether the *verified* actor currently
+  // holds the single driver slot. The decision keys off the trusted, token-stamped
+  // actor — never a body-supplied identity.
+  //
+  // The driver is DURABLE state, not a per-connection or in-memory field: it must
+  // outlive DO hibernation/eviction so a reattaching steerer (HTTP /input has no
+  // long-lived socket) sees a consistent "who is driving" across calls. Stored as
+  // a single durable KV key alongside the §0 log.
+  private static readonly DRIVER_KEY = "driver";
+
+  private async currentDriver(): Promise<Actor | undefined> {
+    return (await this.ctx.storage.get<Actor>(SessionGateway.DRIVER_KEY)) ?? undefined;
+  }
+
+  private async setDriver(actor: Actor | undefined): Promise<void> {
+    if (actor) await this.ctx.storage.put(SessionGateway.DRIVER_KEY, actor);
+    else await this.ctx.storage.delete(SessionGateway.DRIVER_KEY);
   }
 
   // The /event producer path → EventLog::append. A producer (the in-sandbox §0
@@ -121,16 +145,49 @@ export class SessionGateway extends Agent<Env> {
   private async handleInput(req: Request): Promise<Response> {
     // Driving is attributed + authenticated: the steer is stamped with the
     // verified actor (the body's `actor` is ignored), 401 without a valid token.
-    // (Driver-token arbitration — who is *allowed* to drive — is milestone 4;
-    // this establishes who the driver *is*.)
     const actor = await this.requireActor(req);
     if (actor instanceof Response) return actor;
-    const body = (await req.json()) as { text?: string; target?: string; mode?: string };
+    const body = (await req.json()) as {
+      text?: string;
+      target?: string;
+      mode?: string;
+    };
+
+    // Driver arbitration (milestone 4): authZ layered on the authN above. The
+    // verified `actor` is established; here we decide whether that actor may
+    // actually drive. §0 allows one driver at a time:
+    //   - no current driver        → this actor CLAIMS it (driver_changed granted)
+    //   - current driver IS actor   → proceed, no event
+    //   - current driver is OTHER   → 409 unless the request opts to steal
+    //                                 (body `mode:"steal"` or `?steal=1`), in which
+    //                                 case reassign (driver_changed stolen)
+    const wantsSteal = body.mode === "steal" || new URL(req.url).searchParams.get("steal") === "1";
+    const driver = await this.currentDriver();
+    if (!driver) {
+      await this.setDriver(actor);
+      this.append(nowRfc3339(), SYSTEM_ACTOR, { type: "driver_changed", to: actor, mode: "granted" });
+    } else if (!actorsEqual(driver, actor)) {
+      if (!wantsSteal) {
+        return json({ error: "not the driver", driver }, 409);
+      }
+      await this.setDriver(actor);
+      this.append(nowRfc3339(), SYSTEM_ACTOR, {
+        type: "driver_changed",
+        from: driver,
+        to: actor,
+        mode: "stolen",
+      });
+    }
+    // else: current driver is this actor — proceed, no driver_changed event.
+
     const payload: Payload = {
       type: "input",
       text: body.text ?? "",
       target: (body.target as "agent" | "pty" | "exec") ?? "exec",
-      mode: (body.mode as "live" | "turn") ?? "turn",
+      // `body.mode` is overloaded: it can also carry the "steal" arbitration
+      // signal, which is NOT a valid input mode. Only "live" maps through;
+      // everything else (incl. "steal", undefined) is the default "turn".
+      mode: body.mode === "live" ? "live" : "turn",
     };
     const inEv = this.append(nowRfc3339(), actor, payload);
     // Drive the container only when one is bound (the container config). On the
@@ -187,6 +244,27 @@ export class SessionGateway extends Agent<Env> {
       status,
       output,
     });
+  }
+
+  // Release the driver slot — the voluntary give-up half of arbitration. AuthZ:
+  // only the *current* driver may release (a non-driver gets 409, an
+  // unauthenticated caller 401). Clears the durable driver and appends
+  // `driver_changed {from: actor, mode: "released"}` (no `to`: the slot is now
+  // free, so the next /input claims it via "granted").
+  private async handleRelease(req: Request): Promise<Response> {
+    const actor = await this.requireActor(req);
+    if (actor instanceof Response) return actor;
+    const driver = await this.currentDriver();
+    if (!driver || !actorsEqual(driver, actor)) {
+      return json({ error: "not the driver", driver: driver ?? null }, 409);
+    }
+    await this.setDriver(undefined);
+    const ev = this.append(nowRfc3339(), SYSTEM_ACTOR, {
+      type: "driver_changed",
+      from: actor,
+      mode: "released",
+    });
+    return json({ seq: ev.seq, head: this.head() });
   }
 
   // ── Subscribe(from_seq) = replay then tail ────────────────────────────
@@ -277,6 +355,12 @@ export class SessionGateway extends Agent<Env> {
   private head(): number {
     return (this.ctx.storage.sql.exec("SELECT COALESCE(MAX(seq), 0) AS m FROM log").one() as { m: number }).m;
   }
+}
+
+// Actor identity for arbitration: same principal iff (kind, id) match. `display`
+// is cosmetic and ignored — two tokens for the same id are the same driver.
+function actorsEqual(a: Actor, b: Actor): boolean {
+  return a.kind === b.kind && a.id === b.id;
 }
 
 function nowRfc3339(): string {

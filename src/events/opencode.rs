@@ -19,13 +19,18 @@
 //!   (`field:"text"` = assistant text; `field:"reasoning"` = thinking).
 //! - `message.part.updated` with `part.type == "tool"` → `{tool, callID,
 //!   state:{status, input, output}}` — a tool call's evolving state.
+//! - `message.part.updated` with `part.type == "step-finish"` → `{messageID,
+//!   tokens:{input, output, cache:{read, write}}}` — a finished model step's
+//!   token accounting, mapped to a §0 `Usage` (`source: native`). This is the
+//!   live-verified token source: `message.updated`'s `info` carries no tokens,
+//!   so the turn's cost lands here or nowhere.
 //! - `session.idle` → the turn went quiescent (end the open message + the
 //!   `NeedsInput` attention signal, matching the claude end_turn producer).
 //!
 //! The parallel `session.next.*` family exists in the OpenAPI but only emitted
 //! lifecycle bits (`agent.switched`, `model.switched`) in practice — it is
 //! *not* the content source, so we ignore it (along with the `text`/`reasoning`
-//! part *snapshots*, whose content the deltas already carry, and `step-*`,
+//! part *snapshots*, whose content the deltas already carry, and `step-start`,
 //! `session.{updated,status,diff}`, `server.*`).
 //!
 //! Stateful: deltas carry a `messageID` but no role, so we track which message
@@ -33,13 +38,13 @@
 //! status is emitted only when it *changes* (`pending`→`running`→`completed`)
 //! so a chatty input-stream doesn't flood the log with duplicate `ToolCall`s.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
 use crate::contract::{
     AttentionReason, AttentionRequired, Event, MessageDelta, MessageEnd, MessageStart, Payload,
-    Role, Thinking, ToolCall, ToolStatus,
+    Role, Thinking, ToolCall, ToolStatus, Usage, UsageSource,
 };
 use crate::events::log::SessionLog;
 
@@ -57,6 +62,9 @@ pub(crate) struct EventMapper {
     /// the *mapped* status so opencode's `pending`→`running` (both `Running`)
     /// collapses to one event.
     tool_status: HashMap<String, ToolStatus>,
+    /// Step part ids whose `step-finish` usage we've already emitted, so a
+    /// re-sent `part.updated` for the same step can't double-count tokens.
+    steps_seen: HashSet<String>,
 }
 
 impl EventMapper {
@@ -144,14 +152,21 @@ impl EventMapper {
         }
     }
 
-    /// `message.part.updated` — only the `tool` parts are mapped (text/reasoning
-    /// part snapshots duplicate the deltas; step-start/finish are boundaries).
-    /// Emits a `ToolCall` only when the tool's status changes.
+    /// `message.part.updated` — two part kinds carry the turn: `tool` (a tool
+    /// call's evolving state) and `step-finish` (a model step's token
+    /// accounting). Other parts (text/reasoning snapshots duplicate the deltas;
+    /// `step-start` is a boundary) produce nothing.
     fn on_part_updated(&mut self, p: &Value) -> Vec<Payload> {
         let part = p.get("part").unwrap_or(&Value::Null);
-        if part.get("type").and_then(Value::as_str) != Some("tool") {
-            return vec![];
+        match part.get("type").and_then(Value::as_str) {
+            Some("tool") => self.on_tool_part(part),
+            Some("step-finish") => self.on_step_finish(part),
+            _ => vec![],
         }
+    }
+
+    /// A `tool` part. Emits a `ToolCall` only when the tool's status changes.
+    fn on_tool_part(&mut self, part: &Value) -> Vec<Payload> {
         let call_id = part
             .get("callID")
             .and_then(Value::as_str)
@@ -187,6 +202,51 @@ impl EventMapper {
             title: String::new(),
         })]
     }
+
+    /// A finished model step reports its token usage. Emit one §0 `Usage`
+    /// (`source: native`) per step, de-duped on the step part id so a re-sent
+    /// `part.updated` doesn't double-count. A step with no modelled token field
+    /// (e.g. a `{total}`-only shape) yields nothing.
+    fn on_step_finish(&mut self, part: &Value) -> Vec<Payload> {
+        let Some(usage) = usage_from_step(part) else {
+            return vec![];
+        };
+        if let Some(id) = part.get("id").and_then(Value::as_str) {
+            if !self.steps_seen.insert(id.to_string()) {
+                return vec![];
+            }
+        }
+        vec![Payload::Usage(usage)]
+    }
+}
+
+/// Map an opencode `step-finish` part's `tokens` into a §0 [`Usage`]
+/// (`source: native`, mirroring the transcript producer). Returns `None` when
+/// none of the modelled token fields are present, so a `{total}`-only or
+/// token-less step produces no event rather than an all-`None` `Usage`.
+fn usage_from_step(part: &Value) -> Option<Usage> {
+    let tokens = part.get("tokens")?;
+    let count = |obj: &Value, k: &str| obj.get(k).and_then(Value::as_u64);
+    let cache = tokens.get("cache").unwrap_or(&Value::Null);
+    let input = count(tokens, "input");
+    let output = count(tokens, "output");
+    let cache_read = count(cache, "read");
+    let cache_creation = count(cache, "write");
+    // No modelled token field → no event (a `{total}`-only step yields nothing
+    // rather than an all-`None` Usage).
+    input.or(output).or(cache_read).or(cache_creation)?;
+    Some(Usage {
+        message_id: part
+            .get("messageID")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        input_tokens: input,
+        output_tokens: output,
+        cache_read_input_tokens: cache_read,
+        cache_creation_input_tokens: cache_creation,
+        source: UsageSource::Native,
+    })
 }
 
 fn map_tool_status(s: &str) -> ToolStatus {
@@ -475,6 +535,43 @@ mod tests {
     }
 
     #[test]
+    fn step_finish_emits_usage_native_once() {
+        let mut m = EventMapper::new();
+        let step = ev(
+            "message.part.updated",
+            json!({ "sessionID": "s", "part": {
+                "id": "prt_step", "messageID": "msg_a", "type": "step-finish",
+                "tokens": { "input": 120, "output": 30, "reasoning": 5,
+                            "cache": { "read": 100, "write": 20 } } } }),
+        );
+        let out = m.on_event(&step);
+        let [Payload::Usage(u)] = &out[..] else {
+            panic!("expected one Usage: {out:?}");
+        };
+        assert_eq!(u.message_id, "msg_a");
+        assert_eq!(u.input_tokens, Some(120));
+        assert_eq!(u.output_tokens, Some(30));
+        assert_eq!(u.cache_read_input_tokens, Some(100));
+        assert_eq!(u.cache_creation_input_tokens, Some(20));
+        assert_eq!(u.source, UsageSource::Native);
+        // A re-sent part.updated for the same step id must not double-count.
+        assert!(m.on_event(&step).is_empty());
+    }
+
+    #[test]
+    fn step_finish_without_modelled_tokens_is_ignored() {
+        let mut m = EventMapper::new();
+        // A `{total}`-only step (the trimmed fixture shape) carries nothing we
+        // model → no Usage rather than an all-`None` event.
+        let step = ev(
+            "message.part.updated",
+            json!({ "part": { "id": "prt_s", "type": "step-finish",
+                              "tokens": { "total": 10 } } }),
+        );
+        assert!(m.on_event(&step).is_empty());
+    }
+
+    #[test]
     fn snapshots_and_lifecycle_and_session_next_are_ignored() {
         let mut m = EventMapper::new();
         // text/reasoning part *snapshots* (deltas already carry their content),
@@ -522,12 +619,14 @@ data: {\"type\":\"message.part.delta\",\"properties\":{\"messageID\":\"msg_a\",\
 \n\
 data: {\"type\":\"message.part.delta\",\"properties\":{\"messageID\":\"msg_a\",\"field\":\"text\",\"delta\":\"there\"}}\n\
 \n\
+data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"id\":\"prt_s\",\"messageID\":\"msg_a\",\"type\":\"step-finish\",\"tokens\":{\"input\":12,\"output\":4,\"cache\":{\"read\":8,\"write\":0}}}}}\n\
+\n\
 data: {\"type\":\"session.idle\",\"properties\":{\"sessionID\":\"ses_oc\"}}\n\
 \n";
 
             let stop = AtomicBool::new(false);
             let n = drain_sse(Cursor::new(stream), "ses-oc", &mut log, &stop).expect("drain");
-            assert_eq!(n, 5, "start + 2 deltas + end + attention");
+            assert_eq!(n, 6, "start + 2 deltas + usage + end + attention");
 
             let events = SessionLog::open(&pb, "ses-oc")
                 .unwrap()
@@ -537,12 +636,15 @@ data: {\"type\":\"session.idle\",\"properties\":{\"sessionID\":\"ses_oc\"}}\n\
             assert!(matches!(events[0].payload, P::MessageStart(_)));
             assert!(matches!(&events[1].payload, P::MessageDelta(d) if d.text == "hi "));
             assert!(matches!(&events[2].payload, P::MessageDelta(d) if d.text == "there"));
-            assert!(matches!(events[3].payload, P::MessageEnd(_)));
-            assert!(matches!(&events[4].payload,
+            assert!(matches!(&events[3].payload,
+                P::Usage(u) if u.input_tokens == Some(12) && u.output_tokens == Some(4)
+                    && u.cache_read_input_tokens == Some(8) && u.source == UsageSource::Native));
+            assert!(matches!(events[4].payload, P::MessageEnd(_)));
+            assert!(matches!(&events[5].payload,
                 P::AttentionRequired(a) if a.reason == AttentionReason::NeedsInput));
             assert_eq!(
                 events.iter().map(|e| e.seq).collect::<Vec<_>>(),
-                vec![1, 2, 3, 4, 5]
+                vec![1, 2, 3, 4, 5, 6]
             );
         });
     }

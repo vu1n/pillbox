@@ -186,6 +186,29 @@ before the bakeoff:** (a) re-run this harness on a small **Option-A real-bug set
 libkrun-opencode **usage producer** so the cost half populates. The synthetic pass is the
 green light to invest in (a).
 
+### RESULT (a) — agentic-regime σ̂ on the toolz real-bug family (2026-06-07): the stop-branch fires
+
+Ran the same harness on the 5 toolz real-bug tasks (`gen-toolz-tasks.py`), 2 replicate
+arms × 3 trials = 30 cells @ temp-0, glm-4.5-air. **σ̂ = 0.35** (target ≲0.10), mean_d=0.0
+(replicates → no spurious lift, good), CI = [-0.53, +0.47] (straddles 0 hugely),
+`sensitive: false`. **Every task is flaky:** within-condition trial triples like
+`[1,0,0]`, `[1,0,1]`, `[1,1,1]` vs `[0,0,0]` for the *same* condition — per-task pass
+rates 1/6–4/6 with within-cell SDs ~0.37–0.50 (near-maximal Bernoulli noise). glm is
+**non-deterministic per task even at temp-0** on real multi-file bug-fixes.
+
+This is the doc's **§5 stop-branch**: the synthetic σ̂=0 was the floor (deterministic
+single-function tasks); the moment the task is real-codebase + agentic, σ̂ jumps to ~0.35
+and **temp-0 doesn't touch it** — confirming the variance that killed the three prior runs
+is **agentic path-divergence** (or a hosted-MoE not actually greedy at temp-0), NOT decoding
+temperature. Power: detecting a plausible Δ≈0.10 at σ=0.35 needs ≈100 task-trials/arm —
+infeasible, and per-task flakiness makes even that shaky. **Conclusion: do NOT build the
+GEPA/meta-harness on this regime+model** — lift is unmeasurable here. The rig is sound; the
+*regime* can't measure lift. Iterate on the regime, not the optimizer: a genuinely
+deterministic worker (a local greedy model, not a hosted MoE), or far more trials, or accept
+the §0 substrate as the durable win and shelve compile-time optimization. (Caveats: N=3×5 is
+small but σ̂≈0.35 w/ SDs~0.5 is unambiguous; one model; temp-0's effect still unisolated —
+but if it took and σ̂ is still 0.35, that's the finding either way.)
+
 ## Appendix — built vs. needed
 
 | Need | Status |

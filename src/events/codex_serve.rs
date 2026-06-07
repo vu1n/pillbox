@@ -15,10 +15,10 @@
 //! turn-verified): the handshake, `thread/started`, `turn/started`,
 //! `item/started`/`item/completed` for `userMessage`, and `error`. The
 //! assistant-output items (`agentMessage`, `commandExecution`, `fileChange`,
-//! `mcpToolCall`) and `turn/completed` need an *authenticated* turn to fire, so
-//! those branches are schema-verified (the `generate-json-schema` shapes) but
-//! not yet turn-verified — same status opencode's `session.next.*` family
-//! carries.
+//! `mcpToolCall`), `turn/completed`, and `thread/tokenUsage/updated` need an
+//! *authenticated* turn to fire, so those branches are schema-verified (the
+//! `generate-json-schema` shapes, pulled from codex 0.137.0) but not yet
+//! turn-verified — same status opencode's `session.next.*` family carries.
 //!
 //! ## The notification envelope
 //!
@@ -36,8 +36,16 @@
 //!   `ThreadItem` (agentMessage / commandExecution / fileChange / mcpToolCall /
 //!   …). Tool-shaped items become a `ToolCall`; the agentMessage item closes the
 //!   open message.
+//! - `thread/tokenUsage/updated` → `{turnId, tokenUsage:{last, total}}` — token
+//!   accounting (`last` = this turn, `total` = thread-cumulative; each a
+//!   `{inputTokens, cachedInputTokens, outputTokens, reasoningOutputTokens,
+//!   totalTokens}`). The turn's `last` is stashed and flushed as one §0 `Usage`
+//!   (`source: native`) at turn end, so per-turn events are additive. (The `Turn`
+//!   in `turn/completed` carries no usage, so this notification is the only
+//!   source.)
 //! - `turn/completed` → `{threadId, turn}` — the turn went idle (close the open
-//!   message + raise the attention signal; `turn.status == "failed"` → stalled).
+//!   message + flush the turn's `Usage` + raise the attention signal;
+//!   `turn.status == "failed"` → stalled).
 //! - `error` → `{error, threadId, turnId, willRetry}` — a turn-level error.
 //!
 //! Everything else (account/*, thread lifecycle, mcp startup, fuzzyFileSearch,
@@ -59,7 +67,7 @@ use serde_json::Value;
 
 use crate::contract::{
     AgentPhase, AttentionReason, AttentionRequired, Event, MessageDelta, MessageEnd, MessageStart,
-    Payload, PhaseChanged, Role, RunStarted, Thinking, ToolCall, ToolStatus,
+    Payload, PhaseChanged, Role, RunStarted, Thinking, ToolCall, ToolStatus, Usage, UsageSource,
 };
 use crate::events::log::SessionLog;
 
@@ -76,6 +84,10 @@ pub(crate) struct CodexServeMapper {
     /// a tool item's status actually changes (started→completed), not on every
     /// re-delivery. Keyed on the mapped status.
     tool_status: HashMap<String, ToolStatus>,
+    /// The current turn's token usage, stashed from `thread/tokenUsage/updated`
+    /// (overwritten as it's refined) and flushed as one §0 `Usage` at turn end,
+    /// so per-turn Usage events sum to the thread total rather than double-count.
+    pending_usage: Option<Usage>,
 }
 
 impl CodexServeMapper {
@@ -105,9 +117,35 @@ impl CodexServeMapper {
             "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" => on_reasoning(p),
             "item/started" => self.on_item(p, false),
             "item/completed" => self.on_item(p, true),
+            // Stash usage now; it's emitted as one Usage at turn end (see below).
+            "thread/tokenUsage/updated" => {
+                self.on_token_usage(p);
+                vec![]
+            }
             "turn/completed" => self.on_turn_completed(p),
             "error" => self.on_error(p),
             _ => vec![],
+        }
+    }
+
+    /// `thread/tokenUsage/updated` — codex reports cumulative usage for the
+    /// thread (`total`) and the current turn (`last`). Stash the turn's `last`
+    /// breakdown (overwriting as it's refined); it flushes as one §0 `Usage` at
+    /// turn end so per-turn events are additive (sum to the thread total).
+    fn on_token_usage(&mut self, p: &Value) {
+        let usage = p.get("tokenUsage").unwrap_or(&Value::Null);
+        let last = usage.get("last").unwrap_or(&Value::Null);
+        if let Some(u) = usage_from_breakdown(str_field(p, "turnId"), last) {
+            self.pending_usage = Some(u);
+        }
+    }
+
+    /// Drain the stashed turn usage into `out` — called at every turn-end edge
+    /// (`turn/completed` and terminal `error`) so the cost is recorded exactly
+    /// once per turn no matter how the turn ends.
+    fn flush_usage(&mut self, out: &mut Vec<Payload>) {
+        if let Some(usage) = self.pending_usage.take() {
+            out.push(Payload::Usage(usage));
         }
     }
 
@@ -226,6 +264,7 @@ impl CodexServeMapper {
         if let Some(open) = self.open_msg.take() {
             out.push(Payload::MessageEnd(MessageEnd::new(open)));
         }
+        self.flush_usage(&mut out);
         let status = p
             .get("turn")
             .map(|t| str_field(t, "status"))
@@ -253,6 +292,7 @@ impl CodexServeMapper {
             if let Some(open) = self.open_msg.take() {
                 out.push(Payload::MessageEnd(MessageEnd::new(open)));
             }
+            self.flush_usage(&mut out); // the turn's over — don't lose a failed turn's cost
         }
         out.push(Payload::AttentionRequired(AttentionRequired {
             reason: AttentionReason::ErrorStalled,
@@ -272,6 +312,31 @@ fn on_reasoning(p: &Value) -> Vec<Payload> {
     vec![Payload::Thinking(Thinking {
         text: delta.to_string(),
     })]
+}
+
+/// Map a codex `TokenUsageBreakdown` to a §0 [`Usage`] (`source: native`).
+/// codex's `cachedInputTokens` is a SUBSET of `inputTokens` (OpenAI semantics),
+/// so split it out into the cache-read field and report only the non-cached
+/// remainder as `inputTokens` — matching the non-overlapping Anthropic shape the
+/// §0 contract + cost-summer assume (which price cache-read separately, so an
+/// overlapping count would double-charge the cached tokens). codex has no
+/// cache-creation counterpart, and `reasoningOutputTokens` is already part of
+/// `outputTokens` (a billed subset), so neither gets its own field. Returns
+/// `None` when the breakdown carries no modelled count.
+fn usage_from_breakdown(message_id: &str, b: &Value) -> Option<Usage> {
+    let n = |k: &str| b.get(k).and_then(Value::as_u64);
+    let input_total = n("inputTokens");
+    let output = n("outputTokens");
+    let cached = n("cachedInputTokens");
+    input_total.or(output).or(cached)?;
+    Some(Usage {
+        message_id: message_id.to_string(),
+        input_tokens: input_total.map(|i| i.saturating_sub(cached.unwrap_or(0))),
+        output_tokens: output,
+        cache_read_input_tokens: cached,
+        cache_creation_input_tokens: None,
+        source: UsageSource::Native,
+    })
 }
 
 /// codex `ThreadItem.status` → §0 `ToolStatus`. Only `item/completed` carries a
@@ -582,6 +647,45 @@ mod tests {
             }
             other => panic!("expected start/delta/end + idle attention, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn token_usage_flushes_one_usage_at_turn_end() {
+        // last breakdown: cachedInputTokens is a SUBSET of inputTokens, so the
+        // mapped input is the non-cached remainder (1000-200) and cache-read is
+        // the cached 200; reasoning is folded into output upstream, no cache-creation.
+        let out = run(&[
+            json!({"method":"item/agentMessage/delta","params":{
+                "itemId":"it_m","delta":"hi","threadId":"th","turnId":"tu"}}),
+            json!({"method":"thread/tokenUsage/updated","params":{
+                "threadId":"th","turnId":"tu","tokenUsage":{
+                    "last":{"inputTokens":1000,"cachedInputTokens":200,"outputTokens":50,
+                            "reasoningOutputTokens":10,"totalTokens":1050},
+                    "total":{"inputTokens":3000,"cachedInputTokens":600,"outputTokens":150,
+                             "reasoningOutputTokens":30,"totalTokens":3150}}}}),
+            json!({"method":"turn/completed","params":{
+                "threadId":"th","turn":{"id":"tu","status":"completed","items":[]}}}),
+        ]);
+        match out.as_slice() {
+            [Payload::MessageStart(_), Payload::MessageDelta(_), Payload::MessageEnd(_), Payload::Usage(u), Payload::AttentionRequired(a)] =>
+            {
+                assert_eq!(u.message_id, "tu");
+                assert_eq!(u.input_tokens, Some(800)); // 1000 - 200 cached
+                assert_eq!(u.cache_read_input_tokens, Some(200));
+                assert_eq!(u.output_tokens, Some(50));
+                assert_eq!(u.cache_creation_input_tokens, None);
+                assert_eq!(u.source, UsageSource::Native);
+                assert_eq!(a.reason, AttentionReason::NeedsInput);
+            }
+            other => panic!("expected end + usage + idle, got {other:?}"),
+        }
+        // Exactly one Usage per turn (the stash flushes once, not per update).
+        assert_eq!(
+            out.iter()
+                .filter(|p| matches!(p, Payload::Usage(_)))
+                .count(),
+            1
+        );
     }
 
     #[test]

@@ -355,7 +355,14 @@ fn launch_base(
     }
 
     let ca = provision_vault_ca(resolved, ca_lifetime)?;
+    // Trust the per-run MITM CA across runtimes: Node agents via NODE_EXTRA_CA_CERTS,
+    // and OpenSSL/Rust ones (codex's reqwest, curl, python) via SSL_CERT_FILE — which
+    // rustls-native-certs honors. Without it codex's model WebSocket to the ChatGPT
+    // backend hits `UnknownCA` (it reads neither the system bundle nor the Node var).
+    // Trusting only the vault CA is correct here: every allowlisted host's TLS is
+    // terminated + re-presented by the MITM, so the base roots are never exercised.
     guest_env.push(("NODE_EXTRA_CA_CERTS".into(), GUEST_CA_PATH.into()));
+    guest_env.push(("SSL_CERT_FILE".into(), GUEST_CA_PATH.into()));
 
     Ok(LaunchBase {
         rootfs,
@@ -881,24 +888,33 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
 }
 
 /// codex via the in-guest `appserver-host` bridge (`codex app-server`) — fills a
-/// [`ServerLaunch`] for [`launch_server_vm`]. **Non-vault v1**: app-server's model
-/// egress is `wss://api.openai.com/v1/responses` (WebSocket, `api.openai.com`),
-/// which the [`codex` vault provider](crate::vault::providers) (chatgpt.com only)
-/// doesn't intercept — so `--vault` is rejected until that interception lands; the
-/// egress fence still confines the VM to OpenAI's hosts.
+/// [`ServerLaunch`] for [`launch_server_vm`]. **Non-vault v1**: the app-server's
+/// model egress is the ChatGPT backend over WebSocket
+/// (`wss://chatgpt.com/backend-api/codex/responses` for a ChatGPT-subscription
+/// login), which the [`codex` vault provider](crate::vault::providers) doesn't yet
+/// intercept — so `--vault` is rejected until that interception lands; the egress
+/// fence still confines the VM to the OpenAI/ChatGPT hosts.
 fn run_codex_serve(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
     use crate::sandbox::appserver_client as appserver;
 
     let model = opts.model.clone().unwrap_or_else(|| "codex-default".into());
     let launch = ServerLaunch {
-        vault_refusal: "the vault (codex-serve v1 is non-vault: app-server's model egress is \
-                        api.openai.com over WebSocket, which the codex provider doesn't yet intercept)",
-        // codex talks only to OpenAI: + api.openai.com (the app-server's wss model
-        // endpoint). The codex vault provider omits it, but the openai API-key
-        // provider already puts it in `intercepted_hosts`; list it explicitly here
-        // so codex-serve's egress doesn't silently depend on that unrelated
-        // provider staying registered. Terminated + forwarded empty-swap.
-        egress_extra: vec!["api.openai.com".to_string()],
+        vault_refusal: "the vault (codex-serve v1 is non-vault: the app-server's model egress is \
+                        the ChatGPT backend over WebSocket, which the codex provider doesn't yet intercept)",
+        // codex's model egress hosts. A ChatGPT-subscription login (auth_mode=chatgpt
+        // — the common case) dials chatgpt.com (`/backend-api/…` + the
+        // `wss://…/backend-api/codex/responses` model socket) and refreshes tokens via
+        // auth.openai.com; an API-key login uses api.openai.com instead. The codex +
+        // openai providers already put these apexes in `intercepted_hosts`; list them
+        // explicitly (plus `.chatgpt.com` for subdomains) so codex-serve's reachability
+        // doesn't silently depend on an unrelated provider staying registered.
+        // Terminated + forwarded empty-swap (non-vault: no credential substitution);
+        // the egress fence still confines the VM to these hosts.
+        egress_extra: vec![
+            ".chatgpt.com".to_string(),
+            "api.openai.com".to_string(),
+            "auth.openai.com".to_string(),
+        ],
         local_forward_port: None,
         model,
         // The appserver-host bridge owns `codex app-server`, captures notifications

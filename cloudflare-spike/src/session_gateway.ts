@@ -28,10 +28,16 @@ export class SessionGateway extends Agent<Env> {
   }
 
   // ── append + seq authority ────────────────────────────────────────────
-  // UNCHANGED from the raw-DO spike: transactionSync + single-threaded-per-id =>
-  // seq is strictly monotonic with no lock. Seq is derived from storage (MAX),
-  // never an in-memory counter, so it survives eviction. This is a DO primitive
-  // the Agent class inherits, so adopting `Agent` costs the keystone nothing.
+  // EventLog::append — resident-sequencer placement (1:1 with the local
+  // src/events/log.rs::SessionLog::append, which is the co-located single-writer
+  // placement). The log is the seq authority: this method ASSIGNS seq from
+  // storage (MAX(seq)+1) and never reads a producer-supplied seq — a client that
+  // POSTs `seq=42` is ignored exactly as SessionLog::append overwrites the
+  // producer's seq. transactionSync + single-threaded-per-id => seq is strictly
+  // monotonic with no lock. Seq is derived from storage (MAX), never an in-memory
+  // counter, so it survives eviction (the DO analogue of SessionLog recovering
+  // last_seq from log.jsonl on open). This is a DO primitive the Agent class
+  // inherits, so adopting `Agent` costs the keystone nothing.
   private append(at: string, actor: unknown, payload: Payload): Event {
     const seq = this.ctx.storage.transactionSync(() => {
       const row = this.ctx.storage.sql
@@ -64,11 +70,30 @@ export class SessionGateway extends Agent<Env> {
     return new Response("not found\n", { status: 404 });
   }
 
+  // The /event producer path → EventLog::append. A producer (the in-sandbox §0
+  // tailer, a host process) submits an Event; this is the resident-sequencer
+  // analogue of a co-located producer calling SessionLog::append. Note the
+  // producer-supplied `body.seq` is DISCARDED — `append` stamps the authority's
+  // seq, matching SessionLog::append's overwrite-the-producer's-seq rule.
+  //
+  // TODO(actor-stamping — the next slice, NOT this task): authenticate + stamp
+  // `actor` at this trust boundary. Today `body.actor` is taken from the request
+  // body UNAUTHENTICATED — any caller can claim any actor, so actor is not yet an
+  // authz signal (exactly the `emitter` tag's caveat in session-event-log.md).
+  // The fix per session-event-log.md §Actor model:
+  //   1. The actor CLAIM arrives as a verifiable credential on the request — a
+  //      bearer/signed token (per-connection on WS, per-request header on HTTP),
+  //      NOT a body field. Managed tier: minted by the control plane and bound to
+  //      the principal (human user / agent / service).
+  //   2. Verify it server-side here (and in onConnect), derive the Actor from the
+  //      verified claim, and stamp it into the appended event.
+  //   3. IGNORE any body-supplied `actor` entirely (treat as spoofed). Authz —
+  //      who may drive/approve/join — then keys off the stamped, trusted actor.
+  // Until then `body.actor` is a stub for shape only.
   private async handleEvent(req: Request): Promise<Response> {
     const body = (await req.json()) as Partial<Event>;
     if (!body.payload) return json({ error: "missing payload" }, 400);
-    // STUB: actor taken from the body, NOT authenticated. Milestone 1 stamps it
-    // from the connection in onConnect (the trust boundary). TODO.
+    // STUB: actor taken from the body, NOT authenticated. See the TODO above.
     const ev = this.append(body.at ?? nowRfc3339(), body.actor, body.payload as Payload);
     return json({ seq: ev.seq, head: this.head() });
   }
@@ -142,13 +167,23 @@ export class SessionGateway extends Agent<Env> {
   }
 
   // ── Subscribe(from_seq) = replay then tail ────────────────────────────
-  // The Agents SDK accepts + hibernates the WebSocket for us (no WebSocketPair /
-  // acceptWebSocket / 101 plumbing). We just replay from `from` and record the
-  // cursor on the connection.
+  // EventLog::subscribe — resident-sequencer placement (1:1 with
+  // src/events/log.rs::SessionLog::subscribe: replay seq>=from, then tail live
+  // appends). Replay is readFrom(from) (== SessionLog::read_from); the live tail
+  // is `fanout` pushing each new append past this connection's cursor (the DO's
+  // WS fan-out replaces SessionLog's notify-on-the-file bus). The Agents SDK
+  // accepts + hibernates the WebSocket for us (no WebSocketPair / acceptWebSocket
+  // / 101 plumbing). We replay from `from` and record the cursor on the connection.
+  //
+  // TODO(actor-stamping — the next slice, NOT this task): this is the WS half of
+  // the same trust boundary as handleEvent. The connection's actor must be
+  // derived from a verified credential on `ctx.request` (a bearer/signed token on
+  // the upgrade, e.g. a query/header/subprotocol carrying the control-plane-minted
+  // token), verified here, and bound to the connection (e.g. in WsState) so any
+  // /input or /event arriving on this socket is stamped with the connection's
+  // authenticated actor — never a body-supplied one. See handleEvent's TODO.
   async onConnect(connection: Connection<WsState>, ctx: ConnectionContext): Promise<void> {
     const from = Number(new URL(ctx.request.url).searchParams.get("from") ?? "0");
-    // MILESTONE 1: stamp `actor` here from the authenticated ctx.request — the
-    // trust boundary the raw-DO spike couldn't reach. TODO.
     let cursor = from - 1;
     for (const ev of this.readFrom(from)) {
       connection.send(JSON.stringify(ev));
@@ -193,6 +228,8 @@ export class SessionGateway extends Agent<Env> {
   }
 
   // ── read helpers ──────────────────────────────────────────────────────
+  // EventLog::read_from — replay every durable event with seq>=from (1:1 with
+  // src/events/log.rs::SessionLog::read_from). The replay half of subscribe.
   private *readFrom(seq: number): Generator<Event> {
     const rows = this.ctx.storage.sql.exec(
       "SELECT seq, at, actorJson, payloadJson FROM log WHERE seq >= ? ORDER BY seq ASC",

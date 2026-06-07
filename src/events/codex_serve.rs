@@ -66,8 +66,9 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use crate::contract::{
-    AgentPhase, AttentionReason, AttentionRequired, Event, MessageDelta, MessageEnd, MessageStart,
-    Payload, PhaseChanged, Role, RunStarted, Thinking, ToolCall, ToolStatus, Usage, UsageSource,
+    Actor, AgentPhase, AttentionReason, AttentionRequired, Event, MessageDelta, MessageEnd,
+    MessageStart, Payload, PhaseChanged, Role, RunStarted, Thinking, ToolCall, ToolStatus, Usage,
+    UsageSource,
 };
 use crate::events::log::SessionLog;
 
@@ -453,10 +454,11 @@ pub(crate) fn drain_ndjson<R: std::io::Read>(
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
         };
+        // codex app-server notifications are the agent's own output — stamp `agent`.
         let events: Vec<Event> = mapper
             .on_notification(&value)
             .into_iter()
-            .map(|p| Event::session(session_id, p))
+            .map(|p| Event::session(session_id, p).with_actor(Actor::agent("codex")))
             .collect();
         if !events.is_empty() {
             total += events.len();
@@ -767,6 +769,14 @@ mod tests {
             let n = drain_ndjson(Cursor::new(stream), "ses-cx", &mut log, &stop).expect("drain");
             // RunStarted, MessageStart, MessageDelta, MessageEnd, AttentionRequired = 5.
             assert_eq!(n, 5, "expected 5 mapped §0 events");
+            // Every drained event is stamped as the codex agent.
+            let events = SessionLog::open(&g, "ses-cx")
+                .unwrap()
+                .read_from(0)
+                .unwrap();
+            assert!(events
+                .iter()
+                .all(|e| e.actor == Some(crate::contract::Actor::agent("codex"))));
         });
     }
 

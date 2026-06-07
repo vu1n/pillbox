@@ -111,6 +111,29 @@ order, no gap/dup. Restart `wrangler dev` + re-subscribe `from=1` → full repla
 returns (seq persisted to SQLite). A curl + websocat equivalent is in the
 managed-tier notes.
 
+## The DO is the resident-sequencer EventLog impl
+
+`SessionGateway` (this DO) and `src/events/log.rs::SessionLog` (the local
+"no-daemon" impl) are two **placements of the same EventLog contract**
+(docs/session-event-log.md §Sequencing names them: local single-writer, shipped;
+resident sequencer, the DO). Same surface, same seq-authority rule, different
+backing store.
+
+| EventLog method | SessionLog (Rust, local single-writer) | SessionGateway (TS, DO resident sequencer) |
+|---|---|---|
+| `append` (seq authority) | `SessionLog::append` — stamps next seq from `last_seq`, **overwrites** the producer's seq | `append()` — stamps `MAX(seq)+1` inside `transactionSync`, **ignores** any body-supplied seq |
+| `read_from(from)` | `SessionLog::read_from` — replay `seq >= from` | `readFrom(from)` — same query over the SQLite `log` table |
+| `subscribe(from)` | `SessionLog::subscribe` — `read_from` then tail via `notify` on `log.jsonl` | `onConnect` — `readFrom` replay then live tail via `fanout` over the hibernatable WS |
+
+**Seq-authority parity (the load-bearing invariant): both overwrite the
+producer's seq — the log is the authority, never the producer.** SessionLog
+recovers `last_seq` from `log.jsonl` on open and advances it in memory;
+SessionGateway derives `MAX(seq)+1` from DO SQLite inside `transactionSync`
+(single-threaded-per-id → lock-free monotonicity). The producer submits `seq=0`
+(`Event::session` already does) and the placement stamps; swapping a local run
+for a managed run is one transport swap (append `log.jsonl` → POST `/event`),
+same `Event`, same builder.
+
 ## §0 contract mapping (DO ⟷ pillbox)
 
 The DO is the **same surface** as `src/events/log.rs::SessionLog`, different

@@ -324,9 +324,13 @@ pub(crate) enum SessionAction {
     /// Rehydrate a session's result workspace into a directory. Reads
     /// `result_snapshot` from the session record (set by `session done
     /// --result-snapshot`) and asks the workspace backend to pull it.
-    /// Used by orchestrators for post-mortem inspection of a failed
-    /// fork: analyzer agents read the failed session's workspace
-    /// without having to re-run anything.
+    /// If no snapshot was pushed but the backend still has the session's
+    /// live workspace clone on disk (a libkrun server/detached run edits a
+    /// CoW clone that nothing snapshots), pulls straight from that clone
+    /// instead — so a headless server session's edits are recoverable
+    /// before `session rm` scrubs the clone. Used by orchestrators for
+    /// post-mortem inspection of a failed fork: analyzer agents read the
+    /// failed session's workspace without having to re-run anything.
     Pull {
         id: String,
         /// Destination directory. Created if missing. Defaults to

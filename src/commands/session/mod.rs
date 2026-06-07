@@ -860,34 +860,103 @@ fn local_user() -> String {
 fn session_pull(resolved: &Pillbox, id: &str, to: Option<&std::path::Path>) -> Result<()> {
     use crate::workspace::{SnapshotHandle, WorkspaceBackend};
     let session = session::resolve(resolved, id)?;
-    let handle_str = session.result_snapshot.as_ref().ok_or_else(|| {
-        PillboxError::runtime(
-            "session pull",
-            format!(
-                "session `{}` has no result_snapshot yet — the agent hasn't \
-                 finished (or never called `pillbox session done --result-snapshot`)",
-                session.id
-            ),
-        )
-        .with_next(format!("pillbox session info {}", session.id))
-    })?;
-    let backend = resolved.workspace()?;
     let target = match to {
         Some(p) => p.to_path_buf(),
         None => std::env::current_dir()
             .map_err(|e| PillboxError::runtime("session pull", format!("resolve cwd: {e}")))?
             .join(format!("session-{}", session.id)),
     };
-    std::fs::create_dir_all(&target)
-        .map_err(|e| PillboxError::runtime("session pull", format!("create {target:?}: {e}")))?;
-    let handle = SnapshotHandle::new(handle_str.clone());
-    backend.pull(&target, Some(&handle))?;
-    println!(
-        "pillbox: ✓ restored session `{}` (snapshot `{}`) into {}",
-        session.id,
-        handle.short(),
-        target.display()
-    );
+
+    // Two recovery sources, in priority order:
+    //   1. `result_snapshot` — the agent pushed its result tree into the rustic
+    //      repo (set by `session done --result-snapshot`). Snapshot-backed,
+    //      survives `session rm`. The canonical path.
+    //   2. The live backend workspace clone — a libkrun server/detached session
+    //      runs headless against a CoW clone that nothing ever snapshots (no
+    //      in-sandbox wrapper calls `session done` for it), so its edits would be
+    //      stranded on disk until teardown scrubs the clone. While the session is
+    //      alive (it lives until `session rm`) copy them out directly, so the
+    //      documented `session pull` verb recovers them. No rustic push — this
+    //      works for the global pillbox too (which owns no repo).
+    if let Some(handle_str) = session.result_snapshot.as_ref() {
+        let backend = resolved.workspace()?;
+        std::fs::create_dir_all(&target).map_err(|e| {
+            PillboxError::runtime("session pull", format!("create {target:?}: {e}"))
+        })?;
+        let handle = SnapshotHandle::new(handle_str.clone());
+        backend.pull(&target, Some(&handle))?;
+        println!(
+            "pillbox: ✓ restored session `{}` (snapshot `{}`) into {}",
+            session.id,
+            handle.short(),
+            target.display()
+        );
+        return Ok(());
+    }
+
+    if let Some(clone) = live_workspace_clone(&session) {
+        std::fs::create_dir_all(&target).map_err(|e| {
+            PillboxError::runtime("session pull", format!("create {target:?}: {e}"))
+        })?;
+        copy_dir_into(&clone, &target).map_err(|e| {
+            PillboxError::runtime(
+                "session pull",
+                format!("copy live workspace {}: {e}", clone.display()),
+            )
+        })?;
+        println!(
+            "pillbox: ✓ restored session `{}` (live workspace) into {}",
+            session.id,
+            target.display()
+        );
+        return Ok(());
+    }
+
+    Err(PillboxError::runtime(
+        "session pull",
+        format!(
+            "session `{}` has no result to pull — no result_snapshot and no \
+             live workspace clone (the agent hasn't finished, or the session \
+             was already torn down)",
+            session.id
+        ),
+    )
+    .with_next(format!("pillbox session info {}", session.id))
+    .into())
+}
+
+/// The on-disk path of a session's live backend workspace clone, if the backend
+/// keeps one (libkrun: the CoW clone the guest mounts and the agent edits). Only
+/// returned when the directory still exists — a torn-down session's clone is
+/// gone. `None` for backends without a host-visible result tree.
+fn live_workspace_clone(session: &session::Session) -> Option<std::path::PathBuf> {
+    let path = std::path::PathBuf::from(libkrun_workspace_path(session)?);
+    path.is_dir().then_some(path)
+}
+
+/// Recursively copy the contents of `src` into the existing directory `dst`
+/// (entries land at `dst/<name>`, not under a `src`-named subdir). Symlinks are
+/// recreated as links; everything else is byte-copied. Backs `session pull`'s
+/// live-clone fallback — the clone is already secret-scrubbed at creation
+/// (`cow_clone_and_scrub`), so there's nothing to re-filter here.
+fn copy_dir_into(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            let link_target = std::fs::read_link(&from)?;
+            // Replace any existing entry so a re-pull into the same dir is idempotent.
+            let _ = std::fs::remove_file(&to);
+            std::os::unix::fs::symlink(link_target, &to)?;
+        } else if ft.is_dir() {
+            std::fs::create_dir_all(&to)?;
+            copy_dir_into(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
     Ok(())
 }
 
@@ -1370,6 +1439,53 @@ mod tests {
     fn validate_session_id_accepts_minted_form() {
         // `Session::new_id` produces 12 hex chars.
         validate_session_id("abcdef012345").unwrap();
+    }
+
+    #[test]
+    fn copy_dir_into_recreates_tree_files_and_symlinks() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        // file at root, nested file, and a symlink to the root file.
+        std::fs::write(src.path().join("a.txt"), b"alpha").unwrap();
+        std::fs::create_dir(src.path().join("sub")).unwrap();
+        std::fs::write(src.path().join("sub/b.txt"), b"bravo").unwrap();
+        std::os::unix::fs::symlink("a.txt", src.path().join("link")).unwrap();
+
+        copy_dir_into(src.path(), dst.path()).unwrap();
+
+        // Contents land directly under dst (not under a src-named subdir).
+        assert_eq!(std::fs::read(dst.path().join("a.txt")).unwrap(), b"alpha");
+        assert_eq!(
+            std::fs::read(dst.path().join("sub/b.txt")).unwrap(),
+            b"bravo"
+        );
+        // The symlink is recreated as a link (not dereferenced into a copy).
+        let meta = std::fs::symlink_metadata(dst.path().join("link")).unwrap();
+        assert!(meta.file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_link(dst.path().join("link")).unwrap(),
+            std::path::Path::new("a.txt")
+        );
+    }
+
+    #[test]
+    fn copy_dir_into_is_idempotent_on_rerun() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("a.txt"), b"v1").unwrap();
+        std::os::unix::fs::symlink("a.txt", src.path().join("link")).unwrap();
+
+        copy_dir_into(src.path(), dst.path()).unwrap();
+        // A second pull into the same dir must overwrite cleanly, not error on the
+        // pre-existing symlink (the live-clone fallback re-pull case).
+        std::fs::write(src.path().join("a.txt"), b"v2").unwrap();
+        copy_dir_into(src.path(), dst.path()).unwrap();
+
+        assert_eq!(std::fs::read(dst.path().join("a.txt")).unwrap(), b"v2");
+        assert!(std::fs::symlink_metadata(dst.path().join("link"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[test]

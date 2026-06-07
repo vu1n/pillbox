@@ -1,0 +1,37 @@
+name = "pillbox-do-spike"
+main = "src/worker.ts"
+compatibility_date = "2026-06-01"
+# The Agents SDK imports node built-ins (diagnostics_channel, os, path via its
+# deps) — nodejs_compat is required or the bundle fails to resolve them.
+compatibility_flags = ["nodejs_compat"]
+
+# The per-session §0 gateway. Binding name matches the class so routeAgentRequest
+# resolves /agents/session-gateway/<sessionId>/*.
+[[durable_objects.bindings]]
+name = "SessionGateway"
+class_name = "SessionGateway"
+
+# The Sandbox SDK's container-owning DO (one container per session, addressed by
+# the same sessionId). The gateway calls into it via getSandbox(env.Sandbox, …).
+[[durable_objects.bindings]]
+name = "Sandbox"
+class_name = "Sandbox"
+
+# Bind the Sandbox DO class to the container image (built from ./Dockerfile).
+# `wrangler dev` builds + runs it locally via Docker.
+[[containers]]
+class_name = "Sandbox"
+image = "./Dockerfile"
+# Cost guard for the deployed spike: ONE smallest-tier container. Idle containers
+# auto-sleep (no idle billing); we tear the deploy down after validating. Prod
+# sizes max_instances to the concurrent-session budget.
+max_instances = 1
+instance_type = "lite"
+
+# SQLite-backed storage migration (GA). Both DO classes are SQLite-backed.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SessionGateway", "Sandbox"]
+
+[observability]
+enabled = true

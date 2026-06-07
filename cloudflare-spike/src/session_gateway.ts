@@ -87,7 +87,12 @@ export class SessionGateway extends Agent<Env> {
     };
     // STUB: no driver-token arbitration (milestone 4).
     const inEv = this.append(nowRfc3339(), body.actor, payload);
-    await this.driveSandbox(inEv.seq, body.text ?? "");
+    // Drive the container only when one is bound (the container config). On the
+    // free/§0-only deploy there's no Sandbox binding, so `/input` is append-only
+    // — the attributed-input §0 path still works, just without the exec hop.
+    if (this.env.Sandbox) {
+      await this.driveSandbox(inEv.seq, body.text ?? "");
+    }
     return json({ seq: inEv.seq, head: this.head() });
   }
 

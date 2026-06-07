@@ -6,15 +6,24 @@ Object is the §0 sequencer + Subscribe fan-out, 1:1 with pillbox's local
 `SessionLog`.** Everything else (sandbox/container, vault/broker, actor-auth) is
 stubbed so the spike stays small.
 
-> **✅ Validated live (2026-06-07)** on `wrangler dev` (workerd + real DO SQLite):
-> `npm install && npx wrangler dev`, then `node smoke.mjs …` → append assigns
-> monotonic seq 1-3, a `from=1` subscriber replays 1-3 then tails 4, in order, no
-> gap/dup. Two fixes were needed and are in-tree: the Agents SDK requires the
-> `nodejs_compat` flag (it imports node built-ins), and it **multiplexes its own
-> `cf_agent_*` control frames onto the WS** — so a §0 subscriber must filter to
-> Event envelopes (`seq` + `payload`); a real consumer (lum/Slack/browser) does
-> the same. The lock-free seq (single-threaded-per-id + `transactionSync`) holds
-> as designed.
+> **✅ Validated live (2026-06-07)** — locally on `wrangler dev` AND **deployed on
+> real Cloudflare, free tier** (`https://pillbox-do-spike.vuluan-a06.workers.dev`):
+> `node smoke.mjs <url> <sid>` → append assigns monotonic seq 1-3, a `from=1`
+> subscriber replays 1-3 then tails 4, in order, no gap/dup. **No Workers Paid
+> needed** — SQLite-backed DOs run on the free plan, so the §0 sequencer + fan-out
+> (the load-bearing claim) is proven in production for free. Two fixes are in-tree:
+> the Agents SDK needs the `nodejs_compat` flag (it imports node built-ins), and it
+> **multiplexes its own `cf_agent_*` control frames onto the WS** — a §0 subscriber
+> filters to Event envelopes (`seq`+`payload`); a real consumer does the same. The
+> lock-free seq (single-threaded-per-id + `transactionSync`) holds as designed.
+>
+> **Two deploy configs:** `wrangler.toml` = **free / §0-only** (no container;
+> `/input` is append-only — the attributed-input §0 path without the exec hop).
+> `wrangler.container.toml` = the **full** path (Sandbox container; `wrangler deploy
+> -c wrangler.container.toml`) — needs **Workers Paid** (Containers entitlement) and
+> builds linux/amd64 (so it deploys to CF even from an arm64 host, unlike local
+> `wrangler dev`). The container leg is validated to the hop boundary; full
+> container *execution* is the only Paid-gated piece.
 
 ## Why this is the right first slice
 

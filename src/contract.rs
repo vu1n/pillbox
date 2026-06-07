@@ -196,6 +196,9 @@ pub(crate) enum Payload {
     PermissionRequested(PermissionRequested),
     PermissionResolved(PermissionResolved),
     AttentionRequired(AttentionRequired),
+    // multiplayer: the durable, attributed steer (distinct from the live,
+    // ephemeral PTY keystroke frame) — `session send` records one per drive.
+    Input(Input),
     // workspace
     Checkpoint(Checkpoint),
     ResultReady(ResultReady),
@@ -382,6 +385,36 @@ pub(crate) struct PermissionResolved {
 pub(crate) struct AttentionRequired {
     pub(crate) reason: AttentionReason,
     pub(crate) message: String,
+}
+
+/// A durable, attributed steer — the §0 record of `session send` (and the managed
+/// tier's `/input`). Distinct from the live, ephemeral PTY keystroke
+/// (`Frame::Input`): this persists + replays + carries `actor`, so a late joiner
+/// sees who drove the agent and with what. (`data` for binary input is a future
+/// addition; `session send` is text today.)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Input {
+    pub(crate) text: String,
+    pub(crate) target: InputTarget,
+    pub(crate) mode: InputMode,
+}
+
+/// Where the steer goes: the agent's prompt channel, the raw PTY, or a one-off exec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum InputTarget {
+    Agent,
+    Pty,
+    Exec,
+}
+
+/// `turn` = a discrete prompt (await the reply); `live` = streamed keystrokes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum InputMode {
+    Live,
+    Turn,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -649,6 +682,28 @@ mod tests {
         assert_eq!(Actor::system().kind, ActorKind::System);
         assert_eq!(Actor::human("alice").id, "u:alice");
         assert_eq!(Actor::service("grader").id, "svc:grader");
+    }
+
+    #[test]
+    fn input_payload_round_trips_with_human_actor() {
+        let ev = Event::session(
+            "s",
+            Payload::Input(Input {
+                text: "fix the bug".into(),
+                target: InputTarget::Agent,
+                mode: InputMode::Turn,
+            }),
+        )
+        .with_actor(Actor::human("alice"));
+        let s = serde_json::to_string(&ev).unwrap();
+        assert!(s.contains(r#""type":"input""#), "{s}");
+        assert!(s.contains(r#""target":"agent""#), "{s}");
+        assert!(s.contains(r#""mode":"turn""#), "{s}");
+        assert!(
+            s.contains(r#""actor":{"kind":"human","id":"u:alice"}"#),
+            "{s}"
+        );
+        assert_eq!(reparse(&ev), ev);
     }
 
     #[test]

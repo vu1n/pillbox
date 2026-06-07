@@ -44,6 +44,10 @@ export interface Actor {
 export type Payload =
   // spec'd (session-event-log.md), not in contract.rs::Payload:
   | { type: "input"; text?: string; data?: string; target: "agent" | "pty" | "exec"; mode: "live" | "turn" }
+  // §Multiplayer driver arbitration: who currently holds the single driver slot.
+  // `to` is optional because `released` clears the driver (no successor). Actor on
+  // the *event* is system/owner (the gateway), not the new driver.
+  | { type: "driver_changed"; from?: Actor; to?: Actor; mode: "granted" | "requested" | "stolen" | "released" }
   // in contract.rs::Payload (field shapes match the Rust structs):
   | { type: "message_delta"; messageId: string; text: string }
   | { type: "message_end"; messageId: string; model?: string; stopReason?: string }

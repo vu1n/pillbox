@@ -758,12 +758,14 @@ fn session_send(resolved: &Pillbox, id: &str, text: &str) -> Result<()> {
                 server.temperature,
             )?;
         }
+        record_input(resolved, &s.id, text, crate::contract::InputTarget::Agent);
         eprintln!("pillbox: sent prompt to session `{}`", s.id);
         return Ok(());
     }
     match session::Backend::parse(&s.backend) {
         Some(session::Backend::Docker) => {
             sandbox::docker::send_input(&s.sandbox_id, text.as_bytes())?;
+            record_input(resolved, &s.id, text, crate::contract::InputTarget::Pty);
             eprintln!("pillbox: sent {} byte(s) to session `{}`", text.len(), s.id);
             Ok(())
         }
@@ -783,6 +785,43 @@ fn session_send(resolved: &Pillbox, id: &str, text: &str) -> Result<()> {
         )
         .into()),
     }
+}
+
+/// Record `session send` as a durable, attributed §0 [`Input`](crate::contract::Input)
+/// event (actor = the local human driver) so the log shows who drove + replays the
+/// steer. Best-effort + loud: the steer already succeeded, so a §0 logging failure
+/// is a warning, not a command failure.
+fn record_input(
+    resolved: &Pillbox,
+    session_id: &str,
+    text: &str,
+    target: crate::contract::InputTarget,
+) {
+    use crate::contract::{Actor, Event, Input, InputMode, Payload};
+    let ev = Event::session(
+        session_id,
+        Payload::Input(Input {
+            text: text.to_string(),
+            target,
+            mode: InputMode::Turn,
+        }),
+    )
+    .with_actor(Actor::human(local_user()));
+    match crate::events::log::SessionLog::open(resolved, session_id) {
+        Ok(mut log) => {
+            if let Err(e) = log.append(&[ev]) {
+                eprintln!("pillbox: warning: couldn't record input on the §0 log: {e:#}");
+            }
+        }
+        Err(e) => eprintln!("pillbox: warning: couldn't open the §0 log to record input: {e:#}"),
+    }
+}
+
+/// The local human identity for §0 actor attribution — the OS user, else `local`.
+fn local_user() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "local".into())
 }
 
 fn session_pull(resolved: &Pillbox, id: &str, to: Option<&std::path::Path>) -> Result<()> {
@@ -1298,6 +1337,34 @@ mod tests {
     fn validate_session_id_accepts_minted_form() {
         // `Session::new_id` produces 12 hex chars.
         validate_session_id("abcdef012345").unwrap();
+    }
+
+    #[test]
+    fn record_input_writes_an_attributed_input_event() {
+        crate::test_util::with_isolated_home("session-record-input", || {
+            let pb = crate::pillbox::global();
+            record_input(
+                &pb,
+                "sess-drive",
+                "fix it",
+                crate::contract::InputTarget::Agent,
+            );
+            let events = crate::events::log::SessionLog::open(&pb, "sess-drive")
+                .unwrap()
+                .read_from(0)
+                .unwrap();
+            assert_eq!(events.len(), 1);
+            let ev = &events[0];
+            assert!(matches!(&ev.payload, crate::contract::Payload::Input(i)
+                if i.text == "fix it" && i.target == crate::contract::InputTarget::Agent));
+            let actor = ev.actor.as_ref().expect("input is actor-stamped");
+            assert_eq!(actor.kind, crate::contract::ActorKind::Human);
+            assert!(
+                actor.id.starts_with("u:"),
+                "human id is kind-prefixed: {}",
+                actor.id
+            );
+        });
     }
 
     fn scored(grader: &str, passed: bool, score: f64, feedback: &str) -> crate::contract::Scored {

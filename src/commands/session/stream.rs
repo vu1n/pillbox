@@ -122,25 +122,45 @@ pub(super) fn session_watch(resolved: &Pillbox, id: &str, from: u64) -> Result<(
     })
 }
 
-/// Render one event to the terminal for `session watch` — a readable view of
-/// the agent's stream (messages by role, tools, thinking, the attention
-/// signal), not raw JSON. Ephemeral telemetry (usage, lifecycle) is skipped.
+/// Render one event to the terminal for `session watch`. Pure formatting lives
+/// in [`format_watch_event`] (testable); this just tracks role and prints.
 fn render_watch_event(ev: &crate::contract::Event, role: &mut crate::contract::Role) {
+    if let crate::contract::Payload::MessageStart(m) = &ev.payload {
+        *role = m.role;
+    }
+    if let Some(line) = format_watch_event(ev, *role) {
+        println!("{line}");
+    }
+}
+
+/// Format one event into a readable line for `session watch` — a human view of
+/// the agent's stream (messages by role, tools, thinking, the attention signal,
+/// the multiplayer steer/chime-in), not raw JSON. Returns `None` for ephemeral
+/// telemetry (usage, lifecycle) that the watcher skips. `role` is the running
+/// message role from the latest `MessageStart`.
+fn format_watch_event(ev: &crate::contract::Event, role: crate::contract::Role) -> Option<String> {
     use crate::contract::{Payload, Role, ToolStatus};
-    match &ev.payload {
-        Payload::MessageStart(m) => *role = m.role,
+    // Attribution tag: who produced this event. `[u:alice]`-style (the id is
+    // already kind-prefixed); empty for legacy/unattributed events.
+    let tag = ev
+        .actor
+        .as_ref()
+        .map(|a| format!("[{}] ", a.id))
+        .unwrap_or_default();
+    Some(match &ev.payload {
+        Payload::MessageStart(_) => return None,
         Payload::MessageDelta(d) => {
-            let who = match *role {
+            let who = match role {
                 Role::User => "you",
                 Role::Assistant => "assistant",
                 Role::System => "system",
                 Role::Unspecified => "agent",
             };
-            println!("{who}: {}", d.text.trim_end());
+            format!("{tag}{who}: {}", d.text.trim_end())
         }
         Payload::ToolCall(t) if t.status == ToolStatus::Running => {
             let arg = t.input.as_ref().map(summarize_one_line).unwrap_or_default();
-            println!("  ⚙ {} {arg}", t.name);
+            format!("  ⚙ {tag}{} {arg}", t.name)
         }
         Payload::ToolCall(t) => {
             let mark = if t.status == ToolStatus::Error {
@@ -149,15 +169,26 @@ fn render_watch_event(ev: &crate::contract::Event, role: &mut crate::contract::R
                 "✓"
             };
             let out = first_line(&t.output);
-            println!(
-                "  {mark} {}",
+            format!(
+                "  {mark} {tag}{}",
                 if out.is_empty() { "(done)".into() } else { out }
-            );
+            )
         }
-        Payload::Thinking(th) => println!("  · {}", first_line(&th.text)),
-        Payload::AttentionRequired(a) => println!("⏳ needs attention ({:?})", a.reason),
-        _ => {} // usage / lifecycle / unknown — not rendered
-    }
+        Payload::Thinking(th) => format!("  · {tag}{}", first_line(&th.text)),
+        Payload::AttentionRequired(a) => format!("⏳ {tag}needs attention ({:?})", a.reason),
+        // The durable steer (who drove the agent, with what).
+        Payload::Input(i) => format!("▶ {tag}drove: {}", first_line(&i.text)),
+        // The non-driving chime-in; show its anchor when it references something.
+        Payload::Annotation(an) => {
+            let anchor = if an.anchor.is_empty() {
+                String::new()
+            } else {
+                format!(" @{}", an.anchor)
+            };
+            format!("✎ {tag}noted{anchor}: {}", first_line(&an.text))
+        }
+        _ => return None, // usage / lifecycle / unknown — not rendered
+    })
 }
 
 /// First non-empty line of `s`, char-safely capped for a terminal line.
@@ -241,5 +272,62 @@ pub(super) fn session_wait_idle(
             format!("session `{sid}` did not go idle within the timeout"),
         )
         .into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_watch_event;
+    use crate::contract::{
+        Actor, Annotation, Event, Input, InputTarget, MessageDelta, Payload, Role,
+    };
+
+    fn msg(text: &str) -> Payload {
+        Payload::MessageDelta(MessageDelta {
+            message_id: "m".into(),
+            text: text.into(),
+        })
+    }
+
+    #[test]
+    fn actor_renders_as_compact_tag() {
+        let ev = Event::session("s", msg("hi")).with_actor(Actor::agent("claude"));
+        let line = format_watch_event(&ev, Role::Assistant).unwrap();
+        assert_eq!(line, "[a:claude] assistant: hi");
+    }
+
+    #[test]
+    fn missing_actor_renders_no_tag() {
+        let ev = Event::session("s", msg("hi"));
+        let line = format_watch_event(&ev, Role::Assistant).unwrap();
+        assert_eq!(line, "assistant: hi");
+    }
+
+    #[test]
+    fn input_renders_driver_and_text() {
+        let ev = Event::session(
+            "s",
+            Payload::Input(Input {
+                text: "run the tests".into(),
+                target: InputTarget::Agent,
+            }),
+        )
+        .with_actor(Actor::human("alice"));
+        let line = format_watch_event(&ev, Role::Unspecified).unwrap();
+        assert_eq!(line, "▶ [u:alice] drove: run the tests");
+    }
+
+    #[test]
+    fn annotation_renders_author_anchor_and_text() {
+        let ev = Event::session(
+            "s",
+            Payload::Annotation(Annotation {
+                text: "watch the retry path".into(),
+                anchor: "src/net.rs".into(),
+            }),
+        )
+        .with_actor(Actor::human("bob"));
+        let line = format_watch_event(&ev, Role::Unspecified).unwrap();
+        assert_eq!(line, "✎ [u:bob] noted @src/net.rs: watch the retry path");
     }
 }

@@ -22,6 +22,14 @@ const sig = tok.split(".")[1];
 const evilClaim = Buffer.from(JSON.stringify({ kind: "system", id: "pillbox" })).toString("base64url");
 assert.equal(await verifyActorToken(`${evilClaim}.${sig}`, secret), null, "swapped claim rejected");
 
+// A token claiming `system` → rejected: system is the gateway's own identity,
+// never token-borne (else any holder forges gateway-authored events).
+const sysTok = await signActorToken({ kind: "system", id: "pillbox" }, secret);
+assert.equal(await verifyActorToken(sysTok, secret), null, "system-kind token rejected");
+// ...but a well-signed service token is still accepted.
+const svcTok = await signActorToken({ kind: "service", id: "svc:ci" }, secret);
+assert.deepEqual(await verifyActorToken(svcTok, secret), { kind: "service", id: "svc:ci" }, "service token ok");
+
 // Malformed tokens → rejected, never throw.
 for (const bad of ["", "garbage", "a.", ".b", "no-dot"]) {
   assert.equal(await verifyActorToken(bad, secret), null, `malformed rejected: ${JSON.stringify(bad)}`);

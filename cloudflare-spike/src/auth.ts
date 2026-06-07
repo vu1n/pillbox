@@ -14,7 +14,12 @@
 import type { Actor } from "./contract.js";
 
 const enc = new TextEncoder();
-const KINDS = new Set(["human", "agent", "system", "service"]);
+// The kinds a *token* may assert. `system` is deliberately excluded: it's the
+// gateway's own identity (stamped directly as SYSTEM_ACTOR for lifecycle /
+// arbitration / exec events), so a token that claims it would let any holder
+// forge gateway-authored events. human/agent/service are the legitimate
+// token-borne principals.
+const TOKEN_KINDS = new Set(["human", "agent", "service"]);
 
 async function hmacKey(secret: string): Promise<CryptoKey> {
   return crypto.subtle.importKey(
@@ -63,7 +68,8 @@ export async function verifyActorToken(token: string, secret: string): Promise<A
     const ok = await crypto.subtle.verify("HMAC", key, b64urlDecode(sigPart), enc.encode(claimPart));
     if (!ok) return null;
     const actor = JSON.parse(new TextDecoder().decode(b64urlDecode(claimPart))) as Actor;
-    if (!actor || typeof actor.id !== "string" || !KINDS.has(actor.kind)) return null;
+    // A well-formed, token-assertable actor — `system` is rejected (see TOKEN_KINDS).
+    if (!actor || typeof actor.id !== "string" || !TOKEN_KINDS.has(actor.kind)) return null;
     return actor;
   } catch {
     return null; // bad base64, bad JSON, or a crypto error — all unauthenticated

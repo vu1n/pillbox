@@ -40,6 +40,8 @@
 
 use std::fs;
 use std::io;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -98,14 +100,27 @@ impl SessionLog {
 
     /// Append `events` durably, assigning each the next per-session `seq`
     /// (overwriting any `seq` the producer set — the log is the authority).
-    /// Returns the last `seq` assigned (or the unchanged `last_seq` for an
-    /// empty batch). One file open + write per call, so a batch is one
-    /// syscall's worth of work and lands atomically per line.
+    /// Returns the last `seq` assigned (or the unchanged `last_seq` for an empty
+    /// batch).
+    ///
+    /// Holds an exclusive [`LogLock`] across the read-max + write so concurrent
+    /// appenders can't both hand out the same seq. The local §0 spine has genuine
+    /// multi-process writers — a `subscribe`/`watch` tailer in one process and
+    /// `session send`/`annotate`/`score` in another — and each holds its own
+    /// `SessionLog` with an in-memory `last_seq` that goes STALE the moment the
+    /// other appends. So under the lock the FILE is the seq authority: re-read its
+    /// max via [`recover_last_seq`] rather than trust the cache. (Full re-scan per
+    /// append; fine at per-session scale — the byte-offset incremental read is the
+    /// deferred optimization, same as `subscribe`. The cross-process single-writer
+    /// coordination this lock provides is the cheap stand-in for the resident
+    /// sequencer / `EventLog` trait.)
     pub(crate) fn append(&mut self, events: &[Event]) -> Result<u64> {
         if events.is_empty() {
             return Ok(self.last_seq);
         }
-        let mut seq = self.last_seq;
+        let path = self.log_path();
+        let _lock = LogLock::acquire(&path)?;
+        let mut seq = recover_last_seq(&path)?;
         let mut buf = String::new();
         for ev in events {
             seq += 1;
@@ -113,7 +128,7 @@ impl SessionLog {
             buf.push_str(&serde_json::to_string(&line).context("serialize log event")?);
             buf.push('\n');
         }
-        append_private_file(&self.log_path(), buf.as_bytes())?;
+        append_private_file(&path, buf.as_bytes())?;
         self.last_seq = seq;
         Ok(seq)
     }
@@ -250,6 +265,37 @@ fn recover_last_seq(log_path: &Path) -> Result<u64> {
     })
 }
 
+/// An exclusive advisory lock on a session's log file, held across an append so
+/// concurrent appenders serialize (see [`SessionLog::append`]). `flock`-based:
+/// the lock is associated with this open file description and the inode, so every
+/// `SessionLog::append` — in this process or another — contends on it, and it
+/// releases when this fd closes (the `File` drop). `flock` (not POSIX `fcntl`
+/// record locks) is deliberate: it's per-fd, so the separate fd
+/// [`append_private_file`] opens to write isn't affected, and a stray close
+/// elsewhere can't drop our lock.
+struct LogLock {
+    // Held only for its fd's lifetime; closing it (drop) releases the flock.
+    _file: fs::File,
+}
+
+impl LogLock {
+    fn acquire(path: &Path) -> Result<Self> {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("open {} to lock", path.display()))?;
+        // Blocks until no other appender holds the lock.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(io::Error::last_os_error())
+                .with_context(|| format!("lock {}", path.display()));
+        }
+        Ok(Self { _file: file })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +311,44 @@ mod tests {
             output: String::new(),
             title: String::new(),
         })
+    }
+
+    #[test]
+    fn concurrent_appenders_get_unique_contiguous_seqs() {
+        // Each thread opens its OWN SessionLog (mimicking separate processes — a
+        // tailer + `session send`/`annotate`) and appends to the same log. The
+        // flock in `append` must serialize them so no seq is duplicated or skipped;
+        // without it, each would compute seq from its own stale in-memory last_seq.
+        with_isolated_home("log-concurrent-append", || {
+            const N: u64 = 16;
+            let handles: Vec<_> = (0..N)
+                .map(|i| {
+                    std::thread::spawn(move || {
+                        let pb = crate::pillbox::global();
+                        let mut log = SessionLog::open(&pb, "sess-conc").unwrap();
+                        log.append(&[Event::session("sess-conc", tool_call(&format!("t{i}")))])
+                            .unwrap();
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            let pb = crate::pillbox::global();
+            let mut seqs: Vec<u64> = SessionLog::open(&pb, "sess-conc")
+                .unwrap()
+                .read_from(0)
+                .unwrap()
+                .iter()
+                .map(|e| e.seq)
+                .collect();
+            seqs.sort_unstable();
+            assert_eq!(
+                seqs,
+                (1..=N).collect::<Vec<_>>(),
+                "unique + contiguous, no dup/gap"
+            );
+        });
     }
 
     #[test]

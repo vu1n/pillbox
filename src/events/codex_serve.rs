@@ -140,6 +140,15 @@ impl CodexServeMapper {
         }
     }
 
+    /// Drain the stashed turn usage into `out` — called at every turn-end edge
+    /// (`turn/completed` and terminal `error`) so the cost is recorded exactly
+    /// once per turn no matter how the turn ends.
+    fn flush_usage(&mut self, out: &mut Vec<Payload>) {
+        if let Some(usage) = self.pending_usage.take() {
+            out.push(Payload::Usage(usage));
+        }
+    }
+
     /// `item/agentMessage/delta` — open the assistant message on the first delta
     /// for its `itemId`, then append. Empty deltas drop.
     fn on_agent_delta(&mut self, p: &Value) -> Vec<Payload> {
@@ -255,9 +264,7 @@ impl CodexServeMapper {
         if let Some(open) = self.open_msg.take() {
             out.push(Payload::MessageEnd(MessageEnd::new(open)));
         }
-        if let Some(usage) = self.pending_usage.take() {
-            out.push(Payload::Usage(usage));
-        }
+        self.flush_usage(&mut out);
         let status = p
             .get("turn")
             .map(|t| str_field(t, "status"))
@@ -285,10 +292,7 @@ impl CodexServeMapper {
             if let Some(open) = self.open_msg.take() {
                 out.push(Payload::MessageEnd(MessageEnd::new(open)));
             }
-            // The turn is over — flush its usage so a failed turn's cost isn't lost.
-            if let Some(usage) = self.pending_usage.take() {
-                out.push(Payload::Usage(usage));
-            }
+            self.flush_usage(&mut out); // the turn's over — don't lose a failed turn's cost
         }
         out.push(Payload::AttentionRequired(AttentionRequired {
             reason: AttentionReason::ErrorStalled,

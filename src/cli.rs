@@ -284,6 +284,19 @@ pub(crate) enum SessionAction {
         /// Text to send (as-is). Include a trailing newline/`\r` to submit.
         text: String,
     },
+    /// Annotate a session: record an attributed, durable §0 comment WITHOUT
+    /// driving the agent (the async, keyboard-free "chime in" — distinct from
+    /// `send`, which steers). Lands in the log stamped with your actor; an
+    /// orchestrator may inject it as agent context. `--anchor` references what
+    /// it's about (a seq, a path, a message id).
+    Annotate {
+        id: String,
+        /// The comment text.
+        text: String,
+        /// Optional reference to what the annotation is about (free-form).
+        #[arg(long)]
+        anchor: Option<String>,
+    },
     /// Watch a session's event stream rendered to this terminal — the
     /// human-facing reader over the durable log (the `docker logs` model;
     /// `subscribe` is the machine/WS sibling). For a live session it tails the

@@ -46,6 +46,10 @@ export type Payload =
   // turn — live keystrokes are the ephemeral Frame::Input, a different path — so no
   // `mode`. `data` (binary) is deferred both sides; `target` mirrors InputTarget.
   | { type: "input"; text?: string; data?: string; target: "agent" | "pty" | "exec" }
+  // the async, attributed "chime in" that does NOT drive (matches contract.rs::
+  // Annotation) — how a non-driver participates; an orchestrator may inject it as
+  // agent context. `anchor` references what it's about (a seq, a path, a message id).
+  | { type: "annotation"; text: string; anchor?: string }
   // §Multiplayer driver arbitration: who currently holds the single driver slot.
   // Spec'd in session-event-log.md, not (yet) in contract.rs::Payload. `to` is
   // optional because `released` clears the driver (no successor); the *event* actor

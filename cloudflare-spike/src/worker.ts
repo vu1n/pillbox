@@ -12,6 +12,10 @@ export interface Env {
   // The Sandbox SDK's container DO — OPTIONAL: present only in the container
   // config (wrangler.container.toml). Absent in the free/§0-only deploy.
   Sandbox?: DurableObjectNamespace<Sandbox>;
+  // Issuer secret for verifying actor tokens (HMAC). Set out-of-band via
+  // `wrangler secret put ACTOR_TOKEN_SECRET` (or `.dev.vars` for `wrangler dev`),
+  // never committed. Absent → writes fail closed (no actor can be attested).
+  ACTOR_TOKEN_SECRET?: string;
 }
 
 export default {

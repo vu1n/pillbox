@@ -14,20 +14,20 @@ export interface Event {
   sandboxId?: string;
   runId?: string;
   execId?: string;
+  actor?: Actor; // who produced this event — stamped from a verified token (auth.ts), never the body. In contract.rs::Event.
   payload: Payload;
 
   // ── envelope fields spec'd in docs/session-event-log.md but NOT yet in
   // contract.rs::Event (additive; safe to carry here ahead of the Rust side) ──
   v?: number; // schema version (per-line). Spec'd in session-event-log.md §Envelope; absent from contract.rs.
-  actor?: Actor; // who produced this event. Spec'd (gateway-AUTHENTICATED); STUB here — taken from the body, not yet authed.
   causationId?: number; // seq of the event that caused this. Spec'd; not in contract.rs.
   class?: "content" | "signal"; // poolability split. Spec'd as `class`; not in contract.rs.
   idempotencyKey?: string; // per-event append dedup on retry. Spec'd; not in contract.rs (only on RPCs).
 }
 
-// docs/session-event-log.md §Actor model. Stamped by the gateway from the
-// authenticated connection (the trust boundary) — see the TODO in
-// session_gateway.ts. Not present in contract.rs yet.
+// docs/session-event-log.md §Actor model. Stamped by the gateway from a verified
+// token (src/auth.ts), never self-reported by the producer — the trust boundary.
+// Mirrors contract.rs::Actor.
 export interface Actor {
   kind: "human" | "agent" | "system" | "service";
   id: string;

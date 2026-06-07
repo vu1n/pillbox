@@ -158,6 +158,28 @@ The Sandbox SDK (GA Apr 2026, PTY-over-WS/exec/backup-restore) is the container
 layer this spike stubs — its `Sandbox` is itself a DO, so this Session Agent is a
 sibling/wrapper, not its host.
 
+## Actor attestation (the trust boundary)
+
+Every event carries an `actor` (`docs/session-event-log.md` §Actor model). It is
+**stamped from a verified credential, never the request body** — so authz (who
+may drive/approve/join) can key off it. The credential is an HMAC-signed actor
+claim (`src/auth.ts`): the issuer signs `{kind,id,display}` with a shared secret,
+the DO verifies it server-side and stamps the *verified* actor.
+
+| Path | Credential | Policy |
+|---|---|---|
+| `POST /event`, `POST /input` | `Authorization: Bearer <token>` | **write requires a valid token → 401 otherwise**; body-supplied `actor` is ignored |
+| `subscribe` (WS) | `?token=<token>` on the upgrade | open to anonymous readers; a valid token binds the actor to the connection (`WsState.actor`) for future socket-driven input |
+| container-hop exec result | — | stamped `system` (the gateway originated it) |
+
+Set the secret out-of-band (never committed): `wrangler secret put
+ACTOR_TOKEN_SECRET` for deploys, or `.dev.vars` (gitignored; see
+`.dev.vars.example`) for `wrangler dev`. No secret → writes fail closed.
+
+Verify: `node test-auth.mjs` (crypto unit test — round-trip, wrong-secret,
+tampered-sig, swapped-claim) and, against `wrangler dev`, `node smoke-actor.mjs`
+(401 without a token; a body-claimed actor is ignored in favor of the token's).
+
 ## Risks + the next slice
 
 - **Replay/tail race** — an append racing a fresh subscribe. The `cursor` guard

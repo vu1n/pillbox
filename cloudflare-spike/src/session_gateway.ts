@@ -20,6 +20,11 @@ type WsState = { role: "subscriber"; cursor: number; actor?: Actor };
 // exec result), as opposed to a producer- or human-submitted event.
 const SYSTEM_ACTOR: Actor = { kind: "system", id: "pillbox" };
 
+// Payload types a producer may NOT submit via /event — each has its own
+// authoritative path (arbitration / the /input driver gate / the grader), so
+// accepting them on the open producer channel would let a token forge them.
+const PRODUCER_FORBIDDEN = new Set(["driver_changed", "input", "scored"]);
+
 export class SessionGateway extends Agent<Env> {
   // Agents-SDK lifecycle hook (replaces the constructor's table create). The §0
   // log is our own SQLite table, not Agent state — full control, no sync.
@@ -101,6 +106,34 @@ export class SessionGateway extends Agent<Env> {
     else await this.ctx.storage.delete(SessionGateway.DRIVER_KEY);
   }
 
+  // Driver arbitration (milestone 4): authZ on top of the actor authN. §0 allows
+  // one driver at a time. Returns a 409 `Response` for the caller to return (same
+  // convention as `requireActor`), or `null` when `actor` may drive — claiming a
+  // free slot or stealing an occupied one (driver_changed granted|stolen); a no-op
+  // when `actor` is already the driver.
+  private async ensureDriver(actor: Actor, wantsSteal: boolean): Promise<Response | null> {
+    const driver = await this.currentDriver();
+    if (!driver) {
+      await this.setDriver(actor);
+      this.emitDriverChange(undefined, actor, "granted");
+    } else if (!actorsEqual(driver, actor)) {
+      if (!wantsSteal) return json({ error: "not the driver", driver }, 409);
+      await this.setDriver(actor);
+      this.emitDriverChange(driver, actor, "stolen");
+    }
+    return null;
+  }
+
+  // The gateway — not the driver — authors driver_changed events, so they're
+  // stamped `system`. Single source of the transition's §0 shape.
+  private emitDriverChange(
+    from: Actor | undefined,
+    to: Actor | undefined,
+    mode: "granted" | "stolen" | "released",
+  ): Event {
+    return this.append(nowRfc3339(), SYSTEM_ACTOR, { type: "driver_changed", from, to, mode });
+  }
+
   // The /event producer path → EventLog::append. A producer (the in-sandbox §0
   // tailer, a host process) submits an Event; this is the resident-sequencer
   // analogue of a co-located producer calling SessionLog::append. Note the
@@ -118,6 +151,14 @@ export class SessionGateway extends Agent<Env> {
     if (actor instanceof Response) return actor;
     const body = (await req.json()) as Partial<Event>;
     if (!body.payload) return json({ error: "missing payload" }, 400);
+    // /event is the agent-output producer channel. Payload types that carry their
+    // own authority — arbitration state (`driver_changed`), the driver-attributed
+    // steer (`input`), the verifiable reward (`scored`) — have dedicated
+    // authenticated paths (ensureDriver / /input / the grader). Reject them here so
+    // a producer token can't forge them into the §0 log through the wrong door.
+    if (PRODUCER_FORBIDDEN.has((body.payload as Payload).type)) {
+      return json({ error: `payload type '${(body.payload as Payload).type}' not allowed on /event` }, 403);
+    }
     const ev = this.append(body.at ?? nowRfc3339(), actor, body.payload as Payload);
     return json({ seq: ev.seq, head: this.head() });
   }
@@ -153,41 +194,17 @@ export class SessionGateway extends Agent<Env> {
       mode?: string;
     };
 
-    // Driver arbitration (milestone 4): authZ layered on the authN above. The
-    // verified `actor` is established; here we decide whether that actor may
-    // actually drive. §0 allows one driver at a time:
-    //   - no current driver        → this actor CLAIMS it (driver_changed granted)
-    //   - current driver IS actor   → proceed, no event
-    //   - current driver is OTHER   → 409 unless the request opts to steal
-    //                                 (body `mode:"steal"` or `?steal=1`), in which
-    //                                 case reassign (driver_changed stolen)
+    // Arbitration gates the drive (who MAY drive, not just who they are). The
+    // steal signal rides `?steal=1` or body `mode:"steal"` — a request-only flag,
+    // not stored on the event (`Input` is always a discrete turn).
     const wantsSteal = body.mode === "steal" || new URL(req.url).searchParams.get("steal") === "1";
-    const driver = await this.currentDriver();
-    if (!driver) {
-      await this.setDriver(actor);
-      this.append(nowRfc3339(), SYSTEM_ACTOR, { type: "driver_changed", to: actor, mode: "granted" });
-    } else if (!actorsEqual(driver, actor)) {
-      if (!wantsSteal) {
-        return json({ error: "not the driver", driver }, 409);
-      }
-      await this.setDriver(actor);
-      this.append(nowRfc3339(), SYSTEM_ACTOR, {
-        type: "driver_changed",
-        from: driver,
-        to: actor,
-        mode: "stolen",
-      });
-    }
-    // else: current driver is this actor — proceed, no driver_changed event.
+    const denied = await this.ensureDriver(actor, wantsSteal);
+    if (denied) return denied;
 
     const payload: Payload = {
       type: "input",
       text: body.text ?? "",
       target: (body.target as "agent" | "pty" | "exec") ?? "exec",
-      // `body.mode` is overloaded: it can also carry the "steal" arbitration
-      // signal, which is NOT a valid input mode. Only "live" maps through;
-      // everything else (incl. "steal", undefined) is the default "turn".
-      mode: body.mode === "live" ? "live" : "turn",
     };
     const inEv = this.append(nowRfc3339(), actor, payload);
     // Drive the container only when one is bound (the container config). On the
@@ -259,11 +276,7 @@ export class SessionGateway extends Agent<Env> {
       return json({ error: "not the driver", driver: driver ?? null }, 409);
     }
     await this.setDriver(undefined);
-    const ev = this.append(nowRfc3339(), SYSTEM_ACTOR, {
-      type: "driver_changed",
-      from: actor,
-      mode: "released",
-    });
+    const ev = this.emitDriverChange(actor, undefined, "released");
     return json({ seq: ev.seq, head: this.head() });
   }
 

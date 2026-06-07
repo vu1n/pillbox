@@ -52,10 +52,30 @@ ws.close();
 
 const stamped = got[0]?.actor;
 console.log("stamped actor →", JSON.stringify(stamped));
+
+// 4. A token claiming `system` → 401 (system is gateway-only, not token-borne).
+const sysTok = await signActorToken({ kind: "system", id: "pillbox" }, secret);
+const sysRes = await fetch(`${base}${agent}/event`, {
+  method: "POST",
+  headers: { "content-type": "application/json", authorization: `Bearer ${sysTok}` },
+  body: evtBody(),
+});
+console.log("system-token /event →", sysRes.status, "(expect 401)");
+
+// 5. A control payload (driver_changed) on /event → 403 (forging the wrong door).
+const forgeRes = await fetch(`${base}${agent}/event`, {
+  method: "POST",
+  headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+  body: JSON.stringify({ payload: { type: "driver_changed", to: { kind: "human", id: "u:alice" }, mode: "granted" } }),
+});
+console.log("forged driver_changed /event →", forgeRes.status, "(expect 403)");
+
 const ok =
   noTok.status === 401 &&
   withTok.status === 200 &&
   stamped?.kind === "human" &&
-  stamped?.id === "u:alice";
-console.log(ok ? "AUTH SMOKE PASS ✓ (body-claimed actor ignored; token actor stamped)" : "AUTH SMOKE FAIL ✗");
+  stamped?.id === "u:alice" &&
+  sysRes.status === 401 &&
+  forgeRes.status === 403;
+console.log(ok ? "AUTH SMOKE PASS ✓ (body actor ignored; system-token + control-payload forgery rejected)" : "AUTH SMOKE FAIL ✗");
 process.exit(ok ? 0 : 1);

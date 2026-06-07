@@ -388,7 +388,8 @@ pub(crate) struct AttentionRequired {
 }
 
 /// A durable, attributed steer — the §0 record of `session send` (and the managed
-/// tier's `/input`). Distinct from the live, ephemeral PTY keystroke
+/// tier's `/input`). It is by definition a discrete *turn* (a submitted
+/// prompt/command), distinct from the live, ephemeral PTY keystroke
 /// (`Frame::Input`): this persists + replays + carries `actor`, so a late joiner
 /// sees who drove the agent and with what. (`data` for binary input is a future
 /// addition; `session send` is text today.)
@@ -397,7 +398,6 @@ pub(crate) struct AttentionRequired {
 pub(crate) struct Input {
     pub(crate) text: String,
     pub(crate) target: InputTarget,
-    pub(crate) mode: InputMode,
 }
 
 /// Where the steer goes: the agent's prompt channel, the raw PTY, or a one-off exec.
@@ -407,14 +407,6 @@ pub(crate) enum InputTarget {
     Agent,
     Pty,
     Exec,
-}
-
-/// `turn` = a discrete prompt (await the reply); `live` = streamed keystrokes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum InputMode {
-    Live,
-    Turn,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -691,14 +683,12 @@ mod tests {
             Payload::Input(Input {
                 text: "fix the bug".into(),
                 target: InputTarget::Agent,
-                mode: InputMode::Turn,
             }),
         )
         .with_actor(Actor::human("alice"));
         let s = serde_json::to_string(&ev).unwrap();
         assert!(s.contains(r#""type":"input""#), "{s}");
         assert!(s.contains(r#""target":"agent""#), "{s}");
-        assert!(s.contains(r#""mode":"turn""#), "{s}");
         assert!(
             s.contains(r#""actor":{"kind":"human","id":"u:alice"}"#),
             "{s}"

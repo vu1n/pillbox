@@ -42,11 +42,14 @@ export interface Actor {
 // spec'd in docs/session-event-log.md (§Payload taxonomy, the durable attributed
 // steer). Kept because the spike's /input path exercises it; flagged as spec.
 export type Payload =
-  // spec'd (session-event-log.md), not in contract.rs::Payload:
-  | { type: "input"; text?: string; data?: string; target: "agent" | "pty" | "exec"; mode: "live" | "turn" }
+  // the durable, attributed steer (matches contract.rs::Input). Always a discrete
+  // turn — live keystrokes are the ephemeral Frame::Input, a different path — so no
+  // `mode`. `data` (binary) is deferred both sides; `target` mirrors InputTarget.
+  | { type: "input"; text?: string; data?: string; target: "agent" | "pty" | "exec" }
   // §Multiplayer driver arbitration: who currently holds the single driver slot.
-  // `to` is optional because `released` clears the driver (no successor). Actor on
-  // the *event* is system/owner (the gateway), not the new driver.
+  // Spec'd in session-event-log.md, not (yet) in contract.rs::Payload. `to` is
+  // optional because `released` clears the driver (no successor); the *event* actor
+  // is the gateway (system), not the new driver.
   | { type: "driver_changed"; from?: Actor; to?: Actor; mode: "granted" | "requested" | "stolen" | "released" }
   // in contract.rs::Payload (field shapes match the Rust structs):
   | { type: "message_delta"; messageId: string; text: string }

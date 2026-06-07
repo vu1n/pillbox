@@ -168,17 +168,23 @@ the DO verifies it server-side and stamps the *verified* actor.
 
 | Path | Credential | Policy |
 |---|---|---|
-| `POST /event`, `POST /input` | `Authorization: Bearer <token>` | **write requires a valid token → 401 otherwise**; body-supplied `actor` is ignored |
+| `POST /event` | `Authorization: Bearer <token>` | write requires a valid token (401); body `actor` ignored; **control payload types rejected (403)** — `driver_changed`/`input`/`scored` have their own authoritative paths, so the open producer channel can't forge them |
+| `POST /input` | `Authorization: Bearer <token>` | write requires a valid token (401); body `actor` ignored; gated by driver arbitration (below) |
 | `subscribe` (WS) | `?token=<token>` on the upgrade | open to anonymous readers; a valid token binds the actor to the connection (`WsState.actor`) for future socket-driven input |
 | container-hop exec result | — | stamped `system` (the gateway originated it) |
+
+**`system` is the gateway's own identity** (it stamps `SYSTEM_ACTOR` for exec /
+arbitration events): a token claiming `kind:"system"` is **rejected** — only
+`human`/`agent`/`service` are token-borne, so a holder can't forge gateway events.
 
 Set the secret out-of-band (never committed): `wrangler secret put
 ACTOR_TOKEN_SECRET` for deploys, or `.dev.vars` (gitignored; see
 `.dev.vars.example`) for `wrangler dev`. No secret → writes fail closed.
 
-Verify: `node test-auth.mjs` (crypto unit test — round-trip, wrong-secret,
-tampered-sig, swapped-claim) and, against `wrangler dev`, `node smoke-actor.mjs`
-(401 without a token; a body-claimed actor is ignored in favor of the token's).
+Verify: `node test-auth.mjs` (crypto unit — round-trip, wrong-secret,
+tampered-sig, swapped-claim, **system-token rejected**) and, against `wrangler
+dev`, `node smoke-actor.mjs` (401 without a token; body-claimed actor ignored;
+**system-token → 401, forged `driver_changed` → 403**).
 
 ## Risks + the next slice
 

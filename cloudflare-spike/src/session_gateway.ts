@@ -90,12 +90,19 @@ export class SessionGateway extends Agent<Env> {
   // append attributed events; authz (who may drive/approve/join) keys off the
   // stamped, trusted actor.
   private async handleEvent(req: Request): Promise<Response> {
-    const actor = await this.verifiedActor(bearerToken(req));
-    if (!actor) return json({ error: "unauthenticated" }, 401);
+    const actor = await this.requireActor(req);
+    if (actor instanceof Response) return actor;
     const body = (await req.json()) as Partial<Event>;
     if (!body.payload) return json({ error: "missing payload" }, 400);
     const ev = this.append(body.at ?? nowRfc3339(), actor, body.payload as Payload);
     return json({ seq: ev.seq, head: this.head() });
+  }
+
+  // The write-path auth gate (single source of the "writes require a valid token"
+  // policy): the verified actor, or a 401 Response for the caller to return.
+  private async requireActor(req: Request): Promise<Actor | Response> {
+    const actor = await this.verifiedActor(bearerToken(req));
+    return actor ?? json({ error: "unauthenticated" }, 401);
   }
 
   // Verify a token against the issuer secret, returning the attested actor (or
@@ -116,8 +123,8 @@ export class SessionGateway extends Agent<Env> {
     // verified actor (the body's `actor` is ignored), 401 without a valid token.
     // (Driver-token arbitration — who is *allowed* to drive — is milestone 4;
     // this establishes who the driver *is*.)
-    const actor = await this.verifiedActor(bearerToken(req));
-    if (!actor) return json({ error: "unauthenticated" }, 401);
+    const actor = await this.requireActor(req);
+    if (actor instanceof Response) return actor;
     const body = (await req.json()) as { text?: string; target?: string; mode?: string };
     const payload: Payload = {
       type: "input",

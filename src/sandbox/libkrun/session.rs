@@ -355,14 +355,13 @@ fn launch_base(
     }
 
     let ca = provision_vault_ca(resolved, ca_lifetime)?;
-    // Trust the per-run MITM CA across runtimes: Node agents via NODE_EXTRA_CA_CERTS,
-    // and OpenSSL/Rust ones (codex's reqwest, curl, python) via SSL_CERT_FILE — which
-    // rustls-native-certs honors. Without it codex's model WebSocket to the ChatGPT
-    // backend hits `UnknownCA` (it reads neither the system bundle nor the Node var).
-    // Trusting only the vault CA is correct here: every allowlisted host's TLS is
-    // terminated + re-presented by the MITM, so the base roots are never exercised.
+    // Node agents (claude, opencode) trust the per-run MITM CA via NODE_EXTRA_CA_CERTS
+    // (additive to Node's built-ins). Rust/OpenSSL agents that need the CA in their own
+    // trust store (codex's reqwest) get it via a per-agent `SSL_CERT_FILE` (see
+    // ServerLaunch::extra_env) — NOT here: a process-wide `SSL_CERT_FILE` *replaces* the
+    // trust set, and narrowing it to the vault CA broke opencode's bring-up (its startup
+    // also reaches non-MITM'd hosts that need the base roots).
     guest_env.push(("NODE_EXTRA_CA_CERTS".into(), GUEST_CA_PATH.into()));
-    guest_env.push(("SSL_CERT_FILE".into(), GUEST_CA_PATH.into()));
 
     Ok(LaunchBase {
         rootfs,
@@ -610,6 +609,12 @@ struct ServerLaunch {
     /// Extra egress hosts beyond the vault-intercepted set (+ invoker
     /// `--egress-allow`), terminated + forwarded with an empty swap.
     egress_extra: Vec<String>,
+    /// Extra guest env vars for this agent only (appended to the shared
+    /// `launch_base` set). codex-serve uses it to point its Rust TLS stack at the
+    /// vault CA via `SSL_CERT_FILE`; opencode (Node, served by NODE_EXTRA_CA_CERTS)
+    /// needs none — and must not get a narrowed `SSL_CERT_FILE`, which broke its
+    /// bring-up by dropping the base roots its startup also reaches.
+    extra_env: Vec<(String, String)>,
     /// Opt-in local-model forward port (opencode's `PILLBOX_LOCAL_MODEL_PORT`).
     local_forward_port: Option<u16>,
     /// The model recorded on the session (from `--model` or a per-agent default).
@@ -656,10 +661,11 @@ fn launch_server_vm(
         home,
         workspace_clone: clone,
         guest_workspace,
-        guest_env,
+        mut guest_env,
         ca,
         with_vault: _, // server agents refuse vaulted --with above; always empty here
     } = launch_base(spec, &opts, resolved, CaLifetime::Persistent)?;
+    guest_env.extend(launch.extra_env); // per-agent additions (codex's SSL_CERT_FILE)
 
     // Creds: CoW clone the *real* auth home (no stub — the agent authenticates to
     // its provider directly; the MITM forwards it untouched, empty swap).
@@ -858,6 +864,8 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
             .iter()
             .map(|s| s.to_string())
             .collect(),
+        // Node — CA trust is NODE_EXTRA_CA_CERTS (launch_base); needs no extra env.
+        extra_env: vec![],
         // Opt-in: PILLBOX_LOCAL_MODEL_PORT lets the guest reach a host-run ollama.
         local_forward_port: std::env::var("PILLBOX_LOCAL_MODEL_PORT")
             .ok()
@@ -915,6 +923,11 @@ fn run_codex_serve(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Resul
             "api.openai.com".to_string(),
             "auth.openai.com".to_string(),
         ],
+        // codex is Rust (reqwest) — reads neither the system bundle nor
+        // NODE_EXTRA_CA_CERTS, so it needs the vault CA via SSL_CERT_FILE or its model
+        // WebSocket hits `UnknownCA`. MITM-only is correct: all codex egress is
+        // MITM-terminated. (Why this is per-agent and not in launch_base: field doc.)
+        extra_env: vec![("SSL_CERT_FILE".into(), GUEST_CA_PATH.into())],
         local_forward_port: None,
         model,
         // The appserver-host bridge owns `codex app-server`, captures notifications

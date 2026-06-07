@@ -201,7 +201,7 @@ green light to invest in (a).
 | 3-split (train/val/**test-locked**) | **built** — `freeze-split.sh` stable-hash-partitions a task-dir set into train/val/test bookmarks (stable under growth; ratios approximate for small N, printed counts authoritative) |
 | Headroom pre-screen | **not built** — one baseline pass dropping floor/ceiling tasks |
 | Sensitivity-check task family (Option-C synthetic) | **built** — `scripts/eval/gen-sensitivity-tasks.py` emits 12 microtasks + a uniform `oracle.md`; each prompt OMITS the same arbitrary "empty→-1" contract the hidden rubric checks → a structurally-guaranteed, uniform planted lift (validated: correct→4/4, baseline→3/4, so lift = 1 criterion/task). `--self-test` certifies it. Generated under `scripts/eval/sensitivity-tasks/` |
-| Option-A microtask curation (revert real fixes) | **not built** — the *bakeoff* family (the real human cost); the synthetic family above is only for the rig-sensitivity check |
+| Option-A real-bug task family (agentic) | **built** — `scripts/eval/gen-toolz-tasks.py`: 5 single-fault bugs injected into REAL `toolz` functions (off-by-one in take/drop/take_nth, tail slice, sliding_window), graded by toolz's REAL pytest suite (hidden). Real codebase + agentic multi-module navigation + dep-light (pure-Python; graded via `uv run --with pytest`, no pip-per-grade). `--self-test` validates each (clean→test passes, bugged→fails) + end-to-end grade-sim confirmed. Generated on demand (bulky); `freeze-split.sh <out> toolz` to freeze. The agentic-regime σ̂ measurement runs on this (next) |
 | Grader-leak redaction in any memory arm | **fixed in kypp** (`4c62a3d`); re-verify new injection paths |
 
 The substrate is done. What's missing is **discipline** (3 splits, headroom screen,

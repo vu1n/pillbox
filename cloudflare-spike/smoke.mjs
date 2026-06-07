@@ -26,7 +26,19 @@ console.log("input  3:", await post("input", { text: "run the tests", target: "a
 const seen = [];
 const ws = new WebSocket(wsUrl);
 ws.addEventListener("message", (e) => {
-  const ev = JSON.parse(e.data);
+  let ev;
+  try {
+    ev = JSON.parse(typeof e.data === "string" ? e.data : e.data.toString());
+  } catch {
+    console.log(`  <= (non-JSON frame: ${String(e.data).slice(0, 80)})`);
+    return;
+  }
+  // The Agents SDK multiplexes its own control frames (cf_agent_*) on the WS;
+  // a §0 subscriber keeps only our Event envelopes (seq + payload).
+  if (typeof ev.seq !== "number" || !ev.payload) {
+    console.log(`  <= (skip non-event frame: ${JSON.stringify(ev).slice(0, 80)})`);
+    return;
+  }
   seen.push(ev.seq);
   console.log(`  <= seq=${ev.seq} type=${ev.payload.type}`);
 });

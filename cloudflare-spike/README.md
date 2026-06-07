@@ -6,6 +6,16 @@ Object is the §0 sequencer + Subscribe fan-out, 1:1 with pillbox's local
 `SessionLog`.** Everything else (sandbox/container, vault/broker, actor-auth) is
 stubbed so the spike stays small.
 
+> **✅ Validated live (2026-06-07)** on `wrangler dev` (workerd + real DO SQLite):
+> `npm install && npx wrangler dev`, then `node smoke.mjs …` → append assigns
+> monotonic seq 1-3, a `from=1` subscriber replays 1-3 then tails 4, in order, no
+> gap/dup. Two fixes were needed and are in-tree: the Agents SDK requires the
+> `nodejs_compat` flag (it imports node built-ins), and it **multiplexes its own
+> `cf_agent_*` control frames onto the WS** — so a §0 subscriber must filter to
+> Event envelopes (`seq` + `payload`); a real consumer (lum/Slack/browser) does
+> the same. The lock-free seq (single-threaded-per-id + `transactionSync`) holds
+> as designed.
+
 ## Why this is the right first slice
 
 This is **milestone 0 minus the container hop** — it isolates the §0-over-DO

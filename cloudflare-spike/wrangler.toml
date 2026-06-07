@@ -1,6 +1,9 @@
 name = "pillbox-do-spike"
 main = "src/worker.ts"
 compatibility_date = "2026-06-01"
+# The Agents SDK imports node built-ins (diagnostics_channel, os, path via its
+# deps) — nodejs_compat is required or the bundle fails to resolve them.
+compatibility_flags = ["nodejs_compat"]
 
 # One Durable Object class = the per-session §0 gateway. Binding name matches the
 # class so routeAgentRequest resolves /agents/session-gateway/<sessionId>/*.

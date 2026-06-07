@@ -57,7 +57,27 @@ reached via `routeAgentRequest` at `/agents/session-gateway/<sessionId>/*`:
 - `GET …/subscribe?from=N` (WS upgrade → `onConnect`) → replay (`seq >= N`) then live tail, one Event/frame in seq order (hibernation-aware: per-connection cursor on `connection.setState`)
 - `POST …/input` → append an attributed `input` Event (same path → also fans out)
 
-**OUT (stubbed, marked `// TODO`)**: sandbox/container wiring (no real agent; a sibling Sandbox-SDK DO owns the container, not this Agent), vault/broker, `actor` authentication (taken from the body, not the connection — milestone 1 stamps it in `onConnect`), driver-token arbitration, blobs→R2, the deploy/migration handoff probe.
+**Sandbox wiring (cycle 1 — the DO↔container hop):** `/input` now drives a
+per-session container — `getSandbox(env.Sandbox, sessionId).exec(cmd)` (with a
+cold-start retry), and the result is appended as a §0 `tool_call` event, so a
+subscriber sees the round-trip `input` (seq N) → `tool_call` output (seq N+1).
+The Sandbox SDK is a sibling container-owning DO (`[[containers]]` + a Dockerfile
+`FROM cloudflare/sandbox`), not this Agent. **Validated to the hop boundary:** the
+worker compiles + runs with the Agents + Sandbox SDKs together, the cross-boundary
+`exec` call fires, and its result/error round-trips into §0 and fans out (the
+subscriber saw `input`→`tool_call` in order, carrying the real payload from the
+Sandbox DO).
+
+> **⚠️ Local container execution blocked on Apple Silicon (arm64).** wrangler dev
+> builds the container for CF's prod platform (linux/**amd64**; the
+> `cloudflare/sandbox` base is amd64-only — no arm64 manifest), and wrangler's
+> local container runtime fails to boot that amd64 image on an arm64 host
+> (`Container failed to start`) — even though plain `docker run` emulates it fine.
+> So the §0 round-trip + the call path are proven, but the *container executes the
+> command* leg needs amd64: a deploy, or a Rosetta-capable local runtime. A real
+> CF-Containers-on-Apple-Silicon friction, not a wiring defect.
+
+**OUT (stubbed, marked `// TODO`)**: the streaming-agent producer (in-container tailer POSTing `/event` back with `seq=0` — cycle 1 uses one-shot `exec`), the GSV-cribbed hibernate-safe pending-op routing table (cycle 2, gated on the container executing locally), vault/broker, `actor` authentication (body, not connection — milestone 1 stamps it in `onConnect`), driver-token arbitration, blobs→R2.
 
 ## Other CF primitives to pull in (from the review, behind existing seams)
 - **Workflows / Agent "Fibers"** — the durable optimization/eval loop (consumers *of* the §0 log; keep them OUT of the synchronous append path).

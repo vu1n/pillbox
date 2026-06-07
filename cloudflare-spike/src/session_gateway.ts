@@ -1,4 +1,5 @@
 import { Agent, type Connection, type ConnectionContext, type WSMessage } from "agents";
+import { getSandbox } from "@cloudflare/sandbox";
 import type { Event, Payload } from "./contract.js";
 import type { Env } from "./worker.js";
 
@@ -72,19 +73,62 @@ export class SessionGateway extends Agent<Env> {
     return json({ seq: ev.seq, head: this.head() });
   }
 
-  // Attributed input — the durable steer. Same append path => also fans out.
+  // Attributed input — the durable steer, then driven into the container. The
+  // input is appended (seq N, fans out), the call crosses the DO↔container hop
+  // (the one unmeasured managed-tier risk), and the result is appended as a §0
+  // event (seq N+1) so a subscriber sees the round-trip: input → output.
   private async handleInput(req: Request): Promise<Response> {
     const body = (await req.json()) as { text?: string; target?: string; mode?: string; actor?: unknown };
     const payload: Payload = {
       type: "input",
       text: body.text ?? "",
-      target: (body.target as "agent" | "pty" | "exec") ?? "agent",
+      target: (body.target as "agent" | "pty" | "exec") ?? "exec",
       mode: (body.mode as "live" | "turn") ?? "turn",
     };
-    // STUB: no driver-token arbitration (milestone 4); no sandbox forward.
-    // TODO: arbitrate target:pty via driver-token; forward to the Sandbox DO's PTY/exec.
-    const ev = this.append(nowRfc3339(), body.actor, payload);
-    return json({ seq: ev.seq, head: this.head() });
+    // STUB: no driver-token arbitration (milestone 4).
+    const inEv = this.append(nowRfc3339(), body.actor, payload);
+    await this.driveSandbox(inEv.seq, body.text ?? "");
+    return json({ seq: inEv.seq, head: this.head() });
+  }
+
+  // The DO↔container hop. One container per session (addressed by the same
+  // sessionId). Cycle-1: run the input as a command and append its output as a
+  // §0 `tool_call` event. (The streaming-agent producer — the in-container
+  // tailer POSTing /event back with seq=0 — is the next sub-slice; this proves
+  // the hop + the round-trip first.) `getSandbox` is the Sandbox-SDK handle to
+  // the sibling container DO.
+  private async driveSandbox(inputSeq: number, cmd: string): Promise<void> {
+    const opId = `exec-${inputSeq}`;
+    const sandbox = getSandbox(this.env.Sandbox, this.name);
+    // Cold-start: the container DO boots on first use and `exec` throws a
+    // transient "Container is starting" until it's up. Retry that case with a
+    // short backoff; surface any non-transient error as-is.
+    let lastErr = "";
+    for (let attempt = 0; attempt < 15; attempt++) {
+      try {
+        const res = await sandbox.exec(cmd);
+        const out = [res.stdout, res.stderr].filter(Boolean).join("\n");
+        this.append(nowRfc3339(), undefined, {
+          type: "tool_call",
+          toolCallId: opId,
+          name: "exec",
+          status: res.success ? "completed" : "failed",
+          output: out,
+        });
+        return;
+      } catch (e) {
+        lastErr = String(e);
+        if (!/starting|not ready/i.test(lastErr)) break; // non-transient → stop
+        await new Promise((r) => setTimeout(r, 1000)); // container cold-start backoff
+      }
+    }
+    this.append(nowRfc3339(), undefined, {
+      type: "tool_call",
+      toolCallId: opId,
+      name: "exec",
+      status: "error",
+      output: lastErr,
+    });
   }
 
   // ── Subscribe(from_seq) = replay then tail ────────────────────────────

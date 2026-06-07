@@ -20,7 +20,9 @@ async function post(op, body) {
 // 1. Append three events BEFORE subscribing (proves replay-from-seq).
 console.log("append 1:", await post("event", { payload: { type: "message_delta", messageId: "m1", text: "hello" } }));
 console.log("append 2:", await post("event", { payload: { type: "tool_call", toolCallId: "t1", name: "Bash", status: "running" } }));
-console.log("input  3:", await post("input", { text: "run the tests", target: "agent", mode: "turn" }));
+// Use /event (not /input) — /input now drives the container, which would add an
+// extra exec-output event. The §0 replay/tail smoke stays container-independent.
+console.log("event  3:", await post("event", { payload: { type: "input", text: "run the tests", target: "agent", mode: "turn" } }));
 
 // 2. Subscribe from seq 1 => must REPLAY 1,2,3 then TAIL the next append.
 const seen = [];

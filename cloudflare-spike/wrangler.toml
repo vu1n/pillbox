@@ -5,17 +5,31 @@ compatibility_date = "2026-06-01"
 # deps) — nodejs_compat is required or the bundle fails to resolve them.
 compatibility_flags = ["nodejs_compat"]
 
-# One Durable Object class = the per-session §0 gateway. Binding name matches the
-# class so routeAgentRequest resolves /agents/session-gateway/<sessionId>/*.
+# The per-session §0 gateway. Binding name matches the class so routeAgentRequest
+# resolves /agents/session-gateway/<sessionId>/*.
 [[durable_objects.bindings]]
 name = "SessionGateway"
 class_name = "SessionGateway"
 
-# SQLite-backed storage migration (GA). `new_sqlite_classes` is required
-# for ctx.storage.sql to be available on the class.
+# The Sandbox SDK's container-owning DO (one container per session, addressed by
+# the same sessionId). The gateway calls into it via getSandbox(env.Sandbox, …).
+[[durable_objects.bindings]]
+name = "Sandbox"
+class_name = "Sandbox"
+
+# Bind the Sandbox DO class to the container image (built from ./Dockerfile).
+# `wrangler dev` builds + runs it locally via Docker.
+[[containers]]
+class_name = "Sandbox"
+image = "./Dockerfile"
+# One container per session (addressed by sessionId); cap a few for the spike's
+# concurrent smokes. Production sizes this to the concurrent-session budget.
+max_instances = 5
+
+# SQLite-backed storage migration (GA). Both DO classes are SQLite-backed.
 [[migrations]]
 tag = "v1"
-new_sqlite_classes = ["SessionGateway"]
+new_sqlite_classes = ["SessionGateway", "Sandbox"]
 
 [observability]
 enabled = true

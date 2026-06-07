@@ -49,6 +49,11 @@ pub(crate) struct Event {
     pub(crate) exec_id: String,
     /// RFC3339 timestamp.
     pub(crate) at: String,
+    /// Who produced this event — stamped by the producer/gateway, never
+    /// self-reported by the in-sandbox agent (the trust boundary; authz keys off
+    /// `actor`). `None` on legacy/unattributed events. See [`Actor`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) actor: Option<Actor>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) ephemeral: bool,
     pub(crate) payload: Payload,
@@ -65,6 +70,7 @@ impl Event {
             run_id: String::new(),
             exec_id: String::new(),
             at: crate::session::now_rfc3339(),
+            actor: None,
             ephemeral: false,
             payload,
         }
@@ -105,6 +111,61 @@ impl Event {
     pub(crate) fn with_exec(mut self, exec_id: impl Into<String>) -> Self {
         self.exec_id = exec_id.into();
         self
+    }
+
+    pub(crate) fn with_actor(mut self, actor: Actor) -> Self {
+        self.actor = Some(actor);
+        self
+    }
+}
+
+/// Who produced an event. **Stamped by the producer/gateway from an authenticated
+/// source, never self-reported by the in-sandbox agent** — unlike the old
+/// `host`/`sandbox` emitter tag, authz (who may drive / approve / join) keys off
+/// `actor`, so it is the trust boundary. See docs/session-event-log.md §Actor model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Actor {
+    pub(crate) kind: ActorKind,
+    /// Stable, kind-prefixed id (`a:<agent>`, `u:<user>`, `svc:<service>`,
+    /// `pillbox`) — the [`Actor`] constructors apply the prefix.
+    pub(crate) id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) display: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ActorKind {
+    Human,
+    Agent,
+    System,
+    Service,
+}
+
+impl Actor {
+    /// The coding agent's own output (`message_*`, `tool_call`, …).
+    pub(crate) fn agent(id: impl AsRef<str>) -> Self {
+        Self::new(ActorKind::Agent, format!("a:{}", id.as_ref()))
+    }
+    /// pillbox itself — lifecycle, sequencing, snapshots.
+    pub(crate) fn system() -> Self {
+        Self::new(ActorKind::System, "pillbox".into())
+    }
+    /// A person — input, annotations, approvals.
+    pub(crate) fn human(id: impl AsRef<str>) -> Self {
+        Self::new(ActorKind::Human, format!("u:{}", id.as_ref()))
+    }
+    /// A non-human automated participant — a grader, CI, an orchestrator.
+    pub(crate) fn service(id: impl AsRef<str>) -> Self {
+        Self::new(ActorKind::Service, format!("svc:{}", id.as_ref()))
+    }
+    fn new(kind: ActorKind, id: String) -> Self {
+        Self {
+            kind,
+            id,
+            display: String::new(),
+        }
     }
 }
 
@@ -572,6 +633,31 @@ mod tests {
     fn reparse(event: &Event) -> Event {
         let s = serde_json::to_string(event).unwrap();
         serde_json::from_str(&s).unwrap()
+    }
+
+    #[test]
+    fn actor_stamps_kind_and_prefixed_id_and_round_trips() {
+        let ev = Event::session("s", Payload::SandboxReady).with_actor(Actor::agent("claude"));
+        let s = serde_json::to_string(&ev).unwrap();
+        assert!(
+            s.contains(r#""actor":{"kind":"agent","id":"a:claude"}"#),
+            "{s}"
+        );
+        assert_eq!(reparse(&ev), ev);
+        // Each constructor: right kind + kind-prefixed id.
+        assert_eq!(Actor::system().id, "pillbox");
+        assert_eq!(Actor::system().kind, ActorKind::System);
+        assert_eq!(Actor::human("alice").id, "u:alice");
+        assert_eq!(Actor::service("grader").id, "svc:grader");
+    }
+
+    #[test]
+    fn legacy_event_without_actor_parses_as_none() {
+        // Forward/backward-compat: a pre-actor log line (no `actor` field) decodes
+        // to `actor: None`, not an error.
+        let line = r#"{"seq":1,"sessionId":"s","at":"t","payload":{"type":"sandbox_ready"}}"#;
+        let ev: Event = serde_json::from_str(line).unwrap();
+        assert_eq!(ev.actor, None);
     }
 
     #[test]

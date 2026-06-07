@@ -25,7 +25,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use super::{claude, codex, contract_map, emit_event_span, Harness, TranscriptEvent};
-use crate::contract::Event;
+use crate::contract::{Actor, Event};
 use crate::events::log::SessionLog;
 
 /// Stateful tail position for one transcript file. Reusable across
@@ -148,11 +148,11 @@ impl Tailer {
             let events = parse_with(self.harness, line, self.line_idx);
             for event in &events {
                 if logging {
-                    durable.extend(
-                        contract_map::to_payloads(event)
-                            .into_iter()
-                            .map(|p| Event::session(&self.session_id, p)),
-                    );
+                    // The transcript is the agent's own output — stamp `agent`.
+                    durable.extend(contract_map::to_payloads(event).into_iter().map(|p| {
+                        Event::session(&self.session_id, p)
+                            .with_actor(Actor::agent(self.harness.agent_id()))
+                    }));
                 }
                 emit_event_span(event, &self.session_id);
                 self.synth.on_event(event);

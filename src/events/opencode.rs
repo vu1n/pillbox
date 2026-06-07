@@ -43,8 +43,8 @@ use std::collections::{HashMap, HashSet};
 use serde_json::Value;
 
 use crate::contract::{
-    AttentionReason, AttentionRequired, Event, MessageDelta, MessageEnd, MessageStart, Payload,
-    Role, Thinking, ToolCall, ToolStatus, Usage, UsageSource,
+    Actor, AttentionReason, AttentionRequired, Event, MessageDelta, MessageEnd, MessageStart,
+    Payload, Role, Thinking, ToolCall, ToolStatus, Usage, UsageSource,
 };
 use crate::events::log::SessionLog;
 
@@ -345,10 +345,12 @@ fn flush_frame(
     let parsed: Result<Value, _> = serde_json::from_str(data);
     data.clear();
     let Ok(value) = parsed else { return Ok(0) };
+    // opencode's `/event` stream is the agent's own output — stamp it `agent`
+    // (the host knows it launched opencode; the guest can't claim a different actor).
     let events: Vec<Event> = mapper
         .on_event(&value)
         .into_iter()
-        .map(|p| Event::session(session_id, p))
+        .map(|p| Event::session(session_id, p).with_actor(Actor::agent("opencode")))
         .collect();
     if events.is_empty() {
         return Ok(0);
@@ -646,6 +648,10 @@ data: {\"type\":\"session.idle\",\"properties\":{\"sessionID\":\"ses_oc\"}}\n\
                 events.iter().map(|e| e.seq).collect::<Vec<_>>(),
                 vec![1, 2, 3, 4, 5, 6]
             );
+            // Every drained event is stamped as the opencode agent.
+            assert!(events
+                .iter()
+                .all(|e| e.actor == Some(crate::contract::Actor::agent("opencode"))));
         });
     }
 }

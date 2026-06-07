@@ -1068,10 +1068,12 @@ fn session_score(
 
     // Record on the durable §0 log — the source of truth the meta-harness reads.
     let mut log = crate::events::log::SessionLog::open(resolved, &session.id)?;
+    // The grade is an external verifier's verdict, not the agent's — stamp `service`.
     let seq = log.append(&[crate::contract::Event::session(
         &session.id,
         crate::contract::Payload::Scored(scored.clone()),
-    )])?;
+    )
+    .with_actor(crate::contract::Actor::service("grader"))])?;
 
     if json {
         println!("{}", score_verdict_json(&session.id, &scored, seq));

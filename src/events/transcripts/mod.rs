@@ -83,6 +83,15 @@ impl Harness {
         }
     }
 
+    /// The agent id, for stamping the §0 `actor` on transcript-derived events
+    /// (inverse of [`for_agent`]).
+    pub(crate) fn agent_id(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+        }
+    }
+
     /// `(watch_root, scope_dir)` for this run, both under the agent's
     /// `$HOME` (`home`). `watch_root` is the harness's transcript tree;
     /// `scope_dir`, when `Some`, narrows discovery to *this run's own*

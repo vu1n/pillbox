@@ -1,17 +1,24 @@
 import { Agent, type Connection, type ConnectionContext, type WSMessage } from "agents";
 import { getSandbox } from "@cloudflare/sandbox";
-import type { Event, Payload } from "./contract.js";
+import type { Actor, Event, Payload } from "./contract.js";
+import { bearerToken, verifyActorToken } from "./auth.js";
 import type { Env } from "./worker.js";
 
-// Per-connection state (the subscriber's replay cursor), persisted across
-// hibernation via `connection.setState` — the Agents-SDK replacement for raw
-// `serializeAttachment`. NOTE: this is per-connection state, NOT the global
-// `this.setState`. We deliberately NEVER call global `this.setState`: it is
-// last-write-wins whole-object sync, structurally incompatible with an ordered
-// append-only log keyed by monotonic `seq` (it'd lose ordering, replay, and
-// per-event actor attribution). The §0 log lives in `this.ctx.storage.sql`; the
-// cursor lives here. (This is the exact split GSV runs in production.)
-type WsState = { role: "subscriber"; cursor: number };
+// Per-connection state (the subscriber's replay cursor + its authenticated
+// actor), persisted across hibernation via `connection.setState` — the Agents-SDK
+// replacement for raw `serializeAttachment`. NOTE: this is per-connection state,
+// NOT the global `this.setState`. We deliberately NEVER call global
+// `this.setState`: it is last-write-wins whole-object sync, structurally
+// incompatible with an ordered append-only log keyed by monotonic `seq` (it'd
+// lose ordering, replay, and per-event actor attribution). The §0 log lives in
+// `this.ctx.storage.sql`; the cursor lives here. (This is the exact split GSV
+// runs in production.) `actor` is the connection's verified identity (`undefined`
+// for an anonymous read-only subscriber).
+type WsState = { role: "subscriber"; cursor: number; actor?: Actor };
+
+// pillbox itself — the actor for events the gateway originates (the container-hop
+// exec result), as opposed to a producer- or human-submitted event.
+const SYSTEM_ACTOR: Actor = { kind: "system", id: "pillbox" };
 
 export class SessionGateway extends Agent<Env> {
   // Agents-SDK lifecycle hook (replaces the constructor's table create). The §0
@@ -38,7 +45,7 @@ export class SessionGateway extends Agent<Env> {
   // counter, so it survives eviction (the DO analogue of SessionLog recovering
   // last_seq from log.jsonl on open). This is a DO primitive the Agent class
   // inherits, so adopting `Agent` costs the keystone nothing.
-  private append(at: string, actor: unknown, payload: Payload): Event {
+  private append(at: string, actor: Actor | undefined, payload: Payload): Event {
     const seq = this.ctx.storage.transactionSync(() => {
       const row = this.ctx.storage.sql
         .exec("SELECT COALESCE(MAX(seq), 0) AS m FROM log")
@@ -56,7 +63,7 @@ export class SessionGateway extends Agent<Env> {
     // `this.name` is the Agent instance name (the sessionId) — resolves the
     // raw-DO spike's `ctx.id.name` readback caveat for free.
     const ev: Event = { v: 1, seq, sessionId: this.name, at, payload };
-    if (actor) ev.actor = actor as Event["actor"];
+    if (actor) ev.actor = actor;
     this.fanout(ev);
     return ev;
   }
@@ -76,26 +83,28 @@ export class SessionGateway extends Agent<Env> {
   // producer-supplied `body.seq` is DISCARDED — `append` stamps the authority's
   // seq, matching SessionLog::append's overwrite-the-producer's-seq rule.
   //
-  // TODO(actor-stamping — the next slice, NOT this task): authenticate + stamp
-  // `actor` at this trust boundary. Today `body.actor` is taken from the request
-  // body UNAUTHENTICATED — any caller can claim any actor, so actor is not yet an
-  // authz signal (exactly the `emitter` tag's caveat in session-event-log.md).
-  // The fix per session-event-log.md §Actor model:
-  //   1. The actor CLAIM arrives as a verifiable credential on the request — a
-  //      bearer/signed token (per-connection on WS, per-request header on HTTP),
-  //      NOT a body field. Managed tier: minted by the control plane and bound to
-  //      the principal (human user / agent / service).
-  //   2. Verify it server-side here (and in onConnect), derive the Actor from the
-  //      verified claim, and stamp it into the appended event.
-  //   3. IGNORE any body-supplied `actor` entirely (treat as spoofed). Authz —
-  //      who may drive/approve/join — then keys off the stamped, trusted actor.
-  // Until then `body.actor` is a stub for shape only.
+  // The trust boundary (session-event-log.md §Actor model). The actor is derived
+  // from a verified `Authorization: Bearer <token>` credential, NEVER from the
+  // request body — a body-supplied `actor` is ignored as spoofed. Writes require a
+  // valid token (401 otherwise), so only a holder of the issuer's secret can
+  // append attributed events; authz (who may drive/approve/join) keys off the
+  // stamped, trusted actor.
   private async handleEvent(req: Request): Promise<Response> {
+    const actor = await this.verifiedActor(bearerToken(req));
+    if (!actor) return json({ error: "unauthenticated" }, 401);
     const body = (await req.json()) as Partial<Event>;
     if (!body.payload) return json({ error: "missing payload" }, 400);
-    // STUB: actor taken from the body, NOT authenticated. See the TODO above.
-    const ev = this.append(body.at ?? nowRfc3339(), body.actor, body.payload as Payload);
+    const ev = this.append(body.at ?? nowRfc3339(), actor, body.payload as Payload);
     return json({ seq: ev.seq, head: this.head() });
+  }
+
+  // Verify a token against the issuer secret, returning the attested actor (or
+  // `null` = unauthenticated). Fails CLOSED: with no `ACTOR_TOKEN_SECRET`
+  // configured there's nothing to verify against, so no actor can be attested.
+  private async verifiedActor(token: string | null): Promise<Actor | null> {
+    const secret = this.env.ACTOR_TOKEN_SECRET;
+    if (!secret || !token) return null;
+    return verifyActorToken(token, secret);
   }
 
   // Attributed input — the durable steer, then driven into the container. The
@@ -103,15 +112,20 @@ export class SessionGateway extends Agent<Env> {
   // (the one unmeasured managed-tier risk), and the result is appended as a §0
   // event (seq N+1) so a subscriber sees the round-trip: input → output.
   private async handleInput(req: Request): Promise<Response> {
-    const body = (await req.json()) as { text?: string; target?: string; mode?: string; actor?: unknown };
+    // Driving is attributed + authenticated: the steer is stamped with the
+    // verified actor (the body's `actor` is ignored), 401 without a valid token.
+    // (Driver-token arbitration — who is *allowed* to drive — is milestone 4;
+    // this establishes who the driver *is*.)
+    const actor = await this.verifiedActor(bearerToken(req));
+    if (!actor) return json({ error: "unauthenticated" }, 401);
+    const body = (await req.json()) as { text?: string; target?: string; mode?: string };
     const payload: Payload = {
       type: "input",
       text: body.text ?? "",
       target: (body.target as "agent" | "pty" | "exec") ?? "exec",
       mode: (body.mode as "live" | "turn") ?? "turn",
     };
-    // STUB: no driver-token arbitration (milestone 4).
-    const inEv = this.append(nowRfc3339(), body.actor, payload);
+    const inEv = this.append(nowRfc3339(), actor, payload);
     // Drive the container only when one is bound (the container config). On the
     // free/§0-only deploy there's no Sandbox binding, so `/input` is append-only
     // — the attributed-input §0 path still works, just without the exec hop.
@@ -155,9 +169,11 @@ export class SessionGateway extends Agent<Env> {
     this.appendExec(opId, "error", lastErr);
   }
 
-  // Append the container exec's outcome as a §0 tool_call event (fans out to subscribers).
+  // Append the container exec's outcome as a §0 tool_call event (fans out to
+  // subscribers). The gateway originated this (the container hop), so it's stamped
+  // `system`, not the driver's actor.
   private appendExec(opId: string, status: string, output: string): void {
-    this.append(nowRfc3339(), undefined, {
+    this.append(nowRfc3339(), SYSTEM_ACTOR, {
       type: "tool_call",
       toolCallId: opId,
       name: "exec",
@@ -175,21 +191,23 @@ export class SessionGateway extends Agent<Env> {
   // accepts + hibernates the WebSocket for us (no WebSocketPair / acceptWebSocket
   // / 101 plumbing). We replay from `from` and record the cursor on the connection.
   //
-  // TODO(actor-stamping — the next slice, NOT this task): this is the WS half of
-  // the same trust boundary as handleEvent. The connection's actor must be
-  // derived from a verified credential on `ctx.request` (a bearer/signed token on
-  // the upgrade, e.g. a query/header/subprotocol carrying the control-plane-minted
-  // token), verified here, and bound to the connection (e.g. in WsState) so any
-  // /input or /event arriving on this socket is stamped with the connection's
-  // authenticated actor — never a body-supplied one. See handleEvent's TODO.
+  // The WS half of the same trust boundary as handleEvent. The connection's actor
+  // is derived from a verified `?token=` on the upgrade URL (browsers can't set
+  // headers on a WS handshake, so the credential rides the query) and bound to the
+  // connection in WsState — so a future socket-driven /input is stamped with the
+  // connection's authenticated actor, never a body-supplied one. Reads stay open:
+  // an anonymous subscriber (no/invalid token) may watch, just with `actor`
+  // undefined; it's the WRITE paths that require attestation.
   async onConnect(connection: Connection<WsState>, ctx: ConnectionContext): Promise<void> {
-    const from = Number(new URL(ctx.request.url).searchParams.get("from") ?? "0");
+    const url = new URL(ctx.request.url);
+    const actor = (await this.verifiedActor(url.searchParams.get("token"))) ?? undefined;
+    const from = Number(url.searchParams.get("from") ?? "0");
     let cursor = from - 1;
     for (const ev of this.readFrom(from)) {
       connection.send(JSON.stringify(ev));
       cursor = ev.seq;
     }
-    connection.setState({ role: "subscriber", cursor });
+    connection.setState({ role: "subscriber", cursor, actor });
   }
 
   // Optional re-replay on a {"from":N} client message (reconnect-from-seq).
@@ -203,7 +221,8 @@ export class SessionGateway extends Agent<Env> {
           connection.send(JSON.stringify(ev));
           cursor = ev.seq;
         }
-        connection.setState({ role: "subscriber", cursor });
+        // Preserve the connection's authenticated actor across a re-replay.
+        connection.setState({ ...(connection.state ?? { role: "subscriber" }), cursor });
       }
     } catch {
       /* ignore non-JSON pings */

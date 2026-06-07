@@ -1,0 +1,2 @@
+# Copy to .dev.vars (gitignored) for `wrangler dev`. Set via `wrangler secret put` in prod.
+ACTOR_TOKEN_SECRET=replace-with-a-random-secret

@@ -47,10 +47,16 @@ def kypp_python() -> str:
 
 
 def record(py: str, project: str, ops: list) -> None:
-    """Append routing-outcome claims to kypp via the shared seed runner."""
+    """Append routing-outcome claims to kypp via the shared seed runner. (Own copy:
+    cost-router is in scripts/router/, so it can't same-dir-import scripts/eval/memory's
+    _kypp; it reaches _seed_runner.py as a subprocess path instead — see SEED_RUNNER.)"""
     env = {**os.environ, "KYPP_PROJECT": project}
-    subprocess.run([py, SEED_RUNNER, project], input=json.dumps(ops), text=True,
-                   env=env, check=True, capture_output=True)
+    p = subprocess.run([py, SEED_RUNNER, project], input=json.dumps(ops), text=True,
+                       env=env, capture_output=True)
+    if p.returncode != 0:
+        # Surface the child's diagnostic — a swallowed outcome-record failure would
+        # silently desync the learned routing policy from what actually happened.
+        raise RuntimeError(f"_seed_runner failed (project={project}): {p.stderr.strip()}")
 
 
 def recall_adequacy(klass: str, project: str) -> dict:
@@ -58,6 +64,10 @@ def recall_adequacy(klass: str, project: str) -> dict:
     {model: {"adequate": bool, "failed": bool}} from `route/<class>/<model>` claims:
     an ACCEPTED fact (corroborated ≥2 passes) → adequate; a pitfall → failed."""
     env = {**os.environ, "KYPP_PROJECT": project}
+    # The route/<class>/ prefix filter below keeps this correct regardless of recall
+    # ranking; the --limit 200 cap only bites if ONE project accumulates >200 route
+    # claims AND a relevant one ranks below the cap — then an adequate model is missed
+    # and re-explored (a cost regression, not a wrong answer). Raise it if that happens.
     p = subprocess.run(["kypp", "recall", klass, "--candidates", "--json",
                         "--project", project, "--limit", "200"],
                        env=env, capture_output=True, text=True)
@@ -102,6 +112,11 @@ class Pillbox:
     def _json(self, args, timeout):
         p = subprocess.run([self.pillbox, *args], capture_output=True, text=True,
                            env=self.env, timeout=timeout)
+        if p.returncode != 0:
+            # Surface the real CLI error. An infra failure (image missing, daemon down)
+            # propagates and aborts the route loop loudly — it is NOT recorded as a
+            # model verdict, so it can't poison the learned routing policy.
+            raise RuntimeError(f"pillbox {' '.join(args[:2])} failed (exit {p.returncode}): {p.stderr.strip()[:300]}")
         return json.loads(p.stdout)
 
     @contextmanager
@@ -121,14 +136,18 @@ class Pillbox:
                                capture_output=True, env=self.env, timeout=60)
 
     def drive(self, sid: str, prompt: str):
-        subprocess.run([self.pillbox, "session", "send", sid, prompt],
-                       capture_output=True, env=self.env, timeout=60)
+        # A failed `send` must NOT be scored as a model failure (it would record a
+        # spurious pitfall and desync the policy). Fail loud → aborts this route.
+        s = subprocess.run([self.pillbox, "session", "send", sid, prompt],
+                           capture_output=True, text=True, env=self.env, timeout=60)
+        if s.returncode != 0:
+            raise RuntimeError(f"session send failed (exit {s.returncode}): {s.stderr.strip()[:300]}")
         try:
             subprocess.run([self.pillbox, "session", "wait-idle", sid, "--timeout",
                             str(self.max_wait)], capture_output=True, env=self.env,
                            timeout=self.max_wait + 60)
         except subprocess.TimeoutExpired:
-            pass
+            pass  # turn ran long; grade whatever landed (documented tolerance)
 
     def score(self, sid: str, clone: str, rubric: str | None) -> dict:
         args = ["session", "score", sid, "--workspace", clone, "--json"]

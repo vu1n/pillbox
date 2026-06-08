@@ -33,9 +33,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
-import subprocess
 import tempfile
+
+from _kypp import briefing, kypp_python, seed
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT = "memtest"
@@ -193,69 +193,49 @@ def write_family(out: str):
     print(f"\n{len(LEVERS)} memory-lever tasks → {out}")
 
 
-def _kypp_python() -> str:
-    """The interpreter the `kypp` console script runs under (so `import kypp` works)."""
-    kypp = shutil.which("kypp")
-    if not kypp:
-        raise SystemExit("self-test: `kypp` not on PATH")
-    with open(kypp) as f:
-        shebang = f.readline().strip()
-    return shebang[2:].strip() if shebang.startswith("#!") else "python3"
-
-
-def _seed(py: str, db: str, brief_project: str, ops: list) -> None:
-    env = {**os.environ, "KYPP_MEMORY_DB": db, "KYPP_PROJECT": brief_project}
-    subprocess.run([py, os.path.join(HERE, "_seed_runner.py"), brief_project],
-                   input=json.dumps(ops), text=True, env=env, check=True,
-                   capture_output=True)
-
-
-def _briefing(db: str, project: str) -> str:
-    env = {**os.environ, "KYPP_MEMORY_DB": db, "KYPP_PROJECT": project}
-    p = subprocess.run(["kypp", "briefing", "--project", project],
-                       env=env, capture_output=True, text=True)
-    return p.stdout
-
-
 def self_test() -> int:
     """No agent: prove the experiment is sound. For each lever — (1) the answer is NOT
     in the workspace (out-of-band integrity), (2) after seeding, the brief surfaces the
     intended value and NOT the wrong one (the lever actually works at the kypp level).
     If this fails, no agent run is worth doing."""
-    py = _kypp_python()
+    py = kypp_python()
     ok = True
     for spec in LEVERS:
         lever = spec["lever"]
+        # Per-lever flag so one early failure doesn't suppress the ✓ of later sound
+        # levers (the global pass/fail is the AND of these).
+        lever_ok = True
         # (1) out-of-band integrity: no present/absent token already in the workspace.
         blob = spec["workspace"]
         for v in spec["present"] + spec["absent"]:
             if v in blob:
                 print(f"  ✗ {lever}: token {v!r} is IN the workspace — not out-of-band")
-                ok = False
+                lever_ok = False
 
         with tempfile.TemporaryDirectory() as tmp:
             db = os.path.join(tmp, "k.db")
-            _seed(py, db, PROJECT, spec["seed"])
-            brief = _briefing(db, PROJECT)
+            seed(py, db, PROJECT, spec["seed"])
+            brief = briefing(db, PROJECT)
 
             if spec["metric"] == "lift":
                 for v in spec["present"]:
                     if v not in brief:
                         print(f"  ✗ {lever}: brief MISSING expected {v!r} — lever broken at kypp level")
-                        print(f"      brief was: {brief.strip()[:200]!r}")
-                        ok = False
+                        print(f"      brief was: {brief[:200]!r}")
+                        lever_ok = False
                 for v in spec["absent"]:
                     if v in brief:
                         print(f"  ✗ {lever}: brief LEAKED stale/wrong {v!r} — lever broken")
-                        ok = False
+                        lever_ok = False
             elif spec["metric"] == "false_app":
                 # The wrong value lives in OTHER_PROJECT; THIS project's brief must omit it.
                 for v in spec["absent"]:
                     if v in brief:
                         print(f"  ✗ {lever}: cross-project leak — {v!r} in {PROJECT}'s brief")
-                        ok = False
-            if ok:
+                        lever_ok = False
+            if lever_ok:
                 print(f"  ✓ {lever}: out-of-band + brief correct")
+        ok = ok and lever_ok
     print("\nself-test: " + ("PASS — family is sound, agent runs are warranted" if ok
                               else "FAIL — fix the family before spending agent runs"))
     return 0 if ok else 1

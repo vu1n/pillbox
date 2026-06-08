@@ -36,6 +36,8 @@ import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 
+from _kypp import briefing, kypp_python, seed
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # Irrelevant accepted facts for the distractor arm — plausible project lore that
@@ -56,29 +58,7 @@ class Cfg:
     runner_image: str
     max_wait: int = 240
     trials: int = 1
-    arms: tuple = ("off", "on", "distractor")
-
-
-def kypp_python() -> str:
-    kypp = shutil.which("kypp")
-    if not kypp:
-        raise SystemExit("`kypp` not on PATH")
-    with open(kypp) as f:
-        sb = f.readline().strip()
-    return sb[2:].strip() if sb.startswith("#!") else "python3"
-
-
-def seed(py: str, db: str, brief_project: str, ops: list) -> None:
-    env = {**os.environ, "KYPP_MEMORY_DB": db, "KYPP_PROJECT": brief_project}
-    subprocess.run([py, os.path.join(HERE, "_seed_runner.py"), brief_project],
-                   input=json.dumps(ops), text=True, env=env, check=True, capture_output=True)
-
-
-def briefing(db: str, project: str) -> str:
-    env = {**os.environ, "KYPP_MEMORY_DB": db, "KYPP_PROJECT": project}
-    p = subprocess.run(["kypp", "briefing", "--project", project],
-                       env=env, capture_output=True, text=True)
-    return p.stdout.strip()
+    arms: tuple[str, ...] = ("off", "on", "distractor")
 
 
 def compose(brief: str, prompt: str) -> str:
@@ -99,6 +79,10 @@ class Pillbox:
     def _json(self, args, timeout):
         p = subprocess.run([self.cfg.pillbox, *args], capture_output=True, text=True,
                            env=self.env, timeout=timeout)
+        if p.returncode != 0:
+            # Surface the real CLI error — a non-zero `run`/`info` yields empty stdout,
+            # so a bare json.loads would crash with an opaque JSONDecodeError instead.
+            raise RuntimeError(f"pillbox {' '.join(args[:2])} failed (exit {p.returncode}): {p.stderr.strip()[:300]}")
         return json.loads(p.stdout)
 
     @contextmanager
@@ -118,14 +102,19 @@ class Pillbox:
                                capture_output=True, env=self.env, timeout=60)
 
     def drive(self, sid: str, prompt: str):
-        subprocess.run([self.cfg.pillbox, "session", "send", sid, prompt],
-                       capture_output=True, env=self.env, timeout=60)
+        # A failed `send` (dead session, transport hiccup) must NOT be scored as a real
+        # negative — it would inflate the off-arm floor / poison a routing verdict. Fail
+        # loud; the caller records it as an errored cell, not applied=False.
+        s = subprocess.run([self.cfg.pillbox, "session", "send", sid, prompt],
+                           capture_output=True, text=True, env=self.env, timeout=60)
+        if s.returncode != 0:
+            raise RuntimeError(f"session send failed (exit {s.returncode}): {s.stderr.strip()[:300]}")
         try:
             subprocess.run([self.cfg.pillbox, "session", "wait-idle", sid, "--timeout",
                             str(self.cfg.max_wait)], capture_output=True, env=self.env,
                            timeout=self.cfg.max_wait + 60)
         except subprocess.TimeoutExpired:
-            pass
+            pass  # turn ran long; grade whatever landed (documented tolerance)
 
     def score_cmd(self, sid: str, clone: str) -> dict:
         return self._json(["session", "score", sid, "--workspace", clone, "--cmd",
@@ -184,12 +173,13 @@ def run_cell(pb: Pillbox, py: str, task: dict, arm: str) -> dict:
             return {"applied": False, "score": 0.0, "brief_len": len(brief), "error": str(e)}
 
 
-def dry_run(py: str, tasks: list[dict]):
+def dry_run(py: str, tasks: list[dict], arms: tuple[str, ...]):
     """No agent: seed each arm, build the brief, print the composed prompt. Confirms
-    the seed→brief→prompt plumbing end-to-end before spending VMs."""
+    the seed→brief→prompt plumbing end-to-end before spending VMs. Honors --arms so
+    the dry-run exercises exactly the arms a real run would."""
     for task in tasks:
         print(f"\n===== {task['lever']} (metric={task['metric']}, brief_project={task['brief_project']}) =====")
-        for arm in ("off", "on", "distractor"):
+        for arm in arms:
             with tempfile.TemporaryDirectory() as tmp:
                 db = os.path.join(tmp, "k.db")
                 ops = arm_ops(task, arm)
@@ -211,16 +201,23 @@ def report(artifact: dict):
     print()
     for lever, row in artifact["levers"].items():
         if row["metric"] == "lift":
-            off = row["arms"].get("off", {}).get("app_rate", 0.0)
-            on = row["arms"].get("on", {}).get("app_rate", 0.0)
+            # A verdict needs both off (the floor) and on (the effect) actually run;
+            # a missing arm is NOT a 0.0 rate — skip rather than fabricate.
+            if "off" not in row["arms"] or "on" not in row["arms"]:
+                print(f"  {lever:14s} (need both off+on arms for a lift verdict — skipped)")
+                continue
+            off = row["arms"]["off"]["app_rate"]
+            on = row["arms"]["on"]["app_rate"]
             verdict = ("MEMORY WORKS" if (on - off) > 0.5 and off < 0.25 else
                        "TASK LEAKS (off too high)" if off >= 0.25 else
                        "weak/no effect")
             print(f"  {lever:14s} lift(on−off)={on - off:+.3f}  → {verdict}")
         else:  # scope: the grader passes when there's NO leak, so app_rate is the
                # scope-HELD rate; the leak rate is its complement.
-            held = row["arms"].get("on", {}).get("app_rate", 0.0)
-            leak = round(1 - held, 3)
+            if "on" not in row["arms"]:
+                print(f"  {lever:14s} (need the on arm for a scope verdict — skipped)")
+                continue
+            leak = round(1 - row["arms"]["on"]["app_rate"], 3)
             print(f"  {lever:14s} leak_rate(on)={leak:.3f}  → {'SCOPE HOLDS' if leak < 0.25 else 'CROSS-PROJECT LEAK'}")
 
 
@@ -246,11 +243,11 @@ def main():
     if not tasks:
         raise SystemExit(f"no tasks under {args.tasks} (run gen-memory-tasks.py first)")
 
+    arms = tuple(args.arms.split(","))
     if args.dry_run:
-        dry_run(py, tasks)
+        dry_run(py, tasks, arms)
         return
 
-    arms = tuple(args.arms.split(","))
     cfg = Cfg(pillbox=args.pillbox, model=args.model, runner_image=args.runner_image,
               max_wait=args.max_wait, trials=args.trials, arms=arms)
     pb = Pillbox(cfg)

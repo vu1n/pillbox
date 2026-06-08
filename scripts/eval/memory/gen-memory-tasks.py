@@ -158,13 +158,20 @@ LEVERS = [
 
 def grade_script(present: list[str], absent: list[str]) -> str:
     """A tiny, near-binary host grader: every `present` token must appear in the edited
-    workspace and no `absent` token may. Excludes grade.sh itself (it names the tokens,
-    which would self-match under grep -r)."""
+    workspace and no `absent` token may. Excludes grade.sh itself — it names every token
+    in its own grep lines, so without the exclude it self-matches under grep -r.
+
+    Flag order matters and is portable-critical: --exclude MUST precede the pattern, and
+    the pattern is given with -e (not after `--`). BSD/macOS grep — which is what runs on
+    the host `session score --cmd` path — stops parsing options at `--` and at the first
+    non-option, so the original `grep -F -- 'tok' . --exclude=grade.sh` treated --exclude
+    as a filename and grepped grade.sh itself. (GNU grep permutes args and tolerated it,
+    which is why this only failed live on macOS.)"""
     lines = ["#!/bin/sh", "# Auto-generated. Exit 0 = memory correctly applied.", "miss=0"]
     for v in present:
-        lines.append(f"grep -rqF -- '{v}' . --exclude=grade.sh || {{ echo 'missing: {v}'; miss=1; }}")
+        lines.append(f"grep -rqF --exclude=grade.sh -e '{v}' . || {{ echo 'missing: {v}'; miss=1; }}")
     for v in absent:
-        lines.append(f"if grep -rqF -- '{v}' . --exclude=grade.sh; then echo 'leaked (should be absent): {v}'; miss=1; fi")
+        lines.append(f"if grep -rqF --exclude=grade.sh -e '{v}' . ; then echo 'leaked (should be absent): {v}'; miss=1; fi")
     lines += ['[ "$miss" = 0 ] && { echo ok; exit 0; }', "exit 1", ""]
     return "\n".join(lines)
 

@@ -231,3 +231,30 @@ The substrate is done. What's missing is **discipline** (3 splits, headroom scre
 temp-0, pairing) + a **durable stats artifact** — and, before any of it, the **§5
 sensitivity check** proving the rig can see a planted lift. That check is the gate
 before the gate.
+
+## 6. Second deep-research pass (2026-06-08) — arm deltas + a rig-validity gap
+
+A literature-only pressure-test (101 agents, 19 sources, 22/25 claims confirmed;
+`tasks/wn1e3j40m.output`) independently re-derived this gate and changed three priors.
+None reverse the parked decision — the recommended 3-arm bakeoff was already run here
+(§5: σ̂=0.346 on hosted glm → lift unmeasurable); the blocker remains the variance
+**regime**, not a missing harness.
+
+- **Downgrade frontier→cheap model is now REFUTED, not just unproven.** Both supporting
+  claims died in 3-vote verification (Databricks "90× cheaper, beat Opus"; GEPA
+  coding-skills cross-harness transfer). Shopify's downgrade was classification/extraction;
+  the cross-model-transfer premise has zero surviving support for coding. Drop the arm.
+- **ACE is now a mandatory arm, and our rig under-represents it.** ACE (arXiv 2510.04618)
+  beats GEPA +11.9% on AppWorld and +14.8% with NO labels (execution feedback only), and
+  names GEPA's "brevity bias" as a failure mode for program synthesis / multi-step agents.
+  **`gate.py`'s `ace` arm is a STATIC-PLAYBOOK PREPEND, not real ACE** (runtime context
+  evolution: a Reflector that grows the playbook from execution feedback via incremental,
+  non-collapsing deltas). A null "ace" result in the current rig must NOT be read as "ACE
+  doesn't help." Upgrading to a true evolving-context arm is **gated behind the
+  deterministic-worker retry** — don't build it while σ̂ is unmeasurable (would be
+  polishing a rig whose blocker is variance, not arm fidelity).
+- **Reward integrity is the quantified real risk.** Binary test-pass is Goodhart-leaky:
+  21.8% (Claude-3.7) – 33% (GPT-4o) of patches passing model-generated tests fail hidden
+  tests, and refining against those tests makes overfitting WORSE (arXiv 2511.16858). The
+  hidden-grader + `score`-vs-`done` separation is the correct defense; the rubric (rich
+  per-criterion textual feedback) is what justifies GEPA over a scalar optimizer at all.

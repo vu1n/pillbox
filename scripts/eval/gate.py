@@ -4,7 +4,15 @@
 WHAT it measures: does an instruction layer lift a small WORKER model over baseline,
 on a held-out split, via pillbox's verifiable rubric-graded reward? Three arms:
   baseline — worker model, task prompt only.
-  ace      — worker + a curated playbook prepended.
+  ace      — worker + a curated playbook prepended.  ⚠ STATIC-PLAYBOOK PROXY, not
+             real ACE (arXiv 2510.04618): true ACE *evolves* the playbook at runtime
+             from execution feedback via a Reflector, with incremental non-collapsing
+             deltas. The 2026-06-08 deep-research pass elevated ACE to a mandatory arm
+             (beats GEPA +11.9% on AppWorld; +14.8% with NO labels). DO NOT read a
+             null "ace" result here as "ACE doesn't help" — this arm doesn't implement
+             ACE's mechanism. Upgrade to a real evolving-context arm before trusting
+             any ACE verdict (gated behind the deterministic-worker retry — see the
+             optimization-layer-verdict memory and docs/optimization-eval-family.md §6).
   gepa     — worker + a profile a (frontier) REFLECTOR distilled from train failures.
 Teacher→student: --worker-model and --reflector-model are separate, so the cheap
 worker does the volume and the frontier model is spent only at distill time.
@@ -266,7 +274,9 @@ def run_gate(cfg: Config, run_id: str, ts: str) -> dict:
                   "Refusing to run a profile-less arm and mislabel the noise as a lift. ==")
         ace = None
         if playbook:
-            print("== ACE / playbook (held) ==")
+            # NOTE: static-playbook proxy, NOT real ACE runtime context evolution.
+            # A null result here ≠ "ACE doesn't help" (see module docstring).
+            print("== ACE / playbook (held) [STATIC-PLAYBOOK PROXY — not real ACE] ==")
             ace = eval_arm(pb, "ace", held, playbook, cfg.worker_model, tmp, cfg.trials, P)
 
     return {

@@ -39,8 +39,7 @@ from statistics import mean
 
 # Reuse the proven pillbox substrate (the run→score→tasks loop) from the gate rig.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "eval"))
-from gate import Config as SubstrateConfig  # noqa: E402
-from gate import Pillbox, _task_dir, bookmarks, graded_run  # noqa: E402
+from gate import Pillbox, SubstrateConfig, _task_dir, bookmarks, graded_run  # noqa: E402
 
 # Relative cost per task-run by model — the knob the router optimizes against.
 # Local ≈ compute-only; hosted tiers are illustrative $ ratios (tune to reality).
@@ -113,13 +112,10 @@ class GhostConfig:
 
 
 def run_ghost(cfg: GhostConfig, policies: list[str]) -> dict:
-    # The substrate wrapper wants its own Config shape; worker model is per-policy,
-    # so leave it blank here (run_policy passes the routed model into graded_run).
-    sub = SubstrateConfig(
-        pillbox=cfg.pillbox, worker_model="", reflector_model="",
-        task_set=cfg.task_set, evals_pillbox=cfg.evals_pillbox, trials=cfg.trials,
-        max_wait=cfg.max_wait, runner_image=cfg.runner_image,
-    )
+    # The substrate only needs these 5; the routed model is per-policy (run_policy passes
+    # it into graded_run), so there's no worker_model to set here.
+    sub = SubstrateConfig(pillbox=cfg.pillbox, evals_pillbox=cfg.evals_pillbox,
+                          max_wait=cfg.max_wait, runner_image=cfg.runner_image)
     os.environ.setdefault("PILLBOX_LOCAL_MODEL_PORT", str(cfg.local_model_port))
     pb = Pillbox(sub)
     held = bookmarks(pb, cfg.task_set, "held-out")

@@ -54,17 +54,27 @@ REFLECT_PROMPT = (
 )
 
 
+# The 5 fields the Pillbox substrate actually reads (__init__/_json/pull/score + bookmarks).
+# Split out so consumers that only need the substrate (ghost.py, ace.py) construct THIS
+# and don't stub the gate's arm-protocol fields. gate's Config extends it.
 @dataclass
-class Config:
+class SubstrateConfig:
     pillbox: str
-    worker_model: str
-    reflector_model: str
-    task_set: str = "aider"
     evals_pillbox: str = "evals"
-    trials: int = 1
     max_wait: int = 240
     in_sandbox: bool = False
     runner_image: str = "pillbox-runner:l7"
+
+
+@dataclass
+class Config(SubstrateConfig):
+    # gate's three-arm protocol fields (worker/reflector/playbook/…) — NOT read by the
+    # substrate. worker/reflector default "" only to satisfy dataclass field ordering
+    # (base has defaulted fields); main() requires them via argparse, so the default never bites.
+    worker_model: str = ""
+    reflector_model: str = ""
+    task_set: str = "aider"
+    trials: int = 1
     playbook: str = ""
     out: str = "gate-run.json"
     parallel: int = 1   # serial by default; >1 only for LOCAL models (hosted plans throttle concurrent reqs → corrupts scores)

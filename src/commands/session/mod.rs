@@ -1331,7 +1331,10 @@ fn session_started(resolved: &Pillbox, id: &str) -> Result<()> {
     }
     events::emit_session_event(
         resolved,
-        events::EventType::SessionStarted { parent_session_id },
+        events::EventType::SessionStarted {
+            parent_session_id,
+            startup: None,
+        },
         id,
         Some(&stub),
     );

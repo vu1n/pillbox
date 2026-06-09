@@ -23,6 +23,7 @@ use crate::attach::pump;
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
 use crate::sandbox::SandboxBackend;
+use crate::startup::StartupTimer;
 use crate::workspace::WorkspaceBackend;
 
 // VMM substrate kept in the parent module (used here AND by `vmm_child_main`):
@@ -58,14 +59,16 @@ impl SandboxBackend for LibkrunBackend {
 
         // Build the launch packet (rootfs, CoW workspace + creds, env, CA, script,
         // VmSpec). The env-fork guard fails fast inside if a real credential leaked.
+        let mut startup = StartupTimer::start();
         let launch = prepare_launch(spec, &opts, resolved)?;
+        startup.mark("launch_prepare");
 
         // Detach: spawn the VM to outlive the CLI + record the session, then return.
         // libkrun keeps the vault on detach (the MITM lives in the child, not the
         // parent), unlike local Docker. Reattach/teardown go through the session
         // record. Foreground (below) supervises + pumps the terminal inline.
         if opts.detach {
-            return run_detached(spec, resolved, &session_id, &opts, launch);
+            return run_detached(spec, resolved, &session_id, &opts, launch, startup);
         }
 
         // §0: tail the agent's transcript from the host-side creds clone into the
@@ -119,14 +122,44 @@ impl SandboxBackend for LibkrunBackend {
             use std::io::Write as _;
             let _ = sin.write_all(blob.as_bytes());
         }
+        startup.mark("vmm_spawn");
 
         // Poll the listener until the guest pty-host dials in (across VM boot), then
         // run the shared terminal pump. Capture the result rather than `?` so the
         // teardown runs on every path (a failed accept/pump must not leak clones).
-        let outcome = accept_attach(&listener, &mut child).and_then(|stream| {
-            let write_half = stream.try_clone().context("clone attach stream")?;
-            pump::attach_terminal(stream, write_half, false)
-        });
+        let outcome = match accept_attach(&listener, &mut child) {
+            Ok(stream) => {
+                startup.mark("attach_ready");
+                let started_session = crate::session::Session {
+                    id: session_id.clone(),
+                    label: None,
+                    backend: crate::session::BACKEND_LIBKRUN.to_string(),
+                    sandbox_id: String::new(),
+                    pty_pid: 0,
+                    agent_id: spec.id.to_string(),
+                    started_at: crate::session::now_rfc3339(),
+                    attached_pid: Some(std::process::id() as i64),
+                    base_snapshot: None,
+                    result_snapshot: None,
+                    expires_at: None,
+                    guest_cwd: launch.guest_workspace.clone(),
+                    server: None,
+                };
+                let startup_metrics = startup.finish("host_started_event");
+                crate::events::emit_session_event(
+                    resolved,
+                    crate::events::EventType::SessionStarted {
+                        parent_session_id: crate::events::parent_session_id_from_env(),
+                        startup: Some(startup_metrics),
+                    },
+                    &started_session.id,
+                    Some(&started_session),
+                );
+                let write_half = stream.try_clone().context("clone attach stream")?;
+                pump::attach_terminal(stream, write_half, false)
+            }
+            Err(e) => Err(e),
+        };
         let _ = child.wait();
         // Final drain of the agent's last transcript lines into the SessionLog.
         if let Some(tailer) = tailer {
@@ -533,6 +566,7 @@ fn run_detached(
     session_id: &str,
     opts: &RunOpts,
     launch: Launch,
+    mut startup: StartupTimer,
 ) -> Result<()> {
     // The child reads the spec at startup, *after* we return — so persist it (a
     // `NamedTempFile` would delete on drop); `kill_session` removes it.
@@ -560,6 +594,7 @@ fn run_detached(
         use std::io::Write as _;
         let _ = sin.write_all(blob.as_bytes());
     }
+    startup.mark("vmm_spawn");
 
     let handle = LibkrunHandle {
         sock: launch.attach_sock.to_string_lossy().into_owned(),
@@ -584,6 +619,16 @@ fn run_detached(
         server: None,
     };
     crate::session::write(resolved, &session)?;
+    let startup_metrics = startup.finish("session_record");
+    crate::events::emit_session_event(
+        resolved,
+        crate::events::EventType::SessionStarted {
+            parent_session_id: crate::events::parent_session_id_from_env(),
+            startup: Some(startup_metrics),
+        },
+        &session.id,
+        Some(&session),
+    );
     // Don't wait: the child (VM + egress + MITM, with the vault) is reparented to
     // init and keeps running.
     println!(
@@ -644,6 +689,7 @@ fn launch_server_vm(
     resolved: &Pillbox,
     launch: ServerLaunch,
 ) -> Result<()> {
+    let mut startup = StartupTimer::start();
     // Non-vault: refuse --vault / vaulted --with before anything else (the shared
     // base would otherwise compose them into the guest env).
     let withs = resolve_with_entries(resolved, &opts.withs)?;
@@ -731,6 +777,7 @@ fn launch_server_vm(
     serde_json::to_writer(&spec_file, &vmspec).context("write VMM spec")?;
     // The child reads the spec after we return (detached) — persist it.
     let (_, spec_path) = spec_file.keep().context("persist VMM spec")?;
+    startup.mark("launch_prepare");
 
     // Spawn the VM detached (it runs the server + relay, reparented to init).
     let exe = std::env::current_exe().context("locate the pillbox binary to re-exec as VMM")?;
@@ -750,6 +797,7 @@ fn launch_server_vm(
         let _ = sin.write_all(b"[]");
     }
     let pid = child.id() as i32;
+    startup.mark("vmm_spawn");
 
     let session_id = crate::session::Session::new_id();
     let http = http::LibkrunHttp::new(host_sock.clone());
@@ -759,6 +807,7 @@ fn launch_server_vm(
     // down rather than leaking it + the clones.
     let built = (|| -> Result<crate::session::Session> {
         let agent_session_id = (launch.bringup)(&http)?;
+        startup.mark("server_ready");
         let handle = LibkrunHandle {
             sock: host_sock.to_string_lossy().into_owned(),
             pid,
@@ -786,6 +835,7 @@ fn launch_server_vm(
             }),
         };
         crate::session::write(resolved, &session)?;
+        let startup_metrics = startup.finish("session_record");
         // --memory + server: this session is reparented, so its §0 log drains on `session ingest`,
         // AFTER bring-up returns — dispatch-time capture would race an empty log. Stash the brief in
         // the session dir for ingest to capture + record briefed-claim usage from. Best-effort.
@@ -809,6 +859,7 @@ fn launch_server_vm(
             resolved,
             crate::events::EventType::SessionStarted {
                 parent_session_id: crate::events::parent_session_id_from_env(),
+                startup: Some(startup_metrics),
             },
             &session.id,
             Some(&session),

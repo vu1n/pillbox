@@ -70,6 +70,12 @@ Both `session.started` lines share the same `session_id`; the `emitter`
 attribute (`"host"` / `"sandbox"`) tells them apart. The delta between
 them is sandbox cold-start latency.
 
+Host-emitted `session.started` events also include launch timing fields when
+the backend can measure them: `startup_ms` is the host-side total, and
+`startup_stages` is an ordered array of `{name, duration_ms}` stage timings.
+Foreground runs emit this event even though they do not persist a session
+record, so `pillbox session events --json` is the baseline measurement surface.
+
 ### OTLP shape
 
 - **Session spans:** one per run, opened up-front by whichever pillbox

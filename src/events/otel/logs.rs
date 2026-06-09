@@ -129,6 +129,7 @@ fn attr_to_otel(v: AttrValue) -> opentelemetry::logs::AnyValue {
     match v {
         AttrValue::Str(s) => opentelemetry::logs::AnyValue::String(s.into()),
         AttrValue::Int(i) => opentelemetry::logs::AnyValue::Int(i),
+        AttrValue::Json(j) => opentelemetry::logs::AnyValue::String(j.to_string().into()),
     }
 }
 
@@ -175,6 +176,7 @@ mod tests {
         for ty in [
             EventType::SessionStarted {
                 parent_session_id: None,
+                startup: None,
             },
             EventType::SessionCompleted {
                 exit_code: None,
@@ -234,6 +236,7 @@ mod tests {
         let session = Session::test_fixture();
         let ty = EventType::SessionStarted {
             parent_session_id: None,
+            startup: None,
         };
         let attrs = build_attributes(&ty, "abc123def456", Some(&session));
         fill_log_record(&mut record, &ty, attrs);

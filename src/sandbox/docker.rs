@@ -17,6 +17,7 @@ use crate::agents::{
 use crate::attach::pump::{self, Outcome};
 use crate::pillbox::Pillbox;
 use crate::session::{self, Session, BACKEND_DOCKER};
+use crate::startup::StartupTimer;
 use crate::workspace::WorkspaceBackend;
 use crate::{docker, errors::PillboxError};
 
@@ -61,7 +62,9 @@ impl SandboxBackend for DockerBackend {
         if spec.integration == Integration::Server {
             return run_server(spec, opts, resolved);
         }
+        let mut startup = StartupTimer::start();
         let runner_image = docker::check_ready_for(resolved)?;
+        startup.mark("docker_preflight");
 
         let home = spec.home_dir(resolved)?;
         if !home.join(spec.cred_sentinel).exists() {
@@ -72,6 +75,7 @@ impl SandboxBackend for DockerBackend {
             .with_next(format!("pillbox auth login --agent {}", spec.id))
             .into());
         }
+        startup.mark("auth_check");
 
         let workspace_host = match &opts.workspace {
             Some(p) => p.clone(),
@@ -86,6 +90,7 @@ impl SandboxBackend for DockerBackend {
         // Kept for the transcript tailer's scope-dir derivation; the
         // original is moved into the docker args below.
         let guest_cwd = guest_workspace.clone();
+        startup.mark("workspace_prepare");
 
         if opts.vault && !spec.vault_capable {
             return Err(PillboxError::usage(
@@ -185,6 +190,7 @@ impl SandboxBackend for DockerBackend {
         };
 
         let env_vars = resolve_run_env(resolved, &opts, &withs_resolved, vault_session.as_mut())?;
+        startup.mark("env_prepare");
 
         // Bind `mcp` (rather than letting the expression be the
         // tail of an if-let in the args build) so the tempfile
@@ -270,9 +276,11 @@ impl SandboxBackend for DockerBackend {
         // bind-mounted home before the container starts, so an interactive run
         // doesn't stall on the gate (claude runs with cwd `guest_cwd`).
         spec.prepare_workspace_or_warn(&home, &guest_cwd);
+        startup.mark("agent_prepare");
 
         let run_started = SystemTime::now();
         let container = docker::run_detached(&args)?;
+        startup.mark("container_start");
 
         if opts.detach {
             // vault was rejected above, so there's no host-side proxy to keep
@@ -294,10 +302,12 @@ impl SandboxBackend for DockerBackend {
                 server: None,
             };
             session::write(resolved, &session)?;
+            let startup_metrics = startup.finish("session_record");
             crate::events::emit_session_event(
                 resolved,
                 crate::events::EventType::SessionStarted {
                     parent_session_id: crate::events::parent_session_id_from_env(),
+                    startup: Some(startup_metrics),
                 },
                 &session.id,
                 Some(&session),
@@ -324,6 +334,31 @@ impl SandboxBackend for DockerBackend {
         // SIGKILL still bypasses Drop; that residual orphan is the lifecycle
         // follow-up, alongside the ssh remote-container reap.)
         let _container = ContainerGuard(container.clone());
+        let started_session = Session {
+            id: session_id.clone(),
+            label: None,
+            backend: BACKEND_DOCKER.to_string(),
+            sandbox_id: container.clone(),
+            pty_pid: 0,
+            agent_id: spec.id.to_string(),
+            started_at: session::now_rfc3339(),
+            attached_pid: Some(std::process::id() as i64),
+            base_snapshot: None,
+            result_snapshot: None,
+            expires_at: None,
+            guest_cwd: guest_cwd.clone(),
+            server: None,
+        };
+        let startup_metrics = startup.finish("host_started_event");
+        crate::events::emit_session_event(
+            resolved,
+            crate::events::EventType::SessionStarted {
+                parent_session_id: crate::events::parent_session_id_from_env(),
+                startup: Some(startup_metrics),
+            },
+            &started_session.id,
+            Some(&started_session),
+        );
 
         // Open the root `session` span up-front + start live transcript
         // streaming. The agent's `$HOME` is bind-mounted from the host
@@ -383,7 +418,9 @@ impl SandboxBackend for DockerBackend {
 /// with `session send`. Always "background server" — `--detach` is implicit.
 fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
     let action = "run";
+    let mut startup = StartupTimer::start();
     let runner_image = docker::check_ready_for(resolved)?;
+    startup.mark("docker_preflight");
 
     let home = spec.home_dir(resolved)?;
     if !home.join(spec.cred_sentinel).exists() {
@@ -394,6 +431,7 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
         .with_next(format!("pillbox auth login --agent {}", spec.id))
         .into());
     }
+    startup.mark("auth_check");
     // opencode has no vault integration (`vault_capable: false`); refuse rather
     // than silently hand the agent a stub it would ship to the provider.
     if opts.vault {
@@ -423,6 +461,7 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
     let workspace_name = workspace_mount_name(&workspace_host, opts.name.as_deref())?;
     let guest_workspace = format!("{GUEST_WORKSPACE}/{workspace_name}");
     let env_vars = resolve_run_env(resolved, &opts, &withs_resolved, None)?;
+    startup.mark("workspace_env_prepare");
 
     // Detached container (no `-d` reap guard — the server outlives the CLI and
     // is reaped by `session rm`). No pty-host: the command IS `opencode serve`.
@@ -447,6 +486,7 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
     args.extend(super::opencode::serve_args());
 
     let container = docker::run_detached(&args)?;
+    startup.mark("container_start");
     let http = super::http::DockerHttp::new(container.clone(), super::opencode::SERVE_PORT);
     let model = opts
         .model
@@ -459,6 +499,7 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
     let built = (|| -> Result<Session> {
         super::opencode::wait_ready(&http)?;
         let ocid = super::opencode::create_session(&http)?;
+        startup.mark("server_ready");
         let session = Session {
             id: Session::new_id(),
             label: opts.label.clone(),
@@ -479,10 +520,12 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
             }),
         };
         session::write(resolved, &session)?;
+        let startup_metrics = startup.finish("session_record");
         crate::events::emit_session_event(
             resolved,
             crate::events::EventType::SessionStarted {
                 parent_session_id: crate::events::parent_session_id_from_env(),
+                startup: Some(startup_metrics),
             },
             &session.id,
             Some(&session),

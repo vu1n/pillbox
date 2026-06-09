@@ -52,6 +52,7 @@ fn attr_to_json(v: Option<&AttrValue>) -> serde_json::Value {
     match v {
         Some(AttrValue::Str(s)) => serde_json::Value::String(s.clone()),
         Some(AttrValue::Int(i)) => serde_json::Value::Number((*i).into()),
+        Some(AttrValue::Json(j)) => j.clone(),
         None => serde_json::Value::Null,
     }
 }

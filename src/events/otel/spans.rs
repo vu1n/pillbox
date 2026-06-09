@@ -190,6 +190,7 @@ fn span_attributes(attrs: &[(&'static str, Option<AttrValue>)]) -> Vec<KeyValue>
             let value: opentelemetry::Value = match v {
                 AttrValue::Str(s) => s.clone().into(),
                 AttrValue::Int(i) => (*i).into(),
+                AttrValue::Json(j) => j.to_string().into(),
             };
             Some(KeyValue::new(*k, value))
         })
@@ -343,6 +344,7 @@ mod tests {
         let res = sink_emit(
             &EventType::SessionStarted {
                 parent_session_id: None,
+                startup: None,
             },
             "abc123def456",
             &attrs,

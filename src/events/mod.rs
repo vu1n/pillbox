@@ -40,6 +40,11 @@
 //!   "agent_id": "claude",
 //!   "backend": "docker",
 //!   "label": null,
+//!   "startup_ms": 421,
+//!   "startup_stages": [
+//!     { "name": "docker_preflight", "duration_ms": 31 },
+//!     { "name": "container_start", "duration_ms": 390 }
+//!   ],
 //!   // Terminal-event-only fields (null on started / dropped):
 //!   "status": "ok",                        // → OTel status.code ("ok" | "error")
 //!   "reason": null,                        // free-text on failed
@@ -89,6 +94,7 @@ use anyhow::{Context, Result};
 
 use crate::pillbox::Pillbox;
 use crate::session::{self, Session};
+use crate::startup::StartupMetrics;
 
 // codex-serve is libkrun-only (docker rejects it), so the mapper + NDJSON drain
 // are consumed only under that feature (and by tests); allow dead-code otherwise.
@@ -246,6 +252,11 @@ pub(crate) enum EventType {
         /// the wire field `parent_session_id`; `None` for root
         /// sessions.
         parent_session_id: Option<String>,
+        /// Host-side launch timing, present on host-emitted started
+        /// events when the backend can measure it. Sandbox-side
+        /// `session started` emits `None` because it only knows its own
+        /// wall-clock start.
+        startup: Option<StartupMetrics>,
     },
     SessionCompleted {
         exit_code: Option<i32>,
@@ -381,6 +392,7 @@ pub(super) fn current_emitter() -> Emitter {
 pub(super) enum AttrValue {
     Str(String),
     Int(i64),
+    Json(serde_json::Value),
 }
 
 /// Emit one event for a session lifecycle transition. `session` is
@@ -462,10 +474,12 @@ pub(crate) fn build_attributes(
 ) -> Vec<(&'static str, Option<AttrValue>)> {
     let ended_at = (ty.is_terminal() || matches!(ty, EventType::SessionDropped))
         .then(|| AttrValue::Str(session::now_rfc3339()));
-    let parent_session_id = if let EventType::SessionStarted { parent_session_id } = ty {
-        parent_session_id.clone()
-    } else {
-        None
+    let (parent_session_id, startup) = match ty {
+        EventType::SessionStarted {
+            parent_session_id,
+            startup,
+        } => (parent_session_id.clone(), startup.clone()),
+        _ => (None, None),
     };
     let (reason, exit_code, trace_path, result_snapshot) = match ty {
         EventType::SessionCompleted {
@@ -523,6 +537,14 @@ pub(crate) fn build_attributes(
         ("trace_path", trace_path.map(AttrValue::Str)),
         ("result_snapshot", result_snapshot.map(AttrValue::Str)),
         ("base_snapshot", s_opt(|s| s.base_snapshot.as_deref())),
+        (
+            "startup_ms",
+            startup.as_ref().map(|m| AttrValue::Int(m.total_ms)),
+        ),
+        (
+            "startup_stages",
+            startup.map(|m| AttrValue::Json(m.stages_json())),
+        ),
     ]
 }
 
@@ -635,6 +657,13 @@ mod tests {
                 &pb,
                 EventType::SessionStarted {
                     parent_session_id: Some("parent12345".into()),
+                    startup: Some(crate::startup::StartupMetrics {
+                        total_ms: 42,
+                        stages: vec![crate::startup::StartupStage {
+                            name: "container_start".into(),
+                            duration_ms: 42,
+                        }],
+                    }),
                 },
                 &s.id,
                 Some(&s),
@@ -672,6 +701,9 @@ mod tests {
             assert_eq!(started["ended_at"], serde_json::Value::Null);
             assert_eq!(started["status"], "unset");
             assert_eq!(started["version"], EVENT_SCHEMA_VERSION);
+            assert_eq!(started["startup_ms"], 42);
+            assert_eq!(started["startup_stages"][0]["name"], "container_start");
+            assert_eq!(started["startup_stages"][0]["duration_ms"], 42);
             // emitter is always present; defaults to "host" outside
             // a sandbox-side process. Tests run on the host side.
             assert_eq!(started["emitter"], "host");

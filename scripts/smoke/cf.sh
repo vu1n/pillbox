@@ -14,6 +14,10 @@ PORT="${SMOKE_CF_PORT:-8799}"
 [ -f .dev.vars ] || echo "ACTOR_TOKEN_SECRET=dev-secret-for-local-only" >.dev.vars
 
 echo "▶ CF §0 smokes (wrangler dev :$PORT)"
+# §0 contract parity FIRST — pure file-parse, no deps, fails fast before spinning wrangler.
+# Guards "one §0, two backends": contract.ts must stay faithful to contract.rs.
+python3 check-contract-parity.py || { echo "  ✗ §0 contract parity drift (see above)"; exit 1; }
+echo "  ✓ §0 contract parity holds"
 npx tsc --noEmit || { echo "  ✗ tsc --noEmit failed"; exit 1; }
 echo "  ✓ tsc clean"
 

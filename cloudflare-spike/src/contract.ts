@@ -38,14 +38,15 @@ export interface Actor {
 // same camelCase fields. The spike models the variants it exercises; every other
 // `type` is accepted verbatim (forward-compat, == contract.rs Payload::Unknown).
 //
-// NOTE: `input` is NOT in contract.rs::Payload — it's a multiplayer payload
-// spec'd in docs/session-event-log.md (§Payload taxonomy, the durable attributed
-// steer). Kept because the spike's /input path exercises it; flagged as spec.
+// NOTE: `input` and `annotation` ARE now in contract.rs::Payload (added with the
+// multiplayer/actor work); `driver_changed` remains spec-only (docs/session-event-log.md
+// §Payload taxonomy), modeled here because the spike's driver path exercises it.
 export type Payload =
-  // the durable, attributed steer (matches contract.rs::Input). Always a discrete
-  // turn — live keystrokes are the ephemeral Frame::Input, a different path — so no
-  // `mode`. `data` (binary) is deferred both sides; `target` mirrors InputTarget.
-  | { type: "input"; text?: string; data?: string; target: "agent" | "pty" | "exec" }
+  // the durable, attributed steer (matches contract.rs::Input). Always a discrete turn —
+  // live keystrokes are the ephemeral Frame::Input, a different path — so no `mode`.
+  // `target` mirrors InputTarget. (binary `data` is deferred BOTH sides — not a field yet,
+  // so it isn't declared here either; add it to contract.rs::Input first to keep parity.)
+  | { type: "input"; text?: string; target: "agent" | "pty" | "exec" }
   // the async, attributed "chime in" that does NOT drive (matches contract.rs::
   // Annotation) — how a non-driver participates; an orchestrator may inject it as
   // agent context. `anchor` references what it's about (a seq, a path, a message id).

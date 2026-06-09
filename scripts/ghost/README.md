@@ -39,12 +39,12 @@ split the loop never reflects on. This is **not** a quality-lift claim against t
 wall (the parked optimization gate); it's the runtime-memory question the memory matrix
 (`../eval/memory/`) validated at the single-task level, now in a loop.
 
-**The named gap:** the Curator's *remove-harmful* needs a per-claim helpful/harmful
-signal — credit-assignment #2, never built in kypp. The pieces exist (`kypp usage`
-records which claims a run saw; the run has a score), so `ace.py` computes the
-attribution **ghost-side** and reports harmful candidates. Acting on them (supersede)
-is gated behind `--prune-harmful` (off by default — destructive, correlational, needs
-more than one round of evidence).
+**Curator remove-harmful (credit-assignment #2):** `ace.py` computes a per-claim
+helpful/harmful signal **ghost-side** from `kypp usage` (which claims a run saw) + the
+run score, flags harmful candidates, and `kypp reject <handle>` (landed) does the demote
+(status=rejected → dropped from recall/briefing, row preserved). Gated behind
+`--prune-harmful` (off by default — the attribution is correlational, so don't auto-prune
+unsupervised on one round's evidence).
 
 ### Run
 ```sh

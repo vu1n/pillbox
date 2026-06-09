@@ -23,11 +23,11 @@ playbook grows over iterations — does accruing lessons help? It is NOT a quali
 claim against the σ̂ wall (the optimization gate, parked); the held-out signal is the
 accrual question, kept honest by a fixed held-out split the loop never reflects on.
 
-GAP (named, not hidden): the Curator's REMOVE-harmful needs a per-claim helpful/harmful
-signal — credit-assignment #2, never built in kypp. The pieces exist here (kypp usage
-records which claims a run saw; the run has a score), so this loop computes the
-attribution ghost-side and REPORTS harmful candidates; acting on them (supersede) is
-gated behind --prune-harmful (off by default — destructive + needs more than one round).
+Curator REMOVE (credit-assignment #2): a per-claim helpful/harmful signal. kypp records
+which claims a run saw (usage) and the run has a score, so this loop computes the
+attribution ghost-side and flags harmful candidates; `kypp reject <handle>` (landed) does
+the demote. Gated behind --prune-harmful (off by default — the attribution is
+correlational, so don't auto-prune unsupervised on one round's evidence).
 
 Usage:
   python3 ghost/ace.py --train aider --iters 3 --worker-model zai-coding-plan/glm-4.5-air \\
@@ -96,6 +96,13 @@ class Kypp:
                        "--accept-corroboration", "2", "--semantic", "0.25"], timeout=120)
         if p.returncode != 0:
             print(f"    kypp consolidate note: {p.stderr.strip()[:160]}", flush=True)
+
+    def reject(self, handle: str, reason: str):
+        """Curator REMOVE: demote a harmful claim by handle (kypp reject — status=rejected, dropped
+        from recall/briefing, row preserved). Handle is global, so no --project; env scopes the db."""
+        p = self._run(["reject", handle, "--reason", reason], timeout=30)
+        if p.returncode != 0:
+            print(f"    kypp reject note: {p.stderr.strip()[:160]}", flush=True)
 
 
 def compose(brief: str, prompt: str) -> str:
@@ -185,12 +192,13 @@ def run_ace(args) -> dict:
             ky.curate()  # Curator
             attr = attribute(train_runs)
             if args.prune_harmful and attr["harmful_candidates"]:
-                # Acting on these needs a kypp "reject/demote a claim BY HANDLE" verb.
-                # `correct` is subject-keyed (asserts a new value for a SUBJECT) — it can't
-                # target a specific harmful bullet by handle — so we report, never fake a
-                # supersede. Deferred to ship-review: add `kypp reject <handle>` then wire it.
-                print(f"    --prune-harmful: {len(attr['harmful_candidates'])} harmful candidate(s) "
-                      f"flagged but NOT pruned (kypp has no reject-by-handle verb): {attr['harmful_candidates']}")
+                # Curator REMOVE — now real (kypp reject <handle> landed): demote each harmful
+                # claim out of recall/briefing. Still gated off by default: the attribution is
+                # correlational, so one round's evidence shouldn't auto-prune unsupervised.
+                print(f"    --prune-harmful: rejecting {len(attr['harmful_candidates'])} harmful candidate(s): "
+                      f"{attr['harmful_candidates']}")
+                for h in attr["harmful_candidates"]:
+                    ky.reject(h, f"ACE attribution ({args.train}): correlated with failed runs")
 
             iterations.append({"iter": it, "held_quality": held_q,
                                "harmful_candidates": attr["harmful_candidates"],
@@ -267,7 +275,7 @@ def main():
     ap.add_argument("--evals-pillbox", default="evals")
     ap.add_argument("--runner-image", default=os.environ.get("PILLBOX_RUNNER_IMAGE", "pillbox-runner:l7"))
     ap.add_argument("--prune-harmful", action="store_true",
-                    help="act on harmful candidates (supersede). Off by default — destructive.")
+                    help="reject (kypp reject) harmful candidates. Off by default — correlational, destructive.")
     ap.add_argument("--out", default="ace-run.json")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()

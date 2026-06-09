@@ -405,6 +405,67 @@ cheap to falsify.
 
 ---
 
+## Consume path — a real agent through the gateway (scoped 2026-06-09 from the built spike)
+
+The spike is now built **past** the Milestone-0 table's aspiration. `cloudflare-spike/`
+has a `SessionGateway` DO that already does the §0 plane end-to-end: durable log +
+storage-persisted **seq authority** (`append`, 1:1 with `SessionLog::append`),
+`subscribe` (replay-then-tail over the DO WS), **actor attestation** (`auth.ts` HMAC),
+**driver arbitration** (`ensureDriver`/`handleRelease`), and a **DO↔container exec
+round-trip** (`/input` → `driveSandbox` → `sandbox.exec` → `tool_call` §0 event → a
+subscriber sees input→output in order). All smoke-tested (`smoke-{actor,driver,sandbox}.mjs`);
+the contract (`contract.ts`) is **parity-gated** against `contract.rs`
+(`check-contract-parity.py` in `cf.sh`). The §0/trust/subscribe substrate is **done**.
+
+What it runs in the box is `echo`, not an agent. Closing that — the **consume path** — is
+the realization of Milestones 0–1, and it's smaller than the table implied: **one method
+changes** and the whole §0/trust/subscribe substrate is reused untouched. (Consume, don't
+rebuild: opencode runs in CF's Sandbox SDK; we stay the §0/memory/multiplayer layer above.)
+
+**The seam.** `driveSandbox` is the only method that evolves. Today: `sandbox.exec(cmd)` →
+one `tool_call`. Consume: drive opencode + tail its SSE → mapped agent §0 events.
+
+| # | Piece | Detail |
+|---|---|---|
+| 1 | container image | Sandbox-SDK image with opencode installed + authed (the runner-image equivalent); the SDK runs `opencode serve` |
+| 2 | drive | gateway health-checks the opencode port (`getSandbox`), POSTs the prompt to opencode `/session/{id}/prompt` (the structured API, **not** a shell exec). Driver-gated by `handleInput` already |
+| 3 | **tail + map** (the new work) | gateway opens opencode's `/event` SSE (streaming fetch to the container port), runs a TS `OpencodeMapper` per event → §0 `Payload` → `this.append(at, AGENT_ACTOR, …)`. Fan-out unchanged |
+| 4 | turn-done | opencode `session.idle` → `message_end` + `attention_required` → the §0 "turn done" (parity with local `wait-idle`; the read side already exists) |
+
+**The mapper** is the one genuinely-new module — a TS port of `src/events/opencode.rs`
+(~150 lines of logic): `message.updated`→`message_start`; `message.part.delta`→
+`message_delta`/`thinking`; `message.part.updated[tool]`→`tool_call`, `[step-finish]`→
+`usage` (deduped by step id); `session.idle`→`message_end`+`attention_required`;
+`permission`/`question.asked`→`attention_required`. State: open-message-id + emitted-step-ids.
+
+**Trust boundary — reused, not rebuilt.** Agent output is stamped `{kind:"agent",
+id:"a:opencode"}` **by the gateway** (add an `AGENT_ACTOR` const beside `SYSTEM_ACTOR`),
+never self-reported by opencode-in-the-container — the exact boundary `handleEvent`
+enforces. Driver `/input` stays human/service; `driver_changed` stays system.
+
+**Risks / decisions:**
+1. **The mapper becomes a 2nd implementation** (Rust local + TS CF) — a drift surface
+   exactly like the contract we just gated. De-risk: reuse the Rust mapper's SSE→Payload
+   test vectors (`opencode.rs` tests) as the TS mapper's fixtures, and extend
+   `check-contract-parity` to "same SSE fixture → same §0 payloads, both sides." The
+   natural sequel to the contract-parity keystone.
+2. **The DO holds a long-lived SSE for the whole turn** (minutes), mapping+appending as
+   events arrive — vs. today's bounded one-shot exec. **This is Open Question #1 (DO↔container
+   hop cost) for a *streaming* turn — the thing the spike must measure**, plus mid-turn
+   eviction.
+3. **opencode auth in the container = the vault parity** → consume CF's (Managed Agents'
+   secret-injecting proxy / `wrangler secret`), don't rebuild our MITM (Milestone 2).
+4. **`contract.ts` additions**: the mapper emits `message_start`/`thinking`/`usage`
+   (currently catch-all-absorbed, rust-only) — model them explicitly so parity field-checks
+   them. `usage` especially (kypp credit-assignment / cost-routing consume it).
+
+**Cheapest falsifier (one real turn).** Evolve `smoke-sandbox.mjs` from `echo` to a real
+agent turn: drive opencode with a trivial prompt; a WS subscriber must see `message_start
+→ message_delta… → message_end → attention_required`, in order, `actor=a:opencode`. Proves
+opencode-in-Sandbox + SSE tail + TS mapper + §0 append + subscribe end-to-end, and directly
+measures risk #2. If it holds, the managed tier is real; if not, the wall is found cheaply.
+**Stays non-P0** — a spike to de-risk the option, not a tier build-out.
+
 ## Resolved by the research
 
 - **DO-as-session-gateway is sound** — it's CF's own shipped pattern (Sandbox
@@ -461,6 +522,52 @@ cheap to falsify.
   [Liveblocks/PartyKit/Hocuspocus](https://www.pkgpulse.com/guides/liveblocks-vs-partykit-vs-hocuspocus-realtime-2026)
 - [AI code sandbox benchmark 2026](https://www.superagent.sh/blog/ai-code-sandbox-benchmark-2026) ·
   [AI sandbox pricing (Northflank)](https://northflank.com/blog/ai-sandbox-pricing)
+
+---
+
+## Considered: Cloudflare Artifacts as the managed workspace store (deferred 2026-06-08)
+
+When the managed store question came up ("push the workspace to R2/S3"),
+[Cloudflare Artifacts](https://developers.cloudflare.com/artifacts/) — versioned,
+**Git-compatible** file-tree storage (closed beta) — looked like a better
+interface than R2 + a hand-rolled CAS layout, for the *workspace-snapshot* half
+specifically.
+
+**The fit (real):** snapshot = commit, bookmark = branch/ref, `pillbox fork` =
+git clone/branch; the whole `push/pull/snapshot/bookmark/fork` surface maps onto
+git verbs, **with real 3-way merge** (which rustic can't do). It's reachable
+three ways — git-over-HTTPS, REST, and a **Workers binding** — so the managed
+Container `git push`es and the Session DO reads the result tree via the binding
+(no separate S3 client; tighter than R2). **ArtifactFS lazy-mount** ("mount large
+repos without full clone") natively closes the eager-restore-vs-lazy-fault-in gap
+the [fork substrate](#) plan was going to hand-roll with overlayfs warm-base.
+Limits: 10 GB/repo, 1 TB/account, 2000 req/10s.
+
+**Why deferred (two blockers):**
+
+1. **It breaks store transferability — the portability moat.** Artifacts is a
+   *different* CAS engine with a git face; it does **not** ride on R2 and is **not**
+   "push your rustic repo to R2." So a snapshot lineage spanning local (rustic) and
+   managed (Artifacts) has no shared handle space — a rustic snapshot handle ≠ a
+   git commit SHA — and would need a translation/sync layer between two CAS engines.
+   That sync is exactly the thing the local-first identity is supposed to avoid, and
+   it cuts against "the same integrated bundle runs identically across local / BYO /
+   managed" (portability is the moat — see the fork-substrate decision). Also: no
+   client-side encryption (CF-hosted git is readable by CF), unlike rustic's
+   client-encrypted store with `workspace rekey`. So at best it's the **managed-only**
+   `WorkspaceBackend` impl behind the trait, never a replacement for local rustic —
+   and the two-store split is the cost, not a feature.
+
+2. **Closed beta — can't even trial it.** No access means we can't falsify the
+   DO↔binding read path, the lazy-mount behavior on real agent workspaces (git is
+   poor at large binaries / node_modules), or the merge story. Nothing to spike.
+
+**Decision:** document, don't adopt. The managed store stays **R2** (plain blobs
+for §0 `raw_body`/`pty_snapshot`, milestone 3) plus whatever the managed
+`WorkspaceBackend` materializes; local stays **rustic**. Revisit Artifacts when
+(a) it leaves closed beta *and* (b) we have a concrete answer for cross-store
+lineage that doesn't reintroduce a two-engine sync — otherwise the transferability
+loss outweighs the nicer git interface.
 
 ---
 

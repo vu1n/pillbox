@@ -209,6 +209,51 @@ the §0 substrate as the durable win and shelve compile-time optimization. (Cave
 small but σ̂≈0.35 w/ SDs~0.5 is unambiguous; one model; temp-0's effect still unisolated —
 but if it took and σ̂ is still 0.35, that's the finding either way.)
 
+### RESULT (b) — the deterministic-worker retry, LOCAL greedy qwen (2026-06-10): σ̂ bar PASSES on toolz; headroom and variance anti-correlate across families
+
+Reran RESULT (a)'s exact protocol (5 toolz tasks × 2 replicate arms × 3 trials @ temp-0)
+with the worker swapped to **local `ollama/qwen3.6:35b-a3b-coding-nvfp4`** via the libkrun
+local-model forward (`PILLBOX_LOCAL_MODEL_PORT=11434`, 042648c). Same rig, same tasks, same
+stats — only the worker changed.
+
+**Leg A (toolz): σ̂ = 0.0577 ≤ 0.10 — the bar PASSES.** mean_d = −0.067, CI [−0.2, 0.0]
+(replicates → includes 0 ✓). 29/30 trials scored 1.0; 9 of 10 cells perfectly deterministic;
+the single flip was `sliding_window` oracle `[0,1,1]`. vs RESULT (a)'s σ̂ = 0.346 on the
+identical protocol: a **6× variance reduction from the worker swap alone**. The deterministic-
+worker hypothesis is confirmed — the σ̂ wall was the hosted MoE, not the agentic regime per se.
+But: qwen sweeps the family (mean 0.97 vs glm's ~0.5), so **toolz has zero headroom for this
+worker** — nothing to mine, nothing to lift.
+
+**Leg B (aider graded greenfield: ap_pov / ap_connect / ap_pig_latin, same replicate
+protocol): σ̂ = 0.154 — above the bar** (though 2.2× better than hosted). Per-task triples:
+pov all-0 (deterministic floor), connect baseline `[0,0,0]` / oracle `[0,0.6,0.6]`,
+pig_latin baseline `[0,1,1]` / oracle `[1,1,1]`. Two named suspects, both testable:
+1. **Prefix-cache cold/warm divergence** — in 4 of the variable cells the *first* trial is
+   the outlier and later trials agree (`[0,1,1]`, `[0,0.6,0.6]`, …): consistent with
+   ollama's fresh-prefill vs cached-prefill numeric paths diverging at a near-tie token.
+2. **Turn-cap guillotine** — MAX_WAIT=600 truncates long greenfield turns, converting small
+   timing/verbosity jitter into large score variance (score = where the axe fell).
+Also a free demonstration of why the CI gate exists: the two replicate arms differ only by
+two prepended newlines, yet mean_d = +0.244 on n=3 tasks — a fake "lift" from prompt
+perturbation + small N, correctly refused (`sensitive: false`).
+
+**The structural finding: for a fixed worker, σ̂ and headroom anti-correlate across
+families.** Where the worker is strong (toolz) it is near-deterministic but saturated; where
+tasks leave gradient (aider greenfield) variance returns. The de-risking prerequisite
+(σ̂ ≤ 0.10 AND partial-credit headroom on the SAME family) is therefore **half-met**: the
+worker-swap unblock works, the joint regime is not yet exhibited. Knob test (in flight):
+rerun leg B at MAX_WAIT=1800 with a recorded cold warm-up trial per task — if warm-trial
+σ̂ ≤ 0.10 with means strictly inside (0,1), the prerequisite is met on aider and the
+self-harness arm (docs/ghost-self-harness.md §6) unblocks; if not, the gap is a family of
+intermediate difficulty (toolz-shaped surgical fixes, but harder — e.g. multi-fault or
+cross-module variants).
+
+Ops notes from the run (substrate, not stats): two transient libkrun bring-up hangs
+(~6% of ~45 boots; `run --json` stuck pre-reparent, no session record — kill + relaunch;
+a batch medic that kills `pillbox run --json` older than 20 min self-heals it), and
+`materialize_rootfs` leaks the `docker rm -f` container id to stdout on a cold cache,
+corrupting `run --json` (fix queued: capture the Command output).
+
 ## Appendix — built vs. needed
 
 | Need | Status |

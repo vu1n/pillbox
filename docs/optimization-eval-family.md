@@ -241,12 +241,35 @@ perturbation + small N, correctly refused (`sensitive: false`).
 families.** Where the worker is strong (toolz) it is near-deterministic but saturated; where
 tasks leave gradient (aider greenfield) variance returns. The de-risking prerequisite
 (σ̂ ≤ 0.10 AND partial-credit headroom on the SAME family) is therefore **half-met**: the
-worker-swap unblock works, the joint regime is not yet exhibited. Knob test (in flight):
-rerun leg B at MAX_WAIT=1800 with a recorded cold warm-up trial per task — if warm-trial
-σ̂ ≤ 0.10 with means strictly inside (0,1), the prerequisite is met on aider and the
-self-harness arm (docs/ghost-self-harness.md §6) unblocks; if not, the gap is a family of
-intermediate difficulty (toolz-shaped surgical fixes, but harder — e.g. multi-fault or
-cross-module variants).
+worker-swap unblock works, the joint regime is not yet exhibited.
+
+**Knob test (2026-06-11): both suspects REFUTED — the knobs do not rescue the graded
+family.** Reran the 3 aider tasks at MAX_WAIT=1800 with a recorded COLD trial + 3 warm
+trials each (12 cells): pov cold 0 / warm [0,0,0]; connect cold 0 / warm [0,0,0];
+pig_latin cold 0 / warm **[0,1,0]**. Pooled warm σ̂ = **0.333** — worse than the 600s run.
+1. *Prefix-cache:* refuted as the driver — warm byte-identical trials still flip
+   ([0,1,0]; and the flip isn't trial-1 anymore, so the leg-B "trial-1-outlier" pattern
+   was small-N coincidence. Hypotheses are for testing, not for recording as fact.)
+2. *Guillotine:* cuts the other way — at 1800s connect's 0.6 partials VANISH (cold+warm
+   all 0). The 600s partial credits were **truncation artifacts** (runs frozen mid-flight
+   while some tests passed), not a stable capability band. Longer horizon = more room for
+   path divergence, not less variance.
+Residual mechanism, named: **long-horizon agentic bistability** — at-the-margin tasks flip
+solve↔fail run-to-run from tiny decode-level entropy (Metal reduction-order at temp-0)
+amplified across a 10–30 min agentic turn. Short surgical tasks (toolz) give it no room to
+diverge → σ̂=0.058; long greenfield gives it maximal room → bistable. So the σ̂↔headroom
+anti-correlation is really **σ̂↔horizon**: variance scales with turn length, and this
+worker's headroom on aider exists only at long horizon.
+
+**VERDICT: prerequisite NOT met — do NOT build the self-harness arm yet.** The next
+experiment (not more knobs): an **intermediate family** — short-horizon surgical fixes
+(the σ̂=0.058 regime) with built-in gradient. Candidate: multi-fault toolz — inject 2–3
+independent single-faults (they live in different functions) into one workspace, rubric =
+one criterion per fault's test → partial credit = faults fixed, horizon stays surgical.
+Risk to design around: qwen fixed every single-fault deterministically, so plain
+multi-fault may re-saturate; harder variants (symptom withheld — discovery mode; or subtler
+faults) are the difficulty dial. Gradient must come from independent criteria at
+COMPLETION, never from truncation.
 
 Ops notes from the run (substrate, not stats): two transient libkrun bring-up hangs
 (~6% of ~45 boots; `run --json` stuck pre-reparent, no session record — kill + relaunch;

@@ -541,15 +541,19 @@ fn materialize_rootfs(resolved: &Pillbox) -> Result<PathBuf> {
     }
     let cid = String::from_utf8_lossy(&create.stdout).trim().to_string();
 
-    // Stream the container filesystem straight into the cache dir.
+    // Stream the container filesystem straight into the cache dir. Capture both
+    // commands' stdio: `docker rm` echoes the container id, and `run --json`'s
+    // machine-readable stdout must stay pure JSON (a leaked line corrupts the
+    // surface and the caller loses the session id).
     let export = Command::new("sh")
         .arg("-c")
         .arg(format!(
             "docker export {cid} | tar -C {} -xf -",
             cache.display()
         ))
-        .status();
-    let _ = Command::new("docker").args(["rm", "-f", &cid]).status();
+        .output()
+        .map(|o| o.status);
+    let _ = Command::new("docker").args(["rm", "-f", &cid]).output();
     match export {
         Ok(s) if s.success() => {}
         // Clear the half-populated cache so the next run retries from scratch

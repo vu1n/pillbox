@@ -277,6 +277,30 @@ a batch medic that kills `pillbox run --json` older than 20 min self-heals it), 
 `materialize_rootfs` leaks the `docker rm -f` container id to stdout on a cold cache,
 corrupting `run --json` (fix queued: capture the Command output).
 
+### RESULT (b′) — a STRONGER local worker (Nex-N2-mini) does NOT move the needle: the bottleneck is the task family, not the worker (2026-06-12)
+
+Hypothesis going in: Nex-N2-mini (Qwen3.5-35B-A3B base + Nex agentic post-training, a
+*reasoning/thinking* model) might either (a) clear toolz with headroom to spare, or (b) — since
+it generates long reasoning chains and long horizon was the named variance amplifier — show
+*higher* σ̂ than the non-thinking qwen3.6. Same replicate protocol, 30 cells @ temp-0, only the
+worker swapped. Result: **σ̂ = 0.0577 — identical to qwen3.6 to four digits.** 29/30 cells at
+1.0, mean 0.967, the lone flip on the same hardest task:
+```
+take_off_by_one  base=[1,1,1] oracle=[1,1,1]      take_nth_offset  base=[1,1,1] oracle=[1,1,1]
+drop_off_by_one  base=[1,1,1] oracle=[1,1,1]      tail_slice       base=[1,1,1] oracle=[1,1,1]
+sliding_window_drops_first  base=[1,0,1] oracle=[1,1,1]   ← the one bistable cell, same task as qwen
+```
+Neither hypothesis fired: the stronger worker is *neither* more headroom-y *nor* more variable on
+this family — it saturates toolz exactly as qwen does. **The conclusion this isolates: the
+headroom problem is task-side, not worker-side.** Swapping the worker was the clean control — it
+proves a better model can't rescue a saturated family, so the multi-fault toolz family (intermediate
+difficulty) is the next step *regardless of model*. Caveat held honestly: the thinking-model →
+higher-variance hypothesis is NOT refuted, only untested — these surgical fixes are too easy to
+engage long-horizon reasoning, so the model never thinks long enough to diverge. That question
+reopens on the harder family, where it becomes a real risk to design around: a thinking worker may
+be the *wrong* choice precisely where headroom finally exists. (Substrate note: opencode handled
+Nex's `</think>` reasoning channel without mangling tool calls — the agent edited + passed.)
+
 ## Appendix — built vs. needed
 
 | Need | Status |

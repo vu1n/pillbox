@@ -93,11 +93,11 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 # publish scheme is timestamp+sha (e.g. 0.0.1779836786-gb003ec),
 # which Renovate's semver matcher can't compare meaningfully.
 # renovate: datasource=github-releases depName=openai/codex extractVersion=^rust-v(?<version>.*)$
-ARG CODEX_VERSION=0.137.0
+ARG CODEX_VERSION=0.139.0
 # renovate: datasource=npm depName=opencode-ai
-ARG OPENCODE_VERSION=1.15.10
+ARG OPENCODE_VERSION=1.17.3
 # renovate: datasource=npm depName=@earendil-works/pi-coding-agent
-ARG PI_VERSION=0.75.5
+ARG PI_VERSION=0.79.1
 
 RUN npm install -g \
 		@ampcode/cli@latest \

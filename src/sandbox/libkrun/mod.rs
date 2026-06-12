@@ -526,10 +526,29 @@ fn unsupported(spec: &AgentSpec, what: &str) -> anyhow::Error {
 /// instead of reusing an older exported rootfs.
 fn materialize_rootfs(resolved: &Pillbox) -> Result<PathBuf> {
     let (image, _) = crate::docker::resolve_runner_image(resolved);
-    let image_id = docker_image_id(&image)?;
-    let cache = krun_cache_dir()?
-        .join("rootfs")
-        .join(rootfs_cache_key(&image, &image_id));
+    let rootfs_root = krun_cache_dir()?.join("rootfs");
+    // The id-keyed cache needs Docker to resolve the tag → id. When Docker is
+    // unreachable (daemon down, image pruned) we can't compute the live key, but
+    // a prior materialization may already be on disk — boot from the newest
+    // cached generation for this image rather than hard-failing on the daemon.
+    let image_id = match docker_image_id(&image) {
+        Ok(id) => id,
+        Err(_) => {
+            if let Some(cache) = find_cached_rootfs(&rootfs_root, &image) {
+                eprintln!(
+                    "pillbox: note: docker unavailable — reusing cached rootfs for {image} (may be stale)"
+                );
+                return Ok(cache);
+            }
+            return Err(PillboxError::resource(
+                "rootfs materialize",
+                format!("docker unavailable and no cached rootfs for `{image}`"),
+            )
+            .with_next(format!("start Docker, then `docker pull {image}`"))
+            .into());
+        }
+    };
+    let cache = rootfs_root.join(rootfs_cache_key(&image, &image_id));
     let marker = cache.join(".materialized");
     if marker.exists() {
         return Ok(cache);
@@ -581,6 +600,35 @@ fn materialize_rootfs(resolved: &Pillbox) -> Result<PathBuf> {
     Ok(cache)
 }
 
+/// Newest materialized rootfs generation for `image`, or `None`. The fallback
+/// when Docker can't resolve the live image id: scan the rootfs cache root for
+/// generation dirs whose `.materialized` marker's first line is exactly `image`
+/// (the marker is `format!("{image}\n{image_id}\n")`), and pick the one with the
+/// most-recent marker mtime — the freshest export we have for this tag.
+fn find_cached_rootfs(root: &Path, image: &str) -> Option<PathBuf> {
+    let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
+    for entry in std::fs::read_dir(root).ok()?.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let marker = dir.join(".materialized");
+        let Ok(text) = std::fs::read_to_string(&marker) else {
+            continue;
+        };
+        if text.lines().next() != Some(image) {
+            continue;
+        }
+        let Ok(mtime) = marker.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(_, t)| mtime > *t) {
+            best = Some((dir, mtime));
+        }
+    }
+    best.map(|(dir, _)| dir)
+}
+
 fn docker_image_id(image: &str) -> Result<String> {
     let out = Command::new("docker")
         .arg("image")
@@ -622,7 +670,52 @@ fn cstr(s: &str) -> CString {
 
 #[cfg(test)]
 mod tests {
-    use super::mint_oauth_stub;
+    use super::{find_cached_rootfs, mint_oauth_stub};
+
+    // Write a generation dir with a marker shaped like the real one, then set
+    // its mtime so "newest wins" is testable without sleeping (`age_secs` ago).
+    fn gen_dir(root: &std::path::Path, name: &str, first_line: Option<&str>, age_secs: u64) {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(image) = first_line {
+            let path = dir.join(".materialized");
+            let f = std::fs::File::create(&path).unwrap();
+            use std::io::Write;
+            (&f).write_all(format!("{image}\nsha256:deadbeef\n").as_bytes())
+                .unwrap();
+            let when = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+            f.set_modified(when).unwrap();
+        }
+    }
+
+    #[test]
+    fn find_cached_rootfs_picks_newest_matching_image() {
+        let root = tempfile::tempdir().unwrap();
+        let image = "ghcr.io/vu1n/pillbox:rolling";
+        // Two generations of the same image (older + newer) plus a dir for a
+        // different image and a dir with no marker — only the newest match wins.
+        gen_dir(root.path(), "old", Some(image), 100);
+        gen_dir(root.path(), "new", Some(image), 1);
+        gen_dir(root.path(), "other", Some("ghcr.io/vu1n/pillbox:pinned"), 0);
+        gen_dir(root.path(), "nomarker", None, 0);
+
+        let hit = find_cached_rootfs(root.path(), image).expect("a matching generation");
+        assert_eq!(hit.file_name().unwrap(), "new", "expected the newest match");
+    }
+
+    #[test]
+    fn find_cached_rootfs_ignores_non_matching_and_markerless() {
+        let root = tempfile::tempdir().unwrap();
+        gen_dir(root.path(), "other", Some("some/other:image"), 0);
+        gen_dir(root.path(), "nomarker", None, 0);
+        assert!(find_cached_rootfs(root.path(), "ghcr.io/vu1n/pillbox:rolling").is_none());
+    }
+
+    #[test]
+    fn find_cached_rootfs_empty_root_is_none() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(find_cached_rootfs(root.path(), "anything").is_none());
+    }
 
     #[test]
     fn mint_stub_keeps_type_prefix_not_the_secret_body() {

@@ -198,11 +198,13 @@ const GUEST_CA_PATH: &str = "/usr/local/share/ca-certificates/pillbox-vault.crt"
 /// The VMM child (`pillbox __krun-vmm <spec.json>`). Reads the [`VmSpec`],
 /// configures a libkrun context (root + virtio-fs shares + exec), and enters it.
 ///
-/// **This process's environment IS the guest environment**: the parent spawns it
-/// with `env_clear().envs(guest_env)`, so `std::env::vars()` here is exactly the
-/// composed guest env (config + any secrets) and is forwarded to `krun_set_exec`.
-/// `krun_start_enter` does not return — it `exit()`s with the guest's code; only
-/// returns on a pre-boot config error.
+/// **This process's environment is forwarded to `krun_set_exec`** — and libkrun
+/// serializes exec env + argv into the kernel cmdline, which accepts printable
+/// ASCII only. So the parent spawns this child with `env_clear()` + the static
+/// base env only; the composed guest env (and the agent argv's prompt) travel in
+/// the boot script instead (see `session::bootstrap_exec`). `krun_start_enter`
+/// does not return — it `exit()`s with the guest's code; only returns on a
+/// pre-boot config error.
 pub(crate) fn vmm_child_main() -> ! {
     let spec_path = match std::env::args().nth(2) {
         Some(p) => p,

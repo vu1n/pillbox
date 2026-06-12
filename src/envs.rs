@@ -249,7 +249,7 @@ pub(crate) fn parse_dotenv(content: &str, source: &str) -> Result<BTreeMap<Strin
     Ok(out)
 }
 
-fn is_valid_env_key(k: &str) -> bool {
+pub(crate) fn is_valid_env_key(k: &str) -> bool {
     let mut chars = k.chars();
     let Some(first) = chars.next() else {
         return false;

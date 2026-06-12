@@ -39,6 +39,7 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+mod boot;
 mod egress;
 mod http;
 mod local_forward;
@@ -202,7 +203,7 @@ const GUEST_CA_PATH: &str = "/usr/local/share/ca-certificates/pillbox-vault.crt"
 /// serializes exec env + argv into the kernel cmdline, which accepts printable
 /// ASCII only. So the parent spawns this child with `env_clear()` + the static
 /// base env only; the composed guest env (and the agent argv's prompt) travel in
-/// the boot script instead (see `session::bootstrap_exec`). `krun_start_enter`
+/// the boot script instead (see `boot::boot_channel`). `krun_start_enter`
 /// does not return — it `exit()`s with the guest's code; only returns on a
 /// pre-boot config error.
 pub(crate) fn vmm_child_main() -> ! {

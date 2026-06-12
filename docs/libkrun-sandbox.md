@@ -62,6 +62,15 @@ host: pillbox  ──FFI──▶ libkrun (KVM/HVF microVM)
 - **Rootfs** — an OCI image works as the microVM rootfs (krunvm/crun-krun
   style), so the existing runner-image artifact survives the pivot; a slimmer
   custom rootfs is an option later.
+
+  *Known debt:* the materialized-rootfs cache (`~/.pillbox/krun/rootfs/`) is
+  keyed by image **id**, so every `docker pull` of a mutable tag strands the
+  previous multi-GB export — nothing GCs superseded generations. A naive
+  sweep is unsafe: `krun_set_root` serves the cache dir *live* to running
+  (possibly days-old detached) VMs, and the sanitized keys of distinct tags
+  can share a prefix. A sound GC needs a `rootfs/<image>/<id>/` layout plus
+  liveness against session records — do it as an explicit verb (`doctor`
+  surface or `session prune` sibling), not on the launch path.
 - **Workspace** — host dir shared via **virtio-fs**; a **COW snapshot**
   (FICLONE / `clonefile(2)`) gives near-instant per-run isolation and is the
   clean local "fork N agents from one base" primitive. rustic stays the

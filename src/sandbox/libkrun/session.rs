@@ -29,7 +29,7 @@ use crate::workspace::WorkspaceBackend;
 // VMM substrate kept in the parent module (used here AND by `vmm_child_main`):
 // spec types, the CoW/stub/rootfs helpers, the cache dir, and shared consts.
 use super::{
-    cow_clone_and_scrub, cow_clone_home, egress, http, krun_cache_dir, materialize_rootfs,
+    boot, cow_clone_and_scrub, cow_clone_home, egress, http, krun_cache_dir, materialize_rootfs,
     shell_quote, stub_oauth_creds, unsupported, EgressSpec, LibkrunBackend, Share, SwapPair,
     VmSpec, VsockAttach, GUEST_CA_PATH,
 };
@@ -110,7 +110,7 @@ impl SandboxBackend for LibkrunBackend {
             .arg("__krun-vmm")
             .arg(launch.spec_file.path())
             .env_clear()
-            .envs(static_child_env())
+            .envs(boot::static_child_env())
             .stdin(std::process::Stdio::piped())
             .spawn()
             .context("spawn the libkrun VMM subprocess")?;
@@ -192,67 +192,13 @@ struct Launch {
     _ca: VaultCa,
 }
 
-/// In-share filename of the host-written guest boot script (see [`bootstrap_exec`]).
-const BOOT_SCRIPT: &str = ".pillbox-boot.sh";
-
-/// The static kernel-cmdline bootstrap. libkrun serializes the guest exec argv
-/// and env into the kernel cmdline, which accepts printable ASCII only — one
-/// newline or non-ASCII byte (a seeded prompt, a `--memory` briefing, an env
-/// value, a workspace name) aborts the VMM with `InvalidAscii`. So the cmdline
-/// carries only this fixed prologue — mount `tag` at `mountpoint` and exec the
-/// boot script from it — and every dynamic byte lives in the script file, where
-/// anything is legal. Must stay printable-ASCII-pure (tested).
-fn bootstrap_exec(tag: &str, mountpoint: &str) -> Vec<String> {
-    let mp = shell_quote(mountpoint);
-    vec![
-        "/bin/sh".into(),
-        "-c".into(),
-        format!(
-            "set -e; mkdir -p {mp}; mount -t virtiofs {tag} {mp}; exec /bin/sh {mp}/{BOOT_SCRIPT}"
-        ),
-    ]
-}
-
-/// `export K='v'` lines for the boot script — how the composed guest env reaches
-/// the agent now that the cmdline can't carry it. Values are shell-quoted (any
-/// byte is legal); keys are spliced unquoted, so reject anything that isn't a
-/// plain identifier rather than let a hostile name escape into the script.
-fn env_exports(env: &[(String, String)]) -> Result<String> {
-    let mut out = String::new();
-    for (k, v) in env {
-        let mut chars = k.chars();
-        let ident = chars
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
-        if !ident {
-            bail!("guest env var name {k:?} is not a plain identifier — can't export it into the boot script");
-        }
-        out.push_str(&format!("export {k}={}\n", shell_quote(v)));
-    }
-    Ok(out)
-}
-
-/// What the VMM child process is spawned with — and therefore all the kernel
-/// cmdline ever carries: the static ASCII base. The full guest env travels in
-/// the boot script's exports instead (see [`bootstrap_exec`]).
-fn static_child_env() -> Vec<(String, String)> {
-    vec![
-        ("HOME".into(), GUEST_HOME.into()),
-        ("TERM".into(), "xterm-256color".into()),
-        (
-            "PATH".into(),
-            format!("/usr/local/bin:/usr/bin:/bin:{GUEST_HOME}/.local/bin"),
-        ),
-    ]
-}
-
 /// The boot-script preamble shared by every libkrun launch (PTY agents and
 /// the opencode server): bring the NIC up, install the vault CA, mount the
 /// workspace virtio-fs share, and `cd` into the workspace. The caller appends
-/// its own exec. The creds share is already mounted by [`bootstrap_exec`] —
-/// the boot script itself lives there. `gw_q` is pre-[`shell_quote`]d (a
-/// workspace name may contain a space).
+/// its own exec. The creds share is already mounted by the boot channel's
+/// static bootstrap (see [`boot::boot_channel`]) — the boot script itself
+/// lives there. `gw_q` is pre-[`shell_quote`]d (a workspace name may contain
+/// a space).
 fn guest_launch_preamble(ca_cert_pem: &str, gw_q: &str) -> String {
     let net = egress::guest_net_commands();
     let ca_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, ca_cert_pem);
@@ -397,7 +343,7 @@ fn launch_base(
         .into());
     }
     let composed = resolve_run_env(resolved, opts, &plain, None)?;
-    let mut guest_env: Vec<(String, String)> = static_child_env();
+    let mut guest_env: Vec<(String, String)> = boot::static_child_env();
     guest_env.extend(composed);
 
     // Vaulted `--with`: inject a STUB into the env (never the real key), and carry
@@ -504,7 +450,7 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
     // the agent under the in-guest pty-host (Frame over vsock). Written into the
     // creds share and exec'd by the static cmdline bootstrap — the prompt in the
     // agent argv (and any env value) may carry newlines/unicode the cmdline can't
-    // (see [`bootstrap_exec`]). Quote every interpolated path and argv element.
+    // (see [`boot::boot_channel`]). Quote every interpolated path and argv element.
     let agent_argv: Vec<String> = spec
         .run_argv
         .iter()
@@ -522,10 +468,10 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
     // Detach: the guest pty-host *listens* (so the attach socket persists for
     // reattach after the parent returns); foreground: it dials the parent.
     let vsock_flag = if opts.detach { " --vsock-listen" } else { "" };
-    let exports = env_exports(&guest_env)?;
+    let exports = boot::env_exports(&guest_env)?;
     let boot_script = format!(
         "{exports}{preamble}; \
-         exec pillbox pty-host --vsock-port {ATTACH_PORT}{vsock_flag} -- {agent}\n",
+         exec pillbox pty-host --vsock-port {ATTACH_PORT}{vsock_flag} -- {agent}",
     );
 
     // ── env-fork invariant (the security thesis, guarded) ──
@@ -535,16 +481,19 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
     // MITM swap, out-of-band on the child's stdin + held in the VMM child's memory.
     // A real in a guest-readable channel is exfiltratable by a prompt-injected agent
     // — fail fast rather than silently leak if a future change crosses channels.
+    // Raw env values are scanned pre-quoting (shell-quoting can mangle the needle,
+    // e.g. `'` → `'\''`); the rendered script catches argv/path interpolations.
     for pair in &swap_pairs {
-        if boot_script.contains(&pair.real) {
+        if guest_env.iter().any(|(_, v)| v.contains(&pair.real)) || boot_script.contains(&pair.real)
+        {
             bail!(
                 "libkrun env-fork violated: a real credential reached a guest-readable \
                  channel (the boot script) — it must travel only via the MITM stdin swap"
             );
         }
     }
-    std::fs::write(creds_share.join(BOOT_SCRIPT), &boot_script)
-        .context("write guest boot script")?;
+    let (boot_share, boot_exec) =
+        boot::boot_channel(&creds_share, "creds", GUEST_HOME, &boot_script)?;
 
     let attach_sock =
         krun_cache_dir()?.join(format!("attach-{}.sock", uuid::Uuid::now_v7().simple()));
@@ -555,16 +504,13 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
         vcpus: 2,
         ram_mib: 2048,
         shares: vec![
-            Share {
-                tag: "creds".into(),
-                host_path: creds_share.to_string_lossy().into_owned(),
-            },
+            boot_share,
             Share {
                 tag: "workspace".into(),
                 host_path: clone.to_string_lossy().into_owned(),
             },
         ],
-        exec: bootstrap_exec("creds", GUEST_HOME),
+        exec: boot_exec,
         vsock: Some(VsockAttach {
             port: ATTACH_PORT,
             host_sock: attach_sock.to_string_lossy().into_owned(),
@@ -629,7 +575,7 @@ fn run_detached(
         .arg("__krun-vmm")
         .arg(&spec_path)
         .env_clear()
-        .envs(static_child_env())
+        .envs(boot::static_child_env())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -776,18 +722,19 @@ fn launch_server_vm(
     // Guest boot script: env exports, then NIC + CA + workspace mount (the shared
     // preamble) and the agent's own server + vsock forward relay (the per-agent
     // script). Written into the creds share, exec'd by the static cmdline
-    // bootstrap (see [`bootstrap_exec`]) — model names/env values may carry bytes
+    // bootstrap (see [`boot::boot_channel`]) — model names/env values may carry bytes
     // the kernel cmdline can't.
     let gw_q = shell_quote(&guest_workspace);
     let preamble = guest_launch_preamble(&ca.cert_pem, &gw_q);
     let events_q = shell_quote(&format!("{GUEST_HOME}/{}", profile.events_file));
     let script = (launch.build_script)(&preamble, &events_q);
-    let exports = env_exports(&guest_env)?;
-    std::fs::write(
-        creds_share.join(BOOT_SCRIPT),
-        format!("{exports}{script}\n"),
-    )
-    .context("write guest boot script")?;
+    let exports = boot::env_exports(&guest_env)?;
+    let (boot_share, boot_exec) = boot::boot_channel(
+        &creds_share,
+        "creds",
+        GUEST_HOME,
+        &format!("{exports}{script}"),
+    )?;
 
     // host_sock prefix = the agent id (distinct per agent; one socket per VM).
     let host_sock = krun_cache_dir()?.join(format!(
@@ -802,16 +749,13 @@ fn launch_server_vm(
         vcpus: 2,
         ram_mib: 2048,
         shares: vec![
-            Share {
-                tag: "creds".into(),
-                host_path: creds_share.to_string_lossy().into_owned(),
-            },
+            boot_share,
             Share {
                 tag: "workspace".into(),
                 host_path: clone.to_string_lossy().into_owned(),
             },
         ],
-        exec: bootstrap_exec("creds", GUEST_HOME),
+        exec: boot_exec,
         // Guest listens; the host dials `host_sock` once per HTTP request.
         vsock: Some(VsockAttach {
             port: FORWARD_PORT,
@@ -849,7 +793,7 @@ fn launch_server_vm(
         .arg("__krun-vmm")
         .arg(&spec_path)
         .env_clear()
-        .envs(static_child_env())
+        .envs(boot::static_child_env())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -1234,15 +1178,15 @@ pub(crate) fn score_in_sandbox(
 
     // The grader command is user content (`--cmd`, rubric lines) — route it
     // through a boot-script share, off the printable-ASCII-only kernel cmdline
-    // (see [`bootstrap_exec`]). A dedicated share, NOT the grade workspace: a
-    // script in /grade would pollute the tree the verifier inspects. Held past
+    // (see [`boot::boot_channel`]). A dedicated share, NOT the grade workspace:
+    // a script in /grade would pollute the tree the verifier inspects. Held past
     // `child.wait()` below — the guest reads it at boot.
     let boot_dir = tempfile::Builder::new()
         .prefix("pillbox-grade-boot-")
         .tempdir()
         .context("create grader boot dir")?;
-    std::fs::write(boot_dir.path().join(BOOT_SCRIPT), format!("{script}\n"))
-        .context("write grader boot script")?;
+    let (boot_share, boot_exec) =
+        boot::boot_channel(boot_dir.path(), "boot", "/run/pillbox-boot", &script)?;
 
     let vmspec = VmSpec {
         rootfs: rootfs.to_string_lossy().into_owned(),
@@ -1253,12 +1197,9 @@ pub(crate) fn score_in_sandbox(
                 tag: "grade".into(),
                 host_path: workspace.to_string_lossy().into_owned(),
             },
-            Share {
-                tag: "boot".into(),
-                host_path: boot_dir.path().to_string_lossy().into_owned(),
-            },
+            boot_share,
         ],
-        exec: bootstrap_exec("boot", "/run/pillbox-boot"),
+        exec: boot_exec,
         vsock: None,
         egress,
     };
@@ -1390,50 +1331,5 @@ fn accept_attach(listener: &UnixListener, child: &mut std::process::Child) -> Re
             bail!("timed out waiting for the guest pty-host to connect");
         }
         std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The bootstrap IS the kernel cmdline — libkrun validates it as printable
-    /// ASCII (`' '..='~'`) and a violation aborts the VMM. Everything dynamic
-    /// must stay out of it; this pins the invariant.
-    #[test]
-    fn bootstrap_exec_is_kernel_cmdline_safe() {
-        for part in bootstrap_exec("creds", GUEST_HOME) {
-            assert!(
-                part.chars().all(|c| matches!(c, ' '..='~')),
-                "bootstrap exec must stay printable ASCII: {part:?}"
-            );
-        }
-    }
-
-    /// The whole point of the boot script: bytes the cmdline can't carry
-    /// (newlines, unicode — a seeded prompt, a --memory briefing) survive
-    /// verbatim inside the quoted export.
-    #[test]
-    fn env_exports_carries_any_byte_in_values() {
-        let out = env_exports(&[("SEED".into(), "multi\nline — émoji".into())]).unwrap();
-        assert_eq!(out, "export SEED='multi\nline — émoji'\n");
-    }
-
-    #[test]
-    fn env_exports_quotes_embedded_single_quotes() {
-        let out = env_exports(&[("K".into(), "it's".into())]).unwrap();
-        assert_eq!(out, "export K='it'\\''s'\n");
-    }
-
-    /// Keys are spliced unquoted into the script — a non-identifier name is a
-    /// script-injection vector, so it must be rejected, not escaped.
-    #[test]
-    fn env_exports_rejects_non_identifier_keys() {
-        for bad in ["BAD KEY", "9LEAD", "INJ'ECT", "", "A=B"] {
-            assert!(
-                env_exports(&[(bad.to_string(), "v".into())]).is_err(),
-                "key {bad:?} must be rejected"
-            );
-        }
     }
 }

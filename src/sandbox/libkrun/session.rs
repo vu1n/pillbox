@@ -680,11 +680,18 @@ fn run_detached(
     );
     // Don't wait: the child (VM + egress + MITM, with the vault) is reparented to
     // init and keeps running.
-    println!(
-        "pillbox: ✓ session `{}` started in background (libkrun)",
-        session.id
-    );
-    println!("  Next: pillbox session attach {}", session.id);
+    if opts.json {
+        println!(
+            "{}",
+            crate::paths::json_v1(vec![("session", session.to_json_value())])
+        );
+    } else {
+        println!(
+            "pillbox: ✓ session `{}` started in background (libkrun)",
+            session.id
+        );
+        println!("  Next: pillbox session attach {}", session.id);
+    }
     Ok(())
 }
 

@@ -519,10 +519,16 @@ fn unsupported(spec: &AgentSpec, what: &str) -> anyhow::Error {
 
 /// Materialize the runner OCI image into a cached on-disk directory usable as a
 /// virtio-fs root (libkrun's `krun_set_root` takes a *directory*, not an image).
-/// One-time per image via `docker export`; cached under `~/.pillbox/krun/rootfs/`.
+/// One-time per concrete image via `docker export`; cached under
+/// `~/.pillbox/krun/rootfs/`. The key includes Docker's image id, not just the
+/// tag string, so mutable tags (`:rolling`) rematerialize after `docker pull`
+/// instead of reusing an older exported rootfs.
 fn materialize_rootfs(resolved: &Pillbox) -> Result<PathBuf> {
     let (image, _) = crate::docker::resolve_runner_image(resolved);
-    let cache = krun_cache_dir()?.join("rootfs").join(sanitize(&image));
+    let image_id = docker_image_id(&image)?;
+    let cache = krun_cache_dir()?
+        .join("rootfs")
+        .join(rootfs_cache_key(&image, &image_id));
     let marker = cache.join(".materialized");
     if marker.exists() {
         return Ok(cache);
@@ -569,8 +575,31 @@ fn materialize_rootfs(resolved: &Pillbox) -> Result<PathBuf> {
             bail!("rootfs export failed: {e}");
         }
     }
-    std::fs::write(&marker, image.as_bytes()).context("write rootfs cache marker")?;
+    std::fs::write(&marker, format!("{image}\n{image_id}\n"))
+        .context("write rootfs cache marker")?;
     Ok(cache)
+}
+
+fn docker_image_id(image: &str) -> Result<String> {
+    let out = Command::new("docker")
+        .arg("image")
+        .arg("inspect")
+        .arg(image)
+        .arg("--format")
+        .arg("{{.Id}}")
+        .output()
+        .with_context(|| format!("inspect runner image {image}"))?;
+    if out.status.success() {
+        return Ok(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    }
+    bail!(
+        "docker image inspect {image} failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    )
+}
+
+fn rootfs_cache_key(image: &str, image_id: &str) -> String {
+    format!("{}_{}", sanitize(image), sanitize(image_id))
 }
 
 fn krun_cache_dir() -> Result<PathBuf> {

@@ -1,6 +1,22 @@
-# pillbox
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/pillbox-logo-dark.svg">
+    <img alt="pillbox" src="assets/brand/pillbox-logo-light.svg" width="340">
+  </picture>
+</p>
 
-**A secure, fast-loading sandbox for coding agents.** Run `claude`, `codex`,
+<p align="center"><b>A secure, fast-loading sandbox for coding agents.</b></p>
+
+<p align="center">
+  <a href="#what-pillbox-is">What it is</a> &nbsp;·&nbsp;
+  <a href="#command-surface">Commands</a> &nbsp;·&nbsp;
+  <a href="#build">Build</a> &nbsp;·&nbsp;
+  <a href="SECURITY.md">Security</a>
+</p>
+
+---
+
+Run `claude`, `codex`,
 `opencode`, or `pi` in a hardened container that hands the agent credentials it
 can *use but never see* — then put a nice frontend on top, or just drive it
 from your terminal.

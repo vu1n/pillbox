@@ -30,8 +30,9 @@ Five agent CLIs preinstalled at known paths:
 | pi | `npm i -g @earendil-works/pi-coding-agent@<pinned>` | yes |
 
 Plus the system tooling agents tend to reach for: `bash`,
-`bubblewrap`, `ca-certificates`, `curl`, `gh`, `git`, `jq`,
-`openssl`, `python3`, `ripgrep`, `tmux`, `xz-utils`, Node 22 LTS.
+`bubblewrap`, `ca-certificates`, `curl`, `gh`, `git`, `iproute2`
+(the `ip` tool the libkrun egress fence needs), `jq`, `openssl`,
+`python3`, `ripgrep`, `tmux`, `xz-utils`, Node 22 LTS.
 
 And **`pillbox` itself** at `/usr/local/bin/pillbox`, compiled from the
 repo in a multi-stage build. The in-sandbox pillbox runs the interactive

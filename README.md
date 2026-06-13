@@ -102,7 +102,7 @@ unique per host.
 name = "my-project"
 
 # Optional — default agent for `pillbox run`
-agent = "claude"          # or "codex"
+agent = "claude"          # claude | codex | codex-serve | opencode | pi
 
 # Workspace backend (default: local)
 [workspace]

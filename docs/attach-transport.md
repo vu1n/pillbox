@@ -170,12 +170,15 @@ and adds `launch`.
 
 ### Backend mapping
 
-| Concern | local docker | e2b | ssh VPS |
-|---|---|---|---|
-| pty-host location | host process (or in-container) | inside sandbox (`pillbox` mode) | on VPS (`pillbox` mode) |
-| frame transport | `docker exec` stdio | raw-pty `pty-relay` via Node helper stdio | ssh stdio |
-| snapshot | `ScreenModel` (vt100) | `ScreenModel` (vt100) | `ScreenModel` (vt100), or tmux |
-| ssh-detach today | n/a | works | **falls out for free** |
+| Concern | local docker | libkrun microVM |
+|---|---|---|
+| pty-host location | in-container (`pillbox pty-host`) | in-guest (`pillbox-init`) |
+| frame transport | `docker exec` stdio | vsock / forwarded socket |
+| snapshot | `ScreenModel` (vt100) | `ScreenModel` (vt100) |
+
+> The original e2b / ssh columns are gone: the remote backend plane was removed
+> (pillbox is local-only). libkrun is the realized second backend; the frame
+> protocol is unchanged across both.
 
 ## Validated by prototype (`/tmp/ptyproto`, 2026-05-27)
 
@@ -214,6 +217,10 @@ and adds `launch`.
 4. **ssh binding** — same host over ssh stdio; ssh detach lands for free.
 5. **Embedder front-end** — `pillbox session attach --protocol frames` +
    reference TS client; add flow control + multi-client.
+
+> **Status (2026-06):** phases 1–2 shipped. The e2b/ssh bindings (phases 3–4)
+> were **dropped** with the remote plane — libkrun replaced them as the second
+> backend (frames over vsock). Phase 5 (multi-client + flow control) is open.
 
 ## Non-goals
 

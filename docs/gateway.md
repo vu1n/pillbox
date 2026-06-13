@@ -12,8 +12,12 @@ a network process holding an append lock. The **attach endpoint**'s read side
 ships as `src/gateway.rs` (`session subscribe` — a sync `tungstenite` WS server
 streaming `Subscribe(from_seq)` as JSON), plus `session send` for input and
 tail-while-serving (the gateway tails a live session's transcript→log while it
-serves). **Not built:** the **broker** (participant auth / roster /
-driver-token arbitration / the `actor` it stamps) — net-new; the submit→seq
+serves). §0 multiplayer (crate v0.2.0) added a **producer-stamped `actor`** on
+every event plus durable attributed `Payload::Input` (`session send`) and
+`Payload::Annotation` (`session annotate`), and locked the log append against
+concurrent-writer seq collision. **Not built:** the **broker** (participant auth /
+roster / driver-token arbitration / the *authenticated* actor it would stamp at a
+network boundary — today's actor is producer-stamped and unauthenticated) — net-new; the submit→seq
 *network* wire contract + the in-sandbox producer token + the host↔sandbox
 seq-authority handoff. Today's gateway is single-writer, single-session,
 localhost, unauthenticated.

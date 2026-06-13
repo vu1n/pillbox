@@ -55,7 +55,7 @@ The hard core — opencode's event stream → pillbox's §0 — is built and tes
   `session watch`/`subscribe` read. Transport-agnostic over a generic `Read`.
 - **5 unit tests** (real-envelope fixtures) incl. an end-to-end raw-SSE → durable-log drain. No new deps.
 
-**Live-verified against the runner image (`opencode 1.15.10`) with real GLM auth:**
+**Live-verified with real GLM auth** (against `opencode 1.15.10`; the runner image now pins **1.17.3**):
 `opencode serve` boots; created a session; drove a `glm-4.5-air` turn via
 `prompt_async`; observed the real `/event` stream (`message.part.delta`×N,
 `message.part.updated:tool`, `session.idle`) — which is what the mapper now
@@ -67,7 +67,7 @@ targets.
 > (`agent.switched`, `model.switched`) — the **content streams over
 > `message.*`**. Always verify opencode mappings against a captured turn, not `/doc`.
 
-## Contract (verified live against `opencode 1.15.10`)
+## Contract (verified live against `opencode 1.15.10`; runner now pins 1.17.3)
 
 Use the **bare** routes — the `/api/*` namespace in `/doc` is GET-only/experimental
 and POSTs there fall through to the SPA HTML.

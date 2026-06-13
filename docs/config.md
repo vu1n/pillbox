@@ -14,7 +14,7 @@ For the command-table reference see [../AGENTS.md](../AGENTS.md).
 name = "my-project"
 
 # Optional — default agent for `pillbox run`
-agent = "claude"          # "claude" | "codex"
+agent = "claude"          # "claude" | "codex" | "codex-serve" | "opencode" | "pi"
 
 # Workspace backend (PR 3). Default is local.
 [workspace]
@@ -36,7 +36,7 @@ typos *inside* `[workspace]` are silently ignored at parse time.
 | Field | Type | Notes |
 |---|---|---|
 | `name` | string | Required. Display name for the pillbox; also defaults `pillbox run`'s `--name`. |
-| `agent` | string | Default agent for `pillbox run` (`claude` or `codex`). |
+| `agent` | string | Default agent for `pillbox run` (`claude`, `codex`, `codex-serve`, `opencode`, or `pi`). |
 | `[workspace].backend` | string | `local` (default) or `s3`. Picks the rustic-backed snapshot store. |
 | `[workspace].endpoint` | string | S3-only. URL for R2, MinIO, Backblaze, native S3, etc. |
 | `[workspace].region` | string | S3-only. Defaults to `auto`. |

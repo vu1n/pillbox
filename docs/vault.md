@@ -23,11 +23,13 @@ present, runs reuse it. A run inside project `myapp` would persist a stable CA a
 
 > **Egress note:** by default the proxy MITMs only matched hosts
 > (Anthropic/OpenAI/GitHub) and **passes non-matched hosts through unmodified** —
-> so out of the box it is not a general exfiltration guard. The fix is the
-> **default-deny broker** ([§Broker model](#broker-model-v2--the-policy-bound-egress-broker)):
-> the decision layer is built (`src/vault/egress.rs`, off by default), with CLI
-> enablement + the backend egress fence as the next slices. See also
-> [security.md](./security.md). The vault runs **on the host** today:
+> so out of the box it is not a general exfiltration guard. The
+> **default-deny broker** ([§Broker model](#broker-model-v2--the-policy-bound-egress-broker))
+> closes that gap and is now shipped as **opt-in**: `pillbox run --vault --egress-deny`
+> blocks every host with no credential provider that isn't on `--egress-allow`
+> (the same allowlist arms the libkrun egress fence). Default-off preserves the
+> permissive behavior. See also [security.md](./security.md). The vault runs
+> **on the host** today:
 > the MITM proxy is an in-process server bound to a localhost port that
 > the sandbox reaches over the loopback bridge. Because it lives in the
 > CLI process, a vaulted run must stay in the foreground —
@@ -37,10 +39,11 @@ present, runs reuse it. A run inside project `myapp` would persist a stable CA a
 > **Consequence for the swarm-memory scrub** ([swarm-memory.md](./swarm-memory.md)):
 > that pipeline exact-matches outbound content against the vault's *real* secret
 > values to strip them before pooling — but that is **zero-false-negative only
-> for secrets sent to known-provider hosts, and only once strict-deny lands**. A
+> for secrets sent to known-provider hosts, and only under default-deny egress**. A
 > secret exfiltrated to an *unmatched* host never transits an inspected path, so
-> the scrub never sees it. Strict-deny egress is therefore a **prerequisite for
-> cross-user pooling**, not just hardening.
+> the scrub never sees it. Default-deny (`--egress-deny`) is therefore a
+> **prerequisite for cross-user pooling**, not just hardening — pooling must run
+> with it on.
 
 For the command reference, see [../AGENTS.md](../AGENTS.md).
 

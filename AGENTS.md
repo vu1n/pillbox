@@ -90,9 +90,11 @@ global pillbox regardless of where you are.
 | `pillbox sidecar [--bind] [--json]` | Standalone vault sidecar process. |
 | `pillbox session list [--json]` | List sessions started from this pillbox (oldest first). |
 | `pillbox session info ID [--json]` | Show one session (accepts unique id prefix ≥ 4 chars). |
+| `pillbox session diagnose ID [--json]` | Diagnose one session: derived status, failure detail, and an activity summary from the durable log — the "what happened / why is it stuck" companion to `info`. Accepts an id prefix ≥ 4 chars. |
 | `pillbox session attach ID` | Reattach to a detached session. Detach again with Ctrl-A + D or `pillbox session detach ID` from another shell. Works for the local Docker and libkrun backends. |
 | `pillbox session detach ID` | Signal a currently-attached pillbox to detach (SIGTERM, no-op if already detached). |
 | `pillbox session send ID TEXT` | Drive a running (detached) session: push TEXT to the agent's PTY as if typed — the programmatic SendInput half (pair with `session subscribe` to read the response). Bytes sent as-is; add a trailing newline/`\r` to submit a prompt to a TUI agent. Local Docker sessions today. |
+| `pillbox session annotate ID TEXT [--anchor REF]` | Record an attributed, durable §0 comment WITHOUT driving the agent — the async, keyboard-free "chime in" (distinct from `send`, which steers). Lands in the log stamped with your actor; an orchestrator may inject it as agent context. `--anchor` references what it's about (a seq, a path, a message id). |
 | `pillbox session subscribe ID [--from SEQ] [--bind ADDR]` | Stream a session's durable event log to WebSocket subscribers as JSON (one Event per text frame, in seq order from `--from`). For a **live** (detached) session it also tails the transcript→log while serving, so a driven detached session is readable; for a foreground/historical session it serves the existing log. Binds localhost (`--bind`, default `127.0.0.1:0` — printed) until Ctrl-C. The §0 local read surface a chat bridge / orchestrator / browser connects to without a shell. If `$PILLBOX_EVENTS_WEBHOOK` is set, also POSTs attention signals to it (read-side). |
 | `pillbox session watch ID [--from SEQ]` | Render a session's event stream to **this terminal** — messages by role, tools (⚙/✓/✗), thinking, the ⏳ attention signal — the human-facing reader (`docker logs` model; `subscribe` is the machine/WS sibling). Tails a live session as it works. Ctrl-C to stop. Accepts an id prefix. |
 | `pillbox session rm ID` | Tear down the backend (kill sandbox) and remove the session record. |
@@ -118,6 +120,20 @@ global pillbox regardless of where you are.
 | `pillbox bookmark rm NAME` | Remove a bookmark; the underlying snapshot is untouched. |
 | `pillbox workspace rekey` | Rotate the rustic repo password. **Caveat:** rustic_core 0.11 has no public API to delete the prior key; both passwords keep working until upstream lands deletion. Treat the old password as compromised. |
 
+### Sandboxes — a long-lived exec target (Docker)
+
+`pillbox run` launches one agent turn. The `sandbox` group instead spawns a
+**long-lived** sandbox you keep around and `exec`/`agent` into repeatedly — the
+PTY-free exec channel an orchestrator drives. Docker-backed today.
+
+| Command | What it does |
+|---|---|
+| `pillbox sandbox spawn [--image IMG] [--agent A] [--workspace PATH] [--label TEXT]` | Spawn an idle sandbox with the workspace mounted; prints the sandbox id. `--agent` provisions its auth + runs non-root so the agent channel can drive it; omit for a bare exec-only sandbox. |
+| `pillbox sandbox exec ID [--json] -- ARGV…` | Run a command (PTY-free). Streams raw output + mirrors the exit code; `--json` emits `ExecStarted`/`ExecOutput`/`ExecExit` as JSONL. |
+| `pillbox sandbox agent ID [--json] -- PROMPT…` | Run an agent turn (the agent channel) in a sandbox spawned `--agent`. Streams contract events; `--json` for JSONL, else a human trace. |
+| `pillbox sandbox list [--json]` | List sandboxes in the current pillbox. |
+| `pillbox sandbox destroy ID` | Kill the sandbox container and remove the record. |
+
 ### `pillbox run` flags
 
 | Flag | Default | Purpose |
@@ -130,12 +146,20 @@ global pillbox regardless of where you are.
 | `--env BUNDLE` | — | Inject every variable from a stored env bundle. |
 | `--env-file PATH` | — | Inject every variable from a `.env` on disk. |
 | `--vault` | — | Route agent traffic through the stub-swap proxy. |
+| `--egress-allow HOST` | — | Open one host through the libkrun egress fence **and** the vault broker allowlist (repeatable; exact match, or `.suffix` for subdomains). For a self-hosted model endpoint or a registry a build needs. |
+| `--egress-deny` | — | Switch on the vault broker's **default-deny**: block outbound to any host with no credential provider that isn't on `--egress-allow`. Enforced at the vault proxy — needs `--vault` (or a vaulted `--with`), else warns and is a no-op. See [docs/vault.md](./docs/vault.md). |
+| `--memory` | — | Wire in swarm memory (the external [`kypp`](https://github.com/vu1n/kypp) engine, attached not owned): brief the agent from project memory at start, capture this session's §0 log after. Host-side, best-effort — a missing/erroring `kypp` warns, never fails the run. |
+| `--mcp NAME=URL` | — | Attach a shared MCP server (`http(s)://`). NAME is what the agent sees; `localhost`/`127.0.0.1` are rewritten to `host.docker.internal`. Repeatable. See [docs/shared-mcp.md](./docs/shared-mcp.md). |
+| `--mcp-token NAME=SECRET_NAME` | — | Attach a bearer token (from the secret store) to a `--mcp NAME`. claude folds it into a 0600 headers tempfile; codex into an env var via `bearer_token_env_var`. Never lands in argv or shell history. Repeatable. |
 | `--from-bookmark NAME` | — | Start from a named snapshot bookmark — restore that bookmark into the workspace before launching the agent. |
 | `--detach` | — | Start the session and immediately return — the agent keeps running in the background; reattach with `pillbox session attach <id>`. Works for both local backends (Docker and libkrun). Local `--detach` does NOT support `--vault` (the host-side proxy can't outlive the CLI). |
 | `--events-webhook URL` | — | POST every lifecycle event to URL as JSON. Forwarded to the in-sandbox wrapper so terminal events (`session.completed`/`failed`) reach back to the orchestrator. Equivalent to `$PILLBOX_EVENTS_WEBHOOK`. See [docs/observability.md](./docs/observability.md) for the full sink reference (JSONL / webhook / OTLP via `$OTEL_EXPORTER_OTLP_ENDPOINT`). |
 | `--ttl DURATION` | — | Per-session retention TTL — `30m` / `24h` / `7d` (`s`/`m`/`h`/`d` units only, max 365d). Writes `expires_at` to the record. `pillbox session prune` drops expired sessions. Requires `--detach`. |
 | `--label TEXT` | — | Human label for a detached session, surfaced in `pillbox session list`. Only meaningful with `--detach`. |
 | `--json` | — | Emit the started session as `{version:1, session:{id,…}}` on stdout instead of the human banner — `pillbox run --json \| jq -r .session.id`. Needs a persisted session: a `--detach` run (any agent) or a server-mode agent (`opencode`, always reparented). A foreground PTY run has nothing to emit and is rejected at dispatch. |
+| `--model PROVIDER/MODEL` | agent default | Model for a server-mode agent (`opencode`), e.g. `zai-coding-plan/glm-4.5-air`. Ignored by PTY agents. |
+| `--temperature FLOAT` | — | Sampling temperature for a server-mode agent (`opencode`), sent on every `session send`. `0` = greedy/deterministic decoding (the eval rig's variance knob). Ignored by PTY agents. |
+| `--parent ID` | — | The session this run forked from. Carried to the lifecycle event as `parent_session_id` and to OTel as `parent_span_id`, so a forked trace stitches across pillboxes. Observability metadata — the parent need not exist in this pillbox. |
 
 Env composition order (later layers override earlier):
 
@@ -420,6 +444,13 @@ v0.5 command shapes that break in v0.6:
 
 ## Pillbox version this guide describes
 
-v0.6 (pillbox-as-bundle reshape + workspace versioning + sessions,
-local-only). If `pillbox version` reports something else, command shapes
-may differ.
+Two version namespaces, on purpose:
+
+- **Design milestone** — `v0.6` (pillbox-as-bundle reshape + workspace
+  versioning + sessions, local-only), since extended by the libkrun pivot and
+  the **§0 multiplayer** layer. The doc headings track this label.
+- **Published crate / `pillbox version`** — `0.2.0` (git tags `v0.1.0`,
+  `v0.2.0`). This is what `pillbox version` reports; it is *not* the milestone
+  label, so don't expect them to match.
+
+If a command shape here disagrees with your binary, trust `pillbox --help`.

@@ -12,6 +12,11 @@ Status: **partially built** (2026-05-31) — the local-substrate core is shipped
   decoupled from the OTLP gate; **lossless** — `Usage`/`Thinking`/`model`/
   `stop_reason` added to proto + Rust). Local subscribe surface = the `session
   subscribe` WS gateway (`src/gateway.rs`) + `session send` (the drive half).
+  **§0 multiplayer (crate v0.2.0):** every event now carries a producer-stamped
+  authenticated `actor`; `Payload::Input` (durable, attributed `session send`) and
+  `Payload::Annotation` (non-driving `session annotate`, `--anchor`) landed; the
+  log append is **locked** so concurrent writers can't collide on `seq`; `session
+  watch` renders actor attribution + Input/Annotation.
 - **Fan-out = read-side exporters of the log (decided 2026-05-31).** The
   "OTel/Raindrop become exporters that read the log" line below is now the
   realized model, not just intent: `subscribe` uses a `notify` tail (the file
@@ -21,8 +26,10 @@ Status: **partially built** (2026-05-31) — the local-substrate core is shipped
   intuitive producer-side push-bus + `EventType`-fold (the file is the
   cross-process IPC; network on the append path stalls the agent; the fold
   pulls in the deferred host↔sandbox seq handoff).
-- **Deferred (the unification this doc specs):** `actor` on the envelope +
-  gateway-assigned seq / actor-auth; folding the lifecycle stream
+- **Deferred (the unification this doc specs):** *gateway-authenticated* actor +
+  gateway-assigned seq (the `actor` field shipped, but it is **producer-stamped
+  locally**, not authenticated at a network boundary; driver-token arbitration is
+  designed, not built); folding the lifecycle stream
   (`events/mod.rs` / `events.jsonl`) into the log (still a separate stream — the
   next step is to make `events.jsonl` a read-side **projection**, then defer the
   full `EventType`→`Payload` fold until multiplayer needs the unified actor/seq

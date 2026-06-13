@@ -6,6 +6,82 @@ the design milestone (`v0.6`); the published Cargo crate / runner image
 are versioned separately. `0.1.0` is the first non-prerelease crate — it
 moves the `:latest` runner image and ships the interactive attach
 transport (in-sandbox pty-host + frame protocol; local detach/reattach).
+`0.2.0` is the §0 multiplayer trust layer + the libkrun pivot (below).
+
+## v0.2.0 (crate) — local-only (libkrun pivot) + §0 multiplayer
+
+> The crate version (`0.2.0`, what `pillbox version` reports) and the design
+> milestone (`v0.6`) are separate namespaces. This section is the post-`v0.6`
+> work; the `v0.6 PR` entries below are kept as history.
+
+### remote plane removed → local-only
+
+- **Removed the entire remote backend plane:** the `remote add/list/info/rm`
+  commands, `pillbox run --remote`, the `ssh://` / `e2b://` / `docker://` URL
+  backends, `RemoteSsh` / `RemoteE2b`, and the e2b Node helper + `pty-relay`
+  bridge. pillbox is now **local-only**. This retires the v0.6 PR 4/5 and the
+  ssh/e2b halves of the interactive-attach-transport entry below. "Remote"
+  returns later as a managed/Cloudflare tier with a different shape.
+
+### libkrun backend (local microVM)
+
+- New **libkrun** backend, opt-in via `PILLBOX_BACKEND=libkrun`: a local microVM
+  (macOS/HVF, Linux/KVM), no daemon. Owns the VMM via FFI; vsock control plane +
+  smoltcp userspace egress; an in-guest `pillbox-init` runs the pty-host + frame
+  protocol. Boot via a creds-share boot script (off the ASCII-only kernel
+  cmdline). Full session surface incl. detach/reattach and vaulted detached runs.
+- Rootfs cache keyed by docker **image id** (not tag); falls back to a cached
+  rootfs when docker is unreachable.
+
+### §0 multiplayer trust layer
+
+- Every §0 event now carries a producer-stamped **authenticated actor**.
+- `pillbox session send` = durable, attributed input (the drive half);
+  `pillbox session annotate ID TEXT [--anchor REF]` = a non-driving attributed
+  §0 comment (multiplayer "chime in").
+- §0 log append is **locked** so concurrent writers can't collide on `seq`.
+- `pillbox session watch` renders actor attribution + Input/Annotation.
+- Cloudflare Durable-Object-as-§0-gateway **spike** (contract.ts ↔ contract.rs
+  parity, machine-checked) — the managed-tier direction; a spike, not product.
+
+### credential vault — policy-bound egress broker
+
+- **Default-deny egress broker:** `pillbox run --vault --egress-deny` blocks any
+  host with no credential provider that isn't on `--egress-allow`.
+- `--egress-allow HOST` (repeatable; exact or `.suffix`) opens specific hosts
+  through both the libkrun egress fence and the broker allowlist.
+- Destination-bound StubSwap; **per-run ephemeral CA** by default (stable CA
+  opt-in via `pillbox vault ca`); SSRF / DNS-rebind guard on the forward leg.
+
+### sessions — the optimization & read surface
+
+- `pillbox session score` — external grading and the **verifiable reward
+  channel**: `--cmd` (one verifier) | `--rubric FILE` (per-criterion verdicts +
+  fractional score); `--snapshot`/`--workspace`; `--in-sandbox` one-shot microVM
+  grader; `--grader-egress HOST`; `--json` verdict.
+- `pillbox session ingest` — drain the durable §0 capture into `log.jsonl`,
+  post-hoc + idempotent (libkrun opencode).
+- `pillbox session log` — structured read of `log.jsonl` (`--type`/`--last`/`--from`).
+- `pillbox session wait-idle` — block until the turn goes idle (`--timeout`/`--from`).
+- `pillbox session diagnose` — derived status + activity summary.
+- `pillbox session prune [--dry-run]`, `session pull`; `run --ttl` / `--parent`.
+
+### agents & integration
+
+- **opencode** runs server-mode (`opencode serve` + `/event` SSE + `/prompt`) on
+  Docker **and** libkrun (SandboxHttp seam + vsock-forward). `codex-serve` drives
+  `codex app-server` (JSON-RPC), libkrun-only, sharing `codex` auth.
+- `--model PROVIDER/MODEL` + `--temperature FLOAT` for server-mode agents.
+- `--mcp NAME=URL` shared-MCP attach + `--mcp-token NAME=SECRET_NAME` (bearer
+  token from the secret store; never in argv/history).
+- `--memory` wires in the external [`kypp`](https://github.com/vu1n/kypp)
+  swarm-memory engine (brief-before / capture-after, host-side, best-effort).
+- runner image bumps: codex `0.139.0`, opencode `1.17.3`, pi `0.79.1`.
+
+### observability
+
+- `pillbox session transcript --follow` emits OTLP child spans from agent-native
+  transcripts; sandbox startup timings instrumented.
 
 ## v0.6 — pillbox-as-bundle + remote backends
 

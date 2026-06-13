@@ -123,11 +123,11 @@ code, model only for the generalize step):
    cross-user *default* ("patterns are inferences, not facts").
 
 **Honest about the guarantee:** "exact-match scrub against vaulted secrets =
-zero false negatives" holds **only for known-provider hosts under strict-deny
-egress**. The vault passes non-matched hosts through unmodified
-(`vault/server.rs:6`), so a secret exfiltrated elsewhere never transits an
-inspected path — **strict-deny egress (403 on unmatched) must land before any
-cross-user pooling.** Pool **signal by default, content only by opt-in** (FedPOB:
+zero false negatives" holds **only for known-provider hosts under default-deny
+egress**. The vault passes non-matched hosts through unmodified by default, so a
+secret exfiltrated elsewhere never transits an inspected path — **cross-user
+pooling must therefore run with default-deny egress on** (`--egress-deny`, now
+shipped opt-in; off by default). Pool **signal by default, content only by opt-in** (FedPOB:
 sharing only the helpful/harmful *counters* improves everyone, and gains grow
 with participants — the counters are shareable even when bullet text isn't).
 Managed-tier (SAMEP shape): per-user private verbatim memory *below* an opt-in

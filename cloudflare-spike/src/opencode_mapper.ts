@@ -15,6 +15,11 @@
 // absent token counts rather than emitting empty strings — so a future
 // cross-language fixture diff (the documented sequel to the contract-parity gate)
 // can compare serialized payloads byte-for-byte.
+//
+// The opencode event inputs are typed `any` on purpose: they're untyped wire JSON
+// (the analog of opencode.rs's `&serde_json::Value`). The strong contract is the
+// `Payload[]` OUTPUT; `unknown` would force a cast at every `?.` access the chains
+// already guard, so `any` is the deliberate boundary type here, not lazy typing.
 
 import type { Payload } from "./contract.js";
 
@@ -180,6 +185,8 @@ export class OpencodeMapper {
         name: part?.tool ?? "",
         status,
         // Omit empty/absent fields to match contract.rs's skip_serializing_if.
+        // The two checks differ deliberately — don't normalize: `input` mirrors
+        // `Option<Value>` (omit when null), `output` mirrors `String` (omit when "").
         ...(state?.input != null ? { input: state.input } : {}),
         ...(output !== "" ? { output } : {}),
       },

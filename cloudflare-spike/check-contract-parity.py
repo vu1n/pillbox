@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Machine-check that the CF §0 contract (src/contract.ts) stays faithful to the canonical
+"""DEPRECATED — being replaced by schemars codegen (see ./contract-sync.md). This regex
+parser is the INTERIM `contract.rs ↔ contract.ts` gate; once `contract.ts` is generated
+from `contract.schema.json` (`npm run gen:contract`), delete this file and switch
+scripts/smoke/cf.sh to `cargo test --features contract-schema contract_schema_is_current`
++ `npm run check:contract`. Kept until that cutover so the contract stays gated.
+
+Machine-check that the CF §0 contract (src/contract.ts) stays faithful to the canonical
 Rust contract (../src/contract.rs::Event/Payload/Actor). The "one §0, two backends" thesis —
 local libkrun and the CF DO gateway feeding the SAME event log that kypp/ghost/subscribe
 consume — only holds if these two definitions don't drift. contract.ts is hand-reconciled

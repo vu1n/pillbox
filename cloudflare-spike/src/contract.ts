@@ -57,9 +57,15 @@ export type Payload =
   // is the gateway (system), not the new driver.
   | { type: "driver_changed"; from?: Actor; to?: Actor; mode: "granted" | "requested" | "stolen" | "released" }
   // in contract.rs::Payload (field shapes match the Rust structs):
+  // The agent-output stream the OpencodeMapper emits (consume path). message_start/
+  // thinking/usage were previously absorbed by the catch-all (rust-only); modeled
+  // explicitly so the parity gate field-checks them against contract.rs.
+  | { type: "message_start"; messageId: string; role: string }
   | { type: "message_delta"; messageId: string; text: string }
   | { type: "message_end"; messageId: string; model?: string; stopReason?: string }
+  | { type: "thinking"; text: string }
   | { type: "tool_call"; toolCallId: string; name: string; status: string; input?: unknown; output?: string; title?: string }
+  | { type: "usage"; messageId: string; inputTokens?: number; outputTokens?: number; cacheReadInputTokens?: number; cacheCreationInputTokens?: number; source: string }
   | { type: "attention_required"; reason: string; message: string }
   // catch-all == contract.rs Payload::Unknown (any unmodeled `type`):
   | { type: string; [k: string]: unknown };

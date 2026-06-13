@@ -1,0 +1,992 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Event",
+  "description": "One event on a session's durable log. Envelope + a typed payload.\n\n`session_id` is the **partition key** — the durable identity that outlives\nthe sandboxes/runs/execs a session spans (see docs/session-event-log.md).\n`sandbox_id`/`run_id`/`exec_id` demote to optional *correlation*: which\nsandbox/run/exec a given line happened in.\n\n`seq` is monotonic **per session** and assigned by the session log on\nappend (the log is the seq authority), to DURABLE events only; ephemeral\ntelemetry carries `seq == 0` and is excluded from replay. Producers build\nevents via [`Event::session`] with `seq == 0` and let\n[`crate::events::log::SessionLog::append`] stamp it.",
+  "type": "object",
+  "properties": {
+    "actor": {
+      "description": "Who produced this event — stamped by the producer/gateway, never\nself-reported by the in-sandbox agent (the trust boundary; authz keys off\n`actor`). `None` on legacy/unattributed events. See [`Actor`].",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Actor"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "at": {
+      "description": "RFC3339 timestamp.",
+      "type": "string"
+    },
+    "ephemeral": {
+      "type": "boolean"
+    },
+    "execId": {
+      "type": "string"
+    },
+    "payload": {
+      "$ref": "#/$defs/Payload"
+    },
+    "runId": {
+      "type": "string"
+    },
+    "sandboxId": {
+      "type": "string"
+    },
+    "seq": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "sessionId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "seq",
+    "at",
+    "payload"
+  ],
+  "$defs": {
+    "Actor": {
+      "description": "Who produced an event. **Stamped by the producer/gateway from an authenticated\nsource, never self-reported by the in-sandbox agent** — unlike the old\n`host`/`sandbox` emitter tag, authz (who may drive / approve / join) keys off\n`actor`, so it is the trust boundary. See docs/session-event-log.md §Actor model.",
+      "type": "object",
+      "properties": {
+        "display": {
+          "type": "string"
+        },
+        "id": {
+          "description": "Stable, kind-prefixed id (`a:<agent>`, `u:<user>`, `svc:<service>`,\n`pillbox`) — the [`Actor`] constructors apply the prefix.",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ActorKind"
+        }
+      },
+      "required": [
+        "kind",
+        "id"
+      ]
+    },
+    "ActorKind": {
+      "type": "string",
+      "enum": [
+        "human",
+        "agent",
+        "system",
+        "service"
+      ]
+    },
+    "AgentPhase": {
+      "type": "string",
+      "enum": [
+        "unspecified",
+        "queued",
+        "thinking",
+        "editing",
+        "running_tool",
+        "waiting_input",
+        "done"
+      ]
+    },
+    "Annotation": {
+      "description": "An attributed, durable comment on a session that does NOT drive the agent —\nthe async, keyboard-free \"chime in\" (Slack-thread style). Unlike [`Input`] it\ncarries no driver semantics (anyone may annotate, no arbitration), so it's how\na non-driver participates; an orchestrator may optionally inject it as agent\ncontext. `anchor` is a free-form reference to what it's about (a seq, a path, a\nmessage id).",
+      "type": "object",
+      "properties": {
+        "anchor": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ]
+    },
+    "AttentionReason": {
+      "type": "string",
+      "enum": [
+        "unspecified",
+        "needs_input",
+        "error_stalled",
+        "permission"
+      ]
+    },
+    "AttentionRequired": {
+      "type": "object",
+      "properties": {
+        "message": {
+          "type": "string"
+        },
+        "reason": {
+          "$ref": "#/$defs/AttentionReason"
+        }
+      },
+      "required": [
+        "reason",
+        "message"
+      ]
+    },
+    "Checkpoint": {
+      "type": "object",
+      "properties": {
+        "message": {
+          "type": "string"
+        },
+        "snapshotHandle": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "snapshotHandle"
+      ]
+    },
+    "Criterion": {
+      "description": "One rubric criterion's verdict: a named, independently-verifiable check\n(its own command exit) plus its captured output. The structured unit a\n`--rubric` grade decomposes into.",
+      "type": "object",
+      "properties": {
+        "feedback": {
+          "description": "The criterion command's combined output, tail-capped. Empty when it\nproduced none (e.g. a silent passing check).",
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "passed": {
+          "description": "The criterion's command exited 0.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "passed"
+      ]
+    },
+    "Custom": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "payload": true
+      },
+      "required": [
+        "name"
+      ]
+    },
+    "ExecExit": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "integer",
+          "format": "int32"
+        }
+      },
+      "required": [
+        "code"
+      ]
+    },
+    "ExecOutput": {
+      "description": "`data` is base64-encoded bytes (matches the proto `bytes` field under\nprotobuf-JSON) so binary stdout survives the wire intact.",
+      "type": "object",
+      "properties": {
+        "data": {
+          "type": "string"
+        },
+        "stream": {
+          "$ref": "#/$defs/StdStream"
+        }
+      },
+      "required": [
+        "stream",
+        "data"
+      ]
+    },
+    "ExecStarted": {
+      "type": "object",
+      "properties": {
+        "argv": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "argv"
+      ]
+    },
+    "Input": {
+      "description": "A durable, attributed steer — the §0 record of `session send` (and the managed\ntier's `/input`). It is by definition a discrete *turn* (a submitted\nprompt/command), distinct from the live, ephemeral PTY keystroke\n(`Frame::Input`): this persists + replays + carries `actor`, so a late joiner\nsees who drove the agent and with what. (`data` for binary input is a future\naddition; `session send` is text today.)",
+      "type": "object",
+      "properties": {
+        "target": {
+          "$ref": "#/$defs/InputTarget"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "text",
+        "target"
+      ]
+    },
+    "InputTarget": {
+      "description": "Where the steer goes: the agent's prompt channel, the raw PTY, or a one-off exec.",
+      "type": "string",
+      "enum": [
+        "agent",
+        "pty",
+        "exec"
+      ]
+    },
+    "MessageDelta": {
+      "type": "object",
+      "properties": {
+        "messageId": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "messageId",
+        "text"
+      ]
+    },
+    "MessageEnd": {
+      "type": "object",
+      "properties": {
+        "messageId": {
+          "type": "string"
+        },
+        "model": {
+          "description": "The model that served the message; empty when unknown (e.g. a user\nturn or a harness that doesn't record it).",
+          "type": "string"
+        },
+        "stopReason": {
+          "description": "Why the message stopped (`end_turn`, `tool_use`, …); empty when unknown.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "messageId"
+      ]
+    },
+    "MessageStart": {
+      "type": "object",
+      "properties": {
+        "messageId": {
+          "type": "string"
+        },
+        "role": {
+          "$ref": "#/$defs/Role"
+        }
+      },
+      "required": [
+        "messageId",
+        "role"
+      ]
+    },
+    "Payload": {
+      "description": "Typed payload. Internally tagged on `type` (snake_case), so an\n`exec_output` serializes as `{\"type\":\"exec_output\",\"stream\":\"stdout\",...}`.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "sandbox_provisioned"
+            }
+          },
+          "$ref": "#/$defs/SandboxProvisioned",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "sandbox_ready"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "sandbox_destroyed"
+            }
+          },
+          "$ref": "#/$defs/SandboxDestroyed",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "run_started"
+            }
+          },
+          "$ref": "#/$defs/RunStarted",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "run_finished"
+            }
+          },
+          "$ref": "#/$defs/RunFinished",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "run_failed"
+            }
+          },
+          "$ref": "#/$defs/RunFailed",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "message_start"
+            }
+          },
+          "$ref": "#/$defs/MessageStart",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "message_delta"
+            }
+          },
+          "$ref": "#/$defs/MessageDelta",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "message_end"
+            }
+          },
+          "$ref": "#/$defs/MessageEnd",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "tool_call"
+            }
+          },
+          "$ref": "#/$defs/ToolCall",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "thinking"
+            }
+          },
+          "$ref": "#/$defs/Thinking",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "usage"
+            }
+          },
+          "$ref": "#/$defs/Usage",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "phase_changed"
+            }
+          },
+          "$ref": "#/$defs/PhaseChanged",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "todos_updated"
+            }
+          },
+          "$ref": "#/$defs/TodosUpdated",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "permission_requested"
+            }
+          },
+          "$ref": "#/$defs/PermissionRequested",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "permission_resolved"
+            }
+          },
+          "$ref": "#/$defs/PermissionResolved",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "attention_required"
+            }
+          },
+          "$ref": "#/$defs/AttentionRequired",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "input"
+            }
+          },
+          "$ref": "#/$defs/Input",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "annotation"
+            }
+          },
+          "$ref": "#/$defs/Annotation",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "checkpoint"
+            }
+          },
+          "$ref": "#/$defs/Checkpoint",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "result_ready"
+            }
+          },
+          "$ref": "#/$defs/ResultReady",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "scored"
+            }
+          },
+          "$ref": "#/$defs/Scored",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "exec_started"
+            }
+          },
+          "$ref": "#/$defs/ExecStarted",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "exec_output"
+            }
+          },
+          "$ref": "#/$defs/ExecOutput",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "exec_exit"
+            }
+          },
+          "$ref": "#/$defs/ExecExit",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "custom"
+            }
+          },
+          "$ref": "#/$defs/Custom",
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "description": "Forward/foreign-compat catch-all: any payload `type` this binary\ndoesn't know deserializes here instead of failing the whole line, so a\nnewer or foreign producer can't break replay/decode of the rest of the\nlog (see docs/session-event-log.md §Versioning). Unit + `#[serde(other)]`\nis the only shape serde permits for an internally-tagged catch-all, so\nthe original tag + body are *not* preserved on round-trip yet (it\nre-serializes as `{\"type\":\"unknown\"}`); body-preserving Unknown is the\nupgrade that lands with foreign-trace re-export.",
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "unknown"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        }
+      ]
+    },
+    "PermissionDecision": {
+      "type": "string",
+      "enum": [
+        "unspecified",
+        "allow",
+        "allow_always",
+        "deny"
+      ]
+    },
+    "PermissionRequested": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "input": true,
+        "permissionId": {
+          "type": "string"
+        },
+        "tool": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "permissionId",
+        "tool"
+      ]
+    },
+    "PermissionResolved": {
+      "type": "object",
+      "properties": {
+        "decision": {
+          "$ref": "#/$defs/PermissionDecision"
+        },
+        "permissionId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "permissionId",
+        "decision"
+      ]
+    },
+    "PhaseChanged": {
+      "type": "object",
+      "properties": {
+        "phase": {
+          "$ref": "#/$defs/AgentPhase"
+        }
+      },
+      "required": [
+        "phase"
+      ]
+    },
+    "ResultReady": {
+      "type": "object",
+      "properties": {
+        "snapshotHandle": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "snapshotHandle"
+      ]
+    },
+    "Role": {
+      "type": "string",
+      "enum": [
+        "unspecified",
+        "assistant",
+        "user",
+        "system"
+      ]
+    },
+    "RunFailed": {
+      "type": "object",
+      "properties": {
+        "exitCode": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason",
+        "exitCode"
+      ]
+    },
+    "RunFinished": {
+      "type": "object",
+      "properties": {
+        "exitCode": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "resultSnapshot": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "exitCode"
+      ]
+    },
+    "RunStarted": {
+      "type": "object",
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "baseSnapshot": {
+          "type": "string"
+        },
+        "parentRunId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "agent"
+      ]
+    },
+    "SandboxDestroyed": {
+      "type": "object",
+      "properties": {
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason"
+      ]
+    },
+    "SandboxProvisioned": {
+      "type": "object",
+      "properties": {
+        "image": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "image"
+      ]
+    },
+    "Scored": {
+      "description": "An **external, verifiable** grade of a session's result — produced by running\na grader against the result-snapshot (`pillbox session score --cmd …`), NOT\nself-reported by the agent. (`RunFinished` / `session done --status` is\nself-stamped → Goodhart-banned as a reward.) This is the substrate primitive\nthe optimization loops gate on: GEPA needs a coarse verifiable score, and the\n`feedback` carries the textual gradient (test output, stderr, diff) that does\nthe actual optimizing — not just the scalar.",
+      "type": "object",
+      "properties": {
+        "criteria": {
+          "description": "Per-criterion verdicts from a `--rubric` grade — the rich,\ndecomposed feedback an optimizer reflects on (which criterion failed and\nwhy), vs the single `feedback` blob. Empty for a plain `--cmd` grade.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Criterion"
+          }
+        },
+        "feedback": {
+          "description": "The grader's captured output (the gradient, not just the scalar). For a\nrubric grade, a rendered per-criterion summary; `criteria` carries the\nstructured detail.",
+          "type": "string"
+        },
+        "grader": {
+          "description": "What produced the grade — the verifier command line (or a grader id).",
+          "type": "string"
+        },
+        "passed": {
+          "description": "Verifiable pass/fail = the grader's exit status (0 → `true`).",
+          "type": "boolean"
+        },
+        "score": {
+          "description": "Normalized score in `[0,1]`. A plain `--cmd` grade is binary\n(`passed` → 1.0, else 0.0); a `--rubric` grade is the fraction of\ncriteria that passed — a real gradient, not just the scalar.",
+          "type": "number",
+          "format": "double"
+        }
+      },
+      "required": [
+        "grader",
+        "passed",
+        "score",
+        "feedback"
+      ]
+    },
+    "StdStream": {
+      "type": "string",
+      "enum": [
+        "unspecified",
+        "stdout",
+        "stderr"
+      ]
+    },
+    "Thinking": {
+      "description": "Reasoning/thinking content the harness surfaced for a turn. First-class\nsemantic output (the transcript exposes it discretely), `content`-class and\nlocal-only. Distinct from the MITM raw thinking body (blob-stored).",
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ]
+    },
+    "Todo": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/TodoStatus"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "text",
+        "status"
+      ]
+    },
+    "TodoStatus": {
+      "type": "string",
+      "enum": [
+        "unspecified",
+        "pending",
+        "in_progress",
+        "completed"
+      ]
+    },
+    "TodosUpdated": {
+      "type": "object",
+      "properties": {
+        "todos": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Todo"
+          }
+        }
+      },
+      "required": [
+        "todos"
+      ]
+    },
+    "ToolCall": {
+      "type": "object",
+      "properties": {
+        "input": true,
+        "name": {
+          "type": "string"
+        },
+        "output": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/ToolStatus"
+        },
+        "title": {
+          "type": "string"
+        },
+        "toolCallId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "toolCallId",
+        "name",
+        "status"
+      ]
+    },
+    "ToolStatus": {
+      "type": "string",
+      "enum": [
+        "unspecified",
+        "running",
+        "completed",
+        "error"
+      ]
+    },
+    "Usage": {
+      "description": "Token accounting for a turn, correlated to its message by `message_id`.\n`source` distinguishes the harness's persisted counts ([`UsageSource::Native`])\nfrom MITM wire-observed counts ([`UsageSource::Wire`]) so a consumer can\ndedupe across producers. Token fields are `Option` so \"0 tokens\" is\ndistinguishable from \"not reported\".",
+      "type": "object",
+      "properties": {
+        "cacheCreationInputTokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "cacheReadInputTokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "inputTokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "messageId": {
+          "type": "string"
+        },
+        "outputTokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "source": {
+          "$ref": "#/$defs/UsageSource"
+        }
+      },
+      "required": [
+        "messageId",
+        "source"
+      ]
+    },
+    "UsageSource": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "unspecified"
+          ]
+        },
+        {
+          "description": "MITM wire-observed.",
+          "type": "string",
+          "const": "wire"
+        },
+        {
+          "description": "Harness-persisted (transcript).",
+          "type": "string",
+          "const": "native"
+        }
+      ]
+    }
+  }
+}

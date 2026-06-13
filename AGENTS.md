@@ -12,7 +12,11 @@ what you want.
 > `ssh://`/`e2b://`/`docker://` URL backends are gone. pillbox is now
 > **local-only**, with two local backends: **Docker** (default, cross-platform)
 > and **libkrun** (a local microVM, opt-in via `PILLBOX_BACKEND=libkrun`).
-> "Remote" returns later as the managed/Cloudflare tier, with a different shape.
+> "Remote" returns later as the managed/Cloudflare tier (a different shape). Its
+> §0-gateway substrate — a per-session Cloudflare Durable Object (seq authority +
+> actor attestation + driver arbitration + `subscribe` fan-out) — is already
+> built and proven live on CF's free tier (`cloudflare-spike/`,
+> docs/managed-tier.md); it is not yet a `pillbox run` backend.
 > Everything else (run, secrets, env, auth, vault, sessions, snapshots — and
 > local detach/reattach) is current.
 

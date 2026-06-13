@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "wrangler dev",
     "smoke": "node smoke.mjs",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "gen:contract": "json2ts -i contract.schema.json -o src/contract.generated.ts",
+    "check:contract": "npm run gen:contract && git diff --exit-code src/contract.generated.ts"
   },
   "dependencies": {
     "@cloudflare/sandbox": "^0.11.0",
@@ -14,6 +16,7 @@
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260601.0",
+    "json-schema-to-typescript": "^15.0.0",
     "typescript": "^5.5.0",
     "wrangler": "^4.20.0"
   }

@@ -48,8 +48,10 @@ can build on. No cloud, no account, no platform required.
   terminal. Build a frontend on the exact surface you use by hand.
 - **Local-only, two backends.** Runs against **Docker** (the default,
   cross-platform) or **libkrun** (a local microVM, opt-in via
-  `PILLBOX_BACKEND=libkrun`). A managed/Cloudflare "remote" tier is on the
-  roadmap but not shipped today.
+  `PILLBOX_BACKEND=libkrun`). A managed/Cloudflare "remote" tier is in
+  progress: its §0-gateway substrate (a per-session Durable Object) is
+  proven live on Cloudflare's free tier, but it's not yet a `pillbox run`
+  target.
 
 ## Why "pillbox-as-bundle"
 
@@ -66,7 +68,8 @@ Mixing those into one bundle gives you:
   lives in the global pillbox and is reused across every project.
 - **Local-first.** The whole thing runs on your machine with zero cloud
   dependency. A managed/Cloudflare tier for running the same bundle elsewhere
-  is planned, but pillbox is local-only today.
+  is in progress (its §0 gateway substrate is validated on Cloudflare — see
+  below), but pillbox runs fully local today.
 
 ## Where state lives
 
@@ -205,8 +208,14 @@ pillbox runs locally against one of two backends:
 Both backends support the full session surface, including detach/reattach.
 
 A managed/Cloudflare **remote** tier — running the same bundle off your
-machine — is on the roadmap but not shipped today; it will return with a
-different shape than the old `--remote` backends.
+machine — is **in progress**. Its load-bearing piece, the **§0 gateway** (a
+per-session Cloudflare Durable Object that holds the event log, assigns `seq`,
+attests the actor, arbitrates the driver, and fans out `subscribe`), is built
+and **proven live on Cloudflare's free tier**. What remains is running a real
+agent in the managed container and wiring `pillbox run` to target it, so it is
+not yet a runnable backend. See [docs/managed-tier.md](docs/managed-tier.md) and
+`cloudflare-spike/`. It returns with a different shape than the old `--remote`
+backends.
 
 ## Sessions and the detach hotkey
 
@@ -285,8 +294,14 @@ sessions), local-only. Roadmap:
 - **libkrun backend** ✅ local microVM (`PILLBOX_BACKEND=libkrun`) — a
   secure VM boundary, no daemon, macOS-native
   ([docs/libkrun-sandbox.md](docs/libkrun-sandbox.md)).
-- **v0.7+** the §0 event substrate as a first-class gateway; a
-  managed/Cloudflare **remote** tier for running the bundle off-box.
+- **§0 managed gateway** 🚧 the §0 substrate as a per-session Cloudflare
+  Durable Object (seq authority + actor attestation + driver arbitration +
+  `subscribe` fan-out) — **proven live on CF's free tier**
+  (`cloudflare-spike/`, [docs/managed-tier.md](docs/managed-tier.md)). Running
+  a real agent through it + a `pillbox run` managed backend is the remaining
+  slice.
+- **v0.7+** that managed/Cloudflare **remote** tier for running the bundle
+  off-box.
 
 ## Build
 

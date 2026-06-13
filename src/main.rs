@@ -270,6 +270,55 @@ enum Command {
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
     },
+    /// Fork k worker sessions from a bookmark, grade each, select the best.
+    ///
+    /// The worker-loop primitive: fork `k` detached workers from a snapshot
+    /// bookmark onto the same segment prompt, drive each to idle, grade with
+    /// `--cmd`/`--rubric`, retry failures, then pull the highest-scoring
+    /// worker's result. Best-of-k converts long-horizon variance into gain;
+    /// `--temperature` keeps the forks diverse. See `docs/dispatch.md`.
+    /// (Contract only today — the loop is GHOST-003.)
+    #[command(group(clap::ArgGroup::new("grader").required(true).args(["cmd", "rubric"])))]
+    Dispatch {
+        /// Snapshot bookmark every worker forks from (the shared base).
+        #[arg(long = "from-bookmark", value_name = "NAME")]
+        from_bookmark: String,
+        /// Number of parallel worker sessions to fork.
+        #[arg(short = 'k', long = "workers", value_name = "N", default_value_t = 3)]
+        workers: u32,
+        /// Grader: one verifier command (`sh -c`; exit 0 → pass). Mutually
+        /// exclusive with `--rubric`.
+        #[arg(long, value_name = "CMD")]
+        cmd: Option<String>,
+        /// Grader: a rubric file (`NAME :: COMMAND` per line) → per-criterion
+        /// verdicts + a fractional score. Mutually exclusive with `--cmd`.
+        #[arg(long, value_name = "FILE")]
+        rubric: Option<PathBuf>,
+        /// Per-worker retry budget when the grade fails (failing criteria fed
+        /// back as the next prompt).
+        #[arg(long, value_name = "N", default_value_t = 1)]
+        retries: u32,
+        /// Worker agent (`claude` | `codex` | `opencode` | …). Defaults to the
+        /// pillbox's `agent =`, then `claude`.
+        #[arg(long, value_name = "AGENT")]
+        agent: Option<String>,
+        /// Worker model override, forwarded to each worker's run.
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
+        /// Per-fork sampling temperature, forwarded to each worker — the
+        /// diversity knob that keeps best-of-k non-degenerate.
+        #[arg(long, value_name = "FLOAT")]
+        temperature: Option<f64>,
+        /// Wire in kypp swarm-memory (`--memory`) for each worker.
+        #[arg(long)]
+        memory: bool,
+        /// Emit the verdict as JSON on stdout instead of the human banner.
+        #[arg(long)]
+        json: bool,
+        /// The segment prompt handed to every worker.
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
     /// Manage detached sessions started with `pillbox run --detach`.
     Session {
         #[command(subcommand)]
@@ -656,6 +705,37 @@ fn run(cli: Cli) -> Result<()> {
                     temperature,
                     egress_allow,
                     egress_deny,
+                },
+            )
+        }
+        Command::Dispatch {
+            from_bookmark,
+            workers,
+            cmd,
+            rubric,
+            retries,
+            agent,
+            model,
+            temperature,
+            memory,
+            json,
+            args,
+        } => {
+            let resolved = Pillbox::resolve(pillbox_arg)?;
+            commands::dispatch::dispatch(
+                &resolved,
+                commands::dispatch::DispatchOpts {
+                    from_bookmark,
+                    workers,
+                    cmd,
+                    rubric,
+                    retries,
+                    agent,
+                    model,
+                    temperature,
+                    memory,
+                    prompt: args,
+                    json,
                 },
             )
         }

@@ -125,6 +125,7 @@ webpki-roots = "0.26"
 # (we pass our own aws-lc-rs ClientConfig).
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1"] }
 tower-service = "0.3"
+schemars = { version = "1.2.1", optional = true }
 
 [features]
 # Opt-in OTLP/gRPC transport for the OTel logs sink. Adds tonic +
@@ -142,6 +143,14 @@ otel-grpc = ["opentelemetry-otlp/grpc-tonic"]
 # Pulls smoltcp for the in-VMM-child userspace egress stack (virtio-net) +
 # rustls + webpki-roots for the vault MITM (L5b).
 libkrun = ["dep:smoltcp"]
+
+# Codegen-only: derive `JsonSchema` on the §0 contract types so the
+# `contract_schema_is_current` test (src/contract.rs) can emit/check the canonical
+# JSON Schema (`cloudflare-spike/contract.schema.json`) — the single source the TS
+# contract is generated from. OFF by default, so `schemars` stays out of the
+# shipped binary. Regenerate with
+# `UPDATE_SCHEMA=1 cargo test --features contract-schema contract_schema_is_current`.
+contract-schema = ["dep:schemars"]
 
 [profile.release]
 strip = true

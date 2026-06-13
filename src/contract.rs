@@ -35,6 +35,7 @@ use serde_json::Value;
 /// telemetry carries `seq == 0` and is excluded from replay. Producers build
 /// events via [`Event::session`] with `seq == 0` and let
 /// [`crate::events::log::SessionLog::append`] stamp it.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Event {
@@ -123,6 +124,7 @@ impl Event {
 /// source, never self-reported by the in-sandbox agent** — unlike the old
 /// `host`/`sandbox` emitter tag, authz (who may drive / approve / join) keys off
 /// `actor`, so it is the trust boundary. See docs/session-event-log.md §Actor model.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Actor {
@@ -134,6 +136,7 @@ pub(crate) struct Actor {
     pub(crate) display: String,
 }
 
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ActorKind {
@@ -171,6 +174,7 @@ impl Actor {
 
 /// Typed payload. Internally tagged on `type` (snake_case), so an
 /// `exec_output` serializes as `{"type":"exec_output","stream":"stdout",...}`.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum Payload {
@@ -225,18 +229,21 @@ pub(crate) enum Payload {
     Unknown,
 }
 
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SandboxProvisioned {
     pub(crate) image: String,
 }
 
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SandboxDestroyed {
     pub(crate) reason: String,
 }
 
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RunStarted {
@@ -247,6 +254,7 @@ pub(crate) struct RunStarted {
     pub(crate) base_snapshot: String,
 }
 
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RunFinished {
@@ -255,6 +263,7 @@ pub(crate) struct RunFinished {
     pub(crate) exit_code: i32,
 }
 
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RunFailed {
@@ -262,6 +271,7 @@ pub(crate) struct RunFailed {
     pub(crate) exit_code: i32,
 }
 
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MessageStart {
@@ -269,6 +279,7 @@ pub(crate) struct MessageStart {
     pub(crate) role: Role,
 }
 
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MessageDelta {
@@ -276,6 +287,7 @@ pub(crate) struct MessageDelta {
     pub(crate) text: String,
 }
 
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MessageEnd {
@@ -303,6 +315,7 @@ impl MessageEnd {
     }
 }
 
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ToolCall {
@@ -320,6 +333,7 @@ pub(crate) struct ToolCall {
 /// Reasoning/thinking content the harness surfaced for a turn. First-class
 /// semantic output (the transcript exposes it discretely), `content`-class and
 /// local-only. Distinct from the MITM raw thinking body (blob-stored).
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Thinking {
@@ -331,6 +345,7 @@ pub(crate) struct Thinking {
 /// from MITM wire-observed counts ([`UsageSource::Wire`]) so a consumer can
 /// dedupe across producers. Token fields are `Option` so "0 tokens" is
 /// distinguishable from "not reported".
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Usage {
@@ -346,12 +361,14 @@ pub(crate) struct Usage {
     pub(crate) source: UsageSource,
 }
 
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PhaseChanged {
     pub(crate) phase: AgentPhase,
 }
 
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Todo {
@@ -359,12 +376,14 @@ pub(crate) struct Todo {
     pub(crate) status: TodoStatus,
 }
 
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TodosUpdated {
     pub(crate) todos: Vec<Todo>,
 }
 
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PermissionRequested {
@@ -376,6 +395,7 @@ pub(crate) struct PermissionRequested {
     pub(crate) input: Option<Value>,
 }
 
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PermissionResolved {
@@ -383,6 +403,7 @@ pub(crate) struct PermissionResolved {
     pub(crate) decision: PermissionDecision,
 }
 
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AttentionRequired {
@@ -396,6 +417,7 @@ pub(crate) struct AttentionRequired {
 /// (`Frame::Input`): this persists + replays + carries `actor`, so a late joiner
 /// sees who drove the agent and with what. (`data` for binary input is a future
 /// addition; `session send` is text today.)
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Input {
@@ -404,6 +426,7 @@ pub(crate) struct Input {
 }
 
 /// Where the steer goes: the agent's prompt channel, the raw PTY, or a one-off exec.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum InputTarget {
@@ -418,6 +441,7 @@ pub(crate) enum InputTarget {
 /// a non-driver participates; an orchestrator may optionally inject it as agent
 /// context. `anchor` is a free-form reference to what it's about (a seq, a path, a
 /// message id).
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Annotation {
@@ -426,6 +450,7 @@ pub(crate) struct Annotation {
     pub(crate) anchor: String,
 }
 
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Checkpoint {
@@ -434,6 +459,7 @@ pub(crate) struct Checkpoint {
     pub(crate) message: String,
 }
 
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ResultReady {
@@ -447,6 +473,7 @@ pub(crate) struct ResultReady {
 /// the optimization loops gate on: GEPA needs a coarse verifiable score, and the
 /// `feedback` carries the textual gradient (test output, stderr, diff) that does
 /// the actual optimizing — not just the scalar.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Scored {
@@ -472,6 +499,7 @@ pub(crate) struct Scored {
 /// One rubric criterion's verdict: a named, independently-verifiable check
 /// (its own command exit) plus its captured output. The structured unit a
 /// `--rubric` grade decomposes into.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Criterion {
@@ -484,6 +512,7 @@ pub(crate) struct Criterion {
     pub(crate) feedback: String,
 }
 
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ExecStarted {
@@ -492,6 +521,7 @@ pub(crate) struct ExecStarted {
 
 /// `data` is base64-encoded bytes (matches the proto `bytes` field under
 /// protobuf-JSON) so binary stdout survives the wire intact.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ExecOutput {
@@ -499,12 +529,14 @@ pub(crate) struct ExecOutput {
     pub(crate) data: String,
 }
 
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ExecExit {
     pub(crate) code: i32,
 }
 
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Custom {
@@ -515,6 +547,7 @@ pub(crate) struct Custom {
 
 // ── Enums (snake_case on the wire; `Unspecified` is the deserialize fallback) ──
 
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Role {
@@ -524,6 +557,7 @@ pub(crate) enum Role {
     System,
 }
 
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ToolStatus {
@@ -533,6 +567,7 @@ pub(crate) enum ToolStatus {
     Error,
 }
 
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum UsageSource {
@@ -543,6 +578,7 @@ pub(crate) enum UsageSource {
     Native,
 }
 
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AgentPhase {
@@ -555,6 +591,7 @@ pub(crate) enum AgentPhase {
     Done,
 }
 
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TodoStatus {
@@ -564,6 +601,7 @@ pub(crate) enum TodoStatus {
     Completed,
 }
 
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum StdStream {
@@ -572,6 +610,7 @@ pub(crate) enum StdStream {
     Stderr,
 }
 
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AttentionReason {
@@ -581,6 +620,7 @@ pub(crate) enum AttentionReason {
     Permission,
 }
 
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PermissionDecision {
@@ -909,6 +949,47 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&PermissionDecision::AllowAlways).unwrap(),
             r#""allow_always""#
+        );
+    }
+}
+
+/// Cross-language contract sync gate. `contract.rs` is canonical; the committed
+/// JSON Schema (`cloudflare-spike/contract.schema.json`) is generated from it,
+/// and the TS contract is generated from that schema. This test fails if the
+/// schema is stale, so a contract change that isn't propagated can't merge.
+/// Regenerate after a deliberate change:
+///   `UPDATE_SCHEMA=1 cargo test --features contract-schema contract_schema_is_current`
+#[cfg(all(test, feature = "contract-schema"))]
+mod schema_gate {
+    /// The canonical schema's path, relative to the crate root.
+    const SCHEMA_PATH: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/cloudflare-spike/contract.schema.json"
+    );
+
+    fn rendered_schema() -> String {
+        // `Event` is the root; schemars walks the whole reachable graph (Payload +
+        // every variant struct + the enums), honoring the serde attrs (camelCase,
+        // the internally-tagged `type` discriminant, default/skip → optional).
+        let schema = schemars::schema_for!(super::Event);
+        let mut json = serde_json::to_string_pretty(&schema).expect("serialize schema");
+        json.push('\n');
+        json
+    }
+
+    #[test]
+    fn contract_schema_is_current() {
+        let rendered = rendered_schema();
+        if std::env::var_os("UPDATE_SCHEMA").is_some() {
+            std::fs::write(SCHEMA_PATH, &rendered).expect("write contract.schema.json");
+            return;
+        }
+        let committed = std::fs::read_to_string(SCHEMA_PATH).unwrap_or_default();
+        assert_eq!(
+            committed, rendered,
+            "§0 JSON Schema is stale — contract.rs changed without regenerating. Run: \
+             UPDATE_SCHEMA=1 cargo test --features contract-schema contract_schema_is_current \
+             (then regenerate the TS: `npm run gen:contract` in cloudflare-spike/)"
         );
     }
 }

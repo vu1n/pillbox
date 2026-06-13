@@ -5,9 +5,13 @@ Vector logo + favicon assets used by the README and any frontend. The full kit
 distributed separately.
 
 ## Files
-- `pillbox-logo-light.svg` / `pillbox-logo-dark.svg` — horizontal lockup (icon + wordmark). Switch by theme with `<picture>`.
-- `pillbox-glyph.svg` / `pillbox-glyph-dark.svg` — icon only (avatars, small UI).
+- `pillbox-logo-{light,dark}.png` — full lockup (isometric icon + stylized wordmark). The README uses these via `<picture>`.
+- `pillbox-icon-{light,dark}.png` — isometric mark only (avatars, app icon, square spots).
+- `pillbox-wordmark-{light,dark}.png` — stylized wordmark only.
+- `pillbox-glyph.svg` / `pillbox-glyph-dark.svg` — simplified flat icon, vector (favicons, tiny UI).
 - `favicon.svg` — theme-adaptive favicon (box recolors in dark mode; the lid stays Pillbox Blue).
+
+Use the `-light` files on light backgrounds and `-dark` on dark; all PNGs are transparent.
 
 ## Palette
 | Name | Hex | Use |
@@ -19,8 +23,8 @@ distributed separately.
 | Paper | `#E9EEF7` | Box / wordmark on dark |
 
 ## Type
-Wordmark set in **Poppins SemiBold** (converted to outlines, so no font dependency).
-Supporting copy: Poppins. Code / terminal: JetBrains Mono.
+Wordmark: the stylized **pillbox** lettering (with the blue `i`-dot), baked into the
+lockup PNGs. Supporting copy: Poppins. Code / terminal: JetBrains Mono.
 
 ## Usage
 - Use the dark lockup/glyph on dark backgrounds — never the pure-ink box on dark (it dissolves).

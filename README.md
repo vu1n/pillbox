@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/pillbox-logo-dark.svg">
-    <img alt="pillbox" src="assets/brand/pillbox-logo-light.svg" width="340">
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/pillbox-logo-dark.png">
+    <img alt="pillbox" src="assets/brand/pillbox-logo-light.png" width="420">
   </picture>
 </p>
 

@@ -93,10 +93,23 @@ pub(super) fn static_child_env() -> Vec<(String, String)> {
     vec![
         ("HOME".into(), GUEST_HOME.into()),
         ("TERM".into(), "xterm-256color".into()),
-        (
-            "PATH".into(),
-            format!("/usr/local/bin:/usr/bin:/bin:{GUEST_HOME}/.local/bin"),
-        ),
+        ("PATH".into(), crate::agents::guest_path()),
+    ]
+}
+
+/// The grader VM's base env (`session score --in-sandbox`). Deliberately diverges
+/// from [`static_child_env`] on one axis: `HOME=/root`, because the grader mounts
+/// no creds share (it holds no credentials) so there's no `/home/pillbox` to point
+/// at. It shares the agent's `PATH` on purpose — a verifier must resolve the same
+/// `~/.local/bin` toolchain the agent used, or a tool that worked at agent time
+/// fails the grade. All-static-ASCII, so it's safe on the kernel cmdline; a future
+/// *dynamic* grader env value would have to move to the boot-script exports (the
+/// agent paths' shape) to dodge `InvalidAscii`.
+pub(super) fn grader_child_env() -> Vec<(&'static str, String)> {
+    vec![
+        ("HOME", "/root".into()),
+        ("TERM", "xterm-256color".into()),
+        ("PATH", crate::agents::guest_path()),
     ]
 }
 
@@ -121,6 +134,14 @@ mod tests {
             assert!(
                 ascii(&k) && ascii(&v),
                 "static child env must stay printable ASCII: {k}={v:?}"
+            );
+        }
+        // The grader env rides the cmdline too (it spawns with these, not via the
+        // boot script) — pin it the same way.
+        for (k, v) in grader_child_env() {
+            assert!(
+                ascii(k) && ascii(&v),
+                "grader child env must stay printable ASCII: {k}={v:?}"
             );
         }
     }

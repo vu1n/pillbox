@@ -29,6 +29,15 @@ pub(crate) use mcp::{McpAttachment, McpInjection, McpTokenSpec};
 pub(crate) const GUEST_HOME: &str = "/home/pillbox";
 pub(crate) const GUEST_WORKSPACE: &str = "/workspace";
 
+/// The guest `PATH` every backend hands the agent — docker (`-e PATH=`) and
+/// libkrun (the boot-script env + the grader) share this one definition so they
+/// can't drift into resolving different toolchains. Includes the agent user's
+/// `~/.local/bin` where the runner installs per-user tools. The runner image
+/// must install agent binaries onto one of these dirs (see `runner/Dockerfile`).
+pub(crate) fn guest_path() -> String {
+    format!("/usr/local/bin:/usr/bin:/bin:{GUEST_HOME}/.local/bin")
+}
+
 /// Per-agent MCP config builder. Returns a fully-formed injection
 /// (live tempfile + docker mount + extra argv); `None` on
 /// `AgentSpec` means the agent doesn't support `--mcp` yet.
@@ -680,7 +689,7 @@ fn base_docker_args_with(stdio_prefix: &[&str]) -> Vec<String> {
         "-e".into(),
         "TERM=xterm-256color".into(),
         "-e".into(),
-        format!("PATH=/usr/local/bin:/usr/bin:/bin:{GUEST_HOME}/.local/bin"),
+        format!("PATH={}", guest_path()),
     ]);
     v
 }

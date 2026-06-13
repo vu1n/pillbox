@@ -313,10 +313,7 @@ impl SandboxBackend for DockerBackend {
                 Some(&session),
             );
             if opts.json {
-                println!(
-                    "{}",
-                    crate::paths::json_v1(vec![("session", session.to_json_value())])
-                );
+                session::print_started_json(&session);
             } else {
                 let short = &session.sandbox_id[..session.sandbox_id.len().min(12)];
                 println!(

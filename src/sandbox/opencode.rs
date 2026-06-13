@@ -155,10 +155,7 @@ pub(crate) fn print_started(
     pending_prompt: Option<&str>,
 ) {
     if json {
-        println!(
-            "{}",
-            crate::paths::json_v1(vec![("session", session.to_json_value())])
-        );
+        crate::session::print_started_json(session);
         return;
     }
     let model = session

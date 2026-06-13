@@ -58,6 +58,9 @@ FROM debian:bookworm-slim
 ENV DEBIAN_FRONTEND=noninteractive
 ENV NPM_CONFIG_UPDATE_NOTIFIER=false
 ENV NODE_ENV=production
+# Agents/graders run with an explicit PATH from `agents::guest_path()`
+# (/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin). Install agent binaries onto
+# one of those dirs (this image uses /usr/local/bin) or guest_path() must change.
 ENV PATH="/usr/local/bin:${PATH}"
 
 RUN apt-get update \

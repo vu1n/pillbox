@@ -340,6 +340,18 @@ impl Session {
     }
 }
 
+/// Emit the `pillbox run --json` start envelope — the one pinned
+/// `{version:1, session:{…}}` shape every backend's `--json` start path must
+/// agree on (docker detach, libkrun detach, and the server-mode bring-up).
+/// The human banner stays per-backend (it differs by lifecycle); only this
+/// machine surface is shared, so the schema can't drift between backends.
+pub(crate) fn print_started_json(session: &Session) {
+    println!(
+        "{}",
+        crate::paths::json_v1(vec![("session", session.to_json_value())])
+    );
+}
+
 /// Persist a session record. Used by both detached-start (writes the
 /// initial record) and attach (updates `attached_pid`).
 pub(crate) fn write(pb: &Pillbox, session: &Session) -> Result<()> {

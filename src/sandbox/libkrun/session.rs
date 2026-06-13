@@ -201,13 +201,16 @@ struct Launch {
 /// a space).
 fn guest_launch_preamble(ca_cert_pem: &str, gw_q: &str) -> String {
     let net = egress::guest_net_commands();
-    let ca_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, ca_cert_pem);
+    // The PEM is shell-quoted straight into the script — it lands in the boot
+    // script file (see [`boot::boot_channel`]), which carries arbitrary bytes, so
+    // the multi-line cert no longer needs the base64 detour the kernel cmdline
+    // once forced.
     format!(
         "set -e; {net}; \
-         printf '%s' {ca_b64q} | base64 -d > {GUEST_CA_PATH}; \
+         printf '%s' {ca_q} > {GUEST_CA_PATH}; \
          update-ca-certificates >/dev/null 2>&1 || true; \
          mkdir -p {gw_q}; mount -t virtiofs workspace {gw_q}; cd {gw_q}",
-        ca_b64q = shell_quote(&ca_b64),
+        ca_q = shell_quote(ca_cert_pem),
     )
 }
 
@@ -627,10 +630,7 @@ fn run_detached(
     // Don't wait: the child (VM + egress + MITM, with the vault) is reparented to
     // init and keeps running.
     if opts.json {
-        println!(
-            "{}",
-            crate::paths::json_v1(vec![("session", session.to_json_value())])
-        );
+        crate::session::print_started_json(&session);
     } else {
         println!(
             "pillbox: ✓ session `{}` started in background (libkrun)",
@@ -1134,10 +1134,6 @@ pub(crate) fn score_in_sandbox(
         // Supervised one-shot (`child.wait()` below), so a per-run ephemeral CA
         // is safe; the whole VaultCa is returned from this branch to outlive the grader.
         let ca = provision_vault_ca(resolved, CaLifetime::Ephemeral)?;
-        let ca_b64 = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            ca.cert_pem.as_bytes(),
-        );
         let net = egress::guest_net_commands();
         // `exec 2>&1` so setup output (a dep-fetch failure) lands in feedback too;
         // `set -e` aborts loudly on a setup failure; `set +e` before the grader so
@@ -1146,13 +1142,14 @@ pub(crate) fn score_in_sandbox(
         // merge needed (it's not even on the grader's PATH), since the fence is
         // all-MITM: every allowlisted host terminates at our CA-signed leaf, so
         // trusting that one cert is sufficient (the same single-cert trust agents
-        // use via NODE_EXTRA_CA_CERTS).
+        // use via NODE_EXTRA_CA_CERTS). The PEM is shell-quoted straight in — it
+        // rides the boot script (see [`boot::boot_channel`]), so no base64 detour.
         let script = format!(
             "exec 2>&1; set -e; {net}; \
-             printf '%s' {ca_b64q} | base64 -d > {GUEST_CA_PATH}; \
+             printf '%s' {ca_q} > {GUEST_CA_PATH}; \
              mkdir -p /grade; mount -t virtiofs grade /grade; cd /grade; \
              set +e; {cmd}",
-            ca_b64q = shell_quote(&ca_b64),
+            ca_q = shell_quote(&ca.cert_pem),
         );
         let egress = Some(EgressSpec {
             // Only the invoker-declared hosts resolve — the tightest fence (no
@@ -1215,11 +1212,11 @@ pub(crate) fn score_in_sandbox(
         .arg("__krun-vmm")
         .arg(spec_file.path())
         // No secrets reach the grader — only a minimal guest env for the toolchain
-        // (plus CA-bundle pointers when egress is on; all non-secret).
+        // (plus CA-bundle pointers when egress is on; all non-secret). The base env
+        // tracks the agent VM's PATH so a verifier resolves the same toolchain
+        // (see [`boot::grader_child_env`]).
         .env_clear()
-        .env("HOME", "/root")
-        .env("TERM", "xterm-256color")
-        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .envs(boot::grader_child_env())
         .envs(env_extra.iter().copied())
         // Empty stdin: the VMM child reads swap pairs from stdin when egress is on
         // — null → EOF → empty swap (the MITM forwards untouched). No creds.

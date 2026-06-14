@@ -326,6 +326,12 @@ mod tests {
         let out = std::process::Command::new("sh")
             .arg("-c")
             .arg(&script)
+            // Pin the subprocess cwd: other tests mutate the process-global cwd
+            // (set_current_dir into a tempdir that's later removed). An unpinned
+            // `sh` can fork while cwd points at such a dir mid-removal, so its
+            // getcwd fails ("cannot access parent directories"). CARGO_MANIFEST_DIR
+            // is the crate root — always present — so this test is race-immune.
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
             .output()
             .unwrap();
         // The script exits nonzero iff any criterion failed.
@@ -350,6 +356,7 @@ mod tests {
         let out = std::process::Command::new("sh")
             .arg("-c")
             .arg(&script)
+            .current_dir(env!("CARGO_MANIFEST_DIR")) // stable cwd; see compile_then_parse_rubric_roundtrips_verdicts
             .output()
             .unwrap();
         let crits = parse_rubric_output(&combine_streams(&out.stdout, &out.stderr));

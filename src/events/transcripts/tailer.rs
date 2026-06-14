@@ -26,7 +26,7 @@ use anyhow::{Context, Result};
 
 use super::{claude, codex, contract_map, emit_event_span, Harness, TranscriptEvent};
 use crate::contract::{Actor, Event};
-use crate::events::log::SessionLog;
+use crate::events::sink::EventLog;
 
 /// Stateful tail position for one transcript file. Reusable across
 /// pumps so partial lines and the line-index counter survive between
@@ -45,11 +45,14 @@ pub(crate) struct Tailer {
     /// along, since the vault MITM supplies wire-observed usage for
     /// Claude + `--vault` runs — see [`super::synth`].
     synth: super::synth::ChatSynthesizer,
-    /// The durable per-session log this tailer feeds (the spine's first real
-    /// producer). `None` when there's no host-side log to write — remote
-    /// sandbox-side runs and the manual `session transcript` drain — in which
-    /// case the tailer is OTLP-only, as before.
-    log: Option<SessionLog>,
+    /// The durable §0 sink this tailer feeds (the spine's first real producer).
+    /// A `dyn EventLog` so the placement is chosen at the run-dispatch boundary
+    /// (`sink::open_event_log`): the local file-backed [`crate::events::log::SessionLog`]
+    /// by default, or the managed Durable-Object sink when the managed tier is on
+    /// — the tailer writes through the trait and never sees which. `None` when
+    /// there's no host-side sink — remote sandbox-side runs and the manual
+    /// `session transcript` drain — in which case the tailer is OTLP-only.
+    log: Option<Box<dyn EventLog + Send>>,
 }
 
 impl Tailer {
@@ -58,7 +61,7 @@ impl Tailer {
         session_id: String,
         harness: Harness,
         include_usage: bool,
-        log: Option<SessionLog>,
+        log: Option<Box<dyn EventLog + Send>>,
     ) -> Self {
         let synth = super::synth::ChatSynthesizer::new(session_id.clone(), harness, include_usage);
         Self {
@@ -272,6 +275,7 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+    use crate::events::log::SessionLog;
 
     fn fixture_line(uuid: &str, content: &str) -> String {
         format!(
@@ -296,8 +300,13 @@ mod tests {
                 writeln!(f, "{}", fixture_line("u1", "hello")).unwrap();
             }
 
-            let mut tailer =
-                Tailer::new(path, "sess-tail".into(), Harness::Claude, false, Some(log));
+            let mut tailer = Tailer::new(
+                path,
+                "sess-tail".into(),
+                Harness::Claude,
+                false,
+                Some(Box::new(log)),
+            );
             assert_eq!(tailer.pump().expect("pump"), 1, "one transcript event");
 
             // Read the log back through a fresh handle (appends are flushed).

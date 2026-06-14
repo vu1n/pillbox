@@ -2,6 +2,13 @@
 
 **Date:** 2026-06-03 · **Decision: do NOT build the DSPy/GEPA meta-harness.**
 
+> **Update — 2026-06-14 · GHOST-007:** a second result, on a different axis, is at
+> the bottom of this doc — the **σ̂-segmentation keystone**. The gate below
+> falsified the *instruction* layer (no headroom); the keystone tests a
+> *structural* lever (segment the long horizon) on a headroom task and is
+> **positive** — segmentation collapses σ̂ (0.467 → 0.000). The two are
+> complementary; see the **σ̂-segmentation keystone** section below.
+
 The "prove it before you build it" gate from [swarm-memory.md](./swarm-memory.md) and the
 deep-research verdict (memory: `pillbox-optimization-layer-verdict`): before committing to a
 prompt/program optimizer (GEPA-style) on top of the agent, run the cheapest experiment that
@@ -130,4 +137,106 @@ python3 scripts/eval/gen-rubrics.py
 # freeze train/held-out into an `evals` pillbox, then:
 PILLBOX_BACKEND=libkrun MODEL=zai-coding-plan/glm-5.1 TRIALS=1 SET=aider \
   scripts/meta-harness/optimize.sh --rounds 1
+```
+
+---
+
+# σ̂-segmentation keystone (GHOST-007) — 2026-06-14
+
+**Decision: the variance frame HOLDS. Segmentation cuts σ̂ — decisively on the first
+task (σ̂ 0.467 → 0.000, mean 0.42 → 1.00). Proceed; confirm across more tasks before
+trusting the magnitude.**
+
+The structural-lever follow-up the gate above invited ("revisit on a task where the
+base model genuinely struggles — real headroom"). That gate falsified the
+*instruction* layer (GEPA/ACE) in the no-headroom regime; this tests a *structural*
+lever — cutting the long agentic horizon into rubric-gated **segments** — on exactly
+such a headroom task, and it is positive. Complementary, not contradictory:
+prompt-optimization doesn't help a strong base model; horizon-segmentation does help a
+model that *bistably* fails a long horizon.
+
+## The question
+
+Holding model, task, and grader fixed: does running a task as rubric-gated
+**segments** — a *fresh* session per segment over the prior segment's verified
+workspace (the horizon RESET at each checkpoint) — cut the trial-to-trial variance σ̂
+vs a **monolithic** single-horizon run? Harness: `scripts/eval/segmentation/`
+(GHOST-006). Both arms scored on the SAME authoritative full rubric.
+
+## Method
+
+- 1 task — `ap_pov` (Aider-polyglot "Pov": `from_pov` reroot → `path_to`, a genuine
+  sequential split), the headroom task the gate above flagged (glm-5.1 monolithic is
+  bistable on it). 2 segments — 01-reroot (8 hidden tests) → 02-pathfind (7); gates =
+  authoritative subsets of the hidden `pov_test.py`, injected at grade time.
+- Model glm-5.1 (zai-coding-plan), libkrun, TEMPERATURE=0 (greedy), **n=10 trials/arm**,
+  MAX_WAIT=600 (anti-truncation).
+- Metric = full-rubric fractional score; **σ̂ = per-arm trial-to-trial SD** (in-script
+  summary); `paired-stats.py` for the paired lift.
+- Durable records: `scripts/eval/segmentation/results/ap_pov-glm51-n10.jsonl` (the
+  resumable artifact the gate above lacked).
+
+## Result
+
+| arm | scores (n=10) | σ̂ | mean | perfect |
+|---|---|---:|---:|---:|
+| monolithic | 1, 1, 0, 0, 0, .47, 0, .8, 0, .93 | **0.467** | 0.42 | 2/10 |
+| segmented | 1 ×10 | **0.000** | 1.00 | 10/10 |
+
+**Δσ̂ = −0.467 (variance collapsed to zero) · mean lift +0.58 · perfect-rate
+0.20 → 1.00.** (`paired-stats` mean_d = +0.58; its bootstrap CI is degenerate at
+n_tasks = 1.)
+
+The monolithic arm is textbook long-horizon **bistability**: 5/10 trials bail (0.0),
+and — confirmed by the cost telemetry — these are *genuine minimal attempts*
+(≈ $0.013, a real but short turn), **not** session failures (which emit cost 0; the
+batch has zero such records). Handed the whole task at once, the agent frequently
+ships broken/incomplete `pov.py`. The segmented arm never bails: each shorter, gated
+segment keeps it on-task, and it converges correct every trial.
+
+(Artifact-capture of a concrete failing `pov.py` was blocked by **post-batch
+libkrun-VM exhaustion** — fresh VMs intermittently failed to boot *after* the
+30-session batch while docker stayed healthy. The completed batch is unaffected
+(verified: zero cost-0 records, no per-trial degradation trend); the exhaustion is
+itself a scaling note for larger runs — reap VMs between batches.)
+
+## Verdict
+
+**Segmentation cuts σ̂ — yes, decisively, on this task.** The checkpoint-gated horizon
+reset removes the long-horizon failure mode: it collapses the variance (0.467 → 0)
+*and* lifts the mean (0.42 → 1.0). The variance frame holds; ghost's "fork verified
+worker loops + segment long horizons" design is validated on its first keystone
+measurement — on exactly the headroom task the instruction-layer gate pointed at.
+
+## Caveats (the effect is large enough to demand them)
+
+The magnitude (σ̂ → 0, +58 pts) far exceeds the literature's single-to-low-double-digit
+gains, so on ONE task "ap_pov is unusually segmentation-friendly" stays live until
+confirmed:
+
+1. **n_tasks = 1.** ap_pov only — the paired CI is degenerate (one replication unit).
+   The per-arm σ̂ comparison is valid (10 trials each); cross-task generalization is
+   not. **Immediate follow-up: ≥ 3–5 segmented tasks** (decompose more of the
+   aider-polyglot family into `segments/`).
+2. **Co-variable — per-checkpoint retry.** The segmented arm gets `SEG_RETRIES=1`
+   (≤ 1 retry per segment on a gate fail); the monolithic arm gets one shot. So the win
+   blends horizon-reset + checkpoint-enabled-retry. Cost data (segmented totals
+   $0.05–0.12, no retry blow-up) argues the *reset* is the driver, not extra attempts —
+   but to ISOLATE it, add a `SEG_RETRIES=0` segmented arm and/or a retried monolithic
+   arm.
+3. **ap_pov decomposes cleanly** (reroot → pathfind is near-independent + sequential).
+   Entangled tasks may segment worse — part of what the multi-task follow-up measures.
+4. Verifier quality controlled: final grade = the authoritative full pov_test (15
+   methods); gates are its subsets — not a weak-rubric artifact.
+
+## Reproduce
+
+```sh
+# codesigned libkrun binary; materialize ap_pov; run from an IMMUNE binary copy
+# (an external cargo build clobbers target/debug → docker fallback → silent zeros):
+cp target/debug/pillbox /tmp/pb && python3 scripts/eval/import-aider-polyglot.py --limit 20
+PILLBOX=/tmp/pb MODEL=zai-coding-plan/glm-5.1 TRIALS=10 PILLBOX_BACKEND=libkrun \
+  PILLBOX_RUNNER_IMAGE=pillbox-runner:l7 \
+  OUT=scripts/eval/segmentation/results/ap_pov-glm51-n10.jsonl \
+  scripts/eval/segmentation/run.sh scripts/eval/tasks/ap_pov
 ```

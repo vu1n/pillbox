@@ -1,0 +1,23 @@
+# Segment 1 of 2 — reorient the tree (`Tree.from_pov`)
+
+You are implementing `pov.py` incrementally. This segment covers ONLY the
+tree-reorientation method. A later segment adds path-finding, so do not worry
+about `path_to` yet — leave it as-is.
+
+A tree is a connected acyclic graph: there is exactly one path between any two
+nodes. `pov.py` already defines a `Tree(label, children=[])` class with
+structural equality and ordering. Implement:
+
+    Tree.from_pov(from_node)
+
+It returns the SAME tree re-rooted at `from_node`: pull `from_node` up to become
+the root and drag every existing parent/child relationship along as an
+(undirected) edge, so no information is lost — only the point of view changes.
+Do not mutate the original tree; return the reoriented one.
+
+If `from_node` is not the label of any node in the tree, raise `ValueError` with
+a meaningful message — a tree cannot be reoriented onto a node it doesn't
+contain.
+
+Edit `pov.py` directly. Stop once `from_pov` is correct; the next segment
+continues from your work.

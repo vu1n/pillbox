@@ -1,0 +1,17 @@
+# Segment 1 of 2 — enroll students (add + de-duplicate)
+
+You are implementing `grade_school.py` incrementally. This segment covers
+enrolling students and listing them; a later segment adds sorted queries, so
+don't worry about sort order or per-grade lookup yet.
+
+Implement the `School` class:
+
+- `add_student(name, grade)` — enroll a student in a grade.
+- `added()` — report, in call order, whether each `add_student` call was
+  accepted. A student cannot be added more than once to a grade, nor be enrolled
+  in more than one grade; a rejected (duplicate) add must be reported as not
+  accepted and must leave the roster unchanged.
+- `roster()` — list the enrolled students.
+
+Edit `grade_school.py` directly. Stop once enrollment and de-duplication work;
+the next segment adds sorting and per-grade queries on top.

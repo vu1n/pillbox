@@ -1,0 +1,10 @@
+# Segment-2 gate — malformed-input rejection. Authoritative subset of the hidden
+# dot_dsl_test.py (see segment 1 for the gate-vs-metric distinction). Validation
+# builds on construction, so this segment forks from segment 1's VERIFIED
+# workspace — the genuine sequential dependency.
+reject-malformed-graph :: python3 -m unittest dot_dsl_test.DotDslTest.test_malformed_graph
+reject-malformed-graph-item :: python3 -m unittest dot_dsl_test.DotDslTest.test_malformed_graph_item
+reject-malformed-attr :: python3 -m unittest dot_dsl_test.DotDslTest.test_malformed_attr
+reject-malformed-node :: python3 -m unittest dot_dsl_test.DotDslTest.test_malformed_node
+reject-malformed-edge :: python3 -m unittest dot_dsl_test.DotDslTest.test_malformed_EDGE
+reject-unknown-item :: python3 -m unittest dot_dsl_test.DotDslTest.test_unknown_item

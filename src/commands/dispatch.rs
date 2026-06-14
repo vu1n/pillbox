@@ -279,7 +279,7 @@ fn select_winner(workers: &[WorkerOutcome]) -> Option<usize> {
 /// to `retries`), then select + pull the winner into the [`DispatchVerdict`]. A
 /// worker that errors anywhere in its drive becomes an `Errored` outcome — one
 /// bad worker never aborts the dispatch.
-fn run_dispatch(driver: &dyn WorkerDriver, k: u32, retries: u32) -> DispatchVerdict {
+fn run_dispatch(driver: &dyn WorkerDriver, k: u32, prompt: &str, retries: u32) -> DispatchVerdict {
     // Fork all k up front (each is `--detach`, so their first turns overlap),
     // THEN drive each. A fork that fails becomes an `Errored` worker rather than
     // aborting the batch — the successes are still driven, and no forked worker is
@@ -289,7 +289,7 @@ fn run_dispatch(driver: &dyn WorkerDriver, k: u32, retries: u32) -> DispatchVerd
         .collect::<Vec<_>>()
         .into_iter()
         .map(|forked| match forked {
-            Ok(id) => drive_one(driver, id, retries),
+            Ok(id) => drive_one(driver, id, prompt, retries),
             Err(e) => {
                 eprintln!("pillbox: worker fork failed: {e:#}");
                 WorkerOutcome {
@@ -329,8 +329,8 @@ fn run_dispatch(driver: &dyn WorkerDriver, k: u32, retries: u32) -> DispatchVerd
 
 /// Drive one worker to a terminal outcome. Errors are caught into an `Errored`
 /// outcome (not propagated) so one worker's failure doesn't sink the others.
-fn drive_one(driver: &dyn WorkerDriver, id: String, retries: u32) -> WorkerOutcome {
-    drive_one_inner(driver, &id, retries).unwrap_or_else(|e| {
+fn drive_one(driver: &dyn WorkerDriver, id: String, prompt: &str, retries: u32) -> WorkerOutcome {
+    drive_one_inner(driver, &id, prompt, retries).unwrap_or_else(|e| {
         eprintln!("pillbox: worker `{id}` errored: {e:#}");
         WorkerOutcome {
             session: id,
@@ -341,11 +341,23 @@ fn drive_one(driver: &dyn WorkerDriver, id: String, retries: u32) -> WorkerOutco
     })
 }
 
-/// The grade → retry → grade loop for one worker → its terminal outcome. Stops
+/// The send → grade → retry loop for one worker → its terminal outcome. Each
+/// turn is driven by a `send`: turn 1 is the segment `prompt`; a failed grade
+/// with budget left re-drives with the distilled failure summary. A `--detach`
+/// fork comes up idle and does nothing until driven, so the first turn must be a
+/// `send` (the agent's own scaffold runs it) — not a fork-baked positional,
+/// which a server agent treats as a pre-fill hint, not an executed turn. Stops
 /// on the first pass (`Scored`) or when the retry budget is spent (`Failed`).
-fn drive_one_inner(driver: &dyn WorkerDriver, id: &str, retries: u32) -> Result<WorkerOutcome> {
+fn drive_one_inner(
+    driver: &dyn WorkerDriver,
+    id: &str,
+    prompt: &str,
+    retries: u32,
+) -> Result<WorkerOutcome> {
+    let mut turn = prompt.to_string();
     let mut used = 0u32;
     loop {
+        driver.send(id, &turn)?;
         driver.wait_idle(id)?;
         let grade = driver.grade(id)?;
         let done = grade.passed || used >= retries;
@@ -361,7 +373,7 @@ fn drive_one_inner(driver: &dyn WorkerDriver, id: &str, retries: u32) -> Result<
                 },
             });
         }
-        driver.send(id, &distill_feedback(&grade))?;
+        turn = distill_feedback(&grade);
         used += 1;
     }
 }
@@ -426,9 +438,8 @@ impl WorkerDriver for CliDriver<'_> {
         if self.opts.memory {
             args.push("--memory".into());
         }
-        args.push("--".into());
-        args.extend(self.opts.prompt.iter().cloned());
-
+        // No positional prompt: a `--detach` worker comes up idle; the segment
+        // prompt is driven as turn 1 via `session send` (see `drive_one_inner`).
         let out = self.capture(&args)?;
         let v: serde_json::Value = serde_json::from_str(&out)
             .with_context(|| format!("parse `run --json` output: {out:?}"))?;
@@ -455,12 +466,15 @@ impl WorkerDriver for CliDriver<'_> {
         // Grade the worker's *live* workspace clone in place (no pull): `session
         // info --json` exposes its path, `session score --workspace` grades it.
         // The winner is pulled to a durable dir separately (`pull_winner`).
+        // NOTE: `.session.workspace` is populated by `libkrun_workspace_path` —
+        // libkrun sessions only. Docker dispatch needs a different workspace
+        // resolution (see docs/dispatch.md Deferred); v1 is libkrun-only.
         let info = self.capture(&["session".into(), "info".into(), id.into(), "--json".into()])?;
         let iv: serde_json::Value = serde_json::from_str(&info)
             .with_context(|| format!("parse `session info --json`: {info:?}"))?;
         let ws = iv["session"]["workspace"]
             .as_str()
-            .context("`session info --json` had no session.workspace")?
+            .context("`session info --json` had no session.workspace (libkrun-only today)")?
             .to_string();
 
         let mut args = vec![
@@ -513,14 +527,22 @@ impl CliDriver<'_> {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
-    /// Run a pillbox subcommand for its exit status only (success = Ok).
+    /// Run a pillbox subcommand for its exit status only (success = Ok). Its
+    /// stdout — a per-command human banner (`sent prompt…`, `…idle`, `✓
+    /// restored…`) — is captured and **discarded**, never inherited: dispatch's
+    /// own stdout must stay pure JSON for `--json`. stderr surfaces on failure.
     fn status(&self, args: &[String]) -> Result<()> {
-        let st = Command::new(&self.exe)
+        let out = Command::new(&self.exe)
             .args(args)
-            .status()
+            .output()
             .with_context(|| format!("spawn `pillbox {}`", args.join(" ")))?;
-        if !st.success() {
-            bail!("`pillbox {}` failed ({st})", args.join(" "));
+        if !out.status.success() {
+            bail!(
+                "`pillbox {}` failed ({}): {}",
+                args.join(" "),
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
         }
         Ok(())
     }
@@ -557,7 +579,7 @@ pub(crate) fn dispatch(_resolved: &Pillbox, opts: DispatchOpts) -> Result<()> {
     }
 
     let driver = CliDriver::new(&opts)?;
-    let verdict = run_dispatch(&driver, opts.workers, opts.retries);
+    let verdict = run_dispatch(&driver, opts.workers, &opts.prompt.join(" "), opts.retries);
 
     if opts.json {
         verdict.print_json();
@@ -740,14 +762,15 @@ mod tests {
             ("w0", vec![(false, 0.5), (true, 1.0)]),
             ("w1", vec![(true, 1.0)]),
         ]);
-        let v = run_dispatch(&d, 2, 2);
+        let v = run_dispatch(&d, 2, "task", 2);
         assert_eq!(v.workers.len(), 2);
         assert_eq!(v.workers[0].retries_used, 1);
         assert_eq!(v.workers[1].retries_used, 0);
         // Both passed at 1.0 → tie-break on retries → w1 (0 retries).
         assert_eq!(v.winner.as_deref(), Some("w1"));
         assert_eq!(v.pulled_to, Some(PathBuf::from("/tmp/winner-w1")));
-        assert_eq!(*d.sends.borrow(), 1, "exactly one retry-send (w0's)");
+        // 3 sends: each worker's turn-1 prompt (×2) + w0's one retry.
+        assert_eq!(*d.sends.borrow(), 3);
         assert_eq!(
             *d.pulls.borrow(),
             vec!["w1".to_string()],
@@ -761,7 +784,7 @@ mod tests {
         // sink the batch or win — the good one is selected.
         let d = MockDriver::new(vec![("bad", vec![]), ("good", vec![(true, 1.0)])])
             .failing_grade("bad");
-        let v = run_dispatch(&d, 2, 0);
+        let v = run_dispatch(&d, 2, "task", 0);
         assert_eq!(v.workers[0].status, WorkerStatus::Errored);
         assert_eq!(v.workers[0].score, None);
         assert_eq!(v.winner.as_deref(), Some("good"));
@@ -772,13 +795,14 @@ mod tests {
     fn loop_respects_retry_budget_then_fails() {
         // never passes; budget 1 → 1 retry then Failed, no winner, no pull.
         let d = MockDriver::new(vec![("w0", vec![(false, 0.3), (false, 0.4)])]);
-        let v = run_dispatch(&d, 1, 1);
+        let v = run_dispatch(&d, 1, "task", 1);
         assert_eq!(v.workers[0].status, WorkerStatus::Failed);
         assert_eq!(v.workers[0].retries_used, 1);
         assert_eq!(v.workers[0].score, Some(0.4));
         assert_eq!(v.winner, None);
         assert_eq!(v.pulled_to, None);
-        assert_eq!(*d.sends.borrow(), 1);
+        // 2 sends: the turn-1 prompt + one retry.
+        assert_eq!(*d.sends.borrow(), 2);
         assert!(d.pulls.borrow().is_empty());
     }
 

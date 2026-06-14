@@ -29,6 +29,10 @@ if [ "$which" = all ] || [ "$which" = libkrun ]; then
   else
     echo "  · codex-serve smoke skipped (set SMOKE_CODEX=1 to include it)"
   fi
+  # The dispatch fan-out (GHOST-004): forks 2 opencode workers, then drives /
+  # scores / pulls them — boots ~2 VMs, so it runs after the single-agent smoke.
+  scripts/smoke/dispatch.sh "${OPENCODE_IMAGE:-pillbox-runner:l7}" \
+    "${SMOKE_MODEL:-zai-coding-plan/glm-4.5-air}" || rc=1
 fi
 
 if [ "$which" = all ] || [ "$which" = cf ]; then

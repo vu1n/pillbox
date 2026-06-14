@@ -1,0 +1,18 @@
+# Segment 2 of 2 — reject malformed input
+
+Continue `dot_dsl.py` from the previous segment. Building a `Graph` from
+well-formed input already works — build on it, keep it working. Now make
+`Graph(data)` VALIDATE its input and raise an error with a meaningful message
+when it's malformed:
+
+- the `data` itself is not a list of tuples,
+- an entry's tuple is the wrong length for its marker,
+- an attribute / node / edge entry is otherwise structured wrong,
+- an entry has an unknown marker.
+
+Raise the error type the situation calls for (a `TypeError` for a wrong-shaped
+data structure, a `ValueError` for an unknown/invalid entry), each with a
+meaningful message.
+
+Edit `dot_dsl.py` directly. Do not break the well-formed construction from the
+previous segment.

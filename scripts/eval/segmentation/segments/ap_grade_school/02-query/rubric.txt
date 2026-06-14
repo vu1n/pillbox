@@ -1,0 +1,10 @@
+# Segment-2 gate — sorted roster + per-grade query. Authoritative subset of the
+# hidden grade_school_test.py (see segment 1 for the gate-vs-metric distinction).
+# The sorted read side builds on enrollment, so this segment forks from segment
+# 1's VERIFIED workspace — the genuine sequential dependency.
+sort-by-grades :: python3 -m unittest grade_school_test.GradeSchoolTest.test_students_are_sorted_by_grades_in_the_roster
+sort-by-name :: python3 -m unittest grade_school_test.GradeSchoolTest.test_students_are_sorted_by_name_in_the_roster
+sort-by-grades-then-name :: python3 -m unittest grade_school_test.GradeSchoolTest.test_students_are_sorted_by_grades_and_then_by_name_in_the_roster
+grade-empty-no-students :: python3 -m unittest grade_school_test.GradeSchoolTest.test_grade_is_empty_if_no_students_in_the_roster
+grade-empty-that-grade :: python3 -m unittest grade_school_test.GradeSchoolTest.test_grade_is_empty_if_no_students_in_that_grade
+sort-by-name-in-grade :: python3 -m unittest grade_school_test.GradeSchoolTest.test_students_are_sorted_by_name_in_a_grade

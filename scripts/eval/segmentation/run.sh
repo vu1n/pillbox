@@ -44,10 +44,17 @@
 #              specs, rubric paths resolved) WITHOUT launching anything. The gate.
 #
 # Env: PILLBOX (binary), MODEL (provider/modelID), TRIALS (default 10),
-#      SEG_RETRIES (per-segment gate retries, default 1), TEMPERATURE (default 0,
+#      SEG_RETRIES (per-segment gate retries, default 1; SET TO 0 for the H2
+#      isolation arm — pure horizon-reset, no retry), TEMPERATURE (default 0,
 #      greedy — the variance knob), MAX_WAIT (per-turn idle cap, default 600),
+#      LAUNCH_RETRIES (transient-launch retry budget, default 3),
 #      EVALS_PILLBOX (frozen-task store, default `evals`), PRICE_*_PER_M (cost),
 #      OUT (JSONL records path; default a tempfile, printed at the end).
+#
+# Substrate note: `session rm` does NOT yet clean per-session krun state
+# (~/.pillbox/krun/{creds,ws}/* + *.sock accumulate) — low-urgency leak, harmless
+# at this scale; reap by hand on a long campaign. Separate from the transient
+# launch failure LAUNCH_RETRIES handles.
 #
 # Live runs need a codesigned libkrun binary (scripts/lk-build.sh), opencode
 # authed, the runner image present, and the task materialized (ap_pov via
@@ -59,6 +66,11 @@ PILLBOX="${PILLBOX:-$here/../../../target/debug/pillbox}"
 TRIALS="${TRIALS:-10}"
 SEG_RETRIES="${SEG_RETRIES:-1}"
 MAX_WAIT="${MAX_WAIT:-600}"
+# Bounded retry for a transient libkrun launch failure — a fresh VM can
+# intermittently fail to boot right after a burst of create/destroy (observed
+# post-batch in GHOST-007; it self-heals, NOT a hard leak). Without this a
+# multi-task run silently drops trials to the transient. 0 disables.
+LAUNCH_RETRIES="${LAUNCH_RETRIES:-3}"
 EVALS_PILLBOX="${EVALS_PILLBOX:-evals}"
 export PILLBOX_BACKEND="${PILLBOX_BACKEND:-libkrun}"
 export TEMPERATURE="${TEMPERATURE:-0}" # greedy by default — isolate segmentation
@@ -180,6 +192,20 @@ try: print(json.load(sys.stdin).get("costUsd",0))
 except Exception: print(0)'; }
 add_floats() { python3 -c 'import sys;print(float(sys.argv[1])+float(sys.argv[2]))' "$1" "$2"; }
 
+# Launch a worker session over workspace $1, retrying a transient libkrun launch
+# failure (empty sid → the VM didn't boot) up to LAUNCH_RETRIES times with a
+# linear backoff. Echoes the sid, or empty after the budget — the caller still
+# records that trial as a 0, so a persistent failure degrades gracefully.
+launch_session() {
+  local sid attempt
+  for attempt in $(seq 0 "$LAUNCH_RETRIES"); do
+    sid="$(pb_run_session "$1")"
+    [ -n "$sid" ] && { printf '%s' "$sid"; return 0; }
+    [ "$attempt" -lt "$LAUNCH_RETRIES" ] && sleep "$(((attempt + 1) * 5))"
+  done
+  return 1
+}
+
 # Grade session $1's clone $2 against task $3's FULL rubric, in a throwaway copy
 # with the hidden grader injected (invisible to any later turn) → echoes the
 # fractional score. The authoritative, comparable metric for both arms.
@@ -198,7 +224,7 @@ grade_full() { # sid clone task_dir
 run_monolithic_cell() { # task_dir task trial
   local ws; ws="$(mktemp -d)"
   cp -R "$1/workspace/." "$ws"/ 2>/dev/null
-  local sid; sid="$(pb_run_session "$ws")"
+  local sid; sid="$(launch_session "$ws")"
   if [ -z "$sid" ]; then rm -rf "$ws"; emit_record "$2" monolithic "$3" 0 0; return; fi
   local clone; clone="$(pb_workspace "$sid")"
   if [ -z "$clone" ]; then "$PILLBOX" session rm "$sid" >/dev/null 2>&1; rm -rf "$ws"; emit_record "$2" monolithic "$3" 0 0; return; fi
@@ -246,7 +272,7 @@ run_segmented_cell() { # task_dir task trial
   local cost=0 sid="" clone="" i=0 segcost ws_next
   for d in "${segs[@]}"; do
     i=$((i + 1))
-    sid="$(pb_run_session "$ws_prev")"
+    sid="$(launch_session "$ws_prev")"
     if [ -z "$sid" ]; then rm -rf "$ws_prev"; emit_record "$2" segmented "$3" 0 "$cost"; return; fi
     clone="$(pb_workspace "$sid")"
     if [ -z "$clone" ]; then "$PILLBOX" session rm "$sid" >/dev/null 2>&1; rm -rf "$ws_prev"; emit_record "$2" segmented "$3" 0 "$cost"; return; fi

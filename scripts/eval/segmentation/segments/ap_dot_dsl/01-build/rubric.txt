@@ -1,0 +1,10 @@
+# Segment-1 gate — Graph construction from well-formed input. An authoritative
+# SUBSET of the hidden dot_dsl_test.py (injected at grade time; the agent never
+# sees it). Gates the segmented arm's progression only — the comparable score
+# for both arms is the FULL dot_dsl_test rubric at the end.
+build-empty :: python3 -m unittest dot_dsl_test.DotDslTest.test_empty_graph
+build-one-node :: python3 -m unittest dot_dsl_test.DotDslTest.test_graph_with_one_node
+build-one-node-keywords :: python3 -m unittest dot_dsl_test.DotDslTest.test_graph_with_one_node_with_keywords
+build-one-edge :: python3 -m unittest dot_dsl_test.DotDslTest.test_graph_with_one_edge
+build-one-attribute :: python3 -m unittest dot_dsl_test.DotDslTest.test_graph_with_one_attribute
+build-attributes :: python3 -m unittest dot_dsl_test.DotDslTest.test_graph_with_attributes

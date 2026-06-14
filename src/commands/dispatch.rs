@@ -2,27 +2,46 @@
 //!
 //! Fork `k` detached worker sessions from a snapshot bookmark, drive each to
 //! idle on the same segment prompt, grade each with the rubric/cmd, retry
-//! failures (feeding the failing criteria back as the next prompt), then select
-//! the highest-scoring worker and pull its result workspace. Best-of-k turns
-//! the long-horizon variance σ̂ into expected gain instead of a measurement
-//! enemy — which is why per-fork diversity (`--temperature`) matters: `k`
-//! identical deterministic workers all score the same and select-best buys
+//! failures (feeding a distilled failure summary back as the next prompt), then
+//! select the highest-scoring worker that passed and pull its result workspace.
+//! Best-of-k turns the long-horizon variance σ̂ into expected gain instead of a
+//! measurement enemy — which is why per-fork diversity (`--temperature`) matters:
+//! `k` identical deterministic workers all score the same and select-best buys
 //! nothing.
 //!
-//! **This file is the CONTRACT (GHOST-002).** It defines the CLI surface, the
-//! option/verdict types, and the JSON envelope that the loop implementation
-//! (GHOST-003) and the live e2e (GHOST-004) program against. The handler here
-//! is a stub: it validates the surface and reports unimplemented. See
-//! `docs/dispatch.md`.
+//! **Orchestration is subprocess, not in-process.** The loop drives workers by
+//! self-exec'ing the pillbox binary (`run`/`session …`) and parsing the
+//! documented `--json` contracts — the same way the repo's existing eval /
+//! router / smoke stack drives sessions (`scripts/eval/lib.sh`,
+//! `scripts/router/cost-router.py`). The session handlers are private and return
+//! `Result<()>`, not values, so an in-process path would mean re-shaping them +
+//! the run path (a cross-cutting refactor); the CLI `--json` surface exists
+//! precisely for this. The loop sits behind [`WorkerDriver`] so the selection /
+//! retry **policy** is unit-tested over a mock, while the live [`CliDriver`] is
+//! exercised by the GHOST-004 smoke.
 
 use std::path::PathBuf;
+use std::process::Command;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use serde_json::json;
 
+use crate::contract::{Criterion, Scored};
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
+
+/// Per-turn idle timeout (seconds) each worker gets before it's treated as stuck
+/// (→ an `Errored` worker, not a whole-dispatch hang). Generous — agent turns run
+/// minutes. Override with `PILLBOX_DISPATCH_TURN_TIMEOUT`.
+const DEFAULT_TURN_TIMEOUT_SECS: u64 = 1800;
+
+fn turn_timeout_secs() -> u64 {
+    std::env::var("PILLBOX_DISPATCH_TURN_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_TURN_TIMEOUT_SECS)
+}
 
 /// Options for one `pillbox dispatch` invocation, populated from the clap
 /// surface in `main.rs`. The grader is `cmd` xor `rubric` (a required clap
@@ -39,8 +58,8 @@ pub(crate) struct DispatchOpts {
     /// Grader: a rubric file (`NAME :: COMMAND` per line) → per-criterion
     /// verdicts + a fractional score. Mutually exclusive with `cmd`.
     pub(crate) rubric: Option<PathBuf>,
-    /// Per-worker retry budget when the grade fails — the loop feeds the failing
-    /// criteria back as the next prompt and re-grades, up to this many times.
+    /// Per-worker retry budget when the grade fails — the loop feeds a distilled
+    /// failure summary back as the next prompt and re-grades, up to this many times.
     pub(crate) retries: u32,
     /// Worker agent (default: `pillbox.toml` `agent`, then `claude`).
     pub(crate) agent: Option<String>,
@@ -78,6 +97,15 @@ impl WorkerStatus {
     pub(crate) fn passed(self) -> bool {
         matches!(self, WorkerStatus::Scored)
     }
+
+    /// The per-worker glyph in the human banner.
+    fn as_marker(self) -> char {
+        match self {
+            WorkerStatus::Scored => '✓',
+            WorkerStatus::Failed => '✗',
+            WorkerStatus::Errored => '!',
+        }
+    }
 }
 
 /// One worker's outcome — its session, best score across retries, and how it
@@ -111,8 +139,8 @@ impl WorkerOutcome {
 /// and where the winner's result workspace landed. Serialized as the
 /// `pillbox dispatch --json` envelope (`{version:1, dispatch:{…}}`).
 pub(crate) struct DispatchVerdict {
-    /// Session id of the highest-scoring worker, or `None` if none produced a
-    /// gradeable result.
+    /// Session id of the highest-scoring worker that passed, or `None` if none
+    /// passed (the exit-1 case).
     pub(crate) winner: Option<String>,
     /// Every worker's outcome, in fork order.
     pub(crate) workers: Vec<WorkerOutcome>,
@@ -139,16 +167,379 @@ impl DispatchVerdict {
             crate::paths::json_v1(vec![("dispatch", self.to_json_value())])
         );
     }
+
+    /// The human banner — winner + a per-worker line.
+    fn print_banner(&self) {
+        match &self.winner {
+            Some(id) => {
+                let to = self
+                    .pulled_to
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                println!("pillbox: ✓ dispatch winner `{id}` → {to}");
+            }
+            None => println!("pillbox: ✗ dispatch — no worker passed"),
+        }
+        for w in &self.workers {
+            let score = w
+                .score
+                .map(|s| format!("{s:.2}"))
+                .unwrap_or_else(|| "—".into());
+            println!(
+                "  {} {}  score={score} retries={}",
+                w.status.as_marker(),
+                w.session,
+                w.retries_used
+            );
+        }
+    }
 }
 
-/// Run a dispatch (stub — GHOST-002 ships the contract; GHOST-003 the loop).
-///
-/// Exit-code contract (`docs/dispatch.md`): a selected winner → `Ok` (0); all
-/// workers failed → a plain error (1); a malformed invocation → a
-/// [`PillboxError::usage`] (2).
+/// The I/O seam the loop drives workers through. The live [`CliDriver`] shells
+/// out to the pillbox binary; tests substitute a mock so the selection / retry
+/// **policy** is verified without booting a VM. A worker's grade is the
+/// `contract::Scored` the `session score --json` surface emits — deserialized
+/// directly so a wire-contract change is a compile error, not a silent default.
+trait WorkerDriver {
+    /// Fork a new detached worker from the bookmark → its session id.
+    fn fork(&self) -> Result<String>;
+    /// Block until the worker's current turn goes idle (or terminates).
+    fn wait_idle(&self, id: &str) -> Result<()>;
+    /// Grade the worker's current workspace → the parsed verdict.
+    fn grade(&self, id: &str) -> Result<Scored>;
+    /// Drive the worker's next turn with `prompt` (the distilled retry feedback).
+    fn send(&self, id: &str, prompt: &str) -> Result<()>;
+    /// Pull the winner's result workspace to a durable dir → that path.
+    fn pull_winner(&self, id: &str) -> Result<PathBuf>;
+}
+
+// ── pure policy (the unit-tested gate) ──────────────────────────────────────
+
+/// The distilled failure summary fed back as the next prompt on a retry — the
+/// structured signal (which checks failed + why), NOT the raw grader log, per
+/// the Parallel-Distill-Refine finding (a model acts better on a distilled
+/// summary than on noisy raw output). A `--rubric` grade distills to its failed
+/// criteria; a `--cmd` grade falls back to the (capped) combined output.
+fn distill_feedback(grade: &Scored) -> String {
+    let mut out = String::from(
+        "Your previous attempt did not pass verification. Address the following, then continue:\n",
+    );
+    let failed: Vec<&Criterion> = grade.criteria.iter().filter(|c| !c.passed).collect();
+    if !failed.is_empty() {
+        for c in failed {
+            let why = first_lines(&c.feedback, 2);
+            out.push_str(&format!("- {}: {}\n", c.name, why));
+        }
+    } else {
+        // --cmd grade: no per-criterion detail, so distill the combined output.
+        out.push_str(&first_lines(&grade.feedback, 8));
+        out.push('\n');
+    }
+    out
+}
+
+/// Up to `n` non-blank lines of `s`, trimmed — the "distilled, not raw" cap.
+fn first_lines(s: &str, n: usize) -> String {
+    s.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .take(n)
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
+/// Index of the winning worker: the highest-scoring worker that **passed**,
+/// tie-broken by fewest retries then earliest fork order. `None` when no worker
+/// passed (the exit-1 case) — partial-score workers are reported in the verdict
+/// but never auto-selected, so a caller can't mistake a failed attempt for a
+/// success.
+fn select_winner(workers: &[WorkerOutcome]) -> Option<usize> {
+    workers
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| w.status.passed())
+        .max_by(|(ia, a), (ib, b)| {
+            // Higher score wins; then fewer retries; then earlier index. All
+            // passed workers score 1.0 today, so retries/order is the real
+            // discriminator — but rank by score first so the rule still holds if
+            // "winner must pass" ever relaxes to "winner = best partial".
+            a.score
+                .partial_cmp(&b.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(b.retries_used.cmp(&a.retries_used))
+                .then(ib.cmp(ia))
+        })
+        .map(|(i, _)| i)
+}
+
+// ── the loop ────────────────────────────────────────────────────────────────
+
+/// Fork `k` workers, drive each to a terminal outcome (grade → retry → grade up
+/// to `retries`), then select + pull the winner into the [`DispatchVerdict`]. A
+/// worker that errors anywhere in its drive becomes an `Errored` outcome — one
+/// bad worker never aborts the dispatch.
+fn run_dispatch(driver: &dyn WorkerDriver, k: u32, retries: u32) -> DispatchVerdict {
+    // Fork all k up front (each is `--detach`, so their first turns overlap),
+    // THEN drive each. A fork that fails becomes an `Errored` worker rather than
+    // aborting the batch — the successes are still driven, and no forked worker is
+    // left unrecorded (the orphan a `collect::<Result>()?` would leak).
+    let workers: Vec<WorkerOutcome> = (0..k)
+        .map(|_| driver.fork())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|forked| match forked {
+            Ok(id) => drive_one(driver, id, retries),
+            Err(e) => {
+                eprintln!("pillbox: worker fork failed: {e:#}");
+                WorkerOutcome {
+                    session: String::new(),
+                    score: None,
+                    retries_used: 0,
+                    status: WorkerStatus::Errored,
+                }
+            }
+        })
+        .collect();
+
+    let (winner, pulled_to) = match select_winner(&workers) {
+        Some(i) => {
+            let id = workers[i].session.clone();
+            // A pull glitch shouldn't nuke an otherwise-successful run: the winner
+            // is already selected, so report it (exit 0) with a recovery hint and
+            // leave `pulled_to` empty rather than propagating the error.
+            let pulled = driver.pull_winner(&id).unwrap_or_else(|e| {
+                eprintln!(
+                    "pillbox: winner `{id}` selected but pull failed: {e:#}\n  \
+                     recover with: pillbox session pull {id}"
+                );
+                PathBuf::new()
+            });
+            let pulled = (!pulled.as_os_str().is_empty()).then_some(pulled);
+            (Some(id), pulled)
+        }
+        None => (None, None),
+    };
+    DispatchVerdict {
+        winner,
+        workers,
+        pulled_to,
+    }
+}
+
+/// Drive one worker to a terminal outcome. Errors are caught into an `Errored`
+/// outcome (not propagated) so one worker's failure doesn't sink the others.
+fn drive_one(driver: &dyn WorkerDriver, id: String, retries: u32) -> WorkerOutcome {
+    drive_one_inner(driver, &id, retries).unwrap_or_else(|e| {
+        eprintln!("pillbox: worker `{id}` errored: {e:#}");
+        WorkerOutcome {
+            session: id,
+            score: None,
+            retries_used: 0,
+            status: WorkerStatus::Errored,
+        }
+    })
+}
+
+/// The grade → retry → grade loop for one worker → its terminal outcome. Stops
+/// on the first pass (`Scored`) or when the retry budget is spent (`Failed`).
+fn drive_one_inner(driver: &dyn WorkerDriver, id: &str, retries: u32) -> Result<WorkerOutcome> {
+    let mut used = 0u32;
+    loop {
+        driver.wait_idle(id)?;
+        let grade = driver.grade(id)?;
+        let done = grade.passed || used >= retries;
+        if done {
+            return Ok(WorkerOutcome {
+                session: id.to_string(),
+                score: Some(grade.score),
+                retries_used: used,
+                status: if grade.passed {
+                    WorkerStatus::Scored
+                } else {
+                    WorkerStatus::Failed
+                },
+            });
+        }
+        driver.send(id, &distill_feedback(&grade))?;
+        used += 1;
+    }
+}
+
+// ── the live CLI driver (subprocess self-exec) ──────────────────────────────
+
+/// Drives workers by self-exec'ing the pillbox binary and parsing the documented
+/// `--json` contracts. All subprocesses inherit cwd, so they resolve the same
+/// pillbox as the parent (the session a `fork` creates is found by a later
+/// `grade`/`pull`).
+struct CliDriver<'a> {
+    exe: PathBuf,
+    opts: &'a DispatchOpts,
+    /// The `session score` grader flags (`--cmd …` xor `--rubric …`), resolved
+    /// once: the clap ArgGroup guarantees exactly one, so this is never empty.
+    grader: Vec<String>,
+    /// Durable dir the winner is pulled into (a TempDir would drop it).
+    rundir: PathBuf,
+}
+
+impl<'a> CliDriver<'a> {
+    fn new(opts: &'a DispatchOpts) -> Result<Self> {
+        let exe = std::env::current_exe().context("locate the pillbox binary")?;
+        let grader = match (&opts.cmd, &opts.rubric) {
+            (Some(c), _) => vec!["--cmd".into(), c.clone()],
+            (_, Some(r)) => vec!["--rubric".into(), r.to_string_lossy().into_owned()],
+            // clap's required ArgGroup makes this unreachable; a missing grader
+            // would fail the `score` call loudly rather than grade nothing.
+            _ => bail!("dispatch: no grader (--cmd/--rubric) — clap should have rejected this"),
+        };
+        let rundir = std::env::temp_dir().join(format!(
+            "pillbox-dispatch-{}",
+            uuid::Uuid::now_v7().simple()
+        ));
+        Ok(Self {
+            exe,
+            opts,
+            grader,
+            rundir,
+        })
+    }
+}
+
+impl WorkerDriver for CliDriver<'_> {
+    fn fork(&self) -> Result<String> {
+        let mut args = vec![
+            "run".into(),
+            "--from-bookmark".into(),
+            self.opts.from_bookmark.clone(),
+            "--detach".into(),
+            "--json".into(),
+        ];
+        if let Some(a) = &self.opts.agent {
+            args.extend(["--agent".into(), a.clone()]);
+        }
+        if let Some(m) = &self.opts.model {
+            args.extend(["--model".into(), m.clone()]);
+        }
+        if let Some(t) = &self.opts.temperature {
+            args.extend(["--temperature".into(), t.to_string()]);
+        }
+        if self.opts.memory {
+            args.push("--memory".into());
+        }
+        args.push("--".into());
+        args.extend(self.opts.prompt.iter().cloned());
+
+        let out = self.capture(&args)?;
+        let v: serde_json::Value = serde_json::from_str(&out)
+            .with_context(|| format!("parse `run --json` output: {out:?}"))?;
+        v["session"]["id"]
+            .as_str()
+            .map(str::to_string)
+            .context("`run --json` had no session.id")
+    }
+
+    fn wait_idle(&self, id: &str) -> Result<()> {
+        // Bounded so one stuck worker becomes an Errored worker (the caller maps
+        // this Err → Errored), not a whole-dispatch hang. `wait-idle` exits 0 on
+        // idle/terminated, 1 on timeout — so any non-zero here is a stuck turn.
+        self.status(&[
+            "session".into(),
+            "wait-idle".into(),
+            id.into(),
+            "--timeout".into(),
+            turn_timeout_secs().to_string(),
+        ])
+    }
+
+    fn grade(&self, id: &str) -> Result<Scored> {
+        // Grade the worker's *live* workspace clone in place (no pull): `session
+        // info --json` exposes its path, `session score --workspace` grades it.
+        // The winner is pulled to a durable dir separately (`pull_winner`).
+        let info = self.capture(&["session".into(), "info".into(), id.into(), "--json".into()])?;
+        let iv: serde_json::Value = serde_json::from_str(&info)
+            .with_context(|| format!("parse `session info --json`: {info:?}"))?;
+        let ws = iv["session"]["workspace"]
+            .as_str()
+            .context("`session info --json` had no session.workspace")?
+            .to_string();
+
+        let mut args = vec![
+            "session".into(),
+            "score".into(),
+            id.into(),
+            "--workspace".into(),
+            ws,
+            "--json".into(),
+        ];
+        args.extend(self.grader.iter().cloned());
+        let out = self.capture(&args)?;
+        parse_grade(&out)
+    }
+
+    fn send(&self, id: &str, prompt: &str) -> Result<()> {
+        self.status(&["session".into(), "send".into(), id.into(), prompt.into()])
+    }
+
+    fn pull_winner(&self, id: &str) -> Result<PathBuf> {
+        let to = self.rundir.join(format!("winner-{id}"));
+        std::fs::create_dir_all(&self.rundir)
+            .with_context(|| format!("create {:?}", self.rundir))?;
+        self.status(&[
+            "session".into(),
+            "pull".into(),
+            id.into(),
+            "--to".into(),
+            to.to_string_lossy().into_owned(),
+        ])?;
+        Ok(to)
+    }
+}
+
+impl CliDriver<'_> {
+    /// Run a pillbox subcommand, require success, return stdout.
+    fn capture(&self, args: &[String]) -> Result<String> {
+        let out = Command::new(&self.exe)
+            .args(args)
+            .output()
+            .with_context(|| format!("spawn `pillbox {}`", args.join(" ")))?;
+        if !out.status.success() {
+            bail!(
+                "`pillbox {}` failed ({}): {}",
+                args.join(" "),
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// Run a pillbox subcommand for its exit status only (success = Ok).
+    fn status(&self, args: &[String]) -> Result<()> {
+        let st = Command::new(&self.exe)
+            .args(args)
+            .status()
+            .with_context(|| format!("spawn `pillbox {}`", args.join(" ")))?;
+        if !st.success() {
+            bail!("`pillbox {}` failed ({st})", args.join(" "));
+        }
+        Ok(())
+    }
+}
+
+/// Parse a `session score --json` envelope into the `contract::Scored` it
+/// serializes (the extra `version`/`session`/`seq` envelope keys are ignored).
+fn parse_grade(out: &str) -> Result<Scored> {
+    serde_json::from_str(out).with_context(|| format!("parse `score --json`: {out:?}"))
+}
+
+// ── handler ─────────────────────────────────────────────────────────────────
+
+/// Run a dispatch. Exit-code contract (`docs/dispatch.md`): a selected winner →
+/// `Ok` (0); no worker passed → a plain error (1); a malformed invocation → a
+/// [`PillboxError::usage`] (2). The `--json` verdict is printed on **both** the
+/// winner and no-winner paths (so a caller always reads every worker's score);
+/// the no-winner exit-1 error then rides stderr.
 pub(crate) fn dispatch(_resolved: &Pillbox, opts: DispatchOpts) -> Result<()> {
-    // Surface validation that belongs to the contract, not the loop: `-k 0`
-    // can't best-of-anything. (clap enforces the cmd-xor-rubric group itself.)
     if opts.workers < 1 {
         return Err(PillboxError::usage("dispatch", "-k must be at least 1")
             .with_next(
@@ -156,45 +547,255 @@ pub(crate) fn dispatch(_resolved: &Pillbox, opts: DispatchOpts) -> Result<()> {
             )
             .into());
     }
-    bail!(
-        "pillbox dispatch is not yet implemented — GHOST-002 ships the contract \
-         (CLI surface + types + docs/dispatch.md); the fork/score/select loop is GHOST-003"
-    );
+    if opts.prompt.iter().all(|p| p.trim().is_empty()) {
+        return Err(PillboxError::usage(
+            "dispatch",
+            "no segment prompt — workers have nothing to do",
+        )
+        .with_next("pillbox dispatch … -- \"<the segment prompt>\"")
+        .into());
+    }
+
+    let driver = CliDriver::new(&opts)?;
+    let verdict = run_dispatch(&driver, opts.workers, opts.retries);
+
+    if opts.json {
+        verdict.print_json();
+    } else {
+        verdict.print_banner();
+    }
+    if verdict.winner.is_none() {
+        // Verdict already printed (every worker's score is on stdout); signal the
+        // no-winner outcome with exit 1.
+        bail!("dispatch: no worker passed verification");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    fn outcome(
+        session: &str,
+        score: Option<f64>,
+        retries: u32,
+        status: WorkerStatus,
+    ) -> WorkerOutcome {
+        WorkerOutcome {
+            session: session.into(),
+            score,
+            retries_used: retries,
+            status,
+        }
+    }
+
+    // ── selection policy ──
+
+    #[test]
+    fn select_winner_picks_highest_passing_score() {
+        let ws = vec![
+            outcome("a", Some(1.0), 0, WorkerStatus::Scored),
+            outcome("b", Some(0.9), 0, WorkerStatus::Failed), // higher-than-some but didn't pass
+            outcome("c", Some(1.0), 0, WorkerStatus::Scored),
+        ];
+        // a and c both passed at 1.0; tie-break → earliest (a).
+        assert_eq!(select_winner(&ws), Some(0));
+    }
+
+    #[test]
+    fn select_winner_tiebreaks_fewer_retries_then_earliest() {
+        let ws = vec![
+            outcome("a", Some(1.0), 2, WorkerStatus::Scored),
+            outcome("b", Some(1.0), 0, WorkerStatus::Scored), // fewer retries wins
+            outcome("c", Some(1.0), 0, WorkerStatus::Scored),
+        ];
+        assert_eq!(select_winner(&ws), Some(1));
+    }
+
+    #[test]
+    fn select_winner_none_when_no_worker_passed() {
+        let ws = vec![
+            outcome("a", Some(0.8), 1, WorkerStatus::Failed),
+            outcome("b", None, 0, WorkerStatus::Errored),
+        ];
+        // A high partial score is reported but never auto-selected.
+        assert_eq!(select_winner(&ws), None);
+    }
+
+    // ── retry feedback distillation ──
+
+    fn scored(passed: bool, score: f64, criteria: Vec<Criterion>, feedback: &str) -> Scored {
+        Scored {
+            grader: "test".into(),
+            passed,
+            score,
+            feedback: feedback.into(),
+            criteria,
+        }
+    }
+
+    fn criterion(name: &str, passed: bool, feedback: &str) -> Criterion {
+        Criterion {
+            name: name.into(),
+            passed,
+            feedback: feedback.into(),
+        }
+    }
+
+    #[test]
+    fn distill_feedback_lists_only_failed_criteria() {
+        let g = scored(
+            false,
+            0.5,
+            vec![
+                criterion("compiles", true, "ok"),
+                criterion("tests", false, "2 failed\nassertion error"),
+            ],
+            "",
+        );
+        let fb = distill_feedback(&g);
+        assert!(fb.contains("tests: 2 failed / assertion error"));
+        assert!(
+            !fb.contains("compiles"),
+            "passed criteria must not be echoed"
+        );
+    }
+
+    #[test]
+    fn distill_feedback_falls_back_to_capped_output_for_cmd_grade() {
+        let g = scored(false, 0.0, vec![], "line1\n\nline2\nline3");
+        let fb = distill_feedback(&g);
+        assert!(fb.contains("line1 / line2 / line3"));
+    }
+
+    // ── the loop over a mock driver ──
+
+    /// A scripted driver: each fork hands out the next id; `grade` replays a
+    /// per-id queue of (passed, score) so a test can model retry-then-pass.
+    struct MockDriver {
+        ids: RefCell<std::collections::VecDeque<String>>,
+        grades: RefCell<std::collections::HashMap<String, std::collections::VecDeque<(bool, f64)>>>,
+        /// Worker ids whose `grade` raises an error (models a stuck/broken worker).
+        grade_errs: std::collections::HashSet<String>,
+        sends: RefCell<usize>,
+        pulls: RefCell<Vec<String>>,
+    }
+
+    impl MockDriver {
+        fn new(grade_script: Vec<(&str, Vec<(bool, f64)>)>) -> Self {
+            let ids = grade_script.iter().map(|(id, _)| id.to_string()).collect();
+            let grades = grade_script
+                .into_iter()
+                .map(|(id, q)| (id.to_string(), q.into_iter().collect()))
+                .collect();
+            Self {
+                ids: RefCell::new(ids),
+                grades: RefCell::new(grades),
+                grade_errs: std::collections::HashSet::new(),
+                sends: RefCell::new(0),
+                pulls: RefCell::new(Vec::new()),
+            }
+        }
+        fn failing_grade(mut self, id: &str) -> Self {
+            self.grade_errs.insert(id.to_string());
+            self
+        }
+    }
+
+    impl WorkerDriver for MockDriver {
+        fn fork(&self) -> Result<String> {
+            Ok(self.ids.borrow_mut().pop_front().expect("fork over budget"))
+        }
+        fn wait_idle(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+        fn grade(&self, id: &str) -> Result<Scored> {
+            if self.grade_errs.contains(id) {
+                bail!("mock: grade failed for {id}");
+            }
+            let (passed, score) = self
+                .grades
+                .borrow_mut()
+                .get_mut(id)
+                .and_then(|q| q.pop_front())
+                .expect("grade over budget");
+            Ok(scored(passed, score, vec![], ""))
+        }
+        fn send(&self, _id: &str, _prompt: &str) -> Result<()> {
+            *self.sends.borrow_mut() += 1;
+            Ok(())
+        }
+        fn pull_winner(&self, id: &str) -> Result<PathBuf> {
+            self.pulls.borrow_mut().push(id.to_string());
+            Ok(PathBuf::from(format!("/tmp/winner-{id}")))
+        }
+    }
+
+    #[test]
+    fn loop_selects_winner_and_pulls_it() {
+        // worker "w0" fails then passes (1 retry); "w1" passes first try.
+        let d = MockDriver::new(vec![
+            ("w0", vec![(false, 0.5), (true, 1.0)]),
+            ("w1", vec![(true, 1.0)]),
+        ]);
+        let v = run_dispatch(&d, 2, 2);
+        assert_eq!(v.workers.len(), 2);
+        assert_eq!(v.workers[0].retries_used, 1);
+        assert_eq!(v.workers[1].retries_used, 0);
+        // Both passed at 1.0 → tie-break on retries → w1 (0 retries).
+        assert_eq!(v.winner.as_deref(), Some("w1"));
+        assert_eq!(v.pulled_to, Some(PathBuf::from("/tmp/winner-w1")));
+        assert_eq!(*d.sends.borrow(), 1, "exactly one retry-send (w0's)");
+        assert_eq!(
+            *d.pulls.borrow(),
+            vec!["w1".to_string()],
+            "only the winner is pulled"
+        );
+    }
+
+    #[test]
+    fn loop_isolates_an_errored_worker_and_still_picks_a_winner() {
+        // "bad" errors during grade; "good" passes. The errored worker must not
+        // sink the batch or win — the good one is selected.
+        let d = MockDriver::new(vec![("bad", vec![]), ("good", vec![(true, 1.0)])])
+            .failing_grade("bad");
+        let v = run_dispatch(&d, 2, 0);
+        assert_eq!(v.workers[0].status, WorkerStatus::Errored);
+        assert_eq!(v.workers[0].score, None);
+        assert_eq!(v.winner.as_deref(), Some("good"));
+        assert_eq!(*d.pulls.borrow(), vec!["good".to_string()]);
+    }
+
+    #[test]
+    fn loop_respects_retry_budget_then_fails() {
+        // never passes; budget 1 → 1 retry then Failed, no winner, no pull.
+        let d = MockDriver::new(vec![("w0", vec![(false, 0.3), (false, 0.4)])]);
+        let v = run_dispatch(&d, 1, 1);
+        assert_eq!(v.workers[0].status, WorkerStatus::Failed);
+        assert_eq!(v.workers[0].retries_used, 1);
+        assert_eq!(v.workers[0].score, Some(0.4));
+        assert_eq!(v.winner, None);
+        assert_eq!(v.pulled_to, None);
+        assert_eq!(*d.sends.borrow(), 1);
+        assert!(d.pulls.borrow().is_empty());
+    }
+
+    // ── verdict JSON shape (the downstream wire contract) ──
 
     fn sample() -> DispatchVerdict {
         DispatchVerdict {
             winner: Some("abc123".into()),
             workers: vec![
-                WorkerOutcome {
-                    session: "abc123".into(),
-                    score: Some(1.0),
-                    retries_used: 0,
-                    status: WorkerStatus::Scored,
-                },
-                WorkerOutcome {
-                    session: "def456".into(),
-                    score: Some(0.5),
-                    retries_used: 1,
-                    status: WorkerStatus::Failed,
-                },
-                WorkerOutcome {
-                    session: "ghi789".into(),
-                    score: None,
-                    retries_used: 0,
-                    status: WorkerStatus::Errored,
-                },
+                outcome("abc123", Some(1.0), 0, WorkerStatus::Scored),
+                outcome("def456", Some(0.5), 1, WorkerStatus::Failed),
+                outcome("ghi789", None, 0, WorkerStatus::Errored),
             ],
             pulled_to: Some(PathBuf::from("/tmp/session-abc123")),
         }
     }
 
-    /// The `--json` envelope is the pinned downstream surface (GHOST-003/004
-    /// parse it): `{version:1, dispatch:{winner, workers[], pulled_to}}`.
     #[test]
     fn verdict_json_is_the_documented_envelope() {
         let v = crate::paths::json_v1(vec![("dispatch", sample().to_json_value())]);
@@ -212,8 +813,6 @@ mod tests {
         assert_eq!(w0["status"], "scored");
     }
 
-    /// No winner / no gradeable result serializes as JSON `null`, not absent —
-    /// so a consumer can branch on it without a key-existence check.
     #[test]
     fn verdict_json_nulls_are_explicit() {
         let v = DispatchVerdict {
@@ -227,8 +826,6 @@ mod tests {
         assert!(val["workers"].as_array().unwrap().is_empty());
     }
 
-    /// The status tokens (serde rename_all) and the derived `passed` are a wire
-    /// contract — pin both.
     #[test]
     fn worker_status_tokens_and_passed_are_stable() {
         assert_eq!(

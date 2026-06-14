@@ -8,11 +8,6 @@
 
 pub(crate) mod auth;
 pub(crate) mod bookmark;
-// Contract-ahead-of-impl (GHOST-002): the dispatch types + JSON envelope are
-// declared for GHOST-003 (the fork/score/select loop) and GHOST-004 (e2e) to
-// program against; the handler is a stub. Same stance as the `ffi` module.
-// Remove the allow when GHOST-003 wires the consumers.
-#[allow(dead_code)]
 pub(crate) mod dispatch;
 pub(crate) mod env;
 pub(crate) mod sandbox;

@@ -262,6 +262,10 @@ drive_bounded() { # sid prompt
 # with the hidden grader injected (invisible to any later turn) → echoes the
 # fractional score. The authoritative, comparable metric for both arms.
 grade_full() { # sid clone task_dir
+  # Guard the clone path before `cp -R "$2/."`: an empty $2 would expand to
+  # `cp -R "/."` and copy the whole root fs (a real bug that ate 26GB once). The
+  # callers guard $clone non-empty, but this makes the catastrophic case impossible.
+  { [ -n "$2" ] && [ "$2" != "/" ]; } || { printf '0'; return; }
   local scoredir; scoredir="$(mktemp -d)"
   cp -R "$2/." "$scoredir"/ 2>/dev/null
   cp -R "$3/grader/." "$scoredir"/ 2>/dev/null

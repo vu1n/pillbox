@@ -240,3 +240,78 @@ PILLBOX=/tmp/pb MODEL=zai-coding-plan/glm-5.1 TRIALS=10 PILLBOX_BACKEND=libkrun 
   OUT=scripts/eval/segmentation/results/ap_pov-glm51-n10.jsonl \
   scripts/eval/segmentation/run.sh scripts/eval/tasks/ap_pov
 ```
+
+---
+
+# σ̂-segmentation H1 — multi-task confirmation (GHOST-007 hardening) — 2026-06-15
+
+**Decision: the keystone GENERALIZES. Segmentation's benefit replicates across 3 tasks with
+a paired lift CI that excludes zero — the n_tasks=1 caveat above is resolved. Proceed.**
+
+The #1 caveat on the GHOST-007 verdict was n_tasks=1 (degenerate paired CI; "ap_pov may be
+unusually segmentation-friendly"). H1 ran the same harness on **3** genuinely-sequential
+tasks to test generalization. It generalizes — and reveals the benefit has **two distinct
+mechanisms**, not just variance collapse.
+
+## Method
+
+- 3 tasks, each a real sequential split: `ap_dot_dsl` (build → validate), `ap_grade_school`
+  (add → query), `ap_pov` (reroot → pathfind). Gates = authoritative subsets of each task's
+  hidden tests.
+- glm-5.1, libkrun, TEMPERATURE=0, **n=10 trials/arm**, MAX_WAIT=600 (truncation-safe).
+- Records: `scripts/eval/segmentation/results/h1-3task-glm51-n10.jsonl` (60/60 clean, zero
+  cost-0 / failed launches).
+
+## Result
+
+| task | monolithic mean·σ̂ | segmented mean·σ̂ | Δmean | mechanism |
+|---|---|---|---:|---|
+| `grade_school` | 0.75 · **0.00** | 1.00 · 0.00 | +0.25 | deterministic → completion lift, no variance to cut |
+| `dot_dsl` | 0.16 · 0.17 | 0.69 · 0.08 | +0.53 | mildly bistable → σ̂ cut + lift |
+| `pov` | 0.54 · **0.47** | 1.00 · 0.00 | +0.46 | wildly bistable → σ̂ collapsed + lift |
+
+**Pooled per-arm σ̂: monolithic 0.212 → segmented 0.026** (perfect-rate 0/30 → 20/30).
+**Paired lift `mean_d = +0.41`, bootstrap CI over tasks `[0.25, 0.53]` — excludes zero.**
+
+Two findings:
+
+1. **σ̂ scales with horizon complexity** (the variance frame's prediction, now visible across
+   tasks): at TEMPERATURE=0, monolithic σ̂ is 0.00 (grade_school, simple) < 0.17 (dot_dsl) <
+   0.47 (pov, long). pov swings 0.93↔0.0 at temp=0 — bistability *beyond* sampling noise, the
+   long-horizon instability claim. Segmentation shortens each horizon → σ̂ → ~0.
+2. **Segmentation helps via TWO mechanisms.** Where the monolithic horizon is *bistable*
+   (pov, dot_dsl) it **cuts σ̂**. Where it's *deterministic-but-incomplete* (grade_school, a
+   flat 0.75 every trial — the agent consistently under-scopes the second stage) it helps
+   purely by **mean lift / completion** — the focused sub-prompt makes the remaining scope
+   explicit. The σ̂-cut needs pre-existing variance to express; the mean lift is universal.
+
+## Verdict
+
+**The keystone generalizes.** Segmentation robustly improves outcomes across all 3 tasks (lift
+CI excludes zero), cuts σ̂ wherever the monolithic horizon is bistable, and reproduces
+GHOST-007's ap_pov result near-exactly (monolithic σ̂ 0.47 both runs). The variance frame
+holds across tasks, with a richer understanding: decomposition buys *both* variance-collapse
+(on long/bistable horizons) and scope-completion (on horizons the agent under-scopes).
+
+## Caveats / open questions
+
+1. **Mechanism bundling.** Segmented = horizon-reset + focused sub-prompts + per-checkpoint
+   retry (SEG_RETRIES=1). The mean lift likely owes much to the *focused prompts* making scope
+   explicit — which is arguably segmentation's point, not a confound. **H2 (`SEG_RETRIES=0`)
+   isolates the retry contribution**; a focused-prompt-only ablation would isolate the rest.
+2. **dot_dsl stays hard** — segmented caps ~0.69 (never perfect); glm-5.1 doesn't fully solve
+   it either way. Segmentation helps but isn't a capability substitute.
+3. Single model (glm-5.1). H5 (cross-model) remains the next external-validity step.
+
+## Reproduce
+
+```sh
+# from an IMMUNE binary copy on a host with FREE DISK (a full disk half-launches libkrun VMs
+# → stalls; see ../memory pillbox-libkrun-host-fragility). The harness reaps krun state per
+# session, but the runner images/rootfs cache still need headroom.
+PILLBOX=/tmp/pb MODEL=zai-coding-plan/glm-5.1 TRIALS=10 MAX_WAIT=600 PILLBOX_BACKEND=libkrun \
+  PILLBOX_RUNNER_IMAGE=pillbox-runner:l7 \
+  OUT=scripts/eval/segmentation/results/h1-3task-glm51-n10.jsonl \
+  scripts/eval/segmentation/run.sh \
+    scripts/eval/tasks/ap_dot_dsl scripts/eval/tasks/ap_grade_school scripts/eval/tasks/ap_pov
+```

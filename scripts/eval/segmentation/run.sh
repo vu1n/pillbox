@@ -51,10 +51,11 @@
 #      EVALS_PILLBOX (frozen-task store, default `evals`), PRICE_*_PER_M (cost),
 #      OUT (JSONL records path; default a tempfile, printed at the end).
 #
-# Substrate note: `session rm` does NOT yet clean per-session krun state
-# (~/.pillbox/krun/{creds,ws}/* + *.sock accumulate) — low-urgency leak, harmless
-# at this scale; reap by hand on a long campaign. Separate from the transient
-# launch failure LAUNCH_RETRIES handles.
+# Substrate note: `session rm` does NOT clean per-session krun state
+# (~/.pillbox/krun/{creds,ws}/* + *.sock) — the accumulation degrades fresh-VM
+# launches over a long batch (the H1 mid-run stall). The harness compensates:
+# `reap_session` removes each session's state on teardown. The proper fix belongs
+# in pillbox's own session-rm; until then this keeps a multi-hour campaign healthy.
 #
 # Live runs need a codesigned libkrun binary (scripts/lk-build.sh), opencode
 # authed, the runner image present, and the task materialized (ap_pov via
@@ -67,10 +68,15 @@ TRIALS="${TRIALS:-10}"
 SEG_RETRIES="${SEG_RETRIES:-1}"
 MAX_WAIT="${MAX_WAIT:-600}"
 # Bounded retry for a transient libkrun launch failure — a fresh VM can
-# intermittently fail to boot right after a burst of create/destroy (observed
-# post-batch in GHOST-007; it self-heals, NOT a hard leak). Without this a
-# multi-task run silently drops trials to the transient. 0 disables.
+# intermittently fail to boot under sustained churn (the krun-state leak below
+# degrades launches over a long batch). Without this a multi-task run silently
+# drops trials to the transient. 0 disables.
 LAUNCH_RETRIES="${LAUNCH_RETRIES:-3}"
+# Hard caps (macOS has no `timeout`, so the helpers below use a background+kill
+# watchdog). The H1 hang was an unbounded `session send` to a half-dead VM
+# blocking forever; LAUNCH_TIMEOUT bounds a half-booting VM the same way.
+SEND_TIMEOUT="${SEND_TIMEOUT:-60}"
+LAUNCH_TIMEOUT="${LAUNCH_TIMEOUT:-90}"
 EVALS_PILLBOX="${EVALS_PILLBOX:-evals}"
 export PILLBOX_BACKEND="${PILLBOX_BACKEND:-libkrun}"
 export TEMPERATURE="${TEMPERATURE:-0}" # greedy by default — isolate segmentation
@@ -192,18 +198,64 @@ try: print(json.load(sys.stdin).get("costUsd",0))
 except Exception: print(0)'; }
 add_floats() { python3 -c 'import sys;print(float(sys.argv[1])+float(sys.argv[2]))' "$1" "$2"; }
 
-# Launch a worker session over workspace $1, retrying a transient libkrun launch
-# failure (empty sid → the VM didn't boot) up to LAUNCH_RETRIES times with a
-# linear backoff. Echoes the sid, or empty after the budget — the caller still
-# records that trial as a 0, so a persistent failure degrades gracefully.
+# Launch a worker session over workspace $1. BOUNDS the launch (LAUNCH_TIMEOUT)
+# via a background+kill watchdog — a half-booting VM can hang `run --json` (the
+# python parse blocks on a pipe that never EOFs), and an unbounded launch would
+# freeze the whole batch. Retries a transient failure (empty sid) up to
+# LAUNCH_RETRIES with linear backoff. Echoes the sid, or empty after the budget —
+# the caller records that trial as a 0, so a persistent failure degrades gracefully.
 launch_session() {
-  local sid attempt
+  local sid attempt tmpf lp w
   for attempt in $(seq 0 "$LAUNCH_RETRIES"); do
-    sid="$(pb_run_session "$1")"
+    tmpf="$(mktemp)"
+    ( pb_run_session "$1" >"$tmpf" 2>/dev/null ) &
+    lp=$!
+    w=0
+    while kill -0 "$lp" 2>/dev/null && [ "$w" -lt "$LAUNCH_TIMEOUT" ]; do sleep 3; w=$((w + 3)); done
+    kill -0 "$lp" 2>/dev/null && kill -9 "$lp" 2>/dev/null
+    wait "$lp" 2>/dev/null
+    sid="$(cat "$tmpf" 2>/dev/null)"
+    rm -f "$tmpf"
     [ -n "$sid" ] && { printf '%s' "$sid"; return 0; }
     [ "$attempt" -lt "$LAUNCH_RETRIES" ] && sleep "$(((attempt + 1) * 5))"
   done
   return 1
+}
+
+# Tear down session $1 AND reap its leaked krun state (creds/workspace/sock):
+# `session rm` kills the VM but leaves these on disk, and the accumulation is what
+# degrades fresh-VM launches across a long batch (the GHOST-007 scaling note → the
+# H1 mid-run stall). Capture the sandbox paths from `session info` before rm, then
+# remove them. Safe: callers copy the clone out (grade / segment handoff) first.
+reap_session() { # sid
+  [ -n "$1" ] || return 0
+  local info; info="$("$PILLBOX" session info "$1" --json 2>/dev/null)"
+  "$PILLBOX" session rm "$1" >/dev/null 2>&1
+  printf '%s' "$info" | python3 -c '
+import json, sys, os, shutil
+try: sb = json.loads(json.load(sys.stdin)["session"]["sandbox_id"])
+except Exception: sys.exit(0)
+for k in ("creds", "workspace", "sock"):
+    p = sb.get(k)
+    if not isinstance(p, str) or not p: continue
+    try:
+        shutil.rmtree(p, ignore_errors=True) if os.path.isdir(p) else os.remove(p)
+    except Exception: pass
+' 2>/dev/null
+}
+
+# Bounded drive: `session send` has no timeout, so a half-dead VM blocks the batch
+# forever (the H1 hang). Cap the send with a background+kill watchdog; wait-idle is
+# already bounded by MAX_WAIT. A send that overruns → the turn is abandoned and the
+# cell grades whatever landed.
+drive_bounded() { # sid prompt
+  local sp w=0
+  ( "$PILLBOX" session send "$1" "$2" >/dev/null 2>&1 ) &
+  sp=$!
+  while kill -0 "$sp" 2>/dev/null && [ "$w" -lt "$SEND_TIMEOUT" ]; do sleep 2; w=$((w + 2)); done
+  kill -0 "$sp" 2>/dev/null && kill -9 "$sp" 2>/dev/null
+  wait "$sp" 2>/dev/null
+  "$PILLBOX" session wait-idle "$1" --timeout "$MAX_WAIT" >/dev/null 2>&1 || true
 }
 
 # Grade session $1's clone $2 against task $3's FULL rubric, in a throwaway copy
@@ -227,11 +279,11 @@ run_monolithic_cell() { # task_dir task trial
   local sid; sid="$(launch_session "$ws")"
   if [ -z "$sid" ]; then rm -rf "$ws"; emit_record "$2" monolithic "$3" 0 0; return; fi
   local clone; clone="$(pb_workspace "$sid")"
-  if [ -z "$clone" ]; then "$PILLBOX" session rm "$sid" >/dev/null 2>&1; rm -rf "$ws"; emit_record "$2" monolithic "$3" 0 0; return; fi
-  pb_drive_and_wait "$sid" "$(cat "$1/prompt.txt")"
+  if [ -z "$clone" ]; then reap_session "$sid"; rm -rf "$ws"; emit_record "$2" monolithic "$3" 0 0; return; fi
+  drive_bounded "$sid" "$(cat "$1/prompt.txt")"
   local score; score="$(grade_full "$sid" "$clone" "$1")"
   local cost; cost="$(pb_usage "$sid" | cost_of)"
-  "$PILLBOX" session rm "$sid" >/dev/null 2>&1
+  reap_session "$sid"
   rm -rf "$ws"
   emit_record "$2" monolithic "$3" "$score" "$cost"
 }
@@ -244,7 +296,7 @@ gate_segment() { # sid clone segdir task_dir
   local prompt; prompt="$(cat "$3/prompt.txt")"
   local scoredir sj state
   for _ in $(seq 0 "$SEG_RETRIES"); do
-    pb_drive_and_wait "$1" "$prompt"
+    drive_bounded "$1" "$prompt"
     scoredir="$(mktemp -d)"
     cp -R "$2/." "$scoredir"/ 2>/dev/null
     cp -R "$4/grader/." "$scoredir"/ 2>/dev/null
@@ -275,7 +327,7 @@ run_segmented_cell() { # task_dir task trial
     sid="$(launch_session "$ws_prev")"
     if [ -z "$sid" ]; then rm -rf "$ws_prev"; emit_record "$2" segmented "$3" 0 "$cost"; return; fi
     clone="$(pb_workspace "$sid")"
-    if [ -z "$clone" ]; then "$PILLBOX" session rm "$sid" >/dev/null 2>&1; rm -rf "$ws_prev"; emit_record "$2" segmented "$3" 0 "$cost"; return; fi
+    if [ -z "$clone" ]; then reap_session "$sid"; rm -rf "$ws_prev"; emit_record "$2" segmented "$3" 0 "$cost"; return; fi
     gate_segment "$sid" "$clone" "$d" "$1"
     segcost="$(pb_usage "$sid" | cost_of)"
     cost="$(add_floats "$cost" "$segcost")"
@@ -284,13 +336,13 @@ run_segmented_cell() { # task_dir task trial
       # a throwaway, so the clone is clean), then reset the horizon: a new session.
       ws_next="$(mktemp -d)"
       cp -R "$clone/." "$ws_next"/ 2>/dev/null
-      "$PILLBOX" session rm "$sid" >/dev/null 2>&1
+      reap_session "$sid"
       rm -rf "$ws_prev"; ws_prev="$ws_next"
     fi
   done
   # Final authoritative grade on the last segment's clone (its session still live).
   local score; score="$(grade_full "$sid" "$clone" "$1")"
-  "$PILLBOX" session rm "$sid" >/dev/null 2>&1
+  reap_session "$sid"
   rm -rf "$ws_prev"
   emit_record "$2" segmented "$3" "$score" "$cost"
 }

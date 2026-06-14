@@ -23,12 +23,6 @@
 //! Full design: docs/managed-tier.md (§Consume path) + docs/session-event-log.md
 //! (§Sequencing — local single-writer vs resident sequencer).
 
-// The sink seam lands ahead of its first producer wiring (`pillbox run` does not
-// yet select the managed placement — that dispatch is the next slice), mirroring
-// `log.rs`'s contract-first stance. The trait + both impls are exercised by the
-// tests below.
-#![allow(dead_code)]
-
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
@@ -139,8 +133,9 @@ impl EventLog for ManagedDoSink {
 /// on. With `PILLBOX_MANAGED_DO_URL` set (and `PILLBOX_ACTOR_TOKEN` for the
 /// actor credential), events go to the per-session Durable Object; otherwise to
 /// the local file-backed [`SessionLog`]. The caller writes through the returned
-/// `dyn EventLog` and never sees which placement it got.
-pub(crate) fn open_event_log(pb: &Pillbox, session_id: &str) -> Result<Box<dyn EventLog>> {
+/// `dyn EventLog` and never sees which placement it got. `+ Send` so a producer
+/// can move the sink into its background tailer thread; both placements are `Send`.
+pub(crate) fn open_event_log(pb: &Pillbox, session_id: &str) -> Result<Box<dyn EventLog + Send>> {
     if let Ok(base) = std::env::var("PILLBOX_MANAGED_DO_URL") {
         let token = std::env::var("PILLBOX_ACTOR_TOKEN").unwrap_or_default();
         let endpoint = format!(
@@ -150,6 +145,19 @@ pub(crate) fn open_event_log(pb: &Pillbox, session_id: &str) -> Result<Box<dyn E
         return Ok(Box::new(ManagedDoSink::new(endpoint, token)?));
     }
     Ok(Box::new(SessionLog::open(pb, session_id)?))
+}
+
+/// Best-effort [`open_event_log`] for a run producer: a sink-open failure warns
+/// and yields `None` (the run continues OTLP-only) instead of aborting the run.
+/// The single home for that fallback policy, shared by the backend producers.
+pub(crate) fn open_or_warn(pb: &Pillbox, session_id: &str) -> Option<Box<dyn EventLog + Send>> {
+    match open_event_log(pb, session_id) {
+        Ok(log) => Some(log),
+        Err(e) => {
+            eprintln!("pillbox: warning: couldn't open session log: {e:#}");
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -264,5 +272,78 @@ mod tests {
             .unwrap_err();
         server.join().expect("server thread");
         assert!(format!("{err:#}").contains("403"), "expected 403 in error");
+    }
+
+    #[test]
+    fn open_event_log_defaults_to_the_local_file_placement() {
+        // With no managed env, the swap point returns the local file-backed
+        // placement: appended events persist to the on-disk session log (a fresh
+        // handle sees them) and never leave the host. This is the path every
+        // `pillbox run` takes by default — guard against the env-gate inverting.
+        with_isolated_home("sink-open-local", || {
+            std::env::remove_var("PILLBOX_MANAGED_DO_URL");
+            let pb = crate::pillbox::global();
+            let mut sink = open_event_log(&pb, "sess-default").unwrap();
+            let last = sink
+                .append(&[
+                    Event::session("sess-default", tool_call("a")),
+                    Event::session("sess-default", tool_call("b")),
+                ])
+                .unwrap();
+            assert_eq!(last, 2, "local placement stamps via the file authority");
+            assert_eq!(
+                SessionLog::open(&pb, "sess-default").unwrap().last_seq(),
+                2,
+                "events persisted to the on-disk log, not a remote sink"
+            );
+        });
+    }
+
+    /// Removes the named env vars on drop. The managed-routing test sets a var
+    /// (`PILLBOX_MANAGED_DO_URL`) that changes `open_event_log`'s placement for
+    /// ALL subsequent code; an RAII guard removes it even if the body panics
+    /// (`with_isolated_home` holds the test HOME lock but does not `catch_unwind`,
+    /// so a bare `remove_var` at the end would be skipped on panic and leak the
+    /// routing into the next test).
+    struct EnvGuard(&'static [&'static str]);
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for key in self.0 {
+                std::env::remove_var(key);
+            }
+        }
+    }
+
+    #[test]
+    fn open_event_log_routes_to_managed_do_when_env_set() {
+        // PILLBOX_MANAGED_DO_URL flips the swap point to the managed Durable
+        // Object: open_event_log builds the per-session URL and POSTs there with
+        // the actor token. Held under the test HOME lock (via with_isolated_home)
+        // so the env mutation serializes against other env-touching tests; the
+        // EnvGuard clears the vars on scope exit (incl. panic) so routing can't leak.
+        with_isolated_home("sink-open-managed", || {
+            let _env = EnvGuard(&["PILLBOX_MANAGED_DO_URL", "PILLBOX_ACTOR_TOKEN"]);
+            let (base, received, server) =
+                one_shot_server("HTTP/1.1 200 OK", r#"{"seq":3,"head":3}"#);
+            std::env::set_var("PILLBOX_MANAGED_DO_URL", &base);
+            std::env::set_var("PILLBOX_ACTOR_TOKEN", "tok-open");
+
+            let pb = crate::pillbox::global();
+            let seq = open_event_log(&pb, "sess-open")
+                .and_then(|mut sink| sink.append(&[Event::session("sess-open", tool_call("z"))]))
+                .expect("append via managed sink");
+
+            server.join().expect("server thread");
+            assert_eq!(seq, 3);
+            let req = received.lock().unwrap().take().expect("got request");
+            assert!(
+                req.starts_with("POST /agents/session-gateway/sess-open/event"),
+                "open_event_log must build the per-session DO URL: {req}"
+            );
+            assert!(
+                req.contains("Bearer tok-open"),
+                "actor token must ride the request: {req}"
+            );
+        });
     }
 }

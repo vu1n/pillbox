@@ -64,9 +64,15 @@ notify = "8"
 # (`pillbox session subscribe`): streams the durable event log to WS
 # subscribers as JSON. Sync + thread-per-connection — no tokio runtime
 # (matches pillbox's model: async only for the vault proxy). Already in
-# the tree transitively via hudsucker; `handshake` is all we need (no TLS
-# — the gateway binds localhost ws://). Direct dep so `cargo audit` sees it.
-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+# the tree transitively via hudsucker. `handshake` for the localhost ws://
+# gateway server; `rustls-tls-webpki-roots` for the managed §0 read source
+# (`events::source::ManagedDoSource`), a wss:// client to the Durable Object
+# — it uses our explicit aws_lc_rs `Connector` (no process-default provider),
+# reusing the tree's pinned rustls 0.23. Direct dep so `cargo audit` sees it.
+tungstenite = { version = "0.28", default-features = false, features = [
+    "handshake",
+    "rustls-tls-webpki-roots",
+] }
 # Unix-only: `pillbox session detach <id>` SIGTERMs the attached
 # pillbox process. Direct dep so a `cargo audit` flags advisories
 # instead of hiding behind a transitive resolution.

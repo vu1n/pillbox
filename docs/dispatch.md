@@ -121,6 +121,12 @@ treats them as deferred, not forgotten:
 - **`--to DIR` for the winner pull** — a deterministic output path for chaining
   segments. v1 pulls to the default `./session-<id>`, which the caller reads
   back from `pulled_to`.
+- **Docker-backend dispatch** — v1 is **libkrun-only**: the grader resolves each
+  worker's *live* workspace via `session info --json` → `.session.workspace`,
+  which only libkrun sessions populate. A docker run needs a non-libkrun
+  workspace-resolution (pull-then-score, or score the `result_snapshot` after
+  `session done`). The loop itself is backend-agnostic; only the grade step is
+  coupled. (`scripts/smoke/dispatch.sh` skips non-libkrun backends.)
 
 ## Relationship to other verbs
 

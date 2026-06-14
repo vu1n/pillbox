@@ -99,6 +99,10 @@ pub(super) fn session_subscribe(
             .ok()
             .filter(|u| !u.is_empty())
         {
+            // NOTE: local-only — the webhook exporter tails the local file log,
+            // not the managed DO source. Under managed placement it would see an
+            // empty local log; migrating it (and `wait-idle`) to open_event_source
+            // needs a last_seq on the EventSource trait. Deferred follow-up.
             if let Ok(elog) = crate::events::log::SessionLog::open(resolved, &sid) {
                 crate::events::spawn_webhook_log_exporter(elog, url);
             }
@@ -112,11 +116,13 @@ pub(super) fn session_watch(resolved: &Pillbox, id: &str, from: u64) -> Result<(
     use std::sync::atomic::AtomicBool;
     let (sid, _tailer) = resolve_streaming_session(resolved, id, "session watch")?;
     eprintln!("pillbox: watching session {sid} (Ctrl-C to stop)");
-    let log = crate::events::log::SessionLog::open(resolved, &sid)?;
+    // Read through the placement swap point: the local file by default, the
+    // managed DO WebSocket when the managed tier is on.
+    let source = crate::events::source::open_event_source(resolved, &sid)?;
     // Never set: Ctrl-C ends the process; `_tailer` lives until then.
     let stop = AtomicBool::new(false);
     let mut role = crate::contract::Role::Unspecified;
-    log.subscribe(from, &stop, |ev| {
+    source.subscribe(from, &stop, &mut |ev| {
         render_watch_event(ev, &mut role);
         true
     })

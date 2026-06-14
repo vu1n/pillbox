@@ -136,13 +136,13 @@ impl EventLog for ManagedDoSink {
 /// `dyn EventLog` and never sees which placement it got. `+ Send` so a producer
 /// can move the sink into its background tailer thread; both placements are `Send`.
 pub(crate) fn open_event_log(pb: &Pillbox, session_id: &str) -> Result<Box<dyn EventLog + Send>> {
-    if let Ok(base) = std::env::var("PILLBOX_MANAGED_DO_URL") {
-        let token = std::env::var("PILLBOX_ACTOR_TOKEN").unwrap_or_default();
-        let endpoint = format!(
-            "{}/agents/session-gateway/{session_id}",
-            base.trim_end_matches('/')
-        );
-        return Ok(Box::new(ManagedDoSink::new(endpoint, token)?));
+    if let Some((endpoint, token)) = super::managed_endpoint(session_id) {
+        // The DO derives the actor from the token; an empty token fails closed
+        // (401) on the first append. `None` (unset/empty) → `""` preserves that.
+        return Ok(Box::new(ManagedDoSink::new(
+            endpoint,
+            token.unwrap_or_default(),
+        )?));
     }
     Ok(Box::new(SessionLog::open(pb, session_id)?))
 }

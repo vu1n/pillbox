@@ -92,6 +92,11 @@ pillbox's `--json` surface.
 | `failed` | Ran and was graded, but didn't pass after exhausting its retries. |
 | `errored` | Never reached a gradeable result (boot / drive / score error); `score` is `null`. |
 
+A worker that fails to fork, or whose turn doesn't go idle within the per-turn
+timeout, becomes `errored` — one stuck/broken worker never sinks the batch (the
+others are still driven and selected). The per-turn idle timeout defaults to
+30 min; override with `PILLBOX_DISPATCH_TURN_TIMEOUT=<seconds>`.
+
 ## Exit codes
 
 Consistent with the pillbox exit-code table (`CLAUDE.md`):

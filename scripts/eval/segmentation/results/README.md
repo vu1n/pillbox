@@ -8,6 +8,7 @@ consumes them lives in [`docs/optimization-gate.md`](../../../../docs/optimizati
 | file | run | n/arm | model | headline |
 |---|---|---:|---|---|
 | `ap_pov-glm51-n10.jsonl` | GHOST-007, 2026-06-14 | 10 | zai-coding-plan/glm-5.1 | σ̂ 0.467 → 0.000 (monolithic → segmented); mean 0.42 → 1.00 |
+| `h1-3task-glm51-n10.jsonl` | H1 multi-task, 2026-06-15 | 10 | zai-coding-plan/glm-5.1 | 3 tasks (dot_dsl/grade_school/pov); pooled σ̂ 0.212 → 0.026; paired lift +0.41, CI [0.25, 0.53] excludes zero |
 
 Re-derive the stats from any file:
 

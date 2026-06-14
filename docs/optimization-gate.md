@@ -315,3 +315,29 @@ PILLBOX=/tmp/pb MODEL=zai-coding-plan/glm-5.1 TRIALS=10 MAX_WAIT=600 PILLBOX_BAC
   scripts/eval/segmentation/run.sh \
     scripts/eval/tasks/ap_dot_dsl scripts/eval/tasks/ap_grade_school scripts/eval/tasks/ap_pov
 ```
+
+## H2 — retry isolation (`SEG_RETRIES=0`), 2026-06-15
+
+H1's segmented arm bundled three things: horizon-reset + focused sub-prompts + per-checkpoint
+retry. H2 re-runs all 3 tasks with **`SEG_RETRIES=0`** (no retry) to isolate retry's
+contribution. Records: `results/h2-segretries0-glm51-n10.jsonl` (60/60 clean).
+
+| segmented arm | pooled σ̂ | perfect | paired lift CI |
+|---|---:|---:|---|
+| H1 (retry=1) | 0.026 | 20/30 | +0.41 [0.25, 0.53] |
+| H2 (retry=0) | 0.037 | 11/30 | +0.25 [0.13, 0.33] |
+
+**Retry is NOT the driver.** At retry=0, segmentation STILL cuts σ̂ (monolithic 0.251 →
+segmented 0.037) and STILL lifts the mean (+0.247, CI [0.13, 0.33] excludes zero).
+Horizon-reset + focused-prompts carry the effect.
+
+**Retry amplifies it** (real second-order contributor, not the cause): ~doubles the
+perfect-rate (11 → 20/30) and adds ~+0.16 lift, concentrated where a failed segment can
+*recover* — pov segmented 0.76 → 1.00 (1/10 → 10/10 perfect), dot_dsl 0.51 → 0.69.
+**grade_school is 1.00 / 10-perfect with OR without retry** → its mean-lift (scope-completion
+via the focused sub-prompt) is fully retry-independent.
+
+**Remaining isolation (not yet run):** segmentation still bundles horizon-reset + focused
+sub-prompts. The clean next ablation is **focused-prompts WITHOUT horizon-reset** — drive the
+focused sub-prompts in sequence in ONE session — to separate "smaller explicit scope" from
+"fresh session per checkpoint." Then H5 (cross-model, beyond glm-5.1).

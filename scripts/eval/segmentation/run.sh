@@ -4,16 +4,25 @@
 # horizon coding task into rubric-gated SEGMENTS reduce the trial-to-trial
 # variance σ̂ that best-of-k otherwise has to pay to overcome?
 #
-# Two arms per task, TRIALS each, scored on the SAME authoritative full rubric so
+# Three arms per task, TRIALS each, scored on the SAME authoritative full rubric so
 # the scores are comparable:
 #   monolithic  one session does the whole task in one long horizon.
+#   chained     the focused per-segment prompts driven sequentially in ONE session
+#               (in-session chaining): context accumulates, the horizon NEVER
+#               resets. Same decomposition and gating as `segmented`; the ONLY
+#               difference is the session boundary. The ablation arm —
+#               chained−monolithic isolates "smaller explicit scope", and
+#               segmented−chained isolates "fresh session per checkpoint" (horizon
+#               reset). H2 already ruled out per-segment retry as the driver; this
+#               splits the remaining two co-variables.
 #   segmented   a FRESH session per segment over the prior segment's VERIFIED
 #               workspace — the horizon is RESET at every checkpoint (the faithful
-#               operationalization of the hypothesis: in-session chaining would
-#               let context accumulate and NOT reset the horizon). Each segment is
-#               gated by its authoritative sub-rubric (retried up to SEG_RETRIES);
-#               the gate only steers progression — the comparable score is the
-#               full rubric at the end, which bounds the weak-verifier confound.
+#               operationalization of the hypothesis: in-session chaining (= the
+#               `chained` arm) would let context accumulate and NOT reset it). Each
+#               segment is gated by its authoritative sub-rubric (retried up to
+#               SEG_RETRIES); the gate only steers progression — the comparable
+#               score is the full rubric at the end, which bounds the weak-verifier
+#               confound.
 #
 # Relationship to `pillbox dispatch` (GHOST-003/004): this is dispatch's
 # SEGMENTATION sibling — same run→drive→score→pull primitives (GHOST-004
@@ -111,7 +120,7 @@ seg_root_for() { printf '%s' "$here/segments/$1"; }
 # ── dry-run: print the trial matrix, resolve every path, never launch ─────────
 print_matrix() {
   echo "σ̂-segmentation experiment — trial matrix (dry-run, no sessions launched)"
-  echo "  trials/arm: $TRIALS   arms: monolithic, segmented   tasks: ${#REFS[@]}"
+  echo "  trials/arm: $TRIALS   arms: monolithic, chained, segmented   tasks: ${#REFS[@]}"
   echo "  model: ${MODEL:-<opencode default>}   temperature: $TEMPERATURE   seg-retries: $SEG_RETRIES   backend: $PILLBOX_BACKEND"
   echo
   local ref name segd cells=0 boots=0
@@ -152,12 +161,13 @@ print_matrix() {
       echo "    ERROR — segments/$name/ has no NN-*/ segment dirs" >&2
       DRY_ERR=1
     fi
-    # monolithic: 1 VM/trial; segmented: i VMs/trial (a fresh session per segment).
-    boots=$((boots + TRIALS + i * TRIALS))
-    cells=$((cells + 2 * TRIALS))
+    echo "  arm chained    × $TRIALS trials   same $i focused segments, ONE session (no horizon reset)"
+    # monolithic: 1 VM/trial; chained: 1 VM/trial (single session); segmented: i VMs/trial.
+    boots=$((boots + TRIALS + TRIALS + i * TRIALS))
+    cells=$((cells + 3 * TRIALS))
     echo
   done
-  echo "totals: $cells cells (${#REFS[@]} tasks × 2 arms × $TRIALS trials) → ~$boots VM boots"
+  echo "totals: $cells cells (${#REFS[@]} tasks × 3 arms × $TRIALS trials) → ~$boots VM boots"
   echo "stats:  paired-stats.py (paired lift CI + pooled σ̂) + a per-arm σ̂ summary"
 }
 
@@ -292,6 +302,32 @@ run_monolithic_cell() { # task_dir task trial
   emit_record "$2" monolithic "$3" "$score" "$cost"
 }
 
+# Arm C — the focused per-segment prompts driven in ONE session (in-session
+# chaining): same decomposition and gating as arm B, but the horizon never
+# resets. chained−monolithic isolates "smaller explicit scope"; segmented−chained
+# isolates "fresh session per checkpoint". SEG_RETRIES is held identical to arm B,
+# so the ONLY B↔C difference is the session boundary.
+run_chained_cell() { # task_dir task trial
+  local segd; segd="$(seg_root_for "$2")"
+  local segs=() d
+  for d in "$segd"/*/; do [ -d "$d" ] && segs+=("$d"); done
+  if [ "${#segs[@]}" -eq 0 ]; then emit_record "$2" chained "$3" 0 0; return; fi
+
+  local ws; ws="$(mktemp -d)"
+  cp -R "$1/workspace/." "$ws"/ 2>/dev/null
+  local sid; sid="$(launch_session "$ws")"
+  if [ -z "$sid" ]; then rm -rf "$ws"; emit_record "$2" chained "$3" 0 0; return; fi
+  local clone; clone="$(pb_workspace "$sid")"
+  if [ -z "$clone" ]; then reap_session "$sid"; rm -rf "$ws"; emit_record "$2" chained "$3" 0 0; return; fi
+  # Each focused segment drives in the SAME session — context accumulates, no reset.
+  for d in "${segs[@]}"; do gate_segment "$sid" "$clone" "$d" "$1"; done
+  local score; score="$(grade_full "$sid" "$clone" "$1")"
+  local cost; cost="$(pb_usage "$sid" | cost_of)"
+  reap_session "$sid"
+  rm -rf "$ws"
+  emit_record "$2" chained "$3" "$score" "$cost"
+}
+
 # Drive + gate one segment (best-effort, SEG_RETRIES): the gate only steers
 # progression; the final full-rubric grade is the metric. The gate runs the
 # segment's authoritative sub-rubric in a throwaway copy with the hidden grader
@@ -368,6 +404,7 @@ for ref in "${REFS[@]}"; do
   for t in $(seq 1 "$TRIALS"); do
     echo "▶ $name trial $t/$TRIALS" >&2
     run_monolithic_cell "$task_dir" "$name" "$t"
+    run_chained_cell    "$task_dir" "$name" "$t"
     run_segmented_cell  "$task_dir" "$name" "$t"
   done
   # rm only a tempdir we pulled; a dir ref ($ref == $task_dir) is used in place.
@@ -375,9 +412,14 @@ for ref in "${REFS[@]}"; do
 done
 
 echo "=== records: $out ===" >&2
-echo "=== paired-stats (monolithic=A, segmented=B) ===" >&2
+# Three paired contrasts decompose the win: scope alone, horizon-reset on top, full.
+echo "=== paired-stats: scope effect (chained vs monolithic) ===" >&2
+python3 "$here/../paired-stats.py" --baseline monolithic --treatment chained "$out" || true
+echo "=== paired-stats: horizon-reset effect (segmented vs chained) ===" >&2
+python3 "$here/../paired-stats.py" --baseline chained --treatment segmented "$out" || true
+echo "=== paired-stats: full segmentation (segmented vs monolithic) ===" >&2
 python3 "$here/../paired-stats.py" --baseline monolithic --treatment segmented "$out" || true
-echo "=== per-arm σ̂ — the keystone: does segmentation cut it? ===" >&2
+echo "=== per-arm σ̂ — the keystone: does segmentation cut it, and which part? ===" >&2
 python3 - "$out" <<'PY'
 import json, sys, statistics, collections
 cells = collections.defaultdict(list)
@@ -394,13 +436,18 @@ per = collections.defaultdict(list)
 for (task, cond), v in cells.items():
     if len(v) >= 2:
         per[cond].append(statistics.stdev(v))
+sig = {}
 for cond in sorted(per):
     sds = per[cond]
-    sig = sum(sds) / len(sds) if sds else 0.0
+    sig[cond] = sum(sds) / len(sds) if sds else 0.0
     p, n = passes[cond]
-    print(f"  {cond:11s} sigma_hat={sig:.4f}  pass-rate={p}/{n}={(p/n if n else 0):.2f}")
-ms, ss = per.get("monolithic"), per.get("segmented")
-if ms and ss:
-    a, b = sum(ms) / len(ms), sum(ss) / len(ss)
-    print(f"  delta_sigma = segmented - monolithic = {b - a:+.4f}  ({'cuts' if b < a else 'raises'} variance)")
+    print(f"  {cond:11s} sigma_hat={sig[cond]:.4f}  pass-rate={p}/{n}={(p/n if n else 0):.2f}")
+# Ablation deltas: each is σ̂[treatment] − σ̂[baseline]; negative = cuts variance.
+def delta(treat, base, label):
+    if treat in sig and base in sig:
+        d = sig[treat] - sig[base]
+        print(f"  Δσ̂ {label:24s} {treat}−{base} = {d:+.4f}  ({'cuts' if d < 0 else 'raises'} variance)")
+delta("chained",   "monolithic", "[scope alone]")
+delta("segmented", "chained",    "[horizon reset on top]")
+delta("segmented", "monolithic", "[full segmentation]")
 PY

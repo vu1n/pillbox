@@ -337,7 +337,55 @@ perfect-rate (11 → 20/30) and adds ~+0.16 lift, concentrated where a failed se
 **grade_school is 1.00 / 10-perfect with OR without retry** → its mean-lift (scope-completion
 via the focused sub-prompt) is fully retry-independent.
 
-**Remaining isolation (not yet run):** segmentation still bundles horizon-reset + focused
-sub-prompts. The clean next ablation is **focused-prompts WITHOUT horizon-reset** — drive the
-focused sub-prompts in sequence in ONE session — to separate "smaller explicit scope" from
-"fresh session per checkpoint." Then H5 (cross-model, beyond glm-5.1).
+**Remaining isolation (resolved by H4 below):** segmentation still bundles horizon-reset +
+focused sub-prompts. The clean next ablation is **focused-prompts WITHOUT horizon-reset** —
+drive the focused sub-prompts in sequence in ONE session — to separate "smaller explicit scope"
+from "fresh session per checkpoint." Then H5 (cross-model, beyond glm-5.1).
+
+## H4 — horizon-reset vs focused-scope ablation, 2026-06-15
+
+H2 ruled out per-segment retry; the two remaining co-variables were **smaller explicit scope**
+(the focused sub-prompts) and **horizon reset** (a fresh session per checkpoint). H4 splits them
+with a third arm, **`chained`**: the *same* focused, checkpoint-gated sub-prompts (same
+`SEG_RETRIES=1`), but driven sequentially in **ONE persistent session** — context accumulates,
+the horizon never resets. The only `chained`↔`segmented` difference is the session boundary, so
+`chained − monolithic` isolates scope and `segmented − chained` isolates the reset. All 3 arms
+run in one batch (3 tasks × n=10) so host-state drift in σ̂ differences out. Records:
+`results/h4-horizon-reset-glm51-n10.jsonl` (90/90 clean, 0 cost-0 across all arms).
+
+| arm | σ̂ (mean per-task) | pass-rate |
+|---|---:|---:|
+| monolithic | 0.198 | 3/30 (0.10) |
+| **chained** (focused, ONE session) | **0.055** | 22/30 (0.73) |
+| segmented (focused, fresh session/checkpoint) | 0.052 | 20/30 (0.67) |
+
+| contrast | Δσ̂ | paired lift, CI over tasks |
+|---|---:|---|
+| **scope alone** (chained − monolithic) | **−0.143** | **+0.52 [0.23, 0.69]** — excludes 0 |
+| **horizon reset on top** (segmented − chained) | **−0.003** | **−0.025 [−0.075, 0.00]** — includes 0 |
+| full segmentation (segmented − monolithic) | −0.146 | +0.49 [0.23, 0.63] — excludes 0 |
+
+**The mechanism is focused scope, NOT session reset.** `chained` captures **98% of the σ̂-cut**
+(−0.143 of −0.146) and **105% of the mean lift** (+0.52 vs the full +0.49 — `chained` is
+marginally *higher* than `segmented`). Stacking fresh-session-per-checkpoint on top adds nothing
+to variance (Δσ̂ −0.003 ≈ noise) and its lift CI `[−0.075, 0.00]` does not exclude zero, leaning
+slightly negative — flushing accumulated context costs a hair. Per-task, the clincher is
+**ap_pov** — the high-σ̂ bistable task where reset *should* matter most: `chained` collapses its
+`0.37±0.48` to a perfect `1.00±0.00`, identical to `segmented`, with no reset at all (dot_dsl
+`0.07 → 0.76 ≥ 0.68`; grade_school `0.78 → 1.00 = 1.00`).
+
+**Two consequences.** (1) *For dispatch:* segmentation's benefit does **not** require
+fork-per-segment / fresh sessions / workspace handoff — driving focused, checkpoint-gated
+sub-prompts in **one** session captures the whole effect, strictly cheaper (1 boot/task vs N) and
+marginally better. The expensive fork-per-segment machinery is the **best-of-k diversity** lever
+(multiple attempts at one horizon), a *different* axis from segmentation — H4 cleanly separates
+them. (2) *Mechanism, correcting H1's "σ̂ scales with horizon":* `chained` does **more** total
+work than monolithic (higher cost — a *longer* effective horizon) yet has 4× lower σ̂. So it is
+not session length that drives variance; it is **the presence of checkpointed sub-goals**. The
+agent does not drift over a long session — it drifts when handed one under-specified goal. H1's
+horizon↔σ̂ correlation was confounded: longer monolithic tasks were also the vaguer single-shot
+goals.
+
+**Next:** H5 (cross-model robustness, beyond glm-5.1, needs the kimi/deepseek pool). The
+verified-core dispatch design now reads: in-session focused-prompt chaining with per-checkpoint
+verification as the segmentation lever; fork-per-segment reserved for best-of-k diversity.

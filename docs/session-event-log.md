@@ -224,6 +224,28 @@ context.
 (the `Frame::Snapshot` payload), blob-stored, so replay/late-join skip the
 byte stream. (`pty_resize` optional.)
 
+**Structured artifacts (new — LANDED):**
+
+| Payload | Fields |
+|---|---|
+| `artifact` | `kind` (dotted namespace: `eval.grader_report`, `judge.report`, `dispatch.worker_summary`, `code_explore.citations`, `self_harness.proposal`, `patch.summary`, …), `summary`, `contentType`, `class: content\|signal`, `blobRef`(sha256), `bytes`, `workerId?` — a typed, durable output that isn't an ordinary agent message; the body is blob-stored, **never inlined**, dereferenced lazily |
+
+`artifact` is the generalization of `scored` (which stays its own first-class
+reward payload): the typed envelope for any non-message session output an
+optimizer, eval harness, or debugger needs to mine — grader reports, judge
+critiques, per-worker dispatch evidence, code-exploration citations. The body
+lands in the blob store; the log keeps only the small typed reference, so a
+trajectory dump never drowns replay. `class` carries the content-vs-signal
+poolability split per-artifact (defaults to the safe `content`).
+
+**Producer/reader surface:** `pillbox session artifact put ID --kind K
+[--summary S] [--content-type T] [--class content|signal] [--worker WID]
+[--file PATH | stdin] [--json]` stores the body in the blob store and appends
+the `artifact` event; `pillbox session artifact get ID --ref SHA` streams the
+body back. List them with `session log --type artifact`. A host-side tool (a
+grader, a judge, a FastContext explorer, the dispatch loop) attaches output
+this way without inlining it into the transcript or being compiled into pillbox.
+
 **Workspace** (kept): `checkpoint` · `result_ready`
 **Exec** (kept): `exec_started` · `exec_output` · `exec_exit`
 **Valve** (kept): `custom`

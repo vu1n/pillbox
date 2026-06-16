@@ -29,8 +29,12 @@
 //!     produces [`Payload`]s) and the lifecycle stream into the log.
 //!   - **`actor` / `class` envelope fields**: land with the gateway (authenticated
 //!     actor) and the pooling gate (content-vs-signal) that enforce them.
-//!   - **blob store / `pty_snapshot` / `raw_body`** and the `head` fast-resume
-//!     file: optimizations that arrive with their consumers.
+//!     (`actor` is now stamped by producers; `class` ships per-artifact on the
+//!     [`Artifact`](crate::contract::Artifact) payload.)
+//!   - **`pty_snapshot` / `raw_body`** and the `head` fast-resume file:
+//!     optimizations that arrive with their consumers. (The content-addressed
+//!     **blob store** these will use has landed — [`crate::events::blob`] —
+//!     driven first by the structured `artifact` payload.)
 //!
 //! Pure functional core — no docker/agent/network. Fully unit-tested below.
 

@@ -322,6 +322,7 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> 
             agent,
             follow,
         } => session_transcript(&file, &session_id, agent, follow),
+        SessionAction::Artifact { action } => session_artifact(resolved, action),
     }
 }
 
@@ -1110,6 +1111,146 @@ fn select_log_events(
     Ok(matched)
 }
 
+/// `session artifact …` — write/read a structured artifact + its blob.
+fn session_artifact(resolved: &Pillbox, action: crate::cli::ArtifactAction) -> Result<()> {
+    use crate::cli::ArtifactAction;
+    match action {
+        ArtifactAction::Put {
+            id,
+            kind,
+            summary,
+            content_type,
+            class,
+            worker,
+            file,
+            json,
+        } => session_artifact_put(
+            resolved,
+            &id,
+            &kind,
+            summary.as_deref(),
+            content_type.as_deref(),
+            class,
+            worker.as_deref(),
+            file.as_deref(),
+            json,
+        ),
+        ArtifactAction::Get { id, r#ref } => session_artifact_get(resolved, &id, &r#ref),
+    }
+}
+
+/// Store an artifact body (from `--file` or stdin) in the session's content-
+/// addressed blob store and append an `artifact` §0 event referencing it — the
+/// host-side hook a grader / judge / explorer uses to attach output without
+/// inlining it into the transcript. The blob is content-addressed (idempotent),
+/// the log line stays small (a typed ref), and the body is fetched back with
+/// `session artifact get --ref`. Stamped `service:artifact` (the generic CLI
+/// producer); an in-process producer like dispatch stamps its own actor.
+#[allow(clippy::too_many_arguments)] // a CLI leaf handler — args mirror parsed flags 1:1
+fn session_artifact_put(
+    resolved: &Pillbox,
+    id: &str,
+    kind: &str,
+    summary: Option<&str>,
+    content_type: Option<&str>,
+    class: crate::cli::ArtifactClassArg,
+    worker: Option<&str>,
+    file: Option<&std::path::Path>,
+    json: bool,
+) -> Result<()> {
+    use std::io::Read;
+
+    if kind.trim().is_empty() {
+        return Err(PillboxError::usage("session artifact put", "--kind must not be empty").into());
+    }
+    let session = session::resolve(resolved, id)?;
+
+    // Body from --file, else stdin (the pipe shape: `… | pillbox session artifact put`).
+    let body = match file {
+        Some(p) => std::fs::read(p).map_err(|e| {
+            PillboxError::runtime("session artifact put", format!("read {}: {e}", p.display()))
+        })?,
+        None => {
+            let mut buf = Vec::new();
+            std::io::stdin().read_to_end(&mut buf).map_err(|e| {
+                PillboxError::runtime("session artifact put", format!("read stdin: {e}"))
+            })?;
+            buf
+        }
+    };
+
+    let store = crate::events::blob::BlobStore::open(resolved, &session.id)?;
+    let blob_ref = store.put(&body)?;
+    let artifact = crate::contract::Artifact {
+        kind: kind.to_string(),
+        summary: summary.unwrap_or_default().to_string(),
+        content_type: content_type.unwrap_or_default().to_string(),
+        class: match class {
+            crate::cli::ArtifactClassArg::Content => crate::contract::ArtifactClass::Content,
+            crate::cli::ArtifactClassArg::Signal => crate::contract::ArtifactClass::Signal,
+        },
+        blob_ref: blob_ref.clone(),
+        bytes: body.len() as u64,
+        worker_id: worker.unwrap_or_default().to_string(),
+    };
+
+    let mut log = crate::events::log::SessionLog::open(resolved, &session.id)?;
+    let seq = log.append(&[crate::contract::Event::session(
+        &session.id,
+        crate::contract::Payload::Artifact(artifact.clone()),
+    )
+    .with_actor(crate::contract::Actor::service("artifact"))])?;
+
+    if json {
+        println!("{}", artifact_ref_json(&session.id, &artifact, seq));
+    } else {
+        println!(
+            "pillbox: ✓ artifact `{}` ({} bytes) → seq {seq}  ref {}",
+            artifact.kind, artifact.bytes, artifact.blob_ref
+        );
+    }
+    Ok(())
+}
+
+/// Read an artifact body by blob ref and write it to stdout — the lazy
+/// dereference of a `blobRef` seen in `session log --type artifact`. Resolves
+/// the session record (consistent with `score`/`log`), validates the ref is a
+/// bare sha256 handle (the traversal guard lives in `BlobStore`), then streams
+/// the bytes; a broken downstream pipe is a clean exit.
+fn session_artifact_get(resolved: &Pillbox, id: &str, blob_ref: &str) -> Result<()> {
+    use std::io::Write;
+
+    let session = session::resolve(resolved, id)?;
+    let store = crate::events::blob::BlobStore::open(resolved, &session.id)?;
+    let body = store.get(blob_ref)?;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    match out.write_all(&body).and_then(|()| out.flush()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(e) => Err(PillboxError::runtime("session artifact get", format!("write: {e}")).into()),
+    }
+}
+
+/// The `artifact put --json` reference envelope — the artifact event body plus
+/// a `{version, session, seq}` wrapper, so a caller (the eval loop, an
+/// orchestrator) reads the ref directly without scraping the §0 log. serde-built
+/// from the `Artifact` itself so the `--json` surface can't drift from the
+/// logged event (and `skip_serializing_if` rules carry through).
+fn artifact_ref_json(
+    session_id: &str,
+    artifact: &crate::contract::Artifact,
+    seq: u64,
+) -> serde_json::Value {
+    let mut v = serde_json::to_value(artifact).unwrap_or(serde_json::Value::Null);
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("version".into(), serde_json::json!(1));
+        obj.insert("session".into(), serde_json::json!(session_id));
+        obj.insert("seq".into(), serde_json::json!(seq));
+    }
+    v
+}
+
 /// Externally grade a session's result and record it as a verifiable `scored`
 /// §0 event — the reward channel the optimization loops gate on. Runs the grader
 /// (via `sh -c`) with cwd = the graded workspace: `workspace` if given, else a
@@ -1517,6 +1658,83 @@ mod tests {
                 actor.id
             );
         });
+    }
+
+    #[test]
+    fn artifact_put_get_round_trips_through_a_session() {
+        crate::test_util::with_isolated_home("session-artifact-roundtrip", || {
+            use crate::contract::{ActorKind, ArtifactClass, Payload};
+            let pb = crate::pillbox::global();
+            // A resolvable session record — the put/get handlers call `session::resolve`.
+            let s = session::Session::test_fixture();
+            session::write(&pb, &s).unwrap();
+
+            // Producer: write an artifact body from a file.
+            let tmp = tempfile::tempdir().unwrap();
+            let body = br#"{"citations":[{"file":"src/auth.rs","line":42}]}"#;
+            let f = tmp.path().join("cite.json");
+            std::fs::write(&f, body).unwrap();
+            session_artifact_put(
+                &pb,
+                &s.id,
+                "code_explore.citations",
+                Some("2 hits"),
+                Some("application/json"),
+                crate::cli::ArtifactClassArg::Signal,
+                Some("w1"),
+                Some(f.as_path()),
+                false,
+            )
+            .unwrap();
+
+            // The log now carries one `artifact` event with the typed ref...
+            let events = crate::events::log::SessionLog::open(&pb, &s.id)
+                .unwrap()
+                .read_from(0)
+                .unwrap();
+            let ev = events
+                .iter()
+                .find(|e| matches!(e.payload, Payload::Artifact(_)))
+                .expect("artifact event on the log");
+            let Payload::Artifact(art) = &ev.payload else {
+                unreachable!()
+            };
+            assert_eq!(art.kind, "code_explore.citations");
+            assert_eq!(art.summary, "2 hits");
+            assert_eq!(art.class, ArtifactClass::Signal);
+            assert_eq!(art.worker_id, "w1");
+            assert_eq!(art.bytes, body.len() as u64);
+            assert!(!art.blob_ref.is_empty());
+            // ...stamped as the generic CLI producer (service), not the agent.
+            assert_eq!(ev.actor.as_ref().unwrap().kind, ActorKind::Service);
+
+            // Reader: the blob dereferences back to the exact bytes.
+            let store = crate::events::blob::BlobStore::open(&pb, &s.id).unwrap();
+            assert_eq!(store.get(&art.blob_ref).unwrap(), body);
+        });
+    }
+
+    #[test]
+    fn artifact_ref_json_is_the_documented_shape() {
+        let art = crate::contract::Artifact {
+            kind: "judge.report".into(),
+            summary: "consensus: ship".into(),
+            content_type: "text/plain".into(),
+            class: crate::contract::ArtifactClass::Content,
+            blob_ref: "deadbeef".into(),
+            bytes: 128,
+            worker_id: String::new(),
+        };
+        let v = artifact_ref_json("abc123", &art, 9);
+        assert_eq!(v["version"], 1);
+        assert_eq!(v["session"], "abc123");
+        assert_eq!(v["seq"], 9);
+        assert_eq!(v["kind"], "judge.report");
+        assert_eq!(v["blobRef"], "deadbeef");
+        assert_eq!(v["bytes"], 128);
+        assert_eq!(v["class"], "content");
+        // Empty worker_id is omitted (skip_serializing_if carries through).
+        assert!(v.get("workerId").is_none());
     }
 
     fn scored(grader: &str, passed: bool, score: f64, feedback: &str) -> crate::contract::Scored {

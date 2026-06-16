@@ -98,6 +98,7 @@ use crate::startup::StartupMetrics;
 
 // codex-serve is libkrun-only (docker rejects it), so the mapper + NDJSON drain
 // are consumed only under that feature (and by tests); allow dead-code otherwise.
+pub(crate) mod blob;
 #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) mod codex_serve;
 mod jsonl;

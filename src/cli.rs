@@ -554,6 +554,73 @@ pub(crate) enum SessionAction {
         #[arg(long)]
         follow: bool,
     },
+    /// Attach or read a structured session artifact — a typed, durable output
+    /// that isn't an ordinary agent message (a grader report, judge critique,
+    /// dispatch worker summary, code-exploration citations, self-harness
+    /// proposal, patch metadata). The body lands in the session's content-
+    /// addressed blob store; an `artifact` §0 event records the typed reference.
+    /// List them with `session log --type artifact`.
+    Artifact {
+        #[command(subcommand)]
+        action: ArtifactAction,
+    },
+}
+
+/// `pillbox session artifact …` — write/read a structured artifact reference.
+#[derive(clap::Subcommand, Debug)]
+pub(crate) enum ArtifactAction {
+    /// Store an artifact body (from `--file` or stdin) in the blob store and
+    /// append an `artifact` event referencing it. Prints `seq` + the blob ref
+    /// (or, with `--json`, the full reference envelope). The way a host-side
+    /// tool — a grader, a judge, a FastContext explorer — attaches output to a
+    /// session without inlining it into the transcript.
+    Put {
+        /// Session id (or unique prefix ≥ 4 chars).
+        id: String,
+        /// Typed kind in a dotted namespace, e.g. `eval.grader_report`,
+        /// `judge.report`, `dispatch.worker_summary`, `code_explore.citations`.
+        #[arg(long)]
+        kind: String,
+        /// One-line summary — enough to triage from the log without fetching
+        /// the body.
+        #[arg(long)]
+        summary: Option<String>,
+        /// MIME-ish content type of the body (`application/json`, `text/plain`,
+        /// `application/x-ndjson`, …).
+        #[arg(long = "content-type", value_name = "TYPE")]
+        content_type: Option<String>,
+        /// Poolability class: `content` (default, local-only) or `signal`
+        /// (scrub-poolable metadata). See docs/session-event-log.md.
+        #[arg(long, value_enum, default_value_t = ArtifactClassArg::Content)]
+        class: ArtifactClassArg,
+        /// Correlate this artifact with a fan-out worker (a dispatch worker id).
+        #[arg(long = "worker", value_name = "ID")]
+        worker: Option<String>,
+        /// Read the body from this file instead of stdin.
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
+        /// Emit the reference envelope as JSON (`{version, session, seq, kind,
+        /// ref, bytes, class}`) instead of the human line.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read an artifact body by blob ref, writing it to stdout (the lazy
+    /// dereference of a reference seen via `session log --type artifact`).
+    Get {
+        /// Session id (or unique prefix ≥ 4 chars).
+        id: String,
+        /// The blob ref (sha256 hex) to dereference.
+        #[arg(long = "ref", value_name = "SHA256")]
+        r#ref: String,
+    },
+}
+
+/// `--class` selector for `session artifact put` (maps to
+/// [`crate::contract::ArtifactClass`], which stays clap-free).
+#[derive(clap::ValueEnum, Debug, Clone, Copy)]
+pub(crate) enum ArtifactClassArg {
+    Content,
+    Signal,
 }
 
 /// Harness selector for `pillbox session transcript --agent`.

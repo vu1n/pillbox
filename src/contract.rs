@@ -211,6 +211,10 @@ pub(crate) enum Payload {
     ResultReady(ResultReady),
     // reward (external, verifiable grade — see `Scored`)
     Scored(Scored),
+    // structured session output that is NOT an ordinary agent message — a
+    // grader report, judge critique, dispatch worker summary, code-exploration
+    // citations, … The body lives in the blob store; this records the typed ref.
+    Artifact(Artifact),
     // exec channel
     ExecStarted(ExecStarted),
     ExecOutput(ExecOutput),
@@ -512,6 +516,68 @@ pub(crate) struct Criterion {
     pub(crate) feedback: String,
 }
 
+/// A **structured session artifact** — a typed, durable output that is NOT an
+/// ordinary agent message: a grader report, a judge critique, a dispatch
+/// worker summary, a code-exploration citation set, a self-harness proposal,
+/// patch metadata. The log line stays small (kind + summary + a content-
+/// addressed blob ref); the payload body lives in the session's blob store
+/// (`sessions/<id>/blobs/<sha256>`), dereferenced lazily — large tool output
+/// never inlines into the spine. The enabling primitive for the eval loop, the
+/// dispatch evidence channel (#73), and any host-side tool (a FastContext
+/// explorer, a grader) that wants to attach output without overloading the
+/// transcript. See docs/session-event-log.md §Payload taxonomy / §Blob store.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Artifact {
+    /// Typed kind in a dotted namespace: `eval.grader_report`, `judge.report`,
+    /// `dispatch.worker_summary`, `code_explore.citations`,
+    /// `self_harness.proposal`, `patch.summary`, … A free-form string (not an
+    /// enum) so a new producer adds a kind without a contract bump; readers
+    /// filter by prefix.
+    pub(crate) kind: String,
+    /// One-line summary — enough to triage from the log without dereferencing
+    /// the blob.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) summary: String,
+    /// MIME-ish content type of the body (`application/json`, `text/plain`,
+    /// `application/x-ndjson`, …). Empty = opaque bytes.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) content_type: String,
+    /// Poolability class (docs/session-event-log.md §Content vs signal):
+    /// `content` is local-only (raw code/output/critique); `signal` is the
+    /// scrub-poolable metadata (scores, counts, names). Defaults to `content`
+    /// — the safe default, so a body never egresses unless a producer asserts
+    /// it is poolable signal.
+    #[serde(default)]
+    pub(crate) class: ArtifactClass,
+    /// The body, by reference: a content-addressed blob handle (sha256 hex) in
+    /// the session's blob store. The large payload never inlines into the log.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) blob_ref: String,
+    /// Size of the referenced blob in bytes (0 if none).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub(crate) bytes: u64,
+    /// Worker correlation for fan-out artifacts (a dispatch worker id), so a
+    /// reader can group a run's per-worker summaries. Empty when not applicable.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) worker_id: String,
+}
+
+/// The content-vs-signal poolability split (docs/session-event-log.md): a
+/// structural gate so "pool the metadata, not the code" is enforced by the
+/// schema, not by remembering to redact. `Content` is the safe default.
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ArtifactClass {
+    /// Local-only: raw code, prompts, messages, tool I/O, critiques. Never egresses.
+    #[default]
+    Content,
+    /// Poolable after scrub: scores, exit codes, pass/fail, counts, names.
+    Signal,
+}
+
 #[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -707,6 +773,10 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -830,6 +900,50 @@ mod tests {
         assert!(s.contains(r#""feedback":"1 failed, 3 passed""#), "{s}");
         // Empty criteria are omitted — the plain --cmd reward shape is unchanged.
         assert!(!s.contains("criteria"), "{s}");
+        assert_eq!(reparse(&ev), ev);
+    }
+
+    #[test]
+    fn artifact_serializes_with_blob_ref_and_defaults() {
+        let ev = Event::session(
+            "s",
+            Payload::Artifact(Artifact {
+                kind: "dispatch.worker_summary".into(),
+                summary: "worker w2 passed 4/4".into(),
+                content_type: "application/json".into(),
+                class: ArtifactClass::Signal,
+                blob_ref: "abc123".into(),
+                bytes: 512,
+                worker_id: "w2".into(),
+            }),
+        );
+        let s = serde_json::to_string(&ev).unwrap();
+        assert!(s.contains(r#""type":"artifact""#), "{s}");
+        assert!(s.contains(r#""kind":"dispatch.worker_summary""#), "{s}");
+        assert!(s.contains(r#""class":"signal""#), "{s}");
+        assert!(s.contains(r#""blobRef":"abc123""#), "{s}");
+        assert!(s.contains(r#""bytes":512"#), "{s}");
+        assert!(s.contains(r#""workerId":"w2""#), "{s}");
+        assert_eq!(reparse(&ev), ev);
+    }
+
+    #[test]
+    fn artifact_omits_empty_fields_and_defaults_class_to_content() {
+        // A minimal artifact (just a kind + blob ref) drops every empty field;
+        // `class` defaults to the safe `content` on the way back in.
+        let minimal: Artifact = serde_json::from_str(r#"{"kind":"judge.report"}"#).unwrap();
+        assert_eq!(minimal.class, ArtifactClass::Content);
+        assert!(minimal.summary.is_empty() && minimal.blob_ref.is_empty());
+        assert_eq!(minimal.bytes, 0);
+
+        let ev = Event::session("s", Payload::Artifact(minimal));
+        let s = serde_json::to_string(&ev).unwrap();
+        // Defaulted/empty fields omitted; class is always present (the poolability gate).
+        assert!(
+            !s.contains("summary") && !s.contains("blobRef") && !s.contains("bytes"),
+            "{s}"
+        );
+        assert!(s.contains(r#""class":"content""#), "{s}");
         assert_eq!(reparse(&ev), ev);
     }
 

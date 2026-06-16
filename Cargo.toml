@@ -54,6 +54,10 @@ rand = "0.9"
 # Base64 for the exec channel's ExecOutput.data (matches the proto `bytes`
 # field's protobuf-JSON encoding so binary stdout survives the wire).
 base64 = "0.22"
+# SHA-256 for the §0 blob store's content addressing (`sessions/<id>/blobs/
+# <sha256>`) — structured artifact bodies are stored by content hash. Already
+# in the lockfile via rustic; this makes the dependency direct.
+sha2 = "0.10"
 # Cross-platform FS watcher — `pillbox session transcript --follow`
 # tails an agent's JSONL transcript by waiting on inotify/kqueue/
 # FSEvents notifications. Drives the live-trace UX for transcripts;

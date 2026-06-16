@@ -319,6 +319,23 @@ enum Command {
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
     },
+    /// Run a declarative eval spec — every variant × trials, graded with the
+    /// same verifier, → a machine-readable comparison + a paired-stats-ready
+    /// JSONL records file (`scripts/eval/paired-stats.py` consumes it directly).
+    /// The reproducible, variance-aware harness measurement (vs eyeballing one
+    /// run). Spec is TOML (workspace/prompt/verify/budget/variants). libkrun-only
+    /// grading in v1 (like `dispatch`).
+    Eval {
+        /// Path to the TOML eval spec.
+        spec: PathBuf,
+        /// Write the JSONL records here (the paired-stats input). Default: a
+        /// tempfile, printed on completion.
+        #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
+        /// Emit the comparison summary as JSON on stdout instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Manage detached sessions started with `pillbox run --detach`.
     Session {
         #[command(subcommand)]
@@ -738,6 +755,10 @@ fn run(cli: Cli) -> Result<()> {
                     json,
                 },
             )
+        }
+        Command::Eval { spec, out, json } => {
+            let resolved = Pillbox::resolve(pillbox_arg)?;
+            commands::eval::eval(&resolved, commands::eval::EvalOpts { spec, json, out })
         }
         Command::Session { action } => {
             let resolved = Pillbox::resolve(pillbox_arg)?;

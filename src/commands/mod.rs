@@ -10,6 +10,7 @@ pub(crate) mod auth;
 pub(crate) mod bookmark;
 pub(crate) mod dispatch;
 pub(crate) mod env;
+pub(crate) mod eval;
 pub(crate) mod sandbox;
 pub(crate) mod secret;
 pub(crate) mod session;

@@ -32,6 +32,12 @@ its MCP tool list; `URL` is the host-side endpoint (pillbox rewrites
 `localhost` / `127.0.0.1` to `host.docker.internal` before injection
 so the sandbox can reach it).
 
+A first-party example ships in the repo:
+[`scripts/mcp/code-explore`](../scripts/mcp/code-explore/) — a read-only
+repo-orientation server (`explore_code` / `find_pattern`, backed by `rg` +
+`ast-grep`) that hands a sandboxed agent compact `file:line` citations. Serve it,
+then `pillbox run --mcp code-explore=http://localhost:8123`.
+
 ## CLI surface
 
 ```

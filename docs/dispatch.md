@@ -79,7 +79,10 @@ pillbox's `--json` surface.
     ],
     // Host directory the winner's result workspace was pulled to, or null when
     // there is no winner.
-    "pulled_to": "/path/to/session-abc123def456"
+    "pulled_to": "/path/to/session-abc123def456",
+    // Why the winner was selected — its score + the tie-break that decided it,
+    // tied to the verifier output. Null when no worker passed.
+    "selection_rationale": "only passing worker (score 1.00)"
   }
 }
 ```
@@ -96,6 +99,56 @@ A worker that fails to fork, or whose turn doesn't go idle within the per-turn
 timeout, becomes `errored` — one stuck/broken worker never sinks the batch (the
 others are still driven and selected). The per-turn idle timeout defaults to
 30 min; override with `PILLBOX_DISPATCH_TURN_TIMEOUT=<seconds>`.
+
+## Worker evidence (the `dispatch.worker_summary` artifact)
+
+The `--json` verdict is the *summary*; the durable, mineable evidence is a §0
+artifact. After grading, dispatch writes **one `dispatch.worker_summary`
+[artifact](./session-event-log.md#payload-taxonomy) per worker, on that worker's
+own session log** — co-located with its trajectory, so a debugger or a later
+self-harness pass can answer *why* a worker passed or failed, not just read the
+scalar score. The log line is a small typed reference; the body (the full
+evidence JSON) lives in the worker session's content-addressed blob store.
+
+Read a worker's evidence:
+
+```sh
+pillbox session log <worker-id> --type artifact   # the reference (kind, summary, blobRef)
+pillbox session artifact get <worker-id> --ref <blobRef>   # the full evidence body
+```
+
+The body schema:
+
+```jsonc
+{
+  "session": "<worker id>",
+  "status": "scored",            // scored | failed | errored
+  "passed": true,
+  "score": 1.0,
+  "retries_used": 1,
+  "prompt": "<the segment prompt this worker was driven with>",
+  "winner": true,
+  "selection_rationale": "only passing worker (score 1.00)",  // winner only
+  "grader": "rubric:r.txt",      // absent for an errored worker
+  "criteria": [ { "name": "tests", "passed": true, "feedback": "5 passed" } ],
+  "feedback": "…the grader's combined output…",
+  "judge_report_ref": null       // GHOST-011 hook (below)
+}
+```
+
+Failed and errored workers get a summary too (errored ones omit the grade
+fields), so a losing attempt's evidence isn't lost. Writing is **best-effort**:
+a log-write hiccup warns to stderr and is skipped — it never changes the
+dispatch outcome (the run already succeeded; evidence is observability, not
+correctness). The artifact is stamped `actor: svc:dispatch` (the orchestrator,
+not the worker agent).
+
+**`judge_report_ref` — the GHOST-011 hook (advisory, opt-in, not built here).**
+The slot is always present (null today) so the schema is forward-compatible.
+When the cross-vendor judge / Fusion lane lands, it attaches a `judge.report`
+artifact and points this ref at it — purely *advisory* (a Goodhart guard / a
+critique of the winner), **never** a selection input: the execution-grounded
+verifier decides the winner, a judge panel never overrides it.
 
 ## Exit codes
 
@@ -127,6 +180,11 @@ treats them as deferred, not forgotten:
   workspace-resolution (pull-then-score, or score the `result_snapshot` after
   `session done`). The loop itself is backend-agnostic; only the grade step is
   coupled. (`scripts/smoke/dispatch.sh` skips non-libkrun backends.)
+- **`files_changed` in the worker summary** — a per-worker diff-vs-base summary
+  (the touched paths / a stat) is a natural evidence field, but needs a
+  workspace-vs-`from_bookmark` diff op (rustic/git). The mining-critical evidence
+  (grade breakdown, retries, prompt, rationale) ships now; `files_changed` is an
+  additive field on the artifact body when the diff op lands.
 
 ## Relationship to other verbs
 

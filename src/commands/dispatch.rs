@@ -27,8 +27,10 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use serde_json::json;
 
-use crate::contract::{Criterion, Scored};
+use crate::contract::{Actor, Artifact, ArtifactClass, Criterion, Event, Payload, Scored};
 use crate::errors::PillboxError;
+use crate::events::blob::BlobStore;
+use crate::events::log::SessionLog;
 use crate::pillbox::Pillbox;
 
 /// Per-turn idle timeout (seconds) each worker gets before it's treated as stuck
@@ -121,6 +123,12 @@ pub(crate) struct WorkerOutcome {
     /// How the worker ended. The verdict's `passed` is derived from this (see
     /// [`WorkerStatus::passed`]), not stored alongside it.
     pub(crate) status: WorkerStatus,
+    /// The worker's **final** grade — the rich evidence (grader, per-criterion
+    /// verdicts, feedback) the retry loop computes each turn. Retained here (not
+    /// just `score`) so the dispatch-evidence artifact can preserve *why* a
+    /// worker passed or failed, the substrate a later self-harness pass mines.
+    /// `None` for an `Errored` worker that never produced a gradeable result.
+    pub(crate) grade: Option<Scored>,
 }
 
 impl WorkerOutcome {
@@ -147,6 +155,10 @@ pub(crate) struct DispatchVerdict {
     /// Host directory the winner's result workspace was pulled to (`None` when
     /// there is no winner).
     pub(crate) pulled_to: Option<PathBuf>,
+    /// Why the winner was selected, tied to the verifier output (score +
+    /// tie-break) — so a reader doesn't have to re-derive the ranking from the
+    /// per-worker rows. `None` when no worker passed.
+    pub(crate) selection_rationale: Option<String>,
 }
 
 impl DispatchVerdict {
@@ -157,6 +169,7 @@ impl DispatchVerdict {
             "winner": self.winner,
             "workers": self.workers.iter().map(WorkerOutcome::to_json_value).collect::<Vec<_>>(),
             "pulled_to": self.pulled_to.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            "selection_rationale": self.selection_rationale,
         })
     }
 
@@ -178,6 +191,9 @@ impl DispatchVerdict {
                     .map(|p| p.display().to_string())
                     .unwrap_or_default();
                 println!("pillbox: ✓ dispatch winner `{id}` → {to}");
+                if let Some(why) = &self.selection_rationale {
+                    println!("  selected: {why}");
+                }
             }
             None => println!("pillbox: ✗ dispatch — no worker passed"),
         }
@@ -273,6 +289,155 @@ fn select_winner(workers: &[WorkerOutcome]) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
+/// Why worker `winner` was selected — tied to the verifier output (its score,
+/// against how many other passers, on what tie-break). Pure, so the rationale a
+/// reader sees can't drift from the [`select_winner`] ranking it describes.
+fn selection_rationale(workers: &[WorkerOutcome], winner: usize) -> String {
+    let w = &workers[winner];
+    let score = w
+        .score
+        .map(|s| format!("{s:.2}"))
+        .unwrap_or_else(|| "—".into());
+    let passers = workers.iter().filter(|o| o.status.passed()).count();
+    if passers <= 1 {
+        return format!("only passing worker (score {score})");
+    }
+    // >1 passer → the tie-break (fewest retries, then earliest fork) decided it.
+    format!(
+        "highest-ranked of {passers} passing workers: score {score}, {} retries",
+        w.retries_used
+    )
+}
+
+// ── dispatch evidence (#73): durable, mineable per-worker summaries ──────────
+
+/// The structured evidence for one worker — what it was asked, how it was
+/// graded, and (for the winner) why it was selected. Persisted as a
+/// `dispatch.worker_summary` §0 artifact on the worker's own session log so a
+/// later self-harness pass can mine *why* a worker passed or failed, not just
+/// the scalar score. `Serialize` is the blob body; the §0 log keeps only the
+/// small typed [`Artifact`] reference to it.
+#[derive(Debug, Clone, Serialize)]
+struct WorkerSummary {
+    session: String,
+    status: WorkerStatus,
+    passed: bool,
+    score: Option<f64>,
+    retries_used: u32,
+    /// The segment prompt this worker was driven with (turn 1).
+    prompt: String,
+    /// Whether this worker was the selected winner.
+    winner: bool,
+    /// Why it won — only on the winner (see [`selection_rationale`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selection_rationale: Option<String>,
+    /// The grader that produced the verdict (`--cmd …` / `rubric:…`). Absent for
+    /// an `Errored` worker that never graded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grader: Option<String>,
+    /// Per-criterion verdicts from a rubric grade — the decomposed evidence
+    /// (which check failed and why). Empty for a `--cmd` grade or an errored worker.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    criteria: Vec<Criterion>,
+    /// The grader's combined output / rendered feedback. Absent for an errored worker.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    feedback: Option<String>,
+    /// GHOST-011 hook: an optional, **advisory** cross-vendor judge / Fusion
+    /// report (an artifact ref). Always present (null today) so the schema is
+    /// forward-compatible and the slot is discoverable; the panel itself is a
+    /// separate task and is never a selection input (the verifier decides).
+    judge_report_ref: Option<String>,
+}
+
+impl WorkerSummary {
+    fn build(o: &WorkerOutcome, prompt: &str, winner: bool, rationale: Option<&str>) -> Self {
+        let (grader, criteria, feedback) = match &o.grade {
+            Some(g) => (
+                Some(g.grader.clone()),
+                g.criteria.clone(),
+                Some(g.feedback.clone()),
+            ),
+            None => (None, Vec::new(), None),
+        };
+        Self {
+            session: o.session.clone(),
+            status: o.status,
+            passed: o.status.passed(),
+            score: o.score,
+            retries_used: o.retries_used,
+            prompt: prompt.to_string(),
+            winner,
+            selection_rationale: winner.then(|| rationale.map(str::to_string)).flatten(),
+            grader,
+            criteria,
+            feedback,
+            judge_report_ref: None,
+        }
+    }
+
+    /// One-line headline for the artifact's `summary` field — triage from the
+    /// §0 log without dereferencing the blob.
+    fn headline(&self) -> String {
+        let score = self
+            .score
+            .map(|s| format!("{s:.2}"))
+            .unwrap_or_else(|| "—".into());
+        let win = if self.winner { "WINNER " } else { "" };
+        format!(
+            "{win}worker {} {} score {score} ({} retries)",
+            self.session,
+            self.status.as_marker(),
+            self.retries_used
+        )
+    }
+}
+
+/// Persist one `dispatch.worker_summary` §0 artifact per worker — the durable,
+/// mineable evidence channel (#73). Each worker's summary lands on ITS OWN
+/// session log (co-located with that worker's trajectory), the body in the blob
+/// store, the log line a small typed ref. Best-effort: a write failure for one
+/// worker warns and is skipped, never sinking the dispatch — the run already
+/// succeeded, and evidence is observability, not correctness. Stamped
+/// `service:dispatch` (the orchestrator, not the worker agent).
+fn record_worker_summaries(resolved: &Pillbox, verdict: &DispatchVerdict, prompt: &str) {
+    for o in &verdict.workers {
+        // A fork that never produced a session has nothing to attach to.
+        if o.session.is_empty() {
+            continue;
+        }
+        let winner = verdict.winner.as_deref() == Some(o.session.as_str());
+        let summary =
+            WorkerSummary::build(o, prompt, winner, verdict.selection_rationale.as_deref());
+        if let Err(e) = write_worker_summary(resolved, &summary) {
+            eprintln!(
+                "pillbox: note: dispatch evidence not recorded for `{}`: {e:#}",
+                o.session
+            );
+        }
+    }
+}
+
+fn write_worker_summary(resolved: &Pillbox, summary: &WorkerSummary) -> Result<()> {
+    let body = serde_json::to_vec(summary).context("serialize worker summary")?;
+    let blob_ref = BlobStore::open(resolved, &summary.session)?.put(&body)?;
+    let artifact = Artifact {
+        kind: "dispatch.worker_summary".into(),
+        summary: summary.headline(),
+        content_type: "application/json".into(),
+        // Carries raw grader feedback (test output / code) → content (local-only).
+        class: ArtifactClass::Content,
+        blob_ref,
+        bytes: body.len() as u64,
+        worker_id: summary.session.clone(),
+    };
+    SessionLog::open(resolved, &summary.session)?.append(&[Event::session(
+        &summary.session,
+        Payload::Artifact(artifact),
+    )
+    .with_actor(Actor::service("dispatch"))])?;
+    Ok(())
+}
+
 // ── the loop ────────────────────────────────────────────────────────────────
 
 /// Fork `k` workers, drive each to a terminal outcome (grade → retry → grade up
@@ -297,14 +462,16 @@ fn run_dispatch(driver: &dyn WorkerDriver, k: u32, prompt: &str, retries: u32) -
                     score: None,
                     retries_used: 0,
                     status: WorkerStatus::Errored,
+                    grade: None,
                 }
             }
         })
         .collect();
 
-    let (winner, pulled_to) = match select_winner(&workers) {
+    let (winner, pulled_to, selection_rationale) = match select_winner(&workers) {
         Some(i) => {
             let id = workers[i].session.clone();
+            let why = selection_rationale(&workers, i);
             // A pull glitch shouldn't nuke an otherwise-successful run: the winner
             // is already selected, so report it (exit 0) with a recovery hint and
             // leave `pulled_to` empty rather than propagating the error.
@@ -316,14 +483,15 @@ fn run_dispatch(driver: &dyn WorkerDriver, k: u32, prompt: &str, retries: u32) -
                 PathBuf::new()
             });
             let pulled = (!pulled.as_os_str().is_empty()).then_some(pulled);
-            (Some(id), pulled)
+            (Some(id), pulled, Some(why))
         }
-        None => (None, None),
+        None => (None, None, None),
     };
     DispatchVerdict {
         winner,
         workers,
         pulled_to,
+        selection_rationale,
     }
 }
 
@@ -337,6 +505,7 @@ fn drive_one(driver: &dyn WorkerDriver, id: String, prompt: &str, retries: u32) 
             score: None,
             retries_used: 0,
             status: WorkerStatus::Errored,
+            grade: None,
         }
     })
 }
@@ -371,6 +540,7 @@ fn drive_one_inner(
                 } else {
                     WorkerStatus::Failed
                 },
+                grade: Some(grade),
             });
         }
         turn = distill_feedback(&grade);
@@ -561,7 +731,7 @@ fn parse_grade(out: &str) -> Result<Scored> {
 /// [`PillboxError::usage`] (2). The `--json` verdict is printed on **both** the
 /// winner and no-winner paths (so a caller always reads every worker's score);
 /// the no-winner exit-1 error then rides stderr.
-pub(crate) fn dispatch(_resolved: &Pillbox, opts: DispatchOpts) -> Result<()> {
+pub(crate) fn dispatch(resolved: &Pillbox, opts: DispatchOpts) -> Result<()> {
     if opts.workers < 1 {
         return Err(PillboxError::usage("dispatch", "-k must be at least 1")
             .with_next(
@@ -579,7 +749,12 @@ pub(crate) fn dispatch(_resolved: &Pillbox, opts: DispatchOpts) -> Result<()> {
     }
 
     let driver = CliDriver::new(&opts)?;
-    let verdict = run_dispatch(&driver, opts.workers, &opts.prompt.join(" "), opts.retries);
+    let prompt = opts.prompt.join(" ");
+    let verdict = run_dispatch(&driver, opts.workers, &prompt, opts.retries);
+
+    // Persist each worker's evidence to its §0 log (#73) before reporting —
+    // best-effort, so a log-write hiccup never changes the dispatch outcome.
+    record_worker_summaries(resolved, &verdict, &prompt);
 
     if opts.json {
         verdict.print_json();
@@ -610,6 +785,7 @@ mod tests {
             score,
             retries_used: retries,
             status,
+            grade: None,
         }
     }
 
@@ -817,6 +993,7 @@ mod tests {
                 outcome("ghi789", None, 0, WorkerStatus::Errored),
             ],
             pulled_to: Some(PathBuf::from("/tmp/session-abc123")),
+            selection_rationale: Some("only passing worker (score 1.00)".into()),
         }
     }
 
@@ -843,11 +1020,131 @@ mod tests {
             winner: None,
             workers: vec![],
             pulled_to: None,
+            selection_rationale: None,
         };
         let val = v.to_json_value();
         assert!(val["winner"].is_null());
         assert!(val["pulled_to"].is_null());
+        assert!(val["selection_rationale"].is_null());
         assert!(val["workers"].as_array().unwrap().is_empty());
+    }
+
+    // ── dispatch evidence (#73) ──
+
+    #[test]
+    fn selection_rationale_distinguishes_sole_vs_tiebroken_winner() {
+        // Sole passer → "only passing worker".
+        let sole = vec![
+            outcome("a", Some(1.0), 0, WorkerStatus::Scored),
+            outcome("b", Some(0.5), 1, WorkerStatus::Failed),
+        ];
+        assert!(selection_rationale(&sole, 0).starts_with("only passing worker"));
+        // >1 passer → names the field size + the tie-break inputs.
+        let many = vec![
+            outcome("a", Some(1.0), 0, WorkerStatus::Scored),
+            outcome("b", Some(1.0), 2, WorkerStatus::Scored),
+        ];
+        let why = selection_rationale(&many, 0);
+        assert!(why.contains("2 passing workers"), "{why}");
+        assert!(why.contains("0 retries"), "{why}");
+    }
+
+    #[test]
+    fn worker_summary_captures_grade_evidence_and_judge_hook() {
+        let mut o = outcome("w1", Some(1.0), 1, WorkerStatus::Scored);
+        o.grade = Some(scored(
+            true,
+            1.0,
+            vec![
+                criterion("tests", true, "5 passed"),
+                criterion("lint", true, ""),
+            ],
+            "all green",
+        ));
+        let s = WorkerSummary::build(&o, "implement add()", true, Some("only passing worker"));
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["session"], "w1");
+        assert_eq!(v["status"], "scored");
+        assert_eq!(v["passed"], true);
+        assert_eq!(v["prompt"], "implement add()");
+        assert_eq!(v["winner"], true);
+        assert_eq!(v["selection_rationale"], "only passing worker");
+        assert_eq!(v["grader"], "test");
+        assert_eq!(v["criteria"].as_array().unwrap().len(), 2);
+        assert_eq!(v["feedback"], "all green");
+        // The GHOST-011 judge slot is present-and-null (forward-compatible), not omitted.
+        assert!(v.get("judge_report_ref").is_some() && v["judge_report_ref"].is_null());
+    }
+
+    #[test]
+    fn worker_summary_for_errored_worker_omits_grade_and_rationale() {
+        let o = outcome("bad", None, 0, WorkerStatus::Errored);
+        let s = WorkerSummary::build(&o, "task", false, Some("n/a"));
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["status"], "errored");
+        assert_eq!(v["passed"], false);
+        // No grade → grader/criteria/feedback omitted; non-winner → no rationale.
+        assert!(v.get("grader").is_none());
+        assert!(v.get("criteria").is_none());
+        assert!(v.get("feedback").is_none());
+        assert!(v.get("selection_rationale").is_none());
+    }
+
+    #[test]
+    fn record_worker_summaries_writes_an_artifact_to_each_worker_log() {
+        crate::test_util::with_isolated_home("dispatch-evidence-roundtrip", || {
+            use crate::contract::Payload;
+            let pb = crate::pillbox::global();
+            // The worker's session must resolve for BlobStore/SessionLog::open.
+            let s = crate::session::Session::test_fixture(); // id = abc123def456
+            crate::session::write(&pb, &s).unwrap();
+
+            let mut w = outcome(&s.id, Some(1.0), 1, WorkerStatus::Scored);
+            w.grade = Some(scored(
+                true,
+                1.0,
+                vec![criterion("tests", true, "ok")],
+                "green",
+            ));
+            let verdict = DispatchVerdict {
+                winner: Some(s.id.clone()),
+                workers: vec![w],
+                pulled_to: None,
+                selection_rationale: Some("only passing worker (score 1.00)".into()),
+            };
+
+            record_worker_summaries(&pb, &verdict, "implement add()");
+
+            // The worker's §0 log now carries one dispatch.worker_summary artifact...
+            let events = crate::events::log::SessionLog::open(&pb, &s.id)
+                .unwrap()
+                .read_from(0)
+                .unwrap();
+            let ev = events
+                .iter()
+                .find(|e| matches!(e.payload, Payload::Artifact(_)))
+                .expect("worker-summary artifact on the worker's log");
+            let Payload::Artifact(art) = &ev.payload else {
+                unreachable!()
+            };
+            assert_eq!(art.kind, "dispatch.worker_summary");
+            assert_eq!(art.worker_id, s.id);
+            assert_eq!(ev.actor.as_ref().unwrap().id, "svc:dispatch");
+
+            // ...and the blob round-trips to the full WorkerSummary evidence.
+            let body = crate::events::blob::BlobStore::open(&pb, &s.id)
+                .unwrap()
+                .get(&art.blob_ref)
+                .unwrap();
+            let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed["winner"], true);
+            assert_eq!(
+                parsed["selection_rationale"],
+                "only passing worker (score 1.00)"
+            );
+            assert_eq!(parsed["prompt"], "implement add()");
+            assert_eq!(parsed["criteria"][0]["name"], "tests");
+        });
     }
 
     #[test]

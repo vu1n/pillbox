@@ -128,7 +128,10 @@ impl SandboxBackend for LibkrunBackend {
             .env_clear()
             .envs(boot::static_child_env())
             .stdin(std::process::Stdio::piped());
-        vmm_own_process_group(&mut cmd);
+        // No `setsid` here: a foreground run reaps its VMM synchronously via
+        // `child.wait` + the teardown below, and putting it in its own session
+        // would orphan it on a Ctrl-C in the boot window (before the pump's raw
+        // mode forwards signals in-band). setsid is for the detached spawns only.
         let mut child = cmd.spawn().context("spawn the libkrun VMM subprocess")?;
 
         // Hand the real credentials to the child's MITM out-of-band on stdin — the
@@ -1263,7 +1266,8 @@ pub(crate) fn score_in_sandbox(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null()); // VMM diagnostics; the grade's output is the guest console (stdout)
-    vmm_own_process_group(&mut cmd);
+                                              // No `setsid`: the grader is a supervised one-shot reaped via `child.wait`
+                                              // below, not via `killpg` — same rationale as the foreground run.
     let mut child = cmd.spawn().context("spawn the grader VMM subprocess")?;
     let mut out = String::new();
     if let Some(mut so) = child.stdout.take() {
@@ -1331,20 +1335,36 @@ const SEND_SETTLE: Duration = Duration::from_millis(300);
 /// the socket is torn down after the bounded settle below. Concurrent
 /// drive-while-attached needs a threaded accept loop.
 fn pty_send(sock: &str, bytes: &[u8]) -> Result<()> {
-    use std::io::Write as _;
-    let mut stream =
+    use std::io::{Read as _, Write as _};
+    let stream =
         UnixStream::connect(sock).with_context(|| format!("connect attach socket {sock}"))?;
+    // Bound BOTH directions so a wedged guest — or the serial accept loop busy with
+    // an attached terminal — can't hang `session send`: `write_all` into a full
+    // socket buffer and the snapshot read each get a deadline. (Connecting to the
+    // already-listening socket is local and doesn't block.)
+    stream.set_write_timeout(Some(SEND_SETTLE)).ok();
+    stream.set_read_timeout(Some(SEND_SETTLE)).ok();
+    let mut stream = stream;
     crate::attach::driver::send_input(&mut stream, bytes).context("frame the session input")?;
     stream.flush().ok();
-    // The pty-host sends an on-connect `Snapshot` to every client (see
-    // [`crate::attach::host`]); drain it so the guest's read side has run far
-    // enough to also pull our queued `Input` before we tear the socket down.
-    stream
-        .set_read_timeout(Some(SEND_SETTLE))
-        .context("bound the snapshot drain")?;
-    let _ = crate::attach::frame::Frame::decode(&mut stream);
-    std::thread::sleep(SEND_SETTLE);
-    Ok(())
+    // The pty-host sends an on-connect `Snapshot` to EVERY client (see
+    // [`crate::attach::host`]). Receiving any bytes here is our proof the guest
+    // accepted THIS connection and is now in its read loop — so it will pull the
+    // `Input` we just queued. No bytes within the deadline means it never accepted
+    // (the serial accept loop is busy with an attached terminal), so the input was
+    // NOT delivered: fail rather than record a false "sent". A single bounded read
+    // (not a re-armable decode loop) also caps the total time a drip-feeding guest
+    // can hold us.
+    let mut buf = [0u8; 1024];
+    match stream.read(&mut buf) {
+        Ok(n) if n > 0 => Ok(()),
+        _ => Err(PillboxError::runtime(
+            "session send",
+            "the session didn't confirm receipt — the input was not delivered \
+             (a terminal may be attached, or the guest is busy)",
+        )
+        .into()),
+    }
 }
 
 /// Tear down a detached libkrun session: kill the VMM child (the VM + egress +
@@ -1397,16 +1417,29 @@ pub(crate) fn kill_session(resolved: &Pillbox, session: &crate::session::Session
 fn kill_vmm_group(handle: &LibkrunHandle) {
     if vmm_pid_owns_spec(handle.pid, &handle.spec) {
         unsafe { libc::killpg(handle.pid, libc::SIGKILL) };
+    } else if unsafe { libc::kill(handle.pid, 0) } == 0 {
+        // The pid is alive but its argv didn't carry our spec path, so we can't
+        // prove the group is ours — and we won't `killpg` an unattributed group.
+        // Warn rather than silently leak a microVM that may still hold credentials.
+        eprintln!(
+            "pillbox: warning: couldn't confirm pid {pid} is this session's VMM \
+             (argv didn't match its spec) — leaving it. If a `__krun-vmm` lingers, \
+             reap its group with `kill -- -{pid}`.",
+            pid = handle.pid
+        );
     }
 }
 
 /// True iff `pid` is a live `__krun-vmm` process whose argv contains `spec` (the
 /// per-session spec-file path) — the proof a group is ours before `killpg`. A
 /// `ps` read scoped to the one pid; empty/non-matching output (process gone, pid
-/// recycled, or `ps` unavailable) ⇒ `false`, i.e. don't kill.
+/// recycled, or `ps` unavailable) ⇒ `false`, i.e. don't kill. `-ww` so the argv
+/// isn't width-truncated — the spec sits at the END (`__krun-vmm <spec>`), exactly
+/// where a clipped line would drop it, turning a live owned VM into a false "not
+/// ours" and orphaning it.
 fn vmm_pid_owns_spec(pid: i32, spec: &str) -> bool {
     let Ok(out) = Command::new("ps")
-        .args(["-o", "command=", "-p", &pid.to_string()])
+        .args(["-ww", "-o", "command=", "-p", &pid.to_string()])
         .output()
     else {
         return false;
@@ -1424,6 +1457,12 @@ fn vmm_pid_owns_spec(pid: i32, spec: &str) -> bool {
 /// `setsid` also detaches the child from the launching CLI's controlling terminal,
 /// which is correct on every path: the guest console rides the vsock attach
 /// channel (PTY) or the agent's HTTP API (server), never this terminal.
+/// Put a DETACHED VMM child in its own session/process group (`setsid`) so
+/// `kill_session`'s `killpg(handle.pid)` reaps the whole group on `session rm`.
+/// ONLY the detached spawns (`run_detached`, `launch_server_vm`) use this — the
+/// synchronous foreground + grader paths reap via `child.wait` and must NOT
+/// `setsid`: their VMM would otherwise survive in its own session if the CLI is
+/// interrupted before teardown (e.g. Ctrl-C in the boot window), orphaning the VM.
 fn vmm_own_process_group(cmd: &mut Command) {
     use std::os::unix::process::CommandExt as _;
     // SAFETY: `pre_exec` runs in the forked child before `exec`; the closure must be

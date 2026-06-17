@@ -519,7 +519,7 @@ fn unsupported(spec: &AgentSpec, what: &str) -> anyhow::Error {
             spec.id
         ),
     )
-    .with_next("unset PILLBOX_BACKEND to use the default backend")
+    .with_next("retry on the docker backend: PILLBOX_BACKEND=docker")
     .into()
 }
 

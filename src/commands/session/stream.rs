@@ -3,8 +3,8 @@
 //! (`subscribe`), rendering it to the terminal (`watch`), and blocking until a
 //! turn goes idle (`wait-idle`). Split out of `mod.rs` to keep the lifecycle
 //! commands separate from the read plane. The live source + its tailer come from
-//! the [`LiveSession`](crate::sandbox::LiveSession) plane, so this file no longer
-//! branches on the backend.
+//! the [`LiveSession`](crate::sandbox::LiveSession) plane, so this file does not
+//! branch on the backend.
 
 use anyhow::Result;
 

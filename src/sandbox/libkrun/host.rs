@@ -12,10 +12,6 @@
 //! - disk pressure → a half-allocated rootfs/CoW clone stalls the boot, so we
 //!   refuse to start below a floor rather than wedge.
 
-// The probes' only callers (`doctor`, the launch preflight) are sibling modules
-// landing separately; until then they have no non-test use site in this crate.
-#![allow(dead_code)]
-
 use std::path::Path;
 
 /// Minimum free bytes on the filesystem holding the krun cache before a launch is

@@ -77,34 +77,18 @@ impl Caps {
 }
 
 /// One backend = one way to provision a sandbox + vault session, inject
-/// credentials, run the agent, and supervise it.
-///
-/// `run()` is the existing foreground/detach entry point. `start()` returns a
-/// [`LiveSession`] — the polymorphic control surface the command layer drives
-/// without branching on the backend. See docs/substrate-plane.md. Takes a
-/// resolved [`Pillbox`] so the backend can locate the auth home + vault state
-/// for the right scope.
+/// credentials, run the agent, and supervise it. `run()` launches a turn;
+/// `capabilities()` reports the backend's verb support. The per-session control
+/// surface the command layer drives is the [`LiveSession`] from [`live_session`]
+/// (built from a resolved [`Session`]), not the backend directly — see
+/// docs/substrate-plane.md. Takes a resolved [`Pillbox`] so the backend can
+/// locate the auth home + vault state for the right scope.
 pub(crate) trait SandboxBackend {
     fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>;
 
     /// What this backend can do — queried before (or instead of) attempting a
     /// verb. The honest current-state profile, per docs/substrate-plane.md.
     fn capabilities(&self) -> Caps;
-
-    /// Provision + return the live-session handle the command layer drives.
-    /// The default bails so adding this method leaves existing `run()` callers
-    /// untouched until a backend overrides it.
-    #[allow(dead_code)]
-    fn start(
-        &self,
-        _spec: &AgentSpec,
-        _opts: RunOpts,
-        _resolved: &Pillbox,
-    ) -> Result<Box<dyn LiveSession>> {
-        anyhow::bail!(
-            "this backend does not implement LiveSession::start (see docs/substrate-plane.md)"
-        )
-    }
 }
 
 /// The live session — **the plane**. A running (foreground or detached) agent

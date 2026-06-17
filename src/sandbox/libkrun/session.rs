@@ -38,13 +38,13 @@ use super::{
 impl SandboxBackend for LibkrunBackend {
     /// The microVM family: KVM-isolation features are uniquely libkrun's
     /// (real egress fence, in-sandbox grading, detached vault, post-hoc ingest).
-    /// `pty_drive`/`live_pty_tail` are `false` until the vsock `send` +
-    /// `creds_share` transcript tailer are wired. No long-lived exec target.
-    /// See docs/substrate-plane.md.
+    /// `pty_drive` drives the guest pty-host over the persistent attach socket;
+    /// `live_pty_tail` tails the agent's transcript out of the host-readable
+    /// creds clone. No long-lived exec target. See docs/substrate-plane.md.
     fn capabilities(&self) -> Caps {
         Caps {
-            pty_drive: false,
-            live_pty_tail: false,
+            pty_drive: true,
+            live_pty_tail: true,
             server_mode: true,
             long_lived_exec: false,
             in_sandbox_grading: true,
@@ -1310,6 +1310,43 @@ pub(crate) fn reattach(resolved: &Pillbox, session: &crate::session::Session) ->
     }
 }
 
+/// How long to let a buffered `Input` frame traverse socket → guest pty-host →
+/// PTY before closing — mirrors the docker driver's settle. All in-VM once the
+/// frame is written (libkrun bridges the unix socket straight to the guest's
+/// listening pty-host, no exec cold-start), so it's short.
+const SEND_SETTLE: Duration = Duration::from_millis(300);
+
+/// Drive a detached PTY session: dial its persistent attach socket, write one
+/// `Frame::Input` (bytes as if typed), drain the pty-host's on-connect `Snapshot`
+/// then settle briefly so the guest forwards the input to the PTY before the
+/// socket closes, then close. The `SendInput` half of the drive surface; the guest
+/// pty-host (`run_vsock` listen-loop) accepts this transient connection and writes
+/// the frame to the PTY. A dead/refused socket surfaces as a `connect` error.
+///
+/// The guest accept loop is serial (`serve_blocking`), so a `send` to an
+/// *unattended* detached session (the IDE drive + §0-read keystone) lands at once.
+/// A `send` *while a terminal is separately attached* contends with that pump and
+/// may be DROPPED, not merely queued: the bytes sit in the socket buffer but the
+/// serial loop won't accept this connection until the attached client leaves, and
+/// the socket is torn down after the bounded settle below. Concurrent
+/// drive-while-attached needs a threaded accept loop.
+fn pty_send(sock: &str, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    let mut stream =
+        UnixStream::connect(sock).with_context(|| format!("connect attach socket {sock}"))?;
+    crate::attach::driver::send_input(&mut stream, bytes).context("frame the session input")?;
+    stream.flush().ok();
+    // The pty-host sends an on-connect `Snapshot` to every client (see
+    // [`crate::attach::host`]); drain it so the guest's read side has run far
+    // enough to also pull our queued `Input` before we tear the socket down.
+    stream
+        .set_read_timeout(Some(SEND_SETTLE))
+        .context("bound the snapshot drain")?;
+    let _ = crate::attach::frame::Frame::decode(&mut stream);
+    std::thread::sleep(SEND_SETTLE);
+    Ok(())
+}
+
 /// Tear down a detached libkrun session: kill the VMM child (the VM + egress +
 /// MITM go with it), scrub the persisted socket/spec/CoW clones, drop the record.
 pub(crate) fn kill_session(resolved: &Pillbox, session: &crate::session::Session) -> Result<()> {
@@ -1524,11 +1561,12 @@ impl crate::sandbox::LiveSession for LibkrunLiveSession {
         LibkrunBackend.capabilities()
     }
 
-    fn send(&self, _bytes: &[u8]) -> Result<()> {
-        // libkrun has no PTY-drive transport (the vsock attach channel carries an
-        // interactive pump, not programmatic input); a server agent's prompt goes
-        // over its HTTP API (`http`), not this verb.
-        Err(self.caps().unsupported("send"))
+    fn send(&self, bytes: &[u8]) -> Result<()> {
+        // A server agent's prompt goes over its HTTP API (`http`), never the PTY.
+        if self.session.integration() == Integration::Server {
+            return Err(self.caps().unsupported("send"));
+        }
+        pty_send(&LibkrunHandle::decode(&self.session)?.sock, bytes)
     }
 
     fn attach(&self, resolved: &Pillbox) -> Result<()> {
@@ -1542,22 +1580,46 @@ impl crate::sandbox::LiveSession for LibkrunLiveSession {
         Box<dyn crate::events::source::EventSource + Send>,
         Option<crate::events::transcripts::TailerHandle>,
     )> {
-        // A server agent persists its event capture to a host file in the CoW creds
-        // clone. A PTY agent has no host-side live tail on this backend (no
-        // creds-clone transcript tailer), so the live read verb is unsupported.
-        if self.session.integration() != Integration::Server {
-            return Err(self.caps().unsupported("event_source"));
-        }
+        // A detached PTY session has no reparented §0 producer, so each reader spawns
+        // its own transcript tailer — two concurrent readers (`watch`+`subscribe`)
+        // would double-write the log, and a never-watched session captures nothing.
+        // The single-reader IDE drive+read keystone is unaffected.
         let source = crate::events::source::open_event_source(resolved, &self.session.id)?;
-        // A detached run already has a persistent §0 producer draining the capture
-        // into the log; a second drainer here would double-write every event (fresh
-        // seqs). Hand back a read-only source — the live producer keeps it current.
+        // A producer already draining the capture into the log keeps the source
+        // current; a second drainer would double-write every event (fresh seqs).
         if crate::commands::session::detached_tailer_alive(resolved, &self.session) {
             return Ok((source, None));
         }
         let log = crate::events::log::SessionLog::open(resolved, &self.session.id)?;
-        let tailer = self.server_file_tailer(log)?;
-        Ok((source, Some(tailer)))
+        let tailer = if self.session.integration() == Integration::Server {
+            // A server agent persists its event capture to a host file in the CoW
+            // creds clone; tail that (SSE/NDJSON → the durable log).
+            Some(self.server_file_tailer(log)?)
+        } else {
+            // A PTY agent's transcript lands in the host-readable creds clone
+            // (`handle.creds`, the agent home the guest mounts); tail it with the
+            // same producer the foreground PTY run uses, just pointed at the
+            // persisted clone instead of the live auth home.
+            let handle = LibkrunHandle::decode(&self.session)?;
+            let tailer = crate::events::transcripts::spawn_attach_tailer(
+                log,
+                Path::new(&handle.creds),
+                &self.session.agent_id,
+                &self.session.guest_cwd,
+                &self.session.id,
+            );
+            // `None` means this agent has no transcript parser, so there's no live
+            // tail even though the backend advertises one — surface it rather than
+            // silently serving only the existing log.
+            if tailer.is_none() {
+                eprintln!(
+                    "pillbox: note: `{}` has no transcript parser; serving the existing log without a live tail",
+                    self.session.agent_id
+                );
+            }
+            tailer
+        };
+        Ok((source, tailer))
     }
 
     fn http(&self) -> Result<Box<dyn crate::sandbox::http::SandboxHttp>> {
@@ -1671,43 +1733,72 @@ mod tests {
     use crate::sandbox::LiveSession;
     use crate::session::{Session, BACKEND_LIBKRUN};
 
-    /// A libkrun-backed [`Session`] over a PTY agent (claude) — the conservative
-    /// `integration()` default, so `event_source` rejects the live PTY read.
+    /// A libkrun-backed [`Session`] over a PTY agent (claude), carrying a decodable
+    /// [`LibkrunHandle`] whose paths point nowhere real — enough for `send`/
+    /// `event_source` to reach past the capability check into the transport without
+    /// a live VM. The creds path is absent on disk; the transcript tailer's
+    /// discovery tolerates a not-yet-created dir.
     fn libkrun_pty_session() -> Session {
         let mut s = Session::test_fixture();
         s.backend = BACKEND_LIBKRUN.to_string();
+        s.sandbox_id = serde_json::to_string(&LibkrunHandle {
+            sock: "/nonexistent/pillbox-test-attach.sock".to_string(),
+            pid: 0,
+            creds: "/nonexistent/pillbox-test-creds".to_string(),
+            workspace: "/nonexistent/pillbox-test-workspace".to_string(),
+            spec: "/nonexistent/pillbox-test-spec.json".to_string(),
+        })
+        .unwrap();
         s
     }
 
     #[test]
-    fn live_session_caps_and_rejects_pty_verbs() {
-        let live = LibkrunLiveSession::new(libkrun_pty_session());
-        let caps = live.caps();
+    fn pty_drive_and_live_tail_caps_are_on() {
+        let caps = LibkrunBackend.capabilities();
+        assert!(
+            caps.pty_drive,
+            "libkrun drives the guest pty-host over the attach socket — pty_drive must be true"
+        );
+        assert!(
+            caps.live_pty_tail,
+            "libkrun tails the PTY transcript from the creds clone — live_pty_tail must be true"
+        );
         assert!(
             caps.in_sandbox_grading,
             "libkrun is the microVM family — in_sandbox_grading must be true"
         );
-        assert!(
-            !caps.pty_drive,
-            "libkrun has no PTY-drive transport — pty_drive must be false"
-        );
+    }
 
-        let send_err = live.send(b"hi").unwrap_err().to_string();
+    #[test]
+    fn pty_send_is_no_longer_capability_unsupported() {
+        // The PTY `send` now reaches the transport: with an undecodable handle it
+        // fails at the handle decode (or the socket connect), NOT at the old
+        // `caps().unsupported("send")` short-circuit. (Byte delivery to a live PTY
+        // is the live smoke's job — this only proves the verb is wired.)
+        let live = LibkrunLiveSession::new(libkrun_pty_session());
+        let err = live.send(b"hi").unwrap_err().to_string();
         assert!(
-            send_err.contains("send"),
-            "the unsupported error must name the rejected verb, got: {send_err}"
+            !err.contains("isn't supported on this backend"),
+            "PTY send must no longer be capability-unsupported, got: {err}"
         );
+    }
 
-        // The `Ok` variant holds trait objects (no `Debug`), so match rather than
-        // `unwrap_err`.
-        let src_err = match live.event_source(&crate::pillbox::global()) {
-            Ok(_) => panic!("a PTY session's event_source must be unsupported"),
-            Err(e) => e.to_string(),
-        };
-        assert!(
-            src_err.contains("event_source"),
-            "a PTY session's event_source must name the rejected verb, got: {src_err}"
-        );
+    #[test]
+    fn pty_event_source_is_no_longer_capability_unsupported() {
+        // The PTY `event_source` now spawns the creds-clone transcript tailer
+        // instead of rejecting the verb. Run under an isolated $HOME so the log it
+        // opens (and the discovery tailer it spawns) land in a tempdir, not the
+        // real global pillbox. The `Ok` variant holds trait objects (no `Debug`),
+        // so match rather than `unwrap`.
+        crate::test_util::with_isolated_home("libkrun-pty-event-source", || {
+            let live = LibkrunLiveSession::new(libkrun_pty_session());
+            match live.event_source(&crate::pillbox::global()) {
+                // The tailer handle drops at end of scope, stopping the discovery
+                // thread; no live socket is touched.
+                Ok((_source, _tailer)) => {}
+                Err(e) => panic!("a PTY session's event_source must now be supported, got: {e}"),
+            }
+        });
     }
 
     #[test]

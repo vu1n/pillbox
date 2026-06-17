@@ -24,6 +24,10 @@ if [ "$which" = all ] || [ "$which" = libkrun ]; then
   scripts/lk-build.sh || exit 1
   scripts/smoke/libkrun.sh opencode "${OPENCODE_IMAGE:-pillbox-runner:l7}" \
     "${SMOKE_MODEL:-zai-coding-plan/glm-4.5-air}" || rc=1
+  # The PTY drive+read keystone (substrate-plane Phase 4): pty_send → guest PTY,
+  # creds_share transcript → §0 log, wait-idle. A real claude PTY turn (driving a
+  # TUI agent), the path server-mode can't reach.
+  scripts/smoke/libkrun-pty.sh claude "${OPENCODE_IMAGE:-pillbox-runner:l7}" || rc=1
   if [ "${SMOKE_CODEX:-0}" = 1 ]; then
     scripts/smoke/libkrun.sh codex-serve "${CODEX_IMAGE:-pillbox-runner:l8}" || rc=1
   else

@@ -57,27 +57,19 @@ impl Check {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ActiveBackend {
     Docker,
-    // Only ever constructed on a `libkrun` build; the match arms that name it
-    // still compile on the default build (where it's an unreachable variant).
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     Libkrun,
 }
 
-/// Which backend `select_backend` resolves to for this build + env. libkrun's
-/// capability profile carries a real DNS-level egress fence; the Docker family
-/// does not — that bit distinguishes the microVM backend from the container one
-/// without re-deriving the env/feature rule that lives in `select_backend`.
+/// Which backend `select_backend` resolves to for this build + env — read from the
+/// backend's own `id()`, so doctor follows the run path's selection without
+/// re-encoding the env/feature rule (and without overloading a capability bit as a
+/// backend identity, which breaks the moment two backends share that bit).
 fn active_backend() -> ActiveBackend {
-    #[cfg(feature = "libkrun")]
-    {
-        if crate::sandbox::select_backend()
-            .capabilities()
-            .real_egress_fence
-        {
-            return ActiveBackend::Libkrun;
-        }
+    if crate::sandbox::select_backend().id() == crate::session::BACKEND_LIBKRUN {
+        ActiveBackend::Libkrun
+    } else {
+        ActiveBackend::Docker
     }
-    ActiveBackend::Docker
 }
 
 pub(crate) fn run(json: bool, resolved: &Pillbox) -> Result<()> {

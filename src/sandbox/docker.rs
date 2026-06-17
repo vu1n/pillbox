@@ -57,6 +57,10 @@ impl SandboxBackend for DockerBackend {
         }
     }
 
+    fn id(&self) -> &'static str {
+        BACKEND_DOCKER
+    }
+
     fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
         // Some server agents (codex-serve) only run on the libkrun backend — their
         // run path lives in the microVM. Reject on docker rather than mis-routing
@@ -685,18 +689,15 @@ impl super::LiveSession for DockerLiveSession {
         reattach(resolved, &self.session)
     }
 
-    fn event_source(
+    fn spawn_log_tailer(
         &self,
         resolved: &Pillbox,
-    ) -> Result<(
-        Box<dyn crate::events::source::EventSource + Send>,
-        Option<crate::events::transcripts::TailerHandle>,
-    )> {
+    ) -> Result<Option<crate::events::transcripts::TailerHandle>> {
         let log = crate::events::log::SessionLog::open(resolved, &self.session.id)?;
         // A server-mode agent (opencode) has no transcript file — bridge its HTTP
         // `/event` stream into the log; a PTY agent's transcript lands on the
-        // bind-mounted host home, so tail that. Both fill the same durable log the
-        // returned source then reads (the placement swap point picks file vs DO).
+        // bind-mounted host home, so tail that. Both fill the durable log the
+        // caller then opens to read (it owns the placement swap: file vs DO).
         let tailer = if self.session.integration() == Integration::Server {
             let http = self.docker_http()?;
             super::opencode::spawn_event_bridge(&http, &self.session.id, log)
@@ -711,8 +712,7 @@ impl super::LiveSession for DockerLiveSession {
                 &self.session.id,
             )
         };
-        let source = crate::events::source::open_event_source(resolved, &self.session.id)?;
-        Ok((source, tailer))
+        Ok(tailer)
     }
 
     fn http(&self) -> Result<Box<dyn crate::sandbox::http::SandboxHttp>> {

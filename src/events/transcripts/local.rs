@@ -319,7 +319,17 @@ fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
         return;
     };
     for entry in entries.flatten() {
+        // `file_type()` is lstat-based — it does NOT follow symlinks. That is
+        // load-bearing for security: the libkrun PTY tailer reads the guest-WRITABLE
+        // creds clone (the agent home), so a compromised guest could plant symlinks
+        // in the transcript tree; following them would leak arbitrary host files into
+        // the §0 log. Skip symlinks explicitly and NEVER switch to `metadata()`
+        // (which follows) — the explicit skip survives a refactor better than relying
+        // on a symlink being neither a dir nor a file.
         let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_symlink() {
+            continue;
+        }
         let path = entry.path();
         if ft.is_dir() {
             collect_jsonl(&path, out);
@@ -412,6 +422,24 @@ mod tests {
         assert!(names.contains("keep.jsonl"));
         assert!(names.contains("top.jsonl"));
         assert!(!names.contains("skip.txt"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn collect_jsonl_does_not_follow_symlinks() {
+        // A compromised guest writes the creds-clone transcript tree, so it could
+        // plant symlinks to host files; the walker must not follow them into the log.
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret.jsonl");
+        fs::write(&secret, "{}").unwrap();
+        let scan = dir.path().join("scan");
+        fs::create_dir(&scan).unwrap();
+        symlink(&secret, scan.join("link.jsonl")).unwrap(); // symlink → host .jsonl
+        symlink(dir.path(), scan.join("up")).unwrap(); // symlink → parent dir
+        let mut out = Vec::new();
+        collect_jsonl(&scan, &mut out);
+        assert!(out.is_empty(), "symlinks must not be collected: {out:?}");
     }
 
     #[test]

@@ -40,7 +40,7 @@ fn resolve_streaming_session(
                     live.caps().live_pty_tail
                 };
                 if can_tail {
-                    live.event_source(resolved)?.1
+                    live.spawn_log_tailer(resolved)?
                 } else {
                     eprintln!(
                         "pillbox: note: live event tailing isn't available for this `{}` \

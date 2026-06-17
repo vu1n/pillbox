@@ -25,7 +25,6 @@ use anyhow::Result;
 
 use crate::agents::{AgentSpec, RunOpts};
 use crate::errors::PillboxError;
-use crate::events::source::EventSource;
 use crate::events::transcripts::TailerHandle;
 use crate::pillbox::Pillbox;
 use crate::sandbox::http::SandboxHttp;
@@ -89,6 +88,12 @@ pub(crate) trait SandboxBackend {
     /// What this backend can do — queried before (or instead of) attempting a
     /// verb. The honest current-state profile, per docs/substrate-plane.md.
     fn capabilities(&self) -> Caps;
+
+    /// Stable backend identity (`BACKEND_DOCKER` / `BACKEND_LIBKRUN`) — the
+    /// explicit discriminant for code that must branch on *which* backend is
+    /// active, rather than inferring it from a capability bit (which silently
+    /// breaks the moment two backends share that capability).
+    fn id(&self) -> &'static str;
 }
 
 /// The live session — **the plane**. A running (foreground or detached) agent
@@ -110,13 +115,12 @@ pub(crate) trait LiveSession {
     /// Reattach a terminal to this session.
     fn attach(&self, resolved: &Pillbox) -> Result<()>;
 
-    /// Open the §0 read source plus the tailer that fills it for a live session
-    /// (held by the caller for the stream's lifetime; `None` when a producer
-    /// already tails). Backend-blind replacement for `resolve_streaming_session`.
-    fn event_source(
-        &self,
-        resolved: &Pillbox,
-    ) -> Result<(Box<dyn EventSource + Send>, Option<TailerHandle>)>;
+    /// Spawn the tailer that fills this live session's §0 log, returning its guard
+    /// (held by the caller for the stream's lifetime; `None` when a producer already
+    /// tails). The caller opens the read *source* itself (the local/managed
+    /// placement swap), so this returns only the tailer — backend-blind replacement
+    /// for the per-backend tailer-spawning in `resolve_streaming_session`.
+    fn spawn_log_tailer(&self, resolved: &Pillbox) -> Result<Option<TailerHandle>>;
 
     /// HTTP handle to a server-mode agent's in-sandbox server. `caps().server_mode`.
     fn http(&self) -> Result<Box<dyn SandboxHttp>>;

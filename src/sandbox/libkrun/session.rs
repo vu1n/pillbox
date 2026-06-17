@@ -54,6 +54,10 @@ impl SandboxBackend for LibkrunBackend {
         }
     }
 
+    fn id(&self) -> &'static str {
+        crate::session::BACKEND_LIBKRUN
+    }
+
     fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
         // Server-integration agents run headless + are driven/read over their HTTP
         // API through a vsock port-forward — a distinct path with no PTY (mirrors
@@ -928,6 +932,12 @@ fn launch_server_vm(
             if let Some(deps_err) = sigabrt_boot_error(self_status) {
                 return Err(deps_err);
             }
+            // `try_wait` can race the dying child, so a SIGABRT-at-boot may not be
+            // caught above. A swept runtime dep is the likeliest cause of a boot
+            // failure regardless — surface it instead of the opaque generic error.
+            if let Err(reason) = runtime_deps_present() {
+                return Err(PillboxError::runtime("run", reason).into());
+            }
             return Err(e);
         }
     };
@@ -1612,22 +1622,19 @@ impl crate::sandbox::LiveSession for LibkrunLiveSession {
         reattach(resolved, &self.session)
     }
 
-    fn event_source(
+    fn spawn_log_tailer(
         &self,
         resolved: &Pillbox,
-    ) -> Result<(
-        Box<dyn crate::events::source::EventSource + Send>,
-        Option<crate::events::transcripts::TailerHandle>,
-    )> {
+    ) -> Result<Option<crate::events::transcripts::TailerHandle>> {
         // A detached PTY session has no reparented §0 producer, so each reader spawns
         // its own transcript tailer — two concurrent readers (`watch`+`subscribe`)
         // would double-write the log, and a never-watched session captures nothing.
         // The single-reader IDE drive+read keystone is unaffected.
-        let source = crate::events::source::open_event_source(resolved, &self.session.id)?;
-        // A producer already draining the capture into the log keeps the source
-        // current; a second drainer would double-write every event (fresh seqs).
+        //
+        // A producer already draining the capture into the log keeps it current; a
+        // second drainer would double-write every event (fresh seqs).
         if crate::commands::session::detached_tailer_alive(resolved, &self.session) {
-            return Ok((source, None));
+            return Ok(None);
         }
         let log = crate::events::log::SessionLog::open(resolved, &self.session.id)?;
         let tailer = if self.session.integration() == Integration::Server {
@@ -1658,7 +1665,7 @@ impl crate::sandbox::LiveSession for LibkrunLiveSession {
             }
             tailer
         };
-        Ok((source, tailer))
+        Ok(tailer)
     }
 
     fn http(&self) -> Result<Box<dyn crate::sandbox::http::SandboxHttp>> {
@@ -1823,20 +1830,17 @@ mod tests {
     }
 
     #[test]
-    fn pty_event_source_is_no_longer_capability_unsupported() {
-        // The PTY `event_source` now spawns the creds-clone transcript tailer
-        // instead of rejecting the verb. Run under an isolated $HOME so the log it
-        // opens (and the discovery tailer it spawns) land in a tempdir, not the
-        // real global pillbox. The `Ok` variant holds trait objects (no `Debug`),
-        // so match rather than `unwrap`.
-        crate::test_util::with_isolated_home("libkrun-pty-event-source", || {
+    fn pty_spawn_log_tailer_is_no_longer_capability_unsupported() {
+        // PTY `spawn_log_tailer` now spawns the creds-clone transcript tailer instead
+        // of rejecting the verb. Isolated $HOME so the log it opens (and the discovery
+        // tailer it spawns) land in a tempdir, not the real global pillbox. The
+        // returned tailer handle drops at scope end, stopping the thread.
+        crate::test_util::with_isolated_home("libkrun-pty-spawn-log-tailer", || {
             let live = LibkrunLiveSession::new(libkrun_pty_session());
-            match live.event_source(&crate::pillbox::global()) {
-                // The tailer handle drops at end of scope, stopping the discovery
-                // thread; no live socket is touched.
-                Ok((_source, _tailer)) => {}
-                Err(e) => panic!("a PTY session's event_source must now be supported, got: {e}"),
-            }
+            assert!(
+                live.spawn_log_tailer(&crate::pillbox::global()).is_ok(),
+                "a PTY session's spawn_log_tailer must now be supported"
+            );
         });
     }
 

@@ -70,7 +70,7 @@ pub(crate) fn tailer_pid(session_dir: &std::path::Path) -> Option<i32> {
 /// Is a detached §0 producer currently alive for this session? Pid file + a signal-0 liveness probe.
 /// Readers (`subscribe`/`ingest`) use it to DEFER their own drain — only one writer may append to the
 /// log or events double.
-fn detached_tailer_alive(resolved: &Pillbox, s: &session::Session) -> bool {
+pub(crate) fn detached_tailer_alive(resolved: &Pillbox, s: &session::Session) -> bool {
     tailer_pid(&session::session_dir_path(resolved, &s.id))
         .is_some_and(|pid| unsafe { libc::kill(pid, 0) } == 0)
 }

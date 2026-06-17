@@ -147,10 +147,11 @@ libkrun PTY parity, CF) builds on it.
 
 - [ ] **Phase 0 — contract.** Add `LiveSession` + `Caps` + `SandboxBackend::start/capabilities`. No behavior change; nothing calls them yet. `cargo fmt --all`, clippy (default **and** `--features libkrun`).
 - [ ] **Phase 1 — wrap.** `DockerLiveSession` + (gated) `LibkrunLiveSession` impls that *call the existing free fns*. `start()` constructs the right one from (family × `Integration`). Behavior identical; `scripts/smoke/run.sh` green.
-- [ ] **Phase 2 — delete dispatch.** Replace the 8 match sites with `session.start()?` + `caps()` checks, then remove the `Backend::parse` arms:
+- [ ] **Phase 2 — delete dispatch.** Replace the 8 match sites with `live_session(&session)?` + `caps()` checks, then remove the `Backend::parse` arms:
       `src/commands/session/mod.rs:88,239,576,701,769,993`;
       `src/commands/session/stream.rs:36,56`.
       Move `sandbox spawn/exec/agent` (`src/commands/sandbox.rs:118`, hardcoded `BACKEND_DOCKER`) behind `caps().long_lived_exec`.
+      Carry-overs the port must preserve: (1) the `detached_tailer_alive` guard now lives *inside* `LibkrunLiveSession::{event_source,ingest}`, so delete the command-layer copies (`stream.rs:39`, `session_ingest`) rather than double-guarding; (2) `session_subscribe`'s `$PILLBOX_EVENTS_WEBHOOK` exporter — attached today when the tailer `is_some()` (`stream.rs:97`) — must still be wired off `event_source()`'s returned `Option<TailerHandle>`; (3) server-send routing (the http-prompt path that runs *before* the backend match) is orthogonal to `LiveSession::send` (the PTY-drive verb) — a server session must keep going through `http()`, not `.send()`.
       *(End of spine: one plane, dispatch deleted, behavior unchanged.)*
 - [ ] **Phase 3 — flip default.** `select_backend()` defaults to libkrun (where available); docker recast in docs/`doctor` as the container-family compat backend, not the default. Rework `doctor` (it probes the Docker daemon + image, `src/doctor.rs:134`) so a libkrun-default host isn't told "Docker not running."
 - [ ] **Phase 4 — fill libkrun+PTY drive (in scope; see below).** vsock `send` + live transcript tailing for claude/codex/pi on libkrun, so `Caps{ pty_drive, live_pty_tail }` flip true. This is the IDE/ADE surface — required, not optional.

@@ -1345,3 +1345,212 @@ fn accept_attach(listener: &UnixListener, child: &mut std::process::Child) -> Re
         std::thread::sleep(Duration::from_millis(100));
     }
 }
+
+/// The libkrun [`LiveSession`](crate::sandbox::LiveSession) — a detached/server
+/// microVM the command layer drives and reads without branching on the backend.
+/// A thin adapter over the existing free fns (the proven transport), so the plane
+/// gains no new libkrun behavior, only one polymorphic surface. Holds a cloned
+/// [`Session`](crate::session::Session); the [`LibkrunHandle`] is decoded on
+/// demand from its `sandbox_id`.
+//
+// No constructor caller until the `live_session` factory + command-layer dispatch
+// are ported onto the plane; allow(dead_code) until then.
+#[allow(dead_code)]
+pub(crate) struct LibkrunLiveSession {
+    session: crate::session::Session,
+}
+
+impl crate::sandbox::LiveSession for LibkrunLiveSession {
+    fn caps(&self) -> Caps {
+        LibkrunBackend.capabilities()
+    }
+
+    fn send(&self, _bytes: &[u8]) -> Result<()> {
+        // libkrun has no PTY-drive transport (the vsock attach channel carries an
+        // interactive pump, not programmatic input); a server agent's prompt goes
+        // over its HTTP API (`http`), not this verb.
+        Err(self.caps().unsupported("send"))
+    }
+
+    fn attach(&self, resolved: &Pillbox) -> Result<()> {
+        reattach(resolved, &self.session)
+    }
+
+    fn event_source(
+        &self,
+        resolved: &Pillbox,
+    ) -> Result<(
+        Box<dyn crate::events::source::EventSource + Send>,
+        Option<crate::events::transcripts::TailerHandle>,
+    )> {
+        // A server agent persists its event capture to a host file in the CoW creds
+        // clone. A PTY agent has no host-side live tail on this backend (no
+        // creds-clone transcript tailer), so the live read verb is unsupported.
+        if self.session.integration() != Integration::Server {
+            return Err(self.caps().unsupported("event_source"));
+        }
+        let source = crate::events::source::open_event_source(resolved, &self.session.id)?;
+        // A detached run already has a persistent §0 producer draining the capture
+        // into the log; a second drainer here would double-write every event (fresh
+        // seqs). Hand back a read-only source — the live producer keeps it current.
+        if crate::commands::session::detached_tailer_alive(resolved, &self.session) {
+            return Ok((source, None));
+        }
+        let log = crate::events::log::SessionLog::open(resolved, &self.session.id)?;
+        let tailer = self.server_file_tailer(log)?;
+        Ok((source, Some(tailer)))
+    }
+
+    fn http(&self) -> Result<Box<dyn crate::sandbox::http::SandboxHttp>> {
+        // Only a server-mode agent runs an in-guest HTTP server to talk to; a PTY
+        // agent has none, so the verb is unsupported rather than handing back a
+        // handle to a port nothing listens on.
+        if self.session.integration() != Integration::Server {
+            return Err(self.caps().unsupported("http"));
+        }
+        opencode_http(&self.session)
+    }
+
+    fn workspace_path(&self) -> Result<PathBuf> {
+        workspace_path(&self.session)
+    }
+
+    fn ingest(&self, resolved: &Pillbox) -> Result<usize> {
+        // Post-hoc trajectory drain: the reparented guest's persisted capture is read
+        // to EOF into the durable log. Only a server agent produces that capture.
+        if self.session.integration() != Integration::Server {
+            return Err(PillboxError::usage(
+                "session ingest",
+                format!(
+                    "ingest applies to server-mode sessions; `{}` is not one",
+                    self.session.agent_id
+                ),
+            )
+            .into());
+        }
+        // If the detached §0 producer is still draining the capture live, the log is
+        // already current — draining again would duplicate every event.
+        if crate::commands::session::detached_tailer_alive(resolved, &self.session) {
+            return Ok(0);
+        }
+        // A plain `File` (not the follow reader) — the drain returns at EOF rather
+        // than tailing, and the never-set stop flag is meaningless on this path.
+        let path = server_events_file(&self.session)?;
+        let format = self.events_format()?;
+        let file = std::fs::File::open(&path).map_err(|e| {
+            PillboxError::runtime(
+                "session ingest",
+                format!("open events file {}: {e}", path.display()),
+            )
+            .with_next("the session may not have produced any §0 events yet")
+        })?;
+        let mut log = crate::events::log::SessionLog::open(resolved, &self.session.id)?;
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        crate::events::drain_server_capture(format, file, &self.session.id, &mut log, &stop)
+    }
+
+    fn kill(&self, resolved: &Pillbox) -> Result<()> {
+        kill_session(resolved, &self.session)
+    }
+}
+
+impl LibkrunLiveSession {
+    // No caller until the `live_session` factory + command-layer dispatch are
+    // ported onto the plane; allow(dead_code) until then.
+    #[allow(dead_code)]
+    pub(crate) fn new(session: crate::session::Session) -> Self {
+        Self { session }
+    }
+
+    /// The server agent's capture wire format, resolved from its
+    /// [`ServerProfile`](crate::agents::ServerProfile) — the drain-dispatch axis
+    /// (SSE vs NDJSON), shared by [`event_source`](Self::event_source) and
+    /// [`ingest`](Self::ingest) so the format→drain mapping lives in one place.
+    fn events_format(&self) -> Result<crate::events::EventsFormat> {
+        let spec = crate::agents::lookup("session", &self.session.agent_id)?;
+        spec.server.map(|p| p.events_format).ok_or_else(|| {
+            PillboxError::usage(
+                "session",
+                format!("`{}` is not a server-mode agent", self.session.agent_id),
+            )
+            .into()
+        })
+    }
+
+    /// Tail a server session's persistent event-capture file (replay + follow via
+    /// [`FollowReader`](crate::events::opencode::FollowReader)) into the log on a
+    /// background thread. The gateway-free, complete-capture source: a late watcher
+    /// still gets the whole history because the file persisted. The returned
+    /// [`TailerHandle`](crate::events::transcripts::TailerHandle) flips the shared
+    /// stop flag to end the follow.
+    fn server_file_tailer(
+        &self,
+        log: crate::events::log::SessionLog,
+    ) -> Result<crate::events::transcripts::TailerHandle> {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let path = server_events_file(&self.session)?;
+        let format = self.events_format()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let sid = self.session.id.clone();
+        let join = std::thread::spawn(move || {
+            let mut log = log;
+            let reader = crate::events::opencode::FollowReader::new(path, Arc::clone(&stop_thread));
+            if let Err(e) =
+                crate::events::drain_server_capture(format, reader, &sid, &mut log, &stop_thread)
+            {
+                eprintln!("pillbox: warning: server events drain stopped: {e:#}");
+            }
+        });
+        Ok(crate::events::transcripts::TailerHandle::from_flag(
+            stop, join,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sandbox::LiveSession;
+    use crate::session::{Session, BACKEND_LIBKRUN};
+
+    /// A libkrun-backed [`Session`] over a PTY agent (claude) — the conservative
+    /// `integration()` default, so `event_source` rejects the live PTY read.
+    fn libkrun_pty_session() -> Session {
+        let mut s = Session::test_fixture();
+        s.backend = BACKEND_LIBKRUN.to_string();
+        s
+    }
+
+    #[test]
+    fn live_session_caps_and_rejects_pty_verbs() {
+        let live = LibkrunLiveSession::new(libkrun_pty_session());
+        let caps = live.caps();
+        assert!(
+            caps.in_sandbox_grading,
+            "libkrun is the microVM family — in_sandbox_grading must be true"
+        );
+        assert!(
+            !caps.pty_drive,
+            "libkrun has no PTY-drive transport — pty_drive must be false"
+        );
+
+        let send_err = live.send(b"hi").unwrap_err().to_string();
+        assert!(
+            send_err.contains("send"),
+            "the unsupported error must name the rejected verb, got: {send_err}"
+        );
+
+        // The `Ok` variant holds trait objects (no `Debug`), so match rather than
+        // `unwrap_err`.
+        let src_err = match live.event_source(&crate::pillbox::global()) {
+            Ok(_) => panic!("a PTY session's event_source must be unsupported"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            src_err.contains("event_source"),
+            "a PTY session's event_source must name the rejected verb, got: {src_err}"
+        );
+    }
+}

@@ -51,6 +51,7 @@ mod vault;
 // `commands::session` reaches these accessors through the backend module.
 pub(crate) use session::{
     kill_session, opencode_http, reattach, score_in_sandbox, server_events_file, workspace_path,
+    LibkrunLiveSession,
 };
 
 use crate::agents::AgentSpec;

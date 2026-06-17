@@ -660,3 +660,132 @@ pub(crate) fn kill_session(resolved: &Pillbox, session: &Session) -> Result<()> 
     println!("pillbox: ✓ session `{}` removed.", session.id);
     Ok(())
 }
+
+/// The docker [`LiveSession`] — a running container (foreground or detached)
+/// the command layer drives and reads without branching on the backend. A thin
+/// adapter: every verb forwards to the existing free fn (the proven transport),
+/// so the plane gains no new docker behavior, only one polymorphic surface.
+/// Holds a cloned [`Session`] record (the container id is its `sandbox_id`).
+//
+// No constructor caller until the `live_session` factory + command-layer
+// dispatch are ported onto the plane; allow(dead_code) until then.
+#[allow(dead_code)]
+pub(crate) struct DockerLiveSession {
+    session: Session,
+}
+
+impl super::LiveSession for DockerLiveSession {
+    fn caps(&self) -> Caps {
+        DockerBackend.capabilities()
+    }
+
+    fn send(&self, bytes: &[u8]) -> Result<()> {
+        send_input(&self.session.sandbox_id, bytes)
+    }
+
+    fn attach(&self, resolved: &Pillbox) -> Result<()> {
+        reattach(resolved, &self.session)
+    }
+
+    fn event_source(
+        &self,
+        resolved: &Pillbox,
+    ) -> Result<(
+        Box<dyn crate::events::source::EventSource + Send>,
+        Option<crate::events::transcripts::TailerHandle>,
+    )> {
+        let log = crate::events::log::SessionLog::open(resolved, &self.session.id)?;
+        // A server-mode agent (opencode) has no transcript file — bridge its HTTP
+        // `/event` stream into the log; a PTY agent's transcript lands on the
+        // bind-mounted host home, so tail that. Both fill the same durable log the
+        // returned source then reads (the placement swap point picks file vs DO).
+        let tailer = if self.session.integration() == Integration::Server {
+            let http = self.docker_http()?;
+            super::opencode::spawn_event_bridge(&http, &self.session.id, log)
+        } else {
+            let spec = crate::agents::lookup("session", &self.session.agent_id)?;
+            let home = spec.home_dir(resolved)?;
+            crate::events::transcripts::spawn_attach_tailer(
+                log,
+                &home,
+                &self.session.agent_id,
+                &self.session.guest_cwd,
+                &self.session.id,
+            )
+        };
+        let source = crate::events::source::open_event_source(resolved, &self.session.id)?;
+        Ok((source, tailer))
+    }
+
+    fn http(&self) -> Result<Box<dyn crate::sandbox::http::SandboxHttp>> {
+        // Only a server-mode agent runs an in-sandbox HTTP server to talk to; a
+        // PTY agent has none, so the verb is unsupported rather than handing back
+        // a handle that would `curl` a closed port.
+        if self.session.integration() != Integration::Server {
+            return Err(self.caps().unsupported("http"));
+        }
+        Ok(Box::new(self.docker_http()?))
+    }
+
+    fn workspace_path(&self) -> Result<std::path::PathBuf> {
+        // Docker bind-mounts the live host workspace (no CoW result clone), and the
+        // record persists only the *guest* mount path (`guest_cwd`), never the host
+        // source. With no recoverable host result-workspace, the verb is unsupported
+        // — matching `caps().in_sandbox_grading == false`.
+        Err(self.caps().unsupported("workspace_path"))
+    }
+
+    fn ingest(&self, _resolved: &Pillbox) -> Result<usize> {
+        // Docker drains §0 live via the attach tailer / event bridge — there's no
+        // headless capture file to drain post-hoc.
+        Err(self.caps().unsupported("ingest"))
+    }
+
+    fn kill(&self, resolved: &Pillbox) -> Result<()> {
+        kill_session(resolved, &self.session)
+    }
+}
+
+impl DockerLiveSession {
+    // No caller until the `live_session` factory + command-layer dispatch are
+    // ported onto the plane; allow(dead_code) until then.
+    #[allow(dead_code)]
+    pub(crate) fn new(session: Session) -> Self {
+        Self { session }
+    }
+
+    /// The `docker exec curl` HTTP transport to this session's in-container
+    /// server — shared by [`event_source`](Self::event_source) (the opencode
+    /// bridge) and [`http`](Self::http). Mirrors the server bring-up in
+    /// `commands::session` so the dispatch sites converge on one construction.
+    fn docker_http(&self) -> Result<super::http::DockerHttp> {
+        Ok(super::http::DockerHttp::new(
+            self.session.sandbox_id.clone(),
+            super::opencode::SERVE_PORT,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pillbox;
+    use crate::sandbox::LiveSession;
+    use crate::test_util::with_isolated_home;
+
+    #[test]
+    fn live_session_reports_pty_caps_and_rejects_ingest() {
+        let live = DockerLiveSession::new(Session::test_fixture());
+        assert!(
+            live.caps().pty_drive,
+            "docker is the full-PTY family — pty_drive must be true"
+        );
+        with_isolated_home("docker-livesession-ingest", || {
+            let err = live.ingest(&pillbox::global()).unwrap_err().to_string();
+            assert!(
+                err.contains("ingest"),
+                "the unsupported error must name the rejected verb, got: {err}"
+            );
+        });
+    }
+}

@@ -23,10 +23,12 @@ use std::path::PathBuf;
 use anyhow::Result;
 
 use crate::agents::{AgentSpec, RunOpts};
+use crate::errors::PillboxError;
 use crate::events::source::EventSource;
 use crate::events::transcripts::TailerHandle;
 use crate::pillbox::Pillbox;
 use crate::sandbox::http::SandboxHttp;
+use crate::session::{Backend, Session};
 
 /// What a backend can do — **declared, not chased**. The plane queries this to
 /// decide whether a verb is available on the current substrate, instead of
@@ -57,14 +59,32 @@ pub(crate) struct Caps {
     pub(crate) post_hoc_ingest: bool,
 }
 
+impl Caps {
+    /// The one error a [`LiveSession`] method returns when `verb` isn't
+    /// supported on this backend. Centralized so every backend rejects an
+    /// absent verb with the same named, exit-2 shape — the capability gap is a
+    /// single recognizable error across the plane, not a per-impl `bail!` whose
+    /// wording (and exit code) drifts between backends.
+    // No caller until the dispatch sites are ported onto the plane.
+    #[allow(dead_code)]
+    pub(crate) fn unsupported(&self, verb: &str) -> anyhow::Error {
+        PillboxError::usage(
+            "session",
+            format!("`{verb}` isn't supported on this backend"),
+        )
+        .with_next("pillbox session info <id>  # check the session's backend")
+        .into()
+    }
+}
+
 /// One backend = one way to provision a sandbox + vault session, inject
 /// credentials, run the agent, and supervise it.
 ///
-/// `run()` is the existing foreground/detach entry point. `start()` (wired in
-/// Phase 1+) returns a [`LiveSession`] — the polymorphic control surface the
-/// command layer drives without branching on the backend. See
-/// docs/substrate-plane.md. Takes a resolved [`Pillbox`] so the backend can
-/// locate the auth home + vault state for the right scope.
+/// `run()` is the existing foreground/detach entry point. `start()` returns a
+/// [`LiveSession`] — the polymorphic control surface the command layer drives
+/// without branching on the backend. See docs/substrate-plane.md. Takes a
+/// resolved [`Pillbox`] so the backend can locate the auth home + vault state
+/// for the right scope.
 pub(crate) trait SandboxBackend {
     fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>;
 
@@ -84,7 +104,9 @@ pub(crate) trait SandboxBackend {
         _opts: RunOpts,
         _resolved: &Pillbox,
     ) -> Result<Box<dyn LiveSession>> {
-        anyhow::bail!("this backend has no LiveSession::start yet (see docs/substrate-plane.md)")
+        anyhow::bail!(
+            "this backend does not implement LiveSession::start (see docs/substrate-plane.md)"
+        )
     }
 }
 
@@ -141,4 +163,75 @@ pub(crate) fn select_backend() -> Box<dyn SandboxBackend> {
         return Box::new(libkrun::LibkrunBackend);
     }
     Box::new(docker::DockerBackend)
+}
+
+/// Construct the [`LiveSession`] for an existing resolved [`Session`] — the one
+/// place that branches on `session.backend`, so the command-layer control verbs
+/// (`send`/`attach`/`watch`/`kill`/…) dispatch through the plane instead of each
+/// re-matching `Backend::parse`. Construction is just the cloned record; methods
+/// that need the resolved [`Pillbox`] take it per-call.
+// No caller until the dispatch sites are ported onto it.
+#[allow(dead_code)]
+pub(crate) fn live_session(session: &Session) -> Result<Box<dyn LiveSession>> {
+    match Backend::parse(&session.backend) {
+        Some(Backend::Docker) => Ok(Box::new(docker::DockerLiveSession::new(session.clone()))),
+        #[cfg(feature = "libkrun")]
+        Some(Backend::Libkrun) => Ok(Box::new(libkrun::LibkrunLiveSession::new(session.clone()))),
+        #[cfg(not(feature = "libkrun"))]
+        Some(Backend::Libkrun) => Err(PillboxError::config(
+            "session",
+            format!(
+                "session `{}` is libkrun-backed, but this pillbox was built without libkrun support",
+                session.id
+            ),
+        )
+        .into()),
+        None => Err(PillboxError::config(
+            "session",
+            format!("unknown session backend `{}`", session.backend),
+        )
+        .into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::BACKEND_DOCKER;
+
+    #[test]
+    fn unsupported_names_the_verb() {
+        let err = Caps::default().unsupported("event_source");
+        assert!(
+            err.to_string().contains("event_source"),
+            "error should name the rejected verb, got: {err}"
+        );
+    }
+
+    #[test]
+    fn live_session_dispatches_docker_to_pty_family() {
+        let mut s = Session::test_fixture();
+        s.backend = BACKEND_DOCKER.to_string();
+        let live = live_session(&s).expect("docker session resolves to a LiveSession");
+        // Docker is the full-PTY family — the factory must hand back the docker
+        // impl, identified here by its capability profile (not a type assert,
+        // since the return is a trait object).
+        assert!(
+            live.caps().pty_drive,
+            "docker LiveSession must report pty_drive == true"
+        );
+    }
+
+    #[cfg(feature = "libkrun")]
+    #[test]
+    fn live_session_dispatches_libkrun_to_microvm_family() {
+        use crate::session::BACKEND_LIBKRUN;
+        let mut s = Session::test_fixture();
+        s.backend = BACKEND_LIBKRUN.to_string();
+        let live = live_session(&s).expect("libkrun session resolves to a LiveSession");
+        assert!(
+            live.caps().in_sandbox_grading,
+            "libkrun LiveSession must report in_sandbox_grading == true"
+        );
+    }
 }

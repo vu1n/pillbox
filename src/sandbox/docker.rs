@@ -9,7 +9,7 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 
-use super::SandboxBackend;
+use super::{Caps, SandboxBackend};
 use crate::agents::{
     base_docker_args_detached, resolve_run_env, resolve_with_entries, workspace_mount_name,
     AgentSpec, Integration, RunOpts, GUEST_HOME, GUEST_WORKSPACE,
@@ -40,6 +40,23 @@ impl Drop for ContainerGuard {
 }
 
 impl SandboxBackend for DockerBackend {
+    /// The container family: full PTY drive/read + long-lived exec, opencode
+    /// server mode. No KVM-isolation features (real fence, in-sandbox grade,
+    /// detached vault); drains §0 live, so no post-hoc ingest. See
+    /// docs/substrate-plane.md.
+    fn capabilities(&self) -> Caps {
+        Caps {
+            pty_drive: true,
+            live_pty_tail: true,
+            server_mode: true,
+            long_lived_exec: true,
+            in_sandbox_grading: false,
+            real_egress_fence: false,
+            detached_vault: false,
+            post_hoc_ingest: false,
+        }
+    }
+
     fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
         // Some server agents (codex-serve) only run on the libkrun backend — their
         // run path lives in the microVM. Reject on docker rather than mis-routing
@@ -124,13 +141,14 @@ impl SandboxBackend for DockerBackend {
         }
         // Local --detach can't use the vault: the stub-swap proxy runs on the
         // host and would die the moment this CLI returns, leaving the detached
-        // agent with dead credentials. Reject early with a pointer.
-        if opts.detach && (opts.vault || any_vaulted) {
+        // agent with dead credentials. Sourced from the capability so the gate
+        // tracks the backend's real detached_vault support, not a hardcode.
+        if opts.detach && (opts.vault || any_vaulted) && !self.capabilities().detached_vault {
             return Err(PillboxError::usage(
                 "run",
                 "--detach does not support the vault locally (the proxy can't outlive the CLI)",
             )
-            .with_next("run without --vault, or use the libkrun backend (PILLBOX_BACKEND=libkrun), which keeps the vault on detach")
+            .with_next("run without --vault, or use the default libkrun backend (don't set PILLBOX_BACKEND=docker), which keeps the vault on detach")
             .into());
         }
         // One session id for the whole foreground run: it anchors the
@@ -173,7 +191,8 @@ impl SandboxBackend for DockerBackend {
                 // DNS, so it's the airtight path. See docs/vault.md.
                 eprintln!(
                     "pillbox: note: --egress-deny on docker is proxy-level only — it does \
-                     not network-fence direct dials. For sole-egress, use PILLBOX_BACKEND=libkrun."
+                     not network-fence direct dials. For sole-egress, use the default libkrun \
+                     backend (don't set PILLBOX_BACKEND=docker)."
                 );
             }
             Some(crate::vault::VaultSession::start(
@@ -642,4 +661,126 @@ pub(crate) fn kill_session(resolved: &Pillbox, session: &Session) -> Result<()> 
     session::delete(resolved, &session.id)?;
     println!("pillbox: ✓ session `{}` removed.", session.id);
     Ok(())
+}
+
+/// The docker [`LiveSession`] — a running container (foreground or detached)
+/// the command layer drives and reads without branching on the backend. A thin
+/// adapter: every verb forwards to the existing free fn (the proven transport),
+/// so the plane gains no new docker behavior, only one polymorphic surface.
+/// Holds a cloned [`Session`] record (the container id is its `sandbox_id`).
+pub(crate) struct DockerLiveSession {
+    session: Session,
+}
+
+impl super::LiveSession for DockerLiveSession {
+    fn caps(&self) -> Caps {
+        DockerBackend.capabilities()
+    }
+
+    fn send(&self, bytes: &[u8]) -> Result<()> {
+        send_input(&self.session.sandbox_id, bytes)
+    }
+
+    fn attach(&self, resolved: &Pillbox) -> Result<()> {
+        reattach(resolved, &self.session)
+    }
+
+    fn event_source(
+        &self,
+        resolved: &Pillbox,
+    ) -> Result<(
+        Box<dyn crate::events::source::EventSource + Send>,
+        Option<crate::events::transcripts::TailerHandle>,
+    )> {
+        let log = crate::events::log::SessionLog::open(resolved, &self.session.id)?;
+        // A server-mode agent (opencode) has no transcript file — bridge its HTTP
+        // `/event` stream into the log; a PTY agent's transcript lands on the
+        // bind-mounted host home, so tail that. Both fill the same durable log the
+        // returned source then reads (the placement swap point picks file vs DO).
+        let tailer = if self.session.integration() == Integration::Server {
+            let http = self.docker_http()?;
+            super::opencode::spawn_event_bridge(&http, &self.session.id, log)
+        } else {
+            let spec = crate::agents::lookup("session", &self.session.agent_id)?;
+            let home = spec.home_dir(resolved)?;
+            crate::events::transcripts::spawn_attach_tailer(
+                log,
+                &home,
+                &self.session.agent_id,
+                &self.session.guest_cwd,
+                &self.session.id,
+            )
+        };
+        let source = crate::events::source::open_event_source(resolved, &self.session.id)?;
+        Ok((source, tailer))
+    }
+
+    fn http(&self) -> Result<Box<dyn crate::sandbox::http::SandboxHttp>> {
+        // Only a server-mode agent runs an in-sandbox HTTP server to talk to; a
+        // PTY agent has none, so the verb is unsupported rather than handing back
+        // a handle that would `curl` a closed port.
+        if self.session.integration() != Integration::Server {
+            return Err(self.caps().unsupported("http"));
+        }
+        Ok(Box::new(self.docker_http()?))
+    }
+
+    fn workspace_path(&self) -> Result<std::path::PathBuf> {
+        // Docker bind-mounts the live host workspace (no CoW result clone), and the
+        // record persists only the *guest* mount path (`guest_cwd`), never the host
+        // source. With no recoverable host result-workspace, the verb is unsupported
+        // — matching `caps().in_sandbox_grading == false`.
+        Err(self.caps().unsupported("workspace_path"))
+    }
+
+    fn ingest(&self, _resolved: &Pillbox) -> Result<usize> {
+        // Docker drains §0 live via the attach tailer / event bridge — there's no
+        // headless capture file to drain post-hoc.
+        Err(self.caps().unsupported("ingest"))
+    }
+
+    fn kill(&self, resolved: &Pillbox) -> Result<()> {
+        kill_session(resolved, &self.session)
+    }
+}
+
+impl DockerLiveSession {
+    pub(crate) fn new(session: Session) -> Self {
+        Self { session }
+    }
+
+    /// The `docker exec curl` HTTP transport to this session's in-container
+    /// server — shared by [`event_source`](Self::event_source) (the opencode
+    /// bridge) and [`http`](Self::http). Mirrors the server bring-up in
+    /// `commands::session` so the dispatch sites converge on one construction.
+    fn docker_http(&self) -> Result<super::http::DockerHttp> {
+        Ok(super::http::DockerHttp::new(
+            self.session.sandbox_id.clone(),
+            super::opencode::SERVE_PORT,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pillbox;
+    use crate::sandbox::LiveSession;
+    use crate::test_util::with_isolated_home;
+
+    #[test]
+    fn live_session_reports_pty_caps_and_rejects_ingest() {
+        let live = DockerLiveSession::new(Session::test_fixture());
+        assert!(
+            live.caps().pty_drive,
+            "docker is the full-PTY family — pty_drive must be true"
+        );
+        with_isolated_home("docker-livesession-ingest", || {
+            let err = live.ingest(&pillbox::global()).unwrap_err().to_string();
+            assert!(
+                err.contains("ingest"),
+                "the unsupported error must name the rejected verb, got: {err}"
+            );
+        });
+    }
 }

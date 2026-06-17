@@ -41,16 +41,21 @@ use serde::{Deserialize, Serialize};
 
 mod boot;
 mod egress;
+mod host;
 mod http;
 mod local_forward;
 mod mitm;
 mod session;
 mod vault;
 
-// The launch/attach/detach/reattach/teardown choreography lives in `session`;
-// `commands::session` reaches these accessors through the backend module.
-pub(crate) use session::{
-    kill_session, opencode_http, reattach, score_in_sandbox, server_events_file, workspace_path,
+// The control verbs (attach/teardown/§0 accessors) are driven through the
+// `LiveSession` plane (`LibkrunLiveSession`); only the one-shot grader, which has
+// no session record to dispatch on, is still reached directly.
+pub(crate) use session::{score_in_sandbox, LibkrunLiveSession};
+
+// Host-capability probes shared by `doctor` and the launch preflight.
+pub(crate) use host::{
+    disk_headroom, runtime_deps_present, virtualization_available, MIN_HEADROOM_BYTES,
 };
 
 use crate::agents::AgentSpec;

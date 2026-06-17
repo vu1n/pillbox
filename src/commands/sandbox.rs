@@ -28,6 +28,7 @@ use crate::contract::{
 };
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
+use crate::sandbox::{docker::DockerBackend, SandboxBackend};
 use crate::sandboxes::{self, Sandbox, BACKEND_DOCKER};
 use crate::{docker, session};
 
@@ -46,6 +47,26 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: SandboxAction) -> Result<()> 
     }
 }
 
+/// The sandbox group (`spawn`/`exec`/`agent`) needs a long-lived exec target —
+/// the `long_lived_exec` capability, which only the Docker backend provides
+/// (the libkrun microVM is one-shot). Independent of the run-path default
+/// (`select_backend`), this group always runs on Docker. The guard sources that
+/// dependence from the capability rather than a bare backend string, so the
+/// default flip to libkrun can't silently strand `sandbox spawn` on a backend
+/// that lacks the exec channel. Docker daemon/image health is a separate probe
+/// (`docker::check_ready_for`, run right after).
+fn require_long_lived_exec_backend() -> Result<()> {
+    if DockerBackend.capabilities().long_lived_exec {
+        return Ok(());
+    }
+    Err(PillboxError::resource(
+        "sandbox",
+        "the sandbox group needs the docker backend (long-lived exec)",
+    )
+    .with_next("use `pillbox run` (the microVM run path)")
+    .into())
+}
+
 fn spawn(
     resolved: &Pillbox,
     image: Option<String>,
@@ -53,6 +74,7 @@ fn spawn(
     workspace: Option<PathBuf>,
     label: Option<String>,
 ) -> Result<()> {
+    require_long_lived_exec_backend()?;
     let image = match image {
         Some(i) => {
             docker::check_ready(&i)?;

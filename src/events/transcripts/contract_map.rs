@@ -41,14 +41,18 @@ pub(super) fn to_payloads(event: &TranscriptEvent) -> Vec<Payload> {
             if let Some(u) = usage {
                 out.push(Payload::Usage(usage_payload(id, u)));
             }
-            // `end_turn` is the harness's explicit "I finished my turn, awaiting
-            // input" marker — the attention signal a front-end (orca / lum /
-            // Slack) flashes or seeks-input on. pillbox only *produces* it onto
-            // the log/`subscribe` stream; the front-end owns how to surface it.
+            // Any terminal stop reason other than `tool_use` (which continues the
+            // turn with a tool call) means the agent finished and awaits input —
+            // the NeedsInput signal a front-end (orca / lum / Slack) flashes on and
+            // `wait-idle` unblocks on. Must match `synth.rs`'s `turn_ended`:
+            // `end_turn`, `stop_sequence`, and `max_tokens` all end the turn (a
+            // missing reason is "not yet"). Keying only on `end_turn` would hang
+            // `wait-idle` on a turn that stopped via a stop sequence or the token
+            // cap. pillbox only *produces* the signal; the front-end surfaces it.
             // (The ambiguous mid-tool "blocked on permission" case — which a
             // quiescence timer can't tell from a slow tool — is the OSC/hook
             // channel's job, deferred.)
-            if stop_reason.as_deref() == Some("end_turn") {
+            if stop_reason.as_deref().is_some_and(|r| r != "tool_use") {
                 out.push(Payload::AttentionRequired(AttentionRequired {
                     reason: AttentionReason::NeedsInput,
                     message: String::new(),
@@ -220,6 +224,26 @@ mod tests {
                 .any(|p| matches!(p, Payload::AttentionRequired(_))),
             "no attention signal mid-turn (tool_use): {mid_turn:?}"
         );
+
+        // A non-`end_turn` terminal reason (stop_sequence / max_tokens) ALSO ends
+        // the turn and must emit the signal — else `wait-idle` hangs (the live
+        // libkrun PTY smoke caught exactly this when claude stopped via a stop
+        // sequence). Matches `synth.rs::turn_ended`.
+        for terminal in ["stop_sequence", "max_tokens"] {
+            let ended = to_payloads(&event(EventKind::AssistantText {
+                text: "done".into(),
+                model: None,
+                usage: None,
+                stop_reason: Some(terminal.into()),
+            }));
+            assert!(
+                matches!(
+                    ended.last(),
+                    Some(Payload::AttentionRequired(a)) if a.reason == AttentionReason::NeedsInput
+                ),
+                "terminal stop_reason `{terminal}` must emit NeedsInput: {ended:?}"
+            );
+        }
     }
 
     #[test]

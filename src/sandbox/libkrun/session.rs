@@ -22,19 +22,38 @@ use crate::agents::{
 use crate::attach::pump;
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
-use crate::sandbox::SandboxBackend;
+use crate::sandbox::{Caps, SandboxBackend};
 use crate::startup::StartupTimer;
 use crate::workspace::WorkspaceBackend;
 
 // VMM substrate kept in the parent module (used here AND by `vmm_child_main`):
 // spec types, the CoW/stub/rootfs helpers, the cache dir, and shared consts.
 use super::{
-    boot, cow_clone_and_scrub, cow_clone_home, egress, http, krun_cache_dir, materialize_rootfs,
-    shell_quote, stub_oauth_creds, unsupported, EgressSpec, LibkrunBackend, Share, SwapPair,
-    VmSpec, VsockAttach, GUEST_CA_PATH,
+    boot, cow_clone_and_scrub, cow_clone_home, disk_headroom, egress, http, krun_cache_dir,
+    materialize_rootfs, runtime_deps_present, shell_quote, stub_oauth_creds, unsupported,
+    EgressSpec, LibkrunBackend, Share, SwapPair, VmSpec, VsockAttach, GUEST_CA_PATH,
+    MIN_HEADROOM_BYTES,
 };
 
 impl SandboxBackend for LibkrunBackend {
+    /// The microVM family: KVM-isolation features are uniquely libkrun's
+    /// (real egress fence, in-sandbox grading, detached vault, post-hoc ingest).
+    /// `pty_drive` drives the guest pty-host over the persistent attach socket;
+    /// `live_pty_tail` tails the agent's transcript out of the host-readable
+    /// creds clone. No long-lived exec target. See docs/substrate-plane.md.
+    fn capabilities(&self) -> Caps {
+        Caps {
+            pty_drive: true,
+            live_pty_tail: true,
+            server_mode: true,
+            long_lived_exec: false,
+            in_sandbox_grading: true,
+            real_egress_fence: true,
+            detached_vault: true,
+            post_hoc_ingest: true,
+        }
+    }
+
     fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
         // Server-integration agents run headless + are driven/read over their HTTP
         // API through a vsock port-forward — a distinct path with no PTY (mirrors
@@ -103,14 +122,14 @@ impl SandboxBackend for LibkrunBackend {
             .with_context(|| format!("bind attach socket {}", launch.attach_sock.display()))?;
         listener.set_nonblocking(true).ok();
 
-        let mut child = Command::new(&exe)
-            .arg("__krun-vmm")
+        let mut cmd = Command::new(&exe);
+        cmd.arg("__krun-vmm")
             .arg(launch.spec_file.path())
             .env_clear()
             .envs(boot::static_child_env())
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .context("spawn the libkrun VMM subprocess")?;
+            .stdin(std::process::Stdio::piped());
+        vmm_own_process_group(&mut cmd);
+        let mut child = cmd.spawn().context("spawn the libkrun VMM subprocess")?;
 
         // Hand the real credentials to the child's MITM out-of-band on stdin — the
         // reals never touch the guest env, argv, or the VmSpec file. Closing the
@@ -158,7 +177,7 @@ impl SandboxBackend for LibkrunBackend {
             }
             Err(e) => Err(e),
         };
-        let _ = child.wait();
+        let status = child.wait().ok();
         // Final drain of the agent's last transcript lines into the SessionLog.
         if let Some(tailer) = tailer {
             tailer.shutdown();
@@ -167,6 +186,14 @@ impl SandboxBackend for LibkrunBackend {
         let _ = std::fs::remove_file(&launch.attach_sock);
         let _ = std::fs::remove_dir_all(&launch.creds_share);
         let _ = std::fs::remove_dir_all(&launch.workspace_clone);
+        // A SIGABRT'd VMM is the missing-runtime-dep footgun (`brew cleanup` swept
+        // libkrun's undeclared dylibs). The attach/pump already failed with an
+        // opaque "VMM exited" — replace it with the actionable cause when we can.
+        if outcome.is_err() {
+            if let Some(deps_err) = sigabrt_boot_error(status) {
+                return Err(deps_err);
+            }
+        }
         match outcome? {
             pump::Outcome::Exited(code) if code != 0 => std::process::exit(code),
             _ => Ok(()),
@@ -297,6 +324,10 @@ fn launch_base(
     resolved: &Pillbox,
     ca_lifetime: CaLifetime,
 ) -> Result<LaunchBase> {
+    // Disk-pressure guard: the rootfs materialize + CoW workspace/creds clones
+    // below all allocate on the krun cache fs. Below the floor a boot stalls
+    // half-allocated rather than failing — so refuse loudly here, before any clone.
+    disk_preflight()?;
     let rootfs = materialize_rootfs(resolved)?;
 
     let home = spec.home_dir(resolved)?;
@@ -571,14 +602,16 @@ fn run_detached(
         .context("persist VMM spec for detach")?;
 
     let exe = std::env::current_exe().context("locate the pillbox binary to re-exec as VMM")?;
-    let mut child = Command::new(&exe)
-        .arg("__krun-vmm")
+    let mut cmd = Command::new(&exe);
+    cmd.arg("__krun-vmm")
         .arg(&spec_path)
         .env_clear()
         .envs(boot::static_child_env())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    vmm_own_process_group(&mut cmd);
+    let mut child = cmd
         .spawn()
         .context("spawn the detached libkrun VMM subprocess")?;
 
@@ -786,16 +819,16 @@ fn launch_server_vm(
 
     // Spawn the VM detached (it runs the server + relay, reparented to init).
     let exe = std::env::current_exe().context("locate the pillbox binary to re-exec as VMM")?;
-    let mut child = Command::new(&exe)
-        .arg("__krun-vmm")
+    let mut cmd = Command::new(&exe);
+    cmd.arg("__krun-vmm")
         .arg(&spec_path)
         .env_clear()
         .envs(boot::static_child_env())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .context("spawn the libkrun VMM subprocess")?;
+        .stderr(std::process::Stdio::null());
+    vmm_own_process_group(&mut cmd);
+    let mut child = cmd.spawn().context("spawn the libkrun VMM subprocess")?;
     // No swap pairs (non-vault): hand the child's MITM an empty set + EOF.
     if let Some(mut sin) = child.stdin.take() {
         use std::io::Write as _;
@@ -879,12 +912,19 @@ fn launch_server_vm(
             // we don't leave a zombie and don't race the dying child's virtio-fs
             // mounts on the clones we're removing. (The success path leaves the
             // child running, reparented; `kill_session` reaps that one by pid.)
+            // Read the child's own status FIRST: a SIGABRT'd-at-boot VMM (the swept
+            // runtime-dep footgun) has already exited, and our `kill` would otherwise
+            // clobber that status with SIGKILL and mask the actionable cause.
+            let self_status = child.try_wait().ok().flatten();
             let _ = child.kill();
             let _ = child.wait();
             let _ = std::fs::remove_file(&host_sock);
             let _ = std::fs::remove_file(&spec_path);
             let _ = std::fs::remove_dir_all(&creds_share);
             let _ = std::fs::remove_dir_all(&clone);
+            if let Some(deps_err) = sigabrt_boot_error(self_status) {
+                return Err(deps_err);
+            }
             return Err(e);
         }
     };
@@ -1113,6 +1153,9 @@ pub(crate) fn score_in_sandbox(
     egress_allow: &[String],
 ) -> Result<(i32, String)> {
     use std::io::Read as _;
+    // Same disk-pressure guard as the run path: the grader VM materializes the
+    // rootfs and mounts the workspace clone — refuse below the floor, not mid-boot.
+    disk_preflight()?;
     let rootfs = materialize_rootfs(resolved)?;
 
     // Egress is opt-in: an empty allowlist keeps the bare/offline grader. When
@@ -1205,8 +1248,8 @@ pub(crate) fn score_in_sandbox(
     serde_json::to_writer(&spec_file, &vmspec).context("write grader VMM spec")?;
 
     let exe = std::env::current_exe().context("locate the pillbox binary to re-exec as VMM")?;
-    let mut child = Command::new(&exe)
-        .arg("__krun-vmm")
+    let mut cmd = Command::new(&exe);
+    cmd.arg("__krun-vmm")
         .arg(spec_file.path())
         // No secrets reach the grader — only a minimal guest env for the toolchain
         // (plus CA-bundle pointers when egress is on; all non-secret). The base env
@@ -1219,9 +1262,9 @@ pub(crate) fn score_in_sandbox(
         // — null → EOF → empty swap (the MITM forwards untouched). No creds.
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null()) // VMM diagnostics; the grade's output is the guest console (stdout)
-        .spawn()
-        .context("spawn the grader VMM subprocess")?;
+        .stderr(std::process::Stdio::null()); // VMM diagnostics; the grade's output is the guest console (stdout)
+    vmm_own_process_group(&mut cmd);
+    let mut child = cmd.spawn().context("spawn the grader VMM subprocess")?;
     let mut out = String::new();
     if let Some(mut so) = child.stdout.take() {
         so.read_to_string(&mut out).ok();
@@ -1267,6 +1310,43 @@ pub(crate) fn reattach(resolved: &Pillbox, session: &crate::session::Session) ->
     }
 }
 
+/// How long to let a buffered `Input` frame traverse socket → guest pty-host →
+/// PTY before closing — mirrors the docker driver's settle. All in-VM once the
+/// frame is written (libkrun bridges the unix socket straight to the guest's
+/// listening pty-host, no exec cold-start), so it's short.
+const SEND_SETTLE: Duration = Duration::from_millis(300);
+
+/// Drive a detached PTY session: dial its persistent attach socket, write one
+/// `Frame::Input` (bytes as if typed), drain the pty-host's on-connect `Snapshot`
+/// then settle briefly so the guest forwards the input to the PTY before the
+/// socket closes, then close. The `SendInput` half of the drive surface; the guest
+/// pty-host (`run_vsock` listen-loop) accepts this transient connection and writes
+/// the frame to the PTY. A dead/refused socket surfaces as a `connect` error.
+///
+/// The guest accept loop is serial (`serve_blocking`), so a `send` to an
+/// *unattended* detached session (the IDE drive + §0-read keystone) lands at once.
+/// A `send` *while a terminal is separately attached* contends with that pump and
+/// may be DROPPED, not merely queued: the bytes sit in the socket buffer but the
+/// serial loop won't accept this connection until the attached client leaves, and
+/// the socket is torn down after the bounded settle below. Concurrent
+/// drive-while-attached needs a threaded accept loop.
+fn pty_send(sock: &str, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    let mut stream =
+        UnixStream::connect(sock).with_context(|| format!("connect attach socket {sock}"))?;
+    crate::attach::driver::send_input(&mut stream, bytes).context("frame the session input")?;
+    stream.flush().ok();
+    // The pty-host sends an on-connect `Snapshot` to every client (see
+    // [`crate::attach::host`]); drain it so the guest's read side has run far
+    // enough to also pull our queued `Input` before we tear the socket down.
+    stream
+        .set_read_timeout(Some(SEND_SETTLE))
+        .context("bound the snapshot drain")?;
+    let _ = crate::attach::frame::Frame::decode(&mut stream);
+    std::thread::sleep(SEND_SETTLE);
+    Ok(())
+}
+
 /// Tear down a detached libkrun session: kill the VMM child (the VM + egress +
 /// MITM go with it), scrub the persisted socket/spec/CoW clones, drop the record.
 pub(crate) fn kill_session(resolved: &Pillbox, session: &crate::session::Session) -> Result<()> {
@@ -1278,7 +1358,7 @@ pub(crate) fn kill_session(resolved: &Pillbox, session: &crate::session::Session
     }
     let handle = LibkrunHandle::decode(session)?;
     if handle.pid > 0 {
-        unsafe { libc::kill(handle.pid, libc::SIGKILL) };
+        kill_vmm_group(&handle);
     }
     let _ = std::fs::remove_file(&handle.sock);
     let _ = std::fs::remove_file(&handle.spec);
@@ -1291,8 +1371,146 @@ pub(crate) fn kill_session(resolved: &Pillbox, session: &crate::session::Session
         Some(session),
     );
     crate::session::delete(resolved, &session.id)?;
+    // No host-wide `__krun-vmm` sweep: a reparented VMM carries no per-pillbox
+    // attribution, so a scan can't distinguish a dead local orphan from another
+    // pillbox's *live* VM. We only kill the group we can prove is ours (above).
     println!("pillbox: ✓ session `{}` removed.", session.id);
     Ok(())
+}
+
+/// SIGKILL the VMM child's process group — but only after proving the group is
+/// genuinely ours, so a recycled `handle.pid` can never make us signal an
+/// unrelated group.
+///
+/// killpg, not kill: the VMM child is its own group leader (setsid at spawn), and
+/// `krun_start_enter` may fork a `__krun-vmm` VMM subprocess that survives a
+/// pid-only SIGKILL — signalling the whole group reaps both. `handle.pid` is the
+/// group id (== leader pid after setsid).
+///
+/// Attribution: `handle.spec` is this session's spec-file path, unique per
+/// session and present in the VMM child's argv (it's the `__krun-vmm <spec>`
+/// argument). We confirm `handle.pid` is alive AND its command line carries that
+/// path before the group kill. If the pid is gone or recycled to a process whose
+/// argv lacks our spec path, we do nothing — the VM is already down (or the pid
+/// belongs to something else), and a speculative killpg there is exactly the
+/// cross-group hazard we're guarding against.
+fn kill_vmm_group(handle: &LibkrunHandle) {
+    if vmm_pid_owns_spec(handle.pid, &handle.spec) {
+        unsafe { libc::killpg(handle.pid, libc::SIGKILL) };
+    }
+}
+
+/// True iff `pid` is a live `__krun-vmm` process whose argv contains `spec` (the
+/// per-session spec-file path) — the proof a group is ours before `killpg`. A
+/// `ps` read scoped to the one pid; empty/non-matching output (process gone, pid
+/// recycled, or `ps` unavailable) ⇒ `false`, i.e. don't kill.
+fn vmm_pid_owns_spec(pid: i32, spec: &str) -> bool {
+    let Ok(out) = Command::new("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .output()
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let cmdline = String::from_utf8_lossy(&out.stdout);
+    cmdline.contains("__krun-vmm") && cmdline.contains(spec)
+}
+
+/// Spawn the VMM child as its own session+group leader, so the whole group (this
+/// `__krun-vmm` process plus any VMM subprocess `krun_start_enter` forks) can be
+/// reaped together by `killpg` on teardown — a pid-only kill strands the fork.
+/// `setsid` also detaches the child from the launching CLI's controlling terminal,
+/// which is correct on every path: the guest console rides the vsock attach
+/// channel (PTY) or the agent's HTTP API (server), never this terminal.
+fn vmm_own_process_group(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+    // SAFETY: `pre_exec` runs in the forked child before `exec`; the closure must be
+    // async-signal-safe and touch no shared state. `setsid()` is a single bare
+    // syscall meeting both; `io::Error::last_os_error` reads `errno` (no alloc).
+    // A failed `setsid` would leave the child in the CLI's own group — then a
+    // `killpg(handle.pid)` would both miss the VMM and risk signalling the CLI's
+    // group — so fail the spawn loudly instead of proceeding into that hazard.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Refuse a launch when the krun cache filesystem is below the headroom floor —
+/// the disk-pressure guard. A boot that runs out of space mid-allocation stalls a
+/// half-built VM rather than failing cleanly; fail fast and loud instead.
+/// `disk_headroom` returns 0 (== "unknown") on stat failure, which we treat as not
+/// below the floor: an unstattable cache dir is a different problem the materialize
+/// step surfaces, not a reason to block an otherwise-fine host here.
+fn disk_preflight() -> Result<()> {
+    let cache = krun_cache_dir()?;
+    headroom_check(disk_headroom(&cache), MIN_HEADROOM_BYTES, &cache)
+}
+
+/// The pure decision behind [`disk_preflight`] (split out so it's unit-testable
+/// without a real low-disk fs): `Err` when `free` is below `floor`, naming the
+/// shortfall and the fix. `free == 0` is "unknown" (a stat failure), not below the
+/// floor — see [`disk_preflight`].
+fn headroom_check(free: u64, floor: u64, cache: &Path) -> Result<()> {
+    if free > 0 && free < floor {
+        return Err(PillboxError::runtime(
+            "run",
+            format!(
+                "low disk headroom on the krun cache ({}): {} free, need {} — a microVM boot \
+                 would stall half-allocated",
+                cache.display(),
+                human_bytes(free),
+                human_bytes(floor),
+            ),
+        )
+        .with_next("free space on that filesystem, then retry")
+        .into());
+    }
+    Ok(())
+}
+
+/// Map a VMM child that died by `SIGABRT` at boot to an actionable error, or `None`
+/// for any other exit. `SIGABRT` is the loader aborting the VMM — almost always
+/// libkrun's *undeclared* runtime dylibs (`libepoxy`, `MoltenVK`) swept by a `brew
+/// cleanup`. Surface the deps fix when the probe confirms it; otherwise a generic
+/// "VMM aborted at boot" naming the deps as the likely cause (the probe can't see
+/// a dep that's present-but-broken). Does not swallow — the run already failed;
+/// this only makes the *why* legible instead of an opaque signal death.
+fn sigabrt_boot_error(status: Option<std::process::ExitStatus>) -> Option<anyhow::Error> {
+    use std::os::unix::process::ExitStatusExt as _;
+    if status?.signal() != Some(libc::SIGABRT) {
+        return None;
+    }
+    let err = match runtime_deps_present() {
+        Err(reason) => {
+            PillboxError::runtime("run", format!("the libkrun VMM aborted at boot ({reason})"))
+                .with_next("brew install libepoxy molten-vk")
+        }
+        Ok(()) => PillboxError::runtime(
+            "run",
+            "the libkrun VMM aborted at boot (SIGABRT) — the likely cause is missing runtime \
+             deps swept by `brew cleanup`",
+        )
+        .with_next("brew install libepoxy molten-vk"),
+    };
+    Some(err.into())
+}
+
+/// Human-readable bytes for an operator-facing error (GiB/MiB, one decimal).
+fn human_bytes(n: u64) -> String {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
+    if n >= GIB {
+        format!("{:.1} GiB", n as f64 / GIB as f64)
+    } else {
+        format!("{:.1} MiB", n as f64 / MIB as f64)
+    }
 }
 
 /// vsock port the guest pty-host dials for the attach channel.
@@ -1325,5 +1543,317 @@ fn accept_attach(listener: &UnixListener, child: &mut std::process::Child) -> Re
             bail!("timed out waiting for the guest pty-host to connect");
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The libkrun [`LiveSession`](crate::sandbox::LiveSession) — a detached/server
+/// microVM the command layer drives and reads without branching on the backend.
+/// A thin adapter over the existing free fns (the proven transport), so the plane
+/// gains no new libkrun behavior, only one polymorphic surface. Holds a cloned
+/// [`Session`](crate::session::Session); the [`LibkrunHandle`] is decoded on
+/// demand from its `sandbox_id`.
+pub(crate) struct LibkrunLiveSession {
+    session: crate::session::Session,
+}
+
+impl crate::sandbox::LiveSession for LibkrunLiveSession {
+    fn caps(&self) -> Caps {
+        LibkrunBackend.capabilities()
+    }
+
+    fn send(&self, bytes: &[u8]) -> Result<()> {
+        // A server agent's prompt goes over its HTTP API (`http`), never the PTY.
+        if self.session.integration() == Integration::Server {
+            return Err(self.caps().unsupported("send"));
+        }
+        pty_send(&LibkrunHandle::decode(&self.session)?.sock, bytes)
+    }
+
+    fn attach(&self, resolved: &Pillbox) -> Result<()> {
+        reattach(resolved, &self.session)
+    }
+
+    fn event_source(
+        &self,
+        resolved: &Pillbox,
+    ) -> Result<(
+        Box<dyn crate::events::source::EventSource + Send>,
+        Option<crate::events::transcripts::TailerHandle>,
+    )> {
+        // A detached PTY session has no reparented §0 producer, so each reader spawns
+        // its own transcript tailer — two concurrent readers (`watch`+`subscribe`)
+        // would double-write the log, and a never-watched session captures nothing.
+        // The single-reader IDE drive+read keystone is unaffected.
+        let source = crate::events::source::open_event_source(resolved, &self.session.id)?;
+        // A producer already draining the capture into the log keeps the source
+        // current; a second drainer would double-write every event (fresh seqs).
+        if crate::commands::session::detached_tailer_alive(resolved, &self.session) {
+            return Ok((source, None));
+        }
+        let log = crate::events::log::SessionLog::open(resolved, &self.session.id)?;
+        let tailer = if self.session.integration() == Integration::Server {
+            // A server agent persists its event capture to a host file in the CoW
+            // creds clone; tail that (SSE/NDJSON → the durable log).
+            Some(self.server_file_tailer(log)?)
+        } else {
+            // A PTY agent's transcript lands in the host-readable creds clone
+            // (`handle.creds`, the agent home the guest mounts); tail it with the
+            // same producer the foreground PTY run uses, just pointed at the
+            // persisted clone instead of the live auth home.
+            let handle = LibkrunHandle::decode(&self.session)?;
+            let tailer = crate::events::transcripts::spawn_attach_tailer(
+                log,
+                Path::new(&handle.creds),
+                &self.session.agent_id,
+                &self.session.guest_cwd,
+                &self.session.id,
+            );
+            // `None` means this agent has no transcript parser, so there's no live
+            // tail even though the backend advertises one — surface it rather than
+            // silently serving only the existing log.
+            if tailer.is_none() {
+                eprintln!(
+                    "pillbox: note: `{}` has no transcript parser; serving the existing log without a live tail",
+                    self.session.agent_id
+                );
+            }
+            tailer
+        };
+        Ok((source, tailer))
+    }
+
+    fn http(&self) -> Result<Box<dyn crate::sandbox::http::SandboxHttp>> {
+        // Only a server-mode agent runs an in-guest HTTP server to talk to; a PTY
+        // agent has none, so the verb is unsupported rather than handing back a
+        // handle to a port nothing listens on.
+        if self.session.integration() != Integration::Server {
+            return Err(self.caps().unsupported("http"));
+        }
+        opencode_http(&self.session)
+    }
+
+    fn workspace_path(&self) -> Result<PathBuf> {
+        workspace_path(&self.session)
+    }
+
+    fn ingest(&self, resolved: &Pillbox) -> Result<usize> {
+        // Post-hoc trajectory drain: the reparented guest's persisted capture is read
+        // to EOF into the durable log. Only a server agent produces that capture.
+        if self.session.integration() != Integration::Server {
+            return Err(PillboxError::usage(
+                "session ingest",
+                format!(
+                    "ingest applies to server-mode sessions; `{}` is not one",
+                    self.session.agent_id
+                ),
+            )
+            .into());
+        }
+        // If the detached §0 producer is still draining the capture live, the log is
+        // already current — draining again would duplicate every event.
+        if crate::commands::session::detached_tailer_alive(resolved, &self.session) {
+            return Ok(0);
+        }
+        // A plain `File` (not the follow reader) — the drain returns at EOF rather
+        // than tailing, and the never-set stop flag is meaningless on this path.
+        let path = server_events_file(&self.session)?;
+        let format = self.events_format()?;
+        let file = std::fs::File::open(&path).map_err(|e| {
+            PillboxError::runtime(
+                "session ingest",
+                format!("open events file {}: {e}", path.display()),
+            )
+            .with_next("the session may not have produced any §0 events yet")
+        })?;
+        let mut log = crate::events::log::SessionLog::open(resolved, &self.session.id)?;
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        crate::events::drain_server_capture(format, file, &self.session.id, &mut log, &stop)
+    }
+
+    fn kill(&self, resolved: &Pillbox) -> Result<()> {
+        kill_session(resolved, &self.session)
+    }
+}
+
+impl LibkrunLiveSession {
+    pub(crate) fn new(session: crate::session::Session) -> Self {
+        Self { session }
+    }
+
+    /// The server agent's capture wire format, resolved from its
+    /// [`ServerProfile`](crate::agents::ServerProfile) — the drain-dispatch axis
+    /// (SSE vs NDJSON), shared by [`event_source`](Self::event_source) and
+    /// [`ingest`](Self::ingest) so the format→drain mapping lives in one place.
+    fn events_format(&self) -> Result<crate::events::EventsFormat> {
+        let spec = crate::agents::lookup("session", &self.session.agent_id)?;
+        spec.server.map(|p| p.events_format).ok_or_else(|| {
+            PillboxError::usage(
+                "session",
+                format!("`{}` is not a server-mode agent", self.session.agent_id),
+            )
+            .into()
+        })
+    }
+
+    /// Tail a server session's persistent event-capture file (replay + follow via
+    /// [`FollowReader`](crate::events::opencode::FollowReader)) into the log on a
+    /// background thread. The gateway-free, complete-capture source: a late watcher
+    /// still gets the whole history because the file persisted. The returned
+    /// [`TailerHandle`](crate::events::transcripts::TailerHandle) flips the shared
+    /// stop flag to end the follow.
+    fn server_file_tailer(
+        &self,
+        log: crate::events::log::SessionLog,
+    ) -> Result<crate::events::transcripts::TailerHandle> {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let path = server_events_file(&self.session)?;
+        let format = self.events_format()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+        let sid = self.session.id.clone();
+        let join = std::thread::spawn(move || {
+            let mut log = log;
+            let reader = crate::events::opencode::FollowReader::new(path, Arc::clone(&stop_thread));
+            if let Err(e) =
+                crate::events::drain_server_capture(format, reader, &sid, &mut log, &stop_thread)
+            {
+                eprintln!("pillbox: warning: server events drain stopped: {e:#}");
+            }
+        });
+        Ok(crate::events::transcripts::TailerHandle::from_flag(
+            stop, join,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sandbox::LiveSession;
+    use crate::session::{Session, BACKEND_LIBKRUN};
+
+    /// A libkrun-backed [`Session`] over a PTY agent (claude), carrying a decodable
+    /// [`LibkrunHandle`] whose paths point nowhere real — enough for `send`/
+    /// `event_source` to reach past the capability check into the transport without
+    /// a live VM. The creds path is absent on disk; the transcript tailer's
+    /// discovery tolerates a not-yet-created dir.
+    fn libkrun_pty_session() -> Session {
+        let mut s = Session::test_fixture();
+        s.backend = BACKEND_LIBKRUN.to_string();
+        s.sandbox_id = serde_json::to_string(&LibkrunHandle {
+            sock: "/nonexistent/pillbox-test-attach.sock".to_string(),
+            pid: 0,
+            creds: "/nonexistent/pillbox-test-creds".to_string(),
+            workspace: "/nonexistent/pillbox-test-workspace".to_string(),
+            spec: "/nonexistent/pillbox-test-spec.json".to_string(),
+        })
+        .unwrap();
+        s
+    }
+
+    #[test]
+    fn pty_drive_and_live_tail_caps_are_on() {
+        let caps = LibkrunBackend.capabilities();
+        assert!(
+            caps.pty_drive,
+            "libkrun drives the guest pty-host over the attach socket — pty_drive must be true"
+        );
+        assert!(
+            caps.live_pty_tail,
+            "libkrun tails the PTY transcript from the creds clone — live_pty_tail must be true"
+        );
+        assert!(
+            caps.in_sandbox_grading,
+            "libkrun is the microVM family — in_sandbox_grading must be true"
+        );
+    }
+
+    #[test]
+    fn pty_send_is_no_longer_capability_unsupported() {
+        // The PTY `send` now reaches the transport: with an undecodable handle it
+        // fails at the handle decode (or the socket connect), NOT at the old
+        // `caps().unsupported("send")` short-circuit. (Byte delivery to a live PTY
+        // is the live smoke's job — this only proves the verb is wired.)
+        let live = LibkrunLiveSession::new(libkrun_pty_session());
+        let err = live.send(b"hi").unwrap_err().to_string();
+        assert!(
+            !err.contains("isn't supported on this backend"),
+            "PTY send must no longer be capability-unsupported, got: {err}"
+        );
+    }
+
+    #[test]
+    fn pty_event_source_is_no_longer_capability_unsupported() {
+        // The PTY `event_source` now spawns the creds-clone transcript tailer
+        // instead of rejecting the verb. Run under an isolated $HOME so the log it
+        // opens (and the discovery tailer it spawns) land in a tempdir, not the
+        // real global pillbox. The `Ok` variant holds trait objects (no `Debug`),
+        // so match rather than `unwrap`.
+        crate::test_util::with_isolated_home("libkrun-pty-event-source", || {
+            let live = LibkrunLiveSession::new(libkrun_pty_session());
+            match live.event_source(&crate::pillbox::global()) {
+                // The tailer handle drops at end of scope, stopping the discovery
+                // thread; no live socket is touched.
+                Ok((_source, _tailer)) => {}
+                Err(e) => panic!("a PTY session's event_source must now be supported, got: {e}"),
+            }
+        });
+    }
+
+    #[test]
+    fn headroom_check_below_floor_is_a_loud_error() {
+        let cache = Path::new("/fake/krun/cache");
+        // 1 GiB free under a 2 GiB floor → refuse, naming the shortfall + the fix.
+        let err = headroom_check(1024 * 1024 * 1024, MIN_HEADROOM_BYTES, cache)
+            .expect_err("below the floor must error");
+        let msg = err.to_string();
+        assert!(msg.contains("low disk headroom"), "names the cause: {msg}");
+        assert!(msg.contains("free space"), "carries the Next fix: {msg}");
+    }
+
+    #[test]
+    fn headroom_check_at_or_above_floor_passes() {
+        let cache = Path::new("/fake/krun/cache");
+        assert!(headroom_check(MIN_HEADROOM_BYTES, MIN_HEADROOM_BYTES, cache).is_ok());
+        assert!(headroom_check(MIN_HEADROOM_BYTES + 1, MIN_HEADROOM_BYTES, cache).is_ok());
+    }
+
+    #[test]
+    fn headroom_check_unknown_zero_does_not_block() {
+        // 0 == "stat failed / unknown" — not a reason to refuse an otherwise-fine host.
+        let cache = Path::new("/fake/krun/cache");
+        assert!(headroom_check(0, MIN_HEADROOM_BYTES, cache).is_ok());
+    }
+
+    #[test]
+    fn sigabrt_status_maps_to_deps_error() {
+        use std::os::unix::process::ExitStatusExt as _;
+        // A wait-status whose low byte is the signal number → `signal() == SIGABRT`.
+        let status = std::process::ExitStatus::from_raw(libc::SIGABRT);
+        let err = sigabrt_boot_error(Some(status)).expect("SIGABRT must map to an error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("aborted at boot"),
+            "names the abort cause: {msg}"
+        );
+    }
+
+    #[test]
+    fn non_sigabrt_status_is_not_mapped() {
+        use std::os::unix::process::ExitStatusExt as _;
+        // A clean exit and a different signal both pass through unmapped — only the
+        // boot-abort footgun gets the deps hint.
+        assert!(sigabrt_boot_error(Some(std::process::ExitStatus::from_raw(0))).is_none());
+        assert!(
+            sigabrt_boot_error(Some(std::process::ExitStatus::from_raw(libc::SIGKILL))).is_none()
+        );
+        assert!(sigabrt_boot_error(None).is_none());
+    }
+
+    #[test]
+    fn human_bytes_formats_gib_and_mib() {
+        assert_eq!(human_bytes(2 * 1024 * 1024 * 1024), "2.0 GiB");
+        assert_eq!(human_bytes(512 * 1024 * 1024), "512.0 MiB");
     }
 }

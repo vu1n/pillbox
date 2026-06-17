@@ -10,8 +10,11 @@ what you want.
 > **⚠️ Direction note.** The **remote** backend plane has been **removed**:
 > the `remote add/list/info/rm` commands, `pillbox run --remote`, and the
 > `ssh://`/`e2b://`/`docker://` URL backends are gone. pillbox is now
-> **local-only**, with two local backends: **Docker** (default, cross-platform)
-> and **libkrun** (a local microVM, opt-in via `PILLBOX_BACKEND=libkrun`).
+> **local-only**, with two local backends: **libkrun** (a local microVM, the
+> default — needs KVM/HVF, and a `--features libkrun` build) and **Docker** (the
+> no-KVM **compat** backend, cross-platform, opt out to it via
+> `PILLBOX_BACKEND=docker`). A build compiled without `--features libkrun` is
+> always Docker.
 > "Remote" returns later as the managed/Cloudflare tier (a different shape). Its
 > §0-gateway substrate — a per-session Cloudflare Durable Object (seq authority +
 > actor attestation + driver arbitration + `subscribe` fan-out) — is already

@@ -265,32 +265,73 @@ Lean **(1) for the managed tier** to avoid rebuilding a commoditized boundary,
 (both of which the pooling story needs). Don't anchor differentiation on the
 vault — the daylight moved to the §0/multiplayer/eval layer (see [§Verdict](#verdict--research-backed)).
 
-### Sync model — DO+WS vs ElectricSQL Durable Streams
+### Sync model — the DO *is* a Durable Streams server
 
-The instinct that electric.ax is "for chat agents, not us" was *half* right and
-worth correcting precisely. ElectricSQL is **not** Postgres-CRUD-only: its
-**Durable Streams** (Dec 2025) / **Hosted Durable Streams** (Jan 2026) are a
-generic *append-only-log-over-HTTP* primitive — opaque monotonic offsets,
-offset-based late-join replay, SSE tailing — **structurally the same shape as
-§0**. They even published *"Durable Sessions — the key pattern for collaborative
-AI"* and a multiplayer-AI-chat demo. So it's a real candidate, not a category
-error.
+> **Updated 2026-06-17** — re-read the live Durable Streams `PROTOCOL.md`
+> against the original (2026-06-06) "noted alternative transport, not chosen"
+> verdict. The protocol grew the piece that verdict said it lacked, so the stance
+> below flips from "DO+WS *vs* Durable Streams" to "the DO *speaks* Durable
+> Streams." (Prompted by `withastro/flue` adopting it — see the adopter note.)
 
-**But it doesn't give the two things that make §0 §0:** a single-writer
-**logical `seq`** and **per-event `actor` attribution** — Durable Streams expose
-opaque *byte*-offsets, so the sequencer + attribution + driver-token arbitration
-would be **app-layer additions on top**. And its headline pitch (WS/SSE are
-ephemeral, no position-resume) is *weak against §0 specifically*, which already
-does position-resume (`subscribe --from SEQ`).
+The instinct that electric.ax is "for chat agents, not us" was a category error,
+now fully corrected. **Durable Streams** (Electric/ElectricSQL, the open
+`durable-streams/durable-streams` protocol, *"the data primitive for the agent
+loop"*) is an *append-only-log-over-HTTP* primitive — and it is **structurally
+§0**:
 
-**Decision: DO+WS is primary.** The DO gives the single-writer seq, the
-authenticated `actor`, *and* input/driver arbitration **natively** — exactly the
-parts Electric would make us rebuild. Durable Streams stays a noted alternative
-*transport* (durable, cacheable HTTP; resumable) worth revisiting if WS-on-deploy
-churn or read-fan-out cost bites — but adopting it reintroduces the very
-sequencer/attribution layer we'd be offloading. (Same verdict rules out
-Yjs/CRDTs — wrong model for a single-authority append-only log — and the managed
-sync engines Liveblocks/PartyKit/Convex/Zero as heavier than a per-session DO.)
+- `GET {stream}?offset=X[&live=long-poll|sse]` = catch-up replay then live tail;
+  `Stream-Next-Offset` is the resume cursor and the **server keeps no per-client
+  state** (the client persists its offset) — exactly `subscribe --from SEQ`.
+- Server-assigned **offsets are opaque, monotonic, strictly-increasing** — i.e. a
+  single-writer logical `seq`. (The 2026-06-06 "lacks single-writer seq" is now
+  wrong: the offset *is* the seq, and a DO assigning offsets in `transactionSync`
+  *is* the single-writer authority.)
+- **Idempotent producers** (`Producer-Id`/`Producer-Epoch`/`Producer-Seq`, server
+  state `(stream,producerId)→(epoch,lastSeq)`): a retry dedups, a **stale epoch is
+  fenced with `403`**, a seq gap returns `409`. This is **driver-token arbitration
+  as a wire primitive** — the zombie-fence is precisely what a live session needs
+  when a driver hands off across a DO deploy/migration.
+- **Forks** (`Stream-Forked-From` + `Stream-Fork-Offset`): a stream inherits its
+  source up to an offset then diverges, read transparently — the §0-log analog of
+  `pillbox fork` / dispatch fork-k worker lineage.
+- Offset-addressed URLs make **historical replay CDN-cacheable**, so one source
+  stream serves many readers (Slack + browser + orchestrator on one session)
+  cheaply — directly answering the subscribe-fan-out cost (Open Q #1).
+
+**What it still does *not* carry: per-event `actor`.** Attribution stays
+application-layer — so pillbox's gateway-stamped `actor` envelope and the §0
+payload vocab remain **ours** (the daylight, intact). That halves the original
+"adopting it reintroduces our layer": the seq + driver-fencing + resume are the
+protocol's; the attributed-multiplayer vocab is ours, layered on top.
+
+**Decision (revised): the Session DO conforms to Durable Streams.** Not "DO+WS
+*or* Electric" — the DO *implements* the DS protocol for the session's §0 stream:
+it assigns offsets (= `seq`) in `transactionSync`, accepts fenced idempotent
+producer writes (= driver arbitration), and serves `GET ?offset=`
+replay-then-tail (WS hibernation and DS `live=sse` are two live-tail transports of
+the *same* protocol). The wins: (a) **one read protocol local↔managed** — the
+local file-tail `subscribe` and the managed DO speak the same offset-resume
+contract; (b) driver arbitration gets a **proven design** (epoch fencing) instead
+of an invented one; (c) CDN-cacheable fan-out for free. We add `actor` + the
+payload vocab on top. (Cost: the DS offset/header contract is a public surface to
+conform to — bound it to the read/resume + producer-fencing paths; don't chase the
+full protocol, e.g. forks/`__ds` subscriptions, until a milestone needs them.)
+
+**Adopter signal:** `withastro/flue` (Fred Schott's TS agent-harness framework)
+adopted Durable Streams in v0.10.x as its event-streaming transport, *replacing*
+WebSocket/SSE — independent evidence the offset-resume shape is becoming the
+agent-loop streaming standard, not a one-vendor bet.
+
+**PartyKit — reference the ergonomics, skip the CRDT.** `cloudflare/partykit` is
+implementation sugar over the same DO+WS substrate, not a protocol: *PartyServer*
+(`onConnect`/`onMessage`/`broadcast`) is a nicer version of the DO-WS source the
+spike hand-rolls — a worked reference / possible boilerplate saver (a TS dep, not
+a drop-in for the Rust core). *PartySocket* (reconnect/buffer/resilient client) is
+the client half we lack, but DS's HTTP-offset resume largely obviates a stateful
+socket (resume = a fresh `GET ?offset=`). **Skip** *Y-PartyServer*/Yjs (a CRDT is
+the *opposite* of a single-authority ordered log — wrong model, confirms
+DO-as-sequencer-not-CRDT) and *partysub* (at-most-once delivery — strictly worse
+than DS replay; its cross-DO sharding is premature for one-session-per-DO).
 
 ---
 
@@ -298,6 +339,7 @@ sync engines Liveblocks/PartyKit/Convex/Zero as heavier than a per-session DO.)
 
 | Reuse (CF or ours) | Build (the daylight) |
 |---|---|
+| **Durable Streams protocol** (offset-resume read + producer-epoch fencing) — conform, don't invent | **actor** stamping + the §0 payload vocab *on top* of DS (DS carries neither) |
 | CF Container + Sandbox SDK (sandbox, PTY, exec, R2 fs) | The **Session DO**: §0 log + seq authority + actor auth |
 | The runner image (`pillbox-init`, pty-host, agents) — unchanged | The **`ManagedBackend`** trait adapter + `select_backend` arm |
 | `contract.rs` Event/Payload envelope + frame protocol | **actor + DO-assigned seq** (the deferred §0 primitives) |
@@ -368,7 +410,13 @@ So the happy path is one writer, not a consensus problem.
   a *live attached* session. Ordering is safe (storage-backed); but
   reconnect-and-replay-from-seq covering the **input/driver-token arbitration**
   cleanly across that window is **asserted-not-proven** — milestone 0/1 must
-  probe it (a deploy mid-drive shouldn't double-grant the driver token).
+  probe it (a deploy mid-drive shouldn't double-grant the driver token). **The
+  concrete mechanism is the Durable Streams producer fence** (see [§Sync
+  model](#sync-model--the-do-is-a-durable-streams-server)): a driver's writes
+  carry `(Producer-Id, Producer-Epoch, Producer-Seq)`; on reclaim the surviving
+  driver bumps its epoch, and the DO `403`-fences any write from the stale epoch.
+  So "don't double-grant the token" reduces to "the DO holds `(driver → epoch)`
+  in storage and rejects the loser" — a wire primitive, not an invented protocol.
 
 ---
 
@@ -473,9 +521,11 @@ measures risk #2. If it holds, the managed tier is real; if not, the wall is fou
 - **DO limits** are design-arounds, not blockers (10 GB cap → blobs to R2;
   ~1k req/s single-writer → fine for a low-write session; persist the seq;
   reconnect-replay on deploy). *Was OPEN #1.*
-- **Sync model** — DO+WS primary; electric.ax/Durable Streams is §0-shaped but
-  lacks single-writer seq + actor attribution, so it'd reintroduce our layer.
-  *Was OPEN #3.* (See [§Sync model](#sync-model--dows-vs-electricsql-durable-streams).)
+- **Sync model** — the **DO conforms to Durable Streams** (revised 2026-06-17):
+  the protocol now carries a single-writer seq (the offset) + producer-epoch
+  fencing (= driver arbitration), so the DO *implements* it rather than competing
+  with it; only per-event `actor` + the §0 payload vocab stay our layer on top.
+  *Was OPEN #3.* (See [§Sync model](#sync-model--the-do-is-a-durable-streams-server).)
 - **Defensibility** — the substrate (sandbox + container + credential proxy) is
   commoditized (Claude Managed Agents, May 2026). The defensible layer is
   **attributed multi-actor drive/attach + cross-backend §0 portability (local
@@ -518,6 +568,10 @@ measures risk #2. If it holds, the managed tier is real; if not, the wall is fou
 - ElectricSQL — [Durable Streams](https://electric-sql.com/blog/2025/12/09/announcing-durable-streams) ·
   [Hosted Durable Streams](https://electric-sql.com/blog/2026/01/22/announcing-hosted-durable-streams) ·
   [Durable Sessions for collaborative AI](https://electric-sql.com/blog/2026/01/12/durable-sessions-for-collaborative-ai)
+- Durable Streams protocol — [`durable-streams/durable-streams`](https://github.com/durable-streams/durable-streams) ·
+  [PROTOCOL.md](https://github.com/durable-streams/durable-streams/blob/main/PROTOCOL.md) ·
+  [durablestreams.com/concepts](https://durablestreams.com/concepts) (offsets, idempotent producers, forks, live=sse/long-poll) · *adopter:* [`withastro/flue`](https://github.com/withastro/flue) v0.10.x
+- [PartyKit](https://github.com/cloudflare/partykit) — PartyServer / PartySocket / partysub (DO+WS ergonomics reference; Yjs/partysub skipped)
 - Sync-engine comparisons — [ElectricSQL/Convex/Zero guide](https://merginit.com/blog/24082025-sync-engines-guide-electricsql-convex-zero) ·
   [Liveblocks/PartyKit/Hocuspocus](https://www.pkgpulse.com/guides/liveblocks-vs-partykit-vs-hocuspocus-realtime-2026)
 - [AI code sandbox benchmark 2026](https://www.superagent.sh/blog/ai-code-sandbox-benchmark-2026) ·

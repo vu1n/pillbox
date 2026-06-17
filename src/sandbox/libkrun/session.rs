@@ -22,7 +22,7 @@ use crate::agents::{
 use crate::attach::pump;
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
-use crate::sandbox::SandboxBackend;
+use crate::sandbox::{Caps, SandboxBackend};
 use crate::startup::StartupTimer;
 use crate::workspace::WorkspaceBackend;
 
@@ -35,6 +35,24 @@ use super::{
 };
 
 impl SandboxBackend for LibkrunBackend {
+    /// The microVM family: KVM-isolation features are uniquely libkrun's
+    /// (real egress fence, in-sandbox grading, detached vault, post-hoc ingest).
+    /// `pty_drive`/`live_pty_tail` are `false` until the vsock `send` +
+    /// `creds_share` transcript tailer are wired. No long-lived exec target.
+    /// See docs/substrate-plane.md.
+    fn capabilities(&self) -> Caps {
+        Caps {
+            pty_drive: false,
+            live_pty_tail: false,
+            server_mode: true,
+            long_lived_exec: false,
+            in_sandbox_grading: true,
+            real_egress_fence: true,
+            detached_vault: true,
+            post_hoc_ingest: true,
+        }
+    }
+
     fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
         // Server-integration agents run headless + are driven/read over their HTTP
         // API through a vsock port-forward — a distinct path with no PTY (mirrors

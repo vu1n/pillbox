@@ -9,7 +9,7 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 
-use super::SandboxBackend;
+use super::{Caps, SandboxBackend};
 use crate::agents::{
     base_docker_args_detached, resolve_run_env, resolve_with_entries, workspace_mount_name,
     AgentSpec, Integration, RunOpts, GUEST_HOME, GUEST_WORKSPACE,
@@ -40,6 +40,23 @@ impl Drop for ContainerGuard {
 }
 
 impl SandboxBackend for DockerBackend {
+    /// The container family: full PTY drive/read + long-lived exec, opencode
+    /// server mode. No KVM-isolation features (real fence, in-sandbox grade,
+    /// detached vault); drains §0 live, so no post-hoc ingest. See
+    /// docs/substrate-plane.md.
+    fn capabilities(&self) -> Caps {
+        Caps {
+            pty_drive: true,
+            live_pty_tail: true,
+            server_mode: true,
+            long_lived_exec: true,
+            in_sandbox_grading: false,
+            real_egress_fence: false,
+            detached_vault: false,
+            post_hoc_ingest: false,
+        }
+    }
+
     fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
         // Some server agents (codex-serve) only run on the libkrun backend — their
         // run path lives in the microVM. Reject on docker rather than mis-routing

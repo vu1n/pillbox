@@ -2,75 +2,57 @@
 //! streaming (spawning the transcript/event drain), serving it over WebSocket
 //! (`subscribe`), rendering it to the terminal (`watch`), and blocking until a
 //! turn goes idle (`wait-idle`). Split out of `mod.rs` to keep the lifecycle
-//! commands separate from the read plane. Parent-private helpers (`opencode_http`,
-//! the libkrun cfg accessors) are reached via `super::`.
+//! commands separate from the read plane. The live source + its tailer come from
+//! the [`LiveSession`](crate::sandbox::LiveSession) plane, so this file no longer
+//! branches on the backend.
 
 use anyhow::Result;
 
-use crate::agents::Integration;
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
 use crate::{events, sandbox, session};
 
 /// Resolve a session id/prefix for streaming and ensure its log is being
-/// filled. A live local-docker record → spawn the transcript→log tailer
-/// (returned as a guard the caller holds for the stream's lifetime, so a
-/// `session send`-driven session is readable as it runs); a remote record →
-/// note that live tailing is host-unavailable (transcript is sandbox-side); a
-/// foreground/historical run → resolve the log dir. Shared by `session
-/// subscribe` (serves WS) and `session watch` (renders to the terminal).
+/// filled. A live record → open the backend's §0 source + the tailer that fills
+/// it (the tailer is returned as a guard the caller holds for the stream's
+/// lifetime, so a `session send`-driven session is readable as it runs); a
+/// backend that can't host-tail (or whose source open fails) → note it and read
+/// the existing log; a foreground/historical run → resolve the log dir. Shared
+/// by `session subscribe` (serves WS) and `session watch` (renders to terminal).
 fn resolve_streaming_session(
     resolved: &Pillbox,
     id: &str,
-    action: &'static str,
 ) -> Result<(String, Option<events::transcripts::TailerHandle>)> {
     if let Ok(s) = session::resolve(resolved, id) {
-        // Server-integration agents (opencode) have no transcript file — read
-        // their HTTP `/event` stream into the log via the bridge instead.
-        if s.integration() == Integration::Server {
-            let log = crate::events::log::SessionLog::open(resolved, &s.id)?;
-            // libkrun captures /event to a persistent file in the shared home, so
-            // drain THAT (replay + follow) — complete even for a late watcher, no
-            // host daemon. Docker reads the live /event bridge, which only captures
-            // while watched.
-            let tailer = match session::Backend::parse(&s.backend) {
-                // A detached §0 producer already keeps the log live — just follow it (a second
-                // drainer would double-write). Else this reader is the drainer (no producer).
-                Some(session::Backend::Libkrun) if super::detached_tailer_alive(resolved, &s) => {
+        // Gate on the *capability*, not on catching every error: a backend that
+        // can host-tail this session (docker any session, libkrun a server one)
+        // spawns the tailer and lets a genuine failure (registry miss, IO)
+        // propagate loud; one that can't (a libkrun PTY session, an
+        // unknown/removed backend) degrades to reading the existing log. Catching
+        // every `event_source` error instead would silently swallow a real failure
+        // as "no live tail" — and break `wait-idle`. The source is reopened
+        // per-caller below, so only the tailer guard is kept here.
+        let tailer = match sandbox::live_session(&s) {
+            Ok(live) => {
+                let can_tail = if s.integration() == crate::agents::Integration::Server {
+                    live.caps().server_mode
+                } else {
+                    live.caps().live_pty_tail
+                };
+                if can_tail {
+                    live.event_source(resolved)?.1
+                } else {
+                    eprintln!(
+                        "pillbox: note: live event tailing isn't available for this `{}` \
+                         session; reading the existing log",
+                        s.backend
+                    );
                     None
                 }
-                Some(session::Backend::Libkrun) => super::libkrun_server_file_tailer(&s, log),
-                _ => match super::server_http(&s) {
-                    Ok(http) => sandbox::opencode::spawn_event_bridge(&*http, &s.id, log),
-                    Err(e) => {
-                        eprintln!(
-                            "pillbox: note: can't reach the opencode server ({e}); \
-                             reading the existing log"
-                        );
-                        None
-                    }
-                },
-            };
-            return Ok((s.id, tailer));
-        }
-        let tailer = match session::Backend::parse(&s.backend) {
-            Some(session::Backend::Docker) => {
-                let spec = crate::agents::lookup(action, &s.agent_id)?;
-                let home = spec.home_dir(resolved)?;
-                let log = crate::events::log::SessionLog::open(resolved, &s.id)?;
-                events::transcripts::spawn_attach_tailer(
-                    log,
-                    &home,
-                    &s.agent_id,
-                    &s.guest_cwd,
-                    &s.id,
-                )
             }
-            // A libkrun PTY session's transcript tailing isn't wired here yet;
-            // read the existing host log.
-            _ => {
+            Err(_) => {
                 eprintln!(
-                    "pillbox: note: live event tailing isn't available for `{}` sessions; \
+                    "pillbox: note: this binary can't reach the `{}` backend; \
                      reading the existing log",
                     s.backend
                 );
@@ -89,7 +71,7 @@ pub(super) fn session_subscribe(
     from: u64,
     bind: Option<&str>,
 ) -> Result<()> {
-    let (sid, _tailer) = resolve_streaming_session(resolved, id, "session subscribe")?;
+    let (sid, _tailer) = resolve_streaming_session(resolved, id)?;
     // Read-side fan-out: while the log is being filled (live session), if a
     // notification webhook is configured, tail the log and POST attention
     // signals to it — a consumer of the log (its own read view), off the
@@ -114,7 +96,7 @@ pub(super) fn session_subscribe(
 
 pub(super) fn session_watch(resolved: &Pillbox, id: &str, from: u64) -> Result<()> {
     use std::sync::atomic::AtomicBool;
-    let (sid, _tailer) = resolve_streaming_session(resolved, id, "session watch")?;
+    let (sid, _tailer) = resolve_streaming_session(resolved, id)?;
     eprintln!("pillbox: watching session {sid} (Ctrl-C to stop)");
     // Read through the placement swap point: the local file by default, the
     // managed DO WebSocket when the managed tier is on.
@@ -244,7 +226,7 @@ pub(super) fn session_wait_idle(
 
     // The tailer drains the §0 capture into the log while we wait; it stops when
     // `_tailer` drops at fn return (TailerHandle's Drop joins it).
-    let (sid, _tailer) = resolve_streaming_session(resolved, id, "session wait-idle")?;
+    let (sid, _tailer) = resolve_streaming_session(resolved, id)?;
     let log = crate::events::log::SessionLog::open(resolved, &sid)?;
 
     let stop = Arc::new(AtomicBool::new(false));

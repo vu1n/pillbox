@@ -636,9 +636,10 @@ impl WorkerDriver for CliDriver<'_> {
         // Grade the worker's *live* workspace clone in place (no pull): `session
         // info --json` exposes its path, `session score --workspace` grades it.
         // The winner is pulled to a durable dir separately (`pull_winner`).
-        // NOTE: `.session.workspace` is populated by `libkrun_workspace_path` —
-        // libkrun sessions only. Docker dispatch needs a different workspace
-        // resolution (see docs/dispatch.md Deferred); v1 is libkrun-only.
+        // NOTE: `.session.workspace` resolves via the session's `LiveSession`
+        // `workspace_path()` — libkrun sessions only (docker has no result clone).
+        // Docker dispatch needs a different workspace resolution (see
+        // docs/dispatch.md Deferred); v1 is libkrun-only.
         let info = self.capture(&["session".into(), "info".into(), id.into(), "--json".into()])?;
         let iv: serde_json::Value = serde_json::from_str(&info)
             .with_context(|| format!("parse `session info --json`: {info:?}"))?;

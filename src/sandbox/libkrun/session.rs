@@ -1352,10 +1352,6 @@ fn accept_attach(listener: &UnixListener, child: &mut std::process::Child) -> Re
 /// gains no new libkrun behavior, only one polymorphic surface. Holds a cloned
 /// [`Session`](crate::session::Session); the [`LibkrunHandle`] is decoded on
 /// demand from its `sandbox_id`.
-//
-// No constructor caller until the `live_session` factory + command-layer dispatch
-// are ported onto the plane; allow(dead_code) until then.
-#[allow(dead_code)]
 pub(crate) struct LibkrunLiveSession {
     session: crate::session::Session,
 }
@@ -1455,9 +1451,6 @@ impl crate::sandbox::LiveSession for LibkrunLiveSession {
 }
 
 impl LibkrunLiveSession {
-    // No caller until the `live_session` factory + command-layer dispatch are
-    // ported onto the plane; allow(dead_code) until then.
-    #[allow(dead_code)]
     pub(crate) fn new(session: crate::session::Session) -> Self {
         Self { session }
     }

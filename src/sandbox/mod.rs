@@ -36,8 +36,8 @@ use crate::session::{Backend, Session};
 /// false: a backend opts into each capability it actually supports. The matrix
 /// is in docs/substrate-plane.md.
 //
-// Declared ahead of its consumers (the dispatch sites that will read it), so
-// allow(dead_code) until those are ported onto the plane.
+// Not every bit has a reader on the current verb set; allow(dead_code) covers
+// the unread ones.
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Caps {
@@ -65,8 +65,6 @@ impl Caps {
     /// absent verb with the same named, exit-2 shape — the capability gap is a
     /// single recognizable error across the plane, not a per-impl `bail!` whose
     /// wording (and exit code) drifts between backends.
-    // No caller until the dispatch sites are ported onto the plane.
-    #[allow(dead_code)]
     pub(crate) fn unsupported(&self, verb: &str) -> anyhow::Error {
         PillboxError::usage(
             "session",
@@ -90,8 +88,6 @@ pub(crate) trait SandboxBackend {
 
     /// What this backend can do — queried before (or instead of) attempting a
     /// verb. The honest current-state profile, per docs/substrate-plane.md.
-    // No caller until the dispatch sites are ported onto the plane.
-    #[allow(dead_code)]
     fn capabilities(&self) -> Caps;
 
     /// Provision + return the live-session handle the command layer drives.
@@ -119,9 +115,6 @@ pub(crate) trait SandboxBackend {
 ///
 /// The method set maps 1:1 to the backend-string dispatch sites it replaces
 /// (`send`/`attach`/`kill`/`event_source`/`http`/`ingest`).
-//
-// Unused until those dispatch sites are ported onto it, so allow(dead_code).
-#[allow(dead_code)]
 pub(crate) trait LiveSession {
     /// This session's backend capabilities (the per-session view of [`Caps`]).
     fn caps(&self) -> Caps;
@@ -170,15 +163,16 @@ pub(crate) fn select_backend() -> Box<dyn SandboxBackend> {
 /// (`send`/`attach`/`watch`/`kill`/…) dispatch through the plane instead of each
 /// re-matching `Backend::parse`. Construction is just the cloned record; methods
 /// that need the resolved [`Pillbox`] take it per-call.
-// No caller until the dispatch sites are ported onto it.
-#[allow(dead_code)]
 pub(crate) fn live_session(session: &Session) -> Result<Box<dyn LiveSession>> {
     match Backend::parse(&session.backend) {
         Some(Backend::Docker) => Ok(Box::new(docker::DockerLiveSession::new(session.clone()))),
         #[cfg(feature = "libkrun")]
         Some(Backend::Libkrun) => Ok(Box::new(libkrun::LibkrunLiveSession::new(session.clone()))),
+        // Usage (exit 2), not config — matches the per-verb wrappers this replaced,
+        // so a caller branching on exit code sees no drift for a libkrun record on a
+        // build without the feature.
         #[cfg(not(feature = "libkrun"))]
-        Some(Backend::Libkrun) => Err(PillboxError::config(
+        Some(Backend::Libkrun) => Err(PillboxError::usage(
             "session",
             format!(
                 "session `{}` is libkrun-backed, but this pillbox was built without libkrun support",

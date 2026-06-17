@@ -47,12 +47,10 @@ mod mitm;
 mod session;
 mod vault;
 
-// The launch/attach/detach/reattach/teardown choreography lives in `session`;
-// `commands::session` reaches these accessors through the backend module.
-pub(crate) use session::{
-    kill_session, opencode_http, reattach, score_in_sandbox, server_events_file, workspace_path,
-    LibkrunLiveSession,
-};
+// The control verbs (attach/teardown/§0 accessors) are driven through the
+// `LiveSession` plane (`LibkrunLiveSession`); only the one-shot grader, which has
+// no session record to dispatch on, is still reached directly.
+pub(crate) use session::{score_in_sandbox, LibkrunLiveSession};
 
 use crate::agents::AgentSpec;
 use crate::errors::PillboxError;

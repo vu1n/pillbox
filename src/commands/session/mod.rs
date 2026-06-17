@@ -58,6 +58,10 @@ pub(crate) fn run_detached_tailer(
 /// The pid of a session's detached §0 producer, if its pid file is present, parseable, and positive.
 /// THE one reader of the `.tailer.pid` contract — `detached_tailer_alive` (signal-0 probe) and
 /// `kill_session` (SIGTERM on teardown) both go through it, so the format lives in one place.
+// The detached §0 producer is a libkrun-server affordance, so the consumers
+// (`LibkrunLiveSession::{event_source,ingest}` + `kill_session`) are all under
+// the `libkrun` feature; dead on a build without it.
+#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) fn tailer_pid(session_dir: &std::path::Path) -> Option<i32> {
     let pid = std::fs::read_to_string(session_dir.join(TAILER_PID_FILE))
         .ok()?
@@ -70,111 +74,10 @@ pub(crate) fn tailer_pid(session_dir: &std::path::Path) -> Option<i32> {
 /// Is a detached §0 producer currently alive for this session? Pid file + a signal-0 liveness probe.
 /// Readers (`subscribe`/`ingest`) use it to DEFER their own drain — only one writer may append to the
 /// log or events double.
+#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) fn detached_tailer_alive(resolved: &Pillbox, s: &session::Session) -> bool {
     tailer_pid(&session::session_dir_path(resolved, &s.id))
         .is_some_and(|pid| unsafe { libc::kill(pid, 0) } == 0)
-}
-
-/// A [`SandboxHttp`](sandbox::http::SandboxHttp) to a server-mode session's
-/// in-sandbox HTTP server — `docker exec curl` for a local docker session, an
-/// HTTP-over-vsock client for a libkrun one. The dispatch axis for
-/// `session send`/`subscribe`/`watch` on any `Server`-integration agent
-/// (opencode's `serve`, or the codex `appserver-host` bridge). The libkrun
-/// transport is port-free (the guest's vsock forward already targets the right
-/// in-guest port), so it serves both; the `port` only matters for the docker
-/// `curl` variant, which codex-serve never uses (libkrun-only).
-fn server_http(s: &session::Session) -> Result<Box<dyn sandbox::http::SandboxHttp>> {
-    let port = sandbox::opencode::SERVE_PORT;
-    match session::Backend::parse(&s.backend) {
-        Some(session::Backend::Docker) => Ok(Box::new(sandbox::http::DockerHttp::new(
-            s.sandbox_id.clone(),
-            port,
-        ))),
-        Some(session::Backend::Libkrun) => libkrun_opencode_http(s),
-        _ => Err(PillboxError::usage(
-            "session",
-            format!(
-                "opencode server sessions need a docker or libkrun backend (got `{}`)",
-                s.backend
-            ),
-        )
-        .into()),
-    }
-}
-
-/// libkrun server-agent HTTP transport (feature-gated; see [`server_http`]).
-#[cfg(feature = "libkrun")]
-fn libkrun_opencode_http(s: &session::Session) -> Result<Box<dyn sandbox::http::SandboxHttp>> {
-    sandbox::libkrun::opencode_http(s)
-}
-#[cfg(not(feature = "libkrun"))]
-fn libkrun_opencode_http(_s: &session::Session) -> Result<Box<dyn sandbox::http::SandboxHttp>> {
-    Err(PillboxError::usage(
-        "session",
-        "this libkrun session needs the libkrun feature built",
-    )
-    .into())
-}
-
-/// The capture wire format for a server session's agent, from its
-/// [`ServerProfile`](crate::agents::ServerProfile) — the drain-dispatch axis,
-/// resolved from the agent id rather than re-matched at each drain site.
-#[cfg(feature = "libkrun")]
-fn server_events_format(s: &session::Session) -> Result<crate::events::EventsFormat> {
-    let spec = crate::agents::lookup("session", &s.agent_id)?;
-    spec.server.map(|p| p.events_format).ok_or_else(|| {
-        PillboxError::usage(
-            "session",
-            format!("`{}` is not a server-mode agent", s.agent_id),
-        )
-        .into()
-    })
-}
-
-/// §0 read for a libkrun server session: drain its persistent event-capture file
-/// (replay everything + follow appends via [`FollowReader`]) into the log. The
-/// gateway-free, complete-capture source — unlike the live bridge, a late watcher
-/// still gets the whole history because the file persisted. The capture format
-/// (SSE vs NDJSON) is selected by [`crate::events::drain_server_capture`] from the
-/// agent's profile; both wrap the same format-agnostic `FollowReader`.
-#[cfg(feature = "libkrun")]
-fn libkrun_server_file_tailer(
-    s: &session::Session,
-    log: crate::events::log::SessionLog,
-) -> Option<events::transcripts::TailerHandle> {
-    use std::sync::atomic::AtomicBool;
-    use std::sync::Arc;
-    let path = sandbox::libkrun::server_events_file(s)
-        .map_err(|e| eprintln!("pillbox: note: can't locate the server events file ({e})"))
-        .ok()?;
-    let format = server_events_format(s)
-        .map_err(|e| eprintln!("pillbox: note: {e}"))
-        .ok()?;
-    // FollowReader opens the path lazily — it waits for the guest to create the
-    // file (first event line), so a `watch` right after `run` (before any events)
-    // doesn't miss it. Terminating is the shared `stop` flag's job.
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_thread = Arc::clone(&stop);
-    let sid = s.id.clone();
-    let join = std::thread::spawn(move || {
-        let mut log = log;
-        let reader = crate::events::opencode::FollowReader::new(path, Arc::clone(&stop_thread));
-        if let Err(e) =
-            crate::events::drain_server_capture(format, reader, &sid, &mut log, &stop_thread)
-        {
-            eprintln!("pillbox: warning: server events drain stopped: {e:#}");
-        }
-    });
-    // The shared `stop` flag terminates the FollowReader (→ the drain ends), so
-    // there's nothing to tear down beyond flipping it.
-    Some(events::transcripts::TailerHandle::from_flag(stop, join))
-}
-#[cfg(not(feature = "libkrun"))]
-fn libkrun_server_file_tailer(
-    _s: &session::Session,
-    _log: crate::events::log::SessionLog,
-) -> Option<events::transcripts::TailerHandle> {
-    None
 }
 
 /// Run a grader in a one-shot microVM (`session score --in-sandbox`); feature-gated.
@@ -199,55 +102,6 @@ fn libkrun_score_in_sandbox(
         "--in-sandbox requires the libkrun feature (host grading: drop --in-sandbox)",
     )
     .into())
-}
-
-/// Drain a libkrun server session's persisted event-capture file into its
-/// durable log (feature-gated). Plain `File` → the drain reads to EOF (it
-/// final-flushes a trailing partial frame) and returns; the never-set `stop`
-/// flag is only meaningful on the follow path. The format (NDJSON vs SSE) is
-/// selected by [`crate::events::drain_server_capture`]. Returns the §0 count.
-#[cfg(feature = "libkrun")]
-fn libkrun_ingest_events_file(resolved: &Pillbox, s: &session::Session) -> Result<usize> {
-    use std::sync::atomic::AtomicBool;
-    let path = sandbox::libkrun::server_events_file(s)?;
-    let format = server_events_format(s)?;
-    let file = std::fs::File::open(&path).map_err(|e| {
-        PillboxError::runtime(
-            "session ingest",
-            format!("open events file {}: {e}", path.display()),
-        )
-        .with_next("the session may not have produced any §0 events yet")
-    })?;
-    let mut log = crate::events::log::SessionLog::open(resolved, &s.id)?;
-    let stop = AtomicBool::new(false);
-    crate::events::drain_server_capture(format, file, &s.id, &mut log, &stop)
-}
-#[cfg(not(feature = "libkrun"))]
-fn libkrun_ingest_events_file(_resolved: &Pillbox, _s: &session::Session) -> Result<usize> {
-    Err(PillboxError::usage(
-        "session ingest",
-        "this libkrun session needs the libkrun feature built",
-    )
-    .into())
-}
-
-/// Host path of a libkrun session's result-workspace (the agent's CoW clone),
-/// or None for other backends / non-libkrun builds. Feature-gated.
-#[cfg(feature = "libkrun")]
-fn libkrun_workspace_path(s: &session::Session) -> Option<String> {
-    if !matches!(
-        session::Backend::parse(&s.backend),
-        Some(session::Backend::Libkrun)
-    ) {
-        return None;
-    }
-    sandbox::libkrun::workspace_path(s)
-        .ok()
-        .map(|p| p.to_string_lossy().into_owned())
-}
-#[cfg(not(feature = "libkrun"))]
-fn libkrun_workspace_path(_s: &session::Session) -> Option<String> {
-    None
 }
 
 pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> {
@@ -443,8 +297,13 @@ fn session_info(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
         let mut v = session_json_with_status(&s, status);
         // Expose the host path of the result-workspace when the backend has one
         // (libkrun: the agent's CoW clone) — so graders/orchestrators read it
-        // from this surface instead of parsing the session record.
-        if let (Some(obj), Some(ws)) = (v.as_object_mut(), libkrun_workspace_path(&s)) {
+        // from this surface instead of parsing the session record. A backend with
+        // no recoverable host workspace reports it unsupported → omit the field.
+        let workspace = sandbox::live_session(&s)
+            .ok()
+            .and_then(|ls| ls.workspace_path().ok())
+            .map(|p| p.to_string_lossy().into_owned());
+        if let (Some(obj), Some(ws)) = (v.as_object_mut(), workspace) {
             obj.insert("workspace".into(), ws.into());
         }
         println!("{}", crate::paths::json_v1(vec![("session", v)]));
@@ -573,32 +432,7 @@ fn session_attach(resolved: &Pillbox, id: &str) -> Result<()> {
         ))
         .into());
     }
-    match session::Backend::parse(&s.backend) {
-        Some(session::Backend::Docker) => sandbox::docker::reattach(resolved, &s),
-        Some(session::Backend::Libkrun) => libkrun_reattach(resolved, &s),
-        None => Err(PillboxError::config(
-            "session attach",
-            format!("unknown session backend `{}`", s.backend),
-        )
-        .into()),
-    }
-}
-
-/// Dispatch a libkrun reattach (feature-gated). A `libkrun` session record can
-/// exist on disk even in a build without the feature; fail clearly there.
-fn libkrun_reattach(_resolved: &Pillbox, _s: &session::Session) -> Result<()> {
-    #[cfg(feature = "libkrun")]
-    {
-        sandbox::libkrun::reattach(_resolved, _s)
-    }
-    #[cfg(not(feature = "libkrun"))]
-    {
-        Err(PillboxError::usage(
-            "session attach",
-            "this is a libkrun session but this build wasn't compiled with the `libkrun` feature",
-        )
-        .into())
-    }
+    sandbox::live_session(&s)?.attach(resolved)
 }
 
 fn session_detach(resolved: &Pillbox, id: &str) -> Result<()> {
@@ -698,38 +532,22 @@ fn session_detach(resolved: &Pillbox, id: &str) -> Result<()> {
 
 fn session_rm(resolved: &Pillbox, id: &str) -> Result<()> {
     let s = session::resolve(resolved, id)?;
-    match session::Backend::parse(&s.backend) {
-        Some(session::Backend::Docker) => sandbox::docker::kill_session(resolved, &s),
-        Some(session::Backend::Libkrun) => libkrun_kill_session(resolved, &s),
-        // Unknown backend = a pre-pivot remote session (e2b/ssh/remote-docker,
-        // whose backends were removed). We can't tear down a sandbox this binary
-        // no longer knows how to reach, but the orphaned record should still be
-        // removable — mirror libkrun-not-built: drop the record with a warning.
-        None => {
+    // A backend this binary can construct → tear down its sandbox via the plane.
+    // A backend it can't (an unknown/removed remote backend, or a libkrun record
+    // on a build without the feature) can't have its sandbox reached, but the
+    // orphaned record must still be removable — drop it with a warning.
+    match sandbox::live_session(&s) {
+        Ok(live) => live.kill(resolved),
+        Err(_) => {
             eprintln!(
                 "pillbox: warning: session `{}` has an unsupported backend `{}` \
-                 (likely a pre-pivot remote session); dropping the orphaned record only.",
+                 (this binary can't reach its sandbox); dropping the orphaned record only.",
                 s.id, s.backend
             );
             session::delete(resolved, &s.id)?;
             println!("pillbox: ✓ session `{}` removed.", s.id);
             Ok(())
         }
-    }
-}
-
-/// Dispatch a libkrun teardown (feature-gated; see [`libkrun_reattach`]). Without
-/// the feature we can't kill the VM, but still drop the orphaned record.
-fn libkrun_kill_session(resolved: &Pillbox, s: &session::Session) -> Result<()> {
-    #[cfg(feature = "libkrun")]
-    {
-        sandbox::libkrun::kill_session(resolved, s)
-    }
-    #[cfg(not(feature = "libkrun"))]
-    {
-        eprintln!("pillbox: warning: libkrun feature not built — can't kill the VM; dropping the record only");
-        session::delete(resolved, &s.id)?;
-        Ok(())
     }
 }
 
@@ -744,7 +562,7 @@ fn session_send(resolved: &Pillbox, id: &str, text: &str) -> Result<()> {
     // only the route shape differs (opencode's prompt_async vs the codex bridge's
     // /turn, which already holds the thread id).
     if s.integration() == Integration::Server {
-        let http = server_http(&s)?;
+        let http = sandbox::live_session(&s)?.http()?;
         if s.agent_id == crate::agents::CODEX_SERVE.id {
             sandbox::appserver_client::send_turn(&*http, text)?;
         } else {
@@ -766,29 +584,12 @@ fn session_send(resolved: &Pillbox, id: &str, text: &str) -> Result<()> {
         eprintln!("pillbox: sent prompt to session `{}`", s.id);
         return Ok(());
     }
-    match session::Backend::parse(&s.backend) {
-        Some(session::Backend::Docker) => {
-            sandbox::docker::send_input(&s.sandbox_id, text.as_bytes())?;
-            record_input(resolved, &s.id, text, crate::contract::InputTarget::Pty);
-            eprintln!("pillbox: sent {} byte(s) to session `{}`", text.len(), s.id);
-            Ok(())
-        }
-        // A libkrun PTY session's drive transport isn't wired for `send` yet.
-        Some(_) => Err(PillboxError::usage(
-            "session send",
-            format!(
-                "send isn't supported for `{}` sessions yet (docker only)",
-                s.backend
-            ),
-        )
-        .with_next(format!("pillbox session attach {}", s.id))
-        .into()),
-        None => Err(PillboxError::config(
-            "session send",
-            format!("unknown session backend `{}`", s.backend),
-        )
-        .into()),
-    }
+    // PTY drive: push the bytes through the plane (`send` is the PTY-drive verb;
+    // a backend without one rejects with the standard unsupported shape).
+    sandbox::live_session(&s)?.send(text.as_bytes())?;
+    record_input(resolved, &s.id, text, crate::contract::InputTarget::Pty);
+    eprintln!("pillbox: sent {} byte(s) to session `{}`", text.len(), s.id);
+    Ok(())
 }
 
 /// Record `session send` as a durable, attributed §0 [`Input`](crate::contract::Input)
@@ -931,7 +732,9 @@ fn session_pull(resolved: &Pillbox, id: &str, to: Option<&std::path::Path>) -> R
 /// returned when the directory still exists — a torn-down session's clone is
 /// gone. `None` for backends without a host-visible result tree.
 fn live_workspace_clone(session: &session::Session) -> Option<std::path::PathBuf> {
-    let path = std::path::PathBuf::from(libkrun_workspace_path(session)?);
+    let path = sandbox::live_session(session)
+        .ok()
+        .and_then(|ls| ls.workspace_path().ok())?;
     path.is_dir().then_some(path)
 }
 
@@ -985,34 +788,11 @@ fn session_ingest(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Only the file-capture path is supported: libkrun opencode persists `/event`
-    // to a guest-home file we can read post-hoc. docker server sessions drain
-    // live through the HTTP bridge, and PTY agents through the transcript tailer
-    // — both via `session subscribe`/`watch`, which fill the same log.
-    let is_libkrun = matches!(
-        session::Backend::parse(&session.backend),
-        Some(session::Backend::Libkrun)
-    );
-    if !is_libkrun || session.integration() != Integration::Server {
-        return Err(PillboxError::usage(
-            "session ingest",
-            format!(
-                "ingest currently supports libkrun opencode (server) sessions; \
-                 `{}`/{:?} drains live via `session subscribe`/`watch`",
-                session.backend,
-                session.integration()
-            ),
-        )
-        .into());
-    }
-
-    // A live detached §0 producer has already drained the capture into the log; re-draining here
-    // would double-write. Defer to it (the log is already current); else do the post-hoc drain.
-    let n = if detached_tailer_alive(resolved, &session) {
-        0
-    } else {
-        libkrun_ingest_events_file(resolved, &session)?
-    };
+    // Post-hoc drain through the plane. Only a backend with a headless capture file
+    // supports it (libkrun server agents); others reject — they drain live through
+    // `session subscribe`/`watch`. The impl also defers to a live detached §0
+    // producer (returns 0 rather than double-writing the log).
+    let n = sandbox::live_session(&session)?.ingest(resolved)?;
     // The §0 log is now drained — if this was a `--memory` server run, capture it into kypp + record
     // briefed-claim usage (the brief the bring-up stashed). No-op otherwise. Before the marker so a
     // failed capture can retry on a re-ingest; the marker then makes the whole step run once.

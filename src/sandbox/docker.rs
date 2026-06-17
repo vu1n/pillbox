@@ -666,10 +666,6 @@ pub(crate) fn kill_session(resolved: &Pillbox, session: &Session) -> Result<()> 
 /// adapter: every verb forwards to the existing free fn (the proven transport),
 /// so the plane gains no new docker behavior, only one polymorphic surface.
 /// Holds a cloned [`Session`] record (the container id is its `sandbox_id`).
-//
-// No constructor caller until the `live_session` factory + command-layer
-// dispatch are ported onto the plane; allow(dead_code) until then.
-#[allow(dead_code)]
 pub(crate) struct DockerLiveSession {
     session: Session,
 }
@@ -747,9 +743,6 @@ impl super::LiveSession for DockerLiveSession {
 }
 
 impl DockerLiveSession {
-    // No caller until the `live_session` factory + command-layer dispatch are
-    // ported onto the plane; allow(dead_code) until then.
-    #[allow(dead_code)]
     pub(crate) fn new(session: Session) -> Self {
         Self { session }
     }

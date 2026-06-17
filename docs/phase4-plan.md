@@ -82,7 +82,17 @@ assumptions:
    `__session-tailer`): a detached PTY session has no producer, so two concurrent
    readers double-write the log and a never-watched session captures nothing. A
    single reparented producer (readers follow it via `detached_tailer_alive`)
-   fixes both — the multiplayer-§0 + unwatched-capture story for PTY.
+   would fix both — the multiplayer-§0 + unwatched-capture story for PTY.
+   **ATTEMPTED + BACKED OUT** (live smoke caught the regression): the producer
+   plumbing works (it captures messages), but a *continuous* multi-turn transcript
+   tail emits the `AttentionRequired` idle signal for the **first turn only** —
+   subsequent turns' messages are captured but their per-turn idle isn't re-emitted,
+   so per-turn `wait-idle` times out. The pre-existing per-reader model works only
+   because each `wait-idle` spawns a *fresh* tailer that re-derives its turn's idle
+   (the very re-read that double-writes). **BLOCKED ON** a transcript-synth fix:
+   `synth.rs`/`contract_map.rs` must re-emit the per-turn idle signal in a single
+   continuous follow (today it doesn't). Until then the per-reader tailer stays
+   (single-reader keystone works; the double-write/unwatched limitations remain).
 3. **Pin the symlink-non-following invariant** in `events/transcripts/local.rs`
    `collect_jsonl` (a comment + ideally a `symlink_metadata` containment check):
    the libkrun PTY tailer now reads the guest-writable creds clone, so the

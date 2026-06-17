@@ -91,6 +91,32 @@ assumptions:
    to `metadata()` would silently reintroduce a guest→host escape. (Security
    defense-in-depth — vuln-triage found the channel clean, this hardens against
    regression.)
-4. **Bound `pty_send`'s connect/flush** (not just the read): a wedged guest
-   pty-host could hang `session send` on connect/write; the docker sibling bounds
-   its connect-wait. Batch-loop (eval-harness) hygiene.
+4. ~~**Bound `pty_send`'s connect/flush**~~ — DONE in the review-loop pass
+   (`f1f68b2`): both directions now carry `SEND_SETTLE` timeouts and success is
+   gated on the Snapshot, which also fixes the false-success-on-drop. The
+   *threaded accept loop* (#1) remains the real fix for concurrent
+   drive-while-attached.
+
+## Deferred residuals (surfaced by the pre-ship review loop; conscious, low-risk)
+
+- **killpg TOCTOU** (`kill_session` → `vmm_pid_owns_spec` ps-check then `killpg`):
+  both reviewers agree it's narrow (needs a VMM exit + same-pid reuse *as a group
+  leader* in the µs window between check and kill). Fully closing it needs an
+  atomic primitive (`pidfd_send_signal` on Linux) that isn't cross-platform
+  (macOS has no `pidfd`). The argv-attribution + alive-recheck is the mitigation;
+  accepted as residual.
+- **`event_source` double-open**: the trait returns `(EventSource, Option<TailerHandle>)`
+  but `resolve_streaming_session` keeps only the tailer and reopens the source —
+  a wasted `SessionLog` open locally, an open+drop of a managed-DO WebSocket once
+  that's a backend. Tighten the trait to return just the tailer when the managed
+  tier lands (no live cost today).
+- **SIGABRT `try_wait` race** (`launch_server_vm`): `try_wait` before `kill` can
+  miss a not-yet-reaped SIGABRT, masking the deps hint with the SIGKILL. Make the
+  server bring-up failure check `runtime_deps_present()` regardless of catching
+  the exact signal. Diagnosability only.
+- **`ingest` exit-code 2→3 drift** on a removed-backend record: `live_session`'s
+  config(3) fires before ingest's usage(2). Degenerate input (ingest against a
+  pre-pivot remote-backend record).
+- **doctor's caps-as-backend-discriminator** (`real_egress_fence` to tell
+  libkrun from docker): works today; fragile if a future backend gains that cap.
+  A `fn id()`/discriminant on `SandboxBackend` would make it total + explicit.

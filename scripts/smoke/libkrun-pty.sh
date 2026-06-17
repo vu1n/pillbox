@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Live PTY-DRIVE smoke for the libkrun backend (the substrate-plane Phase 4
-# keystone). The server-mode smoke (libkrun.sh) can't reach this path: it
+# Live PTY-DRIVE smoke for the libkrun backend — the PTY drive+read keystone.
+# The server-mode smoke (libkrun.sh) can't reach this path: it
 # exercises both NEW PTY halves on a real microVM —
 #   • send       — pty_send: host → persistent attach socket → guest PTY
 #   • live read  — event_source: the creds_share transcript → the durable §0 log

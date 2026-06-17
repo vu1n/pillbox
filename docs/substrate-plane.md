@@ -69,12 +69,15 @@ still doing string-match dispatch: the **PTY + lifecycle** surface.
 ## Contract first (define the boundary before porting)
 
 ```rust
-// src/sandbox/mod.rs — backend is a FACTORY, session is the PLANE.
+// src/sandbox/mod.rs — backend = launch + capability profile; the session is the PLANE.
 trait SandboxBackend {
-    fn start(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox)
-        -> Result<Box<dyn LiveSession>>;
-    fn capabilities(&self) -> Caps;          // queryable before start()
+    fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>;
+    fn capabilities(&self) -> Caps;
 }
+// The single backend-dispatch point: build the plane handle for an EXISTING
+// resolved Session (what the command layer calls). A run-path-unifying `start()`
+// that launches directly into a LiveSession is deferred — not yet a trait method.
+fn live_session(session: &Session) -> Result<Box<dyn LiveSession>>;
 
 // The plane — every command calls these, backend-blind.
 trait LiveSession {
@@ -146,7 +149,7 @@ the plane *exposes* it via `Caps`, it does not chase it.
 libkrun PTY parity, CF) builds on it.
 
 - [ ] **Phase 0 — contract.** Add `LiveSession` + `Caps` + `SandboxBackend::start/capabilities`. No behavior change; nothing calls them yet. `cargo fmt --all`, clippy (default **and** `--features libkrun`).
-- [ ] **Phase 1 — wrap.** `DockerLiveSession` + (gated) `LibkrunLiveSession` impls that *call the existing free fns*. `start()` constructs the right one from (family × `Integration`). Behavior identical; `scripts/smoke/run.sh` green.
+- [ ] **Phase 1 — wrap.** `DockerLiveSession` + (gated) `LibkrunLiveSession` impls that *call the existing free fns*, plus the `live_session(&Session)` factory that constructs the right one. Behavior identical; `scripts/smoke/run.sh` green.
 - [ ] **Phase 2 — delete dispatch.** Replace the 8 match sites with `live_session(&session)?` + `caps()` checks, then remove the `Backend::parse` arms:
       `src/commands/session/mod.rs:88,239,576,701,769,993`;
       `src/commands/session/stream.rs:36,56`.

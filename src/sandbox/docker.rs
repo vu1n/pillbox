@@ -141,13 +141,14 @@ impl SandboxBackend for DockerBackend {
         }
         // Local --detach can't use the vault: the stub-swap proxy runs on the
         // host and would die the moment this CLI returns, leaving the detached
-        // agent with dead credentials. Reject early with a pointer.
-        if opts.detach && (opts.vault || any_vaulted) {
+        // agent with dead credentials. Sourced from the capability so the gate
+        // tracks the backend's real detached_vault support, not a hardcode.
+        if opts.detach && (opts.vault || any_vaulted) && !self.capabilities().detached_vault {
             return Err(PillboxError::usage(
                 "run",
                 "--detach does not support the vault locally (the proxy can't outlive the CLI)",
             )
-            .with_next("run without --vault, or use the libkrun backend (PILLBOX_BACKEND=libkrun), which keeps the vault on detach")
+            .with_next("run without --vault, or use the default libkrun backend (don't set PILLBOX_BACKEND=docker), which keeps the vault on detach")
             .into());
         }
         // One session id for the whole foreground run: it anchors the
@@ -190,7 +191,8 @@ impl SandboxBackend for DockerBackend {
                 // DNS, so it's the airtight path. See docs/vault.md.
                 eprintln!(
                     "pillbox: note: --egress-deny on docker is proxy-level only — it does \
-                     not network-fence direct dials. For sole-egress, use PILLBOX_BACKEND=libkrun."
+                     not network-fence direct dials. For sole-egress, use the default libkrun \
+                     backend (don't set PILLBOX_BACKEND=docker)."
                 );
             }
             Some(crate::vault::VaultSession::start(

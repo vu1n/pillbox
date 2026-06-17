@@ -46,9 +46,10 @@ can build on. No cloud, no account, no platform required.
   event stream you can drive: `session send` pushes input, `session subscribe`
   streams it to a UI / bot / orchestrator, `session watch` reads it in your
   terminal. Build a frontend on the exact surface you use by hand.
-- **Local-only, two backends.** Runs against **Docker** (the default,
-  cross-platform) or **libkrun** (a local microVM, opt-in via
-  `PILLBOX_BACKEND=libkrun`). A managed/Cloudflare "remote" tier is in
+- **Local-only, two backends.** Runs against **libkrun** (a local microVM, the
+  default — needs KVM/HVF, on a `--features libkrun` build) or **Docker** (the
+  no-KVM compat backend, cross-platform, opt out to it via
+  `PILLBOX_BACKEND=docker`). A managed/Cloudflare "remote" tier is in
   progress: its §0-gateway substrate (a per-session Durable Object) is
   proven live on Cloudflare's free tier, but it's not yet a `pillbox run`
   target.
@@ -139,7 +140,7 @@ to bypass discovery and operate on a specific named pillbox.
 
 | Command | What it does |
 |---|---|
-| `pillbox run [opts] [-- args]` | Launch the agent against the current pillbox (local Docker by default; `PILLBOX_BACKEND=libkrun` for the microVM). |
+| `pillbox run [opts] [-- args]` | Launch the agent against the current pillbox (local libkrun microVM by default on a `--features libkrun` build; `PILLBOX_BACKEND=docker` for the no-KVM compat backend). |
 | `pillbox run --detach [--label TEXT]` | Start the session in the background; print the reattach id. Works on both local backends. |
 | `pillbox session list [--json]` | Sessions started from this pillbox. |
 | `pillbox session info ID [--json]` | One session (accepts unique id prefix ≥ 4 chars). |
@@ -199,11 +200,12 @@ that started them.
 
 pillbox runs locally against one of two backends:
 
-- **Docker** (default, cross-platform) — the agent runs in the runner
-  container on your local daemon.
-- **libkrun** (opt-in via `PILLBOX_BACKEND=libkrun`) — a local microVM
-  (macOS/HVF, Linux/KVM); feature-gated, needs libkrun installed (plus a
-  codesign on macOS). See [docs/libkrun-sandbox.md](docs/libkrun-sandbox.md).
+- **libkrun** (default on a `--features libkrun` build) — a local microVM
+  (macOS/HVF, Linux/KVM); needs KVM/HVF and libkrun installed (plus a codesign
+  on macOS). See [docs/libkrun-sandbox.md](docs/libkrun-sandbox.md).
+- **Docker** (the no-KVM compat backend, cross-platform; opt out to it via
+  `PILLBOX_BACKEND=docker`) — the agent runs in the runner container on your
+  local daemon. A build compiled without `--features libkrun` is Docker-only.
 
 Both backends support the full session surface, including detach/reattach.
 
@@ -271,10 +273,10 @@ Pillbox **does not** defend against:
 - Stolen unencrypted disk / backups. Files are plaintext at 0600.
   Disk encryption (FileVault / LUKS / BitLocker) is the at-rest
   defense.
-- Container escape or kernel attacks on the local Docker backend. The
-  libkrun backend (`PILLBOX_BACKEND=libkrun`) moves execution into a
-  microVM with a hardware-isolated boundary when this is the wrong trust
-  boundary for the Docker backend.
+- Container escape or kernel attacks on the no-KVM Docker compat backend
+  (`PILLBOX_BACKEND=docker`). The default libkrun backend moves execution into a
+  microVM with a hardware-isolated boundary; the Docker compat backend shares
+  the host kernel, so it is the weaker boundary.
 
 Same posture as `gh`, `aws`, `docker`, `kubectl`. Pillbox is a
 sandbox runner, not a secrets manager.
@@ -291,8 +293,9 @@ sessions), local-only. Roadmap:
   sessions (list/attach/detach) on the local backends; the **drive/read
   surface** (`session send` / `subscribe` / `watch`) — the interactive
   event substrate, live-verified.
-- **libkrun backend** ✅ local microVM (`PILLBOX_BACKEND=libkrun`) — a
-  secure VM boundary, no daemon, macOS-native
+- **libkrun backend** ✅ local microVM, the default on a `--features libkrun`
+  build — a secure VM boundary, no daemon, macOS-native; Docker is the no-KVM
+  compat fallback (`PILLBOX_BACKEND=docker`)
   ([docs/libkrun-sandbox.md](docs/libkrun-sandbox.md)).
 - **§0 managed gateway** 🚧 the §0 substrate as a per-session Cloudflare
   Durable Object (seq authority + actor attestation + driver arbitration +

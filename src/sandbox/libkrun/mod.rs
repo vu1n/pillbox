@@ -41,6 +41,7 @@ use serde::{Deserialize, Serialize};
 
 mod boot;
 mod egress;
+mod host;
 mod http;
 mod local_forward;
 mod mitm;
@@ -51,6 +52,11 @@ mod vault;
 // `LiveSession` plane (`LibkrunLiveSession`); only the one-shot grader, which has
 // no session record to dispatch on, is still reached directly.
 pub(crate) use session::{score_in_sandbox, LibkrunLiveSession};
+
+// Host-capability probes shared by `doctor` and the launch preflight.
+pub(crate) use host::{
+    disk_headroom, runtime_deps_present, virtualization_available, MIN_HEADROOM_BYTES,
+};
 
 use crate::agents::AgentSpec;
 use crate::errors::PillboxError;

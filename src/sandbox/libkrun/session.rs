@@ -29,9 +29,10 @@ use crate::workspace::WorkspaceBackend;
 // VMM substrate kept in the parent module (used here AND by `vmm_child_main`):
 // spec types, the CoW/stub/rootfs helpers, the cache dir, and shared consts.
 use super::{
-    boot, cow_clone_and_scrub, cow_clone_home, egress, http, krun_cache_dir, materialize_rootfs,
-    shell_quote, stub_oauth_creds, unsupported, EgressSpec, LibkrunBackend, Share, SwapPair,
-    VmSpec, VsockAttach, GUEST_CA_PATH,
+    boot, cow_clone_and_scrub, cow_clone_home, disk_headroom, egress, http, krun_cache_dir,
+    materialize_rootfs, runtime_deps_present, shell_quote, stub_oauth_creds, unsupported,
+    EgressSpec, LibkrunBackend, Share, SwapPair, VmSpec, VsockAttach, GUEST_CA_PATH,
+    MIN_HEADROOM_BYTES,
 };
 
 impl SandboxBackend for LibkrunBackend {
@@ -121,14 +122,14 @@ impl SandboxBackend for LibkrunBackend {
             .with_context(|| format!("bind attach socket {}", launch.attach_sock.display()))?;
         listener.set_nonblocking(true).ok();
 
-        let mut child = Command::new(&exe)
-            .arg("__krun-vmm")
+        let mut cmd = Command::new(&exe);
+        cmd.arg("__krun-vmm")
             .arg(launch.spec_file.path())
             .env_clear()
             .envs(boot::static_child_env())
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .context("spawn the libkrun VMM subprocess")?;
+            .stdin(std::process::Stdio::piped());
+        vmm_own_process_group(&mut cmd);
+        let mut child = cmd.spawn().context("spawn the libkrun VMM subprocess")?;
 
         // Hand the real credentials to the child's MITM out-of-band on stdin — the
         // reals never touch the guest env, argv, or the VmSpec file. Closing the
@@ -176,7 +177,7 @@ impl SandboxBackend for LibkrunBackend {
             }
             Err(e) => Err(e),
         };
-        let _ = child.wait();
+        let status = child.wait().ok();
         // Final drain of the agent's last transcript lines into the SessionLog.
         if let Some(tailer) = tailer {
             tailer.shutdown();
@@ -185,6 +186,14 @@ impl SandboxBackend for LibkrunBackend {
         let _ = std::fs::remove_file(&launch.attach_sock);
         let _ = std::fs::remove_dir_all(&launch.creds_share);
         let _ = std::fs::remove_dir_all(&launch.workspace_clone);
+        // A SIGABRT'd VMM is the missing-runtime-dep footgun (`brew cleanup` swept
+        // libkrun's undeclared dylibs). The attach/pump already failed with an
+        // opaque "VMM exited" — replace it with the actionable cause when we can.
+        if outcome.is_err() {
+            if let Some(deps_err) = sigabrt_boot_error(status) {
+                return Err(deps_err);
+            }
+        }
         match outcome? {
             pump::Outcome::Exited(code) if code != 0 => std::process::exit(code),
             _ => Ok(()),
@@ -315,6 +324,10 @@ fn launch_base(
     resolved: &Pillbox,
     ca_lifetime: CaLifetime,
 ) -> Result<LaunchBase> {
+    // Disk-pressure guard: the rootfs materialize + CoW workspace/creds clones
+    // below all allocate on the krun cache fs. Below the floor a boot stalls
+    // half-allocated rather than failing — so refuse loudly here, before any clone.
+    disk_preflight()?;
     let rootfs = materialize_rootfs(resolved)?;
 
     let home = spec.home_dir(resolved)?;
@@ -589,14 +602,16 @@ fn run_detached(
         .context("persist VMM spec for detach")?;
 
     let exe = std::env::current_exe().context("locate the pillbox binary to re-exec as VMM")?;
-    let mut child = Command::new(&exe)
-        .arg("__krun-vmm")
+    let mut cmd = Command::new(&exe);
+    cmd.arg("__krun-vmm")
         .arg(&spec_path)
         .env_clear()
         .envs(boot::static_child_env())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    vmm_own_process_group(&mut cmd);
+    let mut child = cmd
         .spawn()
         .context("spawn the detached libkrun VMM subprocess")?;
 
@@ -804,16 +819,16 @@ fn launch_server_vm(
 
     // Spawn the VM detached (it runs the server + relay, reparented to init).
     let exe = std::env::current_exe().context("locate the pillbox binary to re-exec as VMM")?;
-    let mut child = Command::new(&exe)
-        .arg("__krun-vmm")
+    let mut cmd = Command::new(&exe);
+    cmd.arg("__krun-vmm")
         .arg(&spec_path)
         .env_clear()
         .envs(boot::static_child_env())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .context("spawn the libkrun VMM subprocess")?;
+        .stderr(std::process::Stdio::null());
+    vmm_own_process_group(&mut cmd);
+    let mut child = cmd.spawn().context("spawn the libkrun VMM subprocess")?;
     // No swap pairs (non-vault): hand the child's MITM an empty set + EOF.
     if let Some(mut sin) = child.stdin.take() {
         use std::io::Write as _;
@@ -897,12 +912,19 @@ fn launch_server_vm(
             // we don't leave a zombie and don't race the dying child's virtio-fs
             // mounts on the clones we're removing. (The success path leaves the
             // child running, reparented; `kill_session` reaps that one by pid.)
+            // Read the child's own status FIRST: a SIGABRT'd-at-boot VMM (the swept
+            // runtime-dep footgun) has already exited, and our `kill` would otherwise
+            // clobber that status with SIGKILL and mask the actionable cause.
+            let self_status = child.try_wait().ok().flatten();
             let _ = child.kill();
             let _ = child.wait();
             let _ = std::fs::remove_file(&host_sock);
             let _ = std::fs::remove_file(&spec_path);
             let _ = std::fs::remove_dir_all(&creds_share);
             let _ = std::fs::remove_dir_all(&clone);
+            if let Some(deps_err) = sigabrt_boot_error(self_status) {
+                return Err(deps_err);
+            }
             return Err(e);
         }
     };
@@ -1131,6 +1153,9 @@ pub(crate) fn score_in_sandbox(
     egress_allow: &[String],
 ) -> Result<(i32, String)> {
     use std::io::Read as _;
+    // Same disk-pressure guard as the run path: the grader VM materializes the
+    // rootfs and mounts the workspace clone — refuse below the floor, not mid-boot.
+    disk_preflight()?;
     let rootfs = materialize_rootfs(resolved)?;
 
     // Egress is opt-in: an empty allowlist keeps the bare/offline grader. When
@@ -1223,8 +1248,8 @@ pub(crate) fn score_in_sandbox(
     serde_json::to_writer(&spec_file, &vmspec).context("write grader VMM spec")?;
 
     let exe = std::env::current_exe().context("locate the pillbox binary to re-exec as VMM")?;
-    let mut child = Command::new(&exe)
-        .arg("__krun-vmm")
+    let mut cmd = Command::new(&exe);
+    cmd.arg("__krun-vmm")
         .arg(spec_file.path())
         // No secrets reach the grader — only a minimal guest env for the toolchain
         // (plus CA-bundle pointers when egress is on; all non-secret). The base env
@@ -1237,9 +1262,9 @@ pub(crate) fn score_in_sandbox(
         // — null → EOF → empty swap (the MITM forwards untouched). No creds.
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null()) // VMM diagnostics; the grade's output is the guest console (stdout)
-        .spawn()
-        .context("spawn the grader VMM subprocess")?;
+        .stderr(std::process::Stdio::null()); // VMM diagnostics; the grade's output is the guest console (stdout)
+    vmm_own_process_group(&mut cmd);
+    let mut child = cmd.spawn().context("spawn the grader VMM subprocess")?;
     let mut out = String::new();
     if let Some(mut so) = child.stdout.take() {
         so.read_to_string(&mut out).ok();
@@ -1296,7 +1321,7 @@ pub(crate) fn kill_session(resolved: &Pillbox, session: &crate::session::Session
     }
     let handle = LibkrunHandle::decode(session)?;
     if handle.pid > 0 {
-        unsafe { libc::kill(handle.pid, libc::SIGKILL) };
+        kill_vmm_group(&handle);
     }
     let _ = std::fs::remove_file(&handle.sock);
     let _ = std::fs::remove_file(&handle.spec);
@@ -1309,8 +1334,146 @@ pub(crate) fn kill_session(resolved: &Pillbox, session: &crate::session::Session
         Some(session),
     );
     crate::session::delete(resolved, &session.id)?;
+    // No host-wide `__krun-vmm` sweep: a reparented VMM carries no per-pillbox
+    // attribution, so a scan can't distinguish a dead local orphan from another
+    // pillbox's *live* VM. We only kill the group we can prove is ours (above).
     println!("pillbox: ✓ session `{}` removed.", session.id);
     Ok(())
+}
+
+/// SIGKILL the VMM child's process group — but only after proving the group is
+/// genuinely ours, so a recycled `handle.pid` can never make us signal an
+/// unrelated group.
+///
+/// killpg, not kill: the VMM child is its own group leader (setsid at spawn), and
+/// `krun_start_enter` may fork a `__krun-vmm` VMM subprocess that survives a
+/// pid-only SIGKILL — signalling the whole group reaps both. `handle.pid` is the
+/// group id (== leader pid after setsid).
+///
+/// Attribution: `handle.spec` is this session's spec-file path, unique per
+/// session and present in the VMM child's argv (it's the `__krun-vmm <spec>`
+/// argument). We confirm `handle.pid` is alive AND its command line carries that
+/// path before the group kill. If the pid is gone or recycled to a process whose
+/// argv lacks our spec path, we do nothing — the VM is already down (or the pid
+/// belongs to something else), and a speculative killpg there is exactly the
+/// cross-group hazard we're guarding against.
+fn kill_vmm_group(handle: &LibkrunHandle) {
+    if vmm_pid_owns_spec(handle.pid, &handle.spec) {
+        unsafe { libc::killpg(handle.pid, libc::SIGKILL) };
+    }
+}
+
+/// True iff `pid` is a live `__krun-vmm` process whose argv contains `spec` (the
+/// per-session spec-file path) — the proof a group is ours before `killpg`. A
+/// `ps` read scoped to the one pid; empty/non-matching output (process gone, pid
+/// recycled, or `ps` unavailable) ⇒ `false`, i.e. don't kill.
+fn vmm_pid_owns_spec(pid: i32, spec: &str) -> bool {
+    let Ok(out) = Command::new("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .output()
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let cmdline = String::from_utf8_lossy(&out.stdout);
+    cmdline.contains("__krun-vmm") && cmdline.contains(spec)
+}
+
+/// Spawn the VMM child as its own session+group leader, so the whole group (this
+/// `__krun-vmm` process plus any VMM subprocess `krun_start_enter` forks) can be
+/// reaped together by `killpg` on teardown — a pid-only kill strands the fork.
+/// `setsid` also detaches the child from the launching CLI's controlling terminal,
+/// which is correct on every path: the guest console rides the vsock attach
+/// channel (PTY) or the agent's HTTP API (server), never this terminal.
+fn vmm_own_process_group(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+    // SAFETY: `pre_exec` runs in the forked child before `exec`; the closure must be
+    // async-signal-safe and touch no shared state. `setsid()` is a single bare
+    // syscall meeting both; `io::Error::last_os_error` reads `errno` (no alloc).
+    // A failed `setsid` would leave the child in the CLI's own group — then a
+    // `killpg(handle.pid)` would both miss the VMM and risk signalling the CLI's
+    // group — so fail the spawn loudly instead of proceeding into that hazard.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Refuse a launch when the krun cache filesystem is below the headroom floor —
+/// the disk-pressure guard. A boot that runs out of space mid-allocation stalls a
+/// half-built VM rather than failing cleanly; fail fast and loud instead.
+/// `disk_headroom` returns 0 (== "unknown") on stat failure, which we treat as not
+/// below the floor: an unstattable cache dir is a different problem the materialize
+/// step surfaces, not a reason to block an otherwise-fine host here.
+fn disk_preflight() -> Result<()> {
+    let cache = krun_cache_dir()?;
+    headroom_check(disk_headroom(&cache), MIN_HEADROOM_BYTES, &cache)
+}
+
+/// The pure decision behind [`disk_preflight`] (split out so it's unit-testable
+/// without a real low-disk fs): `Err` when `free` is below `floor`, naming the
+/// shortfall and the fix. `free == 0` is "unknown" (a stat failure), not below the
+/// floor — see [`disk_preflight`].
+fn headroom_check(free: u64, floor: u64, cache: &Path) -> Result<()> {
+    if free > 0 && free < floor {
+        return Err(PillboxError::runtime(
+            "run",
+            format!(
+                "low disk headroom on the krun cache ({}): {} free, need {} — a microVM boot \
+                 would stall half-allocated",
+                cache.display(),
+                human_bytes(free),
+                human_bytes(floor),
+            ),
+        )
+        .with_next("free space on that filesystem, then retry")
+        .into());
+    }
+    Ok(())
+}
+
+/// Map a VMM child that died by `SIGABRT` at boot to an actionable error, or `None`
+/// for any other exit. `SIGABRT` is the loader aborting the VMM — almost always
+/// libkrun's *undeclared* runtime dylibs (`libepoxy`, `MoltenVK`) swept by a `brew
+/// cleanup`. Surface the deps fix when the probe confirms it; otherwise a generic
+/// "VMM aborted at boot" naming the deps as the likely cause (the probe can't see
+/// a dep that's present-but-broken). Does not swallow — the run already failed;
+/// this only makes the *why* legible instead of an opaque signal death.
+fn sigabrt_boot_error(status: Option<std::process::ExitStatus>) -> Option<anyhow::Error> {
+    use std::os::unix::process::ExitStatusExt as _;
+    if status?.signal() != Some(libc::SIGABRT) {
+        return None;
+    }
+    let err = match runtime_deps_present() {
+        Err(reason) => {
+            PillboxError::runtime("run", format!("the libkrun VMM aborted at boot ({reason})"))
+                .with_next("brew install libepoxy molten-vk")
+        }
+        Ok(()) => PillboxError::runtime(
+            "run",
+            "the libkrun VMM aborted at boot (SIGABRT) — the likely cause is missing runtime \
+             deps swept by `brew cleanup`",
+        )
+        .with_next("brew install libepoxy molten-vk"),
+    };
+    Some(err.into())
+}
+
+/// Human-readable bytes for an operator-facing error (GiB/MiB, one decimal).
+fn human_bytes(n: u64) -> String {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
+    if n >= GIB {
+        format!("{:.1} GiB", n as f64 / GIB as f64)
+    } else {
+        format!("{:.1} MiB", n as f64 / MIB as f64)
+    }
 }
 
 /// vsock port the guest pty-host dials for the attach channel.
@@ -1545,5 +1708,61 @@ mod tests {
             src_err.contains("event_source"),
             "a PTY session's event_source must name the rejected verb, got: {src_err}"
         );
+    }
+
+    #[test]
+    fn headroom_check_below_floor_is_a_loud_error() {
+        let cache = Path::new("/fake/krun/cache");
+        // 1 GiB free under a 2 GiB floor → refuse, naming the shortfall + the fix.
+        let err = headroom_check(1024 * 1024 * 1024, MIN_HEADROOM_BYTES, cache)
+            .expect_err("below the floor must error");
+        let msg = err.to_string();
+        assert!(msg.contains("low disk headroom"), "names the cause: {msg}");
+        assert!(msg.contains("free space"), "carries the Next fix: {msg}");
+    }
+
+    #[test]
+    fn headroom_check_at_or_above_floor_passes() {
+        let cache = Path::new("/fake/krun/cache");
+        assert!(headroom_check(MIN_HEADROOM_BYTES, MIN_HEADROOM_BYTES, cache).is_ok());
+        assert!(headroom_check(MIN_HEADROOM_BYTES + 1, MIN_HEADROOM_BYTES, cache).is_ok());
+    }
+
+    #[test]
+    fn headroom_check_unknown_zero_does_not_block() {
+        // 0 == "stat failed / unknown" — not a reason to refuse an otherwise-fine host.
+        let cache = Path::new("/fake/krun/cache");
+        assert!(headroom_check(0, MIN_HEADROOM_BYTES, cache).is_ok());
+    }
+
+    #[test]
+    fn sigabrt_status_maps_to_deps_error() {
+        use std::os::unix::process::ExitStatusExt as _;
+        // A wait-status whose low byte is the signal number → `signal() == SIGABRT`.
+        let status = std::process::ExitStatus::from_raw(libc::SIGABRT);
+        let err = sigabrt_boot_error(Some(status)).expect("SIGABRT must map to an error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("aborted at boot"),
+            "names the abort cause: {msg}"
+        );
+    }
+
+    #[test]
+    fn non_sigabrt_status_is_not_mapped() {
+        use std::os::unix::process::ExitStatusExt as _;
+        // A clean exit and a different signal both pass through unmapped — only the
+        // boot-abort footgun gets the deps hint.
+        assert!(sigabrt_boot_error(Some(std::process::ExitStatus::from_raw(0))).is_none());
+        assert!(
+            sigabrt_boot_error(Some(std::process::ExitStatus::from_raw(libc::SIGKILL))).is_none()
+        );
+        assert!(sigabrt_boot_error(None).is_none());
+    }
+
+    #[test]
+    fn human_bytes_formats_gib_and_mib() {
+        assert_eq!(human_bytes(2 * 1024 * 1024 * 1024), "2.0 GiB");
+        assert_eq!(human_bytes(512 * 1024 * 1024), "512.0 MiB");
     }
 }

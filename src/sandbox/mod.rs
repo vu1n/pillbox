@@ -6,9 +6,10 @@
 //! (ssh/docker/e2b) were removed in the libkrun pivot — "remote" is
 //! becoming the managed/Cloudflare tier; until then pillbox is local-only.
 //!
-//! - [`docker::DockerBackend`] — host Docker daemon (the default).
 //! - [`libkrun::LibkrunBackend`] — a local libkrun microVM (feature-gated
-//!   `libkrun`; opt in via `PILLBOX_BACKEND=libkrun`).
+//!   `libkrun`; the default on that build).
+//! - [`docker::DockerBackend`] — host Docker daemon (the no-KVM compat
+//!   backend; opt in via `PILLBOX_BACKEND=docker`).
 
 pub(crate) mod appserver;
 pub(crate) mod appserver_client;
@@ -148,11 +149,13 @@ pub(crate) trait LiveSession {
 
 /// Pick the local backend for one `pillbox run`. The deprecated remote backends
 /// (ssh/docker/e2b) were removed in the libkrun pivot — "remote" is becoming the
-/// managed/Cloudflare tier; until then pillbox is local-only. libkrun (microVM)
-/// opts in via `PILLBOX_BACKEND=libkrun` (feature-gated); the default is Docker.
+/// managed/Cloudflare tier; until then pillbox is local-only. On a `libkrun`
+/// build the microVM is the default local substrate; Docker is the no-KVM compat
+/// opt-out via `PILLBOX_BACKEND=docker`. A build without the feature is always
+/// Docker (libkrun isn't compiled in).
 pub(crate) fn select_backend() -> Box<dyn SandboxBackend> {
     #[cfg(feature = "libkrun")]
-    if std::env::var_os("PILLBOX_BACKEND").is_some_and(|v| v == "libkrun") {
+    if std::env::var_os("PILLBOX_BACKEND").is_none_or(|v| v != "docker") {
         return Box::new(libkrun::LibkrunBackend);
     }
     Box::new(docker::DockerBackend)
@@ -192,6 +195,56 @@ pub(crate) fn live_session(session: &Session) -> Result<Box<dyn LiveSession>> {
 mod tests {
     use super::*;
     use crate::session::BACKEND_DOCKER;
+
+    /// Removes `PILLBOX_BACKEND` on drop so the selection test can't leak its
+    /// override into another test (the env is process-global). Tests touching
+    /// it share the lock below.
+    struct BackendEnvGuard;
+    impl Drop for BackendEnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("PILLBOX_BACKEND");
+        }
+    }
+
+    /// Serializes the env-mutating selection test against any other test that
+    /// reads/writes `PILLBOX_BACKEND` in this process.
+    static BACKEND_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `select_backend` reports a stable id for the chosen backend, so the test
+    /// can assert which one was picked without naming a concrete type.
+    fn selected_backend_id() -> &'static str {
+        if select_backend().capabilities().long_lived_exec {
+            BACKEND_DOCKER // docker is the long-lived-exec family
+        } else {
+            "libkrun"
+        }
+    }
+
+    #[test]
+    fn select_backend_default_and_docker_opt_out() {
+        let _lock = BACKEND_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = BackendEnvGuard;
+
+        std::env::remove_var("PILLBOX_BACKEND");
+        // Default build: always docker (libkrun isn't compiled in). libkrun
+        // build: the microVM is the default substrate.
+        #[cfg(not(feature = "libkrun"))]
+        assert_eq!(selected_backend_id(), BACKEND_DOCKER);
+        #[cfg(feature = "libkrun")]
+        assert_eq!(selected_backend_id(), "libkrun");
+
+        // `PILLBOX_BACKEND=docker` is the compat opt-out — docker on every build.
+        std::env::set_var("PILLBOX_BACKEND", "docker");
+        assert_eq!(selected_backend_id(), BACKEND_DOCKER);
+
+        // An unrecognized value isn't the docker opt-out: it falls through to
+        // the build's default (libkrun on a libkrun build, docker otherwise).
+        std::env::set_var("PILLBOX_BACKEND", "libkrun");
+        #[cfg(not(feature = "libkrun"))]
+        assert_eq!(selected_backend_id(), BACKEND_DOCKER);
+        #[cfg(feature = "libkrun")]
+        assert_eq!(selected_backend_id(), "libkrun");
+    }
 
     #[test]
     fn unsupported_names_the_verb() {

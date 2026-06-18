@@ -322,6 +322,7 @@ impl SandboxBackend for DockerBackend {
                 result_snapshot: None,
                 expires_at: opts.ttl_seconds.map(session::expires_at_from_ttl),
                 guest_cwd: guest_cwd.clone(),
+                placement: session::Placement::Local,
                 server: None,
             };
             session::write(resolved, &session)?;
@@ -367,6 +368,7 @@ impl SandboxBackend for DockerBackend {
             result_snapshot: None,
             expires_at: None,
             guest_cwd: guest_cwd.clone(),
+            placement: session::Placement::Local,
             server: None,
         };
         let startup_metrics = startup.finish("host_started_event");
@@ -531,6 +533,7 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
             result_snapshot: None,
             expires_at: opts.ttl_seconds.map(session::expires_at_from_ttl),
             guest_cwd: guest_workspace.clone(),
+            placement: session::Placement::Local,
             server: Some(session::ServerSession {
                 agent_session_id: ocid.clone(),
                 model: model.clone(),

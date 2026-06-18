@@ -42,6 +42,22 @@ const MAX_TURN_EVENTS = 2000;
 // Wall-clock cap on one driven turn — bounds how long the DO holds the long-lived
 // /event fetch open if the agent never goes idle (Open Question #2's failure mode).
 const TURN_TIMEOUT_MS = 300_000; // 5 min
+// A workspace restore/backup over R2 (rustic) moves the whole tree through the
+// container, far exceeding a turn's interactivity — give it a generous wall clock.
+const WORKSPACE_XFER_TIMEOUT_MS = 300_000; // 5 min
+
+// The rustic-on-R2 repo coordinates + resolved creds the host hands the container
+// to restore the run's workspace in / snapshot results out (mirrors Rust S3Config).
+// `access_key`/`secret_key` (and the separate `password`) are SECRET — they reach
+// `pillbox workspace restore|backup` ONLY via the exec ENV, never argv, never §0.
+type WorkspaceRepo = {
+  endpoint: string;
+  region: string;
+  bucket: string;
+  prefix: string;
+  access_key: string;
+  secret_key: string;
+};
 
 // Minimal shape of the opencode `config` overlay we construct/merge (the full
 // type lives in @opencode-ai/sdk, not installed here). Provider → { options.apiKey }.
@@ -112,6 +128,8 @@ export class SessionGateway extends Agent<Env> {
     if (path.endsWith("/input")) return this.handleInput(req);
     if (path.endsWith("/annotation")) return this.handleAnnotation(req);
     if (path.endsWith("/driver/release")) return this.handleRelease(req);
+    if (path.endsWith("/provision")) return this.handleProvision(req);
+    if (path.endsWith("/finalize")) return this.handleFinalize(req);
     return new Response("not found\n", { status: 404 });
   }
 
@@ -314,6 +332,121 @@ export class SessionGateway extends Agent<Env> {
       type: "tool_call",
       toolCallId: opId,
       name: "exec",
+      status,
+      output,
+    });
+  }
+
+  // ── managed workspace placement (rustic-on-R2) ────────────────────────
+  // `pillbox run --backend managed` snapshots its cwd into a rustic repo on R2,
+  // then POSTs /provision so the container restores that snapshot into /workspace
+  // BEFORE the agent is driven; /finalize snapshots /workspace back to R2 after
+  // the turn and returns the result handle. Both are driver actions (the host
+  // holds the slot), so they're authenticated + driver-gated like /input.
+  //
+  // SECURITY: the R2 creds + repo password arrive in the request body and are
+  // handed to the in-container `pillbox workspace …` ONLY via the exec ENV — never
+  // on argv (visible in `ps`), never appended to the §0 log. The §0 events record
+  // the non-secret coordinates (snapshot handle, target) + status.
+
+  private async handleProvision(req: Request): Promise<Response> {
+    const actor = await this.requireActor(req);
+    if (actor instanceof Response) return actor;
+    const denied = await this.ensureDriver(actor, false); // provisioning claims the slot
+    if (denied) return denied;
+    if (!this.env.Sandbox) {
+      return json({ error: "no container bound — managed provisioning needs the Sandbox binding" }, 503);
+    }
+    const w = (
+      (await req.json()) as {
+        workspace?: { repo?: WorkspaceRepo; password?: string; snapshot?: string };
+      }
+    ).workspace;
+    if (!w?.repo || !w.password || !w.snapshot) {
+      return json({ error: "provision needs {workspace:{repo,password,snapshot}}" }, 400);
+    }
+    const sandbox = getSandbox(this.env.Sandbox, this.name);
+    const res = await this.execWorkspaceTool(
+      sandbox,
+      workspaceCmd("restore", w.repo, w.snapshot),
+      w.repo,
+      w.password,
+    );
+    if (!res.ok) {
+      this.appendWorkspaceXfer("workspace.restore", "failed", redactXfer(res.detail));
+      return json({ error: `workspace restore failed: ${redactXfer(res.detail)}` }, 502);
+    }
+    this.appendWorkspaceXfer("workspace.restore", "completed", `restored ${w.snapshot} → ${OPENCODE_DIR}`);
+    return json({ ok: true });
+  }
+
+  private async handleFinalize(req: Request): Promise<Response> {
+    const actor = await this.requireActor(req);
+    if (actor instanceof Response) return actor;
+    const denied = await this.ensureDriver(actor, false);
+    if (denied) return denied;
+    if (!this.env.Sandbox) {
+      return json({ error: "no container bound — managed finalize needs the Sandbox binding" }, 503);
+    }
+    const w = ((await req.json()) as { workspace?: { repo?: WorkspaceRepo; password?: string } }).workspace;
+    if (!w?.repo || !w.password) {
+      return json({ error: "finalize needs {workspace:{repo,password}}" }, 400);
+    }
+    const sandbox = getSandbox(this.env.Sandbox, this.name);
+    const res = await this.execWorkspaceTool(sandbox, workspaceCmd("backup", w.repo), w.repo, w.password);
+    if (!res.ok) {
+      this.appendWorkspaceXfer("workspace.backup", "failed", redactXfer(res.detail));
+      return json({ error: `workspace backup failed: ${redactXfer(res.detail)}` }, 502);
+    }
+    // `pillbox workspace backup` prints the new snapshot handle as its final stdout
+    // line — that's the result handle the host records for `session pull`.
+    const resultSnapshot = res.stdout.trim().split("\n").filter(Boolean).pop() ?? "";
+    if (!resultSnapshot) {
+      this.appendWorkspaceXfer("workspace.backup", "failed", "no snapshot handle on stdout");
+      return json({ error: "workspace backup produced no snapshot handle" }, 502);
+    }
+    this.appendWorkspaceXfer("workspace.backup", "completed", `snapshot ${resultSnapshot}`);
+    return json({ resultSnapshot });
+  }
+
+  // Run `pillbox workspace restore|backup` in the container with the R2 creds +
+  // repo password injected ONLY via env (never argv/log). Retries the container
+  // cold-start transient (mirrors driveExec).
+  private async execWorkspaceTool(
+    sandbox: ReturnType<typeof getSandbox>,
+    cmd: string,
+    repo: WorkspaceRepo,
+    password: string,
+  ): Promise<{ ok: boolean; detail: string; stdout: string }> {
+    const env = {
+      PILLBOX_R2_ACCESS_KEY: repo.access_key,
+      PILLBOX_R2_SECRET_KEY: repo.secret_key,
+      PILLBOX_REPO_PASSWORD: password,
+    };
+    let lastErr = "";
+    for (let attempt = 0; attempt < 60; attempt++) {
+      try {
+        const res = await sandbox.exec(cmd, { env, timeout: WORKSPACE_XFER_TIMEOUT_MS });
+        return {
+          ok: res.success,
+          detail: [res.stdout, res.stderr].filter(Boolean).join("\n"),
+          stdout: res.stdout ?? "",
+        };
+      } catch (e) {
+        lastErr = String(e);
+        if (!/starting|not ready/i.test(lastErr)) break; // non-transient → stop
+        await new Promise((r) => setTimeout(r, 1000)); // container cold-start backoff
+      }
+    }
+    return { ok: false, detail: lastErr, stdout: "" };
+  }
+
+  // A §0 record of a workspace transfer — non-secret coordinates + status only.
+  private appendWorkspaceXfer(name: string, status: string, output: string): void {
+    this.append(nowRfc3339(), SYSTEM_ACTOR, {
+      type: "tool_call",
+      toolCallId: name,
+      name,
       status,
       output,
     });
@@ -772,6 +905,42 @@ async function* sseEnvelopes(body: ReadableStream<Uint8Array>): AsyncGenerator<u
 function nowRfc3339(): string {
   return new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
 }
+
+// Build a `pillbox workspace restore|backup` command. Non-secret coordinates go
+// on argv (single-quoted); the creds + password are passed via env by the caller
+// (NEVER here), so this string is safe to keep in the §0 log. `backup` omits the
+// snapshot (it creates one).
+function workspaceCmd(mode: "restore" | "backup", repo: WorkspaceRepo, snapshot?: string): string {
+  const args = [
+    "pillbox",
+    "workspace",
+    mode,
+    "--endpoint",
+    sq(repo.endpoint),
+    "--bucket",
+    sq(repo.bucket),
+    "--region",
+    sq(repo.region),
+    "--prefix",
+    sq(repo.prefix),
+  ];
+  if (snapshot) args.push("--snapshot", sq(snapshot));
+  args.push("--target", sq(OPENCODE_DIR));
+  return args.join(" ");
+}
+
+// Single-quote a coordinate for the exec shell string. The values are from the
+// user's own trusted pillbox config, but quote defensively all the same.
+function sq(v: string): string {
+  return `'${v.replace(/'/g, "'\\''")}'`;
+}
+
+// The creds never reach the command's output (they're env-only), but cap the
+// transfer-error detail logged to §0 so a verbose rustic dump can't drown replay.
+function redactXfer(detail: string): string {
+  return detail.length > 2000 ? `${detail.slice(0, 2000)}…` : detail;
+}
+
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body) + "\n", {
     status,

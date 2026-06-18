@@ -593,8 +593,11 @@ mod input {
         .context("serialize managed /input body")?;
 
         let url = format!("{}/input", endpoint.trim_end_matches('/'));
+        // `/input` blocks for the WHOLE agent turn: the DO's handleInput awaits the
+        // opencode turn to idle before responding. So this is a turn-length wait, not
+        // a quick steer — the ~2s event-sink budget would time out every real turn.
         let client = reqwest::blocking::Client::builder()
-            .timeout(crate::events::EVENTS_SINK_TIMEOUT)
+            .timeout(std::time::Duration::from_secs(600))
             .build()
             .context("build managed /input http client")?;
         let resp = client

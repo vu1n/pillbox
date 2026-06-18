@@ -1,2 +1,10 @@
 # Copy to .dev.vars (gitignored) for `wrangler dev`. Set via `wrangler secret put` in prod.
 ACTOR_TOKEN_SECRET=replace-with-a-random-secret
+
+# opencode provider auth for the consume path (driveAgent), only needed for the
+# container deploy (wrangler.container.toml). Set ONE provider.
+# ZAI_API_KEY=...                        # GLM coding-plan subscription; default model zai-coding-plan/glm-4.5-air
+# ANTHROPIC_API_KEY=sk-ant-...           # then drive with --model anthropic/claude-haiku-4-5-20251001
+# OPENAI_API_KEY=sk-...                  # then drive with --model openai/gpt-4o
+# OPENCODE_CONFIG_JSON={"provider":{...}}  # explicit provider block (baseURL/headers) / CF AI Gateway
+# OPENCODE_MODEL=zai-coding-plan/glm-4.5-air   # default when /input omits a model

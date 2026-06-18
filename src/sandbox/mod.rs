@@ -17,6 +17,7 @@ pub(crate) mod docker;
 pub(crate) mod http;
 #[cfg(feature = "libkrun")]
 pub(crate) mod libkrun;
+pub(crate) mod managed;
 pub(crate) mod opencode;
 
 use std::path::PathBuf;
@@ -142,6 +143,15 @@ pub(crate) trait LiveSession {
 /// opt-out via `PILLBOX_BACKEND=docker`. A build without the feature is always
 /// Docker (libkrun isn't compiled in).
 pub(crate) fn select_backend() -> Box<dyn SandboxBackend> {
+    // `PILLBOX_BACKEND=managed` opts into the managed Cloudflare tier (the §0
+    // gateway DO + a CF container). It needs no host capability, so it's
+    // selectable on any build — but it requires the managed config env
+    // (`PILLBOX_MANAGED_DO_URL`, …); the backend itself reports the gap if it's
+    // selected without it. Checked before the local-backend split so it wins on
+    // every build.
+    if std::env::var_os("PILLBOX_BACKEND").is_some_and(|v| v == "managed") {
+        return Box::new(managed::ManagedBackend);
+    }
     #[cfg(feature = "libkrun")]
     if std::env::var_os("PILLBOX_BACKEND").is_none_or(|v| v != "docker") {
         return Box::new(libkrun::LibkrunBackend);
@@ -159,6 +169,9 @@ pub(crate) fn live_session(session: &Session) -> Result<Box<dyn LiveSession>> {
         Some(Backend::Docker) => Ok(Box::new(docker::DockerLiveSession::new(session.clone()))),
         #[cfg(feature = "libkrun")]
         Some(Backend::Libkrun) => Ok(Box::new(libkrun::LibkrunLiveSession::new(session.clone()))),
+        // Managed needs no host capability, so it resolves on every build — the
+        // verbs are DO calls, not local-process ops.
+        Some(Backend::Managed) => Ok(Box::new(managed::ManagedLiveSession::new(session.clone()))),
         // Usage (exit 2), not config — matches the per-verb wrappers this replaced,
         // so a caller branching on exit code sees no drift for a libkrun record on a
         // build without the feature.
@@ -232,6 +245,31 @@ mod tests {
         assert_eq!(selected_backend_id(), BACKEND_DOCKER);
         #[cfg(feature = "libkrun")]
         assert_eq!(selected_backend_id(), "libkrun");
+    }
+
+    #[test]
+    fn select_backend_picks_managed_on_opt_in() {
+        use crate::session::BACKEND_MANAGED;
+        let _lock = BACKEND_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = BackendEnvGuard;
+        // `PILLBOX_BACKEND=managed` selects the managed tier on every build (it
+        // needs no host capability). Asserted via the stable `id()` discriminant,
+        // since managed shares `long_lived_exec=false` with libkrun.
+        std::env::set_var("PILLBOX_BACKEND", "managed");
+        assert_eq!(select_backend().id(), BACKEND_MANAGED);
+    }
+
+    #[test]
+    fn live_session_dispatches_managed_to_the_do_plane() {
+        use crate::session::{Placement, BACKEND_MANAGED};
+        let mut s = Session::test_fixture();
+        s.backend = BACKEND_MANAGED.to_string();
+        s.placement = Placement::Managed;
+        let live = live_session(&s).expect("managed session resolves on every build");
+        // Managed is server-mode (structured agent drive + DO read), with no host
+        // PTY — the honest profile the plane gates verbs on.
+        assert!(live.caps().server_mode);
+        assert!(!live.caps().pty_drive);
     }
 
     #[test]

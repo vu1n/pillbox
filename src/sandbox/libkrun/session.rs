@@ -167,6 +167,7 @@ impl SandboxBackend for LibkrunBackend {
                     result_snapshot: None,
                     expires_at: None,
                     guest_cwd: launch.guest_workspace.clone(),
+                    placement: crate::session::Placement::Local,
                     server: None,
                 };
                 let startup_metrics = startup.finish("host_started_event");
@@ -651,6 +652,7 @@ fn run_detached(
         result_snapshot: None,
         expires_at: opts.ttl_seconds.map(crate::session::expires_at_from_ttl),
         guest_cwd: launch.guest_workspace,
+        placement: crate::session::Placement::Local,
         server: None,
     };
     crate::session::write(resolved, &session)?;
@@ -873,6 +875,7 @@ fn launch_server_vm(
             result_snapshot: None,
             expires_at: opts.ttl_seconds.map(crate::session::expires_at_from_ttl),
             guest_cwd: guest_workspace.clone(),
+            placement: crate::session::Placement::Local,
             server: Some(crate::session::ServerSession {
                 agent_session_id,
                 model: launch.model.clone(),

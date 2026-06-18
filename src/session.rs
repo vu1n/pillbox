@@ -125,6 +125,7 @@ impl IdRegistry for SessionRegistry {
 /// stringly path each time.
 pub(crate) const BACKEND_DOCKER: &str = "docker";
 pub(crate) const BACKEND_LIBKRUN: &str = "libkrun";
+pub(crate) const BACKEND_MANAGED: &str = "managed";
 
 /// Typed view of the on-disk `backend` string. Returned by
 /// [`Backend::parse`]; `None` means a backend label this binary doesn't
@@ -142,6 +143,13 @@ pub(crate) enum Backend {
     /// CoW clones. Detach keeps the vault (the MITM lives in the child, not the
     /// parent — unlike local Docker, which can't keep a host-side proxy alive).
     Libkrun,
+    /// Managed Cloudflare tier — the session runs on a CF container placed by the
+    /// §0-gateway Durable Object, not on this host. `sandbox_id` carries the DO
+    /// base URL + the DO-side session id (a JSON [`ManagedHandle`]); there's no
+    /// local process. Drive (`send`) and read (`subscribe`/`watch`) go over the
+    /// DO's HTTP/WebSocket surface, so attach/teardown route to the DO, never a
+    /// local container/VM. See docs/managed-tier.md + [`crate::sandbox::managed`].
+    Managed,
 }
 
 impl Backend {
@@ -149,9 +157,30 @@ impl Backend {
         match label {
             BACKEND_DOCKER => Some(Backend::Docker),
             BACKEND_LIBKRUN => Some(Backend::Libkrun),
+            BACKEND_MANAGED => Some(Backend::Managed),
             _ => None,
         }
     }
+}
+
+/// Where a session physically runs — the dispatch axis attach/reattach/kill key
+/// off (docs/managed-tier.md §`Session` gains a `placement`). A *real* axis, not
+/// display sugar: a `Managed` session has no local sandbox to reach, so the plane
+/// routes its verbs to the §0 gateway DO instead of a local container/VM. Stored
+/// as a string (not the [`Backend`] label) so a future placement that reuses a
+/// transport — or an old record that predates the field — round-trips cleanly.
+/// `Local` is the default for every record written before this field existed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Placement {
+    /// On this host — a Docker container or a libkrun microVM. The historical
+    /// (and default) case; attach/kill act on the local daemon/VMM directly.
+    #[default]
+    Local,
+    /// On the managed Cloudflare tier — a CF container behind the §0-gateway DO.
+    /// Attach = re-subscribe to the durable DO log (the session is durable
+    /// server-side); there is no local process to signal or tear down.
+    Managed,
 }
 
 /// On-disk shape. Forward-compatible: serde will ignore unknown fields
@@ -220,6 +249,13 @@ pub(crate) struct Session {
     /// predate the field.
     #[serde(default)]
     pub(crate) guest_cwd: String,
+    /// Where this session physically runs (host-local vs the managed CF tier) —
+    /// the dispatch axis attach/reattach/kill route on. `Local` (the default)
+    /// for every record written before the managed tier existed, so old records
+    /// deserialize unchanged. A scalar string in TOML, so it sits above `server`
+    /// (a table) with the other scalars.
+    #[serde(default)]
+    pub(crate) placement: Placement,
     /// Server-integration (opencode) state — `Some` iff the agent is a `Server`
     /// integration, `None` for PTY agents (claude/codex). Grouped so a PTY record
     /// can't carry a half-populated `(agent_session_id, model)` tail.
@@ -286,6 +322,7 @@ impl Session {
             result_snapshot: None,
             expires_at: None,
             guest_cwd: String::new(),
+            placement: Placement::Local,
             server: None,
         }
     }
@@ -304,6 +341,14 @@ impl Session {
             o.insert("label".into(), label.clone().into());
         }
         o.insert("backend".into(), self.backend.clone().into());
+        // `placement` tells a consumer whether the session runs locally or on the
+        // managed tier — the axis `session attach`/`rm` route on. Always present
+        // (defaults to `local`) so an orchestrator can branch on it.
+        o.insert(
+            "placement".into(),
+            serde_json::to_value(self.placement)
+                .unwrap_or_else(|_| serde_json::Value::String("local".into())),
+        );
         o.insert("sandbox_id".into(), self.sandbox_id.clone().into());
         o.insert("pty_pid".into(), self.pty_pid.into());
         o.insert("agent_id".into(), self.agent_id.clone().into());
@@ -389,6 +434,7 @@ impl Session {
             result_snapshot: None,
             expires_at: None,
             guest_cwd: String::new(),
+            placement: Placement::Local,
             server: None,
         }
     }
@@ -658,6 +704,40 @@ mod tests {
         let id = Session::new_id();
         assert_eq!(id.len(), 12);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn placement_defaults_to_local_for_records_without_the_field() {
+        // Backward-compat: a record written before `placement` existed (no
+        // `placement` line) deserializes with `Placement::Local`, not an error.
+        let pre_field = r#"
+            id = "abc123def456"
+            backend = "docker"
+            sandbox_id = "container-1"
+            agent_id = "claude"
+            started_at = "2026-05-23T13:37:00Z"
+        "#;
+        let s: Session = toml::from_str(pre_field).expect("old record parses");
+        assert_eq!(s.placement, Placement::Local);
+    }
+
+    #[test]
+    fn placement_round_trips_managed_through_toml() {
+        let mut s = Session::test_fixture();
+        s.backend = BACKEND_MANAGED.to_string();
+        s.placement = Placement::Managed;
+        let toml = toml::to_string(&s).unwrap();
+        assert!(toml.contains(r#"placement = "managed""#), "{toml}");
+        let back: Session = toml::from_str(&toml).unwrap();
+        assert_eq!(back.placement, Placement::Managed);
+        // `server` (a table) must still parse — `placement` is a scalar above it,
+        // so the table-ordering invariant the struct doc warns about holds.
+        assert_eq!(back.server, s.server);
+    }
+
+    #[test]
+    fn backend_parse_round_trips_managed() {
+        assert_eq!(Backend::parse(BACKEND_MANAGED), Some(Backend::Managed));
     }
 
     #[test]

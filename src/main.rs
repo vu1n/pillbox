@@ -834,10 +834,18 @@ fn run(cli: Cli) -> Result<()> {
             clap_complete::generate(shell, &mut cmd, bin_name, &mut std::io::stdout());
             Ok(())
         }
-        Command::Workspace { action } => {
-            let resolved = Pillbox::resolve(pillbox_arg)?;
-            commands::workspace::dispatch(&resolved, action)
-        }
+        Command::Workspace { action } => match action {
+            // `restore`/`backup` are self-contained from flags+env — the
+            // managed-tier container that execs them has no pillbox /
+            // meta.json / state dir to resolve. Route them BEFORE
+            // `Pillbox::resolve` so the missing descriptor isn't an error.
+            WorkspaceAction::Restore(args) => commands::workspace::remote_restore(args),
+            WorkspaceAction::Backup(args) => commands::workspace::remote_backup(args),
+            other => {
+                let resolved = Pillbox::resolve(pillbox_arg)?;
+                commands::workspace::dispatch(&resolved, other)
+            }
+        },
         // Internal attach-transport commands. No pillbox resolution: they
         // operate on a raw PTY + socket and are invoked by pillbox itself.
         Command::PtyHost {
@@ -1055,5 +1063,168 @@ mod tests {
         let url = "http://collector.example.com/events";
         let out = validate_events_webhook_url(url).unwrap();
         assert_eq!(out, url);
+    }
+
+    // ── managed-tier `workspace restore|backup` flag parsing ─────────────
+    //
+    // These guard the FROZEN invocation contract the Durable Object execs.
+    // The non-secret coordinates are flags; the shape must not drift.
+
+    #[test]
+    fn workspace_restore_parses_frozen_flag_shape() {
+        let cli = Cli::try_parse_from([
+            "pillbox",
+            "workspace",
+            "restore",
+            "--endpoint",
+            "https://acct.r2.cloudflarestorage.com",
+            "--bucket",
+            "ws",
+            "--region",
+            "wnam",
+            "--prefix",
+            "repos/proj",
+            "--snapshot",
+            "abc123",
+            "--target",
+            "/work/proj",
+        ])
+        .expect("frozen restore shape must parse");
+        let Command::Workspace {
+            action: WorkspaceAction::Restore(a),
+        } = cli.command
+        else {
+            panic!("expected workspace restore");
+        };
+        assert_eq!(a.coords.endpoint, "https://acct.r2.cloudflarestorage.com");
+        assert_eq!(a.coords.bucket, "ws");
+        assert_eq!(a.coords.region, "wnam");
+        assert_eq!(a.coords.prefix, "repos/proj");
+        assert_eq!(a.snapshot, "abc123");
+        assert_eq!(a.target, "/work/proj");
+    }
+
+    #[test]
+    fn workspace_backup_parses_frozen_flag_shape() {
+        let cli = Cli::try_parse_from([
+            "pillbox",
+            "workspace",
+            "backup",
+            "--endpoint",
+            "https://x",
+            "--bucket",
+            "b",
+            "--prefix",
+            "p",
+            "--target",
+            "/work",
+        ])
+        .expect("frozen backup shape must parse");
+        let Command::Workspace {
+            action: WorkspaceAction::Backup(a),
+        } = cli.command
+        else {
+            panic!("expected workspace backup");
+        };
+        assert_eq!(a.coords.endpoint, "https://x");
+        assert_eq!(a.coords.bucket, "b");
+        assert_eq!(a.coords.prefix, "p");
+        assert_eq!(a.target, "/work");
+    }
+
+    #[test]
+    fn workspace_region_defaults_to_auto() {
+        // `--region` omitted → R2's `auto` convention.
+        let cli = Cli::try_parse_from([
+            "pillbox",
+            "workspace",
+            "backup",
+            "--endpoint",
+            "https://x",
+            "--bucket",
+            "b",
+            "--target",
+            "/work",
+        ])
+        .unwrap();
+        let Command::Workspace {
+            action: WorkspaceAction::Backup(a),
+        } = cli.command
+        else {
+            panic!("expected workspace backup");
+        };
+        assert_eq!(a.coords.region, "auto");
+    }
+
+    #[test]
+    fn workspace_prefix_may_be_empty() {
+        // `--prefix` omitted → empty (the repo lives at the bucket root).
+        let cli = Cli::try_parse_from([
+            "pillbox",
+            "workspace",
+            "restore",
+            "--endpoint",
+            "https://x",
+            "--bucket",
+            "b",
+            "--snapshot",
+            "h",
+            "--target",
+            "/work",
+        ])
+        .unwrap();
+        let Command::Workspace {
+            action: WorkspaceAction::Restore(a),
+        } = cli.command
+        else {
+            panic!("expected workspace restore");
+        };
+        assert_eq!(a.coords.prefix, "");
+    }
+
+    #[test]
+    fn workspace_restore_requires_target_and_snapshot() {
+        // Missing required flags must be a parse error (clap → usage).
+        assert!(Cli::try_parse_from([
+            "pillbox",
+            "workspace",
+            "restore",
+            "--endpoint",
+            "https://x",
+            "--bucket",
+            "b",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn workspace_rejects_secret_flags() {
+        // Secrets are env-only; there is no `--access-key` etc. surface.
+        // An unknown flag must fail parsing so a caller can't sneak a
+        // secret into argv.
+        for secret_flag in [
+            "--access-key",
+            "--secret-key",
+            "--repo-password",
+            "--password",
+        ] {
+            assert!(
+                Cli::try_parse_from([
+                    "pillbox",
+                    "workspace",
+                    "backup",
+                    "--endpoint",
+                    "https://x",
+                    "--bucket",
+                    "b",
+                    "--target",
+                    "/work",
+                    secret_flag,
+                    "leak",
+                ])
+                .is_err(),
+                "{secret_flag} must not be accepted (secrets are env-only)"
+            );
+        }
     }
 }

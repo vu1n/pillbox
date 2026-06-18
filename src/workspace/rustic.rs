@@ -225,6 +225,28 @@ impl RusticBackend {
         let repo = self.open()?;
         resolve_in(&repo, handle)
     }
+
+    /// The resolved S3 coordinates + creds for an S3-backed pillbox, or
+    /// `None` for the local-filesystem variant. Lets a caller (the managed
+    /// backend's container-native placement) hand the same repo config to a
+    /// remote restorer without re-plumbing the meta.json → env resolution.
+    /// The returned creds are the resolved values, so a caller must treat
+    /// this as secret material — never log or persist it.
+    pub(crate) fn s3_config(&self) -> Option<&S3Config> {
+        match &self.variant {
+            RusticVariant::S3(cfg) => Some(cfg),
+            RusticVariant::Local { .. } => None,
+        }
+    }
+
+    /// The repo encryption password, read from the local 0600 file. The
+    /// password ALWAYS stays local (it never travels with the repo), so this
+    /// is the single read-back point for a caller that must hand it to a
+    /// trusted restorer over a confidential channel. Secret material — never
+    /// log or persist it. Errors (with a `Next:`) if the file is missing.
+    pub(crate) fn resolved_password(&self) -> Result<String> {
+        self.read_password()
+    }
 }
 
 /// Resolve a handle (prefix or full ID) against an already-opened repo.

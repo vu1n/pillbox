@@ -29,12 +29,27 @@
 //!     token via [`mint_actor_token`] when set; falls back to
 //!     `PILLBOX_ACTOR_TOKEN` otherwise.
 //!
-//! ## Open design decisions — STUBBED, not guessed (see docs/managed-tier.md)
+//! ## Workspace placement — container-native rustic-on-R2
 //!
-//!   - **Workspace placement.** The spike runs the agent in an empty container
-//!     `/workspace`; getting the user's cwd *in* (and results *out*) is the
-//!     deferred R2/rustic question, NOT decided. [`ManagedBackend::run`] is a
-//!     loud stub at that boundary — it does not fabricate a transfer.
+//! [`ManagedBackend::run`] places the workspace by reusing the pillbox's rustic
+//! repo: the host snapshots cwd into R2, POSTs the DO `/provision` (repo config +
+//! password + snapshot) to restore it into the container `/workspace`, drives the
+//! turn, then POSTs `/finalize` to snapshot `/workspace` back and records the
+//! result handle. The R2 creds + the repo password travel ONLY in those HTTPS
+//! bodies — never in argv, a log, a §0 event, or the persisted `Session` record
+//! (which holds endpoint + session id + result handle; creds are re-resolved from
+//! env each run). The DO/worker restore+snapshot half is built separately to the
+//! same frozen contract (docs/managed-tier.md).
+//!
+//! ## Open follow-ups (flagged, not faked)
+//!
+//!   - **R2 key scoping.** `run` hands the DO the pillbox's full resolved R2
+//!     creds. The planned mitigation — a prefix-scoped, ephemeral R2 key so a
+//!     credential reaching CF can touch only this run's prefix — is not built yet.
+//!   - **Detached finalize.** Only the foreground path is implemented (drive a
+//!     turn, wait for idle, finalize). For a `--detach` managed run the host
+//!     returns before the turn ends, so the in-container wrapper would own the
+//!     `/finalize` + result-handle emission instead.
 //!   - **Token provisioning / trust.** Where a real user's token/secret comes
 //!     from (vs the spike's `/tmp` file) is unresolved; the env config above is
 //!     the interim surface.
@@ -48,6 +63,7 @@ use crate::agents::{AgentSpec, RunOpts};
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
 use crate::session::{self, Session, BACKEND_MANAGED};
+use crate::workspace::WorkspaceBackend;
 
 pub(crate) struct ManagedBackend;
 
@@ -82,27 +98,225 @@ impl SandboxBackend for ManagedBackend {
         BACKEND_MANAGED
     }
 
-    fn run(&self, _spec: &AgentSpec, _opts: RunOpts, _resolved: &Pillbox) -> Result<()> {
-        // ── STUB: workspace placement is the open design decision ──
-        // The §0/trust/subscribe/drive substrate is built + proven (the DO in
-        // `cloudflare-spike/`), and the read/write seams (`ManagedDoSource` /
-        // `ManagedDoSink`) are wired. What is NOT decided — and what this method
-        // would have to invent — is how the user's cwd gets *into* the managed
-        // container and how results come back out. The spike runs the agent in an
-        // empty `/workspace`; the deferred design (docs/managed-tier.md §workspace
-        // store) is R2/rustic, NOT chosen. Rather than fabricate a transfer (and
-        // silently run an agent against an empty tree), refuse loudly here. The
-        // drive + read verbs below DO work against an already-placed session
-        // (e.g. one the spike's harness started), which is what this backend is
-        // wired for today.
-        Err(PillboxError::usage(
+    /// Container-native, rustic-on-R2 workspace placement.
+    ///
+    /// The host snapshots cwd into the pillbox's R2 repo, hands the DO a
+    /// provisioning payload (repo config + password + snapshot), and the DO's
+    /// container restores it into `/workspace`, drives the agent, and snapshots
+    /// the result back to R2; the host records the result handle on the session.
+    /// This builds ONLY the host side — the DO/worker restore+snapshot is a
+    /// separate build to the same frozen contract (see docs/managed-tier.md).
+    fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
+        // 1. Require an R2/S3 workspace backend. The DO restores from a rustic
+        //    repo it can reach (R2), not the host's local-filesystem repo —
+        //    refuse a local-backend pillbox loudly instead of silently running
+        //    the agent against an empty container tree.
+        let workspace = resolved.workspace()?;
+        let s3 = require_s3_repo(&workspace)?;
+        // Read the repo password back from its local 0600 file. It travels ONLY
+        // in the HTTPS body to the DO (never argv/log/§0/the Session record).
+        let password = workspace.resolved_password()?;
+
+        // 2. Snapshot the run's workspace into the R2 repo, reusing the same push
+        //    path `pillbox push` calls (no reimplemented rustic backup). The DO
+        //    restores THIS handle into the container `/workspace`.
+        let workspace_host = match &opts.workspace {
+            Some(p) => p.clone(),
+            None => std::env::current_dir()
+                .map_err(|e| PillboxError::runtime("run", format!("resolve cwd: {e}")))?,
+        };
+        let snapshot = workspace
+            .push(&workspace_host, crate::workspace::PushOptions::default())?
+            .handle;
+
+        // 3. Resolve the DO endpoint (the same `PILLBOX_MANAGED_DO_URL` + per-session
+        //    path the §0 sink/source build), refusing a non-`https://` origin: the
+        //    POST body carries the resolved R2 creds + the repo password, so it must
+        //    never cross the wire in cleartext.
+        let session_id = crate::session::Session::new_id();
+        let endpoint = resolve_https_endpoint(&session_id)?;
+
+        // 4. Mint a driver token + POST /provision. `/provision` is driver-gated,
+        //    so it carries the same driver actor token as `/input` (`send`).
+        let token = driver_token().ok_or_else(|| {
+            PillboxError::config(
+                "run",
+                "no managed actor token: set PILLBOX_MANAGED_TOKEN_SECRET (to mint a driver \
+                 token) or PILLBOX_ACTOR_TOKEN (a pre-minted one)",
+            )
+        })?;
+        workspace_xfer::provision(&endpoint, &token, s3, &password, snapshot.as_str())?;
+
+        // 5. Build + persist the Session record. The record holds the DO endpoint +
+        //    session id + (later) the result handle — NEVER the creds or password,
+        //    which are re-resolved from env via `workspace()` on every run.
+        let handle = ManagedHandle {
+            endpoint: endpoint.clone(),
+            do_session_id: session_id.clone(),
+        };
+        let model = opts
+            .model
+            .clone()
+            .unwrap_or_else(|| crate::sandbox::opencode::DEFAULT_MODEL.to_string());
+        let session = Session {
+            id: session_id.clone(),
+            label: opts.label.clone(),
+            backend: BACKEND_MANAGED.to_string(),
+            sandbox_id: serde_json::to_string(&handle)
+                .map_err(|e| PillboxError::config("run", format!("encode managed handle: {e}")))?,
+            pty_pid: 0,
+            agent_id: spec.id.to_string(),
+            started_at: crate::session::now_rfc3339(),
+            attached_pid: None,
+            // The base the agent forked from — the snapshot the DO restored.
+            base_snapshot: Some(snapshot.as_str().to_string()),
+            result_snapshot: None,
+            expires_at: opts.ttl_seconds.map(crate::session::expires_at_from_ttl),
+            // The container mounts the restored tree at `/workspace`.
+            guest_cwd: crate::agents::GUEST_WORKSPACE.to_string(),
+            placement: session::Placement::Managed,
+            server: Some(crate::session::ServerSession {
+                // The DO is the agent-session authority; correlate by our id.
+                agent_session_id: session_id.clone(),
+                model,
+                temperature: opts.temperature,
+            }),
+        };
+        session::write(resolved, &session)?;
+        crate::events::emit_session_event(
+            resolved,
+            crate::events::EventType::SessionStarted {
+                parent_session_id: crate::events::parent_session_id_from_env(),
+                startup: None,
+            },
+            &session.id,
+            Some(&session),
+        );
+
+        let live = ManagedLiveSession::new(session.clone());
+
+        // 6. Drive the first turn through the plane (`send` → `/input`), then read
+        //    the §0 stream until the turn goes idle — the foreground path. The
+        //    initial prompt is the agent's positional args; with none, leave the
+        //    session ready for `session send` and return (detached-style).
+        let prompt = opts.args.join(" ").trim().to_string();
+        if prompt.is_empty() {
+            crate::sandbox::opencode::print_started(&session, opts.json, None);
+            // FOLLOW-UP: a no-prompt managed run leaves the workspace provisioned
+            // but never finalized (no turn → no result). When the drive surface
+            // gains a host-free "finalize on idle", the in-container wrapper owns
+            // that; for now a no-prompt run is bring-up only.
+            return Ok(());
+        }
+        live.send(format!("{prompt}\n").as_bytes())?;
+        wait_until_idle(resolved, &session.id)?;
+
+        // 7. Snapshot `/workspace` back to R2 via /finalize; record the handle so
+        //    `session pull <id>` can rehydrate the result.
+        let result_snapshot = workspace_xfer::finalize(&endpoint, &token, s3, &password)?;
+        let mut finished = session;
+        finished.result_snapshot = Some(result_snapshot);
+        session::write(resolved, &finished)?;
+
+        if opts.json {
+            crate::session::print_started_json(&finished);
+        } else {
+            println!(
+                "pillbox: ✓ managed session `{}` finished; result snapshot recorded.",
+                finished.id
+            );
+            println!(
+                "         pillbox session pull {}   # rehydrate the result",
+                finished.id
+            );
+        }
+        // FOLLOW-UP (detached managed run): for `--detach` the host returns before
+        // the turn ends, so this host-side `/finalize` can't run. The in-container
+        // wrapper would finalize + emit the result handle to the §0 sink instead.
+        // This pass implements only the foreground path; `--detach` managed is
+        // flagged, not faked.
+        Ok(())
+    }
+}
+
+/// Require an R2/S3 workspace backend, returning its resolved [`S3Config`]. The DO
+/// restores from a rustic repo it can reach (R2) — a local-filesystem repo is
+/// host-only, so a local-backend pillbox is refused loudly rather than running the
+/// agent against an empty container tree. Split out of `run` so the contract guard
+/// is unit-testable without a live DO.
+fn require_s3_repo(
+    workspace: &crate::workspace::rustic::RusticBackend,
+) -> Result<&crate::workspace::rustic::S3Config> {
+    workspace.s3_config().ok_or_else(|| {
+        PillboxError::config(
             "run",
-            "the managed backend can't place a workspace yet — workspace transfer \
-             (cwd in, results out) is an unresolved design decision (R2/rustic, see \
-             docs/managed-tier.md). pillbox can drive + read an already-placed \
-             managed session, but not launch one with your workspace.",
+            "managed run needs an R2/S3 workspace backend — this pillbox uses the \
+             local-filesystem rustic repo, which the managed container can't reach.",
         )
-        .with_next("PILLBOX_BACKEND=libkrun pillbox run   # the local microVM backend")
+        .with_next("pillbox new --endpoint <r2-url> --bucket <bucket> …  # an R2-backed pillbox")
+        .into()
+    })
+}
+
+/// Resolve the per-session managed DO endpoint and enforce HTTPS. The provision /
+/// finalize bodies carry the resolved R2 creds + the repo password, so a non-HTTPS
+/// origin (which would put them on the wire in cleartext) is refused — this is the
+/// mandatory transport guard. Split out of `run` so it's unit-testable.
+fn resolve_https_endpoint(session_id: &str) -> Result<String> {
+    let (endpoint, _read_token) = crate::events::managed_endpoint(session_id).ok_or_else(|| {
+        PillboxError::config(
+            "run",
+            "the managed backend needs PILLBOX_MANAGED_DO_URL set to the §0-gateway worker origin",
+        )
+        .with_next("export PILLBOX_MANAGED_DO_URL=https://<worker>.workers.dev")
+    })?;
+    if !endpoint.starts_with("https://") {
+        return Err(PillboxError::config(
+            "run",
+            format!(
+                "refusing to provision a managed workspace over a non-HTTPS endpoint \
+                 (`{endpoint}`): the request body carries the R2 credentials + the repo \
+                 password, which must not travel in cleartext"
+            ),
+        )
+        .with_next("set PILLBOX_MANAGED_DO_URL to an https:// origin")
+        .into());
+    }
+    Ok(endpoint)
+}
+
+/// Block until the managed session's current turn goes idle — the §0
+/// `AttentionRequired` signal (the agent yielded for input) or a terminal
+/// `RunFinished`/`RunFailed`. Reads the DO log through the same `open_event_source`
+/// the §0 read verbs use (it routes to [`ManagedDoSource`] under the managed env),
+/// so the wait isn't a hand-rolled read. Subscribes from seq 0 — a freshly-minted
+/// DO session has no prior turn, so the first idle is this turn's.
+fn wait_until_idle(resolved: &Pillbox, session_id: &str) -> Result<()> {
+    use crate::contract::Payload;
+    use std::sync::atomic::AtomicBool;
+
+    let source = crate::events::source::open_event_source(resolved, session_id)?;
+    let stop = AtomicBool::new(false);
+    let mut idle = false;
+    source.subscribe(0, &stop, &mut |ev| {
+        let done = matches!(
+            ev.payload,
+            Payload::AttentionRequired(_) | Payload::RunFinished(_) | Payload::RunFailed(_)
+        );
+        if done {
+            idle = true;
+        }
+        !done // keep reading until a turn-done event
+    })?;
+    if idle {
+        Ok(())
+    } else {
+        // The stream closed without an idle/terminal event (DO went away
+        // mid-turn) — surface it rather than silently finalizing a partial run.
+        Err(PillboxError::runtime(
+            "run",
+            format!("managed session `{session_id}` stream ended before the turn went idle"),
+        )
         .into())
     }
 }
@@ -416,6 +630,229 @@ mod input {
     }
 }
 
+/// Container-native workspace transfer — the host half of the frozen R2/rustic
+/// placement contract (see docs/managed-tier.md). `provision` hands the DO the
+/// rustic-on-R2 coordinates so its container restores the snapshot into
+/// `/workspace`; `finalize` asks the DO to snapshot `/workspace` back and returns
+/// the result handle. Both POST over HTTPS — the **only** channel the resolved R2
+/// creds + the repo password travel on. Kept in one submodule so the wire shapes
+/// (`{workspace:{repo,password,snapshot}}` / `{workspace:{repo,password}}`) and
+/// the error mapping live together, mirroring [`input`].
+mod workspace_xfer {
+    use anyhow::{Context, Result};
+    use serde::Serialize;
+
+    use crate::errors::PillboxError;
+    use crate::workspace::rustic::S3Config;
+
+    /// Restore + snapshot can move a whole workspace tree through R2, so the
+    /// per-event-sink budget ([`crate::events::EVENTS_SINK_TIMEOUT`], ~2s) is far
+    /// too tight — a real restore would time out spuriously. Bound it generously
+    /// instead so a genuinely hung DO still fails loud rather than parking forever.
+    const XFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+    /// The repo + password the DO needs to open the rustic repo on R2. The creds
+    /// inside `repo` (an [`S3Config`]) and `password` are resolved secret material;
+    /// they leave the host ONLY inside this body, over HTTPS — never logged,
+    /// never persisted on the `Session` record.
+    //
+    // FOLLOW-UP (R2 key scoping): we hand the DO the pillbox's full resolved R2
+    // creds. The planned mitigation — minting a prefix-scoped, ephemeral R2 key so
+    // a credential reaching CF can touch only this run's prefix — is not built yet;
+    // until it lands the full creds reach the managed plane. Tracked in
+    // docs/managed-tier.md.
+    #[derive(Serialize)]
+    struct WorkspaceRepo<'a> {
+        repo: &'a S3Config,
+        password: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        snapshot: Option<&'a str>,
+    }
+
+    #[derive(Serialize)]
+    struct ProvisionBody<'a> {
+        workspace: WorkspaceRepo<'a>,
+    }
+
+    /// `POST <endpoint>/provision` — the DO restores `snapshot` from the R2 repo
+    /// into the container `/workspace`. Driver-gated, so it carries the driver
+    /// actor token. Non-2xx maps to a clear pillbox error with the DO's body text.
+    pub(super) fn provision(
+        endpoint: &str,
+        token: &str,
+        repo: &S3Config,
+        password: &str,
+        snapshot: &str,
+    ) -> Result<()> {
+        let body = serde_json::to_string(&ProvisionBody {
+            workspace: WorkspaceRepo {
+                repo,
+                password,
+                snapshot: Some(snapshot),
+            },
+        })
+        .context("serialize managed /provision body")?;
+        let resp = post(endpoint, "provision", token, body)?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        // The error text may echo our request; the DO is trusted not to reflect
+        // the creds, but cap it so a hostile/buggy body can't flood the terminal.
+        let detail = error_detail(resp);
+        Err(PillboxError::runtime(
+            "run",
+            format!("managed workspace provision failed (HTTP {status}): {detail}"),
+        )
+        .into())
+    }
+
+    /// `POST <endpoint>/finalize` — the DO snapshots `/workspace` back to the R2
+    /// repo and returns `{ "resultSnapshot": "<handle>" }`. Returns the handle.
+    pub(super) fn finalize(
+        endpoint: &str,
+        token: &str,
+        repo: &S3Config,
+        password: &str,
+    ) -> Result<String> {
+        let body = serde_json::to_string(&ProvisionBody {
+            workspace: WorkspaceRepo {
+                repo,
+                password,
+                snapshot: None,
+            },
+        })
+        .context("serialize managed /finalize body")?;
+        let resp = post(endpoint, "finalize", token, body)?;
+        let status = resp.status();
+        if !status.is_success() {
+            let detail = error_detail(resp);
+            return Err(PillboxError::runtime(
+                "run",
+                format!("managed workspace finalize failed (HTTP {status}): {detail}"),
+            )
+            .into());
+        }
+        let text = resp.text().context("read managed /finalize response")?;
+        let parsed: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+            PillboxError::runtime(
+                "run",
+                format!("managed /finalize: unexpected response: {e}"),
+            )
+        })?;
+        parsed
+            .get("resultSnapshot")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                PillboxError::runtime(
+                    "run",
+                    format!("managed /finalize returned no `resultSnapshot`: {text}"),
+                )
+                .into()
+            })
+    }
+
+    /// One `POST <endpoint>/<path>` with the driver token + JSON body. Mirrors
+    /// [`super::input::drive_agent`]'s client/error-mapping shape; the only
+    /// difference is the longer [`XFER_TIMEOUT`] (a transfer, not a steer).
+    fn post(
+        endpoint: &str,
+        path: &str,
+        token: &str,
+        body: String,
+    ) -> Result<reqwest::blocking::Response> {
+        let url = format!("{}/{path}", endpoint.trim_end_matches('/'));
+        let client = reqwest::blocking::Client::builder()
+            .timeout(XFER_TIMEOUT)
+            .build()
+            .context("build managed workspace-transfer http client")?;
+        client
+            .post(&url)
+            .header("content-type", "application/json")
+            .bearer_auth(token)
+            .body(body)
+            .send()
+            .with_context(|| format!("POST {url}"))
+    }
+
+    /// The DO's error-body text, capped so a large/hostile body can't flood the
+    /// terminal. A read failure degrades to a placeholder rather than masking the
+    /// HTTP status the caller already reports.
+    fn error_detail(resp: reqwest::blocking::Response) -> String {
+        const CAP: usize = 2048;
+        let mut s = resp.text().unwrap_or_else(|_| "<unreadable body>".into());
+        if s.len() > CAP {
+            s.truncate(CAP);
+            s.push('…');
+        }
+        s
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn cfg() -> S3Config {
+            S3Config {
+                endpoint: "https://r2.example.com".into(),
+                region: "auto".into(),
+                bucket: "ws".into(),
+                prefix: "p/".into(),
+                access_key: "AK".into(),
+                secret_key: "SK".into(),
+            }
+        }
+
+        /// The frozen `/provision` shape: `{workspace:{repo:<S3Config>,password,snapshot}}`
+        /// — the S3Config nested under `repo`, the password + snapshot handle as
+        /// siblings. The DO side is built to this exact JSON.
+        #[test]
+        fn provision_body_serializes_to_the_frozen_shape() {
+            let c = cfg();
+            let body = serde_json::to_value(ProvisionBody {
+                workspace: WorkspaceRepo {
+                    repo: &c,
+                    password: "repo-pw",
+                    snapshot: Some("snap-handle"),
+                },
+            })
+            .unwrap();
+
+            let ws = &body["workspace"];
+            assert_eq!(ws["password"], "repo-pw");
+            assert_eq!(ws["snapshot"], "snap-handle");
+            // The S3Config is nested verbatim under `repo` (its serde fields).
+            let repo = &ws["repo"];
+            assert_eq!(repo["endpoint"], "https://r2.example.com");
+            assert_eq!(repo["bucket"], "ws");
+            assert_eq!(repo["access_key"], "AK");
+            assert_eq!(repo["secret_key"], "SK");
+        }
+
+        /// `/finalize` is the same shape minus `snapshot` (the DO snapshots
+        /// `/workspace`, it doesn't restore one) — `snapshot` is omitted, not null.
+        #[test]
+        fn finalize_body_omits_the_snapshot_field() {
+            let c = cfg();
+            let body = serde_json::to_value(ProvisionBody {
+                workspace: WorkspaceRepo {
+                    repo: &c,
+                    password: "repo-pw",
+                    snapshot: None,
+                },
+            })
+            .unwrap();
+            assert!(
+                body["workspace"].get("snapshot").is_none(),
+                "finalize must omit `snapshot`, got: {body}"
+            );
+            assert_eq!(body["workspace"]["repo"]["bucket"], "ws");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,5 +991,131 @@ mod tests {
         // error — the consumer's own `subscribe` reads it.
         // (Tailer spawn takes a Pillbox; covered by the integration path, not unit
         // tested here to avoid touching the registry.)
+    }
+
+    /// Removes the managed env vars on drop so a panic between set and the
+    /// assertions can't leak managed-routing state into another test.
+    struct ManagedEnvGuard;
+    impl Drop for ManagedEnvGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("PILLBOX_MANAGED_DO_URL");
+        }
+    }
+
+    /// The S3-backend-required guard: a local-filesystem rustic backend is refused
+    /// (the DO can't reach a host-local repo); an S3 backend resolves to its config.
+    #[test]
+    fn require_s3_repo_rejects_local_accepts_s3() {
+        use crate::workspace::rustic::{RusticBackend, RusticVariant, S3Config};
+        use std::path::PathBuf;
+
+        let local = RusticBackend {
+            variant: RusticVariant::Local {
+                repo_path: PathBuf::from("/tmp/repo"),
+            },
+            password_file: PathBuf::from("/tmp/pw"),
+        };
+        let err = require_s3_repo(&local).expect_err("local backend must be refused");
+        assert!(
+            err.to_string().contains("R2/S3 workspace backend"),
+            "guard must name the missing backend, got: {err}"
+        );
+
+        let s3 = RusticBackend {
+            variant: RusticVariant::S3(S3Config {
+                endpoint: "https://r2.example.com".into(),
+                region: "auto".into(),
+                bucket: "ws".into(),
+                prefix: String::new(),
+                access_key: "AK".into(),
+                secret_key: "SK".into(),
+            }),
+            password_file: PathBuf::from("/tmp/pw"),
+        };
+        assert_eq!(require_s3_repo(&s3).unwrap().bucket, "ws");
+    }
+
+    /// The mandatory HTTPS transport guard: a plaintext `http://` origin is refused
+    /// (the body carries the R2 creds + the repo password), and an unset env names
+    /// the missing var; an `https://` origin resolves to the per-session endpoint.
+    #[test]
+    fn resolve_https_endpoint_enforces_https() {
+        // Serialize the env mutation under the shared test lock (held by
+        // `with_isolated_home`) so a parallel test can't trample the var.
+        crate::test_util::with_isolated_home("managed-https-guard", || {
+            let _env = ManagedEnvGuard;
+
+            // Unset → config error naming the var.
+            std::env::remove_var("PILLBOX_MANAGED_DO_URL");
+            let err = resolve_https_endpoint("sess-1").expect_err("unset env must error");
+            assert!(err.to_string().contains("PILLBOX_MANAGED_DO_URL"));
+
+            // Plaintext http:// → refused before any network touch.
+            std::env::set_var("PILLBOX_MANAGED_DO_URL", "http://insecure.example.com");
+            let err = resolve_https_endpoint("sess-1").expect_err("http:// must be refused");
+            assert!(
+                err.to_string().contains("non-HTTPS"),
+                "guard must explain the HTTPS refusal, got: {err}"
+            );
+
+            // https:// → the per-session endpoint (matches `managed_endpoint`).
+            std::env::set_var("PILLBOX_MANAGED_DO_URL", "https://w.workers.dev");
+            let endpoint = resolve_https_endpoint("sess-1").expect("https resolves");
+            assert_eq!(
+                endpoint,
+                "https://w.workers.dev/agents/session-gateway/sess-1"
+            );
+        });
+    }
+
+    /// The persisted record must NEVER carry the R2 creds or the repo password —
+    /// it holds only the endpoint + session id (in the handle) + the result handle;
+    /// creds are re-resolved from env each run. Build the record exactly as `run`
+    /// does and assert no secret material survives the serialization.
+    #[test]
+    fn persisted_record_excludes_creds_and_password() {
+        let handle = ManagedHandle {
+            endpoint: "https://w.workers.dev/agents/session-gateway/sess-do".into(),
+            do_session_id: "sess-do".into(),
+        };
+        let session = Session {
+            id: "sess-do".into(),
+            label: None,
+            backend: BACKEND_MANAGED.to_string(),
+            sandbox_id: serde_json::to_string(&handle).unwrap(),
+            pty_pid: 0,
+            agent_id: "opencode".into(),
+            started_at: crate::session::now_rfc3339(),
+            attached_pid: None,
+            base_snapshot: Some("snap-base".into()),
+            result_snapshot: Some("snap-result".into()),
+            expires_at: None,
+            guest_cwd: crate::agents::GUEST_WORKSPACE.to_string(),
+            placement: session::Placement::Managed,
+            server: Some(crate::session::ServerSession {
+                agent_session_id: "sess-do".into(),
+                model: "zai-coding-plan/glm-4.5-air".into(),
+                temperature: None,
+            }),
+        };
+        // Serialize both the on-disk (TOML) and JSON forms; neither may leak the
+        // R2 access/secret keys or the repo password used during provisioning.
+        let toml = toml::to_string(&session).unwrap();
+        let json = serde_json::to_string(&session.to_json_value()).unwrap();
+        for blob in [&toml, &json] {
+            for secret in [
+                "AKIA-secret-access",
+                "super-secret-key",
+                "repo-password-value",
+            ] {
+                assert!(
+                    !blob.contains(secret),
+                    "record must not carry secret material `{secret}`: {blob}"
+                );
+            }
+        }
+        // Positive: it DOES carry the non-secret correlation handles.
+        assert!(toml.contains("sess-do"));
+        assert!(toml.contains("snap-result"));
     }
 }

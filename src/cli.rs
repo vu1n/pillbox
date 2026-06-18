@@ -127,6 +127,66 @@ pub(crate) enum SandboxAction {
 pub(crate) enum WorkspaceAction {
     /// Rotate the repository encryption password.
     Rekey,
+    /// Restore a snapshot from a rustic-on-S3 repo addressed by explicit
+    /// coordinates — NO pillbox / meta.json / state dir required. The
+    /// managed-tier Durable Object execs this inside a bare container to
+    /// rehydrate the workspace before the agent runs.
+    ///
+    /// Secrets are read from the environment ONLY, never flags/argv:
+    /// `PILLBOX_R2_ACCESS_KEY`, `PILLBOX_R2_SECRET_KEY`,
+    /// `PILLBOX_REPO_PASSWORD`.
+    Restore(RemoteRepoRestore),
+    /// Snapshot a directory into a rustic-on-S3 repo addressed by explicit
+    /// coordinates — NO pillbox required. Prints ONLY the new snapshot
+    /// handle (64-hex) as the final line of stdout. The managed-tier
+    /// Durable Object execs this to push results out after the agent runs.
+    ///
+    /// Secrets are read from the environment ONLY, never flags/argv:
+    /// `PILLBOX_R2_ACCESS_KEY`, `PILLBOX_R2_SECRET_KEY`,
+    /// `PILLBOX_REPO_PASSWORD`.
+    Backup(RemoteRepoBackup),
+}
+
+/// Non-secret S3 repo coordinates shared by `restore`/`backup`. Secrets
+/// (R2 keys + repo password) are deliberately absent — they come from the
+/// environment so they never land in argv, shell history, or a process
+/// listing.
+#[derive(clap::Args, Debug)]
+pub(crate) struct RemoteRepoCoords {
+    /// S3-compatible endpoint URL (e.g. an R2 account endpoint).
+    #[arg(long, value_name = "URL")]
+    pub(crate) endpoint: String,
+    /// Bucket holding the rustic repo.
+    #[arg(long, value_name = "BUCKET")]
+    pub(crate) bucket: String,
+    /// S3 region. R2 ignores it but the driver requires a value; defaults
+    /// to `auto` (R2's convention) when omitted.
+    #[arg(long, value_name = "REGION", default_value = "auto")]
+    pub(crate) region: String,
+    /// Key prefix (repo root) inside the bucket. May be empty.
+    #[arg(long, value_name = "PREFIX", default_value = "")]
+    pub(crate) prefix: String,
+}
+
+#[derive(clap::Args, Debug)]
+pub(crate) struct RemoteRepoRestore {
+    #[command(flatten)]
+    pub(crate) coords: RemoteRepoCoords,
+    /// Snapshot handle (or unique prefix) to restore.
+    #[arg(long, value_name = "HANDLE")]
+    pub(crate) snapshot: String,
+    /// Directory to restore into (created if absent).
+    #[arg(long, value_name = "DIR")]
+    pub(crate) target: String,
+}
+
+#[derive(clap::Args, Debug)]
+pub(crate) struct RemoteRepoBackup {
+    #[command(flatten)]
+    pub(crate) coords: RemoteRepoCoords,
+    /// Directory to snapshot into the repo.
+    #[arg(long, value_name = "DIR")]
+    pub(crate) target: String,
 }
 
 #[derive(Subcommand, Debug)]

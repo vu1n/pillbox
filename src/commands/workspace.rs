@@ -7,12 +7,17 @@
 //! `snapshot_dispatch`, `dispatch`) — main.rs's match arms call
 //! these directly.
 
+use std::path::{Path, PathBuf};
+
 use anyhow::Result;
 
-use crate::cli::{SnapshotAction, WorkspaceAction};
+use crate::cli::{
+    RemoteRepoBackup, RemoteRepoCoords, RemoteRepoRestore, SnapshotAction, WorkspaceAction,
+};
 use crate::errors::PillboxError;
 use crate::paths;
 use crate::pillbox::Pillbox;
+use crate::workspace::rustic::{RusticBackend, RusticVariant, S3Config};
 use crate::workspace::{PushOptions, Snapshot, SnapshotHandle, WorkspaceBackend};
 
 pub(crate) fn push(
@@ -197,8 +202,150 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: WorkspaceAction) -> Result<()
             println!("      treat the old password as compromised — back up + recreate the");
             println!("      pillbox if you need a hard cutover.");
         }
+        // Routed in main.rs BEFORE pillbox resolution (they're
+        // self-contained from flags+env). Unreachable here, but matched
+        // explicitly so adding a variant can't silently fall through.
+        WorkspaceAction::Restore(args) => return remote_restore(args),
+        WorkspaceAction::Backup(args) => return remote_backup(args),
     }
     Ok(())
+}
+
+// ── managed-tier standalone repo ops ────────────────────────────────────────
+//
+// `workspace restore` / `workspace backup` operate on a rustic-on-S3 repo
+// from explicit coordinates, with NO pillbox / meta.json / state dir. The
+// managed-tier Durable Object execs these inside a bare container to pull
+// the workspace in before the agent runs and push results out after. They
+// reuse the existing `RusticBackend` S3 paths (the same `push`/`pull` the
+// per-pillbox commands above call) — the only new surface is building the
+// backend from flags+env instead of a resolved pillbox.
+
+/// Restore `--snapshot` into `--target`, addressing the repo by explicit
+/// S3 coordinates + env-only secrets. Reuses `RusticBackend::pull`.
+pub(crate) fn remote_restore(args: RemoteRepoRestore) -> Result<()> {
+    let target = PathBuf::from(&args.target);
+    // Create the target up front: `pull` restores into an existing dir
+    // (mirrors `pillbox pull` over cwd), and the managed container hands
+    // us a fresh path that may not exist yet.
+    std::fs::create_dir_all(&target).map_err(|e| {
+        PillboxError::runtime(
+            "workspace restore",
+            format!("create target dir {}: {e}", target.display()),
+        )
+    })?;
+
+    let pw = RepoPassword::from_env("workspace restore")?;
+    let backend = remote_backend("workspace restore", &args.coords, pw.path())?;
+    let handle = SnapshotHandle::new(args.snapshot);
+    backend.pull(&target, Some(&handle))?;
+    println!(
+        "pillbox: ✓ restored snapshot {} into {}",
+        handle.short(),
+        target.display()
+    );
+    Ok(())
+}
+
+/// Snapshot `--target` into the repo addressed by explicit S3 coordinates
+/// with env-only secrets. Reuses `RusticBackend::push` and prints ONLY
+/// the new snapshot handle as the final stdout line (the DO captures it
+/// as the result handle).
+pub(crate) fn remote_backup(args: RemoteRepoBackup) -> Result<()> {
+    let target = PathBuf::from(&args.target);
+    if !target.is_dir() {
+        return Err(PillboxError::usage(
+            "workspace backup",
+            format!("target {} is not a directory", target.display()),
+        )
+        .into());
+    }
+
+    let pw = RepoPassword::from_env("workspace backup")?;
+    let backend = remote_backend("workspace backup", &args.coords, pw.path())?;
+    let snap = backend.push(&target, PushOptions::default())?;
+    // The full 64-hex handle is the contract output — the DO reads it as
+    // the final stdout line. Keep it the LAST thing printed; status goes
+    // to stderr so stdout stays a clean single-line handle.
+    eprintln!(
+        "pillbox: ✓ snapshot {} ({})",
+        snap.handle.short(),
+        human_bytes(snap.bytes)
+    );
+    println!("{}", snap.handle.as_str());
+    Ok(())
+}
+
+/// Build an S3-backed `RusticBackend` from non-secret coordinates +
+/// env-resolved credentials. `password_file` points at a temp 0600 file
+/// holding `PILLBOX_REPO_PASSWORD` (see [`RepoPassword`]).
+fn remote_backend(
+    action: &'static str,
+    coords: &RemoteRepoCoords,
+    password_file: &Path,
+) -> Result<RusticBackend> {
+    let access_key = require_env(action, "PILLBOX_R2_ACCESS_KEY")?;
+    let secret_key = require_env(action, "PILLBOX_R2_SECRET_KEY")?;
+    Ok(RusticBackend {
+        variant: RusticVariant::S3(S3Config {
+            endpoint: coords.endpoint.clone(),
+            region: coords.region.clone(),
+            bucket: coords.bucket.clone(),
+            prefix: coords.prefix.clone(),
+            access_key,
+            secret_key,
+        }),
+        password_file: password_file.to_path_buf(),
+    })
+}
+
+/// The repo encryption password sourced from `PILLBOX_REPO_PASSWORD`,
+/// materialized as a temp 0600 file because `RusticBackend` reads its
+/// password from disk (`read_password`). The temp dir auto-removes on
+/// drop, so the password never lingers after the command returns — and it
+/// never touches argv, where another process could read it.
+struct RepoPassword {
+    // Held only for its Drop (RAII cleanup of the temp dir + file).
+    _dir: tempfile::TempDir,
+    path: PathBuf,
+}
+
+impl RepoPassword {
+    fn from_env(action: &'static str) -> Result<Self> {
+        let password = require_env(action, "PILLBOX_REPO_PASSWORD")?;
+        let dir = tempfile::Builder::new()
+            .prefix("pillbox-repo-pw")
+            .tempdir()
+            .map_err(|e| {
+                PillboxError::runtime(action, format!("create temp dir for repo password: {e}"))
+            })?;
+        let path = dir.path().join("repo-password");
+        // 0600 via the shared private-file writer so the on-disk perms
+        // invariant stays in one place (matches the per-pillbox password).
+        crate::paths::write_private_file(&path, password.as_bytes())?;
+        Ok(Self { _dir: dir, path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Read a REQUIRED secret env var, erroring (exit 3 / config) by name if
+/// it's unset or empty. Secrets come from the environment ONLY — never
+/// flags/argv — so a missing one is a configuration error, not usage.
+fn require_env(action: &'static str, var: &'static str) -> Result<String> {
+    match std::env::var(var) {
+        Ok(v) if !v.is_empty() => Ok(v),
+        _ => Err(PillboxError::config(
+            action,
+            format!("missing required environment variable {var}"),
+        )
+        .with_next(format!(
+            "set {var} in the environment (never pass secrets as flags)"
+        ))
+        .into()),
+    }
 }
 
 /// Render `bytes` as a short human-readable string (`104 B`, `4.2 KB`,
@@ -282,4 +429,90 @@ fn snapshot_json_with_bookmark(snap: &Snapshot, bookmark: Option<&str>) -> Strin
         .map(|s| serde_json::Value::String(s.to_string()))
         .unwrap_or(serde_json::Value::Null);
     paths::json_v1(vec![("snapshot", snapshot_value(snap)), ("bookmark", bm)])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::errors::ExitCategory;
+
+    // `require_env` reads PROCESS-global env; serialize the env-mutating
+    // tests so they don't race each other (cargo runs tests in parallel).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn err_is_config_missing(action: &'static str, var: &'static str) {
+        let err = require_env(action, var).unwrap_err();
+        let pb = err
+            .downcast_ref::<PillboxError>()
+            .expect("missing-env must be a PillboxError");
+        // Config error → exit 3 (per the contract: missing secret env var
+        // is a configuration problem, not a usage one).
+        assert_eq!(pb.category as u8, ExitCategory::Config as u8);
+        // The message must NAME the missing var so the DO/operator knows
+        // which one to set.
+        assert!(
+            pb.reason.contains(var),
+            "reason must name {var}, got: {}",
+            pb.reason
+        );
+    }
+
+    #[test]
+    fn require_env_errors_config_for_each_missing_secret() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        for var in [
+            "PILLBOX_R2_ACCESS_KEY",
+            "PILLBOX_R2_SECRET_KEY",
+            "PILLBOX_REPO_PASSWORD",
+        ] {
+            std::env::remove_var(var);
+            err_is_config_missing("workspace restore", var);
+        }
+    }
+
+    #[test]
+    fn require_env_treats_empty_value_as_missing() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // An empty string is as unusable as unset — guard rejects both so
+        // a blank secret can't silently produce a broken repo handle.
+        std::env::set_var("__PB_TEST_EMPTY_SECRET", "");
+        let err = require_env("workspace backup", leak_static("__PB_TEST_EMPTY_SECRET"));
+        let err = err.unwrap_err();
+        let pb = err.downcast_ref::<PillboxError>().unwrap();
+        assert_eq!(pb.category as u8, ExitCategory::Config as u8);
+        std::env::remove_var("__PB_TEST_EMPTY_SECRET");
+    }
+
+    #[test]
+    fn require_env_returns_value_when_set() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("__PB_TEST_PRESENT_SECRET", "v");
+        let got = require_env("workspace backup", leak_static("__PB_TEST_PRESENT_SECRET")).unwrap();
+        assert_eq!(got, "v");
+        std::env::remove_var("__PB_TEST_PRESENT_SECRET");
+    }
+
+    #[test]
+    fn repo_password_writes_temp_0600_file_and_cleans_up() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("PILLBOX_REPO_PASSWORD", "topsecret-pw");
+        let pw = RepoPassword::from_env("workspace restore").unwrap();
+        let path = pw.path().to_path_buf();
+        // Materialized 0600 (matches the per-pillbox password invariant).
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "temp password file must be 0600");
+        // Contents are the env value verbatim (RusticBackend trims on read).
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "topsecret-pw");
+        // Drop removes the temp dir + file so the secret doesn't linger.
+        drop(pw);
+        assert!(!path.exists(), "temp password file must be removed on drop");
+        std::env::remove_var("PILLBOX_REPO_PASSWORD");
+    }
+
+    // `require_env` takes `&'static str`; the test-only var names above are
+    // string literals so this leak is bounded to the (tiny) test set.
+    fn leak_static(s: &str) -> &'static str {
+        Box::leak(s.to_string().into_boxed_str())
+    }
 }

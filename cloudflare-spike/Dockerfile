@@ -10,6 +10,15 @@ FROM docker.io/cloudflare/sandbox:0.11.0
 # /prompt_async (runner/Dockerfile OPENCODE_VERSION).
 RUN npm install -g opencode-ai@1.17.3
 
+# The pillbox binary (linux/amd64) — the managed tier's workspace tool. The
+# §0-gateway DO execs `pillbox workspace restore|backup` to rehydrate the
+# rustic-on-R2 workspace into /workspace before the agent runs and snapshot
+# results back after. Cross-built against glibc 2.31 (≤ this image's 2.35, so it
+# runs) from the repo root and dropped in this build context; gitignored, so it
+# must be (re)built + copied before `wrangler deploy` (see README).
+COPY pillbox-linux-amd64 /usr/local/bin/pillbox
+RUN chmod +x /usr/local/bin/pillbox
+
 # The opencode session's working directory (createOpencodeServer's `directory`,
 # == OPENCODE_DIR in session_gateway.ts). Created so the consume path has a writable cwd.
 RUN mkdir -p /workspace

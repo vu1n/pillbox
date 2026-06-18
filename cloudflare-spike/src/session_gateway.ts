@@ -419,6 +419,11 @@ export class SessionGateway extends Agent<Env> {
     password: string,
   ): Promise<{ ok: boolean; detail: string; stdout: string }> {
     const env = {
+      // The SDK's exec REPLACES the container env with this map, so re-assert the
+      // essentials a bare command needs (PATH for any subprocess, HOME for tools
+      // that read it) alongside the secrets.
+      PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      HOME: "/root",
       PILLBOX_R2_ACCESS_KEY: repo.access_key,
       PILLBOX_R2_SECRET_KEY: repo.secret_key,
       PILLBOX_REPO_PASSWORD: password,
@@ -912,7 +917,11 @@ function nowRfc3339(): string {
 // snapshot (it creates one).
 function workspaceCmd(mode: "restore" | "backup", repo: WorkspaceRepo, snapshot?: string): string {
   const args = [
-    "pillbox",
+    // Absolute path, not bare `pillbox`: execWorkspaceTool passes an explicit
+    // `env`, and the SDK's exec REPLACES the environment with it — so $PATH is
+    // lost and bash's default PATH omits /usr/local/bin. (We also re-assert PATH
+    // in the env, but the absolute path is robust regardless.)
+    "/usr/local/bin/pillbox",
     "workspace",
     mode,
     "--endpoint",

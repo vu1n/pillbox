@@ -8,6 +8,7 @@
 
 pub(crate) mod auth;
 pub(crate) mod bookmark;
+pub(crate) mod collect;
 pub(crate) mod dispatch;
 pub(crate) mod env;
 pub(crate) mod eval;

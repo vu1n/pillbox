@@ -83,6 +83,11 @@ impl std::fmt::Display for SnapshotHandle {
 pub(crate) struct PushOptions {
     pub(crate) tag: Option<String>,
     pub(crate) message: Option<String>,
+    /// Parent snapshot handles (prefix-ok) recorded as this snapshot's lineage —
+    /// the merge-back edge an orchestrator declares (`push --parent base
+    /// --parent winner`). Resolved to full ids against the repo and persisted in
+    /// the snapshot's pillbox metadata; empty for an ordinary push.
+    pub(crate) parents: Vec<String>,
 }
 
 /// One snapshot record returned by [`WorkspaceBackend::push`] /
@@ -106,6 +111,14 @@ pub(crate) struct Snapshot {
     pub(crate) message: Option<String>,
     pub(crate) git_anchor: Option<String>,
     pub(crate) git_dirty: bool,
+    /// Parent snapshot handles (full ids) — this snapshot's lineage in the
+    /// workspace DAG. A fork-result has one parent (its base); a merge-back push
+    /// records several (`push --parent base --parent winner`). Empty for an
+    /// ordinary linear push or a pre-lineage snapshot. Pillbox-native (carried in
+    /// the snapshot's metadata trailer), so it survives `session rm` and works on
+    /// the S3/R2 backend where there's no git to read it from.
+    #[serde(default)]
+    pub(crate) parents: Vec<String>,
     pub(crate) bytes: u64,
     pub(crate) files_new: u64,
     pub(crate) files_changed: u64,

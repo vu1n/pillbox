@@ -119,8 +119,9 @@ global pillbox regardless of where you are.
 | `pillbox session transcript FILE --session-id ID [--agent claude\|codex] [--follow]` | Drain an agent-native transcript (Claude Code `~/.claude/projects/<encoded>/<uuid>.jsonl` or Codex `~/.codex/sessions/<y>/<m>/<d>/rollout-*.jsonl`) and emit one OTLP child span per rendered event, parented under the session span derived from `ID`. Harness auto-detected from path; `--agent` overrides. `--follow` drains then blocks waiting on FS notifications and emits spans for each appended line (Ctrl-C to stop) — the "watch your agent think" mode. Requires `OTEL_EXPORTER_OTLP_ENDPOINT` to actually ship; parser runs regardless and reports the event count. See [docs/observability.md](./docs/observability.md). |
 | `pillbox doctor [--json]` | Diagnose Docker, image, perms, `$HOME`. |
 | `pillbox version` | Print pillbox + runner image versions. |
-| `pillbox push [--tag T] [--message M] [--bookmark NAME] [--json]` | Snapshot cwd into the pillbox's rustic repo. `--bookmark NAME` also points a bookmark at the new snapshot atomically (snapshot+name in one call, bound to this push — no handle-copy or `latest` race; needs a project pillbox). |
+| `pillbox push [--tag T] [--message M] [--bookmark NAME] [--parent HANDLE]… [--json]` | Snapshot cwd into the pillbox's rustic repo. `--bookmark NAME` also points a bookmark at the new snapshot atomically (snapshot+name in one call, bound to this push — no handle-copy or `latest` race; needs a project pillbox). `--parent HANDLE` (repeatable, prefix-ok) records parent snapshots as this one's **lineage** — the merge-back edge an orchestrator declares after merging collected results (`push --parent <base> --parent <winner>`). Parents resolve to full ids (unknown parent → error) and are stored pillbox-native (survive `session rm`, work on S3/R2); surfaced as a `parents` array by `snapshot show/list --json`. |
 | `pillbox pull [--snapshot HANDLE \| --bookmark NAME]` | Restore cwd from a snapshot (defaults to latest) or bookmark. |
+| `pillbox collect SESSION… [--to DIR] [--as-refs] [--json]` | **Collect** finished session results + lineage for an orchestrator to merge — the substrate half of a fan-out loop (pillbox collects, the orchestrator decides how to merge; `dispatch` = `collect` + grade + select-one). Rehydrates each session's result tree into `<to>/<session>/` (default `./collected`) and emits a `--json` manifest of the **merge triple** per result: `base_snapshot`/`base_git_anchor` (fork point + merge base commit), `result_snapshot` (theirs), `dir`, `source`. All-or-nothing on unfinished sessions. `--as-refs` also synthesizes a git commit per result (tree = result, parent = merge base) under `refs/pillbox/collect/<session>` so the orchestrator `git merge`/`jj`s with its own policy (requires cwd = git work tree; adds `ref` to the manifest). pillbox never merges. See docs/collect.md. |
 | `pillbox snapshot list [--json]` | List every snapshot in the pillbox's repo. |
 | `pillbox snapshot show HANDLE [--json]` | Show one snapshot (HANDLE may be a unique prefix). |
 | `pillbox snapshot rm HANDLE` | Forget a snapshot (data packs survive until prune). |
@@ -372,6 +373,7 @@ future releases; the version bumps on restructure. Pin against
       "message": "first cut",
       "git_anchor": "abc123...",
       "git_dirty": false,
+      "parents": ["<64-char hex>", ...],   // lineage DAG edges; [] if none
       "bytes": 1024
     }
   ]
@@ -382,7 +384,7 @@ future releases; the version bumps on restructure. Pin against
   "version": 1,
   "snapshot": { "handle": "...", "short": "...", "created_at": "...",
                 "tag": null, "message": null,
-                "git_anchor": null, "git_dirty": false, "bytes": 0 }
+                "git_anchor": null, "git_dirty": false, "parents": [], "bytes": 0 }
 }
 
 // pillbox bookmark list --json

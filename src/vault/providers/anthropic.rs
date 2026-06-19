@@ -573,6 +573,10 @@ fn coordinate_refresh(
             return Coordinated::Error(format!("read response: {e}"));
         }
     };
+    // A refresh is rare (once per token lifetime); log where the vault's own
+    // upstream call went and how it landed — URL + status only, no token material.
+    // Cheap confirmation that the forward reached Anthropic directly (not a loop).
+    eprintln!("pillbox: vault: refresh forward {url} → HTTP {status}");
 
     if !(200..300).contains(&status) {
         // Upstream rejected the refresh → fail closed (the next begin re-auths).
@@ -628,14 +632,34 @@ fn coordinate_refresh(
     }
 }
 
-/// True if the "upstream" token response handed back one of our own stubs — the
-/// signature of a forward that looped through the vault instead of reaching the real
-/// endpoint. Committing such a response would clobber the real creds file with a
-/// stub, so the coordinator fails closed when this holds.
+/// A pillbox-minted stub by SHAPE: `mint_stub` emits `<prefix>` + three
+/// `uuid_v7().simple()` runs = a 96-char pure-lowercase-hex tail. Real Anthropic
+/// tokens carry mixed-case/non-hex tails, so this is an unambiguous structural
+/// tell — and catches a looped stub from ANY sandbox, not just this session's.
+fn is_stub_shaped(token: &str) -> bool {
+    token
+        .strip_prefix(STUB_ACCESS_PREFIX)
+        .or_else(|| token.strip_prefix(STUB_REFRESH_PREFIX))
+        .is_some_and(|tail| {
+            tail.len() == 96
+                && tail
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+}
+
+/// True if the "upstream" token response handed back a pillbox stub — the signature
+/// of a forward that looped through the vault instead of reaching the real endpoint.
+/// Committing such a response would clobber the real creds file with a stub, so the
+/// coordinator fails closed when this holds. Checks both this session's exact stubs
+/// AND the structural stub shape (a loop can surface another sandbox's stub).
 fn is_stub_loopback(upstream: &serde_json::Value, stub_access: &str, stub_refresh: &str) -> bool {
     let acc = upstream.get("access_token").and_then(|v| v.as_str());
     let refr = upstream.get("refresh_token").and_then(|v| v.as_str());
-    acc == Some(stub_access) || refr == Some(stub_refresh)
+    acc == Some(stub_access)
+        || refr == Some(stub_refresh)
+        || acc.is_some_and(is_stub_shaped)
+        || refr.is_some_and(is_stub_shaped)
 }
 
 /// Splice the upstream token response into the real creds (claude shape). `None`
@@ -1730,5 +1754,141 @@ mod tests {
             stub_a,
             stub_r
         ));
+        // A loop can surface ANOTHER sandbox's stub (not our exact pair) — the
+        // structural check still catches it. This is the case the exact-match guard
+        // missed in the live smoke.
+        let other = format!("sk-ant-oat01-{}", "0123456789abcdef".repeat(6)); // 96 hex
+        assert_eq!(other.len(), 109);
+        assert!(is_stub_shaped(&other));
+        assert!(is_stub_loopback(
+            &serde_json::json!({ "access_token": other, "refresh_token": "REAL_R" }),
+            stub_a,
+            stub_r
+        ));
+        // A real token (mixed case / non-hex tail) is not stub-shaped.
+        assert!(!is_stub_shaped(
+            "sk-ant-oat01-52xRZAGfjjK9someRealMixedCaseTail"
+        ));
+    }
+
+    /// One-shot local HTTP server: accepts a single connection, drains the request,
+    /// and replies with `status` + `body`. Stands in for the real `/oauth/token`
+    /// endpoint so the full forward→commit path is exercised without claude or the
+    /// network — the piece the live smoke couldn't pin down deterministically.
+    fn spawn_oauth_server(status: u16, body: serde_json::Value) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = serde_json::to_vec(&body).unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf); // drain request headers+body (small)
+                let head = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+        format!("http://127.0.0.1:{port}/v1/oauth/token")
+    }
+
+    fn expired_real_disk() -> serde_json::Value {
+        serde_json::json!({
+            "claudeAiOauth": { "accessToken": "AT0", "refreshToken": "RT0", "expiresAt": 1 },
+        })
+    }
+
+    #[test]
+    fn coordinate_refresh_commits_real_tokens_on_success() {
+        // The success path: a real upstream 200 → commit the REAL rotated tokens to
+        // the creds file (NOT a stub). This is the path the live smoke kept routing
+        // around (legacy fallback) or failing early (consumed RT / env-proxy loop).
+        let url = spawn_oauth_server(
+            200,
+            serde_json::json!({
+                "access_token": "REAL_NEW_ACCESS",
+                "refresh_token": "REAL_NEW_REFRESH",
+                "expires_in": 3600,
+            }),
+        );
+        let (dir, store) = store_on(expired_real_disk());
+        let decider = ClaudeRefreshDecider {
+            mapped_access: Some("AT0".into()),
+        };
+        let out = coordinate_refresh(
+            store,
+            decider,
+            url,
+            reqwest::header::HeaderMap::new(),
+            serde_json::json!({ "grant_type": "refresh_token", "refresh_token": "sk-ant-ort01-stub" }),
+            sample_anthropic_real(),
+            "sk-ant-oat01-myStub".into(),
+            "sk-ant-ort01-myStub".into(),
+        );
+        assert!(
+            matches!(out, Coordinated::Committed { .. }),
+            "expected a real commit"
+        );
+        // The creds file holds the REAL rotated tokens — not a stub.
+        let disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(".credentials.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            disk.pointer("/claudeAiOauth/accessToken").unwrap(),
+            "REAL_NEW_ACCESS"
+        );
+        assert_eq!(
+            disk.pointer("/claudeAiOauth/refreshToken").unwrap(),
+            "REAL_NEW_REFRESH"
+        );
+        // Real metadata preserved from the snapshot.
+        assert_eq!(
+            disk.pointer("/claudeAiOauth/subscriptionType").unwrap(),
+            "pro"
+        );
+    }
+
+    #[test]
+    fn coordinate_refresh_refuses_a_stub_response_and_leaves_creds_untouched() {
+        // The clobber-prevention path: if the "upstream" 200 hands back a stub (the
+        // loop signature), the loop-guard fails closed — NO commit, creds file
+        // untouched. This is the exact corruption the live smoke produced.
+        let stub = format!("sk-ant-oat01-{}", "0123456789abcdef".repeat(6)); // 96 hex
+        let url = spawn_oauth_server(
+            200,
+            serde_json::json!({
+                "access_token": stub,
+                "refresh_token": format!("sk-ant-ort01-{}", "0123456789abcdef".repeat(6)),
+                "expires_in": 3600,
+            }),
+        );
+        let (dir, store) = store_on(expired_real_disk());
+        let decider = ClaudeRefreshDecider {
+            mapped_access: Some("AT0".into()),
+        };
+        let out = coordinate_refresh(
+            store,
+            decider,
+            url,
+            reqwest::header::HeaderMap::new(),
+            serde_json::json!({ "grant_type": "refresh_token", "refresh_token": "sk-ant-ort01-stub" }),
+            sample_anthropic_real(),
+            "sk-ant-oat01-myStub".into(),
+            "sk-ant-ort01-myStub".into(),
+        );
+        assert!(
+            matches!(out, Coordinated::Error(ref e) if e.contains("looped")),
+            "expected the loop-guard to fail closed"
+        );
+        // Creds file UNCHANGED — the original disk tokens survive, no stub written.
+        let disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(".credentials.json")).unwrap())
+                .unwrap();
+        assert_eq!(disk.pointer("/claudeAiOauth/accessToken").unwrap(), "AT0");
+        assert_eq!(disk.pointer("/claudeAiOauth/refreshToken").unwrap(), "RT0");
     }
 }

@@ -29,10 +29,10 @@ use crate::workspace::WorkspaceBackend;
 // VMM substrate kept in the parent module (used here AND by `vmm_child_main`):
 // spec types, the CoW/stub/rootfs helpers, the cache dir, and shared consts.
 use super::{
-    boot, cow_clone_and_scrub, cow_clone_home, disk_headroom, egress, http, krun_cache_dir,
-    materialize_rootfs, runtime_deps_present, shell_quote, stub_oauth_creds, unsupported,
-    EgressSpec, LibkrunBackend, Share, SwapPair, VmSpec, VsockAttach, GUEST_CA_PATH,
-    MIN_HEADROOM_BYTES,
+    boot, cow_clone_and_scrub, cow_clone_home, disk_headroom, egress, env_fork_left_real_unstubbed,
+    http, krun_cache_dir, materialize_rootfs, oauth_swap_hosts, runtime_deps_present, shell_quote,
+    stub_oauth_creds, unsupported, EgressSpec, LibkrunBackend, Share, SwapPair, VmSpec,
+    VsockAttach, GUEST_CA_PATH, MIN_HEADROOM_BYTES,
 };
 
 impl SandboxBackend for LibkrunBackend {
@@ -467,14 +467,40 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
     // clone inherits it). The guest mounts the *stubbed* creds — the real tokens
     // never enter the VM; the MITM swaps stub→real on the wire. The reals reach the
     // child out-of-band on stdin (not env/argv/VmSpec).
-    // OAuth tokens are bound to the agent's provider hosts (its API + OAuth/refresh
-    // endpoints) — the swap fires only there, never on a `--with` or `--egress-allow`
-    // host, so a leaked OAuth stub can't be replayed elsewhere for the real token.
-    let oauth_hosts: Vec<String> = crate::vault::providers::intercepted_hosts()
-        .into_iter()
-        .map(str::to_string)
-        .collect();
+    // OAuth tokens are bound to ONLY the agent's own provider hosts (its API +
+    // OAuth/refresh endpoints), never the full cross-provider intercepted_hosts()
+    // union — so a leaked OAuth stub can't be replayed to a *different* provider's
+    // host to extract the real token. Reachability (the DNS fence below) is a
+    // separate axis.
+    let oauth_hosts = oauth_swap_hosts(spec);
+    // A vault-capable agent must resolve to a provider so its swap can be bound to
+    // that provider's hosts. An empty host set is treated as "unbound" by the MITM
+    // (applies on every host) — which would re-open the cross-host replay — so a
+    // vault-capable agent with no provider is fail-closed here, not silently unbound.
+    if spec.vault_capable && oauth_hosts.is_empty() {
+        bail!(
+            "libkrun env-fork: agent `{}` is vault-capable but no vault provider claims it, \
+             so its credential swap can't be host-bound (an unbound swap applies on every \
+             host). Refusing to launch.",
+            spec.id
+        );
+    }
     let (creds_share, mut swap_pairs) = stub_oauth_creds(&home, spec.cred_sentinel, &oauth_hosts)?;
+    // Fail loud: a vault-capable agent whose credentials file produced no stubs
+    // would mount the real token into the guest unstubbed (exfiltratable by a
+    // prompt-injected agent). Refuse to launch rather than leak. Generalizing the
+    // stubber to that agent's credential shape is the fix; until then this guard
+    // keeps an unhandled shape safe. (Checked before the `--with` swaps are folded
+    // in below, so their pairs can't mask an empty OAuth set.)
+    if env_fork_left_real_unstubbed(spec, &home, &swap_pairs) {
+        bail!(
+            "libkrun env-fork: agent `{}` is vault-capable and has credentials at `{}`, but \
+             the env-fork produced no credential stubs — its credential shape isn't handled \
+             yet, so the real token would mount into the guest unstubbed. Refusing to launch.",
+            spec.id,
+            spec.cred_sentinel
+        );
+    }
     // Fold the vaulted `--with` swaps in alongside the OAuth ones (one MITM blob),
     // and collect their hosts for the egress allowlist below.
     let with_hosts: Vec<String> = with_vault

@@ -506,6 +506,31 @@ fn mint_oauth_stub(real: &str) -> String {
     format!("{prefix}-pllbxstub{}", uuid::Uuid::now_v7().simple())
 }
 
+/// The hosts the agent's OAuth credential swap is bound to: ONLY its owning
+/// provider's hosts (its API + OAuth/refresh endpoints), never the full
+/// cross-provider [`intercepted_hosts`] union. Binding to the union would let a
+/// guest replay this agent's OAuth stub onto a *different* provider's host (e.g. a
+/// claude stub to `api.openai.com`) and extract the real token there. Reachability
+/// (the DNS fence) is a separate axis. Empty when no provider claims the agent — a
+/// non-vault agent; the launch guard ([`env_fork_left_real_unstubbed`]) catches a
+/// vault-capable agent that nonetheless stubs nothing.
+fn oauth_swap_hosts(spec: &AgentSpec) -> Vec<String> {
+    crate::vault::providers::provider_for(spec.auth_id)
+        .map(|p| p.hosts().iter().map(|h| (*h).to_string()).collect())
+        .unwrap_or_default()
+}
+
+/// True when the env-fork left a real credential exposed: a vault-capable agent
+/// that has an on-disk credentials file but produced no stub pairs would mount the
+/// real token into the guest unstubbed (exfiltratable by a prompt-injected agent).
+/// `prepare_launch` turns this into a hard launch failure rather than a silent
+/// leak. Non-vault agents (opencode, pi) legitimately mount their key as-is, so
+/// they're exempt; an agent that isn't logged in (no creds file) has nothing to
+/// leak.
+fn env_fork_left_real_unstubbed(spec: &AgentSpec, creds_root: &Path, pairs: &[SwapPair]) -> bool {
+    spec.vault_capable && pairs.is_empty() && creds_root.join(spec.cred_sentinel).exists()
+}
+
 /// Single-quote a shell argument (`'` → `'\''`).
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -675,7 +700,11 @@ fn cstr(s: &str) -> CString {
 
 #[cfg(test)]
 mod tests {
-    use super::{find_cached_rootfs, mint_oauth_stub};
+    use super::{
+        env_fork_left_real_unstubbed, find_cached_rootfs, mint_oauth_stub, oauth_swap_hosts,
+        SwapPair,
+    };
+    use crate::agents::{CLAUDE, CODEX, PI};
 
     // Write a generation dir with a marker shaped like the real one, then set
     // its mtime so "newest wins" is testable without sleeping (`age_secs` ago).
@@ -737,6 +766,64 @@ mod tests {
         assert_ne!(stub, real);
         // Distinct each call (uuid suffix).
         assert_ne!(mint_oauth_stub(real), stub);
+    }
+
+    #[test]
+    fn oauth_swap_hosts_binds_to_only_the_owning_provider() {
+        // claude's OAuth swap binds to Anthropic's hosts — and MUST NOT include
+        // another provider's host (the cross-host replay the binding closes).
+        let hosts = oauth_swap_hosts(&CLAUDE);
+        assert!(
+            hosts.iter().any(|h| h == "api.anthropic.com"),
+            "got: {hosts:?}"
+        );
+        assert!(
+            !hosts.iter().any(|h| h == "api.openai.com"),
+            "leaked openai host: {hosts:?}"
+        );
+        assert!(
+            !hosts.iter().any(|h| h == "api.github.com"),
+            "leaked github host: {hosts:?}"
+        );
+        // codex binds to its own (OpenAI ChatGPT) hosts, not anthropic's.
+        let codex = oauth_swap_hosts(&CODEX);
+        assert!(codex.iter().any(|h| h == "chatgpt.com"), "got: {codex:?}");
+        assert!(
+            !codex.iter().any(|h| h == "api.anthropic.com"),
+            "leaked anthropic host: {codex:?}"
+        );
+        // pi has no vault provider → no swap hosts at all.
+        assert!(oauth_swap_hosts(&PI).is_empty());
+    }
+
+    #[test]
+    fn env_fork_guard_fires_for_vault_agent_with_unstubbed_creds() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path();
+        // A vault-capable agent (codex) with a creds file but zero stub pairs means
+        // the env-fork didn't understand its shape → must be flagged (the real
+        // token would otherwise mount unstubbed).
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::write(home.join(CODEX.cred_sentinel), "{}").unwrap();
+        assert!(env_fork_left_real_unstubbed(&CODEX, home, &[]));
+        // Once pairs are minted, it's fine.
+        let pair = SwapPair {
+            stub: "s".into(),
+            real: "r".into(),
+            hosts: vec![],
+        };
+        assert!(!env_fork_left_real_unstubbed(
+            &CODEX,
+            home,
+            std::slice::from_ref(&pair)
+        ));
+        // A non-vault agent (pi) mounts its key as-is by design — never flagged.
+        std::fs::create_dir_all(home.join(".pi/agent")).unwrap();
+        std::fs::write(home.join(PI.cred_sentinel), "{}").unwrap();
+        assert!(!env_fork_left_real_unstubbed(&PI, home, &[]));
+        // Not logged in (no creds file) → nothing to leak.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(!env_fork_left_real_unstubbed(&CODEX, empty.path(), &[]));
     }
 
     #[test]

@@ -348,6 +348,19 @@ fn launch_base(
         .into());
     }
 
+    // Coordinated start-of-run pre-refresh, on the LIVE/global auth creds, BEFORE
+    // any CoW clone or bookmark pull — so concurrent launches (notably
+    // `dispatch -k`, which forks k libkrun workers on the one shared credential)
+    // rotate the refresh token at most once and the later clone inherits the fresh
+    // token. Routed through the same single-writer `TokenStore` as the docker path;
+    // fails closed if a needed refresh can't complete safely (see
+    // `crate::vault::pre_refresh`). Placed before `cow_clone_and_scrub` so a
+    // fail-closed abort leaks no per-run clone. A no-adapter agent (codex /
+    // opencode today, incl. the server path) is a skip. `auth login` runs the
+    // agent's own login argv directly and never reaches here, so a re-login can't
+    // be blocked by a dead token.
+    crate::vault::pre_refresh(&home.join(spec.cred_sentinel), spec.auth_id)?;
+
     let workspace_host = match &opts.workspace {
         Some(p) => p.clone(),
         None => std::env::current_dir().context("resolve current working directory")?,

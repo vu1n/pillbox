@@ -38,5 +38,9 @@ pub(crate) use ca::{cert_path_in as ca_cert_path_in, Ca};
 pub(crate) use egress::{is_denied_egress_ip, EgressPolicy};
 pub(crate) use known_secrets::{HeaderScheme, VaultMeta};
 pub(crate) use lease::SandboxLease;
+// Re-exported for the libkrun launch path (`prepare_launch`); the docker path
+// calls `refresh::pre_refresh` directly from within the vault module.
+#[cfg(feature = "libkrun")]
+pub(crate) use refresh::pre_refresh;
 pub(crate) use server::{RunContext, Server, ServerConfig};
 pub(crate) use session::{OAuthAgent, VaultSession};

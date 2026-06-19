@@ -330,17 +330,15 @@ fn provision_oauth_mount(server: &Server, agent: OAuthAgent<'_>) -> Result<OAuth
         )
     })?;
 
-    // Proactively refresh if the stored access token is past expiry —
-    // see `super::refresh` for the rationale + wire details. Non-fatal
-    // on failure: caller's warning + agent's own retry-on-401 handle
-    // it transparently.
-    if let Err(e) = super::refresh::refresh_real_if_expired(&mut real, agent.agent_id, &creds_path)
-    {
-        eprintln!(
-            "pillbox: warning: vault token pre-refresh failed for `{}`: {e}; \
-             agent will fall back to its own retry-on-401",
-            agent.agent_id,
-        );
+    // Proactively refresh if the stored access token is past expiry, so the stub
+    // creds mounted into the guest carry a fresh token (the agent never 401s on
+    // its first call). The shared `pre_refresh` routes this through the
+    // single-writer `TokenStore` (safe under `dispatch -k` / overlapping detached
+    // sessions) and FAILS CLOSED on any non-`Fresh` outcome — see its docs and
+    // `docs/vault-oauth-refresh-coordination.md`. `None` = no adapter for this
+    // agent (skip); `?` propagates the fail-closed abort.
+    if let Some(fresh) = super::refresh::pre_refresh(&creds_path, agent.agent_id)? {
+        real = fresh;
     }
 
     let sandbox_id = uuid::Uuid::now_v7().to_string();
@@ -366,11 +364,11 @@ fn provision_oauth_mount(server: &Server, agent: OAuthAgent<'_>) -> Result<OAuth
     })
 }
 
-/// Write `content` to `path` as a 0600 file, creating-or-truncating.
-/// Shared with [`super::refresh`] (which rewrites the stored real
-/// credentials after a token refresh); kept here because
-/// `provision_oauth_mount` is the original caller and the
-/// abstraction doesn't earn its own module.
+/// Write `content` to `path` as a 0600 file, creating-or-truncating. Two
+/// callers: `provision_oauth_mount` (the stub creds tempfile) and the teardown
+/// persist in `VaultSession::drop` (flushing registry-rotated creds back to the
+/// host auth store). The pre-refresh path no longer uses it — that writes
+/// through `TokenStore`'s own atomic rename.
 pub(super) fn write_private(path: &Path, content: &str) -> Result<()> {
     let mut f = fs::OpenOptions::new()
         .create(true)

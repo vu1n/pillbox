@@ -20,10 +20,6 @@
 //! re-sends a token that may already be consumed. An ambiguous failure (the POST
 //! was sent but the outcome is unknown) resolves to **re-auth, not retry**.
 
-// Until the live refresh paths are wired through this (next PR), the type is only
-// exercised by its own tests.
-#![allow(dead_code)]
-
 use std::fs;
 use std::io;
 use std::os::unix::fs::OpenOptionsExt;
@@ -43,12 +39,17 @@ pub(crate) enum EnsureOutcome {
     Fresh(Value),
     /// A fresh token could not be established *safely* — the refresh token is
     /// gone, was rejected, or its rotation outcome is unknown (so it must not be
-    /// re-sent). The caller surfaces this as "run `pillbox auth login`". Distinct
-    /// from a transient I/O error (which is `Err`).
-    ReauthRequired,
-    /// The lock couldn't be acquired within the deadline. The caller should
-    /// proceed on its current (still-valid) access token rather than block a turn
-    /// behind another broker's in-flight refresh (convoy control).
+    /// re-sent). The caller surfaces this as "run `pillbox auth login`". The
+    /// `String` is a human-readable reason for that surfacing; the core stays
+    /// I/O-free and lets the caller log it with run context. Distinct from a
+    /// transient I/O error (which is `Err`).
+    ReauthRequired(String),
+    /// The lock couldn't be acquired within `max_lock_wait`. This is a neutral
+    /// signal — the *policy* is the caller's: proceed on its current access token
+    /// (convoy control) or fail closed. The start-of-run pre-refresh fails closed
+    /// (a holder still wedged past the bound is mid-POST of a stale token, so this
+    /// caller's token is stale too); a future in-proxy caller may choose
+    /// differently.
     LockBusy,
 }
 
@@ -161,7 +162,11 @@ impl TokenStore {
 
         // A real `pending` → a token may be consumed but unconfirmed → fail closed.
         if state.pending.is_some() {
-            return Ok(EnsureOutcome::ReauthRequired);
+            return Ok(EnsureOutcome::ReauthRequired(
+                "a prior refresh's outcome is unconfirmed (pending marker set); \
+                 the refresh token may have been consumed and must not be re-sent"
+                    .to_string(),
+            ));
         }
 
         // Coalesce: re-reading the creds under the lock is the check — if another
@@ -171,7 +176,9 @@ impl TokenStore {
         }
 
         let Some(refresh) = adapter.refresh_token(&creds) else {
-            return Ok(EnsureOutcome::ReauthRequired);
+            return Ok(EnsureOutcome::ReauthRequired(
+                "no refresh token in stored credentials".to_string(),
+            ));
         };
 
         // Mark the token consumed *before* the POST, fsync'd, so "at most once"
@@ -191,17 +198,19 @@ impl TokenStore {
                 self.write_state(&state)?;
                 Ok(EnsureOutcome::Fresh(creds))
             }
-            Err(RotateError::Definite(_)) => {
-                // Cleanly rejected: the token didn't silently rotate, so clearing
-                // the marker is safe. Family is dead → re-auth.
+            Err(RotateError::Definite(reason)) => {
+                // Cleanly rejected, or provably never sent (a connect failure):
+                // either way the token wasn't ambiguously consumed, so clearing
+                // the marker is safe — a clean rejection means the family is dead,
+                // a connect blip means the token is intact for a later attempt.
                 state.pending = None;
                 self.write_state(&state)?;
-                Ok(EnsureOutcome::ReauthRequired)
+                Ok(EnsureOutcome::ReauthRequired(reason))
             }
-            Err(RotateError::Ambiguous(_)) => {
+            Err(RotateError::Ambiguous(reason)) => {
                 // Outcome unknown: leave `pending` SET so neither this caller nor
                 // any other ever re-sends the token. Re-auth, never retry.
-                Ok(EnsureOutcome::ReauthRequired)
+                Ok(EnsureOutcome::ReauthRequired(reason))
             }
         }
     }
@@ -277,6 +286,13 @@ struct LockGuard {
 /// Write `bytes` to `path` atomically: a 0600 temp file in the same directory,
 /// optionally fsync'd, then `rename`d over the target (atomic on a POSIX fs). A
 /// crash leaves either the old or the new file whole, never a torn one.
+///
+/// When `sync`, the parent directory is also fsync'd *after* the rename — the
+/// rename itself is a directory-metadata change, so without this a crash can
+/// lose the rename even though the temp file's data was synced. This is
+/// load-bearing for the `pending` marker: it must be durably visible before the
+/// upstream POST so a crash can't erase the at-most-once record and let a later
+/// run re-send a consumed token.
 fn write_atomic(path: &Path, bytes: &[u8], sync: bool) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = tempfile::Builder::new()
@@ -296,6 +312,16 @@ fn write_atomic(path: &Path, bytes: &[u8], sync: bool) -> Result<()> {
     tmp.persist(path)
         .map_err(|e| e.error)
         .with_context(|| format!("rename into {}", path.display()))?;
+    if sync {
+        // Propagate failure: the `pending` marker's durability is the at-most-once
+        // invariant. If we can't fsync the rename through, we must NOT report
+        // success and let the caller proceed to the POST — fail closed instead.
+        let dir_file =
+            fs::File::open(dir).with_context(|| format!("open dir for fsync {}", dir.display()))?;
+        dir_file
+            .sync_all()
+            .with_context(|| format!("fsync dir {}", dir.display()))?;
+    }
     Ok(())
 }
 
@@ -478,12 +504,12 @@ mod tests {
         let (_d, store) = store_with(stale());
         let adapter = MockAdapter::new(MockOutcome::Ambiguous);
         let out = store.ensure_fresh(&adapter).unwrap();
-        assert!(matches!(out, EnsureOutcome::ReauthRequired));
+        assert!(matches!(out, EnsureOutcome::ReauthRequired(_)));
         assert!(store.read_state().pending.is_some(), "pending stays set");
         // The token on disk is unchanged (rotate didn't splice), so a second call
         // sees pending matching the current token → fail closed, NO second POST.
         let out2 = store.ensure_fresh(&adapter).unwrap();
-        assert!(matches!(out2, EnsureOutcome::ReauthRequired));
+        assert!(matches!(out2, EnsureOutcome::ReauthRequired(_)));
         assert_eq!(
             adapter.rotate_calls.load(Ordering::SeqCst),
             1,
@@ -496,7 +522,7 @@ mod tests {
         let (_d, store) = store_with(stale());
         let adapter = MockAdapter::new(MockOutcome::Definite);
         let out = store.ensure_fresh(&adapter).unwrap();
-        assert!(matches!(out, EnsureOutcome::ReauthRequired));
+        assert!(matches!(out, EnsureOutcome::ReauthRequired(_)));
         assert!(
             store.read_state().pending.is_none(),
             "a clean rejection clears the marker"

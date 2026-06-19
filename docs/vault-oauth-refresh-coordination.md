@@ -1,10 +1,47 @@
 # Vault OAuth refresh coordination — single-writer token rotation (design)
 
-Status: **design / proposed** (2026-06-19). A credential-correctness design for
+Status: **partially built** (2026-06-19). A credential-correctness design for
 running one subscription OAuth account (Claude, Codex) across **multiple
 concurrent pillbox sessions** — `dispatch -k`, concurrent `--detach` runs,
 multiple projects — without tripping the provider's refresh-token reuse
 detection and getting the whole session logged out.
+
+Implementation status (see [Build order](#build-order) for the slices):
+
+| Slice | What | Status |
+|---|---|---|
+| M1a core | `TokenStore` single-writer protocol (`vault/token_store.rs`) | **merged** (#95) |
+| M1a slice 2a | Claude `RefreshAdapter` + start-of-run pre-refresh routed through `TokenStore`, fail-closed — **both backends** (libkrun `prepare_launch`, docker `provision_oauth_mount`) via the shared `refresh::pre_refresh` | **this PR** |
+| M1a slice 2b | in-proxy `/oauth/token` handlers rotate through `TokenStore` (Claude + Codex) | next |
+| M1a slice 3 | `VaultSession::drop` teardown persist under the lock (or deleted) | pending |
+| M1a slice 4 | enforce the `--vault` boundary table in code (incl. codex-serve unstubbed refusal) | pending |
+| M1b / M2 / M3 / M4 | non-expiring stub (gated) / profiles / libkrun verify / managed | later |
+
+### Backend priority — read this before touching the refresh path again
+
+**libkrun is primary; docker is secondary.** This recurs, so it's written down:
+
+- **libkrun** is the local-compute default *and the only backend `dispatch -k`
+  uses* — so it's where credential-coordination work matters first. Its pre-refresh
+  lives in `libkrun/session.rs::prepare_launch` (the env-fork chokepoint), runs for
+  every vault-capable agent (not gated on `--vault`), and therefore covers dispatch
+  workers directly.
+- **docker** is the no-KVM compat backend **and the local twin of the Cloudflare
+  container family** (same container transport family; libkrun is a microVM, a
+  different shape). So a correct docker credential flow is the *local rehearsal* of
+  the managed backend's flow — "container + a single-writer credential authority" is
+  docker+`TokenStore` locally and CF-Container+Credential-DO remotely. That CF-twin
+  role — not docker-only users — is why docker survives deprecation here.
+
+**Is any of this relevant to the managed/CF backend?** The **core** (the invariant,
+`RefreshAdapter`, the failure classification, the fail-closed policy) is
+substrate-agnostic and transfers — *if* M4 builds our own Credential DO (option (a)
+below): a DO is the distributed twin of the flock, both "exactly one writer." If M4
+instead rides CF's credential proxy (option (b), which `managed-tier.md` currently
+leans toward), CF owns rotation and this work stays local-only. The flock and the
+per-backend call sites never transfer; the protocol + adapter do. Don't relitigate
+docker-vs-libkrun as a *priority* question — they're local twins of different
+things, both plugging into the same substrate-agnostic core.
 
 Companion to [vault.md](./vault.md) (the broker mechanics), the
 [managed-tier](./managed-tier.md) (the DO substrate this extends), and the
@@ -47,14 +84,22 @@ two brokers from both sending the *same* refresh token to the provider's
 `/oauth/token`. The reuse-revoke happens at the provider, before any disk write.
 And the persist runs at *teardown* — far too late for an overlapping session.
 
-Concrete failing timeline today:
+Concrete failing timeline (the **pre-2a** behavior this slice closes):
 
 ```
 Run A and Run B start concurrently, both read RT0 from the global creds file.
-A's pre-refresh (session.rs → refresh::refresh_real_if_expired): RT0 -> RT1, persist RT1.
+A's pre-refresh (the old session.rs → refresh::refresh_real_if_expired): RT0 -> RT1, persist RT1.
 B's pre-refresh: still holds RT0 (read before A persisted) -> sends RT0 to provider.
 Provider: "RT0 reused" -> revoke the whole family -> A and B both dead -> forced re-login.
 ```
+
+Slice 2a closes the **pre-refresh** leg of this on **both backends** (libkrun's
+`prepare_launch` and docker's `provision_oauth_mount` call the same
+`refresh::pre_refresh`): concurrent launches — including `dispatch -k`, which forks
+k libkrun workers on the one shared credential — rotate through the single-writer
+`TokenStore`, so only one POSTs `RT0` and the rest coalesce onto `RT1`. The
+**in-proxy** leg (a guest agent refreshing mid-run, which on libkrun is the
+request-leg MITM) is still uncoordinated until slice 2b — see the build order.
 
 ---
 
@@ -74,10 +119,12 @@ The first two hold today. This document is about the third.
 
 - **The vault is the single refresh interceptor.** On `--vault` the broker
   pre-refreshes an expired token before launch
-  (`vault/session.rs::provision_oauth_mount` → `vault/refresh.rs::refresh_real_if_expired`,
+  (`vault/session.rs::provision_oauth_mount`; as of slice 2a this rotates through
+  `TokenStore::ensure_fresh` via `vault/refresh.rs::ClaudeRefreshAdapter`,
   refreshing `PRE_EXPIRY_BUFFER` ahead of `expiresAt`), intercepts in-run
   `/oauth/token` rotations (`vault/providers/anthropic.rs::handle_oauth_request` /
-  `handle_response`), and persists the rotated pair back to the global creds file.
+  `handle_response` — **not yet** routed through `TokenStore`, that's slice 2b),
+  and persists the rotated pair back to the global creds file.
 - **The shared artifact already exists**: the global creds file — the agent's
   `cred_sentinel` under its auth home
   (`~/.pillbox/global/auth/claude/.claude/.credentials.json`,
@@ -109,19 +156,34 @@ file alone gives you reads, not *serialization* — that needs a lock.
 
 A small host-side type wrapping the per-provider/profile creds file plus a lock:
 
-File layout (the creds path is the agent's `cred_sentinel` *under* the auth home —
-e.g. `~/.pillbox/global/auth/claude/.claude/.credentials.json`):
+File layout **as implemented** (`TokenStore::new` derives the sidecars from the
+creds path; the vendor creds file keeps its own schema untouched):
 
 ```
-~/.pillbox/global/auth/claude/
-  .claude/.credentials.json      # real tokens + rotation_generation + pending marker (ONE file, written atomically)
-  pillbox-auth.lock              # flock target — the critical section
+~/.pillbox/global/auth/claude/.claude/
+  .credentials.json                       # vendor file — real tokens (unchanged schema)
+  .credentials.json.pillbox-rotation.json # pillbox bookkeeping: generation + pending marker
+  .credentials.json.pillbox-rotation.lock # flock target — the critical section
 ```
 
-The `rotation_generation` and the `pending` marker live **inside the creds file**
-(or a single sidecar written-and-renamed together with it), not a second
-`meta.json` — two files can't be updated atomically, and a crash between them
-desyncs the generation from the tokens.
+> **Note — divergence from the original design.** The first draft put
+> `generation`/`pending` *inside* the creds file (one atomic write). The
+> implementation instead uses a **sidecar** so the vendor file's schema stays
+> pristine. Two files can't be updated atomically, so the `pending` marker is
+> **reconciled** against the on-disk creds rather than trusted blindly: on entry,
+> if `pending`'s fingerprint no longer matches the on-disk refresh token, a prior
+> rotation completed and the marker is stale → cleared.
+>
+> **Known limitation (tracked).** That reconciliation assumes a completed rotation
+> *moves* the refresh token. Anthropic does **not** always rotate the refresh
+> token (it sometimes returns a new access token only; `apply_refresh_response`
+> preserves the old refresh token). In that case a crash in the narrow window
+> *after* the durable creds write but *before* the (non-durable) `pending`-clear
+> leaves `pending` fingerprinting the still-current refresh token → the next run
+> fails closed (spurious re-auth). Safe (never reuse, recoverable via `auth
+> login`) but a real false-positive. Fix belongs to the core: fold
+> `generation`/`pending` into the durable creds write (per the original design),
+> or reconcile on a monotonic signal independent of whether the RT changed.
 
 ```rust
 struct TokenStore { creds_path: PathBuf, lock_path: PathBuf }
@@ -199,6 +261,48 @@ generation, and adopts the fresh token without ever sending a stale one.
 > empirical check.** If that check fails, we keep Primitive 1 (correct, but the
 > guest still refreshes through the broker, so the libkrun response-leg gap is
 > handled separately rather than sidestepped).
+
+#### Caller policy: fail closed on a non-`Fresh` outcome (slice 2a)
+
+`ensure_fresh` returns `Fresh(creds)` | `ReauthRequired(reason)` | `LockBusy`.
+The start-of-run pre-refresh (`provision_oauth_mount`) **aborts the run on
+anything but `Fresh`** rather than proceeding best-effort on the stored token.
+The reasoning is the at-most-once invariant, not just UX:
+
+- The only safe credential to lease into the proxy is a freshly-rotated one. A
+  stale, refresh-capable credential lets the guest agent re-POST a maybe-consumed
+  / being-rotated refresh token through the **in-proxy** path (still uncoordinated
+  until slice 2b) and trip reuse-revoke.
+- A refresh is only attempted when the access token is already past expiry, so a
+  failed refresh means the run would 401 anyway — aborting with a clear
+  `pillbox auth login` / "retry" message beats a cryptic mid-run failure.
+- `LockBusy` only fires when a holder is genuinely wedged (the bounded wait is
+  sized above the POST timeout; a normal convoy coalesces in well under it), and a
+  wedged holder is one that's mid-POST of a *stale* token — so this caller's token
+  is stale too. Fail closed.
+
+This is stricter than the doc's earlier "best-effort, agent's retry-on-401
+recovers" framing: best-effort proceed is the unsafe bit while the in-proxy path
+(2b) is uncoordinated.
+
+#### Implementation refinements (slice 2a review)
+
+The `RotateError` classification is the at-most-once hinge — only a *provably
+non-consuming* failure may be `Definite` (which clears the `pending` marker):
+
+- **Redirects disabled** on the refresh client. reqwest replays the POST body on
+  307/308, so following a redirect would POST the same refresh token twice in one
+  call and trip reuse detection. A 3xx surfaces as a non-2xx → `Ambiguous`.
+- **`Definite` only for a recognized OAuth grant-rejection** (RFC 6749 §5.2
+  `invalid_grant` etc.) **or a pre-send connect error** (`is_connect() &&
+  !is_timeout()` — a connect *timeout* can never be proven pre-send). A 429, a
+  middlebox 4xx, a 5xx, a timeout, or an unparseable body → `Ambiguous`: a blanket
+  `is_client_error()` was unsafe because a 4xx returned *after* the server rotated
+  would clear `pending` and re-enable a consumed token.
+- **No raw response bodies in surfaced reasons** — only the status + the short
+  OAuth error code, so a reflected request parameter can't echo a token into logs.
+- **`write_atomic` fsyncs the parent directory** after the rename on durable
+  writes, so a crash can't lose the `pending` rename after the POST.
 
 ### Primitive 2 — the non-expiring stub (OPTIMIZATION, empirically gated)
 
@@ -364,16 +468,39 @@ to replace a revoked token family and invalidate stale leases.
 
 ## Build order
 
-- **M1a (now) — the single writer.** `TokenStore` (flock + bounded wait + re-read
-  from disk under the lock + atomic single-file write of creds+generation+pending +
-  at-most-once `pending` marker + circuit-breaker on ambiguous failure). **Rotate
-  the in-proxy `/oauth/token` handlers through it** (anthropic + codex — they must
-  stop forwarding the registry's start-of-run token). **Make `VaultSession::drop`
-  lock+generation-checked for all providers, or delete it.** Enforce the boundary
-  table in code (`dispatch` forces `--vault`; refuse concurrent non-vault OAuth,
-  docker-detach OAuth, vaulted-`--with`-without-OAuth, codex-serve). Concurrent +
-  ambiguous-failure + no-reuse + crash-mid-rotation tests. **This is the slice that
-  kills the dispatch foot-gun — no daemon, no vendor-behavior assumption.**
+- **M1a — the single writer.** Split into reviewable slices:
+  - **core (merged, #95)** — `TokenStore` (flock + bounded wait + re-read from
+    disk under the lock + atomic single-file write + at-most-once `pending` marker
+    fsync'd before the POST + coalesce). Behavior-inert until wired.
+  - **slice 2a (this PR)** — Claude `RefreshAdapter` + the start-of-run
+    pre-refresh routed through `ensure_fresh`, **fail-closed** on non-`Fresh`, with
+    the redirect/grant-rejection/connect-vs-timeout/dir-fsync refinements above.
+    Wired into **both backends** via the shared `refresh::pre_refresh`: libkrun's
+    `prepare_launch` (the env-fork chokepoint — covers `dispatch -k`) and docker's
+    `provision_oauth_mount`. Closes the **pre-refresh** leg of the dispatch
+    foot-gun — no daemon, no vendor-behavior assumption.
+  - **slice 2b (next)** — rotate the in-proxy `/oauth/token` handlers through the
+    `TokenStore` (anthropic + codex must stop forwarding the registry's
+    start-of-run token; synthesize the guest response from the locked result).
+    Closes the **in-proxy** leg. *(Review carry-overs from 2a: (a) if this second
+    `ensure_fresh` caller needs to branch on clean-rejection vs maybe-consumed,
+    promote `ReauthRequired(String)` to carry that bit structurally instead of in
+    prose — 2a's sole caller fails closed on both; (b) the two backends key
+    `pre_refresh` differently — libkrun on `spec.auth_id` (the credential owner),
+    docker on `agent.agent_id` — identical for claude but they diverge for an alias
+    whose `auth_id != id` (the codex-serve shape codex 2b introduces); converge
+    both on the credential owner.)*
+  - **slice 3** — make `VaultSession::drop` lock+generation-checked for all
+    providers, or delete it once the `TokenStore` owns all rotation/persistence.
+    *(Review carry-over: fold the seconds↔ms `expiresAt` normalization into one
+    shared `expires_at_ms` helper — `refresh::is_expired` and `session.rs`'s
+    teardown copy duplicate it today; this path is the natural place since it
+    reworks `is_at_least_as_fresh`.)*
+  - **slice 4** — enforce the boundary table in code (`dispatch` forces `--vault`;
+    refuse concurrent non-vault OAuth, docker-detach OAuth,
+    vaulted-`--with`-without-OAuth, codex-serve).
+  - Convoy control (negative cache / circuit-breaker) lands with 2b, where the
+    `k`-worker in-proxy contention actually occurs.
 - **M1b (gated) — the non-expiring stub.** Only after the per-agent pre-flight
   matrix (Open-Q#1). If it passes, stub a far-future expiry (guest-stub-only) so the
   guest stops self-refreshing — removing the refresh-leak case; if it fails, skip it
@@ -473,6 +600,37 @@ session+host-bound registry).
 
 ## Review history
 
+- **2026-06-19 — slice 2a round 2 (structural + Codex `gpt-5.5` xhigh, on the
+  post-fix shape).** Caught the scope bug: 2a as first written wired only docker's
+  `provision_oauth_mount`, but **libkrun has no `VaultSession`** (it uses the
+  `stub_oauth_creds` env-fork, which did no pre-refresh) and **dispatch is
+  libkrun-only** — so the original "closes the dispatch race" claim was false.
+  Fixed by extracting a shared `refresh::pre_refresh` both backends call (docker +
+  libkrun `prepare_launch`), making 2a actually cover dispatch. Also folded:
+  (1) `clean_rejection` ignored HTTP status → a 5xx/429/3xx with an OAuth-looking
+  body could reach Definite; re-added the 400/401 status gate. (2) parent-dir fsync
+  was best-effort → made it fail-closed for durable writes (the `pending` marker's
+  durability is the invariant). (3) the surfaced OAuth `error` code is now charset/
+  length-sanitized (no reflected-value leak). (4) `LockBusy`'s doc was reconciled
+  with its fail-closed caller. Deferred (tracked above): structured `ReauthRequired`
+  (2b), the expiry-normalization dedup (slice 3).
+- **2026-06-19 — slice 2a build review (code-review high + Codex `gpt-5.5` xhigh).**
+  Adversarial pass on the *implementation* of the pre-refresh wiring. Findings
+  folded in: (1) **redirect double-POST** — reqwest replays the body on 307/308, so
+  the refresh client now disables redirects (a 3xx → Ambiguous). (2) **429 /
+  middlebox-4xx false-Definite** — a blanket `is_client_error()` → Definite could
+  clear `pending` after the server already rotated; tightened to grant-rejection
+  error codes only. (3) **fail-closed on non-`Fresh`** — leasing stale
+  refresh-capable creds let the agent re-POST through the (uncoordinated) in-proxy
+  path; the pre-refresh now aborts the run on `ReauthRequired`/`LockBusy`/error.
+  (4) **secret-leak sanitize** — surfaced reasons carry status + OAuth error code
+  only, never the raw response body. (5) **connect-vs-timeout** — `Definite` for a
+  connect error excludes a connect timeout. (6) **dir fsync** — `write_atomic`
+  fsyncs the parent directory after the rename so a crash can't lose the `pending`
+  marker. Confirmed clean: the `e.is_connect()` pre-send semantics, the
+  `needs_refresh`-on-absent-`expiresAt` coalesce, and that deleting
+  `refresh_real_if_expired` lost no behavior. Carried forward (not 2a): the
+  teardown writer outside the lock = slice 3; in-proxy coordination = slice 2b.
 - **2026-06-19 — Codex adversarial review.** Confirmed the premises (no existing
   `TokenStore`/flock; `snapshot_real` only clones in-memory creds for the teardown
   persist, no in-run disk coordination; managed credentials unbuilt). Landed three

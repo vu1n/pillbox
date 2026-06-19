@@ -3,6 +3,7 @@
 //! Shells out instead of using a Rust SDK to keep the runtime dep at
 //! "Docker Desktop installed" — no extra crates, no extra failure modes.
 
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc;
@@ -178,12 +179,28 @@ pub fn exec_attach(container: &str, argv: &[String]) -> Result<std::process::Chi
         .context("invoking `docker exec -i`")
 }
 
-/// `docker run <args...>` detached. `args` must include `-d` and the image +
-/// command. Returns the container id (stdout, trimmed).
-pub fn run_detached(args: &[String]) -> Result<String> {
+/// Push `-e KEY` (name only) for each secret env var into a `docker run` argv. The
+/// VALUES are supplied out-of-band via the docker client's environment (set on the
+/// Command in [`run_detached`]), so a secret never lands in argv — where
+/// `ps`/`/proc/<pid>/cmdline` would expose it to other local uids. `-e KEY` makes
+/// docker forward the value from its own environment, and `/proc/<pid>/environ` is
+/// readable only by the same uid.
+pub fn push_secret_env_flags(args: &mut Vec<String>, secret_env: &BTreeMap<String, String>) {
+    for k in secret_env.keys() {
+        args.push("-e".into());
+        args.push(k.clone());
+    }
+}
+
+/// `docker run <args...>` detached (`args` must include `-d` and the image +
+/// command); returns the container id (stdout, trimmed). `secret_env` values are
+/// set on the docker client's environment and forwarded to the container by name
+/// via [`push_secret_env_flags`], never passed as `-e KEY=VALUE` argv.
+pub fn run_detached(args: &[String], secret_env: &BTreeMap<String, String>) -> Result<String> {
     let out = Command::new("docker")
         .arg("run")
         .args(args)
+        .envs(secret_env)
         .output()
         .context("invoking `docker run -d`")?;
     if !out.status.success() {
@@ -351,5 +368,40 @@ fn pump<R: Read>(mut reader: R, is_stderr: bool, tx: &mpsc::Sender<(bool, Vec<u8
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::push_secret_env_flags;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn push_secret_env_flags_keeps_values_out_of_argv() {
+        let mut args = vec!["run".to_string(), "-d".to_string()];
+        let env: BTreeMap<String, String> = [
+            ("ANTHROPIC_API_KEY", "sk-ant-SECRETVALUE"),
+            ("PILLBOX_MCP_TOKEN_X", "bearer-SECRET2"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        push_secret_env_flags(&mut args, &env);
+        // Each var is passed by NAME only (`-e KEY`)…
+        assert!(args
+            .windows(2)
+            .any(|w| w[0] == "-e" && w[1] == "ANTHROPIC_API_KEY"));
+        assert!(args
+            .windows(2)
+            .any(|w| w[0] == "-e" && w[1] == "PILLBOX_MCP_TOKEN_X"));
+        // …and no secret value (nor the `KEY=VALUE` form) appears anywhere in argv.
+        assert!(
+            !args.iter().any(|a| a.contains("SECRET")),
+            "secret value leaked into argv: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a.contains('=')),
+            "KEY=VALUE form leaked into argv: {args:?}"
+        );
     }
 }

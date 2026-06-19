@@ -258,16 +258,14 @@ impl SandboxBackend for DockerBackend {
             args.push("-v".into());
             args.push(mount.clone());
         }
-        for (k, v) in &env_vars {
-            args.push("-e".into());
-            args.push(format!("{k}={v}"));
-        }
+        // Secret env reaches the container by NAME only (`-e KEY`), its value set on
+        // the docker client's environment in `run_detached` — never `-e KEY=VALUE` in
+        // argv, which `ps`/`/proc/<pid>/cmdline` expose to other local uids.
+        let mut secret_env = env_vars.clone();
         if let Some(mcp) = &mcp {
-            for (k, v) in &mcp.env_vars {
-                args.push("-e".into());
-                args.push(format!("{k}={v}"));
-            }
+            secret_env.extend(mcp.env_vars.iter().cloned());
         }
+        docker::push_secret_env_flags(&mut args, &secret_env);
         if let Some(session) = &vault_session {
             args.extend(session.docker_extras(GUEST_HOME));
             eprintln!(
@@ -302,7 +300,7 @@ impl SandboxBackend for DockerBackend {
         startup.mark("agent_prepare");
 
         let run_started = SystemTime::now();
-        let container = docker::run_detached(&args)?;
+        let container = docker::run_detached(&args, &secret_env)?;
         startup.mark("container_start");
 
         if opts.detach {
@@ -498,14 +496,13 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
         args.push("-v".into());
         args.push(m.clone());
     }
-    for (k, v) in &env_vars {
-        args.push("-e".into());
-        args.push(format!("{k}={v}"));
-    }
+    // Secret env by name only (value via the Command env in run_detached) — not
+    // `-e KEY=VALUE` argv, which other local uids can read via `ps`.
+    docker::push_secret_env_flags(&mut args, &env_vars);
     args.push(runner_image);
     args.extend(super::opencode::serve_args());
 
-    let container = docker::run_detached(&args)?;
+    let container = docker::run_detached(&args, &env_vars)?;
     startup.mark("container_start");
     let http = super::http::DockerHttp::new(container.clone(), super::opencode::SERVE_PORT);
     let model = opts

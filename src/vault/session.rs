@@ -319,7 +319,7 @@ fn provision_oauth_mount(server: &Server, agent: OAuthAgent<'_>) -> Result<OAuth
             format!("pillbox {} login   # refresh credentials", agent.agent_id),
         )
     })?;
-    let mut real: serde_json::Value = serde_json::from_slice(&real_bytes).map_err(|e| {
+    let real: serde_json::Value = serde_json::from_slice(&real_bytes).map_err(|e| {
         PillboxError::runtime("vault", format!("parse {}: {e}", creds_path.display())).with_next(
             format!(
                 "pillbox {} login   # credentials file is malformed",
@@ -328,23 +328,14 @@ fn provision_oauth_mount(server: &Server, agent: OAuthAgent<'_>) -> Result<OAuth
         )
     })?;
 
-    // The on-disk access token — the teardown's CAS baseline. Captured here, from
-    // what we read off disk, BEFORE any pre-refresh can mutate `real`, so it
-    // matches what's actually on disk (the thing the teardown compares against).
+    // The on-disk access token — the teardown's CAS baseline (what the teardown
+    // compares against to decide whether this session rotated). An expired token is
+    // NOT pre-refreshed host-side: the agent refreshes on demand through the
+    // coordinated in-proxy `/oauth/token` handler, which serializes the rotation
+    // across concurrent sessions via the `TokenStore` lock. A host-side pre-refresh
+    // would POST the refresh token OUTSIDE that lock — two concurrent runs would
+    // forward the same token and trip reuse detection.
     let leased_access = access_token_of(&real);
-
-    // Proactively refresh if the stored access token is past expiry —
-    // see `super::refresh` for the rationale + wire details. Non-fatal
-    // on failure: caller's warning + agent's own retry-on-401 handle
-    // it transparently.
-    if let Err(e) = super::refresh::refresh_real_if_expired(&mut real, agent.agent_id, &creds_path)
-    {
-        eprintln!(
-            "pillbox: warning: vault token pre-refresh failed for `{}`: {e}; \
-             agent will fall back to its own retry-on-401",
-            agent.agent_id,
-        );
-    }
 
     let sandbox_id = uuid::Uuid::now_v7().to_string();
     let lease = server
@@ -373,12 +364,9 @@ fn provision_oauth_mount(server: &Server, agent: OAuthAgent<'_>) -> Result<OAuth
     })
 }
 
-/// Write `content` to `path` as a 0600 file, creating-or-truncating.
-/// Shared with [`super::refresh`] (which rewrites the stored real
-/// credentials after a token refresh); kept here because
-/// `provision_oauth_mount` is the original caller and the
-/// abstraction doesn't earn its own module.
-pub(super) fn write_private(path: &Path, content: &str) -> Result<()> {
+/// Write `content` to `path` as a 0600 file, creating-or-truncating. Used by
+/// `provision_oauth_mount` for the guest stub file.
+fn write_private(path: &Path, content: &str) -> Result<()> {
     let mut f = fs::OpenOptions::new()
         .create(true)
         .truncate(true)

@@ -418,9 +418,11 @@ async fn coordinate_refresh_request(
             apply_registry_rotation(server, &sandbox_id, &disk);
             synth_oauth_response(&disk, &stub_access, &stub_refresh)
         }
-        // Upstream rejected/failed the forward (the guard aborted → fail closed):
-        // relay the upstream error to the guest verbatim (no tokens to re-stub).
-        Ok(Coordinated::Forwarded { status, body }) => raw_response(status, body),
+        // Upstream rejected/failed the forward (the guard aborted → fail closed).
+        // Never relay the upstream body verbatim — it could echo token material;
+        // keep only the standard OAuth error fields so the guest still learns it's
+        // (e.g.) invalid_grant and re-auths.
+        Ok(Coordinated::Forwarded { status, body }) => scrub_oauth_error_response(status, &body),
         Ok(Coordinated::Reauth) => oauth_error_response(
             400,
             "invalid_grant",
@@ -622,7 +624,11 @@ fn build_new_real(
 /// Mirror the committed real tokens into the in-memory registry so this session's
 /// subsequent bearer-token API swaps map the (stable) stub to the new real access
 /// token. The file is the cross-process authority; the registry is the in-session
-/// swap map.
+/// swap map. Called the instant the off-reactor commit returns, before the guest
+/// gets its refresh response. A bearer call the guest fires concurrently in the
+/// sub-millisecond window between `commit` and here swaps the old access token and
+/// gets a transient 401, which the agent's own retry resolves — tolerated rather
+/// than holding the registry lock across the whole forward.
 fn apply_registry_rotation(server: &ServerInner, sandbox_id: &str, new_real: &serde_json::Value) {
     let mut registry = server.registry_lock();
     if let Some(access) = claude_access(new_real) {
@@ -748,6 +754,26 @@ fn oauth_error_response(status: u16, error: &str, description: &str) -> Response
         status,
         &serde_json::json!({ "error": error, "error_description": description }),
     )
+}
+
+/// Build a guest response from an upstream OAuth error WITHOUT relaying its body
+/// verbatim — an upstream error body could echo token material. Keep only the
+/// standard, tokenless OAuth error fields (`error` / `error_description`); a
+/// non-JSON or fieldless body collapses to a generic `server_error`.
+fn scrub_oauth_error_response(status: u16, body: &[u8]) -> Response<Body> {
+    let scrubbed = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            let error = v.get("error").and_then(|e| e.as_str())?.to_string();
+            let description = v
+                .get("error_description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("token refresh failed")
+                .to_string();
+            Some(serde_json::json!({ "error": error, "error_description": description }))
+        })
+        .unwrap_or_else(|| serde_json::json!({ "error": "server_error" }));
+    json_response(status, &scrubbed)
 }
 
 fn now_ms() -> u64 {
@@ -1515,6 +1541,35 @@ mod tests {
             &serde_json::json!({ "token_type": "Bearer" })
         )
         .is_none());
+    }
+
+    #[tokio::test]
+    async fn scrub_oauth_error_drops_token_fields_keeps_error() {
+        // An upstream error body that echoes token material must NOT reach the
+        // guest verbatim — only the standard OAuth error fields survive.
+        let body = serde_json::to_vec(&serde_json::json!({
+            "error": "invalid_grant",
+            "error_description": "refresh token expired",
+            "access_token": "LEAKED_REAL_ACCESS",
+            "refresh_token": "LEAKED_REAL_REFRESH",
+        }))
+        .unwrap();
+        let resp = scrub_oauth_error_response(400, &body);
+        assert_eq!(resp.status(), 400);
+        let v = body_json(resp.into_body()).await;
+        assert_eq!(v["error"], "invalid_grant");
+        assert_eq!(v["error_description"], "refresh token expired");
+        assert!(v.get("access_token").is_none(), "token fields scrubbed");
+        assert!(v.get("refresh_token").is_none(), "token fields scrubbed");
+    }
+
+    #[tokio::test]
+    async fn scrub_oauth_error_collapses_non_json_to_generic() {
+        let resp = scrub_oauth_error_response(502, b"<html>gateway error sk-ant-oat01-leak</html>");
+        let v = body_json(resp.into_body()).await;
+        assert_eq!(v["error"], "server_error");
+        // The raw (potentially token-bearing) body never reaches the guest.
+        assert!(!v.to_string().contains("sk-ant"));
     }
 
     #[tokio::test]

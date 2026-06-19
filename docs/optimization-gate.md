@@ -389,3 +389,76 @@ goals.
 **Next:** H5 (cross-model robustness, beyond glm-5.1, needs the kimi/deepseek pool). The
 verified-core dispatch design now reads: in-session focused-prompt chaining with per-checkpoint
 verification as the segmentation lever; fork-per-segment reserved for best-of-k diversity.
+
+## Enumerated-monolithic control — prompt-decomposition vs checkpoint-gating, 2026-06-19
+
+**Decision: the H4 "focused scope" win is REAL and decomposes into TWO separable levers —
+prompt-decomposition AND checkpoint-gating. The "it's just a better prompt" confound is
+refuted: gating adds a further +0.18 mean lift ON TOP of the decomposed prompt. → build the
+in-session segmentation primitive (`dispatch --segments`, `docs/dispatch-segments-design.md`).**
+
+The open confound on the H4 verdict (raised by the 2026-06-19 ultra-review): the `chained`/
+`segmented` arms both use hand-written sub-prompts that spell out signatures, error types, and
+algorithm hints the raw-README monolithic prompt lacks — so `chained − monolithic` bundled
+*checkpoint gating* with *a much better prompt*. The `enumerated` arm (`ENUM_MONO=1`) splits
+them: the SAME focused sub-prompts concatenated into ONE one-shot turn, NO gates. So
+`enumerated − monolithic` isolates prompt-decomposition and `chained − enumerated` isolates
+checkpoint-gating.
+
+### Method
+
+3 tasks (ap_dot_dsl, ap_grade_school, ap_pov), glm-5.1, libkrun, TEMPERATURE=0, n=10/arm, all
+4 arms in ONE batch (120 cells, **0 cost-0 records**). Records:
+`scripts/eval/segmentation/results/enum-control-3task-glm51-n10.jsonl`.
+
+### Result
+
+| arm | σ̂ | pass-rate |
+|---|---:|---:|
+| monolithic | 0.305 | 4/30 (0.13) |
+| enumerated (decomposed prompt, one shot, no gates) | 0.109 | 11/30 (0.37) |
+| chained (decomposed prompt + per-checkpoint gates, one session) | 0.045 | 19/30 (0.63) |
+| segmented (+ fresh session per checkpoint) | 0.057 | 19/30 (0.63) |
+
+| contrast | Δσ̂ | paired mean lift |
+|---|---:|---:|
+| **prompt-decomposition** (enumerated − monolithic) | **−0.196** | **+0.17** |
+| **checkpoint-gating** (chained − enumerated) | **−0.064** | **+0.18** |
+| horizon-reset on top (segmented − chained) | +0.013 | −0.003 |
+
+Per-task gating contrast (chained − enumerated), the honest read since the n=3 paired CI is a
+degenerate bootstrap (ci_low pins to the min per-task diff):
+
+| task | enumerated → chained | Δ |
+|---|---|---:|
+| ap_dot_dsl | 0.35 → 0.66 | **+0.31** |
+| ap_grade_school | 1.00 → 1.00 | +0.00 (no headroom — enumerated already solves it) |
+| ap_pov | 0.76 → 0.99 | **+0.23** |
+
+### Verdict
+
+**Checkpoint-gating is a real, separable lever, not an artifact of better prompts.** The pass-
+rate climbs monotonically monolithic 0.13 → enumerated 0.37 → chained 0.63, and σ̂ falls
+0.305 → 0.109 → 0.045 — each intervention adds. The chained-over-monolithic lift (+0.35) splits
+≈50/50: prompt-decomposition +0.17 (and the *bulk* of the σ̂-cut, −0.196), checkpoint-gating
++0.18 (an additional −0.064 σ̂-cut). Gating helps on the two tasks with headroom (dot_dsl +0.31,
+pov +0.23) and is neutral only where enumerated already saturates (grade_school) — which is why
+the `chained − enumerated` CI `[0.0, 0.3085]` has ci_low = 0.0 (one no-headroom task), not
+because gating fails. Horizon-reset still adds nothing (reproduces H4: segmented ≈ chained).
+
+### Caveats
+
+1. **n=3 degenerate CI** — read per-task (above), not the bootstrap. Gating's effect is "real on
+   2/3 with headroom," not a clean interval.
+2. **Single model (glm-5.1).** H5 (cross-model) remains the breadth step before trusting magnitudes.
+3. **Monolithic σ̂ here is 0.305 vs H4's 0.198** — the bistable arm's σ̂ estimate is itself noisy
+   run-to-run (a bimodal 0/1 arm at n=10). `chained`/`segmented` reproduce tightly (0.045/0.057 vs
+   H4 0.055/0.052) — the rig-sanity check passes; `enumerated` sits cleanly between.
+
+### Consequence (two-tier)
+
+1. **Prompt-decomposition is FREE** (+0.17 lift, the bulk of the σ̂-cut, no machinery) — ship it as
+   a prompt pattern / orchestrator skill (GHOST-005). Cheap half, capture it first.
+2. **Checkpoint-gating needs the machinery** (+0.18 lift, the 11→19/30 pass jump) — build
+   `dispatch --segments` per `docs/dispatch-segments-design.md` (its gate is now cleared). One
+   session (chained), NOT fork-per-segment.

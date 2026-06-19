@@ -23,6 +23,20 @@
 #               SEG_RETRIES); the gate only steers progression — the comparable
 #               score is the full rubric at the end, which bounds the weak-verifier
 #               confound.
+#   enumerated  OPT-IN (ENUM_MONO=1) — the decomposition-vs-gating control. ONE
+#               session, the SAME focused per-segment sub-prompts as chained/
+#               segmented but concatenated into ONE one-shot turn: NO checkpoint
+#               gating, NO per-segment verification. This separates the two things
+#               chained−monolithic otherwise bundles — the segment prompts are
+#               materially more specific (signatures, error types, algorithm hints)
+#               than the raw-README monolithic prompt, so chained−monolithic mixes
+#               "better/decomposed prompt" with "checkpoint gating". With this arm:
+#                 enumerated − monolithic = the prompt-decomposition effect
+#                                           (same info, one shot, no gates)
+#                 chained    − enumerated = the checkpoint-gating effect
+#                                           (same info, gated sequential turns)
+#               If enumerated captures most of chained's lift, the lever is prompt
+#               quality, not segmentation — the open confound on the H4 verdict.
 #
 # Relationship to `pillbox dispatch` (GHOST-003/004): this is dispatch's
 # SEGMENTATION sibling — same run→drive→score→pull primitives (GHOST-004
@@ -54,17 +68,23 @@
 #
 # Env: PILLBOX (binary), MODEL (provider/modelID), TRIALS (default 10),
 #      SEG_RETRIES (per-segment gate retries, default 1; SET TO 0 for the H2
-#      isolation arm — pure horizon-reset, no retry), TEMPERATURE (default 0,
+#      isolation arm — pure horizon-reset, no retry),
+#      ENUM_MONO (default 0; SET TO 1 to add the enumerated-monolithic control
+#      arm — separates prompt-decomposition from checkpoint-gating, the open H4
+#      confound), TEMPERATURE (default 0,
 #      greedy — the variance knob), MAX_WAIT (per-turn idle cap, default 600),
 #      LAUNCH_RETRIES (transient-launch retry budget, default 3),
 #      EVALS_PILLBOX (frozen-task store, default `evals`), PRICE_*_PER_M (cost),
 #      OUT (JSONL records path; default a tempfile, printed at the end).
 #
-# Substrate note: `session rm` does NOT clean per-session krun state
-# (~/.pillbox/krun/{creds,ws}/* + *.sock) — the accumulation degrades fresh-VM
-# launches over a long batch (the H1 mid-run stall). The harness compensates:
-# `reap_session` removes each session's state on teardown. The proper fix belongs
-# in pillbox's own session-rm; until then this keeps a multi-hour campaign healthy.
+# Substrate note: `session rm` (libkrun) DOES reap a recorded session's krun state
+# (creds/ws/sock/spec) — kill_session removes them unconditionally. `reap_session`
+# below is belt-and-suspenders: it captures `session info` BEFORE rm and re-removes
+# the paths, covering the case `session rm` itself errors mid-teardown. The real
+# leak a long batch hits is NOT cleanly-rm'd sessions but (a) the SHARED rootfs
+# cache (by design, not per-session) and (b) orphaned state from FAILED launches
+# that never got a complete record — neither has a handle to decode, so nothing can
+# attribute+reap them safely (the multi-pillbox attribution wall). Keep disk free.
 #
 # Live runs need a codesigned libkrun binary (scripts/lk-build.sh), opencode
 # authed, the runner image present, and the task materialized (ap_pov via
@@ -75,6 +95,10 @@ here="$(cd "$(dirname "$0")" && pwd)"
 PILLBOX="${PILLBOX:-$here/../../../target/debug/pillbox}"
 TRIALS="${TRIALS:-10}"
 SEG_RETRIES="${SEG_RETRIES:-1}"
+# Opt-in 4th arm: enumerated-monolithic (concatenated focused sub-prompts, one
+# shot, no gates) — the control that splits prompt-decomposition from checkpoint-
+# gating. Default off so the established 3-arm runs/results reproduce unchanged.
+ENUM_MONO="${ENUM_MONO:-0}"
 MAX_WAIT="${MAX_WAIT:-600}"
 # Bounded retry for a transient libkrun launch failure — a fresh VM can
 # intermittently fail to boot under sustained churn (the krun-state leak below
@@ -119,8 +143,11 @@ seg_root_for() { printf '%s' "$here/segments/$1"; }
 
 # ── dry-run: print the trial matrix, resolve every path, never launch ─────────
 print_matrix() {
+  local arms_label n_arms
+  if [ "$ENUM_MONO" = 1 ]; then arms_label="monolithic, enumerated, chained, segmented"; n_arms=4
+  else arms_label="monolithic, chained, segmented"; n_arms=3; fi
   echo "σ̂-segmentation experiment — trial matrix (dry-run, no sessions launched)"
-  echo "  trials/arm: $TRIALS   arms: monolithic, chained, segmented   tasks: ${#REFS[@]}"
+  echo "  trials/arm: $TRIALS   arms: $arms_label   tasks: ${#REFS[@]}"
   echo "  model: ${MODEL:-<opencode default>}   temperature: $TEMPERATURE   seg-retries: $SEG_RETRIES   backend: $PILLBOX_BACKEND"
   echo
   local ref name segd cells=0 boots=0
@@ -139,6 +166,7 @@ print_matrix() {
       echo "  full rubric (both arms): $ref/grader/rubric.txt  [materialize the task before a live run]"
     fi
     echo "  arm monolithic × $TRIALS trials   prompt: $ref/prompt.txt"
+    [ "$ENUM_MONO" = 1 ] && echo "  arm enumerated × $TRIALS trials   prompt: concatenated focused sub-prompts (one shot, no gates)"
 
     if [ ! -d "$segd" ]; then
       echo "  arm segmented: ERROR — no segment spec at segments/$name/ (cannot segment this task)" >&2
@@ -162,12 +190,13 @@ print_matrix() {
       DRY_ERR=1
     fi
     echo "  arm chained    × $TRIALS trials   same $i focused segments, ONE session (no horizon reset)"
-    # monolithic: 1 VM/trial; chained: 1 VM/trial (single session); segmented: i VMs/trial.
+    # monolithic: 1 VM/trial; enumerated (if on): 1; chained: 1; segmented: i VMs/trial.
     boots=$((boots + TRIALS + TRIALS + i * TRIALS))
-    cells=$((cells + 3 * TRIALS))
+    [ "$ENUM_MONO" = 1 ] && boots=$((boots + TRIALS))
+    cells=$((cells + n_arms * TRIALS))
     echo
   done
-  echo "totals: $cells cells (${#REFS[@]} tasks × 3 arms × $TRIALS trials) → ~$boots VM boots"
+  echo "totals: $cells cells (${#REFS[@]} tasks × $n_arms arms × $TRIALS trials) → ~$boots VM boots"
   echo "stats:  paired-stats.py (paired lift CI + pooled σ̂) + a per-arm σ̂ summary"
 }
 
@@ -232,11 +261,10 @@ launch_session() {
   return 1
 }
 
-# Tear down session $1 AND reap its leaked krun state (creds/workspace/sock):
-# `session rm` kills the VM but leaves these on disk, and the accumulation is what
-# degrades fresh-VM launches across a long batch (the GHOST-007 scaling note → the
-# H1 mid-run stall). Capture the sandbox paths from `session info` before rm, then
-# remove them. Safe: callers copy the clone out (grade / segment handoff) first.
+# Tear down session $1. `session rm` (libkrun) already reaps creds/workspace/sock/
+# spec; this captures `session info` BEFORE rm and re-removes the paths as belt-and-
+# suspenders for a mid-teardown rm error. Safe: callers copy the clone out (grade /
+# segment handoff) first.
 reap_session() { # sid
   [ -n "$1" ] || return 0
   local info; info="$("$PILLBOX" session info "$1" --json 2>/dev/null)"
@@ -300,6 +328,43 @@ run_monolithic_cell() { # task_dir task trial
   reap_session "$sid"
   rm -rf "$ws"
   emit_record "$2" monolithic "$3" "$score" "$cost"
+}
+
+# Build the enumerated-monolithic prompt: the SAME focused per-segment sub-prompts
+# the chained/segmented arms get, concatenated into ONE prompt for ONE one-shot
+# turn. The preamble overrides each segment's "stop here / next segment" framing so
+# a single-shot agent completes everything — the per-step CONTENT (signatures,
+# constraints, hints) is identical to what chained sees across its turns, so the
+# only difference from chained is the checkpoint gating.
+enumerated_prompt() { # task → echoes the combined prompt
+  local segd; segd="$(seg_root_for "$1")"
+  local d i=0
+  printf 'Complete ALL of the following steps, in order, in this one session. Ignore any "stop here" or "next segment" notes inside a step — implement every step fully before you finish.\n'
+  for d in "$segd"/*/; do
+    [ -d "$d" ] || continue
+    i=$((i + 1))
+    printf '\n===== Step %d =====\n%s\n' "$i" "$(cat "$d/prompt.txt")"
+  done
+}
+
+# Arm D (opt-in, ENUM_MONO=1) — enumerated-monolithic: ONE session, the
+# concatenated focused sub-prompts in ONE shot, NO gates. enumerated−monolithic
+# isolates the prompt-decomposition effect; chained−enumerated isolates the
+# checkpoint-gating effect (see the header). Mirrors run_monolithic_cell exactly
+# except for the prompt, so the only variable vs monolithic is prompt content.
+run_enumerated_cell() { # task_dir task trial
+  local ws; ws="$(mktemp -d)"
+  cp -R "$1/workspace/." "$ws"/ 2>/dev/null
+  local sid; sid="$(launch_session "$ws")"
+  if [ -z "$sid" ]; then rm -rf "$ws"; emit_record "$2" enumerated "$3" 0 0; return; fi
+  local clone; clone="$(pb_workspace "$sid")"
+  if [ -z "$clone" ]; then reap_session "$sid"; rm -rf "$ws"; emit_record "$2" enumerated "$3" 0 0; return; fi
+  drive_bounded "$sid" "$(enumerated_prompt "$2")"
+  local score; score="$(grade_full "$sid" "$clone" "$1")"
+  local cost; cost="$(pb_usage "$sid" | cost_of)"
+  reap_session "$sid"
+  rm -rf "$ws"
+  emit_record "$2" enumerated "$3" "$score" "$cost"
 }
 
 # Arm C — the focused per-segment prompts driven in ONE session (in-session
@@ -404,6 +469,7 @@ for ref in "${REFS[@]}"; do
   for t in $(seq 1 "$TRIALS"); do
     echo "▶ $name trial $t/$TRIALS" >&2
     run_monolithic_cell "$task_dir" "$name" "$t"
+    [ "$ENUM_MONO" = 1 ] && run_enumerated_cell "$task_dir" "$name" "$t"
     run_chained_cell    "$task_dir" "$name" "$t"
     run_segmented_cell  "$task_dir" "$name" "$t"
   done
@@ -419,6 +485,13 @@ echo "=== paired-stats: horizon-reset effect (segmented vs chained) ===" >&2
 python3 "$here/../paired-stats.py" --baseline chained --treatment segmented "$out" || true
 echo "=== paired-stats: full segmentation (segmented vs monolithic) ===" >&2
 python3 "$here/../paired-stats.py" --baseline monolithic --treatment segmented "$out" || true
+if [ "$ENUM_MONO" = 1 ]; then
+  # The decisive control: split prompt-decomposition from checkpoint-gating.
+  echo "=== paired-stats: prompt decomposition (enumerated vs monolithic) ===" >&2
+  python3 "$here/../paired-stats.py" --baseline monolithic --treatment enumerated "$out" || true
+  echo "=== paired-stats: checkpoint gating (chained vs enumerated) ===" >&2
+  python3 "$here/../paired-stats.py" --baseline enumerated --treatment chained "$out" || true
+fi
 echo "=== per-arm σ̂ — the keystone: does segmentation cut it, and which part? ===" >&2
 python3 - "$out" <<'PY'
 import json, sys, statistics, collections
@@ -450,4 +523,8 @@ def delta(treat, base, label):
 delta("chained",   "monolithic", "[scope alone]")
 delta("segmented", "chained",    "[horizon reset on top]")
 delta("segmented", "monolithic", "[full segmentation]")
+# Decisive control (only printed when the enumerated arm ran): split the scope
+# effect into prompt-decomposition vs checkpoint-gating.
+delta("enumerated", "monolithic", "[prompt decomposition]")
+delta("chained",    "enumerated", "[checkpoint gating]")
 PY

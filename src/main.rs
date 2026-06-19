@@ -294,8 +294,16 @@ enum Command {
         /// verdicts + a fractional score. Mutually exclusive with `--cmd`.
         #[arg(long, value_name = "FILE")]
         rubric: Option<PathBuf>,
+        /// Drive an ordered SEGMENT chain (TOML: `[[segment]]` with name +
+        /// prompt/prompt_file + gate_rubric/gate_cmd) in ONE session per worker —
+        /// the proven in-session segmentation lever — instead of one prompt. The
+        /// `--rubric`/`--cmd` above stays the authoritative final reward; each
+        /// segment carries its own gate. Composes with `-k` (best-of-k over chains).
+        #[arg(long, value_name = "SPEC")]
+        segments: Option<PathBuf>,
         /// Per-worker retry budget when the grade fails (failing criteria fed
-        /// back as the next prompt).
+        /// back as the next prompt). With `--segments` this is the PER-SEGMENT
+        /// gate-retry budget.
         #[arg(long, value_name = "N", default_value_t = 1)]
         retries: u32,
         /// Worker agent (`claude` | `codex` | `opencode` | …). Defaults to the
@@ -312,6 +320,12 @@ enum Command {
         /// Wire in kypp swarm-memory (`--memory`) for each worker.
         #[arg(long)]
         memory: bool,
+        /// Per-worker retention TTL (`30m` / `24h` / `7d`), forwarded to every
+        /// forked worker. Losers are left running (not auto-killed) so their §0
+        /// evidence stays readable; a TTL lets `pillbox session prune` reap them
+        /// after a dispatch campaign instead of leaking k VMs per run.
+        #[arg(long, value_name = "DURATION")]
+        ttl: Option<String>,
         /// Emit the verdict as JSON on stdout instead of the human banner.
         #[arg(long)]
         json: bool,
@@ -730,11 +744,13 @@ fn run(cli: Cli) -> Result<()> {
             workers,
             cmd,
             rubric,
+            segments,
             retries,
             agent,
             model,
             temperature,
             memory,
+            ttl,
             json,
             args,
         } => {
@@ -746,11 +762,13 @@ fn run(cli: Cli) -> Result<()> {
                     workers,
                     cmd,
                     rubric,
+                    segments,
                     retries,
                     agent,
                     model,
                     temperature,
                     memory,
+                    ttl,
                     prompt: args,
                     json,
                 },

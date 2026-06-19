@@ -198,6 +198,9 @@ impl Pillbox {
                     prefix,
                     access_key,
                     secret_key,
+                    // Long-lived resolved key; scoping (a session token) is minted
+                    // per managed run, never persisted in the pillbox descriptor.
+                    session_token: None,
                 })
             }
         };

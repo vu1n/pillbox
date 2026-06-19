@@ -78,6 +78,15 @@ pub(crate) struct S3Config {
     pub(crate) prefix: String,
     pub(crate) access_key: String,
     pub(crate) secret_key: String,
+    /// STS-style session token, set ONLY for a short-lived, prefix-scoped R2
+    /// credential minted for the managed plane (the `temp-access-credentials`
+    /// path). Such a credential is invalid without its `X-Amz-Security-Token`,
+    /// so the field travels with the keys it pairs with. `None` for an
+    /// ordinary long-lived key (every local-backend repo) — absent on the wire
+    /// (`skip_serializing_if`) so the frozen managed contract is unchanged when
+    /// scoping isn't in play.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) session_token: Option<String>,
 }
 
 impl fmt::Debug for S3Config {
@@ -89,6 +98,10 @@ impl fmt::Debug for S3Config {
             .field("prefix", &self.prefix)
             .field("access_key", &"<redacted>")
             .field("secret_key", &"<redacted>")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -196,6 +209,12 @@ impl RusticBackend {
                 }
                 options.insert("access_key_id".into(), cfg.access_key.clone());
                 options.insert("secret_access_key".into(), cfg.secret_key.clone());
+                // A scoped temp credential (managed plane) carries an STS session
+                // token; opendal's S3 driver must forward it as X-Amz-Security-Token
+                // or every signed request 403s. Absent for a normal long-lived key.
+                if let Some(token) = &cfg.session_token {
+                    options.insert("session_token".into(), token.clone());
+                }
                 let opts = BackendOptions::default()
                     .repository("opendal:s3".to_string())
                     .options(options);

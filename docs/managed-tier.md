@@ -434,6 +434,25 @@ So the happy path is one writer, not a consensus problem.
 - Blob store at rest is a new sensitive surface — add the R2 row to
   [security.md](./security.md) **before** the capture path lands (the §0 spec's
   cutover requirement).
+- **Workspace-transfer credential is prefix-scoped.** The container-native
+  placement hands the DO an R2 credential so it can restore + snapshot the rustic
+  repo (`/provision`, `/finalize`). The host does not ship the pillbox's
+  bucket-wide parent key: when `PILLBOX_R2_CF_API_TOKEN` (a Cloudflare API token
+  with R2 read+write) is set, `run` mints a short-lived, **prefix-scoped** temp
+  credential via R2's `temp-access-credentials` API (`permission:
+  object-read-write`, `prefixes: ["<repo-prefix>/"]`) so a credential reaching CF
+  can touch only `bucket/<prefix>`. The Bearer API token authorizes the mint and
+  names the parent key by **id** only — the parent **secret** never crosses to CF.
+  A credential is minted **fresh per transfer** (once for `/provision`, again for
+  `/finalize`) with a 30-min TTL, so it spans only its own round-trip — a long
+  turn between the two can't expire it. The scoped credential carries a
+  `sessionToken`, surfaced on the wire as `S3Config.session_token`; **the DO's S3
+  client must forward it as `X-Amz-Security-Token`** or every signed request 403s
+  (frozen-contract requirement). Scoping is **fail-closed**: with the token set, a
+  non-R2 endpoint or an empty repo prefix (nothing narrower than the bucket) is a
+  hard error, never a bucket-wide mint dressed up as scoped. With no token
+  configured the parent key still travels, but `run` announces the bucket-wide
+  exposure loudly (only on an actual R2 endpoint, where scoping could apply).
 
 ---
 

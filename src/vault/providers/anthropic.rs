@@ -5,13 +5,21 @@
 //! `console.anthropic.com/oauth/token` (refresh-token swap on the way
 //! out, real → stub swap + registry rotation on the way back).
 //!
-//! The `refresh_token` grant additionally routes through the slice-2b in-proxy
-//! **refresh coordinator** ([`coordinate_refresh_request`]): under a cross-process
-//! flock the vault makes its OWN direct upstream POST and persists the rotation to
-//! the shared host creds file, so concurrent sessions sharing one account can't
-//! both forward the same refresh token (reuse → family revoke). The legacy
-//! forward+`handle_response` path remains the fallback (and the `authorization_code`
-//! / login path). See `docs/vault-oauth-refresh-coordination.md`.
+//! The `refresh_token` grant routes through the slice-2b in-proxy **refresh
+//! coordinator** ([`coordinate_refresh_request`]): under a cross-process flock the
+//! vault makes its OWN direct upstream POST and persists the rotation to the shared
+//! host creds file, so concurrent sessions sharing one account can't both forward
+//! the same refresh token (reuse → family revoke). `handle_response` still runs for
+//! the `authorization_code` / login path (which mints, not reuses). See
+//! `docs/vault-oauth-refresh-coordination.md`.
+//!
+//! ⚠ **Scope:** this coordination is wired for **`claude` on the `docker` backend
+//! only.** The `libkrun` backend (the default, and the one `dispatch -k` forks) does
+//! an UNCOORDINATED stub→real wire-swap in its own MITM (`sandbox/libkrun/vault.rs`),
+//! and the `codex` provider still uses the un-coordinated forward+`handle_response`
+//! path. Concurrent sessions sharing one account on those paths can still trip
+//! refresh-token reuse — a backend/provider-neutral refresh broker is the open
+//! follow-up.
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -314,38 +322,10 @@ async fn handle_oauth_request(
         .map(str::to_owned)
     {
         Some(stub) => {
-            coordinate_refresh_request(host, path_and_query, parts, value, stub, server, pending)
-                .await
+            coordinate_refresh_request(host, path_and_query, parts, value, stub, server).await
         }
         None => forward_authorization_code(parts, value, collected.to_vec(), server, pending),
     }
-}
-
-/// Bare-lease/test fallback when no coordinated creds path is recorded: swap the
-/// stub refresh token for the real one from the registry, set `pending` so
-/// `handle_response` re-stubs the rotated tokens, and forward. This is the
-/// pre-coordinator behavior, unchanged. A production OAuth `--vault` run always
-/// records a creds path (`set_oauth_creds_path`) and takes the coordinated path.
-fn legacy_forward_refresh(
-    mut parts: hudsucker::hyper::http::request::Parts,
-    mut value: serde_json::Value,
-    real: &serde_json::Value,
-    sandbox_id: String,
-    pending: &mut Option<PendingFlow>,
-) -> RequestOrResponse {
-    if let (Some(obj), Some(real_rt)) = (value.as_object_mut(), claude_refresh(real)) {
-        obj.insert(
-            "refresh_token".to_string(),
-            serde_json::Value::String(real_rt),
-        );
-    }
-    *pending = Some(PendingFlow {
-        provider_id: PROVIDER_ID,
-        sandbox_id,
-    });
-    let new_body = serde_json::to_vec(&value).unwrap_or_default();
-    force_identity_encoding(&mut parts.headers, new_body.len());
-    Request::from_parts(parts, Body::from(new_body)).into()
 }
 
 /// The `grant_type=authorization_code` path: identify the sandbox, set `pending`
@@ -387,8 +367,9 @@ async fn coordinate_refresh_request(
     value: serde_json::Value,
     stub: String,
     server: &ServerInner,
-    pending: &mut Option<PendingFlow>,
 ) -> RequestOrResponse {
+    // The coordinated path returns a synthesized Response directly, so it never sets
+    // `pending` (no `handle_response` round-trip) — hence no `pending` parameter.
     // Snapshot what the coordinator needs under one registry lock.
     let (sandbox_id, real, creds_path, stub_pair) = {
         let registry = server.registry_lock();
@@ -405,11 +386,21 @@ async fn coordinate_refresh_request(
         return unauthorized("refresh: missing real creds or stubs").into();
     };
 
-    // No coordination path recorded (an OAuth lease always records one via
-    // `set_oauth_creds_path`; this is the bare-lease/test case) → legacy
-    // forward+handle_response keeps behavior unchanged.
+    // Every production OAuth `--vault` lease records a creds path via
+    // `set_oauth_creds_path` (session.rs, right after `lease`), so a refresh with
+    // none is a lease/wiring bug — fail closed rather than silently fall back to an
+    // UNCOORDINATED forward that could re-send a consumed refresh token.
     let Some(creds_path) = creds_path else {
-        return legacy_forward_refresh(parts, value, &real, sandbox_id, pending);
+        eprintln!(
+            "pillbox: vault: refresh for sandbox {sandbox_id} has no recorded creds \
+             path; refusing to forward uncoordinated"
+        );
+        return oauth_error_response(
+            500,
+            "server_error",
+            "refresh coordination unavailable (no creds path recorded)",
+        )
+        .into();
     };
 
     let decider = ClaudeRefreshDecider {
@@ -455,7 +446,9 @@ async fn coordinate_refresh_request(
         // Never relay the upstream body verbatim — it could echo token material;
         // keep only the standard OAuth error fields so the guest still learns it's
         // (e.g.) invalid_grant and re-auths.
-        Ok(Coordinated::Forwarded { status, body }) => scrub_oauth_error_response(status, &body),
+        Ok(Coordinated::UpstreamError { status, body }) => {
+            scrub_oauth_error_response(status, &body)
+        }
         Ok(Coordinated::Reauth) => oauth_error_response(
             400,
             "invalid_grant",
@@ -520,8 +513,10 @@ enum Coordinated {
     /// A peer already rotated; adopt these on-disk creds (synthesize a response).
     Coalesced { disk: serde_json::Value },
     /// The upstream forward returned non-2xx (or an unparseable 2xx); the guard
-    /// aborted (fail closed). Relay the upstream status + body to the guest.
-    Forwarded { status: u16, body: Vec<u8> },
+    /// aborted (fail closed). The body is SCRUBBED to the standard OAuth error
+    /// fields before reaching the guest — never relayed verbatim (it could echo
+    /// token material). See [`scrub_oauth_error_response`].
+    UpstreamError { status: u16, body: Vec<u8> },
     /// A prior refresh's outcome is unknown, or the tokens are missing → re-auth.
     Reauth,
     /// The rotation lock couldn't be acquired in time → retryable.
@@ -602,7 +597,7 @@ fn coordinate_refresh(
     if !(200..300).contains(&status) {
         // Upstream rejected the refresh → fail closed (the next begin re-auths).
         guard.abort();
-        return Coordinated::Forwarded {
+        return Coordinated::UpstreamError {
             status,
             body: resp_body,
         };
@@ -612,7 +607,7 @@ fn coordinate_refresh(
         Ok(v) => v,
         Err(_) => {
             guard.abort();
-            return Coordinated::Forwarded {
+            return Coordinated::UpstreamError {
                 status,
                 body: resp_body,
             };
@@ -636,7 +631,7 @@ fn coordinate_refresh(
     let Some(new_real) = build_new_real(&real_snapshot, &upstream) else {
         // 2xx without a usable access token — don't clear pending, relay as-is.
         guard.abort();
-        return Coordinated::Forwarded {
+        return Coordinated::UpstreamError {
             status,
             body: resp_body,
         };
@@ -1308,18 +1303,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oauth_refresh_request_swaps_body_and_sets_pending() {
+    async fn oauth_refresh_without_recorded_creds_path_fails_closed() {
+        // A refresh_token grant for a lease that never recorded a creds path (a
+        // wiring bug — production always calls `set_oauth_creds_path` right after
+        // `lease`) must FAIL CLOSED with a 500, not silently fall back to an
+        // UNCOORDINATED forward that could re-send a consumed refresh token. (The
+        // coordinated success path is covered by the local-server
+        // `coordinate_refresh_*` tests, which can point the forward URL at a stub
+        // endpoint; `handle_request` can't redirect off the real host.)
         let (server, dir) = fresh_server().await;
         let _lease = server
             .lease("claude", "sbx-oauth", sample_anthropic_real())
-            .expect("lease");
+            .expect("lease"); // deliberately NO set_oauth_creds_path
         let (_, stub_refresh) = stubs_for_sandbox(&server, "sbx-oauth");
 
-        let body_json_in = serde_json::json!({
+        let body_bytes_in = serde_json::to_vec(&serde_json::json!({
             "grant_type": "refresh_token",
             "refresh_token": stub_refresh,
-        });
-        let body_bytes_in = serde_json::to_vec(&body_json_in).unwrap();
+        }))
+        .unwrap();
         let len = body_bytes_in.len();
         let req = Request::builder()
             .method("POST")
@@ -1333,16 +1335,9 @@ mod tests {
         let out = AnthropicProvider
             .handle_request(req, server.inner_for_test(), &mut pending)
             .await;
-        let out_req = expect_request(out, "oauth refresh request");
-
-        let body = body_json(out_req.into_body()).await;
-        assert_eq!(
-            body.get("refresh_token").and_then(|v| v.as_str()),
-            Some("REAL_REFRESH")
-        );
-        let flow = pending.expect("pending should be set for oauth refresh");
-        assert_eq!(flow.provider_id, "claude");
-        assert_eq!(flow.sandbox_id, "sbx-oauth");
+        let res = expect_response(out, "no-creds-path refresh");
+        assert_eq!(res.status(), 500, "fail closed when no creds path recorded");
+        assert!(pending.is_none(), "the coordinated path never sets pending");
 
         drop(_lease);
         cleanup(server, dir);

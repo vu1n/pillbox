@@ -556,39 +556,25 @@ fn session_send(resolved: &Pillbox, id: &str, text: &str) -> Result<()> {
     // against the session registry — not `resolve_logged` (the read side's
     // foreground log dirs).
     let s = session::resolve(resolved, id)?;
-    // Server-integration agents (opencode, codex-serve) are driven over their
-    // HTTP API, not a pty-relay: `session send` = a structured prompt, not
-    // keystrokes. Both reach their in-guest server through the same transport;
-    // only the route shape differs (opencode's prompt_async vs the codex bridge's
-    // /turn, which already holds the thread id).
-    if s.integration() == Integration::Server {
-        let http = sandbox::live_session(&s)?.http()?;
-        if s.agent_id == crate::agents::CODEX_SERVE.id {
-            sandbox::appserver_client::send_turn(&*http, text)?;
-        } else {
-            let server = s.server.as_ref().ok_or_else(|| {
-                PillboxError::config(
-                    "session send",
-                    format!("session `{}` has no server state", s.id),
-                )
-            })?;
-            sandbox::opencode::send_prompt(
-                &*http,
-                &server.agent_session_id,
-                text,
-                &server.model,
-                server.temperature,
-            )?;
-        }
-        record_input(resolved, &s.id, text, crate::contract::InputTarget::Agent);
-        eprintln!("pillbox: sent prompt to session `{}`", s.id);
-        return Ok(());
-    }
-    // PTY drive: push the bytes through the plane (`send` is the PTY-drive verb;
-    // a backend without one rejects with the standard unsupported shape).
+    // Drive through the one polymorphic `send`: each backend delivers the input the
+    // way its agent expects — a structured prompt over the agent's HTTP API (or the
+    // managed `/input`) for a server agent (opencode/codex-serve), raw keystrokes
+    // for a PTY agent. The command layer no longer branches on integration or
+    // backend; a backend that can't drive rejects with the standard unsupported
+    // shape.
     sandbox::live_session(&s)?.send(text.as_bytes())?;
-    record_input(resolved, &s.id, text, crate::contract::InputTarget::Pty);
-    eprintln!("pillbox: sent {} byte(s) to session `{}`", text.len(), s.id);
+    let target = if s.integration() == Integration::Server {
+        crate::contract::InputTarget::Agent
+    } else {
+        crate::contract::InputTarget::Pty
+    };
+    record_input(resolved, &s.id, text, target);
+    match target {
+        crate::contract::InputTarget::Agent => {
+            eprintln!("pillbox: sent prompt to session `{}`", s.id)
+        }
+        _ => eprintln!("pillbox: sent {} byte(s) to session `{}`", text.len(), s.id),
+    }
     Ok(())
 }
 

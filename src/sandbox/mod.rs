@@ -192,6 +192,39 @@ pub(crate) fn live_session(session: &Session) -> Result<Box<dyn LiveSession>> {
     }
 }
 
+/// Drive one structured turn into a server-mode agent (opencode / codex-serve)
+/// over its in-sandbox HTTP transport. The shared body behind every host-side
+/// backend's [`LiveSession::send`] when the session is [`Integration::Server`], so
+/// the command layer drives a server agent through the same polymorphic `send` as a
+/// PTY agent — never re-branching on integration or backend. (The managed backend
+/// overrides `send` entirely: its turn goes to the DO's `/input`, not an HTTP
+/// server the host can reach.)
+pub(crate) fn drive_server_prompt(
+    session: &Session,
+    http: &dyn SandboxHttp,
+    bytes: &[u8],
+) -> Result<()> {
+    let text = String::from_utf8_lossy(bytes);
+    // codex-serve's bridge already holds the thread id, so its turn carries only
+    // the text; opencode needs the agent session id + model/temperature.
+    if session.agent_id == crate::agents::CODEX_SERVE.id {
+        return appserver_client::send_turn(http, &text);
+    }
+    let server = session.server.as_ref().ok_or_else(|| {
+        PillboxError::config(
+            "session send",
+            format!("session `{}` has no server state", session.id),
+        )
+    })?;
+    opencode::send_prompt(
+        http,
+        &server.agent_session_id,
+        &text,
+        &server.model,
+        server.temperature,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

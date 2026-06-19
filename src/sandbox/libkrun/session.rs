@@ -1640,9 +1640,11 @@ impl crate::sandbox::LiveSession for LibkrunLiveSession {
     }
 
     fn send(&self, bytes: &[u8]) -> Result<()> {
-        // A server agent's prompt goes over its HTTP API (`http`), never the PTY.
+        // A server agent's prompt goes over its HTTP API; a PTY agent's is raw
+        // keystrokes. Both flow through this one `send` so the command layer never
+        // branches on integration.
         if self.session.integration() == Integration::Server {
-            return Err(self.caps().unsupported("send"));
+            return crate::sandbox::drive_server_prompt(&self.session, &*self.http()?, bytes);
         }
         pty_send(&LibkrunHandle::decode(&self.session)?.sock, bytes)
     }

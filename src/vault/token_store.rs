@@ -100,10 +100,10 @@ struct RotationState {
     /// this counter.
     generation: u64,
     /// Set to `fingerprint(access_token)` for the token being replaced, immediately
-    /// before the caller forwards, and cleared only on a *definite* outcome. A set
+    /// before the caller forwards, and cleared only on a successful `commit`. A set
     /// marker that still matches the on-disk **access** token means a forward is in
-    /// flight or its result was lost — fail closed. A set marker that no longer
-    /// matches means the forward committed and the marker is stale — clear it.
+    /// flight or its outcome was lost — fail closed. A set marker that no longer
+    /// matches means a forward committed and the marker is stale — clear it.
     pending: Option<String>,
     last_refresh_at_ms: Option<u64>,
 }
@@ -294,15 +294,17 @@ impl TokenStore {
 /// `begin()` a second forward — and carries the durable `pending` marker `begin()`
 /// already wrote.
 ///
-/// Resolve it exactly one of three ways:
-/// - [`commit`](Self::commit) — the forward succeeded; persist the new creds and
-///   clear `pending`.
-/// - [`abort`](Self::abort) — the forward failed; `definite` (clean rejection)
-///   clears `pending`, ambiguous (timeout/5xx after send) leaves it set.
-/// - **drop without either** — the caller panicked or returned mid-forward; treated
-///   as ambiguous: `pending` stays durably set (so no peer re-POSTs a maybe-consumed
-///   token) and the flock releases. That safe default is *why there is no explicit
-///   `Drop` impl* — dropping the fields is already the correct behavior.
+/// Resolve it exactly one of three ways — and only the first ever clears `pending`:
+/// - [`commit`](Self::commit) — the forward returned new creds; persist them and
+///   clear `pending`. Refuses (leaving `pending` set) if the access token did not
+///   actually rotate, so a caller parse bug can't turn a "success" into reuse.
+/// - [`abort`](Self::abort) — the forward failed (4xx, 5xx, timeout, drop, …);
+///   `pending` stays set so no peer re-forwards a maybe-consumed token, and the next
+///   `begin()` fails closed to re-auth.
+/// - **drop without either** — the caller panicked or returned mid-forward; identical
+///   to `abort`. That fail-closed default is *why there is no explicit `Drop` impl* —
+///   dropping the fields (leaving `pending` set, releasing the flock) is already the
+///   correct behavior.
 pub(crate) struct RotateGuard {
     _lock: LockGuard,
     creds_path: PathBuf,
@@ -318,14 +320,28 @@ impl RotateGuard {
         &self.refresh
     }
 
-    /// The forward succeeded: persist `new_creds`, then clear `pending`. The order is
-    /// load-bearing — the new tokens land durably *first*, so a crash before the
-    /// marker clears self-heals on the next `begin()` (the advanced on-disk access
-    /// token reconciles the stale marker away). The reverse order could let a peer
-    /// re-POST a just-consumed refresh token. A `commit` that errors after the creds
-    /// write is likewise safe: `pending` stays set but the advanced access token
-    /// reconciles it away next time.
-    pub(crate) fn commit(mut self, new_creds: Value) -> Result<()> {
+    /// The forward returned new creds: persist them, then clear `pending`.
+    ///
+    /// Two safety properties:
+    /// - **The access token must have rotated.** `commit` refuses (returns `Err`,
+    ///   leaving `pending` set → the guard drops → fail closed) if `new_creds` carries
+    ///   no access token, or the same one we marked pending. Defense in depth at the
+    ///   *authority*: a caller bug (a misparsed or stale response presented as success)
+    ///   cannot clear the marker and let a peer re-forward a consumed token.
+    /// - **Write order is load-bearing.** New tokens land durably *first*, then the
+    ///   marker clears. A crash between self-heals on the next `begin()` (the advanced
+    ///   on-disk access token reconciles the stale marker away). The reverse order
+    ///   could let a peer re-POST a just-consumed refresh token.
+    pub(crate) fn commit(mut self, decider: &dyn RefreshDecider, new_creds: Value) -> Result<()> {
+        let new_access = decider
+            .access_token(&new_creds)
+            .context("commit: refreshed creds carry no access token")?;
+        if Some(fingerprint(&new_access)) == self.state.pending {
+            anyhow::bail!(
+                "commit: access token did not rotate — refusing to clear pending \
+                 (would risk refresh-token reuse)"
+            );
+        }
         write_atomic(&self.creds_path, &creds_bytes(&new_creds)?, true)?;
         self.state.generation = self.state.generation.saturating_add(1);
         self.state.pending = None;
@@ -334,17 +350,22 @@ impl RotateGuard {
         Ok(())
     }
 
-    /// The forward failed. `definite` (a clean 4xx rejection — the token is dead but
-    /// was not silently consumed) clears `pending`. Ambiguous (timeout, connection
-    /// drop, 5xx after the request left) leaves `pending` set so neither this caller
-    /// nor any peer ever re-sends the maybe-consumed token. Either way the caller
-    /// surfaces re-auth.
-    pub(crate) fn abort(mut self, definite: bool) -> Result<()> {
-        if definite {
-            self.state.pending = None;
-            write_atomic(&self.state_path, &state_bytes(&self.state)?, false)?;
-        }
-        Ok(())
+    /// The forward did not yield usable creds — a 4xx rejection, a 5xx, a timeout, a
+    /// dropped connection, an unparseable body: any non-success. Leaves `pending` SET
+    /// so neither this caller nor any peer re-forwards a token that may already have
+    /// been exchanged, and the next `begin()` fails closed to re-auth. Identical in
+    /// effect to dropping the guard; the method exists so a failed forward reads as a
+    /// deliberate decision at the call site.
+    ///
+    /// pillbox deliberately does NOT distinguish "cleanly rejected" from "outcome
+    /// unknown" here. A clean 4xx means the family is likely dead (re-auth needed
+    /// anyway); an unknown outcome means the token may be consumed (re-forwarding =
+    /// reuse). Both resolve to re-auth, so the safe move is identical — and collapsing
+    /// them removes any reliance on the caller classifying the failure correctly,
+    /// which a reuse-revoke bug cannot afford.
+    pub(crate) fn abort(self) {
+        // No-op beyond the drop: `pending` was made durable in `begin()` and is left
+        // set; the flock releases as `self` (holding `_lock`) goes out of scope.
     }
 }
 
@@ -495,7 +516,10 @@ mod tests {
             Some(fingerprint("AT0").as_str())
         );
         guard
-            .commit(serde_json::json!({ "refresh": "RT1", "access": "AT1", "stale": false }))
+            .commit(
+                &MockDecider,
+                serde_json::json!({ "refresh": "RT1", "access": "AT1", "stale": false }),
+            )
             .unwrap();
         let st = store.read_state();
         assert!(st.pending.is_none());
@@ -506,28 +530,17 @@ mod tests {
     }
 
     #[test]
-    fn abort_definite_clears_pending() {
+    fn abort_leaves_pending_and_next_begin_reauths() {
+        // abort never clears pending — a failed forward (clean reject OR unknown
+        // outcome) fails closed so the same RT is never handed out twice.
         let (_d, store) = store_with(stale());
         let Begin::Rotate(guard) = store.begin(&MockDecider).unwrap() else {
             panic!("expected Rotate");
         };
-        guard.abort(true).unwrap();
-        assert!(
-            store.read_state().pending.is_none(),
-            "a clean rejection clears the marker"
-        );
-    }
-
-    #[test]
-    fn abort_ambiguous_leaves_pending_and_next_begin_reauths() {
-        let (_d, store) = store_with(stale());
-        let Begin::Rotate(guard) = store.begin(&MockDecider).unwrap() else {
-            panic!("expected Rotate");
-        };
-        guard.abort(false).unwrap(); // outcome unknown → leave pending set
+        guard.abort();
         assert!(
             store.read_state().pending.is_some(),
-            "ambiguous leaves pending set"
+            "abort leaves pending set"
         );
         // Disk access unchanged (no commit) → next begin sees pending matching disk →
         // fail closed, and critically it does NOT hand out a second Rotate.
@@ -535,6 +548,44 @@ mod tests {
             store.begin(&MockDecider).unwrap(),
             Begin::ReauthRequired(_)
         ));
+    }
+
+    #[test]
+    fn commit_refuses_when_access_did_not_rotate() {
+        // A caller bug presents a "success" whose creds still carry the old access
+        // token (a misparsed/stale response). commit must refuse and leave pending
+        // set, or a peer could re-forward the consumed refresh token.
+        let (_d, store) = store_with(stale());
+        let Begin::Rotate(guard) = store.begin(&MockDecider).unwrap() else {
+            panic!("expected Rotate");
+        };
+        let err = guard
+            .commit(
+                &MockDecider,
+                serde_json::json!({ "refresh": "RT9", "access": "AT0", "stale": false }),
+            )
+            .unwrap_err();
+        assert!(format!("{err}").contains("did not rotate"), "got: {err}");
+        // pending stays set → next begin fails closed; the stale creds were NOT written.
+        assert!(store.read_state().pending.is_some());
+        assert_eq!(store.read_creds().unwrap()["access"], "AT0");
+        assert!(matches!(
+            store.begin(&MockDecider).unwrap(),
+            Begin::ReauthRequired(_)
+        ));
+    }
+
+    #[test]
+    fn commit_refuses_when_new_creds_have_no_access_token() {
+        let (_d, store) = store_with(stale());
+        let Begin::Rotate(guard) = store.begin(&MockDecider).unwrap() else {
+            panic!("expected Rotate");
+        };
+        let err = guard
+            .commit(&MockDecider, serde_json::json!({ "refresh": "RT1" }))
+            .unwrap_err();
+        assert!(format!("{err}").contains("no access token"), "got: {err}");
+        assert!(store.read_state().pending.is_some(), "pending left set");
     }
 
     #[test]
@@ -607,8 +658,11 @@ mod tests {
         };
         assert_eq!(g.refresh_token(), "RT0");
         // Commit, but keep it stale to force a second forward.
-        g.commit(serde_json::json!({ "refresh": "RT1", "access": "AT1", "stale": true }))
-            .unwrap();
+        g.commit(
+            &MockDecider,
+            serde_json::json!({ "refresh": "RT1", "access": "AT1", "stale": true }),
+        )
+        .unwrap();
         let Begin::Rotate(g2) = store.begin(&MockDecider).unwrap() else {
             panic!("expected Rotate");
         };
@@ -617,8 +671,11 @@ mod tests {
             "RT1",
             "the second forward uses the rotated token, never RT0 again"
         );
-        g2.commit(serde_json::json!({ "refresh": "RT2", "access": "AT2", "stale": false }))
-            .unwrap();
+        g2.commit(
+            &MockDecider,
+            serde_json::json!({ "refresh": "RT2", "access": "AT2", "stale": false }),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -632,17 +689,22 @@ mod tests {
             let s = Arc::clone(&store);
             let n = Arc::clone(&forwards);
             let f = Arc::clone(&forwarded);
-            handles.push(std::thread::spawn(move || match s.begin(&MockDecider).unwrap() {
-                Begin::Rotate(g) => {
-                    n.fetch_add(1, Ordering::SeqCst);
-                    f.lock().unwrap().push(g.refresh_token().to_string());
-                    // Simulate a successful upstream forward that freshens the token.
-                    g.commit(serde_json::json!({ "refresh": "RT1", "access": "AT1", "stale": false }))
-                        .unwrap();
-                    true
+            handles.push(std::thread::spawn(move || {
+                match s.begin(&MockDecider).unwrap() {
+                    Begin::Rotate(g) => {
+                        n.fetch_add(1, Ordering::SeqCst);
+                        f.lock().unwrap().push(g.refresh_token().to_string());
+                        // Simulate a successful upstream forward that freshens the token.
+                        g.commit(
+                        &MockDecider,
+                        serde_json::json!({ "refresh": "RT1", "access": "AT1", "stale": false }),
+                    )
+                    .unwrap();
+                        true
+                    }
+                    Begin::Coalesced(_) => true,
+                    Begin::ReauthRequired(_) | Begin::LockBusy => false,
                 }
-                Begin::Coalesced(_) => true,
-                Begin::ReauthRequired(_) | Begin::LockBusy => false,
             }));
         }
         let all_ok = handles.into_iter().all(|h| h.join().unwrap());

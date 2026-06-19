@@ -153,12 +153,25 @@ impl Registry {
     }
 
     /// Resolve `stub` to the real API-key value previously registered via
-    /// `Server::lease_api_key`. Returns `None` if the stub isn't known, or
-    /// if it's known but belongs to a non-API-key (e.g. OAuth) entry.
-    pub(crate) fn api_key_real_for_stub(&self, stub: &str) -> Option<&str> {
+    /// `Server::lease_api_key` — but only when `dest_host` matches the host
+    /// the stub was leased for (case-insensitive). Returns `None` if the stub
+    /// isn't known, belongs to a non-API-key (e.g. OAuth) entry, or is being
+    /// presented on a host other than the one it's bound to.
+    ///
+    /// The host check is destination-binding: it stops a compromised guest
+    /// from replaying a stub leased for host A onto an intercepted request to
+    /// host B (sharing the same auth scheme) to extract the real credential.
+    /// An entry with no recorded host fails closed — `lease_api_key` always
+    /// records one, so a missing host marks a malformed entry we won't release
+    /// against. The host-side analogue of libkrun's `host_bound_swap`.
+    pub(crate) fn api_key_real_for_stub(&self, stub: &str, dest_host: &str) -> Option<&str> {
         let sandbox_id = self.by_stub.get(stub)?;
         let data = self.by_sandbox.get(sandbox_id)?;
         if data.provider_id != API_KEY_PROVIDER_ID {
+            return None;
+        }
+        let leased_host = data.real.get("host").and_then(|v| v.as_str())?;
+        if !leased_host.eq_ignore_ascii_case(dest_host) {
             return None;
         }
         data.real.get("value").and_then(|v| v.as_str())
@@ -383,6 +396,7 @@ pub(crate) fn swap_bearer_style(
     header_value: &HeaderValue,
     scheme: &str,
     server: &ServerInner,
+    dest_host: &str,
 ) -> ApiKeySwap {
     let Ok(auth_str) = header_value.to_str() else {
         return ApiKeySwap::Unauthorized("non-utf8 authorization");
@@ -391,9 +405,14 @@ pub(crate) fn swap_bearer_style(
     let Some(stub) = auth_str.strip_prefix(prefix.as_str()) else {
         return ApiKeySwap::PassThrough;
     };
+    // A stub presented on a host it wasn't leased for resolves to None here, so
+    // the fake stub passes through unchanged and the upstream rejects it — the
+    // real credential is never released cross-host.
     let real = {
         let registry = server.registry_lock();
-        registry.api_key_real_for_stub(stub).map(str::to_owned)
+        registry
+            .api_key_real_for_stub(stub, dest_host)
+            .map(str::to_owned)
     };
     let Some(real) = real else {
         return ApiKeySwap::PassThrough;
@@ -407,13 +426,21 @@ pub(crate) fn swap_bearer_style(
 /// Equivalent of `swap_bearer_style` for raw-value headers like
 /// Anthropic's `x-api-key`, where the header value IS the stub (no
 /// scheme prefix).
-pub(crate) fn swap_raw_header(header_value: &HeaderValue, server: &ServerInner) -> ApiKeySwap {
+pub(crate) fn swap_raw_header(
+    header_value: &HeaderValue,
+    server: &ServerInner,
+    dest_host: &str,
+) -> ApiKeySwap {
     let Ok(stub) = header_value.to_str() else {
         return ApiKeySwap::Unauthorized("non-utf8 header");
     };
+    // Host-bound: a stub leased for a different host resolves to None, so the
+    // fake value passes through and upstream rejects it (no cross-host leak).
     let real = {
         let registry = server.registry_lock();
-        registry.api_key_real_for_stub(stub).map(str::to_owned)
+        registry
+            .api_key_real_for_stub(stub, dest_host)
+            .map(str::to_owned)
     };
     let Some(real) = real else {
         return ApiKeySwap::PassThrough;
@@ -481,6 +508,50 @@ mod tests {
         // Should not panic.
         r.rotate_real_field("sbx-1", "/nope/missing", "x".into());
         r.rotate_real_field("missing-sandbox", "/k", "x".into());
+    }
+
+    #[test]
+    fn api_key_real_for_stub_is_host_bound() {
+        let mut r = Registry::new();
+        let stub = "pllbxstub-deadbeef";
+        r.insert(
+            "sbx-1".into(),
+            SandboxData {
+                provider_id: API_KEY_PROVIDER_ID,
+                real: serde_json::json!({
+                    "name": "GITHUB_TOKEN",
+                    "value": "ghp_realtoken",
+                    "host": "api.github.com",
+                }),
+                stubs: vec![stub.into()],
+            },
+        );
+        // Resolves on the leased host (case-insensitive)…
+        assert_eq!(
+            r.api_key_real_for_stub(stub, "api.github.com"),
+            Some("ghp_realtoken")
+        );
+        assert_eq!(
+            r.api_key_real_for_stub(stub, "API.GitHub.com"),
+            Some("ghp_realtoken")
+        );
+        // …but is never replayed onto a different intercepted host — the
+        // cross-host credential leak this binding closes.
+        assert!(r.api_key_real_for_stub(stub, "api.openai.com").is_none());
+
+        // An entry with no recorded host fails closed (lease_api_key always
+        // records one, so this only catches a malformed entry).
+        r.insert(
+            "sbx-2".into(),
+            SandboxData {
+                provider_id: API_KEY_PROVIDER_ID,
+                real: serde_json::json!({ "name": "X", "value": "real" }),
+                stubs: vec!["nohost-stub".into()],
+            },
+        );
+        assert!(r
+            .api_key_real_for_stub("nohost-stub", "api.github.com")
+            .is_none());
     }
 
     #[test]

@@ -71,7 +71,7 @@ impl VaultProvider for OpenAiApiKeyProvider {
         let Some(auth_value) = parts.headers.get(AUTHORIZATION).cloned() else {
             return Request::from_parts(parts, body).into();
         };
-        match swap_bearer_style(&auth_value, "Bearer", server) {
+        match swap_bearer_style(&auth_value, "Bearer", server, &host) {
             ApiKeySwap::Swapped(hv) => {
                 parts.headers.insert(AUTHORIZATION, hv);
                 Request::from_parts(parts, body).into()
@@ -125,12 +125,19 @@ mod tests {
             "sbx-1".into(),
             SandboxData {
                 provider_id: API_KEY_PROVIDER_ID,
-                real: serde_json::json!({"name": "OPENAI_API_KEY", "value": "sk-real-xyz"}),
+                real: serde_json::json!({"name": "OPENAI_API_KEY", "value": "sk-real-xyz", "host": "api.openai.com"}),
                 stubs: vec![stub.into()],
             },
         );
-        assert_eq!(r.api_key_real_for_stub(stub), Some("sk-real-xyz"));
-        assert!(r.api_key_real_for_stub("sk-unknown").is_none());
+        assert_eq!(
+            r.api_key_real_for_stub(stub, "api.openai.com"),
+            Some("sk-real-xyz")
+        );
+        assert!(r
+            .api_key_real_for_stub("sk-unknown", "api.openai.com")
+            .is_none());
+        // Host-bound: the stub does NOT resolve on a host it wasn't leased for.
+        assert!(r.api_key_real_for_stub(stub, "api.github.com").is_none());
     }
 
     // ── End-to-end Request/Response integration tests ────────────────

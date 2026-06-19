@@ -168,7 +168,20 @@ impl EventSource for ManagedDoSource {
             }
             match ws.read() {
                 Ok(Message::Text(text)) => {
-                    let ev: Event = serde_json::from_str(text.as_str())
+                    // The Agents SDK multiplexes its own `cf_agent_*` control frames
+                    // (identity/state/mcp) onto the same WS — they're not §0 Event
+                    // envelopes and carry no `seq`. Skip any frame that isn't a
+                    // seq-bearing Event rather than erroring (mirrors the JS
+                    // subscriber's `typeof seq === "number"` filter); a seq-bearing
+                    // but malformed frame still fails loud as real corruption.
+                    let val: serde_json::Value = match serde_json::from_str(text.as_str()) {
+                        Ok(v) => v,
+                        Err(_) => continue, // non-JSON control frame
+                    };
+                    if !val.get("seq").is_some_and(serde_json::Value::is_number) {
+                        continue; // cf_agent_* control frame, not a §0 Event
+                    }
+                    let ev: Event = serde_json::from_value(val)
                         .context("parse §0 event from managed gateway")?;
                     if !sink(&ev) {
                         let _ = ws.close(None);

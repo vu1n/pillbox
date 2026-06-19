@@ -242,7 +242,7 @@ pub(super) const EVENTS_SINK_TIMEOUT: Duration = Duration::from_secs(2);
 /// endpoint shape or token handling. The token is `None` when unset or empty
 /// (the DO allows anonymous reads; the write side maps `None` → `""`, which it
 /// fails closed on).
-pub(super) fn managed_endpoint(session_id: &str) -> Option<(String, Option<String>)> {
+pub(crate) fn managed_endpoint(session_id: &str) -> Option<(String, Option<String>)> {
     let base = std::env::var("PILLBOX_MANAGED_DO_URL").ok()?;
     let token = std::env::var("PILLBOX_ACTOR_TOKEN")
         .ok()

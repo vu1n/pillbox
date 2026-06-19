@@ -485,7 +485,7 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
             spec.id
         );
     }
-    let (creds_share, mut swap_pairs) = stub_oauth_creds(&home, spec.cred_sentinel, &oauth_hosts)?;
+    let (creds_share, mut swap_pairs) = stub_oauth_creds(&home, spec, &oauth_hosts)?;
     // Fail loud: a vault-capable agent whose credentials file produced no stubs
     // would mount the real token into the guest unstubbed (exfiltratable by a
     // prompt-injected agent). Refuse to launch rather than leak. Generalizing the

@@ -137,7 +137,7 @@ fn spawn(
     args.push("sleep".into());
     args.push("infinity".into());
 
-    let backend_ref = docker::run_detached(&args)?;
+    let backend_ref = docker::run_detached(&args, &std::collections::BTreeMap::new())?;
 
     let record = Sandbox {
         id: id.clone(),

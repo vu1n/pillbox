@@ -22,11 +22,13 @@ class_name = "Sandbox"
 [[containers]]
 class_name = "Sandbox"
 image = "./Dockerfile"
-# Cost guard for the deployed spike: ONE smallest-tier container. Idle containers
-# auto-sleep (no idle billing); we tear the deploy down after validating. Prod
-# sizes max_instances to the concurrent-session budget.
-max_instances = 1
-instance_type = "lite"
+# opencode's Bun runtime needs ~570 MB resident just to serve, and more to run a
+# turn. lite (128 MB) and basic (256 MB) OOM-kill it at startup; standard-1 (512 MB)
+# only just fits idle and thrashes at the cgroup cap. standard-2 (1 GB) is the floor
+# with headroom for an agent turn. Idle instances auto-sleep (no idle billing).
+# max_instances >1 so concurrent sessions don't contend a single container slot.
+max_instances = 5
+instance_type = "standard-2"
 
 # SQLite-backed storage migration (GA). Both DO classes are SQLite-backed.
 [[migrations]]

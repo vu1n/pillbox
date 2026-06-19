@@ -16,6 +16,21 @@ export interface Env {
   // `wrangler secret put ACTOR_TOKEN_SECRET` (or `.dev.vars` for `wrangler dev`),
   // never committed. Absent → writes fail closed (no actor can be attested).
   ACTOR_TOKEN_SECRET?: string;
+
+  // opencode provider auth + model for the consume path (driveAgent). Set via
+  // `wrangler secret put` / `.dev.vars`; consumed by createOpencodeServer
+  // (managed-tier Milestone 2 — the managed secret store, NOT our MITM vault).
+  // Known provider keys are passed through as env so opencode auto-detects them.
+  ANTHROPIC_API_KEY?: string;
+  OPENAI_API_KEY?: string;
+  // Z.AI GLM coding-plan subscription key — wired into opencode's `zai-coding-plan`
+  // provider (a config overlay, since it isn't a standard-env auto-detect provider).
+  ZAI_API_KEY?: string;
+  // Full opencode `config` JSON (a provider block with an apiKey, or a CF AI
+  // Gateway) — an alternative to / override of the key env vars above.
+  OPENCODE_CONFIG_JSON?: string;
+  // Default model (`provider/modelID`) when an /input doesn't carry one.
+  OPENCODE_MODEL?: string;
 }
 
 export default {

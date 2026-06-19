@@ -294,6 +294,7 @@ fn remote_backend(
             prefix: coords.prefix.clone(),
             access_key,
             secret_key,
+            session_token: None,
         }),
         password_file: password_file.to_path_buf(),
     })

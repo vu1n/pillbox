@@ -43,9 +43,15 @@
 //!
 //! ## Open follow-ups (flagged, not faked)
 //!
-//!   - **R2 key scoping.** `run` hands the DO the pillbox's full resolved R2
-//!     creds. The planned mitigation — a prefix-scoped, ephemeral R2 key so a
-//!     credential reaching CF can touch only this run's prefix — is not built yet.
+//!   - **R2 key scoping.** When `PILLBOX_R2_CF_API_TOKEN` is set, `run` mints a
+//!     short-lived, prefix-scoped R2 temp credential ([`r2_scope`], fresh per
+//!     transfer) and hands the DO *that*, so a credential reaching CF can touch
+//!     only this run's prefix — and the bucket-wide parent *secret* never crosses
+//!     to CF (the Bearer API token authorizes the mint). With no token configured
+//!     the parent key still travels, but the exposure is announced loudly rather
+//!     than silently. The DO side must honor the credential's `session_token`
+//!     (`X-Amz-Security-Token`) for a scoped credential to authenticate — part of
+//!     the frozen contract.
 //!   - **Detached finalize.** Only the foreground path is implemented (drive a
 //!     turn, wait for idle, finalize). For a `--detach` managed run the host
 //!     returns before the turn ends, so the in-container wrapper would own the
@@ -145,7 +151,18 @@ impl SandboxBackend for ManagedBackend {
                  token) or PILLBOX_ACTOR_TOKEN (a pre-minted one)",
             )
         })?;
-        workspace_xfer::provision(&endpoint, &token, s3, &password, snapshot.as_str())?;
+        // Prefix-scope the credential before it crosses to the managed plane: the
+        // DO only needs this repo's prefix, not the whole bucket. Minted fresh per
+        // transfer so each credential outlives only its own round-trip, never the
+        // whole turn.
+        let provision_creds = r2_scope::scope_for_transfer(s3)?;
+        workspace_xfer::provision(
+            &endpoint,
+            &token,
+            &provision_creds,
+            &password,
+            snapshot.as_str(),
+        )?;
 
         // 5. Build + persist the Session record. The record holds the DO endpoint +
         //    session id + (later) the result handle — NEVER the creds or password,
@@ -213,7 +230,9 @@ impl SandboxBackend for ManagedBackend {
 
         // 7. Snapshot `/workspace` back to R2 via /finalize; record the handle so
         //    `session pull <id>` can rehydrate the result.
-        let result_snapshot = workspace_xfer::finalize(&endpoint, &token, s3, &password)?;
+        let finalize_creds = r2_scope::scope_for_transfer(s3)?;
+        let result_snapshot =
+            workspace_xfer::finalize(&endpoint, &token, &finalize_creds, &password)?;
         let mut finished = session;
         finished.result_snapshot = Some(result_snapshot);
         session::write(resolved, &finished)?;
@@ -658,12 +677,9 @@ mod workspace_xfer {
     /// inside `repo` (an [`S3Config`]) and `password` are resolved secret material;
     /// they leave the host ONLY inside this body, over HTTPS — never logged,
     /// never persisted on the `Session` record.
-    //
-    // FOLLOW-UP (R2 key scoping): we hand the DO the pillbox's full resolved R2
-    // creds. The planned mitigation — minting a prefix-scoped, ephemeral R2 key so
-    // a credential reaching CF can touch only this run's prefix — is not built yet;
-    // until it lands the full creds reach the managed plane. Tracked in
-    // docs/managed-tier.md.
+    // The `repo` handed in is already prefix-scoped when scoping is configured
+    // (see [`super::r2_scope`]); a scoped credential carries a `session_token`
+    // the DO must forward as `X-Amz-Security-Token`.
     #[derive(Serialize)]
     struct WorkspaceRepo<'a> {
         repo: &'a S3Config,
@@ -805,6 +821,7 @@ mod workspace_xfer {
                 prefix: "p/".into(),
                 access_key: "AK".into(),
                 secret_key: "SK".into(),
+                session_token: None,
             }
         }
 
@@ -832,6 +849,9 @@ mod workspace_xfer {
             assert_eq!(repo["bucket"], "ws");
             assert_eq!(repo["access_key"], "AK");
             assert_eq!(repo["secret_key"], "SK");
+            // A long-lived key carries no session token: absent on the wire, so
+            // the frozen contract is byte-identical to pre-scoping.
+            assert!(repo.get("session_token").is_none());
         }
 
         /// `/finalize` is the same shape minus `snapshot` (the DO snapshots
@@ -852,6 +872,350 @@ mod workspace_xfer {
                 "finalize must omit `snapshot`, got: {body}"
             );
             assert_eq!(body["workspace"]["repo"]["bucket"], "ws");
+        }
+    }
+}
+
+/// Prefix-scope the R2 credential before it crosses to the managed plane.
+///
+/// `run` hands the DO an [`S3Config`] so its container can restore + snapshot
+/// the rustic repo. Handing it the pillbox's *parent* R2 key gives a credential
+/// reaching Cloudflare bucket-wide reach — far more than this run's repo needs.
+/// When a Cloudflare API token is configured (`PILLBOX_R2_CF_API_TOKEN`), this
+/// mints a short-lived, **prefix-scoped** temp credential via R2's
+/// `temp-access-credentials` API and hands the DO *that* instead, so a credential
+/// reaching CF can touch only `bucket/<prefix>` for a bounded TTL. With no token
+/// configured the parent key still travels (unchanged behavior) but the exposure
+/// is announced once, loudly, instead of silently — the gap is visible, not faked.
+mod r2_scope {
+    use std::borrow::Cow;
+    use std::sync::Once;
+
+    use anyhow::{Context, Result};
+    use serde::{Deserialize, Serialize};
+
+    use crate::errors::PillboxError;
+    use crate::workspace::rustic::S3Config;
+
+    /// The CF API token that authorizes minting temp credentials (a Bearer token
+    /// with R2 read+write on the bucket). Absent ⇒ scoping is off and the parent
+    /// key travels; present ⇒ scoping is required (a mint failure is fatal, never
+    /// a silent fall-back to the bucket-wide key).
+    const API_TOKEN_ENV: &str = "PILLBOX_R2_CF_API_TOKEN";
+    /// Lifetime of a minted transfer credential. A credential is minted fresh
+    /// *per transfer* (provision, then finalize), so it only has to outlive one
+    /// synchronous round-trip (bounded by `XFER_TIMEOUT` = 300s) — not the whole
+    /// turn. 30 min gives generous headroom over that while keeping a leaked
+    /// credential short-lived. This is pillbox's policy, not a claim about R2's
+    /// own min/max — CF rejects an out-of-range value loudly at mint time.
+    const TRANSFER_TTL_SECS: u64 = 1_800;
+    const CF_API_BASE: &str = "https://api.cloudflare.com/client/v4";
+    /// Read + write: the DO both restores (GET) and snapshots back (PUT).
+    const PERMISSION: &str = "object-read-write";
+
+    static WARNED_BUCKET_WIDE: Once = Once::new();
+
+    /// Mint a fresh prefix-scoped temp credential for one workspace transfer
+    /// (provision or finalize) when scoping is configured, else borrow the parent
+    /// key (with a loud one-time warning). Called once per transfer so each
+    /// credential only spans a single round-trip — a long turn between provision
+    /// and finalize can't expire it.
+    ///
+    /// Fail-closed: with the API token set, scoping is *required* — a missing
+    /// account id or an empty repo prefix (nothing narrower than the bucket to
+    /// scope to) or a mint failure aborts the run rather than handing CF a
+    /// bucket-wide key dressed up as scoped.
+    pub(super) fn scope_for_transfer(parent: &S3Config) -> Result<Cow<'_, S3Config>> {
+        let Some(api_token) = configured_token() else {
+            // Only nudge toward scoping where it can actually apply — a non-R2
+            // S3 host (MinIO/Backblaze/native S3) has no CF temp-credential API,
+            // so the remediation would be inapplicable noise there.
+            if account_id_from_endpoint(&parent.endpoint).is_some() {
+                warn_bucket_wide();
+            }
+            return Ok(Cow::Borrowed(parent));
+        };
+        let account_id = account_id_from_endpoint(&parent.endpoint).ok_or_else(|| {
+            PillboxError::config(
+                "run",
+                format!(
+                    "{API_TOKEN_ENV} is set (R2 credential scoping requested) but the R2 endpoint \
+                     `{}` isn't an `<account-id>.r2.cloudflarestorage.com` host, so the account id \
+                     can't be derived to mint a scoped credential",
+                    parent.endpoint
+                ),
+            )
+        })?;
+        let cf_prefix = cf_key_prefix(&parent.prefix).ok_or_else(|| {
+            PillboxError::config(
+                "run",
+                format!(
+                    "{API_TOKEN_ENV} is set (R2 credential scoping requested) but the workspace \
+                     repo prefix is empty, so a scoped credential would still be bucket-wide. Set \
+                     a non-empty workspace prefix, or unset {API_TOKEN_ENV} to accept bucket-wide \
+                     reach explicitly"
+                ),
+            )
+        })?;
+        let scoped = mint(parent, &api_token, &account_id, &cf_prefix)?;
+        Ok(Cow::Owned(scoped))
+    }
+
+    fn configured_token() -> Option<String> {
+        std::env::var(API_TOKEN_ENV)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    fn warn_bucket_wide() {
+        WARNED_BUCKET_WIDE.call_once(|| {
+            eprintln!(
+                "pillbox: note: handing the managed plane a bucket-wide R2 credential. \
+                 Set {API_TOKEN_ENV} (a Cloudflare API token with R2 read+write) to mint a \
+                 short-lived, prefix-scoped credential instead."
+            );
+        });
+    }
+
+    /// Parse the R2 account id out of an `<account-id>.r2.cloudflarestorage.com`
+    /// endpoint (with or without scheme / trailing path). `None` for any other
+    /// S3-compatible host (MinIO, Backblaze, native S3) — those have no CF
+    /// temp-credential API, so scoping doesn't apply.
+    fn account_id_from_endpoint(endpoint: &str) -> Option<String> {
+        const SUFFIX: &str = ".r2.cloudflarestorage.com";
+        let after_scheme = endpoint
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .unwrap_or(endpoint);
+        let host = after_scheme
+            .split('/')
+            .next()? // strip any path
+            .rsplit('@')
+            .next()? // strip any userinfo
+            .split(':')
+            .next()?; // strip any port
+        let account = host.strip_suffix(SUFFIX)?;
+        if account.is_empty() || account.contains('.') {
+            return None;
+        }
+        Some(account.to_string())
+    }
+
+    /// The CF object-key prefix to scope to: the repo prefix as an S3 key prefix
+    /// (no leading slash, trailing slash so it matches the subtree). `None` for an
+    /// empty repo prefix — there's nothing narrower than the bucket to scope to.
+    fn cf_key_prefix(prefix: &str) -> Option<String> {
+        let trimmed = prefix.trim_matches('/');
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(format!("{trimmed}/"))
+        }
+    }
+
+    /// The `temp-access-credentials` HTTP API authorizes the mint with the Bearer
+    /// CF API token and names the parent key by id only — it does NOT take the
+    /// parent *secret* (that belongs to the client-side local-signing variant).
+    /// So the bucket-wide parent secret never crosses to CF, which is the whole
+    /// point of scoping. `prefixes` is always populated (the caller refuses an
+    /// empty prefix), bounding the credential to `bucket/<prefix>`.
+    #[derive(Serialize)]
+    struct TempCredRequest<'a> {
+        bucket: &'a str,
+        #[serde(rename = "parentAccessKeyId")]
+        parent_access_key_id: &'a str,
+        permission: &'a str,
+        #[serde(rename = "ttlSeconds")]
+        ttl_seconds: u64,
+        prefixes: Vec<String>,
+    }
+
+    fn build_request<'a>(parent: &'a S3Config, cf_prefix: &str, ttl: u64) -> TempCredRequest<'a> {
+        TempCredRequest {
+            bucket: &parent.bucket,
+            parent_access_key_id: &parent.access_key,
+            permission: PERMISSION,
+            ttl_seconds: ttl,
+            prefixes: vec![cf_prefix.to_string()],
+        }
+    }
+
+    #[derive(Deserialize)]
+    struct TempCredEnvelope {
+        success: bool,
+        #[serde(default)]
+        result: Option<TempCred>,
+        #[serde(default)]
+        errors: Vec<serde_json::Value>,
+    }
+
+    #[derive(Deserialize)]
+    struct TempCred {
+        #[serde(rename = "accessKeyId")]
+        access_key_id: String,
+        #[serde(rename = "secretAccessKey")]
+        secret_access_key: String,
+        #[serde(rename = "sessionToken")]
+        session_token: String,
+    }
+
+    /// Parse the CF envelope into a scoped [`S3Config`]: the same coordinates as
+    /// `parent` (endpoint/region/bucket/prefix) with the temp key + its session
+    /// token swapped in. Fail-closed — a non-`success` envelope or any missing /
+    /// empty credential field is an error, never a partial credential.
+    fn parse_scoped(body: &str, parent: &S3Config) -> Result<S3Config> {
+        let env: TempCredEnvelope = serde_json::from_str(body)
+            .with_context(|| format!("parse R2 temp-credential response: {body}"))?;
+        if !env.success {
+            return Err(PillboxError::runtime(
+                "run",
+                format!("R2 temp-credential mint failed: {:?}", env.errors),
+            )
+            .into());
+        }
+        let cred = env.result.ok_or_else(|| {
+            PillboxError::runtime("run", "R2 temp-credential response had no `result`")
+        })?;
+        if cred.access_key_id.is_empty()
+            || cred.secret_access_key.is_empty()
+            || cred.session_token.is_empty()
+        {
+            return Err(PillboxError::runtime(
+                "run",
+                "R2 temp-credential response was missing a credential field",
+            )
+            .into());
+        }
+        Ok(S3Config {
+            endpoint: parent.endpoint.clone(),
+            region: parent.region.clone(),
+            bucket: parent.bucket.clone(),
+            prefix: parent.prefix.clone(),
+            access_key: cred.access_key_id,
+            secret_key: cred.secret_access_key,
+            session_token: Some(cred.session_token),
+        })
+    }
+
+    /// `POST <api>/accounts/<id>/r2/temp-access-credentials` — mint a scoped
+    /// credential. The HTTP seam (the only un-unit-tested part); body + response
+    /// parsing are pure and covered.
+    fn mint(
+        parent: &S3Config,
+        api_token: &str,
+        account_id: &str,
+        cf_prefix: &str,
+    ) -> Result<S3Config> {
+        let url = format!("{CF_API_BASE}/accounts/{account_id}/r2/temp-access-credentials");
+        let body = serde_json::to_string(&build_request(parent, cf_prefix, TRANSFER_TTL_SECS))
+            .context("serialize R2 mint body")?;
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .context("build R2 temp-credential http client")?;
+        let resp = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .bearer_auth(api_token)
+            .body(body)
+            .send()
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        let text = resp.text().context("read R2 temp-credential response")?;
+        if !status.is_success() {
+            return Err(PillboxError::runtime(
+                "run",
+                format!("R2 temp-credential mint returned HTTP {status}: {text}"),
+            )
+            .into());
+        }
+        parse_scoped(&text, parent)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn parent() -> S3Config {
+            S3Config {
+                endpoint: "https://abc123.r2.cloudflarestorage.com".into(),
+                region: "auto".into(),
+                bucket: "ws".into(),
+                prefix: "proj/".into(),
+                access_key: "PARENT_AK".into(),
+                secret_key: "PARENT_SK".into(),
+                session_token: None,
+            }
+        }
+
+        #[test]
+        fn account_id_parses_from_r2_endpoint_forms() {
+            assert_eq!(
+                account_id_from_endpoint("https://abc123.r2.cloudflarestorage.com"),
+                Some("abc123".to_string())
+            );
+            assert_eq!(
+                account_id_from_endpoint("abc123.r2.cloudflarestorage.com/ws"),
+                Some("abc123".to_string())
+            );
+            // Not an R2 host → no scoping (MinIO/Backblaze/native S3).
+            assert_eq!(account_id_from_endpoint("https://s3.amazonaws.com"), None);
+            assert_eq!(account_id_from_endpoint("https://minio.local:9000"), None);
+            // A sub-subdomain isn't a bare account id.
+            assert_eq!(
+                account_id_from_endpoint("https://x.abc123.r2.cloudflarestorage.com"),
+                None
+            );
+        }
+
+        #[test]
+        fn request_scopes_to_the_prefix_subtree_with_rw() {
+            let body = serde_json::to_value(build_request(&parent(), "proj/", 1800)).unwrap();
+            assert_eq!(body["bucket"], "ws");
+            assert_eq!(body["parentAccessKeyId"], "PARENT_AK");
+            assert_eq!(body["permission"], "object-read-write");
+            assert_eq!(body["ttlSeconds"], 1800);
+            // Scoped to the repo prefix as a key subtree (no leading slash).
+            assert_eq!(body["prefixes"][0], "proj/");
+            // The parent SECRET must NOT cross to CF — the Bearer API token
+            // authorizes the mint; only the parent key *id* is named.
+            assert!(body.get("parentSecretAccessKey").is_none());
+        }
+
+        #[test]
+        fn cf_key_prefix_requires_a_nonempty_prefix() {
+            // The fail-closed foundation: an empty repo prefix yields None, which
+            // scope_for_transfer turns into a hard error rather than a bucket-wide
+            // mint. A non-empty prefix becomes a trailing-slash key subtree.
+            assert_eq!(cf_key_prefix(""), None);
+            assert_eq!(cf_key_prefix("/"), None);
+            assert_eq!(cf_key_prefix("proj/"), Some("proj/".to_string()));
+            assert_eq!(cf_key_prefix("/a/b"), Some("a/b/".to_string()));
+        }
+
+        #[test]
+        fn parse_scoped_swaps_in_temp_key_and_session_token() {
+            let resp = r#"{"success":true,"errors":[],"messages":[],
+                "result":{"accessKeyId":"TMP_AK","secretAccessKey":"TMP_SK","sessionToken":"TMP_ST"}}"#;
+            let scoped = parse_scoped(resp, &parent()).unwrap();
+            assert_eq!(scoped.access_key, "TMP_AK");
+            assert_eq!(scoped.secret_key, "TMP_SK");
+            assert_eq!(scoped.session_token.as_deref(), Some("TMP_ST"));
+            // Coordinates are untouched — same repo, just a narrower key.
+            assert_eq!(scoped.endpoint, parent().endpoint);
+            assert_eq!(scoped.bucket, "ws");
+            assert_eq!(scoped.prefix, "proj/");
+        }
+
+        #[test]
+        fn parse_scoped_fails_closed_on_unsuccess_or_missing_fields() {
+            let failed = r#"{"success":false,"errors":[{"message":"bad token"}],"result":null}"#;
+            assert!(parse_scoped(failed, &parent()).is_err());
+            // success but a blank credential field is not a usable credential.
+            let blank = r#"{"success":true,"errors":[],
+                "result":{"accessKeyId":"TMP_AK","secretAccessKey":"","sessionToken":"TMP_ST"}}"#;
+            assert!(parse_scoped(blank, &parent()).is_err());
         }
     }
 }
@@ -1032,6 +1396,7 @@ mod tests {
                 prefix: String::new(),
                 access_key: "AK".into(),
                 secret_key: "SK".into(),
+                session_token: None,
             }),
             password_file: PathBuf::from("/tmp/pw"),
         };

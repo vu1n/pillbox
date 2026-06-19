@@ -682,6 +682,12 @@ impl super::LiveSession for DockerLiveSession {
     }
 
     fn send(&self, bytes: &[u8]) -> Result<()> {
+        // A server agent's turn is a structured prompt over its HTTP API; a PTY
+        // agent's is raw keystrokes. Both flow through this one `send` so the
+        // command layer never branches on integration.
+        if self.session.integration() == crate::agents::Integration::Server {
+            return super::drive_server_prompt(&self.session, &*self.http()?, bytes);
+        }
         send_input(&self.session.sandbox_id, bytes)
     }
 

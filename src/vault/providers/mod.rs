@@ -14,7 +14,7 @@
 //! pull strings.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use hudsucker::{
@@ -73,6 +73,12 @@ pub(crate) struct Registry {
     by_sandbox: HashMap<String, SandboxData>,
     /// stub token (any provider) → sandbox_id
     by_stub: HashMap<String, String>,
+    /// sandbox_id → host-absolute creds file the sandbox shadows. Set by
+    /// `Server::lease` (a session concern), not `provision` (the stub-minting
+    /// concern), so it lives beside [`SandboxData`] rather than inside it. The
+    /// in-proxy refresh coordinator builds a `TokenStore` on this path to
+    /// serialize rotation across concurrent sessions sharing the account.
+    creds_paths: HashMap<String, PathBuf>,
 }
 
 impl Registry {
@@ -80,6 +86,7 @@ impl Registry {
         Self {
             by_sandbox: HashMap::new(),
             by_stub: HashMap::new(),
+            creds_paths: HashMap::new(),
         }
     }
 
@@ -95,6 +102,7 @@ impl Registry {
         for stub in &data.stubs {
             self.by_stub.remove(stub);
         }
+        self.creds_paths.remove(sandbox_id);
         Some(data)
     }
 
@@ -150,6 +158,17 @@ impl Registry {
 
     pub(crate) fn stubs_for(&self, sandbox_id: &str) -> Option<&[String]> {
         self.by_sandbox.get(sandbox_id).map(|d| d.stubs.as_slice())
+    }
+
+    /// Record the host-absolute creds file backing this sandbox (set by
+    /// `Server::lease` after provision). Lets the in-proxy refresh coordinator
+    /// reach the shared file the cross-process rotation lock guards.
+    pub(crate) fn set_host_creds_path(&mut self, sandbox_id: &str, path: PathBuf) {
+        self.creds_paths.insert(sandbox_id.to_string(), path);
+    }
+
+    pub(crate) fn host_creds_path(&self, sandbox_id: &str) -> Option<&Path> {
+        self.creds_paths.get(sandbox_id).map(PathBuf::as_path)
     }
 
     /// Resolve `stub` to the real API-key value previously registered via

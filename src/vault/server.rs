@@ -251,6 +251,16 @@ impl Server {
         ))
     }
 
+    /// Record the host-absolute creds file an OAuth `lease` shadows, so the
+    /// in-proxy refresh coordinator can build a `TokenStore` on it and serialize
+    /// rotation across concurrent sessions sharing the account. Set right after
+    /// `lease` (a session concern, kept off the `lease`/`provision` signatures).
+    pub fn set_oauth_creds_path(&self, sandbox_id: &str, host_creds_path: PathBuf) {
+        self.inner
+            .registry_lock()
+            .set_host_creds_path(sandbox_id, host_creds_path);
+    }
+
     /// Lease a stub for a `--with NAME=ENV_VAR --vault`'d API key.
     ///
     /// `vault_meta` carries the host the secret talks to, the header

@@ -350,6 +350,9 @@ fn provision_oauth_mount(server: &Server, agent: OAuthAgent<'_>) -> Result<OAuth
     let lease = server
         .lease(provider.id(), &sandbox_id, real)
         .map_err(|e| PillboxError::runtime("vault", format!("lease sandbox: {e}")))?;
+    // Point the in-proxy refresh coordinator at the shared host creds file so a
+    // mid-session rotation is serialized + persisted through the rotation lock.
+    server.set_oauth_creds_path(&sandbox_id, creds_path.clone());
 
     // Write stub creds to a 0600 temp file the docker mount will overlay
     // onto the guest's real credentials file.

@@ -6,13 +6,14 @@
 //! out, real → stub swap + registry rotation on the way back).
 
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use http_body_util::BodyExt;
 use hudsucker::{
     hyper::{
         header::{HeaderValue, AUTHORIZATION},
-        Request, Response,
+        HeaderMap, Request, Response,
     },
     Body, RequestOrResponse,
 };
@@ -23,6 +24,7 @@ use super::{
     SandboxData, VaultProvider,
 };
 use crate::vault::server::ServerInner;
+use crate::vault::token_store::{Begin, RefreshDecider, TokenStore};
 
 // Provider id matches the AgentSpec id (`claude`) so
 // `VaultSession::start(agent_id, ...)` can look up the right provider
@@ -259,7 +261,16 @@ async fn handle_oauth_request(
     server: &ServerInner,
     pending: &mut Option<PendingFlow>,
 ) -> RequestOrResponse {
-    let (mut parts, body) = req.into_parts();
+    // Capture the request target before consuming `req`; the coordinated refresh
+    // forwards to the guest's own endpoint (a faithful relay, not a reconstruction).
+    let host = host_from_uri(&req).unwrap_or_default();
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| req.uri().path().to_string());
+
+    let (parts, body) = req.into_parts();
     let collected = match body.collect().await {
         Ok(c) => c.to_bytes(),
         Err(error) => {
@@ -268,7 +279,7 @@ async fn handle_oauth_request(
         }
     };
 
-    let mut value: serde_json::Value = match serde_json::from_slice(&collected) {
+    let value: serde_json::Value = match serde_json::from_slice(&collected) {
         Ok(v) => v,
         Err(_) => {
             // Not JSON; we can't rewrite. Reject — refusing is safer
@@ -279,81 +290,471 @@ async fn handle_oauth_request(
 
     // Two grant types reach /oauth/token:
     //
-    // 1. `grant_type=refresh_token` — the agent's normal token refresh.
-    //    Body carries a `refresh_token` that's one of our minted stubs;
-    //    we look up the sandbox by stub, swap stub → real on the way
-    //    out, and the response will return rotated tokens.
+    // 1. `grant_type=refresh_token` — the agent's normal token refresh. The body
+    //    carries a `refresh_token` that's one of our minted stubs. This is the
+    //    reuse-sensitive path: across concurrent sessions sharing the account, only
+    //    ONE may forward the real refresh token upstream. Routed through the
+    //    `TokenStore` begin/commit coordinator (`coordinate_refresh_request`).
     //
-    // 2. `grant_type=authorization_code` — Claude Code's `/login`
-    //    flow. Body carries a one-time `code` from the user's
-    //    browser-side OAuth dance; no stub to look up. We still must
-    //    intercept the *response* because that's where the freshly-
-    //    minted real tokens come back — without rewriting them to
-    //    stubs, the agent stores real bearers and every subsequent
-    //    API call 401s when the vault sees an unknown stub.
-    //
-    // Either way, set `pending` so handle_response runs; the
-    // identification path differs.
-    let stub_refresh = value
+    // 2. `grant_type=authorization_code` — Claude Code's `/login` flow. The body
+    //    carries a one-time browser `code`, not a refresh token; it MINTS the
+    //    initial token pair (no reuse risk), so it keeps the legacy
+    //    forward + `handle_response` path.
+    match value
         .get("refresh_token")
         .and_then(|v| v.as_str())
-        .map(str::to_owned);
+        .map(str::to_owned)
+    {
+        Some(stub) => {
+            coordinate_refresh_request(host, path_and_query, parts, value, stub, server, pending)
+                .await
+        }
+        None => forward_authorization_code(parts, value, collected.to_vec(), server, pending),
+    }
+}
 
-    let real_refresh = if let Some(stub) = stub_refresh.as_deref() {
-        let registry = server.registry_lock();
-        let sandbox_id = match registry.sandbox_for_stub(stub) {
-            Some(s) => s.to_string(),
-            None => return unauthorized("unknown stub refresh token").into(),
-        };
+/// The `grant_type=authorization_code` path: identify the sandbox, set `pending`
+/// so `handle_response` rewrites the freshly-minted real tokens to stubs, and
+/// forward the request body verbatim (the code isn't ours to rewrite).
+fn forward_authorization_code(
+    mut parts: hudsucker::hyper::http::request::Parts,
+    value: serde_json::Value,
+    original: Vec<u8>,
+    server: &ServerInner,
+    pending: &mut Option<PendingFlow>,
+) -> RequestOrResponse {
+    if let Some(sandbox_id) = server
+        .registry_lock()
+        .unique_sandbox_for_provider(PROVIDER_ID)
+    {
         *pending = Some(PendingFlow {
             provider_id: PROVIDER_ID,
-            sandbox_id: sandbox_id.clone(),
+            sandbox_id,
         });
-        registry
-            .real(&sandbox_id)
-            .and_then(|v| v.pointer("/claudeAiOauth/refreshToken"))
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)
-    } else {
-        // Authorization-code grant: identify the sandbox by the
-        // unique anthropic OAuth lease in the registry. Pass the
-        // request body through unchanged — the code itself isn't
-        // ours to rewrite, and the upstream needs it verbatim to
-        // mint the new token pair.
-        let sandbox_id = server
-            .registry_lock()
-            .unique_sandbox_for_provider(PROVIDER_ID);
-        if let Some(sandbox_id) = sandbox_id {
-            *pending = Some(PendingFlow {
-                provider_id: PROVIDER_ID,
-                sandbox_id,
-            });
-        }
-        None
+    }
+    let new_body = serde_json::to_vec(&value).unwrap_or(original);
+    force_identity_encoding(&mut parts.headers, new_body.len());
+    Request::from_parts(parts, Body::from(new_body)).into()
+}
+
+/// `grant_type=refresh_token` — the coordinated in-proxy refresh (slice 2b).
+///
+/// The vault makes its OWN upstream POST (a faithful relay of the guest's request,
+/// only the stub refresh token swapped for the real one) while holding the
+/// rotation flock, so across concurrent sessions sharing the account exactly one
+/// forward happens and the rest coalesce on its result. Returns a synthesized
+/// re-stubbed response directly to the guest — `handle_response` does not run for
+/// this path, so `pending` is left unset.
+async fn coordinate_refresh_request(
+    host: String,
+    path_and_query: String,
+    mut parts: hudsucker::hyper::http::request::Parts,
+    mut value: serde_json::Value,
+    stub: String,
+    server: &ServerInner,
+    pending: &mut Option<PendingFlow>,
+) -> RequestOrResponse {
+    // Snapshot what the coordinator needs under one registry lock.
+    let (sandbox_id, real, creds_path, stub_pair) = {
+        let registry = server.registry_lock();
+        let Some(sandbox_id) = registry.sandbox_for_stub(&stub).map(str::to_owned) else {
+            return unauthorized("unknown stub refresh token").into();
+        };
+        let real = registry.real(&sandbox_id).cloned();
+        let creds_path = registry.host_creds_path(&sandbox_id).map(Path::to_path_buf);
+        let stubs = stubs_for(&registry, &sandbox_id);
+        (sandbox_id, real, creds_path, stubs)
     };
 
-    if let (Some(obj), Some(real)) = (value.as_object_mut(), real_refresh) {
-        obj.insert("refresh_token".to_string(), serde_json::Value::String(real));
+    let (Some(real), Some((stub_access, stub_refresh))) = (real, stub_pair) else {
+        return unauthorized("refresh: missing real creds or stubs").into();
+    };
+
+    // No coordination path recorded (an OAuth lease always records one via
+    // `set_oauth_creds_path`; this is the bare-lease/test case) → legacy
+    // forward+handle_response keeps behavior unchanged.
+    let Some(creds_path) = creds_path else {
+        if let Some(obj) = value.as_object_mut() {
+            if let Some(real_rt) = claude_refresh(&real) {
+                obj.insert(
+                    "refresh_token".to_string(),
+                    serde_json::Value::String(real_rt),
+                );
+            }
+        }
+        *pending = Some(PendingFlow {
+            provider_id: PROVIDER_ID,
+            sandbox_id,
+        });
+        let new_body = serde_json::to_vec(&value).unwrap_or_default();
+        force_identity_encoding(&mut parts.headers, new_body.len());
+        return Request::from_parts(parts, Body::from(new_body)).into();
+    };
+
+    let decider = ClaudeRefreshDecider {
+        mapped_access: claude_access(&real),
+    };
+    let url = format!("https://{host}{path_and_query}");
+    let headers = forwardable_headers(&parts.headers);
+    let store = TokenStore::new(creds_path, REFRESH_LOCK_WAIT);
+
+    // begin (blocking flock) + the reqwest::blocking forward + commit all run
+    // off-reactor in one hop (reqwest::blocking panics inside a runtime, and the
+    // guard holds the lock across the whole forward).
+    let outcome = tokio::task::spawn_blocking(move || {
+        coordinate_refresh(store, decider, url, headers, value, real)
+    })
+    .await;
+
+    let response = match outcome {
+        Ok(Coordinated::Committed {
+            upstream_body,
+            new_real,
+        }) => {
+            apply_registry_rotation(server, &sandbox_id, &new_real);
+            restub_oauth_response(&upstream_body, &stub_access, &stub_refresh)
+        }
+        Ok(Coordinated::Coalesced { disk }) => {
+            apply_registry_rotation(server, &sandbox_id, &disk);
+            synth_oauth_response(&disk, &stub_access, &stub_refresh)
+        }
+        // Upstream rejected/failed the forward (the guard aborted → fail closed):
+        // relay the upstream error to the guest verbatim (no tokens to re-stub).
+        Ok(Coordinated::Forwarded { status, body }) => raw_response(status, body),
+        Ok(Coordinated::Reauth) => oauth_error_response(
+            400,
+            "invalid_grant",
+            "the subscription token must be refreshed via `pillbox auth login`",
+        ),
+        Ok(Coordinated::LockBusy) => oauth_error_response(
+            503,
+            "temporarily_unavailable",
+            "a concurrent token refresh is in flight; retry",
+        ),
+        Ok(Coordinated::Error(detail)) => {
+            eprintln!("pillbox: vault: coordinated refresh failed: {detail}");
+            oauth_error_response(502, "server_error", "token refresh failed")
+        }
+        Err(join_err) => {
+            eprintln!("pillbox: vault: refresh task panicked: {join_err}");
+            oauth_error_response(502, "server_error", "token refresh failed")
+        }
+    };
+    response.into()
+}
+
+/// How long to wait for the cross-process rotation flock before giving the guest
+/// a retryable 503. Generous: under contention a loser blocks until the winner's
+/// forward commits, then coalesces — `LockBusy` only fires if a winner's forward
+/// itself wedges past this.
+const REFRESH_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Decides the refresh for the claude creds shape. `mapped_access` is the real
+/// access token this session is currently mapped to (the registry snapshot); a
+/// forward is due only while the on-disk access token still equals it — if a peer
+/// already advanced it, [`TokenStore::begin`] coalesces instead.
+struct ClaudeRefreshDecider {
+    mapped_access: Option<String>,
+}
+
+impl RefreshDecider for ClaudeRefreshDecider {
+    fn needs_refresh(&self, creds: &serde_json::Value) -> bool {
+        match (claude_access(creds), self.mapped_access.as_deref()) {
+            (Some(disk), Some(mapped)) => disk == mapped,
+            // Unknown shape / no baseline → let begin attempt; it fails closed to
+            // re-auth if the refresh/access tokens aren't actually present.
+            _ => true,
+        }
+    }
+    fn refresh_token(&self, creds: &serde_json::Value) -> Option<String> {
+        claude_refresh(creds)
+    }
+    fn access_token(&self, creds: &serde_json::Value) -> Option<String> {
+        claude_access(creds)
+    }
+}
+
+/// Outcome of the off-reactor coordinator, mapped back to a guest response.
+enum Coordinated {
+    /// This caller won the race and committed the rotation. `upstream_body` is the
+    /// 2xx token response (to re-stub); `new_real` is the persisted real creds.
+    Committed {
+        upstream_body: Vec<u8>,
+        new_real: serde_json::Value,
+    },
+    /// A peer already rotated; adopt these on-disk creds (synthesize a response).
+    Coalesced { disk: serde_json::Value },
+    /// The upstream forward returned non-2xx (or an unparseable 2xx); the guard
+    /// aborted (fail closed). Relay the upstream status + body to the guest.
+    Forwarded { status: u16, body: Vec<u8> },
+    /// A prior refresh's outcome is unknown, or the tokens are missing → re-auth.
+    Reauth,
+    /// The rotation lock couldn't be acquired in time → retryable.
+    LockBusy,
+    /// Transport/serialize/commit error; the guard aborted (fail closed).
+    Error(String),
+}
+
+/// The blocking half: `begin` → forward the guest's request with the real refresh
+/// token → `commit`/`abort`. Runs inside `spawn_blocking` (flock + reqwest::blocking
+/// both block, and the guard holds the lock across the whole forward).
+fn coordinate_refresh(
+    store: TokenStore,
+    decider: ClaudeRefreshDecider,
+    url: String,
+    headers: reqwest::header::HeaderMap,
+    mut body: serde_json::Value,
+    real_snapshot: serde_json::Value,
+) -> Coordinated {
+    let guard = match store.begin(&decider) {
+        Ok(Begin::Rotate(g)) => g,
+        Ok(Begin::Coalesced(disk)) => return Coordinated::Coalesced { disk },
+        Ok(Begin::ReauthRequired(_)) => return Coordinated::Reauth,
+        Ok(Begin::LockBusy) => return Coordinated::LockBusy,
+        Err(e) => return Coordinated::Error(format!("begin: {e}")),
+    };
+
+    // Swap the stub refresh token for the real one read from disk under the lock.
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert(
+            "refresh_token".to_string(),
+            serde_json::Value::String(guard.refresh_token().to_string()),
+        );
+    }
+    let body_bytes = match serde_json::to_vec(&body) {
+        Ok(b) => b,
+        Err(e) => {
+            guard.abort();
+            return Coordinated::Error(format!("serialize body: {e}"));
+        }
+    };
+
+    let client = match reqwest::blocking::Client::builder().build() {
+        Ok(c) => c,
+        Err(e) => {
+            guard.abort();
+            return Coordinated::Error(format!("build client: {e}"));
+        }
+    };
+    let resp = match client.post(&url).headers(headers).body(body_bytes).send() {
+        Ok(r) => r,
+        Err(e) => {
+            guard.abort();
+            return Coordinated::Error(format!("forward: {e}"));
+        }
+    };
+    let status = resp.status().as_u16();
+    let resp_body = match resp.bytes() {
+        Ok(b) => b.to_vec(),
+        Err(e) => {
+            guard.abort();
+            return Coordinated::Error(format!("read response: {e}"));
+        }
+    };
+
+    if !(200..300).contains(&status) {
+        // Upstream rejected the refresh → fail closed (the next begin re-auths).
+        guard.abort();
+        return Coordinated::Forwarded {
+            status,
+            body: resp_body,
+        };
     }
 
-    let new_body = serde_json::to_vec(&value).unwrap_or(collected.to_vec());
-    let new_len = new_body.len();
-    parts.headers.remove("content-length");
-    parts
-        .headers
-        .insert("content-length", HeaderValue::from(new_len));
-    // Force the upstream OAuth response back uncompressed so our
-    // response-side `handle_response` can `serde_json::from_slice`
-    // it. Anthropic gzips `/oauth/token` responses when the client
-    // advertises `Accept-Encoding: gzip` (Claude Code does); the
-    // vault used to log "oauth response not JSON; passing through"
-    // and the agent ended up with raw tokens that the registry
-    // didn't recognize on subsequent API calls → 401.
-    parts.headers.remove("accept-encoding");
-    parts
-        .headers
-        .insert("accept-encoding", HeaderValue::from_static("identity"));
-    Request::from_parts(parts, Body::from(new_body)).into()
+    let upstream: serde_json::Value = match serde_json::from_slice(&resp_body) {
+        Ok(v) => v,
+        Err(_) => {
+            guard.abort();
+            return Coordinated::Forwarded {
+                status,
+                body: resp_body,
+            };
+        }
+    };
+    let Some(new_real) = build_new_real(&real_snapshot, &upstream) else {
+        // 2xx without a usable access token — don't clear pending, relay as-is.
+        guard.abort();
+        return Coordinated::Forwarded {
+            status,
+            body: resp_body,
+        };
+    };
+
+    if let Err(e) = guard.commit(&decider, new_real.clone()) {
+        // commit refused (access didn't rotate) or write failed → pending stays
+        // set (fail closed). The guest sees a server error and re-auths.
+        return Coordinated::Error(format!("commit: {e}"));
+    }
+    Coordinated::Committed {
+        upstream_body: resp_body,
+        new_real,
+    }
+}
+
+/// Splice the upstream token response into the real creds (claude shape). `None`
+/// if the response carries no access token (not a usable rotation).
+fn build_new_real(
+    real_snapshot: &serde_json::Value,
+    upstream: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let new_access = upstream.get("access_token").and_then(|v| v.as_str())?;
+    let mut new_real = real_snapshot.clone();
+    let oauth = new_real.get_mut("claudeAiOauth")?.as_object_mut()?;
+    oauth.insert(
+        "accessToken".to_string(),
+        serde_json::Value::String(new_access.to_string()),
+    );
+    if let Some(new_refresh) = upstream.get("refresh_token").and_then(|v| v.as_str()) {
+        oauth.insert(
+            "refreshToken".to_string(),
+            serde_json::Value::String(new_refresh.to_string()),
+        );
+    }
+    if let Some(expires_in) = upstream.get("expires_in").and_then(|v| v.as_u64()) {
+        oauth.insert(
+            "expiresAt".to_string(),
+            serde_json::Value::from(now_ms().saturating_add(expires_in.saturating_mul(1000))),
+        );
+    }
+    Some(new_real)
+}
+
+/// Mirror the committed real tokens into the in-memory registry so this session's
+/// subsequent bearer-token API swaps map the (stable) stub to the new real access
+/// token. The file is the cross-process authority; the registry is the in-session
+/// swap map.
+fn apply_registry_rotation(server: &ServerInner, sandbox_id: &str, new_real: &serde_json::Value) {
+    let mut registry = server.registry_lock();
+    if let Some(access) = claude_access(new_real) {
+        registry.rotate_real_field(sandbox_id, "/claudeAiOauth/accessToken", access);
+    }
+    if let Some(refresh) = claude_refresh(new_real) {
+        registry.rotate_real_field(sandbox_id, "/claudeAiOauth/refreshToken", refresh);
+    }
+}
+
+/// Re-stub the upstream 2xx token body: swap the new real tokens back to the
+/// session's stable stubs so the guest never sees a real bearer.
+fn restub_oauth_response(
+    upstream_body: &[u8],
+    stub_access: &str,
+    stub_refresh: &str,
+) -> Response<Body> {
+    let mut value: serde_json::Value = serde_json::from_slice(upstream_body).unwrap_or_default();
+    if let Some(obj) = value.as_object_mut() {
+        if obj.contains_key("access_token") {
+            obj.insert(
+                "access_token".to_string(),
+                serde_json::Value::String(stub_access.to_string()),
+            );
+        }
+        if obj.contains_key("refresh_token") {
+            obj.insert(
+                "refresh_token".to_string(),
+                serde_json::Value::String(stub_refresh.to_string()),
+            );
+        }
+    }
+    json_response(200, &value)
+}
+
+/// Synthesize a token response for the coalesce path — a peer already rotated, so
+/// hand the guest its (stable) stubs with the freshened expiry, no upstream call.
+fn synth_oauth_response(
+    disk: &serde_json::Value,
+    stub_access: &str,
+    stub_refresh: &str,
+) -> Response<Body> {
+    let expires_in = disk
+        .pointer("/claudeAiOauth/expiresAt")
+        .and_then(|v| v.as_u64())
+        .map(|exp_ms| exp_ms.saturating_sub(now_ms()) / 1000)
+        .unwrap_or(3600);
+    let body = serde_json::json!({
+        "access_token": stub_access,
+        "refresh_token": stub_refresh,
+        "expires_in": expires_in,
+        "token_type": "Bearer",
+    });
+    json_response(200, &body)
+}
+
+fn claude_access(creds: &serde_json::Value) -> Option<String> {
+    creds
+        .pointer("/claudeAiOauth/accessToken")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+}
+
+fn claude_refresh(creds: &serde_json::Value) -> Option<String> {
+    creds
+        .pointer("/claudeAiOauth/refreshToken")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+}
+
+/// Copy the guest's headers for the upstream relay, dropping the ones reqwest must
+/// recompute (`host`, `content-length`) and forcing identity encoding (reqwest's
+/// blocking client has no gzip feature here, so it would not decompress a gzipped
+/// token response). Reconstructed via bytes so it doesn't assume hudsucker's and
+/// reqwest's header types are the same.
+fn forwardable_headers(src: &HeaderMap) -> reqwest::header::HeaderMap {
+    let mut out = reqwest::header::HeaderMap::new();
+    for (name, value) in src.iter() {
+        let n = name.as_str().to_ascii_lowercase();
+        if n == "host" || n == "content-length" || n == "accept-encoding" {
+            continue;
+        }
+        if let (Ok(hn), Ok(hv)) = (
+            reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes()),
+            reqwest::header::HeaderValue::from_bytes(value.as_bytes()),
+        ) {
+            out.insert(hn, hv);
+        }
+    }
+    out.insert(
+        reqwest::header::ACCEPT_ENCODING,
+        reqwest::header::HeaderValue::from_static("identity"),
+    );
+    out
+}
+
+/// Force the forwarded request body back uncompressed + set the rewritten length.
+/// Anthropic gzips `/oauth/token` responses when the client advertises gzip (Claude
+/// Code does); identity keeps the response parseable on the way back.
+fn force_identity_encoding(headers: &mut HeaderMap, content_length: usize) {
+    headers.remove("content-length");
+    headers.insert("content-length", HeaderValue::from(content_length));
+    headers.remove("accept-encoding");
+    headers.insert("accept-encoding", HeaderValue::from_static("identity"));
+}
+
+fn json_response(status: u16, value: &serde_json::Value) -> Response<Body> {
+    raw_response(status, serde_json::to_vec(value).unwrap_or_default())
+}
+
+fn raw_response(status: u16, body: Vec<u8>) -> Response<Body> {
+    let len = body.len();
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .header("content-length", len)
+        .body(Body::from(body))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+fn oauth_error_response(status: u16, error: &str, description: &str) -> Response<Body> {
+    json_response(
+        status,
+        &serde_json::json!({ "error": error, "error_description": description }),
+    )
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Two flows can target `api.anthropic.com`:
@@ -1048,5 +1449,155 @@ mod tests {
         assert_eq!(res.status(), 401);
 
         cleanup(server, dir);
+    }
+
+    // ── Coordinated refresh (slice 2b) ──────────────────────────────────────
+    //
+    // The Rotate → upstream forward → commit path needs a live endpoint (covered
+    // by live smoke). These exercise everything around it: the decider's coalesce
+    // gate, the creds-shaping helpers, and the non-forward `begin` branches
+    // (Coalesced / Reauth) the coordinator selects WITHOUT touching the network.
+
+    use crate::vault::token_store::TokenStore;
+
+    fn future_expiry_ms() -> u64 {
+        now_ms() + 3_600_000
+    }
+
+    #[test]
+    fn decider_gates_refresh_on_access_token_equality() {
+        let d = ClaudeRefreshDecider {
+            mapped_access: Some("AT0".into()),
+        };
+        // disk still on the access we mapped → a forward is due.
+        assert!(d.needs_refresh(&serde_json::json!({ "claudeAiOauth": { "accessToken": "AT0" } })));
+        // a peer already advanced disk → coalesce, don't forward.
+        assert!(!d.needs_refresh(&serde_json::json!({ "claudeAiOauth": { "accessToken": "AT1" } })));
+        assert_eq!(
+            d.access_token(&serde_json::json!({ "claudeAiOauth": { "accessToken": "AT0" } }))
+                .as_deref(),
+            Some("AT0")
+        );
+        assert_eq!(
+            d.refresh_token(&serde_json::json!({ "claudeAiOauth": { "refreshToken": "RT0" } }))
+                .as_deref(),
+            Some("RT0")
+        );
+    }
+
+    #[test]
+    fn build_new_real_splices_tokens_and_expiry_preserving_other_fields() {
+        let real = sample_anthropic_real();
+        let upstream = serde_json::json!({
+            "access_token": "NEW_A", "refresh_token": "NEW_R", "expires_in": 3600,
+        });
+        let nr = build_new_real(&real, &upstream).expect("usable rotation");
+        assert_eq!(nr.pointer("/claudeAiOauth/accessToken").unwrap(), "NEW_A");
+        assert_eq!(nr.pointer("/claudeAiOauth/refreshToken").unwrap(), "NEW_R");
+        assert!(
+            nr.pointer("/claudeAiOauth/expiresAt")
+                .and_then(|v| v.as_u64())
+                .unwrap()
+                > now_ms()
+        );
+        // Untouched fields survive the splice.
+        assert_eq!(
+            nr.pointer("/claudeAiOauth/subscriptionType").unwrap(),
+            "pro"
+        );
+    }
+
+    #[test]
+    fn build_new_real_none_without_access_token() {
+        // A 2xx body that isn't a usable token response → no rotation to commit.
+        assert!(build_new_real(
+            &sample_anthropic_real(),
+            &serde_json::json!({ "token_type": "Bearer" })
+        )
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn restub_oauth_response_swaps_real_tokens_back_to_stubs() {
+        let upstream_body = serde_json::to_vec(&serde_json::json!({
+            "access_token": "NEW_REAL_A", "refresh_token": "NEW_REAL_R", "expires_in": 3600,
+        }))
+        .unwrap();
+        let resp = restub_oauth_response(&upstream_body, "sk-ant-oat01-stub", "sk-ant-ort01-stub");
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp.into_body()).await;
+        assert_eq!(v["access_token"], "sk-ant-oat01-stub");
+        assert_eq!(v["refresh_token"], "sk-ant-ort01-stub");
+        // The real tokens never reach the guest.
+        assert_ne!(v["access_token"], "NEW_REAL_A");
+    }
+
+    #[tokio::test]
+    async fn synth_oauth_response_carries_stubs_and_a_positive_expiry() {
+        let disk = serde_json::json!({
+            "claudeAiOauth": { "accessToken": "AT", "refreshToken": "RT", "expiresAt": future_expiry_ms() },
+        });
+        let resp = synth_oauth_response(&disk, "stubA", "stubR");
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp.into_body()).await;
+        assert_eq!(v["access_token"], "stubA");
+        assert_eq!(v["refresh_token"], "stubR");
+        let expires_in = v["expires_in"].as_u64().unwrap();
+        assert!(expires_in > 0 && expires_in <= 3600, "got {expires_in}");
+    }
+
+    fn store_on(creds: serde_json::Value) -> (tempfile::TempDir, TokenStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let creds_path = dir.path().join(".credentials.json");
+        std::fs::write(&creds_path, serde_json::to_vec(&creds).unwrap()).unwrap();
+        let store = TokenStore::new(creds_path, std::time::Duration::from_secs(5));
+        (dir, store)
+    }
+
+    #[test]
+    fn coordinate_refresh_coalesces_when_disk_advanced_no_network() {
+        // Disk is on AT1; this session mapped AT0 → a peer already rotated →
+        // begin() returns Coalesced and the coordinator never forwards.
+        let (_d, store) = store_on(serde_json::json!({
+            "claudeAiOauth": { "accessToken": "AT1", "refreshToken": "RT1", "expiresAt": future_expiry_ms() },
+        }));
+        let decider = ClaudeRefreshDecider {
+            mapped_access: Some("AT0".into()),
+        };
+        let out = coordinate_refresh(
+            store,
+            decider,
+            "https://unused.invalid/v1/oauth/token".into(),
+            reqwest::header::HeaderMap::new(),
+            serde_json::json!({ "grant_type": "refresh_token", "refresh_token": "stub" }),
+            sample_anthropic_real(),
+        );
+        match out {
+            Coordinated::Coalesced { disk } => {
+                assert_eq!(disk.pointer("/claudeAiOauth/accessToken").unwrap(), "AT1");
+            }
+            _ => panic!("expected Coalesced"),
+        }
+    }
+
+    #[test]
+    fn coordinate_refresh_reauths_when_refresh_token_missing_no_network() {
+        // Disk has the mapped access token (so a forward is "due") but no refresh
+        // token → begin() fails closed to re-auth; the coordinator never forwards.
+        let (_d, store) = store_on(serde_json::json!({
+            "claudeAiOauth": { "accessToken": "AT0" },
+        }));
+        let decider = ClaudeRefreshDecider {
+            mapped_access: Some("AT0".into()),
+        };
+        let out = coordinate_refresh(
+            store,
+            decider,
+            "https://unused.invalid/v1/oauth/token".into(),
+            reqwest::header::HeaderMap::new(),
+            serde_json::json!({ "refresh_token": "stub" }),
+            sample_anthropic_real(),
+        );
+        assert!(matches!(out, Coordinated::Reauth));
     }
 }

@@ -32,6 +32,7 @@ pub(crate) mod providers;
 mod refresh;
 mod server;
 mod session;
+mod token_store;
 
 pub(crate) use ca::{cert_path_in as ca_cert_path_in, Ca};
 pub(crate) use egress::{is_denied_egress_ip, EgressPolicy};

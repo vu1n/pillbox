@@ -119,15 +119,18 @@ pub(super) fn drive_listeners(
 }
 
 /// Build the per-connection swap from only the pairs bound to `host` (the pinned
-/// SNI) — destination-bound release. A pair with no `hosts` is unbound and applies
-/// everywhere (back-compat / tests); a bound pair applies only on its host(s),
-/// case-insensitively. This is what stops a guest-held stub from being replayed to
-/// a different allowlisted host to extract the real credential.
+/// SNI) — destination-bound release. A pair applies only on its own host(s)
+/// (case-insensitively); a pair with NO hosts matches nothing and is never
+/// released (fail-closed — an unbound credential is a bug, not a wildcard). This
+/// is the last line of defense that stops a guest-held stub from being replayed to
+/// a different allowlisted host to extract the real credential: the binding is
+/// enforced here, in the MITM, not only by the launch-time guards that build the
+/// pairs.
 fn host_bound_swap(swap_pairs: &[CredSwap], host: &str) -> StubSwap {
     StubSwap::new(
         swap_pairs
             .iter()
-            .filter(|p| p.hosts.is_empty() || p.hosts.iter().any(|h| h.eq_ignore_ascii_case(host)))
+            .filter(|p| p.hosts.iter().any(|h| h.eq_ignore_ascii_case(host)))
             .cloned()
             .collect(),
     )
@@ -346,12 +349,14 @@ mod tests {
     }
 
     #[test]
-    fn host_match_is_case_insensitive_and_unbound_applies_everywhere() {
+    fn host_match_is_case_insensitive_and_unbound_is_fail_closed() {
         let bound = vec![pair("s", &["API.Anthropic.COM"])];
         assert!(!host_bound_swap(&bound, "api.anthropic.com").is_noop());
         assert!(host_bound_swap(&bound, "evil.example").is_noop());
-        // a pair with no hosts is unbound → applies on any host (back-compat).
+        // A pair with no hosts matches NOTHING (fail-closed): an unbound credential
+        // is never released, so a stray empty-host pair can't become a wildcard swap.
         let unbound = vec![pair("s", &[])];
-        assert!(!host_bound_swap(&unbound, "evil.example").is_noop());
+        assert!(host_bound_swap(&unbound, "api.anthropic.com").is_noop());
+        assert!(host_bound_swap(&unbound, "evil.example").is_noop());
     }
 }

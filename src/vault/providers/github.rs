@@ -89,7 +89,7 @@ impl VaultProvider for GithubProvider {
             return Request::from_parts(parts, body).into();
         };
 
-        match swap_bearer_style(&auth_value, scheme, server) {
+        match swap_bearer_style(&auth_value, scheme, server, &host) {
             ApiKeySwap::Swapped(hv) => {
                 parts.headers.insert(AUTHORIZATION, hv);
                 Request::from_parts(parts, body).into()
@@ -139,11 +139,14 @@ mod tests {
             "sbx-1".into(),
             SandboxData {
                 provider_id: API_KEY_PROVIDER_ID,
-                real: serde_json::json!({"name": "GITHUB_TOKEN", "value": "ghp_realtoken"}),
+                real: serde_json::json!({"name": "GITHUB_TOKEN", "value": "ghp_realtoken", "host": "api.github.com"}),
                 stubs: vec![stub.into()],
             },
         );
-        assert_eq!(r.api_key_real_for_stub(stub), Some("ghp_realtoken"));
+        assert_eq!(
+            r.api_key_real_for_stub(stub, "api.github.com"),
+            Some("ghp_realtoken")
+        );
     }
 
     // ── End-to-end Request/Response integration tests ────────────────

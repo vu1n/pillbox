@@ -850,7 +850,7 @@ mod tests {
         {
             let registry = server.registry_lock_for_test();
             assert_eq!(
-                registry.api_key_real_for_stub(&stub),
+                registry.api_key_real_for_stub(&stub, "api.anthropic.com"),
                 Some("sk-ant-api03-REAL"),
             );
         }
@@ -860,7 +860,9 @@ mod tests {
         // Stub vanishes from the registry on drop.
         {
             let registry = server.registry_lock_for_test();
-            assert!(registry.api_key_real_for_stub(&stub).is_none());
+            assert!(registry
+                .api_key_real_for_stub(&stub, "api.anthropic.com")
+                .is_none());
         }
 
         drop(server);
@@ -915,7 +917,7 @@ mod tests {
             }
             // API-key stub resolves real via api_key_real_for_stub.
             assert_eq!(
-                registry.api_key_real_for_stub(&stub),
+                registry.api_key_real_for_stub(&stub, "api.anthropic.com"),
                 Some("sk-ant-api03-REAL"),
             );
         }
@@ -924,7 +926,9 @@ mod tests {
         drop(api);
         {
             let registry = server.registry_lock_for_test();
-            assert!(registry.api_key_real_for_stub(&stub).is_none());
+            assert!(registry
+                .api_key_real_for_stub(&stub, "api.anthropic.com")
+                .is_none());
             assert!(registry.stubs_for("sbx-oauth").is_some());
         }
 

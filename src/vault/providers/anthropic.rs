@@ -437,11 +437,12 @@ async fn handle_api_request_x_api_key(
     req: Request<Body>,
     server: &ServerInner,
 ) -> RequestOrResponse {
+    let host = host_from_uri(&req).unwrap_or_default();
     let (mut parts, body) = req.into_parts();
     let Some(header_value) = parts.headers.get(X_API_KEY_HEADER).cloned() else {
         return Request::from_parts(parts, body).into();
     };
-    match swap_raw_header(&header_value, server) {
+    match swap_raw_header(&header_value, server, &host) {
         ApiKeySwap::Swapped(hv) => {
             parts.headers.insert(X_API_KEY_HEADER, hv);
             Request::from_parts(parts, body).into()
@@ -564,7 +565,8 @@ mod tests {
                 provider_id: API_KEY_PROVIDER_ID,
                 real: serde_json::json!({
                     "name": "ANTHROPIC_API_KEY",
-                    "value": "sk-ant-api03-REAL-secret"
+                    "value": "sk-ant-api03-REAL-secret",
+                    "host": "api.anthropic.com"
                 }),
                 stubs: vec![stub.into()],
             },
@@ -573,7 +575,7 @@ mod tests {
         // `api_key_real_for_stub` even though the entry was minted
         // outside the OAuth `provision` path.
         assert_eq!(
-            r.api_key_real_for_stub(stub),
+            r.api_key_real_for_stub(stub, "api.anthropic.com"),
             Some("sk-ant-api03-REAL-secret"),
         );
         // OAuth-style real lookup should NOT pick it up (different shape).

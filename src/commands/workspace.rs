@@ -25,12 +25,20 @@ pub(crate) fn push(
     tag: Option<String>,
     message: Option<String>,
     bookmark: Option<String>,
+    parents: Vec<String>,
     json: bool,
 ) -> Result<()> {
     let backend = resolved.workspace()?;
     let cwd = std::env::current_dir()
         .map_err(|e| PillboxError::runtime("push", format!("could not resolve cwd: {e}")))?;
-    let snap = backend.push(&cwd, PushOptions { tag, message })?;
+    let snap = backend.push(
+        &cwd,
+        PushOptions {
+            tag,
+            message,
+            parents,
+        },
+    )?;
     // Bind the bookmark to THIS snapshot by handle (not `latest`) so a concurrent
     // push can't shift it. The snapshot already exists, so a bookmark failure
     // (e.g. global pillbox — bookmarks need a project) doesn't lose the snapshot.
@@ -65,6 +73,10 @@ pub(crate) fn push(
         if let Some(a) = &snap.git_anchor {
             let dirty = if snap.git_dirty { " (dirty)" } else { "" };
             println!("  git anchor: {a}{dirty}");
+        }
+        if !snap.parents.is_empty() {
+            let shorts: Vec<&str> = snap.parents.iter().map(|p| &p[..p.len().min(8)]).collect();
+            println!("  parents:    {}", shorts.join(", "));
         }
         println!("  created:    {}", snap.created_at);
         if let Some(name) = bookmark.as_deref() {
@@ -404,6 +416,15 @@ fn snapshot_value(snap: &Snapshot) -> serde_json::Value {
             .unwrap_or(serde_json::Value::Null),
     );
     o.insert("git_dirty".into(), serde_json::Value::Bool(snap.git_dirty));
+    o.insert(
+        "parents".into(),
+        serde_json::Value::Array(
+            snap.parents
+                .iter()
+                .map(|p| serde_json::Value::String(p.clone()))
+                .collect(),
+        ),
+    );
     o.insert("bytes".into(), serde_json::Value::Number(snap.bytes.into()));
     o.insert(
         "files_new".into(),

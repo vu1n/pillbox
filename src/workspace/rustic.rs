@@ -317,8 +317,20 @@ impl WorkspaceBackend for RusticBackend {
         if let Some(m) = opts.message.as_deref() {
             validate_user_message("workspace push", m)?;
         }
-        let repo = self
-            .open()?
+        let opened = self.open()?;
+        // Resolve any `--parent` handles (prefix-ok) against this repo, reusing
+        // the single open so we don't pay scrypt per parent. Canonicalizes the
+        // recorded lineage to full ids and fails the push loudly on an unknown
+        // parent rather than persisting a dangling edge.
+        let parent_ids: Vec<String> = opts
+            .parents
+            .iter()
+            .map(|p| {
+                resolve_in(&opened, &SnapshotHandle::new(p.clone()))
+                    .map(|s| s.id.to_hex().as_str().to_string())
+            })
+            .collect::<Result<_>>()?;
+        let repo = opened
             .to_indexed_ids()
             .map_err(|e| rustic_err("workspace push", e))?;
 
@@ -346,9 +358,12 @@ impl WorkspaceBackend for RusticBackend {
         // description field (a free-form blob). `parse_description`
         // round-trips this on read so `snapshot show` reports the
         // same metadata.
-        if let Some(desc) =
-            encode_description(opts.message.as_deref(), git_anchor.as_deref(), git_dirty)
-        {
+        if let Some(desc) = encode_description(
+            opts.message.as_deref(),
+            git_anchor.as_deref(),
+            git_dirty,
+            &parent_ids,
+        ) {
             snap_opts = snap_opts.description(desc);
         }
         // Pin the host name to a stable value so snapshots taken from
@@ -552,7 +567,7 @@ fn snapshot_to_record(
         .next()
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty());
-    let (message, parsed_git_anchor, parsed_git_dirty) =
+    let (message, parsed_git_anchor, parsed_git_dirty, parents) =
         parse_description(snap.description.as_deref());
     // If the caller passed git info explicitly (push path), prefer
     // that. Otherwise, fall back to what we encoded in the
@@ -578,6 +593,7 @@ fn snapshot_to_record(
         message,
         git_anchor,
         git_dirty,
+        parents,
         bytes,
         files_new,
         files_changed,
@@ -615,15 +631,16 @@ fn encode_description(
     message: Option<&str>,
     git_anchor: Option<&str>,
     git_dirty: bool,
+    parents: &[String],
 ) -> Option<String> {
-    if message.is_none() && git_anchor.is_none() && !git_dirty {
+    if message.is_none() && git_anchor.is_none() && !git_dirty && parents.is_empty() {
         return None;
     }
     let mut out = String::new();
     if let Some(m) = message {
         out.push_str(m);
     }
-    if git_anchor.is_some() || git_dirty {
+    if git_anchor.is_some() || git_dirty || !parents.is_empty() {
         if !out.is_empty() {
             out.push_str("\n\n");
         }
@@ -633,6 +650,9 @@ fn encode_description(
             out.push_str(&format!("pillbox-git-anchor: {a}\n"));
         }
         out.push_str(&format!("pillbox-git-dirty: {git_dirty}\n"));
+        for p in parents {
+            out.push_str(&format!("pillbox-parent: {p}\n"));
+        }
         out.push_str(TRAILER_END);
         out.push('\n');
     }
@@ -656,9 +676,9 @@ pub(crate) fn validate_user_message(action: &'static str, msg: &str) -> Result<(
     Ok(())
 }
 
-fn parse_description(s: Option<&str>) -> (Option<String>, Option<String>, bool) {
+fn parse_description(s: Option<&str>) -> (Option<String>, Option<String>, bool, Vec<String>) {
     let Some(s) = s else {
-        return (None, None, false);
+        return (None, None, false, Vec::new());
     };
     // Locate the sentinel-bracketed trailer (if any). Everything
     // outside is the user message; only the block between the
@@ -676,6 +696,7 @@ fn parse_description(s: Option<&str>) -> (Option<String>, Option<String>, bool) 
     };
     let mut git_anchor: Option<String> = None;
     let mut git_dirty = false;
+    let mut parents: Vec<String> = Vec::new();
     if let Some(trailer) = trailer_part {
         for line in trailer.lines() {
             if let Some(rest) = line.strip_prefix("pillbox-git-anchor: ") {
@@ -684,6 +705,11 @@ fn parse_description(s: Option<&str>) -> (Option<String>, Option<String>, bool) 
             }
             if let Some(rest) = line.strip_prefix("pillbox-git-dirty: ") {
                 git_dirty = matches!(rest.trim(), "true" | "True" | "1");
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("pillbox-parent: ") {
+                parents.push(rest.trim().to_string());
+                continue;
             }
         }
     }
@@ -695,7 +721,7 @@ fn parse_description(s: Option<&str>) -> (Option<String>, Option<String>, bool) 
             Some(trimmed)
         }
     };
-    (message, git_anchor, git_dirty)
+    (message, git_anchor, git_dirty, parents)
 }
 
 /// Rustic stores time as `jiff::Zoned`, whose `Display` is RFC3339
@@ -803,6 +829,7 @@ mod tests {
                 PushOptions {
                     tag: Some("v1".into()),
                     message: Some("first cut".into()),
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -814,6 +841,53 @@ mod tests {
         let shown = backend.snapshot_show(&snap.handle).unwrap();
         assert_eq!(shown.tag.as_deref(), Some("v1"));
         assert_eq!(shown.message.as_deref(), Some("first cut"));
+    }
+
+    #[test]
+    fn push_records_resolved_parents() {
+        let (backend, dir) = fresh_local_backend();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(ws.join("a"), b"x").unwrap();
+        let base = backend.push(&ws, PushOptions::default()).unwrap();
+        assert!(base.parents.is_empty(), "ordinary push has no parents");
+
+        fs::write(ws.join("a"), b"y longer content").unwrap();
+        // Pass a PREFIX as the parent to prove prefix → full-id resolution.
+        let merged = backend
+            .push(
+                &ws,
+                PushOptions {
+                    parents: vec![base.handle.short().to_string()],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let want = vec![base.handle.as_str().to_string()];
+        assert_eq!(merged.parents, want, "parent prefix resolved to full id");
+
+        // Round-trips on read.
+        let shown = backend.snapshot_show(&merged.handle).unwrap();
+        assert_eq!(shown.parents, want);
+    }
+
+    #[test]
+    fn push_with_unknown_parent_errors() {
+        let (backend, dir) = fresh_local_backend();
+        let ws = dir.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(ws.join("a"), b"x").unwrap();
+        let err = backend
+            .push(
+                &ws,
+                PushOptions {
+                    parents: vec!["deadbeef".to_string()],
+                    ..Default::default()
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("deadbeef"), "got: {err}");
     }
 
     #[test]
@@ -1006,28 +1080,46 @@ mod tests {
     #[test]
     fn encode_decode_description_roundtrip() {
         // No metadata → None.
-        assert!(encode_description(None, None, false).is_none());
+        assert!(encode_description(None, None, false, &[]).is_none());
 
         // Message only.
-        let s = encode_description(Some("hello"), None, false).unwrap();
-        let (m, a, d) = parse_description(Some(&s));
+        let s = encode_description(Some("hello"), None, false, &[]).unwrap();
+        let (m, a, d, p) = parse_description(Some(&s));
         assert_eq!(m.as_deref(), Some("hello"));
         assert!(a.is_none());
         assert!(!d);
+        assert!(p.is_empty());
 
         // Git anchor + dirty.
-        let s = encode_description(Some("msg"), Some("abc123"), true).unwrap();
-        let (m, a, d) = parse_description(Some(&s));
+        let s = encode_description(Some("msg"), Some("abc123"), true, &[]).unwrap();
+        let (m, a, d, _p) = parse_description(Some(&s));
         assert_eq!(m.as_deref(), Some("msg"));
         assert_eq!(a.as_deref(), Some("abc123"));
         assert!(d);
 
         // Just git anchor.
-        let s = encode_description(None, Some("def456"), false).unwrap();
-        let (m, a, d) = parse_description(Some(&s));
+        let s = encode_description(None, Some("def456"), false, &[]).unwrap();
+        let (m, a, d, _p) = parse_description(Some(&s));
         assert!(m.is_none());
         assert_eq!(a.as_deref(), Some("def456"));
         assert!(!d);
+
+        // Parents only (no anchor, not dirty) — still emits a trailer.
+        let parents = vec!["a".repeat(64), "b".repeat(64)];
+        let s = encode_description(None, None, false, &parents).unwrap();
+        let (m, a, d, p) = parse_description(Some(&s));
+        assert!(m.is_none());
+        assert!(a.is_none());
+        assert!(!d);
+        assert_eq!(p, parents);
+
+        // Message + anchor + parents together.
+        let s = encode_description(Some("merge"), Some("sha"), true, &parents).unwrap();
+        let (m, a, d, p) = parse_description(Some(&s));
+        assert_eq!(m.as_deref(), Some("merge"));
+        assert_eq!(a.as_deref(), Some("sha"));
+        assert!(d);
+        assert_eq!(p, parents);
     }
 
     #[test]
@@ -1062,11 +1154,16 @@ mod tests {
         // Injection vector: a user message that *contains* the
         // trailer-shaped lines, but outside the sentinel block. The
         // parser must NOT interpret these as real metadata.
-        let forged = "hello\npillbox-git-anchor: deadbeef\npillbox-git-dirty: true";
-        let (msg, anchor, dirty) = parse_description(Some(forged));
+        let forged =
+            "hello\npillbox-git-anchor: deadbeef\npillbox-git-dirty: true\npillbox-parent: cafe";
+        let (msg, anchor, dirty, parents) = parse_description(Some(forged));
         assert_eq!(msg.as_deref(), Some(forged.trim()));
         assert!(anchor.is_none(), "anchor must not be forged from message");
         assert!(!dirty, "dirty must not be forged from message");
+        assert!(
+            parents.is_empty(),
+            "parents must not be forged from message"
+        );
     }
 
     #[test]
@@ -1089,11 +1186,15 @@ mod tests {
         // Message contains the *literal text* of a fake trailer key —
         // encode + parse must return it as the message, with no
         // forged anchor.
-        let user_msg = "release notes:\npillbox-git-anchor: not-real";
-        let encoded = encode_description(Some(user_msg), Some("realsha"), true).unwrap();
-        let (m, a, d) = parse_description(Some(&encoded));
+        let user_msg = "release notes:\npillbox-git-anchor: not-real\npillbox-parent: not-real";
+        let real_parents = vec!["c".repeat(64)];
+        let encoded =
+            encode_description(Some(user_msg), Some("realsha"), true, &real_parents).unwrap();
+        let (m, a, d, p) = parse_description(Some(&encoded));
         assert_eq!(m.as_deref(), Some(user_msg));
         assert_eq!(a.as_deref(), Some("realsha"));
         assert!(d);
+        // The real parent is recorded; the message's lookalike line is not.
+        assert_eq!(p, real_parents);
     }
 }

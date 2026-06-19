@@ -404,6 +404,12 @@ enum Command {
         /// `latest` race of a separate `bookmark set`). Requires a project pillbox.
         #[arg(long, value_name = "NAME")]
         bookmark: Option<String>,
+        /// Record one or more parent snapshots (prefix-ok) as this snapshot's
+        /// lineage — the merge-back edge an orchestrator declares after merging
+        /// collected results (`push --parent <base> --parent <winner>`). Builds
+        /// the workspace DAG `pillbox snapshot show` reports. Repeatable.
+        #[arg(long = "parent", value_name = "HANDLE")]
+        parents: Vec<String>,
         /// Emit the snapshot record as JSON on stdout. Stable schema —
         /// pin against `version: 1`.
         #[arg(long)]
@@ -418,6 +424,31 @@ enum Command {
         /// Bookmark to restore. Mutually exclusive with `--snapshot`.
         #[arg(long, value_name = "NAME", conflicts_with = "snapshot")]
         bookmark: Option<String>,
+    },
+    /// Collect finished session results + lineage for an orchestrator to merge.
+    /// Rehydrates each session's result tree into `<to>/<session>/` and reports
+    /// the merge-triple handles (`base_git_anchor` = the merge base). The
+    /// substrate half of a fan-out loop: pillbox collects, the orchestrator
+    /// decides how to merge (select-one / union / three-way / agent-resolve).
+    /// See docs/collect.md.
+    Collect {
+        /// One or more session ids (unique prefix ≥ 4 chars).
+        #[arg(value_name = "SESSION", required = true)]
+        sessions: Vec<String>,
+        /// Parent directory for the rehydrated result trees. Each session lands
+        /// at `<DIR>/<session>/`. Defaults to `./collected`.
+        #[arg(long, value_name = "DIR")]
+        to: Option<PathBuf>,
+        /// Also synthesize a git commit per result (tree = the result, parent =
+        /// the merge base) under `refs/pillbox/collect/<session>`, for an
+        /// orchestrator to `git merge`/`jj` with its own policy. Requires cwd to
+        /// be a git work tree; adds a `ref` field to each manifest entry.
+        #[arg(long = "as-refs")]
+        as_refs: bool,
+        /// Emit the collection manifest as JSON on stdout. Stable schema — pin
+        /// against `version: 1`.
+        #[arg(long)]
+        json: bool,
     },
     /// Inspect / manage the pillbox's snapshots.
     Snapshot {
@@ -821,14 +852,24 @@ fn run(cli: Cli) -> Result<()> {
             tag,
             message,
             bookmark,
+            parents,
             json,
         } => {
             let resolved = Pillbox::resolve(pillbox_arg)?;
-            commands::workspace::push(&resolved, tag, message, bookmark, json)
+            commands::workspace::push(&resolved, tag, message, bookmark, parents, json)
         }
         Command::Pull { snapshot, bookmark } => {
             let resolved = Pillbox::resolve(pillbox_arg)?;
             commands::workspace::pull(&resolved, snapshot, bookmark)
+        }
+        Command::Collect {
+            sessions,
+            to,
+            as_refs,
+            json,
+        } => {
+            let resolved = Pillbox::resolve(pillbox_arg)?;
+            commands::collect::collect(&resolved, sessions, to, as_refs, json)
         }
         Command::Snapshot { action } => {
             let resolved = Pillbox::resolve(pillbox_arg)?;

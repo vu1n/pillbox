@@ -646,7 +646,6 @@ fn local_user() -> String {
 }
 
 fn session_pull(resolved: &Pillbox, id: &str, to: Option<&std::path::Path>) -> Result<()> {
-    use crate::workspace::{SnapshotHandle, WorkspaceBackend};
     let session = session::resolve(resolved, id)?;
     let target = match to {
         Some(p) => p.to_path_buf(),
@@ -654,54 +653,79 @@ fn session_pull(resolved: &Pillbox, id: &str, to: Option<&std::path::Path>) -> R
             .map_err(|e| PillboxError::runtime("session pull", format!("resolve cwd: {e}")))?
             .join(format!("session-{}", session.id)),
     };
-
-    // Two recovery sources, in priority order:
-    //   1. `result_snapshot` — the agent pushed its result tree into the rustic
-    //      repo (set by `session done --result-snapshot`). Snapshot-backed,
-    //      survives `session rm`. The canonical path.
-    //   2. The live backend workspace clone — a libkrun server/detached session
-    //      runs headless against a CoW clone that nothing ever snapshots (no
-    //      in-sandbox wrapper calls `session done` for it), so its edits would be
-    //      stranded on disk until teardown scrubs the clone. While the session is
-    //      alive (it lives until `session rm`) copy them out directly, so the
-    //      documented `session pull` verb recovers them. No rustic push — this
-    //      works for the global pillbox too (which owns no repo).
-    if let Some(handle_str) = session.result_snapshot.as_ref() {
-        let backend = resolved.workspace()?;
-        std::fs::create_dir_all(&target).map_err(|e| {
-            PillboxError::runtime("session pull", format!("create {target:?}: {e}"))
-        })?;
-        let handle = SnapshotHandle::new(handle_str.clone());
-        backend.pull(&target, Some(&handle))?;
-        println!(
+    match rehydrate_result(resolved, &session, &target, "session pull")? {
+        RehydrateSource::Snapshot(handle) => println!(
             "pillbox: ✓ restored session `{}` (snapshot `{}`) into {}",
             session.id,
             handle.short(),
             target.display()
-        );
-        return Ok(());
-    }
-
-    if let Some(clone) = live_workspace_clone(&session) {
-        std::fs::create_dir_all(&target).map_err(|e| {
-            PillboxError::runtime("session pull", format!("create {target:?}: {e}"))
-        })?;
-        copy_dir_into(&clone, &target).map_err(|e| {
-            PillboxError::runtime(
-                "session pull",
-                format!("copy live workspace {}: {e}", clone.display()),
-            )
-        })?;
-        println!(
+        ),
+        RehydrateSource::LiveClone => println!(
             "pillbox: ✓ restored session `{}` (live workspace) into {}",
             session.id,
             target.display()
-        );
-        return Ok(());
+        ),
+    }
+    Ok(())
+}
+
+/// Which source [`rehydrate_result`] recovered a session's result tree from.
+pub(crate) enum RehydrateSource {
+    /// The agent's `result_snapshot` from the rustic repo (canonical; survives
+    /// `session rm`). Carries the handle that was restored.
+    Snapshot(crate::workspace::SnapshotHandle),
+    /// The live backend workspace clone (a libkrun headless session that nothing
+    /// snapshots). Only available while the session is alive.
+    LiveClone,
+}
+
+/// Rehydrate a finished session's result tree into `target` (created if
+/// missing), then report which source it came from. No stdout — callers format
+/// their own banner. The shared core behind `session pull` (one session) and
+/// `collect` (a batch). `action` is the user-facing command label stamped into
+/// any error (so a `collect` failure reports "collect failed", not "session
+/// pull failed").
+///
+/// Two recovery sources, in priority order:
+///   1. `result_snapshot` — the agent pushed its result tree into the rustic
+///      repo (set by `session done --result-snapshot`). Snapshot-backed,
+///      survives `session rm`. The canonical path.
+///   2. The live backend workspace clone — a libkrun server/detached session
+///      runs headless against a CoW clone that nothing ever snapshots (no
+///      in-sandbox wrapper calls `session done` for it), so its edits would be
+///      stranded on disk until teardown scrubs the clone. While the session is
+///      alive (it lives until `session rm`) copy them out directly. No rustic
+///      push — this works for the global pillbox too (which owns no repo).
+pub(crate) fn rehydrate_result(
+    resolved: &Pillbox,
+    session: &session::Session,
+    target: &std::path::Path,
+    action: &'static str,
+) -> Result<RehydrateSource> {
+    use crate::workspace::{SnapshotHandle, WorkspaceBackend};
+    if let Some(handle_str) = session.result_snapshot.as_ref() {
+        let backend = resolved.workspace()?;
+        std::fs::create_dir_all(target)
+            .map_err(|e| PillboxError::runtime(action, format!("create {target:?}: {e}")))?;
+        let handle = SnapshotHandle::new(handle_str.clone());
+        backend.pull(target, Some(&handle))?;
+        return Ok(RehydrateSource::Snapshot(handle));
+    }
+
+    if let Some(clone) = live_workspace_clone(session) {
+        std::fs::create_dir_all(target)
+            .map_err(|e| PillboxError::runtime(action, format!("create {target:?}: {e}")))?;
+        copy_dir_into(&clone, target).map_err(|e| {
+            PillboxError::runtime(
+                action,
+                format!("copy live workspace {}: {e}", clone.display()),
+            )
+        })?;
+        return Ok(RehydrateSource::LiveClone);
     }
 
     Err(PillboxError::runtime(
-        "session pull",
+        action,
         format!(
             "session `{}` has no result to pull — no result_snapshot and no \
              live workspace clone (the agent hasn't finished, or the session \
@@ -717,7 +741,7 @@ fn session_pull(resolved: &Pillbox, id: &str, to: Option<&std::path::Path>) -> R
 /// keeps one (libkrun: the CoW clone the guest mounts and the agent edits). Only
 /// returned when the directory still exists — a torn-down session's clone is
 /// gone. `None` for backends without a host-visible result tree.
-fn live_workspace_clone(session: &session::Session) -> Option<std::path::PathBuf> {
+pub(crate) fn live_workspace_clone(session: &session::Session) -> Option<std::path::PathBuf> {
     let path = sandbox::live_session(session)
         .ok()
         .and_then(|ls| ls.workspace_path().ok())?;

@@ -401,8 +401,20 @@ async fn coordinate_refresh_request(
     // begin (blocking flock) + the reqwest::blocking forward + commit all run
     // off-reactor in one hop (reqwest::blocking panics inside a runtime, and the
     // guard holds the lock across the whole forward).
-    let outcome = tokio::task::spawn_blocking(move || {
-        coordinate_refresh(store, decider, url, headers, value, real)
+    let outcome = tokio::task::spawn_blocking({
+        let (stub_access, stub_refresh) = (stub_access.clone(), stub_refresh.clone());
+        move || {
+            coordinate_refresh(
+                store,
+                decider,
+                url,
+                headers,
+                value,
+                real,
+                stub_access,
+                stub_refresh,
+            )
+        }
     })
     .await;
 
@@ -500,6 +512,7 @@ enum Coordinated {
 /// The blocking half: `begin` → forward the guest's request with the real refresh
 /// token → `commit`/`abort`. Runs inside `spawn_blocking` (flock + reqwest::blocking
 /// both block, and the guard holds the lock across the whole forward).
+#[allow(clippy::too_many_arguments)]
 fn coordinate_refresh(
     store: TokenStore,
     decider: ClaudeRefreshDecider,
@@ -507,6 +520,8 @@ fn coordinate_refresh(
     headers: reqwest::header::HeaderMap,
     mut body: serde_json::Value,
     real_snapshot: serde_json::Value,
+    stub_access: String,
+    stub_refresh: String,
 ) -> Coordinated {
     let guard = match store.begin(&decider) {
         Ok(Begin::Rotate(g)) => g,
@@ -531,7 +546,12 @@ fn coordinate_refresh(
         }
     };
 
-    let client = match reqwest::blocking::Client::builder().build() {
+    // `.no_proxy()` is load-bearing: the vault's own forward must reach the REAL
+    // upstream directly. reqwest otherwise auto-reads HTTPS_PROXY from the host env,
+    // which — if set (the user's shell, or inherited) — routes this POST back through
+    // the vault proxy. The loop hands back a re-stubbed response, and committing that
+    // stub clobbers the real creds file with a stub. Forward direct, always.
+    let client = match reqwest::blocking::Client::builder().no_proxy().build() {
         Ok(c) => c,
         Err(e) => {
             guard.abort();
@@ -573,6 +593,21 @@ fn coordinate_refresh(
             };
         }
     };
+
+    // Loop guard (defense in depth, independent of `.no_proxy()`): if the "upstream"
+    // handed back one of THIS session's own stubs, the forward looped through the
+    // vault instead of reaching Anthropic. Committing that stub would clobber the
+    // real creds file. Fail closed rather than persist a stub.
+    if is_stub_loopback(&upstream, &stub_access, &stub_refresh) {
+        guard.abort();
+        eprintln!(
+            "pillbox: vault: refresh forward to {url} looped back (got our own stub); \
+             refusing to commit — an HTTPS_PROXY in the environment is routing the \
+             vault's own upstream call back through itself"
+        );
+        return Coordinated::Error("refresh forward looped back through the vault".into());
+    }
+
     let Some(new_real) = build_new_real(&real_snapshot, &upstream) else {
         // 2xx without a usable access token — don't clear pending, relay as-is.
         guard.abort();
@@ -591,6 +626,16 @@ fn coordinate_refresh(
         upstream_body: resp_body,
         new_real,
     }
+}
+
+/// True if the "upstream" token response handed back one of our own stubs — the
+/// signature of a forward that looped through the vault instead of reaching the real
+/// endpoint. Committing such a response would clobber the real creds file with a
+/// stub, so the coordinator fails closed when this holds.
+fn is_stub_loopback(upstream: &serde_json::Value, stub_access: &str, stub_refresh: &str) -> bool {
+    let acc = upstream.get("access_token").and_then(|v| v.as_str());
+    let refr = upstream.get("refresh_token").and_then(|v| v.as_str());
+    acc == Some(stub_access) || refr == Some(stub_refresh)
 }
 
 /// Splice the upstream token response into the real creds (claude shape). `None`
@@ -1626,6 +1671,8 @@ mod tests {
             reqwest::header::HeaderMap::new(),
             serde_json::json!({ "grant_type": "refresh_token", "refresh_token": "stub" }),
             sample_anthropic_real(),
+            "sk-ant-oat01-stubA".into(),
+            "sk-ant-ort01-stubR".into(),
         );
         match out {
             Coordinated::Coalesced { disk } => {
@@ -1652,7 +1699,36 @@ mod tests {
             reqwest::header::HeaderMap::new(),
             serde_json::json!({ "refresh_token": "stub" }),
             sample_anthropic_real(),
+            "sk-ant-oat01-stubA".into(),
+            "sk-ant-ort01-stubR".into(),
         );
         assert!(matches!(out, Coordinated::Reauth));
+    }
+
+    #[test]
+    fn is_stub_loopback_detects_our_own_stubs() {
+        // Regression for the live-smoke clobber: a proxy loop hands back THIS
+        // session's own stubs as if they were freshly minted real tokens. The guard
+        // must catch that so the coordinator fails closed instead of committing a
+        // stub over the real creds file.
+        let (stub_a, stub_r) = ("sk-ant-oat01-mineA", "sk-ant-ort01-mineR");
+        // A looped response (vault re-stubbed with our stubs) → detected.
+        assert!(is_stub_loopback(
+            &serde_json::json!({ "access_token": stub_a, "refresh_token": stub_r }),
+            stub_a,
+            stub_r
+        ));
+        // Either field matching is enough (Anthropic doesn't always rotate the RT).
+        assert!(is_stub_loopback(
+            &serde_json::json!({ "access_token": stub_a, "refresh_token": "REAL_R" }),
+            stub_a,
+            stub_r
+        ));
+        // A genuine real upstream response (different tokens) → not a loop.
+        assert!(!is_stub_loopback(
+            &serde_json::json!({ "access_token": "REAL_A", "refresh_token": "REAL_R" }),
+            stub_a,
+            stub_r
+        ));
     }
 }

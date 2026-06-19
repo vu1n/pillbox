@@ -73,11 +73,13 @@ pub(crate) struct Registry {
     by_sandbox: HashMap<String, SandboxData>,
     /// stub token (any provider) → sandbox_id
     by_stub: HashMap<String, String>,
-    /// sandbox_id → host-absolute creds file the sandbox shadows. Set by
-    /// `Server::lease` (a session concern), not `provision` (the stub-minting
-    /// concern), so it lives beside [`SandboxData`] rather than inside it. The
-    /// in-proxy refresh coordinator builds a `TokenStore` on this path to
-    /// serialize rotation across concurrent sessions sharing the account.
+    /// sandbox_id → host-absolute creds file the sandbox shadows. Set via
+    /// `Server::set_oauth_creds_path` (called from `session.rs::provision_oauth_mount`
+    /// right AFTER `lease` — `lease`/`provision` never touch it), a session concern
+    /// kept beside [`SandboxData`] rather than inside it. The in-proxy refresh
+    /// coordinator builds a `TokenStore` on this path to serialize rotation across
+    /// concurrent sessions; a lease site that skips `set_oauth_creds_path` makes the
+    /// refresh fail closed (no silent uncoordinated forward).
     creds_paths: HashMap<String, PathBuf>,
 }
 

@@ -567,7 +567,17 @@ fn coordinate_refresh(
     // which — if set (the user's shell, or inherited) — routes this POST back through
     // the vault proxy. The loop hands back a re-stubbed response, and committing that
     // stub clobbers the real creds file with a stub. Forward direct, always.
-    let client = match reqwest::blocking::Client::builder().no_proxy().build() {
+    // Timeouts are load-bearing: the guard holds the cross-process rotation flock
+    // for the whole forward, so a wedged upstream (TCP-accepts then stalls) would
+    // pin the lock indefinitely and turn one hung connection into an account-wide
+    // refresh outage. Bounded → reqwest errors → `abort()` → fail closed (pending
+    // stays set → re-auth), which is recoverable; a wedge is not.
+    let client = match reqwest::blocking::Client::builder()
+        .no_proxy()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+    {
         Ok(c) => c,
         Err(e) => {
             guard.abort();
@@ -606,11 +616,11 @@ fn coordinate_refresh(
     let upstream: serde_json::Value = match serde_json::from_slice(&resp_body) {
         Ok(v) => v,
         Err(_) => {
+            // A 2xx whose body isn't JSON is not a usable rotation. Surface a 502
+            // (server_error), NOT the upstream 2xx status — a 200 carrying an error
+            // body would read as success to the guest.
             guard.abort();
-            return Coordinated::UpstreamError {
-                status,
-                body: resp_body,
-            };
+            return Coordinated::Error("upstream returned an unparseable 2xx body".into());
         }
     };
 
@@ -629,12 +639,10 @@ fn coordinate_refresh(
     }
 
     let Some(new_real) = build_new_real(&real_snapshot, &upstream) else {
-        // 2xx without a usable access token — don't clear pending, relay as-is.
+        // 2xx without a usable access token — fail closed with a 502, not the 2xx
+        // status (a 200 + error body would read as success to the guest).
         guard.abort();
-        return Coordinated::UpstreamError {
-            status,
-            body: resp_body,
-        };
+        return Coordinated::Error("upstream 2xx carried no usable access token".into());
     };
 
     if let Err(e) = guard.commit(&decider, new_real.clone()) {
@@ -697,12 +705,19 @@ fn build_new_real(
             serde_json::Value::String(new_refresh.to_string()),
         );
     }
-    if let Some(expires_in) = upstream.get("expires_in").and_then(|v| v.as_u64()) {
-        oauth.insert(
-            "expiresAt".to_string(),
-            serde_json::Value::from(now_ms().saturating_add(expires_in.saturating_mul(1000))),
-        );
-    }
+    // Always freshen expiresAt — default to 3600s when the response omits
+    // `expires_in` (Anthropic isn't always consistent about the field). Leaving the
+    // snapshot's old (now-past) expiresAt beside a freshly-rotated token would make
+    // the guest re-refresh on its very next check — a churn loop that burns a
+    // rotation per cycle. The deleted host-side pre-refresh had this same fallback.
+    let expires_in = upstream
+        .get("expires_in")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(3600);
+    oauth.insert(
+        "expiresAt".to_string(),
+        serde_json::Value::from(now_ms().saturating_add(expires_in.saturating_mul(1000))),
+    );
     Some(new_real)
 }
 
@@ -756,11 +771,16 @@ fn synth_oauth_response(
     stub_access: &str,
     stub_refresh: &str,
 ) -> Response<Body> {
+    // Floor to 60s: if the on-disk expiry is at/just-past now (clock skew, or a
+    // token already near expiry when the peer committed), the raw subtraction yields
+    // 0, which tells the guest "expired now" and triggers an immediate re-refresh
+    // storm. The peer's committed token is usable, so hand back at least one turn.
     let expires_in = disk
         .pointer("/claudeAiOauth/expiresAt")
         .and_then(|v| v.as_u64())
         .map(|exp_ms| exp_ms.saturating_sub(now_ms()) / 1000)
-        .unwrap_or(3600);
+        .unwrap_or(3600)
+        .max(60);
     let body = serde_json::json!({
         "access_token": stub_access,
         "refresh_token": stub_refresh,
@@ -784,16 +804,38 @@ fn claude_refresh(creds: &serde_json::Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Copy the guest's headers for the upstream relay, dropping the ones reqwest must
-/// recompute (`host`, `content-length`) and forcing identity encoding (reqwest's
-/// blocking client has no gzip feature here, so it would not decompress a gzipped
-/// token response). Reconstructed via bytes so it doesn't assume hudsucker's and
-/// reqwest's header types are the same.
+/// Headers NOT copied onto the vault's own upstream refresh POST:
+/// - `host`/`content-length`: reqwest recomputes them.
+/// - `accept-encoding`: forced to `identity` below (the blocking client has no gzip
+///   feature here, so it wouldn't decompress a gzipped token response).
+/// - `authorization`: the OAuth refresh grant authenticates via the refresh token in
+///   the BODY, not a bearer — and the guest's bearer is a pillbox STUB, which must
+///   never cross the wire to Anthropic.
+/// - hop-by-hop framing headers (`connection`, `transfer-encoding`, `te`, `upgrade`,
+///   `proxy-*`, `expect`): reqwest sets its own framing from the body; forwarding the
+///   guest's would conflict.
+const DROP_FORWARD_HEADERS: &[&str] = &[
+    "host",
+    "content-length",
+    "accept-encoding",
+    "authorization",
+    "connection",
+    "transfer-encoding",
+    "te",
+    "upgrade",
+    "proxy-connection",
+    "proxy-authorization",
+    "expect",
+];
+
+/// Copy the guest's headers for the upstream relay, minus [`DROP_FORWARD_HEADERS`],
+/// then force identity encoding. Reconstructed via bytes so it doesn't assume
+/// hudsucker's and reqwest's header types are the same.
 fn forwardable_headers(src: &HeaderMap) -> reqwest::header::HeaderMap {
     let mut out = reqwest::header::HeaderMap::new();
     for (name, value) in src.iter() {
         let n = name.as_str().to_ascii_lowercase();
-        if n == "host" || n == "content-length" || n == "accept-encoding" {
+        if DROP_FORWARD_HEADERS.contains(&n.as_str()) {
             continue;
         }
         if let (Ok(hn), Ok(hv)) = (
@@ -1628,6 +1670,25 @@ mod tests {
         .is_none());
     }
 
+    #[test]
+    fn build_new_real_defaults_expiry_when_expires_in_absent() {
+        // Anthropic sometimes omits expires_in; the committed creds must still carry
+        // a FUTURE expiresAt (default 3600s), not the snapshot's now-past one — else
+        // the guest re-refreshes on its next check.
+        let real = sample_anthropic_real(); // expiresAt = 1700000000 (long past)
+        let nr = build_new_real(
+            &real,
+            &serde_json::json!({ "access_token": "NEW_A", "refresh_token": "NEW_R" }),
+        )
+        .expect("rotation");
+        let exp = nr
+            .pointer("/claudeAiOauth/expiresAt")
+            .and_then(|v| v.as_u64())
+            .unwrap();
+        assert!(exp > now_ms(), "expiresAt must be in the future, got {exp}");
+        assert!(exp <= now_ms() + 3600 * 1000 + 5000, "~3600s, got {exp}");
+    }
+
     #[tokio::test]
     async fn scrub_oauth_error_drops_token_fields_keeps_error() {
         // An upstream error body that echoes token material must NOT reach the
@@ -1684,6 +1745,17 @@ mod tests {
         assert_eq!(v["refresh_token"], "stubR");
         let expires_in = v["expires_in"].as_u64().unwrap();
         assert!(expires_in > 0 && expires_in <= 3600, "got {expires_in}");
+    }
+
+    #[tokio::test]
+    async fn synth_oauth_response_floors_a_stale_expiry() {
+        // A peer's disk expiry already in the past must not synthesize expires_in: 0
+        // (which would spin the guest into a re-refresh storm) — floor to 60s.
+        let disk = serde_json::json!({
+            "claudeAiOauth": { "accessToken": "AT", "refreshToken": "RT", "expiresAt": 1 },
+        });
+        let v = body_json(synth_oauth_response(&disk, "stubA", "stubR").into_body()).await;
+        assert_eq!(v["expires_in"].as_u64().unwrap(), 60, "floored, not 0");
     }
 
     fn store_on(creds: serde_json::Value) -> (tempfile::TempDir, TokenStore) {
@@ -1906,5 +1978,35 @@ mod tests {
                 .unwrap();
         assert_eq!(disk.pointer("/claudeAiOauth/accessToken").unwrap(), "AT0");
         assert_eq!(disk.pointer("/claudeAiOauth/refreshToken").unwrap(), "RT0");
+    }
+
+    #[test]
+    fn coordinate_refresh_2xx_without_token_fails_closed_not_committed() {
+        // A 2xx whose body carries no usable access token must FAIL CLOSED
+        // (Coordinated::Error → 502 to the guest), NOT commit and NOT surface a
+        // 200-with-error-body. Creds untouched.
+        let url = spawn_oauth_server(200, serde_json::json!({ "token_type": "Bearer" }));
+        let (dir, store) = store_on(expired_real_disk());
+        let decider = ClaudeRefreshDecider {
+            mapped_access: Some("AT0".into()),
+        };
+        let out = coordinate_refresh(
+            store,
+            decider,
+            url,
+            reqwest::header::HeaderMap::new(),
+            serde_json::json!({ "grant_type": "refresh_token", "refresh_token": "sk-ant-ort01-stub" }),
+            sample_anthropic_real(),
+            "sk-ant-oat01-myStub".into(),
+            "sk-ant-ort01-myStub".into(),
+        );
+        assert!(
+            matches!(out, Coordinated::Error(ref e) if e.contains("no usable access token")),
+            "expected fail-closed Error, not a committed/200-error"
+        );
+        let disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(".credentials.json")).unwrap())
+                .unwrap();
+        assert_eq!(disk.pointer("/claudeAiOauth/accessToken").unwrap(), "AT0");
     }
 }

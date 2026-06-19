@@ -267,6 +267,36 @@ impl TokenStore {
         let body = serde_json::to_vec(creds).context("serialize creds")?;
         write_atomic(&self.creds_path, &body, true)
     }
+
+    /// Persist `creds` to the creds file **under the lock**, atomically, but ONLY
+    /// if `allow_overwrite(disk)` returns true for the current on-disk creds — the
+    /// teardown's guarded compare-and-swap, so an older session can't clobber a
+    /// token a peer rotated under it. Returns whether it wrote.
+    ///
+    /// Outcomes: `LockBusy` → `Ok(false)` (a refresh is mid-flight; its writer is
+    /// the authority — the teardown defers rather than block). A present, parseable
+    /// disk → `allow_overwrite(&disk)` decides. An **absent or unreadable** disk →
+    /// `Ok(false)` (skip): we can't confirm the compare-and-swap, so we don't write
+    /// — that avoids resurrecting a creds file a concurrent `auth rm` removed, and
+    /// avoids a blind overwrite on a transient read error. This is the teardown
+    /// sibling of [`ensure_fresh`]; the refresh path itself is separate.
+    pub(crate) fn persist_if(
+        &self,
+        creds: &Value,
+        allow_overwrite: &dyn Fn(&Value) -> bool,
+    ) -> Result<bool> {
+        let Some(_guard) = self.lock_with_deadline()? else {
+            return Ok(false);
+        };
+        let Ok(disk) = self.read_creds() else {
+            return Ok(false);
+        };
+        if allow_overwrite(&disk) {
+            self.write_creds_atomic(creds)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
 }
 
 /// RAII flock holder — releases on drop (fd close).
@@ -277,6 +307,11 @@ struct LockGuard {
 /// Write `bytes` to `path` atomically: a 0600 temp file in the same directory,
 /// optionally fsync'd, then `rename`d over the target (atomic on a POSIX fs). A
 /// crash leaves either the old or the new file whole, never a torn one.
+///
+/// When `sync`, the parent directory is fsync'd *after* the rename — the rename is
+/// a directory-metadata change, so without this a crash can lose it even though the
+/// temp file's data was synced. Load-bearing for any durable credential write
+/// (the next run must see the rotated token, not the consumed one).
 fn write_atomic(path: &Path, bytes: &[u8], sync: bool) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = tempfile::Builder::new()
@@ -296,6 +331,13 @@ fn write_atomic(path: &Path, bytes: &[u8], sync: bool) -> Result<()> {
     tmp.persist(path)
         .map_err(|e| e.error)
         .with_context(|| format!("rename into {}", path.display()))?;
+    if sync {
+        let dir_file =
+            fs::File::open(dir).with_context(|| format!("open dir for fsync {}", dir.display()))?;
+        dir_file
+            .sync_all()
+            .with_context(|| format!("fsync dir {}", dir.display()))?;
+    }
     Ok(())
 }
 
@@ -554,5 +596,81 @@ mod tests {
         assert_eq!(fp.len(), 16); // 8 bytes hex
         assert_eq!(fingerprint("a"), fingerprint("a")); // stable
         assert_ne!(fingerprint("a"), fingerprint("b"));
+    }
+
+    // ── persist_if (the teardown's guarded compare-and-swap) ────────────────
+
+    fn disk_access_is(expected: &str) -> impl Fn(&Value) -> bool + '_ {
+        move |disk| disk.get("access").and_then(|v| v.as_str()) == Some(expected)
+    }
+
+    #[test]
+    fn persist_if_writes_when_predicate_allows() {
+        let (_d, store) = store_with(serde_json::json!({ "access": "AT0" }));
+        // CAS: disk access is still "AT0" (what we leased) → overwrite with ours.
+        let wrote = store
+            .persist_if(
+                &serde_json::json!({ "access": "AT1" }),
+                &disk_access_is("AT0"),
+            )
+            .unwrap();
+        assert!(wrote);
+        assert_eq!(store.read_creds().unwrap()["access"], "AT1");
+    }
+
+    #[test]
+    fn persist_if_skips_when_predicate_denies_no_clobber() {
+        // A peer rotated disk to AT_PEER; our CAS expected the leased "AT0" → deny.
+        let (_d, store) = store_with(serde_json::json!({ "access": "AT_PEER" }));
+        let wrote = store
+            .persist_if(
+                &serde_json::json!({ "access": "AT_MINE" }),
+                &disk_access_is("AT0"),
+            )
+            .unwrap();
+        assert!(!wrote);
+        // Disk is untouched — the peer's token is not clobbered.
+        assert_eq!(store.read_creds().unwrap()["access"], "AT_PEER");
+    }
+
+    #[test]
+    fn persist_if_skips_when_disk_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let creds_path = dir.path().join(".credentials.json");
+        let store = TokenStore::new(creds_path.clone(), Duration::from_secs(5));
+        // No disk file → can't confirm the CAS → skip (don't recreate a file a
+        // concurrent `auth rm` may have removed; predicate never consulted).
+        let wrote = store
+            .persist_if(&serde_json::json!({ "access": "AT1" }), &|_| true)
+            .unwrap();
+        assert!(!wrote);
+        assert!(
+            !creds_path.exists(),
+            "must not recreate an absent creds file"
+        );
+    }
+
+    #[test]
+    fn persist_if_skips_on_lock_busy() {
+        let (_d, store) = store_with_wait(
+            serde_json::json!({ "access": "AT0" }),
+            Duration::from_millis(100),
+        );
+        let held = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&store.lock_path)
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        // Lock held by a peer (a refresh in flight) → defer, don't write.
+        let wrote = store
+            .persist_if(&serde_json::json!({ "access": "AT1" }), &|_| true)
+            .unwrap();
+        assert!(!wrote);
+        assert_eq!(store.read_creds().unwrap()["access"], "AT0");
     }
 }

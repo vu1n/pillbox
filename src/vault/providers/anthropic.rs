@@ -4,6 +4,14 @@
 //! `api.anthropic.com` (bearer-token swap on every request) and
 //! `console.anthropic.com/oauth/token` (refresh-token swap on the way
 //! out, real → stub swap + registry rotation on the way back).
+//!
+//! The `refresh_token` grant additionally routes through the slice-2b in-proxy
+//! **refresh coordinator** ([`coordinate_refresh_request`]): under a cross-process
+//! flock the vault makes its OWN direct upstream POST and persists the rotation to
+//! the shared host creds file, so concurrent sessions sharing one account can't
+//! both forward the same refresh token (reuse → family revoke). The legacy
+//! forward+`handle_response` path remains the fallback (and the `authorization_code`
+//! / login path). See `docs/vault-oauth-refresh-coordination.md`.
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -313,6 +321,33 @@ async fn handle_oauth_request(
     }
 }
 
+/// Bare-lease/test fallback when no coordinated creds path is recorded: swap the
+/// stub refresh token for the real one from the registry, set `pending` so
+/// `handle_response` re-stubs the rotated tokens, and forward. This is the
+/// pre-coordinator behavior, unchanged. A production OAuth `--vault` run always
+/// records a creds path (`set_oauth_creds_path`) and takes the coordinated path.
+fn legacy_forward_refresh(
+    mut parts: hudsucker::hyper::http::request::Parts,
+    mut value: serde_json::Value,
+    real: &serde_json::Value,
+    sandbox_id: String,
+    pending: &mut Option<PendingFlow>,
+) -> RequestOrResponse {
+    if let (Some(obj), Some(real_rt)) = (value.as_object_mut(), claude_refresh(real)) {
+        obj.insert(
+            "refresh_token".to_string(),
+            serde_json::Value::String(real_rt),
+        );
+    }
+    *pending = Some(PendingFlow {
+        provider_id: PROVIDER_ID,
+        sandbox_id,
+    });
+    let new_body = serde_json::to_vec(&value).unwrap_or_default();
+    force_identity_encoding(&mut parts.headers, new_body.len());
+    Request::from_parts(parts, Body::from(new_body)).into()
+}
+
 /// The `grant_type=authorization_code` path: identify the sandbox, set `pending`
 /// so `handle_response` rewrites the freshly-minted real tokens to stubs, and
 /// forward the request body verbatim (the code isn't ours to rewrite).
@@ -348,8 +383,8 @@ fn forward_authorization_code(
 async fn coordinate_refresh_request(
     host: String,
     path_and_query: String,
-    mut parts: hudsucker::hyper::http::request::Parts,
-    mut value: serde_json::Value,
+    parts: hudsucker::hyper::http::request::Parts,
+    value: serde_json::Value,
     stub: String,
     server: &ServerInner,
     pending: &mut Option<PendingFlow>,
@@ -374,21 +409,7 @@ async fn coordinate_refresh_request(
     // `set_oauth_creds_path`; this is the bare-lease/test case) → legacy
     // forward+handle_response keeps behavior unchanged.
     let Some(creds_path) = creds_path else {
-        if let Some(obj) = value.as_object_mut() {
-            if let Some(real_rt) = claude_refresh(&real) {
-                obj.insert(
-                    "refresh_token".to_string(),
-                    serde_json::Value::String(real_rt),
-                );
-            }
-        }
-        *pending = Some(PendingFlow {
-            provider_id: PROVIDER_ID,
-            sandbox_id,
-        });
-        let new_body = serde_json::to_vec(&value).unwrap_or_default();
-        force_identity_encoding(&mut parts.headers, new_body.len());
-        return Request::from_parts(parts, Body::from(new_body)).into();
+        return legacy_forward_refresh(parts, value, &real, sandbox_id, pending);
     };
 
     let decider = ClaudeRefreshDecider {

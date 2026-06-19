@@ -18,11 +18,6 @@
 //!
 //! ## What it deliberately is NOT (yet) — all additive, see the spec
 //!
-//!   - **`Payload::Unknown`** forward-compat: [`read_from`](SessionLog::read_from)
-//!     parses each line as a known [`Payload`]; an unknown future payload errors
-//!     rather than degrading. Lands with the first real producer + foreign-trace
-//!     ingest. (The seq scan on open is already forward-compatible — it parses
-//!     only `{seq}` — so a newer payload never breaks *append*.)
 //!   - **live subscribe-follow**: a thin loop over `read_from` + an FS notify,
 //!     mirroring [`crate::events::transcripts::Tailer`]. Next slice.
 //!   - **producers**: wiring the harness parser (`agents/harness`, which already
@@ -126,6 +121,19 @@ impl SessionLog {
         let _lock = LogLock::acquire(&path)?;
         let mut seq = recover_last_seq(&path)?;
         let mut buf = String::new();
+        // Heal a torn trailing line: if a prior append crashed mid-write (a partial
+        // record with no terminating newline), start the new event on its own line
+        // so it can't concatenate onto — and be lost with — the torn fragment (which
+        // is itself skipped on read by `fold_parsed_lines`). Surfaced once here (the
+        // actionable moment) rather than on every silent read.
+        if ends_with_torn_line(&path) {
+            eprintln!(
+                "pillbox: note: healing a torn trailing line in {} (a prior append \
+                 likely crashed mid-write)",
+                path.display()
+            );
+            buf.push('\n');
+        }
         for ev in events {
             seq += 1;
             let line = Event { seq, ..ev.clone() };
@@ -223,21 +231,32 @@ pub(crate) fn read_log(pb: &Pillbox, session_id: &str) -> Result<Vec<Event>> {
 /// Parse the tail (`seq >= from`) of a log file. Shared by [`SessionLog::
 /// read_from`] (writer-side, dir already open) and [`read_log`] (read-only).
 fn read_events_at(path: &Path, from: u64) -> Result<Vec<Event>> {
-    fold_lines(path, Vec::new(), |mut out, line| {
-        let ev: Event = serde_json::from_str(line)
-            .with_context(|| format!("parse log line in {}", path.display()))?;
+    fold_parsed_lines(path, Vec::new(), |mut out, ev: Event| {
         if ev.seq >= from {
             out.push(ev);
         }
-        Ok(out)
+        out
     })
 }
 
-/// Fold over the non-empty JSONL lines of `path`, returning `init` unchanged
-/// when the file doesn't exist (an empty / never-written log). Shared by replay
-/// and seq recovery, which differ only in what they parse from each line — the
-/// file read, `NotFound` tolerance, and empty-line skip live here once.
-fn fold_lines<T>(path: &Path, init: T, mut f: impl FnMut(T, &str) -> Result<T>) -> Result<T> {
+/// Fold over the JSONL lines of `path`, deserializing each to `L` and folding the
+/// parsed value into the accumulator. Returns `init` unchanged when the file
+/// doesn't exist (an empty / never-written log). Shared by replay and seq recovery,
+/// which differ only in `L` and the fold.
+///
+/// A line that fails to deserialize is **skipped**, not fatal: a torn final line
+/// (a crash / power-loss / `ENOSPC` mid-append) or a single corrupt line must not
+/// brick the whole log — otherwise one bad line would fail every future `append`
+/// (via [`recover_last_seq`]) and every reader. Skipping is silent (reads fold over
+/// many sessions, so a per-line warning would spam status commands; the common
+/// torn-tail case is surfaced once on the append path via [`ends_with_torn_line`]),
+/// mirroring the line-tolerant lifecycle fold in [`crate::events::status`].
+/// (Unknown/foreign *payloads* aren't skipped — they decode to `Payload::Unknown`;
+/// only malformed JSON lands here.)
+fn fold_parsed_lines<L, T>(path: &Path, init: T, mut f: impl FnMut(T, L) -> T) -> Result<T>
+where
+    L: serde::de::DeserializeOwned,
+{
     let contents = match fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(init),
@@ -245,28 +264,48 @@ fn fold_lines<T>(path: &Path, init: T, mut f: impl FnMut(T, &str) -> Result<T>) 
     };
     let mut acc = init;
     for line in contents.lines() {
-        if !line.trim().is_empty() {
-            acc = f(acc, line)?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(parsed) = serde_json::from_str::<L>(line) {
+            acc = f(acc, parsed);
         }
     }
     Ok(acc)
 }
 
+/// True when `path` exists, is non-empty, and does NOT end in a newline — its
+/// final line is torn (a crash / power-loss / `ENOSPC` mid-append left a partial
+/// record). [`SessionLog::append`] uses this to start the next event on a fresh
+/// line. Reads only the last byte (no full scan).
+fn ends_with_torn_line(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = fs::File::open(path) else {
+        return false;
+    };
+    // Seek to the last byte; an empty file (or a seek failure) can't be torn.
+    if f.seek(SeekFrom::End(-1)).is_err() {
+        return false;
+    }
+    let mut last = [0u8; 1];
+    f.read_exact(&mut last).is_ok() && last[0] != b'\n'
+}
+
 /// Recover the sequencer position by scanning the log for its maximum `seq`.
-/// Parses only the `seq` field (not the payload) so it stays correct even once
-/// newer payload variants exist that this binary can't fully decode — append
-/// never hands out a duplicate seq. A line missing `seq` is corruption we
-/// surface rather than silently extend past.
+/// Parses only the `seq` field (not the full payload) so it stays correct even
+/// once newer/foreign envelope shapes exist that this binary can't fully decode —
+/// such a line is still counted, so `append` never reuses its seq. This is a
+/// superset of what [`read_events_at`] can replay: a counted-but-undecodable line
+/// is a benign seq gap, deliberately preferred over parsing the full `Event` here
+/// (which would *skip* such a line and then reuse its seq — a duplicate, worse than
+/// a gap). A torn/corrupt line is skipped (see [`fold_parsed_lines`]), so the next
+/// `append` recovers from the last good line rather than failing forever.
 fn recover_last_seq(log_path: &Path) -> Result<u64> {
     #[derive(Deserialize)]
     struct SeqOnly {
         seq: u64,
     }
-    fold_lines(log_path, 0, |max, line| {
-        let s: SeqOnly = serde_json::from_str(line)
-            .with_context(|| format!("read seq from {}", log_path.display()))?;
-        Ok(max.max(s.seq))
-    })
+    fold_parsed_lines(log_path, 0, |max, s: SeqOnly| max.max(s.seq))
 }
 
 /// An exclusive advisory lock on a session's log file, held across an append so
@@ -315,6 +354,39 @@ mod tests {
             output: String::new(),
             title: String::new(),
         })
+    }
+
+    #[test]
+    fn a_torn_line_does_not_brick_recovery_or_reads() {
+        with_isolated_home("log-torn-line", || {
+            let pb = crate::pillbox::global();
+            let mut log = SessionLog::open(&pb, "sess-torn").unwrap();
+            log.append(&[Event::session("sess-torn", tool_call("a"))])
+                .unwrap();
+            log.append(&[Event::session("sess-torn", tool_call("b"))])
+                .unwrap();
+
+            // Simulate a crash / power-loss mid-append: a truncated trailing line.
+            let path = crate::session::session_dir_path(&pb, "sess-torn").join(LOG_FILE);
+            {
+                use std::io::Write;
+                let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+                f.write_all(b"{\"seq\":3,\"actor\":{\"par").unwrap();
+            }
+
+            // recover_last_seq (run on every append) must SKIP the torn line, not
+            // error: a fresh open + append recovers from the last good seq (2) and
+            // assigns 3 — the bug was that it bricked append forever.
+            let mut log2 = SessionLog::open(&pb, "sess-torn").unwrap();
+            let seq = log2
+                .append(&[Event::session("sess-torn", tool_call("c"))])
+                .unwrap();
+            assert_eq!(seq, 3, "append after a torn line must not be bricked");
+
+            // Reads skip the torn line too: the three good events, in seq order.
+            let seqs: Vec<u64> = log2.read_from(0).unwrap().iter().map(|e| e.seq).collect();
+            assert_eq!(seqs, vec![1, 2, 3]);
+        });
     }
 
     #[test]

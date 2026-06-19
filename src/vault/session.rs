@@ -13,13 +13,20 @@ use std::{
     net::SocketAddr,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::Result;
 
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
+use crate::vault::token_store::TokenStore;
 use crate::vault::{providers, RunContext, SandboxLease, Server, ServerConfig, VaultMeta};
+
+/// How long the teardown write-back waits for the rotation lock before giving up.
+/// Best-effort + short: if a refresh holds the lock, its writer is the authority,
+/// so the teardown defers (`persist_if` → `Ok(false)`) rather than block teardown.
+const TEARDOWN_LOCK_WAIT: Duration = Duration::from_secs(5);
 
 /// One OAuth-credentials swap mounted into the guest. Owns the temp file
 /// holding the stub creds plus its mount-target path. `VaultSession`
@@ -40,6 +47,12 @@ struct OAuthMount {
     /// Registry key for this mount's real creds, so teardown can read
     /// the (possibly rotated) tokens back out of the server.
     sandbox_id: String,
+    /// The access token this session *leased* (as read from disk at start). The
+    /// teardown compare-and-swaps on it: persist the registry creds back only if
+    /// the on-disk access token is still this one, i.e. no other writer rotated disk
+    /// under us. `None` for an unrecognized creds shape → the teardown skips (don't
+    /// clobber what we can't reason about).
+    leased_access: Option<String>,
     _lease: SandboxLease,
 }
 
@@ -77,72 +90,57 @@ impl Drop for VaultSession {
     /// tokens). Best-effort: a failure only costs a stale token
     /// (recoverable via `pillbox auth login`), so warn, never panic.
     ///
-    /// Guarded against the concurrent-session clobber: two vault sessions
-    /// for the same agent share one global creds file, so a session that
-    /// started earlier (older token) must not overwrite a fresher token a
-    /// later/overlapping session already persisted. We only write back
-    /// when the registry's token is at least as fresh as what's on disk.
+    /// Guarded against the concurrent-session clobber via a compare-and-swap on
+    /// the **access token**: persist only if this session actually rotated, and
+    /// only if the on-disk access token is still the one we leased at start. If
+    /// disk advanced, another writer (a peer broker, or the in-proxy refresh
+    /// handler) wrote a fresher token — never clobber it. The access token is the
+    /// signal, not `expiresAt`/`last_refresh`, because the in-proxy handlers rotate
+    /// only the token fields, not the timestamps — so a timestamp compare can't see
+    /// an in-proxy rotation. The read-compare-write runs under the rotation flock
+    /// (atomic), closing the prior lock-free TOCTOU.
     fn drop(&mut self) {
         for mount in &self.oauth_mounts {
             let Some(real) = self.server.snapshot_real(&mount.sandbox_id) else {
                 continue;
             };
-            if !is_at_least_as_fresh(&real, &mount.host_creds_path) {
+            // Nothing rotated this session (registry == what we leased) → nothing to
+            // persist, so skip the lock + write entirely. Also skips unrecognized
+            // shapes (both `None`) — for which we have no CAS baseline anyway.
+            if access_token_of(&real) == mount.leased_access {
                 continue;
             }
-            match serde_json::to_string_pretty(&real) {
-                Ok(body) => {
-                    if let Err(e) = write_private(&mount.host_creds_path, &body) {
-                        eprintln!(
-                            "pillbox: warning: failed to persist refreshed credentials to {}: {e}",
-                            mount.host_creds_path.display()
-                        );
-                    }
-                }
-                Err(e) => {
-                    eprintln!("pillbox: warning: failed to serialize refreshed credentials: {e}")
-                }
+            // We rotated to a recognized token; CAS the write-back on the access we
+            // leased. (`Some` here for claude/codex — the only vaulted shapes; if we
+            // somehow lack a baseline, skip rather than risk a blind overwrite.)
+            let Some(leased) = mount.leased_access.clone() else {
+                continue;
+            };
+            let store = TokenStore::new(mount.host_creds_path.clone(), TEARDOWN_LOCK_WAIT);
+            let disk_unchanged = |disk: &serde_json::Value| {
+                access_token_of(disk).as_deref() == Some(leased.as_str())
+            };
+            if let Err(e) = store.persist_if(&real, &disk_unchanged) {
+                eprintln!(
+                    "pillbox: warning: failed to persist refreshed credentials to {}: {e}",
+                    mount.host_creds_path.display()
+                );
             }
         }
     }
 }
 
-/// Whether the in-registry `real` creds are at least as fresh as what's
-/// currently on disk at `creds_path`, by comparing
-/// `claudeAiOauth.expiresAt`. Returns `true` (persist) when either side
-/// lacks the field (non-Claude shapes, malformed/absent file) — there's
-/// no freshness signal to defer to, so preserve the unconditional
-/// write-back. Returns `false` only when both timestamps are present and
-/// disk is strictly newer, i.e. an overlapping session already wrote a
-/// fresher token that this older session would otherwise clobber.
-fn is_at_least_as_fresh(real: &serde_json::Value, creds_path: &Path) -> bool {
-    let real_exp = expires_at_ms(real);
-    let disk_exp = fs::read(creds_path)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .and_then(|v| expires_at_ms(&v));
-    match (real_exp, disk_exp) {
-        (Some(real_exp), Some(disk_exp)) => real_exp >= disk_exp,
-        _ => true,
-    }
-}
-
-/// Read `claudeAiOauth.expiresAt`, normalized to milliseconds. Creds
-/// files appear both seconds- and ms-encoded in the wild (Claude Code
-/// writes ms via `Date.now()`; hand-rolled files sometimes use seconds),
-/// so the two sides of a freshness comparison must be on the same scale
-/// or the `>=` inverts. Mirrors `refresh::is_expired`'s normalization.
-fn expires_at_ms(creds: &serde_json::Value) -> Option<u64> {
-    /// 1e11 ms ≈ year 5138 — anything smaller is certainly seconds.
-    const SECONDS_BOUNDARY_MS: u64 = 100_000_000_000;
-    let raw = creds
-        .pointer("/claudeAiOauth/expiresAt")
-        .and_then(serde_json::Value::as_u64)?;
-    Some(if raw < SECONDS_BOUNDARY_MS {
-        raw.saturating_mul(1000)
-    } else {
-        raw
-    })
+/// The OAuth access token from a creds blob, across the shapes pillbox vaults —
+/// claude (`claudeAiOauth.accessToken`) and codex (`tokens.access_token`). The
+/// access token is the field that rotates on *every* refresh, so it's the
+/// compare-and-swap signal the teardown uses. (`expiresAt`/`last_refresh` are NOT
+/// updated by the in-proxy rotation handlers, so they can't detect one.)
+fn access_token_of(creds: &serde_json::Value) -> Option<String> {
+    creds
+        .pointer("/claudeAiOauth/accessToken")
+        .or_else(|| creds.pointer("/tokens/access_token"))
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
 }
 
 impl VaultSession {
@@ -330,6 +328,11 @@ fn provision_oauth_mount(server: &Server, agent: OAuthAgent<'_>) -> Result<OAuth
         )
     })?;
 
+    // The on-disk access token — the teardown's CAS baseline. Captured here, from
+    // what we read off disk, BEFORE any pre-refresh can mutate `real`, so it
+    // matches what's actually on disk (the thing the teardown compares against).
+    let leased_access = access_token_of(&real);
+
     // Proactively refresh if the stored access token is past expiry —
     // see `super::refresh` for the rationale + wire details. Non-fatal
     // on failure: caller's warning + agent's own retry-on-401 handle
@@ -362,6 +365,7 @@ fn provision_oauth_mount(server: &Server, agent: OAuthAgent<'_>) -> Result<OAuth
         creds_path: creds_rel,
         host_creds_path: creds_path,
         sandbox_id,
+        leased_access,
         _lease: lease,
     })
 }
@@ -388,57 +392,57 @@ pub(super) fn write_private(path: &Path, content: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn write_creds(dir: &std::path::Path, expires_at: Option<u64>) -> PathBuf {
-        let path = dir.join(".credentials.json");
-        let body = match expires_at {
-            Some(e) => format!(r#"{{"claudeAiOauth":{{"expiresAt":{e}}}}}"#),
-            None => r#"{"claudeAiOauth":{}}"#.to_string(),
-        };
-        std::fs::write(&path, body).unwrap();
-        path
-    }
-
-    fn real_with(expires_at: u64) -> serde_json::Value {
-        serde_json::json!({ "claudeAiOauth": { "expiresAt": expires_at } })
-    }
-
     #[test]
-    fn fresh_guard_blocks_older_token_from_clobbering_disk() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_creds(dir.path(), Some(2_000));
-        // Registry token is OLDER than disk (an overlapping session
-        // already wrote a fresher one) → must not persist.
-        assert!(!is_at_least_as_fresh(&real_with(1_000), &path));
-        // Equal or newer → persist.
-        assert!(is_at_least_as_fresh(&real_with(2_000), &path));
-        assert!(is_at_least_as_fresh(&real_with(3_000), &path));
-    }
-
-    #[test]
-    fn fresh_guard_normalizes_seconds_vs_ms_before_comparing() {
-        let dir = tempfile::tempdir().unwrap();
-        // Disk ms-encoded, registry seconds-encoded, SAME instant. Without
-        // normalization real(1.7e9) < disk(1.7e12) → wrongly blocks a
-        // legitimate write-back; with it both normalize to 1.7e12 → equal
-        // → persist.
-        let path = write_creds(dir.path(), Some(1_716_000_000_000)); // ms
-        let real_seconds = serde_json::json!({
-            "claudeAiOauth": { "expiresAt": 1_716_000_000_u64 } // seconds, same instant
+    fn access_token_of_extracts_claude_and_codex_shapes() {
+        let claude = serde_json::json!({
+            "claudeAiOauth": { "accessToken": "sk-ant-oat01-AT", "refreshToken": "RT" }
         });
-        assert!(is_at_least_as_fresh(&real_seconds, &path));
+        assert_eq!(access_token_of(&claude).as_deref(), Some("sk-ant-oat01-AT"));
+
+        let codex = serde_json::json!({
+            "tokens": { "access_token": "jwt.aaa.bbb", "refresh_token": "rt" },
+            "last_refresh": "2026-05-18T00:00:00Z"
+        });
+        assert_eq!(access_token_of(&codex).as_deref(), Some("jwt.aaa.bbb"));
     }
 
     #[test]
-    fn fresh_guard_persists_when_no_timestamp_to_compare() {
-        let dir = tempfile::tempdir().unwrap();
-        // Disk has no expiresAt → no signal → persist (preserve the
-        // unconditional write-back for non-Claude shapes).
-        let path = write_creds(dir.path(), None);
-        assert!(is_at_least_as_fresh(&real_with(1_000), &path));
-        // Missing file entirely → persist.
-        let missing = dir.path().join("nope.json");
-        assert!(is_at_least_as_fresh(&real_with(1_000), &missing));
-        // Registry real lacks the field → persist.
-        assert!(is_at_least_as_fresh(&serde_json::json!({}), &path));
+    fn access_token_of_none_for_unknown_shape() {
+        // No recognized access-token field → None → the teardown CAS skips
+        // (don't clobber a shape we can't reason about).
+        assert_eq!(access_token_of(&serde_json::json!({ "apiKey": "x" })), None);
+        assert_eq!(access_token_of(&serde_json::json!({})), None);
+        // A present-but-non-string field is also None.
+        assert_eq!(
+            access_token_of(&serde_json::json!({ "tokens": { "access_token": 5 } })),
+            None
+        );
+    }
+
+    /// The exact compare-and-swap predicate `Drop` installs, over both real creds
+    /// shapes: persist iff the on-disk access token still equals the leased one.
+    fn cas(leased: &str, disk: &serde_json::Value) -> bool {
+        access_token_of(disk).as_deref() == Some(leased)
+    }
+
+    #[test]
+    fn teardown_cas_persists_only_when_disk_unchanged() {
+        // claude: disk still holds the leased access → allow the write-back.
+        let claude_same =
+            serde_json::json!({ "claudeAiOauth": { "accessToken": "AT0", "refreshToken": "RT" } });
+        assert!(cas("AT0", &claude_same));
+        // A peer rotated disk → deny (don't clobber the fresher token).
+        let claude_peer = serde_json::json!({ "claudeAiOauth": { "accessToken": "AT_PEER" } });
+        assert!(!cas("AT0", &claude_peer));
+
+        // codex shape works the same on its own pointer.
+        let codex_same = serde_json::json!({ "tokens": { "access_token": "jwt0" } });
+        assert!(cas("jwt0", &codex_same));
+        let codex_peer = serde_json::json!({ "tokens": { "access_token": "jwt1" } });
+        assert!(!cas("jwt0", &codex_peer));
+
+        // An unrecognized on-disk shape → access_token_of None → never matches a
+        // recognized leased token → deny (don't clobber what we can't reason about).
+        assert!(!cas("AT0", &serde_json::json!({ "apiKey": "x" })));
     }
 }

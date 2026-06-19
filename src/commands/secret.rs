@@ -125,11 +125,110 @@ fn resolve_vault_meta(
         .into());
     }
 
+    // The vault swaps stub→real only when the request's destination host matches
+    // this `host` exactly (the host-bound resolver). An empty or URL-shaped host
+    // can never match a bare request host, so the secret would store fine but
+    // silently never vault — fail closed *here*, at creation, not at swap time.
+    let host = validate_vault_host(host.unwrap())?;
     let scheme = vault::HeaderScheme::parse(header_scheme.unwrap())
         .map_err(|e| PillboxError::usage("secret add", e))?;
     Ok(Some(vault::VaultMeta::new(
-        host.unwrap().to_string(),
+        host,
         scheme,
         prefix.unwrap().to_string(),
     )))
+}
+
+/// Reject a `--host` that can't match a request's destination host. The vault
+/// compares against a bare host (`api.example.com`, optionally `:port`), so a
+/// scheme, path, or whitespace guarantees the swap never fires.
+fn validate_vault_host(host: &str) -> Result<String> {
+    let trimmed = host.trim();
+    let malformed = trimmed.is_empty()
+        || trimmed.contains("://")
+        || trimmed.contains('/')
+        || trimmed.chars().any(char::is_whitespace);
+    if malformed {
+        return Err(PillboxError::usage(
+            "secret add",
+            format!(
+                "--host `{host}` must be a bare host like `api.example.com` (no scheme, path, or \
+                 spaces) — the vault matches it against the request's destination host exactly"
+            ),
+        )
+        .into());
+    }
+    Ok(trimmed.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_vault_host_accepts_bare_host_and_trims() {
+        assert_eq!(
+            validate_vault_host("api.example.com").unwrap(),
+            "api.example.com"
+        );
+        // Surrounding whitespace is a paste artifact, not part of the host.
+        assert_eq!(
+            validate_vault_host("  api.example.com  ").unwrap(),
+            "api.example.com"
+        );
+        // A port is a legitimate bare-host form (self-hosted endpoints).
+        assert_eq!(
+            validate_vault_host("model.local:8443").unwrap(),
+            "model.local:8443"
+        );
+    }
+
+    #[test]
+    fn validate_vault_host_rejects_unmatchable_hosts() {
+        // Each of these can never equal a request's bare destination host, so
+        // the vault would silently never swap — reject at creation instead.
+        for bad in [
+            "",
+            "   ",
+            "https://api.example.com",
+            "api.example.com/v1",
+            "api example.com",
+        ] {
+            assert!(
+                validate_vault_host(bad).is_err(),
+                "expected `{bad}` to be rejected"
+            );
+        }
+    }
+
+    /// The manual `--host/--header-scheme/--prefix` path runs the host guard:
+    /// an empty host is a usage error, not a stored-but-dead vault config.
+    #[test]
+    fn resolve_vault_meta_rejects_empty_manual_host() {
+        let err = resolve_vault_meta(
+            "CUSTOM_KEY",
+            true,
+            None,
+            Some(""),
+            Some("authorization-bearer"),
+            Some("sk-"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--host"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_vault_meta_accepts_valid_manual_host() {
+        let meta = resolve_vault_meta(
+            "CUSTOM_KEY",
+            true,
+            None,
+            Some("api.example.com"),
+            Some("authorization-bearer"),
+            Some("sk-"),
+        )
+        .unwrap()
+        .expect("manual vault meta");
+        assert_eq!(meta.vault.host, "api.example.com");
+    }
 }

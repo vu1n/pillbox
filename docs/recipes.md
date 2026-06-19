@@ -286,6 +286,31 @@ to source it from) rather than guessing. A non-empty
 `pillbox session list` is a signal that something is already
 running in the background — surface it before launching another.
 
+## Dispatch a decomposed task to verified workers
+
+When a task is verifiable (tests/build/a script decide pass-fail) and either has
+run-to-run variance or a real sequential decomposition, delegate it to forked,
+rubric-graded worker sessions with `pillbox dispatch` (libkrun-only). Snapshot a
+base, then dispatch a segment chain with best-of-k over it:
+
+```sh
+PILLBOX_BACKEND=libkrun pillbox push --bookmark base
+PILLBOX_BACKEND=libkrun pillbox dispatch \
+  --from-bookmark base \
+  --segments rubrics/example-segments.toml \
+  -k 3 --temperature 0.7 \
+  --rubric rubrics/rust-change.rubric \
+  --agent opencode --json \
+  -- "Implement the staged refactor described per segment."
+```
+
+`-k`/`--temperature` is the **best-of-k diversity** axis; `--segments` is the
+**in-session decomposition** axis; they compose. The per-segment gate steers
+progression, the run-level `--rubric` is the authoritative reward that selects the
+winner. Read the `--json` verdict (winner + per-segment outcomes + `pulled_to`), not
+the transcripts. See the [dispatch skill](../.claude/skills/dispatch/SKILL.md), the
+[rubric library](../rubrics/README.md), and [docs/dispatch.md](./dispatch.md).
+
 ## What NOT to do
 
 - ❌ Don't commit `~/.pillbox/` to git — it's plaintext secrets and

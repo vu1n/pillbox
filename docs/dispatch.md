@@ -1,10 +1,22 @@
 # `pillbox dispatch` — the worker-loop primitive
 
-**Status: contract only (GHOST-002).** This documents the CLI surface, the
-verdict JSON schema, and the exit codes. The fork/score/select loop is
-**GHOST-003**; the handler currently validates the invocation and reports
-unimplemented. GHOST-003 and the live e2e (GHOST-004) program against the
-contract on this page — change it here first.
+**Status: shipped (GHOST-002 contract → GHOST-003 loop → GHOST-004 live e2e).**
+This documents the CLI surface, the verdict JSON schema, and the exit codes. The
+fork/score/select loop is implemented in `src/commands/dispatch.rs` and
+live-verified by `scripts/smoke/dispatch.sh`. **libkrun-only today** (the grader
+resolves each worker's live workspace via `session info --json` →
+`.session.workspace`, libkrun-only; docker workspace resolution is deferred — see
+"Deferred" below). Downstream programs against the contract on this page — change
+it here first.
+
+> **Two axes (H4 + the enumerated control, `docs/optimization-gate.md`):** the σ̂
+> experiments found the *segmentation* lever is in-session focused-prompt chaining +
+> per-checkpoint verification (gating adds a real +0.18 on top of the decomposed
+> prompt) — now shipped as **`--segments`** (ONE session per worker, the proven
+> lever). `dispatch`'s fork-`k` is the separate **best-of-k diversity** axis; they
+> compose (`--segments -k N`). Two caveats still open: fork-`k`'s own efficacy as a
+> diversity lever isn't measured yet (the smoke validates plumbing, not outcome),
+> and both results are single-model (glm-5.1) pending H5 (cross-model).
 
 ## What it does (the shape)
 
@@ -37,18 +49,59 @@ pillbox dispatch --from-bookmark seg-3 -k 3 --rubric grade.txt \
 | `--from-bookmark NAME` | — (required) | Snapshot bookmark every worker forks from — the shared base. |
 | `-k`, `--workers N` | `3` | Number of parallel worker sessions to fork. Must be ≥ 1. |
 | `--cmd CMD` | — | Grader: one verifier command via `sh -c` (exit 0 → pass / score 1.0). Mutually exclusive with `--rubric`; exactly one of the two is **required**. |
-| `--rubric FILE` | — | Grader: a rubric file (`NAME :: COMMAND` per line, `#`/blank lines ignored) → per-criterion verdicts + a fractional score. Mutually exclusive with `--cmd`. Same format `session score --rubric` parses. |
-| `--retries N` | `1` | Per-worker retry budget when the grade fails — the failing criteria are fed back as the next prompt and the worker is re-graded, up to `N` times. |
+| `--rubric FILE` | — | Grader: a rubric file (`NAME :: COMMAND` per line, `#`/blank lines ignored) → per-criterion verdicts + a fractional score. Mutually exclusive with `--cmd`. Same format `session score --rubric` parses. In `--segments` mode this stays the **final reward** (the gates are per-segment). |
+| `--segments SPEC` | — | Drive an ordered **segment chain** (TOML, below) in ONE session per worker — the proven in-session segmentation lever (`docs/optimization-gate.md` §2026-06-19) — instead of one prompt. Composes with `-k` (best-of-k over chains). See **Segments** below. |
+| `--retries N` | `1` | Per-worker retry budget when the grade fails — the failing criteria are fed back as the next prompt and the worker is re-graded, up to `N` times. With `--segments`, this is the **per-segment** gate-retry budget. |
 | `--agent AGENT` | pillbox `agent =`, then `claude` | Worker agent (`claude` \| `codex` \| `opencode` \| …). |
 | `--model MODEL` | agent default | Worker model override, forwarded to each worker's run. |
 | `--temperature FLOAT` | agent default | Per-fork sampling temperature, forwarded to each worker — the diversity knob that keeps best-of-`k` non-degenerate. |
 | `--memory` | off | Wire in kypp swarm-memory (`--memory`) for each worker (scoped briefing + post-run capture). |
+| `--ttl DURATION` | — | Per-worker retention TTL (`30m`/`24h`/`7d`), forwarded to every forked worker. Losers are left **running** (not auto-killed) so their §0 evidence stays readable; a TTL is how a dispatch campaign reaps them via `session prune` instead of leaking `k` VMs per run. See **Cleanup** below. |
 | `--json` | off | Emit the verdict as JSON on stdout instead of the human banner. |
-| `-- <PROMPT>…` | — | The segment prompt handed to every worker (trailing args). |
+| `-- <PROMPT>…` | — | The task prompt handed to every worker (trailing args). **Required** in fork-`k` mode; **optional** in `--segments` mode (the segments carry the work — given, it's context prepended to segment 1). |
 
 The grader is a required, mutually-exclusive group: exactly one of `--cmd` /
 `--rubric` must be given (a clap `ArgGroup` enforces it → a missing/both case is
-a usage error, exit 2).
+a usage error, exit 2). This holds in `--segments` mode too — the reward is always
+required, distinct from the per-segment gates.
+
+## Segments (`--segments`)
+
+The proven segmentation lever: drive focused, checkpoint-gated **sub-prompts
+sequentially in ONE session** (context accumulates, the horizon never resets).
+H4 + the enumerated control (`docs/optimization-gate.md`) showed this — *not*
+fork-per-segment — is what cuts σ̂ and lifts the mean; `-k` fork stays the
+separate **best-of-k diversity** axis, and the two compose (`--segments -k N` runs
+`N` independent chains, selects the best by the final reward).
+
+The spec is TOML — an ordered list of `[[segment]]`, each a focused sub-prompt
+(`prompt` xor `prompt_file`) and a **gate** (`gate_rubric` xor `gate_cmd`).
+Relative paths resolve against the spec file's directory; unknown keys are a parse
+error.
+
+```toml
+[[segment]]
+name        = "reroot"
+prompt_file = "segments/01-reroot.txt"   # or: prompt = "..."
+gate_rubric = "segments/01-reroot.rubric" # or: gate_cmd = "pytest -k reroot"
+
+[[segment]]
+name   = "pathfind"
+prompt = "Implement Tree.path_to(from_node, to_node) ..."
+gate_cmd = "python3 -m pytest -k path"
+```
+
+Per worker, each segment is: `send` its prompt → wait-idle → grade against its
+**gate** → on a failed gate with budget left, re-drive with the distilled summary
+(`--retries` per segment). **A failed gate does not abort the chain** — it advances
+and lets the run-level `--rubric`/`--cmd` **reward** be the authoritative final
+grade (the gate only steers progression; the reward selects the winner). The
+worker's `retries_used` is the sum across segments.
+
+Gates are **self-contained** — they run against the worker's live workspace as-is
+(same as `dispatch --rubric`). This is the boundary from the σ̂ eval harness
+(`scripts/eval/segmentation/`), which injects *hidden* test subsets at grade time;
+`--segments` is for real work whose tests live in the workspace.
 
 ## Verdict JSON (`--json`)
 
@@ -71,8 +124,14 @@ pillbox's `--json` surface.
                                  // worker's attempts, or null if it never
                                  // produced a gradeable result (status "errored")
         "passed": true,          // did the grade pass (--cmd exit 0, or all rubric criteria)
-        "retries_used": 0,       // retries this worker consumed
-        "status": "scored"       // "scored" | "failed" | "errored" (see below)
+        "retries_used": 0,       // retries this worker consumed (sum across segments in --segments mode)
+        "status": "scored",      // "scored" | "failed" | "errored" (see below)
+        // ADDITIVE — present ONLY for a --segments worker; omitted in fork-k mode.
+        // The per-checkpoint trajectory, in order; `score` is the gate score.
+        "segments": [
+          { "name": "reroot",   "passed": true, "score": 1.0, "retries_used": 0 },
+          { "name": "pathfind", "passed": true, "score": 1.0, "retries_used": 1 }
+        ]
       },
       { "session": "def456...", "score": 0.5, "passed": false, "retries_used": 1, "status": "failed" },
       { "session": "ghi789...", "score": null, "passed": false, "retries_used": 0, "status": "errored" }
@@ -157,8 +216,35 @@ Consistent with the pillbox exit-code table (`CLAUDE.md`):
 | Code | Meaning |
 |---|---|
 | `0` | A winner was selected (at least one worker passed) and its workspace pulled. |
-| `1` | No winner — every worker either failed its grade (`failed`) or never produced a gradeable result (`errored`). The exit code is deliberately coarse: to tell an infra break (all `errored`) from a legitimate all-fail (all `failed`), read the per-worker `status` in the `--json` envelope, not the exit code. (The contract stub also exits `1` today, with a "not yet implemented" message — transient, gone once GHOST-003 lands.) |
+| `1` | No winner — every worker either failed its grade (`failed`) or never produced a gradeable result (`errored`). The exit code is deliberately coarse: to tell an infra break (all `errored`) from a legitimate all-fail (all `failed`), read the per-worker `status` in the `--json` envelope, not the exit code. |
 | `2` | Usage error — `-k 0`, neither/both of `--cmd`/`--rubric`, or a bad flag. |
+
+> **Note:** exit `0` reports the winner even if its *pull* failed — `pulled_to`
+> is then `null` and a recovery hint (`pillbox session pull <id>`) rides stderr.
+> A `--json` consumer should check `pulled_to`, not just the exit code.
+
+## Cleanup (worker teardown)
+
+dispatch does **not** auto-kill workers. After a run, the winner and every loser
+are still live sessions. This is deliberate: each worker's evidence is a
+`dispatch.worker_summary` §0 artifact on **its own** session log, and `session
+rm` removes the session *record* — which orphans that log from the read surface
+(`session log` resolves the record). Auto-rm'ing losers would free the VMs but
+make their evidence unreadable, and `session rm` does **not** reap per-session
+krun state (creds/workspace/sock) either.
+
+So the cleanup model is:
+
+- **One-off:** inspect losers (`session log <id> --type artifact`, `session
+  pull <id>`), then `session rm` each when done.
+- **Campaign:** pass `--ttl` so every worker gets an `expires_at`, and run
+  `pillbox session prune` (cron/orchestrator) to reap expired sessions — the
+  standard retention path, evidence-safe until prune.
+
+Known gap (tracked, not dispatch-specific): `session rm`/`prune` leave
+`~/.pillbox/krun/{creds,ws,*.sock}` on disk; over a long campaign the
+accumulation degrades fresh-VM launches. The eval harness works around this with
+its own `reap_session`; the proper fix belongs in `session rm` itself.
 
 ## Deferred (additive, post-v1)
 

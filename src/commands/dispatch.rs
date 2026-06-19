@@ -1,13 +1,20 @@
 //! `pillbox dispatch` — the worker-loop primitive (ghost's runtime fan-out).
 //!
-//! Fork `k` detached worker sessions from a snapshot bookmark, drive each to
-//! idle on the same segment prompt, grade each with the rubric/cmd, retry
-//! failures (feeding a distilled failure summary back as the next prompt), then
-//! select the highest-scoring worker that passed and pull its result workspace.
-//! Best-of-k turns the long-horizon variance σ̂ into expected gain instead of a
-//! measurement enemy — which is why per-fork diversity (`--temperature`) matters:
-//! `k` identical deterministic workers all score the same and select-best buys
-//! nothing.
+//! Fork `k` detached worker sessions from a snapshot bookmark, drive each to a
+//! terminal outcome, grade each with the rubric/cmd reward, select the
+//! highest-scoring worker that passed, and pull its result workspace. Each worker
+//! runs in one of two modes:
+//!
+//! - **fork-`k` (default):** every worker gets the same single prompt + retry —
+//!   the **best-of-k diversity** axis. Per-fork diversity (`--temperature`)
+//!   matters: `k` identical deterministic workers all score the same and
+//!   select-best buys nothing.
+//! - **`--segments` (the proven segmentation lever):** each worker drives an
+//!   ordered chain of focused, checkpoint-gated sub-prompts in ONE session
+//!   (`drive_segments_inner`) — context accumulates, the horizon never resets.
+//!   The σ̂ experiments (`docs/optimization-gate.md`) showed this, not
+//!   fork-per-segment, is what cuts variance + lifts the mean. The two compose:
+//!   `--segments -k N` = best-of-k over segmented chains.
 //!
 //! **Orchestration is subprocess, not in-process.** The loop drives workers by
 //! self-exec'ing the pillbox binary (`run`/`session …`) and parsing the
@@ -45,6 +52,40 @@ fn turn_timeout_secs() -> u64 {
         .unwrap_or(DEFAULT_TURN_TIMEOUT_SECS)
 }
 
+/// A grader spec — the `--cmd X` xor `--rubric FILE` pair `session score`
+/// accepts. Used for both the run-level **reward** (the authoritative final
+/// grade) and each segment **gate**, so one `grade(id, grader)` seam covers both.
+#[derive(Debug, Clone)]
+enum Grader {
+    Cmd(String),
+    Rubric(PathBuf),
+}
+
+impl Grader {
+    /// The run-level reward grader from the dispatch opts. clap's required
+    /// ArgGroup guarantees exactly one of `cmd`/`rubric`, so the `_` arm is
+    /// unreachable in practice — kept as a loud usage error, not a panic.
+    fn from_opts(opts: &DispatchOpts) -> Result<Self> {
+        match (&opts.cmd, &opts.rubric) {
+            (Some(c), _) => Ok(Grader::Cmd(c.clone())),
+            (_, Some(r)) => Ok(Grader::Rubric(r.clone())),
+            _ => Err(
+                PillboxError::usage("dispatch", "no grader (--cmd/--rubric)")
+                    .with_next("pass --rubric <file> or --cmd \"<verifier>\"")
+                    .into(),
+            ),
+        }
+    }
+
+    /// The `session score` flags for this grader.
+    fn flags(&self) -> Vec<String> {
+        match self {
+            Grader::Cmd(c) => vec!["--cmd".into(), c.clone()],
+            Grader::Rubric(p) => vec!["--rubric".into(), p.to_string_lossy().into_owned()],
+        }
+    }
+}
+
 /// Options for one `pillbox dispatch` invocation, populated from the clap
 /// surface in `main.rs`. The grader is `cmd` xor `rubric` (a required clap
 /// ArgGroup enforces exactly one at parse time, mirroring `session score`).
@@ -72,7 +113,20 @@ pub(crate) struct DispatchOpts {
     pub(crate) temperature: Option<f64>,
     /// Wire in kypp swarm-memory (`--memory`) for each worker.
     pub(crate) memory: bool,
-    /// The segment prompt handed to every worker (the positional `-- args`).
+    /// Per-worker retention TTL (`30m`/`24h`/`7d`), forwarded to each worker's
+    /// `run --detach --ttl`. Losers are left running (not auto-killed), so a TTL
+    /// is how a dispatch campaign reaps them later via `session prune` without
+    /// orphaning their §0 evidence (`session rm` removes the record the evidence
+    /// is read through). `None` → workers persist until manual `session rm`.
+    pub(crate) ttl: Option<String>,
+    /// `--segments SPEC`: drive an ordered segment chain (TOML) in ONE session per
+    /// worker — the proven in-session segmentation lever — instead of one prompt.
+    /// `None` → the fork-`k`-on-one-prompt path. The run-level `cmd`/`rubric` stays
+    /// the final reward; each segment carries its own gate.
+    pub(crate) segments: Option<PathBuf>,
+    /// The task prompt handed to every worker (the positional `-- args`). In
+    /// fork-`k` mode this is the work (required); in `--segments` mode the segments
+    /// carry the work and this is optional context prepended to segment 1.
     pub(crate) prompt: Vec<String>,
     /// Emit the verdict as JSON on stdout instead of the human banner.
     pub(crate) json: bool,
@@ -110,6 +164,18 @@ impl WorkerStatus {
     }
 }
 
+/// One segment's outcome in a `--segments` chain — its gate verdict, score, and
+/// retries. The per-checkpoint trajectory, surfaced in the verdict (additive) and
+/// the §0 evidence. A failed gate does not abort the chain (the final reward is
+/// authoritative), so a `passed: false` segment can still precede a winning worker.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct SegmentOutcome {
+    pub(crate) name: String,
+    pub(crate) passed: bool,
+    pub(crate) score: f64,
+    pub(crate) retries_used: u32,
+}
+
 /// One worker's outcome — its session, best score across retries, and how it
 /// ended. Carried in input (fork) order in [`DispatchVerdict::workers`].
 pub(crate) struct WorkerOutcome {
@@ -118,7 +184,8 @@ pub(crate) struct WorkerOutcome {
     /// Best normalized score in `[0,1]` across this worker's attempts, or
     /// `None` if it never produced a gradeable result (`Errored`).
     pub(crate) score: Option<f64>,
-    /// Retries this worker consumed (0 = passed/failed on the first attempt).
+    /// Retries this worker consumed (0 = passed/failed on the first attempt). In
+    /// `--segments` mode this is the SUM of per-segment retries.
     pub(crate) retries_used: u32,
     /// How the worker ended. The verdict's `passed` is derived from this (see
     /// [`WorkerStatus::passed`]), not stored alongside it.
@@ -129,17 +196,28 @@ pub(crate) struct WorkerOutcome {
     /// worker passed or failed, the substrate a later self-harness pass mines.
     /// `None` for an `Errored` worker that never produced a gradeable result.
     pub(crate) grade: Option<Scored>,
+    /// Per-segment outcomes in a `--segments` run, in order. Empty for a fork-`k`
+    /// (single-prompt) worker or an errored one — so the verdict JSON omits
+    /// `segments` there. A non-errored `--segments` worker always has ≥1 (an empty
+    /// spec is rejected at parse), so empty-vs-non-empty is a sound mode discriminant.
+    pub(crate) segments: Vec<SegmentOutcome>,
 }
 
 impl WorkerOutcome {
     fn to_json_value(&self) -> serde_json::Value {
-        json!({
+        let mut v = json!({
             "session": self.session,
             "score": self.score,
             "passed": self.status.passed(),
             "retries_used": self.retries_used,
             "status": self.status,
-        })
+        });
+        // Additive: only present for a `--segments` worker, so fork-`k` output is
+        // byte-identical to before.
+        if !self.segments.is_empty() {
+            v["segments"] = serde_json::to_value(&self.segments).unwrap_or_else(|_| json!([]));
+        }
+        v
     }
 }
 
@@ -222,8 +300,9 @@ trait WorkerDriver {
     fn fork(&self) -> Result<String>;
     /// Block until the worker's current turn goes idle (or terminates).
     fn wait_idle(&self, id: &str) -> Result<()>;
-    /// Grade the worker's current workspace → the parsed verdict.
-    fn grade(&self, id: &str) -> Result<Scored>;
+    /// Grade the worker's current workspace against `grader` → the parsed verdict.
+    /// One seam for both the run-level reward and per-segment gates.
+    fn grade(&self, id: &str, grader: &Grader) -> Result<Scored>;
     /// Drive the worker's next turn with `prompt` (the distilled retry feedback).
     fn send(&self, id: &str, prompt: &str) -> Result<()>;
     /// Pull the winner's result workspace to a durable dir → that path.
@@ -342,6 +421,10 @@ struct WorkerSummary {
     /// The grader's combined output / rendered feedback. Absent for an errored worker.
     #[serde(skip_serializing_if = "Option::is_none")]
     feedback: Option<String>,
+    /// Per-segment outcomes for a `--segments` worker — the checkpoint trajectory a
+    /// later self-harness pass mines. Empty (omitted) for a fork-`k` worker.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    segments: Vec<SegmentOutcome>,
     /// GHOST-011 hook: an optional, **advisory** cross-vendor judge / Fusion
     /// report (an artifact ref). Always present (null today) so the schema is
     /// forward-compatible and the slot is discoverable; the panel itself is a
@@ -371,6 +454,7 @@ impl WorkerSummary {
             grader,
             criteria,
             feedback,
+            segments: o.segments.clone(),
             judge_report_ref: None,
         }
     }
@@ -444,17 +528,36 @@ fn write_worker_summary(resolved: &Pillbox, summary: &WorkerSummary) -> Result<(
 /// to `retries`), then select + pull the winner into the [`DispatchVerdict`]. A
 /// worker that errors anywhere in its drive becomes an `Errored` outcome — one
 /// bad worker never aborts the dispatch.
-fn run_dispatch(driver: &dyn WorkerDriver, k: u32, prompt: &str, retries: u32) -> DispatchVerdict {
-    // Fork all k up front (each is `--detach`, so their first turns overlap),
-    // THEN drive each. A fork that fails becomes an `Errored` worker rather than
-    // aborting the batch — the successes are still driven, and no forked worker is
-    // left unrecorded (the orphan a `collect::<Result>()?` would leak).
+fn run_dispatch(
+    driver: &dyn WorkerDriver,
+    k: u32,
+    prompt: &str,
+    retries: u32,
+    reward: &Grader,
+    segments: Option<&[ResolvedSegment]>,
+) -> DispatchVerdict {
+    // Fork all k up front, THEN drive each. Forking first overlaps the k VM
+    // BOOTS (each `--detach` worker boots in the background); the agent turns
+    // themselves are driven SERIALLY below — a `--detach` worker comes up idle and
+    // does nothing until its first `send`, so turns do not overlap. (True
+    // turn-level concurrency would need driving workers on separate threads; the
+    // subprocess `WorkerDriver` calls are independent, so that's a safe future
+    // change — not done here.) A fork that fails becomes an `Errored` worker rather
+    // than aborting the batch — the successes are still driven, and no forked worker
+    // is left unrecorded (the orphan a `collect::<Result>()?` would leak).
+    //
+    // Each worker runs EITHER the segment chain (`--segments`, one session) OR the
+    // single-prompt + retry loop (fork-`k`). With both `-k>1` and `--segments`, the
+    // k workers each run the full chain → best-of-k OVER segmented chains.
     let workers: Vec<WorkerOutcome> = (0..k)
         .map(|_| driver.fork())
         .collect::<Vec<_>>()
         .into_iter()
         .map(|forked| match forked {
-            Ok(id) => drive_one(driver, id, prompt, retries),
+            Ok(id) => match segments {
+                Some(segs) => drive_segments(driver, id, prompt, segs, reward, retries),
+                None => drive_one(driver, id, prompt, retries, reward),
+            },
             Err(e) => {
                 eprintln!("pillbox: worker fork failed: {e:#}");
                 WorkerOutcome {
@@ -463,6 +566,7 @@ fn run_dispatch(driver: &dyn WorkerDriver, k: u32, prompt: &str, retries: u32) -
                     retries_used: 0,
                     status: WorkerStatus::Errored,
                     grade: None,
+                    segments: vec![],
                 }
             }
         })
@@ -497,55 +601,146 @@ fn run_dispatch(driver: &dyn WorkerDriver, k: u32, prompt: &str, retries: u32) -
 
 /// Drive one worker to a terminal outcome. Errors are caught into an `Errored`
 /// outcome (not propagated) so one worker's failure doesn't sink the others.
-fn drive_one(driver: &dyn WorkerDriver, id: String, prompt: &str, retries: u32) -> WorkerOutcome {
-    drive_one_inner(driver, &id, prompt, retries).unwrap_or_else(|e| {
-        eprintln!("pillbox: worker `{id}` errored: {e:#}");
-        WorkerOutcome {
-            session: id,
-            score: None,
-            retries_used: 0,
-            status: WorkerStatus::Errored,
-            grade: None,
-        }
-    })
+fn drive_one(
+    driver: &dyn WorkerDriver,
+    id: String,
+    prompt: &str,
+    retries: u32,
+    reward: &Grader,
+) -> WorkerOutcome {
+    drive_one_inner(driver, &id, prompt, retries, reward).unwrap_or_else(|e| errored(id, e))
 }
 
-/// The send → grade → retry loop for one worker → its terminal outcome. Each
-/// turn is driven by a `send`: turn 1 is the segment `prompt`; a failed grade
-/// with budget left re-drives with the distilled failure summary. A `--detach`
-/// fork comes up idle and does nothing until driven, so the first turn must be a
-/// `send` (the agent's own scaffold runs it) — not a fork-baked positional,
-/// which a server agent treats as a pre-fill hint, not an executed turn. Stops
-/// on the first pass (`Scored`) or when the retry budget is spent (`Failed`).
+/// The shared `Errored` outcome for a worker whose drive raised (boot/drive/grade
+/// error) — one worker's failure never sinks the batch.
+fn errored(id: String, e: anyhow::Error) -> WorkerOutcome {
+    eprintln!("pillbox: worker `{id}` errored: {e:#}");
+    WorkerOutcome {
+        session: id,
+        score: None,
+        retries_used: 0,
+        status: WorkerStatus::Errored,
+        grade: None,
+        segments: vec![],
+    }
+}
+
+/// The send → wait-idle → grade-against-`grader` → retry loop: re-drive with the
+/// distilled failure summary until the grade passes or the `retries` budget is
+/// spent → `(final grade, retries used)`. The shared core of both drive paths
+/// (fork-`k` grades by the reward; each segment by its gate). The first turn must
+/// be a `send` — a `--detach` fork comes up idle and does nothing until driven,
+/// and a server agent treats a fork-baked positional as a pre-fill hint, not an
+/// executed turn.
+fn drive_to_grade(
+    driver: &dyn WorkerDriver,
+    id: &str,
+    first_turn: &str,
+    grader: &Grader,
+    retries: u32,
+) -> Result<(Scored, u32)> {
+    let mut turn = first_turn.to_string();
+    let mut used = 0u32;
+    loop {
+        driver.send(id, &turn)?;
+        driver.wait_idle(id)?;
+        let grade = driver.grade(id, grader)?;
+        if grade.passed || used >= retries {
+            return Ok((grade, used));
+        }
+        turn = distill_feedback(&grade);
+        used += 1;
+    }
+}
+
+/// `Scored` → terminal worker status — the single mapping, so the two drive paths
+/// can't disagree on what a pass/fail looks like.
+fn status_of(grade: &Scored) -> WorkerStatus {
+    if grade.passed {
+        WorkerStatus::Scored
+    } else {
+        WorkerStatus::Failed
+    }
+}
+
+/// Drive one fork-`k` worker (single prompt, graded by the reward) to its terminal
+/// outcome.
 fn drive_one_inner(
     driver: &dyn WorkerDriver,
     id: &str,
     prompt: &str,
     retries: u32,
+    reward: &Grader,
 ) -> Result<WorkerOutcome> {
-    let mut turn = prompt.to_string();
-    let mut used = 0u32;
-    loop {
-        driver.send(id, &turn)?;
-        driver.wait_idle(id)?;
-        let grade = driver.grade(id)?;
-        let done = grade.passed || used >= retries;
-        if done {
-            return Ok(WorkerOutcome {
-                session: id.to_string(),
-                score: Some(grade.score),
-                retries_used: used,
-                status: if grade.passed {
-                    WorkerStatus::Scored
-                } else {
-                    WorkerStatus::Failed
-                },
-                grade: Some(grade),
-            });
-        }
-        turn = distill_feedback(&grade);
-        used += 1;
+    let (grade, used) = drive_to_grade(driver, id, prompt, reward, retries)?;
+    Ok(WorkerOutcome {
+        session: id.to_string(),
+        score: Some(grade.score),
+        retries_used: used,
+        status: status_of(&grade),
+        grade: Some(grade),
+        segments: vec![],
+    })
+}
+
+/// Drive one worker through a SEGMENT CHAIN to a terminal outcome (errors → an
+/// `Errored` outcome, like [`drive_one`]).
+fn drive_segments(
+    driver: &dyn WorkerDriver,
+    id: String,
+    context: &str,
+    segments: &[ResolvedSegment],
+    reward: &Grader,
+    retries: u32,
+) -> WorkerOutcome {
+    drive_segments_inner(driver, &id, context, segments, reward, retries)
+        .unwrap_or_else(|e| errored(id, e))
+}
+
+/// Drive the focused per-segment sub-prompts SEQUENTIALLY in ONE session (the
+/// proven `chained` lever, docs/optimization-gate.md §2026-06-19) — context
+/// accumulates, the horizon never resets. Each segment: send its prompt →
+/// wait-idle → grade against its **gate** → on a failed gate with budget left,
+/// re-drive with the distilled summary (per-segment `retries`). A failed gate
+/// does NOT abort the chain — it advances and lets the run-level **reward** be the
+/// authoritative final grade (matches the harness's best-effort progression). The
+/// worker's `retries_used` is the sum across segments.
+fn drive_segments_inner(
+    driver: &dyn WorkerDriver,
+    id: &str,
+    context: &str,
+    segments: &[ResolvedSegment],
+    reward: &Grader,
+    retries: u32,
+) -> Result<WorkerOutcome> {
+    let mut seg_outcomes = Vec::with_capacity(segments.len());
+    for (i, seg) in segments.iter().enumerate() {
+        // Optional positional context rides the FIRST segment's prompt only.
+        let turn = if i == 0 && !context.is_empty() {
+            format!("{context}\n\n{}", seg.prompt)
+        } else {
+            seg.prompt.clone()
+        };
+        let (grade, used) = drive_to_grade(driver, id, &turn, &seg.gate, retries)?;
+        seg_outcomes.push(SegmentOutcome {
+            name: seg.name.clone(),
+            passed: grade.passed,
+            score: grade.score,
+            retries_used: used,
+        });
     }
+    // Authoritative final grade = the run-level reward (distinct from the gates),
+    // graded once after the chain — no retry.
+    let final_grade = driver.grade(id, reward)?;
+    let retries_used = seg_outcomes.iter().map(|s| s.retries_used).sum();
+    Ok(WorkerOutcome {
+        session: id.to_string(),
+        score: Some(final_grade.score),
+        retries_used,
+        status: status_of(&final_grade),
+        grade: Some(final_grade),
+        segments: seg_outcomes,
+    })
 }
 
 // ── the live CLI driver (subprocess self-exec) ──────────────────────────────
@@ -557,9 +752,6 @@ fn drive_one_inner(
 struct CliDriver<'a> {
     exe: PathBuf,
     opts: &'a DispatchOpts,
-    /// The `session score` grader flags (`--cmd …` xor `--rubric …`), resolved
-    /// once: the clap ArgGroup guarantees exactly one, so this is never empty.
-    grader: Vec<String>,
     /// Durable dir the winner is pulled into (a TempDir would drop it).
     rundir: PathBuf,
 }
@@ -567,23 +759,11 @@ struct CliDriver<'a> {
 impl<'a> CliDriver<'a> {
     fn new(opts: &'a DispatchOpts) -> Result<Self> {
         let exe = std::env::current_exe().context("locate the pillbox binary")?;
-        let grader = match (&opts.cmd, &opts.rubric) {
-            (Some(c), _) => vec!["--cmd".into(), c.clone()],
-            (_, Some(r)) => vec!["--rubric".into(), r.to_string_lossy().into_owned()],
-            // clap's required ArgGroup makes this unreachable; a missing grader
-            // would fail the `score` call loudly rather than grade nothing.
-            _ => bail!("dispatch: no grader (--cmd/--rubric) — clap should have rejected this"),
-        };
         let rundir = std::env::temp_dir().join(format!(
             "pillbox-dispatch-{}",
             uuid::Uuid::now_v7().simple()
         ));
-        Ok(Self {
-            exe,
-            opts,
-            grader,
-            rundir,
-        })
+        Ok(Self { exe, opts, rundir })
     }
 }
 
@@ -607,6 +787,11 @@ impl WorkerDriver for CliDriver<'_> {
         }
         if self.opts.memory {
             args.push("--memory".into());
+        }
+        if let Some(t) = &self.opts.ttl {
+            // `run --ttl` requires `--detach` (already passed above) and writes
+            // `expires_at` so `session prune` can later reap this worker.
+            args.extend(["--ttl".into(), t.clone()]);
         }
         // No positional prompt: a `--detach` worker comes up idle; the segment
         // prompt is driven as turn 1 via `session send` (see `drive_one_inner`).
@@ -632,7 +817,7 @@ impl WorkerDriver for CliDriver<'_> {
         ])
     }
 
-    fn grade(&self, id: &str) -> Result<Scored> {
+    fn grade(&self, id: &str, grader: &Grader) -> Result<Scored> {
         // Grade the worker's *live* workspace clone in place (no pull): `session
         // info --json` exposes its path, `session score --workspace` grades it.
         // The winner is pulled to a durable dir separately (`pull_winner`).
@@ -656,7 +841,7 @@ impl WorkerDriver for CliDriver<'_> {
             ws,
             "--json".into(),
         ];
-        args.extend(self.grader.iter().cloned());
+        args.extend(grader.flags());
         let out = self.capture(&args)?;
         parse_grade(&out)
     }
@@ -725,6 +910,109 @@ fn parse_grade(out: &str) -> Result<Scored> {
     serde_json::from_str(out).with_context(|| format!("parse `score --json`: {out:?}"))
 }
 
+// ── segment spec (`--segments`, TOML) ───────────────────────────────────────
+
+/// One `[[segment]]` in the `--segments` TOML: a focused sub-prompt (inline
+/// `prompt` xor `prompt_file`) and a gate (`gate_cmd` xor `gate_rubric`). The
+/// gate steers progression; the run-level `--rubric`/`--cmd` reward is the
+/// authoritative final grade. `deny_unknown_fields` so a typo'd key is a loud
+/// parse error, not silently ignored.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SegmentSpec {
+    name: String,
+    prompt: Option<String>,
+    prompt_file: Option<PathBuf>,
+    gate_rubric: Option<PathBuf>,
+    gate_cmd: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SegmentsFile {
+    #[serde(default)]
+    segment: Vec<SegmentSpec>,
+}
+
+/// A segment with its prompt read and gate resolved — ready to drive.
+struct ResolvedSegment {
+    name: String,
+    prompt: String,
+    gate: Grader,
+}
+
+/// Load + validate the `--segments` TOML spec. Relative `prompt_file`/`gate_rubric`
+/// paths resolve against the spec file's directory. Every failure is a
+/// [`PillboxError::usage`] (exit 2) so a bad spec fails fast, before any worker is
+/// forked — not mid-dispatch.
+fn load_segments(spec_path: &std::path::Path) -> Result<Vec<ResolvedSegment>> {
+    let usage = |msg: String| -> anyhow::Error { PillboxError::usage("dispatch", msg).into() };
+    let raw = std::fs::read_to_string(spec_path)
+        .map_err(|e| usage(format!("read --segments {}: {e}", spec_path.display())))?;
+    let file: SegmentsFile = toml::from_str(&raw)
+        .map_err(|e| usage(format!("parse --segments {}: {e}", spec_path.display())))?;
+    if file.segment.is_empty() {
+        return Err(PillboxError::usage(
+            "dispatch",
+            format!(
+                "--segments {} has no [[segment]] entries",
+                spec_path.display()
+            ),
+        )
+        .with_next("each [[segment]] needs name + (prompt|prompt_file) + (gate_rubric|gate_cmd)")
+        .into());
+    }
+    let dir = spec_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let resolve = |p: &PathBuf| -> PathBuf {
+        if p.is_absolute() {
+            p.clone()
+        } else {
+            dir.join(p)
+        }
+    };
+    let mut out = Vec::with_capacity(file.segment.len());
+    for s in &file.segment {
+        let prompt = match (&s.prompt, &s.prompt_file) {
+            (Some(p), None) => p.clone(),
+            (None, Some(f)) => {
+                let path = resolve(f);
+                std::fs::read_to_string(&path).map_err(|e| {
+                    usage(format!(
+                        "segment `{}`: read prompt_file {}: {e}",
+                        s.name,
+                        path.display()
+                    ))
+                })?
+            }
+            _ => {
+                return Err(usage(format!(
+                    "segment `{}` needs exactly one of `prompt` or `prompt_file`",
+                    s.name
+                )))
+            }
+        };
+        let gate = match (&s.gate_cmd, &s.gate_rubric) {
+            (Some(c), None) => Grader::Cmd(c.clone()),
+            (None, Some(r)) => Grader::Rubric(resolve(r)),
+            _ => {
+                return Err(usage(format!(
+                    "segment `{}` needs exactly one of `gate_cmd` or `gate_rubric`",
+                    s.name
+                )))
+            }
+        };
+        out.push(ResolvedSegment {
+            name: s.name.clone(),
+            prompt,
+            gate,
+        });
+    }
+    Ok(out)
+}
+
 // ── handler ─────────────────────────────────────────────────────────────────
 
 /// Run a dispatch. Exit-code contract (`docs/dispatch.md`): a selected winner →
@@ -740,7 +1028,10 @@ pub(crate) fn dispatch(resolved: &Pillbox, opts: DispatchOpts) -> Result<()> {
             )
             .into());
     }
-    if opts.prompt.iter().all(|p| p.trim().is_empty()) {
+    let prompt = opts.prompt.join(" ");
+    // fork-`k` needs a positional prompt (the work). `--segments` carries the work
+    // in the spec, so there the positional is optional context.
+    if opts.segments.is_none() && prompt.trim().is_empty() {
         return Err(PillboxError::usage(
             "dispatch",
             "no segment prompt — workers have nothing to do",
@@ -748,10 +1039,34 @@ pub(crate) fn dispatch(resolved: &Pillbox, opts: DispatchOpts) -> Result<()> {
         .with_next("pillbox dispatch … -- \"<the segment prompt>\"")
         .into());
     }
+    // Validate `--ttl` at the boundary so a bad duration fails fast (exit 2)
+    // instead of after forking k workers (each `run --ttl` would reject it).
+    if let Some(t) = &opts.ttl {
+        crate::session::parse_ttl_seconds(t).map_err(|e| {
+            PillboxError::usage("dispatch", format!("invalid --ttl `{t}`: {e}"))
+                .with_next("use a duration like 30m / 24h / 7d")
+        })?;
+    }
+
+    // The run-level reward — the authoritative final grade, distinct from any
+    // per-segment gate.
+    let reward = Grader::from_opts(&opts)?;
+    // Parse + validate the segment spec up front (exit 2 on a bad spec) — before
+    // forking any worker.
+    let segments = match &opts.segments {
+        Some(p) => Some(load_segments(p)?),
+        None => None,
+    };
 
     let driver = CliDriver::new(&opts)?;
-    let prompt = opts.prompt.join(" ");
-    let verdict = run_dispatch(&driver, opts.workers, &prompt, opts.retries);
+    let verdict = run_dispatch(
+        &driver,
+        opts.workers,
+        &prompt,
+        opts.retries,
+        &reward,
+        segments.as_deref(),
+    );
 
     // Persist each worker's evidence to its §0 log (#73) before reporting —
     // best-effort, so a log-write hiccup never changes the dispatch outcome.
@@ -787,7 +1102,14 @@ mod tests {
             retries_used: retries,
             status,
             grade: None,
+            segments: vec![],
         }
+    }
+
+    /// A throwaway reward grader for the loop tests (the mock ignores the grader
+    /// and replays its scripted grade queue).
+    fn reward() -> Grader {
+        Grader::Cmd("reward".into())
     }
 
     // ── selection policy ──
@@ -910,7 +1232,7 @@ mod tests {
         fn wait_idle(&self, _id: &str) -> Result<()> {
             Ok(())
         }
-        fn grade(&self, id: &str) -> Result<Scored> {
+        fn grade(&self, id: &str, _grader: &Grader) -> Result<Scored> {
             if self.grade_errs.contains(id) {
                 bail!("mock: grade failed for {id}");
             }
@@ -939,7 +1261,7 @@ mod tests {
             ("w0", vec![(false, 0.5), (true, 1.0)]),
             ("w1", vec![(true, 1.0)]),
         ]);
-        let v = run_dispatch(&d, 2, "task", 2);
+        let v = run_dispatch(&d, 2, "task", 2, &reward(), None);
         assert_eq!(v.workers.len(), 2);
         assert_eq!(v.workers[0].retries_used, 1);
         assert_eq!(v.workers[1].retries_used, 0);
@@ -961,7 +1283,7 @@ mod tests {
         // sink the batch or win — the good one is selected.
         let d = MockDriver::new(vec![("bad", vec![]), ("good", vec![(true, 1.0)])])
             .failing_grade("bad");
-        let v = run_dispatch(&d, 2, "task", 0);
+        let v = run_dispatch(&d, 2, "task", 0, &reward(), None);
         assert_eq!(v.workers[0].status, WorkerStatus::Errored);
         assert_eq!(v.workers[0].score, None);
         assert_eq!(v.winner.as_deref(), Some("good"));
@@ -972,7 +1294,7 @@ mod tests {
     fn loop_respects_retry_budget_then_fails() {
         // never passes; budget 1 → 1 retry then Failed, no winner, no pull.
         let d = MockDriver::new(vec![("w0", vec![(false, 0.3), (false, 0.4)])]);
-        let v = run_dispatch(&d, 1, "task", 1);
+        let v = run_dispatch(&d, 1, "task", 1, &reward(), None);
         assert_eq!(v.workers[0].status, WorkerStatus::Failed);
         assert_eq!(v.workers[0].retries_used, 1);
         assert_eq!(v.workers[0].score, Some(0.4));
@@ -981,6 +1303,137 @@ mod tests {
         // 2 sends: the turn-1 prompt + one retry.
         assert_eq!(*d.sends.borrow(), 2);
         assert!(d.pulls.borrow().is_empty());
+    }
+
+    // ── segment chain (`--segments`) ──
+
+    #[test]
+    fn loop_drives_segment_chain_then_final_reward_in_one_session() {
+        // ONE worker, 2 segments + the final reward, all in one session. seg "a"
+        // passes first try; seg "b" fails its gate once then passes (1 retry); the
+        // final reward passes. The mock's grade queue is consumed in order:
+        // [a-gate, b-gate(fail), b-gate(pass), reward].
+        let segs = vec![
+            ResolvedSegment {
+                name: "a".into(),
+                prompt: "do a".into(),
+                gate: Grader::Cmd("ga".into()),
+            },
+            ResolvedSegment {
+                name: "b".into(),
+                prompt: "do b".into(),
+                gate: Grader::Cmd("gb".into()),
+            },
+        ];
+        let d = MockDriver::new(vec![(
+            "w0",
+            vec![(true, 1.0), (false, 0.5), (true, 1.0), (true, 1.0)],
+        )]);
+        let v = run_dispatch(&d, 1, "", 1, &reward(), Some(&segs));
+        let w = &v.workers[0];
+        assert_eq!(w.status, WorkerStatus::Scored);
+        assert_eq!(w.score, Some(1.0));
+        // Per-segment trajectory captured.
+        assert_eq!(w.segments.len(), 2);
+        assert_eq!(w.segments[0].name, "a");
+        assert_eq!(w.segments[0].retries_used, 0);
+        assert!(w.segments[0].passed);
+        assert_eq!(w.segments[1].name, "b");
+        assert_eq!(w.segments[1].retries_used, 1);
+        assert!(w.segments[1].passed);
+        // Worker retries = SUM across segments.
+        assert_eq!(w.retries_used, 1);
+        // sends: a (1) + b (1 + 1 retry) = 3; the final reward grade does not send.
+        assert_eq!(*d.sends.borrow(), 3);
+        assert_eq!(v.winner.as_deref(), Some("w0"));
+        assert_eq!(*d.pulls.borrow(), vec!["w0".to_string()]);
+        // The verdict JSON carries the segments array for a segmented worker.
+        let val = v.to_json_value();
+        let seg = &val["workers"][0]["segments"];
+        assert_eq!(seg.as_array().unwrap().len(), 2);
+        assert_eq!(seg[1]["name"], "b");
+        assert_eq!(seg[1]["retries_used"], 1);
+        assert_eq!(seg[1]["passed"], true);
+    }
+
+    #[test]
+    fn segment_chain_advances_past_a_failed_gate_and_reward_decides() {
+        // seg "a" never passes its gate (budget 0 → 1 attempt, fails); the chain
+        // STILL advances to seg "b" and the final reward decides the worker. Here
+        // the reward fails → the worker is Failed, no winner.
+        let segs = vec![
+            ResolvedSegment {
+                name: "a".into(),
+                prompt: "do a".into(),
+                gate: Grader::Cmd("ga".into()),
+            },
+            ResolvedSegment {
+                name: "b".into(),
+                prompt: "do b".into(),
+                gate: Grader::Cmd("gb".into()),
+            },
+        ];
+        let d = MockDriver::new(vec![(
+            "w0",
+            vec![(false, 0.0), (true, 1.0), (false, 0.4)], // a-gate fail, b-gate pass, reward fail
+        )]);
+        let v = run_dispatch(&d, 1, "", 0, &reward(), Some(&segs));
+        let w = &v.workers[0];
+        assert_eq!(w.segments.len(), 2, "advanced past the failed gate");
+        assert!(!w.segments[0].passed);
+        assert!(w.segments[1].passed);
+        assert_eq!(w.status, WorkerStatus::Failed); // reward is authoritative
+        assert_eq!(w.score, Some(0.4));
+        assert_eq!(v.winner, None);
+        // sends: a (1) + b (1) = 2 (no retries at budget 0).
+        assert_eq!(*d.sends.borrow(), 2);
+    }
+
+    #[test]
+    fn load_segments_parses_and_resolves() {
+        let dir = std::env::temp_dir().join(format!("pb-seg-{}", uuid::Uuid::now_v7().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("p1.txt"), "focused prompt 1").unwrap();
+        std::fs::write(dir.join("r1.txt"), "c :: true").unwrap();
+        let spec = dir.join("segs.toml");
+        std::fs::write(
+            &spec,
+            "[[segment]]\nname = \"one\"\nprompt_file = \"p1.txt\"\ngate_rubric = \"r1.txt\"\n\n\
+             [[segment]]\nname = \"two\"\nprompt = \"inline 2\"\ngate_cmd = \"pytest -k two\"\n",
+        )
+        .unwrap();
+        let segs = load_segments(&spec).unwrap();
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].name, "one");
+        assert_eq!(segs[0].prompt, "focused prompt 1"); // read from file, rel to spec dir
+        assert!(matches!(&segs[0].gate, Grader::Rubric(p) if p.ends_with("r1.txt")));
+        assert_eq!(segs[1].prompt, "inline 2");
+        assert!(matches!(&segs[1].gate, Grader::Cmd(c) if c == "pytest -k two"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_segments_rejects_both_prompt_sources() {
+        let dir = std::env::temp_dir().join(format!("pb-seg-{}", uuid::Uuid::now_v7().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let spec = dir.join("bad.toml");
+        std::fs::write(
+            &spec,
+            "[[segment]]\nname = \"x\"\nprompt = \"a\"\nprompt_file = \"b.txt\"\ngate_cmd = \"true\"\n",
+        )
+        .unwrap();
+        assert!(load_segments(&spec).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_segments_rejects_empty_spec() {
+        let dir = std::env::temp_dir().join(format!("pb-seg-{}", uuid::Uuid::now_v7().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let spec = dir.join("empty.toml");
+        std::fs::write(&spec, "# no segments\n").unwrap();
+        assert!(load_segments(&spec).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ── verdict JSON shape (the downstream wire contract) ──
@@ -1013,6 +1466,9 @@ mod tests {
         assert_eq!(w0["passed"], true);
         assert_eq!(w0["retries_used"], 0);
         assert_eq!(w0["status"], "scored");
+        // fork-`k` worker → `segments` is omitted (additive field), so existing
+        // consumers see byte-identical output.
+        assert!(w0.get("segments").is_none());
     }
 
     #[test]

@@ -37,6 +37,10 @@ if [ "$which" = all ] || [ "$which" = libkrun ]; then
   # scores / pulls them — boots ~2 VMs, so it runs after the single-agent smoke.
   scripts/smoke/dispatch.sh "${OPENCODE_IMAGE:-pillbox-runner:l7}" \
     "${SMOKE_MODEL:-zai-coding-plan/glm-4.5-air}" || rc=1
+  # The segment chain (`--segments`): one worker, sequential gated sub-prompts in
+  # ONE session — boots a VM, so it runs alongside the fork-k dispatch smoke.
+  scripts/smoke/dispatch-segments.sh "${OPENCODE_IMAGE:-pillbox-runner:l7}" \
+    "${SMOKE_MODEL:-zai-coding-plan/glm-4.5-air}" || rc=1
 fi
 
 if [ "$which" = all ] || [ "$which" = cf ]; then

@@ -1,4 +1,10 @@
 /target
+# Cross-arch build dirs (e.g. target-amd64/ from a cross build) — same
+# build-artifact class as /target; one `git add -A` would otherwise stage ~1GB.
+/target-*
+
+# macOS Finder cruft.
+.DS_Store
 
 # Agent worktrees created by the Claude Code harness (locked, ephemeral).
 .claude/worktrees/

@@ -45,3 +45,35 @@ jobs:
       # lifecycle, `#[ignore]`d) deliberately do NOT run here — a docker job
       # burns the free-minutes allocation. Run them locally / on a self-hosted
       # box with `scripts/test-docker-mechanism.sh` (needs a Docker daemon).
+
+  # The real backend: compile, lint, and unit-test pillbox with `--features
+  # libkrun`. Runs on macOS because the libkrun backend is macOS-only today (it
+  # uses APFS `clonefile`, and the egress stack needs libkrun's brew build; the
+  # from-source Linux build is missing `krun_add_net_unixstream`). brew supplies
+  # libkrun + libkrunfw from the `libkrun/krun` tap and build.rs finds them at
+  # /opt/homebrew/lib. No VM boots here — GitHub macOS runners can't nest HVF —
+  # so this is build + link + non-VM unit tests; the VM-boot smoke stays a local
+  # gate (scripts/smoke/libkrun.sh). The Linux path (cheap-KVM, CI VM-boot) is a
+  # deferred task, and the intended Linux backend is QEMU, not libkrun-on-Linux.
+  libkrun:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rust
+        run: rustup toolchain install stable --profile minimal --component clippy
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-libkrun-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-libkrun-
+      - name: Install libkrun
+        run: brew tap libkrun/krun && brew install libkrun libkrunfw
+      - name: Clippy (libkrun)
+        run: cargo clippy --all-targets --features libkrun -- -D warnings
+      - name: Test (libkrun)
+        run: cargo test --all-targets --features libkrun

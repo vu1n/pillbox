@@ -328,23 +328,23 @@ fn provision_oauth_mount(server: &Server, agent: OAuthAgent<'_>) -> Result<OAuth
         )
     })?;
 
-    // The on-disk access token — the teardown's CAS baseline. Captured here, from
-    // what we read off disk, BEFORE any pre-refresh can mutate `real`, so it
-    // matches what's actually on disk (the thing the teardown compares against).
-    let leased_access = access_token_of(&real);
-
-    // Proactively refresh if the stored access token is past expiry —
-    // see `super::refresh` for the rationale + wire details. Non-fatal
-    // on failure: caller's warning + agent's own retry-on-401 handle
-    // it transparently.
-    if let Err(e) = super::refresh::refresh_real_if_expired(&mut real, agent.agent_id, &creds_path)
-    {
-        eprintln!(
-            "pillbox: warning: vault token pre-refresh failed for `{}`: {e}; \
-             agent will fall back to its own retry-on-401",
-            agent.agent_id,
-        );
+    // Establish a fresh OAuth token before leasing — coordinated across concurrent
+    // sessions via the single-writer TokenStore (see `super::refresh`). In the broker
+    // model the guest's stub carries a far-future expiry and never self-refreshes, so
+    // this is the *only* refresher: a stale token here would 401 with no recovery.
+    // Fail closed rather than lease a doomed credential — `pre_refresh` returns
+    // `Ok(None)` only for agents without a broker decider (codex), where the on-disk
+    // creds are leased as-is.
+    if let Some(fresh) = super::refresh::pre_refresh(&creds_path, agent.agent_id)? {
+        real = fresh;
     }
+
+    // The access token of the creds we actually lease — the teardown's CAS baseline.
+    // Captured AFTER pre-refresh (which already persisted any rotation to disk under
+    // the lock), so registry==leased when nothing rotates in-proxy and the teardown
+    // is a clean no-op; if the 401-retry fallback does rotate mid-run, real diverges
+    // from this and the teardown CAS-persists it.
+    let leased_access = access_token_of(&real);
 
     let sandbox_id = uuid::Uuid::now_v7().to_string();
     let lease = server
@@ -370,12 +370,10 @@ fn provision_oauth_mount(server: &Server, agent: OAuthAgent<'_>) -> Result<OAuth
     })
 }
 
-/// Write `content` to `path` as a 0600 file, creating-or-truncating.
-/// Shared with [`super::refresh`] (which rewrites the stored real
-/// credentials after a token refresh); kept here because
-/// `provision_oauth_mount` is the original caller and the
-/// abstraction doesn't earn its own module.
-pub(super) fn write_private(path: &Path, content: &str) -> Result<()> {
+/// Write `content` to `path` as a 0600 file, creating-or-truncating. Used to drop
+/// the per-run stub creds into its temp file. (Rotated *real* creds are written by
+/// the [`super::token_store::TokenStore`] under the rotation lock, not here.)
+fn write_private(path: &Path, content: &str) -> Result<()> {
     let mut f = fs::OpenOptions::new()
         .create(true)
         .truncate(true)

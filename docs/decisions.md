@@ -61,10 +61,10 @@ Format: `STATUS` · what · why · what it means concretely · what's rejected.
   two-backend tax again).
 
 ## ADR-004 — Vault OAuth uses the broker model, not in-proxy refresh
-**Status: Accepted (2026-06-20). Not yet built. PR #101 (in-proxy coordinator) parked.**
+**Status: Accepted (2026-06-20). Core BUILT (2026-06-20, claude/libkrun). PR #101 (in-proxy coordinator) parked.**
 
-- **Decision:** the sandbox gets a **dummy** creds file with a far-future expiry +
-  the vault MITM **injects** the real `Authorization: Bearer`; a host-side
+- **Decision:** the sandbox gets a creds file with a **far-future expiry** + the
+  vault MITM **injects** the real `Authorization: Bearer`; a host-side, single-writer
   **pre-refresh** owns token rotation. The agent never refreshes.
 - **Why:** dissolves *both* the host-creds clobber *and* the refresh-token-reuse
   coordination problem at once — the agent-never-refreshes move makes the broker
@@ -75,6 +75,15 @@ Format: `STATUS` · what · why · what it means concretely · what's rejected.
   clobber is a docker-on-macOS bind-mount interaction, docker-backend-only,
   libkrun unaffected. So the coordinator wasn't the bug — the whole in-proxy
   approach is just more fragile than the broker.
+- **Built (slice 1):** `provision` stamps the stub's `expiresAt` with the
+  year-2100 sentinel (`STUB_EXPIRES_AT_MS`); the start-of-run pre-refresh
+  (`vault::refresh::pre_refresh`) routes through the `TokenStore` single-writer
+  core so concurrent launches rotate the shared refresh token at most once, and
+  **fails closed** (no stale-token lease). See [vault.md](./vault.md#oauth-refresh--the-broker-model).
+- **Deferred (slice 2):** JIT-refresh-at-proxy — the MITM refreshes the real token
+  on-demand near expiry, closing the >token-lifetime-session case and letting the
+  in-proxy 401-retry fallback finally be deleted. Until then a session that
+  outlives the ~8h access token relies on that (uncoordinated) fallback.
 - **Rejected:** the in-proxy refresh coordinator (PR #101) as the path; letting
   the agent refresh through a coordinated proxy and capturing the rotation.
 

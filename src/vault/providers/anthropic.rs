@@ -50,6 +50,16 @@ const CREDS_PATH: &str = ".claude/.credentials.json";
 pub(crate) const STUB_ACCESS_PREFIX: &str = "sk-ant-oat01-";
 pub(crate) const STUB_REFRESH_PREFIX: &str = "sk-ant-ort01-";
 
+/// `expiresAt` stamped into the stub the guest sees: 2100-01-01T00:00:00Z in ms
+/// (the same far-future sentinel centaur/iron-proxy use). This is the broker move —
+/// the guest's Claude Code trusts its local expiry and so **never refreshes itself**,
+/// which dissolves the host-creds clobber and the refresh-token-reuse race in one
+/// stroke (the agent emits no `/oauth/token` traffic). Rotation is owned entirely
+/// host-side: `super::super::refresh::pre_refresh` keeps the *real* token fresh at
+/// run start, and the MITM injects the real `Authorization: Bearer` on the wire. The
+/// real creds keep their true `expiresAt`; only this stub copy is post-dated.
+const STUB_EXPIRES_AT_MS: u64 = 4_102_444_800_000;
+
 pub(crate) struct AnthropicProvider;
 
 #[async_trait]
@@ -87,10 +97,11 @@ impl VaultProvider for AnthropicProvider {
         let stub_access = mint_stub(STUB_ACCESS_PREFIX, sandbox_id);
         let stub_refresh = mint_stub(STUB_REFRESH_PREFIX, sandbox_id);
 
-        // Build stub creds JSON by cloning real and overwriting just the
-        // token fields. Preserves `expiresAt`, `scopes`, `subscriptionType`,
-        // and any future fields so the guest sees a structurally-correct
-        // file.
+        // Build stub creds JSON by cloning real and overwriting the token fields plus
+        // `expiresAt` (post-dated to STUB_EXPIRES_AT_MS — the broker move that stops
+        // the guest from ever refreshing; see that const). `scopes`,
+        // `subscriptionType`, and any future fields are preserved so the guest sees a
+        // structurally-correct file.
         let mut stub_value = real.clone();
         {
             let oauth = stub_value
@@ -104,6 +115,10 @@ impl VaultProvider for AnthropicProvider {
             oauth.insert(
                 "refreshToken".to_string(),
                 serde_json::Value::String(stub_refresh.clone()),
+            );
+            oauth.insert(
+                "expiresAt".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(STUB_EXPIRES_AT_MS)),
             );
         }
         let stub_json = serde_json::to_string_pretty(&stub_value)
@@ -514,9 +529,11 @@ mod tests {
             oauth.get("subscriptionType").and_then(|v| v.as_str()),
             Some("pro")
         );
+        // Broker move: the stub's expiry is post-dated to the far-future sentinel
+        // (NOT the real `1700000000`), so the guest never refreshes itself.
         assert_eq!(
             oauth.get("expiresAt").and_then(|v| v.as_u64()),
-            Some(1700000000)
+            Some(STUB_EXPIRES_AT_MS)
         );
 
         // Registry knows about both stubs.

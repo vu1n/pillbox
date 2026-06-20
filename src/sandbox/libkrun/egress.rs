@@ -78,6 +78,7 @@ pub(super) fn standard_egress_hosts() -> &'static [&'static str] {
         "api.mistral.ai",                    // Mistral
         "api.groq.com",                      // Groq
         "models.dev",                        // opencode's model registry
+        "opencode.ai",                       // OpenCode Zen / GO gateway (the model API)
     ]
 }
 

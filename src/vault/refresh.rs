@@ -272,7 +272,10 @@ fn post_refresh(refresh_token: &str) -> std::result::Result<Value, RotateError> 
         Ok(r) => r,
         // A pure connect failure provably never delivered the token. Exclude a
         // connect *timeout* (`is_connect() && is_timeout()`): a timeout can never be
-        // proven pre-send, so it stays Ambiguous.
+        // proven pre-send, so it stays Ambiguous. Anything `is_connect` doesn't cover
+        // falls to the `Err(_)` arm below → Ambiguous → fail closed; so the only way
+        // a future reqwest could perturb this is by *broadening* `is_connect`, which
+        // can only make us over-conservative (extra re-auth), never risk a reuse.
         Err(e) if e.is_connect() && !e.is_timeout() => {
             return Err(RotateError::Definite("refresh connect failed".to_string()));
         }

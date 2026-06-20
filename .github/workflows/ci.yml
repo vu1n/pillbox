@@ -92,7 +92,8 @@ jobs:
           # libkrun links it (clang/llvm/libclang/patchelf/pkg-config).
           sudo apt-get install -y \
             build-essential pkg-config clang lld libclang-dev llvm-dev \
-            libcap-ng-dev flex bison libelf-dev bc libssl-dev patchelf python3
+            libcap-ng-dev flex bison libelf-dev bc libssl-dev patchelf \
+            python3 python3-pyelftools
           tmp="$(mktemp -d)"
           # `cd && make`, NOT `make -C`: -C implies --print-directory (-w), which
           # lands in MAKEFLAGS, and libkrunfw forwards $(MAKEFLAGS) verbatim to the

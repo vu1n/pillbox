@@ -138,6 +138,13 @@ tower-service = "0.3"
 schemars = { version = "1.2.1", optional = true }
 
 [features]
+# libkrun is THE backend, so it's the default build — `cargo build` on a host
+# with the libkrun toolchain (the maintainer's Mac, libkrun CI) gives a libkrun
+# binary. Builds without the toolchain (Linux CI, `cargo install` elsewhere) use
+# `--no-default-features`, which falls back to the deprecated docker backend (the
+# toolchain-free path; docker stays a switchable fallback, not deleted).
+default = ["libkrun"]
+
 # Opt-in OTLP/gRPC transport for the OTel logs sink. Adds tonic +
 # prost to the binary; the sandbox runtime image build leaves it off
 # to keep the in-sandbox pillbox lean (HTTP/protobuf is the default
@@ -145,13 +152,13 @@ schemars = { version = "1.2.1", optional = true }
 # this with `cargo install pillbox --features otel-grpc`.
 otel-grpc = ["opentelemetry-otlp/grpc-tonic"]
 
-# Local microVM backend (libkrun) — Linux/KVM + macOS/HVF. OFF by default so the
-# default build + CI (no libkrun toolchain) are unaffected; opt in at runtime via
-# `PILLBOX_BACKEND=libkrun`. Enabling needs libkrun + libkrunfw installed (link dir
-# from `$LIBKRUN_LIB_DIR` or the per-OS default in build.rs); on macOS the binary
-# must also be codesigned with the hypervisor entitlement (no codesign on Linux/KVM).
-# Pulls smoltcp for the in-VMM-child userspace egress stack (virtio-net) +
-# rustls + webpki-roots for the vault MITM (L5b).
+# Local microVM backend (libkrun) — Linux/KVM + macOS/HVF (hardware virt
+# required; no software-emulation fallback). THE backend, and in `default`.
+# Needs libkrun + libkrunfw installed (link dir from `$LIBKRUN_LIB_DIR` or the
+# per-OS default in build.rs); on macOS the binary must also be codesigned with
+# the hypervisor entitlement to *boot* a VM (no codesign on Linux/KVM; building
+# never needs it). Pulls smoltcp for the in-VMM-child userspace egress stack
+# (virtio-net) + rustls + webpki-roots for the vault MITM (L5b).
 libkrun = ["dep:smoltcp"]
 
 # Codegen-only: derive `JsonSchema` on the §0 contract types so the

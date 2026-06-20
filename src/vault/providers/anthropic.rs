@@ -287,11 +287,21 @@ async fn handle_oauth_request(
         .unwrap_or_else(|| req.uri().path().to_string());
 
     let (parts, body) = req.into_parts();
-    let collected = match body.collect().await {
+    // Cap the guest-controlled request body before buffering it: the vault proxy is a
+    // HOST process serving several concurrent sandboxes, so an unbounded POST body is
+    // a host-OOM DoS that takes down credential swapping for every session. An OAuth
+    // token request is a few hundred bytes; 64 KiB is generous.
+    const MAX_OAUTH_BODY: usize = 64 * 1024;
+    let collected = match http_body_util::Limited::new(body, MAX_OAUTH_BODY)
+        .collect()
+        .await
+    {
         Ok(c) => c.to_bytes(),
         Err(error) => {
-            eprintln!("pillbox: vault: failed to collect oauth request body: {error}");
-            return unauthorized("body read error").into();
+            eprintln!(
+                "pillbox: vault: oauth request body unreadable or over {MAX_OAUTH_BODY}B: {error}"
+            );
+            return unauthorized("oauth request body unreadable or too large").into();
         }
     };
 
@@ -471,11 +481,20 @@ async fn coordinate_refresh_request(
     response.into()
 }
 
-/// How long to wait for the cross-process rotation flock before giving the guest
-/// a retryable 503. Generous: under contention a loser blocks until the winner's
-/// forward commits, then coalesces — `LockBusy` only fires if a winner's forward
-/// itself wedges past this.
-const REFRESH_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+/// How long a losing caller waits for the cross-process rotation flock before
+/// giving the guest a retryable 503. MUST exceed the winner's worst-case forward
+/// hold (the [`FORWARD_TIMEOUT`] total request timeout, which the winner holds the
+/// flock across) plus a margin for the commit write — otherwise a slow-but-healthy
+/// winner (Anthropic taking 20-30s) makes peers time out and 503 instead of
+/// coalescing on the winner's imminent commit. `LockBusy` should fire only when a
+/// winner's forward genuinely wedges past the timeout, not for normal slow latency.
+const REFRESH_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// Total request timeout for the vault's own upstream refresh POST (connect through
+/// response body). Bounds how long the flock is held; [`REFRESH_LOCK_WAIT`] is kept
+/// strictly larger so a waiter outlasts a healthy winner's forward.
+const FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const FORWARD_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Decides the refresh for the claude creds shape. `mapped_access` is the real
 /// access token this session is currently mapped to (the registry snapshot); a
@@ -542,7 +561,12 @@ fn coordinate_refresh(
     let guard = match store.begin(&decider) {
         Ok(Begin::Rotate(g)) => g,
         Ok(Begin::Coalesced(disk)) => return Coordinated::Coalesced { disk },
-        Ok(Begin::ReauthRequired(_)) => return Coordinated::Reauth,
+        Ok(Begin::ReauthRequired(reason)) => {
+            // The reason is secret-free by the Begin contract; log it (it explains
+            // WHY re-auth is forced: pending-in-flight vs missing tokens vs unreadable).
+            eprintln!("pillbox: vault: refresh requires re-auth: {reason}");
+            return Coordinated::Reauth;
+        }
         Ok(Begin::LockBusy) => return Coordinated::LockBusy,
         Err(e) => return Coordinated::Error(format!("begin: {e}")),
     };
@@ -574,8 +598,8 @@ fn coordinate_refresh(
     // stays set → re-auth), which is recoverable; a wedge is not.
     let client = match reqwest::blocking::Client::builder()
         .no_proxy()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(FORWARD_CONNECT_TIMEOUT)
+        .timeout(FORWARD_TIMEOUT)
         .build()
     {
         Ok(c) => c,
@@ -1859,19 +1883,29 @@ mod tests {
         ));
     }
 
-    /// One-shot local HTTP server: accepts a single connection, drains the request,
-    /// and replies with `status` + `body`. Stands in for the real `/oauth/token`
-    /// endpoint so the full forward→commit path is exercised without claude or the
-    /// network — the piece the live smoke couldn't pin down deterministically.
-    fn spawn_oauth_server(status: u16, body: serde_json::Value) -> String {
+    /// One-shot local HTTP server: accepts a single connection, CAPTURES the raw
+    /// request (so a test can assert what crossed the wire — the real token, not the
+    /// stub), and replies with `status` + `body`. Stands in for the real
+    /// `/oauth/token` endpoint so the full forward→commit path is exercised without
+    /// claude or the network. Returns `(url, captured_request_bytes)`; the capture is
+    /// populated by the time `coordinate_refresh` returns (the server reads the
+    /// request before writing the response that unblocks the caller).
+    fn spawn_oauth_server(
+        status: u16,
+        body: serde_json::Value,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let body = serde_json::to_vec(&body).unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_w = std::sync::Arc::clone(&captured);
         std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 8192];
-                let _ = stream.read(&mut buf); // drain request headers+body (small)
+                let mut buf = [0u8; 65536];
+                if let Ok(n) = stream.read(&mut buf) {
+                    *captured_w.lock().unwrap() = buf[..n].to_vec(); // headers + small body
+                }
                 let head = format!(
                     "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
@@ -1881,7 +1915,7 @@ mod tests {
                 let _ = stream.flush();
             }
         });
-        format!("http://127.0.0.1:{port}/v1/oauth/token")
+        (format!("http://127.0.0.1:{port}/v1/oauth/token"), captured)
     }
 
     fn expired_real_disk() -> serde_json::Value {
@@ -1895,7 +1929,7 @@ mod tests {
         // The success path: a real upstream 200 → commit the REAL rotated tokens to
         // the creds file (NOT a stub). This is the path the live smoke kept routing
         // around (legacy fallback) or failing early (consumed RT / env-proxy loop).
-        let url = spawn_oauth_server(
+        let (url, captured) = spawn_oauth_server(
             200,
             serde_json::json!({
                 "access_token": "REAL_NEW_ACCESS",
@@ -1920,6 +1954,18 @@ mod tests {
         assert!(
             matches!(out, Coordinated::Committed { .. }),
             "expected a real commit"
+        );
+        // THE core invariant: the REAL refresh token (read from disk under the lock)
+        // crossed the wire, and the guest's STUB did NOT. Without this assertion the
+        // body-swap could regress to forwarding the stub and every test still passes.
+        let sent = String::from_utf8_lossy(&captured.lock().unwrap()).into_owned();
+        assert!(
+            sent.contains("RT0"),
+            "real refresh token must be forwarded: {sent}"
+        );
+        assert!(
+            !sent.contains("sk-ant-ort01-stub"),
+            "the guest's stub must NOT be forwarded: {sent}"
         );
         // The creds file holds the REAL rotated tokens — not a stub.
         let disk: serde_json::Value =
@@ -1946,7 +1992,7 @@ mod tests {
         // loop signature), the loop-guard fails closed — NO commit, creds file
         // untouched. This is the exact corruption the live smoke produced.
         let stub = format!("sk-ant-oat01-{}", "0123456789abcdef".repeat(6)); // 96 hex
-        let url = spawn_oauth_server(
+        let (url, _captured) = spawn_oauth_server(
             200,
             serde_json::json!({
                 "access_token": stub,
@@ -1985,7 +2031,8 @@ mod tests {
         // A 2xx whose body carries no usable access token must FAIL CLOSED
         // (Coordinated::Error → 502 to the guest), NOT commit and NOT surface a
         // 200-with-error-body. Creds untouched.
-        let url = spawn_oauth_server(200, serde_json::json!({ "token_type": "Bearer" }));
+        let (url, _captured) =
+            spawn_oauth_server(200, serde_json::json!({ "token_type": "Bearer" }));
         let (dir, store) = store_on(expired_real_disk());
         let decider = ClaudeRefreshDecider {
             mapped_access: Some("AT0".into()),
@@ -2008,5 +2055,73 @@ mod tests {
             serde_json::from_slice(&std::fs::read(dir.path().join(".credentials.json")).unwrap())
                 .unwrap();
         assert_eq!(disk.pointer("/claudeAiOauth/accessToken").unwrap(), "AT0");
+    }
+
+    #[test]
+    fn forwardable_headers_drops_authorization_and_hop_by_hop() {
+        // The security-relevant drop list (a stub bearer + framing headers must NOT
+        // reach Anthropic) is otherwise unguarded — the stub server can't observe
+        // headers. This pins it as a pure in→out assertion.
+        let mut src = HeaderMap::new();
+        src.insert(
+            "authorization",
+            "Bearer sk-ant-oat01-stubLEAK".parse().unwrap(),
+        );
+        src.insert("connection", "keep-alive".parse().unwrap());
+        src.insert("transfer-encoding", "chunked".parse().unwrap());
+        src.insert("content-length", "999".parse().unwrap());
+        src.insert("accept-encoding", "gzip".parse().unwrap());
+        src.insert("host", "console.anthropic.com".parse().unwrap());
+        src.insert("content-type", "application/json".parse().unwrap());
+        src.insert("user-agent", "claude-code/1.2.3".parse().unwrap());
+
+        let out = forwardable_headers(&src);
+
+        for dropped in [
+            "authorization",
+            "connection",
+            "transfer-encoding",
+            "content-length",
+            "host",
+        ] {
+            assert!(out.get(dropped).is_none(), "{dropped} must be dropped");
+        }
+        // accept-encoding forced to identity (the blocking client can't gunzip).
+        assert_eq!(
+            out.get(reqwest::header::ACCEPT_ENCODING).unwrap(),
+            "identity"
+        );
+        // Safe headers survive.
+        assert_eq!(out.get("content-type").unwrap(), "application/json");
+        assert_eq!(out.get("user-agent").unwrap(), "claude-code/1.2.3");
+    }
+
+    #[tokio::test]
+    async fn apply_registry_rotation_advances_the_in_session_swap_map() {
+        // After a commit the in-memory registry must hold the new real tokens so the
+        // session's subsequent bearer swaps resolve the (stable) stub to the new
+        // access token — otherwise every API call 401s on a consumed token.
+        let (server, dir) = fresh_server().await;
+        let _lease = server
+            .lease("claude", "sbx-rot-reg", sample_anthropic_real())
+            .expect("lease");
+        let new_real = serde_json::json!({
+            "claudeAiOauth": { "accessToken": "ROTATED_A", "refreshToken": "ROTATED_R" },
+        });
+        apply_registry_rotation(server.inner_for_test(), "sbx-rot-reg", &new_real);
+        {
+            let registry = server.registry_lock_for_test();
+            let real = registry.real("sbx-rot-reg").unwrap();
+            assert_eq!(
+                real.pointer("/claudeAiOauth/accessToken").unwrap(),
+                "ROTATED_A"
+            );
+            assert_eq!(
+                real.pointer("/claudeAiOauth/refreshToken").unwrap(),
+                "ROTATED_R"
+            );
+        }
+        drop(_lease);
+        cleanup(server, dir);
     }
 }

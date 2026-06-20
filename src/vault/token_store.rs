@@ -9,8 +9,10 @@
 //! `/oauth/token` request, which the in-proxy handler intercepts and forwards. The
 //! store's job is to make sure exactly one such forward happens across all
 //! concurrent sessions sharing an account, and that the rest coalesce on its
-//! result. Wiring the handlers through it is the next step; until then nothing in
-//! the run path calls it.
+//! result. The docker `claude` provider wires its `/oauth/token` refresh through
+//! [`TokenStore::begin`]/[`RotateGuard`], and `VaultSession` teardown through
+//! [`TokenStore::persist_if`]; `libkrun` and `codex` are not yet wired (their
+//! refresh stays uncoordinated — the open follow-up).
 //!
 //! ## The invariant that makes it correct
 //!
@@ -26,10 +28,6 @@
 //! holder, no handler ever re-sends a token that may already be consumed: an
 //! ambiguous outcome (request sent, result unknown) resolves to **re-auth, not
 //! retry**.
-
-// Until the in-proxy handlers are wired through this (next increment), the type is
-// only exercised by its own tests.
-#![allow(dead_code)]
 
 use std::fs;
 use std::io;

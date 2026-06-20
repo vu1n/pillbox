@@ -4,7 +4,9 @@
 //! one `run` invocation. Drop order is intentional:
 //!  1. `lease` — removes the stub mapping from the server registry.
 //!  2. `server` — sends graceful-shutdown signal to the proxy task.
-//!  3. `runtime` — aborts any remaining tasks, frees resources.
+//!  3. `runtime` — aborts async tasks + frees resources, but WAITS for any
+//!     in-flight `spawn_blocking` task (an in-proxy refresh forward) to finish,
+//!     since blocking tasks can't be cancelled (intentional — see the field note).
 //!  4. `stub_file` — deletes the temp file holding the stub JSON.
 
 use std::{
@@ -60,7 +62,11 @@ pub(crate) struct VaultSession {
     // Drop order matters — see module doc. `api_key_leases` and
     // `oauth_mounts` both hold `SandboxLease`s that remove their entries
     // from the server registry on drop; `_server` then signals proxy
-    // shutdown; `_runtime` aborts any remaining tasks last.
+    // shutdown; `_runtime` is dropped last. Note: dropping the runtime ABORTS
+    // async tasks but WAITS for any in-flight `spawn_blocking` task (e.g. an
+    // in-proxy refresh forward) to finish — those can't be cancelled. Teardown
+    // therefore blocks up to the forward timeout if a refresh is mid-flight; that
+    // is intentional (abandoning a mid-commit refresh could leave torn state).
     api_key_leases: Vec<SandboxLease>,
     oauth_mounts: Vec<OAuthMount>,
     server: Server,

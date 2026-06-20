@@ -151,6 +151,63 @@ pub(crate) fn pre_refresh(creds_path: &Path, agent_id: &str) -> Result<Option<Va
     }
 }
 
+/// JIT broker refresh for the libkrun in-VMM MITM. Runs the coordinated, at-most-once
+/// [`pre_refresh`] (rotate the shared token, or coalesce onto a peer's rotation), then
+/// reads the now-current real access token + its expiry back out. The MITM child calls
+/// this near expiry, off its poll loop, and splices the returned token into the live
+/// swap — so the wire token stays fresh for arbitrarily long sessions without the guest
+/// ever refreshing. Reuses `pre_refresh` verbatim, so the single-writer / at-most-once /
+/// fail-closed invariants are identical to the start-of-run broker refresh; this only
+/// adds the read-back of what `pre_refresh` already established.
+#[cfg(feature = "libkrun")]
+pub(crate) fn broker_jit_refresh(creds_path: &Path, agent_id: &str) -> Result<(String, u64)> {
+    let creds = pre_refresh(creds_path, agent_id)?.ok_or_else(|| {
+        // Reached only if a non-broker agent_id were scheduled — but the caller gates on
+        // `broker_expiry`, which is None for those. Fail closed rather than guess.
+        PillboxError::runtime(
+            "vault",
+            format!("no broker refresh decider for `{agent_id}`"),
+        )
+    })?;
+    let access = ClaudeRefreshDecider
+        .access_token(&creds)
+        .ok_or_else(|| PillboxError::runtime("vault", "refreshed creds missing access token"))?;
+    let expires_at_ms = claude_expiry_ms(&creds)
+        .ok_or_else(|| PillboxError::runtime("vault", "refreshed creds missing expiry"))?;
+    Ok((access, expires_at_ms))
+}
+
+/// The real access-token expiry (unix ms, seconds-normalized) the broker JIT driver
+/// schedules against, or `None` for a non-broker agent (disables JIT) or creds without
+/// a usable expiry. Reads the LIVE creds file — the guest sees a post-dated stub copy,
+/// but the host file keeps the true expiry the rotation must track.
+#[cfg(feature = "libkrun")]
+pub(crate) fn broker_expiry(creds_path: &Path, agent_id: &str) -> Option<u64> {
+    if agent_id != "claude" {
+        return None;
+    }
+    let text = std::fs::read_to_string(creds_path).ok()?;
+    let creds: Value = serde_json::from_str(&text).ok()?;
+    claude_expiry_ms(&creds)
+}
+
+/// `claudeAiOauth.expiresAt` normalized to unix ms (handles seconds-encoded values, as
+/// [`is_expired`] does). The broker is Claude-only today; this generalizes through the
+/// decider when another provider joins.
+#[cfg(feature = "libkrun")]
+fn claude_expiry_ms(creds: &Value) -> Option<u64> {
+    creds
+        .pointer("/claudeAiOauth/expiresAt")
+        .and_then(|v| v.as_u64())
+        .map(|ts| {
+            if ts < SECONDS_BOUNDARY_MS {
+                ts.saturating_mul(1000)
+            } else {
+                ts
+            }
+        })
+}
+
 /// We won the race: POST the refresh grant exactly once, then resolve the guard.
 /// The branch in [`post_refresh`] that we reach decides which resolution the
 /// at-most-once invariant permits.

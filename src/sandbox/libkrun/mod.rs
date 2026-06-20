@@ -43,6 +43,7 @@ mod boot;
 mod egress;
 mod host;
 mod http;
+mod jit_refresh;
 mod local_forward;
 mod mitm;
 mod session;
@@ -151,6 +152,27 @@ struct EgressSpec {
     /// is requested. `None` = no forward. See [`super::local_forward`].
     #[serde(default)]
     local_forward_port: Option<u16>,
+    /// Broker JIT refresh: when set, the in-VMM MITM rotates the real OAuth token near
+    /// its expiry (the guest never refreshes — far-future stub expiry) and splices the
+    /// fresh token into the live swap, so a session outliving the token lifetime keeps
+    /// working. Non-secret (a path + agent id + the public access stub); the real token
+    /// is read host-side by the child. `None` = no JIT (non-vault / non-broker agent).
+    #[serde(default)]
+    refresh: Option<RefreshSpec>,
+}
+
+/// Serde form of the broker-JIT context handed to the VMM child in the spec file
+/// (paths/ids only — never a secret; the child reads the real token host-side from
+/// `creds_path` and it stays in the child's memory + the MITM swap). Converted to
+/// [`jit_refresh::RefreshCtx`] in the child.
+#[derive(Serialize, Deserialize, Clone)]
+struct RefreshSpec {
+    /// The LIVE host creds file (not the stubbed guest clone) the child rotates + reads
+    /// the fresh token back from, coordinated via the shared `TokenStore`.
+    creds_path: String,
+    auth_id: String,
+    /// The public access-token stub identifying which swap pair to keep fresh.
+    access_stub: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -269,6 +291,7 @@ pub(crate) fn vmm_child_main() -> ! {
         ca_dir: Option<String>,
         log_path: Option<String>,
         local_forward_port: Option<u16>,
+        refresh: Option<RefreshSpec>,
     }
     let net: Option<NetAttach> = spec.egress.as_ref().map(|e| {
         let mut fds = [0 as c_int; 2];
@@ -286,6 +309,7 @@ pub(crate) fn vmm_child_main() -> ! {
             ca_dir: e.ca_dir.clone(),
             log_path: e.log_path.clone(),
             local_forward_port: e.local_forward_port,
+            refresh: e.refresh.clone(),
         }
     });
     // Read the stub→real credential pairs the parent pipes on stdin (the env-fork
@@ -353,6 +377,11 @@ pub(crate) fn vmm_child_main() -> ! {
                     swap_pairs,
                     n.log_path,
                     n.local_forward_port,
+                    n.refresh.map(|r| jit_refresh::RefreshCtx {
+                        creds_path: r.creds_path.into(),
+                        auth_id: r.auth_id,
+                        access_stub: r.access_stub.into_bytes(),
+                    }),
                 )
             });
         }
@@ -451,22 +480,25 @@ fn stub_oauth_creds(
     home: &Path,
     spec: &AgentSpec,
     hosts: &[String],
-) -> Result<(PathBuf, Vec<SwapPair>)> {
+) -> Result<(PathBuf, Vec<SwapPair>, Option<String>)> {
     let clone = cow_clone_home(home)?;
     let mut pairs = Vec::new();
+    let mut access_stub = None;
     let creds_file = clone.join(spec.cred_sentinel);
     if let Ok(text) = std::fs::read_to_string(&creds_file) {
         if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&text) {
             // Each provider lays its OAuth tokens out differently, so dispatch on
             // the agent's owning provider (the same key `oauth_swap_hosts` uses) to
             // stub the right fields. An unhandled shape stubs nothing → the launch
-            // guard ([`env_fork_left_real_unstubbed`]) refuses to leak it.
-            let stubbed = match spec.auth_id {
+            // guard ([`env_fork_left_real_unstubbed`]) refuses to leak it. Returns the
+            // access-token stub (when present) so broker JIT refresh can mark which
+            // swap pair to keep fresh.
+            access_stub = match spec.auth_id {
                 "claude" => stub_claude_oauth(&mut json, hosts, &mut pairs),
                 "codex" => stub_codex_oauth(&mut json, hosts, &mut pairs),
-                _ => false,
+                _ => None,
             };
-            if stubbed {
+            if !pairs.is_empty() {
                 let body = serde_json::to_string(&json).context("reserialize stubbed creds")?;
                 // The clone's file is already 0600 (clonefile preserves perms) and
                 // `write` truncates in place without changing them.
@@ -474,23 +506,23 @@ fn stub_oauth_creds(
             }
         }
     }
-    Ok((clone, pairs))
+    Ok((clone, pairs, access_stub))
 }
 
 /// Stub claude's `claudeAiOauth.{accessToken,refreshToken}` in place, pushing one
-/// host-bound swap pair per token. Returns whether anything was stubbed.
+/// host-bound swap pair per token. Returns the **access-token** stub (when one was
+/// stubbed) so broker JIT refresh can identify its swap pair; `None` if nothing stubbed
+/// (or no access token present).
 fn stub_claude_oauth(
     json: &mut serde_json::Value,
     hosts: &[String],
     pairs: &mut Vec<SwapPair>,
-) -> bool {
-    let Some(oauth) = json
+) -> Option<String> {
+    let oauth = json
         .get_mut("claudeAiOauth")
-        .and_then(|v| v.as_object_mut())
-    else {
-        return false;
-    };
+        .and_then(|v| v.as_object_mut())?;
     let mut stubbed = false;
+    let mut access_stub = None;
     for field in ["accessToken", "refreshToken"] {
         let real = oauth
             .get(field)
@@ -500,6 +532,9 @@ fn stub_claude_oauth(
         if let Some(real) = real {
             let stub = mint_oauth_stub(&real);
             oauth.insert(field.to_string(), serde_json::Value::String(stub.clone()));
+            if field == "accessToken" {
+                access_stub = Some(stub.clone());
+            }
             pairs.push(SwapPair {
                 stub,
                 real,
@@ -521,7 +556,7 @@ fn stub_claude_oauth(
             )),
         );
     }
-    stubbed
+    access_stub
 }
 
 /// Stub codex's ChatGPT-mode `tokens.{access_token,refresh_token}` in place. The
@@ -535,12 +570,10 @@ fn stub_codex_oauth(
     json: &mut serde_json::Value,
     hosts: &[String],
     pairs: &mut Vec<SwapPair>,
-) -> bool {
+) -> Option<String> {
     use crate::vault::providers::codex::{STUB_ACCESS_PREFIX, STUB_REFRESH_PREFIX};
-    let Some(tokens) = json.get_mut("tokens").and_then(|v| v.as_object_mut()) else {
-        return false;
-    };
-    let mut stubbed = false;
+    let tokens = json.get_mut("tokens").and_then(|v| v.as_object_mut())?;
+    let mut access_stub = None;
     for (field, prefix) in [
         ("access_token", STUB_ACCESS_PREFIX),
         ("refresh_token", STUB_REFRESH_PREFIX),
@@ -553,15 +586,20 @@ fn stub_codex_oauth(
         if let Some(real) = real {
             let stub = mint_curated_stub(prefix);
             tokens.insert(field.to_string(), serde_json::Value::String(stub.clone()));
+            if field == "access_token" {
+                access_stub = Some(stub.clone());
+            }
             pairs.push(SwapPair {
                 stub,
                 real,
                 hosts: hosts.to_vec(),
             });
-            stubbed = true;
         }
     }
-    stubbed
+    // Codex has no broker decider yet (`broker_expiry` → None disables its JIT), but the
+    // access stub is returned for symmetry with claude; the launch path builds a refresh
+    // spec only when there's an access stub, and the child no-ops it for codex.
+    access_stub
 }
 
 /// A curated-prefix stub `<prefix>pllbxstub<uuid>` for a token whose real bytes
@@ -809,7 +847,7 @@ mod tests {
         });
         let hosts = vec!["api.anthropic.com".to_string()];
         let mut pairs = Vec::new();
-        assert!(stub_claude_oauth(&mut json, &hosts, &mut pairs));
+        let access_stub = stub_claude_oauth(&mut json, &hosts, &mut pairs);
 
         let oauth = json.get("claudeAiOauth").unwrap();
         // Broker move: the guest-mounted stub is post-dated to year 2100 so the agent
@@ -825,6 +863,9 @@ mod tests {
         assert!(access.starts_with("sk-ant-oat01-") && access != real_access);
         assert!(refresh.starts_with("sk-ant-ort01-") && refresh != real_refresh);
         assert!(!access.contains("REALACCESSBODY") && !refresh.contains("REALREFRESHBODY"));
+        // The returned access stub is exactly the file's accessToken stub — what broker
+        // JIT refresh keys on to find the swap pair to keep fresh.
+        assert_eq!(access_stub.as_deref(), Some(access));
         // …and the real values live ONLY in the out-of-band swap pairs.
         assert!(pairs.iter().any(|p| p.real == real_access));
         assert!(pairs.iter().any(|p| p.real == real_refresh));
@@ -988,10 +1029,13 @@ mod tests {
         });
         let mut pairs = Vec::new();
         let hosts = vec!["chatgpt.com".to_string()];
-        assert!(stub_codex_oauth(&mut json, &hosts, &mut pairs));
+        let access_stub = stub_codex_oauth(&mut json, &hosts, &mut pairs);
 
         let tokens = &json["tokens"];
         let stub_access = tokens["access_token"].as_str().unwrap();
+        // The returned access stub is the file's access_token stub (codex has no broker
+        // decider yet, so it's unused for JIT, but the contract matches claude).
+        assert_eq!(access_stub.as_deref(), Some(stub_access));
         let stub_refresh = tokens["refresh_token"].as_str().unwrap();
         assert!(stub_access.starts_with("pb-codex-oat-"), "{stub_access}");
         assert!(stub_refresh.starts_with("pb-codex-ort-"), "{stub_refresh}");
@@ -1017,11 +1061,7 @@ mod tests {
         // launch guard fires (codex --vault is rejected for ApiKey mode anyway).
         let mut json = serde_json::json!({ "OPENAI_API_KEY": "sk-real" });
         let mut pairs = Vec::new();
-        assert!(!stub_codex_oauth(
-            &mut json,
-            &["chatgpt.com".into()],
-            &mut pairs
-        ));
+        assert!(stub_codex_oauth(&mut json, &["chatgpt.com".into()], &mut pairs).is_none());
         assert!(pairs.is_empty());
     }
 

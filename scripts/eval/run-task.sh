@@ -17,7 +17,7 @@
 #      MAX_WAIT (seconds to wait for the turn, default 120).
 set -euo pipefail
 
-u="usage: run-task.sh <task-dir|frozen-bookmark> <baseline|memory>"
+u="usage: run-task.sh <task-dir|frozen-bookmark> <baseline|memory|kypp-briefing>"
 task_ref="${1:?$u}"
 condition="${2:?$u}"
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -49,13 +49,21 @@ task="$(basename "$task_ref")"
 
 # `condition` selects the injected profile (prepended to the prompt):
 #   baseline           → nothing
-#   memory             → memory/playbook.md (the curated bullets)
+#   memory             → memory/playbook.md (the curated, hand-rolled bullets)
+#   kypp-briefing      → live `kypp briefing` for $KYPP_PROJECT — the kypp memory arm:
+#                        same injection seam, dynamic source. Needs `kypp` on PATH and a
+#                        seeded store (KYPP_MEMORY_DB); the brief is the ablation's rung 3.
 #   <path to a file>   → that file (the meta-harness injects candidate profiles)
 prompt="$(cat "$task_dir/prompt.txt")"
 profile=""
+kypp_tmp=""
 case "$condition" in
   baseline) : ;;
   memory)   profile="$here/memory/playbook.md" ;;
+  kypp-briefing)
+    kypp_tmp="$(mktemp)"
+    kypp briefing --project "${KYPP_PROJECT:-aider}" >"$kypp_tmp" 2>/dev/null
+    profile="$kypp_tmp" ;;
   *)        profile="$condition" ;;
 esac
 if [ -n "$profile" ] && [ -f "$profile" ]; then
@@ -66,7 +74,7 @@ fi
 # of THIS dir, so each run must start from a pristine tree). The agent sees ONLY
 # task/workspace/ — never task/grader/, so it can't read the test and hardcode.
 ws="$(mktemp -d)"
-trap 'rm -rf "$ws" "$frozen"' EXIT
+trap 'rm -rf "$ws" "$frozen" "$kypp_tmp"' EXIT
 cp -R "$task_dir/workspace/." "$ws"/
 
 # MODEL (provider/modelID) overrides opencode's default — set it to a capable

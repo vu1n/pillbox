@@ -31,8 +31,8 @@ use crate::workspace::WorkspaceBackend;
 use super::{
     boot, cow_clone_and_scrub, cow_clone_home, disk_headroom, egress, env_fork_left_real_unstubbed,
     http, krun_cache_dir, materialize_rootfs, oauth_swap_hosts, runtime_deps_present, shell_quote,
-    stub_oauth_creds, unsupported, EgressSpec, LibkrunBackend, Share, SwapPair, VmSpec,
-    VsockAttach, GUEST_CA_PATH, MIN_HEADROOM_BYTES,
+    stub_oauth_creds, unsupported, EgressSpec, LibkrunBackend, RefreshSpec, Share, SwapPair,
+    VmSpec, VsockAttach, GUEST_CA_PATH, MIN_HEADROOM_BYTES,
 };
 
 impl SandboxBackend for LibkrunBackend {
@@ -501,7 +501,7 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
         crate::vault::pre_refresh(&home.join(spec.cred_sentinel), spec.auth_id)?;
     }
 
-    let (creds_share, mut swap_pairs) = stub_oauth_creds(&home, spec, &oauth_hosts)?;
+    let (creds_share, mut swap_pairs, access_stub) = stub_oauth_creds(&home, spec, &oauth_hosts)?;
     // Fail loud: a vault-capable agent whose credentials file produced no stubs
     // would mount the real token into the guest unstubbed (exfiltratable by a
     // prompt-injected agent). Refuse to launch rather than leak. Generalizing the
@@ -526,6 +526,18 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
             w.host
         })
         .collect();
+
+    // Broker JIT refresh context for the in-VMM MITM: rotate the access token near its
+    // expiry mid-session (the guest never refreshes — far-future stub expiry) so a
+    // session outliving the token lifetime (~8h) doesn't 401 with no recovery. Built only
+    // when the env-fork produced an access-token stub; the child arms JIT only for an
+    // agent with a broker decider (`broker_expiry`, claude today) and no-ops it otherwise.
+    // Non-secret: the child reads the real token from the live creds file host-side.
+    let refresh = access_stub.map(|stub| RefreshSpec {
+        creds_path: home.join(spec.cred_sentinel).to_string_lossy().into_owned(),
+        auth_id: spec.auth_id.to_string(),
+        access_stub: stub,
+    });
 
     // The guest boot script: env exports, NIC + CA + workspace mount, then exec
     // the agent under the in-guest pty-host (Frame over vsock). Written into the
@@ -610,6 +622,7 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
             log_path: std::env::var("PILLBOX_KRUN_EGRESS_LOG").ok(),
             ca_dir: Some(ca.dir.to_string_lossy().into_owned()),
             local_forward_port: None, // vaulted agents: no local-model forward
+            refresh,
         }),
     };
     let spec_file = tempfile::Builder::new()
@@ -856,6 +869,7 @@ fn launch_server_vm(
             log_path: std::env::var("PILLBOX_KRUN_EGRESS_LOG").ok(),
             ca_dir: Some(ca.dir.to_string_lossy().into_owned()),
             local_forward_port: launch.local_forward_port,
+            refresh: None, // opencode server mode: non-vault, holds its own real key
         }),
     };
     let spec_file = tempfile::Builder::new()
@@ -1256,6 +1270,7 @@ pub(crate) fn score_in_sandbox(
             log_path: std::env::var("PILLBOX_KRUN_EGRESS_LOG").ok(),
             ca_dir: Some(ca.dir.to_string_lossy().into_owned()),
             local_forward_port: None, // grader: tightest fence, no local forward
+            refresh: None,            // grader holds no credentials — nothing to refresh
         });
         // Point every TLS client at the single MITM CA cert. pip/curl/openssl/
         // requests ignore the system store by default; Node reads NODE_EXTRA_CA_CERTS.

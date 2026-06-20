@@ -111,7 +111,7 @@ impl PinTable {
 pub(super) struct Diag(Option<Mutex<std::fs::File>>);
 
 impl Diag {
-    fn open(path: Option<String>) -> Self {
+    pub(super) fn open(path: Option<String>) -> Self {
         Self(
             path.and_then(|p| {
                 std::fs::OpenOptions::new()
@@ -143,11 +143,18 @@ pub(super) fn run(
     fd: c_int,
     allowlist: Vec<String>,
     ca_dir: Option<String>,
-    swap_pairs: Vec<CredSwap>,
+    mut swap_pairs: Vec<CredSwap>,
     diag_path: Option<String>,
     local_forward_port: Option<u16>,
+    refresh: Option<super::jit_refresh::RefreshCtx>,
 ) {
     let diag = Diag::open(diag_path);
+    // Broker JIT refresh: when armed, rotate the real OAuth token near its expiry and
+    // splice the fresh one into `swap_pairs` mid-session, so a session outliving the
+    // token lifetime (~8h) keeps working without the guest ever refreshing. Armed only
+    // for an agent with a broker decider whose access stub matches a live swap pair.
+    let mut refresher =
+        refresh.and_then(|ctx| super::jit_refresh::RefreshDriver::arm(ctx, &swap_pairs, &diag));
     let vault = match ca_dir {
         Some(dir) => match Vault::new(&dir, allowlist.clone()) {
             Ok(v) => Some(v),
@@ -210,6 +217,13 @@ pub(super) fn run(
     ));
 
     loop {
+        if let Some(r) = refresher.as_mut() {
+            // Drive the broker JIT refresh before the MITM reads `swap_pairs` this tick
+            // (sequential borrows — the mutate completes before `drive_listeners`'
+            // shared read below). Connections that pin a fresh SNI after a rotation pick
+            // up the rotated `real`.
+            r.drive(&mut swap_pairs, &diag);
+        }
         iface.poll(now(start), &mut device, &mut sockets);
         serve_dns(
             sockets.get_mut::<udp::Socket>(dns),

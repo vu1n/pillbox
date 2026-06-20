@@ -45,6 +45,10 @@ pub(crate) const PASSWORD_FILE: &str = "repo-password";
 /// Only meaningful for [`RusticVariant::Local`].
 pub(crate) const REPO_DIR: &str = "repo";
 
+/// Directory name of the rustic cache inside the state dir. Only used by
+/// [`RusticVariant::S3`] — see [`RusticBackend::repo_opts`].
+pub(crate) const CACHE_DIR: &str = "cache";
+
 /// Length of the auto-generated repository password (alphanumeric).
 /// 32 chars * log2(62) ≈ 190 bits, comfortably above the 128-bit floor
 /// needed to make brute-forcing rustic's key-derivation infeasible.
@@ -136,7 +140,7 @@ impl RusticBackend {
         }
 
         let backends = self.backends()?;
-        let repo_opts = RepositoryOptions::default().no_cache(true);
+        let repo_opts = self.repo_opts();
         let repo =
             Repository::new(&repo_opts, &backends).map_err(|e| rustic_err("workspace init", e))?;
         // `config_id()` is a cheap backend HEAD on the repo config blob
@@ -189,6 +193,35 @@ impl RusticBackend {
         Ok(s.trim_end().to_string())
     }
 
+    /// Build the [`RepositoryOptions`] for this variant.
+    ///
+    /// Local repos run with the cache OFF: rustic's cache mirrors the
+    /// index + pack metadata to a second on-disk location, but a local
+    /// repo's backend already IS local disk, so caching only amplifies
+    /// writes for zero latency gain. S3 repos run with the cache ON,
+    /// anchored under the per-pillbox state dir, so repeated host-side
+    /// opens (push/pull/list) don't re-fetch the index from the bucket
+    /// every time. The cache is content-addressed + immutable, so there's
+    /// no staleness risk and it's safe under concurrent (swarm) access.
+    ///
+    /// scrypt key derivation is paid on every `open()` regardless — the
+    /// cache only saves index/pack fetches, never the key.
+    fn repo_opts(&self) -> RepositoryOptions {
+        let base = RepositoryOptions::default();
+        match &self.variant {
+            RusticVariant::Local { .. } => base.no_cache(true),
+            // Anchor the cache under the state dir (where the password
+            // file lives) so it's scoped + cleanable, not scattered into
+            // rustic's global XDG cache. If there's no parent to anchor
+            // under — vanishingly rare — fall back to cache-off rather
+            // than leak a cache elsewhere.
+            RusticVariant::S3(_) => match self.password_file.parent() {
+                Some(state_dir) => base.cache_dir(state_dir.join(CACHE_DIR)),
+                None => base.no_cache(true),
+            },
+        }
+    }
+
     /// Build the [`rustic_backend::BackendOptions`] for this variant.
     fn backends(&self) -> Result<rustic_core::RepositoryBackends> {
         match &self.variant {
@@ -227,7 +260,7 @@ impl RusticBackend {
     fn open(&self) -> Result<rustic_core::Repository<rustic_core::OpenStatus>> {
         let password = self.read_password()?;
         let backends = self.backends()?;
-        let repo_opts = RepositoryOptions::default().no_cache(true);
+        let repo_opts = self.repo_opts();
         let repo =
             Repository::new(&repo_opts, &backends).map_err(|e| rustic_err("workspace open", e))?;
         let opened = repo
@@ -472,7 +505,7 @@ impl WorkspaceBackend for RusticBackend {
         // then atomically swap the on-disk file.
         let old = self.read_password()?;
         let backends = self.backends()?;
-        let repo_opts = RepositoryOptions::default().no_cache(true);
+        let repo_opts = self.repo_opts();
         let repo = Repository::new(&repo_opts, &backends)
             .map_err(|e| rustic_err("workspace rekey", e))?
             .open(&Credentials::password(&old))
@@ -1066,6 +1099,39 @@ mod tests {
         let pw = generate_password();
         assert_eq!(pw.len(), PASSWORD_LEN);
         assert!(pw.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn repo_opts_caches_s3_under_state_dir_but_not_local() {
+        // Local: cache OFF — caching a local-disk repo into a second
+        // local dir is pure write amplification (see repo_opts docs).
+        let local = RusticBackend {
+            variant: RusticVariant::Local {
+                repo_path: PathBuf::from("/x/repo"),
+            },
+            password_file: PathBuf::from("/x/repo-password"),
+        };
+        let lo = local.repo_opts();
+        assert!(lo.no_cache, "local repo must run cache-off");
+        assert!(lo.cache_dir.is_none());
+
+        // S3: cache ON, anchored at <state-dir>/cache so it's scoped to
+        // the pillbox, not scattered into rustic's global XDG dir.
+        let s3 = RusticBackend {
+            variant: RusticVariant::S3(S3Config {
+                endpoint: "https://e".into(),
+                region: "auto".into(),
+                bucket: "b".into(),
+                prefix: String::new(),
+                access_key: "k".into(),
+                secret_key: "s".into(),
+                session_token: None,
+            }),
+            password_file: PathBuf::from("/state/repo-password"),
+        };
+        let so = s3.repo_opts();
+        assert!(!so.no_cache, "s3 repo must run cache-on");
+        assert_eq!(so.cache_dir.as_deref(), Some(Path::new("/state/cache")));
     }
 
     #[test]

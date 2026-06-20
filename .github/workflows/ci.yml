@@ -94,14 +94,16 @@ jobs:
             build-essential pkg-config clang lld libclang-dev llvm-dev \
             libcap-ng-dev flex bison libelf-dev bc libssl-dev patchelf python3
           tmp="$(mktemp -d)"
+          # `cd && make`, NOT `make -C`: -C implies --print-directory (-w), which
+          # lands in MAKEFLAGS, and libkrunfw forwards $(MAKEFLAGS) verbatim to the
+          # kernel build → a bare `w` becomes a bogus `make` target.
           git clone --depth 1 --branch "$LIBKRUNFW_VERSION" \
             https://github.com/containers/libkrunfw "$tmp/libkrunfw"
-          make -C "$tmp/libkrunfw" -j"$(nproc)"
-          sudo make -C "$tmp/libkrunfw" install
+          ( cd "$tmp/libkrunfw" && make -j"$(nproc)" && sudo make install )
+          sudo ldconfig
           git clone --depth 1 --branch "$LIBKRUN_VERSION" \
             https://github.com/containers/libkrun "$tmp/libkrun"
-          make -C "$tmp/libkrun" -j"$(nproc)"
-          sudo make -C "$tmp/libkrun" install
+          ( cd "$tmp/libkrun" && make -j"$(nproc)" && sudo make install )
       - name: Refresh linker cache
         run: sudo ldconfig "$LIBKRUN_LIB_DIR"
       # ubuntu-latest ships /dev/kvm; hand it to the runner user so libkrun can

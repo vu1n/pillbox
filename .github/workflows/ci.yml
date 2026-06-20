@@ -105,8 +105,22 @@ jobs:
           git clone --depth 1 --branch "$LIBKRUN_VERSION" \
             https://github.com/containers/libkrun "$tmp/libkrun"
           ( cd "$tmp/libkrun" && make -j"$(nproc)" && sudo make install )
-      - name: Refresh linker cache
-        run: sudo ldconfig "$LIBKRUN_LIB_DIR"
+      - name: Link libkrun for the toolchain
+        # `-lkrun` needs the bare libkrun.so; `make install` ships only the
+        # versioned soname (libkrun.so.N[.M.P]), and ldconfig makes the runtime
+        # soname symlink but not the linker one. Create it (for both libs), then
+        # refresh ldconfig. NOT gated on the build step, so it also fixes a
+        # restored cache (which holds the versioned libs without the symlink).
+        run: |
+          set -eux
+          for stem in libkrun libkrunfw; do
+            if [ ! -e "$LIBKRUN_LIB_DIR/$stem.so" ]; then
+              so="$(ls "$LIBKRUN_LIB_DIR/$stem".so.* 2>/dev/null | sort -V | tail -1)"
+              [ -n "$so" ] && sudo ln -sf "$so" "$LIBKRUN_LIB_DIR/$stem.so"
+            fi
+          done
+          sudo ldconfig "$LIBKRUN_LIB_DIR"
+          ls -la "$LIBKRUN_LIB_DIR"/libkrun*
       # ubuntu-latest ships /dev/kvm; hand it to the runner user so libkrun can
       # create a VM. Non-VM unit tests don't need it, but the smoke does.
       - name: Enable KVM

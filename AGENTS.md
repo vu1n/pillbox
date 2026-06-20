@@ -7,20 +7,23 @@ screen and documents every command an agent might need to run.
 If you're a human, the README is friendlier. If you're an agent, this is
 what you want.
 
-> **⚠️ Direction note — ONE backend: libkrun. Docker is DEPRECATED.**
-> **libkrun** (a local microVM) is *the* backend and **the default build**. All
-> work targets it. **Docker is deprecated and on the path to deletion** — NOT a
-> co-equal backend, NOT held to parity, and it gets **no new features and no
+> **⚠️ Direction note — ONE backend, a local microVM. Docker is DEPRECATED.**
+> The backend is **a single local microVM**. **libkrun** is the current impl (the
+> default build; macOS/HVF only today). **QEMU is under evaluation as the
+> cross-platform single backend** (Mac+Linux+CI via HVF/KVM/TCG) and may replace
+> libkrun — the microVM model and the vault/egress/§0 plumbing are shared, only the
+> VMM launcher differs. **Docker is deprecated and on the path to deletion** — NOT
+> a co-equal backend, NOT held to parity, and it gets **no new features and no
 > bug-fix engineering**. Do not propose, build, or "also do" a docker version of
 > anything. Do not defend docker with "it's cheap" / "cross-platform" / "the
 > CF-container twin" — that framing repeatedly wasted the maintainer's time and is
 > banned. A docker-only bug's resolution is "docker is deprecated," not a fix.
 >
-> **Core swarm primitives belong on libkrun.** pillbox exists for an independent
-> orchestrator to spawn **swarms** — so `sandbox spawn/exec/agent` and
+> **Core swarm primitives belong on the microVM backend.** pillbox exists for an
+> independent orchestrator to spawn **swarms** — so `sandbox spawn/exec/agent` and
 > `session send` are CORE, not optional. Anything that currently lives only on
-> docker is a **bug to fix by porting to libkrun** (top of the backlog), never a
-> reason to keep docker alive.
+> docker is a **bug to fix by porting to the microVM backend** (top of the
+> backlog), never a reason to keep docker alive.
 >
 > The **remote** backend plane was removed (`remote add/list/info/rm`,
 > `pillbox run --remote`, the `ssh://`/`e2b://`/`docker://` URL backends are gone).

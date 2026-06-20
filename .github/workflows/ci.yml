@@ -60,7 +60,10 @@ jobs:
       # local install.
       LIBKRUNFW_VERSION: v5.3.0
       LIBKRUN_VERSION: v1.18.1
-      LIBKRUN_LIB_DIR: /usr/local/lib
+      # Linux libkrun/libkrunfw install to PREFIX/lib64 (LIBDIR_Linux=lib64 in
+      # their Makefiles) — NOT lib (that's the Darwin libdir). build.rs's link
+      # search, the cache path, and ldconfig must all point here.
+      LIBKRUN_LIB_DIR: /usr/local/lib64
     steps:
       - uses: actions/checkout@v4
       - name: Install rust
@@ -81,8 +84,9 @@ jobs:
         id: libkrun-cache
         uses: actions/cache@v4
         with:
-          path: /usr/local/lib/libkrun*
-          key: libkrun-${{ env.LIBKRUNFW_VERSION }}-${{ env.LIBKRUN_VERSION }}-${{ runner.os }}
+          path: /usr/local/lib64/libkrun*
+          # `-lib64` busts the prior key, which cached an empty /usr/local/lib.
+          key: libkrun-${{ env.LIBKRUNFW_VERSION }}-${{ env.LIBKRUN_VERSION }}-lib64-${{ runner.os }}
       - name: Build libkrun + libkrunfw from source
         if: steps.libkrun-cache.outputs.cache-hit != 'true'
         run: |
@@ -120,7 +124,7 @@ jobs:
             fi
           done
           sudo ldconfig "$LIBKRUN_LIB_DIR"
-          ls -la "$LIBKRUN_LIB_DIR"/libkrun*
+          ls -la "$LIBKRUN_LIB_DIR"/libkrun* || true
       # ubuntu-latest ships /dev/kvm; hand it to the runner user so libkrun can
       # create a VM. Non-VM unit tests don't need it, but the smoke does.
       - name: Enable KVM

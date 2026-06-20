@@ -34,13 +34,17 @@ jobs:
           # OS so we don't re-fetch every crate.
           restore-keys: |
             ${{ runner.os }}-cargo-
+      # `--no-default-features` = the toolchain-free build (docker backend + the
+      # backend-agnostic core), so this job needs no libkrun toolchain. libkrun
+      # itself is covered by the dedicated `libkrun` job. Default is now libkrun,
+      # so a plain `cargo test` here would try (and fail) to link it.
       # Lint+format gates are platform-independent; only run them once
       # (on ubuntu) to save macOS minutes (~10x cost).
       - if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --check
-      - run: cargo test --all-targets
+      - run: cargo test --no-default-features --all-targets
       - if: matrix.os == 'ubuntu-latest'
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --no-default-features --all-targets -- -D warnings
       # NOTE: the docker:// mechanism tests (workspace staging + container
       # lifecycle, `#[ignore]`d) deliberately do NOT run here — a docker job
       # burns the free-minutes allocation. Run them locally / on a self-hosted

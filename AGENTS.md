@@ -7,19 +7,30 @@ screen and documents every command an agent might need to run.
 If you're a human, the README is friendlier. If you're an agent, this is
 what you want.
 
-> **⚠️ Direction note.** The **remote** backend plane has been **removed**:
-> the `remote add/list/info/rm` commands, `pillbox run --remote`, and the
-> `ssh://`/`e2b://`/`docker://` URL backends are gone. pillbox is now
-> **local-only**, with two local backends: **libkrun** (a local microVM, the
-> default — needs KVM/HVF, and a `--features libkrun` build) and **Docker** (the
-> no-KVM **compat** backend, cross-platform, opt out to it via
-> `PILLBOX_BACKEND=docker`). A build compiled without `--features libkrun` is
-> always Docker.
-> "Remote" returns later as the managed/Cloudflare tier (a different shape). Its
-> §0-gateway substrate — a per-session Cloudflare Durable Object (seq authority +
-> actor attestation + driver arbitration + `subscribe` fan-out) — is already
-> built and proven live on CF's free tier (`cloudflare-spike/`,
-> docs/managed-tier.md); it is not yet a `pillbox run` backend.
+> **⚠️ Direction note — ONE backend: libkrun. Docker is DEPRECATED.**
+> **libkrun** (a local microVM) is *the* backend and **the default build**. All
+> work targets it. **Docker is deprecated and on the path to deletion** — NOT a
+> co-equal backend, NOT held to parity, and it gets **no new features and no
+> bug-fix engineering**. Do not propose, build, or "also do" a docker version of
+> anything. Do not defend docker with "it's cheap" / "cross-platform" / "the
+> CF-container twin" — that framing repeatedly wasted the maintainer's time and is
+> banned. A docker-only bug's resolution is "docker is deprecated," not a fix.
+>
+> **Core swarm primitives belong on libkrun.** pillbox exists for an independent
+> orchestrator to spawn **swarms** — so `sandbox spawn/exec/agent` and
+> `session send` are CORE, not optional. Anything that currently lives only on
+> docker is a **bug to fix by porting to libkrun** (top of the backlog), never a
+> reason to keep docker alive.
+>
+> The **remote** backend plane was removed (`remote add/list/info/rm`,
+> `pillbox run --remote`, the `ssh://`/`e2b://`/`docker://` URL backends are gone).
+> "Remote" returns later as the managed/Cloudflare tier — a different shape, built
+> fresh against CF's API, **not** a port of local docker (so docker earns no
+> "twin" credit). Its §0-gateway substrate — a per-session Cloudflare Durable
+> Object (seq authority + actor attestation + driver arbitration + `subscribe`
+> fan-out) — is already built and proven live on CF's free tier
+> (`cloudflare-spike/`, docs/managed-tier.md); it is not yet a `pillbox run`
+> backend.
 > Everything else (run, secrets, env, auth, vault, sessions, snapshots — and
 > local detach/reattach) is current.
 

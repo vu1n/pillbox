@@ -45,3 +45,70 @@ jobs:
       # lifecycle, `#[ignore]`d) deliberately do NOT run here — a docker job
       # burns the free-minutes allocation. Run them locally / on a self-hosted
       # box with `scripts/test-docker-mechanism.sh` (needs a Docker daemon).
+
+  # The real backend: compile, lint, and unit-test pillbox with `--features
+  # libkrun`. libkrun isn't vendored or apt-installable, so we build it +
+  # libkrunfw from source (cached) and point `build.rs` at it via
+  # LIBKRUN_LIB_DIR. `ubuntu-latest` exposes /dev/kvm (a `chown` away), so this
+  # job links the libkrun dylib and runs the non-VM unit tests; full VM-boot
+  # smokes stay a local/self-hosted gate (scripts/smoke/libkrun.sh).
+  libkrun:
+    runs-on: ubuntu-latest
+    env:
+      # Pinned to the maintainer's local brew versions (libkrun 1.18.1 /
+      # libkrunfw 5.3.0) so CI exercises the same ABI. Bump together with the
+      # local install.
+      LIBKRUNFW_VERSION: v5.3.0
+      LIBKRUN_VERSION: v1.18.1
+      LIBKRUN_LIB_DIR: /usr/local/lib
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rust
+        run: rustup toolchain install stable --profile minimal --component clippy
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-libkrun-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-libkrun-
+      # Built libkrun + libkrunfw shared objects, keyed on the pinned versions
+      # so the kernel-bearing libkrunfw is built once and reused across runs.
+      - name: Cache libkrun libs
+        id: libkrun-cache
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/lib/libkrun*
+          key: libkrun-${{ env.LIBKRUNFW_VERSION }}-${{ env.LIBKRUN_VERSION }}-${{ runner.os }}
+      - name: Build libkrun + libkrunfw from source
+        if: steps.libkrun-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          # libkrunfw builds a guest kernel (flex/bison/libelf/bc/libssl);
+          # libkrun links it (clang/llvm/libclang/patchelf/pkg-config).
+          sudo apt-get install -y \
+            build-essential pkg-config clang lld libclang-dev llvm-dev \
+            libcap-ng-dev flex bison libelf-dev bc libssl-dev patchelf python3
+          tmp="$(mktemp -d)"
+          git clone --depth 1 --branch "$LIBKRUNFW_VERSION" \
+            https://github.com/containers/libkrunfw "$tmp/libkrunfw"
+          make -C "$tmp/libkrunfw" -j"$(nproc)"
+          sudo make -C "$tmp/libkrunfw" install
+          git clone --depth 1 --branch "$LIBKRUN_VERSION" \
+            https://github.com/containers/libkrun "$tmp/libkrun"
+          make -C "$tmp/libkrun" -j"$(nproc)"
+          sudo make -C "$tmp/libkrun" install
+      - name: Refresh linker cache
+        run: sudo ldconfig "$LIBKRUN_LIB_DIR"
+      # ubuntu-latest ships /dev/kvm; hand it to the runner user so libkrun can
+      # create a VM. Non-VM unit tests don't need it, but the smoke does.
+      - name: Enable KVM
+        run: sudo chown "$(id -u)" /dev/kvm || echo "no /dev/kvm on this runner (unit tests still run)"
+      - name: Clippy (libkrun)
+        run: cargo clippy --all-targets --features libkrun -- -D warnings
+      - name: Test (libkrun)
+        run: cargo test --all-targets --features libkrun

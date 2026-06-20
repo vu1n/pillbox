@@ -47,23 +47,16 @@ jobs:
       # box with `scripts/test-docker-mechanism.sh` (needs a Docker daemon).
 
   # The real backend: compile, lint, and unit-test pillbox with `--features
-  # libkrun`. libkrun isn't vendored or apt-installable, so we build it +
-  # libkrunfw from source (cached) and point `build.rs` at it via
-  # LIBKRUN_LIB_DIR. `ubuntu-latest` exposes /dev/kvm (a `chown` away), so this
-  # job links the libkrun dylib and runs the non-VM unit tests; full VM-boot
-  # smokes stay a local/self-hosted gate (scripts/smoke/libkrun.sh).
+  # libkrun`. Runs on macOS because the libkrun backend is macOS-only today (it
+  # uses APFS `clonefile`, and the egress stack needs libkrun's brew build; the
+  # from-source Linux build is missing `krun_add_net_unixstream`). brew supplies
+  # libkrun + libkrunfw from the `libkrun/krun` tap and build.rs finds them at
+  # /opt/homebrew/lib. No VM boots here — GitHub macOS runners can't nest HVF —
+  # so this is build + link + non-VM unit tests; the VM-boot smoke stays a local
+  # gate (scripts/smoke/libkrun.sh). The Linux path (cheap-KVM, CI VM-boot) is a
+  # deferred task, and the intended Linux backend is QEMU, not libkrun-on-Linux.
   libkrun:
-    runs-on: ubuntu-latest
-    env:
-      # Pinned to the maintainer's local brew versions (libkrun 1.18.1 /
-      # libkrunfw 5.3.0) so CI exercises the same ABI. Bump together with the
-      # local install.
-      LIBKRUNFW_VERSION: v5.3.0
-      LIBKRUN_VERSION: v1.18.1
-      # Linux libkrun/libkrunfw install to PREFIX/lib64 (LIBDIR_Linux=lib64 in
-      # their Makefiles) — NOT lib (that's the Darwin libdir). build.rs's link
-      # search, the cache path, and ldconfig must all point here.
-      LIBKRUN_LIB_DIR: /usr/local/lib64
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install rust
@@ -78,57 +71,8 @@ jobs:
           key: ${{ runner.os }}-cargo-libkrun-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-libkrun-
-      # Built libkrun + libkrunfw shared objects, keyed on the pinned versions
-      # so the kernel-bearing libkrunfw is built once and reused across runs.
-      - name: Cache libkrun libs
-        id: libkrun-cache
-        uses: actions/cache@v4
-        with:
-          path: /usr/local/lib64/libkrun*
-          # `-lib64` busts the prior key, which cached an empty /usr/local/lib.
-          key: libkrun-${{ env.LIBKRUNFW_VERSION }}-${{ env.LIBKRUN_VERSION }}-lib64-${{ runner.os }}
-      - name: Build libkrun + libkrunfw from source
-        if: steps.libkrun-cache.outputs.cache-hit != 'true'
-        run: |
-          set -euxo pipefail
-          sudo apt-get update
-          # libkrunfw builds a guest kernel (flex/bison/libelf/bc/libssl);
-          # libkrun links it (clang/llvm/libclang/patchelf/pkg-config).
-          sudo apt-get install -y \
-            build-essential pkg-config clang lld libclang-dev llvm-dev \
-            libcap-ng-dev flex bison libelf-dev bc libssl-dev patchelf \
-            python3 python3-pyelftools
-          tmp="$(mktemp -d)"
-          # `cd && make`, NOT `make -C`: -C implies --print-directory (-w), which
-          # lands in MAKEFLAGS, and libkrunfw forwards $(MAKEFLAGS) verbatim to the
-          # kernel build → a bare `w` becomes a bogus `make` target.
-          git clone --depth 1 --branch "$LIBKRUNFW_VERSION" \
-            https://github.com/containers/libkrunfw "$tmp/libkrunfw"
-          ( cd "$tmp/libkrunfw" && make -j"$(nproc)" && sudo make install )
-          sudo ldconfig
-          git clone --depth 1 --branch "$LIBKRUN_VERSION" \
-            https://github.com/containers/libkrun "$tmp/libkrun"
-          ( cd "$tmp/libkrun" && make -j"$(nproc)" && sudo make install )
-      - name: Link libkrun for the toolchain
-        # `-lkrun` needs the bare libkrun.so; `make install` ships only the
-        # versioned soname (libkrun.so.N[.M.P]), and ldconfig makes the runtime
-        # soname symlink but not the linker one. Create it (for both libs), then
-        # refresh ldconfig. NOT gated on the build step, so it also fixes a
-        # restored cache (which holds the versioned libs without the symlink).
-        run: |
-          set -eux
-          for stem in libkrun libkrunfw; do
-            if [ ! -e "$LIBKRUN_LIB_DIR/$stem.so" ]; then
-              so="$(ls "$LIBKRUN_LIB_DIR/$stem".so.* 2>/dev/null | sort -V | tail -1)"
-              [ -n "$so" ] && sudo ln -sf "$so" "$LIBKRUN_LIB_DIR/$stem.so"
-            fi
-          done
-          sudo ldconfig "$LIBKRUN_LIB_DIR"
-          ls -la "$LIBKRUN_LIB_DIR"/libkrun* || true
-      # ubuntu-latest ships /dev/kvm; hand it to the runner user so libkrun can
-      # create a VM. Non-VM unit tests don't need it, but the smoke does.
-      - name: Enable KVM
-        run: sudo chown "$(id -u)" /dev/kvm || echo "no /dev/kvm on this runner (unit tests still run)"
+      - name: Install libkrun
+        run: brew tap libkrun/krun && brew install libkrun libkrunfw
       - name: Clippy (libkrun)
         run: cargo clippy --all-targets --features libkrun -- -D warnings
       - name: Test (libkrun)

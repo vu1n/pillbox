@@ -102,3 +102,26 @@ Format: `STATUS` · what · why · what it means concretely · what's rejected.
 - **The discipline (binding):** read a subsystem's canonical doc before acting on
   or claiming things about it; **code wins over doc** — if they disagree, fix the
   doc in the same change.
+
+## ADR-006 — Rustic cache is variant-gated (off for Local, on for S3)
+**Status: Accepted (2026-06-20).**
+
+- **Decision:** `RusticBackend::repo_opts` sets the rustic cache per variant:
+  `no_cache(true)` for `RusticVariant::Local`, cache **on** for
+  `RusticVariant::S3` with `cache_dir` anchored at `<state-dir>/cache`. (Before
+  this, all three open paths hard-coded `no_cache(true)`.)
+- **Why:** the blanket `no_cache(true)` was a local-first default from the first
+  rustic landing (PR #10), never differentiated when the S3 variant arrived. For
+  S3 it's a perf footgun — every host-side open (push/pull/list) re-fetches the
+  index from the bucket. rustic's cache is content-addressed + immutable (keyed by
+  config id), so there is **no** staleness/correctness reason to disable it, and
+  it's safe under concurrent swarm access.
+- **Concretely:** Local stays cache-off *on purpose* — caching a local-disk repo
+  into a second local dir is pure write amplification for zero latency gain, so
+  do **not** "fix" it back to a blanket setting. S3 caches under the per-pillbox
+  state dir (scoped + cleanable), not rustic's global XDG dir. scrypt key
+  derivation (~5s/open) is unaffected — the cache never caches the key, only
+  index/pack data; the per-open scrypt cost is a separate matter.
+- **Rejected:** blanket `no_cache(true)` for all variants (the footgun);
+  enabling the cache in rustic's global XDG dir (unscoped, not cleanable with the
+  pillbox state dir).

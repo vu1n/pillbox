@@ -43,6 +43,8 @@ pub(crate) use lease::SandboxLease;
 // libkrun — the docker path reaches `refresh` directly, so this re-export is otherwise
 // unused.
 #[cfg(feature = "libkrun")]
-pub(crate) use refresh::{pre_refresh, STUB_FAR_FUTURE_EXPIRES_AT_MS};
+pub(crate) use refresh::{
+    broker_expiry, broker_jit_refresh, pre_refresh, STUB_FAR_FUTURE_EXPIRES_AT_MS,
+};
 pub(crate) use server::{RunContext, Server, ServerConfig};
 pub(crate) use session::{OAuthAgent, VaultSession};

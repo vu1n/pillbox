@@ -110,8 +110,11 @@ Running `--vault` for an agent that isn't `vault_capable` errors with exit 2.
 
 ## OAuth refresh — the broker model
 
-> **Status:** built 2026-06-20 for **claude** (the libkrun backend). ADR-004. The
-> >token-lifetime-session case (slice 2, JIT-refresh-at-proxy) is deferred.
+> **Status:** built 2026-06-20 for **claude** on BOTH vault paths — this host-side
+> proxy (#107, the docker path) and the libkrun in-VMM MITM (#109, see
+> [libkrun-sandbox.md](./libkrun-sandbox.md)). ADR-004. The >token-lifetime-session
+> case (PR-B, JIT-refresh-at-the-MITM) is deferred. This section describes the
+> host-side path; libkrun wires the same core (`pre_refresh`, `TokenStore`).
 
 The problem the in-proxy refresh design hit: if the guest agent refreshes its own
 OAuth token (a single-use `refresh_token` grant), pillbox has to intercept, swap,

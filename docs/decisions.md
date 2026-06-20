@@ -61,7 +61,7 @@ Format: `STATUS` · what · why · what it means concretely · what's rejected.
   two-backend tax again).
 
 ## ADR-004 — Vault OAuth uses the broker model, not in-proxy refresh
-**Status: Accepted (2026-06-20). Core BUILT (2026-06-20, claude/libkrun). PR #101 (in-proxy coordinator) parked.**
+**Status: Accepted (2026-06-20). BUILT on BOTH vault paths — host-side/docker #107, libkrun #109. JIT (PR-B) deferred. PR #101 parked.**
 
 - **Decision:** the sandbox gets a creds file with a **far-future expiry** + the
   vault MITM **injects** the real `Authorization: Bearer`; a host-side, single-writer
@@ -75,15 +75,26 @@ Format: `STATUS` · what · why · what it means concretely · what's rejected.
   clobber is a docker-on-macOS bind-mount interaction, docker-backend-only,
   libkrun unaffected. So the coordinator wasn't the bug — the whole in-proxy
   approach is just more fragile than the broker.
-- **Built (slice 1):** `provision` stamps the stub's `expiresAt` with the
-  year-2100 sentinel (`STUB_EXPIRES_AT_MS`); the start-of-run pre-refresh
-  (`vault::refresh::pre_refresh`) routes through the `TokenStore` single-writer
-  core so concurrent launches rotate the shared refresh token at most once, and
-  **fails closed** (no stale-token lease). See [vault.md](./vault.md#oauth-refresh--the-broker-model).
-- **Deferred (slice 2):** JIT-refresh-at-proxy — the MITM refreshes the real token
-  on-demand near expiry, closing the >token-lifetime-session case and letting the
-  in-proxy 401-retry fallback finally be deleted. Until then a session that
-  outlives the ~8h access token relies on that (uncoordinated) fallback.
+- **The core is backend-agnostic.** `vault::refresh::pre_refresh` + the `TokenStore`
+  single-writer + `abort_intact` + the far-future sentinel
+  (`STUB_FAR_FUTURE_EXPIRES_AT_MS`) operate on a creds-file *path* — nothing
+  backend-specific. Each backend just *wires* them in.
+- **Built #107 (host-side proxy = docker path):** `provision` stamps the stub's
+  `expiresAt`; `provision_oauth_mount` routes the start-of-run pre-refresh through
+  the core. NOTE: `src/vault/`'s `VaultSession` is constructed **only by
+  `docker.rs`**, so #107 alone did NOT reach libkrun — a wrong-backend miss caught
+  on review.
+- **Built #109 (libkrun = the real backend):** libkrun has its own vault
+  (`stub_claude_oauth` + the in-VMM byte-swap MITM, no `VaultSession`).
+  `stub_claude_oauth` post-dates the stub expiry; `prepare_launch` calls
+  `pre_refresh` on the live creds file before the CoW clone, fail-closed. Same core.
+- **Deferred (PR-B):** JIT-refresh-at-the-MITM. On the host-side proxy that's a
+  per-request async handler; on libkrun the MITM is a static byte-swap in the
+  `__krun-vmm` child (a *host* process, so it can call the same coordinated
+  `pre_refresh` itself — but needs an expiry-aware egress-loop refresh state
+  machine, not a port). Closes the >token-lifetime (~8h) session case and lets the
+  in-proxy/byte-swap 401-fallback be deleted. Until then a long session relies on
+  that (uncoordinated) fallback.
 - **Rejected:** the in-proxy refresh coordinator (PR #101) as the path; letting
   the agent refresh through a coordinated proxy and capturing the rotation.
 

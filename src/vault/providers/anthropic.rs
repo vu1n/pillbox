@@ -596,8 +596,14 @@ fn coordinate_refresh(
     // pin the lock indefinitely and turn one hung connection into an account-wide
     // refresh outage. Bounded → reqwest errors → `abort()` → fail closed (pending
     // stays set → re-auth), which is recoverable; a wedge is not.
+    // `.redirect(none())` is load-bearing security: the real refresh token rides in
+    // this POST body, and reqwest's default policy follows up to 10 redirects and
+    // RE-SENDS the body on 307/308. A token endpoint never legitimately 30x's, so a
+    // redirect here means a hostile/MITM'd upstream — without this, that Location
+    // would receive the real refresh token (credential theft + family-revoke). Refuse.
     let client = match reqwest::blocking::Client::builder()
         .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(FORWARD_CONNECT_TIMEOUT)
         .timeout(FORWARD_TIMEOUT)
         .build()
@@ -616,13 +622,18 @@ fn coordinate_refresh(
         }
     };
     let status = resp.status().as_u16();
-    let resp_body = match resp.bytes() {
-        Ok(b) => b.to_vec(),
-        Err(e) => {
-            guard.abort();
-            return Coordinated::Error(format!("read response: {e}"));
-        }
-    };
+    // Cap the upstream response read (symmetric with the guest request-body cap): a
+    // hostile/MITM'd upstream — explicitly in the threat model — could stream a huge
+    // body to OOM the host proxy serving every session. An OAuth token response is
+    // < 1 KiB; 256 KiB is generous, and over-limit truncation makes the JSON parse
+    // fail → fail closed (never a partial-but-committed token).
+    use std::io::Read as _;
+    const MAX_UPSTREAM_BODY: u64 = 256 * 1024;
+    let mut resp_body = Vec::new();
+    if let Err(e) = resp.take(MAX_UPSTREAM_BODY).read_to_end(&mut resp_body) {
+        guard.abort();
+        return Coordinated::Error(format!("read response: {e}"));
+    }
     // A refresh is rare (once per token lifetime); log where the vault's own
     // upstream call went and how it landed — URL + status only, no token material.
     // Cheap confirmation that the forward reached Anthropic directly (not a loop).

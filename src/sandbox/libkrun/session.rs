@@ -485,6 +485,22 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
             spec.id
         );
     }
+
+    // Broker pre-refresh: rotate the real OAuth token NOW — coordinated across
+    // concurrent launches by the single-writer `TokenStore` — on the live creds file,
+    // BEFORE the CoW clone below, so the stubbed clone the guest mounts inherits a
+    // fresh token. Paired with the post-dated stub expiry (`stub_claude_oauth`), the
+    // guest never refreshes itself, which dissolves the host-creds clobber and the
+    // refresh-token-reuse race on libkrun the same way it does on the host-side proxy.
+    // Fail closed: a stale token the guest can't self-heal (its expiry says year 2100)
+    // would just 401 with no recovery. Placed AFTER the provider-resolution bail so an
+    // aborted launch never burns a rotation. `pre_refresh` itself no-ops for any
+    // `auth_id` without a broker decider (only claude today), so the `vault_capable`
+    // gate just avoids the call for non-vaulted agents.
+    if spec.vault_capable {
+        crate::vault::pre_refresh(&home.join(spec.cred_sentinel), spec.auth_id)?;
+    }
+
     let (creds_share, mut swap_pairs) = stub_oauth_creds(&home, spec, &oauth_hosts)?;
     // Fail loud: a vault-capable agent whose credentials file produced no stubs
     // would mount the real token into the guest unstubbed (exfiltratable by a

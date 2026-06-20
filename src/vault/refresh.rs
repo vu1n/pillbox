@@ -67,6 +67,16 @@ const FALLBACK_EXPIRES_IN: Duration = Duration::from_secs(3600);
 /// and a waiter that gives up POSTs nothing, so it never risks a double-send.
 const PRE_REFRESH_LOCK_WAIT: Duration = Duration::from_secs(35);
 
+/// `expiresAt` (unix ms) the broker stamps into the stub creds the guest sees:
+/// 2100-01-01, the same far-future sentinel centaur/iron-proxy use. The guest's
+/// agent trusts its local expiry and so **never refreshes itself** — the broker move
+/// that dissolves the host-creds clobber and the refresh-token-reuse race. BOTH vault
+/// backends stamp this same value (the host-side `providers::anthropic` proxy and the
+/// libkrun in-VMM MITM), so "the agent never self-refreshes" holds identically
+/// regardless of backend. The *real* creds keep their true expiry; only the stub copy
+/// is post-dated.
+pub(crate) const STUB_FAR_FUTURE_EXPIRES_AT_MS: u64 = 4_102_444_800_000;
+
 /// The Claude Code OAuth wire shape, plugged into the [`TokenStore`].
 pub(crate) struct ClaudeRefreshDecider;
 

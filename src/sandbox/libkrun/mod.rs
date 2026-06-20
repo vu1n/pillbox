@@ -508,6 +508,19 @@ fn stub_claude_oauth(
             stubbed = true;
         }
     }
+    // Broker move: post-date the stub's expiry so the guest's Claude Code trusts its
+    // local expiry and never refreshes itself — the MITM swaps the live access token
+    // on the wire, and the host-side `pre_refresh` (in `prepare_launch`) keeps the
+    // real token fresh. Only stamp when we actually stubbed; an unhandled/empty file
+    // is left untouched for the launch guard to catch.
+    if stubbed {
+        oauth.insert(
+            "expiresAt".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(
+                crate::vault::STUB_FAR_FUTURE_EXPIRES_AT_MS,
+            )),
+        );
+    }
     stubbed
 }
 
@@ -776,9 +789,51 @@ fn cstr(s: &str) -> CString {
 mod tests {
     use super::{
         env_fork_left_real_unstubbed, find_cached_rootfs, mint_curated_stub, mint_oauth_stub,
-        oauth_swap_hosts, stub_codex_oauth, SwapPair,
+        oauth_swap_hosts, stub_claude_oauth, stub_codex_oauth, SwapPair,
     };
     use crate::agents::{CLAUDE, CODEX, PI};
+
+    #[test]
+    fn stub_claude_oauth_postdates_expiry_and_swaps_tokens() {
+        // Realistic reals: mint_oauth_stub derives the stub from the real's `sk-ant`
+        // type prefix, so the fixture must carry that shape.
+        let real_access = "sk-ant-oat01-REALACCESSBODYxyz";
+        let real_refresh = "sk-ant-ort01-REALREFRESHBODYxyz";
+        let mut json = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": real_access,
+                "refreshToken": real_refresh,
+                "expiresAt": 1_700_000_000_000_u64,
+                "subscriptionType": "pro",
+            }
+        });
+        let hosts = vec!["api.anthropic.com".to_string()];
+        let mut pairs = Vec::new();
+        assert!(stub_claude_oauth(&mut json, &hosts, &mut pairs));
+
+        let oauth = json.get("claudeAiOauth").unwrap();
+        // Broker move: the guest-mounted stub is post-dated to year 2100 so the agent
+        // never refreshes itself (the host-side pre-refresh + MITM own rotation).
+        assert_eq!(
+            oauth.get("expiresAt").and_then(|v| v.as_u64()),
+            Some(crate::vault::STUB_FAR_FUTURE_EXPIRES_AT_MS)
+        );
+        // Real tokens replaced with stubs in the file the guest sees (the stub keeps
+        // the public `sk-ant` type prefix but never the secret body)…
+        let access = oauth.get("accessToken").and_then(|v| v.as_str()).unwrap();
+        let refresh = oauth.get("refreshToken").and_then(|v| v.as_str()).unwrap();
+        assert!(access.starts_with("sk-ant-oat01-") && access != real_access);
+        assert!(refresh.starts_with("sk-ant-ort01-") && refresh != real_refresh);
+        assert!(!access.contains("REALACCESSBODY") && !refresh.contains("REALREFRESHBODY"));
+        // …and the real values live ONLY in the out-of-band swap pairs.
+        assert!(pairs.iter().any(|p| p.real == real_access));
+        assert!(pairs.iter().any(|p| p.real == real_refresh));
+        // Other fields preserved.
+        assert_eq!(
+            oauth.get("subscriptionType").and_then(|v| v.as_str()),
+            Some("pro")
+        );
+    }
 
     // Write a generation dir with a marker shaped like the real one, then set
     // its mtime so "newest wins" is testable without sleeping (`age_secs` ago).

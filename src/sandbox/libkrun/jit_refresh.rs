@@ -35,10 +35,17 @@ use super::vault::CredSwap;
 /// than coalescing onto a not-yet-due token, with headroom for the rotation round-trip.
 const REFRESH_LEAD_MS: u64 = 4 * 60 * 1000;
 
-/// Minimum spacing between rotation attempts: caps the spawn cadence and doubles as the
-/// backoff after a failed/coalesced rotation. A retry is always safe — the shared
+/// Base spacing between rotation attempts: caps the spawn cadence and is the backoff
+/// after the first failed/coalesced rotation. A retry is always safe — the shared
 /// `TokenStore` never re-sends a consumed refresh token (its `pending` marker).
 const REFRESH_RETRY_BACKOFF_MS: u64 = 60 * 1000;
+
+/// Ceiling for the exponential backoff on consecutive failures. `expires_at_ms` only
+/// advances on a SUCCESSFUL rotation, so a persistently-failing case (a revoked account
+/// on a long/detached session) would otherwise re-attempt at the base floor forever;
+/// the backoff decays that to one quiet attempt per this interval. A retry never risks
+/// reuse, so the only cost of waiting longer is a slower recovery from a transient fault.
+const MAX_REFRESH_BACKOFF_MS: u64 = 15 * 60 * 1000;
 
 /// The non-secret context the parent hands the child (in the VmSpec, not on the secret
 /// stdin channel) to drive broker JIT refresh: a creds-file path, an agent id, and the
@@ -70,6 +77,9 @@ pub(super) struct RefreshDriver {
     expires_at_ms: u64,
     /// Floor for the next spawn (cadence cap + post-failure backoff).
     next_attempt_ms: u64,
+    /// Consecutive failed/coalesced-via-error rotations; drives the exponential backoff
+    /// and resets to 0 on a successful rotation.
+    consecutive_failures: u32,
     in_flight: Option<mpsc::Receiver<RefreshResult>>,
 }
 
@@ -92,6 +102,7 @@ impl RefreshDriver {
             access_idx,
             expires_at_ms,
             next_attempt_ms: 0,
+            consecutive_failures: 0,
             in_flight: None,
         })
     }
@@ -118,6 +129,7 @@ impl RefreshDriver {
         match rx.try_recv() {
             Ok(Ok((real, expires_at_ms))) => {
                 self.apply(swap_pairs, real, expires_at_ms, diag);
+                self.consecutive_failures = 0;
                 self.in_flight = None;
             }
             Ok(Err(reason)) => {
@@ -129,11 +141,13 @@ impl RefreshDriver {
                 diag.log(&format!(
                     "krun-egress: [refresh] rotation failed ({reason}); retrying after backoff"
                 ));
+                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
                 self.in_flight = None;
             }
             Err(mpsc::TryRecvError::Empty) => {} // still running — poll next tick
             Err(mpsc::TryRecvError::Disconnected) => {
                 diag.log("krun-egress: [refresh] rotation thread died; retrying after backoff");
+                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
                 self.in_flight = None;
             }
         }
@@ -157,9 +171,19 @@ impl RefreshDriver {
             let _ = tx.send(result);
         });
         self.in_flight = Some(rx);
-        // Floor the next attempt regardless of outcome: caps the spawn cadence and
-        // prevents a hot loop if a rotation keeps returning a still-near expiry.
-        self.next_attempt_ms = now.saturating_add(REFRESH_RETRY_BACKOFF_MS);
+        // Floor the next attempt regardless of outcome: caps the spawn cadence and (via
+        // the exponential backoff on consecutive failures) prevents a persistently-failing
+        // rotation from re-attempting at the base floor forever.
+        self.next_attempt_ms = now.saturating_add(self.retry_floor_ms());
+    }
+
+    /// Spacing before the next attempt: the base floor, doubled per consecutive failure,
+    /// capped at [`MAX_REFRESH_BACKOFF_MS`]. Zero failures → the base floor.
+    fn retry_floor_ms(&self) -> u64 {
+        let shift = self.consecutive_failures.min(8); // 8 → 256× the base, past the cap
+        REFRESH_RETRY_BACKOFF_MS
+            .saturating_mul(1u64 << shift)
+            .min(MAX_REFRESH_BACKOFF_MS)
     }
 
     /// Splice the fresh real access token into its swap pair and reschedule against the
@@ -210,6 +234,7 @@ mod tests {
             access_idx,
             expires_at_ms,
             next_attempt_ms: 0,
+            consecutive_failures: 0,
             in_flight: None,
         }
     }
@@ -224,6 +249,47 @@ mod tests {
             creds_path: PathBuf::from("/nonexistent/creds.json"),
             auth_id: "claude".to_string(),
             access_stub: b"not-a-real-stub".to_vec(),
+        };
+        assert!(RefreshDriver::arm(ctx, &pairs, &Diag::open(None)).is_none());
+    }
+
+    #[test]
+    fn arm_seeds_expiry_from_live_creds_and_matches_the_access_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let creds_path = dir.path().join("creds.json");
+        let future_ms = now_unix_ms() + 8 * 60 * 60 * 1000;
+        std::fs::write(
+            &creds_path,
+            format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"AT","refreshToken":"RT","expiresAt":{future_ms}}}}}"#
+            ),
+        )
+        .unwrap();
+        // The access pair's real is the live access token; arm matches by the access stub.
+        let pairs = vec![pair("accessstub", "AT"), pair("refreshstub", "RT")];
+        let ctx = RefreshCtx {
+            creds_path,
+            auth_id: "claude".to_string(),
+            access_stub: b"accessstub".to_vec(),
+        };
+        let d = RefreshDriver::arm(ctx, &pairs, &Diag::open(None)).expect("armed");
+        assert_eq!(d.access_idx, 0);
+        assert_eq!(d.expires_at_ms, future_ms);
+        assert!(!d.should_spawn(now_unix_ms())); // ~8h out → not yet due
+    }
+
+    #[test]
+    fn arm_disabled_for_non_broker_agent() {
+        // codex has no broker decider → broker_expiry None → JIT stays off even though
+        // a pair matches the stub (the child carries the context but no-ops it).
+        let dir = tempfile::tempdir().unwrap();
+        let creds_path = dir.path().join("auth.json");
+        std::fs::write(&creds_path, r#"{"tokens":{"access_token":"AT"}}"#).unwrap();
+        let pairs = vec![pair("accessstub", "AT")];
+        let ctx = RefreshCtx {
+            creds_path,
+            auth_id: "codex".to_string(),
+            access_stub: b"accessstub".to_vec(),
         };
         assert!(RefreshDriver::arm(ctx, &pairs, &Diag::open(None)).is_none());
     }
@@ -261,6 +327,19 @@ mod tests {
         assert_eq!(pairs[0].real, b"newaccess");
         assert_eq!(pairs[1].real, b"realrefresh");
         assert_eq!(d.expires_at_ms, 2_000_000_000_000);
+    }
+
+    #[test]
+    fn retry_floor_grows_with_failures_and_caps() {
+        let mut d = driver(0, 1);
+        assert_eq!(d.retry_floor_ms(), REFRESH_RETRY_BACKOFF_MS); // 0 failures → base
+        d.consecutive_failures = 1;
+        assert_eq!(d.retry_floor_ms(), REFRESH_RETRY_BACKOFF_MS * 2);
+        d.consecutive_failures = 3;
+        assert_eq!(d.retry_floor_ms(), REFRESH_RETRY_BACKOFF_MS * 8);
+        // Far enough out that the exponential exceeds the ceiling → clamped, no overflow.
+        d.consecutive_failures = 1000;
+        assert_eq!(d.retry_floor_ms(), MAX_REFRESH_BACKOFF_MS);
     }
 
     #[test]

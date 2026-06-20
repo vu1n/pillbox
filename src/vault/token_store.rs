@@ -4,13 +4,15 @@
 //! detection. See `docs/vault-oauth-refresh-coordination.md` (M1a).
 //!
 //! This is the provider-agnostic **core**: the [`RefreshDecider`] contract plus the
-//! [`TokenStore::begin`] / [`RotateGuard`] commit-or-abort protocol. The vault does
-//! NOT POST refresh tokens itself — Claude Code / Codex issue their own
-//! `/oauth/token` request, which the in-proxy handler intercepts and forwards. The
-//! store's job is to make sure exactly one such forward happens across all
-//! concurrent sessions sharing an account, and that the rest coalesce on its
-//! result. Wiring the handlers through it is the next step; until then nothing in
-//! the run path calls it.
+//! [`TokenStore::begin`] / [`RotateGuard`] commit-or-abort protocol. The core is
+//! agnostic to *who* forwards the grant — it hands the winner the refresh token and
+//! a lock-holding guard, and the caller forwards exactly once then commits/aborts.
+//! Two callers drive it: the host-side Claude **broker** (`super::refresh`), where
+//! pillbox itself POSTs the grant at run start so the guest never refreshes; and the
+//! in-proxy handler (codex, and the claude 401-retry fallback), which relays the
+//! guest's own `/oauth/token` request. Either way the store guarantees exactly one
+//! forward across all concurrent sessions sharing an account, and the rest coalesce
+//! on its result.
 //!
 //! ## The invariant that makes it correct
 //!
@@ -26,10 +28,6 @@
 //! holder, no handler ever re-sends a token that may already be consumed: an
 //! ambiguous outcome (request sent, result unknown) resolves to **re-auth, not
 //! retry**.
-
-// Until the in-proxy handlers are wired through this (next increment), the type is
-// only exercised by its own tests.
-#![allow(dead_code)]
 
 use std::fs;
 use std::io;
@@ -196,6 +194,7 @@ impl TokenStore {
             state_path: self.state_path.clone(),
             state,
             refresh,
+            base_creds: disk,
         }))
     }
 
@@ -311,6 +310,7 @@ pub(crate) struct RotateGuard {
     state_path: PathBuf,
     state: RotationState,
     refresh: String,
+    base_creds: Value,
 }
 
 impl RotateGuard {
@@ -318,6 +318,17 @@ impl RotateGuard {
     /// place of the guest's stub, exactly once.
     pub(crate) fn refresh_token(&self) -> &str {
         &self.refresh
+    }
+
+    /// The full credentials blob read under the lock. A caller that assembles its own
+    /// rotated creds (the host-side pre-refresh, which POSTs and gets back only the
+    /// changed token fields) splices the response onto this — so fields the OAuth
+    /// response omits (`scopes`, `subscriptionType`, …) are preserved, and the
+    /// committed creds reflect exactly what was on disk when the lock was taken, not a
+    /// possibly-staler start-of-run copy. Carries live credential material, like
+    /// `refresh_token`; never log it.
+    pub(crate) fn base_creds(&self) -> &Value {
+        &self.base_creds
     }
 
     /// The forward returned new creds: persist them, then clear `pending`.
@@ -357,15 +368,39 @@ impl RotateGuard {
     /// effect to dropping the guard; the method exists so a failed forward reads as a
     /// deliberate decision at the call site.
     ///
-    /// pillbox deliberately does NOT distinguish "cleanly rejected" from "outcome
-    /// unknown" here. A clean 4xx means the family is likely dead (re-auth needed
-    /// anyway); an unknown outcome means the token may be consumed (re-forwarding =
-    /// reuse). Both resolve to re-auth, so the safe move is identical — and collapsing
-    /// them removes any reliance on the caller classifying the failure correctly,
-    /// which a reuse-revoke bug cannot afford.
+    /// `abort` does NOT distinguish "cleanly rejected" from "outcome unknown": both
+    /// leave `pending` set and resolve the next `begin()` to re-auth. That's the only
+    /// safe move when the caller can't prove what reached the server — the in-proxy
+    /// handler forwards the guest's opaque request and is in exactly that position.
+    /// A caller that owns its own POST and can *prove* the token never went on the
+    /// wire (or was rejected without being issued) uses [`abort_intact`](Self::abort_intact)
+    /// instead, so a transient blip on the every-run host-side pre-refresh doesn't
+    /// brick the credential into forced re-auth.
     pub(crate) fn abort(self) {
         // No-op beyond the drop: `pending` was made durable in `begin()` and is left
         // set; the flock releases as `self` (holding `_lock`) goes out of scope.
+    }
+
+    /// The forward provably did NOT consume the refresh token — a pre-send connect
+    /// failure (the bytes never left), or an RFC 6749 grant rejection the
+    /// authorization server returns *without* issuing or rotating a token
+    /// (`invalid_grant` &c.). The token is intact and reusable, so `pending` is
+    /// **cleared**: the next `begin()` may retry the refresh rather than fail closed.
+    /// This is what keeps a transient network blip on the start-of-run pre-refresh
+    /// from poisoning every subsequent run.
+    ///
+    /// **The caller MUST have proven non-consumption** before calling this — clearing
+    /// `pending` on a maybe-consumed token would let a peer re-POST it (reuse). Any
+    /// ambiguous outcome (timeout, 5xx, 429, unparseable/missing body, an unexpected
+    /// status) goes to [`abort`](Self::abort), not here. The current rotation still
+    /// fails (no fresh creds were produced); clearing `pending` only governs whether
+    /// the *next* attempt may proceed.
+    ///
+    /// Not fsync'd: a lost clear leaves `pending` set, which fails safe (re-auth).
+    pub(crate) fn abort_intact(mut self) -> Result<()> {
+        self.state.pending = None;
+        write_atomic(&self.state_path, &state_bytes(&self.state)?, false)?;
+        Ok(())
     }
 }
 
@@ -548,6 +583,32 @@ mod tests {
             store.begin(&MockDecider).unwrap(),
             Begin::ReauthRequired(_)
         ));
+    }
+
+    #[test]
+    fn abort_intact_clears_pending_and_next_begin_retries() {
+        // A provably non-consuming failure (pre-send connect error / clean
+        // grant rejection): the token never went on the wire, so the next run
+        // must be free to retry — NOT fail closed the way plain abort() does.
+        let (_d, store) = store_with(stale());
+        let Begin::Rotate(guard) = store.begin(&MockDecider).unwrap() else {
+            panic!("expected Rotate");
+        };
+        guard.abort_intact().unwrap();
+        assert!(
+            store.read_state().pending.is_none(),
+            "abort_intact clears pending"
+        );
+        // Disk creds untouched (no rotation happened) → still stale → the next
+        // begin hands out a fresh Rotate to retry, not ReauthRequired.
+        let Begin::Rotate(g2) = store.begin(&MockDecider).unwrap() else {
+            panic!("expected a retryable Rotate after abort_intact");
+        };
+        assert_eq!(
+            g2.refresh_token(),
+            "RT0",
+            "the retry re-forwards the intact token"
+        );
     }
 
     #[test]

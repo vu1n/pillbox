@@ -108,6 +108,47 @@ Both kinds coexist in the same run — e.g. `pillbox run --vault --with ANTHROPI
 
 Running `--vault` for an agent that isn't `vault_capable` errors with exit 2.
 
+## OAuth refresh — the broker model
+
+> **Status:** built 2026-06-20 for **claude** (the libkrun backend). ADR-004. The
+> >token-lifetime-session case (slice 2, JIT-refresh-at-proxy) is deferred.
+
+The problem the in-proxy refresh design hit: if the guest agent refreshes its own
+OAuth token (a single-use `refresh_token` grant), pillbox has to intercept, swap,
+forward, and re-stub that exchange — fragile, and across concurrent sessions
+(`dispatch -k`) it races N agents POSTing the *same* shared refresh token, which
+Anthropic treats as theft and revokes the whole family.
+
+The broker model removes the trigger: **the agent never refreshes.** Two pieces,
+both claude-only today (`src/vault/refresh.rs`, `providers/anthropic.rs`):
+
+1. **Far-future stub expiry.** The stub `.credentials.json` the guest sees carries
+   `expiresAt = 4102444800000` (2100-01-01). Claude Code trusts its local expiry and
+   never fires a refresh, so no `/oauth/token` traffic leaves the guest. The MITM
+   still swaps the stub `Authorization: Bearer` for the real access token on the
+   wire (the real creds keep their true expiry — only the stub copy is post-dated).
+   Centaur/iron-proxy use the same sentinel.
+
+2. **Host-side coordinated pre-refresh.** At the start of every vaulted run,
+   `pre_refresh` rotates the *real* token if it's near expiry — routed through the
+   `TokenStore` single-writer core (a cross-process `flock` + an at-most-once
+   `pending` marker), so concurrent launches sharing one subscription refresh **at
+   most once** and the rest coalesce on the result. It **fails closed**: if it can't
+   establish a fresh token it aborts the run with a retry/re-auth next-step rather
+   than leasing a doomed credential (the agent can't self-heal — its expiry says
+   year 2100). A *provably non-consuming* failure (a pre-send connect error, or an
+   RFC-6749 grant rejection) clears `pending` so the next run retries; an ambiguous
+   one leaves it set so no peer ever re-sends a maybe-consumed token.
+
+**Known limit (slice 2 closes it):** a session that runs *longer* than the access
+token's lifetime (~8h) will see the injected real token expire mid-run. The agent
+won't refresh (year-2100 expiry), so Anthropic returns 401 → the agent's own
+retry-on-401 falls back to the **in-proxy** `/oauth/token` path, which still works
+but is *uncoordinated* (the original reuse exposure, now confined to this edge). The
+deferred JIT-refresh-at-proxy — the MITM refreshing the real token on-demand near
+expiry, through the same `TokenStore` — eliminates the 401 entirely and lets the
+in-proxy fallback be deleted.
+
 ## Broker model (v2 — the policy-bound egress broker)
 
 > **Status:** the decision core + CLI are **built** — `pillbox run --vault

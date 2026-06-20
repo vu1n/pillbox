@@ -22,6 +22,7 @@ use super::{
     host_from_uri, mint_stub, swap_raw_header, unauthorized, ApiKeySwap, PendingFlow, Registry,
     SandboxData, VaultProvider,
 };
+use crate::vault::refresh::STUB_FAR_FUTURE_EXPIRES_AT_MS as STUB_EXPIRES_AT_MS;
 use crate::vault::server::ServerInner;
 
 // Provider id matches the AgentSpec id (`claude`) so
@@ -49,16 +50,6 @@ const CREDS_PATH: &str = ".claude/.credentials.json";
 // wire the proxy has swapped them for the real values.
 pub(crate) const STUB_ACCESS_PREFIX: &str = "sk-ant-oat01-";
 pub(crate) const STUB_REFRESH_PREFIX: &str = "sk-ant-ort01-";
-
-/// `expiresAt` stamped into the stub the guest sees: 2100-01-01T00:00:00Z in ms
-/// (the same far-future sentinel centaur/iron-proxy use). This is the broker move —
-/// the guest's Claude Code trusts its local expiry and so **never refreshes itself**,
-/// which dissolves the host-creds clobber and the refresh-token-reuse race in one
-/// stroke (the agent emits no `/oauth/token` traffic). Rotation is owned entirely
-/// host-side: `super::super::refresh::pre_refresh` keeps the *real* token fresh at
-/// run start, and the MITM injects the real `Authorization: Bearer` on the wire. The
-/// real creds keep their true `expiresAt`; only this stub copy is post-dated.
-const STUB_EXPIRES_AT_MS: u64 = 4_102_444_800_000;
 
 pub(crate) struct AnthropicProvider;
 

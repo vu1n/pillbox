@@ -38,5 +38,11 @@ pub(crate) use ca::{cert_path_in as ca_cert_path_in, Ca};
 pub(crate) use egress::{is_denied_egress_ip, EgressPolicy};
 pub(crate) use known_secrets::{HeaderScheme, VaultMeta};
 pub(crate) use lease::SandboxLease;
+// The broker entry points the libkrun backend reuses (it has no `VaultSession`): the
+// coordinated host-side pre-refresh and the far-future stub-expiry sentinel. Gated to
+// libkrun — the docker path reaches `refresh` directly, so this re-export is otherwise
+// unused.
+#[cfg(feature = "libkrun")]
+pub(crate) use refresh::{pre_refresh, STUB_FAR_FUTURE_EXPIRES_AT_MS};
 pub(crate) use server::{RunContext, Server, ServerConfig};
 pub(crate) use session::{OAuthAgent, VaultSession};

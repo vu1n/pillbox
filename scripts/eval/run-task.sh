@@ -64,6 +64,12 @@ case "$condition" in
     kypp_tmp="$(mktemp)"
     kypp briefing --project "${KYPP_PROJECT:-aider}" >"$kypp_tmp" 2>/dev/null
     profile="$kypp_tmp" ;;
+  kypp-recall)
+    # task-conditioned: recall the top-k claims for THIS task's prompt (compose, not dump-all). Tests
+    # the size/precision axis vs `kypp-briefing` — true semantic targeting needs the claims embedded.
+    kypp_tmp="$(mktemp)"
+    kypp recall "$(printf '%s' "$prompt" | head -c 400)" --project "${KYPP_PROJECT:-aider}" --limit 5 >"$kypp_tmp" 2>/dev/null
+    profile="$kypp_tmp" ;;
   *)        profile="$condition" ;;
 esac
 if [ -n "$profile" ] && [ -f "$profile" ]; then

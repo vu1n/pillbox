@@ -96,7 +96,6 @@ class Pillbox:
             "PILLBOX_BACKEND": "libkrun",
             "PILLBOX_RUNNER_IMAGE": cfg.runner_image,
         }
-        self._vm_pids: dict[str, int] = {}  # sid → microVM pid, so rm() reaps the VM it would orphan
 
     def _json(self, args, timeout, cwd=None):
         p = subprocess.run(
@@ -121,14 +120,6 @@ class Pillbox:
             timeout=120,
         )
         sid = d["session"]["id"]
-        # Stash the microVM pid (sandbox_id is a JSON string carrying it) so rm() can reap it:
-        # `session rm` drops the registry entry but ORPHANS the VM process under a long-lived parent.
-        sb = d["session"].get("sandbox_id")
-        if sb:
-            try:
-                self._vm_pids[sid] = int(json.loads(sb)["pid"])
-            except (ValueError, TypeError, KeyError, json.JSONDecodeError):
-                pass
         ws = self._json(["session", "info", sid, "--json"], timeout=30)["session"].get("workspace", "")
         if not ws:
             raise PillboxError(f"session {sid}: no result-workspace (backend not libkrun?)")
@@ -152,17 +143,12 @@ class Pillbox:
         return self._json(args, timeout=self.cfg.max_wait + 60)
 
     def rm(self, sid: str):
+        # `session rm` now reaps the session's microVM at the source (by spec path,
+        # robust to the reparent/own-group drift that the old loop-side `os.kill`
+        # worked around). Discard the "✓ removed" line but let stderr through, so a
+        # reap warning surfaces in the campaign log instead of being swallowed.
         subprocess.run([self.cfg.pillbox, "session", "rm", sid],
-                       capture_output=True, env=self.env, timeout=60)
-        # Reap the specific microVM `session rm` orphans — PRECISE (only THIS session's pid), so it's
-        # safe alongside other users' VMs and gate's own parallel sessions; a blanket pkill would not be.
-        # (The real fix belongs in pillbox `session rm`; this closes the leak loop-side until then.)
-        pid = self._vm_pids.pop(sid, None)
-        if pid:
-            try:
-                os.kill(pid, 9)
-            except OSError:
-                pass
+                       stdout=subprocess.DEVNULL, env=self.env, timeout=60)
 
     @contextmanager
     def session(self, workspace: str, model: str):

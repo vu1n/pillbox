@@ -977,7 +977,7 @@ fn launch_server_vm(
             // hasn't reparented to init yet) before scrubbing the CoW clones, so
             // we don't leave a zombie and don't race the dying child's virtio-fs
             // mounts on the clones we're removing. (The success path leaves the
-            // child running, reparented; `kill_session` reaps that one by pid.)
+            // child running, reparented; `kill_session` reaps that one by spec path.)
             // Read the child's own status FIRST: a SIGABRT'd-at-boot VMM (the swept
             // runtime-dep footgun) has already exited, and our `kill` would otherwise
             // clobber that status with SIGKILL and mask the actionable cause.
@@ -1447,9 +1447,7 @@ pub(crate) fn kill_session(resolved: &Pillbox, session: &crate::session::Session
         unsafe { libc::kill(pid, libc::SIGTERM) };
     }
     let handle = LibkrunHandle::decode(session)?;
-    if handle.pid > 0 {
-        kill_vmm_group(&handle);
-    }
+    reap_vmm_by_spec(&handle.spec);
     let _ = std::fs::remove_file(&handle.sock);
     let _ = std::fs::remove_file(&handle.spec);
     let _ = std::fs::remove_dir_all(&handle.creds);
@@ -1461,64 +1459,103 @@ pub(crate) fn kill_session(resolved: &Pillbox, session: &crate::session::Session
         Some(session),
     );
     crate::session::delete(resolved, &session.id)?;
-    // No host-wide `__krun-vmm` sweep: a reparented VMM carries no per-pillbox
-    // attribution, so a scan can't distinguish a dead local orphan from another
-    // pillbox's *live* VM. We only kill the group we can prove is ours (above).
+    // The reap above is scoped to THIS session's unique spec path — never a blind
+    // host-wide `__krun-vmm` sweep (`~/.pillbox/krun/` is shared across pillboxes,
+    // so a scan can't tell a dead local orphan from another pillbox's *live* VM;
+    // the spec path is the attribution that makes the reap safe).
     println!("pillbox: ✓ session `{}` removed.", session.id);
     Ok(())
 }
 
-/// SIGKILL the VMM child's process group — but only after proving the group is
-/// genuinely ours, so a recycled `handle.pid` can never make us signal an
-/// unrelated group.
+/// SIGKILL the microVM(s) backing this session, attributed by **spec path** rather
+/// than by the pid recorded at spawn.
 ///
-/// killpg, not kill: the VMM child is its own group leader (setsid at spawn), and
-/// `krun_start_enter` may fork a `__krun-vmm` VMM subprocess that survives a
-/// pid-only SIGKILL — signalling the whole group reaps both. `handle.pid` is the
-/// group id (== leader pid after setsid).
+/// Why spec, not `handle.pid`: a server-mode / detached VMM reparents to launchd
+/// and ends up as its OWN process-group leader (`pgid == its own pid`), distinct
+/// from the `handle.pid` group recorded at spawn — so `killpg(handle.pid)` misses
+/// it, and if `handle.pid` has exited or been recycled a pid-gated guard declines
+/// and leaves a live VM. The per-session spec-file path is the durable, unique
+/// attribution key (it's the `__krun-vmm <spec>` argv argument), so scanning for
+/// the live VMM that carries it finds the process regardless of pid/pgid drift.
 ///
-/// Attribution: `handle.spec` is this session's spec-file path, unique per
-/// session and present in the VMM child's argv (it's the `__krun-vmm <spec>`
-/// argument). We confirm `handle.pid` is alive AND its command line carries that
-/// path before the group kill. If the pid is gone or recycled to a process whose
-/// argv lacks our spec path, we do nothing — the VM is already down (or the pid
-/// belongs to something else), and a speculative killpg there is exactly the
-/// cross-group hazard we're guarding against.
-fn kill_vmm_group(handle: &LibkrunHandle) {
-    if vmm_pid_owns_spec(handle.pid, &handle.spec) {
-        unsafe { libc::killpg(handle.pid, libc::SIGKILL) };
-    } else if unsafe { libc::kill(handle.pid, 0) } == 0 {
-        // The pid is alive but its argv didn't carry our spec path, so we can't
-        // prove the group is ours — and we won't `killpg` an unattributed group.
-        // Warn rather than silently leak a microVM that may still hold credentials.
-        eprintln!(
-            "pillbox: warning: couldn't confirm pid {pid} is this session's VMM \
-             (argv didn't match its spec) — leaving it. If a `__krun-vmm` lingers, \
-             reap its group with `kill -- -{pid}`.",
-            pid = handle.pid
-        );
+/// killpg, not kill: the VMM may have forked a subprocess into its group, and
+/// signalling the whole group reaps the leader plus that fork; a pid-only SIGKILL
+/// strands it. Each distinct group is killed once.
+///
+/// Attribution-safe: the spec path is unique to THIS session (a `.keep()`'d
+/// tempfile), so it can't match another pillbox's VM — never a blind host-wide
+/// sweep of `~/.pillbox/krun/` (shared across pillboxes). Nothing carrying the
+/// spec ⇒ the VM is already down (a clean no-op); if `ps` itself can't run,
+/// [`vmm_groups_for_spec`] warns rather than letting the leak go silent.
+fn reap_vmm_by_spec(spec: &str) {
+    let mut killed: Vec<i32> = Vec::new();
+    for (_pid, pgid) in vmm_groups_for_spec(spec) {
+        // pgid must be a real, positive group id: `killpg(0)` would signal OUR OWN
+        // process group (the pillbox CLI + whatever launched it) and a negative
+        // arg is invalid — never let a malformed `ps` line turn a reap into
+        // self-slaughter. A real VMM's pgid is its own pid (setsid), always > 1.
+        if pgid > 1 && !killed.contains(&pgid) {
+            killed.push(pgid);
+            // Result ignored: a group that exited between the scan and here (ESRCH)
+            // is already in the goal state; reaping is best-effort, not a gate.
+            unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        }
     }
 }
 
-/// True iff `pid` is a live `__krun-vmm` process whose argv contains `spec` (the
-/// per-session spec-file path) — the proof a group is ours before `killpg`. A
-/// `ps` read scoped to the one pid; empty/non-matching output (process gone, pid
-/// recycled, or `ps` unavailable) ⇒ `false`, i.e. don't kill. `-ww` so the argv
-/// isn't width-truncated — the spec sits at the END (`__krun-vmm <spec>`), exactly
-/// where a clipped line would drop it, turning a live owned VM into a false "not
-/// ours" and orphaning it.
-fn vmm_pid_owns_spec(pid: i32, spec: &str) -> bool {
-    let Ok(out) = Command::new("ps")
-        .args(["-ww", "-o", "command=", "-p", &pid.to_string()])
+/// `(pid, pgid)` of every live `__krun-vmm` whose argv carries `spec`. One
+/// host-wide `ps` read (`-ax` so a reparented, controlling-terminal-less VMM is
+/// still listed; `-ww` so the trailing `<spec>` arg isn't width-truncated — it
+/// sits at the END of `__krun-vmm <spec>`, exactly where a clipped line would drop
+/// it). Filtering on both the subcommand AND the unique spec path is the
+/// attribution; empty (VM down, or `ps` unavailable) ⇒ no group to reap.
+fn vmm_groups_for_spec(spec: &str) -> Vec<(i32, i32)> {
+    match Command::new("ps")
+        .args(["-axww", "-o", "pid=,pgid=,command="])
         .output()
-    else {
-        return false;
-    };
-    if !out.status.success() {
-        return false;
+    {
+        Ok(out) if out.status.success() => {
+            parse_vmm_groups(&String::from_utf8_lossy(&out.stdout), spec)
+        }
+        // `ps` couldn't run (missing/un-spawnable) or exited non-zero — we could
+        // NOT verify whether a VMM lingers, and `kill_session` is about to delete
+        // the record. Warn loudly rather than silently leak a credential-holding
+        // microVM; this is the user's only signal to reap it by hand. (Empty spec
+        // has nothing to attribute, so stays quiet.)
+        result => {
+            if !spec.is_empty() {
+                let why = result
+                    .err()
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "ps exited non-zero".to_string());
+                eprintln!(
+                    "pillbox: warning: couldn't scan for this session's microVM ({why}); \
+                     if a `__krun-vmm` lingers, reap it with `pkill -9 -f {spec}`."
+                );
+            }
+            Vec::new()
+        }
     }
-    let cmdline = String::from_utf8_lossy(&out.stdout);
-    cmdline.contains("__krun-vmm") && cmdline.contains(spec)
+}
+
+/// Pure parser for [`vmm_groups_for_spec`]: keep `ps` lines whose command carries
+/// both `__krun-vmm` and `spec`, yielding their `(pid, pgid)`. An empty `spec`
+/// matches nothing — the guard against a blank attribution key degenerating into a
+/// match-all (blind host-wide sweep).
+fn parse_vmm_groups(ps_stdout: &str, spec: &str) -> Vec<(i32, i32)> {
+    if spec.is_empty() {
+        return Vec::new();
+    }
+    ps_stdout
+        .lines()
+        .filter(|l| l.contains("__krun-vmm") && l.contains(spec))
+        .filter_map(|l| {
+            let mut fields = l.split_whitespace();
+            let pid = fields.next()?.parse::<i32>().ok()?;
+            let pgid = fields.next()?.parse::<i32>().ok()?;
+            Some((pid, pgid))
+        })
+        .collect()
 }
 
 /// Spawn the VMM child as its own session+group leader, so the whole group (this
@@ -1527,8 +1564,10 @@ fn vmm_pid_owns_spec(pid: i32, spec: &str) -> bool {
 /// `setsid` also detaches the child from the launching CLI's controlling terminal,
 /// which is correct on every path: the guest console rides the vsock attach
 /// channel (PTY) or the agent's HTTP API (server), never this terminal.
-/// Put a DETACHED VMM child in its own session/process group (`setsid`) so
-/// `kill_session`'s `killpg(handle.pid)` reaps the whole group on `session rm`.
+/// Put a DETACHED VMM child in its own session/process group (`setsid`) so the
+/// VMM is a group leader (`pgid == its own pid`) and `kill_session`'s spec-path
+/// reap (`reap_vmm_by_spec` → `killpg(pgid)`) takes down the whole group on
+/// `session rm`, even after the VMM reparents to launchd.
 /// ONLY the detached spawns (`run_detached`, `launch_server_vm`) use this — the
 /// synchronous foreground + grader paths reap via `child.wait` and must NOT
 /// `setsid`: their VMM would otherwise survive in its own session if the CLI is
@@ -1960,5 +1999,74 @@ mod tests {
     fn human_bytes_formats_gib_and_mib() {
         assert_eq!(human_bytes(2 * 1024 * 1024 * 1024), "2.0 GiB");
         assert_eq!(human_bytes(512 * 1024 * 1024), "512.0 MiB");
+    }
+
+    const SPEC: &str = "/var/folders/aa/pillbox-krun-spec-ours.json";
+
+    /// A `ps -axww -o pid=,pgid=,command=` line (leading-padded pid, pgid, argv).
+    fn ps_line(pid: i32, pgid: i32, argv: &str) -> String {
+        format!("{pid:>6} {pgid:>6} {argv}")
+    }
+
+    #[test]
+    fn parse_finds_reparented_vmm_by_spec_not_pid() {
+        // The leak case: a reparented VMM is its OWN group leader (pgid == its own
+        // pid, 9001), NOT the pid recorded at spawn — yet it still carries our spec
+        // in argv, so the spec scan finds it (where `killpg(handle.pid)` would miss).
+        let out = [
+            ps_line(800, 800, "/Users/x/pillbox session rm s-123"),
+            ps_line(
+                9001,
+                9001,
+                &format!("/Users/x/target/debug/pillbox __krun-vmm {SPEC}"),
+            ),
+            ps_line(42, 1, "/sbin/launchd"),
+        ]
+        .join("\n");
+        assert_eq!(parse_vmm_groups(&out, SPEC), vec![(9001, 9001)]);
+    }
+
+    #[test]
+    fn parse_excludes_other_pillboxes_vmm() {
+        // Another pillbox's live VMM carries a DIFFERENT spec path — the attribution
+        // wall: we must never match (and later killpg) it.
+        let theirs = "/var/folders/zz/pillbox-krun-spec-theirs.json";
+        let out = [
+            ps_line(9001, 9001, &format!("/Users/x/pillbox __krun-vmm {SPEC}")),
+            ps_line(7777, 7777, &format!("/Users/y/pillbox __krun-vmm {theirs}")),
+        ]
+        .join("\n");
+        assert_eq!(parse_vmm_groups(&out, SPEC), vec![(9001, 9001)]);
+    }
+
+    #[test]
+    fn parse_empty_spec_matches_nothing() {
+        // A blank attribution key must NOT degenerate into a match-all sweep over
+        // every `__krun-vmm` on the host.
+        let out = ps_line(9001, 9001, "/Users/x/pillbox __krun-vmm /a/b.json");
+        assert!(parse_vmm_groups(&out, "").is_empty());
+    }
+
+    #[test]
+    fn parse_requires_the_krun_vmm_subcommand() {
+        // A process that merely mentions our spec path in argv (e.g. an editor or a
+        // grep) but isn't a `__krun-vmm` is not a VM to reap.
+        let out = ps_line(123, 123, &format!("/usr/bin/vim {SPEC}"));
+        assert!(parse_vmm_groups(&out, SPEC).is_empty());
+    }
+
+    #[test]
+    fn parse_returns_each_matching_pid_for_group_dedup() {
+        // A forked subprocess sharing the leader's group: both pids surface here;
+        // `reap_vmm_by_spec` dedups to one `killpg` per group.
+        let out = [
+            ps_line(9001, 9001, &format!("pillbox __krun-vmm {SPEC}")),
+            ps_line(9002, 9001, &format!("pillbox __krun-vmm {SPEC}")),
+        ]
+        .join("\n");
+        assert_eq!(
+            parse_vmm_groups(&out, SPEC),
+            vec![(9001, 9001), (9002, 9001)]
+        );
     }
 }

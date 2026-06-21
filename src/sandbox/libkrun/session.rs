@@ -673,6 +673,9 @@ fn run_detached(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    // Self-destruct if this CLI dies before the record commits below (an abandoned
+    // detached launch must not orphan its reparented VM).
+    arm_commit_guard(&mut cmd, resolved, session_id);
     vmm_own_process_group(&mut cmd);
     let mut child = cmd
         .spawn()
@@ -882,6 +885,11 @@ fn launch_server_vm(
     let (_, spec_path) = spec_file.keep().context("persist VMM spec")?;
     startup.mark("launch_prepare");
 
+    // The session id is minted BEFORE the spawn so the VMM's self-destruct guard can
+    // watch the record path it'll commit to (an abandoned bring-up must not orphan
+    // this reparented server VM).
+    let session_id = crate::session::Session::new_id();
+
     // Spawn the VM detached (it runs the server + relay, reparented to init).
     let exe = std::env::current_exe().context("locate the pillbox binary to re-exec as VMM")?;
     let mut cmd = Command::new(&exe);
@@ -892,6 +900,7 @@ fn launch_server_vm(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    arm_commit_guard(&mut cmd, resolved, &session_id);
     vmm_own_process_group(&mut cmd);
     let mut child = cmd.spawn().context("spawn the libkrun VMM subprocess")?;
     // No swap pairs (non-vault): hand the child's MITM an empty set + EOF.
@@ -902,7 +911,6 @@ fn launch_server_vm(
     let pid = child.id() as i32;
     startup.mark("vmm_spawn");
 
-    let session_id = crate::session::Session::new_id();
     let http = http::LibkrunHttp::new(host_sock.clone());
     let prompt = opts.args.join(" ").trim().to_string();
 
@@ -1659,6 +1667,28 @@ fn human_bytes(n: u64) -> String {
     } else {
         format!("{:.1} MiB", n as f64 / MIB as f64)
     }
+}
+
+/// Backstop deadline for the VMM self-destruct [`CommitGuard`]: if a detached
+/// launch neither commits its session record nor sees its launcher die within
+/// this window, the VMM self-destructs anyway (covers a recycled/hung owner pid).
+/// Generous — a real launch commits within seconds of bring-up; the owner-death
+/// path handles the common watchdog-`kill -9` case promptly, well before here.
+const COMMIT_DEADLINE_SECS: u64 = 600;
+
+/// Arm a detached VMM's self-destruct guard by setting the `PILLBOX_COMMIT_*` env on
+/// its Command (read + cleared by [`CommitGuard::from_env`](super::CommitGuard) in the
+/// child, so it never reaches the guest). ONLY the reparenting spawns (`run_detached`,
+/// `launch_server_vm`) call this — foreground/grader VMMs are reaped via `child.wait`
+/// and need no guard. The owner pid is THIS launching CLI; the record path is where the
+/// commit lands.
+fn arm_commit_guard(cmd: &mut Command, resolved: &Pillbox, session_id: &str) {
+    cmd.env("PILLBOX_COMMIT_OWNER_PID", std::process::id().to_string())
+        .env(
+            "PILLBOX_COMMIT_RECORD",
+            crate::session::record_path(resolved, session_id),
+        )
+        .env("PILLBOX_COMMIT_DEADLINE", COMMIT_DEADLINE_SECS.to_string());
 }
 
 /// vsock port the guest pty-host dials for the attach channel.

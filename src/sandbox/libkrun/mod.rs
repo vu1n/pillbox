@@ -260,6 +260,15 @@ pub(crate) fn vmm_child_main() -> ! {
         std::process::exit(2);
     }
 
+    // Self-destruct guard (detached/server launches only). A reparented VMM
+    // outlives its launcher by design — but if the launcher is killed BEFORE it
+    // commits the session record (e.g. an eval watchdog `kill -9`s a slow `run`),
+    // nothing ever ties this VM to a session, so neither it nor `session rm` can
+    // reap it: an orphan. The guard watches for the launcher's death before the
+    // record appears and tears this VM down itself. Read (and CLEAR) it before the
+    // env is forwarded to the guest below, so the coordination vars don't leak in.
+    let commit_guard = CommitGuard::from_env(&spec, &spec_path);
+
     // Keep every CString alive until after start_enter.
     let rootfs = cstr(&spec.rootfs);
     let workdir = cstr("/");
@@ -385,9 +394,134 @@ pub(crate) fn vmm_child_main() -> ! {
                 )
             });
         }
+        // Arm the self-destruct watcher just before boot: it self-destructs an
+        // abandoned launch (launcher gone before the record commits). On commit it
+        // returns and the VM lives on independently (reaped later by `session rm`).
+        if let Some(guard) = commit_guard {
+            std::thread::spawn(move || guard.watch());
+        }
         let rc = ffi::krun_start_enter(ctx);
         eprintln!("krun-vmm: start_enter returned {rc} (pre-boot config error)");
         std::process::exit(1);
+    }
+}
+
+/// One of three states the [`CommitGuard`] watcher resolves each poll. Split out as
+/// a pure function so the (otherwise process-killing) decision is unit-testable.
+#[derive(Debug, PartialEq, Eq)]
+enum CommitState {
+    /// Record not yet written, launcher still alive, deadline not reached — keep waiting.
+    Pending,
+    /// The session record exists: the launch committed. Stop watching; the VM is now
+    /// independent and teardown belongs to `session rm`.
+    Committed,
+    /// No record AND (launcher dead OR deadline passed): the launch was abandoned —
+    /// self-destruct so this reparented VM can't orphan.
+    Abandoned,
+}
+
+/// Pure watcher decision. `record_exists` is the commit signal (host wrote the
+/// session record). The deadline is a backstop for an owner pid that was recycled
+/// or hung (so a launch that never commits can't wait forever).
+fn commit_state(record_exists: bool, owner_alive: bool, past_deadline: bool) -> CommitState {
+    if record_exists {
+        CommitState::Committed
+    } else if !owner_alive || past_deadline {
+        CommitState::Abandoned
+    } else {
+        CommitState::Pending
+    }
+}
+
+/// Self-destruct guard for a detached/server VMM. Handed to the VMM child via the
+/// `PILLBOX_COMMIT_*` env (a host-only coordination channel, cleared before the
+/// guest env is composed). See the call site in [`vmm_child_main`].
+struct CommitGuard {
+    /// The launching CLI's pid. The launch is "in progress" while it's alive.
+    owner_pid: i32,
+    /// The session record file the host writes on commit — its EXISTENCE is the
+    /// commit signal ("record exists ⟺ committed", exact, no marker file/race).
+    record_path: std::path::PathBuf,
+    /// Backstop: self-destruct if neither committed nor owner-dead by here (covers a
+    /// recycled/hung owner pid). The owner-death path handles the common case promptly.
+    deadline: std::time::Duration,
+    /// VM artifacts to best-effort remove on self-destruct (this spec file, the CoW
+    /// share clones, the attach socket) — the disk side of the leak. Mirrors what
+    /// `kill_session` scrubs for a recorded session.
+    scrub: Vec<std::path::PathBuf>,
+}
+
+impl CommitGuard {
+    /// Build from the `PILLBOX_COMMIT_*` env, returning `None` (no guard) when any
+    /// var is absent/unparsable — a foreground/grader VMM, or a host too old to set
+    /// them. ALWAYS clears the vars (even on a partial set) so they never forward
+    /// into the guest env at `krun_set_exec`.
+    fn from_env(spec: &VmSpec, spec_path: &str) -> Option<Self> {
+        let owner = std::env::var("PILLBOX_COMMIT_OWNER_PID").ok();
+        let record = std::env::var("PILLBOX_COMMIT_RECORD").ok();
+        let deadline = std::env::var("PILLBOX_COMMIT_DEADLINE").ok();
+        for k in [
+            "PILLBOX_COMMIT_OWNER_PID",
+            "PILLBOX_COMMIT_RECORD",
+            "PILLBOX_COMMIT_DEADLINE",
+        ] {
+            std::env::remove_var(k);
+        }
+        let owner_pid: i32 = owner?.parse().ok()?;
+        let deadline_secs: u64 = deadline?.parse().ok()?;
+        let record_path = record?;
+        let mut scrub: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from(spec_path)];
+        scrub.extend(
+            spec.shares
+                .iter()
+                .map(|s| std::path::PathBuf::from(&s.host_path)),
+        );
+        if let Some(v) = &spec.vsock {
+            scrub.push(std::path::PathBuf::from(&v.host_sock));
+        }
+        Some(CommitGuard {
+            owner_pid,
+            record_path: std::path::PathBuf::from(record_path),
+            deadline: std::time::Duration::from_secs(deadline_secs),
+            scrub,
+        })
+    }
+
+    /// Poll until the launch commits (record appears → return, VM lives) or is
+    /// abandoned (→ scrub artifacts and `exit`, tearing the VM down). Runs in its own
+    /// thread beside `krun_start_enter`; never returns on the abandoned path.
+    fn watch(self) {
+        let start = std::time::Instant::now();
+        loop {
+            let record_exists = self.record_path.exists();
+            // kill(pid,0): 0 ⇒ alive; -1/EPERM ⇒ alive (exists, not signalable);
+            // -1/ESRCH ⇒ gone. Only read errno when kill returned -1.
+            let owner_alive = unsafe { libc::kill(self.owner_pid, 0) } == 0
+                || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
+            let past_deadline = start.elapsed() >= self.deadline;
+            match commit_state(record_exists, owner_alive, past_deadline) {
+                CommitState::Committed => return,
+                CommitState::Pending => std::thread::sleep(std::time::Duration::from_millis(300)),
+                CommitState::Abandoned => {
+                    // Final re-check after a short grace: the launcher may have written
+                    // the record and exited between two polls (commit-then-exit is ~instant).
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    if self.record_path.exists() {
+                        return;
+                    }
+                    eprintln!(
+                        "krun-vmm: launch abandoned (no session record at {}; owner pid {} gone) \
+                         — self-destructing to avoid an orphan microVM",
+                        self.record_path.display(),
+                        self.owner_pid
+                    );
+                    for p in &self.scrub {
+                        let _ = std::fs::remove_file(p).or_else(|_| std::fs::remove_dir_all(p));
+                    }
+                    std::process::exit(70);
+                }
+            }
+        }
     }
 }
 
@@ -1071,5 +1205,54 @@ mod tests {
         let b = mint_curated_stub("pb-codex-oat-");
         assert!(a.starts_with("pb-codex-oat-pllbxstub"));
         assert_ne!(a, b, "uuid suffix must make each stub unique");
+    }
+
+    use super::{commit_state, CommitState};
+
+    #[test]
+    fn commit_state_record_present_always_commits() {
+        // The record is the commit signal: once it exists, the launch is committed —
+        // independent of owner liveness or deadline (don't self-destruct a live session
+        // whose owner CLI has since exited, the normal detached steady state).
+        assert_eq!(commit_state(true, true, false), CommitState::Committed);
+        assert_eq!(commit_state(true, false, false), CommitState::Committed);
+        assert_eq!(commit_state(true, false, true), CommitState::Committed);
+    }
+
+    #[test]
+    fn commit_state_no_record_and_owner_alive_waits() {
+        // Bring-up still in progress: launcher alive, record not yet written, deadline
+        // not reached → keep waiting, never self-destruct.
+        assert_eq!(commit_state(false, true, false), CommitState::Pending);
+    }
+
+    #[test]
+    fn commit_state_no_record_and_owner_dead_is_abandoned() {
+        // The leak case: launcher (e.g. a watchdog `kill -9`'d `run`) gone before it
+        // committed → abandoned → self-destruct.
+        assert_eq!(commit_state(false, false, false), CommitState::Abandoned);
+    }
+
+    #[test]
+    fn commit_state_no_record_past_deadline_is_abandoned() {
+        // Backstop: owner pid still "alive" (recycled or hung) but the deadline passed
+        // with no record → abandoned anyway, so an uncommitted VM can't wait forever.
+        assert_eq!(commit_state(false, true, true), CommitState::Abandoned);
+    }
+
+    #[test]
+    fn watch_returns_without_self_destruct_when_record_present() {
+        // The catastrophic case to rule out: a COMMITTED session (record file present)
+        // must never self-destruct. `watch()` must return promptly here; had it wrongly
+        // taken the Abandoned branch it would `exit(70)` and kill this whole test binary
+        // — so the test passing IS the proof. Record present + owner alive (this pid).
+        let rec = tempfile::NamedTempFile::new().unwrap();
+        let guard = super::CommitGuard {
+            owner_pid: std::process::id() as i32,
+            record_path: rec.path().to_path_buf(),
+            deadline: std::time::Duration::from_secs(5),
+            scrub: Vec::new(),
+        };
+        guard.watch();
     }
 }

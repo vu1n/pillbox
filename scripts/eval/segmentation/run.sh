@@ -267,8 +267,19 @@ launch_session() {
 # segment handoff) first.
 reap_session() { # sid
   [ -n "$1" ] || return 0
-  local info; info="$("$PILLBOX" session info "$1" --json 2>/dev/null)"
+  local info pid; info="$("$PILLBOX" session info "$1" --json 2>/dev/null)"
+  pid="$(printf '%s' "$info" | python3 -c 'import json,sys
+try: print(json.loads(json.load(sys.stdin)["session"]["sandbox_id"])["pid"])
+except Exception: pass' 2>/dev/null)"
   "$PILLBOX" session rm "$1" >/dev/null 2>&1
+  # Escalation: a wedged HVF VMM can fail kill_vmm_group's conservative argv-
+  # attribution check, which then LEAVES it (record deleted anyway) → orphan. We
+  # just removed THIS session, so `pid` is provably our orphan (none of the cross-
+  # pillbox hazard the attribution guard exists for) — force-kill its group.
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    kill -- -"$pid" 2>/dev/null; sleep 1
+    kill -0 "$pid" 2>/dev/null && kill -9 -- -"$pid" 2>/dev/null
+  fi
   printf '%s' "$info" | python3 -c '
 import json, sys, os, shutil
 try: sb = json.loads(json.load(sys.stdin)["session"]["sandbox_id"])

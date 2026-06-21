@@ -92,6 +92,20 @@ pub(crate) fn sessions_root_path(pb: &Pillbox) -> PathBuf {
     pb.subdir_path(SESSIONS_DIR)
 }
 
+/// Absolute path of a session's record file — exactly where [`write`] persists it
+/// (`<pillbox>/sessions/<id>.toml`, the path the `SessionRegistry` composes). The
+/// libkrun commit-guard watches this path: its existence is the "launch committed"
+/// signal that keeps a detached VMM from self-destructing. Pinned to `write`'s
+/// real path by a test (`record_path_matches_write`).
+///
+/// libkrun-only: its sole caller is the commit-guard wiring (`arm_commit_guard`),
+/// feature-gated — so without the feature this would be dead code (a `-D warnings`
+/// build error).
+#[cfg(feature = "libkrun")]
+pub(crate) fn record_path(pb: &Pillbox, id: &str) -> PathBuf {
+    sessions_root_path(pb).join(format!("{id}.toml"))
+}
+
 /// Registry plumbing for sessions. No-inheritance — a session is
 /// concrete runtime state tied to the pillbox that started it, so we
 /// implement [`Registry`] but not `InheritedRegistry`.
@@ -751,6 +765,26 @@ mod tests {
             assert_eq!(back.backend, BACKEND_DOCKER);
             assert_eq!(back.pty_pid, 42);
             assert!(back.attached_pid.is_none());
+        });
+    }
+
+    #[cfg(feature = "libkrun")]
+    #[test]
+    fn record_path_matches_write() {
+        // The libkrun commit-guard self-destructs a detached VMM unless this exact
+        // path exists — so it MUST be where `write` actually persists the record. A
+        // drift here would make every launch look "abandoned" and kill itself.
+        with_isolated_home("session-record-path", || {
+            let g = pillbox::global();
+            let s = make(BACKEND_LIBKRUN);
+            let expected = record_path(&g, &s.id);
+            assert!(!expected.exists(), "record must not exist before write");
+            write(&g, &s).unwrap();
+            assert!(
+                expected.exists(),
+                "record_path() must point at the file write() creates: {}",
+                expected.display()
+            );
         });
     }
 

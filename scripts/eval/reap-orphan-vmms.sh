@@ -1,8 +1,19 @@
 #!/usr/bin/env bash
+# DEPRECATED — both leak paths below are now fixed at the SOURCE in pillbox; this
+# host-side daemon is a TRANSITIONAL net only (for orphans left by an OLD binary,
+# or pre-fix strays). With a current `pillbox` it should find nothing to reap.
+#   - Path 1 (wedged/argv-drift VMM survives `session rm`): fixed — `session rm`
+#     now reaps by SPEC PATH (`reap_vmm_by_spec`), drift-proof past the reparent.
+#   - Path 2 (launcher `kill -9`'d before the record commits → orphan-no-record):
+#     fixed — a detached VMM arms a self-destruct COMMIT GUARD and tears its own VM
+#     down if its launcher dies before the session record appears. The VMM cleans up
+#     after itself, so the host no longer reaps across independent pillboxes.
+# Retire this once campaigns run the fixed binary everywhere.
+#
 # Periodic orphan-`__krun-vmm` reaper for DEDICATED libkrun eval runs.
 #
-# Why this exists: a clean `session rm` reaps its VMM correctly, but under
-# concurrent churn two leak paths survive it —
+# Why this existed: a clean `session rm` reaps its VMM correctly, but under
+# concurrent churn two leak paths survived it —
 #   1. a wedged/half-launched HVF VMM whose `ps` argv no longer matches its spec
 #      path → `kill_vmm_group`'s attribution check fails → it takes the "leave it"
 #      branch (warning suppressed by the rig's 2>&1) and the record is deleted

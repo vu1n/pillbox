@@ -13,7 +13,7 @@
 //! model = "zai-coding-plan/glm-4.5-air"   # provider/model; None → agent's own default
 //!
 //! [runner]
-//! image = "pillbox-runner:l7"   # the sandbox image (else the published default)
+//! image = "pillbox-runner:dev"   # the sandbox image (else the published default)
 //!
 //! [workspace]
 //! backend = "local"        # or "s3"

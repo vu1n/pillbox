@@ -24,7 +24,7 @@ kypp's governed memory (no second store):
 
 | ACE stage | ghost does | kypp verb |
 |---|---|---|
-| inject playbook | prepend the digest to the prompt | **`kypp briefing`** |
+| inject playbook | prepend task-relevant claims to the prompt | **`kypp recall <task>`** (compose) |
 | Generator | run the worker, grade it | `pillbox run` + `session score` |
 | Reflector | mine the failure trajectory → lessons | **`kypp capture --distill`** |
 | Curator | dedup / promote-corroborated / supersede | **`kypp consolidate`** |
@@ -32,6 +32,11 @@ kypp's governed memory (no second store):
 
 ACE bullets become kypp claims, inheriting governance (authority, corroboration,
 staleness) that AxACE's flat playbook lacks.
+
+Injection is task-conditioned `recall` by default, **not** `briefing` (dump-all):
+dumping the full store pollutes a cheap model (scores below baseline — kypp handoff
+`HANDOFF-kypp-kimi.md` §2.1). `--inject {recall,briefing,none}` selects compose /
+dump-all / baseline for the ablation; semantic targeting needs `KYPP_EMBED_MODEL`.
 
 **What it measures:** held-out quality as the playbook grows over iterations — the
 *accrual* question ("does remembering lessons help?"), kept honest by a fixed held-out

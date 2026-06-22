@@ -23,7 +23,7 @@ prompt (the proven mechanism from the eval A/B).
 ```sh
 # build+sign the libkrun binary, import a task pool, then:
 python3 ../eval/import-aider-polyglot.py --limit 12
-PILLBOX_RUNNER_IMAGE=pillbox-runner:l7 MODEL=zai-coding-plan/glm-5.1 TRIALS=3 ./optimize.sh --rounds 2
+PILLBOX_RUNNER_IMAGE=pillbox-runner:dev MODEL=zai-coding-plan/glm-5.1 TRIALS=3 ./optimize.sh --rounds 2
 ```
 
 ## `propose.sh` — the self-improvement core (validated)

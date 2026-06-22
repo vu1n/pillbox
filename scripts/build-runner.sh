@@ -20,7 +20,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 DOCKERFILE=runner/Dockerfile
-TAG=pillbox-runner:l7   # the tag the ghost/ace/eval/dispatch/dogfood stack defaults to
+TAG=pillbox-runner:dev   # moving dev tag — every local script + a dev pillbox.toml default to it
 DO_UPDATE=0 DRY_RUN=0 NO_CACHE=0 PRUNE=0
 
 usage() {
@@ -31,7 +31,7 @@ Usage: scripts/build-runner.sh [options]
   -u, --update       resolve each agent's latest version, rewrite the pins in
                      runner/Dockerfile, rebuild, verify
       --dry-run      with --update: print what would change, don't write or build
-  -t, --tag TAG      image tag to build (default: pillbox-runner:l7)
+  -t, --tag TAG      image tag to build (default: pillbox-runner:dev)
       --no-cache     force a clean rebuild (pass --no-cache to docker)
       --prune-rootfs after build, drop stale libkrun rootfs generations for this
                      tag (run only when no sessions are using the old image)

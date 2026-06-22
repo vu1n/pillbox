@@ -236,7 +236,7 @@ confirmed:
 # (an external cargo build clobbers target/debug → docker fallback → silent zeros):
 cp target/debug/pillbox /tmp/pb && python3 scripts/eval/import-aider-polyglot.py --limit 20
 PILLBOX=/tmp/pb MODEL=zai-coding-plan/glm-5.1 TRIALS=10 PILLBOX_BACKEND=libkrun \
-  PILLBOX_RUNNER_IMAGE=pillbox-runner:l7 \
+  PILLBOX_RUNNER_IMAGE=pillbox-runner:dev \
   OUT=scripts/eval/segmentation/results/ap_pov-glm51-n10.jsonl \
   scripts/eval/segmentation/run.sh scripts/eval/tasks/ap_pov
 ```
@@ -310,7 +310,7 @@ holds across tasks, with a richer understanding: decomposition buys *both* varia
 # → stalls; see ../memory pillbox-libkrun-host-fragility). The harness reaps krun state per
 # session, but the runner images/rootfs cache still need headroom.
 PILLBOX=/tmp/pb MODEL=zai-coding-plan/glm-5.1 TRIALS=10 MAX_WAIT=600 PILLBOX_BACKEND=libkrun \
-  PILLBOX_RUNNER_IMAGE=pillbox-runner:l7 \
+  PILLBOX_RUNNER_IMAGE=pillbox-runner:dev \
   OUT=scripts/eval/segmentation/results/h1-3task-glm51-n10.jsonl \
   scripts/eval/segmentation/run.sh \
     scripts/eval/tasks/ap_dot_dsl scripts/eval/tasks/ap_grade_school scripts/eval/tasks/ap_pov

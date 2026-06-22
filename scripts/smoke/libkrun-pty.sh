@@ -8,7 +8,7 @@
 # CI is unit-only (no libkrun, no live agent), so this is the only guard against
 # "unit-green, live-broken" for the IDE drive+read loop.
 #
-#   Usage: scripts/smoke/libkrun-pty.sh [agent] [runner-image]   (default: claude pillbox-runner:l7)
+#   Usage: scripts/smoke/libkrun-pty.sh [agent] [runner-image]   (default: claude pillbox-runner:dev)
 # Env: SMOKE_TIMEOUT (per-turn idle wait, default 240s).
 # Prereqs: a codesigned libkrun binary (scripts/lk-build.sh), the agent authed
 #          (`pillbox auth login --agent …`), the runner image present.
@@ -16,7 +16,7 @@ set -uo pipefail
 cd "$(dirname "$0")/../.."
 
 AGENT="${1:-claude}"
-IMAGE="${2:-pillbox-runner:l7}"
+IMAGE="${2:-pillbox-runner:dev}"
 TIMEOUT="${SMOKE_TIMEOUT:-240}"
 PB=./target/debug/pillbox
 export PILLBOX_BACKEND=libkrun PILLBOX_RUNNER_IMAGE="$IMAGE"

@@ -106,7 +106,7 @@ class GhostConfig:
     evals_pillbox: str = "evals"
     trials: int = 1
     max_wait: int = 240
-    runner_image: str = "pillbox-runner:l7"
+    runner_image: str = "pillbox-runner:dev"
     limit: int = 0
     local_model_port: int = 11434  # the libkrun host-forward port (local worker reachability)
 
@@ -196,7 +196,7 @@ def main():
     ap.add_argument("--evals-pillbox", default="evals")
     ap.add_argument("--trials", type=int, default=1)
     ap.add_argument("--max-wait", type=int, default=240)
-    ap.add_argument("--runner-image", default=os.environ.get("PILLBOX_RUNNER_IMAGE", "pillbox-runner:l7"))
+    ap.add_argument("--runner-image", default=os.environ.get("PILLBOX_RUNNER_IMAGE", "pillbox-runner:dev"))
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--out", default="ghost-run.json")
     args = ap.parse_args()

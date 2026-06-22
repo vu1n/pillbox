@@ -42,10 +42,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Tag scheme:
+      # Tag scheme (see docs/decisions.md — runner tags name roles, not history):
       #   PR              → ghcr.io/vu1n/pillbox-runner:pr-NN  (build-only, never pushed)
-      #   push to main    → ghcr.io/vu1n/pillbox-runner:rolling
-      #   tag vX.Y.Z      → ghcr.io/vu1n/pillbox-runner:vX.Y.Z
+      #   push to main    → ghcr.io/vu1n/pillbox-runner:dev   (moving dev tag)
+      #   tag vX.Y.Z      → ghcr.io/vu1n/pillbox-runner:vX.Y.Z (immutable, pin for repro)
       #   stable semver   → also moves :latest (handled by flavor=auto,
       #                     which skips prereleases like v0.1.0-alpha.2)
       - id: meta
@@ -54,7 +54,7 @@ jobs:
           images: ghcr.io/${{ github.repository_owner }}/pillbox-runner
           tags: |
             type=ref,event=pr,prefix=pr-
-            type=raw,value=rolling,enable={{is_default_branch}}
+            type=raw,value=dev,enable={{is_default_branch}}
             type=semver,pattern={{version}}
           flavor: |
             latest=auto

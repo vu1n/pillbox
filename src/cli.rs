@@ -504,6 +504,30 @@ pub(crate) enum SessionAction {
         #[arg(long, value_name = "SEQ")]
         from: Option<u64>,
     },
+    /// Circuit-breaker over a session's LIVE §0 stream: subscribe, run a pure
+    /// pathology detector over each event, and on a trip either kill the session
+    /// (`--kill`) or just log the trip and exit 0 (the default dry-run). A
+    /// standalone monitor — NOT wired into `dispatch`'s send→wait-idle loop.
+    /// Detects: a repeated-identical tool call, an error spiral / `RunFailed`,
+    /// and a cumulative-token blowout. With no `--max-*` flags set, it trips only
+    /// on `RunFailed`. Returns when it trips, the stream ends, or Ctrl-C.
+    Guard {
+        id: String,
+        /// Trip if the same tool call (name + input) fires this many times in a
+        /// row, or this many consecutive tool errors occur. 0 disables both the
+        /// repeat and error-spiral detectors (`RunFailed` still trips).
+        #[arg(long = "max-repeats", value_name = "N", default_value_t = 0)]
+        max_repeats: u32,
+        /// Trip if the session's cumulative `Usage` tokens (input + output)
+        /// exceed this budget. 0 disables the token-blowout detector.
+        #[arg(long = "max-tokens", value_name = "N", default_value_t = 0)]
+        max_tokens: u64,
+        /// Arm termination: on a trip, tear down the session (the orphan-safe
+        /// `session rm` kill path). Without it (the default), a trip is logged
+        /// and the guard exits 0 — a dry run, since `--kill` can destroy a VM.
+        #[arg(long)]
+        kill: bool,
+    },
     /// Tear down every session whose `expires_at` is in the past.
     /// Drives `session rm` for each — sandbox killed, record deleted.
     /// Sessions with no `expires_at` (no `--ttl` at spawn) are left

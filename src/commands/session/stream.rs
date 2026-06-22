@@ -263,11 +263,191 @@ pub(super) fn session_wait_idle(
     }
 }
 
+/// A §0 circuit-breaker: subscribe to a session's LIVE event stream, run a pure
+/// pathology detector over each event, and on a trip either kill the session
+/// (`kill`) or just log it (the default dry-run). Modeled on the
+/// [`spawn_webhook_log_exporter`](crate::events::spawn_webhook_log_exporter)
+/// precedent — an external consumer that live-tails §0 and acts — but the action
+/// is "kill" (or log) instead of "POST", and it runs in the foreground (the sink
+/// returns `false` once tripped, ending the subscribe loop).
+///
+/// A standalone monitor: it does NOT touch `dispatch`'s synchronous
+/// send→wait-idle loop (wiring it in is a deliberate follow-up). The kill reuses
+/// `session rm`'s exact path (`live_session(&s).kill`) — orphan-safe (reap-by-
+/// unique-spec), so no host-wide `~/.pillbox/krun` sweep. A resolve-miss (the
+/// session was already removed) is tolerated: log + exit 0.
+pub(super) fn session_guard(
+    resolved: &Pillbox,
+    id: &str,
+    max_repeats: u32,
+    max_tokens: u64,
+    kill: bool,
+) -> Result<()> {
+    use std::sync::atomic::AtomicBool;
+
+    // Spawn the live drain (same as `wait-idle`) so the log fills while we watch
+    // a `send`-driven/headless session — the tailer guard lives until fn return.
+    let (sid, _tailer) = resolve_streaming_session(resolved, id)?;
+    eprintln!(
+        "pillbox: guarding session {sid} (max-repeats={max_repeats}, max-tokens={max_tokens}, \
+         {}); Ctrl-C to stop",
+        if kill { "armed: --kill" } else { "dry-run" }
+    );
+    // Read through the placement swap point (local file or managed DO), like
+    // `watch`. Subscribe from the current head — a breaker reacts to NEW
+    // pathology, not a past one (mirrors the webhook exporter's `last_seq + 1`).
+    let from = crate::events::log::SessionLog::open(resolved, &sid)?.last_seq() + 1;
+    let source = crate::events::source::open_event_source(resolved, &sid)?;
+
+    let mut detector = PathologyDetector::new(max_repeats, max_tokens);
+    let mut tripped: Option<String> = None;
+    // Never set in-process: Ctrl-C ends the process; the sink ends the loop on a
+    // trip by returning `false`. `_tailer` lives until then.
+    let stop = AtomicBool::new(false);
+    source.subscribe(from, &stop, &mut |ev| match detector.observe(ev) {
+        Some(reason) => {
+            tripped = Some(reason);
+            false // stop subscribing — we've seen the pathology
+        }
+        None => true,
+    })?;
+
+    let reason = match tripped {
+        Some(r) => r,
+        None => {
+            // The stream ended (managed DO close / EOF) without a trip.
+            eprintln!("pillbox: guard on session `{sid}` ended without tripping");
+            return Ok(());
+        }
+    };
+    eprintln!("pillbox: ⚠ guard tripped on session `{sid}`: {reason}");
+    if !kill {
+        println!("pillbox: would kill session `{sid}` ({reason}) — re-run with --kill to arm");
+        return Ok(());
+    }
+    // Arm the teardown: reuse `session rm`'s orphan-safe kill exactly. Resolve
+    // first (the breaker held only the streaming sid); a resolve-miss means the
+    // session is already gone — log + exit 0 rather than erroring.
+    let Ok(s) = session::resolve(resolved, &sid) else {
+        eprintln!("pillbox: session `{sid}` already removed; nothing to kill");
+        return Ok(());
+    };
+    sandbox::live_session(&s)?.kill(resolved)?;
+    println!("pillbox: ✓ guard killed session `{sid}` ({reason})");
+    Ok(())
+}
+
+/// A PURE pathology detector over a session's §0 event stream — no I/O, so it's
+/// unit-tested over a `&[Event]` (the `select_winner`/`distill_feedback` pure-
+/// policy pattern). `observe` folds one event into the running state and returns
+/// `Some(reason)` the first time a signal trips. Three signals:
+///   1. **Repeated identical tool call** — consecutive `ToolStatus::Running`
+///      with the same (name, input) key, `>= max_repeats` times (when > 0).
+///   2. **Error spiral** — `>= max_repeats` consecutive `ToolStatus::Error`
+///      (same threshold), and any `RunFailed` is an immediate trip.
+///   3. **Token blowout** — cumulative `Usage` input+output tokens past
+///      `max_tokens` (when > 0).
+///
+/// With both thresholds 0, only `RunFailed` trips.
+struct PathologyDetector {
+    /// Consecutive-identical-ToolCall threshold AND consecutive-error threshold;
+    /// 0 disables both (RunFailed still trips).
+    max_repeats: u32,
+    /// Cumulative input+output token budget; 0 disables the blowout detector.
+    max_tokens: u64,
+    /// The (name, input) key of the last `Running` tool call + its run length.
+    last_call: Option<(String, String)>,
+    repeat_run: u32,
+    /// Consecutive `ToolStatus::Error` count.
+    error_run: u32,
+    /// Running sum of `Usage` input+output tokens.
+    tokens: u64,
+}
+
+impl PathologyDetector {
+    fn new(max_repeats: u32, max_tokens: u64) -> Self {
+        Self {
+            max_repeats,
+            max_tokens,
+            last_call: None,
+            repeat_run: 0,
+            error_run: 0,
+            tokens: 0,
+        }
+    }
+
+    /// Fold one event into the detector; `Some(reason)` on the first trip.
+    fn observe(&mut self, ev: &crate::contract::Event) -> Option<String> {
+        use crate::contract::{Payload, ToolStatus};
+        match &ev.payload {
+            // A run-level failure is always an immediate trip.
+            Payload::RunFailed(f) => {
+                return Some(format!("run failed: {}", f.reason));
+            }
+            Payload::ToolCall(t) => match t.status {
+                ToolStatus::Running => {
+                    // A non-error step breaks an error spiral.
+                    self.error_run = 0;
+                    // Key on (name, input): the same call with the same args,
+                    // back to back, is the spin. `input` is canonicalized to a
+                    // string so equality is structural, not pointer.
+                    let key = (
+                        t.name.clone(),
+                        t.input
+                            .as_ref()
+                            .map(ToString::to_string)
+                            .unwrap_or_default(),
+                    );
+                    if self.last_call.as_ref() == Some(&key) {
+                        self.repeat_run += 1;
+                    } else {
+                        self.last_call = Some(key);
+                        self.repeat_run = 1;
+                    }
+                    if self.max_repeats > 0 && self.repeat_run >= self.max_repeats {
+                        let (name, _) = self.last_call.as_ref().expect("set above");
+                        return Some(format!(
+                            "repeated tool call `{name}` {}× in a row",
+                            self.repeat_run
+                        ));
+                    }
+                }
+                ToolStatus::Error => {
+                    self.error_run += 1;
+                    if self.max_repeats > 0 && self.error_run >= self.max_repeats {
+                        return Some(format!(
+                            "{}× consecutive tool errors (error spiral)",
+                            self.error_run
+                        ));
+                    }
+                }
+                // A completed/other tool status breaks the error spiral; it
+                // isn't a `Running` start, so the repeat run is untouched.
+                ToolStatus::Completed | ToolStatus::Unspecified => {
+                    self.error_run = 0;
+                }
+            },
+            Payload::Usage(u) => {
+                self.tokens += u.input_tokens.unwrap_or(0) + u.output_tokens.unwrap_or(0);
+                if self.max_tokens > 0 && self.tokens > self.max_tokens {
+                    return Some(format!(
+                        "token blowout: {} tokens > budget {}",
+                        self.tokens, self.max_tokens
+                    ));
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::format_watch_event;
+    use super::{format_watch_event, PathologyDetector};
     use crate::contract::{
-        Actor, Annotation, Event, Input, InputTarget, MessageDelta, Payload, Role,
+        Actor, Annotation, Event, Input, InputTarget, MessageDelta, Payload, Role, RunFailed,
+        ToolCall, ToolStatus, Usage, UsageSource,
     };
 
     fn msg(text: &str) -> Payload {
@@ -317,5 +497,187 @@ mod tests {
         .with_actor(Actor::human("bob"));
         let line = format_watch_event(&ev, Role::Unspecified).unwrap();
         assert_eq!(line, "✎ [u:bob] noted @src/net.rs: watch the retry path");
+    }
+
+    // ── PathologyDetector (pure; no VM) ──────────────────────────────────────
+
+    /// A `Running` tool call with `name` + JSON `input`.
+    fn running(name: &str, input: serde_json::Value) -> Event {
+        Event::session(
+            "s",
+            Payload::ToolCall(ToolCall {
+                tool_call_id: format!("tc-{name}"),
+                name: name.into(),
+                status: ToolStatus::Running,
+                input: Some(input),
+                output: String::new(),
+                title: String::new(),
+            }),
+        )
+    }
+
+    /// A tool call with an explicit status (for error-spiral / completed cases).
+    fn tool_status(name: &str, status: ToolStatus) -> Event {
+        Event::session(
+            "s",
+            Payload::ToolCall(ToolCall {
+                tool_call_id: format!("tc-{name}"),
+                name: name.into(),
+                status,
+                input: None,
+                output: String::new(),
+                title: String::new(),
+            }),
+        )
+    }
+
+    /// A `Usage` event carrying `input`/`output` token counts.
+    fn usage(input: u64, output: u64) -> Event {
+        Event::session(
+            "s",
+            Payload::Usage(Usage {
+                message_id: "m".into(),
+                input_tokens: Some(input),
+                output_tokens: Some(output),
+                cache_read_input_tokens: None,
+                cache_creation_input_tokens: None,
+                source: UsageSource::Wire,
+            }),
+        )
+    }
+
+    /// Fold a slice through the detector, returning the first trip reason (pure).
+    fn first_trip(d: &mut PathologyDetector, events: &[Event]) -> Option<String> {
+        events.iter().find_map(|ev| d.observe(ev))
+    }
+
+    #[test]
+    fn trips_after_n_identical_running_tool_calls() {
+        // The same (name, input) call three times in a row trips at max_repeats=3.
+        let evs = [
+            running("Bash", serde_json::json!({"command": "ls"})),
+            running("Bash", serde_json::json!({"command": "ls"})),
+            running("Bash", serde_json::json!({"command": "ls"})),
+        ];
+        let mut d = PathologyDetector::new(3, 0);
+        let trip = first_trip(&mut d, &evs).expect("3 identical calls must trip");
+        assert!(trip.contains("repeated tool call"), "{trip}");
+        assert!(trip.contains("Bash"), "{trip}");
+    }
+
+    #[test]
+    fn does_not_trip_on_distinct_or_interleaved_calls() {
+        // N distinct calls (different inputs) never reach a run of max_repeats.
+        let distinct = [
+            running("Bash", serde_json::json!({"command": "ls"})),
+            running("Bash", serde_json::json!({"command": "pwd"})),
+            running("Bash", serde_json::json!({"command": "cat x"})),
+        ];
+        let mut d = PathologyDetector::new(3, 0);
+        assert!(
+            first_trip(&mut d, &distinct).is_none(),
+            "distinct inputs must not trip"
+        );
+
+        // Healthy interleaving: same call, but a different call breaks each run.
+        let interleaved = [
+            running("Bash", serde_json::json!({"command": "ls"})),
+            running("Read", serde_json::json!({"path": "a"})),
+            running("Bash", serde_json::json!({"command": "ls"})),
+            running("Read", serde_json::json!({"path": "a"})),
+        ];
+        let mut d = PathologyDetector::new(2, 0);
+        assert!(
+            first_trip(&mut d, &interleaved).is_none(),
+            "interleaved calls must not trip"
+        );
+    }
+
+    #[test]
+    fn trips_on_consecutive_errors_and_immediately_on_run_failed() {
+        // Two consecutive tool errors trip at max_repeats=2.
+        let errs = [
+            tool_status("Bash", ToolStatus::Error),
+            tool_status("Bash", ToolStatus::Error),
+        ];
+        let mut d = PathologyDetector::new(2, 0);
+        let trip = first_trip(&mut d, &errs).expect("error spiral must trip");
+        assert!(trip.contains("consecutive tool errors"), "{trip}");
+
+        // RunFailed trips immediately, regardless of thresholds (both 0 here).
+        let failed = [Event::session(
+            "s",
+            Payload::RunFailed(RunFailed {
+                reason: "boom".into(),
+                exit_code: 1,
+            }),
+        )];
+        let mut d = PathologyDetector::new(0, 0);
+        let trip = first_trip(&mut d, &failed).expect("RunFailed must always trip");
+        assert!(trip.contains("run failed"), "{trip}");
+        assert!(trip.contains("boom"), "{trip}");
+    }
+
+    #[test]
+    fn trips_when_cumulative_tokens_exceed_budget() {
+        // Cumulative input+output crosses the budget on the second Usage.
+        let evs = [usage(40, 30), usage(20, 20)]; // 70, then 110
+        let mut d = PathologyDetector::new(0, 100);
+        let trip = first_trip(&mut d, &evs).expect("110 > 100 must trip");
+        assert!(trip.contains("token blowout"), "{trip}");
+
+        // Below budget: no trip.
+        let mut d = PathologyDetector::new(0, 100);
+        assert!(
+            first_trip(&mut d, &[usage(40, 30)]).is_none(),
+            "70 <= 100 must not trip"
+        );
+    }
+
+    #[test]
+    fn a_differing_event_resets_the_run() {
+        // Two identical calls, a different call, then two more identical: no run
+        // ever reaches three, so max_repeats=3 must not trip.
+        let evs = [
+            running("Bash", serde_json::json!({"command": "ls"})),
+            running("Bash", serde_json::json!({"command": "ls"})),
+            running("Read", serde_json::json!({"path": "x"})),
+            running("Bash", serde_json::json!({"command": "ls"})),
+            running("Bash", serde_json::json!({"command": "ls"})),
+        ];
+        let mut d = PathologyDetector::new(3, 0);
+        assert!(
+            first_trip(&mut d, &evs).is_none(),
+            "a differing call must reset the repeat run"
+        );
+
+        // Likewise a non-error (Completed) step breaks an error spiral.
+        let evs = [
+            tool_status("Bash", ToolStatus::Error),
+            tool_status("Bash", ToolStatus::Completed),
+            tool_status("Bash", ToolStatus::Error),
+        ];
+        let mut d = PathologyDetector::new(2, 0);
+        assert!(
+            first_trip(&mut d, &evs).is_none(),
+            "a completed step must reset the error run"
+        );
+    }
+
+    #[test]
+    fn no_flags_trips_only_on_run_failed() {
+        // With both thresholds 0, repeats and errors are inert — only RunFailed.
+        let benign = [
+            running("Bash", serde_json::json!({"command": "ls"})),
+            running("Bash", serde_json::json!({"command": "ls"})),
+            tool_status("Bash", ToolStatus::Error),
+            tool_status("Bash", ToolStatus::Error),
+            usage(10_000, 10_000),
+        ];
+        let mut d = PathologyDetector::new(0, 0);
+        assert!(
+            first_trip(&mut d, &benign).is_none(),
+            "no flags → inert on repeats/errors/tokens"
+        );
     }
 }

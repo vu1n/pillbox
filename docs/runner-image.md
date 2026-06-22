@@ -21,13 +21,18 @@ every tagged CLI release.
 
 Five agent CLIs preinstalled at known paths:
 
-| Harness | Install method | Tracked by Renovate |
-|---|---|---|
-| claude | native installer from `claude.ai/install.sh` | yes (release feed) |
-| codex | `npm i -g @openai/codex@<pinned>` | yes |
-| amp | `npm i -g @ampcode/cli@latest` | no — timestamp+sha versions |
-| opencode | `npm i -g opencode-ai@<pinned>` | yes |
-| pi | `npm i -g @earendil-works/pi-coding-agent@<pinned>` | yes |
+Every harness is **pinned** to a concrete version (an `ARG …_VERSION` in
+`runner/Dockerfile`) so Docker's layer cache reflects the version we ask for —
+an unpinned `@latest` rides a `RUN` whose command string never changes, so a
+rebuild silently reuses the stale layer instead of pulling the newer agent.
+
+| Harness | Install method | Pin | Tracked by Renovate |
+|---|---|---|---|
+| claude | native installer from `claude.ai/install.sh` (`claude install <ver>`) | `CLAUDE_VERSION` | yes — npm `@anthropic-ai/claude-code` (versions match the native release) |
+| codex | native installer from `chatgpt.com/codex/install.sh` | `CODEX_VERSION` | yes — github releases (`rust-v<ver>`) |
+| amp | `npm i -g @ampcode/cli@<pinned>` | `AMP_VERSION` | no — timestamp+sha versions defeat semver; bump by hand |
+| opencode | `npm i -g opencode-ai@<pinned>` | `OPENCODE_VERSION` | yes — npm |
+| pi | `npm i -g @earendil-works/pi-coding-agent@<pinned>` | `PI_VERSION` | yes — npm |
 
 Plus the system tooling agents tend to reach for: `bash`,
 `bubblewrap`, `ca-certificates`, `curl`, `gh`, `git`, `iproute2`
@@ -64,11 +69,32 @@ Resolution order (highest precedence first):
 | `latest` | per CLI release | alias for the most recent `vX.Y.Z`. The default. |
 | `rolling` | per Dockerfile merge to main | rebuilt anytime Renovate bumps a harness version. Bleeding edge — opt in via override. |
 
+## Updating the bundled agents
+
+[`scripts/build-runner.sh`](../scripts/build-runner.sh) is the one-stop wrapper —
+it resolves each agent's latest version, rewrites the pins, rebuilds, and prints
+the versions baked into the image.
+
+```sh
+scripts/build-runner.sh --update --dry-run   # show what would change, no write/build
+scripts/build-runner.sh --update             # bump all agents to latest, rebuild, verify
+scripts/build-runner.sh                       # rebuild current pins (layer-cached), verify
+scripts/build-runner.sh --update --tag pillbox-runner:l8
+```
+
+`--update` edits the `ARG …_VERSION` pins in `runner/Dockerfile`, so it's a
+tracked change: review `git diff runner/Dockerfile` and commit it like a Renovate
+bump. Layer caching keeps the rebuild partial — apt / Node / the cargo-built
+`pillbox` layers stay cached; only the bumped agent layers recompile. The new
+image gets a new id, so libkrun re-materializes its rootfs on the next run (add
+`--prune-rootfs` to drop the superseded generation under `~/.pillbox/krun/rootfs/`).
+
 ## Build it yourself
 
 ```sh
 # Context is the repo root (the build compiles the in-sandbox pillbox);
-# point -f at the Dockerfile.
+# point -f at the Dockerfile. Single native arch + --load for the local loop
+# (build-runner.sh does this); the multi-arch form below is for publishing.
 docker buildx build \
   --platform linux/amd64,linux/arm64 \
   -t my-team/pillbox-runner:custom \

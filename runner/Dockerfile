@@ -48,9 +48,16 @@ COPY src ./src
 # on iteration — the BYO/on-target build loop). The `runner` profile skips
 # release LTO for a much faster compile (see Cargo.toml). `cp` runs inside the
 # same RUN so it grabs the binary before the target cache mount detaches.
+#
+# `--no-default-features` drops the default `libkrun` feature: the in-sandbox
+# binary is only `pty-host` + emitter + `session done` (all guest-side, none
+# feature-gated), and libkrun is the HOST VMM launcher — its build.rs links
+# `-lkrun`, which isn't present in this toolchain-free rust:bookworm image
+# (`cannot find -lkrun`). This is the `--no-default-features` path Cargo.toml
+# documents for non-libkrun-toolchain builds; without it the image won't build.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --profile runner --locked && cp target/runner/pillbox /pillbox
+    cargo build --profile runner --locked --no-default-features && cp target/runner/pillbox /pillbox
 
 # ---- runtime stage -----------------------------------------------------
 FROM debian:bookworm-slim
@@ -90,20 +97,34 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 	&& apt-get install -y --no-install-recommends nodejs \
 	&& rm -rf /var/lib/apt/lists/*
 
-# Agent-harness version pins. Renovate (see renovate.json at repo
-# root) tracks each one via the `# renovate:` hint comments below
-# and opens PRs on upstream bumps. amp stays on @latest because its
-# publish scheme is timestamp+sha (e.g. 0.0.1779836786-gb003ec),
-# which Renovate's semver matcher can't compare meaningfully.
+# Agent-harness version pins. Every agent is pinned to a concrete
+# version so Docker's layer cache is keyed on the version we actually
+# want: an unpinned `@latest` (or the installer's "always newest"
+# default) rides a RUN whose command string never changes, so a rebuild
+# silently reuses the stale layer instead of pulling the newer agent.
+# Pinning makes the cache honest — bump the pin and rebuild to update.
+# Renovate (see renovate.json at repo root) tracks each `# renovate:`-
+# hinted pin and opens PRs on upstream bumps.
+#
+# claude installs via its native installer, but its versions match the
+# @anthropic-ai/claude-code npm package, so Renovate tracks that as the
+# source of truth (the version string is passed to install.sh below).
+# renovate: datasource=npm depName=@anthropic-ai/claude-code
+ARG CLAUDE_VERSION=2.1.185
 # renovate: datasource=github-releases depName=openai/codex extractVersion=^rust-v(?<version>.*)$
-ARG CODEX_VERSION=0.139.0
+ARG CODEX_VERSION=0.141.0
 # renovate: datasource=npm depName=opencode-ai
-ARG OPENCODE_VERSION=1.17.3
+ARG OPENCODE_VERSION=1.17.9
 # renovate: datasource=npm depName=@earendil-works/pi-coding-agent
-ARG PI_VERSION=0.79.1
+ARG PI_VERSION=0.79.9
+# amp has no Renovate-trackable pin: its publish scheme is timestamp+sha
+# (e.g. 0.0.1782062050-gbe2b79), which Renovate's semver matcher can't
+# compare. Pinned anyway for a deterministic layer cache; bump by hand
+# (`npm view @ampcode/cli version`) when you want a newer amp.
+ARG AMP_VERSION=0.0.1782062050-gbe2b79
 
 RUN npm install -g \
-		@ampcode/cli@latest \
+		@ampcode/cli@${AMP_VERSION} \
 		opencode-ai@${OPENCODE_VERSION} \
 		@earendil-works/pi-coding-agent@${PI_VERSION} \
 	&& npm cache clean --force
@@ -124,12 +145,15 @@ RUN curl -fsSL https://chatgpt.com/codex/install.sh -o /tmp/codex-install.sh \
 	&& rm /tmp/codex-install.sh \
 	&& rm -rf /opt/codex-install
 
-# Claude Code: official native installer. Run with HOME pointed at a
-# stable /opt path so the installer's writes don't get shadowed if a
-# downstream consumer mounts a tmpfs over /root or /home. Copy the
-# resolved binary into /usr/local/bin so it survives any HOME shuffle.
+# Claude Code: official native installer. The version arg ($1 →
+# `claude install <VERSION>`) pins which release the launcher resolves
+# to; without it the installer always tracks newest, which the layer
+# cache can't see. Run with HOME pointed at a stable /opt path so the
+# installer's writes don't get shadowed if a downstream consumer mounts
+# a tmpfs over /root or /home. Copy the resolved binary into
+# /usr/local/bin so it survives any HOME shuffle.
 RUN curl -fsSL https://claude.ai/install.sh -o /tmp/claude-install.sh \
-	&& HOME=/opt/claude-install bash /tmp/claude-install.sh \
+	&& HOME=/opt/claude-install bash /tmp/claude-install.sh ${CLAUDE_VERSION} \
 	&& cp -L /opt/claude-install/.local/bin/claude /usr/local/bin/claude \
 	&& chmod +x /usr/local/bin/claude \
 	&& rm /tmp/claude-install.sh \

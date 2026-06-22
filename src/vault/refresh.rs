@@ -105,6 +105,11 @@ impl RefreshDecider for ClaudeRefreshDecider {
             .and_then(|v| v.as_str())
             .map(str::to_owned)
     }
+
+    fn access_usable(&self, creds: &Value) -> bool {
+        self.access_token(creds).is_some()
+            && claude_expiry_ms(creds).is_some_and(|expires_at_ms| expires_at_ms > unix_now_ms())
+    }
 }
 
 /// Establish a fresh OAuth credential for `agent_id`, coordinated across concurrent
@@ -126,6 +131,13 @@ pub(crate) fn pre_refresh(creds_path: &Path, agent_id: &str) -> Result<Option<Va
     let store = TokenStore::new(creds_path.to_path_buf(), PRE_REFRESH_LOCK_WAIT);
     match store.begin(&ClaudeRefreshDecider)? {
         Begin::Coalesced(creds) => Ok(Some(creds)),
+        Begin::DegradedLease(creds) => {
+            eprintln!(
+                "warning: serving claude on a degraded lease: a prior refresh did not commit; \
+                 re-auth before the token expires"
+            );
+            Ok(Some(creds))
+        }
         Begin::Rotate(guard) => rotate(guard).map(Some),
         Begin::ReauthRequired(reason) => Err(PillboxError::runtime(
             "vault",
@@ -194,7 +206,6 @@ pub(crate) fn broker_expiry(creds_path: &Path, agent_id: &str) -> Option<u64> {
 /// `claudeAiOauth.expiresAt` normalized to unix ms (handles seconds-encoded values, as
 /// [`is_expired`] does). The broker is Claude-only today; this generalizes through the
 /// decider when another provider joins.
-#[cfg(feature = "libkrun")]
 fn claude_expiry_ms(creds: &Value) -> Option<u64> {
     creds
         .pointer("/claudeAiOauth/expiresAt")
@@ -490,16 +501,29 @@ mod tests {
         assert_eq!(d.access_token(&fresh).as_deref(), Some("AT"));
         assert_eq!(d.refresh_token(&fresh).as_deref(), Some("RT"));
         assert!(!d.needs_refresh(&fresh));
+        assert!(d.access_usable(&fresh));
+
+        let near_true_expiry = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "AT",
+                "refreshToken": "RT",
+                "expiresAt": unix_now_ms() + 30 * 1000,
+            }
+        });
+        assert!(d.needs_refresh(&near_true_expiry));
+        assert!(d.access_usable(&near_true_expiry));
 
         let stale = serde_json::json!({
             "claudeAiOauth": { "accessToken": "AT", "refreshToken": "RT", "expiresAt": 1_700_000_000_000_u64 }
         });
         assert!(d.needs_refresh(&stale));
+        assert!(!d.access_usable(&stale));
 
         // No expiresAt → no signal → don't force a POST.
         let no_expiry =
             serde_json::json!({ "claudeAiOauth": { "accessToken": "AT", "refreshToken": "RT" } });
         assert!(!d.needs_refresh(&no_expiry));
+        assert!(!d.access_usable(&no_expiry));
     }
 
     #[test]

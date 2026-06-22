@@ -1,0 +1,20 @@
+# pillbox dispatch --workers-spec — a heterogeneous worker roster.
+# Each [[worker]] is one forked worker; omitted fields fall back to the
+# run-level --agent/--model/--temperature (themselves falling back to pillbox.toml).
+#
+# Run it (the roster supplies k = 2 — no -k needed):
+#   pillbox dispatch --from-bookmark base --workers-spec rubrics/example-workers.toml \
+#     --rubric rubrics/test-pass.rubric --json -- "Implement the parser."
+#
+# An explicit -k must match the roster length (the roster is authoritative);
+# omit it and k is derived. Composes with --segments (each rostered worker runs
+# the chain). Unknown keys are an error.
+
+[[worker]]
+agent = "claude"
+model = "anthropic/claude-opus-4-8"
+
+[[worker]]
+agent = "opencode"
+model = "zai-coding-plan/glm-5.2"
+temperature = 0.7

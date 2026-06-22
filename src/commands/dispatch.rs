@@ -45,6 +45,13 @@ use crate::pillbox::Pillbox;
 /// minutes. Override with `PILLBOX_DISPATCH_TURN_TIMEOUT`.
 const DEFAULT_TURN_TIMEOUT_SECS: u64 = 1800;
 
+/// The clap default for `-k`/`--workers` (mirrors `main.rs`'s `default_value_t`).
+/// Used to tell an explicit `-k N` from the default when a `--workers-spec` roster
+/// supplies the count: a roster present alongside an explicit, *disagreeing* `-k`
+/// is a usage error, but a roster with no explicit `-k` (the value is still the
+/// default) just derives `k` from the roster length.
+const DEFAULT_WORKERS: u32 = 3;
+
 fn turn_timeout_secs() -> u64 {
     std::env::var("PILLBOX_DISPATCH_TURN_TIMEOUT")
         .ok()
@@ -111,6 +118,13 @@ pub(crate) struct DispatchOpts {
     /// Per-fork sampling temperature, forwarded to each worker's run — the
     /// diversity knob that keeps best-of-`k` non-degenerate.
     pub(crate) temperature: Option<f64>,
+    /// `--workers-spec FILE`: a heterogeneous worker roster (parsed + validated).
+    /// When `Some`, each `[[worker]]` row binds the `i`-th fork's agent/model/
+    /// temperature, falling back per field to the scalar `agent`/`model`/
+    /// `temperature` above (themselves falling back to `pillbox.toml`); `k` is
+    /// derived from the roster length. `None` → today's homogeneous fork-`k` (the
+    /// scalar opts apply to every worker), byte-identical to before.
+    pub(crate) workers_spec: Option<Vec<WorkerSpec>>,
     /// Wire in kypp swarm-memory (`--memory`) for each worker.
     pub(crate) memory: bool,
     /// Per-worker retention TTL (`30m`/`24h`/`7d`), forwarded to each worker's
@@ -296,8 +310,10 @@ impl DispatchVerdict {
 /// `contract::Scored` the `session score --json` surface emits — deserialized
 /// directly so a wire-contract change is a compile error, not a silent default.
 trait WorkerDriver {
-    /// Fork a new detached worker from the bookmark → its session id.
-    fn fork(&self) -> Result<String>;
+    /// Fork a new detached worker (the `i`-th, 0-based) from the bookmark → its
+    /// session id. The index picks this worker's roster row (`--workers-spec`);
+    /// without a roster it's ignored and every fork is identical.
+    fn fork(&self, i: usize) -> Result<String>;
     /// Block until the worker's current turn goes idle (or terminates).
     fn wait_idle(&self, id: &str) -> Result<()>;
     /// Grade the worker's current workspace against `grader` → the parsed verdict.
@@ -310,6 +326,23 @@ trait WorkerDriver {
 }
 
 // ── pure policy (the unit-tested gate) ──────────────────────────────────────
+
+/// Resolve the `i`-th worker's `(agent, model, temperature)` from the opts —
+/// pure, so the `--workers-spec` → run-level fallback precedence is unit-testable
+/// without a VM. With a roster, this worker's row wins per field and the
+/// run-level scalar opt is the fallback; without one, every worker gets the
+/// scalar opts (today's homogeneous fork-`k`). The handler sets `k =
+/// roster.len()`, so an in-bounds `i` always indexes a row when a roster exists.
+fn resolve_worker(opts: &DispatchOpts, i: usize) -> (Option<String>, Option<String>, Option<f64>) {
+    match opts.workers_spec.as_ref().and_then(|r| r.get(i)) {
+        Some(w) => (
+            w.agent.clone().or_else(|| opts.agent.clone()),
+            w.model.clone().or_else(|| opts.model.clone()),
+            w.temperature.or(opts.temperature),
+        ),
+        None => (opts.agent.clone(), opts.model.clone(), opts.temperature),
+    }
+}
 
 /// The distilled failure summary fed back as the next prompt on a retry — the
 /// structured signal (which checks failed + why), NOT the raw grader log, per
@@ -550,7 +583,7 @@ fn run_dispatch(
     // single-prompt + retry loop (fork-`k`). With both `-k>1` and `--segments`, the
     // k workers each run the full chain → best-of-k OVER segmented chains.
     let workers: Vec<WorkerOutcome> = (0..k)
-        .map(|_| driver.fork())
+        .map(|i| driver.fork(i as usize))
         .collect::<Vec<_>>()
         .into_iter()
         .map(|forked| match forked {
@@ -768,7 +801,12 @@ impl<'a> CliDriver<'a> {
 }
 
 impl WorkerDriver for CliDriver<'_> {
-    fn fork(&self) -> Result<String> {
+    fn fork(&self, i: usize) -> Result<String> {
+        // Per-worker agent/model/temperature from the roster (`--workers-spec`)
+        // falling back to the run-level scalars; without a roster this is the
+        // scalar opts for every worker. The argv assembly below is otherwise
+        // unchanged — only these values become per-worker.
+        let (agent, model, temperature) = resolve_worker(self.opts, i);
         let mut args = vec![
             "run".into(),
             "--from-bookmark".into(),
@@ -776,13 +814,13 @@ impl WorkerDriver for CliDriver<'_> {
             "--detach".into(),
             "--json".into(),
         ];
-        if let Some(a) = &self.opts.agent {
+        if let Some(a) = &agent {
             args.extend(["--agent".into(), a.clone()]);
         }
-        if let Some(m) = &self.opts.model {
+        if let Some(m) = &model {
             args.extend(["--model".into(), m.clone()]);
         }
-        if let Some(t) = &self.opts.temperature {
+        if let Some(t) = &temperature {
             args.extend(["--temperature".into(), t.to_string()]);
         }
         if self.opts.memory {
@@ -1013,6 +1051,52 @@ fn load_segments(spec_path: &std::path::Path) -> Result<Vec<ResolvedSegment>> {
     Ok(out)
 }
 
+// ── worker roster (`--workers-spec`, TOML) ──────────────────────────────────
+
+/// One `[[worker]]` in the `--workers-spec` TOML: a per-worker agent/model/
+/// temperature binding for the heterogeneous-roster fork-`k`. Every field is
+/// optional — an omitted field falls back to the run-level `--agent`/`--model`/
+/// `--temperature` (themselves falling back to `pillbox.toml`). `deny_unknown_fields`
+/// so a typo'd key is a loud parse error, not silently ignored.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkerSpec {
+    agent: Option<String>,
+    model: Option<String>,
+    temperature: Option<f64>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkersFile {
+    #[serde(default)]
+    worker: Vec<WorkerSpec>,
+}
+
+/// Load + validate the `--workers-spec` TOML roster. An empty roster is a
+/// [`PillboxError::usage`] (exit 2) so a bad spec fails fast, before any worker
+/// is forked — mirroring [`load_segments`]' empty-spec rejection. Called from
+/// `main.rs` to materialize [`DispatchOpts::workers_spec`] (the parsed roster).
+pub(crate) fn load_workers_spec(path: &std::path::Path) -> Result<Vec<WorkerSpec>> {
+    let usage = |msg: String| -> anyhow::Error { PillboxError::usage("dispatch", msg).into() };
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| usage(format!("read --workers-spec {}: {e}", path.display())))?;
+    let file: WorkersFile = toml::from_str(&raw)
+        .map_err(|e| usage(format!("parse --workers-spec {}: {e}", path.display())))?;
+    if file.worker.is_empty() {
+        return Err(PillboxError::usage(
+            "dispatch",
+            format!(
+                "--workers-spec {} has no [[worker]] entries",
+                path.display()
+            ),
+        )
+        .with_next("each [[worker]] may set agent / model / temperature (all optional)")
+        .into());
+    }
+    Ok(file.worker)
+}
+
 // ── handler ─────────────────────────────────────────────────────────────────
 
 /// Run a dispatch. Exit-code contract (`docs/dispatch.md`): a selected winner →
@@ -1058,10 +1142,33 @@ pub(crate) fn dispatch(resolved: &Pillbox, opts: DispatchOpts) -> Result<()> {
         None => None,
     };
 
+    // With a `--workers-spec` roster, its length is the authoritative `k`. An
+    // explicit `-k N` that disagrees with the roster is a usage error (exit 2)
+    // before any fork — but `-k` left at its default just derives `k` from the
+    // roster. Without a roster, `-k` is used as-is (today's homogeneous path).
+    let k = match &opts.workers_spec {
+        Some(roster) => {
+            if opts.workers != DEFAULT_WORKERS && opts.workers as usize != roster.len() {
+                return Err(PillboxError::usage(
+                    "dispatch",
+                    format!(
+                        "-k {} disagrees with --workers-spec ({} [[worker]] entries)",
+                        opts.workers,
+                        roster.len()
+                    ),
+                )
+                .with_next("drop -k (the roster length is authoritative) or match it to the roster")
+                .into());
+            }
+            roster.len() as u32
+        }
+        None => opts.workers,
+    };
+
     let driver = CliDriver::new(&opts)?;
     let verdict = run_dispatch(
         &driver,
-        opts.workers,
+        k,
         &prompt,
         opts.retries,
         &reward,
@@ -1202,6 +1309,9 @@ mod tests {
         grade_errs: std::collections::HashSet<String>,
         sends: RefCell<usize>,
         pulls: RefCell<Vec<String>>,
+        /// The fork-index passed to each `fork`, in call order — asserts the loop
+        /// hands each worker its own 0-based roster index.
+        fork_indices: RefCell<Vec<usize>>,
     }
 
     impl MockDriver {
@@ -1217,6 +1327,7 @@ mod tests {
                 grade_errs: std::collections::HashSet::new(),
                 sends: RefCell::new(0),
                 pulls: RefCell::new(Vec::new()),
+                fork_indices: RefCell::new(Vec::new()),
             }
         }
         fn failing_grade(mut self, id: &str) -> Self {
@@ -1226,7 +1337,8 @@ mod tests {
     }
 
     impl WorkerDriver for MockDriver {
-        fn fork(&self) -> Result<String> {
+        fn fork(&self, i: usize) -> Result<String> {
+            self.fork_indices.borrow_mut().push(i);
             Ok(self.ids.borrow_mut().pop_front().expect("fork over budget"))
         }
         fn wait_idle(&self, _id: &str) -> Result<()> {
@@ -1303,6 +1415,19 @@ mod tests {
         // 2 sends: the turn-1 prompt + one retry.
         assert_eq!(*d.sends.borrow(), 2);
         assert!(d.pulls.borrow().is_empty());
+    }
+
+    #[test]
+    fn loop_forks_each_worker_with_its_index() {
+        // The loop must hand each fork its own 0-based index (the roster row a
+        // `--workers-spec` worker binds to), in order.
+        let d = MockDriver::new(vec![
+            ("w0", vec![(true, 1.0)]),
+            ("w1", vec![(true, 1.0)]),
+            ("w2", vec![(true, 1.0)]),
+        ]);
+        let _ = run_dispatch(&d, 3, "task", 0, &reward(), None);
+        assert_eq!(*d.fork_indices.borrow(), vec![0, 1, 2]);
     }
 
     // ── segment chain (`--segments`) ──
@@ -1434,6 +1559,123 @@ mod tests {
         std::fs::write(&spec, "# no segments\n").unwrap();
         assert!(load_segments(&spec).is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── worker roster (`--workers-spec`) ──
+
+    /// Write `toml` to a fresh tempfile and return its path (caller cleans up).
+    fn workers_spec_file(toml: &str) -> PathBuf {
+        let p =
+            std::env::temp_dir().join(format!("pb-workers-{}.toml", uuid::Uuid::now_v7().simple()));
+        std::fs::write(&p, toml).unwrap();
+        p
+    }
+
+    #[test]
+    fn load_workers_spec_parses_roster() {
+        let spec = workers_spec_file(
+            "[[worker]]\nagent = \"claude\"\nmodel = \"anthropic/claude-opus-4-8\"\n\n\
+             [[worker]]\nagent = \"opencode\"\nmodel = \"zai-coding-plan/glm-5.2\"\ntemperature = 0.7\n",
+        );
+        let roster = load_workers_spec(&spec).unwrap();
+        assert_eq!(roster.len(), 2);
+        assert_eq!(roster[0].agent.as_deref(), Some("claude"));
+        assert_eq!(
+            roster[0].model.as_deref(),
+            Some("anthropic/claude-opus-4-8")
+        );
+        assert_eq!(roster[0].temperature, None);
+        assert_eq!(roster[1].agent.as_deref(), Some("opencode"));
+        assert_eq!(roster[1].model.as_deref(), Some("zai-coding-plan/glm-5.2"));
+        assert_eq!(roster[1].temperature, Some(0.7));
+        std::fs::remove_file(&spec).ok();
+    }
+
+    #[test]
+    fn load_workers_spec_rejects_empty() {
+        let spec = workers_spec_file("# no workers\n");
+        assert!(load_workers_spec(&spec).is_err());
+        std::fs::remove_file(&spec).ok();
+    }
+
+    #[test]
+    fn load_workers_spec_rejects_unknown_field() {
+        // A typo'd key must be a parse error (deny_unknown_fields), not ignored.
+        let spec = workers_spec_file("[[worker]]\nagent = \"claude\"\nmodle = \"oops\"\n");
+        assert!(load_workers_spec(&spec).is_err());
+        std::fs::remove_file(&spec).ok();
+    }
+
+    /// A minimal `DispatchOpts` for the pure `resolve_worker` test — only the
+    /// roster + run-level scalar fallbacks matter; the rest are inert.
+    fn opts_for_resolve(
+        agent: Option<&str>,
+        model: Option<&str>,
+        temperature: Option<f64>,
+        workers_spec: Option<Vec<WorkerSpec>>,
+    ) -> DispatchOpts {
+        DispatchOpts {
+            from_bookmark: "base".into(),
+            workers: 1,
+            cmd: Some("true".into()),
+            rubric: None,
+            retries: 0,
+            agent: agent.map(str::to_string),
+            model: model.map(str::to_string),
+            temperature,
+            workers_spec,
+            memory: false,
+            ttl: None,
+            segments: None,
+            prompt: vec![],
+            json: false,
+        }
+    }
+
+    fn worker_spec(
+        agent: Option<&str>,
+        model: Option<&str>,
+        temperature: Option<f64>,
+    ) -> WorkerSpec {
+        WorkerSpec {
+            agent: agent.map(str::to_string),
+            model: model.map(str::to_string),
+            temperature,
+        }
+    }
+
+    #[test]
+    fn resolve_worker_roster_wins_else_falls_back_to_run_level() {
+        let roster = vec![
+            // row 0 sets agent + model, leaves temperature unset → falls back.
+            worker_spec(Some("claude"), Some("anthropic/claude-opus-4-8"), None),
+            // row 1 sets only temperature → agent/model fall back to run-level.
+            worker_spec(None, None, Some(0.9)),
+        ];
+        let opts = opts_for_resolve(Some("opencode"), Some("run/model"), Some(0.2), Some(roster));
+
+        // Worker 0: roster agent/model win; temperature falls back to run-level.
+        let (a0, m0, t0) = resolve_worker(&opts, 0);
+        assert_eq!(a0.as_deref(), Some("claude"));
+        assert_eq!(m0.as_deref(), Some("anthropic/claude-opus-4-8"));
+        assert_eq!(t0, Some(0.2));
+
+        // Worker 1: agent/model fall back to run-level; roster temperature wins.
+        let (a1, m1, t1) = resolve_worker(&opts, 1);
+        assert_eq!(a1.as_deref(), Some("opencode"));
+        assert_eq!(m1.as_deref(), Some("run/model"));
+        assert_eq!(t1, Some(0.9));
+
+        // No roster → every worker gets the run-level scalars (homogeneous path).
+        let plain = opts_for_resolve(Some("opencode"), Some("run/model"), Some(0.2), None);
+        assert_eq!(
+            resolve_worker(&plain, 0),
+            (
+                Some("opencode".to_string()),
+                Some("run/model".to_string()),
+                Some(0.2)
+            )
+        );
     }
 
     // ── verdict JSON shape (the downstream wire contract) ──

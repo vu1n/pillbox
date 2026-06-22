@@ -161,3 +161,38 @@ Format: `STATUS` · what · why · what it means concretely · what's rejected.
   (use `vX.Y.Z`). NB: the local `dev` image was never byte-reproducible while its
   agents were unpinned — pin agents (the `runner/Dockerfile` ARGs) **and** a
   `vX.Y.Z` tag for a real baseline.
+
+## ADR-008 — ghost extracts to its own repo; trigger = conductor-contract stability
+**Status: Accepted (2026-06-22, direction — extraction not yet executed).**
+
+- **Decision:** ghost (the meta-harness / conductor layer — `scripts/ghost/`, the
+  task/verifier corpus, the orchestration policy) becomes its **own repo**, the
+  third component alongside pillbox (substrate) and kypp (already extracted,
+  github.com/vu1n/kypp). The **trigger is contract stability, not the calendar**:
+  extract once the pillbox primitives the conductor depends on have settled —
+  §0-subscribe-consumed-by-a-conductor, the intervention hooks (circuit-breaker /
+  mid-run kill), and the DAG executor + per-worker spec (generalizing
+  `dispatch --segments`). Until then ghost stays an **in-repo tenant** under
+  `scripts/ghost/` with its own `DECISIONS.md`, treated as a *contract consumer*
+  (the `pillbox`/`kypp` CLIs + the §0 event schema), never coupled to pillbox
+  internals.
+- **Why:** it makes the mechanism/policy split physical and mirrors kypp; a separate
+  repo can only touch what pillbox exposes as a real interface, which structurally
+  prevents baking the conductor LLM into the substrate. But **not now**: this
+  conversation's design (the conductor) requires pillbox-side work that is exactly
+  mid-churn (§0-subscribe wiring, kill hooks, the DAG executor) — extracting now
+  makes every one of those a cross-repo release dance, and there is nothing built to
+  extract yet (`ace.py` is experiment scaffolding, not the conductor).
+- **Concretely:** the **DAG executor stays in pillbox** (mechanism — it's the
+  generalization of `dispatch --segments`); the **IR schema is a shared contract**
+  (the `agent.proto` analog for plans); the **builder + planner + pivot policy +
+  the frozen task/verifier corpus** go to ghost (the corpus is part of the IP —
+  fit to private verifiers + task distribution). `scripts/eval/` needs a deliberate
+  split (substrate-test scripts may stay as smoke tests; the eval *rig* moves).
+  Tidy `scripts/ghost/` into a clean tenant **now** (own README/DECISIONS/deps, no
+  reaching into Rust internals) so extraction is a `git filter-repo` move, not a
+  rewrite. ghost's own design decisions live in `scripts/ghost/DECISIONS.md`.
+- **Rejected:** extracting now (premature — cross-repo thrash on a churning
+  contract, and only scaffolding to move); keeping ghost permanently fused into
+  pillbox (mixes mechanism/policy, blocks ghost's independent posture, invites the
+  conductor LLM to leak into the substrate).

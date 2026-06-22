@@ -1003,10 +1003,10 @@ fn wizard_new(
     };
 
     // Runner image: pick from locally-available images, or "custom…" for free text.
-    // The pre-fill (flag or pillbox-runner:l7) is always offered, even if not enumerated.
+    // The pre-fill (flag or pillbox-runner:dev) is always offered, even if not enumerated.
     let pre = runner_image
         .as_deref()
-        .unwrap_or("pillbox-runner:l7")
+        .unwrap_or("pillbox-runner:dev")
         .to_string();
     let mut imgs = crate::docker::list_runner_images();
     if !imgs.contains(&pre) {

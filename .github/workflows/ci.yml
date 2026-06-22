@@ -21,19 +21,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install rust
         run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
+      # rust-cache keys on rustc + Cargo.lock, prunes the registry to used crates,
+      # and cleans target/ of intermediate junk — so the cache stays small and
+      # survives eviction against the matrix + the runner-image buildx cache. The
+      # old hand-rolled actions/cache of the whole target/ bloated toward the 10GB
+      # repo limit and evicted, forcing cold rebuilds (the ~20min CI).
       - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-          # On Cargo.lock churn the target/ dir is stale but the registry
-          # download is still good; fall back to the newest cache for this
-          # OS so we don't re-fetch every crate.
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+        uses: Swatinem/rust-cache@v2
       # `--no-default-features` = the toolchain-free build (docker backend + the
       # backend-agnostic core), so this job needs no libkrun toolchain. libkrun
       # itself is covered by the dedicated `libkrun` job. Default is now libkrun,
@@ -66,15 +60,9 @@ jobs:
       - name: Install rust
         run: rustup toolchain install stable --profile minimal --component clippy
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-libkrun-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-libkrun-
+          key: libkrun   # distinct from the no-default-features `test` job's artifacts
       - name: Install libkrun
         run: brew tap libkrun/krun && brew install libkrun libkrunfw
       - name: Clippy (libkrun)

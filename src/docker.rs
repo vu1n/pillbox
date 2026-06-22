@@ -87,7 +87,7 @@ fn resolve_env_or_default() -> (String, RunnerImageSource) {
 /// Best-effort enumeration of runner images available locally — for the
 /// `pillbox new -i` image selection. Two sources, deduped + sorted: local docker
 /// `pillbox-runner:*` tags, and the cached libkrun rootfs under
-/// `~/.pillbox/krun/rootfs/` (dir `pillbox_runner_l7` ↔ tag `pillbox-runner:l7`;
+/// `~/.pillbox/krun/rootfs/` (dir `pillbox_runner_dev` ↔ tag `pillbox-runner:dev`;
 /// the `…_sha256_…` by-digest variants are skipped — they aren't a usable tag).
 /// Display-only: empty on any failure, and the wizard always offers a free-text
 /// fallback, so this is never a correctness path.

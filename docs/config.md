@@ -19,7 +19,7 @@ model = "zai-coding-plan/glm-4.5-air"   # provider/model; omitted → the agent'
 
 # Sandbox image. Omitted → the published default (which may not be cached → set this).
 [runner]
-image = "pillbox-runner:l7"
+image = "pillbox-runner:dev"
 
 # Workspace backend. Default is local.
 [workspace]

@@ -825,16 +825,11 @@ fn materialize_rootfs(resolved: &Pillbox) -> Result<PathBuf> {
         Err(_) => {
             if let Some(cache) = find_cached_rootfs(&rootfs_root, &image) {
                 eprintln!(
-                    "pillbox: note: docker unavailable — reusing cached rootfs for {image} (may be stale)"
+                    "pillbox: note: can't resolve {image} via docker — reusing cached rootfs (may be stale)"
                 );
                 return Ok(cache);
             }
-            return Err(PillboxError::resource(
-                "rootfs materialize",
-                format!("docker unavailable and no cached rootfs for `{image}`"),
-            )
-            .with_next(format!("start Docker, then `docker pull {image}`"))
-            .into());
+            return Err(rootfs_unavailable_error(&image));
         }
     };
     let cache = rootfs_root.join(rootfs_cache_key(&image, &image_id));
@@ -887,6 +882,66 @@ fn materialize_rootfs(resolved: &Pillbox) -> Result<PathBuf> {
     std::fs::write(&marker, format!("{image}\n{image_id}\n"))
         .context("write rootfs cache marker")?;
     Ok(cache)
+}
+
+/// Accurate, actionable error when the runner image can't be resolved to an id
+/// AND no cached rootfs exists. libkrun builds its rootfs by `docker export`-ing
+/// the runner image, so a missing image is fatal here — but the *fix* differs by
+/// cause. Re-probe the daemon (the inspect in `docker_image_id` already failed)
+/// so we never tell a user with Docker running to "start Docker" when the real
+/// fix is a `docker pull` or pointing `[runner] image` at a cached tag. Replaces
+/// the old blanket "docker unavailable" message, which sent users down the wrong
+/// path on the far more common image-absent case.
+fn rootfs_unavailable_error(image: &str) -> anyhow::Error {
+    let stderr = Command::new("docker")
+        .args(["image", "inspect", image, "--format", "{{.Id}}"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stderr).into_owned())
+        .unwrap_or_default();
+    // Empty stderr ⇒ the `docker` invocation itself couldn't run (binary missing /
+    // exec error) ⇒ treat as unreachable, same as an explicit connect error.
+    let daemon_down = stderr.is_empty() || stderr.contains("Cannot connect to the Docker daemon");
+    let (summary, next) =
+        rootfs_unavailable_message(daemon_down, image, &crate::docker::list_runner_images());
+    PillboxError::resource("rootfs materialize", summary)
+        .with_next(next)
+        .into()
+}
+
+/// Build the (summary, next-step) for an unmaterializable rootfs. Pure — splits the
+/// daemon-down vs image-absent messaging from the subprocess probe in
+/// [`rootfs_unavailable_error`] so it's unit-testable. On image-absent we name the
+/// locally-cached runner images, since the actionable fix is usually to set one as
+/// `[runner] image` rather than to pull (the published default is often uncached).
+fn rootfs_unavailable_message(
+    daemon_down: bool,
+    image: &str,
+    available: &[String],
+) -> (String, String) {
+    if daemon_down {
+        return (
+            format!(
+                "Docker unreachable and no cached rootfs for `{image}` — libkrun exports the runner rootfs via `docker export`"
+            ),
+            format!(
+                "start Docker, then `docker pull {image}` (or point `[runner] image` at a cached image)"
+            ),
+        );
+    }
+    let next = if available.is_empty() {
+        format!("`docker pull {image}`, or build the runner image and set `[runner] image`")
+    } else {
+        format!(
+            "`docker pull {image}`, or set `[runner] image` to a locally-cached image: {}",
+            available.join(", ")
+        )
+    };
+    (
+        format!(
+            "runner image `{image}` not present locally — libkrun builds its rootfs from it via `docker export`, which does not pull"
+        ),
+        next,
+    )
 }
 
 /// Newest materialized rootfs generation for `image`, or `None`. The fallback
@@ -961,7 +1016,8 @@ fn cstr(s: &str) -> CString {
 mod tests {
     use super::{
         env_fork_left_real_unstubbed, find_cached_rootfs, mint_curated_stub, mint_oauth_stub,
-        oauth_swap_hosts, stub_claude_oauth, stub_codex_oauth, SwapPair,
+        oauth_swap_hosts, rootfs_unavailable_message, stub_claude_oauth, stub_codex_oauth,
+        SwapPair,
     };
     use crate::agents::{CLAUDE, CODEX, PI};
 
@@ -1053,6 +1109,39 @@ mod tests {
     fn find_cached_rootfs_empty_root_is_none() {
         let root = tempfile::tempdir().unwrap();
         assert!(find_cached_rootfs(root.path(), "anything").is_none());
+    }
+
+    #[test]
+    fn rootfs_unavailable_daemon_down_says_start_docker() {
+        let (summary, next) =
+            rootfs_unavailable_message(true, "ghcr.io/vu1n/pillbox-runner:latest", &[]);
+        assert!(summary.contains("Docker unreachable"), "{summary}");
+        assert!(next.contains("start Docker"), "{next}");
+        // Must NOT mislead into "image not present" when the daemon is the problem.
+        assert!(!summary.contains("not present locally"), "{summary}");
+    }
+
+    #[test]
+    fn rootfs_unavailable_image_absent_lists_cached_and_does_not_say_start_docker() {
+        // Daemon up, image absent: the actionable fix is pull-or-set-cascade, NOT
+        // "start Docker" — the old blanket message's exact failure mode.
+        let avail = vec![
+            "pillbox-runner:dev".to_string(),
+            "pillbox-runner:latest".to_string(),
+        ];
+        let (summary, next) =
+            rootfs_unavailable_message(false, "ghcr.io/vu1n/pillbox-runner:latest", &avail);
+        assert!(summary.contains("not present locally"), "{summary}");
+        assert!(!next.contains("start Docker"), "{next}");
+        assert!(next.contains("[runner] image"), "{next}");
+        assert!(next.contains("pillbox-runner:dev"), "{next}");
+    }
+
+    #[test]
+    fn rootfs_unavailable_image_absent_no_cache_suggests_build() {
+        let (_summary, next) =
+            rootfs_unavailable_message(false, "ghcr.io/vu1n/pillbox-runner:latest", &[]);
+        assert!(next.contains("build the runner image"), "{next}");
     }
 
     #[test]

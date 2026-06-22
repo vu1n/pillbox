@@ -225,7 +225,7 @@ def main():
     ap = argparse.ArgumentParser(description="memory-validity matrix (lever × arm)")
     ap.add_argument("--pillbox", default=os.environ.get("PILLBOX", "./target/debug/pillbox"))
     ap.add_argument("--model", default=os.environ.get("MODEL", "zai-coding-plan/glm-4.5-air"))
-    ap.add_argument("--runner-image", default=os.environ.get("PILLBOX_RUNNER_IMAGE", "pillbox-runner:l7"))
+    ap.add_argument("--runner-image", default=os.environ.get("PILLBOX_RUNNER_IMAGE", "pillbox-runner:dev"))
     ap.add_argument("--tasks", default=os.path.join(HERE, "tasks"))
     ap.add_argument("--levers", default="", help="comma list to subset (default: all)")
     ap.add_argument("--arms", default="off,on,distractor")

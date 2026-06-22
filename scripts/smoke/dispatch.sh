@@ -12,7 +12,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 
-IMAGE="${1:-pillbox-runner:l7}"
+IMAGE="${1:-pillbox-runner:dev}"
 MODEL="${2:-${SMOKE_MODEL:-zai-coding-plan/glm-4.5-air}}"
 BACKEND="${PILLBOX_BACKEND:-libkrun}"
 PB="$(pwd)/target/debug/pillbox"

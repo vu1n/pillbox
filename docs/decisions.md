@@ -136,3 +136,28 @@ Format: `STATUS` · what · why · what it means concretely · what's rejected.
 - **Rejected:** blanket `no_cache(true)` for all variants (the footgun);
   enabling the cache in rustic's global XDG dir (unscoped, not cleanable with the
   pillbox state dir).
+
+## ADR-007 — Runner image tags name roles, not history
+**Status: Accepted (2026-06-22). PR #118.**
+
+- **Decision:** the runner image has exactly three tag *roles* — `dev` (moving:
+  built locally by `scripts/build-runner.sh`, published by CI on merge-to-main),
+  `latest` (moving: CI on stable release, alias of the newest `vX.Y.Z`, the
+  built-in `DEFAULT_RUNNER_IMAGE`), and `vX.Y.Z` (immutable, per release). A
+  `pillbox.toml` pins `dev` or `latest`; you pin a concrete `vX.Y.Z` **only** when
+  you need a reproducible run (e.g. a frozen eval/σ̂ baseline).
+- **Why:** the old `l5`/`l6`/`l7`/`l8` "generation" tags smuggled version control
+  into Docker tag names. They leaked into `pillbox.toml`, ~20 scripts, CI, and
+  memory, so "which tag is current?" became a research task — and the tag churned
+  live (a config flipped `l7`↔`l8` between reads on 2026-06-22). Docker tags are
+  pointers, not a DAG; roles are stable, generation numbers are not.
+- **Concretely:** all scripts + the `new -i` wizard prefill + CI default to
+  `dev`; `DEFAULT_RUNNER_IMAGE` stays `…:latest`. Reproducibility lives in
+  immutable `vX.Y.Z` tags, never in a moving tag. Historical "Live-verified
+  (`pillbox-runner:l7`)" notes in docs keep their number — they record *which
+  libkrun dev phase* was checked, a changelog, not a current-tag pointer.
+- **Rejected:** per-generation tags (`l<N>`) or ad-hoc names (`rolling`, one-off
+  spikes) as the thing configs point at; freezing a *moving* tag as a baseline
+  (use `vX.Y.Z`). NB: the local `dev` image was never byte-reproducible while its
+  agents were unpinned — pin agents (the `runner/Dockerfile` ARGs) **and** a
+  `vX.Y.Z` tag for a real baseline.

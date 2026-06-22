@@ -7,15 +7,22 @@
 # (provider/modelID), TEMPERATURE (sampling temp; set 0 for greedy/deterministic
 # decoding — the variance knob), PRICE_*_PER_M (cost-summer pricing).
 
-# Start an opencode session against workspace $1; echo the 12-hex session id (or
-# empty on failure, which the caller guards). MODEL overrides opencode's default.
+# Start a worker session against workspace $1; echo the 12-hex session id (or
+# empty on failure, which the caller guards). AGENT overrides the agent (default
+# opencode); MODEL/TEMPERATURE override the model/temperature where the agent
+# honors them (the CLI-harness agents claude/codex ignore both — harmless).
 #
 # `--json` makes `run` emit `{version:1,session:{id,…}}` on stdout instead of the
 # human banner, so we parse the id structurally — no `grep`-the-banner scrape.
 # opencode is server-mode, so `run --json` is valid without `--detach` (the run
 # persists a session record regardless).
 pb_run_session() {
-  "$PILLBOX" run --agent opencode --json --workspace "$1" \
+  # `--json` needs a persisted session. opencode is server-mode (persists without
+  # --detach); CLI-harness agents (claude/codex) are NOT, so they need --detach to
+  # persist a record the harness can drive via `session send`. (The turn still runs
+  # on send, not on launch — detached = provision-then-drive, the dispatch contract.)
+  local detach=""; [ "${AGENT:-opencode}" = opencode ] || detach="--detach"
+  "$PILLBOX" run --agent "${AGENT:-opencode}" $detach --json --workspace "$1" \
     ${MODEL:+--model "$MODEL"} ${TEMPERATURE:+--temperature "$TEMPERATURE"} 2>/dev/null \
     | python3 -c 'import json,sys
 try: print(json.load(sys.stdin)["session"]["id"])

@@ -99,6 +99,14 @@ SEG_RETRIES="${SEG_RETRIES:-1}"
 # shot, no gates) — the control that splits prompt-decomposition from checkpoint-
 # gating. Default off so the established 3-arm runs/results reproduce unchanged.
 ENUM_MONO="${ENUM_MONO:-0}"
+# Which arms to run — a space-separated subset of: monolithic enumerated chained
+# segmented. Default = the standard three (enumerated still also needs ENUM_MONO=1).
+# Set ARMS=monolithic to measure JUST the raw single-horizon bar (e.g. a frontier
+# baseline like `AGENT=claude ARMS=monolithic`) without paying for the chained/
+# segmented drives.
+ARMS="${ARMS:-monolithic chained segmented}"
+# Space-padded membership test (so "mono" can't match "monolithic").
+in_arms() { case " $ARMS " in *" $1 "*) return 0;; *) return 1;; esac; }
 MAX_WAIT="${MAX_WAIT:-600}"
 # Bounded retry for a transient libkrun launch failure — a fresh VM can
 # intermittently fail to boot under sustained churn (the krun-state leak below
@@ -479,10 +487,10 @@ for ref in "${REFS[@]}"; do
   if ! task_dir="$(resolve_task_ref "$ref")"; then echo "skip (no task dir / frozen bookmark): $ref" >&2; continue; fi
   for t in $(seq 1 "$TRIALS"); do
     echo "▶ $name trial $t/$TRIALS" >&2
-    run_monolithic_cell "$task_dir" "$name" "$t"
-    [ "$ENUM_MONO" = 1 ] && run_enumerated_cell "$task_dir" "$name" "$t"
-    run_chained_cell    "$task_dir" "$name" "$t"
-    run_segmented_cell  "$task_dir" "$name" "$t"
+    in_arms monolithic && run_monolithic_cell "$task_dir" "$name" "$t"
+    [ "$ENUM_MONO" = 1 ] && in_arms enumerated && run_enumerated_cell "$task_dir" "$name" "$t"
+    in_arms chained   && run_chained_cell    "$task_dir" "$name" "$t"
+    in_arms segmented && run_segmented_cell  "$task_dir" "$name" "$t"
   done
   # rm only a tempdir we pulled; a dir ref ($ref == $task_dir) is used in place.
   [ "$ref" = "$task_dir" ] || rm -rf "$task_dir"

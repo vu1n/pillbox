@@ -144,6 +144,18 @@ diff -ru "$PULLED" .        # what the winner changed vs your tree (ignore __pyc
 uncommitted WIP in this shared tree (the scarred-history rule: only touch files this
 task changed).
 
+**Tighten the winner for consistency (required after a fanout).** The reward is
+*functional, not stylistic* — a winner can pass every test yet clash with house idiom,
+and a **heterogeneous roster** (different models picking different winners,
+`--workers-spec`) fragments style across merges. So before applying, run **`/tighten`
+on the winner's diff** with explicit attention to consistency-with-neighbors — naming,
+structure, idiom, comment density (the "reads like the surrounding code" bar) — not
+just signal-per-token. And bias *selection* toward catching it up front: include
+`fmt --check` + lint gates in the reward where they exist (e.g.
+`rubrics/rust-change.rubric`'s `fmt`/`clippy` lines), so the winner isn't chosen
+style-blind. fmt/lint don't catch idiom, so the post-fanout `/tighten` is the backstop,
+not the whole defense.
+
 ### 5b. Pivot, never merge (GD-004)
 
 If the winner is wrong or thin, **do not stitch multiple workers together** (merging

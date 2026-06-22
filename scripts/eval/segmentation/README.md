@@ -84,7 +84,7 @@ scripts/eval/segmentation/run.sh --dry-run
 # live (GHOST-007). Needs: a codesigned libkrun binary (scripts/lk-build.sh),
 # opencode authed, the runner image, and the task materialized:
 python3 scripts/eval/import-aider-polyglot.py --limit 20   # materializes tasks/ap_pov
-PILLBOX_RUNNER_IMAGE=pillbox-runner:l7 MODEL=zai-coding-plan/glm-4.5-air \
+PILLBOX_RUNNER_IMAGE=pillbox-runner:dev MODEL=zai-coding-plan/glm-4.5-air \
   scripts/eval/segmentation/run.sh --trials 10
 ```
 

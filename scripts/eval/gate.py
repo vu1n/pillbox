@@ -63,7 +63,7 @@ class SubstrateConfig:
     evals_pillbox: str = "evals"
     max_wait: int = 240
     in_sandbox: bool = False
-    runner_image: str = "pillbox-runner:l7"
+    runner_image: str = "pillbox-runner:dev"
 
 
 @dataclass
@@ -335,7 +335,7 @@ def main():
     ap.add_argument("--parallel", type=int, default=1, help="concurrent worker VMs (>1 only for LOCAL models; hosted plans throttle)")
     ap.add_argument("--limit", type=int, default=0, help="cap tasks per split (0=all; fast iteration)")
     ap.add_argument("--in-sandbox", action="store_true")
-    ap.add_argument("--runner-image", default=os.environ.get("PILLBOX_RUNNER_IMAGE", "pillbox-runner:l7"))
+    ap.add_argument("--runner-image", default=os.environ.get("PILLBOX_RUNNER_IMAGE", "pillbox-runner:dev"))
     ap.add_argument("--playbook", default="")
     ap.add_argument("--out", default="gate-run.json")
     ap.add_argument("--run-id", default="gate")

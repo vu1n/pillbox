@@ -24,7 +24,7 @@ recorded as a verifiable `scored` §0 event). `run-ab.sh` tabulates pass rates.
 # build + sign the libkrun binary first (see docs/libkrun-sandbox.md), then
 # populate tasks/ from a benchmark and A/B it:
 python3 scripts/eval/import-aider-polyglot.py --limit 20   # recommended set
-PILLBOX_RUNNER_IMAGE=pillbox-runner:l7 scripts/eval/run-ab.sh 5
+PILLBOX_RUNNER_IMAGE=pillbox-runner:dev scripts/eval/run-ab.sh 5
 ```
 
 ## A task = a directory under `tasks/`
@@ -75,7 +75,7 @@ in a loop — score against a rubric, inject the *per-criterion* feedback for wh
 still fails, re-drive — until every criterion passes or it hits `--max-iter`.
 
 ```sh
-PILLBOX_RUNNER_IMAGE=pillbox-runner:l7 scripts/eval/rubric-loop.sh \
+PILLBOX_RUNNER_IMAGE=pillbox-runner:dev scripts/eval/rubric-loop.sh \
   scripts/eval/rubric-demo --max-iter 3 --json
 ```
 

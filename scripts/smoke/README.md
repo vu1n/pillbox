@@ -36,7 +36,7 @@ SMOKE_CODEX=1 scripts/smoke/run.sh libkrun   # also smoke codex-serve (opt-in)
 - macOS with the libkrun toolchain (for the libkrun smokes).
 - Agents authed: `pillbox auth login --agent opencode` (and `--agent codex` for
   codex-serve); a reachable model for opencode (`SMOKE_MODEL`).
-- Runner images present: `pillbox-runner:l7` (opencode), `pillbox-runner:l8`
+- Runner images present: `pillbox-runner:dev` (opencode), `pillbox-runner:dev`
   (codex-serve). Override via `OPENCODE_IMAGE`/`CODEX_IMAGE`.
 - `cloudflare-spike/` deps installed (`npm i`) + Node ≥ 23 (for `.ts` imports) for
   the CF smokes.

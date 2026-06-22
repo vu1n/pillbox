@@ -61,13 +61,21 @@ Resolution order (highest precedence first):
 
 `pillbox doctor` shows the resolved image + the source.
 
-## Tags published
+## Tags
 
-| Tag | Cadence | Notes |
-|---|---|---|
-| `vX.Y.Z` | per CLI release | matches `CARGO_PKG_VERSION`. Most stable. |
-| `latest` | per CLI release | alias for the most recent `vX.Y.Z`. The default. |
-| `rolling` | per Dockerfile merge to main | rebuilt anytime Renovate bumps a harness version. Bleeding edge — opt in via override. |
+Tags name **roles, not history** — there is no `l5`/`l6`/`l7` generation scheme
+(that conflated "libkrun dev phase" with "the image you run" and caused endless
+"which tag is current?" churn; see [decisions.md](./decisions.md)). Three tags,
+plus immutable versions:
+
+| Tag | Moving? | Cadence | Use it for |
+|---|---|---|---|
+| `dev` | moving | local `build-runner.sh` + CI on merge-to-main | day-to-day dev — pin it in your dev `pillbox.toml` |
+| `latest` | moving | CI on stable release (alias of newest `vX.Y.Z`) | prod / fresh installs — the built-in default |
+| `vX.Y.Z` | **immutable** | CI per release | reproducibility — pin this (and *only* this) for a frozen eval/σ̂ baseline |
+
+So you pin `dev` or `latest` and never chase a number. When you need a run to be
+reproducible, pin a concrete `vX.Y.Z` — that's what versions are for.
 
 ## Updating the bundled agents
 
@@ -79,7 +87,7 @@ the versions baked into the image.
 scripts/build-runner.sh --update --dry-run   # show what would change, no write/build
 scripts/build-runner.sh --update             # bump all agents to latest, rebuild, verify
 scripts/build-runner.sh                       # rebuild current pins (layer-cached), verify
-scripts/build-runner.sh --update --tag pillbox-runner:l8
+scripts/build-runner.sh --tag pillbox-runner:v0.2.0   # build an immutable version tag
 ```
 
 `--update` edits the `ARG …_VERSION` pins in `runner/Dockerfile`, so it's a

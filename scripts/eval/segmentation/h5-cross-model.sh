@@ -28,7 +28,7 @@ mkdir -p "$RESULTS"
 # the published default (ghcr.io/vu1n/pillbox-runner:latest) which isn't cached
 # locally and needs docker → `run` fails instantly → every cell records a SILENT
 # 0. l7 is the egress-capable local dev image. (The 2026-06-20 cost==0 footgun.)
-export PILLBOX_RUNNER_IMAGE="${PILLBOX_RUNNER_IMAGE:-pillbox-runner:l7}"
+export PILLBOX_RUNNER_IMAGE="${PILLBOX_RUNNER_IMAGE:-pillbox-runner:dev}"
 export PILLBOX_BACKEND="${PILLBOX_BACKEND:-libkrun}"
 
 # Loud preflight: one real launch must yield a session id, else the whole sweep

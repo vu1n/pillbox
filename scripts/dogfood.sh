@@ -15,14 +15,14 @@
 # is the human channel — the strongest signal, surfaced first in every future brief. Set
 # KYPP_DISTILL_MODEL for richer LLM-distilled lessons (else: failure-mining only).
 #
-# Env: PILLBOX (binary), PILLBOX_BACKEND (=libkrun), PILLBOX_RUNNER_IMAGE (=pillbox-runner:l7),
+# Env: PILLBOX (binary), PILLBOX_BACKEND (=libkrun), PILLBOX_RUNNER_IMAGE (=pillbox-runner:dev),
 #      MODEL (=zai-coding-plan/glm-4.5-air), MAXWAIT (idle cap, =600s).
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PB="${PILLBOX:-$ROOT/target/debug/pillbox}"
 export PILLBOX_BACKEND="${PILLBOX_BACKEND:-libkrun}"
-export PILLBOX_RUNNER_IMAGE="${PILLBOX_RUNNER_IMAGE:-pillbox-runner:l7}"
+export PILLBOX_RUNNER_IMAGE="${PILLBOX_RUNNER_IMAGE:-pillbox-runner:dev}"
 MODEL="${MODEL:-zai-coding-plan/glm-4.5-air}"
 MAXWAIT="${MAXWAIT:-600}"
 

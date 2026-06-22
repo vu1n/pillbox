@@ -223,7 +223,7 @@ def main():
                     help="models cheapest→most-capable, comma-separated")
     ap.add_argument("--project", default=os.environ.get("KYPP_PROJECT", "router"))
     ap.add_argument("--pillbox", default=os.environ.get("PILLBOX", "./target/debug/pillbox"))
-    ap.add_argument("--runner-image", default=os.environ.get("PILLBOX_RUNNER_IMAGE", "pillbox-runner:l7"))
+    ap.add_argument("--runner-image", default=os.environ.get("PILLBOX_RUNNER_IMAGE", "pillbox-runner:dev"))
     ap.add_argument("--max-wait", type=int, default=240)
     ap.add_argument("--out", default="route-run.json")
     ap.add_argument("--explain", action="store_true", help="print learned adequacy + the route order, no run")

@@ -7,24 +7,30 @@
 # (provider/modelID), TEMPERATURE (sampling temp; set 0 for greedy/deterministic
 # decoding — the variance knob), PRICE_*_PER_M (cost-summer pricing).
 
-# Start a worker session against workspace $1; echo the 12-hex session id (or
-# empty on failure, which the caller guards). AGENT overrides the agent (default
-# opencode); MODEL/TEMPERATURE override the model/temperature where the agent
-# honors them (the CLI-harness agents claude/codex ignore both — harmless).
+# Start a worker session against workspace $1 (optional launch prompt $2); echo the
+# 12-hex session id (or empty on failure, which the caller guards). AGENT overrides
+# the agent (default opencode); MODEL/TEMPERATURE apply only to opencode.
 #
-# `--json` makes `run` emit `{version:1,session:{id,…}}` on stdout instead of the
-# human banner, so we parse the id structurally — no `grep`-the-banner scrape.
-# opencode is server-mode, so `run --json` is valid without `--detach` (the run
-# persists a session record regardless).
+# `--json` makes `run` emit `{version:1,session:{id,…}}` on stdout, so we parse the
+# id structurally — no `grep`-the-banner scrape.
+#
+# TWO drive models, by agent capability:
+#   opencode (server-mode) — `run --json` persists a session WITHOUT --detach and
+#     WITHOUT a launch prompt; the caller drives the turn via `session send`.
+#   claude/codex (CLI-harness, one-shot `agent -p PROMPT`) — the prompt must be at
+#     LAUNCH, so we pass `--detach -- "$2"`. A later `session send` can NOT drive a
+#     one-shot CLI agent (verified: empty-launch+send yields a booted VM that never
+#     runs a turn → 0/0). So $2 is REQUIRED for a CLI agent to do any work.
 pb_run_session() {
-  # `--json` needs a persisted session. opencode is server-mode (persists without
-  # --detach); CLI-harness agents (claude/codex) are NOT, so they need --detach to
-  # persist a record the harness can drive via `session send`. (The turn still runs
-  # on send, not on launch — detached = provision-then-drive, the dispatch contract.)
-  local detach=""; [ "${AGENT:-opencode}" = opencode ] || detach="--detach"
-  "$PILLBOX" run --agent "${AGENT:-opencode}" $detach --json --workspace "$1" \
-    ${MODEL:+--model "$MODEL"} ${TEMPERATURE:+--temperature "$TEMPERATURE"} 2>/dev/null \
-    | python3 -c 'import json,sys
+  local agent="${AGENT:-opencode}"
+  if [ "$agent" = opencode ]; then
+    "$PILLBOX" run --agent "$agent" --json --workspace "$1" \
+      ${MODEL:+--model "$MODEL"} ${TEMPERATURE:+--temperature "$TEMPERATURE"} 2>/dev/null
+  elif [ -n "${2:-}" ]; then
+    "$PILLBOX" run --agent "$agent" --detach --json --workspace "$1" -- "$2" 2>/dev/null
+  else
+    "$PILLBOX" run --agent "$agent" --detach --json --workspace "$1" 2>/dev/null
+  fi | python3 -c 'import json,sys
 try: print(json.load(sys.stdin)["session"]["id"])
 except Exception: pass'
 }

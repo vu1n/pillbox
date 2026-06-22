@@ -255,7 +255,7 @@ launch_session() {
   local sid attempt tmpf lp w
   for attempt in $(seq 0 "$LAUNCH_RETRIES"); do
     tmpf="$(mktemp)"
-    ( pb_run_session "$1" >"$tmpf" 2>/dev/null ) &
+    ( pb_run_session "$1" "${2:-}" >"$tmpf" 2>/dev/null ) &
     lp=$!
     w=0
     while kill -0 "$lp" 2>/dev/null && [ "$w" -lt "$LAUNCH_TIMEOUT" ]; do sleep 3; w=$((w + 3)); done
@@ -337,11 +337,18 @@ grade_full() { # sid clone task_dir
 run_monolithic_cell() { # task_dir task trial
   local ws; ws="$(mktemp -d)"
   cp -R "$1/workspace/." "$ws"/ 2>/dev/null
-  local sid; sid="$(launch_session "$ws")"
+  local prompt; prompt="$(cat "$1/prompt.txt")"
+  # opencode (server) launches idle and is driven via `session send`; a CLI-harness
+  # agent (claude/codex) is one-shot, so the prompt goes in at LAUNCH and the turn
+  # runs detached — wait for idle, no send (an empty-launch+send never drives it).
+  local sid
+  if [ "${AGENT:-opencode}" = opencode ]; then sid="$(launch_session "$ws")"
+  else sid="$(launch_session "$ws" "$prompt")"; fi
   if [ -z "$sid" ]; then rm -rf "$ws"; emit_record "$2" monolithic "$3" 0 0; return; fi
   local clone; clone="$(pb_workspace "$sid")"
   if [ -z "$clone" ]; then reap_session "$sid"; rm -rf "$ws"; emit_record "$2" monolithic "$3" 0 0; return; fi
-  drive_bounded "$sid" "$(cat "$1/prompt.txt")"
+  if [ "${AGENT:-opencode}" = opencode ]; then drive_bounded "$sid" "$prompt"
+  else "$PILLBOX" session wait-idle "$sid" --timeout "$MAX_WAIT" >/dev/null 2>&1 || true; fi
   local score; score="$(grade_full "$sid" "$clone" "$1")"
   local cost; cost="$(pb_usage "$sid" | cost_of)"
   reap_session "$sid"

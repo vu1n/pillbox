@@ -36,6 +36,7 @@ mod gateway;
 mod memory;
 mod paths;
 mod pillbox;
+mod prompt;
 mod registry;
 mod sandbox;
 mod sandboxes;
@@ -85,6 +86,16 @@ enum Command {
         /// Default agent for `pillbox run` (`claude` | `codex` | `opencode`).
         #[arg(long, value_name = "AGENT")]
         agent: Option<String>,
+        /// Default model for `pillbox run` (`provider/model`). Written to `pillbox.toml`.
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
+        /// Sandbox runner image. Written to `pillbox.toml`'s `[runner] image`.
+        #[arg(long = "runner-image", value_name = "IMAGE")]
+        runner_image: Option<String>,
+        /// Interactively prompt for name/agent/model/image (a simple menu). Pre-fills
+        /// from any flags above; needs a terminal.
+        #[arg(short = 'i', long = "interactive")]
+        interactive: bool,
         /// Workspace backend variant. `local` (default) stores the
         /// rustic repo under `~/.pillbox/projects/<key>/repo/`; `s3`
         /// stores it in a user-owned S3-compatible bucket.
@@ -639,6 +650,9 @@ fn run(cli: Cli) -> Result<()> {
         Command::New {
             name,
             agent,
+            model,
+            runner_image,
+            interactive,
             workspace_backend,
             bucket,
             endpoint,
@@ -648,21 +662,44 @@ fn run(cli: Cli) -> Result<()> {
             secret_key_env,
             from_git,
             git_ref,
-        } => pillbox::new(
-            name,
-            agent,
-            pillbox::NewWorkspaceArgs {
-                backend: workspace_backend,
-                endpoint,
-                region,
-                bucket,
-                prefix,
-                access_key_env,
-                secret_key_env,
-                from_git,
-                git_ref,
-            },
-        ),
+        } => {
+            // `-i` runs the menu, pre-filled with any flags; else the flags are the
+            // descriptor as-is. TTY-guarded so a piped invocation never blocks.
+            let (name, defaults) = if interactive {
+                if !prompt::interactive() {
+                    return Err(PillboxError::usage(
+                        "pillbox new",
+                        "-i/--interactive needs a terminal (stdin + stdout)",
+                    )
+                    .into());
+                }
+                wizard_new(name, agent, model, runner_image)?
+            } else {
+                (
+                    name,
+                    pillbox::NewDefaults {
+                        agent,
+                        model,
+                        runner_image,
+                    },
+                )
+            };
+            pillbox::new(
+                name,
+                defaults,
+                pillbox::NewWorkspaceArgs {
+                    backend: workspace_backend,
+                    endpoint,
+                    region,
+                    bucket,
+                    prefix,
+                    access_key_env,
+                    secret_key_env,
+                    from_git,
+                    git_ref,
+                },
+            )
+        }
         Command::List { json } => pillbox::list(json),
         Command::Rm { name } => pillbox::rm(&name),
         Command::Info { json } => pillbox::info(pillbox_arg, json),
@@ -934,18 +971,79 @@ fn run(cli: Cli) -> Result<()> {
     }
 }
 
+/// `pillbox new -i` — prompt for the descriptor's run-config fields (name, agent,
+/// model, runner image), pre-filled with any flags already passed. Caller has
+/// confirmed a TTY. The runner-image prompt is a selection of locally-available
+/// images plus a free-text fallback. Returns (name, defaults) for `pillbox::new`.
+fn wizard_new(
+    name: Option<String>,
+    agent: Option<String>,
+    model: Option<String>,
+    runner_image: Option<String>,
+) -> Result<(Option<String>, pillbox::NewDefaults)> {
+    let cwd_base = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "pillbox".into());
+    let name = Some(prompt::line("name", name.as_deref().unwrap_or(&cwd_base))?);
+
+    let agents = ["claude", "codex", "opencode", "pi"];
+    let agent_idx = agents
+        .iter()
+        .position(|a| Some(*a) == agent.as_deref())
+        .unwrap_or(0); // default → claude
+    let agent = Some(prompt::select("agent", &agents, agent_idx)?);
+
+    let model = {
+        let m = prompt::line(
+            "model (blank = agent default)",
+            model.as_deref().unwrap_or(""),
+        )?;
+        (!m.is_empty()).then_some(m)
+    };
+
+    // Runner image: pick from locally-available images, or "custom…" for free text.
+    // The pre-fill (flag or pillbox-runner:l7) is always offered, even if not enumerated.
+    let pre = runner_image
+        .as_deref()
+        .unwrap_or("pillbox-runner:l7")
+        .to_string();
+    let mut imgs = crate::docker::list_runner_images();
+    if !imgs.contains(&pre) {
+        imgs.insert(0, pre.clone());
+    }
+    let def_idx = imgs.iter().position(|i| *i == pre).unwrap_or(0);
+    let custom = "custom…";
+    let mut opts: Vec<&str> = imgs.iter().map(String::as_str).collect();
+    opts.push(custom);
+    let chosen = prompt::select("runner image", &opts, def_idx)?;
+    let runner_image = Some(if chosen == custom {
+        prompt::line("image", &pre)?
+    } else {
+        chosen
+    });
+
+    Ok((
+        name,
+        pillbox::NewDefaults {
+            agent,
+            model,
+            runner_image,
+        },
+    ))
+}
+
 fn resolve_agent_spec(
     resolved: &Pillbox,
     override_id: Option<&str>,
 ) -> Result<&'static agents::AgentSpec> {
-    let id = if let Some(id) = override_id {
-        id.to_string()
-    } else if let Some(meta) = &resolved.meta {
-        meta.agent_default
-            .clone()
-            .unwrap_or_else(|| "claude".into())
-    } else {
-        "claude".into()
+    let id = match override_id {
+        Some(id) => id.to_string(),
+        // Descriptor cascade (project pillbox.toml → ~/.pillbox/global → built-in),
+        // read fresh so an edited `agent =` takes effect without a meta rewrite.
+        None => crate::config::resolve_run_config(resolved)
+            .agent
+            .unwrap_or_else(|| "claude".into()),
     };
     agents::lookup("run", &id)
 }
@@ -957,6 +1055,24 @@ fn dispatch_run(resolved: &Pillbox, agent: Option<String>, mut opts: RunOpts) ->
     if let Some(meta) = &resolved.meta {
         if opts.name.is_none() {
             opts.name = Some(meta.name.clone());
+        }
+    }
+
+    // Model cascade: `--model` wins, else the descriptor (project `pillbox.toml`
+    // → `~/.pillbox/global/pillbox.toml`), else the agent's own default (`None`).
+    if opts.model.is_none() {
+        opts.model = crate::config::resolve_run_config(resolved).model;
+    }
+
+    // Workspace default: a PROJECT pillbox carries its repo path (`source_dir`),
+    // so `pillbox run --pillbox sakana` (or `pillbox project sakana`) mounts that
+    // repo from ANYWHERE — not just from inside it. `--workspace` still overrides;
+    // the global pillbox has no `source_dir`, so it falls through to the backend's
+    // cwd default. cwd-discovery already has `source_dir == cwd`, so this is a no-op
+    // there — only by-name invocation changes.
+    if opts.workspace.is_none() {
+        if let crate::pillbox::Scope::Project { source_dir, .. } = &resolved.scope {
+            opts.workspace = Some(source_dir.clone());
         }
     }
 

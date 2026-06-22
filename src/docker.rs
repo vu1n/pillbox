@@ -55,26 +55,21 @@ pub fn default_runner_image() -> String {
 }
 
 /// Resolve the runner image for a specific pillbox plus its source.
-/// Precedence: env var > `pillbox.toml [runner] image` > built-in
-/// default. The toml read happens on demand (per `pillbox run`) so
-/// editing `pillbox.toml` takes effect immediately — no meta.json
-/// rewrite dance — and the parse cost is negligible against the
-/// docker spawn that follows.
-///
-/// The toml step is a no-op for the global pillbox (no descriptor
-/// file to read).
+/// Precedence: env var > `pillbox.toml [runner] image` (project, then
+/// `~/.pillbox/global/pillbox.toml`) > built-in default. The toml reads
+/// happen on demand (per `pillbox run`) so editing a descriptor takes
+/// effect immediately — no meta.json rewrite dance — and the parse cost
+/// is negligible against the sandbox spawn that follows.
 pub fn resolve_runner_image(resolved: &Pillbox) -> (String, RunnerImageSource) {
     if let Ok(env) = std::env::var(RUNNER_IMAGE_ENV) {
         return (env, RunnerImageSource::Env);
     }
-    if let crate::pillbox::Scope::Project { source_dir, .. } = &resolved.scope {
-        let toml_path = source_dir.join("pillbox.toml");
-        if let Ok(cfg) = crate::config::Config::load_from(&toml_path) {
-            if let Some(image) = cfg.runner.image {
-                if !image.trim().is_empty() {
-                    return (image, RunnerImageSource::ProjectToml);
-                }
-            }
+    // Descriptor cascade: project `pillbox.toml` (walk-up) overlaid on the
+    // user-global `~/.pillbox/global/pillbox.toml`.
+    let cfg = crate::config::resolve_run_config(resolved);
+    if let Some(image) = cfg.runner.image {
+        if !image.trim().is_empty() {
+            return (image, RunnerImageSource::ProjectToml);
         }
     }
     (DEFAULT_RUNNER_IMAGE.to_string(), RunnerImageSource::Default)
@@ -87,6 +82,48 @@ fn resolve_env_or_default() -> (String, RunnerImageSource) {
         Ok(v) => (v, RunnerImageSource::Env),
         Err(_) => (DEFAULT_RUNNER_IMAGE.to_string(), RunnerImageSource::Default),
     }
+}
+
+/// Best-effort enumeration of runner images available locally — for the
+/// `pillbox new -i` image selection. Two sources, deduped + sorted: local docker
+/// `pillbox-runner:*` tags, and the cached libkrun rootfs under
+/// `~/.pillbox/krun/rootfs/` (dir `pillbox_runner_l7` ↔ tag `pillbox-runner:l7`;
+/// the `…_sha256_…` by-digest variants are skipped — they aren't a usable tag).
+/// Display-only: empty on any failure, and the wizard always offers a free-text
+/// fallback, so this is never a correctness path.
+pub fn list_runner_images() -> Vec<String> {
+    use std::collections::BTreeSet;
+    let mut set: BTreeSet<String> = BTreeSet::new();
+
+    if let Ok(out) = std::process::Command::new("docker")
+        .args(["image", "ls", "--format", "{{.Repository}}:{{.Tag}}"])
+        .output()
+    {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if line.starts_with("pillbox-runner:") && !line.ends_with(":<none>") {
+                set.insert(line.to_string());
+            }
+        }
+    }
+
+    if let Some(home) = std::env::var_os("HOME") {
+        let rootfs = std::path::Path::new(&home).join(".pillbox/krun/rootfs");
+        if let Ok(rd) = std::fs::read_dir(&rootfs) {
+            for entry in rd.flatten() {
+                if let Some(tag) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|n| n.strip_prefix("pillbox_runner_"))
+                {
+                    if !tag.is_empty() && !tag.contains("_sha256_") {
+                        set.insert(format!("pillbox-runner:{tag}"));
+                    }
+                }
+            }
+        }
+    }
+
+    set.into_iter().collect()
 }
 
 /// Resolve + pre-flight the runner image for `resolved`, returning

@@ -984,7 +984,12 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let saved = std::env::current_dir().ok();
             std::env::set_current_dir(tmp.path()).unwrap();
-            pillbox::new(Some("p".into()), None, pillbox::NewWorkspaceArgs::default()).unwrap();
+            pillbox::new(
+                Some("p".into()),
+                pillbox::NewDefaults::default(),
+                pillbox::NewWorkspaceArgs::default(),
+            )
+            .unwrap();
             let proj = crate::pillbox::Pillbox::resolve(None).unwrap();
             assert!(!proj.is_global());
 

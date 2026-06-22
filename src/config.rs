@@ -5,11 +5,15 @@
 //! rustic-backed snapshot store; vault config will follow later.
 //!
 //! ```toml
-//! # required
+//! # required (project descriptor; optional in the global defaults file)
 //! name = "my-project"
 //!
-//! # optional — default agent for `pillbox run`
-//! agent = "claude"          # or "codex" or "opencode"
+//! # optional run-config defaults for `pillbox run`
+//! agent = "claude"          # or "codex" / "opencode"
+//! model = "zai-coding-plan/glm-4.5-air"   # provider/model; None → agent's own default
+//!
+//! [runner]
+//! image = "pillbox-runner:l7"   # the sandbox image (else the published default)
 //!
 //! [workspace]
 //! backend = "local"        # or "s3"
@@ -22,8 +26,14 @@
 //! # secret_key_env = "R2_SECRET_KEY"
 //! ```
 //!
-//! Discovery is the same shape as `.gitignore` / `Cargo.toml`: walk up
-//! from cwd until a `pillbox.toml` is found.
+//! **Discovery + cascade** (CLAUDE.md-style): walk up from cwd until a
+//! `pillbox.toml` is found (first match = the project descriptor), then
+//! overlay it field-by-field on the user-global defaults at
+//! `~/.pillbox/global/pillbox.toml`. Per field, precedence is
+//! `CLI flag > env > project pillbox.toml > ~/.pillbox/global/pillbox.toml >
+//! built-in default`. Set `agent`/`model`/`[runner] image` once globally;
+//! a project descriptor overrides only what's repo-specific. See
+//! [`resolve_run_config`].
 
 use std::{
     fs,
@@ -139,6 +149,10 @@ pub(crate) struct Config {
     /// back to a built-in default at run time.
     #[serde(default)]
     pub(crate) agent: Option<String>,
+    /// Default model for `pillbox run` (provider/model, e.g. `zai-coding-plan/glm-4.5-air`).
+    /// `None` → the agent's own default. Overridden by `--model`.
+    #[serde(default)]
+    pub(crate) model: Option<String>,
     /// Workspace backend selector (`local` | `s3`). See [`WorkspaceConfig`].
     #[serde(default)]
     pub(crate) workspace: WorkspaceConfig,
@@ -172,6 +186,60 @@ impl Config {
         cfg.source = Some(path.to_path_buf());
         Ok(cfg)
     }
+
+    /// Load the user-global defaults (`~/.pillbox/global/pillbox.toml`) — the BASE
+    /// layer of the cascade. Lenient: it's a defaults file, not a project descriptor,
+    /// so `name` isn't required and any absent/unreadable/malformed file yields empty
+    /// defaults (`Config::default`) rather than an error — a missing global file is
+    /// the normal case, not a failure.
+    pub(crate) fn global_defaults() -> Config {
+        fs::read_to_string(crate::pillbox::global_config_path())
+            .ok()
+            .and_then(|raw| toml::from_str::<Config>(&raw).ok())
+            .unwrap_or_default()
+    }
+
+    /// Overlay `self` (higher precedence — e.g. a project descriptor) onto `base`
+    /// (lower — e.g. global defaults), field-by-field: a field set in `self` wins;
+    /// an unset field falls through to `base`. This is the pillbox.toml cascade
+    /// (CLAUDE.md-style), scoped to the run-config fields that callers resolve.
+    pub(crate) fn overlay_on(self, base: Config) -> Config {
+        Config {
+            name: self.name.or(base.name),
+            agent: self.agent.or(base.agent),
+            model: self.model.or(base.model),
+            runner: RunnerConfig {
+                image: self.runner.image.or(base.runner.image),
+            },
+            // Workspace (store backend) is project-scoped — take the project's if it
+            // declares one, else inherit global. Per-field merge isn't needed: a
+            // descriptor either owns its store config or has none.
+            workspace: if self.workspace == WorkspaceConfig::default() {
+                base.workspace
+            } else {
+                self.workspace
+            },
+            source: self.source.or(base.source),
+        }
+    }
+}
+
+/// Resolve the effective run-config for a pillbox via the descriptor cascade:
+/// the project `pillbox.toml` (found by walking up from cwd, read FRESH so edits
+/// take effect immediately) overlaid on `~/.pillbox/global/pillbox.toml`. Callers
+/// apply the higher-precedence layers (CLI flag, env) and the built-in default on
+/// top of the field they read (`agent` / `model` / `runner.image`).
+pub(crate) fn resolve_run_config(resolved: &crate::pillbox::Pillbox) -> Config {
+    let global = Config::global_defaults();
+    match &resolved.scope {
+        crate::pillbox::Scope::Project { source_dir, .. } => {
+            match Config::load_from(&source_dir.join("pillbox.toml")) {
+                Ok(project) => project.overlay_on(global),
+                Err(_) => global,
+            }
+        }
+        _ => global,
+    }
 }
 
 #[cfg(test)]
@@ -200,6 +268,38 @@ mod tests {
         write_config(root.path(), "name = \"a\"\nagent = \"claude\"\n");
         let cfg = Config::load_from(&root.path().join("pillbox.toml")).unwrap();
         assert_eq!(cfg.agent.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn load_parses_model_field() {
+        let root = TempDir::new().unwrap();
+        write_config(root.path(), "name = \"a\"\nmodel = \"prov/m\"\n");
+        let cfg = Config::load_from(&root.path().join("pillbox.toml")).unwrap();
+        assert_eq!(cfg.model.as_deref(), Some("prov/m"));
+    }
+
+    #[test]
+    fn overlay_project_wins_global_fills_gaps() {
+        // global = the user-wide defaults (~/.pillbox/global/pillbox.toml)
+        let global = Config {
+            agent: Some("claude".into()),
+            model: Some("global/model".into()),
+            runner: RunnerConfig {
+                image: Some("global-img".into()),
+            },
+            ..Default::default()
+        };
+        // project overrides agent, leaves model + image unset → inherit global
+        let project = Config {
+            name: Some("proj".into()),
+            agent: Some("codex".into()),
+            ..Default::default()
+        };
+        let m = project.overlay_on(global);
+        assert_eq!(m.agent.as_deref(), Some("codex")); // project wins
+        assert_eq!(m.model.as_deref(), Some("global/model")); // inherited
+        assert_eq!(m.runner.image.as_deref(), Some("global-img")); // inherited
+        assert_eq!(m.name.as_deref(), Some("proj"));
     }
 
     #[test]

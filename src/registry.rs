@@ -340,7 +340,7 @@ mod tests {
             std::env::set_current_dir(tmp.path()).unwrap();
             pillbox::new(
                 Some("proj".into()),
-                None,
+                pillbox::NewDefaults::default(),
                 pillbox::NewWorkspaceArgs::default(),
             )
             .unwrap();

@@ -169,6 +169,12 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> 
         SessionAction::WaitIdle { id, timeout, from } => {
             stream::session_wait_idle(resolved, &id, timeout, from)
         }
+        SessionAction::Guard {
+            id,
+            max_repeats,
+            max_tokens,
+            kill,
+        } => stream::session_guard(resolved, &id, max_repeats, max_tokens, kill),
         SessionAction::Prune { dry_run } => session_prune(resolved, dry_run),
         SessionAction::Transcript {
             file,

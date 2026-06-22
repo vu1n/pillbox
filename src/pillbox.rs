@@ -336,6 +336,17 @@ pub(crate) fn global() -> Pillbox {
     }
 }
 
+/// Path to the user-global defaults descriptor (`~/.pillbox/global/pillbox.toml`).
+/// The BASE layer of the pillbox.toml cascade: a project descriptor (found by
+/// walking up from cwd) overlays this field-by-field. Infallible (same HOME
+/// fallback as [`global`]); the file need not exist — absent ⇒ no global defaults.
+pub(crate) fn global_config_path() -> PathBuf {
+    let root = std::env::var("HOME")
+        .map(|h| PathBuf::from(h).join(".pillbox"))
+        .unwrap_or_else(|_| PathBuf::from(".pillbox"));
+    root.join(GLOBAL_NAME).join(PILLBOX_TOML)
+}
+
 /// Walk up from `start` looking for `pillbox.toml`. Returns the resolved
 /// project `Pillbox` (with its state dir + meta loaded) or `None`.
 pub(crate) fn discover_from(start: &Path) -> Result<Option<Pillbox>> {
@@ -478,12 +489,23 @@ pub(crate) struct NewWorkspaceArgs {
     pub(crate) git_ref: Option<String>,
 }
 
+/// Run-config defaults written into a new `pillbox.toml` — the cascade fields
+/// `pillbox new` can set (flag or interactive wizard). Distinct from
+/// [`NewWorkspaceArgs`] (the snapshot store). All optional: an unset field is
+/// simply omitted from the descriptor and falls through the cascade at run time.
+#[derive(Default)]
+pub(crate) struct NewDefaults {
+    pub(crate) agent: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) runner_image: Option<String>,
+}
+
 /// `pillbox new` — create a project pillbox in the current directory.
 /// Writes `pillbox.toml` next to the cwd, creates the state dir under
 /// `~/.pillbox/projects/<key>/`, initializes a rustic repo, and
 /// optionally clones from `--from-git`. Fails if a pillbox already
 /// exists at either location.
-pub(crate) fn new(name: Option<String>, agent: Option<String>, ws: NewWorkspaceArgs) -> Result<()> {
+pub(crate) fn new(name: Option<String>, defaults: NewDefaults, ws: NewWorkspaceArgs) -> Result<()> {
     check_legacy_layout()?;
     let cwd = std::env::current_dir()
         .map_err(|e| PillboxError::runtime("pillbox new", format!("could not resolve cwd: {e}")))?;
@@ -500,7 +522,7 @@ pub(crate) fn new(name: Option<String>, agent: Option<String>, ws: NewWorkspaceA
         Some(n) => n,
         None => default_name_from_dir(&cwd),
     };
-    if let Some(a) = agent.as_deref() {
+    if let Some(a) = defaults.agent.as_deref() {
         validate_agent(a)?;
     }
     let workspace_cfg = build_workspace_config(&ws)?;
@@ -526,11 +548,18 @@ pub(crate) fn new(name: Option<String>, agent: Option<String>, ws: NewWorkspaceA
 
     // Write the descriptor first so a failure on meta.json leaves the
     // user with a half-set-up directory they can re-run against.
-    write_descriptor(&descriptor, &display_name, agent.as_deref(), &workspace_cfg)?;
+    write_descriptor(
+        &descriptor,
+        &display_name,
+        defaults.agent.as_deref(),
+        defaults.model.as_deref(),
+        defaults.runner_image.as_deref(),
+        &workspace_cfg,
+    )?;
     let meta = ProjectMeta {
         name: display_name.clone(),
         created_at: rfc3339_now(),
-        agent_default: agent,
+        agent_default: defaults.agent,
         workspace: workspace_cfg.clone(),
     };
     write_project_meta(&state_dir, &meta)?;
@@ -887,12 +916,20 @@ fn write_descriptor(
     path: &Path,
     name: &str,
     agent: Option<&str>,
+    model: Option<&str>,
+    runner_image: Option<&str>,
     workspace: &WorkspaceConfig,
 ) -> Result<()> {
     use std::io::Write;
     let mut body = format!("# v0.6 pillbox descriptor — see docs/config.md\n\nname = \"{name}\"\n");
     if let Some(a) = agent {
         body.push_str(&format!("agent = \"{a}\"\n"));
+    }
+    if let Some(m) = model {
+        body.push_str(&format!("model = \"{m}\"\n"));
+    }
+    if let Some(img) = runner_image {
+        body.push_str(&format!("\n[runner]\nimage = \"{img}\"\n"));
     }
     // Always emit a `[workspace]` table so the user sees the resolved
     // backend even when it's the default.
@@ -1065,7 +1102,10 @@ mod tests {
 
             new(
                 Some("alpha".into()),
-                Some("claude".into()),
+                NewDefaults {
+                    agent: Some("claude".into()),
+                    ..Default::default()
+                },
                 NewWorkspaceArgs::default(),
             )
             .unwrap();
@@ -1097,7 +1137,7 @@ mod tests {
             std::env::set_current_dir(tmp.path()).unwrap();
             fs::write(tmp.path().join(PILLBOX_TOML), "name = \"x\"\n").unwrap();
 
-            let err = new(None, None, NewWorkspaceArgs::default()).unwrap_err();
+            let err = new(None, NewDefaults::default(), NewWorkspaceArgs::default()).unwrap_err();
             let s = format!("{err}");
             assert!(s.contains("already exists"), "got: {s}");
 
@@ -1152,7 +1192,12 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let saved_cwd = std::env::current_dir().ok();
             std::env::set_current_dir(tmp.path()).unwrap();
-            new(Some("alpha".into()), None, NewWorkspaceArgs::default()).unwrap();
+            new(
+                Some("alpha".into()),
+                NewDefaults::default(),
+                NewWorkspaceArgs::default(),
+            )
+            .unwrap();
 
             // Now from /tmp (no descriptor), resolve by name.
             std::env::set_current_dir("/tmp").unwrap();
@@ -1181,7 +1226,12 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let saved_cwd = std::env::current_dir().ok();
             std::env::set_current_dir(tmp.path()).unwrap();
-            new(Some("beta".into()), None, NewWorkspaceArgs::default()).unwrap();
+            new(
+                Some("beta".into()),
+                NewDefaults::default(),
+                NewWorkspaceArgs::default(),
+            )
+            .unwrap();
 
             let all = collect_all().unwrap();
             assert!(all.iter().any(|p| p.is_global()));
@@ -1199,7 +1249,12 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let saved_cwd = std::env::current_dir().ok();
             std::env::set_current_dir(tmp.path()).unwrap();
-            new(Some("gamma".into()), None, NewWorkspaceArgs::default()).unwrap();
+            new(
+                Some("gamma".into()),
+                NewDefaults::default(),
+                NewWorkspaceArgs::default(),
+            )
+            .unwrap();
 
             let key = path_to_key(tmp.path()).unwrap();
             let home = std::env::var("HOME").unwrap();

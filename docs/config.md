@@ -13,10 +13,15 @@ For the command-table reference see [../AGENTS.md](../AGENTS.md).
 # Required
 name = "my-project"
 
-# Optional — default agent for `pillbox run`
+# Optional — run-config defaults for `pillbox run`
 agent = "claude"          # "claude" | "codex" | "codex-serve" | "opencode" | "pi"
+model = "zai-coding-plan/glm-4.5-air"   # provider/model; omitted → the agent's own default
 
-# Workspace backend (PR 3). Default is local.
+# Sandbox image. Omitted → the published default (which may not be cached → set this).
+[runner]
+image = "pillbox-runner:l7"
+
+# Workspace backend. Default is local.
 [workspace]
 backend = "local"         # or "s3"
 # s3-only:
@@ -37,6 +42,8 @@ typos *inside* `[workspace]` are silently ignored at parse time.
 |---|---|---|
 | `name` | string | Required. Display name for the pillbox; also defaults `pillbox run`'s `--name`. |
 | `agent` | string | Default agent for `pillbox run` (`claude`, `codex`, `codex-serve`, `opencode`, or `pi`). |
+| `model` | string | Default model for `pillbox run` (`provider/model`). Omitted → the agent's own default. Overridden by `--model`. |
+| `[runner].image` | string | Sandbox image. Omitted → the published default (often uncached). Overridden by `$PILLBOX_RUNNER_IMAGE`. |
 | `[workspace].backend` | string | `local` (default) or `s3`. Picks the rustic-backed snapshot store. |
 | `[workspace].endpoint` | string | S3-only. URL for R2, MinIO, Backblaze, native S3, etc. |
 | `[workspace].region` | string | S3-only. Defaults to `auto`. |
@@ -107,8 +114,27 @@ reconfigure`).
 
 - Pillbox starts at `std::env::current_dir()`.
 - Walks up looking for `pillbox.toml`.
-- Stops at the first match (multiple configs in the path are NOT merged).
+- Stops at the first match — that descriptor *selects* the pillbox (which secrets/env/state to use).
 - Falls back to the global pillbox if nothing is found.
+
+## Run-config cascade
+
+While *pillbox selection* stops at the first descriptor, the **run-config
+fields** (`agent`, `model`, `[runner] image`) **cascade** like `CLAUDE.md`:
+the selected project `pillbox.toml` is overlaid **field-by-field** on the
+user-global defaults at `~/.pillbox/global/pillbox.toml`. Per field,
+precedence is:
+
+```
+CLI flag  >  env (e.g. $PILLBOX_RUNNER_IMAGE)  >  project pillbox.toml
+          >  ~/.pillbox/global/pillbox.toml    >  built-in default
+```
+
+So set `agent` / `model` / `[runner] image` **once** in the global file and
+every `pillbox run` inherits them — a project descriptor overrides only what's
+repo-specific, and unset fields fall through to global. The global file is read
+leniently (it's a defaults file, so `name` isn't required and an absent file is
+not an error). This is what makes a bare `pillbox run` flagless.
 
 To inspect what discovery resolved to:
 

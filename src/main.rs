@@ -328,6 +328,13 @@ enum Command {
         /// diversity knob that keeps best-of-k non-degenerate.
         #[arg(long, value_name = "FLOAT")]
         temperature: Option<f64>,
+        /// Heterogeneous worker roster (TOML: `[[worker]]` rows with optional
+        /// agent/model/temperature). Each row binds the i-th fork; omitted fields
+        /// fall back to --agent/--model/--temperature (then pillbox.toml). `-k` is
+        /// derived from the roster length (an explicit, disagreeing `-k` is an
+        /// error). Omitted → today's homogeneous fork-k.
+        #[arg(long = "workers-spec", value_name = "FILE")]
+        workers_spec: Option<PathBuf>,
         /// Wire in kypp swarm-memory (`--memory`) for each worker.
         #[arg(long)]
         memory: bool,
@@ -817,12 +824,19 @@ fn run(cli: Cli) -> Result<()> {
             agent,
             model,
             temperature,
+            workers_spec,
             memory,
             ttl,
             json,
             args,
         } => {
             let resolved = Pillbox::resolve(pillbox_arg)?;
+            // Parse + validate the roster up front (exit 2 on a bad spec) so the
+            // handler receives the parsed roster — its length derives `k`.
+            let workers_spec = match workers_spec {
+                Some(p) => Some(commands::dispatch::load_workers_spec(&p)?),
+                None => None,
+            };
             commands::dispatch::dispatch(
                 &resolved,
                 commands::dispatch::DispatchOpts {
@@ -835,6 +849,7 @@ fn run(cli: Cli) -> Result<()> {
                     agent,
                     model,
                     temperature,
+                    workers_spec,
                     memory,
                     ttl,
                     prompt: args,

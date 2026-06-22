@@ -62,11 +62,17 @@ pub(crate) trait RefreshDecider {
     /// crash-safety signal (an expiry timestamp is not, since an in-proxy rotation
     /// may not update it). `None` if absent/malformed (⇒ re-auth).
     fn access_token(&self, creds: &Value) -> Option<String>;
+
+    /// Whether the on-disk access token can still be used as a degraded lease when
+    /// a durable `pending` marker blocks any real rotation. This MUST NOT inspect or
+    /// rely on the refresh token: the degraded path only serves the access token that
+    /// is already on disk, never re-forwards a possibly consumed refresh token.
+    fn access_usable(&self, creds: &Value) -> bool;
 }
 
-/// Outcome of [`TokenStore::begin`]. Deliberately not `Debug`: the `Coalesced` and
-/// `Rotate` variants carry live credential material, which must never reach a log
-/// line or a panic message.
+/// Outcome of [`TokenStore::begin`]. Deliberately not `Debug`: the `Coalesced`,
+/// `DegradedLease`, and `Rotate` variants carry live credential material, which
+/// must never reach a log line or a panic message.
 pub(crate) enum Begin {
     /// The lock couldn't be acquired within the deadline — a peer's forward is in
     /// flight. The caller must NOT forward (a second POST risks reuse); it surfaces
@@ -81,6 +87,11 @@ pub(crate) enum Begin {
     /// A peer already refreshed (or no forward was due): adopt these on-disk creds
     /// and forward nothing.
     Coalesced(Value),
+    /// A prior forward's outcome is unknown, so rotation remains poisoned, but the
+    /// on-disk access token has not truly expired yet. Adopt it temporarily and
+    /// forward nothing; `pending` stays set so re-auth is still required once the
+    /// access token expires.
+    DegradedLease(Value),
     /// This caller won the race. Forward [`RotateGuard::refresh_token`] upstream
     /// exactly once, then resolve the guard with [`RotateGuard::commit`] (success)
     /// or [`RotateGuard::abort`] (failure).
@@ -163,6 +174,9 @@ impl TokenStore {
             }
         }
         if state.pending.is_some() {
+            if decider.access_usable(&disk) {
+                return Ok(Begin::DegradedLease(disk));
+            }
             return Ok(Begin::ReauthRequired(
                 "a prior refresh is in flight or its outcome is unknown".into(),
             ));
@@ -504,6 +518,13 @@ mod tests {
                 .and_then(|v| v.as_str())
                 .map(String::from)
         }
+        fn access_usable(&self, creds: &Value) -> bool {
+            self.access_token(creds).is_some()
+                && creds
+                    .get("expires_at_ms")
+                    .and_then(|v| v.as_u64())
+                    .is_some_and(|expires_at_ms| expires_at_ms > now_ms())
+        }
     }
 
     fn store_with_wait(creds: Value, wait: Duration) -> (tempfile::TempDir, TokenStore) {
@@ -523,10 +544,28 @@ mod tests {
     }
 
     fn stale() -> Value {
-        serde_json::json!({ "refresh": "RT0", "access": "AT0", "stale": true })
+        serde_json::json!({
+            "refresh": "RT0",
+            "access": "AT0",
+            "stale": true,
+            "expires_at_ms": now_ms().saturating_sub(1000),
+        })
     }
     fn fresh() -> Value {
-        serde_json::json!({ "refresh": "RT0", "access": "AT0", "stale": false })
+        serde_json::json!({
+            "refresh": "RT0",
+            "access": "AT0",
+            "stale": false,
+            "expires_at_ms": now_ms() + 60 * 60 * 1000,
+        })
+    }
+    fn stale_but_usable() -> Value {
+        serde_json::json!({
+            "refresh": "RT0",
+            "access": "AT0",
+            "stale": true,
+            "expires_at_ms": now_ms() + 60 * 60 * 1000,
+        })
     }
 
     #[test]
@@ -577,8 +616,9 @@ mod tests {
             store.read_state().pending.is_some(),
             "abort leaves pending set"
         );
-        // Disk access unchanged (no commit) → next begin sees pending matching disk →
-        // fail closed, and critically it does NOT hand out a second Rotate.
+        // Disk access unchanged and truly expired (no commit) → next begin sees
+        // pending matching disk → fail closed, and critically it does NOT hand out a
+        // second Rotate.
         assert!(matches!(
             store.begin(&MockDecider).unwrap(),
             Begin::ReauthRequired(_)
@@ -627,7 +667,8 @@ mod tests {
             )
             .unwrap_err();
         assert!(format!("{err}").contains("did not rotate"), "got: {err}");
-        // pending stays set → next begin fails closed; the stale creds were NOT written.
+        // pending stays set → next begin fails closed because the disk access token is
+        // truly expired; the stale creds were NOT written.
         assert!(store.read_state().pending.is_some());
         assert_eq!(store.read_creds().unwrap()["access"], "AT0");
         assert!(matches!(
@@ -679,12 +720,65 @@ mod tests {
                 last_refresh_at_ms: None,
             })
             .unwrap();
-        // pending fingerprints the on-disk access token → a forward is in flight or
-        // its outcome was lost → re-auth, never Rotate.
+        // pending fingerprints the on-disk access token, and the access token is
+        // truly expired → re-auth, never Rotate.
         assert!(matches!(
             store.begin(&MockDecider).unwrap(),
             Begin::ReauthRequired(_)
         ));
+    }
+
+    #[test]
+    fn pending_matching_disk_access_degrades_when_access_still_usable() {
+        let (_d, store) = store_with(stale_but_usable()); // access AT0
+        store
+            .write_state(&RotationState {
+                generation: 0,
+                pending: Some(fingerprint("AT0")),
+                last_refresh_at_ms: None,
+            })
+            .unwrap();
+
+        let Begin::DegradedLease(creds) = store.begin(&MockDecider).unwrap() else {
+            panic!("expected degraded lease");
+        };
+        assert_eq!(creds["access"], "AT0");
+        assert_eq!(creds["refresh"], "RT0");
+        assert_eq!(
+            store.read_state().pending.as_deref(),
+            Some(fingerprint("AT0").as_str()),
+            "degraded lease leaves pending poisoned"
+        );
+        assert_eq!(
+            store.read_creds().unwrap()["access"],
+            "AT0",
+            "degraded lease serves disk creds without rotating"
+        );
+    }
+
+    #[test]
+    fn abort_with_usable_access_degrades_without_retrying_refresh() {
+        let (_d, store) = store_with(stale_but_usable());
+        let Begin::Rotate(guard) = store.begin(&MockDecider).unwrap() else {
+            panic!("expected Rotate");
+        };
+        assert_eq!(guard.refresh_token(), "RT0");
+        guard.abort();
+
+        let Begin::DegradedLease(creds) = store.begin(&MockDecider).unwrap() else {
+            panic!("expected degraded lease");
+        };
+        assert_eq!(creds["access"], "AT0");
+        assert_eq!(
+            store.read_state().pending.as_deref(),
+            Some(fingerprint("AT0").as_str()),
+            "degraded lease never clears pending"
+        );
+        assert_eq!(
+            store.read_creds().unwrap()["refresh"],
+            "RT0",
+            "degraded lease does not persist a rotation"
+        );
     }
 
     #[test]
@@ -763,7 +857,7 @@ mod tests {
                     .unwrap();
                         true
                     }
-                    Begin::Coalesced(_) => true,
+                    Begin::Coalesced(_) | Begin::DegradedLease(_) => true,
                     Begin::ReauthRequired(_) | Begin::LockBusy => false,
                 }
             }));

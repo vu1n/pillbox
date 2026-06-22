@@ -167,9 +167,10 @@ pillbox's `--json` surface.
       { "session": "def456...", "score": 0.5, "passed": false, "retries_used": 1, "status": "failed" },
       { "session": "ghi789...", "score": null, "passed": false, "retries_used": 0, "status": "errored" }
     ],
-    // Host directory the winner's result workspace was pulled to, or null when
+    // Host directory the winner's result workspace was pulled to (a durable temp
+    // staging dir, `$TMPDIR/pillbox-dispatch-<run>/winner-<id>`), or null when
     // there is no winner.
-    "pulled_to": "/path/to/session-abc123def456",
+    "pulled_to": "/tmp/pillbox-dispatch-019eef4f.../winner-abc123def456",
     // Why the winner was selected — its score + the tie-break that decided it,
     // tied to the verifier output. Null when no worker passed.
     "selection_rationale": "only passing worker (score 1.00)"
@@ -289,8 +290,9 @@ treats them as deferred, not forgotten:
   deps (the libkrun grader path). v1 grades on the host (`session score`'s
   default); GHOST-003/004's gates don't need the sandboxed grader.
 - **`--to DIR` for the winner pull** — a deterministic output path for chaining
-  segments. v1 pulls to the default `./session-<id>`, which the caller reads
-  back from `pulled_to`.
+  segments. v1 pulls to a durable temp staging dir
+  (`$TMPDIR/pillbox-dispatch-<run>/winner-<id>`), which the caller reads back from
+  `pulled_to` (outside cwd, so it's never swept into a commit; reaped with `$TMPDIR`).
 - **Docker-backend dispatch** — v1 is **libkrun-only**: the grader resolves each
   worker's *live* workspace via `session info --json` → `.session.workspace`,
   which only libkrun sessions populate. A docker run needs a non-libkrun

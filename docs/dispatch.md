@@ -55,6 +55,7 @@ pillbox dispatch --from-bookmark seg-3 -k 3 --rubric grade.txt \
 | `--agent AGENT` | pillbox `agent =`, then `claude` | Worker agent (`claude` \| `codex` \| `opencode` \| …). |
 | `--model MODEL` | agent default | Worker model override, forwarded to each worker's run. |
 | `--temperature FLOAT` | agent default | Per-fork sampling temperature, forwarded to each worker — the diversity knob that keeps best-of-`k` non-degenerate. |
+| `--workers-spec FILE` | — | A **heterogeneous worker roster** (TOML, below) — one `[[worker]]` row per fork binding that worker's agent/model/temperature. The roster length is the authoritative `k`. See **Workers spec** below. |
 | `--memory` | off | Wire in kypp swarm-memory (`--memory`) for each worker (scoped briefing + post-run capture). |
 | `--ttl DURATION` | — | Per-worker retention TTL (`30m`/`24h`/`7d`), forwarded to every forked worker. Losers are left **running** (not auto-killed) so their §0 evidence stays readable; a TTL is how a dispatch campaign reaps them via `session prune` instead of leaking `k` VMs per run. See **Cleanup** below. |
 | `--json` | off | Emit the verdict as JSON on stdout instead of the human banner. |
@@ -102,6 +103,36 @@ Gates are **self-contained** — they run against the worker's live workspace as
 (same as `dispatch --rubric`). This is the boundary from the σ̂ eval harness
 (`scripts/eval/segmentation/`), which injects *hidden* test subsets at grade time;
 `--segments` is for real work whose tests live in the workspace.
+
+## Workers spec (`--workers-spec`)
+
+By default `dispatch -k N` forks `N` identical workers (same agent/model; only
+`--temperature` varies). `--workers-spec FILE` makes the `k` workers a
+**heterogeneous roster** — each `[[worker]]` row binds the `i`-th fork's
+`agent` / `model` / `temperature`. The TOML is an ordered list of `[[worker]]`,
+all fields optional:
+
+```toml
+[[worker]]
+agent = "claude"
+model = "anthropic/claude-opus-4-8"
+
+[[worker]]
+agent = "opencode"
+model = "zai-coding-plan/glm-5.2"
+temperature = 0.7
+```
+
+The roster length is the authoritative **`k`** — you don't pass `-k`. (An
+explicit `-k N` is allowed only when it *matches* the roster length; a
+disagreeing `-k` is a usage error, exit 2.) Per field, the precedence is
+**per-worker row → run-level `--agent`/`--model`/`--temperature` →
+`pillbox.toml`**: an omitted row field falls back to the run-level flag, which
+itself falls back to the pillbox descriptor. Unknown keys are a parse error
+(exit 2, before any fork), and an empty roster is rejected. Omit `--workers-spec`
+entirely and behavior is byte-identical to today's homogeneous fork-`k`. The
+roster composes with `--segments` (each rostered worker runs the chain). See
+`rubrics/example-workers.toml`.
 
 ## Verdict JSON (`--json`)
 

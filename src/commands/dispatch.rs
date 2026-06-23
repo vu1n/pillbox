@@ -313,7 +313,10 @@ trait WorkerDriver {
     /// Fork a new detached worker (the `i`-th, 0-based) from the bookmark → its
     /// session id. The index picks this worker's roster row (`--workers-spec`);
     /// without a roster it's ignored and every fork is identical.
-    fn fork(&self, i: usize) -> Result<String>;
+    fn fork(&self, i: usize, first_turn: &str) -> Result<String>;
+    /// True when this worker's first turn is consumed by the launch argv instead
+    /// of the in-session prompt API / PTY send path.
+    fn first_turn_driven_on_fork(&self, i: usize) -> bool;
     /// Block until the worker's current turn goes idle (or terminates).
     fn wait_idle(&self, id: &str) -> Result<()>;
     /// Grade the worker's current workspace against `grader` → the parsed verdict.
@@ -342,6 +345,29 @@ fn resolve_worker(opts: &DispatchOpts, i: usize) -> (Option<String>, Option<Stri
         ),
         None => (opts.agent.clone(), opts.model.clone(), opts.temperature),
     }
+}
+
+fn effective_worker_agent(opts: &DispatchOpts, i: usize, default_agent: &str) -> String {
+    resolve_worker(opts, i)
+        .0
+        .unwrap_or_else(|| default_agent.to_string())
+}
+
+fn default_agent(resolved: &Pillbox) -> String {
+    crate::config::resolve_run_config(resolved)
+        .agent
+        .unwrap_or_else(|| "claude".into())
+}
+
+fn agent_first_turn_driven_on_fork(agent: &str) -> bool {
+    crate::agents::lookup("dispatch", agent)
+        .map(|spec| spec.server.is_none())
+        .unwrap_or(false)
+}
+
+fn worker_first_turn_driven_on_fork(opts: &DispatchOpts, i: usize, default_agent: &str) -> bool {
+    let agent = effective_worker_agent(opts, i, default_agent);
+    agent_first_turn_driven_on_fork(&agent)
 }
 
 /// The distilled failure summary fed back as the next prompt on a retry — the
@@ -570,26 +596,30 @@ fn run_dispatch(
     segments: Option<&[ResolvedSegment]>,
 ) -> DispatchVerdict {
     // Fork all k up front, THEN drive each. Forking first overlaps the k VM
-    // BOOTS (each `--detach` worker boots in the background); the agent turns
-    // themselves are driven SERIALLY below — a `--detach` worker comes up idle and
-    // does nothing until its first `send`, so turns do not overlap. (True
-    // turn-level concurrency would need driving workers on separate threads; the
-    // subprocess `WorkerDriver` calls are independent, so that's a safe future
-    // change — not done here.) A fork that fails becomes an `Errored` worker rather
-    // than aborting the batch — the successes are still driven, and no forked worker
-    // is left unrecorded (the orphan a `collect::<Result>()?` would leak).
+    // BOOTS (each `--detach` worker boots in the background). Server-mode worker
+    // turns are driven SERIALLY below; one-shot CLI workers receive their only
+    // prompt at launch and are merely awaited/graded below. True turn-level
+    // concurrency would need driving workers on separate threads; the subprocess
+    // `WorkerDriver` calls are independent, so that's a safe future change — not
+    // done here. A fork that fails becomes an `Errored` worker rather than aborting
+    // the batch — the successes are still driven, and no forked worker is left
+    // unrecorded (the orphan a `collect::<Result>()?` would leak).
     //
     // Each worker runs EITHER the segment chain (`--segments`, one session) OR the
     // single-prompt + retry loop (fork-`k`). With both `-k>1` and `--segments`, the
     // k workers each run the full chain → best-of-k OVER segmented chains.
+    let fork_first_turn = if segments.is_some() { "" } else { prompt };
     let workers: Vec<WorkerOutcome> = (0..k)
-        .map(|i| driver.fork(i as usize))
+        .map(|i| {
+            let i = i as usize;
+            (i, driver.fork(i, fork_first_turn))
+        })
         .collect::<Vec<_>>()
         .into_iter()
-        .map(|forked| match forked {
+        .map(|(i, forked)| match forked {
             Ok(id) => match segments {
-                Some(segs) => drive_segments(driver, id, prompt, segs, reward, retries),
-                None => drive_one(driver, id, prompt, retries, reward),
+                Some(segs) => drive_segments(driver, i, id, prompt, segs, reward, retries),
+                None => drive_one(driver, i, id, prompt, retries, reward),
             },
             Err(e) => {
                 eprintln!("pillbox: worker fork failed: {e:#}");
@@ -636,12 +666,13 @@ fn run_dispatch(
 /// outcome (not propagated) so one worker's failure doesn't sink the others.
 fn drive_one(
     driver: &dyn WorkerDriver,
+    i: usize,
     id: String,
     prompt: &str,
     retries: u32,
     reward: &Grader,
 ) -> WorkerOutcome {
-    drive_one_inner(driver, &id, prompt, retries, reward).unwrap_or_else(|e| errored(id, e))
+    drive_one_inner(driver, i, &id, prompt, retries, reward).unwrap_or_else(|e| errored(id, e))
 }
 
 /// The shared `Errored` outcome for a worker whose drive raised (boot/drive/grade
@@ -658,20 +689,26 @@ fn errored(id: String, e: anyhow::Error) -> WorkerOutcome {
     }
 }
 
-/// The send → wait-idle → grade-against-`grader` → retry loop: re-drive with the
-/// distilled failure summary until the grade passes or the `retries` budget is
-/// spent → `(final grade, retries used)`. The shared core of both drive paths
-/// (fork-`k` grades by the reward; each segment by its gate). The first turn must
-/// be a `send` — a `--detach` fork comes up idle and does nothing until driven,
-/// and a server agent treats a fork-baked positional as a pre-fill hint, not an
-/// executed turn.
+/// Drive a worker to a grade. One-shot CLI agents already consumed turn 1 at
+/// fork, so they only wait + grade. Server-mode agents use the send → wait-idle
+/// → grade-against-`grader` → retry loop: re-drive with the distilled failure
+/// summary until the grade passes or the `retries` budget is spent → `(final
+/// grade, retries used)`. A server agent treats a fork-baked positional as a
+/// pre-fill hint, not an executed turn.
 fn drive_to_grade(
     driver: &dyn WorkerDriver,
+    i: usize,
     id: &str,
     first_turn: &str,
     grader: &Grader,
     retries: u32,
 ) -> Result<(Scored, u32)> {
+    if driver.first_turn_driven_on_fork(i) {
+        driver.wait_idle(id)?;
+        let grade = driver.grade(id, grader)?;
+        return Ok((grade, 0));
+    }
+
     let mut turn = first_turn.to_string();
     let mut used = 0u32;
     loop {
@@ -700,12 +737,13 @@ fn status_of(grade: &Scored) -> WorkerStatus {
 /// outcome.
 fn drive_one_inner(
     driver: &dyn WorkerDriver,
+    i: usize,
     id: &str,
     prompt: &str,
     retries: u32,
     reward: &Grader,
 ) -> Result<WorkerOutcome> {
-    let (grade, used) = drive_to_grade(driver, id, prompt, reward, retries)?;
+    let (grade, used) = drive_to_grade(driver, i, id, prompt, reward, retries)?;
     Ok(WorkerOutcome {
         session: id.to_string(),
         score: Some(grade.score),
@@ -720,13 +758,14 @@ fn drive_one_inner(
 /// `Errored` outcome, like [`drive_one`]).
 fn drive_segments(
     driver: &dyn WorkerDriver,
+    i: usize,
     id: String,
     context: &str,
     segments: &[ResolvedSegment],
     reward: &Grader,
     retries: u32,
 ) -> WorkerOutcome {
-    drive_segments_inner(driver, &id, context, segments, reward, retries)
+    drive_segments_inner(driver, i, &id, context, segments, reward, retries)
         .unwrap_or_else(|e| errored(id, e))
 }
 
@@ -740,6 +779,7 @@ fn drive_segments(
 /// worker's `retries_used` is the sum across segments.
 fn drive_segments_inner(
     driver: &dyn WorkerDriver,
+    worker_i: usize,
     id: &str,
     context: &str,
     segments: &[ResolvedSegment],
@@ -754,7 +794,7 @@ fn drive_segments_inner(
         } else {
             seg.prompt.clone()
         };
-        let (grade, used) = drive_to_grade(driver, id, &turn, &seg.gate, retries)?;
+        let (grade, used) = drive_to_grade(driver, worker_i, id, &turn, &seg.gate, retries)?;
         seg_outcomes.push(SegmentOutcome {
             name: seg.name.clone(),
             passed: grade.passed,
@@ -785,23 +825,33 @@ fn drive_segments_inner(
 struct CliDriver<'a> {
     exe: PathBuf,
     opts: &'a DispatchOpts,
+    default_agent: String,
     /// Durable dir the winner is pulled into (a TempDir would drop it).
     rundir: PathBuf,
 }
 
 impl<'a> CliDriver<'a> {
-    fn new(opts: &'a DispatchOpts) -> Result<Self> {
+    fn new(opts: &'a DispatchOpts, default_agent: String) -> Result<Self> {
         let exe = std::env::current_exe().context("locate the pillbox binary")?;
         let rundir = std::env::temp_dir().join(format!(
             "pillbox-dispatch-{}",
             uuid::Uuid::now_v7().simple()
         ));
-        Ok(Self { exe, opts, rundir })
+        Ok(Self {
+            exe,
+            opts,
+            default_agent,
+            rundir,
+        })
+    }
+
+    fn effective_agent(&self, i: usize) -> String {
+        effective_worker_agent(self.opts, i, &self.default_agent)
     }
 }
 
 impl WorkerDriver for CliDriver<'_> {
-    fn fork(&self, i: usize) -> Result<String> {
+    fn fork(&self, i: usize, first_turn: &str) -> Result<String> {
         // Per-worker agent/model/temperature from the roster (`--workers-spec`)
         // falling back to the run-level scalars; without a roster this is the
         // scalar opts for every worker. The argv assembly below is otherwise
@@ -831,8 +881,13 @@ impl WorkerDriver for CliDriver<'_> {
             // `expires_at` so `session prune` can later reap this worker.
             args.extend(["--ttl".into(), t.clone()]);
         }
-        // No positional prompt: a `--detach` worker comes up idle; the segment
-        // prompt is driven as turn 1 via `session send` (see `drive_one_inner`).
+        if self.first_turn_driven_on_fork(i) {
+            args.extend(["--".into(), first_turn.into()]);
+        }
+        // Server-mode workers get no positional prompt: a `--detach` server comes
+        // up idle; the segment prompt is driven as turn 1 via `session send` (see
+        // `drive_one_inner`). A server treats a baked positional as a pre-fill
+        // hint, not a turn.
         let out = self.capture(&args)?;
         let v: serde_json::Value = serde_json::from_str(&out)
             .with_context(|| format!("parse `run --json` output: {out:?}"))?;
@@ -840,6 +895,10 @@ impl WorkerDriver for CliDriver<'_> {
             .as_str()
             .map(str::to_string)
             .context("`run --json` had no session.id")
+    }
+
+    fn first_turn_driven_on_fork(&self, i: usize) -> bool {
+        agent_first_turn_driven_on_fork(&self.effective_agent(i))
     }
 
     fn wait_idle(&self, id: &str) -> Result<()> {
@@ -1132,16 +1191,6 @@ pub(crate) fn dispatch(resolved: &Pillbox, opts: DispatchOpts) -> Result<()> {
         })?;
     }
 
-    // The run-level reward — the authoritative final grade, distinct from any
-    // per-segment gate.
-    let reward = Grader::from_opts(&opts)?;
-    // Parse + validate the segment spec up front (exit 2 on a bad spec) — before
-    // forking any worker.
-    let segments = match &opts.segments {
-        Some(p) => Some(load_segments(p)?),
-        None => None,
-    };
-
     // With a `--workers-spec` roster, its length is the authoritative `k`. An
     // explicit `-k N` that disagrees with the roster is a usage error (exit 2)
     // before any fork — but `-k` left at its default just derives `k` from the
@@ -1165,7 +1214,28 @@ pub(crate) fn dispatch(resolved: &Pillbox, opts: DispatchOpts) -> Result<()> {
         None => opts.workers,
     };
 
-    let driver = CliDriver::new(&opts)?;
+    let default_agent_id = default_agent(resolved);
+    if opts.segments.is_some()
+        && (0..k).any(|i| worker_first_turn_driven_on_fork(&opts, i as usize, &default_agent_id))
+    {
+        return Err(PillboxError::usage(
+            "dispatch",
+            "`--segments` requires a server-mode agent (opencode); claude/codex are one-shot — use best-of-k (`-k`) instead.",
+        )
+        .into());
+    }
+
+    // The run-level reward — the authoritative final grade, distinct from any
+    // per-segment gate.
+    let reward = Grader::from_opts(&opts)?;
+    // Parse + validate the segment spec up front (exit 2 on a bad spec) — before
+    // forking any worker.
+    let segments = match &opts.segments {
+        Some(p) => Some(load_segments(p)?),
+        None => None,
+    };
+
+    let driver = CliDriver::new(&opts, default_agent_id)?;
     let verdict = run_dispatch(
         &driver,
         k,
@@ -1312,6 +1382,7 @@ mod tests {
         /// The fork-index passed to each `fork`, in call order — asserts the loop
         /// hands each worker its own 0-based roster index.
         fork_indices: RefCell<Vec<usize>>,
+        first_turn_on_fork: bool,
     }
 
     impl MockDriver {
@@ -1328,18 +1399,26 @@ mod tests {
                 sends: RefCell::new(0),
                 pulls: RefCell::new(Vec::new()),
                 fork_indices: RefCell::new(Vec::new()),
+                first_turn_on_fork: false,
             }
         }
         fn failing_grade(mut self, id: &str) -> Self {
             self.grade_errs.insert(id.to_string());
             self
         }
+        fn first_turn_on_fork(mut self) -> Self {
+            self.first_turn_on_fork = true;
+            self
+        }
     }
 
     impl WorkerDriver for MockDriver {
-        fn fork(&self, i: usize) -> Result<String> {
+        fn fork(&self, i: usize, _first_turn: &str) -> Result<String> {
             self.fork_indices.borrow_mut().push(i);
             Ok(self.ids.borrow_mut().pop_front().expect("fork over budget"))
+        }
+        fn first_turn_driven_on_fork(&self, _i: usize) -> bool {
+            self.first_turn_on_fork
         }
         fn wait_idle(&self, _id: &str) -> Result<()> {
             Ok(())
@@ -1414,6 +1493,18 @@ mod tests {
         assert_eq!(v.pulled_to, None);
         // 2 sends: the turn-1 prompt + one retry.
         assert_eq!(*d.sends.borrow(), 2);
+        assert!(d.pulls.borrow().is_empty());
+    }
+
+    #[test]
+    fn one_shot_drive_one_grades_fork_result_without_send_or_retry() {
+        let d = MockDriver::new(vec![("w0", vec![(false, 0.3)])]).first_turn_on_fork();
+        let w = drive_one(&d, 0, "w0".into(), "task", 3, &reward());
+        assert_eq!(w.session, "w0");
+        assert_eq!(w.status, WorkerStatus::Failed);
+        assert_eq!(w.retries_used, 0);
+        assert_eq!(w.score, Some(0.3));
+        assert_eq!(*d.sends.borrow(), 0);
         assert!(d.pulls.borrow().is_empty());
     }
 

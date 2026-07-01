@@ -64,7 +64,15 @@ jobs:
         with:
           key: libkrun   # distinct from the no-default-features `test` job's artifacts
       - name: Install libkrun
-        run: brew tap libkrun/krun && brew install libkrun libkrunfw
+        # Homebrew now gates third-party taps behind HOMEBREW_REQUIRE_TAP_TRUST
+        # (set on the runner image) — `brew install` refuses an untapped-trust
+        # formula ("Refusing to load formula … from untrusted tap"). `brew trust`
+        # the tap between tap+install; non-interactive + forward-compatible for
+        # when tap-trust becomes the Homebrew default.
+        run: |
+          brew tap libkrun/krun
+          brew trust libkrun/krun
+          brew install libkrun libkrunfw
       - name: Clippy (libkrun)
         run: cargo clippy --all-targets --features libkrun -- -D warnings
       - name: Test (libkrun)

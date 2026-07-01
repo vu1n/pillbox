@@ -23,3 +23,12 @@ __pycache__/
 *.pyc
 .venv/
 scripts/eval/toolz-tasks/
+
+# Run logs + ghost scratch outputs — noisy, regenerable, not evidence (all just
+# {task,cond,trial,score,cost} scalars + progress lines; no transcripts/memory).
+# The curated σ̂ result jsonls under scripts/eval/segmentation/results/ ARE tracked
+# (the evidence archive — see its README); only the .log transcripts there are ignored.
+scripts/eval/segmentation/results/*.log
+scripts/ghost/*.jsonl
+scripts/ghost/*.json
+scripts/ghost/*.log

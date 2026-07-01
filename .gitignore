@@ -23,3 +23,13 @@ __pycache__/
 *.pyc
 .venv/
 scripts/eval/toolz-tasks/
+
+# Eval + ghost run OUTPUTS — local-only. These traces (agent transcripts, and
+# compose packets built from kypp memory) can carry prompt/memory content that
+# must not go public. Findings get distilled into docs/memory, not the raw runs.
+# Already-committed result jsonls under results/ stay tracked; this stops NEW ones.
+scripts/eval/segmentation/results/*.jsonl
+scripts/eval/segmentation/results/*.log
+scripts/ghost/*.jsonl
+scripts/ghost/*.json
+scripts/ghost/*.log

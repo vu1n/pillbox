@@ -207,6 +207,7 @@ impl RusticBackend {
     /// scrypt key derivation is paid on every `open()` regardless — the
     /// cache only saves index/pack fetches, never the key.
     fn repo_opts(&self) -> RepositoryOptions {
+        // Context: doc://pillbox/adr-006-rustic-cache-variant-gated@0001#rustic-cache-variant-gated
         let base = RepositoryOptions::default();
         match &self.variant {
             RusticVariant::Local { .. } => base.no_cache(true),

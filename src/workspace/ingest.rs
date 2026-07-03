@@ -74,6 +74,7 @@ fn is_secret_dir(name: &str) -> bool {
 }
 
 /// Is `name` (a file basename) a secret file that must not cross the wire?
+// Context: doc://pillbox/workspace-ingest-sovereignty@0001#workspace-ingest-sovereignty
 pub(crate) fn is_secret_basename(name: &str) -> bool {
     if SECRET_FILE_NAMES.contains(&name) {
         return true;

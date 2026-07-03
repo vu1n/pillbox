@@ -106,6 +106,7 @@ pub(crate) trait SandboxBackend {
 ///
 /// The method set maps 1:1 to the backend-string dispatch sites it replaces
 /// (`send`/`attach`/`kill`/`event_source`/`http`/`ingest`).
+// Context: doc://pillbox/substrate-plane-livesession@0001#substrate-plane-livesession
 pub(crate) trait LiveSession {
     /// This session's backend capabilities (the per-session view of [`Caps`]).
     fn caps(&self) -> Caps;

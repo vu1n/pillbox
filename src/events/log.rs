@@ -113,6 +113,7 @@ impl SessionLog {
     /// deferred optimization, same as `subscribe`. The cross-process single-writer
     /// coordination this lock provides is the cheap stand-in for the resident
     /// sequencer / `EventLog` trait.)
+    // Context: doc://pillbox/session-event-log-spine@0001#session-event-log-spine
     pub(crate) fn append(&mut self, events: &[Event]) -> Result<u64> {
         if events.is_empty() {
             return Ok(self.last_seq);

@@ -4,6 +4,7 @@
 //! state come from the right scope. Auth currently always resolves to
 //! global; vault state lives per-pillbox so a project's leases never
 //! collide with another's.
+// Context: doc://pillbox/adr-002-docker-backend-deleted@0001#docker-backend-deleted
 
 use std::time::SystemTime;
 

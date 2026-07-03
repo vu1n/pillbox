@@ -10,6 +10,7 @@
 //!   `libkrun`; the default on that build).
 //! - [`docker::DockerBackend`] — host Docker daemon (the no-KVM compat
 //!   backend; opt in via `PILLBOX_BACKEND=docker`).
+// Context: doc://pillbox/adr-003-qemu-parked@0001#qemu-parked
 
 pub(crate) mod appserver;
 pub(crate) mod appserver_client;

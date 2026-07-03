@@ -6,6 +6,7 @@
 //! `--detach`, and the opencode server path), reattach/kill, and the §0/opencode
 //! accessors `commands::session` calls. The VMM child entry, the spec types, and
 //! the CoW/stub/rootfs helpers stay in [`super`] (shared with `vmm_child_main`).
+// Context: doc://pillbox/libkrun-env-fork-substrate@0001#libkrun-env-fork-substrate
 
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};

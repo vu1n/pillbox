@@ -18,3 +18,6 @@ session-event-log-spine conforms: events/log.rs change is a doc-ref comment abov
 stable-exit-codes conforms: errors.rs change is a doc-ref comment; the ExitCategory numeric contract is unchanged.
 substrate-plane-livesession conforms: sandbox/mod.rs change is a doc-ref comment above the LiveSession trait; the trait/Caps surface is unchanged.
 workspace-ingest-sovereignty conforms: ingest.rs/libkrun session.rs changes are doc-ref comments; the pillbox-controlled secret denylist is unchanged.
+libkrun-is-the-backend conforms: workspace-fork source selection inside the libkrun backend; adds no backend and does not touch backend selection.
+libkrun-env-fork-substrate conforms: forks the env-fork substrate's workspace from a warm base cache via CoW (see doc://pillbox/workspace-cow-fork); substrate invariant unchanged.
+workspace-ingest-sovereignty conforms: edits launch_base clone-source selection in session.rs; the ingest denylist / sovereignty invariant is untouched.

@@ -1,0 +1,13 @@
+name: brief
+on: pull_request
+jobs:
+  govern:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: git fetch origin ${{ github.base_ref }}
+      - uses: astral-sh/setup-uv@v5
+      - name: brief governance gate
+        run: uvx --from git+https://github.com/vu1n/brief brief check --base "origin/${{ github.base_ref }}"

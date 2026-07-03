@@ -18,6 +18,7 @@
 //! leaving for the wrong host is never swapped (it ships as a worthless stub) —
 //! and under default-deny that wrong-host request is blocked outright. The
 //! credential is released only on the host it's bound to.
+// Context: doc://pillbox/vault-egress-default-deny@0001#vault-egress-default-deny
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 

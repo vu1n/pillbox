@@ -5,6 +5,8 @@
 //!
 //! Lives in `commands/` (not the registry-storage `session.rs`) so
 //! the CLI surface stays decoupled from the on-disk record format.
+// Context: doc://pillbox/dx-zero-config-local@0001#dx-zero-config-local
+// Context: doc://pillbox/optimization-external-substrate-primitives@0001#optimization-external-substrate-primitives
 
 use anyhow::Result;
 

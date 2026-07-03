@@ -2,6 +2,7 @@
 //!
 //! Public contract documented in AGENTS.md. Agents script against these
 //! codes; do NOT renumber without a major version bump.
+//! Context: doc://pillbox/stable-exit-codes@0001#stable-exit-codes
 
 use std::process::ExitCode;
 

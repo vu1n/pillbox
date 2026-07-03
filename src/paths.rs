@@ -76,6 +76,7 @@ pub(crate) fn ensure_mode_0700(p: &Path) -> Result<()> {
 /// `secrets/<name>`, `repo-password`, future per-pillbox tokens. Use
 /// this instead of hand-rolling `OpenOptions::new().mode(0o600)` so the
 /// invariant ("secret-on-disk = 0600") lives in one place.
+// Context: doc://pillbox/secret-on-disk-0600@0001#secret-on-disk-0600
 pub(crate) fn write_private_file(path: &Path, body: &[u8]) -> Result<()> {
     let mut file = fs::OpenOptions::new()
         .write(true)

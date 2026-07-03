@@ -124,6 +124,7 @@ impl RefreshDecider for ClaudeRefreshDecider {
 ///   is a fresh one: the agent won't self-refresh (far-future stub expiry), so a
 ///   stale access token would simply 401 with no recovery. Surfaces a retry/re-auth
 ///   next-step rather than handing the run a doomed token.
+// Context: doc://pillbox/adr-004-vault-broker-oauth@0001#vault-broker-oauth
 pub(crate) fn pre_refresh(creds_path: &Path, agent_id: &str) -> Result<Option<Value>> {
     if agent_id != "claude" {
         return Ok(None);

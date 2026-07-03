@@ -1,0 +1,20 @@
+# brief backfill — conformance sign-off
+# The backfill commit adds `// Context:` doc-refs (comments only) into governed
+# source sites and reconstructs the decision layer. No pillbox behavior changed,
+# so every touched decision still conforms by construction.
+
+libkrun-is-the-backend conforms: backfill adds a doc-ref comment only; select_backend still defaults to libkrun (mod.rs) and default = ["libkrun"] is unchanged.
+docker-backend-deleted conforms: no code change to the docker backend; only a doc-ref/comment was added to sandbox/mod.rs.
+qemu-parked conforms: no QEMU backend added; sandbox/mod.rs change is a doc-ref comment only.
+vault-broker-oauth conforms: refresh.rs change is a doc-ref comment above pre_refresh; broker/pre_refresh logic unchanged.
+docs-governance conforms: AGENTS.md gained only the brief convention block (via init); the router/canonical-doc discipline is unchanged.
+rustic-cache-variant-gated conforms: rustic.rs change is a doc-ref comment above repo_opts; per-variant cache logic unchanged.
+dx-zero-config-local conforms: events/log.rs change is a doc-ref comment; the zero-config local subscribe surface is unchanged.
+libkrun-env-fork-substrate conforms: libkrun/session.rs change is a doc-ref comment at the env-fork invariant; the env-fork channel split is unchanged.
+managed-tier-do-gateway conforms: sandbox/mod.rs change is a doc-ref comment only; the managed placement behind the trait is unchanged.
+remote-backend-plane-removed conforms: no remote backend re-added; sandbox/mod.rs change is a doc-ref comment only.
+secret-on-disk-0600 conforms: paths.rs/rustic.rs changes are doc-ref comments; the 0600 write helper and its callers are unchanged.
+session-event-log-spine conforms: events/log.rs change is a doc-ref comment above append; the single-writer per-session seq logic is unchanged.
+stable-exit-codes conforms: errors.rs change is a doc-ref comment; the ExitCategory numeric contract is unchanged.
+substrate-plane-livesession conforms: sandbox/mod.rs change is a doc-ref comment above the LiveSession trait; the trait/Caps surface is unchanged.
+workspace-ingest-sovereignty conforms: ingest.rs/libkrun session.rs changes are doc-ref comments; the pillbox-controlled secret denylist is unchanged.

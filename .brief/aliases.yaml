@@ -1,0 +1,44 @@
+adr-001-libkrun-is-the-backend:
+  latest: 1
+adr-002-docker-backend-deleted:
+  latest: 1
+adr-003-qemu-parked:
+  latest: 1
+adr-004-vault-broker-oauth:
+  latest: 1
+adr-005-docs-governance:
+  latest: 1
+adr-006-rustic-cache-variant-gated:
+  latest: 1
+adr-007-runner-image-tags-name-roles:
+  latest: 1
+adr-008-ghost-extraction-trigger:
+  latest: 1
+agent-io-pty-free-contract:
+  latest: 1
+attach-frame-protocol:
+  latest: 1
+dx-zero-config-local:
+  latest: 1
+gateway-no-daemon:
+  latest: 1
+libkrun-env-fork-substrate:
+  latest: 1
+managed-tier-do-gateway:
+  latest: 1
+optimization-external-substrate-primitives:
+  latest: 1
+remote-backend-plane-removed:
+  latest: 1
+secret-on-disk-0600:
+  latest: 1
+session-event-log-spine:
+  latest: 1
+stable-exit-codes:
+  latest: 1
+substrate-plane-livesession:
+  latest: 1
+vault-egress-default-deny:
+  latest: 1
+workspace-ingest-sovereignty:
+  latest: 1

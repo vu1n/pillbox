@@ -1,12 +1,17 @@
 # Remote backends + sessions
 
-> **⚠️ DEPRECATED DIRECTION (2026-06-01).** The whole remote-backend line
-> (`ssh://`, `e2b://`, `docker://`) is being retired: "remote" is now
-> *Cloudflare-managed* or *pillbox-running-locally-on-the-box*, and the local
-> runtime is pivoting Docker → **libkrun microVM**. See
-> [libkrun-sandbox.md](../libkrun-sandbox.md) for the direction. The behavior
-> below **still ships** (the code is present) but is on the way out — don't
-> build new work against it.
+Status: **superseded** (see `.brief/docs/remote-backend-plane-removed.md`,
+`doc://pillbox/remote-backend-plane-removed`).
+
+> **⚠️ SUPERSEDED / REMOVED (2026-06-01; verified removed 2026-07-01).** The whole
+> remote-backend line (`ssh://`, `e2b://`, `docker://`) was retired: "remote" is
+> now *Cloudflare-managed* or *pillbox-running-locally-on-the-box*, and the local
+> runtime pivoted Docker → **libkrun microVM**. See
+> [libkrun-sandbox.md](../libkrun-sandbox.md). **The code below no longer ships**
+> — a backfill audit (2026-07-01) confirmed the `RemoteSshSandbox`/`RemoteE2bSandbox`/
+> `RemoteDockerSandbox` types and the `--remote`/`remote add` surface are GONE
+> from `src/` (the original banner's "still ships" is itself now stale). Kept for
+> history only; do not build against it.
 
 > **Describes shipped v0.6 behavior** (`ssh://` + `e2b://`, S3-backed
 > workspace), plus `docker://` (parsed, registered, inline; foreground +

@@ -62,6 +62,7 @@ pub(crate) use host::{
 use crate::agents::AgentSpec;
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
+use crate::workspace::cow::{cow_clone_dir, CloneMethod};
 
 /// libkrun C API bindings — the single home for the `unsafe extern "C"`
 /// signatures (header: `/opt/homebrew/include/libkrun.h`; linked + rpath'd by
@@ -108,11 +109,6 @@ pub(crate) mod ffi {
         ) -> c_int;
         pub fn krun_start_enter(ctx_id: u32) -> c_int;
     }
-}
-
-// macOS APFS copy-on-write clone (recursive for directories), from libSystem.
-extern "C" {
-    fn clonefile(src: *const c_char, dst: *const c_char, flags: u32) -> std::os::raw::c_int;
 }
 
 /// The microVM spec the parent hands the VMM child (via a temp file — paths,
@@ -535,16 +531,13 @@ fn cow_clone_and_scrub(src: &Path) -> Result<PathBuf> {
     if let Some(parent) = clone.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    let src_c = cstr(&src.to_string_lossy());
-    let clone_c = cstr(&clone.to_string_lossy());
-    let rc = unsafe { clonefile(src_c.as_ptr(), clone_c.as_ptr(), 0) };
-    if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        let _ = std::fs::remove_dir_all(&clone); // don't leave a half clone behind
-        bail!(
-            "clonefile {} → {} failed: {err} (APFS only)",
-            src.display(),
-            clone.display()
+    // CoW-fork via the cross-platform primitive (APFS clonefile / Linux FICLONE
+    // reflink). A filesystem with no reflink support degrades to a full copy —
+    // still correct, but the per-fork "moves no bytes" promise broke, so say so.
+    if cow_clone_dir(src, &clone)? == CloneMethod::Copied {
+        eprintln!(
+            "pillbox: note: workspace fork fell back to a full copy \
+             (filesystem has no reflink support)"
         );
     }
     // Reuse the canonical walker + denylist; delete what it flags as secret.
@@ -591,17 +584,9 @@ fn cow_clone_home(home: &Path) -> Result<PathBuf> {
     if let Some(parent) = clone.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    let src_c = cstr(&home.to_string_lossy());
-    let clone_c = cstr(&clone.to_string_lossy());
-    if unsafe { clonefile(src_c.as_ptr(), clone_c.as_ptr(), 0) } != 0 {
-        let err = std::io::Error::last_os_error();
-        let _ = std::fs::remove_dir_all(&clone);
-        bail!(
-            "clonefile creds {} → {} failed: {err} (APFS only)",
-            home.display(),
-            clone.display()
-        );
-    }
+    // Same cross-platform CoW fork as the workspace; the creds dir is tiny, so a
+    // copy fallback is silent (no per-run byte-movement concern to flag).
+    cow_clone_dir(home, &clone)?;
     Ok(clone)
 }
 

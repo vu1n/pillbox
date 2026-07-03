@@ -24,7 +24,7 @@ use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
 use crate::sandbox::{Caps, SandboxBackend};
 use crate::startup::StartupTimer;
-use crate::workspace::WorkspaceBackend;
+use crate::workspace::{SnapshotHandle, WorkspaceBackend};
 
 // VMM substrate kept in the parent module (used here AND by `vmm_child_main`):
 // spec types, the CoW/stub/rootfs helpers, the cache dir, and shared consts.
@@ -352,13 +352,32 @@ fn launch_base(
         Some(p) => p.clone(),
         None => std::env::current_dir().context("resolve current working directory")?,
     };
-    if let Some(name) = opts.from_bookmark.as_deref() {
-        let handle = crate::bookmarks::resolve_existing(resolved, name)?;
-        resolved.workspace()?.pull(&workspace_host, Some(&handle))?;
-    }
+    // Pick the directory the guest's CoW clone forks from:
+    //  • --from-bookmark WITHOUT an explicit --workspace (the dispatch/default
+    //    case): materialize the immutable snapshot ONCE into the shared base cache
+    //    and clone from there. `k` workers off one bookmark pay a single rustic
+    //    restore, not `k`, and the caller's cwd is left untouched (`pillbox pull`
+    //    is the verb that restores a snapshot into cwd).
+    //  • --from-bookmark WITH --workspace: the user asked for the content in that
+    //    dir — restore into it, then clone it (behavior unchanged).
+    //  • no bookmark: clone the workspace dir (cwd or --workspace) as before.
+    let clone_src = match opts.from_bookmark.as_deref() {
+        Some(name) => {
+            let handle = crate::bookmarks::resolve_existing(resolved, name)?;
+            if opts.workspace.is_some() {
+                // WITH --workspace: restore into that dir, then clone it.
+                resolved.workspace()?.pull(&workspace_host, Some(&handle))?;
+                workspace_host.clone()
+            } else {
+                // Default/dispatch: warm-base cache; cwd untouched.
+                warm_base(resolved, &handle)?
+            }
+        }
+        None => workspace_host.clone(),
+    };
     let workspace_name = workspace_mount_name(&workspace_host, opts.name.as_deref())?;
     let guest_workspace = format!("{GUEST_WORKSPACE}/{workspace_name}");
-    let workspace_clone = cow_clone_and_scrub(&workspace_host)?;
+    let workspace_clone = cow_clone_and_scrub(&clone_src)?;
 
     // Split vaulted `--with` (stub-swapped through the MITM) from plain entries
     // (real value straight into the env). Plain entries + bundles/env-file compose
@@ -1902,6 +1921,29 @@ impl LibkrunLiveSession {
             stop, join,
         ))
     }
+}
+
+/// Content-addressed base cache root: `<krun-cache>/base`. Holds one
+/// materialized snapshot per handle (the once-only materialization + locking
+/// lives in [`crate::workspace::base_cache`]). Cache entries are immutable (a
+/// snapshot handle IS its content), so they never go stale.
+///
+/// NOTE: entries are not yet evicted — the cache grows by one workspace tree per
+/// unique snapshot ever forked from. Eviction (LRU/TTL, or tie-in to `session
+/// prune`) is a follow-up, mirroring rustic's deferred `prune`.
+fn base_cache_root() -> Result<PathBuf> {
+    Ok(krun_cache_dir()?.join("base"))
+}
+
+/// Materialize `handle`'s immutable snapshot into the shared base cache exactly
+/// once and return the cached dir to CoW-clone the guest workspace from. So `k`
+/// workers forked off one bookmark (dispatch) pay a **single** rustic restore
+/// instead of `k`, and the caller's cwd is never touched.
+fn warm_base(resolved: &Pillbox, handle: &SnapshotHandle) -> Result<PathBuf> {
+    let root = base_cache_root()?;
+    crate::workspace::base_cache::materialize_once(&root, handle.as_str(), |dst| {
+        resolved.workspace()?.pull(dst, Some(handle))
+    })
 }
 
 #[cfg(test)]

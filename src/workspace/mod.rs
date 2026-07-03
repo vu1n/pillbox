@@ -31,6 +31,8 @@
 //! lands in PR 4 (RemoteSsh) once we know what shape the SSH transport
 //! wants. For PR 3 every backend operates on a host cwd.
 
+pub(crate) mod base_cache;
+pub(crate) mod cow;
 pub(crate) mod git_inflow;
 pub(crate) mod ingest;
 pub(crate) mod rustic;

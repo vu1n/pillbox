@@ -123,7 +123,11 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "a markerless entry is rebuilt");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a markerless entry is rebuilt"
+        );
         assert!(entry.join("fresh.txt").exists(), "fresh content present");
         assert!(!entry.join("stale.txt").exists(), "stale partial discarded");
     }
@@ -141,7 +145,10 @@ mod tests {
         .unwrap();
         // External cleanup removes the entry dir but leaves the marker sibling.
         std::fs::remove_dir_all(root.join("h")).unwrap();
-        assert!(root.join("h.complete").exists(), "marker survived the delete");
+        assert!(
+            root.join("h.complete").exists(),
+            "marker survived the delete"
+        );
 
         let entry = materialize_once(&root, "h", |dst| {
             calls.fetch_add(1, Ordering::SeqCst);
@@ -149,7 +156,11 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "a marker with no entry rebuilds");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a marker with no entry rebuilds"
+        );
         assert_eq!(std::fs::read(entry.join("f.txt")).unwrap(), b"snap");
     }
 
@@ -183,7 +194,10 @@ mod tests {
         );
         let rs = results.lock().unwrap();
         assert_eq!(rs.len(), 8);
-        assert!(rs.iter().all(|p| *p == rs[0]), "all workers get the same dir");
+        assert!(
+            rs.iter().all(|p| *p == rs[0]),
+            "all workers get the same dir"
+        );
         assert_eq!(std::fs::read(rs[0].join("f.txt")).unwrap(), b"snap");
     }
 }

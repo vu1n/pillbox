@@ -68,7 +68,11 @@ fn clone_impl(src: &Path, dst: &Path) -> Result<CloneMethod> {
     if rc != 0 {
         let err = std::io::Error::last_os_error();
         let _ = std::fs::remove_dir_all(dst); // don't leave a half clone behind
-        bail!("clonefile {} → {} failed: {err}", src.display(), dst.display());
+        bail!(
+            "clonefile {} → {} failed: {err}",
+            src.display(),
+            dst.display()
+        );
     }
     Ok(CloneMethod::Reflink)
 }
@@ -100,7 +104,9 @@ fn clone_tree(src: &Path, dst: &Path, method: &mut CloneMethod) -> Result<()> {
 
     if ft.is_dir() {
         std::fs::create_dir(dst).with_context(|| format!("create dir {}", dst.display()))?;
-        for entry in std::fs::read_dir(src).with_context(|| format!("read dir {}", src.display()))? {
+        for entry in
+            std::fs::read_dir(src).with_context(|| format!("read dir {}", src.display()))?
+        {
             let entry = entry.with_context(|| format!("entry under {}", src.display()))?;
             clone_tree(&entry.path(), &dst.join(entry.file_name()), method)?;
         }
@@ -219,11 +225,19 @@ mod tests {
 
         // Overwrite the clone with a different length → forces a block divergence.
         fs::write(dst.join("top.txt"), b"BBBBBBBB").unwrap();
-        assert_eq!(fs::read(src.join("top.txt")).unwrap(), b"AAAA", "src unchanged");
+        assert_eq!(
+            fs::read(src.join("top.txt")).unwrap(),
+            b"AAAA",
+            "src unchanged"
+        );
 
         // And the reverse direction.
         fs::write(src.join("top.txt"), b"CC").unwrap();
-        assert_eq!(fs::read(dst.join("top.txt")).unwrap(), b"BBBBBBBB", "dst unchanged");
+        assert_eq!(
+            fs::read(dst.join("top.txt")).unwrap(),
+            b"BBBBBBBB",
+            "dst unchanged"
+        );
     }
 
     #[cfg(unix)]
@@ -233,7 +247,10 @@ mod tests {
         fs::set_permissions(src.join("top.txt"), fs::Permissions::from_mode(0o600)).unwrap();
         let dst = tmp.path().join("dst");
         cow_clone_dir(&src, &dst).unwrap();
-        let mode = fs::metadata(dst.join("top.txt")).unwrap().permissions().mode();
+        let mode = fs::metadata(dst.join("top.txt"))
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o600, "0600 must survive the fork");
     }
 
@@ -268,8 +285,14 @@ mod tests {
         cow_clone_dir(&src, &dst).unwrap();
         let link = dst.join("link");
         let meta = fs::symlink_metadata(&link).unwrap();
-        assert!(meta.file_type().is_symlink(), "clone must keep the symlink as a link");
-        assert_eq!(fs::read_link(&link).unwrap(), std::path::Path::new("top.txt"));
+        assert!(
+            meta.file_type().is_symlink(),
+            "clone must keep the symlink as a link"
+        );
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            std::path::Path::new("top.txt")
+        );
     }
 
     #[test]

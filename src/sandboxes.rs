@@ -11,6 +11,7 @@
 //! `<pillbox>/sandboxes/<id>.toml`, single-scope (no inheritance — a sandbox
 //! is concrete runtime state tied to the pillbox that spawned it), via the
 //! shared [`crate::registry::Registry`] plumbing.
+// Context: doc://pillbox/remote-backend-plane-removed@0001#remote-backend-plane-removed
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};

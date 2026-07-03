@@ -59,6 +59,8 @@
 //!   - **Token provisioning / trust.** Where a real user's token/secret comes
 //!     from (vs the spike's `/tmp` file) is unresolved; the env config above is
 //!     the interim surface.
+// Context: doc://pillbox/managed-store-of-record@0001#managed-store-of-record
+// Context: doc://pillbox/managed-tier-do-gateway@0001#managed-tier-do-gateway
 
 use std::path::PathBuf;
 

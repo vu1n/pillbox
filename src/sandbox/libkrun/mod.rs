@@ -30,6 +30,7 @@
 //! ```
 //! Re-codesign after every build (cargo invalidates the signature). Select at
 //! runtime with `PILLBOX_BACKEND=libkrun`.
+// Context: doc://pillbox/adr-001-libkrun-is-the-backend@0001#libkrun-is-the-backend
 
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int};

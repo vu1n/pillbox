@@ -26,6 +26,7 @@
 //! precisely for this. The loop sits behind [`WorkerDriver`] so the selection /
 //! retry **policy** is unit-tested over a mock, while the live [`CliDriver`] is
 //! exercised by the GHOST-004 smoke.
+// Context: doc://pillbox/adr-008-ghost-extraction-trigger@0001#ghost-extraction-trigger
 
 use std::path::PathBuf;
 use std::process::Command;

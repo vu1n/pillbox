@@ -4,6 +4,7 @@
 //! (not the `Event` NDJSON control plane) because full-screen repaints are
 //! high-volume and base64-in-JSON would hurt — the same data/control split
 //! orca uses. See `docs/attach-transport.md` for the frame table.
+// Context: doc://pillbox/attach-frame-protocol@0001#attach-frame-protocol
 
 use std::io::{self, Read, Write};
 

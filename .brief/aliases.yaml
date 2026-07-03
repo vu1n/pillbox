@@ -24,6 +24,8 @@ gateway-no-daemon:
   latest: 1
 libkrun-env-fork-substrate:
   latest: 1
+managed-store-of-record:
+  latest: 1
 managed-tier-do-gateway:
   latest: 1
 optimization-external-substrate-primitives:

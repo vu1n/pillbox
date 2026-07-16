@@ -41,9 +41,9 @@ global pillbox regardless of where you are.
 | `pillbox session list [--json]` | List sessions started from this pillbox (oldest first). |
 | `pillbox session info ID [--json]` | Show one session (accepts unique id prefix ≥ 4 chars). |
 | `pillbox session diagnose ID [--json]` | Diagnose one session: derived status, failure detail, and an activity summary from the durable log — the "what happened / why is it stuck" companion to `info`. Accepts an id prefix ≥ 4 chars. |
-| `pillbox session attach ID` | Reattach to a detached session. Detach again with Ctrl-A + D or `pillbox session detach ID` from another shell. Works for the local Docker and libkrun backends. |
+| `pillbox session attach ID` | Reattach to a detached local libkrun PTY session. Detach again with Ctrl-A + D or `pillbox session detach ID` from another shell. Managed sessions have no host PTY; the deprecated Docker backend remains compatibility residue. |
 | `pillbox session detach ID` | Signal a currently-attached pillbox to detach (SIGTERM, no-op if already detached). |
-| `pillbox session send ID TEXT` | Drive a running (detached) session: push TEXT to the agent's PTY as if typed — the programmatic SendInput half (pair with `session subscribe` to read the response). Bytes sent as-is; add a trailing newline/`\r` to submit a prompt to a TUI agent. Local Docker sessions today. |
+| `pillbox session send ID TEXT` | Drive a running session through `LiveSession`: raw input for a local libkrun PTY, a structured prompt for server-mode/managed agents. Pair with `session subscribe` or `watch` to read the response. Bytes are sent as-is; add a trailing newline/`\r` for a TUI agent. |
 | `pillbox session annotate ID TEXT [--anchor REF]` | Record an attributed, durable §0 comment WITHOUT driving the agent — the async, keyboard-free "chime in" (distinct from `send`, which steers). Lands in the log stamped with your actor; an orchestrator may inject it as agent context. `--anchor` references what it's about (a seq, a path, a message id). |
 | `pillbox session subscribe ID [--from SEQ] [--bind ADDR]` | Stream a session's durable event log to WebSocket subscribers as JSON (one Event per text frame, in seq order from `--from`). For a **live** (detached) session it also tails the transcript→log while serving, so a driven detached session is readable; for a foreground/historical session it serves the existing log. Binds localhost (`--bind`, default `127.0.0.1:0` — printed) until Ctrl-C. The §0 local read surface a chat bridge / orchestrator / browser connects to without a shell. If `$PILLBOX_EVENTS_WEBHOOK` is set, also POSTs attention signals to it (read-side). |
 | `pillbox session watch ID [--from SEQ]` | Render a session's event stream to **this terminal** — messages by role, tools (⚙/✓/✗), thinking, the ⏳ attention signal — the human-facing reader (`docker logs` model; `subscribe` is the machine/WS sibling). Tails a live session as it works. Ctrl-C to stop. Accepts an id prefix. |
@@ -106,7 +106,7 @@ PTY-free exec channel an orchestrator drives. Docker-backed today.
 | `--mcp NAME=URL` | — | Attach a shared MCP server (`http(s)://`). NAME is what the agent sees; `localhost`/`127.0.0.1` are rewritten to `host.docker.internal`. Repeatable. See [docs/shared-mcp.md](./docs/shared-mcp.md). |
 | `--mcp-token NAME=SECRET_NAME` | — | Attach a bearer token (from the secret store) to a `--mcp NAME`. claude folds it into a 0600 headers tempfile; codex into an env var via `bearer_token_env_var`. Never lands in argv or shell history. Repeatable. |
 | `--from-bookmark NAME` | — | Start from a named snapshot bookmark — the **guest** workspace is forked from that snapshot before the agent launches. Without `--workspace`, the snapshot is materialized into a shared base cache and CoW-cloned per run (so `k` dispatch workers pay one restore, not `k`) and your **cwd is left untouched** — use `pillbox pull` to restore a snapshot into cwd. With `--workspace DIR`, the snapshot is restored into that dir. |
-| `--detach` | — | Start the session and immediately return — the agent keeps running in the background; reattach with `pillbox session attach <id>`. Works for both local backends (Docker and libkrun). Local `--detach` does NOT support `--vault` (the host-side proxy can't outlive the CLI). |
+| `--detach` | — | Start a local libkrun session and immediately return; the microVM and its credential/egress broker keep running. Reattach with `pillbox session attach <id>`. Managed detached finalization is not implemented. |
 | `--events-webhook URL` | — | POST every lifecycle event to URL as JSON. Forwarded to the in-sandbox wrapper so terminal events (`session.completed`/`failed`) reach back to the orchestrator. Equivalent to `$PILLBOX_EVENTS_WEBHOOK`. See [docs/observability.md](./docs/observability.md) for the full sink reference (JSONL / webhook / OTLP via `$OTEL_EXPORTER_OTLP_ENDPOINT`). |
 | `--ttl DURATION` | — | Per-session retention TTL — `30m` / `24h` / `7d` (`s`/`m`/`h`/`d` units only, max 365d). Writes `expires_at` to the record. `pillbox session prune` drops expired sessions. Requires `--detach`. |
 | `--label TEXT` | — | Human label for a detached session, surfaced in `pillbox session list`. Only meaningful with `--detach`. |
@@ -154,10 +154,10 @@ works today.
 
 ### Sessions — detach + reattach
 
-A `pillbox run --detach` session can be left running and reconnected to
-later. This works for both local backends (Docker and libkrun). Local
-`--detach` does NOT support `--vault` (the host-side proxy can't outlive
-the CLI).
+A local libkrun `pillbox run --detach` session can be left running and
+reconnected to later. The VM owns its credential/egress broker, so vaulted
+detached runs are supported. Managed detached finalization is not implemented;
+the deprecated Docker backend does not define the product contract.
 
 | Action | How |
 |---|---|

@@ -6,9 +6,11 @@ on it). If code disagrees with this map, **code wins** — fix the map in the sa
 change. The point of this file is to stop agents asserting structure they haven't
 checked.
 
-pillbox = **a self-contained bundle (workspace + code + vault + config)** that an
-orchestrator runs agents against, inside a **local microVM** (libkrun) with a
-**host-side credential/egress vault** in front of the guest's network.
+pillbox = **a durable coding-agent session + self-contained bundle** (workspace
++ code + vault + config). Locally, the agent runs inside a libkrun microVM with
+a host-side credential/egress vault. In the experimental managed placement, a
+Cloudflare Durable Object owns the §0 session authority and a Cloudflare
+Container runs the agent.
 
 ## Subsystem map
 
@@ -16,10 +18,10 @@ orchestrator runs agents against, inside a **local microVM** (libkrun) with a
 |---|---|---|---|
 | Backend / substrate | docs/substrate-plane.md, docs/libkrun-sandbox.md | the microVM that runs the agent; the `SandboxBackend`/`LiveSession` seam | libkrun live; docker backend slated for deletion (ADR-002) |
 | Vault (creds + egress) | docs/vault.md | host-side MITM that swaps stub→real creds + fences egress | live; OAuth re-aimed at the broker model (ADR-004) |
-| Sessions / §0 | docs/session-event-log.md | durable event log, drive (`send`) + read (`subscribe`/`watch`) surface | `[unverified here]` |
-| Snapshots | docs/config.md, AGENTS.md | rustic repo, push/pull, bookmarks | `[unverified here]` |
-| Dispatch / eval | docs/dispatch.md, docs/eval.md | fork-k verified workers; the eval runner | `[unverified here]` |
-| Managed / CF tier | docs/managed-tier.md, docs/gateway.md | the §0-gateway Durable Object; not yet a `run` backend | aspirational |
+| Sessions / §0 | docs/session-event-log.md | durable event log, drive (`send`) + read (`subscribe`/`watch`) surface | local live; managed DO live-validated `[verified 2026-07-16]` |
+| Snapshots | docs/config.md, AGENTS.md | rustic repo, push/pull, bookmarks | local + R2 live `[verified 2026-07-16]` |
+| Dispatch / eval | docs/dispatch.md, docs/eval.md | fork-k verified workers; the eval runner | local libkrun shipped `[verified 2026-07-16]` |
+| Managed / CF tier | docs/managed-tier.md, docs/gateway.md | DO session authority + CF Container placement | experimental foreground backend shipped; product gaps remain `[verified 2026-07-16]` |
 
 ## Entanglements that bite
 
@@ -70,6 +72,6 @@ the vault MITM live (src/sandbox/libkrun/egress.rs).
 - **No-backend build** — `--no-default-features` currently compiles because the
   docker backend is the fallback; deleting it means resolving what the
   toolchain-free / in-sandbox-guest build does.
-- **Spec/code drift** — several big docs (vnext, managed-tier, the optimization
-  family) are aspirational, not current. They belong in docs/archive/ with a
-  clear marker (ADR-005).
+- **Spec/code drift** — several big docs (vnext and parts of the optimization
+  family) mix design history with current behavior. They need curation into
+  current canonical docs vs `docs/archive/` (ADR-005).

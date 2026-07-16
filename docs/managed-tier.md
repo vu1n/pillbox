@@ -1,14 +1,21 @@
-# Managed tier — durable sessions on Cloudflare (design)
+# Managed tier — durable sessions on Cloudflare
 
-Status: **design / proposed** (2026-06-06). The differentiated layer above the
-local substrate. Depends on the §0 spine ([session-event-log.md](./session-event-log.md))
-and realizes the gateway ([gateway.md](./gateway.md)) as the placement authority.
-Sibling to [vnext.md](./vnext.md) (owns the layering + sequence).
+Status: **experimental implementation in progress** (updated 2026-07-16). The
+per-session Durable Object gateway and Cloudflare Container consume path are
+built and live-validated. The Rust `ManagedBackend` is selectable with
+`PILLBOX_BACKEND=managed` and implements the foreground
+snapshot→provision→drive→finalize loop over rustic-on-R2. It is not yet a hosted
+product: detached finalization/teardown, reconnect-and-replay, and user-facing
+identity/token provisioning remain open.
 
-> **Direction.** pillbox is local-only today (Docker + libkrun behind the
-> `SandboxBackend` trait). "Remote" returns here, in a **different shape than
-> the deleted ssh/e2b/`docker://` URL backends**: not a transport to someone
-> else's daemon, but a **managed placement** behind the same trait, where a
+This is the differentiated layer above the local substrate. It depends on the
+§0 spine ([session-event-log.md](./session-event-log.md)) and realizes the
+gateway ([gateway.md](./gateway.md)) as the placement authority. Sibling to
+[vnext.md](./vnext.md) (owns the layering + sequence).
+
+> **Direction.** Managed is a placement behind the same `SandboxBackend` /
+> `LiveSession` traits as local libkrun, not a URL transport to someone else's
+> daemon. The deleted ssh/e2b/`docker://` remote plane does not return. A
 > Cloudflare **Durable Object is the per-session gateway** and a Cloudflare
 > **Container runs the agent**.
 
@@ -422,8 +429,8 @@ So the happy path is one writer, not a consensus problem.
 
 ## Coexistence & migration
 
-- Local backends (Docker, libkrun) are unchanged and remain the default. Managed
-  is **opt-in**.
+- Local libkrun remains the default. Managed is **opt-in**; the Docker agent
+  backend is deprecated and pending deletion.
 - `Session` gains a `placement` (`local` | `managed`); attach/reattach/kill/the
   status projection route on it. (Note: we just removed the always-`"local"`
   `Session.remote` field — `placement` is a *real* dispatch axis, not a display
@@ -431,9 +438,9 @@ So the happy path is one writer, not a consensus problem.
 - §0 readers (`subscribe`/`watch`/`wait-idle`/`ingest`/`log`) are already
   transport-agnostic over the log shape; they gain a DO-WS source alongside the
   local file source.
-- Blob store at rest is a new sensitive surface — add the R2 row to
-  [security.md](./security.md) **before** the capture path lands (the §0 spec's
-  cutover requirement).
+- Blob and workspace storage at rest are sensitive surfaces covered in
+  [security.md](./security.md); raw provider credentials and unredacted auth
+  responses must never enter either store.
 - **Workspace-transfer credential is prefix-scoped.** The container-native
   placement hands the DO an R2 credential so it can restore + snapshot the rustic
   repo (`/provision`, `/finalize`). The host does not ship the pillbox's
@@ -446,9 +453,9 @@ So the happy path is one writer, not a consensus problem.
   A credential is minted **fresh per transfer** (once for `/provision`, again for
   `/finalize`) with a 30-min TTL, so it spans only its own round-trip — a long
   turn between the two can't expire it. The scoped credential carries a
-  `sessionToken`, surfaced on the wire as `S3Config.session_token`; **the DO's S3
-  client must forward it as `X-Amz-Security-Token`** or every signed request 403s
-  (frozen-contract requirement). Scoping is **fail-closed**: with the token set, a
+  `sessionToken`, surfaced on the wire as `S3Config.session_token`; the DO
+  forwards it into the container helper, whose S3 client sends
+  `X-Amz-Security-Token`. Scoping is **fail-closed**: with the token set, a
   non-R2 endpoint or an empty repo prefix (nothing narrower than the bucket) is a
   hard error, never a bucket-wide mint dressed up as scoped. With no token
   configured the parent key still travels, but `run` announces the bucket-wide

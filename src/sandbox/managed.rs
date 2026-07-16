@@ -41,7 +41,7 @@
 //! env each run). The DO/worker restore+snapshot half is built separately to the
 //! same frozen contract (docs/managed-tier.md).
 //!
-//! ## Open follow-ups (flagged, not faked)
+//! ## Security boundary implemented
 //!
 //!   - **R2 key scoping.** When `PILLBOX_R2_CF_API_TOKEN` is set, `run` mints a
 //!     short-lived, prefix-scoped R2 temp credential ([`r2_scope`], fresh per
@@ -49,9 +49,11 @@
 //!     only this run's prefix — and the bucket-wide parent *secret* never crosses
 //!     to CF (the Bearer API token authorizes the mint). With no token configured
 //!     the parent key still travels, but the exposure is announced loudly rather
-//!     than silently. The DO side must honor the credential's `session_token`
-//!     (`X-Amz-Security-Token`) for a scoped credential to authenticate — part of
-//!     the frozen contract.
+//!     than silently. The DO forwards the credential's `session_token` into the
+//!     container helper, which sends it as `X-Amz-Security-Token`.
+//!
+//! ## Open follow-ups (flagged, not faked)
+//!
 //!   - **Detached finalize.** Only the foreground path is implemented (drive a
 //!     turn, wait for idle, finalize). For a `--detach` managed run the host
 //!     returns before the turn ends, so the in-container wrapper would own the
@@ -681,7 +683,7 @@ mod workspace_xfer {
     /// never persisted on the `Session` record.
     // The `repo` handed in is already prefix-scoped when scoping is configured
     // (see [`super::r2_scope`]); a scoped credential carries a `session_token`
-    // the DO must forward as `X-Amz-Security-Token`.
+    // that the DO forwards into the container helper for S3 signing.
     #[derive(Serialize)]
     struct WorkspaceRepo<'a> {
         repo: &'a S3Config,
@@ -854,6 +856,25 @@ mod workspace_xfer {
             // A long-lived key carries no session token: absent on the wire, so
             // the frozen contract is byte-identical to pre-scoping.
             assert!(repo.get("session_token").is_none());
+        }
+
+        #[test]
+        fn scoped_provision_serializes_the_r2_session_token() {
+            let mut c = cfg();
+            c.session_token = Some("scoped-session-token".into());
+            let body = serde_json::to_value(ProvisionBody {
+                workspace: WorkspaceRepo {
+                    repo: &c,
+                    password: "repo-pw",
+                    snapshot: Some("snap-handle"),
+                },
+            })
+            .unwrap();
+
+            assert_eq!(
+                body["workspace"]["repo"]["session_token"],
+                "scoped-session-token"
+            );
         }
 
         /// `/finalize` is the same shape minus `snapshot` (the DO snapshots

@@ -134,7 +134,7 @@ pub(crate) enum WorkspaceAction {
     ///
     /// Secrets are read from the environment ONLY, never flags/argv:
     /// `PILLBOX_R2_ACCESS_KEY`, `PILLBOX_R2_SECRET_KEY`,
-    /// `PILLBOX_REPO_PASSWORD`.
+    /// optional `PILLBOX_R2_SESSION_TOKEN`, `PILLBOX_REPO_PASSWORD`.
     Restore(RemoteRepoRestore),
     /// Snapshot a directory into a rustic-on-S3 repo addressed by explicit
     /// coordinates — NO pillbox required. Prints ONLY the new snapshot
@@ -143,7 +143,7 @@ pub(crate) enum WorkspaceAction {
     ///
     /// Secrets are read from the environment ONLY, never flags/argv:
     /// `PILLBOX_R2_ACCESS_KEY`, `PILLBOX_R2_SECRET_KEY`,
-    /// `PILLBOX_REPO_PASSWORD`.
+    /// optional `PILLBOX_R2_SESSION_TOKEN`, `PILLBOX_REPO_PASSWORD`.
     Backup(RemoteRepoBackup),
 }
 
@@ -338,7 +338,8 @@ pub(crate) enum SessionAction {
     /// Drive a running (detached) session: push text to its agent's PTY as if
     /// typed — the programmatic SendInput half (pair with `session subscribe`
     /// to read the response). Bytes are sent as-is; add a trailing newline to
-    /// submit a prompt to a TUI agent. Local Docker sessions today.
+    /// submit a prompt to a TUI agent. libkrun PTY/server sessions and the
+    /// managed structured-agent path implement this through `LiveSession`.
     Send {
         id: String,
         /// Text to send (as-is). Include a trailing newline/`\r` to submit.

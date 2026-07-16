@@ -3,6 +3,7 @@ import { getSandbox } from "@cloudflare/sandbox";
 import type { Actor, Event, Payload } from "./contract.js";
 import { bearerToken, verifyActorToken } from "./auth.js";
 import { OpencodeMapper } from "./opencode_mapper.js";
+import { workspaceExecEnv, type WorkspaceRepo } from "./workspace_repo.js";
 import type { Env } from "./worker.js";
 
 // Per-connection state (the subscriber's replay cursor + its authenticated
@@ -45,19 +46,6 @@ const TURN_TIMEOUT_MS = 300_000; // 5 min
 // A workspace restore/backup over R2 (rustic) moves the whole tree through the
 // container, far exceeding a turn's interactivity — give it a generous wall clock.
 const WORKSPACE_XFER_TIMEOUT_MS = 300_000; // 5 min
-
-// The rustic-on-R2 repo coordinates + resolved creds the host hands the container
-// to restore the run's workspace in / snapshot results out (mirrors Rust S3Config).
-// `access_key`/`secret_key` (and the separate `password`) are SECRET — they reach
-// `pillbox workspace restore|backup` ONLY via the exec ENV, never argv, never §0.
-type WorkspaceRepo = {
-  endpoint: string;
-  region: string;
-  bucket: string;
-  prefix: string;
-  access_key: string;
-  secret_key: string;
-};
 
 // Minimal shape of the opencode `config` overlay we construct/merge (the full
 // type lives in @opencode-ai/sdk, not installed here). Provider → { options.apiKey }.
@@ -418,16 +406,10 @@ export class SessionGateway extends Agent<Env> {
     repo: WorkspaceRepo,
     password: string,
   ): Promise<{ ok: boolean; detail: string; stdout: string }> {
-    const env = {
-      // The SDK's exec REPLACES the container env with this map, so re-assert the
-      // essentials a bare command needs (PATH for any subprocess, HOME for tools
-      // that read it) alongside the secrets.
-      PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-      HOME: "/root",
-      PILLBOX_R2_ACCESS_KEY: repo.access_key,
-      PILLBOX_R2_SECRET_KEY: repo.secret_key,
-      PILLBOX_REPO_PASSWORD: password,
-    };
+    // The SDK's exec REPLACES the container env with this map. The helper
+    // re-asserts PATH/HOME and forwards the complete R2 credential tuple,
+    // including the session token required by prefix-scoped temporary keys.
+    const env = workspaceExecEnv(repo, password);
     let lastErr = "";
     for (let attempt = 0; attempt < 60; attempt++) {
       try {

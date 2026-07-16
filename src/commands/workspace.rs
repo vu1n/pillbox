@@ -298,6 +298,12 @@ fn remote_backend(
 ) -> Result<RusticBackend> {
     let access_key = require_env(action, "PILLBOX_R2_ACCESS_KEY")?;
     let secret_key = require_env(action, "PILLBOX_R2_SECRET_KEY")?;
+    // R2 temp credentials are an STS-style triple: access key, secret key,
+    // session token. Long-lived credentials omit the token, so keep it optional
+    // while ensuring a scoped credential reaches rustic intact.
+    let session_token = std::env::var("PILLBOX_R2_SESSION_TOKEN")
+        .ok()
+        .filter(|value| !value.is_empty());
     Ok(RusticBackend {
         variant: RusticVariant::S3(S3Config {
             endpoint: coords.endpoint.clone(),
@@ -306,7 +312,7 @@ fn remote_backend(
             prefix: coords.prefix.clone(),
             access_key,
             secret_key,
-            session_token: None,
+            session_token,
         }),
         password_file: password_file.to_path_buf(),
     })
@@ -512,6 +518,34 @@ mod tests {
         let got = require_env("workspace backup", leak_static("__PB_TEST_PRESENT_SECRET")).unwrap();
         assert_eq!(got, "v");
         std::env::remove_var("__PB_TEST_PRESENT_SECRET");
+    }
+
+    #[test]
+    fn remote_backend_forwards_optional_r2_session_token() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("PILLBOX_R2_ACCESS_KEY", "scoped-ak");
+        std::env::set_var("PILLBOX_R2_SECRET_KEY", "scoped-sk");
+        std::env::set_var("PILLBOX_R2_SESSION_TOKEN", "scoped-session-token");
+
+        let coords = RemoteRepoCoords {
+            endpoint: "https://account.r2.cloudflarestorage.com".into(),
+            bucket: "workspaces".into(),
+            region: "auto".into(),
+            prefix: "project/run/".into(),
+        };
+        let backend = remote_backend("workspace restore", &coords, Path::new("/tmp/password"))
+            .expect("scoped R2 credentials should build a backend");
+        let RusticVariant::S3(config) = backend.variant else {
+            panic!("remote workspace backend must use S3");
+        };
+        assert_eq!(
+            config.session_token.as_deref(),
+            Some("scoped-session-token")
+        );
+
+        std::env::remove_var("PILLBOX_R2_ACCESS_KEY");
+        std::env::remove_var("PILLBOX_R2_SECRET_KEY");
+        std::env::remove_var("PILLBOX_R2_SESSION_TOKEN");
     }
 
     #[test]

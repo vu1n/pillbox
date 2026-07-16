@@ -5,7 +5,7 @@
 #
 #   Usage: scripts/smoke/cf.sh
 # Env: SMOKE_CF_PORT (default 8799).
-# Prereqs: cloudflare-spike deps installed (npm i), Node >= 23 (for .ts imports).
+# Prereqs: cloudflare-spike deps installed (npm i), Node >= 22.6 (type stripping).
 set -uo pipefail
 cd "$(dirname "$0")/../../cloudflare-spike"
 

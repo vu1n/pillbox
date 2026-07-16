@@ -8,6 +8,21 @@ moves the `:latest` runner image and ships the interactive attach
 transport (in-sandbox pty-host + frame protocol; local detach/reattach).
 `0.2.0` is the §0 multiplayer trust layer + the libkrun pivot (below).
 
+## Unreleased — managed foreground path + public launch surface
+
+- Added the experimental Cloudflare `ManagedBackend`: rustic-on-R2 workspace
+  provision, structured agent drive through the per-session Durable Object,
+  wait-for-idle, finalize, and result-snapshot recording.
+- Added prefix-scoped R2 temporary credentials and end-to-end session-token
+  propagation through the DO into the container workspace helper.
+- Added Cloudflare gateway CI covering TypeScript, Rust↔TypeScript contract
+  parity, actor authentication, driver arbitration, annotations, and real
+  workerd/Durable Object SQLite.
+- Reframed the public surface around Durable Objects as the managed session
+  authority, local libkrun handoffs as the superpower, and Ghost as the
+  experimental proof tenant.
+- Added contributor guidance and the declared MIT/Apache-2.0 license files.
+
 ## v0.2.0 (crate) — local-only (libkrun pivot) + §0 multiplayer
 
 > The crate version (`0.2.0`, what `pillbox version` reports) and the design

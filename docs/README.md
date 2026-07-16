@@ -8,7 +8,8 @@ authoritative.** When a design doc and a banner disagree, the banner (newer) win
 
 | File | What |
 |---|---|
-| [vnext.md](./vnext.md) | **Start here.** The umbrella: strategy, layering, the unified sequence. (Has a 2026-06-01 direction banner: local-first; remote→Cloudflare/local-on-box; Docker→libkrun.) |
+| [architecture.md](./architecture.md) | **Start here.** Verified system map, current placements, and structural debts. |
+| [vnext.md](./vnext.md) | Historical umbrella strategy and layering context; code and active decisions supersede stale sequence details. |
 | [libkrun-sandbox.md](./libkrun-sandbox.md) | **The substrate.** Docker → libkrun microVM: own-via-FFI, `pillbox-init`, vsock control + smoltcp egress, the security union, what survives the pivot. |
 | [dx.md](./dx.md) | The developer-experience contract — the inner loops + zero-config-local. (Remote-parity sections are superseded by the local-first pivot.) |
 
@@ -18,7 +19,7 @@ authoritative.** When a design doc and a banner disagree, the banner (newer) win
 |---|---|
 | [session-event-log.md](./session-event-log.md) | The durable, attributed per-session event log — the keystone every consumer reads. |
 | [gateway.md](./gateway.md) | The per-session sequencer + broker + attach endpoint §0 gates on. |
-| [managed-tier.md](./managed-tier.md) | **Proposed.** The managed/Cloudflare tier: a Durable Object *is* the §0 gateway; a Container runs the agent. Placement behind the `SandboxBackend` trait. |
+| [managed-tier.md](./managed-tier.md) | **Experimental implementation.** A Durable Object *is* the §0 gateway; a Container runs the agent. Foreground placement is wired behind `SandboxBackend`; detached/reconnect/token UX remain open. |
 | [agent-io-contract.md](./agent-io-contract.md) | The PTY-free structured I/O contract (`agent.proto`). |
 | [attach-transport.md](./attach-transport.md) | The interactive `Frame` transport. (Transport-agnostic surface; the `docker exec` carrier moves to vsock under libkrun.) |
 
@@ -47,7 +48,7 @@ authoritative.** When a design doc and a banner disagree, the banner (newer) win
 | File | Status |
 |---|---|
 | [remotes-redesign.md](./archive/remotes-redesign.md) | **Superseded** by libkrun-sandbox.md (the Docker-context backend collapse is retired). Fork-from-store reasoning carries forward. |
-| [remotes.md](./archive/remotes.md) | **Removed** — the `ssh://`/`e2b://`/`docker://` URL backends and `--remote` are gone. pillbox is local-only; "remote" returns later as a managed/Cloudflare tier. |
+| [remotes.md](./archive/remotes.md) | **Removed** — the `ssh://`/`e2b://`/`docker://` URL backends and `--remote` are gone. Managed has returned as an experimental Cloudflare placement, not a URL backend. |
 
 Archived decision records: [`archive/`](./archive/).
 

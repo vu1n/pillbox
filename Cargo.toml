@@ -4,10 +4,10 @@ version = "0.2.0"
 edition = "2021"
 authors = ["vu1n"]
 license = "MIT OR Apache-2.0"
-description = "Sandboxed coding agents, bundled — local Docker, SSH VPS, or E2B managed sandbox. Per-project workspace + vault + auth + config in one self-contained pillbox."
+description = "Durable coding-agent sessions on Cloudflare and local libkrun microVMs."
 repository = "https://github.com/vu1n/pillbox"
 homepage = "https://github.com/vu1n/pillbox"
-keywords = ["sandbox", "agent", "claude", "codex", "e2b"]
+keywords = ["sandbox", "agent", "cloudflare", "durable-objects", "libkrun"]
 categories = ["command-line-utilities", "development-tools"]
 readme = "README.md"
 

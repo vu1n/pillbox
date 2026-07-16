@@ -1,56 +1,48 @@
 # Substrate plane — one `LiveSession` interface, N substrate handlers
 
-> **Status:** draft / initial plan (2026-06-17). No code yet. Supersedes the
-> "docker is going away, don't polish it" framing — docker is **demoted, not
-> deleted** (see Why).
->
-> **Decisions (2026-06-17):** (1) **Land the plane as the spine first**
-> (Phases 0–2), then build the CF Containers backend on it (Phase 5). (2)
-> **libkrun+PTY drive is in scope, not declined** — local PTY `send` + live
-> tail is a *first-class goal*, because local ADEs/IDEs build rich interfaces on
-> the PTY drive/read surface (drive a session, render its live stream). So
-> libkrun must reach PTY parity with the container family, not just decline it.
+> **Status:** implemented (updated 2026-07-16). `SandboxBackend` +
+> `LiveSession` + `Caps` are the shipped plane; libkrun PTY drive/live tail and
+> the experimental foreground Cloudflare managed backend are wired through it.
+> The phase narrative below is retained as implementation history. Its old
+> "Docker as a co-equal local twin" framing is superseded by ADR-001/002:
+> libkrun is the one local backend and the Docker agent backend is pending
+> deletion.
 
 ## Why
 
-pillbox runs an agent on a *substrate*. Today there are two
-(`select_backend()`, `src/sandbox/mod.rs:39`): **docker** (default) and
-**libkrun** (opt-in, `PILLBOX_BACKEND=libkrun`, feature-gated). We originally
-intended libkrun to *replace* docker; it can't, because **libkrun needs
-`/dev/kvm`** (HVF on Mac, KVM on Linux) and standard/cheap VPS don't expose it.
+pillbox runs an agent on a *substrate*. Today there are two intended placements:
+**libkrun** is the default and only supported local agent backend; **managed**
+selects the experimental Cloudflare Durable Object + Container path with
+`PILLBOX_BACKEND=managed`. The Docker agent backend remains temporarily as
+deprecated code and a toolchain-free build fallback; it is not a product mode.
 
 The strategic decision (this is opinionated-for-our-own-use, not
 broad-compat):
 
-- **libkrun = the local/KVM compute substrate.** Becomes the default.
-- **Cloudflare = remote.** The CF Durable Object (`cloudflare-spike/`) is the §0
-  **coordination** gateway (sequencer + fan-out + attestation), *not* compute.
-  Remote **compute** will be **CF Containers / CF agent sandboxes behind the
-  DO** — a backend we will build.
-- **docker = demoted, kept.** Not the default, no VPS-compat promise. Kept
-  because docker and CF Containers are the **same transport family** (see
-  below), so docker is the free, fast, *local twin* of our real remote
-  substrate — the local dev + regression surface for the CF backend. Deleted
-  only if it ever stops being cheap to keep at parity.
+- **libkrun = the local compute substrate.** It is the default build and owns
+  local isolation, PTY handoff, real egress fencing, and in-sandbox grading.
+- **Cloudflare = managed placement.** A per-session Durable Object owns §0
+  sequencing, actor attestation, arbitration, and fan-out; a Cloudflare
+  Container runs the agent. The foreground backend is implemented.
+- **Docker agent backend = deprecated.** Docker is still used to materialize the
+  libkrun OCI rootfs and for auth plumbing while those dependencies are ported.
+  That does not make it a co-equal backend.
 
 ### The actual problem to fix
 
-Only **one** verb is a trait method: `SandboxBackend::run()`
-(`src/sandbox/mod.rs:31`). The entire rest of the live-session control surface
-(`send`, `attach`, `kill`, live tailing, the server HTTP handle, in-sandbox
-grade, ingest) is **free functions dispatched by ~8 string-matches** on
-`session::Backend::parse(&s.backend)`. New capabilities accrete as docker-first
-match arms; libkrun arms tend to be `bail!("docker only")`. That silent drift is
-why libkrun+PTY can't `send`/live-`watch` today. The fix is to make the
-**live session** the polymorphic thing, with **explicit capability
-negotiation** instead of scattered matches.
+The original problem was scattered backend-string dispatch for `send`,
+`attach`, `kill`, live tailing, server HTTP, grading, and ingest. The shipped
+fix makes the **live session** polymorphic and gates verbs through explicit
+capabilities. `select_backend()` and `live_session()` are the two dispatch
+points; command handlers no longer grow backend-specific match arms.
 
 ## The real axis: transport *families*, not backends
 
 | Family | Transport | Members | Drive/read mechanics |
 |---|---|---|---|
-| **Container** | exec + PTY into an OCI container; FS is peer-readable | **docker** (local), **CF Containers/Sandbox** (remote, planned) | identical |
-| **MicroVM** | vsock into a KVM microVM; FS opaque to host | **libkrun** (local, KVM) | the divergent one |
+| **Managed container** | HTTP/WS through a per-session DO; container FS is server-side | **Cloudflare Containers/Sandbox** | structured drive + §0 replay/tail |
+| **MicroVM** | vsock into an HVF/KVM microVM; FS opaque to the guest | **libkrun** (local) | PTY/server drive + local §0 |
+| **Deprecated container** | exec + PTY into a local OCI container | Docker agent backend (pending deletion) | compatibility residue only |
 
 Two more axes are **already abstracted** and stay as-is — orthogonal to this work:
 

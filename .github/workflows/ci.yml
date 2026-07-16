@@ -11,6 +11,26 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
+  cloudflare:
+    name: Cloudflare gateway
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cloudflare-spike
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: cloudflare-spike/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npx tsc --noEmit
+      - run: python3 check-contract-parity.py
+      # Real workerd + SQLite-backed DO, no account or paid container required.
+      - run: ../scripts/smoke/cf.sh
+
   test:
     strategy:
       fail-fast: false

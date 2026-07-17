@@ -15,6 +15,9 @@ transport (in-sandbox pty-host + frame protocol; local detach/reattach).
   wait-for-idle, finalize, and result-snapshot recording.
 - Added prefix-scoped R2 temporary credentials and end-to-end session-token
   propagation through the DO into the container workspace helper.
+- Live-validated the current scoped credential path on a paid Cloudflare
+  Container: encrypted R2 snapshot, provision, real agent edit, finalize, and
+  ordinary result pull all completed end to end.
 - Added Cloudflare gateway CI covering TypeScript, Rust↔TypeScript contract
   parity, actor authentication, driver arbitration, annotations, and real
   workerd/Durable Object SQLite.

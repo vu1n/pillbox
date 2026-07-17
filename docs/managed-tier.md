@@ -1,12 +1,27 @@
 # Managed tier — durable sessions on Cloudflare
 
-Status: **experimental implementation in progress** (updated 2026-07-16). The
+Status: **experimental implementation in progress** (updated 2026-07-17). The
 per-session Durable Object gateway and Cloudflare Container consume path are
 built and live-validated. The Rust `ManagedBackend` is selectable with
 `PILLBOX_BACKEND=managed` and implements the foreground
 snapshot→provision→drive→finalize loop over rustic-on-R2. It is not yet a hosted
 product: detached finalization/teardown, reconnect-and-replay, and user-facing
 identity/token provisioning remain open.
+
+> **Current live proof (2026-07-17).** A paid `standard-2` Container completed
+> the full foreground loop using the current prefix-scoped R2 temporary
+> credential contract, including the STS-style `sessionToken`: encrypted host
+> snapshot → scoped `/provision` → `workspace.restore` → real opencode turn and
+> agent file edit → a separately minted scoped `/finalize` →
+> `workspace.backup` → ordinary `session pull`. The pull reproduced the input
+> marker and the agent-written two-line result exactly. The Durable Object log
+> held 106 contiguous events (`seq=1..106`), with restore at seq 2 and backup at
+> seq 106, and a value scan found none of the parent R2 access-key ID/secret,
+> Cloudflare API token, actor-token secret, or model key in either the log or
+> session record.
+> Observed timings on this one run: container exec smoke 6.4 s, streamed agent
+> smoke 23.5 s, complete workspace round trip 40.27 s. These are proof samples,
+> not benchmarks.
 
 This is the differentiated layer above the local substrate. It depends on the
 §0 spine ([session-event-log.md](./session-event-log.md)) and realizes the
@@ -491,13 +506,12 @@ subscriber sees input→output in order). All smoke-tested (`smoke-{actor,driver
 the contract (`contract.ts`) is **parity-gated** against `contract.rs`
 (`check-contract-parity.py` in `cf.sh`). The §0/trust/subscribe substrate is **done**.
 
-What it runs in the box is `echo`, not an agent. Closing that — the **consume path** — is
-the realization of Milestones 0–1, and it's smaller than the table implied: **one method
-changes** and the whole §0/trust/subscribe substrate is reused untouched. (Consume, don't
-rebuild: opencode runs in CF's Sandbox SDK; we stay the §0/memory/multiplayer layer above.)
+The first hop proof ran `echo`; the shipped **consume path** now runs opencode and
+reuses the same §0/trust/subscribe substrate untouched. Opencode runs in CF's
+Sandbox SDK while pillbox remains the §0/memory/multiplayer layer above it.
 
-**The seam.** `driveSandbox` is the only method that evolves. Today: `sandbox.exec(cmd)` →
-one `tool_call`. Consume: drive opencode + tail its SSE → mapped agent §0 events.
+**The seam.** `driveSandbox` dispatches either `sandbox.exec(cmd)` → one
+`tool_call`, or an opencode prompt + SSE tail → mapped agent §0 events.
 
 | # | Piece | Detail |
 |---|---|---|
@@ -524,21 +538,20 @@ enforces. Driver `/input` stays human/service; `driver_changed` stays system.
    `check-contract-parity` to "same SSE fixture → same §0 payloads, both sides." The
    natural sequel to the contract-parity keystone.
 2. **The DO holds a long-lived SSE for the whole turn** (minutes), mapping+appending as
-   events arrive — vs. today's bounded one-shot exec. **This is Open Question #1 (DO↔container
-   hop cost) for a *streaming* turn — the thing the spike must measure**, plus mid-turn
-   eviction.
+   events arrive — vs. the bounded one-shot exec. One live 23.5 s turn passed on
+   2026-07-17. Sustained event rate and mid-turn eviction remain open.
 3. **opencode auth in the container = the vault parity** → consume CF's (Managed Agents'
    secret-injecting proxy / `wrangler secret`), don't rebuild our MITM (Milestone 2).
 4. **`contract.ts` additions**: the mapper emits `message_start`/`thinking`/`usage`
    (currently catch-all-absorbed, rust-only) — model them explicitly so parity field-checks
    them. `usage` especially (kypp credit-assignment / cost-routing consume it).
 
-**Cheapest falsifier (one real turn).** Evolve `smoke-sandbox.mjs` from `echo` to a real
-agent turn: drive opencode with a trivial prompt; a WS subscriber must see `message_start
-→ message_delta… → message_end → attention_required`, in order, `actor=a:opencode`. Proves
-opencode-in-Sandbox + SSE tail + TS mapper + §0 append + subscribe end-to-end, and directly
-measures risk #2. If it holds, the managed tier is real; if not, the wall is found cheaply.
-**Stays non-P0** — a spike to de-risk the option, not a tier build-out.
+**Cheapest falsifier result (2026-07-17): passed.** `smoke-agent.mjs` drove a
+real opencode turn; its subscriber observed `message_start → message_delta… →
+message_end → attention_required` in order, all stamped `actor=a:opencode`, in
+23.5 seconds. The subsequent Rust-managed live run also restored and finalized
+an agent-edited workspace through scoped R2 credentials. This proves the one-turn
+path, not sustained load or deploy-mid-turn recovery.
 
 ## Resolved by the research
 

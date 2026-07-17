@@ -1,10 +1,11 @@
 # Cloudflare Durable-Object-as-§0-gateway — spike
 
-A runnable `wrangler dev` spike proving the one load-bearing claim of the managed
-tier ([docs/managed-tier.md](../docs/managed-tier.md)): **a per-session Durable
-Object is the §0 sequencer + Subscribe fan-out, 1:1 with pillbox's local
-`SessionLog`.** Everything else (sandbox/container, vault/broker, actor-auth) is
-stubbed so the spike stays small.
+A runnable Cloudflare implementation proving the load-bearing claim of the
+managed tier ([docs/managed-tier.md](../docs/managed-tier.md)): **a per-session
+Durable Object is the §0 sequencer + Subscribe fan-out, 1:1 with pillbox's local
+`SessionLog`.** It began as a sequencer spike; it now includes actor auth, driver
+arbitration, a Sandbox/Container consume path, and the workspace
+provision/finalize endpoints used by the Rust `ManagedBackend`.
 
 > **✅ Validated live (2026-06-07)** — locally on `wrangler dev` AND **deployed on
 > real Cloudflare, free tier** (`https://pillbox-do-spike.vuluan-a06.workers.dev`):
@@ -22,14 +23,16 @@ stubbed so the spike stays small.
 > `wrangler.container.toml` = the **full** path (Sandbox container; `wrangler deploy
 > -c wrangler.container.toml`) — needs **Workers Paid** (Containers entitlement) and
 > builds linux/amd64 (so it deploys to CF even from an arm64 host, unlike local
-> `wrangler dev`). The container leg is validated to the hop boundary; full
-> container *execution* is the only Paid-gated piece.
+> `wrangler dev`). The paid path was live-validated end to end on 2026-07-17:
+> container exec, a streamed opencode turn, and the Rust-managed
+> snapshot→scoped-R2-provision→drive→scoped-R2-finalize→pull loop all passed.
 
 ## Why this is the right first slice
 
-This is **milestone 0 minus the container hop** — it isolates the §0-over-DO
-mechanics (seq persistence, hibernation replay+tail, reconnect-from-seq) before
-paying for the container. The keystone finding from the research: a DO is
+The free config remains **milestone 0 minus the container hop** — it isolates the
+§0-over-DO mechanics (seq persistence, hibernation replay+tail,
+reconnect-from-seq) without paying for the container. The keystone finding from
+the research: a DO is
 **single-threaded per id** and `ctx.storage.transactionSync` serializes appends,
 so **seq monotonicity is lock-free** — `MAX(seq)+1` inside a sync transaction,
 no distributed ordering, no lock primitive. The spec's feared "total-order under
@@ -82,20 +85,20 @@ dispatching on the input's `target`:
   order — the same §0 shape the local libkrun opencode path produces.
 
 The Sandbox SDK is a sibling container-owning DO (`[[containers]]` + a Dockerfile
-`FROM cloudflare/sandbox`), not this Agent. The exec hop is validated; the agent
-consume path is verified non-outward (tsc, the mapper logic gate, contract parity,
-the worker bundles) and its live falsifier (`smoke-agent.mjs`) needs the container
-deploy + a provider key (below) — arm64 hosts can't boot the amd64 container
-locally, so the real turn runs on a CF deploy.
+`FROM cloudflare/sandbox`), not this Agent. Both the exec hop and the real agent
+consume path are live-validated on a deployed Container; the non-outward gates
+(tsc, mapper fixtures, contract parity, worker bundle) cover the same path in CI.
+`smoke-agent.mjs` still needs a container deploy + provider key because arm64
+hosts cannot boot the amd64 container locally.
 
 > **⚠️ Local container execution blocked on Apple Silicon (arm64).** wrangler dev
 > builds the container for CF's prod platform (linux/**amd64**; the
 > `cloudflare/sandbox` base is amd64-only — no arm64 manifest), and wrangler's
 > local container runtime fails to boot that amd64 image on an arm64 host
 > (`Container failed to start`) — even though plain `docker run` emulates it fine.
-> So the §0 round-trip + the call path are proven, but the *container executes the
-> command* leg needs amd64: a deploy, or a Rosetta-capable local runtime. A real
-> CF-Containers-on-Apple-Silicon friction, not a wiring defect.
+> The remote deploy proves the container-execution leg; local execution still
+> needs amd64 or a Rosetta-capable runtime. This is Cloudflare Containers on
+> Apple Silicon friction, not a gateway wiring defect.
 
 **OUT (not in this spike)**: the GSV-cribbed hibernate-safe pending-op routing
 table (a driven turn whose container reply is in flight at hibernation must be
@@ -140,9 +143,14 @@ locally). One real opencode turn → the §0 stream, end to end:
 # 1. Secrets (never committed): the actor-token issuer + a provider key.
 npx wrangler secret put ACTOR_TOKEN_SECRET  -c wrangler.container.toml
 npx wrangler secret put ZAI_API_KEY         -c wrangler.container.toml   # GLM coding-plan; or ANTHROPIC_API_KEY / OPENCODE_CONFIG_JSON
-# 2. Deploy the container config (builds linux/amd64, so it works from arm64).
+# 2. Cross-build the current in-container workspace helper from the repo root.
+(cd .. && rustup target add x86_64-unknown-linux-gnu)
+(cd .. && cargo zigbuild --release --no-default-features \
+  --target x86_64-unknown-linux-gnu.2.31 --bin pillbox)
+cp ../target/x86_64-unknown-linux-gnu/release/pillbox ./pillbox-linux-amd64
+# 3. Deploy the container config (builds linux/amd64, so it works from arm64).
 npx wrangler deploy -c wrangler.container.toml
-# 3. Drive one turn (ACTOR_TOKEN_SECRET must match step 1's value).
+# 4. Drive one turn (ACTOR_TOKEN_SECRET must match step 1's value).
 ACTOR_TOKEN_SECRET=<same-secret> \
   node smoke-agent.mjs https://<your-worker>.workers.dev sess-1 zai-coding-plan/glm-4.5-air
 ```
@@ -242,11 +250,10 @@ dev`, `node smoke-actor.mjs` (401 without a token; body-claimed actor ignored;
   the container (Sandbox SDK backup/restore) while the DO + log persist. That's
   a container-lifecycle policy, not a §0 mechanic — out of spike.
 - **Done: the consume path** — `/input target:agent` drives a real opencode turn
-  and streams its `/event` SSE into §0 via the mapper (`smoke-agent.mjs`). The
-  unmeasured risk it leaves (Open Question #2: the DO holds a long-lived SSE for
-  the whole turn) is the live falsifier's to measure — run it on a CF deploy.
-- **Next slice (recommended): the Rust `ManagedBackend`** — once the falsifier
-  holds, add the third `SandboxBackend` impl + a `select_backend()` arm + a
-  `placement` field, so `pillbox run --managed` routes through the plane (the
-  LiveSession spine was built for exactly this). Alternatives: blobs→R2
-  (Milestone 3), or the deploy-mid-drive handoff probe (Milestone 1).
+  and streams its `/event` SSE into §0 via the mapper (`smoke-agent.mjs`). A live
+  23.5 s turn passed; sustained event rate and eviction during a turn remain
+  unmeasured.
+- **Done: the Rust `ManagedBackend` foreground loop** — the 2026-07-17 live run
+  proved snapshot, scoped-R2 provision, agent drive, scoped-R2 finalize, and
+  result pull. Next: the deploy-mid-drive handoff probe, detached finalization,
+  and DO-side teardown.

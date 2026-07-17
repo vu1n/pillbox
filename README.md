@@ -100,11 +100,15 @@ The managed path currently includes:
 - machine-checked Rust/TypeScript contract parity plus auth, arbitration,
   mapper, and workspace-credential tests.
 
-The Durable Object sequencer/replay path has run on Cloudflare's free tier. The
-container path and a complete foreground workspace round trip have also been
-validated on Cloudflare. That round-trip proof predates the temporary-credential
-scoping change; current session-token propagation is boundary-tested and still
-needs another paid-container live run. See the [runnable gateway
+The Durable Object sequencer/replay path has run on Cloudflare's free tier. On
+2026-07-17 the paid Container path also completed the current scoped-credential
+flow end to end: snapshot to encrypted rustic-on-R2, mint a prefix-scoped
+temporary credential, restore in the container, run a real opencode turn, mint a
+fresh credential, finalize, then pull the result through `pillbox session pull`.
+The pulled workspace contained the exact agent-written marker, and neither the
+106-event durable log nor the persisted session record contained the tested
+credential values. One observed run took 40.27 seconds; treat that as a proof
+sample, not a latency benchmark. See the [runnable gateway
 spike](./cloudflare-spike/README.md) and the [managed-tier
 design/implementation record](./docs/managed-tier.md).
 

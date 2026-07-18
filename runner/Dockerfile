@@ -110,18 +110,18 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 # @anthropic-ai/claude-code npm package, so Renovate tracks that as the
 # source of truth (the version string is passed to install.sh below).
 # renovate: datasource=npm depName=@anthropic-ai/claude-code
-ARG CLAUDE_VERSION=2.1.185
+ARG CLAUDE_VERSION=2.1.214
 # renovate: datasource=github-releases depName=openai/codex extractVersion=^rust-v(?<version>.*)$
-ARG CODEX_VERSION=0.141.0
+ARG CODEX_VERSION=0.144.5
 # renovate: datasource=npm depName=opencode-ai
-ARG OPENCODE_VERSION=1.17.9
+ARG OPENCODE_VERSION=1.18.3
 # renovate: datasource=npm depName=@earendil-works/pi-coding-agent
-ARG PI_VERSION=0.79.9
+ARG PI_VERSION=0.80.10
 # amp has no Renovate-trackable pin: its publish scheme is timestamp+sha
 # (e.g. 0.0.1782062050-gbe2b79), which Renovate's semver matcher can't
 # compare. Pinned anyway for a deterministic layer cache; bump by hand
 # (`npm view @ampcode/cli version`) when you want a newer amp.
-ARG AMP_VERSION=0.0.1782062050-gbe2b79
+ARG AMP_VERSION=0.0.1784350575-g714407
 
 RUN npm install -g \
 		@ampcode/cli@${AMP_VERSION} \

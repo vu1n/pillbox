@@ -238,10 +238,17 @@ fn guest_launch_preamble(ca_cert_pem: &str, gw_q: &str) -> String {
     // script file (see [`boot::boot_channel`]), which carries arbitrary bytes, so
     // the multi-line cert no longer needs the base64 detour the kernel cmdline
     // once forced.
+    // `update-ca-certificates` lives in /usr/sbin, but the guest PATH pillbox
+    // sets for the agent omits it — so the bare command resolved to "not found"
+    // and the CA install silently no-op'd, leaving codex's rustls to reject the
+    // vault MITM cert with `UnknownIssuer`. Prepend the sbin dirs so it resolves,
+    // and warn (not `|| true`) so a real failure is visible instead of silent.
+    // Mirrors the docker entrypoint fix (runner/entrypoint.sh).
     format!(
         "set -e; {net}; \
          printf '%s' {ca_q} > {GUEST_CA_PATH}; \
-         update-ca-certificates >/dev/null 2>&1 || true; \
+         PATH=/usr/sbin:/sbin:$PATH update-ca-certificates >/dev/null 2>&1 || \
+             echo 'pillbox: warning: update-ca-certificates failed; non-Node agents (Codex etc.) may reject the vault TLS cert' >&2; \
          mkdir -p {gw_q}; mount -t virtiofs workspace {gw_q}; cd {gw_q}",
         ca_q = shell_quote(ca_cert_pem),
     )

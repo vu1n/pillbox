@@ -4,6 +4,16 @@ import type { Actor, Event, Payload } from "./contract.js";
 import { bearerToken, verifyActorToken } from "./auth.js";
 import { OpencodeMapper } from "./opencode_mapper.js";
 import { workspaceExecEnv, type WorkspaceRepo } from "./workspace_repo.js";
+import {
+  canonicalJson,
+  deriveSessionGatewayName,
+  sha256Hex,
+  type EnsureSessionConflict,
+  type EnsureSessionRequest,
+  type EnsureSessionResult,
+  type SessionRef,
+  validateEnsureSessionRequest,
+} from "./huddles_runtime.js";
 import type { Env } from "./worker.js";
 
 // Per-connection state (the subscriber's replay cursor + its authenticated
@@ -17,6 +27,11 @@ import type { Env } from "./worker.js";
 // runs in production.) `actor` is the connection's verified identity (`undefined`
 // for an anonymous read-only subscriber).
 type WsState = { role: "subscriber"; cursor: number; actor?: Actor };
+type EnsureBindingRow = {
+  workspace_id: string;
+  effect_id: string;
+  canonical_request_hash: string;
+};
 
 // pillbox itself — the actor for events the gateway originates (the container-hop
 // exec result), as opposed to a producer- or human-submitted event.
@@ -71,6 +86,93 @@ export class SessionGateway extends Agent<Env> {
         payloadJson TEXT NOT NULL
       );
     `);
+    this.ensureBindingSchema();
+  }
+
+  private ensureBindingSchema(): void {
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS ensure_binding(
+        binding_id              INTEGER PRIMARY KEY CHECK(binding_id = 1),
+        workspace_id            TEXT NOT NULL,
+        effect_id               TEXT NOT NULL,
+        canonical_request_hash  TEXT NOT NULL,
+        canonical_request_json  TEXT NOT NULL,
+        created_at              TEXT NOT NULL
+      );
+    `);
+  }
+
+  /**
+   * Atomic, immutable binding for Huddles' at-least-once effect delivery. The
+   * DO name is derived by HuddlesRuntimeEntrypoint from the workspace/effect
+   * pair; the stored workspace and effect columns make that binding inspectable.
+   */
+  async ensureSession(request: EnsureSessionRequest): Promise<EnsureSessionResult> {
+    // Direct DO RPC does not reliably run the Agent lifecycle hook first.
+    this.ensureBindingSchema();
+    // Namespace holders can call the DO directly, so validate again at its boundary.
+    const validated = validateEnsureSessionRequest(request);
+    const canonicalRequestJson = canonicalJson(validated.canonical_request);
+    const requestHash = await sha256Hex(canonicalRequestJson);
+    const sessionName = await deriveSessionGatewayName(validated.workspace_id, validated.effect_id);
+    const sessionRef: SessionRef = { session_id: sessionName };
+    const requestedModel = validated.canonical_request.requested_model;
+
+    const outcome = this.ctx.storage.transactionSync(() => {
+      const row = this.ctx.storage.sql
+        .exec(
+          `SELECT workspace_id, effect_id, canonical_request_hash
+           FROM ensure_binding
+           WHERE binding_id = 1`,
+        )
+        .toArray()[0] as EnsureBindingRow | undefined;
+
+      if (!row) {
+        this.ctx.storage.sql.exec(
+          `INSERT INTO ensure_binding(
+             binding_id, workspace_id, effect_id, canonical_request_hash,
+             canonical_request_json, created_at
+           ) VALUES (1, ?, ?, ?, ?, ?)`,
+          validated.workspace_id,
+          validated.effect_id,
+          requestHash,
+          canonicalRequestJson,
+          nowRfc3339(),
+        );
+        return "created" as const;
+      }
+
+      if (
+        row.workspace_id === validated.workspace_id &&
+        row.effect_id === validated.effect_id &&
+        row.canonical_request_hash === requestHash
+      ) {
+        return "reused" as const;
+      }
+
+      // Workers RPC drops custom Error fields, so conflicts cross both RPC hops
+      // as a discriminated value instead of an exception.
+      return {
+        code: "ensure_session_conflict",
+        workspace_id: validated.workspace_id,
+        effect_id: validated.effect_id,
+        existing_request_hash: row.canonical_request_hash,
+        requested_request_hash: requestHash,
+      } satisfies EnsureSessionConflict;
+    });
+
+    if (typeof outcome !== "string") return outcome;
+    return {
+      session_ref: sessionRef,
+      disposition: outcome,
+      // P56 same-session served-model evidence is not present in this branch.
+      // Keep the absence explicit; requested != served must never be inferred.
+      attribution: {
+        requested_model: requestedModel,
+        served_model: null,
+        status: "unavailable",
+      },
+    };
   }
 
   // ── append + seq authority ────────────────────────────────────────────

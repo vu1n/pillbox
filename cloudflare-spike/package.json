@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "wrangler dev",
     "smoke": "node smoke.mjs",
-    "test": "node --test *.test.ts",
+    "test": "node --test *.test.ts *.test.mjs",
+    "smoke:ensure": "node --test ensure_session.test.mjs",
     "deploy": "wrangler deploy",
     "gen:contract": "json2ts -i contract.schema.json -o src/contract.generated.ts",
     "check:contract": "npm run gen:contract && git diff --exit-code src/contract.generated.ts"

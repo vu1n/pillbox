@@ -1,8 +1,12 @@
 import { routeAgentRequest } from "agents";
 import { proxyToSandbox, type Sandbox } from "@cloudflare/sandbox";
 import { SessionGateway } from "./session_gateway.js";
+import { HuddlesRuntimeEntrypoint } from "./huddles_runtime.js";
 
 export { SessionGateway };
+// Named entrypoint: Huddles reaches ensureSession through a same-account
+// service-binding RPC. The default fetch handler below never routes that method.
+export { HuddlesRuntimeEntrypoint };
 // Re-export the SDK's container-owning DO so wrangler can bind it.
 export { Sandbox } from "@cloudflare/sandbox";
 

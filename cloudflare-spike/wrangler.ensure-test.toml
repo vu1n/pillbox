@@ -1,0 +1,8 @@
+name = "pillbox-do-spike-ensure-test"
+main = "test/ensure_worker.ts"
+compatibility_date = "2026-06-01"
+
+[[services]]
+binding = "PillboxRuntime"
+service = "pillbox-do-spike"
+entrypoint = "HuddlesRuntimeEntrypoint"

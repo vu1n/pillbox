@@ -49,6 +49,39 @@ test("assistant turn: start (once) → text deltas → idle ends + raises NeedsI
   ]);
 });
 
+test("schema-bound assistant output maps once into the message evidence channel", () => {
+  const m = new OpencodeMapper();
+  const structured = {
+    kind: "document",
+    text: "# Grill\n\nChallenge the assumptions.",
+  };
+  assert.deepEqual(
+    m.onEvent(
+      ev("message.updated", {
+        sessionID: "ses_a",
+        info: { id: "msg_a", role: "assistant", structured },
+      }),
+    ),
+    [
+      { type: "message_start", messageId: "msg_a", role: "assistant" },
+      {
+        type: "message_delta",
+        messageId: "msg_a",
+        text: JSON.stringify(structured),
+      },
+    ],
+  );
+  assert.deepEqual(
+    m.onEvent(
+      ev("message.updated", {
+        sessionID: "ses_a",
+        info: { id: "msg_a", role: "assistant", structured },
+      }),
+    ),
+    [],
+  );
+});
+
 test("reasoning delta maps to thinking", () => {
   const m = new OpencodeMapper();
   assert.deepEqual(

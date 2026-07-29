@@ -90,6 +90,10 @@ export class OpencodeMapper {
   // MessageStarts without an ever-growing seen-set — opencode opens exactly one
   // assistant message per turn.
   private openMsg: string | null = null;
+  // The assistant message whose final schema-bound value has been emitted.
+  // OpenCode carries structured output on message.updated rather than text
+  // parts, so project it into the same MessageDelta evidence channel once.
+  private structuredMsg: string | null = null;
   // callID → last emitted (mapped) tool status, so a ToolCall is emitted only on
   // a status transition, not on every input-stream tick.
   private toolStatus = new Map<string, string>();
@@ -116,6 +120,7 @@ export class OpencodeMapper {
           out.push({ type: "message_end", messageId: this.openMsg });
           this.openMsg = null;
         }
+        this.structuredMsg = null;
         out.push(attention("needs_input"));
         return out;
       }
@@ -130,15 +135,28 @@ export class OpencodeMapper {
     }
   }
 
-  // `message.updated` — open an assistant message on its first sighting. User
-  // messages (the echo of our prompt) and repeat updates produce nothing.
+  // `message.updated` — open an assistant message on its first sighting and
+  // project OpenCode's final schema-bound value into the text evidence channel.
+  // User messages and repeats without new structured output produce nothing.
   private onMessageUpdated(p: any): Payload[] {
     const info = p?.info ?? {};
     const role: string = info.role ?? "";
     const id: string = info.id ?? "";
-    if (role !== "assistant" || id === "" || this.openMsg === id) return [];
-    this.openMsg = id;
-    return [{ type: "message_start", messageId: id, role: "assistant" }];
+    if (role !== "assistant" || id === "") return [];
+    const out: Payload[] = [];
+    if (this.openMsg !== id) {
+      this.openMsg = id;
+      out.push({ type: "message_start", messageId: id, role: "assistant" });
+    }
+    if (info.structured !== undefined && this.structuredMsg !== id) {
+      this.structuredMsg = id;
+      out.push({
+        type: "message_delta",
+        messageId: id,
+        text: JSON.stringify(info.structured),
+      });
+    }
+    return out;
   }
 
   // `message.part.delta` — streaming content. `field` selects the §0 channel:

@@ -1,9 +1,22 @@
-import { Agent, type Connection, type ConnectionContext, type WSMessage } from "agents";
+import {
+  Agent,
+  type Connection,
+  type ConnectionContext,
+  type WSMessage,
+} from "agents";
 import { getSandbox } from "@cloudflare/sandbox";
 import type { Actor, Event, Payload } from "./contract.js";
 import { bearerToken, verifyActorToken } from "./auth.js";
 import { OpencodeMapper } from "./opencode_mapper.js";
 import { workspaceExecEnv, type WorkspaceRepo } from "./workspace_repo.js";
+import {
+  classifyRunningInvocation,
+  enforceHuddlesOpencodePolicy,
+  huddlesPromptTools,
+  isHuddlesSessionName,
+  type HuddlesOpencodeConfig,
+  type HuddlesToolPolicy,
+} from "./huddles_policy.js";
 import {
   canonicalJson,
   deriveSessionGatewayName,
@@ -11,8 +24,12 @@ import {
   type EnsureSessionConflict,
   type EnsureSessionRequest,
   type EnsureSessionResult,
+  type InvokeSessionRequest,
+  type InvokeSessionResult,
+  type JsonValue,
   type SessionRef,
   validateEnsureSessionRequest,
+  validateInvokeSessionRequest,
 } from "./huddles_runtime.js";
 import type { Env } from "./worker.js";
 
@@ -31,6 +48,7 @@ type EnsureBindingRow = {
   workspace_id: string;
   effect_id: string;
   canonical_request_hash: string;
+  canonical_request_json: string;
 };
 
 // pillbox itself — the actor for events the gateway originates (the container-hop
@@ -44,6 +62,7 @@ const SYSTEM_ACTOR: Actor = { kind: "system", id: "pillbox" };
 // (contract.rs prefixes the id with `a:`), so the same turn reads identically
 // whether it ran on libkrun or managed CF.
 const AGENT_ACTOR: Actor = { kind: "agent", id: "a:opencode" };
+const HUDDLES_ACTOR: Actor = { kind: "service", id: "svc:huddles" };
 
 // opencode consume-path constants — kept aligned with src/sandbox/opencode.rs.
 // The working directory the in-container opencode session operates in.
@@ -62,22 +81,29 @@ const TURN_TIMEOUT_MS = 300_000; // 5 min
 // container, far exceeding a turn's interactivity — give it a generous wall clock.
 const WORKSPACE_XFER_TIMEOUT_MS = 300_000; // 5 min
 
-// Minimal shape of the opencode `config` overlay we construct/merge (the full
-// type lives in @opencode-ai/sdk, not installed here). Provider → { options.apiKey }.
-type OcConfig = {
-  provider?: Record<string, { options?: { apiKey?: string } }>;
-} & Record<string, unknown>;
-
 // Payload types a producer may NOT submit via /event — each is a human/gateway
 // action with its own authenticated route (arbitration / /input / /annotation /
 // the grader), so accepting them on the open producer channel would let a token
 // forge them.
-const PRODUCER_FORBIDDEN = new Set(["driver_changed", "input", "annotation", "scored"]);
+const PRODUCER_FORBIDDEN = new Set([
+  "driver_changed",
+  "input",
+  "annotation",
+  "scored",
+]);
 
 export class SessionGateway extends Agent<Env> {
+  // Durable rows survive isolate loss; ownership does not. A running row whose
+  // exact invocation is absent here was interrupted and must never be resampled.
+  private readonly activeHuddlesInvocations = new Set<string>();
+
   // Agents-SDK lifecycle hook (replaces the constructor's table create). The §0
   // log is our own SQLite table, not Agent state — full control, no sync.
   onStart(): void {
+    this.ensureBindingSchema();
+  }
+
+  private ensureBindingSchema(): void {
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS log(
         seq         INTEGER PRIMARY KEY,
@@ -85,12 +111,6 @@ export class SessionGateway extends Agent<Env> {
         actorJson   TEXT,
         payloadJson TEXT NOT NULL
       );
-    `);
-    this.ensureBindingSchema();
-  }
-
-  private ensureBindingSchema(): void {
-    this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS ensure_binding(
         binding_id              INTEGER PRIMARY KEY CHECK(binding_id = 1),
         workspace_id            TEXT NOT NULL,
@@ -98,6 +118,15 @@ export class SessionGateway extends Agent<Env> {
         canonical_request_hash  TEXT NOT NULL,
         canonical_request_json  TEXT NOT NULL,
         created_at              TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS huddles_invocation(
+        invocation_id          TEXT PRIMARY KEY,
+        request_hash           TEXT NOT NULL,
+        request_json           TEXT NOT NULL,
+        status                 TEXT NOT NULL CHECK(status IN ('running', 'completed', 'failed')),
+        result_json            TEXT,
+        created_at             TEXT NOT NULL,
+        completed_at           TEXT
       );
     `);
   }
@@ -107,21 +136,26 @@ export class SessionGateway extends Agent<Env> {
    * DO name is derived by HuddlesRuntimeEntrypoint from the workspace/effect
    * pair; the stored workspace and effect columns make that binding inspectable.
    */
-  async ensureSession(request: EnsureSessionRequest): Promise<EnsureSessionResult> {
+  async ensureSession(
+    request: EnsureSessionRequest,
+  ): Promise<EnsureSessionResult> {
     // Direct DO RPC does not reliably run the Agent lifecycle hook first.
     this.ensureBindingSchema();
     // Namespace holders can call the DO directly, so validate again at its boundary.
     const validated = validateEnsureSessionRequest(request);
     const canonicalRequestJson = canonicalJson(validated.canonical_request);
     const requestHash = await sha256Hex(canonicalRequestJson);
-    const sessionName = await deriveSessionGatewayName(validated.workspace_id, validated.effect_id);
+    const sessionName = await deriveSessionGatewayName(
+      validated.workspace_id,
+      validated.effect_id,
+    );
     const sessionRef: SessionRef = { session_id: sessionName };
     const requestedModel = validated.canonical_request.requested_model;
 
     const outcome = this.ctx.storage.transactionSync(() => {
       const row = this.ctx.storage.sql
         .exec(
-          `SELECT workspace_id, effect_id, canonical_request_hash
+          `SELECT workspace_id, effect_id, canonical_request_hash, canonical_request_json
            FROM ensure_binding
            WHERE binding_id = 1`,
         )
@@ -162,6 +196,7 @@ export class SessionGateway extends Agent<Env> {
     });
 
     if (typeof outcome !== "string") return outcome;
+    this.closeManagedSessionConnections();
     return {
       session_ref: sessionRef,
       disposition: outcome,
@@ -175,6 +210,266 @@ export class SessionGateway extends Agent<Env> {
     };
   }
 
+  /**
+   * Drive one exact Huddles delivery in the already-ensured session. The
+   * invocation row is claimed before crossing into the container, so concurrent
+   * or delayed retries cannot sample a second turn under the same identity.
+   */
+  async invokeSession(
+    request: InvokeSessionRequest,
+  ): Promise<InvokeSessionResult> {
+    this.ensureBindingSchema();
+    const validated = await validateInvokeSessionRequest(request);
+    const ensure = this.ensureBinding();
+    const expectedSessionId = await deriveSessionGatewayName(
+      validated.workspace_id,
+      validated.effect_id,
+    );
+    if (
+      !ensure ||
+      ensure.workspace_id !== validated.workspace_id ||
+      ensure.effect_id !== validated.effect_id ||
+      validated.session_ref.session_id !== expectedSessionId
+    ) {
+      throw new Error("invoke request does not match the ensured session");
+    }
+    const canonicalSession = JSON.parse(ensure.canonical_request_json) as {
+      requested_model?: unknown;
+      harness?: unknown;
+    };
+    if (
+      canonicalSession.requested_model !== validated.requested_model ||
+      canonicalSession.harness !== validated.harness
+    ) {
+      throw new Error(
+        "invoke request execution does not match the ensured session",
+      );
+    }
+
+    const requestJson = canonicalJson(validated as unknown as JsonValue);
+    const requestHash = await sha256Hex(requestJson);
+    const existing = this.invocation(validated.invocation_id);
+    if (existing) {
+      if (existing.request_hash !== requestHash) {
+        return {
+          code: "invoke_session_conflict",
+          workspace_id: validated.workspace_id,
+          effect_id: validated.effect_id,
+          invocation_id: validated.invocation_id,
+          existing_request_hash: existing.request_hash,
+          requested_request_hash: requestHash,
+        };
+      }
+      if (existing.result_json) {
+        return {
+          ...(JSON.parse(existing.result_json) as Exclude<
+            InvokeSessionResult,
+            { readonly code: string }
+          >),
+          disposition: "reused",
+        };
+      }
+      if (
+        classifyRunningInvocation(
+          this.activeHuddlesInvocations.has(validated.invocation_id),
+        ) === "interrupted"
+      ) {
+        return this.recoverInterruptedHuddlesInvocation(validated);
+      }
+      return {
+        status: "running",
+        disposition: "reused",
+        session_ref: validated.session_ref,
+      };
+    }
+
+    this.ctx.storage.sql.exec(
+      `INSERT INTO huddles_invocation(
+         invocation_id, request_hash, request_json, status, result_json, created_at, completed_at
+       ) VALUES (?, ?, ?, 'running', NULL, ?, NULL)`,
+      validated.invocation_id,
+      requestHash,
+      requestJson,
+      nowRfc3339(),
+    );
+
+    this.activeHuddlesInvocations.add(validated.invocation_id);
+    try {
+      const inputEvent = this.append(nowRfc3339(), HUDDLES_ACTOR, {
+        type: "input",
+        text: validated.rendered_input,
+        target: "agent",
+      });
+      if (!this.env.Sandbox) {
+        this.appendAgentError(
+          "managed invocation requires the Cloudflare Sandbox binding",
+        );
+        return this.finishHuddlesInvocation(validated, {
+          status: "failed",
+          disposition: "created",
+          session_ref: {
+            session_id: validated.session_ref.session_id,
+            seq_range: [inputEvent.seq, this.head()],
+          },
+          error: {
+            code: "runtime_unavailable",
+            message: "Pillbox managed runner has no Cloudflare Sandbox binding",
+          },
+        });
+      }
+
+      await this.driveAgent(
+        getSandbox(this.env.Sandbox, this.name),
+        validated.rendered_input,
+        validated.requested_model,
+        validated.tool_policy,
+      );
+      const lastSeq = this.head();
+      const turn = this.huddlesTurn(inputEvent.seq, lastSeq);
+      const sessionRef: SessionRef = {
+        session_id: validated.session_ref.session_id,
+        seq_range: [inputEvent.seq, lastSeq],
+      };
+      return turn.error
+        ? this.finishHuddlesInvocation(validated, {
+            status: "failed",
+            disposition: "created",
+            session_ref: sessionRef,
+            error: { code: "runtime_failed", message: turn.error },
+          })
+        : this.finishHuddlesInvocation(validated, {
+            status: "completed",
+            disposition: "created",
+            session_ref: sessionRef,
+            output_text: turn.output,
+          });
+    } catch {
+      const failure = this.appendAgentError(
+        "managed invocation interrupted before a terminal result",
+      );
+      return this.finishHuddlesInvocation(validated, {
+        status: "failed",
+        disposition: "created",
+        session_ref: {
+          session_id: validated.session_ref.session_id,
+          seq_range: [failure.seq, failure.seq],
+        },
+        error: {
+          code: "runtime_failed",
+          message: "Pillbox managed invocation failed",
+        },
+      });
+    } finally {
+      this.activeHuddlesInvocations.delete(validated.invocation_id);
+    }
+  }
+
+  /** Worker routing guard; private service-binding RPC methods bypass public fetch. */
+  publicAccessAllowed(): boolean {
+    this.ensureBindingSchema();
+    // The route hook rejects reserved names before this RPC. Avoid reading
+    // Agent.name here: workerd has not attached it to stubs used by hook RPC.
+    return !this.isHuddlesManaged();
+  }
+
+  private recoverInterruptedHuddlesInvocation(
+    request: InvokeSessionRequest,
+  ): InvokeSessionResult {
+    const evidence = this.appendAgentError(
+      "managed invocation owner disappeared before a terminal result",
+    );
+    const result = this.finishHuddlesInvocation(request, {
+      status: "failed",
+      disposition: "created",
+      session_ref: {
+        session_id: request.session_ref.session_id,
+        seq_range: [evidence.seq, evidence.seq],
+      },
+      error: {
+        code: "runtime_failed",
+        message: "Pillbox managed invocation was interrupted",
+      },
+    });
+    return { ...result, disposition: "reused" };
+  }
+
+  private ensureBinding(): EnsureBindingRow | undefined {
+    return this.ctx.storage.sql
+      .exec(
+        `SELECT workspace_id, effect_id, canonical_request_hash, canonical_request_json
+         FROM ensure_binding WHERE binding_id = 1`,
+      )
+      .toArray()[0] as EnsureBindingRow | undefined;
+  }
+
+  private invocation(
+    invocationId: string,
+  ): { request_hash: string; result_json: string | null } | undefined {
+    return this.ctx.storage.sql
+      .exec(
+        `SELECT request_hash, result_json
+         FROM huddles_invocation WHERE invocation_id = ?`,
+        invocationId,
+      )
+      .toArray()[0] as
+      | { request_hash: string; result_json: string | null }
+      | undefined;
+  }
+
+  private huddlesTurn(
+    firstSeq: number,
+    lastSeq: number,
+  ): { output: string; error?: string } {
+    let output = "";
+    let error: string | undefined;
+    const rows = this.ctx.storage.sql
+      .exec(
+        `SELECT payloadJson FROM log
+         WHERE seq >= ? AND seq <= ? ORDER BY seq ASC`,
+        firstSeq,
+        lastSeq,
+      )
+      .toArray() as { payloadJson: string }[];
+    for (const row of rows) {
+      const payload = JSON.parse(row.payloadJson) as Payload;
+      if (
+        payload.type === "message_delta" &&
+        typeof payload.text === "string"
+      ) {
+        output += payload.text;
+      }
+      if (
+        payload.type === "attention_required" &&
+        payload.reason === "error_stalled" &&
+        typeof payload.message === "string"
+      ) {
+        error = payload.message || "agent turn failed";
+      }
+    }
+    if (!error && output.trim().length === 0)
+      error = "agent turn produced no text output";
+    return error ? { output, error } : { output };
+  }
+
+  private finishHuddlesInvocation(
+    request: InvokeSessionRequest,
+    result: Exclude<
+      InvokeSessionResult,
+      { readonly code: string } | { readonly status: "running" }
+    >,
+  ): InvokeSessionResult {
+    this.ctx.storage.sql.exec(
+      `UPDATE huddles_invocation
+       SET status = ?, result_json = ?, completed_at = ?
+       WHERE invocation_id = ? AND status = 'running'`,
+      result.status,
+      JSON.stringify(result),
+      nowRfc3339(),
+      request.invocation_id,
+    );
+    return result;
+  }
+
   // ── append + seq authority ────────────────────────────────────────────
   // EventLog::append — resident-sequencer placement (1:1 with the local
   // src/events/log.rs::SessionLog::append, which is the co-located single-writer
@@ -186,7 +481,11 @@ export class SessionGateway extends Agent<Env> {
   // counter, so it survives eviction (the DO analogue of SessionLog recovering
   // last_seq from log.jsonl on open). This is a DO primitive the Agent class
   // inherits, so adopting `Agent` costs the keystone nothing.
-  private append(at: string, actor: Actor | undefined, payload: Payload): Event {
+  private append(
+    at: string,
+    actor: Actor | undefined,
+    payload: Payload,
+  ): Event {
     const seq = this.ctx.storage.transactionSync(() => {
       const row = this.ctx.storage.sql
         .exec("SELECT COALESCE(MAX(seq), 0) AS m FROM log")
@@ -213,6 +512,10 @@ export class SessionGateway extends Agent<Env> {
   // (routeAgentRequest forwards the request; WS upgrades go to onConnect instead).
   // Dispatch on the trailing path.
   async onRequest(req: Request): Promise<Response> {
+    this.ensureBindingSchema();
+    if (this.isHuddlesPrivate()) {
+      return new Response("not found\n", { status: 404 });
+    }
     const path = new URL(req.url).pathname;
     if (path.endsWith("/event")) return this.handleEvent(req);
     if (path.endsWith("/input")) return this.handleInput(req);
@@ -237,7 +540,10 @@ export class SessionGateway extends Agent<Env> {
   private static readonly DRIVER_KEY = "driver";
 
   private async currentDriver(): Promise<Actor | undefined> {
-    return (await this.ctx.storage.get<Actor>(SessionGateway.DRIVER_KEY)) ?? undefined;
+    return (
+      (await this.ctx.storage.get<Actor>(SessionGateway.DRIVER_KEY)) ??
+      undefined
+    );
   }
 
   private async setDriver(actor: Actor | undefined): Promise<void> {
@@ -250,7 +556,10 @@ export class SessionGateway extends Agent<Env> {
   // convention as `requireActor`), or `null` when `actor` may drive — claiming a
   // free slot or stealing an occupied one (driver_changed granted|stolen); a no-op
   // when `actor` is already the driver.
-  private async ensureDriver(actor: Actor, wantsSteal: boolean): Promise<Response | null> {
+  private async ensureDriver(
+    actor: Actor,
+    wantsSteal: boolean,
+  ): Promise<Response | null> {
     const driver = await this.currentDriver();
     if (!driver) {
       await this.setDriver(actor);
@@ -270,7 +579,12 @@ export class SessionGateway extends Agent<Env> {
     to: Actor | undefined,
     mode: "granted" | "stolen" | "released",
   ): Event {
-    return this.append(nowRfc3339(), SYSTEM_ACTOR, { type: "driver_changed", from, to, mode });
+    return this.append(nowRfc3339(), SYSTEM_ACTOR, {
+      type: "driver_changed",
+      from,
+      to,
+      mode,
+    });
   }
 
   // The /event producer path → EventLog::append. A producer (the in-sandbox §0
@@ -296,9 +610,18 @@ export class SessionGateway extends Agent<Env> {
     // authenticated paths (ensureDriver / /input / the grader). Reject them here so
     // a producer token can't forge them into the §0 log through the wrong door.
     if (PRODUCER_FORBIDDEN.has((body.payload as Payload).type)) {
-      return json({ error: `payload type '${(body.payload as Payload).type}' not allowed on /event` }, 403);
+      return json(
+        {
+          error: `payload type '${(body.payload as Payload).type}' not allowed on /event`,
+        },
+        403,
+      );
     }
-    const ev = this.append(body.at ?? nowRfc3339(), actor, body.payload as Payload);
+    const ev = this.append(
+      body.at ?? nowRfc3339(),
+      actor,
+      body.payload as Payload,
+    );
     return json({ seq: ev.seq, head: this.head() });
   }
 
@@ -337,7 +660,9 @@ export class SessionGateway extends Agent<Env> {
     // Arbitration gates the drive (who MAY drive, not just who they are). The
     // steal signal rides `?steal=1` or body `mode:"steal"` — a request-only flag,
     // not stored on the event (`Input` is always a discrete turn).
-    const wantsSteal = body.mode === "steal" || new URL(req.url).searchParams.get("steal") === "1";
+    const wantsSteal =
+      body.mode === "steal" ||
+      new URL(req.url).searchParams.get("steal") === "1";
     const denied = await this.ensureDriver(actor, wantsSteal);
     if (denied) return denied;
 
@@ -349,7 +674,13 @@ export class SessionGateway extends Agent<Env> {
     // — the attributed-input §0 path still works, just without the exec hop.
     if (this.env.Sandbox) {
       const model = body.model ?? this.env.OPENCODE_MODEL ?? DEFAULT_MODEL;
-      await this.driveSandbox(this.env.Sandbox, inEv.seq, body.text ?? "", target, model);
+      await this.driveSandbox(
+        this.env.Sandbox,
+        inEv.seq,
+        body.text ?? "",
+        target,
+        model,
+      );
     }
     return json({ seq: inEv.seq, head: this.head() });
   }
@@ -363,7 +694,11 @@ export class SessionGateway extends Agent<Env> {
     const actor = await this.requireActor(req);
     if (actor instanceof Response) return actor;
     const body = (await req.json()) as { text?: string; anchor?: string };
-    const payload: Payload = { type: "annotation", text: body.text ?? "", anchor: body.anchor };
+    const payload: Payload = {
+      type: "annotation",
+      text: body.text ?? "",
+      anchor: body.anchor,
+    };
     const ev = this.append(nowRfc3339(), actor, payload);
     return json({ seq: ev.seq, head: this.head() });
   }
@@ -445,15 +780,28 @@ export class SessionGateway extends Agent<Env> {
     const denied = await this.ensureDriver(actor, false); // provisioning claims the slot
     if (denied) return denied;
     if (!this.env.Sandbox) {
-      return json({ error: "no container bound — managed provisioning needs the Sandbox binding" }, 503);
+      return json(
+        {
+          error:
+            "no container bound — managed provisioning needs the Sandbox binding",
+        },
+        503,
+      );
     }
     const w = (
       (await req.json()) as {
-        workspace?: { repo?: WorkspaceRepo; password?: string; snapshot?: string };
+        workspace?: {
+          repo?: WorkspaceRepo;
+          password?: string;
+          snapshot?: string;
+        };
       }
     ).workspace;
     if (!w?.repo || !w.password || !w.snapshot) {
-      return json({ error: "provision needs {workspace:{repo,password,snapshot}}" }, 400);
+      return json(
+        { error: "provision needs {workspace:{repo,password,snapshot}}" },
+        400,
+      );
     }
     const sandbox = getSandbox(this.env.Sandbox, this.name);
     const res = await this.execWorkspaceTool(
@@ -463,10 +811,21 @@ export class SessionGateway extends Agent<Env> {
       w.password,
     );
     if (!res.ok) {
-      this.appendWorkspaceXfer("workspace.restore", "failed", redactXfer(res.detail));
-      return json({ error: `workspace restore failed: ${redactXfer(res.detail)}` }, 502);
+      this.appendWorkspaceXfer(
+        "workspace.restore",
+        "failed",
+        redactXfer(res.detail),
+      );
+      return json(
+        { error: `workspace restore failed: ${redactXfer(res.detail)}` },
+        502,
+      );
     }
-    this.appendWorkspaceXfer("workspace.restore", "completed", `restored ${w.snapshot} → ${OPENCODE_DIR}`);
+    this.appendWorkspaceXfer(
+      "workspace.restore",
+      "completed",
+      `restored ${w.snapshot} → ${OPENCODE_DIR}`,
+    );
     return json({ ok: true });
   }
 
@@ -476,26 +835,60 @@ export class SessionGateway extends Agent<Env> {
     const denied = await this.ensureDriver(actor, false);
     if (denied) return denied;
     if (!this.env.Sandbox) {
-      return json({ error: "no container bound — managed finalize needs the Sandbox binding" }, 503);
+      return json(
+        {
+          error:
+            "no container bound — managed finalize needs the Sandbox binding",
+        },
+        503,
+      );
     }
-    const w = ((await req.json()) as { workspace?: { repo?: WorkspaceRepo; password?: string } }).workspace;
+    const w = (
+      (await req.json()) as {
+        workspace?: { repo?: WorkspaceRepo; password?: string };
+      }
+    ).workspace;
     if (!w?.repo || !w.password) {
       return json({ error: "finalize needs {workspace:{repo,password}}" }, 400);
     }
     const sandbox = getSandbox(this.env.Sandbox, this.name);
-    const res = await this.execWorkspaceTool(sandbox, workspaceCmd("backup", w.repo), w.repo, w.password);
+    const res = await this.execWorkspaceTool(
+      sandbox,
+      workspaceCmd("backup", w.repo),
+      w.repo,
+      w.password,
+    );
     if (!res.ok) {
-      this.appendWorkspaceXfer("workspace.backup", "failed", redactXfer(res.detail));
-      return json({ error: `workspace backup failed: ${redactXfer(res.detail)}` }, 502);
+      this.appendWorkspaceXfer(
+        "workspace.backup",
+        "failed",
+        redactXfer(res.detail),
+      );
+      return json(
+        { error: `workspace backup failed: ${redactXfer(res.detail)}` },
+        502,
+      );
     }
     // `pillbox workspace backup` prints the new snapshot handle as its final stdout
     // line — that's the result handle the host records for `session pull`.
-    const resultSnapshot = res.stdout.trim().split("\n").filter(Boolean).pop() ?? "";
+    const resultSnapshot =
+      res.stdout.trim().split("\n").filter(Boolean).pop() ?? "";
     if (!resultSnapshot) {
-      this.appendWorkspaceXfer("workspace.backup", "failed", "no snapshot handle on stdout");
-      return json({ error: "workspace backup produced no snapshot handle" }, 502);
+      this.appendWorkspaceXfer(
+        "workspace.backup",
+        "failed",
+        "no snapshot handle on stdout",
+      );
+      return json(
+        { error: "workspace backup produced no snapshot handle" },
+        502,
+      );
     }
-    this.appendWorkspaceXfer("workspace.backup", "completed", `snapshot ${resultSnapshot}`);
+    this.appendWorkspaceXfer(
+      "workspace.backup",
+      "completed",
+      `snapshot ${resultSnapshot}`,
+    );
     return json({ resultSnapshot });
   }
 
@@ -515,7 +908,10 @@ export class SessionGateway extends Agent<Env> {
     let lastErr = "";
     for (let attempt = 0; attempt < 60; attempt++) {
       try {
-        const res = await sandbox.exec(cmd, { env, timeout: WORKSPACE_XFER_TIMEOUT_MS });
+        const res = await sandbox.exec(cmd, {
+          env,
+          timeout: WORKSPACE_XFER_TIMEOUT_MS,
+        });
         return {
           ok: res.success,
           detail: [res.stdout, res.stderr].filter(Boolean).join("\n"),
@@ -531,7 +927,11 @@ export class SessionGateway extends Agent<Env> {
   }
 
   // A §0 record of a workspace transfer — non-secret coordinates + status only.
-  private appendWorkspaceXfer(name: string, status: string, output: string): void {
+  private appendWorkspaceXfer(
+    name: string,
+    status: string,
+    output: string,
+  ): void {
     this.append(nowRfc3339(), SYSTEM_ACTOR, {
       type: "tool_call",
       toolCallId: name,
@@ -559,10 +959,13 @@ export class SessionGateway extends Agent<Env> {
     sandbox: ReturnType<typeof getSandbox>,
     text: string,
     model: string,
+    toolPolicy?: HuddlesToolPolicy,
   ): Promise<void> {
     const [provider, modelId] = splitModel(model);
     if (!modelId) {
-      this.appendAgentError(`model must be 'provider/modelID' (got '${model}')`);
+      this.appendAgentError(
+        `model must be 'provider/modelID' (got '${model}')`,
+      );
       return;
     }
     const port = OPENCODE_PORT;
@@ -574,15 +977,39 @@ export class SessionGateway extends Agent<Env> {
     // config from OPENCODE_CONFIG_CONTENT.
     let cfg: { config?: unknown; env: Record<string, string> };
     try {
-      cfg = this.opencodeConfig();
+      cfg = this.opencodeConfig(toolPolicy);
     } catch (e) {
       this.appendAgentError(`opencode provider config: ${String(e)}`);
       return;
     }
     let probe = await this.probeDoc(sandbox, port);
+    if (toolPolicy && probe.ok) {
+      // An older deployment may have left a permissive server on this port.
+      // The managed invocation owns a fresh OpenCode session anyway, so replace
+      // the server and prove this turn booted with the sealed deny policy.
+      try {
+        await sandbox.killAllProcesses();
+      } catch {
+        this.appendAgentError(
+          "could not replace an existing OpenCode server with the sealed tool policy",
+        );
+        return;
+      }
+      for (let attempt = 0; attempt < 20 && probe.ok; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        probe = await this.probeDoc(sandbox, port);
+      }
+      if (probe.ok) {
+        this.appendAgentError(
+          "existing OpenCode server remained reachable after policy reset",
+        );
+        return;
+      }
+    }
     if (!probe.ok) {
       const env: Record<string, string> = { ...cfg.env };
-      if (cfg.config !== undefined) env.OPENCODE_CONFIG_CONTENT = JSON.stringify(cfg.config);
+      if (cfg.config !== undefined)
+        env.OPENCODE_CONFIG_CONTENT = JSON.stringify(cfg.config);
       // Cold-start: a fresh container boots on first use and startProcess throws
       // "Container is starting" until it's up — retry that transient (mirrors
       // driveExec's cold-start handling; the agent path self-handles cold start so
@@ -591,9 +1018,12 @@ export class SessionGateway extends Agent<Env> {
       let started = false;
       for (let attempt = 0; attempt < 60; attempt++) {
         try {
-          await sandbox.startProcess(`cd ${OPENCODE_DIR} && opencode serve --port ${port} --hostname 0.0.0.0`, {
-            env: Object.keys(env).length > 0 ? env : undefined,
-          });
+          await sandbox.startProcess(
+            `cd ${OPENCODE_DIR} && opencode serve --port ${port} --hostname 0.0.0.0`,
+            {
+              env: Object.keys(env).length > 0 ? env : undefined,
+            },
+          );
           started = true;
           break;
         } catch (e) {
@@ -613,7 +1043,9 @@ export class SessionGateway extends Agent<Env> {
         probe = await this.probeDoc(sandbox, port);
       }
       if (!probe.ok) {
-        this.appendAgentError(`opencode not ready after boot (last probe: ${probe.detail})`);
+        this.appendAgentError(
+          `opencode not ready after boot (last probe: ${probe.detail})`,
+        );
         return;
       }
     }
@@ -621,7 +1053,9 @@ export class SessionGateway extends Agent<Env> {
     // against a timeout — a streaming fetch can't carry an AbortSignal without
     // capping the whole stream, so a stuck open fails loud instead of hanging.
     const evResp = (await Promise.race([
-      this.ocFetch(sandbox, port, "GET", "/event", undefined, { accept: "text/event-stream" }),
+      this.ocFetch(sandbox, port, "GET", "/event", undefined, {
+        accept: "text/event-stream",
+      }),
       new Promise<null>((r) => setTimeout(() => r(null), 20000)),
     ])) as Response | null;
     if (!evResp) {
@@ -629,15 +1063,26 @@ export class SessionGateway extends Agent<Env> {
       return;
     }
     if (!evResp.ok || !evResp.body) {
-      this.appendAgentError(`opencode /event stream failed (HTTP ${evResp.status})`);
+      this.appendAgentError(
+        `opencode /event stream failed (HTTP ${evResp.status})`,
+      );
       return;
     }
     // Fresh opencode session, then drive it (bounded request/response calls).
     let ocSession: string;
     try {
-      const created = await this.ocFetchT(sandbox, port, "POST", "/session", {}, 30000);
+      const created = await this.ocFetchT(
+        sandbox,
+        port,
+        "POST",
+        "/session",
+        {},
+        30000,
+      );
       if (!created.ok) {
-        this.appendAgentError(`opencode create session failed (HTTP ${created.status})`);
+        this.appendAgentError(
+          `opencode create session failed (HTTP ${created.status})`,
+        );
         return;
       }
       const id = ((await created.json()) as { id?: string }).id;
@@ -647,7 +1092,9 @@ export class SessionGateway extends Agent<Env> {
       }
       ocSession = id;
     } catch (e) {
-      this.appendAgentError(`opencode create session error: ${String(e).slice(0, 100)}`);
+      this.appendAgentError(
+        `opencode create session error: ${String(e).slice(0, 100)}`,
+      );
       return;
     }
     try {
@@ -656,15 +1103,25 @@ export class SessionGateway extends Agent<Env> {
         port,
         "POST",
         `/session/${ocSession}/prompt_async`,
-        { parts: [{ type: "text", text }], model: { providerID: provider, modelID: modelId } },
+        {
+          parts: [{ type: "text", text }],
+          model: { providerID: provider, modelID: modelId },
+          ...(toolPolicy
+            ? { tools: huddlesPromptTools(toolPolicy) }
+            : undefined),
+        },
         30000,
       );
       if (prompted.status < 200 || prompted.status >= 300) {
-        this.appendAgentError(`opencode prompt failed (HTTP ${prompted.status})`);
+        this.appendAgentError(
+          `opencode prompt failed (HTTP ${prompted.status})`,
+        );
         return;
       }
     } catch (e) {
-      this.appendAgentError(`opencode prompt error: ${String(e).slice(0, 100)}`);
+      this.appendAgentError(
+        `opencode prompt error: ${String(e).slice(0, 100)}`,
+      );
       return;
     }
     // Tail the SSE through the mapper → §0; stamped AGENT_ACTOR (the trust boundary).
@@ -706,7 +1163,9 @@ export class SessionGateway extends Agent<Env> {
         break;
       }
       if (Date.now() > deadline) {
-        this.appendAgentError(`agent turn exceeded ${TURN_TIMEOUT_MS / 1000}s without going idle`);
+        this.appendAgentError(
+          `agent turn exceeded ${TURN_TIMEOUT_MS / 1000}s without going idle`,
+        );
         await it.return?.(undefined);
         break;
       }
@@ -735,7 +1194,10 @@ export class SessionGateway extends Agent<Env> {
     // No AbortSignal: containerFetch serializes the Request across the DO→container
     // hop and an AbortSignal isn't cloneable (DataCloneError). Callers that need a
     // deadline race a timer (ocFetchT / Promise.race) instead.
-    return sandbox.containerFetch(new Request(`http://opencode${path}`, init), port);
+    return sandbox.containerFetch(
+      new Request(`http://opencode${path}`, init),
+      port,
+    );
   }
 
   // ocFetch bounded by a wall-clock race (containerFetch can't carry an AbortSignal).
@@ -751,7 +1213,9 @@ export class SessionGateway extends Agent<Env> {
   ): Promise<Response> {
     return Promise.race([
       this.ocFetch(sandbox, port, method, path, jsonBody),
-      new Promise<never>((_, rej) => setTimeout(() => rej(new Error(`timeout ${timeoutMs}ms`)), timeoutMs)),
+      new Promise<never>((_, rej) =>
+        setTimeout(() => rej(new Error(`timeout ${timeoutMs}ms`)), timeoutMs),
+      ),
     ]);
   }
 
@@ -764,7 +1228,14 @@ export class SessionGateway extends Agent<Env> {
     port: number,
   ): Promise<{ ok: boolean; detail: string }> {
     try {
-      const resp = await this.ocFetchT(sandbox, port, "GET", "/doc", undefined, 5000);
+      const resp = await this.ocFetchT(
+        sandbox,
+        port,
+        "GET",
+        "/doc",
+        undefined,
+        5000,
+      );
       return { ok: resp.ok, detail: `HTTP ${resp.status}` };
     } catch (e) {
       return { ok: false, detail: `fetch ${String(e).slice(0, 100)}` };
@@ -777,7 +1248,10 @@ export class SessionGateway extends Agent<Env> {
   // with an apiKey, or a CF AI Gateway); known provider keys are passed through as
   // env so opencode auto-detects them. Fails loud if neither is set — a
   // misconfigured run says so rather than letting opencode error opaquely mid-turn.
-  private opencodeConfig(): { config?: unknown; env: Record<string, string> } {
+  private opencodeConfig(toolPolicy?: HuddlesToolPolicy): {
+    config?: unknown;
+    env: Record<string, string>;
+  } {
     const env: Record<string, string> = {};
     // Providers opencode auto-detects from their standard env vars.
     for (const k of ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"] as const) {
@@ -789,18 +1263,24 @@ export class SessionGateway extends Agent<Env> {
     // opencode knows `zai-coding-plan`'s base URL from models.dev, so only the apiKey
     // is needed (it's NOT a standard-env auto-detect provider, unlike anthropic), and
     // `??=` leaves an explicit config's own zai-coding-plan block untouched.
-    let config: OcConfig | undefined = this.env.OPENCODE_CONFIG_JSON
-      ? (JSON.parse(this.env.OPENCODE_CONFIG_JSON) as OcConfig)
+    let config: HuddlesOpencodeConfig | undefined = this.env
+      .OPENCODE_CONFIG_JSON
+      ? (JSON.parse(this.env.OPENCODE_CONFIG_JSON) as HuddlesOpencodeConfig)
       : undefined;
     if (this.env.ZAI_API_KEY) {
       config ??= {};
       config.provider ??= {};
-      config.provider["zai-coding-plan"] ??= { options: { apiKey: this.env.ZAI_API_KEY } };
+      config.provider["zai-coding-plan"] ??= {
+        options: { apiKey: this.env.ZAI_API_KEY },
+      };
     }
     if (config === undefined && Object.keys(env).length === 0) {
       throw new Error(
         "no opencode provider configured — set ZAI_API_KEY (GLM coding plan), ANTHROPIC_API_KEY / OPENAI_API_KEY, or OPENCODE_CONFIG_JSON",
       );
+    }
+    if (toolPolicy) {
+      config = enforceHuddlesOpencodePolicy(config, toolPolicy);
     }
     return { config, env };
   }
@@ -808,8 +1288,8 @@ export class SessionGateway extends Agent<Env> {
   // A gateway-detected failure in the agent drive → a §0 attention_required so a
   // subscriber sees the turn ended (errored), not a silent hang. Stamped system —
   // the gateway detected it, not the agent.
-  private appendAgentError(message: string): void {
-    this.append(nowRfc3339(), SYSTEM_ACTOR, {
+  private appendAgentError(message: string): Event {
+    return this.append(nowRfc3339(), SYSTEM_ACTOR, {
       type: "attention_required",
       reason: "error_stalled",
       message,
@@ -849,9 +1329,18 @@ export class SessionGateway extends Agent<Env> {
   // connection's authenticated actor, never a body-supplied one. Reads stay open:
   // an anonymous subscriber (no/invalid token) may watch, just with `actor`
   // undefined; it's the WRITE paths that require attestation.
-  async onConnect(connection: Connection<WsState>, ctx: ConnectionContext): Promise<void> {
+  async onConnect(
+    connection: Connection<WsState>,
+    ctx: ConnectionContext,
+  ): Promise<void> {
+    this.ensureBindingSchema();
+    if (this.isHuddlesPrivate()) {
+      connection.close(1008, "managed session is private");
+      return;
+    }
     const url = new URL(ctx.request.url);
-    const actor = (await this.verifiedActor(url.searchParams.get("token"))) ?? undefined;
+    const actor =
+      (await this.verifiedActor(url.searchParams.get("token"))) ?? undefined;
     const from = Number(url.searchParams.get("from") ?? "0");
     let cursor = from - 1;
     for (const ev of this.readFrom(from)) {
@@ -862,7 +1351,14 @@ export class SessionGateway extends Agent<Env> {
   }
 
   // Optional re-replay on a {"from":N} client message (reconnect-from-seq).
-  async onMessage(connection: Connection<WsState>, message: WSMessage): Promise<void> {
+  async onMessage(
+    connection: Connection<WsState>,
+    message: WSMessage,
+  ): Promise<void> {
+    if (this.isHuddlesPrivate()) {
+      connection.close(1008, "managed session is private");
+      return;
+    }
     if (typeof message !== "string") return;
     try {
       const msg = JSON.parse(message);
@@ -873,7 +1369,10 @@ export class SessionGateway extends Agent<Env> {
           cursor = ev.seq;
         }
         // Preserve the connection's authenticated actor across a re-replay.
-        connection.setState({ ...(connection.state ?? { role: "subscriber" }), cursor });
+        connection.setState({
+          ...(connection.state ?? { role: "subscriber" }),
+          cursor,
+        });
       }
     } catch {
       /* ignore non-JSON pings */
@@ -884,6 +1383,10 @@ export class SessionGateway extends Agent<Env> {
   // the replay/tail boundary with no gap/dup). `getConnections()` replaces the
   // raw `getWebSockets(tag)`.
   private fanout(ev: Event): void {
+    if (this.isHuddlesPrivate()) {
+      this.closeManagedSessionConnections();
+      return;
+    }
     for (const conn of this.getConnections<WsState>()) {
       const a = conn.state ?? { role: "subscriber" as const, cursor: 0 };
       if (ev.seq > a.cursor) {
@@ -905,7 +1408,12 @@ export class SessionGateway extends Agent<Env> {
       "SELECT seq, at, actorJson, payloadJson FROM log WHERE seq >= ? ORDER BY seq ASC",
       seq,
     );
-    for (const r of rows as Iterable<{ seq: number; at: string; actorJson: string | null; payloadJson: string }>) {
+    for (const r of rows as Iterable<{
+      seq: number;
+      at: string;
+      actorJson: string | null;
+      payloadJson: string;
+    }>) {
       const ev: Event = {
         v: 1,
         seq: r.seq,
@@ -919,7 +1427,26 @@ export class SessionGateway extends Agent<Env> {
   }
 
   private head(): number {
-    return (this.ctx.storage.sql.exec("SELECT COALESCE(MAX(seq), 0) AS m FROM log").one() as { m: number }).m;
+    return (
+      this.ctx.storage.sql
+        .exec("SELECT COALESCE(MAX(seq), 0) AS m FROM log")
+        .one() as { m: number }
+    ).m;
+  }
+
+  private isHuddlesManaged(): boolean {
+    return this.ensureBinding() !== undefined;
+  }
+
+  private isHuddlesPrivate(): boolean {
+    return isHuddlesSessionName(this.name) || this.isHuddlesManaged();
+  }
+
+  /** Close sockets that may have attached before the private binding committed. */
+  private closeManagedSessionConnections(): void {
+    for (const connection of this.getConnections<WsState>()) {
+      connection.close(1008, "managed session is private");
+    }
   }
 }
 
@@ -932,7 +1459,9 @@ function actorsEqual(a: Actor, b: Actor): boolean {
 // Split `provider/modelID` on the first `/` (a model id may contain none → no model).
 function splitModel(model: string): [string, string | undefined] {
   const i = model.indexOf("/");
-  return i === -1 ? [model, undefined] : [model.slice(0, i), model.slice(i + 1)];
+  return i === -1
+    ? [model, undefined]
+    : [model.slice(0, i), model.slice(i + 1)];
 }
 
 // Parse an opencode `/event` SSE body into JSON envelopes, in order — a port of
@@ -942,7 +1471,9 @@ function splitModel(model: string): [string, string | undefined] {
 // stream). Workers' fetch de-chunks Transfer-Encoding, so there's no manual
 // de-chunk (the Rust vsock path needs one). Cancels the reader on early return
 // (break) so the long-lived containerFetch closes when the turn ends.
-async function* sseEnvelopes(body: ReadableStream<Uint8Array>): AsyncGenerator<unknown> {
+async function* sseEnvelopes(
+  body: ReadableStream<Uint8Array>,
+): AsyncGenerator<unknown> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buf = "";
@@ -999,7 +1530,11 @@ function nowRfc3339(): string {
 // on argv (single-quoted); the creds + password are passed via env by the caller
 // (NEVER here), so this string is safe to keep in the §0 log. `backup` omits the
 // snapshot (it creates one).
-function workspaceCmd(mode: "restore" | "backup", repo: WorkspaceRepo, snapshot?: string): string {
+function workspaceCmd(
+  mode: "restore" | "backup",
+  repo: WorkspaceRepo,
+  snapshot?: string,
+): string {
   const args = [
     // Absolute path, not bare `pillbox`: execWorkspaceTool passes an explicit
     // `env`, and the SDK's exec REPLACES the environment with it — so $PATH is

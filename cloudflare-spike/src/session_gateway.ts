@@ -1146,8 +1146,11 @@ export class SessionGateway extends Agent<Env> {
         30000,
       );
       if (prompted.status < 200 || prompted.status >= 300) {
+        const detail = safeHuddlesRuntimeDiagnostic(
+          await prompted.text().catch(() => "response body unavailable"),
+        );
         this.appendAgentError(
-          `opencode prompt failed (HTTP ${prompted.status})`,
+          `opencode prompt failed (HTTP ${prompted.status}): ${detail}`,
         );
         return;
       }

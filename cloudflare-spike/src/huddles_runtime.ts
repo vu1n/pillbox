@@ -1,6 +1,8 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
+import { sha256Hex } from "./runtime_identity.js";
 import type { Env } from "./worker.js";
 export { isHuddlesSessionName } from "./huddles_policy.js";
+export { deriveSandboxRuntimeId, sha256Hex } from "./runtime_identity.js";
 
 export type JsonPrimitive = null | boolean | number | string;
 export type JsonValue =
@@ -143,16 +145,6 @@ export function canonicalJson(value: JsonValue): string {
     .sort()
     .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
     .join(",")}}`;
-}
-
-export async function sha256Hex(value: string): Promise<string> {
-  const digest = await crypto.subtle.digest(
-    "SHA-256",
-    new TextEncoder().encode(value),
-  );
-  return [...new Uint8Array(digest)]
-    .map((byte) => byte.toString(16).padStart(2, "0"))
-    .join("");
 }
 
 /** A canonical tuple keeps arbitrary opaque IDs from creating ambiguous names. */

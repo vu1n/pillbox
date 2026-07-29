@@ -56,6 +56,25 @@ export function classifyRunningInvocation(
   return ownedByCurrentIsolate ? "running" : "interrupted";
 }
 
+/** A fresh-session correction after OpenCode idles without its schema tool. */
+export function structuredOutputRetryPrompt(
+  originalPrompt: string,
+  retryNumber: number,
+  retryCount: number,
+): string {
+  if (
+    !Number.isInteger(retryNumber) ||
+    retryNumber < 1 ||
+    !Number.isInteger(retryCount) ||
+    retryNumber > retryCount
+  ) {
+    throw new Error("invalid structured-output retry ordinal");
+  }
+  return `${originalPrompt}
+
+Structured-output retry ${retryNumber} of ${retryCount}: the previous attempt ended without calling StructuredOutput. Call StructuredOutput exactly once with a JSON value that matches the supplied schema. If this runtime cannot expose StructuredOutput, return exactly one bare JSON value matching that schema, with no prose or Markdown fence.`;
+}
+
 /** Operator-safe detail for durable §0 evidence and Worker logs. */
 export function safeHuddlesRuntimeDiagnostic(cause: unknown): string {
   const raw =

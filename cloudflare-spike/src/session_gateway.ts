@@ -20,6 +20,7 @@ import {
 } from "./huddles_policy.js";
 import {
   canonicalJson,
+  deriveSandboxRuntimeId,
   deriveSessionGatewayName,
   sha256Hex,
   type EnsureSessionConflict,
@@ -320,7 +321,10 @@ export class SessionGateway extends Agent<Env> {
       }
 
       await this.driveAgent(
-        getSandbox(this.env.Sandbox, this.name),
+        getSandbox(
+          this.env.Sandbox,
+          await deriveSandboxRuntimeId(this.name),
+        ),
         validated.rendered_input,
         validated.requested_model,
         validated.tool_policy,
@@ -709,12 +713,14 @@ export class SessionGateway extends Agent<Env> {
     return json({ seq: ev.seq, head: this.head() });
   }
 
-  // The DO↔container hop. One container per session (addressed by the same
-  // sessionId). Resolves the Sandbox-SDK handle, then dispatches on the input's
-  // target: `agent` drives a real opencode turn and streams its /event SSE into §0
-  // (the consume path); anything else runs the text as a one-shot command and
-  // appends its output as a §0 tool_call (the exec round-trip). Takes the binding
-  // explicitly (non-optional) so "only with a container bound" is in the type.
+  // The DO↔container hop. One container per session, addressed by a deterministic
+  // runtime projection because Cloudflare Sandbox IDs are limited to 63
+  // characters. The authoritative SessionRef remains unchanged. Resolves the
+  // Sandbox-SDK handle, then dispatches on the input's target: `agent` drives a
+  // real opencode turn and streams its /event SSE into §0 (the consume path);
+  // anything else runs the text as a one-shot command and appends its output as
+  // a §0 tool_call (the exec round-trip). Takes the binding explicitly
+  // (non-optional) so "only with a container bound" is in the type.
   private async driveSandbox(
     sandboxNs: NonNullable<Env["Sandbox"]>,
     inputSeq: number,
@@ -722,7 +728,10 @@ export class SessionGateway extends Agent<Env> {
     target: "agent" | "pty" | "exec",
     model: string,
   ): Promise<void> {
-    const sandbox = getSandbox(sandboxNs, this.name);
+    const sandbox = getSandbox(
+      sandboxNs,
+      await deriveSandboxRuntimeId(this.name),
+    );
     if (target === "agent") {
       await this.driveAgent(sandbox, text, model);
     } else {
@@ -809,7 +818,10 @@ export class SessionGateway extends Agent<Env> {
         400,
       );
     }
-    const sandbox = getSandbox(this.env.Sandbox, this.name);
+    const sandbox = getSandbox(
+      this.env.Sandbox,
+      await deriveSandboxRuntimeId(this.name),
+    );
     const res = await this.execWorkspaceTool(
       sandbox,
       workspaceCmd("restore", w.repo, w.snapshot),
@@ -857,7 +869,10 @@ export class SessionGateway extends Agent<Env> {
     if (!w?.repo || !w.password) {
       return json({ error: "finalize needs {workspace:{repo,password}}" }, 400);
     }
-    const sandbox = getSandbox(this.env.Sandbox, this.name);
+    const sandbox = getSandbox(
+      this.env.Sandbox,
+      await deriveSandboxRuntimeId(this.name),
+    );
     const res = await this.execWorkspaceTool(
       sandbox,
       workspaceCmd("backup", w.repo),

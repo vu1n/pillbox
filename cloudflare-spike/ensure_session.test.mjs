@@ -215,6 +215,16 @@ test("ensure is atomic, canonical, restart-safe, and private", async () => {
       tool_policy: "deny_all",
       harness: "opencode",
       requested_model: "openai/gpt-5.6-sol",
+      output_format: {
+        type: "json_schema",
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          properties: { kind: { const: "document" }, text: { type: "string" } },
+          required: ["kind", "text"],
+        },
+        retry_count: 2,
+      },
     };
     const unavailable = await callInvoke(caller, invoke);
     assert.deepEqual(unavailable, {
@@ -252,6 +262,22 @@ test("ensure is atomic, canonical, restart-safe, and private", async () => {
         tool_policy: "allow",
       }),
       (error) => /tool_policy/.test(String(error)),
+    );
+    await assert.rejects(
+      callInvoke(caller, {
+        ...invoke,
+        invocation_id: "invocation-missing-format",
+        output_format: undefined,
+      }),
+      (error) => /output_format/.test(String(error)),
+    );
+    await assert.rejects(
+      callInvoke(caller, {
+        ...invoke,
+        invocation_id: "invocation-bad-format-retry",
+        output_format: { ...invoke.output_format, retry_count: 1 },
+      }),
+      (error) => /retry_count/.test(String(error)),
     );
 
     await caller.stop();

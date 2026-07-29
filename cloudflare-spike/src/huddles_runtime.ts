@@ -31,6 +31,12 @@ export interface SessionRef {
   readonly seq_range?: readonly number[];
 }
 
+export interface JsonSchemaOutputFormat {
+  readonly type: "json_schema";
+  readonly schema: { readonly [key: string]: JsonValue };
+  readonly retry_count: 2;
+}
+
 export interface EffectCompletionAttribution {
   readonly requested_model: string;
   readonly served_model: null;
@@ -64,6 +70,7 @@ export interface InvokeSessionRequest {
   readonly tool_policy: "deny_all";
   readonly harness: "opencode";
   readonly requested_model: string;
+  readonly output_format: JsonSchemaOutputFormat;
 }
 
 export type InvokeSessionResult =
@@ -234,6 +241,25 @@ export async function validateInvokeSessionRequest(
       "invoke request tool_policy must be 'deny_all'",
     );
   }
+  if (!isJsonObject(value.output_format)) {
+    throw new EnsureSessionRequestError("output_format must be an object");
+  }
+  if (value.output_format.type !== "json_schema") {
+    throw new EnsureSessionRequestError(
+      "output_format.type must be 'json_schema'",
+    );
+  }
+  if (!isJsonObject(value.output_format.schema)) {
+    throw new EnsureSessionRequestError(
+      "output_format.schema must be a JSON object",
+    );
+  }
+  validateJsonValue(value.output_format.schema, "output_format.schema");
+  if (value.output_format.retry_count !== 2) {
+    throw new EnsureSessionRequestError(
+      "output_format.retry_count must be 2",
+    );
+  }
   if (!isJsonObject(value.session_ref)) {
     throw new EnsureSessionRequestError("session_ref must be an object");
   }
@@ -258,6 +284,11 @@ export async function validateInvokeSessionRequest(
     tool_policy: value.tool_policy,
     harness: value.harness,
     requested_model: requestedModel,
+    output_format: {
+      type: value.output_format.type,
+      schema: value.output_format.schema,
+      retry_count: value.output_format.retry_count,
+    },
   };
 }
 

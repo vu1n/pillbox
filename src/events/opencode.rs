@@ -13,8 +13,9 @@
 //! Verified against a live GLM turn through `opencode serve` (not just the
 //! OpenAPI): the assistant turn streams over the **`message.*` family** —
 //!
-//! - `message.updated` → `info:{id, role, model}` — a message was created /
-//!   updated. The first sight of an `assistant` message id opens it.
+//! - `message.updated` → `info:{id, role, model, structured?}` — a message was
+//!   created / updated. The first sight of an `assistant` message id opens it;
+//!   a final schema-bound value is projected once into `MessageDelta` evidence.
 //! - `message.part.delta` → `{messageID, field, delta}` — incremental content
 //!   (`field:"text"` = assistant text; `field:"reasoning"` = thinking).
 //! - `message.part.updated` with `part.type == "tool"` → `{tool, callID,
@@ -57,6 +58,9 @@ pub(crate) struct EventMapper {
     /// duplicate `MessageStart`s without an ever-growing seen-set, since opencode
     /// opens exactly one assistant message per turn (a new id only after idle).
     open_msg: Option<String>,
+    /// The assistant message whose final schema-bound value was projected into
+    /// the MessageDelta evidence channel. Cleared when the turn goes idle.
+    structured_msg: Option<String>,
     /// `callID → last emitted tool status`, so we only emit a `ToolCall` when a
     /// tool's status actually changes, not on every input-stream tick. Keyed on
     /// the *mapped* status so opencode's `pending`→`running` (both `Running`)
@@ -90,6 +94,7 @@ impl EventMapper {
                 if let Some(id) = self.open_msg.take() {
                     out.push(Payload::MessageEnd(MessageEnd::new(id)));
                 }
+                self.structured_msg = None;
                 out.push(attention(AttentionReason::NeedsInput));
                 out
             }
@@ -103,21 +108,35 @@ impl EventMapper {
         }
     }
 
-    /// `message.updated` — open an assistant message on its first sighting.
-    /// User messages (the echo of our own prompt) and repeat updates of an
-    /// already-open message produce nothing.
+    /// `message.updated` — open an assistant message on its first sighting and
+    /// project OpenCode's final schema-bound value into the text evidence
+    /// channel. User messages and repeats without new structured output produce
+    /// nothing.
     fn on_message_updated(&mut self, p: &Value) -> Vec<Payload> {
         let info = p.get("info").unwrap_or(&Value::Null);
         let role = info.get("role").and_then(Value::as_str).unwrap_or_default();
         let id = info.get("id").and_then(Value::as_str).unwrap_or_default();
-        if role != "assistant" || id.is_empty() || self.open_msg.as_deref() == Some(id) {
+        if role != "assistant" || id.is_empty() {
             return vec![];
         }
-        self.open_msg = Some(id.to_string());
-        vec![Payload::MessageStart(MessageStart {
-            message_id: id.to_string(),
-            role: Role::Assistant,
-        })]
+        let mut out = Vec::new();
+        if self.open_msg.as_deref() != Some(id) {
+            self.open_msg = Some(id.to_string());
+            out.push(Payload::MessageStart(MessageStart {
+                message_id: id.to_string(),
+                role: Role::Assistant,
+            }));
+        }
+        if self.structured_msg.as_deref() != Some(id) {
+            if let Some(structured) = info.get("structured") {
+                self.structured_msg = Some(id.to_string());
+                out.push(Payload::MessageDelta(MessageDelta {
+                    message_id: id.to_string(),
+                    text: structured.to_string(),
+                }));
+            }
+        }
+        out
     }
 
     /// `message.part.delta` — the streaming content. `field` selects the §0
@@ -492,6 +511,29 @@ mod tests {
         assert!(matches!(&idle[..],
             [Payload::MessageEnd(e), Payload::AttentionRequired(a)]
             if e.message_id == "msg_a" && a.reason == AttentionReason::NeedsInput));
+    }
+
+    #[test]
+    fn schema_bound_output_maps_once_into_message_evidence() {
+        let mut m = EventMapper::new();
+        let updated = ev(
+            "message.updated",
+            json!({ "sessionID": "ses_a", "info": {
+                "id": "msg_a",
+                "role": "assistant",
+                "structured": {
+                    "kind": "document",
+                    "text": "# Grill\n\nChallenge the assumptions."
+                }
+            } }),
+        );
+        let output = m.on_event(&updated);
+        assert!(matches!(&output[..],
+            [Payload::MessageStart(s), Payload::MessageDelta(d)]
+            if s.message_id == "msg_a"
+                && d.message_id == "msg_a"
+                && d.text == "{\"kind\":\"document\",\"text\":\"# Grill\\n\\nChallenge the assumptions.\"}"));
+        assert!(m.on_event(&updated).is_empty());
     }
 
     #[test]

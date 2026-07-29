@@ -85,7 +85,12 @@ export type InvokeSessionResult =
       readonly disposition: "created" | "reused";
       readonly session_ref: SessionRef;
       readonly error: {
-        readonly code: "runtime_unavailable" | "runtime_failed";
+        readonly code:
+          | "runtime_unavailable"
+          | "runtime_failed"
+          | "runtime_interrupted"
+          | "provider_failed"
+          | "structured_output_missing";
         readonly message: string;
       };
     }

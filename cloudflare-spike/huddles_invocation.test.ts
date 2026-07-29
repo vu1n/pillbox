@@ -6,6 +6,7 @@ import {
   huddlesPromptTools,
   isHuddlesSessionName,
   safeHuddlesRuntimeDiagnostic,
+  structuredOutputRetryPrompt,
 } from "./src/huddles_policy.ts";
 import { deriveSandboxRuntimeId } from "./src/runtime_identity.ts";
 
@@ -39,6 +40,19 @@ test("Huddles OpenCode policy denies every server permission and prompt tool", (
 test("only the current isolate owner may report a durable invocation as running", () => {
   assert.equal(classifyRunningInvocation(true), "running");
   assert.equal(classifyRunningInvocation(false), "interrupted");
+});
+
+test("structured-output retries preserve the sealed prompt and demand the schema tool", () => {
+  assert.equal(
+    structuredOutputRetryPrompt("Produce GRILL.md.", 2, 2),
+    `Produce GRILL.md.
+
+Structured-output retry 2 of 2: the previous attempt ended without calling StructuredOutput. Call StructuredOutput exactly once with a JSON value that matches the supplied schema. If this runtime cannot expose StructuredOutput, return exactly one bare JSON value matching that schema, with no prose or Markdown fence.`,
+  );
+  assert.throws(
+    () => structuredOutputRetryPrompt("prompt", 0, 2),
+    /invalid structured-output retry ordinal/,
+  );
 });
 
 test("managed invocation diagnostics retain the cause without exposing credentials", () => {

@@ -7,12 +7,10 @@ import {
 import { getSandbox } from "@cloudflare/sandbox";
 import type { Actor, Event, Payload } from "./contract.js";
 import { bearerToken, verifyActorToken } from "./auth.js";
-import { OpencodeMapper } from "./opencode_mapper.js";
 import { workspaceExecEnv, type WorkspaceRepo } from "./workspace_repo.js";
 import {
   classifyRunningInvocation,
   enforceHuddlesOpencodePolicy,
-  huddlesPromptTools,
   isHuddlesSessionName,
   safeHuddlesRuntimeDiagnostic,
   type HuddlesOpencodeConfig,
@@ -35,6 +33,11 @@ import {
   validateInvokeSessionRequest,
 } from "./huddles_runtime.js";
 import type { Env } from "./worker.js";
+import {
+  DEFAULT_OPENCODE_MODEL,
+  driveOpencodeTurn,
+  OPENCODE_WORKSPACE_DIR,
+} from "./opencode_turn.js";
 
 // Per-connection state (the subscriber's replay cursor + its authenticated
 // actor), persisted across hibernation via `connection.setState` — the Agents-SDK
@@ -67,19 +70,6 @@ const SYSTEM_ACTOR: Actor = { kind: "system", id: "pillbox" };
 const AGENT_ACTOR: Actor = { kind: "agent", id: "a:opencode" };
 const HUDDLES_ACTOR: Actor = { kind: "service", id: "svc:huddles" };
 
-// opencode consume-path constants — kept aligned with src/sandbox/opencode.rs.
-// The working directory the in-container opencode session operates in.
-const OPENCODE_DIR = "/workspace";
-// The port the in-container `opencode serve` binds (matches src/sandbox/opencode.rs).
-const OPENCODE_PORT = 4096;
-// Default model (`provider/modelID`) when neither /input nor OPENCODE_MODEL sets one.
-const DEFAULT_MODEL = "zai-coding-plan/glm-4.5-air";
-// Cap one driven turn's §0 appends so a runaway/looping agent can't grow the DO
-// log without bound (the spike's blast-radius guard; generous for a single turn).
-const MAX_TURN_EVENTS = 2000;
-// Wall-clock cap on one driven turn — bounds how long the DO holds the long-lived
-// /event fetch open if the agent never goes idle (Open Question #2's failure mode).
-const TURN_TIMEOUT_MS = 300_000; // 5 min
 // A workspace restore/backup over R2 (rustic) moves the whole tree through the
 // container, far exceeding a turn's interactivity — give it a generous wall clock.
 const WORKSPACE_XFER_TIMEOUT_MS = 300_000; // 5 min
@@ -321,7 +311,7 @@ export class SessionGateway extends Agent<Env> {
         });
       }
 
-      await this.driveAgent(
+      const structuredOutput = await this.driveAgent(
         getSandbox(
           this.env.Sandbox,
           await deriveSandboxRuntimeId(this.name),
@@ -332,17 +322,28 @@ export class SessionGateway extends Agent<Env> {
         validated.output_format,
       );
       const lastSeq = this.head();
-      const turn = this.huddlesTurn(inputEvent.seq, lastSeq);
+      const turn = this.huddlesTurn(
+        inputEvent.seq,
+        lastSeq,
+        structuredOutput,
+        validated.output_format !== undefined,
+      );
       const sessionRef: SessionRef = {
         session_id: validated.session_ref.session_id,
         seq_range: [inputEvent.seq, lastSeq],
       };
+      if (turn.error) {
+        console.warn(
+          "managed invocation terminalized",
+          turn.error.code,
+        );
+      }
       return turn.error
         ? this.finishHuddlesInvocation(validated, {
             status: "failed",
             disposition: "created",
             session_ref: sessionRef,
-            error: { code: "runtime_failed", message: turn.error },
+            error: turn.error,
           })
         : this.finishHuddlesInvocation(validated, {
             status: "completed",
@@ -398,7 +399,7 @@ export class SessionGateway extends Agent<Env> {
         seq_range: [evidence.seq, evidence.seq],
       },
       error: {
-        code: "runtime_failed",
+        code: "runtime_interrupted",
         message: "Pillbox managed invocation was interrupted",
       },
     });
@@ -431,9 +432,22 @@ export class SessionGateway extends Agent<Env> {
   private huddlesTurn(
     firstSeq: number,
     lastSeq: number,
-  ): { output: string; error?: string } {
-    let output = "";
-    let error: string | undefined;
+    structuredOutput?: string,
+    requireStructuredOutput = false,
+  ): {
+    output: string;
+    error?: {
+      code: "provider_failed" | "runtime_failed" | "structured_output_missing";
+      message: string;
+    };
+  } {
+    let output = structuredOutput ?? "";
+    let error:
+      | {
+          code: "provider_failed" | "runtime_failed" | "structured_output_missing";
+          message: string;
+        }
+      | undefined;
     const rows = this.ctx.storage.sql
       .exec(
         `SELECT payloadJson FROM log
@@ -445,6 +459,7 @@ export class SessionGateway extends Agent<Env> {
     for (const row of rows) {
       const payload = JSON.parse(row.payloadJson) as Payload;
       if (
+        !requireStructuredOutput &&
         payload.type === "message_delta" &&
         typeof payload.text === "string"
       ) {
@@ -455,11 +470,25 @@ export class SessionGateway extends Agent<Env> {
         payload.reason === "error_stalled" &&
         typeof payload.message === "string"
       ) {
-        error = payload.message || "agent turn failed";
+        error = {
+          code: "provider_failed",
+          message: safeHuddlesRuntimeDiagnostic(
+            payload.message || "agent turn failed",
+          ),
+        };
       }
     }
-    if (!error && output.trim().length === 0)
-      error = "agent turn produced no text output";
+    if (!error && output.trim().length === 0) {
+      error = requireStructuredOutput
+        ? {
+            code: "structured_output_missing",
+            message: "agent turn produced no structured output",
+          }
+        : {
+            code: "runtime_failed",
+            message: "agent turn produced no text output",
+          };
+    }
     return error ? { output, error } : { output };
   }
 
@@ -685,7 +714,8 @@ export class SessionGateway extends Agent<Env> {
     // free/§0-only deploy there's no Sandbox binding, so `/input` is append-only
     // — the attributed-input §0 path still works, just without the exec hop.
     if (this.env.Sandbox) {
-      const model = body.model ?? this.env.OPENCODE_MODEL ?? DEFAULT_MODEL;
+      const model =
+        body.model ?? this.env.OPENCODE_MODEL ?? DEFAULT_OPENCODE_MODEL;
       await this.driveSandbox(
         this.env.Sandbox,
         inEv.seq,
@@ -844,7 +874,7 @@ export class SessionGateway extends Agent<Env> {
     this.appendWorkspaceXfer(
       "workspace.restore",
       "completed",
-      `restored ${w.snapshot} → ${OPENCODE_DIR}`,
+      `restored ${w.snapshot} → ${OPENCODE_WORKSPACE_DIR}`,
     );
     return json({ ok: true });
   }
@@ -964,315 +994,48 @@ export class SessionGateway extends Agent<Env> {
     });
   }
 
-  // The consume path (docs/managed-tier.md §Consume path): drive one real opencode
-  // turn through the DO↔container hop and stream its /event SSE into §0 via the
-  // OpencodeMapper. Boots opencode with the SDK's createOpencodeServer, opens the
-  // event stream BEFORE prompting (opencode's /event is server-wide and emits from
-  // connect time, so opening first can't miss the turn's opening events), creates a
-  // fresh opencode session, drives it via prompt_async, then maps each SSE envelope
-  // to §0 payloads — each stamped AGENT_ACTOR by the gateway, never self-reported
-  // by the container. Stops when the turn goes idle (the mapper emits
-  // attention_required) or at the per-turn event cap.
-  //
-  // Holds one long-lived SSE fetch for the whole turn — docs/managed-tier.md Open
-  // Question #2 (DO↔container hop cost at streaming latency); the live falsifier
-  // measures it. One opencode session per drive: cross-turn context (a persisted,
-  // reused opencode session) is a follow-up beyond the one-turn falsifier.
+  // The gateway owns durable sequencing and trusted actor attribution. The
+  // OpenCode driver owns container boot, bounded attempts, and SSE translation.
   private async driveAgent(
     sandbox: ReturnType<typeof getSandbox>,
     text: string,
     model: string,
     toolPolicy?: HuddlesToolPolicy,
     outputFormat?: JsonSchemaOutputFormat,
-  ): Promise<void> {
-    const [provider, modelId] = splitModel(model);
-    if (!modelId) {
-      this.appendAgentError(
-        `model must be 'provider/modelID' (got '${model}')`,
-      );
-      return;
-    }
-    const port = OPENCODE_PORT;
-    // Own the boot. The SDK's createOpencodeServer mis-detects readiness inside the
-    // CF container — its waitForPort(/path) times out though `opencode serve` binds
-    // fine — so we launch the long-lived server with startProcess and poll /doc via
-    // containerFetch (the production DO→container path) until it answers. This is the
-    // Rust wait_ready pattern (src/sandbox/opencode.rs). opencode reads its provider
-    // config from OPENCODE_CONFIG_CONTENT.
-    let cfg: { config?: unknown; env: Record<string, string> };
+  ): Promise<string | undefined> {
+    let config: { config?: unknown; env: Record<string, string> };
     try {
-      cfg = this.opencodeConfig(toolPolicy);
-    } catch (e) {
-      this.appendAgentError(`opencode provider config: ${String(e)}`);
+      config = this.opencodeConfig(toolPolicy);
+    } catch (cause) {
+      this.appendAgentError(`opencode provider config: ${String(cause)}`);
       return;
     }
-    let probe = await this.probeDoc(sandbox, port);
-    if (toolPolicy && probe.ok) {
-      // An older deployment may have left a permissive server on this port.
-      // The managed invocation owns a fresh OpenCode session anyway, so replace
-      // the server and prove this turn booted with the sealed deny policy.
-      try {
-        await sandbox.killAllProcesses();
-      } catch {
-        this.appendAgentError(
-          "could not replace an existing OpenCode server with the sealed tool policy",
-        );
-        return;
-      }
-      for (let attempt = 0; attempt < 20 && probe.ok; attempt++) {
-        await new Promise((resolve) => setTimeout(resolve, 250));
-        probe = await this.probeDoc(sandbox, port);
-      }
-      if (probe.ok) {
-        this.appendAgentError(
-          "existing OpenCode server remained reachable after policy reset",
-        );
-        return;
-      }
-    }
-    if (!probe.ok) {
-      const env: Record<string, string> = { ...cfg.env };
-      if (cfg.config !== undefined)
-        env.OPENCODE_CONFIG_CONTENT = JSON.stringify(cfg.config);
-      // Cold-start: a fresh container boots on first use and startProcess throws
-      // "Container is starting" until it's up — retry that transient (mirrors
-      // driveExec's cold-start handling; the agent path self-handles cold start so
-      // it needs no separate warm-up).
-      let startErr = "";
-      let started = false;
-      for (let attempt = 0; attempt < 60; attempt++) {
-        try {
-          await sandbox.startProcess(
-            `cd ${OPENCODE_DIR} && opencode serve --port ${port} --hostname 0.0.0.0`,
-            {
-              env: Object.keys(env).length > 0 ? env : undefined,
-            },
-          );
-          started = true;
-          break;
-        } catch (e) {
-          startErr = String(e);
-          if (!/starting|not ready/i.test(startErr)) break; // non-transient → stop
-          await new Promise((r) => setTimeout(r, 1000)); // container cold-start backoff
-        }
-      }
-      if (!started) {
-        this.appendAgentError(`opencode startProcess failed: ${startErr}`);
-        return;
-      }
-      // Poll /doc until ready. Each probe is timeout-capped (probeDoc), so an
-      // unreachable port fails fast instead of hanging the single-threaded DO.
-      for (let i = 0; i < 20 && !probe.ok; i++) {
-        await new Promise((r) => setTimeout(r, 1000));
-        probe = await this.probeDoc(sandbox, port);
-      }
-      if (!probe.ok) {
-        this.appendAgentError(
-          `opencode not ready after boot (last probe: ${probe.detail})`,
-        );
-        return;
-      }
-    }
-    // Open the event stream first so no turn events are missed. Race the OPEN
-    // against a timeout — a streaming fetch can't carry an AbortSignal without
-    // capping the whole stream, so a stuck open fails loud instead of hanging.
-    const evResp = (await Promise.race([
-      this.ocFetch(sandbox, port, "GET", "/event", undefined, {
-        accept: "text/event-stream",
-      }),
-      new Promise<null>((r) => setTimeout(() => r(null), 20000)),
-    ])) as Response | null;
-    if (!evResp) {
-      this.appendAgentError("opencode /event open timed out (20s)");
-      return;
-    }
-    if (!evResp.ok || !evResp.body) {
-      this.appendAgentError(
-        `opencode /event stream failed (HTTP ${evResp.status})`,
-      );
-      return;
-    }
-    // Fresh opencode session, then drive it (bounded request/response calls).
-    let ocSession: string;
-    try {
-      const created = await this.ocFetchT(
-        sandbox,
-        port,
-        "POST",
-        "/session",
-        {},
-        30000,
-      );
-      if (!created.ok) {
-        this.appendAgentError(
-          `opencode create session failed (HTTP ${created.status})`,
-        );
-        return;
-      }
-      const id = ((await created.json()) as { id?: string }).id;
-      if (!id) {
-        this.appendAgentError("opencode create session: no id in response");
-        return;
-      }
-      ocSession = id;
-    } catch (e) {
-      this.appendAgentError(
-        `opencode create session error: ${String(e).slice(0, 100)}`,
-      );
-      return;
-    }
-    try {
-      const prompted = await this.ocFetchT(
-        sandbox,
-        port,
-        "POST",
-        `/session/${ocSession}/prompt_async`,
-        {
-          parts: [{ type: "text", text }],
-          model: { providerID: provider, modelID: modelId },
-          ...(toolPolicy
-            ? { tools: huddlesPromptTools(toolPolicy) }
-            : undefined),
-          ...(outputFormat
-            ? {
-                format: {
-                  type: outputFormat.type,
-                  schema: outputFormat.schema,
-                  retryCount: outputFormat.retry_count,
-                },
-              }
-            : undefined),
+    return driveOpencodeTurn({
+      sandbox,
+      text,
+      model,
+      toolPolicy,
+      outputFormat,
+      config,
+      sink: {
+        appendAgent: (payload) => {
+          this.append(nowRfc3339(), AGENT_ACTOR, payload);
         },
-        30000,
-      );
-      if (prompted.status < 200 || prompted.status >= 300) {
-        this.appendAgentError(
-          `opencode prompt failed (HTTP ${prompted.status})`,
-        );
-        return;
-      }
-    } catch (e) {
-      this.appendAgentError(
-        `opencode prompt error: ${String(e).slice(0, 100)}`,
-      );
-      return;
-    }
-    // Tail the SSE through the mapper → §0; stamped AGENT_ACTOR (the trust boundary).
-    // Each read is raced against an idle timeout: `for await` would block on a silent
-    // stream (the wall-clock check only runs after an envelope), so a non-streaming
-    // proxy or a stalled turn would hang the DO. The idle case fails loud and
-    // distinguishes "no data at all" (DO→container SSE not streaming) from a mid-turn
-    // stall. TURN_TIMEOUT_MS still caps a long but live turn.
-    const mapper = new OpencodeMapper();
-    const deadline = Date.now() + TURN_TIMEOUT_MS;
-    const IDLE_MS = 45000;
-    let appended = 0;
-    let sawData = false;
-    const it = sseEnvelopes(evResp.body)[Symbol.asyncIterator]();
-    for (;;) {
-      const step = (await Promise.race([
-        it.next(),
-        new Promise<"idle">((r) => setTimeout(() => r("idle"), IDLE_MS)),
-      ])) as IteratorResult<unknown> | "idle";
-      if (step === "idle") {
-        this.appendAgentError(
-          sawData
-            ? `agent turn stalled (no /event data for ${IDLE_MS / 1000}s)`
-            : `no /event data in ${IDLE_MS / 1000}s — DO→container SSE not streaming`,
-        );
-        await it.return?.(undefined);
-        break;
-      }
-      if (step.done) break;
-      sawData = true;
-      let done = false;
-      for (const payload of mapper.onEvent(step.value)) {
-        this.append(nowRfc3339(), AGENT_ACTOR, payload);
-        if (payload.type === "attention_required") done = true; // turn went idle
-        if (++appended >= MAX_TURN_EVENTS) done = true;
-      }
-      if (done) {
-        await it.return?.(undefined);
-        break;
-      }
-      if (Date.now() > deadline) {
-        this.appendAgentError(
-          `agent turn exceeded ${TURN_TIMEOUT_MS / 1000}s without going idle`,
-        );
-        await it.return?.(undefined);
-        break;
-      }
-    }
-  }
-
-  // One JSON request to the in-container opencode server via the Sandbox SDK's
-  // DO→container primitive. containerFetch(request, port) proxies to
-  // 127.0.0.1:port inside the container; the URL's host is ignored by the proxy,
-  // so any absolute URL carrying the right path/method works.
-  private ocFetch(
-    sandbox: ReturnType<typeof getSandbox>,
-    port: number,
-    method: string,
-    path: string,
-    jsonBody?: unknown,
-    headers?: Record<string, string>,
-  ): Promise<Response> {
-    const h: Record<string, string> = { ...headers };
-    const init: RequestInit = { method };
-    if (jsonBody !== undefined) {
-      init.body = JSON.stringify(jsonBody);
-      h["content-type"] = "application/json";
-    }
-    if (Object.keys(h).length > 0) init.headers = h;
-    // No AbortSignal: containerFetch serializes the Request across the DO→container
-    // hop and an AbortSignal isn't cloneable (DataCloneError). Callers that need a
-    // deadline race a timer (ocFetchT / Promise.race) instead.
-    return sandbox.containerFetch(
-      new Request(`http://opencode${path}`, init),
-      port,
-    );
-  }
-
-  // ocFetch bounded by a wall-clock race (containerFetch can't carry an AbortSignal).
-  // Rejects on timeout so the caller's try/catch reports it; the losing containerFetch
-  // leaks but resolves harmlessly.
-  private ocFetchT(
-    sandbox: ReturnType<typeof getSandbox>,
-    port: number,
-    method: string,
-    path: string,
-    jsonBody: unknown,
-    timeoutMs: number,
-  ): Promise<Response> {
-    return Promise.race([
-      this.ocFetch(sandbox, port, method, path, jsonBody),
-      new Promise<never>((_, rej) =>
-        setTimeout(() => rej(new Error(`timeout ${timeoutMs}ms`)), timeoutMs),
-      ),
-    ]);
-  }
-
-  // Probe opencode's /doc readiness endpoint via the containerFetch proxy, bounded by
-  // a timer race so an unreachable port fails FAST instead of hanging (a hung probe
-  // would wedge the single-threaded DO). Returns the outcome detail for a loud "not
-  // ready" report (HTTP status vs the fetch error).
-  private async probeDoc(
-    sandbox: ReturnType<typeof getSandbox>,
-    port: number,
-  ): Promise<{ ok: boolean; detail: string }> {
-    try {
-      const resp = await this.ocFetchT(
-        sandbox,
-        port,
-        "GET",
-        "/doc",
-        undefined,
-        5000,
-      );
-      return { ok: resp.ok, detail: `HTTP ${resp.status}` };
-    } catch (e) {
-      return { ok: false, detail: `fetch ${String(e).slice(0, 100)}` };
-    }
+        appendError: (message) => {
+          this.appendAgentError(message);
+        },
+        appendSystemTool: (evidence) => {
+          this.append(nowRfc3339(), SYSTEM_ACTOR, {
+            type: "tool_call",
+            toolCallId: `${evidence.idPrefix}:${this.head() + 1}`,
+            name: evidence.name,
+            status: "completed",
+            ...(evidence.input ? { input: evidence.input } : {}),
+            output: evidence.output,
+          });
+        },
+      },
+    });
   }
 
   // opencode provider auth — passed to createOpencodeServer (managed-tier
@@ -1489,72 +1252,6 @@ function actorsEqual(a: Actor, b: Actor): boolean {
   return a.kind === b.kind && a.id === b.id;
 }
 
-// Split `provider/modelID` on the first `/` (a model id may contain none → no model).
-function splitModel(model: string): [string, string | undefined] {
-  const i = model.indexOf("/");
-  return i === -1
-    ? [model, undefined]
-    : [model.slice(0, i), model.slice(i + 1)];
-}
-
-// Parse an opencode `/event` SSE body into JSON envelopes, in order — a port of
-// src/events/opencode.rs::drain_sse. `data:` lines (one optional space after the
-// colon; multiple in a frame joined with `\n`) accumulate until a blank line
-// flushes the frame; a non-JSON frame is skipped (a stray frame can't wedge the
-// stream). Workers' fetch de-chunks Transfer-Encoding, so there's no manual
-// de-chunk (the Rust vsock path needs one). Cancels the reader on early return
-// (break) so the long-lived containerFetch closes when the turn ends.
-async function* sseEnvelopes(
-  body: ReadableStream<Uint8Array>,
-): AsyncGenerator<unknown> {
-  const reader = body.getReader();
-  const decoder = new TextDecoder();
-  let buf = "";
-  let data = "";
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (value) buf += decoder.decode(value, { stream: true });
-      let nl: number;
-      while ((nl = buf.indexOf("\n")) !== -1) {
-        const line = buf.slice(0, nl).replace(/\r$/, ""); // tolerate CRLF
-        buf = buf.slice(nl + 1);
-        if (line.startsWith("data:")) {
-          const rest = line.slice(5);
-          if (data !== "") data += "\n";
-          data += rest.startsWith(" ") ? rest.slice(1) : rest;
-        } else if (line === "") {
-          if (data !== "") {
-            const frame = data;
-            data = "";
-            try {
-              yield JSON.parse(frame);
-            } catch {
-              /* skip non-JSON frame, matching drain_sse */
-            }
-          }
-        }
-        // event: / id: / retry: / :comment lines carry no payload here.
-      }
-      if (done) break;
-    }
-    // A stream that closed mid-frame (no trailing blank line) still flushes.
-    if (data !== "") {
-      try {
-        yield JSON.parse(data);
-      } catch {
-        /* skip */
-      }
-    }
-  } finally {
-    try {
-      await reader.cancel();
-    } catch {
-      /* already closed */
-    }
-  }
-}
-
 function nowRfc3339(): string {
   return new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
 }
@@ -1586,7 +1283,7 @@ function workspaceCmd(
     sq(repo.prefix),
   ];
   if (snapshot) args.push("--snapshot", sq(snapshot));
-  args.push("--target", sq(OPENCODE_DIR));
+  args.push("--target", sq(OPENCODE_WORKSPACE_DIR));
   return args.join(" ");
 }
 

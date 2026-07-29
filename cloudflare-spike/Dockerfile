@@ -8,7 +8,7 @@ FROM docker.io/cloudflare/sandbox:0.11.0
 # binary is the OpencodeStartupError "Stderr: (empty)"). Pinned to the version
 # pillbox's runner verified against the zai-coding-plan provider + /event +
 # /prompt_async (runner/Dockerfile OPENCODE_VERSION).
-RUN npm install -g opencode-ai@1.17.3
+RUN npm install -g opencode-ai@1.18.9
 
 # The pillbox binary (linux/amd64) — the managed tier's workspace tool. The
 # §0-gateway DO execs `pillbox workspace restore|backup` to rehydrate the

@@ -7,6 +7,7 @@ import {
   isHuddlesSessionName,
   safeHuddlesRuntimeDiagnostic,
 } from "./src/huddles_policy.ts";
+import { deriveSandboxRuntimeId } from "./src/runtime_identity.ts";
 
 test("reserved Huddles session names are exact", () => {
   assert.equal(isHuddlesSessionName(`ensure-${"a".repeat(64)}`), true);
@@ -53,4 +54,21 @@ test("managed invocation diagnostics retain the cause without exposing credentia
     safeHuddlesRuntimeDiagnostic({ reason: "opaque" }),
     "unknown runtime error",
   );
+});
+
+test("sandbox runtime identity preserves SessionRef identity without exceeding Cloudflare limits", async () => {
+  assert.equal(
+    await deriveSandboxRuntimeId("ordinary-session"),
+    "ordinary-session",
+  );
+
+  const sessionId = `ensure-${"a".repeat(64)}`;
+  const runtimeId = await deriveSandboxRuntimeId(sessionId);
+  assert.equal(runtimeId.length, 63);
+  assert.match(runtimeId, /^pbx-[0-9a-f]{59}$/);
+  assert.equal(await deriveSandboxRuntimeId(sessionId), runtimeId);
+  assert.notEqual(runtimeId, sessionId);
+
+  assert.match(await deriveSandboxRuntimeId("api"), /^pbx-[0-9a-f]{59}$/);
+  assert.match(await deriveSandboxRuntimeId("-unsafe"), /^pbx-[0-9a-f]{59}$/);
 });

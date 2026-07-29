@@ -171,6 +171,13 @@ code explicitly says is *not* an access-control signal (anything that can write
 the env can set it), `actor` is **stamped by the gateway from the
 authenticated connection**, never self-reported by the producer. Authz
 (who may drive / approve / join) keys off `actor`, so it must be authenticated.
+Managed orchestrator bindings may impose a stricter read boundary than an
+ordinary session. In particular, a SessionGateway bound by Huddles is private:
+public HTTP drive and WebSocket replay are disabled because its log may contain
+visibility-scoped HCP input and derived model output. Evidence access must use a
+private, policy-preserving adapter rather than possession of the session name.
+The deterministic Huddles session-name namespace is private before binding too;
+the public router never allows those names to initialize a gateway.
 
 ## Payload taxonomy
 

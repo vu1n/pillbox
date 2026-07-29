@@ -23,6 +23,33 @@ identity/token provisioning remain open.
 > smoke 23.5 s, complete workspace round trip 40.27 s. These are proof samples,
 > not benchmarks.
 
+The private Huddles service binding now has two deliberately separate retry
+domains. `ensureSession` atomically binds a Huddles start-effect ID to one
+session. `invokeSession` then binds one invocation ID to the exact rendered
+input hash, requested model, harness, delivery receipt, and ensured session
+before crossing into the container. Exact retries return the durable state or
+result; changed content conflicts. A durable `running` row is reported as such
+only while the current isolate owns that exact invocation. If the owner
+disappears, the next exact retry records an interruption and terminalizes the
+row as a runtime failure without sampling another turn.
+
+The current Huddles contract carries `tool_policy: "deny_all"`. Pillbox rejects
+any other value, starts the private OpenCode server with a global deny
+permission, replaces any server left running by an older policy version, and
+disables its built-in tools again on the prompt request. The deterministic
+`ensure-<sha256>` session namespace is rejected on public routes even before its
+durable binding exists, preventing a caller from pre-starting a permissive
+server under a future private identity.
+
+The prompt, raw stream, and model output stay in the private session §0 log,
+while the RPC result carries only terminal text and a positional session range
+for the orchestrator to interpret. Once an `ensure_binding` exists, the
+SessionGateway rejects its public HTTP and WebSocket attach/drive surfaces; a
+future evidence reader must enter through a private service-binding RPC and
+preserve Huddles visibility policy. Ordinary non-Huddles sessions retain the
+existing public multiplayer surface. This is runtime substrate for Huddles, not
+Huddles thread, artifact, or activity semantics.
+
 This is the differentiated layer above the local substrate. It depends on the
 §0 spine ([session-event-log.md](./session-event-log.md)) and realizes the
 gateway ([gateway.md](./gateway.md)) as the placement authority. Sibling to

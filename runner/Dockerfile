@@ -114,7 +114,7 @@ ARG CLAUDE_VERSION=2.1.214
 # renovate: datasource=github-releases depName=openai/codex extractVersion=^rust-v(?<version>.*)$
 ARG CODEX_VERSION=0.144.5
 # renovate: datasource=npm depName=opencode-ai
-ARG OPENCODE_VERSION=1.18.3
+ARG OPENCODE_VERSION=1.18.9
 # renovate: datasource=npm depName=@earendil-works/pi-coding-agent
 ARG PI_VERSION=0.80.10
 # amp has no Renovate-trackable pin: its publish scheme is timestamp+sha

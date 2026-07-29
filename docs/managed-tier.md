@@ -33,6 +33,24 @@ only while the current isolate owns that exact invocation. If the owner
 disappears, the next exact retry records an interruption and terminalizes the
 row as a runtime failure without sampling another turn.
 
+Schema-bound invocations share one five-minute, 2,000-event budget across the
+initial turn and at most two fresh OpenCode sessions. Only a clean
+`session.idle` without structured output is retryable; permission, question,
+provider, transport, and interruption stops remain terminal. Pillbox prefers
+OpenCode's exact `info.structured` value. Because some provider/OpenCode
+combinations omit the schema tool, it may instead accept exactly one
+schema-valid JSON value from the final assistant text part, records that
+normalization as `structured_output.raw_json_fallback`, and returns the
+normalized JSON. Zero or multiple valid values fail closed. These retries and
+normalizations are Pillbox harness behavior, not Huddles orchestration state.
+
+> **Current Huddles proof (2026-07-29).** A signed-in `/grill` dispatch crossed
+> the Huddles workspace Durable Object into this managed invocation path and
+> completed with Pillbox evidence `seq=1..1070`. Huddles materialized the
+> schema-validated result as artifact revision
+> `sha256:05fb48eaaa068aa489b36607791f3fabc52e86606bb3197ac9f5a600221371ba`;
+> no raw harness deltas were copied into Huddles `WorkEvent`s.
+
 The current Huddles contract carries `tool_policy: "deny_all"`. Pillbox rejects
 any other value, starts the private OpenCode server with a global deny
 permission, replaces any server left running by an older policy version, and

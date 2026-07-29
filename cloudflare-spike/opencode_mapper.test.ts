@@ -47,6 +47,8 @@ test("assistant turn: start (once) → text deltas → idle ends + raises NeedsI
     { type: "message_end", messageId: "msg_a" },
     { type: "attention_required", reason: "needs_input", message: "" },
   ]);
+  assert.equal(m.mayRetryStructuredOutput(), true);
+  assert.equal(m.plainTextOutput(), "hi");
 });
 
 test("schema-bound assistant output maps once into the message evidence channel", () => {
@@ -55,6 +57,16 @@ test("schema-bound assistant output maps once into the message evidence channel"
     kind: "document",
     text: "# Grill\n\nChallenge the assumptions.",
   };
+  assert.deepEqual(
+    m.onEvent(
+      ev("message.part.delta", {
+        messageID: "msg_a",
+        field: "text",
+        delta: "provider retry preamble",
+      }),
+    ),
+    [{ type: "message_delta", messageId: "msg_a", text: "provider retry preamble" }],
+  );
   assert.deepEqual(
     m.onEvent(
       ev("message.updated", {
@@ -71,6 +83,9 @@ test("schema-bound assistant output maps once into the message evidence channel"
       },
     ],
   );
+  assert.equal(m.structuredOutput(), JSON.stringify(structured));
+  assert.equal(m.mayRetryStructuredOutput(), false);
+  assert.equal(m.plainTextOutput(), "provider retry preamble");
   assert.deepEqual(
     m.onEvent(
       ev("message.updated", {
@@ -79,6 +94,48 @@ test("schema-bound assistant output maps once into the message evidence channel"
       }),
     ),
     [],
+  );
+  assert.equal(m.structuredOutput(), JSON.stringify(structured));
+});
+
+test("raw output selects the final text part without dropping preamble evidence", () => {
+  const m = new OpencodeMapper();
+  assert.deepEqual(
+    m.onEvent(
+      ev("message.part.delta", {
+        messageID: "msg_a",
+        partID: "prt_preamble",
+        field: "text",
+        delta: "I will now provide the answer.",
+      }),
+    ),
+    [
+      {
+        type: "message_delta",
+        messageId: "msg_a",
+        text: "I will now provide the answer.",
+      },
+    ],
+  );
+  m.onEvent(
+    ev("message.part.delta", {
+      messageID: "msg_a",
+      partID: "prt_answer",
+      field: "text",
+      delta: '{"kind":"doc',
+    }),
+  );
+  m.onEvent(
+    ev("message.part.delta", {
+      messageID: "msg_a",
+      partID: "prt_answer",
+      field: "text",
+      delta: 'ument","text":"# Grill"}',
+    }),
+  );
+  assert.equal(
+    m.plainTextOutput(),
+    '{"kind":"document","text":"# Grill"}',
   );
 });
 
@@ -148,4 +205,19 @@ test("session.error raises ErrorStalled with the extracted message", () => {
     m.onEvent(ev("session.error", { error: { message: "boom" } })),
     [{ type: "attention_required", reason: "error_stalled", message: "boom" }],
   );
+  assert.equal(m.mayRetryStructuredOutput(), false);
+});
+
+test("permission and question stops are not structured-output retry signals", () => {
+  const permission = new OpencodeMapper();
+  assert.deepEqual(permission.onEvent(ev("permission.asked", {})), [
+    { type: "attention_required", reason: "permission", message: "" },
+  ]);
+  assert.equal(permission.mayRetryStructuredOutput(), false);
+
+  const question = new OpencodeMapper();
+  assert.deepEqual(question.onEvent(ev("question.asked", {})), [
+    { type: "attention_required", reason: "needs_input", message: "" },
+  ]);
+  assert.equal(question.mayRetryStructuredOutput(), false);
 });

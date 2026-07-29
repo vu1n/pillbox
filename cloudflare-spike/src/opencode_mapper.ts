@@ -94,6 +94,18 @@ export class OpencodeMapper {
   // OpenCode carries structured output on message.updated rather than text
   // parts, so project it into the same MessageDelta evidence channel once.
   private structuredMsg: string | null = null;
+  // Exact final schema-bound value for the managed invocation result. Keep this
+  // separate from §0 MessageDelta evidence because the transcript may also
+  // contain ordinary assistant text from provider retries or preambles.
+  private finalStructuredOutput: string | undefined;
+  // Only a clean session.idle may trigger Pillbox's bounded structured-output
+  // retry. Permission prompts, model questions, and provider errors are terminal.
+  private retryableStructuredOutputIdle = false;
+  // Exact ordinary text by OpenCode part. Evidence retains every delta, while a
+  // raw-JSON fallback must inspect only the final answer part rather than
+  // concatenating an earlier preamble with the answer.
+  private textPartOrder: string[] = [];
+  private textByPart = new Map<string, string>();
   // callID → last emitted (mapped) tool status, so a ToolCall is emitted only on
   // a status transition, not on every input-stream tick.
   private toolStatus = new Map<string, string>();
@@ -115,6 +127,7 @@ export class OpencodeMapper {
       // Turn went quiescent → close the open assistant message and raise the
       // attention signal the driver waits on.
       case "session.idle": {
+        this.retryableStructuredOutputIdle = true;
         const out: Payload[] = [];
         if (this.openMsg !== null) {
           out.push({ type: "message_end", messageId: this.openMsg });
@@ -125,14 +138,36 @@ export class OpencodeMapper {
         return out;
       }
       case "permission.asked":
+        this.retryableStructuredOutputIdle = false;
         return [attention("permission")];
       case "question.asked":
+        this.retryableStructuredOutputIdle = false;
         return [attention("needs_input")];
       case "session.error":
+        this.retryableStructuredOutputIdle = false;
         return [{ type: "attention_required", reason: "error_stalled", message: errorMessage(p) }];
       default:
         return [];
     }
+  }
+
+  structuredOutput(): string | undefined {
+    return this.finalStructuredOutput;
+  }
+
+  mayRetryStructuredOutput(): boolean {
+    return (
+      this.retryableStructuredOutputIdle &&
+      this.finalStructuredOutput === undefined
+    );
+  }
+
+  plainTextOutput(): string | undefined {
+    for (let index = this.textPartOrder.length - 1; index >= 0; index--) {
+      const text = this.textByPart.get(this.textPartOrder[index]);
+      if (text && text.length > 0) return text;
+    }
+    return;
   }
 
   // `message.updated` — open an assistant message on its first sighting and
@@ -149,11 +184,14 @@ export class OpencodeMapper {
       out.push({ type: "message_start", messageId: id, role: "assistant" });
     }
     if (info.structured !== undefined && this.structuredMsg !== id) {
+      const serialized = JSON.stringify(info.structured);
+      if (serialized === undefined) return out;
       this.structuredMsg = id;
+      this.finalStructuredOutput = serialized;
       out.push({
         type: "message_delta",
         messageId: id,
-        text: JSON.stringify(info.structured),
+        text: serialized,
       });
     }
     return out;
@@ -171,6 +209,11 @@ export class OpencodeMapper {
     const messageId: string | null =
       (typeof p?.messageID === "string" ? p.messageID : null) ?? this.openMsg;
     if (messageId === null) return [];
+    const partId =
+      typeof p?.partID === "string" && p.partID.length > 0
+        ? p.partID
+        : `message:${messageId}`;
+    this.appendTextPart(partId, delta);
     return [{ type: "message_delta", messageId, text: delta }];
   }
 
@@ -179,6 +222,14 @@ export class OpencodeMapper {
   private onPartUpdated(p: any): Payload[] {
     const part = p?.part ?? {};
     switch (part?.type) {
+      case "text":
+        if (
+          typeof part.id === "string" &&
+          typeof part.text === "string"
+        ) {
+          this.replaceTextPart(part.id, part.text);
+        }
+        return [];
       case "tool":
         return this.onToolPart(part);
       case "step-finish":
@@ -186,6 +237,16 @@ export class OpencodeMapper {
       default:
         return [];
     }
+  }
+
+  private appendTextPart(partId: string, delta: string): void {
+    if (!this.textByPart.has(partId)) this.textPartOrder.push(partId);
+    this.textByPart.set(partId, (this.textByPart.get(partId) ?? "") + delta);
+  }
+
+  private replaceTextPart(partId: string, text: string): void {
+    if (!this.textByPart.has(partId)) this.textPartOrder.push(partId);
+    this.textByPart.set(partId, text);
   }
 
   // A `tool` part. Emits a ToolCall only when the mapped status changes.

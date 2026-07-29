@@ -42,3 +42,4 @@ managed-store-of-record conforms: sandbox runtime identity projection changes no
 managed-tier-do-gateway conforms: private Huddles invocation now carries a generic JSON-schema output constraint into OpenCode and projects the resulting structured value through the existing per-session event stream; the Durable Object remains the sequencer, gateway, and container lifecycle authority.
 managed-store-of-record conforms: schema-bound output is session execution evidence only; it changes no workspace content authority or rustic-over-R2 handle.
 session-event-log-spine conforms: OpenCode structured output becomes an ordinary MessageDelta in the existing immutable, single-writer session log without changing the §0 event schema or sequence authority.
+agent-io-pty-free-contract conforms: the OpenCode mapper projects schema-bound output from the existing structured SSE API into session evidence; it adds no PTY, terminal scraping, or alternate agent I/O path.

@@ -28,6 +28,7 @@ import {
   type EnsureSessionResult,
   type InvokeSessionRequest,
   type InvokeSessionResult,
+  type JsonSchemaOutputFormat,
   type JsonValue,
   type SessionRef,
   validateEnsureSessionRequest,
@@ -328,6 +329,7 @@ export class SessionGateway extends Agent<Env> {
         validated.rendered_input,
         validated.requested_model,
         validated.tool_policy,
+        validated.output_format,
       );
       const lastSeq = this.head();
       const turn = this.huddlesTurn(inputEvent.seq, lastSeq);
@@ -981,6 +983,7 @@ export class SessionGateway extends Agent<Env> {
     text: string,
     model: string,
     toolPolicy?: HuddlesToolPolicy,
+    outputFormat?: JsonSchemaOutputFormat,
   ): Promise<void> {
     const [provider, modelId] = splitModel(model);
     if (!modelId) {
@@ -1129,6 +1132,15 @@ export class SessionGateway extends Agent<Env> {
           model: { providerID: provider, modelID: modelId },
           ...(toolPolicy
             ? { tools: huddlesPromptTools(toolPolicy) }
+            : undefined),
+          ...(outputFormat
+            ? {
+                format: {
+                  type: outputFormat.type,
+                  schema: outputFormat.schema,
+                  retryCount: outputFormat.retry_count,
+                },
+              }
             : undefined),
         },
         30000,

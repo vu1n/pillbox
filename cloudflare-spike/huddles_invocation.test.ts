@@ -5,6 +5,7 @@ import {
   enforceHuddlesOpencodePolicy,
   huddlesPromptTools,
   isHuddlesSessionName,
+  safeHuddlesRuntimeDiagnostic,
 } from "./src/huddles_policy.ts";
 
 test("reserved Huddles session names are exact", () => {
@@ -37,4 +38,19 @@ test("Huddles OpenCode policy denies every server permission and prompt tool", (
 test("only the current isolate owner may report a durable invocation as running", () => {
   assert.equal(classifyRunningInvocation(true), "running");
   assert.equal(classifyRunningInvocation(false), "interrupted");
+});
+
+test("managed invocation diagnostics retain the cause without exposing credentials", () => {
+  assert.equal(
+    safeHuddlesRuntimeDiagnostic(
+      new Error(
+        "provider https://api.example.test/v1 failed with cfat_secret-token-value and abcdefghijklmnopqrstuvwxyz0123456789",
+      ),
+    ),
+    "Error: provider [url redacted] failed with [credential redacted] and [opaque value redacted]",
+  );
+  assert.equal(
+    safeHuddlesRuntimeDiagnostic({ reason: "opaque" }),
+    "unknown runtime error",
+  );
 });

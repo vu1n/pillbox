@@ -1,7 +1,10 @@
-import { routeAgentRequest } from "agents";
+import { routeAgentRequest, type AgentOptions } from "agents";
 import { proxyToSandbox, type Sandbox } from "@cloudflare/sandbox";
 import { SessionGateway } from "./session_gateway.js";
-import { HuddlesRuntimeEntrypoint } from "./huddles_runtime.js";
+import {
+  HuddlesRuntimeEntrypoint,
+  isHuddlesSessionName,
+} from "./huddles_runtime.js";
 
 export { SessionGateway };
 // Named entrypoint: Huddles reaches ensureSession through a same-account
@@ -39,14 +42,36 @@ export interface Env {
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
+    const requirePublicSession: NonNullable<
+      AgentOptions<Env>["onBeforeRequest"]
+    > = async (_request, lobby) => {
+      if (lobby.className !== "SessionGateway") return;
+      // The deterministic Huddles namespace is private before its durable
+      // binding exists, so a public caller cannot pre-bind a permissive server.
+      if (isHuddlesSessionName(lobby.name)) {
+        return new Response("not found\n", { status: 404 });
+      }
+      const id = env.SessionGateway.idFromName(lobby.name);
+      if (!(await env.SessionGateway.get(id).publicAccessAllowed())) {
+        return new Response("not found\n", { status: 404 });
+      }
+    };
     // Container preview/port-proxy URLs — only when the container is bound.
     // Re-spread with the narrowed (defined) Sandbox so proxyToSandbox's env type
     // is satisfied without a cast (TS narrows `env.Sandbox`, not `env`).
     if (env.Sandbox) {
-      const proxied = await proxyToSandbox(req, { ...env, Sandbox: env.Sandbox });
+      const proxied = await proxyToSandbox(req, {
+        ...env,
+        Sandbox: env.Sandbox,
+      });
       if (proxied) return proxied;
     }
     // Route to the per-session §0 gateway Agent (works with or without a container).
-    return (await routeAgentRequest(req, env)) ?? new Response("not found\n", { status: 404 });
+    return (
+      (await routeAgentRequest(req, env, {
+        onBeforeConnect: requirePublicSession,
+        onBeforeRequest: requirePublicSession,
+      })) ?? new Response("not found\n", { status: 404 })
+    );
   },
 };

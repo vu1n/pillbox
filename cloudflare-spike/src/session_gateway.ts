@@ -14,6 +14,7 @@ import {
   enforceHuddlesOpencodePolicy,
   huddlesPromptTools,
   isHuddlesSessionName,
+  safeHuddlesRuntimeDiagnostic,
   type HuddlesOpencodeConfig,
   type HuddlesToolPolicy,
 } from "./huddles_policy.js";
@@ -343,9 +344,14 @@ export class SessionGateway extends Agent<Env> {
             session_ref: sessionRef,
             output_text: turn.output,
           });
-    } catch {
-      const failure = this.appendAgentError(
+    } catch (cause) {
+      const diagnostic = safeHuddlesRuntimeDiagnostic(cause);
+      console.error(
         "managed invocation interrupted before a terminal result",
+        diagnostic,
+      );
+      const failure = this.appendAgentError(
+        `managed invocation interrupted before a terminal result: ${diagnostic}`,
       );
       return this.finishHuddlesInvocation(validated, {
         status: "failed",

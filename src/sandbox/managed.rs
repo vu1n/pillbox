@@ -202,6 +202,7 @@ impl SandboxBackend for ManagedBackend {
                 model,
                 temperature: opts.temperature,
             }),
+            requested_execution: None,
         };
         session::write(resolved, &session)?;
         crate::events::emit_session_event(
@@ -1488,6 +1489,7 @@ mod tests {
                 model: "zai-coding-plan/glm-4.5-air".into(),
                 temperature: None,
             }),
+            requested_execution: None,
         };
         // Serialize both the on-disk (TOML) and JSON forms; neither may leak the
         // R2 access/secret keys or the repo password used during provisioning.

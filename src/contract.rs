@@ -19,6 +19,7 @@
 #![allow(dead_code)]
 
 use std::io::Write;
+use std::str::FromStr;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -249,6 +250,171 @@ pub(crate) struct SandboxDestroyed {
 }
 
 #[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+}
+
+impl FromStr for ReasoningEffort {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            _ => Err(format!(
+                "unsupported reasoning effort `{value}` (expected low, medium, or high)"
+            )),
+        }
+    }
+}
+
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RequestedRunProfile {
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    #[serde(default)]
+    pub(crate) profile: Option<String>,
+    #[serde(default)]
+    pub(crate) reasoning_effort: Option<ReasoningEffort>,
+}
+
+impl RequestedRunProfile {
+    pub(crate) fn parse(
+        provider_model: &str,
+        profile: Option<String>,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> Result<Self> {
+        let (provider, model) = provider_model.split_once('/').ok_or_else(|| {
+            anyhow::anyhow!("model must be PROVIDER/MODEL, got `{provider_model}`")
+        })?;
+        if provider.is_empty()
+            || model.is_empty()
+            || provider.trim() != provider
+            || model.trim() != model
+            || provider.chars().any(char::is_whitespace)
+            || model.chars().any(char::is_whitespace)
+        {
+            return Err(anyhow::anyhow!(
+                "model must contain non-empty, whitespace-free PROVIDER/MODEL parts"
+            ));
+        }
+        if profile.as_deref().is_some_and(|value| {
+            value.is_empty() || value.trim() != value || value.chars().any(char::is_whitespace)
+        }) {
+            return Err(anyhow::anyhow!(
+                "profile must be non-empty and whitespace-free when provided"
+            ));
+        }
+        Ok(Self {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            profile,
+            reasoning_effort,
+        })
+    }
+}
+
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ServedRunProfile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) provider: Option<String>,
+    pub(crate) model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reasoning_profile: Option<String>,
+}
+
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EffectiveRuntimeLimits {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) context_window_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) max_output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) supported_reasoning_profiles: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for EffectiveRuntimeLimits {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct RawLimits {
+            #[serde(default)]
+            context_window_tokens: Option<u64>,
+            #[serde(default)]
+            max_output_tokens: Option<u64>,
+            #[serde(default)]
+            supported_reasoning_profiles: Vec<String>,
+        }
+
+        let raw = RawLimits::deserialize(deserializer)?;
+        if raw.context_window_tokens.is_none()
+            && raw.max_output_tokens.is_none()
+            && raw.supported_reasoning_profiles.is_empty()
+        {
+            return Err(serde::de::Error::custom(
+                "reported effective runtime limits must contain at least one limit",
+            ));
+        }
+        Ok(Self {
+            context_window_tokens: raw.context_window_tokens,
+            max_output_tokens: raw.max_output_tokens,
+            supported_reasoning_profiles: raw.supported_reasoning_profiles,
+        })
+    }
+}
+
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum EvidenceUnavailableReason {
+    NotReported,
+    Unsupported,
+    Redacted,
+}
+
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(crate) enum ServedRunProfileEvidence {
+    Reported {
+        #[serde(flatten)]
+        profile: ServedRunProfile,
+    },
+    Unavailable {
+        reason: EvidenceUnavailableReason,
+    },
+}
+
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(crate) enum EffectiveRuntimeLimitsEvidence {
+    Reported {
+        #[serde(flatten)]
+        limits: EffectiveRuntimeLimits,
+    },
+    Unavailable {
+        reason: EvidenceUnavailableReason,
+    },
+}
+
+#[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RunStarted {
@@ -257,6 +423,8 @@ pub(crate) struct RunStarted {
     pub(crate) parent_run_id: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) base_snapshot: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) requested: Option<RequestedRunProfile>,
 }
 
 #[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
@@ -266,6 +434,10 @@ pub(crate) struct RunFinished {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) result_snapshot: String,
     pub(crate) exit_code: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) served_model: Option<ServedRunProfileEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) effective_limits: Option<EffectiveRuntimeLimitsEvidence>,
 }
 
 #[cfg_attr(feature = "contract-schema", derive(schemars::JsonSchema))]
@@ -786,6 +958,65 @@ mod tests {
     fn reparse(event: &Event) -> Event {
         let s = serde_json::to_string(event).unwrap();
         serde_json::from_str(&s).unwrap()
+    }
+
+    #[test]
+    fn model_profile_contract_requested_and_runtime_evidence_round_trip() {
+        let requested = RequestedRunProfile::parse(
+            "openai/gpt-5.6-sol",
+            Some("sol".into()),
+            Some(ReasoningEffort::High),
+        )
+        .unwrap();
+        let started = Event::session(
+            "session-a",
+            Payload::RunStarted(RunStarted {
+                agent: "codex-serve".into(),
+                parent_run_id: String::new(),
+                base_snapshot: String::new(),
+                requested: Some(requested.clone()),
+            }),
+        );
+        assert_eq!(reparse(&started), started);
+
+        let finished = Event::session(
+            "session-a",
+            Payload::RunFinished(RunFinished {
+                result_snapshot: "snapshot-a".into(),
+                exit_code: 0,
+                served_model: Some(ServedRunProfileEvidence::Reported {
+                    profile: ServedRunProfile {
+                        provider: Some("openai".into()),
+                        model: "gpt-5.6-sol-2026-07-15".into(),
+                        profile: Some("sol".into()),
+                        reasoning_profile: Some("high".into()),
+                    },
+                }),
+                effective_limits: Some(EffectiveRuntimeLimitsEvidence::Reported {
+                    limits: EffectiveRuntimeLimits {
+                        context_window_tokens: Some(200_000),
+                        max_output_tokens: Some(32_000),
+                        supported_reasoning_profiles: vec!["medium".into(), "high".into()],
+                    },
+                }),
+            }),
+        );
+        assert_eq!(reparse(&finished), finished);
+        assert_eq!(requested.provider, "openai");
+        assert_eq!(requested.model, "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn model_profile_contract_rejects_malformed_requests_and_effort_aliases() {
+        assert!(RequestedRunProfile::parse("gpt-5.6-sol", None, None).is_err());
+        assert!(RequestedRunProfile::parse("/gpt-5.6-sol", None, None).is_err());
+        assert!(RequestedRunProfile::parse("openai/", None, None).is_err());
+        assert!(RequestedRunProfile::parse("open ai/gpt-5.6-sol", None, None).is_err());
+        assert!(
+            RequestedRunProfile::parse("openai/gpt-5.6-sol", Some(" sol".into()), None).is_err()
+        );
+        assert!("ultra".parse::<ReasoningEffort>().is_err());
+        assert!(serde_json::from_value::<EffectiveRuntimeLimits>(serde_json::json!({})).is_err());
     }
 
     #[test]

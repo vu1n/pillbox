@@ -1,12 +1,13 @@
 # syntax=docker/dockerfile:1
 # Runner image for pillbox sandboxes.
 #
-# Five agent harnesses preinstalled at known paths:
+# Six agent harnesses preinstalled at known paths:
 #   - claude  (Anthropic's native installer → /usr/local/bin/claude)
 #   - codex   (OpenAI's official installer → /usr/local/bin/codex)
 #   - amp     (npm: @ampcode/cli)
 #   - opencode (npm: opencode-ai)
 #   - pi      (npm: @earendil-works/pi-coding-agent)
+#   - cursor  (Cursor Agent CLI lab tarball → /usr/local/bin/agent)
 #
 # System tooling chosen to cover the agents' subagent + shell needs:
 # bubblewrap (codex/claude subagent sandboxing), git/gh (vcs ops),
@@ -114,9 +115,12 @@ ARG CLAUDE_VERSION=2.1.214
 # renovate: datasource=github-releases depName=openai/codex extractVersion=^rust-v(?<version>.*)$
 ARG CODEX_VERSION=0.144.5
 # renovate: datasource=npm depName=opencode-ai
-ARG OPENCODE_VERSION=1.18.9
+ARG OPENCODE_VERSION=1.18.3
 # renovate: datasource=npm depName=@earendil-works/pi-coding-agent
 ARG PI_VERSION=0.80.10
+# Cursor Agent CLI — no Renovate datasource; lab version string from
+# downloads.cursor.com/lab/<ver>/linux/<arch>/agent-cli-package.tar.gz
+ARG CURSOR_AGENT_VERSION=2026.07.23-e383d2b
 # amp has no Renovate-trackable pin: its publish scheme is timestamp+sha
 # (e.g. 0.0.1782062050-gbe2b79), which Renovate's semver matcher can't
 # compare. Pinned anyway for a deterministic layer cache; bump by hand
@@ -162,6 +166,17 @@ RUN curl -fsSL https://claude.ai/install.sh -o /tmp/claude-install.sh \
 	#   (its bundled runtime + node_modules, ~250MB). We've copied the
 	#   resolved binary into /usr/local/bin, so drop the scratch dir —
 	#   otherwise it rides along dead in the layer.
+
+# Cursor Agent CLI: versioned lab tarball (same URL the install script uses).
+# Pin CURSOR_AGENT_VERSION and bump by hand when upgrading — Renovate cannot
+# track cursor.com/lab releases today.
+RUN ARCH="$(uname -m)" \
+	&& case "$ARCH" in x86_64|amd64) CURSOR_ARCH=x64;; aarch64|arm64) CURSOR_ARCH=arm64;; *) echo "unsupported arch: $ARCH" >&2; exit 1;; esac \
+	&& mkdir -p "/opt/cursor-agent/versions/${CURSOR_AGENT_VERSION}" \
+	&& curl -fSL "https://downloads.cursor.com/lab/${CURSOR_AGENT_VERSION}/linux/${CURSOR_ARCH}/agent-cli-package.tar.gz" \
+	| tar --strip-components=1 -xzf - -C "/opt/cursor-agent/versions/${CURSOR_AGENT_VERSION}" \
+	&& ln -sf "/opt/cursor-agent/versions/${CURSOR_AGENT_VERSION}/cursor-agent" /usr/local/bin/agent \
+	&& ln -sf "/opt/cursor-agent/versions/${CURSOR_AGENT_VERSION}/cursor-agent" /usr/local/bin/cursor-agent
 
 # The in-sandbox pillbox: pty-host, event emitter, session-done wrapper.
 COPY --from=pillbox-build /pillbox /usr/local/bin/pillbox

@@ -79,6 +79,10 @@ pub(super) fn standard_egress_hosts() -> &'static [&'static str] {
         "api.groq.com",                      // Groq
         "models.dev",                        // opencode's model registry
         "opencode.ai",                       // OpenCode Zen / GO gateway (the model API)
+        "api2.cursor.sh",                    // Cursor Agent CLI model API
+        "agentn.global.api5.cursor.sh",      // Cursor Agent CLI (global edge)
+        "authenticator.cursor.sh",           // Cursor Agent CLI login poll / auth
+        "cursor.com",                        // Cursor login URL / redirects
     ]
 }
 

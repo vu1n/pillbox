@@ -49,6 +49,7 @@ impl HarnessAdapter for ClaudeAdapter {
                     agent: "claude".into(),
                     parent_run_id: String::new(),
                     base_snapshot: String::new(),
+                    requested: None,
                 })]
             }
             "assistant" => assistant_blocks(line, &mut self.state),
@@ -61,6 +62,8 @@ impl HarnessAdapter for ClaudeAdapter {
                 let mut out = vec![Payload::RunFinished(RunFinished {
                     result_snapshot: String::new(),
                     exit_code: if is_error { 1 } else { 0 },
+                    served_model: None,
+                    effective_limits: None,
                 })];
                 // Cost/usage as a Custom event — orchestrators/Slack want spend
                 // visibility, especially once `-p` bills API.

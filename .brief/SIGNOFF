@@ -45,3 +45,21 @@ session-event-log-spine conforms: OpenCode structured output becomes an ordinary
 agent-io-pty-free-contract conforms: the OpenCode mapper projects schema-bound output from the existing structured SSE API into session evidence; it adds no PTY, terminal scraping, or alternate agent I/O path.
 managed-store-of-record conforms: bounded structured-output retries, normalized terminal output, and their positional session evidence remain execution metadata in the per-session log; workspace contents and the authoritative rustic-over-R2 handle space are unchanged.
 managed-tier-do-gateway conforms: the extracted OpenCode turn driver remains inside the private per-session SessionGateway boundary; the Durable Object still owns sequencing, actor attribution, replay, invocation identity, and container lifecycle, with no host provisioning or public route added.
+session-event-log-spine conforms: requested profiles remain immutable session/run evidence, while served-model and effective-limit facts are reduced only from the same session's append-only log with the enclosing event seq as source position.
+agent-io-pty-free-contract conforms: the shared structured contract now transports provider/model/profile/reasoning requests and observed runtime evidence without adding threads, task policy, locks, or a PTY integration.
+agent-io-pty-free-contract conforms: Cursor Agent CLI stream-json adapter normalizes headless `agent -p` output into the shared contract vocabulary without adding PTY, threads, or orchestration policy.
+agent-io-pty-free-contract conforms: pi moves to Integration::Structured with the shared one-shot drain; no PTY path added.
+dx-zero-config-local conforms: session info JSON now surfaces requested vs served model evidence from the existing local session log; no daemon or remote config required.
+gateway-no-daemon conforms: session info evidence reduction stays in-process against the local §0 log; no new gateway or long-lived daemon.
+libkrun-env-fork-substrate conforms: cursor alt-auth and structured one-shot launch still use launch_base CoW forks; no real credential enters guest argv/VmSpec beyond the existing --with/env path; egress allowlist gains only Cursor hosts.
+optimization-external-substrate-primitives conforms: RequestedRunProfile/served evidence are session evidence fields only; no optimizer/policy logic enters the substrate.
+substrate-plane-livesession conforms: session info JSON evidence is a read of the existing LiveSession log; send/attach/watch surfaces are unchanged.
+vault-egress-default-deny conforms: Cursor Agent CLI hosts are an explicit allowlist addition; default-deny and the DNS fence remain.
+workspace-ingest-sovereignty conforms: structured/cursor launch uses the existing workspace virtio-fs mount; no ingest denylist change.
+libkrun-is-the-backend conforms: Cursor/pi Structured runs are libkrun-only; docker rejects them rather than gaining a parallel path.
+docker-backend-deleted conforms: docker rejects Integration::Structured rather than growing a docker structured path; no new docker features.
+runner-image-tags-name-roles conforms: build-runner.sh only adds the agent binary to the PATH check list; image tag roles are unchanged.
+qemu-parked conforms: sandbox/mod.rs only adds the structured module gate; QEMU remains parked and unselected.
+managed-store-of-record conforms: managed Session records gain an optional requested_execution field with default None; rustic-over-R2 workspace authority is unchanged.
+managed-tier-do-gateway conforms: managed.rs only fills the new Session field as None; DO gateway sequencing and drive path are untouched.
+remote-backend-plane-removed conforms: structured module is local libkrun-only; no remote URL backend returns.

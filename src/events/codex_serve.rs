@@ -110,6 +110,7 @@ impl CodexServeMapper {
                 agent: "codex".into(),
                 parent_run_id: String::new(),
                 base_snapshot: String::new(),
+                requested: None,
             })],
             "turn/started" => vec![Payload::PhaseChanged(PhaseChanged {
                 phase: AgentPhase::Thinking,

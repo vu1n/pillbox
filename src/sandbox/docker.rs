@@ -63,6 +63,17 @@ impl SandboxBackend for DockerBackend {
     }
 
     fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
+        if spec.integration == Integration::Structured {
+            return Err(PillboxError::usage(
+                "run",
+                format!(
+                    "`{}` structured stdout runs on the libkrun backend only (build --features libkrun)",
+                    spec.id
+                ),
+            )
+            .with_next("unset PILLBOX_BACKEND or set PILLBOX_BACKEND=libkrun")
+            .into());
+        }
         // Some server agents (codex-serve) only run on the libkrun backend — their
         // run path lives in the microVM. Reject on docker rather than mis-routing
         // through the opencode server path below. Keyed on the capability, not the
@@ -323,6 +334,7 @@ impl SandboxBackend for DockerBackend {
                 guest_cwd: guest_cwd.clone(),
                 placement: session::Placement::Local,
                 server: None,
+                requested_execution: None,
             };
             session::write(resolved, &session)?;
             let startup_metrics = startup.finish("session_record");
@@ -369,6 +381,7 @@ impl SandboxBackend for DockerBackend {
             guest_cwd: guest_cwd.clone(),
             placement: session::Placement::Local,
             server: None,
+            requested_execution: None,
         };
         let startup_metrics = startup.finish("host_started_event");
         crate::events::emit_session_event(
@@ -537,6 +550,7 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
                 model: model.clone(),
                 temperature: opts.temperature,
             }),
+            requested_execution: Some(opts.requested_profile(&model)?),
         };
         session::write(resolved, &session)?;
         let startup_metrics = startup.finish("session_record");

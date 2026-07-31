@@ -63,3 +63,7 @@ qemu-parked conforms: sandbox/mod.rs only adds the structured module gate; QEMU 
 managed-store-of-record conforms: managed Session records gain an optional requested_execution field with default None; rustic-over-R2 workspace authority is unchanged.
 managed-tier-do-gateway conforms: managed.rs only fills the new Session field as None; DO gateway sequencing and drive path are untouched.
 remote-backend-plane-removed conforms: structured module is local libkrun-only; no remote URL backend returns.
+libkrun-is-the-backend conforms: rustfmt-only whitespace in libkrun session structured path; backend selection unchanged.
+agent-io-pty-free-contract conforms: rustfmt-only whitespace in cursor harness; adapter vocabulary unchanged.
+libkrun-env-fork-substrate conforms: rustfmt-only whitespace in structured launch; CoW fork/env substrate unchanged.
+workspace-ingest-sovereignty conforms: rustfmt-only whitespace in session.rs; ingest denylist untouched.

@@ -121,9 +121,11 @@ impl HarnessAdapter for CursorAdapter {
                     self.state.saw_error = true;
                 }
                 let mut out = cursor_close_open_message(&mut self.state);
-                out.push(Payload::RunFinished(
-                    self.terminal_payload(if is_error { 1 } else { 0 }),
-                ));
+                out.push(Payload::RunFinished(self.terminal_payload(if is_error {
+                    1
+                } else {
+                    0
+                })));
                 out
             }
             _ => Vec::new(),

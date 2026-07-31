@@ -93,11 +93,17 @@ pub(crate) struct ServerProfile {
 #[derive(Clone, Copy)]
 pub(crate) struct StructuredProfile {
     /// Capture filename under the agent home (the §0 source the host drains).
+    /// Consumed by the libkrun structured launch path; dead on a non-libkrun build.
+    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) events_file: &'static str,
     /// How `--model` is parsed for this agent.
+    /// Consumed by the libkrun structured launch path; dead on a non-libkrun build.
+    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) model: StructuredModelPolicy,
     /// Guest env var that authenticates without the login sentinel (e.g.
     /// `CURSOR_API_KEY`). Checked at launch against the resolved run env.
+    /// Consumed by the libkrun launch_base gate; dead on a non-libkrun build.
+    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) alt_auth_env: Option<&'static str>,
 }
 
@@ -151,7 +157,9 @@ pub struct AgentSpec {
     /// backend-capability dispatch reads this instead of matching on `id`.
     pub(crate) server: Option<ServerProfile>,
     /// Structured one-shot data ([`StructuredProfile`]). `Some` iff
-    /// `integration == Structured`.
+    /// `integration == Structured`. Consumed by the libkrun structured launch
+    /// path; dead on a non-libkrun build (docker only checks `integration`).
+    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) structured: Option<StructuredProfile>,
 }
 

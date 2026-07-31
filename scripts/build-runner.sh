@@ -107,7 +107,7 @@ docker "${args[@]}"
 
 echo "▶ agent versions baked into $TAG:"
 docker run --rm --entrypoint sh "$TAG" -c '
-	for a in claude codex amp opencode pi pillbox; do
+	for a in claude codex amp opencode pi agent pillbox; do
 		printf "  %-9s %s\n" "$a" "$($a --version 2>&1 | head -1)"
 	done
 '

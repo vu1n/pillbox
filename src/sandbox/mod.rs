@@ -20,6 +20,8 @@ pub(crate) mod http;
 pub(crate) mod libkrun;
 pub(crate) mod managed;
 pub(crate) mod opencode;
+#[cfg(feature = "libkrun")]
+pub(crate) mod structured;
 
 use std::path::PathBuf;
 

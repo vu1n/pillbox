@@ -6,8 +6,9 @@ use std::collections::{HashMap, HashSet};
 use serde_json::Value;
 
 use crate::contract::{
-    Custom, MessageDelta, MessageEnd, MessageStart, Payload, Role, RunFinished, RunStarted,
-    ToolCall, ToolStatus,
+    Custom, EffectiveRuntimeLimitsEvidence, EvidenceUnavailableReason, MessageDelta, MessageEnd,
+    MessageStart, Payload, RequestedRunProfile, Role, RunFinished, RunStarted, ServedRunProfile,
+    ServedRunProfileEvidence, ToolCall, ToolStatus,
 };
 
 use super::{str_field, HarnessAdapter};
@@ -24,6 +25,9 @@ struct PiState {
     /// reports failure on the message, not the terminal `agent_end`, so this
     /// carries forward to set a non-zero `RunFinished.exit_code`.
     saw_error: bool,
+    /// Last concrete assistant response profile reported by pi itself. This is
+    /// runtime evidence; it is never filled from the requested profile.
+    served_model: Option<ServedRunProfile>,
 }
 
 /// The `pi` coding harness (https://pi.dev/, npm `@earendil-works/pi-coding-agent`)
@@ -33,13 +37,13 @@ struct PiState {
 /// stdin/stdout `--mode rpc` request/response protocol.
 ///
 /// Schema-verification status (read before trusting the normalizer):
-///   - VERIFIED empirically against pi 0.75.5 `-p --mode json`: the session
+///   - VERIFIED against pi 0.80.10 `-p --mode json`: the session
 ///     header line, `agent_start`/`turn_start`, `message_start`/`message_end`,
 ///     `turn_end`, and `agent_end` envelope, plus the assistant `message`
 ///     object shape (no `id` field; carries `timestamp`, `stopReason`,
 ///     `errorMessage`). Captured here on a quota-blocked account, so the
 ///     observed assistant turns terminated with `stopReason:"error"`.
-///   - VERIFIED from the package's shipped TypeScript declarations
+///   - VERIFIED from pi 0.80.10's shipped TypeScript declarations
 ///     (`@earendil-works/pi-ai` + `pi-agent-core` `.d.ts`, which JSON mode
 ///     serializes verbatim via `JSON.stringify(event)`): the streaming
 ///     `message_update.assistantMessageEvent` text lifecycle
@@ -55,6 +59,39 @@ struct PiState {
 #[derive(Default)]
 pub(crate) struct PiAdapter {
     state: PiState,
+    requested: Option<RequestedRunProfile>,
+}
+
+impl PiAdapter {
+    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+    pub(crate) fn with_request(requested: RequestedRunProfile) -> Self {
+        Self {
+            state: PiState::default(),
+            requested: Some(requested),
+        }
+    }
+
+    pub(crate) fn terminal_payload(&self, exit_code: i32) -> RunFinished {
+        RunFinished {
+            result_snapshot: String::new(),
+            exit_code: if exit_code != 0 || self.state.saw_error {
+                exit_code.max(1)
+            } else {
+                0
+            },
+            served_model: Some(match self.state.served_model.clone() {
+                Some(profile) => ServedRunProfileEvidence::Reported { profile },
+                None => ServedRunProfileEvidence::Unavailable {
+                    reason: EvidenceUnavailableReason::NotReported,
+                },
+            }),
+            // Pi 0.80.10 exposes catalog capabilities, but no observed per-run
+            // limits. Catalog values are not effective runtime evidence.
+            effective_limits: Some(EffectiveRuntimeLimitsEvidence::Unavailable {
+                reason: EvidenceUnavailableReason::NotReported,
+            }),
+        }
+    }
 }
 
 impl HarnessAdapter for PiAdapter {
@@ -65,7 +102,7 @@ impl HarnessAdapter for PiAdapter {
         // are off by default) since the sandbox is the security boundary, and
         // `--no-session` keeps the run ephemeral (no session file written into
         // the mounted workspace).
-        vec![
+        let mut argv = vec![
             "pi".into(),
             "-p".into(),
             "--mode".into(),
@@ -73,8 +110,28 @@ impl HarnessAdapter for PiAdapter {
             "--no-session".into(),
             "-t".into(),
             "read,bash,edit,write,grep,find,ls".into(),
-            prompt.into(),
-        ]
+        ];
+        if let Some(requested) = &self.requested {
+            argv.extend([
+                "--provider".into(),
+                requested.provider.clone(),
+                "--model".into(),
+                requested.model.clone(),
+            ]);
+            if let Some(effort) = requested.reasoning_effort {
+                argv.extend([
+                    "--thinking".into(),
+                    match effort {
+                        crate::contract::ReasoningEffort::Low => "low",
+                        crate::contract::ReasoningEffort::Medium => "medium",
+                        crate::contract::ReasoningEffort::High => "high",
+                    }
+                    .into(),
+                ]);
+            }
+        }
+        argv.push(prompt.into());
+        argv
     }
 
     fn parse_line(&mut self, line: &Value) -> Vec<Payload> {
@@ -84,6 +141,7 @@ impl HarnessAdapter for PiAdapter {
                 agent: "pi".into(),
                 parent_run_id: String::new(),
                 base_snapshot: String::new(),
+                requested: self.requested.clone(),
             })],
             // Streaming assistant output. Text arrives as a series of
             // `text_delta`s on `message_update`; the assistant `message_start`
@@ -99,10 +157,13 @@ impl HarnessAdapter for PiAdapter {
             "tool_execution_end" => pi_tool_end(line, &mut self.state),
             // Terminal event for the whole run.
             "agent_end" => {
-                vec![Payload::RunFinished(RunFinished {
-                    result_snapshot: String::new(),
-                    exit_code: if self.state.saw_error { 1 } else { 0 },
-                })]
+                if self.state.served_model.is_none() {
+                    self.state.served_model = line
+                        .get("messages")
+                        .and_then(Value::as_array)
+                        .and_then(|messages| messages.iter().rev().find_map(pi_served_profile));
+                }
+                vec![Payload::RunFinished(self.terminal_payload(0))]
             }
             // Auto-retry around a transient provider error — surface it as a
             // Custom event so orchestrators see the stall without it being
@@ -190,6 +251,9 @@ fn pi_message_end(line: &Value, state: &mut PiState) -> Vec<Payload> {
     if str_field(msg, "stopReason") == "error" {
         state.saw_error = true;
     }
+    if let Some(profile) = pi_served_profile(msg) {
+        state.served_model = Some(profile);
+    }
     // Close any open text block keyed on this message's timestamp.
     let ts = msg
         .get("timestamp")
@@ -207,6 +271,33 @@ fn pi_message_end(line: &Value, state: &mut PiState) -> Vec<Payload> {
         out.push(Payload::MessageEnd(MessageEnd::new(id)));
     }
     out
+}
+
+/// Runtime-served model from an assistant message. Pi reports the configured
+/// model plus an optional `responseModel` when the provider routed to a more
+/// concrete model; the latter is the stronger runtime fact. Thinking/profile
+/// are intentionally absent because Pi does not report their effective values.
+fn pi_served_profile(message: &Value) -> Option<ServedRunProfile> {
+    if str_field(message, "role") != "assistant" {
+        return None;
+    }
+    let model = ["responseModel", "model"].into_iter().find_map(|key| {
+        message
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+    })?;
+    let provider = message
+        .get("provider")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    Some(ServedRunProfile {
+        provider,
+        model: model.to_string(),
+        profile: None,
+        reasoning_profile: None,
+    })
 }
 
 /// `tool_execution_start` → a `running` ToolCall; remember id→name so the
@@ -282,7 +373,7 @@ mod tests {
     // ── pi ────────────────────────────────────────────────────────────────
     //
     // Lifecycle/envelope fixtures (`session`, `message_end`, `agent_end`, the
-    // assistant `message` object) are the exact shapes captured from pi 0.75.5
+    // assistant `message` object) match pi 0.80.10's JSON event declarations
     // `pi -p --mode json`. The inner streaming `message_update`
     // (`assistantMessageEvent.text_*`) and `tool_execution_*` fixtures are
     // built to the package's shipped `.d.ts` type declarations (pi JSON mode
@@ -292,6 +383,37 @@ mod tests {
     fn pi_run(lines: &[Value]) -> Vec<Payload> {
         let mut a = PiAdapter::default();
         lines.iter().flat_map(|l| a.parse_line(l)).collect()
+    }
+
+    #[test]
+    fn pi_exact_request_maps_to_native_provider_model_and_thinking_flags() {
+        let requested = RequestedRunProfile::parse(
+            "openai-codex/gpt-5.6-sol",
+            Some("sol".into()),
+            Some(crate::contract::ReasoningEffort::High),
+        )
+        .unwrap();
+        let argv = PiAdapter::with_request(requested).run_argv("do it");
+        assert_eq!(
+            argv,
+            [
+                "pi",
+                "-p",
+                "--mode",
+                "json",
+                "--no-session",
+                "-t",
+                "read,bash,edit,write,grep,find,ls",
+                "--provider",
+                "openai-codex",
+                "--model",
+                "gpt-5.6-sol",
+                "--thinking",
+                "high",
+                "do it",
+            ]
+        );
+        assert!(!argv.iter().any(|arg| arg == "sol"));
     }
 
     #[test]
@@ -415,7 +537,53 @@ mod tests {
     #[test]
     fn pi_agent_end_maps_to_run_finished_ok() {
         let out = pi_run(&[json!({"type":"agent_end","messages":[],"willRetry":false})]);
-        assert!(matches!(out.as_slice(), [Payload::RunFinished(r)] if r.exit_code == 0));
+        assert!(matches!(out.as_slice(), [Payload::RunFinished(r)]
+        if r.exit_code == 0
+            && matches!(r.served_model, Some(ServedRunProfileEvidence::Unavailable {
+                reason: EvidenceUnavailableReason::NotReported
+            }))
+            && matches!(r.effective_limits, Some(EffectiveRuntimeLimitsEvidence::Unavailable {
+                reason: EvidenceUnavailableReason::NotReported
+            }))));
+    }
+
+    #[test]
+    fn pi_terminal_reports_concrete_response_model_without_inferred_profile() {
+        let out = pi_run(&[
+            json!({"type":"message_end","message":{
+                "role":"assistant","provider":"openai-codex","model":"gpt-5.6-sol",
+                "responseModel":"gpt-5.6-sol-2026-07-15","stopReason":"stop",
+                "timestamp":1779815367989_i64,"content":[]
+            }}),
+            json!({"type":"agent_end","messages":[],"willRetry":false}),
+        ]);
+        let Some(Payload::RunFinished(finished)) = out.last() else {
+            panic!("expected terminal event, got {out:?}");
+        };
+        assert_eq!(
+            finished.served_model,
+            Some(ServedRunProfileEvidence::Reported {
+                profile: ServedRunProfile {
+                    provider: Some("openai-codex".into()),
+                    model: "gpt-5.6-sol-2026-07-15".into(),
+                    profile: None,
+                    reasoning_profile: None,
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn pi_agent_end_messages_are_runtime_evidence_when_message_end_was_absent() {
+        let out = pi_run(&[json!({"type":"agent_end","messages":[{
+            "role":"assistant","provider":"openai-codex","model":"gpt-5.6-terra",
+            "stopReason":"stop","content":[],"timestamp":1
+        }],"willRetry":false})]);
+        assert!(matches!(out.as_slice(), [Payload::RunFinished(r)]
+            if matches!(&r.served_model,
+                Some(ServedRunProfileEvidence::Reported { profile })
+                    if profile.model == "gpt-5.6-terra"
+                        && profile.provider.as_deref() == Some("openai-codex"))));
     }
 
     #[test]

@@ -233,12 +233,48 @@ fn session_transcript(
 fn session_json_with_status(
     s: &session::Session,
     status: events::status::SessionStatus,
+    served_model: Option<
+        &events::status::SourcedEvidence<crate::contract::ServedRunProfileEvidence>,
+    >,
+    effective_limits: Option<
+        &events::status::SourcedEvidence<crate::contract::EffectiveRuntimeLimitsEvidence>,
+    >,
 ) -> serde_json::Value {
     let mut v = s.to_json_value();
     if let Some(obj) = v.as_object_mut() {
         obj.insert("status".into(), status.label().into());
+        if let Some(execution) = obj.get_mut("execution").and_then(|v| v.as_object_mut()) {
+            if let Some(served) = served_model {
+                execution.insert(
+                    "served_model".into(),
+                    sourced_runtime_evidence_json(s, &served.evidence, served.seq),
+                );
+            }
+            if let Some(limits) = effective_limits {
+                execution.insert(
+                    "effective_limits".into(),
+                    sourced_runtime_evidence_json(s, &limits.evidence, limits.seq),
+                );
+            }
+        }
     }
     v
+}
+
+fn sourced_runtime_evidence_json<T: serde::Serialize>(
+    session: &session::Session,
+    evidence: &T,
+    seq: u64,
+) -> serde_json::Value {
+    let mut value = serde_json::to_value(evidence).expect("runtime evidence serializes");
+    value
+        .as_object_mut()
+        .expect("runtime evidence is an object")
+        .insert(
+            "source".into(),
+            serde_json::json!({ "session_id": session.id, "seq": seq }),
+        );
+    value
 }
 
 fn session_list(resolved: &Pillbox, json: bool) -> Result<()> {
@@ -253,8 +289,13 @@ fn session_list(resolved: &Pillbox, json: bool) -> Result<()> {
         let arr: Vec<serde_json::Value> = entries
             .iter()
             .map(|s| {
-                let status = events::status::derive(resolved, s, terminal.get(&s.id))?;
-                Ok(session_json_with_status(s, status))
+                let d = events::status::summarize(resolved, s, terminal.get(&s.id))?;
+                Ok(session_json_with_status(
+                    s,
+                    d.status,
+                    d.served_model.as_ref(),
+                    d.effective_limits.as_ref(),
+                ))
             })
             .collect::<Result<_>>()?;
         println!(
@@ -300,9 +341,16 @@ fn session_list(resolved: &Pillbox, json: bool) -> Result<()> {
 
 fn session_info(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
     let s = session::resolve(resolved, id)?;
-    let status = events::status::derive_one(resolved, &s)?;
+    let terminal = events::status::terminal_outcomes(resolved)?;
+    let d = events::status::summarize(resolved, &s, terminal.get(&s.id))?;
+    let status = d.status;
     if json {
-        let mut v = session_json_with_status(&s, status);
+        let mut v = session_json_with_status(
+            &s,
+            status,
+            d.served_model.as_ref(),
+            d.effective_limits.as_ref(),
+        );
         // Expose the host path of the result-workspace when the backend has one
         // (libkrun: the agent's CoW clone) — so graders/orchestrators read it
         // from this surface instead of parsing the session record. A backend with
@@ -357,7 +405,12 @@ fn session_diagnose(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
     };
 
     if json {
-        let mut v = session_json_with_status(&s, d.status);
+        let mut v = session_json_with_status(
+            &s,
+            d.status,
+            d.served_model.as_ref(),
+            d.effective_limits.as_ref(),
+        );
         if let Some(obj) = v.as_object_mut() {
             obj.insert("log_seq".into(), d.log_seq.into());
             obj.insert("assistant_turns".into(), d.assistant_turns.into());
@@ -1376,6 +1429,74 @@ pub(crate) fn validate_session_id(id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_profile_contract_session_json_projects_sourced_runtime_evidence() {
+        let mut s = session::Session::test_fixture();
+        s.agent_id = "opencode".into();
+        s.server = Some(session::ServerSession {
+            agent_session_id: "ses_native".into(),
+            model: "openai/gpt-5.6-luna".into(),
+            temperature: None,
+        });
+        s.requested_execution = Some(
+            crate::contract::RequestedRunProfile::parse(
+                "openai/gpt-5.6-luna",
+                Some("luna".into()),
+                Some(crate::contract::ReasoningEffort::Medium),
+            )
+            .unwrap(),
+        );
+        let served = events::status::SourcedEvidence {
+            evidence: crate::contract::ServedRunProfileEvidence::Reported {
+                profile: crate::contract::ServedRunProfile {
+                    provider: Some("openai".into()),
+                    model: "gpt-5.6-luna".into(),
+                    profile: Some("luna".into()),
+                    reasoning_profile: Some("medium".into()),
+                },
+            },
+            seq: 18,
+        };
+        let limits = events::status::SourcedEvidence {
+            evidence: crate::contract::EffectiveRuntimeLimitsEvidence::Reported {
+                limits: crate::contract::EffectiveRuntimeLimits {
+                    context_window_tokens: Some(200_000),
+                    max_output_tokens: Some(32_000),
+                    supported_reasoning_profiles: vec!["medium".into(), "high".into()],
+                },
+            },
+            seq: 20,
+        };
+
+        let v = session_json_with_status(
+            &s,
+            events::status::SessionStatus::NeedsInput,
+            Some(&served),
+            Some(&limits),
+        );
+        assert_eq!(
+            v["execution"]["effective_limits"],
+            serde_json::json!({
+                "status": "reported",
+                "contextWindowTokens": 200000,
+                "maxOutputTokens": 32000,
+                "supportedReasoningProfiles": ["medium", "high"],
+                "source": { "session_id": "abc123def456", "seq": 20 }
+            })
+        );
+        assert_eq!(
+            v["execution"]["served_model"],
+            serde_json::json!({
+                "status": "reported",
+                "provider": "openai",
+                "model": "gpt-5.6-luna",
+                "profile": "luna",
+                "reasoningProfile": "medium",
+                "source": { "session_id": "abc123def456", "seq": 18 }
+            })
+        );
+    }
 
     #[test]
     fn validate_session_id_accepts_minted_form() {

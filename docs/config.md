@@ -14,7 +14,7 @@ For the command-table reference see [../AGENTS.md](../AGENTS.md).
 name = "my-project"
 
 # Optional — run-config defaults for `pillbox run`
-agent = "claude"          # "claude" | "codex" | "codex-serve" | "opencode" | "pi"
+agent = "claude"          # "claude" | "codex" | "codex-serve" | "opencode" | "pi" | "cursor"
 model = "zai-coding-plan/glm-4.5-air"   # provider/model; omitted → the agent's own default
 
 # Sandbox image. Omitted → the published default (which may not be cached → set this).
@@ -41,7 +41,7 @@ typos *inside* `[workspace]` are silently ignored at parse time.
 | Field | Type | Notes |
 |---|---|---|
 | `name` | string | Required. Display name for the pillbox; also defaults `pillbox run`'s `--name`. |
-| `agent` | string | Default agent for `pillbox run` (`claude`, `codex`, `codex-serve`, `opencode`, or `pi`). |
+| `agent` | string | Default agent for `pillbox run` (`claude`, `codex`, `codex-serve`, `opencode`, `pi`, or `cursor`). |
 | `model` | string | Default model for `pillbox run` (`provider/model`). Omitted → the agent's own default. Overridden by `--model`. |
 | `[runner].image` | string | Sandbox image. Omitted → the published default (often uncached). Overridden by `$PILLBOX_RUNNER_IMAGE`. |
 | `[workspace].backend` | string | `local` (default) or `s3`. Picks the rustic-backed snapshot store. |

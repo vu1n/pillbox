@@ -1119,7 +1119,10 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
     if !opts.mcps.is_empty() || !opts.mcp_tokens.is_empty() {
         return Err(PillboxError::usage(
             "run",
-            format!("`{}` structured mode does not support MCP attachments", spec.id),
+            format!(
+                "`{}` structured mode does not support MCP attachments",
+                spec.id
+            ),
         )
         .into());
     }
@@ -1429,10 +1432,7 @@ fn resolve_structured_request(
                 if opts.profile.is_some() || opts.reasoning_effort.is_some() {
                     return Err(PillboxError::usage(
                         "run",
-                        format!(
-                            "`{}` --profile/--reasoning-effort require --model",
-                            spec.id
-                        ),
+                        format!("`{}` --profile/--reasoning-effort require --model", spec.id),
                     )
                     .into());
                 }

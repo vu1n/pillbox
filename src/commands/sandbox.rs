@@ -340,6 +340,7 @@ impl ServeDriver {
             agent: "opencode".into(),
             parent_run_id: String::new(),
             base_snapshot: String::new(),
+            requested: None,
         }))?;
 
         // 4. Fire the prompt on a background thread *after* a short delay, so
@@ -407,6 +408,8 @@ impl ServeDriver {
             self.emit(Payload::RunFinished(RunFinished {
                 result_snapshot: String::new(),
                 exit_code: 1,
+                served_model: None,
+                effective_limits: None,
             }))?;
         }
         Ok(())

@@ -16,10 +16,12 @@ use serde_json::Value;
 use crate::contract::Payload;
 
 mod claude;
+mod cursor;
 mod opencode;
 mod pi;
 
 pub(crate) use claude::ClaudeAdapter;
+pub(crate) use cursor::CursorAdapter;
 pub(crate) use opencode::OpencodeAdapter;
 pub(crate) use pi::PiAdapter;
 
@@ -60,6 +62,7 @@ pub(crate) trait ServeAdapter {
 pub(crate) fn lookup(id: &str) -> Option<Box<dyn HarnessAdapter>> {
     match id {
         "claude" => Some(Box::new(ClaudeAdapter::default())),
+        "cursor" => Some(Box::new(CursorAdapter::default())),
         "pi" => Some(Box::new(PiAdapter::default())),
         _ => None,
     }

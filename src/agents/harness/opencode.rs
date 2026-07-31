@@ -89,6 +89,7 @@ impl ServeAdapter for OpencodeAdapter {
                 agent: "opencode".into(),
                 parent_run_id: String::new(),
                 base_snapshot: String::new(),
+                requested: None,
             })],
             // Record id→role so text parts of the user's own prompt aren't
             // re-emitted as assistant output. Emits nothing itself.
@@ -125,6 +126,8 @@ impl ServeAdapter for OpencodeAdapter {
             "session.idle" => vec![Payload::RunFinished(RunFinished {
                 result_snapshot: String::new(),
                 exit_code: 0,
+                served_model: None,
+                effective_limits: None,
             })],
             "session.error" | "session.next.step.failed" => {
                 let msg = opencode_error_message(props.get("error"));

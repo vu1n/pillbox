@@ -34,12 +34,12 @@ global pillbox regardless of where you are.
 | `pillbox secret rm NAME [--global]` | Delete a secret. |
 | `pillbox env load NAME PATH [--global]` | Parse `.env` file, store as bundle. |
 | `pillbox env list/show/rm` | Same shape as secrets. |
-| `pillbox auth login --agent A` | Run the agent's OAuth flow inside a sandbox. Always writes to global. |
+| `pillbox auth login --agent A` | Run the agent's OAuth flow inside a sandbox. Always writes to global. For `cursor`, browser login (`agent login`) is one path; API-key auth is also supported via a stored `CURSOR_API_KEY` (see Cursor auth below). |
 | `pillbox auth list/rm` | List/remove agent OAuth state. |
 | `pillbox vault ca/status [--json]` | Inspect the per-pillbox vault CA. |
 | `pillbox sidecar [--bind] [--json]` | Standalone vault sidecar process. |
 | `pillbox session list [--json]` | List sessions started from this pillbox (oldest first). |
-| `pillbox session info ID [--json]` | Show one session (accepts unique id prefix ≥ 4 chars). |
+| `pillbox session info ID [--json]` | Show one session (accepts unique id prefix ≥ 4 chars). Structured-session JSON separates the persisted `execution.requested` provider/model/profile/reasoning request from `served_model` and `effective_limits`. Reported runtime facts cite their session-log `seq`; missing facts are explicit `unavailable` values and are never filled from the request. |
 | `pillbox session diagnose ID [--json]` | Diagnose one session: derived status, failure detail, and an activity summary from the durable log — the "what happened / why is it stuck" companion to `info`. Accepts an id prefix ≥ 4 chars. |
 | `pillbox session attach ID` | Reattach to a detached local libkrun PTY session. Detach again with Ctrl-A + D or `pillbox session detach ID` from another shell. Managed sessions have no host PTY; the deprecated Docker backend remains compatibility residue. |
 | `pillbox session detach ID` | Signal a currently-attached pillbox to detach (SIGTERM, no-op if already detached). |
@@ -92,7 +92,7 @@ PTY-free exec channel an orchestrator drives. Docker-backed today.
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--agent A` | `pillbox.toml` `agent` field, then `claude` | Agent to launch (`claude` \| `codex` \| `codex-serve` \| `opencode` \| `pi`). `codex-serve` drives `codex app-server` (codex's structured JSON-RPC protocol) as a server-mode agent — libkrun-only, shares `codex`'s auth (one `auth login --agent codex`), driven via `session send` + read via `session watch`/`subscribe`. The PTY `codex` is the default and unaffected. |
+| `--agent A` | `pillbox.toml` `agent` field, then `claude` | Agent to launch (`claude` \| `codex` \| `codex-serve` \| `opencode` \| `pi` \| `cursor`). `pi` and `cursor` are libkrun-only structured one-shot agents (`stream-json` → §0). Cursor auth: `auth login --agent cursor` **or** inject `CURSOR_API_KEY` (see Cursor auth below). `codex-serve` drives `codex app-server` (codex's structured JSON-RPC protocol) as a server-mode agent — libkrun-only, shares `codex`'s auth (one `auth login --agent codex`), driven via `session send` + read via `session watch`/`subscribe`. The PTY `codex` is the default and unaffected. |
 | `--workspace PATH` | cwd | Host directory to mount. |
 | `--name NAME` | `pillbox.toml` `name`, else basename(workspace) | Mount-point name (`/workspace/NAME`). |
 | `--mount HOST:GUEST` | — | Extra bind mount. Repeatable. |
@@ -111,7 +111,9 @@ PTY-free exec channel an orchestrator drives. Docker-backed today.
 | `--ttl DURATION` | — | Per-session retention TTL — `30m` / `24h` / `7d` (`s`/`m`/`h`/`d` units only, max 365d). Writes `expires_at` to the record. `pillbox session prune` drops expired sessions. Requires `--detach`. |
 | `--label TEXT` | — | Human label for a detached session, surfaced in `pillbox session list`. Only meaningful with `--detach`. |
 | `--json` | — | Emit the started session as `{version:1, session:{id,…}}` on stdout instead of the human banner — `pillbox run --json \| jq -r .session.id`. Needs a persisted session: a `--detach` run (any agent) or a server-mode agent (`opencode`, always reparented). A foreground PTY run has nothing to emit and is rejected at dispatch. |
-| `--model PROVIDER/MODEL` | agent default | Model for a server-mode agent (`opencode`), e.g. `zai-coding-plan/glm-4.5-air`. Ignored by PTY agents. |
+| `--model PROVIDER/MODEL` | agent default | Requested model for a structured server agent, e.g. `openai/gpt-5.6-luna`. The provider and model are validated and persisted separately; compare them with runtime evidence in `session info --json`. |
+| `--profile PROFILE` | explicit none | Optional exact model profile selected by the caller. Pillbox transports and records it; it does not choose Sol/Terra/Luna. Rejected for PTY-only integrations. |
+| `--reasoning-effort low\|medium\|high` | harness default | Normalized requested reasoning effort. Runtime-native names remain observed evidence and do not widen this enum. Rejected for PTY-only integrations. |
 | `--temperature FLOAT` | — | Sampling temperature for a server-mode agent (`opencode`), sent on every `session send`. `0` = greedy/deterministic decoding (the eval rig's variance knob). Ignored by PTY agents. |
 | `--parent ID` | — | The session this run forked from. Carried to the lifecycle event as `parent_session_id` and to OTel as `parent_span_id`, so a forked trace stitches across pillboxes. Observability metadata — the parent need not exist in this pillbox. |
 
@@ -140,6 +142,32 @@ the agent's positional prompt: `pillbox run --agent claude -- "your prompt"`
 (interactive, *not* `-p`). Full `--dangerously-skip-permissions` is refused by
 claude as root (the runner runs as root); `auto` is the strongest mode that
 works today.
+
+#### Cursor auth
+
+`cursor` accepts either OAuth login or a Cursor user API key (the CLI's
+`CURSOR_API_KEY` / `--api-key` path). Prefer login for interactive use; prefer
+the API key for CI / headless runs.
+
+```sh
+# Browser login (remote URL + poll; no localhost callback). Writes
+# ~/.pillbox/global/auth/cursor/.config/cursor/auth.json
+pillbox auth login --agent cursor
+
+# API key — store once, inject on run (no login sentinel required)
+pillbox secret add CURSOR_API_KEY          # paste key, Ctrl-D
+pillbox run --agent cursor --with CURSOR_API_KEY -- "say hello"
+```
+
+`--with CURSOR_API_KEY` injects the secret as the env var `CURSOR_API_KEY`.
+If the stored secret has a different name, map it onto that env var:
+`--with MY_CURSOR_KEY=CURSOR_API_KEY`. The Cursor CLI reads `CURSOR_API_KEY`
+specifically — renaming *away* from that name will fail auth. An env bundle /
+`--env-file` that sets `CURSOR_API_KEY` works the same way. Cursor is not
+vault-capable yet — do not pass `--vault` for this agent.
+
+`--model` for cursor takes a **bare** model id (`composer-2.5`, `grok-4.5`),
+not `PROVIDER/MODEL`.
 
 ### `pillbox secret add` flags
 

@@ -25,7 +25,10 @@ use std::collections::HashMap;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::contract::{AttentionReason, Payload, Role, ToolStatus};
+use crate::contract::{
+    AttentionReason, EffectiveRuntimeLimitsEvidence, Payload, Role, ServedRunProfile,
+    ServedRunProfileEvidence, ToolStatus,
+};
 use crate::events::{events_path, log};
 use crate::pillbox::Pillbox;
 use crate::session::Session;
@@ -72,6 +75,35 @@ pub(crate) struct Diagnosis {
     pub(crate) tool_calls: u64,
     pub(crate) last_at: String,
     pub(crate) log_seq: u64,
+    /// Latest model the runtime reported on a completed assistant message.
+    /// This is response evidence, distinct from the model requested at launch.
+    pub(crate) served_model: Option<SourcedEvidence<ServedRunProfileEvidence>>,
+    /// Latest effective-limit evidence reported by the runtime. Advertised
+    /// capability and the requested profile never populate this field.
+    pub(crate) effective_limits: Option<SourcedEvidence<EffectiveRuntimeLimitsEvidence>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SourcedEvidence<T> {
+    pub(crate) evidence: T,
+    pub(crate) seq: u64,
+}
+
+fn served_profile_from_message(model: String) -> ServedRunProfileEvidence {
+    let (provider, model) = match model.split_once('/') {
+        Some((provider, model)) if !provider.is_empty() && !model.is_empty() => {
+            (Some(provider.to_string()), model.to_string())
+        }
+        _ => (None, model),
+    };
+    ServedRunProfileEvidence::Reported {
+        profile: ServedRunProfile {
+            provider,
+            model,
+            profile: None,
+            reasoning_profile: None,
+        },
+    }
 }
 
 /// A host-visible terminal outcome for a session, with the detail `diagnose`
@@ -157,6 +189,8 @@ pub(crate) fn summarize(
     let mut tool_calls = 0;
     let mut last_at = String::new();
     let mut log_seq = 0;
+    let mut served_model = None;
+    let mut effective_limits = None;
     for ev in log::read_log(pb, &session.id)? {
         log_seq = ev.seq;
         if !ev.at.is_empty() {
@@ -179,6 +213,26 @@ pub(crate) fn summarize(
                 tool_calls += 1;
             }
             Payload::Thinking(_) => pending_input = false,
+            Payload::MessageEnd(m) if !m.model.is_empty() => {
+                served_model = Some(SourcedEvidence {
+                    evidence: served_profile_from_message(m.model),
+                    seq: ev.seq,
+                });
+            }
+            Payload::RunFinished(run) => {
+                if let Some(evidence) = run.served_model {
+                    served_model = Some(SourcedEvidence {
+                        evidence,
+                        seq: ev.seq,
+                    });
+                }
+                if let Some(evidence) = run.effective_limits {
+                    effective_limits = Some(SourcedEvidence {
+                        evidence,
+                        seq: ev.seq,
+                    });
+                }
+            }
             _ => {}
         }
     }
@@ -199,6 +253,8 @@ pub(crate) fn summarize(
         tool_calls,
         last_at,
         log_seq,
+        served_model,
+        effective_limits,
     })
 }
 
@@ -211,16 +267,10 @@ pub(crate) fn derive(
     Ok(summarize(pb, session, terminal)?.status)
 }
 
-/// Single-session convenience (`info`): fold the sink for just this id.
-pub(crate) fn derive_one(pb: &Pillbox, session: &Session) -> Result<SessionStatus> {
-    let terminal = terminal_outcomes(pb)?;
-    derive(pb, session, terminal.get(&session.id))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::{AttentionRequired, Event, MessageStart, Role};
+    use crate::contract::{AttentionRequired, Event, MessageEnd, MessageStart, Role};
     use crate::events::log::SessionLog;
     use crate::test_util::with_isolated_home;
 
@@ -344,6 +394,93 @@ mod tests {
             );
             assert_eq!(d.log_seq, 4);
             assert_eq!(d.status, SessionStatus::Running);
+        });
+    }
+
+    #[test]
+    fn summarize_retains_latest_reported_served_model_and_event_seq() {
+        with_isolated_home("status-served-model", || {
+            let pb = crate::pillbox::global();
+            let s = sess("ffff11112222");
+            let mut log = SessionLog::open(&pb, &s.id).unwrap();
+            let mut first = MessageEnd::new("m1");
+            first.model = "openai/gpt-5.6-luna".into();
+            let unavailable = MessageEnd::new("m2");
+            let mut latest = MessageEnd::new("m3");
+            latest.model = "openai/gpt-5.6-terra".into();
+            log.append(&[
+                Event::session(&s.id, Payload::MessageEnd(first)),
+                Event::session(&s.id, Payload::MessageEnd(unavailable)),
+                Event::session(&s.id, Payload::MessageEnd(latest)),
+            ])
+            .unwrap();
+
+            let d = summarize(&pb, &s, None).unwrap();
+            assert_eq!(
+                d.served_model,
+                Some(SourcedEvidence {
+                    evidence: ServedRunProfileEvidence::Reported {
+                        profile: ServedRunProfile {
+                            provider: Some("openai".into()),
+                            model: "gpt-5.6-terra".into(),
+                            profile: None,
+                            reasoning_profile: None,
+                        },
+                    },
+                    seq: 3,
+                })
+            );
+        });
+    }
+
+    #[test]
+    fn model_profile_contract_runtime_evidence_is_sourced_and_session_isolated() {
+        with_isolated_home("status-runtime-profile", || {
+            let pb = crate::pillbox::global();
+            let session_a = sess("aaaa11112222");
+            let session_b = sess("bbbb11112222");
+            let finished = |model: &str, window| {
+                Payload::RunFinished(crate::contract::RunFinished {
+                    result_snapshot: String::new(),
+                    exit_code: 0,
+                    served_model: Some(ServedRunProfileEvidence::Reported {
+                        profile: ServedRunProfile {
+                            provider: Some("openai".into()),
+                            model: model.into(),
+                            profile: None,
+                            reasoning_profile: Some("high".into()),
+                        },
+                    }),
+                    effective_limits: Some(EffectiveRuntimeLimitsEvidence::Reported {
+                        limits: crate::contract::EffectiveRuntimeLimits {
+                            context_window_tokens: Some(window),
+                            max_output_tokens: None,
+                            supported_reasoning_profiles: vec!["high".into()],
+                        },
+                    }),
+                })
+            };
+            SessionLog::open(&pb, &session_a.id)
+                .unwrap()
+                .append(&[Event::session(
+                    &session_a.id,
+                    finished("gpt-5.6-sol", 200_000),
+                )])
+                .unwrap();
+            SessionLog::open(&pb, &session_b.id)
+                .unwrap()
+                .append(&[Event::session(
+                    &session_b.id,
+                    finished("gpt-5.6-terra", 128_000),
+                )])
+                .unwrap();
+
+            let a = summarize(&pb, &session_a, None).unwrap();
+            let b = summarize(&pb, &session_b, None).unwrap();
+            assert_eq!(a.served_model.as_ref().unwrap().seq, 1);
+            assert_eq!(b.served_model.as_ref().unwrap().seq, 1);
+            assert_ne!(a.served_model, b.served_model);
+            assert_ne!(a.effective_limits, b.effective_limits);
         });
     }
 

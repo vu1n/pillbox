@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agents::{
     resolve_run_env, resolve_with_entries, workspace_mount_name, AgentSpec, Integration, RunOpts,
-    GUEST_HOME, GUEST_WORKSPACE,
+    StructuredModelPolicy, StructuredProfile, GUEST_HOME, GUEST_WORKSPACE,
 };
 use crate::attach::pump;
 use crate::errors::PillboxError;
@@ -60,6 +60,9 @@ impl SandboxBackend for LibkrunBackend {
     }
 
     fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
+        if spec.integration == Integration::Structured {
+            return run_structured(spec, opts, resolved);
+        }
         // Server-integration agents run headless + are driven/read over their HTTP
         // API through a vsock port-forward — a distinct path with no PTY (mirrors
         // docker's split). The two share `launch_server_vm`; this picks the
@@ -170,6 +173,7 @@ impl SandboxBackend for LibkrunBackend {
                     guest_cwd: launch.guest_workspace.clone(),
                     placement: crate::session::Placement::Local,
                     server: None,
+                    requested_execution: None,
                 };
                 let startup_metrics = startup.finish("host_started_event");
                 crate::events::emit_session_event(
@@ -334,6 +338,15 @@ fn provision_vault_ca(resolved: &Pillbox, lifetime: CaLifetime) -> Result<VaultC
     })
 }
 
+/// True when `spec.structured.alt_auth_env` is set and present (non-empty) in
+/// the resolved guest env — an alternate to the login sentinel.
+fn alt_auth_configured(resolved: &Pillbox, opts: &RunOpts, env_var: &str) -> Result<bool> {
+    let withs = resolve_with_entries(resolved, &opts.withs)?;
+    // Plain secrets only — vaulted --with is rejected for Structured runs later.
+    let env = resolve_run_env(resolved, opts, &withs, None)?;
+    Ok(env.get(env_var).is_some_and(|value| !value.is_empty()))
+}
+
 fn launch_base(
     spec: &AgentSpec,
     opts: &RunOpts,
@@ -348,12 +361,25 @@ fn launch_base(
 
     let home = spec.home_dir(resolved)?;
     if !home.join(spec.cred_sentinel).exists() {
-        return Err(PillboxError::runtime(
-            "run",
-            format!("no stored credentials for `{}`", spec.id),
-        )
-        .with_next(format!("pillbox auth login --agent {}", spec.id))
-        .into());
+        let alt_ok = match spec.structured.and_then(|p| p.alt_auth_env) {
+            Some(var) => alt_auth_configured(resolved, opts, var)?,
+            None => false,
+        };
+        if !alt_ok {
+            let next = match spec.structured.and_then(|p| p.alt_auth_env) {
+                Some(var) => format!(
+                    "pillbox auth login --agent {}   # or: pillbox secret add {var} && run with --with {var}",
+                    spec.id
+                ),
+                None => format!("pillbox auth login --agent {}", spec.id),
+            };
+            return Err(PillboxError::runtime(
+                "run",
+                format!("no stored credentials for `{}`", spec.id),
+            )
+            .with_next(next)
+            .into());
+        }
     }
 
     let workspace_host = match &opts.workspace {
@@ -739,6 +765,7 @@ fn run_detached(
         guest_cwd: launch.guest_workspace,
         placement: crate::session::Placement::Local,
         server: None,
+        requested_execution: None,
     };
     crate::session::write(resolved, &session)?;
     let startup_metrics = startup.finish("session_record");
@@ -972,6 +999,7 @@ fn launch_server_vm(
                 model: launch.model.clone(),
                 temperature: opts.temperature,
             }),
+            requested_execution: Some(opts.requested_profile(&launch.model)?),
         };
         crate::session::write(resolved, &session)?;
         let startup_metrics = startup.finish("session_record");
@@ -1044,6 +1072,374 @@ fn launch_server_vm(
         (!prompt.is_empty()).then_some(prompt.as_str()),
     );
     Ok(())
+}
+
+fn structured_vmm_diagnostic(stderr: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("krun-vmm: ").map(str::to_string))
+}
+
+/// Run a [`Integration::Structured`] agent as a durable one-shot JSON worker.
+/// The VM has no PTY and no prompt API: the agent writes native JSONL to the
+/// host-readable cloned home, then the supervising host normalizes that capture
+/// into the session log before returning.
+fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
+    use crate::sandbox::structured as structured_io;
+
+    let profile = spec.structured.as_ref().ok_or_else(|| {
+        PillboxError::usage(
+            "run",
+            format!("structured mode is not wired for agent `{}`", spec.id),
+        )
+    })?;
+
+    if opts.detach {
+        return Err(PillboxError::usage(
+            "run",
+            format!(
+                "`{}` structured mode is a supervised one-shot run and cannot detach",
+                spec.id
+            ),
+        )
+        .into());
+    }
+    let withs = resolve_with_entries(resolved, &opts.withs)?;
+    if opts.vault || withs.iter().any(|entry| entry.meta.is_some()) {
+        return Err(PillboxError::usage(
+            "run",
+            format!(
+                "`{}` structured mode does not support the vault or vaulted --with secrets",
+                spec.id
+            ),
+        )
+        .into());
+    }
+    if !opts.mcps.is_empty() || !opts.mcp_tokens.is_empty() {
+        return Err(PillboxError::usage(
+            "run",
+            format!("`{}` structured mode does not support MCP attachments", spec.id),
+        )
+        .into());
+    }
+
+    let prompt = opts.args.join(" ").trim().to_string();
+    if prompt.is_empty() {
+        return Err(PillboxError::usage(
+            "run",
+            format!("`{}` structured mode requires a prompt after `--`", spec.id),
+        )
+        .into());
+    }
+
+    let requested = resolve_structured_request(spec, profile, &opts)?;
+    let requested_execution = requested.clone();
+
+    let mut startup = StartupTimer::start();
+    let LaunchBase {
+        rootfs,
+        home,
+        workspace_clone,
+        guest_workspace,
+        guest_env,
+        ca,
+        with_vault: _,
+    } = launch_base(spec, &opts, resolved, CaLifetime::Ephemeral)?;
+    let creds_share = cow_clone_home(&home)?;
+    let argv = structured_io::run_argv(spec.id, requested.clone(), &prompt)?
+        .iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let events_file = profile.events_file;
+    let events_guest = format!("{GUEST_HOME}/{events_file}");
+    let events_q = shell_quote(&events_guest);
+    let preamble = guest_launch_preamble(&ca.cert_pem, &shell_quote(&guest_workspace));
+    let exports = boot::env_exports(&guest_env)?;
+    let (boot_share, boot_exec) = boot::boot_channel(
+        &creds_share,
+        "creds",
+        GUEST_HOME,
+        &format!("{exports}{preamble}; exec {argv} > {events_q}"),
+    )?;
+    let vmspec = VmSpec {
+        rootfs: rootfs.to_string_lossy().into_owned(),
+        vcpus: 2,
+        ram_mib: 2048,
+        shares: vec![
+            boot_share,
+            Share {
+                tag: "workspace".into(),
+                host_path: workspace_clone.to_string_lossy().into_owned(),
+            },
+        ],
+        exec: boot_exec,
+        vsock: None,
+        egress: Some(EgressSpec {
+            allowlist: crate::vault::providers::intercepted_hosts()
+                .into_iter()
+                .map(str::to_string)
+                .chain(
+                    egress::standard_egress_hosts()
+                        .iter()
+                        .map(|host| (*host).to_string()),
+                )
+                .chain(opts.egress_allow.iter().cloned())
+                .collect(),
+            log_path: std::env::var("PILLBOX_KRUN_EGRESS_LOG").ok(),
+            ca_dir: Some(ca.dir.to_string_lossy().into_owned()),
+            local_forward_port: None,
+            refresh: None,
+        }),
+    };
+    let spec_file = tempfile::Builder::new()
+        .prefix("pillbox-krun-spec-")
+        .suffix(".json")
+        .tempfile()
+        .context("create structured VMM spec tempfile")?;
+    serde_json::to_writer(&spec_file, &vmspec).context("write structured VMM spec")?;
+    let (_, spec_path) = spec_file.keep().context("persist structured VMM spec")?;
+    startup.mark("launch_prepare");
+
+    let session_id = crate::session::Session::new_id();
+    let handle = LibkrunHandle {
+        sock: String::new(),
+        pid: 0,
+        creds: creds_share.to_string_lossy().into_owned(),
+        workspace: workspace_clone.to_string_lossy().into_owned(),
+        spec: spec_path.to_string_lossy().into_owned(),
+    };
+    let mut session = crate::session::Session {
+        id: session_id.clone(),
+        label: opts.label.clone(),
+        backend: crate::session::BACKEND_LIBKRUN.to_string(),
+        sandbox_id: serde_json::to_string(&handle).context("encode structured libkrun handle")?,
+        pty_pid: 0,
+        agent_id: spec.id.to_string(),
+        started_at: crate::session::now_rfc3339(),
+        attached_pid: Some(std::process::id() as i64),
+        base_snapshot: None,
+        result_snapshot: None,
+        expires_at: opts.ttl_seconds.map(crate::session::expires_at_from_ttl),
+        guest_cwd: guest_workspace,
+        placement: crate::session::Placement::Local,
+        server: None,
+        requested_execution,
+    };
+    crate::session::write(resolved, &session)?;
+    let mut log = crate::events::log::SessionLog::open(resolved, &session.id)?;
+    structured_io::append_started(spec.id, &session.id, requested.clone(), &mut log)?;
+    let startup_metrics = startup.finish("session_record");
+    crate::events::emit_session_event(
+        resolved,
+        crate::events::EventType::SessionStarted {
+            parent_session_id: crate::events::parent_session_id_from_env(),
+            startup: Some(startup_metrics),
+        },
+        &session.id,
+        Some(&session),
+    );
+
+    let execution = (|| -> Result<(std::process::ExitStatus, Option<String>)> {
+        let exe = std::env::current_exe().context("locate pillbox for structured VMM")?;
+        let mut cmd = Command::new(exe);
+        cmd.arg("__krun-vmm")
+            .arg(&spec_path)
+            .env_clear()
+            .envs(boot::static_child_env())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+        vmm_own_process_group(&mut cmd);
+        let mut child = cmd.spawn().context("spawn structured libkrun VMM")?;
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write as _;
+            stdin
+                .write_all(b"[]")
+                .context("send empty structured swap set")?;
+        }
+        let output = child
+            .wait_with_output()
+            .context("wait for structured libkrun VMM")?;
+        let diagnostic = structured_vmm_diagnostic(&output.stderr);
+        Ok((output.status, diagnostic))
+    })();
+
+    let (status, vmm_diagnostic) = match execution {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            session.attached_pid = None;
+            crate::session::write(resolved, &session)?;
+            structured_io::append_unavailable_terminal(
+                spec.id,
+                &session.id,
+                requested.clone(),
+                1,
+                &mut log,
+            )?;
+            crate::events::emit_session_event(
+                resolved,
+                crate::events::EventType::SessionFailed {
+                    reason: error.to_string(),
+                    exit_code: Some(1),
+                    trace_path: None,
+                    result_snapshot: None,
+                },
+                &session.id,
+                Some(&session),
+            );
+            return Err(error);
+        }
+    };
+    session.attached_pid = None;
+    crate::session::write(resolved, &session)?;
+    let process_exit = status.code().unwrap_or(1);
+    let capture = creds_share.join(events_file);
+    let drained = (|| -> Result<(usize, i32)> {
+        let file = std::fs::File::open(&capture).with_context(|| match vmm_diagnostic.as_deref() {
+            Some(diagnostic) => format!(
+                "{} VMM exited with code {process_exit} before creating structured capture: {diagnostic}",
+                spec.id
+            ),
+            None => format!("open {} structured capture {}", spec.id, capture.display()),
+        })?;
+        let outcome = structured_io::drain_jsonl(
+            spec.id,
+            file,
+            &session.id,
+            requested.clone(),
+            process_exit,
+            &mut log,
+        )?;
+        Ok((outcome.events, outcome.exit_code))
+    })();
+    let outcome = match drained {
+        Ok((events, exit_code)) => (events, exit_code),
+        Err(error) => {
+            structured_io::append_unavailable_terminal(
+                spec.id,
+                &session.id,
+                requested,
+                process_exit.max(1),
+                &mut log,
+            )?;
+            crate::events::emit_session_event(
+                resolved,
+                crate::events::EventType::SessionFailed {
+                    reason: error.to_string(),
+                    exit_code: Some(process_exit.max(1)),
+                    trace_path: None,
+                    result_snapshot: None,
+                },
+                &session.id,
+                Some(&session),
+            );
+            return Err(error);
+        }
+    };
+    let (outcome_events, outcome_exit_code) = outcome;
+    let terminal = if outcome_exit_code == 0 {
+        crate::events::EventType::SessionCompleted {
+            exit_code: Some(0),
+            trace_path: None,
+            result_snapshot: None,
+        }
+    } else {
+        crate::events::EventType::SessionFailed {
+            reason: format!("{} structured run failed", spec.id),
+            exit_code: Some(outcome_exit_code),
+            trace_path: None,
+            result_snapshot: None,
+        }
+    };
+    crate::events::emit_session_event(resolved, terminal, &session.id, Some(&session));
+    if opts.json {
+        crate::session::print_started_json(&session);
+    } else {
+        println!(
+            "pillbox: ✓ {} session `{}` finished ({} durable events)",
+            spec.id,
+            session.id,
+            outcome_events + 1
+        );
+    }
+    if outcome_exit_code != 0 {
+        bail!("{} structured run exited {}", spec.id, outcome_exit_code);
+    }
+    Ok(())
+}
+
+/// Resolve the structured agent's `--model` request from its [`StructuredProfile`]
+/// policy — the one place that knows pi requires PROVIDER/MODEL and cursor takes
+/// an optional bare id.
+fn resolve_structured_request(
+    spec: &AgentSpec,
+    profile: &StructuredProfile,
+    opts: &RunOpts,
+) -> Result<Option<crate::contract::RequestedRunProfile>> {
+    match profile.model {
+        StructuredModelPolicy::RequireProviderModel => {
+            let model = opts.model.as_deref().ok_or_else(|| {
+                PillboxError::usage(
+                    "run",
+                    format!(
+                        "`{}` structured mode requires an exact --model PROVIDER/MODEL",
+                        spec.id
+                    ),
+                )
+            })?;
+            Ok(Some(opts.requested_profile(model)?))
+        }
+        StructuredModelPolicy::OptionalBare => match opts.model.as_deref() {
+            Some(model) if model.contains('/') => Ok(Some(opts.requested_profile(model)?)),
+            Some(model) => {
+                if model.is_empty()
+                    || model.trim() != model
+                    || model.chars().any(char::is_whitespace)
+                {
+                    return Err(PillboxError::usage(
+                        "run",
+                        format!(
+                            "`{}` --model must be a non-empty bare id, got `{model}`",
+                            spec.id
+                        ),
+                    )
+                    .into());
+                }
+                if opts.profile.as_deref().is_some_and(|value| {
+                    value.is_empty()
+                        || value.trim() != value
+                        || value.chars().any(char::is_whitespace)
+                }) {
+                    return Err(PillboxError::usage(
+                        "run",
+                        "profile must be non-empty and whitespace-free when provided",
+                    )
+                    .into());
+                }
+                Ok(Some(crate::contract::RequestedRunProfile {
+                    provider: spec.id.into(),
+                    model: model.to_string(),
+                    profile: opts.profile.clone(),
+                    reasoning_effort: opts.reasoning_effort,
+                }))
+            }
+            None => {
+                if opts.profile.is_some() || opts.reasoning_effort.is_some() {
+                    return Err(PillboxError::usage(
+                        "run",
+                        format!(
+                            "`{}` --profile/--reasoning-effort require --model",
+                            spec.id
+                        ),
+                    )
+                    .into());
+                }
+                Ok(None)
+            }
+        },
+    }
 }
 
 /// opencode via `opencode serve` — fills a [`ServerLaunch`] for [`launch_server_vm`].
@@ -1596,17 +1992,14 @@ fn parse_vmm_groups(ps_stdout: &str, spec: &str) -> Vec<(i32, i32)> {
 /// Spawn the VMM child as its own session+group leader, so the whole group (this
 /// `__krun-vmm` process plus any VMM subprocess `krun_start_enter` forks) can be
 /// reaped together by `killpg` on teardown — a pid-only kill strands the fork.
-/// `setsid` also detaches the child from the launching CLI's controlling terminal,
-/// which is correct on every path: the guest console rides the vsock attach
-/// channel (PTY) or the agent's HTTP API (server), never this terminal.
-/// Put a DETACHED VMM child in its own session/process group (`setsid`) so the
+/// `setsid` also detaches the child from the launching CLI's controlling terminal.
+/// Put a recorded VMM child in its own session/process group (`setsid`) so the
 /// VMM is a group leader (`pgid == its own pid`) and `kill_session`'s spec-path
 /// reap (`reap_vmm_by_spec` → `killpg(pgid)`) takes down the whole group on
-/// `session rm`, even after the VMM reparents to launchd.
-/// ONLY the detached spawns (`run_detached`, `launch_server_vm`) use this — the
-/// synchronous foreground + grader paths reap via `child.wait` and must NOT
-/// `setsid`: their VMM would otherwise survive in its own session if the CLI is
-/// interrupted before teardown (e.g. Ctrl-C in the boot window), orphaning the VM.
+/// `session rm`, even after the VMM reparents to launchd. Used by detached/server
+/// sessions and durable Pi one-shots, all of which commit a recoverable record.
+/// Unrecorded foreground PTY and grader VMs stay in the CLI group so interruption
+/// cannot orphan a VM with no teardown handle.
 fn vmm_own_process_group(cmd: &mut Command) {
     use std::os::unix::process::CommandExt as _;
     // SAFETY: `pre_exec` runs in the forked child before `exec`; the closure must be
@@ -1959,6 +2352,16 @@ mod tests {
     use super::*;
     use crate::sandbox::LiveSession;
     use crate::session::{Session, BACKEND_LIBKRUN};
+
+    #[test]
+    fn structured_vmm_diagnostic_retains_only_pillbox_preboot_errors() {
+        let stderr = b"provider detail that must not persist\nkrun-vmm: start_enter returned -22 (pre-boot config error)\n";
+        assert_eq!(
+            structured_vmm_diagnostic(stderr).as_deref(),
+            Some("start_enter returned -22 (pre-boot config error)")
+        );
+        assert_eq!(structured_vmm_diagnostic(b"provider detail only\n"), None);
+    }
 
     /// A libkrun-backed [`Session`] over a PTY agent (claude), carrying a decodable
     /// [`LibkrunHandle`] whose paths point nowhere real — enough for `send`/

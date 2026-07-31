@@ -46,14 +46,24 @@ pub(crate) type McpInjectFn = fn(&[McpAttachment]) -> Result<McpInjection>;
 /// How pillbox talks to an agent. Most agents are a TUI we wrap in a PTY and
 /// observe by scraping their transcript file ([`Integration::Pty`]); a few
 /// (opencode) run as a headless server with a structured event stream + a
-/// prompt API, which pillbox drives/reads directly ([`Integration::Server`]) —
-/// cleaner and bidirectional. See `events::opencode` + `sandbox::opencode`.
+/// prompt API ([`Integration::Server`]); pi and cursor run as one-shot
+/// structured JSON streams ([`Integration::Structured`]). Neither structured
+/// path uses a PTY.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Integration {
-    /// PTY + transcript-file scrape (claude, codex, pi today).
+    /// PTY + transcript-file scrape (claude, codex).
     Pty,
+    /// Headless one-shot process + structured stdout (pi `--mode json`,
+    /// cursor `agent -p --output-format stream-json`).
+    Structured,
     /// Headless HTTP server + SSE event stream + prompt API (opencode).
     Server,
+}
+
+impl Integration {
+    pub(crate) fn supports_execution_request(self) -> bool {
+        matches!(self, Self::Structured | Self::Server)
+    }
 }
 
 /// The per-agent data a [`Integration::Server`] agent needs, beyond the common
@@ -74,6 +84,31 @@ pub(crate) struct ServerProfile {
     pub(crate) events_format: crate::events::EventsFormat,
     /// True for server agents that only run on libkrun (docker rejects them).
     pub(crate) libkrun_only: bool,
+}
+
+/// The per-agent data a [`Integration::Structured`] agent needs beyond the
+/// common [`AgentSpec`] fields — capture filename, model-flag policy, and an
+/// optional env-var auth alternate to the login sentinel. `Some` iff
+/// `integration == Structured`.
+#[derive(Clone, Copy)]
+pub(crate) struct StructuredProfile {
+    /// Capture filename under the agent home (the §0 source the host drains).
+    pub(crate) events_file: &'static str,
+    /// How `--model` is parsed for this agent.
+    pub(crate) model: StructuredModelPolicy,
+    /// Guest env var that authenticates without the login sentinel (e.g.
+    /// `CURSOR_API_KEY`). Checked at launch against the resolved run env.
+    pub(crate) alt_auth_env: Option<&'static str>,
+}
+
+/// Model-flag policy for a structured agent.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum StructuredModelPolicy {
+    /// Exact `--model PROVIDER/MODEL` is required (pi).
+    RequireProviderModel,
+    /// Optional bare id (`composer-2.5`); `provider/model` is also accepted and
+    /// only the model half is forwarded to the harness (cursor).
+    OptionalBare,
 }
 
 #[derive(Clone, Copy)]
@@ -112,9 +147,12 @@ pub struct AgentSpec {
     /// nothing to prepare.
     pub(crate) prepare_workspace: Option<fn(&Path, &str) -> Result<()>>,
     /// Server-mode data ([`ServerProfile`]). `Some` iff `integration == Server`;
-    /// `None` for PTY agents. The capture-file + drain-format + backend-capability
-    /// dispatch reads this instead of matching on `id`.
+    /// `None` for PTY / Structured agents. The capture-file + drain-format +
+    /// backend-capability dispatch reads this instead of matching on `id`.
     pub(crate) server: Option<ServerProfile>,
+    /// Structured one-shot data ([`StructuredProfile`]). `Some` iff
+    /// `integration == Structured`.
+    pub(crate) structured: Option<StructuredProfile>,
 }
 
 pub const CLAUDE: AgentSpec = AgentSpec {
@@ -136,6 +174,7 @@ pub const CLAUDE: AgentSpec = AgentSpec {
     sandbox_args: &["--permission-mode", "auto"],
     prepare_workspace: Some(pretrust_claude_workspace),
     server: None,
+    structured: None,
 };
 
 pub const CODEX: AgentSpec = AgentSpec {
@@ -152,6 +191,7 @@ pub const CODEX: AgentSpec = AgentSpec {
     sandbox_args: &[],
     prepare_workspace: None,
     server: None,
+    structured: None,
 };
 
 /// codex driven through `codex app-server` (its JSON-RPC-over-stdio protocol,
@@ -161,6 +201,10 @@ pub const CODEX: AgentSpec = AgentSpec {
 /// `= "codex"`): one `pillbox auth login --agent codex` covers both. The PTY
 /// `codex` stays the default; this is opt-in via `--agent codex-serve`, so if
 /// upstream ever closes the app-server surface the TUI path is unaffected.
+/// Codex 0.144.5 receives the exact structured model and reasoning request at
+/// thread creation and again on each turn; the generic named model-profile
+/// label remains Pillbox request metadata because Codex's config profile is a
+/// different, local-file concept.
 ///
 /// libkrun-only today (the server bring-up lives in the microVM run path; docker
 /// rejects it via [`ServerProfile::libkrun_only`]). **Non-vault v1**: the
@@ -192,6 +236,7 @@ pub const CODEX_SERVE: AgentSpec = AgentSpec {
         events_format: crate::events::EventsFormat::Ndjson,
         libkrun_only: true,
     }),
+    structured: None,
 };
 
 pub const OPENCODE: AgentSpec = AgentSpec {
@@ -201,6 +246,8 @@ pub const OPENCODE: AgentSpec = AgentSpec {
     cred_sentinel: ".local/share/opencode/auth.json",
     login_argv: &["opencode", "auth", "login"],
     run_argv: &["opencode"],
+    // OpenCode owns its isolated provider store. Structured runs consume an
+    // existing OAuth/API credential and do not open a callback during serve.
     oauth_port: None,
     post_login_finalize: None,
     vault_capable: false,
@@ -212,15 +259,42 @@ pub const OPENCODE: AgentSpec = AgentSpec {
         events_format: crate::events::EventsFormat::Sse,
         libkrun_only: false,
     }),
+    structured: None,
+};
+
+/// Cursor Agent CLI (`agent`) as a structured one-shot. Auth is either
+/// `agent login` → `.config/cursor/auth.json` (Linux guest file store) or
+/// `CURSOR_API_KEY` injected into the guest env (no sentinel required). Not
+/// vault-capable yet. Model ids are bare (`composer-2.5`), not `PROVIDER/MODEL`.
+pub const CURSOR: AgentSpec = AgentSpec {
+    id: "cursor",
+    auth_id: "cursor",
+    integration: Integration::Structured,
+    cred_sentinel: ".config/cursor/auth.json",
+    login_argv: &["agent", "login"],
+    run_argv: &["agent"],
+    // Remote URL + poll login — no localhost OAuth callback to forward.
+    oauth_port: None,
+    post_login_finalize: None,
+    vault_capable: false,
+    mcp_inject: None,
+    sandbox_args: &[],
+    prepare_workspace: None,
+    server: None,
+    structured: Some(StructuredProfile {
+        events_file: ".pillbox-cursor-events.jsonl",
+        model: StructuredModelPolicy::OptionalBare,
+        alt_auth_env: Some("CURSOR_API_KEY"),
+    }),
 };
 
 pub const PI: AgentSpec = AgentSpec {
     id: "pi",
     auth_id: "pi",
-    integration: Integration::Pty,
+    integration: Integration::Structured,
     // pi (npm `@earendil-works/pi-coding-agent`) stores provider credentials —
     // OAuth tokens or API keys saved via `/login` — at `~/.pi/agent/auth.json`
-    // (config dir `~/.pi`, agent subdir `agent`). Verified against pi 0.75.5.
+    // (config dir `~/.pi`, agent subdir `agent`). Verified against pi 0.80.10.
     cred_sentinel: ".pi/agent/auth.json",
     // pi has no headless `login` subcommand; authentication is the interactive
     // `/login` slash command inside the TUI. Launching bare `pi` boots that TUI
@@ -241,9 +315,14 @@ pub const PI: AgentSpec = AgentSpec {
     sandbox_args: &[],
     prepare_workspace: None,
     server: None,
+    structured: Some(StructuredProfile {
+        events_file: ".pillbox-pi-events.jsonl",
+        model: StructuredModelPolicy::RequireProviderModel,
+        alt_auth_env: None,
+    }),
 };
 
-pub const ALL: &[&AgentSpec] = &[&CLAUDE, &CODEX, &CODEX_SERVE, &OPENCODE, &PI];
+pub const ALL: &[&AgentSpec] = &[&CLAUDE, &CODEX, &CODEX_SERVE, &OPENCODE, &PI, &CURSOR];
 
 /// Look up an agent spec by id, or return a usage error listing the
 /// known ids. Centralized so every CLI surface that takes an
@@ -526,6 +605,12 @@ pub(crate) struct RunOpts {
     /// the session and reused by every `session send`. `None` → a default.
     /// Ignored by PTY agents (they pick their own model interactively).
     pub(crate) model: Option<String>,
+    /// Exact model profile selected by the caller. `None` is an explicit
+    /// request to use no named profile; pillbox never chooses Sol/Terra/Luna.
+    pub(crate) profile: Option<String>,
+    /// Normalized orchestration request. Harness-native reasoning names remain
+    /// runtime evidence and are not accepted here.
+    pub(crate) reasoning_effort: Option<crate::contract::ReasoningEffort>,
     /// `--temperature FLOAT` — sampling temperature for a `Server`-integration
     /// agent (opencode), recorded on the session and sent on every `session
     /// send`. `Some(0.0)` = greedy decoding (the eval's variance knob). `None` →
@@ -546,6 +631,17 @@ pub(crate) struct RunOpts {
 
 #[allow(dead_code)]
 impl RunOpts {
+    pub(crate) fn requested_profile(
+        &self,
+        provider_model: &str,
+    ) -> Result<crate::contract::RequestedRunProfile> {
+        crate::contract::RequestedRunProfile::parse(
+            provider_model,
+            self.profile.clone(),
+            self.reasoning_effort,
+        )
+    }
+
     /// The kypp project for `--memory` (the pillbox name, else "default"); `None` when --memory is
     /// off. Single-sources the derivation shared by `dispatch_run` and the server bring-up's stash.
     pub(crate) fn memory_project(&self) -> Option<String> {
@@ -754,6 +850,8 @@ mod tests {
             ttl_seconds: None,
             from_bookmark: None,
             model: None,
+            profile: None,
+            reasoning_effort: None,
             temperature: None,
             egress_allow: Vec::new(),
             egress_deny: false,

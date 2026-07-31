@@ -83,7 +83,7 @@ enum Command {
         /// Display name for the pillbox. Defaults to the cwd's basename.
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
-        /// Default agent for `pillbox run` (`claude` | `codex` | `opencode`).
+        /// Default agent for `pillbox run` (`claude` | `codex` | `opencode` | `pi` | `cursor`).
         #[arg(long, value_name = "AGENT")]
         agent: Option<String>,
         /// Default model for `pillbox run` (`provider/model`). Written to `pillbox.toml`.
@@ -144,7 +144,7 @@ enum Command {
     },
     /// Launch an agent against the current pillbox.
     Run {
-        /// Agent to launch (`claude` | `codex` | `opencode`). Defaults to the current
+        /// Agent to launch (`claude` | `codex` | `opencode` | `pi` | `cursor`). Defaults to the current
         /// pillbox's `agent =` field, or `claude` if unset.
         #[arg(long, value_name = "AGENT")]
         agent: Option<String>,
@@ -260,6 +260,14 @@ enum Command {
         /// e.g. `zai-coding-plan/glm-4.5-air`. Ignored by PTY agents.
         #[arg(long, value_name = "PROVIDER/MODEL")]
         model: Option<String>,
+        /// Optional exact model profile requested by the orchestrator. The
+        /// absence is persisted as null; pillbox does not choose a profile.
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// Harness-neutral reasoning request. Adapters translate this later;
+        /// unsupported values fail at the CLI boundary.
+        #[arg(long, value_name = "LOW|MEDIUM|HIGH")]
+        reasoning_effort: Option<contract::ReasoningEffort>,
         /// Sampling temperature for a server-integration agent (opencode), sent
         /// on every `session send`. `0` = greedy/deterministic decoding — the
         /// variance-reduction knob the eval rig needs. Ignored by PTY agents.
@@ -730,6 +738,8 @@ fn run(cli: Cli) -> Result<()> {
             parent,
             from_bookmark,
             model,
+            profile,
+            reasoning_effort,
             temperature,
             egress_allow,
             egress_deny,
@@ -808,6 +818,8 @@ fn run(cli: Cli) -> Result<()> {
                     ttl_seconds,
                     from_bookmark,
                     model,
+                    profile,
+                    reasoning_effort,
                     temperature,
                     egress_allow,
                     egress_deny,
@@ -1002,7 +1014,7 @@ fn wizard_new(
         .unwrap_or_else(|| "pillbox".into());
     let name = Some(prompt::line("name", name.as_deref().unwrap_or(&cwd_base))?);
 
-    let agents = ["claude", "codex", "opencode", "pi"];
+    let agents = ["claude", "codex", "opencode", "pi", "cursor"];
     let agent_idx = agents
         .iter()
         .position(|a| Some(*a) == agent.as_deref())
@@ -1073,6 +1085,19 @@ fn dispatch_run(resolved: &Pillbox, agent: Option<String>, mut opts: RunOpts) ->
         }
     }
 
+    if !spec.integration.supports_execution_request()
+        && (opts.profile.is_some() || opts.reasoning_effort.is_some())
+    {
+        return Err(PillboxError::usage(
+            "run",
+            format!(
+                "agent `{}` has no structured profile transport; use a structured agent integration",
+                spec.id
+            ),
+        )
+        .into());
+    }
+
     // Model cascade: `--model` wins, else the descriptor (project `pillbox.toml`
     // → `~/.pillbox/global/pillbox.toml`), else the agent's own default (`None`).
     if opts.model.is_none() {
@@ -1092,14 +1117,14 @@ fn dispatch_run(resolved: &Pillbox, agent: Option<String>, mut opts: RunOpts) ->
     }
 
     // `--json` emits the started-session record; only `--detach` runs and
-    // server-mode agents (opencode, always reparented) persist one. A foreground
-    // PTY run has nothing to emit, so reject loudly here rather than print
+    // structured agents persist one. A foreground PTY run has nothing to emit,
+    // so reject loudly here rather than print
     // nothing. (Can't be a clap `requires` — server-mode validity depends on the
     // resolved agent, not a flag.)
-    if opts.json && !opts.detach && spec.integration != crate::agents::Integration::Server {
+    if opts.json && !opts.detach && !spec.integration.supports_execution_request() {
         return Err(PillboxError::usage(
             "run",
-            "--json needs a persisted session: add --detach, or run a server-mode agent (opencode)",
+            "--json needs a persisted session: add --detach, or run a structured agent",
         )
         .with_next(format!("pillbox run --agent {} --detach --json", spec.id))
         .into());
@@ -1203,6 +1228,40 @@ fn validate_events_webhook_url(url: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_profile_contract_cli_parses_normalized_request() {
+        let cli = Cli::try_parse_from([
+            "pillbox",
+            "run",
+            "--agent",
+            "codex-serve",
+            "--model",
+            "openai/gpt-5.6-sol",
+            "--profile",
+            "sol",
+            "--reasoning-effort",
+            "high",
+        ])
+        .unwrap();
+        let Command::Run {
+            model,
+            profile,
+            reasoning_effort,
+            ..
+        } = cli.command
+        else {
+            panic!("expected run");
+        };
+        assert_eq!(model.as_deref(), Some("openai/gpt-5.6-sol"));
+        assert_eq!(profile.as_deref(), Some("sol"));
+        assert_eq!(reasoning_effort, Some(contract::ReasoningEffort::High));
+    }
+
+    #[test]
+    fn model_profile_contract_cli_rejects_runtime_native_effort_alias() {
+        assert!(Cli::try_parse_from(["pillbox", "run", "--reasoning-effort", "ultra",]).is_err());
+    }
 
     #[test]
     fn validate_events_webhook_accepts_https() {

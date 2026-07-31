@@ -55,6 +55,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::contract::RequestedRunProfile;
 use crate::errors::PillboxError;
 use crate::paths::ensure_mode_0700;
 use crate::pillbox::Pillbox;
@@ -274,11 +275,15 @@ pub(crate) struct Session {
     /// integration, `None` for PTY agents (claude/codex). Grouped so a PTY record
     /// can't carry a half-populated `(agent_session_id, model)` tail.
     ///
-    /// MUST stay the LAST field: it serializes to a TOML `[server]` table, and
-    /// any scalar field declared after it would be parsed *into* that table on
-    /// read. New scalar fields go above; new table/struct fields go below.
+    /// No scalar field may follow this table: TOML would parse it into
+    /// `[server]`. New scalar fields go above; new table/struct fields go below.
     #[serde(default)]
     pub(crate) server: Option<ServerSession>,
+    /// Harness-neutral request persisted before execution. Kept separate from
+    /// `ServerSession`, which is agent-native transport state, so Pi and future
+    /// structured non-server adapters can share the same evidence contract.
+    #[serde(default)]
+    pub(crate) requested_execution: Option<RequestedRunProfile>,
 }
 
 /// The agent-native state a `Server`-integration agent (opencode) needs to be
@@ -338,6 +343,7 @@ impl Session {
             guest_cwd: String::new(),
             placement: Placement::Local,
             server: None,
+            requested_execution: None,
         }
     }
 
@@ -395,6 +401,34 @@ impl Session {
                 .map(serde_json::Value::String)
                 .unwrap_or(serde_json::Value::Null),
         );
+        if self.server.is_some() || self.requested_execution.is_some() {
+            let requested = self
+                .requested_execution
+                .as_ref()
+                .map(|profile| serde_json::to_value(profile).expect("requested profile serializes"))
+                .unwrap_or_else(|| {
+                    serde_json::json!({
+                        "status": "unavailable",
+                        "reason": "legacy_record",
+                    })
+                });
+            o.insert(
+                "execution".into(),
+                serde_json::json!({
+                    "requested": requested,
+                    "served_model": {
+                        "status": "unavailable",
+                        "reason": "not_reported",
+                        "source": { "session_id": self.id },
+                    },
+                    "effective_limits": {
+                        "status": "unavailable",
+                        "reason": "not_reported",
+                        "source": { "session_id": self.id },
+                    },
+                }),
+            );
+        }
         serde_json::Value::Object(o)
     }
 }
@@ -450,6 +484,7 @@ impl Session {
             guest_cwd: String::new(),
             placement: Placement::Local,
             server: None,
+            requested_execution: None,
         }
     }
 }
@@ -733,6 +768,32 @@ mod tests {
         "#;
         let s: Session = toml::from_str(pre_field).expect("old record parses");
         assert_eq!(s.placement, Placement::Local);
+        assert_eq!(s.requested_execution, None);
+        assert!(s.to_json_value().get("execution").is_none());
+    }
+
+    #[test]
+    fn model_profile_contract_legacy_server_record_is_explicitly_unavailable() {
+        let legacy = r#"
+            id = "abc123def456"
+            backend = "libkrun"
+            sandbox_id = "handle"
+            agent_id = "opencode"
+            started_at = "2026-05-23T13:37:00Z"
+
+            [server]
+            agent_session_id = "ses_native"
+            model = "openai/gpt-5.6-luna"
+        "#;
+        let session: Session = toml::from_str(legacy).expect("legacy server record parses");
+        assert_eq!(session.requested_execution, None);
+        assert_eq!(
+            session.to_json_value()["execution"]["requested"],
+            serde_json::json!({
+                "status": "unavailable",
+                "reason": "legacy_record"
+            })
+        );
     }
 
     #[test]
@@ -747,6 +808,45 @@ mod tests {
         // `server` (a table) must still parse — `placement` is a scalar above it,
         // so the table-ordering invariant the struct doc warns about holds.
         assert_eq!(back.server, s.server);
+    }
+
+    #[test]
+    fn server_session_json_exposes_requested_execution_profile() {
+        let mut s = Session::test_fixture();
+        s.agent_id = "opencode".into();
+        s.server = Some(ServerSession {
+            agent_session_id: "ses_native".into(),
+            model: "openai/gpt-5.6-luna".into(),
+            temperature: Some(0.2),
+        });
+        s.requested_execution = Some(
+            RequestedRunProfile::parse(
+                "openai/gpt-5.6-luna",
+                Some("luna".into()),
+                Some(crate::contract::ReasoningEffort::High),
+            )
+            .unwrap(),
+        );
+
+        let execution = &s.to_json_value()["execution"];
+        assert_eq!(
+            execution["requested"],
+            serde_json::json!({
+                "provider": "openai",
+                "model": "gpt-5.6-luna",
+                "profile": "luna",
+                "reasoningEffort": "high"
+            })
+        );
+        assert_eq!(
+            execution["served_model"],
+            serde_json::json!({
+                "status": "unavailable",
+                "reason": "not_reported",
+                "source": { "session_id": "abc123def456" }
+            })
+        );
+        assert!(execution.get("agent_session_id").is_none());
     }
 
     #[test]

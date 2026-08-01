@@ -12,6 +12,9 @@
 //!   backend; opt in via `PILLBOX_BACKEND=docker`).
 // Context: doc://pillbox/adr-003-qemu-parked@0001#qemu-parked
 
+// The ACP spike is intentionally not wired into a production backend yet.
+#[allow(dead_code)]
+pub(crate) mod acp;
 pub(crate) mod appserver;
 pub(crate) mod appserver_client;
 pub(crate) mod docker;

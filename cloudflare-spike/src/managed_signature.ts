@@ -1,4 +1,5 @@
 import { managedCanonicalJson } from "./managed_contract.js";
+import { decodeManagedEd25519PublicKey, fingerprintManagedEd25519PublicKeyBytes } from "./managed_signer.js";
 
 const encoder = new TextEncoder();
 
@@ -7,10 +8,11 @@ export async function verifyManagedEd25519Signature(input: {
   readonly publicKeyMaterial: string;
   readonly signature: string;
   readonly claims: unknown;
-}): Promise<void> {
+}): Promise<{ readonly public_key_sha256: `sha256:${string}` }> {
+  const publicKeyBytes = decodeManagedEd25519PublicKey(input.publicKeyMaterial);
   const key = await crypto.subtle.importKey(
     "raw",
-    toArrayBuffer(decodeEd25519PublicKey(input.publicKeyMaterial)),
+    toArrayBuffer(publicKeyBytes),
     "Ed25519",
     false,
     ["verify"],
@@ -22,13 +24,7 @@ export async function verifyManagedEd25519Signature(input: {
     toArrayBuffer(encoder.encode(managedCanonicalJson(input.claims))),
   );
   if (!valid) throw new Error("signature mismatch");
-}
-
-function decodeEd25519PublicKey(value: string): Uint8Array {
-  if (!value.startsWith("ed25519:")) throw new Error("public key must use ed25519: prefix");
-  const bytes = decodeBase64Url(value.slice("ed25519:".length));
-  if (bytes.byteLength !== 32) throw new Error("Ed25519 public key must be 32 bytes");
-  return bytes;
+  return { public_key_sha256: await fingerprintManagedEd25519PublicKeyBytes(publicKeyBytes) };
 }
 
 function decodeBase64Url(value: string): Uint8Array {

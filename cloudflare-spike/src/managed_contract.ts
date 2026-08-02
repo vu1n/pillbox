@@ -151,6 +151,51 @@ export type PillboxEvidenceReadBinding = {
   readonly session_ref: PillboxSessionRef;
 };
 
+/**
+ * Signed-envelope verification evidence sent to Huddles currentness.
+ *
+ * The fingerprint is over the decoded 32-byte Ed25519 public key, not its
+ * textual `ed25519:` representation. Huddles uses both fields to detect a
+ * retired key or a Pillbox verifier configured with a different key material.
+ */
+export type PillboxVerifiedSigner = {
+  readonly algorithm: "Ed25519";
+  readonly key_id: string;
+  readonly public_key_sha256: `sha256:${string}`;
+};
+
+export const PILLBOX_AUTHORIZATION_CURRENTNESS_VERSION = "pillbox.authorization-currentness/2" as const;
+
+export type PillboxExecutionGrantCurrentnessRequest = {
+  readonly version: typeof PILLBOX_AUTHORIZATION_CURRENTNESS_VERSION;
+  readonly grant: PillboxExecutionGrantClaims;
+  readonly expected: PillboxExecutionGrantBinding;
+  readonly verified_signer: PillboxVerifiedSigner;
+};
+
+export type PillboxEvidenceReadCurrentnessRequest = {
+  readonly version: typeof PILLBOX_AUTHORIZATION_CURRENTNESS_VERSION;
+  readonly grant: PillboxEvidenceReadGrantClaims;
+  readonly expected: PillboxEvidenceReadBinding;
+  readonly verified_signer: PillboxVerifiedSigner;
+};
+
+export function makeExecutionGrantCurrentnessRequest(
+  grant: PillboxExecutionGrantClaims,
+  expected: PillboxExecutionGrantBinding,
+  verifiedSigner: PillboxVerifiedSigner,
+): PillboxExecutionGrantCurrentnessRequest {
+  return { version: PILLBOX_AUTHORIZATION_CURRENTNESS_VERSION, grant, expected, verified_signer: verifiedSigner };
+}
+
+export function makeEvidenceReadCurrentnessRequest(
+  grant: PillboxEvidenceReadGrantClaims,
+  expected: PillboxEvidenceReadBinding,
+  verifiedSigner: PillboxVerifiedSigner,
+): PillboxEvidenceReadCurrentnessRequest {
+  return { version: PILLBOX_AUTHORIZATION_CURRENTNESS_VERSION, grant, expected, verified_signer: verifiedSigner };
+}
+
 export class ManagedContractError extends Error {
   readonly code = "invalid_managed_contract" as const;
 }
@@ -350,6 +395,37 @@ export function managedCanonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(managedCanonicalJson).join(",")}]`;
   const object = value as Record<string, unknown>;
   return `{${Object.keys(object).sort().map((key) => `${JSON.stringify(key)}:${managedCanonicalJson(object[key])}`).join(",")}}`;
+}
+
+/**
+ * Project an invocation onto the immutable request tuple.
+ *
+ * The signed grant is an authorization envelope, not invocation identity: a
+ * response-loss retry may receive a new grant ID, signature, key, or validity
+ * interval. Keep the independent request_binding so changed delivery,
+ * execution, output, or runtime-policy facts still conflict.
+ *
+ * This also normalizes request_json written by the PR #145 deployment, which
+ * persisted the complete envelope. Historical rows are read-only; callers
+ * compare their normalized projection without rewriting them.
+ */
+export function managedInvocationSemanticMaterial(value: unknown): unknown {
+  if (!record(value)) throw new ManagedContractError("managed invocation request must be an object");
+  const authorization = value.managed_authorization;
+  if (authorization === undefined) return value;
+  if (!record(authorization) || authorization.request_binding === undefined) {
+    throw new ManagedContractError("managed invocation authorization binding is unavailable");
+  }
+  return { ...value, managed_authorization: { request_binding: authorization.request_binding } };
+}
+
+export function managedInvocationSemanticJson(value: unknown): string {
+  return managedCanonicalJson(managedInvocationSemanticMaterial(value));
+}
+
+export async function managedInvocationSemanticHash(value: unknown): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(managedInvocationSemanticJson(value))));
+  return [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 export function validateGrantBinding(claims: PillboxExecutionGrantClaims, expected: PillboxExecutionGrantBinding): string | undefined {

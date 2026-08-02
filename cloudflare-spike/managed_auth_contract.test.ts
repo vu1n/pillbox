@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { isCurrentRefreshGeneration } from "./src/credentials/contract.ts";
-import { managedCanonicalJson, validateExecutionGrantClaims, validateGrantBinding, validateManagedRequestBinding } from "./src/managed_contract.ts";
+import { managedCanonicalJson, makeExecutionGrantCurrentnessRequest, validateExecutionGrantClaims, validateGrantBinding, validateManagedRequestBinding } from "./src/managed_contract.ts";
 import { authorizeOutboundRequest, safeProviderRedirect, scrubCredentialResponseHeaders } from "./src/outbound/policy.ts";
 
 const digest = "sha256:" + "a".repeat(64);
@@ -50,6 +50,30 @@ test("managed grant claims are strict, canonical, and bind operation identity", 
   assert.throws(() => validateExecutionGrantClaims({ ...claims, expires_at: 500 }), /time window/);
   assert.doesNotThrow(() => validateExecutionGrantClaims({ ...claims, operations: ["invoke_session"] }));
   assert.throws(() => validateExecutionGrantClaims({ ...claims, extra: true }), /unrecognized field/);
+});
+
+test("execution currentness v2 carries the verified signer without changing the grant tuple", () => {
+  const decoded = validateExecutionGrantClaims(claims);
+  const request = makeExecutionGrantCurrentnessRequest(decoded, {
+    operation: "invoke_session",
+    installation: decoded.installation,
+    organization_id: decoded.organization_id,
+    workspace_id: decoded.workspace_id,
+    principal_id: decoded.policy.principal_id,
+    policy_id: decoded.policy.policy_id,
+    run_id: decoded.run_id,
+    invocation_id: decoded.invocation_id,
+    packet_id: decoded.packet_id,
+    delivery_receipt_id: decoded.delivery_receipt_id,
+    session_idempotency_key: decoded.session_idempotency_key,
+    rendered_input_hash: decoded.rendered_input_hash,
+    execution_identity_hash: decoded.execution_identity_hash,
+    output_contract_hash: decoded.output_contract_hash,
+    runtime_policy: decoded.runtime_policy,
+  }, { algorithm: "Ed25519", key_id: "key-1", public_key_sha256: digest });
+  assert.equal(request.version, "pillbox.authorization-currentness/2");
+  assert.equal(request.verified_signer.key_id, "key-1");
+  assert.equal(request.grant.grant_id, "grant-1");
 });
 
 test("managed outbound policy is exact-host HTTPS and rejects credential-bearing URLs", () => {

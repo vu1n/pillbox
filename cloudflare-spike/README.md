@@ -10,13 +10,25 @@ service binding plus an Ed25519 `huddles.execution-grant/1`. The binding is
 transport-only: SessionGateway verifies the envelope, validates the explicit
 Huddles `request_binding`, recomputes execution/output hashes from request
 material, checks every tuple, and re-introspects currentness before both ensure
-and invoke. Provider OAuth state is owned by the `CredentialBroker` Durable
+and invoke. Currentness calls use the additive
+`pillbox.authorization-currentness/2` request on the existing RPC method names;
+they carry the exact verified signer key ID and SHA-256 fingerprint of the raw
+32-byte Ed25519 public key. Pillbox never retries a rejected v2 request through
+the v1 shape, so Huddles must accept the v1/v2 union before deploying this
+runtime. Provider OAuth state is owned by the `CredentialBroker` Durable
 Object and is never passed through Huddles, a container environment, a session
 event, or a browser response.
 
+Invocation idempotency hashes the immutable request tuple and excludes only the
+volatile signed grant envelope. A replacement grant can therefore recover a
+response-loss retry after expiry; changed delivery, input, execution, output,
+or runtime-policy facts still conflict. Rows written by PR #145 are normalized
+on read without rewriting their durable history.
+
 Managed cutover gates remain explicit: Huddles must send
-`managed_authorization.request_binding` and add the evidence currentness RPC;
-Pillbox fails closed when either is unavailable. The managed runtime currently
+`managed_authorization.request_binding`, accept currentness v2 on both existing
+authorization RPCs, and expose the evidence currentness RPC; Pillbox fails
+closed when any is unavailable. The managed runtime currently
 accepts only the pinned OpenCode/Cloudflare transport and records unsupported
 execution requests without entering a container; Codex app-server still needs
 a dedicated runtime adapter. Production provider adapters still need

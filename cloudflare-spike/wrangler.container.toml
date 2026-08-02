@@ -1,9 +1,16 @@
+# Preserve the existing deployed Worker/DO namespace. Product promotion does
+# not silently orphan historical SessionGateway objects.
 name = "pillbox-do-spike"
 main = "src/worker.ts"
 compatibility_date = "2026-06-01"
 # The Agents SDK imports node built-ins (diagnostics_channel, os, path via its
 # deps) — nodejs_compat is required or the bundle fails to resolve them.
 compatibility_flags = ["nodejs_compat"]
+
+[vars]
+# The paid/container deployment is the managed production surface; legacy
+# unsigned requests remain available only in the free compatibility smoke path.
+MANAGED_AUTH_REQUIRED = "1"
 
 # The per-session §0 gateway. Binding name matches the class so routeAgentRequest
 # resolves /agents/session-gateway/<sessionId>/*.
@@ -16,6 +23,15 @@ class_name = "SessionGateway"
 [[durable_objects.bindings]]
 name = "Sandbox"
 class_name = "Sandbox"
+
+[[durable_objects.bindings]]
+name = "CredentialBroker"
+class_name = "CredentialBroker"
+
+[[services]]
+binding = "PillboxAuthorizationControlPlane"
+service = "huddles-projectors"
+entrypoint = "PillboxAuthorizationControlPlaneEntrypoint"
 
 # Bind the Sandbox DO class to the container image (built from ./Dockerfile).
 # `wrangler dev` builds + runs it locally via Docker.
@@ -34,6 +50,10 @@ instance_type = "standard-2"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["SessionGateway", "Sandbox"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["CredentialBroker"]
 
 [observability]
 enabled = true

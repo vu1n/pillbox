@@ -1,6 +1,8 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { sha256Hex } from "./runtime_identity.js";
 import type { Env } from "./worker.js";
+import { validateManagedRequestBinding, validateSignedExecutionGrant, type PillboxManagedAuthorization, type PillboxSessionRef, type SignedPillboxEvidenceReadGrant } from "./managed_contract.js";
+import type { EvidenceFrame } from "./evidence_reader.js";
 export { isHuddlesSessionName } from "./huddles_policy.js";
 export { deriveSandboxRuntimeId, sha256Hex } from "./runtime_identity.js";
 
@@ -15,18 +17,22 @@ export type JsonValue =
  * model so it can return an explicit attribution outcome without guessing.
  */
 export interface CanonicalSessionRequest {
-  readonly requested_model: string;
-  readonly [key: string]: JsonValue;
+  readonly requested_model?: string;
+  readonly execution?: JsonValue;
+  readonly [key: string]: JsonValue | undefined;
 }
 
 export interface EnsureSessionRequest {
   readonly workspace_id: string;
   readonly effect_id: string;
   readonly canonical_request: CanonicalSessionRequest;
+  /** Present only for the managed placement; absent is the legacy compatibility path. */
+  readonly managed_authorization?: PillboxManagedAuthorization;
 }
 
 export interface SessionRef {
   readonly session_id: string;
+  readonly realm?: { readonly runtime: "pillbox"; readonly execution_realm_id: string };
   /** Worker RPC widens tuples to arrays; callers validate the two-position contract. */
   readonly seq_range?: readonly number[];
 }
@@ -63,14 +69,27 @@ export interface InvokeSessionRequest {
   readonly workspace_id: string;
   readonly effect_id: string;
   readonly invocation_id: string;
+  readonly activity_principal_id?: string;
+  readonly policy_id?: string;
+  readonly run_id?: string;
+  readonly packet_id?: string;
   readonly session_ref: SessionRef;
   readonly delivery_receipt_id: string;
   readonly rendered_input: string;
   readonly rendered_input_hash: string;
   readonly tool_policy: "deny_all";
-  readonly harness: "opencode";
+  readonly harness?: "opencode";
   readonly requested_model: string;
+  readonly execution?: JsonValue;
+  readonly execution_policy_revision?: string;
   readonly output_format: JsonSchemaOutputFormat;
+  readonly managed_authorization?: PillboxManagedAuthorization;
+}
+
+export interface EvidenceReadRequest {
+  readonly grant: SignedPillboxEvidenceReadGrant;
+  readonly session_ref: PillboxSessionRef;
+  readonly max_events?: number;
 }
 
 export type InvokeSessionResult =
@@ -87,6 +106,7 @@ export type InvokeSessionResult =
       readonly error: {
         readonly code:
           | "runtime_unavailable"
+          | "unsupported_execution"
           | "runtime_failed"
           | "runtime_interrupted"
           | "provider_failed"
@@ -135,6 +155,7 @@ export function validateEnsureSessionRequest(
     workspace_id: workspaceId,
     effect_id: effectId,
     canonical_request: canonicalRequest,
+    ...(value.managed_authorization === undefined ? {} : { managed_authorization: validateManagedAuthorization(value.managed_authorization) }),
   };
 }
 
@@ -201,6 +222,16 @@ export class HuddlesRuntimeEntrypoint extends WorkerEntrypoint<Env> {
     return stub.invokeSession(validated);
   }
 
+  async readEvidence(request: EvidenceReadRequest): Promise<readonly EvidenceFrame[]> {
+    if (!request || typeof request !== "object") throw new EnsureSessionRequestError("evidence request must be an object");
+    const sessionId = request.session_ref?.session_id;
+    if (typeof sessionId !== "string" || sessionId.length === 0) throw new EnsureSessionRequestError("evidence session_ref.session_id is required");
+    const id = this.env.SessionGateway.idFromName(sessionId);
+    const stub = this.env.SessionGateway.get(id);
+    setAgentName(stub, sessionId);
+    return stub.readEvidence(request);
+  }
+
   async fetch(): Promise<Response> {
     return new Response("not found\n", { status: 404 });
   }
@@ -232,15 +263,9 @@ export async function validateInvokeSessionRequest(
     value.rendered_input_hash,
     "rendered_input_hash",
   );
-  const requestedModel = requireIdentifier(
-    value.requested_model,
-    "requested_model",
-  );
-  if (value.harness !== "opencode") {
-    throw new EnsureSessionRequestError(
-      "invoke request harness must be 'opencode'",
-    );
-  }
+  const legacyHarness = value.harness === "opencode";
+  if (!legacyHarness && !isJsonObject(value.execution)) throw new EnsureSessionRequestError("invoke request execution is required");
+  const requestedModel = legacyHarness ? requireIdentifier(value.requested_model, "requested_model") : requestedModelFromExecution(value.execution);
   if (value.tool_policy !== "deny_all") {
     throw new EnsureSessionRequestError(
       "invoke request tool_policy must be 'deny_all'",
@@ -278,36 +303,87 @@ export async function validateInvokeSessionRequest(
       "rendered_input_hash does not match rendered_input",
     );
   }
+  const activityPrincipalId = value.activity_principal_id === undefined ? undefined : requireIdentifier(value.activity_principal_id, "activity_principal_id");
+  const policyId = value.policy_id === undefined ? undefined : requireIdentifier(value.policy_id, "policy_id");
+  const runId = value.run_id === undefined ? undefined : requireIdentifier(value.run_id, "run_id");
+  const packetId = value.packet_id === undefined ? undefined : requireIdentifier(value.packet_id, "packet_id");
   return {
     workspace_id: workspaceId,
     effect_id: effectId,
     invocation_id: invocationId,
-    session_ref: { session_id: sessionId },
+    ...(activityPrincipalId === undefined ? {} : { activity_principal_id: activityPrincipalId }),
+    ...(policyId === undefined ? {} : { policy_id: policyId }),
+    ...(runId === undefined ? {} : { run_id: runId }),
+    ...(packetId === undefined ? {} : { packet_id: packetId }),
+    session_ref: validateSessionRefForRequest(value.session_ref, sessionId),
     delivery_receipt_id: deliveryReceiptId,
     rendered_input: renderedInput,
     rendered_input_hash: renderedInputHash,
     tool_policy: value.tool_policy,
-    harness: value.harness,
+    ...(legacyHarness ? { harness: "opencode" as const } : {}),
     requested_model: requestedModel,
+    ...(value.execution === undefined ? {} : { execution: value.execution }),
+    ...(typeof value.execution_policy_revision === "string" ? { execution_policy_revision: value.execution_policy_revision } : {}),
     output_format: {
       type: value.output_format.type,
       schema: value.output_format.schema,
       retry_count: value.output_format.retry_count,
     },
+    ...(value.managed_authorization === undefined ? {} : { managed_authorization: validateManagedAuthorization(value.managed_authorization) }),
   };
+}
+
+function validateManagedAuthorization(value: unknown): PillboxManagedAuthorization {
+  if (!isJsonObject(value) || !isJsonObject(value.grant) || !isJsonObject(value.request_binding)) {
+    throw new EnsureSessionRequestError("managed_authorization.grant and request_binding are required objects");
+  }
+  try {
+    return { grant: validateSignedExecutionGrant(value.grant), request_binding: validateManagedRequestBinding(value.request_binding) };
+  } catch (cause) {
+    throw new EnsureSessionRequestError(`managed_authorization is invalid: ${cause instanceof Error ? cause.message : "invalid contract"}`);
+  }
+}
+
+function validateSessionRefForRequest(value: Record<string, JsonValue>, sessionId: string): SessionRef {
+  const realm = value.realm;
+  if (realm === undefined) return { session_id: sessionId };
+  if (!isJsonObject(realm) || realm.runtime !== "pillbox" || typeof realm.execution_realm_id !== "string" || realm.execution_realm_id.length === 0) {
+    throw new EnsureSessionRequestError("session_ref.realm is invalid");
+  }
+  return { session_id: sessionId, realm: { runtime: "pillbox", execution_realm_id: realm.execution_realm_id } };
 }
 
 function validateCanonicalRequest(
   value: Record<string, JsonValue>,
 ): CanonicalSessionRequest {
-  const requestedModel = value.requested_model;
-  if (typeof requestedModel !== "string" || requestedModel.length === 0) {
-    throw new EnsureSessionRequestError(
-      "canonical_request.requested_model must be a non-empty string",
-    );
+  if (value.execution !== undefined) {
+    const requestedModel = requestedModelFromExecution(value.execution);
+    if (value.requested_model !== undefined && requireIdentifier(value.requested_model, "canonical_request.requested_model") !== requestedModel) {
+      throw new EnsureSessionRequestError("canonical_request requested_model does not match execution.requested.model");
+    }
+  } else if (value.requested_model !== undefined) {
+    requireIdentifier(value.requested_model, "canonical_request.requested_model");
+  } else {
+    throw new EnsureSessionRequestError("canonical_request must contain requested_model or execution");
   }
   validateJsonValue(value, "canonical_request");
   return value as CanonicalSessionRequest;
+}
+
+export function requestedModelFromCanonicalRequest(request: CanonicalSessionRequest): string {
+  return request.requested_model ?? requestedModelFromExecution(request.execution);
+}
+
+function requestedModelFromExecution(value: JsonValue | undefined): string {
+  if (!isJsonObject(value) || !isJsonObject(value.requested) || !isJsonObject(value.transport)) throw new EnsureSessionRequestError("execution must contain requested and transport objects");
+  const provider = requireIdentifier(value.requested.provider, "execution.requested.provider");
+  const model = requireIdentifier(value.requested.model, "execution.requested.model");
+  requireIdentifier(value.transport.harness, "execution.transport.harness");
+  requireIdentifier(value.transport.transport, "execution.transport.transport");
+  requireIdentifier(value.transport.harness_version, "execution.transport.harness_version");
+  requireIdentifier(value.transport.adapter_revision, "execution.transport.adapter_revision");
+  requireIdentifier(value.context_renderer_revision, "execution.context_renderer_revision");
+  return `${provider}/${model}`;
 }
 
 function requireIdentifier(

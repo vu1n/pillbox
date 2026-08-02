@@ -31,7 +31,18 @@ import {
   type SessionRef,
   validateEnsureSessionRequest,
   validateInvokeSessionRequest,
+  requestedModelFromCanonicalRequest,
 } from "./huddles_runtime.js";
+import { authorizeExecutionGrant, ManagedAuthorizationError, verifySignedExecutionGrant } from "./managed_auth.js";
+import { authorizeEvidenceRead } from "./evidence_reader.js";
+import { managedCanonicalJson, type PillboxInstallationRef, type PillboxManagedRequestBinding } from "./managed_contract.js";
+import type {
+  PillboxExecutionGrantBinding,
+  PillboxExecutionGrantClaims,
+} from "./managed_contract.js";
+import type { EvidenceReadRequest } from "./huddles_runtime.js";
+import type { ManagedOutboundParams } from "./credentials/contract.js";
+import { getManagedSandbox, type ManagedSandboxPolicy } from "./sandbox.js";
 import type { Env } from "./worker.js";
 import {
   DEFAULT_OPENCODE_MODEL,
@@ -55,6 +66,7 @@ type EnsureBindingRow = {
   effect_id: string;
   canonical_request_hash: string;
   canonical_request_json: string;
+  managed_claims_json?: string;
 };
 
 // pillbox itself — the actor for events the gateway originates (the container-hop
@@ -110,6 +122,7 @@ export class SessionGateway extends Agent<Env> {
         effect_id               TEXT NOT NULL,
         canonical_request_hash  TEXT NOT NULL,
         canonical_request_json  TEXT NOT NULL,
+        managed_claims_json     TEXT,
         created_at              TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS huddles_invocation(
@@ -122,6 +135,8 @@ export class SessionGateway extends Agent<Env> {
         completed_at           TEXT
       );
     `);
+    const columns = new Set((this.ctx.storage.sql.exec("PRAGMA table_info(ensure_binding)").toArray() as Array<{ name: string }>).map((column) => column.name));
+    if (!columns.has("managed_claims_json")) this.ctx.storage.sql.exec("ALTER TABLE ensure_binding ADD COLUMN managed_claims_json TEXT");
   }
 
   /**
@@ -136,34 +151,42 @@ export class SessionGateway extends Agent<Env> {
     this.ensureBindingSchema();
     // Namespace holders can call the DO directly, so validate again at its boundary.
     const validated = validateEnsureSessionRequest(request);
-    const canonicalRequestJson = canonicalJson(validated.canonical_request);
+    const grant = await this.authorizeManagedEnsure(validated);
+    if (validated.canonical_request.execution !== undefined && !isSupportedOpencodeExecution(validated.canonical_request.execution)) {
+      throw new Error("Pillbox managed runtime does not support the requested execution");
+    }
+    const canonicalRequestJson = canonicalJson(validated.canonical_request as unknown as JsonValue);
     const requestHash = await sha256Hex(canonicalRequestJson);
     const sessionName = await deriveSessionGatewayName(
       validated.workspace_id,
       validated.effect_id,
     );
-    const sessionRef: SessionRef = { session_id: sessionName };
-    const requestedModel = validated.canonical_request.requested_model;
+    const sessionRef: SessionRef = grant
+      ? { realm: { runtime: "pillbox", execution_realm_id: grant.installation.execution_realm_id }, session_id: sessionName }
+      : { session_id: sessionName };
+    const requestedModel = requestedModelFromCanonicalRequest(validated.canonical_request);
 
     const outcome = this.ctx.storage.transactionSync(() => {
-      const row = this.ctx.storage.sql
+      const storedRow = this.ctx.storage.sql
         .exec(
-          `SELECT workspace_id, effect_id, canonical_request_hash, canonical_request_json
+          `SELECT workspace_id, effect_id, canonical_request_hash, canonical_request_json, managed_claims_json
            FROM ensure_binding
            WHERE binding_id = 1`,
         )
-        .toArray()[0] as EnsureBindingRow | undefined;
+        .toArray()[0] as (EnsureBindingRow & { managed_claims_json?: string | null }) | undefined;
+      const row = storedRow === undefined ? undefined : { ...storedRow, managed_claims_json: storedRow.managed_claims_json ?? undefined };
 
       if (!row) {
         this.ctx.storage.sql.exec(
           `INSERT INTO ensure_binding(
              binding_id, workspace_id, effect_id, canonical_request_hash,
-             canonical_request_json, created_at
-           ) VALUES (1, ?, ?, ?, ?, ?)`,
+             canonical_request_json, managed_claims_json, created_at
+           ) VALUES (1, ?, ?, ?, ?, ?, ?)`,
           validated.workspace_id,
           validated.effect_id,
           requestHash,
           canonicalRequestJson,
+          grant ? managedSessionClaimsJson(grant) : null,
           nowRfc3339(),
         );
         return "created" as const;
@@ -172,7 +195,8 @@ export class SessionGateway extends Agent<Env> {
       if (
         row.workspace_id === validated.workspace_id &&
         row.effect_id === validated.effect_id &&
-        row.canonical_request_hash === requestHash
+        row.canonical_request_hash === requestHash &&
+        row.managed_claims_json === (grant ? managedSessionClaimsJson(grant) : undefined)
       ) {
         return "reused" as const;
       }
@@ -226,13 +250,16 @@ export class SessionGateway extends Agent<Env> {
     ) {
       throw new Error("invoke request does not match the ensured session");
     }
+    const grant = await this.authorizeManagedInvoke(validated, ensure);
     const canonicalSession = JSON.parse(ensure.canonical_request_json) as {
       requested_model?: unknown;
       harness?: unknown;
+      execution?: JsonValue;
     };
     if (
-      canonicalSession.requested_model !== validated.requested_model ||
-      canonicalSession.harness !== validated.harness
+      (canonicalSession.requested_model !== undefined && canonicalSession.requested_model !== validated.requested_model) ||
+      (canonicalSession.harness !== undefined && canonicalSession.harness !== validated.harness) ||
+      (canonicalSession.execution !== undefined && canonicalJson(canonicalSession.execution as JsonValue) !== canonicalJson((validated.execution ?? null) as JsonValue))
     ) {
       throw new Error(
         "invoke request execution does not match the ensured session",
@@ -288,6 +315,20 @@ export class SessionGateway extends Agent<Env> {
 
     this.activeHuddlesInvocations.add(validated.invocation_id);
     try {
+      if (validated.execution !== undefined && !isSupportedOpencodeExecution(validated.execution)) {
+        const evidence = this.appendAgentError("unsupported execution requested by Huddles");
+        return this.finishHuddlesInvocation(validated, {
+          status: "failed",
+          disposition: "created",
+          session_ref: grant
+            ? { realm: { runtime: "pillbox", execution_realm_id: grant.installation.execution_realm_id }, session_id: validated.session_ref.session_id, seq_range: [evidence.seq, evidence.seq] }
+            : { session_id: validated.session_ref.session_id, seq_range: [evidence.seq, evidence.seq] },
+          error: {
+            code: "unsupported_execution",
+            message: "Pillbox does not support the requested execution",
+          },
+        });
+      }
       const inputEvent = this.append(nowRfc3339(), HUDDLES_ACTOR, {
         type: "input",
         text: validated.rendered_input,
@@ -300,16 +341,15 @@ export class SessionGateway extends Agent<Env> {
         return this.finishHuddlesInvocation(validated, {
           status: "failed",
           disposition: "created",
-          session_ref: {
-            session_id: validated.session_ref.session_id,
-            seq_range: [inputEvent.seq, this.head()],
-          },
+          session_ref: grant ? { realm: { runtime: "pillbox", execution_realm_id: grant.installation.execution_realm_id }, session_id: validated.session_ref.session_id, seq_range: [inputEvent.seq, this.head()] } : { session_id: validated.session_ref.session_id, seq_range: [inputEvent.seq, this.head()] },
           error: {
             code: "runtime_unavailable",
             message: "Pillbox managed runner has no Cloudflare Sandbox binding",
           },
         });
       }
+
+      if (grant) await this.configureManagedEgress(getManagedSandbox(this.env.Sandbox!, await deriveSandboxRuntimeId(this.name)), grant, validated);
 
       const structuredOutput = await this.driveAgent(
         getSandbox(
@@ -320,6 +360,7 @@ export class SessionGateway extends Agent<Env> {
         validated.requested_model,
         validated.tool_policy,
         validated.output_format,
+        grant !== undefined,
       );
       const lastSeq = this.head();
       const turn = this.huddlesTurn(
@@ -328,10 +369,9 @@ export class SessionGateway extends Agent<Env> {
         structuredOutput,
         validated.output_format !== undefined,
       );
-      const sessionRef: SessionRef = {
-        session_id: validated.session_ref.session_id,
-        seq_range: [inputEvent.seq, lastSeq],
-      };
+      const sessionRef: SessionRef = grant
+        ? { realm: { runtime: "pillbox", execution_realm_id: grant.installation.execution_realm_id }, session_id: validated.session_ref.session_id, seq_range: [inputEvent.seq, lastSeq] }
+        : { session_id: validated.session_ref.session_id, seq_range: [inputEvent.seq, lastSeq] };
       if (turn.error) {
         console.warn(
           "managed invocation terminalized",
@@ -363,10 +403,7 @@ export class SessionGateway extends Agent<Env> {
       return this.finishHuddlesInvocation(validated, {
         status: "failed",
         disposition: "created",
-        session_ref: {
-          session_id: validated.session_ref.session_id,
-          seq_range: [failure.seq, failure.seq],
-        },
+        session_ref: grant ? { realm: { runtime: "pillbox", execution_realm_id: grant.installation.execution_realm_id }, session_id: validated.session_ref.session_id, seq_range: [failure.seq, failure.seq] } : { session_id: validated.session_ref.session_id, seq_range: [failure.seq, failure.seq] },
         error: {
           code: "runtime_failed",
           message: "Pillbox managed invocation failed",
@@ -375,6 +412,149 @@ export class SessionGateway extends Agent<Env> {
     } finally {
       this.activeHuddlesInvocations.delete(validated.invocation_id);
     }
+  }
+
+  async readEvidence(request: EvidenceReadRequest): Promise<readonly import("./evidence_reader.js").EvidenceFrame[]> {
+    this.ensureBindingSchema();
+    const claims = await authorizeEvidenceRead({ request, keyId: this.env.PILLBOX_GRANT_KEY_ID, publicKey: this.env.PILLBOX_GRANT_PUBLIC_KEY });
+    if (!this.env.PILLBOX_INSTALLATION_ID || !this.env.PILLBOX_EXECUTION_REALM_ID || !this.env.PILLBOX_PROTOCOL_REVISION || claims.installation.installation_id !== this.env.PILLBOX_INSTALLATION_ID || claims.installation.execution_realm_id !== this.env.PILLBOX_EXECUTION_REALM_ID || claims.installation.protocol_revision !== this.env.PILLBOX_PROTOCOL_REVISION) throw new ManagedAuthorizationError("grant_binding_mismatch", "evidence grant does not match this deployment");
+    if (!this.env.PillboxAuthorizationControlPlane) throw new ManagedAuthorizationError("authorization_unavailable", "Huddles evidence currentness RPC is unavailable");
+    const evidenceAuth = this.env.PillboxAuthorizationControlPlane.authorizeEvidenceReadGrant;
+    if (this.env.PillboxAuthorizationControlPlane && !evidenceAuth) throw new ManagedAuthorizationError("authorization_unavailable", "Huddles evidence currentness RPC is not configured");
+    if (evidenceAuth) {
+      const current = await evidenceAuth({ grant: claims, expected: { installation: claims.installation, workspace_id: claims.workspace_id, viewer_principal_id: claims.viewer_principal_id, policy_id: claims.policy_id, run_id: claims.run_id, session_ref: request.session_ref } });
+      if (managedCanonicalJson(current) !== managedCanonicalJson(claims)) throw new ManagedAuthorizationError("grant_revoked", "Huddles evidence grant is not current");
+    }
+    if (claims.session_ref.session_id !== this.name) throw new Error("evidence session does not match the durable object");
+    const ensured = this.ensureBinding();
+    if (!ensured?.managed_claims_json || !managedEvidenceBelongsToSession(ensured.managed_claims_json, claims)) {
+      throw new ManagedAuthorizationError("grant_binding_mismatch", "evidence grant is not bound to this managed session");
+    }
+    const max = request.max_events ?? 100;
+    if (!Number.isSafeInteger(max) || max < 1 || max > 500) throw new Error("evidence max_events is outside the bounded range");
+    const from = request.session_ref.seq_range?.[0] ?? request.session_ref.seq ?? 1;
+    const to = request.session_ref.seq_range?.[1] ?? request.session_ref.seq ?? Number.MAX_SAFE_INTEGER;
+    if (to - from + 1 > max) throw new Error("evidence range is too large");
+    return this.readEvidenceRange(from, to, max);
+  }
+
+  private async authorizeManagedEnsure(request: EnsureSessionRequest): Promise<PillboxExecutionGrantClaims | undefined> {
+    const envelope = request.managed_authorization?.grant;
+    if (!envelope) {
+      if (this.managedAuthRequired(request)) throw new ManagedAuthorizationError("invalid_grant", "managed execution grant is required");
+      return undefined;
+    }
+    const claims = await verifySignedExecutionGrant(envelope, this.env.PILLBOX_GRANT_KEY_ID, this.env.PILLBOX_GRANT_PUBLIC_KEY);
+    rejectCredentialMaterial(request.canonical_request, "canonical_request");
+    const binding = requireManagedRequestBinding(request.managed_authorization, "ensure_session");
+    if (binding.session_idempotency_key !== request.effect_id || binding.run_id !== requiredRequestField(request.canonical_request.run_id, "canonical_request.run_id") || binding.packet_id !== requiredRequestField(request.canonical_request.packet_id, "canonical_request.packet_id") || binding.principal_id !== requiredRequestField(request.canonical_request.activity_principal_id, "canonical_request.activity_principal_id") || binding.policy_id !== requiredRequestField(request.canonical_request.policy_id, "canonical_request.policy_id")) {
+      throw new ManagedAuthorizationError("grant_binding_mismatch", "managed ensure request binding does not match the canonical request");
+    }
+    const hashes = await this.managedRequestHashes(request.canonical_request.execution, binding);
+    const expected = this.expectedBinding("ensure_session", request.workspace_id, binding, hashes);
+    return authorizeExecutionGrant(this.env, envelope, expected);
+  }
+
+  private async authorizeManagedInvoke(request: InvokeSessionRequest, ensured: EnsureBindingRow): Promise<PillboxExecutionGrantClaims | undefined> {
+    const envelope = request.managed_authorization?.grant;
+    if (!envelope) {
+      if (this.managedAuthRequired(request)) throw new ManagedAuthorizationError("invalid_grant", "managed execution grant is required");
+      return undefined;
+    }
+    const claims = await verifySignedExecutionGrant(envelope, this.env.PILLBOX_GRANT_KEY_ID, this.env.PILLBOX_GRANT_PUBLIC_KEY);
+    rejectCredentialMaterial(request, "invoke_request");
+    const binding = requireManagedRequestBinding(request.managed_authorization, "invoke_session");
+    if (binding.invocation_id !== request.invocation_id || binding.session_idempotency_key !== request.invocation_id || binding.delivery_receipt_id !== request.delivery_receipt_id || binding.rendered_input_hash !== request.rendered_input_hash || (request.activity_principal_id !== undefined && binding.principal_id !== request.activity_principal_id) || (request.policy_id !== undefined && binding.policy_id !== request.policy_id) || (request.run_id !== undefined && binding.run_id !== request.run_id) || (request.packet_id !== undefined && binding.packet_id !== request.packet_id) || (request.execution_policy_revision !== undefined && binding.execution_policy_revision !== request.execution_policy_revision) || claims.installation.execution_realm_id !== request.session_ref.realm?.execution_realm_id || ensured.managed_claims_json === undefined) {
+      throw new ManagedAuthorizationError("grant_binding_mismatch", "managed invoke request does not match its request binding");
+    }
+    if (managedCanonicalJson(binding.output_format) !== managedCanonicalJson(request.output_format)) throw new ManagedAuthorizationError("grant_binding_mismatch", "managed invoke output contract does not match its request binding");
+    if (managedSessionClaimsJson(claims) !== ensured.managed_claims_json) throw new ManagedAuthorizationError("grant_binding_mismatch", "managed invoke grant relabels an existing session");
+    const hashes = await this.managedRequestHashes(request.execution, binding);
+    const expected = this.expectedBinding("invoke_session", request.workspace_id, binding, hashes);
+    return authorizeExecutionGrant(this.env, envelope, expected);
+  }
+
+  private async configureManagedEgress(sandbox: ManagedSandboxPolicy, grant: PillboxExecutionGrantClaims, request: InvokeSessionRequest): Promise<void> {
+    if (!request.managed_authorization) throw new ManagedAuthorizationError("invalid_grant", "managed egress requires the signed invocation grant");
+    let hosts: Record<string, string>;
+    try {
+      const parsed: unknown = JSON.parse(this.env.PILLBOX_CREDENTIAL_HOSTS_JSON ?? "");
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("credential host map is not an object");
+      hosts = parsed as Record<string, string>;
+    } catch (cause) {
+      throw new ManagedAuthorizationError("authorization_unavailable", "managed credential host map is unavailable", cause);
+    }
+    const bindings = grant.runtime_policy.credential_bindings;
+    const configuredHosts = bindings.map((binding) => hosts[binding.credential_binding_id]);
+    if (configuredHosts.some((host) => typeof host !== "string" || host.length === 0)) throw new ManagedAuthorizationError("authorization_unavailable", "managed credential host mapping is incomplete");
+    await sandbox.setAllowedHosts(configuredHosts);
+    const binding = requireManagedRequestBinding(request.managed_authorization, "invoke_session");
+    const hashes = await this.managedRequestHashes(request.execution, binding);
+    const expected = this.expectedBinding("invoke_session", request.workspace_id, binding, hashes);
+    for (const binding of bindings) {
+      const allowedHost = hosts[binding.credential_binding_id]!;
+      const params: ManagedOutboundParams = { route: { credential_binding_id: binding.credential_binding_id, secret_ref: binding.secret_ref, purpose: binding.purpose, host: allowedHost }, invocation_id: request.invocation_id, execution_realm_id: grant.installation.execution_realm_id, grant: request.managed_authorization.grant, expected };
+      await sandbox.setOutboundByHost(allowedHost, "managedCredential", params);
+    }
+  }
+
+  private expectedBinding(
+    operation: "ensure_session" | "invoke_session",
+    workspaceId: string,
+    binding: PillboxManagedRequestBinding,
+    hashes: { readonly execution_identity_hash: `sha256:${string}`; readonly output_contract_hash: `sha256:${string}` },
+  ): PillboxExecutionGrantBinding {
+    const installation = this.deploymentInstallation();
+    const organizationId = this.env.PILLBOX_ORGANIZATION_ID;
+    if (!organizationId) throw new ManagedAuthorizationError("authorization_unavailable", "managed organization pin is not configured");
+    return {
+      operation,
+      installation,
+      organization_id: organizationId,
+      workspace_id: workspaceId,
+      principal_id: binding.principal_id,
+      policy_id: binding.policy_id,
+      run_id: binding.run_id,
+      invocation_id: binding.invocation_id,
+      packet_id: binding.packet_id,
+      delivery_receipt_id: binding.delivery_receipt_id,
+      session_idempotency_key: binding.session_idempotency_key,
+      rendered_input_hash: binding.rendered_input_hash,
+      execution_identity_hash: hashes.execution_identity_hash,
+      output_contract_hash: hashes.output_contract_hash,
+      runtime_policy: binding.runtime_policy,
+    };
+  }
+
+  private deploymentInstallation(): PillboxInstallationRef {
+    if (!this.env.PILLBOX_INSTALLATION_ID || !this.env.PILLBOX_EXECUTION_REALM_ID || this.env.PILLBOX_PROTOCOL_REVISION !== "pillbox.huddles/1") throw new ManagedAuthorizationError("authorization_unavailable", "managed deployment pins are not configured");
+    return { installation_id: this.env.PILLBOX_INSTALLATION_ID, execution_realm_id: this.env.PILLBOX_EXECUTION_REALM_ID, protocol_revision: "pillbox.huddles/1" };
+  }
+
+  private async managedRequestHashes(
+    execution: JsonValue | undefined,
+    binding: PillboxManagedRequestBinding,
+  ): Promise<{ readonly execution_identity_hash: `sha256:${string}`; readonly output_contract_hash: `sha256:${string}` }> {
+    if (execution === undefined) throw new ManagedAuthorizationError("authorization_unavailable", "managed request execution is unavailable");
+    try {
+      return {
+        execution_identity_hash: `sha256:${await sha256Hex(managedCanonicalJson({ execution, execution_policy_revision: binding.execution_policy_revision }))}`,
+        output_contract_hash: `sha256:${await sha256Hex(managedCanonicalJson(binding.output_format))}`,
+      };
+    } catch (cause) {
+      throw new ManagedAuthorizationError("grant_binding_mismatch", "managed request hash material is invalid", cause);
+    }
+  }
+
+  private managedAuthRequired(request: EnsureSessionRequest | InvokeSessionRequest): boolean {
+    if (this.env.MANAGED_AUTH_REQUIRED === "1") return true;
+    // Preserve the legacy local smoke/compatibility protocol while requiring a
+    // grant for Huddles' current execution envelope. The managed deployment
+    // can set MANAGED_AUTH_REQUIRED=1 to close even that compatibility path.
+    if (this.env.PillboxAuthorizationControlPlane === undefined) return false;
+    return "canonical_request" in request
+      ? request.canonical_request.execution !== undefined
+      : request.execution !== undefined;
   }
 
   /** Worker routing guard; private service-binding RPC methods bypass public fetch. */
@@ -394,10 +574,7 @@ export class SessionGateway extends Agent<Env> {
     const result = this.finishHuddlesInvocation(request, {
       status: "failed",
       disposition: "created",
-      session_ref: {
-        session_id: request.session_ref.session_id,
-        seq_range: [evidence.seq, evidence.seq],
-      },
+      session_ref: request.session_ref.realm ? { realm: request.session_ref.realm, session_id: request.session_ref.session_id, seq_range: [evidence.seq, evidence.seq] } : { session_id: request.session_ref.session_id, seq_range: [evidence.seq, evidence.seq] },
       error: {
         code: "runtime_interrupted",
         message: "Pillbox managed invocation was interrupted",
@@ -407,12 +584,13 @@ export class SessionGateway extends Agent<Env> {
   }
 
   private ensureBinding(): EnsureBindingRow | undefined {
-    return this.ctx.storage.sql
+    const row = this.ctx.storage.sql
       .exec(
-        `SELECT workspace_id, effect_id, canonical_request_hash, canonical_request_json
+        `SELECT workspace_id, effect_id, canonical_request_hash, canonical_request_json, managed_claims_json
          FROM ensure_binding WHERE binding_id = 1`,
       )
-      .toArray()[0] as EnsureBindingRow | undefined;
+      .toArray()[0] as (EnsureBindingRow & { managed_claims_json?: string | null }) | undefined;
+    return row === undefined ? undefined : { ...row, managed_claims_json: row.managed_claims_json ?? undefined };
   }
 
   private invocation(
@@ -1002,10 +1180,11 @@ export class SessionGateway extends Agent<Env> {
     model: string,
     toolPolicy?: HuddlesToolPolicy,
     outputFormat?: JsonSchemaOutputFormat,
+    managed = false,
   ): Promise<string | undefined> {
     let config: { config?: unknown; env: Record<string, string> };
     try {
-      config = this.opencodeConfig(toolPolicy);
+      config = this.opencodeConfig(toolPolicy, managed);
     } catch (cause) {
       this.appendAgentError(`opencode provider config: ${String(cause)}`);
       return;
@@ -1044,10 +1223,19 @@ export class SessionGateway extends Agent<Env> {
   // with an apiKey, or a CF AI Gateway); known provider keys are passed through as
   // env so opencode auto-detects them. Fails loud if neither is set — a
   // misconfigured run says so rather than letting opencode error opaquely mid-turn.
-  private opencodeConfig(toolPolicy?: HuddlesToolPolicy): {
+  private opencodeConfig(toolPolicy?: HuddlesToolPolicy, managed = false): {
     config?: unknown;
     env: Record<string, string>;
   } {
+    if (managed) {
+      // Managed credentials are injected by the trusted outbound handler. A
+      // managed invocation may never downgrade to Worker provider-key env vars
+      // or OPENCODE_CONFIG_JSON, even when those legacy secrets are present.
+      if (!this.env.CredentialBroker) {
+        throw new Error("managed credential broker is not configured");
+      }
+      return { env: {}, config: enforceHuddlesOpencodePolicy(undefined, toolPolicy ?? "deny_all") };
+    }
     const env: Record<string, string> = {};
     // Providers opencode auto-detects from their standard env vars.
     for (const k of ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"] as const) {
@@ -1222,6 +1410,29 @@ export class SessionGateway extends Agent<Env> {
     }
   }
 
+  private readEvidenceRange(
+    from: number,
+    to: number,
+    max: number,
+  ): readonly import("./evidence_reader.js").EvidenceFrame[] {
+    const rows = this.ctx.storage.sql.exec(
+      `SELECT seq, at, actorJson, payloadJson
+       FROM log WHERE seq >= ? AND seq <= ? ORDER BY seq ASC LIMIT ?`,
+      from,
+      to,
+      max,
+    ) as Iterable<{ seq: number; at: string; actorJson: string | null; payloadJson: string }>;
+    return Array.from(rows, (row) => {
+      const frame: import("./evidence_reader.js").EvidenceFrame = {
+        seq: row.seq,
+        sessionId: this.name,
+        at: row.at,
+        payload: JSON.parse(row.payloadJson) as Payload,
+      };
+      return row.actorJson ? { ...frame, actor: JSON.parse(row.actorJson) } : frame;
+    });
+  }
+
   private head(): number {
     return (
       this.ctx.storage.sql
@@ -1243,6 +1454,71 @@ export class SessionGateway extends Agent<Env> {
     for (const connection of this.getConnections<WsState>()) {
       connection.close(1008, "managed session is private");
     }
+  }
+}
+
+function managedSessionClaimsJson(claims: PillboxExecutionGrantClaims): string {
+  return managedCanonicalJson({
+    installation: claims.installation,
+    organization_id: claims.organization_id,
+    workspace_id: claims.workspace_id,
+    policy: claims.policy,
+    run_id: claims.run_id,
+    packet_id: claims.packet_id,
+    runtime_policy: claims.runtime_policy,
+    execution_identity_hash: claims.execution_identity_hash,
+    output_contract_hash: claims.output_contract_hash,
+  });
+}
+
+function rejectCredentialMaterial(value: unknown, path: string): void {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => rejectCredentialMaterial(item, `${path}[${index}]`));
+    return;
+  }
+  if (!value || typeof value !== "object") return;
+  for (const [key, child] of Object.entries(value)) {
+    if (/(?:access|refresh)[_-]?token|api[_-]?key|authorization|cookie|client[_-]?secret|private[_-]?key/i.test(key)) throw new ManagedAuthorizationError("grant_binding_mismatch", `${path}.${key} cannot carry credential material`);
+    rejectCredentialMaterial(child, `${path}.${key}`);
+  }
+}
+
+function requireManagedRequestBinding(
+  value: { readonly request_binding?: PillboxManagedRequestBinding } | undefined,
+  operation: string,
+): PillboxManagedRequestBinding {
+  if (!value?.request_binding) throw new ManagedAuthorizationError("authorization_unavailable", `Huddles ${operation} request lacks its independent request binding`);
+  return value.request_binding;
+}
+
+function requiredRequestField(value: unknown, field: string): string {
+  if (typeof value !== "string" || value.length === 0) throw new ManagedAuthorizationError("authorization_unavailable", `Huddles request lacks ${field}`);
+  return value;
+}
+
+function isSupportedOpencodeExecution(value: JsonValue): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const execution = value as Record<string, JsonValue | undefined>;
+  const transport = execution.transport;
+  if (!transport || typeof transport !== "object" || Array.isArray(transport)) return false;
+  const details = transport as Record<string, JsonValue | undefined>;
+  return execution.placement === "managed_container" && details.harness === "opencode" && details.transport === "cloudflare-service-binding" && details.harness_version === "opencode/managed" && details.adapter_revision === "pillbox/huddles-invoke-v1";
+}
+
+function managedEvidenceBelongsToSession(
+  storedClaimsJson: string,
+  claims: { readonly installation: PillboxInstallationRef; readonly workspace_id: string; readonly policy_id: string; readonly run_id: string },
+): boolean {
+  try {
+    const stored = JSON.parse(storedClaimsJson) as {
+      installation?: PillboxInstallationRef;
+      workspace_id?: unknown;
+      policy?: { readonly policy_id?: unknown };
+      run_id?: unknown;
+    };
+    return stored.workspace_id === claims.workspace_id && stored.run_id === claims.run_id && stored.policy?.policy_id === claims.policy_id && managedCanonicalJson(stored.installation) === managedCanonicalJson(claims.installation);
+  } catch {
+    return false;
   }
 }
 

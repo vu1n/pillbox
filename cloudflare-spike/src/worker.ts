@@ -1,17 +1,21 @@
 import { routeAgentRequest, type AgentOptions } from "agents";
-import { proxyToSandbox, type Sandbox } from "@cloudflare/sandbox";
+import { proxyToSandbox } from "@cloudflare/sandbox";
+import { Sandbox, ContainerProxy } from "./sandbox.js";
 import { SessionGateway } from "./session_gateway.js";
 import {
   HuddlesRuntimeEntrypoint,
   isHuddlesSessionName,
 } from "./huddles_runtime.js";
+import type { PillboxAuthorizationControlPlane } from "./managed_auth.js";
+import { CredentialBroker } from "./credentials/credential_broker.js";
 
 export { SessionGateway };
+export { CredentialBroker };
 // Named entrypoint: Huddles reaches ensureSession through a same-account
 // service-binding RPC. The default fetch handler below never routes that method.
 export { HuddlesRuntimeEntrypoint };
 // Re-export the SDK's container-owning DO so wrangler can bind it.
-export { Sandbox } from "@cloudflare/sandbox";
+export { Sandbox, ContainerProxy };
 
 export interface Env {
   // The §0 gateway Agent (kebab-class `session-gateway` in the route).
@@ -19,6 +23,19 @@ export interface Env {
   // The Sandbox SDK's container DO — OPTIONAL: present only in the container
   // config (wrangler.container.toml). Absent in the free/§0-only deploy.
   Sandbox?: DurableObjectNamespace<Sandbox>;
+  /** Private Huddles control-plane binding. Transport auth is not workload auth. */
+  PillboxAuthorizationControlPlane?: PillboxAuthorizationControlPlane;
+  CredentialBroker?: DurableObjectNamespace<CredentialBroker>;
+  /** Public verification half of the active Huddles Ed25519 grant key. */
+  PILLBOX_GRANT_KEY_ID?: string;
+  PILLBOX_GRANT_PUBLIC_KEY?: string;
+  PILLBOX_INSTALLATION_ID?: string;
+  PILLBOX_EXECUTION_REALM_ID?: string;
+  PILLBOX_PROTOCOL_REVISION?: string;
+  PILLBOX_ORGANIZATION_ID?: string;
+  PILLBOX_CREDENTIAL_ENCRYPTION_KEY?: string;
+  PILLBOX_CREDENTIAL_HOSTS_JSON?: string;
+  MANAGED_AUTH_REQUIRED?: string;
   // Issuer secret for verifying actor tokens (HMAC). Set out-of-band via
   // `wrangler secret put ACTOR_TOKEN_SECRET` (or `.dev.vars` for `wrangler dev`),
   // never committed. Absent → writes fail closed (no actor can be attested).

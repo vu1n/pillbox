@@ -1,0 +1,8 @@
+name = "pillbox-managed-auth-caller"
+main = "test/ensure_worker.ts"
+compatibility_date = "2026-06-01"
+
+[[services]]
+binding = "PillboxRuntime"
+service = "pillbox-managed-auth-test"
+entrypoint = "HuddlesRuntimeEntrypoint"

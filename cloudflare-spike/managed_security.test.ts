@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { decryptOAuthMaterial, encryptOAuthMaterial } from "./src/credentials/crypto.ts";
-import { validateEvidenceBinding, validateEvidenceReadClaims, validatePositionalEvidenceSelector, validateSessionRef } from "./src/managed_contract.ts";
+import { makeEvidenceReadCurrentnessRequest, validateEvidenceBinding, validateEvidenceReadClaims, validatePositionalEvidenceSelector, validateSessionRef } from "./src/managed_contract.ts";
 
 test("OAuth material is versioned, encrypted, and authenticated with binding AAD", async () => {
   const material = { access_token: "access-secret", refresh_token: "refresh-secret", expires_at: 200, provider_host: "api.example.test", generation: 1 };
@@ -33,4 +33,14 @@ test("evidence reads require a positional or snapshot-bound reference and contai
   assert.throws(() => validatePositionalEvidenceSelector({ ...claims.session_ref, seq_range: undefined, event_cursor: "cursor-1" }), /positional selector/);
   assert.throws(() => validatePositionalEvidenceSelector({ ...claims.session_ref, seq: undefined, seq_range: undefined }), /positional selector/);
   assert.throws(() => validatePositionalEvidenceSelector({ ...claims.session_ref, seq: 15, seq_range: undefined, snapshot_ref: "snapshot-1" }), /cursor or snapshot selectors/);
+  const currentness = makeEvidenceReadCurrentnessRequest(claims, {
+    installation: claims.installation,
+    workspace_id: claims.workspace_id,
+    viewer_principal_id: claims.viewer_principal_id,
+    policy_id: claims.policy_id,
+    run_id: claims.run_id,
+    session_ref: claims.session_ref,
+  }, { algorithm: "Ed25519", key_id: "key-1", public_key_sha256: "sha256:" + "a".repeat(64) });
+  assert.equal(currentness.version, "pillbox.authorization-currentness/2");
+  assert.equal(currentness.verified_signer.public_key_sha256, "sha256:" + "a".repeat(64));
 });

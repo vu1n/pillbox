@@ -34,8 +34,8 @@ import {
   requestedModelFromCanonicalRequest,
 } from "./huddles_runtime.js";
 import { authorizeExecutionGrant, ManagedAuthorizationError, verifySignedExecutionGrant } from "./managed_auth.js";
-import { authorizeEvidenceRead } from "./evidence_reader.js";
-import { managedCanonicalJson, type PillboxInstallationRef, type PillboxManagedRequestBinding } from "./managed_contract.js";
+import { authorizeEvidenceReadWithSigner } from "./evidence_reader.js";
+import { managedCanonicalJson, managedInvocationSemanticHash, managedInvocationSemanticJson, makeEvidenceReadCurrentnessRequest, type PillboxInstallationRef, type PillboxManagedRequestBinding } from "./managed_contract.js";
 import type {
   PillboxExecutionGrantBinding,
   PillboxExecutionGrantClaims,
@@ -266,17 +266,24 @@ export class SessionGateway extends Agent<Env> {
       );
     }
 
-    const requestJson = canonicalJson(validated as unknown as JsonValue);
-    const requestHash = await sha256Hex(requestJson);
+    const requestJson = managedInvocationSemanticJson(validated as unknown as JsonValue);
+    const requestHash = await managedInvocationSemanticHash(validated as unknown as JsonValue);
     const existing = this.invocation(validated.invocation_id);
     if (existing) {
-      if (existing.request_hash !== requestHash) {
+      // PR #145 persisted the full signed envelope. Normalize that immutable
+      // historical tuple before comparing so a fresh grant can recover a
+      // response-loss retry without rewriting durable history.
+      const storedRequest = JSON.parse(existing.request_json) as JsonValue;
+      const storedRequestJson = managedInvocationSemanticJson(storedRequest);
+      if (storedRequestJson !== requestJson) {
         return {
           code: "invoke_session_conflict",
           workspace_id: validated.workspace_id,
           effect_id: validated.effect_id,
           invocation_id: validated.invocation_id,
-          existing_request_hash: existing.request_hash,
+          // PR #145 rows retain their envelope-inclusive hash. Report the
+          // comparable semantic hash without mutating that immutable history.
+          existing_request_hash: await managedInvocationSemanticHash(storedRequest),
           requested_request_hash: requestHash,
         };
       }
@@ -416,15 +423,19 @@ export class SessionGateway extends Agent<Env> {
 
   async readEvidence(request: EvidenceReadRequest): Promise<readonly import("./evidence_reader.js").EvidenceFrame[]> {
     this.ensureBindingSchema();
-    const claims = await authorizeEvidenceRead({ request, keyId: this.env.PILLBOX_GRANT_KEY_ID, publicKey: this.env.PILLBOX_GRANT_PUBLIC_KEY });
+    const authorized = await authorizeEvidenceReadWithSigner({ request, keyId: this.env.PILLBOX_GRANT_KEY_ID, publicKey: this.env.PILLBOX_GRANT_PUBLIC_KEY });
+    const claims = authorized.claims;
     if (!this.env.PILLBOX_INSTALLATION_ID || !this.env.PILLBOX_EXECUTION_REALM_ID || !this.env.PILLBOX_PROTOCOL_REVISION || claims.installation.installation_id !== this.env.PILLBOX_INSTALLATION_ID || claims.installation.execution_realm_id !== this.env.PILLBOX_EXECUTION_REALM_ID || claims.installation.protocol_revision !== this.env.PILLBOX_PROTOCOL_REVISION) throw new ManagedAuthorizationError("grant_binding_mismatch", "evidence grant does not match this deployment");
-    if (!this.env.PillboxAuthorizationControlPlane) throw new ManagedAuthorizationError("authorization_unavailable", "Huddles evidence currentness RPC is unavailable");
-    const evidenceAuth = this.env.PillboxAuthorizationControlPlane.authorizeEvidenceReadGrant;
-    if (this.env.PillboxAuthorizationControlPlane && !evidenceAuth) throw new ManagedAuthorizationError("authorization_unavailable", "Huddles evidence currentness RPC is not configured");
-    if (evidenceAuth) {
-      const current = await evidenceAuth({ grant: claims, expected: { installation: claims.installation, workspace_id: claims.workspace_id, viewer_principal_id: claims.viewer_principal_id, policy_id: claims.policy_id, run_id: claims.run_id, session_ref: request.session_ref } });
-      if (managedCanonicalJson(current) !== managedCanonicalJson(claims)) throw new ManagedAuthorizationError("grant_revoked", "Huddles evidence grant is not current");
-    }
+    const controlPlane = this.env.PillboxAuthorizationControlPlane;
+    if (!controlPlane) throw new ManagedAuthorizationError("authorization_unavailable", "Huddles evidence currentness RPC is unavailable");
+    const evidenceAuth = controlPlane.authorizeEvidenceReadGrant;
+    if (!evidenceAuth) throw new ManagedAuthorizationError("authorization_unavailable", "Huddles evidence currentness RPC is not configured");
+    const current = await evidenceAuth(makeEvidenceReadCurrentnessRequest(
+      claims,
+      { installation: claims.installation, workspace_id: claims.workspace_id, viewer_principal_id: claims.viewer_principal_id, policy_id: claims.policy_id, run_id: claims.run_id, session_ref: request.session_ref },
+      authorized.verified_signer,
+    ));
+    if (managedCanonicalJson(current) !== managedCanonicalJson(claims)) throw new ManagedAuthorizationError("grant_revoked", "Huddles evidence grant is not current");
     if (claims.session_ref.session_id !== this.name) throw new Error("evidence session does not match the durable object");
     const ensured = this.ensureBinding();
     if (!ensured?.managed_claims_json || !managedEvidenceBelongsToSession(ensured.managed_claims_json, claims)) {
@@ -462,7 +473,12 @@ export class SessionGateway extends Agent<Env> {
       return undefined;
     }
     const claims = await verifySignedExecutionGrant(envelope, this.env.PILLBOX_GRANT_KEY_ID, this.env.PILLBOX_GRANT_PUBLIC_KEY);
-    rejectCredentialMaterial(request, "invoke_request");
+    // The signed envelope is the authorization contract, not raw credential
+    // material. It has already passed strict grant/request-binding validation;
+    // scan the independent invoke fields so the guard does not reject its own
+    // `managed_authorization` structural key.
+    const { managed_authorization: _managedAuthorization, ...requestWithoutAuthorization } = request;
+    rejectCredentialMaterial(requestWithoutAuthorization, "invoke_request");
     const binding = requireManagedRequestBinding(request.managed_authorization, "invoke_session");
     if (binding.invocation_id !== request.invocation_id || binding.session_idempotency_key !== request.invocation_id || binding.delivery_receipt_id !== request.delivery_receipt_id || binding.rendered_input_hash !== request.rendered_input_hash || (request.activity_principal_id !== undefined && binding.principal_id !== request.activity_principal_id) || (request.policy_id !== undefined && binding.policy_id !== request.policy_id) || (request.run_id !== undefined && binding.run_id !== request.run_id) || (request.packet_id !== undefined && binding.packet_id !== request.packet_id) || (request.execution_policy_revision !== undefined && binding.execution_policy_revision !== request.execution_policy_revision) || claims.installation.execution_realm_id !== request.session_ref.realm?.execution_realm_id || ensured.managed_claims_json === undefined) {
       throw new ManagedAuthorizationError("grant_binding_mismatch", "managed invoke request does not match its request binding");
@@ -595,15 +611,15 @@ export class SessionGateway extends Agent<Env> {
 
   private invocation(
     invocationId: string,
-  ): { request_hash: string; result_json: string | null } | undefined {
+  ): { request_hash: string; request_json: string; result_json: string | null } | undefined {
     return this.ctx.storage.sql
       .exec(
-        `SELECT request_hash, result_json
+        `SELECT request_hash, request_json, result_json
          FROM huddles_invocation WHERE invocation_id = ?`,
         invocationId,
       )
       .toArray()[0] as
-      | { request_hash: string; result_json: string | null }
+      | { request_hash: string; request_json: string; result_json: string | null }
       | undefined;
   }
 

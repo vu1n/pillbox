@@ -1,10 +1,16 @@
 import type { Env } from "./worker.js";
 import { verifyManagedEd25519Signature } from "./managed_signature.js";
+import { makeManagedVerifiedSigner } from "./managed_signer.js";
 import {
   managedCanonicalJson,
   isManagedGrantCurrent,
+  makeExecutionGrantCurrentnessRequest,
+  type PillboxExecutionGrantCurrentnessRequest,
   type PillboxExecutionGrantBinding,
   type PillboxExecutionGrantClaims,
+  type PillboxEvidenceReadCurrentnessRequest,
+  type PillboxEvidenceReadGrantClaims,
+  type PillboxVerifiedSigner,
   type SignedPillboxExecutionGrant,
   validateExecutionGrantClaims,
   validateGrantBinding,
@@ -12,11 +18,9 @@ import {
 } from "./managed_contract.js";
 
 export interface PillboxAuthorizationControlPlane {
-  authorizeExecutionGrant(input: {
-    grant: PillboxExecutionGrantClaims;
-    expected: PillboxExecutionGrantBinding;
-  }): Promise<PillboxExecutionGrantClaims>;
-  authorizeEvidenceReadGrant?(input: unknown): Promise<unknown>;
+  /** Currentness v2 is deliberately the same method name: old exact v1 request schemas must reject rather than downgrade. */
+  authorizeExecutionGrant(input: PillboxExecutionGrantCurrentnessRequest): Promise<PillboxExecutionGrantClaims>;
+  authorizeEvidenceReadGrant?(input: PillboxEvidenceReadCurrentnessRequest): Promise<PillboxEvidenceReadGrantClaims>;
 }
 
 export class ManagedAuthorizationError extends Error {
@@ -40,6 +44,14 @@ export async function verifySignedExecutionGrant(
   keyId: string | undefined,
   publicKeyMaterial: string | undefined,
 ): Promise<PillboxExecutionGrantClaims> {
+  return (await verifySignedExecutionGrantWithSigner(value, keyId, publicKeyMaterial)).claims;
+}
+
+export async function verifySignedExecutionGrantWithSigner(
+  value: unknown,
+  keyId: string | undefined,
+  publicKeyMaterial: string | undefined,
+): Promise<{ readonly claims: PillboxExecutionGrantClaims; readonly verified_signer: PillboxVerifiedSigner }> {
   let envelope: SignedPillboxExecutionGrant;
   try {
     envelope = validateSignedExecutionGrant(value);
@@ -50,8 +62,11 @@ export async function verifySignedExecutionGrant(
     throw new ManagedAuthorizationError("invalid_grant", "managed execution grant key is not trusted");
   }
   try {
-    await verifyManagedEd25519Signature({ publicKeyMaterial, signature: envelope.signature, claims: envelope.claims });
-    return validateExecutionGrantClaims(envelope.claims);
+    const verified = await verifyManagedEd25519Signature({ publicKeyMaterial, signature: envelope.signature, claims: envelope.claims });
+    return {
+      claims: validateExecutionGrantClaims(envelope.claims),
+      verified_signer: makeManagedVerifiedSigner(envelope.key_id, verified.public_key_sha256),
+    };
   } catch (cause) {
     throw new ManagedAuthorizationError("invalid_grant", "managed execution grant signature is invalid", cause);
   }
@@ -63,11 +78,12 @@ export async function authorizeExecutionGrant(
   value: unknown,
   expected: PillboxExecutionGrantBinding,
 ): Promise<PillboxExecutionGrantClaims> {
-  const claims = await verifySignedExecutionGrant(
+  const verified = await verifySignedExecutionGrantWithSigner(
     value,
     env.PILLBOX_GRANT_KEY_ID,
     env.PILLBOX_GRANT_PUBLIC_KEY,
   );
+  const claims = verified.claims;
   const pins: readonly [string, string | undefined, string][] = [
     ["installation", env.PILLBOX_INSTALLATION_ID, claims.installation.installation_id],
     ["execution realm", env.PILLBOX_EXECUTION_REALM_ID, claims.installation.execution_realm_id],
@@ -88,7 +104,7 @@ export async function authorizeExecutionGrant(
   const controlPlane = env.PillboxAuthorizationControlPlane;
   if (!controlPlane) throw new ManagedAuthorizationError("authorization_unavailable", "Pillbox authorization control plane is not configured");
   try {
-    const current = await controlPlane.authorizeExecutionGrant({ grant: claims, expected });
+    const current = await controlPlane.authorizeExecutionGrant(makeExecutionGrantCurrentnessRequest(claims, expected, verified.verified_signer));
     const validated = validateExecutionGrantClaims(current);
     if (managedCanonicalJson(validated) !== managedCanonicalJson(claims)) {
       throw new ManagedAuthorizationError("grant_revoked", "authorization control plane returned different grant claims");

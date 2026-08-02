@@ -1,0 +1,35 @@
+name = "pillbox-managed-auth-test"
+main = "src/worker.ts"
+compatibility_date = "2026-06-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+[vars]
+MANAGED_AUTH_REQUIRED = "1"
+PILLBOX_GRANT_KEY_ID = "test-key"
+PILLBOX_GRANT_PUBLIC_KEY = "ed25519:SKaA_nE69844nq00przjwmcPcg5iRY1hL4fnfgipY94"
+PILLBOX_INSTALLATION_ID = "test-installation"
+PILLBOX_EXECUTION_REALM_ID = "test-realm"
+PILLBOX_PROTOCOL_REVISION = "pillbox.huddles/1"
+PILLBOX_ORGANIZATION_ID = "test-organization"
+
+[[durable_objects.bindings]]
+name = "SessionGateway"
+class_name = "SessionGateway"
+
+[[durable_objects.bindings]]
+name = "CredentialBroker"
+class_name = "CredentialBroker"
+
+[[services]]
+binding = "PillboxAuthorizationControlPlane"
+service = "pillbox-managed-auth-authority"
+entrypoint = "ManagedAuthorizationControlPlaneEntrypoint"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SessionGateway", "Sandbox"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["CredentialBroker"]

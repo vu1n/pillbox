@@ -1,3 +1,6 @@
+# Keep the deployed Worker name and SessionGateway namespace stable while the
+# package graduates from spike status. A namespace transfer is a separate
+# coordinated Cloudflare migration, never a config rename.
 name = "pillbox-do-spike"
 main = "src/worker.ts"
 compatibility_date = "2026-06-01"
@@ -16,12 +19,27 @@ workers_dev = true
 name = "SessionGateway"
 class_name = "SessionGateway"
 
+[[durable_objects.bindings]]
+name = "CredentialBroker"
+class_name = "CredentialBroker"
+
+# Private Huddles authorization transport. The binding authenticates transport
+# only; every ensure/invoke call still carries a signed execution grant.
+[[services]]
+binding = "PillboxAuthorizationControlPlane"
+service = "huddles-projectors"
+entrypoint = "PillboxAuthorizationControlPlaneEntrypoint"
+
 # Sandbox is registered in the migration (worker.ts exports the class) but NOT
 # bound and NOT given a container here — so nothing is instantiated and the free
 # tier provisions no container. The container config adds the binding + [[containers]].
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["SessionGateway", "Sandbox"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["CredentialBroker"]
 
 [observability]
 enabled = true

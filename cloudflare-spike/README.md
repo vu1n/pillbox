@@ -1,4 +1,28 @@
-# Cloudflare Durable-Object-as-§0-gateway — spike
+# pillbox managed Cloudflare runtime
+
+`wrangler.toml` is the supported `pillbox-managed` deployment. The old
+`pillbox-do-spike` name remains available through `wrangler.legacy.toml` for
+historical SessionGateway evidence and migration-safe rollback; it is not a
+second backend and must not create new managed sessions.
+
+Managed Huddles calls use the private `PillboxAuthorizationControlPlane`
+service binding plus an Ed25519 `huddles.execution-grant/1`. The binding is
+transport-only: SessionGateway verifies the envelope, validates the explicit
+Huddles `request_binding`, recomputes execution/output hashes from request
+material, checks every tuple, and re-introspects currentness before both ensure
+and invoke. Provider OAuth state is owned by the `CredentialBroker` Durable
+Object and is never passed through Huddles, a container environment, a session
+event, or a browser response.
+
+Managed cutover gates remain explicit: Huddles must send
+`managed_authorization.request_binding` and add the evidence currentness RPC;
+Pillbox fails closed when either is unavailable. The managed runtime currently
+accepts only the pinned OpenCode/Cloudflare transport and records unsupported
+execution requests without entering a container; Codex app-server still needs
+a dedicated runtime adapter. Production provider adapters still need
+PKCE/issuer validation and registration in the OAuthBroker. `wrangler.container.toml`
+sets `MANAGED_AUTH_REQUIRED=1`; the free `wrangler.toml` retains only the legacy
+smoke compatibility path.
 
 A runnable Cloudflare implementation proving the load-bearing claim of the
 managed tier ([docs/managed-tier.md](../docs/managed-tier.md)): **a per-session

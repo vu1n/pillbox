@@ -8,9 +8,9 @@ checked.
 
 pillbox = **a durable coding-agent session + self-contained bundle** (workspace
 + code + vault + config). Locally, the agent runs inside a libkrun microVM with
-a host-side credential/egress vault. In the experimental managed placement, a
-Cloudflare Durable Object owns the §0 session authority and a Cloudflare
-Container runs the agent.
+a host-side credential/egress vault. In the experimental managed placement,
+Cloudflare Sandbox owns container lifecycle, D1/R2 hold bounded execution
+metadata/evidence, and the caller keeps its §0 log local.
 
 ## Subsystem map
 
@@ -18,10 +18,10 @@ Container runs the agent.
 |---|---|---|---|
 | Backend / substrate | docs/substrate-plane.md, docs/libkrun-sandbox.md | the microVM that runs the agent; the `SandboxBackend`/`LiveSession` seam | libkrun live; docker backend slated for deletion (ADR-002) |
 | Vault (creds + egress) | docs/vault.md | host-side MITM that swaps stub→real creds + fences egress | live; OAuth re-aimed at the broker model (ADR-004) |
-| Sessions / §0 | docs/session-event-log.md | durable event log, drive (`send`) + read (`subscribe`/`watch`) surface | local live; managed DO live-validated `[verified 2026-07-16]` |
+| Sessions / §0 | docs/session-event-log.md | durable event log, drive (`send`) + read (`subscribe`/`watch`) surface | local live; managed evidence copied into the local log `[verified 2026-08-31]` |
 | Snapshots | docs/config.md, AGENTS.md | rustic repo, push/pull, bookmarks | local + R2 live `[verified 2026-07-16]` |
 | Dispatch / eval | docs/dispatch.md, docs/eval.md | fork-k verified workers; the eval runner | local libkrun shipped `[verified 2026-07-16]` |
-| Managed / CF tier | docs/managed-tier.md, docs/gateway.md | DO session authority + CF Container placement | experimental foreground backend shipped; product gaps remain `[verified 2026-07-16]` |
+| Managed / CF tier | docs/managed-tier.md, docs/durable-object-usage.md | bounded D1/R2 execution + CF Sandbox placement | experimental foreground backend; no custom Pillbox DO `[verified 2026-08-31]` |
 
 ## Entanglements that bite
 

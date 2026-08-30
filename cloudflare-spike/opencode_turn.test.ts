@@ -35,7 +35,7 @@ const outputFormat = {
   },
 };
 
-test("OpenCode turn returns exact structured output through the gateway sink", async () => {
+test("OpenCode turn returns exact structured output through the evidence sink", async () => {
   const transport = fakeTransport([
     sse(
       event("message.updated", {

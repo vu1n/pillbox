@@ -32,7 +32,7 @@ tamper with those inputs even though it does not host the normal agent run.
 | Other host tools accidentally consuming pillbox state | Everything is namespaced under `~/.pillbox/` with restrictive perms. |
 | `pillbox secret show --reveal` accidentally piped to logs | Refused unless `--to-stdout` is also passed. |
 | Agent crosses the normal local sandbox boundary | The local agent runs in a hardware-isolated libkrun microVM, not a shared-kernel container. Guest egress terminates at the host-owned broker. |
-| Managed caller forges another participant | The Durable Object derives `actor` from a verified token and ignores body-supplied identity. Driver changes are gateway-authored control events. |
+| Managed caller invokes another user's runtime | Worker execution/workspace routes require a verified actor token; Huddles owns participant identity, visibility, and collaborative driver policy. |
 | Managed workspace credential reaches outside its project | When scoping is enabled, the host mints a fresh prefix-scoped R2 credential per transfer; mint/shape failures abort rather than falling back silently. |
 
 ## What pillbox does NOT defend against

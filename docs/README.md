@@ -18,8 +18,9 @@ authoritative.** When a design doc and a banner disagree, the banner (newer) win
 | File | What |
 |---|---|
 | [session-event-log.md](./session-event-log.md) | The durable, attributed per-session event log — the keystone every consumer reads. |
-| [gateway.md](./gateway.md) | The per-session sequencer + broker + attach endpoint §0 gates on. |
-| [managed-tier.md](./managed-tier.md) | **Experimental implementation.** A Durable Object *is* the §0 gateway; a Container runs the agent. Foreground placement is wired behind `SandboxBackend`; detached/reconnect/token UX remain open. |
+| [gateway.md](./gateway.md) | The local gateway boundary and why multiplayer gateway ownership belongs to Huddles. |
+| [managed-tier.md](./managed-tier.md) | **Experimental implementation.** Bounded D1/R2 execution using Cloudflare Sandbox; no custom Pillbox DO or remote §0 log. |
+| [durable-object-usage.md](./durable-object-usage.md) | Default-deny DO policy, cost gates, and Cloudflare Computer evaluation rubric. |
 | [agent-io-contract.md](./agent-io-contract.md) | The PTY-free structured I/O contract (`agent.proto`). |
 | [attach-transport.md](./attach-transport.md) | The interactive `Frame` transport. (Transport-agnostic surface; the `docker exec` carrier moves to vsock under libkrun.) |
 

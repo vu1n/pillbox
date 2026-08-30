@@ -5,11 +5,14 @@ import {
   computeInvocationRequestHash,
   computeRenderedInputHash,
   CodexExecutionBoundaryError,
+  MAX_EVIDENCE_PAGE_SIZE,
   type ExecuteInvocationV2Request,
   type InvocationExecution,
   UnsupportedAcpExecutionError,
   UnsupportedCodexExecutionError,
   validateExecuteInvocationV2Request,
+  validateCancelInvocationV2Request,
+  validateGetInvocationV2Request,
   validateSupportedAcpExecution,
   validateSupportedCodexExecution,
 } from "./src/codex_execution.ts";
@@ -283,6 +286,81 @@ test("unknown fields and credential or claim fields are rejected", async () => {
   }
   await assert.rejects(
     validateExecuteInvocationV2Request({ ...request, invocation_id: 1 }),
+    assertBoundaryError,
+  );
+});
+
+test("status reads default to one bounded evidence page", () => {
+  assert.deepEqual(
+    validateGetInvocationV2Request({
+      contract_version: "pillbox.execution/2",
+      invocation_id: "invocation-1",
+    }),
+    {
+      contract_version: "pillbox.execution/2",
+      invocation_id: "invocation-1",
+      evidence_after: 0,
+      evidence_limit: MAX_EVIDENCE_PAGE_SIZE,
+    },
+  );
+  assert.deepEqual(
+    validateGetInvocationV2Request({
+      contract_version: "pillbox.execution/2",
+      invocation_id: "invocation-1",
+      evidence_after: 12,
+      evidence_limit: 8,
+    }),
+    {
+      contract_version: "pillbox.execution/2",
+      invocation_id: "invocation-1",
+      evidence_after: 12,
+      evidence_limit: 8,
+    },
+  );
+});
+
+test("status evidence pagination rejects scans and malformed cursors", () => {
+  for (const fields of [
+    { evidence_after: -1 },
+    { evidence_after: 1.5 },
+    { evidence_limit: 0 },
+    { evidence_limit: MAX_EVIDENCE_PAGE_SIZE + 1 },
+  ]) {
+    assert.throws(
+      () =>
+        validateGetInvocationV2Request({
+          contract_version: "pillbox.execution/2",
+          invocation_id: "invocation-1",
+          ...fields,
+        }),
+      assertBoundaryError,
+    );
+  }
+  assert.throws(
+    () =>
+      validateGetInvocationV2Request({
+        contract_version: "pillbox.execution/2",
+        invocation_id: "invocation-1",
+        list_all: true,
+      }),
+    assertBoundaryError,
+  );
+});
+
+test("cancellation is an exact idempotent runtime request", () => {
+  const request = {
+    contract_version: "pillbox.execution/2",
+    invocation_id: "invocation-1",
+    idempotency_key: "cancel-delivery-1",
+    reason: "caller requested cancellation",
+  } as const;
+  assert.deepEqual(validateCancelInvocationV2Request(request), request);
+  assert.throws(
+    () => validateCancelInvocationV2Request({ ...request, actor: "human:1" }),
+    assertBoundaryError,
+  );
+  assert.throws(
+    () => validateCancelInvocationV2Request({ ...request, reason: "" }),
     assertBoundaryError,
   );
 });

@@ -53,6 +53,7 @@ export interface JsonSchemaOutputFormat {
 export type Sha256Digest = `sha256:${string}`;
 export type ExecutionDigest = Sha256Digest;
 export type InvocationRequestHash = Sha256Digest;
+export const MAX_EVIDENCE_PAGE_SIZE = 100;
 
 export interface ExecuteInvocationV2Request {
   readonly contract_version: "pillbox.execution/2";
@@ -68,6 +69,7 @@ export interface ExecuteInvocationV2Request {
 }
 
 export type ExecuteInvocationV2ErrorCode =
+  | "idempotency_conflict"
   | "unsupported_execution"
   | "unsupported_policy"
   | "auth_unavailable"
@@ -77,24 +79,61 @@ export type ExecuteInvocationV2ErrorCode =
   | "cancelled"
   | "structured_output_missing";
 
+export interface ExecutionAttribution {
+  readonly harness: Harness;
+  readonly transport: string;
+  readonly requested_model: string;
+  readonly served_model: string | null;
+}
+
+export interface ExecutionArtifactRef {
+  readonly key: string;
+  readonly media_type: "application/json";
+  readonly bytes: number;
+  readonly sha256: Sha256Digest;
+}
+
+/** A bounded projection of runtime evidence; the immutable artifact is canonical. */
+export interface ExecutionEvidencePage {
+  readonly from: number;
+  readonly next: number | null;
+  readonly truncated: boolean;
+  readonly events: readonly JsonValue[];
+  readonly artifact_ref?: ExecutionArtifactRef;
+}
+
+export interface GetInvocationV2Request {
+  readonly contract_version: "pillbox.execution/2";
+  readonly invocation_id: string;
+  readonly evidence_after: number;
+  readonly evidence_limit: number;
+}
+
+export interface CancelInvocationV2Request {
+  readonly contract_version: "pillbox.execution/2";
+  readonly invocation_id: string;
+  readonly idempotency_key: string;
+  readonly reason: string;
+}
+
 interface ExecuteInvocationV2ResultBase {
   readonly disposition: "created" | "reused";
+  readonly invocation_id: string;
+  readonly request_hash: InvocationRequestHash;
   readonly execution_digest: ExecutionDigest;
   readonly execution_policy_revision: string;
   readonly session_ref: {
     readonly session_id: string;
     readonly seq_range?: readonly [number, number];
   };
-  readonly attribution: {
-    readonly harness: "codex_app_server";
-    readonly requested_model: string;
-    readonly served_model: string | null;
-  };
+  readonly attribution: ExecutionAttribution;
+  readonly evidence: ExecutionEvidencePage;
 }
 
 export type ExecuteInvocationV2Result =
   | (ExecuteInvocationV2ResultBase & {
       readonly status: "running";
+      readonly retry_after_ms: number;
     })
   | (ExecuteInvocationV2ResultBase & {
       readonly status: "completed";
@@ -104,21 +143,24 @@ export type ExecuteInvocationV2Result =
       };
     })
   | (ExecuteInvocationV2ResultBase & {
-      readonly status: "failed" | "cancelled";
+      readonly status: "failed" | "cancelled" | "interrupted" | "conflict";
       readonly error: {
         readonly code: ExecuteInvocationV2ErrorCode;
         readonly message: string;
       };
     });
 
-export class CodexExecutionBoundaryError extends Error {
+export class ExecutionBoundaryError extends Error {
   readonly code = "invalid_execute_invocation_v2_request" as const;
 
   constructor(message: string) {
     super(message);
-    this.name = "CodexExecutionBoundaryError";
+    this.name = "ExecutionBoundaryError";
   }
 }
+
+/** Compatibility name retained while callers move to the runtime-owned boundary. */
+export { ExecutionBoundaryError as CodexExecutionBoundaryError };
 
 export class UnsupportedCodexExecutionError extends Error {
   readonly code = "unsupported_execution" as const;
@@ -238,6 +280,61 @@ export async function validateExecuteInvocationV2Request(
     execution,
     execution_policy_revision: executionPolicyRevision,
     output_format: outputFormat,
+  };
+}
+
+/** Validate a bounded status/evidence read. Missing cursor fields use safe defaults. */
+export function validateGetInvocationV2Request(
+  value: unknown,
+): GetInvocationV2Request {
+  assertJsonValue(value, "request");
+  const request = requireObject(value, "request");
+  assertExactKeys(
+    request,
+    ["contract_version", "invocation_id", "evidence_after", "evidence_limit"],
+    "request",
+  );
+  requireContractVersion(request.contract_version);
+  const invocationId = requireNonEmptyString(request.invocation_id, "invocation_id");
+  const evidenceAfter =
+    request.evidence_after === undefined
+      ? 0
+      : requireNonNegativeInteger(request.evidence_after, "evidence_after");
+  const evidenceLimit =
+    request.evidence_limit === undefined
+      ? MAX_EVIDENCE_PAGE_SIZE
+      : requirePositiveInteger(request.evidence_limit, "evidence_limit");
+  if (evidenceLimit > MAX_EVIDENCE_PAGE_SIZE) {
+    reject(`evidence_limit must be <= ${MAX_EVIDENCE_PAGE_SIZE}`);
+  }
+  return {
+    contract_version: "pillbox.execution/2",
+    invocation_id: invocationId,
+    evidence_after: evidenceAfter,
+    evidence_limit: evidenceLimit,
+  };
+}
+
+/** Validate an idempotent cancellation intent without importing scheduler state. */
+export function validateCancelInvocationV2Request(
+  value: unknown,
+): CancelInvocationV2Request {
+  assertJsonValue(value, "request");
+  const request = requireObject(value, "request");
+  assertExactKeys(
+    request,
+    ["contract_version", "invocation_id", "idempotency_key", "reason"],
+    "request",
+  );
+  requireContractVersion(request.contract_version);
+  return {
+    contract_version: "pillbox.execution/2",
+    invocation_id: requireNonEmptyString(request.invocation_id, "invocation_id"),
+    idempotency_key: requireNonEmptyString(
+      request.idempotency_key,
+      "idempotency_key",
+    ),
+    reason: requireNonEmptyString(request.reason, "reason"),
   };
 }
 
@@ -401,6 +498,28 @@ function requireDigest(value: JsonValue | undefined, path: string): Sha256Digest
   return value as Sha256Digest;
 }
 
+function requireContractVersion(value: JsonValue | undefined): void {
+  if (value !== "pillbox.execution/2") {
+    reject("contract_version must be 'pillbox.execution/2'");
+  }
+}
+
+function requireNonNegativeInteger(
+  value: JsonValue | undefined,
+  path: string,
+): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    reject(`${path} must be a non-negative safe integer`);
+  }
+  return value;
+}
+
+function requirePositiveInteger(value: JsonValue | undefined, path: string): number {
+  const number = requireNonNegativeInteger(value, path);
+  if (number === 0) reject(`${path} must be greater than zero`);
+  return number;
+}
+
 function requireNonEmptyString(value: JsonValue | undefined, path: string): string {
   if (typeof value !== "string" || value.length === 0) {
     reject(`${path} must be a non-empty string`);
@@ -512,5 +631,5 @@ async function sha256Digest(value: string): Promise<Sha256Digest> {
 }
 
 function reject(message: string): never {
-  throw new CodexExecutionBoundaryError(message);
+  throw new ExecutionBoundaryError(message);
 }

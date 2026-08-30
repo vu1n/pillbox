@@ -1,7 +1,7 @@
 import { getSandbox, type Sandbox } from "@cloudflare/sandbox";
 import { bearerToken, verifyActorToken } from "./auth.js";
 import { safeHuddlesRuntimeDiagnostic } from "./huddles_policy.js";
-import { deriveSandboxRuntimeId } from "./huddles_runtime.js";
+import { deriveSandboxRuntimeId } from "./runtime_identity.js";
 import { OPENCODE_WORKSPACE_DIR } from "./opencode_turn.js";
 import { workspaceExecEnv, type WorkspaceRepo } from "./workspace_repo.js";
 
@@ -114,12 +114,13 @@ async function execWorkspaceTool(
   password: string,
 ): Promise<{ ok: boolean; detail: string; stdout: string }> {
   const execEnv = workspaceExecEnv(repo, password);
+  const deadline = Date.now() + WORKSPACE_XFER_TIMEOUT_MS;
   let lastError = "";
-  for (let attempt = 0; attempt < 60; attempt++) {
+  while (Date.now() < deadline) {
     try {
       const result = await sandbox.exec(command, {
         env: execEnv,
-        timeout: WORKSPACE_XFER_TIMEOUT_MS,
+        timeout: Math.max(1, deadline - Date.now()),
       });
       return {
         ok: result.success,
@@ -129,7 +130,11 @@ async function execWorkspaceTool(
     } catch (cause) {
       lastError = String(cause);
       if (!/starting|not ready/i.test(lastError)) break;
-      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      await new Promise((resolve) =>
+        setTimeout(resolve, Math.min(1_000, remaining)),
+      );
     }
   }
   return { ok: false, detail: lastError, stdout: "" };

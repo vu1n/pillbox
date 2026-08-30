@@ -19,6 +19,7 @@ import type {
   ExecutionArtifact,
   ExecutionArtifactStore,
 } from "./execution_artifacts.js";
+import { ExecutionArtifactConflictError } from "./execution_artifacts.js";
 import type {
   ExecutionClaimInput,
   ExecutionRecord,
@@ -317,19 +318,28 @@ export class ExecutionService {
       evidence,
       ...(cost === undefined ? {} : { cost: cost as unknown as JsonValue }),
     };
-    const artifact = sealArtifactCostBytes(unsealedArtifact);
-    const artifactRef = await this.artifacts.write(artifact);
+    let artifact = sealArtifactCostBytes(unsealedArtifact);
+    let artifactRef;
+    try {
+      artifactRef = await this.artifacts.write(artifact);
+    } catch (cause) {
+      if (!(cause instanceof ExecutionArtifactConflictError)) throw cause;
+      artifact = cause.existing;
+      artifactRef = cause.existing_ref;
+    }
+    const stored = terminalResult(artifact, record);
     const finished = await this.store.finish({
       invocation_id: record.invocation_id,
       request_hash: record.request_hash,
       owner_token: record.owner_token,
-      status: terminal.status,
+      status: stored.status,
       artifact_ref: artifactRef,
       now_ms: this.now(),
     });
     if (!finished) return null;
     const result: ExecuteInvocationV2Result = {
-      ...placeholder,
+      ...stored,
+      disposition,
       evidence: evidencePage(
         artifact,
         { ...record, artifact_ref: artifactRef },
@@ -481,8 +491,11 @@ export class OpencodeExecutionRuntime implements ExecutionRuntime {
       };
     }
     return {
-      served_model: null,
-      output: structured === undefined ? { text: output } : { text: structured },
+      served_model: `${request.execution.requested.provider}/${request.execution.requested.model}`,
+      output:
+        structured === undefined
+          ? { text: output }
+          : { json: JSON.parse(structured) as JsonValue },
       evidence,
     };
   }
@@ -561,4 +574,26 @@ function evidencePage(
       ? {}
       : { artifact_ref: record.artifact_ref }),
   };
+}
+
+function terminalResult(
+  artifact: ExecutionArtifact,
+  record: ExecutionRecord,
+): Extract<
+  ExecuteInvocationV2Result,
+  { readonly status: "completed" | "failed" | "cancelled" | "interrupted" }
+> {
+  const result = artifact.terminal_result as unknown as ExecuteInvocationV2Result;
+  if (
+    result.invocation_id !== record.invocation_id ||
+    result.request_hash !== record.request_hash ||
+    result.session_ref.session_id !== record.session_id ||
+    result.status !== "completed" &&
+    result.status !== "failed" &&
+    result.status !== "cancelled" &&
+    result.status !== "interrupted"
+  ) {
+    throw new Error("execution artifact does not contain a terminal result");
+  }
+  return result;
 }

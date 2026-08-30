@@ -3,7 +3,7 @@ import type {
   EnsureSessionResult,
   InvokeSessionRequest,
   InvokeSessionResult,
-} from "../src/huddles_runtime.js";
+} from "../src/legacy_huddles_adapter.js";
 
 // Test-only HTTP bridge into the private service binding. The product Worker
 // intentionally has no equivalent route.

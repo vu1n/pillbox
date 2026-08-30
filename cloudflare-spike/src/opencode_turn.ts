@@ -6,7 +6,7 @@ import {
   structuredOutputRetryPrompt,
   type HuddlesToolPolicy,
 } from "./huddles_policy.js";
-import type { JsonSchemaOutputFormat } from "./huddles_runtime.js";
+import type { JsonSchemaOutputFormat } from "./codex_execution.js";
 import { OpencodeMapper } from "./opencode_mapper.js";
 import { inspectRawStructuredOutput } from "./structured_output.js";
 

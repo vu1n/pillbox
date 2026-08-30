@@ -41,8 +41,11 @@ test("execution persistence is bounded and local logs cannot route to a DO", () 
     /planned_analytics_points:\s*this\.analytics === undefined \? 0 : 1/,
   );
 
-  const rustSource = read("../src/events/source.rs");
-  const rustSink = read("../src/events/sink.rs");
-  assert.doesNotMatch(rustSource, /ManagedDoSource|managed_endpoint/);
-  assert.doesNotMatch(rustSink, /ManagedDoSink|managed_endpoint/);
+  assert.equal(existsSync(new URL("../src/events/source.rs", import.meta.url)), false);
+  assert.equal(existsSync(new URL("../src/events/sink.rs", import.meta.url)), false);
+  assert.doesNotMatch(read("../src/events/mod.rs"), /mod (source|sink);/);
+  assert.match(
+    read("../src/events/transcripts/tailer.rs"),
+    /log: Option<SessionLog>/,
+  );
 });

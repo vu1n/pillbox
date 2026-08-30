@@ -3,7 +3,7 @@ import {
   type Schema,
   type ValidationResult,
 } from "@cfworker/json-schema";
-import type { JsonValue } from "./huddles_runtime.js";
+import type { JsonValue } from "./codex_execution.js";
 
 const MAX_RAW_OUTPUT_BYTES = 1_000_000;
 

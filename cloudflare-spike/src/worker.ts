@@ -1,15 +1,9 @@
-import { routeAgentRequest, type AgentOptions } from "agents";
 import { proxyToSandbox, type Sandbox } from "@cloudflare/sandbox";
-import { SessionGateway } from "./session_gateway.js";
-import {
-  HuddlesRuntimeEntrypoint,
-  executionService,
-  isHuddlesSessionName,
-} from "./huddles_runtime.js";
+import { HuddlesRuntimeEntrypoint, executionService } from "./huddles_runtime.js";
 import { bearerToken, verifyActorToken } from "./auth.js";
 import { safeHuddlesRuntimeDiagnostic } from "./huddles_policy.js";
+import { routeWorkspaceTransfer } from "./workspace_transfer.js";
 
-export { SessionGateway };
 // Named entrypoint: Huddles reaches ensureSession through a same-account
 // service-binding RPC. The default fetch handler below never routes that method.
 export { HuddlesRuntimeEntrypoint };
@@ -17,8 +11,6 @@ export { HuddlesRuntimeEntrypoint };
 export { Sandbox } from "@cloudflare/sandbox";
 
 export interface Env {
-  // The §0 gateway Agent (kebab-class `session-gateway` in the route).
-  SessionGateway: DurableObjectNamespace<SessionGateway>;
   EXECUTION_DB: D1Database;
   EXECUTION_EVIDENCE: R2Bucket;
   RUN_COSTS?: AnalyticsEngineDataset;
@@ -51,20 +43,8 @@ export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const executionResponse = await routeExecutionRequest(req, env);
     if (executionResponse !== null) return executionResponse;
-    const requirePublicSession: NonNullable<
-      AgentOptions<Env>["onBeforeRequest"]
-    > = async (_request, lobby) => {
-      if (lobby.className !== "SessionGateway") return;
-      // The deterministic Huddles namespace is private before its durable
-      // binding exists, so a public caller cannot pre-bind a permissive server.
-      if (isHuddlesSessionName(lobby.name)) {
-        return new Response("not found\n", { status: 404 });
-      }
-      const id = env.SessionGateway.idFromName(lobby.name);
-      if (!(await env.SessionGateway.get(id).publicAccessAllowed())) {
-        return new Response("not found\n", { status: 404 });
-      }
-    };
+    const workspaceResponse = await routeWorkspaceTransfer(req, env);
+    if (workspaceResponse !== null) return workspaceResponse;
     // Container preview/port-proxy URLs — only when the container is bound.
     // Re-spread with the narrowed (defined) Sandbox so proxyToSandbox's env type
     // is satisfied without a cast (TS narrows `env.Sandbox`, not `env`).
@@ -75,13 +55,7 @@ export default {
       });
       if (proxied) return proxied;
     }
-    // Route to the per-session §0 gateway Agent (works with or without a container).
-    return (
-      (await routeAgentRequest(req, env, {
-        onBeforeConnect: requirePublicSession,
-        onBeforeRequest: requirePublicSession,
-      })) ?? new Response("not found\n", { status: 404 })
-    );
+    return new Response("not found\n", { status: 404 });
   },
 };
 

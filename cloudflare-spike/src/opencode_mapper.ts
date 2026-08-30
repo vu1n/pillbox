@@ -2,7 +2,8 @@
 // managed-tier §0 gateway's **consume path** (docs/managed-tier.md §Consume path).
 //
 // One instance per session stream. `onEvent` maps a single opencode `/event`
-// envelope into zero or more §0 [`Payload`]s, which `SessionGateway` appends —
+// envelope into zero or more §0 [`Payload`]s, which the bounded execution
+// artifact preserves and the caller can append to its own event log —
 // stamped with the agent actor (never self-reported by opencode-in-the-box).
 //
 // Kept 1:1 with the Rust mapper. Two gates guard the "one §0, two backends"

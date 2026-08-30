@@ -1,8 +1,7 @@
 name = "pillbox-do-spike"
 main = "src/worker.ts"
 compatibility_date = "2026-06-01"
-# The Agents SDK imports node built-ins (diagnostics_channel, os, path via its
-# deps) — nodejs_compat is required or the bundle fails to resolve them.
+# Sandbox SDK dependencies use Node compatibility shims.
 compatibility_flags = ["nodejs_compat"]
 
 [[d1_databases]]
@@ -22,14 +21,8 @@ dataset = "pillbox_execution_run_costs_preview"
 [vars]
 SANDBOX_PROFILE = "standard-2"
 
-# The per-session §0 gateway. Binding name matches the class so routeAgentRequest
-# resolves /agents/session-gateway/<sessionId>/*.
-[[durable_objects.bindings]]
-name = "SessionGateway"
-class_name = "SessionGateway"
-
 # The Sandbox SDK's container-owning DO (one container per session, addressed by
-# the same sessionId). The gateway calls into it via getSandbox(env.Sandbox, …).
+# the execution session id). The Worker calls it through the Sandbox SDK.
 [[durable_objects.bindings]]
 name = "Sandbox"
 class_name = "Sandbox"
@@ -47,7 +40,8 @@ image = "./Dockerfile"
 max_instances = 5
 instance_type = "standard-2"
 
-# SQLite-backed storage migration (GA). Both DO classes are SQLite-backed.
+# Historical migration record. SessionGateway is not bound or exported; its
+# namespace/data retirement remains a separate retention review.
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["SessionGateway", "Sandbox"]

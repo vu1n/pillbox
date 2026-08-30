@@ -653,7 +653,7 @@ fn session_send(resolved: &Pillbox, id: &str, text: &str) -> Result<()> {
     // for a PTY agent. The command layer no longer branches on integration or
     // backend; a backend that can't drive rejects with the standard unsupported
     // shape.
-    sandbox::live_session(&s)?.send(text.as_bytes())?;
+    sandbox::live_session(&s)?.send(resolved, text.as_bytes())?;
     let target = if s.integration() == Integration::Server {
         crate::contract::InputTarget::Agent
     } else {

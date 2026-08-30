@@ -40,6 +40,7 @@ pub(crate) struct RunCostEnvelope {
 impl RunCostEnvelope {
     pub(crate) fn from_events(events: &[Event]) -> Self {
         let mut by_message: BTreeMap<&str, &Usage> = BTreeMap::new();
+        let mut managed_envelope = None;
         let mut fallback_provider_cost = 0.0;
         let mut has_fallback_cost = false;
         let mut status = "running";
@@ -69,8 +70,21 @@ impl RunCostEnvelope {
                         has_fallback_cost = true;
                     }
                 }
+                Payload::Custom(custom) if custom.name == "run_cost" => {
+                    managed_envelope = custom
+                        .payload
+                        .clone()
+                        .and_then(|value| serde_json::from_value(value).ok());
+                }
                 _ => {}
             }
+        }
+
+        // The managed runtime observes infrastructure usage that cannot be
+        // reconstructed from the local event stream. Its terminal envelope is
+        // canonical for that turn and already includes model usage.
+        if let Some(envelope) = managed_envelope {
+            return envelope;
         }
 
         let mut model = ModelUsageCost {
@@ -162,5 +176,42 @@ mod tests {
         assert_eq!(summary.model.input_tokens, 10);
         assert_eq!(summary.known_cost_usd, Some(0.01));
         assert_eq!(summary.estimated_total_cost_usd, None);
+    }
+
+    #[test]
+    fn managed_terminal_envelope_preserves_infrastructure_usage() {
+        let expected = RunCostEnvelope {
+            version: 1,
+            status: "completed".into(),
+            model: ModelUsageCost {
+                input_tokens: 3,
+                output_tokens: 4,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                provider_reported_cost_usd: Some(0.02),
+            },
+            infrastructure: Some(InfrastructureUsageCost {
+                d1_rows_read: 1,
+                d1_rows_written: 2,
+                r2_reads: 0,
+                r2_writes: 1,
+                r2_bytes_read: 0,
+                r2_bytes_written: 512,
+                analytics_points_written: 1,
+                sandbox_duration_ms: 50,
+                sandbox_profile: Some("standard-2".into()),
+            }),
+            known_cost_usd: Some(0.02),
+            estimated_total_cost_usd: None,
+            rate_card_version: None,
+        };
+        let event = Event::session(
+            "session-1",
+            Payload::Custom(crate::contract::Custom {
+                name: "run_cost".into(),
+                payload: Some(serde_json::to_value(&expected).unwrap()),
+            }),
+        );
+        assert_eq!(RunCostEnvelope::from_events(&[event]), expected);
     }
 }

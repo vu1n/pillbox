@@ -1,40 +1,27 @@
-//! `SandboxBackend` / `LiveSession` implementation for the **managed Cloudflare
-//! tier** — a session placed on a CF container behind the per-session §0-gateway
-//! Durable Object, driven + read over the DO's HTTP/WebSocket surface.
-//!
-//! Unlike [`docker`](super::docker) / [`libkrun`](super::libkrun) this backend
-//! provisions nothing on the host: the durable session lives server-side in the
-//! DO (the seq authority + actor attestation + driver arbitration), so every
-//! verb is a network call against the gateway. The read path reuses the §0 read
-//! seam ([`crate::events::source::ManagedDoSource`]) — `subscribe` opens the
-//! DO's WebSocket, which replays-then-tails one `contract::Event` per frame in
-//! seq order. The write path (`send`) POSTs the driver-attributed steer to
-//! `/input`. The whole §0 contract is the SAME event schema the local backends
-//! emit; the DO is just a different placement of the same log.
+//! `SandboxBackend` / `LiveSession` implementation for the managed Cloudflare
+//! execution runtime. Pillbox is a single controller: one bounded HTTP request
+//! drives one turn, then its bounded evidence page is appended to the local §0
+//! log. Collaboration, arbitration, replay, and fan-out belong to Huddles.
 //!
 //! ## Configuration (env-driven; no host state)
 //!
-//! The DO base URL + the actor-token material come from the environment — the
-//! same vars the §0 sink/source factories already read
-//! ([`crate::events::managed_endpoint`]):
+//! The Worker origin + actor-token material come from the environment:
 //!
-//!   - `PILLBOX_MANAGED_DO_URL` — the worker origin, e.g.
-//!     `https://<worker>.workers.dev` (the `/agents/session-gateway/<id>` path
-//!     is appended per session). Required; absent ⇒ this backend isn't selected.
+//!   - `PILLBOX_MANAGED_URL` — the worker origin, e.g.
+//!     `https://<worker>.workers.dev`. `PILLBOX_MANAGED_DO_URL` remains a
+//!     deprecated compatibility fallback while installations migrate.
 //!   - `PILLBOX_ACTOR_TOKEN` — a pre-minted actor token (the deploy's HMAC over
-//!     the actor claim). Used verbatim for read + the §0 sink.
+//!     the actor claim). Used only for Worker authentication.
 //!   - `PILLBOX_MANAGED_TOKEN_SECRET` — the shared HMAC secret, when pillbox
-//!     should mint its own driver token (for `/input`, which is driver-gated and
-//!     so must be stamped with a *driver* actor). Mints a `human(<os user>)`
-//!     token via [`mint_actor_token`] when set; falls back to
-//!     `PILLBOX_ACTOR_TOKEN` otherwise.
+//!     should mint its own token. Mints a `human(<os user>)` token via
+//!     [`mint_actor_token`] when set; falls back to `PILLBOX_ACTOR_TOKEN`.
 //!
 //! ## Workspace placement — container-native rustic-on-R2
 //!
 //! [`ManagedBackend::run`] places the workspace by reusing the pillbox's rustic
-//! repo: the host snapshots cwd into R2, POSTs the DO `/provision` (repo config +
+//! repo: the host snapshots cwd into R2, POSTs `/v2/workspaces/provision` (repo config +
 //! password + snapshot) to restore it into the container `/workspace`, drives the
-//! turn, then POSTs `/finalize` to snapshot `/workspace` back and records the
+//! turn, then POSTs `/v2/workspaces/finalize` to snapshot `/workspace` back and records the
 //! result handle. The R2 creds + the repo password travel ONLY in those HTTPS
 //! bodies — never in argv, a log, a §0 event, or the persisted `Session` record
 //! (which holds endpoint + session id + result handle; creds are re-resolved from
@@ -62,7 +49,7 @@
 //!     from (vs the spike's `/tmp` file) is unresolved; the env config above is
 //!     the interim surface.
 // Context: doc://pillbox/managed-store-of-record@0001#managed-store-of-record
-// Context: doc://pillbox/managed-tier-do-gateway@0001#managed-tier-do-gateway
+// Context: doc://pillbox/managed-tier-do-gateway@0002#managed-tier-do-gateway
 
 use std::path::PathBuf;
 
@@ -78,28 +65,21 @@ use crate::workspace::WorkspaceBackend;
 pub(crate) struct ManagedBackend;
 
 impl SandboxBackend for ManagedBackend {
-    /// The managed family: the DO offers an attributed agent-drive (`/input`
-    /// `target:"agent"`) and a durable replay-then-tail read (`/subscribe`), so
-    /// `server_mode` + `post_hoc_ingest`'s *read* analogue are covered. It does
-    /// NOT offer a host PTY, a long-lived host exec target, or the KVM-isolation
-    /// features (those are libkrun's). `pty_drive`/`live_pty_tail` are false: the
-    /// DO drives the agent's structured prompt channel, not raw keystrokes. See
-    /// docs/substrate-plane.md.
+    /// The managed family exposes bounded agent turns, not a host PTY or a
+    /// persistent remote event authority.
     fn capabilities(&self) -> Caps {
         Caps {
-            // No host PTY behind the DO — drive is the structured agent channel.
+            // Drive is the structured agent channel, not raw keystrokes.
             pty_drive: false,
             live_pty_tail: false,
-            // The DO drives an opencode-style agent turn (`/input target:agent`)
-            // and streams its §0 events back over `/subscribe`.
+            // The Worker drives one bounded opencode HTTP turn.
             server_mode: true,
             // No host exec target / KVM isolation — those are the local backends.
             long_lived_exec: false,
             in_sandbox_grading: false,
             real_egress_fence: false,
             detached_vault: false,
-            // The durable log lives server-side; there's no headless host capture
-            // file to drain post-hoc (reads stream live from the DO instead).
+            // The response is appended directly to the local log.
             post_hoc_ingest: false,
         }
     }
@@ -139,16 +119,14 @@ impl SandboxBackend for ManagedBackend {
             .push(&workspace_host, crate::workspace::PushOptions::default())?
             .handle;
 
-        // 3. Resolve the DO endpoint (the same `PILLBOX_MANAGED_DO_URL` + per-session
-        //    path the §0 sink/source build), refusing a non-`https://` origin: the
+        // 3. Resolve the Worker origin, refusing a non-`https://` origin: the
         //    POST body carries the resolved R2 creds + the repo password, so it must
         //    never cross the wire in cleartext.
         let session_id = crate::session::Session::new_id();
-        let endpoint = resolve_https_endpoint(&session_id)?;
+        let endpoint = resolve_https_origin()?;
 
-        // 4. Mint a driver token + POST /provision. `/provision` is driver-gated,
-        //    so it carries the same driver actor token as `/input` (`send`).
-        let token = driver_token().ok_or_else(|| {
+        // 4. Mint an authentication token + provision the workspace.
+        let token = managed_token().ok_or_else(|| {
             PillboxError::config(
                 "run",
                 "no managed actor token: set PILLBOX_MANAGED_TOKEN_SECRET (to mint a driver \
@@ -163,17 +141,18 @@ impl SandboxBackend for ManagedBackend {
         workspace_xfer::provision(
             &endpoint,
             &token,
+            &session_id,
             &provision_creds,
             &password,
             snapshot.as_str(),
         )?;
 
-        // 5. Build + persist the Session record. The record holds the DO endpoint +
-        //    session id + (later) the result handle — NEVER the creds or password,
+        // 5. Build + persist the Session record. The record holds the Worker origin +
+        //    execution session id + (later) the result handle — NEVER the creds or password,
         //    which are re-resolved from env via `workspace()` on every run.
         let handle = ManagedHandle {
             endpoint: endpoint.clone(),
-            do_session_id: session_id.clone(),
+            execution_session_id: session_id.clone(),
         };
         let model = opts
             .model
@@ -197,7 +176,7 @@ impl SandboxBackend for ManagedBackend {
             guest_cwd: crate::agents::GUEST_WORKSPACE.to_string(),
             placement: session::Placement::Managed,
             server: Some(crate::session::ServerSession {
-                // The DO is the agent-session authority; correlate by our id.
+                // The execution runtime correlates each bounded turn by this id.
                 agent_session_id: session_id.clone(),
                 model,
                 temperature: opts.temperature,
@@ -217,8 +196,7 @@ impl SandboxBackend for ManagedBackend {
 
         let live = ManagedLiveSession::new(session.clone());
 
-        // 6. Drive the first turn through the plane (`send` → `/input`), then read
-        //    the §0 stream until the turn goes idle — the foreground path. The
+        // 6. Drive the first turn through the bounded execution API. The
         //    initial prompt is the agent's positional args; with none, leave the
         //    session ready for `session send` and return (detached-style).
         let prompt = opts.args.join(" ").trim().to_string();
@@ -230,14 +208,13 @@ impl SandboxBackend for ManagedBackend {
             // that; for now a no-prompt run is bring-up only.
             return Ok(());
         }
-        live.send(format!("{prompt}\n").as_bytes())?;
-        wait_until_idle(resolved, &session.id)?;
+        live.send(resolved, format!("{prompt}\n").as_bytes())?;
 
-        // 7. Snapshot `/workspace` back to R2 via /finalize; record the handle so
+        // 7. Snapshot `/workspace` back to R2; record the handle so
         //    `session pull <id>` can rehydrate the result.
         let finalize_creds = r2_scope::scope_for_transfer(s3)?;
         let result_snapshot =
-            workspace_xfer::finalize(&endpoint, &token, &finalize_creds, &password)?;
+            workspace_xfer::finalize(&endpoint, &token, &session_id, &finalize_creds, &password)?;
         let mut finished = session;
         finished.result_snapshot = Some(result_snapshot);
         session::write(resolved, &finished)?;
@@ -282,18 +259,27 @@ fn require_s3_repo(
     })
 }
 
-/// Resolve the per-session managed DO endpoint and enforce HTTPS. The provision /
+/// Resolve the managed Worker origin and enforce HTTPS. The provision /
 /// finalize bodies carry the resolved R2 creds + the repo password, so a non-HTTPS
 /// origin (which would put them on the wire in cleartext) is refused — this is the
 /// mandatory transport guard. Split out of `run` so it's unit-testable.
-fn resolve_https_endpoint(session_id: &str) -> Result<String> {
-    let (endpoint, _read_token) = crate::events::managed_endpoint(session_id).ok_or_else(|| {
-        PillboxError::config(
-            "run",
-            "the managed backend needs PILLBOX_MANAGED_DO_URL set to the §0-gateway worker origin",
-        )
-        .with_next("export PILLBOX_MANAGED_DO_URL=https://<worker>.workers.dev")
-    })?;
+fn resolve_https_origin() -> Result<String> {
+    let endpoint = std::env::var("PILLBOX_MANAGED_URL")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::env::var("PILLBOX_MANAGED_DO_URL")
+                .ok()
+                .filter(|value| !value.is_empty())
+        })
+        .ok_or_else(|| {
+            PillboxError::config(
+                "run",
+                "the managed backend needs PILLBOX_MANAGED_URL set to the Worker origin",
+            )
+            .with_next("export PILLBOX_MANAGED_URL=https://<worker>.workers.dev")
+        })?;
+    let endpoint = endpoint.trim_end_matches('/').to_string();
     if !endpoint.starts_with("https://") {
         return Err(PillboxError::config(
             "run",
@@ -303,52 +289,14 @@ fn resolve_https_endpoint(session_id: &str) -> Result<String> {
                  password, which must not travel in cleartext"
             ),
         )
-        .with_next("set PILLBOX_MANAGED_DO_URL to an https:// origin")
+        .with_next("set PILLBOX_MANAGED_URL to an https:// origin")
         .into());
     }
     Ok(endpoint)
 }
 
-/// Block until the managed session's current turn goes idle — the §0
-/// `AttentionRequired` signal (the agent yielded for input) or a terminal
-/// `RunFinished`/`RunFailed`. Reads the DO log through the same `open_event_source`
-/// the §0 read verbs use (it routes to [`ManagedDoSource`] under the managed env),
-/// so the wait isn't a hand-rolled read. Subscribes from seq 0 — a freshly-minted
-/// DO session has no prior turn, so the first idle is this turn's.
-fn wait_until_idle(resolved: &Pillbox, session_id: &str) -> Result<()> {
-    use crate::contract::Payload;
-    use std::sync::atomic::AtomicBool;
-
-    let source = crate::events::source::open_event_source(resolved, session_id)?;
-    let stop = AtomicBool::new(false);
-    let mut idle = false;
-    source.subscribe(0, &stop, &mut |ev| {
-        let done = matches!(
-            ev.payload,
-            Payload::AttentionRequired(_) | Payload::RunFinished(_) | Payload::RunFailed(_)
-        );
-        if done {
-            idle = true;
-        }
-        !done // keep reading until a turn-done event
-    })?;
-    if idle {
-        Ok(())
-    } else {
-        // The stream closed without an idle/terminal event (DO went away
-        // mid-turn) — surface it rather than silently finalizing a partial run.
-        Err(PillboxError::runtime(
-            "run",
-            format!("managed session `{session_id}` stream ended before the turn went idle"),
-        )
-        .into())
-    }
-}
-
-/// The managed [`LiveSession`] — a session that lives on the §0-gateway DO. Holds
-/// the cloned [`Session`] record (whose [`ManagedHandle`] in `sandbox_id` carries
-/// the DO endpoint + the DO-side session id) and resolves the per-verb network
-/// surface from it. No local process: every verb is a DO call.
+/// The managed [`LiveSession`] — a local session record whose turns execute on
+/// the managed Worker. There is no remote session authority or replay stream.
 pub(crate) struct ManagedLiveSession {
     session: Session,
 }
@@ -358,8 +306,7 @@ impl ManagedLiveSession {
         Self { session }
     }
 
-    /// The decoded DO handle (endpoint + DO-side session id) this session points
-    /// at — the single place that reads it back out of the record.
+    /// The decoded Worker handle this session points at.
     fn handle(&self) -> Result<ManagedHandle> {
         ManagedHandle::decode(&self.session)
     }
@@ -370,37 +317,32 @@ impl LiveSession for ManagedLiveSession {
         ManagedBackend.capabilities()
     }
 
-    fn send(&self, bytes: &[u8]) -> Result<()> {
+    fn send(&self, resolved: &Pillbox, bytes: &[u8]) -> Result<()> {
         let handle = self.handle()?;
-        // `/input` is driver-gated + attributed: it needs a *driver* actor token
-        // (`human`/`service`), not the anonymous read token. Mint one from the
-        // shared secret when configured, else fall back to a pre-minted token.
-        let token = driver_token().ok_or_else(|| {
+        let token = managed_token().ok_or_else(|| {
             PillboxError::config(
                 "session send",
                 "no managed actor token: set PILLBOX_MANAGED_TOKEN_SECRET (to mint a \
-                 driver token) or PILLBOX_ACTOR_TOKEN (a pre-minted one)",
+                 token) or PILLBOX_ACTOR_TOKEN (a pre-minted one)",
             )
         })?;
-        // The agent's structured prompt channel — the DO runs an opencode turn
-        // whose §0 events stream back over `/subscribe`.
         let text = String::from_utf8_lossy(bytes).into_owned();
         let model = self.session.server.as_ref().map(|s| s.model.as_str());
-        input::drive_agent(&handle.endpoint, &token, &text, model)
+        execution::execute_turn(
+            resolved,
+            &self.session.id,
+            &handle.endpoint,
+            &token,
+            &text,
+            model,
+        )
     }
 
     fn attach(&self, _resolved: &Pillbox) -> Result<()> {
-        // Reattach for a managed session is NOT a local-process re-pump (docker's
-        // docker-exec relay / libkrun's attach socket): the session is durable
-        // server-side, so "reattach" = re-subscribe to the DO log from the last
-        // seq. The read surface for that is `session watch`/`subscribe` (they open
-        // the DO WebSocket via the §0 source), and there's no terminal PTY to pump
-        // — so a bare `attach` (which means "pump a terminal") is unsupported.
-        // Point the user at the read verbs instead of pumping garbage frames.
+        // Managed turns have no terminal PTY; evidence is already in the local log.
         Err(PillboxError::usage(
             "session attach",
-            "a managed session has no host PTY to attach — it's durable on the §0 \
-             gateway; re-subscribe instead",
+            "a managed session has no host PTY to attach; inspect its local event log instead",
         )
         .with_next(format!(
             "pillbox session watch {id}   # read it    ·   pillbox session send {id} \"…\"   # drive it",
@@ -413,21 +355,15 @@ impl LiveSession for ManagedLiveSession {
         &self,
         _resolved: &Pillbox,
     ) -> Result<Option<crate::events::transcripts::TailerHandle>> {
-        // The §0 read source for a managed session (`ManagedDoSource`, opened by
-        // `open_event_source` when the managed env is on) IS the live tail: the
-        // DO replays-then-tails over the WebSocket. There's no separate host-side
-        // transcript/capture to drain into the log, so there's nothing to spawn —
-        // the consumer's own `subscribe` is the live reader. (Contrast docker's
-        // transcript tailer / libkrun's capture-file drain, which fill a *local*
-        // log; the managed log lives on the DO.)
+        // Each bounded response appends its evidence directly to the local log.
         Ok(None)
     }
 
     fn http(&self) -> Result<Box<dyn crate::sandbox::http::SandboxHttp>> {
-        // The managed agent is reached through the DO's REST surface (`/input`,
-        // `/subscribe`), not a raw in-sandbox HTTP server the host can `curl`.
+        // The managed agent is reached through the execution REST surface,
+        // not a raw in-sandbox HTTP server the host can `curl`.
         // The `SandboxHttp` seam models the latter; managed doesn't expose one, so
-        // the verb is unsupported (drive goes through `send` → `/input`).
+        // the verb is unsupported (drive goes through a bounded execution request).
         Err(self.caps().unsupported("http"))
     }
 
@@ -440,20 +376,13 @@ impl LiveSession for ManagedLiveSession {
     }
 
     fn ingest(&self, _resolved: &Pillbox) -> Result<usize> {
-        // The DO holds the durable log; reads stream live from it via
-        // `subscribe`/`watch`. There's no host capture file to drain post-hoc,
-        // so post-hoc ingest is a no-op verb here (matches
-        // `caps().post_hoc_ingest == false`).
+        // There is no host capture file to drain post-hoc.
         Err(self.caps().unsupported("ingest"))
     }
 
     fn kill(&self, resolved: &Pillbox) -> Result<()> {
-        // No local sandbox to tear down — the CF container's lifecycle is the
-        // managed tier's (the DO owns it). pillbox's teardown is dropping the
-        // *local* record so it stops showing in `session list`; the durable DO
-        // session is unaffected (its own retention governs it). Best-effort
-        // DO-side teardown (a `/driver/release` or a future `/session/destroy`)
-        // is a managed-tier follow-up — flagged, not faked.
+        // The execution runtime is request-scoped; dropping the local record is
+        // the complete session teardown.
         crate::events::emit_session_event(
             resolved,
             crate::events::EventType::SessionDropped,
@@ -462,29 +391,25 @@ impl LiveSession for ManagedLiveSession {
         );
         session::delete(resolved, &self.session.id)?;
         println!(
-            "pillbox: ✓ session `{}` record removed (the managed §0 session is durable \
-             server-side and is unaffected).",
+            "pillbox: ✓ managed session `{}` record removed.",
             self.session.id
         );
         Ok(())
     }
 }
 
-/// What a managed session stores in [`Session::sandbox_id`] (as JSON): the DO
-/// base endpoint to reach + the DO-side session id. Mirrors libkrun's
+/// What a managed session stores in [`Session::sandbox_id`] (as JSON): the Worker
+/// origin + execution session id. Mirrors libkrun's
 /// `LibkrunHandle` pattern — an opaque, backend-specific handle the plane decodes
 /// to find the session again. No credential material (the token comes from env).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ManagedHandle {
-    /// The per-session DO base URL, e.g.
-    /// `https://<worker>.workers.dev/agents/session-gateway/<doSessionId>` (no
-    /// trailing slash). `/input` etc. are appended per call; the read side
-    /// rewrites the scheme to `wss` for `/subscribe`.
+    /// The Worker origin, e.g. `https://<worker>.workers.dev` (no trailing slash).
     pub(crate) endpoint: String,
-    /// The DO-side session id (the §0-gateway Agent instance name). May differ
-    /// from this record's pillbox id; kept so a consumer can correlate the local
-    /// record with the durable server-side log.
-    pub(crate) do_session_id: String,
+    /// The stable execution session id. The alias reads records written by the
+    /// retired gateway client without preserving gateway semantics.
+    #[serde(alias = "do_session_id")]
+    pub(crate) execution_session_id: String,
 }
 
 impl ManagedHandle {
@@ -500,11 +425,10 @@ impl ManagedHandle {
     }
 }
 
-/// The driver token for a `/input` (driver-gated) call: mint one from the shared
-/// HMAC secret when set (stamped `human(<os user>)` — the local user is the
-/// driver), else fall back to a pre-minted `PILLBOX_ACTOR_TOKEN`. `None` when
+/// The Worker authentication token: mint one from the shared HMAC secret when
+/// set (stamped `human(<os user>)`), else use `PILLBOX_ACTOR_TOKEN`. `None` when
 /// neither is configured, so `send` can fail with a clear next-step.
-fn driver_token() -> Option<String> {
+fn managed_token() -> Option<String> {
     if let Ok(secret) = std::env::var("PILLBOX_MANAGED_TOKEN_SECRET") {
         if !secret.is_empty() {
             let actor = crate::contract::Actor::human(local_user());
@@ -525,7 +449,7 @@ fn local_user() -> String {
         .unwrap_or_else(|_| "local".into())
 }
 
-/// Mint an actor token the §0-gateway DO's `verifyActorToken` accepts.
+/// Mint an actor token the Worker's `verifyActorToken` accepts.
 ///
 /// The wire format is **exactly** `cloudflare-spike/src/auth.ts::signActorToken`:
 /// `base64url(claimJson) . base64url(HMAC-SHA256(claimJson, secret))`, where
@@ -583,77 +507,176 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     out
 }
 
-/// The `/input` drive call — the DO-side `send`. Kept in a submodule so the HTTP
-/// shape (the `{text, target, model?}` body + the driver 409 mapping) is in one
-/// place, separate from the trait wiring above.
-mod input {
+/// One bounded managed execution call plus local evidence persistence.
+mod execution {
     use anyhow::{Context, Result};
-    use serde::Serialize;
+    use serde::Deserialize;
+    use sha2::{Digest, Sha256};
 
+    use crate::contract::{Custom, Event, Payload};
     use crate::errors::PillboxError;
+    use crate::events::log::SessionLog;
+    use crate::pillbox::Pillbox;
 
-    /// `POST <endpoint>/input` with `target:"agent"` — drive an agent turn whose
-    /// §0 events stream back over `/subscribe`. Maps the driver 409 ("not the
-    /// driver") to a clear pillbox error (another actor holds the slot); other
-    /// non-2xx are surfaced verbatim.
-    pub(super) fn drive_agent(
+    #[derive(Deserialize)]
+    struct EvidencePage {
+        events: Vec<Payload>,
+        next: Option<u64>,
+    }
+
+    #[derive(Deserialize)]
+    struct ExecutionError {
+        code: String,
+        message: String,
+    }
+
+    #[derive(Deserialize)]
+    struct ExecutionResult {
+        invocation_id: String,
+        status: String,
+        evidence: EvidencePage,
+        #[serde(default)]
+        cost: Option<serde_json::Value>,
+        #[serde(default)]
+        error: Option<ExecutionError>,
+    }
+
+    pub(super) fn execute_turn(
+        resolved: &Pillbox,
+        session_id: &str,
         endpoint: &str,
         token: &str,
         text: &str,
         model: Option<&str>,
     ) -> Result<()> {
-        #[derive(Serialize)]
-        struct Input<'a> {
-            text: &'a str,
-            target: &'a str,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            model: Option<&'a str>,
-        }
-        let body = serde_json::to_string(&Input {
-            text,
-            target: "agent",
-            model,
-        })
-        .context("serialize managed /input body")?;
+        let model = model.unwrap_or(crate::sandbox::opencode::DEFAULT_MODEL);
+        let (provider, model_id) = model.split_once('/').ok_or_else(|| {
+            PillboxError::config(
+                "session send",
+                format!("managed model must be provider/model, got `{model}`"),
+            )
+        })?;
+        let invocation_id = crate::session::Session::new_id();
+        let rendered_hash = format!("sha256:{:x}", Sha256::digest(text.as_bytes()));
+        let body = serde_json::json!({
+            "contract_version": "pillbox.execution/2",
+            "session_ref": { "session_id": session_id },
+            "invocation_id": invocation_id,
+            "idempotency_key": invocation_id,
+            "rendered_input": text,
+            "rendered_input_hash": rendered_hash,
+            "tool_policy": "runtime_default",
+            "execution": {
+                "transport": {
+                    "harness": "opencode",
+                    "transport": "http",
+                    "harness_version": "managed-v2",
+                    "adapter_revision": "pillbox-cli-v2"
+                },
+                "requested": {
+                    "provider": provider,
+                    "model": model_id,
+                    "profile": null,
+                    "reasoning_effort": "medium"
+                },
+                "placement": "managed_container",
+                "context_renderer_revision": "pillbox-cli-v2"
+            },
+            "execution_policy_revision": "pillbox-managed-v2",
+            "output_format": { "type": "text", "retry_count": 0 }
+        });
 
-        let url = format!("{}/input", endpoint.trim_end_matches('/'));
-        // `/input` blocks for the WHOLE agent turn: the DO's handleInput awaits the
-        // opencode turn to idle before responding. So this is a turn-length wait, not
-        // a quick steer — the ~2s event-sink budget would time out every real turn.
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(600))
             .build()
-            .context("build managed /input http client")?;
-        let resp = client
-            .post(&url)
-            .header("content-type", "application/json")
-            .bearer_auth(token)
-            .body(body)
-            .send()
-            .with_context(|| format!("POST {url}"))?;
+            .context("build managed execution http client")?;
+        let mut result = post_json(
+            &client,
+            &format!("{}/v2/executions", endpoint.trim_end_matches('/')),
+            token,
+            &body,
+        )?;
+        let mut payloads = Vec::new();
+        payloads.append(&mut result.evidence.events);
+        let mut cursor = result.evidence.next;
+        while let Some(after) = cursor {
+            let status_body = serde_json::json!({
+                "contract_version": "pillbox.execution/2",
+                "invocation_id": result.invocation_id,
+                "evidence_after": after,
+                "evidence_limit": 100
+            });
+            let mut page = post_json(
+                &client,
+                &format!("{}/v2/executions/status", endpoint.trim_end_matches('/')),
+                token,
+                &status_body,
+            )?;
+            payloads.append(&mut page.evidence.events);
+            cursor = page.evidence.next;
+            if result.cost.is_none() {
+                result.cost = page.cost;
+            }
+        }
 
-        let status = resp.status();
-        if status.is_success() {
+        if let Some(cost) = result.cost.clone() {
+            payloads.push(Payload::Custom(Custom {
+                name: "run_cost".into(),
+                payload: Some(cost),
+            }));
+        }
+        let events: Vec<_> = payloads
+            .into_iter()
+            .map(|payload| Event::session(session_id, payload))
+            .collect();
+        SessionLog::open(resolved, session_id)?.append(&events)?;
+
+        if result.status == "completed" {
             return Ok(());
         }
-        // 409 = the DO's driver arbitration rejected the steer (another actor
-        // holds the single driver slot). Distinct, actionable error vs a generic
-        // HTTP failure — the user can re-issue with the steal flag (a follow-up
-        // surface) or wait for the driver to release.
-        if status.as_u16() == 409 {
+        let detail = result.error.map_or_else(
+            || format!("managed execution ended with status {}", result.status),
+            |error| format!("{}: {}", error.code, error.message),
+        );
+        Err(PillboxError::runtime("session send", detail).into())
+    }
+
+    fn post_json(
+        client: &reqwest::blocking::Client,
+        url: &str,
+        token: &str,
+        body: &serde_json::Value,
+    ) -> Result<ExecutionResult> {
+        let resp = client
+            .post(url)
+            .header("content-type", "application/json")
+            .bearer_auth(token)
+            .body(serde_json::to_string(body).context("serialize managed execution body")?)
+            .send()
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        let response = resp.text().context("read managed execution response")?;
+        if !status.is_success() {
             return Err(PillboxError::runtime(
                 "session send",
-                "the managed session is driven by another actor (the §0 driver slot \
-                 is held); your steer was rejected",
+                format!(
+                    "managed execution returned HTTP {status}: {}",
+                    capped(&response)
+                ),
             )
-            .with_next("retry once the current driver releases the session")
             .into());
         }
-        Err(PillboxError::runtime(
-            "session send",
-            format!("managed §0 gateway {url} returned HTTP {status}"),
-        )
-        .into())
+        serde_json::from_str(&response).map_err(|error| {
+            PillboxError::runtime(
+                "session send",
+                format!("invalid managed execution response: {error}"),
+            )
+            .into()
+        })
+    }
+
+    fn capped(value: &str) -> &str {
+        value.get(..value.len().min(2048)).unwrap_or(value)
     }
 }
 
@@ -695,6 +718,8 @@ mod workspace_xfer {
 
     #[derive(Serialize)]
     struct ProvisionBody<'a> {
+        #[serde(rename = "sessionId")]
+        session_id: &'a str,
         workspace: WorkspaceRepo<'a>,
     }
 
@@ -704,11 +729,13 @@ mod workspace_xfer {
     pub(super) fn provision(
         endpoint: &str,
         token: &str,
+        session_id: &str,
         repo: &S3Config,
         password: &str,
         snapshot: &str,
     ) -> Result<()> {
         let body = serde_json::to_string(&ProvisionBody {
+            session_id,
             workspace: WorkspaceRepo {
                 repo,
                 password,
@@ -716,7 +743,7 @@ mod workspace_xfer {
             },
         })
         .context("serialize managed /provision body")?;
-        let resp = post(endpoint, "provision", token, body)?;
+        let resp = post(endpoint, "v2/workspaces/provision", token, body)?;
         let status = resp.status();
         if status.is_success() {
             return Ok(());
@@ -736,10 +763,12 @@ mod workspace_xfer {
     pub(super) fn finalize(
         endpoint: &str,
         token: &str,
+        session_id: &str,
         repo: &S3Config,
         password: &str,
     ) -> Result<String> {
         let body = serde_json::to_string(&ProvisionBody {
+            session_id,
             workspace: WorkspaceRepo {
                 repo,
                 password,
@@ -747,7 +776,7 @@ mod workspace_xfer {
             },
         })
         .context("serialize managed /finalize body")?;
-        let resp = post(endpoint, "finalize", token, body)?;
+        let resp = post(endpoint, "v2/workspaces/finalize", token, body)?;
         let status = resp.status();
         if !status.is_success() {
             let detail = error_detail(resp);
@@ -837,6 +866,7 @@ mod workspace_xfer {
         fn provision_body_serializes_to_the_frozen_shape() {
             let c = cfg();
             let body = serde_json::to_value(ProvisionBody {
+                session_id: "session-1",
                 workspace: WorkspaceRepo {
                     repo: &c,
                     password: "repo-pw",
@@ -864,6 +894,7 @@ mod workspace_xfer {
             let mut c = cfg();
             c.session_token = Some("scoped-session-token".into());
             let body = serde_json::to_value(ProvisionBody {
+                session_id: "session-1",
                 workspace: WorkspaceRepo {
                     repo: &c,
                     password: "repo-pw",
@@ -884,6 +915,7 @@ mod workspace_xfer {
         fn finalize_body_omits_the_snapshot_field() {
             let c = cfg();
             let body = serde_json::to_value(ProvisionBody {
+                session_id: "session-1",
                 workspace: WorkspaceRepo {
                     repo: &c,
                     password: "repo-pw",
@@ -1328,8 +1360,8 @@ mod tests {
     #[test]
     fn managed_handle_round_trips_through_sandbox_id() {
         let handle = ManagedHandle {
-            endpoint: "https://w.workers.dev/agents/session-gateway/sess-do".into(),
-            do_session_id: "sess-do".into(),
+            endpoint: "https://w.workers.dev".into(),
+            execution_session_id: "sess-do".into(),
         };
         let mut s = Session::test_fixture();
         s.backend = BACKEND_MANAGED.to_string();
@@ -1364,8 +1396,8 @@ mod tests {
     #[test]
     fn unsupported_verbs_reject_with_clear_errors() {
         let handle = ManagedHandle {
-            endpoint: "https://w.workers.dev/agents/session-gateway/sess-do".into(),
-            do_session_id: "sess-do".into(),
+            endpoint: "https://w.workers.dev".into(),
+            execution_session_id: "sess-do".into(),
         };
         let mut s = Session::test_fixture();
         s.backend = BACKEND_MANAGED.to_string();
@@ -1389,6 +1421,7 @@ mod tests {
     struct ManagedEnvGuard;
     impl Drop for ManagedEnvGuard {
         fn drop(&mut self) {
+            std::env::remove_var("PILLBOX_MANAGED_URL");
             std::env::remove_var("PILLBOX_MANAGED_DO_URL");
         }
     }
@@ -1431,32 +1464,30 @@ mod tests {
     /// (the body carries the R2 creds + the repo password), and an unset env names
     /// the missing var; an `https://` origin resolves to the per-session endpoint.
     #[test]
-    fn resolve_https_endpoint_enforces_https() {
+    fn resolve_https_origin_enforces_https() {
         // Serialize the env mutation under the shared test lock (held by
         // `with_isolated_home`) so a parallel test can't trample the var.
         crate::test_util::with_isolated_home("managed-https-guard", || {
             let _env = ManagedEnvGuard;
 
             // Unset → config error naming the var.
+            std::env::remove_var("PILLBOX_MANAGED_URL");
             std::env::remove_var("PILLBOX_MANAGED_DO_URL");
-            let err = resolve_https_endpoint("sess-1").expect_err("unset env must error");
-            assert!(err.to_string().contains("PILLBOX_MANAGED_DO_URL"));
+            let err = resolve_https_origin().expect_err("unset env must error");
+            assert!(err.to_string().contains("PILLBOX_MANAGED_URL"));
 
             // Plaintext http:// → refused before any network touch.
-            std::env::set_var("PILLBOX_MANAGED_DO_URL", "http://insecure.example.com");
-            let err = resolve_https_endpoint("sess-1").expect_err("http:// must be refused");
+            std::env::set_var("PILLBOX_MANAGED_URL", "http://insecure.example.com");
+            let err = resolve_https_origin().expect_err("http:// must be refused");
             assert!(
                 err.to_string().contains("non-HTTPS"),
                 "guard must explain the HTTPS refusal, got: {err}"
             );
 
-            // https:// → the per-session endpoint (matches `managed_endpoint`).
-            std::env::set_var("PILLBOX_MANAGED_DO_URL", "https://w.workers.dev");
-            let endpoint = resolve_https_endpoint("sess-1").expect("https resolves");
-            assert_eq!(
-                endpoint,
-                "https://w.workers.dev/agents/session-gateway/sess-1"
-            );
+            // https:// → the Worker origin, with trailing slash normalized.
+            std::env::set_var("PILLBOX_MANAGED_URL", "https://w.workers.dev/");
+            let endpoint = resolve_https_origin().expect("https resolves");
+            assert_eq!(endpoint, "https://w.workers.dev");
         });
     }
 
@@ -1467,8 +1498,8 @@ mod tests {
     #[test]
     fn persisted_record_excludes_creds_and_password() {
         let handle = ManagedHandle {
-            endpoint: "https://w.workers.dev/agents/session-gateway/sess-do".into(),
-            do_session_id: "sess-do".into(),
+            endpoint: "https://w.workers.dev".into(),
+            execution_session_id: "sess-do".into(),
         };
         let session = Session {
             id: "sess-do".into(),

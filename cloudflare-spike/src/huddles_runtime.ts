@@ -370,7 +370,7 @@ function legacyError(
 
 function opencodeConfig(
   env: Env,
-  toolPolicy: "deny_all",
+  toolPolicy: "deny_all" | "runtime_default",
 ): { readonly config?: unknown; readonly env: Readonly<Record<string, string>> } {
   const providerEnv: Record<string, string> = {};
   for (const key of ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"] as const) {
@@ -391,7 +391,10 @@ function opencodeConfig(
     throw new Error("no opencode provider configured");
   }
   return {
-    config: enforceHuddlesOpencodePolicy(config, toolPolicy),
+    config:
+      toolPolicy === "deny_all"
+        ? enforceHuddlesOpencodePolicy(config, toolPolicy)
+        : config,
     env: providerEnv,
   };
 }

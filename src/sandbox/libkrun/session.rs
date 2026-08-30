@@ -2159,7 +2159,7 @@ impl crate::sandbox::LiveSession for LibkrunLiveSession {
         LibkrunBackend.capabilities()
     }
 
-    fn send(&self, bytes: &[u8]) -> Result<()> {
+    fn send(&self, _resolved: &Pillbox, bytes: &[u8]) -> Result<()> {
         // A server agent's prompt goes over its HTTP API; a PTY agent's is raw
         // keystrokes. Both flow through this one `send` so the command layer never
         // branches on integration.
@@ -2405,12 +2405,15 @@ mod tests {
         // fails at the handle decode (or the socket connect), NOT at the old
         // `caps().unsupported("send")` short-circuit. (Byte delivery to a live PTY
         // is the live smoke's job — this only proves the verb is wired.)
-        let live = LibkrunLiveSession::new(libkrun_pty_session());
-        let err = live.send(b"hi").unwrap_err().to_string();
-        assert!(
-            !err.contains("isn't supported on this backend"),
-            "PTY send must no longer be capability-unsupported, got: {err}"
-        );
+        crate::test_util::with_isolated_home("libkrun-pty-send", || {
+            let pb = Pillbox::resolve(None).unwrap();
+            let live = LibkrunLiveSession::new(libkrun_pty_session());
+            let err = live.send(&pb, b"hi").unwrap_err().to_string();
+            assert!(
+                !err.contains("isn't supported on this backend"),
+                "PTY send must no longer be capability-unsupported, got: {err}"
+            );
+        });
     }
 
     #[test]

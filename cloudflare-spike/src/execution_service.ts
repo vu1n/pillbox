@@ -415,8 +415,11 @@ export class OpencodeExecutionRuntime implements ExecutionRuntime {
       sandbox: await this.options.sandboxFor(request.session_ref.session_id),
       text: request.rendered_input,
       model: `${request.execution.requested.provider}/${request.execution.requested.model}`,
-      toolPolicy: request.tool_policy,
-      outputFormat: request.output_format,
+      toolPolicy: request.tool_policy === "deny_all" ? "deny_all" : undefined,
+      outputFormat:
+        request.output_format.type === "json_schema"
+          ? request.output_format
+          : undefined,
       config: await this.options.configFor(request),
       sink: {
         appendAgent(payload: Payload) {
@@ -465,8 +468,14 @@ export class OpencodeExecutionRuntime implements ExecutionRuntime {
       return {
         served_model: null,
         error: {
-          code: "structured_output_missing",
-          message: "agent turn produced no structured output",
+          code:
+            request.output_format.type === "json_schema"
+              ? "structured_output_missing"
+              : "runtime_failed",
+          message:
+            request.output_format.type === "json_schema"
+              ? "agent turn produced no structured output"
+              : "agent turn produced no text output",
         },
         evidence,
       };

@@ -52,6 +52,13 @@ export interface JsonSchemaOutputFormat {
   readonly retry_count: 2;
 }
 
+export interface TextOutputFormat {
+  readonly type: "text";
+  readonly retry_count: 0;
+}
+
+export type ExecutionOutputFormat = JsonSchemaOutputFormat | TextOutputFormat;
+
 export type Sha256Digest = `sha256:${string}`;
 export type ExecutionDigest = Sha256Digest;
 export type InvocationRequestHash = Sha256Digest;
@@ -64,10 +71,10 @@ export interface ExecuteInvocationV2Request {
   readonly idempotency_key: string;
   readonly rendered_input: string;
   readonly rendered_input_hash: Sha256Digest;
-  readonly tool_policy: "deny_all";
+  readonly tool_policy: "deny_all" | "runtime_default";
   readonly execution: InvocationExecution;
   readonly execution_policy_revision: string;
-  readonly output_format: JsonSchemaOutputFormat;
+  readonly output_format: ExecutionOutputFormat;
 }
 
 export type ExecuteInvocationV2ErrorCode =
@@ -271,8 +278,11 @@ export async function validateExecuteInvocationV2Request(
   if (renderedInputHash !== expectedInputHash) {
     reject("rendered_input_hash does not match rendered_input");
   }
-  if (request.tool_policy !== "deny_all") {
-    reject("tool_policy must be 'deny_all'");
+  if (
+    request.tool_policy !== "deny_all" &&
+    request.tool_policy !== "runtime_default"
+  ) {
+    reject("tool_policy must be 'deny_all' or 'runtime_default'");
   }
 
   const executionPolicyRevision = requireNonEmptyString(
@@ -289,7 +299,7 @@ export async function validateExecuteInvocationV2Request(
     idempotency_key: idempotencyKey,
     rendered_input: renderedInput,
     rendered_input_hash: renderedInputHash,
-    tool_policy: "deny_all",
+    tool_policy: request.tool_policy,
     execution,
     execution_policy_revision: executionPolicyRevision,
     output_format: outputFormat,
@@ -482,8 +492,15 @@ function validateInvocationExecution(value: JsonValue | undefined): InvocationEx
   };
 }
 
-function validateOutputFormat(value: JsonValue | undefined): JsonSchemaOutputFormat {
+function validateOutputFormat(value: JsonValue | undefined): ExecutionOutputFormat {
   const outputFormat = requireObject(value, "output_format");
+  if (outputFormat.type === "text") {
+    assertExactKeys(outputFormat, ["type", "retry_count"], "output_format");
+    if (outputFormat.retry_count !== 0) {
+      reject("text output_format.retry_count must be 0");
+    }
+    return { type: "text", retry_count: 0 };
+  }
   assertExactKeys(
     outputFormat,
     ["type", "schema", "retry_count"],

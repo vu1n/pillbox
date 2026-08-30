@@ -27,6 +27,7 @@ mod cli;
 mod commands;
 mod config;
 mod contract;
+mod cost;
 mod docker;
 mod doctor;
 mod envs;

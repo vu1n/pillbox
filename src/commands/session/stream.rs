@@ -541,6 +541,7 @@ mod tests {
                 output_tokens: Some(output),
                 cache_read_input_tokens: None,
                 cache_creation_input_tokens: None,
+                cost_usd: None,
                 source: UsageSource::Wire,
             }),
         )

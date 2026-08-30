@@ -27,6 +27,12 @@ import type {
 import { safeHuddlesRuntimeDiagnostic } from "./huddles_policy.js";
 import { driveOpencodeTurn } from "./opencode_turn.js";
 import type { Payload } from "./contract.js";
+import {
+  type RunCostAnalytics,
+  type RunCostEnvelope,
+  type RunCostMeter,
+  sealArtifactCostBytes,
+} from "./run_cost.js";
 
 export const EXECUTION_OWNER_LEASE_MS = 10 * 60 * 1_000;
 
@@ -48,6 +54,9 @@ export interface ExecutionRuntime {
 export interface ExecutionServiceOptions {
   readonly now?: () => number;
   readonly ownerToken?: () => string;
+  readonly costMeter?: RunCostMeter;
+  readonly analytics?: RunCostAnalytics;
+  readonly sandboxProfile?: string;
 }
 
 export class ExecutionNotFoundError extends Error {
@@ -65,6 +74,9 @@ export class ExecutionService {
   private readonly runtime: ExecutionRuntime;
   private readonly now: () => number;
   private readonly ownerToken: () => string;
+  private readonly costMeter: RunCostMeter | undefined;
+  private readonly analytics: RunCostAnalytics | undefined;
+  private readonly sandboxProfile: string | null;
 
   constructor(
     store: ExecutionStore,
@@ -77,6 +89,9 @@ export class ExecutionService {
     this.runtime = runtime;
     this.now = options.now ?? Date.now;
     this.ownerToken = options.ownerToken ?? (() => crypto.randomUUID());
+    this.costMeter = options.costMeter;
+    this.analytics = options.analytics;
+    this.sandboxProfile = options.sandboxProfile ?? null;
   }
 
   async executeInvocation(value: unknown): Promise<ExecuteInvocationV2Result> {
@@ -238,6 +253,9 @@ export class ExecutionService {
       ...stored,
       disposition: "reused",
       evidence: evidencePage(artifact, record, cursor.after, cursor.limit),
+      ...(artifact.cost === undefined
+        ? {}
+        : { cost: artifact.cost as unknown as RunCostEnvelope }),
     };
   }
 
@@ -283,13 +301,23 @@ export class ExecutionService {
       ...baseResult(record, attribution, emptyEvidence(0), disposition),
       ...terminal,
     } satisfies ExecuteInvocationV2Result;
-    const artifact: ExecutionArtifact = {
+    this.costMeter?.observeEvidence(evidence);
+    const cost = this.costMeter?.terminal(terminal.status, {
+      sandbox_duration_ms: Math.max(0, this.now() - record.created_at_ms),
+      sandbox_profile: this.sandboxProfile,
+      planned_d1_terminal_writes: 1,
+      planned_r2_writes: 1,
+      planned_analytics_points: this.analytics === undefined ? 0 : 1,
+    });
+    const unsealedArtifact: ExecutionArtifact = {
       version: 1,
       invocation_id: record.invocation_id,
       request_hash: record.request_hash,
       terminal_result: placeholder as unknown as JsonValue,
       evidence,
+      ...(cost === undefined ? {} : { cost: cost as unknown as JsonValue }),
     };
+    const artifact = sealArtifactCostBytes(unsealedArtifact);
     const artifactRef = await this.artifacts.write(artifact);
     const finished = await this.store.finish({
       invocation_id: record.invocation_id,
@@ -300,7 +328,7 @@ export class ExecutionService {
       now_ms: this.now(),
     });
     if (!finished) return null;
-    return {
+    const result: ExecuteInvocationV2Result = {
       ...placeholder,
       evidence: evidencePage(
         artifact,
@@ -308,7 +336,27 @@ export class ExecutionService {
         0,
         MAX_EVIDENCE_PAGE_SIZE,
       ),
+      ...(artifact.cost === undefined
+        ? {}
+        : { cost: artifact.cost as unknown as RunCostEnvelope }),
     };
+    if (this.analytics !== undefined && result.cost !== undefined) {
+      try {
+        await this.analytics.emit({
+          invocation_id: record.invocation_id,
+          request_hash: record.request_hash,
+          harness: attribution.harness,
+          transport: attribution.transport,
+          cost: result.cost,
+        });
+      } catch (cause) {
+        console.error(
+          "run cost analytics emission failed",
+          safeHuddlesRuntimeDiagnostic(cause),
+        );
+      }
+    }
+    return result;
   }
 
   private conflictResult(

@@ -129,6 +129,7 @@ fn usage_payload(message_id: &str, u: &GenAiUsage) -> Usage {
         output_tokens: u.output_tokens,
         cache_read_input_tokens: u.cache_read_input_tokens,
         cache_creation_input_tokens: u.cache_creation_input_tokens,
+        cost_usd: None,
         source: UsageSource::Native,
     }
 }

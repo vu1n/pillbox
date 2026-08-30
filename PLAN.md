@@ -142,7 +142,7 @@ produces:
   - "cloudflare-spike/src/run_cost.ts::RunCostAnalytics"
   - "src/cost.rs::CostSummary"
   - "src/cli.rs::pillbox session cost"
-gate: "cd cloudflare-spike && node --test run_cost.test.ts execution_service.test.ts && cd .. && cargo test cost commands::session"
+gate: "cd cloudflare-spike && node --test run_cost.test.ts execution_service.test.ts && cd .. && cargo test cost && cargo test commands::session"
 assumptions:
   - "Raw usage units and provider-reported model cost are evidence; infrastructure dollar estimates are advisory and carry a rate-card version."
   - "Analytics Engine receives no prompts, outputs, secrets, repository paths, or participant identity and is capped at one non-blocking point per terminal run."

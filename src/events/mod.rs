@@ -234,26 +234,6 @@ const FOLLOW_POLL_MS: u64 = 200;
 /// `OTEL_EXPORTER_OTLP_TIMEOUT` env overrides it for OTel.
 pub(super) const EVENTS_SINK_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The managed §0 placement for `session_id` when the managed tier is on: the
-/// per-session Durable Object endpoint + an optional actor token. `None` → use
-/// the local file-backed placement. The one home for "where is the managed DO
-/// for this session", shared by the write-side ([`sink::open_event_log`]) and
-/// read-side ([`source::open_event_source`]) factories so they can't drift on
-/// endpoint shape or token handling. The token is `None` when unset or empty
-/// (the DO allows anonymous reads; the write side maps `None` → `""`, which it
-/// fails closed on).
-pub(crate) fn managed_endpoint(session_id: &str) -> Option<(String, Option<String>)> {
-    let base = std::env::var("PILLBOX_MANAGED_DO_URL").ok()?;
-    let token = std::env::var("PILLBOX_ACTOR_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty());
-    let endpoint = format!(
-        "{}/agents/session-gateway/{session_id}",
-        base.trim_end_matches('/')
-    );
-    Some((endpoint, token))
-}
-
 /// One lifecycle event variant. Terminal events (`SessionCompleted` /
 /// `SessionFailed`) carry the variant-specific payload inline so
 /// [`build_attributes`] can be exhaustive at compile time. Lost

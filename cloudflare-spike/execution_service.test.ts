@@ -14,6 +14,7 @@ import type {
   ExecutionArtifact,
   ExecutionArtifactStore,
 } from "./src/execution_artifacts.ts";
+import { ExecutionArtifactConflictError } from "./src/execution_artifacts.ts";
 import type {
   ExecutionRuntime,
   RuntimeTurnResult,
@@ -194,6 +195,48 @@ test("expired running claims become interrupted instead of resampling", async ()
   assert.equal(runtime.executions, 0);
 });
 
+test("an immutable terminal artifact repairs a lost D1 terminal write", async () => {
+  let now = 1_000;
+  const store = new MemoryStore();
+  store.finishFailures = 1;
+  const artifacts = new MemoryArtifacts();
+  const service = new ExecutionService(
+    store,
+    artifacts,
+    new FakeRuntime({
+      served_model: "zai-coding-plan/glm-4.5-air",
+      output: { text: "done" },
+      evidence: [],
+    }),
+    { now: () => now, ownerToken: () => "owner-1" },
+  );
+
+  const first = await service.executeInvocation(await request());
+  assert.equal(first.status, "running");
+
+  now += EXECUTION_OWNER_LEASE_MS + 1;
+  const recovered = await service.getExecutionStatus({
+    contract_version: "pillbox.execution/2",
+    invocation_id: "invocation-1",
+    evidence_after: 0,
+    evidence_limit: 100,
+  });
+  assert.equal(recovered.status, "completed");
+  assert.equal(recovered.attribution.served_model, "zai-coding-plan/glm-4.5-air");
+  assert.equal(artifacts.values.size, 1);
+  assert.equal(
+    (
+      await service.getExecutionStatus({
+        contract_version: "pillbox.execution/2",
+        invocation_id: "invocation-1",
+        evidence_after: 0,
+        evidence_limit: 100,
+      })
+    ).status,
+    "completed",
+  );
+});
+
 test("status evidence reads are paginated and bounded", async () => {
   const service = new ExecutionService(
     new MemoryStore(),
@@ -304,6 +347,7 @@ class FakeRuntime implements ExecutionRuntime {
 
 class MemoryStore implements ExecutionStore {
   readonly rows = new Map<string, ExecutionRecord>();
+  finishFailures = 0;
 
   async claim(input: ExecutionClaimInput): Promise<ExecutionClaim> {
     const existing =
@@ -333,6 +377,10 @@ class MemoryStore implements ExecutionStore {
   }
 
   async finish(input: FinishExecutionInput): Promise<boolean> {
+    if (this.finishFailures > 0) {
+      this.finishFailures -= 1;
+      return false;
+    }
     const current = this.rows.get(input.invocation_id);
     if (
       current === undefined ||
@@ -359,13 +407,18 @@ class MemoryArtifacts implements ExecutionArtifactStore {
   async write(value: ExecutionArtifact): Promise<ExecutionArtifactRef> {
     this.writes += 1;
     const key = `executions/${value.invocation_id}.json`;
+    const existing = this.values.get(key);
+    if (existing !== undefined) {
+      const existingRef = memoryArtifactRef(key, existing);
+      if (JSON.stringify(existing) === JSON.stringify(value)) return existingRef;
+      throw new ExecutionArtifactConflictError(
+        existingRef,
+        structuredClone(existing),
+      );
+    }
+    const ref = memoryArtifactRef(key, value);
     this.values.set(key, structuredClone(value));
-    return {
-      key,
-      media_type: "application/json",
-      bytes: JSON.stringify(value).length,
-      sha256: `sha256:${"d".repeat(64)}`,
-    };
+    return ref;
   }
 
   async read(ref: ExecutionArtifactRef): Promise<ExecutionArtifact> {
@@ -373,6 +426,18 @@ class MemoryArtifacts implements ExecutionArtifactStore {
     if (value === undefined) throw new Error("missing artifact");
     return structuredClone(value);
   }
+}
+
+function memoryArtifactRef(
+  key: string,
+  value: ExecutionArtifact,
+): ExecutionArtifactRef {
+  return {
+    key,
+    media_type: "application/json",
+    bytes: JSON.stringify(value).length,
+    sha256: `sha256:${"d".repeat(64)}`,
+  };
 }
 
 function deferred<T>(): {

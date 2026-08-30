@@ -29,6 +29,19 @@ export interface ExecutionArtifactStore {
   read(ref: ExecutionArtifactRef): Promise<ExecutionArtifact>;
 }
 
+/** The deterministic key already contains another valid terminal winner. */
+export class ExecutionArtifactConflictError extends Error {
+  readonly existing_ref: ExecutionArtifactRef;
+  readonly existing: ExecutionArtifact;
+
+  constructor(existing_ref: ExecutionArtifactRef, existing: ExecutionArtifact) {
+    super(`immutable execution artifact conflict at ${existing_ref.key}`);
+    this.name = "ExecutionArtifactConflictError";
+    this.existing_ref = existing_ref;
+    this.existing = existing;
+  }
+}
+
 type UsageObserver = (usage: ObjectUsage) => void;
 
 export class R2ExecutionArtifactStore implements ExecutionArtifactStore {
@@ -79,23 +92,45 @@ export class R2ExecutionArtifactStore implements ExecutionArtifactStore {
 
     // An exact retry may race the first immutable put. Verify the winner rather
     // than overwriting it; a changed body at the deterministic key fails loud.
-    let existing: ExecutionArtifact;
+    let existing: { ref: ExecutionArtifactRef; artifact: ExecutionArtifact };
     try {
-      existing = await this.read(ref);
+      existing = await this.readAtKey(key);
     } catch (error) {
       throw new Error(`immutable execution artifact conflict at ${key}`, {
         cause: error,
       });
     }
-    if (JSON.stringify(existing) !== JSON.stringify(artifact)) {
-      throw new Error(`immutable execution artifact conflict at ${key}`);
+    if (
+      existing.artifact.invocation_id !== artifact.invocation_id ||
+      existing.artifact.request_hash !== artifact.request_hash
+    ) {
+      throw new Error(`immutable execution artifact identity mismatch at ${key}`);
     }
-    return ref;
+    if (JSON.stringify(existing.artifact) !== JSON.stringify(artifact)) {
+      throw new ExecutionArtifactConflictError(
+        existing.ref,
+        existing.artifact,
+      );
+    }
+    return existing.ref;
   }
 
   async read(ref: ExecutionArtifactRef): Promise<ExecutionArtifact> {
-    const object = await this.bucket.get(ref.key);
-    if (object === null) throw new Error(`execution artifact missing at ${ref.key}`);
+    const stored = await this.readAtKey(ref.key);
+    if (stored.ref.bytes !== ref.bytes) {
+      throw new Error(`execution artifact byte length mismatch at ${ref.key}`);
+    }
+    if (stored.ref.sha256 !== ref.sha256) {
+      throw new Error(`execution artifact digest mismatch at ${ref.key}`);
+    }
+    return stored.artifact;
+  }
+
+  private async readAtKey(
+    key: string,
+  ): Promise<{ ref: ExecutionArtifactRef; artifact: ExecutionArtifact }> {
+    const object = await this.bucket.get(key);
+    if (object === null) throw new Error(`execution artifact missing at ${key}`);
     const body = new Uint8Array(await object.arrayBuffer());
     this.observeUsage({
       reads: 1,
@@ -103,17 +138,20 @@ export class R2ExecutionArtifactStore implements ExecutionArtifactStore {
       bytes_read: body.byteLength,
       bytes_written: 0,
     });
-    if (body.byteLength !== ref.bytes) {
-      throw new Error(`execution artifact byte length mismatch at ${ref.key}`);
-    }
-    if ((await digestBytes(body)) !== ref.sha256) {
-      throw new Error(`execution artifact digest mismatch at ${ref.key}`);
-    }
+    const sha256 = await digestBytes(body);
     const value: unknown = JSON.parse(new TextDecoder().decode(body));
     if (!isExecutionArtifact(value)) {
-      throw new Error(`execution artifact has invalid shape at ${ref.key}`);
+      throw new Error(`execution artifact has invalid shape at ${key}`);
     }
-    return value;
+    return {
+      ref: {
+        key,
+        media_type: "application/json",
+        bytes: body.byteLength,
+        sha256,
+      },
+      artifact: value,
+    };
   }
 }
 

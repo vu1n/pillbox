@@ -38,6 +38,42 @@ pub(crate) struct RunCostEnvelope {
 }
 
 impl RunCostEnvelope {
+    pub(crate) fn validate_untrusted(&self, terminal_status: &str) -> bool {
+        let Some(infrastructure) = &self.infrastructure else {
+            return false;
+        };
+        self.version == 1
+            && self.status == terminal_status
+            && matches!(
+                self.status.as_str(),
+                "completed" | "failed" | "cancelled" | "interrupted"
+            )
+            && finite_non_negative(self.model.provider_reported_cost_usd)
+            && finite_non_negative(self.known_cost_usd)
+            && finite_non_negative(self.estimated_total_cost_usd)
+            && self.model.input_tokens <= 10_000_000_000
+            && self.model.output_tokens <= 10_000_000_000
+            && self.model.cache_read_input_tokens <= 10_000_000_000
+            && self.model.cache_creation_input_tokens <= 10_000_000_000
+            && infrastructure.d1_rows_read <= 10_000
+            && infrastructure.d1_rows_written <= 10_000
+            && infrastructure.r2_reads <= 1_000
+            && infrastructure.r2_writes <= 1_000
+            && infrastructure.r2_bytes_read <= 1024 * 1024 * 1024
+            && infrastructure.r2_bytes_written <= 1024 * 1024 * 1024
+            && infrastructure.analytics_points_written <= 1
+            && infrastructure.sandbox_duration_ms <= 24 * 60 * 60 * 1_000
+            && self
+                .rate_card_version
+                .as_ref()
+                .is_none_or(|version| !version.is_empty() && version.len() <= 128)
+            && self
+                .infrastructure
+                .as_ref()
+                .and_then(|usage| usage.sandbox_profile.as_ref())
+                .is_none_or(|profile| profile.len() <= 128)
+    }
+
     pub(crate) fn from_events(events: &[Event]) -> Self {
         let mut by_message: BTreeMap<&str, &Usage> = BTreeMap::new();
         let mut managed_envelope = None;
@@ -97,10 +133,18 @@ impl RunCostEnvelope {
         let mut usage_cost = 0.0;
         let mut has_usage_cost = false;
         for usage in by_message.values() {
-            model.input_tokens += usage.input_tokens.unwrap_or(0);
-            model.output_tokens += usage.output_tokens.unwrap_or(0);
-            model.cache_read_input_tokens += usage.cache_read_input_tokens.unwrap_or(0);
-            model.cache_creation_input_tokens += usage.cache_creation_input_tokens.unwrap_or(0);
+            model.input_tokens = model
+                .input_tokens
+                .saturating_add(usage.input_tokens.unwrap_or(0));
+            model.output_tokens = model
+                .output_tokens
+                .saturating_add(usage.output_tokens.unwrap_or(0));
+            model.cache_read_input_tokens = model
+                .cache_read_input_tokens
+                .saturating_add(usage.cache_read_input_tokens.unwrap_or(0));
+            model.cache_creation_input_tokens = model
+                .cache_creation_input_tokens
+                .saturating_add(usage.cache_creation_input_tokens.unwrap_or(0));
             if let Some(cost) = usage.cost_usd {
                 usage_cost += cost.max(0.0);
                 has_usage_cost = true;
@@ -126,6 +170,10 @@ impl RunCostEnvelope {
             rate_card_version: None,
         }
     }
+}
+
+fn finite_non_negative(value: Option<f64>) -> bool {
+    value.is_none_or(|number| number.is_finite() && (0.0..=1_000_000.0).contains(&number))
 }
 
 fn source_rank(source: UsageSource) -> u8 {
@@ -213,5 +261,41 @@ mod tests {
             }),
         );
         assert_eq!(RunCostEnvelope::from_events(&[event]), expected);
+    }
+
+    #[test]
+    fn untrusted_managed_cost_rejects_impossible_ranges() {
+        let mut envelope = RunCostEnvelope {
+            version: 1,
+            status: "completed".into(),
+            model: ModelUsageCost {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                provider_reported_cost_usd: Some(0.01),
+            },
+            infrastructure: Some(InfrastructureUsageCost {
+                d1_rows_read: 1,
+                d1_rows_written: 2,
+                r2_reads: 0,
+                r2_writes: 1,
+                r2_bytes_read: 0,
+                r2_bytes_written: 512,
+                analytics_points_written: 1,
+                sandbox_duration_ms: 50,
+                sandbox_profile: Some("standard-2".into()),
+            }),
+            known_cost_usd: Some(0.01),
+            estimated_total_cost_usd: None,
+            rate_card_version: None,
+        };
+        assert!(envelope.validate_untrusted("completed"));
+        envelope
+            .infrastructure
+            .as_mut()
+            .unwrap()
+            .analytics_points_written = 2;
+        assert!(!envelope.validate_untrusted("completed"));
     }
 }

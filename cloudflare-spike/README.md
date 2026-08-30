@@ -15,6 +15,12 @@ single-controller execution service, not a multiplayer gateway.
 There is no Pillbox-authored Durable Object class, Agents SDK, per-event SQLite
 log, WebSocket replay stream, driver lease, or participant roster.
 
+Public HTTP routes require short-lived HMAC capabilities bound to one operation
+and exact session/invocation id (`MANAGED_CAPABILITY_SECRET`). Huddles uses the
+same-account service binding instead. Public execution is `deny_all`: managed
+runtime tools stay disabled until credentials can be brokered without placing
+provider or workspace secrets in a prompt-controlled process.
+
 ## Checks
 
 ```sh

@@ -62,15 +62,15 @@ export class RunCostMeter {
   private r2BytesWritten = 0;
 
   readonly observeRelational = (usage: RelationalUsage): void => {
-    this.d1RowsRead += usage.rows_read;
-    this.d1RowsWritten += usage.rows_written;
+    this.d1RowsRead = boundedAdd(this.d1RowsRead, usage.rows_read);
+    this.d1RowsWritten = boundedAdd(this.d1RowsWritten, usage.rows_written);
   };
 
   readonly observeObject = (usage: ObjectUsage): void => {
-    this.r2Reads += usage.reads;
-    this.r2Writes += usage.writes;
-    this.r2BytesRead += usage.bytes_read;
-    this.r2BytesWritten += usage.bytes_written;
+    this.r2Reads = boundedAdd(this.r2Reads, usage.reads);
+    this.r2Writes = boundedAdd(this.r2Writes, usage.writes);
+    this.r2BytesRead = boundedAdd(this.r2BytesRead, usage.bytes_read);
+    this.r2BytesWritten = boundedAdd(this.r2BytesWritten, usage.bytes_written);
   };
 
   observeEvidence(events: readonly JsonValue[]): void {
@@ -80,14 +80,21 @@ export class RunCostMeter {
       }
       const payload = event as unknown as Payload;
       if (payload.type !== "usage") continue;
-      this.inputTokens += finiteNonNegative(payload.inputTokens);
-      this.outputTokens += finiteNonNegative(payload.outputTokens);
-      this.cacheReadTokens += finiteNonNegative(payload.cacheReadInputTokens);
-      this.cacheCreationTokens += finiteNonNegative(
-        payload.cacheCreationInputTokens,
+      this.inputTokens = boundedAdd(this.inputTokens, finiteNonNegative(payload.inputTokens));
+      this.outputTokens = boundedAdd(this.outputTokens, finiteNonNegative(payload.outputTokens));
+      this.cacheReadTokens = boundedAdd(
+        this.cacheReadTokens,
+        finiteNonNegative(payload.cacheReadInputTokens),
+      );
+      this.cacheCreationTokens = boundedAdd(
+        this.cacheCreationTokens,
+        finiteNonNegative(payload.cacheCreationInputTokens),
       );
       if (typeof payload.costUsd === "number" && Number.isFinite(payload.costUsd)) {
-        this.providerCostUsd += Math.max(0, payload.costUsd);
+        this.providerCostUsd = Math.min(
+          1_000_000,
+          this.providerCostUsd + Math.max(0, payload.costUsd),
+        );
         this.hasProviderCost = true;
       }
     }
@@ -188,8 +195,12 @@ export class WorkersAnalyticsEngineRunCost implements RunCostAnalytics {
 
 function finiteNonNegative(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value)
-    ? Math.max(0, value)
+    ? Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, value))
     : 0;
+}
+
+function boundedAdd(left: number, right: number): number {
+  return Math.min(Number.MAX_SAFE_INTEGER, left + right);
 }
 
 function isRunCostEnvelope(value: unknown): value is RunCostEnvelope {

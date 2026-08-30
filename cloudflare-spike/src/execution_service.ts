@@ -19,7 +19,11 @@ import type {
   ExecutionArtifact,
   ExecutionArtifactStore,
 } from "./execution_artifacts.js";
-import { ExecutionArtifactConflictError } from "./execution_artifacts.js";
+import {
+  ExecutionArtifactConflictError,
+  MAX_EXECUTION_ARTIFACT_BYTES,
+  MAX_EXECUTION_EVIDENCE_EVENT_BYTES,
+} from "./execution_artifacts.js";
 import type {
   ExecutionClaimInput,
   ExecutionRecord,
@@ -127,7 +131,16 @@ export class ExecutionService {
     }
 
     let turn: RuntimeTurnResult;
-    if (
+    if (request.tool_policy !== "deny_all") {
+      turn = {
+        served_model: null,
+        error: {
+          code: "unsupported_policy",
+          message: "managed execution requires tool_policy 'deny_all' until credentials are brokered",
+        },
+        evidence: [],
+      };
+    } else if (
       request.execution.transport.harness !== "opencode" ||
       request.execution.transport.transport !== "http"
     ) {
@@ -420,6 +433,27 @@ export class OpencodeExecutionRuntime implements ExecutionRuntime {
   async execute(request: ExecuteInvocationV2Request): Promise<RuntimeTurnResult> {
     const evidence: JsonValue[] = [];
     let text = "";
+    let evidenceBytes = 0;
+    let outputBytes = 0;
+    const contentBudget = MAX_EXECUTION_ARTIFACT_BYTES - 64 * 1024;
+    const appendEvidence = (value: JsonValue): void => {
+      const bytes = new TextEncoder().encode(JSON.stringify(value)).byteLength;
+      if (bytes > MAX_EXECUTION_EVIDENCE_EVENT_BYTES) {
+        throw new Error(`managed evidence event exceeds ${MAX_EXECUTION_EVIDENCE_EVENT_BYTES} bytes`);
+      }
+      evidenceBytes += bytes;
+      if (evidenceBytes + outputBytes > contentBudget) {
+        throw new Error(`managed execution content exceeds ${contentBudget} bytes`);
+      }
+      evidence.push(value);
+    };
+    const appendOutput = (value: string): void => {
+      outputBytes += new TextEncoder().encode(value).byteLength;
+      if (evidenceBytes + outputBytes > contentBudget) {
+        throw new Error(`managed execution content exceeds ${contentBudget} bytes`);
+      }
+      text += value;
+    };
     let runtimeError: { code: ExecuteInvocationV2ErrorCode; message: string } | undefined;
     const structured = await driveOpencodeTurn({
       sandbox: await this.options.sandboxFor(request.session_ref.session_id),
@@ -433,9 +467,9 @@ export class OpencodeExecutionRuntime implements ExecutionRuntime {
       config: await this.options.configFor(request),
       sink: {
         appendAgent(payload: Payload) {
-          evidence.push(payload as unknown as JsonValue);
+          appendEvidence(payload as unknown as JsonValue);
           if (payload.type === "message_delta" && typeof payload.text === "string") {
-            text += payload.text;
+            appendOutput(payload.text);
           }
           if (
             payload.type === "attention_required" &&
@@ -451,7 +485,7 @@ export class OpencodeExecutionRuntime implements ExecutionRuntime {
           }
         },
         appendError(message: string) {
-          evidence.push({
+          appendEvidence({
             type: "attention_required",
             reason: "error_stalled",
             message,
@@ -459,7 +493,7 @@ export class OpencodeExecutionRuntime implements ExecutionRuntime {
           runtimeError = { code: "runtime_failed", message };
         },
         appendSystemTool(item) {
-          evidence.push({
+          appendEvidence({
             type: "tool_call",
             toolCallId: `${item.idPrefix}:${evidence.length + 1}`,
             name: item.name,
@@ -474,6 +508,12 @@ export class OpencodeExecutionRuntime implements ExecutionRuntime {
       return { served_model: null, error: runtimeError, evidence };
     }
     const output = structured ?? text;
+    if (structured !== undefined) {
+      outputBytes += new TextEncoder().encode(structured).byteLength;
+      if (evidenceBytes + outputBytes > contentBudget) {
+        throw new Error(`managed execution content exceeds ${contentBudget} bytes`);
+      }
+    }
     if (output.trim().length === 0) {
       return {
         served_model: null,

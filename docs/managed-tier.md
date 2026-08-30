@@ -31,7 +31,7 @@ namespace retirement needs a separate retention/export review.
 ## Execution lifecycle
 
 1. The client snapshots its workspace to its rustic-on-R2 repository and sends
-   scoped, short-lived transfer credentials to
+   scoped, short-lived transfer credentials with an exact provision capability to
    `POST /v2/workspaces/provision`.
 2. `POST /v2/executions` validates and hashes the sealed request.
 3. D1 claims the invocation with a point query/write. Exact retries reuse the
@@ -42,8 +42,9 @@ namespace retirement needs a separate retention/export review.
 5. Pillbox writes one immutable R2 artifact, terminalizes the D1 row, and emits
    at most one best-effort Analytics Engine point.
 6. The client appends returned evidence plus the terminal cost envelope to its
-   ordinary local session log, finalizes the workspace, and records the result
-   snapshot.
+   ordinary local session log. Finalize first stops every prompt-controlled
+   process, then introduces a fresh transfer credential to the helper and records
+   the canonical result snapshot.
 
 The happy-path persistence budget is two D1 writes, one R2 object write, and one
 Analytics Engine point. Status reads are bounded pages of at most 100 events.
@@ -71,8 +72,14 @@ participant identity.
 
 - Foreground execution only; managed detach/reconnect is unsupported.
 - OpenCode over HTTP is the current executable capability.
-- Actor tokens authenticate Worker requests; they do not create participant or
-  driver semantics inside Pillbox.
+- Public HTTP uses short-lived controller capabilities bound to one operation and
+  exact session/invocation id. Huddles uses the trusted same-account service
+  binding and owns participant/driver authorization.
+- Public managed execution is `tool_policy: deny_all`. Tool-enabled execution is
+  disabled until provider and workspace credentials have a brokered boundary;
+  local microVM tools are unaffected.
+- Request bodies are capped at 1 MiB, evidence at 2,000 events / 8 MiB, and
+  responses and cursors are bounded and identity-checked by the CLI.
 - The legacy Huddles `ensureSession`/`invokeSession` RPC methods are stateless
   compatibility adapters over the generic execution service.
 

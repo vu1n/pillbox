@@ -588,8 +588,19 @@ function assertJsonValue(
   value: unknown,
   path: string,
   ancestors = new Set<object>(),
+  state: { nodes: number } = { nodes: 0 },
+  depth = 0,
 ): asserts value is JsonValue {
-  if (value === null || typeof value === "boolean" || typeof value === "string") return;
+  state.nodes += 1;
+  if (state.nodes > 20_000) reject(`${path} exceeds the JSON node limit`);
+  if (depth > 64) reject(`${path} exceeds the JSON depth limit`);
+  if (value === null || typeof value === "boolean") return;
+  if (typeof value === "string") {
+    if (new TextEncoder().encode(value).byteLength > 1024 * 1024) {
+      reject(`${path} exceeds the JSON string limit`);
+    }
+    return;
+  }
   if (typeof value === "number") {
     if (!Number.isFinite(value)) reject(`${path} contains a non-finite number`);
     return;
@@ -611,12 +622,12 @@ function assertJsonValue(
         if (!Object.prototype.hasOwnProperty.call(value, index)) {
           reject(`${path}[${index}] is missing`);
         }
-        assertJsonValue(value[index], `${path}[${index}]`, ancestors);
+        assertJsonValue(value[index], `${path}[${index}]`, ancestors, state, depth + 1);
       }
       return;
     }
     for (const [key, item] of Object.entries(value)) {
-      assertJsonValue(item, `${path}.${key}`, ancestors);
+      assertJsonValue(item, `${path}.${key}`, ancestors, state, depth + 1);
     }
   } finally {
     ancestors.delete(value);

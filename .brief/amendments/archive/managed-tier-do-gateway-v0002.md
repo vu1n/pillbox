@@ -103,3 +103,8 @@ After ratification, the implementation should:
 - **Security:** the amendment narrows Pillbox's authority but does not weaken
   scoped R2 credentials, tool-policy enforcement, actor-independent runtime
   attribution, secret redaction, or default-deny behavior.
+
+
+---
+ratified_rev: 0002
+ratified_by: maintainer

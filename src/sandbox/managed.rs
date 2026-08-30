@@ -676,7 +676,20 @@ mod execution {
     }
 
     fn capped(value: &str) -> &str {
-        value.get(..value.len().min(2048)).unwrap_or(value)
+        let mut end = value.len().min(2048);
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        &value[..end]
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn capped_stops_before_a_split_utf8_character() {
+            let value = format!("{}étail", "a".repeat(2047));
+            assert_eq!(super::capped(&value), "a".repeat(2047));
+        }
     }
 }
 

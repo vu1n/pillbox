@@ -5,7 +5,11 @@ import { test } from "node:test";
 const read = (path) => readFileSync(new URL(path, import.meta.url), "utf8");
 
 test("managed topology binds only Cloudflare Sandbox as a Durable Object", () => {
-  for (const config of [read("./wrangler.toml"), read("./wrangler.container.toml")]) {
+  for (const config of [
+    read("./wrangler.toml"),
+    read("./wrangler.container.toml"),
+    read("./wrangler.runtime-test.toml"),
+  ]) {
     const bindings = [...config.matchAll(/\[\[durable_objects\.bindings\]\][\s\S]*?class_name\s*=\s*"([^"]+)"/g)]
       .map((match) => match[1]);
     assert.deepEqual(bindings, config.includes('name = "Sandbox"') ? ["Sandbox"] : []);

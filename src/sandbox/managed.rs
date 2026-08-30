@@ -25,15 +25,15 @@
 //! result handle. The R2 creds + the repo password travel ONLY in those HTTPS
 //! bodies — never in argv, a log, a §0 event, or the persisted `Session` record
 //! (which holds endpoint + session id + result handle; creds are re-resolved from
-//! env each run). The DO/worker restore+snapshot half is built separately to the
+//! env each run). The Worker/Sandbox restore and snapshot path implements the
 //! same frozen contract (docs/managed-tier.md).
 //!
 //! ## Security boundary implemented
 //!
 //!   - **R2 key scoping.** When `PILLBOX_R2_CF_API_TOKEN` is set, `run` mints a
 //!     short-lived, prefix-scoped R2 temp credential ([`r2_scope`], fresh per
-//!     transfer) and hands the DO *that*, so a credential reaching CF can touch
-//!     only this run's prefix — and the bucket-wide parent *secret* never crosses
+//!     transfer) and hands the managed runtime *that*, so a credential reaching
+//!     CF can touch only this run's prefix — and the bucket-wide parent *secret* never crosses
 //!     to CF (the Bearer API token authorizes the mint). With no token configured
 //!     the parent key still travels, but the exposure is announced loudly rather
 //!     than silently. The DO forwards the credential's `session_token` into the
@@ -400,7 +400,7 @@ impl LiveSession for ManagedLiveSession {
 
 /// What a managed session stores in [`Session::sandbox_id`] (as JSON): the Worker
 /// origin + execution session id. Mirrors libkrun's
-/// `LibkrunHandle` pattern — an opaque, backend-specific handle the plane decodes
+/// `LibkrunHandle` pattern — an opaque, backend-specific handle the runtime decodes
 /// to find the session again. No credential material (the token comes from env).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ManagedHandle {

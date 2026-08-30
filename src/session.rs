@@ -159,11 +159,11 @@ pub(crate) enum Backend {
     /// parent — unlike local Docker, which can't keep a host-side proxy alive).
     Libkrun,
     /// Managed Cloudflare tier — the session runs on a CF container placed by the
-    /// §0-gateway Durable Object, not on this host. `sandbox_id` carries the DO
-    /// base URL + the DO-side session id (a JSON [`ManagedHandle`]); there's no
-    /// local process. Drive (`send`) and read (`subscribe`/`watch`) go over the
-    /// DO's HTTP/WebSocket surface, so attach/teardown route to the DO, never a
-    /// local container/VM. See docs/managed-tier.md + [`crate::sandbox::managed`].
+    /// Cloudflare execution runtime, not on this host. `sandbox_id` carries the
+    /// Worker origin and execution session id (a JSON [`ManagedHandle`]); there's
+    /// no local process. Drive (`send`) uses the Worker's HTTP surface and copies
+    /// returned evidence into the local session log. See docs/managed-tier.md and
+    /// [`crate::sandbox::managed`].
     Managed,
 }
 
@@ -181,7 +181,7 @@ impl Backend {
 /// Where a session physically runs — the dispatch axis attach/reattach/kill key
 /// off (docs/managed-tier.md §`Session` gains a `placement`). A *real* axis, not
 /// display sugar: a `Managed` session has no local sandbox to reach, so the plane
-/// routes its verbs to the §0 gateway DO instead of a local container/VM. Stored
+/// routes its verbs to the Worker instead of a local container/VM. Stored
 /// as a string (not the [`Backend`] label) so a future placement that reuses a
 /// transport — or an old record that predates the field — round-trips cleanly.
 /// `Local` is the default for every record written before this field existed.
@@ -192,9 +192,9 @@ pub(crate) enum Placement {
     /// (and default) case; attach/kill act on the local daemon/VMM directly.
     #[default]
     Local,
-    /// On the managed Cloudflare tier — a CF container behind the §0-gateway DO.
-    /// Attach = re-subscribe to the durable DO log (the session is durable
-    /// server-side); there is no local process to signal or tear down.
+    /// On the managed Cloudflare tier — a bounded turn in Cloudflare Sandbox.
+    /// Returned evidence is copied to the local session log; there is no local
+    /// process to signal or tear down.
     Managed,
 }
 

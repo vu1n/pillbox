@@ -47,6 +47,18 @@ test("cost meter preserves raw usage units and planned terminal operations", () 
   assert.equal(cost.rate_card_version, null);
 });
 
+test("cost meter ignores non-event JSON evidence", () => {
+  const meter = new RunCostMeter();
+  meter.observeEvidence([null, 1, "text", []]);
+  assert.equal(
+    meter.terminal("completed", {
+      sandbox_duration_ms: 0,
+      sandbox_profile: null,
+    }).model.input_tokens,
+    0,
+  );
+});
+
 test("artifact cost sealing converges on its exact serialized byte count", () => {
   const meter = new RunCostMeter();
   const artifact: ExecutionArtifact = {

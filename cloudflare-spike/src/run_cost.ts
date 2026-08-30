@@ -75,6 +75,9 @@ export class RunCostMeter {
 
   observeEvidence(events: readonly JsonValue[]): void {
     for (const event of events) {
+      if (typeof event !== "object" || event === null || Array.isArray(event)) {
+        continue;
+      }
       const payload = event as unknown as Payload;
       if (payload.type !== "usage") continue;
       this.inputTokens += finiteNonNegative(payload.inputTokens);

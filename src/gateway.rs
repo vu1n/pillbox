@@ -62,9 +62,8 @@ pub(crate) fn serve_session_ws(
                 continue;
             }
         };
-        // A fresh read source per connection — each subscriber tails from its own
-        // seq. The placement (local file vs managed DO WebSocket) is chosen by
-        // `open_event_source`, so a managed-tier subscriber relays from the DO.
+        // A fresh read source per connection — each subscriber tails the local
+        // session log from its own sequence number.
         let source = match open_event_source(pb, session_id) {
             Ok(source) => source,
             Err(e) => {
@@ -101,7 +100,8 @@ fn serve_one(stream: TcpStream, source: Box<dyn EventSource + Send>, from: u64, 
             Err(_) => true,
         },
     );
-    // A source error (e.g. the managed DO was unreachable) shouldn't be silent —
+    // A source error (for example, the local log becoming unreadable) shouldn't
+    // be silent —
     // the client already sees the closed socket; log so the operator can tell
     // "upstream failed" from "no events yet".
     if let Err(e) = relay {

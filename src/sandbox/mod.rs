@@ -150,10 +150,10 @@ pub(crate) trait LiveSession {
 /// opt-out via `PILLBOX_BACKEND=docker`. A build without the feature is always
 /// Docker (libkrun isn't compiled in).
 pub(crate) fn select_backend() -> Box<dyn SandboxBackend> {
-    // `PILLBOX_BACKEND=managed` opts into the managed Cloudflare tier (the §0
-    // gateway DO + a CF container). It needs no host capability, so it's
+    // `PILLBOX_BACKEND=managed` opts into the managed Cloudflare execution
+    // runtime. It needs no host capability, so it's
     // selectable on any build — but it requires the managed config env
-    // (`PILLBOX_MANAGED_DO_URL`, …); the backend itself reports the gap if it's
+    // (`PILLBOX_MANAGED_URL`, …); the backend itself reports the gap if it's
     // selected without it. Checked before the local-backend split so it wins on
     // every build.
     if std::env::var_os("PILLBOX_BACKEND").is_some_and(|v| v == "managed") {
@@ -300,14 +300,14 @@ mod tests {
     }
 
     #[test]
-    fn live_session_dispatches_managed_to_the_do_plane() {
+    fn live_session_dispatches_managed_to_the_execution_runtime() {
         use crate::session::{Placement, BACKEND_MANAGED};
         let mut s = Session::test_fixture();
         s.backend = BACKEND_MANAGED.to_string();
         s.placement = Placement::Managed;
         let live = live_session(&s).expect("managed session resolves on every build");
-        // Managed is server-mode (structured agent drive + DO read), with no host
-        // PTY — the honest profile the plane gates verbs on.
+        // Managed is server-mode (structured execution plus evidence retrieval),
+        // with no host PTY — the honest profile the plane gates verbs on.
         assert!(live.caps().server_mode);
         assert!(!live.caps().pty_drive);
     }

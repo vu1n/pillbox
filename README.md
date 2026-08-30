@@ -28,11 +28,12 @@ agents, IDEs, and orchestrators can replay, drive, annotate, and hand off. We
 call that stream **§0**: the session's source of truth for messages, tool calls,
 inputs, actors, checkpoints, and externally verified results.
 
-The same contract has two placements:
+The runtime has two placements:
 
-- **Cloudflare managed (experimental):** one Durable Object per session is the
-  sequencer, actor authority, driver arbiter, replay store, and fan-out point. A
-  Cloudflare Container runs the agent.
+- **Cloudflare managed (experimental):** a Worker runs one bounded turn in
+  Cloudflare Sandbox. D1 stores the claim and terminal state, R2 stores one
+  immutable evidence artifact, and the caller appends that evidence to its
+  local §0 log. Huddles owns multiplayer collaboration.
 - **Local (working alpha):** a libkrun microVM runs the agent on your machine,
   with a local §0 log, credential broker, encrypted snapshots, detach/reattach,
   and verified workspace handoffs.

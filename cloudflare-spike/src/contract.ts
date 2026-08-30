@@ -6,7 +6,7 @@
 // forward-compat.
 export interface Event {
   // ── envelope fields that ARE in contract.rs::Event ──
-  seq: number; // monotonic per SESSION, gateway-assigned. 0 = unassigned on submit (Rust: Event::session sets 0).
+  seq: number; // monotonic per session; 0 is unassigned before trusted local ingestion (Rust: Event::session sets 0).
   sessionId: string; // partition key (contract.rs: the durable identity)
   at: string; // RFC3339
   ephemeral?: boolean; // contract.rs: `ephemeral` bool, default false / omitted; seq 0, excluded from replay
@@ -25,8 +25,8 @@ export interface Event {
   idempotencyKey?: string; // per-event append dedup on retry. Spec'd; not in contract.rs (only on RPCs).
 }
 
-// docs/session-event-log.md §Actor model. Stamped by the gateway from a verified
-// token (src/auth.ts), never self-reported by the producer — the trust boundary.
+// docs/session-event-log.md §Actor model. Stamped at trusted ingestion from a
+// verified identity, never self-reported by the producer — the trust boundary.
 // Mirrors contract.rs::Actor.
 export interface Actor {
   kind: "human" | "agent" | "system" | "service";
@@ -54,7 +54,7 @@ export type Payload =
   // §Multiplayer driver arbitration: who currently holds the single driver slot.
   // Spec'd in session-event-log.md, not (yet) in contract.rs::Payload. `to` is
   // optional because `released` clears the driver (no successor); the *event* actor
-  // is the gateway (system), not the new driver.
+  // is the collaboration authority (system), not the new driver.
   | { type: "driver_changed"; from?: Actor; to?: Actor; mode: "granted" | "requested" | "stolen" | "released" }
   // in contract.rs::Payload (field shapes match the Rust structs):
   // The agent-output stream the OpencodeMapper emits (consume path). message_start/

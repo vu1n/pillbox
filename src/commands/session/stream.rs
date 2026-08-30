@@ -81,10 +81,8 @@ pub(super) fn session_subscribe(
             .ok()
             .filter(|u| !u.is_empty())
         {
-            // NOTE: local-only — the webhook exporter tails the local file log,
-            // not the managed DO source. Under managed placement it would see an
-            // empty local log; migrating it (and `wait-idle`) to open_event_source
-            // needs a last_seq on the EventSource trait. Deferred follow-up.
+            // The webhook exporter tails the local file log. Managed execution
+            // copies its bounded evidence into that same log before returning.
             if let Ok(elog) = crate::events::log::SessionLog::open(resolved, &sid) {
                 crate::events::spawn_webhook_log_exporter(elog, url);
             }
@@ -98,8 +96,7 @@ pub(super) fn session_watch(resolved: &Pillbox, id: &str, from: u64) -> Result<(
     use std::sync::atomic::AtomicBool;
     let (sid, _tailer) = resolve_streaming_session(resolved, id)?;
     eprintln!("pillbox: watching session {sid} (Ctrl-C to stop)");
-    // Read through the placement swap point: the local file by default, the
-    // managed DO WebSocket when the managed tier is on.
+    // All placements expose their evidence through the local session log.
     let source = crate::events::source::open_event_source(resolved, &sid)?;
     // Never set: Ctrl-C ends the process; `_tailer` lives until then.
     let stop = AtomicBool::new(false);
@@ -293,9 +290,9 @@ pub(super) fn session_guard(
          {}); Ctrl-C to stop",
         if kill { "armed: --kill" } else { "dry-run" }
     );
-    // Read through the placement swap point (local file or managed DO), like
-    // `watch`. Subscribe from the current head — a breaker reacts to NEW
-    // pathology, not a past one (mirrors the webhook exporter's `last_seq + 1`).
+    // Subscribe to the local session log from the current head — a breaker reacts
+    // to NEW pathology, not a past one (mirrors the webhook exporter's
+    // `last_seq + 1`).
     let from = crate::events::log::SessionLog::open(resolved, &sid)?.last_seq() + 1;
     let source = crate::events::source::open_event_source(resolved, &sid)?;
 
@@ -315,7 +312,7 @@ pub(super) fn session_guard(
     let reason = match tripped {
         Some(r) => r,
         None => {
-            // The stream ended (managed DO close / EOF) without a trip.
+            // The local stream ended without a trip.
             eprintln!("pillbox: guard on session `{sid}` ended without tripping");
             return Ok(());
         }

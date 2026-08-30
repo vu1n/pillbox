@@ -324,6 +324,13 @@ pub(crate) enum SessionAction {
         #[arg(long)]
         json: bool,
     },
+    /// Summarize a session's model usage and any managed infrastructure cost
+    /// envelope. Provider-reported spend is never presented as an all-in total.
+    Cost {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Reattach to a detached session. Streams the session's PTY back
     /// into the current terminal. Detach again with Ctrl-A + D or by
     /// running `pillbox session detach <id>` from another shell.

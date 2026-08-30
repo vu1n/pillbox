@@ -1,3 +1,5 @@
+import type { RunCostEnvelope } from "./run_cost.js";
+
 export type JsonPrimitive = null | boolean | number | string;
 export type JsonValue =
   | JsonPrimitive
@@ -128,6 +130,7 @@ interface ExecuteInvocationV2ResultBase {
   };
   readonly attribution: ExecutionAttribution;
   readonly evidence: ExecutionEvidencePage;
+  readonly cost?: RunCostEnvelope;
 }
 
 export type ExecuteInvocationV2Result =

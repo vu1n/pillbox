@@ -25,6 +25,10 @@ import type {
   ExecutionStore,
   FinishExecutionInput,
 } from "./src/execution_store.ts";
+import {
+  RunCostMeter,
+  type RunCostAnalyticsPoint,
+} from "./src/run_cost.ts";
 
 registerHooks({
   resolve(specifier, context, nextResolve) {
@@ -84,29 +88,46 @@ async function request(
 test("created execution persists terminal evidence and exact retry does not resample", async () => {
   const store = new MemoryStore();
   const artifacts = new MemoryArtifacts();
+  const analytics: RunCostAnalyticsPoint[] = [];
   const runtime = new FakeRuntime({
     served_model: "zai-coding-plan/glm-4.5-air",
     output: { json: { ok: true } },
     evidence: [
       { type: "message_start", messageId: "m1" },
       { type: "message_delta", messageId: "m1", text: "done" },
+      {
+        type: "usage",
+        messageId: "m1",
+        inputTokens: 10,
+        outputTokens: 2,
+        costUsd: 0.001,
+        source: "native",
+      },
     ],
   });
-  const service = new ExecutionService(store, artifacts, runtime, fixedOptions());
+  const service = new ExecutionService(store, artifacts, runtime, {
+    ...fixedOptions(),
+    costMeter: new RunCostMeter(),
+    analytics: { emit: (point) => analytics.push(point) },
+    sandboxProfile: "standard-2",
+  });
   const input = await request();
 
   const created = await service.executeInvocation(input);
   assert.equal(created.status, "completed");
   assert.equal(created.disposition, "created");
   assert.equal(created.attribution.harness, "opencode");
-  assert.equal(created.evidence.events.length, 2);
+  assert.equal(created.evidence.events.length, 3);
   assert.ok(created.evidence.artifact_ref);
+  assert.equal(created.cost?.model.provider_reported_cost_usd, 0.001);
+  assert.equal(created.cost?.infrastructure.analytics_points_written, 1);
 
   const reused = await service.executeInvocation(input);
   assert.equal(reused.status, "completed");
   assert.equal(reused.disposition, "reused");
   assert.equal(runtime.executions, 1);
   assert.equal(artifacts.writes, 1);
+  assert.equal(analytics.length, 1);
 });
 
 test("changed content conflicts without crossing into the runtime", async () => {

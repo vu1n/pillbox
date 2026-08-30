@@ -111,6 +111,7 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> 
         SessionAction::List { json } => session_list(resolved, json),
         SessionAction::Info { id, json } => session_info(resolved, &id, json),
         SessionAction::Diagnose { id, json } => session_diagnose(resolved, &id, json),
+        SessionAction::Cost { id, json } => session_cost(resolved, &id, json),
         SessionAction::Attach { id } => session_attach(resolved, &id),
         SessionAction::Detach { id } => session_detach(resolved, &id),
         SessionAction::Rm { id } => session_rm(resolved, &id),
@@ -186,6 +187,35 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> 
         } => session_transcript(&file, &session_id, agent, follow),
         SessionAction::Artifact { action } => session_artifact(resolved, action),
     }
+}
+
+fn session_cost(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
+    let session = session::resolve(resolved, id)?;
+    let log = crate::events::log::SessionLog::open(resolved, &session.id)?;
+    let summary = crate::cost::RunCostEnvelope::from_events(&log.read_from(0)?);
+    if json {
+        println!("{}", serde_json::to_string(&summary)?);
+        return Ok(());
+    }
+
+    println!("session: {}", session.id);
+    println!("status: {}", summary.status);
+    println!(
+        "tokens: input={} output={} cache_read={} cache_create={}",
+        summary.model.input_tokens,
+        summary.model.output_tokens,
+        summary.model.cache_read_input_tokens,
+        summary.model.cache_creation_input_tokens,
+    );
+    match summary.known_cost_usd {
+        Some(cost) => println!("provider-reported cost: ${cost:.6}"),
+        None => println!("provider-reported cost: unavailable"),
+    }
+    if summary.infrastructure.is_none() {
+        println!("infrastructure usage: unavailable for this local log");
+    }
+    println!("estimated total cost: unavailable (no versioned rate card)");
+    Ok(())
 }
 
 fn session_transcript(

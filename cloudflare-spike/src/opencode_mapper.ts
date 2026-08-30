@@ -64,11 +64,13 @@ function usageFromStep(part: any): Payload | null {
   const output = num(tokens, "output");
   const cacheRead = num(cache, "read");
   const cacheCreation = num(cache, "write");
+  const costUsd = num(part, "cost");
   if (
     input === undefined &&
     output === undefined &&
     cacheRead === undefined &&
-    cacheCreation === undefined
+    cacheCreation === undefined &&
+    costUsd === undefined
   ) {
     return null;
   }
@@ -80,6 +82,7 @@ function usageFromStep(part: any): Payload | null {
     ...(output !== undefined ? { outputTokens: output } : {}),
     ...(cacheRead !== undefined ? { cacheReadInputTokens: cacheRead } : {}),
     ...(cacheCreation !== undefined ? { cacheCreationInputTokens: cacheCreation } : {}),
+    ...(costUsd !== undefined ? { costUsd } : {}),
   };
 }
 

@@ -14,6 +14,7 @@ export interface ExecutionArtifact {
   readonly request_hash: InvocationRequestHash;
   readonly terminal_result: JsonValue;
   readonly evidence: readonly JsonValue[];
+  readonly cost?: JsonValue;
 }
 
 export interface ObjectUsage {

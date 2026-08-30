@@ -65,7 +65,7 @@ export type Payload =
   | { type: "message_end"; messageId: string; model?: string; stopReason?: string }
   | { type: "thinking"; text: string }
   | { type: "tool_call"; toolCallId: string; name: string; status: string; input?: unknown; output?: string; title?: string }
-  | { type: "usage"; messageId: string; inputTokens?: number; outputTokens?: number; cacheReadInputTokens?: number; cacheCreationInputTokens?: number; source: string }
+  | { type: "usage"; messageId: string; inputTokens?: number; outputTokens?: number; cacheReadInputTokens?: number; cacheCreationInputTokens?: number; costUsd?: number; source: string }
   | { type: "attention_required"; reason: string; message: string }
   // catch-all == contract.rs Payload::Unknown (any unmodeled `type`):
   | { type: string; [k: string]: unknown };

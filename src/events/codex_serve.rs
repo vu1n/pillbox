@@ -337,6 +337,7 @@ fn usage_from_breakdown(message_id: &str, b: &Value) -> Option<Usage> {
         output_tokens: output,
         cache_read_input_tokens: cached,
         cache_creation_input_tokens: None,
+        cost_usd: None,
         source: UsageSource::Native,
     })
 }

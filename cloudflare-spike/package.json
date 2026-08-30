@@ -5,7 +5,6 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "smoke": "node smoke.mjs",
     "test": "node --test *.test.ts *.test.mjs",
     "smoke:ensure": "node --test ensure_session.test.mjs",
     "deploy": "wrangler deploy",
@@ -13,9 +12,8 @@
     "check:contract": "npm run gen:contract && git diff --exit-code src/contract.generated.ts"
   },
   "dependencies": {
-    "@cloudflare/sandbox": "^0.11.0",
     "@cfworker/json-schema": "^4.1.1",
-    "agents": "^0.10.2"
+    "@cloudflare/sandbox": "^0.11.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260601.0",

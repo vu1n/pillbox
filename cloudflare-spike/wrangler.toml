@@ -1,13 +1,10 @@
 name = "pillbox-do-spike"
 main = "src/worker.ts"
 compatibility_date = "2026-06-01"
-# The Agents SDK imports node built-ins; nodejs_compat is required.
+# Sandbox SDK dependencies use Node compatibility shims.
 compatibility_flags = ["nodejs_compat"]
-# Free-tier deploy: the §0 gateway only — no container. SQLite-backed DOs run on
-# the Workers free plan (proven: this worker + the SessionGateway DO uploaded
-# fine on a free account; only the container step needs Workers Paid). The full
-# container path lives in wrangler.container.toml (deploy with `-c`). `/input`
-# degrades to append-only when there's no Sandbox binding (see session_gateway).
+# Contract-only deploy: D1/R2 execution lifecycle without a container binding.
+# The full execution path lives in wrangler.container.toml (deploy with `-c`).
 workers_dev = true
 
 [[d1_databases]]
@@ -24,17 +21,13 @@ bucket_name = "pillbox-execution-evidence-preview"
 binding = "RUN_COSTS"
 dataset = "pillbox_execution_run_costs_preview"
 
-# The per-session §0 gateway. routeAgentRequest resolves
-# /agents/session-gateway/<sessionId>/*.
-[[durable_objects.bindings]]
-name = "SessionGateway"
-class_name = "SessionGateway"
-
 # Sandbox is registered in the migration (worker.ts exports the class) but NOT
 # bound and NOT given a container here — so nothing is instantiated and the free
 # tier provisions no container. The container config adds the binding + [[containers]].
 [[migrations]]
 tag = "v1"
+# Historical migration record. SessionGateway is deliberately not bound or
+# exported; deleting its existing namespace/data is a separate retention review.
 new_sqlite_classes = ["SessionGateway", "Sandbox"]
 
 [observability]

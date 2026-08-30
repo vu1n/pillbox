@@ -189,7 +189,7 @@ export function canonicalJson(value: JsonValue): string {
 }
 
 /** A canonical tuple keeps arbitrary opaque IDs from creating ambiguous names. */
-export async function deriveSessionGatewayName(
+export async function deriveExecutionSessionName(
   workspaceId: string,
   effectId: string,
 ): Promise<string> {
@@ -199,7 +199,8 @@ export async function deriveSessionGatewayName(
 /**
  * Private same-account RPC surface for Huddles. There is deliberately no HTTP
  * ensure route: WorkerEntrypoint methods are reachable only through a service
- * binding, while durable binding state belongs to SessionGateway.
+ * binding. Session identity is a deterministic projection; it is not a remote
+ * mutable session authority.
  */
 export class HuddlesRuntimeEntrypoint extends WorkerEntrypoint<Env> {
   async executeInvocation(request: ExecuteInvocationV2Request) {
@@ -218,7 +219,7 @@ export class HuddlesRuntimeEntrypoint extends WorkerEntrypoint<Env> {
     request: EnsureSessionRequest,
   ): Promise<EnsureSessionResult> {
     const validated = validateEnsureSessionRequest(request);
-    const sessionId = await deriveSessionGatewayName(
+    const sessionId = await deriveExecutionSessionName(
       validated.workspace_id,
       validated.effect_id,
     );
@@ -239,7 +240,7 @@ export class HuddlesRuntimeEntrypoint extends WorkerEntrypoint<Env> {
     request: InvokeSessionRequest,
   ): Promise<InvokeSessionResult> {
     const validated = await validateInvokeSessionRequest(request);
-    const expectedSessionId = await deriveSessionGatewayName(
+    const expectedSessionId = await deriveExecutionSessionName(
       validated.workspace_id,
       validated.effect_id,
     );

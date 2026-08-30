@@ -404,15 +404,9 @@ impl SandboxBackend for DockerBackend {
         // sandbox-side. See spawn_session_observability for the
         // include_usage / MITM-double-count reasoning.
         let proxy_active = opts.vault || any_vaulted;
-        // Open the durable per-session §0 sink (the spine's first producer)
-        // through the placement swap point: the local file-backed log by default,
-        // or the managed Durable Object when the managed tier is on (env-gated in
-        // `open_event_log`). The agent's $HOME is host-bind-mounted, so the
-        // transcript is always written host-side; the default placement tails it
-        // into ~/.pillbox's log.jsonl, the managed placement streams it to the DO.
-        // Best-effort (`open_or_warn`): a sink-open failure falls back to OTLP-only
-        // rather than aborting the run.
-        let log = crate::events::sink::open_or_warn(resolved, &session_id);
+        // Open the durable local §0 log. A failure stays loud but falls back to
+        // OTLP-only observability rather than aborting the run.
+        let log = crate::events::log::SessionLog::open_or_warn(resolved, &session_id);
         let tailer = crate::events::transcripts::spawn_session_observability(
             log,
             &session_id,

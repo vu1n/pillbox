@@ -105,8 +105,6 @@ mod jsonl;
 pub(crate) mod log;
 pub(crate) mod opencode;
 mod otel;
-pub(crate) mod sink;
-pub(crate) mod source;
 pub(crate) mod status;
 pub(crate) mod transcripts;
 mod webhook;

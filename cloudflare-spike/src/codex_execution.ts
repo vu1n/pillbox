@@ -629,8 +629,8 @@ function isJsonObject(value: unknown): value is Record<string, JsonValue> {
   return prototype === Object.prototype || prototype === null;
 }
 
-/** Byte-for-byte mirror of the repository's canonicalJson helper. */
-function canonicalJson(value: JsonValue): string {
+/** Deterministic JSON encoding shared by request hashing and compatibility adapters. */
+export function canonicalJson(value: JsonValue): string {
   if (value === null || typeof value === "boolean" || typeof value === "string") {
     return JSON.stringify(value);
   }

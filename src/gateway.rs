@@ -24,7 +24,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tungstenite::Message;
 
-use crate::events::source::{open_event_source, EventSource};
+use crate::events::log::SessionLog;
 use crate::pillbox::Pillbox;
 
 /// Default bind: an ephemeral localhost port (printed on start). Zero-config —
@@ -64,7 +64,7 @@ pub(crate) fn serve_session_ws(
         };
         // A fresh read source per connection — each subscriber tails the local
         // session log from its own sequence number.
-        let source = match open_event_source(pb, session_id) {
+        let source = match SessionLog::open(pb, session_id) {
             Ok(source) => source,
             Err(e) => {
                 eprintln!("pillbox: warning: open session event source failed: {e:#}");
@@ -86,20 +86,16 @@ pub(crate) fn serve_session_ws(
 /// reaped until the next event, since disconnect is detected on send. Fine
 /// while a live session is producing events; a ping/read-side keepalive is the
 /// follow-up for idle-subscriber reaping.
-fn serve_one(stream: TcpStream, source: Box<dyn EventSource + Send>, from: u64, stop: &AtomicBool) {
+fn serve_one(stream: TcpStream, source: SessionLog, from: u64, stop: &AtomicBool) {
     let mut ws = match tungstenite::accept(stream) {
         Ok(ws) => ws,
         Err(_) => return, // not a WS client / handshake failed — drop it
     };
-    let relay = source.subscribe(
-        from,
-        stop,
-        &mut |event| match serde_json::to_string(event) {
-            Ok(json) => ws.send(Message::Text(json.into())).is_ok(),
-            // An event we somehow can't serialize shouldn't kill the stream; skip it.
-            Err(_) => true,
-        },
-    );
+    let relay = source.subscribe(from, stop, |event| match serde_json::to_string(event) {
+        Ok(json) => ws.send(Message::Text(json.into())).is_ok(),
+        // An event we somehow can't serialize shouldn't kill the stream; skip it.
+        Err(_) => true,
+    });
     // A source error (for example, the local log becoming unreadable) shouldn't
     // be silent —
     // the client already sees the closed socket; log so the operator can tell
@@ -155,7 +151,7 @@ mod tests {
             let server_stop = Arc::clone(&stop);
             let server = std::thread::spawn(move || {
                 let (stream, _) = listener.accept().unwrap();
-                serve_one(stream, Box::new(server_log), 0, &server_stop);
+                serve_one(stream, server_log, 0, &server_stop);
             });
 
             let (mut client, _) = tungstenite::connect(format!("ws://{addr}")).unwrap();

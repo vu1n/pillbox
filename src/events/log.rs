@@ -79,6 +79,19 @@ impl SessionLog {
         Self::open_at(crate::session::session_dir(pb, session_id)?)
     }
 
+    /// Open the local session log without making observability a run blocker.
+    /// Transcript capture is best-effort: a failure stays loud, then callers may
+    /// continue with OTLP-only observability.
+    pub(crate) fn open_or_warn(pb: &Pillbox, session_id: &str) -> Option<Self> {
+        match Self::open(pb, session_id) {
+            Ok(log) => Some(log),
+            Err(error) => {
+                eprintln!("pillbox: warning: couldn't open session log: {error:#}");
+                None
+            }
+        }
+    }
+
     /// Open the log at an already-resolved session directory — for a caller that
     /// has the path but not a [`Pillbox`] (the detached §0 producer, re-exec'd as
     /// a bare subprocess, is handed the dir on argv). Same seq recovery as `open`.
@@ -112,7 +125,7 @@ impl SessionLog {
     /// append; fine at per-session scale — the byte-offset incremental read is the
     /// deferred optimization, same as `subscribe`. The cross-process single-writer
     /// coordination this lock provides is the cheap stand-in for the resident
-    /// sequencer / `EventLog` trait.)
+    /// sequencer.)
     // Context: doc://pillbox/session-event-log-spine@0001#session-event-log-spine
     pub(crate) fn append(&mut self, events: &[Event]) -> Result<u64> {
         if events.is_empty() {

@@ -674,14 +674,9 @@ fn session_send(resolved: &Pillbox, id: &str, text: &str) -> Result<()> {
 /// steer. Best-effort + loud: the steer already succeeded, so a §0 logging failure
 /// is a warning, not a command failure.
 ///
-/// CAVEAT (the seq-authority fault line): this opens a *fresh* [`SessionLog`], which
-/// recovers `last_seq` from the file — a SECOND writer. If a `subscribe`/`watch`
-/// tailer is concurrently appending agent output to the same `log.jsonl` from
-/// another process (the Docker driven-session workflow), the two can assign the
-/// same `seq` (no cross-process lock), degrading a subscriber's `--from`/resume
-/// (dup/skip) — bytes stay intact (whole-line `O_APPEND`). libkrun is safe (one
-/// detached producer). The real fix is single-writer coordination / a resident
-/// sequencer (the deferred EventLog work); acceptable best-effort until then.
+/// This opens a fresh [`SessionLog`] and may write concurrently with a transcript
+/// tailer. [`SessionLog::append`] serializes those writers with its file lock and
+/// re-reads the durable maximum sequence under that lock.
 fn record_input(
     resolved: &Pillbox,
     session_id: &str,

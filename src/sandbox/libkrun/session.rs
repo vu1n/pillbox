@@ -100,11 +100,10 @@ impl SandboxBackend for LibkrunBackend {
 
         // §0: tail the agent's transcript from the host-side creds clone into the
         // durable §0 sink (the same producer docker uses; no guest emitter).
-        // `open_or_warn` picks the placement — local file by default, managed
-        // Durable Object when the managed tier is on — and falls back to OTLP-only
-        // if the open fails. Spawned before the child so it's ready when the agent
+        // A local log-open failure stays loud but falls back to OTLP-only
+        // observability. Spawned before the child so it's ready when the agent
         // first writes.
-        let log = crate::events::sink::open_or_warn(resolved, &session_id);
+        let log = crate::events::log::SessionLog::open_or_warn(resolved, &session_id);
         let tailer = crate::events::transcripts::spawn_session_observability(
             log,
             &session_id,

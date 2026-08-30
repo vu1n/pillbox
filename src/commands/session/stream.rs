@@ -97,11 +97,11 @@ pub(super) fn session_watch(resolved: &Pillbox, id: &str, from: u64) -> Result<(
     let (sid, _tailer) = resolve_streaming_session(resolved, id)?;
     eprintln!("pillbox: watching session {sid} (Ctrl-C to stop)");
     // All placements expose their evidence through the local session log.
-    let source = crate::events::source::open_event_source(resolved, &sid)?;
+    let source = crate::events::log::SessionLog::open(resolved, &sid)?;
     // Never set: Ctrl-C ends the process; `_tailer` lives until then.
     let stop = AtomicBool::new(false);
     let mut role = crate::contract::Role::Unspecified;
-    source.subscribe(from, &stop, &mut |ev| {
+    source.subscribe(from, &stop, |ev| {
         render_watch_event(ev, &mut role);
         true
     })
@@ -294,14 +294,14 @@ pub(super) fn session_guard(
     // to NEW pathology, not a past one (mirrors the webhook exporter's
     // `last_seq + 1`).
     let from = crate::events::log::SessionLog::open(resolved, &sid)?.last_seq() + 1;
-    let source = crate::events::source::open_event_source(resolved, &sid)?;
+    let source = crate::events::log::SessionLog::open(resolved, &sid)?;
 
     let mut detector = PathologyDetector::new(max_repeats, max_tokens);
     let mut tripped: Option<String> = None;
     // Never set in-process: Ctrl-C ends the process; the sink ends the loop on a
     // trip by returning `false`. `_tailer` lives until then.
     let stop = AtomicBool::new(false);
-    source.subscribe(from, &stop, &mut |ev| match detector.observe(ev) {
+    source.subscribe(from, &stop, |ev| match detector.observe(ev) {
         Some(reason) => {
             tripped = Some(reason);
             false // stop subscribing — we've seen the pathology

@@ -5,6 +5,9 @@ CREATE TABLE execution (
   execution_digest TEXT NOT NULL,
   execution_policy_revision TEXT NOT NULL,
   session_id TEXT NOT NULL,
+  harness TEXT NOT NULL,
+  transport TEXT NOT NULL,
+  requested_model TEXT NOT NULL,
   status TEXT NOT NULL CHECK (
     status IN ('running', 'completed', 'failed', 'cancelled', 'interrupted')
   ),

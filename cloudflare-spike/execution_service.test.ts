@@ -294,7 +294,10 @@ class FakeRuntime implements ExecutionRuntime {
     return this.result;
   }
 
-  async cancel(_request: CancelInvocationV2Request): Promise<void> {
+  async cancel(
+    _request: CancelInvocationV2Request,
+    _session_id: string,
+  ): Promise<void> {
     this.cancellations += 1;
   }
 }

@@ -3,8 +3,11 @@ import { proxyToSandbox, type Sandbox } from "@cloudflare/sandbox";
 import { SessionGateway } from "./session_gateway.js";
 import {
   HuddlesRuntimeEntrypoint,
+  executionService,
   isHuddlesSessionName,
 } from "./huddles_runtime.js";
+import { bearerToken, verifyActorToken } from "./auth.js";
+import { safeHuddlesRuntimeDiagnostic } from "./huddles_policy.js";
 
 export { SessionGateway };
 // Named entrypoint: Huddles reaches ensureSession through a same-account
@@ -16,6 +19,9 @@ export { Sandbox } from "@cloudflare/sandbox";
 export interface Env {
   // The §0 gateway Agent (kebab-class `session-gateway` in the route).
   SessionGateway: DurableObjectNamespace<SessionGateway>;
+  EXECUTION_DB: D1Database;
+  EXECUTION_EVIDENCE: R2Bucket;
+  RUN_COSTS?: AnalyticsEngineDataset;
   // The Sandbox SDK's container DO — OPTIONAL: present only in the container
   // config (wrangler.container.toml). Absent in the free/§0-only deploy.
   Sandbox?: DurableObjectNamespace<Sandbox>;
@@ -38,10 +44,13 @@ export interface Env {
   OPENCODE_CONFIG_JSON?: string;
   // Default model (`provider/modelID`) when an /input doesn't carry one.
   OPENCODE_MODEL?: string;
+  SANDBOX_PROFILE?: string;
 }
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
+    const executionResponse = await routeExecutionRequest(req, env);
+    if (executionResponse !== null) return executionResponse;
     const requirePublicSession: NonNullable<
       AgentOptions<Env>["onBeforeRequest"]
     > = async (_request, lobby) => {
@@ -75,3 +84,60 @@ export default {
     );
   },
 };
+
+async function routeExecutionRequest(
+  request: Request,
+  env: Env,
+): Promise<Response | null> {
+  const path = new URL(request.url).pathname;
+  const operation =
+    path === "/v2/executions"
+      ? "execute"
+      : path === "/v2/executions/status"
+        ? "status"
+        : path === "/v2/executions/cancel"
+          ? "cancel"
+          : null;
+  if (operation === null) return null;
+  if (request.method !== "POST") {
+    return new Response("method not allowed\n", {
+      status: 405,
+      headers: { allow: "POST" },
+    });
+  }
+  const token = bearerToken(request);
+  if (
+    env.ACTOR_TOKEN_SECRET === undefined ||
+    token === null ||
+    (await verifyActorToken(token, env.ACTOR_TOKEN_SECRET)) === null
+  ) {
+    return Response.json({ error: { code: "unauthenticated" } }, { status: 401 });
+  }
+  try {
+    const body = await request.json();
+    const service = executionService(env);
+    const result =
+      operation === "execute"
+        ? await service.executeInvocation(body)
+        : operation === "status"
+          ? await service.getExecutionStatus(body)
+          : await service.cancelInvocation(body);
+    return Response.json(result, {
+      status: result.status === "running" ? 202 : result.status === "conflict" ? 409 : 200,
+    });
+  } catch (cause) {
+    const code =
+      typeof cause === "object" && cause !== null && "code" in cause
+        ? String(cause.code)
+        : "managed_execution_failed";
+    return Response.json(
+      {
+        error: {
+          code,
+          message: safeHuddlesRuntimeDiagnostic(cause),
+        },
+      },
+      { status: code === "execution_not_found" ? 404 : 400 },
+    );
+  }
+}

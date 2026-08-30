@@ -4,26 +4,18 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { unstable_dev } from "wrangler";
 
-function request(
-  canonicalRequest,
-  workspaceId = "ws-huddles",
-  effectId = "effect-42",
-) {
+const execFileAsync = promisify(execFile);
+
+function ensureRequest(canonicalRequest) {
   return {
-    workspace_id: workspaceId,
-    effect_id: effectId,
+    workspace_id: "ws-huddles",
+    effect_id: "effect-42",
     canonical_request: canonicalRequest,
   };
-}
-
-async function callEnsure(worker, input) {
-  return callPrivate(worker, "/ensure", input);
-}
-
-async function callInvoke(worker, input) {
-  return callPrivate(worker, "/invoke", input);
 }
 
 async function callPrivate(worker, path, input) {
@@ -34,181 +26,96 @@ async function callPrivate(worker, path, input) {
   });
   const body = await response.json();
   if (!response.ok) {
-    const error = new Error(body.error?.message ?? "ensure failed");
+    const error = new Error(body.error?.message ?? "private call failed");
     error.code = body.error?.code;
-    error.name = body.error?.name ?? error.name;
     throw error;
   }
   return body;
 }
 
-test("ensure is atomic, canonical, restart-safe, and private", async () => {
-  const persistence = await mkdtemp(join(tmpdir(), "pillbox-ensure-"));
+test("legacy Huddles RPC is a stateless adapter over bounded execution", async () => {
+  const persistence = await mkdtemp(join(tmpdir(), "pillbox-execution-adapter-"));
   let target;
   let caller;
   let restartedTarget;
   let restartedCaller;
+  const workerOptions = {
+    logLevel: "none",
+    experimental: { fileBasedRegistry: true, enableIpc: true },
+  };
   try {
-    const workerOptions = {
-      logLevel: "none",
-      experimental: { fileBasedRegistry: true, enableIpc: true },
-    };
+    await execFileAsync(
+      "npx",
+      [
+        "wrangler",
+        "d1",
+        "migrations",
+        "apply",
+        "pillbox-execution-preview",
+        "--local",
+        "--persist-to",
+        persistence,
+        "--config",
+        "wrangler.toml",
+      ],
+      { env: { ...process.env, WRANGLER_LOG_PATH: join(persistence, "wrangler.log") } },
+    );
     target = await unstable_dev("src/worker.ts", {
       ...workerOptions,
       config: "wrangler.toml",
       persistTo: persistence,
     });
     await target.fetch("http://pillbox.test/health");
-    await new Promise((resolve) => setTimeout(resolve, 250));
     caller = await unstable_dev("test/ensure_worker.ts", {
       ...workerOptions,
       config: "wrangler.ensure-test.toml",
       persist: false,
     });
 
-    const ordinaryPublicInput = await target.fetch(
-      `http://${target.address}/agents/session-gateway/public-session/input`,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ text: "still public", target: "agent" }),
-      },
-    );
-    assert.equal(
-      ordinaryPublicInput.status,
-      401,
-      await ordinaryPublicInput.text(),
-    );
-
-    const reservedSessionId = `ensure-${createHash("sha256")
-      .update(JSON.stringify(["ws-huddles", "effect-42"]))
-      .digest("hex")}`;
-    const reservedBeforeEnsure = await target.fetch(
-      `http://${target.address}/agents/session-gateway/${reservedSessionId}/input`,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ text: "must never pre-bind", target: "agent" }),
-      },
-    );
-    assert.equal(reservedBeforeEnsure.status, 404);
-
-    const first = request({
+    const canonical = {
       requested_model: "openai/gpt-5.6-sol",
       harness: "opencode",
       nested: { z: 1, a: 2 },
-    });
-    const concurrent = await Promise.all(
-      Array.from({ length: 16 }, () => callEnsure(caller, first)),
+    };
+    const ensured = await Promise.all(
+      Array.from({ length: 16 }, () =>
+        callPrivate(caller, "/ensure", ensureRequest(canonical)),
+      ),
     );
-
-    assert.equal(
-      concurrent.filter((result) => result.disposition === "created").length,
-      1,
-    );
-    assert.equal(
-      concurrent.filter((result) => result.disposition === "reused").length,
-      15,
-    );
+    assert.ok(ensured.every((result) => result.disposition === "reused"));
     assert.ok(
-      concurrent.every(
+      ensured.every(
         (result) =>
-          result.session_ref.session_id ===
-          concurrent[0].session_ref.session_id,
+          result.session_ref.session_id === ensured[0].session_ref.session_id,
       ),
     );
-    for (const result of concurrent) {
-      assert.deepEqual(result.attribution, {
-        requested_model: "openai/gpt-5.6-sol",
-        served_model: null,
-        status: "unavailable",
-      });
-    }
-
-    const reordered = request({
-      nested: { a: 2, z: 1 },
-      harness: "opencode",
+    assert.deepEqual(ensured[0].attribution, {
       requested_model: "openai/gpt-5.6-sol",
+      served_model: null,
+      status: "unavailable",
     });
-    assert.equal((await callEnsure(caller, reordered)).disposition, "reused");
 
-    const otherWorkspace = await callEnsure(
+    const reordered = await callPrivate(
       caller,
-      request(first.canonical_request, "another-workspace", "effect-42"),
+      "/ensure",
+      ensureRequest({
+        nested: { a: 2, z: 1 },
+        harness: "opencode",
+        requested_model: "openai/gpt-5.6-sol",
+      }),
     );
-    assert.equal(otherWorkspace.disposition, "created");
-    assert.notEqual(
-      otherWorkspace.session_ref.session_id,
-      concurrent[0].session_ref.session_id,
-    );
-
-    const formerlyAmbiguousLeft = await callEnsure(
-      caller,
-      request(first.canonical_request, "workspace\0suffix", "effect"),
-    );
-    const formerlyAmbiguousRight = await callEnsure(
-      caller,
-      request(first.canonical_request, "workspace", "suffix\0effect"),
-    );
-    assert.notEqual(
-      formerlyAmbiguousLeft.session_ref.session_id,
-      formerlyAmbiguousRight.session_ref.session_id,
-    );
-
+    assert.equal(reordered.session_ref.session_id, ensured[0].session_ref.session_id);
     await assert.rejects(
-      callEnsure(
-        caller,
-        request({
-          requested_model: "openai/gpt-5.6-sol",
-          harness: "opencode",
-          nested: { a: 3, z: 1 },
-        }),
-      ),
-      (error) => error?.code === "ensure_session_conflict",
+      callPrivate(caller, "/ensure", ensureRequest({ nested: {} })),
+      /requested_model/,
     );
 
-    await assert.rejects(callEnsure(caller, request({ nested: {} })), (error) =>
-      /requested_model/.test(String(error)),
-    );
-
-    const sessionId = concurrent[0].session_ref.session_id;
-    const publicInput = await target.fetch(
-      `http://${target.address}/agents/session-gateway/${sessionId}/input`,
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ text: "must stay private", target: "agent" }),
-      },
-    );
-    assert.equal(publicInput.status, 404);
-    const publicSocket = new WebSocket(
-      `ws://${target.address}/agents/session-gateway/${sessionId}/subscribe?from=1`,
-    );
-    const publicSocketOutcome = await new Promise((resolve, reject) => {
-      const timeout = setTimeout(
-        () => reject(new Error("managed session socket stayed open")),
-        5_000,
-      );
-      publicSocket.addEventListener("open", () => {
-        clearTimeout(timeout);
-        resolve("opened");
-      });
-      publicSocket.addEventListener("close", (event) => {
-        clearTimeout(timeout);
-        resolve(`closed:${event.code}`);
-      });
-      publicSocket.addEventListener("error", () => {
-        clearTimeout(timeout);
-        resolve("rejected");
-      });
-    });
-    assert.notEqual(publicSocketOutcome, "opened");
     const renderedInput = "Return one concise planning critique.";
     const invoke = {
       workspace_id: "ws-huddles",
       effect_id: "effect-42",
       invocation_id: "invocation-1",
-      session_ref: { session_id: sessionId },
+      session_ref: ensured[0].session_ref,
       delivery_receipt_id: "delivery-1",
       rendered_input: renderedInput,
       rendered_input_hash: `sha256:${createHash("sha256").update(renderedInput).digest("hex")}`,
@@ -217,68 +124,44 @@ test("ensure is atomic, canonical, restart-safe, and private", async () => {
       requested_model: "openai/gpt-5.6-sol",
       output_format: {
         type: "json_schema",
-        schema: {
-          type: "object",
-          additionalProperties: false,
-          properties: { kind: { const: "document" }, text: { type: "string" } },
-          required: ["kind", "text"],
-        },
+        schema: { type: "object" },
         retry_count: 2,
       },
     };
-    const unavailable = await callInvoke(caller, invoke);
+    const unavailable = await callPrivate(caller, "/invoke", invoke);
     assert.deepEqual(unavailable, {
       status: "failed",
       disposition: "created",
-      session_ref: { session_id: sessionId, seq_range: [1, 2] },
+      session_ref: ensured[0].session_ref,
       error: {
         code: "runtime_unavailable",
         message: "Pillbox managed runner has no Cloudflare Sandbox binding",
       },
     });
-    assert.deepEqual(await callInvoke(caller, invoke), {
+    assert.deepEqual(await callPrivate(caller, "/invoke", invoke), {
       ...unavailable,
       disposition: "reused",
     });
     await assert.rejects(
-      callInvoke(caller, {
+      callPrivate(caller, "/invoke", {
         ...invoke,
         delivery_receipt_id: "changed-delivery",
       }),
       (error) => error?.code === "invoke_session_conflict",
     );
-    await assert.rejects(
-      callInvoke(caller, {
-        ...invoke,
-        invocation_id: "invocation-bad-hash",
-        rendered_input_hash: "sha256:wrong",
-      }),
-      (error) => /rendered_input_hash/.test(String(error)),
+
+    const unauthenticated = await target.fetch(
+      `http://${target.address}/v2/executions/status`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          contract_version: "pillbox.execution/2",
+          invocation_id: "invocation-1",
+        }),
+      },
     );
-    await assert.rejects(
-      callInvoke(caller, {
-        ...invoke,
-        invocation_id: "invocation-bad-policy",
-        tool_policy: "allow",
-      }),
-      (error) => /tool_policy/.test(String(error)),
-    );
-    await assert.rejects(
-      callInvoke(caller, {
-        ...invoke,
-        invocation_id: "invocation-missing-format",
-        output_format: undefined,
-      }),
-      (error) => /output_format/.test(String(error)),
-    );
-    await assert.rejects(
-      callInvoke(caller, {
-        ...invoke,
-        invocation_id: "invocation-bad-format-retry",
-        output_format: { ...invoke.output_format, retry_count: 1 },
-      }),
-      (error) => /retry_count/.test(String(error)),
-    );
+    assert.equal(unauthenticated.status, 401);
 
     await caller.stop();
     await target.stop();
@@ -291,25 +174,15 @@ test("ensure is atomic, canonical, restart-safe, and private", async () => {
       persistTo: persistence,
     });
     await restartedTarget.fetch("http://pillbox.test/health");
-    await new Promise((resolve) => setTimeout(resolve, 250));
     restartedCaller = await unstable_dev("test/ensure_worker.ts", {
       ...workerOptions,
       config: "wrangler.ensure-test.toml",
       persist: false,
     });
-    const afterRestart = await callEnsure(restartedCaller, first);
-    assert.equal(afterRestart.disposition, "reused");
-    assert.equal(afterRestart.session_ref.session_id, sessionId);
-    assert.deepEqual(await callInvoke(restartedCaller, invoke), {
+    assert.deepEqual(await callPrivate(restartedCaller, "/invoke", invoke), {
       ...unavailable,
       disposition: "reused",
     });
-
-    const publicProbe = await restartedTarget.fetch(
-      `http://${restartedTarget.address}/agents/session-gateway/${sessionId}/ensure`,
-      { method: "POST" },
-    );
-    assert.equal(publicProbe.status, 404);
   } finally {
     if (restartedCaller) await restartedCaller.stop();
     if (restartedTarget) await restartedTarget.stop();

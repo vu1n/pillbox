@@ -1,5 +1,6 @@
 import type {
   ExecutionArtifactRef,
+  ExecutionAttribution,
   ExecutionDigest,
   InvocationRequestHash,
 } from "./codex_execution.js";
@@ -18,6 +19,7 @@ export interface ExecutionRecord {
   readonly execution_digest: ExecutionDigest;
   readonly execution_policy_revision: string;
   readonly session_id: string;
+  readonly attribution: ExecutionAttribution;
   readonly status: ExecutionStatus;
   readonly owner_token: string;
   readonly lease_expires_at_ms: number;
@@ -33,6 +35,7 @@ export interface ExecutionClaimInput {
   readonly execution_digest: ExecutionDigest;
   readonly execution_policy_revision: string;
   readonly session_id: string;
+  readonly attribution: ExecutionAttribution;
   readonly owner_token: string;
   readonly now_ms: number;
   readonly lease_expires_at_ms: number;
@@ -91,6 +94,9 @@ interface ExecutionRow {
   execution_digest: ExecutionDigest;
   execution_policy_revision: string;
   session_id: string;
+  harness: ExecutionAttribution["harness"];
+  transport: string;
+  requested_model: string;
   status: ExecutionStatus;
   owner_token: string;
   lease_expires_at_ms: number;
@@ -104,7 +110,8 @@ interface ExecutionRow {
 
 const SELECT_COLUMNS = `
   invocation_id, idempotency_key, request_hash, execution_digest,
-  execution_policy_revision, session_id, status, owner_token,
+  execution_policy_revision, session_id, harness, transport, requested_model,
+  status, owner_token,
   lease_expires_at_ms, created_at_ms, updated_at_ms,
   artifact_key, artifact_media_type, artifact_bytes, artifact_sha256
 `;
@@ -128,9 +135,10 @@ export class D1ExecutionStore implements ExecutionStore {
     const inserted = await this.run(
       `INSERT OR IGNORE INTO execution (
         invocation_id, idempotency_key, request_hash, execution_digest,
-        execution_policy_revision, session_id, status, owner_token,
+        execution_policy_revision, session_id, harness, transport,
+        requested_model, status, owner_token,
         lease_expires_at_ms, created_at_ms, updated_at_ms
-      ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?)`,
       [
         input.invocation_id,
         input.idempotency_key,
@@ -138,6 +146,9 @@ export class D1ExecutionStore implements ExecutionStore {
         input.execution_digest,
         input.execution_policy_revision,
         input.session_id,
+        input.attribution.harness,
+        input.attribution.transport,
+        input.attribution.requested_model,
         input.owner_token,
         input.lease_expires_at_ms,
         input.now_ms,
@@ -244,6 +255,7 @@ function recordFromClaim(input: ExecutionClaimInput): ExecutionRecord {
     execution_digest: input.execution_digest,
     execution_policy_revision: input.execution_policy_revision,
     session_id: input.session_id,
+    attribution: input.attribution,
     status: "running",
     owner_token: input.owner_token,
     lease_expires_at_ms: input.lease_expires_at_ms,
@@ -272,6 +284,12 @@ function recordFromRow(row: ExecutionRow): ExecutionRecord {
     execution_digest: row.execution_digest,
     execution_policy_revision: row.execution_policy_revision,
     session_id: row.session_id,
+    attribution: {
+      harness: row.harness,
+      transport: row.transport,
+      requested_model: row.requested_model,
+      served_model: null,
+    },
     status: row.status,
     owner_token: row.owner_token,
     lease_expires_at_ms: row.lease_expires_at_ms,

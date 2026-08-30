@@ -56,13 +56,13 @@ test("legacy Huddles RPC is a stateless adapter over bounded execution", async (
         "--persist-to",
         persistence,
         "--config",
-        "wrangler.toml",
+        "wrangler.runtime-test.toml",
       ],
       { env: { ...process.env, WRANGLER_LOG_PATH: join(persistence, "wrangler.log") } },
     );
     target = await unstable_dev("src/worker.ts", {
       ...workerOptions,
-      config: "wrangler.toml",
+      config: "wrangler.runtime-test.toml",
       persistTo: persistence,
     });
     await target.fetch("http://pillbox.test/health");
@@ -170,7 +170,7 @@ test("legacy Huddles RPC is a stateless adapter over bounded execution", async (
 
     restartedTarget = await unstable_dev("src/worker.ts", {
       ...workerOptions,
-      config: "wrangler.toml",
+      config: "wrangler.runtime-test.toml",
       persistTo: persistence,
     });
     await restartedTarget.fetch("http://pillbox.test/health");

@@ -67,4 +67,4 @@ libkrun-is-the-backend conforms: rustfmt-only whitespace in libkrun session stru
 agent-io-pty-free-contract conforms: rustfmt-only whitespace in cursor harness; adapter vocabulary unchanged.
 libkrun-env-fork-substrate conforms: rustfmt-only whitespace in structured launch; CoW fork/env substrate unchanged.
 workspace-ingest-sovereignty conforms: rustfmt-only whitespace in session.rs; ingest denylist untouched.
-managed-tier-do-gateway amend-proposed: move multiplayer gateway ownership to Huddles and narrow Pillbox managed state to single-controller execution identity, results, and artifacts.
+managed-tier-do-gateway conforms: v0002 removes the custom SessionGateway and remote §0 placement; Huddles owns collaboration while Pillbox persists bounded D1 claims, one immutable R2 evidence object, one terminal analytics point, and uses only Cloudflare Sandbox's vendor-owned DO.

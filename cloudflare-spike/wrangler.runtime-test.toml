@@ -1,0 +1,18 @@
+name = "pillbox-do-spike"
+main = "src/worker.ts"
+compatibility_date = "2026-06-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "EXECUTION_DB"
+database_name = "pillbox-execution-preview"
+database_id = "2bdaab2a-d0df-48cd-8fb5-fd4feeab091b"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "EXECUTION_EVIDENCE"
+bucket_name = "pillbox-execution-evidence-preview"
+
+[[analytics_engine_datasets]]
+binding = "RUN_COSTS"
+dataset = "pillbox_execution_run_costs_preview"

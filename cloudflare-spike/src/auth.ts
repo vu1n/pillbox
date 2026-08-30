@@ -1,23 +1,19 @@
-// A verifiable actor credential — the trust boundary for §0 attribution.
+// A verifiable actor credential for managed Worker authentication.
 //
 // The issuer (the control plane / orchestrator) signs an `Actor` claim with a
-// shared secret; the DO verifies it server-side and stamps the *verified* actor
-// onto the event. An in-sandbox agent (or any caller) can't forge one without the
-// secret, so `actor` is attested, never self-reported — exactly the property
-// session-event-log.md §Actor model requires for authz to key off it.
+// shared secret; the Worker verifies it before execution or workspace access.
+// Huddles, not Pillbox, owns participant identity and collaborative authz.
 //
 // Token = `base64url(claimJson).base64url(HMAC-SHA256(claimJson))`. HMAC (not a
 // bearer→identity lookup) keeps the spike self-contained — no auth-provider
 // round-trip — while still being unforgeable. A managed tier swaps this for
-// control-plane-minted tokens bound to the principal; the verify-and-stamp shape
-// here is unchanged.
+// control-plane-minted tokens bound to the principal.
 import type { Actor } from "./contract.js";
 
 const enc = new TextEncoder();
 // The kinds a *token* may assert. `system` is deliberately excluded: it's the
-// gateway's own identity (stamped directly as SYSTEM_ACTOR for lifecycle /
-// arbitration / exec events), so a token that claims it would let any holder
-// forge gateway-authored events. human/agent/service are the legitimate
+// runtime's own identity, so a token that claims it would let any holder forge
+// runtime-authored evidence. human/agent/service are the legitimate
 // token-borne principals.
 const TOKEN_KINDS = new Set(["human", "agent", "service"]);
 

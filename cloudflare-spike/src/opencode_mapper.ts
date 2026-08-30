@@ -1,5 +1,5 @@
 // Port of pillbox/src/events/opencode.rs::EventMapper to TypeScript, for the
-// managed-tier §0 gateway's **consume path** (docs/managed-tier.md §Consume path).
+// managed execution runtime's bounded evidence path.
 //
 // One instance per session stream. `onEvent` maps a single opencode `/event`
 // envelope into zero or more §0 [`Payload`]s, which the bounded execution

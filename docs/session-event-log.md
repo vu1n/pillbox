@@ -1,7 +1,8 @@
 # Session event log (vNext keystone)
 
-Status: **partially built** (2026-05-31) — the local-substrate core is shipped
-+ live-verified; the unification + multiplayer envelope below are still design.
+Status: **local substrate built** (updated 2026-08-31). The local event spine is
+Pillbox-owned. Multiplayer sequencing and authenticated participant semantics
+belong to Huddles and are not a managed Pillbox storage placement.
 
 - **Built:** `src/events/log.rs::SessionLog` — per-session `log.jsonl`,
   per-session monotonic seq (the log is the **co-located single-writer**
@@ -26,10 +27,7 @@ Status: **partially built** (2026-05-31) — the local-substrate core is shipped
   intuitive producer-side push-bus + `EventType`-fold (the file is the
   cross-process IPC; network on the append path stalls the agent; the fold
   pulls in the deferred host↔sandbox seq handoff).
-- **Deferred (the unification this doc specs):** *gateway-authenticated* actor +
-  gateway-assigned seq (the `actor` field shipped, but it is **producer-stamped
-  locally**, not authenticated at a network boundary; driver-token arbitration is
-  designed, not built); folding the lifecycle stream
+- **Deferred (local unification only):** folding the lifecycle stream
   (`events/mod.rs` / `events.jsonl`) into the log (still a separate stream — the
   next step is to make `events.jsonl` a read-side **projection**, then defer the
   full `EventType`→`Payload` fold until multiplayer needs the unified actor/seq
@@ -168,16 +166,11 @@ requirement — retrofitting normalization after the schema sets is expensive.
 
 **Trust boundary.** Unlike today's `emitter` tag (`host`/`sandbox`), which the
 code explicitly says is *not* an access-control signal (anything that can write
-the env can set it), `actor` is **stamped by the gateway from the
-authenticated connection**, never self-reported by the producer. Authz
-(who may drive / approve / join) keys off `actor`, so it must be authenticated.
-Managed orchestrator bindings may impose a stricter read boundary than an
-ordinary session. In particular, a SessionGateway bound by Huddles is private:
-public HTTP drive and WebSocket replay are disabled because its log may contain
-visibility-scoped HCP input and derived model output. Evidence access must use a
-private, policy-preserving adapter rather than possession of the session name.
-The deterministic Huddles session-name namespace is private before binding too;
-the public router never allows those names to initialize a gateway.
+the env can set it), the local `actor` field is attribution, not a multiplayer
+authorization boundary. Huddles authenticates participants and owns any policy
+about who may drive, approve, join, read, or replay collaborative activity.
+Managed Pillbox returns bounded runtime evidence through authenticated execution
+requests; it does not expose a remote session log.
 
 ## Payload taxonomy
 
@@ -259,22 +252,13 @@ this way without inlining it into the transcript or being compiled into pillbox.
 
 ## Sequencing & ordering
 
-- **Co-located case (ship first):** one sequencer per session = the session
-  gateway/broker. Co-located producers *submit*; the gateway assigns `seq` on
-  append → total order, deterministic replay. The multi-writer problem is easy
-  **only here**.
-- **Managed-placement disconnect case (future; hard — defer + scope):** when the
-  producer is in a remote placement (the managed tier) and the host gateway can
-  disconnect, the placement-side `seq` is provisional and must be reconciled —
-  that is distributed total-order-under-partition, the hardest form; it does
-  **not** "disappear." Until reconciliation is designed, **gate managed-tier
-  multiplayer on host-side-only sequencing** and document that a host disconnect
-  drops the ordering authority. (Both local backends are co-located, so this case
-  does not arise today.)
-- **No sequencer exists today.** `EventEmitter` assigns `seq` per-*emitter*
-  (resets to 1 per run/exec). §0 must make the gateway the sole seq authority
-  and define how host- and sandbox-side lifecycle events (both emit
-  `session.started` today) get a seq without gaps/dupes.
+- **Co-located case:** `SessionLog::append` holds the local file lock and assigns
+  per-session `seq` → total order and deterministic local replay.
+- **Managed execution:** runtime evidence arrives as one bounded response/page
+  set and is appended to the local log. There is no remote seq authority or
+  attach/detach handoff to reconcile.
+- **Multiplayer:** Huddles owns collaborative order. If it projects activity into
+  Pillbox evidence, the projection must not turn Pillbox into another authority.
 - **Ephemeral** (`seq 0` / `ephemeral:true`) bypasses the log — live-only
   telemetry (cards, phase flicker). Existing semantics, preserved.
 - **Idempotency:** add a per-event `idempotencyKey` to the `LogEvent` envelope

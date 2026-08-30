@@ -21,9 +21,9 @@ broad-compat):
 
 - **libkrun = the local compute substrate.** It is the default build and owns
   local isolation, PTY handoff, real egress fencing, and in-sandbox grading.
-- **Cloudflare = managed placement.** A per-session Durable Object owns §0
-  sequencing, actor attestation, arbitration, and fan-out; a Cloudflare
-  Container runs the agent. The foreground backend is implemented.
+- **Cloudflare = managed execution placement.** Cloudflare Sandbox's vendor DO
+  owns container lifecycle; D1/R2 hold bounded claims/evidence; the caller's
+  local `SessionLog` remains §0. The foreground backend is implemented.
 - **Docker agent backend = deprecated.** Docker is still used to materialize the
   libkrun OCI rootfs and for auth plumbing while those dependencies are ported.
   That does not make it a co-equal backend.
@@ -40,14 +40,14 @@ points; command handlers no longer grow backend-specific match arms.
 
 | Family | Transport | Members | Drive/read mechanics |
 |---|---|---|---|
-| **Managed container** | HTTP/WS through a per-session DO; container FS is server-side | **Cloudflare Containers/Sandbox** | structured drive + §0 replay/tail |
+| **Managed container** | bounded HTTP execution; container FS is server-side | **Cloudflare Containers/Sandbox** | structured drive + bounded evidence response |
 | **MicroVM** | vsock into an HVF/KVM microVM; FS opaque to the guest | **libkrun** (local) | PTY/server drive + local §0 |
 | **Deprecated container** | exec + PTY into a local OCI container | Docker agent backend (pending deletion) | compatibility residue only |
 
 Two more axes are **already abstracted** and stay as-is — orthogonal to this work:
 
-- **Placement** (local file ↔ managed DO): `EventSource` / `sink::EventLog`
-  (`src/events/source.rs`, `src/events/sink.rs`).
+- **Event placement:** `EventSource` / `sink::EventLog` are local-only; managed
+  evidence is appended after a bounded execution response.
 - **Agent integration** (`Pty` ↔ `Server`): `Integration` + `ServerProfile`
   (`src/agents/mod.rs:52`), already a single source of truth incl. a
   `libkrun_only` capability bit.
@@ -150,7 +150,8 @@ libkrun PTY parity, CF) builds on it.
       *(End of spine: one plane, dispatch deleted, behavior unchanged.)*
 - [ ] **Phase 3 — flip default.** `select_backend()` defaults to libkrun (where available); docker recast in docs/`doctor` as the container-family compat backend, not the default. Rework `doctor` (it probes the Docker daemon + image, `src/doctor.rs:134`) so a libkrun-default host isn't told "Docker not running."
 - [ ] **Phase 4 — fill libkrun+PTY drive (in scope; see below).** vsock `send` + live transcript tailing for claude/codex/pi on libkrun, so `Caps{ pty_drive, live_pty_tail }` flip true. This is the IDE/ADE surface — required, not optional.
-- [ ] **Phase 5 — later, separate plan.** CF Containers backend = one new `LiveSession` impl in the container family; reuse `SandboxHttp` + `ManagedDoSource`. Out of scope here; the spine makes it a one-handler add.
+- [x] **Phase 5 — experimental.** CF Sandbox backend = one `LiveSession` impl
+  using bounded HTTP execution; returned evidence is appended to local §0.
 
 ## Phase 4 detail: libkrun + PTY drive (the IDE surface)
 

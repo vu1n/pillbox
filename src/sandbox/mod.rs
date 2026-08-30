@@ -118,7 +118,7 @@ pub(crate) trait LiveSession {
     fn caps(&self) -> Caps;
 
     /// Drive: push bytes to the agent (PTY input / server prompt). `caps().pty_drive`.
-    fn send(&self, bytes: &[u8]) -> Result<()>;
+    fn send(&self, resolved: &Pillbox, bytes: &[u8]) -> Result<()>;
 
     /// Reattach a terminal to this session.
     fn attach(&self, resolved: &Pillbox) -> Result<()>;

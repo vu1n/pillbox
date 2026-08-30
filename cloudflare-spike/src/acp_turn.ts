@@ -206,6 +206,13 @@ export class AcpTurnDriver {
         await this.beginCancellation(active);
         return cancelled(attribution, active.cancellation_error);
       }
+      if (active.request.output_format.type !== "json_schema") {
+        return failure(
+          "runtime_failed",
+          "ACP adapter requires json_schema output",
+          attribution,
+        );
+      }
       const output = inspectRawStructuredOutput(
         prompted.output === undefined ? undefined : JSON.stringify(prompted.output),
         active.request.output_format.schema,

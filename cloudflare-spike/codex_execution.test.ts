@@ -96,6 +96,22 @@ test("valid Codex app-server execution envelope validates", async () => {
   assert.deepEqual(validateSupportedCodexExecution(validated.execution), codexExecution);
 });
 
+test("single-controller CLI turns may use runtime tools and text output", async () => {
+  const request = await validRequest({
+    tool_policy: "runtime_default",
+    output_format: { type: "text", retry_count: 0 },
+    execution: {
+      ...codexExecution,
+      transport: {
+        ...codexExecution.transport,
+        harness: "opencode",
+        transport: "http",
+      },
+    },
+  });
+  assert.deepEqual(await validateExecuteInvocationV2Request(request), request);
+});
+
 test("broad non-Codex execution validates, then fails the Codex capability check", async () => {
   const request = await validRequest({
     execution: {

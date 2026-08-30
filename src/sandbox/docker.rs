@@ -696,7 +696,7 @@ impl super::LiveSession for DockerLiveSession {
         DockerBackend.capabilities()
     }
 
-    fn send(&self, bytes: &[u8]) -> Result<()> {
+    fn send(&self, _resolved: &Pillbox, bytes: &[u8]) -> Result<()> {
         // A server agent's turn is a structured prompt over its HTTP API; a PTY
         // agent's is raw keystrokes. Both flow through this one `send` so the
         // command layer never branches on integration.

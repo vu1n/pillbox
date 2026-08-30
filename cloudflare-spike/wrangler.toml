@@ -10,6 +10,20 @@ compatibility_flags = ["nodejs_compat"]
 # degrades to append-only when there's no Sandbox binding (see session_gateway).
 workers_dev = true
 
+[[d1_databases]]
+binding = "EXECUTION_DB"
+database_name = "pillbox-execution-preview"
+database_id = "2bdaab2a-d0df-48cd-8fb5-fd4feeab091b"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "EXECUTION_EVIDENCE"
+bucket_name = "pillbox-execution-evidence-preview"
+
+[[analytics_engine_datasets]]
+binding = "RUN_COSTS"
+dataset = "pillbox_execution_run_costs_preview"
+
 # The per-session §0 gateway. routeAgentRequest resolves
 # /agents/session-gateway/<sessionId>/*.
 [[durable_objects.bindings]]

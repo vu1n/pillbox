@@ -48,7 +48,7 @@ export interface RuntimeTurnResult {
 
 export interface ExecutionRuntime {
   execute(request: ExecuteInvocationV2Request): Promise<RuntimeTurnResult>;
-  cancel(request: CancelInvocationV2Request): Promise<void>;
+  cancel(request: CancelInvocationV2Request, session_id: string): Promise<void>;
 }
 
 export interface ExecutionServiceOptions {
@@ -180,7 +180,7 @@ export class ExecutionService {
         limit: MAX_EVIDENCE_PAGE_SIZE,
       });
     }
-    await this.runtime.cancel(request);
+    await this.runtime.cancel(request, record.session_id);
     const result = await this.finishTerminal(
       record,
       {
@@ -371,11 +371,12 @@ export class ExecutionService {
         emptyEvidence(0),
         "reused",
       ),
-      request_hash: requestedHash,
       status: "conflict",
       error: {
         code: "idempotency_conflict",
         message: "invocation or idempotency key is already bound to different content",
+        existing_request_hash: record.request_hash,
+        requested_request_hash: requestedHash,
       },
     };
   }
@@ -477,8 +478,11 @@ export class OpencodeExecutionRuntime implements ExecutionRuntime {
     };
   }
 
-  async cancel(request: CancelInvocationV2Request): Promise<void> {
-    const sandbox = await this.options.sandboxFor(request.invocation_id);
+  async cancel(
+    _request: CancelInvocationV2Request,
+    session_id: string,
+  ): Promise<void> {
+    const sandbox = await this.options.sandboxFor(session_id);
     await sandbox.killAllProcesses();
   }
 }

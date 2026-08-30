@@ -75,6 +75,7 @@ export type ExecuteInvocationV2ErrorCode =
   | "unsupported_execution"
   | "unsupported_policy"
   | "auth_unavailable"
+  | "runtime_unavailable"
   | "runtime_busy"
   | "runtime_interrupted"
   | "runtime_failed"
@@ -146,10 +147,19 @@ export type ExecuteInvocationV2Result =
       };
     })
   | (ExecuteInvocationV2ResultBase & {
-      readonly status: "failed" | "cancelled" | "interrupted" | "conflict";
+      readonly status: "failed" | "cancelled" | "interrupted";
       readonly error: {
         readonly code: ExecuteInvocationV2ErrorCode;
         readonly message: string;
+      };
+    })
+  | (ExecuteInvocationV2ResultBase & {
+      readonly status: "conflict";
+      readonly error: {
+        readonly code: "idempotency_conflict";
+        readonly message: string;
+        readonly existing_request_hash: InvocationRequestHash;
+        readonly requested_request_hash: InvocationRequestHash;
       };
     });
 

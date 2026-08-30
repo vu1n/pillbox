@@ -1,6 +1,35 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
+import { getSandbox } from "@cloudflare/sandbox";
 import { sha256Hex } from "./runtime_identity.js";
 import type { Env } from "./worker.js";
+import {
+  type CancelInvocationV2Request,
+  type ExecuteInvocationV2Request,
+  type GetInvocationV2Request,
+} from "./codex_execution.js";
+import {
+  D1ExecutionStore,
+  type RelationalDatabase,
+} from "./execution_store.js";
+import { R2ExecutionArtifactStore } from "./execution_artifacts.js";
+import {
+  ExecutionService,
+  OpencodeExecutionRuntime,
+  type ExecutionRuntime,
+} from "./execution_service.js";
+import {
+  RunCostMeter,
+  WorkersAnalyticsEngineRunCost,
+} from "./run_cost.js";
+import {
+  deriveSandboxRuntimeId,
+} from "./runtime_identity.js";
+import {
+  enforceHuddlesOpencodePolicy,
+  type HuddlesOpencodeConfig,
+} from "./huddles_policy.js";
+import { legacyExecutionRequest } from "./legacy_huddles_adapter.js";
+export { legacyExecutionRequest } from "./legacy_huddles_adapter.js";
 export { isHuddlesSessionName } from "./huddles_policy.js";
 export { deriveSandboxRuntimeId, sha256Hex } from "./runtime_identity.js";
 
@@ -173,32 +202,91 @@ export async function deriveSessionGatewayName(
  * binding, while durable binding state belongs to SessionGateway.
  */
 export class HuddlesRuntimeEntrypoint extends WorkerEntrypoint<Env> {
+  async executeInvocation(request: ExecuteInvocationV2Request) {
+    return executionService(this.env).executeInvocation(request);
+  }
+
+  async getExecutionStatus(request: GetInvocationV2Request) {
+    return executionService(this.env).getExecutionStatus(request);
+  }
+
+  async cancelInvocation(request: CancelInvocationV2Request) {
+    return executionService(this.env).cancelInvocation(request);
+  }
+
   async ensureSession(
     request: EnsureSessionRequest,
   ): Promise<EnsureSessionResult> {
     const validated = validateEnsureSessionRequest(request);
-    const name = await deriveSessionGatewayName(
+    const sessionId = await deriveSessionGatewayName(
       validated.workspace_id,
       validated.effect_id,
     );
-    const id = this.env.SessionGateway.idFromName(name);
-    const stub = this.env.SessionGateway.get(id);
-    setAgentName(stub, name);
-    return stub.ensureSession(validated);
+    return {
+      session_ref: { session_id: sessionId },
+      // Compatibility-only ensure is now a stateless deterministic projection;
+      // exact invocation idempotency is owned by the generic execution service.
+      disposition: "reused",
+      attribution: {
+        requested_model: validated.canonical_request.requested_model,
+        served_model: null,
+        status: "unavailable",
+      },
+    };
   }
 
   async invokeSession(
     request: InvokeSessionRequest,
   ): Promise<InvokeSessionResult> {
     const validated = await validateInvokeSessionRequest(request);
-    const name = await deriveSessionGatewayName(
+    const expectedSessionId = await deriveSessionGatewayName(
       validated.workspace_id,
       validated.effect_id,
     );
-    const id = this.env.SessionGateway.idFromName(name);
-    const stub = this.env.SessionGateway.get(id);
-    setAgentName(stub, name);
-    return stub.invokeSession(validated);
+    if (validated.session_ref.session_id !== expectedSessionId) {
+      throw new Error("invoke request does not match its deterministic session");
+    }
+    const executionRequest = legacyExecutionRequest(validated);
+    const result = await executionService(this.env).executeInvocation(
+      executionRequest,
+    );
+    if (result.status === "conflict") {
+      return {
+        code: "invoke_session_conflict",
+        workspace_id: validated.workspace_id,
+        effect_id: validated.effect_id,
+        invocation_id: validated.invocation_id,
+        existing_request_hash: result.error.existing_request_hash,
+        requested_request_hash: result.error.requested_request_hash,
+      };
+    }
+    const session_ref: SessionRef = {
+      session_id: result.session_ref.session_id,
+      ...(result.session_ref.seq_range === undefined
+        ? {}
+        : { seq_range: result.session_ref.seq_range }),
+    };
+    if (result.status === "running") {
+      return { status: "running", disposition: "reused", session_ref };
+    }
+    if (result.status === "completed") {
+      return {
+        status: "completed",
+        disposition: result.disposition,
+        session_ref,
+        output_text:
+          result.output.text ??
+          (result.output.json === undefined
+            ? ""
+            : JSON.stringify(result.output.json)),
+      };
+    }
+    return {
+      status: "failed",
+      disposition: result.disposition,
+      session_ref,
+      error: legacyError(result.error.code, result.error.message),
+    };
   }
 
   async fetch(): Promise<Response> {
@@ -206,9 +294,106 @@ export class HuddlesRuntimeEntrypoint extends WorkerEntrypoint<Env> {
   }
 }
 
-function setAgentName(stub: object, name: string): void {
-  const maybeNamed = stub as { setName?: (value: string) => void };
-  maybeNamed.setName?.(name);
+export function executionService(env: Env): ExecutionService {
+  const meter = new RunCostMeter();
+  const store = new D1ExecutionStore(
+    env.EXECUTION_DB as unknown as RelationalDatabase,
+    meter.observeRelational,
+  );
+  const artifacts = new R2ExecutionArtifactStore(
+    env.EXECUTION_EVIDENCE,
+    meter.observeObject,
+  );
+  let runtime: ExecutionRuntime;
+  if (env.Sandbox === undefined) {
+    runtime = new UnavailableExecutionRuntime();
+  } else {
+    const sandboxNamespace = env.Sandbox;
+    runtime = new OpencodeExecutionRuntime({
+      sandboxFor: async (sessionId) =>
+        getSandbox(
+          sandboxNamespace,
+          await deriveSandboxRuntimeId(sessionId),
+        ),
+      configFor: (request) => opencodeConfig(env, request.tool_policy),
+    });
+  }
+  return new ExecutionService(store, artifacts, runtime, {
+    costMeter: meter,
+    analytics:
+      env.RUN_COSTS === undefined
+        ? undefined
+        : new WorkersAnalyticsEngineRunCost(env.RUN_COSTS),
+    sandboxProfile: env.SANDBOX_PROFILE,
+  });
+}
+
+class UnavailableExecutionRuntime implements ExecutionRuntime {
+  async execute(): Promise<{
+    served_model: null;
+    error: {
+      code: "runtime_unavailable";
+      message: string;
+    };
+    evidence: readonly [];
+  }> {
+    return {
+      served_model: null,
+      error: {
+        code: "runtime_unavailable",
+        message: "Pillbox managed runner has no Cloudflare Sandbox binding",
+      },
+      evidence: [],
+    };
+  }
+
+  async cancel(): Promise<void> {}
+}
+
+function legacyError(
+  code: string,
+  message: string,
+): Extract<InvokeSessionResult, { readonly status: "failed" }>["error"] {
+  const supported = new Set([
+    "runtime_failed",
+    "runtime_unavailable",
+    "runtime_interrupted",
+    "structured_output_missing",
+  ]);
+  return {
+    code: supported.has(code)
+      ? (code as "runtime_unavailable" | "runtime_failed" | "runtime_interrupted" | "structured_output_missing")
+      : "runtime_failed",
+    message,
+  };
+}
+
+function opencodeConfig(
+  env: Env,
+  toolPolicy: "deny_all",
+): { readonly config?: unknown; readonly env: Readonly<Record<string, string>> } {
+  const providerEnv: Record<string, string> = {};
+  for (const key of ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"] as const) {
+    const value = env[key];
+    if (value) providerEnv[key] = value;
+  }
+  let config: HuddlesOpencodeConfig | undefined = env.OPENCODE_CONFIG_JSON
+    ? (JSON.parse(env.OPENCODE_CONFIG_JSON) as HuddlesOpencodeConfig)
+    : undefined;
+  if (env.ZAI_API_KEY) {
+    config ??= {};
+    config.provider ??= {};
+    config.provider["zai-coding-plan"] ??= {
+      options: { apiKey: env.ZAI_API_KEY },
+    };
+  }
+  if (config === undefined && Object.keys(providerEnv).length === 0) {
+    throw new Error("no opencode provider configured");
+  }
+  return {
+    config: enforceHuddlesOpencodePolicy(config, toolPolicy),
+    env: providerEnv,
+  };
 }
 
 export async function validateInvokeSessionRequest(

@@ -1,7 +1,12 @@
-import { proxyToSandbox, type Sandbox } from "@cloudflare/sandbox";
+import type { Sandbox } from "@cloudflare/sandbox";
 import { HuddlesRuntimeEntrypoint, executionService } from "./huddles_runtime.js";
-import { bearerToken, verifyActorToken } from "./auth.js";
+import {
+  bearerToken,
+  verifyManagedCapability,
+  type ManagedOperation,
+} from "./auth.js";
 import { safeHuddlesRuntimeDiagnostic } from "./huddles_policy.js";
+import { readBoundedJson, RequestBodyTooLargeError } from "./request_body.js";
 import { routeWorkspaceTransfer } from "./workspace_transfer.js";
 
 // Named entrypoint: Huddles reaches ensureSession through a same-account
@@ -17,10 +22,10 @@ export interface Env {
   // The Sandbox SDK's container DO — OPTIONAL: present only in the container
   // config (wrangler.container.toml). Absent in the free/§0-only deploy.
   Sandbox?: DurableObjectNamespace<Sandbox>;
-  // Issuer secret for verifying actor tokens (HMAC). Set out-of-band via
-  // `wrangler secret put ACTOR_TOKEN_SECRET` (or `.dev.vars` for `wrangler dev`),
-  // never committed. Absent → writes fail closed (no actor can be attested).
-  ACTOR_TOKEN_SECRET?: string;
+  // HMAC issuer secret for short-lived, operation- and resource-bound public
+  // controller capabilities. Huddles reaches the private service binding and
+  // does not use this public bearer-token surface.
+  MANAGED_CAPABILITY_SECRET?: string;
 
   // opencode provider auth + model for the consume path (driveAgent). Set via
   // `wrangler secret put` / `.dev.vars`; consumed by createOpencodeServer
@@ -45,16 +50,6 @@ export default {
     if (executionResponse !== null) return executionResponse;
     const workspaceResponse = await routeWorkspaceTransfer(req, env);
     if (workspaceResponse !== null) return workspaceResponse;
-    // Container preview/port-proxy URLs — only when the container is bound.
-    // Re-spread with the narrowed (defined) Sandbox so proxyToSandbox's env type
-    // is satisfied without a cast (TS narrows `env.Sandbox`, not `env`).
-    if (env.Sandbox) {
-      const proxied = await proxyToSandbox(req, {
-        ...env,
-        Sandbox: env.Sandbox,
-      });
-      if (proxied) return proxied;
-    }
     return new Response("not found\n", { status: 404 });
   },
 };
@@ -64,7 +59,7 @@ async function routeExecutionRequest(
   env: Env,
 ): Promise<Response | null> {
   const path = new URL(request.url).pathname;
-  const operation =
+  const operation: ManagedOperation | null =
     path === "/v2/executions"
       ? "execute"
       : path === "/v2/executions/status"
@@ -79,16 +74,38 @@ async function routeExecutionRequest(
       headers: { allow: "POST" },
     });
   }
-  const token = bearerToken(request);
-  if (
-    env.ACTOR_TOKEN_SECRET === undefined ||
-    token === null ||
-    (await verifyActorToken(token, env.ACTOR_TOKEN_SECRET)) === null
-  ) {
-    return Response.json({ error: { code: "unauthenticated" } }, { status: 401 });
-  }
   try {
-    const body = await request.json();
+    const body = await readBoundedJson(request);
+    const scope = executionCapabilityScope(operation, body);
+    const token = bearerToken(request);
+    if (
+      env.MANAGED_CAPABILITY_SECRET === undefined ||
+      token === null ||
+      (await verifyManagedCapability(
+        token,
+        env.MANAGED_CAPABILITY_SECRET,
+        scope,
+      )) === null
+    ) {
+      return Response.json({ error: { code: "unauthenticated" } }, { status: 401 });
+    }
+    if (
+      operation === "execute" &&
+      typeof body === "object" &&
+      body !== null &&
+      "tool_policy" in body &&
+      body.tool_policy !== "deny_all"
+    ) {
+      return Response.json(
+        {
+          error: {
+            code: "unsupported_policy",
+            message: "public managed execution requires tool_policy 'deny_all'",
+          },
+        },
+        { status: 400 },
+      );
+    }
     const service = executionService(env);
     const result =
       operation === "execute"
@@ -111,7 +128,51 @@ async function routeExecutionRequest(
           message: safeHuddlesRuntimeDiagnostic(cause),
         },
       },
-      { status: code === "execution_not_found" ? 404 : 400 },
+      {
+        status:
+          cause instanceof RequestBodyTooLargeError
+            ? 413
+            : code === "execution_not_found"
+              ? 404
+              : 400,
+      },
     );
   }
+}
+
+function executionCapabilityScope(
+  operation: ManagedOperation,
+  value: unknown,
+): {
+  readonly operation: ManagedOperation;
+  readonly session_id?: string;
+  readonly invocation_id?: string;
+} {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("request must be an object");
+  }
+  const body = value as Record<string, unknown>;
+  const invocationId = nonEmptyScope(body.invocation_id, "invocation_id");
+  if (operation !== "execute") {
+    return { operation, invocation_id: invocationId };
+  }
+  if (
+    typeof body.session_ref !== "object" ||
+    body.session_ref === null ||
+    Array.isArray(body.session_ref)
+  ) {
+    throw new Error("session_ref must be an object");
+  }
+  const sessionId = nonEmptyScope(
+    (body.session_ref as Record<string, unknown>).session_id,
+    "session_ref.session_id",
+  );
+  return { operation, session_id: sessionId, invocation_id: invocationId };
+}
+
+function nonEmptyScope(value: unknown, name: string): string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`${name} must be a non-empty string`);
+  }
+  return value;
 }

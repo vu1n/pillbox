@@ -87,6 +87,16 @@ test("evidence cardinality is bounded before touching R2", async () => {
   assert.equal(bucket.puts, 0);
 });
 
+test("one oversized evidence event is rejected before touching R2", async () => {
+  const bucket = new FakeBucket();
+  const store = new R2ExecutionArtifactStore(
+    bucket as unknown as Pick<R2Bucket, "get" | "put">,
+  );
+  const value = artifact({ evidence: [{ text: "x".repeat(256 * 1024) }] });
+  await assert.rejects(store.write(value), /evidence event 0.*maximum/);
+  assert.equal(bucket.puts, 0);
+});
+
 function sum(items: readonly ObjectUsage[], key: keyof ObjectUsage): number {
   return items.reduce((total, item) => total + item[key], 0);
 }

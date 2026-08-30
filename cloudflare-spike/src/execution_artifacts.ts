@@ -7,6 +7,7 @@ import type {
 
 export const MAX_EXECUTION_EVIDENCE_EVENTS = 2_000;
 export const MAX_EXECUTION_ARTIFACT_BYTES = 8 * 1024 * 1024;
+export const MAX_EXECUTION_EVIDENCE_EVENT_BYTES = 256 * 1024;
 
 export interface ExecutionArtifact {
   readonly version: 1;
@@ -61,6 +62,14 @@ export class R2ExecutionArtifactStore implements ExecutionArtifactStore {
       throw new Error(
         `execution evidence has ${artifact.evidence.length} events; maximum is ${MAX_EXECUTION_EVIDENCE_EVENTS}`,
       );
+    }
+    for (const [index, event] of artifact.evidence.entries()) {
+      const bytes = new TextEncoder().encode(JSON.stringify(event)).byteLength;
+      if (bytes > MAX_EXECUTION_EVIDENCE_EVENT_BYTES) {
+        throw new Error(
+          `execution evidence event ${index} is ${bytes} bytes; maximum is ${MAX_EXECUTION_EVIDENCE_EVENT_BYTES}`,
+        );
+      }
     }
     const body = new TextEncoder().encode(JSON.stringify(artifact));
     if (body.byteLength > MAX_EXECUTION_ARTIFACT_BYTES) {
@@ -131,6 +140,11 @@ export class R2ExecutionArtifactStore implements ExecutionArtifactStore {
   ): Promise<{ ref: ExecutionArtifactRef; artifact: ExecutionArtifact }> {
     const object = await this.bucket.get(key);
     if (object === null) throw new Error(`execution artifact missing at ${key}`);
+    if (object.size > MAX_EXECUTION_ARTIFACT_BYTES) {
+      throw new Error(
+        `execution artifact is ${object.size} bytes; maximum is ${MAX_EXECUTION_ARTIFACT_BYTES}`,
+      );
+    }
     const body = new Uint8Array(await object.arrayBuffer());
     this.observeUsage({
       reads: 1,

@@ -5,16 +5,14 @@
 //!
 //! ## Configuration (env-driven; no host state)
 //!
-//! The Worker origin + actor-token material come from the environment:
+//! The Worker origin + capability issuer secret come from the environment:
 //!
 //!   - `PILLBOX_MANAGED_URL` — the worker origin, e.g.
 //!     `https://<worker>.workers.dev`. `PILLBOX_MANAGED_DO_URL` remains a
 //!     deprecated compatibility fallback while installations migrate.
-//!   - `PILLBOX_ACTOR_TOKEN` — a pre-minted actor token (the deploy's HMAC over
-//!     the actor claim). Used only for Worker authentication.
 //!   - `PILLBOX_MANAGED_TOKEN_SECRET` — the shared HMAC secret, when pillbox
-//!     should mint its own token. Mints a `human(<os user>)` token via
-//!     [`mint_actor_token`] when set; falls back to `PILLBOX_ACTOR_TOKEN`.
+//!     should mint short-lived capabilities. Each token is bound to one
+//!     operation plus its exact session/invocation resource.
 //!
 //! ## Workspace placement — container-native rustic-on-R2
 //!
@@ -125,14 +123,14 @@ impl SandboxBackend for ManagedBackend {
         let session_id = crate::session::Session::new_id();
         let endpoint = resolve_https_origin()?;
 
-        // 4. Mint an authentication token + provision the workspace.
-        let token = managed_token().ok_or_else(|| {
-            PillboxError::config(
-                "run",
-                "no managed actor token: set PILLBOX_MANAGED_TOKEN_SECRET (to mint a driver \
-                 token) or PILLBOX_ACTOR_TOKEN (a pre-minted one)",
-            )
-        })?;
+        // 4. Mint an exact, short-lived provision capability.
+        let capability_secret = managed_capability_secret("run")?;
+        let provision_token = mint_managed_capability(
+            "workspace_provision",
+            Some(&session_id),
+            None,
+            &capability_secret,
+        );
         // Prefix-scope the credential before it crosses to the managed plane: the
         // DO only needs this repo's prefix, not the whole bucket. Minted fresh per
         // transfer so each credential outlives only its own round-trip, never the
@@ -140,7 +138,7 @@ impl SandboxBackend for ManagedBackend {
         let provision_creds = r2_scope::scope_for_transfer(s3)?;
         workspace_xfer::provision(
             &endpoint,
-            &token,
+            &provision_token,
             &session_id,
             &provision_creds,
             &password,
@@ -213,8 +211,19 @@ impl SandboxBackend for ManagedBackend {
         // 7. Snapshot `/workspace` back to R2; record the handle so
         //    `session pull <id>` can rehydrate the result.
         let finalize_creds = r2_scope::scope_for_transfer(s3)?;
-        let result_snapshot =
-            workspace_xfer::finalize(&endpoint, &token, &session_id, &finalize_creds, &password)?;
+        let finalize_token = mint_managed_capability(
+            "workspace_finalize",
+            Some(&session_id),
+            None,
+            &capability_secret,
+        );
+        let result_snapshot = workspace_xfer::finalize(
+            &endpoint,
+            &finalize_token,
+            &session_id,
+            &finalize_creds,
+            &password,
+        )?;
         let mut finished = session;
         finished.result_snapshot = Some(result_snapshot);
         session::write(resolved, &finished)?;
@@ -279,8 +288,17 @@ fn resolve_https_origin() -> Result<String> {
             )
             .with_next("export PILLBOX_MANAGED_URL=https://<worker>.workers.dev")
         })?;
-    let endpoint = endpoint.trim_end_matches('/').to_string();
-    if !endpoint.starts_with("https://") {
+    let parsed = reqwest::Url::parse(&endpoint).map_err(|error| {
+        PillboxError::config("run", format!("invalid managed Worker origin: {error}"))
+    })?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.path() != "/"
+    {
         return Err(PillboxError::config(
             "run",
             format!(
@@ -292,7 +310,7 @@ fn resolve_https_origin() -> Result<String> {
         .with_next("set PILLBOX_MANAGED_URL to an https:// origin")
         .into());
     }
-    Ok(endpoint)
+    Ok(parsed.origin().ascii_serialization())
 }
 
 /// The managed [`LiveSession`] — a local session record whose turns execute on
@@ -319,20 +337,14 @@ impl LiveSession for ManagedLiveSession {
 
     fn send(&self, resolved: &Pillbox, bytes: &[u8]) -> Result<()> {
         let handle = self.handle()?;
-        let token = managed_token().ok_or_else(|| {
-            PillboxError::config(
-                "session send",
-                "no managed actor token: set PILLBOX_MANAGED_TOKEN_SECRET (to mint a \
-                 token) or PILLBOX_ACTOR_TOKEN (a pre-minted one)",
-            )
-        })?;
+        let capability_secret = managed_capability_secret("session send")?;
         let text = String::from_utf8_lossy(bytes).into_owned();
         let model = self.session.server.as_ref().map(|s| s.model.as_str());
         execution::execute_turn(
             resolved,
             &self.session.id,
             &handle.endpoint,
-            &token,
+            &capability_secret,
             &text,
             model,
         )
@@ -414,30 +426,52 @@ pub(crate) struct ManagedHandle {
 
 impl ManagedHandle {
     fn decode(session: &Session) -> Result<Self> {
-        serde_json::from_str(&session.sandbox_id)
+        let configured = resolve_https_origin()?;
+        Self::decode_for_origin(session, &configured)
+    }
+
+    fn decode_for_origin(session: &Session, configured: &str) -> Result<Self> {
+        let handle: Self = serde_json::from_str(&session.sandbox_id)
             .map_err(|e| {
                 PillboxError::config(
                     "session",
                     format!("decode managed session handle for `{}`: {e}", session.id),
                 )
             })
-            .map_err(Into::into)
+            .map_err(anyhow::Error::from)?;
+        if handle.execution_session_id != session.id {
+            return Err(PillboxError::config(
+                "session",
+                format!(
+                    "managed handle session id `{}` does not match record id `{}`",
+                    handle.execution_session_id, session.id
+                ),
+            )
+            .into());
+        }
+        if handle.endpoint.trim_end_matches('/') != configured.trim_end_matches('/') {
+            return Err(PillboxError::config(
+                "session",
+                "managed session endpoint does not match PILLBOX_MANAGED_URL",
+            )
+            .with_next("inspect or recreate the managed session record")
+            .into());
+        }
+        Ok(handle)
     }
 }
 
-/// The Worker authentication token: mint one from the shared HMAC secret when
-/// set (stamped `human(<os user>)`), else use `PILLBOX_ACTOR_TOKEN`. `None` when
-/// neither is configured, so `send` can fail with a clear next-step.
-fn managed_token() -> Option<String> {
-    if let Ok(secret) = std::env::var("PILLBOX_MANAGED_TOKEN_SECRET") {
-        if !secret.is_empty() {
-            let actor = crate::contract::Actor::human(local_user());
-            return Some(mint_actor_token(&actor, &secret));
-        }
-    }
-    std::env::var("PILLBOX_ACTOR_TOKEN")
+fn managed_capability_secret(action: &'static str) -> Result<String> {
+    std::env::var("PILLBOX_MANAGED_TOKEN_SECRET")
         .ok()
-        .filter(|t| !t.is_empty())
+        .filter(|secret| !secret.is_empty())
+        .ok_or_else(|| {
+            PillboxError::config(
+                action,
+                "set PILLBOX_MANAGED_TOKEN_SECRET to mint scoped managed capabilities",
+            )
+            .into()
+        })
 }
 
 /// The OS user, used as the driver actor's id when pillbox mints its own token.
@@ -449,20 +483,42 @@ fn local_user() -> String {
         .unwrap_or_else(|_| "local".into())
 }
 
-/// Mint an actor token the Worker's `verifyActorToken` accepts.
-///
-/// The wire format is **exactly** `cloudflare-spike/src/auth.ts::signActorToken`:
-/// `base64url(claimJson) . base64url(HMAC-SHA256(claimJson, secret))`, where
-/// `claimJson` is the JSON serialization of the [`Actor`](crate::contract::Actor)
-/// (the DO re-parses it and re-checks `kind` ∈ {human,agent,service} + a string
-/// `id`). The two base64url segments are padless (`=` stripped), `+`→`-`, `/`→`_`
-/// — matching `b64urlEncode`. Serializing via serde produces `{"kind":…,"id":…}`
-/// (and `display` only when non-empty); the DO ignores `display` for identity, so
-/// the only thing that must agree is the byte string the HMAC signs — which is the
-/// claim segment, signed as-is on both sides.
-pub(crate) fn mint_actor_token(actor: &crate::contract::Actor, secret: &str) -> String {
+#[derive(serde::Serialize)]
+struct ManagedCapability<'a> {
+    version: u8,
+    subject: String,
+    audience: &'static str,
+    expires_at_ms: u64,
+    operation: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    invocation_id: Option<&'a str>,
+}
+
+/// Mint the exact capability shape verified by `cloudflare-spike/src/auth.ts`.
+pub(crate) fn mint_managed_capability(
+    operation: &str,
+    session_id: Option<&str>,
+    invocation_id: Option<&str>,
+    secret: &str,
+) -> String {
     use base64::Engine as _;
-    let claim_json = serde_json::to_vec(actor).expect("Actor serializes (no non-string keys)");
+    let expires_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_millis()
+        .saturating_add(10 * 60 * 1_000) as u64;
+    let claim = ManagedCapability {
+        version: 1,
+        subject: format!("controller:{}", local_user()),
+        audience: "pillbox-managed",
+        expires_at_ms,
+        operation,
+        session_id,
+        invocation_id,
+    };
+    let claim_json = serde_json::to_vec(&claim).expect("managed capability serializes");
     let claim_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&claim_json);
     let sig = hmac_sha256(secret.as_bytes(), claim_b64.as_bytes());
     let sig_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig);
@@ -509,6 +565,8 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
 
 /// One bounded managed execution call plus local evidence persistence.
 mod execution {
+    use std::io::Read as _;
+
     use anyhow::{Context, Result};
     use serde::Deserialize;
     use sha2::{Digest, Sha256};
@@ -520,6 +578,7 @@ mod execution {
 
     #[derive(Deserialize)]
     struct EvidencePage {
+        from: u64,
         events: Vec<Payload>,
         next: Option<u64>,
     }
@@ -536,7 +595,7 @@ mod execution {
         status: String,
         evidence: EvidencePage,
         #[serde(default)]
-        cost: Option<serde_json::Value>,
+        cost: Option<crate::cost::RunCostEnvelope>,
         #[serde(default)]
         error: Option<ExecutionError>,
     }
@@ -545,7 +604,7 @@ mod execution {
         resolved: &Pillbox,
         session_id: &str,
         endpoint: &str,
-        token: &str,
+        capability_secret: &str,
         text: &str,
         model: Option<&str>,
     ) -> Result<()> {
@@ -565,7 +624,7 @@ mod execution {
             "idempotency_key": invocation_id,
             "rendered_input": text,
             "rendered_input_hash": rendered_hash,
-            "tool_policy": "runtime_default",
+            "tool_policy": "deny_all",
             "execution": {
                 "transport": {
                     "harness": "opencode",
@@ -590,39 +649,117 @@ mod execution {
             .timeout(std::time::Duration::from_secs(600))
             .build()
             .context("build managed execution http client")?;
-        let mut result = post_json(
+        let execute_token = super::mint_managed_capability(
+            "execute",
+            Some(session_id),
+            Some(&invocation_id),
+            capability_secret,
+        );
+        let (mut result, mut response_bytes) = post_json(
             &client,
             &format!("{}/v2/executions", endpoint.trim_end_matches('/')),
-            token,
+            &execute_token,
             &body,
         )?;
+        if result.invocation_id != invocation_id || result.evidence.from != 0 {
+            return Err(PillboxError::runtime(
+                "session send",
+                "managed execution response identity or evidence cursor mismatch",
+            )
+            .into());
+        }
         let mut payloads = Vec::new();
         payloads.append(&mut result.evidence.events);
+        validate_payloads(&payloads)?;
+        if payloads.len() > 2_000 || result.evidence.next.is_some_and(|next| next == 0) {
+            return Err(PillboxError::runtime(
+                "session send",
+                "managed execution evidence exceeded its bound or did not advance",
+            )
+            .into());
+        }
         let mut cursor = result.evidence.next;
+        let mut pages = 1usize;
         while let Some(after) = cursor {
+            if pages >= 20 || payloads.len() >= 2_000 {
+                return Err(PillboxError::runtime(
+                    "session send",
+                    "managed execution evidence exceeded the bounded page budget",
+                )
+                .into());
+            }
+            let status_token = super::mint_managed_capability(
+                "status",
+                None,
+                Some(&result.invocation_id),
+                capability_secret,
+            );
             let status_body = serde_json::json!({
                 "contract_version": "pillbox.execution/2",
                 "invocation_id": result.invocation_id,
                 "evidence_after": after,
                 "evidence_limit": 100
             });
-            let mut page = post_json(
+            let (mut page, page_bytes) = post_json(
                 &client,
                 &format!("{}/v2/executions/status", endpoint.trim_end_matches('/')),
-                token,
+                &status_token,
                 &status_body,
             )?;
+            response_bytes = response_bytes.checked_add(page_bytes).ok_or_else(|| {
+                PillboxError::runtime("session send", "managed response byte counter overflowed")
+            })?;
+            if response_bytes > 8 * 1024 * 1024 {
+                return Err(PillboxError::runtime(
+                    "session send",
+                    "managed execution responses exceeded 8 MiB in total",
+                )
+                .into());
+            }
+            if page.invocation_id != invocation_id
+                || page.status != result.status
+                || page.evidence.from != after
+            {
+                return Err(PillboxError::runtime(
+                    "session send",
+                    "managed execution response identity or evidence cursor mismatch",
+                )
+                .into());
+            }
+            if page.evidence.next.is_some_and(|next| next <= after) {
+                return Err(PillboxError::runtime(
+                    "session send",
+                    "managed execution evidence cursor did not advance",
+                )
+                .into());
+            }
+            validate_payloads(&page.evidence.events)?;
             payloads.append(&mut page.evidence.events);
+            if payloads.len() > 2_000 {
+                return Err(PillboxError::runtime(
+                    "session send",
+                    "managed execution evidence exceeded 2000 events",
+                )
+                .into());
+            }
             cursor = page.evidence.next;
+            pages += 1;
             if result.cost.is_none() {
                 result.cost = page.cost;
             }
         }
 
         if let Some(cost) = result.cost.clone() {
+            if !cost.validate_untrusted(&result.status) {
+                return Err(PillboxError::runtime(
+                    "session send",
+                    "managed execution returned an invalid cost envelope",
+                )
+                .into());
+            }
             payloads.push(Payload::Custom(Custom {
                 name: "run_cost".into(),
-                payload: Some(cost),
+                payload: Some(serde_json::to_value(cost).expect("cost envelope serializes")),
             }));
         }
         let events: Vec<_> = payloads
@@ -646,7 +783,7 @@ mod execution {
         url: &str,
         token: &str,
         body: &serde_json::Value,
-    ) -> Result<ExecutionResult> {
+    ) -> Result<(ExecutionResult, usize)> {
         let resp = client
             .post(url)
             .header("content-type", "application/json")
@@ -655,7 +792,8 @@ mod execution {
             .send()
             .with_context(|| format!("POST {url}"))?;
         let status = resp.status();
-        let response = resp.text().context("read managed execution response")?;
+        let response =
+            read_capped(resp, 8 * 1024 * 1024).context("read managed execution response")?;
         if !status.is_success() {
             return Err(PillboxError::runtime(
                 "session send",
@@ -666,13 +804,52 @@ mod execution {
             )
             .into());
         }
-        serde_json::from_str(&response).map_err(|error| {
-            PillboxError::runtime(
+        let bytes = response.len();
+        let result = serde_json::from_str(&response).map_err(|error| {
+            anyhow::Error::from(PillboxError::runtime(
                 "session send",
                 format!("invalid managed execution response: {error}"),
+            ))
+        })?;
+        Ok((result, bytes))
+    }
+
+    fn read_capped(mut response: reqwest::blocking::Response, limit: u64) -> Result<String> {
+        let mut bytes = Vec::new();
+        response
+            .by_ref()
+            .take(limit + 1)
+            .read_to_end(&mut bytes)
+            .context("read response body")?;
+        if bytes.len() as u64 > limit {
+            return Err(PillboxError::runtime(
+                "session send",
+                format!("managed execution response exceeded {limit} bytes"),
             )
-            .into()
-        })
+            .into());
+        }
+        String::from_utf8(bytes).context("managed execution response was not UTF-8")
+    }
+
+    fn validate_payloads(payloads: &[Payload]) -> Result<()> {
+        if payloads.iter().all(|payload| {
+            matches!(
+                payload,
+                Payload::MessageStart(_)
+                    | Payload::MessageDelta(_)
+                    | Payload::MessageEnd(_)
+                    | Payload::ToolCall(_)
+                    | Payload::Thinking(_)
+                    | Payload::Usage(_)
+            )
+        }) {
+            return Ok(());
+        }
+        Err(PillboxError::runtime(
+            "session send",
+            "managed execution returned a disallowed evidence event",
+        )
+        .into())
     }
 
     fn capped(value: &str) -> &str {
@@ -702,6 +879,8 @@ mod execution {
 /// (`{workspace:{repo,password,snapshot}}` / `{workspace:{repo,password}}`) and
 /// the error mapping live together, mirroring [`input`].
 mod workspace_xfer {
+    use std::io::Read as _;
+
     use anyhow::{Context, Result};
     use serde::Serialize;
 
@@ -738,7 +917,7 @@ mod workspace_xfer {
 
     /// `POST <endpoint>/provision` — the DO restores `snapshot` from the R2 repo
     /// into the container `/workspace`. Driver-gated, so it carries the driver
-    /// actor token. Non-2xx maps to a clear pillbox error with the DO's body text.
+    /// provision capability. Non-2xx maps to a clear pillbox error.
     pub(super) fn provision(
         endpoint: &str,
         token: &str,
@@ -799,7 +978,7 @@ mod workspace_xfer {
             )
             .into());
         }
-        let text = resp.text().context("read managed /finalize response")?;
+        let text = read_capped(resp, 64 * 1024).context("read managed /finalize response")?;
         let parsed: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
             PillboxError::runtime(
                 "run",
@@ -809,7 +988,12 @@ mod workspace_xfer {
         parsed
             .get("resultSnapshot")
             .and_then(serde_json::Value::as_str)
-            .filter(|s| !s.is_empty())
+            .filter(|value| {
+                value.len() == 64
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
             .map(str::to_string)
             .ok_or_else(|| {
                 PillboxError::runtime(
@@ -847,13 +1031,20 @@ mod workspace_xfer {
     /// terminal. A read failure degrades to a placeholder rather than masking the
     /// HTTP status the caller already reports.
     fn error_detail(resp: reqwest::blocking::Response) -> String {
-        const CAP: usize = 2048;
-        let mut s = resp.text().unwrap_or_else(|_| "<unreadable body>".into());
-        if s.len() > CAP {
-            s.truncate(CAP);
-            s.push('…');
+        read_capped(resp, 2048).unwrap_or_else(|_| "<unreadable or oversized body>".into())
+    }
+
+    fn read_capped(mut response: reqwest::blocking::Response, cap: u64) -> Result<String> {
+        let mut bytes = Vec::new();
+        response
+            .by_ref()
+            .take(cap + 1)
+            .read_to_end(&mut bytes)
+            .context("read response body")?;
+        if bytes.len() as u64 > cap {
+            anyhow::bail!("response exceeded {cap} bytes");
         }
-        s
+        String::from_utf8(bytes).context("response body was not UTF-8")
     }
 
     #[cfg(test)]
@@ -1292,7 +1483,6 @@ mod r2_scope {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::{Actor, ActorKind};
 
     /// HMAC-SHA256 against the RFC 4231 Test Case 2 vector
     /// (key=`"Jefe"`, data=`"what do ya want for nothing?"`) — proves our
@@ -1308,14 +1498,18 @@ mod tests {
         );
     }
 
-    /// The token shape matches `auth.ts::signActorToken`:
+    /// The token shape matches `auth.ts::signManagedCapability`:
     /// `base64url(claimJson).base64url(hmac)`, two padless URL-safe segments
     /// split on a single `.`, the first being the base64url of the actor JSON.
     #[test]
-    fn mint_actor_token_has_two_b64url_segments_over_the_actor_claim() {
+    fn mint_managed_capability_has_two_b64url_segments_over_the_claim() {
         use base64::Engine as _;
-        let actor = Actor::agent("opencode"); // id => "a:opencode"
-        let token = mint_actor_token(&actor, "shared-secret");
+        let token = mint_managed_capability(
+            "execute",
+            Some("abc123def456"),
+            Some("def456abc123"),
+            "shared-secret",
+        );
 
         let (claim_b64, sig_b64) = token.split_once('.').expect("two dot-joined segments");
         assert!(!claim_b64.is_empty() && !sig_b64.is_empty());
@@ -1326,25 +1520,27 @@ mod tests {
                 "segment not base64url-no-pad: {seg}"
             );
         }
-        // The claim segment decodes back to the exact actor JSON serde produced —
-        // the byte string the DO re-parses + the HMAC signs.
+        // The claim is operation- and resource-bound, versioned, and expiring.
         let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(claim_b64)
             .expect("claim is valid base64url");
-        let back: Actor = serde_json::from_slice(&decoded).expect("claim is the Actor JSON");
-        assert_eq!(back.kind, ActorKind::Agent);
-        assert_eq!(back.id, "a:opencode");
+        let back: serde_json::Value = serde_json::from_slice(&decoded).expect("claim JSON");
+        assert_eq!(back["version"], 1);
+        assert_eq!(back["audience"], "pillbox-managed");
+        assert_eq!(back["operation"], "execute");
+        assert_eq!(back["session_id"], "abc123def456");
+        assert_eq!(back["invocation_id"], "def456abc123");
+        assert!(back["expires_at_ms"].as_u64().is_some());
     }
 
     /// The signature is over the *claim segment* (the base64url string), exactly
     /// as `auth.ts` signs `claim` — not over the raw JSON. Recomputing the HMAC
     /// over `claim_b64` must reproduce the token's signature segment.
     #[test]
-    fn mint_actor_token_signs_the_claim_segment() {
+    fn mint_managed_capability_signs_the_claim_segment() {
         use base64::Engine as _;
-        let actor = Actor::human("alice"); // id => "u:alice"
         let secret = "deploy-secret";
-        let token = mint_actor_token(&actor, secret);
+        let token = mint_managed_capability("status", None, Some("def456abc123"), secret);
         let (claim_b64, sig_b64) = token.split_once('.').unwrap();
 
         let expected = hmac_sha256(secret.as_bytes(), claim_b64.as_bytes());
@@ -1355,17 +1551,15 @@ mod tests {
         );
     }
 
-    /// A different secret yields a different signature (the MAC actually binds to
-    /// the key) while the claim segment is unchanged (it only encodes the actor).
+    /// A different secret yields a different signature over the same claim bytes.
     #[test]
-    fn mint_actor_token_signature_depends_on_secret() {
-        let actor = Actor::service("grader");
-        let a = mint_actor_token(&actor, "secret-a");
-        let b = mint_actor_token(&actor, "secret-b");
-        let (claim_a, sig_a) = a.split_once('.').unwrap();
-        let (claim_b, sig_b) = b.split_once('.').unwrap();
-        assert_eq!(claim_a, claim_b, "same actor => same claim segment");
-        assert_ne!(sig_a, sig_b, "different secret => different signature");
+    fn managed_capability_signature_depends_on_secret() {
+        use base64::Engine as _;
+        let token = mint_managed_capability("cancel", None, Some("def456abc123"), "secret-a");
+        let (claim, signature) = token.split_once('.').unwrap();
+        let alternate = hmac_sha256(b"secret-b", claim.as_bytes());
+        let alternate = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(alternate);
+        assert_ne!(signature, alternate);
     }
 
     /// The handle round-trips through the record's `sandbox_id` JSON, so the
@@ -1374,16 +1568,34 @@ mod tests {
     fn managed_handle_round_trips_through_sandbox_id() {
         let handle = ManagedHandle {
             endpoint: "https://w.workers.dev".into(),
-            execution_session_id: "sess-do".into(),
+            execution_session_id: "abc123def456".into(),
         };
         let mut s = Session::test_fixture();
         s.backend = BACKEND_MANAGED.to_string();
         s.placement = session::Placement::Managed;
         s.sandbox_id = serde_json::to_string(&handle).unwrap();
 
-        let live = ManagedLiveSession::new(s);
-        let decoded = live.handle().expect("decodes the managed handle");
+        let decoded = ManagedHandle::decode_for_origin(&s, "https://w.workers.dev")
+            .expect("decodes the managed handle");
         assert_eq!(decoded, handle);
+    }
+
+    #[test]
+    fn managed_handle_rejects_record_and_origin_mismatch() {
+        let handle = ManagedHandle {
+            endpoint: "https://w.workers.dev".into(),
+            execution_session_id: "def456abc123".into(),
+        };
+        let mut session = Session::test_fixture();
+        session.sandbox_id = serde_json::to_string(&handle).unwrap();
+        assert!(ManagedHandle::decode_for_origin(&session, "https://w.workers.dev").is_err());
+
+        let handle = ManagedHandle {
+            endpoint: "https://other.workers.dev".into(),
+            execution_session_id: session.id.clone(),
+        };
+        session.sandbox_id = serde_json::to_string(&handle).unwrap();
+        assert!(ManagedHandle::decode_for_origin(&session, "https://w.workers.dev").is_err());
     }
 
     /// The capability profile is the honest managed surface: server-mode drive +

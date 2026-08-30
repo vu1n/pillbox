@@ -16,7 +16,10 @@ test("managed topology binds only Cloudflare Sandbox as a Durable Object", () =>
   }
   assert.equal(existsSync(new URL("./src/session_gateway.ts", import.meta.url)), false);
   const worker = read("./src/worker.ts");
-  assert.doesNotMatch(worker, /SessionGateway|routeAgentRequest|from ["']agents["']/);
+  assert.doesNotMatch(
+    worker,
+    /SessionGateway|routeAgentRequest|proxyToSandbox|from ["']agents["']/,
+  );
 });
 
 test("managed dependencies contain no custom agent or Computer runtime", () => {
@@ -48,4 +51,23 @@ test("execution persistence is bounded and local logs cannot route to a DO", () 
     read("../src/events/transcripts/tailer.rs"),
     /log: Option<SessionLog>/,
   );
+});
+
+test("workspace finalize quiesces prompt-controlled processes before credentials enter", () => {
+  const source = read("./src/workspace_transfer.ts");
+  const kill = source.indexOf("await sandbox.killAllProcesses()");
+  const transfer = source.indexOf("await execWorkspaceTool(");
+  assert.ok(kill >= 0 && transfer > kill);
+  assert.match(source, /r2\\\.cloudflarestorage\\\.com/);
+  assert.match(source, /verifyManagedCapability/);
+  assert.doesNotMatch(source, /verifyActorToken|ACTOR_TOKEN_SECRET/);
+});
+
+test("public execution uses scoped capabilities and denies runtime tools", () => {
+  const source = read("./src/worker.ts");
+  assert.match(source, /verifyManagedCapability/);
+  assert.match(source, /tool_policy !== "deny_all"/);
+  assert.match(source, /readBoundedJson/);
+  assert.doesNotMatch(source, /verifyActorToken|ACTOR_TOKEN_SECRET/);
+  assert.match(read("./src/execution_service.ts"), /request\.tool_policy !== "deny_all"/);
 });

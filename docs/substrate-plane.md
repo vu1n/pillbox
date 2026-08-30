@@ -12,7 +12,7 @@
 
 pillbox runs an agent on a *substrate*. Today there are two intended placements:
 **libkrun** is the default and only supported local agent backend; **managed**
-selects the experimental Cloudflare Durable Object + Container path with
+selects the experimental Cloudflare bounded Worker + Sandbox path with
 `PILLBOX_BACKEND=managed`. The Docker agent backend remains temporarily as
 deprecated code and a toolchain-free build fallback; it is not a product mode.
 
@@ -46,16 +46,15 @@ points; command handlers no longer grow backend-specific match arms.
 
 Two more axes are **already abstracted** and stay as-is — orthogonal to this work:
 
-- **Event placement:** `EventSource` / `sink::EventLog` are local-only; managed
-  evidence is appended after a bounded execution response.
+- **Event placement:** every backend appends to concrete local `SessionLog`;
+  managed evidence is copied there after a bounded execution response.
 - **Agent integration** (`Pty` ↔ `Server`): `Integration` + `ServerProfile`
   (`src/agents/mod.rs:52`), already a single source of truth incl. a
   `libkrun_only` capability bit.
 
-We've built this trait-swap pattern three times already (`EventSource`,
-`EventLog`, **`SandboxHttp`** at `src/sandbox/http.rs:44` — which is *already*
+The remaining HTTP seam (`SandboxHttp` at `src/sandbox/http.rs`) is already
 backend-abstracted: `DockerHttp` + libkrun `opencode_http()` both return
-`Box<dyn SandboxHttp>`). This plan extends the same pattern to the one surface
+`Box<dyn SandboxHttp>`. This plan extends the same pattern to the one surface
 still doing string-match dispatch: the **PTY + lifecycle** surface.
 
 ## Contract first (define the boundary before porting)
@@ -76,8 +75,7 @@ trait LiveSession {
     fn caps(&self) -> Caps;
     fn send(&self, bytes: &[u8]) -> Result<()>;                 // PTY/server drive
     fn attach(&self, resolved: &Pillbox) -> Result<()>;          // reattach
-    fn event_source(&self)                                       // unifies tailer mess
-        -> Result<(Box<dyn EventSource + Send>, Option<TailerHandle>)>;
+    fn spawn_log_tailer(&self, resolved: &Pillbox) -> Result<Option<TailerHandle>>;
     fn http(&self) -> Result<Box<dyn SandboxHttp>>;              // server-mode (cap-gated)
     fn workspace_path(&self) -> Result<PathBuf>;
     fn kill(&self, resolved: &Pillbox) -> Result<()>;
@@ -227,7 +225,7 @@ command layer doesn't change, only libkrun's impl flips `pty_drive` +
 
 - Building the CF Containers backend (Phase 5, own plan).
 - Deleting docker (it's the container-family reference).
-- Touching the §0 contract, `EventSource`, or placement.
+- Touching the §0 contract or event placement.
 - Real egress fencing on docker (declare Unsupported; libkrun owns it).
 
 ## Risks

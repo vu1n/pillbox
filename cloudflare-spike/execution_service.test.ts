@@ -131,6 +131,28 @@ test("created execution persists terminal evidence and exact retry does not resa
   assert.equal(analytics.length, 1);
 });
 
+test("tool-enabled managed execution fails closed before runtime access", async () => {
+  const runtime = new FakeRuntime({
+    served_model: null,
+    output: { text: "must not run" },
+    evidence: [],
+  });
+  const service = new ExecutionService(
+    new MemoryStore(),
+    new MemoryArtifacts(),
+    runtime,
+    fixedOptions(),
+  );
+  const result = await service.executeInvocation(
+    await request({ tool_policy: "runtime_default" }),
+  );
+  assert.equal(result.status, "failed");
+  if (result.status === "failed") {
+    assert.equal(result.error.code, "unsupported_policy");
+  }
+  assert.equal(runtime.executions, 0);
+});
+
 test("changed content conflicts without crossing into the runtime", async () => {
   const runtime = new FakeRuntime({
     served_model: null,

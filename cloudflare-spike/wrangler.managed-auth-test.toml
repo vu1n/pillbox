@@ -1,0 +1,29 @@
+name = "pillbox-managed-auth-test"
+main = "src/worker.ts"
+compatibility_date = "2026-06-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+[vars]
+MANAGED_AUTH_REQUIRED = "1"
+PILLBOX_GRANT_KEY_ID = "test-key"
+PILLBOX_GRANT_PUBLIC_KEY = "ed25519:SKaA_nE69844nq00przjwmcPcg5iRY1hL4fnfgipY94"
+PILLBOX_INSTALLATION_ID = "test-installation"
+PILLBOX_EXECUTION_REALM_ID = "test-realm"
+PILLBOX_PROTOCOL_REVISION = "pillbox.huddles/1"
+PILLBOX_ORGANIZATION_ID = "test-organization"
+
+[[d1_databases]]
+binding = "EXECUTION_DB"
+database_name = "pillbox-managed-auth-test"
+database_id = "00000000-0000-0000-0000-000000000001"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "EXECUTION_EVIDENCE"
+bucket_name = "pillbox-managed-auth-test-evidence"
+
+[[services]]
+binding = "PillboxAuthorizationControlPlane"
+service = "pillbox-managed-auth-authority"
+entrypoint = "ManagedAuthorizationControlPlaneEntrypoint"

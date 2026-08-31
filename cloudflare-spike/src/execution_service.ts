@@ -142,7 +142,8 @@ export class ExecutionService {
       };
     } else if (
       request.execution.transport.harness !== "opencode" ||
-      request.execution.transport.transport !== "http"
+      (request.execution.transport.transport !== "http" &&
+        request.execution.transport.transport !== "cloudflare-service-binding")
     ) {
       turn = {
         served_model: null,

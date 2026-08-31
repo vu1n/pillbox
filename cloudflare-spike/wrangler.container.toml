@@ -1,3 +1,5 @@
+# Preserve the existing deployed Worker name. Historical namespace retirement
+# remains a separate release operation.
 name = "pillbox-do-spike"
 main = "src/worker.ts"
 compatibility_date = "2026-06-01"
@@ -20,12 +22,18 @@ dataset = "pillbox_execution_run_costs_preview"
 
 [vars]
 SANDBOX_PROFILE = "standard-2"
+MANAGED_AUTH_REQUIRED = "1"
 
 # The Sandbox SDK's container-owning DO (one container per session, addressed by
 # the execution session id). The Worker calls it through the Sandbox SDK.
 [[durable_objects.bindings]]
 name = "Sandbox"
 class_name = "Sandbox"
+
+[[services]]
+binding = "PillboxAuthorizationControlPlane"
+service = "huddles-projectors"
+entrypoint = "PillboxAuthorizationControlPlaneEntrypoint"
 
 # Bind the Sandbox DO class to the container image (built from ./Dockerfile).
 # `wrangler dev` builds + runs it locally via Docker.

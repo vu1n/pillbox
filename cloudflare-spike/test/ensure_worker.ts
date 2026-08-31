@@ -24,21 +24,14 @@ export default {
       const input = await request.json();
       const result =
         path === "/ensure"
-          ? await env.PillboxRuntime.ensureSession(
-              input as EnsureSessionRequest,
-            )
-          : await env.PillboxRuntime.invokeSession(
-              input as InvokeSessionRequest,
-            );
-      if ("code" in result)
+          ? await env.PillboxRuntime.ensureSession(input as EnsureSessionRequest)
+          : await env.PillboxRuntime.invokeSession(input as InvokeSessionRequest);
+      if ("code" in result) {
         return Response.json({ error: result }, { status: 409 });
+      }
       return Response.json(result);
     } catch (error) {
-      const detail = error as {
-        code?: string;
-        message?: string;
-        name?: string;
-      };
+      const detail = error as { code?: string; message?: string; name?: string };
       return Response.json(
         {
           error: {

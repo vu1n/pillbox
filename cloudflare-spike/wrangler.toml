@@ -1,3 +1,5 @@
+# Keep the deployed Worker name stable while the package graduates from spike
+# status. Historical namespace retirement is a separate release operation.
 name = "pillbox-do-spike"
 main = "src/worker.ts"
 compatibility_date = "2026-06-01"
@@ -20,6 +22,13 @@ bucket_name = "pillbox-execution-evidence-preview"
 [[analytics_engine_datasets]]
 binding = "RUN_COSTS"
 dataset = "pillbox_execution_run_costs_preview"
+
+# Private Huddles authorization transport. The binding authenticates transport
+# only; every ensure/invoke call still carries a signed execution grant.
+[[services]]
+binding = "PillboxAuthorizationControlPlane"
+service = "huddles-projectors"
+entrypoint = "PillboxAuthorizationControlPlaneEntrypoint"
 
 # Sandbox is registered in the migration (worker.ts exports the class) but NOT
 # bound and NOT given a container here — so nothing is instantiated and the free

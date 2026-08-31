@@ -74,6 +74,8 @@ export interface ExecuteInvocationV2Request {
   readonly tool_policy: "deny_all" | "runtime_default";
   readonly execution: InvocationExecution;
   readonly execution_policy_revision: string;
+  /** Stable controller authorization context; volatile grant envelopes stay out. */
+  readonly controller_context_hash?: Sha256Digest;
   readonly output_format: ExecutionOutputFormat;
 }
 
@@ -246,6 +248,7 @@ export async function validateExecuteInvocationV2Request(
       "tool_policy",
       "execution",
       "execution_policy_revision",
+      "controller_context_hash",
       "output_format",
     ],
     "request",
@@ -289,6 +292,13 @@ export async function validateExecuteInvocationV2Request(
     request.execution_policy_revision,
     "execution_policy_revision",
   );
+  const controllerContextHash =
+    request.controller_context_hash === undefined
+      ? undefined
+      : requireDigest(
+          request.controller_context_hash,
+          "controller_context_hash",
+        );
   const execution = validateInvocationExecution(request.execution);
   const outputFormat = validateOutputFormat(request.output_format);
 
@@ -302,6 +312,9 @@ export async function validateExecuteInvocationV2Request(
     tool_policy: request.tool_policy,
     execution,
     execution_policy_revision: executionPolicyRevision,
+    ...(controllerContextHash === undefined
+      ? {}
+      : { controller_context_hash: controllerContextHash }),
     output_format: outputFormat,
   };
 }

@@ -68,3 +68,5 @@ agent-io-pty-free-contract conforms: rustfmt-only whitespace in cursor harness; 
 libkrun-env-fork-substrate conforms: rustfmt-only whitespace in structured launch; CoW fork/env substrate unchanged.
 workspace-ingest-sovereignty conforms: rustfmt-only whitespace in session.rs; ingest denylist untouched.
 managed-tier-do-gateway conforms: v0002 removes the custom SessionGateway and remote §0 placement; Huddles owns collaboration while Pillbox persists bounded D1 claims, one immutable R2 evidence object, one terminal analytics point, and uses only Cloudflare Sandbox's vendor-owned DO.
+managed-tier-do-gateway conforms: signed execution grants are verified and re-introspected statelessly before bounded D1 execution; no SessionGateway, CredentialBroker, or other Pillbox-authored Durable Object is bound or exported.
+managed-store-of-record conforms: signed grants remain authorization input only; execution identity stays in bounded D1 and evidence in immutable R2, with no OAuth or token material persisted.

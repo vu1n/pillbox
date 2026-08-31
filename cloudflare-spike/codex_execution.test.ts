@@ -177,7 +177,7 @@ test("execution identity digest is deterministic across object key order", async
   );
 });
 
-test("request hash changes with input, output schema, and policy revision", async () => {
+test("request hash changes with input, output, policy, and controller context", async () => {
   const request = await validRequest();
   const original = await computeInvocationRequestHash(request);
   const changedInput = await computeInvocationRequestHash(
@@ -194,9 +194,13 @@ test("request hash changes with input, output schema, and policy revision", asyn
   const changedPolicy = await computeInvocationRequestHash(
     await validRequest({ execution_policy_revision: "planning-execution/codex-app-server/2" }),
   );
+  const changedControllerContext = await computeInvocationRequestHash(
+    await validRequest({ controller_context_hash: `sha256:${"b".repeat(64)}` }),
+  );
   assert.notEqual(original, changedInput);
   assert.notEqual(original, changedOutput);
   assert.notEqual(original, changedPolicy);
+  assert.notEqual(original, changedControllerContext);
 });
 
 test("rendered input hash is recomputed over the exact UTF-8 input", async () => {

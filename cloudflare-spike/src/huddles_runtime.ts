@@ -1,15 +1,11 @@
-import { WorkerEntrypoint } from "cloudflare:workers";
 import { getSandbox } from "@cloudflare/sandbox";
+import { WorkerEntrypoint } from "cloudflare:workers";
 import type { Env } from "./worker.js";
 import {
   type CancelInvocationV2Request,
   type ExecuteInvocationV2Request,
   type GetInvocationV2Request,
 } from "./codex_execution.js";
-import {
-  D1ExecutionStore,
-  type RelationalDatabase,
-} from "./execution_store.js";
 import { R2ExecutionArtifactStore } from "./execution_artifacts.js";
 import {
   ExecutionService,
@@ -17,10 +13,9 @@ import {
   type ExecutionRuntime,
 } from "./execution_service.js";
 import {
-  RunCostMeter,
-  WorkersAnalyticsEngineRunCost,
-} from "./run_cost.js";
-import { deriveSandboxRuntimeId } from "./runtime_identity.js";
+  D1ExecutionStore,
+  type RelationalDatabase,
+} from "./execution_store.js";
 import {
   enforceHuddlesOpencodePolicy,
   type HuddlesOpencodeConfig,
@@ -28,11 +23,22 @@ import {
 import {
   ensureLegacySession,
   invokeLegacySession,
+  validateEnsureSessionRequest,
+  validateInvokeSessionRequest,
   type EnsureSessionRequest,
   type EnsureSessionResult,
   type InvokeSessionRequest,
   type InvokeSessionResult,
 } from "./legacy_huddles_adapter.js";
+import {
+  authorizeManagedEnsure,
+  authorizeManagedInvoke,
+} from "./managed_huddles_auth.js";
+import {
+  RunCostMeter,
+  WorkersAnalyticsEngineRunCost,
+} from "./run_cost.js";
+import { deriveSandboxRuntimeId } from "./runtime_identity.js";
 
 export {
   deriveExecutionSessionName,
@@ -71,13 +77,22 @@ export class HuddlesRuntimeEntrypoint extends WorkerEntrypoint<Env> {
   }
 
   async ensureSession(request: EnsureSessionRequest): Promise<EnsureSessionResult> {
-    return ensureLegacySession(request);
+    const validated = validateEnsureSessionRequest(request);
+    const executionRealmId = await authorizeManagedEnsure(this.env, validated);
+    return ensureLegacySession(validated, executionRealmId);
   }
 
   async invokeSession(request: InvokeSessionRequest): Promise<InvokeSessionResult> {
+    const validated = await validateInvokeSessionRequest(request);
+    const controllerContextHash = await authorizeManagedInvoke(
+      this.env,
+      validated,
+    );
     const service = executionService(this.env);
-    return invokeLegacySession(request, (execution) =>
-      service.executeInvocation(execution),
+    return invokeLegacySession(
+      validated,
+      (execution) => service.executeInvocation(execution),
+      controllerContextHash,
     );
   }
 

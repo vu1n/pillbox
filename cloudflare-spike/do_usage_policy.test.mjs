@@ -9,16 +9,18 @@ test("managed topology binds only Cloudflare Sandbox as a Durable Object", () =>
     read("./wrangler.toml"),
     read("./wrangler.container.toml"),
     read("./wrangler.runtime-test.toml"),
+    read("./wrangler.managed-auth-test.toml"),
   ]) {
     const bindings = [...config.matchAll(/\[\[durable_objects\.bindings\]\][\s\S]*?class_name\s*=\s*"([^"]+)"/g)]
       .map((match) => match[1]);
     assert.deepEqual(bindings, config.includes('name = "Sandbox"') ? ["Sandbox"] : []);
   }
   assert.equal(existsSync(new URL("./src/session_gateway.ts", import.meta.url)), false);
+  assert.equal(existsSync(new URL("./src/credentials/credential_broker.ts", import.meta.url)), false);
   const worker = read("./src/worker.ts");
   assert.doesNotMatch(
     worker,
-    /SessionGateway|routeAgentRequest|proxyToSandbox|from ["']agents["']/,
+    /SessionGateway|CredentialBroker|routeAgentRequest|proxyToSandbox|from ["']agents["']/,
   );
 });
 

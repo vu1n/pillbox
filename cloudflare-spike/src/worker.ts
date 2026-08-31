@@ -11,7 +11,7 @@ import {
   RequestBodyTooLargeError,
 } from "./request_body.js";
 import { routeWorkspaceTransfer } from "./workspace_transfer.js";
-
+import type { PillboxAuthorizationControlPlane } from "./managed_auth.js";
 // Named entrypoint: Huddles reaches ensureSession through a same-account
 // service-binding RPC. The default fetch handler below never routes that method.
 export { HuddlesRuntimeEntrypoint };
@@ -29,6 +29,16 @@ export interface Env {
   // exact request bytes, operation, and resource. Huddles reaches the private
   // service binding and does not use this public bearer-token surface.
   MANAGED_CAPABILITY_SECRET?: string;
+  /** Private Huddles control-plane binding. Transport auth is not workload auth. */
+  PillboxAuthorizationControlPlane?: PillboxAuthorizationControlPlane;
+  /** Public verification half of the active Huddles Ed25519 grant key. */
+  PILLBOX_GRANT_KEY_ID?: string;
+  PILLBOX_GRANT_PUBLIC_KEY?: string;
+  PILLBOX_INSTALLATION_ID?: string;
+  PILLBOX_EXECUTION_REALM_ID?: string;
+  PILLBOX_PROTOCOL_REVISION?: string;
+  PILLBOX_ORGANIZATION_ID?: string;
+  MANAGED_AUTH_REQUIRED?: string;
 
   // opencode provider auth + model for the consume path (driveAgent). Set via
   // `wrangler secret put` / `.dev.vars`; consumed by createOpencodeServer

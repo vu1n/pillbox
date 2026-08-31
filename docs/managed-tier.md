@@ -43,8 +43,10 @@ namespace retirement needs a separate retention/export review.
    at most one best-effort Analytics Engine point.
 6. The client appends returned evidence plus the terminal cost envelope to its
    ordinary local session log. Finalize first stops every prompt-controlled
-   process, then introduces a fresh transfer credential to the helper and records
-   the canonical result snapshot.
+   process, then introduces a fresh transfer credential to the helper. The helper
+   records the provisioned base as the result snapshot's parent, and the client
+   verifies that lineage in the authoritative rustic repository before persisting
+   the result handle.
 
 The happy-path persistence budget is two D1 writes, one R2 object write, and one
 Analytics Engine point. Status reads are bounded pages of at most 100 events.
@@ -52,7 +54,8 @@ There are no per-token, per-delta, PTY-frame, progress, or replay writes.
 
 ## Cost evidence
 
-Every terminal run carries a versioned `RunCostEnvelope` containing raw units:
+Every terminal response must carry exactly one versioned, internally consistent
+`RunCostEnvelope` containing raw units:
 model tokens, provider-reported model cost, D1 rows read/written, R2 operations
 and bytes, Analytics Engine points, Sandbox duration, and Sandbox profile.
 Unknown dollar amounts remain unknown. `estimated_total_cost_usd` is absent
@@ -72,14 +75,16 @@ participant identity.
 
 - Foreground execution only; managed detach/reconnect is unsupported.
 - OpenCode over HTTP is the current executable capability.
-- Public HTTP uses short-lived controller capabilities bound to one operation and
-  exact session/invocation id. Huddles uses the trusted same-account service
-  binding and owns participant/driver authorization.
+- Public HTTP uses short-lived controller capabilities bound to one operation,
+  the exact bounded request bytes, and the exact session/invocation id. Huddles
+  uses the trusted same-account service binding and owns participant/driver
+  authorization.
 - Public managed execution is `tool_policy: deny_all`. Tool-enabled execution is
   disabled until provider and workspace credentials have a brokered boundary;
   local microVM tools are unaffected.
-- Request bodies are capped at 1 MiB, evidence at 2,000 events / 8 MiB, and
-  responses and cursors are bounded and identity-checked by the CLI.
+- Request bodies are capped at 1 MiB, OpenCode control responses and SSE frames
+  are capped before parsing, evidence is capped at 2,000 events / 8 MiB, and
+  responses, costs, and cursors are bounded and identity-checked by the CLI.
 - The legacy Huddles `ensureSession`/`invokeSession` RPC methods are stateless
   compatibility adapters over the generic execution service.
 

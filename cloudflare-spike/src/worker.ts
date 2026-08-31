@@ -6,7 +6,10 @@ import {
   type ManagedOperation,
 } from "./auth.js";
 import { safeHuddlesRuntimeDiagnostic } from "./huddles_policy.js";
-import { readBoundedJson, RequestBodyTooLargeError } from "./request_body.js";
+import {
+  readBoundedJsonWithDigest,
+  RequestBodyTooLargeError,
+} from "./request_body.js";
 import { routeWorkspaceTransfer } from "./workspace_transfer.js";
 
 // Named entrypoint: Huddles reaches ensureSession through a same-account
@@ -22,9 +25,9 @@ export interface Env {
   // The Sandbox SDK's container DO — OPTIONAL: present only in the container
   // config (wrangler.container.toml). Absent in the free/§0-only deploy.
   Sandbox?: DurableObjectNamespace<Sandbox>;
-  // HMAC issuer secret for short-lived, operation- and resource-bound public
-  // controller capabilities. Huddles reaches the private service binding and
-  // does not use this public bearer-token surface.
+  // HMAC issuer secret for short-lived public controller capabilities bound to
+  // exact request bytes, operation, and resource. Huddles reaches the private
+  // service binding and does not use this public bearer-token surface.
   MANAGED_CAPABILITY_SECRET?: string;
 
   // opencode provider auth + model for the consume path (driveAgent). Set via
@@ -75,8 +78,9 @@ async function routeExecutionRequest(
     });
   }
   try {
-    const body = await readBoundedJson(request);
-    const scope = executionCapabilityScope(operation, body);
+    const decoded = await readBoundedJsonWithDigest(request);
+    const body = decoded.value;
+    const scope = executionCapabilityScope(operation, body, decoded.sha256);
     const token = bearerToken(request);
     if (
       env.MANAGED_CAPABILITY_SECRET === undefined ||
@@ -143,8 +147,10 @@ async function routeExecutionRequest(
 function executionCapabilityScope(
   operation: ManagedOperation,
   value: unknown,
+  request_sha256: `sha256:${string}`,
 ): {
   readonly operation: ManagedOperation;
+  readonly request_sha256: `sha256:${string}`;
   readonly session_id?: string;
   readonly invocation_id?: string;
 } {
@@ -154,7 +160,7 @@ function executionCapabilityScope(
   const body = value as Record<string, unknown>;
   const invocationId = nonEmptyScope(body.invocation_id, "invocation_id");
   if (operation !== "execute") {
-    return { operation, invocation_id: invocationId };
+    return { operation, request_sha256, invocation_id: invocationId };
   }
   if (
     typeof body.session_ref !== "object" ||
@@ -167,7 +173,12 @@ function executionCapabilityScope(
     (body.session_ref as Record<string, unknown>).session_id,
     "session_ref.session_id",
   );
-  return { operation, session_id: sessionId, invocation_id: invocationId };
+  return {
+    operation,
+    request_sha256,
+    session_id: sessionId,
+    invocation_id: invocationId,
+  };
 }
 
 function nonEmptyScope(value: unknown, name: string): string {

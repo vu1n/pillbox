@@ -42,6 +42,19 @@ impl RunCostEnvelope {
         let Some(infrastructure) = &self.infrastructure else {
             return false;
         };
+        let dollar_fields_agree = self.known_cost_usd == self.model.provider_reported_cost_usd;
+        let estimate_has_rate_card = match (
+            self.estimated_total_cost_usd,
+            self.rate_card_version.as_deref(),
+        ) {
+            (None, None) => true,
+            (Some(estimate), Some(version)) => {
+                !version.is_empty()
+                    && version.len() <= 128
+                    && self.known_cost_usd.is_none_or(|known| estimate >= known)
+            }
+            _ => false,
+        };
         self.version == 1
             && self.status == terminal_status
             && matches!(
@@ -51,6 +64,8 @@ impl RunCostEnvelope {
             && finite_non_negative(self.model.provider_reported_cost_usd)
             && finite_non_negative(self.known_cost_usd)
             && finite_non_negative(self.estimated_total_cost_usd)
+            && dollar_fields_agree
+            && estimate_has_rate_card
             && self.model.input_tokens <= 10_000_000_000
             && self.model.output_tokens <= 10_000_000_000
             && self.model.cache_read_input_tokens <= 10_000_000_000
@@ -63,10 +78,6 @@ impl RunCostEnvelope {
             && infrastructure.r2_bytes_written <= 1024 * 1024 * 1024
             && infrastructure.analytics_points_written <= 1
             && infrastructure.sandbox_duration_ms <= 24 * 60 * 60 * 1_000
-            && self
-                .rate_card_version
-                .as_ref()
-                .is_none_or(|version| !version.is_empty() && version.len() <= 128)
             && self
                 .infrastructure
                 .as_ref()
@@ -102,8 +113,10 @@ impl RunCostEnvelope {
                         .and_then(|value| value.get("total_cost_usd"))
                         .and_then(serde_json::Value::as_f64)
                     {
-                        fallback_provider_cost += cost.max(0.0);
-                        has_fallback_cost = true;
+                        if let Some(cost) = bounded_cost(cost) {
+                            fallback_provider_cost = bounded_cost_add(fallback_provider_cost, cost);
+                            has_fallback_cost = true;
+                        }
                     }
                 }
                 Payload::Custom(custom) if custom.name == "run_cost" => {
@@ -145,8 +158,8 @@ impl RunCostEnvelope {
             model.cache_creation_input_tokens = model
                 .cache_creation_input_tokens
                 .saturating_add(usage.cache_creation_input_tokens.unwrap_or(0));
-            if let Some(cost) = usage.cost_usd {
-                usage_cost += cost.max(0.0);
+            if let Some(cost) = usage.cost_usd.and_then(bounded_cost) {
+                usage_cost = bounded_cost_add(usage_cost, cost);
                 has_usage_cost = true;
             }
         }
@@ -174,6 +187,14 @@ impl RunCostEnvelope {
 
 fn finite_non_negative(value: Option<f64>) -> bool {
     value.is_none_or(|number| number.is_finite() && (0.0..=1_000_000.0).contains(&number))
+}
+
+fn bounded_cost(value: f64) -> Option<f64> {
+    value.is_finite().then(|| value.clamp(0.0, 1_000_000.0))
+}
+
+fn bounded_cost_add(left: f64, right: f64) -> f64 {
+    (left + right).min(1_000_000.0)
 }
 
 fn source_rank(source: UsageSource) -> u8 {
@@ -297,5 +318,54 @@ mod tests {
             .unwrap()
             .analytics_points_written = 2;
         assert!(!envelope.validate_untrusted("completed"));
+    }
+
+    #[test]
+    fn untrusted_managed_cost_requires_consistent_dollar_provenance() {
+        let mut envelope = RunCostEnvelope {
+            version: 1,
+            status: "completed".into(),
+            model: ModelUsageCost {
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                provider_reported_cost_usd: Some(0.01),
+            },
+            infrastructure: Some(InfrastructureUsageCost {
+                d1_rows_read: 1,
+                d1_rows_written: 2,
+                r2_reads: 0,
+                r2_writes: 1,
+                r2_bytes_read: 0,
+                r2_bytes_written: 512,
+                analytics_points_written: 1,
+                sandbox_duration_ms: 50,
+                sandbox_profile: Some("standard-2".into()),
+            }),
+            known_cost_usd: Some(0.02),
+            estimated_total_cost_usd: None,
+            rate_card_version: None,
+        };
+        assert!(!envelope.validate_untrusted("completed"));
+
+        envelope.known_cost_usd = Some(0.01);
+        envelope.estimated_total_cost_usd = Some(0.009);
+        envelope.rate_card_version = Some("2026-08".into());
+        assert!(!envelope.validate_untrusted("completed"));
+
+        envelope.estimated_total_cost_usd = Some(0.02);
+        assert!(envelope.validate_untrusted("completed"));
+    }
+
+    #[test]
+    fn fallback_costs_are_finite_and_saturating() {
+        let events = vec![
+            usage("m1", UsageSource::Native, 1, Some(f64::INFINITY)),
+            usage("m2", UsageSource::Native, 1, Some(900_000.0)),
+            usage("m3", UsageSource::Native, 1, Some(900_000.0)),
+        ];
+        let summary = RunCostEnvelope::from_events(&events);
+        assert_eq!(summary.known_cost_usd, Some(1_000_000.0));
     }
 }

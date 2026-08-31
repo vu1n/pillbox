@@ -12,7 +12,7 @@
 //!     deprecated compatibility fallback while installations migrate.
 //!   - `PILLBOX_MANAGED_TOKEN_SECRET` — the shared HMAC secret, when pillbox
 //!     should mint short-lived capabilities. Each token is bound to one
-//!     operation plus its exact session/invocation resource.
+//!     operation, exact request bytes, and exact session/invocation resource.
 //!
 //! ## Workspace placement — container-native rustic-on-R2
 //!
@@ -123,14 +123,8 @@ impl SandboxBackend for ManagedBackend {
         let session_id = crate::session::Session::new_id();
         let endpoint = resolve_https_origin()?;
 
-        // 4. Mint an exact, short-lived provision capability.
+        // 4. Provision with a capability bound to the exact credentialed body.
         let capability_secret = managed_capability_secret("run")?;
-        let provision_token = mint_managed_capability(
-            "workspace_provision",
-            Some(&session_id),
-            None,
-            &capability_secret,
-        );
         // Prefix-scope the credential before it crosses to the managed plane: the
         // DO only needs this repo's prefix, not the whole bucket. Minted fresh per
         // transfer so each credential outlives only its own round-trip, never the
@@ -138,7 +132,7 @@ impl SandboxBackend for ManagedBackend {
         let provision_creds = r2_scope::scope_for_transfer(s3)?;
         workspace_xfer::provision(
             &endpoint,
-            &provision_token,
+            &capability_secret,
             &session_id,
             &provision_creds,
             &password,
@@ -211,19 +205,28 @@ impl SandboxBackend for ManagedBackend {
         // 7. Snapshot `/workspace` back to R2; record the handle so
         //    `session pull <id>` can rehydrate the result.
         let finalize_creds = r2_scope::scope_for_transfer(s3)?;
-        let finalize_token = mint_managed_capability(
-            "workspace_finalize",
-            Some(&session_id),
-            None,
-            &capability_secret,
-        );
         let result_snapshot = workspace_xfer::finalize(
             &endpoint,
-            &finalize_token,
+            &capability_secret,
             &session_id,
             &finalize_creds,
             &password,
+            snapshot.as_str(),
         )?;
+        let verified = workspace.snapshot_show(&crate::workspace::SnapshotHandle::new(
+            result_snapshot.clone(),
+        ))?;
+        if !verified
+            .parents
+            .iter()
+            .any(|parent| parent == snapshot.as_str())
+        {
+            return Err(PillboxError::runtime(
+                "run",
+                "managed result snapshot is not descended from the provisioned base snapshot",
+            )
+            .into());
+        }
         let mut finished = session;
         finished.result_snapshot = Some(result_snapshot);
         session::write(resolved, &finished)?;
@@ -490,6 +493,7 @@ struct ManagedCapability<'a> {
     audience: &'static str,
     expires_at_ms: u64,
     operation: &'a str,
+    request_sha256: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     session_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -499,6 +503,7 @@ struct ManagedCapability<'a> {
 /// Mint the exact capability shape verified by `cloudflare-spike/src/auth.ts`.
 pub(crate) fn mint_managed_capability(
     operation: &str,
+    request_sha256: &str,
     session_id: Option<&str>,
     invocation_id: Option<&str>,
     secret: &str,
@@ -515,6 +520,7 @@ pub(crate) fn mint_managed_capability(
         audience: "pillbox-managed",
         expires_at_ms,
         operation,
+        request_sha256,
         session_id,
         invocation_id,
     };
@@ -644,6 +650,8 @@ mod execution {
             "execution_policy_revision": "pillbox-managed-v2",
             "output_format": { "type": "text", "retry_count": 0 }
         });
+        let body = serde_json::to_string(&body).context("serialize managed execution request")?;
+        let body_hash = request_sha256(&body);
 
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(600))
@@ -651,6 +659,7 @@ mod execution {
             .context("build managed execution http client")?;
         let execute_token = super::mint_managed_capability(
             "execute",
+            &body_hash,
             Some(session_id),
             Some(&invocation_id),
             capability_secret,
@@ -665,6 +674,19 @@ mod execution {
             return Err(PillboxError::runtime(
                 "session send",
                 "managed execution response identity or evidence cursor mismatch",
+            )
+            .into());
+        }
+        let terminal_cost = result.cost.clone().ok_or_else(|| {
+            PillboxError::runtime(
+                "session send",
+                "managed terminal response omitted its required cost envelope",
+            )
+        })?;
+        if !terminal_cost.validate_untrusted(&result.status) {
+            return Err(PillboxError::runtime(
+                "session send",
+                "managed execution returned an invalid cost envelope",
             )
             .into());
         }
@@ -688,18 +710,22 @@ mod execution {
                 )
                 .into());
             }
-            let status_token = super::mint_managed_capability(
-                "status",
-                None,
-                Some(&result.invocation_id),
-                capability_secret,
-            );
             let status_body = serde_json::json!({
                 "contract_version": "pillbox.execution/2",
                 "invocation_id": result.invocation_id,
                 "evidence_after": after,
                 "evidence_limit": 100
             });
+            let status_body =
+                serde_json::to_string(&status_body).context("serialize managed status request")?;
+            let status_hash = request_sha256(&status_body);
+            let status_token = super::mint_managed_capability(
+                "status",
+                &status_hash,
+                None,
+                Some(&result.invocation_id),
+                capability_secret,
+            );
             let (mut page, page_bytes) = post_json(
                 &client,
                 &format!("{}/v2/executions/status", endpoint.trim_end_matches('/')),
@@ -719,10 +745,11 @@ mod execution {
             if page.invocation_id != invocation_id
                 || page.status != result.status
                 || page.evidence.from != after
+                || page.cost.as_ref() != Some(&terminal_cost)
             {
                 return Err(PillboxError::runtime(
                     "session send",
-                    "managed execution response identity or evidence cursor mismatch",
+                    "managed execution response identity, cost, or evidence cursor mismatch",
                 )
                 .into());
             }
@@ -744,24 +771,12 @@ mod execution {
             }
             cursor = page.evidence.next;
             pages += 1;
-            if result.cost.is_none() {
-                result.cost = page.cost;
-            }
         }
 
-        if let Some(cost) = result.cost.clone() {
-            if !cost.validate_untrusted(&result.status) {
-                return Err(PillboxError::runtime(
-                    "session send",
-                    "managed execution returned an invalid cost envelope",
-                )
-                .into());
-            }
-            payloads.push(Payload::Custom(Custom {
-                name: "run_cost".into(),
-                payload: Some(serde_json::to_value(cost).expect("cost envelope serializes")),
-            }));
-        }
+        payloads.push(Payload::Custom(Custom {
+            name: "run_cost".into(),
+            payload: Some(serde_json::to_value(terminal_cost).expect("cost envelope serializes")),
+        }));
         let events: Vec<_> = payloads
             .into_iter()
             .map(|payload| Event::session(session_id, payload))
@@ -782,13 +797,13 @@ mod execution {
         client: &reqwest::blocking::Client,
         url: &str,
         token: &str,
-        body: &serde_json::Value,
+        body: &str,
     ) -> Result<(ExecutionResult, usize)> {
         let resp = client
             .post(url)
             .header("content-type", "application/json")
             .bearer_auth(token)
-            .body(serde_json::to_string(body).context("serialize managed execution body")?)
+            .body(body.to_owned())
             .send()
             .with_context(|| format!("POST {url}"))?;
         let status = resp.status();
@@ -814,6 +829,10 @@ mod execution {
         Ok((result, bytes))
     }
 
+    fn request_sha256(body: &str) -> String {
+        format!("sha256:{:x}", Sha256::digest(body.as_bytes()))
+    }
+
     fn read_capped(mut response: reqwest::blocking::Response, limit: u64) -> Result<String> {
         let mut bytes = Vec::new();
         response
@@ -832,16 +851,27 @@ mod execution {
     }
 
     fn validate_payloads(payloads: &[Payload]) -> Result<()> {
-        if payloads.iter().all(|payload| {
-            matches!(
-                payload,
-                Payload::MessageStart(_)
-                    | Payload::MessageDelta(_)
-                    | Payload::MessageEnd(_)
-                    | Payload::ToolCall(_)
-                    | Payload::Thinking(_)
-                    | Payload::Usage(_)
-            )
+        if payloads.iter().all(|payload| match payload {
+            Payload::MessageStart(_)
+            | Payload::MessageDelta(_)
+            | Payload::MessageEnd(_)
+            | Payload::ToolCall(_)
+            | Payload::Thinking(_) => true,
+            Payload::Usage(usage) => {
+                [
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.cache_read_input_tokens,
+                    usage.cache_creation_input_tokens,
+                ]
+                .into_iter()
+                .flatten()
+                .all(|tokens| tokens <= 10_000_000_000)
+                    && usage
+                        .cost_usd
+                        .is_none_or(|cost| cost.is_finite() && (0.0..=1_000_000.0).contains(&cost))
+            }
+            _ => false,
         }) {
             return Ok(());
         }
@@ -876,13 +906,14 @@ mod execution {
 /// `/workspace`; `finalize` asks the DO to snapshot `/workspace` back and returns
 /// the result handle. Both POST over HTTPS — the **only** channel the resolved R2
 /// creds + the repo password travel on. Kept in one submodule so the wire shapes
-/// (`{workspace:{repo,password,snapshot}}` / `{workspace:{repo,password}}`) and
+/// (`{workspace:{repo,password,snapshot}}` for both restore and backup) and
 /// the error mapping live together, mirroring [`input`].
 mod workspace_xfer {
     use std::io::Read as _;
 
     use anyhow::{Context, Result};
     use serde::Serialize;
+    use sha2::{Digest, Sha256};
 
     use crate::errors::PillboxError;
     use crate::workspace::rustic::S3Config;
@@ -920,7 +951,7 @@ mod workspace_xfer {
     /// provision capability. Non-2xx maps to a clear pillbox error.
     pub(super) fn provision(
         endpoint: &str,
-        token: &str,
+        capability_secret: &str,
         session_id: &str,
         repo: &S3Config,
         password: &str,
@@ -935,7 +966,14 @@ mod workspace_xfer {
             },
         })
         .context("serialize managed /provision body")?;
-        let resp = post(endpoint, "v2/workspaces/provision", token, body)?;
+        let token = super::mint_managed_capability(
+            "workspace_provision",
+            &request_sha256(&body),
+            Some(session_id),
+            None,
+            capability_secret,
+        );
+        let resp = post(endpoint, "v2/workspaces/provision", &token, body)?;
         let status = resp.status();
         if status.is_success() {
             return Ok(());
@@ -954,21 +992,29 @@ mod workspace_xfer {
     /// repo and returns `{ "resultSnapshot": "<handle>" }`. Returns the handle.
     pub(super) fn finalize(
         endpoint: &str,
-        token: &str,
+        capability_secret: &str,
         session_id: &str,
         repo: &S3Config,
         password: &str,
+        base_snapshot: &str,
     ) -> Result<String> {
         let body = serde_json::to_string(&ProvisionBody {
             session_id,
             workspace: WorkspaceRepo {
                 repo,
                 password,
-                snapshot: None,
+                snapshot: Some(base_snapshot),
             },
         })
         .context("serialize managed /finalize body")?;
-        let resp = post(endpoint, "v2/workspaces/finalize", token, body)?;
+        let token = super::mint_managed_capability(
+            "workspace_finalize",
+            &request_sha256(&body),
+            Some(session_id),
+            None,
+            capability_secret,
+        );
+        let resp = post(endpoint, "v2/workspaces/finalize", &token, body)?;
         let status = resp.status();
         if !status.is_success() {
             let detail = error_detail(resp);
@@ -1032,6 +1078,10 @@ mod workspace_xfer {
     /// HTTP status the caller already reports.
     fn error_detail(resp: reqwest::blocking::Response) -> String {
         read_capped(resp, 2048).unwrap_or_else(|_| "<unreadable or oversized body>".into())
+    }
+
+    fn request_sha256(body: &str) -> String {
+        format!("sha256:{:x}", Sha256::digest(body.as_bytes()))
     }
 
     fn read_capped(mut response: reqwest::blocking::Response, cap: u64) -> Result<String> {
@@ -1113,24 +1163,21 @@ mod workspace_xfer {
             );
         }
 
-        /// `/finalize` is the same shape minus `snapshot` (the DO snapshots
-        /// `/workspace`, it doesn't restore one) — `snapshot` is omitted, not null.
+        /// `/finalize` carries the restored base snapshot so the helper records
+        /// a repository-verifiable lineage edge on the result.
         #[test]
-        fn finalize_body_omits_the_snapshot_field() {
+        fn finalize_body_binds_the_base_snapshot() {
             let c = cfg();
             let body = serde_json::to_value(ProvisionBody {
                 session_id: "session-1",
                 workspace: WorkspaceRepo {
                     repo: &c,
                     password: "repo-pw",
-                    snapshot: None,
+                    snapshot: Some("base-snapshot"),
                 },
             })
             .unwrap();
-            assert!(
-                body["workspace"].get("snapshot").is_none(),
-                "finalize must omit `snapshot`, got: {body}"
-            );
+            assert_eq!(body["workspace"]["snapshot"], "base-snapshot");
             assert_eq!(body["workspace"]["repo"]["bucket"], "ws");
         }
     }
@@ -1506,6 +1553,7 @@ mod tests {
         use base64::Engine as _;
         let token = mint_managed_capability(
             "execute",
+            &format!("sha256:{}", "a".repeat(64)),
             Some("abc123def456"),
             Some("def456abc123"),
             "shared-secret",
@@ -1528,6 +1576,7 @@ mod tests {
         assert_eq!(back["version"], 1);
         assert_eq!(back["audience"], "pillbox-managed");
         assert_eq!(back["operation"], "execute");
+        assert_eq!(back["request_sha256"], format!("sha256:{}", "a".repeat(64)));
         assert_eq!(back["session_id"], "abc123def456");
         assert_eq!(back["invocation_id"], "def456abc123");
         assert!(back["expires_at_ms"].as_u64().is_some());
@@ -1540,7 +1589,13 @@ mod tests {
     fn mint_managed_capability_signs_the_claim_segment() {
         use base64::Engine as _;
         let secret = "deploy-secret";
-        let token = mint_managed_capability("status", None, Some("def456abc123"), secret);
+        let token = mint_managed_capability(
+            "status",
+            &format!("sha256:{}", "a".repeat(64)),
+            None,
+            Some("def456abc123"),
+            secret,
+        );
         let (claim_b64, sig_b64) = token.split_once('.').unwrap();
 
         let expected = hmac_sha256(secret.as_bytes(), claim_b64.as_bytes());
@@ -1555,7 +1610,13 @@ mod tests {
     #[test]
     fn managed_capability_signature_depends_on_secret() {
         use base64::Engine as _;
-        let token = mint_managed_capability("cancel", None, Some("def456abc123"), "secret-a");
+        let token = mint_managed_capability(
+            "cancel",
+            &format!("sha256:{}", "a".repeat(64)),
+            None,
+            Some("def456abc123"),
+            "secret-a",
+        );
         let (claim, signature) = token.split_once('.').unwrap();
         let alternate = hmac_sha256(b"secret-b", claim.as_bytes());
         let alternate = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(alternate);

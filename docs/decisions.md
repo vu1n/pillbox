@@ -196,3 +196,28 @@ Format: `STATUS` · what · why · what it means concretely · what's rejected.
   contract, and only scaffolding to move); keeping ghost permanently fused into
   pillbox (mixes mechanism/policy, blocks ghost's independent posture, invites the
   conductor LLM to leak into the substrate).
+
+## ADR-009 — Huddles owns collaboration; managed Pillbox is bounded execution
+**Status: Accepted (2026-08-31).** Governed by
+`doc://pillbox/managed-tier-do-gateway@0002#managed-tier-do-gateway`.
+
+- **Decision:** remove Pillbox's custom `SessionGateway` Durable Object and keep
+  Pillbox managed as a single-controller runtime. Huddles owns participants,
+  collaborative ordering, retry/cancel intent, driver policy, replay, and
+  fan-out. Pillbox owns Sandbox execution, policy enforcement, cancellation,
+  output, and snapshot/evidence references.
+- **Storage:** D1 holds bounded invocation claims and terminal references; R2
+  holds one immutable evidence/result artifact; Analytics Engine receives at
+  most one content-free point per terminal run; the caller's §0 log stays local.
+  Cloudflare Sandbox's vendor-owned DO may own container lifecycle. New
+  Pillbox-authored DO classes are default-deny and require a ratified amendment,
+  operation/retention budgets, telemetry, alerts, and a kill switch.
+- **Why:** Pillbox runs are single-player runtimes. Persisting logs, deltas,
+  driver state, and replay in a DO duplicated Huddles' collaboration role and
+  created unbounded read/write cost exposure.
+- **Cloudflare Computer:** evaluate only after this cutover in an isolated
+  preview namespace. Its preview status and DO-SQLite-backed VFS make it a
+  benchmark candidate, not an implicit production dependency.
+- **Rejected:** custom per-session DO logs, per-delta relational rows, recurring
+  polling alarms, startup/history scans, unbounded retention, and adopting
+  Computer before per-task correctness and cost are measured.

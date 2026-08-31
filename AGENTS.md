@@ -27,13 +27,14 @@ what you want.
 >
 > The **remote** backend plane was removed (`remote add/list/info/rm`,
 > `pillbox run --remote`, the `ssh://`/`e2b://`/`docker://` URL backends are gone).
-> "Remote" returns later as the managed/Cloudflare tier — a different shape, built
+> "Remote" returns as the managed/Cloudflare tier — a different shape, built
 > fresh against CF's API, **not** a port of local docker (so docker earns no
-> "twin" credit). Its §0-gateway substrate — a per-session Cloudflare Durable
-> Object (seq authority + actor attestation + driver arbitration + `subscribe`
-> fan-out) — is already built and proven live on CF's free tier
-> (`cloudflare-spike/`, docs/managed-tier.md); it is not yet a `pillbox run`
-> backend.
+> "twin" credit). Managed Pillbox is a **single-controller execution runtime**:
+> Cloudflare's Sandbox Durable Object may own the container lifecycle, while
+> bounded invocation claims live in D1, immutable evidence lives in R2, and
+> collaboration belongs to Huddles. Pillbox must not introduce a custom Durable
+> Object, remote §0 log, driver arbitration, replay broker, or per-delta storage.
+> See `docs/managed-tier.md` and `docs/durable-object-usage.md`.
 > Everything else (run, secrets, env, auth, vault, sessions, snapshots — and
 > local detach/reattach) is current.
 
@@ -106,6 +107,13 @@ from a partial memory of a large project.
   chat or a contradicting edit elsewhere.
 - **Backend = libkrun** (the direction note above). Docker's *backend* is
   deprecated/slated for deletion — don't add features to it.
+- **Durable Objects are default-deny.** Cloudflare Sandbox may use its own DO as
+  substrate; new Pillbox-authored DO classes require a ratified Brief amendment,
+  a per-operation read/write budget, retention bound, kill switch, and cost
+  telemetry before code. Never persist tokens, deltas, PTY frames, progress,
+  logs, or replay rows in a DO. Use D1 for bounded relational claims and R2 for
+  immutable/raw evidence. Run `node --test cloudflare-spike/do_usage_policy.test.mjs`
+  when changing Cloudflare topology.
 
 ## Context Vault (brief)
 

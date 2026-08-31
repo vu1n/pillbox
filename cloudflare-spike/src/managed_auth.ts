@@ -8,8 +8,6 @@ import {
   type PillboxExecutionGrantCurrentnessRequest,
   type PillboxExecutionGrantBinding,
   type PillboxExecutionGrantClaims,
-  type PillboxEvidenceReadCurrentnessRequest,
-  type PillboxEvidenceReadGrantClaims,
   type PillboxVerifiedSigner,
   type SignedPillboxExecutionGrant,
   validateExecutionGrantClaims,
@@ -20,7 +18,6 @@ import {
 export interface PillboxAuthorizationControlPlane {
   /** Currentness v2 is deliberately the same method name: old exact v1 request schemas must reject rather than downgrade. */
   authorizeExecutionGrant(input: PillboxExecutionGrantCurrentnessRequest): Promise<PillboxExecutionGrantClaims>;
-  authorizeEvidenceReadGrant?(input: PillboxEvidenceReadCurrentnessRequest): Promise<PillboxEvidenceReadGrantClaims>;
 }
 
 export class ManagedAuthorizationError extends Error {

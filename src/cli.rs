@@ -187,6 +187,10 @@ pub(crate) struct RemoteRepoBackup {
     /// Directory to snapshot into the repo.
     #[arg(long, value_name = "DIR")]
     pub(crate) target: String,
+    /// Full snapshot handle restored before this backup. The managed helper
+    /// records it as the result snapshot's lineage edge.
+    #[arg(long, value_name = "HANDLE")]
+    pub(crate) parent: String,
 }
 
 #[derive(Subcommand, Debug)]
@@ -320,6 +324,13 @@ pub(crate) enum SessionAction {
     /// summary from the durable log — the "what happened / why is it stuck"
     /// companion to `info`. Accepts a unique id prefix ≥ 4 chars.
     Diagnose {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Summarize a session's model usage and any managed infrastructure cost
+    /// envelope. Provider-reported spend is never presented as an all-in total.
+    Cost {
         id: String,
         #[arg(long)]
         json: bool,

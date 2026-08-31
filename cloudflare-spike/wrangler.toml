@@ -1,27 +1,27 @@
-# Keep the deployed Worker name and SessionGateway namespace stable while the
-# package graduates from spike status. A namespace transfer is a separate
-# coordinated Cloudflare migration, never a config rename.
+# Keep the deployed Worker name stable while the package graduates from spike
+# status. Historical namespace retirement is a separate release operation.
 name = "pillbox-do-spike"
 main = "src/worker.ts"
 compatibility_date = "2026-06-01"
-# The Agents SDK imports node built-ins; nodejs_compat is required.
+# Sandbox SDK dependencies use Node compatibility shims.
 compatibility_flags = ["nodejs_compat"]
-# Free-tier deploy: the §0 gateway only — no container. SQLite-backed DOs run on
-# the Workers free plan (proven: this worker + the SessionGateway DO uploaded
-# fine on a free account; only the container step needs Workers Paid). The full
-# container path lives in wrangler.container.toml (deploy with `-c`). `/input`
-# degrades to append-only when there's no Sandbox binding (see session_gateway).
+# Contract-only deploy: D1/R2 execution lifecycle without a container binding.
+# The full execution path lives in wrangler.container.toml (deploy with `-c`).
 workers_dev = true
 
-# The per-session §0 gateway. routeAgentRequest resolves
-# /agents/session-gateway/<sessionId>/*.
-[[durable_objects.bindings]]
-name = "SessionGateway"
-class_name = "SessionGateway"
+[[d1_databases]]
+binding = "EXECUTION_DB"
+database_name = "pillbox-execution-preview"
+database_id = "2bdaab2a-d0df-48cd-8fb5-fd4feeab091b"
+migrations_dir = "migrations"
 
-[[durable_objects.bindings]]
-name = "CredentialBroker"
-class_name = "CredentialBroker"
+[[r2_buckets]]
+binding = "EXECUTION_EVIDENCE"
+bucket_name = "pillbox-execution-evidence-preview"
+
+[[analytics_engine_datasets]]
+binding = "RUN_COSTS"
+dataset = "pillbox_execution_run_costs_preview"
 
 # Private Huddles authorization transport. The binding authenticates transport
 # only; every ensure/invoke call still carries a signed execution grant.
@@ -35,11 +35,9 @@ entrypoint = "PillboxAuthorizationControlPlaneEntrypoint"
 # tier provisions no container. The container config adds the binding + [[containers]].
 [[migrations]]
 tag = "v1"
+# Historical migration record. SessionGateway is deliberately not bound or
+# exported; deleting its existing namespace/data is a separate retention review.
 new_sqlite_classes = ["SessionGateway", "Sandbox"]
-
-[[migrations]]
-tag = "v2"
-new_sqlite_classes = ["CredentialBroker"]
 
 [observability]
 enabled = true

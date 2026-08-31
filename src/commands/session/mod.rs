@@ -111,6 +111,7 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> 
         SessionAction::List { json } => session_list(resolved, json),
         SessionAction::Info { id, json } => session_info(resolved, &id, json),
         SessionAction::Diagnose { id, json } => session_diagnose(resolved, &id, json),
+        SessionAction::Cost { id, json } => session_cost(resolved, &id, json),
         SessionAction::Attach { id } => session_attach(resolved, &id),
         SessionAction::Detach { id } => session_detach(resolved, &id),
         SessionAction::Rm { id } => session_rm(resolved, &id),
@@ -186,6 +187,35 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> 
         } => session_transcript(&file, &session_id, agent, follow),
         SessionAction::Artifact { action } => session_artifact(resolved, action),
     }
+}
+
+fn session_cost(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
+    let session = session::resolve(resolved, id)?;
+    let log = crate::events::log::SessionLog::open(resolved, &session.id)?;
+    let summary = crate::cost::RunCostEnvelope::from_events(&log.read_from(0)?);
+    if json {
+        println!("{}", serde_json::to_string(&summary)?);
+        return Ok(());
+    }
+
+    println!("session: {}", session.id);
+    println!("status: {}", summary.status);
+    println!(
+        "tokens: input={} output={} cache_read={} cache_create={}",
+        summary.model.input_tokens,
+        summary.model.output_tokens,
+        summary.model.cache_read_input_tokens,
+        summary.model.cache_creation_input_tokens,
+    );
+    match summary.known_cost_usd {
+        Some(cost) => println!("provider-reported cost: ${cost:.6}"),
+        None => println!("provider-reported cost: unavailable"),
+    }
+    if summary.infrastructure.is_none() {
+        println!("infrastructure usage: unavailable for this local log");
+    }
+    println!("estimated total cost: unavailable (no versioned rate card)");
+    Ok(())
 }
 
 fn session_transcript(
@@ -623,7 +653,7 @@ fn session_send(resolved: &Pillbox, id: &str, text: &str) -> Result<()> {
     // for a PTY agent. The command layer no longer branches on integration or
     // backend; a backend that can't drive rejects with the standard unsupported
     // shape.
-    sandbox::live_session(&s)?.send(text.as_bytes())?;
+    sandbox::live_session(&s)?.send(resolved, text.as_bytes())?;
     let target = if s.integration() == Integration::Server {
         crate::contract::InputTarget::Agent
     } else {
@@ -644,14 +674,9 @@ fn session_send(resolved: &Pillbox, id: &str, text: &str) -> Result<()> {
 /// steer. Best-effort + loud: the steer already succeeded, so a §0 logging failure
 /// is a warning, not a command failure.
 ///
-/// CAVEAT (the seq-authority fault line): this opens a *fresh* [`SessionLog`], which
-/// recovers `last_seq` from the file — a SECOND writer. If a `subscribe`/`watch`
-/// tailer is concurrently appending agent output to the same `log.jsonl` from
-/// another process (the Docker driven-session workflow), the two can assign the
-/// same `seq` (no cross-process lock), degrading a subscriber's `--from`/resume
-/// (dup/skip) — bytes stay intact (whole-line `O_APPEND`). libkrun is safe (one
-/// detached producer). The real fix is single-writer coordination / a resident
-/// sequencer (the deferred EventLog work); acceptable best-effort until then.
+/// This opens a fresh [`SessionLog`] and may write concurrently with a transcript
+/// tailer. [`SessionLog::append`] serializes those writers with its file lock and
+/// re-reads the durable maximum sequence under that lock.
 fn record_input(
     resolved: &Pillbox,
     session_id: &str,

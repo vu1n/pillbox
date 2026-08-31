@@ -13,11 +13,6 @@ export class ManagedAuthorizationControlPlaneEntrypoint extends WorkerEntrypoint
     return (input as { grant: unknown }).grant;
   }
 
-  authorizeEvidenceReadGrant(input: unknown): unknown {
-    assertCurrentnessV2(input);
-    currentnessCalls.push(input);
-    return (input as { grant: unknown }).grant;
-  }
 }
 
 export default {

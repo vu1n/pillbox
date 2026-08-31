@@ -185,6 +185,33 @@ test("step-finish without modelled tokens is ignored", () => {
   );
 });
 
+test("step-finish preserves provider-reported cost", () => {
+  const mapper = new OpencodeMapper();
+  assert.deepEqual(
+    mapper.onEvent(
+      ev("message.part.updated", {
+        part: {
+          id: "prt_cost",
+          messageID: "msg_cost",
+          type: "step-finish",
+          cost: 0.0125,
+          tokens: { input: 10, output: 2 },
+        },
+      }),
+    ),
+    [
+      {
+        type: "usage",
+        messageId: "msg_cost",
+        source: "native",
+        inputTokens: 10,
+        outputTokens: 2,
+        costUsd: 0.0125,
+      },
+    ],
+  );
+});
+
 test("snapshots, lifecycle, session.next.* and server.* are ignored", () => {
   const m = new OpencodeMapper();
   for (const e of [

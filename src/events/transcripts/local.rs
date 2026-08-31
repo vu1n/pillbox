@@ -38,7 +38,6 @@ use std::time::Duration;
 
 use super::{Harness, Tailer};
 use crate::events::log::SessionLog;
-use crate::events::sink::EventLog;
 
 /// Owns the background tailer thread for one local foreground run.
 /// Stopping is idempotent and happens on either [`shutdown`](Self::shutdown)
@@ -127,7 +126,7 @@ impl Drop for TailerHandle {
 /// discovery to this run's own transcript directory (see module docs);
 /// `None` discovers across the whole `watch_root` tree.
 pub(crate) fn spawn_local_tailer(
-    log: Option<Box<dyn EventLog + Send>>,
+    log: Option<SessionLog>,
     watch_root: PathBuf,
     scope_dir: Option<PathBuf>,
     harness: Harness,
@@ -164,13 +163,10 @@ pub(crate) fn spawn_attach_tailer(
 ) -> Option<TailerHandle> {
     let harness = Harness::for_agent(agent_id)?;
     let (watch_root, scope_dir) = harness.transcript_roots(home, guest_cwd);
-    // Read-side filler: takes a concrete local `SessionLog`, not the
-    // `open_event_log` swap point. A live read of a detached session in managed
-    // mode reads from the DO's WebSocket, not this local file — pushing to the
-    // DO here would double-write the resident sequencer. So this stays local; the
-    // managed swap is only at the foreground producer (`spawn_session_observability`).
+    // Read-side filler takes the concrete local session log used by every
+    // placement.
     Some(spawn_tailer(
-        Some(Box::new(log)),
+        Some(log),
         watch_root,
         scope_dir,
         harness,
@@ -183,7 +179,7 @@ pub(crate) fn spawn_attach_tailer(
 /// Shared spawn: discover the transcript under `watch_root`/`scope_dir` (the
 /// newest not in `exclude`), then follow it into the sinks until stopped.
 fn spawn_tailer(
-    log: Option<Box<dyn EventLog + Send>>,
+    log: Option<SessionLog>,
     watch_root: PathBuf,
     scope_dir: Option<PathBuf>,
     harness: Harness,
@@ -235,7 +231,7 @@ fn spawn_tailer(
 /// The session span is emitted unconditionally (a no-op without a
 /// collector) so it precedes any child spans.
 pub(crate) fn spawn_session_observability(
-    log: Option<Box<dyn EventLog + Send>>,
+    log: Option<SessionLog>,
     session_id: &str,
     agent_id: &str,
     home: &Path,

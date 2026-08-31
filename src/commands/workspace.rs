@@ -275,7 +275,13 @@ pub(crate) fn remote_backup(args: RemoteRepoBackup) -> Result<()> {
 
     let pw = RepoPassword::from_env("workspace backup")?;
     let backend = remote_backend("workspace backup", &args.coords, pw.path())?;
-    let snap = backend.push(&target, PushOptions::default())?;
+    let snap = backend.push(
+        &target,
+        PushOptions {
+            parents: vec![args.parent],
+            ..PushOptions::default()
+        },
+    )?;
     // The full 64-hex handle is the contract output — the DO reads it as
     // the final stdout line. Keep it the LAST thing printed; status goes
     // to stderr so stdout stays a clean single-line handle.

@@ -1,3 +1,5 @@
+import type { RunCostEnvelope } from "./run_cost.js";
+
 export type JsonPrimitive = null | boolean | number | string;
 export type JsonValue =
   | JsonPrimitive
@@ -50,9 +52,17 @@ export interface JsonSchemaOutputFormat {
   readonly retry_count: 2;
 }
 
+export interface TextOutputFormat {
+  readonly type: "text";
+  readonly retry_count: 0;
+}
+
+export type ExecutionOutputFormat = JsonSchemaOutputFormat | TextOutputFormat;
+
 export type Sha256Digest = `sha256:${string}`;
 export type ExecutionDigest = Sha256Digest;
 export type InvocationRequestHash = Sha256Digest;
+export const MAX_EVIDENCE_PAGE_SIZE = 100;
 
 export interface ExecuteInvocationV2Request {
   readonly contract_version: "pillbox.execution/2";
@@ -61,40 +71,82 @@ export interface ExecuteInvocationV2Request {
   readonly idempotency_key: string;
   readonly rendered_input: string;
   readonly rendered_input_hash: Sha256Digest;
-  readonly tool_policy: "deny_all";
+  readonly tool_policy: "deny_all" | "runtime_default";
   readonly execution: InvocationExecution;
   readonly execution_policy_revision: string;
-  readonly output_format: JsonSchemaOutputFormat;
+  /** Stable controller authorization context; volatile grant envelopes stay out. */
+  readonly controller_context_hash?: Sha256Digest;
+  readonly output_format: ExecutionOutputFormat;
 }
 
 export type ExecuteInvocationV2ErrorCode =
+  | "idempotency_conflict"
   | "unsupported_execution"
   | "unsupported_policy"
   | "auth_unavailable"
+  | "runtime_unavailable"
   | "runtime_busy"
   | "runtime_interrupted"
   | "runtime_failed"
   | "cancelled"
   | "structured_output_missing";
 
+export interface ExecutionAttribution {
+  readonly harness: Harness;
+  readonly transport: string;
+  readonly requested_model: string;
+  readonly served_model: string | null;
+}
+
+export interface ExecutionArtifactRef {
+  readonly key: string;
+  readonly media_type: "application/json";
+  readonly bytes: number;
+  readonly sha256: Sha256Digest;
+}
+
+/** A bounded projection of runtime evidence; the immutable artifact is canonical. */
+export interface ExecutionEvidencePage {
+  readonly from: number;
+  readonly next: number | null;
+  readonly truncated: boolean;
+  readonly events: readonly JsonValue[];
+  readonly artifact_ref?: ExecutionArtifactRef;
+}
+
+export interface GetInvocationV2Request {
+  readonly contract_version: "pillbox.execution/2";
+  readonly invocation_id: string;
+  readonly evidence_after: number;
+  readonly evidence_limit: number;
+}
+
+export interface CancelInvocationV2Request {
+  readonly contract_version: "pillbox.execution/2";
+  readonly invocation_id: string;
+  readonly idempotency_key: string;
+  readonly reason: string;
+}
+
 interface ExecuteInvocationV2ResultBase {
   readonly disposition: "created" | "reused";
+  readonly invocation_id: string;
+  readonly request_hash: InvocationRequestHash;
   readonly execution_digest: ExecutionDigest;
   readonly execution_policy_revision: string;
   readonly session_ref: {
     readonly session_id: string;
     readonly seq_range?: readonly [number, number];
   };
-  readonly attribution: {
-    readonly harness: "codex_app_server";
-    readonly requested_model: string;
-    readonly served_model: string | null;
-  };
+  readonly attribution: ExecutionAttribution;
+  readonly evidence: ExecutionEvidencePage;
+  readonly cost?: RunCostEnvelope;
 }
 
 export type ExecuteInvocationV2Result =
   | (ExecuteInvocationV2ResultBase & {
       readonly status: "running";
+      readonly retry_after_ms: number;
     })
   | (ExecuteInvocationV2ResultBase & {
       readonly status: "completed";
@@ -104,21 +156,33 @@ export type ExecuteInvocationV2Result =
       };
     })
   | (ExecuteInvocationV2ResultBase & {
-      readonly status: "failed" | "cancelled";
+      readonly status: "failed" | "cancelled" | "interrupted";
       readonly error: {
         readonly code: ExecuteInvocationV2ErrorCode;
         readonly message: string;
       };
+    })
+  | (ExecuteInvocationV2ResultBase & {
+      readonly status: "conflict";
+      readonly error: {
+        readonly code: "idempotency_conflict";
+        readonly message: string;
+        readonly existing_request_hash: InvocationRequestHash;
+        readonly requested_request_hash: InvocationRequestHash;
+      };
     });
 
-export class CodexExecutionBoundaryError extends Error {
+export class ExecutionBoundaryError extends Error {
   readonly code = "invalid_execute_invocation_v2_request" as const;
 
   constructor(message: string) {
     super(message);
-    this.name = "CodexExecutionBoundaryError";
+    this.name = "ExecutionBoundaryError";
   }
 }
+
+/** Compatibility name retained while callers move to the runtime-owned boundary. */
+export { ExecutionBoundaryError as CodexExecutionBoundaryError };
 
 export class UnsupportedCodexExecutionError extends Error {
   readonly code = "unsupported_execution" as const;
@@ -184,6 +248,7 @@ export async function validateExecuteInvocationV2Request(
       "tool_policy",
       "execution",
       "execution_policy_revision",
+      "controller_context_hash",
       "output_format",
     ],
     "request",
@@ -216,14 +281,24 @@ export async function validateExecuteInvocationV2Request(
   if (renderedInputHash !== expectedInputHash) {
     reject("rendered_input_hash does not match rendered_input");
   }
-  if (request.tool_policy !== "deny_all") {
-    reject("tool_policy must be 'deny_all'");
+  if (
+    request.tool_policy !== "deny_all" &&
+    request.tool_policy !== "runtime_default"
+  ) {
+    reject("tool_policy must be 'deny_all' or 'runtime_default'");
   }
 
   const executionPolicyRevision = requireNonEmptyString(
     request.execution_policy_revision,
     "execution_policy_revision",
   );
+  const controllerContextHash =
+    request.controller_context_hash === undefined
+      ? undefined
+      : requireDigest(
+          request.controller_context_hash,
+          "controller_context_hash",
+        );
   const execution = validateInvocationExecution(request.execution);
   const outputFormat = validateOutputFormat(request.output_format);
 
@@ -234,10 +309,68 @@ export async function validateExecuteInvocationV2Request(
     idempotency_key: idempotencyKey,
     rendered_input: renderedInput,
     rendered_input_hash: renderedInputHash,
-    tool_policy: "deny_all",
+    tool_policy: request.tool_policy,
     execution,
     execution_policy_revision: executionPolicyRevision,
+    ...(controllerContextHash === undefined
+      ? {}
+      : { controller_context_hash: controllerContextHash }),
     output_format: outputFormat,
+  };
+}
+
+/** Validate a bounded status/evidence read. Missing cursor fields use safe defaults. */
+export function validateGetInvocationV2Request(
+  value: unknown,
+): GetInvocationV2Request {
+  assertJsonValue(value, "request");
+  const request = requireObject(value, "request");
+  assertExactKeys(
+    request,
+    ["contract_version", "invocation_id", "evidence_after", "evidence_limit"],
+    "request",
+  );
+  requireContractVersion(request.contract_version);
+  const invocationId = requireNonEmptyString(request.invocation_id, "invocation_id");
+  const evidenceAfter =
+    request.evidence_after === undefined
+      ? 0
+      : requireNonNegativeInteger(request.evidence_after, "evidence_after");
+  const evidenceLimit =
+    request.evidence_limit === undefined
+      ? MAX_EVIDENCE_PAGE_SIZE
+      : requirePositiveInteger(request.evidence_limit, "evidence_limit");
+  if (evidenceLimit > MAX_EVIDENCE_PAGE_SIZE) {
+    reject(`evidence_limit must be <= ${MAX_EVIDENCE_PAGE_SIZE}`);
+  }
+  return {
+    contract_version: "pillbox.execution/2",
+    invocation_id: invocationId,
+    evidence_after: evidenceAfter,
+    evidence_limit: evidenceLimit,
+  };
+}
+
+/** Validate an idempotent cancellation intent without importing scheduler state. */
+export function validateCancelInvocationV2Request(
+  value: unknown,
+): CancelInvocationV2Request {
+  assertJsonValue(value, "request");
+  const request = requireObject(value, "request");
+  assertExactKeys(
+    request,
+    ["contract_version", "invocation_id", "idempotency_key", "reason"],
+    "request",
+  );
+  requireContractVersion(request.contract_version);
+  return {
+    contract_version: "pillbox.execution/2",
+    invocation_id: requireNonEmptyString(request.invocation_id, "invocation_id"),
+    idempotency_key: requireNonEmptyString(
+      request.idempotency_key,
+      "idempotency_key",
+    ),
+    reason: requireNonEmptyString(request.reason, "reason"),
   };
 }
 
@@ -372,8 +505,15 @@ function validateInvocationExecution(value: JsonValue | undefined): InvocationEx
   };
 }
 
-function validateOutputFormat(value: JsonValue | undefined): JsonSchemaOutputFormat {
+function validateOutputFormat(value: JsonValue | undefined): ExecutionOutputFormat {
   const outputFormat = requireObject(value, "output_format");
+  if (outputFormat.type === "text") {
+    assertExactKeys(outputFormat, ["type", "retry_count"], "output_format");
+    if (outputFormat.retry_count !== 0) {
+      reject("text output_format.retry_count must be 0");
+    }
+    return { type: "text", retry_count: 0 };
+  }
   assertExactKeys(
     outputFormat,
     ["type", "schema", "retry_count"],
@@ -399,6 +539,28 @@ function requireDigest(value: JsonValue | undefined, path: string): Sha256Digest
     reject(`${path} must match sha256:<64 lowercase hex>`);
   }
   return value as Sha256Digest;
+}
+
+function requireContractVersion(value: JsonValue | undefined): void {
+  if (value !== "pillbox.execution/2") {
+    reject("contract_version must be 'pillbox.execution/2'");
+  }
+}
+
+function requireNonNegativeInteger(
+  value: JsonValue | undefined,
+  path: string,
+): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    reject(`${path} must be a non-negative safe integer`);
+  }
+  return value;
+}
+
+function requirePositiveInteger(value: JsonValue | undefined, path: string): number {
+  const number = requireNonNegativeInteger(value, path);
+  if (number === 0) reject(`${path} must be greater than zero`);
+  return number;
 }
 
 function requireNonEmptyString(value: JsonValue | undefined, path: string): string {
@@ -439,8 +601,19 @@ function assertJsonValue(
   value: unknown,
   path: string,
   ancestors = new Set<object>(),
+  state: { nodes: number } = { nodes: 0 },
+  depth = 0,
 ): asserts value is JsonValue {
-  if (value === null || typeof value === "boolean" || typeof value === "string") return;
+  state.nodes += 1;
+  if (state.nodes > 20_000) reject(`${path} exceeds the JSON node limit`);
+  if (depth > 64) reject(`${path} exceeds the JSON depth limit`);
+  if (value === null || typeof value === "boolean") return;
+  if (typeof value === "string") {
+    if (new TextEncoder().encode(value).byteLength > 1024 * 1024) {
+      reject(`${path} exceeds the JSON string limit`);
+    }
+    return;
+  }
   if (typeof value === "number") {
     if (!Number.isFinite(value)) reject(`${path} contains a non-finite number`);
     return;
@@ -462,12 +635,12 @@ function assertJsonValue(
         if (!Object.prototype.hasOwnProperty.call(value, index)) {
           reject(`${path}[${index}] is missing`);
         }
-        assertJsonValue(value[index], `${path}[${index}]`, ancestors);
+        assertJsonValue(value[index], `${path}[${index}]`, ancestors, state, depth + 1);
       }
       return;
     }
     for (const [key, item] of Object.entries(value)) {
-      assertJsonValue(item, `${path}.${key}`, ancestors);
+      assertJsonValue(item, `${path}.${key}`, ancestors, state, depth + 1);
     }
   } finally {
     ancestors.delete(value);
@@ -480,8 +653,8 @@ function isJsonObject(value: unknown): value is Record<string, JsonValue> {
   return prototype === Object.prototype || prototype === null;
 }
 
-/** Byte-for-byte mirror of the repository's canonicalJson helper. */
-function canonicalJson(value: JsonValue): string {
+/** Deterministic JSON encoding shared by request hashing and compatibility adapters. */
+export function canonicalJson(value: JsonValue): string {
   if (value === null || typeof value === "boolean" || typeof value === "string") {
     return JSON.stringify(value);
   }
@@ -512,5 +685,5 @@ async function sha256Digest(value: string): Promise<Sha256Digest> {
 }
 
 function reject(message: string): never {
-  throw new CodexExecutionBoundaryError(message);
+  throw new ExecutionBoundaryError(message);
 }

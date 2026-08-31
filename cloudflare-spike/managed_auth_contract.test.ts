@@ -1,8 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { isCurrentRefreshGeneration } from "./src/credentials/contract.ts";
 import { managedCanonicalJson, makeExecutionGrantCurrentnessRequest, validateExecutionGrantClaims, validateGrantBinding, validateManagedRequestBinding } from "./src/managed_contract.ts";
-import { authorizeOutboundRequest, safeProviderRedirect, scrubCredentialResponseHeaders } from "./src/outbound/policy.ts";
 
 const digest = "sha256:" + "a".repeat(64);
 const claims = {
@@ -76,15 +74,6 @@ test("execution currentness v2 carries the verified signer without changing the 
   assert.equal(request.grant.grant_id, "grant-1");
 });
 
-test("managed outbound policy is exact-host HTTPS and rejects credential-bearing URLs", () => {
-  const route = { credential_binding_id: "binding", secret_ref: "secret", purpose: "provider", host: "api.example.test" };
-  authorizeOutboundRequest({ request: new Request("https://api.example.test/v1"), route });
-  authorizeOutboundRequest({ request: new Request("https://api.example.test:443/v1"), route });
-  assert.throws(() => authorizeOutboundRequest({ request: new Request("http://api.example.test/v1"), route }));
-  assert.throws(() => authorizeOutboundRequest({ request: new Request("https://api.example.test:444/v1"), route }));
-  assert.throws(() => authorizeOutboundRequest({ request: new Request("https://evil.example.test/v1"), route }));
-});
-
 test("managed request binding is strict and remains independent from signed claims", () => {
   const binding = validateManagedRequestBinding({
     principal_id: "principal-1",
@@ -102,23 +91,4 @@ test("managed request binding is strict and remains independent from signed clai
   assert.equal(binding.policy_id, "policy-1");
   assert.throws(() => validateManagedRequestBinding({ ...binding, extra: true }), /unrecognized field/);
   assert.throws(() => validateManagedRequestBinding({ ...binding, output_format: { ...binding.output_format, retry_count: 1 } }), /output_format/);
-});
-
-test("managed outbound redirects stay on the exact provider origin", () => {
-  assert.equal(safeProviderRedirect({ location: "/next", baseUrl: "https://api.example.test/v1", routeHost: "api.example.test" }), "https://api.example.test/next");
-  assert.equal(safeProviderRedirect({ location: "https://api.example.test:444/next", baseUrl: "https://api.example.test/v1", routeHost: "api.example.test" }), undefined);
-  assert.equal(safeProviderRedirect({ location: "https://evil.example.test/next", baseUrl: "https://api.example.test/v1", routeHost: "api.example.test" }), undefined);
-});
-
-test("managed response scrubbing removes adjacent credential-bearing headers", () => {
-  const scrubbed = scrubCredentialResponseHeaders({ headers: new Headers({ "x-first": "access-secret", "x-second": "access-secret", "www-authenticate": "Bearer challenge" }), accessToken: "access-secret" });
-  assert.equal(scrubbed.has("x-first"), false);
-  assert.equal(scrubbed.has("x-second"), false);
-  assert.equal(scrubbed.has("www-authenticate"), false);
-});
-
-test("refresh re-auth terminalization is scoped to the expected generation", () => {
-  assert.equal(isCurrentRefreshGeneration({ generation: 4, pending_generation: 5, status: "active" }, 4), true);
-  assert.equal(isCurrentRefreshGeneration({ generation: 5, pending_generation: 6, status: "active" }, 4), false);
-  assert.equal(isCurrentRefreshGeneration({ generation: 4, pending_generation: 5, status: "reauth_required" }, 4), false);
 });

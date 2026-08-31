@@ -28,11 +28,12 @@ agents, IDEs, and orchestrators can replay, drive, annotate, and hand off. We
 call that stream **§0**: the session's source of truth for messages, tool calls,
 inputs, actors, checkpoints, and externally verified results.
 
-The same contract has two placements:
+The runtime has two placements:
 
-- **Cloudflare managed (experimental):** one Durable Object per session is the
-  sequencer, actor authority, driver arbiter, replay store, and fan-out point. A
-  Cloudflare Container runs the agent.
+- **Cloudflare managed (experimental):** a Worker runs one bounded turn in
+  Cloudflare Sandbox. D1 stores the claim and terminal state, R2 stores one
+  immutable evidence artifact, and the caller appends that evidence to its
+  local §0 log. Huddles owns multiplayer collaboration.
 - **Local (working alpha):** a libkrun microVM runs the agent on your machine,
   with a local §0 log, credential broker, encrypted snapshots, detach/reattach,
   and verified workspace handoffs.
@@ -46,98 +47,25 @@ checks, and bring one passing workspace back for review.
 > not yet a hosted product or a polished end-user service. The gaps are listed
 > openly below.
 
-## One session contract, two placements
+## One runtime contract, two placements
 
-```mermaid
-flowchart LR
-    clients["People · agents · IDEs · orchestrators"]
+Local Pillbox runs the agent in a libkrun microVM and keeps the session log on
+disk. Experimental managed Pillbox runs one bounded turn in Cloudflare Sandbox,
+stores the invocation claim in D1 and immutable evidence in R2, then appends the
+returned evidence to the caller's local log.
 
-    subgraph managed["Cloudflare managed"]
-        do["Session Durable Object<br/>seq · actor · driver · replay · fan-out"]
-        container["Cloudflare Container<br/>agent + workspace"]
-        r2["R2<br/>encrypted workspace snapshots"]
-        do <--> container
-        container <--> r2
-    end
+Cloudflare Sandbox's vendor-owned Durable Object may own container lifecycle.
+Pillbox does not add a custom DO, remote event sequencer, replay broker, driver
+lease, or participant roster. Huddles owns those multiplayer concerns.
 
-    subgraph local["Local"]
-        gateway["Local §0 gateway<br/>send · watch · subscribe · annotate"]
-        vm["libkrun microVM<br/>agent + workspace"]
-        store["Local log + encrypted snapshots"]
-        gateway <--> vm
-        gateway <--> store
-    end
+Every terminal run records raw usage units—model tokens and provider cost,
+D1/R2 operations and bytes, Analytics Engine points, Sandbox time/profile—in a
+versioned cost envelope. Inspect it with `pillbox session cost <id>`.
 
-    clients <--> do
-    clients <--> gateway
-```
-
-The durable session contract is the product boundary. Cloudflare and libkrun
-are placements behind the same `SandboxBackend` / `LiveSession` plane; the
-event vocabulary stays the same.
-
-## Cloudflare is the headliner
-
-A Durable Object is the natural coordination unit for an agent session: one
-addressable, single-writer actor with co-located SQLite and hibernatable
-connections. Pillbox uses that shape directly instead of building a separate
-resident control plane.
-
-The managed path currently includes:
-
-- a per-session Agent/Durable Object with storage-backed monotonic sequence
-  assignment and replay-then-tail subscriptions;
-- gateway-stamped actor identity, attributed input and annotations, and a
-  durable single-driver slot with explicit release/steal transitions;
-- a Cloudflare Sandbox/Container consume path that maps a real opencode event
-  stream into the same §0 vocabulary used locally;
-- a Rust `ManagedBackend`, selected with `PILLBOX_BACKEND=managed`, that pushes
-  a workspace to encrypted rustic-on-R2 storage, provisions the container,
-  drives one foreground turn, waits for idle, finalizes the result, and records
-  the result snapshot;
-- prefix-scoped temporary R2 credentials, including end-to-end session-token
-  propagation, so the managed transfer does not need a bucket-wide secret;
-- machine-checked Rust/TypeScript contract parity plus auth, arbitration,
-  mapper, and workspace-credential tests.
-
-The Durable Object sequencer/replay path has run on Cloudflare's free tier. On
-2026-07-17 the paid Container path also completed the current scoped-credential
-flow end to end: snapshot to encrypted rustic-on-R2, mint a prefix-scoped
-temporary credential, restore in the container, run a real opencode turn, mint a
-fresh credential, finalize, then pull the result through `pillbox session pull`.
-The pulled workspace contained the exact agent-written marker, and neither the
-106-event durable log nor the persisted session record contained the tested
-credential values. One observed run took 40.27 seconds; treat that as a proof
-sample, not a latency benchmark. See the [runnable gateway
-spike](./cloudflare-spike/README.md) and the [managed-tier
-design/implementation record](./docs/managed-tier.md).
-
-What remains before calling managed product-ready:
-
-- user-facing identity and token provisioning instead of interim environment
-  configuration;
-- reconnect-and-replay after a Durable Object connection closes;
-- host-free detached finalization and complete remote teardown;
-- removal of the second TypeScript agent-event mapper as a contract-drift
-  surface;
-- a stable public deployment and end-user managed quickstart.
-
-### Run the free gateway proof locally
-
-This exercises real workerd + Durable Object SQLite locally. It needs Node.js
-22.6+ but no Cloudflare account, container, provider key, or paid plan.
-
-```sh
-git clone https://github.com/vu1n/pillbox.git
-cd pillbox/cloudflare-spike
-npm ci
-npm test
-../scripts/smoke/cf.sh
-```
-
-The smoke proves contract parity, actor attestation, authenticated writes,
-single-driver arbitration, non-driver annotation, ordered replay, and live
-fan-out. The container-backed falsifiers are documented in
+The managed tier remains experimental: foreground OpenCode turns are the
+implemented capability; managed detach/reconnect, hosted token UX, and a stable
+public deployment remain open. See the [managed runtime](./docs/managed-tier.md)
+and [Durable Object policy](./docs/durable-object-usage.md).
 [`cloudflare-spike/README.md`](./cloudflare-spike/README.md).
 
 ## Local is the superpower
@@ -264,8 +192,8 @@ This is pre-alpha security software, not a claim of perfect isolation. Read the
 - [`docs/session-event-log.md`](./docs/session-event-log.md) — the §0 contract.
 - [`docs/managed-tier.md`](./docs/managed-tier.md) — Cloudflare architecture,
   implementation status, and open questions.
-- [`cloudflare-spike/`](./cloudflare-spike/) — runnable Durable Object gateway
-  and container path.
+- [`cloudflare-spike/`](./cloudflare-spike/) — bounded D1/R2 execution and
+  Cloudflare Sandbox path.
 - [`docs/dispatch.md`](./docs/dispatch.md) — verified worker-loop contract.
 - [`scripts/ghost/`](./scripts/ghost/) — Ghost research tenant and evidence.
 - [`AGENTS.md`](./AGENTS.md) — coding-agent guide and canonical-doc router.

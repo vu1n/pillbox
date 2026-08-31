@@ -1,5 +1,5 @@
 # Copy to .dev.vars (gitignored) for `wrangler dev`. Set via `wrangler secret put` in prod.
-ACTOR_TOKEN_SECRET=replace-with-a-random-secret
+MANAGED_CAPABILITY_SECRET=replace-with-a-random-secret
 
 # opencode provider auth for the consume path (driveAgent), only needed for the
 # container deploy (wrangler.container.toml). Set ONE provider.

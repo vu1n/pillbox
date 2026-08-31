@@ -89,41 +89,6 @@ export type SignedPillboxExecutionGrant = {
   readonly signature: string;
 };
 
-export type ExecutionRealmRef = {
-  readonly runtime: "pillbox";
-  readonly execution_realm_id: string;
-};
-
-export type PillboxSessionRef = {
-  readonly realm: ExecutionRealmRef;
-  readonly session_id: string;
-  readonly seq?: number;
-  readonly seq_range?: readonly [number, number];
-  readonly event_cursor?: string;
-  readonly snapshot_ref?: string;
-};
-
-export type PillboxEvidenceReadGrantClaims = {
-  readonly version: "huddles.evidence-read-grant/1";
-  readonly grant_id: string;
-  readonly installation: PillboxInstallationRef;
-  readonly workspace_id: string;
-  readonly viewer_principal_id: string;
-  readonly policy_id: string;
-  readonly run_id: string;
-  readonly session_ref: PillboxSessionRef;
-  readonly issued_at: number;
-  readonly not_before: number;
-  readonly expires_at: number;
-};
-
-export type SignedPillboxEvidenceReadGrant = {
-  readonly algorithm: "Ed25519";
-  readonly key_id: string;
-  readonly claims: PillboxEvidenceReadGrantClaims;
-  readonly signature: string;
-};
-
 export type PillboxExecutionGrantBinding = {
   readonly operation: PillboxGrantOperation;
   readonly installation: PillboxInstallationRef;
@@ -140,15 +105,6 @@ export type PillboxExecutionGrantBinding = {
   readonly execution_identity_hash: string;
   readonly output_contract_hash: string;
   readonly runtime_policy: PillboxRuntimePolicy;
-};
-
-export type PillboxEvidenceReadBinding = {
-  readonly installation: PillboxInstallationRef;
-  readonly workspace_id: string;
-  readonly viewer_principal_id: string;
-  readonly policy_id: string;
-  readonly run_id: string;
-  readonly session_ref: PillboxSessionRef;
 };
 
 /**
@@ -173,26 +129,11 @@ export type PillboxExecutionGrantCurrentnessRequest = {
   readonly verified_signer: PillboxVerifiedSigner;
 };
 
-export type PillboxEvidenceReadCurrentnessRequest = {
-  readonly version: typeof PILLBOX_AUTHORIZATION_CURRENTNESS_VERSION;
-  readonly grant: PillboxEvidenceReadGrantClaims;
-  readonly expected: PillboxEvidenceReadBinding;
-  readonly verified_signer: PillboxVerifiedSigner;
-};
-
 export function makeExecutionGrantCurrentnessRequest(
   grant: PillboxExecutionGrantClaims,
   expected: PillboxExecutionGrantBinding,
   verifiedSigner: PillboxVerifiedSigner,
 ): PillboxExecutionGrantCurrentnessRequest {
-  return { version: PILLBOX_AUTHORIZATION_CURRENTNESS_VERSION, grant, expected, verified_signer: verifiedSigner };
-}
-
-export function makeEvidenceReadCurrentnessRequest(
-  grant: PillboxEvidenceReadGrantClaims,
-  expected: PillboxEvidenceReadBinding,
-  verifiedSigner: PillboxVerifiedSigner,
-): PillboxEvidenceReadCurrentnessRequest {
   return { version: PILLBOX_AUTHORIZATION_CURRENTNESS_VERSION, grant, expected, verified_signer: verifiedSigner };
 }
 
@@ -352,40 +293,6 @@ export function validateSignedExecutionGrant(value: unknown): SignedPillboxExecu
   return { algorithm: "Ed25519", key_id: nonEmpty(value.key_id, "grant.key_id"), claims: validateExecutionGrantClaims(value.claims), signature };
 }
 
-export function validateSessionRef(value: unknown): PillboxSessionRef {
-  if (!record(value) || !record(value.realm) || value.realm.runtime !== "pillbox") throw new ManagedContractError("managed session ref realm is invalid");
-  rejectUnknown(value, ["realm", "session_id", "seq", "seq_range", "event_cursor", "snapshot_ref"], "session ref");
-  rejectUnknown(value.realm, ["runtime", "execution_realm_id"], "session ref realm");
-  const session: { -readonly [K in keyof PillboxSessionRef]?: PillboxSessionRef[K] } = { realm: { runtime: "pillbox", execution_realm_id: nonEmpty(value.realm.execution_realm_id, "session_ref.realm.execution_realm_id") }, session_id: nonEmpty(value.session_id, "session_ref.session_id") };
-  if (value.seq !== undefined) session.seq = integer(value.seq, "session_ref.seq");
-  if (value.seq_range !== undefined) {
-    if (value.seq !== undefined) throw new ManagedContractError("session_ref cannot contain both seq and seq_range");
-    if (!Array.isArray(value.seq_range) || value.seq_range.length !== 2) throw new ManagedContractError("session_ref.seq_range must have two values");
-    const range: [number, number] = [integer(value.seq_range[0], "session_ref.seq_range[0]"), integer(value.seq_range[1], "session_ref.seq_range[1]")];
-    if (range[0] > range[1]) throw new ManagedContractError("session_ref.seq_range must be ordered");
-    session.seq_range = range;
-  }
-  if (value.event_cursor !== undefined) session.event_cursor = nonEmpty(value.event_cursor, "session_ref.event_cursor");
-  if (value.snapshot_ref !== undefined) session.snapshot_ref = nonEmpty(value.snapshot_ref, "session_ref.snapshot_ref");
-  return session as PillboxSessionRef;
-}
-
-/** The current reader supports only one positional sequence selector. */
-export function validatePositionalEvidenceSelector(value: unknown): PillboxSessionRef {
-  const session = validateSessionRef(value);
-  if (session.seq === undefined && session.seq_range === undefined) throw new ManagedContractError("evidence reader requires a positional selector");
-  if (session.event_cursor !== undefined || session.snapshot_ref !== undefined) throw new ManagedContractError("evidence reader does not support cursor or snapshot selectors");
-  return session;
-}
-
-export function validateEvidenceReadClaims(value: unknown): PillboxEvidenceReadGrantClaims {
-  if (!record(value) || value.version !== "huddles.evidence-read-grant/1") throw new ManagedContractError("evidence grant version is invalid");
-  rejectUnknown(value, ["version", "grant_id", "installation", "workspace_id", "viewer_principal_id", "policy_id", "run_id", "session_ref", "issued_at", "not_before", "expires_at"], "evidence grant");
-  const claims = { version: "huddles.evidence-read-grant/1", grant_id: nonEmpty(value.grant_id, "grant_id"), installation: installation(value.installation), workspace_id: nonEmpty(value.workspace_id, "workspace_id"), viewer_principal_id: nonEmpty(value.viewer_principal_id, "viewer_principal_id"), policy_id: nonEmpty(value.policy_id, "policy_id"), run_id: nonEmpty(value.run_id, "run_id"), session_ref: validateSessionRef(value.session_ref), issued_at: integer(value.issued_at, "issued_at"), not_before: integer(value.not_before, "not_before"), expires_at: integer(value.expires_at, "expires_at") } satisfies PillboxEvidenceReadGrantClaims;
-  if (claims.session_ref.realm.execution_realm_id !== claims.installation.execution_realm_id || !(claims.issued_at <= claims.not_before && claims.not_before < claims.expires_at)) throw new ManagedContractError("evidence grant binding or time window is invalid");
-  return claims;
-}
-
 function integer(value: unknown, field: string): number { if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) throw new ManagedContractError(`${field} must be a non-negative integer`); return value; }
 function record(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
 
@@ -397,54 +304,11 @@ export function managedCanonicalJson(value: unknown): string {
   return `{${Object.keys(object).sort().map((key) => `${JSON.stringify(key)}:${managedCanonicalJson(object[key])}`).join(",")}}`;
 }
 
-/**
- * Project an invocation onto the immutable request tuple.
- *
- * The signed grant is an authorization envelope, not invocation identity: a
- * response-loss retry may receive a new grant ID, signature, key, or validity
- * interval. Keep the independent request_binding so changed delivery,
- * execution, output, or runtime-policy facts still conflict.
- *
- * This also normalizes request_json written by the PR #145 deployment, which
- * persisted the complete envelope. Historical rows are read-only; callers
- * compare their normalized projection without rewriting them.
- */
-export function managedInvocationSemanticMaterial(value: unknown): unknown {
-  if (!record(value)) throw new ManagedContractError("managed invocation request must be an object");
-  const authorization = value.managed_authorization;
-  if (authorization === undefined) return value;
-  if (!record(authorization) || authorization.request_binding === undefined) {
-    throw new ManagedContractError("managed invocation authorization binding is unavailable");
-  }
-  return { ...value, managed_authorization: { request_binding: authorization.request_binding } };
-}
-
-export function managedInvocationSemanticJson(value: unknown): string {
-  return managedCanonicalJson(managedInvocationSemanticMaterial(value));
-}
-
-export async function managedInvocationSemanticHash(value: unknown): Promise<string> {
-  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(managedInvocationSemanticJson(value))));
-  return [...digest].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
 export function validateGrantBinding(claims: PillboxExecutionGrantClaims, expected: PillboxExecutionGrantBinding): string | undefined {
   const sameInstallation = claims.installation.installation_id === expected.installation.installation_id && claims.installation.execution_realm_id === expected.installation.execution_realm_id && claims.installation.protocol_revision === expected.installation.protocol_revision;
   const checks: [boolean, string][] = [
     [sameInstallation, "installation_mismatch"], [claims.organization_id === expected.organization_id, "organization_mismatch"], [claims.workspace_id === expected.workspace_id, "workspace_mismatch"], [claims.policy.principal_id === expected.principal_id, "principal_mismatch"], [claims.policy.policy_id === expected.policy_id, "policy_mismatch"], [claims.operations.includes(expected.operation), "operation_mismatch"], [claims.run_id === expected.run_id, "run_mismatch"], [claims.invocation_id === expected.invocation_id, "invocation_mismatch"], [claims.packet_id === expected.packet_id, "packet_mismatch"], [claims.delivery_receipt_id === expected.delivery_receipt_id, "delivery_receipt_mismatch"], [claims.session_idempotency_key === expected.session_idempotency_key, "session_idempotency_mismatch"], [claims.rendered_input_hash === expected.rendered_input_hash, "rendered_input_hash_mismatch"], [claims.execution_identity_hash === expected.execution_identity_hash, "execution_identity_hash_mismatch"], [claims.output_contract_hash === expected.output_contract_hash, "output_contract_hash_mismatch"], [managedCanonicalJson(claims.runtime_policy) === managedCanonicalJson(expected.runtime_policy), "runtime_policy_mismatch"],
   ];
-  return checks.find(([matches]) => !matches)?.[1];
-}
-
-export function validateEvidenceBinding(claims: PillboxEvidenceReadGrantClaims, expected: PillboxEvidenceReadBinding): string | undefined {
-  const sameSession = claims.session_ref.realm.execution_realm_id === expected.session_ref.realm.execution_realm_id && claims.session_ref.session_id === expected.session_ref.session_id;
-  const requested = expected.session_ref;
-  const requestedHasPosition = requested.seq !== undefined || requested.seq_range !== undefined || requested.event_cursor !== undefined || requested.snapshot_ref !== undefined;
-  const allowedRange = requested.seq === undefined && requested.seq_range === undefined || claims.session_ref.seq !== undefined || claims.session_ref.seq_range !== undefined;
-  const contained = requested.seq === undefined && requested.seq_range === undefined || requested.seq !== undefined && (claims.session_ref.seq !== undefined && requested.seq === claims.session_ref.seq || claims.session_ref.seq_range !== undefined && requested.seq >= claims.session_ref.seq_range[0] && requested.seq <= claims.session_ref.seq_range[1]) || requested.seq_range !== undefined && claims.session_ref.seq_range !== undefined && requested.seq_range[0] >= claims.session_ref.seq_range[0] && requested.seq_range[1] <= claims.session_ref.seq_range[1];
-  const cursorsMatch = requested.event_cursor === undefined || requested.event_cursor === claims.session_ref.event_cursor;
-  const snapshotsMatch = requested.snapshot_ref === undefined || requested.snapshot_ref === claims.session_ref.snapshot_ref;
-  const checks: [boolean, string][] = [[claims.installation.installation_id === expected.installation.installation_id && claims.installation.execution_realm_id === expected.installation.execution_realm_id, "installation_mismatch"], [claims.workspace_id === expected.workspace_id, "workspace_mismatch"], [claims.viewer_principal_id === expected.viewer_principal_id, "viewer_principal_mismatch"], [claims.policy_id === expected.policy_id, "policy_mismatch"], [claims.run_id === expected.run_id, "run_mismatch"], [sameSession && requestedHasPosition && allowedRange && contained && cursorsMatch && snapshotsMatch, "session_mismatch"]];
   return checks.find(([matches]) => !matches)?.[1];
 }
 

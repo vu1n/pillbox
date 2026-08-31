@@ -12,10 +12,10 @@ There are two security boundaries:
   unmatched host. Workspace and credential homes are per-run CoW clones with a
   pillbox-controlled secret exclusion policy.
 - **Managed, experimental:** a Cloudflare Container isolates the agent; a
-  per-session Durable Object authenticates actors, assigns sequence numbers,
-  arbitrates the driver, and stores the §0 log. Encrypted rustic snapshots live
-  in R2. Temporary R2 credentials are prefix-scoped and forwarded as the full
-  access-key/secret/session-token tuple.
+  bounded Worker execution service uses D1 for claims, R2 for one immutable
+  terminal artifact, and the caller's local `SessionLog` for §0. Cloudflare's
+  vendor-owned Sandbox Durable Object owns container lifecycle only. Huddles
+  owns collaboration and driver policy.
 
 The local Docker **agent backend** is deprecated. Docker is still in the build
 and auth trust path today: it materializes the OCI rootfs that libkrun boots and
@@ -32,7 +32,7 @@ tamper with those inputs even though it does not host the normal agent run.
 | Other host tools accidentally consuming pillbox state | Everything is namespaced under `~/.pillbox/` with restrictive perms. |
 | `pillbox secret show --reveal` accidentally piped to logs | Refused unless `--to-stdout` is also passed. |
 | Agent crosses the normal local sandbox boundary | The local agent runs in a hardware-isolated libkrun microVM, not a shared-kernel container. Guest egress terminates at the host-owned broker. |
-| Managed caller forges another participant | The Durable Object derives `actor` from a verified token and ignores body-supplied identity. Driver changes are gateway-authored control events. |
+| Managed caller invokes another run | Public Worker routes require an expiring capability bound to one operation, exact bounded request bytes, and exact session/invocation id; Huddles uses the trusted service binding and owns participant authorization. |
 | Managed workspace credential reaches outside its project | When scoping is enabled, the host mints a fresh prefix-scoped R2 credential per transfer; mint/shape failures abort rather than falling back silently. |
 
 ## What pillbox does NOT defend against
@@ -44,7 +44,7 @@ tamper with those inputs even though it does not host the normal agent run.
 | Compromised Docker daemon | Docker still materializes libkrun's OCI rootfs and runs OAuth login, so a root-equivalent daemon compromise can tamper with either. Daemonless OCI pull and auth-in-libkrun remain open structural debts. |
 | Kernel-level or hypervisor attacks | libkrun/HVF and Cloudflare's isolation reduce the shared-kernel attack surface; compromise of the host kernel, hypervisor, Cloudflare control plane, or VMM remains out of scope. |
 | Multi-user separation on a shared host | One secret store per OS user. 0600 blocks other non-root users from reading; a root user on the host bypasses it. |
-| Cloudflare/R2 compromise | Managed logs and encrypted workspace objects leave the local machine. Rustic protects workspace content at rest, but §0 event metadata/log content is trusted to the Cloudflare account boundary. Do not emit provider tokens or unredacted auth responses into §0. |
+| Cloudflare/R2 compromise | Managed terminal evidence and encrypted workspace objects leave the local machine. Rustic protects workspace content at rest; the local §0 copy still trusts evidence returned by the managed account boundary. Do not emit provider tokens or unredacted auth responses into evidence. |
 
 ## Where data lives (v0.6)
 
@@ -148,9 +148,16 @@ tracked migration debts, not supported alternative agent placements.
 
 ## Managed data boundary
 
-- The Durable Object stores the attributed §0 log and driver state. Do not place
-  raw OAuth tokens, provider auth responses, or workspace secrets in event
-  payloads.
+- Pillbox authors no Durable Object state. D1 stores one bounded invocation row,
+  R2 stores one immutable terminal artifact, Analytics Engine receives at most
+  one compact terminal point, and returned evidence is copied into the caller's
+  local session log.
+- Public requests carry short-lived controller capabilities scoped to one
+  operation, exact bounded request bytes, and exact resource. They are not
+  participant credentials and cannot be replayed with another request body or
+  for another status read, cancellation, session, or invocation.
+- The Worker has no generic Sandbox port/preview proxy; only the named bounded
+  execution and workspace routes are public.
 - Workspace content is encrypted and content-addressed by rustic in R2. The
   local `repo-password` is not persisted in the session record, but it crosses
   to the managed provision/finalize handler over HTTPS for the foreground
@@ -159,9 +166,14 @@ tracked migration debts, not supported alternative agent placements.
   another for finalize. The bucket-wide parent secret does not cross to
   Cloudflare on that path; the temporary session token is required and
   propagated end-to-end.
-- Managed identity currently uses interim token material supplied through the
-  environment. User-facing issuance, reconnect semantics, detached
-  finalization, and complete remote teardown are not yet product-ready.
+- Workspace endpoints are restricted to HTTPS Cloudflare R2 origins. Finalize
+  kills prompt-controlled processes before transfer credentials enter the
+  Sandbox. The backup records the provisioned base as its parent; the host
+  resolves that canonical 64-hex result in rustic and verifies the lineage
+  before persisting it.
+- Public managed turns are tool-denied until provider/workspace credentials are
+  brokered outside prompt-controlled processes. User-facing capability issuance,
+  reconnect semantics, detached finalization, and teardown remain experimental.
 
 ## Sessions (detach + reattach)
 

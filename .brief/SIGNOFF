@@ -59,6 +59,7 @@ workspace-ingest-sovereignty conforms: structured/cursor launch uses the existin
 libkrun-is-the-backend conforms: Cursor/pi Structured runs are libkrun-only; docker rejects them rather than gaining a parallel path.
 docker-backend-deleted conforms: docker rejects Integration::Structured rather than growing a docker structured path; no new docker features.
 runner-image-tags-name-roles conforms: build-runner.sh only adds the agent binary to the PATH check list; image tag roles are unchanged.
+runner-image-tags-name-roles conforms: the updater now refreshes every bundled harness while retaining the dev/latest/vX.Y.Z tag roles.
 qemu-parked conforms: sandbox/mod.rs only adds the structured module gate; QEMU remains parked and unselected.
 managed-store-of-record conforms: managed Session records gain an optional requested_execution field with default None; rustic-over-R2 workspace authority is unchanged.
 managed-tier-do-gateway conforms: managed.rs only fills the new Session field as None; DO gateway sequencing and drive path are untouched.

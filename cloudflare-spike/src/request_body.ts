@@ -4,6 +4,13 @@ export async function readBoundedJson(
   request: Request,
   maximumBytes = MAX_MANAGED_REQUEST_BYTES,
 ): Promise<unknown> {
+  return (await readBoundedJsonWithDigest(request, maximumBytes)).value;
+}
+
+export async function readBoundedJsonWithDigest(
+  request: Request,
+  maximumBytes = MAX_MANAGED_REQUEST_BYTES,
+): Promise<{ readonly value: unknown; readonly sha256: `sha256:${string}` }> {
   const declared = request.headers.get("content-length");
   if (declared !== null) {
     const bytes = Number(declared);
@@ -31,9 +38,14 @@ export async function readBoundedJson(
     bytes.set(chunk, offset);
     offset += chunk.byteLength;
   }
-  return JSON.parse(
+  const value: unknown = JSON.parse(
     new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes),
   );
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  const hex = [...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+  return { value, sha256: `sha256:${hex}` };
 }
 
 export class RequestBodyTooLargeError extends Error {

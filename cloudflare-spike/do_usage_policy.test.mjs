@@ -60,6 +60,8 @@ test("workspace finalize quiesces prompt-controlled processes before credentials
   assert.ok(kill >= 0 && transfer > kill);
   assert.match(source, /r2\\\.cloudflarestorage\\\.com/);
   assert.match(source, /verifyManagedCapability/);
+  assert.match(source, /workspace\.snapshot/);
+  assert.match(source, /--parent/);
   assert.doesNotMatch(source, /verifyActorToken|ACTOR_TOKEN_SECRET/);
 });
 
@@ -68,6 +70,7 @@ test("public execution uses scoped capabilities and denies runtime tools", () =>
   assert.match(source, /verifyManagedCapability/);
   assert.match(source, /tool_policy !== "deny_all"/);
   assert.match(source, /readBoundedJson/);
+  assert.match(source, /request_sha256/);
   assert.doesNotMatch(source, /verifyActorToken|ACTOR_TOKEN_SECRET/);
   assert.match(read("./src/execution_service.ts"), /request\.tool_policy !== "deny_all"/);
 });

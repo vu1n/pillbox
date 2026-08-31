@@ -40,10 +40,12 @@ and application counters are not a substitute for invoice reconciliation.
 ## Run-cost contract
 
 Each terminal execution records exactly one cost envelope in its immutable R2
-artifact. It contains raw provider and infrastructure units; it does not claim
-an all-in dollar total without a versioned rate card. Analytics Engine receives
-at most one derivative point, after the terminal D1 update. Retries and status
-reads emit no additional points.
+artifact, and every terminal client response carries that same envelope. The
+client rejects missing, inconsistent, non-finite, or out-of-budget cost evidence.
+It contains raw provider and infrastructure units; it does not claim an all-in
+dollar total without a versioned rate card. Analytics Engine receives at most
+one derivative point, after the terminal D1 update. Retries and status reads emit
+no additional points.
 
 Release owners must compare these envelopes with Cloudflare's D1, R2,
 Containers, Workers, Analytics Engine, and Durable Objects metrics/billing

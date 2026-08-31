@@ -14,11 +14,13 @@ const capability = {
   audience: "pillbox-managed",
   expires_at_ms: now + 60_000,
   operation: "execute",
+  request_sha256: `sha256:${"a".repeat(64)}`,
   session_id: "abc123def456",
   invocation_id: "def456abc123",
 };
 const scope = {
   operation: "execute",
+  request_sha256: `sha256:${"a".repeat(64)}`,
   session_id: "abc123def456",
   invocation_id: "def456abc123",
 };
@@ -37,6 +39,15 @@ test("managed capabilities are exact, expiring operation grants", async () => {
   );
   assert.equal(
     await verifyManagedCapability(token, secret, { ...scope, invocation_id: "other" }, now),
+    null,
+  );
+  assert.equal(
+    await verifyManagedCapability(
+      token,
+      secret,
+      { ...scope, request_sha256: `sha256:${"b".repeat(64)}` },
+      now,
+    ),
     null,
   );
   assert.equal(await verifyManagedCapability(token, secret, scope, capability.expires_at_ms), null);

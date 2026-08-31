@@ -17,12 +17,14 @@ export interface ManagedCapability {
   readonly audience: typeof MANAGED_CAPABILITY_AUDIENCE;
   readonly expires_at_ms: number;
   readonly operation: ManagedOperation;
+  readonly request_sha256: `sha256:${string}`;
   readonly session_id?: string;
   readonly invocation_id?: string;
 }
 
 export interface CapabilityScope {
   readonly operation: ManagedOperation;
+  readonly request_sha256: `sha256:${string}`;
   readonly session_id?: string;
   readonly invocation_id?: string;
 }
@@ -95,6 +97,7 @@ export async function verifyManagedCapability(
     );
     if (!isManagedCapability(value, now)) return null;
     if (value.operation !== expected.operation) return null;
+    if (value.request_sha256 !== expected.request_sha256) return null;
     if (value.session_id !== expected.session_id) return null;
     if (value.invocation_id !== expected.invocation_id) return null;
     return value;
@@ -115,6 +118,7 @@ function isManagedCapability(
     "audience",
     "expires_at_ms",
     "operation",
+    "request_sha256",
     "session_id",
     "invocation_id",
   ]);
@@ -130,7 +134,9 @@ function isManagedCapability(
     claim.expires_at_ms <= now ||
     claim.expires_at_ms > now + MAX_MANAGED_CAPABILITY_LIFETIME_MS ||
     typeof claim.operation !== "string" ||
-    !OPERATIONS.has(claim.operation as ManagedOperation)
+    !OPERATIONS.has(claim.operation as ManagedOperation) ||
+    typeof claim.request_sha256 !== "string" ||
+    !/^sha256:[0-9a-f]{64}$/.test(claim.request_sha256)
   ) {
     return false;
   }

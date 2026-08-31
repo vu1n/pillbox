@@ -187,6 +187,10 @@ pub(crate) struct RemoteRepoBackup {
     /// Directory to snapshot into the repo.
     #[arg(long, value_name = "DIR")]
     pub(crate) target: String,
+    /// Full snapshot handle restored before this backup. The managed helper
+    /// records it as the result snapshot's lineage edge.
+    #[arg(long, value_name = "HANDLE")]
+    pub(crate) parent: String,
 }
 
 #[derive(Subcommand, Debug)]

@@ -3,7 +3,10 @@ import { bearerToken, verifyManagedCapability } from "./auth.js";
 import { safeHuddlesRuntimeDiagnostic } from "./huddles_policy.js";
 import { deriveSandboxRuntimeId } from "./runtime_identity.js";
 import { OPENCODE_WORKSPACE_DIR } from "./opencode_turn.js";
-import { readBoundedJson, RequestBodyTooLargeError } from "./request_body.js";
+import {
+  readBoundedJsonWithDigest,
+  RequestBodyTooLargeError,
+} from "./request_body.js";
 import { workspaceExecEnv, type WorkspaceRepo } from "./workspace_repo.js";
 
 const WORKSPACE_XFER_TIMEOUT_MS = 300_000;
@@ -32,7 +35,8 @@ export async function routeWorkspaceTransfer(
     });
   }
   try {
-    const body = (await readBoundedJson(request)) as {
+    const decoded = await readBoundedJsonWithDigest(request);
+    const body = decoded.value as {
       sessionId?: unknown;
       workspace?: {
         repo?: WorkspaceRepo;
@@ -48,6 +52,7 @@ export async function routeWorkspaceTransfer(
       token === null ||
       (await verifyManagedCapability(token, env.MANAGED_CAPABILITY_SECRET, {
         operation,
+        request_sha256: decoded.sha256,
         session_id: sessionId,
       })) === null
     ) {
@@ -63,10 +68,7 @@ export async function routeWorkspaceTransfer(
     if (!workspace?.repo) throw new Error("workspace.repo is required");
     validateR2Repo(workspace.repo);
     const password = nonEmpty(workspace.password, "workspace.password");
-    const snapshot =
-      mode === "restore"
-        ? snapshotHandle(workspace.snapshot, "workspace.snapshot")
-        : undefined;
+    const snapshot = snapshotHandle(workspace.snapshot, "workspace.snapshot");
     const sandbox = getSandbox(env.Sandbox, await deriveSandboxRuntimeId(sessionId));
     if (mode === "backup") {
       // Finalize credentials must never overlap a prompt-controlled process.
@@ -184,7 +186,7 @@ async function execWorkspaceTool(
 function workspaceCmd(
   mode: "restore" | "backup",
   repo: WorkspaceRepo,
-  snapshot?: string,
+  snapshot: string,
 ): string {
   const args = [
     "/usr/local/bin/pillbox",
@@ -199,7 +201,10 @@ function workspaceCmd(
     "--prefix",
     shellQuote(repo.prefix),
   ];
-  if (snapshot) args.push("--snapshot", shellQuote(snapshot));
+  args.push(
+    mode === "restore" ? "--snapshot" : "--parent",
+    shellQuote(snapshot),
+  );
   args.push("--target", shellQuote(OPENCODE_WORKSPACE_DIR));
   return args.join(" ");
 }

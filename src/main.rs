@@ -27,6 +27,7 @@ mod cli;
 mod commands;
 mod config;
 mod contract;
+mod cost;
 mod docker;
 mod doctor;
 mod envs;
@@ -1367,6 +1368,8 @@ mod tests {
             "p",
             "--target",
             "/work",
+            "--parent",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ])
         .expect("frozen backup shape must parse");
         let Command::Workspace {
@@ -1379,6 +1382,10 @@ mod tests {
         assert_eq!(a.coords.bucket, "b");
         assert_eq!(a.coords.prefix, "p");
         assert_eq!(a.target, "/work");
+        assert_eq!(
+            a.parent,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
     }
 
     #[test]
@@ -1394,6 +1401,8 @@ mod tests {
             "b",
             "--target",
             "/work",
+            "--parent",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ])
         .unwrap();
         let Command::Workspace {
@@ -1403,6 +1412,23 @@ mod tests {
             panic!("expected workspace backup");
         };
         assert_eq!(a.coords.region, "auto");
+    }
+
+    #[test]
+    fn workspace_backup_requires_a_lineage_parent() {
+        let err = Cli::try_parse_from([
+            "pillbox",
+            "workspace",
+            "backup",
+            "--endpoint",
+            "https://x",
+            "--bucket",
+            "b",
+            "--target",
+            "/work",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     }
 
     #[test]

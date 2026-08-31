@@ -100,11 +100,10 @@ impl SandboxBackend for LibkrunBackend {
 
         // §0: tail the agent's transcript from the host-side creds clone into the
         // durable §0 sink (the same producer docker uses; no guest emitter).
-        // `open_or_warn` picks the placement — local file by default, managed
-        // Durable Object when the managed tier is on — and falls back to OTLP-only
-        // if the open fails. Spawned before the child so it's ready when the agent
+        // A local log-open failure stays loud but falls back to OTLP-only
+        // observability. Spawned before the child so it's ready when the agent
         // first writes.
-        let log = crate::events::sink::open_or_warn(resolved, &session_id);
+        let log = crate::events::log::SessionLog::open_or_warn(resolved, &session_id);
         let tailer = crate::events::transcripts::spawn_session_observability(
             log,
             &session_id,
@@ -2159,7 +2158,7 @@ impl crate::sandbox::LiveSession for LibkrunLiveSession {
         LibkrunBackend.capabilities()
     }
 
-    fn send(&self, bytes: &[u8]) -> Result<()> {
+    fn send(&self, _resolved: &Pillbox, bytes: &[u8]) -> Result<()> {
         // A server agent's prompt goes over its HTTP API; a PTY agent's is raw
         // keystrokes. Both flow through this one `send` so the command layer never
         // branches on integration.
@@ -2405,12 +2404,15 @@ mod tests {
         // fails at the handle decode (or the socket connect), NOT at the old
         // `caps().unsupported("send")` short-circuit. (Byte delivery to a live PTY
         // is the live smoke's job — this only proves the verb is wired.)
-        let live = LibkrunLiveSession::new(libkrun_pty_session());
-        let err = live.send(b"hi").unwrap_err().to_string();
-        assert!(
-            !err.contains("isn't supported on this backend"),
-            "PTY send must no longer be capability-unsupported, got: {err}"
-        );
+        crate::test_util::with_isolated_home("libkrun-pty-send", || {
+            let pb = Pillbox::resolve(None).unwrap();
+            let live = LibkrunLiveSession::new(libkrun_pty_session());
+            let err = live.send(&pb, b"hi").unwrap_err().to_string();
+            assert!(
+                !err.contains("isn't supported on this backend"),
+                "PTY send must no longer be capability-unsupported, got: {err}"
+            );
+        });
     }
 
     #[test]

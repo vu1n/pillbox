@@ -1,8 +1,9 @@
 // Port of pillbox/src/events/opencode.rs::EventMapper to TypeScript, for the
-// managed-tier §0 gateway's **consume path** (docs/managed-tier.md §Consume path).
+// managed execution runtime's bounded evidence path.
 //
 // One instance per session stream. `onEvent` maps a single opencode `/event`
-// envelope into zero or more §0 [`Payload`]s, which `SessionGateway` appends —
+// envelope into zero or more §0 [`Payload`]s, which the bounded execution
+// artifact preserves and the caller can append to its own event log —
 // stamped with the agent actor (never self-reported by opencode-in-the-box).
 //
 // Kept 1:1 with the Rust mapper. Two gates guard the "one §0, two backends"
@@ -64,11 +65,13 @@ function usageFromStep(part: any): Payload | null {
   const output = num(tokens, "output");
   const cacheRead = num(cache, "read");
   const cacheCreation = num(cache, "write");
+  const costUsd = num(part, "cost");
   if (
     input === undefined &&
     output === undefined &&
     cacheRead === undefined &&
-    cacheCreation === undefined
+    cacheCreation === undefined &&
+    costUsd === undefined
   ) {
     return null;
   }
@@ -80,6 +83,7 @@ function usageFromStep(part: any): Payload | null {
     ...(output !== undefined ? { outputTokens: output } : {}),
     ...(cacheRead !== undefined ? { cacheReadInputTokens: cacheRead } : {}),
     ...(cacheCreation !== undefined ? { cacheCreationInputTokens: cacheCreation } : {}),
+    ...(costUsd !== undefined ? { costUsd } : {}),
   };
 }
 

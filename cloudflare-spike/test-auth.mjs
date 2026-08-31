@@ -1,42 +1,86 @@
-// Unit test for the actor-token crypto (no worker needed). Run: node test-auth.mjs
-// (Node >= 23 strips the .ts types on import; auth.ts has only a type-only import.)
 import assert from "node:assert/strict";
-import { signActorToken, verifyActorToken, bearerToken } from "./src/auth.ts";
+import { test } from "node:test";
+import {
+  bearerToken,
+  signManagedCapability,
+  verifyManagedCapability,
+} from "./src/auth.ts";
 
 const secret = "test-secret-123";
-const actor = { kind: "human", id: "u:alice", display: "Alice" };
+const now = 1_700_000_000_000;
+const capability = {
+  version: 1,
+  subject: "controller:alice",
+  audience: "pillbox-managed",
+  expires_at_ms: now + 60_000,
+  operation: "execute",
+  request_sha256: `sha256:${"a".repeat(64)}`,
+  session_id: "abc123def456",
+  invocation_id: "def456abc123",
+};
+const scope = {
+  operation: "execute",
+  request_sha256: `sha256:${"a".repeat(64)}`,
+  session_id: "abc123def456",
+  invocation_id: "def456abc123",
+};
 
-// Round-trip: a token signed with the secret verifies back to the same actor.
-const tok = await signActorToken(actor, secret);
-assert.deepEqual(await verifyActorToken(tok, secret), actor, "roundtrip");
+test("managed capabilities are exact, expiring operation grants", async () => {
+  const token = await signManagedCapability(capability, secret);
+  assert.deepEqual(await verifyManagedCapability(token, secret, scope, now), capability);
+  assert.equal(await verifyManagedCapability(token, "wrong", scope, now), null);
+  assert.equal(
+    await verifyManagedCapability(token, secret, { ...scope, operation: "status" }, now),
+    null,
+  );
+  assert.equal(
+    await verifyManagedCapability(token, secret, { ...scope, session_id: "other" }, now),
+    null,
+  );
+  assert.equal(
+    await verifyManagedCapability(token, secret, { ...scope, invocation_id: "other" }, now),
+    null,
+  );
+  assert.equal(
+    await verifyManagedCapability(
+      token,
+      secret,
+      { ...scope, request_sha256: `sha256:${"b".repeat(64)}` },
+      now,
+    ),
+    null,
+  );
+  assert.equal(await verifyManagedCapability(token, secret, scope, capability.expires_at_ms), null);
+  const farFuture = await signManagedCapability(
+    { ...capability, expires_at_ms: now + 16 * 60 * 1000 },
+    secret,
+  );
+  assert.equal(await verifyManagedCapability(farFuture, secret, scope, now), null);
+});
 
-// Wrong secret → unforgeable: cannot verify without the issuer secret.
-assert.equal(await verifyActorToken(tok, "wrong-secret"), null, "wrong secret rejected");
+test("managed capabilities reject the wrong audience and malformed tokens", async () => {
+  const wrongAudience = await signManagedCapability(
+    { ...capability, audience: "another-service" },
+    secret,
+  );
+  assert.equal(await verifyManagedCapability(wrongAudience, secret, scope, now), null);
+  for (const token of ["", "garbage", "a.", ".b", "a.b.c", "%%%.$$$"]) {
+    assert.equal(await verifyManagedCapability(token, secret, scope, now), null);
+  }
+});
 
-// Tampered signature → rejected.
-assert.equal(await verifyActorToken(tok.slice(0, -2) + "AA", secret), null, "tampered sig rejected");
-
-// Swapped claim (attacker keeps a valid sig, swaps in a privileged actor) → rejected:
-// the sig is over the original claim, so it won't match the new one.
-const sig = tok.split(".")[1];
-const evilClaim = Buffer.from(JSON.stringify({ kind: "system", id: "pillbox" })).toString("base64url");
-assert.equal(await verifyActorToken(`${evilClaim}.${sig}`, secret), null, "swapped claim rejected");
-
-// A token claiming `system` → rejected: system is the gateway's own identity,
-// never token-borne (else any holder forges gateway-authored events).
-const sysTok = await signActorToken({ kind: "system", id: "pillbox" }, secret);
-assert.equal(await verifyActorToken(sysTok, secret), null, "system-kind token rejected");
-// ...but a well-signed service token is still accepted.
-const svcTok = await signActorToken({ kind: "service", id: "svc:ci" }, secret);
-assert.deepEqual(await verifyActorToken(svcTok, secret), { kind: "service", id: "svc:ci" }, "service token ok");
-
-// Malformed tokens → rejected, never throw.
-for (const bad of ["", "garbage", "a.", ".b", "no-dot"]) {
-  assert.equal(await verifyActorToken(bad, secret), null, `malformed rejected: ${JSON.stringify(bad)}`);
-}
-
-// Bearer extraction from an Authorization header.
-assert.equal(bearerToken(new Request("https://x/", { headers: { authorization: "Bearer abc.def" } })), "abc.def");
-assert.equal(bearerToken(new Request("https://x/")), null, "no header → null");
-
-console.log("auth tests passed");
+test("bearer extraction accepts one opaque token only", () => {
+  assert.equal(
+    bearerToken(
+      new Request("https://x/", { headers: { authorization: "Bearer abc.def" } }),
+    ),
+    "abc.def",
+  );
+  assert.equal(
+    bearerToken(
+      new Request("https://x/", { headers: { authorization: "Bearer abc def" } }),
+    ),
+    null,
+  );
+  assert.equal(bearerToken(new Request("https://x/")), null);
+});

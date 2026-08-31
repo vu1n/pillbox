@@ -74,7 +74,9 @@ jobs:
   # gate (scripts/smoke/libkrun.sh). The Linux path (cheap-KVM, CI VM-boot) is a
   # deferred task, and the intended Linux backend is QEMU, not libkrun-on-Linux.
   libkrun:
-    runs-on: macos-latest
+    # The `macos-15` runner label resolves to arm64 Sequoia, matching the
+    # libkrun toolchain's supported CI architecture.
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - name: Install rust
@@ -92,7 +94,12 @@ jobs:
         run: |
           brew tap libkrun/krun
           brew trust libkrun/krun
-          brew install libkrun libkrunfw
+          # The tap currently infers libkrunfw's version as `64` from its
+          # `aarch64` source URL, so its generated bottle URL does not match the
+          # published 5.5.0 asset. Build that one formula from its verified
+          # prebuilt source tarball, then install libkrun's normal bottle.
+          brew install --build-from-source libkrunfw
+          brew install libkrun
       - name: Clippy (libkrun)
         run: cargo clippy --all-targets --features libkrun -- -D warnings
       - name: Test (libkrun)

@@ -6,7 +6,7 @@ import {
   structuredOutputRetryPrompt,
   type HuddlesToolPolicy,
 } from "./huddles_policy.js";
-import type { JsonSchemaOutputFormat } from "./huddles_runtime.js";
+import type { JsonSchemaOutputFormat } from "./codex_execution.js";
 import { OpencodeMapper } from "./opencode_mapper.js";
 import { inspectRawStructuredOutput } from "./structured_output.js";
 
@@ -19,6 +19,9 @@ const TURN_TIMEOUT_MS = 300_000;
 const EVENT_OPEN_TIMEOUT_MS = 20_000;
 const REQUEST_TIMEOUT_MS = 30_000;
 const EVENT_IDLE_TIMEOUT_MS = 45_000;
+const MAX_OPENCODE_RESPONSE_BYTES = 256 * 1024;
+const MAX_OPENCODE_SSE_FRAME_BYTES = 256 * 1024;
+const MAX_OPENCODE_SSE_TOTAL_BYTES = 8 * 1024 * 1024;
 
 type SandboxHandle = ReturnType<typeof getSandbox>;
 
@@ -243,7 +246,11 @@ async function driveOpencodeAttempt(
       await cancelBody(eventResponse.body);
       return failed();
     }
-    const id = ((await created.json()) as { id?: string }).id;
+    const createdBody = await readResponseTextBounded(
+      created,
+      MAX_OPENCODE_RESPONSE_BYTES,
+    );
+    const id = (JSON.parse(createdBody) as { id?: string }).id;
     if (!id) {
       input.sink.appendError("opencode create session: no id in response");
       await cancelBody(eventResponse.body);
@@ -283,7 +290,10 @@ async function driveOpencodeAttempt(
     );
     if (!prompted.ok) {
       const detail = safeHuddlesRuntimeDiagnostic(
-        await prompted.text().catch(() => "response body unavailable"),
+        await readResponseTextBounded(
+          prompted,
+          MAX_OPENCODE_RESPONSE_BYTES,
+        ).catch(() => "response body unavailable or oversized"),
       );
       input.sink.appendError(
         `opencode prompt failed (HTTP ${prompted.status}): ${detail}`,
@@ -301,26 +311,20 @@ async function driveOpencodeAttempt(
 
   const mapper = new OpencodeMapper();
   let appended = 0;
-  let sawData = false;
   const iterator = sseEnvelopes(eventResponse.body)[Symbol.asyncIterator]();
   for (;;) {
-    const step = await withTimeoutValue(
-      iterator.next(),
-      EVENT_IDLE_TIMEOUT_MS,
-      "idle" as const,
-    );
-    if (step === "idle") {
+    let step: IteratorResult<unknown>;
+    try {
+      step = await iterator.next();
+    } catch (cause) {
       input.sink.appendError(
-        sawData
-          ? `agent turn stalled (no /event data for ${EVENT_IDLE_TIMEOUT_MS / 1_000}s)`
-          : `no /event data in ${EVENT_IDLE_TIMEOUT_MS / 1_000}s — DO→container SSE not streaming`,
+        `opencode /event stream rejected: ${safeHuddlesRuntimeDiagnostic(cause)}`,
       );
       await iterator.return?.(undefined);
       return failed(appended);
     }
     if (step.done) return attemptResult(mapper, appended);
 
-    sawData = true;
     let done = false;
     for (const payload of mapper.onEvent(step.value)) {
       if (appended >= input.eventBudget) {
@@ -471,6 +475,39 @@ async function cancelBody(body: ReadableStream<Uint8Array>): Promise<void> {
   }
 }
 
+async function readResponseTextBounded(
+  response: Response,
+  maximumBytes: number,
+): Promise<string> {
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let totalBytes = 0;
+  let text = "";
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (value) {
+        totalBytes += value.byteLength;
+        if (totalBytes > maximumBytes) {
+          throw new Error(`response exceeded ${maximumBytes} bytes`);
+        }
+        text += decoder.decode(value, { stream: true });
+      }
+      if (done) {
+        text += decoder.decode();
+        return text;
+      }
+    }
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {
+      // The stream may already be closed.
+    }
+  }
+}
+
 // Parse OpenCode `/event` SSE frames into JSON envelopes. Workers fetch already
 // de-chunks the transport, so this handles only SSE framing and closes the reader
 // when a bounded turn ends early.
@@ -481,10 +518,22 @@ async function* sseEnvelopes(
   const decoder = new TextDecoder();
   let buffer = "";
   let data = "";
+  let totalBytes = 0;
   try {
     for (;;) {
-      const { value, done } = await reader.read();
-      if (value) buffer += decoder.decode(value, { stream: true });
+      const { value, done } = await readStreamChunkWithTimeout(
+        reader,
+        EVENT_IDLE_TIMEOUT_MS,
+      );
+      if (value) {
+        totalBytes += value.byteLength;
+        if (totalBytes > MAX_OPENCODE_SSE_TOTAL_BYTES) {
+          throw new Error(
+            `event stream exceeded ${MAX_OPENCODE_SSE_TOTAL_BYTES} bytes`,
+          );
+        }
+        buffer += decoder.decode(value, { stream: true });
+      }
       let newline: number;
       while ((newline = buffer.indexOf("\n")) !== -1) {
         const line = buffer.slice(0, newline).replace(/\r$/, "");
@@ -493,6 +542,11 @@ async function* sseEnvelopes(
           const rest = line.slice(5);
           if (data !== "") data += "\n";
           data += rest.startsWith(" ") ? rest.slice(1) : rest;
+          if (data.length > MAX_OPENCODE_SSE_FRAME_BYTES) {
+            throw new Error(
+              `event stream frame exceeded ${MAX_OPENCODE_SSE_FRAME_BYTES} bytes`,
+            );
+          }
         } else if (line === "" && data !== "") {
           const frame = data;
           data = "";
@@ -502,6 +556,11 @@ async function* sseEnvelopes(
             // Skip non-JSON frames, matching the local OpenCode driver.
           }
         }
+      }
+      if (buffer.length > MAX_OPENCODE_SSE_FRAME_BYTES) {
+        throw new Error(
+          `event stream frame exceeded ${MAX_OPENCODE_SSE_FRAME_BYTES} bytes`,
+        );
       }
       if (done) break;
     }
@@ -518,5 +577,25 @@ async function* sseEnvelopes(
     } catch {
       // The stream may already be closed.
     }
+  }
+}
+
+export async function readStreamChunkWithTimeout(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  timeoutMs: number,
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      reader.read(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error(`no event-stream bytes for ${timeoutMs}ms`));
+          void reader.cancel("OpenCode event stream idle timeout").catch(() => {});
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }

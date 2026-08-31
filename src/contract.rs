@@ -535,6 +535,8 @@ pub(crate) struct Usage {
     pub(crate) cache_read_input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) cache_creation_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cost_usd: Option<f64>,
     pub(crate) source: UsageSource,
 }
 

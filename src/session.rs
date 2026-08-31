@@ -74,6 +74,7 @@ const SESSIONS_DIR: &str = "sessions";
 /// session-storage layout in the module that owns the session concept, rather
 /// than having callers reach into `sessions/` directly.
 pub(crate) fn session_dir(pb: &Pillbox, id: &str) -> Result<PathBuf> {
+    validate_storage_id(id, "session directory")?;
     let dir = pb.subdir(SESSIONS_DIR)?.join(id);
     fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     ensure_mode_0700(&dir)?;
@@ -121,9 +122,23 @@ impl Registry for SessionRegistry {
         format!("{name}.toml")
     }
     fn parse(raw: &str, source: &Path) -> Result<Self::Record> {
-        toml::from_str(raw).map_err(|e| {
-            PillboxError::config("session read", format!("{}: {e}", source.display())).into()
-        })
+        let record: Session = toml::from_str(raw).map_err(|e| {
+            PillboxError::config("session read", format!("{}: {e}", source.display()))
+        })?;
+        validate_storage_id(&record.id, "session read")?;
+        let expected = source.file_stem().and_then(|name| name.to_str());
+        if expected != Some(record.id.as_str()) {
+            return Err(PillboxError::config(
+                "session read",
+                format!(
+                    "record id `{}` does not match filename `{}`",
+                    record.id,
+                    source.display()
+                ),
+            )
+            .into());
+        }
+        Ok(record)
     }
 }
 impl IdRegistry for SessionRegistry {
@@ -159,11 +174,11 @@ pub(crate) enum Backend {
     /// parent — unlike local Docker, which can't keep a host-side proxy alive).
     Libkrun,
     /// Managed Cloudflare tier — the session runs on a CF container placed by the
-    /// §0-gateway Durable Object, not on this host. `sandbox_id` carries the DO
-    /// base URL + the DO-side session id (a JSON [`ManagedHandle`]); there's no
-    /// local process. Drive (`send`) and read (`subscribe`/`watch`) go over the
-    /// DO's HTTP/WebSocket surface, so attach/teardown route to the DO, never a
-    /// local container/VM. See docs/managed-tier.md + [`crate::sandbox::managed`].
+    /// Cloudflare execution runtime, not on this host. `sandbox_id` carries the
+    /// Worker origin and execution session id (a JSON [`ManagedHandle`]); there's
+    /// no local process. Drive (`send`) uses the Worker's HTTP surface and copies
+    /// returned evidence into the local session log. See docs/managed-tier.md and
+    /// [`crate::sandbox::managed`].
     Managed,
 }
 
@@ -181,7 +196,7 @@ impl Backend {
 /// Where a session physically runs — the dispatch axis attach/reattach/kill key
 /// off (docs/managed-tier.md §`Session` gains a `placement`). A *real* axis, not
 /// display sugar: a `Managed` session has no local sandbox to reach, so the plane
-/// routes its verbs to the §0 gateway DO instead of a local container/VM. Stored
+/// routes its verbs to the Worker instead of a local container/VM. Stored
 /// as a string (not the [`Backend`] label) so a future placement that reuses a
 /// transport — or an old record that predates the field — round-trips cleanly.
 /// `Local` is the default for every record written before this field existed.
@@ -192,9 +207,9 @@ pub(crate) enum Placement {
     /// (and default) case; attach/kill act on the local daemon/VMM directly.
     #[default]
     Local,
-    /// On the managed Cloudflare tier — a CF container behind the §0-gateway DO.
-    /// Attach = re-subscribe to the durable DO log (the session is durable
-    /// server-side); there is no local process to signal or tear down.
+    /// On the managed Cloudflare tier — a bounded turn in Cloudflare Sandbox.
+    /// Returned evidence is copied to the local session log; there is no local
+    /// process to signal or tear down.
     Managed,
 }
 
@@ -448,6 +463,7 @@ pub(crate) fn print_started_json(session: &Session) {
 /// Persist a session record. Used by both detached-start (writes the
 /// initial record) and attach (updates `attached_pid`).
 pub(crate) fn write(pb: &Pillbox, session: &Session) -> Result<()> {
+    validate_storage_id(&session.id, "session write")?;
     let body = toml::to_string(session)
         .map_err(|e| PillboxError::config("session write", e.to_string()))?;
     reg::write_record::<SessionRegistry>(pb, &session.id, body.as_bytes())
@@ -456,7 +472,33 @@ pub(crate) fn write(pb: &Pillbox, session: &Session) -> Result<()> {
 /// Read by exact id. Returns `Ok(None)` for missing records (callers
 /// usually want `resolve` instead, which accepts prefixes).
 pub(crate) fn read(pb: &Pillbox, id: &str) -> Result<Option<Session>> {
-    SessionRegistry::read_one(pb, id)
+    validate_storage_id(id, "session read")?;
+    let record = SessionRegistry::read_one(pb, id)?;
+    if let Some(record) = &record {
+        if record.id != id {
+            return Err(PillboxError::config(
+                "session read",
+                format!(
+                    "record id `{}` does not match filename id `{id}`",
+                    record.id
+                ),
+            )
+            .into());
+        }
+    }
+    Ok(record)
+}
+
+fn validate_storage_id(id: &str, action: &'static str) -> Result<()> {
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err(PillboxError::config(action, format!("invalid session id `{id}`")).into());
+    }
+    Ok(())
 }
 
 impl Session {
@@ -753,6 +795,16 @@ mod tests {
         let id = Session::new_id();
         assert_eq!(id.len(), 12);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn storage_ids_reject_path_components() {
+        for id in ["", ".", "..", "../escape", "a/b", "a\\b"] {
+            assert!(validate_storage_id(id, "test").is_err(), "accepted {id:?}");
+        }
+        for id in ["abc123def456", "sess-drive", "session_1"] {
+            assert!(validate_storage_id(id, "test").is_ok(), "rejected {id:?}");
+        }
     }
 
     #[test]

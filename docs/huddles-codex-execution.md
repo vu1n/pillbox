@@ -46,15 +46,14 @@ does not retry inside ACP; any retry decision remains Huddles orchestration.
 The Rust `sandbox::acp` module is deliberately a private supervisor seam only;
 it has no host command or production dispatch yet. The Cloudflare adapter is
 pure and injected-client based so its lifecycle contract is testable without
-changing the current gateway, worker, OpenCode path, or deployment image.
+changing Huddles orchestration or the deployment image.
 
 ## Versioned boundary
 
 Pillbox adds a private `pillbox.execution/2` contract in
 `cloudflare-spike/src/codex_execution.ts`. It is deliberately beside the
-historical OpenCode RPC; the existing `ensureSession`/`invokeSession` request,
-ledger rows, retries, and `a:opencode` evidence remain compatible and are not
-reinterpreted.
+historical OpenCode RPC; `ensureSession`/`invokeSession` remain as stateless
+compatibility adapters over the bounded D1/R2 execution service.
 
 The v2 request binds the substrate execution identity to the exact invocation
 input and output contract:
@@ -125,9 +124,8 @@ revisions must fail before Codex starts.
    invocation-scoped credential capabilities.
 2. Prove the sealed `deny_all` policy at that ACP boundary. Empty MCP alone is
    not proof of tool denial.
-3. Add Huddles adapter wiring only after the runtime sink/event contract is
-   reviewed; it must preserve `actor`, `execId`, `causationId`, and durable
-   idempotency in the gateway.
+3. Cut Huddles over to the generic execution methods while keeping actor,
+   collaboration order, retry intent, and visibility policy in Huddles.
 4. If native app-server is enabled in managed Huddles, replace the local
    auto-accept approval behavior with enforceable denial and separately review
    its managed credential path. It remains local-microVM-only for now.

@@ -19,7 +19,9 @@ registerHooks({
   },
 });
 
-const { driveOpencodeTurn } = await import("./src/opencode_turn.ts");
+const { driveOpencodeTurn, readStreamChunkWithTimeout } = await import(
+  "./src/opencode_turn.ts"
+);
 
 const outputFormat = {
   type: "json_schema" as const,
@@ -35,7 +37,7 @@ const outputFormat = {
   },
 };
 
-test("OpenCode turn returns exact structured output through the gateway sink", async () => {
+test("OpenCode turn returns exact structured output through the evidence sink", async () => {
   const transport = fakeTransport([
     sse(
       event("message.updated", {
@@ -135,6 +137,59 @@ test("OpenCode turn retries in a fresh session and records raw JSON acceptance",
   assert.deepEqual(evidence.errors, []);
 });
 
+test("OpenCode turn rejects an oversized session response before JSON parsing", async () => {
+  const transport = fakeTransport([sse(event("session.idle", {}))], {
+    sessionResponse: () =>
+      new Response(`{"id":"${"a".repeat(256 * 1024)}"}`, {
+        headers: { "content-type": "application/json" },
+      }),
+  });
+  const evidence = captureEvidence();
+
+  const output = await driveOpencodeTurn({
+    sandbox: transport.sandbox,
+    text: "hello",
+    model: "zai-coding-plan/glm-4.7",
+    config: { env: {} },
+    sink: evidence.sink,
+  });
+
+  assert.equal(output, undefined);
+  assert.match(evidence.errors[0] ?? "", /response exceeded 262144 bytes/);
+});
+
+test("OpenCode turn rejects an oversized SSE frame before accumulation", async () => {
+  const transport = fakeTransport([`data: ${"x".repeat(256 * 1024 + 1)}\n\n`]);
+  const evidence = captureEvidence();
+
+  const output = await driveOpencodeTurn({
+    sandbox: transport.sandbox,
+    text: "hello",
+    model: "zai-coding-plan/glm-4.7",
+    config: { env: {} },
+    sink: evidence.sink,
+  });
+
+  assert.equal(output, undefined);
+  assert.match(evidence.errors[0] ?? "", /event stream frame exceeded 262144 bytes/);
+});
+
+test("OpenCode SSE idle timeout directly cancels its pending reader", async () => {
+  let cancelled = false;
+  const stream = new ReadableStream<Uint8Array>({
+    cancel: () => {
+      cancelled = true;
+    },
+  });
+  const reader = stream.getReader();
+
+  await assert.rejects(
+    readStreamChunkWithTimeout(reader, 5),
+    /no event-stream bytes for 5ms/,
+  );
+  assert.equal(cancelled, true);
+});
+
 function captureEvidence(): {
   readonly agent: Payload[];
   readonly errors: string[];
@@ -166,7 +221,10 @@ function captureEvidence(): {
   };
 }
 
-function fakeTransport(eventStreams: readonly string[]): {
+function fakeTransport(
+  eventStreams: readonly string[],
+  options: { readonly sessionResponse?: () => Response } = {},
+): {
   readonly sandbox: never;
   readonly promptPaths: string[];
   readonly promptBodies: Array<{
@@ -194,6 +252,7 @@ function fakeTransport(eventStreams: readonly string[]): {
       }
       if (request.method === "POST" && path === "/session") {
         sessionIndex += 1;
+        if (options.sessionResponse) return options.sessionResponse();
         return Response.json({ id: `session:${sessionIndex}` });
       }
       if (request.method === "POST" && path.endsWith("/prompt_async")) {

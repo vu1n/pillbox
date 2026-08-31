@@ -27,7 +27,7 @@ libkrun-env-fork-substrate:
 managed-store-of-record:
   latest: 1
 managed-tier-do-gateway:
-  latest: 1
+  latest: 2
 optimization-external-substrate-primitives:
   latest: 1
 remote-backend-plane-removed:

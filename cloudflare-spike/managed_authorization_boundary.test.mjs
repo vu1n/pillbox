@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
 import { createHash, createPrivateKey, sign } from "node:crypto";
+import { execFile } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { promisify } from "node:util";
 import { unstable_dev } from "wrangler";
+
+const execFileAsync = promisify(execFile);
 
 const privateJwk = {
   crv: "Ed25519",
@@ -64,6 +68,27 @@ test("managed boundary authorizes fresh retries before replay and carries signer
       config: "wrangler.managed-auth-authority.toml",
       persist: false,
     });
+    await execFileAsync(
+      "npx",
+      [
+        "wrangler",
+        "d1",
+        "migrations",
+        "apply",
+        "pillbox-managed-auth-test",
+        "--local",
+        "--persist-to",
+        persistence,
+        "--config",
+        "wrangler.managed-auth-test.toml",
+      ],
+      {
+        env: {
+          ...process.env,
+          WRANGLER_LOG_PATH: join(persistence, "wrangler.log"),
+        },
+      },
+    );
     target = await unstable_dev("src/worker.ts", {
       ...workerOptions,
       config: "wrangler.managed-auth-test.toml",
@@ -110,7 +135,7 @@ test("managed boundary authorizes fresh retries before replay and carries signer
         request_binding: ensureBinding,
       },
     });
-    assert.equal(ensured.disposition, "created");
+    assert.equal(ensured.disposition, "reused");
 
     const invokeBinding = requestBinding({
       sessionIdempotencyKey: invocationId,
@@ -124,10 +149,7 @@ test("managed boundary authorizes fresh retries before replay and carries signer
       policy_id: policyId,
       run_id: runId,
       packet_id: packetId,
-      session_ref: {
-        realm: { runtime: "pillbox", execution_realm_id: "test-realm" },
-        session_id: ensured.session_ref.session_id,
-      },
+      session_ref: ensured.session_ref,
       delivery_receipt_id: "managed-delivery-1",
       rendered_input: renderedInput,
       rendered_input_hash: renderedInputHash,
@@ -137,6 +159,25 @@ test("managed boundary authorizes fresh retries before replay and carries signer
       execution_policy_revision: executionPolicyRevision,
       output_format: outputFormat,
     };
+    const { activity_principal_id: _omittedPrincipal, ...missingPrincipal } =
+      invokeBase;
+    await assert.rejects(
+      callPrivate(caller, "/invoke", {
+        ...missingPrincipal,
+        managed_authorization: {
+          grant: signedExecutionGrant({
+            grantId: "managed-grant-missing-principal",
+            sessionIdempotencyKey: invocationId,
+            deliveryReceiptId: "managed-delivery-1",
+          }),
+          request_binding: invokeBinding,
+        },
+      }),
+      (error) => {
+        assert.match(error.message, /activity_principal_id/);
+        return true;
+      },
+    );
     const firstInvoke = await callPrivate(caller, "/invoke", {
       ...invokeBase,
       managed_authorization: {
@@ -154,8 +195,8 @@ test("managed boundary authorizes fresh retries before replay and carries signer
     assert.equal(firstInvoke.error.code, "runtime_unavailable");
 
     // Model a response-loss retry: only the signed authorization envelope
-    // changes, after the original grant has expired. The DO must currentness-
-    // check this fresh grant before it reuses the durable terminal result.
+    // changes, after the original grant has expired. Pillbox must currentness-
+    // check this fresh grant before it reuses the bounded D1 terminal result.
     await new Promise((resolve) => setTimeout(resolve, 2_100));
     const secondInvoke = await callPrivate(caller, "/invoke", {
       ...invokeBase,
@@ -191,36 +232,46 @@ test("managed boundary authorizes fresh retries before replay and carries signer
       callPrivate(caller, "/invoke", conflictRequest),
       (error) => {
         assert.equal(error.code, "invoke_session_conflict");
-        assert.equal(
-          error.existing_request_hash,
-          semanticInvocationHash({
-            ...invokeBase,
-            managed_authorization: { request_binding: invokeBinding },
-          }),
-        );
-        assert.equal(error.requested_request_hash, semanticInvocationHash(conflictRequest));
+        assert.match(error.existing_request_hash, /^sha256:[0-9a-f]{64}$/);
+        assert.match(error.requested_request_hash, /^sha256:[0-9a-f]{64}$/);
         assert.notEqual(error.existing_request_hash, error.requested_request_hash);
         return true;
       },
     );
 
-    const evidenceRange = {
-      realm: { runtime: "pillbox", execution_realm_id: "test-realm" },
-      session_id: ensured.session_ref.session_id,
-      seq_range: [1, 2],
-    };
-    const evidence = await callPrivate(caller, "/evidence", {
-      grant: signedEvidenceGrant(evidenceRange),
-      session_ref: evidenceRange,
-      max_events: 10,
-    });
-    assert.equal(evidence.length, 2);
-    assert.equal(evidence[0].seq, 1);
-    assert.equal(evidence[1].seq, 2);
+    const changedPrincipal = "managed-principal-2";
+    await assert.rejects(
+      callPrivate(caller, "/invoke", {
+        ...invokeBase,
+        activity_principal_id: changedPrincipal,
+        managed_authorization: {
+          grant: signedExecutionGrant({
+            grantId: "managed-grant-principal-conflict",
+            sessionIdempotencyKey: invocationId,
+            deliveryReceiptId: "managed-delivery-1",
+            principalId: changedPrincipal,
+          }),
+          request_binding: requestBinding({
+            sessionIdempotencyKey: invocationId,
+            deliveryReceiptId: "managed-delivery-1",
+            principalId: changedPrincipal,
+          }),
+        },
+      }),
+      (error) => {
+        assert.equal(error.code, "invoke_session_conflict");
+        assert.notEqual(error.existing_request_hash, error.requested_request_hash);
+        return true;
+      },
+    );
 
     const callsResponse = await authority.fetch("http://authority.test/calls");
     const calls = await callsResponse.json();
-    assert.equal(calls.length, 5, "ensure, first invoke, fresh retry, conflict, evidence");
+    assert.equal(
+      calls.length,
+      5,
+      "ensure, first invoke, fresh retry, delivery conflict, principal conflict",
+    );
     assert.ok(
       calls.every(
         (call) =>
@@ -232,7 +283,6 @@ test("managed boundary authorizes fresh retries before replay and carries signer
       ),
     );
     assert.notEqual(calls[1].grant.grant_id, calls[2].grant.grant_id);
-    assert.equal(calls[4].grant.version, "huddles.evidence-read-grant/1");
   } finally {
     if (caller) await caller.stop();
     if (target) await target.stop();
@@ -257,9 +307,13 @@ async function callPrivate(worker, path, input) {
   return body;
 }
 
-function requestBinding({ sessionIdempotencyKey, deliveryReceiptId }) {
+function requestBinding({
+  sessionIdempotencyKey,
+  deliveryReceiptId,
+  principalId = "managed-principal",
+}) {
   return {
-    principal_id: "managed-principal",
+    principal_id: principalId,
     policy_id: "managed-policy",
     run_id: "managed-run",
     invocation_id: "managed-invocation",
@@ -278,6 +332,7 @@ function signedExecutionGrant({
   sessionIdempotencyKey,
   deliveryReceiptId,
   expiresIn = 120,
+  principalId = "managed-principal",
 }) {
   const now = Math.floor(Date.now() / 1000);
   const claims = {
@@ -287,7 +342,7 @@ function signedExecutionGrant({
     organization_id: "test-organization",
     workspace_id: "managed-workspace",
     policy: {
-      principal_id: "managed-principal",
+      principal_id: principalId,
       policy_id: "managed-policy",
     },
     operations: ["ensure_session", "invoke_session"],
@@ -305,34 +360,6 @@ function signedExecutionGrant({
     expires_at: now + expiresIn,
   };
   return signedEnvelope(claims);
-}
-
-function semanticInvocationHash(value) {
-  const authorization = value.managed_authorization;
-  const projection = {
-    ...value,
-    managed_authorization: {
-      request_binding: authorization.request_binding,
-    },
-  };
-  return createHash("sha256").update(canonicalJson(projection)).digest("hex");
-}
-
-function signedEvidenceGrant(sessionRef) {
-  const now = Math.floor(Date.now() / 1000);
-  return signedEnvelope({
-    version: "huddles.evidence-read-grant/1",
-    grant_id: "managed-evidence-grant",
-    installation,
-    workspace_id: "managed-workspace",
-    viewer_principal_id: "managed-viewer",
-    policy_id: "managed-policy",
-    run_id: "managed-run",
-    session_ref: sessionRef,
-    issued_at: now - 10,
-    not_before: now - 10,
-    expires_at: now + 120,
-  });
 }
 
 function signedEnvelope(claims) {

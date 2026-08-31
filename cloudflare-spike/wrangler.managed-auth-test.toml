@@ -13,23 +13,17 @@ PILLBOX_EXECUTION_REALM_ID = "test-realm"
 PILLBOX_PROTOCOL_REVISION = "pillbox.huddles/1"
 PILLBOX_ORGANIZATION_ID = "test-organization"
 
-[[durable_objects.bindings]]
-name = "SessionGateway"
-class_name = "SessionGateway"
+[[d1_databases]]
+binding = "EXECUTION_DB"
+database_name = "pillbox-managed-auth-test"
+database_id = "00000000-0000-0000-0000-000000000001"
+migrations_dir = "migrations"
 
-[[durable_objects.bindings]]
-name = "CredentialBroker"
-class_name = "CredentialBroker"
+[[r2_buckets]]
+binding = "EXECUTION_EVIDENCE"
+bucket_name = "pillbox-managed-auth-test-evidence"
 
 [[services]]
 binding = "PillboxAuthorizationControlPlane"
 service = "pillbox-managed-auth-authority"
 entrypoint = "ManagedAuthorizationControlPlaneEntrypoint"
-
-[[migrations]]
-tag = "v1"
-new_sqlite_classes = ["SessionGateway", "Sandbox"]
-
-[[migrations]]
-tag = "v2"
-new_sqlite_classes = ["CredentialBroker"]

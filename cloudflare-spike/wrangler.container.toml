@@ -1,32 +1,34 @@
-# Preserve the existing deployed Worker/DO namespace. Product promotion does
-# not silently orphan historical SessionGateway objects.
+# Preserve the existing deployed Worker name. Historical namespace retirement
+# remains a separate release operation.
 name = "pillbox-do-spike"
 main = "src/worker.ts"
 compatibility_date = "2026-06-01"
-# The Agents SDK imports node built-ins (diagnostics_channel, os, path via its
-# deps) — nodejs_compat is required or the bundle fails to resolve them.
+# Sandbox SDK dependencies use Node compatibility shims.
 compatibility_flags = ["nodejs_compat"]
 
+[[d1_databases]]
+binding = "EXECUTION_DB"
+database_name = "pillbox-execution-preview"
+database_id = "2bdaab2a-d0df-48cd-8fb5-fd4feeab091b"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "EXECUTION_EVIDENCE"
+bucket_name = "pillbox-execution-evidence-preview"
+
+[[analytics_engine_datasets]]
+binding = "RUN_COSTS"
+dataset = "pillbox_execution_run_costs_preview"
+
 [vars]
-# The paid/container deployment is the managed production surface; legacy
-# unsigned requests remain available only in the free compatibility smoke path.
+SANDBOX_PROFILE = "standard-2"
 MANAGED_AUTH_REQUIRED = "1"
 
-# The per-session §0 gateway. Binding name matches the class so routeAgentRequest
-# resolves /agents/session-gateway/<sessionId>/*.
-[[durable_objects.bindings]]
-name = "SessionGateway"
-class_name = "SessionGateway"
-
 # The Sandbox SDK's container-owning DO (one container per session, addressed by
-# the same sessionId). The gateway calls into it via getSandbox(env.Sandbox, …).
+# the execution session id). The Worker calls it through the Sandbox SDK.
 [[durable_objects.bindings]]
 name = "Sandbox"
 class_name = "Sandbox"
-
-[[durable_objects.bindings]]
-name = "CredentialBroker"
-class_name = "CredentialBroker"
 
 [[services]]
 binding = "PillboxAuthorizationControlPlane"
@@ -46,14 +48,11 @@ image = "./Dockerfile"
 max_instances = 5
 instance_type = "standard-2"
 
-# SQLite-backed storage migration (GA). Both DO classes are SQLite-backed.
+# Historical migration record. SessionGateway is not bound or exported; its
+# namespace/data retirement remains a separate retention review.
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["SessionGateway", "Sandbox"]
-
-[[migrations]]
-tag = "v2"
-new_sqlite_classes = ["CredentialBroker"]
 
 [observability]
 enabled = true

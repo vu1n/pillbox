@@ -19,7 +19,7 @@ every tagged CLI release.
 
 ## What's in it
 
-Five agent CLIs preinstalled at known paths:
+Six agent CLIs preinstalled at known paths:
 
 Every harness is **pinned** to a concrete version (an `ARG …_VERSION` in
 `runner/Dockerfile`) so Docker's layer cache reflects the version we ask for —
@@ -30,6 +30,7 @@ rebuild silently reuses the stale layer instead of pulling the newer agent.
 |---|---|---|---|
 | claude | native installer from `claude.ai/install.sh` (`claude install <ver>`) | `CLAUDE_VERSION` | yes — npm `@anthropic-ai/claude-code` (versions match the native release) |
 | codex | native installer from `chatgpt.com/codex/install.sh` | `CODEX_VERSION` | yes — github releases (`rust-v<ver>`) |
+| cursor | official `cursor.com/install` artifact | `CURSOR_AGENT_VERSION` | no — resolved from the official installer by `build-runner.sh --update` |
 | amp | `npm i -g @ampcode/cli@<pinned>` | `AMP_VERSION` | no — timestamp+sha versions defeat semver; bump by hand |
 | opencode | `npm i -g opencode-ai@<pinned>` | `OPENCODE_VERSION` | yes — npm |
 | pi | `npm i -g @earendil-works/pi-coding-agent@<pinned>` | `PI_VERSION` | yes — npm |
@@ -161,12 +162,12 @@ image, pillbox CLI assumes:
 
 ## Harness updates
 
-Renovate watches the npm packages pinned in `runner/Dockerfile`
-(via `# renovate:` hint comments) and opens PRs on upstream
-bumps. CI rebuilds the image on the PR for verification. Patch
-+ minor bumps auto-merge on green; major bumps hold for human
-review.
+Renovate watches supported package/release pins in `runner/Dockerfile`
+(via `# renovate:` hint comments) and opens PRs on upstream bumps. Cursor and
+Amp are refreshed by `build-runner.sh --update` from their official installer
+and npm metadata respectively. CI rebuilds the image on the PR for
+verification. Patch + minor bumps auto-merge on green; major bumps hold for
+human review.
 
-After merge to `main`, the `:rolling` tag is republished. The
-next CLI release picks up whatever's on `:rolling` and stamps
-it as `:vX.Y.Z` + `:latest`.
+After merge to `main`, the `:dev` tag is republished. The next CLI release
+stamps that image as `:vX.Y.Z` + `:latest`.

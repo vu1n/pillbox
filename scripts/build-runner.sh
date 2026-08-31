@@ -63,23 +63,28 @@ cur() { grep -E "^ARG ${1}=" "$DOCKERFILE" | head -1 | sed -E "s/^ARG ${1}=//"; 
 set_arg() { perl -i -pe "s/^ARG ${1}=.*\$/ARG ${1}=${2}/" "$DOCKERFILE"; }
 
 if [ "$DO_UPDATE" = 1 ]; then
-	need npm; need gh; need jq
+	need npm; need gh; need jq; need curl
 	# claude installs via its native installer, but its versions match the
 	# @anthropic-ai/claude-code npm package. codex tracks the latest *stable*
-	# (non-prerelease) github release (rust-v<ver> tag). amp/opencode/pi take the
-	# npm `latest` dist-tag.
+	# (non-prerelease) github release (rust-v<ver> tag). cursor's official
+	# installer pins the current lab artifact. amp/opencode/pi take the npm
+	# `latest` dist-tag.
 	CLAUDE_NEW=$(npm view @anthropic-ai/claude-code version)
 	CODEX_NEW=$(gh api repos/openai/codex/releases \
 		--jq '[.[] | select(.prerelease==false and .draft==false)][0].tag_name' | sed 's/^rust-v//')
+	CURSOR_NEW=$(curl -fsSL https://cursor.com/install \
+		| sed -nE 's#^DOWNLOAD_URL="https://downloads\.cursor\.com/lab/([^/]+)/\$\{OS\}/\$\{ARCH\}/agent-cli-package\.tar\.gz"$#\1#p' \
+		| head -1)
 	OPENCODE_NEW=$(npm view opencode-ai version)
 	PI_NEW=$(npm view @earendil-works/pi-coding-agent version)
 	AMP_NEW=$(npm view @ampcode/cli version)
 
 	changed=0
-	printf '  %-9s %-28s   %s\n' agent current latest
+	printf '  %-13s %-28s   %s\n' agent current latest
 	for row in \
 		"CLAUDE_VERSION:$CLAUDE_NEW" \
 		"CODEX_VERSION:$CODEX_NEW" \
+		"CURSOR_AGENT_VERSION:$CURSOR_NEW" \
 		"OPENCODE_VERSION:$OPENCODE_NEW" \
 		"PI_VERSION:$PI_NEW" \
 		"AMP_VERSION:$AMP_NEW"; do
@@ -87,7 +92,7 @@ if [ "$DO_UPDATE" = 1 ]; then
 		[ -n "$new" ] || { echo "✗ could not resolve latest for $name" >&2; exit 1; }
 		old=$(cur "$name"); mark=""
 		[ "$old" != "$new" ] && { mark="  ←"; changed=1; }
-		printf '  %-9s %-28s → %s%s\n' "${name%_VERSION}" "$old" "$new" "$mark"
+		printf '  %-13s %-28s → %s%s\n' "${name%_VERSION}" "$old" "$new" "$mark"
 		[ "$DRY_RUN" = 1 ] || set_arg "$name" "$new"
 	done
 

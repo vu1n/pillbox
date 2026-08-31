@@ -97,7 +97,7 @@ impl RunCostEnvelope {
                 Payload::Usage(usage) => {
                     let replace = by_message
                         .get(usage.message_id.as_str())
-                        .map_or(true, |current| {
+                        .is_none_or(|current| {
                             source_rank(usage.source) > source_rank(current.source)
                         });
                     if replace {

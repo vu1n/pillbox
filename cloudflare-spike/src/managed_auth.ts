@@ -5,7 +5,10 @@ import type {
   GetInvocationV2Request,
 } from "./codex_execution.js";
 import { verifyManagedEd25519Signature } from "./managed_signature.js";
-import { makeManagedVerifiedSigner } from "./managed_signer.js";
+import {
+  decodeManagedEd25519PublicKey,
+  makeManagedVerifiedSigner,
+} from "./managed_signer.js";
 import {
   isExecutionOperationGrantCurrent,
   managedCanonicalJson,
@@ -46,6 +49,111 @@ export class ManagedAuthorizationError extends Error {
     super(message, { cause });
     this.name = "ManagedAuthorizationError";
     this.code = code;
+  }
+}
+
+export class ManagedBootstrapError extends Error {
+  readonly code = "managed_bootstrap_unavailable" as const;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "ManagedBootstrapError";
+  }
+}
+
+export interface ManagedBurninBootstrapEnvironment {
+  readonly PILLBOX_BOOTSTRAP_REQUIRED?: string;
+  readonly MANAGED_CAPABILITY_SECRET?: string;
+  readonly PILLBOX_GRANT_KEY_ID?: string;
+  readonly PILLBOX_GRANT_PUBLIC_KEY?: string;
+  readonly PILLBOX_INSTALLATION_ID?: string;
+  readonly PILLBOX_EXECUTION_REALM_ID?: string;
+  readonly PILLBOX_PROTOCOL_REVISION?: string;
+  readonly PILLBOX_ORGANIZATION_ID?: string;
+  readonly PILLBOX_MANAGED_CONCURRENCY?: string;
+  readonly MANAGED_EXECUTION_EPOCH?: string;
+  readonly MANAGED_EXECUTION_LIMIT?: string;
+  readonly PillboxAuthorizationCurrentness?: PillboxAuthorizationCurrentness;
+}
+
+/**
+ * Runtime half of the isolated burn-in bootstrap gate. Static service names,
+ * resource IDs, key fingerprints, and container concurrency are checked by
+ * scripts/validate-burnin-bootstrap.mjs before deployment.
+ */
+export function requireManagedBurninBootstrap(
+  env: ManagedBurninBootstrapEnvironment,
+): void {
+  if (env.PILLBOX_BOOTSTRAP_REQUIRED === undefined) return;
+  if (env.PILLBOX_BOOTSTRAP_REQUIRED !== "1") {
+    throw new ManagedBootstrapError("managed burn-in bootstrap marker is not configured");
+  }
+
+  const pins: readonly [string, string | undefined][] = [
+    ["grant key ID", env.PILLBOX_GRANT_KEY_ID],
+    ["grant public key", env.PILLBOX_GRANT_PUBLIC_KEY],
+    ["installation", env.PILLBOX_INSTALLATION_ID],
+    ["execution realm", env.PILLBOX_EXECUTION_REALM_ID],
+    ["organization", env.PILLBOX_ORGANIZATION_ID],
+    ["execution epoch", env.MANAGED_EXECUTION_EPOCH],
+  ];
+  for (const [label, value] of pins) {
+    if (!isConfiguredBootstrapValue(value)) {
+      throw new ManagedBootstrapError(`managed burn-in ${label} is not configured`);
+    }
+  }
+  if (!isManagedEd25519PublicKey(env.PILLBOX_GRANT_PUBLIC_KEY!)) {
+    throw new ManagedBootstrapError("managed burn-in grant public key is invalid");
+  }
+  if (env.PILLBOX_PROTOCOL_REVISION !== "pillbox.huddles/1") {
+    throw new ManagedBootstrapError("managed burn-in protocol pin is not configured");
+  }
+  if (
+    env.PILLBOX_MANAGED_CONCURRENCY !== "1" ||
+    env.MANAGED_EXECUTION_LIMIT !== env.PILLBOX_MANAGED_CONCURRENCY
+  ) {
+    throw new ManagedBootstrapError("managed burn-in concurrency pins do not match");
+  }
+  if (
+    typeof env.PillboxAuthorizationCurrentness?.authorizeExecutionOperationGrant !==
+    "function"
+  ) {
+    throw new ManagedBootstrapError(
+      "managed burn-in authorization currentness service is not configured",
+    );
+  }
+}
+
+/** Public HTTP adds an HMAC capability without weakening private grant authorization. */
+export function requireManagedBurninHttpBootstrap(
+  env: ManagedBurninBootstrapEnvironment,
+): void {
+  requireManagedBurninBootstrap(env);
+  if (env.PILLBOX_BOOTSTRAP_REQUIRED === undefined) return;
+  if (!isConfiguredBootstrapValue(env.MANAGED_CAPABILITY_SECRET)) {
+    throw new ManagedBootstrapError(
+      "managed burn-in capability secret is not configured",
+    );
+  }
+  if (env.MANAGED_CAPABILITY_SECRET.length < 32) {
+    throw new ManagedBootstrapError("managed burn-in capability secret is invalid");
+  }
+}
+
+function isConfiguredBootstrapValue(value: string | undefined): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    !/placeholder|replace|unconfigured/i.test(value) &&
+    !/^<.*>$/.test(value)
+  );
+}
+
+function isManagedEd25519PublicKey(value: string): boolean {
+  try {
+    return new Set(decodeManagedEd25519PublicKey(value)).size > 1;
+  } catch {
+    return false;
   }
 }
 

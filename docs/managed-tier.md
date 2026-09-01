@@ -75,6 +75,12 @@ participant identity.
 
 - Foreground execution only; managed detach/reconnect is unsupported.
 - OpenCode over HTTP is the current executable capability.
+- Managed agent support is admitted at the first `ManagedBackend::run`
+  boundary. Any other agent, including Codex, returns
+  `unsupported_execution` before workspace resolution/snapshot, local session
+  persistence, scoped credential minting, provisioning, execution allowance,
+  or network access. This gate does not affect Codex on the local libkrun
+  backend.
 - Public HTTP uses short-lived controller capabilities bound to one operation,
   the exact bounded request bytes, and the exact session/invocation id. Huddles
   uses the trusted same-account service binding and owns participant/driver
@@ -128,7 +134,10 @@ The gate must:
 - verify the Wrangler binding list contains no Pillbox-authored DO class;
 - execute the deterministic workload, including an exact retry and bounded
   status pages;
-- fail before Sandbox provisioning for unsupported managed Codex;
+- run `scripts/smoke/managed-agent-preflight.sh` through the workload recorder
+  and retain its observed rejection output/hash and zero provision, network,
+  and state-write counters; copied manifest expectations are not release
+  evidence;
 - reconcile every `RunCostEnvelope` against captured D1, R2, Container, Worker,
   Analytics Engine, and vendor Sandbox/DO counters;
 - fail on unexplained counter deltas, more than one immutable artifact or

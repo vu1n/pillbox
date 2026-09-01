@@ -138,7 +138,7 @@
         "execution_policy_revision": "managed/burnin-v1",
         "session_ref": { "session_id": "burnin-session-1", "seq_range": [0, 0] },
         "evidence": { "from": 0, "next": null, "truncated": false, "event_count": 1, "artifact_ref": { "key": "executions/cbb2a2c73d113c48587fbbe4c31a515f739c2765456ada65e484d53b70aa11a3/9f8eee9eb3b6b2fb6bd36eb1b9889bd5b480cbceac0aba80a23b709f609d2e15.json", "media_type": "application/json", "bytes": 672, "sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" } },
-        "cost_ref": "sha256:568720abc440185bfc02afb28f3a9501a9550b42548f21da9a7cba400b8e66b1"
+        "cost_ref": "sha256:dab73a9a9ddafcb2ddd927da40fa430fd5037342a3079f7b63471fc3382fef7f"
       },
       {
         "step_id": "exact-retry",
@@ -152,7 +152,7 @@
         "execution_policy_revision": "managed/burnin-v1",
         "session_ref": { "session_id": "burnin-session-1", "seq_range": [0, 0] },
         "evidence": { "from": 0, "next": null, "truncated": false, "event_count": 1, "artifact_ref": { "key": "executions/cbb2a2c73d113c48587fbbe4c31a515f739c2765456ada65e484d53b70aa11a3/9f8eee9eb3b6b2fb6bd36eb1b9889bd5b480cbceac0aba80a23b709f609d2e15.json", "media_type": "application/json", "bytes": 672, "sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" } },
-        "cost_ref": "sha256:568720abc440185bfc02afb28f3a9501a9550b42548f21da9a7cba400b8e66b1"
+        "cost_ref": "sha256:dab73a9a9ddafcb2ddd927da40fa430fd5037342a3079f7b63471fc3382fef7f"
       },
       {
         "step_id": "status-page-1",
@@ -166,7 +166,7 @@
         "execution_policy_revision": "managed/burnin-v1",
         "session_ref": { "session_id": "burnin-session-1", "seq_range": [0, 0] },
         "evidence": { "from": 0, "next": null, "truncated": false, "event_count": 1, "artifact_ref": { "key": "executions/cbb2a2c73d113c48587fbbe4c31a515f739c2765456ada65e484d53b70aa11a3/9f8eee9eb3b6b2fb6bd36eb1b9889bd5b480cbceac0aba80a23b709f609d2e15.json", "media_type": "application/json", "bytes": 672, "sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" } },
-        "cost_ref": "sha256:568720abc440185bfc02afb28f3a9501a9550b42548f21da9a7cba400b8e66b1"
+        "cost_ref": "sha256:dab73a9a9ddafcb2ddd927da40fa430fd5037342a3079f7b63471fc3382fef7f"
       },
       {
         "step_id": "status-page-2",
@@ -180,7 +180,7 @@
         "execution_policy_revision": "managed/burnin-v1",
         "session_ref": { "session_id": "burnin-session-1", "seq_range": [0, 0] },
         "evidence": { "from": 100, "next": null, "truncated": false, "event_count": 0, "artifact_ref": { "key": "executions/cbb2a2c73d113c48587fbbe4c31a515f739c2765456ada65e484d53b70aa11a3/9f8eee9eb3b6b2fb6bd36eb1b9889bd5b480cbceac0aba80a23b709f609d2e15.json", "media_type": "application/json", "bytes": 672, "sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" } },
-        "cost_ref": "sha256:568720abc440185bfc02afb28f3a9501a9550b42548f21da9a7cba400b8e66b1"
+        "cost_ref": "sha256:dab73a9a9ddafcb2ddd927da40fa430fd5037342a3079f7b63471fc3382fef7f"
       }
     ],
     "preflight": {
@@ -209,7 +209,7 @@
     },
     "run_cost_envelopes": [
       {
-        "id": "sha256:568720abc440185bfc02afb28f3a9501a9550b42548f21da9a7cba400b8e66b1",
+        "id": "sha256:dab73a9a9ddafcb2ddd927da40fa430fd5037342a3079f7b63471fc3382fef7f",
         "execution_identity": {
           "invocation_id": "burnin-invocation-1",
           "idempotency_key": "burnin-invocation-1",
@@ -220,7 +220,7 @@
         },
         "artifact_ref": { "key": "executions/cbb2a2c73d113c48587fbbe4c31a515f739c2765456ada65e484d53b70aa11a3/9f8eee9eb3b6b2fb6bd36eb1b9889bd5b480cbceac0aba80a23b709f609d2e15.json", "media_type": "application/json", "bytes": 672, "sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" },
         "artifact_count": 1,
-        "analytics_point_count": 1,
+        "analytics_points_planned": 1,
         "cost": {
           "version": 1,
           "status": "completed",
@@ -238,7 +238,7 @@
             "r2_writes": 1,
             "r2_bytes_read": 0,
             "r2_bytes_written": 672,
-            "analytics_points_written": 1,
+            "analytics_points_planned": 1,
             "sandbox_duration_ms": 2500,
             "sandbox_profile": "standard-2"
           },
@@ -261,7 +261,7 @@
             "cleanup_calls": 0
           },
           "worker": { "requests": 1 },
-          "analytics_engine": { "points_written": 1 },
+          "analytics_engine": { "points_written": 1, "variance_from_planned": 0 },
           "vendor_sandbox_do": {
             "class_name": "Sandbox",
             "instances_started": 1,

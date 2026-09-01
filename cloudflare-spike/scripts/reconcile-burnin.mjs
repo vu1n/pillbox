@@ -40,6 +40,11 @@ const integer = (value, path) => {
   check(valid, `${path} must be a non-negative safe integer`);
   return valid ? value : 0;
 };
+const signedInteger = (value, path) => {
+  const valid = Number.isSafeInteger(value);
+  check(valid, `${path} must be a safe integer`);
+  return valid ? value : 0;
+};
 const string = (value, path) => {
   check(typeof value === "string" && value.length > 0, `${path} must be non-empty`);
   return typeof value === "string" ? value : "";
@@ -216,9 +221,10 @@ const runs = array(capture.run_cost_envelopes, "capture.run_cost_envelopes");
 check(runs.length === reviewedCount, "there must be exactly one captured RunCostEnvelope per genuinely new execution");
 const runIds = new Set();
 const observedRuns = [];
+let plannedAnalyticsPoints = 0;
 for (const [index, rawRun] of runs.entries()) {
   const run = record(rawRun, `capture.run_cost_envelopes[${index}]`);
-  exactKeys(run, ["id", "execution_identity", "artifact_ref", "artifact_count", "analytics_point_count", "cost", "observed"], `capture.run_cost_envelopes[${index}]`);
+  exactKeys(run, ["id", "execution_identity", "artifact_ref", "artifact_count", "analytics_points_planned", "cost", "observed"], `capture.run_cost_envelopes[${index}]`);
   const runId = string(run.id, `capture.run_cost_envelopes[${index}].id`);
   const runIdentity = executionIdentity(run.execution_identity, `capture.run_cost_envelopes[${index}].execution_identity`);
   const runArtifact = artifactRef(run.artifact_ref, `capture.run_cost_envelopes[${index}].artifact_ref`);
@@ -233,8 +239,10 @@ for (const [index, rawRun] of runs.entries()) {
   const infra = record(cost.infrastructure, `${runId}.cost.infrastructure`);
   check(runArtifact.bytes === integer(infra.r2_bytes_written, `${runId}.cost.infrastructure.r2_bytes_written`), `${runId} artifact byte identity disagrees with its RunCostEnvelope`);
   check(integer(run.artifact_count, `${runId}.artifact_count`) === 1, `${runId} must have exactly one immutable R2 artifact`);
-  check(integer(run.analytics_point_count, `${runId}.analytics_point_count`) <= 1, `${runId} emitted more than one Analytics Engine point`);
-  check(integer(run.analytics_point_count, `${runId}.analytics_point_count`) === infra.analytics_points_written, `${runId} Analytics capture disagrees with its RunCostEnvelope`);
+  const analyticsPointsPlanned = integer(run.analytics_points_planned, `${runId}.analytics_points_planned`);
+  plannedAnalyticsPoints += analyticsPointsPlanned;
+  check(analyticsPointsPlanned <= 1, `${runId} plans more than one Analytics Engine point`);
+  check(analyticsPointsPlanned === infra.analytics_points_planned, `${runId} Analytics plan disagrees with its RunCostEnvelope`);
   check(integer(run.artifact_count, `${runId}.artifact_count`) === integer(infra.r2_writes, `${runId}.cost.infrastructure.r2_writes`), `${runId} R2 artifact count disagrees with its RunCostEnvelope`);
   if (partial) {
     check(run.observed === null, `${runId}.observed must remain null in the Huddles partial`);
@@ -246,6 +254,11 @@ for (const [index, rawRun] of runs.entries()) {
   const container = record(observed.container, `${runId}.observed.container`);
   const worker = record(observed.worker, `${runId}.observed.worker`);
   const analytics = record(observed.analytics_engine, `${runId}.observed.analytics_engine`);
+  exactKeys(analytics, ["points_written", "variance_from_planned"], `${runId}.observed.analytics_engine`);
+  const analyticsPointsWritten = integer(analytics.points_written, `${runId}.observed.analytics_engine.points_written`);
+  const analyticsVariance = signedInteger(analytics.variance_from_planned, `${runId}.observed.analytics_engine.variance_from_planned`);
+  check(analyticsPointsWritten <= 1, `${runId} provider observed more than one Analytics Engine point`);
+  check(analyticsVariance === analyticsPointsWritten - analyticsPointsPlanned, `${runId} Analytics Engine variance does not reconcile observed writes against planned units`);
   const vendor = validateVendorCounters(observed.vendor_sandbox_do, `${runId}.observed.vendor_sandbox_do`);
   check(integer(infra.d1_rows_read, `${runId}.cost.infrastructure.d1_rows_read`) === integer(d1.rows_read, `${runId}.observed.d1.rows_read`), `${runId} D1 read delta is unexplained`);
   check(integer(infra.d1_rows_written, `${runId}.cost.infrastructure.d1_rows_written`) === integer(d1.rows_written, `${runId}.observed.d1.rows_written`), `${runId} D1 write delta is unexplained`);
@@ -253,7 +266,6 @@ for (const [index, rawRun] of runs.entries()) {
   check(integer(infra.r2_writes, `${runId}.cost.infrastructure.r2_writes`) === integer(r2.writes, `${runId}.observed.r2.writes`), `${runId} R2 write delta is unexplained`);
   check(integer(infra.r2_bytes_read, `${runId}.cost.infrastructure.r2_bytes_read`) === integer(r2.bytes_read, `${runId}.observed.r2.bytes_read`), `${runId} R2 read-byte delta is unexplained`);
   check(integer(infra.r2_bytes_written, `${runId}.cost.infrastructure.r2_bytes_written`) === integer(r2.bytes_written, `${runId}.observed.r2.bytes_written`), `${runId} R2 write-byte delta is unexplained`);
-  check(integer(infra.analytics_points_written, `${runId}.cost.infrastructure.analytics_points_written`) === integer(analytics.points_written, `${runId}.observed.analytics_engine.points_written`), `${runId} Analytics Engine delta is unexplained`);
   check(integer(infra.sandbox_duration_ms, `${runId}.cost.infrastructure.sandbox_duration_ms`) === integer(container.duration_ms, `${runId}.observed.container.duration_ms`), `${runId} container duration disagrees with its RunCostEnvelope`);
   check(infra.sandbox_profile === container.profile, `${runId} container profile disagrees with its RunCostEnvelope`);
   check(integer(worker.requests, `${runId}.observed.worker.requests`) === 1, `${runId} must account for one Worker execute request`);
@@ -287,7 +299,7 @@ const totals = counters(record(capture.totals, "capture.totals"), "capture.total
 const expectedTotals = sumCounters(observedRuns, readOnly);
 compareCounters(expectedTotals, totals);
 check(totals.worker.requests === expectedNetworkRequests, "captured Worker requests do not match the fixed workload");
-check(totals.analytics_engine.points_written === runs.length, "captured Analytics Engine points exceed one per new terminal run");
+check(totals.analytics_engine.points_written <= plannedAnalyticsPoints, "captured Analytics Engine points exceed planned terminal units");
 check(totals.r2.writes === runs.length, "captured R2 writes exceed one immutable artifact per new terminal run");
 check(totals.vendor_sandbox_do.custom_classes.length === 0, "captured topology contains a custom Durable Object class");
 check(totals.vendor_sandbox_do.custom_storage_bytes_delta === 0, "captured custom Durable Object storage grew");
@@ -301,7 +313,7 @@ if (failures.length > 0) {
   console.log("✓ managed preview burn-in reconciliation passed");
   console.log(`  isolated Worker: ${workerName}`);
   console.log(`  new executions: ${runs.length}/${allowanceLimit}`);
-  console.log(`  artifacts: ${totals.r2.writes}; Analytics points: ${totals.analytics_engine.points_written}`);
+  console.log(`  artifacts: ${totals.r2.writes}; Analytics planned/observed/variance: ${plannedAnalyticsPoints}/${totals.analytics_engine.points_written}/${totals.analytics_engine.points_written - plannedAnalyticsPoints}`);
   console.log(`  custom Durable Object classes: ${totals.vendor_sandbox_do.custom_classes.length}; custom storage delta: ${totals.vendor_sandbox_do.custom_storage_bytes_delta} bytes`);
 }
 
@@ -313,9 +325,9 @@ function validateCost(value, path) {
   for (const key of ["input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]) integer(model[key], `${path}.model.${key}`);
   if (model.provider_reported_cost_usd !== null) check(Number.isFinite(model.provider_reported_cost_usd) && model.provider_reported_cost_usd >= 0, `${path}.model.provider_reported_cost_usd must be null or non-negative`);
   const infra = record(cost.infrastructure, `${path}.infrastructure`);
-  for (const key of ["d1_rows_read", "d1_rows_written", "r2_reads", "r2_writes", "r2_bytes_read", "r2_bytes_written", "analytics_points_written", "sandbox_duration_ms"]) integer(infra[key], `${path}.infrastructure.${key}`);
+  for (const key of ["d1_rows_read", "d1_rows_written", "r2_reads", "r2_writes", "r2_bytes_read", "r2_bytes_written", "analytics_points_planned", "sandbox_duration_ms"]) integer(infra[key], `${path}.infrastructure.${key}`);
   check(infra.r2_writes <= 1, `${path}.infrastructure.r2_writes exceeds one artifact`);
-  check(infra.analytics_points_written <= 1, `${path}.infrastructure.analytics_points_written exceeds one point`);
+  check(infra.analytics_points_planned <= 1, `${path}.infrastructure.analytics_points_planned exceeds one point`);
   check(typeof infra.sandbox_profile === "string" && infra.sandbox_profile.length > 0, `${path}.infrastructure.sandbox_profile must identify the captured profile`);
   check(cost.known_cost_usd === model.provider_reported_cost_usd, `${path}.known_cost_usd must equal provider-reported cost or both be null`);
   check(cost.estimated_total_cost_usd === null, `${path}.estimated_total_cost_usd requires a versioned rate card`);

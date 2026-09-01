@@ -219,6 +219,9 @@ Huddles writes one strict report shape and Pillbox attaches only cleanup:
 - Huddles initially writes `capture.cleanup: null`. Pillbox replaces only that
   field after validating the terminal partial and completing public finalize for
   the same session. Cleanup has no execution artifact or cost fields.
+- Each Huddles `run_cost_envelopes` entry copies
+  `analytics_points_planned` from its immutable cost envelope. The partial does
+  not claim a provider write and leaves `observed: null`.
 
 Copy the report to a private working location, attach the per-run `observed`
 counters, and fill its `capture.read_only` and `capture.totals` objects from the
@@ -228,15 +231,19 @@ same isolated run. Capture all of these dimensions, including zeroes:
 - R2 reads, writes, and bytes;
 - Container starts, duration/profile, and cleanup calls;
 - Worker requests;
-- Analytics Engine points;
+- Analytics Engine provider-observed points and signed
+  `variance_from_planned` (`points_written - analytics_points_planned`);
 - vendor Sandbox/DO lifecycle/storage counters, including custom class list,
   starting/ending bytes, and custom storage delta.
 
 The report's `run_cost_envelopes` must contain exactly one envelope for the one
 new claim, bound again to the full execution identity and artifact digest. Its
-D1/R2/Analytics/container counters must match the per-run
-captures. Read-only retry/status/finalize traffic belongs in `read_only`, not
-in a second envelope. Reconcile with:
+D1/R2/container counters must match the per-run captures. Analytics is compared
+separately: the immutable envelope records the one planned unit, while the
+provider capture records zero or one write plus explicit variance. A variance
+of `-1` records a best-effort miss without invalidating the terminal run;
+positive variance fails the max-one gate. Read-only retry/status/finalize
+traffic belongs in `read_only`, not in a second envelope. Reconcile with:
 
 ```sh
 npm run burnin:reconcile -- /private/path/burnin-report.json

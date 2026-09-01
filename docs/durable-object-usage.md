@@ -43,9 +43,11 @@ Each terminal execution records exactly one cost envelope in its immutable R2
 artifact, and every terminal client response carries that same envelope. The
 client rejects missing, inconsistent, non-finite, or out-of-budget cost evidence.
 It contains raw provider and infrastructure units; it does not claim an all-in
-dollar total without a versioned rate card. Analytics Engine receives at most
-one derivative point, after the terminal D1 update. Retries and status reads emit
-no additional points.
+dollar total without a versioned rate card. Its `analytics_points_planned` field
+records the bounded terminal-write budget, never confirmed provider delivery.
+After the immutable R2 write and conditional terminal D1 update, only that D1
+winner attempts one derivative Analytics point. Failure is logged but cannot
+undo terminal execution; retries and status reads emit no additional points.
 
 Release owners must compare these envelopes with Cloudflare's D1, R2,
 Containers, Workers, Analytics Engine, and Durable Objects metrics/billing
@@ -67,9 +69,12 @@ kill switch and does not affect local libkrun Pillbox.
 
 For every captured `RunCostEnvelope`, compare the per-run units and profile with
 the same invocation's D1, R2, Container, Worker, Analytics Engine, and vendor
-Sandbox/DO counters. Reconcile retry/status/finalize read-only activity in a
-separate bounded counter set; never explain a second artifact, Analytics point,
-or model turn as a retry. Fail closed on an unexplained delta, a status page
+Sandbox/DO counters. Provider-observed Analytics writes remain outside the
+immutable envelope and record explicit `observed - planned` variance; `-1` is a
+truthful best-effort miss, while a positive variance violates the max-one plan.
+Reconcile retry/status/finalize read-only activity in a separate bounded counter
+set; never explain a second artifact, Analytics point, or model turn as a retry.
+Fail closed on an unexplained delta, a status page
 larger than 100 events, more than one artifact/Analytics point per new run, a
 custom DO class, or any custom DO storage growth. The executable fixture and
 operator report template are in

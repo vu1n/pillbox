@@ -120,6 +120,11 @@ function dryRunPlan(value) {
       limit: value.deployment.managed_execution_limit,
       reviewed_new_execution_count: value.deployment.reviewed_new_execution_count,
     },
+    accounting: {
+      analytics_points_planned: value.deployment.reviewed_new_execution_count,
+      analytics_points_observed: "provider capture required after the run",
+      analytics_variance: "observed minus planned",
+    },
     sequence: ["Pillbox --preflight records the real local managed-Codex rejection without HTTP execution or finalize", "Huddles records the only created execute, exact retry, and two bounded private status reads", "Pillbox --finalize validates the Huddles report-v3 partial, then attaches scoped public cleanup to that same file"],
     safety: {
       unsupported_managed_codex: "preflight rejected; no request or Sandbox provision",

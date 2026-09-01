@@ -73,6 +73,26 @@ test("reconciliation seals artifact identity and digest across every observation
   assert.match(result.stderr, /used a second artifact identity or digest/);
 });
 
+test("reconciliation accepts a best-effort Analytics miss with explicit negative variance", async (t) => {
+  const report = JSON.parse(await readFile(fixture, "utf8"));
+  report.capture.run_cost_envelopes[0].observed.analytics_engine = {
+    points_written: 0,
+    variance_from_planned: -1,
+  };
+  report.capture.totals.analytics_engine.points_written = 0;
+  const result = await reconcileTemporary(t, report);
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /Analytics planned\/observed\/variance: 1\/0\/-1/);
+});
+
+test("reconciliation rejects Analytics observations without truthful plan variance", async (t) => {
+  const report = JSON.parse(await readFile(fixture, "utf8"));
+  report.capture.run_cost_envelopes[0].observed.analytics_engine.variance_from_planned = -1;
+  const result = await reconcileTemporary(t, report);
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /variance does not reconcile observed writes against planned units/);
+});
+
 async function reconcileTemporary(t, report, args = []) {
   const temp = await mkdtemp(join(tmpdir(), "pillbox-burnin-reconcile-"));
   t.after(() => rm(temp, { recursive: true, force: true }));

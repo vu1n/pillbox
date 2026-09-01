@@ -44,9 +44,13 @@ use hudsucker::{
 };
 
 use super::{
-    host_from_uri, mint_stub, unauthorized, PendingFlow, Registry, SandboxData, VaultProvider,
+    host_from_uri, mint_stub, unauthorized, HostProxyOAuthStub, OAuthCodec, OAuthRefreshRequest,
+    PendingFlow, Registry, SandboxData, VaultProvider,
 };
+#[cfg(feature = "libkrun")]
+use super::{LibkrunOAuthStub, OAuthRelease};
 use crate::vault::server::ServerInner;
+use crate::vault::token_store::RefreshDecider;
 
 const PROVIDER_ID: &str = "codex";
 
@@ -56,6 +60,8 @@ const CHAT_OPENAI_HOST: &str = "chat.openai.com";
 const AUTH_OPENAI_HOST: &str = "auth.openai.com";
 const OAUTH_TOKEN_PATH_SUFFIX: &str = "/oauth/token";
 const CREDS_PATH: &str = ".codex/auth.json";
+const OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const OAUTH_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
 
 // Codex doesn't ship a public stub prefix convention (tokens are opaque
 // JWTs / random strings). We invent a `pb-codex-` family so:
@@ -91,74 +97,18 @@ impl VaultProvider for CodexProvider {
         Path::new(CREDS_PATH)
     }
 
+    fn oauth_codec(&self) -> Option<&dyn OAuthCodec> {
+        Some(self)
+    }
+
     fn provision(
         &self,
         sandbox_id: &str,
         real: &serde_json::Value,
         registry: &mut Registry,
     ) -> Result<String, String> {
-        let obj = real
-            .as_object()
-            .ok_or_else(|| "codex auth.json must be a JSON object".to_string())?;
-
-        // Reject ApiKey mode — the swap pipeline needs a refresh token to
-        // intercept rotation, which API-key auth doesn't have.
-        let tokens = match obj.get("tokens") {
-            Some(serde_json::Value::Object(map)) => map,
-            Some(serde_json::Value::Null) | None => {
-                return Err("codex auth.json has no `tokens` block (ApiKey mode). \
-                     v0.5 vault supports ChatGPT mode only. \
-                     The API-key path lands with the API-key vault track \
-                     (pillbox task #26)."
-                    .into());
-            }
-            Some(_) => return Err("codex auth.json `tokens` is not an object".into()),
-        };
-
-        let real_access = tokens
-            .get("access_token")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "codex auth.json: tokens.access_token missing".to_string())?;
-        let _real_refresh = tokens
-            .get("refresh_token")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "codex auth.json: tokens.refresh_token missing".to_string())?;
-
-        // Sanity check: access_token should look like a JWT (three
-        // dot-separated parts). If not, codex's own validator will choke
-        // anyway, but bail early with a clearer message.
-        if real_access.split('.').count() != 3 {
-            return Err(
-                "codex auth.json: tokens.access_token is not a JWT (expected 3 dot-separated parts)"
-                    .into(),
-            );
-        }
-
-        let stub_access = mint_stub(STUB_ACCESS_PREFIX, sandbox_id);
-        let stub_refresh = mint_stub(STUB_REFRESH_PREFIX, sandbox_id);
-
-        // Build the stub auth.json by cloning and swapping just the two
-        // token fields. id_token is left verbatim — it's a self-contained
-        // JWT used for identity claims (account_id, plan_type, email),
-        // not a bearer credential, so preserving it keeps the guest's
-        // account identity intact without exposing anything codex
-        // wouldn't already accept.
-        let mut stub_value = real.clone();
-        {
-            let tokens = stub_value
-                .get_mut("tokens")
-                .and_then(|v| v.as_object_mut())
-                .ok_or_else(|| "tokens block missing during stub build".to_string())?;
-            tokens.insert(
-                "access_token".to_string(),
-                serde_json::Value::String(stub_access.clone()),
-            );
-            tokens.insert(
-                "refresh_token".to_string(),
-                serde_json::Value::String(stub_refresh.clone()),
-            );
-        }
-        let stub_json = serde_json::to_string_pretty(&stub_value)
+        let stub = self.host_proxy_stub(sandbox_id, real)?;
+        let stub_json = serde_json::to_string_pretty(&stub.credentials)
             .map_err(|error| format!("serialize stub auth.json: {error}"))?;
 
         registry.insert(
@@ -166,7 +116,7 @@ impl VaultProvider for CodexProvider {
             SandboxData {
                 provider_id: PROVIDER_ID,
                 real: real.clone(),
-                stubs: vec![stub_access, stub_refresh],
+                stubs: stub.stubs,
             },
         );
 
@@ -277,6 +227,220 @@ impl VaultProvider for CodexProvider {
             .insert("content-length", HeaderValue::from(new_len));
         Response::from_parts(parts, Body::from(new_body))
     }
+}
+
+impl RefreshDecider for CodexProvider {
+    fn needs_refresh(&self, creds: &serde_json::Value) -> bool {
+        self.expiry_ms(creds)
+            .map(crate::vault::refresh::is_expired)
+            .unwrap_or(true)
+    }
+
+    fn refresh_token(&self, creds: &serde_json::Value) -> Option<String> {
+        creds
+            .pointer("/tokens/refresh_token")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+    }
+
+    fn access_token(&self, creds: &serde_json::Value) -> Option<String> {
+        creds
+            .pointer("/tokens/access_token")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+    }
+
+    fn access_usable(&self, creds: &serde_json::Value) -> bool {
+        self.access_token(creds).is_some()
+            && self
+                .expiry_ms(creds)
+                .is_some_and(|expiry| expiry > crate::vault::refresh::unix_now_ms())
+    }
+}
+
+impl OAuthCodec for CodexProvider {
+    fn refresh_request(&self, refresh_token: &str) -> OAuthRefreshRequest {
+        OAuthRefreshRequest {
+            endpoint: OAUTH_ENDPOINT,
+            body: serde_json::json!({
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": OAUTH_CLIENT_ID,
+            }),
+        }
+    }
+
+    fn apply_refresh_response(
+        &self,
+        real: &mut serde_json::Value,
+        response: &serde_json::Value,
+        old_refresh: &str,
+        now_ms: u64,
+    ) -> anyhow::Result<()> {
+        let access = response
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                crate::errors::PillboxError::runtime(
+                    "vault",
+                    "refresh response missing access_token",
+                )
+            })?;
+        let refresh = response
+            .get("refresh_token")
+            .and_then(|v| v.as_str())
+            .unwrap_or(old_refresh);
+        let tokens = real
+            .get_mut("tokens")
+            .and_then(|v| v.as_object_mut())
+            .ok_or_else(|| {
+                crate::errors::PillboxError::runtime("vault", "codex tokens block disappeared")
+            })?;
+        tokens.insert("access_token".into(), access.into());
+        tokens.insert("refresh_token".into(), refresh.into());
+        if let Some(id_token) = response.get("id_token").and_then(|v| v.as_str()) {
+            tokens.insert("id_token".into(), id_token.into());
+        }
+        if self.expiry_ms(real).is_none() {
+            return Err(crate::errors::PillboxError::runtime(
+                "vault",
+                "codex refresh response access_token has no usable JWT expiry",
+            )
+            .into());
+        }
+        let refreshed_at = time::OffsetDateTime::from_unix_timestamp_nanos(
+            i128::from(now_ms).saturating_mul(1_000_000),
+        )
+        .map_err(|_| {
+            crate::errors::PillboxError::runtime("vault", "refresh timestamp out of range")
+        })?
+        .format(&time::format_description::well_known::Rfc3339)
+        .map_err(|_| crate::errors::PillboxError::runtime("vault", "format refresh timestamp"))?;
+        real.as_object_mut()
+            .ok_or_else(|| {
+                crate::errors::PillboxError::runtime("vault", "codex auth.json is not an object")
+            })?
+            .insert("last_refresh".into(), refreshed_at.into());
+        Ok(())
+    }
+
+    fn expiry_ms(&self, real: &serde_json::Value) -> Option<u64> {
+        use base64::Engine as _;
+        let token = real.pointer("/tokens/access_token")?.as_str()?;
+        let payload = token.split('.').nth(1)?;
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .ok()?;
+        let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+        Some(claims.get("exp")?.as_u64()?.saturating_mul(1000))
+    }
+
+    fn host_proxy_stub(
+        &self,
+        sandbox_id: &str,
+        real: &serde_json::Value,
+    ) -> Result<HostProxyOAuthStub, String> {
+        let obj = real
+            .as_object()
+            .ok_or_else(|| "codex auth.json must be a JSON object".to_string())?;
+        let tokens = match obj.get("tokens") {
+            Some(serde_json::Value::Object(map)) => map,
+            Some(serde_json::Value::Null) | None => {
+                return Err("codex auth.json has no `tokens` block (ApiKey mode). \
+                     v0.5 vault supports ChatGPT mode only. \
+                     The API-key path lands with the API-key vault track \
+                     (pillbox task #26)."
+                    .into());
+            }
+            Some(_) => return Err("codex auth.json `tokens` is not an object".into()),
+        };
+        let access = tokens
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "codex auth.json: tokens.access_token missing".to_string())?;
+        tokens
+            .get("refresh_token")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "codex auth.json: tokens.refresh_token missing".to_string())?;
+        if access.split('.').count() != 3 {
+            return Err(
+                "codex auth.json: tokens.access_token is not a JWT (expected 3 dot-separated parts)"
+                    .into(),
+            );
+        }
+        let access = mint_stub(STUB_ACCESS_PREFIX, sandbox_id);
+        let refresh = mint_stub(STUB_REFRESH_PREFIX, sandbox_id);
+        let mut credentials = real.clone();
+        let tokens = credentials
+            .get_mut("tokens")
+            .and_then(|v| v.as_object_mut())
+            .ok_or_else(|| "tokens block missing during stub build".to_string())?;
+        tokens.insert("access_token".into(), access.clone().into());
+        tokens.insert("refresh_token".into(), refresh.clone().into());
+        Ok(HostProxyOAuthStub {
+            credentials,
+            stubs: vec![access, refresh],
+        })
+    }
+
+    #[cfg(feature = "libkrun")]
+    fn libkrun_stub(&self, real: &mut serde_json::Value) -> LibkrunOAuthStub {
+        let Some(tokens) = real.get_mut("tokens").and_then(|v| v.as_object_mut()) else {
+            return LibkrunOAuthStub {
+                access_stub: None,
+                releases: Vec::new(),
+            };
+        };
+        let mut releases = Vec::new();
+        let access_stub = tokens
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+            .map(|real| {
+                let stub = mint_libkrun_access_stub();
+                tokens.insert("access_token".into(), stub.clone().into());
+                releases.push(OAuthRelease {
+                    stub: stub.clone(),
+                    real,
+                });
+                stub
+            });
+        if tokens
+            .get("refresh_token")
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| !v.is_empty())
+        {
+            tokens.insert(
+                "refresh_token".into(),
+                format!(
+                    "{STUB_REFRESH_PREFIX}pllbxstub{}",
+                    uuid::Uuid::now_v7().simple()
+                )
+                .into(),
+            );
+        }
+        LibkrunOAuthStub {
+            access_stub,
+            releases,
+        }
+    }
+}
+
+#[cfg(feature = "libkrun")]
+fn mint_libkrun_access_stub() -> String {
+    use base64::Engine as _;
+    let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "exp": crate::vault::STUB_FAR_FUTURE_EXPIRES_AT_MS / 1000,
+    }))
+    .expect("static codex stub claims serialize");
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload);
+    let signature = format!(
+        "{STUB_ACCESS_PREFIX}pllbxstub{}",
+        uuid::Uuid::now_v7().simple()
+    );
+    format!("{header}.{payload}.{signature}")
 }
 
 /// Swap stub refresh_token → real refresh_token on the way out to

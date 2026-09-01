@@ -12,37 +12,21 @@
 //! that share one subscription (`dispatch -k`, overlapping `--detach`) rotate the
 //! shared refresh token **at most once** instead of each POSTing it and tripping
 //! Anthropic's refresh-token-reuse revoke. The store owns the cross-process lock,
-//! the at-most-once `pending` discipline, and the atomic write; this file owns the
-//! provider-specific reads (which field is which, when a refresh is due) and the
-//! POST. The guest never receives a usable refresh credential or a refresh
-//! response containing real tokens.
+//! the at-most-once `pending` discipline, and the atomic write. Provider codecs own
+//! token fields, expiry, request construction, and response application; this file
+//! owns only coordinated transport. The guest never receives a real refresh
+//! credential or a refresh response containing real tokens.
 
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use base64::Engine as _;
 use serde_json::Value;
 
 use crate::errors::PillboxError;
 
-use super::token_store::{Begin, RefreshDecider, RotateGuard, TokenStore};
-
-/// Anthropic OAuth `client_id` for the Claude Code CLI flow. The same value Claude
-/// Code itself sends when *it* refreshes. Hardcoded because there's no public API
-/// to discover it; pillbox just needs the canonical one Anthropic expects.
-const CLAUDE_OAUTH_CLIENT_ID: &str = "claude_code";
-
-/// Anthropic OAuth `/oauth/token` endpoint Claude Code's current release talks to.
-/// The vault provider intercepts both this and the legacy `console.anthropic.com`
-/// host; the pre-refresh goes straight to the canonical host so it can run *before*
-/// the proxy is even up.
-const CLAUDE_OAUTH_ENDPOINT: &str = "https://platform.claude.com/oauth/token";
-
-/// OpenAI OAuth values used by Codex 0.151.0 for ChatGPT-mode token refresh.
-/// Keep this wire contract aligned with `codex-rs/login/src/auth/manager.rs`.
-const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-const CODEX_OAUTH_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
+use super::providers::{self, OAuthCodec};
+use super::token_store::{Begin, RotateGuard, TokenStore};
 
 /// Upper bound (in ms) below which a unix timestamp is *certainly* in seconds. 1e11
 /// ms is the year 5138 — no real seconds-encoded timestamp will ever exceed this,
@@ -57,10 +41,6 @@ const PRE_EXPIRY_BUFFER: Duration = Duration::from_secs(5 * 60);
 /// respond in <1s; 30s buys headroom for a degraded edge without stalling pillbox
 /// startup forever.
 const REFRESH_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Default access-token lifetime to assume when the upstream response omits
-/// `expires_in`. Matches Anthropic's documented default at time of writing.
-const FALLBACK_EXPIRES_IN: Duration = Duration::from_secs(3600);
 
 /// How long [`pre_refresh`] waits for the rotation lock before failing closed. A
 /// peer holding it is mid-POST of the shared refresh token; out-waiting it (then
@@ -79,114 +59,6 @@ const PRE_REFRESH_LOCK_WAIT: Duration = Duration::from_secs(35);
 /// only the stub copy is post-dated.
 pub(crate) const STUB_FAR_FUTURE_EXPIRES_AT_MS: u64 = 4_102_444_800_000;
 
-/// The Claude Code OAuth wire shape, plugged into the [`TokenStore`].
-pub(crate) struct ClaudeRefreshDecider;
-
-impl RefreshDecider for ClaudeRefreshDecider {
-    /// A forward is due iff the stored access token has passed its expiry (within
-    /// [`PRE_EXPIRY_BUFFER`]). No `expiresAt` → no staleness signal → don't force a
-    /// POST (the store then coalesces onto the on-disk creds).
-    fn needs_refresh(&self, creds: &Value) -> bool {
-        creds
-            .pointer("/claudeAiOauth/expiresAt")
-            .and_then(|v| v.as_u64())
-            .map(is_expired)
-            .unwrap_or(false)
-    }
-
-    fn refresh_token(&self, creds: &Value) -> Option<String> {
-        creds
-            .pointer("/claudeAiOauth/refreshToken")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)
-    }
-
-    fn access_token(&self, creds: &Value) -> Option<String> {
-        creds
-            .pointer("/claudeAiOauth/accessToken")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)
-    }
-
-    fn access_usable(&self, creds: &Value) -> bool {
-        self.access_token(creds).is_some()
-            && claude_expiry_ms(creds).is_some_and(|expires_at_ms| expires_at_ms > unix_now_ms())
-    }
-}
-
-/// The Codex ChatGPT OAuth shape, using the access JWT's `exp` claim as the
-/// authority for both pre-refresh and long-running-session JIT scheduling.
-pub(crate) struct CodexRefreshDecider;
-
-impl RefreshDecider for CodexRefreshDecider {
-    fn needs_refresh(&self, creds: &Value) -> bool {
-        codex_expiry_ms(creds).map(is_expired).unwrap_or(true)
-    }
-
-    fn refresh_token(&self, creds: &Value) -> Option<String> {
-        creds
-            .pointer("/tokens/refresh_token")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)
-    }
-
-    fn access_token(&self, creds: &Value) -> Option<String> {
-        creds
-            .pointer("/tokens/access_token")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)
-    }
-
-    fn access_usable(&self, creds: &Value) -> bool {
-        self.access_token(creds).is_some()
-            && codex_expiry_ms(creds).is_some_and(|expires_at_ms| expires_at_ms > unix_now_ms())
-    }
-}
-
-#[derive(Clone, Copy)]
-enum Broker {
-    Claude,
-    Codex,
-}
-
-impl Broker {
-    fn for_agent(agent_id: &str) -> Option<Self> {
-        match agent_id {
-            "claude" => Some(Self::Claude),
-            "codex" => Some(Self::Codex),
-            _ => None,
-        }
-    }
-
-    fn decider(self) -> &'static dyn RefreshDecider {
-        match self {
-            Self::Claude => &ClaudeRefreshDecider,
-            Self::Codex => &CodexRefreshDecider,
-        }
-    }
-
-    fn endpoint(self) -> &'static str {
-        match self {
-            Self::Claude => CLAUDE_OAUTH_ENDPOINT,
-            Self::Codex => CODEX_OAUTH_ENDPOINT,
-        }
-    }
-
-    fn client_id(self) -> &'static str {
-        match self {
-            Self::Claude => CLAUDE_OAUTH_CLIENT_ID,
-            Self::Codex => CODEX_OAUTH_CLIENT_ID,
-        }
-    }
-
-    fn expiry_ms(self, creds: &Value) -> Option<u64> {
-        match self {
-            Self::Claude => claude_expiry_ms(creds),
-            Self::Codex => codex_expiry_ms(creds),
-        }
-    }
-}
-
 /// Establish a fresh OAuth credential for `agent_id`, coordinated across concurrent
 /// sessions. Called from `provision_oauth_mount` at the start of every vaulted run.
 ///
@@ -201,11 +73,14 @@ impl Broker {
 ///   next-step rather than handing the run a doomed token.
 // Context: doc://pillbox/adr-004-vault-broker-oauth@0001#vault-broker-oauth
 pub(crate) fn pre_refresh(creds_path: &Path, agent_id: &str) -> Result<Option<Value>> {
-    let Some(broker) = Broker::for_agent(agent_id) else {
+    let Some(provider) = providers::provider_for(agent_id) else {
+        return Ok(None);
+    };
+    let Some(codec) = provider.oauth_codec() else {
         return Ok(None);
     };
     let store = TokenStore::new(creds_path.to_path_buf(), PRE_REFRESH_LOCK_WAIT);
-    match store.begin(broker.decider())? {
+    match store.begin(codec)? {
         Begin::Coalesced(creds) => Ok(Some(creds)),
         Begin::DegradedLease(creds) => {
             eprintln!(
@@ -214,7 +89,7 @@ pub(crate) fn pre_refresh(creds_path: &Path, agent_id: &str) -> Result<Option<Va
             );
             Ok(Some(creds))
         }
-        Begin::Rotate(guard) => rotate(guard, broker, agent_id).map(Some),
+        Begin::Rotate(guard) => rotate(guard, codec, agent_id).map(Some),
         Begin::ReauthRequired(reason) => Err(PillboxError::runtime(
             "vault",
             format!("could not establish a fresh OAuth token for `{agent_id}`: {reason}"),
@@ -257,17 +132,22 @@ pub(crate) fn broker_jit_refresh(creds_path: &Path, agent_id: &str) -> Result<(S
             format!("no broker refresh decider for `{agent_id}`"),
         )
     })?;
-    let broker = Broker::for_agent(agent_id).ok_or_else(|| {
+    let provider = providers::provider_for(agent_id).ok_or_else(|| {
         PillboxError::runtime(
             "vault",
             format!("no broker refresh decider for `{agent_id}`"),
         )
     })?;
-    let access = broker
-        .decider()
+    let codec = provider.oauth_codec().ok_or_else(|| {
+        PillboxError::runtime(
+            "vault",
+            format!("no broker refresh decider for `{agent_id}`"),
+        )
+    })?;
+    let access = codec
         .access_token(&creds)
         .ok_or_else(|| PillboxError::runtime("vault", "refreshed creds missing access token"))?;
-    let expires_at_ms = broker
+    let expires_at_ms = codec
         .expiry_ms(&creds)
         .ok_or_else(|| PillboxError::runtime("vault", "refreshed creds missing expiry"))?;
     Ok((access, expires_at_ms))
@@ -279,51 +159,23 @@ pub(crate) fn broker_jit_refresh(creds_path: &Path, agent_id: &str) -> Result<(S
 /// but the host file keeps the true expiry the rotation must track.
 #[cfg(feature = "libkrun")]
 pub(crate) fn broker_expiry(creds_path: &Path, agent_id: &str) -> Option<u64> {
-    let broker = Broker::for_agent(agent_id)?;
+    let provider = providers::provider_for(agent_id)?;
+    let codec = provider.oauth_codec()?;
     let text = std::fs::read_to_string(creds_path).ok()?;
     let creds: Value = serde_json::from_str(&text).ok()?;
-    broker.expiry_ms(&creds)
-}
-
-/// `claudeAiOauth.expiresAt` normalized to unix ms (handles seconds-encoded values, as
-/// [`is_expired`] does).
-fn claude_expiry_ms(creds: &Value) -> Option<u64> {
-    creds
-        .pointer("/claudeAiOauth/expiresAt")
-        .and_then(|v| v.as_u64())
-        .map(|ts| {
-            if ts < SECONDS_BOUNDARY_MS {
-                ts.saturating_mul(1000)
-            } else {
-                ts
-            }
-        })
-}
-
-/// Decode the unverified `exp` claim from a Codex access JWT. This claim is only a
-/// local scheduling hint; the provider still authenticates the full token on every
-/// request, so accepting the claim here cannot make an invalid token authoritative.
-fn codex_expiry_ms(creds: &Value) -> Option<u64> {
-    let token = creds.pointer("/tokens/access_token")?.as_str()?;
-    let payload = token.split('.').nth(1)?;
-    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
-        .ok()?;
-    let claims: Value = serde_json::from_slice(&decoded).ok()?;
-    let expiry_secs = claims.get("exp")?.as_u64()?;
-    Some(expiry_secs.saturating_mul(1000))
+    codec.expiry_ms(&creds)
 }
 
 /// We won the race: POST the refresh grant exactly once, then resolve the guard.
 /// The branch in [`post_refresh`] that we reach decides which resolution the
 /// at-most-once invariant permits.
-fn rotate(guard: RotateGuard, broker: Broker, agent_id: &str) -> Result<Value> {
+fn rotate(guard: RotateGuard, codec: &dyn OAuthCodec, agent_id: &str) -> Result<Value> {
     let refresh = guard.refresh_token().to_owned();
-    match post_refresh(broker, &refresh) {
+    match post_refresh(codec, &refresh) {
         Ok(resp) => {
             let mut new_creds = guard.base_creds().clone();
             if let Err(e) =
-                apply_refresh_response(broker, &mut new_creds, &resp, &refresh, unix_now_ms())
+                codec.apply_refresh_response(&mut new_creds, &resp, &refresh, unix_now_ms())
             {
                 // A 2xx came back, so a token was almost certainly issued and the old
                 // one consumed — but we can't assemble usable creds from the body.
@@ -339,7 +191,7 @@ fn rotate(guard: RotateGuard, broker: Broker, agent_id: &str) -> Result<Value> {
             }
             // `commit` re-checks the access token actually rotated; if not, it returns
             // Err and (via the dropped guard) leaves `pending` set → next run re-auths.
-            guard.commit(broker.decider(), new_creds.clone())?;
+            guard.commit(codec, new_creds.clone())?;
             Ok(new_creds)
         }
         Err(RotateError::Definite(reason)) => {
@@ -372,17 +224,21 @@ fn rotate(guard: RotateGuard, broker: Broker, agent_id: &str) -> Result<Value> {
 /// Has `expires_at` passed [`PRE_EXPIRY_BUFFER`] before now? Handles both ms-encoded
 /// (Node `Date.now()`; what Claude Code writes) and seconds-encoded (older /
 /// hand-rolled files) timestamps via [`SECONDS_BOUNDARY_MS`].
-fn is_expired(expires_at: u64) -> bool {
-    let expires_at_ms = if expires_at < SECONDS_BOUNDARY_MS {
-        expires_at.saturating_mul(1000)
-    } else {
-        expires_at
-    };
+pub(crate) fn is_expired(expires_at: u64) -> bool {
+    let expires_at_ms = normalize_expiry_ms(expires_at);
     let buffer_ms = PRE_EXPIRY_BUFFER.as_millis() as u64;
     expires_at_ms.saturating_sub(buffer_ms) <= unix_now_ms()
 }
 
-fn unix_now_ms() -> u64 {
+pub(crate) fn normalize_expiry_ms(expires_at: u64) -> u64 {
+    if expires_at < SECONDS_BOUNDARY_MS {
+        expires_at.saturating_mul(1000)
+    } else {
+        expires_at
+    }
+}
+
+pub(crate) fn unix_now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -420,9 +276,12 @@ const OAUTH_GRANT_REJECTION_CODES: &[&str] = &[
 /// surfaces as a non-2xx and resolves to `Ambiguous`. `accept-encoding: identity`
 /// because providers may gzip OAuth responses and the blocking client doesn't
 /// auto-decode them.
-fn post_refresh(broker: Broker, refresh_token: &str) -> std::result::Result<Value, RotateError> {
-    let body = refresh_request_body(broker, refresh_token);
-    let body = serde_json::to_vec(&body)
+fn post_refresh(
+    codec: &dyn OAuthCodec,
+    refresh_token: &str,
+) -> std::result::Result<Value, RotateError> {
+    let request = codec.refresh_request(refresh_token);
+    let body = serde_json::to_vec(&request.body)
         // Serializing our own body can't fail in practice; if it did, nothing was sent.
         .map_err(|e| RotateError::Definite(format!("serialize refresh body: {e}")))?;
 
@@ -434,7 +293,7 @@ fn post_refresh(broker: Broker, refresh_token: &str) -> std::result::Result<Valu
         .map_err(|e| RotateError::Definite(format!("build refresh client: {e}")))?;
 
     let resp = match client
-        .post(broker.endpoint())
+        .post(request.endpoint)
         .header("content-type", "application/json")
         .header("accept-encoding", "identity")
         .body(body)
@@ -469,14 +328,6 @@ fn post_refresh(broker: Broker, refresh_token: &str) -> std::result::Result<Valu
             .map_err(|_| RotateError::Ambiguous("refresh succeeded but body not JSON".into()));
     }
     Err(classify_non_2xx(status, &read.unwrap_or_default()))
-}
-
-fn refresh_request_body(broker: Broker, refresh_token: &str) -> Value {
-    serde_json::json!({
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token,
-        "client_id": broker.client_id(),
-    })
 }
 
 /// Classify a non-2xx refresh response. Pure (no I/O) so the security-critical
@@ -534,109 +385,10 @@ fn is_safe_error_code(code: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b == b'_' || b.is_ascii_digit())
 }
 
-/// Dispatch a successful refresh response to the provider's credential shape.
-/// `refresh_token` may be omitted from a response; each provider preserves the
-/// old value so the next session can still talk upstream.
-fn apply_refresh_response(
-    broker: Broker,
-    real: &mut Value,
-    resp: &Value,
-    old_refresh: &str,
-    now_ms: u64,
-) -> Result<()> {
-    match broker {
-        Broker::Claude => apply_claude_refresh_response(real, resp, old_refresh, now_ms),
-        Broker::Codex => apply_codex_refresh_response(real, resp, old_refresh, now_ms),
-    }
-}
-
-fn apply_claude_refresh_response(
-    real: &mut Value,
-    resp: &Value,
-    old_refresh: &str,
-    now_ms: u64,
-) -> Result<()> {
-    let new_access = resp
-        .get("access_token")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| PillboxError::runtime("vault", "refresh response missing access_token"))?
-        .to_string();
-    let new_refresh = resp
-        .get("refresh_token")
-        .and_then(|v| v.as_str())
-        .unwrap_or(old_refresh)
-        .to_string();
-    let expires_in_secs = resp
-        .get("expires_in")
-        .and_then(|v| v.as_u64())
-        .unwrap_or_else(|| FALLBACK_EXPIRES_IN.as_secs());
-    let new_expires_at_ms = now_ms.saturating_add(expires_in_secs.saturating_mul(1000));
-
-    let oauth = real
-        .get_mut("claudeAiOauth")
-        .and_then(|v| v.as_object_mut())
-        .ok_or_else(|| PillboxError::runtime("vault", "claudeAiOauth block disappeared"))?;
-    oauth.insert("accessToken".to_string(), Value::String(new_access));
-    oauth.insert("refreshToken".to_string(), Value::String(new_refresh));
-    oauth.insert(
-        "expiresAt".to_string(),
-        Value::Number(serde_json::Number::from(new_expires_at_ms)),
-    );
-    Ok(())
-}
-
-/// Persist the fields Codex itself accepts from a successful refresh while
-/// preserving account identity and any future auth.json fields. The access JWT
-/// must carry a usable `exp`; otherwise the broker cannot safely schedule JIT.
-fn apply_codex_refresh_response(
-    real: &mut Value,
-    resp: &Value,
-    old_refresh: &str,
-    now_ms: u64,
-) -> Result<()> {
-    let new_access = resp
-        .get("access_token")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| PillboxError::runtime("vault", "refresh response missing access_token"))?
-        .to_string();
-    let new_refresh = resp
-        .get("refresh_token")
-        .and_then(|v| v.as_str())
-        .unwrap_or(old_refresh)
-        .to_string();
-
-    let tokens = real
-        .get_mut("tokens")
-        .and_then(|v| v.as_object_mut())
-        .ok_or_else(|| PillboxError::runtime("vault", "codex tokens block disappeared"))?;
-    tokens.insert("access_token".to_string(), Value::String(new_access));
-    tokens.insert("refresh_token".to_string(), Value::String(new_refresh));
-    if let Some(id_token) = resp.get("id_token").and_then(|v| v.as_str()) {
-        tokens.insert("id_token".to_string(), Value::String(id_token.to_string()));
-    }
-
-    if codex_expiry_ms(real).is_none() {
-        return Err(PillboxError::runtime(
-            "vault",
-            "codex refresh response access_token has no usable JWT expiry",
-        )
-        .into());
-    }
-    let refreshed_at = time::OffsetDateTime::from_unix_timestamp_nanos(
-        i128::from(now_ms).saturating_mul(1_000_000),
-    )
-    .map_err(|_| PillboxError::runtime("vault", "refresh timestamp out of range"))?
-    .format(&time::format_description::well_known::Rfc3339)
-    .map_err(|_| PillboxError::runtime("vault", "format refresh timestamp"))?;
-    real.as_object_mut()
-        .ok_or_else(|| PillboxError::runtime("vault", "codex auth.json is not an object"))?
-        .insert("last_refresh".to_string(), Value::String(refreshed_at));
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
 
     fn codex_jwt(expiry_ms: u64) -> String {
         let payload = serde_json::to_vec(&serde_json::json!({
@@ -668,7 +420,8 @@ mod tests {
 
     #[test]
     fn claude_decider_reads_tokens_and_staleness() {
-        let d = ClaudeRefreshDecider;
+        let provider = providers::provider_for("claude").unwrap();
+        let d = provider.oauth_codec().unwrap();
         let fresh = serde_json::json!({
             "claudeAiOauth": {
                 "accessToken": "AT",
@@ -706,7 +459,8 @@ mod tests {
 
     #[test]
     fn codex_decider_uses_access_jwt_expiry() {
-        let d = CodexRefreshDecider;
+        let provider = providers::provider_for("codex").unwrap();
+        let d = provider.oauth_codec().unwrap();
         let fresh_expiry = unix_now_ms() + 24 * 60 * 60 * 1000;
         let fresh = serde_json::json!({
             "tokens": {
@@ -717,7 +471,7 @@ mod tests {
         assert_eq!(d.refresh_token(&fresh).as_deref(), Some("RT"));
         assert!(!d.needs_refresh(&fresh));
         assert!(d.access_usable(&fresh));
-        assert_eq!(codex_expiry_ms(&fresh), Some((fresh_expiry / 1000) * 1000));
+        assert_eq!(d.expiry_ms(&fresh), Some((fresh_expiry / 1000) * 1000));
 
         let near_expiry = serde_json::json!({
             "tokens": {
@@ -746,11 +500,16 @@ mod tests {
 
     #[test]
     fn codex_refresh_request_matches_0_151_json_contract() {
-        assert_eq!(Broker::Codex.endpoint(), CODEX_OAUTH_ENDPOINT);
+        let provider = providers::provider_for("codex").unwrap();
+        let request = provider
+            .oauth_codec()
+            .unwrap()
+            .refresh_request("STUB_REFRESH");
+        assert_eq!(request.endpoint, "https://auth.openai.com/oauth/token");
         assert_eq!(
-            refresh_request_body(Broker::Codex, "STUB_REFRESH"),
+            request.body,
             serde_json::json!({
-                "client_id": CODEX_OAUTH_CLIENT_ID,
+                "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
                 "grant_type": "refresh_token",
                 "refresh_token": "STUB_REFRESH",
             })
@@ -824,6 +583,8 @@ mod tests {
 
     #[test]
     fn apply_refresh_response_overwrites_oauth_block() {
+        let provider = providers::provider_for("claude").unwrap();
+        let codec = provider.oauth_codec().unwrap();
         let mut real = serde_json::json!({
             "claudeAiOauth": {
                 "accessToken": "OLD_ACCESS",
@@ -837,14 +598,9 @@ mod tests {
             "refresh_token": "NEW_REFRESH",
             "expires_in": 3600,
         });
-        apply_refresh_response(
-            Broker::Claude,
-            &mut real,
-            &resp,
-            "OLD_REFRESH",
-            2_000_000_000_000_u64,
-        )
-        .expect("apply");
+        codec
+            .apply_refresh_response(&mut real, &resp, "OLD_REFRESH", 2_000_000_000_000_u64)
+            .expect("apply");
 
         let oauth = real.get("claudeAiOauth").unwrap();
         assert_eq!(
@@ -868,11 +624,15 @@ mod tests {
 
     #[test]
     fn apply_refresh_response_preserves_old_refresh_when_response_omits_it() {
+        let provider = providers::provider_for("claude").unwrap();
+        let codec = provider.oauth_codec().unwrap();
         let mut real = serde_json::json!({
             "claudeAiOauth": { "accessToken": "OLD", "refreshToken": "PRESERVE_ME", "expiresAt": 0_u64 }
         });
         let resp = serde_json::json!({ "access_token": "NEW_ACCESS", "expires_in": 3600 });
-        apply_refresh_response(Broker::Claude, &mut real, &resp, "PRESERVE_ME", 0).expect("apply");
+        codec
+            .apply_refresh_response(&mut real, &resp, "PRESERVE_ME", 0)
+            .expect("apply");
         assert_eq!(
             real.pointer("/claudeAiOauth/refreshToken")
                 .and_then(|v| v.as_str()),
@@ -882,6 +642,8 @@ mod tests {
 
     #[test]
     fn codex_refresh_response_updates_tokens_and_preserves_auth_fields() {
+        let provider = providers::provider_for("codex").unwrap();
+        let codec = provider.oauth_codec().unwrap();
         let expiry_ms = 2_000_000_000_000_u64;
         let mut real = serde_json::json!({
             "auth_mode": "ChatGPT",
@@ -900,14 +662,9 @@ mod tests {
             "access_token": new_access,
             "refresh_token": "NEW_REFRESH",
         });
-        apply_refresh_response(
-            Broker::Codex,
-            &mut real,
-            &resp,
-            "OLD_REFRESH",
-            1_999_000_000_000,
-        )
-        .expect("apply");
+        codec
+            .apply_refresh_response(&mut real, &resp, "OLD_REFRESH", 1_999_000_000_000)
+            .expect("apply");
 
         assert_eq!(
             real.pointer("/tokens/access_token").and_then(Value::as_str),
@@ -938,6 +695,8 @@ mod tests {
 
     #[test]
     fn codex_refresh_response_preserves_omitted_optional_tokens() {
+        let provider = providers::provider_for("codex").unwrap();
+        let codec = provider.oauth_codec().unwrap();
         let mut real = serde_json::json!({
             "tokens": {
                 "id_token": "PRESERVE_ID",
@@ -948,7 +707,8 @@ mod tests {
         let resp = serde_json::json!({
             "access_token": codex_jwt(2_000_000_000_000),
         });
-        apply_refresh_response(Broker::Codex, &mut real, &resp, "PRESERVE_REFRESH", 0)
+        codec
+            .apply_refresh_response(&mut real, &resp, "PRESERVE_REFRESH", 0)
             .expect("apply");
         assert_eq!(
             real.pointer("/tokens/refresh_token")

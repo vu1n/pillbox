@@ -14,6 +14,7 @@ import {
 } from "./execution_service.js";
 import {
   D1ExecutionStore,
+  parseManagedExecutionAllowance,
   type RelationalDatabase,
 } from "./execution_store.js";
 import {
@@ -137,6 +138,10 @@ export function executionService(env: Env): ExecutionService {
         : new WorkersAnalyticsEngineRunCost(env.RUN_COSTS),
     sandboxProfile: env.SANDBOX_PROFILE,
     admission: managedAdmissionPolicy(env.MANAGED_EXECUTION_ENABLED),
+    allowance: parseManagedExecutionAllowance(
+      env.MANAGED_EXECUTION_EPOCH,
+      env.MANAGED_EXECUTION_LIMIT,
+    ),
   });
 }
 

@@ -25,10 +25,13 @@ import {
   MAX_EXECUTION_EVIDENCE_EVENT_BYTES,
 } from "./execution_artifacts.js";
 import type {
+  ExecutionClaim,
   ExecutionClaimInput,
   ExecutionRecord,
   ExecutionStore,
+  ManagedExecutionAllowance,
 } from "./execution_store.js";
+import { ManagedExecutionAllowanceError } from "./execution_store.js";
 import { safeHuddlesRuntimeDiagnostic } from "./huddles_policy.js";
 import {
   ManagedAdmissionError,
@@ -68,6 +71,7 @@ export interface ExecutionServiceOptions {
   readonly costMeter?: RunCostMeter;
   readonly analytics?: RunCostAnalytics;
   readonly sandboxProfile?: string;
+  readonly allowance?: ManagedExecutionAllowance | null;
 }
 
 export class ExecutionNotFoundError extends Error {
@@ -89,6 +93,7 @@ export class ExecutionService {
   private readonly analytics: RunCostAnalytics | undefined;
   private readonly sandboxProfile: string | null;
   private readonly admission: ManagedAdmissionPolicy;
+  private readonly allowance: ManagedExecutionAllowance | null;
 
   constructor(
     store: ExecutionStore,
@@ -107,6 +112,7 @@ export class ExecutionService {
     this.analytics = options.analytics;
     this.sandboxProfile = options.sandboxProfile ?? null;
     this.admission = options.admission ?? managedAdmissionPolicy(undefined);
+    this.allowance = options.allowance ?? null;
   }
 
   async executeInvocation(value: unknown): Promise<ExecuteInvocationV2Result> {
@@ -120,21 +126,20 @@ export class ExecutionService {
       requireManagedAdmission(this.admission);
     } catch (cause) {
       if (!(cause instanceof ManagedAdmissionError)) throw cause;
-      return {
-        disposition: "created",
-        invocation_id: request.invocation_id,
-        request_hash: requestHash,
-        execution_digest: executionDigest,
-        execution_policy_revision: request.execution_policy_revision,
-        session_ref: this.positionalSessionRef(request.session_ref.session_id, 0),
-        attribution: attributionFromRequest(request, null),
-        evidence: emptyEvidence(0),
-        status: "failed",
-        error: {
-          code: cause.code,
-          message: cause.message,
-        },
-      };
+      return this.managedDisabledResult(
+        request,
+        requestHash,
+        executionDigest,
+        cause.message,
+      );
+    }
+    if (this.allowance === null) {
+      return this.managedDisabledResult(
+        request,
+        requestHash,
+        executionDigest,
+        "Pillbox managed execution allowance is not configured",
+      );
     }
     const now = this.now();
     const input: ExecutionClaimInput = {
@@ -149,7 +154,18 @@ export class ExecutionService {
       now_ms: now,
       lease_expires_at_ms: now + EXECUTION_OWNER_LEASE_MS,
     };
-    const claim = await this.store.claim(input);
+    let claim: ExecutionClaim;
+    try {
+      claim = await this.store.claim(input, this.allowance);
+    } catch (cause) {
+      if (!(cause instanceof ManagedExecutionAllowanceError)) throw cause;
+      return this.managedDisabledResult(
+        request,
+        requestHash,
+        executionDigest,
+        cause.message,
+      );
+    }
     if (claim.kind === "conflict") {
       return this.conflictResult(request, claim.record, requestHash);
     }
@@ -440,6 +456,26 @@ export class ExecutionService {
         existing_request_hash: record.request_hash,
         requested_request_hash: requestedHash,
       },
+    };
+  }
+
+  private managedDisabledResult(
+    request: ExecuteInvocationV2Request,
+    requestHash: `sha256:${string}`,
+    executionDigest: `sha256:${string}`,
+    message: string,
+  ): ExecuteInvocationV2Result {
+    return {
+      disposition: "created",
+      invocation_id: request.invocation_id,
+      request_hash: requestHash,
+      execution_digest: executionDigest,
+      execution_policy_revision: request.execution_policy_revision,
+      session_ref: this.positionalSessionRef(request.session_ref.session_id, 0),
+      attribution: attributionFromRequest(request, null),
+      evidence: emptyEvidence(0),
+      status: "failed",
+      error: { code: "managed_disabled", message },
     };
   }
 

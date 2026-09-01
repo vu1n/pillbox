@@ -89,6 +89,28 @@ test("managed boundary authorizes fresh retries before replay and carries signer
         },
       },
     );
+    await execFileAsync(
+      "npx",
+      [
+        "wrangler",
+        "d1",
+        "execute",
+        "pillbox-managed-auth-test",
+        "--local",
+        "--persist-to",
+        persistence,
+        "--config",
+        "wrangler.managed-auth-test.toml",
+        "--command",
+        "INSERT INTO managed_execution_allowance (singleton, deployment_epoch, execution_limit, reserved_executions) VALUES (1, 'managed-auth-test-v1', 2, 0)",
+      ],
+      {
+        env: {
+          ...process.env,
+          WRANGLER_LOG_PATH: join(persistence, "wrangler.log"),
+        },
+      },
+    );
     target = await unstable_dev("src/worker.ts", {
       ...workerOptions,
       config: "wrangler.managed-auth-test.toml",

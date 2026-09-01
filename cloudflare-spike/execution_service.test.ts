@@ -25,7 +25,9 @@ import type {
   ExecutionRecord,
   ExecutionStore,
   FinishExecutionInput,
+  ManagedExecutionAllowance,
 } from "./src/execution_store.ts";
+import { ManagedExecutionAllowanceError } from "./src/execution_store.ts";
 import {
   RunCostMeter,
   type RunCostAnalyticsPoint,
@@ -48,6 +50,11 @@ registerHooks({
 const { EXECUTION_OWNER_LEASE_MS, ExecutionService } = await import(
   "./src/execution_service.ts"
 );
+
+const allowance: ManagedExecutionAllowance = {
+  deployment_epoch: "preview-2026-09-01",
+  execution_limit: 3,
+};
 
 async function request(
   changes: Partial<ExecuteInvocationV2Request> = {},
@@ -190,6 +197,74 @@ test("disabled managed execution returns a typed failure before charged access",
   assert.deepEqual(result.evidence.events, []);
 });
 
+test("enabled managed execution with missing allowance config fails before charged access", async () => {
+  const never = (): never => {
+    throw new Error("missing allowance crossed into a charged dependency");
+  };
+  const service = new ExecutionService(
+    {
+      claim: async () => never(),
+      get: async () => never(),
+      finish: async () => never(),
+    },
+    {
+      write: async () => never(),
+      read: async () => never(),
+    },
+    {
+      execute: async () => never(),
+      cancel: async () => never(),
+    },
+    {
+      now: never,
+      ownerToken: never,
+      analytics: { emit: async () => never() },
+      admission: managedAdmissionPolicy("1"),
+    },
+  );
+
+  const result = await service.executeInvocation(await request());
+  assert.equal(result.status, "failed");
+  if (result.status === "failed") {
+    assert.equal(result.error.code, "managed_disabled");
+    assert.match(result.error.message, /allowance is not configured/);
+  }
+});
+
+test("exhausted allowance fails before Sandbox, R2, or Analytics", async () => {
+  const never = (): never => {
+    throw new Error("exhausted allowance crossed into a charged dependency");
+  };
+  const service = new ExecutionService(
+    {
+      claim: async () => {
+        throw new ManagedExecutionAllowanceError();
+      },
+      get: async () => never(),
+      finish: async () => never(),
+    },
+    {
+      write: async () => never(),
+      read: async () => never(),
+    },
+    {
+      execute: async () => never(),
+      cancel: async () => never(),
+    },
+    {
+      ...fixedOptions(),
+      analytics: { emit: async () => never() },
+    },
+  );
+
+  const result = await service.executeInvocation(await request());
+  assert.equal(result.status, "failed");
+  if (result.status === "failed") {
+    assert.equal(result.error.code, "managed_disabled");
+    assert.match(result.error.message, /allowance is exhausted/);
+  }
+});
+
 test("changed content conflicts without crossing into the runtime", async () => {
   const runtime = new FakeRuntime({
     served_model: null,
@@ -250,6 +325,7 @@ test("expired running claims become interrupted instead of resampling", async ()
     now: () => EXECUTION_OWNER_LEASE_MS + 1,
     ownerToken: () => "unused-owner",
     admission: managedAdmissionPolicy("1"),
+    allowance,
   });
 
   const result = await service.executeInvocation(input);
@@ -274,6 +350,7 @@ test("an immutable terminal artifact repairs a lost D1 terminal write", async ()
       now: () => now,
       ownerToken: () => "owner-1",
       admission: managedAdmissionPolicy("1"),
+      allowance,
     },
   );
 
@@ -419,26 +496,29 @@ async function seedRunning(
   input: ExecuteInvocationV2Request,
   now_ms: number,
 ): Promise<void> {
-  await store.claim({
-    invocation_id: input.invocation_id,
-    idempotency_key: input.idempotency_key,
-    request_hash: await computeInvocationRequestHash(input),
-    execution_digest: await computeExecutionIdentityDigest(
-      input.execution,
-      input.execution_policy_revision,
-    ),
-    execution_policy_revision: input.execution_policy_revision,
-    session_id: input.session_ref.session_id,
-    attribution: {
-      harness: input.execution.transport.harness,
-      transport: input.execution.transport.transport,
-      requested_model: `${input.execution.requested.provider}/${input.execution.requested.model}`,
-      served_model: null,
+  await store.claim(
+    {
+      invocation_id: input.invocation_id,
+      idempotency_key: input.idempotency_key,
+      request_hash: await computeInvocationRequestHash(input),
+      execution_digest: await computeExecutionIdentityDigest(
+        input.execution,
+        input.execution_policy_revision,
+      ),
+      execution_policy_revision: input.execution_policy_revision,
+      session_id: input.session_ref.session_id,
+      attribution: {
+        harness: input.execution.transport.harness,
+        transport: input.execution.transport.transport,
+        requested_model: `${input.execution.requested.provider}/${input.execution.requested.model}`,
+        served_model: null,
+      },
+      owner_token: "seed-owner",
+      now_ms,
+      lease_expires_at_ms: now_ms + EXECUTION_OWNER_LEASE_MS,
     },
-    owner_token: "seed-owner",
-    now_ms,
-    lease_expires_at_ms: now_ms + EXECUTION_OWNER_LEASE_MS,
-  });
+    allowance,
+  );
 }
 
 function fixedOptions() {
@@ -446,6 +526,7 @@ function fixedOptions() {
     now: () => 1_000,
     ownerToken: () => "owner-1",
     admission: managedAdmissionPolicy("1"),
+    allowance,
   };
 }
 
@@ -480,7 +561,10 @@ class MemoryStore implements ExecutionStore {
   readonly rows = new Map<string, ExecutionRecord>();
   finishFailures = 0;
 
-  async claim(input: ExecutionClaimInput): Promise<ExecutionClaim> {
+  async claim(
+    input: ExecutionClaimInput,
+    _allowance: ManagedExecutionAllowance,
+  ): Promise<ExecutionClaim> {
     const existing =
       this.rows.get(input.invocation_id) ??
       [...this.rows.values()].find(

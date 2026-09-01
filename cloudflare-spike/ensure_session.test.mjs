@@ -60,6 +60,23 @@ test("legacy Huddles RPC is a stateless adapter over bounded execution", async (
       ],
       { env: { ...process.env, WRANGLER_LOG_PATH: join(persistence, "wrangler.log") } },
     );
+    await execFileAsync(
+      "npx",
+      [
+        "wrangler",
+        "d1",
+        "execute",
+        "pillbox-execution-preview",
+        "--local",
+        "--persist-to",
+        persistence,
+        "--config",
+        "wrangler.runtime-test.toml",
+        "--command",
+        "INSERT INTO managed_execution_allowance (singleton, deployment_epoch, execution_limit, reserved_executions) VALUES (1, 'runtime-test-v1', 2, 0)",
+      ],
+      { env: { ...process.env, WRANGLER_LOG_PATH: join(persistence, "wrangler.log") } },
+    );
     target = await unstable_dev("src/worker.ts", {
       ...workerOptions,
       config: "wrangler.runtime-test.toml",

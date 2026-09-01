@@ -46,6 +46,9 @@ export interface Env {
   MANAGED_AUTH_REQUIRED?: string;
   /** Exact "1" admits new managed executions and workspace provisioning. */
   MANAGED_EXECUTION_ENABLED?: string;
+  /** Operator-reviewed epoch and hard cap for genuinely new managed claims. */
+  MANAGED_EXECUTION_EPOCH?: string;
+  MANAGED_EXECUTION_LIMIT?: string;
 
   // opencode provider auth + model for the consume path (driveAgent). Set via
   // `wrangler secret put` / `.dev.vars`; consumed by createOpencodeServer

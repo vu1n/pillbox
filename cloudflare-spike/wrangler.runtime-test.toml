@@ -5,6 +5,8 @@ compatibility_flags = ["nodejs_compat"]
 
 [vars]
 MANAGED_EXECUTION_ENABLED = "1"
+MANAGED_EXECUTION_EPOCH = "runtime-test-v1"
+MANAGED_EXECUTION_LIMIT = "2"
 
 [[d1_databases]]
 binding = "EXECUTION_DB"

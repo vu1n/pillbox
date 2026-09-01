@@ -15,13 +15,13 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use hudsucker::{
-    hyper::{header::AUTHORIZATION, Request, Response},
+    hyper::{header::AUTHORIZATION, Request},
     Body, RequestOrResponse,
 };
 
 use super::{
     host_from_uri, provision_is_api_key_only, swap_bearer_style, unauthorized, ApiKeySwap,
-    PendingFlow, Registry, VaultProvider, API_KEY_UNUSED_CREDS_PATH,
+    Registry, VaultProvider, API_KEY_UNUSED_CREDS_PATH,
 };
 use crate::vault::server::ServerInner;
 
@@ -57,12 +57,7 @@ impl VaultProvider for OpenAiApiKeyProvider {
         provision_is_api_key_only(PROVIDER_ID)
     }
 
-    async fn handle_request(
-        &self,
-        req: Request<Body>,
-        server: &ServerInner,
-        _pending: &mut Option<PendingFlow>,
-    ) -> RequestOrResponse {
+    async fn handle_request(&self, req: Request<Body>, server: &ServerInner) -> RequestOrResponse {
         let host = host_from_uri(&req).unwrap_or_default();
         if host != API_HOST {
             return req.into();
@@ -79,16 +74,6 @@ impl VaultProvider for OpenAiApiKeyProvider {
             ApiKeySwap::PassThrough => Request::from_parts(parts, body).into(),
             ApiKeySwap::Unauthorized(detail) => unauthorized(detail).into(),
         }
-    }
-
-    async fn handle_response(
-        &self,
-        res: Response<Body>,
-        _server: &ServerInner,
-        _pending: &mut Option<PendingFlow>,
-    ) -> Response<Body> {
-        // API keys never rotate inline. No tear-down work needed.
-        res
     }
 }
 
@@ -144,9 +129,8 @@ mod tests {
 
     use crate::vault::known_secrets::HeaderScheme;
     use crate::vault::providers::test_support::{
-        body_bytes, build_request, cleanup, expect_request, fresh_server,
+        build_request, cleanup, expect_request, fresh_server,
     };
-    use crate::vault::providers::PendingFlow;
     use hudsucker::{hyper::Request as HReq, Body};
 
     #[tokio::test]
@@ -175,9 +159,8 @@ mod tests {
             HReq::from_parts(parts, body)
         };
 
-        let mut pending: Option<PendingFlow> = None;
         let out = OpenAiApiKeyProvider
-            .handle_request(req, server.inner_for_test(), &mut pending)
+            .handle_request(req, server.inner_for_test())
             .await;
         let out_req = expect_request(out, "openai bearer swap");
         let auth = out_req
@@ -187,7 +170,6 @@ mod tests {
             .to_str()
             .unwrap();
         assert_eq!(auth, "Bearer sk-real-openai-key");
-        assert!(pending.is_none());
 
         drop(_lease);
         cleanup(server, dir);
@@ -213,9 +195,8 @@ mod tests {
             HReq::from_parts(parts, body)
         };
 
-        let mut pending = None;
         let out = OpenAiApiKeyProvider
-            .handle_request(req, server.inner_for_test(), &mut pending)
+            .handle_request(req, server.inner_for_test())
             .await;
         let out_req = expect_request(out, "openai pass-through");
         assert_eq!(
@@ -235,9 +216,8 @@ mod tests {
     async fn no_auth_header_passes_through() {
         let (server, dir) = fresh_server().await;
         let req = build_request("GET", "https://api.openai.com/v1/models", Body::empty());
-        let mut pending = None;
         let out = OpenAiApiKeyProvider
-            .handle_request(req, server.inner_for_test(), &mut pending)
+            .handle_request(req, server.inner_for_test())
             .await;
         let out_req = expect_request(out, "openai no-auth");
         assert!(out_req.headers().get("authorization").is_none());
@@ -283,9 +263,8 @@ mod tests {
             HReq::from_parts(parts, body)
         };
 
-        let mut pending = None;
         let out = OpenAiApiKeyProvider
-            .handle_request(req, server.inner_for_test(), &mut pending)
+            .handle_request(req, server.inner_for_test())
             .await;
         let out_req = expect_request(out, "cross-provider no-op");
         // Bearer header untouched.
@@ -300,22 +279,6 @@ mod tests {
         );
 
         drop(_lease);
-        cleanup(server, dir);
-    }
-
-    #[tokio::test]
-    async fn handle_response_is_pass_through() {
-        let (server, dir) = fresh_server().await;
-        let res = hudsucker::hyper::Response::builder()
-            .status(200)
-            .body(Body::from("hello"))
-            .unwrap();
-        let mut pending = None;
-        let out = OpenAiApiKeyProvider
-            .handle_response(res, server.inner_for_test(), &mut pending)
-            .await;
-        let bytes = body_bytes(out.into_body()).await;
-        assert_eq!(bytes, b"hello");
         cleanup(server, dir);
     }
 }

@@ -667,8 +667,8 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
             listen: opts.detach,
         }),
         egress: Some(EgressSpec {
-            // The vault providers' full intercept set (API + OAuth/platform hosts)
-            // — so the agent can reach its provider *and* refresh a token — plus
+            // The vault providers' full intercept set (API + OAuth/platform hosts;
+            // token endpoints remain intercepted for local rejection) plus
             // any invoker-declared `--egress-allow` hosts (forwarded, no swap).
             allowlist: crate::vault::providers::intercepted_hosts()
                 .into_iter()

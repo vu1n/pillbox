@@ -12,6 +12,11 @@ import {
 } from "./request_body.js";
 import { routeWorkspaceTransfer } from "./workspace_transfer.js";
 import type { PillboxAuthorizationControlPlane } from "./managed_auth.js";
+import {
+  ManagedAdmissionError,
+  managedAdmissionPolicy,
+  requireManagedAdmission,
+} from "./managed_admission.js";
 // Named entrypoint: Huddles reaches ensureSession through a same-account
 // service-binding RPC. The default fetch handler below never routes that method.
 export { HuddlesRuntimeEntrypoint };
@@ -39,6 +44,8 @@ export interface Env {
   PILLBOX_PROTOCOL_REVISION?: string;
   PILLBOX_ORGANIZATION_ID?: string;
   MANAGED_AUTH_REQUIRED?: string;
+  /** Exact "1" admits new managed executions and workspace provisioning. */
+  MANAGED_EXECUTION_ENABLED?: string;
 
   // opencode provider auth + model for the consume path (driveAgent). Set via
   // `wrangler secret put` / `.dev.vars`; consumed by createOpencodeServer
@@ -59,6 +66,22 @@ export interface Env {
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
+    if (
+      req.method === "POST" &&
+      new URL(req.url).pathname === "/v2/workspaces/provision"
+    ) {
+      try {
+        requireManagedAdmission(
+          managedAdmissionPolicy(env.MANAGED_EXECUTION_ENABLED),
+        );
+      } catch (cause) {
+        if (!(cause instanceof ManagedAdmissionError)) throw cause;
+        return Response.json(
+          { error: { code: cause.code, message: cause.message } },
+          { status: 503 },
+        );
+      }
+    }
     const executionResponse = await routeExecutionRequest(req, env);
     if (executionResponse !== null) return executionResponse;
     const workspaceResponse = await routeWorkspaceTransfer(req, env);
@@ -128,7 +151,14 @@ async function routeExecutionRequest(
           ? await service.getExecutionStatus(body)
           : await service.cancelInvocation(body);
     return Response.json(result, {
-      status: result.status === "running" ? 202 : result.status === "conflict" ? 409 : 200,
+      status:
+        result.status === "running"
+          ? 202
+          : result.status === "conflict"
+            ? 409
+            : result.status === "failed" && result.error.code === "managed_disabled"
+              ? 503
+              : 200,
     });
   } catch (cause) {
     const code =

@@ -30,6 +30,12 @@ import type {
   ExecutionStore,
 } from "./execution_store.js";
 import { safeHuddlesRuntimeDiagnostic } from "./huddles_policy.js";
+import {
+  ManagedAdmissionError,
+  managedAdmissionPolicy,
+  requireManagedAdmission,
+  type ManagedAdmissionPolicy,
+} from "./managed_admission.js";
 import { driveOpencodeTurn } from "./opencode_turn.js";
 import type { Payload } from "./contract.js";
 import {
@@ -82,12 +88,15 @@ export class ExecutionService {
   private readonly costMeter: RunCostMeter | undefined;
   private readonly analytics: RunCostAnalytics | undefined;
   private readonly sandboxProfile: string | null;
+  private readonly admission: ManagedAdmissionPolicy;
 
   constructor(
     store: ExecutionStore,
     artifacts: ExecutionArtifactStore,
     runtime: ExecutionRuntime,
-    options: ExecutionServiceOptions = {},
+    options: ExecutionServiceOptions & {
+      readonly admission?: ManagedAdmissionPolicy;
+    } = {},
   ) {
     this.store = store;
     this.artifacts = artifacts;
@@ -97,6 +106,7 @@ export class ExecutionService {
     this.costMeter = options.costMeter;
     this.analytics = options.analytics;
     this.sandboxProfile = options.sandboxProfile ?? null;
+    this.admission = options.admission ?? managedAdmissionPolicy(undefined);
   }
 
   async executeInvocation(value: unknown): Promise<ExecuteInvocationV2Result> {
@@ -106,6 +116,26 @@ export class ExecutionService {
       request.execution,
       request.execution_policy_revision,
     );
+    try {
+      requireManagedAdmission(this.admission);
+    } catch (cause) {
+      if (!(cause instanceof ManagedAdmissionError)) throw cause;
+      return {
+        disposition: "created",
+        invocation_id: request.invocation_id,
+        request_hash: requestHash,
+        execution_digest: executionDigest,
+        execution_policy_revision: request.execution_policy_revision,
+        session_ref: this.positionalSessionRef(request.session_ref.session_id, 0),
+        attribution: attributionFromRequest(request, null),
+        evidence: emptyEvidence(0),
+        status: "failed",
+        error: {
+          code: cause.code,
+          message: cause.message,
+        },
+      };
+    }
     const now = this.now();
     const input: ExecutionClaimInput = {
       invocation_id: request.invocation_id,
@@ -230,6 +260,7 @@ export class ExecutionService {
             emptyEvidence(cursor.after),
             "reused",
           ),
+          session_ref: this.positionalSessionRef(record.session_id, 0),
           status: "running",
           retry_after_ms: Math.min(
             5_000,
@@ -267,6 +298,7 @@ export class ExecutionService {
     return {
       ...stored,
       disposition: "reused",
+      session_ref: this.positionalSessionRef(record.session_id, artifact.evidence.length),
       evidence: evidencePage(artifact, record, cursor.after, cursor.limit),
       ...(artifact.cost === undefined
         ? {}
@@ -314,6 +346,7 @@ export class ExecutionService {
   ): Promise<ExecuteInvocationV2Result | null> {
     const placeholder = {
       ...baseResult(record, attribution, emptyEvidence(0), disposition),
+      session_ref: this.positionalSessionRef(record.session_id, evidence.length),
       ...terminal,
     } satisfies ExecuteInvocationV2Result;
     this.costMeter?.observeEvidence(evidence);
@@ -341,7 +374,11 @@ export class ExecutionService {
       artifact = cause.existing;
       artifactRef = cause.existing_ref;
     }
-    const stored = terminalResult(artifact, record);
+    const storedTerminal = terminalResult(artifact, record);
+    const stored = {
+      ...storedTerminal,
+      session_ref: this.positionalSessionRef(record.session_id, artifact.evidence.length),
+    };
     const finished = await this.store.finish({
       invocation_id: record.invocation_id,
       request_hash: record.request_hash,
@@ -395,6 +432,7 @@ export class ExecutionService {
         emptyEvidence(0),
         "reused",
       ),
+      session_ref: this.positionalSessionRef(record.session_id, 0),
       status: "conflict",
       error: {
         code: "idempotency_conflict",
@@ -409,6 +447,18 @@ export class ExecutionService {
     const record = await this.store.get(invocation_id);
     if (record === null) throw new ExecutionNotFoundError(invocation_id);
     return record;
+  }
+
+  private positionalSessionRef(
+    session_id: string,
+    evidenceLength: number,
+  ): {
+    readonly session_id: string;
+    readonly seq_range?: readonly [number, number];
+  } {
+    return evidenceLength === 0
+      ? { session_id }
+      : { session_id, seq_range: [0, evidenceLength - 1] };
   }
 }
 

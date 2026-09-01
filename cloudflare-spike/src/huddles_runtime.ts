@@ -101,6 +101,34 @@ export class HuddlesRuntimeEntrypoint extends WorkerEntrypoint<Env> {
     ).cancelInvocation(request);
   }
 
+  /** Read the live D1 allowance under the same invocation-scoped status grant. */
+  async getManagedExecutionAllowance(
+    request: GetInvocationV2Request,
+    authorization: PillboxExecutionOperationGrantIssueResponse,
+  ) {
+    requireManagedBurninBootstrap(this.env);
+    await authorizeExecutionOperation(this.env, authorization, "status", request);
+    const configured = parseManagedExecutionAllowance(
+      this.env.MANAGED_EXECUTION_EPOCH,
+      this.env.MANAGED_EXECUTION_LIMIT,
+    );
+    if (configured === null) {
+      throw new Error("managed execution allowance configuration is invalid");
+    }
+    const store = new D1ExecutionStore(
+      this.env.EXECUTION_DB as unknown as RelationalDatabase,
+    );
+    const snapshot = await store.getAllowance(configured);
+    if (snapshot === null) {
+      throw new Error("managed execution allowance row does not match configuration");
+    }
+    return {
+      source: "pillbox-d1-live" as const,
+      captured_at: new Date().toISOString(),
+      ...snapshot,
+    };
+  }
+
   async fetch(): Promise<Response> {
     return new Response("not found\n", { status: 404 });
   }

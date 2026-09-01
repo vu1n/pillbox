@@ -8,17 +8,33 @@ import {
   RequestBodyTooLargeError,
 } from "./request_body.js";
 import { workspaceExecEnv, type WorkspaceRepo } from "./workspace_repo.js";
+import {
+  D1WorkspaceFinalizeStore,
+  workspaceFinalizeIdentity,
+  type WorkspaceFinalizeRecord,
+  type WorkspaceFinalizeStore,
+} from "./workspace_finalize.js";
 
 const WORKSPACE_XFER_TIMEOUT_MS = 300_000;
 
 export interface WorkspaceTransferEnv {
   readonly Sandbox?: DurableObjectNamespace<Sandbox>;
+  readonly EXECUTION_DB: D1Database;
   readonly MANAGED_CAPABILITY_SECRET?: string;
+}
+
+type WorkspaceSandbox = Pick<ReturnType<typeof getSandbox>, "killAllProcesses" | "exec">;
+
+export interface WorkspaceTransferDependencies {
+  readonly finalizeStore?: WorkspaceFinalizeStore;
+  readonly sandboxFor?: (sessionId: string) => Promise<WorkspaceSandbox>;
+  readonly now?: () => number;
 }
 
 export async function routeWorkspaceTransfer(
   request: Request,
   env: WorkspaceTransferEnv,
+  dependencies: WorkspaceTransferDependencies = {},
 ): Promise<Response | null> {
   const path = new URL(request.url).pathname;
   const mode =
@@ -27,7 +43,8 @@ export async function routeWorkspaceTransfer(
       : path === "/v2/workspaces/finalize"
         ? "backup"
         : null;
-  if (mode === null) return null;
+  const finalizeStatus = path === "/v2/workspaces/finalize/status";
+  if (mode === null && !finalizeStatus) return null;
   if (request.method !== "POST") {
     return new Response("method not allowed\n", {
       status: 405,
@@ -58,25 +75,41 @@ export async function routeWorkspaceTransfer(
     ) {
       return Response.json({ error: { code: "unauthenticated" } }, { status: 401 });
     }
-    if (!env.Sandbox) {
-      return Response.json(
-        { error: { code: "runtime_unavailable", message: "no Sandbox binding" } },
-        { status: 503 },
-      );
-    }
     const workspace = body.workspace;
     if (!workspace?.repo) throw new Error("workspace.repo is required");
     validateR2Repo(workspace.repo);
     const password = nonEmpty(workspace.password, "workspace.password");
     const snapshot = snapshotHandle(workspace.snapshot, "workspace.snapshot");
-    const sandbox = getSandbox(env.Sandbox, await deriveSandboxRuntimeId(sessionId));
+    if (finalizeStatus) {
+      return finalizeStatusResponse(
+        await finalizeStore(env, dependencies).get(sessionId),
+        await workspaceFinalizeIdentity(sessionId, body),
+      );
+    }
+    if (!env.Sandbox && !dependencies.sandboxFor) {
+      return Response.json(
+        { error: { code: "runtime_unavailable", message: "no Sandbox binding" } },
+        { status: 503 },
+      );
+    }
+    const sandbox = dependencies.sandboxFor
+      ? await dependencies.sandboxFor(sessionId)
+      : getSandbox(env.Sandbox!, await deriveSandboxRuntimeId(sessionId));
     if (mode === "backup") {
-      // Finalize credentials must never overlap a prompt-controlled process.
-      await sandbox.killAllProcesses();
+      return finalizeWorkspace({
+        sandbox,
+        store: finalizeStore(env, dependencies),
+        sessionId,
+        body,
+        repo: workspace.repo,
+        password,
+        snapshot,
+        now: dependencies.now ?? Date.now,
+      });
     }
     const result = await execWorkspaceTool(
       sandbox,
-      workspaceCmd(mode, workspace.repo, snapshot),
+      workspaceCmd("restore", workspace.repo, snapshot),
       workspace.repo,
       password,
     );
@@ -91,20 +124,7 @@ export async function routeWorkspaceTransfer(
         { status: 502 },
       );
     }
-    if (mode === "restore") return Response.json({ ok: true });
-    const resultSnapshot = result.stdout.trim().split("\n").filter(Boolean).pop();
-    if (!resultSnapshot || !/^[0-9a-f]{64}$/.test(resultSnapshot)) {
-      return Response.json(
-        {
-          error: {
-            code: "workspace_transfer_failed",
-            message: "workspace backup produced no canonical snapshot handle",
-          },
-        },
-        { status: 502 },
-      );
-    }
-    return Response.json({ resultSnapshot });
+    return Response.json({ ok: true });
   } catch (cause) {
     return Response.json(
       {
@@ -116,6 +136,111 @@ export async function routeWorkspaceTransfer(
       { status: cause instanceof RequestBodyTooLargeError ? 413 : 400 },
     );
   }
+}
+
+async function finalizeWorkspace(input: {
+  readonly sandbox: WorkspaceSandbox;
+  readonly store: WorkspaceFinalizeStore;
+  readonly sessionId: string;
+  readonly body: unknown;
+  readonly repo: WorkspaceRepo;
+  readonly password: string;
+  readonly snapshot: string;
+  readonly now: () => number;
+}): Promise<Response> {
+  const identity = await workspaceFinalizeIdentity(input.sessionId, input.body);
+  const claimed = await input.store.claim({
+    ...identity,
+    session_id: input.sessionId,
+    now_ms: input.now(),
+  });
+  if (claimed.kind === "conflict") {
+    return Response.json(
+      { error: { code: "workspace_finalize_conflict", message: "session was finalized with another canonical request" } },
+      { status: 409 },
+    );
+  }
+  if (claimed.kind === "reused") return finalizeReplayResponse(claimed.record);
+
+  try {
+    // The durable running claim is the point of no return. A crash after this
+    // line leaves observable status and exact retries never repeat side effects.
+    await input.sandbox.killAllProcesses();
+    const result = await execWorkspaceTool(
+      input.sandbox,
+      workspaceCmd("backup", input.repo, input.snapshot),
+      input.repo,
+      input.password,
+    );
+    if (!result.ok) throw new Error(redact(result.detail));
+    const resultSnapshot = result.stdout.trim().split("\n").filter(Boolean).pop();
+    if (!resultSnapshot || !/^[0-9a-f]{64}$/.test(resultSnapshot)) {
+      throw new Error("workspace backup produced no canonical snapshot handle");
+    }
+    if (!(await input.store.complete({
+      finalize_id: identity.finalize_id,
+      result_snapshot: resultSnapshot,
+      now_ms: input.now(),
+    }))) {
+      throw new Error("workspace finalize completion lost its durable owner");
+    }
+    return Response.json({
+      status: "completed",
+      disposition: "created",
+      finalizeId: identity.finalize_id,
+      requestDigest: identity.request_digest,
+      resultSnapshot,
+    });
+  } catch (cause) {
+    const message = redact(safeHuddlesRuntimeDiagnostic(cause));
+    await input.store.fail({
+      finalize_id: identity.finalize_id,
+      error_code: "workspace_transfer_failed",
+      error_message: message,
+      now_ms: input.now(),
+    });
+    return Response.json(
+      { error: { code: "workspace_transfer_failed", message } },
+      { status: 502 },
+    );
+  }
+}
+
+function finalizeStatusResponse(
+  record: WorkspaceFinalizeRecord | null,
+  identity: { readonly finalize_id: `sha256:${string}`; readonly request_digest: `sha256:${string}` },
+): Response {
+  if (record === null) {
+    return Response.json({ error: { code: "workspace_finalize_not_found" } }, { status: 404 });
+  }
+  if (record.finalize_id !== identity.finalize_id || record.request_digest !== identity.request_digest) {
+    return Response.json({ error: { code: "workspace_finalize_conflict" } }, { status: 409 });
+  }
+  return finalizeReplayResponse(record);
+}
+
+function finalizeReplayResponse(record: WorkspaceFinalizeRecord): Response {
+  const base = {
+    status: record.status,
+    disposition: "reused",
+    finalizeId: record.finalize_id,
+    requestDigest: record.request_digest,
+  };
+  if (record.status === "running") return Response.json(base, { status: 202 });
+  if (record.status === "completed") {
+    return Response.json({ ...base, resultSnapshot: record.result_snapshot });
+  }
+  return Response.json(
+    { ...base, error: { code: record.error_code, message: record.error_message } },
+    { status: 502 },
+  );
+}
+
+function finalizeStore(
+  env: WorkspaceTransferEnv,
+  dependencies: WorkspaceTransferDependencies,
+): WorkspaceFinalizeStore {
+  return dependencies.finalizeStore ?? new D1WorkspaceFinalizeStore(env.EXECUTION_DB);
 }
 
 function snapshotHandle(value: unknown, name: string): string {
@@ -151,7 +276,7 @@ function validateR2Repo(repo: WorkspaceRepo): void {
 }
 
 async function execWorkspaceTool(
-  sandbox: ReturnType<typeof getSandbox>,
+  sandbox: WorkspaceSandbox,
   command: string,
   repo: WorkspaceRepo,
   password: string,

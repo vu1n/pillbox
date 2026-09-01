@@ -7,21 +7,20 @@
     "managed_execution_enabled": "1",
     "managed_execution_limit": 1,
     "reviewed_new_execution_count": 1,
-    "reserved_executions": 1,
     "custom_durable_object_classes": []
   },
   "workload": {
-    "expected_network_requests": 5,
+    "expected_network_requests": 6,
     "steps": [
       {
         "id": "first-execute",
         "operation": "execute",
-        "invocation_id": "burnin-invocation-1",
+        "invocation_id": "burnin-invocation-8ff486ac8e22e43f1a85d36fffaa166e",
         "request": {
           "contract_version": "pillbox.execution/2",
-          "session_ref": { "session_id": "burnin-session-1" },
-          "invocation_id": "burnin-invocation-1",
-          "idempotency_key": "burnin-invocation-1",
+          "session_ref": { "session_id": "burnin-session-e386783e7ddc5b288235581cf9bc2133" },
+          "invocation_id": "burnin-invocation-8ff486ac8e22e43f1a85d36fffaa166e",
+          "idempotency_key": "burnin-invocation-8ff486ac8e22e43f1a85d36fffaa166e",
           "rendered_input": "Return exactly a JSON object with key \"ok\" set to true.",
           "rendered_input_hash": "sha256:7c1a327ad525b4b19bfb4e4940939f9ccd8e3783cd8d2b23b81f04a2ff26667b",
           "tool_policy": "deny_all",
@@ -73,7 +72,7 @@
       {
         "id": "status-page-1",
         "operation": "status",
-        "invocation_id": "burnin-invocation-1",
+        "invocation_id": "burnin-invocation-8ff486ac8e22e43f1a85d36fffaa166e",
         "evidence_after": 0,
         "evidence_limit": 100,
         "expected": { "status": "completed", "bounded": true }
@@ -81,7 +80,7 @@
       {
         "id": "status-page-2",
         "operation": "status",
-        "invocation_id": "burnin-invocation-1",
+        "invocation_id": "burnin-invocation-8ff486ac8e22e43f1a85d36fffaa166e",
         "evidence_after": 100,
         "evidence_limit": 100,
         "expected": { "status": "completed", "bounded": true }
@@ -104,7 +103,7 @@
       {
         "id": "finalize",
         "operation": "workspace_finalize",
-        "session_id": "burnin-session-1",
+        "session_id": "burnin-session-e386783e7ddc5b288235581cf9bc2133",
         "requires_operator_request": true,
         "expected": {
           "requests": 1,
@@ -118,10 +117,10 @@
     "source": "huddles-managed-burnin",
     "notes": "Replace this deterministic example with the operator-captured counters from the isolated preview before declaring a live burn-in reconciled.",
     "execution_identity": {
-      "invocation_id": "burnin-invocation-1",
-      "idempotency_key": "burnin-invocation-1",
-      "session_id": "burnin-session-1",
-      "request_hash": "sha256:9f8eee9eb3b6b2fb6bd36eb1b9889bd5b480cbceac0aba80a23b709f609d2e15",
+      "invocation_id": "burnin-invocation-8ff486ac8e22e43f1a85d36fffaa166e",
+      "idempotency_key": "burnin-invocation-8ff486ac8e22e43f1a85d36fffaa166e",
+      "session_id": "burnin-session-e386783e7ddc5b288235581cf9bc2133",
+      "request_hash": "sha256:51b848eb73c7757cf2a9020e4bda724ef502217540e2a52ce7f37b69eb821875",
       "execution_digest": "sha256:7861be754594a33fdf37291cd1a7e7f6c42f10c0bd9c75351e40cfa51db9cfa5",
       "execution_policy_revision": "managed/burnin-v1"
     },
@@ -130,59 +129,66 @@
         "step_id": "first-execute",
         "operation": "execute",
         "http_status": 200,
-        "invocation_id": "burnin-invocation-1",
+        "invocation_id": "burnin-invocation-8ff486ac8e22e43f1a85d36fffaa166e",
         "status": "completed",
         "disposition": "created",
-        "request_hash": "sha256:9f8eee9eb3b6b2fb6bd36eb1b9889bd5b480cbceac0aba80a23b709f609d2e15",
+        "request_hash": "sha256:51b848eb73c7757cf2a9020e4bda724ef502217540e2a52ce7f37b69eb821875",
         "execution_digest": "sha256:7861be754594a33fdf37291cd1a7e7f6c42f10c0bd9c75351e40cfa51db9cfa5",
         "execution_policy_revision": "managed/burnin-v1",
-        "session_ref": { "session_id": "burnin-session-1", "seq_range": [0, 0] },
-        "evidence": { "from": 0, "next": null, "truncated": false, "event_count": 1, "artifact_ref": { "key": "executions/cbb2a2c73d113c48587fbbe4c31a515f739c2765456ada65e484d53b70aa11a3/9f8eee9eb3b6b2fb6bd36eb1b9889bd5b480cbceac0aba80a23b709f609d2e15.json", "media_type": "application/json", "bytes": 672, "sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" } },
+        "session_ref": { "session_id": "burnin-session-e386783e7ddc5b288235581cf9bc2133", "seq_range": [0, 0] },
+        "evidence": { "from": 0, "next": null, "truncated": false, "event_count": 1, "artifact_ref": { "key": "executions/622a9b7f40cf210479595fbcd56da95c48fafb6b39c7e680791ce5c5eb1b4171/51b848eb73c7757cf2a9020e4bda724ef502217540e2a52ce7f37b69eb821875.json", "media_type": "application/json", "bytes": 672, "sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" } },
         "cost_ref": "sha256:dab73a9a9ddafcb2ddd927da40fa430fd5037342a3079f7b63471fc3382fef7f"
       },
       {
         "step_id": "exact-retry",
         "operation": "execute",
         "http_status": 200,
-        "invocation_id": "burnin-invocation-1",
+        "invocation_id": "burnin-invocation-8ff486ac8e22e43f1a85d36fffaa166e",
         "status": "completed",
         "disposition": "reused",
-        "request_hash": "sha256:9f8eee9eb3b6b2fb6bd36eb1b9889bd5b480cbceac0aba80a23b709f609d2e15",
+        "request_hash": "sha256:51b848eb73c7757cf2a9020e4bda724ef502217540e2a52ce7f37b69eb821875",
         "execution_digest": "sha256:7861be754594a33fdf37291cd1a7e7f6c42f10c0bd9c75351e40cfa51db9cfa5",
         "execution_policy_revision": "managed/burnin-v1",
-        "session_ref": { "session_id": "burnin-session-1", "seq_range": [0, 0] },
-        "evidence": { "from": 0, "next": null, "truncated": false, "event_count": 1, "artifact_ref": { "key": "executions/cbb2a2c73d113c48587fbbe4c31a515f739c2765456ada65e484d53b70aa11a3/9f8eee9eb3b6b2fb6bd36eb1b9889bd5b480cbceac0aba80a23b709f609d2e15.json", "media_type": "application/json", "bytes": 672, "sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" } },
+        "session_ref": { "session_id": "burnin-session-e386783e7ddc5b288235581cf9bc2133", "seq_range": [0, 0] },
+        "evidence": { "from": 0, "next": null, "truncated": false, "event_count": 1, "artifact_ref": { "key": "executions/622a9b7f40cf210479595fbcd56da95c48fafb6b39c7e680791ce5c5eb1b4171/51b848eb73c7757cf2a9020e4bda724ef502217540e2a52ce7f37b69eb821875.json", "media_type": "application/json", "bytes": 672, "sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" } },
         "cost_ref": "sha256:dab73a9a9ddafcb2ddd927da40fa430fd5037342a3079f7b63471fc3382fef7f"
       },
       {
         "step_id": "status-page-1",
         "operation": "status",
         "http_status": 200,
-        "invocation_id": "burnin-invocation-1",
+        "invocation_id": "burnin-invocation-8ff486ac8e22e43f1a85d36fffaa166e",
         "status": "completed",
         "disposition": "reused",
-        "request_hash": "sha256:9f8eee9eb3b6b2fb6bd36eb1b9889bd5b480cbceac0aba80a23b709f609d2e15",
+        "request_hash": "sha256:51b848eb73c7757cf2a9020e4bda724ef502217540e2a52ce7f37b69eb821875",
         "execution_digest": "sha256:7861be754594a33fdf37291cd1a7e7f6c42f10c0bd9c75351e40cfa51db9cfa5",
         "execution_policy_revision": "managed/burnin-v1",
-        "session_ref": { "session_id": "burnin-session-1", "seq_range": [0, 0] },
-        "evidence": { "from": 0, "next": null, "truncated": false, "event_count": 1, "artifact_ref": { "key": "executions/cbb2a2c73d113c48587fbbe4c31a515f739c2765456ada65e484d53b70aa11a3/9f8eee9eb3b6b2fb6bd36eb1b9889bd5b480cbceac0aba80a23b709f609d2e15.json", "media_type": "application/json", "bytes": 672, "sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" } },
+        "session_ref": { "session_id": "burnin-session-e386783e7ddc5b288235581cf9bc2133", "seq_range": [0, 0] },
+        "evidence": { "from": 0, "next": null, "truncated": false, "event_count": 1, "artifact_ref": { "key": "executions/622a9b7f40cf210479595fbcd56da95c48fafb6b39c7e680791ce5c5eb1b4171/51b848eb73c7757cf2a9020e4bda724ef502217540e2a52ce7f37b69eb821875.json", "media_type": "application/json", "bytes": 672, "sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" } },
         "cost_ref": "sha256:dab73a9a9ddafcb2ddd927da40fa430fd5037342a3079f7b63471fc3382fef7f"
       },
       {
         "step_id": "status-page-2",
         "operation": "status",
         "http_status": 200,
-        "invocation_id": "burnin-invocation-1",
+        "invocation_id": "burnin-invocation-8ff486ac8e22e43f1a85d36fffaa166e",
         "status": "completed",
         "disposition": "reused",
-        "request_hash": "sha256:9f8eee9eb3b6b2fb6bd36eb1b9889bd5b480cbceac0aba80a23b709f609d2e15",
+        "request_hash": "sha256:51b848eb73c7757cf2a9020e4bda724ef502217540e2a52ce7f37b69eb821875",
         "execution_digest": "sha256:7861be754594a33fdf37291cd1a7e7f6c42f10c0bd9c75351e40cfa51db9cfa5",
         "execution_policy_revision": "managed/burnin-v1",
-        "session_ref": { "session_id": "burnin-session-1", "seq_range": [0, 0] },
-        "evidence": { "from": 100, "next": null, "truncated": false, "event_count": 0, "artifact_ref": { "key": "executions/cbb2a2c73d113c48587fbbe4c31a515f739c2765456ada65e484d53b70aa11a3/9f8eee9eb3b6b2fb6bd36eb1b9889bd5b480cbceac0aba80a23b709f609d2e15.json", "media_type": "application/json", "bytes": 672, "sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" } },
+        "session_ref": { "session_id": "burnin-session-e386783e7ddc5b288235581cf9bc2133", "seq_range": [0, 0] },
+        "evidence": { "from": 100, "next": null, "truncated": false, "event_count": 0, "artifact_ref": { "key": "executions/622a9b7f40cf210479595fbcd56da95c48fafb6b39c7e680791ce5c5eb1b4171/51b848eb73c7757cf2a9020e4bda724ef502217540e2a52ce7f37b69eb821875.json", "media_type": "application/json", "bytes": 672, "sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" } },
         "cost_ref": "sha256:dab73a9a9ddafcb2ddd927da40fa430fd5037342a3079f7b63471fc3382fef7f"
       }
     ],
+    "allowance_snapshot": {
+      "source": "pillbox-d1-live",
+      "captured_at": "2026-09-01T00:10:00.000Z",
+      "deployment_epoch": "burnin-2026-09-01-v1",
+      "execution_limit": 1,
+      "reserved_executions": 1
+    },
     "preflight": {
       "step_id": "unsupported-managed-codex",
       "operation": "managed_codex_preflight",
@@ -204,21 +210,25 @@
       "step_id": "finalize",
       "operation": "workspace_finalize",
       "http_status": 200,
-      "session_id": "burnin-session-1",
+      "session_id": "burnin-session-e386783e7ddc5b288235581cf9bc2133",
+      "request_count": 1,
+      "disposition": "created",
+      "finalize_id": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "request_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
       "result_snapshot": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
     },
     "run_cost_envelopes": [
       {
         "id": "sha256:dab73a9a9ddafcb2ddd927da40fa430fd5037342a3079f7b63471fc3382fef7f",
         "execution_identity": {
-          "invocation_id": "burnin-invocation-1",
-          "idempotency_key": "burnin-invocation-1",
-          "session_id": "burnin-session-1",
-          "request_hash": "sha256:9f8eee9eb3b6b2fb6bd36eb1b9889bd5b480cbceac0aba80a23b709f609d2e15",
+          "invocation_id": "burnin-invocation-8ff486ac8e22e43f1a85d36fffaa166e",
+          "idempotency_key": "burnin-invocation-8ff486ac8e22e43f1a85d36fffaa166e",
+          "session_id": "burnin-session-e386783e7ddc5b288235581cf9bc2133",
+          "request_hash": "sha256:51b848eb73c7757cf2a9020e4bda724ef502217540e2a52ce7f37b69eb821875",
           "execution_digest": "sha256:7861be754594a33fdf37291cd1a7e7f6c42f10c0bd9c75351e40cfa51db9cfa5",
           "execution_policy_revision": "managed/burnin-v1"
         },
-        "artifact_ref": { "key": "executions/cbb2a2c73d113c48587fbbe4c31a515f739c2765456ada65e484d53b70aa11a3/9f8eee9eb3b6b2fb6bd36eb1b9889bd5b480cbceac0aba80a23b709f609d2e15.json", "media_type": "application/json", "bytes": 672, "sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" },
+        "artifact_ref": { "key": "executions/622a9b7f40cf210479595fbcd56da95c48fafb6b39c7e680791ce5c5eb1b4171/51b848eb73c7757cf2a9020e4bda724ef502217540e2a52ce7f37b69eb821875.json", "media_type": "application/json", "bytes": 672, "sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" },
         "artifact_count": 1,
         "analytics_points_planned": 1,
         "cost": {
@@ -276,7 +286,7 @@
       }
     ],
     "read_only": {
-      "d1": { "rows_read": 3, "rows_written": 0 },
+      "d1": { "rows_read": 4, "rows_written": 0 },
       "r2": {
         "reads": 3,
         "writes": 0,
@@ -289,7 +299,7 @@
         "profile": "standard-2",
         "cleanup_calls": 1
       },
-      "worker": { "requests": 4 },
+      "worker": { "requests": 5 },
       "analytics_engine": { "points_written": 0 },
       "vendor_sandbox_do": {
         "class_name": "Sandbox",
@@ -303,7 +313,7 @@
       }
     },
     "totals": {
-      "d1": { "rows_read": 3, "rows_written": 2 },
+      "d1": { "rows_read": 4, "rows_written": 2 },
       "r2": {
         "reads": 3,
         "writes": 1,
@@ -316,7 +326,7 @@
         "profile": "standard-2",
         "cleanup_calls": 1
       },
-      "worker": { "requests": 5 },
+      "worker": { "requests": 6 },
       "analytics_engine": { "points_written": 1 },
       "vendor_sandbox_do": {
         "class_name": "Sandbox",

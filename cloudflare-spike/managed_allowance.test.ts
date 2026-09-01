@@ -75,6 +75,21 @@ test("only a genuinely new claim atomically reserves the singleton allowance", a
   assert.equal(reserved(sqlite), 1);
 });
 
+test("live allowance snapshots are exact point reads of the configured epoch and limit", async () => {
+  const { database } = seededDatabase(allowance);
+  const store = new D1ExecutionStore(database);
+  assert.deepEqual({ ...(await store.getAllowance(allowance)) }, {
+    ...allowance,
+    reserved_executions: 0,
+  });
+  await store.claim(claim(), allowance);
+  assert.deepEqual({ ...(await store.getAllowance(allowance)) }, {
+    ...allowance,
+    reserved_executions: 1,
+  });
+  assert.equal(await store.getAllowance({ ...allowance, execution_limit: 2 }), null);
+});
+
 test("exhaustion and configuration mismatch create no invocation row", async () => {
   const { database, sqlite } = seededDatabase(allowance);
   const store = new D1ExecutionStore(database);

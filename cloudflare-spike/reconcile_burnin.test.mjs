@@ -57,6 +57,25 @@ test("reconciliation recomputes the full request and execution identity", async 
   assert.match(result.stderr, /execution_identity does not match the canonical first-execute request/);
 });
 
+test("reconciliation requires a post-execution live allowance snapshot", async (t) => {
+  const report = JSON.parse(await readFile(fixture, "utf8"));
+  report.deployment.reserved_executions = 1;
+  report.capture.allowance_snapshot.reserved_executions = 0;
+  const result = await reconcileTemporary(t, report);
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /deployment\.reserved_executions is not allowed/);
+  assert.match(result.stderr, /live allowance reservation/);
+});
+
+test("reconciliation binds invocation and session identity to the reviewed epoch", async (t) => {
+  const report = JSON.parse(await readFile(fixture, "utf8"));
+  report.deployment.allowance_epoch = "burnin-other-epoch";
+  report.capture.allowance_snapshot.deployment_epoch = "burnin-other-epoch";
+  const result = await reconcileTemporary(t, report);
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /does not derive from the reviewed allowance epoch/);
+});
+
 test("reconciliation rejects positional evidence discontinuity", async (t) => {
   const report = JSON.parse(await readFile(fixture, "utf8"));
   report.capture.runtime_calls[2].evidence.from = 1;

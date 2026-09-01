@@ -89,7 +89,17 @@ if (finalizeRequest.sessionId !== finalizeStep.session_id) {
   fail("operator finalize request sessionId does not match the terminal Huddles execution");
 }
 const finalized = await callFinalize(finalizeRequest);
-if (finalized.status !== 200 || typeof finalized.body.resultSnapshot !== "string" || !/^[0-9a-f]{64}$/.test(finalized.body.resultSnapshot)) {
+if (
+  finalized.status !== 200 ||
+  finalized.body.status !== "completed" ||
+  !["created", "reused"].includes(finalized.body.disposition) ||
+  typeof finalized.body.finalizeId !== "string" ||
+  !/^sha256:[0-9a-f]{64}$/.test(finalized.body.finalizeId) ||
+  typeof finalized.body.requestDigest !== "string" ||
+  !/^sha256:[0-9a-f]{64}$/.test(finalized.body.requestDigest) ||
+  typeof finalized.body.resultSnapshot !== "string" ||
+  !/^[0-9a-f]{64}$/.test(finalized.body.resultSnapshot)
+) {
   fail("finalize did not return a canonical result snapshot");
 }
 const completed = {
@@ -100,6 +110,10 @@ const completed = {
       step_id: finalizeStep.id,
       operation: finalizeStep.operation,
       http_status: finalized.status,
+      request_count: finalized.requestCount,
+      disposition: finalized.body.disposition,
+      finalize_id: finalized.body.finalizeId,
+      request_digest: finalized.body.requestDigest,
       session_id: finalizeRequest.sessionId,
       result_snapshot: finalized.body.resultSnapshot,
     },
@@ -176,7 +190,9 @@ async function callFinalize(body) {
   if (typeof token !== "string" || token.length === 0) {
     fail("missing BURNIN_FINALIZE_TOKEN; capability must be minted for the exact finalize request bytes");
   }
+  const encodedBody = JSON.stringify(body);
   let response;
+  let requestCount = 1;
   try {
     response = await fetch(new URL("/v2/workspaces/finalize", ensureTrailingSlash(baseUrl)), {
       method: "POST",
@@ -185,22 +201,36 @@ async function callFinalize(body) {
         "content-type": "application/json",
         authorization: `Bearer ${token}`,
       },
-      body: JSON.stringify(body),
+      body: encodedBody,
     });
   } catch (error) {
-    fail(`finalize request failed before a response: ${String(error)}`);
+    requestCount += 1;
+    try {
+      response = await fetch(new URL("/v2/workspaces/finalize/status", ensureTrailingSlash(baseUrl)), {
+        method: "POST",
+        headers: {
+          accept: "application/json",
+          "content-type": "application/json",
+          authorization: `Bearer ${token}`,
+        },
+        body: encodedBody,
+      });
+    } catch (statusError) {
+      fail(`finalize response was lost and durable status failed: ${String(statusError)}`);
+    }
   }
   let responseBody;
   try {
     responseBody = await response.json();
   } catch {
-    fail(`finalize returned non-JSON HTTP ${response.status}`);
+    fail(`finalize/status returned non-JSON HTTP ${response.status}`);
   }
   if (!response.ok) {
     const code = responseBody?.error?.code ?? "unknown";
-    fail(`finalize returned HTTP ${response.status} (${code})`);
+    fail(`finalize/status returned HTTP ${response.status} (${code})`);
   }
-  return { status: response.status, body: responseBody };
+  if (response.status === 202) fail("finalize response was lost and durable status remains running");
+  return { status: response.status, body: responseBody, requestCount };
 }
 
 async function runManagedAgentPreflight(step) {
@@ -232,7 +262,8 @@ function validateManifest(value) {
   if (!isRecord(value) || value.schema_version !== REPORT_SCHEMA_VERSION) fail(`manifest schema_version must be ${REPORT_SCHEMA_VERSION}`);
   const deployment = value.deployment;
   if (!isRecord(deployment) || deployment.worker_name !== "pillbox-managed-burnin") fail("manifest must target pillbox-managed-burnin");
-  if (deployment.managed_execution_limit !== 1 || deployment.reviewed_new_execution_count !== 1 || deployment.reserved_executions !== 1) fail("fixed workload allowance must be exactly one reserved execution");
+  if (deployment.managed_execution_limit !== 1 || deployment.reviewed_new_execution_count !== 1) fail("fixed workload allowance must be exactly one reviewed execution");
+  if (typeof deployment.allowance_epoch !== "string" || deployment.allowance_epoch.length === 0) fail("manifest allowance_epoch must be a non-empty string");
   if (!isRecord(value.workload) || !Array.isArray(value.workload.steps)) fail("manifest workload.steps must be an array");
   const stepById = new Map();
   for (const step of value.workload.steps) {
@@ -249,6 +280,10 @@ function validateManifest(value) {
   const first = stepById.get("first-execute");
   if (!isRecord(first) || !isRecord(first.request)) fail("manifest must contain first-execute.request");
   if (first.invocation_id !== first.request.invocation_id) fail("first-execute invocation identity must match its request");
+  const identity = managedBurninEpochIdentity(deployment.allowance_epoch);
+  if (first.invocation_id !== identity.invocation_id || first.request.session_ref?.session_id !== identity.session_id) {
+    fail("first-execute invocation and session identities must derive from allowance_epoch");
+  }
   if (stepById.get("exact-retry")?.request_ref !== "first-execute") fail("exact-retry must reference first-execute");
   if (first.expected?.allowance_reservation !== 1) fail("first-execute must reserve the one reviewed allowance");
   if (stepById.get("exact-retry")?.expected?.allowance_reservation_delta !== 0 || stepById.get("exact-retry")?.expected?.new_model_turns !== 0) fail("exact-retry must not reserve or sample again");
@@ -259,11 +294,26 @@ function validateManifest(value) {
     if (step.evidence_limit !== MAX_STATUS_PAGE_SIZE || step.evidence_after !== index * MAX_STATUS_PAGE_SIZE || step.expected?.bounded !== true) fail(`${step.id} must request the checked bounded evidence page`);
   }
   const networkSteps = value.workload.steps.filter((step) => step.operation !== "managed_codex_preflight");
-  if (value.workload.expected_network_requests !== networkSteps.length) fail("manifest network request count must match runtime and cleanup calls");
+  if (value.workload.expected_network_requests !== networkSteps.length + 1) fail("manifest network request count must include the live allowance read");
   const unsupported = stepById.get("unsupported-managed-codex");
   if (unsupported.expected?.error_code !== "unsupported_execution" || unsupported.expected?.provision_attempts !== 0 || unsupported.expected?.network_requests !== 0) fail("managed Codex preflight must reject without side effects");
   const finalize = stepById.get("finalize");
   if (finalize.session_id !== first.request.session_ref.session_id || finalize.requires_operator_request !== true || finalize.expected?.requests !== 1 || finalize.expected?.kill_before_transfer !== true || finalize.expected?.result_snapshot_required !== true) fail("finalize must be one operator-scoped cleanup for the execution session");
+}
+
+function managedBurninEpochIdentity(epoch) {
+  const sessionHash = createHash("sha256")
+    .update(`pillbox-managed-burnin/session/1\0${epoch}`)
+    .digest("hex")
+    .slice(0, 32);
+  const invocationHash = createHash("sha256")
+    .update(`pillbox-managed-burnin/invocation/1\0${epoch}`)
+    .digest("hex")
+    .slice(0, 32);
+  return {
+    session_id: `burnin-session-${sessionHash}`,
+    invocation_id: `burnin-invocation-${invocationHash}`,
+  };
 }
 
 async function readJson(path, label) {

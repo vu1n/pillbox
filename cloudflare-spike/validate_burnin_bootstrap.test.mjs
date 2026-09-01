@@ -3,8 +3,9 @@ import { createHash } from "node:crypto";
 import { test } from "node:test";
 
 import {
+  D1_BOOTSTRAP_QUERY,
   parseWranglerToml,
-  validateBurninBootstrap,
+  validateBurninBootstrap as validateBurninBootstrapRaw,
 } from "./scripts/validate-burnin-bootstrap.mjs";
 
 const publicKey = "ed25519:SKaA_nE69844nq00przjwmcPcg5iRY1hL4fnfgipY94";
@@ -97,6 +98,25 @@ entrypoint = "PillboxAuthorizationCurrentnessEntrypoint"
 `;
 
 const metadata = { secrets: [{ name: "MANAGED_CAPABILITY_SECRET", type: "secret_text" }] };
+const d1Receipt = d1ReceiptFromBody({
+  schema_version: "pillbox.managed-d1-bootstrap-receipt/1",
+  source: "wrangler-d1-execute-remote",
+  observed_at: "2026-09-01T00:01:00.000Z",
+  database_id: "0123456789abcdef0123456789abcdef",
+  query_sha256: `sha256:${createHash("sha256").update(D1_BOOTSTRAP_QUERY).digest("hex")}`,
+  migrations: [
+    "0001_execution.sql",
+    "0002_managed_execution_allowance.sql",
+    "0003_workspace_finalize.sql",
+  ],
+  allowance: {
+    deployment_epoch: "burnin-test-v1",
+    execution_limit: 1,
+    reserved_executions: 0,
+  },
+});
+const validateBurninBootstrap = (input) =>
+  validateBurninBootstrapRaw({ d1Receipt, ...input });
 
 test("exact Huddles tuple and resolved Wrangler metadata pass without secret output", async () => {
   const result = await validateBurninBootstrap({ bootstrap, wrangler: config, metadata });
@@ -105,7 +125,30 @@ test("exact Huddles tuple and resolved Wrangler metadata pass without secret out
   assert.equal(result.signer.fingerprint, fingerprint);
   assert.equal(result.max_concurrent_executions, 1);
   assert.equal(result.capability_secret, "installed");
+  assert.deepEqual(result.d1_receipt.allowance, d1Receipt.allowance);
   assert.doesNotMatch(JSON.stringify(result), /secret_text/);
+});
+
+test("live D1 receipt must prove the exact applied migrations and allowance row", async () => {
+  await assert.rejects(
+    validateBurninBootstrapRaw({ bootstrap, wrangler: config, metadata }),
+    /D1 applied receipt must be an object/,
+  );
+  for (const mutate of [
+    (receipt) => receipt.migrations.pop(),
+    (receipt) => { receipt.allowance.deployment_epoch = "other-epoch"; },
+    (receipt) => { receipt.allowance.execution_limit = 2; },
+    (receipt) => { receipt.allowance.reserved_executions = 1; },
+    (receipt) => { receipt.query_sha256 = `sha256:${"0".repeat(64)}`; },
+  ]) {
+    const invalid = structuredClone(d1Receipt);
+    mutate(invalid);
+    const signed = d1ReceiptFromBody(invalid);
+    await assert.rejects(
+      validateBurninBootstrap({ bootstrap, wrangler: config, metadata, d1Receipt: signed }),
+      /D1 applied receipt/,
+    );
+  }
 });
 
 test("missing capability-secret metadata fails closed", async () => {
@@ -268,6 +311,14 @@ function authorityReceipt(tuple) {
 }
 
 function authorityReceiptFromBody(receipt) {
+  const { receipt_sha256: _ignored, ...body } = receipt;
+  return {
+    ...body,
+    receipt_sha256: `sha256:${createHash("sha256").update(canonicalJson(body)).digest("hex")}`,
+  };
+}
+
+function d1ReceiptFromBody(receipt) {
   const { receipt_sha256: _ignored, ...body } = receipt;
   return {
     ...body,

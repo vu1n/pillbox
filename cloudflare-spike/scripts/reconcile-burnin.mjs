@@ -57,10 +57,11 @@ const digest = (value, path) => {
 const root = record(fixture, "fixture");
 check(root.schema_version === REPORT_SCHEMA_VERSION, `fixture.schema_version must be ${REPORT_SCHEMA_VERSION}`);
 const deployment = record(root.deployment, "fixture.deployment");
+allowedKeys(deployment, ["worker_name", "container_class", "allowance_epoch", "managed_execution_enabled", "managed_execution_limit", "reviewed_new_execution_count", "custom_durable_object_classes"], "fixture.deployment");
 const workload = record(root.workload, "fixture.workload");
 const capture = record(root.capture, "fixture.capture");
-allowedKeys(capture, ["source", "notes", "execution_identity", "runtime_calls", "preflight", "cleanup", "run_cost_envelopes", "read_only", "totals", "operator_capture_required"], "fixture.capture");
-for (const key of ["source", "execution_identity", "runtime_calls", "preflight", "cleanup", "run_cost_envelopes", "read_only", "totals"]) {
+allowedKeys(capture, ["source", "notes", "execution_identity", "runtime_calls", "allowance_snapshot", "preflight", "cleanup", "run_cost_envelopes", "read_only", "totals", "operator_capture_required"], "fixture.capture");
+for (const key of ["source", "execution_identity", "runtime_calls", "allowance_snapshot", "preflight", "cleanup", "run_cost_envelopes", "read_only", "totals"]) {
   check(Object.hasOwn(capture, key), `fixture.capture.${key} is required by the burn-in report contract`);
 }
 string(capture.source, "fixture.capture.source");
@@ -74,7 +75,7 @@ const allowanceLimit = integer(deployment.managed_execution_limit, "deployment.m
 const reviewedCount = integer(deployment.reviewed_new_execution_count, "deployment.reviewed_new_execution_count");
 check(allowanceLimit === reviewedCount, "managed execution limit must equal the reviewed new-execution count");
 check(allowanceLimit === 1, "this fixed burn-in is intentionally limited to one new managed execution");
-check(integer(deployment.reserved_executions, "deployment.reserved_executions") === reviewedCount, "allowance reservation must equal the reviewed execution count");
+const allowanceEpoch = string(deployment.allowance_epoch, "deployment.allowance_epoch");
 const deploymentClasses = array(deployment.custom_durable_object_classes, "deployment.custom_durable_object_classes");
 check(deploymentClasses.length === 0, "custom Durable Object classes are forbidden");
 
@@ -128,7 +129,7 @@ check(finalize?.expected?.requests === 1, "finalize must make exactly one cleanu
 check(finalize?.expected?.result_snapshot_required === true, "finalize must require a result snapshot");
 
 const expectedNetworkRequests = integer(workload.expected_network_requests, "workload.expected_network_requests");
-check(expectedNetworkRequests === runtimeSteps.length + cleanupSteps.length, "workload network request count has an unexplained operation");
+check(expectedNetworkRequests === runtimeSteps.length + cleanupSteps.length + 1, "workload network request count must include one live allowance read");
 
 let derivedIdentity = {};
 if (isRecord(first?.request)) {
@@ -144,6 +145,9 @@ if (isRecord(first?.request)) {
 }
 const capturedIdentity = executionIdentity(capture.execution_identity, "capture.execution_identity");
 check(canonicalJson(capturedIdentity) === canonicalJson(derivedIdentity), "capture.execution_identity does not match the canonical first-execute request");
+const epochIdentity = managedBurninEpochIdentity(allowanceEpoch);
+check(capturedIdentity.invocation_id === epochIdentity.invocation_id, "capture.execution_identity invocation_id does not derive from the reviewed allowance epoch");
+check(capturedIdentity.session_id === epochIdentity.session_id, "capture.execution_identity session_id does not derive from the reviewed allowance epoch");
 const expectedArtifactKey = `executions/${createHash("sha256").update(capturedIdentity.invocation_id).digest("hex")}/${capturedIdentity.request_hash.slice("sha256:".length)}.json`;
 
 const runtimeCalls = array(capture.runtime_calls, "capture.runtime_calls").map((value, index) => record(value, `capture.runtime_calls[${index}]`));
@@ -185,6 +189,19 @@ for (const stepId of ["exact-retry", "status-page-1", "status-page-2"]) {
   check(response?.cost_ref === firstResponse?.cost_ref, `${stepId} used a second cost envelope`);
 }
 
+const allowanceSnapshot = record(capture.allowance_snapshot, "capture.allowance_snapshot");
+exactKeys(allowanceSnapshot, ["source", "captured_at", "deployment_epoch", "execution_limit", "reserved_executions"], "capture.allowance_snapshot");
+check(allowanceSnapshot.source === "pillbox-d1-live", "capture.allowance_snapshot must come from the live Pillbox D1 row");
+check(
+  typeof allowanceSnapshot.captured_at === "string" &&
+    Number.isFinite(Date.parse(allowanceSnapshot.captured_at)) &&
+    new Date(allowanceSnapshot.captured_at).toISOString() === allowanceSnapshot.captured_at,
+  "capture.allowance_snapshot.captured_at must be an exact ISO-8601 instant",
+);
+check(allowanceSnapshot.deployment_epoch === allowanceEpoch, "live allowance epoch does not match the reviewed deployment epoch");
+check(integer(allowanceSnapshot.execution_limit, "capture.allowance_snapshot.execution_limit") === allowanceLimit, "live allowance limit does not match the reviewed deployment limit");
+check(integer(allowanceSnapshot.reserved_executions, "capture.allowance_snapshot.reserved_executions") === reviewedCount, "live allowance reservation does not prove exactly one created execution");
+
 check(preflightSteps.length === 1, "workload must contain exactly one managed preflight step");
 const preflight = record(capture.preflight, "capture.preflight");
 exactKeys(preflight, ["step_id", "operation", "schema_version", "agent", "status", "disposition", "error_code", "exit_code", "observed_output", "observed_output_sha256", "counters"], "capture.preflight");
@@ -205,15 +222,21 @@ for (const key of ["provision_attempts", "network_requests", "state_entries_crea
 }
 
 check(cleanupSteps.length === 1, "workload must contain exactly one workspace cleanup step");
+let cleanupRequestCount = 0;
 if (partial) {
   check(capture.cleanup === null, "capture.cleanup must remain null until Pillbox finalizes terminal Huddles evidence");
 } else {
   const cleanup = record(capture.cleanup, "capture.cleanup");
-  exactKeys(cleanup, ["step_id", "operation", "http_status", "session_id", "result_snapshot"], "capture.cleanup");
+  exactKeys(cleanup, ["step_id", "operation", "http_status", "session_id", "request_count", "disposition", "finalize_id", "request_digest", "result_snapshot"], "capture.cleanup");
   check(cleanup.step_id === cleanupSteps[0]?.id, "capture.cleanup does not match the workload cleanup step");
   check(cleanup.operation === cleanupSteps[0]?.operation, "capture.cleanup.operation does not match the workload step");
   check(integer(cleanup.http_status, "capture.cleanup.http_status") === 200, "capture.cleanup.http_status must be 200");
   check(cleanup.session_id === capturedIdentity.session_id, "capture.cleanup.session_id does not match the terminal execution session");
+  cleanupRequestCount = integer(cleanup.request_count, "capture.cleanup.request_count");
+  check(cleanupRequestCount === 1 || cleanupRequestCount === 2, "capture.cleanup.request_count must be one finalize or finalize plus status recovery");
+  check(cleanup.disposition === "created" || cleanup.disposition === "reused", "capture.cleanup.disposition must prove created or durable replay");
+  digest(cleanup.finalize_id, "capture.cleanup.finalize_id");
+  digest(cleanup.request_digest, "capture.cleanup.request_digest");
   check(typeof cleanup.result_snapshot === "string" && /^[0-9a-f]{64}$/.test(cleanup.result_snapshot), "capture.cleanup.result_snapshot must be a canonical snapshot handle");
 }
 
@@ -298,7 +321,7 @@ const readOnly = counters(record(capture.read_only, "capture.read_only"), "captu
 const totals = counters(record(capture.totals, "capture.totals"), "capture.totals");
 const expectedTotals = sumCounters(observedRuns, readOnly);
 compareCounters(expectedTotals, totals);
-check(totals.worker.requests === expectedNetworkRequests, "captured Worker requests do not match the fixed workload");
+check(totals.worker.requests === expectedNetworkRequests + cleanupRequestCount - 1, "captured Worker requests do not match the fixed workload and finalize recovery");
 check(totals.analytics_engine.points_written <= plannedAnalyticsPoints, "captured Analytics Engine points exceed planned terminal units");
 check(totals.r2.writes === runs.length, "captured R2 writes exceed one immutable artifact per new terminal run");
 check(totals.vendor_sandbox_do.custom_classes.length === 0, "captured topology contains a custom Durable Object class");
@@ -475,6 +498,17 @@ function requestIdentity(request) {
       execution_policy_revision: request.execution_policy_revision,
     }),
     execution_policy_revision: request.execution_policy_revision,
+  };
+}
+
+function managedBurninEpochIdentity(allowanceEpoch) {
+  const derive = (kind) => createHash("sha256")
+    .update(`pillbox-managed-burnin/${kind}/1\0${allowanceEpoch}`)
+    .digest("hex")
+    .slice(0, 32);
+  return {
+    session_id: `burnin-session-${derive("session")}`,
+    invocation_id: `burnin-invocation-${derive("invocation")}`,
   };
 }
 

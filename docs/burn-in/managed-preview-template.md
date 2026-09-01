@@ -16,7 +16,8 @@ this order, with Huddles as the only live runtime recorder:
 2. let Huddles execute one deny-all OpenCode turn over its private service binding;
 3. let Huddles retry the exact request;
 4. let Huddles read status twice with `evidence_after` 0 and 100, each limited to
-   100 events, then write the authoritative report-v3 partial;
+   100 events, then read the live D1 allowance row under a status-scoped grant
+   and write the authoritative report-v3 partial;
 5. let Pillbox validate that terminal partial and finalize the same session over
    scoped public HTTP, attaching the result snapshot to the same report.
 
@@ -39,14 +40,20 @@ Do not change the limit to compensate for retries, status reads, or a failed
 operator run. Stop, reconcile, and create a new reviewed epoch if the one
 claim is consumed.
 
+The reviewed allowance epoch is also the identity namespace. Huddles derives
+one session ID and one invocation/idempotency ID from that epoch with the
+checked `pillbox-managed-burnin/{session|invocation}/1` derivation. Exact retries
+inside an epoch reuse those IDs. A new reviewed epoch necessarily derives new
+IDs, so a prior report cannot silently attest the new allowance.
+
 ## Bootstrap boundary
 
 OPS-000 owns creation and validation of the isolated D1/R2 resources, database
 migrations and allowance row, signing/currentness keys and pins, capability
 secret, and installation/workspace/policy identity. This runbook consumes the
 checked OPS-000 outputs; it does not provide an alternate manual bootstrap.
-Do not enable the Worker unless the applied bootstrap receipt proves the complete
-matching tuple and the one-run allowance.
+Do not enable the Worker unless the applied bootstrap receipts prove the complete
+matching tuple, all three D1 migrations, and the exact unconsumed one-run allowance.
 
 The committed `wrangler.burnin.toml` is deliberately non-deployable: its public
 pin values are empty and its parse-only D1 UUID is rejected by the bootstrap
@@ -61,6 +68,26 @@ application time and canonical receipt digest. Its database tuple, issuer
 key-pair self-test, and currentness probe must all be `verified` for the same
 installation, policy, key ID/fingerprint, and service entrypoints. Wrangler
 configuration and secret-name metadata alone do not prove applied authority.
+
+After applying migrations 0001–0003 and seeding the reviewed singleton row,
+capture the checked remote D1 query exported as `D1_BOOTSTRAP_QUERY` by
+`validate-burnin-bootstrap.mjs`. Normalize that live Wrangler result into a
+protected `pillbox.managed-d1-bootstrap-receipt/1` receipt. It identifies the
+resolved D1 database, exact ordered migration names, query digest, observation
+time, and exactly:
+
+```json
+{
+  "deployment_epoch": "burnin-2026-09-01-v1",
+  "execution_limit": 1,
+  "reserved_executions": 0
+}
+```
+
+The canonical receipt digest is `receipt_sha256`. The validator rejects a
+missing/reordered migration, another D1 ID or query, an epoch/limit mismatch,
+or any already-reserved allowance. This runs while
+`MANAGED_EXECUTION_ENABLED=0`; only its success permits explicit enablement.
 
 Install the mandatory public-HTTP capability secret through Wrangler stdin.
 The secret must not appear in a command argument, shell trace, config, metadata,
@@ -87,7 +114,8 @@ the complete resolved tuple before any dry-run, migration, seed, or enablement:
 node cloudflare-spike/scripts/validate-burnin-bootstrap.mjs \
   --bootstrap /private/path/huddles-pillbox-burnin-bootstrap.json \
   --config /private/path/wrangler.burnin.resolved.toml \
-  --metadata /private/path/wrangler-secret-metadata.json
+  --metadata /private/path/wrangler-secret-metadata.json \
+  --d1-receipt /private/path/pillbox-d1-bootstrap-receipt.json
 ```
 
 The validator fails on dry-run mode, a missing or mismatched applied-authority
@@ -151,7 +179,9 @@ npm run burnin -- --preflight \
 
 Next run Huddles with that attachment. Huddles performs the only created execute,
 the exact retry, and both bounded status reads over its authenticated private
-service-binding bridge. It writes the authoritative version 3 partial with
+service-binding bridge. Its final private read uses a status-scoped grant to
+attach the live post-run D1 row `{epoch, limit: 1, reserved: 1}`. It writes the
+authoritative version 3 partial with
 `capture.cleanup: null`:
 
 ```sh
@@ -203,6 +233,15 @@ the sole cleanup request; there is no separate cancel call. A duplicate execute,
 cleanup that predates terminal evidence, a second allowance, an unbounded page,
 a second artifact, or a second Analytics point is a failed gate.
 
+Finalize remains a public exact-request HMAC capability; it is not exposed on
+the private Huddles binding. Before kill, backup, or snapshot, the Worker claims
+the canonical session/request identity in D1. Exact retries replay the durable
+terminal row, and `/v2/workspaces/finalize/status` reads that row using the same
+request body and scoped capability. If the HTTP response is lost, the recorder
+asks status instead of sending finalize again. A surviving `running` row is an
+explicit uncertain result and blocks repeated effects for operator recovery; a
+changed canonical request for the same session conflicts.
+
 ## Capture and reconcile provider counters
 
 Huddles writes one strict report shape and Pillbox attaches only cleanup:
@@ -214,11 +253,15 @@ Huddles writes one strict report shape and Pillbox attaches only cleanup:
   bounded status calls. Each record carries the full returned identity,
   positional session range and evidence cursor, immutable artifact reference
   (including bytes and digest), and cost reference.
+- `capture.allowance_snapshot` is read from the live D1 singleton after those
+  calls. Deployment-manifest `reserved_executions` is forbidden as evidence.
 - `capture.preflight` contains the observed local rejection and zero side-effect
   counters. It has no execution artifact or cost fields.
 - Huddles initially writes `capture.cleanup: null`. Pillbox replaces only that
   field after validating the terminal partial and completing public finalize for
-  the same session. Cleanup has no execution artifact or cost fields.
+  the same session. Cleanup records created/reused disposition plus the durable
+  finalize ID and canonical request digest; it has no execution artifact or
+  cost fields.
 - Each Huddles `run_cost_envelopes` entry copies
   `analytics_points_planned` from its immutable cost envelope. The partial does
   not claim a provider write and leaves `observed: null`.
@@ -242,7 +285,8 @@ D1/R2/container counters must match the per-run captures. Analytics is compared
 separately: the immutable envelope records the one planned unit, while the
 provider capture records zero or one write plus explicit variance. A variance
 of `-1` records a best-effort miss without invalidating the terminal run;
-positive variance fails the max-one gate. Read-only retry/status/finalize
+positive variance fails the max-one gate. Read-only
+retry/status/live-allowance/finalize
 traffic belongs in `read_only`, not in a second envelope. Reconcile with:
 
 ```sh

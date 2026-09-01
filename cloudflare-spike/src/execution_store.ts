@@ -48,6 +48,10 @@ export interface ManagedExecutionAllowance {
   readonly execution_limit: number;
 }
 
+export interface ManagedExecutionAllowanceSnapshot extends ManagedExecutionAllowance {
+  readonly reserved_executions: number;
+}
+
 export class ManagedExecutionAllowanceError extends Error {
   readonly code = "managed_disabled" as const;
 
@@ -104,6 +108,9 @@ export interface ExecutionStore {
     allowance: ManagedExecutionAllowance,
   ): Promise<ExecutionClaim>;
   get(invocation_id: string): Promise<ExecutionRecord | null>;
+  getAllowance(
+    allowance: ManagedExecutionAllowance,
+  ): Promise<ManagedExecutionAllowanceSnapshot | null>;
   finish(input: FinishExecutionInput): Promise<boolean>;
 }
 
@@ -246,6 +253,24 @@ export class D1ExecutionStore implements ExecutionStore {
       `SELECT ${SELECT_COLUMNS} FROM execution WHERE invocation_id = ? LIMIT 1`,
       [invocation_id],
     );
+  }
+
+  async getAllowance(
+    allowance: ManagedExecutionAllowance,
+  ): Promise<ManagedExecutionAllowanceSnapshot | null> {
+    const result = await this.database
+      .prepare(
+        `SELECT deployment_epoch, execution_limit, reserved_executions
+         FROM managed_execution_allowance
+         WHERE singleton = 1 AND deployment_epoch = ? AND execution_limit = ?
+         LIMIT 1`,
+      )
+      .bind(allowance.deployment_epoch, allowance.execution_limit)
+      .all<ManagedExecutionAllowanceSnapshot>();
+    this.observe(result);
+    const rows = result.results ?? [];
+    if (rows.length > 1) throw new Error("indexed allowance query returned multiple rows");
+    return rows[0] ?? null;
   }
 
   async finish(input: FinishExecutionInput): Promise<boolean> {

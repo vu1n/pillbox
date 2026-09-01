@@ -9,6 +9,14 @@ const PROTOCOL_REVISION = "pillbox.huddles/1";
 const REQUIRED_SECRET = "MANAGED_CAPABILITY_SECRET";
 const PLACEHOLDER_D1_ID = "00000000-0000-4000-8000-000000000004";
 const AUTHORITY_RECEIPT_VERSION = "huddles.pillbox-burnin-authority-receipt/1";
+const D1_RECEIPT_VERSION = "pillbox.managed-d1-bootstrap-receipt/1";
+export const D1_BOOTSTRAP_QUERY =
+  "SELECT name FROM d1_migrations ORDER BY id; SELECT deployment_epoch, execution_limit, reserved_executions FROM managed_execution_allowance WHERE singleton = 1;";
+const REQUIRED_D1_MIGRATIONS = Object.freeze([
+  "0001_execution.sql",
+  "0002_managed_execution_allowance.sql",
+  "0003_workspace_finalize.sql",
+]);
 const ISOLATED_RESOURCES = Object.freeze({
   worker: "pillbox-managed-burnin",
   d1: "pillbox-managed-burnin-db",
@@ -16,7 +24,7 @@ const ISOLATED_RESOURCES = Object.freeze({
   analytics: "pillbox_managed_burnin_costs",
 });
 
-export async function validateBurninBootstrap({ bootstrap, wrangler, metadata }) {
+export async function validateBurninBootstrap({ bootstrap, wrangler, metadata, d1Receipt }) {
   const tuple = requireRecord(bootstrap, "Huddles bootstrap tuple");
   if (tuple.schema_version !== BOOTSTRAP_VERSION) {
     fail(`bootstrap schema_version must be ${BOOTSTRAP_VERSION}`);
@@ -158,6 +166,7 @@ export async function validateBurninBootstrap({ bootstrap, wrangler, metadata })
   if (!resolved.secretNames.has(REQUIRED_SECRET)) {
     fail(`${REQUIRED_SECRET} is not installed according to Wrangler secret metadata`);
   }
+  const appliedD1 = validateAppliedD1Receipt(d1Receipt, database, vars);
 
   return {
     status: "valid",
@@ -182,11 +191,69 @@ export async function validateBurninBootstrap({ bootstrap, wrangler, metadata })
       issuer_self_test: "verified",
       currentness_probe: "verified",
     },
+    d1_receipt: appliedD1,
     resources: {
       d1_database_name: database.database_name,
       r2_bucket_name: evidence.bucket_name,
       analytics_dataset: analytics.dataset,
     },
+  };
+}
+
+function validateAppliedD1Receipt(value, database, vars) {
+  const receipt = requireRecord(value, "D1 applied receipt");
+  requireExactKeys(
+    receipt,
+    ["schema_version", "source", "observed_at", "database_id", "query_sha256", "migrations", "allowance", "receipt_sha256"],
+    "D1 applied receipt",
+  );
+  if (receipt.schema_version !== D1_RECEIPT_VERSION) {
+    fail(`D1 applied receipt schema_version must be ${D1_RECEIPT_VERSION}`);
+  }
+  if (receipt.source !== "wrangler-d1-execute-remote") {
+    fail("D1 applied receipt must come from wrangler-d1-execute-remote");
+  }
+  if (
+    typeof receipt.observed_at !== "string" ||
+    !Number.isFinite(Date.parse(receipt.observed_at)) ||
+    new Date(receipt.observed_at).toISOString() !== receipt.observed_at
+  ) {
+    fail("D1 applied receipt observed_at must be an exact ISO-8601 instant");
+  }
+  if (receipt.database_id !== database.database_id) {
+    fail("D1 applied receipt database_id does not match EXECUTION_DB");
+  }
+  const queryDigest = `sha256:${createHash("sha256").update(D1_BOOTSTRAP_QUERY).digest("hex")}`;
+  if (receipt.query_sha256 !== queryDigest) {
+    fail("D1 applied receipt query_sha256 does not match the checked live query");
+  }
+  if (!Array.isArray(receipt.migrations) || canonicalJson(receipt.migrations) !== canonicalJson(REQUIRED_D1_MIGRATIONS)) {
+    fail("D1 applied receipt must prove the exact ordered migration set");
+  }
+  const allowance = requireRecord(receipt.allowance, "D1 applied receipt allowance");
+  requireExactKeys(
+    allowance,
+    ["deployment_epoch", "execution_limit", "reserved_executions"],
+    "D1 applied receipt allowance",
+  );
+  if (
+    allowance.deployment_epoch !== vars.MANAGED_EXECUTION_EPOCH ||
+    allowance.execution_limit !== Number(vars.MANAGED_EXECUTION_LIMIT) ||
+    allowance.reserved_executions !== 0
+  ) {
+    fail("D1 applied receipt allowance must exactly match {epoch, limit, reserved: 0}");
+  }
+  const { receipt_sha256: claimedDigest, ...body } = receipt;
+  const expectedDigest = `sha256:${createHash("sha256").update(canonicalJson(body)).digest("hex")}`;
+  if (claimedDigest !== expectedDigest) {
+    fail("D1 applied receipt receipt_sha256 does not match its canonical body");
+  }
+  return {
+    observed_at: receipt.observed_at,
+    receipt_sha256: receipt.receipt_sha256,
+    database_id: receipt.database_id,
+    migrations: [...REQUIRED_D1_MIGRATIONS],
+    allowance: { ...allowance },
   };
 }
 
@@ -432,15 +499,17 @@ async function main() {
   const bootstrapPath = option("--bootstrap");
   const configPath = option("--config");
   const metadataPath = option("--metadata");
-  if (!bootstrapPath || !configPath || !metadataPath) {
-    fail("usage: validate-burnin-bootstrap.mjs --bootstrap <json> --config <toml> --metadata <json>");
+  const d1ReceiptPath = option("--d1-receipt");
+  if (!bootstrapPath || !configPath || !metadataPath || !d1ReceiptPath) {
+    fail("usage: validate-burnin-bootstrap.mjs --bootstrap <json> --config <toml> --metadata <json> --d1-receipt <json>");
   }
-  const [bootstrap, wrangler, metadata] = await Promise.all([
+  const [bootstrap, wrangler, metadata, d1Receipt] = await Promise.all([
     readJson(bootstrapPath, "Huddles bootstrap tuple"),
     readFile(configPath, "utf8"),
     readJson(metadataPath, "Wrangler metadata"),
+    readJson(d1ReceiptPath, "live D1 applied receipt"),
   ]);
-  const result = await validateBurninBootstrap({ bootstrap, wrangler, metadata });
+  const result = await validateBurninBootstrap({ bootstrap, wrangler, metadata, d1Receipt });
   console.log(JSON.stringify(result, null, 2));
 }
 

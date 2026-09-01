@@ -10,8 +10,9 @@
 //! Whatever the agent writes — `.credentials.json`, settings, refresh
 //! tokens — persists there naturally.
 
+#[cfg(feature = "libkrun")]
+use std::borrow::Cow;
 use std::{
-    borrow::Cow,
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -121,6 +122,7 @@ pub(crate) enum StructuredModelPolicy {
 /// Libkrun-only policy for a PTY agent whose cloned home or terminal protocol
 /// needs agent-specific handling. Docker deliberately does not consume this:
 /// its PTY contract remains the existing raw byte stream.
+#[cfg(feature = "libkrun")]
 #[derive(Clone, Copy)]
 pub(crate) struct LibkrunPtyProfile {
     cloned_home: Option<ClonedHomePreparation>,
@@ -128,6 +130,7 @@ pub(crate) struct LibkrunPtyProfile {
     input_framing: PtyInputFraming,
 }
 
+#[cfg(feature = "libkrun")]
 #[derive(Clone, Copy)]
 enum ClonedHomePreparation {
     FreshCodex,
@@ -143,6 +146,7 @@ pub(crate) enum DetachedTranscriptSource {
 }
 
 impl DetachedTranscriptSource {
+    #[cfg(feature = "libkrun")]
     pub(crate) fn as_token(self) -> &'static str {
         match self {
             Self::ServerCapture(format) => format.as_str(),
@@ -165,11 +169,13 @@ impl DetachedTranscriptSource {
     }
 }
 
+#[cfg(feature = "libkrun")]
 #[derive(Clone, Copy)]
 enum PtyInputFraming {
     BracketedPasteLfTurn,
 }
 
+#[cfg(feature = "libkrun")]
 impl LibkrunPtyProfile {
     /// Prepare only the throwaway home clone. Errors are launch failures: an
     /// unprepared detached agent can park before it accepts input or can expose
@@ -241,7 +247,7 @@ pub struct AgentSpec {
     /// Agent-specific PTY behavior consumed only by libkrun. `None` preserves
     /// the generic raw-input/no-clone-prep behavior (including Docker, which
     /// never reads this field).
-    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+    #[cfg(feature = "libkrun")]
     pub(crate) libkrun_pty: Option<LibkrunPtyProfile>,
 }
 
@@ -265,6 +271,7 @@ pub const CLAUDE: AgentSpec = AgentSpec {
     prepare_workspace: Some(pretrust_claude_workspace),
     server: None,
     structured: None,
+    #[cfg(feature = "libkrun")]
     libkrun_pty: None,
 };
 
@@ -283,6 +290,7 @@ pub const CODEX: AgentSpec = AgentSpec {
     prepare_workspace: None,
     server: None,
     structured: None,
+    #[cfg(feature = "libkrun")]
     libkrun_pty: Some(LibkrunPtyProfile {
         cloned_home: Some(ClonedHomePreparation::FreshCodex),
         detached_transcript: Some(DetachedTranscriptSource::Discover(
@@ -335,6 +343,7 @@ pub const CODEX_SERVE: AgentSpec = AgentSpec {
         libkrun_only: true,
     }),
     structured: None,
+    #[cfg(feature = "libkrun")]
     libkrun_pty: None,
 };
 
@@ -359,6 +368,7 @@ pub const OPENCODE: AgentSpec = AgentSpec {
         libkrun_only: false,
     }),
     structured: None,
+    #[cfg(feature = "libkrun")]
     libkrun_pty: None,
 };
 
@@ -386,6 +396,7 @@ pub const CURSOR: AgentSpec = AgentSpec {
         model: StructuredModelPolicy::OptionalBare,
         alt_auth_env: Some("CURSOR_API_KEY"),
     }),
+    #[cfg(feature = "libkrun")]
     libkrun_pty: None,
 };
 
@@ -421,6 +432,7 @@ pub const PI: AgentSpec = AgentSpec {
         model: StructuredModelPolicy::RequireProviderModel,
         alt_auth_env: None,
     }),
+    #[cfg(feature = "libkrun")]
     libkrun_pty: None,
 };
 
@@ -464,6 +476,7 @@ fn finalize_claude_onboarding(home: &Path) -> Result<()> {
 /// Make a throwaway Codex home unambiguously fresh before libkrun mounts it.
 /// The authoritative auth home is never touched: stale rollouts are removed
 /// only from the clone, and only this run's unique guest workspace is trusted.
+#[cfg(feature = "libkrun")]
 fn prepare_fresh_codex_home(home: &Path, guest_workspace: &str) -> Result<()> {
     let sessions = home.join(".codex/sessions");
     match fs::remove_dir_all(&sessions) {
@@ -521,6 +534,7 @@ fn prepare_fresh_codex_home(home: &Path, guest_workspace: &str) -> Result<()> {
 /// A trailing LF explicitly marks a complete turn, so paste the body as one
 /// input event and submit it with a following CR. Non-terminated bytes remain
 /// exactly raw.
+#[cfg(feature = "libkrun")]
 fn frame_bracketed_paste_lf_turn(bytes: &[u8]) -> Cow<'_, [u8]> {
     let Some(body) = bytes.strip_suffix(b"\n") else {
         return Cow::Borrowed(bytes);
@@ -1325,6 +1339,7 @@ mod tests {
         assert_eq!(v["hasCompletedOnboarding"], true);
     }
 
+    #[cfg(feature = "libkrun")]
     #[test]
     fn detached_transcript_source_tokens_round_trip_and_reject_unknown() {
         let sources = [

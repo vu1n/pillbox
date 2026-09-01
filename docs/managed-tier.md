@@ -97,18 +97,44 @@ it later in an isolated preview namespace using the rubric in
 [durable-object-usage.md](./durable-object-usage.md). No benchmark may silently
 become a production dependency.
 
-## Release gate
+## Managed preview release gate
 
-Before a managed deployment:
+Before any managed preview deployment, run the fixed burn-in described in
+[docs/burn-in/managed-preview-template.md](burn-in/managed-preview-template.md)
+against a namespace whose Worker, D1 database, R2 bucket, Analytics dataset,
+and Sandbox container class are all distinct from the existing preview. The
+first reviewed workload has exactly **one genuinely new execution**: one
+deny-all OpenCode execute, one exact retry, two status pages capped at 100
+events, a managed-Codex preflight rejection, and one kill-before-transfer
+finalize. The retry/status/finalize calls do not increase the execution claim
+allowance. Therefore the initial environment must set:
+
+```toml
+MANAGED_EXECUTION_ENABLED = "0"
+MANAGED_EXECUTION_EPOCH = "burnin-2026-09-01-v1"
+MANAGED_EXECUTION_LIMIT = "1"
+```
+
+The operator applies migration 0002 first, seeds the singleton
+`managed_execution_allowance` row with the same epoch and limit, and only then
+explicitly enables the isolated Worker. The application allowance is the hard
+breaker and never auto-resets; changing the epoch/limit is a new reviewed run.
+There is no production deploy automation.
+
+The gate must:
 
 - run the topology policy test and the full TypeScript/Rust suites;
 - verify the Wrangler binding list contains no Pillbox-authored DO class;
-- reconcile application counters against Cloudflare D1, R2, Container, Worker,
-  Analytics Engine, and Durable Object dashboards;
-- configure account budget alerts at the low, medium, and emergency thresholds
-  selected for that environment;
-- verify a documented kill switch can stop managed execution without affecting
-  local Pillbox.
+- execute the deterministic workload, including an exact retry and bounded
+  status pages;
+- fail before Sandbox provisioning for unsupported managed Codex;
+- reconcile every `RunCostEnvelope` against captured D1, R2, Container, Worker,
+  Analytics Engine, and vendor Sandbox/DO counters;
+- fail on unexplained counter deltas, more than one immutable artifact or
+  Analytics point per new run, any custom DO class, or custom DO storage growth;
+- configure account budget alerts at 50%, 75%, and 90% of the small preview
+  cap, and verify the documented kill switch stops managed execution without
+  affecting local Pillbox.
 
 The detailed default-deny rules are canonical in
 [durable-object-usage.md](./durable-object-usage.md).

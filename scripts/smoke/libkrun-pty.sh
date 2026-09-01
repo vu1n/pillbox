@@ -35,7 +35,16 @@ SID=""
 cleanup() { [ -n "$SID" ] && $PB session rm "$SID" >/dev/null 2>&1; rm -rf "$WS"; }
 trap cleanup EXIT
 
-log_has() { $PB session log "$SID" 2>/dev/null | grep -q "$1"; }
+assistant_log_has() {
+  $PB session log "$SID" 2>/dev/null | jq -s -e --arg needle "$1" '
+    ([.[] | select(.payload.type == "message_start" and .payload.role == "assistant")
+          | .payload.messageId]) as $assistant_ids
+    | any(.[];
+        .payload.type == "message_delta"
+        and (.payload.messageId as $id | $assistant_ids | index($id) != null)
+        and (.payload.text | contains($needle)))
+  ' >/dev/null
+}
 
 echo "== launch detached PTY $AGENT (seeded turn 1) =="
 SID=$($PB run --agent "$AGENT" --detach --json --workspace "$WS" \
@@ -50,18 +59,18 @@ echo "  session $SID"
 # then assert the seeded response landed via the creds_share transcript tailer.
 echo "== read half: turn-1 transcript → §0 log =="
 $PB session wait-idle "$SID" --timeout "$TIMEOUT" >/dev/null 2>&1 || true
-log_has "SMOKE_TAIL_OK" \
+assistant_log_has "SMOKE_TAIL_OK" \
   || fail "turn-1 response not in §0 log — the creds_share transcript tailer didn't capture it"
 echo "  ✓ event_source PTY tail: turn-1 response in the §0 log"
 
 # SEND HALF + IDLE SIGNAL: drive a second turn over pty_send, then REQUIRE wait-idle
 # to fire (rc 0) — proving both the byte delivery and the turn-done signal.
 echo "== send half: pty_send turn 2 + wait-idle =="
-$PB session send "$SID" "Reply with exactly: SMOKE_SEND_OK and nothing else." >/dev/null 2>&1 \
+$PB session send "$SID" $'Reply with exactly: SMOKE_SEND_OK and nothing else.\n' >/dev/null 2>&1 \
   || fail "session send failed"
 $PB session wait-idle "$SID" --timeout "$TIMEOUT" >/dev/null 2>&1 \
   || fail "wait-idle (turn 2) timed out — the idle signal isn't being derived"
-log_has "SMOKE_SEND_OK" \
+assistant_log_has "SMOKE_SEND_OK" \
   || fail "turn-2 response not in §0 log — pty_send didn't reach the guest PTY"
 echo "  ✓ pty_send delivered + turn-2 response tailed + wait-idle fired"
 

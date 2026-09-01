@@ -86,8 +86,8 @@ pub(super) struct RefreshDriver {
 impl RefreshDriver {
     /// Arm the driver: locate the access pair by its stub and seed the expiry from the
     /// live creds. `None` (JIT stays disabled) when the stub matches no pair, or the
-    /// agent has no broker decider ([`crate::vault::broker_expiry`] → `None`, e.g.
-    /// codex), or the creds carry no usable expiry.
+    /// agent has no broker decider ([`crate::vault::broker_expiry`] → `None`), or
+    /// the creds carry no usable expiry.
     pub(super) fn arm(ctx: RefreshCtx, swap_pairs: &[CredSwap], diag: &Diag) -> Option<Self> {
         let access_idx = swap_pairs.iter().position(|p| p.stub == ctx.access_stub)?;
         let expires_at_ms = crate::vault::broker_expiry(&ctx.creds_path, &ctx.auth_id)?;
@@ -217,6 +217,8 @@ fn now_unix_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine as _;
+
     use super::*;
 
     fn pair(stub: &str, real: &str) -> CredSwap {
@@ -237,6 +239,15 @@ mod tests {
             consecutive_failures: 0,
             in_flight: None,
         }
+    }
+
+    fn codex_jwt(expiry_ms: u64) -> String {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "exp": expiry_ms / 1000,
+        }))
+        .unwrap();
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload);
+        format!("e30.{payload}.pillbox-test-signature")
     }
 
     #[test]
@@ -279,19 +290,29 @@ mod tests {
     }
 
     #[test]
-    fn arm_disabled_for_non_broker_agent() {
-        // codex has no broker decider → broker_expiry None → JIT stays off even though
-        // a pair matches the stub (the child carries the context but no-ops it).
+    fn arm_seeds_codex_expiry_from_access_jwt() {
         let dir = tempfile::tempdir().unwrap();
         let creds_path = dir.path().join("auth.json");
-        std::fs::write(&creds_path, r#"{"tokens":{"access_token":"AT"}}"#).unwrap();
-        let pairs = vec![pair("accessstub", "AT")];
+        let future_ms = ((now_unix_ms() + 8 * 60 * 60 * 1000) / 1000) * 1000;
+        let access = codex_jwt(future_ms);
+        std::fs::write(
+            &creds_path,
+            serde_json::to_vec(&serde_json::json!({
+                "tokens": { "access_token": access, "refresh_token": "RT" }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let pairs = vec![pair("accessstub", &access)];
         let ctx = RefreshCtx {
             creds_path,
             auth_id: "codex".to_string(),
             access_stub: b"accessstub".to_vec(),
         };
-        assert!(RefreshDriver::arm(ctx, &pairs, &Diag::open(None)).is_none());
+        let d = RefreshDriver::arm(ctx, &pairs, &Diag::open(None)).expect("codex broker armed");
+        assert_eq!(d.access_idx, 0);
+        assert_eq!(d.expires_at_ms, future_ms);
+        assert!(!d.should_spawn(now_unix_ms()));
     }
 
     #[test]

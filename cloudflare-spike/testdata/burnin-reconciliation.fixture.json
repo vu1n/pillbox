@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "deployment": {
     "worker_name": "pillbox-managed-burnin",
     "container_class": "Sandbox",
@@ -117,6 +117,14 @@
   "capture": {
     "source": "reviewed-fixture",
     "notes": "Replace this deterministic example with the operator-captured counters from the isolated preview before declaring a live burn-in reconciled.",
+    "execution_identity": {
+      "invocation_id": "burnin-invocation-1",
+      "idempotency_key": "burnin-invocation-1",
+      "session_id": "burnin-session-1",
+      "request_hash": "sha256:9f8eee9eb3b6b2fb6bd36eb1b9889bd5b480cbceac0aba80a23b709f609d2e15",
+      "execution_digest": "sha256:7861be754594a33fdf37291cd1a7e7f6c42f10c0bd9c75351e40cfa51db9cfa5",
+      "execution_policy_revision": "managed/burnin-v1"
+    },
     "runtime_calls": [
       {
         "step_id": "first-execute",
@@ -125,9 +133,12 @@
         "invocation_id": "burnin-invocation-1",
         "status": "completed",
         "disposition": "created",
-        "request_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-        "artifact_key": "executions/burnin-invocation-1.json",
-        "cost_ref": "sha256:4291e793d2c5c33fa79f8f52dde27eeb3ae4f2b24d7f31304b37b173410c5c26"
+        "request_hash": "sha256:9f8eee9eb3b6b2fb6bd36eb1b9889bd5b480cbceac0aba80a23b709f609d2e15",
+        "execution_digest": "sha256:7861be754594a33fdf37291cd1a7e7f6c42f10c0bd9c75351e40cfa51db9cfa5",
+        "execution_policy_revision": "managed/burnin-v1",
+        "session_ref": { "session_id": "burnin-session-1", "seq_range": [0, 0] },
+        "evidence": { "from": 0, "next": null, "truncated": false, "event_count": 1, "artifact_ref": { "key": "executions/cbb2a2c73d113c48587fbbe4c31a515f739c2765456ada65e484d53b70aa11a3/9f8eee9eb3b6b2fb6bd36eb1b9889bd5b480cbceac0aba80a23b709f609d2e15.json", "media_type": "application/json", "bytes": 672, "sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" } },
+        "cost_ref": "sha256:568720abc440185bfc02afb28f3a9501a9550b42548f21da9a7cba400b8e66b1"
       },
       {
         "step_id": "exact-retry",
@@ -136,9 +147,12 @@
         "invocation_id": "burnin-invocation-1",
         "status": "completed",
         "disposition": "reused",
-        "request_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-        "artifact_key": "executions/burnin-invocation-1.json",
-        "cost_ref": "sha256:4291e793d2c5c33fa79f8f52dde27eeb3ae4f2b24d7f31304b37b173410c5c26"
+        "request_hash": "sha256:9f8eee9eb3b6b2fb6bd36eb1b9889bd5b480cbceac0aba80a23b709f609d2e15",
+        "execution_digest": "sha256:7861be754594a33fdf37291cd1a7e7f6c42f10c0bd9c75351e40cfa51db9cfa5",
+        "execution_policy_revision": "managed/burnin-v1",
+        "session_ref": { "session_id": "burnin-session-1", "seq_range": [0, 0] },
+        "evidence": { "from": 0, "next": null, "truncated": false, "event_count": 1, "artifact_ref": { "key": "executions/cbb2a2c73d113c48587fbbe4c31a515f739c2765456ada65e484d53b70aa11a3/9f8eee9eb3b6b2fb6bd36eb1b9889bd5b480cbceac0aba80a23b709f609d2e15.json", "media_type": "application/json", "bytes": 672, "sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" } },
+        "cost_ref": "sha256:568720abc440185bfc02afb28f3a9501a9550b42548f21da9a7cba400b8e66b1"
       },
       {
         "step_id": "status-page-1",
@@ -147,9 +161,12 @@
         "invocation_id": "burnin-invocation-1",
         "status": "completed",
         "disposition": "reused",
-        "request_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-        "artifact_key": "executions/burnin-invocation-1.json",
-        "cost_ref": "sha256:4291e793d2c5c33fa79f8f52dde27eeb3ae4f2b24d7f31304b37b173410c5c26"
+        "request_hash": "sha256:9f8eee9eb3b6b2fb6bd36eb1b9889bd5b480cbceac0aba80a23b709f609d2e15",
+        "execution_digest": "sha256:7861be754594a33fdf37291cd1a7e7f6c42f10c0bd9c75351e40cfa51db9cfa5",
+        "execution_policy_revision": "managed/burnin-v1",
+        "session_ref": { "session_id": "burnin-session-1", "seq_range": [0, 0] },
+        "evidence": { "from": 0, "next": null, "truncated": false, "event_count": 1, "artifact_ref": { "key": "executions/cbb2a2c73d113c48587fbbe4c31a515f739c2765456ada65e484d53b70aa11a3/9f8eee9eb3b6b2fb6bd36eb1b9889bd5b480cbceac0aba80a23b709f609d2e15.json", "media_type": "application/json", "bytes": 672, "sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" } },
+        "cost_ref": "sha256:568720abc440185bfc02afb28f3a9501a9550b42548f21da9a7cba400b8e66b1"
       },
       {
         "step_id": "status-page-2",
@@ -158,9 +175,12 @@
         "invocation_id": "burnin-invocation-1",
         "status": "completed",
         "disposition": "reused",
-        "request_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-        "artifact_key": "executions/burnin-invocation-1.json",
-        "cost_ref": "sha256:4291e793d2c5c33fa79f8f52dde27eeb3ae4f2b24d7f31304b37b173410c5c26"
+        "request_hash": "sha256:9f8eee9eb3b6b2fb6bd36eb1b9889bd5b480cbceac0aba80a23b709f609d2e15",
+        "execution_digest": "sha256:7861be754594a33fdf37291cd1a7e7f6c42f10c0bd9c75351e40cfa51db9cfa5",
+        "execution_policy_revision": "managed/burnin-v1",
+        "session_ref": { "session_id": "burnin-session-1", "seq_range": [0, 0] },
+        "evidence": { "from": 100, "next": null, "truncated": false, "event_count": 0, "artifact_ref": { "key": "executions/cbb2a2c73d113c48587fbbe4c31a515f739c2765456ada65e484d53b70aa11a3/9f8eee9eb3b6b2fb6bd36eb1b9889bd5b480cbceac0aba80a23b709f609d2e15.json", "media_type": "application/json", "bytes": 672, "sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" } },
+        "cost_ref": "sha256:568720abc440185bfc02afb28f3a9501a9550b42548f21da9a7cba400b8e66b1"
       }
     ],
     "preflight": {
@@ -189,8 +209,16 @@
     },
     "run_cost_envelopes": [
       {
-        "id": "sha256:4291e793d2c5c33fa79f8f52dde27eeb3ae4f2b24d7f31304b37b173410c5c26",
-        "invocation_id": "burnin-invocation-1",
+        "id": "sha256:568720abc440185bfc02afb28f3a9501a9550b42548f21da9a7cba400b8e66b1",
+        "execution_identity": {
+          "invocation_id": "burnin-invocation-1",
+          "idempotency_key": "burnin-invocation-1",
+          "session_id": "burnin-session-1",
+          "request_hash": "sha256:9f8eee9eb3b6b2fb6bd36eb1b9889bd5b480cbceac0aba80a23b709f609d2e15",
+          "execution_digest": "sha256:7861be754594a33fdf37291cd1a7e7f6c42f10c0bd9c75351e40cfa51db9cfa5",
+          "execution_policy_revision": "managed/burnin-v1"
+        },
+        "artifact_ref": { "key": "executions/cbb2a2c73d113c48587fbbe4c31a515f739c2765456ada65e484d53b70aa11a3/9f8eee9eb3b6b2fb6bd36eb1b9889bd5b480cbceac0aba80a23b709f609d2e15.json", "media_type": "application/json", "bytes": 672, "sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" },
         "artifact_count": 1,
         "analytics_point_count": 1,
         "cost": {

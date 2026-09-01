@@ -32,6 +32,30 @@ test("reconciliation fails when cleanup is attributed to the wrong step", async 
   assert.match(result.stderr, /capture\.cleanup does not match the workload cleanup step/);
 });
 
+test("reconciliation recomputes the full request and execution identity", async (t) => {
+  const report = JSON.parse(await readFile(fixture, "utf8"));
+  report.workload.steps[0].request.execution_policy_revision = "managed/tampered";
+  const result = await reconcileTemporary(t, report);
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /execution_identity does not match the canonical first-execute request/);
+});
+
+test("reconciliation rejects positional evidence discontinuity", async (t) => {
+  const report = JSON.parse(await readFile(fixture, "utf8"));
+  report.capture.runtime_calls[2].evidence.from = 1;
+  const result = await reconcileTemporary(t, report);
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /evidence\.from breaks positional continuity/);
+});
+
+test("reconciliation seals artifact identity and digest across every observation", async (t) => {
+  const report = JSON.parse(await readFile(fixture, "utf8"));
+  report.capture.runtime_calls[1].evidence.artifact_ref.sha256 = `sha256:${"e".repeat(64)}`;
+  const result = await reconcileTemporary(t, report);
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /used a second artifact identity or digest/);
+});
+
 async function reconcileTemporary(t, report) {
   const temp = await mkdtemp(join(tmpdir(), "pillbox-burnin-reconcile-"));
   t.after(() => rm(temp, { recursive: true, force: true }));

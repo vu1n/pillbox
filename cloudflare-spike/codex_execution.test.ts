@@ -4,6 +4,7 @@ import {
   computeExecutionIdentityDigest,
   computeInvocationRequestHash,
   computeRenderedInputHash,
+  canonicalJson,
   CodexExecutionBoundaryError,
   MAX_EVIDENCE_PAGE_SIZE,
   type ExecuteInvocationV2Request,
@@ -185,6 +186,20 @@ test("execution identity digest is deterministic across object key order", async
   assert.equal(
     await computeExecutionIdentityDigest(codexExecution, "policy/1"),
     await computeExecutionIdentityDigest(reordered, "policy/1"),
+  );
+});
+
+test("canonical JSON orders uppercase and non-ASCII keys by UTF-16 code units", () => {
+  assert.equal(
+    canonicalJson({
+      "\ufffd": 6,
+      "\ud83d\ude00": 5,
+      "\u00e9": 4,
+      "\u00c9": 3,
+      a: 2,
+      A: 1,
+    }),
+    '{"A":1,"a":2,"\u00c9":3,"\u00e9":4,"\ud83d\ude00":5,"\ufffd":6}',
   );
 });
 

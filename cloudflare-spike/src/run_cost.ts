@@ -107,7 +107,7 @@ export class RunCostMeter {
       readonly sandbox_profile: string | null;
       readonly planned_d1_terminal_writes?: number;
       readonly planned_r2_writes?: number;
-      readonly planned_analytics_points?: number;
+      readonly confirmed_analytics_points?: number;
     },
   ): RunCostEnvelope {
     const known = this.hasProviderCost ? this.providerCostUsd : null;
@@ -129,7 +129,7 @@ export class RunCostMeter {
         r2_writes: this.r2Writes + (options.planned_r2_writes ?? 0),
         r2_bytes_read: this.r2BytesRead,
         r2_bytes_written: this.r2BytesWritten,
-        analytics_points_written: options.planned_analytics_points ?? 0,
+        analytics_points_written: options.confirmed_analytics_points ?? 0,
         sandbox_duration_ms: Math.max(0, options.sandbox_duration_ms),
         sandbox_profile: options.sandbox_profile,
       },

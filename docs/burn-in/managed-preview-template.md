@@ -7,7 +7,7 @@ create a Durable Object owned by Pillbox.
 
 ## Scope and reviewed budget
 
-The version 2 report contract in
+The version 3 report contract in
 `cloudflare-spike/testdata/burnin-reconciliation.fixture.json` records one
 genuinely new managed execution. The live recorder performs these steps in
 this order:
@@ -44,17 +44,22 @@ OPS-000 owns creation and validation of the isolated D1/R2 resources, database
 migrations and allowance row, signing/currentness keys and pins, capability
 secret, and installation/workspace/policy identity. This runbook consumes the
 checked OPS-000 outputs; it does not provide an alternate manual bootstrap.
-Do not enable the Worker unless that bootstrap dry-run proves the complete
+Do not enable the Worker unless the applied bootstrap receipt proves the complete
 matching tuple and the one-run allowance.
 
 The committed `wrangler.burnin.toml` is deliberately non-deployable: its public
 pin values are empty and its parse-only D1 UUID is rejected by the bootstrap
 validator. Materialize a protected local copy from the HD-013/OPS-000 output;
 never replace the template with guessed identifiers. The non-secret Huddles
-tuple has schema `huddles.pillbox-burnin-bootstrap/1` and is authoritative for
+tuple has schema `huddles.pillbox-burnin-bootstrap/1`, must come from `--apply`, and is authoritative for
 the signer key ID/public key/fingerprint, installation, execution realm,
 protocol revision, organization, currentness service/entrypoint, and concurrency
-of one.
+of one. A dry-run tuple is never deployment evidence. The applied tuple also
+contains an `huddles.pillbox-burnin-authority-receipt/1` receipt with an exact
+application time and canonical receipt digest. Its database tuple, issuer
+key-pair self-test, and currentness probe must all be `verified` for the same
+installation, policy, key ID/fingerprint, and service entrypoints. Wrangler
+configuration and secret-name metadata alone do not prove applied authority.
 
 Install the mandatory public-HTTP capability secret through Wrangler stdin.
 The secret must not appear in a command argument, shell trace, config, metadata,
@@ -84,10 +89,13 @@ node cloudflare-spike/scripts/validate-burnin-bootstrap.mjs \
   --metadata /private/path/wrangler-secret-metadata.json
 ```
 
-The validator fails on a missing secret name, empty or placeholder resource,
-invalid key/fingerprint, missing pin, tuple mismatch, wrong currentness binding,
-or concurrency other than one. Its successful output contains public pins and
-the word `installed`; it never reads or prints secret material. The Worker
+The validator fails on dry-run mode, a missing or mismatched applied-authority
+receipt, missing secret name, empty or placeholder resource, invalid
+key/fingerprint, missing pin, tuple mismatch, wrong currentness binding, or
+concurrency other than one. It requires exactly one isolated D1 database, R2
+bucket, `RUN_COSTS` Analytics dataset, vendor `Sandbox` DO/container/migration
+tuple, and currentness service. Its successful output contains public evidence
+and the word `installed`; it never reads or prints secret material. The Worker
 repeats the executable subset of this preflight before routing any public
 request. Huddles continues to use its private service binding plus signed,
 current operation grants; this public HMAC secret does not replace that path.
@@ -173,9 +181,13 @@ Analytics point is a failed gate; stop the Worker and preserve the evidence.
 
 The recorder writes one strict report shape:
 
+- `capture.execution_identity` is recomputed from the canonical first execute
+  request and seals invocation/idempotency/session identity, request hash,
+  execution digest, and policy revision.
 - `capture.runtime_calls` contains exactly the execute, exact retry, and two
-  bounded status calls. Only these records carry invocation, request-hash,
-  artifact, and cost references.
+  bounded status calls. Each record carries the full returned identity,
+  positional session range and evidence cursor, immutable artifact reference
+  (including bytes and digest), and cost reference.
 - `capture.preflight` contains the observed local rejection and zero side-effect
   counters. It has no execution artifact or cost fields.
 - `capture.cleanup` contains the finalize HTTP result, session, and result
@@ -194,7 +206,8 @@ same isolated run. Capture all of these dimensions, including zeroes:
   starting/ending bytes, and custom storage delta.
 
 The report's `run_cost_envelopes` must contain exactly one envelope for the one
-new claim. Its D1/R2/Analytics/container counters must match the per-run
+new claim, bound again to the full execution identity and artifact digest. Its
+D1/R2/Analytics/container counters must match the per-run
 captures. Read-only retry/status/finalize traffic belongs in `read_only`, not
 in a second envelope. Reconcile with:
 

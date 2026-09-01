@@ -305,6 +305,143 @@ test("managed boundary authorizes fresh retries before replay and carries signer
       ),
     );
     assert.notEqual(calls[1].grant.grant_id, calls[2].grant.grant_id);
+
+    const genericExecute = {
+      contract_version: "pillbox.execution/2",
+      session_ref: { session_id: "generic-session" },
+      invocation_id: "generic-invocation",
+      idempotency_key: "generic-delivery",
+      rendered_input: "Return one generic boundary probe.",
+      rendered_input_hash: digest("Return one generic boundary probe."),
+      tool_policy: "deny_all",
+      execution: {
+        transport: {
+          harness: "opencode",
+          transport: "http",
+          harness_version: "opencode/managed",
+          adapter_revision: "pillbox/execution-v2",
+        },
+        requested: {
+          provider: "zai-coding-plan",
+          model: "managed-model",
+          profile: null,
+          reasoning_effort: "high",
+        },
+        placement: "managed_container",
+        context_renderer_revision: "huddles/context/1",
+      },
+      execution_policy_revision: "execution/2",
+      output_format: { type: "text", retry_count: 0 },
+    };
+    const executeAuthorization = signedOperationAuthorization(
+      "execute",
+      genericExecute,
+      "generic-grant-execute",
+    );
+
+    await assert.rejects(
+      callPrivate(caller, "/execute", { request: genericExecute }),
+      /operation authorization is invalid/,
+    );
+    for (const [mismatch, authorization] of [
+      ["operation_mismatch", signedOperationAuthorization("cancel", genericExecute, "generic-wrong-operation")],
+      ["invocation_mismatch", signedOperationAuthorization("execute", genericExecute, "generic-wrong-invocation", { invocation_id: "other" })],
+      ["request_digest_mismatch", signedOperationAuthorization("execute", genericExecute, "generic-wrong-digest", { request_digest: `sha256:${"0".repeat(64)}` })],
+    ]) {
+      await assert.rejects(
+        callPrivate(caller, "/execute", { request: genericExecute, authorization }),
+        new RegExp(`grant ${mismatch}`),
+      );
+    }
+    await assert.rejects(
+      callPrivate(caller, "/execute", {
+        request: genericExecute,
+        authorization: signedOperationAuthorization("execute", genericExecute, "generic-expired", { expires_at: Math.floor(Date.now() / 1000) - 1 }),
+      }),
+      /outside its validity interval/,
+    );
+    await assert.rejects(
+      callPrivate(caller, "/execute", {
+        request: genericExecute,
+        authorization: signedOperationAuthorization("execute", genericExecute, "generic-wrong-signer", {}, "other-key"),
+      }),
+      /key is not trusted/,
+    );
+    await assert.rejects(
+      callPrivate(caller, "/execute", {
+        request: genericExecute,
+        authorization: signedOperationAuthorization("execute", genericExecute, "generic-wrong-deployment", {
+          installation: { ...installation, installation_id: "other-installation" },
+        }),
+      }),
+      /installation does not match this deployment/,
+    );
+    await assert.rejects(
+      callPrivate(caller, "/execute", {
+        request: genericExecute,
+        authorization: signedOperationAuthorization("execute", genericExecute, "generic-revoked"),
+      }),
+      /grant is not current/,
+    );
+
+    const firstGeneric = await callPrivate(caller, "/execute", {
+      request: genericExecute,
+      authorization: executeAuthorization,
+    });
+    assert.equal(firstGeneric.status, "failed");
+    assert.equal(firstGeneric.disposition, "created");
+    assert.equal(firstGeneric.error.code, "runtime_unavailable");
+    const retriedGeneric = await callPrivate(caller, "/execute", {
+      request: genericExecute,
+      authorization: executeAuthorization,
+    });
+    assert.deepEqual(retriedGeneric, { ...firstGeneric, disposition: "reused" });
+
+    const statusRequest = {
+      contract_version: "pillbox.execution/2",
+      invocation_id: genericExecute.invocation_id,
+      evidence_after: 0,
+      evidence_limit: 100,
+    };
+    const status = await callPrivate(caller, "/status", {
+      request: statusRequest,
+      authorization: signedOperationAuthorization("status", statusRequest, "generic-grant-status"),
+    });
+    assert.equal(status.status, "failed");
+    const cancelRequest = {
+      contract_version: "pillbox.execution/2",
+      invocation_id: genericExecute.invocation_id,
+      idempotency_key: "generic-cancel",
+      reason: "boundary probe complete",
+    };
+    const cancelled = await callPrivate(caller, "/cancel", {
+      request: cancelRequest,
+      authorization: signedOperationAuthorization("cancel", cancelRequest, "generic-grant-cancel"),
+    });
+    assert.equal(cancelled.status, "failed", "terminal result remains immutable after authorized cancel");
+
+    const missingStatus = { ...statusRequest, invocation_id: "never-persisted" };
+    await assert.rejects(
+      callPrivate(caller, "/status", { request: missingStatus }),
+      /operation authorization is invalid/,
+    );
+    await assert.rejects(
+      callPrivate(caller, "/cancel", { request: { ...cancelRequest, invocation_id: "never-persisted" } }),
+      /operation authorization is invalid/,
+    );
+
+    const allCalls = await (await authority.fetch("http://authority.test/calls")).json();
+    const operationCalls = allCalls.filter(
+      (call) => call.version === "pillbox.authorization-currentness/3",
+    );
+    assert.deepEqual(
+      operationCalls.map((call) => call.expected.operation),
+      ["execute", "execute", "execute", "status", "cancel"],
+      "revoked check, create, exact retry, status, and cancel each recheck currentness",
+    );
+    assert.equal(operationCalls[1].grant.claims.grant_id, "generic-grant-execute");
+    assert.deepEqual(operationCalls[1].grant, executeAuthorization.grant);
+    assert.equal(JSON.stringify({ firstGeneric, retriedGeneric, status, cancelled }).includes("managed-principal"), false);
   } finally {
     if (caller) await caller.stop();
     if (target) await target.stop();
@@ -394,6 +531,32 @@ function signedEnvelope(claims) {
       Buffer.from(canonicalJson(claims)),
       privateKey,
     ).toString("base64url"),
+  };
+}
+
+function signedOperationAuthorization(operation, request, grantId, claimChanges = {}, keyId = "test-key") {
+  const now = Math.floor(Date.now() / 1000);
+  const claims = {
+    version: "huddles.execution-operation-grant/2",
+    grant_id: grantId,
+    installation,
+    organization_id: "test-organization",
+    workspace_id: "managed-workspace",
+    principal_id: "managed-principal",
+    policy_id: "managed-policy",
+    operation,
+    invocation_id: request.invocation_id,
+    request_digest: digest(request),
+    issued_at: now - 10,
+    not_before: now - 10,
+    expires_at: now + 120,
+    ...claimChanges,
+  };
+  return {
+    grant: {
+      ...signedEnvelope(claims),
+      key_id: keyId,
+    },
   };
 }
 

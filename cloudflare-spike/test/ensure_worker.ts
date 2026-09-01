@@ -4,11 +4,30 @@ import type {
   InvokeSessionRequest,
   InvokeSessionResult,
 } from "../src/legacy_huddles_adapter.js";
+import type {
+  CancelInvocationV2Request,
+  ExecuteInvocationV2Request,
+  ExecuteInvocationV2Result,
+  GetInvocationV2Request,
+} from "../src/codex_execution.js";
+import type { PillboxExecutionOperationGrantIssueResponse } from "../src/managed_contract.js";
 
 // Test-only HTTP bridge into the private service binding. The product Worker
 // intentionally has no equivalent route.
 interface Env {
   PillboxRuntime: {
+    executeInvocation(
+      request: ExecuteInvocationV2Request,
+      authorization: PillboxExecutionOperationGrantIssueResponse,
+    ): Promise<ExecuteInvocationV2Result>;
+    getExecutionStatus(
+      request: GetInvocationV2Request,
+      authorization: PillboxExecutionOperationGrantIssueResponse,
+    ): Promise<ExecuteInvocationV2Result>;
+    cancelInvocation(
+      request: CancelInvocationV2Request,
+      authorization: PillboxExecutionOperationGrantIssueResponse,
+    ): Promise<ExecuteInvocationV2Result>;
     ensureSession(request: EnsureSessionRequest): Promise<EnsureSessionResult>;
     invokeSession(request: InvokeSessionRequest): Promise<InvokeSessionResult>;
   };
@@ -17,15 +36,36 @@ interface Env {
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const path = new URL(request.url).pathname;
-    if (path !== "/ensure" && path !== "/invoke") {
+    if (!["/execute", "/status", "/cancel", "/ensure", "/invoke"].includes(path)) {
       return new Response("not found\n", { status: 404 });
     }
     try {
-      const input = await request.json();
+      const input = await request.json() as {
+        request?: unknown;
+        authorization?: PillboxExecutionOperationGrantIssueResponse;
+      };
+      if (path === "/execute") {
+        return Response.json(await env.PillboxRuntime.executeInvocation(
+          input.request as ExecuteInvocationV2Request,
+          input.authorization as PillboxExecutionOperationGrantIssueResponse,
+        ));
+      }
+      if (path === "/status") {
+        return Response.json(await env.PillboxRuntime.getExecutionStatus(
+          input.request as GetInvocationV2Request,
+          input.authorization as PillboxExecutionOperationGrantIssueResponse,
+        ));
+      }
+      if (path === "/cancel") {
+        return Response.json(await env.PillboxRuntime.cancelInvocation(
+          input.request as CancelInvocationV2Request,
+          input.authorization as PillboxExecutionOperationGrantIssueResponse,
+        ));
+      }
       const result =
         path === "/ensure"
-          ? await env.PillboxRuntime.ensureSession(input as EnsureSessionRequest)
-          : await env.PillboxRuntime.invokeSession(input as InvokeSessionRequest);
+          ? await env.PillboxRuntime.ensureSession(input as unknown as EnsureSessionRequest)
+          : await env.PillboxRuntime.invokeSession(input as unknown as InvokeSessionRequest);
       if ("code" in result) {
         return Response.json({ error: result }, { status: 409 });
       }

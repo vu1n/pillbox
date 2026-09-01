@@ -55,11 +55,11 @@ tag = "v1"
 new_sqlite_classes = ["Sandbox"]
 
 [[services]]
-# Point this at an isolated Huddles preview service before a live private-RPC
-# run. The binding is transport only; signed request grants remain required.
-binding = "PillboxAuthorizationControlPlane"
+# Point this at the isolated Huddles authorize-only preview service before a
+# live private-RPC run. The binding cannot issue grants; signed grants remain required.
+binding = "PillboxAuthorizationCurrentness"
 service = "huddles-projectors-managed-burnin"
-entrypoint = "PillboxAuthorizationControlPlaneEntrypoint"
+entrypoint = "PillboxAuthorizationCurrentnessEntrypoint"
 
 [observability]
 enabled = true

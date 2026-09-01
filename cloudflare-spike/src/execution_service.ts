@@ -65,6 +65,25 @@ export interface ExecutionRuntime {
   cancel(request: CancelInvocationV2Request, session_id: string): Promise<void>;
 }
 
+export type ExecutionOperationAuthorization =
+  | {
+      readonly operation: "execute";
+      readonly request: ExecuteInvocationV2Request;
+    }
+  | {
+      readonly operation: "status";
+      readonly request: GetInvocationV2Request;
+    }
+  | {
+      readonly operation: "cancel";
+      readonly request: CancelInvocationV2Request;
+    };
+
+/** Identity-free pre-access capability; authorization claims never enter runtime state. */
+export type ExecutionOperationAuthorizer = (
+  input: ExecutionOperationAuthorization,
+) => Promise<void>;
+
 export interface ExecutionServiceOptions {
   readonly now?: () => number;
   readonly ownerToken?: () => string;
@@ -72,6 +91,7 @@ export interface ExecutionServiceOptions {
   readonly analytics?: RunCostAnalytics;
   readonly sandboxProfile?: string;
   readonly allowance?: ManagedExecutionAllowance | null;
+  readonly authorizer?: ExecutionOperationAuthorizer;
 }
 
 export class ExecutionNotFoundError extends Error {
@@ -94,6 +114,7 @@ export class ExecutionService {
   private readonly sandboxProfile: string | null;
   private readonly admission: ManagedAdmissionPolicy;
   private readonly allowance: ManagedExecutionAllowance | null;
+  private readonly authorizer: ExecutionOperationAuthorizer | undefined;
 
   constructor(
     store: ExecutionStore,
@@ -113,6 +134,7 @@ export class ExecutionService {
     this.sandboxProfile = options.sandboxProfile ?? null;
     this.admission = options.admission ?? managedAdmissionPolicy(undefined);
     this.allowance = options.allowance ?? null;
+    this.authorizer = options.authorizer;
   }
 
   async executeInvocation(value: unknown): Promise<ExecuteInvocationV2Result> {
@@ -122,6 +144,7 @@ export class ExecutionService {
       request.execution,
       request.execution_policy_revision,
     );
+    await this.authorizer?.({ operation: "execute", request });
     try {
       requireManagedAdmission(this.admission);
     } catch (cause) {
@@ -224,6 +247,7 @@ export class ExecutionService {
 
   async getExecutionStatus(value: unknown): Promise<ExecuteInvocationV2Result> {
     const request = validateGetInvocationV2Request(value);
+    await this.authorizer?.({ operation: "status", request });
     const record = await this.requireRecord(request.invocation_id);
     return this.resultForRecord(
       undefined,
@@ -234,6 +258,7 @@ export class ExecutionService {
 
   async cancelInvocation(value: unknown): Promise<ExecuteInvocationV2Result> {
     const request = validateCancelInvocationV2Request(value);
+    await this.authorizer?.({ operation: "cancel", request });
     let record = await this.requireRecord(request.invocation_id);
     if (record.status !== "running") {
       return this.resultForRecord(undefined, record, {

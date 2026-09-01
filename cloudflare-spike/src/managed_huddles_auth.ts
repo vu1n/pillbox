@@ -119,7 +119,7 @@ export async function authorizeManagedInvoke(
 
 function managedAuthRequired(env: Env, currentEnvelope: boolean): boolean {
   if (env.MANAGED_AUTH_REQUIRED === "1") return true;
-  return env.PillboxAuthorizationControlPlane !== undefined && currentEnvelope;
+  return env.PillboxAuthorizationCurrentness !== undefined && currentEnvelope;
 }
 
 function requireNoBrokeredCredentials(binding: PillboxManagedRequestBinding): void {

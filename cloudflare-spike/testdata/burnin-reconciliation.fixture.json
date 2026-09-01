@@ -21,7 +21,7 @@
           "contract_version": "pillbox.execution/2",
           "session_ref": { "session_id": "burnin-session-1" },
           "invocation_id": "burnin-invocation-1",
-          "idempotency_key": "burnin-delivery-1",
+          "idempotency_key": "burnin-invocation-1",
           "rendered_input": "Return exactly a JSON object with key \"ok\" set to true.",
           "rendered_input_hash": "sha256:7c1a327ad525b4b19bfb4e4940939f9ccd8e3783cd8d2b23b81f04a2ff26667b",
           "tool_policy": "deny_all",

@@ -83,7 +83,7 @@ export async function verifySignedExecutionOperationGrantWithSigner(
     });
     return {
       grant,
-      claims: validateExecutionOperationGrantClaims(grant.claims),
+      claims: grant.claims,
       verified_signer: makeManagedVerifiedSigner(
         grant.key_id,
         verified.public_key_sha256,

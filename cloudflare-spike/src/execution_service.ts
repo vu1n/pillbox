@@ -90,6 +90,7 @@ export interface ExecutionServiceOptions {
   readonly costMeter?: RunCostMeter;
   readonly analytics?: RunCostAnalytics;
   readonly sandboxProfile?: string;
+  readonly admission?: ManagedAdmissionPolicy;
   readonly allowance?: ManagedExecutionAllowance | null;
   readonly authorizer?: ExecutionOperationAuthorizer;
 }
@@ -120,9 +121,7 @@ export class ExecutionService {
     store: ExecutionStore,
     artifacts: ExecutionArtifactStore,
     runtime: ExecutionRuntime,
-    options: ExecutionServiceOptions & {
-      readonly admission?: ManagedAdmissionPolicy;
-    } = {},
+    options: ExecutionServiceOptions = {},
   ) {
     this.store = store;
     this.artifacts = artifacts;

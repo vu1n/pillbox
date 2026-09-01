@@ -942,9 +942,11 @@ mod tests {
         // The returned access stub is exactly the file's accessToken stub — what broker
         // JIT refresh keys on to find the swap pair to keep fresh.
         assert_eq!(access_stub.as_deref(), Some(access));
-        // …and the real values live ONLY in the out-of-band swap pairs.
+        // Only the real access token lives in an out-of-band release pair. The
+        // refresh token stays host-broker-only and can never be released by MITM.
         assert!(pairs.iter().any(|p| p.real == real_access));
-        assert!(pairs.iter().any(|p| p.real == real_refresh));
+        assert_eq!(pairs.len(), 1);
+        assert!(pairs.iter().all(|p| p.real != real_refresh));
         // Other fields preserved.
         assert_eq!(
             oauth.get("subscriptionType").and_then(|v| v.as_str()),

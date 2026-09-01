@@ -7,8 +7,8 @@
 //!   "auth_mode": "ChatGPT",
 //!   "tokens": {
 //!     "id_token": "<JWT>",        // identity claims; copied verbatim into the stub
-//!     "access_token": "<JWT>",    // swapped
-//!     "refresh_token": "<opaque>",// swapped
+//!     "access_token": "<JWT>",    // stubbed; released only to API hosts
+//!     "refresh_token": "<opaque>",// shape-valid stub; never released
 //!     "account_id": "<id>"        // copied verbatim
 //!   },
 //!   "last_refresh": "<ISO ts>",
@@ -24,7 +24,7 @@
 //!  - `chatgpt.com` (exact + any subdomain) — bearer-token swap on every
 //!    request.
 //!  - `chat.openai.com` — same.
-//!  - `auth.openai.com` — `/oauth/token` is the refresh endpoint
+//!  - `auth.openai.com` — `/oauth/token` is intercepted and rejected locally
 //!    (verified against `codex-rs/login/src/auth/manager.rs`:
 //!    `const REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token"`).
 //!
@@ -34,18 +34,17 @@
 use std::path::Path;
 
 use async_trait::async_trait;
-use http_body_util::BodyExt;
 use hudsucker::{
     hyper::{
         header::{HeaderValue, AUTHORIZATION},
-        Request, Response,
+        Request,
     },
     Body, RequestOrResponse,
 };
 
 use super::{
-    host_from_uri, mint_stub, unauthorized, HostProxyOAuthStub, OAuthCodec, OAuthRefreshRequest,
-    PendingFlow, Registry, SandboxData, VaultProvider,
+    host_from_uri, mint_stub, oauth_rotation_forbidden, unauthorized, HostProxyOAuthStub,
+    OAuthCodec, OAuthRefreshRequest, Registry, SandboxData, VaultProvider,
 };
 #[cfg(feature = "libkrun")]
 use super::{LibkrunOAuthStub, OAuthRelease};
@@ -64,10 +63,8 @@ const OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OAUTH_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
 
 // Codex doesn't ship a public stub prefix convention (tokens are opaque
-// JWTs / random strings). We invent a `pb-codex-` family so:
-//  - the proxy can recognise stubs without parsing them, and
-//  - if a stub ever leaks into a log somewhere it's obviously a pillbox
-//    artifact, not a real OpenAI token.
+// JWTs / random strings). The `pb-codex-` family makes any logged stub
+// visibly a pillbox artifact rather than a real OpenAI token.
 pub(crate) const STUB_ACCESS_PREFIX: &str = "pb-codex-oat-";
 pub(crate) const STUB_REFRESH_PREFIX: &str = "pb-codex-ort-";
 
@@ -101,6 +98,10 @@ impl VaultProvider for CodexProvider {
         Some(self)
     }
 
+    fn is_oauth_token_endpoint(&self, host: &str, path: &str) -> bool {
+        host == AUTH_OPENAI_HOST && path.ends_with(OAUTH_TOKEN_PATH_SUFFIX)
+    }
+
     fn provision(
         &self,
         sandbox_id: &str,
@@ -123,109 +124,15 @@ impl VaultProvider for CodexProvider {
         Ok(stub_json)
     }
 
-    async fn handle_request(
-        &self,
-        req: Request<Body>,
-        server: &ServerInner,
-        pending: &mut Option<PendingFlow>,
-    ) -> RequestOrResponse {
+    async fn handle_request(&self, req: Request<Body>, server: &ServerInner) -> RequestOrResponse {
         let host = host_from_uri(&req).unwrap_or_default();
-        if host == AUTH_OPENAI_HOST && req.uri().path().ends_with(OAUTH_TOKEN_PATH_SUFFIX) {
-            return handle_oauth_request(req, server, pending).await;
+        if self.is_oauth_token_endpoint(&host, req.uri().path()) {
+            return oauth_rotation_forbidden().into();
         }
         // chatgpt.com / chat.openai.com / subdomains all use a Bearer
         // access token in the Authorization header for codex-cli's
         // backend calls.
         handle_bearer_request(req, server).await
-    }
-
-    async fn handle_response(
-        &self,
-        res: Response<Body>,
-        server: &ServerInner,
-        pending: &mut Option<PendingFlow>,
-    ) -> Response<Body> {
-        let Some(flow) = pending.take() else {
-            return res;
-        };
-        if flow.provider_id != PROVIDER_ID {
-            *pending = Some(flow);
-            return res;
-        }
-
-        let (parts, body) = res.into_parts();
-        let collected = match body.collect().await {
-            Ok(c) => c.to_bytes(),
-            Err(error) => {
-                eprintln!("pillbox: vault: failed to collect codex oauth response body: {error}");
-                return Response::from_parts(parts, Body::empty());
-            }
-        };
-
-        let mut value: serde_json::Value = match serde_json::from_slice(&collected) {
-            Ok(v) => v,
-            Err(error) => {
-                eprintln!(
-                    "pillbox: vault: codex oauth response not JSON; passing through: {error}"
-                );
-                return Response::from_parts(parts, Body::from(collected));
-            }
-        };
-
-        let stub_pair = {
-            let mut registry = server.registry_lock();
-            if let Some(obj) = value.as_object_mut() {
-                if let Some(new_access) = obj
-                    .get("access_token")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned)
-                {
-                    registry.rotate_real_field(
-                        &flow.sandbox_id,
-                        "/tokens/access_token",
-                        new_access,
-                    );
-                }
-                if let Some(new_refresh) = obj
-                    .get("refresh_token")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned)
-                {
-                    registry.rotate_real_field(
-                        &flow.sandbox_id,
-                        "/tokens/refresh_token",
-                        new_refresh,
-                    );
-                }
-            }
-            stubs_for(&registry, &flow.sandbox_id)
-        };
-
-        if let (Some(obj), Some((stub_access, stub_refresh))) =
-            (value.as_object_mut(), stub_pair.as_ref())
-        {
-            if obj.contains_key("access_token") {
-                obj.insert(
-                    "access_token".to_string(),
-                    serde_json::Value::String(stub_access.clone()),
-                );
-            }
-            if obj.contains_key("refresh_token") {
-                obj.insert(
-                    "refresh_token".to_string(),
-                    serde_json::Value::String(stub_refresh.clone()),
-                );
-            }
-        }
-
-        let new_body = serde_json::to_vec(&value).unwrap_or(collected.to_vec());
-        let new_len = new_body.len();
-        let mut parts = parts;
-        parts.headers.remove("content-length");
-        parts
-            .headers
-            .insert("content-length", HeaderValue::from(new_len));
-        Response::from_parts(parts, Body::from(new_body))
     }
 }
 
@@ -443,67 +350,6 @@ fn mint_libkrun_access_stub() -> String {
     format!("{header}.{payload}.{signature}")
 }
 
-/// Swap stub refresh_token → real refresh_token on the way out to
-/// `auth.openai.com/oauth/token`. Codex sends a JSON body
-/// `{client_id, grant_type:"refresh_token", refresh_token}`.
-async fn handle_oauth_request(
-    req: Request<Body>,
-    server: &ServerInner,
-    pending: &mut Option<PendingFlow>,
-) -> RequestOrResponse {
-    let (mut parts, body) = req.into_parts();
-    let collected = match body.collect().await {
-        Ok(c) => c.to_bytes(),
-        Err(error) => {
-            eprintln!("pillbox: vault: failed to collect codex oauth request body: {error}");
-            return unauthorized("body read error").into();
-        }
-    };
-
-    let mut value: serde_json::Value = match serde_json::from_slice(&collected) {
-        Ok(v) => v,
-        Err(_) => {
-            return unauthorized("non-json oauth body").into();
-        }
-    };
-
-    let stub_refresh = value
-        .get("refresh_token")
-        .and_then(|v| v.as_str())
-        .map(str::to_owned);
-
-    let real_refresh = if let Some(stub) = stub_refresh.as_deref() {
-        let registry = server.registry_lock();
-        let sandbox_id = match registry.sandbox_for_stub(stub) {
-            Some(s) => s.to_string(),
-            None => return unauthorized("unknown stub refresh token").into(),
-        };
-        *pending = Some(PendingFlow {
-            provider_id: PROVIDER_ID,
-            sandbox_id: sandbox_id.clone(),
-        });
-        registry
-            .real(&sandbox_id)
-            .and_then(|v| v.pointer("/tokens/refresh_token"))
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)
-    } else {
-        None
-    };
-
-    if let (Some(obj), Some(real)) = (value.as_object_mut(), real_refresh) {
-        obj.insert("refresh_token".to_string(), serde_json::Value::String(real));
-    }
-
-    let new_body = serde_json::to_vec(&value).unwrap_or(collected.to_vec());
-    let new_len = new_body.len();
-    parts.headers.remove("content-length");
-    parts
-        .headers
-        .insert("content-length", HeaderValue::from(new_len));
-    Request::from_parts(parts, Body::from(new_body)).into()
-}
-
 /// Swap stub bearer access_token → real bearer access_token on the way
 /// out to chatgpt.com / chat.openai.com.
 async fn handle_bearer_request(req: Request<Body>, server: &ServerInner) -> RequestOrResponse {
@@ -555,19 +401,6 @@ async fn handle_bearer_request(req: Request<Body>, server: &ServerInner) -> Requ
     }
 
     Request::from_parts(parts, body).into()
-}
-
-fn stubs_for(registry: &Registry, sandbox_id: &str) -> Option<(String, String)> {
-    let stubs = registry.stubs_for(sandbox_id)?;
-    let access = stubs
-        .iter()
-        .find(|s| s.starts_with(STUB_ACCESS_PREFIX))?
-        .clone();
-    let refresh = stubs
-        .iter()
-        .find(|s| s.starts_with(STUB_REFRESH_PREFIX))?
-        .clone();
-    Some((access, refresh))
 }
 
 #[cfg(test)]
@@ -692,11 +525,11 @@ mod tests {
         assert_eq!(CodexProvider.creds_path(), Path::new(".codex/auth.json"));
     }
 
-    // ── End-to-end Request/Response integration tests ────────────────
+    // ── End-to-end request integration tests ────────────────────────
 
     use crate::vault::providers::test_support::{
-        body_bytes, body_json, build_json_response, build_request, cleanup, expect_request,
-        expect_response, fresh_server, sample_codex_real,
+        body_bytes, build_request, cleanup, expect_request, expect_response, fresh_server,
+        sample_codex_real,
     };
     use hudsucker::Body;
 
@@ -741,9 +574,8 @@ mod tests {
             Request::from_parts(parts, body)
         };
 
-        let mut pending: Option<PendingFlow> = None;
         let out = CodexProvider
-            .handle_request(req, server.inner_for_test(), &mut pending)
+            .handle_request(req, server.inner_for_test())
             .await;
         let out_req = expect_request(out, "codex bearer swap");
         let auth = out_req
@@ -753,7 +585,6 @@ mod tests {
             .to_str()
             .unwrap();
         assert_eq!(auth, format!("Bearer {FAKE_JWT}"));
-        assert!(pending.is_none());
 
         drop(_lease);
         cleanup(server, dir);
@@ -776,9 +607,8 @@ mod tests {
             Request::from_parts(parts, body)
         };
 
-        let mut pending = None;
         let out = CodexProvider
-            .handle_request(req, server.inner_for_test(), &mut pending)
+            .handle_request(req, server.inner_for_test())
             .await;
         let res = expect_response(out, "codex unknown stub");
         assert_eq!(res.status(), 401);
@@ -805,9 +635,8 @@ mod tests {
             Request::from_parts(parts, body)
         };
 
-        let mut pending = None;
         let out = CodexProvider
-            .handle_request(req, server.inner_for_test(), &mut pending)
+            .handle_request(req, server.inner_for_test())
             .await;
         let out_req = expect_request(out, "non-codex bearer pass-through");
         assert_eq!(
@@ -828,9 +657,8 @@ mod tests {
         let (server, dir) = fresh_server().await;
         let req = build_request("GET", "https://chatgpt.com/api/health", Body::empty());
 
-        let mut pending = None;
         let out = CodexProvider
-            .handle_request(req, server.inner_for_test(), &mut pending)
+            .handle_request(req, server.inner_for_test())
             .await;
         let out_req = expect_request(out, "codex no-auth pass-through");
         assert!(out_req.headers().get("authorization").is_none());
@@ -839,152 +667,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oauth_refresh_request_swaps_body_and_sets_pending() {
+    async fn oauth_refresh_request_is_rejected_without_releasing_token() {
         let (server, dir) = fresh_server().await;
         let _lease = server
             .lease("codex", "sbx-cx-rt", sample_codex_real())
             .expect("lease");
         let (_, stub_refresh) = stubs_for_sandbox(&server, "sbx-cx-rt");
-
-        let body_in = serde_json::json!({
-            "client_id": "app_codex",
-            "grant_type": "refresh_token",
-            "refresh_token": stub_refresh,
-        });
-        let bytes = serde_json::to_vec(&body_in).unwrap();
-        let len = bytes.len();
         let req = Request::builder()
             .method("POST")
             .uri("https://auth.openai.com/oauth/token")
             .header("content-type", "application/json")
-            .header("content-length", len)
-            .body(Body::from(bytes))
+            .body(Body::from(format!(
+                r#"{{"grant_type":"refresh_token","refresh_token":"{stub_refresh}"}}"#
+            )))
             .unwrap();
-
-        let mut pending: Option<PendingFlow> = None;
-        let out = CodexProvider
-            .handle_request(req, server.inner_for_test(), &mut pending)
-            .await;
-        let out_req = expect_request(out, "codex oauth refresh");
-        let body = body_json(out_req.into_body()).await;
-        assert_eq!(
-            body.get("refresh_token").and_then(|v| v.as_str()),
-            Some("rt_codex_real")
+        let res = expect_response(
+            CodexProvider
+                .handle_request(req, server.inner_for_test())
+                .await,
+            "broker-owned codex refresh",
         );
-        // grant_type / client_id preserved.
-        assert_eq!(
-            body.get("grant_type").and_then(|v| v.as_str()),
-            Some("refresh_token")
-        );
-        assert_eq!(
-            body.get("client_id").and_then(|v| v.as_str()),
-            Some("app_codex")
-        );
-        let flow = pending.expect("pending set");
-        assert_eq!(flow.provider_id, "codex");
-        assert_eq!(flow.sandbox_id, "sbx-cx-rt");
+        assert_eq!(res.status(), 403);
+        let body = String::from_utf8(body_bytes(res.into_body()).await).unwrap();
+        assert!(body.contains("OAuth rotation is broker-owned"));
+        assert!(!body.contains(&stub_refresh));
+        assert!(!body.contains("rt_codex_real"));
 
         drop(_lease);
-        cleanup(server, dir);
-    }
-
-    #[tokio::test]
-    async fn oauth_refresh_response_rotates_real_and_swaps_to_stubs() {
-        let (server, dir) = fresh_server().await;
-        let _lease = server
-            .lease("codex", "sbx-cx-rsp", sample_codex_real())
-            .expect("lease");
-        let (stub_a_before, stub_r_before) = stubs_for_sandbox(&server, "sbx-cx-rsp");
-
-        let mut pending: Option<PendingFlow> = Some(PendingFlow {
-            provider_id: "codex",
-            sandbox_id: "sbx-cx-rsp".into(),
-        });
-        let res = build_json_response(serde_json::json!({
-            "access_token": "NEW_CODEX_ACCESS",
-            "refresh_token": "NEW_CODEX_REFRESH",
-            "id_token": FAKE_JWT,
-        }));
-
-        let out = CodexProvider
-            .handle_response(res, server.inner_for_test(), &mut pending)
-            .await;
-        assert!(pending.is_none());
-
-        let (parts, body) = out.into_parts();
-        let cl: usize = parts
-            .headers
-            .get("content-length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse().ok())
-            .expect("content-length present");
-        let raw = body_bytes(body).await;
-        assert_eq!(cl, raw.len());
-        let json: serde_json::Value = serde_json::from_slice(&raw).unwrap();
-        let access = json.get("access_token").and_then(|v| v.as_str()).unwrap();
-        let refresh = json.get("refresh_token").and_then(|v| v.as_str()).unwrap();
-        assert!(access.starts_with(STUB_ACCESS_PREFIX), "got {access}");
-        assert!(refresh.starts_with(STUB_REFRESH_PREFIX), "got {refresh}");
-        // New real values must not leak in the body the guest sees.
-        assert!(!std::str::from_utf8(&raw)
-            .unwrap()
-            .contains("NEW_CODEX_ACCESS"));
-        assert!(!std::str::from_utf8(&raw)
-            .unwrap()
-            .contains("NEW_CODEX_REFRESH"));
-
-        // Stubs the guest sees are stable across rotation.
-        let (stub_a_after, stub_r_after) = stubs_for_sandbox(&server, "sbx-cx-rsp");
-        assert_eq!(stub_a_before, stub_a_after);
-        assert_eq!(stub_r_before, stub_r_after);
-
-        // Registry stored new real values at the codex JSON pointer.
-        {
-            let registry = server.registry_lock_for_test();
-            let real = registry.real("sbx-cx-rsp").unwrap();
-            assert_eq!(
-                real.pointer("/tokens/access_token")
-                    .and_then(|v| v.as_str()),
-                Some("NEW_CODEX_ACCESS")
-            );
-            assert_eq!(
-                real.pointer("/tokens/refresh_token")
-                    .and_then(|v| v.as_str()),
-                Some("NEW_CODEX_REFRESH")
-            );
-        }
-
-        drop(_lease);
-        cleanup(server, dir);
-    }
-
-    #[tokio::test]
-    async fn handle_response_with_misrouted_pending_returns_unchanged() {
-        // If a non-codex pending flow leaks into the codex response
-        // handler, the response must pass through and pending must
-        // remain populated for the right provider to consume.
-        let (server, dir) = fresh_server().await;
-        let mut pending: Option<PendingFlow> = Some(PendingFlow {
-            provider_id: "claude",
-            sandbox_id: "sbx-other".into(),
-        });
-        let res = build_json_response(serde_json::json!({
-            "access_token": "leave_me_alone",
-        }));
-        let out = CodexProvider
-            .handle_response(res, server.inner_for_test(), &mut pending)
-            .await;
-        // Body untouched.
-        let raw = body_bytes(out.into_body()).await;
-        let json: serde_json::Value = serde_json::from_slice(&raw).unwrap();
-        assert_eq!(
-            json.get("access_token").and_then(|v| v.as_str()),
-            Some("leave_me_alone")
-        );
-        // Pending preserved for the real owner.
-        let flow = pending.expect("pending preserved");
-        assert_eq!(flow.provider_id, "claude");
-
         cleanup(server, dir);
     }
 }

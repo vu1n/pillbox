@@ -5,7 +5,7 @@
 //!  - host predicate (`intercept`)
 //!  - credentials shape (`provision`: parse real creds → produce stubs +
 //!    register them in the [`Registry`])
-//!  - request/response rewriting (`handle_request` / `handle_response`)
+//!  - request rewriting (`handle_request`)
 //!  - on-disk credentials path inside the guest (`creds_path`)
 //!
 //! State that's the same for every provider — the stub → sandbox lookup
@@ -64,8 +64,8 @@ pub(crate) trait OAuthCodec: RefreshDecider {
     /// JIT scheduling hint.
     fn expiry_ms(&self, real: &serde_json::Value) -> Option<u64>;
 
-    /// Build the host-proxy credential file. This operation may mint both access and
-    /// refresh stubs because the proxy can safely re-stub intercepted responses.
+    /// Build the host-proxy credential file. It may need shape-valid access and
+    /// refresh stubs even though guest token-endpoint requests are rejected.
     fn host_proxy_stub(
         &self,
         sandbox_id: &str,
@@ -100,26 +100,14 @@ pub(crate) struct OAuthRelease {
     pub real: String,
 }
 
-/// In-flight OAuth refresh the handler is mid-way through processing.
-/// Set in `handle_request`, consumed in `handle_response` so the response-
-/// side swap knows which sandbox to update.
-#[derive(Clone, Debug)]
-pub(crate) struct PendingFlow {
-    pub provider_id: &'static str,
-    pub sandbox_id: String,
-}
-
 /// Provider-agnostic state for one active sandbox.
 #[derive(Clone, Debug)]
 pub(crate) struct SandboxData {
-    /// Which provider owns this entry. Tracked for diagnostics and
-    /// future cross-provider sanity checks (e.g. asserting a response is
-    /// being routed back to the provider that handled the request).
-    /// Not yet read in production code paths.
+    /// Which provider owns this entry. Retained for diagnostics and future
+    /// cross-provider sanity checks; not yet read in production paths.
     #[allow(dead_code)]
     pub provider_id: &'static str,
-    /// Full real creds JSON, kept so providers can read whichever fields
-    /// they need and write rotated values back in place.
+    /// Full real creds JSON, kept so providers can read their access-token field.
     pub real: serde_json::Value,
     /// Stub tokens minted for this sandbox. Tracked so [`Registry::remove`]
     /// can clean up `by_stub` reverse-lookups without re-parsing JSON.
@@ -161,52 +149,11 @@ impl Registry {
         self.by_stub.get(stub).map(String::as_str)
     }
 
-    /// Find the unique sandbox provisioned by `provider_id`. Used by
-    /// the OAuth handler to attribute *authorization-code* grant
-    /// responses (Claude Code's `/login`) — those requests carry a
-    /// `code`, not a refresh_token, so [`Self::sandbox_for_stub`]
-    /// can't resolve them. Returns `None` when zero or multiple
-    /// sandboxes match; pillbox v0 has one OAuth sandbox per
-    /// `pillbox run --vault` so ambiguity isn't a concern, but the
-    /// conservative `None` signal lets a multi-tenant future extend
-    /// without silently misattributing tokens.
-    pub(crate) fn unique_sandbox_for_provider(&self, provider_id: &'static str) -> Option<String> {
-        let mut found = None;
-        for (id, data) in &self.by_sandbox {
-            if data.provider_id != provider_id {
-                continue;
-            }
-            if found.is_some() {
-                return None;
-            }
-            found = Some(id.clone());
-        }
-        found
-    }
-
     pub(crate) fn real(&self, sandbox_id: &str) -> Option<&serde_json::Value> {
         self.by_sandbox.get(sandbox_id).map(|d| &d.real)
     }
 
-    /// Walk into the stored real JSON via an RFC 6901 JSON pointer (e.g.
-    /// `/claudeAiOauth/accessToken`) and overwrite the leaf with a
-    /// string. Used by provider response-handlers to persist rotated
-    /// tokens. Quietly no-ops if the path is missing — rotation responses
-    /// don't always include both fields.
-    pub(crate) fn rotate_real_field(
-        &mut self,
-        sandbox_id: &str,
-        json_pointer: &str,
-        new_value: String,
-    ) {
-        let Some(data) = self.by_sandbox.get_mut(sandbox_id) else {
-            return;
-        };
-        if let Some(leaf) = data.real.pointer_mut(json_pointer) {
-            *leaf = serde_json::Value::String(new_value);
-        }
-    }
-
+    #[cfg(test)]
     pub(crate) fn stubs_for(&self, sandbox_id: &str) -> Option<&[String]> {
         self.by_sandbox.get(sandbox_id).map(|d| d.stubs.as_slice())
     }
@@ -273,6 +220,13 @@ pub(crate) trait VaultProvider: Send + Sync + 'static {
         None
     }
 
+    /// Whether this host/path is a provider token endpoint that a guest must
+    /// never drive. Both proxy implementations use this provider-owned matcher
+    /// to reject rotation before any credential substitution or network send.
+    fn is_oauth_token_endpoint(&self, _host: &str, _path: &str) -> bool {
+        false
+    }
+
     /// Validate the loaded real creds, register stub tokens into
     /// `registry`, and return the stub credentials file body that should
     /// be written into the guest at [`Self::creds_path`].
@@ -283,24 +237,9 @@ pub(crate) trait VaultProvider: Send + Sync + 'static {
         registry: &mut Registry,
     ) -> Result<String, String>;
 
-    /// Inspect/rewrite an outbound request. Sets `*pending` if a follow-
-    /// up response-side swap is required.
-    async fn handle_request(
-        &self,
-        req: Request<Body>,
-        server: &ServerInner,
-        pending: &mut Option<PendingFlow>,
-    ) -> RequestOrResponse;
-
-    /// Inspect/rewrite an inbound response. Only invoked when `pending`
-    /// was set by this provider's `handle_request`. Providers should
-    /// clear `pending` themselves before returning.
-    async fn handle_response(
-        &self,
-        res: Response<Body>,
-        server: &ServerInner,
-        pending: &mut Option<PendingFlow>,
-    ) -> Response<Body>;
+    /// Inspect/rewrite an outbound request. OAuth token-endpoint requests from
+    /// the guest must be rejected locally; only the host broker may rotate.
+    async fn handle_request(&self, req: Request<Body>, server: &ServerInner) -> RequestOrResponse;
 
     /// Whether `(method, path)` is this provider's chat/generation
     /// endpoint. Gates emitting a `gen_ai` *usage* span: the proxy sees
@@ -329,8 +268,8 @@ pub(crate) fn registry() -> Vec<Box<dyn VaultProvider>> {
 }
 
 /// Every host the registered providers intercept — the egress DNS-fence allowlist
-/// for a sandbox (each provider's API + OAuth/platform endpoints, so the agent can
-/// reach its provider *and* refresh a token; everything else is default-denied).
+/// for a sandbox (each provider's API + OAuth/platform endpoints; token endpoints
+/// stay intercepted so the local broker can reject guest rotation).
 #[cfg(feature = "libkrun")]
 pub(crate) fn intercepted_hosts() -> Vec<&'static str> {
     registry()
@@ -343,6 +282,15 @@ pub(crate) fn intercepted_hosts() -> Vec<&'static str> {
 /// with an `AgentSpec.id` and needs the matching provider).
 pub(crate) fn provider_for(id: &str) -> Option<Box<dyn VaultProvider>> {
     registry().into_iter().find(|p| p.id() == id)
+}
+
+/// Provider-owned token-endpoint classification shared by the deprecated host
+/// proxy and the maintained libkrun MITM.
+#[cfg(feature = "libkrun")]
+pub(crate) fn is_oauth_token_endpoint(host: &str, path: &str) -> bool {
+    registry()
+        .iter()
+        .any(|provider| provider.is_oauth_token_endpoint(host, path))
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────
@@ -403,6 +351,19 @@ pub(crate) fn unauthorized(detail: &str) -> Response<Body> {
         .header("content-type", "application/json")
         .body(Body::from(body))
         .expect("build vault unauthorized response")
+}
+
+/// Refuse a guest-owned OAuth grant before it reaches the provider. The response
+/// deliberately contains no request data: token bodies are credential material
+/// and must not be reflected or logged.
+pub(crate) fn oauth_rotation_forbidden() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"vault":"forbidden","detail":"OAuth rotation is broker-owned"}"#,
+        ))
+        .expect("build vault forbidden response")
 }
 
 /// Mint a stub token: `<prefix><sandbox_id_compact><uuid1><uuid2>`.
@@ -542,40 +503,6 @@ mod tests {
     }
 
     #[test]
-    fn rotate_real_field_walks_nested_path() {
-        let mut r = Registry::new();
-        let mut d = data("claude", vec!["s"]);
-        d.real = serde_json::json!({
-            "claudeAiOauth": {"accessToken": "old", "refreshToken": "old-r"}
-        });
-        r.insert("sbx-1".into(), d);
-
-        r.rotate_real_field("sbx-1", "/claudeAiOauth/accessToken", "new-access".into());
-
-        let v = r.real("sbx-1").unwrap();
-        assert_eq!(
-            v.pointer("/claudeAiOauth/accessToken")
-                .and_then(|v| v.as_str()),
-            Some("new-access")
-        );
-        // Other fields untouched.
-        assert_eq!(
-            v.pointer("/claudeAiOauth/refreshToken")
-                .and_then(|v| v.as_str()),
-            Some("old-r")
-        );
-    }
-
-    #[test]
-    fn rotate_real_field_missing_path_is_noop() {
-        let mut r = Registry::new();
-        r.insert("sbx-1".into(), data("claude", vec!["s"]));
-        // Should not panic.
-        r.rotate_real_field("sbx-1", "/nope/missing", "x".into());
-        r.rotate_real_field("missing-sandbox", "/k", "x".into());
-    }
-
-    #[test]
     fn api_key_real_for_stub_is_host_bound() {
         let mut r = Registry::new();
         let stub = "pllbxstub-deadbeef";
@@ -634,7 +561,7 @@ mod tests {
 //
 // Per-provider integration tests construct hyper `Request<Body>` /
 // `Response<Body>` objects and feed them straight to the matching
-// provider's `handle_request` / `handle_response`. The plumbing
+// provider's `handle_request`. The plumbing
 // (booting a `Server`, draining bodies, asserting on stubbed/swapped
 // headers) is identical across providers — collect it here so each
 // provider's test module stays focused on its own header/body shape.
@@ -714,19 +641,6 @@ pub(crate) mod test_support {
             .expect("build request")
     }
 
-    /// Build a 200-OK `Response<Body>` with a JSON body. Used for the
-    /// OAuth refresh-response swap tests.
-    pub(crate) fn build_json_response(body_json: serde_json::Value) -> Response<Body> {
-        let bytes = serde_json::to_vec(&body_json).expect("serialize json body");
-        let len = bytes.len();
-        Response::builder()
-            .status(200)
-            .header("content-type", "application/json")
-            .header("content-length", len)
-            .body(Body::from(bytes))
-            .expect("build response")
-    }
-
     /// Collect a body's bytes into a `Vec<u8>`. Tests use this to read
     /// the rewritten body of the returned Request/Response.
     pub(crate) async fn body_bytes(body: Body) -> Vec<u8> {
@@ -735,13 +649,6 @@ pub(crate) mod test_support {
             .expect("collect body")
             .to_bytes()
             .to_vec()
-    }
-
-    /// Collect a body's bytes and parse as JSON. Convenience wrapper for
-    /// the OAuth refresh body assertions.
-    pub(crate) async fn body_json(body: Body) -> serde_json::Value {
-        let bytes = body_bytes(body).await;
-        serde_json::from_slice(&bytes).expect("body should be json")
     }
 
     /// Destructure a `RequestOrResponse` into the `Request` variant or

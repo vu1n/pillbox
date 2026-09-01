@@ -13,20 +13,13 @@ use std::{
     net::SocketAddr,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
-    time::Duration,
 };
 
 use anyhow::Result;
 
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
-use crate::vault::token_store::TokenStore;
 use crate::vault::{providers, RunContext, SandboxLease, Server, ServerConfig, VaultMeta};
-
-/// How long the teardown write-back waits for the rotation lock before giving up.
-/// Best-effort + short: if a refresh holds the lock, its writer is the authority,
-/// so the teardown defers (`persist_if` → `Ok(false)`) rather than block teardown.
-const TEARDOWN_LOCK_WAIT: Duration = Duration::from_secs(5);
 
 /// One OAuth-credentials swap mounted into the guest. Owns the temp file
 /// holding the stub creds plus its mount-target path. `VaultSession`
@@ -39,20 +32,6 @@ struct OAuthMount {
     /// `.claude/.credentials.json` or `.codex/auth.json`). The agent
     /// provider tells us where.
     creds_path: PathBuf,
-    /// Host-absolute path to the real credentials file this mount
-    /// shadows (the global auth store). At teardown we persist the
-    /// registry's real creds back here so an in-proxy token rotation
-    /// during the run survives to the next session.
-    host_creds_path: PathBuf,
-    /// Registry key for this mount's real creds, so teardown can read
-    /// the (possibly rotated) tokens back out of the server.
-    sandbox_id: String,
-    /// The access token this session *leased* (as read from disk at start). The
-    /// teardown compare-and-swaps on it: persist the registry creds back only if
-    /// the on-disk access token is still this one, i.e. no other writer rotated disk
-    /// under us. `None` for an unrecognized creds shape → the teardown skips (don't
-    /// clobber what we can't reason about).
-    leased_access: Option<String>,
     _lease: SandboxLease,
 }
 
@@ -72,75 +51,6 @@ pub(crate) struct VaultSession {
     /// stable persistent CA is in use. Last field → dropped last, after the
     /// server, so the cert outlives anything reading it.
     _ca_tempdir: Option<tempfile::TempDir>,
-}
-
-impl Drop for VaultSession {
-    /// Persist any in-proxy-rotated real credentials back to the host
-    /// auth store. Runs before the fields drop (a manual `Drop` fires
-    /// ahead of field destruction), so the leases haven't yet removed
-    /// their registry entries and `snapshot_real` still sees them.
-    ///
-    /// Why this exists: Anthropic rotates refresh tokens single-use. If
-    /// the agent refreshes mid-session through the proxy, the new token
-    /// lands only in the in-memory registry — the on-disk creds file
-    /// keeps the old one, which the rotation just invalidated. The next
-    /// run's pre-refresh then sends a dead token and 401s, recurring
-    /// every session. Flushing the registry's real creds here closes
-    /// that loop (mirrors how Orca reads back + persists CLI-rotated
-    /// tokens). Best-effort: a failure only costs a stale token
-    /// (recoverable via `pillbox auth login`), so warn, never panic.
-    ///
-    /// Guarded against the concurrent-session clobber via a compare-and-swap on
-    /// the **access token**: persist only if this session actually rotated, and
-    /// only if the on-disk access token is still the one we leased at start. If
-    /// disk advanced, another writer (a peer broker, or the in-proxy refresh
-    /// handler) wrote a fresher token — never clobber it. The access token is the
-    /// signal, not `expiresAt`/`last_refresh`, because the in-proxy handlers rotate
-    /// only the token fields, not the timestamps — so a timestamp compare can't see
-    /// an in-proxy rotation. The read-compare-write runs under the rotation flock
-    /// (atomic), closing the prior lock-free TOCTOU.
-    fn drop(&mut self) {
-        for mount in &self.oauth_mounts {
-            let Some(real) = self.server.snapshot_real(&mount.sandbox_id) else {
-                continue;
-            };
-            // Nothing rotated this session (registry == what we leased) → nothing to
-            // persist, so skip the lock + write entirely. Also skips unrecognized
-            // shapes (both `None`) — for which we have no CAS baseline anyway.
-            if access_token_of(&real) == mount.leased_access {
-                continue;
-            }
-            // We rotated to a recognized token; CAS the write-back on the access we
-            // leased. (`Some` here for claude/codex — the only vaulted shapes; if we
-            // somehow lack a baseline, skip rather than risk a blind overwrite.)
-            let Some(leased) = mount.leased_access.clone() else {
-                continue;
-            };
-            let store = TokenStore::new(mount.host_creds_path.clone(), TEARDOWN_LOCK_WAIT);
-            let disk_unchanged = |disk: &serde_json::Value| {
-                access_token_of(disk).as_deref() == Some(leased.as_str())
-            };
-            if let Err(e) = store.persist_if(&real, &disk_unchanged) {
-                eprintln!(
-                    "pillbox: warning: failed to persist refreshed credentials to {}: {e}",
-                    mount.host_creds_path.display()
-                );
-            }
-        }
-    }
-}
-
-/// The OAuth access token from a creds blob, across the shapes pillbox vaults —
-/// claude (`claudeAiOauth.accessToken`) and codex (`tokens.access_token`). The
-/// access token is the field that rotates on *every* refresh, so it's the
-/// compare-and-swap signal the teardown uses. (`expiresAt`/`last_refresh` are NOT
-/// updated by the in-proxy rotation handlers, so they can't detect one.)
-fn access_token_of(creds: &serde_json::Value) -> Option<String> {
-    creds
-        .pointer("/claudeAiOauth/accessToken")
-        .or_else(|| creds.pointer("/tokens/access_token"))
-        .and_then(|v| v.as_str())
-        .map(str::to_owned)
 }
 
 impl VaultSession {
@@ -333,18 +243,10 @@ fn provision_oauth_mount(server: &Server, agent: OAuthAgent<'_>) -> Result<OAuth
     // model the guest's stub carries a far-future expiry and never self-refreshes, so
     // this is the *only* refresher: a stale token here would 401 with no recovery.
     // Fail closed rather than lease a doomed credential — `pre_refresh` returns
-    // `Ok(None)` only for agents without a broker decider (codex), where the on-disk
-    // creds are leased as-is.
+    // `Ok(None)` only for agents without a registered OAuth broker codec.
     if let Some(fresh) = super::refresh::pre_refresh(&creds_path, agent.agent_id)? {
         real = fresh;
     }
-
-    // The access token of the creds we actually lease — the teardown's CAS baseline.
-    // Captured AFTER pre-refresh (which already persisted any rotation to disk under
-    // the lock), so registry==leased when nothing rotates in-proxy and the teardown
-    // is a clean no-op; if the 401-retry fallback does rotate mid-run, real diverges
-    // from this and the teardown CAS-persists it.
-    let leased_access = access_token_of(&real);
 
     let sandbox_id = uuid::Uuid::now_v7().to_string();
     let lease = server
@@ -363,9 +265,6 @@ fn provision_oauth_mount(server: &Server, agent: OAuthAgent<'_>) -> Result<OAuth
     Ok(OAuthMount {
         stub_file,
         creds_path: creds_rel,
-        host_creds_path: creds_path,
-        sandbox_id,
-        leased_access,
         _lease: lease,
     })
 }
@@ -384,63 +283,4 @@ fn write_private(path: &Path, content: &str) -> Result<()> {
     f.write_all(content.as_bytes())
         .map_err(|e| PillboxError::runtime("vault", format!("write {}: {e}", path.display())))?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn access_token_of_extracts_claude_and_codex_shapes() {
-        let claude = serde_json::json!({
-            "claudeAiOauth": { "accessToken": "sk-ant-oat01-AT", "refreshToken": "RT" }
-        });
-        assert_eq!(access_token_of(&claude).as_deref(), Some("sk-ant-oat01-AT"));
-
-        let codex = serde_json::json!({
-            "tokens": { "access_token": "jwt.aaa.bbb", "refresh_token": "rt" },
-            "last_refresh": "2026-05-18T00:00:00Z"
-        });
-        assert_eq!(access_token_of(&codex).as_deref(), Some("jwt.aaa.bbb"));
-    }
-
-    #[test]
-    fn access_token_of_none_for_unknown_shape() {
-        // No recognized access-token field → None → the teardown CAS skips
-        // (don't clobber a shape we can't reason about).
-        assert_eq!(access_token_of(&serde_json::json!({ "apiKey": "x" })), None);
-        assert_eq!(access_token_of(&serde_json::json!({})), None);
-        // A present-but-non-string field is also None.
-        assert_eq!(
-            access_token_of(&serde_json::json!({ "tokens": { "access_token": 5 } })),
-            None
-        );
-    }
-
-    /// The exact compare-and-swap predicate `Drop` installs, over both real creds
-    /// shapes: persist iff the on-disk access token still equals the leased one.
-    fn cas(leased: &str, disk: &serde_json::Value) -> bool {
-        access_token_of(disk).as_deref() == Some(leased)
-    }
-
-    #[test]
-    fn teardown_cas_persists_only_when_disk_unchanged() {
-        // claude: disk still holds the leased access → allow the write-back.
-        let claude_same =
-            serde_json::json!({ "claudeAiOauth": { "accessToken": "AT0", "refreshToken": "RT" } });
-        assert!(cas("AT0", &claude_same));
-        // A peer rotated disk → deny (don't clobber the fresher token).
-        let claude_peer = serde_json::json!({ "claudeAiOauth": { "accessToken": "AT_PEER" } });
-        assert!(!cas("AT0", &claude_peer));
-
-        // codex shape works the same on its own pointer.
-        let codex_same = serde_json::json!({ "tokens": { "access_token": "jwt0" } });
-        assert!(cas("jwt0", &codex_same));
-        let codex_peer = serde_json::json!({ "tokens": { "access_token": "jwt1" } });
-        assert!(!cas("jwt0", &codex_peer));
-
-        // An unrecognized on-disk shape → access_token_of None → never matches a
-        // recognized leased token → deny (don't clobber what we can't reason about).
-        assert!(!cas("AT0", &serde_json::json!({ "apiKey": "x" })));
-    }
 }

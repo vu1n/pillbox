@@ -15,13 +15,13 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use hudsucker::{
-    hyper::{header::AUTHORIZATION, Request, Response},
+    hyper::{header::AUTHORIZATION, Request},
     Body, RequestOrResponse,
 };
 
 use super::{
     host_from_uri, provision_is_api_key_only, swap_bearer_style, unauthorized, ApiKeySwap,
-    PendingFlow, Registry, VaultProvider, API_KEY_UNUSED_CREDS_PATH,
+    Registry, VaultProvider, API_KEY_UNUSED_CREDS_PATH,
 };
 use crate::vault::server::ServerInner;
 
@@ -57,12 +57,7 @@ impl VaultProvider for GithubProvider {
         provision_is_api_key_only(PROVIDER_ID)
     }
 
-    async fn handle_request(
-        &self,
-        req: Request<Body>,
-        server: &ServerInner,
-        _pending: &mut Option<PendingFlow>,
-    ) -> RequestOrResponse {
+    async fn handle_request(&self, req: Request<Body>, server: &ServerInner) -> RequestOrResponse {
         let host = host_from_uri(&req).unwrap_or_default();
         if host != API_HOST {
             return req.into();
@@ -97,15 +92,6 @@ impl VaultProvider for GithubProvider {
             ApiKeySwap::PassThrough => Request::from_parts(parts, body).into(),
             ApiKeySwap::Unauthorized(detail) => unauthorized(detail).into(),
         }
-    }
-
-    async fn handle_response(
-        &self,
-        res: Response<Body>,
-        _server: &ServerInner,
-        _pending: &mut Option<PendingFlow>,
-    ) -> Response<Body> {
-        res
     }
 }
 
@@ -155,7 +141,6 @@ mod tests {
     use crate::vault::providers::test_support::{
         build_request, cleanup, expect_request, fresh_server,
     };
-    use crate::vault::providers::PendingFlow;
     use hudsucker::{hyper::Request as HReq, Body};
 
     fn lease_github_pat(
@@ -187,9 +172,8 @@ mod tests {
             HReq::from_parts(parts, body)
         };
 
-        let mut pending: Option<PendingFlow> = None;
         let out = GithubProvider
-            .handle_request(req, server.inner_for_test(), &mut pending)
+            .handle_request(req, server.inner_for_test())
             .await;
         let out_req = expect_request(out, "github bearer swap");
         assert_eq!(
@@ -222,9 +206,8 @@ mod tests {
             HReq::from_parts(parts, body)
         };
 
-        let mut pending = None;
         let out = GithubProvider
-            .handle_request(req, server.inner_for_test(), &mut pending)
+            .handle_request(req, server.inner_for_test())
             .await;
         let out_req = expect_request(out, "github token swap");
         assert_eq!(
@@ -255,9 +238,8 @@ mod tests {
             HReq::from_parts(parts, body)
         };
 
-        let mut pending = None;
         let out = GithubProvider
-            .handle_request(req, server.inner_for_test(), &mut pending)
+            .handle_request(req, server.inner_for_test())
             .await;
         let out_req = expect_request(out, "github unknown scheme pass-through");
         assert_eq!(
@@ -287,9 +269,8 @@ mod tests {
             );
             HReq::from_parts(parts, body)
         };
-        let mut pending = None;
         let out = GithubProvider
-            .handle_request(req, server.inner_for_test(), &mut pending)
+            .handle_request(req, server.inner_for_test())
             .await;
         let out_req = expect_request(out, "github unknown stub");
         assert_eq!(
@@ -309,9 +290,8 @@ mod tests {
     async fn no_auth_header_passes_through() {
         let (server, dir) = fresh_server().await;
         let req = build_request("GET", "https://api.github.com/", Body::empty());
-        let mut pending = None;
         let out = GithubProvider
-            .handle_request(req, server.inner_for_test(), &mut pending)
+            .handle_request(req, server.inner_for_test())
             .await;
         let out_req = expect_request(out, "github no-auth");
         assert!(out_req.headers().get("authorization").is_none());

@@ -19,7 +19,7 @@ Context: `doc://pillbox/managed-tier-do-gateway@0002#managed-tier-do-gateway`
 | Container lifecycle and isolation | Cloudflare Sandbox SDK and its vendor-owned Durable Object |
 | Bounded invocation/idempotency claim | D1 |
 | Immutable terminal result and bounded evidence | R2 |
-| One compact terminal usage point | Analytics Engine |
+| At most one compact derivative terminal usage point | Analytics Engine |
 | Per-session §0 log for Pillbox CLI reads | Local `SessionLog` |
 
 Pillbox has no custom Durable Object class, remote event sequencer, actor roster,
@@ -55,9 +55,10 @@ There are no per-token, per-delta, PTY-frame, progress, or replay writes.
 ## Cost evidence
 
 Every terminal response must carry exactly one versioned, internally consistent
-`RunCostEnvelope` containing raw units:
-model tokens, provider-reported model cost, D1 rows read/written, R2 operations
-and bytes, Analytics Engine points, Sandbox duration, and Sandbox profile.
+`RunCostEnvelope` containing raw units: model tokens, provider-reported model
+cost, D1 rows read/written, R2 operations and bytes, planned Analytics Engine
+points, Sandbox duration, and Sandbox profile. `analytics_points_planned` is the
+bounded write budget, not evidence that Cloudflare accepted a point.
 Unknown dollar amounts remain unknown. `estimated_total_cost_usd` is absent
 until a versioned infrastructure rate card exists. Local and managed runs are
 inspectable with:
@@ -67,9 +68,14 @@ pillbox session cost <session-id>
 pillbox session cost <session-id> --json
 ```
 
-The immutable R2 artifact is the source of truth. Analytics is intentionally
-best-effort and contains no prompt, output, secret, repository path, or
-participant identity.
+The terminal commit order is immutable R2 artifact, conditional D1 terminal
+update, then at most one best-effort Analytics emission by the D1 winner. A D1
+terminal row prevents retries and recovery from emitting again. Analytics
+failure is logged after commit and cannot undo terminal execution. Provider-
+observed Analytics writes are attached later during burn-in reconciliation with
+an explicit `observed - planned` variance; they never rewrite the envelope.
+Analytics contains no prompt, output, secret, repository path, or participant
+identity.
 
 ## Current limits
 
@@ -139,7 +145,8 @@ The gate must:
   and state-write counters; copied manifest expectations are not release
   evidence;
 - reconcile every `RunCostEnvelope` against captured D1, R2, Container, Worker,
-  Analytics Engine, and vendor Sandbox/DO counters;
+  Analytics Engine, and vendor Sandbox/DO counters, keeping planned Analytics
+  units separate from provider-observed writes and recording their variance;
 - fail on unexplained counter deltas, more than one immutable artifact or
   Analytics point per new run, any custom DO class, or custom DO storage growth;
 - configure account budget alerts at 50%, 75%, and 90% of the small preview

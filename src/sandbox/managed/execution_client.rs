@@ -864,7 +864,7 @@ mod tests {
                     "r2_writes": 1,
                     "r2_bytes_read": 0,
                     "r2_bytes_written": 512,
-                    "analytics_points_written": 1,
+                    "analytics_points_planned": 1,
                     "sandbox_duration_ms": 5,
                     "sandbox_profile": "standard-2"
                 },

@@ -398,30 +398,13 @@ export class ExecutionService {
             ...outcome,
           };
     this.costMeter?.observeEvidence(evidence);
-    let cost = this.costMeter?.terminal(outcome.status, {
+    const cost = this.costMeter?.terminal(outcome.status, {
       sandbox_duration_ms: Math.max(0, this.now() - record.created_at_ms),
       sandbox_profile: this.sandboxProfile,
       planned_d1_terminal_writes: 1,
       planned_r2_writes: 1,
+      planned_analytics_points: this.analytics === undefined ? 0 : 1,
     });
-    if (this.analytics !== undefined && cost !== undefined) {
-      cost = {
-        ...cost,
-        infrastructure: {
-          ...cost.infrastructure,
-          analytics_points_written: 1,
-        },
-      };
-      // A point becomes immutable evidence only after the provider accepts it.
-      // Failure leaves the claim running, so an exact retry cannot resample.
-      await this.analytics.emit({
-        invocation_id: record.invocation_id,
-        request_hash: record.request_hash,
-        harness: attribution.harness,
-        transport: attribution.transport,
-        cost,
-      });
-    }
     const unsealedArtifact: ExecutionArtifact = {
       version: 1,
       invocation_id: record.invocation_id,
@@ -449,6 +432,9 @@ export class ExecutionService {
       now_ms: this.now(),
     });
     if (!finished) return null;
+    // The terminal CAS is the emission fence: its sole winner may attempt once,
+    // and a crash or failure after this point is reconciled as observed variance.
+    await this.emitTerminalAnalytics(record, stored, artifact);
     const result: ExecuteInvocationV2Result = {
       ...stored,
       disposition,
@@ -463,6 +449,33 @@ export class ExecutionService {
         : { cost: artifact.cost as unknown as RunCostEnvelope }),
     };
     return result;
+  }
+
+  private async emitTerminalAnalytics(
+    record: ExecutionRecord,
+    terminal: Extract<
+      ExecuteInvocationV2Result,
+      { readonly status: "completed" | "failed" | "cancelled" | "interrupted" }
+    >,
+    artifact: ExecutionArtifact,
+  ): Promise<void> {
+    if (this.analytics === undefined || artifact.cost === undefined) return;
+    const cost = artifact.cost as unknown as RunCostEnvelope;
+    if (cost.infrastructure.analytics_points_planned !== 1) return;
+    try {
+      await this.analytics.emit({
+        invocation_id: record.invocation_id,
+        request_hash: record.request_hash,
+        harness: terminal.attribution.harness,
+        transport: terminal.attribution.transport,
+        cost,
+      });
+    } catch (cause) {
+      console.warn(
+        "Pillbox terminal Analytics emission failed after authoritative commit:",
+        safeHuddlesRuntimeDiagnostic(cause),
+      );
+    }
   }
 
   private conflictResult(

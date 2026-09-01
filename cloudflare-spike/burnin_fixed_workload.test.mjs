@@ -11,6 +11,17 @@ const script = new URL("./scripts/burnin-fixed-workload.mjs", import.meta.url);
 const reconciler = new URL("./scripts/reconcile-burnin.mjs", import.meta.url);
 const fixture = new URL("./testdata/burnin-reconciliation.fixture.json", import.meta.url);
 
+test("dry run distinguishes planned Analytics units from provider-observed writes", async () => {
+  const result = await run(process.execPath, [script.pathname]);
+  assert.equal(result.code, 0, result.stderr);
+  const plan = JSON.parse(result.stdout);
+  assert.deepEqual(plan.accounting, {
+    analytics_points_planned: 1,
+    analytics_points_observed: "provider capture required after the run",
+    analytics_variance: "observed minus planned",
+  });
+});
+
 test("Pillbox brackets the sole Huddles recorder with preflight and same-report finalize", async (t) => {
   const temp = await mkdtemp(join(tmpdir(), "pillbox-burnin-preflight-"));
   t.after(() => rm(temp, { recursive: true, force: true }));

@@ -95,8 +95,9 @@ async function request(
 }
 
 test("created execution persists terminal evidence and exact retry does not resample", async () => {
-  const store = new MemoryStore();
-  const artifacts = new MemoryArtifacts();
+  const terminalOrder: string[] = [];
+  const store = new MemoryStore(() => terminalOrder.push("d1"));
+  const artifacts = new MemoryArtifacts(() => terminalOrder.push("r2"));
   const analytics: RunCostAnalyticsPoint[] = [];
   const runtime = new FakeRuntime({
     served_model: "zai-coding-plan/glm-4.5-air",
@@ -118,7 +119,12 @@ test("created execution persists terminal evidence and exact retry does not resa
   const service = new ExecutionService(store, artifacts, runtime, {
     ...fixedOptions(),
     costMeter: new RunCostMeter(),
-    analytics: { emit: (point) => analytics.push(point) },
+    analytics: {
+      emit: (point) => {
+        terminalOrder.push("analytics");
+        analytics.push(point);
+      },
+    },
     sandboxProfile: "standard-2",
     authorizer: async () => {
       authorizationChecks += 1;
@@ -134,7 +140,8 @@ test("created execution persists terminal evidence and exact retry does not resa
   assert.deepEqual(created.session_ref.seq_range, [0, 2]);
   assert.ok(created.evidence.artifact_ref);
   assert.equal(created.cost?.model.provider_reported_cost_usd, 0.001);
-  assert.equal(created.cost?.infrastructure.analytics_points_written, 1);
+  assert.equal(created.cost?.infrastructure.analytics_points_planned, 1);
+  assert.deepEqual(terminalOrder, ["r2", "d1", "analytics"]);
 
   const reused = await service.executeInvocation(input);
   assert.equal(reused.status, "completed");
@@ -172,6 +179,7 @@ test("zero-event runtime success becomes a typed terminal failure", async () => 
   assert.equal(result.cost?.status, "failed");
   assert.equal(result.cost?.model.input_tokens, 0);
   assert.equal(result.cost?.model.output_tokens, 0);
+  assert.equal(result.cost?.infrastructure.analytics_points_planned, 0);
 
   const reused = await service.executeInvocation(input);
   assert.equal(reused.status, "failed");
@@ -420,7 +428,7 @@ test("changed content conflicts without crossing into the runtime", async () => 
   assert.equal(runtime.executions, 1);
 });
 
-test("failed Analytics emission is loud and never persists a cost claiming one point", async () => {
+test("failed Analytics emission is logged after terminal commit and never retried", async () => {
   const store = new MemoryStore();
   const artifacts = new MemoryArtifacts();
   const runtime = new FakeRuntime({
@@ -429,6 +437,9 @@ test("failed Analytics emission is loud and never persists a cost claiming one p
     evidence: [{ type: "message_delta", text: "done" }],
   });
   let emissionAttempts = 0;
+  const warnings: unknown[][] = [];
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => void warnings.push(args);
   const service = new ExecutionService(store, artifacts, runtime, {
     ...fixedOptions(),
     costMeter: new RunCostMeter(),
@@ -441,15 +452,22 @@ test("failed Analytics emission is loud and never persists a cost claiming one p
   });
   const input = await request();
 
-  await assert.rejects(service.executeInvocation(input), /Analytics unavailable/);
-  assert.equal(emissionAttempts, 1);
-  assert.equal(artifacts.writes, 0);
-  assert.equal(store.rows.get(input.invocation_id)?.status, "running");
+  try {
+    const completed = await service.executeInvocation(input);
+    assert.equal(completed.status, "completed");
+    assert.equal(completed.cost?.infrastructure.analytics_points_planned, 1);
+    assert.equal(emissionAttempts, 1);
+    assert.equal(artifacts.writes, 1);
+    assert.equal(store.rows.get(input.invocation_id)?.status, "completed");
+    assert.match(String(warnings[0]?.join(" ")), /Analytics unavailable/);
 
-  const retry = await service.executeInvocation(input);
-  assert.equal(retry.status, "running");
-  assert.equal(runtime.executions, 1, "exact retry must not resample after failed accounting");
-  assert.equal(emissionAttempts, 1, "running retry must not emit a second point");
+    const retry = await service.executeInvocation(input);
+    assert.equal(retry.status, "completed");
+    assert.equal(runtime.executions, 1, "exact retry must not resample after failed accounting");
+    assert.equal(emissionAttempts, 1, "terminal D1 reuse must not emit a second point");
+  } finally {
+    console.warn = originalWarn;
+  }
 });
 
 test("concurrent exact retry observes running and never samples twice", async () => {
@@ -505,6 +523,7 @@ test("an immutable terminal artifact repairs a lost D1 terminal write", async ()
   const store = new MemoryStore();
   store.finishFailures = 1;
   const artifacts = new MemoryArtifacts();
+  const analytics: RunCostAnalyticsPoint[] = [];
   const service = new ExecutionService(
     store,
     artifacts,
@@ -518,11 +537,14 @@ test("an immutable terminal artifact repairs a lost D1 terminal write", async ()
       ownerToken: () => "owner-1",
       admission: managedAdmissionPolicy("1"),
       allowance,
+      costMeter: new RunCostMeter(),
+      analytics: { emit: (point) => analytics.push(point) },
     },
   );
 
   const first = await service.executeInvocation(await request());
   assert.equal(first.status, "running");
+  assert.equal(analytics.length, 0, "a lost terminal CAS cannot emit Analytics");
 
   now += EXECUTION_OWNER_LEASE_MS + 1;
   const recovered = await service.getExecutionStatus({
@@ -534,6 +556,7 @@ test("an immutable terminal artifact repairs a lost D1 terminal write", async ()
   assert.equal(recovered.status, "completed");
   assert.equal(recovered.attribution.served_model, "zai-coding-plan/glm-4.5-air");
   assert.equal(artifacts.values.size, 1);
+  assert.equal(analytics.length, 1, "the terminal CAS winner emits once after recovery");
   assert.equal(
     (
       await service.getExecutionStatus({
@@ -545,6 +568,7 @@ test("an immutable terminal artifact repairs a lost D1 terminal write", async ()
     ).status,
     "completed",
   );
+  assert.equal(analytics.length, 1, "terminal status reuse cannot re-emit Analytics");
 });
 
 test("status evidence reads are paginated and bounded", async () => {
@@ -727,6 +751,11 @@ class FakeRuntime implements ExecutionRuntime {
 class MemoryStore implements ExecutionStore {
   readonly rows = new Map<string, ExecutionRecord>();
   finishFailures = 0;
+  private readonly onFinish: () => void;
+
+  constructor(onFinish: () => void = () => {}) {
+    this.onFinish = onFinish;
+  }
 
   async claim(
     input: ExecutionClaimInput,
@@ -759,6 +788,7 @@ class MemoryStore implements ExecutionStore {
   }
 
   async finish(input: FinishExecutionInput): Promise<boolean> {
+    this.onFinish();
     if (this.finishFailures > 0) {
       this.finishFailures -= 1;
       return false;
@@ -785,8 +815,14 @@ class MemoryStore implements ExecutionStore {
 class MemoryArtifacts implements ExecutionArtifactStore {
   readonly values = new Map<string, ExecutionArtifact>();
   writes = 0;
+  private readonly onWrite: () => void;
+
+  constructor(onWrite: () => void = () => {}) {
+    this.onWrite = onWrite;
+  }
 
   async write(value: ExecutionArtifact): Promise<ExecutionArtifactRef> {
+    this.onWrite();
     this.writes += 1;
     const key = `executions/${value.invocation_id}.json`;
     const existing = this.values.get(key);

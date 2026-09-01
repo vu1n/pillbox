@@ -1,6 +1,17 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { managedCanonicalJson, makeExecutionGrantCurrentnessRequest, validateExecutionGrantClaims, validateGrantBinding, validateManagedRequestBinding } from "./src/managed_contract.ts";
+import {
+  managedCanonicalJson,
+  makeExecutionGrantCurrentnessRequest,
+  makeExecutionOperationGrantCurrentnessRequest,
+  validateExecutionGrantClaims,
+  validateExecutionOperationBinding,
+  validateExecutionOperationGrantClaims,
+  validateExecutionOperationGrantIssueRequest,
+  validateExecutionOperationGrantIssueResponse,
+  validateGrantBinding,
+  validateManagedRequestBinding,
+} from "./src/managed_contract.ts";
 
 const digest = "sha256:" + "a".repeat(64);
 const claims = {
@@ -91,4 +102,78 @@ test("managed request binding is strict and remains independent from signed clai
   assert.equal(binding.policy_id, "policy-1");
   assert.throws(() => validateManagedRequestBinding({ ...binding, extra: true }), /unrecognized field/);
   assert.throws(() => validateManagedRequestBinding({ ...binding, output_format: { ...binding.output_format, retry_count: 1 } }), /output_format/);
+});
+
+test("generic operation grants mirror the strict Huddles v2 and currentness v3 contracts", () => {
+  const operationClaims = validateExecutionOperationGrantClaims({
+    version: "huddles.execution-operation-grant/2",
+    grant_id: "operation-grant-1",
+    installation: claims.installation,
+    organization_id: "org-1",
+    workspace_id: "ws-1",
+    principal_id: "principal-1",
+    policy_id: "policy-1",
+    operation: "execute",
+    invocation_id: "inv-1",
+    request_digest: digest,
+    issued_at: 100,
+    not_before: 100,
+    expires_at: 160,
+  });
+  const signed = validateExecutionOperationGrantIssueResponse({
+    grant: {
+      algorithm: "Ed25519",
+      key_id: "key-1",
+      claims: operationClaims,
+      signature: "signature-1",
+    },
+  });
+  const expected = {
+    operation: "execute" as const,
+    invocation_id: "inv-1",
+    request_digest: digest,
+  };
+  const currentness = makeExecutionOperationGrantCurrentnessRequest(
+    signed.grant,
+    expected,
+    { algorithm: "Ed25519", key_id: "key-1", public_key_sha256: digest },
+  );
+
+  assert.equal(currentness.version, "pillbox.authorization-currentness/3");
+  assert.deepEqual(currentness.grant, signed.grant);
+  assert.equal(validateExecutionOperationBinding(operationClaims, expected), undefined);
+  assert.match(
+    validateExecutionOperationBinding(operationClaims, {
+      ...expected,
+      operation: "cancel",
+    }) ?? "",
+    /operation/,
+  );
+  assert.throws(
+    () => validateExecutionOperationGrantClaims({ ...operationClaims, operations: ["execute"] }),
+    /unrecognized field/,
+  );
+  assert.throws(
+    () => validateExecutionOperationGrantIssueResponse({ ...signed, request_binding: expected }),
+    /unrecognized field/,
+  );
+});
+
+test("generic operation grant issue requests are operation-scoped and bounded", () => {
+  const issue = validateExecutionOperationGrantIssueRequest({
+    grant_id: "operation-grant-1",
+    installation_id: "install-1",
+    workspace_id: "ws-1",
+    principal_id: "principal-1",
+    policy_id: "policy-1",
+    operation: "status",
+    invocation_id: "inv-1",
+    request_digest: digest,
+    ttl_seconds: 30,
+  });
+  assert.equal(issue.operation, "status");
+  assert.throws(
+    () => validateExecutionOperationGrantIssueRequest({ ...issue, ttl_seconds: 301 }),
+    /ttl_seconds/,
+  );
 });

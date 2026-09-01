@@ -53,8 +53,9 @@ class, and Analytics dataset (`pillbox_managed_burnin_costs`) isolated. The
 Analytics Engine dataset is declared by the config; this Wrangler release has
 no separate `analytics-engine create` command, so verify the declared dataset
 in the account dashboard/API before the run. Configure an isolated Huddles
-projector service for the `PillboxAuthorizationControlPlane` binding before a
-private service-binding run.
+authorize-only Huddles service for the `PillboxAuthorizationCurrentness`
+binding before a private service-binding run. Keep the signing issuer separate;
+Pillbox must not bind it.
 
 The config contains only the vendor-owned `Sandbox` Durable Object class and
 sets `max_instances = 1`. Do not add `SessionGateway`, a VFS class, or any

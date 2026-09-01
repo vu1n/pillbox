@@ -10,6 +10,7 @@ import { R2ExecutionArtifactStore } from "./execution_artifacts.js";
 import {
   ExecutionService,
   OpencodeExecutionRuntime,
+  type ExecutionOperationAuthorizer,
   type ExecutionRuntime,
 } from "./execution_service.js";
 import {
@@ -35,6 +36,8 @@ import {
   authorizeManagedEnsure,
   authorizeManagedInvoke,
 } from "./managed_huddles_auth.js";
+import { authorizeExecutionOperation } from "./managed_auth.js";
+import type { PillboxExecutionOperationGrantIssueResponse } from "./managed_contract.js";
 import {
   RunCostMeter,
   WorkersAnalyticsEngineRunCost,
@@ -69,16 +72,34 @@ export { deriveSandboxRuntimeId, sha256Hex } from "./runtime_identity.js";
 
 /** Private same-account RPC surface for Huddles and generic execution callers. */
 export class HuddlesRuntimeEntrypoint extends WorkerEntrypoint<Env> {
-  async executeInvocation(request: ExecuteInvocationV2Request) {
-    return executionService(this.env).executeInvocation(request);
+  async executeInvocation(
+    request: ExecuteInvocationV2Request,
+    authorization: PillboxExecutionOperationGrantIssueResponse,
+  ) {
+    return executionService(
+      this.env,
+      operationAuthorizer(this.env, authorization),
+    ).executeInvocation(request);
   }
 
-  async getExecutionStatus(request: GetInvocationV2Request) {
-    return executionService(this.env).getExecutionStatus(request);
+  async getExecutionStatus(
+    request: GetInvocationV2Request,
+    authorization: PillboxExecutionOperationGrantIssueResponse,
+  ) {
+    return executionService(
+      this.env,
+      operationAuthorizer(this.env, authorization),
+    ).getExecutionStatus(request);
   }
 
-  async cancelInvocation(request: CancelInvocationV2Request) {
-    return executionService(this.env).cancelInvocation(request);
+  async cancelInvocation(
+    request: CancelInvocationV2Request,
+    authorization: PillboxExecutionOperationGrantIssueResponse,
+  ) {
+    return executionService(
+      this.env,
+      operationAuthorizer(this.env, authorization),
+    ).cancelInvocation(request);
   }
 
   async ensureSession(request: EnsureSessionRequest): Promise<EnsureSessionResult> {
@@ -109,7 +130,10 @@ export class HuddlesRuntimeEntrypoint extends WorkerEntrypoint<Env> {
   }
 }
 
-export function executionService(env: Env): ExecutionService {
+export function executionService(
+  env: Env,
+  authorizer?: ExecutionOperationAuthorizer,
+): ExecutionService {
   const meter = new RunCostMeter();
   const store = new D1ExecutionStore(
     env.EXECUTION_DB as unknown as RelationalDatabase,
@@ -142,7 +166,16 @@ export function executionService(env: Env): ExecutionService {
       env.MANAGED_EXECUTION_EPOCH,
       env.MANAGED_EXECUTION_LIMIT,
     ),
+    authorizer,
   });
+}
+
+function operationAuthorizer(
+  env: Env,
+  authorization: PillboxExecutionOperationGrantIssueResponse,
+): ExecutionOperationAuthorizer {
+  return ({ operation, request }) =>
+    authorizeExecutionOperation(env, authorization, operation, request);
 }
 
 class UnavailableExecutionRuntime implements ExecutionRuntime {

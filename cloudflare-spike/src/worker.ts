@@ -12,7 +12,7 @@ import {
   RequestBodyTooLargeError,
 } from "./request_body.js";
 import { routeWorkspaceTransfer } from "./workspace_transfer.js";
-import type { PillboxAuthorizationControlPlane } from "./managed_auth.js";
+import type { PillboxAuthorizationCurrentness } from "./managed_auth.js";
 import {
   ManagedAdmissionError,
   managedAdmissionPolicy,
@@ -35,8 +35,8 @@ export interface Env {
   // exact request bytes, operation, and resource. Huddles reaches the private
   // service binding and does not use this public bearer-token surface.
   MANAGED_CAPABILITY_SECRET?: string;
-  /** Private Huddles control-plane binding. Transport auth is not workload auth. */
-  PillboxAuthorizationControlPlane?: PillboxAuthorizationControlPlane;
+  /** Private Huddles currentness binding. Transport auth is not workload auth. */
+  PillboxAuthorizationCurrentness?: PillboxAuthorizationCurrentness;
   /** Public verification half of the active Huddles Ed25519 grant key. */
   PILLBOX_GRANT_KEY_ID?: string;
   PILLBOX_GRANT_PUBLIC_KEY?: string;

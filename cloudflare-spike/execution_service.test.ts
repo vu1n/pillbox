@@ -114,11 +114,17 @@ test("created execution persists terminal evidence and exact retry does not resa
       },
     ],
   });
+  let authorizationChecks = 0;
+  const authorizationIdentity = "principal-must-not-persist";
   const service = new ExecutionService(store, artifacts, runtime, {
     ...fixedOptions(),
     costMeter: new RunCostMeter(),
     analytics: { emit: (point) => analytics.push(point) },
     sandboxProfile: "standard-2",
+    authorizer: async () => {
+      authorizationChecks += 1;
+      void authorizationIdentity;
+    },
   });
   const input = await request();
 
@@ -138,6 +144,54 @@ test("created execution persists terminal evidence and exact retry does not resa
   assert.equal(runtime.executions, 1);
   assert.equal(artifacts.writes, 1);
   assert.equal(analytics.length, 1);
+  assert.equal(authorizationChecks, 2, "exact retry is reauthorized before D1 reuse");
+  assert.equal(
+    JSON.stringify({ result: reused, rows: [...store.rows.values()], artifacts: [...artifacts.values.values()], analytics })
+      .includes(authorizationIdentity),
+    false,
+    "authorization identity cannot enter runtime state, evidence, or analytics",
+  );
+});
+
+test("execute, status, and cancel authorization failures precede every persistence access", async () => {
+  const operations: string[] = [];
+  const never = (): never => {
+    throw new Error("authorization failure crossed into persistence");
+  };
+  const service = new ExecutionService(
+    { claim: async () => never(), get: async () => never(), finish: async () => never() },
+    { write: async () => never(), read: async () => never() },
+    { execute: async () => never(), cancel: async () => never() },
+    {
+      ...fixedOptions(),
+      authorizer: async ({ operation }) => {
+        operations.push(operation);
+        throw new Error(`denied ${operation}`);
+      },
+    },
+  );
+  const input = await request();
+
+  await assert.rejects(service.executeInvocation(input), /denied execute/);
+  await assert.rejects(
+    service.getExecutionStatus({
+      contract_version: "pillbox.execution/2",
+      invocation_id: input.invocation_id,
+      evidence_after: 0,
+      evidence_limit: 100,
+    }),
+    /denied status/,
+  );
+  await assert.rejects(
+    service.cancelInvocation({
+      contract_version: "pillbox.execution/2",
+      invocation_id: input.invocation_id,
+      idempotency_key: "cancel-denied",
+      reason: "test",
+    }),
+    /denied cancel/,
+  );
+  assert.deepEqual(operations, ["execute", "status", "cancel"]);
 });
 
 test("tool-enabled managed execution fails closed before runtime access", async () => {
@@ -166,6 +220,7 @@ test("disabled managed execution returns a typed failure before charged access",
   const never = (): never => {
     throw new Error("disabled admission crossed into a charged dependency");
   };
+  let authorized = false;
   const service = new ExecutionService(
     {
       claim: async () => never(),
@@ -185,6 +240,9 @@ test("disabled managed execution returns a typed failure before charged access",
       ownerToken: never,
       analytics: { emit: async () => never() },
       admission: managedAdmissionPolicy(undefined),
+      authorizer: async () => {
+        authorized = true;
+      },
     },
   );
 
@@ -195,6 +253,7 @@ test("disabled managed execution returns a typed failure before charged access",
   }
   assert.equal(result.session_ref.seq_range, undefined);
   assert.deepEqual(result.evidence.events, []);
+  assert.equal(authorized, true, "managed-disabled drain happens only after authorization");
 });
 
 test("enabled managed execution with missing allowance config fails before charged access", async () => {

@@ -27,6 +27,6 @@ binding = "EXECUTION_EVIDENCE"
 bucket_name = "pillbox-managed-auth-test-evidence"
 
 [[services]]
-binding = "PillboxAuthorizationControlPlane"
+binding = "PillboxAuthorizationCurrentness"
 service = "pillbox-managed-auth-authority"
-entrypoint = "ManagedAuthorizationControlPlaneEntrypoint"
+entrypoint = "PillboxAuthorizationCurrentnessEntrypoint"

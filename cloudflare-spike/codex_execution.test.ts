@@ -56,7 +56,7 @@ async function validRequest(
     contract_version: "pillbox.execution/2",
     session_ref: { session_id: "session-1" },
     invocation_id: "invocation-1",
-    idempotency_key: "delivery-1",
+    idempotency_key: "invocation-1",
     rendered_input,
     rendered_input_hash: await computeRenderedInputHash(rendered_input),
     tool_policy: "deny_all",
@@ -94,6 +94,17 @@ test("valid Codex app-server execution envelope validates", async () => {
   const validated = await validateExecuteInvocationV2Request(request);
   assert.deepEqual(validated, request);
   assert.deepEqual(validateSupportedCodexExecution(validated.execution), codexExecution);
+});
+
+test("execute identity rejects a separately chosen idempotency key", async () => {
+  const request = await validRequest();
+  await assert.rejects(
+    validateExecuteInvocationV2Request({
+      ...request,
+      idempotency_key: "delivery-1",
+    }),
+    assertBoundaryError,
+  );
 });
 
 test("single-controller CLI turns may use runtime tools and text output", async () => {
@@ -371,7 +382,7 @@ test("cancellation is an exact idempotent runtime request", () => {
   const request = {
     contract_version: "pillbox.execution/2",
     invocation_id: "invocation-1",
-    idempotency_key: "cancel-delivery-1",
+    idempotency_key: "invocation-1",
     reason: "caller requested cancellation",
   } as const;
   assert.deepEqual(validateCancelInvocationV2Request(request), request);
@@ -381,6 +392,14 @@ test("cancellation is an exact idempotent runtime request", () => {
   );
   assert.throws(
     () => validateCancelInvocationV2Request({ ...request, reason: "" }),
+    assertBoundaryError,
+  );
+  assert.throws(
+    () =>
+      validateCancelInvocationV2Request({
+        ...request,
+        idempotency_key: "cancel-delivery-1",
+      }),
     assertBoundaryError,
   );
 });

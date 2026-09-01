@@ -173,12 +173,13 @@ test("local-only legacy RPC is a stateless adapter over bounded execution", asyn
       }),
       /local legacy requests do not accept managed_authorization/,
     );
-    await assert.rejects(
-      callPrivate(caller, "/invoke", {
+    assert.deepEqual(
+      await callPrivate(caller, "/invoke", {
         ...invoke,
         delivery_receipt_id: "changed-delivery",
       }),
-      (error) => error?.code === "invoke_session_conflict",
+      { ...unavailable, disposition: "reused" },
+      "local compatibility derives execution/2 idempotency from invocation identity",
     );
 
     const unauthenticated = await target.fetch(

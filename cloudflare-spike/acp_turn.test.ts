@@ -63,11 +63,12 @@ async function validRequest(
   changes: Partial<ExecuteInvocationV2Request> = {},
 ): Promise<ExecuteInvocationV2Request> {
   const rendered_input = changes.rendered_input ?? "Write the sealed answer.";
+  const invocation_id = changes.invocation_id ?? "invocation-acp-1";
   return validateExecuteInvocationV2Request({
     contract_version: "pillbox.execution/2",
     session_ref: { session_id: "session-acp" },
-    invocation_id: "invocation-acp-1",
-    idempotency_key: "delivery-acp-1",
+    invocation_id,
+    idempotency_key: changes.idempotency_key ?? invocation_id,
     rendered_input,
     rendered_input_hash: await computeRenderedInputHash(rendered_input),
     tool_policy: "deny_all",

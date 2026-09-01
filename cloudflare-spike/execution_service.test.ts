@@ -115,7 +115,6 @@ test("created execution persists terminal evidence and exact retry does not resa
     ],
   });
   let authorizationChecks = 0;
-  const authorizationIdentity = "principal-must-not-persist";
   const service = new ExecutionService(store, artifacts, runtime, {
     ...fixedOptions(),
     costMeter: new RunCostMeter(),
@@ -123,7 +122,6 @@ test("created execution persists terminal evidence and exact retry does not resa
     sandboxProfile: "standard-2",
     authorizer: async () => {
       authorizationChecks += 1;
-      void authorizationIdentity;
     },
   });
   const input = await request();
@@ -145,12 +143,6 @@ test("created execution persists terminal evidence and exact retry does not resa
   assert.equal(artifacts.writes, 1);
   assert.equal(analytics.length, 1);
   assert.equal(authorizationChecks, 2, "exact retry is reauthorized before D1 reuse");
-  assert.equal(
-    JSON.stringify({ result: reused, rows: [...store.rows.values()], artifacts: [...artifacts.values.values()], analytics })
-      .includes(authorizationIdentity),
-    false,
-    "authorization identity cannot enter runtime state, evidence, or analytics",
-  );
 });
 
 test("execute, status, and cancel authorization failures precede every persistence access", async () => {

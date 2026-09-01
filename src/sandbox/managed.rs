@@ -1191,13 +1191,10 @@ mod workspace_xfer {
 /// When a Cloudflare API token is configured (`PILLBOX_R2_CF_API_TOKEN`), this
 /// mints a short-lived, **prefix-scoped** temp credential via R2's
 /// `temp-access-credentials` API and hands the DO *that* instead, so a credential
-/// reaching CF can touch only `bucket/<prefix>` for a bounded TTL. With no token
-/// configured the parent key still travels (unchanged behavior) but the exposure
-/// is announced once, loudly, instead of silently — the gap is visible, not faked.
+/// reaching CF can touch only `bucket/<prefix>` for a bounded TTL. The minting
+/// authority is mandatory: without it, the transfer fails before the parent key
+/// can cross to the managed plane.
 mod r2_scope {
-    use std::borrow::Cow;
-    use std::sync::Once;
-
     use anyhow::{Context, Result};
     use serde::{Deserialize, Serialize};
 
@@ -1205,9 +1202,8 @@ mod r2_scope {
     use crate::workspace::rustic::S3Config;
 
     /// The CF API token that authorizes minting temp credentials (a Bearer token
-    /// with R2 read+write on the bucket). Absent ⇒ scoping is off and the parent
-    /// key travels; present ⇒ scoping is required (a mint failure is fatal, never
-    /// a silent fall-back to the bucket-wide key).
+    /// with R2 read+write on the bucket). It is the only accepted minting
+    /// authority; missing, non-Unicode, or blank values are configuration errors.
     const API_TOKEN_ENV: &str = "PILLBOX_R2_CF_API_TOKEN";
     /// Lifetime of a minted transfer credential. A credential is minted fresh
     /// *per transfer* (provision, then finalize), so it only has to outlive one
@@ -1220,35 +1216,36 @@ mod r2_scope {
     /// Read + write: the DO both restores (GET) and snapshots back (PUT).
     const PERMISSION: &str = "object-read-write";
 
-    static WARNED_BUCKET_WIDE: Once = Once::new();
-
     /// Mint a fresh prefix-scoped temp credential for one workspace transfer
-    /// (provision or finalize) when scoping is configured, else borrow the parent
-    /// key (with a loud one-time warning). Called once per transfer so each
-    /// credential only spans a single round-trip — a long turn between provision
-    /// and finalize can't expire it.
+    /// (provision or finalize). Called once per transfer so each credential only
+    /// spans a single round-trip — a long turn between provision and finalize
+    /// can't expire it.
     ///
-    /// Fail-closed: with the API token set, scoping is *required* — a missing
-    /// account id or an empty repo prefix (nothing narrower than the bucket to
-    /// scope to) or a mint failure aborts the run rather than handing CF a
-    /// bucket-wide key dressed up as scoped.
-    pub(super) fn scope_for_transfer(parent: &S3Config) -> Result<Cow<'_, S3Config>> {
-        let Some(api_token) = configured_token() else {
-            // Only nudge toward scoping where it can actually apply — a non-R2
-            // S3 host (MinIO/Backblaze/native S3) has no CF temp-credential API,
-            // so the remediation would be inapplicable noise there.
-            if account_id_from_endpoint(&parent.endpoint).is_some() {
-                warn_bucket_wide();
-            }
-            return Ok(Cow::Borrowed(parent));
-        };
+    /// Fail-closed: a missing minting authority, missing account id, empty repo
+    /// prefix, mint failure, or unusable returned credential aborts the run. The
+    /// parent credential is never a return value from this boundary.
+    pub(super) fn scope_for_transfer(parent: &S3Config) -> Result<S3Config> {
+        let api_token = required_api_token()?;
+        scope_for_transfer_with(parent, &api_token, mint)
+    }
+
+    fn scope_for_transfer_with<M>(
+        parent: &S3Config,
+        api_token: &str,
+        mint_fn: M,
+    ) -> Result<S3Config>
+    where
+        M: FnOnce(&S3Config, &str, &str, &str) -> Result<S3Config>,
+    {
+        if api_token.trim().is_empty() {
+            return Err(missing_api_token_error().into());
+        }
         let account_id = account_id_from_endpoint(&parent.endpoint).ok_or_else(|| {
             PillboxError::config(
                 "run",
                 format!(
-                    "{API_TOKEN_ENV} is set (R2 credential scoping requested) but the R2 endpoint \
-                     `{}` isn't an `<account-id>.r2.cloudflarestorage.com` host, so the account id \
-                     can't be derived to mint a scoped credential",
+                    "managed workspace transfer requires an R2 endpoint of the form \
+                     `<account-id>.r2.cloudflarestorage.com`; `{}` cannot be scoped",
                     parent.endpoint
                 ),
             )
@@ -1257,38 +1254,45 @@ mod r2_scope {
             PillboxError::config(
                 "run",
                 format!(
-                    "{API_TOKEN_ENV} is set (R2 credential scoping requested) but the workspace \
-                     repo prefix is empty, so a scoped credential would still be bucket-wide. Set \
-                     a non-empty workspace prefix, or unset {API_TOKEN_ENV} to accept bucket-wide \
-                     reach explicitly"
+                    "managed workspace transfer requires a non-empty R2 repo prefix; an empty \
+                     prefix would grant bucket-wide access"
                 ),
             )
         })?;
-        let scoped = mint(parent, &api_token, &account_id, &cf_prefix)?;
-        Ok(Cow::Owned(scoped))
+        let scoped = mint_fn(parent, api_token.trim(), &account_id, &cf_prefix)?;
+        validate_scoped(parent, scoped)
     }
 
-    fn configured_token() -> Option<String> {
-        std::env::var(API_TOKEN_ENV)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
+    fn required_api_token() -> Result<String> {
+        required_api_token_value(std::env::var_os(API_TOKEN_ENV))
     }
 
-    fn warn_bucket_wide() {
-        WARNED_BUCKET_WIDE.call_once(|| {
-            eprintln!(
-                "pillbox: note: handing the managed plane a bucket-wide R2 credential. \
-                 Set {API_TOKEN_ENV} (a Cloudflare API token with R2 read+write) to mint a \
-                 short-lived, prefix-scoped credential instead."
-            );
-        });
+    fn required_api_token_value(value: Option<std::ffi::OsString>) -> Result<String> {
+        let token = value
+            .ok_or_else(missing_api_token_error)?
+            .into_string()
+            .map_err(|_| missing_api_token_error())?;
+        let token = token.trim();
+        if token.is_empty() {
+            return Err(missing_api_token_error().into());
+        }
+        Ok(token.to_string())
+    }
+
+    fn missing_api_token_error() -> PillboxError {
+        PillboxError::config(
+            "run",
+            format!(
+                "{API_TOKEN_ENV} is required for managed workspace transfer; it must authorize \
+                 a fresh prefix-scoped R2 credential mint"
+            ),
+        )
     }
 
     /// Parse the R2 account id out of an `<account-id>.r2.cloudflarestorage.com`
     /// endpoint (with or without scheme / trailing path). `None` for any other
-    /// S3-compatible host (MinIO, Backblaze, native S3) — those have no CF
-    /// temp-credential API, so scoping doesn't apply.
+    /// S3-compatible host (MinIO, Backblaze, native S3), which the managed R2
+    /// transfer boundary rejects because it cannot mint a scoped credential.
     fn account_id_from_endpoint(endpoint: &str) -> Option<String> {
         const SUFFIX: &str = ".r2.cloudflarestorage.com";
         let after_scheme = endpoint
@@ -1384,9 +1388,9 @@ mod r2_scope {
         let cred = env.result.ok_or_else(|| {
             PillboxError::runtime("run", "R2 temp-credential response had no `result`")
         })?;
-        if cred.access_key_id.is_empty()
-            || cred.secret_access_key.is_empty()
-            || cred.session_token.is_empty()
+        if cred.access_key_id.trim().is_empty()
+            || cred.secret_access_key.trim().is_empty()
+            || cred.session_token.trim().is_empty()
         {
             return Err(PillboxError::runtime(
                 "run",
@@ -1403,6 +1407,25 @@ mod r2_scope {
             secret_key: cred.secret_access_key,
             session_token: Some(cred.session_token),
         })
+    }
+
+    fn validate_scoped(parent: &S3Config, scoped: S3Config) -> Result<S3Config> {
+        let has_session_token = scoped
+            .session_token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty());
+        let fresh_key = scoped.access_key != parent.access_key
+            && scoped.secret_key != parent.secret_key
+            && !scoped.access_key.trim().is_empty()
+            && !scoped.secret_key.trim().is_empty();
+        if !has_session_token || !fresh_key {
+            return Err(PillboxError::runtime(
+                "run",
+                "R2 temp-credential mint did not return a fresh scoped credential",
+            )
+            .into());
+        }
+        Ok(scoped)
     }
 
     /// `POST <api>/accounts/<id>/r2/temp-access-credentials` — mint a scoped
@@ -1477,6 +1500,98 @@ mod r2_scope {
         }
 
         #[test]
+        fn minting_authority_is_required_and_must_be_usable_text() {
+            let missing = required_api_token_value(None).expect_err("missing token must fail");
+            assert!(missing.to_string().contains(API_TOKEN_ENV));
+
+            let blank =
+                required_api_token_value(Some("  \n".into())).expect_err("blank token must fail");
+            assert!(blank.to_string().contains(API_TOKEN_ENV));
+
+            assert_eq!(
+                required_api_token_value(Some("  mint-authority  ".into())).unwrap(),
+                "mint-authority"
+            );
+        }
+
+        #[test]
+        fn scope_rejects_non_r2_and_bucket_wide_repositories_before_mint() {
+            let mut non_r2 = parent();
+            non_r2.endpoint = "https://s3.amazonaws.com".into();
+            let err = scope_for_transfer_with(&non_r2, "mint-authority", |_, _, _, _| {
+                panic!("invalid endpoint must fail before mint")
+            })
+            .expect_err("non-R2 endpoint must fail closed");
+            assert!(err.to_string().contains("cannot be scoped"));
+
+            let mut bucket_wide = parent();
+            bucket_wide.prefix = "/".into();
+            let err = scope_for_transfer_with(&bucket_wide, "mint-authority", |_, _, _, _| {
+                panic!("empty prefix must fail before mint")
+            })
+            .expect_err("bucket-wide prefix must fail closed");
+            assert!(err.to_string().contains("bucket-wide access"));
+        }
+
+        #[test]
+        fn scope_propagates_api_failure_without_parent_fallback() {
+            let err = scope_for_transfer_with(&parent(), "mint-authority", |_, _, _, _| {
+                Err(PillboxError::runtime("run", "mint API unavailable").into())
+            })
+            .expect_err("mint failure must abort the transfer");
+            assert!(err.to_string().contains("mint API unavailable"));
+        }
+
+        #[test]
+        fn scope_returns_only_a_fresh_prefix_scoped_credential() {
+            let original = parent();
+            let scoped = scope_for_transfer_with(
+                &original,
+                " mint-authority ",
+                |received_parent, token, account_id, prefix| {
+                    assert_eq!(received_parent.secret_key, "PARENT_SK");
+                    assert_eq!(token, "mint-authority");
+                    assert_eq!(account_id, "abc123");
+                    assert_eq!(prefix, "proj/");
+                    Ok(S3Config {
+                        access_key: "TMP_AK".into(),
+                        secret_key: "TMP_SK".into(),
+                        session_token: Some("TMP_ST".into()),
+                        ..received_parent.clone()
+                    })
+                },
+            )
+            .expect("fresh scoped credential accepted");
+
+            assert_eq!(scoped.access_key, "TMP_AK");
+            assert_eq!(scoped.secret_key, "TMP_SK");
+            assert_eq!(scoped.session_token.as_deref(), Some("TMP_ST"));
+            assert_ne!(scoped.access_key, original.access_key);
+            assert_ne!(scoped.secret_key, original.secret_key);
+        }
+
+        #[test]
+        fn scope_rejects_a_minter_returning_parent_or_incomplete_credentials() {
+            let original = parent();
+            let err = scope_for_transfer_with(&original, "mint-authority", |parent, _, _, _| {
+                Ok(parent.clone())
+            })
+            .expect_err("parent credential must never cross the boundary");
+            assert!(err.to_string().contains("fresh scoped credential"));
+
+            let err = scope_for_transfer_with(&original, "mint-authority", |parent, _, _, _| {
+                Ok(S3Config {
+                    access_key: "TMP_AK".into(),
+                    secret_key: "TMP_SK".into(),
+                    session_token: Some("  ".into()),
+                    ..parent.clone()
+                })
+            })
+            .expect_err("blank session token must fail closed");
+            assert!(err.to_string().contains("fresh scoped credential"));
+        }
+
+        #[test]
         fn request_scopes_to_the_prefix_subtree_with_rw() {
             let body = serde_json::to_value(build_request(&parent(), "proj/", 1800)).unwrap();
             assert_eq!(body["bucket"], "ws");
@@ -1519,9 +1634,10 @@ mod r2_scope {
         fn parse_scoped_fails_closed_on_unsuccess_or_missing_fields() {
             let failed = r#"{"success":false,"errors":[{"message":"bad token"}],"result":null}"#;
             assert!(parse_scoped(failed, &parent()).is_err());
+            assert!(parse_scoped("not-json", &parent()).is_err());
             // success but a blank credential field is not a usable credential.
             let blank = r#"{"success":true,"errors":[],
-                "result":{"accessKeyId":"TMP_AK","secretAccessKey":"","sessionToken":"TMP_ST"}}"#;
+                "result":{"accessKeyId":"TMP_AK","secretAccessKey":"  ","sessionToken":"TMP_ST"}}"#;
             assert!(parse_scoped(blank, &parent()).is_err());
         }
     }

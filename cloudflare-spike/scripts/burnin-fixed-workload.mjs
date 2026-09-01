@@ -12,6 +12,15 @@ const DEFAULT_MANIFEST = new URL(
   import.meta.url,
 );
 const MAX_STATUS_PAGE_SIZE = 100;
+const REPORT_SCHEMA_VERSION = 2;
+const EXPECTED_WORKLOAD = new Map([
+  ["first-execute", "execute"],
+  ["exact-retry", "execute"],
+  ["status-page-1", "status"],
+  ["status-page-2", "status"],
+  ["unsupported-managed-codex", "managed_codex_preflight"],
+  ["finalize", "workspace_finalize"],
+]);
 const execFileAsync = promisify(execFile);
 
 const args = process.argv.slice(2);
@@ -45,27 +54,33 @@ if (finalizeRequestPath === undefined) {
 }
 
 const request = manifest.workload.steps.find((step) => step.id === "first-execute").request;
-const responses = [];
+const runtimeCalls = [];
 const unsupported = manifest.workload.steps.find((step) => step.id === "unsupported-managed-codex");
 const unsupportedResult = await runManagedAgentPreflight(unsupported);
-responses.push({ step_id: unsupported.id, ...unsupportedResult });
+const preflight = {
+  step_id: unsupported.id,
+  operation: unsupported.operation,
+  schema_version: unsupportedResult.schema_version,
+  agent: unsupportedResult.agent,
+  status: unsupportedResult.status,
+  disposition: unsupportedResult.disposition,
+  error_code: unsupportedResult.error_code,
+  exit_code: unsupportedResult.exit_code,
+  observed_output: unsupportedResult.observed_output,
+  observed_output_sha256: unsupportedResult.observed_output_sha256,
+  counters: unsupportedResult.counters,
+};
 
 const first = await call("first-execute", "/v2/executions", request, "EXECUTE");
-responses.push(summary("first-execute", first));
 expect(first.body, "first-execute", { status: "completed", disposition: "created" });
+expectTerminalAttribution("first-execute", first, request.invocation_id);
+runtimeCalls.push(runtimeSummary("first-execute", "execute", first));
 
 const retry = await call("exact-retry", "/v2/executions", request, "EXECUTE");
-responses.push(summary("exact-retry", retry));
 expect(retry.body, "exact-retry", { status: "completed", disposition: "reused" });
-if (retry.body.request_hash !== first.body.request_hash) {
-  fail("exact retry changed request_hash");
-}
-if (retry.body.evidence?.artifact_ref?.key !== first.body.evidence?.artifact_ref?.key) {
-  fail("exact retry returned a second artifact");
-}
-if (JSON.stringify(retry.body.cost ?? null) !== JSON.stringify(first.body.cost ?? null)) {
-  fail("exact retry returned a different RunCostEnvelope");
-}
+expectTerminalAttribution("exact-retry", retry, request.invocation_id);
+expectSameTerminalExecution("exact-retry", retry.body, first.body);
+runtimeCalls.push(runtimeSummary("exact-retry", "execute", retry));
 
 for (const [index, step] of manifest.workload.steps
   .filter((candidate) => candidate.operation === "status")
@@ -77,11 +92,10 @@ for (const [index, step] of manifest.workload.steps
     evidence_limit: step.evidence_limit,
   };
   const status = await call(step.id, "/v2/executions/status", statusRequest, `STATUS_${index + 1}`);
-  responses.push(summary(step.id, status));
   expect(status.body, step.id, { status: "completed", disposition: "reused" });
-  if (status.body.request_hash !== first.body.request_hash) {
-    fail(`${step.id} changed request_hash`);
-  }
+  expectTerminalAttribution(step.id, status, request.invocation_id);
+  expectSameTerminalExecution(step.id, status.body, first.body);
+  runtimeCalls.push(runtimeSummary(step.id, step.operation, status));
 }
 
 const finalizeStep = manifest.workload.steps.find((step) => step.id === "finalize");
@@ -90,18 +104,26 @@ if (finalizeRequest.sessionId !== finalizeStep.session_id) {
   fail("operator finalize request sessionId does not match the fixed workload");
 }
 const finalized = await call("finalize", "/v2/workspaces/finalize", finalizeRequest, "FINALIZE");
-responses.push(summary("finalize", finalized));
-if (typeof finalized.body.resultSnapshot !== "string" || !/^[0-9a-f]{64}$/.test(finalized.body.resultSnapshot)) {
+if (finalized.status !== 200 || typeof finalized.body.resultSnapshot !== "string" || !/^[0-9a-f]{64}$/.test(finalized.body.resultSnapshot)) {
   fail("finalize did not return a canonical result snapshot");
 }
+const cleanup = {
+  step_id: finalizeStep.id,
+  operation: finalizeStep.operation,
+  http_status: finalized.status,
+  session_id: finalizeRequest.sessionId,
+  result_snapshot: finalized.body.resultSnapshot,
+};
 
 const report = {
-  schema_version: 1,
+  schema_version: REPORT_SCHEMA_VERSION,
   deployment: manifest.deployment,
   workload: manifest.workload,
   capture: {
     source: "burnin-fixed-workload",
-    responses,
+    runtime_calls: runtimeCalls,
+    preflight,
+    cleanup,
     run_cost_envelopes: uniqueRunCost(first.body),
     read_only: null,
     totals: null,
@@ -230,10 +252,11 @@ async function runManagedAgentPreflight(step) {
   return observed;
 }
 
-function summary(stepId, result) {
+function runtimeSummary(stepId, operation, result) {
   const body = result.body;
   return {
     step_id: stepId,
+    operation,
     http_status: result.status,
     invocation_id: body.invocation_id,
     status: body.status,
@@ -247,7 +270,7 @@ function summary(stepId, result) {
 function uniqueRunCost(body) {
   if (body.cost === undefined) return [];
   return [{
-    id: "run-1",
+    id: digestOf(body.cost),
     invocation_id: body.invocation_id,
     artifact_count: body.evidence?.artifact_ref === undefined ? 0 : 1,
     analytics_point_count: body.cost.infrastructure.analytics_points_written,
@@ -263,18 +286,68 @@ function expect(body, stepId, expected) {
 }
 
 function validateManifest(value) {
-  if (!isRecord(value) || value.schema_version !== 1) fail("manifest schema_version must be 1");
+  if (!isRecord(value) || value.schema_version !== REPORT_SCHEMA_VERSION) fail(`manifest schema_version must be ${REPORT_SCHEMA_VERSION}`);
   const deployment = value.deployment;
   if (!isRecord(deployment) || deployment.worker_name !== "pillbox-managed-burnin") fail("manifest must target pillbox-managed-burnin");
-  if (deployment.managed_execution_limit !== 1 || deployment.reviewed_new_execution_count !== 1) fail("fixed workload allowance must be exactly one new execution");
+  if (deployment.managed_execution_limit !== 1 || deployment.reviewed_new_execution_count !== 1 || deployment.reserved_executions !== 1) fail("fixed workload allowance must be exactly one reserved execution");
   if (!isRecord(value.workload) || !Array.isArray(value.workload.steps)) fail("manifest workload.steps must be an array");
-  const first = value.workload.steps.find((step) => step?.id === "first-execute");
+  const stepById = new Map();
+  for (const step of value.workload.steps) {
+    if (!isRecord(step) || typeof step.id !== "string" || stepById.has(step.id)) fail("manifest workload steps must have unique string ids");
+    stepById.set(step.id, step);
+  }
+  for (const [stepId, operation] of EXPECTED_WORKLOAD) {
+    if (stepById.get(stepId)?.operation !== operation) fail(`manifest step ${stepId} must use operation ${operation}`);
+  }
+  for (const stepId of stepById.keys()) {
+    if (!EXPECTED_WORKLOAD.has(stepId)) fail(`manifest contains unexpected workload step ${stepId}`);
+  }
+  if (stepById.size !== EXPECTED_WORKLOAD.size) fail("manifest must contain exactly the checked burn-in steps");
+  const first = stepById.get("first-execute");
   if (!isRecord(first) || !isRecord(first.request)) fail("manifest must contain first-execute.request");
+  if (first.invocation_id !== first.request.invocation_id) fail("first-execute invocation identity must match its request");
+  if (stepById.get("exact-retry")?.request_ref !== "first-execute") fail("exact-retry must reference first-execute");
+  if (first.expected?.allowance_reservation !== 1) fail("first-execute must reserve the one reviewed allowance");
+  if (stepById.get("exact-retry")?.expected?.allowance_reservation_delta !== 0 || stepById.get("exact-retry")?.expected?.new_model_turns !== 0) fail("exact-retry must not reserve or sample again");
   const inputHash = `sha256:${createHash("sha256").update(first.request.rendered_input).digest("hex")}`;
   if (first.request.rendered_input_hash !== inputHash) fail("manifest rendered_input_hash is not deterministic");
   const statusSteps = value.workload.steps.filter((step) => step?.operation === "status");
-  for (const step of statusSteps) {
-    if (!Number.isSafeInteger(step.evidence_limit) || step.evidence_limit < 1 || step.evidence_limit > MAX_STATUS_PAGE_SIZE) fail(`${step.id} evidence_limit is outside the bounded page size`);
+  for (const [index, step] of statusSteps.entries()) {
+    if (step.evidence_limit !== MAX_STATUS_PAGE_SIZE || step.evidence_after !== index * MAX_STATUS_PAGE_SIZE || step.expected?.bounded !== true) fail(`${step.id} must request the checked bounded evidence page`);
+  }
+  const networkSteps = value.workload.steps.filter((step) => step.operation !== "managed_codex_preflight");
+  if (value.workload.expected_network_requests !== networkSteps.length) fail("manifest network request count must match runtime and cleanup calls");
+  const unsupported = stepById.get("unsupported-managed-codex");
+  if (unsupported.expected?.error_code !== "unsupported_execution" || unsupported.expected?.provision_attempts !== 0 || unsupported.expected?.network_requests !== 0) fail("managed Codex preflight must reject without side effects");
+  const finalize = stepById.get("finalize");
+  if (finalize.requires_operator_request !== true || finalize.expected?.requests !== 1 || finalize.expected?.kill_before_transfer !== true || finalize.expected?.result_snapshot_required !== true) fail("finalize must be one operator-scoped kill-before-transfer cleanup");
+}
+
+function expectSameTerminalExecution(stepId, body, firstBody) {
+  if (body.request_hash !== firstBody.request_hash) {
+    fail(`${stepId} changed request_hash`);
+  }
+  if (body.evidence?.artifact_ref?.key !== firstBody.evidence?.artifact_ref?.key) {
+    fail(`${stepId} returned a second artifact`);
+  }
+  if (JSON.stringify(body.cost ?? null) !== JSON.stringify(firstBody.cost ?? null)) {
+    fail(`${stepId} returned a different RunCostEnvelope`);
+  }
+}
+
+function expectTerminalAttribution(stepId, result, invocationId) {
+  const body = result.body;
+  if (
+    result.status !== 200 ||
+    body.invocation_id !== invocationId ||
+    typeof body.request_hash !== "string" ||
+    !/^sha256:[0-9a-f]{64}$/.test(body.request_hash) ||
+    typeof body.evidence?.artifact_ref?.key !== "string" ||
+    body.evidence.artifact_ref.key.length === 0 ||
+    !isRecord(body.cost) ||
+    !isRecord(body.cost.infrastructure)
+  ) {
+    fail(`${stepId} omitted required terminal invocation attribution`);
   }
 }
 

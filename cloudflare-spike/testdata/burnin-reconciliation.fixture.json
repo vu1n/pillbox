@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "deployment": {
     "worker_name": "pillbox-managed-burnin",
     "container_class": "Sandbox",
@@ -117,47 +117,79 @@
   "capture": {
     "source": "reviewed-fixture",
     "notes": "Replace this deterministic example with the operator-captured counters from the isolated preview before declaring a live burn-in reconciled.",
-    "responses": [
+    "runtime_calls": [
       {
         "step_id": "first-execute",
+        "operation": "execute",
+        "http_status": 200,
         "invocation_id": "burnin-invocation-1",
         "status": "completed",
         "disposition": "created",
         "request_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
         "artifact_key": "executions/burnin-invocation-1.json",
-        "cost_ref": "run-1"
+        "cost_ref": "sha256:4291e793d2c5c33fa79f8f52dde27eeb3ae4f2b24d7f31304b37b173410c5c26"
       },
       {
         "step_id": "exact-retry",
+        "operation": "execute",
+        "http_status": 200,
         "invocation_id": "burnin-invocation-1",
         "status": "completed",
         "disposition": "reused",
         "request_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
         "artifact_key": "executions/burnin-invocation-1.json",
-        "cost_ref": "run-1"
+        "cost_ref": "sha256:4291e793d2c5c33fa79f8f52dde27eeb3ae4f2b24d7f31304b37b173410c5c26"
       },
       {
         "step_id": "status-page-1",
+        "operation": "status",
+        "http_status": 200,
         "invocation_id": "burnin-invocation-1",
         "status": "completed",
         "disposition": "reused",
         "request_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
         "artifact_key": "executions/burnin-invocation-1.json",
-        "cost_ref": "run-1"
+        "cost_ref": "sha256:4291e793d2c5c33fa79f8f52dde27eeb3ae4f2b24d7f31304b37b173410c5c26"
       },
       {
         "step_id": "status-page-2",
+        "operation": "status",
+        "http_status": 200,
         "invocation_id": "burnin-invocation-1",
         "status": "completed",
         "disposition": "reused",
         "request_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
         "artifact_key": "executions/burnin-invocation-1.json",
-        "cost_ref": "run-1"
+        "cost_ref": "sha256:4291e793d2c5c33fa79f8f52dde27eeb3ae4f2b24d7f31304b37b173410c5c26"
       }
     ],
+    "preflight": {
+      "step_id": "unsupported-managed-codex",
+      "operation": "managed_codex_preflight",
+      "schema_version": 1,
+      "agent": "codex",
+      "status": "preflight_rejected",
+      "disposition": "not_sent",
+      "error_code": "unsupported_execution",
+      "exit_code": 2,
+      "observed_output": "pillbox: run failed. unsupported_execution",
+      "observed_output_sha256": "sha256:2532b0e86d0ef9c2a85a9b8d21b956da551642d87095f430d0997a314dbb352d",
+      "counters": {
+        "provision_attempts": 0,
+        "network_requests": 0,
+        "state_entries_created": 0
+      }
+    },
+    "cleanup": {
+      "step_id": "finalize",
+      "operation": "workspace_finalize",
+      "http_status": 200,
+      "session_id": "burnin-session-1",
+      "result_snapshot": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
     "run_cost_envelopes": [
       {
-        "id": "run-1",
+        "id": "sha256:4291e793d2c5c33fa79f8f52dde27eeb3ae4f2b24d7f31304b37b173410c5c26",
         "invocation_id": "burnin-invocation-1",
         "artifact_count": 1,
         "analytics_point_count": 1,

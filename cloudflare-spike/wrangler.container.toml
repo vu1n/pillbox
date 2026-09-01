@@ -22,7 +22,6 @@ dataset = "pillbox_execution_run_costs_preview"
 
 [vars]
 SANDBOX_PROFILE = "standard-2"
-MANAGED_AUTH_REQUIRED = "1"
 
 # The Sandbox SDK's container-owning DO (one container per session, addressed by
 # the execution session id). The Worker calls it through the Sandbox SDK.

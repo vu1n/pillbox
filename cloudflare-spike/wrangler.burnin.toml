@@ -32,7 +32,6 @@ dataset = "pillbox_managed_burnin_costs"
 MANAGED_EXECUTION_ENABLED = "0"
 MANAGED_EXECUTION_EPOCH = "burnin-2026-09-01-v1"
 MANAGED_EXECUTION_LIMIT = "1"
-MANAGED_AUTH_REQUIRED = "1"
 SANDBOX_PROFILE = "standard-2"
 
 # Only the vendor-owned Sandbox class is allowed to own container lifecycle.

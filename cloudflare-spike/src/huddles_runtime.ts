@@ -32,10 +32,6 @@ import {
   type InvokeSessionRequest,
   type InvokeSessionResult,
 } from "./legacy_huddles_adapter.js";
-import {
-  authorizeManagedEnsure,
-  authorizeManagedInvoke,
-} from "./managed_huddles_auth.js";
 import { authorizeExecutionOperation } from "./managed_auth.js";
 import type { PillboxExecutionOperationGrantIssueResponse } from "./managed_contract.js";
 import {
@@ -70,7 +66,7 @@ export type { JsonSchemaOutputFormat, JsonValue } from "./codex_execution.js";
 export { isHuddlesSessionName } from "./huddles_policy.js";
 export { deriveSandboxRuntimeId, sha256Hex } from "./runtime_identity.js";
 
-/** Private same-account RPC surface for Huddles and generic execution callers. */
+/** Private same-account RPC surface for Huddles; execution/2 operation grants are mandatory. */
 export class HuddlesRuntimeEntrypoint extends WorkerEntrypoint<Env> {
   async executeInvocation(
     request: ExecuteInvocationV2Request,
@@ -102,10 +98,15 @@ export class HuddlesRuntimeEntrypoint extends WorkerEntrypoint<Env> {
     ).cancelInvocation(request);
   }
 
+  async fetch(): Promise<Response> {
+    return new Response("not found\n", { status: 404 });
+  }
+}
+
+/** Local-test compatibility only; this class is never exported by the production Worker. */
+export class LocalLegacyRuntimeEntrypoint extends WorkerEntrypoint<Env> {
   async ensureSession(request: EnsureSessionRequest): Promise<EnsureSessionResult> {
-    const validated = validateEnsureSessionRequest(request);
-    const executionRealmId = await authorizeManagedEnsure(this.env, validated);
-    return ensureLegacySession(validated, executionRealmId);
+    return ensureLegacySession(validateEnsureSessionRequest(request));
   }
 
   async invokeSession(request: InvokeSessionRequest): Promise<InvokeSessionResult> {
@@ -113,15 +114,9 @@ export class HuddlesRuntimeEntrypoint extends WorkerEntrypoint<Env> {
     requireManagedAdmission(
       managedAdmissionPolicy(this.env.MANAGED_EXECUTION_ENABLED),
     );
-    const controllerContextHash = await authorizeManagedInvoke(
-      this.env,
-      validated,
-    );
     const service = executionService(this.env);
-    return invokeLegacySession(
-      validated,
-      (execution) => service.executeInvocation(execution),
-      controllerContextHash,
+    return invokeLegacySession(validated, (execution) =>
+      service.executeInvocation(execution),
     );
   }
 

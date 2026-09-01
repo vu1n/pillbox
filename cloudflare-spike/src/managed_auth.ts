@@ -9,32 +9,21 @@ import { makeManagedVerifiedSigner } from "./managed_signer.js";
 import {
   isExecutionOperationGrantCurrent,
   managedCanonicalJson,
-  isManagedGrantCurrent,
   makeExecutionOperationGrantCurrentnessRequest,
-  makeExecutionGrantCurrentnessRequest,
   type PillboxExecutionOperation,
   type PillboxExecutionOperationBinding,
   type PillboxExecutionOperationGrantClaims,
   type PillboxExecutionOperationGrantIssueResponse,
   type PillboxExecutionOperationGrantUseRequest,
-  type PillboxExecutionGrantCurrentnessRequest,
-  type PillboxExecutionGrantBinding,
-  type PillboxExecutionGrantClaims,
   type PillboxVerifiedSigner,
   type SignedPillboxExecutionOperationGrant,
-  type SignedPillboxExecutionGrant,
   validateExecutionOperationBinding,
   validateExecutionOperationGrantClaims,
   validateExecutionOperationGrantIssueResponse,
-  validateExecutionGrantClaims,
-  validateGrantBinding,
-  validateSignedExecutionGrant,
 } from "./managed_contract.js";
 import { sha256Hex } from "./runtime_identity.js";
 
 export interface PillboxAuthorizationCurrentness {
-  /** Currentness v2 is deliberately the same method name: old exact v1 request schemas must reject rather than downgrade. */
-  authorizeExecutionGrant(input: PillboxExecutionGrantCurrentnessRequest): Promise<PillboxExecutionGrantClaims>;
   authorizeExecutionOperationGrant(
     input: PillboxExecutionOperationGrantUseRequest,
   ): Promise<PillboxExecutionOperationGrantClaims>;
@@ -57,40 +46,6 @@ export class ManagedAuthorizationError extends Error {
     super(message, { cause });
     this.name = "ManagedAuthorizationError";
     this.code = code;
-  }
-}
-
-/** Verify the Huddles envelope before the service binding is contacted. */
-export async function verifySignedExecutionGrant(
-  value: unknown,
-  keyId: string | undefined,
-  publicKeyMaterial: string | undefined,
-): Promise<PillboxExecutionGrantClaims> {
-  return (await verifySignedExecutionGrantWithSigner(value, keyId, publicKeyMaterial)).claims;
-}
-
-export async function verifySignedExecutionGrantWithSigner(
-  value: unknown,
-  keyId: string | undefined,
-  publicKeyMaterial: string | undefined,
-): Promise<{ readonly claims: PillboxExecutionGrantClaims; readonly verified_signer: PillboxVerifiedSigner }> {
-  let envelope: SignedPillboxExecutionGrant;
-  try {
-    envelope = validateSignedExecutionGrant(value);
-  } catch (cause) {
-    throw new ManagedAuthorizationError("invalid_grant", "managed execution grant is invalid", cause);
-  }
-  if (!keyId || envelope.key_id !== keyId || !publicKeyMaterial) {
-    throw new ManagedAuthorizationError("invalid_grant", "managed execution grant key is not trusted");
-  }
-  try {
-    const verified = await verifyManagedEd25519Signature({ publicKeyMaterial, signature: envelope.signature, claims: envelope.claims });
-    return {
-      claims: validateExecutionGrantClaims(envelope.claims),
-      verified_signer: makeManagedVerifiedSigner(envelope.key_id, verified.public_key_sha256),
-    };
-  } catch (cause) {
-    throw new ManagedAuthorizationError("invalid_grant", "managed execution grant signature is invalid", cause);
   }
 }
 
@@ -180,7 +135,7 @@ export async function authorizeExecutionOperation(
   if (!currentness) {
     throw new ManagedAuthorizationError(
       "authorization_unavailable",
-      "Pillbox authorization control plane is not configured",
+      "Pillbox authorization currentness service is not configured",
     );
   }
   try {
@@ -218,43 +173,6 @@ export async function executionOperationRequestDigest(
   request: ExecutionOperationRequest,
 ): Promise<`sha256:${string}`> {
   return `sha256:${await sha256Hex(managedCanonicalJson(request))}`;
-}
-
-/** Verify, bind, and re-introspect a grant at every sensitive operation. */
-export async function authorizeExecutionGrant(
-  env: Env,
-  value: unknown,
-  expected: PillboxExecutionGrantBinding,
-): Promise<PillboxExecutionGrantClaims> {
-  const verified = await verifySignedExecutionGrantWithSigner(
-    value,
-    env.PILLBOX_GRANT_KEY_ID,
-    env.PILLBOX_GRANT_PUBLIC_KEY,
-  );
-  const claims = verified.claims;
-  validateDeploymentPins(env, claims);
-  const now = Math.floor(Date.now() / 1000);
-  if (!isManagedGrantCurrent(claims, now)) {
-    throw new ManagedAuthorizationError("grant_expired", "managed execution grant is outside its validity interval");
-  }
-  const mismatch = validateGrantBinding(claims, expected);
-  if (mismatch) throw new ManagedAuthorizationError("grant_binding_mismatch", `managed grant ${mismatch}`);
-  const currentness = env.PillboxAuthorizationCurrentness;
-  if (!currentness) throw new ManagedAuthorizationError("authorization_unavailable", "Pillbox authorization currentness service is not configured");
-  try {
-    const current = await currentness.authorizeExecutionGrant(makeExecutionGrantCurrentnessRequest(claims, expected, verified.verified_signer));
-    const validated = validateExecutionGrantClaims(current);
-    if (managedCanonicalJson(validated) !== managedCanonicalJson(claims)) {
-      throw new ManagedAuthorizationError("grant_revoked", "authorization currentness service returned different grant claims");
-    }
-    if (!isManagedGrantCurrent(validated, Math.floor(Date.now() / 1000))) {
-      throw new ManagedAuthorizationError("grant_expired", "managed execution grant expired during authorization");
-    }
-    return validated;
-  } catch (cause) {
-    if (cause instanceof ManagedAuthorizationError) throw cause;
-    throw new ManagedAuthorizationError("grant_revoked", "managed execution grant is not current", cause);
-  }
 }
 
 function validateDeploymentPins(

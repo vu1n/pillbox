@@ -3,16 +3,10 @@ import { WorkerEntrypoint } from "cloudflare:workers";
 const currentnessCalls: unknown[] = [];
 
 /**
- * Test-only Huddles authority. It accepts only the exact legacy v2 and generic
- * v3 currentness envelopes, so stale or downgraded callers fail closed.
+ * Test-only Huddles authority. It accepts only the exact generic v3
+ * currentness envelope, so stale or downgraded callers fail closed.
  */
 export class PillboxAuthorizationCurrentnessEntrypoint extends WorkerEntrypoint {
-  authorizeExecutionGrant(input: unknown): unknown {
-    assertCurrentnessV2(input);
-    currentnessCalls.push(input);
-    return (input as { grant: unknown }).grant;
-  }
-
   authorizeExecutionOperationGrant(input: unknown): unknown {
     assertCurrentnessV3(input);
     currentnessCalls.push(input);
@@ -79,25 +73,6 @@ export default {
     return new Response("not found\n", { status: 404 });
   },
 };
-
-function assertCurrentnessV2(value: unknown): asserts value is {
-  version: "pillbox.authorization-currentness/2";
-  grant: unknown;
-  verified_signer: {
-    algorithm: "Ed25519";
-    key_id: string;
-    public_key_sha256: string;
-  };
-} {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("currentness request must be an object");
-  }
-  const request = value as Record<string, unknown>;
-  if (request.version !== "pillbox.authorization-currentness/2") {
-    throw new Error("currentness v1 is not accepted by this test authority");
-  }
-  assertVerifiedSigner(request.verified_signer);
-}
 
 function assertVerifiedSigner(signer: unknown): void {
   if (!signer || typeof signer !== "object" || Array.isArray(signer)) {

@@ -15,14 +15,16 @@ single-controller execution service, not a multiplayer gateway.
 There is no Pillbox-authored Durable Object class, Agents SDK, per-event SQLite
 log, WebSocket replay stream, driver lease, or participant roster.
 
-Managed Huddles calls carry signed Ed25519 sidecars: the live compatibility
-ensure/invoke surface uses `huddles.execution-grant/1`, while generic
-execute/status/cancel uses `huddles.execution-operation-grant/2`. Pillbox
-verifies exact request binding and rechecks the separate, authorize-only
+Managed Huddles execute/status/cancel calls carry signed Ed25519
+`huddles.execution-operation-grant/2` sidecars. Pillbox verifies exact request
+binding and rechecks the separate, authorize-only
 `PillboxAuthorizationCurrentness` service before persistence or charged access,
 including exact D1 retries. The signing issuer is not bound to Pillbox.
 Credential bindings fail closed until a bounded, non-Durable-Object broker
 exists.
+
+Historical ensure/invoke compatibility is local-test-only, accepts no managed
+authorization, and is not exported by the production Worker.
 
 Public HTTP routes require short-lived HMAC capabilities bound to one operation
 and exact session/invocation id (`MANAGED_CAPABILITY_SECRET`). Huddles uses the

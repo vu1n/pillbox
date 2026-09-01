@@ -1,10 +1,4 @@
 import type {
-  EnsureSessionRequest,
-  EnsureSessionResult,
-  InvokeSessionRequest,
-  InvokeSessionResult,
-} from "../src/legacy_huddles_adapter.js";
-import type {
   CancelInvocationV2Request,
   ExecuteInvocationV2Request,
   ExecuteInvocationV2Result,
@@ -28,15 +22,13 @@ interface Env {
       request: CancelInvocationV2Request,
       authorization: PillboxExecutionOperationGrantIssueResponse,
     ): Promise<ExecuteInvocationV2Result>;
-    ensureSession(request: EnsureSessionRequest): Promise<EnsureSessionResult>;
-    invokeSession(request: InvokeSessionRequest): Promise<InvokeSessionResult>;
   };
 }
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const path = new URL(request.url).pathname;
-    if (!["/execute", "/status", "/cancel", "/ensure", "/invoke"].includes(path)) {
+    if (!["/execute", "/status", "/cancel"].includes(path)) {
       return new Response("not found\n", { status: 404 });
     }
     try {
@@ -62,14 +54,7 @@ export default {
           input.authorization as PillboxExecutionOperationGrantIssueResponse,
         ));
       }
-      const result =
-        path === "/ensure"
-          ? await env.PillboxRuntime.ensureSession(input as unknown as EnsureSessionRequest)
-          : await env.PillboxRuntime.invokeSession(input as unknown as InvokeSessionRequest);
-      if ("code" in result) {
-        return Response.json({ error: result }, { status: 409 });
-      }
-      return Response.json(result);
+      return new Response("not found\n", { status: 404 });
     } catch (error) {
       const detail = error as { code?: string; message?: string; name?: string };
       return Response.json(

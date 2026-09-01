@@ -6,14 +6,9 @@ import {
   type JsonSchemaOutputFormat,
   type JsonValue,
 } from "./codex_execution.js";
-import {
-  validateManagedRequestBinding,
-  validateSignedExecutionGrant,
-  type PillboxManagedAuthorization,
-} from "./managed_contract.js";
 import { sha256Hex } from "./runtime_identity.js";
 
-/** Compatibility contract for Huddles callers that predate pillbox.execution/2. */
+/** Explicitly local compatibility contract for callers that predate pillbox.execution/2. */
 export interface CanonicalSessionRequest {
   readonly requested_model?: string;
   readonly execution?: JsonValue;
@@ -24,7 +19,6 @@ export interface EnsureSessionRequest {
   readonly workspace_id: string;
   readonly effect_id: string;
   readonly canonical_request: CanonicalSessionRequest;
-  readonly managed_authorization?: PillboxManagedAuthorization;
 }
 
 export interface SessionRef {
@@ -76,7 +70,6 @@ export interface InvokeSessionRequest {
   readonly execution?: JsonValue;
   readonly execution_policy_revision?: string;
   readonly output_format: JsonSchemaOutputFormat;
-  readonly managed_authorization?: PillboxManagedAuthorization;
 }
 
 export type InvokeSessionResult =
@@ -128,6 +121,7 @@ export function validateEnsureSessionRequest(value: unknown): EnsureSessionReque
   if (!isJsonObject(value)) {
     throw new EnsureSessionRequestError("ensure request must be an object");
   }
+  rejectManagedAuthorization(value);
   const workspaceId = requireIdentifier(value.workspace_id, "workspace_id");
   const effectId = requireIdentifier(value.effect_id, "effect_id");
   if (!isJsonObject(value.canonical_request)) {
@@ -137,9 +131,6 @@ export function validateEnsureSessionRequest(value: unknown): EnsureSessionReque
     workspace_id: workspaceId,
     effect_id: effectId,
     canonical_request: validateCanonicalRequest(value.canonical_request),
-    ...(value.managed_authorization === undefined
-      ? {}
-      : { managed_authorization: validateManagedAuthorization(value.managed_authorization) }),
   };
 }
 
@@ -153,20 +144,11 @@ export async function deriveExecutionSessionName(
 /** Stateless compatibility projection; generic execution owns idempotency. */
 export async function ensureLegacySession(
   value: unknown,
-  executionRealmId?: string,
 ): Promise<EnsureSessionResult> {
   const request = validateEnsureSessionRequest(value);
   return {
     session_ref: {
       session_id: await deriveExecutionSessionName(request.workspace_id, request.effect_id),
-      ...(executionRealmId === undefined
-        ? {}
-        : {
-            realm: {
-              runtime: "pillbox" as const,
-              execution_realm_id: executionRealmId,
-            },
-          }),
     },
     disposition: "reused",
     attribution: {
@@ -180,7 +162,6 @@ export async function ensureLegacySession(
 export async function invokeLegacySession(
   value: unknown,
   execute: (request: ExecuteInvocationV2Request) => Promise<ExecuteInvocationV2Result>,
-  controllerContextHash?: `sha256:${string}`,
 ): Promise<InvokeSessionResult> {
   const request = await validateInvokeSessionRequest(value);
   const expectedSessionId = await deriveExecutionSessionName(
@@ -191,7 +172,7 @@ export async function invokeLegacySession(
     throw new Error("invoke request does not match its deterministic session");
   }
   const result = await execute(
-    legacyExecutionRequest(request, controllerContextHash),
+    legacyExecutionRequest(request),
   );
   if (result.status === "conflict") {
     return {
@@ -233,7 +214,6 @@ export async function invokeLegacySession(
 
 export function legacyExecutionRequest(
   request: InvokeSessionRequest,
-  controllerContextHash?: `sha256:${string}`,
 ): ExecuteInvocationV2Request {
   return {
     contract_version: "pillbox.execution/2",
@@ -246,12 +226,9 @@ export function legacyExecutionRequest(
     execution:
       request.execution === undefined
         ? legacyExecution(request.requested_model)
-        : managedExecution(request.execution),
+        : compatibilityExecution(request.execution),
     execution_policy_revision:
       request.execution_policy_revision ?? "huddles-compat/1",
-    ...(controllerContextHash === undefined
-      ? {}
-      : { controller_context_hash: controllerContextHash }),
     output_format: request.output_format,
   };
 }
@@ -262,6 +239,7 @@ export async function validateInvokeSessionRequest(
   if (!isJsonObject(value)) {
     throw new EnsureSessionRequestError("invoke request must be an object");
   }
+  rejectManagedAuthorization(value);
   const workspaceId = requireIdentifier(value.workspace_id, "workspace_id");
   const effectId = requireIdentifier(value.effect_id, "effect_id");
   const invocationId = requireIdentifier(value.invocation_id, "invocation_id");
@@ -307,25 +285,6 @@ export async function validateInvokeSessionRequest(
     value.execution_policy_revision,
     "execution_policy_revision",
   );
-  const managedAuthorization =
-    value.managed_authorization === undefined
-      ? undefined
-      : validateManagedAuthorization(value.managed_authorization);
-  if (managedAuthorization !== undefined) {
-    const missing = [
-      ["activity_principal_id", activityPrincipalId],
-      ["policy_id", policyId],
-      ["run_id", runId],
-      ["packet_id", packetId],
-      ["execution_policy_revision", executionPolicyRevision],
-      ["execution", value.execution],
-    ].find(([, fieldValue]) => fieldValue === undefined)?.[0];
-    if (missing !== undefined) {
-      throw new EnsureSessionRequestError(
-        `managed invoke request requires ${missing}`,
-      );
-    }
-  }
   return {
     workspace_id: workspaceId,
     effect_id: effectId,
@@ -346,9 +305,6 @@ export async function validateInvokeSessionRequest(
       ? {}
       : { execution_policy_revision: executionPolicyRevision }),
     output_format: outputFormat,
-    ...(managedAuthorization === undefined
-      ? {}
-      : { managed_authorization: managedAuthorization }),
   };
 }
 
@@ -369,8 +325,8 @@ function legacyExecution(requestedModel: string): InvocationExecution {
   };
 }
 
-/** Convert the signed Huddles execution identity into the generic runtime shape. */
-function managedExecution(value: JsonValue): InvocationExecution {
+/** Convert a local compatibility execution descriptor into the generic runtime shape. */
+function compatibilityExecution(value: JsonValue): InvocationExecution {
   if (!isJsonObject(value) || !isJsonObject(value.requested) || !isJsonObject(value.transport)) {
     throw new EnsureSessionRequestError(
       "execution must contain requested and transport objects",
@@ -462,24 +418,10 @@ function legacyError(
   };
 }
 
-function validateManagedAuthorization(value: unknown): PillboxManagedAuthorization {
-  if (
-    !isJsonObject(value) ||
-    !isJsonObject(value.grant) ||
-    !isJsonObject(value.request_binding)
-  ) {
+function rejectManagedAuthorization(value: Record<string, JsonValue>): void {
+  if (Object.hasOwn(value, "managed_authorization")) {
     throw new EnsureSessionRequestError(
-      "managed_authorization.grant and request_binding are required objects",
-    );
-  }
-  try {
-    return {
-      grant: validateSignedExecutionGrant(value.grant),
-      request_binding: validateManagedRequestBinding(value.request_binding),
-    };
-  } catch (cause) {
-    throw new EnsureSessionRequestError(
-      `managed_authorization is invalid: ${cause instanceof Error ? cause.message : "invalid contract"}`,
+      "local legacy requests do not accept managed_authorization",
     );
   }
 }

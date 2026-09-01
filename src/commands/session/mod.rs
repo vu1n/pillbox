@@ -24,9 +24,9 @@ mod stream;
 /// the log fresh (and skip their own drain — the single-producer invariant).
 pub(crate) const TAILER_PID_FILE: &str = ".tailer.pid";
 
-/// The detached §0 PRODUCER for a reparented server session (the libkrun analog of
+/// The detached §0 PRODUCER for a reparented session (the libkrun analog of
 /// docker's always-on transcript tailer). Re-exec'd as a bare subprocess at
-/// bring-up (`pillbox __session-tailer <dir> <capture> <format> <sid>`), it tails
+/// bring-up (`pillbox __session-tailer <dir> <capture> <source> <sid>`), it tails
 /// the guest's persistent capture file → maps → appends to the durable log
 /// FOREVER (until SIGTERM on teardown). This keeps the log continuously live for a
 /// reparented agent the CLI doesn't supervise, so EVERY consumer — `list`/
@@ -36,7 +36,7 @@ pub(crate) const TAILER_PID_FILE: &str = ".tailer.pid";
 pub(crate) fn run_detached_tailer(
     session_dir: std::path::PathBuf,
     capture: std::path::PathBuf,
-    format: events::EventsFormat,
+    source: crate::agents::DetachedTranscriptSource,
     sid: String,
 ) -> Result<()> {
     use std::sync::atomic::AtomicBool;
@@ -48,24 +48,32 @@ pub(crate) fn run_detached_tailer(
         std::process::id().to_string(),
     );
     let mut log = events::log::SessionLog::open_at(session_dir)?;
-    // A directory capture is the cloned home of a detached Codex PTY session.
-    // Its rollout path does not exist until Codex starts, so use the transcript
-    // discovery tailer and keep this re-exec alive as the session's sole
-    // producer. The clone is fresh (the launch path removes prior rollouts),
-    // therefore discovery can select only this session's newly-created file.
-    if capture.is_dir() {
-        let _tailer = events::transcripts::spawn_attach_tailer(log, &capture, "codex", "", &sid)
-            .ok_or_else(|| anyhow::anyhow!("Codex transcript tailer is unavailable"))?;
-        loop {
-            std::thread::park();
+    match source {
+        crate::agents::DetachedTranscriptSource::Discover(harness) => {
+            // The rollout path does not exist until the PTY agent starts. The
+            // typed source explicitly selects discovery; the capture path's
+            // current filesystem type carries no orchestration semantics.
+            let _tailer = events::transcripts::spawn_attach_tailer(
+                log,
+                &capture,
+                harness.agent_id(),
+                "",
+                &sid,
+            )
+            .ok_or_else(|| anyhow::anyhow!("detached transcript tailer is unavailable"))?;
+            loop {
+                std::thread::park();
+            }
+        }
+        crate::agents::DetachedTranscriptSource::ServerCapture(format) => {
+            // `stop` is never set in-process — the producer runs until the
+            // process is SIGTERM'd by `kill_session`. FollowReader blocks
+            // waiting for appends and resumes when the agent writes.
+            let stop = Arc::new(AtomicBool::new(false));
+            let reader = events::opencode::FollowReader::new(capture, Arc::clone(&stop));
+            events::drain_server_capture(format, reader, &sid, &mut log, &stop)?;
         }
     }
-    // `stop` is never set in-process — the producer runs until the process is
-    // SIGTERM'd by `kill_session`. FollowReader blocks waiting for appends, so
-    // the drain naturally idles when the agent is quiet and resumes on activity.
-    let stop = Arc::new(AtomicBool::new(false));
-    let reader = events::opencode::FollowReader::new(capture, Arc::clone(&stop));
-    events::drain_server_capture(format, reader, &sid, &mut log, &stop)?;
     Ok(())
 }
 

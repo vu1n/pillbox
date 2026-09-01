@@ -33,7 +33,7 @@ async function callPrivate(worker, path, input) {
   return body;
 }
 
-test("legacy Huddles RPC is a stateless adapter over bounded execution", async () => {
+test("local-only legacy RPC is a stateless adapter over bounded execution", async () => {
   const persistence = await mkdtemp(join(tmpdir(), "pillbox-execution-adapter-"));
   let target;
   let caller;
@@ -77,13 +77,13 @@ test("legacy Huddles RPC is a stateless adapter over bounded execution", async (
       ],
       { env: { ...process.env, WRANGLER_LOG_PATH: join(persistence, "wrangler.log") } },
     );
-    target = await unstable_dev("src/worker.ts", {
+    target = await unstable_dev("test/local_legacy_worker.ts", {
       ...workerOptions,
       config: "wrangler.runtime-test.toml",
       persistTo: persistence,
     });
     await target.fetch("http://pillbox.test/health");
-    caller = await unstable_dev("test/ensure_worker.ts", {
+    caller = await unstable_dev("test/local_legacy_worker.ts", {
       ...workerOptions,
       config: "wrangler.ensure-test.toml",
       persist: false,
@@ -94,6 +94,13 @@ test("legacy Huddles RPC is a stateless adapter over bounded execution", async (
       harness: "opencode",
       nested: { z: 1, a: 2 },
     };
+    await assert.rejects(
+      callPrivate(caller, "/ensure", {
+        ...ensureRequest(canonical),
+        managed_authorization: {},
+      }),
+      /local legacy requests do not accept managed_authorization/,
+    );
     const ensured = await Promise.all(
       Array.from({ length: 16 }, () =>
         callPrivate(caller, "/ensure", ensureRequest(canonical)),
@@ -162,6 +169,13 @@ test("legacy Huddles RPC is a stateless adapter over bounded execution", async (
     await assert.rejects(
       callPrivate(caller, "/invoke", {
         ...invoke,
+        managed_authorization: {},
+      }),
+      /local legacy requests do not accept managed_authorization/,
+    );
+    await assert.rejects(
+      callPrivate(caller, "/invoke", {
+        ...invoke,
         delivery_receipt_id: "changed-delivery",
       }),
       (error) => error?.code === "invoke_session_conflict",
@@ -178,20 +192,24 @@ test("legacy Huddles RPC is a stateless adapter over bounded execution", async (
         }),
       },
     );
-    assert.equal(unauthenticated.status, 401);
+    assert.equal(
+      unauthenticated.status,
+      404,
+      "the local compatibility Worker exposes no public execution route",
+    );
 
     await caller.stop();
     await target.stop();
     caller = undefined;
     target = undefined;
 
-    restartedTarget = await unstable_dev("src/worker.ts", {
+    restartedTarget = await unstable_dev("test/local_legacy_worker.ts", {
       ...workerOptions,
       config: "wrangler.runtime-test.toml",
       persistTo: persistence,
     });
     await restartedTarget.fetch("http://pillbox.test/health");
-    restartedCaller = await unstable_dev("test/ensure_worker.ts", {
+    restartedCaller = await unstable_dev("test/local_legacy_worker.ts", {
       ...workerOptions,
       config: "wrangler.ensure-test.toml",
       persist: false,

@@ -85,8 +85,9 @@ participant identity.
 - Request bodies are capped at 1 MiB, OpenCode control responses and SSE frames
   are capped before parsing, evidence is capped at 2,000 events / 8 MiB, and
   responses, costs, and cursors are bounded and identity-checked by the CLI.
-- The legacy Huddles `ensureSession`/`invokeSession` RPC methods are stateless
-  compatibility adapters over the generic execution service.
+- Historical `ensureSession`/`invokeSession` adapters are local-test-only and
+  accept no managed authorization. The production Huddles entrypoint exposes
+  only authenticated v2 execute/status/cancel operations.
 
 ## Cloudflare Computer
 

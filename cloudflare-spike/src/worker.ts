@@ -18,8 +18,8 @@ import {
   managedAdmissionPolicy,
   requireManagedAdmission,
 } from "./managed_admission.js";
-// Named entrypoint: Huddles reaches ensureSession through a same-account
-// service-binding RPC. The default fetch handler below never routes that method.
+// Named entrypoint: Huddles reaches only authenticated execution/2 lifecycle
+// methods through a same-account service binding.
 export { HuddlesRuntimeEntrypoint };
 // Re-export the SDK's container-owning DO so wrangler can bind it.
 export { Sandbox } from "@cloudflare/sandbox";
@@ -44,7 +44,6 @@ export interface Env {
   PILLBOX_EXECUTION_REALM_ID?: string;
   PILLBOX_PROTOCOL_REVISION?: string;
   PILLBOX_ORGANIZATION_ID?: string;
-  MANAGED_AUTH_REQUIRED?: string;
   /** Exact "1" admits new managed executions and workspace provisioning. */
   MANAGED_EXECUTION_ENABLED?: string;
   /** Operator-reviewed epoch and hard cap for genuinely new managed claims. */

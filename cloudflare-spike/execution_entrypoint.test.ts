@@ -26,6 +26,32 @@ test("private entrypoint exposes generic execution lifecycle methods", async () 
   assert.match(source, /async executeInvocation\(/);
   assert.match(source, /async getExecutionStatus\(/);
   assert.match(source, /async cancelInvocation\(/);
+  assert.match(
+    source,
+    /admission: managedAdmissionPolicy\(env\.MANAGED_EXECUTION_ENABLED\)/,
+  );
+});
+
+test("new public provisioning and private legacy invocation share the admission guard", async () => {
+  const worker = await readFile(new URL("./src/worker.ts", import.meta.url), "utf8");
+  const runtime = await readFile(
+    new URL("./src/huddles_runtime.ts", import.meta.url),
+    "utf8",
+  );
+
+  const provisionGuard = worker.indexOf(
+    'new URL(req.url).pathname === "/v2/workspaces/provision"',
+  );
+  assert.ok(provisionGuard >= 0);
+  assert.ok(worker.indexOf("requireManagedAdmission", provisionGuard) >= provisionGuard);
+  assert.ok(
+    worker.indexOf("routeWorkspaceTransfer(req, env)", provisionGuard) > provisionGuard,
+  );
+
+  const invoke = runtime.indexOf("async invokeSession(");
+  const admission = runtime.indexOf("requireManagedAdmission", invoke);
+  const authorization = runtime.indexOf("authorizeManagedInvoke", invoke);
+  assert.ok(invoke >= 0 && admission > invoke && authorization > admission);
 });
 
 test("legacy Huddles invocation translates only execution-owned fields", async () => {

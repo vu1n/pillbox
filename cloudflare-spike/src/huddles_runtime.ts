@@ -38,6 +38,10 @@ import {
   RunCostMeter,
   WorkersAnalyticsEngineRunCost,
 } from "./run_cost.js";
+import {
+  managedAdmissionPolicy,
+  requireManagedAdmission,
+} from "./managed_admission.js";
 import { deriveSandboxRuntimeId } from "./runtime_identity.js";
 
 export {
@@ -84,6 +88,9 @@ export class HuddlesRuntimeEntrypoint extends WorkerEntrypoint<Env> {
 
   async invokeSession(request: InvokeSessionRequest): Promise<InvokeSessionResult> {
     const validated = await validateInvokeSessionRequest(request);
+    requireManagedAdmission(
+      managedAdmissionPolicy(this.env.MANAGED_EXECUTION_ENABLED),
+    );
     const controllerContextHash = await authorizeManagedInvoke(
       this.env,
       validated,
@@ -129,6 +136,7 @@ export function executionService(env: Env): ExecutionService {
         ? undefined
         : new WorkersAnalyticsEngineRunCost(env.RUN_COSTS),
     sandboxProfile: env.SANDBOX_PROFILE,
+    admission: managedAdmissionPolicy(env.MANAGED_EXECUTION_ENABLED),
   });
 }
 

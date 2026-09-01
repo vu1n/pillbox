@@ -30,6 +30,7 @@ import {
   RunCostMeter,
   type RunCostAnalyticsPoint,
 } from "./src/run_cost.ts";
+import { managedAdmissionPolicy } from "./src/managed_admission.ts";
 
 registerHooks({
   resolve(specifier, context, nextResolve) {
@@ -119,6 +120,7 @@ test("created execution persists terminal evidence and exact retry does not resa
   assert.equal(created.disposition, "created");
   assert.equal(created.attribution.harness, "opencode");
   assert.equal(created.evidence.events.length, 3);
+  assert.deepEqual(created.session_ref.seq_range, [0, 2]);
   assert.ok(created.evidence.artifact_ref);
   assert.equal(created.cost?.model.provider_reported_cost_usd, 0.001);
   assert.equal(created.cost?.infrastructure.analytics_points_written, 1);
@@ -153,6 +155,41 @@ test("tool-enabled managed execution fails closed before runtime access", async 
   assert.equal(runtime.executions, 0);
 });
 
+test("disabled managed execution returns a typed failure before charged access", async () => {
+  const never = (): never => {
+    throw new Error("disabled admission crossed into a charged dependency");
+  };
+  const service = new ExecutionService(
+    {
+      claim: async () => never(),
+      get: async () => never(),
+      finish: async () => never(),
+    },
+    {
+      write: async () => never(),
+      read: async () => never(),
+    },
+    {
+      execute: async () => never(),
+      cancel: async () => never(),
+    },
+    {
+      now: never,
+      ownerToken: never,
+      analytics: { emit: async () => never() },
+      admission: managedAdmissionPolicy(undefined),
+    },
+  );
+
+  const result = await service.executeInvocation(await request());
+  assert.equal(result.status, "failed");
+  if (result.status === "failed") {
+    assert.equal(result.error.code, "managed_disabled");
+  }
+  assert.equal(result.session_ref.seq_range, undefined);
+  assert.deepEqual(result.evidence.events, []);
+});
+
 test("changed content conflicts without crossing into the runtime", async () => {
   const runtime = new FakeRuntime({
     served_model: null,
@@ -173,6 +210,7 @@ test("changed content conflicts without crossing into the runtime", async () => 
   if (conflict.status === "conflict") {
     assert.equal(conflict.error.code, "idempotency_conflict");
   }
+  assert.equal(conflict.session_ref.seq_range, undefined);
   assert.equal(runtime.executions, 1);
 });
 
@@ -192,6 +230,7 @@ test("concurrent exact retry observes running and never samples twice", async ()
   const retry = await service.executeInvocation(input);
   assert.equal(retry.status, "running");
   assert.equal(retry.disposition, "reused");
+  assert.equal(retry.session_ref.seq_range, undefined);
   assert.equal(runtime.executions, 1);
 
   pending.resolve({ served_model: null, output: { text: "done" }, evidence: [] });
@@ -210,6 +249,7 @@ test("expired running claims become interrupted instead of resampling", async ()
   const service = new ExecutionService(store, new MemoryArtifacts(), runtime, {
     now: () => EXECUTION_OWNER_LEASE_MS + 1,
     ownerToken: () => "unused-owner",
+    admission: managedAdmissionPolicy("1"),
   });
 
   const result = await service.executeInvocation(input);
@@ -230,7 +270,11 @@ test("an immutable terminal artifact repairs a lost D1 terminal write", async ()
       output: { text: "done" },
       evidence: [],
     }),
-    { now: () => now, ownerToken: () => "owner-1" },
+    {
+      now: () => now,
+      ownerToken: () => "owner-1",
+      admission: managedAdmissionPolicy("1"),
+    },
   );
 
   const first = await service.executeInvocation(await request());
@@ -278,6 +322,7 @@ test("status evidence reads are paginated and bounded", async () => {
     evidence_limit: 1,
   });
   assert.deepEqual(page.evidence.events, [{ n: 1 }]);
+  assert.deepEqual(page.session_ref.seq_range, [0, 2]);
   assert.equal(page.evidence.next, 2);
   assert.equal(page.evidence.truncated, true);
 });
@@ -309,6 +354,66 @@ test("cancellation terminalizes once and exact retries read the same result", as
   assert.equal(runtime.cancellations, 1);
 });
 
+test("disabled admission still permits status, cancellation, and terminal drain", async () => {
+  const input = await request();
+  const store = new MemoryStore();
+  await seedRunning(store, input, 1_000);
+  const runtime = new FakeRuntime({
+    served_model: null,
+    output: { text: "must not run" },
+    evidence: [],
+  });
+  const service = new ExecutionService(store, new MemoryArtifacts(), runtime, {
+    now: () => 1_000,
+    ownerToken: () => "unused-owner",
+    admission: managedAdmissionPolicy(undefined),
+  });
+
+  const running = await service.getExecutionStatus({
+    contract_version: "pillbox.execution/2",
+    invocation_id: input.invocation_id,
+    evidence_after: 0,
+    evidence_limit: 100,
+  });
+  assert.equal(running.status, "running");
+
+  const cancelled = await service.cancelInvocation({
+    contract_version: "pillbox.execution/2",
+    invocation_id: input.invocation_id,
+    idempotency_key: "cancel-disabled-1",
+    reason: "cost circuit breaker",
+  });
+  assert.equal(cancelled.status, "cancelled");
+  assert.equal(cancelled.session_ref.seq_range, undefined);
+  assert.equal(runtime.cancellations, 1);
+
+  const terminal = await service.getExecutionStatus({
+    contract_version: "pillbox.execution/2",
+    invocation_id: input.invocation_id,
+    evidence_after: 0,
+    evidence_limit: 100,
+  });
+  assert.equal(terminal.status, "cancelled");
+  assert.equal(terminal.session_ref.seq_range, undefined);
+});
+
+test("one evidence event produces one inclusive managed position", async () => {
+  const service = new ExecutionService(
+    new MemoryStore(),
+    new MemoryArtifacts(),
+    new FakeRuntime({
+      served_model: null,
+      output: { text: "done" },
+      evidence: [{ type: "message_delta", text: "done" }],
+    }),
+    fixedOptions(),
+  );
+
+  const result = await service.executeInvocation(await request());
+  assert.equal(result.status, "completed");
+  assert.deepEqual(result.session_ref.seq_range, [0, 0]);
+});
+
 async function seedRunning(
   store: MemoryStore,
   input: ExecuteInvocationV2Request,
@@ -337,7 +442,11 @@ async function seedRunning(
 }
 
 function fixedOptions() {
-  return { now: () => 1_000, ownerToken: () => "owner-1" };
+  return {
+    now: () => 1_000,
+    ownerToken: () => "owner-1",
+    admission: managedAdmissionPolicy("1"),
+  };
 }
 
 class FakeRuntime implements ExecutionRuntime {

@@ -81,6 +81,7 @@ export interface ExecuteInvocationV2Request {
 
 export type ExecuteInvocationV2ErrorCode =
   | "idempotency_conflict"
+  | "managed_disabled"
   | "unsupported_execution"
   | "unsupported_policy"
   | "auth_unavailable"
@@ -136,6 +137,7 @@ interface ExecuteInvocationV2ResultBase {
   readonly execution_policy_revision: string;
   readonly session_ref: {
     readonly session_id: string;
+    /** Inclusive positions in the bounded managed evidence artifact. */
     readonly seq_range?: readonly [number, number];
   };
   readonly attribution: ExecutionAttribution;

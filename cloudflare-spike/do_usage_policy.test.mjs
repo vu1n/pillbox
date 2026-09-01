@@ -57,9 +57,10 @@ test("execution persistence is bounded and local logs cannot route to a DO", () 
 
 test("workspace finalize quiesces prompt-controlled processes before credentials enter", () => {
   const source = read("./src/workspace_transfer.ts");
-  const kill = source.indexOf("await sandbox.killAllProcesses()");
-  const transfer = source.indexOf("await execWorkspaceTool(");
-  assert.ok(kill >= 0 && transfer > kill);
+  const claim = source.indexOf("await input.store.claim(");
+  const kill = source.indexOf("await input.sandbox.killAllProcesses()");
+  const transfer = source.indexOf("await execWorkspaceTool(", kill);
+  assert.ok(claim >= 0 && kill > claim && transfer > kill);
   assert.match(source, /r2\\\.cloudflarestorage\\\.com/);
   assert.match(source, /verifyManagedCapability/);
   assert.match(source, /workspace\.snapshot/);

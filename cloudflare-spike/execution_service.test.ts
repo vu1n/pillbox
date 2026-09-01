@@ -787,6 +787,10 @@ class MemoryStore implements ExecutionStore {
     return this.rows.get(invocation_id) ?? null;
   }
 
+  async getAllowance(_allowance: ManagedExecutionAllowance) {
+    return null;
+  }
+
   async finish(input: FinishExecutionInput): Promise<boolean> {
     this.onFinish();
     if (this.finishFailures > 0) {

@@ -82,11 +82,26 @@ printf '%s\\n' '{"schema_version":1,"agent":"codex","status":"preflight_rejected
   );
 
   const requests = [];
+  const requestBodies = [];
+  let finalizeEffects = 0;
   const server = createServer(async (request, response) => {
     requests.push(request.url);
-    assert.equal(request.url, "/v2/workspaces/finalize");
+    requestBodies.push(await requestText(request));
+    assert.equal(request.headers.authorization, "Bearer finalize-token");
+    if (request.url === "/v2/workspaces/finalize") {
+      finalizeEffects += 1;
+      request.socket.destroy();
+      return;
+    }
+    assert.equal(request.url, "/v2/workspaces/finalize/status");
     response.setHeader("content-type", "application/json");
-    response.end(JSON.stringify({ resultSnapshot: "c".repeat(64) }));
+    response.end(JSON.stringify({
+      status: "completed",
+      disposition: "reused",
+      finalizeId: `sha256:${"d".repeat(64)}`,
+      requestDigest: `sha256:${"e".repeat(64)}`,
+      resultSnapshot: "c".repeat(64),
+    }));
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   t.after(() => new Promise((resolve) => server.close(resolve)));
@@ -101,7 +116,11 @@ printf '%s\\n' '{"schema_version":1,"agent":"codex","status":"preflight_rejected
   const completed = JSON.parse(await readFile(reportPath, "utf8"));
   assert.equal(completed.capture.cleanup.step_id, "finalize");
   assert.equal(completed.capture.cleanup.session_id, completed.capture.execution_identity.session_id);
-  assert.equal(requests.length, 1);
+  assert.equal(completed.capture.cleanup.request_count, 2);
+  assert.equal(completed.capture.cleanup.disposition, "reused");
+  assert.deepEqual(requests, ["/v2/workspaces/finalize", "/v2/workspaces/finalize/status"]);
+  assert.equal(requestBodies[0], requestBodies[1]);
+  assert.equal(finalizeEffects, 1);
   assert.deepEqual(completed.capture.runtime_calls, report.capture.runtime_calls);
   assert.deepEqual(completed.capture.run_cost_envelopes[0].execution_identity, completed.capture.execution_identity);
 
@@ -112,16 +131,26 @@ printf '%s\\n' '{"schema_version":1,"agent":"codex","status":"preflight_rejected
   });
   assert.equal(duplicateFinalize.code, 1);
   assert.match(duplicateFinalize.stderr, /cleanup still pending/);
-  assert.equal(requests.length, 1, "cleanup may attach only once and never predate execution");
+  assert.equal(requests.length, 2, "cleanup may attach only once and never predate execution");
 
   completed.capture.run_cost_envelopes[0].observed = reviewedManifest.capture.run_cost_envelopes[0].observed;
   completed.capture.read_only = reviewedManifest.capture.read_only;
   completed.capture.totals = reviewedManifest.capture.totals;
+  completed.capture.read_only.worker.requests += 1;
+  completed.capture.totals.worker.requests += 1;
+  completed.capture.read_only.d1.rows_read += 1;
+  completed.capture.totals.d1.rows_read += 1;
   await writeFile(reportPath, JSON.stringify(completed));
   const reconciliation = await run(process.execPath, [reconciler.pathname, reportPath]);
   assert.equal(reconciliation.code, 0, reconciliation.stderr);
   assert.match(reconciliation.stdout, /managed preview burn-in reconciliation passed/);
 });
+
+async function requestText(request) {
+  const chunks = [];
+  for await (const chunk of request) chunks.push(chunk);
+  return Buffer.concat(chunks).toString("utf8");
+}
 
 async function fileExists(path) {
   try {

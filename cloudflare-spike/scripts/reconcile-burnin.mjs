@@ -4,10 +4,7 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
-const DEFAULT_FIXTURE = new URL(
-  "../testdata/burnin-reconciliation.fixture.json",
-  import.meta.url,
-);
+const DEFAULT_FIXTURE = new URL("../testdata/burnin-reconciliation.fixture.json", import.meta.url);
 const MAX_STATUS_PAGE_SIZE = 100;
 const REPORT_SCHEMA_VERSION = 3;
 const EXPECTED_WORKLOAD = new Map([
@@ -18,16 +15,10 @@ const EXPECTED_WORKLOAD = new Map([
   ["unsupported-managed-codex", "managed_codex_preflight"],
   ["finalize", "workspace_finalize"],
 ]);
-const TERMINAL_STATUSES = new Set([
-  "completed",
-  "failed",
-  "cancelled",
-  "interrupted",
-]);
+const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled", "interrupted"]);
+const partial = process.argv.includes("--partial");
 
-const fixturePath = process.argv[2] === undefined
-  ? DEFAULT_FIXTURE
-  : resolve(process.cwd(), process.argv[2]);
+const fixturePath = process.argv[2] === undefined ? DEFAULT_FIXTURE : resolve(process.cwd(), process.argv[2]);
 
 let fixture;
 try {
@@ -63,22 +54,12 @@ check(root.schema_version === REPORT_SCHEMA_VERSION, `fixture.schema_version mus
 const deployment = record(root.deployment, "fixture.deployment");
 const workload = record(root.workload, "fixture.workload");
 const capture = record(root.capture, "fixture.capture");
-allowedKeys(capture, [
-  "source",
-  "notes",
-  "execution_identity",
-  "runtime_calls",
-  "preflight",
-  "cleanup",
-  "run_cost_envelopes",
-  "read_only",
-  "totals",
-  "operator_capture_required",
-], "fixture.capture");
+allowedKeys(capture, ["source", "notes", "execution_identity", "runtime_calls", "preflight", "cleanup", "run_cost_envelopes", "read_only", "totals", "operator_capture_required"], "fixture.capture");
 for (const key of ["source", "execution_identity", "runtime_calls", "preflight", "cleanup", "run_cost_envelopes", "read_only", "totals"]) {
   check(Object.hasOwn(capture, key), `fixture.capture.${key} is required by the burn-in report contract`);
 }
 string(capture.source, "fixture.capture.source");
+check(capture.source === "huddles-managed-burnin", "capture.source must identify Huddles as the sole runtime recorder");
 
 const workerName = string(deployment.worker_name, "deployment.worker_name");
 check(workerName === "pillbox-managed-burnin", "deployment.worker_name must identify the isolated burn-in Worker");
@@ -111,10 +92,7 @@ check(stepById.size === EXPECTED_WORKLOAD.size, "workload must contain exactly t
 const runtimeSteps = steps.filter((step) => step?.operation === "execute" || step?.operation === "status");
 const preflightSteps = steps.filter((step) => step?.operation === "managed_codex_preflight");
 const cleanupSteps = steps.filter((step) => step?.operation === "workspace_finalize");
-check(
-  runtimeSteps.length + preflightSteps.length + cleanupSteps.length === steps.length,
-  "workload contains an operation outside the checked burn-in report contract",
-);
+check(runtimeSteps.length + preflightSteps.length + cleanupSteps.length === steps.length, "workload contains an operation outside the checked burn-in report contract");
 
 const first = stepById.get("first-execute");
 const retry = stepById.get("exact-retry");
@@ -145,10 +123,7 @@ check(finalize?.expected?.requests === 1, "finalize must make exactly one cleanu
 check(finalize?.expected?.result_snapshot_required === true, "finalize must require a result snapshot");
 
 const expectedNetworkRequests = integer(workload.expected_network_requests, "workload.expected_network_requests");
-check(
-  expectedNetworkRequests === runtimeSteps.length + cleanupSteps.length,
-  "workload network request count has an unexplained operation",
-);
+check(expectedNetworkRequests === runtimeSteps.length + cleanupSteps.length, "workload network request count has an unexplained operation");
 
 let derivedIdentity = {};
 if (isRecord(first?.request)) {
@@ -166,27 +141,12 @@ const capturedIdentity = executionIdentity(capture.execution_identity, "capture.
 check(canonicalJson(capturedIdentity) === canonicalJson(derivedIdentity), "capture.execution_identity does not match the canonical first-execute request");
 const expectedArtifactKey = `executions/${createHash("sha256").update(capturedIdentity.invocation_id).digest("hex")}/${capturedIdentity.request_hash.slice("sha256:".length)}.json`;
 
-const runtimeCalls = array(capture.runtime_calls, "capture.runtime_calls").map((value, index) =>
-  record(value, `capture.runtime_calls[${index}]`)
-);
+const runtimeCalls = array(capture.runtime_calls, "capture.runtime_calls").map((value, index) => record(value, `capture.runtime_calls[${index}]`));
 const runtimeCallByStep = indexedObservations(runtimeCalls, "capture.runtime_calls");
 checkExactStepCoverage(runtimeSteps, runtimeCallByStep, "capture.runtime_calls");
 for (const [index, response] of runtimeCalls.entries()) {
   const path = `capture.runtime_calls[${index}]`;
-  exactKeys(response, [
-    "step_id",
-    "operation",
-    "http_status",
-    "invocation_id",
-    "status",
-    "disposition",
-    "request_hash",
-    "execution_digest",
-    "execution_policy_revision",
-    "session_ref",
-    "evidence",
-    "cost_ref",
-  ], path);
+  exactKeys(response, ["step_id", "operation", "http_status", "invocation_id", "status", "disposition", "request_hash", "execution_digest", "execution_policy_revision", "session_ref", "evidence", "cost_ref"], path);
   check(response.operation === stepById.get(response.step_id)?.operation, `${path}.operation does not match the workload step`);
   check(integer(response.http_status, `${path}.http_status`) === 200, `${path}.http_status must be 200`);
   check(response.invocation_id === first?.invocation_id, `${path}.invocation_id does not identify the one reviewed invocation`);
@@ -222,19 +182,7 @@ for (const stepId of ["exact-retry", "status-page-1", "status-page-2"]) {
 
 check(preflightSteps.length === 1, "workload must contain exactly one managed preflight step");
 const preflight = record(capture.preflight, "capture.preflight");
-exactKeys(preflight, [
-  "step_id",
-  "operation",
-  "schema_version",
-  "agent",
-  "status",
-  "disposition",
-  "error_code",
-  "exit_code",
-  "observed_output",
-  "observed_output_sha256",
-  "counters",
-], "capture.preflight");
+exactKeys(preflight, ["step_id", "operation", "schema_version", "agent", "status", "disposition", "error_code", "exit_code", "observed_output", "observed_output_sha256", "counters"], "capture.preflight");
 check(preflight.step_id === preflightSteps[0]?.id, "capture.preflight does not match the workload preflight step");
 check(preflight.operation === preflightSteps[0]?.operation, "capture.preflight.operation does not match the workload step");
 check(preflight.schema_version === 1, "capture.preflight.schema_version must be 1");
@@ -252,13 +200,17 @@ for (const key of ["provision_attempts", "network_requests", "state_entries_crea
 }
 
 check(cleanupSteps.length === 1, "workload must contain exactly one workspace cleanup step");
-const cleanup = record(capture.cleanup, "capture.cleanup");
-exactKeys(cleanup, ["step_id", "operation", "http_status", "session_id", "result_snapshot"], "capture.cleanup");
-check(cleanup.step_id === cleanupSteps[0]?.id, "capture.cleanup does not match the workload cleanup step");
-check(cleanup.operation === cleanupSteps[0]?.operation, "capture.cleanup.operation does not match the workload step");
-check(integer(cleanup.http_status, "capture.cleanup.http_status") === 200, "capture.cleanup.http_status must be 200");
-check(cleanup.session_id === cleanupSteps[0]?.session_id, "capture.cleanup.session_id does not match the finalized workspace");
-check(typeof cleanup.result_snapshot === "string" && /^[0-9a-f]{64}$/.test(cleanup.result_snapshot), "capture.cleanup.result_snapshot must be a canonical snapshot handle");
+if (partial) {
+  check(capture.cleanup === null, "capture.cleanup must remain null until Pillbox finalizes terminal Huddles evidence");
+} else {
+  const cleanup = record(capture.cleanup, "capture.cleanup");
+  exactKeys(cleanup, ["step_id", "operation", "http_status", "session_id", "result_snapshot"], "capture.cleanup");
+  check(cleanup.step_id === cleanupSteps[0]?.id, "capture.cleanup does not match the workload cleanup step");
+  check(cleanup.operation === cleanupSteps[0]?.operation, "capture.cleanup.operation does not match the workload step");
+  check(integer(cleanup.http_status, "capture.cleanup.http_status") === 200, "capture.cleanup.http_status must be 200");
+  check(cleanup.session_id === capturedIdentity.session_id, "capture.cleanup.session_id does not match the terminal execution session");
+  check(typeof cleanup.result_snapshot === "string" && /^[0-9a-f]{64}$/.test(cleanup.result_snapshot), "capture.cleanup.result_snapshot must be a canonical snapshot handle");
+}
 
 const runs = array(capture.run_cost_envelopes, "capture.run_cost_envelopes");
 check(runs.length === reviewedCount, "there must be exactly one captured RunCostEnvelope per genuinely new execution");
@@ -266,15 +218,7 @@ const runIds = new Set();
 const observedRuns = [];
 for (const [index, rawRun] of runs.entries()) {
   const run = record(rawRun, `capture.run_cost_envelopes[${index}]`);
-  exactKeys(run, [
-    "id",
-    "execution_identity",
-    "artifact_ref",
-    "artifact_count",
-    "analytics_point_count",
-    "cost",
-    "observed",
-  ], `capture.run_cost_envelopes[${index}]`);
+  exactKeys(run, ["id", "execution_identity", "artifact_ref", "artifact_count", "analytics_point_count", "cost", "observed"], `capture.run_cost_envelopes[${index}]`);
   const runId = string(run.id, `capture.run_cost_envelopes[${index}].id`);
   const runIdentity = executionIdentity(run.execution_identity, `capture.run_cost_envelopes[${index}].execution_identity`);
   const runArtifact = artifactRef(run.artifact_ref, `capture.run_cost_envelopes[${index}].artifact_ref`);
@@ -286,6 +230,16 @@ for (const [index, rawRun] of runs.entries()) {
   const cost = validateCost(run.cost, `${runId}.cost`);
   check(runId === digestOf(cost), `${runId}.id must be the RunCostEnvelope digest`);
   check(firstResponse?.cost_ref === runId, `${runId} is not referenced by first-execute`);
+  const infra = record(cost.infrastructure, `${runId}.cost.infrastructure`);
+  check(runArtifact.bytes === integer(infra.r2_bytes_written, `${runId}.cost.infrastructure.r2_bytes_written`), `${runId} artifact byte identity disagrees with its RunCostEnvelope`);
+  check(integer(run.artifact_count, `${runId}.artifact_count`) === 1, `${runId} must have exactly one immutable R2 artifact`);
+  check(integer(run.analytics_point_count, `${runId}.analytics_point_count`) <= 1, `${runId} emitted more than one Analytics Engine point`);
+  check(integer(run.analytics_point_count, `${runId}.analytics_point_count`) === infra.analytics_points_written, `${runId} Analytics capture disagrees with its RunCostEnvelope`);
+  check(integer(run.artifact_count, `${runId}.artifact_count`) === integer(infra.r2_writes, `${runId}.cost.infrastructure.r2_writes`), `${runId} R2 artifact count disagrees with its RunCostEnvelope`);
+  if (partial) {
+    check(run.observed === null, `${runId}.observed must remain null in the Huddles partial`);
+    continue;
+  }
   const observed = record(run.observed, `${runId}.observed`);
   const d1 = record(observed.d1, `${runId}.observed.d1`);
   const r2 = record(observed.r2, `${runId}.observed.r2`);
@@ -293,12 +247,6 @@ for (const [index, rawRun] of runs.entries()) {
   const worker = record(observed.worker, `${runId}.observed.worker`);
   const analytics = record(observed.analytics_engine, `${runId}.observed.analytics_engine`);
   const vendor = validateVendorCounters(observed.vendor_sandbox_do, `${runId}.observed.vendor_sandbox_do`);
-  const infra = record(cost.infrastructure, `${runId}.cost.infrastructure`);
-  check(runArtifact.bytes === integer(infra.r2_bytes_written, `${runId}.cost.infrastructure.r2_bytes_written`), `${runId} artifact byte identity disagrees with its RunCostEnvelope`);
-  check(integer(run.artifact_count, `${runId}.artifact_count`) === 1, `${runId} must have exactly one immutable R2 artifact`);
-  check(integer(run.analytics_point_count, `${runId}.analytics_point_count`) <= 1, `${runId} emitted more than one Analytics Engine point`);
-  check(integer(run.analytics_point_count, `${runId}.analytics_point_count`) === infra.analytics_points_written, `${runId} Analytics capture disagrees with its RunCostEnvelope`);
-  check(integer(run.artifact_count, `${runId}.artifact_count`) === integer(infra.r2_writes, `${runId}.cost.infrastructure.r2_writes`), `${runId} R2 artifact count disagrees with its RunCostEnvelope`);
   check(integer(infra.d1_rows_read, `${runId}.cost.infrastructure.d1_rows_read`) === integer(d1.rows_read, `${runId}.observed.d1.rows_read`), `${runId} D1 read delta is unexplained`);
   check(integer(infra.d1_rows_written, `${runId}.cost.infrastructure.d1_rows_written`) === integer(d1.rows_written, `${runId}.observed.d1.rows_written`), `${runId} D1 write delta is unexplained`);
   check(integer(infra.r2_reads, `${runId}.cost.infrastructure.r2_reads`) === integer(r2.reads, `${runId}.observed.r2.reads`), `${runId} R2 read delta is unexplained`);
@@ -312,7 +260,26 @@ for (const [index, rawRun] of runs.entries()) {
   check(vendor.class_name === "Sandbox", `${runId} must be attributed to the vendor Sandbox DO`);
   check(vendor.custom_classes.length === 0, `${runId} observed a custom Durable Object class`);
   check(vendor.custom_storage_bytes_delta === 0, `${runId} observed custom Durable Object storage growth`);
-  observedRuns.push({ d1, r2, container, worker, analytics_engine: analytics, vendor });
+  observedRuns.push({
+    d1,
+    r2,
+    container,
+    worker,
+    analytics_engine: analytics,
+    vendor,
+  });
+}
+
+if (partial) {
+  check(capture.read_only === null, "capture.read_only must remain null in the Huddles partial");
+  check(capture.totals === null, "capture.totals must remain null in the Huddles partial");
+  if (failures.length > 0) {
+    console.error("✗ managed preview burn-in partial validation failed");
+    for (const failure of failures) console.error(`  - ${failure}`);
+    process.exit(1);
+  }
+  console.log("✓ authoritative Huddles burn-in report-v3 partial passed");
+  process.exit(0);
 }
 
 const readOnly = counters(record(capture.read_only, "capture.read_only"), "capture.read_only");
@@ -324,10 +291,7 @@ check(totals.analytics_engine.points_written === runs.length, "captured Analytic
 check(totals.r2.writes === runs.length, "captured R2 writes exceed one immutable artifact per new terminal run");
 check(totals.vendor_sandbox_do.custom_classes.length === 0, "captured topology contains a custom Durable Object class");
 check(totals.vendor_sandbox_do.custom_storage_bytes_delta === 0, "captured custom Durable Object storage grew");
-check(
-  totals.r2.bytes_read === totals.r2.reads * (runs[0]?.observed?.r2?.bytes_written ?? 0),
-  "captured R2 read bytes do not equal bounded artifact re-reads",
-);
+check(totals.r2.bytes_read === totals.r2.reads * (runs[0]?.observed?.r2?.bytes_written ?? 0), "captured R2 read bytes do not equal bounded artifact re-reads");
 
 if (failures.length > 0) {
   console.error("✗ managed preview burn-in reconciliation failed");
@@ -378,7 +342,14 @@ function counters(value, path) {
   const worker = numericPair(counters.worker, `${path}.worker`, ["requests"]);
   const analytics = numericPair(counters.analytics_engine, `${path}.analytics_engine`, ["points_written"]);
   const vendor = validateVendorCounters(counters.vendor_sandbox_do, `${path}.vendor_sandbox_do`);
-  return { d1, r2, container: containerValue, worker, analytics_engine: analytics, vendor_sandbox_do: vendor };
+  return {
+    d1,
+    r2,
+    container: containerValue,
+    worker,
+    analytics_engine: analytics,
+    vendor_sandbox_do: vendor,
+  };
 }
 
 function sumCounters(runs, readOnly) {
@@ -400,8 +371,12 @@ function sumCounters(runs, readOnly) {
       profile: readOnly.container.profile,
       cleanup_calls: sumNested(runs, "container", "cleanup_calls") + readOnly.container.cleanup_calls,
     },
-    worker: { requests: sumNested(runs, "worker", "requests") + readOnly.worker.requests },
-    analytics_engine: { points_written: sumNested(runs, "analytics_engine", "points_written") + readOnly.analytics_engine.points_written },
+    worker: {
+      requests: sumNested(runs, "worker", "requests") + readOnly.worker.requests,
+    },
+    analytics_engine: {
+      points_written: sumNested(runs, "analytics_engine", "points_written") + readOnly.analytics_engine.points_written,
+    },
     vendor_sandbox_do: {
       class_name: readOnly.vendor_sandbox_do.class_name,
       instances_started: sumNested(runs, "vendor", "instances_started") + readOnly.vendor_sandbox_do.instances_started,
@@ -493,14 +468,7 @@ function requestIdentity(request) {
 
 function executionIdentity(value, path) {
   const identity = record(value, path);
-  exactKeys(identity, [
-    "invocation_id",
-    "idempotency_key",
-    "session_id",
-    "request_hash",
-    "execution_digest",
-    "execution_policy_revision",
-  ], path);
+  exactKeys(identity, ["invocation_id", "idempotency_key", "session_id", "request_hash", "execution_digest", "execution_policy_revision"], path);
   for (const key of ["invocation_id", "idempotency_key", "session_id", "execution_policy_revision"]) {
     string(identity[key], `${path}.${key}`);
   }
@@ -542,7 +510,12 @@ function evidencePage(value, path) {
   check(typeof page.truncated === "boolean", `${path}.truncated must be boolean`);
   check(page.truncated === (page.next !== null), `${path}.truncated disagrees with next`);
   if (page.next !== null) check(page.next === from + eventCount, `${path}.next breaks positional continuity`);
-  return { ...page, from, event_count: eventCount, artifact_ref: artifactRef(page.artifact_ref, `${path}.artifact_ref`) };
+  return {
+    ...page,
+    from,
+    event_count: eventCount,
+    artifact_ref: artifactRef(page.artifact_ref, `${path}.artifact_ref`),
+  };
 }
 
 function validateEvidenceContinuity(value, seqRange, path) {
@@ -561,7 +534,7 @@ function canonicalJson(value) {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   return `{${Object.keys(value)
-    .sort((left, right) => left < right ? -1 : left > right ? 1 : 0)
+    .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0))
     .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
     .join(",")}}`;
 }

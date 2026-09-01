@@ -8,17 +8,34 @@ import test from "node:test";
 const reconciler = new URL("./scripts/reconcile-burnin.mjs", import.meta.url);
 const fixture = new URL("./testdata/burnin-reconciliation.fixture.json", import.meta.url);
 
-test("recorder-shaped fixture reconciles without translating response records", async () => {
+test("the sole Huddles recorder fixture reconciles without translating response records", async () => {
   const result = await run(process.execPath, [reconciler.pathname, fixture.pathname]);
   assert.equal(result.code, 0, result.stderr);
   assert.match(result.stdout, /managed preview burn-in reconciliation passed/);
 });
 
+test("partial validation accepts terminal Huddles evidence only before cleanup", async (t) => {
+  const report = JSON.parse(await readFile(fixture, "utf8"));
+  report.capture.cleanup = null;
+  report.capture.run_cost_envelopes[0].observed = null;
+  report.capture.read_only = null;
+  report.capture.totals = null;
+  const result = await reconcileTemporary(t, report, ["--partial"]);
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /authoritative Huddles burn-in report-v3 partial passed/);
+});
+
+test("reconciliation rejects a second runtime recorder", async (t) => {
+  const report = JSON.parse(await readFile(fixture, "utf8"));
+  report.capture.source = "burnin-fixed-workload";
+  const result = await reconcileTemporary(t, report);
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /Huddles as the sole runtime recorder/);
+});
+
 test("reconciliation fails when a runtime workload step is omitted", async (t) => {
   const report = JSON.parse(await readFile(fixture, "utf8"));
-  report.capture.runtime_calls = report.capture.runtime_calls.filter(
-    (call) => call.step_id !== "status-page-2",
-  );
+  report.capture.runtime_calls = report.capture.runtime_calls.filter((call) => call.step_id !== "status-page-2");
   const result = await reconcileTemporary(t, report);
   assert.equal(result.code, 1);
   assert.match(result.stderr, /omitted workload step status-page-2/);
@@ -56,12 +73,12 @@ test("reconciliation seals artifact identity and digest across every observation
   assert.match(result.stderr, /used a second artifact identity or digest/);
 });
 
-async function reconcileTemporary(t, report) {
+async function reconcileTemporary(t, report, args = []) {
   const temp = await mkdtemp(join(tmpdir(), "pillbox-burnin-reconcile-"));
   t.after(() => rm(temp, { recursive: true, force: true }));
   const path = join(temp, "report.json");
   await writeFile(path, JSON.stringify(report));
-  return run(process.execPath, [reconciler.pathname, path]);
+  return run(process.execPath, [reconciler.pathname, path, ...args]);
 }
 
 function run(command, args) {
@@ -69,8 +86,12 @@ function run(command, args) {
     const child = spawn(command, args);
     let stdout = "";
     let stderr = "";
-    child.stdout.on("data", (chunk) => { stdout += chunk; });
-    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
     child.on("error", reject);
     child.on("close", (code) => resolve({ code, stdout, stderr }));
   });

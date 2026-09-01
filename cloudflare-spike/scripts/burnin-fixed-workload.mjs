@@ -7,10 +7,8 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
-const DEFAULT_MANIFEST = new URL(
-  "../testdata/burnin-reconciliation.fixture.json",
-  import.meta.url,
-);
+const DEFAULT_MANIFEST = new URL("../testdata/burnin-reconciliation.fixture.json", import.meta.url);
+const RECONCILER = fileURLToPath(new URL("./reconcile-burnin.mjs", import.meta.url));
 const MAX_STATUS_PAGE_SIZE = 100;
 const REPORT_SCHEMA_VERSION = 3;
 const EXPECTED_WORKLOAD = new Map([
@@ -24,134 +22,95 @@ const EXPECTED_WORKLOAD = new Map([
 const execFileAsync = promisify(execFile);
 
 const args = process.argv.slice(2);
-const execute = args.includes("--execute");
+const preflightMode = args.includes("--preflight");
+const finalizeMode = args.includes("--finalize");
 const manifestPath = option("--manifest") ?? DEFAULT_MANIFEST;
 const recordPath = option("--record");
+const reportPath = option("--report") ?? process.env.BURNIN_HUDDLES_REPORT_FILE;
 const baseUrl = option("--base-url") ?? process.env.BURNIN_BASE_URL;
-const finalizeRequestPath =
-  option("--finalize-request") ?? process.env.BURNIN_FINALIZE_REQUEST_FILE;
-const managedPreflightPath =
-  option("--managed-preflight") ??
-  process.env.BURNIN_MANAGED_PREFLIGHT ??
-  fileURLToPath(new URL("../../scripts/smoke/managed-agent-preflight.sh", import.meta.url));
+const finalizeRequestPath = option("--finalize-request") ?? process.env.BURNIN_FINALIZE_REQUEST_FILE;
+const managedPreflightPath = option("--managed-preflight") ?? process.env.BURNIN_MANAGED_PREFLIGHT ?? fileURLToPath(new URL("../../scripts/smoke/managed-agent-preflight.sh", import.meta.url));
 
 const manifest = await readJson(manifestPath, "burn-in manifest");
 validateManifest(manifest);
 
-if (!execute) {
+if (!preflightMode && !finalizeMode) {
+  if (args.includes("--execute")) {
+    fail("the combined Pillbox recorder is retired; choose --preflight or --finalize");
+  }
   console.log(JSON.stringify(dryRunPlan(manifest), null, 2));
+  process.exit(0);
+}
+if (preflightMode === finalizeMode) fail("choose exactly one of --preflight or --finalize");
+
+const unsupported = manifest.workload.steps.find((step) => step.id === "unsupported-managed-codex");
+if (preflightMode) {
+  const observed = await runManagedAgentPreflight(unsupported);
+  const attachment = {
+    schema_version: REPORT_SCHEMA_VERSION,
+    deployment: manifest.deployment,
+    workload: manifest.workload,
+    capture: {
+      source: "pillbox-managed-preflight",
+      preflight: preflightSummary(unsupported, observed),
+    },
+  };
+  await writeReport(recordPath, attachment);
+  console.log(JSON.stringify(attachment, null, 2));
   process.exit(0);
 }
 
 if (process.env.BURNIN_CONFIRM_ISOLATED !== "1") {
-  fail("live burn-in requires BURNIN_CONFIRM_ISOLATED=1; verify the endpoint is the isolated preview namespace");
+  fail("live finalize requires BURNIN_CONFIRM_ISOLATED=1; verify the endpoint is the isolated preview namespace");
 }
 if (typeof baseUrl !== "string" || !/^https?:\/\//.test(baseUrl)) {
-  fail("live burn-in requires --base-url or BURNIN_BASE_URL with an http(s) isolated preview URL");
+  fail("live finalize requires --base-url or BURNIN_BASE_URL with an http(s) isolated preview URL");
 }
 if (finalizeRequestPath === undefined) {
-  fail("live burn-in requires --finalize-request or BURNIN_FINALIZE_REQUEST_FILE; credentials never belong in the repository manifest");
+  fail("live finalize requires --finalize-request or BURNIN_FINALIZE_REQUEST_FILE; credentials never belong in the report");
+}
+if (reportPath === undefined) {
+  fail("live finalize requires --report or BURNIN_HUDDLES_REPORT_FILE for the authoritative Huddles partial");
+}
+if (recordPath !== undefined && resolve(process.cwd(), recordPath) !== resolve(process.cwd(), reportPath)) {
+  fail("finalize must attach cleanup to the same authoritative Huddles report");
 }
 
-const request = manifest.workload.steps.find((step) => step.id === "first-execute").request;
-const executionIdentity = requestIdentity(request);
-const runtimeCalls = [];
-const unsupported = manifest.workload.steps.find((step) => step.id === "unsupported-managed-codex");
-const unsupportedResult = await runManagedAgentPreflight(unsupported);
-const preflight = {
-  step_id: unsupported.id,
-  operation: unsupported.operation,
-  schema_version: unsupportedResult.schema_version,
-  agent: unsupportedResult.agent,
-  status: unsupportedResult.status,
-  disposition: unsupportedResult.disposition,
-  error_code: unsupportedResult.error_code,
-  exit_code: unsupportedResult.exit_code,
-  observed_output: unsupportedResult.observed_output,
-  observed_output_sha256: unsupportedResult.observed_output_sha256,
-  counters: unsupportedResult.counters,
-};
-
-const first = await call("first-execute", "/v2/executions", request, "EXECUTE");
-expect(first.body, "first-execute", { status: "completed", disposition: "created" });
-expectTerminalAttribution("first-execute", first, request.invocation_id);
-runtimeCalls.push(runtimeSummary("first-execute", "execute", first));
-
-const retry = await call("exact-retry", "/v2/executions", request, "EXECUTE");
-expect(retry.body, "exact-retry", { status: "completed", disposition: "reused" });
-expectTerminalAttribution("exact-retry", retry, request.invocation_id);
-expectSameTerminalExecution("exact-retry", retry.body, first.body);
-runtimeCalls.push(runtimeSummary("exact-retry", "execute", retry));
-
-for (const [index, step] of manifest.workload.steps
-  .filter((candidate) => candidate.operation === "status")
-  .entries()) {
-  const statusRequest = {
-    contract_version: "pillbox.execution/2",
-    invocation_id: request.invocation_id,
-    evidence_after: step.evidence_after,
-    evidence_limit: step.evidence_limit,
-  };
-  const status = await call(step.id, "/v2/executions/status", statusRequest, `STATUS_${index + 1}`);
-  expect(status.body, step.id, { status: "completed", disposition: "reused" });
-  expectTerminalAttribution(step.id, status, request.invocation_id);
-  expectSameTerminalExecution(step.id, status.body, first.body);
-  runtimeCalls.push(runtimeSummary(step.id, step.operation, status));
+const report = await readJson(reportPath, "authoritative Huddles report");
+if (report?.schema_version !== REPORT_SCHEMA_VERSION || report?.capture?.source !== "huddles-managed-burnin" || report.capture.cleanup !== null || canonicalJson(report.deployment) !== canonicalJson(manifest.deployment) || canonicalJson(report.workload) !== canonicalJson(manifest.workload)) {
+  fail("finalize requires the matching Huddles report-v3 partial with cleanup still pending");
 }
+// Terminal validation precedes the only public call so cleanup cannot predate Huddles evidence.
+await validateHuddlesPartial(reportPath);
 
-const finalizeStep = manifest.workload.steps.find((step) => step.id === "finalize");
+const finalizeStep = report.workload.steps.find((step) => step.id === "finalize");
 const finalizeRequest = await readJson(finalizeRequestPath, "operator finalize request");
 if (finalizeRequest.sessionId !== finalizeStep.session_id) {
-  fail("operator finalize request sessionId does not match the fixed workload");
+  fail("operator finalize request sessionId does not match the terminal Huddles execution");
 }
-const finalized = await call("finalize", "/v2/workspaces/finalize", finalizeRequest, "FINALIZE");
+const finalized = await callFinalize(finalizeRequest);
 if (finalized.status !== 200 || typeof finalized.body.resultSnapshot !== "string" || !/^[0-9a-f]{64}$/.test(finalized.body.resultSnapshot)) {
   fail("finalize did not return a canonical result snapshot");
 }
-const cleanup = {
-  step_id: finalizeStep.id,
-  operation: finalizeStep.operation,
-  http_status: finalized.status,
-  session_id: finalizeRequest.sessionId,
-  result_snapshot: finalized.body.resultSnapshot,
-};
-
-const report = {
-  schema_version: REPORT_SCHEMA_VERSION,
-  deployment: manifest.deployment,
-  workload: manifest.workload,
+const completed = {
+  ...report,
   capture: {
-    source: "burnin-fixed-workload",
-    execution_identity: executionIdentity,
-    runtime_calls: runtimeCalls,
-    preflight,
-    cleanup,
-    run_cost_envelopes: uniqueRunCost(first.body),
-    read_only: null,
-    totals: null,
-    operator_capture_required: [
-      "D1 rows read/written",
-      "R2 reads/writes/bytes",
-      "Container duration and lifecycle counters",
-      "Worker request counters",
-      "Analytics Engine point count",
-      "vendor Sandbox/DO counters and custom DO storage delta",
-    ],
+    ...report.capture,
+    cleanup: {
+      step_id: finalizeStep.id,
+      operation: finalizeStep.operation,
+      http_status: finalized.status,
+      session_id: finalizeRequest.sessionId,
+      result_snapshot: finalized.body.resultSnapshot,
+    },
   },
 };
-
-if (recordPath !== undefined) {
-  await writeFile(resolve(process.cwd(), recordPath), `${JSON.stringify(report, null, 2)}\n`, { mode: 0o600 });
-}
-console.log(JSON.stringify(report, null, 2));
+await writeFile(resolve(process.cwd(), reportPath), `${JSON.stringify(completed, null, 2)}\n`, {
+  mode: 0o600,
+});
+console.log(JSON.stringify(completed, null, 2));
 
 function dryRunPlan(value) {
-  const steps = value.workload.steps.map((step) => ({
-    id: step.id,
-    operation: step.operation,
-    network_requests: networkRequestsForStep(step),
-    expected: step.expected ?? {},
-  }));
   return {
     mode: "dry-run",
     worker: value.deployment.worker_name,
@@ -161,38 +120,60 @@ function dryRunPlan(value) {
       limit: value.deployment.managed_execution_limit,
       reviewed_new_execution_count: value.deployment.reviewed_new_execution_count,
     },
-    steps,
+    sequence: ["Pillbox --preflight records the real local managed-Codex rejection without HTTP execution or finalize", "Huddles records the only created execute, exact retry, and two bounded private status reads", "Pillbox --finalize validates the Huddles report-v3 partial, then attaches scoped public cleanup to that same file"],
     safety: {
       unsupported_managed_codex: "preflight rejected; no request or Sandbox provision",
       exact_retry: "same request hash; no new claim, artifact, or Analytics point",
       status_pages: `bounded at ${MAX_STATUS_PAGE_SIZE} evidence events per request`,
-      finalize: "operator-supplied scoped request; kill-before-transfer required",
+      execution: "private Huddles service binding only",
+      finalize: "one public operator-scoped request after terminal positional evidence",
     },
-    next: "Use --execute only with BURNIN_CONFIRM_ISOLATED=1 and operator-captured provider counters, then run npm run burnin:reconcile -- <report.json>.",
+    next: "Run --preflight, then the Huddles recorder, then --finalize against that Huddles report file.",
   };
 }
 
-function networkRequestsForStep(step) {
-  if (step.operation === "managed_codex_preflight") return 0;
-  if (
-    step.id === "first-execute" ||
-    step.id === "exact-retry" ||
-    step.operation === "status" ||
-    step.operation === "workspace_finalize"
-  ) {
-    return 1;
-  }
-  return 0;
+function preflightSummary(step, observed) {
+  return {
+    step_id: step.id,
+    operation: step.operation,
+    schema_version: observed.schema_version,
+    agent: observed.agent,
+    status: observed.status,
+    disposition: observed.disposition,
+    error_code: observed.error_code,
+    exit_code: observed.exit_code,
+    observed_output: observed.observed_output,
+    observed_output_sha256: observed.observed_output_sha256,
+    counters: observed.counters,
+  };
 }
 
-async function call(stepId, path, body, tokenName) {
-  const token = process.env[`BURNIN_${tokenName}_TOKEN`];
+async function validateHuddlesPartial(path) {
+  try {
+    await execFileAsync(process.execPath, [RECONCILER, resolve(process.cwd(), path), "--partial"], {
+      encoding: "utf8",
+      maxBuffer: 64 * 1024,
+    });
+  } catch (error) {
+    fail(`authoritative Huddles report-v3 partial failed validation: ${error.stderr || error.message}`);
+  }
+}
+
+async function writeReport(path, value) {
+  if (path === undefined) return;
+  await writeFile(resolve(process.cwd(), path), `${JSON.stringify(value, null, 2)}\n`, {
+    mode: 0o600,
+  });
+}
+
+async function callFinalize(body) {
+  const token = process.env.BURNIN_FINALIZE_TOKEN;
   if (typeof token !== "string" || token.length === 0) {
-    fail(`missing BURNIN_${tokenName}_TOKEN for ${stepId}; capabilities must be minted for the exact request bytes`);
+    fail("missing BURNIN_FINALIZE_TOKEN; capability must be minted for the exact finalize request bytes");
   }
   let response;
   try {
-    response = await fetch(new URL(path, ensureTrailingSlash(baseUrl)), {
+    response = await fetch(new URL("/v2/workspaces/finalize", ensureTrailingSlash(baseUrl)), {
       method: "POST",
       headers: {
         accept: "application/json",
@@ -202,17 +183,17 @@ async function call(stepId, path, body, tokenName) {
       body: JSON.stringify(body),
     });
   } catch (error) {
-    fail(`${stepId} request failed before a response: ${String(error)}`);
+    fail(`finalize request failed before a response: ${String(error)}`);
   }
   let responseBody;
   try {
     responseBody = await response.json();
   } catch {
-    fail(`${stepId} returned non-JSON HTTP ${response.status}`);
+    fail(`finalize returned non-JSON HTTP ${response.status}`);
   }
   if (!response.ok) {
     const code = responseBody?.error?.code ?? "unknown";
-    fail(`${stepId} returned HTTP ${response.status} (${code})`);
+    fail(`finalize returned HTTP ${response.status} (${code})`);
   }
   return { status: response.status, body: responseBody };
 }
@@ -236,65 +217,10 @@ async function runManagedAgentPreflight(step) {
   } catch {
     fail(`${step.id} executable preflight returned non-JSON output`);
   }
-  if (
-    observed?.schema_version !== 1 ||
-    observed?.agent !== "codex" ||
-    observed?.status !== "preflight_rejected" ||
-    observed?.disposition !== "not_sent" ||
-    observed?.error_code !== "unsupported_execution" ||
-    observed?.exit_code !== 2 ||
-    typeof observed?.observed_output !== "string" ||
-    observed?.observed_output_sha256 !== digestText(observed.observed_output) ||
-    observed?.counters?.provision_attempts !== 0 ||
-    observed?.counters?.network_requests !== 0 ||
-    observed?.counters?.state_entries_created !== 0
-  ) {
+  if (observed?.schema_version !== 1 || observed?.agent !== "codex" || observed?.status !== "preflight_rejected" || observed?.disposition !== "not_sent" || observed?.error_code !== "unsupported_execution" || observed?.exit_code !== 2 || typeof observed?.observed_output !== "string" || observed?.observed_output_sha256 !== digestText(observed.observed_output) || observed?.counters?.provision_attempts !== 0 || observed?.counters?.network_requests !== 0 || observed?.counters?.state_entries_created !== 0) {
     fail(`${step.id} did not observe the fail-closed managed boundary`);
   }
   return observed;
-}
-
-function runtimeSummary(stepId, operation, result) {
-  const body = result.body;
-  return {
-    step_id: stepId,
-    operation,
-    http_status: result.status,
-    invocation_id: body.invocation_id,
-    status: body.status,
-    disposition: body.disposition,
-    request_hash: body.request_hash,
-    execution_digest: body.execution_digest,
-    execution_policy_revision: body.execution_policy_revision,
-    session_ref: body.session_ref,
-    evidence: {
-      from: body.evidence.from,
-      next: body.evidence.next,
-      truncated: body.evidence.truncated,
-      event_count: body.evidence.events.length,
-      artifact_ref: body.evidence.artifact_ref,
-    },
-    cost_ref: body.cost === undefined ? null : digestOf(body.cost),
-  };
-}
-
-function uniqueRunCost(body) {
-  if (body.cost === undefined) return [];
-  return [{
-    id: digestOf(body.cost),
-    execution_identity: executionIdentity,
-    artifact_ref: body.evidence.artifact_ref,
-    artifact_count: body.evidence?.artifact_ref === undefined ? 0 : 1,
-    analytics_point_count: body.cost.infrastructure.analytics_points_written,
-    cost: body.cost,
-    observed: null,
-  }];
-}
-
-function expect(body, stepId, expected) {
-  for (const [key, value] of Object.entries(expected)) {
-    if (body?.[key] !== value) fail(`${stepId} expected ${key}=${value}`);
-  }
 }
 
 function validateManifest(value) {
@@ -332,44 +258,7 @@ function validateManifest(value) {
   const unsupported = stepById.get("unsupported-managed-codex");
   if (unsupported.expected?.error_code !== "unsupported_execution" || unsupported.expected?.provision_attempts !== 0 || unsupported.expected?.network_requests !== 0) fail("managed Codex preflight must reject without side effects");
   const finalize = stepById.get("finalize");
-  if (finalize.requires_operator_request !== true || finalize.expected?.requests !== 1 || finalize.expected?.kill_before_transfer !== true || finalize.expected?.result_snapshot_required !== true) fail("finalize must be one operator-scoped kill-before-transfer cleanup");
-}
-
-function expectSameTerminalExecution(stepId, body, firstBody) {
-  for (const field of ["request_hash", "execution_digest", "execution_policy_revision"]) {
-    if (body[field] !== firstBody[field]) fail(`${stepId} changed ${field}`);
-  }
-  if (JSON.stringify(body.session_ref) !== JSON.stringify(firstBody.session_ref)) {
-    fail(`${stepId} changed the positional session range`);
-  }
-  if (JSON.stringify(body.evidence?.artifact_ref) !== JSON.stringify(firstBody.evidence?.artifact_ref)) {
-    fail(`${stepId} returned a second artifact`);
-  }
-  if (JSON.stringify(body.cost ?? null) !== JSON.stringify(firstBody.cost ?? null)) {
-    fail(`${stepId} returned a different RunCostEnvelope`);
-  }
-}
-
-function expectTerminalAttribution(stepId, result, invocationId) {
-  const body = result.body;
-  if (
-    result.status !== 200 ||
-    body.invocation_id !== invocationId ||
-    typeof body.request_hash !== "string" ||
-    !/^sha256:[0-9a-f]{64}$/.test(body.request_hash) ||
-    typeof body.execution_digest !== "string" ||
-    !/^sha256:[0-9a-f]{64}$/.test(body.execution_digest) ||
-    typeof body.execution_policy_revision !== "string" ||
-    body.execution_policy_revision.length === 0 ||
-    body.session_ref?.session_id !== request.session_ref.session_id ||
-    !validSeqRange(body.session_ref?.seq_range) ||
-    !validEvidencePage(body.evidence) ||
-    !validArtifactRef(body.evidence.artifact_ref) ||
-    !isRecord(body.cost) ||
-    !isRecord(body.cost.infrastructure)
-  ) {
-    fail(`${stepId} omitted required terminal invocation attribution`);
-  }
+  if (finalize.session_id !== first.request.session_ref.session_id || finalize.requires_operator_request !== true || finalize.expected?.requests !== 1 || finalize.expected?.kill_before_transfer !== true || finalize.expected?.result_snapshot_required !== true) fail("finalize must be one operator-scoped cleanup for the execution session");
 }
 
 async function readJson(path, label) {
@@ -382,15 +271,14 @@ async function readJson(path, label) {
 
 function option(name) {
   const index = args.indexOf(name);
-  return index < 0 ? undefined : args[index + 1];
+  if (index < 0) return undefined;
+  const value = args[index + 1];
+  if (value === undefined || value.startsWith("--")) fail(`${name} requires a value`);
+  return value;
 }
 
 function ensureTrailingSlash(value) {
   return value.endsWith("/") ? value : `${value}/`;
-}
-
-function digestOf(value) {
-  return `sha256:${createHash("sha256").update(canonicalJson(value)).digest("hex")}`;
 }
 
 function digestText(value) {
@@ -401,43 +289,11 @@ function isRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function requestIdentity(value) {
-  return {
-    invocation_id: value.invocation_id,
-    idempotency_key: value.idempotency_key,
-    session_id: value.session_ref.session_id,
-    request_hash: digestOf(value),
-    execution_digest: digestOf({
-      execution: value.execution,
-      execution_policy_revision: value.execution_policy_revision,
-    }),
-    execution_policy_revision: value.execution_policy_revision,
-  };
-}
-
-function validSeqRange(value) {
-  return Array.isArray(value) && value.length === 2 &&
-    Number.isSafeInteger(value[0]) && Number.isSafeInteger(value[1]) &&
-    value[0] === 0 && value[1] >= value[0];
-}
-
-function validEvidencePage(value) {
-  return isRecord(value) && Number.isSafeInteger(value.from) && value.from >= 0 &&
-    (value.next === null || Number.isSafeInteger(value.next) && value.next > value.from) &&
-    typeof value.truncated === "boolean" && Array.isArray(value.events);
-}
-
-function validArtifactRef(value) {
-  return isRecord(value) && typeof value.key === "string" && value.key.length > 0 &&
-    value.media_type === "application/json" && Number.isSafeInteger(value.bytes) &&
-    value.bytes > 0 && /^sha256:[0-9a-f]{64}$/.test(value.sha256);
-}
-
 function canonicalJson(value) {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   return `{${Object.keys(value)
-    .sort((left, right) => left < right ? -1 : left > right ? 1 : 0)
+    .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0))
     .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
     .join(",")}}`;
 }

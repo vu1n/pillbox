@@ -218,8 +218,50 @@ pub(super) fn session_wait_idle(
     // subscribing from baseline+1 catches them (computing last_seq after spawn
     // could skip an already-drained idle). Default = next idle, not a stale one.
     let s = session::resolve(resolved, id)?;
-    let baseline = crate::events::log::SessionLog::open(resolved, &s.id)?.last_seq();
+    let existing_log = crate::events::log::SessionLog::open(resolved, &s.id)?;
+    let baseline = existing_log.last_seq();
+    let default_from = from.is_none();
     let from = from.unwrap_or(baseline + 1);
+
+    // A detached producer can append the completion between `session send`
+    // returning and this separate command starting. In default mode, recognize
+    // an already-complete current turn instead of waiting for a future one. The
+    // most recent durable Input is the driver's boundary; the transcript's user
+    // MessageStart covers the seeded argv turn, which has no separate Input.
+    // An older idle before either boundary is stale and must not satisfy this
+    // wait. Explicit `--from` retains exact replay semantics and skips this
+    // convenience check.
+    if default_from {
+        let existing = existing_log.read_from(0)?;
+        let last_turn = existing
+            .iter()
+            .filter(|ev| {
+                matches!(&ev.payload, Payload::Input(_))
+                    || matches!(
+                        &ev.payload,
+                        Payload::MessageStart(message)
+                            if message.role == crate::contract::Role::User
+                    )
+            })
+            .map(|ev| ev.seq)
+            .max()
+            .unwrap_or(0);
+        let last_idle = existing
+            .iter()
+            .filter(|ev| {
+                matches!(
+                    &ev.payload,
+                    Payload::AttentionRequired(_) | Payload::RunFinished(_) | Payload::RunFailed(_)
+                )
+            })
+            .map(|ev| ev.seq)
+            .max()
+            .unwrap_or(0);
+        if last_idle > last_turn {
+            println!("pillbox: session `{}` idle", s.id);
+            return Ok(());
+        }
+    }
 
     // The tailer drains the §0 capture into the log while we wait; it stops when
     // `_tailer` drops at fn return (TailerHandle's Drop joins it).

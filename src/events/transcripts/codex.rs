@@ -5,20 +5,22 @@
 //! line has a `type`-tagged envelope; the meaty content sits under
 //! `type: "response_item"` where `payload.type` discriminates:
 //!
-//! - `message` (role=user / assistant) → user prompt or assistant
-//!   text. Codex uses OpenAI's `input_text` / `output_text` content
-//!   blocks; we concatenate their `.text` fields into one string
-//!   per message.
+//! - `message` (role=user) → user prompt. Codex uses OpenAI's
+//!   `input_text` content blocks; we concatenate their `.text` fields.
 //! - `function_call` → tool invocation (name, JSON-string
 //!   arguments, call_id).
 //! - `function_call_output` → tool result (call_id, output as a
 //!   single string).
 //! - `reasoning` → assistant thinking trace.
+//! - `event_msg.task_complete` → the final assistant message plus the
+//!   explicit turn-complete boundary. This is the only trustworthy idle
+//!   marker in a Codex rollout: a tool-using turn can contain several
+//!   intermediate assistant `response_item.message` records.
 //!
-//! Envelope-only types (`session_meta`, `turn_context`, `event_msg`)
-//! are dropped. `message` lines with `role=developer` / `system` are
-//! also dropped — those are the harness's system prompt, not agent
-//! activity.
+//! Other envelope-only types (`session_meta`, `turn_context`, `event_msg`)
+//! are dropped. `message` lines with `role=assistant` / `developer` /
+//! `system` are also dropped: assistant output is emitted once from
+//! `task_complete`, while developer/system are harness prompts.
 //!
 //! Unlike Claude Code, Codex lines have no per-line `uuid`. We
 //! synthesize one from `payload.call_id` (function calls/results) or
@@ -33,6 +35,9 @@ pub(super) fn parse_line(line: &str, line_idx: usize) -> Vec<TranscriptEvent> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
         return vec![];
     };
+    if v.get("type").and_then(|t| t.as_str()) == Some("event_msg") {
+        return parse_task_complete(&v, line_idx).into_iter().collect();
+    }
     if v.get("type").and_then(|t| t.as_str()) != Some("response_item") {
         return vec![];
     }
@@ -67,9 +72,11 @@ fn parse_message(
     timestamp: SystemTime,
 ) -> Option<TranscriptEvent> {
     let role = payload.get("role").and_then(|v| v.as_str())?;
-    // developer / system are harness-injected prompts; not agent
-    // activity. Skip.
-    if role != "user" && role != "assistant" {
+    // Assistant response items can be intermediate text in a tool-using turn.
+    // Emit the final answer exactly once from `event_msg.task_complete` below,
+    // which also carries the explicit idle boundary. Developer/system are
+    // harness prompts, not activity.
+    if role != "user" {
         return None;
     }
     let content = payload.get("content").and_then(|v| v.as_array())?;
@@ -78,21 +85,46 @@ fn parse_message(
         return None;
     }
     let uuid = format!("msg:{line_idx}");
-    let kind = if role == "user" {
-        EventKind::UserPrompt { content: text }
-    } else {
-        EventKind::AssistantText {
-            text,
-            model: None,
-            usage: None,
-            stop_reason: None,
-        }
-    };
+    let kind = EventKind::UserPrompt { content: text };
     Some(TranscriptEvent {
         uuid,
         parent_uuid: None,
         timestamp,
         kind,
+    })
+}
+
+fn parse_task_complete(v: &serde_json::Value, line_idx: usize) -> Option<TranscriptEvent> {
+    let payload = v.get("payload")?;
+    if payload.get("type").and_then(|v| v.as_str()) != Some("task_complete") {
+        return None;
+    }
+    let text = payload
+        .get("last_agent_message")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let turn_id = payload
+        .get("turn_id")
+        .and_then(|v| v.as_str())
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| line_idx.to_string());
+    let timestamp = v
+        .get("timestamp")
+        .and_then(|v| v.as_str())
+        .and_then(parse_timestamp)
+        .unwrap_or_else(SystemTime::now);
+    Some(TranscriptEvent {
+        uuid: format!("turn:{turn_id}"),
+        parent_uuid: None,
+        timestamp,
+        kind: EventKind::AssistantText {
+            text,
+            model: None,
+            usage: None,
+            stop_reason: Some("end_turn".into()),
+        },
     })
 }
 
@@ -225,14 +257,34 @@ mod tests {
     }
 
     #[test]
-    fn parses_assistant_message_with_output_text() {
+    fn defers_assistant_messages_until_task_complete() {
         let line = r#"{"timestamp":"2026-05-18T09:26:30Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"running the tests"}]}}"#;
+        assert!(parse_line(line, 9).is_empty());
+    }
+
+    #[test]
+    fn task_complete_emits_final_answer_and_idle_boundary() {
+        use crate::contract::{AttentionReason, Payload};
+
+        let line = r#"{"timestamp":"2026-05-18T09:26:31Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-7","last_agent_message":"running the tests"}}"#;
         let events = parse_line(line, 9);
         assert_eq!(events.len(), 1);
+        assert_eq!(events[0].uuid, "turn:turn-7");
         match &events[0].kind {
-            EventKind::AssistantText { text, .. } => assert_eq!(text, "running the tests"),
+            EventKind::AssistantText {
+                text, stop_reason, ..
+            } => {
+                assert_eq!(text, "running the tests");
+                assert_eq!(stop_reason.as_deref(), Some("end_turn"));
+            }
             other => panic!("expected AssistantText, got {other:?}"),
         }
+        let payloads = super::super::contract_map::to_payloads(&events[0]);
+        assert!(matches!(
+            payloads.last(),
+            Some(Payload::AttentionRequired(a))
+                if a.reason == AttentionReason::NeedsInput
+        ));
     }
 
     #[test]
@@ -308,7 +360,7 @@ mod tests {
 
     #[test]
     fn drops_envelope_types() {
-        for ty in ["session_meta", "turn_context", "event_msg", "unknown"] {
+        for ty in ["session_meta", "turn_context", "unknown"] {
             let line = format!(r#"{{"timestamp":"2026-05-18T09:26:21Z","type":"{ty}"}}"#);
             assert!(parse_line(&line, 0).is_empty(), "expected drop for {ty}");
         }

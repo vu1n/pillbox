@@ -680,46 +680,69 @@ fn stub_claude_oauth(
 }
 
 /// Stub codex's ChatGPT-mode `tokens.{access_token,refresh_token}` in place. The
-/// MITM swaps each stub→real as raw bytes on the request leg (content-agnostic),
-/// so a curated-prefix stub — reusing the host-side codex vault provider's
-/// prefixes for consistency — is all that's needed, NEVER the claude
-/// [`mint_oauth_stub`] derivation, whose `-`-splitting would leak base64url JWT
-/// body chunks from the access token. ApiKey-mode auth.json (no `tokens` block)
-/// stubs nothing.
+/// access stub is a synthetic JWT with a far-future `exp`, so Codex never attempts
+/// proactive refresh; only that access stub gets a MITM release pair. The refresh
+/// stub deliberately has NO pair: an unexpected guest refresh therefore fails
+/// closed upstream and can never capture a real token response. ApiKey-mode
+/// auth.json (no `tokens` block) stubs nothing.
 fn stub_codex_oauth(
     json: &mut serde_json::Value,
     hosts: &[String],
     pairs: &mut Vec<SwapPair>,
 ) -> Option<String> {
-    use crate::vault::providers::codex::{STUB_ACCESS_PREFIX, STUB_REFRESH_PREFIX};
+    use crate::vault::providers::codex::STUB_REFRESH_PREFIX;
     let tokens = json.get_mut("tokens").and_then(|v| v.as_object_mut())?;
-    let mut access_stub = None;
-    for (field, prefix) in [
-        ("access_token", STUB_ACCESS_PREFIX),
-        ("refresh_token", STUB_REFRESH_PREFIX),
-    ] {
-        let real = tokens
-            .get(field)
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-            .filter(|s| !s.is_empty());
-        if let Some(real) = real {
-            let stub = mint_curated_stub(prefix);
-            tokens.insert(field.to_string(), serde_json::Value::String(stub.clone()));
-            if field == "access_token" {
-                access_stub = Some(stub.clone());
-            }
-            pairs.push(SwapPair {
-                stub,
-                real,
-                hosts: hosts.to_vec(),
-            });
-        }
+    let real_access = tokens
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .filter(|s| !s.is_empty());
+    let access_stub = real_access.map(|real| {
+        let stub = mint_codex_access_stub();
+        tokens.insert(
+            "access_token".to_string(),
+            serde_json::Value::String(stub.clone()),
+        );
+        pairs.push(SwapPair {
+            stub: stub.clone(),
+            real,
+            hosts: hosts.to_vec(),
+        });
+        stub
+    });
+
+    if tokens
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .is_some_and(|value| !value.is_empty())
+    {
+        tokens.insert(
+            "refresh_token".to_string(),
+            serde_json::Value::String(mint_curated_stub(STUB_REFRESH_PREFIX)),
+        );
     }
-    // Codex has no broker decider yet (`broker_expiry` → None disables its JIT), but the
-    // access stub is returned for symmetry with claude; the launch path builds a refresh
-    // spec only when there's an access stub, and the child no-ops it for codex.
+
     access_stub
+}
+
+/// Synthetic JWT accepted by Codex's local expiry parser. The provider never sees
+/// it: the MITM replaces the complete token in the Authorization header. No segment
+/// is derived from the real JWT, and the signature carries an obvious pillbox marker.
+fn mint_codex_access_stub() -> String {
+    use base64::Engine as _;
+
+    let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "exp": crate::vault::STUB_FAR_FUTURE_EXPIRES_AT_MS / 1000,
+    }))
+    .expect("static codex stub claims serialize");
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload);
+    let signature = format!(
+        "{}pllbxstub{}",
+        crate::vault::providers::codex::STUB_ACCESS_PREFIX,
+        uuid::Uuid::now_v7().simple()
+    );
+    format!("{header}.{payload}.{signature}")
 }
 
 /// A curated-prefix stub `<prefix>pllbxstub<uuid>` for a token whose real bytes
@@ -1000,10 +1023,12 @@ fn cstr(s: &str) -> CString {
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine as _;
+
     use super::{
-        env_fork_left_real_unstubbed, find_cached_rootfs, mint_curated_stub, mint_oauth_stub,
-        oauth_swap_hosts, rootfs_unavailable_message, stub_claude_oauth, stub_codex_oauth,
-        SwapPair,
+        env_fork_left_real_unstubbed, find_cached_rootfs, mint_codex_access_stub,
+        mint_curated_stub, mint_oauth_stub, oauth_swap_hosts, rootfs_unavailable_message,
+        stub_claude_oauth, stub_codex_oauth, SwapPair,
     };
     use crate::agents::{CLAUDE, CODEX, PI};
 
@@ -1223,8 +1248,8 @@ mod tests {
     fn stub_codex_oauth_stubs_chatgpt_tokens_without_leaking_them() {
         // codex ChatGPT-mode auth.json: the access token is a JWT whose base64url
         // body contains '-' (the exact shape mint_oauth_stub would leak), the
-        // refresh token is opaque. Both must be swapped for curated-prefix stubs
-        // that share NO bytes with the real.
+        // refresh token is opaque. Both guest values share NO bytes with the real,
+        // and only access gets a release pair; refresh is broker-only.
         let real_access = "eyJhbGciOiJSUzI1NiJ9.PA-YL0AD-with-dashes.SIGSEG";
         let real_refresh = "rt-OPAQUE-SECRETBODY";
         let mut json = serde_json::json!({
@@ -1242,11 +1267,21 @@ mod tests {
 
         let tokens = &json["tokens"];
         let stub_access = tokens["access_token"].as_str().unwrap();
-        // The returned access stub is the file's access_token stub (codex has no broker
-        // decider yet, so it's unused for JIT, but the contract matches claude).
+        // The returned access stub is the file's access_token stub and identifies
+        // the pair JIT refresh updates.
         assert_eq!(access_stub.as_deref(), Some(stub_access));
         let stub_refresh = tokens["refresh_token"].as_str().unwrap();
-        assert!(stub_access.starts_with("pb-codex-oat-"), "{stub_access}");
+        let parts = stub_access.split('.').collect::<Vec<_>>();
+        assert_eq!(parts.len(), 3, "access stub must be a JWT");
+        assert!(parts[2].starts_with("pb-codex-oat-pllbxstub"));
+        let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(parts[1])
+            .unwrap();
+        let claims: serde_json::Value = serde_json::from_slice(&claims).unwrap();
+        assert_eq!(
+            claims.get("exp").and_then(|v| v.as_u64()),
+            Some(crate::vault::STUB_FAR_FUTURE_EXPIRES_AT_MS / 1000)
+        );
         assert!(stub_refresh.starts_with("pb-codex-ort-"), "{stub_refresh}");
         // No real-token bytes leak into the stubs (the JWT-body '-' footgun).
         for leak in ["PA-YL0AD", "with-dashes", "SIGSEG", "OPAQUE", "SECRETBODY"] {
@@ -1257,10 +1292,11 @@ mod tests {
         assert_eq!(tokens["id_token"], "ID_TOKEN_UNTOUCHED");
         assert_eq!(tokens["account_id"], "acc-123");
 
-        // Two pairs, each carrying the real and bound to the agent's hosts.
-        assert_eq!(pairs.len(), 2);
-        assert!(pairs.iter().any(|p| p.real == real_access));
-        assert!(pairs.iter().any(|p| p.real == real_refresh));
+        // Refresh has no release pair: unexpected guest refresh fails closed and
+        // can never receive real rotated tokens in its response.
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].real, real_access);
+        assert_ne!(pairs[0].real, real_refresh);
         assert!(pairs.iter().all(|p| p.hosts == hosts));
     }
 
@@ -1280,6 +1316,26 @@ mod tests {
         let b = mint_curated_stub("pb-codex-oat-");
         assert!(a.starts_with("pb-codex-oat-pllbxstub"));
         assert_ne!(a, b, "uuid suffix must make each stub unique");
+    }
+
+    #[test]
+    fn mint_codex_access_stub_is_unique_and_far_future() {
+        let a = mint_codex_access_stub();
+        let b = mint_codex_access_stub();
+        assert_ne!(a, b);
+        for stub in [a, b] {
+            let parts = stub.split('.').collect::<Vec<_>>();
+            assert_eq!(parts.len(), 3);
+            assert!(parts[2].starts_with("pb-codex-oat-pllbxstub"));
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(parts[1])
+                .unwrap();
+            let claims: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(
+                claims.get("exp").and_then(|v| v.as_u64()),
+                Some(crate::vault::STUB_FAR_FUTURE_EXPIRES_AT_MS / 1000)
+            );
+        }
     }
 
     use super::{commit_state, CommitState};

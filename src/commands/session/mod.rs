@@ -48,6 +48,18 @@ pub(crate) fn run_detached_tailer(
         std::process::id().to_string(),
     );
     let mut log = events::log::SessionLog::open_at(session_dir)?;
+    // A directory capture is the cloned home of a detached Codex PTY session.
+    // Its rollout path does not exist until Codex starts, so use the transcript
+    // discovery tailer and keep this re-exec alive as the session's sole
+    // producer. The clone is fresh (the launch path removes prior rollouts),
+    // therefore discovery can select only this session's newly-created file.
+    if capture.is_dir() {
+        let _tailer = events::transcripts::spawn_attach_tailer(log, &capture, "codex", "", &sid)
+            .ok_or_else(|| anyhow::anyhow!("Codex transcript tailer is unavailable"))?;
+        loop {
+            std::thread::park();
+        }
+    }
     // `stop` is never set in-process — the producer runs until the process is
     // SIGTERM'd by `kill_session`. FollowReader blocks waiting for appends, so
     // the drain naturally idles when the agent is quiet and resumes on activity.

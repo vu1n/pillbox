@@ -17,8 +17,9 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::agents::{
-    resolve_run_env, resolve_with_entries, workspace_mount_name, AgentSpec, Integration, RunOpts,
-    StructuredModelPolicy, StructuredProfile, GUEST_HOME, GUEST_WORKSPACE,
+    resolve_run_env, resolve_with_entries, workspace_mount_name, AgentSpec,
+    DetachedTranscriptSource, Integration, RunOpts, StructuredModelPolicy, StructuredProfile,
+    GUEST_HOME, GUEST_WORKSPACE,
 };
 use crate::attach::pump;
 use crate::errors::PillboxError;
@@ -554,7 +555,9 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
     }
 
     let (creds_share, mut swap_pairs, access_stub) = stub_oauth_creds(&home, spec, &oauth_hosts)?;
-    prepare_fresh_pty_home(spec, &creds_share, &guest_workspace)?;
+    if let Some(profile) = spec.libkrun_pty {
+        profile.prepare_cloned_home(&creds_share, &guest_workspace)?;
+    }
     // Fail loud: a vault-capable agent whose credentials file produced no stubs
     // would mount the real token into the guest unstubbed (exfiltratable by a
     // prompt-injected agent). Refuse to launch rather than leak. Generalizing the
@@ -697,74 +700,6 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
     })
 }
 
-/// Prepare the cloned home for a fresh headless Codex PTY run. Prior rollouts
-/// beside auth/config can be resumed or selected by the detached tailer, while
-/// an untrusted unique workspace parks before Codex creates any rollout. Remove
-/// only the clone's transcript subtree and trust only this run's guest mount;
-/// the authoritative auth home stays untouched.
-fn prepare_fresh_pty_home(
-    spec: &AgentSpec,
-    creds_share: &Path,
-    guest_workspace: &str,
-) -> Result<()> {
-    if spec.id != crate::agents::CODEX.id {
-        return Ok(());
-    }
-    let sessions = creds_share.join(".codex/sessions");
-    match std::fs::remove_dir_all(&sessions) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(e).with_context(|| {
-                format!(
-                    "clear cloned Codex transcript history {}",
-                    sessions.display()
-                )
-            });
-        }
-    }
-
-    // The clone's workspace mount name is unique per run. Pre-accept Codex's
-    // trust gate there so a detached, headless launch cannot park forever at
-    // "Do you trust this directory?" before it creates a rollout or accepts a
-    // driven prompt. This edits only the throwaway clone, never the user's auth
-    // home. Preserve every unrelated config key and project entry.
-    let config_path = creds_share.join(".codex/config.toml");
-    let mut config = match std::fs::read_to_string(&config_path) {
-        Ok(text) => text
-            .parse::<toml::Value>()
-            .with_context(|| format!("parse cloned Codex config {}", config_path.display()))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            toml::Value::Table(toml::map::Map::new())
-        }
-        Err(e) => {
-            return Err(e)
-                .with_context(|| format!("read cloned Codex config {}", config_path.display()));
-        }
-    };
-    let root = config
-        .as_table_mut()
-        .context("cloned Codex config root must be a TOML table")?;
-    let projects = root
-        .entry("projects")
-        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
-        .as_table_mut()
-        .context("cloned Codex config `projects` must be a TOML table")?;
-    let project = projects
-        .entry(guest_workspace)
-        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
-        .as_table_mut()
-        .context("cloned Codex project trust entry must be a TOML table")?;
-    project.insert("trust_level".into(), toml::Value::String("trusted".into()));
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create cloned Codex config dir {}", parent.display()))?;
-    }
-    std::fs::write(&config_path, toml::to_string(&config)?)
-        .with_context(|| format!("write cloned Codex config {}", config_path.display()))?;
-    Ok(())
-}
-
 /// Start the microVM detached: spawn the VMM child so it outlives the CLI (it's
 /// reparented to init), hand it the reals on stdin, record the session, return.
 /// No pump and no teardown (the clones + spec persist for the running VM;
@@ -854,7 +789,7 @@ fn run_detached(
         // session back down instead of returning a session that is known to be
         // unsafe to drive.
         let _ = kill_session(resolved, &session);
-        return Err(e).context("start detached Codex transcript tailer");
+        return Err(e).context("start detached session transcript tailer");
     }
     // Don't wait: the child (VM + egress + MITM, with the vault) is reparented to
     // init and keeps running.
@@ -1680,13 +1615,16 @@ fn spawn_session_tailer(
     session: &crate::session::Session,
     spec: &AgentSpec,
 ) -> Result<()> {
-    let (capture, format) = if let Some(profile) = spec.server.as_ref() {
-        (server_events_file(session)?, profile.events_format)
-    } else if spec.id == crate::agents::CODEX.id && spec.integration == Integration::Pty {
+    let (capture, source) = if let Some(profile) = spec.server.as_ref() {
         (
-            PathBuf::from(LibkrunHandle::decode(session)?.creds),
-            crate::events::EventsFormat::Ndjson,
+            server_events_file(session)?,
+            DetachedTranscriptSource::ServerCapture(profile.events_format),
         )
+    } else if let Some(source) = spec
+        .libkrun_pty
+        .and_then(|profile| profile.detached_transcript())
+    {
+        (PathBuf::from(LibkrunHandle::decode(session)?.creds), source)
     } else {
         return Ok(());
     };
@@ -1696,7 +1634,7 @@ fn spawn_session_tailer(
         .arg("__session-tailer")
         .arg(&dir)
         .arg(&capture)
-        .arg(format.as_str())
+        .arg(source.as_token())
         .arg(&session.id)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -1947,26 +1885,6 @@ const SEND_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// drive-while-attached needs a threaded accept loop.
 fn pty_send(sock: &str, bytes: &[u8]) -> Result<()> {
     pty_send_with_timing(sock, bytes, SEND_READY_TIMEOUT, SEND_SETTLE)
-}
-
-/// Translate the command-layer's explicit LF turn terminator into Codex's PTY
-/// submit sequence. Codex 0.151 runs its TUI in raw mode: LF inserts text but
-/// does not produce `KeyCode::Enter`, while a body and CR delivered in the same
-/// raw burst can race the input widget's state update. Bracketed paste makes the
-/// body one input event; the following CR is then an unambiguous submit event.
-///
-/// Only a trailing LF opts into this turn-level behavior. Inputs without it stay
-/// byte-for-byte raw, preserving the lower-level PTY drive contract.
-fn codex_pty_input(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
-    let Some(body) = bytes.strip_suffix(b"\n") else {
-        return std::borrow::Cow::Borrowed(bytes);
-    };
-    let body = body.strip_suffix(b"\r").unwrap_or(body);
-    let mut framed = Vec::with_capacity(body.len() + 13);
-    framed.extend_from_slice(b"\x1b[200~");
-    framed.extend_from_slice(body);
-    framed.extend_from_slice(b"\x1b[201~\r");
-    std::borrow::Cow::Owned(framed)
 }
 
 fn pty_send_with_timing(
@@ -2333,11 +2251,11 @@ impl crate::sandbox::LiveSession for LibkrunLiveSession {
         if self.session.integration() == Integration::Server {
             return crate::sandbox::drive_server_prompt(&self.session, &*self.http()?, bytes);
         }
-        let input = if self.session.agent_id == crate::agents::CODEX.id {
-            codex_pty_input(bytes)
-        } else {
-            std::borrow::Cow::Borrowed(bytes)
-        };
+        let input = crate::agents::lookup("session", &self.session.agent_id)
+            .ok()
+            .and_then(|spec| spec.libkrun_pty)
+            .map(|profile| profile.frame_input(bytes))
+            .unwrap_or_else(|| std::borrow::Cow::Borrowed(bytes));
         pty_send(&LibkrunHandle::decode(&self.session)?.sock, &input)
     }
 
@@ -2564,7 +2482,11 @@ mod tests {
         std::fs::write(codex.join("auth.json"), "auth\n").unwrap();
         std::fs::write(codex.join("config.toml"), "model = 'x'\n").unwrap();
 
-        prepare_fresh_pty_home(&crate::agents::CODEX, home.path(), "/workspace/fresh").unwrap();
+        crate::agents::CODEX
+            .libkrun_pty
+            .expect("Codex declares a libkrun PTY profile")
+            .prepare_cloned_home(home.path(), "/workspace/fresh")
+            .unwrap();
 
         assert!(!codex.join("sessions").exists());
         assert_eq!(
@@ -2583,6 +2505,26 @@ mod tests {
                 .and_then(|v| v.get("trust_level"))
                 .and_then(|v| v.as_str()),
             Some("trusted")
+        );
+    }
+
+    #[test]
+    fn malformed_codex_clone_config_fails_preparation_closed() {
+        let home = tempfile::tempdir().unwrap();
+        let codex = home.path().join(".codex");
+        std::fs::create_dir_all(&codex).unwrap();
+        std::fs::write(codex.join("config.toml"), "projects = []\n").unwrap();
+
+        let err = crate::agents::CODEX
+            .libkrun_pty
+            .expect("Codex declares a libkrun PTY profile")
+            .prepare_cloned_home(home.path(), "/workspace/fresh")
+            .expect_err("invalid cloned config must abort launch preparation");
+
+        assert!(
+            err.to_string()
+                .contains("cloned Codex config `projects` must be a TOML table"),
+            "unexpected preparation error: {err:#}"
         );
     }
 
@@ -2621,22 +2563,40 @@ mod tests {
     }
 
     #[test]
-    fn codex_pty_input_frames_newline_terminated_turn_as_paste_then_enter() {
+    fn codex_profile_frames_newline_terminated_turn_as_paste_then_enter() {
+        let profile = crate::agents::CODEX
+            .libkrun_pty
+            .expect("Codex declares a libkrun PTY profile");
         let input = b"line one\nline two\n";
         assert_eq!(
-            codex_pty_input(input).as_ref(),
+            profile.frame_input(input).as_ref(),
             b"\x1b[200~line one\nline two\x1b[201~\r"
         );
         assert_eq!(
-            codex_pty_input(b"windows newline\r\n").as_ref(),
+            profile.frame_input(b"windows newline\r\n").as_ref(),
             b"\x1b[200~windows newline\x1b[201~\r"
         );
     }
 
     #[test]
-    fn codex_pty_input_without_newline_remains_raw() {
+    fn codex_profile_keeps_non_newline_input_raw() {
+        let profile = crate::agents::CODEX
+            .libkrun_pty
+            .expect("Codex declares a libkrun PTY profile");
         let input = b"typed but not submitted";
-        let framed = codex_pty_input(input);
+        let framed = profile.frame_input(input);
+        assert!(matches!(framed, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(framed.as_ref(), input);
+    }
+
+    #[test]
+    fn pty_agent_without_profile_keeps_raw_input() {
+        assert!(crate::agents::CLAUDE.libkrun_pty.is_none());
+        let input = b"raw newline stays raw for generic PTY agents\n";
+        let framed = crate::agents::CLAUDE
+            .libkrun_pty
+            .map(|profile| profile.frame_input(input))
+            .unwrap_or_else(|| std::borrow::Cow::Borrowed(input));
         assert!(matches!(framed, std::borrow::Cow::Borrowed(_)));
         assert_eq!(framed.as_ref(), input);
     }

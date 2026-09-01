@@ -36,8 +36,19 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use anyhow::{anyhow, Context, Result};
+
 use super::{Harness, Tailer};
 use crate::events::log::SessionLog;
+
+enum TailerJoin {
+    /// Streaming tailers report failures themselves because their transport
+    /// readers predate the file producer's process-health contract.
+    Infallible(JoinHandle<()>),
+    /// File-backed transcript producers return their terminal result so a
+    /// detached owner can couple process health to evidence health.
+    Producer(JoinHandle<Result<()>>),
+}
 
 /// Owns the background tailer thread for one local foreground run.
 /// Stopping is idempotent and happens on either [`shutdown`](Self::shutdown)
@@ -55,7 +66,7 @@ pub(crate) struct TailerHandle {
     /// EOF the read. `None` for the file-based local tailer, which self-stops
     /// via its poll timeout.
     stopper: Option<Box<dyn FnOnce() + Send>>,
-    join: Option<JoinHandle<()>>,
+    join: Option<TailerJoin>,
 }
 
 impl TailerHandle {
@@ -70,7 +81,7 @@ impl TailerHandle {
         Self {
             stop,
             stopper: Some(stopper),
-            join: Some(join),
+            join: Some(TailerJoin::Infallible(join)),
         }
     }
 
@@ -84,7 +95,29 @@ impl TailerHandle {
         Self {
             stop,
             stopper: None,
-            join: Some(join),
+            join: Some(TailerJoin::Infallible(join)),
+        }
+    }
+
+    /// Wait for the producer itself to terminate without requesting shutdown.
+    ///
+    /// Detached discovery uses this instead of parking its owner process: a
+    /// healthy watcher keeps this blocked, while a clean end, error, or panic
+    /// returns and lets the owner process exit so signal-0 health is truthful.
+    pub(crate) fn wait(mut self) -> Result<()> {
+        let join = self
+            .join
+            .take()
+            .ok_or_else(|| anyhow!("transcript producer join handle is unavailable"))?;
+        join.wait()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn finished_for_test(result: Result<()>) -> Self {
+        Self {
+            stop: Arc::new(AtomicBool::new(false)),
+            stopper: None,
+            join: Some(TailerJoin::Producer(std::thread::spawn(move || result))),
         }
     }
 
@@ -103,8 +136,39 @@ impl TailerHandle {
             stopper();
         }
         if let Some(join) = self.join.take() {
-            let _ = join.join();
+            if let Err(e) = join.wait() {
+                eprintln!("pillbox: warning: transcript tailer stopped: {e:#}");
+            }
         }
+    }
+}
+
+impl TailerJoin {
+    fn wait(self) -> Result<()> {
+        match self {
+            Self::Infallible(join) => join.join().map_err(|panic| {
+                anyhow!(
+                    "transcript tailer thread panicked: {}",
+                    panic_message(panic)
+                )
+            }),
+            Self::Producer(join) => join.join().map_err(|panic| {
+                anyhow!(
+                    "transcript producer thread panicked: {}",
+                    panic_message(panic)
+                )
+            })?,
+        }
+    }
+}
+
+fn panic_message(panic: Box<dyn std::any::Any + Send + 'static>) -> String {
+    if let Some(message) = panic.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = panic.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
     }
 }
 
@@ -190,10 +254,10 @@ fn spawn_tailer(
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = Arc::clone(&stop);
 
-    let join = std::thread::spawn(move || {
+    let join = std::thread::spawn(move || -> Result<()> {
         let path = loop {
             if stop_thread.load(Ordering::Relaxed) {
-                return; // asked to stop before the transcript appeared
+                return Ok(()); // asked to stop before the transcript appeared
             }
             if let Some(p) = find_new_jsonl(&watch_root, scope_dir.as_deref(), &exclude) {
                 break p;
@@ -201,15 +265,16 @@ fn spawn_tailer(
             std::thread::sleep(Duration::from_millis(200));
         };
         let mut tailer = Tailer::new(path, session_id, harness, include_usage, log);
-        if let Err(e) = tailer.follow_until(&stop_thread) {
-            eprintln!("pillbox: warning: transcript tailer stopped: {e:#}");
-        }
+        tailer
+            .follow_until(&stop_thread)
+            .context("follow discovered transcript")?;
+        Ok(())
     });
 
     TailerHandle {
         stop,
         stopper: None,
-        join: Some(join),
+        join: Some(TailerJoin::Producer(join)),
     }
 }
 
@@ -443,5 +508,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("does-not-exist");
         assert!(snapshot_jsonl(&missing).is_empty());
+    }
+
+    #[test]
+    fn producer_wait_propagates_watcher_failure_with_context() {
+        let tailer = TailerHandle::finished_for_test(Err(anyhow!(
+            "watcher channel disconnected while following transcript"
+        )));
+
+        let error = tailer.wait().expect_err("watcher failure must propagate");
+
+        assert_eq!(
+            format!("{error:#}"),
+            "watcher channel disconnected while following transcript"
+        );
+    }
+
+    #[test]
+    fn producer_wait_returns_when_watcher_ends_cleanly() {
+        TailerHandle::finished_for_test(Ok(()))
+            .wait()
+            .expect("a clean watcher end must release its owner");
     }
 }

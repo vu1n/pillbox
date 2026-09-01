@@ -8,8 +8,9 @@
 #   Usage: scripts/smoke/run.sh [all|libkrun|cf]   (default: all)
 # Env:
 #   SMOKE_CODEX=1            also run the codex-serve libkrun smoke (opt-in: its
-#                            bring-up is more sensitive + needs the l8 image, so
-#                            it's off by default to keep the gate cry-wolf-free).
+#                            bring-up is more sensitive + needs the l8 image, and
+#                            the real Codex PTY multi-turn smoke. Off by default
+#                            to keep the gate cry-wolf-free.
 #   OPENCODE_IMAGE           runner image for opencode  (default pillbox-runner:dev)
 #   CODEX_IMAGE              runner image for codex-serve (default pillbox-runner:dev)
 #   SMOKE_MODEL              model for opencode (default zai-coding-plan/glm-4.5-air)
@@ -30,8 +31,9 @@ if [ "$which" = all ] || [ "$which" = libkrun ]; then
   scripts/smoke/libkrun-pty.sh claude "${OPENCODE_IMAGE:-pillbox-runner:dev}" || rc=1
   if [ "${SMOKE_CODEX:-0}" = 1 ]; then
     scripts/smoke/libkrun.sh codex-serve "${CODEX_IMAGE:-pillbox-runner:dev}" || rc=1
+    scripts/smoke/libkrun-pty.sh codex "${CODEX_IMAGE:-pillbox-runner:dev}" || rc=1
   else
-    echo "  · codex-serve smoke skipped (set SMOKE_CODEX=1 to include it)"
+    echo "  · Codex server + PTY smokes skipped (set SMOKE_CODEX=1 to include them)"
   fi
   # The dispatch fan-out (GHOST-004): forks 2 opencode workers, then drives /
   # scores / pulls them — boots ~2 VMs, so it runs after the single-agent smoke.

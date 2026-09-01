@@ -62,6 +62,31 @@ use crate::workspace::WorkspaceBackend;
 
 pub(crate) struct ManagedBackend;
 
+/// Proof that an agent is executable by the managed runtime. Keep this token
+/// private to the admission boundary so every managed run must pass the same
+/// support check before it can enter the workspace/Cloudflare path.
+struct SupportedManagedAgent<'a> {
+    spec: &'a AgentSpec,
+}
+
+/// The managed runtime currently drives OpenCode only. This is the one
+/// authoritative support check shared by the production run path and its
+/// executable preflight smoke.
+fn require_supported_agent(spec: &AgentSpec) -> Result<SupportedManagedAgent<'_>> {
+    if spec.id() != crate::agents::OPENCODE.id() {
+        return Err(PillboxError::usage(
+            "run",
+            format!(
+                "unsupported_execution: managed execution supports only agent `opencode`; \
+                 agent `{}` was rejected before workspace snapshot or external access",
+                spec.id()
+            ),
+        )
+        .into());
+    }
+    Ok(SupportedManagedAgent { spec })
+}
+
 impl SandboxBackend for ManagedBackend {
     /// The managed family exposes bounded agent turns, not a host PTY or a
     /// persistent remote event authority.
@@ -95,6 +120,21 @@ impl SandboxBackend for ManagedBackend {
     /// This builds ONLY the host side — the DO/worker restore+snapshot is a
     /// separate build to the same frozen contract (see docs/managed-tier.md).
     fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
+        let supported = require_supported_agent(spec)?;
+        self.run_supported(supported, opts, resolved)
+    }
+}
+
+impl ManagedBackend {
+    /// Execute an admitted OpenCode run. Requiring the admission token keeps
+    /// snapshot, persistence, allowance, provisioning, and network operations
+    /// structurally behind the support check.
+    fn run_supported(
+        &self,
+        supported: SupportedManagedAgent<'_>,
+        opts: RunOpts,
+        resolved: &Pillbox,
+    ) -> Result<()> {
         // 1. Require an R2/S3 workspace backend. The DO restores from a rustic
         //    repo it can reach (R2), not the host's local-filesystem repo —
         //    refuse a local-backend pillbox loudly instead of silently running
@@ -157,7 +197,7 @@ impl SandboxBackend for ManagedBackend {
             sandbox_id: serde_json::to_string(&handle)
                 .map_err(|e| PillboxError::config("run", format!("encode managed handle: {e}")))?,
             pty_pid: 0,
-            agent_id: spec.id.to_string(),
+            agent_id: supported.spec.id().to_string(),
             started_at: crate::session::now_rfc3339(),
             attached_pid: None,
             // The base the agent forked from — the snapshot the DO restored.
@@ -1654,6 +1694,84 @@ mod r2_scope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run_opts() -> RunOpts {
+        RunOpts {
+            workspace: None,
+            name: None,
+            mounts: Vec::new(),
+            withs: Vec::new(),
+            env_bundles: Vec::new(),
+            env_files: Vec::new(),
+            vault: false,
+            memory: false,
+            memory_briefed: Vec::new(),
+            mcps: Vec::new(),
+            mcp_tokens: Vec::new(),
+            args: vec!["must-not-run".into()],
+            detach: false,
+            label: None,
+            json: false,
+            ttl_seconds: None,
+            from_bookmark: None,
+            model: None,
+            profile: None,
+            reasoning_effort: None,
+            temperature: None,
+            egress_allow: Vec::new(),
+            egress_deny: false,
+        }
+    }
+
+    #[test]
+    fn managed_support_contract_accepts_only_opencode() {
+        assert_eq!(
+            require_supported_agent(&crate::agents::OPENCODE)
+                .expect("OpenCode remains the managed executable")
+                .spec
+                .id(),
+            "opencode"
+        );
+        for unsupported in [
+            &crate::agents::CLAUDE,
+            &crate::agents::CODEX,
+            &crate::agents::CODEX_SERVE,
+            &crate::agents::PI,
+            &crate::agents::CURSOR,
+        ] {
+            let error = require_supported_agent(unsupported)
+                .err()
+                .expect("every other managed agent must fail closed");
+            assert!(error.to_string().contains("unsupported_execution"));
+        }
+    }
+
+    /// Exercise the actual `SandboxBackend::run` boundary with no initialized
+    /// workspace or managed credentials. The only successful route to this
+    /// exact error is the first-line support gate: moving or bypassing it makes
+    /// the poison fixture fail on workspace/config access and this test red.
+    #[test]
+    fn unsupported_codex_run_rejects_before_any_managed_side_effect() {
+        crate::test_util::with_isolated_home("managed-agent-preflight", || {
+            let resolved = crate::pillbox::global();
+            assert!(!resolved.state_dir.exists());
+            std::env::remove_var("PILLBOX_MANAGED_URL");
+            std::env::remove_var("PILLBOX_MANAGED_DO_URL");
+            std::env::remove_var("PILLBOX_MANAGED_TOKEN_SECRET");
+            std::env::remove_var("PILLBOX_R2_CF_API_TOKEN");
+
+            let error = ManagedBackend
+                .run(&crate::agents::CODEX, run_opts(), &resolved)
+                .expect_err("managed Codex must be rejected");
+            let message = error.to_string();
+            assert!(message.contains("unsupported_execution"), "{message}");
+            assert!(message.contains("before workspace snapshot or external access"));
+            assert!(
+                !resolved.state_dir.exists(),
+                "preflight must not persist a session, snapshot, or other state"
+            );
+        });
+    }
 
     /// HMAC-SHA256 against the RFC 4231 Test Case 2 vector
     /// (key=`"Jefe"`, data=`"what do ya want for nothing?"`) — proves our

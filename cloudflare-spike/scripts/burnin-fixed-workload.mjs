@@ -1,14 +1,18 @@
 #!/usr/bin/env node
 
 import { createHash } from "node:crypto";
+import { execFile } from "node:child_process";
 import { readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 
 const DEFAULT_MANIFEST = new URL(
   "../testdata/burnin-reconciliation.fixture.json",
   import.meta.url,
 );
 const MAX_STATUS_PAGE_SIZE = 100;
+const execFileAsync = promisify(execFile);
 
 const args = process.argv.slice(2);
 const execute = args.includes("--execute");
@@ -17,6 +21,10 @@ const recordPath = option("--record");
 const baseUrl = option("--base-url") ?? process.env.BURNIN_BASE_URL;
 const finalizeRequestPath =
   option("--finalize-request") ?? process.env.BURNIN_FINALIZE_REQUEST_FILE;
+const managedPreflightPath =
+  option("--managed-preflight") ??
+  process.env.BURNIN_MANAGED_PREFLIGHT ??
+  fileURLToPath(new URL("../../scripts/smoke/managed-agent-preflight.sh", import.meta.url));
 
 const manifest = await readJson(manifestPath, "burn-in manifest");
 validateManifest(manifest);
@@ -38,6 +46,10 @@ if (finalizeRequestPath === undefined) {
 
 const request = manifest.workload.steps.find((step) => step.id === "first-execute").request;
 const responses = [];
+const unsupported = manifest.workload.steps.find((step) => step.id === "unsupported-managed-codex");
+const unsupportedResult = await runManagedAgentPreflight(unsupported);
+responses.push({ step_id: unsupported.id, ...unsupportedResult });
+
 const first = await call("first-execute", "/v2/executions", request, "EXECUTE");
 responses.push(summary("first-execute", first));
 expect(first.body, "first-execute", { status: "completed", disposition: "created" });
@@ -71,17 +83,6 @@ for (const [index, step] of manifest.workload.steps
     fail(`${step.id} changed request_hash`);
   }
 }
-
-const unsupported = manifest.workload.steps.find((step) => step.id === "unsupported-managed-codex");
-const unsupportedResult = {
-  step_id: unsupported.id,
-  status: "preflight_rejected",
-  disposition: "not_sent",
-  error_code: unsupported.expected.error_code,
-  provision_attempts: unsupported.expected.provision_attempts,
-  network_requests: unsupported.expected.network_requests,
-};
-responses.push(unsupportedResult);
 
 const finalizeStep = manifest.workload.steps.find((step) => step.id === "finalize");
 const finalizeRequest = await readJson(finalizeRequestPath, "operator finalize request");
@@ -192,6 +193,43 @@ async function call(stepId, path, body, tokenName) {
   return { status: response.status, body: responseBody };
 }
 
+async function runManagedAgentPreflight(step) {
+  let stdout;
+  try {
+    ({ stdout } = await execFileAsync(managedPreflightPath, [], {
+      cwd: resolve(fileURLToPath(new URL("../..", import.meta.url))),
+      env: process.env,
+      encoding: "utf8",
+      timeout: 120_000,
+      maxBuffer: 64 * 1024,
+    }));
+  } catch (error) {
+    fail(`${step.id} executable preflight failed: ${error.stderr || error.message}`);
+  }
+  let observed;
+  try {
+    observed = JSON.parse(stdout);
+  } catch {
+    fail(`${step.id} executable preflight returned non-JSON output`);
+  }
+  if (
+    observed?.schema_version !== 1 ||
+    observed?.agent !== "codex" ||
+    observed?.status !== "preflight_rejected" ||
+    observed?.disposition !== "not_sent" ||
+    observed?.error_code !== "unsupported_execution" ||
+    observed?.exit_code !== 2 ||
+    typeof observed?.observed_output !== "string" ||
+    observed?.observed_output_sha256 !== digestText(observed.observed_output) ||
+    observed?.counters?.provision_attempts !== 0 ||
+    observed?.counters?.network_requests !== 0 ||
+    observed?.counters?.state_entries_created !== 0
+  ) {
+    fail(`${step.id} did not observe the fail-closed managed boundary`);
+  }
+  return observed;
+}
+
 function summary(stepId, result) {
   const body = result.body;
   return {
@@ -259,6 +297,10 @@ function ensureTrailingSlash(value) {
 
 function digestOf(value) {
   return `sha256:${createHash("sha256").update(JSON.stringify(value)).digest("hex")}`;
+}
+
+function digestText(value) {
+  return `sha256:${createHash("sha256").update(value).digest("hex")}`;
 }
 
 function isRecord(value) {

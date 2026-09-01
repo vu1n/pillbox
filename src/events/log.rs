@@ -128,12 +128,61 @@ impl SessionLog {
     /// sequencer.)
     // Context: doc://pillbox/session-event-log-spine@0001#session-event-log-spine
     pub(crate) fn append(&mut self, events: &[Event]) -> Result<u64> {
+        self.append_exact_batch(events, None, |_| Ok(()))
+    }
+
+    /// Durably append one recoverable batch without duplicating a prefix that a
+    /// prior process wrote before crashing.
+    ///
+    /// A fresh caller passes `None`; while holding the ordinary session-log
+    /// lock, `prepare` receives the authoritative pre-append sequence and must
+    /// persist the batch's committing intent before any event is written. A
+    /// recovering caller passes that journaled sequence. Every valid event
+    /// after it must be an exact payload prefix of `events`; an unrelated append,
+    /// sequence gap, or payload mismatch fails loud. A complete prefix is a
+    /// no-op, and a partial (including torn-tail) prefix appends only its missing
+    /// suffix.
+    pub(crate) fn append_exact_batch(
+        &mut self,
+        events: &[Event],
+        pre_append_seq: Option<u64>,
+        prepare: impl FnOnce(u64) -> Result<()>,
+    ) -> Result<u64> {
         if events.is_empty() {
             return Ok(self.last_seq);
         }
         let path = self.log_path();
-        let _lock = LogLock::acquire(&path)?;
-        let mut seq = recover_last_seq(&path)?;
+        let lock = LogLock::acquire(&path)?;
+        let current_seq = recover_last_seq(&path)?;
+        let base_seq = pre_append_seq.unwrap_or(current_seq);
+        if base_seq > current_seq {
+            anyhow::bail!(
+                "recoverable log batch starts after the current session sequence ({base_seq} > {current_seq})"
+            );
+        }
+
+        let existing = read_events_at(&path, base_seq.saturating_add(1))?;
+        let durable_tail = current_seq - base_seq;
+        if durable_tail as usize != existing.len() || existing.len() > events.len() {
+            anyhow::bail!(
+                "recoverable log batch found interleaved, corrupt, or excess events after sequence {base_seq}"
+            );
+        }
+        for (index, actual) in existing.iter().enumerate() {
+            let expected_seq = base_seq + index as u64 + 1;
+            if actual.seq != expected_seq || actual.payload != events[index].payload {
+                anyhow::bail!(
+                    "recoverable log batch payload mismatch at session sequence {}",
+                    actual.seq
+                );
+            }
+        }
+
+        if pre_append_seq.is_none() {
+            prepare(base_seq)?;
+        }
+
+        let mut seq = current_seq;
         let mut buf = String::new();
         // Heal a torn trailing line: if a prior append crashed mid-write (a partial
         // record with no terminating newline), start the new event on its own line
@@ -148,13 +197,19 @@ impl SessionLog {
             );
             buf.push('\n');
         }
-        for ev in events {
+        for ev in &events[existing.len()..] {
             seq += 1;
             let line = Event { seq, ..ev.clone() };
             buf.push_str(&serde_json::to_string(&line).context("serialize log event")?);
             buf.push('\n');
         }
-        append_private_file(&path, buf.as_bytes())?;
+        if !buf.is_empty() {
+            append_private_file(&path, buf.as_bytes())?;
+        }
+        // A recovered complete prefix may have reached the page cache just
+        // before the prior process died. Sync even when no suffix was needed so
+        // the committing journal is never cleared ahead of durable log bytes.
+        lock.sync_all()?;
         self.last_seq = seq;
         Ok(seq)
     }
@@ -332,7 +387,7 @@ fn recover_last_seq(log_path: &Path) -> Result<u64> {
 /// elsewhere can't drop our lock.
 struct LogLock {
     // Held only for its fd's lifetime; closing it (drop) releases the flock.
-    _file: fs::File,
+    file: fs::File,
 }
 
 impl LogLock {
@@ -349,7 +404,13 @@ impl LogLock {
             return Err(io::Error::last_os_error())
                 .with_context(|| format!("lock {}", path.display()));
         }
-        Ok(Self { _file: file })
+        Ok(Self { file })
+    }
+
+    fn sync_all(&self) -> Result<()> {
+        self.file
+            .sync_all()
+            .with_context(|| "fsync locked session log")
     }
 }
 
@@ -589,6 +650,83 @@ mod tests {
             })
             .unwrap();
             assert_eq!(count, 1);
+        });
+    }
+
+    #[test]
+    fn exact_batch_prepares_before_append_and_recovers_before_append_crash() {
+        with_isolated_home("log-exact-before-append", || {
+            let pb = crate::pillbox::global();
+            let expected = [
+                Event::session("sess-exact", tool_call("a")),
+                Event::session("sess-exact", tool_call("b")),
+            ];
+            let mut log = SessionLog::open(&pb, "sess-exact").unwrap();
+            let error = log
+                .append_exact_batch(&expected, None, |seq| {
+                    assert_eq!(seq, 0);
+                    anyhow::bail!("simulated crash before append")
+                })
+                .unwrap_err();
+            assert!(error.to_string().contains("simulated crash"));
+            assert!(log.read_from(0).unwrap().is_empty());
+
+            let last = log
+                .append_exact_batch(&expected, Some(0), |_| panic!("already prepared"))
+                .unwrap();
+            assert_eq!(last, 2);
+            assert_eq!(log.read_from(0).unwrap().len(), 2);
+        });
+    }
+
+    #[test]
+    fn exact_batch_recovers_partial_and_full_prefixes_without_duplication() {
+        with_isolated_home("log-exact-prefix", || {
+            let pb = crate::pillbox::global();
+            let expected = [
+                Event::session("sess-exact", tool_call("a")),
+                Event::session("sess-exact", tool_call("b")),
+            ];
+            let mut log = SessionLog::open(&pb, "sess-exact").unwrap();
+            log.append(&expected[..1]).unwrap();
+
+            let path = log.log_path();
+            {
+                use std::io::Write;
+                let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+                file.write_all(b"{\"seq\":2,\"payload\":").unwrap();
+            }
+            assert_eq!(
+                log.append_exact_batch(&expected, Some(0), |_| panic!("already prepared"))
+                    .unwrap(),
+                2
+            );
+            assert_eq!(
+                log.append_exact_batch(&expected, Some(0), |_| panic!("already prepared"))
+                    .unwrap(),
+                2
+            );
+            let events = log.read_from(0).unwrap();
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0].payload, expected[0].payload);
+            assert_eq!(events[1].payload, expected[1].payload);
+        });
+    }
+
+    #[test]
+    fn exact_batch_fails_loud_on_interleaving_or_payload_mismatch() {
+        with_isolated_home("log-exact-mismatch", || {
+            let pb = crate::pillbox::global();
+            let expected = [Event::session("sess-exact", tool_call("expected"))];
+            let mut log = SessionLog::open(&pb, "sess-exact").unwrap();
+            log.append(&[Event::session("sess-exact", tool_call("other"))])
+                .unwrap();
+
+            let error = log
+                .append_exact_batch(&expected, Some(0), |_| panic!("already prepared"))
+                .unwrap_err();
+            assert!(error.to_string().contains("payload mismatch"));
+            assert_eq!(log.read_from(0).unwrap().len(), 1);
         });
     }
 

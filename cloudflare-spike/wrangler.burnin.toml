@@ -8,10 +8,9 @@ compatibility_date = "2026-06-01"
 compatibility_flags = ["nodejs_compat"]
 workers_dev = true
 
-# Create the three resources first, then replace only the D1 id/name and R2
-# bucket values below with the returned values. The UUID is syntactically
-# valid so `wrangler deploy --dry-run` can validate this isolated topology
-# before an operator provisions the remote resources.
+# Create the three resources first, then replace the D1 id/name and R2 bucket
+# in a protected local copy. The committed UUID is rejected by the bootstrap
+# validator and is present only so Wrangler can parse this non-deployable template.
 [[d1_databases]]
 binding = "EXECUTION_DB"
 database_name = "pillbox-managed-burnin-db"
@@ -27,6 +26,17 @@ binding = "RUN_COSTS"
 dataset = "pillbox_managed_burnin_costs"
 
 [vars]
+# The checked HD-013 tuple must supply these public values in a protected local
+# config or resolved Wrangler metadata. Empty values are deliberately invalid.
+PILLBOX_BOOTSTRAP_REQUIRED = "1"
+PILLBOX_GRANT_KEY_ID = ""
+PILLBOX_GRANT_PUBLIC_KEY = ""
+PILLBOX_INSTALLATION_ID = ""
+PILLBOX_EXECUTION_REALM_ID = ""
+PILLBOX_PROTOCOL_REVISION = ""
+PILLBOX_ORGANIZATION_ID = ""
+PILLBOX_MANAGED_CONCURRENCY = "1"
+
 # Fail closed by default. The operator enables this only for the one reviewed
 # burn-in claim, after applying migrations and seeding the matching D1 row.
 MANAGED_EXECUTION_ENABLED = "0"

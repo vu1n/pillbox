@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { registerHooks } from "node:module";
 import { test } from "node:test";
+import type { ManagedBurninBootstrapEnvironment } from "./src/managed_auth.ts";
 
 registerHooks({
   resolve(specifier, context, nextResolve) {
@@ -15,7 +17,11 @@ registerHooks({
   },
 });
 
-const { executionOperationRequestDigest } = await import("./src/managed_auth.ts");
+const {
+  executionOperationRequestDigest,
+  requireManagedBurninBootstrap,
+  requireManagedBurninHttpBootstrap,
+} = await import("./src/managed_auth.ts");
 import {
   managedCanonicalJson,
   makeExecutionOperationGrantCurrentnessRequest,
@@ -133,4 +139,72 @@ test("operation authorization digest binds the canonical invocation idempotency 
 
   assert.match(canonical, /^sha256:[0-9a-f]{64}$/);
   assert.notEqual(noncanonical, canonical);
+});
+
+test("burn-in runtime bootstrap rejects incomplete deployment pins before execution", () => {
+  const complete: ManagedBurninBootstrapEnvironment = {
+    PILLBOX_BOOTSTRAP_REQUIRED: "1",
+    MANAGED_CAPABILITY_SECRET: "s".repeat(32),
+    PILLBOX_GRANT_KEY_ID: "huddles-pillbox-grant-burnin-1",
+    PILLBOX_GRANT_PUBLIC_KEY: "ed25519:SKaA_nE69844nq00przjwmcPcg5iRY1hL4fnfgipY94",
+    PILLBOX_INSTALLATION_ID: "pillbox-burnin-installation-1",
+    PILLBOX_EXECUTION_REALM_ID: "pillbox-managed-burnin-1",
+    PILLBOX_PROTOCOL_REVISION: "pillbox.huddles/1",
+    PILLBOX_ORGANIZATION_ID: "pillbox-burnin-organization-1",
+    PILLBOX_MANAGED_CONCURRENCY: "1",
+    MANAGED_EXECUTION_EPOCH: "burnin-2026-09-01-v1",
+    MANAGED_EXECUTION_LIMIT: "1",
+    PillboxAuthorizationCurrentness: {
+      authorizeExecutionOperationGrant: async () => operationClaims,
+    },
+  };
+
+  assert.doesNotThrow(() => requireManagedBurninBootstrap(complete));
+  assert.doesNotThrow(() => requireManagedBurninHttpBootstrap(complete));
+  const withoutHttpSecret = {
+    ...complete,
+    MANAGED_CAPABILITY_SECRET: undefined,
+  };
+  assert.doesNotThrow(() => requireManagedBurninBootstrap(withoutHttpSecret));
+  assert.throws(
+    () => requireManagedBurninHttpBootstrap(withoutHttpSecret),
+    /capability secret is not configured/,
+  );
+  assert.throws(
+    () =>
+      requireManagedBurninBootstrap({
+        ...complete,
+        PILLBOX_GRANT_PUBLIC_KEY: "ed25519:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      }),
+    /grant public key is invalid/,
+  );
+  assert.throws(
+    () =>
+      requireManagedBurninBootstrap({
+        ...complete,
+        PILLBOX_MANAGED_CONCURRENCY: "2",
+      }),
+    /concurrency pins do not match/,
+  );
+  assert.throws(
+    () =>
+      requireManagedBurninBootstrap({
+        ...complete,
+        PillboxAuthorizationCurrentness: undefined,
+      }),
+    /currentness service is not configured/,
+  );
+});
+
+test("Worker runs the burn-in bootstrap gate before request routing", async () => {
+  const worker = await readFile(new URL("./src/worker.ts", import.meta.url), "utf8");
+  const fetchStart = worker.indexOf("async fetch(req: Request, env: Env)");
+  const bootstrap = worker.indexOf("requireManagedBurninHttpBootstrap(env)", fetchStart);
+  const execution = worker.indexOf("routeExecutionRequest(req, env)", fetchStart);
+  const workspace = worker.indexOf("routeWorkspaceTransfer(req, env)", fetchStart);
+
+  assert.ok(fetchStart >= 0);
+  assert.ok(bootstrap > fetchStart);
+  assert.ok(execution > bootstrap);
+  assert.ok(workspace > execution);
 });

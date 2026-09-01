@@ -32,7 +32,10 @@ import {
   type InvokeSessionRequest,
   type InvokeSessionResult,
 } from "./legacy_huddles_adapter.js";
-import { authorizeExecutionOperation } from "./managed_auth.js";
+import {
+  authorizeExecutionOperation,
+  requireManagedBurninBootstrap,
+} from "./managed_auth.js";
 import type { PillboxExecutionOperationGrantIssueResponse } from "./managed_contract.js";
 import {
   RunCostMeter,
@@ -129,6 +132,7 @@ export function executionService(
   env: Env,
   authorizer?: ExecutionOperationAuthorizer,
 ): ExecutionService {
+  requireManagedBurninBootstrap(env);
   const meter = new RunCostMeter();
   const store = new D1ExecutionStore(
     env.EXECUTION_DB as unknown as RelationalDatabase,

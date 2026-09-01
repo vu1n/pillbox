@@ -14,6 +14,10 @@ import {
 import { routeWorkspaceTransfer } from "./workspace_transfer.js";
 import type { PillboxAuthorizationCurrentness } from "./managed_auth.js";
 import {
+  ManagedBootstrapError,
+  requireManagedBurninHttpBootstrap,
+} from "./managed_auth.js";
+import {
   ManagedAdmissionError,
   managedAdmissionPolicy,
   requireManagedAdmission,
@@ -35,6 +39,8 @@ export interface Env {
   // exact request bytes, operation, and resource. Huddles reaches the private
   // service binding and does not use this public bearer-token surface.
   MANAGED_CAPABILITY_SECRET?: string;
+  /** Makes the isolated burn-in reject every request until its full bootstrap is installed. */
+  PILLBOX_BOOTSTRAP_REQUIRED?: string;
   /** Private Huddles currentness binding. Transport auth is not workload auth. */
   PillboxAuthorizationCurrentness?: PillboxAuthorizationCurrentness;
   /** Public verification half of the active Huddles Ed25519 grant key. */
@@ -44,6 +50,8 @@ export interface Env {
   PILLBOX_EXECUTION_REALM_ID?: string;
   PILLBOX_PROTOCOL_REVISION?: string;
   PILLBOX_ORGANIZATION_ID?: string;
+  /** Must match both the Huddles bootstrap limit and Wrangler container max_instances. */
+  PILLBOX_MANAGED_CONCURRENCY?: string;
   /** Exact "1" admits new managed executions and workspace provisioning. */
   MANAGED_EXECUTION_ENABLED?: string;
   /** Operator-reviewed epoch and hard cap for genuinely new managed claims. */
@@ -69,6 +77,15 @@ export interface Env {
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
+    try {
+      requireManagedBurninHttpBootstrap(env);
+    } catch (cause) {
+      if (!(cause instanceof ManagedBootstrapError)) throw cause;
+      return Response.json(
+        { error: { code: cause.code, message: cause.message } },
+        { status: 503 },
+      );
+    }
     if (
       req.method === "POST" &&
       new URL(req.url).pathname === "/v2/workspaces/provision"

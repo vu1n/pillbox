@@ -66,6 +66,20 @@ test("public provisioning and local legacy invocation keep the admission guard",
   assert.ok(invoke >= 0 && admission > invoke && execution > admission);
 });
 
+test("private Huddles execution validates burn-in bootstrap before service construction", async () => {
+  const runtime = await readFile(
+    new URL("./src/huddles_runtime.ts", import.meta.url),
+    "utf8",
+  );
+  const factory = runtime.indexOf("export function executionService(");
+  const bootstrap = runtime.indexOf("requireManagedBurninBootstrap(env)", factory);
+  const store = runtime.indexOf("new D1ExecutionStore", factory);
+
+  assert.ok(factory >= 0);
+  assert.ok(bootstrap > factory);
+  assert.ok(store > bootstrap);
+});
+
 test("legacy Huddles invocation translates only execution-owned fields", async () => {
   const rendered_input = "Return structured output.";
   const translated = legacyExecutionRequest({

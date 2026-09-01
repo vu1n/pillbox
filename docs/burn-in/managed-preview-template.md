@@ -47,6 +47,51 @@ checked OPS-000 outputs; it does not provide an alternate manual bootstrap.
 Do not enable the Worker unless that bootstrap dry-run proves the complete
 matching tuple and the one-run allowance.
 
+The committed `wrangler.burnin.toml` is deliberately non-deployable: its public
+pin values are empty and its parse-only D1 UUID is rejected by the bootstrap
+validator. Materialize a protected local copy from the HD-013/OPS-000 output;
+never replace the template with guessed identifiers. The non-secret Huddles
+tuple has schema `huddles.pillbox-burnin-bootstrap/1` and is authoritative for
+the signer key ID/public key/fingerprint, installation, execution realm,
+protocol revision, organization, currentness service/entrypoint, and concurrency
+of one.
+
+Install the mandatory public-HTTP capability secret through Wrangler stdin.
+The secret must not appear in a command argument, shell trace, config, metadata,
+or terminal output:
+
+```sh
+set +x
+umask 077
+read -r -s PB_BURNIN_CAPABILITY_SECRET
+printf '%s' "$PB_BURNIN_CAPABILITY_SECRET" |
+  npx wrangler secret put MANAGED_CAPABILITY_SECRET \
+    -c /private/path/wrangler.burnin.resolved.toml
+npx wrangler secret list \
+  -c /private/path/wrangler.burnin.resolved.toml \
+  --json \
+  > /private/path/wrangler-secret-metadata.json
+```
+
+`wrangler secret list` records names and types only; check that the protected
+metadata file contains `MANAGED_CAPABILITY_SECRET`, never its value. Validate
+the complete resolved tuple before any dry-run, migration, seed, or enablement:
+
+```sh
+node cloudflare-spike/scripts/validate-burnin-bootstrap.mjs \
+  --bootstrap /private/path/huddles-pillbox-burnin-bootstrap.json \
+  --config /private/path/wrangler.burnin.resolved.toml \
+  --metadata /private/path/wrangler-secret-metadata.json
+```
+
+The validator fails on a missing secret name, empty or placeholder resource,
+invalid key/fingerprint, missing pin, tuple mismatch, wrong currentness binding,
+or concurrency other than one. Its successful output contains public pins and
+the word `installed`; it never reads or prints secret material. The Worker
+repeats the executable subset of this preflight before routing any public
+request. Huddles continues to use its private service binding plus signed,
+current operation grants; this public HMAC secret does not replace that path.
+
 The config contains only the vendor-owned `Sandbox` Durable Object class and
 sets `max_instances = 1`. Do not add `SessionGateway`, a VFS class, or any
 Pillbox-authored DO class.
@@ -62,7 +107,9 @@ npm test
 npx tsc --noEmit
 npm run check:contract
 node --test do_usage_policy.test.mjs
-npm run burnin:dry-run
+npx wrangler deploy \
+  -c /private/path/wrangler.burnin.resolved.toml \
+  --dry-run --containers-rollout=none
 npm run burnin
 ```
 
@@ -78,7 +125,7 @@ gates pass. The default config remains off; enabling is an explicit operator
 override, not a repository edit:
 
 ```sh
-npx wrangler deploy -c wrangler.burnin.toml \
+npx wrangler deploy -c /private/path/wrangler.burnin.resolved.toml \
   --var MANAGED_EXECUTION_ENABLED:1 \
   --containers-rollout=none
 ```
@@ -99,6 +146,21 @@ BURNIN_FINALIZE_TOKEN=<exact-finalize-capability> \
 BURNIN_FINALIZE_REQUEST_FILE=/private/path/finalize.json \
 npm run burnin -- --execute --record /private/path/burnin-report.json
 ```
+
+The Huddles recorder above stays on the private service-binding path. If the
+Pillbox-only public HTTP recorder is used instead, export the exact same local
+secret that was sent to Wrangler so Pillbox mints the request-bound bearer
+capabilities the Worker verifies; do not generate a second HMAC key:
+
+```sh
+PILLBOX_MANAGED_TOKEN_SECRET="$PB_BURNIN_CAPABILITY_SECRET" \
+  pillbox run --managed
+unset PB_BURNIN_CAPABILITY_SECRET
+```
+
+Mint only short-lived capabilities for the canonical request bytes. Clear the
+local secret after the required tokens exist; never write it or the bearer
+tokens into the bootstrap tuple, Wrangler metadata, manifest, report, or Git.
 
 The exact retry uses the same execute request and capability scope. The Codex
 step is a local preflight and must make zero HTTP requests and zero Sandbox

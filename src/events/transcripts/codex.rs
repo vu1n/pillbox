@@ -17,15 +17,16 @@
 //!   marker in a Codex rollout: a tool-using turn can contain several
 //!   intermediate assistant `response_item.message` records.
 //!
-//! Other envelope-only types (`session_meta`, `turn_context`, `event_msg`)
-//! are dropped. `message` lines with `role=assistant` / `developer` /
-//! `system` are also dropped: assistant output is emitted once from
-//! `task_complete`, while developer/system are harness prompts.
+//! Other envelope-only types (`session_meta`, `turn_context`) and `event_msg`
+//! variants other than `task_complete` are dropped. `message` lines with
+//! `role=assistant` / `developer` / `system` are also dropped: assistant output
+//! is emitted once from `task_complete`, while developer/system are harness
+//! prompts.
 //!
 //! Unlike Claude Code, Codex lines have no per-line `uuid`. We
-//! synthesize one from `payload.call_id` (function calls/results) or
-//! from the file-line index (messages, reasoning), suffixed with a
-//! type prefix so collisions across event kinds are impossible.
+//! synthesize one from `payload.call_id` (function calls/results), `turn_id`
+//! (task completion), or the file-line index (messages, reasoning), suffixed
+//! with a type prefix so collisions across event kinds are impossible.
 
 use std::time::SystemTime;
 
@@ -85,12 +86,11 @@ fn parse_message(
         return None;
     }
     let uuid = format!("msg:{line_idx}");
-    let kind = EventKind::UserPrompt { content: text };
     Some(TranscriptEvent {
         uuid,
         parent_uuid: None,
         timestamp,
-        kind,
+        kind: EventKind::UserPrompt { content: text },
     })
 }
 
@@ -104,6 +104,7 @@ fn parse_task_complete(v: &serde_json::Value, line_idx: usize) -> Option<Transcr
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
+    // Keep an empty final-message event: task_complete is also the idle boundary.
     let turn_id = payload
         .get("turn_id")
         .and_then(|v| v.as_str())

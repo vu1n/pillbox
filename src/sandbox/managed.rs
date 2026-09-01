@@ -1492,7 +1492,8 @@ mod r2_scope {
                 account_id_from_endpoint("abc123.r2.cloudflarestorage.com/ws"),
                 Some("abc123".to_string())
             );
-            // Not an R2 host → no scoping (MinIO/Backblaze/native S3).
+            // Not an R2 host → the managed transfer boundary rejects it because
+            // Cloudflare cannot mint a scoped credential for that endpoint.
             assert_eq!(account_id_from_endpoint("https://s3.amazonaws.com"), None);
             assert_eq!(account_id_from_endpoint("https://minio.local:9000"), None);
             // A sub-subdomain isn't a bare account id.

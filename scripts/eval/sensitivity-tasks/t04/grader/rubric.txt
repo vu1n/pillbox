@@ -1,0 +1,4 @@
+range_span [1, 5, 3]=4 :: python3 -c 'import sys;sys.path.insert(0,".");from solution import range_span as f;assert f([1, 5, 3])==4'
+range_span [7]=0 :: python3 -c 'import sys;sys.path.insert(0,".");from solution import range_span as f;assert f([7])==0'
+range_span [-2, 2]=4 :: python3 -c 'import sys;sys.path.insert(0,".");from solution import range_span as f;assert f([-2, 2])==4'
+range_span []=-1 :: python3 -c 'import sys;sys.path.insert(0,".");from solution import range_span as f;assert f([])==-1'

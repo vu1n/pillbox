@@ -1,0 +1,199 @@
+# syntax=docker/dockerfile:1
+# Runner image for pillbox sandboxes.
+#
+# Six agent harnesses preinstalled at known paths:
+#   - claude  (Anthropic's native installer → /usr/local/bin/claude)
+#   - codex   (OpenAI's official installer → /usr/local/bin/codex)
+#   - amp     (npm: @ampcode/cli)
+#   - opencode (npm: opencode-ai)
+#   - pi      (npm: @earendil-works/pi-coding-agent)
+#   - cursor  (Cursor Agent CLI lab tarball → /usr/local/bin/agent)
+#
+# System tooling chosen to cover the agents' subagent + shell needs:
+# bubblewrap (codex/claude subagent sandboxing), git/gh (vcs ops),
+# ripgrep (search), tmux (multi-pane TUI), jq (json scripting),
+# gawk (codex installer's SHA256 manifest check uses interval regexes
+# that Debian's default mawk doesn't support),
+# python3 + pip/venv (script runner; grader test-deps via `session score
+# --grader-egress` — bookworm pip is PEP-668 externally-managed, so graders
+# use a venv), openssl (vault CA verification),
+# curl/ca-certificates (pulls + TLS).
+#
+# Contract assumed by pillbox CLI:
+#   - Agent binaries are on $PATH (verified by `pillbox doctor`)
+#   - /workspace exists and is writable (bind-mount target)
+#   - /etc is writable for the --mcp-config bind mount
+#   - HOME is set by the caller (pillbox sets HOME=/home/pillbox at runtime
+#     and bind-mounts the agent's persistent auth state there)
+#   - A shell is available
+#
+# To layer your own tools, FROM this image and apt-get / npm-install on top:
+#   FROM ghcr.io/vu1n/pillbox-runner:vX.Y.Z
+#   RUN apt-get update && apt-get install -y my-tool && rm -rf /var/lib/apt/lists/*
+#
+# NOTE: the build context is the REPO ROOT (not runner/), because the
+# pillbox binary is compiled in-image below:
+#   docker buildx build -f runner/Dockerfile .
+
+# ---- build stage: compile the in-sandbox pillbox binary ----------------
+# The runner ships `pillbox` itself: the interactive attach pty-host
+# (`pillbox pty-host`) and the in-sandbox emitter / `session done` wrapper
+# all run *inside* the sandbox, matching what the e2b/ssh backends already
+# assume. Same glibc (bookworm) as the runtime stage below.
+FROM rust:1-bookworm AS pillbox-build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+# Cache mounts keep the cargo registry + compiled deps on the build daemon, so
+# a rebuild on the same host only recompiles changed crates (minutes → seconds
+# on iteration — the BYO/on-target build loop). The `runner` profile skips
+# release LTO for a much faster compile (see Cargo.toml). `cp` runs inside the
+# same RUN so it grabs the binary before the target cache mount detaches.
+#
+# `--no-default-features` drops the default `libkrun` feature: the in-sandbox
+# binary is only `pty-host` + emitter + `session done` (all guest-side, none
+# feature-gated), and libkrun is the HOST VMM launcher — its build.rs links
+# `-lkrun`, which isn't present in this toolchain-free rust:bookworm image
+# (`cannot find -lkrun`). This is the `--no-default-features` path Cargo.toml
+# documents for non-libkrun-toolchain builds; without it the image won't build.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --profile runner --locked --no-default-features && cp target/runner/pillbox /pillbox
+
+# ---- runtime stage -----------------------------------------------------
+FROM debian:bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV NPM_CONFIG_UPDATE_NOTIFIER=false
+ENV NODE_ENV=production
+# Agents/graders run with an explicit PATH from `agents::guest_path()`
+# (/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin). Install agent binaries onto
+# one of those dirs (this image uses /usr/local/bin) or guest_path() must change.
+ENV PATH="/usr/local/bin:${PATH}"
+
+RUN apt-get update \
+	&& apt-get install -y --no-install-recommends \
+		bash \
+		bubblewrap \
+		ca-certificates \
+		curl \
+		gawk \
+		gh \
+		git \
+		iproute2 \
+		jq \
+		openssl \
+		python3 \
+		python3-pip \
+		python3-venv \
+		ripgrep \
+		tmux \
+		xz-utils \
+	&& rm -rf /var/lib/apt/lists/*
+
+# Node 22 LTS from NodeSource — Debian's `nodejs` package lags behind
+# what the agent CLIs require.
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+	&& apt-get update \
+	&& apt-get install -y --no-install-recommends nodejs \
+	&& rm -rf /var/lib/apt/lists/*
+
+# Agent-harness version pins. Every agent is pinned to a concrete
+# version so Docker's layer cache is keyed on the version we actually
+# want: an unpinned `@latest` (or the installer's "always newest"
+# default) rides a RUN whose command string never changes, so a rebuild
+# silently reuses the stale layer instead of pulling the newer agent.
+# Pinning makes the cache honest — bump the pin and rebuild to update.
+# Renovate (see renovate.json at repo root) tracks each `# renovate:`-
+# hinted pin and opens PRs on upstream bumps.
+#
+# claude installs via its native installer, but its versions match the
+# @anthropic-ai/claude-code npm package, so Renovate tracks that as the
+# source of truth (the version string is passed to install.sh below).
+# renovate: datasource=npm depName=@anthropic-ai/claude-code
+ARG CLAUDE_VERSION=2.1.251
+# renovate: datasource=github-releases depName=openai/codex extractVersion=^rust-v(?<version>.*)$
+ARG CODEX_VERSION=0.151.0
+# renovate: datasource=npm depName=opencode-ai
+ARG OPENCODE_VERSION=1.18.25
+# renovate: datasource=npm depName=@earendil-works/pi-coding-agent
+ARG PI_VERSION=0.84.4
+# Cursor Agent CLI — no Renovate datasource; lab version string from
+# downloads.cursor.com/lab/<ver>/linux/<arch>/agent-cli-package.tar.gz
+ARG CURSOR_AGENT_VERSION=2026.08.25-3e8eec8
+# amp has no Renovate-trackable pin: its publish scheme is timestamp+sha
+# (e.g. 0.0.1782062050-gbe2b79), which Renovate's semver matcher can't
+# compare. Pinned anyway for a deterministic layer cache; bump by hand
+# (`npm view @ampcode/cli version`) when you want a newer amp.
+ARG AMP_VERSION=0.0.1788148853-g38a2d7
+
+RUN npm install -g \
+		@ampcode/cli@${AMP_VERSION} \
+		opencode-ai@${OPENCODE_VERSION} \
+		@earendil-works/pi-coding-agent@${PI_VERSION} \
+	&& npm cache clean --force
+	# ^ the global install leaves a populated npm cache (~/.npm) in the
+	#   layer that nothing reads at runtime — drop it.
+
+# Codex: official standalone installer (native binary; the npm wrapper is
+# no longer how upstream ships protocol-bearing builds like `app-server`).
+# Same scratch-HOME pattern as Claude below: the installer symlinks
+# ~/.local/bin/codex into $CODEX_HOME/packages/standalone/releases/<ver>,
+# so resolve the link with `cp -L` into /usr/local/bin and drop the
+# scratch tree.
+RUN curl -fsSL https://chatgpt.com/codex/install.sh -o /tmp/codex-install.sh \
+	&& HOME=/opt/codex-install CODEX_RELEASE=${CODEX_VERSION} CODEX_NON_INTERACTIVE=1 \
+		sh /tmp/codex-install.sh \
+	&& cp -L /opt/codex-install/.local/bin/codex /usr/local/bin/codex \
+	&& chmod +x /usr/local/bin/codex \
+	&& rm /tmp/codex-install.sh \
+	&& rm -rf /opt/codex-install
+
+# Claude Code: official native installer. The version arg ($1 →
+# `claude install <VERSION>`) pins which release the launcher resolves
+# to; without it the installer always tracks newest, which the layer
+# cache can't see. Run with HOME pointed at a stable /opt path so the
+# installer's writes don't get shadowed if a downstream consumer mounts
+# a tmpfs over /root or /home. Copy the resolved binary into
+# /usr/local/bin so it survives any HOME shuffle.
+RUN curl -fsSL https://claude.ai/install.sh -o /tmp/claude-install.sh \
+	&& HOME=/opt/claude-install bash /tmp/claude-install.sh ${CLAUDE_VERSION} \
+	&& cp -L /opt/claude-install/.local/bin/claude /usr/local/bin/claude \
+	&& chmod +x /usr/local/bin/claude \
+	&& rm /tmp/claude-install.sh \
+	&& rm -rf /opt/claude-install
+	# ^ the installer's scratch HOME is a full second copy of Claude Code
+	#   (its bundled runtime + node_modules, ~250MB). We've copied the
+	#   resolved binary into /usr/local/bin, so drop the scratch dir —
+	#   otherwise it rides along dead in the layer.
+
+# Cursor Agent CLI: versioned lab tarball (same URL the install script uses).
+# Pin CURSOR_AGENT_VERSION and bump by hand when upgrading — Renovate cannot
+# track cursor.com/lab releases today.
+RUN ARCH="$(uname -m)" \
+	&& case "$ARCH" in x86_64|amd64) CURSOR_ARCH=x64;; aarch64|arm64) CURSOR_ARCH=arm64;; *) echo "unsupported arch: $ARCH" >&2; exit 1;; esac \
+	&& mkdir -p "/opt/cursor-agent/versions/${CURSOR_AGENT_VERSION}" \
+	&& curl -fSL "https://downloads.cursor.com/lab/${CURSOR_AGENT_VERSION}/linux/${CURSOR_ARCH}/agent-cli-package.tar.gz" \
+	| tar --strip-components=1 -xzf - -C "/opt/cursor-agent/versions/${CURSOR_AGENT_VERSION}" \
+	&& ln -sf "/opt/cursor-agent/versions/${CURSOR_AGENT_VERSION}/cursor-agent" /usr/local/bin/agent \
+	&& ln -sf "/opt/cursor-agent/versions/${CURSOR_AGENT_VERSION}/cursor-agent" /usr/local/bin/cursor-agent
+
+# The in-sandbox pillbox: pty-host, event emitter, session-done wrapper.
+COPY --from=pillbox-build /pillbox /usr/local/bin/pillbox
+
+# Boot hook that installs the vault CA into the system trust store when
+# pillbox bind-mounts one — required for non-Node agents (Codex's
+# reqwest, future Rust/Go agents) to honor the MITM cert. Node agents
+# go through `NODE_EXTRA_CA_CERTS` and don't need this. See
+# `runner/entrypoint.sh` for the full rationale; the script is a
+# no-op on non-vaulted runs.
+COPY runner/entrypoint.sh /usr/local/bin/pillbox-entrypoint.sh
+RUN chmod +x /usr/local/bin/pillbox-entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/pillbox-entrypoint.sh"]
+
+WORKDIR /workspace
+
+# `sleep infinity` for `docker exec`-style consumers; pillbox CLI
+# overrides with the agent command via `docker run … claude` etc.
+# The entrypoint above runs first, then execs whatever CMD lands here.
+CMD ["sleep", "infinity"]

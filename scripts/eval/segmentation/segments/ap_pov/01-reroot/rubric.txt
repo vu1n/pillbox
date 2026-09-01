@@ -1,0 +1,13 @@
+# Segment-1 gate — Tree.from_pov (reroot). An authoritative SUBSET of the task's
+# hidden pov_test.py (the harness injects that test module into a throwaway copy
+# at grade time; the agent never sees it). This gate only decides whether the
+# segmented arm ADVANCES to segment 2 — the comparable score for BOTH arms is the
+# FULL pov_test rubric graded at the end, so a coarse gate can't bias the metric.
+reroot-singleton :: python3 -m unittest pov_test.PovTest.test_results_in_the_same_tree_if_the_input_tree_is_a_singleton
+reroot-parent-one-sibling :: python3 -m unittest pov_test.PovTest.test_can_reroot_a_tree_with_a_parent_and_one_sibling
+reroot-parent-many-siblings :: python3 -m unittest pov_test.PovTest.test_can_reroot_a_tree_with_a_parent_and_many_siblings
+reroot-deeply-nested :: python3 -m unittest pov_test.PovTest.test_can_reroot_a_tree_with_new_root_deeply_nested_in_tree
+reroot-moves-children :: python3 -m unittest pov_test.PovTest.test_moves_children_of_the_new_root_to_same_level_as_former_parent
+reroot-complex-cousins :: python3 -m unittest pov_test.PovTest.test_can_reroot_a_complex_tree_with_cousins
+reroot-error-singleton :: python3 -m unittest pov_test.PovTest.test_errors_if_target_does_not_exist_in_a_singleton_tree
+reroot-error-large :: python3 -m unittest pov_test.PovTest.test_errors_if_target_does_not_exist_in_a_large_tree

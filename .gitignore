@@ -1,0 +1,34 @@
+/target
+# Cross-arch build dirs (e.g. target-amd64/ from a cross build) — same
+# build-artifact class as /target; one `git add -A` would otherwise stage ~1GB.
+/target-*
+
+# macOS Finder cruft.
+.DS_Store
+
+# Agent worktrees created by the Claude Code harness (locked, ephemeral).
+.claude/worktrees/
+
+# Local-only env (secrets like E2B_API_KEY for dev/test). Never commit.
+.env
+.env.local
+.env.*.local
+
+# Node deps (wrangler/opencode dev tooling) — never commit; a stray `npm i`
+# once swept the whole tree (incl. a 100MB+ workerd binary) into history.
+node_modules/
+
+# Python bytecode + uv venvs (scripts/ghost/*)
+__pycache__/
+*.pyc
+.venv/
+scripts/eval/toolz-tasks/
+
+# Run logs + ghost scratch outputs — noisy, regenerable, not evidence (all just
+# {task,cond,trial,score,cost} scalars + progress lines; no transcripts/memory).
+# The curated σ̂ result jsonls under scripts/eval/segmentation/results/ ARE tracked
+# (the evidence archive — see its README); only the .log transcripts there are ignored.
+scripts/eval/segmentation/results/*.log
+scripts/ghost/*.jsonl
+scripts/ghost/*.json
+scripts/ghost/*.log

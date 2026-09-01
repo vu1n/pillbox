@@ -1,0 +1,13 @@
+# Segment 2 of 2 — sorted roster + per-grade query
+
+Continue `grade_school.py` from the previous segment. Enrollment
+(`add_student` / `added`) already works — build on it, keep it working. Now
+implement the sorted read side:
+
+- `grade(grade_number)` — the students in one grade, sorted alphabetically by
+  name (empty if that grade has none).
+- `roster()` — ALL students, sorted by grade (1, 2, 3, …) and then
+  alphabetically by name within each grade.
+
+Edit `grade_school.py` directly. Do not break the enrollment / de-duplication
+behavior from the previous segment.

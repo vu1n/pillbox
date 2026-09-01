@@ -1,0 +1,4 @@
+Implement `digit_sum_max(xs)` in `solution.py`: return the largest digit-sum among the non-negative integers in `xs` (e.g. 91 → 10).
+
+`xs` is a list of integers. Edit ONLY `solution.py`. Keep the function name and
+signature exactly as given.

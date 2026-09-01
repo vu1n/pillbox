@@ -1,0 +1,6 @@
+# test-pass — the project's test suite is green. Language-agnostic skeleton;
+# replace the runner with the project's (cargo test / go test ./... / npm test).
+build :: cargo build
+unit-tests :: cargo test
+# Example for a Python project (uncomment + drop the cargo lines above):
+# unit-tests :: python3 -m pytest -q

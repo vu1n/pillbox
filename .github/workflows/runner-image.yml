@@ -1,0 +1,81 @@
+name: runner-image
+# Triggers narrowed during prerelease iteration: only build the published
+# image on an explicit version tag (or a manual `workflow_dispatch`).
+# Local musl builds + manual `e2b template build` cover the dev loop, so
+# rebuilding the GHCR image on every `src/**` push to main was burning
+# minutes for no consumer. When we're ready to publish more frequently,
+# restore the `push: branches: [main]` trigger (and ideally split arm64
+# onto a native runner).
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+# Cancel stale in-flight runs when a new commit lands on the same PR /
+# branch — image builds are slow and we'd rather burn the latest.
+concurrency:
+  group: runner-image-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # No `setup-qemu-action` — we build a single linux/amd64 image, so
+      # the runner's native arch is the target arch. Restoring multi-arch
+      # would mean re-adding qemu OR (better) matrix-splitting per arch
+      # onto native runners (`ubuntu-24.04-arm` for arm64).
+      - uses: docker/setup-buildx-action@v3
+
+      # Authenticate to GHCR only on push events; PRs from forks don't
+      # have permission to push and would fail the login step.
+      - if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Tag scheme (see docs/decisions.md — runner tags name roles, not history):
+      #   PR              → ghcr.io/vu1n/pillbox-runner:pr-NN  (build-only, never pushed)
+      #   push to main    → ghcr.io/vu1n/pillbox-runner:dev   (moving dev tag)
+      #   tag vX.Y.Z      → ghcr.io/vu1n/pillbox-runner:vX.Y.Z (immutable, pin for repro)
+      #   stable semver   → also moves :latest (handled by flavor=auto,
+      #                     which skips prereleases like v0.1.0-alpha.2)
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/pillbox-runner
+          tags: |
+            type=ref,event=pr,prefix=pr-
+            type=raw,value=dev,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+          flavor: |
+            latest=auto
+
+      - uses: docker/build-push-action@v6
+        with:
+          # Context is the repo root: the multi-stage build compiles the
+          # in-sandbox pillbox binary from Cargo.{toml,lock} + src/.
+          context: .
+          file: runner/Dockerfile
+          # linux/amd64 only — e2b sandboxes are x86_64, Apple Silicon
+          # Docker Desktop can run amd64 via Rosetta/emulation, and the
+          # QEMU-emulated arm64 `cargo build --release` was dominating
+          # the wall clock (~100 min on ubuntu-latest). When a real
+          # native arm64 consumer shows up, restore via a matrix on
+          # `ubuntu-24.04-arm` rather than re-enabling QEMU cross-build.
+          platforms: linux/amd64
+          # PRs build to verify the Dockerfile + Renovate bumps still
+          # produce a valid image, but don't push (no GHCR creds).
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -1,0 +1,4 @@
+Implement `count_positives(xs)` in `solution.py`: return how many numbers in `xs` are strictly greater than zero.
+
+`xs` is a list of integers. Edit ONLY `solution.py`. Keep the function name and
+signature exactly as given.

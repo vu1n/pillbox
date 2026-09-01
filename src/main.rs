@@ -1,0 +1,1505 @@
+//! pillbox — pillbox-as-bundle CLI (v0.6).
+//!
+//! See README.md and AGENTS.md for the design rationale. High-level:
+//!
+//! 1. A **pillbox** is a self-contained bundle of (workspace + code +
+//!    vault + config). There's one **global** pillbox at
+//!    `~/.pillbox/global/`, plus a **project** pillbox per directory
+//!    that has a `pillbox.toml`. State lives at
+//!    `~/.pillbox/projects/<dash-encoded-cwd>/`.
+//!
+//! 2. Top-level commands operate on pillbox **lifecycle**:
+//!    `init / new / list / rm / info`.
+//!
+//! 3. Per-pillbox commands operate on the **current** pillbox, resolved
+//!    from cwd or `--pillbox NAME`:
+//!    `run / secret / env / auth / vault / doctor / sidecar / version`.
+
+use std::{path::PathBuf, process::ExitCode};
+
+use anyhow::Result;
+use clap::{CommandFactory, Parser, Subcommand};
+
+mod agents;
+mod attach;
+mod bookmarks;
+mod cli;
+mod commands;
+mod config;
+mod contract;
+mod cost;
+mod docker;
+mod doctor;
+mod envs;
+mod errors;
+mod events;
+mod gateway;
+mod memory;
+mod paths;
+mod pillbox;
+mod prompt;
+mod registry;
+mod sandbox;
+mod sandboxes;
+mod secrets;
+mod session;
+mod startup;
+#[cfg(test)]
+mod test_util;
+mod url_safety;
+mod vault;
+mod workspace;
+
+use agents::RunOpts;
+use cli::{
+    AuthAction, BookmarkAction, EnvAction, SandboxAction, SecretAction, SessionAction,
+    SnapshotAction, VaultAction, WorkspaceAction,
+};
+use errors::PillboxError;
+use pillbox::Pillbox;
+use secrets::WriteScope;
+
+#[derive(Parser, Debug)]
+#[command(name = "pillbox", version, about, long_about = None)]
+struct Cli {
+    /// Select a specific named pillbox (matches `meta.json.name` or the
+    /// path-encoded state-dir key). Overrides cwd-based discovery.
+    #[arg(long, global = true, value_name = "NAME")]
+    pillbox: Option<String>,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Create the global pillbox at `~/.pillbox/global/`. Idempotent.
+    Init,
+    /// Create a project pillbox in the current directory. Writes
+    /// `pillbox.toml` to cwd, creates a state dir at
+    /// `~/.pillbox/projects/<dash-encoded-cwd>/`, and initializes a
+    /// rustic repository (local by default; `--workspace-backend s3`
+    /// to use an S3-shaped bucket).
+    New {
+        /// Display name for the pillbox. Defaults to the cwd's basename.
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// Default agent for `pillbox run` (`claude` | `codex` | `opencode` | `pi` | `cursor`).
+        #[arg(long, value_name = "AGENT")]
+        agent: Option<String>,
+        /// Default model for `pillbox run` (`provider/model`). Written to `pillbox.toml`.
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
+        /// Sandbox runner image. Written to `pillbox.toml`'s `[runner] image`.
+        #[arg(long = "runner-image", value_name = "IMAGE")]
+        runner_image: Option<String>,
+        /// Interactively prompt for name/agent/model/image (a simple menu). Pre-fills
+        /// from any flags above; needs a terminal.
+        #[arg(short = 'i', long = "interactive")]
+        interactive: bool,
+        /// Workspace backend variant. `local` (default) stores the
+        /// rustic repo under `~/.pillbox/projects/<key>/repo/`; `s3`
+        /// stores it in a user-owned S3-compatible bucket.
+        #[arg(long = "workspace-backend", value_name = "VARIANT")]
+        workspace_backend: Option<String>,
+        /// S3-only: bucket name.
+        #[arg(long, value_name = "BUCKET")]
+        bucket: Option<String>,
+        /// S3-only: endpoint URL (R2, MinIO, native S3, …).
+        #[arg(long, value_name = "URL")]
+        endpoint: Option<String>,
+        /// S3-only: region. Defaults to `auto`.
+        #[arg(long, value_name = "REGION")]
+        region: Option<String>,
+        /// S3-only: object key prefix within the bucket.
+        #[arg(long, value_name = "PREFIX")]
+        prefix: Option<String>,
+        /// S3-only: env var name that holds the access key.
+        #[arg(long = "access-key-env", value_name = "VAR")]
+        access_key_env: Option<String>,
+        /// S3-only: env var name that holds the secret key.
+        #[arg(long = "secret-key-env", value_name = "VAR")]
+        secret_key_env: Option<String>,
+        /// Clone a git repository into cwd at pillbox-creation time.
+        /// Refuses if cwd isn't empty.
+        #[arg(long = "from-git", value_name = "URL")]
+        from_git: Option<String>,
+        /// Optional ref (branch or SHA) when paired with `--from-git`.
+        #[arg(long = "git-ref", value_name = "REF", requires = "from_git")]
+        git_ref: Option<String>,
+    },
+    /// List every pillbox on disk (global + projects).
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a pillbox by name. Refuses to remove the global pillbox.
+    Rm {
+        /// Pillbox name (`meta.json.name`) or path-encoded key.
+        name: String,
+    },
+    /// Show the current pillbox: source, state dir, default agent.
+    Info {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Launch an agent against the current pillbox.
+    Run {
+        /// Agent to launch (`claude` | `codex` | `opencode` | `pi` | `cursor`). Defaults to the current
+        /// pillbox's `agent =` field, or `claude` if unset.
+        #[arg(long, value_name = "AGENT")]
+        agent: Option<String>,
+        /// Host path to mount as the workspace. Defaults to cwd.
+        #[arg(long, value_name = "PATH")]
+        workspace: Option<PathBuf>,
+        /// Override the workspace mount-point name (`/workspace/<name>`).
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// Extra bind mount. Repeatable. Forwarded to `docker run -v`.
+        #[arg(long = "mount", value_name = "HOST:GUEST")]
+        mounts: Vec<String>,
+        /// Inject a stored secret as an env var. `NAME` binds to `NAME`;
+        /// `NAME=ENV_VAR` rebinds. Repeatable. Highest precedence.
+        #[arg(long = "with", value_name = "NAME[=ENV_VAR]")]
+        withs: Vec<String>,
+        /// Inject every variable from a stored env bundle. Repeatable.
+        #[arg(long = "env", value_name = "BUNDLE")]
+        env_bundles: Vec<String>,
+        /// Inject every variable from a `.env` file on disk. Repeatable.
+        #[arg(long = "env-file", value_name = "PATH")]
+        env_files: Vec<PathBuf>,
+        /// Route the agent's API traffic through pillbox's vault proxy.
+        #[arg(long)]
+        vault: bool,
+        /// Wire in swarm memory (the external `kypp` engine, attached not owned): brief the agent
+        /// from project memory at start and capture this session's §0 log after. Host-side, best-
+        /// effort — a missing/erroring `kypp` warns, never fails the run. See github.com/vu1n/kypp.
+        #[arg(long)]
+        memory: bool,
+        /// Attach a shared MCP server to the sandbox. NAME is the
+        /// identifier the agent sees in its tool list; URL must be
+        /// http:// or https://. `localhost` / `127.0.0.1` are
+        /// rewritten to `host.docker.internal` so the sandbox can
+        /// reach host-bound servers. Repeatable.
+        #[arg(long = "mcp", value_name = "NAME=URL")]
+        mcps: Vec<agents::McpAttachment>,
+        /// Attach a bearer token to a `--mcp NAME=URL` from the
+        /// pillbox secret store. NAME must match a `--mcp` entry;
+        /// SECRET_NAME is the name passed to `pillbox secret add`.
+        /// Claude folds it into a 0600 tempfile as
+        /// `headers.Authorization: Bearer <value>`; Codex stashes
+        /// it in an env var and references it via
+        /// `bearer_token_env_var`. Token values never land in argv
+        /// or shell history. Repeatable.
+        #[arg(long = "mcp-token", value_name = "NAME=SECRET_NAME")]
+        mcp_tokens: Vec<agents::McpTokenSpec>,
+        /// Start the agent and immediately return — keeps the session
+        /// alive in the background. Reattach later with `pillbox session
+        /// attach <id>`. Local Docker / libkrun only today. (Local
+        /// --detach doesn't support --vault: the proxy can't outlive the
+        /// CLI; libkrun keeps the vault in the VMM child.)
+        #[arg(long)]
+        detach: bool,
+        /// Human label for the detached session (surfaced in `session
+        /// list`). Only meaningful with `--detach` — clap rejects the
+        /// flag without it instead of silently dropping the value.
+        #[arg(long, value_name = "TEXT", requires = "detach")]
+        label: Option<String>,
+        /// Emit the started session as a JSON object on stdout instead
+        /// of the human "session started" banner. Useful for
+        /// orchestrators: `pillbox run --json | jq -r .session.id`.
+        /// Needs a persisted session record: a `--detach` run (any
+        /// agent) or a server-mode agent (opencode, always reparented).
+        /// A foreground PTY run has nothing to emit — rejected at
+        /// dispatch (not a clap `requires`, since server-mode validity
+        /// depends on the resolved agent, not a flag).
+        #[arg(long)]
+        json: bool,
+        /// POST every lifecycle event to URL as JSON. Forwarded to the
+        /// in-sandbox wrapper so its `pillbox session done` call can
+        /// reach the same URL — orchestrators that subscribe to the
+        /// webhook see started + completed/failed end-to-end without
+        /// pillbox running a daemon. Equivalent to setting
+        /// `$PILLBOX_EVENTS_WEBHOOK` in the environment; when both are
+        /// set, the flag wins (it overwrites the env for the rest of
+        /// this pillbox invocation).
+        #[arg(long = "events-webhook", value_name = "URL")]
+        events_webhook: Option<String>,
+        /// Retention TTL — duration after which `pillbox session prune`
+        /// will tear this session down (sandbox kill + record delete).
+        /// Format: `30m`, `24h`, `7d` (`s`/`m`/`h`/`d` units only).
+        /// Captures per-session retention intent at spawn time so
+        /// different sessions can have different lifetimes — failed
+        /// experiments 1h, prod runs 7d. Only meaningful with
+        /// `--detach` (interactive runs don't persist a record).
+        /// Pillbox does NOT auto-prune; the user / orchestrator runs
+        /// `pillbox session prune` from cron or by hand.
+        /// Caveats: the TTL anchor is the moment the sandbox-spawn
+        /// helper returns (potentially seconds after you press
+        /// enter), not CLI dispatch time — irrelevant for hour/day
+        /// TTLs, occasionally surprising for `--ttl 30s` tests.
+        /// And `expires_at` is computed against the local system
+        /// clock, so badly skewed clocks (no NTP) skew expirations.
+        #[arg(long, value_name = "DURATION", requires = "detach")]
+        ttl: Option<String>,
+        /// Reference to the session this run was forked from. Carried
+        /// through to the lifecycle event payload as
+        /// `parent_session_id` and to OTel as `parent_span_id`, so a
+        /// consumer can stitch a forked trace tree even when the
+        /// parent lives in a different pillbox. Shape-validated via
+        /// `validate_session_id` (alphanumeric + hyphen, max 64
+        /// chars), but pillbox does NOT require the parent to exist
+        /// in this pillbox's registry — the field is observability
+        /// metadata; consumers reconcile.
+        #[arg(long, value_name = "ID")]
+        parent: Option<String>,
+        /// Start the run from a named snapshot bookmark — restore it into
+        /// the workspace before launching the agent.
+        #[arg(long = "from-bookmark", value_name = "NAME")]
+        from_bookmark: Option<String>,
+        /// Model for a server-integration agent (opencode): `PROVIDER/MODEL`,
+        /// e.g. `zai-coding-plan/glm-4.5-air`. Ignored by PTY agents.
+        #[arg(long, value_name = "PROVIDER/MODEL")]
+        model: Option<String>,
+        /// Optional exact model profile requested by the orchestrator. The
+        /// absence is persisted as null; pillbox does not choose a profile.
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// Harness-neutral reasoning request. Adapters translate this later;
+        /// unsupported values fail at the CLI boundary.
+        #[arg(long, value_name = "LOW|MEDIUM|HIGH")]
+        reasoning_effort: Option<contract::ReasoningEffort>,
+        /// Sampling temperature for a server-integration agent (opencode), sent
+        /// on every `session send`. `0` = greedy/deterministic decoding — the
+        /// variance-reduction knob the eval rig needs. Ignored by PTY agents.
+        #[arg(long, value_name = "FLOAT")]
+        temperature: Option<f64>,
+        /// Allow a host through egress (repeatable): the libkrun egress fence
+        /// AND the vault broker's default-deny allowlist (see `--egress-deny`).
+        /// Exact match, or `.suffix` for subdomains. For a custom/self-hosted
+        /// model endpoint or a package registry a build needs.
+        #[arg(long = "egress-allow", value_name = "HOST")]
+        egress_allow: Vec<String>,
+        /// Deny outbound to any host that has no credential provider and isn't
+        /// on `--egress-allow` — the vault broker's default-deny line. Enforced
+        /// at the vault proxy, so it needs `--vault` (or a vaulted `--with`) to
+        /// take effect; without one it warns and is a no-op. See docs/vault.md.
+        #[arg(long = "egress-deny")]
+        egress_deny: bool,
+        /// Args forwarded to the agent CLI inside the sandbox.
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
+    /// Fork k worker sessions from a bookmark, grade each, select the best.
+    ///
+    /// The worker-loop primitive: fork `k` detached workers from a snapshot
+    /// bookmark onto the same segment prompt, drive each to idle, grade with
+    /// `--cmd`/`--rubric`, retry failures, then pull the highest-scoring
+    /// worker's result. Best-of-k converts long-horizon variance into gain;
+    /// `--temperature` keeps the forks diverse. See `docs/dispatch.md`.
+    /// (Contract only today — the loop is GHOST-003.)
+    #[command(group(clap::ArgGroup::new("grader").required(true).args(["cmd", "rubric"])))]
+    Dispatch {
+        /// Snapshot bookmark every worker forks from (the shared base).
+        #[arg(long = "from-bookmark", value_name = "NAME")]
+        from_bookmark: String,
+        /// Number of parallel worker sessions to fork.
+        #[arg(short = 'k', long = "workers", value_name = "N", default_value_t = 3)]
+        workers: u32,
+        /// Grader: one verifier command (`sh -c`; exit 0 → pass). Mutually
+        /// exclusive with `--rubric`.
+        #[arg(long, value_name = "CMD")]
+        cmd: Option<String>,
+        /// Grader: a rubric file (`NAME :: COMMAND` per line) → per-criterion
+        /// verdicts + a fractional score. Mutually exclusive with `--cmd`.
+        #[arg(long, value_name = "FILE")]
+        rubric: Option<PathBuf>,
+        /// Drive an ordered SEGMENT chain (TOML: `[[segment]]` with name +
+        /// prompt/prompt_file + gate_rubric/gate_cmd) in ONE session per worker —
+        /// the proven in-session segmentation lever — instead of one prompt. The
+        /// `--rubric`/`--cmd` above stays the authoritative final reward; each
+        /// segment carries its own gate. Composes with `-k` (best-of-k over chains).
+        #[arg(long, value_name = "SPEC")]
+        segments: Option<PathBuf>,
+        /// Per-worker retry budget when the grade fails (failing criteria fed
+        /// back as the next prompt). With `--segments` this is the PER-SEGMENT
+        /// gate-retry budget.
+        #[arg(long, value_name = "N", default_value_t = 1)]
+        retries: u32,
+        /// Worker agent (`claude` | `codex` | `opencode` | …). Defaults to the
+        /// pillbox's `agent =`, then `claude`.
+        #[arg(long, value_name = "AGENT")]
+        agent: Option<String>,
+        /// Worker model override, forwarded to each worker's run.
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
+        /// Per-fork sampling temperature, forwarded to each worker — the
+        /// diversity knob that keeps best-of-k non-degenerate.
+        #[arg(long, value_name = "FLOAT")]
+        temperature: Option<f64>,
+        /// Heterogeneous worker roster (TOML: `[[worker]]` rows with optional
+        /// agent/model/temperature). Each row binds the i-th fork; omitted fields
+        /// fall back to --agent/--model/--temperature (then pillbox.toml). `-k` is
+        /// derived from the roster length (an explicit, disagreeing `-k` is an
+        /// error). Omitted → today's homogeneous fork-k.
+        #[arg(long = "workers-spec", value_name = "FILE")]
+        workers_spec: Option<PathBuf>,
+        /// Wire in kypp swarm-memory (`--memory`) for each worker.
+        #[arg(long)]
+        memory: bool,
+        /// Per-worker retention TTL (`30m` / `24h` / `7d`), forwarded to every
+        /// forked worker. Losers are left running (not auto-killed) so their §0
+        /// evidence stays readable; a TTL lets `pillbox session prune` reap them
+        /// after a dispatch campaign instead of leaking k VMs per run.
+        #[arg(long, value_name = "DURATION")]
+        ttl: Option<String>,
+        /// Emit the verdict as JSON on stdout instead of the human banner.
+        #[arg(long)]
+        json: bool,
+        /// The segment prompt handed to every worker.
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
+    /// Run a declarative eval spec — every variant × trials, graded with the
+    /// same verifier, → a machine-readable comparison + a paired-stats-ready
+    /// JSONL records file (`scripts/eval/paired-stats.py` consumes it directly).
+    /// The reproducible, variance-aware harness measurement (vs eyeballing one
+    /// run). Spec is TOML (workspace/prompt/verify/budget/variants). libkrun-only
+    /// grading in v1 (like `dispatch`).
+    Eval {
+        /// Path to the TOML eval spec.
+        spec: PathBuf,
+        /// Write the JSONL records here (the paired-stats input). Default: a
+        /// tempfile, printed on completion.
+        #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
+        /// Emit the comparison summary as JSON on stdout instead of the table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Manage detached sessions started with `pillbox run --detach`.
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
+    /// Manage stored secrets for the current pillbox.
+    Secret {
+        #[command(subcommand)]
+        action: SecretAction,
+    },
+    /// Manage stored env bundles for the current pillbox.
+    Env {
+        #[command(subcommand)]
+        action: EnvAction,
+    },
+    /// Inspect or remove persisted agent state.
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
+    /// Inspect the credential vault for the current pillbox.
+    Vault {
+        #[command(subcommand)]
+        action: VaultAction,
+    },
+    /// Run the credential vault as a standalone sidecar process.
+    Sidecar {
+        #[arg(long, value_name = "ADDR")]
+        bind: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Diagnose pillbox's environment.
+    Doctor {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print pillbox version + the runner image tag it targets.
+    Version,
+    /// Snapshot the current workspace (cwd) into the pillbox's
+    /// rustic repository.
+    Push {
+        /// Short tag for the snapshot (e.g. `v1`, `before-refactor`).
+        /// Surfaced in `snapshot list` next to the handle.
+        #[arg(long, value_name = "NAME")]
+        tag: Option<String>,
+        /// Free-form snapshot message (analogous to a commit message).
+        #[arg(long, short = 'm', value_name = "TEXT")]
+        message: Option<String>,
+        /// Also point a bookmark at the new snapshot — atomic snapshot+name,
+        /// binding the bookmark to *this* push (avoids the handle-copy and the
+        /// `latest` race of a separate `bookmark set`). Requires a project pillbox.
+        #[arg(long, value_name = "NAME")]
+        bookmark: Option<String>,
+        /// Record one or more parent snapshots (prefix-ok) as this snapshot's
+        /// lineage — the merge-back edge an orchestrator declares after merging
+        /// collected results (`push --parent <base> --parent <winner>`). Builds
+        /// the workspace DAG `pillbox snapshot show` reports. Repeatable.
+        #[arg(long = "parent", value_name = "HANDLE")]
+        parents: Vec<String>,
+        /// Emit the snapshot record as JSON on stdout. Stable schema —
+        /// pin against `version: 1`.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Restore the workspace from a snapshot. Defaults to the latest.
+    Pull {
+        /// Snapshot to restore. Accepts a unique prefix (≥ 4 hex chars)
+        /// or the full handle. Omit to restore the latest snapshot.
+        #[arg(long, value_name = "HANDLE", conflicts_with = "bookmark")]
+        snapshot: Option<String>,
+        /// Bookmark to restore. Mutually exclusive with `--snapshot`.
+        #[arg(long, value_name = "NAME", conflicts_with = "snapshot")]
+        bookmark: Option<String>,
+    },
+    /// Collect finished session results + lineage for an orchestrator to merge.
+    /// Rehydrates each session's result tree into `<to>/<session>/` and reports
+    /// the merge-triple handles (`base_git_anchor` = the merge base). The
+    /// substrate half of a fan-out loop: pillbox collects, the orchestrator
+    /// decides how to merge (select-one / union / three-way / agent-resolve).
+    /// See docs/collect.md.
+    Collect {
+        /// One or more session ids (unique prefix ≥ 4 chars).
+        #[arg(value_name = "SESSION", required = true)]
+        sessions: Vec<String>,
+        /// Parent directory for the rehydrated result trees. Each session lands
+        /// at `<DIR>/<session>/`. Defaults to `./collected`.
+        #[arg(long, value_name = "DIR")]
+        to: Option<PathBuf>,
+        /// Also synthesize a git commit per result (tree = the result, parent =
+        /// the merge base) under `refs/pillbox/collect/<session>`, for an
+        /// orchestrator to `git merge`/`jj` with its own policy. Requires cwd to
+        /// be a git work tree; adds a `ref` field to each manifest entry.
+        #[arg(long = "as-refs")]
+        as_refs: bool,
+        /// Emit the collection manifest as JSON on stdout. Stable schema — pin
+        /// against `version: 1`.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect / manage the pillbox's snapshots.
+    Snapshot {
+        #[command(subcommand)]
+        action: SnapshotAction,
+    },
+    /// Manage named bookmarks that point at snapshots.
+    Bookmark {
+        #[command(subcommand)]
+        action: BookmarkAction,
+    },
+    /// Spawn / exec / destroy long-lived sandboxes (PTY-free container I/O).
+    Sandbox {
+        #[command(subcommand)]
+        action: SandboxAction,
+    },
+    /// Workspace-level operations (rekey, …).
+    Workspace {
+        #[command(subcommand)]
+        action: WorkspaceAction,
+    },
+    /// Emit a shell completion script on stdout. Pipe into your shell's
+    /// completion dir (`bash`, `zsh`, `fish`, `powershell`, `elvish`).
+    Completions {
+        /// Shell to generate completions for.
+        #[arg(value_name = "SHELL")]
+        shell: clap_complete::Shell,
+    },
+    /// Internal: run the interactive attach pty-host. Owns the agent's
+    /// PTY + a screen model and serves the attach-transport frame
+    /// protocol on a unix socket. Invoked by pillbox inside a sandbox
+    /// (or locally); not a user-facing command. See docs/attach-transport.md.
+    #[command(hide = true)]
+    PtyHost {
+        /// Unix socket to listen on for attach clients (the in-sandbox pty-host).
+        #[arg(long, value_name = "PATH")]
+        sock: Option<String>,
+        /// vsock port instead (libkrun guest backend; Linux-only). Default
+        /// direction is guest-dials-host (foreground); `--vsock-listen` flips it
+        /// to guest-listens for `--detach` (so the socket persists for reattach).
+        #[arg(long, value_name = "PORT")]
+        vsock_port: Option<u32>,
+        /// With `--vsock-port`: the guest *listens* (detach), instead of dialing.
+        #[arg(long)]
+        vsock_listen: bool,
+        /// Command to run under the PTY: everything after `--`.
+        #[arg(last = true, value_name = "CMD")]
+        argv: Vec<String>,
+    },
+    /// Internal: verbatim byte pump between a pty-host socket and stdio.
+    /// Run inside a sandbox by the per-attach transport (docker exec / ssh)
+    /// so one client's frames reach the pty-host. See docs/attach-transport.md.
+    #[command(hide = true)]
+    PtyRelay {
+        /// Unix socket the in-sandbox `pty-host` is listening on.
+        #[arg(long, value_name = "PATH")]
+        sock: String,
+    },
+    /// Internal: guest-side opencode port-forward relay (libkrun; Linux-only).
+    /// Listens on a vsock port and bridges each connection to an in-guest TCP
+    /// port (the headless `opencode serve`), so the host speaks HTTP to a
+    /// `Server`-mode agent over vsock. Not user-facing.
+    #[command(hide = true)]
+    VsockForward {
+        /// vsock port the guest listens on (libkrun binds the host side).
+        #[arg(long, value_name = "PORT")]
+        vsock_port: u32,
+        /// In-guest TCP port to forward each connection to (e.g. opencode 4096).
+        #[arg(long, value_name = "PORT")]
+        to_port: u16,
+    },
+    /// Internal: guest-side `codex app-server` bridge (libkrun codex-serve).
+    /// Spawns `codex app-server`, does the JSON-RPC `initialize` + `thread/start`
+    /// handshake, captures every notification line to `--events-file` (the §0
+    /// source the host drains), auto-accepts approval requests (the sandbox is
+    /// the boundary), and serves a small one-shot HTTP API on `--port`
+    /// (`GET /health`, `POST /session`, `POST /turn`) the host drives over the
+    /// vsock forward. Not user-facing. See `sandbox::appserver`.
+    #[command(hide = true)]
+    AppserverHost {
+        /// Loopback TCP port to serve the host-facing HTTP API on.
+        #[arg(long, value_name = "PORT")]
+        port: u16,
+        /// File to append each codex notification line to (NDJSON, the §0 source).
+        #[arg(long, value_name = "PATH")]
+        events_file: String,
+        /// The `codex app-server` command to spawn: everything after `--`.
+        /// Defaults to `codex app-server` when omitted.
+        #[arg(last = true, value_name = "CMD")]
+        argv: Vec<String>,
+    },
+}
+
+fn main() -> ExitCode {
+    // Internal re-exec entrypoint: the libkrun VMM child *becomes* the microVM.
+    // `krun_start_enter` doesn't return — it `exit()`s with the guest's code when
+    // the VM shuts down — so the backend spawns this hidden subprocess and
+    // supervises it from the parent (which keeps a live process for attach +
+    // cleanup). Not a user-facing command; argv is set by the backend.
+    #[cfg(feature = "libkrun")]
+    if std::env::args().nth(1).as_deref() == Some("__krun-vmm") {
+        crate::sandbox::libkrun::vmm_child_main(); // never returns
+    }
+    // Internal re-exec entrypoint: the detached §0 PRODUCER for a reparented server
+    // session. Tails the guest capture → durable log forever (until SIGTERM on
+    // teardown) so the log stays live for every consumer. argv set by the backend:
+    // [exe, __session-tailer, <session_dir>, <capture>, <format>, <sid>].
+    if std::env::args().nth(1).as_deref() == Some("__session-tailer") {
+        let a: Vec<String> = std::env::args().collect();
+        let code = match (a.get(2), a.get(3), a.get(4), a.get(5)) {
+            (Some(dir), Some(cap), Some(fmt), Some(sid)) => {
+                match crate::events::EventsFormat::from_token(fmt) {
+                    Some(fmt) => match crate::commands::session::run_detached_tailer(
+                        dir.into(),
+                        cap.into(),
+                        fmt,
+                        sid.clone(),
+                    ) {
+                        Ok(()) => 0,
+                        Err(e) => {
+                            eprintln!("pillbox __session-tailer: {e:#}");
+                            1
+                        }
+                    },
+                    None => {
+                        eprintln!("pillbox __session-tailer: unknown format {fmt:?}");
+                        2
+                    }
+                }
+            }
+            _ => {
+                eprintln!(
+                    "pillbox __session-tailer: usage: <session_dir> <capture> <format> <sid>"
+                );
+                2
+            }
+        };
+        return ExitCode::from(code as u8);
+    }
+    init_vault_trace();
+    let cli = Cli::parse();
+    let result = run(cli);
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => errors::report(&e),
+    }
+}
+
+/// Install a file-backed `tracing` subscriber when `PILLBOX_VAULT_TRACE`
+/// names a path, so hudsucker's internal proxy errors (TLS / WebSocket)
+/// become visible for debugging. Writes to a file rather than stderr so
+/// an attached agent's raw-mode terminal isn't corrupted. Filter comes
+/// from `RUST_LOG`, defaulting to everything hudsucker + pillbox emit at
+/// debug. No-op (and zero overhead) when the var is unset.
+fn init_vault_trace() {
+    let Ok(path) = std::env::var("PILLBOX_VAULT_TRACE") else {
+        return;
+    };
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        eprintln!("pillbox: warning: could not open PILLBOX_VAULT_TRACE file `{path}`");
+        return;
+    };
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("hudsucker=debug,pillbox=debug"));
+    // Per-event writer: clone the handle, falling back to a sink rather
+    // than panicking — a debug logging facility must never crash the CLI.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(move || -> Box<dyn std::io::Write> {
+            match file.try_clone() {
+                Ok(f) => Box::new(f),
+                Err(_) => Box::new(std::io::sink()),
+            }
+        })
+        .with_ansi(false)
+        .try_init();
+}
+
+fn run(cli: Cli) -> Result<()> {
+    let pillbox_arg = cli.pillbox.as_deref();
+    match cli.command {
+        Command::Init => pillbox::init(),
+        Command::New {
+            name,
+            agent,
+            model,
+            runner_image,
+            interactive,
+            workspace_backend,
+            bucket,
+            endpoint,
+            region,
+            prefix,
+            access_key_env,
+            secret_key_env,
+            from_git,
+            git_ref,
+        } => {
+            // `-i` runs the menu, pre-filled with any flags; else the flags are the
+            // descriptor as-is. TTY-guarded so a piped invocation never blocks.
+            let (name, defaults) = if interactive {
+                if !prompt::interactive() {
+                    return Err(PillboxError::usage(
+                        "pillbox new",
+                        "-i/--interactive needs a terminal (stdin + stdout)",
+                    )
+                    .into());
+                }
+                wizard_new(name, agent, model, runner_image)?
+            } else {
+                (
+                    name,
+                    pillbox::NewDefaults {
+                        agent,
+                        model,
+                        runner_image,
+                    },
+                )
+            };
+            pillbox::new(
+                name,
+                defaults,
+                pillbox::NewWorkspaceArgs {
+                    backend: workspace_backend,
+                    endpoint,
+                    region,
+                    bucket,
+                    prefix,
+                    access_key_env,
+                    secret_key_env,
+                    from_git,
+                    git_ref,
+                },
+            )
+        }
+        Command::List { json } => pillbox::list(json),
+        Command::Rm { name } => pillbox::rm(&name),
+        Command::Info { json } => pillbox::info(pillbox_arg, json),
+        Command::Run {
+            agent,
+            workspace,
+            name,
+            mounts,
+            withs,
+            env_bundles,
+            env_files,
+            vault,
+            memory,
+            mcps,
+            mcp_tokens,
+            detach,
+            label,
+            json,
+            events_webhook,
+            ttl,
+            parent,
+            from_bookmark,
+            model,
+            profile,
+            reasoning_effort,
+            temperature,
+            egress_allow,
+            egress_deny,
+            args,
+        } => {
+            let resolved = Pillbox::resolve(pillbox_arg)?;
+            // `--events-webhook URL` sets the env var for the duration of
+            // this process so every downstream `emit_session_event` call
+            // (here and threaded through to the helper subprocess) picks
+            // it up uniformly. Equivalent to `PILLBOX_EVENTS_WEBHOOK=URL
+            // pillbox run …`; either form works. When both the flag and
+            // the env are set, the flag wins (the `set_var` below
+            // overwrites the inherited env for this process tree).
+            //
+            // SAFETY: `std::env::set_var` is `unsafe` in edition 2024
+            // because concurrent `env::var` reads in other threads can
+            // observe a torn pointer. At this call site we're still on
+            // the main thread — `Cli::parse` doesn't spawn, and the
+            // first downstream `std::thread::spawn` (the stderr pump in
+            // `spawn_and_pump`) happens strictly after this `set_var`
+            // returns. We never mutate `PILLBOX_EVENTS_WEBHOOK` again,
+            // so subsequent `env::var` reads (from the pump thread,
+            // from `emit_session_event`, from the helper subprocess)
+            // race only against this single completed write.
+            if let Some(url) = &events_webhook {
+                let validated = validate_events_webhook_url(url)?;
+                unsafe {
+                    std::env::set_var("PILLBOX_EVENTS_WEBHOOK", &validated);
+                }
+            }
+            // `--parent <id>` plumbing mirrors the webhook flow: shape-
+            // validate, stash in `PILLBOX_PARENT_SESSION_ID`, and let
+            // both the host's `session.started` emit and the sandbox-
+            // side `session started` CLI (via the helper's bash export)
+            // pick it up off the env. Shape-only validation: the parent
+            // may live in another pillbox's registry, so we don't
+            // reject "unknown" ids — the field is observability
+            // metadata; consumers reconcile.
+            //
+            // SAFETY: same single-threaded justification as the
+            // PILLBOX_EVENTS_WEBHOOK `set_var` above.
+            if let Some(id) = &parent {
+                commands::session::validate_session_id(id)?;
+                unsafe {
+                    std::env::set_var(events::PARENT_SESSION_ID_ENV, id);
+                }
+            }
+            // Parse `--ttl 30m` / `24h` / `7d` at the CLI boundary.
+            // Stored as seconds on `RunOpts` so the backend converts
+            // to an absolute RFC3339 `expires_at` close to the actual
+            // session-write time (no clock drift between parse and
+            // persist).
+            let ttl_seconds = match ttl {
+                Some(s) => Some(session::parse_ttl_seconds(&s)?),
+                None => None,
+            };
+            dispatch_run(
+                &resolved,
+                agent,
+                RunOpts {
+                    workspace,
+                    name,
+                    mounts,
+                    withs,
+                    env_bundles,
+                    env_files,
+                    vault,
+                    memory,
+                    memory_briefed: Vec::new(), // dispatch_run fills this from the kypp briefing
+                    mcps,
+                    mcp_tokens,
+                    args,
+                    detach,
+                    label,
+                    json,
+                    ttl_seconds,
+                    from_bookmark,
+                    model,
+                    profile,
+                    reasoning_effort,
+                    temperature,
+                    egress_allow,
+                    egress_deny,
+                },
+            )
+        }
+        Command::Dispatch {
+            from_bookmark,
+            workers,
+            cmd,
+            rubric,
+            segments,
+            retries,
+            agent,
+            model,
+            temperature,
+            workers_spec,
+            memory,
+            ttl,
+            json,
+            args,
+        } => {
+            let resolved = Pillbox::resolve(pillbox_arg)?;
+            // Parse + validate the roster up front (exit 2 on a bad spec) so the
+            // handler receives the parsed roster — its length derives `k`.
+            let workers_spec = match workers_spec {
+                Some(p) => Some(commands::dispatch::load_workers_spec(&p)?),
+                None => None,
+            };
+            commands::dispatch::dispatch(
+                &resolved,
+                commands::dispatch::DispatchOpts {
+                    from_bookmark,
+                    workers,
+                    cmd,
+                    rubric,
+                    segments,
+                    retries,
+                    agent,
+                    model,
+                    temperature,
+                    workers_spec,
+                    memory,
+                    ttl,
+                    prompt: args,
+                    json,
+                },
+            )
+        }
+        Command::Eval { spec, out, json } => {
+            let resolved = Pillbox::resolve(pillbox_arg)?;
+            commands::eval::eval(&resolved, commands::eval::EvalOpts { spec, json, out })
+        }
+        Command::Session { action } => {
+            let resolved = Pillbox::resolve(pillbox_arg)?;
+            commands::session::dispatch(&resolved, action)
+        }
+        Command::Secret { action } => {
+            let resolved = Pillbox::resolve(pillbox_arg)?;
+            commands::secret::dispatch(&resolved, action)
+        }
+        Command::Env { action } => {
+            let resolved = Pillbox::resolve(pillbox_arg)?;
+            commands::env::dispatch(&resolved, action)
+        }
+        Command::Auth { action } => {
+            // Auth always resolves to global in PR 2, but we still
+            // resolve the current pillbox so `--pillbox NAME` works for
+            // the v0.7 path forward without breaking the CLI shape now.
+            let resolved = Pillbox::resolve(pillbox_arg)?;
+            commands::auth::dispatch(&resolved, action)
+        }
+        Command::Vault { action } => {
+            let resolved = Pillbox::resolve(pillbox_arg)?;
+            commands::vault::dispatch(&resolved, action)
+        }
+        Command::Sidecar { bind, json } => {
+            let resolved = Pillbox::resolve(pillbox_arg)?;
+            commands::sidecar::run(&resolved, bind, json)
+        }
+        Command::Doctor { json } => {
+            let resolved = Pillbox::resolve(pillbox_arg)?;
+            doctor::run(json, &resolved)
+        }
+        Command::Version => {
+            println!(
+                "pillbox {} (runner image: {})",
+                env!("CARGO_PKG_VERSION"),
+                docker::default_runner_image()
+            );
+            Ok(())
+        }
+        Command::Push {
+            tag,
+            message,
+            bookmark,
+            parents,
+            json,
+        } => {
+            let resolved = Pillbox::resolve(pillbox_arg)?;
+            commands::workspace::push(&resolved, tag, message, bookmark, parents, json)
+        }
+        Command::Pull { snapshot, bookmark } => {
+            let resolved = Pillbox::resolve(pillbox_arg)?;
+            commands::workspace::pull(&resolved, snapshot, bookmark)
+        }
+        Command::Collect {
+            sessions,
+            to,
+            as_refs,
+            json,
+        } => {
+            let resolved = Pillbox::resolve(pillbox_arg)?;
+            commands::collect::collect(&resolved, sessions, to, as_refs, json)
+        }
+        Command::Snapshot { action } => {
+            let resolved = Pillbox::resolve(pillbox_arg)?;
+            commands::workspace::snapshot_dispatch(&resolved, action)
+        }
+        Command::Bookmark { action } => {
+            let resolved = Pillbox::resolve(pillbox_arg)?;
+            commands::bookmark::dispatch(&resolved, action)
+        }
+        Command::Sandbox { action } => {
+            let resolved = Pillbox::resolve(pillbox_arg)?;
+            commands::sandbox::dispatch(&resolved, action)
+        }
+        Command::Completions { shell } => {
+            // `Cli::command()` materializes the clap definition without
+            // re-parsing argv; generate_to_stdout writes the shell
+            // script for the user to source. No pillbox resolution
+            // needed — this is a static codegen step.
+            let mut cmd = Cli::command();
+            let bin_name = cmd.get_name().to_string();
+            clap_complete::generate(shell, &mut cmd, bin_name, &mut std::io::stdout());
+            Ok(())
+        }
+        Command::Workspace { action } => match action {
+            // `restore`/`backup` are self-contained from flags+env — the
+            // managed-tier container that execs them has no pillbox /
+            // meta.json / state dir to resolve. Route them BEFORE
+            // `Pillbox::resolve` so the missing descriptor isn't an error.
+            WorkspaceAction::Restore(args) => commands::workspace::remote_restore(args),
+            WorkspaceAction::Backup(args) => commands::workspace::remote_backup(args),
+            other => {
+                let resolved = Pillbox::resolve(pillbox_arg)?;
+                commands::workspace::dispatch(&resolved, other)
+            }
+        },
+        // Internal attach-transport commands. No pillbox resolution: they
+        // operate on a raw PTY + socket and are invoked by pillbox itself.
+        Command::PtyHost {
+            sock,
+            vsock_port,
+            vsock_listen,
+            argv,
+        } => match (sock, vsock_port) {
+            (Some(s), None) => attach::host::run(&s, &argv),
+            (None, Some(port)) => pty_host_vsock(port, vsock_listen, &argv),
+            _ => Err(PillboxError::usage(
+                "pty-host",
+                "exactly one of --sock or --vsock-port is required",
+            )
+            .into()),
+        },
+        Command::PtyRelay { sock } => attach::relay::run(&sock),
+        Command::VsockForward {
+            vsock_port,
+            to_port,
+        } => vsock_forward(vsock_port, to_port),
+        Command::AppserverHost {
+            port,
+            events_file,
+            argv,
+        } => sandbox::appserver::run_host(port, &events_file, &argv),
+    }
+}
+
+/// `pillbox new -i` — prompt for the descriptor's run-config fields (name, agent,
+/// model, runner image), pre-filled with any flags already passed. Caller has
+/// confirmed a TTY. The runner-image prompt is a selection of locally-available
+/// images plus a free-text fallback. Returns (name, defaults) for `pillbox::new`.
+fn wizard_new(
+    name: Option<String>,
+    agent: Option<String>,
+    model: Option<String>,
+    runner_image: Option<String>,
+) -> Result<(Option<String>, pillbox::NewDefaults)> {
+    let cwd_base = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "pillbox".into());
+    let name = Some(prompt::line("name", name.as_deref().unwrap_or(&cwd_base))?);
+
+    let agents = ["claude", "codex", "opencode", "pi", "cursor"];
+    let agent_idx = agents
+        .iter()
+        .position(|a| Some(*a) == agent.as_deref())
+        .unwrap_or(0); // default → claude
+    let agent = Some(prompt::select("agent", &agents, agent_idx)?);
+
+    let model = {
+        let m = prompt::line(
+            "model (blank = agent default)",
+            model.as_deref().unwrap_or(""),
+        )?;
+        (!m.is_empty()).then_some(m)
+    };
+
+    // Runner image: pick from locally-available images, or "custom…" for free text.
+    // The pre-fill (flag or pillbox-runner:dev) is always offered, even if not enumerated.
+    let pre = runner_image
+        .as_deref()
+        .unwrap_or("pillbox-runner:dev")
+        .to_string();
+    let mut imgs = crate::docker::list_runner_images();
+    if !imgs.contains(&pre) {
+        imgs.insert(0, pre.clone());
+    }
+    let def_idx = imgs.iter().position(|i| *i == pre).unwrap_or(0);
+    let custom = "custom…";
+    let mut opts: Vec<&str> = imgs.iter().map(String::as_str).collect();
+    opts.push(custom);
+    let chosen = prompt::select("runner image", &opts, def_idx)?;
+    let runner_image = Some(if chosen == custom {
+        prompt::line("image", &pre)?
+    } else {
+        chosen
+    });
+
+    Ok((
+        name,
+        pillbox::NewDefaults {
+            agent,
+            model,
+            runner_image,
+        },
+    ))
+}
+
+fn resolve_agent_spec(
+    resolved: &Pillbox,
+    override_id: Option<&str>,
+) -> Result<&'static agents::AgentSpec> {
+    let id = match override_id {
+        Some(id) => id.to_string(),
+        // Descriptor cascade (project pillbox.toml → ~/.pillbox/global → built-in),
+        // read fresh so an edited `agent =` takes effect without a meta rewrite.
+        None => crate::config::resolve_run_config(resolved)
+            .agent
+            .unwrap_or_else(|| "claude".into()),
+    };
+    agents::lookup("run", &id)
+}
+
+fn dispatch_run(resolved: &Pillbox, agent: Option<String>, mut opts: RunOpts) -> Result<()> {
+    // Resolve the agent + apply pillbox.toml defaults; the backend
+    // selection happens below.
+    let spec = resolve_agent_spec(resolved, agent.as_deref())?;
+    if let Some(meta) = &resolved.meta {
+        if opts.name.is_none() {
+            opts.name = Some(meta.name.clone());
+        }
+    }
+
+    if !spec.integration.supports_execution_request()
+        && (opts.profile.is_some() || opts.reasoning_effort.is_some())
+    {
+        return Err(PillboxError::usage(
+            "run",
+            format!(
+                "agent `{}` has no structured profile transport; use a structured agent integration",
+                spec.id
+            ),
+        )
+        .into());
+    }
+
+    // Model cascade: `--model` wins, else the descriptor (project `pillbox.toml`
+    // → `~/.pillbox/global/pillbox.toml`), else the agent's own default (`None`).
+    if opts.model.is_none() {
+        opts.model = crate::config::resolve_run_config(resolved).model;
+    }
+
+    // Workspace default: a PROJECT pillbox carries its repo path (`source_dir`),
+    // so `pillbox run --pillbox sakana` (or `pillbox project sakana`) mounts that
+    // repo from ANYWHERE — not just from inside it. `--workspace` still overrides;
+    // the global pillbox has no `source_dir`, so it falls through to the backend's
+    // cwd default. cwd-discovery already has `source_dir == cwd`, so this is a no-op
+    // there — only by-name invocation changes.
+    if opts.workspace.is_none() {
+        if let crate::pillbox::Scope::Project { source_dir, .. } = &resolved.scope {
+            opts.workspace = Some(source_dir.clone());
+        }
+    }
+
+    // `--json` emits the started-session record; only `--detach` runs and
+    // structured agents persist one. A foreground PTY run has nothing to emit,
+    // so reject loudly here rather than print
+    // nothing. (Can't be a clap `requires` — server-mode validity depends on the
+    // resolved agent, not a flag.)
+    if opts.json && !opts.detach && !spec.integration.supports_execution_request() {
+        return Err(PillboxError::usage(
+            "run",
+            "--json needs a persisted session: add --detach, or run a structured agent",
+        )
+        .with_next(format!("pillbox run --agent {} --detach --json", spec.id))
+        .into());
+    }
+
+    // Nudge if Raindrop Workshop is installed but no OTLP endpoint is set, so a
+    // silent "no events" doesn't surprise the user.
+    crate::events::hint_workshop_if_unconfigured();
+
+    let backend = crate::sandbox::select_backend();
+    if !opts.memory {
+        return backend.run(spec, opts, resolved);
+    }
+    // --memory: brief the agent from kypp at start, capture THIS run's §0 log after. Host-side +
+    // best-effort. Detached runs skip the post-capture — the agent outlives this call, so the §0 log
+    // isn't complete yet; a scheduled `kypp sweep` (cron) catches them. Project scope = pillbox name.
+    let project = opts.name.clone().unwrap_or_else(|| "default".to_string());
+    let is_server = spec.integration == crate::agents::Integration::Server;
+    let capture_after = !opts.detach;
+    let briefed = crate::memory::brief_into_args(&mut opts.args, &project);
+    opts.memory_briefed = briefed.clone(); // carried into the backend so a server bring-up can stash it
+    let started = std::time::SystemTime::now(); // run-window start: capture only logs written after this
+    let result = backend.run(spec, opts, resolved);
+    // A FOREGROUND (PTY) agent finalizes its §0 log before `run` returns → capture now. A SERVER agent
+    // (opencode) is reparented: the log drains LATER, so capturing here would race an empty log —
+    // `session ingest` does the capture instead, from the brief the bring-up stashed (crate::memory).
+    if capture_after && !is_server {
+        let sessions = crate::session::sessions_root_path(resolved);
+        crate::memory::capture_run(&sessions, &project, started);
+        // record which briefed claims this run saw, for later credit assignment
+        crate::memory::record_brief_usage(&sessions, &project, started, &briefed);
+    }
+    result
+}
+
+/// Dispatch `pty-host --vsock-port` — Linux-only. The libkrun guest serves the
+/// attach frame protocol over vsock; the macOS host never runs this (it connects
+/// to the bridged socket and pumps).
+#[cfg(target_os = "linux")]
+fn pty_host_vsock(port: u32, listen: bool, argv: &[String]) -> Result<()> {
+    attach::host::run_vsock(port, listen, argv)
+}
+#[cfg(not(target_os = "linux"))]
+fn pty_host_vsock(_port: u32, _listen: bool, _argv: &[String]) -> Result<()> {
+    Err(PillboxError::usage("pty-host", "--vsock-port is Linux-only (the libkrun guest)").into())
+}
+
+/// Dispatch `vsock-forward` — Linux-only (the libkrun guest). Forwards a vsock
+/// port to an in-guest TCP port so the host can reach a `Server`-mode agent's
+/// HTTP API over vsock.
+#[cfg(target_os = "linux")]
+fn vsock_forward(vsock_port: u32, to_port: u16) -> Result<()> {
+    attach::host::run_vsock_forward(vsock_port, to_port)
+}
+#[cfg(not(target_os = "linux"))]
+fn vsock_forward(_vsock_port: u32, _to_port: u16) -> Result<()> {
+    Err(PillboxError::usage("vsock-forward", "Linux-only (the libkrun guest)").into())
+}
+
+/// Validate an `--events-webhook URL`:
+///   - non-empty after trim
+///   - no embedded whitespace or control chars (so it can't smuggle
+///     newlines into `Host:` headers or escape the shell wrapper)
+///   - scheme is `http://` or `https://` (no `file://`, `gopher://`, …)
+///   - warns to stderr if scheme is `http://` and the host isn't a
+///     loopback / `.local` address — events contain session ids + exit
+///     codes; in-cluster collectors are fine over plain HTTP, but a
+///     remote cleartext endpoint is almost always a misconfig
+///
+/// Returns the trimmed URL ready to stash in the env var.
+fn validate_events_webhook_url(url: &str) -> Result<String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() || trimmed.bytes().any(|b| b.is_ascii_whitespace() || b < 0x20) {
+        return Err(PillboxError::usage(
+            "run",
+            "--events-webhook URL must be a single URL with no whitespace \
+             or control characters",
+        )
+        .into());
+    }
+    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+        return Err(PillboxError::usage(
+            "run",
+            format!(
+                "--events-webhook URL must start with http:// or https:// \
+                 (got `{trimmed}`)"
+            ),
+        )
+        .into());
+    }
+    if let Some(host) = url_safety::plaintext_non_loopback_host(trimmed) {
+        eprintln!(
+            "pillbox: warning: --events-webhook is http:// to a non-loopback \
+             host (`{host}`); session events will traverse the network in \
+             cleartext. Use https:// in production."
+        );
+    }
+    Ok(trimmed.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_profile_contract_cli_parses_normalized_request() {
+        let cli = Cli::try_parse_from([
+            "pillbox",
+            "run",
+            "--agent",
+            "codex-serve",
+            "--model",
+            "openai/gpt-5.6-sol",
+            "--profile",
+            "sol",
+            "--reasoning-effort",
+            "high",
+        ])
+        .unwrap();
+        let Command::Run {
+            model,
+            profile,
+            reasoning_effort,
+            ..
+        } = cli.command
+        else {
+            panic!("expected run");
+        };
+        assert_eq!(model.as_deref(), Some("openai/gpt-5.6-sol"));
+        assert_eq!(profile.as_deref(), Some("sol"));
+        assert_eq!(reasoning_effort, Some(contract::ReasoningEffort::High));
+    }
+
+    #[test]
+    fn model_profile_contract_cli_rejects_runtime_native_effort_alias() {
+        assert!(Cli::try_parse_from(["pillbox", "run", "--reasoning-effort", "ultra",]).is_err());
+    }
+
+    #[test]
+    fn validate_events_webhook_accepts_https() {
+        let out = validate_events_webhook_url("https://collector.example.com/events").unwrap();
+        assert_eq!(out, "https://collector.example.com/events");
+    }
+
+    #[test]
+    fn validate_events_webhook_trims_whitespace() {
+        let out = validate_events_webhook_url("  https://x/y  ").unwrap();
+        assert_eq!(out, "https://x/y");
+    }
+
+    #[test]
+    fn validate_events_webhook_rejects_embedded_whitespace() {
+        let err = validate_events_webhook_url("https://x/y\nHost: evil").unwrap_err();
+        assert!(format!("{err}").contains("whitespace"));
+    }
+
+    #[test]
+    fn validate_events_webhook_rejects_non_http_scheme() {
+        let err = validate_events_webhook_url("file:///etc/passwd").unwrap_err();
+        assert!(format!("{err}").contains("http://"));
+        let err = validate_events_webhook_url("//collector.example.com").unwrap_err();
+        assert!(format!("{err}").contains("http://"));
+    }
+
+    #[test]
+    fn validate_events_webhook_accepts_http_loopback_silently() {
+        // 127.0.0.1, ::1, localhost, *.localhost — all valid http
+        // collector targets for development; no warning emitted.
+        for url in [
+            "http://127.0.0.1:8080/events",
+            "http://localhost:9000",
+            "http://collector.localhost/x",
+            "http://[::1]:9000/events",
+        ] {
+            let out = validate_events_webhook_url(url).unwrap();
+            assert_eq!(out, url);
+        }
+    }
+
+    #[test]
+    fn validate_events_webhook_accepts_http_non_loopback() {
+        // Plain http to a remote is allowed but warns on stderr (not
+        // captured here). The function still returns Ok — pillbox
+        // doesn't refuse the URL, just nudges the user.
+        let url = "http://collector.example.com/events";
+        let out = validate_events_webhook_url(url).unwrap();
+        assert_eq!(out, url);
+    }
+
+    // ── managed-tier `workspace restore|backup` flag parsing ─────────────
+    //
+    // These guard the FROZEN invocation contract the Durable Object execs.
+    // The non-secret coordinates are flags; the shape must not drift.
+
+    #[test]
+    fn workspace_restore_parses_frozen_flag_shape() {
+        let cli = Cli::try_parse_from([
+            "pillbox",
+            "workspace",
+            "restore",
+            "--endpoint",
+            "https://acct.r2.cloudflarestorage.com",
+            "--bucket",
+            "ws",
+            "--region",
+            "wnam",
+            "--prefix",
+            "repos/proj",
+            "--snapshot",
+            "abc123",
+            "--target",
+            "/work/proj",
+        ])
+        .expect("frozen restore shape must parse");
+        let Command::Workspace {
+            action: WorkspaceAction::Restore(a),
+        } = cli.command
+        else {
+            panic!("expected workspace restore");
+        };
+        assert_eq!(a.coords.endpoint, "https://acct.r2.cloudflarestorage.com");
+        assert_eq!(a.coords.bucket, "ws");
+        assert_eq!(a.coords.region, "wnam");
+        assert_eq!(a.coords.prefix, "repos/proj");
+        assert_eq!(a.snapshot, "abc123");
+        assert_eq!(a.target, "/work/proj");
+    }
+
+    #[test]
+    fn workspace_backup_parses_frozen_flag_shape() {
+        let cli = Cli::try_parse_from([
+            "pillbox",
+            "workspace",
+            "backup",
+            "--endpoint",
+            "https://x",
+            "--bucket",
+            "b",
+            "--prefix",
+            "p",
+            "--target",
+            "/work",
+            "--parent",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ])
+        .expect("frozen backup shape must parse");
+        let Command::Workspace {
+            action: WorkspaceAction::Backup(a),
+        } = cli.command
+        else {
+            panic!("expected workspace backup");
+        };
+        assert_eq!(a.coords.endpoint, "https://x");
+        assert_eq!(a.coords.bucket, "b");
+        assert_eq!(a.coords.prefix, "p");
+        assert_eq!(a.target, "/work");
+        assert_eq!(
+            a.parent,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+    }
+
+    #[test]
+    fn workspace_region_defaults_to_auto() {
+        // `--region` omitted → R2's `auto` convention.
+        let cli = Cli::try_parse_from([
+            "pillbox",
+            "workspace",
+            "backup",
+            "--endpoint",
+            "https://x",
+            "--bucket",
+            "b",
+            "--target",
+            "/work",
+            "--parent",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ])
+        .unwrap();
+        let Command::Workspace {
+            action: WorkspaceAction::Backup(a),
+        } = cli.command
+        else {
+            panic!("expected workspace backup");
+        };
+        assert_eq!(a.coords.region, "auto");
+    }
+
+    #[test]
+    fn workspace_backup_requires_a_lineage_parent() {
+        let err = Cli::try_parse_from([
+            "pillbox",
+            "workspace",
+            "backup",
+            "--endpoint",
+            "https://x",
+            "--bucket",
+            "b",
+            "--target",
+            "/work",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn workspace_prefix_may_be_empty() {
+        // `--prefix` omitted → empty (the repo lives at the bucket root).
+        let cli = Cli::try_parse_from([
+            "pillbox",
+            "workspace",
+            "restore",
+            "--endpoint",
+            "https://x",
+            "--bucket",
+            "b",
+            "--snapshot",
+            "h",
+            "--target",
+            "/work",
+        ])
+        .unwrap();
+        let Command::Workspace {
+            action: WorkspaceAction::Restore(a),
+        } = cli.command
+        else {
+            panic!("expected workspace restore");
+        };
+        assert_eq!(a.coords.prefix, "");
+    }
+
+    #[test]
+    fn workspace_restore_requires_target_and_snapshot() {
+        // Missing required flags must be a parse error (clap → usage).
+        assert!(Cli::try_parse_from([
+            "pillbox",
+            "workspace",
+            "restore",
+            "--endpoint",
+            "https://x",
+            "--bucket",
+            "b",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn workspace_rejects_secret_flags() {
+        // Secrets are env-only; there is no `--access-key` etc. surface.
+        // An unknown flag must fail parsing so a caller can't sneak a
+        // secret into argv.
+        for secret_flag in [
+            "--access-key",
+            "--secret-key",
+            "--repo-password",
+            "--password",
+        ] {
+            assert!(
+                Cli::try_parse_from([
+                    "pillbox",
+                    "workspace",
+                    "backup",
+                    "--endpoint",
+                    "https://x",
+                    "--bucket",
+                    "b",
+                    "--target",
+                    "/work",
+                    secret_flag,
+                    "leak",
+                ])
+                .is_err(),
+                "{secret_flag} must not be accepted (secrets are env-only)"
+            );
+        }
+    }
+}

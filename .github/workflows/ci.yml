@@ -1,0 +1,106 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+# Cancel stale in-flight runs when a new commit lands on the same PR /
+# branch — saves macOS minutes (~10x cost) on iterative force-pushes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  cloudflare:
+    name: Cloudflare gateway
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cloudflare-spike
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: cloudflare-spike/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npx tsc --noEmit
+      - run: python3 check-contract-parity.py
+      # Real workerd + SQLite-backed DO, no account or paid container required.
+      - run: ../scripts/smoke/cf.sh
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rust
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
+      # rust-cache keys on rustc + Cargo.lock, prunes the registry to used crates,
+      # and cleans target/ of intermediate junk — so the cache stays small and
+      # survives eviction against the matrix + the runner-image buildx cache. The
+      # old hand-rolled actions/cache of the whole target/ bloated toward the 10GB
+      # repo limit and evicted, forcing cold rebuilds (the ~20min CI).
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      # `--no-default-features` = the toolchain-free build (docker backend + the
+      # backend-agnostic core), so this job needs no libkrun toolchain. libkrun
+      # itself is covered by the dedicated `libkrun` job. Default is now libkrun,
+      # so a plain `cargo test` here would try (and fail) to link it.
+      # Lint+format gates are platform-independent; only run them once
+      # (on ubuntu) to save macOS minutes (~10x cost).
+      - if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --check
+      - run: cargo test --no-default-features --all-targets
+      - if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy --no-default-features --all-targets -- -D warnings
+      # NOTE: the docker:// mechanism tests (workspace staging + container
+      # lifecycle, `#[ignore]`d) deliberately do NOT run here — a docker job
+      # burns the free-minutes allocation. Run them locally / on a self-hosted
+      # box with `scripts/test-docker-mechanism.sh` (needs a Docker daemon).
+
+  # The real backend: compile, lint, and unit-test pillbox with `--features
+  # libkrun`. Runs on macOS because the libkrun backend is macOS-only today (it
+  # uses APFS `clonefile`, and the egress stack needs libkrun's brew build; the
+  # from-source Linux build is missing `krun_add_net_unixstream`). brew supplies
+  # libkrun + libkrunfw from the `libkrun/krun` tap and build.rs finds them at
+  # /opt/homebrew/lib. No VM boots here — GitHub macOS runners can't nest HVF —
+  # so this is build + link + non-VM unit tests; the VM-boot smoke stays a local
+  # gate (scripts/smoke/libkrun.sh). The Linux path (cheap-KVM, CI VM-boot) is a
+  # deferred task, and the intended Linux backend is QEMU, not libkrun-on-Linux.
+  libkrun:
+    # The `macos-15` runner label resolves to arm64 Sequoia, matching the
+    # libkrun toolchain's supported CI architecture.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rust
+        run: rustup toolchain install stable --profile minimal --component clippy
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: libkrun   # distinct from the no-default-features `test` job's artifacts
+      - name: Install libkrun
+        # Homebrew now gates third-party taps behind HOMEBREW_REQUIRE_TAP_TRUST
+        # (set on the runner image) — `brew install` refuses an untapped-trust
+        # formula ("Refusing to load formula … from untrusted tap"). `brew trust`
+        # the tap between tap+install; non-interactive + forward-compatible for
+        # when tap-trust becomes the Homebrew default.
+        run: |
+          brew tap libkrun/krun
+          brew trust libkrun/krun
+          # The tap currently infers libkrunfw's version as `64` from its
+          # `aarch64` source URL, so its generated bottle URL does not match the
+          # published 5.5.0 asset. Build that one formula from its verified
+          # prebuilt source tarball, then install libkrun's normal bottle.
+          brew install --build-from-source libkrunfw
+          brew install libkrun
+      - name: Clippy (libkrun)
+        run: cargo clippy --all-targets --features libkrun -- -D warnings
+      - name: Test (libkrun)
+        run: cargo test --all-targets --features libkrun

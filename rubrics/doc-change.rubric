@@ -1,0 +1,6 @@
+# doc-change — a documentation change exists and holds its invariants.
+# Replace docs/CHANGES.md with the doc the task touches.
+file-present :: test -f docs/CHANGES.md
+non-empty :: test -s docs/CHANGES.md
+no-todo-marker :: sh -c '! grep -rn "TODO" docs/CHANGES.md'
+no-broken-relative-link :: sh -c 'for f in $(grep -oE "\]\([^)#:]+\.md" docs/CHANGES.md | sed -E "s/^\]\(//"); do test -f "docs/$f" || test -f "$f" || exit 1; done'

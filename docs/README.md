@@ -1,0 +1,57 @@
+# pillbox docs
+
+Topic-organized deep dives. For the agent-facing command reference, see
+[../AGENTS.md](../AGENTS.md). **This index is the map — it marks what's
+authoritative.** When a design doc and a banner disagree, the banner (newer) wins.
+
+## Direction (read these first — current strategy + substrate)
+
+| File | What |
+|---|---|
+| [architecture.md](./architecture.md) | **Start here.** Verified system map, current placements, and structural debts. |
+| [vnext.md](./vnext.md) | Historical umbrella strategy and layering context; code and active decisions supersede stale sequence details. |
+| [libkrun-sandbox.md](./libkrun-sandbox.md) | **The substrate.** Docker → libkrun microVM: own-via-FFI, `pillbox-init`, vsock control + smoltcp egress, the security union, what survives the pivot. |
+| [dx.md](./dx.md) | The developer-experience contract — the inner loops + zero-config-local. (Remote-parity sections are superseded by the local-first pivot.) |
+
+## Substrate / §0 spine (the contracts everything rides on)
+
+| File | What |
+|---|---|
+| [session-event-log.md](./session-event-log.md) | The durable, attributed per-session event log — the keystone every consumer reads. |
+| [gateway.md](./gateway.md) | The local gateway boundary and why multiplayer gateway ownership belongs to Huddles. |
+| [managed-tier.md](./managed-tier.md) | **Experimental implementation.** Bounded D1/R2 execution using Cloudflare Sandbox; no custom Pillbox DO or remote §0 log. |
+| [durable-object-usage.md](./durable-object-usage.md) | Default-deny DO policy, cost gates, and Cloudflare Computer evaluation rubric. |
+| [agent-io-contract.md](./agent-io-contract.md) | The PTY-free structured I/O contract (`agent.proto`). |
+| [attach-transport.md](./attach-transport.md) | The interactive `Frame` transport. (Transport-agnostic surface; the `docker exec` carrier moves to vsock under libkrun.) |
+
+## Reference (shipped behavior)
+
+| File | When to read |
+|---|---|
+| [secrets.md](./secrets.md) | Storing API keys + `.env` bundles, lifecycle, precedence |
+| [config.md](./config.md) | Per-project `pillbox.toml` — schema, discovery, merge |
+| [vault.md](./vault.md) | `--vault` MITM proxy (stub-swap). *Hardening → vault v2 in libkrun-sandbox.md.* |
+| [observability.md](./observability.md) | OTLP telemetry — pointing pillbox at a collector |
+| [runner-image.md](./runner-image.md) | The sandbox image. *Docker framing; becomes a microVM rootfs under libkrun.* |
+| [shared-mcp.md](./shared-mcp.md) | `--mcp` shared MCP attachments |
+| [recipes.md](./recipes.md) | Copy-paste flows |
+| [security.md](./security.md) | Threat model + file layout. *VM-boundary upgrade tracked in libkrun-sandbox.md.* |
+| [opencode-integration.md](./opencode-integration.md) | opencode (server-mode) as a **first-class** run target on docker + libkrun — the `/event` wire contract + drive/read API. (pi backlogged.) |
+
+## External consumer (separate project, not this repo)
+
+| File | What |
+|---|---|
+| [swarm-memory.md](./swarm-memory.md) | Optimization / memory loops (GEPA + ACE) that consume the pillbox contract. |
+
+## ⚠️ Superseded / deprecated (kept for history; do not build against)
+
+| File | Status |
+|---|---|
+| [remotes-redesign.md](./archive/remotes-redesign.md) | **Superseded** by libkrun-sandbox.md (the Docker-context backend collapse is retired). Fork-from-store reasoning carries forward. |
+| [remotes.md](./archive/remotes.md) | **Removed** — the `ssh://`/`e2b://`/`docker://` URL backends and `--remote` are gone. Managed has returned as an experimental Cloudflare placement, not a URL backend. |
+
+Archived decision records: [`archive/`](./archive/).
+
+If you're a coding agent on a fresh machine, start with `pillbox doctor --json`
+and [AGENTS.md](../AGENTS.md).

@@ -1,0 +1,4 @@
+# code-explore MCP sidecar. Host-side only — NOT installed in the pillbox runner
+# image (the issue's constraint: keep model/serving deps out of the default
+# runner). rg + ast-grep are system binaries, not pip deps.
+mcp>=1.12

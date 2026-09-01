@@ -1,0 +1,4 @@
+digit_sum_max [12, 91, 5]=10 :: python3 -c 'import sys;sys.path.insert(0,".");from solution import digit_sum_max as f;assert f([12, 91, 5])==10'
+digit_sum_max [100, 7]=7 :: python3 -c 'import sys;sys.path.insert(0,".");from solution import digit_sum_max as f;assert f([100, 7])==7'
+digit_sum_max [19]=10 :: python3 -c 'import sys;sys.path.insert(0,".");from solution import digit_sum_max as f;assert f([19])==10'
+digit_sum_max []=-1 :: python3 -c 'import sys;sys.path.insert(0,".");from solution import digit_sum_max as f;assert f([])==-1'

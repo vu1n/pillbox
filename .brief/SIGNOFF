@@ -1,0 +1,87 @@
+# brief backfill — conformance sign-off
+# The backfill commit adds `// Context:` doc-refs (comments only) into governed
+# source sites and reconstructs the decision layer. No pillbox behavior changed,
+# so every touched decision still conforms by construction.
+
+libkrun-is-the-backend conforms: backfill adds a doc-ref comment only; select_backend still defaults to libkrun (mod.rs) and default = ["libkrun"] is unchanged.
+docker-backend-deleted conforms: no code change to the docker backend; only a doc-ref/comment was added to sandbox/mod.rs.
+qemu-parked conforms: no QEMU backend added; sandbox/mod.rs change is a doc-ref comment only.
+vault-broker-oauth conforms: refresh.rs change is a doc-ref comment above pre_refresh; broker/pre_refresh logic unchanged.
+docs-governance conforms: AGENTS.md gained only the brief convention block (via init); the router/canonical-doc discipline is unchanged.
+rustic-cache-variant-gated conforms: rustic.rs change is a doc-ref comment above repo_opts; per-variant cache logic unchanged.
+dx-zero-config-local conforms: events/log.rs change is a doc-ref comment; the zero-config local subscribe surface is unchanged.
+libkrun-env-fork-substrate conforms: libkrun/session.rs change is a doc-ref comment at the env-fork invariant; the env-fork channel split is unchanged.
+managed-tier-do-gateway conforms: sandbox/mod.rs change is a doc-ref comment only; the managed placement behind the trait is unchanged.
+remote-backend-plane-removed conforms: no remote backend re-added; sandbox/mod.rs change is a doc-ref comment only.
+secret-on-disk-0600 conforms: paths.rs/rustic.rs changes are doc-ref comments; the 0600 write helper and its callers are unchanged.
+session-event-log-spine conforms: events/log.rs change is a doc-ref comment above append; the single-writer per-session seq logic is unchanged.
+stable-exit-codes conforms: errors.rs change is a doc-ref comment; the ExitCategory numeric contract is unchanged.
+substrate-plane-livesession conforms: sandbox/mod.rs change is a doc-ref comment above the LiveSession trait; the trait/Caps surface is unchanged.
+workspace-ingest-sovereignty conforms: ingest.rs/libkrun session.rs changes are doc-ref comments; the pillbox-controlled secret denylist is unchanged.
+libkrun-is-the-backend conforms: workspace-fork source selection inside the libkrun backend; adds no backend and does not touch backend selection.
+libkrun-env-fork-substrate conforms: forks the env-fork substrate's workspace from a warm base cache via CoW (see doc://pillbox/workspace-cow-fork); substrate invariant unchanged.
+workspace-ingest-sovereignty conforms: edits launch_base clone-source selection in session.rs; the ingest denylist / sovereignty invariant is untouched.
+managed-tier-do-gateway conforms: the Cloudflare workspace-transfer path now forwards the prefix-scoped R2 credential's required session token into the container helper, satisfying the frozen fail-closed credential contract.
+managed-store-of-record conforms: scoped credential propagation changes only authentication for rustic-over-R2 provision/finalize; rustic remains the authoritative cross-placement store and handle space.
+libkrun-is-the-backend conforms: Cargo metadata now describes the public Cloudflare/local positioning; the default libkrun feature and backend selection are unchanged.
+docs-governance conforms: the docs router and canonical subsystem docs were updated to match shipped code and active decisions, reducing rather than introducing drift.
+secret-on-disk-0600 conforms: the workspace helper reads an optional R2 session token from its process environment and changes no private-file write path; the repo password still uses write_private_file.
+managed-tier-do-gateway conforms: records the live scoped-R2 foreground proof and updates the deployment guide; the per-session Durable Object remains the sequencer, actor authority, driver arbiter, replay store, and container gateway required by the decision.
+libkrun-env-fork-substrate conforms: the guest boot preamble now runs update-ca-certificates via a PATH including /usr/sbin so the vault MITM CA cert lands in the guest trust store; no real credential enters the guest env/argv/VmSpec and the host-owned smoltcp/MITM termination point is unchanged.
+workspace-ingest-sovereignty conforms: change is confined to the CA-install line of the boot preamble; the pillbox-controlled ingest denylist and the workspace virtio-fs mount are untouched.
+libkrun-is-the-backend conforms: the change is a bugfix inside the libkrun backend's guest boot preamble (CA install); it adds no backend, does not touch `default = ["libkrun"]`, and does not alter backend selection.
+managed-store-of-record conforms: the per-session ensure binding adds only Durable Object coordination metadata; it does not store workspace contents or alter rustic-over-R2 as the authoritative managed workspace store and handle space.
+managed-tier-do-gateway conforms: private ensure-session RPC keeps atomic session identity state in the per-session Durable Object; the DO remains the server-side gateway and no host provisioning or public ensure route is added.
+managed-tier-do-gateway conforms: private Huddles invocation claims one exact rendered delivery before the existing DO-to-container turn, records raw input/output in the per-session log, and adds no host provisioning, public route, or orchestration semantics.
+managed-store-of-record conforms: the invocation row and §0 events are session execution metadata only; managed workspace contents remain recoverable from the unchanged rustic-over-R2 store and handle space.
+managed-tier-do-gateway conforms: an ensured Huddles SessionGateway now fails closed on public HTTP and WebSocket attach/drive, including sockets connected before binding; private service-binding ensure/invoke and the per-session seq authority remain unchanged.
+managed-store-of-record conforms: redacted invocation diagnostics add only session execution evidence to the existing Durable Object log; workspace contents and the authoritative rustic-over-R2 handle space are unchanged.
+managed-tier-do-gateway conforms: the per-session Durable Object still owns sequencing and the private container invocation; this change retains a redacted caught-exception cause in its own log while the Huddles RPC failure envelope remains generic.
+managed-tier-do-gateway conforms: the SessionGateway deterministically projects session identity into Cloudflare's 63-character Sandbox namespace at the DO-to-container adapter boundary; the per-session Durable Object still owns sequencing, attribution, replay, and container lifecycle.
+managed-store-of-record conforms: sandbox runtime identity projection changes no SessionRef, durable event identity, workspace content, or rustic-over-R2 handle; it only supplies a valid Cloudflare container address.
+managed-tier-do-gateway conforms: private Huddles invocation now carries a generic JSON-schema output constraint into OpenCode and projects the resulting structured value through the existing per-session event stream; the Durable Object remains the sequencer, gateway, and container lifecycle authority.
+managed-store-of-record conforms: schema-bound output is session execution evidence only; it changes no workspace content authority or rustic-over-R2 handle.
+session-event-log-spine conforms: OpenCode structured output becomes an ordinary MessageDelta in the existing immutable, single-writer session log without changing the §0 event schema or sequence authority.
+agent-io-pty-free-contract conforms: the OpenCode mapper projects schema-bound output from the existing structured SSE API into session evidence; it adds no PTY, terminal scraping, or alternate agent I/O path.
+managed-store-of-record conforms: bounded structured-output retries, normalized terminal output, and their positional session evidence remain execution metadata in the per-session log; workspace contents and the authoritative rustic-over-R2 handle space are unchanged.
+managed-tier-do-gateway conforms: the extracted OpenCode turn driver remains inside the private per-session SessionGateway boundary; the Durable Object still owns sequencing, actor attribution, replay, invocation identity, and container lifecycle, with no host provisioning or public route added.
+session-event-log-spine conforms: requested profiles remain immutable session/run evidence, while served-model and effective-limit facts are reduced only from the same session's append-only log with the enclosing event seq as source position.
+agent-io-pty-free-contract conforms: the shared structured contract now transports provider/model/profile/reasoning requests and observed runtime evidence without adding threads, task policy, locks, or a PTY integration.
+agent-io-pty-free-contract conforms: Cursor Agent CLI stream-json adapter normalizes headless `agent -p` output into the shared contract vocabulary without adding PTY, threads, or orchestration policy.
+agent-io-pty-free-contract conforms: pi moves to Integration::Structured with the shared one-shot drain; no PTY path added.
+dx-zero-config-local conforms: session info JSON now surfaces requested vs served model evidence from the existing local session log; no daemon or remote config required.
+gateway-no-daemon conforms: session info evidence reduction stays in-process against the local §0 log; no new gateway or long-lived daemon.
+libkrun-env-fork-substrate conforms: cursor alt-auth and structured one-shot launch still use launch_base CoW forks; no real credential enters guest argv/VmSpec beyond the existing --with/env path; egress allowlist gains only Cursor hosts.
+optimization-external-substrate-primitives conforms: RequestedRunProfile/served evidence are session evidence fields only; no optimizer/policy logic enters the substrate.
+substrate-plane-livesession conforms: session info JSON evidence is a read of the existing LiveSession log; send/attach/watch surfaces are unchanged.
+vault-egress-default-deny conforms: Cursor Agent CLI hosts are an explicit allowlist addition; default-deny and the DNS fence remain.
+workspace-ingest-sovereignty conforms: structured/cursor launch uses the existing workspace virtio-fs mount; no ingest denylist change.
+libkrun-is-the-backend conforms: Cursor/pi Structured runs are libkrun-only; docker rejects them rather than gaining a parallel path.
+docker-backend-deleted conforms: docker rejects Integration::Structured rather than growing a docker structured path; no new docker features.
+runner-image-tags-name-roles conforms: build-runner.sh only adds the agent binary to the PATH check list; image tag roles are unchanged.
+runner-image-tags-name-roles conforms: the updater now refreshes every bundled harness while retaining the dev/latest/vX.Y.Z tag roles.
+qemu-parked conforms: sandbox/mod.rs only adds the structured module gate; QEMU remains parked and unselected.
+managed-store-of-record conforms: managed Session records gain an optional requested_execution field with default None; rustic-over-R2 workspace authority is unchanged.
+managed-tier-do-gateway conforms: managed.rs only fills the new Session field as None; DO gateway sequencing and drive path are untouched.
+remote-backend-plane-removed conforms: structured module is local libkrun-only; no remote URL backend returns.
+libkrun-is-the-backend conforms: rustfmt-only whitespace in libkrun session structured path; backend selection unchanged.
+agent-io-pty-free-contract conforms: rustfmt-only whitespace in cursor harness; adapter vocabulary unchanged.
+libkrun-env-fork-substrate conforms: rustfmt-only whitespace in structured launch; CoW fork/env substrate unchanged.
+workspace-ingest-sovereignty conforms: rustfmt-only whitespace in session.rs; ingest denylist untouched.
+managed-tier-do-gateway conforms: v0002 removes the custom SessionGateway and remote §0 placement; Huddles owns collaboration while Pillbox persists bounded D1 claims, one immutable R2 evidence object, one terminal analytics point, and uses only Cloudflare Sandbox's vendor-owned DO.
+managed-tier-do-gateway conforms: signed execution grants are verified and re-introspected statelessly before bounded D1 execution; no SessionGateway, CredentialBroker, or other Pillbox-authored Durable Object is bound or exported.
+managed-store-of-record conforms: signed grants remain authorization input only; execution identity stays in bounded D1 and evidence in immutable R2, with no OAuth or token material persisted.
+libkrun-is-the-backend conforms: structured-run payload bounds, cost evidence, and workspace lineage checks stay inside the selected libkrun backend; backend selection and the default feature are unchanged.
+docker-backend-deleted conforms: docker only rejects the structured integration introduced for libkrun; it gains no feature, parity promise, or new engineering path.
+qemu-parked conforms: sandbox module wiring exposes structured execution without selecting or implementing a QEMU backend; QEMU remains parked.
+docs-governance conforms: AGENTS.md and the canonical docs record the ratified single-controller managed boundary, Durable Object default-deny policy, and storage/cost contracts without creating a competing source of truth.
+agent-io-pty-free-contract conforms: requested model profiles, served-model evidence, usage, and bounded structured output travel through the existing normalized event contract; no PTY or terminal-scraping path is added.
+dx-zero-config-local conforms: local session status and cost evidence continue to derive in-process from the local session log; no daemon, managed gateway, or remote configuration is required.
+gateway-no-daemon conforms: the remote event source/sink and custom managed gateway are removed; the remaining local gateway stays in-process and introduces no long-lived daemon.
+libkrun-env-fork-substrate conforms: structured launches and their payload limits retain the existing launch-base CoW fork and environment channel; no real credential is added to guest argv or VmSpec.
+optimization-external-substrate-primitives conforms: model, usage, and cost fields are sourced execution evidence only; no optimizer, routing policy, or learning loop enters the substrate.
+remote-backend-plane-removed conforms: managed Cloudflare execution remains a fresh single-controller runtime reached through its explicit managed placement; no remote URL backend or legacy remote control plane returns.
+secret-on-disk-0600 conforms: scoped workspace credentials remain process-bound and the rustic repository password still uses the private-file path; no secret-bearing file permission is weakened.
+session-event-log-spine conforms: the local append-only SessionLog remains the sole per-session event spine with monotonic sequence assignment; remote source/sink routing and DO log placement are removed.
+substrate-plane-livesession conforms: structured execution, status evidence, and cost projection preserve the existing LiveSession capability boundary; send, attach, and watch ownership do not move into orchestration.
+workspace-ingest-sovereignty conforms: managed lineage verification and structured local launches keep the existing workspace mount and ingest denylist; no untrusted workspace file becomes credential or policy authority.

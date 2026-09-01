@@ -1,0 +1,4 @@
+Implement `alternating_sum(xs)` in `solution.py`: return xs[0] - xs[1] + xs[2] - ... (alternating signs from the left).
+
+`xs` is a list of integers. Edit ONLY `solution.py`. Keep the function name and
+signature exactly as given.

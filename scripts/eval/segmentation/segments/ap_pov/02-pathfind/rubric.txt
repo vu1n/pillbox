@@ -1,0 +1,12 @@
+# Segment-2 gate — Tree.path_to (pathfinding). Authoritative subset of the hidden
+# pov_test.py (injected at grade time; see segment 1's rubric for the gate-vs-
+# metric distinction). path_to builds on from_pov, so this segment forks from
+# segment 1's VERIFIED workspace — the genuine sequential dependency the σ̂
+# hypothesis is about.
+path-to-parent :: python3 -m unittest pov_test.PovTest.test_can_find_path_to_parent
+path-to-sibling :: python3 -m unittest pov_test.PovTest.test_can_find_path_to_sibling
+path-to-cousin :: python3 -m unittest pov_test.PovTest.test_can_find_path_to_cousin
+path-not-involving-root :: python3 -m unittest pov_test.PovTest.test_can_find_path_not_involving_root
+path-from-other-nodes :: python3 -m unittest pov_test.PovTest.test_can_find_path_from_nodes_other_than_x
+path-error-destination :: python3 -m unittest pov_test.PovTest.test_errors_if_destination_does_not_exist
+path-error-source :: python3 -m unittest pov_test.PovTest.test_errors_if_source_does_not_exist

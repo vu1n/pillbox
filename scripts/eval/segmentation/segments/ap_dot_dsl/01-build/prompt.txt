@@ -1,0 +1,19 @@
+# Segment 1 of 2 — build the graph from well-formed input
+
+You are implementing `dot_dsl.py` incrementally. This segment covers ONLY
+building a `Graph` from WELL-FORMED input; a later segment adds rejecting
+malformed input, so don't worry about validation/errors yet.
+
+`dot_dsl.py` already defines the `NODE`, `EDGE`, `ATTR` markers and `Node` /
+`Edge` / `Graph` classes (with structural equality). Implement `Graph(data)` so
+it builds a graph from `data`, a list of tuples whose first element is a marker:
+
+- `(ATTR, key, value)` → a graph-level attribute,
+- `(NODE, name, attrs)` → a node (`attrs` is a dict),
+- `(EDGE, src, dst, attrs)` → an edge.
+
+After construction, expose the graph's `attrs`, `nodes`, and `edges`. An empty
+`data` (or `None`) yields an empty graph.
+
+Edit `dot_dsl.py` directly. Stop once well-formed graphs build correctly; the
+next segment adds input validation on top of this.

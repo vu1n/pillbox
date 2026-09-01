@@ -1,0 +1,185 @@
+[package]
+name = "pillbox"
+version = "0.2.0"
+edition = "2021"
+authors = ["vu1n"]
+license = "MIT OR Apache-2.0"
+description = "Durable coding-agent sessions on Cloudflare and local libkrun microVMs."
+repository = "https://github.com/vu1n/pillbox"
+homepage = "https://github.com/vu1n/pillbox"
+keywords = ["sandbox", "agent", "cloudflare", "durable-objects", "libkrun"]
+categories = ["command-line-utilities", "development-tools"]
+readme = "README.md"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Credential vault — MITM HTTPS proxy that swaps stub creds for real
+# ones at the host boundary. Anthropic + codex providers as of v0.5.
+# See src/vault/.
+# NOTE: deliberately NOT enabling the `http2` feature. With it on, the
+# MITM's server-side TLS advertises `h2` in ALPN; an agent whose client
+# speaks HTTP/2 (codex) then negotiates h2 to the proxy, and a WebSocket
+# upgrade — HTTP/1.1-only; hyper_tungstenite has no RFC 8441 (WS-over-h2)
+# — can no longer happen, so codex's WS dies and it falls back to HTTPS.
+# Pinning the proxy to HTTP/1.1 makes the vault WebSocket-capable for any
+# agent. Anthropic/OpenAI + SSE all work over 1.1; the lost h2
+# multiplexing is irrelevant for a single agent's traffic.
+hudsucker = { version = "0.24", default-features = true }
+async-trait = "0.1"
+rcgen = "0.14"
+# Opt-in debug logging for the vault proxy. hudsucker emits its internal
+# errors (TLS, WebSocket upgrade/relay) via `tracing`; with no subscriber
+# they're dropped. `PILLBOX_VAULT_TRACE=<file>` installs an fmt subscriber
+# that writes them to a file (a file, not stderr, so an attached agent's
+# raw-mode TUI isn't corrupted). Already in the tree transitively.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "sync", "time"] }
+http-body-util = "0.1"
+time = "0.3"
+uuid = { version = "1", features = ["v7"] }
+tempfile = "3"
+
+# Workspace versioning — rustic_core is a Rust port of restic. Each
+# pillbox owns one rustic repository (local on disk, or S3-shaped via
+# opendal). See src/workspace/.
+rustic_core = "0.11"
+rustic_backend = { version = "0.6", default-features = false, features = ["opendal"] }
+rand = "0.9"
+# Base64 for the exec channel's ExecOutput.data (matches the proto `bytes`
+# field's protobuf-JSON encoding so binary stdout survives the wire).
+base64 = "0.22"
+# SHA-256 for the §0 blob store's content addressing (`sessions/<id>/blobs/
+# <sha256>`) — structured artifact bodies are stored by content hash. Already
+# in the lockfile via rustic; this makes the dependency direct.
+sha2 = "0.10"
+# Cross-platform FS watcher — `pillbox session transcript --follow`
+# tails an agent's JSONL transcript by waiting on inotify/kqueue/
+# FSEvents notifications. Drives the live-trace UX for transcripts;
+# the same Tailer struct will back the bind-mount-tailed auto-emit
+# path once that ships. v8 is the most-recent stable.
+notify = "8"
+# Sync WebSocket server for the per-session event gateway
+# (`pillbox session subscribe`): streams the durable event log to WS
+# subscribers as JSON. Sync + thread-per-connection — no tokio runtime
+# (matches pillbox's model: async only for the vault proxy). Already in
+# the tree transitively via hudsucker. `handshake` for the localhost ws://
+# gateway server; `rustls-tls-webpki-roots` for the managed §0 read source
+# (`events::source::ManagedDoSource`), a wss:// client to the Durable Object
+# — it uses our explicit aws_lc_rs `Connector` (no process-default provider),
+# reusing the tree's pinned rustls 0.23. Direct dep so `cargo audit` sees it.
+tungstenite = { version = "0.28", default-features = false, features = [
+    "handshake",
+    "rustls-tls-webpki-roots",
+] }
+# Unix-only: `pillbox session detach <id>` SIGTERMs the attached
+# pillbox process. Direct dep so a `cargo audit` flags advisories
+# instead of hiding behind a transitive resolution.
+libc = "0.2"
+# Webhook sink for the events stream (`pillbox session done` POSTs to
+# `$PILLBOX_EVENTS_WEBHOOK`). The `blocking` feature lets us call from
+# sync code paths without dragging a tokio runtime through every
+# event-emit. Already in the tree transitively via hudsucker; direct
+# dep so a `cargo audit` flags advisories.
+reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-features = false }
+# OTel sinks — per-event OTLP log records + per-session OTLP spans
+# to whichever collector `OTEL_EXPORTER_OTLP_ENDPOINT` points at.
+# Default transport is HTTP/protobuf via the blocking reqwest client
+# (no tokio runtime drag — emit is sync, matching the webhook sink's
+# model). Spans are sandbox-only and only emitted at terminal events
+# when the wrapper has exported `PILLBOX_SESSION_STARTED_AT` so
+# span.start_time is meaningful.
+opentelemetry = "0.30"
+opentelemetry_sdk = { version = "0.30", default-features = false, features = ["logs", "trace"] }
+opentelemetry-otlp = { version = "0.30", default-features = false, features = ["logs", "trace", "http-proto", "reqwest-blocking-client"] }
+# rustic_core re-exposes timestamps as jiff::Zoned — depend on jiff
+# directly so the helper that normalizes to strict RFC3339 doesn't
+# look at types it can't name.
+jiff = "0.2"
+# Interactive attach transport — the in-sandbox pty-host keeps a vt100
+# screen model so reattach can serve a bounded ANSI snapshot of current
+# state. state_formatted()+contents_formatted() round-trips modes the
+# way orca's xterm-headless + SerializeAddon does, minus the hand-rolled
+# mouse-mode mirroring. See docs/attach-transport.md.
+vt100 = "0.15"
+# portable-pty: the in-sandbox pty-host owns the agent's PTY through this
+# (spawn under a PTY, read/write, resize). Runs sandbox-side.
+portable-pty = "0.8"
+# crossterm: host-side only — the terminal front-end pump (`pty-attach`)
+# uses it for raw mode + terminal size. Never runs in the sandbox.
+crossterm = "0.27"
+
+# Userspace TCP/IP stack for the libkrun backend's egress termination point
+# (virtio-net in the VMM child). Optional — pulled in only by the `libkrun`
+# feature; the default build never compiles it.
+smoltcp = { version = "0.12", optional = true, default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp"] }
+# rustls + Mozilla roots for the vault MITM forward leg. Two consumers:
+# libkrun (L5b — terminate the guest's TLS on the smoltcp stack, validate the
+# real upstream's cert) and the docker broker's forward connector (the SSRF
+# guard rebuilds hudsucker's rustls connector around a filtering resolver — see
+# src/vault/server.rs). Pinned to 0.23 to match hudsucker (one rustls in the
+# tree) and already compiled transitively (reqwest/hudsucker), so naming them
+# directly adds no crates. rcgen (the vault CA) mints the leaf.
+rustls = "0.23"
+webpki-roots = "0.26"
+# hyper-rustls + tower-service: the docker forward leg's SSRF guard wraps a
+# custom DNS resolver in an HttpConnector and re-wraps it with rustls TLS
+# (HttpsConnectorBuilder::wrap_connector), then feeds it to hudsucker via
+# with_http_connector. Both are already in the default tree (reqwest/hyper-util).
+# default-features off on hyper-rustls so we don't pull a second crypto provider
+# (we pass our own aws-lc-rs ClientConfig).
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1"] }
+tower-service = "0.3"
+schemars = { version = "1.2.1", optional = true }
+
+[features]
+# libkrun is THE backend, so it's the default build — `cargo build` on a host
+# with the libkrun toolchain (the maintainer's Mac, libkrun CI) gives a libkrun
+# binary. Builds without the toolchain (Linux CI, `cargo install` elsewhere) use
+# `--no-default-features`, which falls back to the deprecated docker backend (the
+# toolchain-free path; docker stays a switchable fallback, not deleted).
+default = ["libkrun"]
+
+# Opt-in OTLP/gRPC transport for the OTel logs sink. Adds tonic +
+# prost to the binary; the sandbox runtime image build leaves it off
+# to keep the in-sandbox pillbox lean (HTTP/protobuf is the default
+# everywhere). Host-side users who run a gRPC-only collector enable
+# this with `cargo install pillbox --features otel-grpc`.
+otel-grpc = ["opentelemetry-otlp/grpc-tonic"]
+
+# Local microVM backend (libkrun) — Linux/KVM + macOS/HVF (hardware virt
+# required; no software-emulation fallback). THE backend, and in `default`.
+# Needs libkrun + libkrunfw installed (link dir from `$LIBKRUN_LIB_DIR` or the
+# per-OS default in build.rs); on macOS the binary must also be codesigned with
+# the hypervisor entitlement to *boot* a VM (no codesign on Linux/KVM; building
+# never needs it). Pulls smoltcp for the in-VMM-child userspace egress stack
+# (virtio-net) + rustls + webpki-roots for the vault MITM (L5b).
+libkrun = ["dep:smoltcp"]
+
+# Codegen-only: derive `JsonSchema` on the §0 contract types so the
+# `contract_schema_is_current` test (src/contract.rs) can emit/check the canonical
+# JSON Schema (`cloudflare-spike/contract.schema.json`) — the single source the TS
+# contract is generated from. OFF by default, so `schemars` stays out of the
+# shipped binary. Regenerate with
+# `UPDATE_SCHEMA=1 cargo test --features contract-schema contract_schema_is_current`.
+contract-schema = ["dep:schemars"]
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+
+# Profile for the in-sandbox pillbox baked into the runner image. That binary
+# is `pty-host` + the vault proxy + blob plumbing — I/O-bound, not a hot path —
+# so it doesn't need release LTO/single-codegen-unit. Trading those for a much
+# faster compile (the runner image rebuilds on every BYO/on-target build).
+[profile.runner]
+inherits = "release"
+opt-level = 1
+lto = false
+codegen-units = 16

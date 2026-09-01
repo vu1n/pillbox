@@ -1,0 +1,10 @@
+Implement `find_duplicates(items)` in solution.py.
+
+Return a list of the values that appear more than once in `items`, each listed
+once, in the order they first become a duplicate (i.e. ordered by the position
+of their second occurrence). It must also work when the elements are unhashable
+(e.g. lists), not just hashable values.
+
+Examples:
+  find_duplicates([1, 2, 2, 3, 3, 3]) == [2, 3]
+  find_duplicates([[1], [1], [2]])    == [[1]]

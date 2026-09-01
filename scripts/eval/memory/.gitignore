@@ -1,0 +1,4 @@
+# Generated task family (regenerate via gen-memory-tasks.py) + run artifacts.
+tasks/
+*-run.json
+mem-run.json

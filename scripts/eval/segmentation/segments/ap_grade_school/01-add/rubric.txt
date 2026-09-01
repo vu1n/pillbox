@@ -1,0 +1,19 @@
+# Segment-1 gate — enrollment + de-duplication. An authoritative SUBSET of the
+# hidden grade_school_test.py (injected at grade time; the agent never sees it).
+# Gates the segmented arm's progression only — the comparable score for both arms
+# is the FULL grade_school_test rubric at the end. These are the order-insensitive
+# (membership / dedup) tests; the order-sensitive ones are segment 2's gate.
+add-roster-empty :: python3 -m unittest grade_school_test.GradeSchoolTest.test_roster_is_empty_when_no_student_is_added
+add-a-student :: python3 -m unittest grade_school_test.GradeSchoolTest.test_add_a_student
+add-student-in-roster :: python3 -m unittest grade_school_test.GradeSchoolTest.test_student_is_added_to_the_roster
+add-multiple-same-grade :: python3 -m unittest grade_school_test.GradeSchoolTest.test_adding_multiple_students_in_the_same_grade_in_the_roster
+add-multiple-same-grade-roster :: python3 -m unittest grade_school_test.GradeSchoolTest.test_multiple_students_in_the_same_grade_are_added_to_the_roster
+dedup-same-grade :: python3 -m unittest grade_school_test.GradeSchoolTest.test_cannot_add_student_to_same_grade_in_the_roster_more_than_once
+dedup-same-grade-roster :: python3 -m unittest grade_school_test.GradeSchoolTest.test_student_not_added_to_same_grade_in_the_roster_more_than_once
+add-multiple-grades :: python3 -m unittest grade_school_test.GradeSchoolTest.test_adding_students_in_multiple_grades
+add-multiple-grades-roster :: python3 -m unittest grade_school_test.GradeSchoolTest.test_students_in_multiple_grades_are_added_to_the_roster
+dedup-multiple-grades :: python3 -m unittest grade_school_test.GradeSchoolTest.test_cannot_add_same_student_to_multiple_grades_in_the_roster
+dedup-multiple-grades-roster :: python3 -m unittest grade_school_test.GradeSchoolTest.test_student_not_added_to_multiple_grades_in_the_roster
+dedup-same-grade-2 :: python3 -m unittest grade_school_test.GradeSchoolTest.test_student_not_added_to_same_grade_more_than_once
+dedup-multiple-grades-2 :: python3 -m unittest grade_school_test.GradeSchoolTest.test_student_not_added_to_multiple_grades
+dedup-other-grade :: python3 -m unittest grade_school_test.GradeSchoolTest.test_student_not_added_to_other_grade_for_multiple_grades

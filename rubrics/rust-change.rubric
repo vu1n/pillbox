@@ -1,0 +1,6 @@
+# rust-change — a Rust change is formatted, lint-clean, builds, and tests pass.
+# Reward for a Rust dispatch; per-segment gates are usually a subset of these lines.
+fmt :: cargo fmt --all --check
+clippy :: cargo clippy --all-targets -- -D warnings
+build :: cargo build --all-targets
+test :: cargo test

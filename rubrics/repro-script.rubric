@@ -1,0 +1,5 @@
+# repro-script — a repro script exists, is executable, and exits 0.
+# Replace repro.sh with the script the task is meant to produce/fix.
+script-present :: test -f repro.sh
+script-executable :: test -x repro.sh
+script-passes :: ./repro.sh

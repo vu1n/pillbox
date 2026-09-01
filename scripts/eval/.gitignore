@@ -1,0 +1,4 @@
+# Generated benchmark tasks + clone cache (regenerate via import-*.py; do not commit)
+tasks/he_*/
+tasks/ap_*/
+.cache/

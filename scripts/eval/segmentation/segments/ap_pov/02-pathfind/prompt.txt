@@ -1,0 +1,18 @@
+# Segment 2 of 2 — find the path between two nodes (`Tree.path_to`)
+
+Continue `pov.py` from the previous segment. `Tree.from_pov(from_node)` is
+already implemented and working — build on it; do not break it. Implement:
+
+    Tree.path_to(from_node, to_node)
+
+It returns the list of node labels on the unique path from `from_node` to
+`to_node`, inclusive of both endpoints. Reorienting the tree so `from_node` is
+the root (you already have `from_pov`) turns this into a straight walk down to
+`to_node`.
+
+If either `from_node` or `to_node` is not present in the tree, raise
+`ValueError` with a meaningful message — there is no path to or from a node the
+tree doesn't contain.
+
+Edit `pov.py` directly. Keep the `from_pov` behavior from the previous segment
+intact.

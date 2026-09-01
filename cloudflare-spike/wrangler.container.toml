@@ -1,0 +1,58 @@
+# Preserve the existing deployed Worker name. Historical namespace retirement
+# remains a separate release operation.
+name = "pillbox-do-spike"
+main = "src/worker.ts"
+compatibility_date = "2026-06-01"
+# Sandbox SDK dependencies use Node compatibility shims.
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "EXECUTION_DB"
+database_name = "pillbox-execution-preview"
+database_id = "2bdaab2a-d0df-48cd-8fb5-fd4feeab091b"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "EXECUTION_EVIDENCE"
+bucket_name = "pillbox-execution-evidence-preview"
+
+[[analytics_engine_datasets]]
+binding = "RUN_COSTS"
+dataset = "pillbox_execution_run_costs_preview"
+
+[vars]
+SANDBOX_PROFILE = "standard-2"
+MANAGED_AUTH_REQUIRED = "1"
+
+# The Sandbox SDK's container-owning DO (one container per session, addressed by
+# the execution session id). The Worker calls it through the Sandbox SDK.
+[[durable_objects.bindings]]
+name = "Sandbox"
+class_name = "Sandbox"
+
+[[services]]
+binding = "PillboxAuthorizationControlPlane"
+service = "huddles-projectors"
+entrypoint = "PillboxAuthorizationControlPlaneEntrypoint"
+
+# Bind the Sandbox DO class to the container image (built from ./Dockerfile).
+# `wrangler dev` builds + runs it locally via Docker.
+[[containers]]
+class_name = "Sandbox"
+image = "./Dockerfile"
+# opencode's Bun runtime needs ~570 MB resident just to serve, and more to run a
+# turn. lite (128 MB) and basic (256 MB) OOM-kill it at startup; standard-1 (512 MB)
+# only just fits idle and thrashes at the cgroup cap. standard-2 (1 GB) is the floor
+# with headroom for an agent turn. Idle instances auto-sleep (no idle billing).
+# max_instances >1 so concurrent sessions don't contend a single container slot.
+max_instances = 5
+instance_type = "standard-2"
+
+# Historical migration record. SessionGateway is not bound or exported; its
+# namespace/data retirement remains a separate retention review.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SessionGateway", "Sandbox"]
+
+[observability]
+enabled = true

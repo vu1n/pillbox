@@ -534,10 +534,9 @@ fn is_safe_error_code(code: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b == b'_' || b.is_ascii_digit())
 }
 
-/// Splice new `access_token` / `refresh_token` / `expiresAt` into the stored
-/// `claudeAiOauth` block. `refresh_token` may be omitted from the response (Anthropic
-/// doesn't always rotate it); in that case the old refresh token is preserved so the
-/// next session can still talk upstream.
+/// Dispatch a successful refresh response to the provider's credential shape.
+/// `refresh_token` may be omitted from a response; each provider preserves the
+/// old value so the next session can still talk upstream.
 fn apply_refresh_response(
     broker: Broker,
     real: &mut Value,

@@ -5,6 +5,7 @@ import {
   verifyManagedCapability,
   type ManagedOperation,
 } from "./auth.js";
+import type { ExecuteInvocationV2Result } from "./codex_execution.js";
 import { safeHuddlesRuntimeDiagnostic } from "./huddles_policy.js";
 import {
   readBoundedJsonWithDigest,
@@ -153,16 +154,7 @@ async function routeExecutionRequest(
         : operation === "status"
           ? await service.getExecutionStatus(body)
           : await service.cancelInvocation(body);
-    return Response.json(result, {
-      status:
-        result.status === "running"
-          ? 202
-          : result.status === "conflict"
-            ? 409
-            : result.status === "failed" && result.error.code === "managed_disabled"
-              ? 503
-              : 200,
-    });
+    return Response.json(result, { status: executionHttpStatus(result) });
   } catch (cause) {
     const code =
       typeof cause === "object" && cause !== null && "code" in cause
@@ -185,6 +177,15 @@ async function routeExecutionRequest(
       },
     );
   }
+}
+
+function executionHttpStatus(result: ExecuteInvocationV2Result): number {
+  if (result.status === "running") return 202;
+  if (result.status === "conflict") return 409;
+  if (result.status === "failed" && result.error.code === "managed_disabled") {
+    return 503;
+  }
+  return 200;
 }
 
 function executionCapabilityScope(

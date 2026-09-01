@@ -124,7 +124,7 @@ function dryRunPlan(value) {
   const steps = value.workload.steps.map((step) => ({
     id: step.id,
     operation: step.operation,
-    network_requests: step.operation === "managed_codex_preflight" ? 0 : step.id === "first-execute" || step.id === "exact-retry" || step.operation === "status" || step.operation === "workspace_finalize" ? 1 : 0,
+    network_requests: networkRequestsForStep(step),
     expected: step.expected ?? {},
   }));
   return {
@@ -145,6 +145,19 @@ function dryRunPlan(value) {
     },
     next: "Use --execute only with BURNIN_CONFIRM_ISOLATED=1 and operator-captured provider counters, then run npm run burnin:reconcile -- <report.json>.",
   };
+}
+
+function networkRequestsForStep(step) {
+  if (step.operation === "managed_codex_preflight") return 0;
+  if (
+    step.id === "first-execute" ||
+    step.id === "exact-retry" ||
+    step.operation === "status" ||
+    step.operation === "workspace_finalize"
+  ) {
+    return 1;
+  }
+  return 0;
 }
 
 async function call(stepId, path, body, tokenName) {

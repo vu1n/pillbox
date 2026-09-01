@@ -1981,9 +1981,8 @@ fn pty_send_with_timing(
     let mut stream = loop {
         match UnixStream::connect(sock) {
             Ok(stream) => break stream,
-            Err(e) if Instant::now() < deadline => {
+            Err(_e) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(25));
-                let _ = e;
             }
             Err(e) => {
                 return Err(e).with_context(|| {

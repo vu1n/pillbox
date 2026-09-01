@@ -8,9 +8,10 @@ import { join } from "node:path";
 import test from "node:test";
 
 const script = new URL("./scripts/burnin-fixed-workload.mjs", import.meta.url);
+const reconciler = new URL("./scripts/reconcile-burnin.mjs", import.meta.url);
 const fixture = new URL("./testdata/burnin-reconciliation.fixture.json", import.meta.url);
 
-test("live burn-in records the executable managed preflight before network access", async (t) => {
+test("live recorder output becomes a reconciled report after operator counters are attached", async (t) => {
   const temp = await mkdtemp(join(tmpdir(), "pillbox-burnin-preflight-"));
   t.after(() => rm(temp, { recursive: true, force: true }));
   const marker = join(temp, "preflight-ran");
@@ -27,13 +28,8 @@ printf '%s\\n' '{"schema_version":1,"agent":"codex","status":"preflight_rejected
   );
   await chmod(preflight, 0o700);
 
-  const manifest = JSON.parse(await readFile(fixture, "utf8"));
-  const unsupported = manifest.workload.steps.find((step) => step.id === "unsupported-managed-codex");
-  unsupported.expected = {
-    error_code: "must-not-be-copied",
-    provision_attempts: 41,
-    network_requests: 42,
-  };
+  const reviewedManifest = JSON.parse(await readFile(fixture, "utf8"));
+  const manifest = structuredClone(reviewedManifest);
   const manifestPath = join(temp, "manifest.json");
   await writeFile(manifestPath, JSON.stringify(manifest));
   const finalizePath = join(temp, "finalize.json");
@@ -96,7 +92,7 @@ printf '%s\\n' '{"schema_version":1,"agent":"codex","status":"preflight_rejected
   });
   assert.equal(result.code, 0, result.stderr);
   const report = JSON.parse(result.stdout);
-  const observed = report.capture.responses[0];
+  const observed = report.capture.preflight;
   assert.equal(observed.step_id, "unsupported-managed-codex");
   assert.equal(observed.error_code, "unsupported_execution");
   assert.deepEqual(observed.counters, {
@@ -105,7 +101,25 @@ printf '%s\\n' '{"schema_version":1,"agent":"codex","status":"preflight_rejected
     state_entries_created: 0,
   });
   assert.match(observed.observed_output, /unsupported_execution/);
-  assert.equal(requests.length, 5);
+  assert.equal(Object.hasOwn(observed, "artifact_key"), false);
+  assert.equal(Object.hasOwn(observed, "cost_ref"), false);
+  assert.equal(report.capture.cleanup.step_id, "finalize");
+  assert.equal(Object.hasOwn(report.capture.cleanup, "artifact_key"), false);
+  assert.equal(Object.hasOwn(report.capture.cleanup, "cost_ref"), false);
+  assert.equal(
+    report.capture.runtime_calls.length,
+    manifest.workload.steps.filter((step) => step.operation === "execute" || step.operation === "status").length,
+  );
+  assert.equal(requests.length, manifest.workload.expected_network_requests);
+
+  report.capture.run_cost_envelopes[0].observed = reviewedManifest.capture.run_cost_envelopes[0].observed;
+  report.capture.read_only = reviewedManifest.capture.read_only;
+  report.capture.totals = reviewedManifest.capture.totals;
+  const completedReport = join(temp, "completed-report.json");
+  await writeFile(completedReport, JSON.stringify(report));
+  const reconciliation = await run(process.execPath, [reconciler.pathname, completedReport], process.env);
+  assert.equal(reconciliation.code, 0, reconciliation.stderr);
+  assert.match(reconciliation.stdout, /managed preview burn-in reconciliation passed/);
 });
 
 async function fileExists(path) {

@@ -9,6 +9,15 @@ const DEFAULT_FIXTURE = new URL(
   import.meta.url,
 );
 const MAX_STATUS_PAGE_SIZE = 100;
+const REPORT_SCHEMA_VERSION = 2;
+const EXPECTED_WORKLOAD = new Map([
+  ["first-execute", "execute"],
+  ["exact-retry", "execute"],
+  ["status-page-1", "status"],
+  ["status-page-2", "status"],
+  ["unsupported-managed-codex", "managed_codex_preflight"],
+  ["finalize", "workspace_finalize"],
+]);
 const TERMINAL_STATUSES = new Set([
   "completed",
   "failed",
@@ -50,10 +59,25 @@ const digest = (value, path) => {
 };
 
 const root = record(fixture, "fixture");
-check(root.schema_version === 1, "fixture.schema_version must be 1");
+check(root.schema_version === REPORT_SCHEMA_VERSION, `fixture.schema_version must be ${REPORT_SCHEMA_VERSION}`);
 const deployment = record(root.deployment, "fixture.deployment");
 const workload = record(root.workload, "fixture.workload");
 const capture = record(root.capture, "fixture.capture");
+allowedKeys(capture, [
+  "source",
+  "notes",
+  "runtime_calls",
+  "preflight",
+  "cleanup",
+  "run_cost_envelopes",
+  "read_only",
+  "totals",
+  "operator_capture_required",
+], "fixture.capture");
+for (const key of ["source", "runtime_calls", "preflight", "cleanup", "run_cost_envelopes", "read_only", "totals"]) {
+  check(Object.hasOwn(capture, key), `fixture.capture.${key} is required by the burn-in report contract`);
+}
+string(capture.source, "fixture.capture.source");
 
 const workerName = string(deployment.worker_name, "deployment.worker_name");
 check(workerName === "pillbox-managed-burnin", "deployment.worker_name must identify the isolated burn-in Worker");
@@ -75,6 +99,21 @@ for (const [index, rawStep] of steps.entries()) {
   check(!stepById.has(id), `workload.steps contains duplicate id ${id}`);
   stepById.set(id, step);
 }
+for (const [stepId, operation] of EXPECTED_WORKLOAD) {
+  check(stepById.get(stepId)?.operation === operation, `workload step ${stepId} must use operation ${operation}`);
+}
+for (const stepId of stepById.keys()) {
+  check(EXPECTED_WORKLOAD.has(stepId), `workload contains unexpected step ${stepId}`);
+}
+check(stepById.size === EXPECTED_WORKLOAD.size, "workload must contain exactly the checked burn-in steps");
+
+const runtimeSteps = steps.filter((step) => step?.operation === "execute" || step?.operation === "status");
+const preflightSteps = steps.filter((step) => step?.operation === "managed_codex_preflight");
+const cleanupSteps = steps.filter((step) => step?.operation === "workspace_finalize");
+check(
+  runtimeSteps.length + preflightSteps.length + cleanupSteps.length === steps.length,
+  "workload contains an operation outside the checked burn-in report contract",
+);
 
 const first = stepById.get("first-execute");
 const retry = stepById.get("exact-retry");
@@ -83,12 +122,16 @@ const codex = stepById.get("unsupported-managed-codex");
 const finalize = stepById.get("finalize");
 check(first?.operation === "execute", "workload must start with first-execute");
 check(retry?.operation === "execute" && retry?.request_ref === "first-execute", "exact-retry must reuse the first execute request");
+check(first?.expected?.allowance_reservation === 1, "first-execute must reserve the one reviewed allowance");
+check(retry?.expected?.allowance_reservation_delta === 0, "exact-retry must not reserve another allowance");
+check(retry?.expected?.new_model_turns === 0, "exact-retry must not sample another model turn");
 for (const [index, step] of statusSteps.entries()) {
   const path = `status-page-${index + 1}`;
   check(step?.operation === "status", `${path} must be a status read`);
   const limit = integer(step?.evidence_limit, `${path}.evidence_limit`);
-  check(limit > 0 && limit <= MAX_STATUS_PAGE_SIZE, `${path}.evidence_limit must be between 1 and ${MAX_STATUS_PAGE_SIZE}`);
-  integer(step?.evidence_after, `${path}.evidence_after`);
+  check(limit === MAX_STATUS_PAGE_SIZE, `${path}.evidence_limit must be ${MAX_STATUS_PAGE_SIZE}`);
+  check(integer(step?.evidence_after, `${path}.evidence_after`) === index * MAX_STATUS_PAGE_SIZE, `${path}.evidence_after must select the checked page`);
+  check(step?.expected?.bounded === true, `${path} must declare bounded evidence`);
 }
 check(codex?.operation === "managed_codex_preflight", "unsupported-managed-codex must be an explicit preflight step");
 check(record(codex?.expected, "unsupported-managed-codex.expected").error_code === "unsupported_execution", "managed Codex preflight must fail with unsupported_execution");
@@ -97,44 +140,102 @@ check(integer(codex?.expected?.network_requests, "unsupported-managed-codex.expe
 check(finalize?.operation === "workspace_finalize", "workload must include workspace finalize");
 check(finalize?.requires_operator_request === true, "finalize must require an operator-supplied scoped request");
 check(record(finalize?.expected, "finalize.expected").kill_before_transfer === true, "finalize must quiesce the container before transfer credentials enter");
+check(finalize?.expected?.requests === 1, "finalize must make exactly one cleanup request");
+check(finalize?.expected?.result_snapshot_required === true, "finalize must require a result snapshot");
 
 const expectedNetworkRequests = integer(workload.expected_network_requests, "workload.expected_network_requests");
-check(expectedNetworkRequests === 5, "fixed workload network request count must be five (execute, retry, two status pages, finalize)");
-check(expectedNetworkRequests === 1 + 1 + statusSteps.filter(Boolean).length + 1, "workload network request count has an unexplained operation");
+check(
+  expectedNetworkRequests === runtimeSteps.length + cleanupSteps.length,
+  "workload network request count has an unexplained operation",
+);
 
 if (isRecord(first?.request)) {
   const request = first.request;
   const input = string(request.rendered_input, "first-execute.request.rendered_input");
   const expectedInputHash = `sha256:${createHash("sha256").update(input).digest("hex")}`;
+  check(first.invocation_id === request.invocation_id, "first-execute invocation identity must match its request");
   check(request.rendered_input_hash === expectedInputHash, "first-execute rendered_input_hash does not match the sealed input");
   check(request.tool_policy === "deny_all", "fixed burn-in must deny managed runtime tools");
   check(request.execution?.placement === "managed_container", "first-execute must target managed_container");
   check(request.execution?.transport?.harness === "opencode", "first-execute must use the supported managed OpenCode harness");
 }
 
-const responses = array(capture.responses, "capture.responses");
-const responseByStep = new Map();
-for (const [index, rawResponse] of responses.entries()) {
-  const response = record(rawResponse, `capture.responses[${index}]`);
-  const stepId = string(response.step_id, `capture.responses[${index}].step_id`);
-  check(!responseByStep.has(stepId), `capture.responses contains duplicate step ${stepId}`);
-  responseByStep.set(stepId, response);
-  digest(response.request_hash, `capture.responses[${index}].request_hash`);
-  string(response.artifact_key, `capture.responses[${index}].artifact_key`);
-  string(response.cost_ref, `capture.responses[${index}].cost_ref`);
+const runtimeCalls = array(capture.runtime_calls, "capture.runtime_calls").map((value, index) =>
+  record(value, `capture.runtime_calls[${index}]`)
+);
+const runtimeCallByStep = indexedObservations(runtimeCalls, "capture.runtime_calls");
+checkExactStepCoverage(runtimeSteps, runtimeCallByStep, "capture.runtime_calls");
+for (const [index, response] of runtimeCalls.entries()) {
+  const path = `capture.runtime_calls[${index}]`;
+  exactKeys(response, [
+    "step_id",
+    "operation",
+    "http_status",
+    "invocation_id",
+    "status",
+    "disposition",
+    "request_hash",
+    "artifact_key",
+    "cost_ref",
+  ], path);
+  check(response.operation === stepById.get(response.step_id)?.operation, `${path}.operation does not match the workload step`);
+  check(integer(response.http_status, `${path}.http_status`) === 200, `${path}.http_status must be 200`);
+  check(response.invocation_id === first?.invocation_id, `${path}.invocation_id does not identify the one reviewed invocation`);
+  digest(response.request_hash, `${path}.request_hash`);
+  string(response.artifact_key, `${path}.artifact_key`);
+  digest(response.cost_ref, `${path}.cost_ref`);
 }
-const firstResponse = responseByStep.get("first-execute");
+const firstResponse = runtimeCallByStep.get("first-execute");
 check(firstResponse?.disposition === "created", "first execute must create the only execution claim");
 check(firstResponse?.status === "completed", "first execute fixture must complete");
 for (const stepId of ["exact-retry", "status-page-1", "status-page-2"]) {
-  const response = responseByStep.get(stepId);
+  const response = runtimeCallByStep.get(stepId);
   check(response?.disposition === "reused", `${stepId} must reuse the first terminal result`);
   check(response?.status === "completed", `${stepId} must observe the completed terminal result`);
   check(response?.request_hash === firstResponse?.request_hash, `${stepId} changed the request hash during replay`);
   check(response?.artifact_key === firstResponse?.artifact_key, `${stepId} used a second artifact`);
   check(response?.cost_ref === firstResponse?.cost_ref, `${stepId} used a second cost envelope`);
 }
-check(responses.length === 4, "the fixture must capture exactly four execution/status responses");
+
+check(preflightSteps.length === 1, "workload must contain exactly one managed preflight step");
+const preflight = record(capture.preflight, "capture.preflight");
+exactKeys(preflight, [
+  "step_id",
+  "operation",
+  "schema_version",
+  "agent",
+  "status",
+  "disposition",
+  "error_code",
+  "exit_code",
+  "observed_output",
+  "observed_output_sha256",
+  "counters",
+], "capture.preflight");
+check(preflight.step_id === preflightSteps[0]?.id, "capture.preflight does not match the workload preflight step");
+check(preflight.operation === preflightSteps[0]?.operation, "capture.preflight.operation does not match the workload step");
+check(preflight.schema_version === 1, "capture.preflight.schema_version must be 1");
+check(preflight.agent === "codex", "capture.preflight.agent must be codex");
+check(preflight.status === "preflight_rejected", "capture.preflight.status must be preflight_rejected");
+check(preflight.disposition === "not_sent", "capture.preflight.disposition must be not_sent");
+check(preflight.error_code === "unsupported_execution", "capture.preflight.error_code must be unsupported_execution");
+check(preflight.exit_code === 2, "capture.preflight.exit_code must be 2");
+const observedOutput = string(preflight.observed_output, "capture.preflight.observed_output");
+check(preflight.observed_output_sha256 === digestText(observedOutput), "capture.preflight.observed_output_sha256 does not match observed output");
+const preflightCounters = record(preflight.counters, "capture.preflight.counters");
+exactKeys(preflightCounters, ["provision_attempts", "network_requests", "state_entries_created"], "capture.preflight.counters");
+for (const key of ["provision_attempts", "network_requests", "state_entries_created"]) {
+  check(integer(preflightCounters[key], `capture.preflight.counters.${key}`) === 0, `capture.preflight.counters.${key} must be zero`);
+}
+
+check(cleanupSteps.length === 1, "workload must contain exactly one workspace cleanup step");
+const cleanup = record(capture.cleanup, "capture.cleanup");
+exactKeys(cleanup, ["step_id", "operation", "http_status", "session_id", "result_snapshot"], "capture.cleanup");
+check(cleanup.step_id === cleanupSteps[0]?.id, "capture.cleanup does not match the workload cleanup step");
+check(cleanup.operation === cleanupSteps[0]?.operation, "capture.cleanup.operation does not match the workload step");
+check(integer(cleanup.http_status, "capture.cleanup.http_status") === 200, "capture.cleanup.http_status must be 200");
+check(cleanup.session_id === cleanupSteps[0]?.session_id, "capture.cleanup.session_id does not match the finalized workspace");
+check(typeof cleanup.result_snapshot === "string" && /^[0-9a-f]{64}$/.test(cleanup.result_snapshot), "capture.cleanup.result_snapshot must be a canonical snapshot handle");
 
 const runs = array(capture.run_cost_envelopes, "capture.run_cost_envelopes");
 check(runs.length === reviewedCount, "there must be exactly one captured RunCostEnvelope per genuinely new execution");
@@ -148,6 +249,8 @@ for (const [index, rawRun] of runs.entries()) {
   runIds.add(runId);
   check(invocationId === first?.invocation_id, `${runId} is not attributed to first-execute`);
   const cost = validateCost(run.cost, `${runId}.cost`);
+  check(runId === digestOf(cost), `${runId}.id must be the RunCostEnvelope digest`);
+  check(firstResponse?.cost_ref === runId, `${runId} is not referenced by first-execute`);
   const observed = record(run.observed, `${runId}.observed`);
   const d1 = record(observed.d1, `${runId}.observed.d1`);
   const r2 = record(observed.r2, `${runId}.observed.r2`);
@@ -297,6 +400,49 @@ function numericPair(value, path, keys) {
 
 function sumNested(runs, parent, key) {
   return runs.reduce((total, run) => total + run[parent][key], 0);
+}
+
+function indexedObservations(observations, path) {
+  const byStep = new Map();
+  for (const [index, observation] of observations.entries()) {
+    const stepId = string(observation.step_id, `${path}[${index}].step_id`);
+    check(!byStep.has(stepId), `${path} contains duplicate step ${stepId}`);
+    byStep.set(stepId, observation);
+  }
+  return byStep;
+}
+
+function checkExactStepCoverage(expectedSteps, observations, path) {
+  const expectedIds = new Set(expectedSteps.map((step) => step.id));
+  for (const stepId of expectedIds) {
+    check(observations.has(stepId), `${path} omitted workload step ${stepId}`);
+  }
+  for (const stepId of observations.keys()) {
+    check(expectedIds.has(stepId), `${path} contains unexpected workload step ${stepId}`);
+  }
+  check(observations.size === expectedIds.size, `${path} must contain exactly one observation per runtime workload step`);
+}
+
+function exactKeys(value, keys, path) {
+  allowedKeys(value, keys, path);
+  for (const key of keys) {
+    check(Object.hasOwn(value, key), `${path}.${key} is required by the burn-in report contract`);
+  }
+}
+
+function allowedKeys(value, keys, path) {
+  const allowed = new Set(keys);
+  for (const key of Object.keys(value)) {
+    check(allowed.has(key), `${path}.${key} is not allowed by the burn-in report contract`);
+  }
+}
+
+function digestOf(value) {
+  return digestText(JSON.stringify(value));
+}
+
+function digestText(value) {
+  return `sha256:${createHash("sha256").update(value).digest("hex")}`;
 }
 
 function array(value, path) {

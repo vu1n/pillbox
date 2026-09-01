@@ -7,15 +7,17 @@ create a Durable Object owned by Pillbox.
 
 ## Scope and reviewed budget
 
-The fixed workload in
-`cloudflare-spike/testdata/burnin-reconciliation.fixture.json` has one
-genuinely new managed execution:
+The version 2 report contract in
+`cloudflare-spike/testdata/burnin-reconciliation.fixture.json` records one
+genuinely new managed execution. The live recorder performs these steps in
+this order:
 
-1. execute one deny-all OpenCode turn;
-2. retry the exact request;
-3. read two evidence pages, each limited to 100 events;
-4. reject a managed Codex request during local preflight, before provisioning;
-5. finalize the workspace after killing prompt-controlled processes.
+1. reject a managed Codex request during local preflight, before provisioning;
+2. execute one deny-all OpenCode turn;
+3. retry the exact request;
+4. read status twice with `evidence_after` 0 and 100, each limited to 100 events;
+5. finalize the workspace after killing prompt-controlled processes and record
+   the returned result snapshot.
 
 The retry and status reads do not claim another execution, write another
 artifact, or emit another Analytics Engine point. Therefore the first reviewed
@@ -36,51 +38,18 @@ Do not change the limit to compensate for retries, status reads, or a failed
 operator run. Stop, reconcile, and create a new reviewed epoch if the one
 claim is consumed.
 
-## Create isolated resources
+## Bootstrap boundary
 
-Use a Cloudflare account/project reserved for preview. The names below must
-remain distinct from the existing `pillbox-do-spike` resources.
-
-```sh
-cd cloudflare-spike
-npx wrangler d1 create pillbox-managed-burnin-db
-npx wrangler r2 bucket create pillbox-managed-burnin-evidence
-```
-
-Copy the returned D1 database id into `wrangler.burnin.toml`. Keep the D1 name,
-R2 bucket name, Worker name (`pillbox-managed-burnin`), Sandbox container
-class, and Analytics dataset (`pillbox_managed_burnin_costs`) isolated. The
-Analytics Engine dataset is declared by the config; this Wrangler release has
-no separate `analytics-engine create` command, so verify the declared dataset
-in the account dashboard/API before the run. Configure an isolated,
-authorize-only Huddles service for the `PillboxAuthorizationCurrentness`
-binding before a private v2 execute/status/cancel service-binding run. Keep the
-signing issuer separate; Pillbox must not bind it.
+OPS-000 owns creation and validation of the isolated D1/R2 resources, database
+migrations and allowance row, signing/currentness keys and pins, capability
+secret, and installation/workspace/policy identity. This runbook consumes the
+checked OPS-000 outputs; it does not provide an alternate manual bootstrap.
+Do not enable the Worker unless that bootstrap dry-run proves the complete
+matching tuple and the one-run allowance.
 
 The config contains only the vendor-owned `Sandbox` Durable Object class and
 sets `max_instances = 1`. Do not add `SessionGateway`, a VFS class, or any
 Pillbox-authored DO class.
-
-## Apply and seed, in order
-
-Run these commands manually and record their output in the private release
-record. Migration 0002 must be applied before the operator allowance row is
-inserted. The seed is deliberately separate from deployment so a code deploy
-cannot silently reset the budget.
-
-```sh
-npx wrangler d1 migrations apply pillbox-managed-burnin-db \
-  --remote --config wrangler.burnin.toml
-
-npx wrangler d1 execute pillbox-managed-burnin-db \
-  --remote --config wrangler.burnin.toml \
-  --command "INSERT INTO managed_execution_allowance (singleton, deployment_epoch, execution_limit, reserved_executions) VALUES (1, 'burnin-2026-09-01-v1', 1, 0)"
-```
-
-The insert must be a singleton operator action. If the row already exists,
-inspect its epoch and reservation count; do not use `OR REPLACE`, an update, or
-a reset while investigating. The matching deployment epoch and limit are
-required by every new claim.
 
 ## Topology gate and dry run
 
@@ -114,11 +83,11 @@ npx wrangler deploy -c wrangler.burnin.toml \
   --containers-rollout=none
 ```
 
-Mint short-lived capabilities bound to the exact request bytes for each
-operation. Do not put a provider key, workspace credential, or bearer token in
-the manifest or in a committed file. Supply the isolated endpoint and tokens
-through the shell environment, and supply finalize JSON from a protected local
-file:
+Use the short-lived, exact-request capabilities produced from the checked
+OPS-000 bootstrap. Do not put a provider key, workspace credential, or bearer
+token in the manifest or in a committed file. Supply the isolated endpoint and
+tokens through the shell environment, and supply finalize JSON from a protected
+local file:
 
 ```sh
 BURNIN_CONFIRM_ISOLATED=1 \
@@ -131,17 +100,28 @@ BURNIN_FINALIZE_REQUEST_FILE=/private/path/finalize.json \
 npm run burnin -- --execute --record /private/path/burnin-report.json
 ```
 
-The exact-retry uses the same execute request and capability scope. The Codex
+The exact retry uses the same execute request and capability scope. The Codex
 step is a local preflight and must make zero HTTP requests and zero Sandbox
-provisions. A live response that attempts managed Codex, exceeds a status page
-of 100 events, creates a second artifact, or returns a second Analytics point
-is a failed gate; stop the Worker and preserve the evidence.
+provisions. Finalize is the sole cleanup request in this workload; there is no
+separate cancel call. A live response that attempts managed Codex, exceeds a
+status page of 100 events, creates a second artifact, or returns a second
+Analytics point is a failed gate; stop the Worker and preserve the evidence.
 
 ## Capture and reconcile provider counters
 
-Copy the report to a private working location and fill its `capture.read_only`
-and `capture.totals` objects from the same isolated run. Capture all of these
-dimensions, including zeroes:
+The recorder writes one strict report shape:
+
+- `capture.runtime_calls` contains exactly the execute, exact retry, and two
+  bounded status calls. Only these records carry invocation, request-hash,
+  artifact, and cost references.
+- `capture.preflight` contains the observed local rejection and zero side-effect
+  counters. It has no execution artifact or cost fields.
+- `capture.cleanup` contains the finalize HTTP result, session, and result
+  snapshot. It has no execution artifact or cost fields.
+
+Copy the report to a private working location, attach the per-run `observed`
+counters, and fill its `capture.read_only` and `capture.totals` objects from the
+same isolated run. Capture all of these dimensions, including zeroes:
 
 - D1 rows read and written;
 - R2 reads, writes, and bytes;

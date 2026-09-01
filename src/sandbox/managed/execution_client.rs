@@ -39,6 +39,9 @@ pub(super) fn execute_turn(
     text: &str,
     model: Option<&str>,
 ) -> Result<()> {
+    // These failures are deterministic peer-side admission failures, so no
+    // recovery marker should be created for a request the peer will reject.
+    validate_rendered_input(text)?;
     let model = model.unwrap_or(crate::sandbox::opencode::DEFAULT_MODEL);
     let (provider, model_id) = model.split_once('/').ok_or_else(|| {
         PillboxError::config(
@@ -81,6 +84,8 @@ pub(super) fn execute_turn(
         "output_format": { "type": "text", "retry_count": 0 }
     });
     let body = serde_json::to_string(&request).context("serialize managed execution request")?;
+    // The peer bounds exact UTF-8 request bytes before decoding or journaling.
+    validate_request_body(&body)?;
     let prepared = PreparedInvocation {
         pending: PendingRequest {
             invocation_id: invocation_id.clone(),
@@ -489,6 +494,61 @@ mod tests {
     }
 
     #[test]
+    fn request_validation_matches_nonempty_and_exact_byte_boundaries() {
+        assert!(validate_rendered_input("").is_err());
+        assert!(validate_rendered_input(" ").is_ok());
+        assert!(validate_request_body(&"x".repeat(MAX_MANAGED_REQUEST_BYTES)).is_ok());
+        assert!(validate_request_body(&"x".repeat(MAX_MANAGED_REQUEST_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn empty_rendered_input_is_rejected_before_prepared_journal() {
+        crate::test_util::with_isolated_home("managed-empty-input", || {
+            let resolved = crate::pillbox::global();
+            let session_id = "abc123def456";
+            let journal = PendingJournal::open(&resolved, session_id).unwrap();
+
+            let error = execute_turn(
+                &resolved,
+                session_id,
+                "https://network-must-not-run.invalid",
+                "capability-secret",
+                "",
+                Some("provider/model"),
+            )
+            .unwrap_err();
+
+            assert!(error.to_string().contains("non-empty"));
+            assert!(!journal.path().exists());
+        });
+    }
+
+    #[test]
+    fn oversized_request_is_rejected_before_prepared_journal() {
+        crate::test_util::with_isolated_home("managed-oversized-request", || {
+            let resolved = crate::pillbox::global();
+            let session_id = "abc123def456";
+            let journal = PendingJournal::open(&resolved, session_id).unwrap();
+            let text = "x".repeat(MAX_MANAGED_REQUEST_BYTES);
+
+            let error = execute_turn(
+                &resolved,
+                session_id,
+                "https://network-must-not-run.invalid",
+                "capability-secret",
+                &text,
+                Some("provider/model"),
+            )
+            .unwrap_err();
+
+            assert!(error
+                .to_string()
+                .contains(&format!("exceeds {MAX_MANAGED_REQUEST_BYTES} bytes")));
+            assert!(!journal.path().exists());
+        });
+    }
+
+    #[test]
     fn terminal_validation_rejects_corrupted_response_identity_and_cursor() {
         let prepared = fixture_prepared("invocation-1", "session-1", "hello");
         let valid = fixture_terminal(&prepared, "session-1");
@@ -654,6 +714,78 @@ mod tests {
             assert!(error.to_string().contains("payload mismatch"));
             assert!(journal.path().exists());
             assert_eq!(log.read_from(0).unwrap().len(), 1);
+        });
+    }
+
+    #[test]
+    fn valid_request_http_rejection_keeps_prepared_journal() {
+        crate::test_util::with_isolated_home("managed-http-rejection", || {
+            let resolved = crate::pillbox::global();
+            let session_id = "abc123def456";
+            let journal = PendingJournal::open(&resolved, session_id).unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut socket);
+                assert!(request.starts_with("POST /v2/executions HTTP/1.1"));
+                assert!(http_body(&request).contains("hello"));
+                write!(
+                    socket,
+                    "HTTP/1.1 400 Bad Request\r\nContent-Length: 8\r\nConnection: close\r\n\r\nrejected"
+                )
+                .unwrap();
+            });
+
+            let error = execute_turn(
+                &resolved,
+                session_id,
+                &endpoint,
+                "capability-secret",
+                "hello",
+                Some("provider/model"),
+            )
+            .unwrap_err();
+
+            server.join().unwrap();
+            assert!(error.to_string().contains("HTTP 400"), "{error:#}");
+            assert!(journal.path().exists());
+            assert!(journal.load().unwrap().is_some());
+        });
+    }
+
+    #[test]
+    fn lost_post_send_response_keeps_prepared_journal() {
+        crate::test_util::with_isolated_home("managed-lost-post-send", || {
+            let resolved = crate::pillbox::global();
+            let session_id = "abc123def456";
+            let journal = PendingJournal::open(&resolved, session_id).unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut execute_socket, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut execute_socket);
+                assert!(request.starts_with("POST /v2/executions HTTP/1.1"));
+                drop(execute_socket);
+
+                let (mut status_socket, _) = listener.accept().unwrap();
+                let status_request = read_http_request(&mut status_socket);
+                assert!(status_request.starts_with("POST /v2/executions/status HTTP/1.1"));
+                drop(status_socket);
+            });
+
+            let _error = execute_turn(
+                &resolved,
+                session_id,
+                &endpoint,
+                "capability-secret",
+                "hello",
+                Some("provider/model"),
+            )
+            .unwrap_err();
+
+            server.join().unwrap();
+            assert!(journal.path().exists());
         });
     }
 

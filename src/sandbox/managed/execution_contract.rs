@@ -9,6 +9,10 @@ use crate::errors::PillboxError;
 
 pub(super) const CONTRACT_VERSION: &str = "pillbox.execution/2";
 pub(super) const EXECUTION_POLICY_REVISION: &str = "pillbox-managed-v2";
+/// Keep the client-side request bound in lockstep with the managed Worker.
+/// This is a byte bound on the serialized UTF-8 JSON body, not a character
+/// bound on `rendered_input`.
+pub(super) const MAX_MANAGED_REQUEST_BYTES: usize = 1024 * 1024;
 pub(super) const MAX_EVIDENCE_EVENTS: usize = 2_000;
 pub(super) const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 pub(super) const MAX_PAGES: usize = 20;
@@ -399,6 +403,7 @@ pub(super) fn validate_artifact_ref(
 }
 
 pub(super) fn validate_pending(pending: &PendingRequest) -> Result<()> {
+    validate_request_body(&pending.request_body)?;
     let request: serde_json::Value =
         serde_json::from_str(&pending.request_body).map_err(|error| {
             PillboxError::config(
@@ -421,11 +426,37 @@ pub(super) fn validate_pending(pending: &PendingRequest) -> Result<()> {
             }))?
         && pending.execution_policy_revision == EXECUTION_POLICY_REVISION
         && request["invocation_id"] == pending.invocation_id
-        && request["idempotency_key"] == pending.invocation_id;
+        && request["idempotency_key"] == pending.invocation_id
+        && request
+            .get("rendered_input")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|rendered_input| !rendered_input.is_empty());
     if !valid {
         return Err(PillboxError::config(
             "session send",
             "pending managed invocation identity is corrupted or mismatched",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+pub(super) fn validate_rendered_input(rendered_input: &str) -> Result<()> {
+    if rendered_input.is_empty() {
+        return Err(PillboxError::config(
+            "session send",
+            "managed rendered_input must be a non-empty string",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+pub(super) fn validate_request_body(body: &str) -> Result<()> {
+    if body.len() > MAX_MANAGED_REQUEST_BYTES {
+        return Err(PillboxError::config(
+            "session send",
+            format!("managed request body exceeds {MAX_MANAGED_REQUEST_BYTES} bytes"),
         )
         .into());
     }

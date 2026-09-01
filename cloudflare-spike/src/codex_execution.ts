@@ -689,9 +689,13 @@ export function canonicalJson(value: JsonValue): string {
   }
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   return `{${Object.keys(value)
-    .sort()
+    .sort(compareUtf16CodeUnits)
     .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
     .join(",")}}`;
+}
+
+function compareUtf16CodeUnits(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 async function sha256Json(value: JsonValue): Promise<Sha256Digest> {

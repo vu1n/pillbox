@@ -105,6 +105,13 @@ test("operation grants mirror the strict Huddles v2 and currentness v3 contracts
   );
 });
 
+test("managed signature JSON uses deterministic UTF-16 key ordering", () => {
+  assert.equal(
+    managedCanonicalJson({ "\ufffd": 6, "\ud83d\ude00": 5, "\u00e9": 4, "\u00c9": 3, a: 2, A: 1 }),
+    '{"A":1,"a":2,"\u00c9":3,"\u00e9":4,"\ud83d\ude00":5,"\ufffd":6}',
+  );
+});
+
 test("operation grant issue requests are operation-scoped and bounded", () => {
   const issue = validateExecutionOperationGrantIssueRequest({
     grant_id: "operation-grant-1",

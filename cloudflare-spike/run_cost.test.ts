@@ -7,7 +7,7 @@ import {
   WorkersAnalyticsEngineRunCost,
 } from "./src/run_cost.ts";
 
-test("cost meter preserves raw usage units and planned terminal operations", () => {
+test("cost meter preserves raw usage units and confirmed terminal operations", () => {
   const meter = new RunCostMeter();
   meter.observeRelational({ rows_read: 1, rows_written: 1 });
   meter.observeObject({ reads: 0, writes: 0, bytes_read: 0, bytes_written: 0 });
@@ -28,7 +28,7 @@ test("cost meter preserves raw usage units and planned terminal operations", () 
     sandbox_profile: "standard-2",
     planned_d1_terminal_writes: 1,
     planned_r2_writes: 1,
-    planned_analytics_points: 1,
+    confirmed_analytics_points: 1,
   });
 
   assert.deepEqual(cost.model, {
@@ -72,7 +72,7 @@ test("artifact cost sealing converges on its exact serialized byte count", () =>
       sandbox_profile: null,
       planned_d1_terminal_writes: 1,
       planned_r2_writes: 1,
-      planned_analytics_points: 1,
+      confirmed_analytics_points: 1,
     }) as unknown as ExecutionArtifact["cost"],
   };
   const sealed = sealArtifactCostBytes(artifact);
@@ -94,7 +94,7 @@ test("analytics emits one compact point without run content", () => {
   const cost = meter.terminal("failed", {
     sandbox_duration_ms: 10,
     sandbox_profile: "standard-2",
-    planned_analytics_points: 1,
+    confirmed_analytics_points: 1,
   });
   analytics.emit({
     invocation_id: "invocation-secret-not-emitted",

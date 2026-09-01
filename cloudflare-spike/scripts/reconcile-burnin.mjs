@@ -9,7 +9,7 @@ const DEFAULT_FIXTURE = new URL(
   import.meta.url,
 );
 const MAX_STATUS_PAGE_SIZE = 100;
-const REPORT_SCHEMA_VERSION = 2;
+const REPORT_SCHEMA_VERSION = 3;
 const EXPECTED_WORKLOAD = new Map([
   ["first-execute", "execute"],
   ["exact-retry", "execute"],
@@ -66,6 +66,7 @@ const capture = record(root.capture, "fixture.capture");
 allowedKeys(capture, [
   "source",
   "notes",
+  "execution_identity",
   "runtime_calls",
   "preflight",
   "cleanup",
@@ -74,7 +75,7 @@ allowedKeys(capture, [
   "totals",
   "operator_capture_required",
 ], "fixture.capture");
-for (const key of ["source", "runtime_calls", "preflight", "cleanup", "run_cost_envelopes", "read_only", "totals"]) {
+for (const key of ["source", "execution_identity", "runtime_calls", "preflight", "cleanup", "run_cost_envelopes", "read_only", "totals"]) {
   check(Object.hasOwn(capture, key), `fixture.capture.${key} is required by the burn-in report contract`);
 }
 string(capture.source, "fixture.capture.source");
@@ -149,6 +150,7 @@ check(
   "workload network request count has an unexplained operation",
 );
 
+let derivedIdentity = {};
 if (isRecord(first?.request)) {
   const request = first.request;
   const input = string(request.rendered_input, "first-execute.request.rendered_input");
@@ -158,7 +160,11 @@ if (isRecord(first?.request)) {
   check(request.tool_policy === "deny_all", "fixed burn-in must deny managed runtime tools");
   check(request.execution?.placement === "managed_container", "first-execute must target managed_container");
   check(request.execution?.transport?.harness === "opencode", "first-execute must use the supported managed OpenCode harness");
+  derivedIdentity = requestIdentity(request);
 }
+const capturedIdentity = executionIdentity(capture.execution_identity, "capture.execution_identity");
+check(canonicalJson(capturedIdentity) === canonicalJson(derivedIdentity), "capture.execution_identity does not match the canonical first-execute request");
+const expectedArtifactKey = `executions/${createHash("sha256").update(capturedIdentity.invocation_id).digest("hex")}/${capturedIdentity.request_hash.slice("sha256:".length)}.json`;
 
 const runtimeCalls = array(capture.runtime_calls, "capture.runtime_calls").map((value, index) =>
   record(value, `capture.runtime_calls[${index}]`)
@@ -175,25 +181,42 @@ for (const [index, response] of runtimeCalls.entries()) {
     "status",
     "disposition",
     "request_hash",
-    "artifact_key",
+    "execution_digest",
+    "execution_policy_revision",
+    "session_ref",
+    "evidence",
     "cost_ref",
   ], path);
   check(response.operation === stepById.get(response.step_id)?.operation, `${path}.operation does not match the workload step`);
   check(integer(response.http_status, `${path}.http_status`) === 200, `${path}.http_status must be 200`);
   check(response.invocation_id === first?.invocation_id, `${path}.invocation_id does not identify the one reviewed invocation`);
-  digest(response.request_hash, `${path}.request_hash`);
-  string(response.artifact_key, `${path}.artifact_key`);
+  check(response.request_hash === capturedIdentity.request_hash, `${path}.request_hash does not match the sealed request`);
+  check(response.execution_digest === capturedIdentity.execution_digest, `${path}.execution_digest does not match the sealed execution`);
+  check(response.execution_policy_revision === capturedIdentity.execution_policy_revision, `${path}.execution_policy_revision changed`);
+  const session = positionalSessionRef(response.session_ref, `${path}.session_ref`);
+  check(session.session_id === capturedIdentity.session_id, `${path}.session_ref identifies another session`);
+  const page = evidencePage(response.evidence, `${path}.evidence`);
+  const step = stepById.get(response.step_id);
+  const expectedFrom = step?.operation === "status" ? step.evidence_after : 0;
+  check(page.from === expectedFrom, `${path}.evidence.from breaks positional continuity`);
   digest(response.cost_ref, `${path}.cost_ref`);
 }
 const firstResponse = runtimeCallByStep.get("first-execute");
 check(firstResponse?.disposition === "created", "first execute must create the only execution claim");
 check(firstResponse?.status === "completed", "first execute fixture must complete");
+const terminalRange = positionalSessionRef(firstResponse?.session_ref, "first-execute.session_ref").seq_range;
+for (const response of runtimeCalls) {
+  validateEvidenceContinuity(response.evidence, terminalRange, `capture.runtime_calls.${response.step_id}.evidence`);
+}
 for (const stepId of ["exact-retry", "status-page-1", "status-page-2"]) {
   const response = runtimeCallByStep.get(stepId);
   check(response?.disposition === "reused", `${stepId} must reuse the first terminal result`);
   check(response?.status === "completed", `${stepId} must observe the completed terminal result`);
-  check(response?.request_hash === firstResponse?.request_hash, `${stepId} changed the request hash during replay`);
-  check(response?.artifact_key === firstResponse?.artifact_key, `${stepId} used a second artifact`);
+  for (const field of ["request_hash", "execution_digest", "execution_policy_revision"]) {
+    check(response?.[field] === firstResponse?.[field], `${stepId} changed ${field} during replay`);
+  }
+  check(canonicalJson(response?.session_ref) === canonicalJson(firstResponse?.session_ref), `${stepId} changed the positional session range`);
+  check(canonicalJson(response?.evidence?.artifact_ref) === canonicalJson(firstResponse?.evidence?.artifact_ref), `${stepId} used a second artifact identity or digest`);
   check(response?.cost_ref === firstResponse?.cost_ref, `${stepId} used a second cost envelope`);
 }
 
@@ -243,11 +266,23 @@ const runIds = new Set();
 const observedRuns = [];
 for (const [index, rawRun] of runs.entries()) {
   const run = record(rawRun, `capture.run_cost_envelopes[${index}]`);
+  exactKeys(run, [
+    "id",
+    "execution_identity",
+    "artifact_ref",
+    "artifact_count",
+    "analytics_point_count",
+    "cost",
+    "observed",
+  ], `capture.run_cost_envelopes[${index}]`);
   const runId = string(run.id, `capture.run_cost_envelopes[${index}].id`);
-  const invocationId = string(run.invocation_id, `capture.run_cost_envelopes[${index}].invocation_id`);
+  const runIdentity = executionIdentity(run.execution_identity, `capture.run_cost_envelopes[${index}].execution_identity`);
+  const runArtifact = artifactRef(run.artifact_ref, `capture.run_cost_envelopes[${index}].artifact_ref`);
   check(!runIds.has(runId), `duplicate RunCostEnvelope id ${runId}`);
   runIds.add(runId);
-  check(invocationId === first?.invocation_id, `${runId} is not attributed to first-execute`);
+  check(canonicalJson(runIdentity) === canonicalJson(capturedIdentity), `${runId} is not attributed to the full first-execute identity`);
+  check(canonicalJson(runArtifact) === canonicalJson(firstResponse?.evidence?.artifact_ref), `${runId} does not seal the terminal artifact identity and digest`);
+  check(runArtifact.key === expectedArtifactKey, `${runId} artifact key does not derive from invocation_id and request_hash`);
   const cost = validateCost(run.cost, `${runId}.cost`);
   check(runId === digestOf(cost), `${runId}.id must be the RunCostEnvelope digest`);
   check(firstResponse?.cost_ref === runId, `${runId} is not referenced by first-execute`);
@@ -259,6 +294,7 @@ for (const [index, rawRun] of runs.entries()) {
   const analytics = record(observed.analytics_engine, `${runId}.observed.analytics_engine`);
   const vendor = validateVendorCounters(observed.vendor_sandbox_do, `${runId}.observed.vendor_sandbox_do`);
   const infra = record(cost.infrastructure, `${runId}.cost.infrastructure`);
+  check(runArtifact.bytes === integer(infra.r2_bytes_written, `${runId}.cost.infrastructure.r2_bytes_written`), `${runId} artifact byte identity disagrees with its RunCostEnvelope`);
   check(integer(run.artifact_count, `${runId}.artifact_count`) === 1, `${runId} must have exactly one immutable R2 artifact`);
   check(integer(run.analytics_point_count, `${runId}.analytics_point_count`) <= 1, `${runId} emitted more than one Analytics Engine point`);
   check(integer(run.analytics_point_count, `${runId}.analytics_point_count`) === infra.analytics_points_written, `${runId} Analytics capture disagrees with its RunCostEnvelope`);
@@ -438,7 +474,96 @@ function allowedKeys(value, keys, path) {
 }
 
 function digestOf(value) {
-  return digestText(JSON.stringify(value));
+  return digestText(canonicalJson(value));
+}
+
+function requestIdentity(request) {
+  return {
+    invocation_id: request.invocation_id,
+    idempotency_key: request.idempotency_key,
+    session_id: request.session_ref.session_id,
+    request_hash: digestOf(request),
+    execution_digest: digestOf({
+      execution: request.execution,
+      execution_policy_revision: request.execution_policy_revision,
+    }),
+    execution_policy_revision: request.execution_policy_revision,
+  };
+}
+
+function executionIdentity(value, path) {
+  const identity = record(value, path);
+  exactKeys(identity, [
+    "invocation_id",
+    "idempotency_key",
+    "session_id",
+    "request_hash",
+    "execution_digest",
+    "execution_policy_revision",
+  ], path);
+  for (const key of ["invocation_id", "idempotency_key", "session_id", "execution_policy_revision"]) {
+    string(identity[key], `${path}.${key}`);
+  }
+  digest(identity.request_hash, `${path}.request_hash`);
+  digest(identity.execution_digest, `${path}.execution_digest`);
+  check(identity.idempotency_key === identity.invocation_id, `${path}.idempotency_key must equal invocation_id`);
+  return identity;
+}
+
+function positionalSessionRef(value, path) {
+  const session = record(value, path);
+  exactKeys(session, ["session_id", "seq_range"], path);
+  string(session.session_id, `${path}.session_id`);
+  const range = array(session.seq_range, `${path}.seq_range`);
+  check(range.length === 2, `${path}.seq_range must contain exactly two positions`);
+  const start = integer(range[0], `${path}.seq_range[0]`);
+  const end = integer(range[1], `${path}.seq_range[1]`);
+  check(start === 0 && end >= start, `${path}.seq_range must be an inclusive zero-based artifact range`);
+  return { ...session, seq_range: [start, end] };
+}
+
+function artifactRef(value, path) {
+  const artifact = record(value, path);
+  exactKeys(artifact, ["key", "media_type", "bytes", "sha256"], path);
+  string(artifact.key, `${path}.key`);
+  check(artifact.media_type === "application/json", `${path}.media_type must be application/json`);
+  check(integer(artifact.bytes, `${path}.bytes`) > 0, `${path}.bytes must be positive`);
+  digest(artifact.sha256, `${path}.sha256`);
+  return artifact;
+}
+
+function evidencePage(value, path) {
+  const page = record(value, path);
+  exactKeys(page, ["from", "next", "truncated", "event_count", "artifact_ref"], path);
+  const from = integer(page.from, `${path}.from`);
+  const eventCount = integer(page.event_count, `${path}.event_count`);
+  check(eventCount <= MAX_STATUS_PAGE_SIZE, `${path}.event_count exceeds the bounded page size`);
+  if (page.next !== null) integer(page.next, `${path}.next`);
+  check(typeof page.truncated === "boolean", `${path}.truncated must be boolean`);
+  check(page.truncated === (page.next !== null), `${path}.truncated disagrees with next`);
+  if (page.next !== null) check(page.next === from + eventCount, `${path}.next breaks positional continuity`);
+  return { ...page, from, event_count: eventCount, artifact_ref: artifactRef(page.artifact_ref, `${path}.artifact_ref`) };
+}
+
+function validateEvidenceContinuity(value, seqRange, path) {
+  const page = evidencePage(value, path);
+  const end = seqRange[1];
+  if (page.from > end) {
+    check(page.event_count === 0 && page.next === null, `${path} reads positions beyond the artifact range`);
+  } else if (page.next === null) {
+    check(page.event_count === end - page.from + 1, `${path} omits terminal artifact positions`);
+  } else {
+    check(page.next <= end, `${path}.next exceeds the terminal artifact range`);
+  }
+}
+
+function canonicalJson(value) {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  return `{${Object.keys(value)
+    .sort((left, right) => left < right ? -1 : left > right ? 1 : 0)
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+    .join(",")}}`;
 }
 
 function digestText(value) {

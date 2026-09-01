@@ -12,7 +12,7 @@ const DEFAULT_MANIFEST = new URL(
   import.meta.url,
 );
 const MAX_STATUS_PAGE_SIZE = 100;
-const REPORT_SCHEMA_VERSION = 2;
+const REPORT_SCHEMA_VERSION = 3;
 const EXPECTED_WORKLOAD = new Map([
   ["first-execute", "execute"],
   ["exact-retry", "execute"],
@@ -54,6 +54,7 @@ if (finalizeRequestPath === undefined) {
 }
 
 const request = manifest.workload.steps.find((step) => step.id === "first-execute").request;
+const executionIdentity = requestIdentity(request);
 const runtimeCalls = [];
 const unsupported = manifest.workload.steps.find((step) => step.id === "unsupported-managed-codex");
 const unsupportedResult = await runManagedAgentPreflight(unsupported);
@@ -121,6 +122,7 @@ const report = {
   workload: manifest.workload,
   capture: {
     source: "burnin-fixed-workload",
+    execution_identity: executionIdentity,
     runtime_calls: runtimeCalls,
     preflight,
     cleanup,
@@ -262,7 +264,16 @@ function runtimeSummary(stepId, operation, result) {
     status: body.status,
     disposition: body.disposition,
     request_hash: body.request_hash,
-    artifact_key: body.evidence?.artifact_ref?.key ?? null,
+    execution_digest: body.execution_digest,
+    execution_policy_revision: body.execution_policy_revision,
+    session_ref: body.session_ref,
+    evidence: {
+      from: body.evidence.from,
+      next: body.evidence.next,
+      truncated: body.evidence.truncated,
+      event_count: body.evidence.events.length,
+      artifact_ref: body.evidence.artifact_ref,
+    },
     cost_ref: body.cost === undefined ? null : digestOf(body.cost),
   };
 }
@@ -271,7 +282,8 @@ function uniqueRunCost(body) {
   if (body.cost === undefined) return [];
   return [{
     id: digestOf(body.cost),
-    invocation_id: body.invocation_id,
+    execution_identity: executionIdentity,
+    artifact_ref: body.evidence.artifact_ref,
     artifact_count: body.evidence?.artifact_ref === undefined ? 0 : 1,
     analytics_point_count: body.cost.infrastructure.analytics_points_written,
     cost: body.cost,
@@ -324,10 +336,13 @@ function validateManifest(value) {
 }
 
 function expectSameTerminalExecution(stepId, body, firstBody) {
-  if (body.request_hash !== firstBody.request_hash) {
-    fail(`${stepId} changed request_hash`);
+  for (const field of ["request_hash", "execution_digest", "execution_policy_revision"]) {
+    if (body[field] !== firstBody[field]) fail(`${stepId} changed ${field}`);
   }
-  if (body.evidence?.artifact_ref?.key !== firstBody.evidence?.artifact_ref?.key) {
+  if (JSON.stringify(body.session_ref) !== JSON.stringify(firstBody.session_ref)) {
+    fail(`${stepId} changed the positional session range`);
+  }
+  if (JSON.stringify(body.evidence?.artifact_ref) !== JSON.stringify(firstBody.evidence?.artifact_ref)) {
     fail(`${stepId} returned a second artifact`);
   }
   if (JSON.stringify(body.cost ?? null) !== JSON.stringify(firstBody.cost ?? null)) {
@@ -342,8 +357,14 @@ function expectTerminalAttribution(stepId, result, invocationId) {
     body.invocation_id !== invocationId ||
     typeof body.request_hash !== "string" ||
     !/^sha256:[0-9a-f]{64}$/.test(body.request_hash) ||
-    typeof body.evidence?.artifact_ref?.key !== "string" ||
-    body.evidence.artifact_ref.key.length === 0 ||
+    typeof body.execution_digest !== "string" ||
+    !/^sha256:[0-9a-f]{64}$/.test(body.execution_digest) ||
+    typeof body.execution_policy_revision !== "string" ||
+    body.execution_policy_revision.length === 0 ||
+    body.session_ref?.session_id !== request.session_ref.session_id ||
+    !validSeqRange(body.session_ref?.seq_range) ||
+    !validEvidencePage(body.evidence) ||
+    !validArtifactRef(body.evidence.artifact_ref) ||
     !isRecord(body.cost) ||
     !isRecord(body.cost.infrastructure)
   ) {
@@ -369,7 +390,7 @@ function ensureTrailingSlash(value) {
 }
 
 function digestOf(value) {
-  return `sha256:${createHash("sha256").update(JSON.stringify(value)).digest("hex")}`;
+  return `sha256:${createHash("sha256").update(canonicalJson(value)).digest("hex")}`;
 }
 
 function digestText(value) {
@@ -378,6 +399,47 @@ function digestText(value) {
 
 function isRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function requestIdentity(value) {
+  return {
+    invocation_id: value.invocation_id,
+    idempotency_key: value.idempotency_key,
+    session_id: value.session_ref.session_id,
+    request_hash: digestOf(value),
+    execution_digest: digestOf({
+      execution: value.execution,
+      execution_policy_revision: value.execution_policy_revision,
+    }),
+    execution_policy_revision: value.execution_policy_revision,
+  };
+}
+
+function validSeqRange(value) {
+  return Array.isArray(value) && value.length === 2 &&
+    Number.isSafeInteger(value[0]) && Number.isSafeInteger(value[1]) &&
+    value[0] === 0 && value[1] >= value[0];
+}
+
+function validEvidencePage(value) {
+  return isRecord(value) && Number.isSafeInteger(value.from) && value.from >= 0 &&
+    (value.next === null || Number.isSafeInteger(value.next) && value.next > value.from) &&
+    typeof value.truncated === "boolean" && Array.isArray(value.events);
+}
+
+function validArtifactRef(value) {
+  return isRecord(value) && typeof value.key === "string" && value.key.length > 0 &&
+    value.media_type === "application/json" && Number.isSafeInteger(value.bytes) &&
+    value.bytes > 0 && /^sha256:[0-9a-f]{64}$/.test(value.sha256);
+}
+
+function canonicalJson(value) {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  return `{${Object.keys(value)
+    .sort((left, right) => left < right ? -1 : left > right ? 1 : 0)
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+    .join(",")}}`;
 }
 
 function fail(message) {

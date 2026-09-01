@@ -221,13 +221,21 @@ test("execute, status, and cancel authorization failures precede every persisten
 });
 
 test("tool-enabled managed execution fails closed before runtime access", async () => {
+  let claims = 0;
   const runtime = new FakeRuntime({
     served_model: null,
     output: { text: "must not run" },
     evidence: [],
   });
   const service = new ExecutionService(
-    new MemoryStore(),
+    {
+      claim: async () => {
+        claims += 1;
+        throw new Error("unsupported policy reached D1 claim");
+      },
+      get: async () => null,
+      finish: async () => false,
+    },
     new MemoryArtifacts(),
     runtime,
     fixedOptions(),
@@ -240,6 +248,44 @@ test("tool-enabled managed execution fails closed before runtime access", async 
     assert.equal(result.error.code, "unsupported_policy");
   }
   assert.equal(runtime.executions, 0);
+  assert.equal(claims, 0);
+});
+
+test("unsupported managed transport rejects repeatably before allowance reservation", async () => {
+  let claims = 0;
+  const supported = await request();
+  const service = new ExecutionService(
+    {
+      claim: async () => {
+        claims += 1;
+        throw new Error("unsupported execution reached D1 claim");
+      },
+      get: async () => null,
+      finish: async () => false,
+    },
+    new MemoryArtifacts(),
+    new FakeRuntime({ served_model: null, evidence: [] }),
+    fixedOptions(),
+  );
+  const input = await request({
+    execution: {
+      ...supported.execution,
+      transport: {
+        ...supported.execution.transport,
+        harness: "codex",
+        transport: "app_server",
+      },
+    },
+  });
+
+  const first = await service.executeInvocation(input);
+  const retry = await service.executeInvocation(input);
+  assert.deepEqual(retry, first);
+  assert.equal(first.status, "failed");
+  if (first.status === "failed") {
+    assert.equal(first.error.code, "unsupported_execution");
+  }
+  assert.equal(claims, 0);
 });
 
 test("disabled managed execution returns a typed failure before charged access", async () => {
@@ -372,6 +418,38 @@ test("changed content conflicts without crossing into the runtime", async () => 
   }
   assert.equal(conflict.session_ref.seq_range, undefined);
   assert.equal(runtime.executions, 1);
+});
+
+test("failed Analytics emission is loud and never persists a cost claiming one point", async () => {
+  const store = new MemoryStore();
+  const artifacts = new MemoryArtifacts();
+  const runtime = new FakeRuntime({
+    served_model: "zai-coding-plan/glm-4.5-air",
+    output: { text: "done" },
+    evidence: [{ type: "message_delta", text: "done" }],
+  });
+  let emissionAttempts = 0;
+  const service = new ExecutionService(store, artifacts, runtime, {
+    ...fixedOptions(),
+    costMeter: new RunCostMeter(),
+    analytics: {
+      emit: async () => {
+        emissionAttempts += 1;
+        throw new Error("Analytics unavailable");
+      },
+    },
+  });
+  const input = await request();
+
+  await assert.rejects(service.executeInvocation(input), /Analytics unavailable/);
+  assert.equal(emissionAttempts, 1);
+  assert.equal(artifacts.writes, 0);
+  assert.equal(store.rows.get(input.invocation_id)?.status, "running");
+
+  const retry = await service.executeInvocation(input);
+  assert.equal(retry.status, "running");
+  assert.equal(runtime.executions, 1, "exact retry must not resample after failed accounting");
+  assert.equal(emissionAttempts, 1, "running retry must not emit a second point");
 });
 
 test("concurrent exact retry observes running and never samples twice", async () => {

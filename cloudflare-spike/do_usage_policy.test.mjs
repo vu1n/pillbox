@@ -43,7 +43,7 @@ test("execution persistence is bounded and local logs cannot route to a DO", () 
   assert.match(service, /MAX_EVIDENCE_PAGE_SIZE/);
   assert.match(
     service,
-    /planned_analytics_points:\s*this\.analytics === undefined \? 0 : 1/,
+    /await this\.analytics\.emit/,
   );
 
   assert.equal(existsSync(new URL("../src/events/source.rs", import.meta.url)), false);

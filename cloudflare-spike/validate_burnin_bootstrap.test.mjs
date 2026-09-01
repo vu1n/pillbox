@@ -12,9 +12,9 @@ const fingerprint = `sha256:${createHash("sha256")
   .update(Buffer.from(publicKey.slice("ed25519:".length), "base64url"))
   .digest("hex")}`;
 
-const bootstrap = {
+const bootstrapBase = {
   schema_version: "huddles.pillbox-burnin-bootstrap/1",
-  mode: "dry-run",
+  mode: "apply",
   installation: {
     installation_id: "pillbox-burnin-installation-1",
     execution_realm_id: "pillbox-managed-burnin-1",
@@ -41,6 +41,10 @@ const bootstrap = {
   },
   limits: { max_concurrent_executions: 1 },
 };
+const bootstrap = {
+  ...bootstrapBase,
+  authority_receipt: authorityReceipt(bootstrapBase),
+};
 
 const config = `
 name = "pillbox-managed-burnin"
@@ -62,14 +66,29 @@ MANAGED_EXECUTION_LIMIT = "1"
 binding = "EXECUTION_DB"
 database_name = "pillbox-managed-burnin-db"
 database_id = "0123456789abcdef0123456789abcdef"
+migrations_dir = "migrations"
 
 [[r2_buckets]]
 binding = "EXECUTION_EVIDENCE"
 bucket_name = "pillbox-managed-burnin-evidence"
 
+[[analytics_engine_datasets]]
+binding = "RUN_COSTS"
+dataset = "pillbox_managed_burnin_costs"
+
+[[durable_objects.bindings]]
+name = "Sandbox"
+class_name = "Sandbox"
+
 [[containers]]
 class_name = "Sandbox"
+image = "./Dockerfile"
+instance_type = "standard-2"
 max_instances = 1
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Sandbox"]
 
 [[services]]
 binding = "PillboxAuthorizationCurrentness"
@@ -94,6 +113,47 @@ test("missing capability-secret metadata fails closed", async () => {
     validateBurninBootstrap({ bootstrap, wrangler: config, metadata: { secrets: [] } }),
     /MANAGED_CAPABILITY_SECRET is not installed/,
   );
+});
+
+test("dry-run tuples and unverified applied authority receipts fail closed", async () => {
+  await assert.rejects(
+    validateBurninBootstrap({
+      bootstrap: { ...bootstrap, mode: "dry-run" },
+      wrangler: config,
+      metadata,
+    }),
+    /mode must be apply/,
+  );
+
+  const unverified = structuredClone(bootstrap);
+  unverified.authority_receipt.issuer_self_test.status = "configured";
+  await assert.rejects(
+    validateBurninBootstrap({ bootstrap: unverified, wrangler: config, metadata }),
+    /issuer_self_test status must be verified/,
+  );
+});
+
+test("authority receipt digest and exact database, issuer, and currentness proofs are required", async () => {
+  const wrongDigest = structuredClone(bootstrap);
+  wrongDigest.authority_receipt.receipt_sha256 = `sha256:${"0".repeat(64)}`;
+  await assert.rejects(
+    validateBurninBootstrap({ bootstrap: wrongDigest, wrangler: config, metadata }),
+    /receipt_sha256 does not match/,
+  );
+
+  for (const [section, field] of [
+    ["database", "policy_id"],
+    ["issuer_self_test", "key_id"],
+    ["currentness_probe", "installation_id"],
+  ]) {
+    const mismatched = structuredClone(bootstrap);
+    mismatched.authority_receipt[section][field] = "other";
+    mismatched.authority_receipt = authorityReceiptFromBody(mismatched.authority_receipt);
+    await assert.rejects(
+      validateBurninBootstrap({ bootstrap: mismatched, wrangler: config, metadata }),
+      /does not match the bootstrap tuple/,
+    );
+  }
 });
 
 test("mismatched deployment pins and currentness service fail closed", async () => {
@@ -143,6 +203,83 @@ test("placeholder public keys, D1 IDs, and concurrency never validate", async ()
   wrongConcurrency.containers[0].max_instances = 2;
   await assert.rejects(
     validateBurninBootstrap({ bootstrap, wrangler: wrongConcurrency, metadata }),
-    /max_instances does not match/,
+    /Sandbox container tuple does not match/,
   );
 });
+
+test("full topology requires isolated RUN_COSTS and only the vendor Sandbox tuple", async () => {
+  const missingAnalytics = parseWranglerToml(config);
+  missingAnalytics.analytics_engine_datasets = [];
+  await assert.rejects(
+    validateBurninBootstrap({ bootstrap, wrangler: missingAnalytics, metadata }),
+    /isolated RUN_COSTS binding/,
+  );
+
+  const customDo = parseWranglerToml(config);
+  customDo["durable_objects.bindings"].push({
+    name: "SessionGateway",
+    class_name: "SessionGateway",
+  });
+  await assert.rejects(
+    validateBurninBootstrap({ bootstrap, wrangler: customDo, metadata }),
+    /only the vendor Sandbox Durable Object binding/,
+  );
+
+  const customMigration = parseWranglerToml(config);
+  customMigration.migrations[0].new_sqlite_classes.push("SessionGateway");
+  await assert.rejects(
+    validateBurninBootstrap({ bootstrap, wrangler: customMigration, metadata }),
+    /only introduce the vendor Sandbox class/,
+  );
+});
+
+function authorityReceipt(tuple) {
+  return authorityReceiptFromBody({
+    schema_version: "huddles.pillbox-burnin-authority-receipt/1",
+    applied_at: "2026-09-01T00:00:00.000Z",
+    database: {
+      status: "verified",
+      installation_id: tuple.installation.installation_id,
+      execution_realm_id: tuple.installation.execution_realm_id,
+      organization_id: tuple.installation.organization_id,
+      workspace_id: tuple.installation.workspace_id,
+      principal_id: tuple.installation.principal_id,
+      policy_id: tuple.installation.policy_id,
+      key_id: tuple.signing_key.key_id,
+      public_key_fingerprint: tuple.signing_key.fingerprint,
+    },
+    issuer_self_test: {
+      status: "verified",
+      service: tuple.services.issuer.service,
+      entrypoint: tuple.services.issuer.entrypoint,
+      key_id: tuple.signing_key.key_id,
+      public_key_fingerprint: tuple.signing_key.fingerprint,
+    },
+    currentness_probe: {
+      status: "verified",
+      service: tuple.services.currentness.service,
+      entrypoint: tuple.services.currentness.entrypoint,
+      installation_id: tuple.installation.installation_id,
+      key_id: tuple.signing_key.key_id,
+      public_key_fingerprint: tuple.signing_key.fingerprint,
+      policy_id: tuple.installation.policy_id,
+    },
+  });
+}
+
+function authorityReceiptFromBody(receipt) {
+  const { receipt_sha256: _ignored, ...body } = receipt;
+  return {
+    ...body,
+    receipt_sha256: `sha256:${createHash("sha256").update(canonicalJson(body)).digest("hex")}`,
+  };
+}
+
+function canonicalJson(value) {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  return `{${Object.keys(value)
+    .sort((left, right) => left < right ? -1 : left > right ? 1 : 0)
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+    .join(",")}}`;
+}

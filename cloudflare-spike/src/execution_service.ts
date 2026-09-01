@@ -175,6 +175,15 @@ export class ExecutionService {
         cause.message,
       );
     }
+    const unsupported = unsupportedManagedRequest(request);
+    if (unsupported !== undefined) {
+      return this.preClaimFailureResult(
+        request,
+        requestHash,
+        executionDigest,
+        unsupported,
+      );
+    }
     if (this.allowance === null) {
       return this.managedDisabledResult(
         request,
@@ -219,47 +228,23 @@ export class ExecutionService {
     }
 
     let turn: RuntimeTurnResult;
-    if (request.tool_policy !== "deny_all") {
+    try {
+      turn = await this.runtime.execute(request);
+    } catch (cause) {
       turn = {
         served_model: null,
         error: {
-          code: "unsupported_policy",
-          message: "managed execution requires tool_policy 'deny_all' until credentials are brokered",
+          code: "runtime_failed",
+          message: "Pillbox managed invocation failed",
         },
-        evidence: [],
-      };
-    } else if (
-      request.execution.transport.harness !== "opencode" ||
-      (request.execution.transport.transport !== "http" &&
-        request.execution.transport.transport !== "cloudflare-service-binding")
-    ) {
-      turn = {
-        served_model: null,
-        error: {
-          code: "unsupported_execution",
-          message: `unsupported managed execution ${request.execution.transport.harness}/${request.execution.transport.transport}`,
-        },
-        evidence: [],
-      };
-    } else {
-      try {
-        turn = await this.runtime.execute(request);
-      } catch (cause) {
-        turn = {
-          served_model: null,
-          error: {
-            code: "runtime_failed",
-            message: "Pillbox managed invocation failed",
+        evidence: [
+          {
+            type: "attention_required",
+            reason: "error_stalled",
+            message: safeHuddlesRuntimeDiagnostic(cause),
           },
-          evidence: [
-            {
-              type: "attention_required",
-              reason: "error_stalled",
-              message: safeHuddlesRuntimeDiagnostic(cause),
-            },
-          ],
-        };
-      }
+        ],
+      };
     }
     return this.finishTurn(request, claim.record, turn, "created");
   }
@@ -413,13 +398,30 @@ export class ExecutionService {
             ...outcome,
           };
     this.costMeter?.observeEvidence(evidence);
-    const cost = this.costMeter?.terminal(outcome.status, {
+    let cost = this.costMeter?.terminal(outcome.status, {
       sandbox_duration_ms: Math.max(0, this.now() - record.created_at_ms),
       sandbox_profile: this.sandboxProfile,
       planned_d1_terminal_writes: 1,
       planned_r2_writes: 1,
-      planned_analytics_points: this.analytics === undefined ? 0 : 1,
     });
+    if (this.analytics !== undefined && cost !== undefined) {
+      cost = {
+        ...cost,
+        infrastructure: {
+          ...cost.infrastructure,
+          analytics_points_written: 1,
+        },
+      };
+      // A point becomes immutable evidence only after the provider accepts it.
+      // Failure leaves the claim running, so an exact retry cannot resample.
+      await this.analytics.emit({
+        invocation_id: record.invocation_id,
+        request_hash: record.request_hash,
+        harness: attribution.harness,
+        transport: attribution.transport,
+        cost,
+      });
+    }
     const unsealedArtifact: ExecutionArtifact = {
       version: 1,
       invocation_id: record.invocation_id,
@@ -460,22 +462,6 @@ export class ExecutionService {
         ? {}
         : { cost: artifact.cost as unknown as RunCostEnvelope }),
     };
-    if (this.analytics !== undefined && result.cost !== undefined) {
-      try {
-        await this.analytics.emit({
-          invocation_id: record.invocation_id,
-          request_hash: record.request_hash,
-          harness: attribution.harness,
-          transport: attribution.transport,
-          cost: result.cost,
-        });
-      } catch (cause) {
-        console.error(
-          "run cost analytics emission failed",
-          safeHuddlesRuntimeDiagnostic(cause),
-        );
-      }
-    }
     return result;
   }
 
@@ -508,6 +494,21 @@ export class ExecutionService {
     executionDigest: `sha256:${string}`,
     message: string,
   ): ExecuteInvocationV2Result {
+    return this.preClaimFailureResult(request, requestHash, executionDigest, {
+      code: "managed_disabled",
+      message,
+    });
+  }
+
+  private preClaimFailureResult(
+    request: ExecuteInvocationV2Request,
+    requestHash: `sha256:${string}`,
+    executionDigest: `sha256:${string}`,
+    error: {
+      readonly code: "managed_disabled" | "unsupported_execution" | "unsupported_policy";
+      readonly message: string;
+    },
+  ): ExecuteInvocationV2Result {
     return {
       disposition: "created",
       invocation_id: request.invocation_id,
@@ -518,7 +519,7 @@ export class ExecutionService {
       attribution: attributionFromRequest(request, null),
       evidence: emptyEvidence(0),
       status: "failed",
-      error: { code: "managed_disabled", message },
+      error,
     };
   }
 
@@ -580,6 +581,34 @@ export class ExecutionService {
           ),
         };
   }
+}
+
+function unsupportedManagedRequest(
+  request: ExecuteInvocationV2Request,
+):
+  | {
+      readonly code: "unsupported_execution" | "unsupported_policy";
+      readonly message: string;
+    }
+  | undefined {
+  if (request.tool_policy !== "deny_all") {
+    return {
+      code: "unsupported_policy",
+      message:
+        "managed execution requires tool_policy 'deny_all' until credentials are brokered",
+    };
+  }
+  const { harness, transport } = request.execution.transport;
+  if (
+    harness !== "opencode" ||
+    (transport !== "http" && transport !== "cloudflare-service-binding")
+  ) {
+    return {
+      code: "unsupported_execution",
+      message: `unsupported managed execution ${harness}/${transport}`,
+    };
+  }
+  return undefined;
 }
 
 type SandboxHandle = ReturnType<typeof getSandbox>;

@@ -40,17 +40,28 @@ printf '%s\\n' '{"schema_version":1,"agent":"codex","status":"preflight_rejected
     }),
   );
 
-  const requestHash = `sha256:${"b".repeat(64)}`;
-  const artifactKey = "executions/burnin-invocation-1/evidence.json";
+  const executeRequest = manifest.workload.steps.find((step) => step.id === "first-execute").request;
+  const requestHash = digestOf(executeRequest);
+  const executionDigest = digestOf({
+    execution: executeRequest.execution,
+    execution_policy_revision: executeRequest.execution_policy_revision,
+  });
+  const artifactKey = `executions/${createHash("sha256").update(executeRequest.invocation_id).digest("hex")}/${requestHash.slice("sha256:".length)}.json`;
+  const artifactRef = {
+    key: artifactKey,
+    media_type: "application/json",
+    bytes: 672,
+    sha256: `sha256:${"d".repeat(64)}`,
+  };
   const cost = manifest.capture.run_cost_envelopes[0].cost;
   let executeCalls = 0;
   const requests = [];
   const server = createServer(async (request, response) => {
     assert.equal(await fileExists(marker), true, "preflight must run before the first HTTP request");
     requests.push(request.url);
-    for await (const _ of request) {
-      // Drain the bounded request body before replying.
-    }
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString());
     response.setHeader("content-type", "application/json");
     if (request.url === "/v2/workspaces/finalize") {
       response.end(JSON.stringify({ resultSnapshot: "c".repeat(64) }));
@@ -62,7 +73,16 @@ printf '%s\\n' '{"schema_version":1,"agent":"codex","status":"preflight_rejected
       status: "completed",
       disposition: executeCalls === 1 ? "created" : "reused",
       request_hash: requestHash,
-      evidence: { artifact_ref: { key: artifactKey } },
+      execution_digest: executionDigest,
+      execution_policy_revision: executeRequest.execution_policy_revision,
+      session_ref: { session_id: executeRequest.session_ref.session_id, seq_range: [0, 0] },
+      evidence: {
+        from: body.evidence_after ?? 0,
+        next: null,
+        truncated: false,
+        events: (body.evidence_after ?? 0) === 0 ? [{ type: "message_delta" }] : [],
+        artifact_ref: artifactRef,
+      },
       cost,
     }));
   });
@@ -111,6 +131,15 @@ printf '%s\\n' '{"schema_version":1,"agent":"codex","status":"preflight_rejected
     manifest.workload.steps.filter((step) => step.operation === "execute" || step.operation === "status").length,
   );
   assert.equal(requests.length, manifest.workload.expected_network_requests);
+  assert.equal(report.schema_version, 3);
+  assert.equal(report.capture.execution_identity.request_hash, requestHash);
+  assert.equal(report.capture.execution_identity.execution_digest, executionDigest);
+  assert.deepEqual(report.capture.runtime_calls[0].session_ref.seq_range, [0, 0]);
+  assert.equal(report.capture.runtime_calls[0].evidence.artifact_ref.sha256, artifactRef.sha256);
+  assert.deepEqual(
+    report.capture.run_cost_envelopes[0].execution_identity,
+    report.capture.execution_identity,
+  );
 
   report.capture.run_cost_envelopes[0].observed = reviewedManifest.capture.run_cost_envelopes[0].observed;
   report.capture.read_only = reviewedManifest.capture.read_only;
@@ -142,4 +171,15 @@ function run(command, args, env) {
     child.on("error", reject);
     child.on("close", (code) => resolve({ code, stdout, stderr }));
   });
+}
+
+function digestOf(value) {
+  return `sha256:${createHash("sha256").update(canonicalJson(value)).digest("hex")}`;
+}
+
+function canonicalJson(value) {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  return `{${Object.keys(value).sort((left, right) => left < right ? -1 : left > right ? 1 : 0)
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(",")}}`;
 }

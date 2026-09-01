@@ -41,6 +41,49 @@ export interface ExecutionClaimInput {
   readonly lease_expires_at_ms: number;
 }
 
+export const MAX_MANAGED_EXECUTION_LIMIT = 1_000;
+
+export interface ManagedExecutionAllowance {
+  readonly deployment_epoch: string;
+  readonly execution_limit: number;
+}
+
+export class ManagedExecutionAllowanceError extends Error {
+  readonly code = "managed_disabled" as const;
+
+  constructor() {
+    super(
+      "Pillbox managed execution allowance is exhausted or does not match the deployment configuration",
+    );
+    this.name = "ManagedExecutionAllowanceError";
+  }
+}
+
+export function parseManagedExecutionAllowance(
+  deploymentEpoch: string | undefined,
+  executionLimit: string | undefined,
+): ManagedExecutionAllowance | null {
+  if (
+    deploymentEpoch === undefined ||
+    !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(deploymentEpoch) ||
+    executionLimit === undefined ||
+    !/^[1-9][0-9]*$/.test(executionLimit)
+  ) {
+    return null;
+  }
+  const parsedLimit = Number(executionLimit);
+  if (
+    !Number.isSafeInteger(parsedLimit) ||
+    parsedLimit > MAX_MANAGED_EXECUTION_LIMIT
+  ) {
+    return null;
+  }
+  return {
+    deployment_epoch: deploymentEpoch,
+    execution_limit: parsedLimit,
+  };
+}
+
 export type ExecutionClaim =
   | { readonly kind: "created"; readonly record: ExecutionRecord }
   | { readonly kind: "reused"; readonly record: ExecutionRecord }
@@ -56,7 +99,10 @@ export interface FinishExecutionInput {
 }
 
 export interface ExecutionStore {
-  claim(input: ExecutionClaimInput): Promise<ExecutionClaim>;
+  claim(
+    input: ExecutionClaimInput,
+    allowance: ManagedExecutionAllowance,
+  ): Promise<ExecutionClaim>;
   get(invocation_id: string): Promise<ExecutionRecord | null>;
   finish(input: FinishExecutionInput): Promise<boolean>;
 }
@@ -128,34 +174,59 @@ export class D1ExecutionStore implements ExecutionStore {
     this.observeUsage = observeUsage;
   }
 
-  async claim(input: ExecutionClaimInput): Promise<ExecutionClaim> {
+  async claim(
+    input: ExecutionClaimInput,
+    allowance: ManagedExecutionAllowance,
+  ): Promise<ExecutionClaim> {
     const byInvocation = await this.get(input.invocation_id);
     if (byInvocation !== null) return classifyClaim(byInvocation, input);
 
-    const inserted = await this.run(
-      `INSERT OR IGNORE INTO execution (
+    let inserted: RelationalResult;
+    try {
+      inserted = await this.run(
+        `INSERT OR IGNORE INTO execution (
         invocation_id, idempotency_key, request_hash, execution_digest,
         execution_policy_revision, session_id, harness, transport,
         requested_model, status, owner_token,
-        lease_expires_at_ms, created_at_ms, updated_at_ms
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?)`,
-      [
-        input.invocation_id,
-        input.idempotency_key,
-        input.request_hash,
-        input.execution_digest,
-        input.execution_policy_revision,
-        input.session_id,
-        input.attribution.harness,
-        input.attribution.transport,
-        input.attribution.requested_model,
-        input.owner_token,
-        input.lease_expires_at_ms,
-        input.now_ms,
-        input.now_ms,
-      ],
-    );
-    if ((inserted.meta?.changes ?? 0) === 1) {
+        lease_expires_at_ms, created_at_ms, updated_at_ms,
+        allowance_epoch, allowance_limit
+      )
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?
+      WHERE EXISTS (
+        SELECT 1 FROM managed_execution_allowance
+        WHERE singleton = 1 AND deployment_epoch = ? AND execution_limit = ?
+          AND reserved_executions < execution_limit
+        LIMIT 1
+      )`,
+        [
+          input.invocation_id,
+          input.idempotency_key,
+          input.request_hash,
+          input.execution_digest,
+          input.execution_policy_revision,
+          input.session_id,
+          input.attribution.harness,
+          input.attribution.transport,
+          input.attribution.requested_model,
+          input.owner_token,
+          input.lease_expires_at_ms,
+          input.now_ms,
+          input.now_ms,
+          allowance.deployment_epoch,
+          allowance.execution_limit,
+          allowance.deployment_epoch,
+          allowance.execution_limit,
+        ],
+      );
+    } catch (cause) {
+      if (String(cause).includes("managed_execution_allowance_unavailable")) {
+        throw new ManagedExecutionAllowanceError();
+      }
+      throw cause;
+    }
+    // D1 may include the trigger's reservation update in `changes`; zero is the
+    // only ignored/no-capacity outcome.
+    if ((inserted.meta?.changes ?? 0) > 0) {
       return { kind: "created", record: recordFromClaim(input) };
     }
 
@@ -165,7 +236,7 @@ export class D1ExecutionStore implements ExecutionStore {
       (await this.get(input.invocation_id)) ??
       (await this.getByIdempotencyKey(input.idempotency_key));
     if (winner === null) {
-      throw new Error("execution claim lost without an indexed winning row");
+      throw new ManagedExecutionAllowanceError();
     }
     return classifyClaim(winner, input);
   }

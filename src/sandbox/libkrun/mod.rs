@@ -607,17 +607,20 @@ fn stub_oauth_creds(
     let creds_file = clone.join(spec.cred_sentinel);
     if let Ok(text) = std::fs::read_to_string(&creds_file) {
         if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&text) {
-            // Each provider lays its OAuth tokens out differently, so dispatch on
-            // the agent's owning provider (the same key `oauth_swap_hosts` uses) to
-            // stub the right fields. An unhandled shape stubs nothing → the launch
-            // guard ([`env_fork_left_real_unstubbed`]) refuses to leak it. Returns the
-            // access-token stub (when present) so broker JIT refresh can mark which
-            // swap pair to keep fresh.
-            access_stub = match spec.auth_id {
-                "claude" => stub_claude_oauth(&mut json, hosts, &mut pairs),
-                "codex" => stub_codex_oauth(&mut json, hosts, &mut pairs),
-                _ => None,
-            };
+            // The provider registry is the sole OAuth shape dispatch. Host-proxy
+            // and libkrun stubbing are distinct codec operations because libkrun
+            // can intentionally withhold a refresh-token release pair.
+            if let Some(provider) = crate::vault::providers::provider_for(spec.auth_id) {
+                if let Some(codec) = provider.oauth_codec() {
+                    let stubbed = codec.libkrun_stub(&mut json);
+                    access_stub = stubbed.access_stub;
+                    pairs.extend(stubbed.releases.into_iter().map(|release| SwapPair {
+                        stub: release.stub,
+                        real: release.real,
+                        hosts: hosts.to_vec(),
+                    }));
+                }
+            }
             if !pairs.is_empty() {
                 let body = serde_json::to_string(&json).context("reserialize stubbed creds")?;
                 // The clone's file is already 0600 (clonefile preserves perms) and
@@ -627,151 +630,6 @@ fn stub_oauth_creds(
         }
     }
     Ok((clone, pairs, access_stub))
-}
-
-/// Stub claude's `claudeAiOauth.{accessToken,refreshToken}` in place, pushing one
-/// host-bound swap pair per token. Returns the **access-token** stub (when one was
-/// stubbed) so broker JIT refresh can identify its swap pair; `None` if nothing stubbed
-/// (or no access token present).
-fn stub_claude_oauth(
-    json: &mut serde_json::Value,
-    hosts: &[String],
-    pairs: &mut Vec<SwapPair>,
-) -> Option<String> {
-    let oauth = json
-        .get_mut("claudeAiOauth")
-        .and_then(|v| v.as_object_mut())?;
-    let mut stubbed = false;
-    let mut access_stub = None;
-    for field in ["accessToken", "refreshToken"] {
-        let real = oauth
-            .get(field)
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-            .filter(|s| !s.is_empty());
-        if let Some(real) = real {
-            let stub = mint_oauth_stub(&real);
-            oauth.insert(field.to_string(), serde_json::Value::String(stub.clone()));
-            if field == "accessToken" {
-                access_stub = Some(stub.clone());
-            }
-            pairs.push(SwapPair {
-                stub,
-                real,
-                hosts: hosts.to_vec(),
-            });
-            stubbed = true;
-        }
-    }
-    // Broker move: post-date the stub's expiry so the guest's Claude Code trusts its
-    // local expiry and never refreshes itself — the MITM swaps the live access token
-    // on the wire, and the host-side `pre_refresh` (in `prepare_launch`) keeps the
-    // real token fresh. Only stamp when we actually stubbed; an unhandled/empty file
-    // is left untouched for the launch guard to catch.
-    if stubbed {
-        oauth.insert(
-            "expiresAt".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(
-                crate::vault::STUB_FAR_FUTURE_EXPIRES_AT_MS,
-            )),
-        );
-    }
-    access_stub
-}
-
-/// Stub codex's ChatGPT-mode `tokens.{access_token,refresh_token}` in place. The
-/// access stub is a synthetic JWT with a far-future `exp`, so Codex never attempts
-/// proactive refresh; only that access stub gets a MITM release pair. The refresh
-/// stub deliberately has NO pair: an unexpected guest refresh therefore fails
-/// closed upstream and can never capture a real token response. ApiKey-mode
-/// auth.json (no `tokens` block) stubs nothing.
-fn stub_codex_oauth(
-    json: &mut serde_json::Value,
-    hosts: &[String],
-    pairs: &mut Vec<SwapPair>,
-) -> Option<String> {
-    use crate::vault::providers::codex::STUB_REFRESH_PREFIX;
-    let tokens = json.get_mut("tokens").and_then(|v| v.as_object_mut())?;
-    let real_access = tokens
-        .get("access_token")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .filter(|s| !s.is_empty());
-    let access_stub = real_access.map(|real| {
-        let stub = mint_codex_access_stub();
-        tokens.insert(
-            "access_token".to_string(),
-            serde_json::Value::String(stub.clone()),
-        );
-        pairs.push(SwapPair {
-            stub: stub.clone(),
-            real,
-            hosts: hosts.to_vec(),
-        });
-        stub
-    });
-
-    if tokens
-        .get("refresh_token")
-        .and_then(|v| v.as_str())
-        .is_some_and(|value| !value.is_empty())
-    {
-        tokens.insert(
-            "refresh_token".to_string(),
-            serde_json::Value::String(mint_curated_stub(STUB_REFRESH_PREFIX)),
-        );
-    }
-
-    access_stub
-}
-
-/// Synthetic JWT accepted by Codex's local expiry parser. The provider never sees
-/// it: the MITM replaces the complete token in the Authorization header. No segment
-/// is derived from the real JWT, and the signature carries an obvious pillbox marker.
-fn mint_codex_access_stub() -> String {
-    use base64::Engine as _;
-
-    let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
-    let payload = serde_json::to_vec(&serde_json::json!({
-        "exp": crate::vault::STUB_FAR_FUTURE_EXPIRES_AT_MS / 1000,
-    }))
-    .expect("static codex stub claims serialize");
-    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload);
-    let signature = format!(
-        "{}pllbxstub{}",
-        crate::vault::providers::codex::STUB_ACCESS_PREFIX,
-        uuid::Uuid::now_v7().simple()
-    );
-    format!("{header}.{payload}.{signature}")
-}
-
-/// A curated-prefix stub `<prefix>pllbxstub<uuid>` for a token whose real bytes
-/// must never appear in the stub (an opaque or JWT token). The public prefix is a
-/// fixed pillbox marker, not derived from the real, so a leaked stub reveals
-/// nothing of the credential. Contrast [`mint_oauth_stub`] (claude's `sk-ant`
-/// shape, where the first 3 hyphen segments are a safe public type marker).
-fn mint_curated_stub(prefix: &str) -> String {
-    format!("{prefix}pllbxstub{}", uuid::Uuid::now_v7().simple())
-}
-
-/// Mint a stub for an **OAuth token** (the `claudeAiOauth` `access`/`refreshToken`,
-/// shaped `sk-ant-{oat01,ort01}-<body>` — a fixed 3-hyphen-segment type prefix).
-/// Derives the stub prefix from `real` (the two token types differ, so a single
-/// curated prefix can't serve both), keeping ONLY the first 3 segments — for the
-/// OAuth shape that's exactly the public type marker, never the body.
-///
-/// **Only for OAuth-shaped tokens.** For an arbitrary `--with` secret use the
-/// curated `crate::vault::providers::mint_stub(prefix, …)` instead: a key whose
-/// public prefix is <3 segments (OpenAI `sk-proj-<body>`) would leak a body chunk
-/// through this derivation. The ≥4-segment guard only protects short/odd tokens
-/// (synthetic fallback), NOT 2-segment-prefix keys — hence the OAuth-only contract.
-fn mint_oauth_stub(real: &str) -> String {
-    let prefix = if real.split('-').count() >= 4 {
-        real.splitn(4, '-').take(3).collect::<Vec<_>>().join("-")
-    } else {
-        "pllbx".to_string()
-    };
-    format!("{prefix}-pllbxstub{}", uuid::Uuid::now_v7().simple())
 }
 
 /// The hosts the agent's OAuth credential swap is bound to: ONLY its owning
@@ -1026,11 +884,29 @@ mod tests {
     use base64::Engine as _;
 
     use super::{
-        env_fork_left_real_unstubbed, find_cached_rootfs, mint_codex_access_stub,
-        mint_curated_stub, mint_oauth_stub, oauth_swap_hosts, rootfs_unavailable_message,
-        stub_claude_oauth, stub_codex_oauth, SwapPair,
+        env_fork_left_real_unstubbed, find_cached_rootfs, oauth_swap_hosts,
+        rootfs_unavailable_message, SwapPair,
     };
     use crate::agents::{CLAUDE, CODEX, PI};
+
+    fn codec_stub(
+        provider_id: &str,
+        json: &mut serde_json::Value,
+        hosts: &[String],
+    ) -> (Option<String>, Vec<SwapPair>) {
+        let provider = crate::vault::providers::provider_for(provider_id).unwrap();
+        let stubbed = provider.oauth_codec().unwrap().libkrun_stub(json);
+        let pairs = stubbed
+            .releases
+            .into_iter()
+            .map(|release| SwapPair {
+                stub: release.stub,
+                real: release.real,
+                hosts: hosts.to_vec(),
+            })
+            .collect();
+        (stubbed.access_stub, pairs)
+    }
 
     #[test]
     fn stub_claude_oauth_postdates_expiry_and_swaps_tokens() {
@@ -1047,8 +923,7 @@ mod tests {
             }
         });
         let hosts = vec!["api.anthropic.com".to_string()];
-        let mut pairs = Vec::new();
-        let access_stub = stub_claude_oauth(&mut json, &hosts, &mut pairs);
+        let (access_stub, pairs) = codec_stub("claude", &mut json, &hosts);
 
         let oauth = json.get("claudeAiOauth").unwrap();
         // Broker move: the guest-mounted stub is post-dated to year 2100 so the agent
@@ -1160,7 +1035,11 @@ mod tests {
         // Anthropic OAuth tokens are sk-ant-oat01-<base64url> and the body can
         // contain hyphens — the stub must keep only the type prefix, never the body.
         let real = "sk-ant-oat01-3WY-itf8QpVP38ipXjip-SECRETBODYxyz";
-        let stub = mint_oauth_stub(real);
+        let mut json = serde_json::json!({
+            "claudeAiOauth": { "accessToken": real, "refreshToken": "sk-ant-ort01-refresh" }
+        });
+        let (first, _) = codec_stub("claude", &mut json, &[]);
+        let stub = first.unwrap();
         assert!(
             stub.starts_with("sk-ant-oat01-pllbxstub"),
             "stub leaked shape: {stub}"
@@ -1169,7 +1048,10 @@ mod tests {
         assert!(!stub.contains("SECRETBODYxyz"), "stub leaked body: {stub}");
         assert_ne!(stub, real);
         // Distinct each call (uuid suffix).
-        assert_ne!(mint_oauth_stub(real), stub);
+        let mut again = serde_json::json!({
+            "claudeAiOauth": { "accessToken": real, "refreshToken": "sk-ant-ort01-refresh" }
+        });
+        assert_ne!(codec_stub("claude", &mut again, &[]).0.unwrap(), stub);
     }
 
     #[test]
@@ -1235,7 +1117,10 @@ mod tests {
         // A token with <4 hyphen segments has no clear type/body split, so the
         // prefix must be synthetic — never any of the real bytes.
         for real in ["sk-secret", "justonesecretword", "sk-ant-secretbody"] {
-            let stub = mint_oauth_stub(real);
+            let mut json = serde_json::json!({
+                "claudeAiOauth": { "accessToken": real, "refreshToken": "sk-ant-ort01-refresh" }
+            });
+            let stub = codec_stub("claude", &mut json, &[]).0.unwrap();
             assert!(
                 stub.starts_with("pllbx-pllbxstub"),
                 "short token leaked shape: {stub}"
@@ -1261,9 +1146,8 @@ mod tests {
                 "account_id": "acc-123",
             },
         });
-        let mut pairs = Vec::new();
         let hosts = vec!["chatgpt.com".to_string()];
-        let access_stub = stub_codex_oauth(&mut json, &hosts, &mut pairs);
+        let (access_stub, pairs) = codec_stub("codex", &mut json, &hosts);
 
         let tokens = &json["tokens"];
         let stub_access = tokens["access_token"].as_str().unwrap();
@@ -1305,23 +1189,21 @@ mod tests {
         // ApiKey-mode auth.json has no `tokens` block — nothing to stub, so the
         // launch guard fires (codex --vault is rejected for ApiKey mode anyway).
         let mut json = serde_json::json!({ "OPENAI_API_KEY": "sk-real" });
-        let mut pairs = Vec::new();
-        assert!(stub_codex_oauth(&mut json, &["chatgpt.com".into()], &mut pairs).is_none());
+        let (access_stub, pairs) = codec_stub("codex", &mut json, &["chatgpt.com".into()]);
+        assert!(access_stub.is_none());
         assert!(pairs.is_empty());
     }
 
     #[test]
-    fn mint_curated_stub_uses_the_prefix_and_is_unique() {
-        let a = mint_curated_stub("pb-codex-oat-");
-        let b = mint_curated_stub("pb-codex-oat-");
-        assert!(a.starts_with("pb-codex-oat-pllbxstub"));
-        assert_ne!(a, b, "uuid suffix must make each stub unique");
-    }
-
-    #[test]
     fn mint_codex_access_stub_is_unique_and_far_future() {
-        let a = mint_codex_access_stub();
-        let b = mint_codex_access_stub();
+        let make = || {
+            let mut json = serde_json::json!({
+                "tokens": { "access_token": "a.b.c", "refresh_token": "r" }
+            });
+            codec_stub("codex", &mut json, &[]).0.unwrap()
+        };
+        let a = make();
+        let b = make();
         assert_ne!(a, b);
         for stub in [a, b] {
             let parts = stub.split('.').collect::<Vec<_>>();

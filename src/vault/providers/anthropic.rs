@@ -19,11 +19,17 @@ use hudsucker::{
 use serde::Deserialize;
 
 use super::{
-    host_from_uri, mint_stub, swap_raw_header, unauthorized, ApiKeySwap, PendingFlow, Registry,
-    SandboxData, VaultProvider,
+    host_from_uri, mint_stub, swap_raw_header, unauthorized, ApiKeySwap, HostProxyOAuthStub,
+    OAuthCodec, OAuthRefreshRequest, PendingFlow, Registry, SandboxData, VaultProvider,
 };
+#[cfg(feature = "libkrun")]
+use super::{LibkrunOAuthStub, OAuthRelease};
+#[cfg(not(feature = "libkrun"))]
 use crate::vault::refresh::STUB_FAR_FUTURE_EXPIRES_AT_MS as STUB_EXPIRES_AT_MS;
 use crate::vault::server::ServerInner;
+use crate::vault::token_store::RefreshDecider;
+#[cfg(feature = "libkrun")]
+use crate::vault::STUB_FAR_FUTURE_EXPIRES_AT_MS as STUB_EXPIRES_AT_MS;
 
 // Provider id matches the AgentSpec id (`claude`) so
 // `VaultSession::start(agent_id, ...)` can look up the right provider
@@ -42,6 +48,9 @@ const CONSOLE_HOST: &str = "console.anthropic.com";
 const PLATFORM_HOST: &str = "platform.claude.com";
 const OAUTH_TOKEN_PATH_SUFFIX: &str = "/oauth/token";
 const CREDS_PATH: &str = ".claude/.credentials.json";
+const OAUTH_CLIENT_ID: &str = "claude_code";
+const OAUTH_ENDPOINT: &str = "https://platform.claude.com/oauth/token";
+const FALLBACK_EXPIRES_IN_SECS: u64 = 3600;
 
 // Stub tokens mimic Anthropic's `sk-ant-oat01-` / `sk-ant-ort01-`
 // prefixes so Claude Code's local format validation accepts them. The
@@ -71,48 +80,18 @@ impl VaultProvider for AnthropicProvider {
         Path::new(CREDS_PATH)
     }
 
+    fn oauth_codec(&self) -> Option<&dyn OAuthCodec> {
+        Some(self)
+    }
+
     fn provision(
         &self,
         sandbox_id: &str,
         real: &serde_json::Value,
         registry: &mut Registry,
     ) -> Result<String, String> {
-        // Validate shape — we want a clear error if the user pointed us at
-        // the wrong file rather than a silent passthrough of garbage.
-        let oauth = real
-            .get("claudeAiOauth")
-            .ok_or_else(|| "anthropic creds missing claudeAiOauth field".to_string())?;
-        let _block: OauthBlock = serde_json::from_value(oauth.clone())
-            .map_err(|error| format!("parse claudeAiOauth: {error}"))?;
-
-        let stub_access = mint_stub(STUB_ACCESS_PREFIX, sandbox_id);
-        let stub_refresh = mint_stub(STUB_REFRESH_PREFIX, sandbox_id);
-
-        // Build stub creds JSON by cloning real and overwriting the token fields plus
-        // `expiresAt` (post-dated to STUB_EXPIRES_AT_MS — the broker move that stops
-        // the guest from ever refreshing; see that const). `scopes`,
-        // `subscriptionType`, and any future fields are preserved so the guest sees a
-        // structurally-correct file.
-        let mut stub_value = real.clone();
-        {
-            let oauth = stub_value
-                .get_mut("claudeAiOauth")
-                .and_then(|v| v.as_object_mut())
-                .ok_or_else(|| "claudeAiOauth block missing".to_string())?;
-            oauth.insert(
-                "accessToken".to_string(),
-                serde_json::Value::String(stub_access.clone()),
-            );
-            oauth.insert(
-                "refreshToken".to_string(),
-                serde_json::Value::String(stub_refresh.clone()),
-            );
-            oauth.insert(
-                "expiresAt".to_string(),
-                serde_json::Value::Number(serde_json::Number::from(STUB_EXPIRES_AT_MS)),
-            );
-        }
-        let stub_json = serde_json::to_string_pretty(&stub_value)
+        let stub = self.host_proxy_stub(sandbox_id, real)?;
+        let stub_json = serde_json::to_string_pretty(&stub.credentials)
             .map_err(|error| format!("serialize stub creds: {error}"))?;
 
         registry.insert(
@@ -120,7 +99,7 @@ impl VaultProvider for AnthropicProvider {
             SandboxData {
                 provider_id: PROVIDER_ID,
                 real: real.clone(),
-                stubs: vec![stub_access, stub_refresh],
+                stubs: stub.stubs,
             },
         );
 
@@ -250,6 +229,175 @@ impl VaultProvider for AnthropicProvider {
     fn is_chat_request(&self, method: &str, path: &str) -> bool {
         method == "POST" && path.ends_with("/v1/messages")
     }
+}
+
+impl RefreshDecider for AnthropicProvider {
+    fn needs_refresh(&self, creds: &serde_json::Value) -> bool {
+        self.expiry_ms(creds)
+            .map(crate::vault::refresh::is_expired)
+            .unwrap_or(false)
+    }
+
+    fn refresh_token(&self, creds: &serde_json::Value) -> Option<String> {
+        creds
+            .pointer("/claudeAiOauth/refreshToken")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+    }
+
+    fn access_token(&self, creds: &serde_json::Value) -> Option<String> {
+        creds
+            .pointer("/claudeAiOauth/accessToken")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+    }
+
+    fn access_usable(&self, creds: &serde_json::Value) -> bool {
+        self.access_token(creds).is_some()
+            && self
+                .expiry_ms(creds)
+                .is_some_and(|expiry| expiry > crate::vault::refresh::unix_now_ms())
+    }
+}
+
+impl OAuthCodec for AnthropicProvider {
+    fn refresh_request(&self, refresh_token: &str) -> OAuthRefreshRequest {
+        OAuthRefreshRequest {
+            endpoint: OAUTH_ENDPOINT,
+            body: serde_json::json!({
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": OAUTH_CLIENT_ID,
+            }),
+        }
+    }
+
+    fn apply_refresh_response(
+        &self,
+        real: &mut serde_json::Value,
+        response: &serde_json::Value,
+        old_refresh: &str,
+        now_ms: u64,
+    ) -> anyhow::Result<()> {
+        let access = response
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                crate::errors::PillboxError::runtime(
+                    "vault",
+                    "refresh response missing access_token",
+                )
+            })?;
+        let refresh = response
+            .get("refresh_token")
+            .and_then(|v| v.as_str())
+            .unwrap_or(old_refresh);
+        let expires_in = response
+            .get("expires_in")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(FALLBACK_EXPIRES_IN_SECS);
+        let oauth = real
+            .get_mut("claudeAiOauth")
+            .and_then(|v| v.as_object_mut())
+            .ok_or_else(|| {
+                crate::errors::PillboxError::runtime("vault", "claudeAiOauth block disappeared")
+            })?;
+        oauth.insert("accessToken".into(), access.into());
+        oauth.insert("refreshToken".into(), refresh.into());
+        oauth.insert(
+            "expiresAt".into(),
+            serde_json::Value::Number(serde_json::Number::from(
+                now_ms.saturating_add(expires_in.saturating_mul(1000)),
+            )),
+        );
+        Ok(())
+    }
+
+    fn expiry_ms(&self, real: &serde_json::Value) -> Option<u64> {
+        real.pointer("/claudeAiOauth/expiresAt")
+            .and_then(|v| v.as_u64())
+            .map(crate::vault::refresh::normalize_expiry_ms)
+    }
+
+    fn host_proxy_stub(
+        &self,
+        sandbox_id: &str,
+        real: &serde_json::Value,
+    ) -> Result<HostProxyOAuthStub, String> {
+        let oauth = real
+            .get("claudeAiOauth")
+            .ok_or_else(|| "anthropic creds missing claudeAiOauth field".to_string())?;
+        let _block: OauthBlock = serde_json::from_value(oauth.clone())
+            .map_err(|error| format!("parse claudeAiOauth: {error}"))?;
+        let access = mint_stub(STUB_ACCESS_PREFIX, sandbox_id);
+        let refresh = mint_stub(STUB_REFRESH_PREFIX, sandbox_id);
+        let mut credentials = real.clone();
+        let oauth = credentials
+            .get_mut("claudeAiOauth")
+            .and_then(|v| v.as_object_mut())
+            .ok_or_else(|| "claudeAiOauth block missing".to_string())?;
+        oauth.insert("accessToken".into(), access.clone().into());
+        oauth.insert("refreshToken".into(), refresh.clone().into());
+        oauth.insert(
+            "expiresAt".into(),
+            serde_json::Value::Number(serde_json::Number::from(STUB_EXPIRES_AT_MS)),
+        );
+        Ok(HostProxyOAuthStub {
+            credentials,
+            stubs: vec![access, refresh],
+        })
+    }
+
+    #[cfg(feature = "libkrun")]
+    fn libkrun_stub(&self, real: &mut serde_json::Value) -> LibkrunOAuthStub {
+        let Some(oauth) = real
+            .get_mut("claudeAiOauth")
+            .and_then(|v| v.as_object_mut())
+        else {
+            return LibkrunOAuthStub {
+                access_stub: None,
+                releases: Vec::new(),
+            };
+        };
+        let mut releases = Vec::new();
+        let mut access_stub = None;
+        for field in ["accessToken", "refreshToken"] {
+            let Some(token) = oauth
+                .get(field)
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let stub = mint_libkrun_stub(&token);
+            oauth.insert(field.into(), stub.clone().into());
+            if field == "accessToken" {
+                access_stub = Some(stub.clone());
+            }
+            releases.push(OAuthRelease { stub, real: token });
+        }
+        if !releases.is_empty() {
+            oauth.insert(
+                "expiresAt".into(),
+                serde_json::Value::Number(serde_json::Number::from(STUB_EXPIRES_AT_MS)),
+            );
+        }
+        LibkrunOAuthStub {
+            access_stub,
+            releases,
+        }
+    }
+}
+
+#[cfg(feature = "libkrun")]
+fn mint_libkrun_stub(real: &str) -> String {
+    let prefix = if real.split('-').count() >= 4 {
+        real.splitn(4, '-').take(3).collect::<Vec<_>>().join("-")
+    } else {
+        "pllbx".to_string()
+    };
+    format!("{prefix}-pllbxstub{}", uuid::Uuid::now_v7().simple())
 }
 
 #[derive(Debug, Deserialize)]

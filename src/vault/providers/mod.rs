@@ -40,6 +40,65 @@ pub(crate) mod openai;
 pub(crate) const API_KEY_PROVIDER_ID: &str = "api-key";
 
 use super::server::ServerInner;
+use super::token_store::RefreshDecider;
+
+/// Provider-owned OAuth wire contract. The broker owns coordination and transport;
+/// the codec owns every credential-shape decision that differs by provider.
+pub(crate) trait OAuthCodec: RefreshDecider {
+    /// Build the upstream refresh request without exposing token-field knowledge to
+    /// the generic broker.
+    fn refresh_request(&self, refresh_token: &str) -> OAuthRefreshRequest;
+
+    /// Apply a successful token response to the provider's persisted credential
+    /// shape. A response may omit a rotated refresh token; codecs preserve the old
+    /// value in that case.
+    fn apply_refresh_response(
+        &self,
+        real: &mut serde_json::Value,
+        response: &serde_json::Value,
+        old_refresh: &str,
+        now_ms: u64,
+    ) -> anyhow::Result<()>;
+
+    /// Real access-token expiry in unix milliseconds, used only as the host broker's
+    /// JIT scheduling hint.
+    fn expiry_ms(&self, real: &serde_json::Value) -> Option<u64>;
+
+    /// Build the host-proxy credential file. This operation may mint both access and
+    /// refresh stubs because the proxy can safely re-stub intercepted responses.
+    fn host_proxy_stub(
+        &self,
+        sandbox_id: &str,
+        real: &serde_json::Value,
+    ) -> Result<HostProxyOAuthStub, String>;
+
+    /// Build the libkrun env-fork in place. Its release pairs are intentionally a
+    /// separate operation: providers may refuse to release a guest refresh stub.
+    #[cfg(feature = "libkrun")]
+    fn libkrun_stub(&self, real: &mut serde_json::Value) -> LibkrunOAuthStub;
+}
+
+pub(crate) struct OAuthRefreshRequest {
+    pub endpoint: &'static str,
+    pub body: serde_json::Value,
+}
+
+pub(crate) struct HostProxyOAuthStub {
+    pub credentials: serde_json::Value,
+    pub stubs: Vec<String>,
+}
+
+#[cfg(feature = "libkrun")]
+pub(crate) struct LibkrunOAuthStub {
+    pub access_stub: Option<String>,
+    pub releases: Vec<OAuthRelease>,
+}
+
+#[cfg(feature = "libkrun")]
+pub(crate) struct OAuthRelease {
+    pub stub: String,
+    pub real: String,
+}
 
 /// In-flight OAuth refresh the handler is mid-way through processing.
 /// Set in `handle_request`, consumed in `handle_response` so the response-
@@ -207,6 +266,12 @@ pub(crate) trait VaultProvider: Send + Sync + 'static {
     /// Path (relative to guest HOME) where the agent expects to find its
     /// credentials file. Pillbox mounts the stub at this location.
     fn creds_path(&self) -> &'static Path;
+
+    /// Typed OAuth operations for this provider. API-key-only providers leave this
+    /// absent; all OAuth dispatch flows through this one registry-owned seam.
+    fn oauth_codec(&self) -> Option<&dyn OAuthCodec> {
+        None
+    }
 
     /// Validate the loaded real creds, register stub tokens into
     /// `registry`, and return the stub credentials file body that should

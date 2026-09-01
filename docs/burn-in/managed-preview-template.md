@@ -9,15 +9,16 @@ create a Durable Object owned by Pillbox.
 
 The version 3 report contract in
 `cloudflare-spike/testdata/burnin-reconciliation.fixture.json` records one
-genuinely new managed execution. The live recorder performs these steps in
-this order:
+genuinely new managed execution. The release harness performs these steps in
+this order, with Huddles as the only live runtime recorder:
 
 1. reject a managed Codex request during local preflight, before provisioning;
-2. execute one deny-all OpenCode turn;
-3. retry the exact request;
-4. read status twice with `evidence_after` 0 and 100, each limited to 100 events;
-5. finalize the workspace after killing prompt-controlled processes and record
-   the returned result snapshot.
+2. let Huddles execute one deny-all OpenCode turn over its private service binding;
+3. let Huddles retry the exact request;
+4. let Huddles read status twice with `evidence_after` 0 and 100, each limited to
+   100 events, then write the authoritative report-v3 partial;
+5. let Pillbox validate that terminal partial and finalize the same session over
+   scoped public HTTP, attaching the result snapshot to the same report.
 
 The retry and status reads do not claim another execution, write another
 artifact, or emit another Analytics Engine point. Therefore the first reviewed
@@ -138,27 +139,50 @@ npx wrangler deploy -c /private/path/wrangler.burnin.resolved.toml \
   --containers-rollout=none
 ```
 
-Use the short-lived, exact-request capabilities produced from the checked
-OPS-000 bootstrap. Do not put a provider key, workspace credential, or bearer
-token in the manifest or in a committed file. Supply the isolated endpoint and
-tokens through the shell environment, and supply finalize JSON from a protected
-local file:
+First run the real managed-Codex preflight from Pillbox. This phase performs no
+execute, status, or finalize request:
 
 ```sh
-BURNIN_CONFIRM_ISOLATED=1 \
-BURNIN_BASE_URL=https://pillbox-managed-burnin.<preview-domain> \
-BURNIN_EXECUTE_TOKEN=<exact-execute-capability> \
-BURNIN_STATUS_1_TOKEN=<exact-status-capability-1> \
-BURNIN_STATUS_2_TOKEN=<exact-status-capability-2> \
-BURNIN_FINALIZE_TOKEN=<exact-finalize-capability> \
-BURNIN_FINALIZE_REQUEST_FILE=/private/path/finalize.json \
-npm run burnin -- --execute --record /private/path/burnin-report.json
+cd /path/to/pillbox/cloudflare-spike
+BURNIN_MANAGED_PREFLIGHT=/path/to/pillbox/scripts/smoke/managed-agent-preflight.sh \
+npm run burnin -- --preflight \
+  --record /private/path/pillbox-preflight.json
 ```
 
-The Huddles recorder above stays on the private service-binding path. If the
-Pillbox-only public HTTP recorder is used instead, export the exact same local
-secret that was sent to Wrangler so Pillbox mints the request-bound bearer
-capabilities the Worker verifies; do not generate a second HMAC key:
+Next run Huddles with that attachment. Huddles performs the only created execute,
+the exact retry, and both bounded status reads over its authenticated private
+service-binding bridge. It writes the authoritative version 3 partial with
+`capture.cleanup: null`:
+
+```sh
+cd /path/to/huddles
+BURNIN_CONFIRM_ISOLATED=1 \
+PILLBOX_BURNIN_OPERATOR_TOKEN=<huddles-operator-token> \
+CLOUDFLARE_ACCOUNT_ID=<account-id> \
+BURNIN_PILLBOX_PREFLIGHT_FILE=/private/path/pillbox-preflight.json \
+node app/coordinator/scripts/pillbox-managed-burnin.mjs \
+  --execute --record /private/path/burnin-report.json
+```
+
+Only after that command returns terminal positional evidence, run Pillbox
+finalize against the same report and session. This is the separately scoped
+public HTTP boundary; it has no execute or status capability:
+
+```sh
+cd /path/to/pillbox/cloudflare-spike
+BURNIN_CONFIRM_ISOLATED=1 \
+BURNIN_BASE_URL=https://pillbox-managed-burnin.<preview-domain> \
+BURNIN_FINALIZE_TOKEN=<exact-finalize-capability> \
+BURNIN_FINALIZE_REQUEST_FILE=/private/path/finalize.json \
+npm run burnin -- --finalize \
+  --report /private/path/burnin-report.json
+```
+
+Use the short-lived, exact-request capabilities produced from the checked
+OPS-000 bootstrap. Do not put a provider key, workspace credential, or bearer
+token in the manifest, report, or a committed file. If minting the scoped public
+finalize capability locally, export the exact same local secret that was sent to
+Wrangler; do not generate a second HMAC key:
 
 ```sh
 PILLBOX_MANAGED_TOKEN_SECRET="$PB_BURNIN_CAPABILITY_SECRET" \
@@ -166,20 +190,22 @@ PILLBOX_MANAGED_TOKEN_SECRET="$PB_BURNIN_CAPABILITY_SECRET" \
 unset PB_BURNIN_CAPABILITY_SECRET
 ```
 
-Mint only short-lived capabilities for the canonical request bytes. Clear the
-local secret after the required tokens exist; never write it or the bearer
-tokens into the bootstrap tuple, Wrangler metadata, manifest, report, or Git.
+Mint only the short-lived finalize capability for its canonical request bytes.
+Clear the local secret after the token exists; never write it or bearer tokens
+into the bootstrap tuple, Wrangler metadata, manifest, report, or Git.
 
-The exact retry uses the same execute request and capability scope. The Codex
-step is a local preflight and must make zero HTTP requests and zero Sandbox
-provisions. Finalize is the sole cleanup request in this workload; there is no
-separate cancel call. A live response that attempts managed Codex, exceeds a
-status page of 100 events, creates a second artifact, or returns a second
-Analytics point is a failed gate; stop the Worker and preserve the evidence.
+The exact retry reuses the same Huddles invocation and one allowance reservation.
+The Codex step is a local preflight and must make zero HTTP requests and zero
+Sandbox provisions. Pillbox rejects finalize unless the Huddles partial proves
+one created execution, one reused retry, both status pages, immutable positional
+evidence, one artifact, and one cost envelope for the same session. Finalize is
+the sole cleanup request; there is no separate cancel call. A duplicate execute,
+cleanup that predates terminal evidence, a second allowance, an unbounded page,
+a second artifact, or a second Analytics point is a failed gate.
 
 ## Capture and reconcile provider counters
 
-The recorder writes one strict report shape:
+Huddles writes one strict report shape and Pillbox attaches only cleanup:
 
 - `capture.execution_identity` is recomputed from the canonical first execute
   request and seals invocation/idempotency/session identity, request hash,
@@ -190,8 +216,9 @@ The recorder writes one strict report shape:
   (including bytes and digest), and cost reference.
 - `capture.preflight` contains the observed local rejection and zero side-effect
   counters. It has no execution artifact or cost fields.
-- `capture.cleanup` contains the finalize HTTP result, session, and result
-  snapshot. It has no execution artifact or cost fields.
+- Huddles initially writes `capture.cleanup: null`. Pillbox replaces only that
+  field after validating the terminal partial and completing public finalize for
+  the same session. Cleanup has no execution artifact or cost fields.
 
 Copy the report to a private working location, attach the per-run `observed`
 counters, and fill its `capture.read_only` and `capture.totals` objects from the

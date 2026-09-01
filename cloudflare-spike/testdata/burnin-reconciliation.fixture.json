@@ -115,7 +115,7 @@
     ]
   },
   "capture": {
-    "source": "reviewed-fixture",
+    "source": "huddles-managed-burnin",
     "notes": "Replace this deterministic example with the operator-captured counters from the isolated preview before declaring a live burn-in reconciled.",
     "execution_identity": {
       "invocation_id": "burnin-invocation-1",

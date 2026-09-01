@@ -8,7 +8,7 @@
 // Context: doc://pillbox/dx-zero-config-local@0001#dx-zero-config-local
 // Context: doc://pillbox/optimization-external-substrate-primitives@0001#optimization-external-substrate-primitives
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::agents::Integration;
 use crate::cli::{DoneStatus, SessionAction};
@@ -28,8 +28,8 @@ pub(crate) const TAILER_PID_FILE: &str = ".tailer.pid";
 /// docker's always-on transcript tailer). Re-exec'd as a bare subprocess at
 /// bring-up (`pillbox __session-tailer <dir> <capture> <source> <sid>`), it tails
 /// the guest's persistent capture file → maps → appends to the durable log
-/// FOREVER (until SIGTERM on teardown). This keeps the log continuously live for a
-/// reparented agent the CLI doesn't supervise, so EVERY consumer — `list`/
+/// until SIGTERM on teardown or the nested producer terminates. This keeps the log
+/// continuously live for a reparented agent the CLI doesn't supervise, so EVERY consumer — `list`/
 /// `diagnose`/`subscribe` and the webhook/OTLP exporters — reads fresh data with
 /// no explicit drain. Takes paths (not a `Pillbox`) since the child has no cwd
 /// context. Sole producer: `subscribe`/`ingest` defer while it's alive.
@@ -53,7 +53,7 @@ pub(crate) fn run_detached_tailer(
             // The rollout path does not exist until the PTY agent starts. The
             // typed source explicitly selects discovery; the capture path's
             // current filesystem type carries no orchestration semantics.
-            let _tailer = events::transcripts::spawn_attach_tailer(
+            let tailer = events::transcripts::spawn_attach_tailer(
                 log,
                 &capture,
                 harness.agent_id(),
@@ -61,9 +61,7 @@ pub(crate) fn run_detached_tailer(
                 &sid,
             )
             .ok_or_else(|| anyhow::anyhow!("detached transcript tailer is unavailable"))?;
-            loop {
-                std::thread::park();
-            }
+            wait_for_discover_tailer(tailer)?;
         }
         crate::agents::DetachedTranscriptSource::ServerCapture(format) => {
             // `stop` is never set in-process — the producer runs until the
@@ -75,6 +73,16 @@ pub(crate) fn run_detached_tailer(
         }
     }
     Ok(())
+}
+
+/// Couple the detached process lifetime to the file producer it advertises via
+/// `.tailer.pid`. A normal producer stays joined until teardown; any terminal
+/// result returns to `main`, which exits the process and makes signal-0 health
+/// truthful so readers can start the normal replacement tailer.
+fn wait_for_discover_tailer(tailer: events::transcripts::TailerHandle) -> Result<()> {
+    tailer
+        .wait()
+        .context("detached transcript discovery producer terminated")
 }
 
 /// The pid of a session's detached §0 producer, if its pid file is present, parseable, and positive.
@@ -1474,6 +1482,58 @@ pub(crate) fn validate_session_id(id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn discover_watcher_failure_exits_process_and_allows_replacement() {
+        const CHILD_ENV: &str = "PILLBOX_TEST_TRANSCRIPT_PRODUCER_FAILURE_CHILD";
+        const CHILD_EXIT: i32 = 73;
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let tailer = events::transcripts::TailerHandle::finished_for_test(Err(
+                anyhow::anyhow!("synthetic transcript watcher failure"),
+            ));
+            let error = wait_for_discover_tailer(tailer)
+                .expect_err("synthetic watcher termination must fail the producer");
+            eprintln!("{error:#}");
+            std::process::exit(CHILD_EXIT);
+        }
+
+        crate::test_util::with_isolated_home("session-transcript-health", || {
+            let resolved = crate::pillbox::global();
+            let session = session::Session::test_fixture();
+            session::write(&resolved, &session).unwrap();
+            let session_dir = session::session_dir(&resolved, &session.id).unwrap();
+
+            let current_test = std::env::current_exe().unwrap();
+            let test_name =
+                "commands::session::tests::discover_watcher_failure_exits_process_and_allows_replacement";
+            let child = std::process::Command::new(current_test)
+                .args(["--exact", test_name, "--nocapture"])
+                .env(CHILD_ENV, "1")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let pid = child.id() as i32;
+            std::fs::write(session_dir.join(TAILER_PID_FILE), pid.to_string()).unwrap();
+
+            let output = child.wait_with_output().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(CHILD_EXIT), "stderr: {stderr}");
+            assert!(
+                stderr.contains("detached transcript discovery producer terminated")
+                    && stderr.contains("synthetic transcript watcher failure"),
+                "terminal error must retain lifecycle and watcher context: {stderr}"
+            );
+
+            // The stale pid stamp remains, but the exited subprocess must not be
+            // treated as the sole producer. The normal live-reader path is now
+            // eligible to start its replacement tailer.
+            assert_eq!(tailer_pid(&session_dir), Some(pid));
+            assert!(!detached_tailer_alive(&resolved, &session));
+        });
+    }
 
     #[test]
     fn model_profile_contract_session_json_projects_sourced_runtime_evidence() {

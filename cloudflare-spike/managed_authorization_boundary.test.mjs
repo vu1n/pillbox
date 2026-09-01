@@ -96,7 +96,7 @@ test("managed runtime is v2-only and authorizes every lifecycle operation", asyn
       contract_version: "pillbox.execution/2",
       session_ref: { session_id: "generic-session" },
       invocation_id: "generic-invocation",
-      idempotency_key: "generic-delivery",
+      idempotency_key: "generic-invocation",
       rendered_input: "Return one generic boundary probe.",
       rendered_input_hash: digest("Return one generic boundary probe."),
       tool_policy: "deny_all",
@@ -123,6 +123,22 @@ test("managed runtime is v2-only and authorizes every lifecycle operation", asyn
       "execute",
       executeRequest,
       "generic-grant-execute",
+    );
+    const noncanonicalExecuteRequest = {
+      ...executeRequest,
+      idempotency_key: "generic-delivery",
+    };
+
+    await assert.rejects(
+      callPrivate(caller, "/execute", {
+        request: noncanonicalExecuteRequest,
+        authorization: signedAuthorization(
+          "execute",
+          noncanonicalExecuteRequest,
+          "noncanonical-execute-identity",
+        ),
+      }),
+      /idempotency_key must equal invocation_id/,
     );
 
     await assert.rejects(
@@ -199,9 +215,24 @@ test("managed runtime is v2-only and authorizes every lifecycle operation", asyn
     const cancelRequest = {
       contract_version: "pillbox.execution/2",
       invocation_id: executeRequest.invocation_id,
-      idempotency_key: "generic-cancel",
+      idempotency_key: executeRequest.invocation_id,
       reason: "boundary probe complete",
     };
+    const noncanonicalCancelRequest = {
+      ...cancelRequest,
+      idempotency_key: "generic-cancel",
+    };
+    await assert.rejects(
+      callPrivate(caller, "/cancel", {
+        request: noncanonicalCancelRequest,
+        authorization: signedAuthorization(
+          "cancel",
+          noncanonicalCancelRequest,
+          "noncanonical-cancel-identity",
+        ),
+      }),
+      /idempotency_key must equal invocation_id/,
+    );
     const cancelled = await callPrivate(caller, "/cancel", {
       request: cancelRequest,
       authorization: signedAuthorization("cancel", cancelRequest, "grant-cancel"),
@@ -215,7 +246,11 @@ test("managed runtime is v2-only and authorizes every lifecycle operation", asyn
     );
     await assert.rejects(
       callPrivate(caller, "/cancel", {
-        request: { ...cancelRequest, invocation_id: "never-persisted" },
+        request: {
+          ...cancelRequest,
+          invocation_id: "never-persisted",
+          idempotency_key: "never-persisted",
+        },
       }),
       /operation authorization is invalid/,
     );

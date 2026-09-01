@@ -87,7 +87,7 @@ test("legacy Huddles invocation translates only execution-owned fields", async (
   });
 
   assert.equal(translated.contract_version, "pillbox.execution/2");
-  assert.equal(translated.idempotency_key, "delivery-1");
+  assert.equal(translated.idempotency_key, "invocation-1");
   assert.equal(translated.execution.transport.harness, "opencode");
   assert.equal(translated.execution.transport.transport, "http");
   assert.equal(translated.execution.requested.provider, "openai");

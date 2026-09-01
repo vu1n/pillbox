@@ -6,8 +6,10 @@ import {
   type ExecuteInvocationV2ErrorCode,
   type ExecuteInvocationV2Request,
   type ExecuteInvocationV2Result,
+  type CompletedExecutionResultSessionRef,
   type ExecutionAttribution,
   type ExecutionEvidencePage,
+  type ExecutionResultSessionRef,
   type GetInvocationV2Request,
   type JsonValue,
   MAX_EVIDENCE_PAGE_SIZE,
@@ -49,6 +51,24 @@ import {
 } from "./run_cost.js";
 
 export const EXECUTION_OWNER_LEASE_MS = 10 * 60 * 1_000;
+
+const MISSING_POSITIONAL_EVIDENCE_ERROR = {
+  code: "runtime_failed",
+  message: "Pillbox managed invocation completed without immutable positional evidence",
+} as const;
+
+type ExecutionTerminal =
+  | {
+      readonly status: "completed";
+      readonly output: { readonly text?: string; readonly json?: JsonValue };
+    }
+  | {
+      readonly status: "failed" | "cancelled" | "interrupted";
+      readonly error: {
+        readonly code: ExecuteInvocationV2ErrorCode;
+        readonly message: string;
+      };
+    };
 
 export interface RuntimeTurnResult {
   readonly served_model: string | null;
@@ -334,11 +354,10 @@ export class ExecutionService {
       throw new Error(`terminal execution '${record.invocation_id}' has no artifact`);
     }
     const artifact = await this.artifacts.read(record.artifact_ref);
-    const stored = artifact.terminal_result as unknown as ExecuteInvocationV2Result;
+    const stored = this.terminalWithSessionRef(record, artifact);
     return {
       ...stored,
       disposition: "reused",
-      session_ref: this.positionalSessionRef(record.session_id, artifact.evidence.length),
       evidence: evidencePage(artifact, record, cursor.after, cursor.limit),
       ...(artifact.cost === undefined
         ? {}
@@ -374,23 +393,27 @@ export class ExecutionService {
 
   private async finishTerminal(
     record: ExecutionRecord,
-    terminal:
-      | { readonly status: "completed"; readonly output: { readonly text?: string; readonly json?: JsonValue } }
-      | {
-          readonly status: "failed" | "cancelled" | "interrupted";
-          readonly error: { readonly code: ExecuteInvocationV2ErrorCode; readonly message: string };
-        },
+    terminal: ExecutionTerminal,
     evidence: readonly JsonValue[],
     attribution: ExecutionAttribution,
     disposition: "created" | "reused",
   ): Promise<ExecuteInvocationV2Result | null> {
-    const placeholder = {
-      ...baseResult(record, attribution, emptyEvidence(0), disposition),
-      session_ref: this.positionalSessionRef(record.session_id, evidence.length),
-      ...terminal,
-    } satisfies ExecuteInvocationV2Result;
+    const outcome = terminalOutcome(terminal, evidence.length);
+    const base = baseResult(record, attribution, emptyEvidence(0), disposition);
+    const placeholder: ExecuteInvocationV2Result =
+      outcome.status === "completed"
+        ? {
+            ...base,
+            session_ref: this.completedSessionRef(record.session_id, evidence.length),
+            ...outcome,
+          }
+        : {
+            ...base,
+            session_ref: this.positionalSessionRef(record.session_id, evidence.length),
+            ...outcome,
+          };
     this.costMeter?.observeEvidence(evidence);
-    const cost = this.costMeter?.terminal(terminal.status, {
+    const cost = this.costMeter?.terminal(outcome.status, {
       sandbox_duration_ms: Math.max(0, this.now() - record.created_at_ms),
       sandbox_profile: this.sandboxProfile,
       planned_d1_terminal_writes: 1,
@@ -414,11 +437,7 @@ export class ExecutionService {
       artifact = cause.existing;
       artifactRef = cause.existing_ref;
     }
-    const storedTerminal = terminalResult(artifact, record);
-    const stored = {
-      ...storedTerminal,
-      session_ref: this.positionalSessionRef(record.session_id, artifact.evidence.length),
-    };
+    const stored = this.terminalWithSessionRef(record, artifact);
     const finished = await this.store.finish({
       invocation_id: record.invocation_id,
       request_hash: record.request_hash,
@@ -512,13 +531,54 @@ export class ExecutionService {
   private positionalSessionRef(
     session_id: string,
     evidenceLength: number,
-  ): {
-    readonly session_id: string;
-    readonly seq_range?: readonly [number, number];
-  } {
+  ): ExecutionResultSessionRef {
     return evidenceLength === 0
       ? { session_id }
       : { session_id, seq_range: [0, evidenceLength - 1] };
+  }
+
+  private completedSessionRef(
+    session_id: string,
+    evidenceLength: number,
+  ): CompletedExecutionResultSessionRef {
+    if (evidenceLength === 0) {
+      throw new Error("completed execution has no immutable positional evidence");
+    }
+    return { session_id, seq_range: [0, evidenceLength - 1] };
+  }
+
+  private terminalWithSessionRef(
+    record: ExecutionRecord,
+    artifact: ExecutionArtifact,
+  ): Extract<
+    ExecuteInvocationV2Result,
+    { readonly status: "completed" | "failed" | "cancelled" | "interrupted" }
+  > {
+    const terminal = terminalResult(artifact, record);
+    if (terminal.status === "completed" && artifact.evidence.length === 0) {
+      const { output: _output, ...base } = terminal;
+      return {
+        ...base,
+        status: "failed",
+        session_ref: this.positionalSessionRef(record.session_id, 0),
+        error: MISSING_POSITIONAL_EVIDENCE_ERROR,
+      };
+    }
+    return terminal.status === "completed"
+      ? {
+          ...terminal,
+          session_ref: this.completedSessionRef(
+            record.session_id,
+            artifact.evidence.length,
+          ),
+        }
+      : {
+          ...terminal,
+          session_ref: this.positionalSessionRef(
+            record.session_id,
+            artifact.evidence.length,
+          ),
+        };
   }
 }
 
@@ -700,6 +760,15 @@ function errorStatus(
   if (code === "cancelled") return "cancelled";
   if (code === "runtime_interrupted") return "interrupted";
   return "failed";
+}
+
+function terminalOutcome(
+  terminal: ExecutionTerminal,
+  evidenceLength: number,
+): ExecutionTerminal {
+  return terminal.status === "completed" && evidenceLength === 0
+    ? { status: "failed", error: MISSING_POSITIONAL_EVIDENCE_ERROR }
+    : terminal;
 }
 
 function emptyEvidence(from: number): ExecutionEvidencePage {

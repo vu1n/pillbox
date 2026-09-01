@@ -64,7 +64,7 @@ async function request(
     contract_version: "pillbox.execution/2",
     session_ref: { session_id: "session-1" },
     invocation_id: "invocation-1",
-    idempotency_key: "delivery-1",
+    idempotency_key: "invocation-1",
     rendered_input,
     rendered_input_hash: await computeRenderedInputHash(rendered_input),
     tool_policy: "deny_all",
@@ -145,6 +145,40 @@ test("created execution persists terminal evidence and exact retry does not resa
   assert.equal(authorizationChecks, 2, "exact retry is reauthorized before D1 reuse");
 });
 
+test("zero-event runtime success becomes a typed terminal failure", async () => {
+  const service = new ExecutionService(
+    new MemoryStore(),
+    new MemoryArtifacts(),
+    new FakeRuntime({
+      served_model: "zai-coding-plan/glm-4.5-air",
+      output: { text: "unattested output" },
+      evidence: [],
+    }),
+    {
+      ...fixedOptions(),
+      costMeter: new RunCostMeter(),
+    },
+  );
+
+  const input = await request();
+  const result = await service.executeInvocation(input);
+  assert.equal(result.status, "failed");
+  if (result.status === "failed") {
+    assert.equal(result.error.code, "runtime_failed");
+    assert.match(result.error.message, /without immutable positional evidence/);
+  }
+  assert.equal(result.session_ref.seq_range, undefined);
+  assert.deepEqual(result.evidence.events, []);
+  assert.equal(result.cost?.status, "failed");
+  assert.equal(result.cost?.model.input_tokens, 0);
+  assert.equal(result.cost?.model.output_tokens, 0);
+
+  const reused = await service.executeInvocation(input);
+  assert.equal(reused.status, "failed");
+  assert.equal(reused.disposition, "reused");
+  assert.equal(reused.session_ref.seq_range, undefined);
+});
+
 test("execute, status, and cancel authorization failures precede every persistence access", async () => {
   const operations: string[] = [];
   const never = (): never => {
@@ -178,7 +212,7 @@ test("execute, status, and cancel authorization failures precede every persisten
     service.cancelInvocation({
       contract_version: "pillbox.execution/2",
       invocation_id: input.invocation_id,
-      idempotency_key: "cancel-denied",
+      idempotency_key: input.invocation_id,
       reason: "test",
     }),
     /denied cancel/,
@@ -359,7 +393,11 @@ test("concurrent exact retry observes running and never samples twice", async ()
   assert.equal(retry.session_ref.seq_range, undefined);
   assert.equal(runtime.executions, 1);
 
-  pending.resolve({ served_model: null, output: { text: "done" }, evidence: [] });
+  pending.resolve({
+    served_model: null,
+    output: { text: "done" },
+    evidence: [{ type: "message_delta", text: "done" }],
+  });
   assert.equal((await first).status, "completed");
 });
 
@@ -395,7 +433,7 @@ test("an immutable terminal artifact repairs a lost D1 terminal write", async ()
     new FakeRuntime({
       served_model: "zai-coding-plan/glm-4.5-air",
       output: { text: "done" },
-      evidence: [],
+      evidence: [{ type: "message_delta", text: "done" }],
     }),
     {
       now: () => now,
@@ -473,7 +511,7 @@ test("cancellation terminalizes once and exact retries read the same result", as
   const cancel = {
     contract_version: "pillbox.execution/2",
     invocation_id: input.invocation_id,
-    idempotency_key: "cancel-1",
+    idempotency_key: input.invocation_id,
     reason: "caller stopped the run",
   } as const;
 
@@ -508,7 +546,7 @@ test("disabled admission still permits status, cancellation, and terminal drain"
   const cancelled = await service.cancelInvocation({
     contract_version: "pillbox.execution/2",
     invocation_id: input.invocation_id,
-    idempotency_key: "cancel-disabled-1",
+    idempotency_key: input.invocation_id,
     reason: "cost circuit breaker",
   });
   assert.equal(cancelled.status, "cancelled");

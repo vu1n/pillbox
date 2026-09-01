@@ -219,7 +219,7 @@ export function legacyExecutionRequest(
     contract_version: "pillbox.execution/2",
     session_ref: { session_id: request.session_ref.session_id },
     invocation_id: request.invocation_id,
-    idempotency_key: request.delivery_receipt_id,
+    idempotency_key: request.invocation_id,
     rendered_input: request.rendered_input,
     rendered_input_hash: request.rendered_input_hash as `sha256:${string}`,
     tool_policy: request.tool_policy,

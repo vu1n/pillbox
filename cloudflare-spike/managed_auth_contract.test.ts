@@ -1,5 +1,21 @@
 import assert from "node:assert/strict";
+import { registerHooks } from "node:module";
 import { test } from "node:test";
+
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    return nextResolve(
+      context.parentURL?.includes("/cloudflare-spike/src/") &&
+        specifier.startsWith(".") &&
+        specifier.endsWith(".js")
+        ? `${specifier.slice(0, -3)}.ts`
+        : specifier,
+      context,
+    );
+  },
+});
+
+const { executionOperationRequestDigest } = await import("./src/managed_auth.ts");
 import {
   managedCanonicalJson,
   makeExecutionOperationGrantCurrentnessRequest,
@@ -100,4 +116,21 @@ test("operation grant issue requests are operation-scoped and bounded", () => {
     () => validateExecutionOperationGrantIssueRequest({ ...issue, ttl_seconds: 301 }),
     /ttl_seconds/,
   );
+});
+
+test("operation authorization digest binds the canonical invocation idempotency key", async () => {
+  const request = {
+    contract_version: "pillbox.execution/2",
+    invocation_id: "inv-1",
+    idempotency_key: "inv-1",
+    reason: "operator requested cancellation",
+  } as const;
+  const canonical = await executionOperationRequestDigest(request);
+  const noncanonical = await executionOperationRequestDigest({
+    ...request,
+    idempotency_key: "cancel-delivery-1",
+  });
+
+  assert.match(canonical, /^sha256:[0-9a-f]{64}$/);
+  assert.notEqual(noncanonical, canonical);
 });

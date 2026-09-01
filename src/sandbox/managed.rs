@@ -28,14 +28,14 @@
 //!
 //! ## Security boundary implemented
 //!
-//!   - **R2 key scoping.** When `PILLBOX_R2_CF_API_TOKEN` is set, `run` mints a
+//!   - **R2 key scoping.** `PILLBOX_R2_CF_API_TOKEN` is required; `run` mints a
 //!     short-lived, prefix-scoped R2 temp credential ([`r2_scope`], fresh per
 //!     transfer) and hands the managed runtime *that*, so a credential reaching
 //!     CF can touch only this run's prefix — and the bucket-wide parent *secret* never crosses
-//!     to CF (the Bearer API token authorizes the mint). With no token configured
-//!     the parent key still travels, but the exposure is announced loudly rather
-//!     than silently. The DO forwards the credential's `session_token` into the
-//!     container helper, which sends it as `X-Amz-Security-Token`.
+//!     to CF (the Bearer API token authorizes the mint). Missing authority or a
+//!     failed mint aborts before provisioning. The DO forwards the credential's
+//!     `session_token` into the container helper, which sends it as
+//!     `X-Amz-Security-Token`.
 //!
 //! ## Open follow-ups (flagged, not faked)
 //!
@@ -1376,12 +1376,15 @@ mod r2_scope {
     /// token swapped in. Fail-closed — a non-`success` envelope or any missing /
     /// empty credential field is an error, never a partial credential.
     fn parse_scoped(body: &str, parent: &S3Config) -> Result<S3Config> {
-        let env: TempCredEnvelope = serde_json::from_str(body)
-            .with_context(|| format!("parse R2 temp-credential response: {body}"))?;
+        let env: TempCredEnvelope =
+            serde_json::from_str(body).context("parse R2 temp-credential response")?;
         if !env.success {
             return Err(PillboxError::runtime(
                 "run",
-                format!("R2 temp-credential mint failed: {:?}", env.errors),
+                format!(
+                    "R2 temp-credential mint was rejected by Cloudflare ({} error(s))",
+                    env.errors.len()
+                ),
             )
             .into());
         }
@@ -1456,7 +1459,7 @@ mod r2_scope {
         if !status.is_success() {
             return Err(PillboxError::runtime(
                 "run",
-                format!("R2 temp-credential mint returned HTTP {status}: {text}"),
+                format!("R2 temp-credential mint returned HTTP {status}"),
             )
             .into());
         }
@@ -1632,9 +1635,13 @@ mod r2_scope {
 
         #[test]
         fn parse_scoped_fails_closed_on_unsuccess_or_missing_fields() {
-            let failed = r#"{"success":false,"errors":[{"message":"bad token"}],"result":null}"#;
-            assert!(parse_scoped(failed, &parent()).is_err());
-            assert!(parse_scoped("not-json", &parent()).is_err());
+            let failed = r#"{"success":false,"errors":[{"message":"SENSITIVE"}],"result":null}"#;
+            let err = parse_scoped(failed, &parent()).expect_err("rejection must fail");
+            assert!(!err.to_string().contains("SENSITIVE"));
+
+            let malformed = r#"{"result":{"secretAccessKey":"SENSITIVE"}"#;
+            let err = parse_scoped(malformed, &parent()).expect_err("malformed JSON must fail");
+            assert!(!err.to_string().contains("SENSITIVE"));
             // success but a blank credential field is not a usable credential.
             let blank = r#"{"success":true,"errors":[],
                 "result":{"accessKeyId":"TMP_AK","secretAccessKey":"  ","sessionToken":"TMP_ST"}}"#;

@@ -53,12 +53,38 @@ views. Cloudflare account budget alerts are daily projected-spend safeguards,
 not real-time per-product circuit breakers, so the application kill switch is
 still mandatory.
 
+## Managed preview cost controls
+
+The fixed managed-preview burn-in is deliberately limited to one genuinely new
+execution. An exact retry reuses the D1 claim and immutable R2 artifact; bounded
+status pages are read-only; unsupported managed Codex is rejected before
+Sandbox provisioning; finalize is a separate kill-before-transfer operation.
+The first environment therefore seeds `MANAGED_EXECUTION_LIMIT = 1` and the
+matching `MANAGED_EXECUTION_EPOCH` after migration 0002. The D1 allowance is the
+hard application breaker, does not auto-reset, and is reseeded only as a new
+operator-reviewed epoch. `MANAGED_EXECUTION_ENABLED = 0` remains the default
+kill switch and does not affect local libkrun Pillbox.
+
+For every captured `RunCostEnvelope`, compare the per-run units and profile with
+the same invocation's D1, R2, Container, Worker, Analytics Engine, and vendor
+Sandbox/DO counters. Reconcile retry/status/finalize read-only activity in a
+separate bounded counter set; never explain a second artifact, Analytics point,
+or model turn as a retry. Fail closed on an unexplained delta, a status page
+larger than 100 events, more than one artifact/Analytics point per new run, a
+custom DO class, or any custom DO storage growth. The executable fixture and
+operator report template are in
+[docs/burn-in/managed-preview-template.md](burn-in/managed-preview-template.md).
+
 For each environment, record an absolute monthly cap and configure alerts at:
 
 - **low — 50%:** investigate the top run profiles and reconcile counters;
 - **medium — 75%:** stop nonessential preview/benchmark traffic;
 - **emergency — 90%:** disable managed execution with the kill switch and keep
   local Pillbox available.
+
+These Cloudflare budget alerts are informational and account-wide; they do not
+cap usage and must not be treated as a real-time breaker. The D1 allowance and
+the explicit admission switch are the enforceable controls.
 
 The release owner records the account, cap, alert recipients, and kill-switch
 command in the private deployment runbook; secrets and account identifiers do

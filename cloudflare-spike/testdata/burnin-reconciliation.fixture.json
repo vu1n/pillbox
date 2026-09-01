@@ -1,0 +1,273 @@
+{
+  "schema_version": 1,
+  "deployment": {
+    "worker_name": "pillbox-managed-burnin",
+    "container_class": "Sandbox",
+    "allowance_epoch": "burnin-2026-09-01-v1",
+    "managed_execution_enabled": "1",
+    "managed_execution_limit": 1,
+    "reviewed_new_execution_count": 1,
+    "reserved_executions": 1,
+    "custom_durable_object_classes": []
+  },
+  "workload": {
+    "expected_network_requests": 5,
+    "steps": [
+      {
+        "id": "first-execute",
+        "operation": "execute",
+        "invocation_id": "burnin-invocation-1",
+        "request": {
+          "contract_version": "pillbox.execution/2",
+          "session_ref": { "session_id": "burnin-session-1" },
+          "invocation_id": "burnin-invocation-1",
+          "idempotency_key": "burnin-delivery-1",
+          "rendered_input": "Return exactly a JSON object with key \"ok\" set to true.",
+          "rendered_input_hash": "sha256:7c1a327ad525b4b19bfb4e4940939f9ccd8e3783cd8d2b23b81f04a2ff26667b",
+          "tool_policy": "deny_all",
+          "execution": {
+            "transport": {
+              "harness": "opencode",
+              "transport": "http",
+              "harness_version": "opencode/managed-burnin",
+              "adapter_revision": "pillbox/burnin-v1"
+            },
+            "requested": {
+              "provider": "zai-coding-plan",
+              "model": "glm-4.5-air",
+              "profile": null,
+              "reasoning_effort": "high"
+            },
+            "placement": "managed_container",
+            "context_renderer_revision": "huddles/burnin-v1"
+          },
+          "execution_policy_revision": "managed/burnin-v1",
+          "output_format": {
+            "type": "json_schema",
+            "schema": {
+              "type": "object",
+              "properties": { "ok": { "type": "boolean" } },
+              "required": ["ok"],
+              "additionalProperties": false
+            },
+            "retry_count": 2
+          }
+        },
+        "expected": {
+          "status": "completed",
+          "disposition": "created",
+          "allowance_reservation": 1
+        }
+      },
+      {
+        "id": "exact-retry",
+        "operation": "execute",
+        "request_ref": "first-execute",
+        "expected": {
+          "status": "completed",
+          "disposition": "reused",
+          "new_model_turns": 0,
+          "allowance_reservation_delta": 0
+        }
+      },
+      {
+        "id": "status-page-1",
+        "operation": "status",
+        "invocation_id": "burnin-invocation-1",
+        "evidence_after": 0,
+        "evidence_limit": 100,
+        "expected": { "status": "completed", "bounded": true }
+      },
+      {
+        "id": "status-page-2",
+        "operation": "status",
+        "invocation_id": "burnin-invocation-1",
+        "evidence_after": 100,
+        "evidence_limit": 100,
+        "expected": { "status": "completed", "bounded": true }
+      },
+      {
+        "id": "unsupported-managed-codex",
+        "operation": "managed_codex_preflight",
+        "invocation_id": "burnin-codex-preflight",
+        "execution": {
+          "harness": "codex",
+          "transport": "app_server",
+          "placement": "managed_container"
+        },
+        "expected": {
+          "error_code": "unsupported_execution",
+          "provision_attempts": 0,
+          "network_requests": 0
+        }
+      },
+      {
+        "id": "finalize",
+        "operation": "workspace_finalize",
+        "session_id": "burnin-session-1",
+        "requires_operator_request": true,
+        "expected": {
+          "requests": 1,
+          "kill_before_transfer": true,
+          "result_snapshot_required": true
+        }
+      }
+    ]
+  },
+  "capture": {
+    "source": "reviewed-fixture",
+    "notes": "Replace this deterministic example with the operator-captured counters from the isolated preview before declaring a live burn-in reconciled.",
+    "responses": [
+      {
+        "step_id": "first-execute",
+        "invocation_id": "burnin-invocation-1",
+        "status": "completed",
+        "disposition": "created",
+        "request_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "artifact_key": "executions/burnin-invocation-1.json",
+        "cost_ref": "run-1"
+      },
+      {
+        "step_id": "exact-retry",
+        "invocation_id": "burnin-invocation-1",
+        "status": "completed",
+        "disposition": "reused",
+        "request_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "artifact_key": "executions/burnin-invocation-1.json",
+        "cost_ref": "run-1"
+      },
+      {
+        "step_id": "status-page-1",
+        "invocation_id": "burnin-invocation-1",
+        "status": "completed",
+        "disposition": "reused",
+        "request_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "artifact_key": "executions/burnin-invocation-1.json",
+        "cost_ref": "run-1"
+      },
+      {
+        "step_id": "status-page-2",
+        "invocation_id": "burnin-invocation-1",
+        "status": "completed",
+        "disposition": "reused",
+        "request_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "artifact_key": "executions/burnin-invocation-1.json",
+        "cost_ref": "run-1"
+      }
+    ],
+    "run_cost_envelopes": [
+      {
+        "id": "run-1",
+        "invocation_id": "burnin-invocation-1",
+        "artifact_count": 1,
+        "analytics_point_count": 1,
+        "cost": {
+          "version": 1,
+          "status": "completed",
+          "model": {
+            "input_tokens": 24,
+            "output_tokens": 12,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "provider_reported_cost_usd": 0.001
+          },
+          "infrastructure": {
+            "d1_rows_read": 0,
+            "d1_rows_written": 2,
+            "r2_reads": 0,
+            "r2_writes": 1,
+            "r2_bytes_read": 0,
+            "r2_bytes_written": 672,
+            "analytics_points_written": 1,
+            "sandbox_duration_ms": 2500,
+            "sandbox_profile": "standard-2"
+          },
+          "known_cost_usd": 0.001,
+          "estimated_total_cost_usd": null,
+          "rate_card_version": null
+        },
+        "observed": {
+          "d1": { "rows_read": 0, "rows_written": 2 },
+          "r2": {
+            "reads": 0,
+            "writes": 1,
+            "bytes_read": 0,
+            "bytes_written": 672
+          },
+          "container": {
+            "instances_started": 1,
+            "duration_ms": 2500,
+            "profile": "standard-2",
+            "cleanup_calls": 0
+          },
+          "worker": { "requests": 1 },
+          "analytics_engine": { "points_written": 1 },
+          "vendor_sandbox_do": {
+            "class_name": "Sandbox",
+            "instances_started": 1,
+            "storage_reads": 0,
+            "storage_writes": 0,
+            "stored_bytes_before": 0,
+            "stored_bytes_after": 0,
+            "custom_classes": [],
+            "custom_storage_bytes_delta": 0
+          }
+        }
+      }
+    ],
+    "read_only": {
+      "d1": { "rows_read": 3, "rows_written": 0 },
+      "r2": {
+        "reads": 3,
+        "writes": 0,
+        "bytes_read": 2016,
+        "bytes_written": 0
+      },
+      "container": {
+        "instances_started": 0,
+        "duration_ms": 0,
+        "profile": "standard-2",
+        "cleanup_calls": 1
+      },
+      "worker": { "requests": 4 },
+      "analytics_engine": { "points_written": 0 },
+      "vendor_sandbox_do": {
+        "class_name": "Sandbox",
+        "instances_started": 0,
+        "storage_reads": 0,
+        "storage_writes": 0,
+        "stored_bytes_before": 0,
+        "stored_bytes_after": 0,
+        "custom_classes": [],
+        "custom_storage_bytes_delta": 0
+      }
+    },
+    "totals": {
+      "d1": { "rows_read": 3, "rows_written": 2 },
+      "r2": {
+        "reads": 3,
+        "writes": 1,
+        "bytes_read": 2016,
+        "bytes_written": 672
+      },
+      "container": {
+        "instances_started": 1,
+        "duration_ms": 2500,
+        "profile": "standard-2",
+        "cleanup_calls": 1
+      },
+      "worker": { "requests": 5 },
+      "analytics_engine": { "points_written": 1 },
+      "vendor_sandbox_do": {
+        "class_name": "Sandbox",
+        "instances_started": 1,
+        "storage_reads": 0,
+        "storage_writes": 0,
+        "stored_bytes_before": 0,
+        "stored_bytes_after": 0,
+        "custom_classes": [],
+        "custom_storage_bytes_delta": 0
+      }
+    }
+  }
+}

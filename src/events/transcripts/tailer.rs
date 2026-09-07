@@ -346,10 +346,18 @@ impl Tailer {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
             Err(e) => return Err(e).with_context(|| format!("open {}", self.path.display())),
         };
-        let len = file
+        let metadata = file
             .metadata()
-            .with_context(|| format!("stat {}", self.path.display()))?
-            .len();
+            .with_context(|| format!("stat {}", self.path.display()))?;
+        if self.cursor.as_ref().is_some_and(|cursor| {
+            metadata.dev() != cursor.position.device || metadata.ino() != cursor.position.inode
+        }) {
+            anyhow::bail!(
+                "detached transcript {} changed file identity behind its durable cursor",
+                self.path.display()
+            );
+        }
+        let len = metadata.len();
         if len < self.offset {
             if self.cursor.is_some() {
                 anyhow::bail!(
@@ -843,6 +851,56 @@ mod tests {
             )
             .unwrap();
             assert_eq!(replacement.pump().unwrap(), 1);
+        });
+    }
+
+    #[test]
+    fn durable_cursor_rejects_same_path_with_changed_file_identity() {
+        crate::test_util::with_isolated_home("tailer-durable-replaced-rollout", || {
+            let pb = crate::pillbox::global();
+            let session_id = "sess-replaced-rollout";
+            let session_dir = crate::session::session_dir(&pb, session_id).unwrap();
+            let cursor_path = session_dir.join(".tailer-cursor.json");
+            let transcript = session_dir.join("rollout-test.jsonl");
+            let first = codex_complete("one", "first");
+            std::fs::write(&transcript, format!("{first}\n")).unwrap();
+
+            let mut tailer = Tailer::new_durable(
+                transcript.clone(),
+                session_id.into(),
+                Harness::Codex,
+                true,
+                SessionLog::open(&pb, session_id).unwrap(),
+                cursor_path.clone(),
+            )
+            .unwrap();
+            assert_eq!(tailer.pump().unwrap(), 1);
+            let committed = read_cursor(&cursor_path, session_id).unwrap().unwrap();
+
+            // Keep the old inode alive under another name so the new file at the
+            // rollout path cannot reuse it. A longer replacement proves identity
+            // is checked before the length/offset fast paths.
+            std::fs::rename(&transcript, session_dir.join("old-rollout.jsonl")).unwrap();
+            let replacement = format!(
+                "{}\n{}\n",
+                codex_complete("two", "replacement"),
+                codex_complete("three", "longer replacement")
+            );
+            assert!(replacement.len() as u64 >= committed.position().offset);
+            std::fs::write(&transcript, replacement).unwrap();
+
+            let error = tailer
+                .pump()
+                .expect_err("a replaced rollout must not inherit the prior cursor");
+            assert!(error.to_string().contains("changed file identity"));
+            assert_eq!(
+                read_cursor(&cursor_path, session_id)
+                    .unwrap()
+                    .unwrap()
+                    .position(),
+                committed.position(),
+                "rejection must not advance the durable cursor"
+            );
         });
     }
 

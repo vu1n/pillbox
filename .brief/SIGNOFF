@@ -125,3 +125,7 @@ managed-tier-do-gateway conforms: PB-024 replaces only a literal-only formatting
 managed-store-of-record conforms: PB-024 is a strict-Clippy gate repair in transfer validation; rustic-over-R2 remains the authoritative workspace store and handle space.
 session-event-log-spine conforms: BND-001 bounds untrusted local transcript discovery and records plus durable log records, while preserving the flock-serialized per-session sequence authority, exact append-prefix crash recovery, and fail-loud immutable history.
 dx-zero-config-local conforms: BND-001 keeps every reader on the same zero-config local session log and changes only bounded producer admission and append/replay implementation work.
+libkrun-is-the-backend conforms: IMG-001 preserves the complete pinned Codex native package in the OCI rootfs consumed by libkrun; it adds no backend or changes backend selection.
+docker-backend-deleted conforms: IMG-001 changes only runner image/build packaging, which remains the permitted Docker role; it adds no Docker agent-runtime feature.
+runner-image-tags-name-roles conforms: IMG-001 leaves CODEX_VERSION pinned and changes no dev/latest/vX.Y.Z tag role or image selection.
+docs-governance conforms: IMG-001 documents the stable Codex package layout and companion verification in the canonical runner-image guide, matching the Dockerfile and build gate.

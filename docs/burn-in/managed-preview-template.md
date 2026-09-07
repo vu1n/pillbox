@@ -15,9 +15,10 @@ this order, with Huddles as the only live runtime recorder:
 1. reject a managed Codex request during local preflight, before provisioning;
 2. let Huddles execute one deny-all OpenCode turn over its private service binding;
 3. let Huddles retry the exact request;
-4. let Huddles read status twice with `evidence_after` 0 and 100, each limited to
-   100 events, then read the live D1 allowance row under a status-scoped grant
-   and write the authoritative report-v3 partial;
+4. let Huddles prove the live D1 allowance is exactly `{epoch, limit: 1,
+reserved: 0}`, execute and read status twice with `evidence_after` 0 and 100,
+   each limited to 100 events, then prove the row is exactly `{epoch, limit: 1,
+reserved: 1}` and write the authoritative report-v3 partial;
 5. let Pillbox validate that terminal partial and finalize the same session over
    scoped public HTTP, attaching the result snapshot to the same report.
 
@@ -70,11 +71,12 @@ installation, policy, key ID/fingerprint, and service entrypoints. Wrangler
 configuration and secret-name metadata alone do not prove applied authority.
 
 After applying migrations 0001–0003 and seeding the reviewed singleton row,
-capture the checked remote D1 query exported as `D1_BOOTSTRAP_QUERY` by
-`validate-burnin-bootstrap.mjs`. Normalize that live Wrangler result into a
-protected `pillbox.managed-d1-bootstrap-receipt/1` receipt. It identifies the
-resolved D1 database, exact ordered migration names, query digest, observation
-time, and exactly:
+run `validate-burnin-bootstrap.mjs`. The validator invokes its checked
+`D1_BOOTSTRAP_QUERY` itself with Wrangler `d1 execute --remote` against the
+validated database and config. It does not accept an operator-normalized D1
+receipt. Its `pillbox.managed-d1-bootstrap-receipt/2` output binds the raw
+Wrangler output digest, resolved D1 database, exact ordered migration names,
+query digest, observation time, and exactly:
 
 ```json
 {
@@ -102,7 +104,7 @@ printf '%s' "$PB_BURNIN_CAPABILITY_SECRET" |
     -c /private/path/wrangler.burnin.resolved.toml
 npx wrangler secret list \
   -c /private/path/wrangler.burnin.resolved.toml \
-  --json \
+  --format json \
   > /private/path/wrangler-secret-metadata.json
 ```
 
@@ -114,8 +116,7 @@ the complete resolved tuple before any dry-run, migration, seed, or enablement:
 node cloudflare-spike/scripts/validate-burnin-bootstrap.mjs \
   --bootstrap /private/path/huddles-pillbox-burnin-bootstrap.json \
   --config /private/path/wrangler.burnin.resolved.toml \
-  --metadata /private/path/wrangler-secret-metadata.json \
-  --d1-receipt /private/path/pillbox-d1-bootstrap-receipt.json
+  --metadata /private/path/wrangler-secret-metadata.json
 ```
 
 The validator fails on dry-run mode, a missing or mismatched applied-authority
@@ -177,10 +178,11 @@ npm run burnin -- --preflight \
   --record /private/path/pillbox-preflight.json
 ```
 
-Next run Huddles with that attachment. Huddles performs the only created execute,
-the exact retry, and both bounded status reads over its authenticated private
-service-binding bridge. Its final private read uses a status-scoped grant to
-attach the live post-run D1 row `{epoch, limit: 1, reserved: 1}`. It writes the
+Next run Huddles with that attachment. Before execute, Huddles uses a
+status-scoped grant to require the live row `{epoch, limit: 1, reserved: 0}`.
+Only then does it perform the only created execute, exact retry, and both
+bounded status reads over its authenticated private service-binding bridge.
+Its final private read requires `{epoch, limit: 1, reserved: 1}`. It writes the
 authoritative version 3 partial with
 `capture.cleanup: null`:
 
@@ -204,6 +206,7 @@ BURNIN_CONFIRM_ISOLATED=1 \
 BURNIN_BASE_URL=https://pillbox-managed-burnin.<preview-domain> \
 BURNIN_FINALIZE_TOKEN=<exact-finalize-capability> \
 BURNIN_FINALIZE_REQUEST_FILE=/private/path/finalize.json \
+BURNIN_PILLBOX_NAME=<named-pillbox-for-the-requested-rustic-repository> \
 npm run burnin -- --finalize \
   --report /private/path/burnin-report.json
 ```
@@ -241,6 +244,12 @@ request body and scoped capability. If the HTTP response is lost, the recorder
 asks status instead of sending finalize again. A surviving `running` row is an
 explicit uncertain result and blocks repeated effects for operator recovery; a
 changed canonical request for the same session conflicts.
+The recorder recomputes the canonical request digest and finalize ID for both
+the direct and status response. It then asks the existing Pillbox rustic
+snapshot inspector for the returned handle and requires its actual parent list
+to contain the request's `workspace.snapshot`. Only after that ancestry check
+does it persist cleanup, including `requested_base_snapshot` and
+`result_snapshot`.
 
 ## Capture and reconcile provider counters
 
@@ -253,15 +262,17 @@ Huddles writes one strict report shape and Pillbox attaches only cleanup:
   bounded status calls. Each record carries the full returned identity,
   positional session range and evidence cursor, immutable artifact reference
   (including bytes and digest), and cost reference.
-- `capture.allowance_snapshot` is read from the live D1 singleton after those
-  calls. Deployment-manifest `reserved_executions` is forbidden as evidence.
+- `capture.pre_execution_allowance_snapshot` and `capture.allowance_snapshot`
+  are read from the live D1 singleton immediately before execute and after the
+  bounded status calls. They prove reserved counts zero and one respectively;
+  deployment-manifest `reserved_executions` is forbidden as evidence.
 - `capture.preflight` contains the observed local rejection and zero side-effect
   counters. It has no execution artifact or cost fields.
 - Huddles initially writes `capture.cleanup: null`. Pillbox replaces only that
   field after validating the terminal partial and completing public finalize for
   the same session. Cleanup records created/reused disposition plus the durable
-  finalize ID and canonical request digest; it has no execution artifact or
-  cost fields.
+  finalize ID, canonical request digest, requested base snapshot, and verified
+  descendant result snapshot; it has no execution artifact or cost fields.
 - Each Huddles `run_cost_envelopes` entry copies
   `analytics_points_planned` from its immutable cost envelope. The partial does
   not claim a provider write and leaves `observed: null`.
@@ -286,7 +297,7 @@ separately: the immutable envelope records the one planned unit, while the
 provider capture records zero or one write plus explicit variance. A variance
 of `-1` records a best-effort miss without invalidating the terminal run;
 positive variance fails the max-one gate. Read-only
-retry/status/live-allowance/finalize
+retry/status/two-live-allowance/finalize
 traffic belongs in `read_only`, not in a second envelope. Reconcile with:
 
 ```sh
@@ -308,7 +319,7 @@ per-run cost/variance alongside the Cloudflare dashboard exports.
 
 ## Budget alerts and stop conditions
 
-Configure account-level projected-spend alerts at 50%, 75%, and 90% of the
+Configure account-level cumulative-usage-spend alerts at 50%, 75%, and 90% of the
 small monthly preview cap. These Cloudflare alerts are informational and
 account-wide; they do not cap usage and are not a real-time circuit breaker.
 The D1 application allowance and `MANAGED_EXECUTION_ENABLED=0` kill switch are

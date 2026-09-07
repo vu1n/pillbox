@@ -41,6 +41,9 @@ use anyhow::{anyhow, Context, Result};
 use super::{Harness, Tailer};
 use crate::events::log::SessionLog;
 
+const MAX_DISCOVERY_DEPTH: usize = 8;
+const MAX_DISCOVERY_ENTRIES: usize = 4096;
+
 enum TailPersistence {
     BestEffort(Option<SessionLog>),
     Durable {
@@ -96,7 +99,7 @@ impl TailerHandle {
             harness,
             session_id.to_string(),
             true,
-            HashSet::new(),
+            Ok(HashSet::new()),
         ))
     }
 
@@ -266,7 +269,7 @@ pub(crate) fn spawn_attach_tailer(
         harness,
         session_id.to_string(),
         true,
-        HashSet::new(), // include existing — the session may already be running
+        Ok(HashSet::new()), // include existing — the session may already be running
     ))
 }
 
@@ -279,12 +282,13 @@ fn spawn_tailer(
     harness: Harness,
     session_id: String,
     include_usage: bool,
-    exclude: HashSet<PathBuf>,
+    exclude: Result<HashSet<PathBuf>>,
 ) -> TailerHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = Arc::clone(&stop);
 
     let join = std::thread::spawn(move || -> Result<()> {
+        let exclude = exclude?;
         let resumed = match &persistence {
             TailPersistence::BestEffort(_) => None,
             TailPersistence::Durable { cursor_path, .. } => {
@@ -301,7 +305,8 @@ fn spawn_tailer(
                 {
                     break path.clone();
                 }
-            } else if let Some(path) = find_new_jsonl(&watch_root, scope_dir.as_deref(), &exclude) {
+            } else if let Some(path) = find_new_jsonl(&watch_root, scope_dir.as_deref(), &exclude)?
+            {
                 break path;
             }
             std::thread::sleep(Duration::from_millis(200));
@@ -386,10 +391,10 @@ fn mitm_emits_usage(harness: Harness, proxy_active: bool) -> bool {
 /// All `*.jsonl` paths under `root` (recursive). Empty if `root`
 /// doesn't exist or can't be read — discovery tolerates a not-yet-
 /// created transcript dir.
-fn snapshot_jsonl(root: &Path) -> HashSet<PathBuf> {
+fn snapshot_jsonl(root: &Path) -> Result<HashSet<PathBuf>> {
     let mut out = Vec::new();
-    collect_jsonl(root, &mut out);
-    out.into_iter().collect()
+    collect_jsonl(root, &mut out)?;
+    Ok(out.into_iter().collect())
 }
 
 /// The most-recently-modified `*.jsonl` under `root` that isn't in
@@ -407,10 +412,10 @@ fn find_new_jsonl(
     root: &Path,
     scope_dir: Option<&Path>,
     exclude: &HashSet<PathBuf>,
-) -> Option<PathBuf> {
+) -> Result<Option<PathBuf>> {
     let mut candidates = Vec::new();
-    collect_jsonl(root, &mut candidates);
-    candidates
+    collect_jsonl(root, &mut candidates)?;
+    Ok(candidates
         .into_iter()
         .filter(|p| !exclude.contains(p))
         .filter(|p| scope_dir.is_none_or(|d| p.starts_with(d)))
@@ -419,16 +424,37 @@ fn find_new_jsonl(
             Some((mtime, p))
         })
         .max_by(|(ta, pa), (tb, pb)| ta.cmp(tb).then_with(|| pa.cmp(pb)))
-        .map(|(_, p)| p)
+        .map(|(_, p)| p))
 }
 
 /// Recursively append every `*.jsonl` file under `dir` to `out`.
-/// Skips unreadable subdirectories silently (best-effort discovery).
-fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
+/// Skips unreadable subdirectories silently (best-effort discovery), but fails
+/// loud before crossing the finite tree depth or entry-count contract.
+fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    let mut entries_seen = 0;
+    collect_jsonl_at(dir, out, 0, &mut entries_seen)
+}
+
+fn collect_jsonl_at(
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    depth: usize,
+    entries_seen: &mut usize,
+) -> Result<()> {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+        return Ok(());
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        *entries_seen = entries_seen
+            .checked_add(1)
+            .context("transcript discovery entry count overflow")?;
+        if *entries_seen > MAX_DISCOVERY_ENTRIES {
+            anyhow::bail!(
+                "transcript discovery under {} exceeds {MAX_DISCOVERY_ENTRIES} entries",
+                dir.display()
+            );
+        }
         // `file_type()` is lstat-based — it does NOT follow symlinks. That is
         // load-bearing for security: the libkrun PTY tailer reads the guest-WRITABLE
         // creds clone (the agent home), so a compromised guest could plant symlinks
@@ -442,11 +468,18 @@ fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
         }
         let path = entry.path();
         if ft.is_dir() {
-            collect_jsonl(&path, out);
+            if depth >= MAX_DISCOVERY_DEPTH {
+                anyhow::bail!(
+                    "transcript discovery under {} exceeds {MAX_DISCOVERY_DEPTH} directory levels",
+                    path.display()
+                );
+            }
+            collect_jsonl_at(&path, out, depth + 1, entries_seen)?;
         } else if ft.is_file() && path.extension().is_some_and(|e| e == "jsonl") {
             out.push(path);
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -478,18 +511,18 @@ mod tests {
 
         let old = root.join("old-session.jsonl");
         fs::File::create(&old).unwrap();
-        let pre = snapshot_jsonl(dir.path());
+        let pre = snapshot_jsonl(dir.path()).unwrap();
         assert!(pre.contains(&old));
 
         // No new file yet.
-        assert_eq!(find_new_jsonl(dir.path(), None, &pre), None);
+        assert_eq!(find_new_jsonl(dir.path(), None, &pre).unwrap(), None);
 
         // Agent writes a new transcript.
         let fresh = root.join("new-session.jsonl");
         let mut f = fs::File::create(&fresh).unwrap();
         writeln!(f, "{{}}").unwrap();
 
-        assert_eq!(find_new_jsonl(dir.path(), None, &pre), Some(fresh));
+        assert_eq!(find_new_jsonl(dir.path(), None, &pre).unwrap(), Some(fresh));
     }
 
     #[test]
@@ -502,16 +535,19 @@ mod tests {
         fs::create_dir_all(&mine).unwrap();
         fs::create_dir_all(&theirs).unwrap();
 
-        let pre = snapshot_jsonl(dir.path()); // empty
-                                              // Sibling run's file appears first (newest mtime globally).
+        let pre = snapshot_jsonl(dir.path()).unwrap(); // empty
+                                                       // Sibling run's file appears first (newest mtime globally).
         fs::File::create(theirs.join("sibling.jsonl")).unwrap();
         // Scoped to my dir: sibling is invisible, so nothing yet.
-        assert_eq!(find_new_jsonl(dir.path(), Some(&mine), &pre), None);
+        assert_eq!(find_new_jsonl(dir.path(), Some(&mine), &pre).unwrap(), None);
 
         // My file appears; scoped discovery finds only it.
         let my_file = mine.join("mine.jsonl");
         fs::File::create(&my_file).unwrap();
-        assert_eq!(find_new_jsonl(dir.path(), Some(&mine), &pre), Some(my_file));
+        assert_eq!(
+            find_new_jsonl(dir.path(), Some(&mine), &pre).unwrap(),
+            Some(my_file)
+        );
     }
 
     #[test]
@@ -524,7 +560,7 @@ mod tests {
         fs::File::create(dir.path().join("top.jsonl")).unwrap();
 
         let mut out = Vec::new();
-        collect_jsonl(dir.path(), &mut out);
+        collect_jsonl(dir.path(), &mut out).unwrap();
         let names: HashSet<_> = out
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
@@ -548,15 +584,53 @@ mod tests {
         symlink(&secret, scan.join("link.jsonl")).unwrap(); // symlink → host .jsonl
         symlink(dir.path(), scan.join("up")).unwrap(); // symlink → parent dir
         let mut out = Vec::new();
-        collect_jsonl(&scan, &mut out);
+        collect_jsonl(&scan, &mut out).unwrap();
         assert!(out.is_empty(), "symlinks must not be collected: {out:?}");
+    }
+
+    #[test]
+    fn discovery_accepts_the_depth_limit_and_rejects_one_more_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut nested = dir.path().to_path_buf();
+        for depth in 0..MAX_DISCOVERY_DEPTH {
+            nested = nested.join(format!("d{depth}"));
+            fs::create_dir(&nested).unwrap();
+        }
+        let accepted = nested.join("accepted.jsonl");
+        fs::File::create(&accepted).unwrap();
+        let mut out = Vec::new();
+        collect_jsonl(dir.path(), &mut out).unwrap();
+        assert_eq!(out, vec![accepted]);
+
+        fs::create_dir(nested.join("too-deep")).unwrap();
+        let error = collect_jsonl(dir.path(), &mut Vec::new())
+            .expect_err("one directory past the depth limit must fail");
+        assert!(error
+            .to_string()
+            .contains(&format!("exceeds {MAX_DISCOVERY_DEPTH} directory levels")));
+    }
+
+    #[test]
+    fn discovery_accepts_the_entry_limit_and_rejects_one_more_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..MAX_DISCOVERY_ENTRIES {
+            fs::File::create(dir.path().join(format!("entry-{index}"))).unwrap();
+        }
+        collect_jsonl(dir.path(), &mut Vec::new()).unwrap();
+
+        fs::File::create(dir.path().join("entry-over-limit")).unwrap();
+        let error = collect_jsonl(dir.path(), &mut Vec::new())
+            .expect_err("one entry past the count limit must fail");
+        assert!(error
+            .to_string()
+            .contains(&format!("exceeds {MAX_DISCOVERY_ENTRIES} entries")));
     }
 
     #[test]
     fn snapshot_of_missing_dir_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("does-not-exist");
-        assert!(snapshot_jsonl(&missing).is_empty());
+        assert!(snapshot_jsonl(&missing).unwrap().is_empty());
     }
 
     #[test]

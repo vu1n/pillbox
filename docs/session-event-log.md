@@ -285,6 +285,34 @@ trait EventLog {
 }
 ```
 
+### Local transcript recovery admission limits
+
+Detached local transcript recovery treats the agent-writable transcript tree and
+JSONL body as untrusted input. The local producer enforces these finite limits
+before accepting more history:
+
+- transcript reads use 64 KiB chunks and accept at most 1 MiB of UTF-8 bytes per
+  JSONL record, excluding the terminating LF;
+- transcript discovery descends at most 8 directories below the harness root
+  and inspects at most 4,096 directory entries per scan;
+- the durable session log accepts and replays at most 8 MiB per JSONL event
+  record, excluding the terminating LF.
+
+Cross-chunk UTF-8 and unterminated records remain buffered without advancing the
+durable cursor. The active producer reads each byte only once; a record that
+crosses the 1 MiB limit, invalid UTF-8 in a completed record, or a discovery
+tree that crosses either limit terminates the producer with an error. It never
+truncates the record, skips accepted history, or advances the cursor past the
+rejected bytes. A replacement starts from the last complete committed record.
+
+Session-log open and replay scan with bounded record buffers. A fresh append
+holds the existing per-session `flock` and recovers the authoritative sequence
+in progressively larger windows starting at 64 KiB, up to 16 MiB plus two LF
+delimiter bytes (one maximum record plus a possible maximum torn record), rather
+than rescanning complete history on every append. Crash recovery for a journaled
+exact batch still validates every durable suffix event against the prepared
+payloads before adding only the missing suffix.
+
 Local-jsonl default (local-first, greppable). A Postgres impl could land for the
 future team/managed tier (Aquifer parity) without changing producers. This extends
 the existing `EventSink` trait with read/replay.
@@ -356,4 +384,3 @@ The table is the *target*, not the *transition*. Required before building:
 4. **Input target arbitration** — `input{target:pty}` must route through the
    driver-token arbiter (see multiplayer spec); `target:agent` (turns) can
    queue. Driver-token vs turn-queue default is the one genuine product fork.
-```

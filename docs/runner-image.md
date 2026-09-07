@@ -104,18 +104,27 @@ tracked change: review `git diff runner/Dockerfile` and commit it like a Renovat
 bump. Layer caching keeps the rebuild partial — apt / Node / the cargo-built
 `pillbox` layers stay cached; only the bumped agent layers recompile. The new
 image gets a new id, so libkrun re-materializes its rootfs on the next run (add
-`--prune-rootfs` to drop the superseded generation under `~/.pillbox/krun/rootfs/`).
+`--prune-rootfs` to drop superseded current-format generations for that exact
+image reference under `~/.pillbox/krun/rootfs/`).
 
 libkrun's materialized cache format is versioned independently of image tags.
-The current `v2` generation extracts `docker export` with archive permissions
-preserved, including `/tmp`'s required `01777` mode, and records the exact cache
-format, image reference, and image ID in `.materialized`. Docker-unavailable
-fallback accepts only a matching current-format marker and key; older exports
-remain untouched because a running VM serves its rootfs directory live. They
-are removed only by the explicit `--prune-rootfs` option when no session uses
-the old image. Materialized generations remain beneath Pillbox's host-owned
-`~/.pillbox` directory, whose mode is reasserted as `0700` on every access;
-preserved setuid/setgid bits are therefore not exposed through a shared cache.
+The current `v3` layout is
+`rootfs/v3/<sha256-image-ref>/<sanitized-image-id>/{.materialized,rootfs/}`. Only the
+`rootfs/` child is served to the guest; the sibling authority marker is read as
+a bounded, no-follow regular file and binds the exact format, original image
+reference, and image ID. The hash namespace prevents distinct valid image refs
+from aliasing through lossy filename sanitization. Extraction preserves archive
+permissions, including `/tmp`'s required `01777` mode.
+
+Docker-unavailable fallback accepts only an exact current-format namespace and
+marker. Launch never deletes or rewrites a pre-existing generation because a
+running VM serves its rootfs directory live. Explicit `--prune-rootfs` considers
+only generations beneath the exact current v3 image-ref hash; legacy and v2
+directories remain untouched because their guest-writable metadata cannot
+authorize deletion. Materialized generations remain beneath Pillbox's
+host-owned `~/.pillbox` directory, whose mode is reasserted as `0700` on every
+access; preserved setuid/setgid bits are therefore not exposed through a shared
+cache.
 
 ## Build it yourself
 

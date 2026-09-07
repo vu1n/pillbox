@@ -16,9 +16,9 @@ this order, with Huddles as the only live runtime recorder:
 2. let Huddles execute one deny-all OpenCode turn over its private service binding;
 3. let Huddles retry the exact request;
 4. let Huddles prove the live D1 allowance is exactly `{epoch, limit: 1,
-reserved: 0}`, execute and read status twice with `evidence_after` 0 and 100,
+   reserved: 0}`, execute and read status twice with `evidence_after` 0 and 100,
    each limited to 100 events, then prove the row is exactly `{epoch, limit: 1,
-reserved: 1}` and write the authoritative report-v3 partial;
+   reserved: 1}` and write the authoritative report-v3 partial;
 5. let Pillbox validate that terminal partial and finalize the same session over
    scoped public HTTP, attaching the result snapshot to the same report.
 

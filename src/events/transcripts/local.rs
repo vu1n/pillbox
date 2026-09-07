@@ -41,6 +41,14 @@ use anyhow::{anyhow, Context, Result};
 use super::{Harness, Tailer};
 use crate::events::log::SessionLog;
 
+enum TailPersistence {
+    BestEffort(Option<SessionLog>),
+    Durable {
+        log: SessionLog,
+        cursor_path: PathBuf,
+    },
+}
+
 enum TailerJoin {
     /// Streaming tailers report failures themselves because their transport
     /// readers predate the file producer's process-health contract.
@@ -82,14 +90,13 @@ impl TailerHandle {
         let harness = Harness::for_agent(agent_id)?;
         let (watch_root, scope_dir) = harness.transcript_roots(home, guest_cwd);
         Some(spawn_tailer(
-            Some(log),
+            TailPersistence::Durable { log, cursor_path },
             watch_root,
             scope_dir,
             harness,
             session_id.to_string(),
             true,
             HashSet::new(),
-            Some(cursor_path),
         ))
     }
 
@@ -224,14 +231,13 @@ pub(crate) fn spawn_local_tailer(
     // run creates, not a prior session's file in the same project dir.
     let preexisting = snapshot_jsonl(&watch_root);
     spawn_tailer(
-        log,
+        TailPersistence::BestEffort(log),
         watch_root,
         scope_dir,
         harness,
         session_id,
         include_usage,
         preexisting,
-        None,
     )
 }
 
@@ -254,38 +260,37 @@ pub(crate) fn spawn_attach_tailer(
     // Read-side filler takes the concrete local session log used by every
     // placement.
     Some(spawn_tailer(
-        Some(log),
+        TailPersistence::BestEffort(Some(log)),
         watch_root,
         scope_dir,
         harness,
         session_id.to_string(),
         true,
         HashSet::new(), // include existing — the session may already be running
-        None,
     ))
 }
 
 /// Shared spawn: discover the transcript under `watch_root`/`scope_dir` (the
 /// newest not in `exclude`), then follow it into the sinks until stopped.
 fn spawn_tailer(
-    log: Option<SessionLog>,
+    persistence: TailPersistence,
     watch_root: PathBuf,
     scope_dir: Option<PathBuf>,
     harness: Harness,
     session_id: String,
     include_usage: bool,
     exclude: HashSet<PathBuf>,
-    cursor_path: Option<PathBuf>,
 ) -> TailerHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = Arc::clone(&stop);
 
     let join = std::thread::spawn(move || -> Result<()> {
-        let resumed = cursor_path
-            .as_deref()
-            .map(|path| Tailer::durable_source(path, &session_id))
-            .transpose()?
-            .flatten();
+        let resumed = match &persistence {
+            TailPersistence::BestEffort(_) => None,
+            TailPersistence::Durable { cursor_path, .. } => {
+                Tailer::durable_source(cursor_path, &session_id)?
+            }
+        };
         let path = loop {
             if stop_thread.load(Ordering::Relaxed) {
                 return Ok(()); // asked to stop before the transcript appeared
@@ -301,12 +306,13 @@ fn spawn_tailer(
             }
             std::thread::sleep(Duration::from_millis(200));
         };
-        let mut tailer = match (log, cursor_path) {
-            (Some(log), Some(cursor_path)) => {
+        let mut tailer = match persistence {
+            TailPersistence::Durable { log, cursor_path } => {
                 Tailer::new_durable(path, session_id, harness, include_usage, log, cursor_path)?
             }
-            (log, None) => Tailer::new(path, session_id, harness, include_usage, log),
-            (None, Some(_)) => anyhow::bail!("durable transcript tailer requires a session log"),
+            TailPersistence::BestEffort(log) => {
+                Tailer::new(path, session_id, harness, include_usage, log)
+            }
         };
         tailer
             .follow_until(&stop_thread)

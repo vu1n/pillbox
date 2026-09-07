@@ -30,6 +30,7 @@ impl ManagedTurnLock {
         let path: PathBuf = crate::session::session_dir(resolved, session_id)?.join(TURN_LOCK_FILE);
         let file = fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .mode(0o600)

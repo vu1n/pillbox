@@ -430,11 +430,30 @@ pub(super) fn validate_pending(pending: &PendingRequest) -> Result<()> {
         && request
             .get("rendered_input")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|rendered_input| !rendered_input.is_empty());
+            .is_some_and(|rendered_input| !rendered_input.is_empty())
+        && request
+            .pointer("/execution/requested/provider")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|provider| !provider.is_empty())
+        && request
+            .pointer("/execution/requested/model")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|model| !model.is_empty());
     if !valid {
         return Err(PillboxError::config(
             "session send",
             "pending managed invocation identity is corrupted or mismatched",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+pub(super) fn validate_model_parts(provider: &str, model: &str) -> Result<()> {
+    if provider.is_empty() || model.is_empty() {
+        return Err(PillboxError::config(
+            "session send",
+            "managed model must contain non-empty provider/model parts",
         )
         .into());
     }

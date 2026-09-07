@@ -70,6 +70,29 @@ pub(crate) struct TailerHandle {
 }
 
 impl TailerHandle {
+    /// Spawn the sole reparented Codex producer with a session-local cursor.
+    pub(crate) fn spawn_detached(
+        log: SessionLog,
+        home: &Path,
+        agent_id: &str,
+        guest_cwd: &str,
+        session_id: &str,
+        cursor_path: PathBuf,
+    ) -> Option<Self> {
+        let harness = Harness::for_agent(agent_id)?;
+        let (watch_root, scope_dir) = harness.transcript_roots(home, guest_cwd);
+        Some(spawn_tailer(
+            Some(log),
+            watch_root,
+            scope_dir,
+            harness,
+            session_id.to_string(),
+            true,
+            HashSet::new(),
+            Some(cursor_path),
+        ))
+    }
+
     /// Wrap a tailer thread spawned elsewhere, given an explicit `stopper` that
     /// tears down whatever transport the thread is reading (a killed exec, a
     /// closed vsock). `stop` is the flag the thread observes between reads.
@@ -208,6 +231,7 @@ pub(crate) fn spawn_local_tailer(
         session_id,
         include_usage,
         preexisting,
+        None,
     )
 }
 
@@ -237,6 +261,7 @@ pub(crate) fn spawn_attach_tailer(
         session_id.to_string(),
         true,
         HashSet::new(), // include existing — the session may already be running
+        None,
     ))
 }
 
@@ -250,21 +275,39 @@ fn spawn_tailer(
     session_id: String,
     include_usage: bool,
     exclude: HashSet<PathBuf>,
+    cursor_path: Option<PathBuf>,
 ) -> TailerHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = Arc::clone(&stop);
 
     let join = std::thread::spawn(move || -> Result<()> {
+        let resumed = cursor_path
+            .as_deref()
+            .map(|path| Tailer::durable_source(path, &session_id))
+            .transpose()?
+            .flatten();
         let path = loop {
             if stop_thread.load(Ordering::Relaxed) {
                 return Ok(()); // asked to stop before the transcript appeared
             }
-            if let Some(p) = find_new_jsonl(&watch_root, scope_dir.as_deref(), &exclude) {
-                break p;
+            if let Some(path) = resumed.as_ref() {
+                if std::fs::symlink_metadata(path)
+                    .is_ok_and(|metadata| metadata.file_type().is_file())
+                {
+                    break path.clone();
+                }
+            } else if let Some(path) = find_new_jsonl(&watch_root, scope_dir.as_deref(), &exclude) {
+                break path;
             }
             std::thread::sleep(Duration::from_millis(200));
         };
-        let mut tailer = Tailer::new(path, session_id, harness, include_usage, log);
+        let mut tailer = match (log, cursor_path) {
+            (Some(log), Some(cursor_path)) => {
+                Tailer::new_durable(path, session_id, harness, include_usage, log, cursor_path)?
+            }
+            (log, None) => Tailer::new(path, session_id, harness, include_usage, log),
+            (None, Some(_)) => anyhow::bail!("durable transcript tailer requires a session log"),
+        };
         tailer
             .follow_until(&stop_thread)
             .context("follow discovered transcript")?;

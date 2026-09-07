@@ -9,6 +9,8 @@
 // Context: doc://pillbox/optimization-external-substrate-primitives@0001#optimization-external-substrate-primitives
 
 use anyhow::{Context, Result};
+use std::os::unix::fs::OpenOptionsExt as _;
+use std::os::unix::io::AsRawFd as _;
 
 use crate::agents::Integration;
 use crate::cli::{DoneStatus, SessionAction};
@@ -23,6 +25,33 @@ mod stream;
 /// dir, so teardown can SIGTERM it and live readers can tell a producer is keeping
 /// the log fresh (and skip their own drain — the single-producer invariant).
 pub(crate) const TAILER_PID_FILE: &str = ".tailer.pid";
+pub(crate) const TAILER_CURSOR_FILE: &str = ".tailer-cursor.json";
+const TAILER_LOCK_FILE: &str = ".tailer.lock";
+
+struct DetachedProducerLock {
+    _file: std::fs::File,
+}
+
+impl DetachedProducerLock {
+    fn try_acquire(session_dir: &std::path::Path) -> Result<Self> {
+        let path = session_dir.join(TAILER_LOCK_FILE);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("open detached producer lock {}", path.display()))?;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                anyhow::bail!("another detached transcript producer already owns this session");
+            }
+            return Err(error).with_context(|| format!("lock {}", path.display()));
+        }
+        Ok(Self { _file: file })
+    }
+}
 
 /// The detached §0 PRODUCER for a reparented session (the libkrun analog of
 /// docker's always-on transcript tailer). Re-exec'd as a bare subprocess at
@@ -41,24 +70,28 @@ pub(crate) fn run_detached_tailer(
 ) -> Result<()> {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+    // The flock is the ownership primitive; the pid file is only liveness and
+    // teardown metadata. Keeping the guard in scope prevents replacement races.
+    let _producer_lock = DetachedProducerLock::try_acquire(&session_dir)?;
     // Claim sole-producer: our pid lets teardown stop us and signals readers a
     // producer is live (so they don't double-drain into the log).
     let _ = std::fs::write(
         session_dir.join(TAILER_PID_FILE),
         std::process::id().to_string(),
     );
-    let mut log = events::log::SessionLog::open_at(session_dir)?;
+    let mut log = events::log::SessionLog::open_at(session_dir.clone())?;
     match source {
         crate::agents::DetachedTranscriptSource::Discover(harness) => {
             // The rollout path does not exist until the PTY agent starts. The
             // typed source explicitly selects discovery; the capture path's
             // current filesystem type carries no orchestration semantics.
-            let tailer = events::transcripts::spawn_attach_tailer(
+            let tailer = events::transcripts::TailerHandle::spawn_detached(
                 log,
                 &capture,
                 harness.agent_id(),
                 "",
                 &sid,
+                session_dir.join(TAILER_CURSOR_FILE),
             )
             .ok_or_else(|| anyhow::anyhow!("detached transcript tailer is unavailable"))?;
             wait_for_discover_tailer(tailer)?;
@@ -1482,6 +1515,26 @@ pub(crate) fn validate_session_id(id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detached_producer_lock_is_scoped_per_session() {
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let held = DetachedProducerLock::try_acquire(first_dir.path()).unwrap();
+
+        let error = DetachedProducerLock::try_acquire(first_dir.path())
+            .err()
+            .expect("a second producer must not acquire the same session lock");
+        assert!(error
+            .to_string()
+            .contains("another detached transcript producer"));
+        DetachedProducerLock::try_acquire(second_dir.path())
+            .expect("another session has an independent producer lock");
+
+        drop(held);
+        DetachedProducerLock::try_acquire(first_dir.path())
+            .expect("dropping the producer releases its session lock");
+    }
 
     #[test]
     #[cfg(unix)]

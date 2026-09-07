@@ -27,26 +27,15 @@ const ISOLATED_RESOURCES = Object.freeze({
   analytics: "pillbox_managed_burnin_costs",
 });
 
-export async function validateBurninBootstrap({
-  bootstrap,
-  wrangler,
-  metadata,
-  queryRemoteD1,
-}) {
+export async function validateBurninBootstrap({ bootstrap, wrangler, metadata, queryRemoteD1 }) {
   const tuple = requireRecord(bootstrap, "Huddles bootstrap tuple");
   if (tuple.schema_version !== BOOTSTRAP_VERSION) {
     fail(`bootstrap schema_version must be ${BOOTSTRAP_VERSION}`);
   }
-  const installation = requireRecord(
-    tuple.installation,
-    "bootstrap installation",
-  );
+  const installation = requireRecord(tuple.installation, "bootstrap installation");
   const signingKey = requireRecord(tuple.signing_key, "bootstrap signing_key");
   const services = requireRecord(tuple.services, "bootstrap services");
-  const currentness = requireRecord(
-    services.currentness,
-    "bootstrap currentness service",
-  );
+  const currentness = requireRecord(services.currentness, "bootstrap currentness service");
   const issuer = requireRecord(services.issuer, "bootstrap issuer service");
   const limits = requireRecord(tuple.limits, "bootstrap limits");
 
@@ -70,8 +59,7 @@ export async function validateBurninBootstrap({
   for (const [name, expected] of expectedPins) {
     requireConfiguredString(expected, `bootstrap ${name}`);
     requireConfiguredString(vars[name], `Wrangler ${name}`);
-    if (vars[name] !== expected)
-      fail(`${name} does not match the Huddles bootstrap tuple`);
+    if (vars[name] !== expected) fail(`${name} does not match the Huddles bootstrap tuple`);
   }
   if (installation.protocol_revision !== PROTOCOL_REVISION) {
     fail(`bootstrap protocol_revision must be ${PROTOCOL_REVISION}`);
@@ -82,10 +70,7 @@ export async function validateBurninBootstrap({
   if (vars.MANAGED_EXECUTION_LIMIT !== "1") {
     fail("MANAGED_EXECUTION_LIMIT must match the one-run burn-in limit");
   }
-  requireConfiguredString(
-    vars.MANAGED_EXECUTION_EPOCH,
-    "Wrangler MANAGED_EXECUTION_EPOCH",
-  );
+  requireConfiguredString(vars.MANAGED_EXECUTION_EPOCH, "Wrangler MANAGED_EXECUTION_EPOCH");
   if (vars.MANAGED_EXECUTION_ENABLED !== "0") {
     fail("MANAGED_EXECUTION_ENABLED must remain 0 during bootstrap validation");
   }
@@ -101,10 +86,7 @@ export async function validateBurninBootstrap({
   );
   if (!binding) fail("Wrangler currentness service binding is missing");
   for (const field of ["service", "entrypoint"]) {
-    requireConfiguredString(
-      currentness[field],
-      `bootstrap currentness ${field}`,
-    );
+    requireConfiguredString(currentness[field], `bootstrap currentness ${field}`);
     if (binding[field] !== currentness[field]) {
       fail(`currentness ${field} does not match the Huddles bootstrap tuple`);
     }
@@ -129,8 +111,7 @@ export async function validateBurninBootstrap({
     fail("Wrangler must contain only the isolated EXECUTION_DB binding");
   }
   const database = resolved.d1_databases[0];
-  if (database.binding !== "EXECUTION_DB")
-    fail("EXECUTION_DB binding is missing");
+  if (database.binding !== "EXECUTION_DB") fail("EXECUTION_DB binding is missing");
   requireConfiguredString(database.database_name, "EXECUTION_DB database_name");
   requireConfiguredString(database.database_id, "EXECUTION_DB database_id");
   if (database.migrations_dir !== "migrations") {
@@ -149,10 +130,7 @@ export async function validateBurninBootstrap({
   if (evidence.binding !== "EXECUTION_EVIDENCE") {
     fail("EXECUTION_EVIDENCE binding is missing");
   }
-  requireConfiguredString(
-    evidence.bucket_name,
-    "EXECUTION_EVIDENCE bucket_name",
-  );
+  requireConfiguredString(evidence.bucket_name, "EXECUTION_EVIDENCE bucket_name");
   if (evidence.bucket_name !== ISOLATED_RESOURCES.r2) {
     fail("EXECUTION_EVIDENCE must use the isolated burn-in bucket name");
   }
@@ -189,9 +167,7 @@ export async function validateBurninBootstrap({
   }
 
   if (!resolved.secretNames.has(REQUIRED_SECRET)) {
-    fail(
-      `${REQUIRED_SECRET} is not installed according to Wrangler secret metadata`,
-    );
+    fail(`${REQUIRED_SECRET} is not installed according to Wrangler secret metadata`);
   }
   if (typeof queryRemoteD1 !== "function") {
     fail("validator-owned remote D1 query runner is required");
@@ -237,9 +213,7 @@ export async function validateBurninBootstrap({
 
 function validateRemoteD1Output(rawOutput, database, vars) {
   if (typeof rawOutput !== "string") {
-    fail(
-      "validator-owned remote D1 query must return raw Wrangler JSON output",
-    );
+    fail("validator-owned remote D1 query must return raw Wrangler JSON output");
   }
   let results;
   try {
@@ -248,9 +222,7 @@ function validateRemoteD1Output(rawOutput, database, vars) {
     fail("validator-owned remote D1 query returned non-JSON output");
   }
   if (!Array.isArray(results) || results.length !== 2) {
-    fail(
-      "remote D1 output must contain exactly the migration and allowance query results",
-    );
+    fail("remote D1 output must contain exactly the migration and allowance query results");
   }
   for (const [index, result] of results.entries()) {
     const queryResult = requireRecord(result, `remote D1 result ${index}`);
@@ -269,10 +241,7 @@ function validateRemoteD1Output(rawOutput, database, vars) {
   if (results[1].results.length !== 1) {
     fail("remote D1 output must contain exactly one allowance row");
   }
-  const allowance = requireRecord(
-    results[1].results[0],
-    "remote D1 allowance row",
-  );
+  const allowance = requireRecord(results[1].results[0], "remote D1 allowance row");
   requireExactKeys(
     allowance,
     ["deployment_epoch", "execution_limit", "reserved_executions"],
@@ -283,9 +252,7 @@ function validateRemoteD1Output(rawOutput, database, vars) {
     allowance.execution_limit !== Number(vars.MANAGED_EXECUTION_LIMIT) ||
     allowance.reserved_executions !== 0
   ) {
-    fail(
-      "remote D1 allowance row must exactly match {epoch, limit, reserved: 0}",
-    );
+    fail("remote D1 allowance row must exactly match {epoch, limit, reserved: 0}");
   }
   const body = {
     schema_version: D1_RECEIPT_VERSION,
@@ -347,11 +314,8 @@ export function parseWranglerToml(source) {
 }
 
 function resolvedWrangler(config, metadata) {
-  const parsed =
-    typeof config === "string" ? parseWranglerToml(config) : config;
-  const resolvedMetadata = Array.isArray(metadata)
-    ? { secrets: metadata }
-    : (metadata ?? {});
+  const parsed = typeof config === "string" ? parseWranglerToml(config) : config;
+  const resolvedMetadata = Array.isArray(metadata) ? { secrets: metadata } : metadata ?? {};
   const merged = {
     name: resolvedMetadata.name ?? parsed.name,
     vars: { ...parsed.vars, ...(resolvedMetadata.vars ?? {}) },
@@ -360,17 +324,14 @@ function resolvedWrangler(config, metadata) {
     d1_databases: resolvedMetadata.d1_databases ?? parsed.d1_databases,
     r2_buckets: resolvedMetadata.r2_buckets ?? parsed.r2_buckets,
     analytics_engine_datasets:
-      resolvedMetadata.analytics_engine_datasets ??
-      parsed.analytics_engine_datasets,
+      resolvedMetadata.analytics_engine_datasets ?? parsed.analytics_engine_datasets,
     durable_object_bindings:
       resolvedMetadata.durable_object_bindings ??
       parsed["durable_objects.bindings"],
     migrations: resolvedMetadata.migrations ?? parsed.migrations,
     secretNames: new Set(),
   };
-  for (const secret of resolvedMetadata.secret_names ??
-    resolvedMetadata.secrets ??
-    []) {
+  for (const secret of resolvedMetadata.secret_names ?? resolvedMetadata.secrets ?? []) {
     const name = typeof secret === "string" ? secret : secret?.name;
     if (typeof name === "string") merged.secretNames.add(name);
   }
@@ -393,10 +354,7 @@ function parseTomlScalar(value) {
 }
 
 function validateAuthorityReceipt(tuple, issuer, currentness) {
-  const receipt = requireRecord(
-    tuple.authority_receipt,
-    "bootstrap authority_receipt",
-  );
+  const receipt = requireRecord(tuple.authority_receipt, "bootstrap authority_receipt");
   requireExactKeys(
     receipt,
     [
@@ -410,9 +368,7 @@ function validateAuthorityReceipt(tuple, issuer, currentness) {
     "bootstrap authority_receipt",
   );
   if (receipt.schema_version !== AUTHORITY_RECEIPT_VERSION) {
-    fail(
-      `authority_receipt schema_version must be ${AUTHORITY_RECEIPT_VERSION}`,
-    );
+    fail(`authority_receipt schema_version must be ${AUTHORITY_RECEIPT_VERSION}`);
   }
   if (
     typeof receipt.applied_at !== "string" ||
@@ -421,10 +377,7 @@ function validateAuthorityReceipt(tuple, issuer, currentness) {
   ) {
     fail("authority_receipt applied_at must be an exact ISO-8601 instant");
   }
-  const database = requireRecord(
-    receipt.database,
-    "authority_receipt database",
-  );
+  const database = requireRecord(receipt.database, "authority_receipt database");
   const issuerTest = requireRecord(
     receipt.issuer_self_test,
     "authority_receipt issuer_self_test",
@@ -439,42 +392,30 @@ function validateAuthorityReceipt(tuple, issuer, currentness) {
 
   const installation = tuple.installation;
   const key = tuple.signing_key;
-  requireReceiptMatches(
-    database,
-    {
-      installation_id: installation.installation_id,
-      execution_realm_id: installation.execution_realm_id,
-      organization_id: installation.organization_id,
-      workspace_id: installation.workspace_id,
-      principal_id: installation.principal_id,
-      policy_id: installation.policy_id,
-      key_id: key.key_id,
-      public_key_fingerprint: key.fingerprint,
-    },
-    "database",
-  );
-  requireReceiptMatches(
-    issuerTest,
-    {
-      service: issuer.service,
-      entrypoint: issuer.entrypoint,
-      key_id: key.key_id,
-      public_key_fingerprint: key.fingerprint,
-    },
-    "issuer_self_test",
-  );
-  requireReceiptMatches(
-    currentnessProbe,
-    {
-      service: currentness.service,
-      entrypoint: currentness.entrypoint,
-      installation_id: installation.installation_id,
-      key_id: key.key_id,
-      public_key_fingerprint: key.fingerprint,
-      policy_id: installation.policy_id,
-    },
-    "currentness_probe",
-  );
+  requireReceiptMatches(database, {
+    installation_id: installation.installation_id,
+    execution_realm_id: installation.execution_realm_id,
+    organization_id: installation.organization_id,
+    workspace_id: installation.workspace_id,
+    principal_id: installation.principal_id,
+    policy_id: installation.policy_id,
+    key_id: key.key_id,
+    public_key_fingerprint: key.fingerprint,
+  }, "database");
+  requireReceiptMatches(issuerTest, {
+    service: issuer.service,
+    entrypoint: issuer.entrypoint,
+    key_id: key.key_id,
+    public_key_fingerprint: key.fingerprint,
+  }, "issuer_self_test");
+  requireReceiptMatches(currentnessProbe, {
+    service: currentness.service,
+    entrypoint: currentness.entrypoint,
+    installation_id: installation.installation_id,
+    key_id: key.key_id,
+    public_key_fingerprint: key.fingerprint,
+    policy_id: installation.policy_id,
+  }, "currentness_probe");
 
   const { receipt_sha256: claimedDigest, ...digestBody } = receipt;
   const expectedDigest = `sha256:${createHash("sha256")
@@ -493,20 +434,11 @@ function requireVerified(value, label) {
 }
 
 function requireReceiptMatches(actual, expected, label) {
-  requireExactKeys(
-    actual,
-    ["status", ...Object.keys(expected)],
-    `authority_receipt ${label}`,
-  );
+  requireExactKeys(actual, ["status", ...Object.keys(expected)], `authority_receipt ${label}`);
   for (const [field, expectedValue] of Object.entries(expected)) {
-    requireConfiguredString(
-      actual[field],
-      `authority_receipt ${label}.${field}`,
-    );
+    requireConfiguredString(actual[field], `authority_receipt ${label}.${field}`);
     if (actual[field] !== expectedValue) {
-      fail(
-        `authority_receipt ${label}.${field} does not match the bootstrap tuple`,
-      );
+      fail(`authority_receipt ${label}.${field} does not match the bootstrap tuple`);
     }
   }
 }
@@ -529,7 +461,7 @@ function canonicalJson(value) {
   }
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   return `{${Object.keys(value)
-    .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0))
+    .sort((left, right) => left < right ? -1 : left > right ? 1 : 0)
     .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
     .join(",")}}`;
 }
@@ -585,49 +517,34 @@ async function main() {
   const configPath = option("--config");
   const metadataPath = option("--metadata");
   if (!bootstrapPath || !configPath || !metadataPath) {
-    fail(
-      "usage: validate-burnin-bootstrap.mjs --bootstrap <json> --config <toml> --metadata <json>",
-    );
+    fail("usage: validate-burnin-bootstrap.mjs --bootstrap <json> --config <toml> --metadata <json>");
   }
   const [bootstrap, wrangler, metadata] = await Promise.all([
     readJson(bootstrapPath, "Huddles bootstrap tuple"),
     readFile(configPath, "utf8"),
     readJson(metadataPath, "Wrangler metadata"),
   ]);
-  const wranglerBin = fileURLToPath(
-    import.meta.resolve("wrangler/bin/wrangler.js"),
-  );
+  const wranglerBin = fileURLToPath(import.meta.resolve("wrangler/bin/wrangler.js"));
   const queryRemoteD1 = async ({ database_name, query }) => {
     try {
-      const { stdout } = await execFileAsync(
-        process.execPath,
-        [
-          wranglerBin,
-          "d1",
-          "execute",
-          database_name,
-          "--remote",
-          "--config",
-          configPath,
-          "--command",
-          query,
-          "--json",
-        ],
-        { encoding: "utf8", maxBuffer: 256 * 1024 },
-      );
+      const { stdout } = await execFileAsync(process.execPath, [
+        wranglerBin,
+        "d1",
+        "execute",
+        database_name,
+        "--remote",
+        "--config",
+        configPath,
+        "--command",
+        query,
+        "--json",
+      ], { encoding: "utf8", maxBuffer: 256 * 1024 });
       return stdout;
     } catch (cause) {
-      fail(
-        `validator-owned remote D1 query failed: ${cause.stderr || cause.message}`,
-      );
+      fail(`validator-owned remote D1 query failed: ${cause.stderr || cause.message}`);
     }
   };
-  const result = await validateBurninBootstrap({
-    bootstrap,
-    wrangler,
-    metadata,
-    queryRemoteD1,
-  });
+  const result = await validateBurninBootstrap({ bootstrap, wrangler, metadata, queryRemoteD1 });
   console.log(JSON.stringify(result, null, 2));
 }
 
@@ -635,16 +552,11 @@ async function readJson(path, label) {
   try {
     return JSON.parse(await readFile(path, "utf8"));
   } catch (cause) {
-    fail(
-      `${label} could not be read: ${cause instanceof Error ? cause.message : String(cause)}`,
-    );
+    fail(`${label} could not be read: ${cause instanceof Error ? cause.message : String(cause)}`);
   }
 }
 
-if (
-  process.argv[1] &&
-  pathToFileURL(process.argv[1]).href === import.meta.url
-) {
+if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
   main().catch((cause) => {
     console.error(cause instanceof Error ? cause.message : String(cause));
     process.exitCode = 1;

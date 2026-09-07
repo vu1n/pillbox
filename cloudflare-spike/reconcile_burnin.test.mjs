@@ -6,16 +6,10 @@ import { join } from "node:path";
 import test from "node:test";
 
 const reconciler = new URL("./scripts/reconcile-burnin.mjs", import.meta.url);
-const fixture = new URL(
-  "./testdata/burnin-reconciliation.fixture.json",
-  import.meta.url,
-);
+const fixture = new URL("./testdata/burnin-reconciliation.fixture.json", import.meta.url);
 
 test("the sole Huddles recorder fixture reconciles without translating response records", async () => {
-  const result = await run(process.execPath, [
-    reconciler.pathname,
-    fixture.pathname,
-  ]);
+  const result = await run(process.execPath, [reconciler.pathname, fixture.pathname]);
   assert.equal(result.code, 0, result.stderr);
   assert.match(result.stdout, /managed preview burn-in reconciliation passed/);
 });
@@ -28,10 +22,7 @@ test("partial validation accepts terminal Huddles evidence only before cleanup",
   report.capture.totals = null;
   const result = await reconcileTemporary(t, report, ["--partial"]);
   assert.equal(result.code, 0, result.stderr);
-  assert.match(
-    result.stdout,
-    /authoritative Huddles burn-in report-v3 partial passed/,
-  );
+  assert.match(result.stdout, /authoritative Huddles burn-in report-v3 partial passed/);
 });
 
 test("reconciliation rejects a second runtime recorder", async (t) => {
@@ -44,9 +35,7 @@ test("reconciliation rejects a second runtime recorder", async (t) => {
 
 test("reconciliation fails when a runtime workload step is omitted", async (t) => {
   const report = JSON.parse(await readFile(fixture, "utf8"));
-  report.capture.runtime_calls = report.capture.runtime_calls.filter(
-    (call) => call.step_id !== "status-page-2",
-  );
+  report.capture.runtime_calls = report.capture.runtime_calls.filter((call) => call.step_id !== "status-page-2");
   const result = await reconcileTemporary(t, report);
   assert.equal(result.code, 1);
   assert.match(result.stderr, /omitted workload step status-page-2/);
@@ -57,22 +46,15 @@ test("reconciliation fails when cleanup is attributed to the wrong step", async 
   report.capture.cleanup.step_id = "unsupported-managed-codex";
   const result = await reconcileTemporary(t, report);
   assert.equal(result.code, 1);
-  assert.match(
-    result.stderr,
-    /capture\.cleanup does not match the workload cleanup step/,
-  );
+  assert.match(result.stderr, /capture\.cleanup does not match the workload cleanup step/);
 });
 
 test("reconciliation recomputes the full request and execution identity", async (t) => {
   const report = JSON.parse(await readFile(fixture, "utf8"));
-  report.workload.steps[0].request.execution_policy_revision =
-    "managed/tampered";
+  report.workload.steps[0].request.execution_policy_revision = "managed/tampered";
   const result = await reconcileTemporary(t, report);
   assert.equal(result.code, 1);
-  assert.match(
-    result.stderr,
-    /execution_identity does not match the canonical first-execute request/,
-  );
+  assert.match(result.stderr, /execution_identity does not match the canonical first-execute request/);
 });
 
 test("reconciliation requires live allowance snapshots before and after execution", async (t) => {
@@ -81,14 +63,8 @@ test("reconciliation requires live allowance snapshots before and after executio
   report.capture.allowance_snapshot.reserved_executions = 0;
   const result = await reconcileTemporary(t, report);
   assert.equal(result.code, 1);
-  assert.match(
-    result.stderr,
-    /pre_execution_allowance_snapshot does not prove reserved_executions 0/,
-  );
-  assert.match(
-    result.stderr,
-    /allowance_snapshot does not prove reserved_executions 1/,
-  );
+  assert.match(result.stderr, /pre_execution_allowance_snapshot does not prove reserved_executions 0/);
+  assert.match(result.stderr, /allowance_snapshot does not prove reserved_executions 1/);
 });
 
 test("reconciliation binds invocation and session identity to the reviewed epoch", async (t) => {
@@ -97,10 +73,7 @@ test("reconciliation binds invocation and session identity to the reviewed epoch
   report.capture.allowance_snapshot.deployment_epoch = "burnin-other-epoch";
   const result = await reconcileTemporary(t, report);
   assert.equal(result.code, 1);
-  assert.match(
-    result.stderr,
-    /does not derive from the reviewed allowance epoch/,
-  );
+  assert.match(result.stderr, /does not derive from the reviewed allowance epoch/);
 });
 
 test("reconciliation rejects positional evidence discontinuity", async (t) => {
@@ -128,10 +101,7 @@ test("reconciliation accepts a best-effort Analytics miss with explicit negative
   report.capture.totals.analytics_engine.points_written = 0;
   const result = await reconcileTemporary(t, report);
   assert.equal(result.code, 0, result.stderr);
-  assert.match(
-    result.stdout,
-    /Analytics planned\/observed\/variance: 1\/0\/-1/,
-  );
+  assert.match(result.stdout, /Analytics planned\/observed\/variance: 1\/0\/-1/);
 });
 
 test("fixed topology requires exactly one planned Analytics point", async (t) => {
@@ -149,14 +119,10 @@ test("fixed topology requires exactly one planned Analytics point", async (t) =>
 
 test("reconciliation rejects Analytics observations without truthful plan variance", async (t) => {
   const report = JSON.parse(await readFile(fixture, "utf8"));
-  report.capture.run_cost_envelopes[0].observed.analytics_engine.variance_from_planned =
-    -1;
+  report.capture.run_cost_envelopes[0].observed.analytics_engine.variance_from_planned = -1;
   const result = await reconcileTemporary(t, report);
   assert.equal(result.code, 1);
-  assert.match(
-    result.stderr,
-    /variance does not reconcile observed writes against planned units/,
-  );
+  assert.match(result.stderr, /variance does not reconcile observed writes against planned units/);
 });
 
 async function reconcileTemporary(t, report, args = []) {

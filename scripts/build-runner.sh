@@ -110,6 +110,30 @@ args=(buildx build -f "$DOCKERFILE" -t "$TAG" --load)
 args+=(.)
 docker "${args[@]}"
 
+CODEX_VERSION_PIN=$(cur CODEX_VERSION)
+echo "▶ verifying the pinned Codex native package in $TAG:"
+docker run --rm --entrypoint sh -e EXPECTED_CODEX_VERSION="$CODEX_VERSION_PIN" "$TAG" -c '
+	set -eu
+	package_root="${CODEX_PACKAGE_ROOT:?CODEX_PACKAGE_ROOT is not set}"
+	expected_version="${EXPECTED_CODEX_VERSION:?EXPECTED_CODEX_VERSION is not set}"
+	manifest="$package_root/codex-package.json"
+	test -f "$manifest"
+	test "$(jq -er ".version | select(type == \"string\")" "$manifest")" = "$expected_version"
+	test "$(jq -er ".layoutVersion == 1" "$manifest")" = true
+	test "$(jq -er ".entrypoint == \"bin/codex\"" "$manifest")" = true
+	test "$(jq -er ".resourcesDir == \"codex-resources\"" "$manifest")" = true
+	test "$(jq -er ".pathDir == \"codex-path\"" "$manifest")" = true
+	test -x "$package_root/bin/codex"
+	test -x "$package_root/bin/codex-code-mode-host"
+	test -x "$package_root/codex-resources/zsh/bin/zsh"
+	test -x "$package_root/codex-path/rg"
+	test -L /usr/local/bin/codex
+	test -L /usr/local/bin/codex-code-mode-host
+	test "$(readlink -f /usr/local/bin/codex)" = "$package_root/bin/codex"
+	test "$(readlink -f /usr/local/bin/codex-code-mode-host)" = "$package_root/bin/codex-code-mode-host"
+	echo "  codex package: $expected_version + code-mode host + resources + path tools ✓"
+'
+
 echo "▶ agent versions baked into $TAG:"
 docker run --rm --entrypoint sh "$TAG" -c '
 	for a in claude codex amp opencode pi agent pillbox; do

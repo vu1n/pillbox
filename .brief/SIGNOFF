@@ -123,3 +123,5 @@ substrate-plane-livesession conforms: PB-023 restores a failed detached Codex tr
 optimization-external-substrate-primitives conforms: PB-023 adds only local session serialization and durable transcript evidence recovery; no routing, optimization, or policy authority enters the substrate.
 managed-tier-do-gateway conforms: PB-024 replaces only a literal-only formatting call in managed workspace transfer validation; the prefix-scoped R2 credential boundary and fail-closed error semantics are unchanged.
 managed-store-of-record conforms: PB-024 is a strict-Clippy gate repair in transfer validation; rustic-over-R2 remains the authoritative workspace store and handle space.
+session-event-log-spine conforms: BND-001 bounds untrusted local transcript discovery and records plus durable log records, while preserving the flock-serialized per-session sequence authority, exact append-prefix crash recovery, and fail-loud immutable history.
+dx-zero-config-local conforms: BND-001 keeps every reader on the same zero-config local session log and changes only bounded producer admission and append/replay implementation work.

@@ -32,6 +32,8 @@ use crate::contract::{Actor, Event};
 use crate::events::log::SessionLog;
 
 const CURSOR_VERSION: u8 = 1;
+const TRANSCRIPT_READ_CHUNK_BYTES: usize = 64 * 1024;
+const MAX_TRANSCRIPT_LINE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -263,7 +265,7 @@ pub(crate) struct Tailer {
     harness: Harness,
     offset: u64,
     line_idx: usize,
-    leftover: String,
+    leftover: Vec<u8>,
     /// Reconstructs whole-chat gen_ai spans from the events for
     /// Workshop's Overview. Always present — the transcript is the
     /// conversation source for every harness. `include_usage` (threaded
@@ -295,7 +297,7 @@ impl Tailer {
             harness,
             offset: 0,
             line_idx: 0,
-            leftover: String::new(),
+            leftover: Vec::new(),
             synth,
             log,
             cursor: None,
@@ -322,7 +324,7 @@ impl Tailer {
             harness,
             offset: cursor.position.offset,
             line_idx: cursor.position.line_idx,
-            leftover: String::new(),
+            leftover: Vec::new(),
             synth,
             log: Some(log),
             cursor: Some(cursor),
@@ -375,55 +377,48 @@ impl Tailer {
         }
         file.seek(SeekFrom::Start(self.offset))
             .with_context(|| format!("seek {}", self.path.display()))?;
-        let mut buf = Vec::with_capacity((len - self.offset) as usize);
-        file.read_to_end(&mut buf)
-            .with_context(|| format!("read {}", self.path.display()))?;
+        let mut emitted = 0;
+        while self.offset < len {
+            let read_len = (len - self.offset).min(TRANSCRIPT_READ_CHUNK_BYTES as u64);
+            let mut buf = Vec::with_capacity(read_len as usize);
+            (&mut file)
+                .take(read_len)
+                .read_to_end(&mut buf)
+                .with_context(|| format!("read {}", self.path.display()))?;
+            if buf.is_empty() {
+                break;
+            }
+            self.offset = self
+                .offset
+                .checked_add(buf.len() as u64)
+                .context("transcript read offset overflow")?;
+            emitted += self.ingest_bytes(&buf)?;
+        }
+        Ok(emitted)
+    }
+
+    /// Buffer one bounded read chunk, then parse and commit every complete line.
+    /// Bytes after the last LF stay in memory so an unterminated record is never
+    /// reread by the active producer and a UTF-8 code point may span chunks.
+    fn ingest_bytes(&mut self, chunk: &[u8]) -> Result<usize> {
+        self.leftover.extend_from_slice(chunk);
+        validate_record_lengths(&self.leftover, &self.path)?;
+        let Some(last_newline) = self.leftover.iter().rposition(|byte| *byte == b'\n') else {
+            return Ok(0);
+        };
+        let mut complete = std::mem::take(&mut self.leftover);
+        self.leftover = complete.split_off(last_newline + 1);
+        let complete = std::str::from_utf8(&complete)
+            .with_context(|| format!("decode transcript {} as UTF-8", self.path.display()))?;
 
         if self.cursor.is_some() {
-            let Some(last_newline) = buf.iter().rposition(|byte| *byte == b'\n') else {
-                return Ok(0);
-            };
-            let complete = std::str::from_utf8(&buf[..=last_newline]).with_context(|| {
-                format!(
-                    "decode detached transcript {} as UTF-8",
-                    self.path.display()
-                )
-            })?;
             let next_offset = self
                 .offset
-                .checked_add((last_newline + 1) as u64)
-                .context("detached transcript cursor offset overflow")?;
+                .checked_sub(self.leftover.len() as u64)
+                .context("detached transcript cursor offset underflow")?;
             return self.ingest_durable(complete, next_offset);
         }
 
-        self.offset = len;
-
-        let text = match std::str::from_utf8(&buf) {
-            Ok(s) => s,
-            Err(_) => {
-                // Non-UTF8 input shouldn't happen on JSONL but if it
-                // does, skip this chunk rather than corrupt the
-                // parser state. The next pump's read will give us a
-                // fresh window past `self.offset`.
-                self.leftover.clear();
-                return Ok(0);
-            }
-        };
-        self.ingest(text)
-    }
-
-    /// Parse the complete lines in `chunk` (prepended with any leftover partial
-    /// line from a previous call), emitting one span + durable event per parsed
-    /// transcript event; the trailing partial line is buffered for next time.
-    /// The byte-level reader ([`Tailer::pump`]) owns *where* bytes come from;
-    /// this owns *what they mean*.
-    fn ingest(&mut self, chunk: &str) -> Result<usize> {
-        // Combine leftover + new bytes, then split on `\n`. Anything after the
-        // final `\n` becomes the new leftover for the next call.
-        let mut combined = std::mem::take(&mut self.leftover);
-        combined.push_str(chunk);
-
-        let (complete, partial) = split_trailing_partial(&combined);
         let (parsed, durable, next_line_idx) = self.parse_complete(complete)?;
         // Durable spine append — best-effort + loud: a write failure must not
         // strand the OTLP/synth emits above or the tail's progress. (`append`
@@ -435,7 +430,6 @@ impl Tailer {
         }
         self.emit_parsed(&parsed);
         self.line_idx = next_line_idx;
-        self.leftover = partial.to_string();
         Ok(parsed.len())
     }
 
@@ -454,7 +448,6 @@ impl Tailer {
             &durable,
             next,
         )?;
-        self.offset = next_offset;
         self.line_idx = next_line_idx;
         self.emit_parsed(&parsed);
         Ok(parsed.len())
@@ -577,14 +570,16 @@ fn parse_with(harness: Harness, line: &str, idx: usize) -> Vec<TranscriptEvent> 
     }
 }
 
-/// Split `s` into `(complete, partial)` where `complete` ends at the
-/// last `\n` and `partial` is whatever followed. If `s` has no `\n`
-/// the whole thing is partial — we haven't seen a full line yet.
-fn split_trailing_partial(s: &str) -> (&str, &str) {
-    match s.rfind('\n') {
-        Some(idx) => s.split_at(idx + 1),
-        None => ("", s),
+fn validate_record_lengths(bytes: &[u8], path: &Path) -> Result<()> {
+    for record in bytes.split(|byte| *byte == b'\n') {
+        if record.len() > MAX_TRANSCRIPT_LINE_BYTES {
+            anyhow::bail!(
+                "transcript record in {} exceeds {MAX_TRANSCRIPT_LINE_BYTES} bytes",
+                path.display()
+            );
+        }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -702,6 +697,84 @@ mod tests {
             f.write_all(b"\n").unwrap();
         }
         assert_eq!(tailer.pump().unwrap(), 1, "completed line emits one event",);
+    }
+
+    #[test]
+    fn pump_preserves_utf8_split_across_read_chunks() {
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let path = tmp.path().to_path_buf();
+        let empty = codex_complete("one", "");
+        let content_marker = "\"last_agent_message\":\"";
+        let content_start = empty.find(content_marker).unwrap() + content_marker.len();
+        let padding = TRANSCRIPT_READ_CHUNK_BYTES - content_start - 1;
+        let content = format!("{}🌶", "a".repeat(padding));
+        let line = codex_complete("one", &content);
+        assert_eq!(line.find('🌶').unwrap(), TRANSCRIPT_READ_CHUNK_BYTES - 1);
+        let bytes = format!("{line}\n").into_bytes();
+
+        let mut tailer = Tailer::new(path, "sess".into(), Harness::Codex, false, None);
+        assert_eq!(
+            tailer
+                .ingest_bytes(&bytes[..TRANSCRIPT_READ_CHUNK_BYTES])
+                .unwrap(),
+            0,
+            "first chunk ends inside UTF-8"
+        );
+        assert_eq!(
+            tailer
+                .ingest_bytes(&bytes[TRANSCRIPT_READ_CHUNK_BYTES..])
+                .unwrap(),
+            1,
+            "next chunk completes the record"
+        );
+    }
+
+    #[test]
+    fn durable_sparse_unterminated_record_fails_before_attacker_length_is_read() {
+        crate::test_util::with_isolated_home("tailer-durable-sparse-oversize", || {
+            let pb = crate::pillbox::global();
+            let session_id = "sess-sparse";
+            let session_dir = crate::session::session_dir(&pb, session_id).unwrap();
+            let cursor_path = session_dir.join(".tailer-cursor.json");
+            let transcript = session_dir.join("rollout-sparse.jsonl");
+            let file = std::fs::File::create(&transcript).unwrap();
+            file.set_len(1024 * 1024 * 1024).unwrap();
+
+            let mut tailer = Tailer::new_durable(
+                transcript,
+                session_id.into(),
+                Harness::Codex,
+                true,
+                SessionLog::open(&pb, session_id).unwrap(),
+                cursor_path.clone(),
+            )
+            .unwrap();
+            let error = loop {
+                match tailer.pump() {
+                    Ok(0) => {}
+                    other => break other.expect_err("sparse record must cross the line bound"),
+                }
+            };
+
+            assert!(error
+                .to_string()
+                .contains(&format!("exceeds {MAX_TRANSCRIPT_LINE_BYTES} bytes")));
+            assert!(
+                tailer.offset <= (MAX_TRANSCRIPT_LINE_BYTES + TRANSCRIPT_READ_CHUNK_BYTES) as u64
+            );
+            assert!(
+                tailer.leftover.len() <= MAX_TRANSCRIPT_LINE_BYTES + TRANSCRIPT_READ_CHUNK_BYTES
+            );
+            assert_eq!(
+                read_cursor(&cursor_path, session_id)
+                    .unwrap()
+                    .unwrap()
+                    .position()
+                    .offset,
+                0,
+                "rejected history must not advance the durable cursor"
+            );
+        });
     }
 
     #[test]
@@ -855,6 +928,97 @@ mod tests {
     }
 
     #[test]
+    fn durable_cursor_does_not_reread_a_retained_partial_line() {
+        crate::test_util::with_isolated_home("tailer-durable-live-partial", || {
+            let pb = crate::pillbox::global();
+            let session_id = "sess-live-partial";
+            let session_dir = crate::session::session_dir(&pb, session_id).unwrap();
+            let cursor_path = session_dir.join(".tailer-cursor.json");
+            let transcript = session_dir.join("rollout-test.jsonl");
+            let first = codex_complete("one", "first");
+            let second = codex_complete("two", "second");
+            let split = second.len() / 2;
+            std::fs::write(&transcript, format!("{first}\n{}", &second[..split])).unwrap();
+
+            let mut tailer = Tailer::new_durable(
+                transcript.clone(),
+                session_id.into(),
+                Harness::Codex,
+                true,
+                SessionLog::open(&pb, session_id).unwrap(),
+                cursor_path.clone(),
+            )
+            .unwrap();
+            assert_eq!(tailer.pump().unwrap(), 1);
+            let read_offset = std::fs::metadata(&transcript).unwrap().len();
+            assert_eq!(tailer.offset, read_offset);
+            assert_eq!(
+                read_cursor(&cursor_path, session_id)
+                    .unwrap()
+                    .unwrap()
+                    .position()
+                    .offset,
+                first.len() as u64 + 1
+            );
+
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&transcript)
+                .unwrap();
+            file.write_all(&second.as_bytes()[split..]).unwrap();
+            file.write_all(b"\n").unwrap();
+            drop(file);
+            assert_eq!(tailer.pump().unwrap(), 1);
+            assert_eq!(
+                read_cursor(&cursor_path, session_id)
+                    .unwrap()
+                    .unwrap()
+                    .position()
+                    .offset,
+                std::fs::metadata(transcript).unwrap().len()
+            );
+        });
+    }
+
+    #[test]
+    fn durable_cursor_tracks_lines_across_multiple_unaligned_read_chunks() {
+        crate::test_util::with_isolated_home("tailer-durable-multichunk", || {
+            let pb = crate::pillbox::global();
+            let session_id = "sess-multichunk";
+            let session_dir = crate::session::session_dir(&pb, session_id).unwrap();
+            let cursor_path = session_dir.join(".tailer-cursor.json");
+            let transcript = session_dir.join("rollout-test.jsonl");
+            let content = "x".repeat(40 * 1024);
+            let body = (0..4)
+                .map(|index| codex_complete(&index.to_string(), &content))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n";
+            assert!(body.len() > 2 * TRANSCRIPT_READ_CHUNK_BYTES);
+            assert_ne!(
+                body.lines().next().unwrap().len() % TRANSCRIPT_READ_CHUNK_BYTES,
+                0
+            );
+            std::fs::write(&transcript, &body).unwrap();
+
+            let mut tailer = Tailer::new_durable(
+                transcript.clone(),
+                session_id.into(),
+                Harness::Codex,
+                true,
+                SessionLog::open(&pb, session_id).unwrap(),
+                cursor_path.clone(),
+            )
+            .unwrap();
+            assert_eq!(tailer.pump().unwrap(), 4);
+            assert_eq!(tailer.offset, body.len() as u64);
+            let cursor = read_cursor(&cursor_path, session_id).unwrap().unwrap();
+            assert_eq!(cursor.position().offset, body.len() as u64);
+            assert_eq!(cursor.position().line_idx, 4);
+        });
+    }
+
+    #[test]
     fn durable_cursor_rejects_same_path_with_changed_file_identity() {
         crate::test_util::with_isolated_home("tailer-durable-replaced-rollout", || {
             let pb = crate::pillbox::global();
@@ -974,21 +1138,11 @@ mod tests {
     }
 
     #[test]
-    fn split_trailing_partial_isolates_unterminated_tail() {
-        let (c, p) = split_trailing_partial("a\nb\nc");
-        assert_eq!(c, "a\nb\n");
-        assert_eq!(p, "c");
-
-        let (c, p) = split_trailing_partial("");
-        assert_eq!(c, "");
-        assert_eq!(p, "");
-
-        let (c, p) = split_trailing_partial("complete\n");
-        assert_eq!(c, "complete\n");
-        assert_eq!(p, "");
-
-        let (c, p) = split_trailing_partial("only-partial");
-        assert_eq!(c, "");
-        assert_eq!(p, "only-partial");
+    fn record_length_admission_accepts_the_limit_and_rejects_one_more_byte() {
+        let path = Path::new("rollout.jsonl");
+        assert!(validate_record_lengths(&vec![b'x'; MAX_TRANSCRIPT_LINE_BYTES], path).is_ok());
+        let error = validate_record_lengths(&vec![b'x'; MAX_TRANSCRIPT_LINE_BYTES + 1], path)
+            .expect_err("one byte over the record limit must fail");
+        assert!(error.to_string().contains("rollout.jsonl"));
     }
 }

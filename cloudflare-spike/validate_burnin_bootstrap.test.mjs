@@ -97,63 +97,118 @@ service = "huddles-projectors-managed-burnin"
 entrypoint = "PillboxAuthorizationCurrentnessEntrypoint"
 `;
 
-const metadata = { secrets: [{ name: "MANAGED_CAPABILITY_SECRET", type: "secret_text" }] };
-const d1Receipt = d1ReceiptFromBody({
-  schema_version: "pillbox.managed-d1-bootstrap-receipt/1",
-  source: "wrangler-d1-execute-remote",
-  observed_at: "2026-09-01T00:01:00.000Z",
-  database_id: "0123456789abcdef0123456789abcdef",
-  query_sha256: `sha256:${createHash("sha256").update(D1_BOOTSTRAP_QUERY).digest("hex")}`,
-  migrations: [
-    "0001_execution.sql",
-    "0002_managed_execution_allowance.sql",
-    "0003_workspace_finalize.sql",
-  ],
-  allowance: {
-    deployment_epoch: "burnin-test-v1",
-    execution_limit: 1,
-    reserved_executions: 0,
+const metadata = {
+  secrets: [{ name: "MANAGED_CAPABILITY_SECRET", type: "secret_text" }],
+};
+const remoteD1Result = [
+  {
+    results: [
+      { name: "0001_execution.sql" },
+      { name: "0002_managed_execution_allowance.sql" },
+      { name: "0003_workspace_finalize.sql" },
+    ],
+    success: true,
   },
-});
+  {
+    results: [
+      {
+        deployment_epoch: "burnin-test-v1",
+        execution_limit: 1,
+        reserved_executions: 0,
+      },
+    ],
+    success: true,
+  },
+];
+const queryRemoteD1 = async () => JSON.stringify(remoteD1Result);
 const validateBurninBootstrap = (input) =>
-  validateBurninBootstrapRaw({ d1Receipt, ...input });
+  validateBurninBootstrapRaw({ queryRemoteD1, ...input });
 
 test("exact Huddles tuple and resolved Wrangler metadata pass without secret output", async () => {
-  const result = await validateBurninBootstrap({ bootstrap, wrangler: config, metadata });
+  const result = await validateBurninBootstrap({
+    bootstrap,
+    wrangler: config,
+    metadata,
+  });
 
   assert.equal(result.status, "valid");
   assert.equal(result.signer.fingerprint, fingerprint);
   assert.equal(result.max_concurrent_executions, 1);
   assert.equal(result.capability_secret, "installed");
-  assert.deepEqual(result.d1_receipt.allowance, d1Receipt.allowance);
+  assert.deepEqual(result.d1_receipt.allowance, remoteD1Result[1].results[0]);
+  assert.equal(
+    result.d1_receipt.source,
+    "validator-owned-wrangler-d1-execute-remote",
+  );
+  assert.match(result.d1_receipt.raw_output_sha256, /^sha256:[0-9a-f]{64}$/);
   assert.doesNotMatch(JSON.stringify(result), /secret_text/);
 });
 
-test("live D1 receipt must prove the exact applied migrations and allowance row", async () => {
+test("validator-owned raw remote D1 output must prove exact migrations and allowance", async () => {
   await assert.rejects(
     validateBurninBootstrapRaw({ bootstrap, wrangler: config, metadata }),
-    /D1 applied receipt must be an object/,
+    /validator-owned remote D1 query runner is required/,
   );
   for (const mutate of [
-    (receipt) => receipt.migrations.pop(),
-    (receipt) => { receipt.allowance.deployment_epoch = "other-epoch"; },
-    (receipt) => { receipt.allowance.execution_limit = 2; },
-    (receipt) => { receipt.allowance.reserved_executions = 1; },
-    (receipt) => { receipt.query_sha256 = `sha256:${"0".repeat(64)}`; },
+    (result) => result[0].results.pop(),
+    (result) => {
+      result[1].results[0].deployment_epoch = "other-epoch";
+    },
+    (result) => {
+      result[1].results[0].execution_limit = 2;
+    },
+    (result) => {
+      result[1].results[0].reserved_executions = 1;
+    },
+    (result) => {
+      result[1].success = false;
+    },
   ]) {
-    const invalid = structuredClone(d1Receipt);
+    const invalid = structuredClone(remoteD1Result);
     mutate(invalid);
-    const signed = d1ReceiptFromBody(invalid);
     await assert.rejects(
-      validateBurninBootstrap({ bootstrap, wrangler: config, metadata, d1Receipt: signed }),
-      /D1 applied receipt/,
+      validateBurninBootstrap({
+        bootstrap,
+        wrangler: config,
+        metadata,
+        queryRemoteD1: async (request) => {
+          assert.deepEqual(request, {
+            database_name: "pillbox-managed-burnin-db",
+            database_id: "0123456789abcdef0123456789abcdef",
+            query: D1_BOOTSTRAP_QUERY,
+          });
+          return JSON.stringify(invalid);
+        },
+      }),
+      /remote D1/,
     );
   }
 });
 
+test("fabricated normalized D1 receipts are not accepted as query output", async () => {
+  await assert.rejects(
+    validateBurninBootstrap({
+      bootstrap,
+      wrangler: config,
+      metadata,
+      queryRemoteD1: async () =>
+        JSON.stringify({
+          schema_version: "pillbox.managed-d1-bootstrap-receipt/1",
+          migrations: remoteD1Result[0].results.map(({ name }) => name),
+          allowance: remoteD1Result[1].results[0],
+        }),
+    }),
+    /exactly the migration and allowance query results/,
+  );
+});
+
 test("missing capability-secret metadata fails closed", async () => {
   await assert.rejects(
-    validateBurninBootstrap({ bootstrap, wrangler: config, metadata: { secrets: [] } }),
+    validateBurninBootstrap({
+      bootstrap,
+      wrangler: config,
+      metadata: { secrets: [] },
+    }),
     /MANAGED_CAPABILITY_SECRET is not installed/,
   );
 });
@@ -171,7 +226,11 @@ test("dry-run tuples and unverified applied authority receipts fail closed", asy
   const unverified = structuredClone(bootstrap);
   unverified.authority_receipt.issuer_self_test.status = "configured";
   await assert.rejects(
-    validateBurninBootstrap({ bootstrap: unverified, wrangler: config, metadata }),
+    validateBurninBootstrap({
+      bootstrap: unverified,
+      wrangler: config,
+      metadata,
+    }),
     /issuer_self_test status must be verified/,
   );
 });
@@ -180,7 +239,11 @@ test("authority receipt digest and exact database, issuer, and currentness proof
   const wrongDigest = structuredClone(bootstrap);
   wrongDigest.authority_receipt.receipt_sha256 = `sha256:${"0".repeat(64)}`;
   await assert.rejects(
-    validateBurninBootstrap({ bootstrap: wrongDigest, wrangler: config, metadata }),
+    validateBurninBootstrap({
+      bootstrap: wrongDigest,
+      wrangler: config,
+      metadata,
+    }),
     /receipt_sha256 does not match/,
   );
 
@@ -191,9 +254,15 @@ test("authority receipt digest and exact database, issuer, and currentness proof
   ]) {
     const mismatched = structuredClone(bootstrap);
     mismatched.authority_receipt[section][field] = "other";
-    mismatched.authority_receipt = authorityReceiptFromBody(mismatched.authority_receipt);
+    mismatched.authority_receipt = authorityReceiptFromBody(
+      mismatched.authority_receipt,
+    );
     await assert.rejects(
-      validateBurninBootstrap({ bootstrap: mismatched, wrangler: config, metadata }),
+      validateBurninBootstrap({
+        bootstrap: mismatched,
+        wrangler: config,
+        metadata,
+      }),
       /does not match the bootstrap tuple/,
     );
   }
@@ -238,14 +307,22 @@ test("placeholder public keys, D1 IDs, and concurrency never validate", async ()
   placeholderDatabase.d1_databases[0].database_id =
     "00000000-0000-4000-8000-000000000004";
   await assert.rejects(
-    validateBurninBootstrap({ bootstrap, wrangler: placeholderDatabase, metadata }),
+    validateBurninBootstrap({
+      bootstrap,
+      wrangler: placeholderDatabase,
+      metadata,
+    }),
     /database_id is invalid or still a placeholder/,
   );
 
   const wrongConcurrency = parseWranglerToml(config);
   wrongConcurrency.containers[0].max_instances = 2;
   await assert.rejects(
-    validateBurninBootstrap({ bootstrap, wrangler: wrongConcurrency, metadata }),
+    validateBurninBootstrap({
+      bootstrap,
+      wrangler: wrongConcurrency,
+      metadata,
+    }),
     /Sandbox container tuple does not match/,
   );
 });
@@ -254,7 +331,11 @@ test("full topology requires isolated RUN_COSTS and only the vendor Sandbox tupl
   const missingAnalytics = parseWranglerToml(config);
   missingAnalytics.analytics_engine_datasets = [];
   await assert.rejects(
-    validateBurninBootstrap({ bootstrap, wrangler: missingAnalytics, metadata }),
+    validateBurninBootstrap({
+      bootstrap,
+      wrangler: missingAnalytics,
+      metadata,
+    }),
     /isolated RUN_COSTS binding/,
   );
 
@@ -318,19 +399,11 @@ function authorityReceiptFromBody(receipt) {
   };
 }
 
-function d1ReceiptFromBody(receipt) {
-  const { receipt_sha256: _ignored, ...body } = receipt;
-  return {
-    ...body,
-    receipt_sha256: `sha256:${createHash("sha256").update(canonicalJson(body)).digest("hex")}`,
-  };
-}
-
 function canonicalJson(value) {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   return `{${Object.keys(value)
-    .sort((left, right) => left < right ? -1 : left > right ? 1 : 0)
+    .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0))
     .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
     .join(",")}}`;
 }

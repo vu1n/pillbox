@@ -121,3 +121,5 @@ managed-tier-do-gateway conforms: PB-023 serializes one local managed turn from 
 session-event-log-spine conforms: PB-023 persists the detached Codex rollout byte position only after the authoritative exact session-log batch and recovers the append/cursor crash window through append_exact_batch without changing sequence authority.
 substrate-plane-livesession conforms: PB-023 restores a failed detached Codex transcript producer behind LiveSession::spawn_log_tailer while preserving the sole-producer boundary for every reader.
 optimization-external-substrate-primitives conforms: PB-023 adds only local session serialization and durable transcript evidence recovery; no routing, optimization, or policy authority enters the substrate.
+managed-tier-do-gateway conforms: PB-024 replaces only a literal-only formatting call in managed workspace transfer validation; the prefix-scoped R2 credential boundary and fail-closed error semantics are unchanged.
+managed-store-of-record conforms: PB-024 is a strict-Clippy gate repair in transfer validation; rustic-over-R2 remains the authoritative workspace store and handle space.

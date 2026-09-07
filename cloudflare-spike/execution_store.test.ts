@@ -4,16 +4,16 @@ import type { ExecutionArtifactRef } from "./src/codex_execution.ts";
 import {
   D1ExecutionStore,
   type ExecutionClaimInput,
-  type ManagedExecutionAllowance,
   type RelationalDatabase,
   type RelationalResult,
   type RelationalStatement,
   type RelationalUsage,
 } from "./src/execution_store.ts";
+import type { ManagedExecutionOwner } from "./src/managed_ownership.ts";
 
-const allowance: ManagedExecutionAllowance = {
-  deployment_epoch: "preview-2026-09-01",
-  execution_limit: 3,
+const owner: ManagedExecutionOwner = {
+  domain: "huddles_workspace",
+  digest: `sha256:${"d".repeat(64)}`,
 };
 
 const hashA = `sha256:${"a".repeat(64)}` as const;
@@ -36,6 +36,9 @@ function claim(
     execution_digest: digest,
     execution_policy_revision: "policy/1",
     session_id: "session-1",
+    owner,
+    allowance_epoch: "preview-2026-09-01",
+    allowance_limit: 3,
     attribution: {
       harness: "opencode",
       transport: "http",
@@ -49,18 +52,19 @@ function claim(
   };
 }
 
-test("happy path uses one claim write, one allowance write, and one terminal write", async () => {
+test("happy path uses one execution claim write and one terminal write", async () => {
   const database = new FakeDatabase();
   const usage: RelationalUsage[] = [];
   const store = new D1ExecutionStore(database, (item) => usage.push(item));
 
-  const created = await store.claim(claim(), allowance);
+  const created = await store.claim(claim());
   assert.equal(created.kind, "created");
   assert.equal(
     await store.finish({
       invocation_id: "invocation-1",
       request_hash: hashA,
       owner_token: "owner-1",
+      owner,
       status: "completed",
       artifact_ref: artifact,
       now_ms: 2_000,
@@ -68,22 +72,19 @@ test("happy path uses one claim write, one allowance write, and one terminal wri
     true,
   );
 
-  assert.equal(sum(usage, "rows_written"), 3);
+  assert.equal(sum(usage, "rows_written"), 2);
   assert.ok(sum(usage, "rows_read") <= 1);
-  assert.equal((await store.get("invocation-1"))?.artifact_ref?.key, artifact.key);
+  assert.equal((await store.get("invocation-1", owner))?.artifact_ref?.key, artifact.key);
 });
 
 test("exact retries reuse the row without another write", async () => {
   const database = new FakeDatabase();
   const usage: RelationalUsage[] = [];
   const store = new D1ExecutionStore(database, (item) => usage.push(item));
-  await store.claim(claim(), allowance);
+  await store.claim(claim());
   usage.length = 0;
 
-  const retry = await store.claim(
-    claim({ owner_token: "ignored-new-owner" }),
-    allowance,
-  );
+  const retry = await store.claim(claim({ owner_token: "ignored-new-owner" }));
   assert.equal(retry.kind, "reused");
   assert.equal(retry.record.owner_token, "owner-1");
   assert.equal(sum(usage, "rows_written"), 0);
@@ -93,18 +94,15 @@ test("exact retries reuse the row without another write", async () => {
 test("changed content or reused idempotency keys conflict", async () => {
   const database = new FakeDatabase();
   const store = new D1ExecutionStore(database);
-  await store.claim(claim(), allowance);
+  await store.claim(claim());
 
   assert.equal(
-    (await store.claim(claim({ request_hash: hashB }), allowance)).kind,
+    (await store.claim(claim({ request_hash: hashB }))).kind,
     "conflict",
   );
   assert.equal(
     (
-      await store.claim(
-        claim({ invocation_id: "invocation-2", owner_token: "owner-2" }),
-        allowance,
-      )
+      await store.claim(claim({ invocation_id: "invocation-2", owner_token: "owner-2" }))
     ).kind,
     "conflict",
   );
@@ -113,19 +111,20 @@ test("changed content or reused idempotency keys conflict", async () => {
 
 test("only the live owner can terminalize a running execution", async () => {
   const store = new D1ExecutionStore(new FakeDatabase());
-  await store.claim(claim(), allowance);
+  await store.claim(claim());
   assert.equal(
     await store.finish({
       invocation_id: "invocation-1",
       request_hash: hashA,
       owner_token: "other-owner",
+      owner,
       status: "failed",
       artifact_ref: artifact,
       now_ms: 2_000,
     }),
     false,
   );
-  assert.equal((await store.get("invocation-1"))?.status, "running");
+  assert.equal((await store.get("invocation-1", owner))?.status, "running");
 });
 
 function sum(items: readonly RelationalUsage[], key: keyof RelationalUsage): number {
@@ -189,14 +188,14 @@ class FakeStatement implements RelationalStatement {
         harness,
         transport,
         requested_model,
+        owner_domain,
+        owner_digest,
         owner_token,
         lease_expires_at_ms,
         created_at_ms,
         updated_at_ms,
         allowance_epoch,
         allowance_limit,
-        expected_allowance_epoch,
-        expected_allowance_limit,
       ] = this.values;
       const duplicate =
         this.database.rows.has(String(invocation_id)) ||
@@ -204,16 +203,6 @@ class FakeStatement implements RelationalStatement {
           (row) => row.idempotency_key === idempotency_key,
         );
       if (duplicate) return { meta: { changes: 0, rows_written: 0 } };
-      if (
-        this.database.allowance.deployment_epoch !== expected_allowance_epoch ||
-        this.database.allowance.execution_limit !== expected_allowance_limit ||
-        allowance_epoch !== expected_allowance_epoch ||
-        allowance_limit !== expected_allowance_limit ||
-        this.database.allowance.reserved_executions >=
-          this.database.allowance.execution_limit
-      ) {
-        return { meta: { changes: 0, rows_written: 0 } };
-      }
       this.database.rows.set(String(invocation_id), {
         invocation_id,
         idempotency_key,
@@ -224,6 +213,8 @@ class FakeStatement implements RelationalStatement {
         harness,
         transport,
         requested_model,
+        owner_domain,
+        owner_digest,
         status: "running",
         owner_token,
         lease_expires_at_ms,
@@ -236,8 +227,7 @@ class FakeStatement implements RelationalStatement {
         artifact_bytes: null,
         artifact_sha256: null,
       });
-      this.database.allowance.reserved_executions += 1;
-      return { meta: { changes: 2, rows_written: 2 } };
+      return { meta: { changes: 1, rows_written: 1 } };
     }
     if (this.sql.startsWith("UPDATE execution")) {
       const [
@@ -250,12 +240,16 @@ class FakeStatement implements RelationalStatement {
         invocation_id,
         request_hash,
         owner_token,
+        owner_domain,
+        owner_digest,
       ] = this.values;
       const row = this.database.rows.get(String(invocation_id));
       if (
         row === undefined ||
         row.request_hash !== request_hash ||
         row.owner_token !== owner_token ||
+        row.owner_domain !== owner_domain ||
+        row.owner_digest !== owner_digest ||
         row.status !== "running"
       ) {
         return { meta: { changes: 0, rows_written: 0 } };

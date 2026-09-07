@@ -83,13 +83,6 @@ pub(super) fn execute_turn(
     // recovery marker should be created for a request the peer will reject.
     validate_rendered_input(text)?;
     let model = model.unwrap_or(crate::sandbox::opencode::DEFAULT_MODEL);
-    let (provider, model_id) = model.split_once('/').ok_or_else(|| {
-        PillboxError::config(
-            "session send",
-            format!("managed model must be provider/model, got `{model}`"),
-        )
-    })?;
-    validate_model_parts(provider, model_id)?;
     // Journal identity and the remote side effect are one per-session critical
     // section. Keep this guard alive through local evidence fsync + journal clear.
     let _turn_lock = ManagedTurnLock::try_acquire(resolved, session_id)?;
@@ -99,14 +92,80 @@ pub(super) fn execute_turn(
         .as_ref()
         .map(|state| state.request().invocation_id.clone())
         .unwrap_or_else(crate::session::Session::new_id);
-    let rendered_hash = request_sha256(text);
+    let prepared = build_prepared(session_id, text, model, &invocation_id)?;
+    let resumed = existing.is_some();
+    if let Some(existing) = existing {
+        validate_pending(existing.request())?;
+        if existing.request() != &prepared.pending {
+            return Err(PillboxError::runtime(
+                "session send",
+                format!(
+                    "managed session has unresolved invocation `{}` with a different canonical request identity",
+                    existing.request().invocation_id
+                ),
+            )
+            .with_next("retry the exact pending turn before sending different input")
+            .into());
+        }
+        if let Some(commit) = existing.commit() {
+            return recover_commit(resolved, session_id, &journal, commit);
+        }
+    } else {
+        journal.persist(&PendingState::prepared(prepared.pending.clone()))?;
+    }
+
+    execute_prepared(
+        resolved,
+        session_id,
+        endpoint,
+        capability_secret,
+        prepared,
+        resumed,
+        journal,
+    )
+}
+
+pub(super) fn prepare_initial_turn(
+    resolved: &Pillbox,
+    session_id: &str,
+    text: &str,
+    model: &str,
+) -> Result<PreparedInvocation> {
+    validate_rendered_input(text)?;
+    let _turn_lock = ManagedTurnLock::try_acquire(resolved, session_id)?;
+    let journal = PendingJournal::open(resolved, session_id)?;
+    if journal.load()?.is_some() {
+        return Err(PillboxError::runtime(
+            "run",
+            "new managed session unexpectedly has a pending invocation",
+        )
+        .into());
+    }
+    let prepared = build_prepared(session_id, text, model, &crate::session::Session::new_id())?;
+    journal.persist(&PendingState::prepared(prepared.pending.clone()))?;
+    Ok(prepared)
+}
+
+fn build_prepared(
+    session_id: &str,
+    text: &str,
+    model: &str,
+    invocation_id: &str,
+) -> Result<PreparedInvocation> {
+    let (provider, model_id) = model.split_once('/').ok_or_else(|| {
+        PillboxError::config(
+            "session send",
+            format!("managed model must be provider/model, got `{model}`"),
+        )
+    })?;
+    validate_model_parts(provider, model_id)?;
     let request = serde_json::json!({
         "contract_version": CONTRACT_VERSION,
         "session_ref": { "session_id": session_id },
         "invocation_id": invocation_id,
         "idempotency_key": invocation_id,
         "rendered_input": text,
-        "rendered_input_hash": rendered_hash,
+        "rendered_input_hash": request_sha256(text),
         "tool_policy": "deny_all",
         "execution": {
             "transport": {
@@ -130,9 +189,9 @@ pub(super) fn execute_turn(
     let body = serde_json::to_string(&request).context("serialize managed execution request")?;
     // The peer bounds exact UTF-8 request bytes before decoding or journaling.
     validate_request_body(&body)?;
-    let prepared = PreparedInvocation {
+    Ok(PreparedInvocation {
         pending: PendingRequest {
-            invocation_id: invocation_id.clone(),
+            invocation_id: invocation_id.to_string(),
             body_sha256: request_sha256(&body),
             request_hash: canonical_sha256(&request)?,
             execution_digest: canonical_sha256(&serde_json::json!({
@@ -143,28 +202,18 @@ pub(super) fn execute_turn(
             request_body: body,
         },
         requested_model: model.to_string(),
-    };
-    let resumed = existing.is_some();
-    if let Some(existing) = existing {
-        validate_pending(existing.request())?;
-        if existing.request() != &prepared.pending {
-            return Err(PillboxError::runtime(
-                "session send",
-                format!(
-                    "managed session has unresolved invocation `{}` with a different canonical request identity",
-                    existing.request().invocation_id
-                ),
-            )
-            .with_next("retry the exact pending turn before sending different input")
-            .into());
-        }
-        if let Some(commit) = existing.commit() {
-            return recover_commit(resolved, session_id, &journal, commit);
-        }
-    } else {
-        journal.persist(&PendingState::prepared(prepared.pending.clone()))?;
-    }
+    })
+}
 
+fn execute_prepared(
+    resolved: &Pillbox,
+    session_id: &str,
+    endpoint: &str,
+    capability_secret: &str,
+    prepared: PreparedInvocation,
+    resumed: bool,
+    journal: PendingJournal,
+) -> Result<()> {
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(600))
         .build()
@@ -564,6 +613,27 @@ mod tests {
             drop(held);
             ManagedTurnLock::try_acquire(&resolved, "session-a")
                 .expect("dropping the owner releases the session lock");
+        });
+    }
+
+    #[test]
+    fn initial_preparation_durably_seals_the_invocation_used_by_execute() {
+        crate::test_util::with_isolated_home("managed-initial-preparation", || {
+            let resolved = crate::pillbox::global();
+            let session_id = "initial-session";
+            let prepared =
+                prepare_initial_turn(&resolved, session_id, "hello\n", "provider/model").unwrap();
+            let journal = PendingJournal::open(&resolved, session_id).unwrap();
+            let persisted = journal.load().unwrap().expect("prepared journal exists");
+            assert_eq!(persisted.request(), &prepared.pending);
+            assert_eq!(
+                persisted.request().request_hash,
+                canonical_sha256(
+                    &serde_json::from_str::<serde_json::Value>(&persisted.request().request_body)
+                        .unwrap()
+                )
+                .unwrap()
+            );
         });
     }
 

@@ -15,9 +15,13 @@ import {
 } from "./execution_service.js";
 import {
   D1ExecutionStore,
-  parseManagedExecutionAllowance,
   type RelationalDatabase,
 } from "./execution_store.js";
+import {
+  D1ManagedExecutionReservationStore,
+  parseManagedExecutionAllowance,
+} from "./managed_reservation.js";
+import { publicControllerOwner } from "./managed_ownership.js";
 import {
   enforceHuddlesOpencodePolicy,
   type HuddlesOpencodeConfig,
@@ -115,7 +119,7 @@ export class HuddlesRuntimeEntrypoint extends WorkerEntrypoint<Env> {
     if (configured === null) {
       throw new Error("managed execution allowance configuration is invalid");
     }
-    const store = new D1ExecutionStore(
+    const store = new D1ManagedExecutionReservationStore(
       this.env.EXECUTION_DB as unknown as RelationalDatabase,
     );
     const snapshot = await store.getAllowance(configured);
@@ -145,7 +149,9 @@ export class LocalLegacyRuntimeEntrypoint extends WorkerEntrypoint<Env> {
     requireManagedAdmission(
       managedAdmissionPolicy(this.env.MANAGED_EXECUTION_ENABLED),
     );
-    const service = executionService(this.env);
+    const service = executionService(this.env, async () =>
+      publicControllerOwner({ subject: "local-legacy-test" }),
+    );
     return invokeLegacySession(validated, (execution) =>
       service.executeInvocation(execution),
     );
@@ -158,11 +164,15 @@ export class LocalLegacyRuntimeEntrypoint extends WorkerEntrypoint<Env> {
 
 export function executionService(
   env: Env,
-  authorizer?: ExecutionOperationAuthorizer,
+  authorizer: ExecutionOperationAuthorizer,
 ): ExecutionService {
   requireManagedBurninBootstrap(env);
   const meter = new RunCostMeter();
   const store = new D1ExecutionStore(
+    env.EXECUTION_DB as unknown as RelationalDatabase,
+    meter.observeRelational,
+  );
+  const reservations = new D1ManagedExecutionReservationStore(
     env.EXECUTION_DB as unknown as RelationalDatabase,
     meter.observeRelational,
   );
@@ -193,6 +203,7 @@ export function executionService(
       env.MANAGED_EXECUTION_EPOCH,
       env.MANAGED_EXECUTION_LIMIT,
     ),
+    reservations,
     authorizer,
   });
 }

@@ -25,6 +25,7 @@ import {
   validateExecutionOperationGrantIssueResponse,
 } from "./managed_contract.js";
 import { sha256Hex } from "./runtime_identity.js";
+import { huddlesExecutionOwner, type ManagedExecutionOwner } from "./managed_ownership.js";
 
 export interface PillboxAuthorizationCurrentness {
   authorizeExecutionOperationGrant(
@@ -212,7 +213,7 @@ export async function authorizeExecutionOperation(
   authorization: unknown,
   operation: PillboxExecutionOperation,
   request: ExecutionOperationRequest,
-): Promise<void> {
+): Promise<ManagedExecutionOwner> {
   const verified = await verifySignedExecutionOperationGrantWithSigner(
     authorization,
     env.PILLBOX_GRANT_KEY_ID,
@@ -267,6 +268,7 @@ export async function authorizeExecutionOperation(
         "managed execution operation grant expired during authorization",
       );
     }
+    return huddlesExecutionOwner(validated);
   } catch (cause) {
     if (cause instanceof ManagedAuthorizationError) throw cause;
     throw new ManagedAuthorizationError(

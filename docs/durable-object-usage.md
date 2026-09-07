@@ -25,7 +25,7 @@ A new Pillbox-authored DO class requires all of the following before code:
 
 | Data | Store | Constraint |
 |---|---|---|
-| Invocation claim, idempotency hash, lease, terminal references | D1 | bounded rows; primary-key point queries; no raw deltas |
+| Session owner, invocation reservation and claim, idempotency hash, lease, terminal references | D1 | bounded rows; primary-key point queries; opaque owner digest; no raw deltas |
 | Raw/bulky evidence, logs, terminal output, snapshots | R2 | immutable/content-addressed objects; bounded object size |
 | Aggregate run analytics | Analytics Engine | at most one compact point per terminal run; no content or identity |
 | Pillbox CLI session log | local `SessionLog` | local single-controller sequencing |
@@ -66,6 +66,14 @@ matching `MANAGED_EXECUTION_EPOCH` after migration 0002. The D1 allowance is the
 hard application breaker, does not auto-reset, and is reseeded only as a new
 operator-reviewed epoch. `MANAGED_EXECUTION_ENABLED = 0` remains the default
 kill switch and does not affect local libkrun Pillbox.
+
+A genuinely new invocation first inserts one durable reservation. The insert
+atomically binds or checks the session owner and increments the allowance;
+failure rolls back all three effects. Provision is the initial invocation's
+reservation and execution consumes it without another increment. Exact retries
+perform only bounded point lookups. A crash after provision reservation is
+fail-closed: the row remains consumed and restore is never repeated from
+ephemeral credential material.
 
 For every captured `RunCostEnvelope`, compare the per-run units and profile with
 the same invocation's D1, R2, Container, Worker, Analytics Engine, and vendor

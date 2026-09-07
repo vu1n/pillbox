@@ -62,7 +62,7 @@ test("public provisioning and local legacy invocation keep the admission guard",
 
   const invoke = runtime.indexOf("async invokeSession(", runtime.indexOf("LocalLegacyRuntimeEntrypoint"));
   const admission = runtime.indexOf("requireManagedAdmission", invoke);
-  const execution = runtime.indexOf("executionService(this.env)", invoke);
+  const execution = runtime.indexOf("executionService(this.env,", invoke);
   assert.ok(invoke >= 0 && admission > invoke && execution > admission);
 });
 

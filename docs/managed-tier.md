@@ -30,13 +30,19 @@ namespace retirement needs a separate retention/export review.
 
 ## Execution lifecycle
 
-1. The client snapshots its workspace to its rustic-on-R2 repository and sends
-   scoped, short-lived transfer credentials with an exact provision capability to
+1. The client prepares the initial invocation identity and request hash, snapshots
+   its workspace to its rustic-on-R2 repository, and sends scoped, short-lived
+   transfer credentials with that identity and an exact provision capability to
    `POST /v2/workspaces/provision`.
-2. `POST /v2/executions` validates and hashes the sealed request.
-3. D1 claims the invocation with a point query/write. Exact retries reuse the
-   row; changed content conflicts; an expired owner is interrupted, never
-   re-sampled.
+2. Before Sandbox lookup or restore, D1 atomically binds the session to an opaque
+   authorization owner and reserves one reviewed invocation allowance. Exact
+   provision retries never restore twice; an ambiguous `provisioning` row stays
+   consumed for operator reconciliation.
+3. `POST /v2/executions` validates and hashes the sealed request. Its D1 claim
+   consumes the matching ready provision reservation without reserving again.
+   Direct and later invocations reserve once before runtime work. Exact retries
+   reuse the row; changed content conflicts; an expired runtime owner is
+   interrupted, never re-sampled.
 4. Cloudflare Sandbox runs the OpenCode turn within a five-minute and
    2,000-event bound.
 5. Pillbox writes one immutable R2 artifact, terminalizes the D1 row, and emits
@@ -48,9 +54,26 @@ namespace retirement needs a separate retention/export review.
    verifies that lineage in the authoritative rustic repository before persisting
    the result handle.
 
-The happy-path persistence budget is two D1 writes, one R2 object write, and one
-Analytics Engine point. Status reads are bounded pages of at most 100 events.
+The execution-only happy-path persistence budget is one reservation claim, one
+execution claim, one terminal D1 update, one R2 object write, and one Analytics
+Engine point. An initial public provision uses its provision reservation in
+place of the execution reservation, plus one readiness update; finalize retains
+its separate claim and terminal update. Triggered session-owner and allowance
+row mutations are counted explicitly during reconciliation. Status reads are
+bounded pages of at most 100 events.
 There are no per-token, per-delta, PTY-frame, progress, or replay writes.
+
+The allowance bounds genuinely new managed invocations, not total spend.
+Incoming Worker, authorization/currentness, status, and D1 reads, operator-side
+rustic snapshot traffic, and provider infrastructure remain separately
+attributable costs.
+
+Public HMAC and private Huddles authorization deliberately produce different
+owner domains. A session provisioned by a public controller can only be executed
+by that public controller owner; a private Huddles grant cannot adopt it. The
+current Huddles burn-in uses direct private execution and trusted operator
+finalize. A future Huddles workspace restore needs an authenticated,
+owner-preserving broker contract rather than a cross-domain bypass.
 
 ## Cost evidence
 
@@ -91,6 +114,12 @@ identity.
   the exact bounded request bytes, and the exact session/invocation id. Huddles
   uses the trusted same-account service binding and owns participant/driver
   authorization.
+- Every session is durably bound to one opaque owner domain and digest at its
+  first invocation reservation. Huddles ownership derives from the verified
+  installation, execution realm, organization, and workspace; public HMAC
+  controllers occupy a separate domain. Principal, policy, grant, signer, and
+  credential material are not persisted. Legacy rows without that provenance
+  fail closed.
 - Public managed execution is `tool_policy: deny_all`. Tool-enabled execution is
   disabled until provider and workspace credentials have a brokered boundary;
   local microVM tools are unaffected.

@@ -13,10 +13,16 @@ import {
   workspaceFinalizeIdentity,
 } from "./src/workspace_finalize.ts";
 
-const migration = readFileSync(
-  new URL("./migrations/0003_workspace_finalize.sql", import.meta.url),
-  "utf8",
-);
+const migrations = [
+  "0001_execution.sql",
+  "0002_managed_execution_allowance.sql",
+  "0003_workspace_finalize.sql",
+  "0004_managed_reservation_ownership.sql",
+].map((name) => readFileSync(new URL(`./migrations/${name}`, import.meta.url), "utf8"));
+const targetOwner = {
+  domain: "huddles_workspace" as const,
+  digest: `sha256:${"a".repeat(64)}` as const,
+};
 
 test("canonical session/request identity is stable across object key order", async () => {
   const first = await workspaceFinalizeIdentity("session-1", {
@@ -39,12 +45,12 @@ test("canonical session/request identity is stable across object key order", asy
 
 test("durable finalize claims replay exact requests and conflict on changed session content", async () => {
   const sqlite = new DatabaseSync(":memory:");
-  sqlite.exec(migration);
+  for (const migration of migrations) sqlite.exec(migration);
   const store = new D1WorkspaceFinalizeStore(new SqliteDatabase(sqlite));
   const identity = await workspaceFinalizeIdentity("session-1", {
     sessionId: "session-1",
   });
-  const input = { ...identity, session_id: "session-1", now_ms: 10 };
+  const input = { ...identity, session_id: "session-1", target_owner: targetOwner, now_ms: 10 };
 
   assert.equal((await store.claim(input)).kind, "created");
   assert.equal((await store.claim({ ...input, now_ms: 11 })).kind, "reused");
@@ -54,7 +60,7 @@ test("durable finalize claims replay exact requests and conflict on changed sess
     workspace: { snapshot: "b".repeat(64) },
   });
   assert.equal(
-    (await store.claim({ ...changed, session_id: "session-1", now_ms: 12 }))
+    (await store.claim({ ...changed, session_id: "session-1", target_owner: targetOwner, now_ms: 12 }))
       .kind,
     "conflict",
   );
@@ -62,6 +68,7 @@ test("durable finalize claims replay exact requests and conflict on changed sess
   assert.equal(
     await store.complete({
       finalize_id: identity.finalize_id,
+      target_owner: targetOwner,
       result_snapshot: "c".repeat(64),
       now_ms: 20,
     }),
@@ -70,6 +77,7 @@ test("durable finalize claims replay exact requests and conflict on changed sess
   assert.equal(
     await store.complete({
       finalize_id: identity.finalize_id,
+      target_owner: targetOwner,
       result_snapshot: "d".repeat(64),
       now_ms: 21,
     }),
@@ -83,12 +91,12 @@ test("durable finalize claims replay exact requests and conflict on changed sess
 
 test("a surviving running claim is replayed without becoming a new owner", async () => {
   const sqlite = new DatabaseSync(":memory:");
-  sqlite.exec(migration);
+  for (const migration of migrations) sqlite.exec(migration);
   const store = new D1WorkspaceFinalizeStore(new SqliteDatabase(sqlite));
   const identity = await workspaceFinalizeIdentity("session-crash", {
     sessionId: "session-crash",
   });
-  const input = { ...identity, session_id: "session-crash", now_ms: 10 };
+  const input = { ...identity, session_id: "session-crash", target_owner: targetOwner, now_ms: 10 };
   assert.equal((await store.claim(input)).kind, "created");
 
   const recovery = await store.claim({ ...input, now_ms: 60_000 });

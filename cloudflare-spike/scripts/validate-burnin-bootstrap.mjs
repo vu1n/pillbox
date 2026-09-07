@@ -19,6 +19,7 @@ const REQUIRED_D1_MIGRATIONS = Object.freeze([
   "0001_execution.sql",
   "0002_managed_execution_allowance.sql",
   "0003_workspace_finalize.sql",
+  "0004_managed_reservation_ownership.sql",
 ]);
 const ISOLATED_RESOURCES = Object.freeze({
   worker: "pillbox-managed-burnin",

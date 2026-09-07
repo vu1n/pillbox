@@ -22,6 +22,9 @@ const {
   requireManagedBurninBootstrap,
   requireManagedBurninHttpBootstrap,
 } = await import("./src/managed_auth.ts");
+const { huddlesExecutionOwner, publicControllerOwner } = await import(
+  "./src/managed_ownership.ts"
+);
 import {
   managedCanonicalJson,
   makeExecutionOperationGrantCurrentnessRequest,
@@ -51,6 +54,38 @@ const operationClaims = {
   not_before: 100,
   expires_at: 160,
 };
+
+test("workspace ownership is stable across grant evolution and domain-separated from public HMAC", async () => {
+  const owner = await huddlesExecutionOwner(operationClaims);
+  assert.deepEqual(
+    await huddlesExecutionOwner({
+      ...operationClaims,
+      grant_id: "another-grant",
+      principal_id: "another-principal",
+      policy_id: "another-policy",
+      expires_at: 999,
+    }),
+    owner,
+  );
+  for (const changedClaims of [
+    {
+      ...operationClaims,
+      installation: { ...operationClaims.installation, installation_id: "another-install" },
+    },
+    {
+      ...operationClaims,
+      installation: { ...operationClaims.installation, execution_realm_id: "another-realm" },
+    },
+    { ...operationClaims, organization_id: "another-org" },
+    { ...operationClaims, workspace_id: "another-workspace" },
+  ]) {
+    assert.notDeepEqual(await huddlesExecutionOwner(changedClaims), owner);
+  }
+  assert.notDeepEqual(
+    await publicControllerOwner({ subject: operationClaims.workspace_id }),
+    owner,
+  );
+});
 
 test("operation grants mirror the strict Huddles v2 and currentness v3 contracts", () => {
   const claims = validateExecutionOperationGrantClaims(operationClaims);

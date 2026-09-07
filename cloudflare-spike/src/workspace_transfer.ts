@@ -9,6 +9,18 @@ import {
 } from "./request_body.js";
 import { workspaceExecEnv, type WorkspaceRepo } from "./workspace_repo.js";
 import {
+  publicControllerOwner,
+  type ManagedExecutionOwner,
+} from "./managed_ownership.js";
+import {
+  D1ManagedExecutionReservationStore,
+  ManagedExecutionAllowanceError,
+  ManagedReservationAccessError,
+  parseManagedExecutionAllowance,
+  type ManagedReservationClaim,
+  type ManagedExecutionReservationStore,
+} from "./managed_reservation.js";
+import {
   D1WorkspaceFinalizeStore,
   workspaceFinalizeIdentity,
   type WorkspaceFinalizeRecord,
@@ -21,12 +33,15 @@ export interface WorkspaceTransferEnv {
   readonly Sandbox?: DurableObjectNamespace<Sandbox>;
   readonly EXECUTION_DB: D1Database;
   readonly MANAGED_CAPABILITY_SECRET?: string;
+  readonly MANAGED_EXECUTION_EPOCH?: string;
+  readonly MANAGED_EXECUTION_LIMIT?: string;
 }
 
 type WorkspaceSandbox = Pick<ReturnType<typeof getSandbox>, "killAllProcesses" | "exec">;
 
 export interface WorkspaceTransferDependencies {
   readonly finalizeStore?: WorkspaceFinalizeStore;
+  readonly reservationStore?: ManagedExecutionReservationStore;
   readonly sandboxFor?: (sessionId: string) => Promise<WorkspaceSandbox>;
   readonly now?: () => number;
 }
@@ -55,6 +70,8 @@ export async function routeWorkspaceTransfer(
     const decoded = await readBoundedJsonWithDigest(request);
     const body = decoded.value as {
       sessionId?: unknown;
+      invocationId?: unknown;
+      executionRequestHash?: unknown;
       workspace?: {
         repo?: WorkspaceRepo;
         password?: unknown;
@@ -64,15 +81,19 @@ export async function routeWorkspaceTransfer(
     const sessionId = nonEmpty(body.sessionId, "sessionId");
     const token = bearerToken(request);
     const operation = mode === "restore" ? "workspace_provision" : "workspace_finalize";
-    if (
-      env.MANAGED_CAPABILITY_SECRET === undefined ||
-      token === null ||
-      (await verifyManagedCapability(token, env.MANAGED_CAPABILITY_SECRET, {
-        operation,
-        request_sha256: decoded.sha256,
-        session_id: sessionId,
-      })) === null
-    ) {
+    const invocationId = mode === "restore"
+      ? nonEmpty(body.invocationId, "invocationId")
+      : undefined;
+    const capability =
+      env.MANAGED_CAPABILITY_SECRET === undefined || token === null
+        ? null
+        : await verifyManagedCapability(token, env.MANAGED_CAPABILITY_SECRET, {
+            operation,
+            request_sha256: decoded.sha256,
+            session_id: sessionId,
+            invocation_id: invocationId,
+          });
+    if (capability === null) {
       return Response.json({ error: { code: "unauthenticated" } }, { status: 401 });
     }
     const workspace = body.workspace;
@@ -80,9 +101,133 @@ export async function routeWorkspaceTransfer(
     validateR2Repo(workspace.repo);
     const password = nonEmpty(workspace.password, "workspace.password");
     const snapshot = snapshotHandle(workspace.snapshot, "workspace.snapshot");
+    const reservations = reservationStore(env, dependencies);
+    if (mode === "restore") {
+      const executionRequestHash = sha256Digest(
+        body.executionRequestHash,
+        "executionRequestHash",
+      );
+      const allowance = parseManagedExecutionAllowance(
+        env.MANAGED_EXECUTION_EPOCH,
+        env.MANAGED_EXECUTION_LIMIT,
+      );
+      if (allowance === null) {
+        return Response.json(
+          { error: { code: "managed_disabled", message: "managed execution allowance is not configured" } },
+          { status: 503 },
+        );
+      }
+      const owner = await publicControllerOwner(capability);
+      let claim: ManagedReservationClaim;
+      try {
+        claim = await reservations.claimProvision(
+          {
+            invocation_id: invocationId!,
+            session_id: sessionId,
+            owner,
+            execution_request_hash: executionRequestHash,
+            source: "workspace_provision",
+            provision_request_digest: decoded.sha256,
+            now_ms: (dependencies.now ?? Date.now)(),
+          },
+          allowance,
+        );
+      } catch (cause) {
+        if (cause instanceof ManagedExecutionAllowanceError) {
+          return Response.json(
+            { error: { code: cause.code, message: cause.message } },
+            { status: 503 },
+          );
+        }
+        if (cause instanceof ManagedReservationAccessError) {
+          return Response.json(
+            { error: { code: "workspace_provision_conflict" } },
+            { status: 409 },
+          );
+        }
+        throw cause;
+      }
+      if (claim.kind === "conflict") {
+        return Response.json(
+          { error: { code: "workspace_provision_conflict" } },
+          { status: 409 },
+        );
+      }
+      if (claim.kind === "reused") {
+        if (claim.record.status === "ready") {
+          return Response.json({ ok: true, disposition: "reused" });
+        }
+        if (claim.record.status === "provisioning") {
+          return Response.json(
+            { status: "provisioning", disposition: "reused" },
+            { status: 202 },
+          );
+        }
+        return Response.json(
+          { error: { code: claim.record.error_code ?? "workspace_transfer_failed" } },
+          { status: 502 },
+        );
+      }
+      if (!env.Sandbox && !dependencies.sandboxFor) {
+        await reservations.markFailed({
+          invocation_id: invocationId!,
+          owner,
+          error_code: "runtime_unavailable",
+          now_ms: (dependencies.now ?? Date.now)(),
+        });
+        return Response.json(
+          { error: { code: "runtime_unavailable", message: "no Sandbox binding" } },
+          { status: 503 },
+        );
+      }
+      const sandbox = dependencies.sandboxFor
+        ? await dependencies.sandboxFor(sessionId)
+        : getSandbox(env.Sandbox!, await deriveSandboxRuntimeId(sessionId));
+      const result = await execWorkspaceTool(
+        sandbox,
+        workspaceCmd("restore", workspace.repo, snapshot),
+        workspace.repo,
+        password,
+      );
+      if (!result.ok) {
+        await reservations.markFailed({
+          invocation_id: invocationId!,
+          owner,
+          error_code: "workspace_transfer_failed",
+          now_ms: (dependencies.now ?? Date.now)(),
+        });
+        return Response.json(
+          {
+            error: {
+              code: "workspace_transfer_failed",
+              message: redact(result.detail),
+            },
+          },
+          { status: 502 },
+        );
+      }
+      if (!(await reservations.markReady({
+        invocation_id: invocationId!,
+        owner,
+        now_ms: (dependencies.now ?? Date.now)(),
+      }))) {
+        return Response.json(
+          { error: { code: "workspace_provision_interrupted" } },
+          { status: 502 },
+        );
+      }
+      return Response.json({ ok: true, disposition: "created" });
+    }
+    const targetOwner = await reservations.getSessionOwner(sessionId);
+    if (targetOwner === null) {
+      return Response.json(
+        { error: { code: "workspace_session_not_found" } },
+        { status: 404 },
+      );
+    }
     if (finalizeStatus) {
       return finalizeStatusResponse(
-        await finalizeStore(env, dependencies).get(sessionId),
+        await finalizeStore(env, dependencies).get(sessionId, targetOwner),
         await workspaceFinalizeIdentity(sessionId, body),
       );
     }
@@ -104,27 +249,11 @@ export async function routeWorkspaceTransfer(
         repo: workspace.repo,
         password,
         snapshot,
+        targetOwner,
         now: dependencies.now ?? Date.now,
       });
     }
-    const result = await execWorkspaceTool(
-      sandbox,
-      workspaceCmd("restore", workspace.repo, snapshot),
-      workspace.repo,
-      password,
-    );
-    if (!result.ok) {
-      return Response.json(
-        {
-          error: {
-            code: "workspace_transfer_failed",
-            message: redact(result.detail),
-          },
-        },
-        { status: 502 },
-      );
-    }
-    return Response.json({ ok: true });
+    throw new Error("unreachable workspace transfer mode");
   } catch (cause) {
     return Response.json(
       {
@@ -146,12 +275,14 @@ async function finalizeWorkspace(input: {
   readonly repo: WorkspaceRepo;
   readonly password: string;
   readonly snapshot: string;
+  readonly targetOwner: ManagedExecutionOwner;
   readonly now: () => number;
 }): Promise<Response> {
   const identity = await workspaceFinalizeIdentity(input.sessionId, input.body);
   const claimed = await input.store.claim({
     ...identity,
     session_id: input.sessionId,
+    target_owner: input.targetOwner,
     now_ms: input.now(),
   });
   if (claimed.kind === "conflict") {
@@ -179,6 +310,7 @@ async function finalizeWorkspace(input: {
     }
     if (!(await input.store.complete({
       finalize_id: identity.finalize_id,
+      target_owner: input.targetOwner,
       result_snapshot: resultSnapshot,
       now_ms: input.now(),
     }))) {
@@ -195,6 +327,7 @@ async function finalizeWorkspace(input: {
     const message = redact(safeHuddlesRuntimeDiagnostic(cause));
     await input.store.fail({
       finalize_id: identity.finalize_id,
+      target_owner: input.targetOwner,
       error_code: "workspace_transfer_failed",
       error_message: message,
       now_ms: input.now(),
@@ -243,12 +376,27 @@ function finalizeStore(
   return dependencies.finalizeStore ?? new D1WorkspaceFinalizeStore(env.EXECUTION_DB);
 }
 
+function reservationStore(
+  env: WorkspaceTransferEnv,
+  dependencies: WorkspaceTransferDependencies,
+): ManagedExecutionReservationStore {
+  return dependencies.reservationStore ?? new D1ManagedExecutionReservationStore(env.EXECUTION_DB);
+}
+
 function snapshotHandle(value: unknown, name: string): string {
   const handle = nonEmpty(value, name);
   if (!/^[0-9a-f]{64}$/.test(handle)) {
     throw new Error(`${name} must be a 64-character lowercase hex snapshot id`);
   }
   return handle;
+}
+
+function sha256Digest(value: unknown, name: string): `sha256:${string}` {
+  const digest = nonEmpty(value, name);
+  if (!/^sha256:[0-9a-f]{64}$/.test(digest)) {
+    throw new Error(`${name} must be a lowercase sha256 digest`);
+  }
+  return digest as `sha256:${string}`;
 }
 
 function validateR2Repo(repo: WorkspaceRepo): void {

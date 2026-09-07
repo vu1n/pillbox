@@ -966,10 +966,8 @@ mod r2_scope {
         let cf_prefix = cf_key_prefix(&parent.prefix).ok_or_else(|| {
             PillboxError::config(
                 "run",
-                format!(
-                    "managed workspace transfer requires a non-empty R2 repo prefix; an empty \
-                     prefix would grant bucket-wide access"
-                ),
+                "managed workspace transfer requires a non-empty R2 repo prefix; an empty \
+                 prefix would grant bucket-wide access",
             )
         })?;
         let scoped = mint_fn(parent, api_token.trim(), &account_id, &cf_prefix)?;

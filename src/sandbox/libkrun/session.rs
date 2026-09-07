@@ -2277,34 +2277,28 @@ impl crate::sandbox::LiveSession for LibkrunLiveSession {
         if crate::commands::session::detached_tailer_alive(resolved, &self.session) {
             return Ok(None);
         }
-        let log = crate::events::log::SessionLog::open(resolved, &self.session.id)?;
         let tailer = if self.session.integration() == Integration::Server {
             // A server agent persists its event capture to a host file in the CoW
             // creds clone; tail that (SSE/NDJSON → the durable log).
+            let log = crate::events::log::SessionLog::open(resolved, &self.session.id)?;
             Some(self.server_file_tailer(log)?)
         } else {
-            // A PTY agent's transcript lands in the host-readable creds clone
-            // (`handle.creds`, the agent home the guest mounts); tail it with the
-            // same producer the foreground PTY run uses, just pointed at the
-            // persisted clone instead of the live auth home.
-            let handle = LibkrunHandle::decode(&self.session)?;
-            let tailer = crate::events::transcripts::spawn_attach_tailer(
-                log,
-                Path::new(&handle.creds),
-                &self.session.agent_id,
-                &self.session.guest_cwd,
-                &self.session.id,
-            );
-            // `None` means this agent has no transcript parser, so there's no live
-            // tail even though the backend advertises one — surface it rather than
-            // silently serving only the existing log.
-            if tailer.is_none() {
+            let spec = crate::agents::lookup("session", &self.session.agent_id)?;
+            if spec
+                .libkrun_pty
+                .and_then(|profile| profile.detached_transcript())
+                .is_none()
+            {
                 eprintln!(
                     "pillbox: note: `{}` has no transcript parser; serving the existing log without a live tail",
                     self.session.agent_id
                 );
+            } else {
+                // Restore the sole reparented producer, not a reader-scoped byte-zero
+                // tailer. Its durable rollout cursor prevents stale idle replay.
+                spawn_session_tailer(resolved, &self.session, &spec)?;
             }
-            tailer
+            None
         };
         Ok(tailer)
     }

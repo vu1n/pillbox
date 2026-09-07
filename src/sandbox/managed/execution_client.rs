@@ -1,6 +1,10 @@
 //! One bounded managed HTTP execution and its crash-idempotent local commit.
 
-use std::io::Read as _;
+use std::fs;
+use std::io::{self, Read as _};
+use std::os::unix::fs::OpenOptionsExt as _;
+use std::os::unix::io::AsRawFd as _;
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
@@ -11,6 +15,41 @@ use crate::pillbox::Pillbox;
 
 use super::execution_contract::*;
 use super::pending_journal::{CommitIntent, PendingJournal, PendingState};
+
+const TURN_LOCK_FILE: &str = ".managed-turn.lock";
+
+/// Serializes one local managed turn per session without parking a second CLI
+/// behind a potentially ten-minute network operation. The inode may remain after
+/// release; ownership is the open file description's advisory lock, not presence.
+struct ManagedTurnLock {
+    _file: fs::File,
+}
+
+impl ManagedTurnLock {
+    fn try_acquire(resolved: &Pillbox, session_id: &str) -> Result<Self> {
+        let path: PathBuf = crate::session::session_dir(resolved, session_id)?.join(TURN_LOCK_FILE);
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("open managed turn lock {}", path.display()))?;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::WouldBlock {
+                return Err(PillboxError::runtime(
+                    "session send",
+                    format!("managed session `{session_id}` already has a turn in progress"),
+                )
+                .with_next("wait for the active session send to finish, then retry")
+                .into());
+            }
+            return Err(error).with_context(|| format!("lock {}", path.display()));
+        }
+        Ok(Self { _file: file })
+    }
+}
 
 #[derive(Debug)]
 enum PostJsonError {
@@ -49,6 +88,10 @@ pub(super) fn execute_turn(
             format!("managed model must be provider/model, got `{model}`"),
         )
     })?;
+    validate_model_parts(provider, model_id)?;
+    // Journal identity and the remote side effect are one per-session critical
+    // section. Keep this guard alive through local evidence fsync + journal clear.
+    let _turn_lock = ManagedTurnLock::try_acquire(resolved, session_id)?;
     let journal = PendingJournal::open(resolved, session_id)?;
     let existing = journal.load()?;
     let invocation_id = existing
@@ -497,8 +540,30 @@ mod tests {
     fn request_validation_matches_nonempty_and_exact_byte_boundaries() {
         assert!(validate_rendered_input("").is_err());
         assert!(validate_rendered_input(" ").is_ok());
+        assert!(validate_model_parts("", "model").is_err());
+        assert!(validate_model_parts("provider", "").is_err());
+        assert!(validate_model_parts("provider", "model").is_ok());
         assert!(validate_request_body(&"x".repeat(MAX_MANAGED_REQUEST_BYTES)).is_ok());
         assert!(validate_request_body(&"x".repeat(MAX_MANAGED_REQUEST_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn managed_turn_lock_rejects_same_session_without_cross_session_contention() {
+        crate::test_util::with_isolated_home("managed-turn-lock", || {
+            let resolved = crate::pillbox::global();
+            let held = ManagedTurnLock::try_acquire(&resolved, "session-a").unwrap();
+
+            let error = ManagedTurnLock::try_acquire(&resolved, "session-a")
+                .err()
+                .expect("same-session contention must fail without blocking");
+            assert!(error.to_string().contains("already has a turn in progress"));
+            ManagedTurnLock::try_acquire(&resolved, "session-b")
+                .expect("another session has an independent lock");
+
+            drop(held);
+            ManagedTurnLock::try_acquire(&resolved, "session-a")
+                .expect("dropping the owner releases the session lock");
+        });
     }
 
     #[test]
@@ -520,6 +585,29 @@ mod tests {
 
             assert!(error.to_string().contains("non-empty"));
             assert!(!journal.path().exists());
+        });
+    }
+
+    #[test]
+    fn empty_model_parts_are_rejected_before_prepared_journal() {
+        crate::test_util::with_isolated_home("managed-empty-model-parts", || {
+            let resolved = crate::pillbox::global();
+            for (session_id, model) in [("empty-provider", "/model"), ("empty-model", "provider/")]
+            {
+                let journal = PendingJournal::open(&resolved, session_id).unwrap();
+                let error = execute_turn(
+                    &resolved,
+                    session_id,
+                    "https://network-must-not-run.invalid",
+                    "capability-secret",
+                    "hello",
+                    Some(model),
+                )
+                .unwrap_err();
+
+                assert!(error.to_string().contains("non-empty provider/model"));
+                assert!(!journal.path().exists());
+            }
         });
     }
 

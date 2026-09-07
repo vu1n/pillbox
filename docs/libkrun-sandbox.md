@@ -468,6 +468,21 @@ the guest's `pillbox-init ws` branch:
 - **Phase 4 — diff/flush:** `diff(clone, base)` = the guest's `RESULT.txt` — the
   result surface a driven run flushes/snapshots, with the base as the fork point.
 
+**Per-run clone ownership contract.** The host owns the source auth home,
+workspace, and immutable warm-base cache; those paths are never mounted for an
+agent. For its home and workspace shares, each launch mounts only disposable
+CoW clones (with the workspace clone already scrubbed). Immediately after each
+clone is mounted, and before PTY, server, or structured agent execution, the
+guest physically traverses that one filesystem and changes each entry to `0:0`
+without dereferencing symlinks. This lets Codex's nested user namespace traverse
+an otherwise host-UID-owned `0700` mount root.
+Because GNU `chown` may clear setuid/setgid bits, the preamble captures and
+restores each non-symlink's exact mode; any `find`, `stat`, `chown`, or `chmod`
+failure aborts the launch. It does not apply to the rootfs, the grader's
+temporary boot share, an original credential/workspace source, or a shared
+warm-base tree; symlinks in a clone are changed as links and are never followed
+into another tree.
+
 **In-repo landing:**
 - **Reuse the canonical denylist** — the spike hand-rolled a crude `is_secret`;
   the repo already has `workspace::ingest` (`is_secret_dir` / `is_secret_basename`

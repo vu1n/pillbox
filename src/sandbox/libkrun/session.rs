@@ -231,13 +231,14 @@ struct Launch {
 
 /// The boot-script preamble shared by every libkrun launch (PTY agents and
 /// the opencode server): bring the NIC up, install the vault CA, mount the
-/// workspace virtio-fs share, and `cd` into the workspace. The caller appends
-/// its own exec. The creds share is already mounted by the boot channel's
-/// static bootstrap (see [`boot::boot_channel`]) — the boot script itself
-/// lives there. `gw_q` is pre-[`shell_quote`]d (a workspace name may contain
-/// a space).
-fn guest_launch_preamble(ca_cert_pem: &str, gw_q: &str) -> String {
+/// workspace virtio-fs share, normalize that disposable clone's guest ownership,
+/// and `cd` into it. The caller appends its own exec. The cloned creds share is
+/// already mounted and normalized by the boot channel's static bootstrap (see
+/// [`boot::boot_channel`]) — the boot script itself lives there.
+fn guest_launch_preamble(ca_cert_pem: &str, guest_workspace: &str) -> String {
     let net = egress::guest_net_commands();
+    let gw_q = shell_quote(guest_workspace);
+    let own_workspace = boot::guest_root_clone_ownership(guest_workspace);
     // The PEM is shell-quoted straight into the script — it lands in the boot
     // script file (see [`boot::boot_channel`]), which carries arbitrary bytes, so
     // the multi-line cert no longer needs the base64 detour the kernel cmdline
@@ -253,7 +254,8 @@ fn guest_launch_preamble(ca_cert_pem: &str, gw_q: &str) -> String {
          printf '%s' {ca_q} > {GUEST_CA_PATH}; \
          PATH=/usr/sbin:/sbin:$PATH update-ca-certificates >/dev/null 2>&1 || \
              echo 'pillbox: warning: update-ca-certificates failed; non-Node agents (Codex etc.) may reject the vault TLS cert' >&2; \
-         mkdir -p {gw_q}; mount -t virtiofs workspace {gw_q}; cd {gw_q}",
+         mkdir -p {gw_q}; mount -t virtiofs workspace {gw_q}; \
+         {own_workspace}; cd {gw_q}",
         ca_q = shell_quote(ca_cert_pem),
     )
 }
@@ -608,13 +610,12 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
         .chain(spec.sandbox_args.iter().map(|s| s.to_string()))
         .chain(opts.args.iter().cloned())
         .collect();
-    let gw_q = shell_quote(&guest_workspace);
     let agent = agent_argv
         .iter()
         .map(|a| shell_quote(a))
         .collect::<Vec<_>>()
         .join(" ");
-    let preamble = guest_launch_preamble(&ca.cert_pem, &gw_q);
+    let preamble = guest_launch_preamble(&ca.cert_pem, &guest_workspace);
     // Detach: the guest pty-host *listens* (so the attach socket persists for
     // reattach after the parent returns); foreground: it dials the parent.
     let vsock_flag = if opts.detach { " --vsock-listen" } else { "" };
@@ -642,8 +643,13 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
             );
         }
     }
-    let (boot_share, boot_exec) =
-        boot::boot_channel(&creds_share, "creds", GUEST_HOME, &boot_script)?;
+    let (boot_share, boot_exec) = boot::boot_channel(
+        &creds_share,
+        "creds",
+        GUEST_HOME,
+        boot::MountedShareOwnership::GuestRootClone,
+        &boot_script,
+    )?;
 
     let attach_sock =
         krun_cache_dir()?.join(format!("attach-{}.sock", uuid::Uuid::now_v7().simple()));
@@ -888,8 +894,7 @@ fn launch_server_vm(
     // script). Written into the creds share, exec'd by the static cmdline
     // bootstrap (see [`boot::boot_channel`]) — model names/env values may carry bytes
     // the kernel cmdline can't.
-    let gw_q = shell_quote(&guest_workspace);
-    let preamble = guest_launch_preamble(&ca.cert_pem, &gw_q);
+    let preamble = guest_launch_preamble(&ca.cert_pem, &guest_workspace);
     let events_q = shell_quote(&format!("{GUEST_HOME}/{}", profile.events_file));
     let script = (launch.build_script)(&preamble, &events_q);
     let exports = boot::env_exports(&guest_env)?;
@@ -897,6 +902,7 @@ fn launch_server_vm(
         &creds_share,
         "creds",
         GUEST_HOME,
+        boot::MountedShareOwnership::GuestRootClone,
         &format!("{exports}{script}"),
     )?;
 
@@ -1173,12 +1179,13 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
     let events_file = profile.events_file;
     let events_guest = format!("{GUEST_HOME}/{events_file}");
     let events_q = shell_quote(&events_guest);
-    let preamble = guest_launch_preamble(&ca.cert_pem, &shell_quote(&guest_workspace));
+    let preamble = guest_launch_preamble(&ca.cert_pem, &guest_workspace);
     let exports = boot::env_exports(&guest_env)?;
     let (boot_share, boot_exec) = boot::boot_channel(
         &creds_share,
         "creds",
         GUEST_HOME,
+        boot::MountedShareOwnership::GuestRootClone,
         &format!("{exports}{preamble}; exec {argv} > {events_q}"),
     )?;
     let vmspec = VmSpec {
@@ -1769,8 +1776,13 @@ pub(crate) fn score_in_sandbox(
         .prefix("pillbox-grade-boot-")
         .tempdir()
         .context("create grader boot dir")?;
-    let (boot_share, boot_exec) =
-        boot::boot_channel(boot_dir.path(), "boot", "/run/pillbox-boot", &script)?;
+    let (boot_share, boot_exec) = boot::boot_channel(
+        boot_dir.path(),
+        "boot",
+        "/run/pillbox-boot",
+        boot::MountedShareOwnership::PreserveHost,
+        &script,
+    )?;
 
     let vmspec = VmSpec {
         rootfs: rootfs.to_string_lossy().into_owned(),
@@ -2436,6 +2448,22 @@ mod tests {
     use super::*;
     use crate::sandbox::LiveSession;
     use crate::session::{Session, BACKEND_LIBKRUN};
+
+    #[test]
+    fn guest_preamble_owns_only_mounted_workspace_before_agent_exec() {
+        let preamble = guest_launch_preamble("test certificate", "/workspace/a b");
+        let script = format!("{preamble}; exec agent");
+        let mount = script
+            .find("mount -t virtiofs workspace '/workspace/a b'")
+            .unwrap();
+        let ownership = script.find("find -P '/workspace/a b' -xdev").unwrap();
+        let cd = script.find("cd '/workspace/a b'").unwrap();
+        let exec = script.find("exec agent").unwrap();
+        assert!(mount < ownership && ownership < cd && cd < exec);
+        assert_eq!(script.matches("chown ").count(), 1);
+        assert!(!script.contains(GUEST_HOME));
+        assert!(script.contains("chmod \"$mode\""));
+    }
 
     #[test]
     fn structured_vmm_diagnostic_retains_only_pillbox_preboot_errors() {

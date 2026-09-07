@@ -37,6 +37,7 @@ impl DetachedProducerLock {
         let path = session_dir.join(TAILER_LOCK_FILE);
         let file = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .mode(0o600)

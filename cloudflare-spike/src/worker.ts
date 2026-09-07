@@ -22,6 +22,7 @@ import {
   managedAdmissionPolicy,
   requireManagedAdmission,
 } from "./managed_admission.js";
+import { publicControllerOwner } from "./managed_ownership.js";
 // Named entrypoint: Huddles reaches only authenticated execution/2 lifecycle
 // methods through a same-account service binding.
 export { HuddlesRuntimeEntrypoint };
@@ -135,15 +136,15 @@ async function routeExecutionRequest(
     const body = decoded.value;
     const scope = executionCapabilityScope(operation, body, decoded.sha256);
     const token = bearerToken(request);
-    if (
-      env.MANAGED_CAPABILITY_SECRET === undefined ||
-      token === null ||
-      (await verifyManagedCapability(
-        token,
-        env.MANAGED_CAPABILITY_SECRET,
-        scope,
-      )) === null
-    ) {
+    const capability =
+      env.MANAGED_CAPABILITY_SECRET === undefined || token === null
+        ? null
+        : await verifyManagedCapability(
+            token,
+            env.MANAGED_CAPABILITY_SECRET,
+            scope,
+          );
+    if (!capability) {
       return Response.json({ error: { code: "unauthenticated" } }, { status: 401 });
     }
     if (
@@ -163,7 +164,8 @@ async function routeExecutionRequest(
         { status: 400 },
       );
     }
-    const service = executionService(env);
+    const owner = await publicControllerOwner(capability);
+    const service = executionService(env, async () => owner);
     const result =
       operation === "execute"
         ? await service.executeInvocation(body)

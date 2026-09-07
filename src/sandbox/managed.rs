@@ -17,8 +17,9 @@
 //! ## Workspace placement — container-native rustic-on-R2
 //!
 //! [`ManagedBackend::run`] places the workspace by reusing the pillbox's rustic
-//! repo: the host snapshots cwd into R2, POSTs `/v2/workspaces/provision` (repo config +
-//! password + snapshot) to restore it into the container `/workspace`, drives the
+//! repo: the host prepares and journals the first invocation, snapshots cwd into
+//! R2, then POSTs `/v2/workspaces/provision` (invocation/request identity + repo
+//! config + password + snapshot) to restore it into the container `/workspace`, drives the
 //! turn, then POSTs `/v2/workspaces/finalize` to snapshot `/workspace` back and records the
 //! result handle. The R2 creds + the repo password travel ONLY in those HTTPS
 //! bodies — never in argv, a log, a §0 event, or the persisted `Session` record
@@ -39,10 +40,9 @@
 //!
 //! ## Open follow-ups (flagged, not faked)
 //!
-//!   - **Detached finalize.** Only the foreground path is implemented (drive a
-//!     turn, wait for idle, finalize). For a `--detach` managed run the host
-//!     returns before the turn ends, so the in-container wrapper would own the
-//!     `/finalize` + result-handle emission instead.
+//!   - **Detached finalize.** Detached and no-prompt managed bring-up fail before
+//!     state or external access. Supporting them requires a future host-free
+//!     `/finalize` + result-handle owner.
 //!   - **Token provisioning / trust.** Where a real user's token/secret comes
 //!     from (vs the spike's `/tmp` file) is unresolved; the env config above is
 //!     the interim surface.
@@ -139,6 +139,32 @@ impl ManagedBackend {
         opts: RunOpts,
         resolved: &Pillbox,
     ) -> Result<()> {
+        let prompt = opts.args.join(" ").trim().to_string();
+        if prompt.is_empty() {
+            return Err(PillboxError::usage(
+                "run",
+                "managed execution requires an initial prompt; no-prompt bring-up is unsupported",
+            )
+            .into());
+        }
+        if opts.detach {
+            return Err(PillboxError::usage(
+                "run",
+                "detached managed execution is unsupported until finalize-on-idle exists",
+            )
+            .into());
+        }
+        let session_id = crate::session::Session::new_id();
+        let model = opts
+            .model
+            .clone()
+            .unwrap_or_else(|| crate::sandbox::opencode::DEFAULT_MODEL.to_string());
+        let initial_input = format!("{prompt}\n");
+        // Persist the exact invocation identity before any workspace or remote
+        // side effect. Provision and the first execute consume this same request.
+        let prepared =
+            execution_client::prepare_initial_turn(resolved, &session_id, &initial_input, &model)?;
+
         // 1. Require an R2/S3 workspace backend. The DO restores from a rustic
         //    repo it can reach (R2), not the host's local-filesystem repo —
         //    refuse a local-backend pillbox loudly instead of silently running
@@ -164,7 +190,6 @@ impl ManagedBackend {
         // 3. Resolve the Worker origin, refusing a non-`https://` origin: the
         //    POST body carries the resolved R2 creds + the repo password, so it must
         //    never cross the wire in cleartext.
-        let session_id = crate::session::Session::new_id();
         let endpoint = resolve_https_origin()?;
 
         // 4. Provision with a capability bound to the exact credentialed body.
@@ -177,7 +202,11 @@ impl ManagedBackend {
         workspace_xfer::provision(
             &endpoint,
             &capability_secret,
-            &session_id,
+            workspace_xfer::ProvisionIdentity {
+                session_id: &session_id,
+                invocation_id: &prepared.pending.invocation_id,
+                execution_request_hash: &prepared.pending.request_hash,
+            },
             &provision_creds,
             &password,
             snapshot.as_str(),
@@ -190,10 +219,6 @@ impl ManagedBackend {
             endpoint: endpoint.clone(),
             execution_session_id: session_id.clone(),
         };
-        let model = opts
-            .model
-            .clone()
-            .unwrap_or_else(|| crate::sandbox::opencode::DEFAULT_MODEL.to_string());
         let session = Session {
             id: session_id.clone(),
             label: opts.label.clone(),
@@ -232,19 +257,8 @@ impl ManagedBackend {
 
         let live = ManagedLiveSession::new(session.clone());
 
-        // 6. Drive the first turn through the bounded execution API. The
-        //    initial prompt is the agent's positional args; with none, leave the
-        //    session ready for `session send` and return (detached-style).
-        let prompt = opts.args.join(" ").trim().to_string();
-        if prompt.is_empty() {
-            crate::sandbox::opencode::print_started(&session, opts.json, None);
-            // FOLLOW-UP: a no-prompt managed run leaves the workspace provisioned
-            // but never finalized (no turn → no result). When the drive surface
-            // gains a host-free "finalize on idle", the in-container wrapper owns
-            // that; for now a no-prompt run is bring-up only.
-            return Ok(());
-        }
-        live.send(resolved, format!("{prompt}\n").as_bytes())?;
+        // 6. Drive the exact invocation prepared before provisioning.
+        live.send(resolved, initial_input.as_bytes())?;
 
         // 7. Snapshot `/workspace` back to R2; record the handle so
         //    `session pull <id>` can rehydrate the result.
@@ -287,11 +301,6 @@ impl ManagedBackend {
                 finished.id
             );
         }
-        // FOLLOW-UP (detached managed run): for `--detach` the host returns before
-        // the turn ends, so this host-side `/finalize` can't run. The in-container
-        // wrapper would finalize + emit the result handle to the §0 sink instead.
-        // This pass implements only the foreground path; `--detach` managed is
-        // flagged, not faked.
         Ok(())
     }
 }
@@ -656,7 +665,17 @@ mod workspace_xfer {
     struct ProvisionBody<'a> {
         #[serde(rename = "sessionId")]
         session_id: &'a str,
+        #[serde(rename = "invocationId")]
+        invocation_id: &'a str,
+        #[serde(rename = "executionRequestHash")]
+        execution_request_hash: &'a str,
         workspace: WorkspaceRepo<'a>,
+    }
+
+    pub(super) struct ProvisionIdentity<'a> {
+        pub(super) session_id: &'a str,
+        pub(super) invocation_id: &'a str,
+        pub(super) execution_request_hash: &'a str,
     }
 
     /// `POST <endpoint>/provision` — the DO restores `snapshot` from the R2 repo
@@ -665,13 +684,15 @@ mod workspace_xfer {
     pub(super) fn provision(
         endpoint: &str,
         capability_secret: &str,
-        session_id: &str,
+        identity: ProvisionIdentity<'_>,
         repo: &S3Config,
         password: &str,
         snapshot: &str,
     ) -> Result<()> {
         let body = serde_json::to_string(&ProvisionBody {
-            session_id,
+            session_id: identity.session_id,
+            invocation_id: identity.invocation_id,
+            execution_request_hash: identity.execution_request_hash,
             workspace: WorkspaceRepo {
                 repo,
                 password,
@@ -682,13 +703,13 @@ mod workspace_xfer {
         let token = super::mint_managed_capability(
             "workspace_provision",
             &request_sha256(&body),
-            Some(session_id),
-            None,
+            Some(identity.session_id),
+            Some(identity.invocation_id),
             capability_secret,
         );
         let resp = post(endpoint, "v2/workspaces/provision", &token, body)?;
         let status = resp.status();
-        if status.is_success() {
+        if status == reqwest::StatusCode::OK {
             return Ok(());
         }
         // The error text may echo our request; the DO is trusted not to reflect
@@ -711,7 +732,13 @@ mod workspace_xfer {
         password: &str,
         base_snapshot: &str,
     ) -> Result<String> {
-        let body = serde_json::to_string(&ProvisionBody {
+        #[derive(Serialize)]
+        struct FinalizeBody<'a> {
+            #[serde(rename = "sessionId")]
+            session_id: &'a str,
+            workspace: WorkspaceRepo<'a>,
+        }
+        let body = serde_json::to_string(&FinalizeBody {
             session_id,
             workspace: WorkspaceRepo {
                 repo,
@@ -826,14 +853,16 @@ mod workspace_xfer {
             }
         }
 
-        /// The frozen `/provision` shape: `{workspace:{repo:<S3Config>,password,snapshot}}`
-        /// — the S3Config nested under `repo`, the password + snapshot handle as
-        /// siblings. The DO side is built to this exact JSON.
+        /// Provision binds the credentialed restore to one prepared execution:
+        /// `S3Config` is nested under `repo`, while the password and snapshot
+        /// handle are siblings. The DO side is built to this exact JSON.
         #[test]
         fn provision_body_serializes_to_the_frozen_shape() {
             let c = cfg();
             let body = serde_json::to_value(ProvisionBody {
                 session_id: "session-1",
+                invocation_id: "invocation-1",
+                execution_request_hash: "sha256:request",
                 workspace: WorkspaceRepo {
                     repo: &c,
                     password: "repo-pw",
@@ -843,6 +872,8 @@ mod workspace_xfer {
             .unwrap();
 
             let ws = &body["workspace"];
+            assert_eq!(body["invocationId"], "invocation-1");
+            assert_eq!(body["executionRequestHash"], "sha256:request");
             assert_eq!(ws["password"], "repo-pw");
             assert_eq!(ws["snapshot"], "snap-handle");
             // The S3Config is nested verbatim under `repo` (its serde fields).
@@ -862,6 +893,8 @@ mod workspace_xfer {
             c.session_token = Some("scoped-session-token".into());
             let body = serde_json::to_value(ProvisionBody {
                 session_id: "session-1",
+                invocation_id: "invocation-1",
+                execution_request_hash: "sha256:request",
                 workspace: WorkspaceRepo {
                     repo: &c,
                     password: "repo-pw",
@@ -881,7 +914,13 @@ mod workspace_xfer {
         #[test]
         fn finalize_body_binds_the_base_snapshot() {
             let c = cfg();
-            let body = serde_json::to_value(ProvisionBody {
+            #[derive(serde::Serialize)]
+            struct FinalizeBody<'a> {
+                #[serde(rename = "sessionId")]
+                session_id: &'a str,
+                workspace: WorkspaceRepo<'a>,
+            }
+            let body = serde_json::to_value(FinalizeBody {
                 session_id: "session-1",
                 workspace: WorkspaceRepo {
                     repo: &c,
@@ -1442,6 +1481,29 @@ mod tests {
                 "preflight must not persist a session, snapshot, or other state"
             );
         });
+    }
+
+    #[test]
+    fn no_prompt_and_detach_reject_before_managed_state_or_external_access() {
+        for name in ["managed-no-prompt", "managed-detach"] {
+            crate::test_util::with_isolated_home(name, || {
+                let resolved = crate::pillbox::global();
+                let mut opts = run_opts();
+                if name == "managed-no-prompt" {
+                    opts.args.clear();
+                } else {
+                    opts.detach = true;
+                }
+                let error = ManagedBackend
+                    .run(&crate::agents::OPENCODE, opts, &resolved)
+                    .expect_err("unsupported managed lifecycle must fail closed");
+                assert!(error.to_string().contains("unsupported"));
+                assert!(
+                    !resolved.state_dir.exists(),
+                    "lifecycle preflight must precede session, snapshot, and credential state"
+                );
+            });
+        }
     }
 
     /// HMAC-SHA256 against the RFC 4231 Test Case 2 vector

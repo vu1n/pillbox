@@ -70,7 +70,7 @@ key-pair self-test, and currentness probe must all be `verified` for the same
 installation, policy, key ID/fingerprint, and service entrypoints. Wrangler
 configuration and secret-name metadata alone do not prove applied authority.
 
-After applying migrations 0001–0003 and seeding the reviewed singleton row,
+After applying migrations 0001–0004 and seeding the reviewed singleton row,
 run `validate-burnin-bootstrap.mjs`. The validator invokes its checked
 `D1_BOOTSTRAP_QUERY` itself with Wrangler `d1 execute --remote` against the
 validated database and config. It does not accept an operator-normalized D1

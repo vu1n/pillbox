@@ -31,9 +31,14 @@ import type {
   ExecutionClaimInput,
   ExecutionRecord,
   ExecutionStore,
-  ManagedExecutionAllowance,
 } from "./execution_store.js";
-import { ManagedExecutionAllowanceError } from "./execution_store.js";
+import type { ManagedExecutionOwner } from "./managed_ownership.js";
+import {
+  ManagedExecutionAllowanceError,
+  ManagedReservationAccessError,
+  type ManagedExecutionAllowance,
+  type ManagedExecutionReservationStore,
+} from "./managed_reservation.js";
 import { safeHuddlesRuntimeDiagnostic } from "./huddles_policy.js";
 import {
   ManagedAdmissionError,
@@ -99,10 +104,10 @@ export type ExecutionOperationAuthorization =
       readonly request: CancelInvocationV2Request;
     };
 
-/** Identity-free pre-access capability; authorization claims never enter runtime state. */
+/** Pre-access authorization returns only the opaque durable owner identity. */
 export type ExecutionOperationAuthorizer = (
   input: ExecutionOperationAuthorization,
-) => Promise<void>;
+) => Promise<ManagedExecutionOwner>;
 
 export interface ExecutionServiceOptions {
   readonly now?: () => number;
@@ -112,7 +117,8 @@ export interface ExecutionServiceOptions {
   readonly sandboxProfile?: string;
   readonly admission?: ManagedAdmissionPolicy;
   readonly allowance?: ManagedExecutionAllowance | null;
-  readonly authorizer?: ExecutionOperationAuthorizer;
+  readonly reservations: ManagedExecutionReservationStore;
+  readonly authorizer: ExecutionOperationAuthorizer;
 }
 
 export class ExecutionNotFoundError extends Error {
@@ -135,13 +141,14 @@ export class ExecutionService {
   private readonly sandboxProfile: string | null;
   private readonly admission: ManagedAdmissionPolicy;
   private readonly allowance: ManagedExecutionAllowance | null;
-  private readonly authorizer: ExecutionOperationAuthorizer | undefined;
+  private readonly reservations: ManagedExecutionReservationStore;
+  private readonly authorizer: ExecutionOperationAuthorizer;
 
   constructor(
     store: ExecutionStore,
     artifacts: ExecutionArtifactStore,
     runtime: ExecutionRuntime,
-    options: ExecutionServiceOptions = {},
+    options: ExecutionServiceOptions,
   ) {
     this.store = store;
     this.artifacts = artifacts;
@@ -153,6 +160,7 @@ export class ExecutionService {
     this.sandboxProfile = options.sandboxProfile ?? null;
     this.admission = options.admission ?? managedAdmissionPolicy(undefined);
     this.allowance = options.allowance ?? null;
+    this.reservations = options.reservations;
     this.authorizer = options.authorizer;
   }
 
@@ -163,7 +171,7 @@ export class ExecutionService {
       request.execution,
       request.execution_policy_revision,
     );
-    await this.authorizer?.({ operation: "execute", request });
+    const owner = await this.authorizer({ operation: "execute", request });
     try {
       requireManagedAdmission(this.admission);
     } catch (cause) {
@@ -193,6 +201,43 @@ export class ExecutionService {
       );
     }
     const now = this.now();
+    let reservation;
+    try {
+      reservation = await this.reservations.claimExecution(
+        {
+          invocation_id: request.invocation_id,
+          session_id: request.session_ref.session_id,
+          owner,
+          execution_request_hash: requestHash,
+          now_ms: now,
+        },
+        this.allowance,
+      );
+    } catch (cause) {
+      if (cause instanceof ManagedExecutionAllowanceError) {
+        return this.managedDisabledResult(
+          request,
+          requestHash,
+          executionDigest,
+          cause.message,
+        );
+      }
+      if (cause instanceof ManagedReservationAccessError) {
+        throw new ExecutionNotFoundError(request.invocation_id);
+      }
+      throw cause;
+    }
+    if (reservation.kind === "conflict") {
+      return this.reservationConflictResult(
+        request,
+        reservation.record.execution_request_hash,
+        requestHash,
+        executionDigest,
+      );
+    }
+    if (reservation.record.status !== "ready") {
+      throw new ExecutionNotFoundError(request.invocation_id);
+    }
     const input: ExecutionClaimInput = {
       invocation_id: request.invocation_id,
       idempotency_key: request.idempotency_key,
@@ -200,22 +245,17 @@ export class ExecutionService {
       execution_digest: executionDigest,
       execution_policy_revision: request.execution_policy_revision,
       session_id: request.session_ref.session_id,
+      owner,
+      allowance_epoch: this.allowance.deployment_epoch,
+      allowance_limit: this.allowance.execution_limit,
       attribution: attributionFromRequest(request, null),
       owner_token: this.ownerToken(),
       now_ms: now,
       lease_expires_at_ms: now + EXECUTION_OWNER_LEASE_MS,
     };
-    let claim: ExecutionClaim;
-    try {
-      claim = await this.store.claim(input, this.allowance);
-    } catch (cause) {
-      if (!(cause instanceof ManagedExecutionAllowanceError)) throw cause;
-      return this.managedDisabledResult(
-        request,
-        requestHash,
-        executionDigest,
-        cause.message,
-      );
+    const claim: ExecutionClaim = await this.store.claim(input);
+    if (claim.kind === "unavailable") {
+      throw new ExecutionNotFoundError(request.invocation_id);
     }
     if (claim.kind === "conflict") {
       return this.conflictResult(request, claim.record, requestHash);
@@ -251,8 +291,8 @@ export class ExecutionService {
 
   async getExecutionStatus(value: unknown): Promise<ExecuteInvocationV2Result> {
     const request = validateGetInvocationV2Request(value);
-    await this.authorizer?.({ operation: "status", request });
-    const record = await this.requireRecord(request.invocation_id);
+    const owner = await this.authorizer({ operation: "status", request });
+    const record = await this.requireRecord(request.invocation_id, owner);
     return this.resultForRecord(
       undefined,
       record,
@@ -262,8 +302,8 @@ export class ExecutionService {
 
   async cancelInvocation(value: unknown): Promise<ExecuteInvocationV2Result> {
     const request = validateCancelInvocationV2Request(value);
-    await this.authorizer?.({ operation: "cancel", request });
-    let record = await this.requireRecord(request.invocation_id);
+    const owner = await this.authorizer({ operation: "cancel", request });
+    let record = await this.requireRecord(request.invocation_id, owner);
     if (record.status !== "running") {
       return this.resultForRecord(undefined, record, {
         after: 0,
@@ -282,7 +322,7 @@ export class ExecutionService {
       "reused",
     );
     if (result !== null) return result;
-    record = await this.requireRecord(request.invocation_id);
+    record = await this.requireRecord(request.invocation_id, owner);
     return this.resultForRecord(undefined, record, {
       after: 0,
       limit: MAX_EVIDENCE_PAGE_SIZE,
@@ -331,7 +371,7 @@ export class ExecutionService {
       if (interrupted !== null) return interrupted;
       return this.resultForRecord(
         request,
-        await this.requireRecord(record.invocation_id),
+        await this.requireRecord(record.invocation_id, record.owner),
         cursor,
       );
     }
@@ -368,7 +408,7 @@ export class ExecutionService {
       disposition,
     );
     if (result === null) {
-      return this.resultForRecord(request, await this.requireRecord(record.invocation_id), {
+      return this.resultForRecord(request, await this.requireRecord(record.invocation_id, record.owner), {
         after: 0,
         limit: MAX_EVIDENCE_PAGE_SIZE,
       });
@@ -427,6 +467,7 @@ export class ExecutionService {
       invocation_id: record.invocation_id,
       request_hash: record.request_hash,
       owner_token: record.owner_token,
+      owner: record.owner,
       status: stored.status,
       artifact_ref: artifactRef,
       now_ms: this.now(),
@@ -501,6 +542,31 @@ export class ExecutionService {
     };
   }
 
+  private reservationConflictResult(
+    request: ExecuteInvocationV2Request,
+    existingHash: `sha256:${string}`,
+    requestedHash: `sha256:${string}`,
+    executionDigest: `sha256:${string}`,
+  ): ExecuteInvocationV2Result {
+    return {
+      disposition: "reused",
+      invocation_id: request.invocation_id,
+      request_hash: existingHash,
+      execution_digest: executionDigest,
+      execution_policy_revision: request.execution_policy_revision,
+      session_ref: this.positionalSessionRef(request.session_ref.session_id, 0),
+      attribution: attributionFromRequest(request, null),
+      evidence: emptyEvidence(0),
+      status: "conflict",
+      error: {
+        code: "idempotency_conflict",
+        message: "invocation is already reserved for different content",
+        existing_request_hash: existingHash,
+        requested_request_hash: requestedHash,
+      },
+    };
+  }
+
   private managedDisabledResult(
     request: ExecuteInvocationV2Request,
     requestHash: `sha256:${string}`,
@@ -536,8 +602,11 @@ export class ExecutionService {
     };
   }
 
-  private async requireRecord(invocation_id: string): Promise<ExecutionRecord> {
-    const record = await this.store.get(invocation_id);
+  private async requireRecord(
+    invocation_id: string,
+    owner: ManagedExecutionOwner,
+  ): Promise<ExecutionRecord> {
+    const record = await this.store.get(invocation_id, owner);
     if (record === null) throw new ExecutionNotFoundError(invocation_id);
     return record;
   }

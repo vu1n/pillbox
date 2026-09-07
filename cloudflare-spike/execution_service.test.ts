@@ -25,9 +25,16 @@ import type {
   ExecutionRecord,
   ExecutionStore,
   FinishExecutionInput,
-  ManagedExecutionAllowance,
 } from "./src/execution_store.ts";
-import { ManagedExecutionAllowanceError } from "./src/execution_store.ts";
+import type { ManagedExecutionOwner } from "./src/managed_ownership.ts";
+import {
+  ManagedExecutionAllowanceError,
+  type ManagedExecutionAllowance,
+  type ManagedExecutionReservation,
+  type ManagedExecutionReservationStore,
+  type ManagedReservationInput,
+  type ManagedReservationClaim,
+} from "./src/managed_reservation.ts";
 import {
   RunCostMeter,
   type RunCostAnalyticsPoint,
@@ -54,6 +61,10 @@ const { EXECUTION_OWNER_LEASE_MS, ExecutionService } = await import(
 const allowance: ManagedExecutionAllowance = {
   deployment_epoch: "preview-2026-09-01",
   execution_limit: 3,
+};
+const executionOwner: ManagedExecutionOwner = {
+  domain: "huddles_workspace",
+  digest: `sha256:${"d".repeat(64)}`,
 };
 
 async function request(
@@ -128,6 +139,7 @@ test("created execution persists terminal evidence and exact retry does not resa
     sandboxProfile: "standard-2",
     authorizer: async () => {
       authorizationChecks += 1;
+      return executionOwner;
     },
   });
   const input = await request();
@@ -320,8 +332,10 @@ test("disabled managed execution returns a typed failure before charged access",
       ownerToken: never,
       analytics: { emit: async () => never() },
       admission: managedAdmissionPolicy(undefined),
+      reservations: new MemoryReservations(),
       authorizer: async () => {
         authorized = true;
+        return executionOwner;
       },
     },
   );
@@ -359,6 +373,8 @@ test("enabled managed execution with missing allowance config fails before charg
       ownerToken: never,
       analytics: { emit: async () => never() },
       admission: managedAdmissionPolicy("1"),
+      reservations: new MemoryReservations(),
+      authorizer: async () => executionOwner,
     },
   );
 
@@ -376,9 +392,7 @@ test("exhausted allowance fails before Sandbox, R2, or Analytics", async () => {
   };
   const service = new ExecutionService(
     {
-      claim: async () => {
-        throw new ManagedExecutionAllowanceError();
-      },
+      claim: async () => never(),
       get: async () => never(),
       finish: async () => never(),
     },
@@ -392,6 +406,12 @@ test("exhausted allowance fails before Sandbox, R2, or Analytics", async () => {
     },
     {
       ...fixedOptions(),
+      reservations: {
+        ...new MemoryReservations(),
+        claimExecution: async () => {
+          throw new ManagedExecutionAllowanceError();
+        },
+      },
       analytics: { emit: async () => never() },
     },
   );
@@ -507,10 +527,9 @@ test("expired running claims become interrupted instead of resampling", async ()
     evidence: [],
   });
   const service = new ExecutionService(store, new MemoryArtifacts(), runtime, {
+    ...fixedOptions(),
     now: () => EXECUTION_OWNER_LEASE_MS + 1,
     ownerToken: () => "unused-owner",
-    admission: managedAdmissionPolicy("1"),
-    allowance,
   });
 
   const result = await service.executeInvocation(input);
@@ -533,10 +552,9 @@ test("an immutable terminal artifact repairs a lost D1 terminal write", async ()
       evidence: [{ type: "message_delta", text: "done" }],
     }),
     {
+      ...fixedOptions(),
       now: () => now,
       ownerToken: () => "owner-1",
-      admission: managedAdmissionPolicy("1"),
-      allowance,
       costMeter: new RunCostMeter(),
       analytics: { emit: (point) => analytics.push(point) },
     },
@@ -622,6 +640,46 @@ test("cancellation terminalizes once and exact retries read the same result", as
   assert.equal(runtime.cancellations, 1);
 });
 
+test("foreign owners cannot read evidence, status, or cancel an invocation", async () => {
+  const input = await request();
+  const store = new MemoryStore();
+  const artifacts = new MemoryArtifacts();
+  const runtime = new FakeRuntime({
+    served_model: null,
+    output: { text: "done" },
+    evidence: [{ type: "message_delta", text: "private" }],
+  });
+  await new ExecutionService(store, artifacts, runtime, fixedOptions()).executeInvocation(input);
+  const foreignOwner: ManagedExecutionOwner = {
+    domain: "huddles_workspace",
+    digest: `sha256:${"e".repeat(64)}`,
+  };
+  const foreign = new ExecutionService(store, artifacts, runtime, {
+    ...fixedOptions(),
+    authorizer: async () => foreignOwner,
+  });
+  await assert.rejects(
+    foreign.getExecutionStatus({
+      contract_version: "pillbox.execution/2",
+      invocation_id: input.invocation_id,
+      evidence_after: 0,
+      evidence_limit: 100,
+    }),
+    /was not found/,
+  );
+  await assert.rejects(
+    foreign.cancelInvocation({
+      contract_version: "pillbox.execution/2",
+      invocation_id: input.invocation_id,
+      idempotency_key: input.invocation_id,
+      reason: "foreign",
+    }),
+    /was not found/,
+  );
+  assert.equal(artifacts.reads, 0);
+  assert.equal(runtime.cancellations, 0);
+});
+
 test("disabled admission still permits status, cancellation, and terminal drain", async () => {
   const input = await request();
   const store = new MemoryStore();
@@ -632,6 +690,7 @@ test("disabled admission still permits status, cancellation, and terminal drain"
     evidence: [],
   });
   const service = new ExecutionService(store, new MemoryArtifacts(), runtime, {
+    ...fixedOptions(),
     now: () => 1_000,
     ownerToken: () => "unused-owner",
     admission: managedAdmissionPolicy(undefined),
@@ -698,6 +757,9 @@ async function seedRunning(
       ),
       execution_policy_revision: input.execution_policy_revision,
       session_id: input.session_ref.session_id,
+      owner: executionOwner,
+      allowance_epoch: allowance.deployment_epoch,
+      allowance_limit: allowance.execution_limit,
       attribution: {
         harness: input.execution.transport.harness,
         transport: input.execution.transport.transport,
@@ -708,7 +770,6 @@ async function seedRunning(
       now_ms,
       lease_expires_at_ms: now_ms + EXECUTION_OWNER_LEASE_MS,
     },
-    allowance,
   );
 }
 
@@ -718,6 +779,8 @@ function fixedOptions() {
     ownerToken: () => "owner-1",
     admission: managedAdmissionPolicy("1"),
     allowance,
+    reservations: new MemoryReservations(),
+    authorizer: async () => executionOwner,
   };
 }
 
@@ -759,7 +822,6 @@ class MemoryStore implements ExecutionStore {
 
   async claim(
     input: ExecutionClaimInput,
-    _allowance: ManagedExecutionAllowance,
   ): Promise<ExecutionClaim> {
     const existing =
       this.rows.get(input.invocation_id) ??
@@ -783,12 +845,9 @@ class MemoryStore implements ExecutionStore {
     return { kind: "created", record };
   }
 
-  async get(invocation_id: string): Promise<ExecutionRecord | null> {
-    return this.rows.get(invocation_id) ?? null;
-  }
-
-  async getAllowance(_allowance: ManagedExecutionAllowance) {
-    return null;
+  async get(invocation_id: string, owner: ManagedExecutionOwner): Promise<ExecutionRecord | null> {
+    const row = this.rows.get(invocation_id);
+    return row?.owner.domain === owner.domain && row.owner.digest === owner.digest ? row : null;
   }
 
   async finish(input: FinishExecutionInput): Promise<boolean> {
@@ -802,7 +861,9 @@ class MemoryStore implements ExecutionStore {
       current === undefined ||
       current.status !== "running" ||
       current.request_hash !== input.request_hash ||
-      current.owner_token !== input.owner_token
+      current.owner_token !== input.owner_token ||
+      current.owner.domain !== input.owner.domain ||
+      current.owner.digest !== input.owner.digest
     ) {
       return false;
     }
@@ -816,9 +877,106 @@ class MemoryStore implements ExecutionStore {
   }
 }
 
+class MemoryReservations implements ManagedExecutionReservationStore {
+  readonly rows = new Map<string, ManagedExecutionReservation>();
+
+  async claimProvision(
+    input: ManagedReservationInput,
+    allowance: ManagedExecutionAllowance,
+  ): Promise<ManagedReservationClaim> {
+    return this.claim(input, allowance, "provisioning");
+  }
+
+  async claimExecution(
+    input: Omit<ManagedReservationInput, "source" | "provision_request_digest">,
+    allowance: ManagedExecutionAllowance,
+  ): Promise<ManagedReservationClaim> {
+    const existing = this.rows.get(input.invocation_id);
+    if (existing !== undefined) {
+      const exact =
+        existing.session_id === input.session_id &&
+        existing.owner.domain === input.owner.domain &&
+        existing.owner.digest === input.owner.digest &&
+        existing.execution_request_hash === input.execution_request_hash &&
+        existing.allowance_epoch === allowance.deployment_epoch &&
+        existing.allowance_limit === allowance.execution_limit;
+      return { kind: exact ? "reused" : "conflict", record: existing };
+    }
+    return this.claim({ ...input, source: "direct_execution" }, allowance, "ready");
+  }
+
+  async getReady(
+    invocationId: string,
+    sessionId: string,
+    owner: ManagedExecutionOwner,
+    requestHash: `sha256:${string}`,
+    allowance: ManagedExecutionAllowance,
+  ): Promise<ManagedExecutionReservation | null> {
+    const row = this.rows.get(invocationId);
+    return row?.status === "ready" && row.session_id === sessionId &&
+      row.owner.domain === owner.domain && row.owner.digest === owner.digest &&
+      row.execution_request_hash === requestHash &&
+      row.allowance_epoch === allowance.deployment_epoch &&
+      row.allowance_limit === allowance.execution_limit ? row : null;
+  }
+
+  async getSessionOwner(sessionId: string): Promise<ManagedExecutionOwner | null> {
+    return [...this.rows.values()].find((row) => row.session_id === sessionId)?.owner ?? null;
+  }
+
+  async markReady(input: { invocation_id: string; owner: ManagedExecutionOwner; now_ms: number }): Promise<boolean> {
+    return this.transition(input, "ready", null);
+  }
+
+  async markFailed(input: { invocation_id: string; owner: ManagedExecutionOwner; error_code: string; now_ms: number }): Promise<boolean> {
+    return this.transition(input, "failed", input.error_code);
+  }
+
+  async getAllowance(config: ManagedExecutionAllowance) {
+    return { ...config, reserved_executions: this.rows.size };
+  }
+
+  private async claim(
+    input: ManagedReservationInput,
+    config: ManagedExecutionAllowance,
+    status: "provisioning" | "ready",
+  ): Promise<ManagedReservationClaim> {
+    const existing = this.rows.get(input.invocation_id);
+    if (existing !== undefined) return { kind: "reused", record: existing };
+    const record: ManagedExecutionReservation = {
+      invocation_id: input.invocation_id,
+      session_id: input.session_id,
+      owner: input.owner,
+      execution_request_hash: input.execution_request_hash,
+      source: input.source,
+      provision_request_digest: input.provision_request_digest ?? null,
+      status,
+      error_code: null,
+      allowance_epoch: config.deployment_epoch,
+      allowance_limit: config.execution_limit,
+      created_at_ms: input.now_ms,
+      updated_at_ms: input.now_ms,
+    };
+    this.rows.set(input.invocation_id, record);
+    return { kind: "created", record };
+  }
+
+  private async transition(
+    input: { invocation_id: string; owner: ManagedExecutionOwner; now_ms: number },
+    status: "ready" | "failed",
+    error_code: string | null,
+  ): Promise<boolean> {
+    const row = this.rows.get(input.invocation_id);
+    if (row === undefined || row.owner.domain !== input.owner.domain || row.owner.digest !== input.owner.digest) return false;
+    this.rows.set(input.invocation_id, { ...row, status, error_code, updated_at_ms: input.now_ms });
+    return true;
+  }
+}
+
 class MemoryArtifacts implements ExecutionArtifactStore {
   readonly values = new Map<string, ExecutionArtifact>();
   writes = 0;
+  reads = 0;
   private readonly onWrite: () => void;
 
   constructor(onWrite: () => void = () => {}) {
@@ -844,6 +1002,7 @@ class MemoryArtifacts implements ExecutionArtifactStore {
   }
 
   async read(ref: ExecutionArtifactRef): Promise<ExecutionArtifact> {
+    this.reads += 1;
     const value = this.values.get(ref.key);
     if (value === undefined) throw new Error("missing artifact");
     return structuredClone(value);

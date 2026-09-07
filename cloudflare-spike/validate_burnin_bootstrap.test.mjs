@@ -104,6 +104,7 @@ const remoteD1Result = [
       { name: "0001_execution.sql" },
       { name: "0002_managed_execution_allowance.sql" },
       { name: "0003_workspace_finalize.sql" },
+      { name: "0004_managed_reservation_ownership.sql" },
     ],
     success: true,
   },

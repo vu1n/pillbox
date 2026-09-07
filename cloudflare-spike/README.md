@@ -9,7 +9,8 @@ single-controller execution service, not a multiplayer gateway.
 - D1 `execution`: bounded invocation claims and terminal references
 - R2 `EXECUTION_EVIDENCE`: one immutable terminal artifact per invocation
 - Analytics Engine `RUN_COSTS`: at most one compact point per terminal run
-- Worker/service-binding routes: execute, status, cancel, workspace provision,
+- Worker/service-binding routes: execute, status, cancel, workspace provision
+  (bound to a prepared invocation ID and execution request hash),
   and workspace finalize
 
 There is no Pillbox-authored Durable Object class, Agents SDK, per-event SQLite

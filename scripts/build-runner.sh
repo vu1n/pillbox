@@ -21,6 +21,7 @@ cd "$(dirname "$0")/.."
 
 DOCKERFILE=runner/Dockerfile
 TAG=pillbox-runner:dev   # moving dev tag — every local script + a dev pillbox.toml default to it
+ROOTFS_CACHE_VERSION=v2  # mirrors ROOTFS_CACHE_VERSION in src/sandbox/libkrun/mod.rs
 DO_UPDATE=0 DRY_RUN=0 NO_CACHE=0 PRUNE=0
 
 usage() {
@@ -142,15 +143,16 @@ docker run --rm --entrypoint sh "$TAG" -c '
 '
 
 # Each rebuild gives the image a new id, so libkrun re-materializes its rootfs
-# (~/.pillbox/krun/rootfs/<sanitized-tag>_<sanitized-id>/) on the next run and
-# the prior generation lingers. Opt-in prune drops generations for THIS tag that
-# don't match the freshly-built id — never the current one, never other tags.
+# (~/.pillbox/krun/rootfs/<sanitized-tag>_<sanitized-id>_v2/) on the next run and
+# prior materialization generations linger. Opt-in prune drops legacy and current
+# generations for THIS tag that don't match the freshly-built id and format —
+# never the current one, never other tags.
 if [ "$PRUNE" = 1 ]; then
 	root="${HOME}/.pillbox/krun/rootfs"
 	if [ -d "$root" ]; then
 		san() { printf '%s' "$1" | sed 's/[^a-zA-Z0-9]/_/g'; }   # mirrors Rust sanitize()
 		new_id=$(docker image inspect "$TAG" --format '{{.Id}}')
-		keep="$(san "$TAG")_$(san "$new_id")"
+		keep="$(san "$TAG")_$(san "$new_id")_${ROOTFS_CACHE_VERSION}"
 		pruned=0
 		for d in "$root/$(san "$TAG")_sha256_"*; do
 			[ -d "$d" ] || continue

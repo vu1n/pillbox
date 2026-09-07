@@ -674,6 +674,10 @@ fn unsupported(spec: &AgentSpec, what: &str) -> anyhow::Error {
     .into()
 }
 
+const ROOTFS_CACHE_VERSION: &str = "v2";
+const ROOTFS_CACHE_MARKER_MAGIC: &str = "pillbox-rootfs-cache/v2";
+const ROOTFS_TAR_EXTRACT_FLAG: &str = "-xpf";
+
 /// Materialize the runner OCI image into a cached on-disk directory usable as a
 /// virtio-fs root (libkrun's `krun_set_root` takes a *directory*, not an image).
 /// One-time per concrete image via `docker export`; cached under
@@ -701,11 +705,17 @@ fn materialize_rootfs(resolved: &Pillbox) -> Result<PathBuf> {
     };
     let cache = rootfs_root.join(rootfs_cache_key(&image, &image_id));
     let marker = cache.join(".materialized");
-    if marker.exists() {
+    if rootfs_marker_matches(&marker, &image, &image_id) {
         return Ok(cache);
     }
-    let _ = std::fs::remove_dir_all(&cache);
-    std::fs::create_dir_all(&cache).with_context(|| format!("create {}", cache.display()))?;
+    if cache.exists() {
+        bail!(
+            "rootfs cache generation {} is incomplete or uses an incompatible materialization format; refusing to replace a directory that may be live (remove it only after confirming no session uses it)",
+            cache.display()
+        );
+    }
+    std::fs::create_dir_all(&rootfs_root)
+        .with_context(|| format!("create {}", rootfs_root.display()))?;
     eprintln!("pillbox: materializing runner rootfs from {image} (one-time)…");
 
     let create = Command::new("docker")
@@ -719,6 +729,10 @@ fn materialize_rootfs(resolved: &Pillbox) -> Result<PathBuf> {
         );
     }
     let cid = String::from_utf8_lossy(&create.stdout).trim().to_string();
+    if let Err(cause) = std::fs::create_dir(&cache) {
+        let _ = Command::new("docker").args(["rm", "-f", &cid]).output();
+        return Err(cause).with_context(|| format!("create {}", cache.display()));
+    }
 
     // Stream the container filesystem straight into the cache dir. Capture both
     // commands' stdio: `docker rm` echoes the container id, and `run --json`'s
@@ -727,8 +741,9 @@ fn materialize_rootfs(resolved: &Pillbox) -> Result<PathBuf> {
     let export = Command::new("sh")
         .arg("-c")
         .arg(format!(
-            "docker export {cid} | tar -C {} -xf -",
-            cache.display()
+            "docker export {} | tar -C {} {ROOTFS_TAR_EXTRACT_FLAG} -",
+            shell_quote(&cid),
+            shell_quote(&cache.to_string_lossy())
         ))
         .output()
         .map(|o| o.status);
@@ -746,8 +761,10 @@ fn materialize_rootfs(resolved: &Pillbox) -> Result<PathBuf> {
             bail!("rootfs export failed: {e}");
         }
     }
-    std::fs::write(&marker, format!("{image}\n{image_id}\n"))
-        .context("write rootfs cache marker")?;
+    if let Err(cause) = std::fs::write(&marker, rootfs_marker_contents(&image, &image_id)) {
+        let _ = std::fs::remove_dir_all(&cache);
+        return Err(cause).context("write rootfs cache marker");
+    }
     Ok(cache)
 }
 
@@ -813,9 +830,9 @@ fn rootfs_unavailable_message(
 
 /// Newest materialized rootfs generation for `image`, or `None`. The fallback
 /// when Docker can't resolve the live image id: scan the rootfs cache root for
-/// generation dirs whose `.materialized` marker's first line is exactly `image`
-/// (the marker is `format!("{image}\n{image_id}\n")`), and pick the one with the
-/// most-recent marker mtime — the freshest export we have for this tag.
+/// generation dirs whose versioned marker and cache key bind the exact image and
+/// image id, and pick the one with the most-recent marker mtime. Legacy markers
+/// are deliberately ignored because their extraction did not preserve modes.
 fn find_cached_rootfs(root: &Path, image: &str) -> Option<PathBuf> {
     let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
     for entry in std::fs::read_dir(root).ok()?.flatten() {
@@ -824,10 +841,13 @@ fn find_cached_rootfs(root: &Path, image: &str) -> Option<PathBuf> {
             continue;
         }
         let marker = dir.join(".materialized");
-        let Ok(text) = std::fs::read_to_string(&marker) else {
+        let Some((marker_image, image_id)) = read_rootfs_marker(&marker) else {
             continue;
         };
-        if text.lines().next() != Some(image) {
+        let expected_key = rootfs_cache_key(image, &image_id);
+        if marker_image != image
+            || dir.file_name().and_then(|name| name.to_str()) != Some(expected_key.as_str())
+        {
             continue;
         }
         let Ok(mtime) = marker.metadata().and_then(|m| m.modified()) else {
@@ -859,12 +879,40 @@ fn docker_image_id(image: &str) -> Result<String> {
 }
 
 fn rootfs_cache_key(image: &str, image_id: &str) -> String {
-    format!("{}_{}", sanitize(image), sanitize(image_id))
+    format!(
+        "{}_{}_{}",
+        sanitize(image),
+        sanitize(image_id),
+        ROOTFS_CACHE_VERSION
+    )
+}
+
+fn rootfs_marker_contents(image: &str, image_id: &str) -> String {
+    format!("{ROOTFS_CACHE_MARKER_MAGIC}\n{image}\n{image_id}\n")
+}
+
+fn rootfs_marker_matches(marker: &Path, image: &str, image_id: &str) -> bool {
+    read_rootfs_marker(marker).is_some_and(|(marker_image, marker_image_id)| {
+        marker_image == image && marker_image_id == image_id
+    })
+}
+
+fn read_rootfs_marker(marker: &Path) -> Option<(String, String)> {
+    let text = std::fs::read_to_string(marker).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != ROOTFS_CACHE_MARKER_MAGIC {
+        return None;
+    }
+    let image = lines.next()?.to_string();
+    let image_id = lines.next()?.to_string();
+    if image.is_empty() || image_id.is_empty() || lines.next().is_some() {
+        return None;
+    }
+    Some((image, image_id))
 }
 
 fn krun_cache_dir() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").context("HOME unset")?;
-    Ok(PathBuf::from(home).join(".pillbox").join("krun"))
+    Ok(crate::paths::pillbox_root()?.join("krun"))
 }
 
 /// Filesystem-safe cache key for an image ref (`a/b:c` → `a_b_c`).
@@ -881,11 +929,14 @@ fn cstr(s: &str) -> CString {
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
+
     use base64::Engine as _;
 
     use super::{
-        env_fork_left_real_unstubbed, find_cached_rootfs, oauth_swap_hosts,
-        rootfs_unavailable_message, SwapPair,
+        env_fork_left_real_unstubbed, find_cached_rootfs, krun_cache_dir, oauth_swap_hosts,
+        rootfs_cache_key, rootfs_marker_contents, rootfs_marker_matches,
+        rootfs_unavailable_message, SwapPair, ROOTFS_TAR_EXTRACT_FLAG,
     };
     use crate::agents::{CLAUDE, CODEX, PI};
 
@@ -954,42 +1005,73 @@ mod tests {
         );
     }
 
-    // Write a generation dir with a marker shaped like the real one, then set
-    // its mtime so "newest wins" is testable without sleeping (`age_secs` ago).
-    fn gen_dir(root: &std::path::Path, name: &str, first_line: Option<&str>, age_secs: u64) {
+    // Write a generation dir and set the marker mtime so newest-wins behavior is
+    // deterministic without sleeps (`age_secs` ago).
+    fn gen_dir(root: &std::path::Path, name: &str, marker_contents: Option<String>, age_secs: u64) {
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
-        if let Some(image) = first_line {
+        if let Some(contents) = marker_contents {
             let path = dir.join(".materialized");
             let f = std::fs::File::create(&path).unwrap();
             use std::io::Write;
-            (&f).write_all(format!("{image}\nsha256:deadbeef\n").as_bytes())
-                .unwrap();
+            (&f).write_all(contents.as_bytes()).unwrap();
             let when = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
             f.set_modified(when).unwrap();
         }
     }
 
     #[test]
-    fn find_cached_rootfs_picks_newest_matching_image() {
+    fn find_cached_rootfs_picks_newest_current_generation_and_rejects_legacy() {
         let root = tempfile::tempdir().unwrap();
         let image = "ghcr.io/vu1n/pillbox:rolling";
-        // Two generations of the same image (older + newer) plus a dir for a
-        // different image and a dir with no marker — only the newest match wins.
-        gen_dir(root.path(), "old", Some(image), 100);
-        gen_dir(root.path(), "new", Some(image), 1);
-        gen_dir(root.path(), "other", Some("ghcr.io/vu1n/pillbox:pinned"), 0);
-        gen_dir(root.path(), "nomarker", None, 0);
+        let old_id = "sha256:1111";
+        let new_id = "sha256:2222";
+        let old_key = rootfs_cache_key(image, old_id);
+        let new_key = rootfs_cache_key(image, new_id);
+        gen_dir(
+            root.path(),
+            &old_key,
+            Some(rootfs_marker_contents(image, old_id)),
+            100,
+        );
+        gen_dir(
+            root.path(),
+            &new_key,
+            Some(rootfs_marker_contents(image, new_id)),
+            10,
+        );
+        // This legacy generation is newer, but its unversioned marker means its
+        // extraction may have lost sticky/setuid mode bits and cannot be reused.
+        gen_dir(
+            root.path(),
+            "ghcr_io_vu1n_pillbox_rolling_sha256_3333",
+            Some(format!("{image}\nsha256:3333\n")),
+            0,
+        );
 
         let hit = find_cached_rootfs(root.path(), image).expect("a matching generation");
-        assert_eq!(hit.file_name().unwrap(), "new", "expected the newest match");
+        assert_eq!(hit, root.path().join(new_key));
     }
 
     #[test]
-    fn find_cached_rootfs_ignores_non_matching_and_markerless() {
+    fn find_cached_rootfs_ignores_non_matching_markerless_and_misnamed() {
         let root = tempfile::tempdir().unwrap();
-        gen_dir(root.path(), "other", Some("some/other:image"), 0);
+        gen_dir(
+            root.path(),
+            &rootfs_cache_key("some/other:image", "sha256:1"),
+            Some(rootfs_marker_contents("some/other:image", "sha256:1")),
+            0,
+        );
         gen_dir(root.path(), "nomarker", None, 0);
+        gen_dir(
+            root.path(),
+            "wrong-key-v2",
+            Some(rootfs_marker_contents(
+                "ghcr.io/vu1n/pillbox:rolling",
+                "sha256:2",
+            )),
+            0,
+        );
         assert!(find_cached_rootfs(root.path(), "ghcr.io/vu1n/pillbox:rolling").is_none());
     }
 
@@ -997,6 +1079,85 @@ mod tests {
     fn find_cached_rootfs_empty_root_is_none() {
         let root = tempfile::tempdir().unwrap();
         assert!(find_cached_rootfs(root.path(), "anything").is_none());
+    }
+
+    #[test]
+    fn rootfs_marker_fast_path_requires_current_exact_identity() {
+        let fixture = tempfile::tempdir().unwrap();
+        let marker = fixture.path().join(".materialized");
+        let image = "pillbox-runner:dev";
+        let image_id = "sha256:current";
+        for (contents, expected) in [
+            (rootfs_marker_contents(image, image_id), true),
+            (
+                format!("pillbox-rootfs-cache/v1\n{image}\n{image_id}\n"),
+                false,
+            ),
+            (
+                rootfs_marker_contents("pillbox-runner:latest", image_id),
+                false,
+            ),
+            (rootfs_marker_contents(image, "sha256:other"), false),
+            (
+                format!("pillbox-rootfs-cache/v2\n{image}\n{image_id}\nextra\n"),
+                false,
+            ),
+        ] {
+            std::fs::write(&marker, contents).unwrap();
+            assert_eq!(rootfs_marker_matches(&marker, image, image_id), expected);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rootfs_cache_stays_beneath_the_private_pillbox_root() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        crate::test_util::with_isolated_home("rootfs-cache-private", || {
+            let cache = krun_cache_dir().unwrap();
+            let private_root = cache.parent().unwrap();
+            let mode = std::fs::metadata(private_root)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(mode, 0o700);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rootfs_tar_extraction_preserves_sticky_world_writable_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("source");
+        let extracted = fixture.path().join("extracted");
+        let archive = fixture.path().join("rootfs.tar");
+        std::fs::create_dir_all(source.join("tmp")).unwrap();
+        std::fs::create_dir_all(&extracted).unwrap();
+        std::fs::set_permissions(source.join("tmp"), std::fs::Permissions::from_mode(0o1777))
+            .unwrap();
+        assert!(Command::new("tar")
+            .args(["-C", source.to_str().unwrap(), "-cf"])
+            .arg(&archive)
+            .arg("tmp")
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("tar")
+            .args(["-C", extracted.to_str().unwrap(), ROOTFS_TAR_EXTRACT_FLAG])
+            .arg(&archive)
+            .status()
+            .unwrap()
+            .success());
+
+        let mode = std::fs::metadata(extracted.join("tmp"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o1777);
     }
 
     #[test]

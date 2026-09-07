@@ -106,6 +106,17 @@ bump. Layer caching keeps the rebuild partial — apt / Node / the cargo-built
 image gets a new id, so libkrun re-materializes its rootfs on the next run (add
 `--prune-rootfs` to drop the superseded generation under `~/.pillbox/krun/rootfs/`).
 
+libkrun's materialized cache format is versioned independently of image tags.
+The current `v2` generation extracts `docker export` with archive permissions
+preserved, including `/tmp`'s required `01777` mode, and records the exact cache
+format, image reference, and image ID in `.materialized`. Docker-unavailable
+fallback accepts only a matching current-format marker and key; older exports
+remain untouched because a running VM serves its rootfs directory live. They
+are removed only by the explicit `--prune-rootfs` option when no session uses
+the old image. Materialized generations remain beneath Pillbox's host-owned
+`~/.pillbox` directory, whose mode is reasserted as `0700` on every access;
+preserved setuid/setgid bits are therefore not exposed through a shared cache.
+
 ## Build it yourself
 
 ```sh
@@ -149,6 +160,8 @@ image, pillbox CLI assumes:
   for the agents you intend to run. `pillbox doctor` will flag
   missing ones at runtime.
 - `/workspace` exists and is writable (bind-mount target).
+- `/tmp` exists with mode `01777`; libkrun preserves image archive mode bits
+  when materializing the rootfs.
 - `/etc` writable for the `--mcp-config` bind mount.
 - A shell.
 - `HOME` is set by the caller (pillbox sets `HOME=/home/pillbox`

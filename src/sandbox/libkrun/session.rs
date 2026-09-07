@@ -2296,7 +2296,7 @@ impl crate::sandbox::LiveSession for LibkrunLiveSession {
             } else {
                 // Restore the sole reparented producer, not a reader-scoped byte-zero
                 // tailer. Its durable rollout cursor prevents stale idle replay.
-                spawn_session_tailer(resolved, &self.session, &spec)?;
+                spawn_session_tailer(resolved, &self.session, spec)?;
             }
             None
         };

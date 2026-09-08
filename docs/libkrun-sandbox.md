@@ -479,9 +479,11 @@ for an unknown field. A mode of `x` means the backing mode is effective, while
 an explicit mode must carry the actual inode type (or no type bits) and is
 preserved exactly, including set-id bits. Every normalized entry is exposed to
 the guest as owner `0:0`; the host backing mode is restored exactly after the
-xattr write, including error paths. A temporary owner-write bit is used only
-inside the private clone when macOS rejects xattr writes on host-created `0444`
-or `0555` entries. Malformed, overlong, type-conflicting, or unsupported
+xattr write, including error paths. Before inspection, files receive only the
+minimum temporary owner `rw` access and directories only owner `rwx` access;
+these bits are used only inside the private clone when macOS rejects xattr
+writes or opens on host-created `0444`, `0555`, `0200`, or `0000` entries.
+Malformed, overlong, type-conflicting, or unsupported
 metadata aborts launch; symlinks are metadata targets only and are never
 followed. Non-macOS retains the existing guest-side walk.
 

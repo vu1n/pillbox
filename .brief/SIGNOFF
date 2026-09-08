@@ -145,3 +145,4 @@ libkrun-is-the-backend conforms: META-001 prepares only disposable libkrun works
 libkrun-env-fork-substrate conforms: META-001 changes only guest-visible override metadata on private clones, retains the existing guest env/argv/VmSpec credential boundary, and leaves egress and swap channels unchanged.
 workspace-ingest-sovereignty conforms: META-001 runs after the canonical workspace secret scrub, never touches source or warm-base paths, and rejects symlink-following or unsupported clone entries.
 docs-governance conforms: META-001 records libkrun's source-backed override-stat format, temporary owner-write/restore invariant, effective-mode preservation, and excluded rootfs/grader/source targets in the canonical sandbox guide.
+docs-governance conforms: META-001 follow-up records the bounded temporary owner-access adjustment for unreadable/searchless private-clone entries and its exact restoration boundary.

@@ -32,8 +32,16 @@ use crate::contract::{Actor, Event};
 use crate::events::log::SessionLog;
 
 const CURSOR_VERSION: u8 = 1;
+const CODEX_CURSOR_VERSION: u8 = 2;
 const TRANSCRIPT_READ_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_TRANSCRIPT_LINE_BYTES: usize = 1024 * 1024;
+
+type ParsedBatch = (
+    Vec<TranscriptEvent>,
+    Vec<Event>,
+    usize,
+    Option<codex::Parser>,
+);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -43,6 +51,10 @@ struct CursorPosition {
     inode: u64,
     offset: u64,
     line_idx: usize,
+    /// Codex cumulative-usage baseline. Claude cursors leave this absent so
+    /// existing v1 Claude sessions remain readable.
+    #[serde(default)]
+    codex_parser: Option<codex::ParserState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +74,12 @@ enum CursorState {
 }
 
 impl CursorState {
+    fn version(&self) -> u8 {
+        match self {
+            Self::Committed { version, .. } | Self::Committing { version, .. } => *version,
+        }
+    }
+
     fn position(&self) -> &CursorPosition {
         match self {
             Self::Committed { position, .. } | Self::Committing { position, .. } => position,
@@ -69,11 +87,10 @@ impl CursorState {
     }
 
     fn validate(&self, session_id: &str) -> Result<()> {
-        let version = match self {
-            Self::Committed { version, .. } | Self::Committing { version, .. } => *version,
-        };
-        if version != CURSOR_VERSION || self.position().transcript.as_os_str().is_empty() {
-            anyhow::bail!("invalid detached transcript cursor identity");
+        if !matches!(self.version(), CURSOR_VERSION | CODEX_CURSOR_VERSION)
+            || self.position().transcript.as_os_str().is_empty()
+        {
+            anyhow::bail!("invalid detached transcript cursor identity or unsupported version");
         }
         if let Self::Committing {
             events,
@@ -95,6 +112,7 @@ impl CursorState {
 struct DurableCursor {
     path: PathBuf,
     position: CursorPosition,
+    version: u8,
 }
 
 impl DurableCursor {
@@ -107,6 +125,7 @@ impl DurableCursor {
         transcript: &Path,
         session_id: &str,
         log: &mut SessionLog,
+        expected_version: u8,
     ) -> Result<Self> {
         let (device, inode) = source_identity(transcript)?;
         let state = read_cursor(&path, session_id)?;
@@ -122,6 +141,17 @@ impl DurableCursor {
                 transcript.display()
             );
         }
+        let state_version = state.as_ref().map(CursorState::version);
+        if let Some(version) = state_version.filter(|version| *version != expected_version) {
+            anyhow::bail!(
+                "detached transcript cursor version {version} is incompatible with this {} producer (expected {expected_version}); preserve the cursor and start a new session",
+                if expected_version == CODEX_CURSOR_VERSION {
+                    "Codex"
+                } else {
+                    "Claude"
+                }
+            );
+        }
         let position = match state {
             None => CursorPosition {
                 transcript: transcript.to_path_buf(),
@@ -129,6 +159,7 @@ impl DurableCursor {
                 inode,
                 offset: 0,
                 line_idx: 0,
+                codex_parser: None,
             },
             Some(CursorState::Committed { position, .. }) => position,
             Some(CursorState::Committing {
@@ -143,7 +174,7 @@ impl DurableCursor {
                 persist_cursor(
                     &path,
                     &CursorState::Committed {
-                        version: CURSOR_VERSION,
+                        version: expected_version,
                         position: position.clone(),
                     },
                 )?;
@@ -154,12 +185,16 @@ impl DurableCursor {
             persist_cursor(
                 &path,
                 &CursorState::Committed {
-                    version: CURSOR_VERSION,
+                    version: expected_version,
                     position: position.clone(),
                 },
             )?;
         }
-        Ok(Self { path, position })
+        Ok(Self {
+            path,
+            position,
+            version: expected_version,
+        })
     }
 
     fn commit_batch(
@@ -172,7 +207,7 @@ impl DurableCursor {
             persist_cursor(
                 &self.path,
                 &CursorState::Committed {
-                    version: CURSOR_VERSION,
+                    version: self.version,
                     position: next.clone(),
                 },
             )?;
@@ -181,7 +216,7 @@ impl DurableCursor {
                 persist_cursor(
                     &self.path,
                     &CursorState::Committing {
-                        version: CURSOR_VERSION,
+                        version: self.version,
                         position: next.clone(),
                         pre_append_seq,
                         events: events.to_vec(),
@@ -192,7 +227,7 @@ impl DurableCursor {
             persist_cursor(
                 &self.path,
                 &CursorState::Committed {
-                    version: CURSOR_VERSION,
+                    version: self.version,
                     position: next.clone(),
                 },
             )?;
@@ -280,6 +315,9 @@ pub(crate) struct Tailer {
     /// Present only for the reparented Codex producer. It turns transcript
     /// consumption + §0 append into a recoverable local transaction.
     cursor: Option<DurableCursor>,
+    /// Stateful only for Codex: cumulative token baselines are persisted in
+    /// `cursor.position.codex_parser` before the transcript cursor advances.
+    codex_parser: Option<codex::Parser>,
 }
 
 impl Tailer {
@@ -301,6 +339,7 @@ impl Tailer {
             synth,
             log,
             cursor: None,
+            codex_parser: (harness == Harness::Codex).then(codex::Parser::default),
         }
     }
 
@@ -316,7 +355,24 @@ impl Tailer {
         mut log: SessionLog,
         cursor_path: PathBuf,
     ) -> Result<Self> {
-        let cursor = DurableCursor::open(cursor_path, &path, &session_id, &mut log)?;
+        let expected_version = if harness == Harness::Codex {
+            CODEX_CURSOR_VERSION
+        } else {
+            CURSOR_VERSION
+        };
+        let cursor =
+            DurableCursor::open(cursor_path, &path, &session_id, &mut log, expected_version)?;
+        if harness == Harness::Codex
+            && cursor.position.offset > 0
+            && cursor.position.codex_parser.is_none()
+        {
+            anyhow::bail!(
+                "Codex detached transcript cursor has no accounting baseline at offset {}; preserve the cursor and start a new session",
+                cursor.position.offset
+            );
+        }
+        let codex_parser = (harness == Harness::Codex)
+            .then(|| codex::Parser::from_state(cursor.position.codex_parser.clone()));
         let synth = super::synth::ChatSynthesizer::new(session_id.clone(), harness, include_usage);
         Ok(Self {
             path,
@@ -328,6 +384,7 @@ impl Tailer {
             synth,
             log: Some(log),
             cursor: Some(cursor),
+            codex_parser,
         })
     }
 
@@ -370,7 +427,9 @@ impl Tailer {
             // File rotated / truncated under us; rewind so we don't
             // miss the head of the new content.
             self.offset = 0;
+            self.line_idx = 0;
             self.leftover.clear();
+            self.codex_parser = (self.harness == Harness::Codex).then(codex::Parser::default);
         }
         if len == self.offset {
             return Ok(0);
@@ -419,7 +478,7 @@ impl Tailer {
             return self.ingest_durable(complete, next_offset);
         }
 
-        let (parsed, durable, next_line_idx) = self.parse_complete(complete)?;
+        let (parsed, durable, next_line_idx, next_codex_parser) = self.parse_complete(complete)?;
         // Durable spine append — best-effort + loud: a write failure must not
         // strand the OTLP/synth emits above or the tail's progress. (`append`
         // is a no-op on an empty batch.)
@@ -428,13 +487,14 @@ impl Tailer {
                 eprintln!("pillbox: warning: session log append failed: {e:#}");
             }
         }
+        self.codex_parser = next_codex_parser;
         self.emit_parsed(&parsed);
         self.line_idx = next_line_idx;
         Ok(parsed.len())
     }
 
     fn ingest_durable(&mut self, complete: &str, next_offset: u64) -> Result<usize> {
-        let (parsed, durable, next_line_idx) = self.parse_complete(complete)?;
+        let (parsed, durable, next_line_idx, next_codex_parser) = self.parse_complete(complete)?;
         let cursor = self.cursor.as_mut().expect("durable ingest has a cursor");
         let next = CursorPosition {
             transcript: cursor.position.transcript.clone(),
@@ -442,26 +502,36 @@ impl Tailer {
             inode: cursor.position.inode,
             offset: next_offset,
             line_idx: next_line_idx,
+            codex_parser: next_codex_parser.as_ref().map(codex::Parser::state),
         };
         cursor.commit_batch(
             self.log.as_mut().expect("durable cursor requires a log"),
             &durable,
             next,
         )?;
+        self.codex_parser = next_codex_parser;
         self.line_idx = next_line_idx;
         self.emit_parsed(&parsed);
         Ok(parsed.len())
     }
 
-    fn parse_complete(&self, complete: &str) -> Result<(Vec<TranscriptEvent>, Vec<Event>, usize)> {
+    fn parse_complete(&self, complete: &str) -> Result<ParsedBatch> {
         let mut parsed = Vec::new();
         let mut durable = Vec::new();
         let mut line_idx = self.line_idx;
+        let mut codex_parser = self.codex_parser.clone();
         for line in complete.lines() {
             if line.is_empty() {
                 continue;
             }
-            let events = parse_with(self.harness, line, line_idx);
+            let events = match self.harness {
+                Harness::Claude => claude::parse_line(line, line_idx),
+                Harness::Codex => codex_parser
+                    .as_mut()
+                    .expect("Codex tailer parser")
+                    .parse_line_checked(line, line_idx)
+                    .with_context(|| format!("parse Codex transcript line {line_idx}"))?,
+            };
             for event in &events {
                 if self.log.is_some() {
                     durable.extend(contract_map::to_payloads(event).into_iter().map(|payload| {
@@ -475,7 +545,7 @@ impl Tailer {
                 .checked_add(1)
                 .context("transcript line index overflow")?;
         }
-        Ok((parsed, durable, line_idx))
+        Ok((parsed, durable, line_idx, codex_parser))
     }
 
     fn emit_parsed(&mut self, parsed: &[TranscriptEvent]) {
@@ -563,6 +633,7 @@ impl Tailer {
     }
 }
 
+#[cfg(test)]
 fn parse_with(harness: Harness, line: &str, idx: usize) -> Vec<TranscriptEvent> {
     match harness {
         Harness::Claude => claude::parse_line(line, idx),
@@ -599,6 +670,407 @@ mod tests {
         format!(
             r#"{{"timestamp":"2026-05-18T09:26:31Z","type":"event_msg","payload":{{"type":"task_complete","turn_id":"{turn}","last_agent_message":"{content}"}}}}"#,
         )
+    }
+
+    fn codex_custom_call(call_id: &str) -> String {
+        serde_json::json!({
+            "timestamp": "2026-09-08T06:39:44Z",
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "input": "const r = await tools.exec_command({cmd:\"pwd\"});",
+                "call_id": call_id,
+            }
+        })
+        .to_string()
+    }
+
+    fn codex_custom_output(call_id: &str) -> String {
+        serde_json::json!({
+            "timestamp": "2026-09-08T06:39:44Z",
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": call_id,
+                "output": [
+                    {"type": "input_text", "text": "Script completed\n"},
+                    {"type": "input_text", "text": "SAFE_OUTPUT\n"},
+                ],
+            }
+        })
+        .to_string()
+    }
+
+    fn codex_tokens(input: u64, cached: u64, output: u64) -> String {
+        serde_json::json!({
+            "timestamp": "2026-09-08T06:39:44Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": input,
+                        "cached_input_tokens": cached,
+                        "cache_write_input_tokens": 0,
+                        "output_tokens": output,
+                    },
+                    "model_context_window": 258400,
+                },
+            }
+        })
+        .to_string()
+    }
+
+    const BURNIN_USAGE: [(u64, u64, u64); 9] = [
+        (11_574, 9_984, 487),
+        (23_671, 19_968, 624),
+        (35_928, 30_976, 725),
+        (48_332, 43_008, 926),
+        (60_975, 55_040, 962),
+        (73_736, 66_048, 1_213),
+        (86_776, 78_080, 1_317),
+        (99_943, 90_112, 1_406),
+        (113_226, 102_144, 1_425),
+    ];
+
+    fn codex_burnin_lines() -> Vec<String> {
+        let mut lines = Vec::new();
+        for (index, (input, cached, output)) in BURNIN_USAGE.iter().copied().enumerate() {
+            if index < 4 {
+                let call_id = format!("call-first-{index}");
+                lines.push(codex_custom_call(&call_id));
+                lines.push(codex_custom_output(&call_id));
+            } else if (5..8).contains(&index) {
+                let call_id = format!("call-second-{}", index - 5);
+                lines.push(codex_custom_call(&call_id));
+                lines.push(codex_custom_output(&call_id));
+            }
+            lines.push(codex_tokens(input, cached, output));
+            if index == 4 {
+                lines.push(codex_complete("turn-one", "FIRST_DONE"));
+            }
+        }
+        lines.push(codex_complete("turn-two", "SECOND_DONE"));
+        lines
+    }
+
+    fn append_lines(path: &Path, lines: &[String]) {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("open transcript for append");
+        for line in lines {
+            writeln!(file, "{line}").expect("append transcript line");
+        }
+    }
+
+    fn assert_burnin_projection(events: &[crate::contract::Event]) {
+        use crate::contract::Payload;
+
+        let tool_calls = events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                Payload::ToolCall(tool) => Some(tool),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tool_calls
+                .iter()
+                .filter(|tool| tool.status == crate::contract::ToolStatus::Running)
+                .count(),
+            7,
+            "one running event per modern custom tool call"
+        );
+        assert_eq!(
+            tool_calls
+                .iter()
+                .filter(|tool| tool.status == crate::contract::ToolStatus::Completed)
+                .count(),
+            7,
+            "one completed event per modern custom tool output"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.payload, Payload::Usage(_)))
+                .count(),
+            9,
+            "one incremental usage event per changed cumulative snapshot"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.payload, Payload::AttentionRequired(_)))
+                .count(),
+            2,
+            "task_complete remains the only idle boundary"
+        );
+
+        let cost = crate::cost::RunCostEnvelope::from_events(events);
+        assert_eq!(cost.model.input_tokens, 11_082);
+        assert_eq!(cost.model.cache_read_input_tokens, 102_144);
+        assert_eq!(cost.model.output_tokens, 1_425);
+    }
+
+    #[test]
+    fn durable_codex_burnin_fixture_replays_tools_and_incremental_usage() {
+        crate::test_util::with_isolated_home("tailer-codex-burnin-fixture", || {
+            let pb = crate::pillbox::global();
+            let session_id = "sess-codex-burnin";
+            let session_dir = crate::session::session_dir(&pb, session_id).unwrap();
+            let cursor_path = session_dir.join(".tailer-cursor.json");
+            let transcript = session_dir.join("rollout.jsonl");
+            let lines = codex_burnin_lines();
+            // First turn (four tools + five cumulative snapshots), then one
+            // second-turn snapshot before the producer is replaced.
+            let first_turn_end = 14;
+            let first_second_snapshot_end = 17;
+            append_lines(&transcript, &lines[..first_turn_end]);
+
+            let mut first = Tailer::new_durable(
+                transcript.clone(),
+                session_id.into(),
+                Harness::Codex,
+                true,
+                SessionLog::open(&pb, session_id).unwrap(),
+                cursor_path.clone(),
+            )
+            .unwrap();
+            assert_eq!(first.pump().unwrap(), 14);
+            append_lines(
+                &transcript,
+                &lines[first_turn_end..first_second_snapshot_end],
+            );
+            assert_eq!(first.pump().unwrap(), 3);
+            drop(first);
+
+            // The replacement sees an unchanged cumulative snapshot first;
+            // it must not emit a duplicate usage event before consuming the
+            // remaining second-turn records.
+            append_lines(
+                &transcript,
+                &[codex_tokens(
+                    BURNIN_USAGE[5].0,
+                    BURNIN_USAGE[5].1,
+                    BURNIN_USAGE[5].2,
+                )],
+            );
+            append_lines(&transcript, &lines[first_second_snapshot_end..]);
+            let mut replacement = Tailer::new_durable(
+                transcript.clone(),
+                session_id.into(),
+                Harness::Codex,
+                true,
+                SessionLog::open(&pb, session_id).unwrap(),
+                cursor_path.clone(),
+            )
+            .unwrap();
+            assert_eq!(replacement.pump().unwrap(), 8);
+            drop(replacement);
+
+            // A clean replay from the committed cursor has no work left.
+            let mut replay = Tailer::new_durable(
+                transcript,
+                session_id.into(),
+                Harness::Codex,
+                true,
+                SessionLog::open(&pb, session_id).unwrap(),
+                cursor_path,
+            )
+            .unwrap();
+            assert_eq!(replay.pump().unwrap(), 0);
+
+            let events = SessionLog::open(&pb, session_id)
+                .unwrap()
+                .read_from(0)
+                .unwrap();
+            assert_burnin_projection(&events);
+        });
+    }
+
+    #[test]
+    fn durable_prepared_usage_batch_recovers_without_replay() {
+        crate::test_util::with_isolated_home("tailer-durable-prepared-usage", || {
+            let pb = crate::pillbox::global();
+            let session_id = "sess-prepared-usage";
+            let session_dir = crate::session::session_dir(&pb, session_id).unwrap();
+            let cursor_path = session_dir.join(".tailer-cursor.json");
+            let transcript = session_dir.join("rollout.jsonl");
+            let line = codex_tokens(1_000, 800, 10);
+            std::fs::write(&transcript, format!("{line}\n")).unwrap();
+            let mut parser = codex::Parser::default();
+            let parsed = parser.parse_line_checked(&line, 0).unwrap();
+            assert!(matches!(
+                parsed.as_slice(),
+                [TranscriptEvent {
+                    kind: super::super::EventKind::Usage { .. },
+                    ..
+                }]
+            ));
+            let events = parsed
+                .iter()
+                .flat_map(contract_map::to_payloads)
+                .map(|payload| {
+                    Event::session(session_id, payload)
+                        .with_actor(Actor::agent(Harness::Codex.agent_id()))
+                })
+                .collect::<Vec<_>>();
+            let (device, inode) = source_identity(&transcript).unwrap();
+            let position = CursorPosition {
+                transcript,
+                device,
+                inode,
+                offset: line.len() as u64 + 1,
+                line_idx: 1,
+                codex_parser: Some(parser.state()),
+            };
+            let mut log = SessionLog::open(&pb, session_id).unwrap();
+            log.append_exact_batch(&events, None, |pre_append_seq| {
+                persist_cursor(
+                    &cursor_path,
+                    &CursorState::Committing {
+                        version: CODEX_CURSOR_VERSION,
+                        position: position.clone(),
+                        pre_append_seq,
+                        events: events.clone(),
+                        events_sha256: hash_events(&events)?,
+                    },
+                )
+            })
+            .unwrap();
+            let event_count = log.read_from(0).unwrap().len();
+
+            let mut recovered = Tailer::new_durable(
+                position.transcript.clone(),
+                session_id.into(),
+                Harness::Codex,
+                true,
+                SessionLog::open(&pb, session_id).unwrap(),
+                cursor_path.clone(),
+            )
+            .unwrap();
+            assert_eq!(recovered.pump().unwrap(), 0);
+            assert_eq!(
+                SessionLog::open(&pb, session_id)
+                    .unwrap()
+                    .read_from(0)
+                    .unwrap()
+                    .len(),
+                event_count
+            );
+            let state = read_cursor(&cursor_path, session_id).unwrap().unwrap();
+            assert!(matches!(state, CursorState::Committed { .. }));
+            assert_eq!(state.position().codex_parser, position.codex_parser);
+        });
+    }
+
+    #[test]
+    fn durable_invalid_usage_does_not_advance_cursor_or_log() {
+        crate::test_util::with_isolated_home("tailer-durable-invalid-usage", || {
+            let pb = crate::pillbox::global();
+            let session_id = "sess-invalid-usage";
+            let session_dir = crate::session::session_dir(&pb, session_id).unwrap();
+            let cursor_path = session_dir.join(".tailer-cursor.json");
+            let transcript = session_dir.join("rollout.jsonl");
+            std::fs::write(&transcript, format!("{}\n", codex_tokens(100, 50, 2))).unwrap();
+            let mut tailer = Tailer::new_durable(
+                transcript.clone(),
+                session_id.into(),
+                Harness::Codex,
+                true,
+                SessionLog::open(&pb, session_id).unwrap(),
+                cursor_path.clone(),
+            )
+            .unwrap();
+            assert_eq!(tailer.pump().unwrap(), 1);
+            let before = read_cursor(&cursor_path, session_id).unwrap().unwrap();
+            let event_count = SessionLog::open(&pb, session_id)
+                .unwrap()
+                .read_from(0)
+                .unwrap()
+                .len();
+            let invalid = serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {"total_token_usage": {
+                        "input_tokens": 90,
+                        "cached_input_tokens": 40,
+                        "output_tokens": 1
+                    }}
+                }
+            });
+            append_lines(&transcript, &[invalid.to_string()]);
+            let error = tailer
+                .pump()
+                .expect_err("decreasing cumulative usage must stop ingestion");
+            assert!(format!("{error:#}").contains("decreased"));
+            assert_eq!(
+                read_cursor(&cursor_path, session_id)
+                    .unwrap()
+                    .unwrap()
+                    .position(),
+                before.position()
+            );
+            assert_eq!(
+                SessionLog::open(&pb, session_id)
+                    .unwrap()
+                    .read_from(0)
+                    .unwrap()
+                    .len(),
+                event_count
+            );
+        });
+    }
+
+    #[test]
+    #[ignore = "reads the caller-provided private Codex rollout fixture"]
+    fn replay_private_codex_rollout_fixture_offline() {
+        let path = std::env::var_os("PILLBOX_CODEX_REPLAY_FIXTURE")
+            .map(PathBuf::from)
+            .expect("set PILLBOX_CODEX_REPLAY_FIXTURE to a local rollout.jsonl");
+        crate::test_util::with_isolated_home("tailer-codex-private-replay", || {
+            let pb = crate::pillbox::global();
+            let session_id = "sess-codex-private-replay";
+            let session_dir = crate::session::session_dir(&pb, session_id).unwrap();
+            let cursor_path = session_dir.join(".tailer-cursor.json");
+            let mut tailer = Tailer::new_durable(
+                path.clone(),
+                session_id.into(),
+                Harness::Codex,
+                true,
+                SessionLog::open(&pb, session_id).unwrap(),
+                cursor_path.clone(),
+            )
+            .unwrap();
+            assert!(
+                tailer.pump().unwrap() > 0,
+                "private rollout should contain events"
+            );
+            drop(tailer);
+            let mut replay = Tailer::new_durable(
+                path,
+                session_id.into(),
+                Harness::Codex,
+                true,
+                SessionLog::open(&pb, session_id).unwrap(),
+                cursor_path,
+            )
+            .unwrap();
+            assert_eq!(
+                replay.pump().unwrap(),
+                0,
+                "committed private rollout must replay cleanly"
+            );
+            let events = SessionLog::open(&pb, session_id)
+                .unwrap()
+                .read_from(0)
+                .unwrap();
+            assert_burnin_projection(&events);
+        });
     }
 
     /// The producer wiring end-to-end: a pumped transcript line lands in the
@@ -1094,6 +1566,7 @@ mod tests {
                 inode,
                 offset: line.len() as u64 + 1,
                 line_idx: 1,
+                codex_parser: Some(codex::Parser::default().state()),
             };
             let mut log = SessionLog::open(&pb, session_id).unwrap();
             log.append_exact_batch(&events, None, |pre_append_seq| {
@@ -1101,7 +1574,7 @@ mod tests {
                 persist_cursor(
                     &cursor_path,
                     &CursorState::Committing {
-                        version: CURSOR_VERSION,
+                        version: CODEX_CURSOR_VERSION,
                         position: position.clone(),
                         pre_append_seq,
                         events: events.clone(),

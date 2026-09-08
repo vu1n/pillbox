@@ -254,7 +254,8 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> 
 fn session_cost(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
     let session = session::resolve(resolved, id)?;
     let log = crate::events::log::SessionLog::open(resolved, &session.id)?;
-    let summary = crate::cost::RunCostEnvelope::from_events(&log.read_from(0)?);
+    let events = log.read_from(0)?;
+    let summary = crate::cost::RunCostEnvelope::from_events(&events);
     if json {
         println!("{}", serde_json::to_string(&summary)?);
         return Ok(());
@@ -262,13 +263,7 @@ fn session_cost(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
 
     println!("session: {}", session.id);
     println!("status: {}", summary.status);
-    println!(
-        "tokens: input={} output={} cache_read={} cache_create={}",
-        summary.model.input_tokens,
-        summary.model.output_tokens,
-        summary.model.cache_read_input_tokens,
-        summary.model.cache_creation_input_tokens,
-    );
+    println!("{}", format_session_tokens(&events, &summary));
     match summary.known_cost_usd {
         Some(cost) => println!("provider-reported cost: ${cost:.6}"),
         None => println!("provider-reported cost: unavailable"),
@@ -278,6 +273,37 @@ fn session_cost(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
     }
     println!("estimated total cost: unavailable (no versioned rate card)");
     Ok(())
+}
+
+fn format_session_tokens(
+    events: &[crate::contract::Event],
+    summary: &crate::cost::RunCostEnvelope,
+) -> String {
+    // The legacy cost envelope uses integer defaults; consult native evidence
+    // before presenting those defaults as measured zero. Managed envelopes
+    // carry their own aggregate and need not include separate Usage events.
+    let observed = summary.infrastructure.is_some()
+        || events.iter().any(|event| match &event.payload {
+            crate::contract::Payload::Usage(usage) => [
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_read_input_tokens,
+                usage.cache_creation_input_tokens,
+            ]
+            .iter()
+            .any(Option::is_some),
+            _ => false,
+        });
+    if !observed {
+        return "tokens: unavailable (no token counts recorded)".into();
+    }
+    format!(
+        "tokens: input={} output={} cache_read={} cache_create={}",
+        summary.model.input_tokens,
+        summary.model.output_tokens,
+        summary.model.cache_read_input_tokens,
+        summary.model.cache_creation_input_tokens,
+    )
 }
 
 fn session_transcript(
@@ -1516,6 +1542,40 @@ pub(crate) fn validate_session_id(id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_tokens_distinguish_missing_from_measured_zero() {
+        use crate::contract::{Event, Payload, Usage, UsageSource};
+        use crate::cost::RunCostEnvelope;
+
+        assert_eq!(
+            format_session_tokens(&[], &RunCostEnvelope::from_events(&[])),
+            "tokens: unavailable (no token counts recorded)"
+        );
+        let mut usage = Usage {
+            message_id: "usage:1".into(),
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+            cost_usd: None,
+            source: UsageSource::Native,
+        };
+        let missing = [Event::session("cost-test", Payload::Usage(usage.clone()))];
+        assert_eq!(
+            format_session_tokens(&missing, &RunCostEnvelope::from_events(&missing)),
+            "tokens: unavailable (no token counts recorded)"
+        );
+        usage.input_tokens = Some(0);
+        usage.output_tokens = Some(0);
+        usage.cache_read_input_tokens = Some(0);
+        usage.cache_creation_input_tokens = Some(0);
+        let measured = [Event::session("cost-test", Payload::Usage(usage))];
+        assert_eq!(
+            format_session_tokens(&measured, &RunCostEnvelope::from_events(&measured)),
+            "tokens: input=0 output=0 cache_read=0 cache_create=0"
+        );
+    }
 
     #[test]
     fn detached_producer_lock_is_scoped_per_session() {

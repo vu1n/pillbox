@@ -168,6 +168,12 @@ pub(crate) enum EventKind {
     AssistantThinking {
         text: String,
     },
+    /// A standalone usage observation from a transcript-native accounting
+    /// record. Keeping this separate from assistant text avoids manufacturing
+    /// a message just to carry cumulative token deltas.
+    Usage {
+        usage: GenAiUsage,
+    },
     ToolUse {
         tool_use_id: String,
         tool_name: String,
@@ -190,13 +196,18 @@ pub(crate) fn drain_file_as(path: &Path, session_id: &str, harness: Harness) -> 
     let contents =
         std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let mut count = 0;
+    let mut codex_parser = (harness == Harness::Codex).then(codex::Parser::default);
     for (idx, line) in contents.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
         let events = match harness {
             Harness::Claude => claude::parse_line(line, idx),
-            Harness::Codex => codex::parse_line(line, idx),
+            Harness::Codex => codex_parser
+                .as_mut()
+                .expect("Codex drain parser")
+                .parse_line_checked(line, idx)
+                .with_context(|| format!("parse Codex transcript line {idx}"))?,
         };
         for event in events {
             emit_event_span(&event, session_id);
@@ -236,6 +247,7 @@ fn span_name(kind: &EventKind) -> String {
         EventKind::UserPrompt { .. } => "user.prompt".into(),
         EventKind::AssistantText { .. } => "assistant.text".into(),
         EventKind::AssistantThinking { .. } => "assistant.thinking".into(),
+        EventKind::Usage { .. } => "usage".into(),
         EventKind::ToolUse { tool_name, .. } => format!("tool {tool_name}"),
         EventKind::ToolResult { .. } => "tool.result".into(),
     }
@@ -289,6 +301,9 @@ fn build_attributes(event: &TranscriptEvent) -> Vec<KeyValue> {
         }
         EventKind::AssistantThinking { text } => {
             attrs.push(KeyValue::new("gen_ai.completion.thinking", truncate(text)));
+        }
+        EventKind::Usage { usage } => {
+            push_usage_attrs(&mut attrs, usage);
         }
         EventKind::ToolUse {
             tool_use_id,

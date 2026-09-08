@@ -230,15 +230,20 @@ struct Launch {
 }
 
 /// The boot-script preamble shared by every libkrun launch (PTY agents and
-/// the opencode server): bring the NIC up, install the vault CA, mount the
-/// workspace virtio-fs share, normalize that disposable clone's guest ownership,
-/// and `cd` into it. The caller appends its own exec. The cloned creds share is
-/// already mounted and normalized by the boot channel's static bootstrap (see
-/// [`boot::boot_channel`]) — the boot script itself lives there.
+/// the opencode server): bring the NIC up, install the vault CA, and mount the
+/// workspace virtio-fs share before `cd`-ing into it. On macOS, the disposable
+/// clone's virtio-fs metadata was prepared on the host before the VM was
+/// mounted; non-macOS retains the guest-side normalization. The caller appends
+/// its own exec. The cloned creds share is already mounted and prepared by the
+/// boot channel's static bootstrap (see [`boot::boot_channel`]) — the boot
+/// script itself lives there.
 fn guest_launch_preamble(ca_cert_pem: &str, guest_workspace: &str) -> String {
     let net = egress::guest_net_commands();
     let gw_q = shell_quote(guest_workspace);
-    let own_workspace = boot::guest_root_clone_ownership(guest_workspace);
+    #[cfg(target_os = "macos")]
+    let own_workspace = String::new();
+    #[cfg(not(target_os = "macos"))]
+    let own_workspace = format!("{}; ", boot::guest_root_clone_ownership(guest_workspace));
     // The PEM is shell-quoted straight into the script — it lands in the boot
     // script file (see [`boot::boot_channel`]), which carries arbitrary bytes, so
     // the multi-line cert no longer needs the base64 detour the kernel cmdline
@@ -255,7 +260,7 @@ fn guest_launch_preamble(ca_cert_pem: &str, guest_workspace: &str) -> String {
          PATH=/usr/sbin:/sbin:$PATH update-ca-certificates >/dev/null 2>&1 || \
              echo 'pillbox: warning: update-ca-certificates failed; non-Node agents (Codex etc.) may reject the vault TLS cert' >&2; \
          mkdir -p {gw_q}; mount -t virtiofs workspace {gw_q}; \
-         {own_workspace}; cd {gw_q}",
+         {own_workspace}cd {gw_q}",
         ca_q = shell_quote(ca_cert_pem),
     )
 }
@@ -2456,13 +2461,23 @@ mod tests {
         let mount = script
             .find("mount -t virtiofs workspace '/workspace/a b'")
             .unwrap();
-        let ownership = script.find("find -P '/workspace/a b' -xdev").unwrap();
         let cd = script.find("cd '/workspace/a b'").unwrap();
         let exec = script.find("exec agent").unwrap();
-        assert!(mount < ownership && ownership < cd && cd < exec);
-        assert_eq!(script.matches("chown ").count(), 1);
+        assert!(mount < cd && cd < exec);
         assert!(!script.contains(GUEST_HOME));
-        assert!(script.contains("chmod \"$mode\""));
+        #[cfg(target_os = "macos")]
+        {
+            assert!(!script.contains("find -P"));
+            assert_eq!(script.matches("chown ").count(), 0);
+            assert!(!script.contains("chmod \"$mode\""));
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let ownership = script.find("find -P '/workspace/a b' -xdev").unwrap();
+            assert!(mount < ownership && ownership < cd);
+            assert_eq!(script.matches("chown ").count(), 1);
+            assert!(script.contains("chmod \"$mode\""));
+        }
     }
 
     #[test]

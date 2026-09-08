@@ -27,6 +27,7 @@ const BOOT_SCRIPT: &str = ".pillbox-boot.sh";
 /// Whether the mounted boot share is a disposable per-run clone whose ownership
 /// must be normalized for the guest's nested user namespace. `PreserveHost` is
 /// for non-clone shares such as the grader's temporary boot-script directory.
+#[derive(Clone, Copy)]
 pub(super) enum MountedShareOwnership {
     PreserveHost,
     GuestRootClone,
@@ -54,6 +55,10 @@ pub(super) fn boot_channel(
         .open(dir.join(BOOT_SCRIPT))
         .and_then(|mut f| f.write_all(script.as_bytes()))
         .context("write guest boot script")?;
+    #[cfg(target_os = "macos")]
+    if matches!(ownership, MountedShareOwnership::GuestRootClone) {
+        super::metadata::prepare_guest_clone_metadata(dir)?;
+    }
     Ok((
         Share {
             tag: tag.to_string(),
@@ -63,12 +68,10 @@ pub(super) fn boot_channel(
     ))
 }
 
-/// Render the ownership normalization for one mounted disposable clone.
-/// `find -P ... -xdev` keeps traversal physical and on the clone's filesystem;
-/// `chown -h` changes symlinks themselves. GNU `chown` may clear setuid/setgid,
-/// so capture each entry's mode first and restore it for non-symlinks. With
-/// `-exec ... {} +`, a failing child makes `find` fail; the caller's `set -e`
-/// therefore aborts before agent execution.
+/// Render the legacy ownership normalization for one mounted disposable clone.
+/// macOS prepares the clone's virtio-fs metadata on the host before mounting;
+/// this remains the guest-side path for non-macOS libkrun backends.
+#[cfg(not(target_os = "macos"))]
 pub(super) fn guest_root_clone_ownership(mountpoint: &str) -> String {
     format!(
         "find -P {} -xdev -exec /bin/sh -c 'for path do \
@@ -87,7 +90,14 @@ fn bootstrap_exec(tag: &str, mountpoint: &str, ownership: MountedShareOwnership)
     let normalize = match ownership {
         MountedShareOwnership::PreserveHost => String::new(),
         MountedShareOwnership::GuestRootClone => {
-            format!("{}; ", guest_root_clone_ownership(mountpoint))
+            #[cfg(target_os = "macos")]
+            {
+                String::new()
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                format!("{}; ", guest_root_clone_ownership(mountpoint))
+            }
         }
     };
     vec![
@@ -149,6 +159,7 @@ pub(super) fn grader_child_env() -> Vec<(&'static str, String)> {
 mod tests {
     use super::*;
 
+    #[cfg(not(target_os = "macos"))]
     fn write_test_tool(dir: &Path, name: &str, body: &str) {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -157,6 +168,7 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn ownership_test_tools(dir: &Path) {
         write_test_tool(
             dir,
@@ -235,11 +247,22 @@ mod tests {
         let command = bootstrap_exec("creds", GUEST_HOME, MountedShareOwnership::GuestRootClone)
             .pop()
             .unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                command,
+                "set -e; mkdir -p '/home/pillbox'; mount -t virtiofs creds '/home/pillbox'; exec /bin/sh '/home/pillbox'/.pillbox-boot.sh"
+            );
+            assert!(!command.contains("chown"));
+        }
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(
             command,
             "set -e; mkdir -p '/home/pillbox'; mount -t virtiofs creds '/home/pillbox'; find -P '/home/pillbox' -xdev -exec /bin/sh -c 'for path do mode=$(stat -c %a -- \"$path\") || exit; chown -h 0:0 -- \"$path\" || exit; if [ ! -L \"$path\" ]; then chmod \"$mode\" -- \"$path\" || exit; fi; done' sh {} +; exec /bin/sh '/home/pillbox'/.pillbox-boot.sh"
         );
+        #[cfg(not(target_os = "macos"))]
         assert!(command.contains("mode=$(stat -c %a"));
+        #[cfg(not(target_os = "macos"))]
         assert!(command.contains("chmod \"$mode\""));
     }
 
@@ -256,6 +279,7 @@ mod tests {
         assert!(command.contains("mount -t virtiofs boot '/run/pillbox-boot'; exec"));
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn clone_ownership_is_physical_no_dereference_and_shell_quoted() {
         let command = guest_root_clone_ownership("/workspace/a b'; touch /escaped");
@@ -269,6 +293,7 @@ mod tests {
         assert!(!command.contains("find -L"));
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn clone_ownership_restores_captured_special_modes_without_following_symlinks() {
         use std::os::unix::fs::symlink;
@@ -317,6 +342,7 @@ mod tests {
         assert!(!owned.contains(outside_file.to_str().unwrap()));
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn clone_ownership_child_failure_aborts_the_preamble() {
         let fixture = tempfile::tempdir().unwrap();

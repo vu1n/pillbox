@@ -468,20 +468,27 @@ the guest's `pillbox-init ws` branch:
 - **Phase 4 — diff/flush:** `diff(clone, base)` = the guest's `RESULT.txt` — the
   result surface a driven run flushes/snapshots, with the base as the fork point.
 
-**Per-run clone ownership contract.** The host owns the source auth home,
-workspace, and immutable warm-base cache; those paths are never mounted for an
-agent. For its home and workspace shares, each launch mounts only disposable
-CoW clones (with the workspace clone already scrubbed). Immediately after each
-clone is mounted, and before PTY, server, or structured agent execution, the
-guest physically traverses that one filesystem and changes each entry to `0:0`
-without dereferencing symlinks. This lets Codex's nested user namespace traverse
-an otherwise host-UID-owned `0700` mount root.
-Because GNU `chown` may clear setuid/setgid bits, the preamble captures and
-restores each non-symlink's exact mode; any `find`, `stat`, `chown`, or `chmod`
-failure aborts the launch. It does not apply to the rootfs, the grader's
-temporary boot share, an original credential/workspace source, or a shared
-warm-base tree; symlinks in a clone are changed as links and are never followed
-into another tree.
+**Per-run clone metadata contract (META-001).** The host owns the source auth
+home, workspace, and immutable warm-base cache; those paths are never mounted
+for an agent. Each launch mounts only disposable CoW clones (with the workspace
+clone already scrubbed). On macOS, before a clone is mounted, the host walks
+only that clone with no-follow operations and writes libkrun 1.19.0's
+[`user.containers.override_stat` metadata](https://github.com/libkrun/libkrun/blob/v1.19.0/src/devices/src/virtio/fs/macos/passthrough.rs). Its source-backed format is
+`uid:gid:mode`: UID/GID are decimal and mode is octal; the writer may emit `x`
+for an unknown field. A mode of `x` means the backing mode is effective, while
+an explicit mode must carry the actual inode type (or no type bits) and is
+preserved exactly, including set-id bits. Every normalized entry is exposed to
+the guest as owner `0:0`; the host backing mode is restored exactly after the
+xattr write, including error paths. A temporary owner-write bit is used only
+inside the private clone when macOS rejects xattr writes on host-created `0444`
+or `0555` entries. Malformed, overlong, type-conflicting, or unsupported
+metadata aborts launch; symlinks are metadata targets only and are never
+followed. Non-macOS retains the existing guest-side walk.
+
+The preparation boundary covers the scrubbed workspace clone and the credential
+clone after generated credential files and the boot script are written. It does
+not apply to the rootfs, the grader's temporary boot share, an original
+credential/workspace source, or a shared warm-base tree.
 
 **In-repo landing:**
 - **Reuse the canonical denylist** — the spike hand-rolled a crude `is_secret`;

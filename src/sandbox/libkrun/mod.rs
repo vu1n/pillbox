@@ -46,6 +46,7 @@ mod host;
 mod http;
 mod jit_refresh;
 mod local_forward;
+mod metadata;
 mod mitm;
 mod session;
 mod vault;
@@ -551,6 +552,7 @@ fn cow_clone_and_scrub(src: &Path) -> Result<PathBuf> {
             std::fs::remove_file(&p)
         };
     }
+    metadata::prepare_guest_clone_metadata(&clone)?;
     Ok(clone)
 }
 

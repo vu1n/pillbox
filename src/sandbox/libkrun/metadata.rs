@@ -41,38 +41,55 @@ mod macos {
             bail!("clone metadata root {} is not a directory", root.display());
         }
         // O_NOFOLLOW_ANY also rejects harmless symlinks in the host's parent
-        // path (for example macOS's `/var` → `/private/var`). Resolve only the
-        // already-verified clone root; entries below it remain no-follow.
-        let root = fs::canonicalize(root)
-            .with_context(|| format!("resolve clone root {}", root.display()))?;
+        // path (for example macOS's `/var` → `/private/var`). Resolve the
+        // parent only; the already-verified clone root may itself be
+        // searchless and must be opened after temporary access is added.
+        let root_name = root.file_name().ok_or_else(|| {
+            anyhow::anyhow!("clone root has no final component: {}", root.display())
+        })?;
+        let root_parent = fs::canonicalize(root.parent().unwrap_or_else(|| Path::new(".")))
+            .with_context(|| format!("resolve clone parent {}", root.display()))?;
+        let root = root_parent.join(root_name);
         normalize_directory(&root)
     }
 
     fn normalize_directory(path: &Path) -> Result<()> {
-        let file = open_directory(path)
-            .with_context(|| format!("open clone directory {}", path.display()))?;
-        let metadata = file
-            .metadata()
-            .with_context(|| format!("fstat clone directory {}", path.display()))?;
-        if !metadata.file_type().is_dir() {
+        let backing_mode = fs::symlink_metadata(path)
+            .with_context(|| format!("lstat clone directory {}", path.display()))?
+            .mode();
+        if backing_mode & libc::S_IFMT as u32 != libc::S_IFDIR as u32 {
             bail!(
-                "clone directory {} changed type while opening",
+                "clone directory {} changed type before opening",
                 path.display()
             );
         }
-        let backing_mode = metadata.mode();
-        let effective_mode = effective_mode(path, Some(&file), None, backing_mode)?;
-
-        with_temporary_owner_write(&file, path, backing_mode, || {
-            set_override_fd(&file, effective_mode, path)?;
-            for entry in fs::read_dir(path)
-                .with_context(|| format!("read clone directory {}", path.display()))?
-            {
-                let entry = entry.with_context(|| format!("read entry in {}", path.display()))?;
-                normalize_entry(&entry.path())?;
-            }
-            Ok(())
-        })
+        with_prepared_entry(
+            path,
+            backing_mode,
+            true,
+            || open_directory(path),
+            |file| {
+                let metadata = file
+                    .metadata()
+                    .with_context(|| format!("fstat clone directory {}", path.display()))?;
+                if !metadata.file_type().is_dir() {
+                    bail!(
+                        "clone directory {} changed type while opening",
+                        path.display()
+                    );
+                }
+                let effective_mode = effective_mode(path, Some(file), None, backing_mode)?;
+                set_override_fd(file, effective_mode, path)?;
+                for entry in fs::read_dir(path)
+                    .with_context(|| format!("read clone directory {}", path.display()))?
+                {
+                    let entry =
+                        entry.with_context(|| format!("read entry in {}", path.display()))?;
+                    normalize_entry(&entry.path())?;
+                }
+                Ok(())
+            },
+        )
     }
 
     fn normalize_entry(path: &Path) -> Result<()> {
@@ -96,19 +113,28 @@ mod macos {
     }
 
     fn normalize_regular_file(path: &Path) -> Result<()> {
-        let file = open_regular_file(path)
-            .with_context(|| format!("open clone file {}", path.display()))?;
-        let metadata = file
-            .metadata()
-            .with_context(|| format!("fstat clone file {}", path.display()))?;
-        if !metadata.file_type().is_file() {
-            bail!("clone file {} changed type while opening", path.display());
+        let backing_mode = fs::symlink_metadata(path)
+            .with_context(|| format!("lstat clone file {}", path.display()))?
+            .mode();
+        if backing_mode & libc::S_IFMT as u32 != libc::S_IFREG as u32 {
+            bail!("clone file {} changed type before opening", path.display());
         }
-        let backing_mode = metadata.mode();
-        let effective_mode = effective_mode(path, Some(&file), None, backing_mode)?;
-        with_temporary_owner_write(&file, path, backing_mode, || {
-            set_override_fd(&file, effective_mode, path)
-        })
+        with_prepared_entry(
+            path,
+            backing_mode,
+            false,
+            || open_regular_file(path),
+            |file| {
+                let metadata = file
+                    .metadata()
+                    .with_context(|| format!("fstat clone file {}", path.display()))?;
+                if !metadata.file_type().is_file() {
+                    bail!("clone file {} changed type while opening", path.display());
+                }
+                let effective_mode = effective_mode(path, Some(file), None, backing_mode)?;
+                set_override_fd(file, effective_mode, path)
+            },
+        )
     }
 
     fn open_directory(path: &Path) -> io::Result<File> {
@@ -319,21 +345,42 @@ mod macos {
             .with_context(|| format!("clone path contains NUL: {}", path.display()))
     }
 
-    fn with_temporary_owner_write<T>(
-        file: &File,
+    fn with_prepared_entry<T>(
         path: &Path,
         backing_mode: u32,
-        operation: impl FnOnce() -> Result<T>,
+        directory: bool,
+        open: impl FnOnce() -> io::Result<File>,
+        operation: impl FnOnce(&File) -> Result<T>,
     ) -> Result<T> {
-        let needs_write = backing_mode & libc::S_IWUSR as u32 == 0;
-        if needs_write {
-            fchmod(file, backing_mode | libc::S_IWUSR as u32, path)
-                .context("temporarily add owner-write for clone metadata")?;
+        let required = if directory {
+            libc::S_IRWXU as u32
+        } else {
+            (libc::S_IRUSR | libc::S_IWUSR) as u32
+        };
+        let prepared_mode = backing_mode | required;
+        let changed = prepared_mode != backing_mode;
+        if changed {
+            fchmodat_no_follow(path, prepared_mode)
+                .context("temporarily add owner access for clone metadata")?;
         }
 
-        let result = operation();
-        let restore = if needs_write {
-            fchmod(file, backing_mode, path)
+        let mut opened = None;
+        let result = match open() {
+            Ok(file) => {
+                let result = operation(&file);
+                opened = Some(file);
+                result
+            }
+            Err(error) => {
+                Err(error).with_context(|| format!("open clone entry {}", path.display()))
+            }
+        };
+        let restore = if changed {
+            if let Some(file) = opened.as_ref() {
+                fchmod(file, backing_mode, path)
+            } else {
+                fchmodat_no_follow(path, backing_mode)
+            }
         } else {
             Ok(())
         };
@@ -346,6 +393,23 @@ mod macos {
                 path.display()
             )),
         }
+    }
+
+    fn fchmodat_no_follow(path: &Path, mode: u32) -> Result<()> {
+        let c_path = c_path(path)?;
+        let rc = unsafe {
+            libc::fchmodat(
+                libc::AT_FDCWD,
+                c_path.as_ptr(),
+                mode as libc::mode_t,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error())
+                .with_context(|| format!("chmod clone entry {}", path.display()));
+        }
+        Ok(())
     }
 
     fn fchmod(file: &File, mode: u32, path: &Path) -> Result<()> {
@@ -388,24 +452,40 @@ mod macos {
         }
 
         fn read_override_text(path: &Path) -> String {
-            let c_path = c_path(path).unwrap();
-            let mut value = [0_u8; MAX_OVERRIDE_STAT + 1];
-            let size = unsafe {
-                libc::getxattr(
-                    c_path.as_ptr(),
-                    OVERRIDE_STAT.as_ptr().cast(),
-                    value.as_mut_ptr().cast(),
-                    value.len(),
-                    0,
-                    0,
-                )
-            };
-            assert!(
-                size >= 0,
-                "read override metadata: {}",
-                io::Error::last_os_error()
-            );
-            String::from_utf8(value[..size as usize].to_vec()).unwrap()
+            let canonical_parent = fs::canonicalize(path.parent().unwrap()).unwrap();
+            let path = canonical_parent.join(path.file_name().unwrap());
+            let backing_mode = mode(&path);
+            let directory = backing_mode & libc::S_IFMT as u32 == libc::S_IFDIR as u32;
+            with_prepared_entry(
+                &path,
+                backing_mode,
+                directory,
+                || {
+                    if directory {
+                        open_directory(&path)
+                    } else {
+                        open_regular_file(&path)
+                    }
+                },
+                |file| {
+                    let mut value = [0_u8; MAX_OVERRIDE_STAT + 1];
+                    let size = unsafe {
+                        libc::fgetxattr(
+                            file.as_raw_fd(),
+                            OVERRIDE_STAT.as_ptr().cast(),
+                            value.as_mut_ptr().cast(),
+                            value.len(),
+                            0,
+                            0,
+                        )
+                    };
+                    if size < 0 {
+                        return Err(io::Error::last_os_error()).context("read override metadata");
+                    }
+                    Ok(String::from_utf8(value[..size as usize].to_vec()).unwrap())
+                },
+            )
+            .unwrap()
         }
 
         #[test]
@@ -435,6 +515,20 @@ mod macos {
             fs::write(&x_mode, b"x-mode").unwrap();
             write_override(&x_mode, "0:0:x");
             fs::set_permissions(&x_mode, fs::Permissions::from_mode(0o555)).unwrap();
+            let file_write_only = clone.join("file-0200");
+            fs::write(&file_write_only, b"write-only").unwrap();
+            fs::set_permissions(&file_write_only, fs::Permissions::from_mode(0o200)).unwrap();
+            let file_unreadable = clone.join("file-0000");
+            fs::write(&file_unreadable, b"unreadable").unwrap();
+            fs::set_permissions(&file_unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+            let dir_write_search = clone.join("dir-0300");
+            fs::create_dir(&dir_write_search).unwrap();
+            fs::write(dir_write_search.join("child"), b"child").unwrap();
+            fs::set_permissions(&dir_write_search, fs::Permissions::from_mode(0o300)).unwrap();
+            let dir_search_only = clone.join("dir-0100");
+            fs::create_dir(&dir_search_only).unwrap();
+            fs::write(dir_search_only.join("child"), b"child").unwrap();
+            fs::set_permissions(&dir_search_only, fs::Permissions::from_mode(0o100)).unwrap();
 
             let private = clone.join("private");
             fs::create_dir(&private).unwrap();
@@ -457,6 +551,14 @@ mod macos {
             assert_eq!(read_override_text(&virtual_readonly), "0:0:0100444");
             assert_eq!(read_override_text(&x_fields), "0:0:0100644");
             assert_eq!(read_override_text(&x_mode), "0:0:0100555");
+            assert_eq!(mode(&file_write_only) & 0o7777, 0o200);
+            assert_eq!(read_override_text(&file_write_only), "0:0:0100200");
+            assert_eq!(mode(&file_unreadable) & 0o7777, 0o000);
+            assert_eq!(read_override_text(&file_unreadable), "0:0:0100000");
+            assert_eq!(mode(&dir_write_search) & 0o7777, 0o300);
+            assert_eq!(read_override_text(&dir_write_search), "0:0:040300");
+            assert_eq!(mode(&dir_search_only) & 0o7777, 0o100);
+            assert_eq!(read_override_text(&dir_search_only), "0:0:040100");
             assert_eq!(mode(&private) & 0o7777, 0o555);
             assert_eq!(mode(&setid), setid_mode);
             assert_eq!(read_override_text(&setid), format!("0:0:0{setid_mode:o}"));
@@ -490,9 +592,23 @@ mod macos {
             let fifo = clone.join("fifo");
             let c_fifo = c_path(&fifo).unwrap();
             assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+            let open_error = clone.join("open-error");
+            fs::write(&open_error, b"open-error").unwrap();
+            fs::set_permissions(&open_error, fs::Permissions::from_mode(0o000)).unwrap();
             fs::set_permissions(&clone, fs::Permissions::from_mode(0o555)).unwrap();
             assert!(prepare_guest_clone_metadata(&clone).is_err());
             assert_eq!(mode(&clone) & 0o7777, 0o555);
+
+            let backing_mode = mode(&open_error);
+            let result = with_prepared_entry(
+                &open_error,
+                backing_mode,
+                false,
+                || Err(io::Error::from_raw_os_error(libc::EACCES)),
+                |_| Ok::<(), anyhow::Error>(()),
+            );
+            assert!(result.is_err());
+            assert_eq!(mode(&open_error), backing_mode);
         }
     }
 }

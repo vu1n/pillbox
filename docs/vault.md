@@ -13,6 +13,16 @@ provider API hosts. OAuth token endpoints are local deny points: rotation runs
 only in the host broker, so rotated access and refresh secrets never enter the
 guest or a response-side registry path.
 
+The libkrun MITM retains at most 256 KiB of unsent request bytes per connection,
+across its fixed 32-listener pool (8 MiB of queued payload total, plus bounded
+TLS/framing buffers). It processes plaintext in 4 KiB chunks and resets the
+connection on queue overflow, including while DNS/connect or an upstream write
+is stalled. Partial TLS writes retain their exact suffix for the next poll;
+accepted bytes alone leave the queue. Credential substitution retains partial
+stubs across polls and flushes only at a completed HTTP request boundary.
+This is an unsent-buffer bound, not a
+lifetime request-size limit or a billing cap.
+
 **v0.6 scope:** vault state is **per-pillbox**, and the CA is **per-run by
 default** — each `--vault` run mints an ephemeral CA in a tempdir and discards it
 after (blast radius = one run). An *opt-in stable* CA persists at

@@ -560,7 +560,7 @@ fn capped(value: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read as _, Write as _};
+    use std::io::Write as _;
     use std::net::{TcpListener, TcpStream};
     use std::os::unix::fs::PermissionsExt as _;
 

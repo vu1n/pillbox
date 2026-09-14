@@ -1,4 +1,5 @@
 # brief backfill — conformance sign-off
+vault-egress-default-deny conforms: Host-owned OAuth refresh removes response-leg token rotation only; host classification and the libkrun default-deny DNS/IP fence are unchanged, with no new pass-through or pooling path.
 managed-tier-do-gateway conforms: Approved external cost receipts bind observed commit and lifecycle usage to immutable runtime evidence; no runtime persistence, custom DO, collaboration authority, or commit-order change is introduced.
 optimization-external-substrate-primitives conforms: Foreground producer-health and token-overflow checks observe the existing session event stream; no optimizer, routing policy, or reward authority is embedded.
 substrate-plane-livesession conforms: Guard health remains local event-producer monitoring through existing session resolution; no backend-string dispatch, capability change, or new backend is added.

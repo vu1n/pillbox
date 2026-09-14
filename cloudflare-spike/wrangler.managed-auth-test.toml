@@ -5,7 +5,9 @@ compatibility_flags = ["nodejs_compat"]
 workers_dev = true
 
 [vars]
-MANAGED_AUTH_REQUIRED = "1"
+MANAGED_EXECUTION_ENABLED = "1"
+MANAGED_EXECUTION_EPOCH = "managed-auth-test-v1"
+MANAGED_EXECUTION_LIMIT = "2"
 PILLBOX_GRANT_KEY_ID = "test-key"
 PILLBOX_GRANT_PUBLIC_KEY = "ed25519:SKaA_nE69844nq00przjwmcPcg5iRY1hL4fnfgipY94"
 PILLBOX_INSTALLATION_ID = "test-installation"
@@ -24,6 +26,6 @@ binding = "EXECUTION_EVIDENCE"
 bucket_name = "pillbox-managed-auth-test-evidence"
 
 [[services]]
-binding = "PillboxAuthorizationControlPlane"
+binding = "PillboxAuthorizationCurrentness"
 service = "pillbox-managed-auth-authority"
-entrypoint = "ManagedAuthorizationControlPlaneEntrypoint"
+entrypoint = "PillboxAuthorizationCurrentnessEntrypoint"

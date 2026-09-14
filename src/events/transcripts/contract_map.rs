@@ -63,6 +63,9 @@ pub(super) fn to_payloads(event: &TranscriptEvent) -> Vec<Payload> {
         EventKind::AssistantThinking { text } => {
             vec![Payload::Thinking(Thinking { text: text.clone() })]
         }
+        EventKind::Usage { usage } => {
+            vec![Payload::Usage(usage_payload(id, usage))]
+        }
         EventKind::ToolUse {
             tool_use_id,
             tool_name,
@@ -260,6 +263,27 @@ mod tests {
             3,
             "no usage event when the harness didn't record counts"
         );
+    }
+
+    #[test]
+    fn standalone_usage_maps_without_a_fake_assistant_message() {
+        let out = to_payloads(&event(EventKind::Usage {
+            usage: GenAiUsage {
+                input_tokens: Some(7),
+                output_tokens: Some(3),
+                cache_read_input_tokens: Some(5),
+                ..Default::default()
+            },
+        }));
+        assert!(matches!(
+            out.as_slice(),
+            [Payload::Usage(usage)]
+                if usage.message_id == "u1"
+                    && usage.input_tokens == Some(7)
+                    && usage.output_tokens == Some(3)
+                    && usage.cache_read_input_tokens == Some(5)
+                    && usage.source == UsageSource::Native
+        ));
     }
 
     #[test]

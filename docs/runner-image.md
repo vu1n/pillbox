@@ -29,7 +29,7 @@ rebuild silently reuses the stale layer instead of pulling the newer agent.
 | Harness | Install method | Pin | Tracked by Renovate |
 |---|---|---|---|
 | claude | native installer from `claude.ai/install.sh` (`claude install <ver>`) | `CLAUDE_VERSION` | yes — npm `@anthropic-ai/claude-code` (versions match the native release) |
-| codex | native installer from `chatgpt.com/codex/install.sh` | `CODEX_VERSION` | yes — github releases (`rust-v<ver>`) |
+| codex | native installer from `chatgpt.com/codex/install.sh`; complete native package preserved under `/opt/codex/packages/standalone/releases/<version>` | `CODEX_VERSION` | yes — github releases (`rust-v<ver>`) |
 | cursor | official `cursor.com/install` artifact | `CURSOR_AGENT_VERSION` | no — resolved from the official installer by `build-runner.sh --update` |
 | amp | `npm i -g @ampcode/cli@<pinned>` | `AMP_VERSION` | no — timestamp+sha versions defeat semver; bump by hand |
 | opencode | `npm i -g opencode-ai@<pinned>` | `OPENCODE_VERSION` | yes — npm |
@@ -47,6 +47,14 @@ pty-relay`), and the event emitter / `session done` wrapper — the
 in-sandbox role both local backends rely on. Because the image
 embeds the binary, it is rebuilt when `src/**` or `Cargo.{toml,lock}`
 change, not only on `runner/Dockerfile` edits.
+
+The Codex installer package is kept intact at
+`/opt/codex/packages/standalone/releases/<CODEX_VERSION>`. Its manifest, native
+`bin/codex`, `bin/codex-code-mode-host`, bundled `codex-resources`, and
+`codex-path/rg` survive cleanup of the installer's scratch home. The two native
+executables are symlinked into `/usr/local/bin`; `scripts/build-runner.sh`
+checks these companions and the pinned manifest without making an authenticated
+model call.
 
 ## Picking which image pillbox uses
 
@@ -96,7 +104,27 @@ tracked change: review `git diff runner/Dockerfile` and commit it like a Renovat
 bump. Layer caching keeps the rebuild partial — apt / Node / the cargo-built
 `pillbox` layers stay cached; only the bumped agent layers recompile. The new
 image gets a new id, so libkrun re-materializes its rootfs on the next run (add
-`--prune-rootfs` to drop the superseded generation under `~/.pillbox/krun/rootfs/`).
+`--prune-rootfs` to drop superseded current-format generations for that exact
+image reference under `~/.pillbox/krun/rootfs/`).
+
+libkrun's materialized cache format is versioned independently of image tags.
+The current `v3` layout is
+`rootfs/v3/<sha256-image-ref>/<sanitized-image-id>/{.materialized,rootfs/}`. Only the
+`rootfs/` child is served to the guest; the sibling authority marker is read as
+a bounded, no-follow regular file and binds the exact format, original image
+reference, and image ID. The hash namespace prevents distinct valid image refs
+from aliasing through lossy filename sanitization. Extraction preserves archive
+permissions, including `/tmp`'s required `01777` mode.
+
+Docker-unavailable fallback accepts only an exact current-format namespace and
+marker. Launch never deletes or rewrites a pre-existing generation because a
+running VM serves its rootfs directory live. Explicit `--prune-rootfs` considers
+only generations beneath the exact current v3 image-ref hash; legacy and v2
+directories remain untouched because their guest-writable metadata cannot
+authorize deletion. Materialized generations remain beneath Pillbox's
+host-owned `~/.pillbox` directory, whose mode is reasserted as `0700` on every
+access; preserved setuid/setgid bits are therefore not exposed through a shared
+cache.
 
 ## Build it yourself
 
@@ -141,6 +169,8 @@ image, pillbox CLI assumes:
   for the agents you intend to run. `pillbox doctor` will flag
   missing ones at runtime.
 - `/workspace` exists and is writable (bind-mount target).
+- `/tmp` exists with mode `01777`; libkrun preserves image archive mode bits
+  when materializing the rootfs.
 - `/etc` writable for the `--mcp-config` bind mount.
 - A shell.
 - `HOME` is set by the caller (pillbox sets `HOME=/home/pillbox`

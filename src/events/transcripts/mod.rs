@@ -92,6 +92,13 @@ impl Harness {
         }
     }
 
+    fn gen_ai_system(self) -> &'static str {
+        match self {
+            Self::Claude => "anthropic",
+            Self::Codex => "openai",
+        }
+    }
+
     /// `(watch_root, scope_dir)` for this run, both under the agent's
     /// `$HOME` (`home`). `watch_root` is the harness's transcript tree;
     /// `scope_dir`, when `Some`, narrows discovery to *this run's own*
@@ -168,6 +175,12 @@ pub(crate) enum EventKind {
     AssistantThinking {
         text: String,
     },
+    /// A standalone usage observation from a transcript-native accounting
+    /// record. Keeping this separate from assistant text avoids manufacturing
+    /// a message just to carry cumulative token deltas.
+    Usage {
+        usage: GenAiUsage,
+    },
     ToolUse {
         tool_use_id: String,
         tool_name: String,
@@ -190,16 +203,21 @@ pub(crate) fn drain_file_as(path: &Path, session_id: &str, harness: Harness) -> 
     let contents =
         std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let mut count = 0;
+    let mut codex_parser = (harness == Harness::Codex).then(codex::Parser::default);
     for (idx, line) in contents.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
         let events = match harness {
             Harness::Claude => claude::parse_line(line, idx),
-            Harness::Codex => codex::parse_line(line, idx),
+            Harness::Codex => codex_parser
+                .as_mut()
+                .expect("Codex drain parser")
+                .parse_line_checked(line, idx)
+                .with_context(|| format!("parse Codex transcript line {idx}"))?,
         };
         for event in events {
-            emit_event_span(&event, session_id);
+            emit_event_span(&event, session_id, harness);
             count += 1;
         }
     }
@@ -210,7 +228,7 @@ pub(crate) fn drain_file_as(path: &Path, session_id: &str, harness: Harness) -> 
 /// Skips silently when no OTel endpoint is configured (the parser
 /// still ran — useful for `drain_file`'s count when the user wants
 /// to verify the parse without standing up a collector).
-pub(super) fn emit_event_span(event: &TranscriptEvent, session_id: &str) {
+pub(super) fn emit_event_span(event: &TranscriptEvent, session_id: &str, harness: Harness) {
     let Some(tracer) = tracer() else {
         return;
     };
@@ -226,7 +244,7 @@ pub(super) fn emit_event_span(event: &TranscriptEvent, session_id: &str) {
         .with_trace_id(trace_id)
         .with_start_time(event.timestamp)
         .with_end_time(event.timestamp)
-        .with_attributes(build_attributes(event));
+        .with_attributes(build_attributes(event, harness));
     let mut span = tracer.build_with_context(builder, &parent_ctx);
     span.end();
 }
@@ -236,6 +254,7 @@ fn span_name(kind: &EventKind) -> String {
         EventKind::UserPrompt { .. } => "user.prompt".into(),
         EventKind::AssistantText { .. } => "assistant.text".into(),
         EventKind::AssistantThinking { .. } => "assistant.thinking".into(),
+        EventKind::Usage { .. } => "usage".into(),
         EventKind::ToolUse { tool_name, .. } => format!("tool {tool_name}"),
         EventKind::ToolResult { .. } => "tool.result".into(),
     }
@@ -252,9 +271,9 @@ const MAX_BODY_BYTES: usize = 4096;
 /// `trace_id` is derived from session_id (see
 /// [`derive_trace_id`]) so the binding is already encoded; adding
 /// it as an attribute would be duplicate noise on every span.
-fn build_attributes(event: &TranscriptEvent) -> Vec<KeyValue> {
+fn build_attributes(event: &TranscriptEvent, harness: Harness) -> Vec<KeyValue> {
     let mut attrs = vec![
-        KeyValue::new("gen_ai.system", "anthropic"),
+        KeyValue::new("gen_ai.system", harness.gen_ai_system()),
         KeyValue::new("pillbox.transcript.uuid", event.uuid.clone()),
     ];
     if let Some(p) = event.parent_uuid.as_deref() {
@@ -289,6 +308,9 @@ fn build_attributes(event: &TranscriptEvent) -> Vec<KeyValue> {
         }
         EventKind::AssistantThinking { text } => {
             attrs.push(KeyValue::new("gen_ai.completion.thinking", truncate(text)));
+        }
+        EventKind::Usage { usage } => {
+            push_usage_attrs(&mut attrs, usage);
         }
         EventKind::ToolUse {
             tool_use_id,
@@ -444,7 +466,7 @@ mod tests {
                 content: "hello".into(),
             },
         };
-        let attrs = build_attributes(&event);
+        let attrs = build_attributes(&event, Harness::Claude);
         let keys: Vec<&str> = attrs.iter().map(|kv| kv.key.as_str()).collect();
         for expected in [
             "gen_ai.system",
@@ -458,6 +480,29 @@ mod tests {
         // trace_id encodes it. Pin that so a future "let's just
         // re-add it" change has to defend the choice.
         assert!(!keys.contains(&"pillbox.session_id"));
+    }
+
+    #[test]
+    fn build_attributes_uses_provider_identity_for_each_harness() {
+        let event = TranscriptEvent {
+            uuid: "u1".into(),
+            parent_uuid: None,
+            timestamp: SystemTime::now(),
+            kind: EventKind::Usage {
+                usage: GenAiUsage::default(),
+            },
+        };
+        let attr_value = |harness| {
+            build_attributes(&event, harness)
+                .into_iter()
+                .find(|kv| kv.key.as_str() == "gen_ai.system")
+                .expect("gen_ai.system")
+                .value
+                .as_str()
+                .into_owned()
+        };
+        assert_eq!(attr_value(Harness::Claude), "anthropic");
+        assert_eq!(attr_value(Harness::Codex), "openai");
     }
 
     #[test]
@@ -499,6 +544,6 @@ mod tests {
                 content: "x".into(),
             },
         };
-        emit_event_span(&event, "sess-xyz"); // no-op or live; either is OK
+        emit_event_span(&event, "sess-xyz", Harness::Claude); // no-op or live; either is OK
     }
 }

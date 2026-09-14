@@ -285,6 +285,82 @@ trait EventLog {
 }
 ```
 
+### Local transcript recovery admission limits
+
+Detached local transcript recovery treats the agent-writable transcript tree and
+JSONL body as untrusted input. The local producer enforces these finite limits
+before accepting more history:
+
+- transcript reads use 64 KiB chunks and accept at most 1 MiB of UTF-8 bytes per
+  JSONL record, excluding the terminating LF;
+- transcript discovery descends at most 8 directories below the harness root
+  and inspects at most 4,096 directory entries per scan;
+- the durable session log accepts and replays at most 8 MiB per JSONL event
+  record, excluding the terminating LF.
+
+Cross-chunk UTF-8 and unterminated records remain buffered without advancing the
+durable cursor. The active producer reads each byte only once; a record that
+crosses the 1 MiB limit, invalid UTF-8 in a completed record, or a discovery
+tree that crosses either limit terminates the producer with an error. It never
+truncates the record, skips accepted history, or advances the cursor past the
+rejected bytes. A replacement starts from the last complete committed record.
+
+`session guard` checks producer health on every event and on the subscription's
+500 ms idle poll. A stopped in-process tailer, a detached producer losing its
+ownership lock or PID identity, or a log-subscription failure trips the guard.
+`--kill` uses the existing session teardown; dry-run reports the trip without
+teardown. A historical log without a live producer cannot be guarded. Malformed
+records remain rejected rather than being skipped to make the monitor look
+healthy. Token-counter arithmetic overflow also trips immediately, even with
+the numeric token threshold disabled. These checks protect monitoring integrity;
+guest-reported token counts are not an independent billing cap.
+
+### Codex transcript accounting and replay
+
+The Codex transcript adapter maps both the legacy `function_call` pair and the
+modern `custom_tool_call` / `custom_tool_call_output` pair into one correlated
+`tool_call` identity. Custom-tool input remains the source's free-form string;
+an input that happens to look like JSON is not decoded. Output arrays are
+flattened only when every block is a plain text block. Mixed or structured
+blocks remain JSON so logging does not discard non-text output.
+
+Tool results preserve explicit status when present. Codex 0.151's unstructured
+code-mode host-spawn error is recognized by its anchored native error format;
+arbitrary failure text or a nested shell exit code does not imply tool-host
+failure. Transcript spans carry the harness identity (Codex/OpenAI or
+Claude/Anthropic), including standalone usage spans.
+
+Codex `event_msg.token_count` records are cumulative snapshots. The adapter
+emits a standalone native `usage` event only for a changed snapshot and emits
+component-wise deltas, so a live tool loop is observable without double
+counting repeated snapshots. Inclusive `input_tokens` is normalized to
+non-cached input, and the optional cache-write counter keeps its prior
+baseline when a snapshot omits it so a later reappearance cannot rebill the
+prefix. A first all-zero snapshot is still a measured observation; later
+unchanged zero snapshots are suppressed. Malformed counters, cache greater
+than inclusive input, and decreasing cumulative totals fail the producer
+without advancing the durable cursor.
+
+The durable Codex tailer persists its parser accounting baseline alongside the
+transcript byte position in cursor version 2, and commits both only with the
+matching exact session-log batch. A cursor written for another producer or
+cursor version fails loudly rather than rebilling history. Prepared-batch
+recovery restores a usage-containing append without replaying it.
+
+The human `session cost` view reports token accounting as unavailable when no
+native or wire `Usage` field was observed, while preserving the existing JSON
+cost schema. Consequently, a zero in the legacy JSON cost envelope is not by
+itself proof that measured zero usage was observed; use the durable `usage`
+events when that distinction matters.
+
+Session-log open and replay scan with bounded record buffers. A fresh append
+holds the existing per-session `flock` and recovers the authoritative sequence
+in progressively larger windows starting at 64 KiB, up to 16 MiB plus two LF
+delimiter bytes (one maximum record plus a possible maximum torn record), rather
+than rescanning complete history on every append. Crash recovery for a journaled
+exact batch still validates every durable suffix event against the prepared
+payloads before adding only the missing suffix.
+
 Local-jsonl default (local-first, greppable). A Postgres impl could land for the
 future team/managed tier (Aquifer parity) without changing producers. This extends
 the existing `EventSink` trait with read/replay.
@@ -356,4 +432,3 @@ The table is the *target*, not the *transition*. Required before building:
 4. **Input target arbitration** — `input{target:pty}` must route through the
    driver-token arbiter (see multiplayer spec); `target:agent` (turns) can
    queue. Driver-token vs turn-queue default is the one genuine product fork.
-```

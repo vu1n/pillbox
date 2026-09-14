@@ -6,8 +6,10 @@ import {
   type ExecuteInvocationV2ErrorCode,
   type ExecuteInvocationV2Request,
   type ExecuteInvocationV2Result,
+  type CompletedExecutionResultSessionRef,
   type ExecutionAttribution,
   type ExecutionEvidencePage,
+  type ExecutionResultSessionRef,
   type GetInvocationV2Request,
   type JsonValue,
   MAX_EVIDENCE_PAGE_SIZE,
@@ -25,11 +27,25 @@ import {
   MAX_EXECUTION_EVIDENCE_EVENT_BYTES,
 } from "./execution_artifacts.js";
 import type {
+  ExecutionClaim,
   ExecutionClaimInput,
   ExecutionRecord,
   ExecutionStore,
 } from "./execution_store.js";
+import type { ManagedExecutionOwner } from "./managed_ownership.js";
+import {
+  ManagedExecutionAllowanceError,
+  ManagedReservationAccessError,
+  type ManagedExecutionAllowance,
+  type ManagedExecutionReservationStore,
+} from "./managed_reservation.js";
 import { safeHuddlesRuntimeDiagnostic } from "./huddles_policy.js";
+import {
+  ManagedAdmissionError,
+  managedAdmissionPolicy,
+  requireManagedAdmission,
+  type ManagedAdmissionPolicy,
+} from "./managed_admission.js";
 import { driveOpencodeTurn } from "./opencode_turn.js";
 import type { Payload } from "./contract.js";
 import {
@@ -40,6 +56,24 @@ import {
 } from "./run_cost.js";
 
 export const EXECUTION_OWNER_LEASE_MS = 10 * 60 * 1_000;
+
+const MISSING_POSITIONAL_EVIDENCE_ERROR = {
+  code: "runtime_failed",
+  message: "Pillbox managed invocation completed without immutable positional evidence",
+} as const;
+
+type ExecutionTerminal =
+  | {
+      readonly status: "completed";
+      readonly output: { readonly text?: string; readonly json?: JsonValue };
+    }
+  | {
+      readonly status: "failed" | "cancelled" | "interrupted";
+      readonly error: {
+        readonly code: ExecuteInvocationV2ErrorCode;
+        readonly message: string;
+      };
+    };
 
 export interface RuntimeTurnResult {
   readonly served_model: string | null;
@@ -56,12 +90,35 @@ export interface ExecutionRuntime {
   cancel(request: CancelInvocationV2Request, session_id: string): Promise<void>;
 }
 
+export type ExecutionOperationAuthorization =
+  | {
+      readonly operation: "execute";
+      readonly request: ExecuteInvocationV2Request;
+    }
+  | {
+      readonly operation: "status";
+      readonly request: GetInvocationV2Request;
+    }
+  | {
+      readonly operation: "cancel";
+      readonly request: CancelInvocationV2Request;
+    };
+
+/** Pre-access authorization returns only the opaque durable owner identity. */
+export type ExecutionOperationAuthorizer = (
+  input: ExecutionOperationAuthorization,
+) => Promise<ManagedExecutionOwner>;
+
 export interface ExecutionServiceOptions {
   readonly now?: () => number;
   readonly ownerToken?: () => string;
   readonly costMeter?: RunCostMeter;
   readonly analytics?: RunCostAnalytics;
   readonly sandboxProfile?: string;
+  readonly admission?: ManagedAdmissionPolicy;
+  readonly allowance?: ManagedExecutionAllowance | null;
+  readonly reservations: ManagedExecutionReservationStore;
+  readonly authorizer: ExecutionOperationAuthorizer;
 }
 
 export class ExecutionNotFoundError extends Error {
@@ -82,12 +139,16 @@ export class ExecutionService {
   private readonly costMeter: RunCostMeter | undefined;
   private readonly analytics: RunCostAnalytics | undefined;
   private readonly sandboxProfile: string | null;
+  private readonly admission: ManagedAdmissionPolicy;
+  private readonly allowance: ManagedExecutionAllowance | null;
+  private readonly reservations: ManagedExecutionReservationStore;
+  private readonly authorizer: ExecutionOperationAuthorizer;
 
   constructor(
     store: ExecutionStore,
     artifacts: ExecutionArtifactStore,
     runtime: ExecutionRuntime,
-    options: ExecutionServiceOptions = {},
+    options: ExecutionServiceOptions,
   ) {
     this.store = store;
     this.artifacts = artifacts;
@@ -97,6 +158,10 @@ export class ExecutionService {
     this.costMeter = options.costMeter;
     this.analytics = options.analytics;
     this.sandboxProfile = options.sandboxProfile ?? null;
+    this.admission = options.admission ?? managedAdmissionPolicy(undefined);
+    this.allowance = options.allowance ?? null;
+    this.reservations = options.reservations;
+    this.authorizer = options.authorizer;
   }
 
   async executeInvocation(value: unknown): Promise<ExecuteInvocationV2Result> {
@@ -106,7 +171,73 @@ export class ExecutionService {
       request.execution,
       request.execution_policy_revision,
     );
+    const owner = await this.authorizer({ operation: "execute", request });
+    try {
+      requireManagedAdmission(this.admission);
+    } catch (cause) {
+      if (!(cause instanceof ManagedAdmissionError)) throw cause;
+      return this.managedDisabledResult(
+        request,
+        requestHash,
+        executionDigest,
+        cause.message,
+      );
+    }
+    const unsupported = unsupportedManagedRequest(request);
+    if (unsupported !== undefined) {
+      return this.preClaimFailureResult(
+        request,
+        requestHash,
+        executionDigest,
+        unsupported,
+      );
+    }
+    if (this.allowance === null) {
+      return this.managedDisabledResult(
+        request,
+        requestHash,
+        executionDigest,
+        "Pillbox managed execution allowance is not configured",
+      );
+    }
     const now = this.now();
+    let reservation;
+    try {
+      reservation = await this.reservations.claimExecution(
+        {
+          invocation_id: request.invocation_id,
+          session_id: request.session_ref.session_id,
+          owner,
+          execution_request_hash: requestHash,
+          now_ms: now,
+        },
+        this.allowance,
+      );
+    } catch (cause) {
+      if (cause instanceof ManagedExecutionAllowanceError) {
+        return this.managedDisabledResult(
+          request,
+          requestHash,
+          executionDigest,
+          cause.message,
+        );
+      }
+      if (cause instanceof ManagedReservationAccessError) {
+        throw new ExecutionNotFoundError(request.invocation_id);
+      }
+      throw cause;
+    }
+    if (reservation.kind === "conflict") {
+      return this.reservationConflictResult(
+        request,
+        reservation.record.execution_request_hash,
+        requestHash,
+        executionDigest,
+      );
+    }
+    if (reservation.record.status !== "ready") {
+      throw new ExecutionNotFoundError(request.invocation_id);
+    }
     const input: ExecutionClaimInput = {
       invocation_id: request.invocation_id,
       idempotency_key: request.idempotency_key,
@@ -114,12 +245,18 @@ export class ExecutionService {
       execution_digest: executionDigest,
       execution_policy_revision: request.execution_policy_revision,
       session_id: request.session_ref.session_id,
+      owner,
+      allowance_epoch: this.allowance.deployment_epoch,
+      allowance_limit: this.allowance.execution_limit,
       attribution: attributionFromRequest(request, null),
       owner_token: this.ownerToken(),
       now_ms: now,
       lease_expires_at_ms: now + EXECUTION_OWNER_LEASE_MS,
     };
-    const claim = await this.store.claim(input);
+    const claim: ExecutionClaim = await this.store.claim(input);
+    if (claim.kind === "unavailable") {
+      throw new ExecutionNotFoundError(request.invocation_id);
+    }
     if (claim.kind === "conflict") {
       return this.conflictResult(request, claim.record, requestHash);
     }
@@ -131,54 +268,31 @@ export class ExecutionService {
     }
 
     let turn: RuntimeTurnResult;
-    if (request.tool_policy !== "deny_all") {
+    try {
+      turn = await this.runtime.execute(request);
+    } catch (cause) {
       turn = {
         served_model: null,
         error: {
-          code: "unsupported_policy",
-          message: "managed execution requires tool_policy 'deny_all' until credentials are brokered",
+          code: "runtime_failed",
+          message: "Pillbox managed invocation failed",
         },
-        evidence: [],
-      };
-    } else if (
-      request.execution.transport.harness !== "opencode" ||
-      (request.execution.transport.transport !== "http" &&
-        request.execution.transport.transport !== "cloudflare-service-binding")
-    ) {
-      turn = {
-        served_model: null,
-        error: {
-          code: "unsupported_execution",
-          message: `unsupported managed execution ${request.execution.transport.harness}/${request.execution.transport.transport}`,
-        },
-        evidence: [],
-      };
-    } else {
-      try {
-        turn = await this.runtime.execute(request);
-      } catch (cause) {
-        turn = {
-          served_model: null,
-          error: {
-            code: "runtime_failed",
-            message: "Pillbox managed invocation failed",
+        evidence: [
+          {
+            type: "attention_required",
+            reason: "error_stalled",
+            message: safeHuddlesRuntimeDiagnostic(cause),
           },
-          evidence: [
-            {
-              type: "attention_required",
-              reason: "error_stalled",
-              message: safeHuddlesRuntimeDiagnostic(cause),
-            },
-          ],
-        };
-      }
+        ],
+      };
     }
     return this.finishTurn(request, claim.record, turn, "created");
   }
 
   async getExecutionStatus(value: unknown): Promise<ExecuteInvocationV2Result> {
     const request = validateGetInvocationV2Request(value);
-    const record = await this.requireRecord(request.invocation_id);
+    const owner = await this.authorizer({ operation: "status", request });
+    const record = await this.requireRecord(request.invocation_id, owner);
     return this.resultForRecord(
       undefined,
       record,
@@ -188,7 +302,8 @@ export class ExecutionService {
 
   async cancelInvocation(value: unknown): Promise<ExecuteInvocationV2Result> {
     const request = validateCancelInvocationV2Request(value);
-    let record = await this.requireRecord(request.invocation_id);
+    const owner = await this.authorizer({ operation: "cancel", request });
+    let record = await this.requireRecord(request.invocation_id, owner);
     if (record.status !== "running") {
       return this.resultForRecord(undefined, record, {
         after: 0,
@@ -207,7 +322,7 @@ export class ExecutionService {
       "reused",
     );
     if (result !== null) return result;
-    record = await this.requireRecord(request.invocation_id);
+    record = await this.requireRecord(request.invocation_id, owner);
     return this.resultForRecord(undefined, record, {
       after: 0,
       limit: MAX_EVIDENCE_PAGE_SIZE,
@@ -230,6 +345,7 @@ export class ExecutionService {
             emptyEvidence(cursor.after),
             "reused",
           ),
+          session_ref: this.positionalSessionRef(record.session_id, 0),
           status: "running",
           retry_after_ms: Math.min(
             5_000,
@@ -255,7 +371,7 @@ export class ExecutionService {
       if (interrupted !== null) return interrupted;
       return this.resultForRecord(
         request,
-        await this.requireRecord(record.invocation_id),
+        await this.requireRecord(record.invocation_id, record.owner),
         cursor,
       );
     }
@@ -263,7 +379,7 @@ export class ExecutionService {
       throw new Error(`terminal execution '${record.invocation_id}' has no artifact`);
     }
     const artifact = await this.artifacts.read(record.artifact_ref);
-    const stored = artifact.terminal_result as unknown as ExecuteInvocationV2Result;
+    const stored = this.terminalWithSessionRef(record, artifact);
     return {
       ...stored,
       disposition: "reused",
@@ -292,7 +408,7 @@ export class ExecutionService {
       disposition,
     );
     if (result === null) {
-      return this.resultForRecord(request, await this.requireRecord(record.invocation_id), {
+      return this.resultForRecord(request, await this.requireRecord(record.invocation_id, record.owner), {
         after: 0,
         limit: MAX_EVIDENCE_PAGE_SIZE,
       });
@@ -302,22 +418,27 @@ export class ExecutionService {
 
   private async finishTerminal(
     record: ExecutionRecord,
-    terminal:
-      | { readonly status: "completed"; readonly output: { readonly text?: string; readonly json?: JsonValue } }
-      | {
-          readonly status: "failed" | "cancelled" | "interrupted";
-          readonly error: { readonly code: ExecuteInvocationV2ErrorCode; readonly message: string };
-        },
+    terminal: ExecutionTerminal,
     evidence: readonly JsonValue[],
     attribution: ExecutionAttribution,
     disposition: "created" | "reused",
   ): Promise<ExecuteInvocationV2Result | null> {
-    const placeholder = {
-      ...baseResult(record, attribution, emptyEvidence(0), disposition),
-      ...terminal,
-    } satisfies ExecuteInvocationV2Result;
+    const outcome = terminalOutcome(terminal, evidence.length);
+    const base = baseResult(record, attribution, emptyEvidence(0), disposition);
+    const placeholder: ExecuteInvocationV2Result =
+      outcome.status === "completed"
+        ? {
+            ...base,
+            session_ref: this.completedSessionRef(record.session_id, evidence.length),
+            ...outcome,
+          }
+        : {
+            ...base,
+            session_ref: this.positionalSessionRef(record.session_id, evidence.length),
+            ...outcome,
+          };
     this.costMeter?.observeEvidence(evidence);
-    const cost = this.costMeter?.terminal(terminal.status, {
+    const cost = this.costMeter?.terminal(outcome.status, {
       sandbox_duration_ms: Math.max(0, this.now() - record.created_at_ms),
       sandbox_profile: this.sandboxProfile,
       planned_d1_terminal_writes: 1,
@@ -341,16 +462,20 @@ export class ExecutionService {
       artifact = cause.existing;
       artifactRef = cause.existing_ref;
     }
-    const stored = terminalResult(artifact, record);
+    const stored = this.terminalWithSessionRef(record, artifact);
     const finished = await this.store.finish({
       invocation_id: record.invocation_id,
       request_hash: record.request_hash,
       owner_token: record.owner_token,
+      owner: record.owner,
       status: stored.status,
       artifact_ref: artifactRef,
       now_ms: this.now(),
     });
     if (!finished) return null;
+    // The terminal CAS is the emission fence: its sole winner may attempt once,
+    // and a crash or failure after this point is reconciled as observed variance.
+    await this.emitTerminalAnalytics(record, stored, artifact);
     const result: ExecuteInvocationV2Result = {
       ...stored,
       disposition,
@@ -364,23 +489,34 @@ export class ExecutionService {
         ? {}
         : { cost: artifact.cost as unknown as RunCostEnvelope }),
     };
-    if (this.analytics !== undefined && result.cost !== undefined) {
-      try {
-        await this.analytics.emit({
-          invocation_id: record.invocation_id,
-          request_hash: record.request_hash,
-          harness: attribution.harness,
-          transport: attribution.transport,
-          cost: result.cost,
-        });
-      } catch (cause) {
-        console.error(
-          "run cost analytics emission failed",
-          safeHuddlesRuntimeDiagnostic(cause),
-        );
-      }
-    }
     return result;
+  }
+
+  private async emitTerminalAnalytics(
+    record: ExecutionRecord,
+    terminal: Extract<
+      ExecuteInvocationV2Result,
+      { readonly status: "completed" | "failed" | "cancelled" | "interrupted" }
+    >,
+    artifact: ExecutionArtifact,
+  ): Promise<void> {
+    if (this.analytics === undefined || artifact.cost === undefined) return;
+    const cost = artifact.cost as unknown as RunCostEnvelope;
+    if (cost.infrastructure.analytics_points_planned !== 1) return;
+    try {
+      await this.analytics.emit({
+        invocation_id: record.invocation_id,
+        request_hash: record.request_hash,
+        harness: terminal.attribution.harness,
+        transport: terminal.attribution.transport,
+        cost,
+      });
+    } catch (cause) {
+      console.warn(
+        "Pillbox terminal Analytics emission failed after authoritative commit:",
+        safeHuddlesRuntimeDiagnostic(cause),
+      );
+    }
   }
 
   private conflictResult(
@@ -395,6 +531,7 @@ export class ExecutionService {
         emptyEvidence(0),
         "reused",
       ),
+      session_ref: this.positionalSessionRef(record.session_id, 0),
       status: "conflict",
       error: {
         code: "idempotency_conflict",
@@ -405,11 +542,155 @@ export class ExecutionService {
     };
   }
 
-  private async requireRecord(invocation_id: string): Promise<ExecutionRecord> {
-    const record = await this.store.get(invocation_id);
+  private reservationConflictResult(
+    request: ExecuteInvocationV2Request,
+    existingHash: `sha256:${string}`,
+    requestedHash: `sha256:${string}`,
+    executionDigest: `sha256:${string}`,
+  ): ExecuteInvocationV2Result {
+    return {
+      disposition: "reused",
+      invocation_id: request.invocation_id,
+      request_hash: existingHash,
+      execution_digest: executionDigest,
+      execution_policy_revision: request.execution_policy_revision,
+      session_ref: this.positionalSessionRef(request.session_ref.session_id, 0),
+      attribution: attributionFromRequest(request, null),
+      evidence: emptyEvidence(0),
+      status: "conflict",
+      error: {
+        code: "idempotency_conflict",
+        message: "invocation is already reserved for different content",
+        existing_request_hash: existingHash,
+        requested_request_hash: requestedHash,
+      },
+    };
+  }
+
+  private managedDisabledResult(
+    request: ExecuteInvocationV2Request,
+    requestHash: `sha256:${string}`,
+    executionDigest: `sha256:${string}`,
+    message: string,
+  ): ExecuteInvocationV2Result {
+    return this.preClaimFailureResult(request, requestHash, executionDigest, {
+      code: "managed_disabled",
+      message,
+    });
+  }
+
+  private preClaimFailureResult(
+    request: ExecuteInvocationV2Request,
+    requestHash: `sha256:${string}`,
+    executionDigest: `sha256:${string}`,
+    error: {
+      readonly code: "managed_disabled" | "unsupported_execution" | "unsupported_policy";
+      readonly message: string;
+    },
+  ): ExecuteInvocationV2Result {
+    return {
+      disposition: "created",
+      invocation_id: request.invocation_id,
+      request_hash: requestHash,
+      execution_digest: executionDigest,
+      execution_policy_revision: request.execution_policy_revision,
+      session_ref: this.positionalSessionRef(request.session_ref.session_id, 0),
+      attribution: attributionFromRequest(request, null),
+      evidence: emptyEvidence(0),
+      status: "failed",
+      error,
+    };
+  }
+
+  private async requireRecord(
+    invocation_id: string,
+    owner: ManagedExecutionOwner,
+  ): Promise<ExecutionRecord> {
+    const record = await this.store.get(invocation_id, owner);
     if (record === null) throw new ExecutionNotFoundError(invocation_id);
     return record;
   }
+
+  private positionalSessionRef(
+    session_id: string,
+    evidenceLength: number,
+  ): ExecutionResultSessionRef {
+    return evidenceLength === 0
+      ? { session_id }
+      : { session_id, seq_range: [0, evidenceLength - 1] };
+  }
+
+  private completedSessionRef(
+    session_id: string,
+    evidenceLength: number,
+  ): CompletedExecutionResultSessionRef {
+    if (evidenceLength === 0) {
+      throw new Error("completed execution has no immutable positional evidence");
+    }
+    return { session_id, seq_range: [0, evidenceLength - 1] };
+  }
+
+  private terminalWithSessionRef(
+    record: ExecutionRecord,
+    artifact: ExecutionArtifact,
+  ): Extract<
+    ExecuteInvocationV2Result,
+    { readonly status: "completed" | "failed" | "cancelled" | "interrupted" }
+  > {
+    const terminal = terminalResult(artifact, record);
+    if (terminal.status === "completed" && artifact.evidence.length === 0) {
+      const { output: _output, ...base } = terminal;
+      return {
+        ...base,
+        status: "failed",
+        session_ref: this.positionalSessionRef(record.session_id, 0),
+        error: MISSING_POSITIONAL_EVIDENCE_ERROR,
+      };
+    }
+    return terminal.status === "completed"
+      ? {
+          ...terminal,
+          session_ref: this.completedSessionRef(
+            record.session_id,
+            artifact.evidence.length,
+          ),
+        }
+      : {
+          ...terminal,
+          session_ref: this.positionalSessionRef(
+            record.session_id,
+            artifact.evidence.length,
+          ),
+        };
+  }
+}
+
+function unsupportedManagedRequest(
+  request: ExecuteInvocationV2Request,
+):
+  | {
+      readonly code: "unsupported_execution" | "unsupported_policy";
+      readonly message: string;
+    }
+  | undefined {
+  if (request.tool_policy !== "deny_all") {
+    return {
+      code: "unsupported_policy",
+      message:
+        "managed execution requires tool_policy 'deny_all' until credentials are brokered",
+    };
+  }
+  const { harness, transport } = request.execution.transport;
+  if (
+    harness !== "opencode" ||
+    (transport !== "http" && transport !== "cloudflare-service-binding")
+  ) {
+    return {
+      code: "unsupported_execution",
+      message: `unsupported managed execution ${harness}/${transport}`,
+    };
+  }
+  return undefined;
 }
 
 type SandboxHandle = ReturnType<typeof getSandbox>;
@@ -590,6 +871,15 @@ function errorStatus(
   if (code === "cancelled") return "cancelled";
   if (code === "runtime_interrupted") return "interrupted";
   return "failed";
+}
+
+function terminalOutcome(
+  terminal: ExecutionTerminal,
+  evidenceLength: number,
+): ExecutionTerminal {
+  return terminal.status === "completed" && evidenceLength === 0
+    ? { status: "failed", error: MISSING_POSITIONAL_EVIDENCE_ERROR }
+    : terminal;
 }
 
 function emptyEvidence(from: number): ExecutionEvidencePage {

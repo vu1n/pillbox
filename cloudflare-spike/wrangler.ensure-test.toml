@@ -1,8 +1,9 @@
 name = "pillbox-do-spike-ensure-test"
-main = "test/ensure_worker.ts"
+main = "test/local_legacy_worker.ts"
 compatibility_date = "2026-06-01"
+compatibility_flags = ["nodejs_compat"]
 
 [[services]]
 binding = "PillboxRuntime"
 service = "pillbox-do-spike"
-entrypoint = "HuddlesRuntimeEntrypoint"
+entrypoint = "LocalLegacyRuntimeEntrypoint"

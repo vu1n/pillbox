@@ -24,6 +24,15 @@ use crate::agents::GUEST_HOME;
 /// In-share filename of the host-written guest boot script.
 const BOOT_SCRIPT: &str = ".pillbox-boot.sh";
 
+/// Whether the mounted boot share is a disposable per-run clone whose ownership
+/// must be normalized for the guest's nested user namespace. `PreserveHost` is
+/// for non-clone shares such as the grader's temporary boot-script directory.
+#[derive(Clone, Copy)]
+pub(super) enum MountedShareOwnership {
+    PreserveHost,
+    GuestRootClone,
+}
+
 /// Set up the boot channel: write `content` as the boot script into `dir`
 /// (normalized to end in exactly one newline) and return the [`Share`] exposing
 /// `dir` under `tag` together with the static-ASCII exec that mounts it at
@@ -32,6 +41,7 @@ pub(super) fn boot_channel(
     dir: &Path,
     tag: &str,
     mountpoint: &str,
+    ownership: MountedShareOwnership,
     content: &str,
 ) -> Result<(Share, Vec<String>)> {
     let script = format!("{}\n", content.trim_end_matches('\n'));
@@ -45,24 +55,56 @@ pub(super) fn boot_channel(
         .open(dir.join(BOOT_SCRIPT))
         .and_then(|mut f| f.write_all(script.as_bytes()))
         .context("write guest boot script")?;
+    #[cfg(target_os = "macos")]
+    if matches!(ownership, MountedShareOwnership::GuestRootClone) {
+        super::metadata::prepare_guest_clone_metadata(dir)?;
+    }
     Ok((
         Share {
             tag: tag.to_string(),
             host_path: dir.to_string_lossy().into_owned(),
         },
-        bootstrap_exec(tag, mountpoint),
+        bootstrap_exec(tag, mountpoint, ownership),
     ))
+}
+
+/// Render the legacy ownership normalization for one mounted disposable clone.
+/// macOS prepares the clone's virtio-fs metadata on the host before mounting;
+/// this remains the guest-side path for non-macOS libkrun backends.
+#[cfg(not(target_os = "macos"))]
+pub(super) fn guest_root_clone_ownership(mountpoint: &str) -> String {
+    format!(
+        "find -P {} -xdev -exec /bin/sh -c 'for path do \
+         mode=$(stat -c %a -- \"$path\") || exit; \
+         chown -h 0:0 -- \"$path\" || exit; \
+         if [ ! -L \"$path\" ]; then chmod \"$mode\" -- \"$path\" || exit; fi; \
+         done' sh {{}} +",
+        shell_quote(mountpoint)
+    )
 }
 
 /// The static kernel-cmdline bootstrap: mount `tag` at `mountpoint`, exec the
 /// boot script from it.
-fn bootstrap_exec(tag: &str, mountpoint: &str) -> Vec<String> {
+fn bootstrap_exec(tag: &str, mountpoint: &str, ownership: MountedShareOwnership) -> Vec<String> {
     let mp = shell_quote(mountpoint);
+    let normalize = match ownership {
+        MountedShareOwnership::PreserveHost => String::new(),
+        MountedShareOwnership::GuestRootClone => {
+            #[cfg(target_os = "macos")]
+            {
+                String::new()
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                format!("{}; ", guest_root_clone_ownership(mountpoint))
+            }
+        }
+    };
     vec![
         "/bin/sh".into(),
         "-c".into(),
         format!(
-            "set -e; mkdir -p {mp}; mount -t virtiofs {tag} {mp}; exec /bin/sh {mp}/{BOOT_SCRIPT}"
+            "set -e; mkdir -p {mp}; mount -t virtiofs {tag} {mp}; {normalize}exec /bin/sh {mp}/{BOOT_SCRIPT}"
         ),
     ]
 }
@@ -117,6 +159,34 @@ pub(super) fn grader_child_env() -> Vec<(&'static str, String)> {
 mod tests {
     use super::*;
 
+    #[cfg(not(target_os = "macos"))]
+    fn write_test_tool(dir: &Path, name: &str, body: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn ownership_test_tools(dir: &Path) {
+        write_test_tool(
+            dir,
+            "stat",
+            "#!/bin/sh\nfor path do :; done\ncase \"$path\" in */setid-tool) printf '6751\\n'; exit 0;; esac\nif /usr/bin/stat -c %a -- \"$path\" >/dev/null 2>&1; then\n  exec /usr/bin/stat -c %a -- \"$path\"\nfi\nexec /usr/bin/stat -f %Lp \"$path\"\n",
+        );
+        write_test_tool(
+            dir,
+            "chown",
+            "#!/bin/sh\nfor path do :; done\nprintf '%s\\n' \"$path\" >> \"$OWN_LOG\" || exit\nif [ \"${FAIL_PATH:-}\" = \"$path\" ]; then exit 42; fi\n",
+        );
+        write_test_tool(
+            dir,
+            "chmod",
+            "#!/bin/sh\nmode=$1\nfor path do :; done\nprintf '%s %s\\n' \"$mode\" \"$path\" >> \"$CHMOD_LOG\"\n",
+        );
+    }
+
     /// The bootstrap argv AND the static child env ride the kernel cmdline —
     /// libkrun validates both as printable ASCII (`' '..='~'`) and a violation
     /// aborts the VMM. Everything dynamic must stay out of them; this pins the
@@ -124,7 +194,7 @@ mod tests {
     #[test]
     fn kernel_cmdline_parts_stay_printable_ascii() {
         let ascii = |s: &str| s.chars().all(|c| matches!(c, ' '..='~'));
-        for part in bootstrap_exec("creds", GUEST_HOME) {
+        for part in bootstrap_exec("creds", GUEST_HOME, MountedShareOwnership::GuestRootClone) {
             assert!(
                 ascii(&part),
                 "bootstrap exec must stay printable ASCII: {part:?}"
@@ -152,7 +222,14 @@ mod tests {
     #[test]
     fn boot_channel_binds_share_to_exec_and_writes_script() {
         let dir = tempfile::tempdir().unwrap();
-        let (share, exec) = boot_channel(dir.path(), "creds", "/root", "echo hi").unwrap();
+        let (share, exec) = boot_channel(
+            dir.path(),
+            "creds",
+            "/root",
+            MountedShareOwnership::GuestRootClone,
+            "echo hi",
+        )
+        .unwrap();
         assert_eq!(share.tag, "creds");
         assert_eq!(share.host_path, dir.path().to_string_lossy());
         assert!(exec
@@ -163,6 +240,137 @@ mod tests {
             std::fs::read_to_string(dir.path().join(BOOT_SCRIPT)).unwrap(),
             "echo hi\n"
         );
+    }
+
+    #[test]
+    fn cloned_boot_share_is_owned_after_mount_before_script_exec() {
+        let command = bootstrap_exec("creds", GUEST_HOME, MountedShareOwnership::GuestRootClone)
+            .pop()
+            .unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                command,
+                "set -e; mkdir -p '/home/pillbox'; mount -t virtiofs creds '/home/pillbox'; exec /bin/sh '/home/pillbox'/.pillbox-boot.sh"
+            );
+            assert!(!command.contains("chown"));
+        }
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(
+            command,
+            "set -e; mkdir -p '/home/pillbox'; mount -t virtiofs creds '/home/pillbox'; find -P '/home/pillbox' -xdev -exec /bin/sh -c 'for path do mode=$(stat -c %a -- \"$path\") || exit; chown -h 0:0 -- \"$path\" || exit; if [ ! -L \"$path\" ]; then chmod \"$mode\" -- \"$path\" || exit; fi; done' sh {} +; exec /bin/sh '/home/pillbox'/.pillbox-boot.sh"
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert!(command.contains("mode=$(stat -c %a"));
+        #[cfg(not(target_os = "macos"))]
+        assert!(command.contains("chmod \"$mode\""));
+    }
+
+    #[test]
+    fn non_clone_boot_share_preserves_host_ownership() {
+        let command = bootstrap_exec(
+            "boot",
+            "/run/pillbox-boot",
+            MountedShareOwnership::PreserveHost,
+        )
+        .pop()
+        .unwrap();
+        assert!(!command.contains("chown"));
+        assert!(command.contains("mount -t virtiofs boot '/run/pillbox-boot'; exec"));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn clone_ownership_is_physical_no_dereference_and_shell_quoted() {
+        let command = guest_root_clone_ownership("/workspace/a b'; touch /escaped");
+        assert_eq!(
+            command,
+            "find -P '/workspace/a b'\\''; touch /escaped' -xdev -exec /bin/sh -c 'for path do mode=$(stat -c %a -- \"$path\") || exit; chown -h 0:0 -- \"$path\" || exit; if [ ! -L \"$path\" ]; then chmod \"$mode\" -- \"$path\" || exit; fi; done' sh {} +"
+        );
+        assert!(command.starts_with("find -P "));
+        assert!(command.contains(" -xdev "));
+        assert!(command.contains("chown -h 0:0"));
+        assert!(!command.contains("find -L"));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn clone_ownership_restores_captured_special_modes_without_following_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        // This host's test sandbox strips setid bits from fixtures. The fake
+        // `stat` therefore reports 6751 for `setid-tool`, and the fake `chmod`
+        // records the mode it receives: the guest VM probe covers the real GNU
+        // filesystem behavior while this pins capture -> exact restore wiring.
+        let fixture = tempfile::tempdir().unwrap();
+        let tools = fixture.path().join("tools");
+        let clone = fixture.path().join("clone");
+        let outside = fixture.path().join("outside");
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::create_dir_all(&clone).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        ownership_test_tools(&tools);
+
+        let executable = clone.join("setid-tool");
+        let outside_file = outside.join("must-not-be-visited");
+        std::fs::write(&executable, b"fixture").unwrap();
+        std::fs::write(&outside_file, b"outside").unwrap();
+        symlink(&outside, clone.join("escape")).unwrap();
+        let own_log = fixture.path().join("owned.log");
+        let chmod_log = fixture.path().join("chmod.log");
+
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(guest_root_clone_ownership(clone.to_str().unwrap()))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin:/usr/sbin", tools.display()),
+            )
+            .env("OWN_LOG", &own_log)
+            .env("CHMOD_LOG", &chmod_log)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(
+            std::fs::read_to_string(chmod_log)
+                .unwrap()
+                .contains(&format!("6751 {}", executable.display())),
+            "the exact captured mode, including setuid/setgid, must reach chmod"
+        );
+        let owned = std::fs::read_to_string(own_log).unwrap();
+        assert!(owned.contains(clone.join("escape").to_str().unwrap()));
+        assert!(!owned.contains(outside_file.to_str().unwrap()));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn clone_ownership_child_failure_aborts_the_preamble() {
+        let fixture = tempfile::tempdir().unwrap();
+        let tools = fixture.path().join("tools");
+        let clone = fixture.path().join("clone");
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::create_dir_all(&clone).unwrap();
+        ownership_test_tools(&tools);
+        let own_log = fixture.path().join("owned.log");
+        let chmod_log = fixture.path().join("chmod.log");
+
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "set -e; {}; printf SHOULD_NOT_RUN",
+                guest_root_clone_ownership(clone.to_str().unwrap())
+            ))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin:/usr/sbin", tools.display()),
+            )
+            .env("OWN_LOG", &own_log)
+            .env("CHMOD_LOG", &chmod_log)
+            .env("FAIL_PATH", &clone)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("SHOULD_NOT_RUN"));
     }
 
     /// The whole point of the boot script: bytes the cmdline can't carry
@@ -202,7 +410,14 @@ mod tests {
     fn boot_channel_writes_script_owner_only() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        boot_channel(dir.path(), "creds", "/root", "echo hi").unwrap();
+        boot_channel(
+            dir.path(),
+            "creds",
+            "/root",
+            MountedShareOwnership::GuestRootClone,
+            "echo hi",
+        )
+        .unwrap();
         let mode = std::fs::metadata(dir.path().join(BOOT_SCRIPT))
             .unwrap()
             .permissions()

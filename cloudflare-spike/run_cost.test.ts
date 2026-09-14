@@ -41,7 +41,7 @@ test("cost meter preserves raw usage units and planned terminal operations", () 
   assert.equal(cost.infrastructure.d1_rows_read, 1);
   assert.equal(cost.infrastructure.d1_rows_written, 2);
   assert.equal(cost.infrastructure.r2_writes, 1);
-  assert.equal(cost.infrastructure.analytics_points_written, 1);
+  assert.equal(cost.infrastructure.analytics_points_planned, 1);
   assert.equal(cost.known_cost_usd, 0.0125);
   assert.equal(cost.estimated_total_cost_usd, null);
   assert.equal(cost.rate_card_version, null);
@@ -83,7 +83,7 @@ test("artifact cost sealing converges on its exact serialized byte count", () =>
   );
 });
 
-test("analytics emits one compact point without run content", () => {
+test("analytics emits one compact point without converting the plan into delivery evidence", () => {
   const points: unknown[] = [];
   const analytics = new WorkersAnalyticsEngineRunCost({
     writeDataPoint(point: unknown) {
@@ -109,4 +109,6 @@ test("analytics emits one compact point without run content", () => {
   assert.doesNotMatch(serialized, /invocation-secret-not-emitted/);
   assert.doesNotMatch(serialized, /prompt|output|repository/i);
   assert.match(serialized, /sha256:/);
+  assert.equal(cost.infrastructure.analytics_points_planned, 1);
+  assert.equal("analytics_points_written" in cost.infrastructure, false);
 });

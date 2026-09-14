@@ -17,8 +17,9 @@
 //! ## Workspace placement — container-native rustic-on-R2
 //!
 //! [`ManagedBackend::run`] places the workspace by reusing the pillbox's rustic
-//! repo: the host snapshots cwd into R2, POSTs `/v2/workspaces/provision` (repo config +
-//! password + snapshot) to restore it into the container `/workspace`, drives the
+//! repo: the host prepares and journals the first invocation, snapshots cwd into
+//! R2, then POSTs `/v2/workspaces/provision` (invocation/request identity + repo
+//! config + password + snapshot) to restore it into the container `/workspace`, drives the
 //! turn, then POSTs `/v2/workspaces/finalize` to snapshot `/workspace` back and records the
 //! result handle. The R2 creds + the repo password travel ONLY in those HTTPS
 //! bodies — never in argv, a log, a §0 event, or the persisted `Session` record
@@ -28,21 +29,20 @@
 //!
 //! ## Security boundary implemented
 //!
-//!   - **R2 key scoping.** When `PILLBOX_R2_CF_API_TOKEN` is set, `run` mints a
+//!   - **R2 key scoping.** `PILLBOX_R2_CF_API_TOKEN` is required; `run` mints a
 //!     short-lived, prefix-scoped R2 temp credential ([`r2_scope`], fresh per
 //!     transfer) and hands the managed runtime *that*, so a credential reaching
 //!     CF can touch only this run's prefix — and the bucket-wide parent *secret* never crosses
-//!     to CF (the Bearer API token authorizes the mint). With no token configured
-//!     the parent key still travels, but the exposure is announced loudly rather
-//!     than silently. The DO forwards the credential's `session_token` into the
-//!     container helper, which sends it as `X-Amz-Security-Token`.
+//!     to CF (the Bearer API token authorizes the mint). Missing authority or a
+//!     failed mint aborts before provisioning. The DO forwards the credential's
+//!     `session_token` into the container helper, which sends it as
+//!     `X-Amz-Security-Token`.
 //!
 //! ## Open follow-ups (flagged, not faked)
 //!
-//!   - **Detached finalize.** Only the foreground path is implemented (drive a
-//!     turn, wait for idle, finalize). For a `--detach` managed run the host
-//!     returns before the turn ends, so the in-container wrapper would own the
-//!     `/finalize` + result-handle emission instead.
+//!   - **Detached finalize.** Detached and no-prompt managed bring-up fail before
+//!     state or external access. Supporting them requires a future host-free
+//!     `/finalize` + result-handle owner.
 //!   - **Token provisioning / trust.** Where a real user's token/secret comes
 //!     from (vs the spike's `/tmp` file) is unresolved; the env config above is
 //!     the interim surface.
@@ -60,7 +60,36 @@ use crate::pillbox::Pillbox;
 use crate::session::{self, Session, BACKEND_MANAGED};
 use crate::workspace::WorkspaceBackend;
 
+mod execution_client;
+mod execution_contract;
+mod pending_journal;
+
 pub(crate) struct ManagedBackend;
+
+/// Proof that an agent is executable by the managed runtime. Keep this token
+/// private to the admission boundary so every managed run must pass the same
+/// support check before it can enter the workspace/Cloudflare path.
+struct SupportedManagedAgent<'a> {
+    spec: &'a AgentSpec,
+}
+
+/// The managed runtime currently drives OpenCode only. This is the one
+/// authoritative support check shared by the production run path and its
+/// executable preflight smoke.
+fn require_supported_agent(spec: &AgentSpec) -> Result<SupportedManagedAgent<'_>> {
+    if spec.id() != crate::agents::OPENCODE.id() {
+        return Err(PillboxError::usage(
+            "run",
+            format!(
+                "unsupported_execution: managed execution supports only agent `opencode`; \
+                 agent `{}` was rejected before workspace snapshot or external access",
+                spec.id()
+            ),
+        )
+        .into());
+    }
+    Ok(SupportedManagedAgent { spec })
+}
 
 impl SandboxBackend for ManagedBackend {
     /// The managed family exposes bounded agent turns, not a host PTY or a
@@ -95,6 +124,47 @@ impl SandboxBackend for ManagedBackend {
     /// This builds ONLY the host side — the DO/worker restore+snapshot is a
     /// separate build to the same frozen contract (see docs/managed-tier.md).
     fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
+        let supported = require_supported_agent(spec)?;
+        self.run_supported(supported, opts, resolved)
+    }
+}
+
+impl ManagedBackend {
+    /// Execute an admitted OpenCode run. Requiring the admission token keeps
+    /// snapshot, persistence, allowance, provisioning, and network operations
+    /// structurally behind the support check.
+    fn run_supported(
+        &self,
+        supported: SupportedManagedAgent<'_>,
+        opts: RunOpts,
+        resolved: &Pillbox,
+    ) -> Result<()> {
+        let prompt = opts.args.join(" ").trim().to_string();
+        if prompt.is_empty() {
+            return Err(PillboxError::usage(
+                "run",
+                "managed execution requires an initial prompt; no-prompt bring-up is unsupported",
+            )
+            .into());
+        }
+        if opts.detach {
+            return Err(PillboxError::usage(
+                "run",
+                "detached managed execution is unsupported until finalize-on-idle exists",
+            )
+            .into());
+        }
+        let session_id = crate::session::Session::new_id();
+        let model = opts
+            .model
+            .clone()
+            .unwrap_or_else(|| crate::sandbox::opencode::DEFAULT_MODEL.to_string());
+        let initial_input = format!("{prompt}\n");
+        // Persist the exact invocation identity before any workspace or remote
+        // side effect. Provision and the first execute consume this same request.
+        let prepared =
+            execution_client::prepare_initial_turn(resolved, &session_id, &initial_input, &model)?;
+
         // 1. Require an R2/S3 workspace backend. The DO restores from a rustic
         //    repo it can reach (R2), not the host's local-filesystem repo —
         //    refuse a local-backend pillbox loudly instead of silently running
@@ -120,7 +190,6 @@ impl SandboxBackend for ManagedBackend {
         // 3. Resolve the Worker origin, refusing a non-`https://` origin: the
         //    POST body carries the resolved R2 creds + the repo password, so it must
         //    never cross the wire in cleartext.
-        let session_id = crate::session::Session::new_id();
         let endpoint = resolve_https_origin()?;
 
         // 4. Provision with a capability bound to the exact credentialed body.
@@ -133,7 +202,11 @@ impl SandboxBackend for ManagedBackend {
         workspace_xfer::provision(
             &endpoint,
             &capability_secret,
-            &session_id,
+            workspace_xfer::ProvisionIdentity {
+                session_id: &session_id,
+                invocation_id: &prepared.pending.invocation_id,
+                execution_request_hash: &prepared.pending.request_hash,
+            },
             &provision_creds,
             &password,
             snapshot.as_str(),
@@ -146,10 +219,6 @@ impl SandboxBackend for ManagedBackend {
             endpoint: endpoint.clone(),
             execution_session_id: session_id.clone(),
         };
-        let model = opts
-            .model
-            .clone()
-            .unwrap_or_else(|| crate::sandbox::opencode::DEFAULT_MODEL.to_string());
         let session = Session {
             id: session_id.clone(),
             label: opts.label.clone(),
@@ -157,7 +226,7 @@ impl SandboxBackend for ManagedBackend {
             sandbox_id: serde_json::to_string(&handle)
                 .map_err(|e| PillboxError::config("run", format!("encode managed handle: {e}")))?,
             pty_pid: 0,
-            agent_id: spec.id.to_string(),
+            agent_id: supported.spec.id().to_string(),
             started_at: crate::session::now_rfc3339(),
             attached_pid: None,
             // The base the agent forked from — the snapshot the DO restored.
@@ -188,19 +257,8 @@ impl SandboxBackend for ManagedBackend {
 
         let live = ManagedLiveSession::new(session.clone());
 
-        // 6. Drive the first turn through the bounded execution API. The
-        //    initial prompt is the agent's positional args; with none, leave the
-        //    session ready for `session send` and return (detached-style).
-        let prompt = opts.args.join(" ").trim().to_string();
-        if prompt.is_empty() {
-            crate::sandbox::opencode::print_started(&session, opts.json, None);
-            // FOLLOW-UP: a no-prompt managed run leaves the workspace provisioned
-            // but never finalized (no turn → no result). When the drive surface
-            // gains a host-free "finalize on idle", the in-container wrapper owns
-            // that; for now a no-prompt run is bring-up only.
-            return Ok(());
-        }
-        live.send(resolved, format!("{prompt}\n").as_bytes())?;
+        // 6. Drive the exact invocation prepared before provisioning.
+        live.send(resolved, initial_input.as_bytes())?;
 
         // 7. Snapshot `/workspace` back to R2; record the handle so
         //    `session pull <id>` can rehydrate the result.
@@ -243,11 +301,6 @@ impl SandboxBackend for ManagedBackend {
                 finished.id
             );
         }
-        // FOLLOW-UP (detached managed run): for `--detach` the host returns before
-        // the turn ends, so this host-side `/finalize` can't run. The in-container
-        // wrapper would finalize + emit the result handle to the §0 sink instead.
-        // This pass implements only the foreground path; `--detach` managed is
-        // flagged, not faked.
         Ok(())
     }
 }
@@ -343,7 +396,7 @@ impl LiveSession for ManagedLiveSession {
         let capability_secret = managed_capability_secret("session send")?;
         let text = String::from_utf8_lossy(bytes).into_owned();
         let model = self.session.server.as_ref().map(|s| s.model.as_str());
-        execution::execute_turn(
+        execution_client::execute_turn(
             resolved,
             &self.session.id,
             &handle.endpoint,
@@ -569,337 +622,6 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     out
 }
 
-/// One bounded managed execution call plus local evidence persistence.
-mod execution {
-    use std::io::Read as _;
-
-    use anyhow::{Context, Result};
-    use serde::Deserialize;
-    use sha2::{Digest, Sha256};
-
-    use crate::contract::{Custom, Event, Payload};
-    use crate::errors::PillboxError;
-    use crate::events::log::SessionLog;
-    use crate::pillbox::Pillbox;
-
-    #[derive(Deserialize)]
-    struct EvidencePage {
-        from: u64,
-        events: Vec<Payload>,
-        next: Option<u64>,
-    }
-
-    #[derive(Deserialize)]
-    struct ExecutionError {
-        code: String,
-        message: String,
-    }
-
-    #[derive(Deserialize)]
-    struct ExecutionResult {
-        invocation_id: String,
-        status: String,
-        evidence: EvidencePage,
-        #[serde(default)]
-        cost: Option<crate::cost::RunCostEnvelope>,
-        #[serde(default)]
-        error: Option<ExecutionError>,
-    }
-
-    pub(super) fn execute_turn(
-        resolved: &Pillbox,
-        session_id: &str,
-        endpoint: &str,
-        capability_secret: &str,
-        text: &str,
-        model: Option<&str>,
-    ) -> Result<()> {
-        let model = model.unwrap_or(crate::sandbox::opencode::DEFAULT_MODEL);
-        let (provider, model_id) = model.split_once('/').ok_or_else(|| {
-            PillboxError::config(
-                "session send",
-                format!("managed model must be provider/model, got `{model}`"),
-            )
-        })?;
-        let invocation_id = crate::session::Session::new_id();
-        let rendered_hash = format!("sha256:{:x}", Sha256::digest(text.as_bytes()));
-        let body = serde_json::json!({
-            "contract_version": "pillbox.execution/2",
-            "session_ref": { "session_id": session_id },
-            "invocation_id": invocation_id,
-            "idempotency_key": invocation_id,
-            "rendered_input": text,
-            "rendered_input_hash": rendered_hash,
-            "tool_policy": "deny_all",
-            "execution": {
-                "transport": {
-                    "harness": "opencode",
-                    "transport": "http",
-                    "harness_version": "managed-v2",
-                    "adapter_revision": "pillbox-cli-v2"
-                },
-                "requested": {
-                    "provider": provider,
-                    "model": model_id,
-                    "profile": null,
-                    "reasoning_effort": "medium"
-                },
-                "placement": "managed_container",
-                "context_renderer_revision": "pillbox-cli-v2"
-            },
-            "execution_policy_revision": "pillbox-managed-v2",
-            "output_format": { "type": "text", "retry_count": 0 }
-        });
-        let body = serde_json::to_string(&body).context("serialize managed execution request")?;
-        let body_hash = request_sha256(&body);
-
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(600))
-            .build()
-            .context("build managed execution http client")?;
-        let execute_token = super::mint_managed_capability(
-            "execute",
-            &body_hash,
-            Some(session_id),
-            Some(&invocation_id),
-            capability_secret,
-        );
-        let (mut result, mut response_bytes) = post_json(
-            &client,
-            &format!("{}/v2/executions", endpoint.trim_end_matches('/')),
-            &execute_token,
-            &body,
-        )?;
-        if result.invocation_id != invocation_id || result.evidence.from != 0 {
-            return Err(PillboxError::runtime(
-                "session send",
-                "managed execution response identity or evidence cursor mismatch",
-            )
-            .into());
-        }
-        let terminal_cost = result.cost.clone().ok_or_else(|| {
-            PillboxError::runtime(
-                "session send",
-                "managed terminal response omitted its required cost envelope",
-            )
-        })?;
-        if !terminal_cost.validate_untrusted(&result.status) {
-            return Err(PillboxError::runtime(
-                "session send",
-                "managed execution returned an invalid cost envelope",
-            )
-            .into());
-        }
-        let mut payloads = Vec::new();
-        payloads.append(&mut result.evidence.events);
-        validate_payloads(&payloads)?;
-        if payloads.len() > 2_000 || result.evidence.next.is_some_and(|next| next == 0) {
-            return Err(PillboxError::runtime(
-                "session send",
-                "managed execution evidence exceeded its bound or did not advance",
-            )
-            .into());
-        }
-        let mut cursor = result.evidence.next;
-        let mut pages = 1usize;
-        while let Some(after) = cursor {
-            if pages >= 20 || payloads.len() >= 2_000 {
-                return Err(PillboxError::runtime(
-                    "session send",
-                    "managed execution evidence exceeded the bounded page budget",
-                )
-                .into());
-            }
-            let status_body = serde_json::json!({
-                "contract_version": "pillbox.execution/2",
-                "invocation_id": result.invocation_id,
-                "evidence_after": after,
-                "evidence_limit": 100
-            });
-            let status_body =
-                serde_json::to_string(&status_body).context("serialize managed status request")?;
-            let status_hash = request_sha256(&status_body);
-            let status_token = super::mint_managed_capability(
-                "status",
-                &status_hash,
-                None,
-                Some(&result.invocation_id),
-                capability_secret,
-            );
-            let (mut page, page_bytes) = post_json(
-                &client,
-                &format!("{}/v2/executions/status", endpoint.trim_end_matches('/')),
-                &status_token,
-                &status_body,
-            )?;
-            response_bytes = response_bytes.checked_add(page_bytes).ok_or_else(|| {
-                PillboxError::runtime("session send", "managed response byte counter overflowed")
-            })?;
-            if response_bytes > 8 * 1024 * 1024 {
-                return Err(PillboxError::runtime(
-                    "session send",
-                    "managed execution responses exceeded 8 MiB in total",
-                )
-                .into());
-            }
-            if page.invocation_id != invocation_id
-                || page.status != result.status
-                || page.evidence.from != after
-                || page.cost.as_ref() != Some(&terminal_cost)
-            {
-                return Err(PillboxError::runtime(
-                    "session send",
-                    "managed execution response identity, cost, or evidence cursor mismatch",
-                )
-                .into());
-            }
-            if page.evidence.next.is_some_and(|next| next <= after) {
-                return Err(PillboxError::runtime(
-                    "session send",
-                    "managed execution evidence cursor did not advance",
-                )
-                .into());
-            }
-            validate_payloads(&page.evidence.events)?;
-            payloads.append(&mut page.evidence.events);
-            if payloads.len() > 2_000 {
-                return Err(PillboxError::runtime(
-                    "session send",
-                    "managed execution evidence exceeded 2000 events",
-                )
-                .into());
-            }
-            cursor = page.evidence.next;
-            pages += 1;
-        }
-
-        payloads.push(Payload::Custom(Custom {
-            name: "run_cost".into(),
-            payload: Some(serde_json::to_value(terminal_cost).expect("cost envelope serializes")),
-        }));
-        let events: Vec<_> = payloads
-            .into_iter()
-            .map(|payload| Event::session(session_id, payload))
-            .collect();
-        SessionLog::open(resolved, session_id)?.append(&events)?;
-
-        if result.status == "completed" {
-            return Ok(());
-        }
-        let detail = result.error.map_or_else(
-            || format!("managed execution ended with status {}", result.status),
-            |error| format!("{}: {}", error.code, error.message),
-        );
-        Err(PillboxError::runtime("session send", detail).into())
-    }
-
-    fn post_json(
-        client: &reqwest::blocking::Client,
-        url: &str,
-        token: &str,
-        body: &str,
-    ) -> Result<(ExecutionResult, usize)> {
-        let resp = client
-            .post(url)
-            .header("content-type", "application/json")
-            .bearer_auth(token)
-            .body(body.to_owned())
-            .send()
-            .with_context(|| format!("POST {url}"))?;
-        let status = resp.status();
-        let response =
-            read_capped(resp, 8 * 1024 * 1024).context("read managed execution response")?;
-        if !status.is_success() {
-            return Err(PillboxError::runtime(
-                "session send",
-                format!(
-                    "managed execution returned HTTP {status}: {}",
-                    capped(&response)
-                ),
-            )
-            .into());
-        }
-        let bytes = response.len();
-        let result = serde_json::from_str(&response).map_err(|error| {
-            anyhow::Error::from(PillboxError::runtime(
-                "session send",
-                format!("invalid managed execution response: {error}"),
-            ))
-        })?;
-        Ok((result, bytes))
-    }
-
-    fn request_sha256(body: &str) -> String {
-        format!("sha256:{:x}", Sha256::digest(body.as_bytes()))
-    }
-
-    fn read_capped(mut response: reqwest::blocking::Response, limit: u64) -> Result<String> {
-        let mut bytes = Vec::new();
-        response
-            .by_ref()
-            .take(limit + 1)
-            .read_to_end(&mut bytes)
-            .context("read response body")?;
-        if bytes.len() as u64 > limit {
-            return Err(PillboxError::runtime(
-                "session send",
-                format!("managed execution response exceeded {limit} bytes"),
-            )
-            .into());
-        }
-        String::from_utf8(bytes).context("managed execution response was not UTF-8")
-    }
-
-    fn validate_payloads(payloads: &[Payload]) -> Result<()> {
-        if payloads.iter().all(|payload| match payload {
-            Payload::MessageStart(_)
-            | Payload::MessageDelta(_)
-            | Payload::MessageEnd(_)
-            | Payload::ToolCall(_)
-            | Payload::Thinking(_) => true,
-            Payload::Usage(usage) => {
-                [
-                    usage.input_tokens,
-                    usage.output_tokens,
-                    usage.cache_read_input_tokens,
-                    usage.cache_creation_input_tokens,
-                ]
-                .into_iter()
-                .flatten()
-                .all(|tokens| tokens <= 10_000_000_000)
-                    && usage
-                        .cost_usd
-                        .is_none_or(|cost| cost.is_finite() && (0.0..=1_000_000.0).contains(&cost))
-            }
-            _ => false,
-        }) {
-            return Ok(());
-        }
-        Err(PillboxError::runtime(
-            "session send",
-            "managed execution returned a disallowed evidence event",
-        )
-        .into())
-    }
-
-    fn capped(value: &str) -> &str {
-        let mut end = value.len().min(2048);
-        while !value.is_char_boundary(end) {
-            end -= 1;
-        }
-        &value[..end]
-    }
-
-    #[cfg(test)]
-    mod tests {
-        #[test]
-        fn capped_stops_before_a_split_utf8_character() {
-            let value = format!("{}étail", "a".repeat(2047));
-            assert_eq!(super::capped(&value), "a".repeat(2047));
-        }
-    }
-}
-
 /// Container-native workspace transfer — the host half of the frozen R2/rustic
 /// placement contract (see docs/managed-tier.md). `provision` hands the DO the
 /// rustic-on-R2 coordinates so its container restores the snapshot into
@@ -943,7 +665,17 @@ mod workspace_xfer {
     struct ProvisionBody<'a> {
         #[serde(rename = "sessionId")]
         session_id: &'a str,
+        #[serde(rename = "invocationId")]
+        invocation_id: &'a str,
+        #[serde(rename = "executionRequestHash")]
+        execution_request_hash: &'a str,
         workspace: WorkspaceRepo<'a>,
+    }
+
+    pub(super) struct ProvisionIdentity<'a> {
+        pub(super) session_id: &'a str,
+        pub(super) invocation_id: &'a str,
+        pub(super) execution_request_hash: &'a str,
     }
 
     /// `POST <endpoint>/provision` — the DO restores `snapshot` from the R2 repo
@@ -952,13 +684,15 @@ mod workspace_xfer {
     pub(super) fn provision(
         endpoint: &str,
         capability_secret: &str,
-        session_id: &str,
+        identity: ProvisionIdentity<'_>,
         repo: &S3Config,
         password: &str,
         snapshot: &str,
     ) -> Result<()> {
         let body = serde_json::to_string(&ProvisionBody {
-            session_id,
+            session_id: identity.session_id,
+            invocation_id: identity.invocation_id,
+            execution_request_hash: identity.execution_request_hash,
             workspace: WorkspaceRepo {
                 repo,
                 password,
@@ -969,13 +703,13 @@ mod workspace_xfer {
         let token = super::mint_managed_capability(
             "workspace_provision",
             &request_sha256(&body),
-            Some(session_id),
-            None,
+            Some(identity.session_id),
+            Some(identity.invocation_id),
             capability_secret,
         );
         let resp = post(endpoint, "v2/workspaces/provision", &token, body)?;
         let status = resp.status();
-        if status.is_success() {
+        if status == reqwest::StatusCode::OK {
             return Ok(());
         }
         // The error text may echo our request; the DO is trusted not to reflect
@@ -998,7 +732,13 @@ mod workspace_xfer {
         password: &str,
         base_snapshot: &str,
     ) -> Result<String> {
-        let body = serde_json::to_string(&ProvisionBody {
+        #[derive(Serialize)]
+        struct FinalizeBody<'a> {
+            #[serde(rename = "sessionId")]
+            session_id: &'a str,
+            workspace: WorkspaceRepo<'a>,
+        }
+        let body = serde_json::to_string(&FinalizeBody {
             session_id,
             workspace: WorkspaceRepo {
                 repo,
@@ -1113,14 +853,16 @@ mod workspace_xfer {
             }
         }
 
-        /// The frozen `/provision` shape: `{workspace:{repo:<S3Config>,password,snapshot}}`
-        /// — the S3Config nested under `repo`, the password + snapshot handle as
-        /// siblings. The DO side is built to this exact JSON.
+        /// Provision binds the credentialed restore to one prepared execution:
+        /// `S3Config` is nested under `repo`, while the password and snapshot
+        /// handle are siblings. The DO side is built to this exact JSON.
         #[test]
         fn provision_body_serializes_to_the_frozen_shape() {
             let c = cfg();
             let body = serde_json::to_value(ProvisionBody {
                 session_id: "session-1",
+                invocation_id: "invocation-1",
+                execution_request_hash: "sha256:request",
                 workspace: WorkspaceRepo {
                     repo: &c,
                     password: "repo-pw",
@@ -1130,6 +872,8 @@ mod workspace_xfer {
             .unwrap();
 
             let ws = &body["workspace"];
+            assert_eq!(body["invocationId"], "invocation-1");
+            assert_eq!(body["executionRequestHash"], "sha256:request");
             assert_eq!(ws["password"], "repo-pw");
             assert_eq!(ws["snapshot"], "snap-handle");
             // The S3Config is nested verbatim under `repo` (its serde fields).
@@ -1149,6 +893,8 @@ mod workspace_xfer {
             c.session_token = Some("scoped-session-token".into());
             let body = serde_json::to_value(ProvisionBody {
                 session_id: "session-1",
+                invocation_id: "invocation-1",
+                execution_request_hash: "sha256:request",
                 workspace: WorkspaceRepo {
                     repo: &c,
                     password: "repo-pw",
@@ -1168,7 +914,13 @@ mod workspace_xfer {
         #[test]
         fn finalize_body_binds_the_base_snapshot() {
             let c = cfg();
-            let body = serde_json::to_value(ProvisionBody {
+            #[derive(serde::Serialize)]
+            struct FinalizeBody<'a> {
+                #[serde(rename = "sessionId")]
+                session_id: &'a str,
+                workspace: WorkspaceRepo<'a>,
+            }
+            let body = serde_json::to_value(FinalizeBody {
                 session_id: "session-1",
                 workspace: WorkspaceRepo {
                     repo: &c,
@@ -1191,13 +943,10 @@ mod workspace_xfer {
 /// When a Cloudflare API token is configured (`PILLBOX_R2_CF_API_TOKEN`), this
 /// mints a short-lived, **prefix-scoped** temp credential via R2's
 /// `temp-access-credentials` API and hands the DO *that* instead, so a credential
-/// reaching CF can touch only `bucket/<prefix>` for a bounded TTL. With no token
-/// configured the parent key still travels (unchanged behavior) but the exposure
-/// is announced once, loudly, instead of silently — the gap is visible, not faked.
+/// reaching CF can touch only `bucket/<prefix>` for a bounded TTL. The minting
+/// authority is mandatory: without it, the transfer fails before the parent key
+/// can cross to the managed plane.
 mod r2_scope {
-    use std::borrow::Cow;
-    use std::sync::Once;
-
     use anyhow::{Context, Result};
     use serde::{Deserialize, Serialize};
 
@@ -1205,9 +954,8 @@ mod r2_scope {
     use crate::workspace::rustic::S3Config;
 
     /// The CF API token that authorizes minting temp credentials (a Bearer token
-    /// with R2 read+write on the bucket). Absent ⇒ scoping is off and the parent
-    /// key travels; present ⇒ scoping is required (a mint failure is fatal, never
-    /// a silent fall-back to the bucket-wide key).
+    /// with R2 read+write on the bucket). It is the only accepted minting
+    /// authority; missing, non-Unicode, or blank values are configuration errors.
     const API_TOKEN_ENV: &str = "PILLBOX_R2_CF_API_TOKEN";
     /// Lifetime of a minted transfer credential. A credential is minted fresh
     /// *per transfer* (provision, then finalize), so it only has to outlive one
@@ -1220,35 +968,36 @@ mod r2_scope {
     /// Read + write: the DO both restores (GET) and snapshots back (PUT).
     const PERMISSION: &str = "object-read-write";
 
-    static WARNED_BUCKET_WIDE: Once = Once::new();
-
     /// Mint a fresh prefix-scoped temp credential for one workspace transfer
-    /// (provision or finalize) when scoping is configured, else borrow the parent
-    /// key (with a loud one-time warning). Called once per transfer so each
-    /// credential only spans a single round-trip — a long turn between provision
-    /// and finalize can't expire it.
+    /// (provision or finalize). Called once per transfer so each credential only
+    /// spans a single round-trip — a long turn between provision and finalize
+    /// can't expire it.
     ///
-    /// Fail-closed: with the API token set, scoping is *required* — a missing
-    /// account id or an empty repo prefix (nothing narrower than the bucket to
-    /// scope to) or a mint failure aborts the run rather than handing CF a
-    /// bucket-wide key dressed up as scoped.
-    pub(super) fn scope_for_transfer(parent: &S3Config) -> Result<Cow<'_, S3Config>> {
-        let Some(api_token) = configured_token() else {
-            // Only nudge toward scoping where it can actually apply — a non-R2
-            // S3 host (MinIO/Backblaze/native S3) has no CF temp-credential API,
-            // so the remediation would be inapplicable noise there.
-            if account_id_from_endpoint(&parent.endpoint).is_some() {
-                warn_bucket_wide();
-            }
-            return Ok(Cow::Borrowed(parent));
-        };
+    /// Fail-closed: a missing minting authority, missing account id, empty repo
+    /// prefix, mint failure, or unusable returned credential aborts the run. The
+    /// parent credential is never a return value from this boundary.
+    pub(super) fn scope_for_transfer(parent: &S3Config) -> Result<S3Config> {
+        let api_token = required_api_token()?;
+        scope_for_transfer_with(parent, &api_token, mint)
+    }
+
+    fn scope_for_transfer_with<M>(
+        parent: &S3Config,
+        api_token: &str,
+        mint_fn: M,
+    ) -> Result<S3Config>
+    where
+        M: FnOnce(&S3Config, &str, &str, &str) -> Result<S3Config>,
+    {
+        if api_token.trim().is_empty() {
+            return Err(missing_api_token_error().into());
+        }
         let account_id = account_id_from_endpoint(&parent.endpoint).ok_or_else(|| {
             PillboxError::config(
                 "run",
                 format!(
-                    "{API_TOKEN_ENV} is set (R2 credential scoping requested) but the R2 endpoint \
-                     `{}` isn't an `<account-id>.r2.cloudflarestorage.com` host, so the account id \
-                     can't be derived to mint a scoped credential",
+                    "managed workspace transfer requires an R2 endpoint of the form \
+                     `<account-id>.r2.cloudflarestorage.com`; `{}` cannot be scoped",
                     parent.endpoint
                 ),
             )
@@ -1256,39 +1005,44 @@ mod r2_scope {
         let cf_prefix = cf_key_prefix(&parent.prefix).ok_or_else(|| {
             PillboxError::config(
                 "run",
-                format!(
-                    "{API_TOKEN_ENV} is set (R2 credential scoping requested) but the workspace \
-                     repo prefix is empty, so a scoped credential would still be bucket-wide. Set \
-                     a non-empty workspace prefix, or unset {API_TOKEN_ENV} to accept bucket-wide \
-                     reach explicitly"
-                ),
+                "managed workspace transfer requires a non-empty R2 repo prefix; an empty \
+                 prefix would grant bucket-wide access",
             )
         })?;
-        let scoped = mint(parent, &api_token, &account_id, &cf_prefix)?;
-        Ok(Cow::Owned(scoped))
+        let scoped = mint_fn(parent, api_token.trim(), &account_id, &cf_prefix)?;
+        validate_scoped(parent, scoped)
     }
 
-    fn configured_token() -> Option<String> {
-        std::env::var(API_TOKEN_ENV)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
+    fn required_api_token() -> Result<String> {
+        required_api_token_value(std::env::var_os(API_TOKEN_ENV))
     }
 
-    fn warn_bucket_wide() {
-        WARNED_BUCKET_WIDE.call_once(|| {
-            eprintln!(
-                "pillbox: note: handing the managed plane a bucket-wide R2 credential. \
-                 Set {API_TOKEN_ENV} (a Cloudflare API token with R2 read+write) to mint a \
-                 short-lived, prefix-scoped credential instead."
-            );
-        });
+    fn required_api_token_value(value: Option<std::ffi::OsString>) -> Result<String> {
+        let token = value
+            .ok_or_else(missing_api_token_error)?
+            .into_string()
+            .map_err(|_| missing_api_token_error())?;
+        let token = token.trim();
+        if token.is_empty() {
+            return Err(missing_api_token_error().into());
+        }
+        Ok(token.to_string())
+    }
+
+    fn missing_api_token_error() -> PillboxError {
+        PillboxError::config(
+            "run",
+            format!(
+                "{API_TOKEN_ENV} is required for managed workspace transfer; it must authorize \
+                 a fresh prefix-scoped R2 credential mint"
+            ),
+        )
     }
 
     /// Parse the R2 account id out of an `<account-id>.r2.cloudflarestorage.com`
     /// endpoint (with or without scheme / trailing path). `None` for any other
-    /// S3-compatible host (MinIO, Backblaze, native S3) — those have no CF
-    /// temp-credential API, so scoping doesn't apply.
+    /// S3-compatible host (MinIO, Backblaze, native S3), which the managed R2
+    /// transfer boundary rejects because it cannot mint a scoped credential.
     fn account_id_from_endpoint(endpoint: &str) -> Option<String> {
         const SUFFIX: &str = ".r2.cloudflarestorage.com";
         let after_scheme = endpoint
@@ -1372,21 +1126,24 @@ mod r2_scope {
     /// token swapped in. Fail-closed — a non-`success` envelope or any missing /
     /// empty credential field is an error, never a partial credential.
     fn parse_scoped(body: &str, parent: &S3Config) -> Result<S3Config> {
-        let env: TempCredEnvelope = serde_json::from_str(body)
-            .with_context(|| format!("parse R2 temp-credential response: {body}"))?;
+        let env: TempCredEnvelope =
+            serde_json::from_str(body).context("parse R2 temp-credential response")?;
         if !env.success {
             return Err(PillboxError::runtime(
                 "run",
-                format!("R2 temp-credential mint failed: {:?}", env.errors),
+                format!(
+                    "R2 temp-credential mint was rejected by Cloudflare ({} error(s))",
+                    env.errors.len()
+                ),
             )
             .into());
         }
         let cred = env.result.ok_or_else(|| {
             PillboxError::runtime("run", "R2 temp-credential response had no `result`")
         })?;
-        if cred.access_key_id.is_empty()
-            || cred.secret_access_key.is_empty()
-            || cred.session_token.is_empty()
+        if cred.access_key_id.trim().is_empty()
+            || cred.secret_access_key.trim().is_empty()
+            || cred.session_token.trim().is_empty()
         {
             return Err(PillboxError::runtime(
                 "run",
@@ -1403,6 +1160,25 @@ mod r2_scope {
             secret_key: cred.secret_access_key,
             session_token: Some(cred.session_token),
         })
+    }
+
+    fn validate_scoped(parent: &S3Config, scoped: S3Config) -> Result<S3Config> {
+        let has_session_token = scoped
+            .session_token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty());
+        let fresh_key = scoped.access_key != parent.access_key
+            && scoped.secret_key != parent.secret_key
+            && !scoped.access_key.trim().is_empty()
+            && !scoped.secret_key.trim().is_empty();
+        if !has_session_token || !fresh_key {
+            return Err(PillboxError::runtime(
+                "run",
+                "R2 temp-credential mint did not return a fresh scoped credential",
+            )
+            .into());
+        }
+        Ok(scoped)
     }
 
     /// `POST <api>/accounts/<id>/r2/temp-access-credentials` — mint a scoped
@@ -1433,7 +1209,7 @@ mod r2_scope {
         if !status.is_success() {
             return Err(PillboxError::runtime(
                 "run",
-                format!("R2 temp-credential mint returned HTTP {status}: {text}"),
+                format!("R2 temp-credential mint returned HTTP {status}"),
             )
             .into());
         }
@@ -1466,7 +1242,8 @@ mod r2_scope {
                 account_id_from_endpoint("abc123.r2.cloudflarestorage.com/ws"),
                 Some("abc123".to_string())
             );
-            // Not an R2 host → no scoping (MinIO/Backblaze/native S3).
+            // Not an R2 host → the managed transfer boundary rejects it because
+            // Cloudflare cannot mint a scoped credential for that endpoint.
             assert_eq!(account_id_from_endpoint("https://s3.amazonaws.com"), None);
             assert_eq!(account_id_from_endpoint("https://minio.local:9000"), None);
             // A sub-subdomain isn't a bare account id.
@@ -1474,6 +1251,98 @@ mod r2_scope {
                 account_id_from_endpoint("https://x.abc123.r2.cloudflarestorage.com"),
                 None
             );
+        }
+
+        #[test]
+        fn minting_authority_is_required_and_must_be_usable_text() {
+            let missing = required_api_token_value(None).expect_err("missing token must fail");
+            assert!(missing.to_string().contains(API_TOKEN_ENV));
+
+            let blank =
+                required_api_token_value(Some("  \n".into())).expect_err("blank token must fail");
+            assert!(blank.to_string().contains(API_TOKEN_ENV));
+
+            assert_eq!(
+                required_api_token_value(Some("  mint-authority  ".into())).unwrap(),
+                "mint-authority"
+            );
+        }
+
+        #[test]
+        fn scope_rejects_non_r2_and_bucket_wide_repositories_before_mint() {
+            let mut non_r2 = parent();
+            non_r2.endpoint = "https://s3.amazonaws.com".into();
+            let err = scope_for_transfer_with(&non_r2, "mint-authority", |_, _, _, _| {
+                panic!("invalid endpoint must fail before mint")
+            })
+            .expect_err("non-R2 endpoint must fail closed");
+            assert!(err.to_string().contains("cannot be scoped"));
+
+            let mut bucket_wide = parent();
+            bucket_wide.prefix = "/".into();
+            let err = scope_for_transfer_with(&bucket_wide, "mint-authority", |_, _, _, _| {
+                panic!("empty prefix must fail before mint")
+            })
+            .expect_err("bucket-wide prefix must fail closed");
+            assert!(err.to_string().contains("bucket-wide access"));
+        }
+
+        #[test]
+        fn scope_propagates_api_failure_without_parent_fallback() {
+            let err = scope_for_transfer_with(&parent(), "mint-authority", |_, _, _, _| {
+                Err(PillboxError::runtime("run", "mint API unavailable").into())
+            })
+            .expect_err("mint failure must abort the transfer");
+            assert!(err.to_string().contains("mint API unavailable"));
+        }
+
+        #[test]
+        fn scope_returns_only_a_fresh_prefix_scoped_credential() {
+            let original = parent();
+            let scoped = scope_for_transfer_with(
+                &original,
+                " mint-authority ",
+                |received_parent, token, account_id, prefix| {
+                    assert_eq!(received_parent.secret_key, "PARENT_SK");
+                    assert_eq!(token, "mint-authority");
+                    assert_eq!(account_id, "abc123");
+                    assert_eq!(prefix, "proj/");
+                    Ok(S3Config {
+                        access_key: "TMP_AK".into(),
+                        secret_key: "TMP_SK".into(),
+                        session_token: Some("TMP_ST".into()),
+                        ..received_parent.clone()
+                    })
+                },
+            )
+            .expect("fresh scoped credential accepted");
+
+            assert_eq!(scoped.access_key, "TMP_AK");
+            assert_eq!(scoped.secret_key, "TMP_SK");
+            assert_eq!(scoped.session_token.as_deref(), Some("TMP_ST"));
+            assert_ne!(scoped.access_key, original.access_key);
+            assert_ne!(scoped.secret_key, original.secret_key);
+        }
+
+        #[test]
+        fn scope_rejects_a_minter_returning_parent_or_incomplete_credentials() {
+            let original = parent();
+            let err = scope_for_transfer_with(&original, "mint-authority", |parent, _, _, _| {
+                Ok(parent.clone())
+            })
+            .expect_err("parent credential must never cross the boundary");
+            assert!(err.to_string().contains("fresh scoped credential"));
+
+            let err = scope_for_transfer_with(&original, "mint-authority", |parent, _, _, _| {
+                Ok(S3Config {
+                    access_key: "TMP_AK".into(),
+                    secret_key: "TMP_SK".into(),
+                    session_token: Some("  ".into()),
+                    ..parent.clone()
+                })
+            })
+            .expect_err("blank session token must fail closed");
+            assert!(err.to_string().contains("fresh scoped credential"));
         }
 
         #[test]
@@ -1517,11 +1386,16 @@ mod r2_scope {
 
         #[test]
         fn parse_scoped_fails_closed_on_unsuccess_or_missing_fields() {
-            let failed = r#"{"success":false,"errors":[{"message":"bad token"}],"result":null}"#;
-            assert!(parse_scoped(failed, &parent()).is_err());
+            let failed = r#"{"success":false,"errors":[{"message":"SENSITIVE"}],"result":null}"#;
+            let err = parse_scoped(failed, &parent()).expect_err("rejection must fail");
+            assert!(!err.to_string().contains("SENSITIVE"));
+
+            let malformed = r#"{"result":{"secretAccessKey":"SENSITIVE"}"#;
+            let err = parse_scoped(malformed, &parent()).expect_err("malformed JSON must fail");
+            assert!(!err.to_string().contains("SENSITIVE"));
             // success but a blank credential field is not a usable credential.
             let blank = r#"{"success":true,"errors":[],
-                "result":{"accessKeyId":"TMP_AK","secretAccessKey":"","sessionToken":"TMP_ST"}}"#;
+                "result":{"accessKeyId":"TMP_AK","secretAccessKey":"  ","sessionToken":"TMP_ST"}}"#;
             assert!(parse_scoped(blank, &parent()).is_err());
         }
     }
@@ -1530,6 +1404,107 @@ mod r2_scope {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run_opts() -> RunOpts {
+        RunOpts {
+            workspace: None,
+            name: None,
+            mounts: Vec::new(),
+            withs: Vec::new(),
+            env_bundles: Vec::new(),
+            env_files: Vec::new(),
+            vault: false,
+            memory: false,
+            memory_briefed: Vec::new(),
+            mcps: Vec::new(),
+            mcp_tokens: Vec::new(),
+            args: vec!["must-not-run".into()],
+            detach: false,
+            label: None,
+            json: false,
+            ttl_seconds: None,
+            from_bookmark: None,
+            model: None,
+            profile: None,
+            reasoning_effort: None,
+            temperature: None,
+            egress_allow: Vec::new(),
+            egress_deny: false,
+        }
+    }
+
+    #[test]
+    fn managed_support_contract_accepts_only_opencode() {
+        assert_eq!(
+            require_supported_agent(&crate::agents::OPENCODE)
+                .expect("OpenCode remains the managed executable")
+                .spec
+                .id(),
+            "opencode"
+        );
+        for unsupported in [
+            &crate::agents::CLAUDE,
+            &crate::agents::CODEX,
+            &crate::agents::CODEX_SERVE,
+            &crate::agents::PI,
+            &crate::agents::CURSOR,
+        ] {
+            let error = require_supported_agent(unsupported)
+                .err()
+                .expect("every other managed agent must fail closed");
+            assert!(error.to_string().contains("unsupported_execution"));
+        }
+    }
+
+    /// Exercise the actual `SandboxBackend::run` boundary with no initialized
+    /// workspace or managed credentials. The only successful route to this
+    /// exact error is the first-line support gate: moving or bypassing it makes
+    /// the poison fixture fail on workspace/config access and this test red.
+    #[test]
+    fn unsupported_codex_run_rejects_before_any_managed_side_effect() {
+        crate::test_util::with_isolated_home("managed-agent-preflight", || {
+            let resolved = crate::pillbox::global();
+            assert!(!resolved.state_dir.exists());
+            std::env::remove_var("PILLBOX_MANAGED_URL");
+            std::env::remove_var("PILLBOX_MANAGED_DO_URL");
+            std::env::remove_var("PILLBOX_MANAGED_TOKEN_SECRET");
+            std::env::remove_var("PILLBOX_R2_CF_API_TOKEN");
+
+            let error = ManagedBackend
+                .run(&crate::agents::CODEX, run_opts(), &resolved)
+                .expect_err("managed Codex must be rejected");
+            let message = error.to_string();
+            assert!(message.contains("unsupported_execution"), "{message}");
+            assert!(message.contains("before workspace snapshot or external access"));
+            assert!(
+                !resolved.state_dir.exists(),
+                "preflight must not persist a session, snapshot, or other state"
+            );
+        });
+    }
+
+    #[test]
+    fn no_prompt_and_detach_reject_before_managed_state_or_external_access() {
+        for name in ["managed-no-prompt", "managed-detach"] {
+            crate::test_util::with_isolated_home(name, || {
+                let resolved = crate::pillbox::global();
+                let mut opts = run_opts();
+                if name == "managed-no-prompt" {
+                    opts.args.clear();
+                } else {
+                    opts.detach = true;
+                }
+                let error = ManagedBackend
+                    .run(&crate::agents::OPENCODE, opts, &resolved)
+                    .expect_err("unsupported managed lifecycle must fail closed");
+                assert!(error.to_string().contains("unsupported"));
+                assert!(
+                    !resolved.state_dir.exists(),
+                    "lifecycle preflight must precede session, snapshot, and credential state"
+                );
+            });
+        }
+    }
 
     /// HMAC-SHA256 against the RFC 4231 Test Case 2 vector
     /// (key=`"Jefe"`, data=`"what do ya want for nothing?"`) — proves our

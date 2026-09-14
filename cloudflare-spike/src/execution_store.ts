@@ -4,6 +4,7 @@ import type {
   ExecutionDigest,
   InvocationRequestHash,
 } from "./codex_execution.js";
+import type { ManagedExecutionOwner } from "./managed_ownership.js";
 
 export type ExecutionStatus =
   | "running"
@@ -19,6 +20,7 @@ export interface ExecutionRecord {
   readonly execution_digest: ExecutionDigest;
   readonly execution_policy_revision: string;
   readonly session_id: string;
+  readonly owner: ManagedExecutionOwner;
   readonly attribution: ExecutionAttribution;
   readonly status: ExecutionStatus;
   readonly owner_token: string;
@@ -35,6 +37,9 @@ export interface ExecutionClaimInput {
   readonly execution_digest: ExecutionDigest;
   readonly execution_policy_revision: string;
   readonly session_id: string;
+  readonly owner: ManagedExecutionOwner;
+  readonly allowance_epoch: string;
+  readonly allowance_limit: number;
   readonly attribution: ExecutionAttribution;
   readonly owner_token: string;
   readonly now_ms: number;
@@ -44,20 +49,27 @@ export interface ExecutionClaimInput {
 export type ExecutionClaim =
   | { readonly kind: "created"; readonly record: ExecutionRecord }
   | { readonly kind: "reused"; readonly record: ExecutionRecord }
-  | { readonly kind: "conflict"; readonly record: ExecutionRecord };
+  | { readonly kind: "conflict"; readonly record: ExecutionRecord }
+  | { readonly kind: "unavailable" };
 
 export interface FinishExecutionInput {
   readonly invocation_id: string;
   readonly request_hash: InvocationRequestHash;
   readonly owner_token: string;
+  readonly owner: ManagedExecutionOwner;
   readonly status: Exclude<ExecutionStatus, "running">;
   readonly artifact_ref: ExecutionArtifactRef;
   readonly now_ms: number;
 }
 
 export interface ExecutionStore {
-  claim(input: ExecutionClaimInput): Promise<ExecutionClaim>;
-  get(invocation_id: string): Promise<ExecutionRecord | null>;
+  claim(
+    input: ExecutionClaimInput,
+  ): Promise<ExecutionClaim>;
+  get(
+    invocation_id: string,
+    owner: ManagedExecutionOwner,
+  ): Promise<ExecutionRecord | null>;
   finish(input: FinishExecutionInput): Promise<boolean>;
 }
 
@@ -94,6 +106,8 @@ interface ExecutionRow {
   execution_digest: ExecutionDigest;
   execution_policy_revision: string;
   session_id: string;
+  owner_domain: ManagedExecutionOwner["domain"];
+  owner_digest: `sha256:${string}`;
   harness: ExecutionAttribution["harness"];
   transport: string;
   requested_model: string;
@@ -111,7 +125,7 @@ interface ExecutionRow {
 const SELECT_COLUMNS = `
   invocation_id, idempotency_key, request_hash, execution_digest,
   execution_policy_revision, session_id, harness, transport, requested_model,
-  status, owner_token,
+  owner_domain, owner_digest, status, owner_token,
   lease_expires_at_ms, created_at_ms, updated_at_ms,
   artifact_key, artifact_media_type, artifact_bytes, artifact_sha256
 `;
@@ -128,52 +142,70 @@ export class D1ExecutionStore implements ExecutionStore {
     this.observeUsage = observeUsage;
   }
 
-  async claim(input: ExecutionClaimInput): Promise<ExecutionClaim> {
-    const byInvocation = await this.get(input.invocation_id);
+  async claim(
+    input: ExecutionClaimInput,
+  ): Promise<ExecutionClaim> {
+    const byInvocation = await this.get(input.invocation_id, input.owner);
     if (byInvocation !== null) return classifyClaim(byInvocation, input);
 
-    const inserted = await this.run(
-      `INSERT OR IGNORE INTO execution (
+    let inserted: RelationalResult;
+    try {
+      inserted = await this.run(
+        `INSERT OR IGNORE INTO execution (
         invocation_id, idempotency_key, request_hash, execution_digest,
         execution_policy_revision, session_id, harness, transport,
-        requested_model, status, owner_token,
-        lease_expires_at_ms, created_at_ms, updated_at_ms
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?)`,
-      [
-        input.invocation_id,
-        input.idempotency_key,
-        input.request_hash,
-        input.execution_digest,
-        input.execution_policy_revision,
-        input.session_id,
-        input.attribution.harness,
-        input.attribution.transport,
-        input.attribution.requested_model,
-        input.owner_token,
-        input.lease_expires_at_ms,
-        input.now_ms,
-        input.now_ms,
-      ],
-    );
-    if ((inserted.meta?.changes ?? 0) === 1) {
+        requested_model, owner_domain, owner_digest, status, owner_token,
+        lease_expires_at_ms, created_at_ms, updated_at_ms,
+        allowance_epoch, allowance_limit
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)`,
+        [
+          input.invocation_id,
+          input.idempotency_key,
+          input.request_hash,
+          input.execution_digest,
+          input.execution_policy_revision,
+          input.session_id,
+          input.attribution.harness,
+          input.attribution.transport,
+          input.attribution.requested_model,
+          input.owner.domain,
+          input.owner.digest,
+          input.owner_token,
+          input.lease_expires_at_ms,
+          input.now_ms,
+          input.now_ms,
+          input.allowance_epoch,
+          input.allowance_limit,
+        ],
+      );
+    } catch (cause) {
+      if (String(cause).includes("managed_execution_reservation_unavailable")) return { kind: "unavailable" };
+      throw cause;
+    }
+    if ((inserted.meta?.changes ?? 0) > 0) {
       return { kind: "created", record: recordFromClaim(input) };
     }
 
     // A concurrent claim or the unique idempotency key won. Both lookups are
     // indexed and bounded to one row; there is deliberately no scan fallback.
     const winner =
-      (await this.get(input.invocation_id)) ??
-      (await this.getByIdempotencyKey(input.idempotency_key));
+      (await this.get(input.invocation_id, input.owner)) ??
+      (await this.getByIdempotencyKey(input.idempotency_key, input.owner));
     if (winner === null) {
-      throw new Error("execution claim lost without an indexed winning row");
+      return { kind: "unavailable" };
     }
     return classifyClaim(winner, input);
   }
 
-  async get(invocation_id: string): Promise<ExecutionRecord | null> {
+  async get(
+    invocation_id: string,
+    owner: ManagedExecutionOwner,
+  ): Promise<ExecutionRecord | null> {
     return this.queryOne(
-      `SELECT ${SELECT_COLUMNS} FROM execution WHERE invocation_id = ? LIMIT 1`,
-      [invocation_id],
+      `SELECT ${SELECT_COLUMNS} FROM execution
+       WHERE invocation_id = ? AND owner_domain = ? AND owner_digest = ? LIMIT 1`,
+      [invocation_id, owner.domain, owner.digest],
     );
   }
 
@@ -183,7 +215,7 @@ export class D1ExecutionStore implements ExecutionStore {
         status = ?, artifact_key = ?, artifact_media_type = ?,
         artifact_bytes = ?, artifact_sha256 = ?, updated_at_ms = ?
       WHERE invocation_id = ? AND request_hash = ? AND owner_token = ?
-        AND status = 'running'`,
+        AND owner_domain = ? AND owner_digest = ? AND status = 'running'`,
       [
         input.status,
         input.artifact_ref.key,
@@ -194,6 +226,8 @@ export class D1ExecutionStore implements ExecutionStore {
         input.invocation_id,
         input.request_hash,
         input.owner_token,
+        input.owner.domain,
+        input.owner.digest,
       ],
     );
     return (result.meta?.changes ?? 0) === 1;
@@ -201,10 +235,12 @@ export class D1ExecutionStore implements ExecutionStore {
 
   private async getByIdempotencyKey(
     idempotency_key: string,
+    owner: ManagedExecutionOwner,
   ): Promise<ExecutionRecord | null> {
     return this.queryOne(
-      `SELECT ${SELECT_COLUMNS} FROM execution WHERE idempotency_key = ? LIMIT 1`,
-      [idempotency_key],
+      `SELECT ${SELECT_COLUMNS} FROM execution
+       WHERE idempotency_key = ? AND owner_domain = ? AND owner_digest = ? LIMIT 1`,
+      [idempotency_key, owner.domain, owner.digest],
     );
   }
 
@@ -255,6 +291,7 @@ function recordFromClaim(input: ExecutionClaimInput): ExecutionRecord {
     execution_digest: input.execution_digest,
     execution_policy_revision: input.execution_policy_revision,
     session_id: input.session_id,
+    owner: input.owner,
     attribution: input.attribution,
     status: "running",
     owner_token: input.owner_token,
@@ -284,6 +321,7 @@ function recordFromRow(row: ExecutionRow): ExecutionRecord {
     execution_digest: row.execution_digest,
     execution_policy_revision: row.execution_policy_revision,
     session_id: row.session_id,
+    owner: { domain: row.owner_domain, digest: row.owner_digest },
     attribution: {
       harness: row.harness,
       transport: row.transport,

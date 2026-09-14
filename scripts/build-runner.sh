@@ -21,7 +21,8 @@ cd "$(dirname "$0")/.."
 
 DOCKERFILE=runner/Dockerfile
 TAG=pillbox-runner:dev   # moving dev tag — every local script + a dev pillbox.toml default to it
-DO_UPDATE=0 DRY_RUN=0 NO_CACHE=0 PRUNE=0
+ROOTFS_CACHE_VERSION=v3  # mirrors ROOTFS_CACHE_VERSION in src/sandbox/libkrun/mod.rs
+DO_UPDATE=0 DRY_RUN=0 NO_CACHE=0 PRUNE=0 PRINT_ROOTFS_NAMESPACE=
 
 usage() {
 	cat <<'EOF'
@@ -35,6 +36,8 @@ Usage: scripts/build-runner.sh [options]
       --no-cache     force a clean rebuild (pass --no-cache to docker)
       --prune-rootfs after build, drop stale libkrun rootfs generations for this
                      tag (run only when no sessions are using the old image)
+      --print-rootfs-cache-namespace IMAGE
+                     print IMAGE's current cache namespace and exit (no build)
   -h, --help         this help
 
 After --update, review `git diff runner/Dockerfile` and commit the bumped pins.
@@ -47,12 +50,36 @@ while [ $# -gt 0 ]; do
 		--dry-run)       DRY_RUN=1 ;;
 		--no-cache)      NO_CACHE=1 ;;
 		--prune-rootfs)  PRUNE=1 ;;
+		--print-rootfs-cache-namespace)
+			PRINT_ROOTFS_NAMESPACE="${2:?--print-rootfs-cache-namespace needs an image}"
+			shift
+			;;
 		-t|--tag)        TAG="${2:?--tag needs a value}"; shift ;;
 		-h|--help)       usage; exit 0 ;;
 		*) echo "✗ unknown arg: $1" >&2; usage >&2; exit 2 ;;
 	esac
 	shift
 done
+
+sha256_text() {
+	if command -v sha256sum >/dev/null 2>&1; then
+		printf '%s' "$1" | sha256sum | awk '{print $1}'
+	elif command -v shasum >/dev/null 2>&1; then
+		printf '%s' "$1" | shasum -a 256 | awk '{print $1}'
+	else
+		echo "✗ sha256sum or shasum is required for rootfs cache identity" >&2
+		exit 1
+	fi
+}
+
+rootfs_namespace() {
+	printf '%s/%s\n' "$ROOTFS_CACHE_VERSION" "$(sha256_text "$1")"
+}
+
+if [ -n "$PRINT_ROOTFS_NAMESPACE" ]; then
+	rootfs_namespace "$PRINT_ROOTFS_NAMESPACE"
+	exit 0
+fi
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "✗ missing dependency: $1" >&2; exit 1; }; }
 need docker
@@ -110,6 +137,30 @@ args=(buildx build -f "$DOCKERFILE" -t "$TAG" --load)
 args+=(.)
 docker "${args[@]}"
 
+CODEX_VERSION_PIN=$(cur CODEX_VERSION)
+echo "▶ verifying the pinned Codex native package in $TAG:"
+docker run --rm --entrypoint sh -e EXPECTED_CODEX_VERSION="$CODEX_VERSION_PIN" "$TAG" -c '
+	set -eu
+	package_root="${CODEX_PACKAGE_ROOT:?CODEX_PACKAGE_ROOT is not set}"
+	expected_version="${EXPECTED_CODEX_VERSION:?EXPECTED_CODEX_VERSION is not set}"
+	manifest="$package_root/codex-package.json"
+	test -f "$manifest"
+	test "$(jq -er ".version | select(type == \"string\")" "$manifest")" = "$expected_version"
+	test "$(jq -er ".layoutVersion == 1" "$manifest")" = true
+	test "$(jq -er ".entrypoint == \"bin/codex\"" "$manifest")" = true
+	test "$(jq -er ".resourcesDir == \"codex-resources\"" "$manifest")" = true
+	test "$(jq -er ".pathDir == \"codex-path\"" "$manifest")" = true
+	test -x "$package_root/bin/codex"
+	test -x "$package_root/bin/codex-code-mode-host"
+	test -x "$package_root/codex-resources/zsh/bin/zsh"
+	test -x "$package_root/codex-path/rg"
+	test -L /usr/local/bin/codex
+	test -L /usr/local/bin/codex-code-mode-host
+	test "$(readlink -f /usr/local/bin/codex)" = "$package_root/bin/codex"
+	test "$(readlink -f /usr/local/bin/codex-code-mode-host)" = "$package_root/bin/codex-code-mode-host"
+	echo "  codex package: $expected_version + code-mode host + resources + path tools ✓"
+'
+
 echo "▶ agent versions baked into $TAG:"
 docker run --rm --entrypoint sh "$TAG" -c '
 	for a in claude codex amp opencode pi agent pillbox; do
@@ -118,17 +169,18 @@ docker run --rm --entrypoint sh "$TAG" -c '
 '
 
 # Each rebuild gives the image a new id, so libkrun re-materializes its rootfs
-# (~/.pillbox/krun/rootfs/<sanitized-tag>_<sanitized-id>/) on the next run and
-# the prior generation lingers. Opt-in prune drops generations for THIS tag that
-# don't match the freshly-built id — never the current one, never other tags.
+# (`~/.pillbox/krun/rootfs/v3/<sha256-tag>/<sanitized-id>/rootfs`) on the next
+# run and prior generations linger. Opt-in prune is confined to THIS tag's exact
+# v3 hash namespace. Legacy/v2 trees and other tags remain untouched.
 if [ "$PRUNE" = 1 ]; then
 	root="${HOME}/.pillbox/krun/rootfs"
 	if [ -d "$root" ]; then
 		san() { printf '%s' "$1" | sed 's/[^a-zA-Z0-9]/_/g'; }   # mirrors Rust sanitize()
 		new_id=$(docker image inspect "$TAG" --format '{{.Id}}')
-		keep="$(san "$TAG")_$(san "$new_id")"
+		namespace="$root/$(rootfs_namespace "$TAG")"
+		keep="$(san "$new_id")"
 		pruned=0
-		for d in "$root/$(san "$TAG")_sha256_"*; do
+		for d in "$namespace/sha256_"*; do
 			[ -d "$d" ] || continue
 			[ "$(basename "$d")" = "$keep" ] && continue
 			rm -rf "$d" && pruned=$((pruned + 1))

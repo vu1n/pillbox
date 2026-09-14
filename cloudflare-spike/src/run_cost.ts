@@ -19,7 +19,7 @@ export interface InfrastructureUsageCost {
   readonly r2_writes: number;
   readonly r2_bytes_read: number;
   readonly r2_bytes_written: number;
-  readonly analytics_points_written: number;
+  readonly analytics_points_planned: number;
   readonly sandbox_duration_ms: number;
   readonly sandbox_profile: string | null;
 }
@@ -129,7 +129,7 @@ export class RunCostMeter {
         r2_writes: this.r2Writes + (options.planned_r2_writes ?? 0),
         r2_bytes_read: this.r2BytesRead,
         r2_bytes_written: this.r2BytesWritten,
-        analytics_points_written: options.planned_analytics_points ?? 0,
+        analytics_points_planned: options.planned_analytics_points ?? 0,
         sandbox_duration_ms: Math.max(0, options.sandbox_duration_ms),
         sandbox_profile: options.sandbox_profile,
       },
@@ -186,7 +186,7 @@ export class WorkersAnalyticsEngineRunCost implements RunCostAnalytics {
         infra.r2_writes,
         infra.r2_bytes_read,
         infra.r2_bytes_written,
-        infra.analytics_points_written,
+        infra.analytics_points_planned,
         infra.sandbox_duration_ms,
       ],
     });

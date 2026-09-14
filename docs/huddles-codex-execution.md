@@ -50,10 +50,10 @@ changing Huddles orchestration or the deployment image.
 
 ## Versioned boundary
 
-Pillbox adds a private `pillbox.execution/2` contract in
-`cloudflare-spike/src/codex_execution.ts`. It is deliberately beside the
-historical OpenCode RPC; `ensureSession`/`invokeSession` remain as stateless
-compatibility adapters over the bounded D1/R2 execution service.
+Pillbox exposes the private `pillbox.execution/2` contract in
+`cloudflare-spike/src/codex_execution.ts` as its only managed Huddles RPC.
+Historical OpenCode `ensureSession`/`invokeSession` adapters remain available
+only through a local-test entrypoint that accepts no managed authorization.
 
 The v2 request binds the substrate execution identity to the exact invocation
 input and output contract:
@@ -95,20 +95,15 @@ and policy revision, a positional `SessionRef`, and Codex attribution
 `auth_unavailable`, `runtime_busy`, interruption, cancellation, or structured
 output failure without exposing provider diagnostics in the public result.
 
-## Integration contract still needed in Huddles
+## Huddles integration contract
 
 Huddles remains responsible for constructing and authorizing
 `InvocationExecution`, selecting and sealing the execution policy revision,
 workspace and effect identities, scheduling, retries, cancellation intent, and
-interpreting the result. Its future Pillbox adapter should call the v2 private
-method with the rendered input, input hash, output format, and sealed
+interpreting the result. Its Pillbox adapter calls the v2 private method with
+the rendered input, input hash, output format, and sealed
 `execution_policy_revision`; it should not derive a second execution profile or
 turn the policy revision into Pillbox orchestration.
-
-Until that adapter exists, Huddles must continue using the historical ensure
-RPC and provide its required top-level `requested_model` compatibility
-projection. The v2 invocation envelope does not replace or migrate the
-existing OpenCode ensure ledger.
 
 Pillbox is responsible for validating the boundary, enforcing the known policy
 before spawning Codex, launching the pinned app-server, normalizing

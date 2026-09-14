@@ -5,14 +5,10 @@
 //!
 //! This is the provider-agnostic **core**: the [`RefreshDecider`] contract plus the
 //! [`TokenStore::begin`] / [`RotateGuard`] commit-or-abort protocol. The core is
-//! agnostic to *who* forwards the grant — it hands the winner the refresh token and
-//! a lock-holding guard, and the caller forwards exactly once then commits/aborts.
-//! Two callers drive it: the host-side Claude **broker** (`super::refresh`), where
-//! pillbox itself POSTs the grant at run start so the guest never refreshes; and the
-//! in-proxy handler (codex, and the claude 401-retry fallback), which relays the
-//! guest's own `/oauth/token` request. Either way the store guarantees exactly one
-//! forward across all concurrent sessions sharing an account, and the rest coalesce
-//! on its result.
+//! agnostic to provider shape — it hands the host broker a refresh token and a
+//! lock-holding guard, and the broker forwards exactly once then commits/aborts.
+//! Both pre-run and JIT refresh enter through `super::refresh`; guest-owned token
+//! endpoint requests are rejected before any credential release.
 //!
 //! ## The invariant that makes it correct
 //!
@@ -23,9 +19,8 @@
 //! the lock (never a stale start-of-run copy); and a `pending` marker — the
 //! fingerprint of the **access token** being replaced — is fsync'd *before* the
 //! caller forwards. The access token is the sound signal because it lives in the
-//! atomic vendor creds file and always rotates; an expiry timestamp is not, since an
-//! in-proxy rotation need not update it. Across a crash, a timeout, or a wedged
-//! holder, no handler ever re-sends a token that may already be consumed: an
+//! atomic vendor creds file and always rotates. Across a crash, a timeout, or a
+//! wedged holder, no broker ever re-sends a token that may already be consumed: an
 //! ambiguous outcome (request sent, result unknown) resolves to **re-auth, not
 //! retry**.
 
@@ -43,9 +38,9 @@ use serde_json::Value;
 /// What a provider plugs in so the store can coordinate its refresh generically.
 /// The store owns the locking, the `pending` discipline, and the atomic write; the
 /// decider owns only the provider-specific *reads* — which field is the refresh
-/// token, which is the access token, and whether a forward is actually due. It
-/// never performs the rotation: the in-proxy handler forwards the guest's own
-/// `/oauth/token` request.
+/// token, which is the access token, and whether a forward is actually due. The
+/// sibling [`super::providers::OAuthCodec`] owns request construction and response
+/// application; only the host broker combines the two contracts into a rotation.
 pub(crate) trait RefreshDecider {
     /// Whether a forward is due for these on-disk creds — i.e. no peer has already
     /// advanced the access token past the one this caller is replacing. Re-evaluated
@@ -59,8 +54,7 @@ pub(crate) trait RefreshDecider {
 
     /// The access token in `creds` — the value the `pending` marker fingerprints.
     /// It always rotates and lives in the atomic creds file, so it is the sound
-    /// crash-safety signal (an expiry timestamp is not, since an in-proxy rotation
-    /// may not update it). `None` if absent/malformed (⇒ re-auth).
+    /// crash-safety signal. `None` if absent/malformed (⇒ re-auth).
     fn access_token(&self, creds: &Value) -> Option<String>;
 
     /// Whether the on-disk access token can still be used as a degraded lease when
@@ -147,7 +141,7 @@ impl TokenStore {
     /// Decide whether *this* caller should forward the refresh upstream, coalesce on
     /// a peer's result, or re-auth — and, when it should forward, hand back a
     /// [`RotateGuard`] that holds the lock across the forward and persists the
-    /// outcome. The single entry point the in-proxy refresh handler calls.
+    /// outcome. The host broker is the sole caller that may resolve a rotation.
     pub(crate) fn begin(&self, decider: &dyn RefreshDecider) -> Result<Begin> {
         let Some(lock) = self.lock_with_deadline()? else {
             return Ok(Begin::LockBusy);
@@ -266,40 +260,6 @@ impl TokenStore {
     fn write_state_durable(&self, state: &RotationState) -> Result<()> {
         write_atomic(&self.state_path, &state_bytes(state)?, true)
     }
-
-    fn write_creds_atomic(&self, creds: &Value) -> Result<()> {
-        write_atomic(&self.creds_path, &creds_bytes(creds)?, true)
-    }
-
-    /// Persist `creds` to the creds file **under the lock**, atomically, but ONLY if
-    /// `allow_overwrite(disk)` returns true for the current on-disk creds — the
-    /// teardown's guarded compare-and-swap, so an older session can't clobber a token
-    /// a peer rotated under it. Returns whether it wrote.
-    ///
-    /// Outcomes: `LockBusy` → `Ok(false)` (a refresh is mid-flight; its writer is the
-    /// authority — the teardown defers rather than block). A present, parseable disk →
-    /// `allow_overwrite(&disk)` decides. An **absent or unreadable** disk → `Ok(false)`
-    /// (skip): we can't confirm the compare-and-swap, so we don't write — that avoids
-    /// resurrecting a creds file a concurrent `auth rm` removed, and avoids a blind
-    /// overwrite on a transient read error. This is the teardown sibling of
-    /// [`begin`](Self::begin); the refresh path itself goes through `begin`.
-    pub(crate) fn persist_if(
-        &self,
-        creds: &Value,
-        allow_overwrite: &dyn Fn(&Value) -> bool,
-    ) -> Result<bool> {
-        let Some(_guard) = self.lock_with_deadline()? else {
-            return Ok(false);
-        };
-        let Ok(disk) = self.read_creds() else {
-            return Ok(false);
-        };
-        if allow_overwrite(&disk) {
-            self.write_creds_atomic(creds)?;
-            return Ok(true);
-        }
-        Ok(false)
-    }
 }
 
 /// The winner's handle for one rotation. Holds the cross-process flock for its whole
@@ -384,9 +344,8 @@ impl RotateGuard {
     ///
     /// `abort` does NOT distinguish "cleanly rejected" from "outcome unknown": both
     /// leave `pending` set and resolve the next `begin()` to re-auth. That's the only
-    /// safe move when the caller can't prove what reached the server — the in-proxy
-    /// handler forwards the guest's opaque request and is in exactly that position.
-    /// A caller that owns its own POST and can *prove* the token never went on the
+    /// safe move when the broker can't prove what reached the server. A broker that
+    /// owns its own POST and can *prove* the token never went on the
     /// wire (or was rejected without being issued) uses [`abort_intact`](Self::abort_intact)
     /// instead, so a transient blip on the every-run host-side pre-refresh doesn't
     /// brick the credential into forced re-auth.
@@ -904,81 +863,5 @@ mod tests {
         assert_eq!(fp.len(), 16); // 8 bytes hex
         assert_eq!(fingerprint("a"), fingerprint("a")); // stable
         assert_ne!(fingerprint("a"), fingerprint("b"));
-    }
-
-    // ── persist_if (the teardown's guarded compare-and-swap) ────────────────
-
-    fn disk_access_is(expected: &str) -> impl Fn(&Value) -> bool + '_ {
-        move |disk| disk.get("access").and_then(|v| v.as_str()) == Some(expected)
-    }
-
-    #[test]
-    fn persist_if_writes_when_predicate_allows() {
-        let (_d, store) = store_with(serde_json::json!({ "access": "AT0" }));
-        // CAS: disk access is still "AT0" (what we leased) → overwrite with ours.
-        let wrote = store
-            .persist_if(
-                &serde_json::json!({ "access": "AT1" }),
-                &disk_access_is("AT0"),
-            )
-            .unwrap();
-        assert!(wrote);
-        assert_eq!(store.read_creds().unwrap()["access"], "AT1");
-    }
-
-    #[test]
-    fn persist_if_skips_when_predicate_denies_no_clobber() {
-        // A peer rotated disk to AT_PEER; our CAS expected the leased "AT0" → deny.
-        let (_d, store) = store_with(serde_json::json!({ "access": "AT_PEER" }));
-        let wrote = store
-            .persist_if(
-                &serde_json::json!({ "access": "AT_MINE" }),
-                &disk_access_is("AT0"),
-            )
-            .unwrap();
-        assert!(!wrote);
-        // Disk is untouched — the peer's token is not clobbered.
-        assert_eq!(store.read_creds().unwrap()["access"], "AT_PEER");
-    }
-
-    #[test]
-    fn persist_if_skips_when_disk_absent() {
-        let dir = tempfile::tempdir().unwrap();
-        let creds_path = dir.path().join(".credentials.json");
-        let store = TokenStore::new(creds_path.clone(), Duration::from_secs(5));
-        // No disk file → can't confirm the CAS → skip (don't recreate a file a
-        // concurrent `auth rm` may have removed; predicate never consulted).
-        let wrote = store
-            .persist_if(&serde_json::json!({ "access": "AT1" }), &|_| true)
-            .unwrap();
-        assert!(!wrote);
-        assert!(
-            !creds_path.exists(),
-            "must not recreate an absent creds file"
-        );
-    }
-
-    #[test]
-    fn persist_if_skips_on_lock_busy() {
-        let (_d, store) = store_with_wait(
-            serde_json::json!({ "access": "AT0" }),
-            Duration::from_millis(100),
-        );
-        let held = fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&store.lock_path)
-            .unwrap();
-        assert_eq!(
-            unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
-        // Lock held by a peer (a refresh in flight) → defer, don't write.
-        let wrote = store
-            .persist_if(&serde_json::json!({ "access": "AT1" }), &|_| true)
-            .unwrap();
-        assert!(!wrote);
-        assert_eq!(store.read_creds().unwrap()["access"], "AT0");
     }
 }

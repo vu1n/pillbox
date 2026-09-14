@@ -36,8 +36,30 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use anyhow::{anyhow, Context, Result};
+
 use super::{Harness, Tailer};
 use crate::events::log::SessionLog;
+
+const MAX_DISCOVERY_DEPTH: usize = 8;
+const MAX_DISCOVERY_ENTRIES: usize = 4096;
+
+enum TailPersistence {
+    BestEffort(Option<SessionLog>),
+    Durable {
+        log: SessionLog,
+        cursor_path: PathBuf,
+    },
+}
+
+enum TailerJoin {
+    /// Streaming tailers report failures themselves because their transport
+    /// readers predate the file producer's process-health contract.
+    Infallible(JoinHandle<()>),
+    /// File-backed transcript producers return their terminal result so a
+    /// detached owner can couple process health to evidence health.
+    Producer(JoinHandle<Result<()>>),
+}
 
 /// Owns the background tailer thread for one local foreground run.
 /// Stopping is idempotent and happens on either [`shutdown`](Self::shutdown)
@@ -55,10 +77,32 @@ pub(crate) struct TailerHandle {
     /// EOF the read. `None` for the file-based local tailer, which self-stops
     /// via its poll timeout.
     stopper: Option<Box<dyn FnOnce() + Send>>,
-    join: Option<JoinHandle<()>>,
+    join: Option<TailerJoin>,
 }
 
 impl TailerHandle {
+    /// Spawn the sole reparented Codex producer with a session-local cursor.
+    pub(crate) fn spawn_detached(
+        log: SessionLog,
+        home: &Path,
+        agent_id: &str,
+        guest_cwd: &str,
+        session_id: &str,
+        cursor_path: PathBuf,
+    ) -> Option<Self> {
+        let harness = Harness::for_agent(agent_id)?;
+        let (watch_root, scope_dir) = harness.transcript_roots(home, guest_cwd);
+        Some(spawn_tailer(
+            TailPersistence::Durable { log, cursor_path },
+            watch_root,
+            scope_dir,
+            harness,
+            session_id.to_string(),
+            true,
+            Ok(HashSet::new()),
+        ))
+    }
+
     /// Wrap a tailer thread spawned elsewhere, given an explicit `stopper` that
     /// tears down whatever transport the thread is reading (a killed exec, a
     /// closed vsock). `stop` is the flag the thread observes between reads.
@@ -70,7 +114,7 @@ impl TailerHandle {
         Self {
             stop,
             stopper: Some(stopper),
-            join: Some(join),
+            join: Some(TailerJoin::Infallible(join)),
         }
     }
 
@@ -84,7 +128,47 @@ impl TailerHandle {
         Self {
             stop,
             stopper: None,
-            join: Some(join),
+            join: Some(TailerJoin::Infallible(join)),
+        }
+    }
+
+    /// Wait for the producer itself to terminate without requesting shutdown.
+    ///
+    /// Detached discovery uses this instead of parking its owner process: a
+    /// healthy watcher keeps this blocked, while a clean end, error, or panic
+    /// returns and lets the owner process exit so signal-0 health is truthful.
+    pub(crate) fn wait(mut self) -> Result<()> {
+        let join = self
+            .join
+            .take()
+            .ok_or_else(|| anyhow!("transcript producer join handle is unavailable"))?;
+        join.wait()
+    }
+
+    /// An ended producer is unhealthy while its consumer is still guarding a
+    /// live session, including a clean EOF. Join only after it has finished.
+    pub(crate) fn check_running(&mut self) -> Result<()> {
+        let join = self
+            .join
+            .as_ref()
+            .ok_or_else(|| anyhow!("transcript producer is no longer running"))?;
+        let finished = match join {
+            TailerJoin::Infallible(join) => join.is_finished(),
+            TailerJoin::Producer(join) => join.is_finished(),
+        };
+        if finished {
+            self.join.take().expect("checked above").wait()?;
+            anyhow::bail!("transcript producer ended while session was guarded");
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn finished_for_test(result: Result<()>) -> Self {
+        Self {
+            stop: Arc::new(AtomicBool::new(false)),
+            stopper: None,
+            join: Some(TailerJoin::Producer(std::thread::spawn(move || result))),
         }
     }
 
@@ -103,8 +187,39 @@ impl TailerHandle {
             stopper();
         }
         if let Some(join) = self.join.take() {
-            let _ = join.join();
+            if let Err(e) = join.wait() {
+                eprintln!("pillbox: warning: transcript tailer stopped: {e:#}");
+            }
         }
+    }
+}
+
+impl TailerJoin {
+    fn wait(self) -> Result<()> {
+        match self {
+            Self::Infallible(join) => join.join().map_err(|panic| {
+                anyhow!(
+                    "transcript tailer thread panicked: {}",
+                    panic_message(panic)
+                )
+            }),
+            Self::Producer(join) => join.join().map_err(|panic| {
+                anyhow!(
+                    "transcript producer thread panicked: {}",
+                    panic_message(panic)
+                )
+            })?,
+        }
+    }
+}
+
+fn panic_message(panic: Box<dyn std::any::Any + Send + 'static>) -> String {
+    if let Some(message) = panic.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = panic.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
     }
 }
 
@@ -137,7 +252,7 @@ pub(crate) fn spawn_local_tailer(
     // run creates, not a prior session's file in the same project dir.
     let preexisting = snapshot_jsonl(&watch_root);
     spawn_tailer(
-        log,
+        TailPersistence::BestEffort(log),
         watch_root,
         scope_dir,
         harness,
@@ -166,50 +281,72 @@ pub(crate) fn spawn_attach_tailer(
     // Read-side filler takes the concrete local session log used by every
     // placement.
     Some(spawn_tailer(
-        Some(log),
+        TailPersistence::BestEffort(Some(log)),
         watch_root,
         scope_dir,
         harness,
         session_id.to_string(),
         true,
-        HashSet::new(), // include existing — the session may already be running
+        Ok(HashSet::new()), // include existing — the session may already be running
     ))
 }
 
 /// Shared spawn: discover the transcript under `watch_root`/`scope_dir` (the
 /// newest not in `exclude`), then follow it into the sinks until stopped.
 fn spawn_tailer(
-    log: Option<SessionLog>,
+    persistence: TailPersistence,
     watch_root: PathBuf,
     scope_dir: Option<PathBuf>,
     harness: Harness,
     session_id: String,
     include_usage: bool,
-    exclude: HashSet<PathBuf>,
+    exclude: Result<HashSet<PathBuf>>,
 ) -> TailerHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_thread = Arc::clone(&stop);
 
-    let join = std::thread::spawn(move || {
+    let join = std::thread::spawn(move || -> Result<()> {
+        let exclude = exclude?;
+        let resumed = match &persistence {
+            TailPersistence::BestEffort(_) => None,
+            TailPersistence::Durable { cursor_path, .. } => {
+                Tailer::durable_source(cursor_path, &session_id)?
+            }
+        };
         let path = loop {
             if stop_thread.load(Ordering::Relaxed) {
-                return; // asked to stop before the transcript appeared
+                return Ok(()); // asked to stop before the transcript appeared
             }
-            if let Some(p) = find_new_jsonl(&watch_root, scope_dir.as_deref(), &exclude) {
-                break p;
+            if let Some(path) = resumed.as_ref() {
+                if std::fs::symlink_metadata(path)
+                    .is_ok_and(|metadata| metadata.file_type().is_file())
+                {
+                    break path.clone();
+                }
+            } else if let Some(path) = find_new_jsonl(&watch_root, scope_dir.as_deref(), &exclude)?
+            {
+                break path;
             }
             std::thread::sleep(Duration::from_millis(200));
         };
-        let mut tailer = Tailer::new(path, session_id, harness, include_usage, log);
-        if let Err(e) = tailer.follow_until(&stop_thread) {
-            eprintln!("pillbox: warning: transcript tailer stopped: {e:#}");
-        }
+        let mut tailer = match persistence {
+            TailPersistence::Durable { log, cursor_path } => {
+                Tailer::new_durable(path, session_id, harness, include_usage, log, cursor_path)?
+            }
+            TailPersistence::BestEffort(log) => {
+                Tailer::new(path, session_id, harness, include_usage, log)
+            }
+        };
+        tailer
+            .follow_until(&stop_thread)
+            .context("follow discovered transcript")?;
+        Ok(())
     });
 
     TailerHandle {
         stop,
         stopper: None,
-        join: Some(join),
+        join: Some(TailerJoin::Producer(join)),
     }
 }
 
@@ -272,10 +409,10 @@ fn mitm_emits_usage(harness: Harness, proxy_active: bool) -> bool {
 /// All `*.jsonl` paths under `root` (recursive). Empty if `root`
 /// doesn't exist or can't be read — discovery tolerates a not-yet-
 /// created transcript dir.
-fn snapshot_jsonl(root: &Path) -> HashSet<PathBuf> {
+fn snapshot_jsonl(root: &Path) -> Result<HashSet<PathBuf>> {
     let mut out = Vec::new();
-    collect_jsonl(root, &mut out);
-    out.into_iter().collect()
+    collect_jsonl(root, &mut out)?;
+    Ok(out.into_iter().collect())
 }
 
 /// The most-recently-modified `*.jsonl` under `root` that isn't in
@@ -293,10 +430,10 @@ fn find_new_jsonl(
     root: &Path,
     scope_dir: Option<&Path>,
     exclude: &HashSet<PathBuf>,
-) -> Option<PathBuf> {
+) -> Result<Option<PathBuf>> {
     let mut candidates = Vec::new();
-    collect_jsonl(root, &mut candidates);
-    candidates
+    collect_jsonl(root, &mut candidates)?;
+    Ok(candidates
         .into_iter()
         .filter(|p| !exclude.contains(p))
         .filter(|p| scope_dir.is_none_or(|d| p.starts_with(d)))
@@ -305,16 +442,37 @@ fn find_new_jsonl(
             Some((mtime, p))
         })
         .max_by(|(ta, pa), (tb, pb)| ta.cmp(tb).then_with(|| pa.cmp(pb)))
-        .map(|(_, p)| p)
+        .map(|(_, p)| p))
 }
 
 /// Recursively append every `*.jsonl` file under `dir` to `out`.
-/// Skips unreadable subdirectories silently (best-effort discovery).
-fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
+/// Skips unreadable subdirectories silently (best-effort discovery), but fails
+/// loud before crossing the finite tree depth or entry-count contract.
+fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    let mut entries_seen = 0;
+    collect_jsonl_at(dir, out, 0, &mut entries_seen)
+}
+
+fn collect_jsonl_at(
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    depth: usize,
+    entries_seen: &mut usize,
+) -> Result<()> {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+        return Ok(());
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        *entries_seen = entries_seen
+            .checked_add(1)
+            .context("transcript discovery entry count overflow")?;
+        if *entries_seen > MAX_DISCOVERY_ENTRIES {
+            anyhow::bail!(
+                "transcript discovery under {} exceeds {MAX_DISCOVERY_ENTRIES} entries",
+                dir.display()
+            );
+        }
         // `file_type()` is lstat-based — it does NOT follow symlinks. That is
         // load-bearing for security: the libkrun PTY tailer reads the guest-WRITABLE
         // creds clone (the agent home), so a compromised guest could plant symlinks
@@ -328,11 +486,18 @@ fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
         }
         let path = entry.path();
         if ft.is_dir() {
-            collect_jsonl(&path, out);
+            if depth >= MAX_DISCOVERY_DEPTH {
+                anyhow::bail!(
+                    "transcript discovery under {} exceeds {MAX_DISCOVERY_DEPTH} directory levels",
+                    path.display()
+                );
+            }
+            collect_jsonl_at(&path, out, depth + 1, entries_seen)?;
         } else if ft.is_file() && path.extension().is_some_and(|e| e == "jsonl") {
             out.push(path);
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -364,18 +529,18 @@ mod tests {
 
         let old = root.join("old-session.jsonl");
         fs::File::create(&old).unwrap();
-        let pre = snapshot_jsonl(dir.path());
+        let pre = snapshot_jsonl(dir.path()).unwrap();
         assert!(pre.contains(&old));
 
         // No new file yet.
-        assert_eq!(find_new_jsonl(dir.path(), None, &pre), None);
+        assert_eq!(find_new_jsonl(dir.path(), None, &pre).unwrap(), None);
 
         // Agent writes a new transcript.
         let fresh = root.join("new-session.jsonl");
         let mut f = fs::File::create(&fresh).unwrap();
         writeln!(f, "{{}}").unwrap();
 
-        assert_eq!(find_new_jsonl(dir.path(), None, &pre), Some(fresh));
+        assert_eq!(find_new_jsonl(dir.path(), None, &pre).unwrap(), Some(fresh));
     }
 
     #[test]
@@ -388,16 +553,19 @@ mod tests {
         fs::create_dir_all(&mine).unwrap();
         fs::create_dir_all(&theirs).unwrap();
 
-        let pre = snapshot_jsonl(dir.path()); // empty
-                                              // Sibling run's file appears first (newest mtime globally).
+        let pre = snapshot_jsonl(dir.path()).unwrap(); // empty
+                                                       // Sibling run's file appears first (newest mtime globally).
         fs::File::create(theirs.join("sibling.jsonl")).unwrap();
         // Scoped to my dir: sibling is invisible, so nothing yet.
-        assert_eq!(find_new_jsonl(dir.path(), Some(&mine), &pre), None);
+        assert_eq!(find_new_jsonl(dir.path(), Some(&mine), &pre).unwrap(), None);
 
         // My file appears; scoped discovery finds only it.
         let my_file = mine.join("mine.jsonl");
         fs::File::create(&my_file).unwrap();
-        assert_eq!(find_new_jsonl(dir.path(), Some(&mine), &pre), Some(my_file));
+        assert_eq!(
+            find_new_jsonl(dir.path(), Some(&mine), &pre).unwrap(),
+            Some(my_file)
+        );
     }
 
     #[test]
@@ -410,7 +578,7 @@ mod tests {
         fs::File::create(dir.path().join("top.jsonl")).unwrap();
 
         let mut out = Vec::new();
-        collect_jsonl(dir.path(), &mut out);
+        collect_jsonl(dir.path(), &mut out).unwrap();
         let names: HashSet<_> = out
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
@@ -434,14 +602,73 @@ mod tests {
         symlink(&secret, scan.join("link.jsonl")).unwrap(); // symlink → host .jsonl
         symlink(dir.path(), scan.join("up")).unwrap(); // symlink → parent dir
         let mut out = Vec::new();
-        collect_jsonl(&scan, &mut out);
+        collect_jsonl(&scan, &mut out).unwrap();
         assert!(out.is_empty(), "symlinks must not be collected: {out:?}");
+    }
+
+    #[test]
+    fn discovery_accepts_the_depth_limit_and_rejects_one_more_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut nested = dir.path().to_path_buf();
+        for depth in 0..MAX_DISCOVERY_DEPTH {
+            nested = nested.join(format!("d{depth}"));
+            fs::create_dir(&nested).unwrap();
+        }
+        let accepted = nested.join("accepted.jsonl");
+        fs::File::create(&accepted).unwrap();
+        let mut out = Vec::new();
+        collect_jsonl(dir.path(), &mut out).unwrap();
+        assert_eq!(out, vec![accepted]);
+
+        fs::create_dir(nested.join("too-deep")).unwrap();
+        let error = collect_jsonl(dir.path(), &mut Vec::new())
+            .expect_err("one directory past the depth limit must fail");
+        assert!(error
+            .to_string()
+            .contains(&format!("exceeds {MAX_DISCOVERY_DEPTH} directory levels")));
+    }
+
+    #[test]
+    fn discovery_accepts_the_entry_limit_and_rejects_one_more_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..MAX_DISCOVERY_ENTRIES {
+            fs::File::create(dir.path().join(format!("entry-{index}"))).unwrap();
+        }
+        collect_jsonl(dir.path(), &mut Vec::new()).unwrap();
+
+        fs::File::create(dir.path().join("entry-over-limit")).unwrap();
+        let error = collect_jsonl(dir.path(), &mut Vec::new())
+            .expect_err("one entry past the count limit must fail");
+        assert!(error
+            .to_string()
+            .contains(&format!("exceeds {MAX_DISCOVERY_ENTRIES} entries")));
     }
 
     #[test]
     fn snapshot_of_missing_dir_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("does-not-exist");
-        assert!(snapshot_jsonl(&missing).is_empty());
+        assert!(snapshot_jsonl(&missing).unwrap().is_empty());
+    }
+
+    #[test]
+    fn producer_wait_propagates_watcher_failure_with_context() {
+        let tailer = TailerHandle::finished_for_test(Err(anyhow!(
+            "watcher channel disconnected while following transcript"
+        )));
+
+        let error = tailer.wait().expect_err("watcher failure must propagate");
+
+        assert_eq!(
+            format!("{error:#}"),
+            "watcher channel disconnected while following transcript"
+        );
+    }
+
+    #[test]
+    fn producer_wait_returns_when_watcher_ends_cleanly() {
+        TailerHandle::finished_for_test(Ok(()))
+            .wait()
+            .expect("a clean watcher end must release its owner");
     }
 }

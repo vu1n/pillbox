@@ -81,6 +81,7 @@ export interface ExecuteInvocationV2Request {
 
 export type ExecuteInvocationV2ErrorCode =
   | "idempotency_conflict"
+  | "managed_disabled"
   | "unsupported_execution"
   | "unsupported_policy"
   | "auth_unavailable"
@@ -134,22 +135,31 @@ interface ExecuteInvocationV2ResultBase {
   readonly request_hash: InvocationRequestHash;
   readonly execution_digest: ExecutionDigest;
   readonly execution_policy_revision: string;
-  readonly session_ref: {
-    readonly session_id: string;
-    readonly seq_range?: readonly [number, number];
-  };
   readonly attribution: ExecutionAttribution;
   readonly evidence: ExecutionEvidencePage;
   readonly cost?: RunCostEnvelope;
 }
 
+export interface ExecutionResultSessionRef {
+  readonly session_id: string;
+  /** Inclusive positions in the bounded managed evidence artifact. */
+  readonly seq_range?: readonly [number, number];
+}
+
+export interface CompletedExecutionResultSessionRef extends ExecutionResultSessionRef {
+  /** A completed result always owns at least one immutable evidence position. */
+  readonly seq_range: readonly [number, number];
+}
+
 export type ExecuteInvocationV2Result =
   | (ExecuteInvocationV2ResultBase & {
       readonly status: "running";
+      readonly session_ref: ExecutionResultSessionRef;
       readonly retry_after_ms: number;
     })
   | (ExecuteInvocationV2ResultBase & {
       readonly status: "completed";
+      readonly session_ref: CompletedExecutionResultSessionRef;
       readonly output: {
         readonly text?: string;
         readonly json?: JsonValue;
@@ -157,6 +167,7 @@ export type ExecuteInvocationV2Result =
     })
   | (ExecuteInvocationV2ResultBase & {
       readonly status: "failed" | "cancelled" | "interrupted";
+      readonly session_ref: ExecutionResultSessionRef;
       readonly error: {
         readonly code: ExecuteInvocationV2ErrorCode;
         readonly message: string;
@@ -164,6 +175,7 @@ export type ExecuteInvocationV2Result =
     })
   | (ExecuteInvocationV2ResultBase & {
       readonly status: "conflict";
+      readonly session_ref: ExecutionResultSessionRef;
       readonly error: {
         readonly code: "idempotency_conflict";
         readonly message: string;
@@ -265,9 +277,9 @@ export async function validateExecuteInvocationV2Request(
     "session_ref.session_id",
   );
   const invocationId = requireNonEmptyString(request.invocation_id, "invocation_id");
-  const idempotencyKey = requireNonEmptyString(
+  const idempotencyKey = requireCanonicalIdempotencyKey(
     request.idempotency_key,
-    "idempotency_key",
+    invocationId,
   );
   const renderedInput = requireNonEmptyString(
     request.rendered_input,
@@ -363,13 +375,15 @@ export function validateCancelInvocationV2Request(
     "request",
   );
   requireContractVersion(request.contract_version);
+  const invocationId = requireNonEmptyString(request.invocation_id, "invocation_id");
+  const idempotencyKey = requireCanonicalIdempotencyKey(
+    request.idempotency_key,
+    invocationId,
+  );
   return {
     contract_version: "pillbox.execution/2",
-    invocation_id: requireNonEmptyString(request.invocation_id, "invocation_id"),
-    idempotency_key: requireNonEmptyString(
-      request.idempotency_key,
-      "idempotency_key",
-    ),
+    invocation_id: invocationId,
+    idempotency_key: idempotencyKey,
     reason: requireNonEmptyString(request.reason, "reason"),
   };
 }
@@ -570,6 +584,17 @@ function requireNonEmptyString(value: JsonValue | undefined, path: string): stri
   return value;
 }
 
+function requireCanonicalIdempotencyKey(
+  value: JsonValue | undefined,
+  invocationId: string,
+): string {
+  const idempotencyKey = requireNonEmptyString(value, "idempotency_key");
+  if (idempotencyKey !== invocationId) {
+    reject("idempotency_key must equal invocation_id");
+  }
+  return idempotencyKey;
+}
+
 function requireObject(
   value: JsonValue | undefined,
   path: string,
@@ -664,9 +689,13 @@ export function canonicalJson(value: JsonValue): string {
   }
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   return `{${Object.keys(value)
-    .sort()
+    .sort(compareUtf16CodeUnits)
     .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
     .join(",")}}`;
+}
+
+function compareUtf16CodeUnits(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 async function sha256Json(value: JsonValue): Promise<Sha256Digest> {

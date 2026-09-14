@@ -9,8 +9,19 @@
 The vault keeps real Anthropic OAuth tokens on the host while the
 sandboxed claude sees stubs. A pillbox-managed MITM HTTPS proxy swaps
 stub → real on outbound requests to `api.anthropic.com` and
-`console.anthropic.com`, and swaps real → stub on inbound responses
-(so rotated tokens never reach the guest).
+provider API hosts. OAuth token endpoints are local deny points: rotation runs
+only in the host broker, so rotated access and refresh secrets never enter the
+guest or a response-side registry path.
+
+The libkrun MITM retains at most 256 KiB of unsent request bytes per connection,
+across its fixed 32-listener pool (8 MiB of queued payload total, plus bounded
+TLS/framing buffers). It processes plaintext in 4 KiB chunks and resets the
+connection on queue overflow, including while DNS/connect or an upstream write
+is stalled. Partial TLS writes retain their exact suffix for the next poll;
+accepted bytes alone leave the queue. Credential substitution retains partial
+stubs across polls and flushes only at a completed HTTP request boundary.
+This is an unsent-buffer bound, not a
+lifetime request-size limit or a billing cap.
 
 **v0.6 scope:** vault state is **per-pillbox**, and the CA is **per-run by
 default** — each `--vault` run mints an ephemeral CA in a tempdir and discards it
@@ -89,10 +100,10 @@ The CA persists across runs — sandboxes share the trust root.
 |---|---|
 | `claude` agent, OAuth tokens (`claudeAiOauth` block) | ✅ |
 | `api.anthropic.com` request bodies / headers | ✅ Stub → real swap |
-| `console.anthropic.com/oauth/token` (rotation) | ✅ Real → stub swap inbound |
+| `console.anthropic.com/oauth/token`, `platform.claude.com/**/oauth/token` | ⛔ Guest request rejected locally; broker rotates host-side |
 | `codex` agent, ChatGPT-mode OAuth tokens (`tokens` block) | ✅ (v0.5) |
 | `chatgpt.com`, `chat.openai.com` request headers | ✅ Stub → real swap (v0.5) |
-| `auth.openai.com/oauth/token` (rotation) | ✅ Real → stub swap inbound (v0.5) |
+| `auth.openai.com/oauth/token` | ⛔ Guest request rejected locally; broker rotates host-side |
 | `codex` ApiKey mode (`OPENAI_API_KEY` in auth.json) | ❌ — use `--with OPENAI_API_KEY` via the secret-vault path instead |
 | Anthropic API keys (`x-api-key` header via `--with`) | ✅ (v0.5) — see [secrets.md](./secrets.md#vaulted-secrets) |
 | OpenAI API keys (`Authorization: Bearer` to api.openai.com via `--with`) | ✅ (v0.5) |
@@ -110,11 +121,11 @@ Running `--vault` for an agent that isn't `vault_capable` errors with exit 2.
 
 ## OAuth refresh — the broker model
 
-> **Status:** built 2026-06-20 for **claude** on BOTH vault paths — this host-side
-> proxy (#107, the docker path) and the libkrun in-VMM MITM (#109, see
-> [libkrun-sandbox.md](./libkrun-sandbox.md)). ADR-004. The >token-lifetime-session
-> case (PR-B, JIT-refresh-at-the-MITM) is deferred. This section describes the
-> host-side path; libkrun wires the same core (`pre_refresh`, `TokenStore`).
+> **Status:** built for **claude and codex** on both vault paths. Pre-run refresh
+> uses the shared `OAuthCodec` + `TokenStore` broker. The maintained libkrun MITM
+> also performs JIT refresh through that same broker for sessions that outlive an
+> access token. The deprecated host proxy retains pre-run refresh and rejects
+> guest token-endpoint requests rather than capturing their responses. ADR-004.
 
 The problem the in-proxy refresh design hit: if the guest agent refreshes its own
 OAuth token (a single-use `refresh_token` grant), pillbox has to intercept, swap,
@@ -122,8 +133,7 @@ forward, and re-stub that exchange — fragile, and across concurrent sessions
 (`dispatch -k`) it races N agents POSTing the *same* shared refresh token, which
 Anthropic treats as theft and revokes the whole family.
 
-The broker model removes the trigger: **the agent never refreshes.** Two pieces,
-both claude-only today (`src/vault/refresh.rs`, `providers/anthropic.rs`):
+The broker model removes the trigger: **the agent never refreshes.** Three pieces:
 
 1. **Far-future stub expiry.** The stub `.credentials.json` the guest sees carries
    `expiresAt = 4102444800000` (2100-01-01). Claude Code trusts its local expiry and
@@ -132,7 +142,7 @@ both claude-only today (`src/vault/refresh.rs`, `providers/anthropic.rs`):
    wire (the real creds keep their true expiry — only the stub copy is post-dated).
    Centaur/iron-proxy use the same sentinel.
 
-2. **Host-side coordinated pre-refresh.** At the start of every vaulted run,
+2. **Host-side coordinated refresh.** At the start of every vaulted run,
    `pre_refresh` rotates the *real* token if it's near expiry — routed through the
    `TokenStore` single-writer core (a cross-process `flock` + an at-most-once
    `pending` marker), so concurrent launches sharing one subscription refresh **at
@@ -141,16 +151,15 @@ both claude-only today (`src/vault/refresh.rs`, `providers/anthropic.rs`):
    than leasing a doomed credential (the agent can't self-heal — its expiry says
    year 2100). A *provably non-consuming* failure (a pre-send connect error, or an
    RFC-6749 grant rejection) clears `pending` so the next run retries; an ambiguous
-   one leaves it set so no peer ever re-sends a maybe-consumed token.
+   one leaves it set so no peer ever re-sends a maybe-consumed token. Libkrun's JIT
+   scheduler invokes the same entrypoint near expiry and updates only the live
+   access-token swap.
 
-**Known limit (slice 2 closes it):** a session that runs *longer* than the access
-token's lifetime (~8h) will see the injected real token expire mid-run. The agent
-won't refresh (year-2100 expiry), so Anthropic returns 401 → the agent's own
-retry-on-401 falls back to the **in-proxy** `/oauth/token` path, which still works
-but is *uncoordinated* (the original reuse exposure, now confined to this edge). The
-deferred JIT-refresh-at-proxy — the MITM refreshing the real token on-demand near
-expiry, through the same `TokenStore` — eliminates the 401 entirely and lets the
-in-proxy fallback be deleted.
+3. **Guest rotation refusal.** Anthropic and Codex token endpoints are recognized
+   by provider-owned matchers and return a local 403. The libkrun credentials file
+   contains a shape-valid refresh stub, but there is no refresh-token release pair;
+   only the broker can read or POST the real refresh token. The host proxy likewise
+   has no response-side mutation or teardown persistence path.
 
 ## Broker model (v2 — the policy-bound egress broker)
 
@@ -326,7 +335,7 @@ collide because each provider has its own prefix.
   │ api.anthropic.com /     │ ──TLS──▶     │  (real connection,       │
   │ console.anthropic.com:  │              │   real token only here)  │
   │  • stub → real outbound │              └──────────────────────────┘
-  │  • real → stub inbound  │
+  │  • token endpoint → 403 │
   │ Everything else: pass-  │
   │ through (no MITM).      │
   └─────────────────────────┘

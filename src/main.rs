@@ -579,19 +579,19 @@ fn main() -> ExitCode {
     if std::env::args().nth(1).as_deref() == Some("__krun-vmm") {
         crate::sandbox::libkrun::vmm_child_main(); // never returns
     }
-    // Internal re-exec entrypoint: the detached §0 PRODUCER for a reparented server
+    // Internal re-exec entrypoint: the detached §0 PRODUCER for a reparented
     // session. Tails the guest capture → durable log forever (until SIGTERM on
     // teardown) so the log stays live for every consumer. argv set by the backend:
-    // [exe, __session-tailer, <session_dir>, <capture>, <format>, <sid>].
+    // [exe, __session-tailer, <session_dir>, <capture>, <source>, <sid>].
     if std::env::args().nth(1).as_deref() == Some("__session-tailer") {
         let a: Vec<String> = std::env::args().collect();
         let code = match (a.get(2), a.get(3), a.get(4), a.get(5)) {
-            (Some(dir), Some(cap), Some(fmt), Some(sid)) => {
-                match crate::events::EventsFormat::from_token(fmt) {
-                    Some(fmt) => match crate::commands::session::run_detached_tailer(
+            (Some(dir), Some(cap), Some(source_token), Some(sid)) => {
+                match crate::agents::DetachedTranscriptSource::from_token(source_token) {
+                    Some(source) => match crate::commands::session::run_detached_tailer(
                         dir.into(),
                         cap.into(),
-                        fmt,
+                        source,
                         sid.clone(),
                     ) {
                         Ok(()) => 0,
@@ -601,14 +601,14 @@ fn main() -> ExitCode {
                         }
                     },
                     None => {
-                        eprintln!("pillbox __session-tailer: unknown format {fmt:?}");
+                        eprintln!("pillbox __session-tailer: unknown source {source_token:?}");
                         2
                     }
                 }
             }
             _ => {
                 eprintln!(
-                    "pillbox __session-tailer: usage: <session_dir> <capture> <format> <sid>"
+                    "pillbox __session-tailer: usage: <session_dir> <capture> <source> <sid>"
                 );
                 2
             }

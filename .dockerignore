@@ -1,8 +1,8 @@
 # Build context for runner/Dockerfile is the repo root (it compiles the
 # pillbox binary in-image). Keep the context small: Cargo.* + src/ +
-# runner/entrypoint.sh are COPYed, so exclude the heavy/irrelevant dirs
-# but keep the entrypoint (excluding all of runner/ broke the build —
-# the Dockerfile COPYs runner/entrypoint.sh).
+# runner/entrypoint.sh and runner/install-codex-package.sh are COPYed, so
+# exclude the heavy/irrelevant dirs but keep those two files (excluding all of
+# runner/ broke the build because the Dockerfile COPYs them).
 target/
 .git/
 .github/
@@ -10,6 +10,7 @@ docs/
 tests/
 runner/*
 !runner/entrypoint.sh
+!runner/install-codex-package.sh
 .claude/
 *.md
 .env*

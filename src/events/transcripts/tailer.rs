@@ -519,6 +519,7 @@ impl Tailer {
         let mut parsed = Vec::new();
         let mut durable = Vec::new();
         let mut line_idx = self.line_idx;
+        // Parse against a copy so a rejected batch cannot advance accounting.
         let mut codex_parser = self.codex_parser.clone();
         for line in complete.lines() {
             if line.is_empty() {
@@ -550,7 +551,7 @@ impl Tailer {
 
     fn emit_parsed(&mut self, parsed: &[TranscriptEvent]) {
         for event in parsed {
-            emit_event_span(event, &self.session_id);
+            emit_event_span(event, &self.session_id, self.harness);
             self.synth.on_event(event);
         }
     }

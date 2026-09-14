@@ -145,6 +145,24 @@ impl TailerHandle {
         join.wait()
     }
 
+    /// An ended producer is unhealthy while its consumer is still guarding a
+    /// live session, including a clean EOF. Join only after it has finished.
+    pub(crate) fn check_running(&mut self) -> Result<()> {
+        let join = self
+            .join
+            .as_ref()
+            .ok_or_else(|| anyhow!("transcript producer is no longer running"))?;
+        let finished = match join {
+            TailerJoin::Infallible(join) => join.is_finished(),
+            TailerJoin::Producer(join) => join.is_finished(),
+        };
+        if finished {
+            self.join.take().expect("checked above").wait()?;
+            anyhow::bail!("transcript producer ended while session was guarded");
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn finished_for_test(result: Result<()>) -> Self {
         Self {

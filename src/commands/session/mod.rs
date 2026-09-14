@@ -33,6 +33,22 @@ struct DetachedProducerLock {
 }
 
 impl DetachedProducerLock {
+    fn check_held(session_dir: &std::path::Path) -> Result<()> {
+        let path = session_dir.join(TAILER_LOCK_FILE);
+        let file = std::fs::File::open(&path)
+            .with_context(|| format!("open detached producer lock {}", path.display()))?;
+        // A dead child may remain a zombie (signal-0 still succeeds), but its
+        // kernel-owned flock is released. Never trust the PID stamp alone.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            anyhow::bail!("detached transcript producer released its ownership lock");
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(());
+        }
+        Err(error).with_context(|| format!("probe detached producer lock {}", path.display()))
+    }
+
     fn try_acquire(session_dir: &std::path::Path) -> Result<Self> {
         let path = session_dir.join(TAILER_LOCK_FILE);
         let file = std::fs::OpenOptions::new()

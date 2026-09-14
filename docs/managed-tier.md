@@ -100,6 +100,13 @@ an explicit `observed - planned` variance; they never rewrite the envelope.
 Analytics contains no prompt, output, secret, repository path, or participant
 identity.
 
+The v1 envelope is sealed before terminal persistence: its D1 reads are pre-seal
+measurements and its writes include one planned terminal write. Full burn-in
+reconciliation requires an identity/artifact-bound [cost receipt](burn-in/cost-receipt.md)
+with separately observed commit rows and container lifecycle allocation units.
+It never rewrites the artifact or assumes execution duration equals billed
+lifecycle duration. Missing receipt observations keep the gate closed.
+
 ## Current limits
 
 - Foreground execution only; managed detach/reconnect is unsupported.

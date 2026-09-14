@@ -7,11 +7,45 @@ import test from "node:test";
 
 const reconciler = new URL("./scripts/reconcile-burnin.mjs", import.meta.url);
 const fixture = new URL("./testdata/burnin-reconciliation.fixture.json", import.meta.url);
+const receiptFixture = new URL("./testdata/cost-receipt.fixture.json", import.meta.url);
 
 test("the sole Huddles recorder fixture reconciles without translating response records", async () => {
-  const result = await run(process.execPath, [reconciler.pathname, fixture.pathname]);
+  const result = await run(process.execPath, [reconciler.pathname, fixture.pathname, "--receipt", receiptFixture.pathname]);
   assert.equal(result.code, 0, result.stderr);
   assert.match(result.stdout, /managed preview burn-in reconciliation passed/);
+});
+
+test("full reconciliation fails closed without an external receipt", async () => {
+  const result = await run(process.execPath, [reconciler.pathname, fixture.pathname]);
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /requires --receipt/);
+});
+
+test("measured terminal reads reconcile without rewriting the sealed cost", async (t) => {
+  const report = JSON.parse(await readFile(fixture, "utf8"));
+  const receipt = JSON.parse(await readFile(receiptFixture, "utf8"));
+  const originalCost = structuredClone(report.capture.run_cost_envelopes[0].cost);
+  receipt.d1.terminal_commit.rows_read = 2;
+  receipt.d1.execution_total.rows_read += 2;
+  report.capture.run_cost_envelopes[0].observed.d1.rows_read += 2;
+  report.capture.totals.d1.rows_read += 2;
+  const result = await reconcileTemporary(t, report, [], receipt);
+  assert.equal(result.code, 0, result.stderr);
+  assert.deepEqual(report.capture.run_cost_envelopes[0].cost, originalCost);
+
+  receipt.d1.terminal_commit.rows_read = 1;
+  const mismatch = await reconcileTemporary(t, report, [], receipt);
+  assert.equal(mismatch.code, 1);
+  assert.match(mismatch.stderr, /read|total/);
+});
+
+test("full reconciliation binds the receipt to the recorded artifact", async (t) => {
+  const report = JSON.parse(await readFile(fixture, "utf8"));
+  const receipt = JSON.parse(await readFile(receiptFixture, "utf8"));
+  receipt.artifact_ref.sha256 = `sha256:${"e".repeat(64)}`;
+  const result = await reconcileTemporary(t, report, [], receipt);
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /artifact/);
 });
 
 test("partial validation accepts terminal Huddles evidence only before cleanup", async (t) => {
@@ -125,12 +159,17 @@ test("reconciliation rejects Analytics observations without truthful plan varian
   assert.match(result.stderr, /variance does not reconcile observed writes against planned units/);
 });
 
-async function reconcileTemporary(t, report, args = []) {
+async function reconcileTemporary(t, report, args = [], receipt = null) {
   const temp = await mkdtemp(join(tmpdir(), "pillbox-burnin-reconcile-"));
   t.after(() => rm(temp, { recursive: true, force: true }));
   const path = join(temp, "report.json");
   await writeFile(path, JSON.stringify(report));
-  return run(process.execPath, [reconciler.pathname, path, ...args]);
+  let receiptPath = receiptFixture.pathname;
+  if (receipt !== null) {
+    receiptPath = join(temp, "receipt.json");
+    await writeFile(receiptPath, JSON.stringify(receipt));
+  }
+  return run(process.execPath, [reconciler.pathname, path, "--receipt", receiptPath, ...args]);
 }
 
 function run(command, args) {

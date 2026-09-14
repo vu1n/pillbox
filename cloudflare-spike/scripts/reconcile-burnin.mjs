@@ -3,6 +3,8 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
+import { parseArgs } from "node:util";
+import { validateCostReceipt } from "./cost-receipt.mjs";
 
 const DEFAULT_FIXTURE = new URL("../testdata/burnin-reconciliation.fixture.json", import.meta.url);
 const MAX_STATUS_PAGE_SIZE = 100;
@@ -16,9 +18,26 @@ const EXPECTED_WORKLOAD = new Map([
   ["finalize", "workspace_finalize"],
 ]);
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled", "interrupted"]);
-const partial = process.argv.includes("--partial");
-
-const fixturePath = process.argv[2] === undefined ? DEFAULT_FIXTURE : resolve(process.cwd(), process.argv[2]);
+let args;
+try {
+  args = parseArgs({ options: { partial: { type: "boolean" }, receipt: { type: "string" } }, allowPositionals: true });
+} catch (error) {
+  fail(`invalid reconciliation arguments: ${error.message}`);
+}
+if (args.positionals.length > 1) fail("expected at most one report path");
+const partial = args.values.partial === true;
+const fixturePath = args.positionals[0] === undefined ? DEFAULT_FIXTURE : resolve(process.cwd(), args.positionals[0]);
+let receipt;
+if (!partial) {
+  if (!args.values.receipt) {
+    fail("full reconciliation requires --receipt <path>");
+  }
+  try {
+    receipt = JSON.parse(await readFile(resolve(process.cwd(), args.values.receipt), "utf8"));
+  } catch (error) {
+    fail(`cannot read cost reconciliation receipt: ${error}`);
+  }
+}
 
 let fixture;
 try {
@@ -274,8 +293,13 @@ for (const [index, rawRun] of runs.entries()) {
   check(analyticsPointsWritten === 0 || analyticsPointsWritten === 1, `${runId} provider observation must be zero or one Analytics Engine point`);
   check(analyticsVariance === analyticsPointsWritten - analyticsPointsPlanned, `${runId} Analytics Engine variance does not reconcile observed writes against planned units`);
   const vendor = validateVendorCounters(observed.vendor_sandbox_do, `${runId}.observed.vendor_sandbox_do`);
-  check(integer(infra.d1_rows_read, `${runId}.cost.infrastructure.d1_rows_read`) === integer(d1.rows_read, `${runId}.observed.d1.rows_read`), `${runId} D1 read delta is unexplained`);
-  check(integer(infra.d1_rows_written, `${runId}.cost.infrastructure.d1_rows_written`) === integer(d1.rows_written, `${runId}.observed.d1.rows_written`), `${runId} D1 write delta is unexplained`);
+  failures.push(...validateCostReceipt(receipt, {
+    execution_identity: capturedIdentity,
+    artifact_ref: runArtifact,
+    cost_ref: runId,
+    cost,
+    observed,
+  }));
   check(integer(infra.r2_reads, `${runId}.cost.infrastructure.r2_reads`) === integer(r2.reads, `${runId}.observed.r2.reads`), `${runId} R2 read delta is unexplained`);
   check(integer(infra.r2_writes, `${runId}.cost.infrastructure.r2_writes`) === integer(r2.writes, `${runId}.observed.r2.writes`), `${runId} R2 write delta is unexplained`);
   check(integer(infra.r2_bytes_read, `${runId}.cost.infrastructure.r2_bytes_read`) === integer(r2.bytes_read, `${runId}.observed.r2.bytes_read`), `${runId} R2 read-byte delta is unexplained`);

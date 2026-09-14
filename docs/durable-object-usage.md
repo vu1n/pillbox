@@ -49,6 +49,12 @@ After the immutable R2 write and conditional terminal D1 update, only that D1
 winner attempts one derivative Analytics point. Failure is logged but cannot
 undo terminal execution; retries and status reads emit no additional points.
 
+An external [cost receipt](burn-in/cost-receipt.md) binds post-seal commit and
+lifecycle observations to the immutable artifact and execution identity. It
+reconciles measured scopes against the envelope's planned terminal write,
+rather than inventing a fixed terminal-read correction or mutating evidence.
+The receipt does not waive missing vendor DO counters or other release gates.
+
 Release owners must compare these envelopes with Cloudflare's D1, R2,
 Containers, Workers, Analytics Engine, and Durable Objects metrics/billing
 views. Cloudflare account budget alerts are daily projected-spend safeguards,

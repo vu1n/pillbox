@@ -256,6 +256,18 @@ impl SessionLog {
         &self,
         from: u64,
         stop: &AtomicBool,
+        sink: impl FnMut(&Event) -> bool,
+    ) -> Result<()> {
+        self.subscribe_checked(from, stop, || Ok(()), sink)
+    }
+
+    /// Check producer health even when no events arrive. A safety consumer
+    /// cannot distinguish a quiet agent from a dead producer using events alone.
+    pub(crate) fn subscribe_checked(
+        &self,
+        from: u64,
+        stop: &AtomicBool,
+        mut check_health: impl FnMut() -> Result<()>,
         mut sink: impl FnMut(&Event) -> bool,
     ) -> Result<()> {
         use notify::{RecursiveMode, Watcher};
@@ -277,7 +289,9 @@ impl SessionLog {
 
         let mut next = from;
         loop {
+            check_health()?;
             for ev in self.read_from(next)? {
+                check_health()?;
                 next = ev.seq + 1;
                 if !sink(&ev) {
                     return Ok(());

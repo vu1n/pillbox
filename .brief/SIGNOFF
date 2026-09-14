@@ -1,4 +1,7 @@
 # brief backfill — conformance sign-off
+managed-tier-do-gateway conforms: Approved external cost receipts bind observed commit and lifecycle usage to immutable runtime evidence; no runtime persistence, custom DO, collaboration authority, or commit-order change is introduced.
+optimization-external-substrate-primitives conforms: Foreground producer-health and token-overflow checks observe the existing session event stream; no optimizer, routing policy, or reward authority is embedded.
+substrate-plane-livesession conforms: Guard health remains local event-producer monitoring through existing session resolution; no backend-string dispatch, capability change, or new backend is added.
 # The backfill commit adds `// Context:` doc-refs (comments only) into governed
 # source sites and reconstructs the decision layer. No pillbox behavior changed,
 # so every touched decision still conforms by construction.
@@ -147,6 +150,11 @@ workspace-ingest-sovereignty conforms: META-001 runs after the canonical workspa
 docs-governance conforms: META-001 records libkrun's source-backed override-stat format, temporary owner-write/restore invariant, effective-mode preservation, and excluded rootfs/grader/source targets in the canonical sandbox guide.
 docs-governance conforms: META-001 follow-up records the bounded temporary owner-access adjustment for unreadable/searchless private-clone entries and its exact restoration boundary.
 session-event-log-spine conforms: Codex 0.151 transcript ingestion maps modern custom-tool pairs and standalone incremental Usage into the existing single-writer log, persisting the cumulative baseline with the exact cursor batch and preserving bounded replay/fail-loud recovery.
+session-event-log-spine conforms: Logging tighten removes an internal snapshot wrapper and redundant branches without changing serialized parser state, validation failures, or the atomic log/cursor commit boundary.
+session-event-log-spine conforms: Guard health checks observe producer termination without changing event sequencing, append locking, or rejected-record cursor semantics; overflow trips instead of corrupting monitoring arithmetic.
+session-event-log-spine conforms: Current Codex host-spawn failures map to the existing ToolStatus error path and spans use their harness identity; wire schemas and durable accounting checkpoints remain unchanged.
+gateway-no-daemon conforms: Producer-health polling belongs to the foreground guard, uses the existing detached ownership lock, and adds no resident coordinator or new event authority.
+dx-zero-config-local conforms: Guard health and overflow checks use local thread/process/file state and the existing log subscription without requiring telemetry infrastructure.
 dx-zero-config-local conforms: Codex transcript accounting remains local-only and uses the existing session log/cost projection; the human missing-usage display distinguishes unavailable accounting without changing the JSON contract.
 optimization-external-substrate-primitives conforms: The Codex transcript fix records execution usage and tool evidence only; it adds no routing, optimization, or policy authority to Pillbox.
 docs-governance conforms: The canonical session-event-log document records the modern Codex mapping, cumulative usage semantics, cursor recovery boundary, and human-only missingness behavior alongside the implementation.

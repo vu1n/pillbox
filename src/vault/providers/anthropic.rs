@@ -1,29 +1,33 @@
 //! Anthropic provider — Claude Code OAuth.
 //!
-//! Mirrors the v0.4 single-provider implementation: intercept
-//! `api.anthropic.com` (bearer-token swap on every request) and
-//! `console.anthropic.com/oauth/token` (refresh-token swap on the way
-//! out, real → stub swap + registry rotation on the way back).
+//! Intercepts Anthropic API traffic for bearer-token substitution. OAuth token
+//! endpoints are intercepted only to reject guest-owned rotation locally; the
+//! host broker is the sole rotation authority.
 
 use std::path::Path;
 
 use async_trait::async_trait;
-use http_body_util::BodyExt;
 use hudsucker::{
     hyper::{
         header::{HeaderValue, AUTHORIZATION},
-        Request, Response,
+        Request,
     },
     Body, RequestOrResponse,
 };
 use serde::Deserialize;
 
 use super::{
-    host_from_uri, mint_stub, swap_raw_header, unauthorized, ApiKeySwap, PendingFlow, Registry,
-    SandboxData, VaultProvider,
+    host_from_uri, mint_stub, oauth_rotation_forbidden, swap_raw_header, unauthorized, ApiKeySwap,
+    HostProxyOAuthStub, OAuthCodec, OAuthRefreshRequest, Registry, SandboxData, VaultProvider,
 };
+#[cfg(feature = "libkrun")]
+use super::{LibkrunOAuthStub, OAuthRelease};
+#[cfg(not(feature = "libkrun"))]
 use crate::vault::refresh::STUB_FAR_FUTURE_EXPIRES_AT_MS as STUB_EXPIRES_AT_MS;
 use crate::vault::server::ServerInner;
+use crate::vault::token_store::RefreshDecider;
+#[cfg(feature = "libkrun")]
+use crate::vault::STUB_FAR_FUTURE_EXPIRES_AT_MS as STUB_EXPIRES_AT_MS;
 
 // Provider id matches the AgentSpec id (`claude`) so
 // `VaultSession::start(agent_id, ...)` can look up the right provider
@@ -34,14 +38,14 @@ const PROVIDER_ID: &str = "claude";
 
 const API_HOST: &str = "api.anthropic.com";
 const CONSOLE_HOST: &str = "console.anthropic.com";
-/// Newer Anthropic OAuth host — claude code refreshes its access token
-/// against `platform.claude.com/oauth/token`. Without this in the
-/// intercept list the stub refresh token passes through to the real host,
-/// gets rejected, and the access-token swap on `api.anthropic.com` then
-/// fails with 401 "Invalid authentication credentials" downstream.
+/// Newer Anthropic OAuth host. It remains intercepted so the guest token
+/// endpoint can be rejected locally instead of reaching the provider.
 const PLATFORM_HOST: &str = "platform.claude.com";
 const OAUTH_TOKEN_PATH_SUFFIX: &str = "/oauth/token";
 const CREDS_PATH: &str = ".claude/.credentials.json";
+const OAUTH_CLIENT_ID: &str = "claude_code";
+const OAUTH_ENDPOINT: &str = "https://platform.claude.com/oauth/token";
+const FALLBACK_EXPIRES_IN_SECS: u64 = 3600;
 
 // Stub tokens mimic Anthropic's `sk-ant-oat01-` / `sk-ant-ort01-`
 // prefixes so Claude Code's local format validation accepts them. The
@@ -71,48 +75,22 @@ impl VaultProvider for AnthropicProvider {
         Path::new(CREDS_PATH)
     }
 
+    fn oauth_codec(&self) -> Option<&dyn OAuthCodec> {
+        Some(self)
+    }
+
+    fn is_oauth_token_endpoint(&self, host: &str, path: &str) -> bool {
+        (host == CONSOLE_HOST || host == PLATFORM_HOST) && path.ends_with(OAUTH_TOKEN_PATH_SUFFIX)
+    }
+
     fn provision(
         &self,
         sandbox_id: &str,
         real: &serde_json::Value,
         registry: &mut Registry,
     ) -> Result<String, String> {
-        // Validate shape — we want a clear error if the user pointed us at
-        // the wrong file rather than a silent passthrough of garbage.
-        let oauth = real
-            .get("claudeAiOauth")
-            .ok_or_else(|| "anthropic creds missing claudeAiOauth field".to_string())?;
-        let _block: OauthBlock = serde_json::from_value(oauth.clone())
-            .map_err(|error| format!("parse claudeAiOauth: {error}"))?;
-
-        let stub_access = mint_stub(STUB_ACCESS_PREFIX, sandbox_id);
-        let stub_refresh = mint_stub(STUB_REFRESH_PREFIX, sandbox_id);
-
-        // Build stub creds JSON by cloning real and overwriting the token fields plus
-        // `expiresAt` (post-dated to STUB_EXPIRES_AT_MS — the broker move that stops
-        // the guest from ever refreshing; see that const). `scopes`,
-        // `subscriptionType`, and any future fields are preserved so the guest sees a
-        // structurally-correct file.
-        let mut stub_value = real.clone();
-        {
-            let oauth = stub_value
-                .get_mut("claudeAiOauth")
-                .and_then(|v| v.as_object_mut())
-                .ok_or_else(|| "claudeAiOauth block missing".to_string())?;
-            oauth.insert(
-                "accessToken".to_string(),
-                serde_json::Value::String(stub_access.clone()),
-            );
-            oauth.insert(
-                "refreshToken".to_string(),
-                serde_json::Value::String(stub_refresh.clone()),
-            );
-            oauth.insert(
-                "expiresAt".to_string(),
-                serde_json::Value::Number(serde_json::Number::from(STUB_EXPIRES_AT_MS)),
-            );
-        }
-        let stub_json = serde_json::to_string_pretty(&stub_value)
+        let stub = self.host_proxy_stub(sandbox_id, real)?;
+        let stub_json = serde_json::to_string_pretty(&stub.credentials)
             .map_err(|error| format!("serialize stub creds: {error}"))?;
 
         registry.insert(
@@ -120,124 +98,24 @@ impl VaultProvider for AnthropicProvider {
             SandboxData {
                 provider_id: PROVIDER_ID,
                 real: real.clone(),
-                stubs: vec![stub_access, stub_refresh],
+                stubs: stub.stubs,
             },
         );
 
         Ok(stub_json)
     }
 
-    async fn handle_request(
-        &self,
-        req: Request<Body>,
-        server: &ServerInner,
-        pending: &mut Option<PendingFlow>,
-    ) -> RequestOrResponse {
+    async fn handle_request(&self, req: Request<Body>, server: &ServerInner) -> RequestOrResponse {
         let host = host_from_uri(&req).unwrap_or_default();
-        // OAuth refresh (`/oauth/token`) needs JSON-body rewriting on
-        // both the legacy console host and the newer platform host. Plain
-        // bearer-token endpoints (everything else under our intercept
-        // set) get the Authorization-header swap.
-        let is_oauth_path = req.uri().path().ends_with(OAUTH_TOKEN_PATH_SUFFIX);
-        if is_oauth_path && (host == CONSOLE_HOST || host == PLATFORM_HOST) {
-            return handle_oauth_request(req, server, pending).await;
+        // Both legacy and current token endpoints are local deny points. Plain
+        // bearer-token endpoints get the Authorization-header swap.
+        if self.is_oauth_token_endpoint(&host, req.uri().path()) {
+            return oauth_rotation_forbidden().into();
         }
         if host == API_HOST || host == PLATFORM_HOST {
             return handle_api_request(req, server).await;
         }
         req.into()
-    }
-
-    async fn handle_response(
-        &self,
-        res: Response<Body>,
-        server: &ServerInner,
-        pending: &mut Option<PendingFlow>,
-    ) -> Response<Body> {
-        let Some(flow) = pending.take() else {
-            return res;
-        };
-        if flow.provider_id != PROVIDER_ID {
-            // Misrouted; put it back. Shouldn't happen — server.rs only
-            // dispatches to the provider that set the flow.
-            *pending = Some(flow);
-            return res;
-        }
-
-        let (parts, body) = res.into_parts();
-        let collected = match body.collect().await {
-            Ok(c) => c.to_bytes(),
-            Err(error) => {
-                eprintln!("pillbox: vault: failed to collect oauth response body: {error}");
-                return Response::from_parts(parts, Body::empty());
-            }
-        };
-
-        let mut value: serde_json::Value = match serde_json::from_slice(&collected) {
-            Ok(v) => v,
-            Err(error) => {
-                eprintln!("pillbox: vault: oauth response not JSON; passing through: {error}");
-                return Response::from_parts(parts, Body::from(collected));
-            }
-        };
-
-        // Two passes through the map: first rotate stored real values
-        // with whatever the server returned, then read back the stubs to
-        // swap into the body.
-        let stub_pair = {
-            let mut registry = server.registry_lock();
-            if let Some(obj) = value.as_object_mut() {
-                if let Some(new_access) = obj
-                    .get("access_token")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned)
-                {
-                    registry.rotate_real_field(
-                        &flow.sandbox_id,
-                        "/claudeAiOauth/accessToken",
-                        new_access,
-                    );
-                }
-                if let Some(new_refresh) = obj
-                    .get("refresh_token")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned)
-                {
-                    registry.rotate_real_field(
-                        &flow.sandbox_id,
-                        "/claudeAiOauth/refreshToken",
-                        new_refresh,
-                    );
-                }
-            }
-            stubs_for(&registry, &flow.sandbox_id)
-        };
-
-        if let (Some(obj), Some((stub_access, stub_refresh))) =
-            (value.as_object_mut(), stub_pair.as_ref())
-        {
-            if obj.contains_key("access_token") {
-                obj.insert(
-                    "access_token".to_string(),
-                    serde_json::Value::String(stub_access.clone()),
-                );
-            }
-            if obj.contains_key("refresh_token") {
-                obj.insert(
-                    "refresh_token".to_string(),
-                    serde_json::Value::String(stub_refresh.clone()),
-                );
-            }
-        }
-
-        let new_body = serde_json::to_vec(&value).unwrap_or(collected.to_vec());
-        let new_len = new_body.len();
-        let mut parts = parts;
-        parts.headers.remove("content-length");
-        parts
-            .headers
-            .insert("content-length", HeaderValue::from(new_len));
-        Response::from_parts(parts, Body::from(new_body))
     }
 
     /// Anthropic's generation endpoint is `POST /v1/messages` (on both
@@ -252,114 +130,186 @@ impl VaultProvider for AnthropicProvider {
     }
 }
 
+impl RefreshDecider for AnthropicProvider {
+    fn needs_refresh(&self, creds: &serde_json::Value) -> bool {
+        self.expiry_ms(creds)
+            .map(crate::vault::refresh::is_expired)
+            .unwrap_or(false)
+    }
+
+    fn refresh_token(&self, creds: &serde_json::Value) -> Option<String> {
+        creds
+            .pointer("/claudeAiOauth/refreshToken")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+    }
+
+    fn access_token(&self, creds: &serde_json::Value) -> Option<String> {
+        creds
+            .pointer("/claudeAiOauth/accessToken")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+    }
+
+    fn access_usable(&self, creds: &serde_json::Value) -> bool {
+        self.access_token(creds).is_some()
+            && self
+                .expiry_ms(creds)
+                .is_some_and(|expiry| expiry > crate::vault::refresh::unix_now_ms())
+    }
+}
+
+impl OAuthCodec for AnthropicProvider {
+    fn refresh_request(&self, refresh_token: &str) -> OAuthRefreshRequest {
+        OAuthRefreshRequest {
+            endpoint: OAUTH_ENDPOINT,
+            body: serde_json::json!({
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": OAUTH_CLIENT_ID,
+            }),
+        }
+    }
+
+    fn apply_refresh_response(
+        &self,
+        real: &mut serde_json::Value,
+        response: &serde_json::Value,
+        old_refresh: &str,
+        now_ms: u64,
+    ) -> anyhow::Result<()> {
+        let access = response
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                crate::errors::PillboxError::runtime(
+                    "vault",
+                    "refresh response missing access_token",
+                )
+            })?;
+        let refresh = response
+            .get("refresh_token")
+            .and_then(|v| v.as_str())
+            .unwrap_or(old_refresh);
+        let expires_in = response
+            .get("expires_in")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(FALLBACK_EXPIRES_IN_SECS);
+        let oauth = real
+            .get_mut("claudeAiOauth")
+            .and_then(|v| v.as_object_mut())
+            .ok_or_else(|| {
+                crate::errors::PillboxError::runtime("vault", "claudeAiOauth block disappeared")
+            })?;
+        oauth.insert("accessToken".into(), access.into());
+        oauth.insert("refreshToken".into(), refresh.into());
+        oauth.insert(
+            "expiresAt".into(),
+            serde_json::Value::Number(serde_json::Number::from(
+                now_ms.saturating_add(expires_in.saturating_mul(1000)),
+            )),
+        );
+        Ok(())
+    }
+
+    fn expiry_ms(&self, real: &serde_json::Value) -> Option<u64> {
+        real.pointer("/claudeAiOauth/expiresAt")
+            .and_then(|v| v.as_u64())
+            .map(crate::vault::refresh::normalize_expiry_ms)
+    }
+
+    fn host_proxy_stub(
+        &self,
+        sandbox_id: &str,
+        real: &serde_json::Value,
+    ) -> Result<HostProxyOAuthStub, String> {
+        let oauth = real
+            .get("claudeAiOauth")
+            .ok_or_else(|| "anthropic creds missing claudeAiOauth field".to_string())?;
+        let _block: OauthBlock = serde_json::from_value(oauth.clone())
+            .map_err(|error| format!("parse claudeAiOauth: {error}"))?;
+        let access = mint_stub(STUB_ACCESS_PREFIX, sandbox_id);
+        let refresh = mint_stub(STUB_REFRESH_PREFIX, sandbox_id);
+        let mut credentials = real.clone();
+        let oauth = credentials
+            .get_mut("claudeAiOauth")
+            .and_then(|v| v.as_object_mut())
+            .ok_or_else(|| "claudeAiOauth block missing".to_string())?;
+        oauth.insert("accessToken".into(), access.clone().into());
+        oauth.insert("refreshToken".into(), refresh.clone().into());
+        oauth.insert(
+            "expiresAt".into(),
+            serde_json::Value::Number(serde_json::Number::from(STUB_EXPIRES_AT_MS)),
+        );
+        Ok(HostProxyOAuthStub {
+            credentials,
+            stubs: vec![access, refresh],
+        })
+    }
+
+    #[cfg(feature = "libkrun")]
+    fn libkrun_stub(&self, real: &mut serde_json::Value) -> LibkrunOAuthStub {
+        let Some(oauth) = real
+            .get_mut("claudeAiOauth")
+            .and_then(|v| v.as_object_mut())
+        else {
+            return LibkrunOAuthStub {
+                access_stub: None,
+                releases: Vec::new(),
+            };
+        };
+        let mut releases = Vec::new();
+        let mut access_stub = None;
+        for field in ["accessToken", "refreshToken"] {
+            let Some(token) = oauth
+                .get(field)
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let stub = mint_libkrun_stub(&token);
+            oauth.insert(field.into(), stub.clone().into());
+            if field == "accessToken" {
+                access_stub = Some(stub.clone());
+            }
+            // The guest needs a shape-valid refresh stub in its file, but only the
+            // access stub is releasable on egress. Refresh rotation belongs to the
+            // broker and token-endpoint requests are locally rejected.
+            if field == "accessToken" {
+                releases.push(OAuthRelease { stub, real: token });
+            }
+        }
+        if !releases.is_empty() {
+            oauth.insert(
+                "expiresAt".into(),
+                serde_json::Value::Number(serde_json::Number::from(STUB_EXPIRES_AT_MS)),
+            );
+        }
+        LibkrunOAuthStub {
+            access_stub,
+            releases,
+        }
+    }
+}
+
+#[cfg(feature = "libkrun")]
+fn mint_libkrun_stub(real: &str) -> String {
+    let prefix = if real.split('-').count() >= 4 {
+        real.splitn(4, '-').take(3).collect::<Vec<_>>().join("-")
+    } else {
+        "pllbx".to_string()
+    };
+    format!("{prefix}-pllbxstub{}", uuid::Uuid::now_v7().simple())
+}
+
 #[derive(Debug, Deserialize)]
 struct OauthBlock {
     #[serde(rename = "accessToken")]
     _access_token: String,
     #[serde(rename = "refreshToken")]
     _refresh_token: String,
-}
-
-async fn handle_oauth_request(
-    req: Request<Body>,
-    server: &ServerInner,
-    pending: &mut Option<PendingFlow>,
-) -> RequestOrResponse {
-    let (mut parts, body) = req.into_parts();
-    let collected = match body.collect().await {
-        Ok(c) => c.to_bytes(),
-        Err(error) => {
-            eprintln!("pillbox: vault: failed to collect oauth request body: {error}");
-            return unauthorized("body read error").into();
-        }
-    };
-
-    let mut value: serde_json::Value = match serde_json::from_slice(&collected) {
-        Ok(v) => v,
-        Err(_) => {
-            // Not JSON; we can't rewrite. Reject — refusing is safer
-            // than leaking the real token by accident.
-            return unauthorized("non-json oauth body").into();
-        }
-    };
-
-    // Two grant types reach /oauth/token:
-    //
-    // 1. `grant_type=refresh_token` — the agent's normal token refresh.
-    //    Body carries a `refresh_token` that's one of our minted stubs;
-    //    we look up the sandbox by stub, swap stub → real on the way
-    //    out, and the response will return rotated tokens.
-    //
-    // 2. `grant_type=authorization_code` — Claude Code's `/login`
-    //    flow. Body carries a one-time `code` from the user's
-    //    browser-side OAuth dance; no stub to look up. We still must
-    //    intercept the *response* because that's where the freshly-
-    //    minted real tokens come back — without rewriting them to
-    //    stubs, the agent stores real bearers and every subsequent
-    //    API call 401s when the vault sees an unknown stub.
-    //
-    // Either way, set `pending` so handle_response runs; the
-    // identification path differs.
-    let stub_refresh = value
-        .get("refresh_token")
-        .and_then(|v| v.as_str())
-        .map(str::to_owned);
-
-    let real_refresh = if let Some(stub) = stub_refresh.as_deref() {
-        let registry = server.registry_lock();
-        let sandbox_id = match registry.sandbox_for_stub(stub) {
-            Some(s) => s.to_string(),
-            None => return unauthorized("unknown stub refresh token").into(),
-        };
-        *pending = Some(PendingFlow {
-            provider_id: PROVIDER_ID,
-            sandbox_id: sandbox_id.clone(),
-        });
-        registry
-            .real(&sandbox_id)
-            .and_then(|v| v.pointer("/claudeAiOauth/refreshToken"))
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)
-    } else {
-        // Authorization-code grant: identify the sandbox by the
-        // unique anthropic OAuth lease in the registry. Pass the
-        // request body through unchanged — the code itself isn't
-        // ours to rewrite, and the upstream needs it verbatim to
-        // mint the new token pair.
-        let sandbox_id = server
-            .registry_lock()
-            .unique_sandbox_for_provider(PROVIDER_ID);
-        if let Some(sandbox_id) = sandbox_id {
-            *pending = Some(PendingFlow {
-                provider_id: PROVIDER_ID,
-                sandbox_id,
-            });
-        }
-        None
-    };
-
-    if let (Some(obj), Some(real)) = (value.as_object_mut(), real_refresh) {
-        obj.insert("refresh_token".to_string(), serde_json::Value::String(real));
-    }
-
-    let new_body = serde_json::to_vec(&value).unwrap_or(collected.to_vec());
-    let new_len = new_body.len();
-    parts.headers.remove("content-length");
-    parts
-        .headers
-        .insert("content-length", HeaderValue::from(new_len));
-    // Force the upstream OAuth response back uncompressed so our
-    // response-side `handle_response` can `serde_json::from_slice`
-    // it. Anthropic gzips `/oauth/token` responses when the client
-    // advertises `Accept-Encoding: gzip` (Claude Code does); the
-    // vault used to log "oauth response not JSON; passing through"
-    // and the agent ended up with raw tokens that the registry
-    // didn't recognize on subsequent API calls → 401.
-    parts.headers.remove("accept-encoding");
-    parts
-        .headers
-        .insert("accept-encoding", HeaderValue::from_static("identity"));
-    Request::from_parts(parts, Body::from(new_body)).into()
 }
 
 /// Two flows can target `api.anthropic.com`:
@@ -458,19 +408,6 @@ async fn handle_api_request_x_api_key(
         ApiKeySwap::PassThrough => Request::from_parts(parts, body).into(),
         ApiKeySwap::Unauthorized(detail) => unauthorized(detail).into(),
     }
-}
-
-fn stubs_for(registry: &Registry, sandbox_id: &str) -> Option<(String, String)> {
-    let stubs = registry.stubs_for(sandbox_id)?;
-    let access = stubs
-        .iter()
-        .find(|s| s.starts_with(STUB_ACCESS_PREFIX))?
-        .clone();
-    let refresh = stubs
-        .iter()
-        .find(|s| s.starts_with(STUB_REFRESH_PREFIX))?
-        .clone();
-    Some((access, refresh))
 }
 
 #[cfg(test)]
@@ -593,18 +530,17 @@ mod tests {
             .is_none());
     }
 
-    // ── End-to-end Request/Response integration tests ────────────────
+    // ── End-to-end request integration tests ────────────────────────
     //
-    // These tests construct hyper `Request<Body>` / `Response<Body>`
-    // objects, hand them to the provider's handlers, and assert on the
-    // returned objects. They live in the crate test module (rather than
+    // These tests construct hyper `Request<Body>` objects, hand them to the
+    // provider handler, and assert on the returned objects. They live in the crate test module (rather than
     // a separate `tests/` integration crate) because the trait methods
     // and supporting types are `pub(crate)`.
 
     use crate::vault::known_secrets::HeaderScheme;
     use crate::vault::providers::test_support::{
-        body_bytes, body_json, build_json_response, build_request, cleanup, expect_request,
-        expect_response, fresh_server, sample_anthropic_real,
+        body_bytes, build_request, cleanup, expect_request, expect_response, fresh_server,
+        sample_anthropic_real,
     };
     use hudsucker::Body;
 
@@ -652,9 +588,8 @@ mod tests {
             Request::from_parts(parts, body)
         };
 
-        let mut pending: Option<PendingFlow> = None;
         let out = AnthropicProvider
-            .handle_request(req, server.inner_for_test(), &mut pending)
+            .handle_request(req, server.inner_for_test())
             .await;
         let out_req = expect_request(out, "bearer swap");
 
@@ -665,8 +600,6 @@ mod tests {
             .to_str()
             .unwrap();
         assert_eq!(auth, "Bearer REAL_ACCESS");
-        // The bearer flow doesn't need a response-side swap.
-        assert!(pending.is_none());
 
         drop(_lease);
         cleanup(server, dir);
@@ -689,9 +622,8 @@ mod tests {
             Request::from_parts(parts, body)
         };
 
-        let mut pending: Option<PendingFlow> = None;
         let out = AnthropicProvider
-            .handle_request(req, server.inner_for_test(), &mut pending)
+            .handle_request(req, server.inner_for_test())
             .await;
         let res = expect_response(out, "unknown bearer");
         assert_eq!(res.status(), 401);
@@ -699,7 +631,6 @@ mod tests {
         let s = std::str::from_utf8(&body).unwrap();
         assert!(s.contains("\"vault\":\"unauthorized\""), "body: {s}");
         assert!(s.contains("unknown stub access token"), "body: {s}");
-        assert!(pending.is_none());
 
         cleanup(server, dir);
     }
@@ -709,13 +640,11 @@ mod tests {
         let (server, dir) = fresh_server().await;
         let req = build_request("GET", "https://api.anthropic.com/v1/models", Body::empty());
 
-        let mut pending: Option<PendingFlow> = None;
         let out = AnthropicProvider
-            .handle_request(req, server.inner_for_test(), &mut pending)
+            .handle_request(req, server.inner_for_test())
             .await;
         let out_req = expect_request(out, "no-auth pass-through");
         assert!(out_req.headers().get("authorization").is_none());
-        assert!(pending.is_none());
 
         cleanup(server, dir);
     }
@@ -744,9 +673,8 @@ mod tests {
             Request::from_parts(parts, body)
         };
 
-        let mut pending: Option<PendingFlow> = None;
         let out = AnthropicProvider
-            .handle_request(req, server.inner_for_test(), &mut pending)
+            .handle_request(req, server.inner_for_test())
             .await;
         let out_req = expect_request(out, "x-api-key swap");
         let key = out_req
@@ -780,9 +708,8 @@ mod tests {
             Request::from_parts(parts, body)
         };
 
-        let mut pending: Option<PendingFlow> = None;
         let out = AnthropicProvider
-            .handle_request(req, server.inner_for_test(), &mut pending)
+            .handle_request(req, server.inner_for_test())
             .await;
         let out_req = expect_request(out, "x-api-key pass-through");
         assert_eq!(
@@ -799,205 +726,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oauth_refresh_request_swaps_body_and_sets_pending() {
+    async fn oauth_refresh_request_is_rejected_without_inspecting_or_releasing_token() {
         let (server, dir) = fresh_server().await;
         let _lease = server
             .lease("claude", "sbx-oauth", sample_anthropic_real())
             .expect("lease");
         let (_, stub_refresh) = stubs_for_sandbox(&server, "sbx-oauth");
-
-        let body_json_in = serde_json::json!({
-            "grant_type": "refresh_token",
-            "refresh_token": stub_refresh,
-        });
-        let body_bytes_in = serde_json::to_vec(&body_json_in).unwrap();
-        let len = body_bytes_in.len();
         let req = Request::builder()
             .method("POST")
             .uri("https://console.anthropic.com/oauth/token")
             .header("content-type", "application/json")
-            .header("content-length", len)
-            .body(Body::from(body_bytes_in))
+            .body(Body::from(format!(
+                r#"{{"grant_type":"refresh_token","refresh_token":"{stub_refresh}"}}"#
+            )))
             .unwrap();
-
-        let mut pending: Option<PendingFlow> = None;
-        let out = AnthropicProvider
-            .handle_request(req, server.inner_for_test(), &mut pending)
-            .await;
-        let out_req = expect_request(out, "oauth refresh request");
-
-        let body = body_json(out_req.into_body()).await;
-        assert_eq!(
-            body.get("refresh_token").and_then(|v| v.as_str()),
-            Some("REAL_REFRESH")
+        let res = expect_response(
+            AnthropicProvider
+                .handle_request(req, server.inner_for_test())
+                .await,
+            "broker-owned oauth refresh",
         );
-        let flow = pending.expect("pending should be set for oauth refresh");
-        assert_eq!(flow.provider_id, "claude");
-        assert_eq!(flow.sandbox_id, "sbx-oauth");
+        assert_eq!(res.status(), 403);
+        let body = String::from_utf8(body_bytes(res.into_body()).await).unwrap();
+        assert!(body.contains("OAuth rotation is broker-owned"));
+        assert!(!body.contains(&stub_refresh));
+        assert!(!body.contains("REAL_REFRESH"));
 
         drop(_lease);
         cleanup(server, dir);
     }
 
     #[tokio::test]
-    async fn oauth_authorization_code_grant_sets_pending_for_unique_sandbox() {
-        // Claude Code's `/login` flow does grant_type=authorization_code
-        // with a `code` instead of a refresh_token. The vault still needs
-        // to intercept the response (which carries the freshly-minted
-        // real tokens) so it can rotate vault state + swap real → stub
-        // in the body — otherwise the agent stores real bearers and
-        // every subsequent API call 401s when the vault sees an unknown
-        // stub. Regression guard for that path.
+    async fn oauth_authorization_code_grant_is_also_rejected() {
         let (server, dir) = fresh_server().await;
-        let _lease = server
-            .lease("claude", "sbx-fresh-login", sample_anthropic_real())
-            .expect("lease");
-
-        let body_json_in = serde_json::json!({
-            "grant_type": "authorization_code",
-            "code": "oauth_code_from_browser",
-            "client_id": "claude_code",
-            "redirect_uri": "http://localhost:54321/callback",
-        });
-        let body_bytes_in = serde_json::to_vec(&body_json_in).unwrap();
-        let len = body_bytes_in.len();
         let req = Request::builder()
             .method("POST")
-            .uri("https://console.anthropic.com/oauth/token")
-            .header("content-type", "application/json")
-            .header("content-length", len)
-            .body(Body::from(body_bytes_in.clone()))
+            .uri("https://platform.claude.com/v1/oauth/token")
+            .body(Body::from("not even json"))
             .unwrap();
-
-        let mut pending: Option<PendingFlow> = None;
-        let out = AnthropicProvider
-            .handle_request(req, server.inner_for_test(), &mut pending)
-            .await;
-        let out_req = expect_request(out, "oauth authorization-code request");
-
-        // The request body passes through unchanged — we don't own
-        // the authorization code and the upstream needs it verbatim.
-        let bytes = body_bytes(out_req.into_body()).await;
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(
-            body.get("grant_type").and_then(|v| v.as_str()),
-            Some("authorization_code")
+        let res = expect_response(
+            AnthropicProvider
+                .handle_request(req, server.inner_for_test())
+                .await,
+            "guest authorization-code grant",
         );
-        assert_eq!(
-            body.get("code").and_then(|v| v.as_str()),
-            Some("oauth_code_from_browser")
-        );
-
-        // But pending MUST be set so handle_response runs and swaps the
-        // real tokens to stubs on the way back to the agent.
-        let flow = pending.expect("pending should be set for authorization_code grant");
-        assert_eq!(flow.provider_id, "claude");
-        assert_eq!(flow.sandbox_id, "sbx-fresh-login");
-
-        drop(_lease);
-        cleanup(server, dir);
-    }
-
-    #[tokio::test]
-    async fn oauth_refresh_request_unknown_stub_returns_401_and_no_pending() {
-        let (server, dir) = fresh_server().await;
-        let body_json_in = serde_json::json!({
-            "grant_type": "refresh_token",
-            "refresh_token": "sk-ant-ort01-unknownStubRefresh",
-        });
-        let body_bytes_in = serde_json::to_vec(&body_json_in).unwrap();
-        let len = body_bytes_in.len();
-        let req = Request::builder()
-            .method("POST")
-            .uri("https://console.anthropic.com/oauth/token")
-            .header("content-type", "application/json")
-            .header("content-length", len)
-            .body(Body::from(body_bytes_in))
-            .unwrap();
-
-        let mut pending: Option<PendingFlow> = None;
-        let out = AnthropicProvider
-            .handle_request(req, server.inner_for_test(), &mut pending)
-            .await;
-        let res = expect_response(out, "oauth unknown stub");
-        assert_eq!(res.status(), 401);
-        assert!(pending.is_none());
-
-        cleanup(server, dir);
-    }
-
-    #[tokio::test]
-    async fn oauth_refresh_response_swaps_real_to_new_stubs_and_rotates_registry() {
-        let (server, dir) = fresh_server().await;
-        let _lease = server
-            .lease("claude", "sbx-rot", sample_anthropic_real())
-            .expect("lease");
-        let (stub_access_before, stub_refresh_before) = stubs_for_sandbox(&server, "sbx-rot");
-
-        // The response handler only fires when pending was set by a
-        // prior request-side swap. Mirror that here.
-        let mut pending: Option<PendingFlow> = Some(PendingFlow {
-            provider_id: "claude",
-            sandbox_id: "sbx-rot".into(),
-        });
-
-        let res = build_json_response(serde_json::json!({
-            "access_token": "NEW_REAL_ACCESS",
-            "refresh_token": "NEW_REAL_REFRESH",
-            "expires_in": 3600,
-        }));
-
-        let out = AnthropicProvider
-            .handle_response(res, server.inner_for_test(), &mut pending)
-            .await;
-
-        // Pending must be cleared so the next request/response pair
-        // starts fresh.
-        assert!(pending.is_none());
-
-        let (parts, body) = out.into_parts();
-        // content-length must reflect the rewritten body, not the old one.
-        let cl: usize = parts
-            .headers
-            .get("content-length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse().ok())
-            .expect("content-length present and numeric");
-        let raw_body = body_bytes(body).await;
-        assert_eq!(cl, raw_body.len(), "content-length matches body length");
-
-        let body: serde_json::Value = serde_json::from_slice(&raw_body).unwrap();
-        let access = body.get("access_token").and_then(|v| v.as_str()).unwrap();
-        let refresh = body.get("refresh_token").and_then(|v| v.as_str()).unwrap();
-        // Body must carry stubs back to the guest, not the new real tokens.
-        assert!(access.starts_with(STUB_ACCESS_PREFIX), "got {access}");
-        assert!(refresh.starts_with(STUB_REFRESH_PREFIX), "got {refresh}");
-        assert!(!raw_body.windows(15).any(|w| w == b"NEW_REAL_ACCESS"));
-        assert!(!raw_body.windows(16).any(|w| w == b"NEW_REAL_REFRESH"));
-
-        // Stubs minted at provision time stay stable across rotation —
-        // pillbox rotates only the *real* side, not the stub the guest sees.
-        let (stub_access_after, stub_refresh_after) = stubs_for_sandbox(&server, "sbx-rot");
-        assert_eq!(stub_access_before, stub_access_after);
-        assert_eq!(stub_refresh_before, stub_refresh_after);
-
-        // Registry's stored real values must have rotated.
-        {
-            let registry = server.registry_lock_for_test();
-            let real = registry.real("sbx-rot").unwrap();
-            assert_eq!(
-                real.pointer("/claudeAiOauth/accessToken")
-                    .and_then(|v| v.as_str()),
-                Some("NEW_REAL_ACCESS")
-            );
-            assert_eq!(
-                real.pointer("/claudeAiOauth/refreshToken")
-                    .and_then(|v| v.as_str()),
-                Some("NEW_REAL_REFRESH")
-            );
-        }
-
-        drop(_lease);
+        assert_eq!(res.status(), 403);
         cleanup(server, dir);
     }
 
@@ -1024,9 +797,8 @@ mod tests {
                 );
                 Request::from_parts(parts, body)
             };
-            let mut pending = None;
             let out = AnthropicProvider
-                .handle_request(req, server.inner_for_test(), &mut pending)
+                .handle_request(req, server.inner_for_test())
                 .await;
             let _ = expect_request(out, "pre-drop swap");
         }
@@ -1048,9 +820,8 @@ mod tests {
             );
             Request::from_parts(parts, body)
         };
-        let mut pending = None;
         let out = AnthropicProvider
-            .handle_request(req, server.inner_for_test(), &mut pending)
+            .handle_request(req, server.inner_for_test())
             .await;
         let res = expect_response(out, "post-drop 401");
         assert_eq!(res.status(), 401);

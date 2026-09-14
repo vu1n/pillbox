@@ -10,6 +10,8 @@
 //! Whatever the agent writes — `.credentials.json`, settings, refresh
 //! tokens — persists there naturally.
 
+#[cfg(feature = "libkrun")]
+use std::borrow::Cow;
 use std::{
     fs,
     os::unix::fs::PermissionsExt,
@@ -117,6 +119,87 @@ pub(crate) enum StructuredModelPolicy {
     OptionalBare,
 }
 
+/// Libkrun-only policy for a PTY agent whose cloned home or terminal protocol
+/// needs agent-specific handling. Docker deliberately does not consume this:
+/// its PTY contract remains the existing raw byte stream.
+#[cfg(feature = "libkrun")]
+#[derive(Clone, Copy)]
+pub(crate) struct LibkrunPtyProfile {
+    cloned_home: Option<ClonedHomePreparation>,
+    detached_transcript: Option<DetachedTranscriptSource>,
+    input_framing: PtyInputFraming,
+}
+
+#[cfg(feature = "libkrun")]
+#[derive(Clone, Copy)]
+enum ClonedHomePreparation {
+    FreshCodex,
+}
+
+/// The durable source a detached producer follows. The source kind is explicit
+/// across the re-exec boundary; callers never infer it from the capture path's
+/// filesystem type.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DetachedTranscriptSource {
+    ServerCapture(crate::events::EventsFormat),
+    Discover(crate::events::transcripts::Harness),
+}
+
+impl DetachedTranscriptSource {
+    #[cfg(feature = "libkrun")]
+    pub(crate) fn as_token(self) -> &'static str {
+        match self {
+            Self::ServerCapture(format) => format.as_str(),
+            Self::Discover(crate::events::transcripts::Harness::Claude) => "transcript:claude",
+            Self::Discover(crate::events::transcripts::Harness::Codex) => "transcript:codex",
+        }
+    }
+
+    pub(crate) fn from_token(token: &str) -> Option<Self> {
+        if let Some(format) = crate::events::EventsFormat::from_token(token) {
+            return Some(Self::ServerCapture(format));
+        }
+        match token {
+            "transcript:claude" => {
+                Some(Self::Discover(crate::events::transcripts::Harness::Claude))
+            }
+            "transcript:codex" => Some(Self::Discover(crate::events::transcripts::Harness::Codex)),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(feature = "libkrun")]
+#[derive(Clone, Copy)]
+enum PtyInputFraming {
+    BracketedPasteLfTurn,
+}
+
+#[cfg(feature = "libkrun")]
+impl LibkrunPtyProfile {
+    /// Prepare only the throwaway home clone. Errors are launch failures: an
+    /// unprepared detached agent can park before it accepts input or can expose
+    /// stale transcripts to the sole producer, so this path is fail-closed.
+    pub(crate) fn prepare_cloned_home(self, home: &Path, guest_workspace: &str) -> Result<()> {
+        match self.cloned_home {
+            Some(ClonedHomePreparation::FreshCodex) => {
+                prepare_fresh_codex_home(home, guest_workspace)
+            }
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn detached_transcript(self) -> Option<DetachedTranscriptSource> {
+        self.detached_transcript
+    }
+
+    pub(crate) fn frame_input<'a>(self, bytes: &'a [u8]) -> Cow<'a, [u8]> {
+        match self.input_framing {
+            PtyInputFraming::BracketedPasteLfTurn => frame_bracketed_paste_lf_turn(bytes),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct AgentSpec {
     pub(crate) id: &'static str,
@@ -161,6 +244,11 @@ pub struct AgentSpec {
     /// path; dead on a non-libkrun build (docker only checks `integration`).
     #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) structured: Option<StructuredProfile>,
+    /// Agent-specific PTY behavior consumed only by libkrun. `None` preserves
+    /// the generic raw-input/no-clone-prep behavior (including Docker, which
+    /// never reads this field).
+    #[cfg(feature = "libkrun")]
+    pub(crate) libkrun_pty: Option<LibkrunPtyProfile>,
 }
 
 pub const CLAUDE: AgentSpec = AgentSpec {
@@ -183,6 +271,8 @@ pub const CLAUDE: AgentSpec = AgentSpec {
     prepare_workspace: Some(pretrust_claude_workspace),
     server: None,
     structured: None,
+    #[cfg(feature = "libkrun")]
+    libkrun_pty: None,
 };
 
 pub const CODEX: AgentSpec = AgentSpec {
@@ -200,6 +290,14 @@ pub const CODEX: AgentSpec = AgentSpec {
     prepare_workspace: None,
     server: None,
     structured: None,
+    #[cfg(feature = "libkrun")]
+    libkrun_pty: Some(LibkrunPtyProfile {
+        cloned_home: Some(ClonedHomePreparation::FreshCodex),
+        detached_transcript: Some(DetachedTranscriptSource::Discover(
+            crate::events::transcripts::Harness::Codex,
+        )),
+        input_framing: PtyInputFraming::BracketedPasteLfTurn,
+    }),
 };
 
 /// codex driven through `codex app-server` (its JSON-RPC-over-stdio protocol,
@@ -245,6 +343,8 @@ pub const CODEX_SERVE: AgentSpec = AgentSpec {
         libkrun_only: true,
     }),
     structured: None,
+    #[cfg(feature = "libkrun")]
+    libkrun_pty: None,
 };
 
 pub const OPENCODE: AgentSpec = AgentSpec {
@@ -268,6 +368,8 @@ pub const OPENCODE: AgentSpec = AgentSpec {
         libkrun_only: false,
     }),
     structured: None,
+    #[cfg(feature = "libkrun")]
+    libkrun_pty: None,
 };
 
 /// Cursor Agent CLI (`agent`) as a structured one-shot. Auth is either
@@ -294,6 +396,8 @@ pub const CURSOR: AgentSpec = AgentSpec {
         model: StructuredModelPolicy::OptionalBare,
         alt_auth_env: Some("CURSOR_API_KEY"),
     }),
+    #[cfg(feature = "libkrun")]
+    libkrun_pty: None,
 };
 
 pub const PI: AgentSpec = AgentSpec {
@@ -328,6 +432,8 @@ pub const PI: AgentSpec = AgentSpec {
         model: StructuredModelPolicy::RequireProviderModel,
         alt_auth_env: None,
     }),
+    #[cfg(feature = "libkrun")]
+    libkrun_pty: None,
 };
 
 pub const ALL: &[&AgentSpec] = &[&CLAUDE, &CODEX, &CODEX_SERVE, &OPENCODE, &PI, &CURSOR];
@@ -365,6 +471,80 @@ fn finalize_claude_onboarding(home: &Path) -> Result<()> {
         .with_context(|| format!("serialize {}", path.display()))?;
     fs::write(&path, serialized).with_context(|| format!("write {}", path.display()))?;
     Ok(())
+}
+
+/// Make a throwaway Codex home unambiguously fresh before libkrun mounts it.
+/// The authoritative auth home is never touched: stale rollouts are removed
+/// only from the clone, and only this run's unique guest workspace is trusted.
+#[cfg(feature = "libkrun")]
+fn prepare_fresh_codex_home(home: &Path, guest_workspace: &str) -> Result<()> {
+    let sessions = home.join(".codex/sessions");
+    match fs::remove_dir_all(&sessions) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "clear cloned Codex transcript history {}",
+                    sessions.display()
+                )
+            });
+        }
+    }
+
+    // Mutate the complete TOML document so unrelated settings and project
+    // entries survive preparation of this one workspace.
+    let config_path = home.join(".codex/config.toml");
+    let mut config = match fs::read_to_string(&config_path) {
+        Ok(text) => text
+            .parse::<toml::Value>()
+            .with_context(|| format!("parse cloned Codex config {}", config_path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            toml::Value::Table(toml::map::Map::new())
+        }
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("read cloned Codex config {}", config_path.display()));
+        }
+    };
+    let root = config
+        .as_table_mut()
+        .context("cloned Codex config root must be a TOML table")?;
+    let projects = root
+        .entry("projects")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .context("cloned Codex config `projects` must be a TOML table")?;
+    let project = projects
+        .entry(guest_workspace)
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .context("cloned Codex project trust entry must be a TOML table")?;
+    project.insert("trust_level".into(), toml::Value::String("trusted".into()));
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create cloned Codex config dir {}", parent.display()))?;
+    }
+    fs::write(&config_path, toml::to_string(&config)?)
+        .with_context(|| format!("write cloned Codex config {}", config_path.display()))?;
+    Ok(())
+}
+
+/// Codex 0.151's raw-mode TUI treats LF as text rather than `KeyCode::Enter`.
+/// A trailing LF explicitly marks a complete turn, so paste the body as one
+/// input event and submit it with a following CR. Non-terminated bytes remain
+/// exactly raw.
+#[cfg(feature = "libkrun")]
+fn frame_bracketed_paste_lf_turn(bytes: &[u8]) -> Cow<'_, [u8]> {
+    let Some(body) = bytes.strip_suffix(b"\n") else {
+        return Cow::Borrowed(bytes);
+    };
+    let body = body.strip_suffix(b"\r").unwrap_or(body);
+    let mut framed = Vec::with_capacity(body.len() + 13);
+    framed.extend_from_slice(b"\x1b[200~");
+    framed.extend_from_slice(body);
+    framed.extend_from_slice(b"\x1b[201~\r");
+    Cow::Owned(framed)
 }
 
 /// Pre-accept claude's workspace trust dialog for `guest_workspace` by seeding
@@ -1157,5 +1337,28 @@ mod tests {
             true
         );
         assert_eq!(v["hasCompletedOnboarding"], true);
+    }
+
+    #[cfg(feature = "libkrun")]
+    #[test]
+    fn detached_transcript_source_tokens_round_trip_and_reject_unknown() {
+        let sources = [
+            DetachedTranscriptSource::ServerCapture(crate::events::EventsFormat::Sse),
+            DetachedTranscriptSource::ServerCapture(crate::events::EventsFormat::Ndjson),
+            DetachedTranscriptSource::Discover(crate::events::transcripts::Harness::Claude),
+            DetachedTranscriptSource::Discover(crate::events::transcripts::Harness::Codex),
+        ];
+        for source in sources {
+            assert_eq!(
+                DetachedTranscriptSource::from_token(source.as_token()),
+                Some(source)
+            );
+        }
+        assert_eq!(DetachedTranscriptSource::from_token(""), None);
+        assert_eq!(DetachedTranscriptSource::from_token("transcript"), None);
+        assert_eq!(
+            DetachedTranscriptSource::from_token("transcript:unknown"),
+            None
+        );
     }
 }

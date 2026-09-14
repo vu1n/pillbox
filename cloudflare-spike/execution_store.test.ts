@@ -9,6 +9,12 @@ import {
   type RelationalStatement,
   type RelationalUsage,
 } from "./src/execution_store.ts";
+import type { ManagedExecutionOwner } from "./src/managed_ownership.ts";
+
+const owner: ManagedExecutionOwner = {
+  domain: "huddles_workspace",
+  digest: `sha256:${"d".repeat(64)}`,
+};
 
 const hashA = `sha256:${"a".repeat(64)}` as const;
 const hashB = `sha256:${"b".repeat(64)}` as const;
@@ -30,6 +36,9 @@ function claim(
     execution_digest: digest,
     execution_policy_revision: "policy/1",
     session_id: "session-1",
+    owner,
+    allowance_epoch: "preview-2026-09-01",
+    allowance_limit: 3,
     attribution: {
       harness: "opencode",
       transport: "http",
@@ -43,7 +52,7 @@ function claim(
   };
 }
 
-test("happy path uses one claim write and one terminal write", async () => {
+test("happy path uses one execution claim write and one terminal write", async () => {
   const database = new FakeDatabase();
   const usage: RelationalUsage[] = [];
   const store = new D1ExecutionStore(database, (item) => usage.push(item));
@@ -55,6 +64,7 @@ test("happy path uses one claim write and one terminal write", async () => {
       invocation_id: "invocation-1",
       request_hash: hashA,
       owner_token: "owner-1",
+      owner,
       status: "completed",
       artifact_ref: artifact,
       now_ms: 2_000,
@@ -64,7 +74,7 @@ test("happy path uses one claim write and one terminal write", async () => {
 
   assert.equal(sum(usage, "rows_written"), 2);
   assert.ok(sum(usage, "rows_read") <= 1);
-  assert.equal((await store.get("invocation-1"))?.artifact_ref?.key, artifact.key);
+  assert.equal((await store.get("invocation-1", owner))?.artifact_ref?.key, artifact.key);
 });
 
 test("exact retries reuse the row without another write", async () => {
@@ -92,9 +102,7 @@ test("changed content or reused idempotency keys conflict", async () => {
   );
   assert.equal(
     (
-      await store.claim(
-        claim({ invocation_id: "invocation-2", owner_token: "owner-2" }),
-      )
+      await store.claim(claim({ invocation_id: "invocation-2", owner_token: "owner-2" }))
     ).kind,
     "conflict",
   );
@@ -109,13 +117,14 @@ test("only the live owner can terminalize a running execution", async () => {
       invocation_id: "invocation-1",
       request_hash: hashA,
       owner_token: "other-owner",
+      owner,
       status: "failed",
       artifact_ref: artifact,
       now_ms: 2_000,
     }),
     false,
   );
-  assert.equal((await store.get("invocation-1"))?.status, "running");
+  assert.equal((await store.get("invocation-1", owner))?.status, "running");
 });
 
 function sum(items: readonly RelationalUsage[], key: keyof RelationalUsage): number {
@@ -124,6 +133,11 @@ function sum(items: readonly RelationalUsage[], key: keyof RelationalUsage): num
 
 class FakeDatabase implements RelationalDatabase {
   readonly rows = new Map<string, Record<string, unknown>>();
+  readonly allowance = {
+    deployment_epoch: "preview-2026-09-01",
+    execution_limit: 3,
+    reserved_executions: 0,
+  };
 
   prepare(sql: string): RelationalStatement {
     return new FakeStatement(this, sql);
@@ -174,10 +188,14 @@ class FakeStatement implements RelationalStatement {
         harness,
         transport,
         requested_model,
+        owner_domain,
+        owner_digest,
         owner_token,
         lease_expires_at_ms,
         created_at_ms,
         updated_at_ms,
+        allowance_epoch,
+        allowance_limit,
       ] = this.values;
       const duplicate =
         this.database.rows.has(String(invocation_id)) ||
@@ -195,11 +213,15 @@ class FakeStatement implements RelationalStatement {
         harness,
         transport,
         requested_model,
+        owner_domain,
+        owner_digest,
         status: "running",
         owner_token,
         lease_expires_at_ms,
         created_at_ms,
         updated_at_ms,
+        allowance_epoch,
+        allowance_limit,
         artifact_key: null,
         artifact_media_type: null,
         artifact_bytes: null,
@@ -218,12 +240,16 @@ class FakeStatement implements RelationalStatement {
         invocation_id,
         request_hash,
         owner_token,
+        owner_domain,
+        owner_digest,
       ] = this.values;
       const row = this.database.rows.get(String(invocation_id));
       if (
         row === undefined ||
         row.request_hash !== request_hash ||
         row.owner_token !== owner_token ||
+        row.owner_domain !== owner_domain ||
+        row.owner_digest !== owner_digest ||
         row.status !== "running"
       ) {
         return { meta: { changes: 0, rows_written: 0 } };

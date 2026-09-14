@@ -9,19 +9,23 @@ single-controller execution service, not a multiplayer gateway.
 - D1 `execution`: bounded invocation claims and terminal references
 - R2 `EXECUTION_EVIDENCE`: one immutable terminal artifact per invocation
 - Analytics Engine `RUN_COSTS`: at most one compact point per terminal run
-- Worker/service-binding routes: execute, status, cancel, workspace provision,
+- Worker/service-binding routes: execute, status, cancel, workspace provision
+  (bound to a prepared invocation ID and execution request hash),
   and workspace finalize
 
 There is no Pillbox-authored Durable Object class, Agents SDK, per-event SQLite
 log, WebSocket replay stream, driver lease, or participant roster.
 
-Managed Huddles calls carry an Ed25519 `huddles.execution-grant/1` over the
-private `PillboxAuthorizationControlPlane` service binding. Pillbox validates
-the independent request binding, recomputes execution/output hashes, verifies
-the signature, and rechecks currentness before every ensure and invoke—even
-when D1 can reuse a terminal result. Currentness v2 pins both signer key ID and
-the SHA-256 fingerprint of the raw Ed25519 public key. Credential bindings fail
-closed until a bounded, non-Durable-Object broker exists.
+Managed Huddles execute/status/cancel calls carry signed Ed25519
+`huddles.execution-operation-grant/2` sidecars. Pillbox verifies exact request
+binding and rechecks the separate, authorize-only
+`PillboxAuthorizationCurrentness` service before persistence or charged access,
+including exact D1 retries. The signing issuer is not bound to Pillbox.
+Credential bindings fail closed until a bounded, non-Durable-Object broker
+exists.
+
+Historical ensure/invoke compatibility is local-test-only, accepts no managed
+authorization, and is not exported by the production Worker.
 
 Public HTTP routes require short-lived HMAC capabilities bound to one operation
 and exact session/invocation id (`MANAGED_CAPABILITY_SECRET`). Huddles uses the

@@ -4,6 +4,7 @@ import {
   computeExecutionIdentityDigest,
   computeInvocationRequestHash,
   computeRenderedInputHash,
+  canonicalJson,
   CodexExecutionBoundaryError,
   MAX_EVIDENCE_PAGE_SIZE,
   type ExecuteInvocationV2Request,
@@ -56,7 +57,7 @@ async function validRequest(
     contract_version: "pillbox.execution/2",
     session_ref: { session_id: "session-1" },
     invocation_id: "invocation-1",
-    idempotency_key: "delivery-1",
+    idempotency_key: "invocation-1",
     rendered_input,
     rendered_input_hash: await computeRenderedInputHash(rendered_input),
     tool_policy: "deny_all",
@@ -94,6 +95,17 @@ test("valid Codex app-server execution envelope validates", async () => {
   const validated = await validateExecuteInvocationV2Request(request);
   assert.deepEqual(validated, request);
   assert.deepEqual(validateSupportedCodexExecution(validated.execution), codexExecution);
+});
+
+test("execute identity rejects a separately chosen idempotency key", async () => {
+  const request = await validRequest();
+  await assert.rejects(
+    validateExecuteInvocationV2Request({
+      ...request,
+      idempotency_key: "delivery-1",
+    }),
+    assertBoundaryError,
+  );
 });
 
 test("single-controller CLI turns may use runtime tools and text output", async () => {
@@ -174,6 +186,20 @@ test("execution identity digest is deterministic across object key order", async
   assert.equal(
     await computeExecutionIdentityDigest(codexExecution, "policy/1"),
     await computeExecutionIdentityDigest(reordered, "policy/1"),
+  );
+});
+
+test("canonical JSON orders uppercase and non-ASCII keys by UTF-16 code units", () => {
+  assert.equal(
+    canonicalJson({
+      "\ufffd": 6,
+      "\ud83d\ude00": 5,
+      "\u00e9": 4,
+      "\u00c9": 3,
+      a: 2,
+      A: 1,
+    }),
+    '{"A":1,"a":2,"\u00c9":3,"\u00e9":4,"\ud83d\ude00":5,"\ufffd":6}',
   );
 });
 
@@ -371,7 +397,7 @@ test("cancellation is an exact idempotent runtime request", () => {
   const request = {
     contract_version: "pillbox.execution/2",
     invocation_id: "invocation-1",
-    idempotency_key: "cancel-delivery-1",
+    idempotency_key: "invocation-1",
     reason: "caller requested cancellation",
   } as const;
   assert.deepEqual(validateCancelInvocationV2Request(request), request);
@@ -381,6 +407,14 @@ test("cancellation is an exact idempotent runtime request", () => {
   );
   assert.throws(
     () => validateCancelInvocationV2Request({ ...request, reason: "" }),
+    assertBoundaryError,
+  );
+  assert.throws(
+    () =>
+      validateCancelInvocationV2Request({
+        ...request,
+        idempotency_key: "cancel-delivery-1",
+      }),
     assertBoundaryError,
   );
 });

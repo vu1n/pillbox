@@ -8,7 +8,9 @@
 // Context: doc://pillbox/dx-zero-config-local@0001#dx-zero-config-local
 // Context: doc://pillbox/optimization-external-substrate-primitives@0001#optimization-external-substrate-primitives
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use std::os::unix::fs::OpenOptionsExt as _;
+use std::os::unix::io::AsRawFd as _;
 
 use crate::agents::Integration;
 use crate::cli::{DoneStatus, SessionAction};
@@ -23,38 +25,114 @@ mod stream;
 /// dir, so teardown can SIGTERM it and live readers can tell a producer is keeping
 /// the log fresh (and skip their own drain — the single-producer invariant).
 pub(crate) const TAILER_PID_FILE: &str = ".tailer.pid";
+pub(crate) const TAILER_CURSOR_FILE: &str = ".tailer-cursor.json";
+const TAILER_LOCK_FILE: &str = ".tailer.lock";
 
-/// The detached §0 PRODUCER for a reparented server session (the libkrun analog of
+struct DetachedProducerLock {
+    _file: std::fs::File,
+}
+
+impl DetachedProducerLock {
+    fn check_held(session_dir: &std::path::Path) -> Result<()> {
+        let path = session_dir.join(TAILER_LOCK_FILE);
+        let file = std::fs::File::open(&path)
+            .with_context(|| format!("open detached producer lock {}", path.display()))?;
+        // A dead child may remain a zombie (signal-0 still succeeds), but its
+        // kernel-owned flock is released. Never trust the PID stamp alone.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            anyhow::bail!("detached transcript producer released its ownership lock");
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(());
+        }
+        Err(error).with_context(|| format!("probe detached producer lock {}", path.display()))
+    }
+
+    fn try_acquire(session_dir: &std::path::Path) -> Result<Self> {
+        let path = session_dir.join(TAILER_LOCK_FILE);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("open detached producer lock {}", path.display()))?;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                anyhow::bail!("another detached transcript producer already owns this session");
+            }
+            return Err(error).with_context(|| format!("lock {}", path.display()));
+        }
+        Ok(Self { _file: file })
+    }
+}
+
+/// The detached §0 PRODUCER for a reparented session (the libkrun analog of
 /// docker's always-on transcript tailer). Re-exec'd as a bare subprocess at
-/// bring-up (`pillbox __session-tailer <dir> <capture> <format> <sid>`), it tails
+/// bring-up (`pillbox __session-tailer <dir> <capture> <source> <sid>`), it tails
 /// the guest's persistent capture file → maps → appends to the durable log
-/// FOREVER (until SIGTERM on teardown). This keeps the log continuously live for a
-/// reparented agent the CLI doesn't supervise, so EVERY consumer — `list`/
+/// until SIGTERM on teardown or the nested producer terminates. This keeps the log
+/// continuously live for a reparented agent the CLI doesn't supervise, so EVERY consumer — `list`/
 /// `diagnose`/`subscribe` and the webhook/OTLP exporters — reads fresh data with
 /// no explicit drain. Takes paths (not a `Pillbox`) since the child has no cwd
 /// context. Sole producer: `subscribe`/`ingest` defer while it's alive.
 pub(crate) fn run_detached_tailer(
     session_dir: std::path::PathBuf,
     capture: std::path::PathBuf,
-    format: events::EventsFormat,
+    source: crate::agents::DetachedTranscriptSource,
     sid: String,
 ) -> Result<()> {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+    // The flock is the ownership primitive; the pid file is only liveness and
+    // teardown metadata. Keeping the guard in scope prevents replacement races.
+    let _producer_lock = DetachedProducerLock::try_acquire(&session_dir)?;
     // Claim sole-producer: our pid lets teardown stop us and signals readers a
     // producer is live (so they don't double-drain into the log).
     let _ = std::fs::write(
         session_dir.join(TAILER_PID_FILE),
         std::process::id().to_string(),
     );
-    let mut log = events::log::SessionLog::open_at(session_dir)?;
-    // `stop` is never set in-process — the producer runs until the process is
-    // SIGTERM'd by `kill_session`. FollowReader blocks waiting for appends, so
-    // the drain naturally idles when the agent is quiet and resumes on activity.
-    let stop = Arc::new(AtomicBool::new(false));
-    let reader = events::opencode::FollowReader::new(capture, Arc::clone(&stop));
-    events::drain_server_capture(format, reader, &sid, &mut log, &stop)?;
+    let mut log = events::log::SessionLog::open_at(session_dir.clone())?;
+    match source {
+        crate::agents::DetachedTranscriptSource::Discover(harness) => {
+            // The rollout path does not exist until the PTY agent starts. The
+            // typed source explicitly selects discovery; the capture path's
+            // current filesystem type carries no orchestration semantics.
+            let tailer = events::transcripts::TailerHandle::spawn_detached(
+                log,
+                &capture,
+                harness.agent_id(),
+                "",
+                &sid,
+                session_dir.join(TAILER_CURSOR_FILE),
+            )
+            .ok_or_else(|| anyhow::anyhow!("detached transcript tailer is unavailable"))?;
+            wait_for_discover_tailer(tailer)?;
+        }
+        crate::agents::DetachedTranscriptSource::ServerCapture(format) => {
+            // `stop` is never set in-process — the producer runs until the
+            // process is SIGTERM'd by `kill_session`. FollowReader blocks
+            // waiting for appends and resumes when the agent writes.
+            let stop = Arc::new(AtomicBool::new(false));
+            let reader = events::opencode::FollowReader::new(capture, Arc::clone(&stop));
+            events::drain_server_capture(format, reader, &sid, &mut log, &stop)?;
+        }
+    }
     Ok(())
+}
+
+/// Couple the detached process lifetime to the file producer it advertises via
+/// `.tailer.pid`. A normal producer stays joined until teardown; any terminal
+/// result returns to `main`, which exits the process and makes signal-0 health
+/// truthful so readers can start the normal replacement tailer.
+fn wait_for_discover_tailer(tailer: events::transcripts::TailerHandle) -> Result<()> {
+    tailer
+        .wait()
+        .context("detached transcript discovery producer terminated")
 }
 
 /// The pid of a session's detached §0 producer, if its pid file is present, parseable, and positive.
@@ -192,7 +270,8 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> 
 fn session_cost(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
     let session = session::resolve(resolved, id)?;
     let log = crate::events::log::SessionLog::open(resolved, &session.id)?;
-    let summary = crate::cost::RunCostEnvelope::from_events(&log.read_from(0)?);
+    let events = log.read_from(0)?;
+    let summary = crate::cost::RunCostEnvelope::from_events(&events);
     if json {
         println!("{}", serde_json::to_string(&summary)?);
         return Ok(());
@@ -200,13 +279,7 @@ fn session_cost(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
 
     println!("session: {}", session.id);
     println!("status: {}", summary.status);
-    println!(
-        "tokens: input={} output={} cache_read={} cache_create={}",
-        summary.model.input_tokens,
-        summary.model.output_tokens,
-        summary.model.cache_read_input_tokens,
-        summary.model.cache_creation_input_tokens,
-    );
+    println!("{}", format_session_tokens(&events, &summary));
     match summary.known_cost_usd {
         Some(cost) => println!("provider-reported cost: ${cost:.6}"),
         None => println!("provider-reported cost: unavailable"),
@@ -216,6 +289,37 @@ fn session_cost(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
     }
     println!("estimated total cost: unavailable (no versioned rate card)");
     Ok(())
+}
+
+fn format_session_tokens(
+    events: &[crate::contract::Event],
+    summary: &crate::cost::RunCostEnvelope,
+) -> String {
+    // The legacy cost envelope uses integer defaults; consult native evidence
+    // before presenting those defaults as measured zero. Managed envelopes
+    // carry their own aggregate and need not include separate Usage events.
+    let observed = summary.infrastructure.is_some()
+        || events.iter().any(|event| match &event.payload {
+            crate::contract::Payload::Usage(usage) => [
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_read_input_tokens,
+                usage.cache_creation_input_tokens,
+            ]
+            .iter()
+            .any(Option::is_some),
+            _ => false,
+        });
+    if !observed {
+        return "tokens: unavailable (no token counts recorded)".into();
+    }
+    format!(
+        "tokens: input={} output={} cache_read={} cache_create={}",
+        summary.model.input_tokens,
+        summary.model.output_tokens,
+        summary.model.cache_read_input_tokens,
+        summary.model.cache_creation_input_tokens,
+    )
 }
 
 fn session_transcript(
@@ -1454,6 +1558,112 @@ pub(crate) fn validate_session_id(id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_tokens_distinguish_missing_from_measured_zero() {
+        use crate::contract::{Event, Payload, Usage, UsageSource};
+        use crate::cost::RunCostEnvelope;
+
+        assert_eq!(
+            format_session_tokens(&[], &RunCostEnvelope::from_events(&[])),
+            "tokens: unavailable (no token counts recorded)"
+        );
+        let mut usage = Usage {
+            message_id: "usage:1".into(),
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+            cost_usd: None,
+            source: UsageSource::Native,
+        };
+        let missing = [Event::session("cost-test", Payload::Usage(usage.clone()))];
+        assert_eq!(
+            format_session_tokens(&missing, &RunCostEnvelope::from_events(&missing)),
+            "tokens: unavailable (no token counts recorded)"
+        );
+        usage.input_tokens = Some(0);
+        usage.output_tokens = Some(0);
+        usage.cache_read_input_tokens = Some(0);
+        usage.cache_creation_input_tokens = Some(0);
+        let measured = [Event::session("cost-test", Payload::Usage(usage))];
+        assert_eq!(
+            format_session_tokens(&measured, &RunCostEnvelope::from_events(&measured)),
+            "tokens: input=0 output=0 cache_read=0 cache_create=0"
+        );
+    }
+
+    #[test]
+    fn detached_producer_lock_is_scoped_per_session() {
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let held = DetachedProducerLock::try_acquire(first_dir.path()).unwrap();
+
+        let error = DetachedProducerLock::try_acquire(first_dir.path())
+            .err()
+            .expect("a second producer must not acquire the same session lock");
+        assert!(error
+            .to_string()
+            .contains("another detached transcript producer"));
+        DetachedProducerLock::try_acquire(second_dir.path())
+            .expect("another session has an independent producer lock");
+
+        drop(held);
+        DetachedProducerLock::try_acquire(first_dir.path())
+            .expect("dropping the producer releases its session lock");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn discover_watcher_failure_exits_process_and_allows_replacement() {
+        const CHILD_ENV: &str = "PILLBOX_TEST_TRANSCRIPT_PRODUCER_FAILURE_CHILD";
+        const CHILD_EXIT: i32 = 73;
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let tailer = events::transcripts::TailerHandle::finished_for_test(Err(
+                anyhow::anyhow!("synthetic transcript watcher failure"),
+            ));
+            let error = wait_for_discover_tailer(tailer)
+                .expect_err("synthetic watcher termination must fail the producer");
+            eprintln!("{error:#}");
+            std::process::exit(CHILD_EXIT);
+        }
+
+        crate::test_util::with_isolated_home("session-transcript-health", || {
+            let resolved = crate::pillbox::global();
+            let session = session::Session::test_fixture();
+            session::write(&resolved, &session).unwrap();
+            let session_dir = session::session_dir(&resolved, &session.id).unwrap();
+
+            let current_test = std::env::current_exe().unwrap();
+            let test_name =
+                "commands::session::tests::discover_watcher_failure_exits_process_and_allows_replacement";
+            let child = std::process::Command::new(current_test)
+                .args(["--exact", test_name, "--nocapture"])
+                .env(CHILD_ENV, "1")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let pid = child.id() as i32;
+            std::fs::write(session_dir.join(TAILER_PID_FILE), pid.to_string()).unwrap();
+
+            let output = child.wait_with_output().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(CHILD_EXIT), "stderr: {stderr}");
+            assert!(
+                stderr.contains("detached transcript discovery producer terminated")
+                    && stderr.contains("synthetic transcript watcher failure"),
+                "terminal error must retain lifecycle and watcher context: {stderr}"
+            );
+
+            // The stale pid stamp remains, but the exited subprocess must not be
+            // treated as the sole producer. The normal live-reader path is now
+            // eligible to start its replacement tailer.
+            assert_eq!(tailer_pid(&session_dir), Some(pid));
+            assert!(!detached_tailer_alive(&resolved, &session));
+        });
+    }
 
     #[test]
     fn model_profile_contract_session_json_projects_sourced_runtime_evidence() {

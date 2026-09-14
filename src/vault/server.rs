@@ -5,9 +5,8 @@
 //!  - For each request, ask each provider whether it claims the host.
 //!    First match wins; non-matching hosts pass through (no MITM), so
 //!    unrelated traffic from the guest is not exposed to our CA.
-//!  - The matched provider rewrites the request and may set a
-//!    [`PendingFlow`] so the following response is routed back to the
-//!    same provider for tear-down (token rotation, real → stub swap).
+//!  - The matched provider rewrites the request. OAuth token endpoints are
+//!    rejected on this request leg; responses never rotate registry state.
 //!
 //! Stubs encode `sandbox_id` (see each provider), so any incoming stub
 //! resolves to its sandbox regardless of the TCP source. A sandbox whose
@@ -38,8 +37,8 @@ use super::{
     known_secrets::VaultMeta,
     lease::SandboxLease,
     providers::{
-        self, extract_inbound_stub, host_from_uri, mint_stub, PendingFlow, Registry, SandboxData,
-        VaultProvider, API_KEY_PROVIDER_ID,
+        self, extract_inbound_stub, host_from_uri, mint_stub, Registry, SandboxData, VaultProvider,
+        API_KEY_PROVIDER_ID,
     },
 };
 use crate::events::{emit_genai_call_span, GenAiCallSpan};
@@ -180,7 +179,6 @@ impl Server {
 
         let handler = VaultHandler {
             server: Arc::clone(&inner),
-            pending: None,
             in_flight: None,
         };
 
@@ -324,16 +322,6 @@ impl Server {
         self.lease_api_key(name, real, &meta)
     }
 
-    /// Snapshot the current real credentials for `sandbox_id`, cloned out
-    /// of the registry. Returns `None` if no lease for that sandbox is
-    /// live. Used at session teardown to persist tokens the in-proxy
-    /// refresh rotated during the run (the registry holds the rotated
-    /// values; the on-disk creds file would otherwise keep the stale —
-    /// and, post-rotation, invalidated — refresh token).
-    pub(crate) fn snapshot_real(&self, sandbox_id: &str) -> Option<serde_json::Value> {
-        self.inner.registry_lock().real(sandbox_id).cloned()
-    }
-
     /// Test-only: borrow the inner registry mutex. Use `inner_for_test`
     /// from tests in this module; downstream tests use the lease's
     /// observable side-effects instead.
@@ -343,7 +331,7 @@ impl Server {
     }
 
     /// Test-only: borrow the shared `ServerInner`. Provider integration
-    /// tests use this to call `handle_request` / `handle_response`
+    /// tests use this to call `handle_request`
     /// directly on a constructed hyper Request/Response, bypassing the
     /// proxy/TLS stack.
     ///
@@ -374,14 +362,9 @@ impl Drop for Server {
 #[derive(Clone)]
 struct VaultHandler {
     server: Arc<ServerInner>,
-    /// In-flight provider flow set by `handle_request` and consumed by
-    /// `handle_response`. Lives one request/response pair.
-    pending: Option<PendingFlow>,
     /// Telemetry shadow of the in-flight request. Captures wall-clock
     /// start + the inbound auth stub so `handle_response` can emit a
-    /// `gen_ai` span tagged with the resolved sandbox_id. Independent
-    /// of `pending` — bearer-token calls (the hot path for chat) don't
-    /// set `pending` but we still want a span for them.
+    /// `gen_ai` span tagged with the resolved sandbox_id.
     in_flight: Option<InFlightCall>,
 }
 
@@ -499,47 +482,15 @@ impl HttpHandler for VaultHandler {
             is_chat,
         });
 
-        provider
-            .handle_request(req, &self.server, &mut self.pending)
-            .await
+        provider.handle_request(req, &self.server).await
     }
 
     async fn handle_response(&mut self, _ctx: &HttpContext, res: Response<Body>) -> Response<Body> {
-        // Dispatch first so the gen_ai span sees the *final* status
-        // code (after any provider-side response rewriting). The body
-        // is then wrapped to tap SSE usage events as they stream past
-        // to the guest; the span fires when the wrapped body ends.
-        let res = self.dispatch_response(res).await;
         self.wrap_for_telemetry(res)
     }
 }
 
 impl VaultHandler {
-    /// Run the response through the provider that claimed a pending
-    /// flow on the request side. No-op when no provider needs response-
-    /// side rewriting (the bearer/api-key swap path doesn't set
-    /// `pending`).
-    async fn dispatch_response(&mut self, res: Response<Body>) -> Response<Body> {
-        let Some(provider_id) = self.pending.as_ref().map(|p| p.provider_id) else {
-            return res;
-        };
-        match self.server.provider_by_id(provider_id) {
-            Some(p) => {
-                Arc::clone(p)
-                    .handle_response(res, &self.server, &mut self.pending)
-                    .await
-            }
-            None => {
-                // Provider disappeared (shouldn't happen — registry is
-                // fixed for the server's lifetime). Drop the pending
-                // flow so it doesn't poison the next response and pass
-                // the body through.
-                self.pending = None;
-                res
-            }
-        }
-    }
-
     /// Wrap the response body in a [`TappedBody`] so SSE usage events
     /// flowing to the guest are also parsed into a [`GenAiCallSpan`].
     /// The span fires when the wrapped body ends (natural completion
@@ -687,44 +638,6 @@ mod tests {
             let registry = server.registry_lock_for_test();
             assert!(registry.real("sbx-1").is_none());
         }
-
-        drop(server);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn snapshot_real_returns_rotated_tokens_until_lease_drops() {
-        // The teardown persist path (VaultSession::drop) reads the
-        // registry's real creds via snapshot_real and writes them back
-        // to disk. Pin that it reflects an in-proxy rotation and goes
-        // None once the lease is gone.
-        let (server, dir) = fresh_server().await;
-        let lease = server
-            .lease("claude", "sbx-rot", sample_anthropic_real())
-            .expect("lease");
-
-        // Simulate the in-proxy refresh rotating the stored refresh token.
-        server.inner_for_test().registry_lock().rotate_real_field(
-            "sbx-rot",
-            "/claudeAiOauth/refreshToken",
-            "ROTATED_REFRESH".to_string(),
-        );
-
-        let snap = server.snapshot_real("sbx-rot").expect("snapshot");
-        assert_eq!(
-            snap.pointer("/claudeAiOauth/refreshToken")
-                .and_then(|v| v.as_str()),
-            Some("ROTATED_REFRESH"),
-            "snapshot must reflect the rotation the teardown persist will write back"
-        );
-        // Unknown sandbox → None (nothing to persist).
-        assert!(server.snapshot_real("sbx-missing").is_none());
-
-        drop(lease);
-        assert!(
-            server.snapshot_real("sbx-rot").is_none(),
-            "after the lease drops the registry entry is gone — teardown must persist before drop"
-        );
 
         drop(server);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1058,12 +971,10 @@ mod tests {
             .unwrap();
 
         let openai = crate::vault::providers::openai::OpenAiApiKeyProvider;
-        let mut pending: Option<crate::vault::providers::PendingFlow> = None;
         let out = crate::vault::providers::VaultProvider::handle_request(
             &openai,
             req,
             server.inner_for_test(),
-            &mut pending,
         )
         .await;
         let out_req = match out {

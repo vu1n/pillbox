@@ -21,7 +21,7 @@ pub(crate) struct InfrastructureUsageCost {
     pub(crate) r2_writes: u64,
     pub(crate) r2_bytes_read: u64,
     pub(crate) r2_bytes_written: u64,
-    pub(crate) analytics_points_written: u64,
+    pub(crate) analytics_points_planned: u64,
     pub(crate) sandbox_duration_ms: u64,
     pub(crate) sandbox_profile: Option<String>,
 }
@@ -76,7 +76,7 @@ impl RunCostEnvelope {
             && infrastructure.r2_writes <= 1_000
             && infrastructure.r2_bytes_read <= 1024 * 1024 * 1024
             && infrastructure.r2_bytes_written <= 1024 * 1024 * 1024
-            && infrastructure.analytics_points_written <= 1
+            && infrastructure.analytics_points_planned <= 1
             && infrastructure.sandbox_duration_ms <= 24 * 60 * 60 * 1_000
             && self
                 .infrastructure
@@ -266,7 +266,7 @@ mod tests {
                 r2_writes: 1,
                 r2_bytes_read: 0,
                 r2_bytes_written: 512,
-                analytics_points_written: 1,
+                analytics_points_planned: 1,
                 sandbox_duration_ms: 50,
                 sandbox_profile: Some("standard-2".into()),
             }),
@@ -303,7 +303,7 @@ mod tests {
                 r2_writes: 1,
                 r2_bytes_read: 0,
                 r2_bytes_written: 512,
-                analytics_points_written: 1,
+                analytics_points_planned: 1,
                 sandbox_duration_ms: 50,
                 sandbox_profile: Some("standard-2".into()),
             }),
@@ -316,7 +316,7 @@ mod tests {
             .infrastructure
             .as_mut()
             .unwrap()
-            .analytics_points_written = 2;
+            .analytics_points_planned = 2;
         assert!(!envelope.validate_untrusted("completed"));
     }
 
@@ -339,7 +339,7 @@ mod tests {
                 r2_writes: 1,
                 r2_bytes_read: 0,
                 r2_bytes_written: 512,
-                analytics_points_written: 1,
+                analytics_points_planned: 1,
                 sandbox_duration_ms: 50,
                 sandbox_profile: Some("standard-2".into()),
             }),

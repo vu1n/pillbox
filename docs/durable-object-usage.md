@@ -25,7 +25,7 @@ A new Pillbox-authored DO class requires all of the following before code:
 
 | Data | Store | Constraint |
 |---|---|---|
-| Invocation claim, idempotency hash, lease, terminal references | D1 | bounded rows; primary-key point queries; no raw deltas |
+| Session owner, invocation reservation and claim, idempotency hash, lease, terminal references | D1 | bounded rows; primary-key point queries; opaque owner digest; no raw deltas |
 | Raw/bulky evidence, logs, terminal output, snapshots | R2 | immutable/content-addressed objects; bounded object size |
 | Aggregate run analytics | Analytics Engine | at most one compact point per terminal run; no content or identity |
 | Pillbox CLI session log | local `SessionLog` | local single-controller sequencing |
@@ -43,9 +43,17 @@ Each terminal execution records exactly one cost envelope in its immutable R2
 artifact, and every terminal client response carries that same envelope. The
 client rejects missing, inconsistent, non-finite, or out-of-budget cost evidence.
 It contains raw provider and infrastructure units; it does not claim an all-in
-dollar total without a versioned rate card. Analytics Engine receives at most
-one derivative point, after the terminal D1 update. Retries and status reads emit
-no additional points.
+dollar total without a versioned rate card. Its `analytics_points_planned` field
+records the bounded terminal-write budget, never confirmed provider delivery.
+After the immutable R2 write and conditional terminal D1 update, only that D1
+winner attempts one derivative Analytics point. Failure is logged but cannot
+undo terminal execution; retries and status reads emit no additional points.
+
+An external [cost receipt](burn-in/cost-receipt.md) binds post-seal commit and
+lifecycle observations to the immutable artifact and execution identity. It
+reconciles measured scopes against the envelope's planned terminal write,
+rather than inventing a fixed terminal-read correction or mutating evidence.
+The receipt does not waive missing vendor DO counters or other release gates.
 
 Release owners must compare these envelopes with Cloudflare's D1, R2,
 Containers, Workers, Analytics Engine, and Durable Objects metrics/billing
@@ -53,12 +61,49 @@ views. Cloudflare account budget alerts are daily projected-spend safeguards,
 not real-time per-product circuit breakers, so the application kill switch is
 still mandatory.
 
+## Managed preview cost controls
+
+The fixed managed-preview burn-in is deliberately limited to one genuinely new
+execution. An exact retry reuses the D1 claim and immutable R2 artifact; bounded
+status pages are read-only; unsupported managed Codex is rejected before
+Sandbox provisioning; finalize is a separate kill-before-transfer operation.
+The first environment therefore seeds `MANAGED_EXECUTION_LIMIT = 1` and the
+matching `MANAGED_EXECUTION_EPOCH` after migration 0002. The D1 allowance is the
+hard application breaker, does not auto-reset, and is reseeded only as a new
+operator-reviewed epoch. `MANAGED_EXECUTION_ENABLED = 0` remains the default
+kill switch and does not affect local libkrun Pillbox.
+
+A genuinely new invocation first inserts one durable reservation. The insert
+atomically binds or checks the session owner and increments the allowance;
+failure rolls back all three effects. Provision is the initial invocation's
+reservation and execution consumes it without another increment. Exact retries
+perform only bounded point lookups. A crash after provision reservation is
+fail-closed: the row remains consumed and restore is never repeated from
+ephemeral credential material.
+
+For every captured `RunCostEnvelope`, compare the per-run units and profile with
+the same invocation's D1, R2, Container, Worker, Analytics Engine, and vendor
+Sandbox/DO counters. Provider-observed Analytics writes remain outside the
+immutable envelope and record explicit `observed - planned` variance; `-1` is a
+truthful best-effort miss, while a positive variance violates the max-one plan.
+Reconcile retry/status/finalize read-only activity in a separate bounded counter
+set; never explain a second artifact, Analytics point, or model turn as a retry.
+Fail closed on an unexplained delta, a status page
+larger than 100 events, more than one artifact/Analytics point per new run, a
+custom DO class, or any custom DO storage growth. The executable fixture and
+operator report template are in
+[docs/burn-in/managed-preview-template.md](burn-in/managed-preview-template.md).
+
 For each environment, record an absolute monthly cap and configure alerts at:
 
 - **low — 50%:** investigate the top run profiles and reconcile counters;
 - **medium — 75%:** stop nonessential preview/benchmark traffic;
 - **emergency — 90%:** disable managed execution with the kill switch and keep
   local Pillbox available.
+
+These Cloudflare budget alerts are informational and account-wide; they do not
+cap usage and must not be treated as a real-time breaker. The D1 allowance and
+the explicit admission switch are the enforceable controls.
 
 The release owner records the account, cap, alert recipients, and kill-switch
 command in the private deployment runbook; secrets and account identifiers do

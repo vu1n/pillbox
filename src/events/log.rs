@@ -38,7 +38,7 @@
 #![allow(dead_code)]
 
 use std::fs;
-use std::io;
+use std::io::{self, BufRead as _, BufReader, Read as _, Seek as _, SeekFrom, Write as _};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -50,11 +50,13 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use crate::contract::Event;
-use crate::paths::append_private_file;
 use crate::pillbox::Pillbox;
 
 /// The append-only spine file inside a session's directory.
 const LOG_FILE: &str = "log.jsonl";
+const MAX_LOG_LINE_BYTES: usize = 8 * 1024 * 1024;
+const LOG_TAIL_READ_CHUNK_BYTES: usize = 64 * 1024;
+const MAX_LOG_TAIL_SCAN_BYTES: usize = 2 * (MAX_LOG_LINE_BYTES + 1);
 
 /// Append-only durable event log for one session, backed by a local JSONL
 /// file. Holds the seq authority for the session: each [`append`](Self::append)
@@ -120,21 +122,86 @@ impl SessionLog {
     /// multi-process writers — a `subscribe`/`watch` tailer in one process and
     /// `session send`/`annotate`/`score` in another — and each holds its own
     /// `SessionLog` with an in-memory `last_seq` that goes STALE the moment the
-    /// other appends. So under the lock the FILE is the seq authority: re-read its
-    /// max via [`recover_last_seq`] rather than trust the cache. (Full re-scan per
-    /// append; fine at per-session scale — the byte-offset incremental read is the
-    /// deferred optimization, same as `subscribe`. The cross-process single-writer
-    /// coordination this lock provides is the cheap stand-in for the resident
-    /// sequencer.)
+    /// other appends. So under the lock the FILE is the seq authority: recover its
+    /// last durable sequence from a bounded tail scan rather than trust the cache. The
+    /// cross-process single-writer coordination this lock provides is the cheap
+    /// stand-in for the resident sequencer.
     // Context: doc://pillbox/session-event-log-spine@0001#session-event-log-spine
     pub(crate) fn append(&mut self, events: &[Event]) -> Result<u64> {
+        self.append_exact_batch(events, None, |_| Ok(()))
+    }
+
+    /// Durably append one recoverable batch without duplicating a prefix that a
+    /// prior process wrote before crashing.
+    ///
+    /// A fresh caller passes `None`; while holding the ordinary session-log
+    /// lock, `prepare` receives the authoritative pre-append sequence and must
+    /// persist the batch's committing intent before any event is written. A
+    /// recovering caller passes that journaled sequence. Every valid event
+    /// after it must be an exact payload prefix of `events`; an unrelated append,
+    /// sequence gap, or payload mismatch fails loud. A complete prefix is a
+    /// no-op, and a partial (including torn-tail) prefix appends only its missing
+    /// suffix.
+    pub(crate) fn append_exact_batch(
+        &mut self,
+        events: &[Event],
+        pre_append_seq: Option<u64>,
+        prepare: impl FnOnce(u64) -> Result<()>,
+    ) -> Result<u64> {
         if events.is_empty() {
             return Ok(self.last_seq);
         }
         let path = self.log_path();
-        let _lock = LogLock::acquire(&path)?;
-        let mut seq = recover_last_seq(&path)?;
-        let mut buf = String::new();
+        let lock = LogLock::acquire(&path)?;
+        let current_seq = recover_last_seq_from_tail(&lock.file, &path)?;
+        if current_seq < self.last_seq {
+            anyhow::bail!(
+                "session log sequence regressed from {} to {current_seq}",
+                self.last_seq
+            );
+        }
+        let base_seq = pre_append_seq.unwrap_or(current_seq);
+        if base_seq > current_seq {
+            anyhow::bail!(
+                "recoverable log batch starts after the current session sequence ({base_seq} > {current_seq})"
+            );
+        }
+
+        let existing = if pre_append_seq.is_some() {
+            read_events_at(&path, base_seq.saturating_add(1))?
+        } else {
+            Vec::new()
+        };
+        let durable_tail = current_seq - base_seq;
+        if durable_tail as usize != existing.len() || existing.len() > events.len() {
+            anyhow::bail!(
+                "recoverable log batch found interleaved, corrupt, or excess events after sequence {base_seq}"
+            );
+        }
+        for (index, actual) in existing.iter().enumerate() {
+            let expected_seq = base_seq + index as u64 + 1;
+            if actual.seq != expected_seq || actual.payload != events[index].payload {
+                anyhow::bail!(
+                    "recoverable log batch payload mismatch at session sequence {}",
+                    actual.seq
+                );
+            }
+        }
+
+        // Validate the complete missing suffix before persisting a prepare
+        // journal or healing/writing bytes, so an oversized later event cannot
+        // leave an accepted prefix behind.
+        let mut seq = current_seq;
+        for ev in &events[existing.len()..] {
+            seq = seq
+                .checked_add(1)
+                .context("session log sequence overflow")?;
+            serialize_log_line(ev, seq)?;
+        }
+        if pre_append_seq.is_none() {
+            prepare(base_seq)?;
+        }
+        seq = current_seq;
         // Heal a torn trailing line: if a prior append crashed mid-write (a partial
         // record with no terminating newline), start the new event on its own line
         // so it can't concatenate onto — and be lost with — the torn fragment (which
@@ -146,15 +213,19 @@ impl SessionLog {
                  likely crashed mid-write)",
                 path.display()
             );
-            buf.push('\n');
+            lock.append_all(b"\n")?;
         }
-        for ev in events {
-            seq += 1;
-            let line = Event { seq, ..ev.clone() };
-            buf.push_str(&serde_json::to_string(&line).context("serialize log event")?);
-            buf.push('\n');
+        for ev in &events[existing.len()..] {
+            seq = seq
+                .checked_add(1)
+                .context("session log sequence overflow")?;
+            let bytes = serialize_log_line(ev, seq)?;
+            lock.append_all(&bytes)?;
         }
-        append_private_file(&path, buf.as_bytes())?;
+        // A recovered complete prefix may have reached the page cache just
+        // before the prior process died. Sync even when no suffix was needed so
+        // the committing journal is never cleared ahead of durable log bytes.
+        lock.sync_all()?;
         self.last_seq = seq;
         Ok(seq)
     }
@@ -185,6 +256,18 @@ impl SessionLog {
         &self,
         from: u64,
         stop: &AtomicBool,
+        sink: impl FnMut(&Event) -> bool,
+    ) -> Result<()> {
+        self.subscribe_checked(from, stop, || Ok(()), sink)
+    }
+
+    /// Check producer health even when no events arrive. A safety consumer
+    /// cannot distinguish a quiet agent from a dead producer using events alone.
+    pub(crate) fn subscribe_checked(
+        &self,
+        from: u64,
+        stop: &AtomicBool,
+        mut check_health: impl FnMut() -> Result<()>,
         mut sink: impl FnMut(&Event) -> bool,
     ) -> Result<()> {
         use notify::{RecursiveMode, Watcher};
@@ -206,7 +289,9 @@ impl SessionLog {
 
         let mut next = from;
         loop {
+            check_health()?;
             for ev in self.read_from(next)? {
+                check_health()?;
                 next = ev.seq + 1;
                 if !sink(&ev) {
                     return Ok(());
@@ -253,6 +338,19 @@ fn read_events_at(path: &Path, from: u64) -> Result<Vec<Event>> {
     })
 }
 
+fn serialize_log_line(event: &Event, seq: u64) -> Result<Vec<u8>> {
+    let line = Event {
+        seq,
+        ..event.clone()
+    };
+    let mut bytes = serde_json::to_vec(&line).context("serialize log event")?;
+    if bytes.len() > MAX_LOG_LINE_BYTES {
+        anyhow::bail!("session log event at sequence {seq} exceeds {MAX_LOG_LINE_BYTES} bytes");
+    }
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
 /// Fold over the JSONL lines of `path`, deserializing each to `L` and folding the
 /// parsed value into the accumulator. Returns `init` unchanged when the file
 /// doesn't exist (an empty / never-written log). Shared by replay and seq recovery,
@@ -271,17 +369,40 @@ fn fold_parsed_lines<L, T>(path: &Path, init: T, mut f: impl FnMut(T, L) -> T) -
 where
     L: serde::de::DeserializeOwned,
 {
-    let contents = match fs::read_to_string(path) {
-        Ok(c) => c,
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(init),
         Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
     };
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
     let mut acc = init;
-    for line in contents.lines() {
-        if line.trim().is_empty() {
+    loop {
+        line.clear();
+        let read = reader
+            .by_ref()
+            .take((MAX_LOG_LINE_BYTES + 2) as u64)
+            .read_until(b'\n', &mut line)
+            .with_context(|| format!("read record from {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        if line.last() == Some(&b'\n') {
+            line.pop();
+        }
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        if line.len() > MAX_LOG_LINE_BYTES {
+            anyhow::bail!(
+                "session log record in {} exceeds {MAX_LOG_LINE_BYTES} bytes",
+                path.display()
+            );
+        }
+        if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        if let Ok(parsed) = serde_json::from_str::<L>(line) {
+        if let Ok(parsed) = serde_json::from_slice::<L>(&line) {
             acc = f(acc, parsed);
         }
     }
@@ -322,17 +443,83 @@ fn recover_last_seq(log_path: &Path) -> Result<u64> {
     fold_parsed_lines(log_path, 0, |max, s: SeqOnly| max.max(s.seq))
 }
 
+/// Recover the authoritative append position without rereading full history.
+/// The window holds one maximum valid event plus one maximum torn tail. If no
+/// valid sequence is present while older bytes exist, failing loud is safer than
+/// reusing sequence zero.
+fn recover_last_seq_from_tail(file: &fs::File, log_path: &Path) -> Result<u64> {
+    #[derive(Deserialize)]
+    struct SeqOnly {
+        seq: u64,
+    }
+
+    let len = file
+        .metadata()
+        .with_context(|| format!("stat {}", log_path.display()))?
+        .len();
+    if len == 0 {
+        return Ok(0);
+    }
+    let mut reader = file
+        .try_clone()
+        .with_context(|| format!("clone {} for sequence recovery", log_path.display()))?;
+    let mut scan_len = len.min(LOG_TAIL_READ_CHUNK_BYTES as u64);
+    loop {
+        let start = len - scan_len;
+        reader
+            .seek(SeekFrom::Start(start))
+            .with_context(|| format!("seek {} for sequence recovery", log_path.display()))?;
+        let mut tail = Vec::with_capacity(scan_len as usize);
+        (&mut reader)
+            .take(scan_len)
+            .read_to_end(&mut tail)
+            .with_context(|| format!("read {} tail for sequence recovery", log_path.display()))?;
+
+        for record in tail.rsplit(|byte| *byte == b'\n') {
+            let record = record.strip_suffix(b"\r").unwrap_or(record);
+            if record.len() > MAX_LOG_LINE_BYTES {
+                anyhow::bail!(
+                    "session log record in {} exceeds {MAX_LOG_LINE_BYTES} bytes",
+                    log_path.display()
+                );
+            }
+            if start > 0 && record.as_ptr() == tail.as_ptr() {
+                continue;
+            }
+            if record.is_empty() {
+                continue;
+            }
+            if let Ok(seq) = serde_json::from_slice::<SeqOnly>(record) {
+                return Ok(seq.seq);
+            }
+        }
+        if start == 0 {
+            return Ok(0);
+        }
+        if scan_len >= MAX_LOG_TAIL_SCAN_BYTES as u64 {
+            anyhow::bail!(
+                "session log {} has no valid sequence in the last {MAX_LOG_TAIL_SCAN_BYTES} bytes",
+                log_path.display()
+            );
+        }
+        scan_len = len.min(
+            scan_len
+                .saturating_mul(2)
+                .min(MAX_LOG_TAIL_SCAN_BYTES as u64),
+        );
+    }
+}
+
 /// An exclusive advisory lock on a session's log file, held across an append so
 /// concurrent appenders serialize (see [`SessionLog::append`]). `flock`-based:
 /// the lock is associated with this open file description and the inode, so every
 /// `SessionLog::append` — in this process or another — contends on it, and it
 /// releases when this fd closes (the `File` drop). `flock` (not POSIX `fcntl`
-/// record locks) is deliberate: it's per-fd, so the separate fd
-/// [`append_private_file`] opens to write isn't affected, and a stray close
-/// elsewhere can't drop our lock.
+/// record locks) is deliberate: it's per-fd, so a stray close elsewhere can't
+/// drop our lock.
 struct LogLock {
     // Held only for its fd's lifetime; closing it (drop) releases the flock.
-    _file: fs::File,
+    file: fs::File,
 }
 
 impl LogLock {
@@ -349,7 +536,19 @@ impl LogLock {
             return Err(io::Error::last_os_error())
                 .with_context(|| format!("lock {}", path.display()));
         }
-        Ok(Self { _file: file })
+        Ok(Self { file })
+    }
+
+    fn sync_all(&self) -> Result<()> {
+        self.file
+            .sync_all()
+            .with_context(|| "fsync locked session log")
+    }
+
+    fn append_all(&self, bytes: &[u8]) -> Result<()> {
+        (&self.file)
+            .write_all(bytes)
+            .with_context(|| "append locked session log")
     }
 }
 
@@ -400,6 +599,115 @@ mod tests {
             // Reads skip the torn line too: the three good events, in seq order.
             let seqs: Vec<u64> = log2.read_from(0).unwrap().iter().map(|e| e.seq).collect();
             assert_eq!(seqs, vec![1, 2, 3]);
+        });
+    }
+
+    #[test]
+    fn oversized_log_record_fails_loud_with_bounded_buffering() {
+        with_isolated_home("log-oversized-record", || {
+            let pb = crate::pillbox::global();
+            let dir = crate::session::session_dir(&pb, "sess-oversized").unwrap();
+            let path = dir.join(LOG_FILE);
+            fs::write(&path, vec![b'x'; MAX_LOG_LINE_BYTES + 1]).unwrap();
+
+            let error = recover_last_seq(&path).expect_err("oversized record must fail");
+            assert!(error
+                .to_string()
+                .contains(&format!("exceeds {MAX_LOG_LINE_BYTES} bytes")));
+        });
+    }
+
+    #[test]
+    fn oversized_append_rejects_the_entire_batch_before_writing() {
+        with_isolated_home("log-oversized-append", || {
+            let pb = crate::pillbox::global();
+            let mut log = SessionLog::open(&pb, "sess-oversized-append").unwrap();
+            let oversized = Event::session(
+                "sess-oversized-append",
+                Payload::Custom(Custom {
+                    name: "oversized".into(),
+                    payload: Some(serde_json::Value::String("x".repeat(MAX_LOG_LINE_BYTES))),
+                }),
+            );
+
+            let error = log
+                .append(&[
+                    Event::session("sess-oversized-append", tool_call("accepted-prefix")),
+                    oversized,
+                ])
+                .expect_err("oversized append must reject the whole batch");
+            assert!(error
+                .to_string()
+                .contains(&format!("exceeds {MAX_LOG_LINE_BYTES} bytes")));
+            assert_eq!(fs::metadata(log.log_path()).unwrap().len(), 0);
+        });
+    }
+
+    #[test]
+    fn fresh_append_recovers_seq_from_tail_without_scanning_old_history() {
+        with_isolated_home("log-bounded-tail-append", || {
+            let pb = crate::pillbox::global();
+            let dir = crate::session::session_dir(&pb, "sess-tail-recovery").unwrap();
+            let path = dir.join(LOG_FILE);
+            let mut file = fs::File::create(&path).unwrap();
+            file.write_all(&vec![b'x'; MAX_LOG_LINE_BYTES + 1]).unwrap();
+            file.write_all(b"\n").unwrap();
+            let mut prior = Event::session("sess-tail-recovery", tool_call("prior"));
+            prior.seq = 41;
+            serde_json::to_writer(&mut file, &prior).unwrap();
+            file.write_all(b"\n").unwrap();
+            drop(file);
+
+            let mut log = SessionLog { dir, last_seq: 0 };
+            let seq = log
+                .append(&[Event::session("sess-tail-recovery", tool_call("next"))])
+                .unwrap();
+            assert_eq!(seq, 42);
+        });
+    }
+
+    #[test]
+    fn tail_recovery_never_infers_zero_when_valid_seq_is_beyond_window() {
+        with_isolated_home("log-tail-no-seq", || {
+            let pb = crate::pillbox::global();
+            let dir = crate::session::session_dir(&pb, "sess-tail-no-seq").unwrap();
+            let path = dir.join(LOG_FILE);
+            let mut file = fs::File::create(&path).unwrap();
+            let mut prior = Event::session("sess-tail-no-seq", tool_call("prior"));
+            prior.seq = 7;
+            serde_json::to_writer(&mut file, &prior).unwrap();
+            file.write_all(b"\n").unwrap();
+            file.write_all(&vec![b'\n'; MAX_LOG_TAIL_SCAN_BYTES + 1])
+                .unwrap();
+            drop(file);
+
+            let error = recover_last_seq_from_tail(&fs::File::open(&path).unwrap(), &path)
+                .expect_err("a bounded scan without a valid tail sequence must fail");
+            assert!(error
+                .to_string()
+                .contains("has no valid sequence in the last"));
+        });
+    }
+
+    #[test]
+    fn append_fails_loud_when_tail_sequence_regresses() {
+        with_isolated_home("log-tail-regressed", || {
+            let pb = crate::pillbox::global();
+            let mut log = SessionLog::open(&pb, "sess-tail-regressed").unwrap();
+            log.append(&[Event::session("sess-tail-regressed", tool_call("first"))])
+                .unwrap();
+            let path = log.log_path();
+            let mut regressed = Event::session("sess-tail-regressed", tool_call("regressed"));
+            regressed.seq = 0;
+            let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+            serde_json::to_writer(&mut file, &regressed).unwrap();
+            file.write_all(b"\n").unwrap();
+            drop(file);
+
+            let error = log
+                .append(&[Event::session("sess-tail-regressed", tool_call("next"))])
+                .expect_err("a backward tail must not cause sequence reuse");
+            assert!(error.to_string().contains("sequence regressed from 1 to 0"));
         });
     }
 
@@ -589,6 +897,83 @@ mod tests {
             })
             .unwrap();
             assert_eq!(count, 1);
+        });
+    }
+
+    #[test]
+    fn exact_batch_prepares_before_append_and_recovers_before_append_crash() {
+        with_isolated_home("log-exact-before-append", || {
+            let pb = crate::pillbox::global();
+            let expected = [
+                Event::session("sess-exact", tool_call("a")),
+                Event::session("sess-exact", tool_call("b")),
+            ];
+            let mut log = SessionLog::open(&pb, "sess-exact").unwrap();
+            let error = log
+                .append_exact_batch(&expected, None, |seq| {
+                    assert_eq!(seq, 0);
+                    anyhow::bail!("simulated crash before append")
+                })
+                .unwrap_err();
+            assert!(error.to_string().contains("simulated crash"));
+            assert!(log.read_from(0).unwrap().is_empty());
+
+            let last = log
+                .append_exact_batch(&expected, Some(0), |_| panic!("already prepared"))
+                .unwrap();
+            assert_eq!(last, 2);
+            assert_eq!(log.read_from(0).unwrap().len(), 2);
+        });
+    }
+
+    #[test]
+    fn exact_batch_recovers_partial_and_full_prefixes_without_duplication() {
+        with_isolated_home("log-exact-prefix", || {
+            let pb = crate::pillbox::global();
+            let expected = [
+                Event::session("sess-exact", tool_call("a")),
+                Event::session("sess-exact", tool_call("b")),
+            ];
+            let mut log = SessionLog::open(&pb, "sess-exact").unwrap();
+            log.append(&expected[..1]).unwrap();
+
+            let path = log.log_path();
+            {
+                use std::io::Write;
+                let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+                file.write_all(b"{\"seq\":2,\"payload\":").unwrap();
+            }
+            assert_eq!(
+                log.append_exact_batch(&expected, Some(0), |_| panic!("already prepared"))
+                    .unwrap(),
+                2
+            );
+            assert_eq!(
+                log.append_exact_batch(&expected, Some(0), |_| panic!("already prepared"))
+                    .unwrap(),
+                2
+            );
+            let events = log.read_from(0).unwrap();
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0].payload, expected[0].payload);
+            assert_eq!(events[1].payload, expected[1].payload);
+        });
+    }
+
+    #[test]
+    fn exact_batch_fails_loud_on_interleaving_or_payload_mismatch() {
+        with_isolated_home("log-exact-mismatch", || {
+            let pb = crate::pillbox::global();
+            let expected = [Event::session("sess-exact", tool_call("expected"))];
+            let mut log = SessionLog::open(&pb, "sess-exact").unwrap();
+            log.append(&[Event::session("sess-exact", tool_call("other"))])
+                .unwrap();
+
+            let error = log
+                .append_exact_batch(&expected, Some(0), |_| panic!("already prepared"))
+                .unwrap_err();
+            assert!(error.to_string().contains("payload mismatch"));
+            assert_eq!(log.read_from(0).unwrap().len(), 1);
         });
     }
 

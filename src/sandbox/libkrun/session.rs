@@ -17,8 +17,9 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::agents::{
-    resolve_run_env, resolve_with_entries, workspace_mount_name, AgentSpec, Integration, RunOpts,
-    StructuredModelPolicy, StructuredProfile, GUEST_HOME, GUEST_WORKSPACE,
+    resolve_run_env, resolve_with_entries, workspace_mount_name, AgentSpec,
+    DetachedTranscriptSource, Integration, RunOpts, StructuredModelPolicy, StructuredProfile,
+    GUEST_HOME, GUEST_WORKSPACE,
 };
 use crate::attach::pump;
 use crate::errors::PillboxError;
@@ -229,14 +230,20 @@ struct Launch {
 }
 
 /// The boot-script preamble shared by every libkrun launch (PTY agents and
-/// the opencode server): bring the NIC up, install the vault CA, mount the
-/// workspace virtio-fs share, and `cd` into the workspace. The caller appends
-/// its own exec. The creds share is already mounted by the boot channel's
-/// static bootstrap (see [`boot::boot_channel`]) — the boot script itself
-/// lives there. `gw_q` is pre-[`shell_quote`]d (a workspace name may contain
-/// a space).
-fn guest_launch_preamble(ca_cert_pem: &str, gw_q: &str) -> String {
+/// the opencode server): bring the NIC up, install the vault CA, and mount the
+/// workspace virtio-fs share before `cd`-ing into it. On macOS, the disposable
+/// clone's virtio-fs metadata was prepared on the host before the VM was
+/// mounted; non-macOS retains the guest-side normalization. The caller appends
+/// its own exec. The cloned creds share is already mounted and prepared by the
+/// boot channel's static bootstrap (see [`boot::boot_channel`]) — the boot
+/// script itself lives there.
+fn guest_launch_preamble(ca_cert_pem: &str, guest_workspace: &str) -> String {
     let net = egress::guest_net_commands();
+    let gw_q = shell_quote(guest_workspace);
+    #[cfg(target_os = "macos")]
+    let own_workspace = String::new();
+    #[cfg(not(target_os = "macos"))]
+    let own_workspace = format!("{}; ", boot::guest_root_clone_ownership(guest_workspace));
     // The PEM is shell-quoted straight into the script — it lands in the boot
     // script file (see [`boot::boot_channel`]), which carries arbitrary bytes, so
     // the multi-line cert no longer needs the base64 detour the kernel cmdline
@@ -252,7 +259,8 @@ fn guest_launch_preamble(ca_cert_pem: &str, gw_q: &str) -> String {
          printf '%s' {ca_q} > {GUEST_CA_PATH}; \
          PATH=/usr/sbin:/sbin:$PATH update-ca-certificates >/dev/null 2>&1 || \
              echo 'pillbox: warning: update-ca-certificates failed; non-Node agents (Codex etc.) may reject the vault TLS cert' >&2; \
-         mkdir -p {gw_q}; mount -t virtiofs workspace {gw_q}; cd {gw_q}",
+         mkdir -p {gw_q}; mount -t virtiofs workspace {gw_q}; \
+         {own_workspace}cd {gw_q}",
         ca_q = shell_quote(ca_cert_pem),
     )
 }
@@ -547,13 +555,16 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
     // Fail closed: a stale token the guest can't self-heal (its expiry says year 2100)
     // would just 401 with no recovery. Placed AFTER the provider-resolution bail so an
     // aborted launch never burns a rotation. `pre_refresh` itself no-ops for any
-    // `auth_id` without a broker decider (only claude today), so the `vault_capable`
+    // `auth_id` without a broker decider, so the `vault_capable`
     // gate just avoids the call for non-vaulted agents.
     if spec.vault_capable {
         crate::vault::pre_refresh(&home.join(spec.cred_sentinel), spec.auth_id)?;
     }
 
     let (creds_share, mut swap_pairs, access_stub) = stub_oauth_creds(&home, spec, &oauth_hosts)?;
+    if let Some(profile) = spec.libkrun_pty {
+        profile.prepare_cloned_home(&creds_share, &guest_workspace)?;
+    }
     // Fail loud: a vault-capable agent whose credentials file produced no stubs
     // would mount the real token into the guest unstubbed (exfiltratable by a
     // prompt-injected agent). Refuse to launch rather than leak. Generalizing the
@@ -583,7 +594,8 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
     // expiry mid-session (the guest never refreshes — far-future stub expiry) so a
     // session outliving the token lifetime (~8h) doesn't 401 with no recovery. Built only
     // when the env-fork produced an access-token stub; the child arms JIT only for an
-    // agent with a broker decider (`broker_expiry`, claude today) and no-ops it otherwise.
+    // agent with a broker decider (`broker_expiry`, Claude and Codex today) and
+    // no-ops it otherwise.
     // Non-secret: the child reads the real token from the live creds file host-side.
     let refresh = access_stub.map(|stub| RefreshSpec {
         creds_path: home.join(spec.cred_sentinel).to_string_lossy().into_owned(),
@@ -603,13 +615,12 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
         .chain(spec.sandbox_args.iter().map(|s| s.to_string()))
         .chain(opts.args.iter().cloned())
         .collect();
-    let gw_q = shell_quote(&guest_workspace);
     let agent = agent_argv
         .iter()
         .map(|a| shell_quote(a))
         .collect::<Vec<_>>()
         .join(" ");
-    let preamble = guest_launch_preamble(&ca.cert_pem, &gw_q);
+    let preamble = guest_launch_preamble(&ca.cert_pem, &guest_workspace);
     // Detach: the guest pty-host *listens* (so the attach socket persists for
     // reattach after the parent returns); foreground: it dials the parent.
     let vsock_flag = if opts.detach { " --vsock-listen" } else { "" };
@@ -637,8 +648,13 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
             );
         }
     }
-    let (boot_share, boot_exec) =
-        boot::boot_channel(&creds_share, "creds", GUEST_HOME, &boot_script)?;
+    let (boot_share, boot_exec) = boot::boot_channel(
+        &creds_share,
+        "creds",
+        GUEST_HOME,
+        boot::MountedShareOwnership::GuestRootClone,
+        &boot_script,
+    )?;
 
     let attach_sock =
         krun_cache_dir()?.join(format!("attach-{}.sock", uuid::Uuid::now_v7().simple()));
@@ -662,8 +678,8 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
             listen: opts.detach,
         }),
         egress: Some(EgressSpec {
-            // The vault providers' full intercept set (API + OAuth/platform hosts)
-            // — so the agent can reach its provider *and* refresh a token — plus
+            // The vault providers' full intercept set (API + OAuth/platform hosts;
+            // token endpoints remain intercepted for local rejection) plus
             // any invoker-declared `--egress-allow` hosts (forwarded, no swap).
             allowlist: crate::vault::providers::intercepted_hosts()
                 .into_iter()
@@ -697,10 +713,11 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
 
 /// Start the microVM detached: spawn the VMM child so it outlives the CLI (it's
 /// reparented to init), hand it the reals on stdin, record the session, return.
-/// No pump, no §0 tailer (that spawns on `reattach`), no teardown (the clones +
-/// spec persist for the running VM; `kill_session` scrubs them). The guest
-/// pty-host listens (set by `prepare_launch` when `opts.detach`), so libkrun's
-/// bound socket persists for reattach.
+/// No pump and no teardown (the clones + spec persist for the running VM;
+/// `kill_session` scrubs them). Codex starts one reparented transcript tailer
+/// after the record commits so repeated read commands never replay its rollout
+/// from byte zero. The guest pty-host listens (set by `prepare_launch` when
+/// `opts.detach`), so libkrun's bound socket persists for reattach.
 fn run_detached(
     spec: &AgentSpec,
     resolved: &Pillbox,
@@ -777,6 +794,14 @@ fn run_detached(
         &session.id,
         Some(&session),
     );
+    if let Err(e) = spawn_session_tailer(resolved, &session, spec) {
+        // A detached Codex run without its sole producer would make repeated
+        // wait-idle calls replay old turn boundaries. Tear the just-committed
+        // session back down instead of returning a session that is known to be
+        // unsafe to drive.
+        let _ = kill_session(resolved, &session);
+        return Err(e).context("start detached session transcript tailer");
+    }
     // Don't wait: the child (VM + egress + MITM, with the vault) is reparented to
     // init and keeps running.
     if opts.json {
@@ -874,8 +899,7 @@ fn launch_server_vm(
     // script). Written into the creds share, exec'd by the static cmdline
     // bootstrap (see [`boot::boot_channel`]) — model names/env values may carry bytes
     // the kernel cmdline can't.
-    let gw_q = shell_quote(&guest_workspace);
-    let preamble = guest_launch_preamble(&ca.cert_pem, &gw_q);
+    let preamble = guest_launch_preamble(&ca.cert_pem, &guest_workspace);
     let events_q = shell_quote(&format!("{GUEST_HOME}/{}", profile.events_file));
     let script = (launch.build_script)(&preamble, &events_q);
     let exports = boot::env_exports(&guest_env)?;
@@ -883,6 +907,7 @@ fn launch_server_vm(
         &creds_share,
         "creds",
         GUEST_HOME,
+        boot::MountedShareOwnership::GuestRootClone,
         &format!("{exports}{script}"),
     )?;
 
@@ -1020,7 +1045,9 @@ fn launch_server_vm(
         // it tails the guest capture → durable log forever, keeping the log live for every consumer
         // (list/diagnose/subscribe + telemetry exporters) with no explicit drain. Killed by
         // kill_session. The libkrun analog of docker's always-on transcript tailer.
-        spawn_session_tailer(resolved, &session, spec);
+        if let Err(e) = spawn_session_tailer(resolved, &session, spec) {
+            eprintln!("pillbox: warning: detached session tailer did not start: {e:#}");
+        }
         crate::events::emit_session_event(
             resolved,
             crate::events::EventType::SessionStarted {
@@ -1157,12 +1184,13 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
     let events_file = profile.events_file;
     let events_guest = format!("{GUEST_HOME}/{events_file}");
     let events_q = shell_quote(&events_guest);
-    let preamble = guest_launch_preamble(&ca.cert_pem, &shell_quote(&guest_workspace));
+    let preamble = guest_launch_preamble(&ca.cert_pem, &guest_workspace);
     let exports = boot::env_exports(&guest_env)?;
     let (boot_share, boot_exec) = boot::boot_channel(
         &creds_share,
         "creds",
         GUEST_HOME,
+        boot::MountedShareOwnership::GuestRootClone,
         &format!("{exports}{preamble}; exec {argv} > {events_q}"),
     )?;
     let vmspec = VmSpec {
@@ -1589,33 +1617,61 @@ pub(crate) fn server_events_file(session: &crate::session::Session) -> Result<Pa
     Ok(PathBuf::from(handle.creds).join(profile.events_file))
 }
 
-/// Spawn the detached §0 producer for a reparented server session: a re-exec'd
-/// `pillbox __session-tailer` that tails the guest capture → durable log forever,
-/// so the log stays live for every consumer with no explicit drain. Best-effort —
-/// a failed spawn just falls back to drain-on-demand (`ingest`/`subscribe`).
-fn spawn_session_tailer(resolved: &Pillbox, session: &crate::session::Session, spec: &AgentSpec) {
-    let Some(profile) = spec.server.as_ref() else {
-        return; // not a server agent — no capture to tail
+/// Spawn the detached §0 producer for a reparented session. Server agents tail
+/// their explicit capture file; Codex PTY tails the one fresh rollout discovered
+/// under its cloned home. Waiting for the pid stamp closes the launch→immediate
+/// `session send`/`wait-idle` race: readers see one live producer before `run`
+/// returns and therefore never start a second byte-zero transcript drain.
+fn spawn_session_tailer(
+    resolved: &Pillbox,
+    session: &crate::session::Session,
+    spec: &AgentSpec,
+) -> Result<()> {
+    let (capture, source) = if let Some(profile) = spec.server.as_ref() {
+        (
+            server_events_file(session)?,
+            DetachedTranscriptSource::ServerCapture(profile.events_format),
+        )
+    } else if let Some(source) = spec
+        .libkrun_pty
+        .and_then(|profile| profile.detached_transcript())
+    {
+        (PathBuf::from(LibkrunHandle::decode(session)?.creds), source)
+    } else {
+        return Ok(());
     };
-    let (Ok(dir), Ok(capture)) = (
-        crate::session::session_dir(resolved, &session.id),
-        server_events_file(session),
-    ) else {
-        return;
-    };
-    let Ok(exe) = std::env::current_exe() else {
-        return;
-    };
-    let _ = Command::new(exe)
+    let dir = crate::session::session_dir(resolved, &session.id)?;
+    let exe = std::env::current_exe().context("locate pillbox transcript tailer executable")?;
+    let mut child = Command::new(exe)
         .arg("__session-tailer")
         .arg(&dir)
         .arg(&capture)
-        .arg(profile.events_format.as_str())
+        .arg(source.as_token())
         .arg(&session.id)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn();
+        .spawn()
+        .context("spawn detached session transcript tailer")?;
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if crate::commands::session::detached_tailer_alive(resolved, session) {
+            return Ok(());
+        }
+        if let Some(status) = child
+            .try_wait()
+            .context("probe detached transcript tailer")?
+        {
+            bail!("detached transcript tailer exited before readiness ({status})");
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("timed out waiting for the detached transcript tailer to become ready");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 /// Host path of a libkrun session's result-workspace — the CoW clone the guest
@@ -1725,8 +1781,13 @@ pub(crate) fn score_in_sandbox(
         .prefix("pillbox-grade-boot-")
         .tempdir()
         .context("create grader boot dir")?;
-    let (boot_share, boot_exec) =
-        boot::boot_channel(boot_dir.path(), "boot", "/run/pillbox-boot", &script)?;
+    let (boot_share, boot_exec) = boot::boot_channel(
+        boot_dir.path(),
+        "boot",
+        "/run/pillbox-boot",
+        boot::MountedShareOwnership::PreserveHost,
+        &script,
+    )?;
 
     let vmspec = VmSpec {
         rootfs: rootfs.to_string_lossy().into_owned(),
@@ -1819,6 +1880,11 @@ pub(crate) fn reattach(resolved: &Pillbox, session: &crate::session::Session) ->
 /// frame is written (libkrun bridges the unix socket straight to the guest's
 /// listening pty-host, no exec cold-start), so it's short.
 const SEND_SETTLE: Duration = Duration::from_millis(300);
+/// A detached run returns after the VMM is spawned, before the guest necessarily
+/// reaches its vsock accept loop. An immediate `session send` therefore waits
+/// for the pty-host handshake instead of treating the first ENOENT/ECONNREFUSED
+/// as a dropped prompt.
+const SEND_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Drive a detached PTY session: dial its persistent attach socket, write one
 /// `Frame::Input` (bytes as if typed), drain the pty-host's on-connect `Snapshot`
@@ -1835,36 +1901,73 @@ const SEND_SETTLE: Duration = Duration::from_millis(300);
 /// the socket is torn down after the bounded settle below. Concurrent
 /// drive-while-attached needs a threaded accept loop.
 fn pty_send(sock: &str, bytes: &[u8]) -> Result<()> {
-    use std::io::{Read as _, Write as _};
-    let stream =
-        UnixStream::connect(sock).with_context(|| format!("connect attach socket {sock}"))?;
-    // Bound BOTH directions so a wedged guest — or the serial accept loop busy with
-    // an attached terminal — can't hang `session send`: `write_all` into a full
-    // socket buffer and the snapshot read each get a deadline. (Connecting to the
-    // already-listening socket is local and doesn't block.)
-    stream.set_write_timeout(Some(SEND_SETTLE)).ok();
-    stream.set_read_timeout(Some(SEND_SETTLE)).ok();
-    let mut stream = stream;
-    crate::attach::driver::send_input(&mut stream, bytes).context("frame the session input")?;
-    stream.flush().ok();
-    // The pty-host sends an on-connect `Snapshot` to EVERY client (see
-    // [`crate::attach::host`]). Receiving any bytes here is our proof the guest
-    // accepted THIS connection and is now in its read loop — so it will pull the
-    // `Input` we just queued. No bytes within the deadline means it never accepted
-    // (the serial accept loop is busy with an attached terminal), so the input was
-    // NOT delivered: fail rather than record a false "sent". A single bounded read
-    // (not a re-armable decode loop) also caps the total time a drip-feeding guest
-    // can hold us.
-    let mut buf = [0u8; 1024];
-    match stream.read(&mut buf) {
-        Ok(n) if n > 0 => Ok(()),
-        _ => Err(PillboxError::runtime(
-            "session send",
-            "the session didn't confirm receipt — the input was not delivered \
-             (a terminal may be attached, or the guest is busy)",
-        )
-        .into()),
+    pty_send_with_timing(sock, bytes, SEND_READY_TIMEOUT, SEND_SETTLE)
+}
+
+fn pty_send_with_timing(
+    sock: &str,
+    bytes: &[u8],
+    ready_timeout: Duration,
+    settle: Duration,
+) -> Result<()> {
+    use std::io::Write as _;
+
+    let deadline = Instant::now() + ready_timeout;
+    let mut stream = loop {
+        match UnixStream::connect(sock) {
+            Ok(stream) => break stream,
+            Err(_e) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("connect attach socket {sock} before the readiness deadline")
+                });
+            }
+        }
+    };
+
+    // The on-connect Snapshot is the pty-host's readiness acknowledgement. Read
+    // and validate the complete frame BEFORE writing input: merely connecting to
+    // libkrun's host socket does not prove that the guest accept loop is ready.
+    // This ordering also prevents boot-time bytes from being queued blindly into
+    // a socket whose guest side has not accepted the connection yet.
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    stream.set_read_timeout(Some(remaining)).ok();
+    match crate::attach::frame::Frame::decode(&mut stream) {
+        Ok(Some(crate::attach::frame::Frame::Snapshot(_))) => {}
+        Ok(Some(crate::attach::frame::Frame::Exit(code))) => {
+            return Err(PillboxError::runtime(
+                "session send",
+                format!("the agent exited ({code}) before it could accept input"),
+            )
+            .into());
+        }
+        Ok(Some(other)) => {
+            return Err(PillboxError::runtime(
+                "session send",
+                format!("expected the PTY readiness snapshot, received {other:?}"),
+            )
+            .into());
+        }
+        Ok(None) | Err(_) => {
+            return Err(PillboxError::runtime(
+                "session send",
+                "the session didn't acknowledge PTY readiness — the input was not delivered \
+                 (a terminal may be attached, or the guest is still starting)",
+            )
+            .into());
+        }
     }
+
+    stream.set_write_timeout(Some(settle)).ok();
+    crate::attach::driver::send_input(&mut stream, bytes).context("frame the session input")?;
+    stream.flush().context("flush the session input")?;
+    // No data-plane InputAck exists yet. Keep the accepted connection alive for
+    // one bounded settle so the guest read loop can forward this exact frame to
+    // the PTY; the pre-send Snapshot is the fail-closed readiness proof.
+    std::thread::sleep(settle);
+    Ok(())
 }
 
 /// Tear down a detached libkrun session: kill the VMM child (the VM + egress +
@@ -2165,7 +2268,12 @@ impl crate::sandbox::LiveSession for LibkrunLiveSession {
         if self.session.integration() == Integration::Server {
             return crate::sandbox::drive_server_prompt(&self.session, &*self.http()?, bytes);
         }
-        pty_send(&LibkrunHandle::decode(&self.session)?.sock, bytes)
+        let input = crate::agents::lookup("session", &self.session.agent_id)
+            .ok()
+            .and_then(|spec| spec.libkrun_pty)
+            .map(|profile| profile.frame_input(bytes))
+            .unwrap_or_else(|| std::borrow::Cow::Borrowed(bytes));
+        pty_send(&LibkrunHandle::decode(&self.session)?.sock, &input)
     }
 
     fn attach(&self, resolved: &Pillbox) -> Result<()> {
@@ -2186,34 +2294,28 @@ impl crate::sandbox::LiveSession for LibkrunLiveSession {
         if crate::commands::session::detached_tailer_alive(resolved, &self.session) {
             return Ok(None);
         }
-        let log = crate::events::log::SessionLog::open(resolved, &self.session.id)?;
         let tailer = if self.session.integration() == Integration::Server {
             // A server agent persists its event capture to a host file in the CoW
             // creds clone; tail that (SSE/NDJSON → the durable log).
+            let log = crate::events::log::SessionLog::open(resolved, &self.session.id)?;
             Some(self.server_file_tailer(log)?)
         } else {
-            // A PTY agent's transcript lands in the host-readable creds clone
-            // (`handle.creds`, the agent home the guest mounts); tail it with the
-            // same producer the foreground PTY run uses, just pointed at the
-            // persisted clone instead of the live auth home.
-            let handle = LibkrunHandle::decode(&self.session)?;
-            let tailer = crate::events::transcripts::spawn_attach_tailer(
-                log,
-                Path::new(&handle.creds),
-                &self.session.agent_id,
-                &self.session.guest_cwd,
-                &self.session.id,
-            );
-            // `None` means this agent has no transcript parser, so there's no live
-            // tail even though the backend advertises one — surface it rather than
-            // silently serving only the existing log.
-            if tailer.is_none() {
+            let spec = crate::agents::lookup("session", &self.session.agent_id)?;
+            if spec
+                .libkrun_pty
+                .and_then(|profile| profile.detached_transcript())
+                .is_none()
+            {
                 eprintln!(
                     "pillbox: note: `{}` has no transcript parser; serving the existing log without a live tail",
                     self.session.agent_id
                 );
+            } else {
+                // Restore the sole reparented producer, not a reader-scoped byte-zero
+                // tailer. Its durable rollout cursor prevents stale idle replay.
+                spawn_session_tailer(resolved, &self.session, spec)?;
             }
-            tailer
+            None
         };
         Ok(tailer)
     }
@@ -2353,6 +2455,32 @@ mod tests {
     use crate::session::{Session, BACKEND_LIBKRUN};
 
     #[test]
+    fn guest_preamble_owns_only_mounted_workspace_before_agent_exec() {
+        let preamble = guest_launch_preamble("test certificate", "/workspace/a b");
+        let script = format!("{preamble}; exec agent");
+        let mount = script
+            .find("mount -t virtiofs workspace '/workspace/a b'")
+            .unwrap();
+        let cd = script.find("cd '/workspace/a b'").unwrap();
+        let exec = script.find("exec agent").unwrap();
+        assert!(mount < cd && cd < exec);
+        assert!(!script.contains(GUEST_HOME));
+        #[cfg(target_os = "macos")]
+        {
+            assert!(!script.contains("find -P"));
+            assert_eq!(script.matches("chown ").count(), 0);
+            assert!(!script.contains("chmod \"$mode\""));
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let ownership = script.find("find -P '/workspace/a b' -xdev").unwrap();
+            assert!(mount < ownership && ownership < cd);
+            assert_eq!(script.matches("chown ").count(), 1);
+            assert!(script.contains("chmod \"$mode\""));
+        }
+    }
+
+    #[test]
     fn structured_vmm_diagnostic_retains_only_pillbox_preboot_errors() {
         let stderr = b"provider detail that must not persist\nkrun-vmm: start_enter returned -22 (pre-boot config error)\n";
         assert_eq!(
@@ -2379,6 +2507,135 @@ mod tests {
         })
         .unwrap();
         s
+    }
+
+    #[test]
+    fn fresh_codex_clone_drops_rollouts_and_trusts_only_the_new_workspace() {
+        let home = tempfile::tempdir().unwrap();
+        let codex = home.path().join(".codex");
+        let old = codex.join("sessions/2026/08/31/rollout-old.jsonl");
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::write(&old, "stale\n").unwrap();
+        std::fs::write(codex.join("auth.json"), "auth\n").unwrap();
+        std::fs::write(codex.join("config.toml"), "model = 'x'\n").unwrap();
+
+        crate::agents::CODEX
+            .libkrun_pty
+            .expect("Codex declares a libkrun PTY profile")
+            .prepare_cloned_home(home.path(), "/workspace/fresh")
+            .unwrap();
+
+        assert!(!codex.join("sessions").exists());
+        assert_eq!(
+            std::fs::read_to_string(codex.join("auth.json")).unwrap(),
+            "auth\n"
+        );
+        let config: toml::Value = std::fs::read_to_string(codex.join("config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(config.get("model").and_then(|v| v.as_str()), Some("x"));
+        assert_eq!(
+            config
+                .get("projects")
+                .and_then(|v| v.get("/workspace/fresh"))
+                .and_then(|v| v.get("trust_level"))
+                .and_then(|v| v.as_str()),
+            Some("trusted")
+        );
+    }
+
+    #[test]
+    fn malformed_codex_clone_config_fails_preparation_closed() {
+        let home = tempfile::tempdir().unwrap();
+        let codex = home.path().join(".codex");
+        std::fs::create_dir_all(&codex).unwrap();
+        std::fs::write(codex.join("config.toml"), "projects = []\n").unwrap();
+
+        let err = crate::agents::CODEX
+            .libkrun_pty
+            .expect("Codex declares a libkrun PTY profile")
+            .prepare_cloned_home(home.path(), "/workspace/fresh")
+            .expect_err("invalid cloned config must abort launch preparation");
+
+        assert!(
+            err.to_string()
+                .contains("cloned Codex config `projects` must be a TOML table"),
+            "unexpected preparation error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn pty_send_waits_for_readiness_snapshot_before_delivering_exact_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("delayed.sock");
+        let sock_for_server = sock.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            // Model the launch race: `session send` begins before the guest-side
+            // pty-host has made the bridge connectable.
+            std::thread::sleep(Duration::from_millis(75));
+            let listener = UnixListener::bind(sock_for_server).unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
+            crate::attach::frame::Frame::Snapshot(b"ready".to_vec())
+                .encode(&mut stream)
+                .unwrap();
+            let input = crate::attach::frame::Frame::decode(&mut stream).unwrap();
+            tx.send(input).unwrap();
+        });
+
+        let input = b"second turn\n";
+        pty_send_with_timing(
+            sock.to_str().unwrap(),
+            input,
+            Duration::from_secs(2),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Some(crate::attach::frame::Frame::Input(input.to_vec()))
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn codex_profile_frames_newline_terminated_turn_as_paste_then_enter() {
+        let profile = crate::agents::CODEX
+            .libkrun_pty
+            .expect("Codex declares a libkrun PTY profile");
+        let input = b"line one\nline two\n";
+        assert_eq!(
+            profile.frame_input(input).as_ref(),
+            b"\x1b[200~line one\nline two\x1b[201~\r"
+        );
+        assert_eq!(
+            profile.frame_input(b"windows newline\r\n").as_ref(),
+            b"\x1b[200~windows newline\x1b[201~\r"
+        );
+    }
+
+    #[test]
+    fn codex_profile_keeps_non_newline_input_raw() {
+        let profile = crate::agents::CODEX
+            .libkrun_pty
+            .expect("Codex declares a libkrun PTY profile");
+        let input = b"typed but not submitted";
+        let framed = profile.frame_input(input);
+        assert!(matches!(framed, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(framed.as_ref(), input);
+    }
+
+    #[test]
+    fn pty_agent_without_profile_keeps_raw_input() {
+        assert!(crate::agents::CLAUDE.libkrun_pty.is_none());
+        let input = b"raw newline stays raw for generic PTY agents\n";
+        let framed = crate::agents::CLAUDE
+            .libkrun_pty
+            .map(|profile| profile.frame_input(input))
+            .unwrap_or_else(|| std::borrow::Cow::Borrowed(input));
+        assert!(matches!(framed, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(framed.as_ref(), input);
     }
 
     #[test]

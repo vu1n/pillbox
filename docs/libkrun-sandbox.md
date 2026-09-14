@@ -468,6 +468,30 @@ the guest's `pillbox-init ws` branch:
 - **Phase 4 — diff/flush:** `diff(clone, base)` = the guest's `RESULT.txt` — the
   result surface a driven run flushes/snapshots, with the base as the fork point.
 
+**Per-run clone metadata contract (META-001).** The host owns the source auth
+home, workspace, and immutable warm-base cache; those paths are never mounted
+for an agent. Each launch mounts only disposable CoW clones (with the workspace
+clone already scrubbed). On macOS, before a clone is mounted, the host walks
+only that clone with no-follow operations and writes libkrun 1.19.0's
+[`user.containers.override_stat` metadata](https://github.com/libkrun/libkrun/blob/v1.19.0/src/devices/src/virtio/fs/macos/passthrough.rs). Its source-backed format is
+`uid:gid:mode`: UID/GID are decimal and mode is octal; the writer may emit `x`
+for an unknown field. A mode of `x` means the backing mode is effective, while
+an explicit mode must carry the actual inode type (or no type bits) and is
+preserved exactly, including set-id bits. Every normalized entry is exposed to
+the guest as owner `0:0`; the host backing mode is restored exactly after the
+xattr write, including error paths. Before inspection, files receive only the
+minimum temporary owner `rw` access and directories only owner `rwx` access;
+these bits are used only inside the private clone when macOS rejects xattr
+writes or opens on host-created `0444`, `0555`, `0200`, or `0000` entries.
+Malformed, overlong, type-conflicting, or unsupported
+metadata aborts launch; symlinks are metadata targets only and are never
+followed. Non-macOS retains the existing guest-side walk.
+
+The preparation boundary covers the scrubbed workspace clone and the credential
+clone after generated credential files and the boot script are written. It does
+not apply to the rootfs, the grader's temporary boot share, an original
+credential/workspace source, or a shared warm-base tree.
+
 **In-repo landing:**
 - **Reuse the canonical denylist** — the spike hand-rolled a crude `is_secret`;
   the repo already has `workspace::ingest` (`is_secret_dir` / `is_secret_basename`

@@ -46,6 +46,7 @@ mod host;
 mod http;
 mod jit_refresh;
 mod local_forward;
+mod metadata;
 mod mitm;
 mod session;
 mod vault;
@@ -551,6 +552,7 @@ fn cow_clone_and_scrub(src: &Path) -> Result<PathBuf> {
             std::fs::remove_file(&p)
         };
     }
+    metadata::prepare_guest_clone_metadata(&clone)?;
     Ok(clone)
 }
 
@@ -607,17 +609,20 @@ fn stub_oauth_creds(
     let creds_file = clone.join(spec.cred_sentinel);
     if let Ok(text) = std::fs::read_to_string(&creds_file) {
         if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&text) {
-            // Each provider lays its OAuth tokens out differently, so dispatch on
-            // the agent's owning provider (the same key `oauth_swap_hosts` uses) to
-            // stub the right fields. An unhandled shape stubs nothing → the launch
-            // guard ([`env_fork_left_real_unstubbed`]) refuses to leak it. Returns the
-            // access-token stub (when present) so broker JIT refresh can mark which
-            // swap pair to keep fresh.
-            access_stub = match spec.auth_id {
-                "claude" => stub_claude_oauth(&mut json, hosts, &mut pairs),
-                "codex" => stub_codex_oauth(&mut json, hosts, &mut pairs),
-                _ => None,
-            };
+            // The provider registry is the sole OAuth shape dispatch. Host-proxy
+            // and libkrun stubbing are distinct codec operations because libkrun
+            // can intentionally withhold a refresh-token release pair.
+            if let Some(provider) = crate::vault::providers::provider_for(spec.auth_id) {
+                if let Some(codec) = provider.oauth_codec() {
+                    let stubbed = codec.libkrun_stub(&mut json);
+                    access_stub = stubbed.access_stub;
+                    pairs.extend(stubbed.releases.into_iter().map(|release| SwapPair {
+                        stub: release.stub,
+                        real: release.real,
+                        hosts: hosts.to_vec(),
+                    }));
+                }
+            }
             if !pairs.is_empty() {
                 let body = serde_json::to_string(&json).context("reserialize stubbed creds")?;
                 // The clone's file is already 0600 (clonefile preserves perms) and
@@ -627,128 +632,6 @@ fn stub_oauth_creds(
         }
     }
     Ok((clone, pairs, access_stub))
-}
-
-/// Stub claude's `claudeAiOauth.{accessToken,refreshToken}` in place, pushing one
-/// host-bound swap pair per token. Returns the **access-token** stub (when one was
-/// stubbed) so broker JIT refresh can identify its swap pair; `None` if nothing stubbed
-/// (or no access token present).
-fn stub_claude_oauth(
-    json: &mut serde_json::Value,
-    hosts: &[String],
-    pairs: &mut Vec<SwapPair>,
-) -> Option<String> {
-    let oauth = json
-        .get_mut("claudeAiOauth")
-        .and_then(|v| v.as_object_mut())?;
-    let mut stubbed = false;
-    let mut access_stub = None;
-    for field in ["accessToken", "refreshToken"] {
-        let real = oauth
-            .get(field)
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-            .filter(|s| !s.is_empty());
-        if let Some(real) = real {
-            let stub = mint_oauth_stub(&real);
-            oauth.insert(field.to_string(), serde_json::Value::String(stub.clone()));
-            if field == "accessToken" {
-                access_stub = Some(stub.clone());
-            }
-            pairs.push(SwapPair {
-                stub,
-                real,
-                hosts: hosts.to_vec(),
-            });
-            stubbed = true;
-        }
-    }
-    // Broker move: post-date the stub's expiry so the guest's Claude Code trusts its
-    // local expiry and never refreshes itself — the MITM swaps the live access token
-    // on the wire, and the host-side `pre_refresh` (in `prepare_launch`) keeps the
-    // real token fresh. Only stamp when we actually stubbed; an unhandled/empty file
-    // is left untouched for the launch guard to catch.
-    if stubbed {
-        oauth.insert(
-            "expiresAt".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(
-                crate::vault::STUB_FAR_FUTURE_EXPIRES_AT_MS,
-            )),
-        );
-    }
-    access_stub
-}
-
-/// Stub codex's ChatGPT-mode `tokens.{access_token,refresh_token}` in place. The
-/// MITM swaps each stub→real as raw bytes on the request leg (content-agnostic),
-/// so a curated-prefix stub — reusing the host-side codex vault provider's
-/// prefixes for consistency — is all that's needed, NEVER the claude
-/// [`mint_oauth_stub`] derivation, whose `-`-splitting would leak base64url JWT
-/// body chunks from the access token. ApiKey-mode auth.json (no `tokens` block)
-/// stubs nothing.
-fn stub_codex_oauth(
-    json: &mut serde_json::Value,
-    hosts: &[String],
-    pairs: &mut Vec<SwapPair>,
-) -> Option<String> {
-    use crate::vault::providers::codex::{STUB_ACCESS_PREFIX, STUB_REFRESH_PREFIX};
-    let tokens = json.get_mut("tokens").and_then(|v| v.as_object_mut())?;
-    let mut access_stub = None;
-    for (field, prefix) in [
-        ("access_token", STUB_ACCESS_PREFIX),
-        ("refresh_token", STUB_REFRESH_PREFIX),
-    ] {
-        let real = tokens
-            .get(field)
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-            .filter(|s| !s.is_empty());
-        if let Some(real) = real {
-            let stub = mint_curated_stub(prefix);
-            tokens.insert(field.to_string(), serde_json::Value::String(stub.clone()));
-            if field == "access_token" {
-                access_stub = Some(stub.clone());
-            }
-            pairs.push(SwapPair {
-                stub,
-                real,
-                hosts: hosts.to_vec(),
-            });
-        }
-    }
-    // Codex has no broker decider yet (`broker_expiry` → None disables its JIT), but the
-    // access stub is returned for symmetry with claude; the launch path builds a refresh
-    // spec only when there's an access stub, and the child no-ops it for codex.
-    access_stub
-}
-
-/// A curated-prefix stub `<prefix>pllbxstub<uuid>` for a token whose real bytes
-/// must never appear in the stub (an opaque or JWT token). The public prefix is a
-/// fixed pillbox marker, not derived from the real, so a leaked stub reveals
-/// nothing of the credential. Contrast [`mint_oauth_stub`] (claude's `sk-ant`
-/// shape, where the first 3 hyphen segments are a safe public type marker).
-fn mint_curated_stub(prefix: &str) -> String {
-    format!("{prefix}pllbxstub{}", uuid::Uuid::now_v7().simple())
-}
-
-/// Mint a stub for an **OAuth token** (the `claudeAiOauth` `access`/`refreshToken`,
-/// shaped `sk-ant-{oat01,ort01}-<body>` — a fixed 3-hyphen-segment type prefix).
-/// Derives the stub prefix from `real` (the two token types differ, so a single
-/// curated prefix can't serve both), keeping ONLY the first 3 segments — for the
-/// OAuth shape that's exactly the public type marker, never the body.
-///
-/// **Only for OAuth-shaped tokens.** For an arbitrary `--with` secret use the
-/// curated `crate::vault::providers::mint_stub(prefix, …)` instead: a key whose
-/// public prefix is <3 segments (OpenAI `sk-proj-<body>`) would leak a body chunk
-/// through this derivation. The ≥4-segment guard only protects short/odd tokens
-/// (synthetic fallback), NOT 2-segment-prefix keys — hence the OAuth-only contract.
-fn mint_oauth_stub(real: &str) -> String {
-    let prefix = if real.split('-').count() >= 4 {
-        real.splitn(4, '-').take(3).collect::<Vec<_>>().join("-")
-    } else {
-        "pllbx".to_string()
-    };
-    format!("{prefix}-pllbxstub{}", uuid::Uuid::now_v7().simple())
 }
 
 /// The hosts the agent's OAuth credential swap is bound to: ONLY its owning
@@ -793,6 +676,11 @@ fn unsupported(spec: &AgentSpec, what: &str) -> anyhow::Error {
     .into()
 }
 
+const ROOTFS_CACHE_VERSION: &str = "v3";
+const ROOTFS_CACHE_MARKER_MAGIC: &str = "pillbox-rootfs-cache/v3";
+const MAX_ROOTFS_MARKER_BYTES: u64 = 1_024;
+const ROOTFS_TAR_EXTRACT_FLAG: &str = "-xpf";
+
 /// Materialize the runner OCI image into a cached on-disk directory usable as a
 /// virtio-fs root (libkrun's `krun_set_root` takes a *directory*, not an image).
 /// One-time per concrete image via `docker export`; cached under
@@ -818,13 +706,21 @@ fn materialize_rootfs(resolved: &Pillbox) -> Result<PathBuf> {
             return Err(rootfs_unavailable_error(&image));
         }
     };
-    let cache = rootfs_root.join(rootfs_cache_key(&image, &image_id));
-    let marker = cache.join(".materialized");
-    if marker.exists() {
+    let generation = rootfs_generation_dir(&rootfs_root, &image, &image_id);
+    let cache = generation.join("rootfs");
+    let marker = generation.join(".materialized");
+    if rootfs_marker_matches(&marker, &image, &image_id) && plain_directory(&cache) {
         return Ok(cache);
     }
-    let _ = std::fs::remove_dir_all(&cache);
-    std::fs::create_dir_all(&cache).with_context(|| format!("create {}", cache.display()))?;
+    if generation.exists() {
+        bail!(
+            "rootfs cache generation {} is incomplete or uses an incompatible materialization format; refusing to replace a directory that may be live (remove it only after confirming no session uses it)",
+            generation.display()
+        );
+    }
+    let image_root = rootfs_image_root(&rootfs_root, &image);
+    std::fs::create_dir_all(&image_root)
+        .with_context(|| format!("create {}", image_root.display()))?;
     eprintln!("pillbox: materializing runner rootfs from {image} (one-time)…");
 
     let create = Command::new("docker")
@@ -838,6 +734,15 @@ fn materialize_rootfs(resolved: &Pillbox) -> Result<PathBuf> {
         );
     }
     let cid = String::from_utf8_lossy(&create.stdout).trim().to_string();
+    if let Err(cause) = std::fs::create_dir(&generation) {
+        let _ = Command::new("docker").args(["rm", "-f", &cid]).output();
+        return Err(cause).with_context(|| format!("create {}", generation.display()));
+    }
+    if let Err(cause) = std::fs::create_dir(&cache) {
+        let _ = Command::new("docker").args(["rm", "-f", &cid]).output();
+        let _ = std::fs::remove_dir(&generation);
+        return Err(cause).with_context(|| format!("create {}", cache.display()));
+    }
 
     // Stream the container filesystem straight into the cache dir. Capture both
     // commands' stdio: `docker rm` echoes the container id, and `run --json`'s
@@ -846,8 +751,9 @@ fn materialize_rootfs(resolved: &Pillbox) -> Result<PathBuf> {
     let export = Command::new("sh")
         .arg("-c")
         .arg(format!(
-            "docker export {cid} | tar -C {} -xf -",
-            cache.display()
+            "docker export {} | tar -C {} {ROOTFS_TAR_EXTRACT_FLAG} -",
+            shell_quote(&cid),
+            shell_quote(&cache.to_string_lossy())
         ))
         .output()
         .map(|o| o.status);
@@ -857,16 +763,18 @@ fn materialize_rootfs(resolved: &Pillbox) -> Result<PathBuf> {
         // Clear the half-populated cache so the next run retries from scratch
         // (the marker is written only on success, but leave nothing partial).
         Ok(s) => {
-            let _ = std::fs::remove_dir_all(&cache);
+            let _ = std::fs::remove_dir_all(&generation);
             bail!("rootfs export failed (status {:?})", s.code());
         }
         Err(e) => {
-            let _ = std::fs::remove_dir_all(&cache);
+            let _ = std::fs::remove_dir_all(&generation);
             bail!("rootfs export failed: {e}");
         }
     }
-    std::fs::write(&marker, format!("{image}\n{image_id}\n"))
-        .context("write rootfs cache marker")?;
+    if let Err(cause) = std::fs::write(&marker, rootfs_marker_contents(&image, &image_id)) {
+        let _ = std::fs::remove_dir_all(&generation);
+        return Err(cause).context("write rootfs cache marker");
+    }
     Ok(cache)
 }
 
@@ -931,32 +839,46 @@ fn rootfs_unavailable_message(
 }
 
 /// Newest materialized rootfs generation for `image`, or `None`. The fallback
-/// when Docker can't resolve the live image id: scan the rootfs cache root for
-/// generation dirs whose `.materialized` marker's first line is exactly `image`
-/// (the marker is `format!("{image}\n{image_id}\n")`), and pick the one with the
-/// most-recent marker mtime — the freshest export we have for this tag.
+/// when Docker can't resolve the live image id scans only that image's hashed v3
+/// namespace. A sibling marker binds each generation's exact image and image id;
+/// the guest receives only its `rootfs` child. Legacy generations are ignored.
 fn find_cached_rootfs(root: &Path, image: &str) -> Option<PathBuf> {
     let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
-    for entry in std::fs::read_dir(root).ok()?.flatten() {
-        let dir = entry.path();
-        if !dir.is_dir() {
-            continue;
-        }
-        let marker = dir.join(".materialized");
-        let Ok(text) = std::fs::read_to_string(&marker) else {
-            continue;
-        };
-        if text.lines().next() != Some(image) {
-            continue;
-        }
-        let Ok(mtime) = marker.metadata().and_then(|m| m.modified()) else {
+    let image_root = rootfs_image_root(root, image);
+    if !plain_directory(&image_root) {
+        return None;
+    }
+    for entry in std::fs::read_dir(image_root).ok()?.flatten() {
+        let Ok(file_type) = entry.file_type() else {
             continue;
         };
-        if best.as_ref().is_none_or(|(_, t)| mtime > *t) {
-            best = Some((dir, mtime));
+        if !file_type.is_dir() {
+            continue;
+        }
+        let generation = entry.path();
+        let marker = generation.join(".materialized");
+        let Some(marker_identity) = read_rootfs_marker(&marker) else {
+            continue;
+        };
+        let expected_generation = rootfs_image_id_key(&marker_identity.image_id);
+        if marker_identity.image != image
+            || generation.file_name().and_then(|name| name.to_str())
+                != Some(expected_generation.as_str())
+        {
+            continue;
+        }
+        let cache = generation.join("rootfs");
+        if !plain_directory(&cache) {
+            continue;
+        }
+        if best
+            .as_ref()
+            .is_none_or(|(_, modified)| marker_identity.modified > *modified)
+        {
+            best = Some((cache, marker_identity.modified));
         }
     }
-    best.map(|(dir, _)| dir)
+    best.map(|(cache, _)| cache)
 }
 
 fn docker_image_id(image: &str) -> Result<String> {
@@ -977,13 +899,84 @@ fn docker_image_id(image: &str) -> Result<String> {
     )
 }
 
-fn rootfs_cache_key(image: &str, image_id: &str) -> String {
-    format!("{}_{}", sanitize(image), sanitize(image_id))
+fn rootfs_image_ref_key(image: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+
+    format!("{:x}", Sha256::digest(image.as_bytes()))
+}
+
+fn rootfs_image_id_key(image_id: &str) -> String {
+    sanitize(image_id)
+}
+
+fn rootfs_image_root(root: &Path, image: &str) -> PathBuf {
+    root.join(ROOTFS_CACHE_VERSION)
+        .join(rootfs_image_ref_key(image))
+}
+
+fn rootfs_generation_dir(root: &Path, image: &str, image_id: &str) -> PathBuf {
+    rootfs_image_root(root, image).join(rootfs_image_id_key(image_id))
+}
+
+fn rootfs_marker_contents(image: &str, image_id: &str) -> String {
+    format!("{ROOTFS_CACHE_MARKER_MAGIC}\n{image}\n{image_id}\n")
+}
+
+fn rootfs_marker_matches(marker: &Path, image: &str, image_id: &str) -> bool {
+    read_rootfs_marker(marker)
+        .is_some_and(|identity| identity.image == image && identity.image_id == image_id)
+}
+
+struct RootfsMarker {
+    image: String,
+    image_id: String,
+    modified: std::time::SystemTime,
+}
+
+fn read_rootfs_marker(marker: &Path) -> Option<RootfsMarker> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(marker)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_ROOTFS_MARKER_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.by_ref()
+        .take(MAX_ROOTFS_MARKER_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_ROOTFS_MARKER_BYTES {
+        return None;
+    }
+    let text = String::from_utf8(bytes).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != ROOTFS_CACHE_MARKER_MAGIC {
+        return None;
+    }
+    let image = lines.next()?.to_string();
+    let image_id = lines.next()?.to_string();
+    if image.is_empty() || image_id.is_empty() || lines.next().is_some() {
+        return None;
+    }
+    Some(RootfsMarker {
+        image,
+        image_id,
+        modified: metadata.modified().ok()?,
+    })
+}
+
+fn plain_directory(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
 }
 
 fn krun_cache_dir() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").context("HOME unset")?;
-    Ok(PathBuf::from(home).join(".pillbox").join("krun"))
+    Ok(crate::paths::pillbox_root()?.join("krun"))
 }
 
 /// Filesystem-safe cache key for an image ref (`a/b:c` → `a_b_c`).
@@ -1000,12 +993,36 @@ fn cstr(s: &str) -> CString {
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
+
+    use base64::Engine as _;
+
     use super::{
-        env_fork_left_real_unstubbed, find_cached_rootfs, mint_curated_stub, mint_oauth_stub,
-        oauth_swap_hosts, rootfs_unavailable_message, stub_claude_oauth, stub_codex_oauth,
-        SwapPair,
+        env_fork_left_real_unstubbed, find_cached_rootfs, krun_cache_dir, oauth_swap_hosts,
+        rootfs_generation_dir, rootfs_image_ref_key, rootfs_image_root, rootfs_marker_contents,
+        rootfs_marker_matches, rootfs_unavailable_message, SwapPair, MAX_ROOTFS_MARKER_BYTES,
+        ROOTFS_CACHE_MARKER_MAGIC, ROOTFS_CACHE_VERSION, ROOTFS_TAR_EXTRACT_FLAG,
     };
     use crate::agents::{CLAUDE, CODEX, PI};
+
+    fn codec_stub(
+        provider_id: &str,
+        json: &mut serde_json::Value,
+        hosts: &[String],
+    ) -> (Option<String>, Vec<SwapPair>) {
+        let provider = crate::vault::providers::provider_for(provider_id).unwrap();
+        let stubbed = provider.oauth_codec().unwrap().libkrun_stub(json);
+        let pairs = stubbed
+            .releases
+            .into_iter()
+            .map(|release| SwapPair {
+                stub: release.stub,
+                real: release.real,
+                hosts: hosts.to_vec(),
+            })
+            .collect();
+        (stubbed.access_stub, pairs)
+    }
 
     #[test]
     fn stub_claude_oauth_postdates_expiry_and_swaps_tokens() {
@@ -1022,8 +1039,7 @@ mod tests {
             }
         });
         let hosts = vec!["api.anthropic.com".to_string()];
-        let mut pairs = Vec::new();
-        let access_stub = stub_claude_oauth(&mut json, &hosts, &mut pairs);
+        let (access_stub, pairs) = codec_stub("claude", &mut json, &hosts);
 
         let oauth = json.get("claudeAiOauth").unwrap();
         // Broker move: the guest-mounted stub is post-dated to year 2100 so the agent
@@ -1042,9 +1058,11 @@ mod tests {
         // The returned access stub is exactly the file's accessToken stub — what broker
         // JIT refresh keys on to find the swap pair to keep fresh.
         assert_eq!(access_stub.as_deref(), Some(access));
-        // …and the real values live ONLY in the out-of-band swap pairs.
+        // Only the real access token lives in an out-of-band release pair. The
+        // refresh token stays host-broker-only and can never be released by MITM.
         assert!(pairs.iter().any(|p| p.real == real_access));
-        assert!(pairs.iter().any(|p| p.real == real_refresh));
+        assert_eq!(pairs.len(), 1);
+        assert!(pairs.iter().all(|p| p.real != real_refresh));
         // Other fields preserved.
         assert_eq!(
             oauth.get("subscriptionType").and_then(|v| v.as_str()),
@@ -1052,49 +1070,228 @@ mod tests {
         );
     }
 
-    // Write a generation dir with a marker shaped like the real one, then set
-    // its mtime so "newest wins" is testable without sleeping (`age_secs` ago).
-    fn gen_dir(root: &std::path::Path, name: &str, first_line: Option<&str>, age_secs: u64) {
-        let dir = root.join(name);
-        std::fs::create_dir_all(&dir).unwrap();
-        if let Some(image) = first_line {
-            let path = dir.join(".materialized");
+    fn gen_dir(
+        root: &std::path::Path,
+        image: &str,
+        image_id: &str,
+        marker_contents: Option<String>,
+        age_secs: u64,
+    ) -> std::path::PathBuf {
+        let generation = rootfs_generation_dir(root, image, image_id);
+        std::fs::create_dir_all(generation.join("rootfs")).unwrap();
+        if let Some(contents) = marker_contents {
+            let path = generation.join(".materialized");
             let f = std::fs::File::create(&path).unwrap();
             use std::io::Write;
-            (&f).write_all(format!("{image}\nsha256:deadbeef\n").as_bytes())
-                .unwrap();
+            (&f).write_all(contents.as_bytes()).unwrap();
+            // Make newest-generation selection deterministic without sleeping.
             let when = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
             f.set_modified(when).unwrap();
         }
+        generation
     }
 
     #[test]
-    fn find_cached_rootfs_picks_newest_matching_image() {
+    fn find_cached_rootfs_picks_newest_current_generation_and_rejects_legacy() {
         let root = tempfile::tempdir().unwrap();
         let image = "ghcr.io/vu1n/pillbox:rolling";
-        // Two generations of the same image (older + newer) plus a dir for a
-        // different image and a dir with no marker — only the newest match wins.
-        gen_dir(root.path(), "old", Some(image), 100);
-        gen_dir(root.path(), "new", Some(image), 1);
-        gen_dir(root.path(), "other", Some("ghcr.io/vu1n/pillbox:pinned"), 0);
-        gen_dir(root.path(), "nomarker", None, 0);
+        let old_id = "sha256:1111";
+        let new_id = "sha256:2222";
+        gen_dir(
+            root.path(),
+            image,
+            old_id,
+            Some(rootfs_marker_contents(image, old_id)),
+            100,
+        );
+        let new_generation = gen_dir(
+            root.path(),
+            image,
+            new_id,
+            Some(rootfs_marker_contents(image, new_id)),
+            10,
+        );
+        let legacy = root
+            .path()
+            .join("ghcr_io_vu1n_pillbox_rolling_sha256_3333_v2");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(
+            legacy.join(".materialized"),
+            format!("{image}\nsha256:3333\n"),
+        )
+        .unwrap();
 
         let hit = find_cached_rootfs(root.path(), image).expect("a matching generation");
-        assert_eq!(hit.file_name().unwrap(), "new", "expected the newest match");
+        assert_eq!(hit, new_generation.join("rootfs"));
     }
 
     #[test]
-    fn find_cached_rootfs_ignores_non_matching_and_markerless() {
+    fn find_cached_rootfs_ignores_non_matching_markerless_and_misnamed() {
         let root = tempfile::tempdir().unwrap();
-        gen_dir(root.path(), "other", Some("some/other:image"), 0);
-        gen_dir(root.path(), "nomarker", None, 0);
-        assert!(find_cached_rootfs(root.path(), "ghcr.io/vu1n/pillbox:rolling").is_none());
+        gen_dir(
+            root.path(),
+            "some/other:image",
+            "sha256:1",
+            Some(rootfs_marker_contents("some/other:image", "sha256:1")),
+            0,
+        );
+        let image = "ghcr.io/vu1n/pillbox:rolling";
+        gen_dir(root.path(), image, "sha256:2", None, 0);
+        let misnamed = rootfs_image_root(root.path(), image).join("wrong-key");
+        std::fs::create_dir_all(misnamed.join("rootfs")).unwrap();
+        std::fs::write(
+            misnamed.join(".materialized"),
+            rootfs_marker_contents(image, "sha256:3"),
+        )
+        .unwrap();
+        assert!(find_cached_rootfs(root.path(), image).is_none());
     }
 
     #[test]
     fn find_cached_rootfs_empty_root_is_none() {
         let root = tempfile::tempdir().unwrap();
         assert!(find_cached_rootfs(root.path(), "anything").is_none());
+    }
+
+    #[test]
+    fn rootfs_marker_fast_path_requires_current_exact_identity() {
+        let fixture = tempfile::tempdir().unwrap();
+        let marker = fixture.path().join(".materialized");
+        let image = "pillbox-runner:dev";
+        let image_id = "sha256:current";
+        for (contents, expected) in [
+            (rootfs_marker_contents(image, image_id), true),
+            (
+                format!("pillbox-rootfs-cache/v1\n{image}\n{image_id}\n"),
+                false,
+            ),
+            (
+                rootfs_marker_contents("pillbox-runner:latest", image_id),
+                false,
+            ),
+            (rootfs_marker_contents(image, "sha256:other"), false),
+            (
+                format!("pillbox-rootfs-cache/v3\n{image}\n{image_id}\nextra\n"),
+                false,
+            ),
+        ] {
+            std::fs::write(&marker, contents).unwrap();
+            assert_eq!(rootfs_marker_matches(&marker, image, image_id), expected);
+        }
+    }
+
+    #[test]
+    fn rootfs_image_ref_hash_separates_sanitize_aliases_and_matches_prune_script() {
+        let dashed = "foo-bar:baz";
+        let slashed = "foo/bar:baz";
+        assert_ne!(rootfs_image_ref_key(dashed), rootfs_image_ref_key(slashed));
+        assert_eq!(
+            ROOTFS_CACHE_MARKER_MAGIC,
+            format!("pillbox-rootfs-cache/{ROOTFS_CACHE_VERSION}")
+        );
+
+        let script =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/build-runner.sh");
+        let output = Command::new("bash")
+            .arg(script)
+            .args(["--print-rootfs-cache-namespace", dashed])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            format!("{ROOTFS_CACHE_VERSION}/{}", rootfs_image_ref_key(dashed))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rootfs_marker_read_is_bounded_nofollow_and_regular_file_only() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let marker = fixture.path().join(".materialized");
+        let target = fixture.path().join("target");
+        let image = "pillbox-runner:dev";
+        let image_id = "sha256:current";
+        std::fs::write(&target, rootfs_marker_contents(image, image_id)).unwrap();
+        symlink(&target, &marker).unwrap();
+        assert!(!rootfs_marker_matches(&marker, image, image_id));
+
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::create_dir(&marker).unwrap();
+        assert!(!rootfs_marker_matches(&marker, image, image_id));
+        assert!(!rootfs_marker_matches(
+            std::path::Path::new("/dev/zero"),
+            image,
+            image_id
+        ));
+
+        std::fs::remove_dir(&marker).unwrap();
+        std::fs::write(&marker, vec![b'x'; (MAX_ROOTFS_MARKER_BYTES + 1) as usize]).unwrap();
+        assert!(!rootfs_marker_matches(&marker, image, image_id));
+    }
+
+    #[test]
+    fn rootfs_authority_marker_is_sibling_to_guest_served_root() {
+        let root = tempfile::tempdir().unwrap();
+        let generation = rootfs_generation_dir(root.path(), "pillbox-runner:dev", "sha256:current");
+        let guest_root = generation.join("rootfs");
+        let marker = generation.join(".materialized");
+        assert_eq!(guest_root.parent(), marker.parent());
+        assert!(!marker.starts_with(&guest_root));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rootfs_cache_stays_beneath_the_private_pillbox_root() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        crate::test_util::with_isolated_home("rootfs-cache-private", || {
+            let cache = krun_cache_dir().unwrap();
+            let private_root = cache.parent().unwrap();
+            let mode = std::fs::metadata(private_root)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(mode, 0o700);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rootfs_tar_extraction_preserves_sticky_world_writable_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("source");
+        let extracted = fixture.path().join("extracted");
+        let archive = fixture.path().join("rootfs.tar");
+        std::fs::create_dir_all(source.join("tmp")).unwrap();
+        std::fs::create_dir_all(&extracted).unwrap();
+        std::fs::set_permissions(source.join("tmp"), std::fs::Permissions::from_mode(0o1777))
+            .unwrap();
+        assert!(Command::new("tar")
+            .args(["-C", source.to_str().unwrap(), "-cf"])
+            .arg(&archive)
+            .arg("tmp")
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("tar")
+            .args(["-C", extracted.to_str().unwrap(), ROOTFS_TAR_EXTRACT_FLAG])
+            .arg(&archive)
+            .status()
+            .unwrap()
+            .success());
+
+        let mode = std::fs::metadata(extracted.join("tmp"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode, 0o1777);
     }
 
     #[test]
@@ -1135,7 +1332,11 @@ mod tests {
         // Anthropic OAuth tokens are sk-ant-oat01-<base64url> and the body can
         // contain hyphens — the stub must keep only the type prefix, never the body.
         let real = "sk-ant-oat01-3WY-itf8QpVP38ipXjip-SECRETBODYxyz";
-        let stub = mint_oauth_stub(real);
+        let mut json = serde_json::json!({
+            "claudeAiOauth": { "accessToken": real, "refreshToken": "sk-ant-ort01-refresh" }
+        });
+        let (first, _) = codec_stub("claude", &mut json, &[]);
+        let stub = first.unwrap();
         assert!(
             stub.starts_with("sk-ant-oat01-pllbxstub"),
             "stub leaked shape: {stub}"
@@ -1144,7 +1345,10 @@ mod tests {
         assert!(!stub.contains("SECRETBODYxyz"), "stub leaked body: {stub}");
         assert_ne!(stub, real);
         // Distinct each call (uuid suffix).
-        assert_ne!(mint_oauth_stub(real), stub);
+        let mut again = serde_json::json!({
+            "claudeAiOauth": { "accessToken": real, "refreshToken": "sk-ant-ort01-refresh" }
+        });
+        assert_ne!(codec_stub("claude", &mut again, &[]).0.unwrap(), stub);
     }
 
     #[test]
@@ -1210,7 +1414,10 @@ mod tests {
         // A token with <4 hyphen segments has no clear type/body split, so the
         // prefix must be synthetic — never any of the real bytes.
         for real in ["sk-secret", "justonesecretword", "sk-ant-secretbody"] {
-            let stub = mint_oauth_stub(real);
+            let mut json = serde_json::json!({
+                "claudeAiOauth": { "accessToken": real, "refreshToken": "sk-ant-ort01-refresh" }
+            });
+            let stub = codec_stub("claude", &mut json, &[]).0.unwrap();
             assert!(
                 stub.starts_with("pllbx-pllbxstub"),
                 "short token leaked shape: {stub}"
@@ -1223,8 +1430,8 @@ mod tests {
     fn stub_codex_oauth_stubs_chatgpt_tokens_without_leaking_them() {
         // codex ChatGPT-mode auth.json: the access token is a JWT whose base64url
         // body contains '-' (the exact shape mint_oauth_stub would leak), the
-        // refresh token is opaque. Both must be swapped for curated-prefix stubs
-        // that share NO bytes with the real.
+        // refresh token is opaque. Both guest values share NO bytes with the real,
+        // and only access gets a release pair; refresh is broker-only.
         let real_access = "eyJhbGciOiJSUzI1NiJ9.PA-YL0AD-with-dashes.SIGSEG";
         let real_refresh = "rt-OPAQUE-SECRETBODY";
         let mut json = serde_json::json!({
@@ -1236,17 +1443,26 @@ mod tests {
                 "account_id": "acc-123",
             },
         });
-        let mut pairs = Vec::new();
         let hosts = vec!["chatgpt.com".to_string()];
-        let access_stub = stub_codex_oauth(&mut json, &hosts, &mut pairs);
+        let (access_stub, pairs) = codec_stub("codex", &mut json, &hosts);
 
         let tokens = &json["tokens"];
         let stub_access = tokens["access_token"].as_str().unwrap();
-        // The returned access stub is the file's access_token stub (codex has no broker
-        // decider yet, so it's unused for JIT, but the contract matches claude).
+        // The returned access stub is the file's access_token stub and identifies
+        // the pair JIT refresh updates.
         assert_eq!(access_stub.as_deref(), Some(stub_access));
         let stub_refresh = tokens["refresh_token"].as_str().unwrap();
-        assert!(stub_access.starts_with("pb-codex-oat-"), "{stub_access}");
+        let parts = stub_access.split('.').collect::<Vec<_>>();
+        assert_eq!(parts.len(), 3, "access stub must be a JWT");
+        assert!(parts[2].starts_with("pb-codex-oat-pllbxstub"));
+        let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(parts[1])
+            .unwrap();
+        let claims: serde_json::Value = serde_json::from_slice(&claims).unwrap();
+        assert_eq!(
+            claims.get("exp").and_then(|v| v.as_u64()),
+            Some(crate::vault::STUB_FAR_FUTURE_EXPIRES_AT_MS / 1000)
+        );
         assert!(stub_refresh.starts_with("pb-codex-ort-"), "{stub_refresh}");
         // No real-token bytes leak into the stubs (the JWT-body '-' footgun).
         for leak in ["PA-YL0AD", "with-dashes", "SIGSEG", "OPAQUE", "SECRETBODY"] {
@@ -1257,10 +1473,11 @@ mod tests {
         assert_eq!(tokens["id_token"], "ID_TOKEN_UNTOUCHED");
         assert_eq!(tokens["account_id"], "acc-123");
 
-        // Two pairs, each carrying the real and bound to the agent's hosts.
-        assert_eq!(pairs.len(), 2);
-        assert!(pairs.iter().any(|p| p.real == real_access));
-        assert!(pairs.iter().any(|p| p.real == real_refresh));
+        // Refresh has no release pair: unexpected guest refresh fails closed and
+        // can never receive real rotated tokens in its response.
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].real, real_access);
+        assert_ne!(pairs[0].real, real_refresh);
         assert!(pairs.iter().all(|p| p.hosts == hosts));
     }
 
@@ -1269,17 +1486,35 @@ mod tests {
         // ApiKey-mode auth.json has no `tokens` block — nothing to stub, so the
         // launch guard fires (codex --vault is rejected for ApiKey mode anyway).
         let mut json = serde_json::json!({ "OPENAI_API_KEY": "sk-real" });
-        let mut pairs = Vec::new();
-        assert!(stub_codex_oauth(&mut json, &["chatgpt.com".into()], &mut pairs).is_none());
+        let (access_stub, pairs) = codec_stub("codex", &mut json, &["chatgpt.com".into()]);
+        assert!(access_stub.is_none());
         assert!(pairs.is_empty());
     }
 
     #[test]
-    fn mint_curated_stub_uses_the_prefix_and_is_unique() {
-        let a = mint_curated_stub("pb-codex-oat-");
-        let b = mint_curated_stub("pb-codex-oat-");
-        assert!(a.starts_with("pb-codex-oat-pllbxstub"));
-        assert_ne!(a, b, "uuid suffix must make each stub unique");
+    fn mint_codex_access_stub_is_unique_and_far_future() {
+        let make = || {
+            let mut json = serde_json::json!({
+                "tokens": { "access_token": "a.b.c", "refresh_token": "r" }
+            });
+            codec_stub("codex", &mut json, &[]).0.unwrap()
+        };
+        let a = make();
+        let b = make();
+        assert_ne!(a, b);
+        for stub in [a, b] {
+            let parts = stub.split('.').collect::<Vec<_>>();
+            assert_eq!(parts.len(), 3);
+            assert!(parts[2].starts_with("pb-codex-oat-pllbxstub"));
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(parts[1])
+                .unwrap();
+            let claims: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(
+                claims.get("exp").and_then(|v| v.as_u64()),
+                Some(crate::vault::STUB_FAR_FUTURE_EXPIRES_AT_MS / 1000)
+            );
+        }
     }
 
     use super::{commit_state, CommitState};

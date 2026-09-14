@@ -23,12 +23,12 @@ bucket_name = "pillbox-execution-evidence-preview"
 binding = "RUN_COSTS"
 dataset = "pillbox_execution_run_costs_preview"
 
-# Private Huddles authorization transport. The binding authenticates transport
-# only; every ensure/invoke call still carries a signed execution grant.
+# Private Huddles currentness transport. The binding authenticates transport
+# only; every managed RPC still carries a signed operation-specific grant.
 [[services]]
-binding = "PillboxAuthorizationControlPlane"
+binding = "PillboxAuthorizationCurrentness"
 service = "huddles-projectors"
-entrypoint = "PillboxAuthorizationControlPlaneEntrypoint"
+entrypoint = "PillboxAuthorizationCurrentnessEntrypoint"
 
 # Sandbox is registered in the migration (worker.ts exports the class) but NOT
 # bound and NOT given a container here — so nothing is instantiated and the free

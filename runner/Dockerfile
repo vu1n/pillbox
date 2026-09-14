@@ -137,16 +137,17 @@ RUN npm install -g \
 
 # Codex: official standalone installer (native binary; the npm wrapper is
 # no longer how upstream ships protocol-bearing builds like `app-server`).
-# Same scratch-HOME pattern as Claude below: the installer symlinks
-# ~/.local/bin/codex into $CODEX_HOME/packages/standalone/releases/<ver>,
-# so resolve the link with `cp -L` into /usr/local/bin and drop the
-# scratch tree.
+# Preserve the complete package before dropping the installer scratch HOME:
+# the package contains the code-mode host, bundled zsh, and path tools that
+# the native CLI needs at runtime.
+ENV CODEX_PACKAGE_ROOT=/opt/codex/packages/standalone/releases/${CODEX_VERSION}
+COPY runner/install-codex-package.sh /tmp/install-codex-package.sh
 RUN curl -fsSL https://chatgpt.com/codex/install.sh -o /tmp/codex-install.sh \
 	&& HOME=/opt/codex-install CODEX_RELEASE=${CODEX_VERSION} CODEX_NON_INTERACTIVE=1 \
 		sh /tmp/codex-install.sh \
-	&& cp -L /opt/codex-install/.local/bin/codex /usr/local/bin/codex \
-	&& chmod +x /usr/local/bin/codex \
+	&& sh /tmp/install-codex-package.sh /opt/codex-install "${CODEX_VERSION}" /opt/codex /usr/local/bin \
 	&& rm /tmp/codex-install.sh \
+	&& rm /tmp/install-codex-package.sh \
 	&& rm -rf /opt/codex-install
 
 # Claude Code: official native installer. The version arg ($1 →

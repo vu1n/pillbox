@@ -10,12 +10,18 @@ import { R2ExecutionArtifactStore } from "./execution_artifacts.js";
 import {
   ExecutionService,
   OpencodeExecutionRuntime,
+  type ExecutionOperationAuthorizer,
   type ExecutionRuntime,
 } from "./execution_service.js";
 import {
   D1ExecutionStore,
   type RelationalDatabase,
 } from "./execution_store.js";
+import {
+  D1ManagedExecutionReservationStore,
+  parseManagedExecutionAllowance,
+} from "./managed_reservation.js";
+import { publicControllerOwner } from "./managed_ownership.js";
 import {
   enforceHuddlesOpencodePolicy,
   type HuddlesOpencodeConfig,
@@ -31,13 +37,18 @@ import {
   type InvokeSessionResult,
 } from "./legacy_huddles_adapter.js";
 import {
-  authorizeManagedEnsure,
-  authorizeManagedInvoke,
-} from "./managed_huddles_auth.js";
+  authorizeExecutionOperation,
+  requireManagedBurninBootstrap,
+} from "./managed_auth.js";
+import type { PillboxExecutionOperationGrantIssueResponse } from "./managed_contract.js";
 import {
   RunCostMeter,
   WorkersAnalyticsEngineRunCost,
 } from "./run_cost.js";
+import {
+  managedAdmissionPolicy,
+  requireManagedAdmission,
+} from "./managed_admission.js";
 import { deriveSandboxRuntimeId } from "./runtime_identity.js";
 
 export {
@@ -62,37 +73,87 @@ export type { JsonSchemaOutputFormat, JsonValue } from "./codex_execution.js";
 export { isHuddlesSessionName } from "./huddles_policy.js";
 export { deriveSandboxRuntimeId, sha256Hex } from "./runtime_identity.js";
 
-/** Private same-account RPC surface for Huddles and generic execution callers. */
+/** Private same-account RPC surface for Huddles; execution/2 operation grants are mandatory. */
 export class HuddlesRuntimeEntrypoint extends WorkerEntrypoint<Env> {
-  async executeInvocation(request: ExecuteInvocationV2Request) {
-    return executionService(this.env).executeInvocation(request);
+  async executeInvocation(
+    request: ExecuteInvocationV2Request,
+    authorization: PillboxExecutionOperationGrantIssueResponse,
+  ) {
+    return executionService(
+      this.env,
+      operationAuthorizer(this.env, authorization),
+    ).executeInvocation(request);
   }
 
-  async getExecutionStatus(request: GetInvocationV2Request) {
-    return executionService(this.env).getExecutionStatus(request);
+  async getExecutionStatus(
+    request: GetInvocationV2Request,
+    authorization: PillboxExecutionOperationGrantIssueResponse,
+  ) {
+    return executionService(
+      this.env,
+      operationAuthorizer(this.env, authorization),
+    ).getExecutionStatus(request);
   }
 
-  async cancelInvocation(request: CancelInvocationV2Request) {
-    return executionService(this.env).cancelInvocation(request);
+  async cancelInvocation(
+    request: CancelInvocationV2Request,
+    authorization: PillboxExecutionOperationGrantIssueResponse,
+  ) {
+    return executionService(
+      this.env,
+      operationAuthorizer(this.env, authorization),
+    ).cancelInvocation(request);
   }
 
+  /** Read the live D1 allowance under the same invocation-scoped status grant. */
+  async getManagedExecutionAllowance(
+    request: GetInvocationV2Request,
+    authorization: PillboxExecutionOperationGrantIssueResponse,
+  ) {
+    requireManagedBurninBootstrap(this.env);
+    await authorizeExecutionOperation(this.env, authorization, "status", request);
+    const configured = parseManagedExecutionAllowance(
+      this.env.MANAGED_EXECUTION_EPOCH,
+      this.env.MANAGED_EXECUTION_LIMIT,
+    );
+    if (configured === null) {
+      throw new Error("managed execution allowance configuration is invalid");
+    }
+    const store = new D1ManagedExecutionReservationStore(
+      this.env.EXECUTION_DB as unknown as RelationalDatabase,
+    );
+    const snapshot = await store.getAllowance(configured);
+    if (snapshot === null) {
+      throw new Error("managed execution allowance row does not match configuration");
+    }
+    return {
+      source: "pillbox-d1-live" as const,
+      captured_at: new Date().toISOString(),
+      ...snapshot,
+    };
+  }
+
+  async fetch(): Promise<Response> {
+    return new Response("not found\n", { status: 404 });
+  }
+}
+
+/** Local-test compatibility only; this class is never exported by the production Worker. */
+export class LocalLegacyRuntimeEntrypoint extends WorkerEntrypoint<Env> {
   async ensureSession(request: EnsureSessionRequest): Promise<EnsureSessionResult> {
-    const validated = validateEnsureSessionRequest(request);
-    const executionRealmId = await authorizeManagedEnsure(this.env, validated);
-    return ensureLegacySession(validated, executionRealmId);
+    return ensureLegacySession(validateEnsureSessionRequest(request));
   }
 
   async invokeSession(request: InvokeSessionRequest): Promise<InvokeSessionResult> {
     const validated = await validateInvokeSessionRequest(request);
-    const controllerContextHash = await authorizeManagedInvoke(
-      this.env,
-      validated,
+    requireManagedAdmission(
+      managedAdmissionPolicy(this.env.MANAGED_EXECUTION_ENABLED),
     );
-    const service = executionService(this.env);
-    return invokeLegacySession(
-      validated,
-      (execution) => service.executeInvocation(execution),
-      controllerContextHash,
+    const service = executionService(this.env, async () =>
+      publicControllerOwner({ subject: "local-legacy-test" }),
+    );
+    return invokeLegacySession(validated, (execution) =>
+      service.executeInvocation(execution),
     );
   }
 
@@ -101,9 +162,17 @@ export class HuddlesRuntimeEntrypoint extends WorkerEntrypoint<Env> {
   }
 }
 
-export function executionService(env: Env): ExecutionService {
+export function executionService(
+  env: Env,
+  authorizer: ExecutionOperationAuthorizer,
+): ExecutionService {
+  requireManagedBurninBootstrap(env);
   const meter = new RunCostMeter();
   const store = new D1ExecutionStore(
+    env.EXECUTION_DB as unknown as RelationalDatabase,
+    meter.observeRelational,
+  );
+  const reservations = new D1ManagedExecutionReservationStore(
     env.EXECUTION_DB as unknown as RelationalDatabase,
     meter.observeRelational,
   );
@@ -129,7 +198,22 @@ export function executionService(env: Env): ExecutionService {
         ? undefined
         : new WorkersAnalyticsEngineRunCost(env.RUN_COSTS),
     sandboxProfile: env.SANDBOX_PROFILE,
+    admission: managedAdmissionPolicy(env.MANAGED_EXECUTION_ENABLED),
+    allowance: parseManagedExecutionAllowance(
+      env.MANAGED_EXECUTION_EPOCH,
+      env.MANAGED_EXECUTION_LIMIT,
+    ),
+    reservations,
+    authorizer,
   });
+}
+
+function operationAuthorizer(
+  env: Env,
+  authorization: PillboxExecutionOperationGrantIssueResponse,
+): ExecutionOperationAuthorizer {
+  return ({ operation, request }) =>
+    authorizeExecutionOperation(env, authorization, operation, request);
 }
 
 class UnavailableExecutionRuntime implements ExecutionRuntime {

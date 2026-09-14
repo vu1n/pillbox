@@ -1,0 +1,74 @@
+# Isolated managed-preview burn-in only. This file deliberately names a new
+# Worker, container class, D1 database, R2 bucket, and Analytics dataset. It
+# must not be copied over wrangler.container.toml or used as a production
+# deployment configuration.
+name = "pillbox-managed-burnin"
+main = "src/worker.ts"
+compatibility_date = "2026-06-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+# Create the three resources first, then replace the D1 id/name and R2 bucket
+# in a protected local copy. The committed UUID is rejected by the bootstrap
+# validator and is present only so Wrangler can parse this non-deployable template.
+[[d1_databases]]
+binding = "EXECUTION_DB"
+database_name = "pillbox-managed-burnin-db"
+database_id = "00000000-0000-4000-8000-000000000004"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "EXECUTION_EVIDENCE"
+bucket_name = "pillbox-managed-burnin-evidence"
+
+[[analytics_engine_datasets]]
+binding = "RUN_COSTS"
+dataset = "pillbox_managed_burnin_costs"
+
+[vars]
+# The checked HD-013 tuple must supply these public values in a protected local
+# config or resolved Wrangler metadata. Empty values are deliberately invalid.
+PILLBOX_BOOTSTRAP_REQUIRED = "1"
+PILLBOX_GRANT_KEY_ID = ""
+PILLBOX_GRANT_PUBLIC_KEY = ""
+PILLBOX_INSTALLATION_ID = ""
+PILLBOX_EXECUTION_REALM_ID = ""
+PILLBOX_PROTOCOL_REVISION = ""
+PILLBOX_ORGANIZATION_ID = ""
+PILLBOX_MANAGED_CONCURRENCY = "1"
+
+# Fail closed by default. The operator enables this only for the one reviewed
+# burn-in claim, after applying migrations and seeding the matching D1 row.
+MANAGED_EXECUTION_ENABLED = "0"
+MANAGED_EXECUTION_EPOCH = "burnin-2026-09-01-v1"
+MANAGED_EXECUTION_LIMIT = "1"
+SANDBOX_PROFILE = "standard-2"
+
+# Only the vendor-owned Sandbox class is allowed to own container lifecycle.
+# No Pillbox-authored DO class or application state is bound here.
+[[durable_objects.bindings]]
+name = "Sandbox"
+class_name = "Sandbox"
+
+[[containers]]
+class_name = "Sandbox"
+image = "./Dockerfile"
+instance_type = "standard-2"
+max_instances = 1
+
+# This is a fresh namespace, so only the vendor Sandbox class is introduced.
+# D1 migration 0002 is independent and is applied by the operator command in
+# docs/burn-in/managed-preview-template.md.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Sandbox"]
+
+[[services]]
+# Point this at the isolated Huddles authorize-only preview service before a
+# live private-RPC run. The binding cannot issue grants; signed grants remain required.
+binding = "PillboxAuthorizationCurrentness"
+service = "huddles-projectors-managed-burnin"
+entrypoint = "PillboxAuthorizationCurrentnessEntrypoint"
+
+[observability]
+enabled = true

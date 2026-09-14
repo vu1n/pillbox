@@ -5,15 +5,26 @@ import {
   verifyManagedCapability,
   type ManagedOperation,
 } from "./auth.js";
+import type { ExecuteInvocationV2Result } from "./codex_execution.js";
 import { safeHuddlesRuntimeDiagnostic } from "./huddles_policy.js";
 import {
   readBoundedJsonWithDigest,
   RequestBodyTooLargeError,
 } from "./request_body.js";
 import { routeWorkspaceTransfer } from "./workspace_transfer.js";
-import type { PillboxAuthorizationControlPlane } from "./managed_auth.js";
-// Named entrypoint: Huddles reaches ensureSession through a same-account
-// service-binding RPC. The default fetch handler below never routes that method.
+import type { PillboxAuthorizationCurrentness } from "./managed_auth.js";
+import {
+  ManagedBootstrapError,
+  requireManagedBurninHttpBootstrap,
+} from "./managed_auth.js";
+import {
+  ManagedAdmissionError,
+  managedAdmissionPolicy,
+  requireManagedAdmission,
+} from "./managed_admission.js";
+import { publicControllerOwner } from "./managed_ownership.js";
+// Named entrypoint: Huddles reaches only authenticated execution/2 lifecycle
+// methods through a same-account service binding.
 export { HuddlesRuntimeEntrypoint };
 // Re-export the SDK's container-owning DO so wrangler can bind it.
 export { Sandbox } from "@cloudflare/sandbox";
@@ -29,8 +40,10 @@ export interface Env {
   // exact request bytes, operation, and resource. Huddles reaches the private
   // service binding and does not use this public bearer-token surface.
   MANAGED_CAPABILITY_SECRET?: string;
-  /** Private Huddles control-plane binding. Transport auth is not workload auth. */
-  PillboxAuthorizationControlPlane?: PillboxAuthorizationControlPlane;
+  /** Makes the isolated burn-in reject every request until its full bootstrap is installed. */
+  PILLBOX_BOOTSTRAP_REQUIRED?: string;
+  /** Private Huddles currentness binding. Transport auth is not workload auth. */
+  PillboxAuthorizationCurrentness?: PillboxAuthorizationCurrentness;
   /** Public verification half of the active Huddles Ed25519 grant key. */
   PILLBOX_GRANT_KEY_ID?: string;
   PILLBOX_GRANT_PUBLIC_KEY?: string;
@@ -38,7 +51,13 @@ export interface Env {
   PILLBOX_EXECUTION_REALM_ID?: string;
   PILLBOX_PROTOCOL_REVISION?: string;
   PILLBOX_ORGANIZATION_ID?: string;
-  MANAGED_AUTH_REQUIRED?: string;
+  /** Must match both the Huddles bootstrap limit and Wrangler container max_instances. */
+  PILLBOX_MANAGED_CONCURRENCY?: string;
+  /** Exact "1" admits new managed executions and workspace provisioning. */
+  MANAGED_EXECUTION_ENABLED?: string;
+  /** Operator-reviewed epoch and hard cap for genuinely new managed claims. */
+  MANAGED_EXECUTION_EPOCH?: string;
+  MANAGED_EXECUTION_LIMIT?: string;
 
   // opencode provider auth + model for the consume path (driveAgent). Set via
   // `wrangler secret put` / `.dev.vars`; consumed by createOpencodeServer
@@ -59,6 +78,31 @@ export interface Env {
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
+    try {
+      requireManagedBurninHttpBootstrap(env);
+    } catch (cause) {
+      if (!(cause instanceof ManagedBootstrapError)) throw cause;
+      return Response.json(
+        { error: { code: cause.code, message: cause.message } },
+        { status: 503 },
+      );
+    }
+    if (
+      req.method === "POST" &&
+      new URL(req.url).pathname === "/v2/workspaces/provision"
+    ) {
+      try {
+        requireManagedAdmission(
+          managedAdmissionPolicy(env.MANAGED_EXECUTION_ENABLED),
+        );
+      } catch (cause) {
+        if (!(cause instanceof ManagedAdmissionError)) throw cause;
+        return Response.json(
+          { error: { code: cause.code, message: cause.message } },
+          { status: 503 },
+        );
+      }
+    }
     const executionResponse = await routeExecutionRequest(req, env);
     if (executionResponse !== null) return executionResponse;
     const workspaceResponse = await routeWorkspaceTransfer(req, env);
@@ -92,15 +136,15 @@ async function routeExecutionRequest(
     const body = decoded.value;
     const scope = executionCapabilityScope(operation, body, decoded.sha256);
     const token = bearerToken(request);
-    if (
-      env.MANAGED_CAPABILITY_SECRET === undefined ||
-      token === null ||
-      (await verifyManagedCapability(
-        token,
-        env.MANAGED_CAPABILITY_SECRET,
-        scope,
-      )) === null
-    ) {
+    const capability =
+      env.MANAGED_CAPABILITY_SECRET === undefined || token === null
+        ? null
+        : await verifyManagedCapability(
+            token,
+            env.MANAGED_CAPABILITY_SECRET,
+            scope,
+          );
+    if (!capability) {
       return Response.json({ error: { code: "unauthenticated" } }, { status: 401 });
     }
     if (
@@ -120,16 +164,15 @@ async function routeExecutionRequest(
         { status: 400 },
       );
     }
-    const service = executionService(env);
+    const owner = await publicControllerOwner(capability);
+    const service = executionService(env, async () => owner);
     const result =
       operation === "execute"
         ? await service.executeInvocation(body)
         : operation === "status"
           ? await service.getExecutionStatus(body)
           : await service.cancelInvocation(body);
-    return Response.json(result, {
-      status: result.status === "running" ? 202 : result.status === "conflict" ? 409 : 200,
-    });
+    return Response.json(result, { status: executionHttpStatus(result) });
   } catch (cause) {
     const code =
       typeof cause === "object" && cause !== null && "code" in cause
@@ -152,6 +195,15 @@ async function routeExecutionRequest(
       },
     );
   }
+}
+
+function executionHttpStatus(result: ExecuteInvocationV2Result): number {
+  if (result.status === "running") return 202;
+  if (result.status === "conflict") return 409;
+  if (result.status === "failed" && result.error.code === "managed_disabled") {
+    return 503;
+  }
+  return 200;
 }
 
 function executionCapabilityScope(

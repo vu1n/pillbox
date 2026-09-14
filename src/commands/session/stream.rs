@@ -218,8 +218,50 @@ pub(super) fn session_wait_idle(
     // subscribing from baseline+1 catches them (computing last_seq after spawn
     // could skip an already-drained idle). Default = next idle, not a stale one.
     let s = session::resolve(resolved, id)?;
-    let baseline = crate::events::log::SessionLog::open(resolved, &s.id)?.last_seq();
+    let existing_log = crate::events::log::SessionLog::open(resolved, &s.id)?;
+    let baseline = existing_log.last_seq();
+    let default_from = from.is_none();
     let from = from.unwrap_or(baseline + 1);
+
+    // A detached producer can append the completion between `session send`
+    // returning and this separate command starting. In default mode, recognize
+    // an already-complete current turn instead of waiting for a future one. The
+    // most recent durable Input is the driver's boundary; the transcript's user
+    // MessageStart covers the seeded argv turn, which has no separate Input.
+    // An older idle before either boundary is stale and must not satisfy this
+    // wait. Explicit `--from` retains exact replay semantics and skips this
+    // convenience check.
+    if default_from {
+        let existing = existing_log.read_from(0)?;
+        let last_turn = existing
+            .iter()
+            .filter(|ev| {
+                matches!(&ev.payload, Payload::Input(_))
+                    || matches!(
+                        &ev.payload,
+                        Payload::MessageStart(message)
+                            if message.role == crate::contract::Role::User
+                    )
+            })
+            .map(|ev| ev.seq)
+            .max()
+            .unwrap_or(0);
+        let last_idle = existing
+            .iter()
+            .filter(|ev| {
+                matches!(
+                    &ev.payload,
+                    Payload::AttentionRequired(_) | Payload::RunFinished(_) | Payload::RunFailed(_)
+                )
+            })
+            .map(|ev| ev.seq)
+            .max()
+            .unwrap_or(0);
+        if last_idle > last_turn {
+            println!("pillbox: session `{}` idle", s.id);
+            return Ok(());
+        }
+    }
 
     // The tailer drains the §0 capture into the log while we wait; it stops when
     // `_tailer` drops at fn return (TailerHandle's Drop joins it).
@@ -280,42 +322,31 @@ pub(super) fn session_guard(
     max_tokens: u64,
     kill: bool,
 ) -> Result<()> {
-    use std::sync::atomic::AtomicBool;
-
-    // Spawn the live drain (same as `wait-idle`) so the log fills while we watch
-    // a `send`-driven/headless session — the tailer guard lives until fn return.
-    let (sid, _tailer) = resolve_streaming_session(resolved, id)?;
+    // Capture the head before starting the producer so startup failures and
+    // initial usage cannot fall into the gap before subscription.
+    let sid = session::resolve(resolved, id)
+        .map(|s| s.id)
+        .or_else(|_| session::resolve_logged(resolved, id))?;
+    let source = crate::events::log::SessionLog::open(resolved, &sid)?;
+    let from = source.last_seq().saturating_add(1);
+    let mut producer = resolve_streaming_session(resolved, &sid);
     eprintln!(
         "pillbox: guarding session {sid} (max-repeats={max_repeats}, max-tokens={max_tokens}, \
          {}); Ctrl-C to stop",
         if kill { "armed: --kill" } else { "dry-run" }
     );
-    // Subscribe to the local session log from the current head — a breaker reacts
-    // to NEW pathology, not a past one (mirrors the webhook exporter's
-    // `last_seq + 1`).
-    let from = crate::events::log::SessionLog::open(resolved, &sid)?.last_seq() + 1;
-    let source = crate::events::log::SessionLog::open(resolved, &sid)?;
-
-    let mut detector = PathologyDetector::new(max_repeats, max_tokens);
-    let mut tripped: Option<String> = None;
-    // Never set in-process: Ctrl-C ends the process; the sink ends the loop on a
-    // trip by returning `false`. `_tailer` lives until then.
-    let stop = AtomicBool::new(false);
-    source.subscribe(from, &stop, |ev| match detector.observe(ev) {
-        Some(reason) => {
-            tripped = Some(reason);
-            false // stop subscribing — we've seen the pathology
+    let reason = match producer.as_mut() {
+        Ok((_, tailer)) => {
+            let session_dir = session::session_dir_path(resolved, &sid);
+            let producer_pid = super::tailer_pid(&session_dir);
+            guard_trip_reason(&source, from, max_repeats, max_tokens, || {
+                if let Some(tailer) = tailer.as_mut() {
+                    return tailer.check_running();
+                }
+                check_detached_producer(&session_dir, producer_pid)
+            })
         }
-        None => true,
-    })?;
-
-    let reason = match tripped {
-        Some(r) => r,
-        None => {
-            // The local stream ended without a trip.
-            eprintln!("pillbox: guard on session `{sid}` ended without tripping");
-            return Ok(());
-        }
+        Err(error) => format!("event producer unavailable: {error:#}"),
     };
     eprintln!("pillbox: ⚠ guard tripped on session `{sid}`: {reason}");
     if !kill {
@@ -334,6 +365,35 @@ pub(super) fn session_guard(
     Ok(())
 }
 
+fn check_detached_producer(session_dir: &std::path::Path, expected_pid: Option<i32>) -> Result<()> {
+    let pid = expected_pid.ok_or_else(|| anyhow::anyhow!("no live event producer"))?;
+    anyhow::ensure!(
+        super::tailer_pid(session_dir) == Some(pid) && unsafe { libc::kill(pid, 0) } == 0,
+        "detached event producer {pid} stopped or changed"
+    );
+    super::DetachedProducerLock::check_held(session_dir)
+}
+
+fn guard_trip_reason(
+    source: &events::log::SessionLog,
+    from: u64,
+    max_repeats: u32,
+    max_tokens: u64,
+    check_health: impl FnMut() -> Result<()>,
+) -> String {
+    let mut detector = PathologyDetector::new(max_repeats, max_tokens);
+    let mut tripped = None;
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let result = source.subscribe_checked(from, &stop, check_health, |ev| {
+        tripped = detector.observe(ev);
+        tripped.is_none()
+    });
+    match result {
+        Err(error) => format!("event monitoring failed: {error:#}"),
+        Ok(()) => tripped.unwrap_or_else(|| "event monitoring ended unexpectedly".into()),
+    }
+}
+
 /// A PURE pathology detector over a session's §0 event stream — no I/O, so it's
 /// unit-tested over a `&[Event]` (the `select_winner`/`distill_feedback` pure-
 /// policy pattern). `observe` folds one event into the running state and returns
@@ -345,7 +405,7 @@ pub(super) fn session_guard(
 ///   3. **Token blowout** — cumulative `Usage` input+output tokens past
 ///      `max_tokens` (when > 0).
 ///
-/// With both thresholds 0, only `RunFailed` trips.
+/// With both thresholds 0, only `RunFailed` or accounting overflow trips.
 struct PathologyDetector {
     /// Consecutive-identical-ToolCall threshold AND consecutive-error threshold;
     /// 0 disables both (RunFailed still trips).
@@ -425,7 +485,15 @@ impl PathologyDetector {
                 }
             },
             Payload::Usage(u) => {
-                self.tokens += u.input_tokens.unwrap_or(0) + u.output_tokens.unwrap_or(0);
+                let Some(tokens) = u
+                    .input_tokens
+                    .unwrap_or(0)
+                    .checked_add(u.output_tokens.unwrap_or(0))
+                    .and_then(|delta| self.tokens.checked_add(delta))
+                else {
+                    return Some("token accounting overflow".into());
+                };
+                self.tokens = tokens;
                 if self.max_tokens > 0 && self.tokens > self.max_tokens {
                     return Some(format!(
                         "token blowout: {} tokens > budget {}",
@@ -542,6 +610,94 @@ mod tests {
                 source: UsageSource::Wire,
             }),
         )
+    }
+
+    #[test]
+    fn token_overflow_trips_within_and_across_records() {
+        for max_tokens in [0, u64::MAX] {
+            let mut detector = PathologyDetector::new(0, max_tokens);
+            assert_eq!(
+                detector.observe(&usage(u64::MAX, 1)).as_deref(),
+                Some("token accounting overflow")
+            );
+            let mut detector = PathologyDetector::new(0, max_tokens);
+            assert!(detector.observe(&usage(u64::MAX, 0)).is_none());
+            assert_eq!(
+                detector.observe(&usage(0, 1)).as_deref(),
+                Some("token accounting overflow")
+            );
+        }
+    }
+
+    #[test]
+    fn guard_trips_without_events_when_producer_health_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = crate::events::log::SessionLog::open_at(dir.path().to_path_buf()).unwrap();
+        let mut checks = 0;
+        let reason = super::guard_trip_reason(&log, 0, 3, 100, || {
+            checks += 1;
+            anyhow::ensure!(checks < 2, "producer stopped");
+            Ok(())
+        });
+        assert!(reason.contains("producer stopped"), "{reason}");
+        assert_eq!(checks, 2);
+    }
+
+    #[test]
+    fn malformed_codex_record_trips_guard_without_advancing_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let transcripts = home.join(".codex/sessions");
+        std::fs::create_dir_all(&transcripts).unwrap();
+        std::fs::write(transcripts.join("rollout.jsonl"), "not-json\n").unwrap();
+        let log_dir = dir.path().join("session");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let log = crate::events::log::SessionLog::open_at(log_dir.clone()).unwrap();
+        let cursor = log_dir.join("cursor.json");
+        let mut tailer = crate::events::transcripts::TailerHandle::spawn_detached(
+            log,
+            &home,
+            "codex",
+            "",
+            "session",
+            cursor.clone(),
+        )
+        .unwrap();
+        let source = crate::events::log::SessionLog::open_at(log_dir).unwrap();
+        let started = std::time::Instant::now();
+        let reason = super::guard_trip_reason(&source, 0, 3, 100, || {
+            anyhow::ensure!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "test timed out"
+            );
+            tailer.check_running()
+        });
+        assert!(reason.contains("parse Codex"), "{reason}");
+        assert!(source.read_from(0).unwrap().is_empty());
+        let checkpoint: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(cursor).unwrap()).unwrap();
+        assert_eq!(
+            checkpoint["position"]["offset"], 0,
+            "rejected first record cannot advance the cursor"
+        );
+    }
+
+    #[test]
+    fn guard_rejects_missing_or_changed_detached_producer() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(super::check_detached_producer(dir.path(), None).is_err());
+        let pid = std::process::id() as i32;
+        let pid_file = dir.path().join(crate::commands::session::TAILER_PID_FILE);
+        std::fs::write(&pid_file, pid.to_string()).unwrap();
+        let held = crate::commands::session::DetachedProducerLock::try_acquire(dir.path()).unwrap();
+        super::check_detached_producer(dir.path(), Some(pid)).unwrap();
+        drop(held);
+        assert!(super::check_detached_producer(dir.path(), Some(pid))
+            .unwrap_err()
+            .to_string()
+            .contains("ownership lock"));
+        std::fs::remove_file(pid_file).unwrap();
+        assert!(super::check_detached_producer(dir.path(), Some(pid)).is_err());
     }
 
     /// Fold a slice through the detector, returning the first trip reason (pure).

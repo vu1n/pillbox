@@ -159,3 +159,5 @@ dx-zero-config-local conforms: Guard health and overflow checks use local thread
 dx-zero-config-local conforms: Codex transcript accounting remains local-only and uses the existing session log/cost projection; the human missing-usage display distinguishes unavailable accounting without changing the JSON contract.
 optimization-external-substrate-primitives conforms: The Codex transcript fix records execution usage and tool evidence only; it adds no routing, optimization, or policy authority to Pillbox.
 docs-governance conforms: The canonical session-event-log document records the modern Codex mapping, cumulative usage semantics, cursor recovery boundary, and human-only missingness behavior alongside the implementation.
+session-event-log-spine conforms: A cache-write counter first reported after an omitted snapshot emits its cumulative value once; restored accounting state, duplicate suppression, and the existing exact log/cursor commit boundary remain unchanged.
+managed-tier-do-gateway conforms: Removing a redundant test-only Read import preserves bounded managed HTTP execution, authorization, and persistence behavior.

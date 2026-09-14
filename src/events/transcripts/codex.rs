@@ -155,8 +155,7 @@ impl Parser {
                 );
             }
         }
-        let cache_write_reported = usage.cache_write_input_tokens.is_some()
-            && previous.is_none_or(|previous| previous.cache_write_input_tokens.is_some());
+        let cache_write_reported = usage.cache_write_input_tokens.is_some();
         // A missing/null cache-write counter means "not reported for this
         // snapshot", not "the cumulative counter reset". Carry the last
         // known baseline so a later reappearance cannot rebill the prefix.
@@ -859,6 +858,30 @@ mod tests {
         assert_eq!(second.cache_read_input_tokens, Some(200));
         assert_eq!(second.cache_creation_input_tokens, Some(3));
         assert_eq!(second.output_tokens, Some(4));
+    }
+
+    #[test]
+    fn accounts_for_cache_writes_first_reported_after_an_omitted_counter() {
+        let mut parser = Parser::default();
+        let first = usage_from(&token_count(100, 50, 1, None), &mut parser, 1)
+            .expect("first usage without cache-write reporting");
+        assert_eq!(first.cache_creation_input_tokens, None);
+
+        let mut parser = Parser::from_state(Some(parser.state()));
+        let reported = token_count(100, 50, 1, Some(serde_json::json!(10)));
+        let second =
+            usage_from(&reported, &mut parser, 2).expect("first reported cache-write count");
+        assert_eq!(second.cache_creation_input_tokens, Some(10));
+        assert!(usage_from(&reported, &mut parser, 3).is_none());
+
+        let mut parser = Parser::from_state(Some(parser.state()));
+        let third = usage_from(
+            &token_count(110, 55, 2, Some(serde_json::json!(12))),
+            &mut parser,
+            4,
+        )
+        .expect("incremental cache-write count");
+        assert_eq!(third.cache_creation_input_tokens, Some(2));
     }
 
     #[test]

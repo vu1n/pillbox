@@ -217,7 +217,8 @@ printf '{"version":1,"snapshot":{"handle":"%s","parents":["%s"]}}\\n' "$3" "$BUR
   completed.capture.read_only.d1.rows_read += 1;
   completed.capture.totals.d1.rows_read += 1;
   await writeFile(reportPath, JSON.stringify(completed));
-  const reconciliation = await run(process.execPath, [reconciler.pathname, reportPath]);
+  const reconciliation = await run(process.execPath, [reconciler.pathname, reportPath,
+    "--receipt", new URL("./testdata/cost-receipt.fixture.json", import.meta.url).pathname]);
   assert.equal(reconciliation.code, 0, reconciliation.stderr);
   assert.match(reconciliation.stdout, /managed preview burn-in reconciliation passed/);
 });

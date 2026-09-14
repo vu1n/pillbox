@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "execution_identity": {
+    "invocation_id": "burnin-invocation-f7c83e0c4309e1bf6c385d69ad514d4b",
+    "idempotency_key": "burnin-invocation-f7c83e0c4309e1bf6c385d69ad514d4b",
+    "session_id": "burnin-session-264ad4e90e17713e8e8c989a96e5a4f5",
+    "request_hash": "sha256:85eca7b729f822e4c7fabe30483ac979bc01713fb425b800cb9291138f2eb558",
+    "execution_digest": "sha256:d37c73e072204aa37cfd679eef6e446e5613ada0978847d1cf1f604e91264760",
+    "execution_policy_revision": "managed/burnin-v1"
+  },
+  "artifact_ref": {
+    "key": "executions/0edeb223d4067ed694ec881e03b81ac403a8e1bced6eb537d6837c960316e364/85eca7b729f822e4c7fabe30483ac979bc01713fb425b800cb9291138f2eb558.json",
+    "media_type": "application/json",
+    "bytes": 672,
+    "sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  },
+  "cost_ref": "sha256:dab73a9a9ddafcb2ddd927da40fa430fd5037342a3079f7b63471fc3382fef7f",
+  "d1": {
+    "pre_seal": { "rows_read": 0, "rows_written": 1 },
+    "terminal_commit": { "rows_read": 0, "rows_written": 1 },
+    "execution_total": { "rows_read": 0, "rows_written": 2 }
+  },
+  "container": {
+    "instance_id": "synthetic-instance",
+    "profile": "standard-2",
+    "execution_duration_ms": 2500,
+    "cpu_seconds": 1.25,
+    "memory_byte_seconds": 1932735283200,
+    "disk_byte_seconds": 3600000000000,
+    "egress_bytes": 1024
+  },
+  "sources": {
+    "d1_pre_seal": {
+      "dataset": "synthetic-d1",
+      "resource_id": "synthetic-database",
+      "capture_sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "from": "2026-09-13T00:10:00.000Z",
+      "to": "2026-09-13T00:10:02.000Z"
+    },
+    "d1_terminal_commit": {
+      "dataset": "synthetic-d1",
+      "resource_id": "synthetic-database",
+      "capture_sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "from": "2026-09-13T00:10:02.000Z",
+      "to": "2026-09-13T00:10:03.000Z"
+    },
+    "d1_execution_total": {
+      "dataset": "synthetic-d1",
+      "resource_id": "synthetic-database",
+      "capture_sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "from": "2026-09-13T00:10:00.000Z",
+      "to": "2026-09-13T00:10:03.000Z"
+    },
+    "container_lifecycle": {
+      "dataset": "synthetic-containers-usage",
+      "resource_id": "synthetic-instance",
+      "capture_sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "from": "2026-09-13T00:09:00.000Z",
+      "to": "2026-09-13T00:20:00.000Z"
+    }
+  }
+}

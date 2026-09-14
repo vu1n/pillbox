@@ -57,11 +57,6 @@ pub(super) struct ParserState {
     pub(super) accounted: Option<CumulativeUsage>,
 }
 
-#[derive(Debug, Clone)]
-struct TokenSnapshot {
-    usage: CumulativeUsage,
-}
-
 /// Stateful Codex rollout parser. Token-count records are cumulative and may
 /// be emitted repeatedly while a tool loop is active, so parsing cannot be
 /// stateless once the transcript is a live durable source.
@@ -145,13 +140,13 @@ impl Parser {
         line_idx: usize,
         timestamp: SystemTime,
     ) -> anyhow::Result<Vec<TranscriptEvent>> {
-        let Some(snapshot) = parse_token_snapshot(payload)? else {
+        let Some(mut usage) = parse_token_snapshot(payload)? else {
             return Ok(vec![]);
         };
         let previous = self.state.accounted.as_ref();
         let had_previous = previous.is_some();
         if let Some(previous) = previous {
-            if !snapshot.usage.is_monotonic_from(previous) {
+            if !usage.is_monotonic_from(previous) {
                 // A decreasing cumulative stream is not a fresh session: the
                 // cursor pins the rollout identity. Refuse to reset or clamp
                 // it, so a malformed record cannot silently corrupt spend.
@@ -160,9 +155,8 @@ impl Parser {
                 );
             }
         }
-        let cache_write_reported = snapshot.usage.cache_write_input_tokens.is_some()
+        let cache_write_reported = usage.cache_write_input_tokens.is_some()
             && previous.is_none_or(|previous| previous.cache_write_input_tokens.is_some());
-        let mut usage = snapshot.usage;
         // A missing/null cache-write counter means "not reported for this
         // snapshot", not "the cumulative counter reset". Carry the last
         // known baseline so a later reappearance cannot rebill the prefix.
@@ -200,8 +194,7 @@ impl CumulativeUsage {
                 previous.cache_write_input_tokens,
             ) {
                 (Some(current), Some(previous)) => current >= previous,
-                (None, _) => true,
-                (Some(_), None) => true,
+                _ => true,
             }
     }
 
@@ -248,7 +241,7 @@ impl CumulativeUsage {
     }
 }
 
-fn parse_token_snapshot(payload: &serde_json::Value) -> anyhow::Result<Option<TokenSnapshot>> {
+fn parse_token_snapshot(payload: &serde_json::Value) -> anyhow::Result<Option<CumulativeUsage>> {
     let Some(info) = payload.get("info") else {
         return Ok(None);
     };
@@ -278,13 +271,11 @@ fn parse_token_snapshot(payload: &serde_json::Value) -> anyhow::Result<Option<To
         );
     }
     let cache_write_input_tokens = counter(total, "cache_write_input_tokens")?;
-    Ok(Some(TokenSnapshot {
-        usage: CumulativeUsage {
-            input_tokens,
-            cached_input_tokens,
-            cache_write_input_tokens,
-            output_tokens,
-        },
+    Ok(Some(CumulativeUsage {
+        input_tokens,
+        cached_input_tokens,
+        cache_write_input_tokens,
+        output_tokens,
     }))
 }
 
@@ -311,17 +302,12 @@ fn required_counter(
     let Some(value) = object.get(key) else {
         anyhow::bail!("Codex token_count total_token_usage missing {key}");
     };
-    if value.is_null() {
-        anyhow::bail!("Codex token_count {key} must be a non-negative integer");
-    }
     value
         .as_u64()
         .ok_or_else(|| anyhow::anyhow!("Codex token_count {key} must be a non-negative integer"))
 }
 
-/// Compatibility helper for one-line callers and parser unit tests. Live and
-/// durable paths use [`Parser`] so cumulative accounting survives a pump or
-/// process restart.
+/// Single-record test helper; production retains a [`Parser`] across records.
 #[cfg(test)]
 pub(super) fn parse_line(line: &str, line_idx: usize) -> Vec<TranscriptEvent> {
     Parser::default()
@@ -486,16 +472,7 @@ fn parse_custom_tool_call_output(
         .get("output")
         .map(stringify_tool_output)
         .unwrap_or_default();
-    let is_error = payload
-        .get("is_error")
-        .and_then(|v| v.as_bool())
-        .or_else(|| {
-            payload
-                .get("status")
-                .and_then(|v| v.as_str())
-                .map(|s| s == "error" || s == "failed")
-        })
-        .unwrap_or(false);
+    let is_error = custom_tool_call_output_is_error(payload);
     Some(TranscriptEvent {
         uuid: format!("ctco:{call_id}"),
         parent_uuid: Some(format!("ctc:{call_id}")),
@@ -506,6 +483,48 @@ fn parse_custom_tool_call_output(
             is_error,
         },
     })
+}
+
+/// Codex 0.151 serializes a code-mode host spawn failure as a plain-text
+/// `custom_tool_call_output` without an `is_error` or `status` field. Keep the
+/// fallback narrow to that native error shape: normal command output can be
+/// scalar too, and a nested command's exit code is not the tool-host status.
+fn custom_tool_call_output_is_error(payload: &serde_json::Value) -> bool {
+    if let Some(is_error) = payload.get("is_error").and_then(|value| value.as_bool()) {
+        return is_error;
+    }
+    if let Some(status) = payload.get("status").and_then(|value| value.as_str()) {
+        match status {
+            "error" | "failed" => return true,
+            "completed" | "success" => return false,
+            _ => {}
+        }
+    }
+    payload
+        .get("output")
+        .is_some_and(is_code_mode_host_spawn_failure)
+}
+
+fn is_code_mode_host_spawn_failure(output: &serde_json::Value) -> bool {
+    let Some(output) = output.as_str() else {
+        return false;
+    };
+    let Some(details) = output.strip_prefix("failed to spawn code-mode host ") else {
+        return false;
+    };
+    let Some((host, error)) = details.rsplit_once(": ") else {
+        return false;
+    };
+    if host.is_empty() {
+        return false;
+    }
+    let Some((message, code)) = error.rsplit_once(" (os error ") else {
+        return false;
+    };
+    !message.is_empty()
+        && code
+            .strip_suffix(')')
+            .is_some_and(|code| !code.is_empty() && code.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 fn stringify_tool_output(value: &serde_json::Value) -> String {
@@ -726,6 +745,35 @@ mod tests {
             }
             other => panic!("expected custom ToolResult, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn recognizes_codex_host_spawn_failure_without_guessing_nested_exit_codes() {
+        // Real Codex 0.151 transcript shape from
+        // artifact-turn-one/rollout.jsonl:14.
+        let host_failure = r#"{"timestamp":"2026-09-07T15:20:28.091Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_host","output":"failed to spawn code-mode host /usr/local/bin/codex-code-mode-host: No such file or directory (os error 2)"}}"#;
+        let events = parse_line(host_failure, 14);
+        let EventKind::ToolResult { is_error, .. } = &events[0].kind else {
+            panic!("expected custom ToolResult: {events:?}");
+        };
+        assert!(*is_error);
+
+        // A normal code-mode result can contain a failed nested command. Its
+        // structured output is not a tool-host failure.
+        let nested_exit = r#"{"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_nested","output":[{"type":"input_text","text":"Script completed\nOutput:\n[exit_code=1]\n"}]}}"#;
+        let events = parse_line(nested_exit, 15);
+        let EventKind::ToolResult { is_error, .. } = &events[0].kind else {
+            panic!("expected custom ToolResult: {events:?}");
+        };
+        assert!(!*is_error);
+
+        // Scalar output alone does not identify a host failure.
+        let ordinary_failure_text = r#"{"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_text","output":"command failed with exit code 1"}}"#;
+        let events = parse_line(ordinary_failure_text, 16);
+        let EventKind::ToolResult { is_error, .. } = &events[0].kind else {
+            panic!("expected custom ToolResult: {events:?}");
+        };
+        assert!(!*is_error);
     }
 
     #[test]

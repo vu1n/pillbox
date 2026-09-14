@@ -305,6 +305,16 @@ tree that crosses either limit terminates the producer with an error. It never
 truncates the record, skips accepted history, or advances the cursor past the
 rejected bytes. A replacement starts from the last complete committed record.
 
+`session guard` checks producer health on every event and on the subscription's
+500 ms idle poll. A stopped in-process tailer, a detached producer losing its
+ownership lock or PID identity, or a log-subscription failure trips the guard.
+`--kill` uses the existing session teardown; dry-run reports the trip without
+teardown. A historical log without a live producer cannot be guarded. Malformed
+records remain rejected rather than being skipped to make the monitor look
+healthy. Token-counter arithmetic overflow also trips immediately, even with
+the numeric token threshold disabled. These checks protect monitoring integrity;
+guest-reported token counts are not an independent billing cap.
+
 ### Codex transcript accounting and replay
 
 The Codex transcript adapter maps both the legacy `function_call` pair and the
@@ -313,6 +323,12 @@ modern `custom_tool_call` / `custom_tool_call_output` pair into one correlated
 an input that happens to look like JSON is not decoded. Output arrays are
 flattened only when every block is a plain text block. Mixed or structured
 blocks remain JSON so logging does not discard non-text output.
+
+Tool results preserve explicit status when present. Codex 0.151's unstructured
+code-mode host-spawn error is recognized by its anchored native error format;
+arbitrary failure text or a nested shell exit code does not imply tool-host
+failure. Transcript spans carry the harness identity (Codex/OpenAI or
+Claude/Anthropic), including standalone usage spans.
 
 Codex `event_msg.token_count` records are cumulative snapshots. The adapter
 emits a standalone native `usage` event only for a changed snapshot and emits

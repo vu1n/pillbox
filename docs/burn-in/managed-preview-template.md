@@ -292,7 +292,11 @@ same isolated run. Capture all of these dimensions, including zeroes:
 
 The report's `run_cost_envelopes` must contain exactly one envelope for the one
 new claim, bound again to the full execution identity and artifact digest. Its
-D1/R2/container counters must match the per-run captures. Analytics is compared
+D1 counters reconcile through a separate [cost receipt](cost-receipt.md), which
+binds pre-seal, terminal-commit, and execution-total observations to the same
+identity and artifact. R2 counters and execution duration/profile still match
+the per-run captures; container lifecycle allocation is a separate receipt
+measurement, not the execution duration. Analytics is compared
 separately: the immutable envelope records the one planned unit, while the
 provider capture records zero or one write plus explicit variance. A variance
 of `-1` records a best-effort miss without invalidating the terminal run;
@@ -301,7 +305,7 @@ retry/status/two-live-allowance/finalize
 traffic belongs in `read_only`, not in a second envelope. Reconcile with:
 
 ```sh
-npm run burnin:reconcile -- /private/path/burnin-report.json
+npm run burnin:reconcile -- /private/path/burnin-report.json --receipt /private/path/cost-receipt.json
 ```
 
 The reconciler fails closed on unexplained counter deltas, malformed/non-finite
@@ -310,7 +314,7 @@ unbounded status pages, any custom Durable Object class, or any custom DO
 storage growth. A successful fixture check is:
 
 ```sh
-npm run burnin:reconcile -- testdata/burnin-reconciliation.fixture.json
+npm run burnin:reconcile -- testdata/burnin-reconciliation.fixture.json --receipt testdata/cost-receipt.fixture.json
 ```
 
 The checked-in fixture is deterministic test data, not a claim about an

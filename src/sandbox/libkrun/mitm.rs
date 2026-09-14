@@ -48,8 +48,7 @@ struct Conn {
     /// Holds every HTTP/1.1 request line until it can be classified. Token
     /// endpoints are rejected before their bytes reach an upstream.
     request_gate: RequestGate,
-    /// Request bytes that passed the gate while the upstream connection is still
-    /// being established.
+    /// Gated request bytes not yet accepted by the upstream TLS buffer.
     outbound: Vec<u8>,
     req_logged: bool,
     closing: bool,
@@ -146,6 +145,10 @@ fn host_bound_swap(swap_pairs: &[CredSwap], host: &str) -> StubSwap {
 
 const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
 const MAX_REQUEST_HEADER_BYTES: usize = 64 * 1024;
+/// Bound unsent guest bytes during both connect and upstream backpressure.
+/// The fixed listener pool bounds the aggregate; overflow fails closed.
+const MAX_PENDING_UPSTREAM_BYTES: usize = 256 * 1024;
+const MAX_PLAINTEXT_CHUNK_BYTES: usize = 4 * 1024;
 
 struct RequestGate {
     state: RequestState,
@@ -270,6 +273,10 @@ impl RequestGate {
         self.upstream_allowed && !matches!(self.state, RequestState::Rejected)
     }
 
+    fn at_request_boundary(&self) -> bool {
+        matches!(self.state, RequestState::RequestLine(_))
+    }
+
     fn reject<T>(&mut self) -> Result<T, ()> {
         self.state = RequestState::Rejected;
         Err(())
@@ -318,6 +325,49 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+fn queue_pending_upstream(outbound: &mut Vec<u8>, bytes: &[u8]) -> bool {
+    let Some(remaining) = MAX_PENDING_UPSTREAM_BYTES.checked_sub(outbound.len()) else {
+        return false;
+    };
+    if bytes.len() > remaining {
+        return false;
+    }
+    outbound.extend_from_slice(bytes);
+    true
+}
+
+fn queue_swapped_request(
+    outbound: &mut Vec<u8>,
+    swap: &mut StubSwap,
+    gate: &RequestGate,
+    allowed: &[u8],
+) -> bool {
+    if !queue_pending_upstream(outbound, &swap.push(allowed)) {
+        return false;
+    }
+    // A poll/read boundary is not an HTTP boundary: a stub may continue in the
+    // next TLS record. Only completed framing makes the retained tail final.
+    !gate.at_request_boundary() || queue_pending_upstream(outbound, &swap.flush())
+}
+
+fn forward_pending(
+    outbound: &mut Vec<u8>,
+    mut send: impl FnMut(&[u8]) -> std::io::Result<usize>,
+) -> std::io::Result<()> {
+    while !outbound.is_empty() {
+        match send(outbound) {
+            Ok(0) => break,
+            Ok(written) => {
+                outbound.drain(..written);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 struct ChunkedBody {
@@ -488,43 +538,49 @@ fn drive_conn(
 
     // Drain guest plaintext before opening the upstream. Every request line is held
     // until the provider-owned token-endpoint matcher allows it, which makes a guest
-    // refresh a local response rather than even a partial upstream request.
-    let mut plain = Vec::new();
-    let mut buf = [0u8; 4096];
-    loop {
-        match tls.reader().read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => plain.extend_from_slice(&buf[..n]),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(_) => break,
-        }
-    }
-    if !plain.is_empty() && !*closing {
-        match request_gate.push(host, &plain) {
-            Ok(Some(allowed)) => {
-                if !*req_logged {
-                    let head = String::from_utf8_lossy(&allowed);
-                    diag.log(&format!(
-                        "krun-egress: [mitm] {:?} → {host} (forwarding{})",
-                        head.lines().next().unwrap_or(""),
-                        if swap.is_noop() { "" } else { ", cred swapped" }
-                    ));
-                    *req_logged = true;
+    // refresh a local response rather than even a partial upstream request. Process
+    // bounded chunks so a guest cannot create a second unbounded staging buffer in
+    // front of the pending-upstream queue.
+    if !*closing {
+        let mut plain = [0u8; MAX_PLAINTEXT_CHUNK_BYTES];
+        'plaintext: loop {
+            let n = match tls.reader().read(&mut plain) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            };
+            match request_gate.push(host, &plain[..n]) {
+                Ok(Some(allowed)) => {
+                    if !*req_logged {
+                        let head = String::from_utf8_lossy(&allowed);
+                        diag.log(&format!(
+                            "krun-egress: [mitm] {:?} → {host} (forwarding{})",
+                            head.lines().next().unwrap_or(""),
+                            if swap.is_noop() { "" } else { ", cred swapped" }
+                        ));
+                        *req_logged = true;
+                    }
+                    if !queue_swapped_request(outbound, swap, request_gate, &allowed) {
+                        diag.log(&format!(
+                            "krun-egress: [mitm] pending request exceeds {MAX_PENDING_UPSTREAM_BYTES} bytes → RST"
+                        ));
+                        sock.abort();
+                        return;
+                    }
                 }
-                let mut swapped = swap.push(&allowed);
-                swapped.extend(swap.flush());
-                outbound.extend(swapped);
-            }
-            Ok(None) => {}
-            Err(()) => {
-                diag.log(&format!(
-                    "krun-egress: [mitm] DENY guest OAuth rotation → {host} (local 403)"
-                ));
-                let _ = tls.writer().write_all(&oauth_forbidden_response());
-                *closing = true;
-                *connecting = None;
-                *upstream = None;
-                outbound.clear();
+                Ok(None) => {}
+                Err(()) => {
+                    diag.log(&format!(
+                        "krun-egress: [mitm] DENY guest OAuth rotation → {host} (local 403)"
+                    ));
+                    let _ = tls.writer().write_all(&oauth_forbidden_response());
+                    *closing = true;
+                    *connecting = None;
+                    *upstream = None;
+                    outbound.clear();
+                    break 'plaintext;
+                }
             }
         }
     }
@@ -564,9 +620,12 @@ fn drive_conn(
     // guest. OAuth rotation responses cannot exist here because their requests
     // never leave the local gate.
     if let Some(up) = upstream.as_mut() {
-        if !outbound.is_empty() {
-            up.send(outbound);
-            outbound.clear();
+        if let Err(error) = forward_pending(outbound, |bytes| up.send(bytes)) {
+            diag.log(&format!(
+                "krun-egress: [mitm] upstream write failed → RST ({error})"
+            ));
+            sock.abort();
+            return;
         }
         let alive = up.pump();
         let mut resp = Vec::new();
@@ -736,5 +795,157 @@ mod tests {
                 b"POST /v1/oauth/token HTTP/1.1\r\n\r\n",
             )
             .is_err());
+    }
+
+    fn push_pending(gate: &mut RequestGate, outbound: &mut Vec<u8>, chunk: &[u8]) -> bool {
+        match gate.push("platform.claude.com", chunk) {
+            Ok(Some(allowed)) => queue_pending_upstream(outbound, &allowed),
+            Ok(None) => true,
+            Err(()) => false,
+        }
+    }
+
+    #[test]
+    fn pending_upstream_queue_rejects_only_after_exact_boundary() {
+        let mut outbound = Vec::new();
+        assert!(queue_pending_upstream(
+            &mut outbound,
+            &vec![b'x'; MAX_PENDING_UPSTREAM_BYTES]
+        ));
+        assert_eq!(outbound.len(), MAX_PENDING_UPSTREAM_BYTES);
+        assert!(!queue_pending_upstream(&mut outbound, b"x"));
+        assert_eq!(outbound.len(), MAX_PENDING_UPSTREAM_BYTES);
+    }
+
+    #[test]
+    fn fixed_length_pending_request_fails_closed_at_queue_bound() {
+        let mut gate = RequestGate::new();
+        let mut outbound = Vec::new();
+        let head = b"POST /v1/messages HTTP/1.1\r\ncontent-length: 400000\r\n\r\n";
+        assert!(push_pending(&mut gate, &mut outbound, head));
+
+        let body = vec![b'x'; MAX_PENDING_UPSTREAM_BYTES + 1];
+        let overflowed = body
+            .chunks(MAX_PLAINTEXT_CHUNK_BYTES)
+            .any(|chunk| !push_pending(&mut gate, &mut outbound, chunk));
+        assert!(overflowed);
+        assert!(outbound.len() <= MAX_PENDING_UPSTREAM_BYTES);
+    }
+
+    #[test]
+    fn chunked_pending_request_fails_closed_at_queue_bound() {
+        let mut gate = RequestGate::new();
+        let mut outbound = Vec::new();
+        let head = b"POST /v1/messages HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\n";
+        assert!(push_pending(&mut gate, &mut outbound, head));
+
+        let mut wire_chunk = Vec::with_capacity(4096 + 10);
+        wire_chunk.extend_from_slice(b"1000\r\n");
+        wire_chunk.extend(std::iter::repeat_n(b'x', 4096));
+        wire_chunk.extend_from_slice(b"\r\n");
+        let overflowed = (0..128).any(|_| !push_pending(&mut gate, &mut outbound, &wire_chunk));
+        assert!(overflowed);
+        assert!(outbound.len() <= MAX_PENDING_UPSTREAM_BYTES);
+    }
+
+    #[test]
+    fn pending_queue_bound_is_per_forward_batch() {
+        let mut outbound = Vec::new();
+        assert!(queue_pending_upstream(
+            &mut outbound,
+            &vec![b'x'; MAX_PENDING_UPSTREAM_BYTES]
+        ));
+        forward_pending(&mut outbound, |bytes| Ok(bytes.len())).unwrap();
+        assert!(outbound.is_empty());
+        assert!(queue_pending_upstream(&mut outbound, b"next request"));
+    }
+
+    #[test]
+    fn partial_upstream_writes_retain_the_exact_suffix_until_accepted() {
+        let original = b"exact request bytes";
+        let mut outbound = original.to_vec();
+        let mut received = Vec::new();
+        forward_pending(&mut outbound, |bytes| {
+            if received.len() >= 5 {
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            received.extend_from_slice(&bytes[..5]);
+            Ok(5)
+        })
+        .unwrap();
+        assert_eq!(outbound, original[5..]);
+        forward_pending(&mut outbound, |_| Ok(0)).unwrap();
+        assert_eq!(outbound, original[5..]);
+        let error = forward_pending(
+            &mut outbound,
+            |_| Err(std::io::ErrorKind::BrokenPipe.into()),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(outbound, original[5..]);
+        forward_pending(&mut outbound, |bytes| {
+            received.extend_from_slice(bytes);
+            Ok(bytes.len())
+        })
+        .unwrap();
+        assert!(outbound.is_empty());
+        assert_eq!(received, original);
+    }
+
+    #[test]
+    fn bounded_plaintext_chunks_preserve_split_credential_substitution() {
+        let mut swap = StubSwap::new(vec![CredSwap {
+            stub: b"stub-token".to_vec(),
+            real: b"real-token".to_vec(),
+            hosts: vec!["api.anthropic.com".to_string()],
+        }]);
+        let mut input = vec![b'x'; MAX_PLAINTEXT_CHUNK_BYTES - 4];
+        input.extend_from_slice(b"stub-token\r\n");
+        let mut outbound = Vec::new();
+        for chunk in input.chunks(MAX_PLAINTEXT_CHUNK_BYTES) {
+            assert!(queue_pending_upstream(&mut outbound, &swap.push(chunk)));
+        }
+        assert!(queue_pending_upstream(&mut outbound, &swap.flush()));
+        let mut expected = vec![b'x'; MAX_PLAINTEXT_CHUNK_BYTES - 4];
+        expected.extend_from_slice(b"real-token\r\n");
+        assert_eq!(outbound, expected);
+    }
+
+    #[test]
+    fn separate_poll_cycles_preserve_stub_carry_until_request_end() {
+        for (first, second, expected) in [
+            (
+                "POST /messages HTTP/1.1\r\nContent-Length: 10\r\n\r\nstub-",
+                "token",
+                "POST /messages HTTP/1.1\r\nContent-Length: 10\r\n\r\nreal-token",
+            ),
+            (
+                "POST /messages HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\na\r\nstub-",
+                "token\r\n0\r\n\r\n",
+                "POST /messages HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\na\r\nreal-token\r\n0\r\n\r\n",
+            ),
+        ] {
+            let mut gate = RequestGate::new();
+            let mut swap = StubSwap::new(vec![CredSwap {
+                stub: b"stub-token".to_vec(),
+                real: b"real-token".to_vec(),
+                hosts: vec!["api.anthropic.com".to_string()],
+            }]);
+            let mut outbound = Vec::new();
+            let mut received = Vec::new();
+            for fragment in [first, second] {
+                let allowed = gate.push("api.anthropic.com", fragment.as_bytes()).unwrap().unwrap();
+                assert!(queue_swapped_request(&mut outbound, &mut swap, &gate, &allowed));
+                // Simulate an upstream drain between polls, not just two chunks
+                // accumulated before a single final flush.
+                forward_pending(&mut outbound, |bytes| {
+                    received.extend_from_slice(bytes);
+                    Ok(bytes.len())
+                }).unwrap();
+            }
+            assert!(gate.at_request_boundary());
+            assert_eq!(received, expected.as_bytes());
+            assert!(swap.flush().is_empty());
+        }
     }
 }

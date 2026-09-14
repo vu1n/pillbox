@@ -144,9 +144,9 @@ pub(super) struct Upstream {
 }
 
 impl Upstream {
-    /// Queue decrypted request bytes (from the guest) to send to the upstream.
-    pub(super) fn send(&mut self, buf: &[u8]) {
-        let _ = self.tls.writer().write_all(buf);
+    /// Accept only the bytes that fit the bounded TLS buffer; the caller retains the rest.
+    pub(super) fn send(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.tls.writer().write(buf)
     }
 
     /// Drive the socket: flush queued ciphertext out, pull any response ciphertext

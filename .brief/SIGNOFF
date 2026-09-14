@@ -161,3 +161,6 @@ optimization-external-substrate-primitives conforms: The Codex transcript fix re
 docs-governance conforms: The canonical session-event-log document records the modern Codex mapping, cumulative usage semantics, cursor recovery boundary, and human-only missingness behavior alongside the implementation.
 session-event-log-spine conforms: A cache-write counter first reported after an omitted snapshot emits its cumulative value once; restored accounting state, duplicate suppression, and the existing exact log/cursor commit boundary remain unchanged.
 managed-tier-do-gateway conforms: Removing a redundant test-only Read import preserves bounded managed HTTP execution, authorization, and persistence behavior.
+libkrun-env-fork-substrate conforms: Bound unsent MITM request bytes and preserve partial upstream writes and cross-poll credential substitution within the existing host-owned per-VM egress boundary; no real credentials enter guest state.
+libkrun-is-the-backend conforms: The bounded MITM queue changes only the existing local libkrun relay and leaves backend selection unchanged.
+docs-governance conforms: The canonical vault guide records the enforced unsent-byte bound, overflow reset, accepted-prefix forwarding, and HTTP-boundary substitution behavior alongside the implementation.

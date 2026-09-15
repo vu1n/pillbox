@@ -54,6 +54,10 @@ lifecycle observations to the immutable artifact and execution identity. It
 reconciles measured scopes against the envelope's planned terminal write,
 rather than inventing a fixed terminal-read correction or mutating evidence.
 The receipt does not waive missing vendor DO counters or other release gates.
+Receipt v2 names vendor SQL row units separately from non-SQLite storage units,
+records lifecycle GB-seconds independently of execution milliseconds, and keeps
+namespace retention outside additive per-run totals. Source-backed snapshot and
+authority scopes cannot explain away extra execution artifacts or Analytics points.
 
 Release owners must compare these envelopes with Cloudflare's D1, R2,
 Containers, Workers, Analytics Engine, and Durable Objects metrics/billing

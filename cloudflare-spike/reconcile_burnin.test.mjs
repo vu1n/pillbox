@@ -29,6 +29,8 @@ test("measured terminal reads reconcile without rewriting the sealed cost", asyn
   receipt.d1.execution_total.rows_read += 2;
   report.capture.run_cost_envelopes[0].observed.d1.rows_read += 2;
   report.capture.totals.d1.rows_read += 2;
+  receipt.accounting.d1.execution.units.rows_read += 2;
+  receipt.accounting.d1.total.units.rows_read += 2;
   const result = await reconcileTemporary(t, report, [], receipt);
   assert.equal(result.code, 0, result.stderr);
   assert.deepEqual(report.capture.run_cost_envelopes[0].cost, originalCost);

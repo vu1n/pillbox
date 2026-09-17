@@ -13,7 +13,7 @@ const MAX_JSON_DEPTH = 32;
 const LIMITATIONS = Object.freeze([
   "provider results are delayed and hourly/sample-granular",
   "lifecycle stop was not independently confirmed; this is a snapshot, not release proof",
-  "per-operation R2 capture is unavailable because rustic_backend hides HTTP retries",
+  "R2 HTTP attempts require the separate opt-in operation capture",
   "no execute/cleanup partition inference, receipt completeness, or billing total is made",
 ]);
 const SOURCE_NAMES = ["do_lifecycle", "container_lifecycle", "retention_before", "retention_after"];

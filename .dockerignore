@@ -14,3 +14,8 @@ runner/*
 .claude/
 *.md
 .env*
+# The vendored rustic_backend manifest names its README and licenses. Keep
+# those package metadata files in the build context alongside the source.
+!vendor/rustic_backend/README.md
+!vendor/rustic_backend/LICENSE-APACHE
+!vendor/rustic_backend/LICENSE-MIT

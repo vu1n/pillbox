@@ -1,0 +1,108 @@
+[package]
+name = "rustic_backend"
+version = "0.6.1"
+authors = ["the rustic-rs team"]
+categories = ["data-structures", "filesystem"]
+documentation = "https://docs.rs/rustic_backend"
+edition = "2024"
+homepage = "https://rustic.cli.rs/"
+include = ["src/**/*", "LICENSE-*", "README.md"]
+keywords = ["backup", "restic", "deduplication", "encryption", "library"]
+license = "Apache-2.0 OR MIT"
+publish = true
+readme = "README.md"
+repository = "https://github.com/rustic-rs/rustic_core/tree/main/crates/backend"
+resolver = "3"
+rust-version = { workspace = true }
+description = """
+rustic_backend - library for supporting various backends in rustic-rs
+"""
+
+[lib]
+path = "src/lib.rs"
+name = "rustic_backend"
+test = true
+doctest = true
+bench = true
+doc = true
+harness = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[features]
+default = ["opendal", "rest", "rclone"]
+cli = ["merge", "clap"]
+merge = ["dep:conflate"]
+clap = ["dep:clap"]
+opendal = [
+  "dep:opendal",
+  "dep:rayon",
+  "dep:tokio",
+  "tokio/rt-multi-thread",
+  "dep:typed-path",
+]
+rest = ["dep:reqwest", "dep:backon"]
+rclone = ["rest", "dep:rand", "dep:semver"]
+
+[dependencies]
+# core
+rustic_core = { workspace = true }
+
+# errors
+displaydoc = { workspace = true }
+thiserror = { workspace = true }
+
+# logging
+log = { workspace = true }
+
+# other dependencies
+bytes = { workspace = true }
+derive_setters = "0.1.9"
+jiff = "0.2.19"
+strum = { version = "0.28.0", features = ["derive"] }
+
+# general / backend choosing
+hex = { version = "0.4.3", features = ["serde"] }
+serde = { version = "1.0.228" }
+url = "2.5.8"
+
+# cli support
+clap = { version = "4.5.57", optional = true, features = ["derive", "env", "wrap_help"] }
+conflate = { version = "0.3.3", optional = true }
+
+# local backend
+aho-corasick = { workspace = true }
+walkdir = "2.5.0"
+
+# rest backend
+backon = { version = "1.6.0", optional = true }
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls-native-roots", "stream", "blocking"], optional = true }
+
+# rclone backend
+rand = { version = "0.10.0", optional = true }
+semver = { version = "1.0.27", optional = true }
+
+# opendal backend
+bytesize = "2.3.1"
+rayon = { version = "1.11.0", optional = true }
+tokio = { version = "1.49.0", optional = true, default-features = false }
+typed-path = { version = "0.12.2", optional = true }
+
+[target.'cfg(not(windows))'.dependencies]
+# opendal backend
+# - sftp is not supported on windows, see https://github.com/apache/incubator-opendal/issues/2963
+# - ftp is temporarily disabled due to dependency on aws-lc-sys
+opendal = { version = "0.55.0", features = ["blocking", "services-b2", "services-sftp", "services-swift", "services-azblob", "services-azdls", "services-cos", "services-fs", "services-dropbox", "services-gdrive", "services-gcs", "services-ghac", "services-http", "services-ipmfs", "services-memory", "services-obs", "services-onedrive", "services-oss", "services-s3", "services-webdav", "services-webhdfs", "services-azfile", "layers-throttle", "services-yandex-disk"], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+# opendal backend
+# - ftp is temporarily disabled due to dependency on aws-lc-sys
+opendal = { version = "0.55.0", features = ["blocking", "services-b2", "services-swift", "services-azblob", "services-azdls", "services-cos", "services-fs", "services-dropbox", "services-gdrive", "services-gcs", "services-ghac", "services-http", "services-ipmfs", "services-memory", "services-obs", "services-onedrive", "services-oss", "services-s3", "services-webdav", "services-webhdfs", "services-azfile", "layers-throttle", "services-yandex-disk"], optional = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+rstest = { workspace = true }
+toml = "1.0.3"
+
+[lints]
+workspace = true

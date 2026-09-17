@@ -6,6 +6,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { createOperationSidecar } from "./operation-sidecar.mjs";
 
 const DEFAULT_MANIFEST = new URL("../testdata/burnin-reconciliation.fixture.json", import.meta.url);
 const RECONCILER = fileURLToPath(new URL("./reconcile-burnin.mjs", import.meta.url));
@@ -30,7 +31,12 @@ const reportPath = option("--report") ?? process.env.BURNIN_HUDDLES_REPORT_FILE;
 const baseUrl = option("--base-url") ?? process.env.BURNIN_BASE_URL;
 const finalizeRequestPath = option("--finalize-request") ?? process.env.BURNIN_FINALIZE_REQUEST_FILE;
 const pillboxName = option("--pillbox") ?? process.env.BURNIN_PILLBOX_NAME;
+const operationCapturePath = option("--operation-capture-out");
 const managedPreflightPath = option("--managed-preflight") ?? process.env.BURNIN_MANAGED_PREFLIGHT ?? fileURLToPath(new URL("../../scripts/smoke/managed-agent-preflight.sh", import.meta.url));
+
+if (args.includes("--operation-capture-out") && (!finalizeMode || !operationCapturePath)) {
+  fail("--operation-capture-out requires --finalize and an output path");
+}
 
 const manifest = await readJson(manifestPath, "burn-in manifest");
 validateManifest(manifest);
@@ -101,26 +107,57 @@ const expectedFinalizeId = digestText(canonicalJson({
   session_id: finalizeRequest.sessionId,
   request_digest: expectedRequestDigest,
 }));
-const finalized = await callFinalize(finalizeRequest);
-if (
-  finalized.status !== 200 ||
-  finalized.body.status !== "completed" ||
-  !["created", "reused"].includes(finalized.body.disposition) ||
-  typeof finalized.body.finalizeId !== "string" ||
-  !/^sha256:[0-9a-f]{64}$/.test(finalized.body.finalizeId) ||
-  typeof finalized.body.requestDigest !== "string" ||
-  !/^sha256:[0-9a-f]{64}$/.test(finalized.body.requestDigest) ||
-  finalized.body.requestDigest !== expectedRequestDigest ||
-  finalized.body.finalizeId !== expectedFinalizeId ||
-  typeof finalized.body.resultSnapshot !== "string" ||
-  !/^[0-9a-f]{64}$/.test(finalized.body.resultSnapshot)
-) {
-  fail("finalize/status did not return the canonical request digest, finalize ID, and result snapshot");
+let operationSidecar;
+if (operationCapturePath !== undefined) {
+  try {
+    operationSidecar = await createOperationSidecar(operationCapturePath, {
+      execution_identity: report.capture.execution_identity,
+      finalize_id: expectedFinalizeId,
+      request_digest: expectedRequestDigest,
+    }, finalizeRequest.workspace.repo);
+  } catch {
+    fail("cannot reserve private R2 operation capture output; no finalize request sent");
+  }
 }
-await verifySnapshotAncestry({
-  resultSnapshot: finalized.body.resultSnapshot,
-  requestedBaseSnapshot,
-});
+let finalized;
+let verificationError;
+try {
+  finalized = await callFinalize(finalizeRequest);
+  if (finalized.body?.finalizeId === expectedFinalizeId && finalized.body.requestDigest === expectedRequestDigest) {
+    await operationSidecar?.recordFinalize(finalized.body.r2Capture, finalized.body.disposition === "reused");
+  }
+  if (finalized.status >= 400) {
+    throw new Error(`finalize/status returned HTTP ${finalized.status} (${finalized.body?.error?.code ?? "unknown"})`);
+  }
+  if (finalized.status === 202) throw new Error("finalize response was lost and durable status remains running");
+  if (
+    finalized.status !== 200 ||
+    finalized.body?.status !== "completed" ||
+    !["created", "reused"].includes(finalized.body.disposition) ||
+    typeof finalized.body.finalizeId !== "string" ||
+    !/^sha256:[0-9a-f]{64}$/.test(finalized.body.finalizeId) ||
+    typeof finalized.body.requestDigest !== "string" ||
+    !/^sha256:[0-9a-f]{64}$/.test(finalized.body.requestDigest) ||
+    finalized.body.requestDigest !== expectedRequestDigest ||
+    finalized.body.finalizeId !== expectedFinalizeId ||
+    typeof finalized.body.resultSnapshot !== "string" ||
+    !/^[0-9a-f]{64}$/.test(finalized.body.resultSnapshot)
+  ) {
+    throw new Error("finalize/status did not return the canonical request digest, finalize ID, and result snapshot");
+  }
+  const verify = capturePath => verifySnapshotAncestry({
+    resultSnapshot: finalized.body.resultSnapshot,
+    requestedBaseSnapshot,
+    capturePath,
+  });
+  if (operationSidecar) await operationSidecar.verify(verify);
+  else await verify();
+} catch (error) {
+  verificationError = error;
+} finally {
+  await operationSidecar?.close();
+}
+if (verificationError) fail(verificationError.message);
 const completed = {
   ...report,
   capture: {
@@ -208,7 +245,7 @@ async function writeReport(path, value) {
 async function callFinalize(body) {
   const token = process.env.BURNIN_FINALIZE_TOKEN;
   if (typeof token !== "string" || token.length === 0) {
-    fail("missing BURNIN_FINALIZE_TOKEN; capability must be minted for the exact finalize request bytes");
+    throw new Error("missing BURNIN_FINALIZE_TOKEN; capability must be minted for the exact finalize request bytes");
   }
   const encodedBody = JSON.stringify(body);
   let response;
@@ -236,24 +273,19 @@ async function callFinalize(body) {
         body: encodedBody,
       });
     } catch (statusError) {
-      fail(`finalize response was lost and durable status failed: ${String(statusError)}`);
+      throw new Error(`finalize response was lost and durable status failed: ${String(statusError)}`);
     }
   }
   let responseBody;
   try {
     responseBody = await response.json();
   } catch {
-    fail(`finalize/status returned non-JSON HTTP ${response.status}`);
+    throw new Error(`finalize/status returned non-JSON HTTP ${response.status}`);
   }
-  if (!response.ok) {
-    const code = responseBody?.error?.code ?? "unknown";
-    fail(`finalize/status returned HTTP ${response.status} (${code})`);
-  }
-  if (response.status === 202) fail("finalize response was lost and durable status remains running");
   return { status: response.status, body: responseBody, requestCount };
 }
 
-async function verifySnapshotAncestry({ resultSnapshot, requestedBaseSnapshot }) {
+async function verifySnapshotAncestry({ resultSnapshot, requestedBaseSnapshot, capturePath }) {
   // The Worker response names a handle; only the rustic store can prove its DAG parentage.
   let stdout;
   try {
@@ -264,15 +296,16 @@ async function verifySnapshotAncestry({ resultSnapshot, requestedBaseSnapshot })
       "--json",
       "--pillbox",
       pillboxName,
+      ...(capturePath ? ["--capture-r2", capturePath] : []),
     ], { encoding: "utf8", maxBuffer: 64 * 1024 }));
   } catch (error) {
-    fail(`rustic result snapshot inspection failed: ${error.stderr || error.message}`);
+    throw new Error(`rustic result snapshot inspection failed: ${error.stderr || error.message}`);
   }
   let inspected;
   try {
     inspected = JSON.parse(stdout);
   } catch {
-    fail("rustic result snapshot inspection returned non-JSON output");
+    throw new Error("rustic result snapshot inspection returned non-JSON output");
   }
   const snapshot = inspected?.snapshot;
   if (
@@ -281,7 +314,7 @@ async function verifySnapshotAncestry({ resultSnapshot, requestedBaseSnapshot })
     !Array.isArray(snapshot?.parents) ||
     !snapshot.parents.includes(requestedBaseSnapshot)
   ) {
-    fail("managed result snapshot is not descended from the requested base snapshot");
+    throw new Error("managed result snapshot is not descended from the requested base snapshot");
   }
 }
 

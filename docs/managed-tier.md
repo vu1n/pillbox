@@ -115,8 +115,10 @@ shared namespace delta. This adds no runtime write or deployment requirement.
 
 The operator-only [vendor lifecycle collector](burn-in/operation-capture.md)
 retains bounded provider observations without converting unavailable data to
-zero. It does not yet supply snapshot HTTP accounting or execute/cleanup
-partitions, and cannot by itself close the release gate.
+zero. Opt-in [snapshot HTTP capture](burn-in/r2-http-capture.md) records
+OpenDAL attempts below retries and separates submitted from consumed bytes.
+Neither collector proves provider billing completeness or execute/cleanup
+lifecycle attribution; both preserve those remaining release gates.
 
 ## Current limits
 

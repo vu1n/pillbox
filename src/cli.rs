@@ -26,6 +26,10 @@ pub(crate) enum SnapshotAction {
         /// Emit the snapshot record as JSON on stdout.
         #[arg(long)]
         json: bool,
+        /// Write an opt-in bounded R2 HTTP-attempt capture to an exclusively
+        /// created private sidecar. Normal snapshot output is unchanged.
+        #[arg(long = "capture-r2", value_name = "PATH")]
+        capture_r2: Option<PathBuf>,
     },
     /// Remove one snapshot. Data packs survive until a future `prune`.
     Rm {
@@ -178,6 +182,9 @@ pub(crate) struct RemoteRepoRestore {
     /// Directory to restore into (created if absent).
     #[arg(long, value_name = "DIR")]
     pub(crate) target: String,
+    /// Emit the bounded R2 capture helper envelope on stdout.
+    #[arg(long = "capture-r2-json")]
+    pub(crate) capture_r2_json: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -191,6 +198,9 @@ pub(crate) struct RemoteRepoBackup {
     /// records it as the result snapshot's lineage edge.
     #[arg(long, value_name = "HANDLE")]
     pub(crate) parent: String,
+    /// Emit the bounded R2 capture helper envelope on stdout.
+    #[arg(long = "capture-r2-json")]
+    pub(crate) capture_r2_json: bool,
 }
 
 #[derive(Subcommand, Debug)]

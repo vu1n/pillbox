@@ -104,7 +104,7 @@ fields. Example units below are synthetic, not live release evidence.
   "limitations": [
     "provider results are delayed and hourly/sample-granular",
     "lifecycle stop was not independently confirmed; this is a snapshot, not release proof",
-    "per-operation R2 capture is unavailable because rustic_backend hides HTTP retries",
+    "R2 HTTP attempts require the separate opt-in operation capture",
     "no partition inference or billing total is made"
   ]
 }
@@ -138,10 +138,13 @@ does not attest complete provider coverage. Storage observations report the
 maximum `storedBytes` sample returned in their window; they do not claim that a
 namespace delta belongs to one object or invocation.
 
+For snapshot request observations, use the separate opt-in
+[R2 HTTP capture](r2-http-capture.md). It does not substitute client counters for
+provider billing evidence.
+
 The provider may lag the workload and its hourly bins can begin before a
 requested lower bound. The requested UTC window and raw bin labels are retained
 without pretending that a bin is an exact operation timestamp. The capture does
-not provide per-operation R2 attribution because `rustic_backend` hides HTTP
-retries. It does not infer execute/cleanup partitions, receipt completeness,
+not provide per-operation R2 attribution. It does not infer execute/cleanup partitions, receipt completeness,
 invoice totals, or release approval. A live lifecycle that has not been
 independently observed as stopped remains an open snapshot condition.

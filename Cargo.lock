@@ -2882,12 +2882,15 @@ dependencies = [
  "clap",
  "clap_complete",
  "crossterm",
+ "futures-util",
+ "http",
  "http-body-util",
  "hudsucker",
  "hyper-rustls",
  "jiff",
  "libc",
  "notify",
+ "opendal",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
@@ -3571,8 +3574,6 @@ dependencies = [
 [[package]]
 name = "rustic_backend"
 version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02bd2f9c5b02e692175d8a7d7131ee39f6f89a60c43de3d0acdbe24093e722d3"
 dependencies = [
  "aho-corasick",
  "bytes",

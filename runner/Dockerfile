@@ -44,6 +44,7 @@ FROM rust:1-bookworm AS pillbox-build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY vendor ./vendor
 # Cache mounts keep the cargo registry + compiled deps on the build daemon, so
 # a rebuild on the same host only recompiles changed crates (minutes → seconds
 # on iteration — the BYO/on-target build loop). The `runner` profile skips

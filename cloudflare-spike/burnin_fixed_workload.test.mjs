@@ -2,14 +2,29 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { createOperationSidecar } from "./scripts/operation-sidecar.mjs";
 
 const script = new URL("./scripts/burnin-fixed-workload.mjs", import.meta.url);
 const reconciler = new URL("./scripts/reconcile-burnin.mjs", import.meta.url);
 const fixture = new URL("./testdata/burnin-reconciliation.fixture.json", import.meta.url);
+
+function syntheticCapture(operation = "verification") {
+  return {
+    schema_version: 1, capture_type: "r2_http_operation",
+    capture_id: "11111111-1111-4111-8111-111111111111", operation,
+    bucket: "burnin", prefix: "snapshots/",
+    started_at: "2026-09-17T00:00:00.000Z", finished_at: "2026-09-17T00:00:01.000Z",
+    status: "complete", reasons: [], records: [{
+      id: "11111111-1111-4111-8111-111111111111:1", method: "GET", action: "GetObject",
+      selector: "snapshots/config", status: 200, request_body_bytes: 0,
+      response_body_bytes: 42, response_complete: true,
+    }],
+  };
+}
 
 test("dry run distinguishes planned Analytics units from provider-observed writes", async () => {
   const result = await run(process.execPath, [script.pathname]);
@@ -20,6 +35,17 @@ test("dry run distinguishes planned Analytics units from provider-observed write
     analytics_points_observed: "provider capture required after the run",
     analytics_variance: "observed minus planned",
   });
+});
+
+test("operation capture rejects non-finalize and missing-output invocations", async () => {
+  for (const [args, expected] of [
+    [["--operation-capture-out", "unused.json"], /requires --finalize and an output path/],
+    [["--finalize", "--operation-capture-out"], /requires a value/],
+  ]) {
+    const result = await run(process.execPath, [script.pathname, ...args]);
+    assert.notEqual(result.code, 0);
+    assert.match(result.stderr, expected);
+  }
 });
 
 test("Pillbox brackets the sole Huddles recorder with preflight and same-report finalize", async (t) => {
@@ -80,6 +106,7 @@ printf '%s\\n' '{"schema_version":1,"agent":"codex","status":"preflight_rejected
       repo: {
         endpoint: "https://example.invalid",
         bucket: "burnin",
+        prefix: "snapshots/",
         accessKeyId: "access-key",
         secretAccessKey: "secret-key",
       },
@@ -95,6 +122,9 @@ printf '%s\\n' '{"schema_version":1,"agent":"codex","status":"preflight_rejected
   });
   const resultSnapshot = "c".repeat(64);
   const snapshotInspector = join(temp, "pillbox");
+  const verificationCapture = syntheticCapture();
+  const verificationFixturePath = join(temp, "verification-fixture.json");
+  await writeFile(verificationFixturePath, JSON.stringify(verificationCapture));
   await writeFile(snapshotInspector, `#!/usr/bin/env bash
 set -eu
 test "$1" = snapshot
@@ -102,6 +132,10 @@ test "$2" = show
 test "$4" = --json
 test "$5" = --pillbox
 test "$6" = burnin-pillbox
+if test "\${7:-}" = --capture-r2; then
+  umask 077
+  cp "$BURNIN_VERIFICATION_CAPTURE" "$8"
+fi
 printf '{"version":1,"snapshot":{"handle":"%s","parents":["%s"]}}\\n' "$3" "$BURNIN_SNAPSHOT_PARENT"
 `);
   await chmod(snapshotInspector, 0o700);
@@ -112,6 +146,17 @@ printf '{"version":1,"snapshot":{"handle":"%s","parents":["%s"]}}\\n' "$3" "$BUR
   const server = createServer(async (request, response) => {
     const requestBody = await requestText(request);
     const authorization = request.headers.authorization;
+    if (authorization === "Bearer failed-transfer-token") {
+      const capture = syntheticCapture("snapshot_finalize");
+      capture.status = "incomplete";
+      capture.reasons = ["operation_failed"];
+      response.writeHead(502, { "content-type": "application/json" });
+      response.end(JSON.stringify({
+        finalizeId, requestDigest, r2Capture: capture,
+        error: { code: "workspace_transfer_failed" },
+      }));
+      return;
+    }
     if (authorization === "Bearer wrong-digest-token") {
       response.setHeader("content-type", "application/json");
       response.end(JSON.stringify({
@@ -162,6 +207,7 @@ printf '{"version":1,"snapshot":{"handle":"%s","parents":["%s"]}}\\n' "$3" "$BUR
     PATH: `${temp}:${process.env.PATH}`,
     BURNIN_CONFIRM_ISOLATED: "1",
     BURNIN_SNAPSHOT_PARENT: finalizeRequest.workspace.snapshot,
+    BURNIN_VERIFICATION_CAPTURE: verificationFixturePath,
   };
 
   const mismatchedDigest = await run(process.execPath, finalizeArgs, {
@@ -181,7 +227,30 @@ printf '{"version":1,"snapshot":{"handle":"%s","parents":["%s"]}}\\n' "$3" "$BUR
   assert.match(mismatchedParent.stderr, /not descended from the requested base snapshot/);
   assert.equal(JSON.parse(await readFile(reportPath, "utf8")).capture.cleanup, null);
 
-  const finalizeResult = await run(process.execPath, finalizeArgs, {
+  const occupiedCapture = join(temp, "occupied-capture.json");
+  await writeFile(occupiedCapture, "existing evidence");
+  const blockedCapture = await run(process.execPath, [...finalizeArgs, "--operation-capture-out", occupiedCapture], {
+    ...finalizeEnv, BURNIN_FINALIZE_TOKEN: "finalize-token",
+  });
+  assert.equal(blockedCapture.code, 1);
+  assert.match(blockedCapture.stderr, /no finalize request sent/);
+  assert.equal(requests.length, 0);
+  assert.equal(await readFile(occupiedCapture, "utf8"), "existing evidence");
+
+  const operationCapture = join(temp, "operation-capture.json");
+  const failedCapturePath = join(temp, "failed-operation-capture.json");
+  const failedTransfer = await run(process.execPath, [...finalizeArgs, "--operation-capture-out", failedCapturePath], {
+    ...finalizeEnv, BURNIN_FINALIZE_TOKEN: "failed-transfer-token",
+  });
+  assert.equal(failedTransfer.code, 1);
+  assert.match(failedTransfer.stderr, /HTTP 502/);
+  const failedCapture = JSON.parse(await readFile(failedCapturePath, "utf8"));
+  assert.equal(failedCapture.captures.snapshot_finalize.status, "incomplete");
+  assert.deepEqual(failedCapture.captures.snapshot_finalize.reasons, ["operation_failed"]);
+  assert.deepEqual(failedCapture.captures.verification, { status: "unavailable", reason: "not_observed" });
+  assert.equal(JSON.parse(await readFile(reportPath, "utf8")).capture.cleanup, null);
+
+  const finalizeResult = await run(process.execPath, [...finalizeArgs, "--operation-capture-out", operationCapture], {
     ...finalizeEnv,
     BURNIN_FINALIZE_TOKEN: "finalize-token",
   });
@@ -198,6 +267,14 @@ printf '{"version":1,"snapshot":{"handle":"%s","parents":["%s"]}}\\n' "$3" "$BUR
   assert.deepEqual(requests, ["/v2/workspaces/finalize", "/v2/workspaces/finalize/status"]);
   assert.equal(requestBodies[0], requestBodies[1]);
   assert.equal(finalizeEffects, 1);
+  const sidecar = JSON.parse(await readFile(operationCapture, "utf8"));
+  assert.deepEqual(sidecar.execution_identity, report.capture.execution_identity);
+  assert.equal(sidecar.finalize_id, finalizeId);
+  assert.equal(sidecar.request_digest, requestDigest);
+  assert.deepEqual(sidecar.captures.snapshot_finalize, { status: "unavailable", reason: "replayed_without_capture" });
+  assert.deepEqual(sidecar.captures.verification, verificationCapture);
+  assert.equal((await stat(operationCapture)).mode & 0o777, 0o600);
+  assert.doesNotMatch(await readFile(operationCapture, "utf8"), /workspace-password|secret-key|access-key|finalize-token/);
   assert.deepEqual(completed.capture.runtime_calls, report.capture.runtime_calls);
   assert.deepEqual(completed.capture.run_cost_envelopes[0].execution_identity, completed.capture.execution_identity);
 
@@ -232,6 +309,28 @@ printf '{"version":1,"snapshot":{"handle":"%s","parents":["%s"]}}\\n' "$3" "$BUR
     "--receipt", receiptPath]);
   assert.equal(reconciliation.code, 0, reconciliation.stderr);
   assert.match(reconciliation.stdout, /managed preview burn-in reconciliation passed/);
+});
+
+test("operation sidecar preserves failed verification without accepting unsafe telemetry", async t => {
+  const directory = await mkdtemp(join(tmpdir(), "pillbox-sidecar-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const output = join(directory, "operations.json");
+  const sidecar = await createOperationSidecar(output, { finalize_id: "synthetic" }, { bucket: "burnin", prefix: "snapshots/" });
+  try {
+    const final = syntheticCapture("snapshot_finalize");
+    await sidecar.recordFinalize(final, false);
+    assert.deepEqual(JSON.parse(await readFile(output, "utf8")).captures.snapshot_finalize, final);
+    await sidecar.recordFinalize({ ...final, authorization: "never-copy-this-token" }, false);
+    assert.doesNotMatch(await readFile(output, "utf8"), /never-copy-this-token/);
+    const incomplete = { ...syntheticCapture(), status: "incomplete", reasons: ["operation_failed"] };
+    await assert.rejects(sidecar.verify(async path => {
+      await writeFile(path, JSON.stringify(incomplete));
+      throw new Error("verification failed");
+    }), /verification failed/);
+    assert.deepEqual(JSON.parse(await readFile(output, "utf8")).captures.verification, incomplete);
+    await sidecar.verify(async path => { await writeFile(path, "x".repeat(512 * 1024 + 1)); });
+    assert.equal(JSON.parse(await readFile(output, "utf8")).captures.verification.status, "unavailable");
+  } finally { await sidecar.close(); }
 });
 
 async function requestText(request) {

@@ -269,8 +269,13 @@ pillbox dispatch --from-bookmark seg-3 -k 4 --rubric grade.txt --agent opencode 
 
 What the critic sees is the worker's **edits from its own §0 log** (`session log
 <id> --type tool_call`, completed `edit`/`write` calls) rendered with the task
-prompt — the same representation the offline calibration harness scores, so a
-Brier/ECE number measured offline is the number the live loop gets. Shell writes
+prompt — the same representation the offline calibration harness scores, so an
+offline Brier/ECE number is the right *starting estimate* for the live loop. It is
+not a guarantee: live dispatches are a different distribution, which is why
+`record` exists — it produces one labeled `(p, passed)` pair per run for ongoing
+validation. Note the selection bias in the other two policies: `order`/`select`
+only grade (and therefore only label) the workers the critic ranked highest, so
+their pairs must not be pooled with `record`'s when measuring the critic. Shell writes
 (`cat > f`, `sed -i`) are not recovered; that blind spot is the extractor's, and
 it is stated rather than papered over. One `noul` question, phrased in
 TypeSafe's own idiom; the probability comes back natively (no verbalized
@@ -281,7 +286,7 @@ Three policies:
 
 | policy | what happens | what it's for |
 |---|---|---|
-| `record` (default) | Every worker is scored right before **each** of its grades; grading is unchanged. | Measurement. Every dispatch becomes a labeled `(p, passed)` pair — the harness grades its own critic for free. Composes with `--segments` (the critic judges the finished chain before the reward). |
+| `record` (default) | Every worker is scored right before **each** of its grades; grading is unchanged. | Measurement. Every dispatch becomes an unbiased labeled `(p, passed)` pair — the only policy whose pairs are fit for measuring the critic. Composes with `--segments` (the critic judges the finished chain before the reward). |
 | `order` | All forks are settled to idle first, then graded in **descending `p`**; the loop stops at the first passer. The rest are `unverified`. A worker that fails its first grade still gets its `--retries` before the loop moves on. | Saving verifier runs when the critic ranks well. `verifier_runs_saved` in the verdict is the count. |
 | `select` | Settle all, score all, grade **only the argmax-`p`** worker. If it fails after retries, there is no winner (exit 1). | The "critic instead of verifier" claim, ground-truthed on the one worker it picked. The honest cost of trusting the critic is visible in the exit code. |
 

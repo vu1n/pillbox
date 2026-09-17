@@ -66,7 +66,7 @@ global pillbox regardless of where you are.
 | `pillbox pull [--snapshot HANDLE \| --bookmark NAME]` | Restore cwd from a snapshot (defaults to latest) or bookmark. |
 | `pillbox collect SESSION… [--to DIR] [--as-refs] [--json]` | **Collect** finished session results + lineage for an orchestrator to merge — the substrate half of a fan-out loop (pillbox collects, the orchestrator decides how to merge; `dispatch` = `collect` + grade + select-one). Rehydrates each session's result tree into `<to>/<session>/` (default `./collected`) and emits a `--json` manifest of the **merge triple** per result: `base_snapshot`/`base_git_anchor` (fork point + merge base commit), `result_snapshot` (theirs), `dir`, `source`. All-or-nothing on unfinished sessions. `--as-refs` also synthesizes a git commit per result (tree = result, parent = merge base) under `refs/pillbox/collect/<session>` so the orchestrator `git merge`/`jj`s with its own policy (requires cwd = git work tree; adds `ref` to the manifest). pillbox never merges. See docs/collect.md. |
 | `pillbox snapshot list [--json]` | List every snapshot in the pillbox's repo. |
-| `pillbox snapshot show HANDLE [--json]` | Show one snapshot (HANDLE may be a unique prefix). |
+| `pillbox snapshot show HANDLE [--json] [--capture-r2 PATH]` | Show one snapshot (HANDLE may be a unique prefix). Optional R2 HTTP-attempt capture reserves an exclusive private sidecar before network access; see [capture contract](burn-in/r2-http-capture.md). |
 | `pillbox snapshot rm HANDLE` | Forget a snapshot (data packs survive until prune). |
 | `pillbox bookmark list [--json]` | List named snapshot bookmarks. |
 | `pillbox bookmark show NAME [--json]` | Show one bookmark. |

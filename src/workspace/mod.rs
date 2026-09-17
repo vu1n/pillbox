@@ -35,6 +35,7 @@ pub(crate) mod base_cache;
 pub(crate) mod cow;
 pub(crate) mod git_inflow;
 pub(crate) mod ingest;
+pub(crate) mod operation_capture;
 pub(crate) mod rustic;
 
 use std::path::Path;

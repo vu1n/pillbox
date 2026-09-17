@@ -90,6 +90,18 @@ pub(crate) fn write_private_file(path: &Path, body: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Reserve a new private sidecar without following an existing path. Capture
+/// callers use this before any network activity so even a failed operation has
+/// an exclusive 0600 destination for its incomplete evidence.
+pub(crate) fn reserve_private_file(path: &Path) -> Result<fs::File> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("reserve {} for private write", path.display()))
+}
+
 /// Append `body` to `path` with 0600 perms (create if absent, never
 /// truncate). Companion to [`write_private_file`] for append-only
 /// records — today's only caller is the lifecycle events JSONL stream

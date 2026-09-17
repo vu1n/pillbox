@@ -26,6 +26,13 @@ import {
   type WorkspaceFinalizeRecord,
   type WorkspaceFinalizeStore,
 } from "./workspace_finalize.js";
+import {
+  parseR2CaptureOutput,
+  unavailableR2Capture,
+  type ParsedR2CaptureOutput,
+  type R2CaptureExpectation,
+  type R2CaptureTelemetry,
+} from "./r2_capture.js";
 
 const WORKSPACE_XFER_TIMEOUT_MS = 300_000;
 
@@ -35,6 +42,7 @@ export interface WorkspaceTransferEnv {
   readonly MANAGED_CAPABILITY_SECRET?: string;
   readonly MANAGED_EXECUTION_EPOCH?: string;
   readonly MANAGED_EXECUTION_LIMIT?: string;
+  readonly MANAGED_R2_CAPTURE_ENABLED?: string;
 }
 
 type WorkspaceSandbox = Pick<ReturnType<typeof getSandbox>, "killAllProcesses" | "exec">;
@@ -101,6 +109,8 @@ export async function routeWorkspaceTransfer(
     validateR2Repo(workspace.repo);
     const password = nonEmpty(workspace.password, "workspace.password");
     const snapshot = snapshotHandle(workspace.snapshot, "workspace.snapshot");
+    const captureEnabled = env.MANAGED_R2_CAPTURE_ENABLED === "1";
+    const captureExpectation = captureExpectationFor(mode ?? "backup", workspace.repo);
     const reservations = reservationStore(env, dependencies);
     if (mode === "restore") {
       const executionRequestHash = sha256Digest(
@@ -155,16 +165,27 @@ export async function routeWorkspaceTransfer(
       }
       if (claim.kind === "reused") {
         if (claim.record.status === "ready") {
-          return Response.json({ ok: true, disposition: "reused" });
+          return Response.json({
+            ok: true,
+            disposition: "reused",
+            ...replayCapture(captureEnabled),
+          });
         }
         if (claim.record.status === "provisioning") {
           return Response.json(
-            { status: "provisioning", disposition: "reused" },
+            {
+              status: "provisioning",
+              disposition: "reused",
+              ...replayCapture(captureEnabled),
+            },
             { status: 202 },
           );
         }
         return Response.json(
-          { error: { code: claim.record.error_code ?? "workspace_transfer_failed" } },
+          {
+            error: { code: claim.record.error_code ?? "workspace_transfer_failed" },
+            ...replayCapture(captureEnabled),
+          },
           { status: 502 },
         );
       }
@@ -176,7 +197,10 @@ export async function routeWorkspaceTransfer(
           now_ms: (dependencies.now ?? Date.now)(),
         });
         return Response.json(
-          { error: { code: "runtime_unavailable", message: "no Sandbox binding" } },
+          {
+            error: { code: "runtime_unavailable", message: "no Sandbox binding" },
+            ...unavailableCapture(captureEnabled),
+          },
           { status: 503 },
         );
       }
@@ -185,11 +209,15 @@ export async function routeWorkspaceTransfer(
         : getSandbox(env.Sandbox!, await deriveSandboxRuntimeId(sessionId));
       const result = await execWorkspaceTool(
         sandbox,
-        workspaceCmd("restore", workspace.repo, snapshot),
+        workspaceCmd("restore", workspace.repo, snapshot, captureEnabled),
         workspace.repo,
         password,
       );
-      if (!result.ok) {
+      const parsedCapture = captureEnabled
+        ? parseR2CaptureOutput(result.stdout, captureExpectation)
+        : null;
+      const capture = captureTelemetry(parsedCapture);
+      if (!result.ok || (captureEnabled && !isCompletedCapture(parsedCapture))) {
         await reservations.markFailed({
           invocation_id: invocationId!,
           owner,
@@ -200,8 +228,11 @@ export async function routeWorkspaceTransfer(
           {
             error: {
               code: "workspace_transfer_failed",
-              message: redact(result.detail),
+              message: captureEnabled
+                ? "workspace transfer helper failed"
+                : redact(result.detail),
             },
+            ...capture,
           },
           { status: 502 },
         );
@@ -212,11 +243,14 @@ export async function routeWorkspaceTransfer(
         now_ms: (dependencies.now ?? Date.now)(),
       }))) {
         return Response.json(
-          { error: { code: "workspace_provision_interrupted" } },
+          {
+            error: { code: "workspace_provision_interrupted" },
+            ...capture,
+          },
           { status: 502 },
         );
       }
-      return Response.json({ ok: true, disposition: "created" });
+      return Response.json({ ok: true, disposition: "created", ...capture });
     }
     const targetOwner = await reservations.getSessionOwner(sessionId);
     if (targetOwner === null) {
@@ -229,11 +263,15 @@ export async function routeWorkspaceTransfer(
       return finalizeStatusResponse(
         await finalizeStore(env, dependencies).get(sessionId, targetOwner),
         await workspaceFinalizeIdentity(sessionId, body),
+        captureEnabled,
       );
     }
     if (!env.Sandbox && !dependencies.sandboxFor) {
       return Response.json(
-        { error: { code: "runtime_unavailable", message: "no Sandbox binding" } },
+        {
+          error: { code: "runtime_unavailable", message: "no Sandbox binding" },
+          ...unavailableCapture(captureEnabled),
+        },
         { status: 503 },
       );
     }
@@ -251,6 +289,8 @@ export async function routeWorkspaceTransfer(
         snapshot,
         targetOwner,
         now: dependencies.now ?? Date.now,
+        captureEnabled,
+        captureExpectation,
       });
     }
     throw new Error("unreachable workspace transfer mode");
@@ -277,6 +317,8 @@ async function finalizeWorkspace(input: {
   readonly snapshot: string;
   readonly targetOwner: ManagedExecutionOwner;
   readonly now: () => number;
+  readonly captureEnabled: boolean;
+  readonly captureExpectation: R2CaptureExpectation;
 }): Promise<Response> {
   const identity = await workspaceFinalizeIdentity(input.sessionId, input.body);
   const claimed = await input.store.claim({
@@ -291,20 +333,37 @@ async function finalizeWorkspace(input: {
       { status: 409 },
     );
   }
-  if (claimed.kind === "reused") return finalizeReplayResponse(claimed.record);
+  if (claimed.kind === "reused") {
+    return finalizeReplayResponse(claimed.record, input.captureEnabled);
+  }
 
+  let capture: R2CaptureTelemetry | undefined = input.captureEnabled
+    ? unavailableR2Capture("helper_response_missing")
+    : undefined;
   try {
     // The durable running claim is the point of no return. A crash after this
     // line leaves observable status and exact retries never repeat side effects.
     await input.sandbox.killAllProcesses();
     const result = await execWorkspaceTool(
       input.sandbox,
-      workspaceCmd("backup", input.repo, input.snapshot),
+      workspaceCmd("backup", input.repo, input.snapshot, input.captureEnabled),
       input.repo,
       input.password,
     );
-    if (!result.ok) throw new Error(redact(result.detail));
-    const resultSnapshot = result.stdout.trim().split("\n").filter(Boolean).pop();
+    const parsedCapture = input.captureEnabled
+      ? parseR2CaptureOutput(result.stdout, input.captureExpectation)
+      : null;
+    capture = captureTelemetryValue(parsedCapture);
+    if (!result.ok || (input.captureEnabled && !isCompletedCapture(parsedCapture))) {
+      throw new Error(
+        input.captureEnabled
+          ? "workspace transfer helper failed"
+          : redact(result.detail),
+      );
+    }
+    const resultSnapshot = input.captureEnabled && isCompletedCapture(parsedCapture)
+      ? parsedCapture.snapshot
+      : result.stdout.trim().split("\n").filter(Boolean).pop();
     if (!resultSnapshot || !/^[0-9a-f]{64}$/.test(resultSnapshot)) {
       throw new Error("workspace backup produced no canonical snapshot handle");
     }
@@ -322,9 +381,12 @@ async function finalizeWorkspace(input: {
       finalizeId: identity.finalize_id,
       requestDigest: identity.request_digest,
       resultSnapshot,
+      ...(input.captureEnabled ? { r2Capture: capture } : {}),
     });
   } catch (cause) {
-    const message = redact(safeHuddlesRuntimeDiagnostic(cause));
+    const message = input.captureEnabled
+      ? "workspace transfer failed"
+      : redact(safeHuddlesRuntimeDiagnostic(cause));
     await input.store.fail({
       finalize_id: identity.finalize_id,
       target_owner: input.targetOwner,
@@ -333,7 +395,16 @@ async function finalizeWorkspace(input: {
       now_ms: input.now(),
     });
     return Response.json(
-      { error: { code: "workspace_transfer_failed", message } },
+      {
+        error: { code: "workspace_transfer_failed", message },
+        ...(input.captureEnabled
+          ? {
+              finalizeId: identity.finalize_id,
+              requestDigest: identity.request_digest,
+            }
+          : {}),
+        ...(input.captureEnabled ? { r2Capture: capture } : {}),
+      },
       { status: 502 },
     );
   }
@@ -342,6 +413,7 @@ async function finalizeWorkspace(input: {
 function finalizeStatusResponse(
   record: WorkspaceFinalizeRecord | null,
   identity: { readonly finalize_id: `sha256:${string}`; readonly request_digest: `sha256:${string}` },
+  captureEnabled: boolean,
 ): Response {
   if (record === null) {
     return Response.json({ error: { code: "workspace_finalize_not_found" } }, { status: 404 });
@@ -349,22 +421,32 @@ function finalizeStatusResponse(
   if (record.finalize_id !== identity.finalize_id || record.request_digest !== identity.request_digest) {
     return Response.json({ error: { code: "workspace_finalize_conflict" } }, { status: 409 });
   }
-  return finalizeReplayResponse(record);
+  return finalizeReplayResponse(record, captureEnabled);
 }
 
-function finalizeReplayResponse(record: WorkspaceFinalizeRecord): Response {
+function finalizeReplayResponse(
+  record: WorkspaceFinalizeRecord,
+  captureEnabled: boolean,
+): Response {
   const base = {
     status: record.status,
     disposition: "reused",
     finalizeId: record.finalize_id,
     requestDigest: record.request_digest,
+    ...replayCapture(captureEnabled),
   };
   if (record.status === "running") return Response.json(base, { status: 202 });
   if (record.status === "completed") {
     return Response.json({ ...base, resultSnapshot: record.result_snapshot });
   }
   return Response.json(
-    { ...base, error: { code: record.error_code, message: record.error_message } },
+    {
+      ...base,
+      error: {
+        code: record.error_code,
+        message: captureEnabled ? "workspace transfer failed" : record.error_message,
+      },
+    },
     { status: 502 },
   );
 }
@@ -460,11 +542,11 @@ function workspaceCmd(
   mode: "restore" | "backup",
   repo: WorkspaceRepo,
   snapshot: string,
+  captureR2Json = false,
 ): string {
-  const args = [
-    "/usr/local/bin/pillbox",
-    "workspace",
-    mode,
+  const args = ["/usr/local/bin/pillbox", "workspace", mode];
+  if (captureR2Json) args.push("--capture-r2-json");
+  args.push(
     "--endpoint",
     shellQuote(repo.endpoint),
     "--bucket",
@@ -473,7 +555,7 @@ function workspaceCmd(
     shellQuote(repo.region),
     "--prefix",
     shellQuote(repo.prefix),
-  ];
+  );
   args.push(
     mode === "restore" ? "--snapshot" : "--parent",
     shellQuote(snapshot),
@@ -495,4 +577,51 @@ function nonEmpty(value: unknown, name: string): string {
 
 function redact(detail: string): string {
   return detail.length > 2_000 ? `${detail.slice(0, 2_000)}…` : detail;
+}
+
+function captureExpectationFor(
+  mode: "restore" | "backup",
+  repo: WorkspaceRepo,
+): R2CaptureExpectation {
+  return {
+    operation: mode === "restore" ? "snapshot_restore" : "snapshot_finalize",
+    bucket: repo.bucket,
+    prefix: repo.prefix,
+  };
+}
+
+function isCompletedCapture(
+  value: ParsedR2CaptureOutput | null,
+): value is Extract<ParsedR2CaptureOutput, { readonly capture: unknown }> & {
+  readonly status: "completed";
+} {
+  return value !== null && "capture" in value && value.status === "completed";
+}
+
+function captureTelemetry(
+  value: ParsedR2CaptureOutput | null,
+): { readonly r2Capture?: R2CaptureTelemetry } {
+  if (value === null) return {};
+  return { r2Capture: "capture" in value ? value.capture : value };
+}
+
+function captureTelemetryValue(
+  value: ParsedR2CaptureOutput | null,
+): R2CaptureTelemetry | undefined {
+  if (value === null) return undefined;
+  return "capture" in value ? value.capture : value;
+}
+
+function unavailableCapture(
+  enabled: boolean,
+): { readonly r2Capture?: R2CaptureTelemetry } {
+  return enabled
+    ? { r2Capture: unavailableR2Capture("helper_response_missing") }
+    : {};
+}
+
+function replayCapture(
+  enabled: boolean,
+): { readonly r2Capture?: R2CaptureTelemetry } {
+  return enabled ? { r2Capture: unavailableR2Capture("replayed") } : {};
 }

@@ -7,9 +7,13 @@
 //! `snapshot_dispatch`, `dispatch`) — main.rs's match arms call
 //! these directly.
 
-use std::path::{Path, PathBuf};
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use serde::Serialize;
 
 use crate::cli::{
     RemoteRepoBackup, RemoteRepoCoords, RemoteRepoRestore, SnapshotAction, WorkspaceAction,
@@ -17,6 +21,7 @@ use crate::cli::{
 use crate::errors::PillboxError;
 use crate::paths;
 use crate::pillbox::Pillbox;
+use crate::workspace::operation_capture::{CaptureDocument, CaptureHandle, CaptureOperation};
 use crate::workspace::rustic::{RusticBackend, RusticVariant, S3Config};
 use crate::workspace::{PushOptions, Snapshot, SnapshotHandle, WorkspaceBackend};
 
@@ -164,10 +169,20 @@ pub(crate) fn snapshot_dispatch(resolved: &Pillbox, action: SnapshotAction) -> R
                 }
             }
             println!();
-            println!("Use `pillbox snapshot show <HANDLE>` for details, `pillbox pull --snapshot <HANDLE>` to restore.");
+            println!(
+                "Use `pillbox snapshot show <HANDLE>` for details, `pillbox pull --snapshot <HANDLE>` to restore."
+            );
         }
-        SnapshotAction::Show { handle, json } => {
-            let snap = backend.snapshot_show(&SnapshotHandle::new(handle))?;
+        SnapshotAction::Show {
+            handle,
+            json,
+            capture_r2,
+        } => {
+            let handle = SnapshotHandle::new(handle);
+            let snap = match capture_r2 {
+                Some(path) => snapshot_show_with_capture(&backend, &handle, &path)?,
+                None => backend.snapshot_show(&handle)?,
+            };
             if json {
                 println!("{}", snapshot_json(&snap));
             } else {
@@ -236,6 +251,13 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: WorkspaceAction) -> Result<()
 /// Restore `--snapshot` into `--target`, addressing the repo by explicit
 /// S3 coordinates + env-only secrets. Reuses `RusticBackend::pull`.
 pub(crate) fn remote_restore(args: RemoteRepoRestore) -> Result<()> {
+    if args.capture_r2_json {
+        return remote_restore_captured(args);
+    }
+    remote_restore_uncaptured(args)
+}
+
+fn remote_restore_uncaptured(args: RemoteRepoRestore) -> Result<()> {
     let target = PathBuf::from(&args.target);
     // Create the target up front: `pull` restores into an existing dir
     // (mirrors `pillbox pull` over cwd), and the managed container hands
@@ -264,6 +286,13 @@ pub(crate) fn remote_restore(args: RemoteRepoRestore) -> Result<()> {
 /// the new snapshot handle as the final stdout line (the DO captures it
 /// as the result handle).
 pub(crate) fn remote_backup(args: RemoteRepoBackup) -> Result<()> {
+    if args.capture_r2_json {
+        return remote_backup_captured(args);
+    }
+    remote_backup_uncaptured(args)
+}
+
+fn remote_backup_uncaptured(args: RemoteRepoBackup) -> Result<()> {
     let target = PathBuf::from(&args.target);
     if !target.is_dir() {
         return Err(PillboxError::usage(
@@ -292,6 +321,227 @@ pub(crate) fn remote_backup(args: RemoteRepoBackup) -> Result<()> {
     );
     println!("{}", snap.handle.as_str());
     Ok(())
+}
+
+#[derive(Serialize)]
+struct CaptureHelperEnvelope {
+    schema_version: u8,
+    status: &'static str,
+    snapshot: Option<String>,
+    capture: CaptureDocument,
+}
+
+fn print_capture_envelope(
+    status: &'static str,
+    snapshot: Option<String>,
+    capture: CaptureDocument,
+) -> Result<()> {
+    let envelope = CaptureHelperEnvelope {
+        schema_version: 1,
+        status,
+        snapshot,
+        capture,
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&envelope).context("serialize R2 capture helper output")?
+    );
+    Ok(())
+}
+
+fn remote_restore_captured(args: RemoteRepoRestore) -> Result<()> {
+    validate_capture_coords("workspace restore", &args.coords)?;
+    let capture = CaptureHandle::new(
+        CaptureOperation::SnapshotRestore,
+        &args.coords.bucket,
+        &args.coords.prefix,
+    );
+    let result = (|| -> Result<()> {
+        let target = PathBuf::from(&args.target);
+        std::fs::create_dir_all(&target).map_err(|e| {
+            PillboxError::runtime(
+                "workspace restore",
+                format!("create target dir {}: {e}", target.display()),
+            )
+        })?;
+        let pw = RepoPassword::from_env("workspace restore")?;
+        let backend = remote_backend("workspace restore", &args.coords, pw.path())?;
+        validate_capture_config(
+            "workspace restore",
+            backend.s3_config().expect("remote backend is always S3"),
+        )
+        .inspect_err(|_| capture.mark_capture_unavailable())?;
+        let client = capture
+            .http_client()
+            .inspect_err(|_| capture.mark_capture_unavailable())?;
+        let handle = SnapshotHandle::new(args.snapshot.clone());
+        backend.pull_with_http_client(&target, Some(&handle), client)
+    })();
+    let status = if result.is_ok() {
+        "completed"
+    } else {
+        "failed"
+    };
+    let capture = capture.finish(result.is_ok());
+    print_capture_envelope(status, None, capture)?;
+    result
+}
+
+fn remote_backup_captured(args: RemoteRepoBackup) -> Result<()> {
+    validate_capture_coords("workspace backup", &args.coords)?;
+    let capture = CaptureHandle::new(
+        CaptureOperation::SnapshotFinalize,
+        &args.coords.bucket,
+        &args.coords.prefix,
+    );
+    let result = (|| -> Result<Snapshot> {
+        let target = PathBuf::from(&args.target);
+        if !target.is_dir() {
+            return Err(PillboxError::usage(
+                "workspace backup",
+                format!("target {} is not a directory", target.display()),
+            )
+            .into());
+        }
+        let pw = RepoPassword::from_env("workspace backup")?;
+        let backend = remote_backend("workspace backup", &args.coords, pw.path())?;
+        validate_capture_config(
+            "workspace backup",
+            backend.s3_config().expect("remote backend is always S3"),
+        )
+        .inspect_err(|_| capture.mark_capture_unavailable())?;
+        let client = capture
+            .http_client()
+            .inspect_err(|_| capture.mark_capture_unavailable())?;
+        backend.push_with_http_client(
+            &target,
+            PushOptions {
+                parents: vec![args.parent.clone()],
+                ..PushOptions::default()
+            },
+            client,
+        )
+    })();
+    let status = if result.is_ok() {
+        "completed"
+    } else {
+        "failed"
+    };
+    let snapshot = result
+        .as_ref()
+        .ok()
+        .map(|snap| snap.handle.as_str().to_string());
+    let capture = capture.finish(result.is_ok());
+    print_capture_envelope(status, snapshot, capture)?;
+    result.map(|_| ())
+}
+
+fn validate_capture_coords(action: &'static str, coords: &RemoteRepoCoords) -> Result<()> {
+    if coords.region != "auto" {
+        return Err(PillboxError::usage(action, "--capture-r2-json requires --region auto").into());
+    }
+    if coords.endpoint.is_empty()
+        || coords.bucket.is_empty()
+        || coords.prefix.trim_matches('/').is_empty()
+    {
+        return Err(PillboxError::usage(
+            action,
+            "--capture-r2-json requires nonempty endpoint, bucket, and prefix",
+        )
+        .into());
+    }
+    if coords.endpoint.len() > 2048
+        || coords.bucket.len() > 1024
+        || normalized_capture_prefix(&coords.prefix).len() > 1024
+    {
+        return Err(PillboxError::usage(
+            action,
+            "--capture-r2-json coordinates exceed the capture bounds",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_capture_config(action: &'static str, cfg: &S3Config) -> Result<()> {
+    if cfg.region != "auto" {
+        return Err(PillboxError::usage(
+            action,
+            "--capture-r2 requires an S3/R2 workspace with region auto",
+        )
+        .into());
+    }
+    if cfg.endpoint.is_empty()
+        || cfg.bucket.is_empty()
+        || cfg.prefix.trim_matches('/').is_empty()
+        || cfg.access_key.is_empty()
+        || cfg.secret_key.is_empty()
+    {
+        return Err(PillboxError::usage(
+            action,
+            "--capture-r2 requires nonempty endpoint, bucket, prefix, and explicit credentials",
+        )
+        .into());
+    }
+    if cfg.endpoint.len() > 2048
+        || cfg.bucket.len() > 1024
+        || normalized_capture_prefix(&cfg.prefix).len() > 1024
+        || cfg.access_key.len() > 1024
+        || cfg.secret_key.len() > 1024
+        || cfg
+            .session_token
+            .as_deref()
+            .is_some_and(|token| token.is_empty() || token.len() > 1024)
+    {
+        return Err(PillboxError::usage(
+            action,
+            "--capture-r2 configuration exceeds the capture bounds",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn normalized_capture_prefix(prefix: &str) -> String {
+    let trimmed = prefix.trim_matches('/');
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!("{trimmed}/")
+    }
+}
+
+fn snapshot_show_with_capture(
+    backend: &RusticBackend,
+    handle: &SnapshotHandle,
+    path: &Path,
+) -> Result<Snapshot> {
+    let Some(cfg) = backend.s3_config() else {
+        return Err(PillboxError::usage(
+            "snapshot show",
+            "--capture-r2 is only available for an S3/R2 workspace backend",
+        )
+        .into());
+    };
+    validate_capture_config("snapshot show", cfg)?;
+    let mut sidecar = paths::reserve_private_file(path)?;
+    let capture = CaptureHandle::new(CaptureOperation::Verification, &cfg.bucket, &cfg.prefix);
+    let result = match capture.http_client() {
+        Ok(client) => backend.snapshot_show_with_http_client(handle, client),
+        Err(error) => {
+            capture.mark_capture_unavailable();
+            Err(error)
+        }
+    };
+    let body = serde_json::to_vec(&capture.finish(result.is_ok()))
+        .context("serialize snapshot R2 capture")?;
+    sidecar
+        .set_len(0)
+        .with_context(|| format!("truncate capture sidecar {}", path.display()))?;
+    sidecar
+        .write_all(&body)
+        .with_context(|| format!("write capture sidecar {}", path.display()))?;
+    result
 }
 
 /// Build an S3-backed `RusticBackend` from non-secret coordinates +

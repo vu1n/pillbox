@@ -113,6 +113,13 @@ records and an independently measured total. Namespace retention remains a
 separate before/after observation, never a per-run allocation inferred from a
 shared namespace delta. This adds no runtime write or deployment requirement.
 
+The operator-only [vendor lifecycle collector](burn-in/operation-capture.md)
+retains bounded provider observations without converting unavailable data to
+zero. Opt-in [snapshot HTTP capture](burn-in/r2-http-capture.md) records
+OpenDAL attempts below retries and separates submitted from consumed bytes.
+Neither collector proves provider billing completeness or execute/cleanup
+lifecycle attribution; both preserve those remaining release gates.
+
 ## Current limits
 
 - Foreground execution only; managed detach/reconnect is unsupported.

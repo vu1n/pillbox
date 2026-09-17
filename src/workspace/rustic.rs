@@ -19,17 +19,20 @@
 //! Cohesion wins.
 
 use std::{
+    collections::BTreeMap,
     fmt, fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Context, Result};
+use opendal::raw::HttpClient;
 use rand::{distr::Alphanumeric, Rng};
-use rustic_backend::BackendOptions;
+use rustic_backend::{BackendOptions, OpenDALBackend};
 use rustic_core::{
     repofile::SnapshotFile, BackupOptions, ConfigOptions, Credentials, KeyOptions,
-    LocalDestination, LsOptions, PathList, Repository, RepositoryOptions, RestoreOptions,
-    SnapshotOptions,
+    LocalDestination, LsOptions, PathList, Repository, RepositoryBackends, RepositoryOptions,
+    RestoreOptions, SnapshotOptions,
 };
 use serde::{Deserialize, Serialize};
 
@@ -224,43 +227,64 @@ impl RusticBackend {
     }
 
     /// Build the [`rustic_backend::BackendOptions`] for this variant.
-    fn backends(&self) -> Result<rustic_core::RepositoryBackends> {
+    fn backends(&self) -> Result<RepositoryBackends> {
+        self.backends_with_http_client(None)
+    }
+
+    /// Build the repository backends, optionally replacing only the S3
+    /// OpenDAL transport. The injected constructor is capture-only; local
+    /// repositories never enter this path.
+    fn backends_with_http_client(
+        &self,
+        http_client: Option<HttpClient>,
+    ) -> Result<RepositoryBackends> {
         match &self.variant {
             RusticVariant::Local { repo_path } => {
+                if http_client.is_some() {
+                    return Err(PillboxError::usage(
+                        "R2 capture",
+                        "capture is only available for an S3/R2 workspace backend",
+                    )
+                    .into());
+                }
                 let opts = BackendOptions::default().repository(repo_path.display().to_string());
                 opts.to_backends()
                     .map_err(|e| rustic_err("workspace backend", e).into())
             }
             RusticVariant::S3(cfg) => {
-                // opendal's S3 driver wants flat key/value options; the
-                // repository URL is `opendal:s3` (type=opendal, path=s3).
-                let mut options = std::collections::BTreeMap::new();
-                options.insert("endpoint".into(), cfg.endpoint.clone());
-                options.insert("region".into(), cfg.region.clone());
-                options.insert("bucket".into(), cfg.bucket.clone());
-                if !cfg.prefix.is_empty() {
-                    options.insert("root".into(), normalize_prefix(&cfg.prefix));
+                let mut options = s3_backend_options(cfg);
+                if http_client.is_some() {
+                    // Captured operations must never consult ambient AWS
+                    // files, metadata service, or role discovery. Credentials
+                    // remain the explicit values supplied by the helper.
+                    options.insert("disable_config_load".into(), "true".into());
+                    options.insert("disable_ec2_metadata".into(), "true".into());
                 }
-                options.insert("access_key_id".into(), cfg.access_key.clone());
-                options.insert("secret_access_key".into(), cfg.secret_key.clone());
-                // A scoped temp credential (managed plane) carries an STS session
-                // token; opendal's S3 driver must forward it as X-Amz-Security-Token
-                // or every signed request 403s. Absent for a normal long-lived key.
-                if let Some(token) = &cfg.session_token {
-                    options.insert("session_token".into(), token.clone());
+                if let Some(http_client) = http_client {
+                    let backend = OpenDALBackend::new_with_http_client("s3", options, http_client)
+                        .map_err(|e| rustic_err("workspace backend", e))?;
+                    Ok(RepositoryBackends::new(Arc::new(backend), None))
+                } else {
+                    let opts = BackendOptions::default()
+                        .repository("opendal:s3".to_string())
+                        .options(options);
+                    opts.to_backends()
+                        .map_err(|e| rustic_err("workspace backend", e).into())
                 }
-                let opts = BackendOptions::default()
-                    .repository("opendal:s3".to_string())
-                    .options(options);
-                opts.to_backends()
-                    .map_err(|e| rustic_err("workspace backend", e).into())
             }
         }
     }
 
     fn open(&self) -> Result<rustic_core::Repository<rustic_core::OpenStatus>> {
+        self.open_with_http_client(None)
+    }
+
+    fn open_with_http_client(
+        &self,
+        http_client: Option<HttpClient>,
+    ) -> Result<rustic_core::Repository<rustic_core::OpenStatus>> {
         let password = self.read_password()?;
-        let backends = self.backends()?;
+        let backends = self.backends_with_http_client(http_client)?;
         let repo_opts = self.repo_opts();
         let repo =
             Repository::new(&repo_opts, &backends).map_err(|e| rustic_err("workspace open", e))?;
@@ -276,6 +300,15 @@ impl RusticBackend {
     /// open.
     fn resolve_snapshot(&self, handle: &SnapshotHandle) -> Result<SnapshotFile> {
         let repo = self.open()?;
+        resolve_in(&repo, handle)
+    }
+
+    fn resolve_snapshot_with_http_client(
+        &self,
+        handle: &SnapshotHandle,
+        http_client: HttpClient,
+    ) -> Result<SnapshotFile> {
+        let repo = self.open_with_http_client(Some(http_client))?;
         resolve_in(&repo, handle)
     }
 
@@ -343,6 +376,79 @@ fn resolve_in(
 
 impl WorkspaceBackend for RusticBackend {
     fn push(&self, cwd: &Path, opts: PushOptions) -> Result<Snapshot> {
+        self.push_inner(cwd, opts, None)
+    }
+
+    fn pull(&self, cwd: &Path, snapshot: Option<&SnapshotHandle>) -> Result<()> {
+        self.pull_inner(cwd, snapshot, None)
+    }
+
+    fn snapshots(&self) -> Result<Vec<Snapshot>> {
+        let repo = self.open()?;
+        let mut snaps = repo
+            .get_all_snapshots()
+            .map_err(|e| rustic_err("snapshot list", e))?;
+        snaps.sort_by(|a, b| a.time.cmp(&b.time));
+        Ok(snaps
+            .into_iter()
+            .map(|s| snapshot_to_record(&s, None, false))
+            .collect())
+    }
+
+    fn snapshot_show(&self, handle: &SnapshotHandle) -> Result<Snapshot> {
+        let snap = self.resolve_snapshot(handle)?;
+        Ok(snapshot_to_record(&snap, None, false))
+    }
+
+    fn snapshot_rm(&self, handle: &SnapshotHandle) -> Result<()> {
+        // Open once: resolve + delete on the same opened repo so we pay
+        // one scrypt pass, not two.
+        let repo = self.open()?;
+        let snap = resolve_in(&repo, handle)?;
+        repo.delete_snapshots(&[snap.id])
+            .map_err(|e| rustic_err("snapshot rm", e))?;
+        Ok(())
+    }
+
+    fn rekey(&self) -> Result<()> {
+        self.rekey_inner()
+    }
+}
+
+impl RusticBackend {
+    pub(crate) fn push_with_http_client(
+        &self,
+        cwd: &Path,
+        opts: PushOptions,
+        http_client: HttpClient,
+    ) -> Result<Snapshot> {
+        self.push_inner(cwd, opts, Some(http_client))
+    }
+
+    pub(crate) fn pull_with_http_client(
+        &self,
+        cwd: &Path,
+        snapshot: Option<&SnapshotHandle>,
+        http_client: HttpClient,
+    ) -> Result<()> {
+        self.pull_inner(cwd, snapshot, Some(http_client))
+    }
+
+    pub(crate) fn snapshot_show_with_http_client(
+        &self,
+        handle: &SnapshotHandle,
+        http_client: HttpClient,
+    ) -> Result<Snapshot> {
+        let snap = self.resolve_snapshot_with_http_client(handle, http_client)?;
+        Ok(snapshot_to_record(&snap, None, false))
+    }
+
+    fn push_inner(
+        &self,
+        cwd: &Path,
+        opts: PushOptions,
+        http_client: Option<HttpClient>,
+    ) -> Result<Snapshot> {
         // Reject sentinel-laden messages *before* paying the cost of
         // opening the repo (~5s scrypt). The check itself prevents
         // forged trailer metadata; the early position prevents the
@@ -351,7 +457,7 @@ impl WorkspaceBackend for RusticBackend {
         if let Some(m) = opts.message.as_deref() {
             validate_user_message("workspace push", m)?;
         }
-        let opened = self.open()?;
+        let opened = self.open_with_http_client(http_client)?;
         // Resolve any `--parent` handles (prefix-ok) against this repo, reusing
         // the single open so we don't pay scrypt per parent. Canonicalizes the
         // recorded lineage to full ids and fails the push loudly on an unknown
@@ -425,11 +531,16 @@ impl WorkspaceBackend for RusticBackend {
         Ok(snapshot_to_record(&snap, git_anchor, git_dirty))
     }
 
-    fn pull(&self, cwd: &Path, snapshot: Option<&SnapshotHandle>) -> Result<()> {
+    fn pull_inner(
+        &self,
+        cwd: &Path,
+        snapshot: Option<&SnapshotHandle>,
+        http_client: Option<HttpClient>,
+    ) -> Result<()> {
         // Open once, resolve the handle on the open repo, THEN convert
         // to indexed for the restore. Going via `resolve_snapshot`
         // would open a second time and pay scrypt twice.
-        let open = self.open()?;
+        let open = self.open_with_http_client(http_client)?;
         let snap = match snapshot {
             Some(h) => resolve_in(&open, h)?,
             None => {
@@ -470,34 +581,7 @@ impl WorkspaceBackend for RusticBackend {
         Ok(())
     }
 
-    fn snapshots(&self) -> Result<Vec<Snapshot>> {
-        let repo = self.open()?;
-        let mut snaps = repo
-            .get_all_snapshots()
-            .map_err(|e| rustic_err("snapshot list", e))?;
-        snaps.sort_by(|a, b| a.time.cmp(&b.time));
-        Ok(snaps
-            .into_iter()
-            .map(|s| snapshot_to_record(&s, None, false))
-            .collect())
-    }
-
-    fn snapshot_show(&self, handle: &SnapshotHandle) -> Result<Snapshot> {
-        let snap = self.resolve_snapshot(handle)?;
-        Ok(snapshot_to_record(&snap, None, false))
-    }
-
-    fn snapshot_rm(&self, handle: &SnapshotHandle) -> Result<()> {
-        // Open once: resolve + delete on the same opened repo so we pay
-        // one scrypt pass, not two.
-        let repo = self.open()?;
-        let snap = resolve_in(&repo, handle)?;
-        repo.delete_snapshots(&[snap.id])
-            .map_err(|e| rustic_err("snapshot rm", e))?;
-        Ok(())
-    }
-
-    fn rekey(&self) -> Result<()> {
+    fn rekey_inner(&self) -> Result<()> {
         // Add a new key with a fresh password, persist it, then remove
         // the old one — operations using the new password file will
         // open with the new key without any other change.
@@ -582,6 +666,22 @@ fn normalize_prefix(p: &str) -> String {
     } else {
         format!("/{trimmed}/")
     }
+}
+
+fn s3_backend_options(cfg: &S3Config) -> BTreeMap<String, String> {
+    let mut options = BTreeMap::new();
+    options.insert("endpoint".into(), cfg.endpoint.clone());
+    options.insert("region".into(), cfg.region.clone());
+    options.insert("bucket".into(), cfg.bucket.clone());
+    if !cfg.prefix.is_empty() {
+        options.insert("root".into(), normalize_prefix(&cfg.prefix));
+    }
+    options.insert("access_key_id".into(), cfg.access_key.clone());
+    options.insert("secret_access_key".into(), cfg.secret_key.clone());
+    if let Some(token) = &cfg.session_token {
+        options.insert("session_token".into(), token.clone());
+    }
+    options
 }
 
 /// Project a rustic `SnapshotFile` into the pillbox-public [`Snapshot`].

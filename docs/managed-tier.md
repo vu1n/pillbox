@@ -113,6 +113,11 @@ records and an independently measured total. Namespace retention remains a
 separate before/after observation, never a per-run allocation inferred from a
 shared namespace delta. This adds no runtime write or deployment requirement.
 
+The operator-only [vendor lifecycle collector](burn-in/operation-capture.md)
+retains bounded provider observations without converting unavailable data to
+zero. It does not yet supply snapshot HTTP accounting or execute/cleanup
+partitions, and cannot by itself close the release gate.
+
 ## Current limits
 
 - Foreground execution only; managed detach/reconnect is unsupported.

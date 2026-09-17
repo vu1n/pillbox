@@ -302,7 +302,20 @@ provider capture records zero or one write plus explicit variance. A variance
 of `-1` records a best-effort miss without invalidating the terminal run;
 positive variance fails the max-one gate. Read-only
 retry/status/two-live-allowance/finalize
-traffic belongs in `read_only`, not in a second envelope. Reconcile with:
+traffic belongs in `read_only`, not in a second envelope. This historical field
+includes finalize's own bounded mutations; it does not make finalize a read-only
+operation. Report R2 totals cover only immutable execution artifacts and their
+re-reads, and report Worker totals cover only the runtime Worker.
+
+Full reconciliation requires receipt **v2** with explicit `accounting` groups:
+D1 execution/retry-status/finalize/inspection; R2 artifact/restore/finalize/
+verification/probes; runtime/issuer/currentness/operator Workers; vendor DO
+execute/cleanup-idle; and namespace before/after retention. Every group has
+source-backed partitions and an independent total. Supply exact capture record
+identifiers and the disjoint snapshot key prefix described in
+[the receipt contract](cost-receipt.md); broad bucket timing/size matches are
+not sufficient key-level attribution. Missing zero-usage evidence blocks the
+gate. Version 1 receipts are rejected, not converted. Reconcile with:
 
 ```sh
 npm run burnin:reconcile -- /private/path/burnin-report.json --receipt /private/path/cost-receipt.json

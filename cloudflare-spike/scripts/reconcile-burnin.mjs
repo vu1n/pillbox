@@ -299,6 +299,7 @@ for (const [index, rawRun] of runs.entries()) {
     cost_ref: runId,
     cost,
     observed,
+    report: root,
   }));
   check(integer(infra.r2_reads, `${runId}.cost.infrastructure.r2_reads`) === integer(r2.reads, `${runId}.observed.r2.reads`), `${runId} R2 read delta is unexplained`);
   check(integer(infra.r2_writes, `${runId}.cost.infrastructure.r2_writes`) === integer(r2.writes, `${runId}.observed.r2.writes`), `${runId} R2 write delta is unexplained`);

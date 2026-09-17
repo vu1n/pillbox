@@ -216,9 +216,20 @@ printf '{"version":1,"snapshot":{"handle":"%s","parents":["%s"]}}\\n' "$3" "$BUR
   completed.capture.totals.worker.requests += 1;
   completed.capture.read_only.d1.rows_read += 1;
   completed.capture.totals.d1.rows_read += 1;
+  const receipt = JSON.parse(await readFile(new URL("./testdata/cost-receipt.fixture.json", import.meta.url), "utf8"));
+  // This fake finalizer adds one status poll beyond the fixed fixture. Attribute
+  // it in both independent scope totals; it is not a new execution or artifact.
+  receipt.accounting.d1.finalize.units.rows_read += 1;
+  receipt.accounting.d1.finalize.source.record_ids.push("synthetic-finalize-status");
+  receipt.accounting.d1.total.units.rows_read += 1;
+  receipt.accounting.workers.runtime.units.requests += 1;
+  receipt.accounting.workers.runtime.source.record_ids.push("synthetic-finalize-status");
+  receipt.accounting.workers.total.units.requests += 1;
+  const receiptPath = join(temp, "receipt.json");
+  await writeFile(receiptPath, JSON.stringify(receipt));
   await writeFile(reportPath, JSON.stringify(completed));
   const reconciliation = await run(process.execPath, [reconciler.pathname, reportPath,
-    "--receipt", new URL("./testdata/cost-receipt.fixture.json", import.meta.url).pathname]);
+    "--receipt", receiptPath]);
   assert.equal(reconciliation.code, 0, reconciliation.stderr);
   assert.match(reconciliation.stdout, /managed preview burn-in reconciliation passed/);
 });

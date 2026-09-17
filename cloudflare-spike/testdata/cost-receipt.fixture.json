@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "execution_identity": {
     "invocation_id": "burnin-invocation-f7c83e0c4309e1bf6c385d69ad514d4b",
     "idempotency_key": "burnin-invocation-f7c83e0c4309e1bf6c385d69ad514d4b",
@@ -16,9 +16,18 @@
   },
   "cost_ref": "sha256:dab73a9a9ddafcb2ddd927da40fa430fd5037342a3079f7b63471fc3382fef7f",
   "d1": {
-    "pre_seal": { "rows_read": 0, "rows_written": 1 },
-    "terminal_commit": { "rows_read": 0, "rows_written": 1 },
-    "execution_total": { "rows_read": 0, "rows_written": 2 }
+    "pre_seal": {
+      "rows_read": 0,
+      "rows_written": 1
+    },
+    "terminal_commit": {
+      "rows_read": 0,
+      "rows_written": 1
+    },
+    "execution_total": {
+      "rows_read": 0,
+      "rows_written": 2
+    }
   },
   "container": {
     "instance_id": "synthetic-instance",
@@ -57,6 +66,392 @@
       "capture_sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
       "from": "2026-09-13T00:09:00.000Z",
       "to": "2026-09-13T00:20:00.000Z"
+    }
+  },
+  "accounting": {
+    "snapshot_prefix": "snapshots/",
+    "d1": {
+      "execution": {
+        "units": {
+          "rows_read": 0,
+          "rows_written": 2
+        },
+        "source": {
+          "dataset": "synthetic-d1",
+          "resource_id": "synthetic-database",
+          "capture_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "from": "2026-09-13T00:10:00.000Z",
+          "to": "2026-09-13T00:10:03.000Z",
+          "record_ids": [
+            "d1:execution"
+          ]
+        }
+      },
+      "retry_status": {
+        "units": {
+          "rows_read": 3,
+          "rows_written": 0
+        },
+        "source": {
+          "dataset": "synthetic-d1",
+          "resource_id": "synthetic-database",
+          "capture_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "from": "2026-09-13T00:09:00.000Z",
+          "to": "2026-09-13T00:20:00.000Z",
+          "record_ids": [
+            "d1:retry_status"
+          ]
+        }
+      },
+      "finalize": {
+        "units": {
+          "rows_read": 2,
+          "rows_written": 0
+        },
+        "source": {
+          "dataset": "synthetic-d1",
+          "resource_id": "synthetic-database",
+          "capture_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "from": "2026-09-13T00:09:00.000Z",
+          "to": "2026-09-13T00:20:00.000Z",
+          "record_ids": [
+            "d1:finalize"
+          ]
+        }
+      },
+      "operator_inspection": {
+        "units": {
+          "rows_read": 0,
+          "rows_written": 0
+        },
+        "source": {
+          "dataset": "synthetic-d1",
+          "resource_id": "synthetic-database",
+          "capture_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "from": "2026-09-13T00:09:00.000Z",
+          "to": "2026-09-13T00:20:00.000Z",
+          "record_ids": [
+            "d1:operator_inspection"
+          ]
+        }
+      },
+      "total": {
+        "units": {
+          "rows_read": 5,
+          "rows_written": 2
+        },
+        "source": {
+          "dataset": "synthetic-d1",
+          "resource_id": "synthetic-database",
+          "capture_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "from": "2026-09-13T00:09:00.000Z",
+          "to": "2026-09-13T00:20:00.000Z",
+          "record_ids": [
+            "d1:total"
+          ]
+        }
+      }
+    },
+    "r2": {
+      "artifact": {
+        "units": {
+          "reads": 3,
+          "writes": 1,
+          "lists": 0,
+          "heads": 0,
+          "deletes": 0,
+          "bytes_read": 2016,
+          "bytes_written": 672
+        },
+        "source": {
+          "dataset": "synthetic-r2",
+          "resource_id": "synthetic-bucket",
+          "capture_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "from": "2026-09-13T00:09:00.000Z",
+          "to": "2026-09-13T00:20:00.000Z",
+          "record_ids": [
+            "r2:artifact"
+          ],
+          "key_prefix": "executions/0edeb223d4067ed694ec881e03b81ac403a8e1bced6eb537d6837c960316e364/85eca7b729f822e4c7fabe30483ac979bc01713fb425b800cb9291138f2eb558.json"
+        }
+      },
+      "snapshot_restore": {
+        "units": {
+          "reads": 2,
+          "writes": 0,
+          "lists": 1,
+          "heads": 0,
+          "deletes": 0,
+          "bytes_read": 100,
+          "bytes_written": 0
+        },
+        "source": {
+          "dataset": "synthetic-r2",
+          "resource_id": "synthetic-bucket",
+          "capture_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "from": "2026-09-13T00:09:00.000Z",
+          "to": "2026-09-13T00:20:00.000Z",
+          "record_ids": [
+            "r2:snapshot_restore"
+          ],
+          "key_prefix": "snapshots/"
+        }
+      },
+      "snapshot_finalize": {
+        "units": {
+          "reads": 2,
+          "writes": 3,
+          "lists": 1,
+          "heads": 0,
+          "deletes": 0,
+          "bytes_read": 100,
+          "bytes_written": 1000
+        },
+        "source": {
+          "dataset": "synthetic-r2",
+          "resource_id": "synthetic-bucket",
+          "capture_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "from": "2026-09-13T00:09:00.000Z",
+          "to": "2026-09-13T00:20:00.000Z",
+          "record_ids": [
+            "r2:snapshot_finalize"
+          ],
+          "key_prefix": "snapshots/"
+        }
+      },
+      "verification": {
+        "units": {
+          "reads": 1,
+          "writes": 0,
+          "lists": 1,
+          "heads": 0,
+          "deletes": 0,
+          "bytes_read": 50,
+          "bytes_written": 0
+        },
+        "source": {
+          "dataset": "synthetic-r2",
+          "resource_id": "synthetic-bucket",
+          "capture_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "from": "2026-09-13T00:09:00.000Z",
+          "to": "2026-09-13T00:20:00.000Z",
+          "record_ids": [
+            "r2:verification"
+          ],
+          "key_prefix": "snapshots/"
+        }
+      },
+      "bucket_probes": {
+        "units": {
+          "reads": 0,
+          "writes": 0,
+          "lists": 0,
+          "heads": 2,
+          "deletes": 0,
+          "bytes_read": 0,
+          "bytes_written": 0
+        },
+        "source": {
+          "dataset": "synthetic-r2",
+          "resource_id": "synthetic-bucket",
+          "capture_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "from": "2026-09-13T00:09:00.000Z",
+          "to": "2026-09-13T00:20:00.000Z",
+          "record_ids": [
+            "r2:bucket_probes"
+          ],
+          "key_prefix": ""
+        }
+      },
+      "total": {
+        "units": {
+          "reads": 8,
+          "writes": 4,
+          "lists": 3,
+          "heads": 2,
+          "deletes": 0,
+          "bytes_read": 2266,
+          "bytes_written": 1672
+        },
+        "source": {
+          "dataset": "synthetic-r2",
+          "resource_id": "synthetic-bucket",
+          "capture_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "from": "2026-09-13T00:09:00.000Z",
+          "to": "2026-09-13T00:20:00.000Z",
+          "record_ids": [
+            "r2:total"
+          ],
+          "key_prefix": ""
+        }
+      }
+    },
+    "workers": {
+      "runtime": {
+        "units": {
+          "requests": 7,
+          "cpu_time_us": 50
+        },
+        "source": {
+          "dataset": "synthetic-workers",
+          "resource_id": "pillbox-managed-burnin",
+          "capture_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "from": "2026-09-13T00:09:00.000Z",
+          "to": "2026-09-13T00:20:00.000Z",
+          "record_ids": [
+            "workers:runtime"
+          ]
+        }
+      },
+      "issuer": {
+        "units": {
+          "requests": 7,
+          "cpu_time_us": 100
+        },
+        "source": {
+          "dataset": "synthetic-workers",
+          "resource_id": "synthetic-issuer",
+          "capture_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "from": "2026-09-13T00:09:00.000Z",
+          "to": "2026-09-13T00:20:00.000Z",
+          "record_ids": [
+            "workers:issuer"
+          ]
+        }
+      },
+      "currentness": {
+        "units": {
+          "requests": 7,
+          "cpu_time_us": 100
+        },
+        "source": {
+          "dataset": "synthetic-workers",
+          "resource_id": "synthetic-currentness",
+          "capture_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "from": "2026-09-13T00:09:00.000Z",
+          "to": "2026-09-13T00:20:00.000Z",
+          "record_ids": [
+            "workers:currentness"
+          ]
+        }
+      },
+      "operator": {
+        "units": {
+          "requests": 1,
+          "cpu_time_us": 20
+        },
+        "source": {
+          "dataset": "synthetic-workers",
+          "resource_id": "synthetic-operator",
+          "capture_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "from": "2026-09-13T00:09:00.000Z",
+          "to": "2026-09-13T00:20:00.000Z",
+          "record_ids": [
+            "workers:operator"
+          ]
+        }
+      },
+      "total": {
+        "units": {
+          "requests": 22,
+          "cpu_time_us": 270
+        },
+        "source": {
+          "dataset": "synthetic-workers",
+          "resource_id": "synthetic-account",
+          "capture_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "from": "2026-09-13T00:09:00.000Z",
+          "to": "2026-09-13T00:20:00.000Z",
+          "record_ids": [
+            "workers:total"
+          ]
+        }
+      }
+    },
+    "vendor_do": {
+      "execute": {
+        "units": {
+          "sql_rows_read": 0,
+          "sql_rows_written": 0,
+          "duration_gb_seconds": 2
+        },
+        "source": {
+          "dataset": "synthetic-vendor-do",
+          "resource_id": "synthetic-instance",
+          "capture_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "from": "2026-09-13T00:09:00.000Z",
+          "to": "2026-09-13T00:20:00.000Z",
+          "record_ids": [
+            "vendor-do:execute"
+          ]
+        }
+      },
+      "cleanup_idle": {
+        "units": {
+          "sql_rows_read": 0,
+          "sql_rows_written": 0,
+          "duration_gb_seconds": 3
+        },
+        "source": {
+          "dataset": "synthetic-vendor-do",
+          "resource_id": "synthetic-instance",
+          "capture_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "from": "2026-09-13T00:09:00.000Z",
+          "to": "2026-09-13T00:20:00.000Z",
+          "record_ids": [
+            "vendor-do:cleanup_idle"
+          ]
+        }
+      },
+      "total": {
+        "units": {
+          "sql_rows_read": 0,
+          "sql_rows_written": 0,
+          "duration_gb_seconds": 5
+        },
+        "source": {
+          "dataset": "synthetic-vendor-do",
+          "resource_id": "synthetic-instance",
+          "capture_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "from": "2026-09-13T00:09:00.000Z",
+          "to": "2026-09-13T00:20:00.000Z",
+          "record_ids": [
+            "vendor-do:total"
+          ]
+        }
+      }
+    },
+    "vendor_retention": {
+      "before": {
+        "units": {
+          "stored_bytes": 0
+        },
+        "source": {
+          "dataset": "synthetic-retention",
+          "resource_id": "synthetic-namespace",
+          "capture_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "from": "2026-09-13T00:08:00.000Z",
+          "to": "2026-09-13T00:09:00.000Z",
+          "record_ids": [
+            "retention:before"
+          ]
+        }
+      },
+      "after": {
+        "units": {
+          "stored_bytes": 0
+        },
+        "source": {
+          "dataset": "synthetic-retention",
+          "resource_id": "synthetic-namespace",
+          "capture_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "from": "2026-09-13T00:20:00.000Z",
+          "to": "2026-09-13T00:21:00.000Z",
+          "record_ids": [
+            "retention:after"
+          ]
+        }
+      }
     }
   }
 }

@@ -6,7 +6,7 @@ import { validateCostReceipt } from "./scripts/cost-receipt.mjs";
 const fixture = JSON.parse(await readFile(new URL("./testdata/cost-receipt.fixture.json", import.meta.url), "utf8"));
 const report = JSON.parse(await readFile(new URL("./testdata/burnin-reconciliation.fixture.json", import.meta.url), "utf8"));
 const run = report.capture.run_cost_envelopes[0];
-const expected = { ...run, cost_ref: run.id };
+const expected = { ...run, cost_ref: run.id, report };
 
 test("receipt validates independent lifecycle usage without changing evidence", () => {
   const before = JSON.stringify({ fixture, expected });
@@ -24,6 +24,11 @@ test("real commit-order discrepancy reconciles measured reads, not a fixed corre
     receipt.d1.terminal_commit = { rows_read: reads, rows_written: 1 };
     receipt.d1.execution_total = { rows_read: 5 + reads, rows_written: 10 };
     context.observed.d1 = { ...receipt.d1.execution_total };
+    receipt.accounting.d1.execution.units = { ...receipt.d1.execution_total };
+    receipt.accounting.d1.total.units = {
+      rows_read: receipt.d1.execution_total.rows_read + context.report.capture.read_only.d1.rows_read,
+      rows_written: receipt.d1.execution_total.rows_written + context.report.capture.read_only.d1.rows_written,
+    };
     assert.deepEqual(validateCostReceipt(receipt, context), []);
   }
 });

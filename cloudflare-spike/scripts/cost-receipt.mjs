@@ -1,3 +1,5 @@
+import { validateCostAccounting } from "./cost-accounting.mjs";
+
 // Operator-side evidence; the immutable runtime envelope is never amended.
 export function validateCostReceipt(value, expected) {
   const failures = [];
@@ -16,8 +18,8 @@ export function validateCostReceipt(value, expected) {
   };
   const text = (value, path) => check(typeof value === "string" && value.trim().length > 0, `${path} must be nonempty`);
   const digest = (value, path) => check(typeof value === "string" && /^sha256:[0-9a-f]{64}$/.test(value), `${path} must be a SHA-256 digest`);
-  const receipt = object(value, ["schema_version", "execution_identity", "artifact_ref", "cost_ref", "d1", "container", "sources"], "receipt");
-  check(receipt.schema_version === 1, "schema_version must be 1");
+  const receipt = object(value, ["schema_version", "execution_identity", "artifact_ref", "cost_ref", "d1", "container", "sources", "accounting"], "receipt");
+  check(receipt.schema_version === 2, "schema_version must be 2");
   for (const [field, keys] of [
     ["execution_identity", ["invocation_id", "idempotency_key", "session_id", "request_hash", "execution_digest", "execution_policy_revision"]],
     ["artifact_ref", ["key", "media_type", "bytes", "sha256"]],
@@ -81,5 +83,6 @@ export function validateCostReceipt(value, expected) {
   check(windows.d1_pre_seal.to <= windows.d1_terminal_commit.from, "pre-seal and commit windows overlap");
   check(resources.container_lifecycle === container.instance_id, "lifecycle source must name the exact container instance");
   check(windows.container_lifecycle.from <= total.from && windows.container_lifecycle.to >= total.to, "lifecycle window must contain execution-total window");
+  failures.push(...validateCostAccounting(receipt.accounting, receipt, expected?.report));
   return failures;
 }

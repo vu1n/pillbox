@@ -106,6 +106,12 @@ reconciliation requires an identity/artifact-bound [cost receipt](burn-in/cost-r
 with separately observed commit rows and container lifecycle allocation units.
 It never rewrites the artifact or assumes execution duration equals billed
 lifecycle duration. Missing receipt observations keep the gate closed.
+Receipt v2 additionally reconciles explicit D1 inspection, artifact versus
+snapshot/verification R2 traffic, runtime versus authority Worker calls, and
+vendor DO execute versus cleanup/idle usage. Each scope has retained source
+records and an independently measured total. Namespace retention remains a
+separate before/after observation, never a per-run allocation inferred from a
+shared namespace delta. This adds no runtime write or deployment requirement.
 
 ## Current limits
 

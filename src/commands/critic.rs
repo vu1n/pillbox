@@ -22,7 +22,10 @@
 //! **State format is a contract.** [`render_state`] is byte-identical to the
 //! `buildState` in the companion offline harness (typesafe.vu1n.dev,
 //! `deploy/deciders.js`), so calibration measured offline on the held-out set
-//! is the calibration the live loop gets.
+//! is the right starting estimate for the live loop — not a guarantee. Live
+//! dispatches are a different distribution; `record` produces the labeled
+//! pairs that keep the estimate honest, and `order`/`select` pairs are
+//! selection-biased (only the highest-ranked workers get graded).
 
 use std::time::{Duration, Instant};
 

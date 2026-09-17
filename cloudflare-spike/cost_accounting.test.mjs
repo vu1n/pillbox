@@ -78,12 +78,26 @@ test("source records, selectors, resources, and windows cannot be substituted", 
     r => { r.accounting.vendor_retention.after.source.resource_id = "another-namespace"; },
     r => { r.accounting.vendor_retention.after.source.from = "2026-09-13T00:08:00.000Z"; },
     r => { r.accounting.vendor_retention.after.source.record_ids = r.accounting.vendor_retention.before.source.record_ids; },
+    r => { r.accounting.vendor_retention.before.source.from = "2026-09-13T00:09:00.000Z"; r.accounting.vendor_retention.before.source.to = "2026-09-13T00:09:30.000Z"; },
   ];
   for (const mutate of mutations) {
     const receipt = structuredClone(fixture);
     mutate(receipt);
     assert.ok(validate(receipt).length > 0, mutate.toString());
   }
+});
+
+test("malformed units and oversized record arrays return bounded validation failures", () => {
+  for (const value of [{ toString: null }, [], null, "1", true]) {
+    const receipt = structuredClone(fixture);
+    receipt.accounting.workers.issuer.units.requests = value;
+    assert.ok(validate(receipt).some(x => /safe integer/.test(x)));
+  }
+  const receipt = structuredClone(fixture);
+  for (const part of ["before", "after"]) {
+    receipt.accounting.vendor_retention[part].source.record_ids = Array.from({ length: 513 }, (_, i) => `${part}-${i}`);
+  }
+  assert.equal(validate(receipt).filter(x => /requires 1–512 records/.test(x)).length, 2);
 });
 
 test("snapshot selector must exclude the actual artifact even outside its normal namespace", () => {

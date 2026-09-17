@@ -23,8 +23,10 @@ export function validateCostAccounting(value, receipt, report) {
       check(Number.isFinite(times[key]) && new Date(times[key]).toISOString() === source[key], `${path}.${key} must be canonical ISO UTC`);
     }
     check(times.from < times.to, `${path} requires from < to`);
-    const ids = Array.isArray(source.record_ids) ? source.record_ids : [];
-    check(ids.length > 0 && ids.length <= 512, `${path}.record_ids requires 1–512 records`);
+    const boundedIds = Array.isArray(source.record_ids) && source.record_ids.length > 0 && source.record_ids.length <= 512;
+    check(boundedIds, `${path}.record_ids requires 1–512 records`);
+    // Invalid arrays must not reach downstream iteration or intersection checks.
+    const ids = boundedIds ? source.record_ids : [];
     for (const id of ids) text(id, `${path}.record_ids entry`);
     check(new Set(ids).size === ids.length, `${path} repeats a record`);
     if (r2) check(typeof source.key_prefix === "string" && source.key_prefix.length <= 1024, `${path}.key_prefix must be bounded text`);
@@ -32,8 +34,13 @@ export function validateCostAccounting(value, receipt, report) {
   };
   const measurement = (value, keys, path, r2 = false) => {
     const record = object(value, ["units", "source"], path);
-    const units = object(record.units, keys, `${path}.units`);
-    for (const key of keys) number(units[key], `${path}.${key}`, key === "duration_gb_seconds");
+    const input = object(record.units, keys, `${path}.units`);
+    const units = {};
+    for (const key of keys) {
+      number(input[key], `${path}.${key}`, key === "duration_gb_seconds");
+      // Keep invalid JSON values out of arithmetic without hiding their failures.
+      units[key] = typeof input[key] === "number" ? input[key] : NaN;
+    }
     return { units, source: source(record.source, `${path}.source`, r2) };
   };
   const accounting = object(value, ["snapshot_prefix", "d1", "r2", "workers", "vendor_do", "vendor_retention"], "accounting");
@@ -126,9 +133,10 @@ export function validateCostAccounting(value, receipt, report) {
   const after = measurement(retention.after, ["stored_bytes"], "vendor_retention.after");
   check(before.source.resource_id === after.source.resource_id, "retention observations name different namespaces");
   check(before.source.dataset === after.source.dataset, "retention observations use different datasets");
-  check(!before.source.record_ids.some(id => after.source.record_ids.includes(id)), "retention observations reuse a provider record");
+  const afterIds = new Set(after.source.record_ids);
+  check(!before.source.record_ids.some(id => afterIds.has(id)), "retention observations reuse a provider record");
   check(before.source.to <= after.source.from, "retention before/after windows overlap or are reversed");
-  check(before.source.to <= Date.parse(executionWindow?.from) && after.source.from >= vendor.total.source.to, "retention observations must bracket the measured lifecycle");
+  check(before.source.to <= vendor.total.source.from && after.source.from >= vendor.total.source.to, "retention observations must bracket the measured lifecycle");
   check(before.units.stored_bytes === capture?.totals?.vendor_sandbox_do?.stored_bytes_before, "retention before disagrees with namespace total");
   check(after.units.stored_bytes === capture?.totals?.vendor_sandbox_do?.stored_bytes_after, "retention after disagrees with namespace total");
   return failures;

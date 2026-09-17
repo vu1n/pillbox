@@ -109,7 +109,8 @@ match the report's per-run and non-execution vendor counters respectively;
 duration is independently measured GB-seconds, never summed invocation wall
 time or substituted execution milliseconds. `accounting.vendor_retention` is
 `{before, after}`, each `{units: {stored_bytes}, source}` naming the same namespace,
-with the before observation ending no later than the after observation starts.
+with the before observation ending no later than the vendor lifecycle starts
+and the after observation starting no earlier than that lifecycle ends.
 It matches report namespace storage totals, is not added across runs, and does
 not claim the namespace delta belongs exclusively to this invocation.
 

@@ -356,6 +356,22 @@ enum Command {
         /// Emit the verdict as JSON on stdout instead of the human banner.
         #[arg(long)]
         json: bool,
+        /// Score each worker's edits with a calibrated System One critic BEFORE
+        /// the verifier runs (`typesafe` = TypeSafe `jev-latest`; needs
+        /// `TYPESAFE_API_KEY`). The verifier stays the reward; the critic's
+        /// probability is recorded next to it on every worker — every dispatch
+        /// becomes a labeled (p, passed) pair. See `docs/dispatch.md` §Critic.
+        #[arg(long, value_name = "KIND", value_parser = ["typesafe"])]
+        critic: Option<String>,
+        /// What to do with the critic's probabilities: `record` (measure only,
+        /// grading unchanged) | `order` (grade in descending p, stop at the first
+        /// passer; the rest are `unverified`) | `select` (grade ONLY the argmax-p
+        /// worker; if it fails there is no winner). Requires `--critic`.
+        #[arg(long = "critic-policy", value_name = "POLICY", default_value = "record", value_parser = ["record", "order", "select"])]
+        critic_policy: String,
+        /// The critic's model id.
+        #[arg(long = "critic-model", value_name = "MODEL", default_value = commands::critic::DEFAULT_CRITIC_MODEL)]
+        critic_model: String,
         /// The segment prompt handed to every worker.
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
@@ -841,6 +857,9 @@ fn run(cli: Cli) -> Result<()> {
             memory,
             ttl,
             json,
+            critic,
+            critic_policy,
+            critic_model,
             args,
         } => {
             let resolved = Pillbox::resolve(pillbox_arg)?;
@@ -867,6 +886,9 @@ fn run(cli: Cli) -> Result<()> {
                     ttl,
                     prompt: args,
                     json,
+                    critic,
+                    critic_policy,
+                    critic_model,
                 },
             )
         }

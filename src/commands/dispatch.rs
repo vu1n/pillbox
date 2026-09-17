@@ -35,6 +35,9 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use serde_json::json;
 
+use crate::commands::critic::{
+    edits_from_log, render_state, Critic, CriticPolicy, CriticVerdict, EditRecord, TypesafeCritic,
+};
 use crate::contract::{Actor, Artifact, ArtifactClass, Criterion, Event, Payload, Scored};
 use crate::errors::PillboxError;
 use crate::events::blob::BlobStore;
@@ -145,6 +148,15 @@ pub(crate) struct DispatchOpts {
     pub(crate) prompt: Vec<String>,
     /// Emit the verdict as JSON on stdout instead of the human banner.
     pub(crate) json: bool,
+    /// `--critic KIND`: score each worker's edits with a calibrated System One
+    /// critic before the verifier runs (`typesafe` today). `None` → no critic,
+    /// byte-identical output to before.
+    pub(crate) critic: Option<String>,
+    /// `--critic-policy`: `record` (measure only) | `order` (grade in descending
+    /// p, stop at the first passer) | `select` (grade only the argmax-p worker).
+    pub(crate) critic_policy: String,
+    /// `--critic-model`: the critic's model id (`jev-latest`).
+    pub(crate) critic_model: String,
 }
 
 /// Terminal state of one worker in a dispatch run. Serializes to the snake_case
@@ -159,6 +171,10 @@ pub(crate) enum WorkerStatus {
     Failed,
     /// Never reached a gradeable result (boot / drive / score error).
     Errored,
+    /// Reached idle but was never graded: a `--critic-policy order` run found a
+    /// passer earlier in critic order, or `select` picked another worker. Its
+    /// `critic.p` is the only signal about it. Never a pass, never a winner.
+    Unverified,
 }
 
 impl WorkerStatus {
@@ -169,12 +185,19 @@ impl WorkerStatus {
         matches!(self, WorkerStatus::Scored)
     }
 
+    /// Whether the verifier ran on this worker at all (`Unverified`/`Errored`
+    /// never cost a verifier run).
+    fn verified(self) -> bool {
+        matches!(self, WorkerStatus::Scored | WorkerStatus::Failed)
+    }
+
     /// The per-worker glyph in the human banner.
     fn as_marker(self) -> char {
         match self {
             WorkerStatus::Scored => '✓',
             WorkerStatus::Failed => '✗',
             WorkerStatus::Errored => '!',
+            WorkerStatus::Unverified => '?',
         }
     }
 }
@@ -216,6 +239,10 @@ pub(crate) struct WorkerOutcome {
     /// `segments` there. A non-errored `--segments` worker always has ≥1 (an empty
     /// spec is rejected at parse), so empty-vs-non-empty is a sound mode discriminant.
     pub(crate) segments: Vec<SegmentOutcome>,
+    /// The critic's probability for this worker, taken right before its final
+    /// grade (`--critic`). `None` without a critic, or when the critic call
+    /// failed (a critic failure never sinks a worker — it just goes unscored).
+    pub(crate) critic: Option<CriticVerdict>,
 }
 
 impl WorkerOutcome {
@@ -232,8 +259,35 @@ impl WorkerOutcome {
         if !self.segments.is_empty() {
             v["segments"] = serde_json::to_value(&self.segments).unwrap_or_else(|_| json!([]));
         }
+        // Additive: only present when a `--critic` scored this worker.
+        if let Some(c) = &self.critic {
+            v["critic"] = serde_json::to_value(c).unwrap_or(serde_json::Value::Null);
+        }
         v
     }
+
+    /// Verifier runs this worker cost: one grade per attempt, none if it was
+    /// never graded.
+    fn verifier_runs(&self) -> u32 {
+        if self.status.verified() {
+            1 + self.retries_used
+        } else {
+            0
+        }
+    }
+}
+
+/// The critic block of the verdict — present only when `--critic` was given.
+/// `verifier_runs_saved` is the count of workers left `unverified` (each would
+/// have cost at least one grade), the number the `order`/`select` policies exist
+/// to move.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct CriticRun {
+    pub(crate) kind: String,
+    pub(crate) policy: CriticPolicy,
+    pub(crate) model: String,
+    pub(crate) verifier_runs: u32,
+    pub(crate) verifier_runs_saved: u32,
 }
 
 /// The verdict of a dispatch run: the selected winner, every worker's outcome,
@@ -252,18 +306,26 @@ pub(crate) struct DispatchVerdict {
     /// tie-break) — so a reader doesn't have to re-derive the ranking from the
     /// per-worker rows. `None` when no worker passed.
     pub(crate) selection_rationale: Option<String>,
+    /// The critic that ran and what it saved — `None` without `--critic`, so the
+    /// envelope is byte-identical to before.
+    pub(crate) critic: Option<CriticRun>,
 }
 
 impl DispatchVerdict {
     /// The `dispatch` payload of the JSON envelope (without the `version`
     /// wrapper — [`print_json`] adds that via [`crate::paths::json_v1`]).
     fn to_json_value(&self) -> serde_json::Value {
-        json!({
+        let mut v = json!({
             "winner": self.winner,
             "workers": self.workers.iter().map(WorkerOutcome::to_json_value).collect::<Vec<_>>(),
             "pulled_to": self.pulled_to.as_ref().map(|p| p.to_string_lossy().into_owned()),
             "selection_rationale": self.selection_rationale,
-        })
+        });
+        // Additive: only present when a `--critic` ran.
+        if let Some(c) = &self.critic {
+            v["critic"] = serde_json::to_value(c).unwrap_or(serde_json::Value::Null);
+        }
+        v
     }
 
     /// Emit the pinned `{version:1, dispatch:{…}}` envelope on stdout.
@@ -290,13 +352,28 @@ impl DispatchVerdict {
             }
             None => println!("pillbox: ✗ dispatch — no worker passed"),
         }
+        if let Some(c) = &self.critic {
+            println!(
+                "  critic: {} ({}) policy={} verifier_runs={} saved={}",
+                c.kind,
+                c.model,
+                c.policy.as_str(),
+                c.verifier_runs,
+                c.verifier_runs_saved
+            );
+        }
         for w in &self.workers {
             let score = w
                 .score
                 .map(|s| format!("{s:.2}"))
                 .unwrap_or_else(|| "—".into());
+            let critic = w
+                .critic
+                .as_ref()
+                .map(|c| format!(" critic_p={:.2}", c.p))
+                .unwrap_or_default();
             println!(
-                "  {} {}  score={score} retries={}",
+                "  {} {}  score={score} retries={}{critic}",
                 w.status.as_marker(),
                 w.session,
                 w.retries_used
@@ -327,6 +404,39 @@ trait WorkerDriver {
     fn send(&self, id: &str, prompt: &str) -> Result<()>;
     /// Pull the winner's result workspace to a durable dir → that path.
     fn pull_winner(&self, id: &str) -> Result<PathBuf>;
+    /// The worker's edits so far, from its §0 log — what a `--critic` judges.
+    fn edits(&self, id: &str) -> Result<Vec<EditRecord>>;
+}
+
+/// The critic, threaded through the drive paths as one handle. `None` = no
+/// `--critic` — every path below is byte-for-byte the pre-critic loop then.
+struct CriticCtx<'a> {
+    critic: &'a dyn Critic,
+    /// The task prompt the worker was driven with — half of the critic's state.
+    prompt: &'a str,
+}
+
+impl CriticCtx<'_> {
+    /// Score one worker's current edits. Errors are logged and swallowed into
+    /// `None`: the critic is advisory, and an HTTP hiccup must not turn a
+    /// gradeable worker into an `Errored` one.
+    fn score(&self, driver: &dyn WorkerDriver, id: &str) -> Option<CriticVerdict> {
+        let edits = match driver.edits(id) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("pillbox: critic skipped `{id}` (edits unreadable): {e:#}");
+                return None;
+            }
+        };
+        let (state, _truncated) = render_state(self.prompt, &edits);
+        match self.critic.score(&state) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                eprintln!("pillbox: critic failed for `{id}`: {e:#}");
+                None
+            }
+        }
+    }
 }
 
 // ── pure policy (the unit-tested gate) ──────────────────────────────────────
@@ -438,12 +548,19 @@ fn selection_rationale(workers: &[WorkerOutcome], winner: usize) -> String {
         .map(|s| format!("{s:.2}"))
         .unwrap_or_else(|| "—".into());
     let passers = workers.iter().filter(|o| o.status.passed()).count();
+    // A critic's p rides along so a reader can see whether the critic would
+    // have picked the same worker — it never decides; the verifier did.
+    let critic = w
+        .critic
+        .as_ref()
+        .map(|c| format!("; critic p={:.2}", c.p))
+        .unwrap_or_default();
     if passers <= 1 {
-        return format!("only passing worker (score {score})");
+        return format!("only passing worker (score {score}{critic})");
     }
     // >1 passer → the tie-break (fewest retries, then earliest fork) decided it.
     format!(
-        "highest-ranked of {passers} passing workers: score {score}, {} retries",
+        "highest-ranked of {passers} passing workers: score {score}, {} retries{critic}",
         w.retries_used
     )
 }
@@ -490,6 +607,12 @@ struct WorkerSummary {
     /// forward-compatible and the slot is discoverable; the panel itself is a
     /// separate task and is never a selection input (the verifier decides).
     judge_report_ref: Option<String>,
+    /// The `--critic` probability recorded right before this worker's final
+    /// grade — the `(p, passed)` pair the harness learns its critic from. Omitted
+    /// when no critic ran. Also written on its own as a `dispatch.critic_verdict`
+    /// signal artifact so it can pool without this content-class body.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    critic: Option<CriticVerdict>,
 }
 
 impl WorkerSummary {
@@ -516,6 +639,7 @@ impl WorkerSummary {
             feedback,
             segments: o.segments.clone(),
             judge_report_ref: None,
+            critic: o.critic.clone(),
         }
     }
 
@@ -558,7 +682,63 @@ fn record_worker_summaries(resolved: &Pillbox, verdict: &DispatchVerdict, prompt
                 o.session
             );
         }
+        // The critic's verdict also lands on its own, as poolable signal: p next to
+        // the verifier's passed/score, no prompt, no code. This is the labeled pair
+        // every dispatch contributes to measuring the critic.
+        if let (Some(c), Some(run)) = (&o.critic, &verdict.critic) {
+            if let Err(e) = write_critic_verdict(resolved, o, c, run) {
+                eprintln!(
+                    "pillbox: note: critic verdict not recorded for `{}`: {e:#}",
+                    o.session
+                );
+            }
+        }
     }
+}
+
+/// Persist one `dispatch.critic_verdict` §0 artifact (signal class) on the
+/// worker's own log: the critic's `p` alongside the verifier's ground truth.
+fn write_critic_verdict(
+    resolved: &Pillbox,
+    o: &WorkerOutcome,
+    c: &CriticVerdict,
+    run: &CriticRun,
+) -> Result<()> {
+    let record = json!({
+        "session": o.session,
+        "critic": c,
+        "policy": run.policy,
+        "status": o.status,
+        "verified": o.status.verified(),
+        "passed": o.status.passed(),
+        "score": o.score,
+        "retries_used": o.retries_used,
+    });
+    let body = serde_json::to_vec(&record).context("serialize critic verdict")?;
+    let blob_ref = BlobStore::open(resolved, &o.session)?.put(&body)?;
+    let verdict_word = if !o.status.verified() {
+        "unverified"
+    } else if o.status.passed() {
+        "passed"
+    } else {
+        "failed"
+    };
+    let artifact = Artifact {
+        kind: "dispatch.critic_verdict".into(),
+        summary: format!("critic {} p={:.2} → {verdict_word}", c.critic, c.p),
+        content_type: "application/json".into(),
+        // Numbers and names only (p, pass/fail, score, counts) — poolable.
+        class: ArtifactClass::Signal,
+        blob_ref,
+        bytes: body.len() as u64,
+        worker_id: o.session.clone(),
+    };
+    SessionLog::open(resolved, &o.session)?.append(&[Event::session(
+        &o.session,
+        Payload::Artifact(artifact),
+    )
+    .with_actor(Actor::service("dispatch"))])?;
+    Ok(())
 }
 
 fn write_worker_summary(resolved: &Pillbox, summary: &WorkerSummary) -> Result<()> {
@@ -588,6 +768,7 @@ fn write_worker_summary(resolved: &Pillbox, summary: &WorkerSummary) -> Result<(
 /// to `retries`), then select + pull the winner into the [`DispatchVerdict`]. A
 /// worker that errors anywhere in its drive becomes an `Errored` outcome — one
 /// bad worker never aborts the dispatch.
+#[cfg(test)]
 fn run_dispatch(
     driver: &dyn WorkerDriver,
     k: u32,
@@ -596,6 +777,34 @@ fn run_dispatch(
     reward: &Grader,
     segments: Option<&[ResolvedSegment]>,
 ) -> DispatchVerdict {
+    run_dispatch_with(
+        driver,
+        k,
+        prompt,
+        retries,
+        reward,
+        segments,
+        None,
+        CriticPolicy::Record,
+    )
+}
+
+/// [`run_dispatch`] with an optional critic. Without one (`None`) this is the
+/// pre-critic loop, byte-for-byte. With one, `policy` decides whether the
+/// probabilities only ride along (`record`) or reorder / prune the verifier
+/// runs (`order` / `select`, fork-`k` only).
+#[allow(clippy::too_many_arguments)]
+fn run_dispatch_with(
+    driver: &dyn WorkerDriver,
+    k: u32,
+    prompt: &str,
+    retries: u32,
+    reward: &Grader,
+    segments: Option<&[ResolvedSegment]>,
+    critic: Option<&dyn Critic>,
+    policy: CriticPolicy,
+) -> DispatchVerdict {
+    let ctx = critic.map(|c| CriticCtx { critic: c, prompt });
     // Fork all k up front, THEN drive each. Forking first overlaps the k VM
     // BOOTS (each `--detach` worker boots in the background). Server-mode worker
     // turns are driven SERIALLY below; one-shot CLI workers receive their only
@@ -610,31 +819,52 @@ fn run_dispatch(
     // single-prompt + retry loop (fork-`k`). With both `-k>1` and `--segments`, the
     // k workers each run the full chain → best-of-k OVER segmented chains.
     let fork_first_turn = if segments.is_some() { "" } else { prompt };
-    let workers: Vec<WorkerOutcome> = (0..k)
+    let forked: Vec<(usize, Result<String>)> = (0..k)
         .map(|i| {
             let i = i as usize;
             (i, driver.fork(i, fork_first_turn))
         })
-        .collect::<Vec<_>>()
-        .into_iter()
-        .map(|(i, forked)| match forked {
-            Ok(id) => match segments {
-                Some(segs) => drive_segments(driver, i, id, prompt, segs, reward, retries),
-                None => drive_one(driver, i, id, prompt, retries, reward),
-            },
-            Err(e) => {
-                eprintln!("pillbox: worker fork failed: {e:#}");
-                WorkerOutcome {
-                    session: String::new(),
-                    score: None,
-                    retries_used: 0,
-                    status: WorkerStatus::Errored,
-                    grade: None,
-                    segments: vec![],
-                }
-            }
-        })
         .collect();
+    let workers: Vec<WorkerOutcome> = match (ctx.as_ref(), policy, segments) {
+        // The critic reorders/prunes grading: every worker must be idle BEFORE the
+        // first grade, so the drive is two-phase (settle all → grade in p order).
+        (Some(cx), CriticPolicy::Order | CriticPolicy::Select, None) => {
+            drive_ranked(driver, forked, prompt, retries, reward, cx, policy)
+        }
+        _ => forked
+            .into_iter()
+            .map(|(i, forked)| match forked {
+                Ok(id) => match segments {
+                    Some(segs) => drive_segments_with(
+                        driver,
+                        i,
+                        id,
+                        prompt,
+                        segs,
+                        reward,
+                        retries,
+                        ctx.as_ref(),
+                    ),
+                    None => drive_one_with(driver, i, id, prompt, retries, reward, ctx.as_ref()),
+                },
+                Err(e) => {
+                    eprintln!("pillbox: worker fork failed: {e:#}");
+                    fork_failed()
+                }
+            })
+            .collect(),
+    };
+
+    let critic_run = ctx.as_ref().map(|cx| CriticRun {
+        kind: cx.critic.name().to_string(),
+        policy,
+        model: cx.critic.model().to_string(),
+        verifier_runs: workers.iter().map(WorkerOutcome::verifier_runs).sum(),
+        verifier_runs_saved: workers
+            .iter()
+            .filter(|w| w.status == WorkerStatus::Unverified)
+            .count() as u32,
+    });
 
     let (winner, pulled_to, selection_rationale) = match select_winner(&workers) {
         Some(i) => {
@@ -660,11 +890,156 @@ fn run_dispatch(
         workers,
         pulled_to,
         selection_rationale,
+        critic: critic_run,
+    }
+}
+
+/// The critic-ranked drive (`--critic-policy order|select`, fork-`k` only).
+/// Phase 1: settle every fork to idle after its first turn — a critic must see
+/// finished edits. Phase 2: score each with the critic. Phase 3: grade in
+/// descending `p` — `order` stops at the first passer, `select` grades only the
+/// first — and everything left ungraded becomes `Unverified`, its `p` retained
+/// as the only evidence about it. A worker that fails its first grade still gets
+/// its `--retries` before the loop moves on, so per-worker semantics match the
+/// plain drive.
+fn drive_ranked(
+    driver: &dyn WorkerDriver,
+    forked: Vec<(usize, Result<String>)>,
+    prompt: &str,
+    retries: u32,
+    reward: &Grader,
+    cx: &CriticCtx,
+    policy: CriticPolicy,
+) -> Vec<WorkerOutcome> {
+    let n = forked.len();
+    let mut outcomes: Vec<Option<WorkerOutcome>> = (0..n).map(|_| None).collect();
+    let mut settled: Vec<(usize, usize, String, Option<CriticVerdict>)> = Vec::new();
+    for (slot, (i, forked)) in forked.into_iter().enumerate() {
+        match forked {
+            Err(e) => {
+                eprintln!("pillbox: worker fork failed: {e:#}");
+                outcomes[slot] = Some(fork_failed());
+            }
+            Ok(id) => match settle(driver, i, &id, prompt) {
+                Ok(()) => {
+                    let verdict = cx.score(driver, &id);
+                    settled.push((slot, i, id, verdict));
+                }
+                Err(e) => outcomes[slot] = Some(errored(id, e)),
+            },
+        }
+    }
+    // Descending p; an unscored worker (critic error) ranks last; ties keep fork
+    // order (stable sort).
+    settled.sort_by(|a, b| {
+        let pa = a.3.as_ref().map(|v| v.p).unwrap_or(-1.0);
+        let pb = b.3.as_ref().map(|v| v.p).unwrap_or(-1.0);
+        pb.partial_cmp(&pa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut found_pass = false;
+    let mut graded_any = false;
+    for (slot, i, id, verdict) in settled {
+        let grade_it = match policy {
+            CriticPolicy::Order => !found_pass,
+            CriticPolicy::Select => !graded_any,
+            CriticPolicy::Record => true,
+        };
+        if !grade_it {
+            outcomes[slot] = Some(unverified(id, verdict));
+            continue;
+        }
+        graded_any = true;
+        let outcome = match grade_from_idle(driver, i, &id, reward, retries) {
+            Ok((grade, used)) => outcome_from_grade(&id, grade, used, verdict),
+            Err(e) => errored(id, e),
+        };
+        found_pass |= outcome.status.passed();
+        outcomes[slot] = Some(outcome);
+    }
+    outcomes
+        .into_iter()
+        .map(|o| o.expect("every fork slot is filled by one of the phases"))
+        .collect()
+}
+
+/// Bring a freshly forked worker to idle after its first turn. One-shot CLI
+/// agents consumed the prompt at fork (just wait); server agents are driven.
+fn settle(driver: &dyn WorkerDriver, i: usize, id: &str, first_turn: &str) -> Result<()> {
+    if !driver.first_turn_driven_on_fork(i) {
+        driver.send(id, first_turn)?;
+    }
+    driver.wait_idle(id)
+}
+
+/// Grade an already-idle worker, with the same retry loop as [`drive_to_grade`]
+/// (re-drive with the distilled failure summary up to `retries` times). One-shot
+/// agents can't take a second turn, so they get exactly one grade.
+fn grade_from_idle(
+    driver: &dyn WorkerDriver,
+    i: usize,
+    id: &str,
+    grader: &Grader,
+    retries: u32,
+) -> Result<(Scored, u32)> {
+    let mut used = 0u32;
+    loop {
+        let grade = driver.grade(id, grader)?;
+        if grade.passed || used >= retries || driver.first_turn_driven_on_fork(i) {
+            return Ok((grade, used));
+        }
+        driver.send(id, &distill_feedback(&grade))?;
+        driver.wait_idle(id)?;
+        used += 1;
+    }
+}
+
+/// A graded worker's outcome, with whatever the critic said about it.
+fn outcome_from_grade(
+    id: &str,
+    grade: Scored,
+    used: u32,
+    critic: Option<CriticVerdict>,
+) -> WorkerOutcome {
+    WorkerOutcome {
+        session: id.to_string(),
+        score: Some(grade.score),
+        retries_used: used,
+        status: status_of(&grade),
+        grade: Some(grade),
+        segments: vec![],
+        critic,
+    }
+}
+
+/// A worker the critic policy left ungraded — no score, no grade, just `p`.
+fn unverified(id: String, critic: Option<CriticVerdict>) -> WorkerOutcome {
+    WorkerOutcome {
+        session: id,
+        score: None,
+        retries_used: 0,
+        status: WorkerStatus::Unverified,
+        grade: None,
+        segments: vec![],
+        critic,
+    }
+}
+
+/// The outcome for a fork that never produced a session.
+fn fork_failed() -> WorkerOutcome {
+    WorkerOutcome {
+        session: String::new(),
+        score: None,
+        retries_used: 0,
+        status: WorkerStatus::Errored,
+        grade: None,
+        segments: vec![],
+        critic: None,
     }
 }
 
 /// Drive one worker to a terminal outcome. Errors are caught into an `Errored`
 /// outcome (not propagated) so one worker's failure doesn't sink the others.
+#[cfg(test)]
 fn drive_one(
     driver: &dyn WorkerDriver,
     i: usize,
@@ -673,7 +1048,20 @@ fn drive_one(
     retries: u32,
     reward: &Grader,
 ) -> WorkerOutcome {
-    drive_one_inner(driver, i, &id, prompt, retries, reward).unwrap_or_else(|e| errored(id, e))
+    drive_one_with(driver, i, id, prompt, retries, reward, None)
+}
+
+fn drive_one_with(
+    driver: &dyn WorkerDriver,
+    i: usize,
+    id: String,
+    prompt: &str,
+    retries: u32,
+    reward: &Grader,
+    critic: Option<&CriticCtx>,
+) -> WorkerOutcome {
+    drive_one_inner(driver, i, &id, prompt, retries, reward, critic)
+        .unwrap_or_else(|e| errored(id, e))
 }
 
 /// The shared `Errored` outcome for a worker whose drive raised (boot/drive/grade
@@ -687,6 +1075,7 @@ fn errored(id: String, e: anyhow::Error) -> WorkerOutcome {
         status: WorkerStatus::Errored,
         grade: None,
         segments: vec![],
+        critic: None,
     }
 }
 
@@ -704,10 +1093,28 @@ fn drive_to_grade(
     grader: &Grader,
     retries: u32,
 ) -> Result<(Scored, u32)> {
+    let (grade, used, _critic) =
+        drive_to_grade_with(driver, i, id, first_turn, grader, retries, None)?;
+    Ok((grade, used))
+}
+
+/// [`drive_to_grade`] with an optional critic scored right before EACH grade —
+/// the critic predicts *this* verifier call, so every attempt yields a labeled
+/// pair. The returned verdict is the one aligned with the returned (final) grade.
+fn drive_to_grade_with(
+    driver: &dyn WorkerDriver,
+    i: usize,
+    id: &str,
+    first_turn: &str,
+    grader: &Grader,
+    retries: u32,
+    critic: Option<&CriticCtx>,
+) -> Result<(Scored, u32, Option<CriticVerdict>)> {
     if driver.first_turn_driven_on_fork(i) {
         driver.wait_idle(id)?;
+        let verdict = critic.and_then(|c| c.score(driver, id));
         let grade = driver.grade(id, grader)?;
-        return Ok((grade, 0));
+        return Ok((grade, 0, verdict));
     }
 
     let mut turn = first_turn.to_string();
@@ -715,9 +1122,10 @@ fn drive_to_grade(
     loop {
         driver.send(id, &turn)?;
         driver.wait_idle(id)?;
+        let verdict = critic.and_then(|c| c.score(driver, id));
         let grade = driver.grade(id, grader)?;
         if grade.passed || used >= retries {
-            return Ok((grade, used));
+            return Ok((grade, used, verdict));
         }
         turn = distill_feedback(&grade);
         used += 1;
@@ -743,20 +1151,16 @@ fn drive_one_inner(
     prompt: &str,
     retries: u32,
     reward: &Grader,
+    critic: Option<&CriticCtx>,
 ) -> Result<WorkerOutcome> {
-    let (grade, used) = drive_to_grade(driver, i, id, prompt, reward, retries)?;
-    Ok(WorkerOutcome {
-        session: id.to_string(),
-        score: Some(grade.score),
-        retries_used: used,
-        status: status_of(&grade),
-        grade: Some(grade),
-        segments: vec![],
-    })
+    let (grade, used, verdict) =
+        drive_to_grade_with(driver, i, id, prompt, reward, retries, critic)?;
+    Ok(outcome_from_grade(id, grade, used, verdict))
 }
 
 /// Drive one worker through a SEGMENT CHAIN to a terminal outcome (errors → an
 /// `Errored` outcome, like [`drive_one`]).
+#[cfg(test)]
 fn drive_segments(
     driver: &dyn WorkerDriver,
     i: usize,
@@ -766,7 +1170,21 @@ fn drive_segments(
     reward: &Grader,
     retries: u32,
 ) -> WorkerOutcome {
-    drive_segments_inner(driver, i, &id, context, segments, reward, retries)
+    drive_segments_with(driver, i, id, context, segments, reward, retries, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drive_segments_with(
+    driver: &dyn WorkerDriver,
+    i: usize,
+    id: String,
+    context: &str,
+    segments: &[ResolvedSegment],
+    reward: &Grader,
+    retries: u32,
+    critic: Option<&CriticCtx>,
+) -> WorkerOutcome {
+    drive_segments_inner(driver, i, &id, context, segments, reward, retries, critic)
         .unwrap_or_else(|e| errored(id, e))
 }
 
@@ -778,6 +1196,7 @@ fn drive_segments(
 /// does NOT abort the chain — it advances and lets the run-level **reward** be the
 /// authoritative final grade (matches the harness's best-effort progression). The
 /// worker's `retries_used` is the sum across segments.
+#[allow(clippy::too_many_arguments)]
 fn drive_segments_inner(
     driver: &dyn WorkerDriver,
     worker_i: usize,
@@ -786,6 +1205,7 @@ fn drive_segments_inner(
     segments: &[ResolvedSegment],
     reward: &Grader,
     retries: u32,
+    critic: Option<&CriticCtx>,
 ) -> Result<WorkerOutcome> {
     let mut seg_outcomes = Vec::with_capacity(segments.len());
     for (i, seg) in segments.iter().enumerate() {
@@ -803,6 +1223,9 @@ fn drive_segments_inner(
             retries_used: used,
         });
     }
+    // The critic judges the finished chain, right before the reward — the gates
+    // are the chain's own business.
+    let verdict = critic.and_then(|c| c.score(driver, id));
     // Authoritative final grade = the run-level reward (distinct from the gates),
     // graded once after the chain — no retry.
     let final_grade = driver.grade(id, reward)?;
@@ -814,6 +1237,7 @@ fn drive_segments_inner(
         status: status_of(&final_grade),
         grade: Some(final_grade),
         segments: seg_outcomes,
+        critic: verdict,
     })
 }
 
@@ -960,6 +1384,19 @@ impl WorkerDriver for CliDriver<'_> {
             to.to_string_lossy().into_owned(),
         ])?;
         Ok(to)
+    }
+
+    fn edits(&self, id: &str) -> Result<Vec<EditRecord>> {
+        // The worker's own §0 log is the source — the same events the offline
+        // harness extracts, so the live critic sees exactly what was measured.
+        let out = self.capture(&[
+            "session".into(),
+            "log".into(),
+            id.into(),
+            "--type".into(),
+            "tool_call".into(),
+        ])?;
+        Ok(edits_from_log(&out))
     }
 }
 
@@ -1236,14 +1673,51 @@ pub(crate) fn dispatch(resolved: &Pillbox, opts: DispatchOpts) -> Result<()> {
         None => None,
     };
 
+    // The critic (`--critic`): resolved and credentialed up front, so a missing
+    // key or a bad policy is a usage error before any VM boots. `order`/`select`
+    // reorder the grading of independent forks; a segment chain grades once at
+    // the end, so there they'd be meaningless — `record` is the only policy that
+    // composes with `--segments`.
+    let critic_policy = CriticPolicy::parse(&opts.critic_policy)?;
+    let critic: Option<TypesafeCritic> = match opts.critic.as_deref() {
+        None => {
+            if critic_policy != CriticPolicy::Record {
+                return Err(PillboxError::usage(
+                    "dispatch",
+                    format!("--critic-policy {} needs --critic", critic_policy.as_str()),
+                )
+                .with_next("add --critic typesafe")
+                .into());
+            }
+            None
+        }
+        Some("typesafe") => Some(TypesafeCritic::from_env(&opts.critic_model)?),
+        Some(other) => {
+            return Err(
+                PillboxError::usage("dispatch", format!("unknown --critic `{other}`"))
+                    .with_next("use --critic typesafe")
+                    .into(),
+            )
+        }
+    };
+    if critic.is_some() && segments.is_some() && critic_policy != CriticPolicy::Record {
+        return Err(PillboxError::usage(
+            "dispatch",
+            "`--critic-policy order|select` reorders fork-k grading; with --segments use --critic-policy record",
+        )
+        .into());
+    }
+
     let driver = CliDriver::new(&opts, default_agent_id)?;
-    let verdict = run_dispatch(
+    let verdict = run_dispatch_with(
         &driver,
         k,
         &prompt,
         opts.retries,
         &reward,
         segments.as_deref(),
+        critic.as_ref().map(|c| c as &dyn Critic),
+        critic_policy,
     );
 
     // Persist each worker's evidence to its §0 log (#73) before reporting —
@@ -1281,6 +1755,7 @@ mod tests {
             status,
             grade: None,
             segments: vec![],
+            critic: None,
         }
     }
 
@@ -1288,6 +1763,51 @@ mod tests {
     /// and replays its scripted grade queue).
     fn reward() -> Grader {
         Grader::Cmd("reward".into())
+    }
+
+    /// A scripted critic: `p` per worker id. It finds the id in the rendered
+    /// state (the mock driver's single edit names the worker), so the policy
+    /// under test sees the real render → score path.
+    struct MockCritic {
+        ps: std::collections::HashMap<String, f64>,
+        calls: RefCell<Vec<String>>,
+    }
+
+    impl MockCritic {
+        fn new(ps: &[(&str, f64)]) -> Self {
+            Self {
+                ps: ps.iter().map(|(id, p)| (id.to_string(), *p)).collect(),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Critic for MockCritic {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        fn model(&self) -> &str {
+            "mock-1"
+        }
+        fn score(&self, state: &str) -> Result<CriticVerdict> {
+            let id = state
+                .split("## edit 1: edit ")
+                .nth(1)
+                .and_then(|s| s.lines().next())
+                .expect("mock state names the worker");
+            self.calls.borrow_mut().push(id.to_string());
+            let p = *self.ps.get(id).expect("scripted p for worker");
+            Ok(CriticVerdict {
+                critic: "mock".into(),
+                model: "mock-1".into(),
+                p,
+                latency_ms: 1,
+                cost_usd: Some(0.0),
+                input_tokens: 1,
+                truncated: false,
+                n_edits: 1,
+            })
+        }
     }
 
     // ── selection policy ──
@@ -1444,6 +1964,263 @@ mod tests {
             self.pulls.borrow_mut().push(id.to_string());
             Ok(PathBuf::from(format!("/tmp/winner-{id}")))
         }
+        fn edits(&self, id: &str) -> Result<Vec<EditRecord>> {
+            // One edit that names the worker, so a MockCritic can find it in the
+            // rendered state.
+            Ok(vec![EditRecord {
+                tool: "edit".into(),
+                file: id.into(),
+                old: String::new(),
+                new: format!("// {id}"),
+            }])
+        }
+    }
+
+    // ── the critic policies (`--critic`) ──
+
+    #[test]
+    fn record_policy_attaches_p_and_leaves_grading_unchanged() {
+        // Same script as `loop_selects_winner_and_pulls_it`: the critic must not
+        // change a single send, grade, or the winner — it only rides along.
+        let d = MockDriver::new(vec![
+            ("w0", vec![(false, 0.5), (true, 1.0)]),
+            ("w1", vec![(true, 1.0)]),
+        ]);
+        let c = MockCritic::new(&[("w0", 0.2), ("w1", 0.9)]);
+        let v = run_dispatch_with(
+            &d,
+            2,
+            "task",
+            2,
+            &reward(),
+            None,
+            Some(&c),
+            CriticPolicy::Record,
+        );
+        assert_eq!(v.winner.as_deref(), Some("w1"));
+        assert_eq!(*d.sends.borrow(), 3);
+        assert_eq!(v.workers[0].critic.as_ref().map(|c| c.p), Some(0.2));
+        assert_eq!(v.workers[1].critic.as_ref().map(|c| c.p), Some(0.9));
+        // Scored before EACH grade: w0 twice (fail, then pass), w1 once.
+        assert_eq!(*c.calls.borrow(), vec!["w0", "w0", "w1"]);
+        let run = v.critic.as_ref().expect("critic block");
+        assert_eq!(run.policy, CriticPolicy::Record);
+        assert_eq!(run.verifier_runs, 3);
+        assert_eq!(run.verifier_runs_saved, 0);
+        assert!(v.workers.iter().all(|w| w.status.verified()));
+    }
+
+    #[test]
+    fn order_policy_grades_by_descending_p_and_stops_at_the_first_passer() {
+        // All three would pass; the critic ranks w1 first, so only w1 is graded.
+        let d = MockDriver::new(vec![
+            ("w0", vec![(true, 1.0)]),
+            ("w1", vec![(true, 1.0)]),
+            ("w2", vec![(true, 1.0)]),
+        ]);
+        let c = MockCritic::new(&[("w0", 0.1), ("w1", 0.9), ("w2", 0.5)]);
+        let v = run_dispatch_with(
+            &d,
+            3,
+            "task",
+            1,
+            &reward(),
+            None,
+            Some(&c),
+            CriticPolicy::Order,
+        );
+        assert_eq!(v.winner.as_deref(), Some("w1"));
+        assert_eq!(v.workers[1].status, WorkerStatus::Scored);
+        assert_eq!(v.workers[0].status, WorkerStatus::Unverified);
+        assert_eq!(v.workers[2].status, WorkerStatus::Unverified);
+        // Unverified workers keep their p and cost no verifier run.
+        assert_eq!(v.workers[0].critic.as_ref().map(|c| c.p), Some(0.1));
+        assert_eq!(v.workers[0].score, None);
+        assert_eq!(
+            d.grades.borrow()["w0"].len(),
+            1,
+            "w0's grade was never consumed"
+        );
+        assert_eq!(
+            d.grades.borrow()["w2"].len(),
+            1,
+            "w2's grade was never consumed"
+        );
+        let run = v.critic.as_ref().unwrap();
+        assert_eq!(run.verifier_runs, 1);
+        assert_eq!(run.verifier_runs_saved, 2);
+        // Every fork was settled (one send each) before any grade.
+        assert_eq!(*d.sends.borrow(), 3);
+        // Outcomes stay in fork order regardless of grading order.
+        assert_eq!(
+            v.workers
+                .iter()
+                .map(|w| w.session.as_str())
+                .collect::<Vec<_>>(),
+            ["w0", "w1", "w2"]
+        );
+    }
+
+    #[test]
+    fn order_policy_falls_through_when_the_top_ranked_worker_fails() {
+        // The critic is wrong about w0 (0.9 but fails, no retries); w1 passes.
+        let d = MockDriver::new(vec![("w0", vec![(false, 0.0)]), ("w1", vec![(true, 1.0)])]);
+        let c = MockCritic::new(&[("w0", 0.9), ("w1", 0.4)]);
+        let v = run_dispatch_with(
+            &d,
+            2,
+            "task",
+            0,
+            &reward(),
+            None,
+            Some(&c),
+            CriticPolicy::Order,
+        );
+        assert_eq!(v.winner.as_deref(), Some("w1"));
+        assert_eq!(v.workers[0].status, WorkerStatus::Failed);
+        assert_eq!(v.workers[1].status, WorkerStatus::Scored);
+        let run = v.critic.as_ref().unwrap();
+        assert_eq!(run.verifier_runs, 2);
+        assert_eq!(run.verifier_runs_saved, 0);
+        // The rationale shows the critic's p next to the verifier's decision.
+        assert!(v
+            .selection_rationale
+            .as_deref()
+            .unwrap()
+            .contains("critic p=0.40"));
+    }
+
+    #[test]
+    fn order_policy_retries_a_failed_worker_before_moving_on() {
+        // w0 ranked first, fails once then passes within its retry budget → it
+        // wins and w1 is never graded.
+        let d = MockDriver::new(vec![
+            ("w0", vec![(false, 0.5), (true, 1.0)]),
+            ("w1", vec![(true, 1.0)]),
+        ]);
+        let c = MockCritic::new(&[("w0", 0.8), ("w1", 0.7)]);
+        let v = run_dispatch_with(
+            &d,
+            2,
+            "task",
+            1,
+            &reward(),
+            None,
+            Some(&c),
+            CriticPolicy::Order,
+        );
+        assert_eq!(v.winner.as_deref(), Some("w0"));
+        assert_eq!(v.workers[0].retries_used, 1);
+        assert_eq!(v.workers[1].status, WorkerStatus::Unverified);
+        // sends: 2 settles + 1 retry re-drive.
+        assert_eq!(*d.sends.borrow(), 3);
+        assert_eq!(v.critic.as_ref().unwrap().verifier_runs, 2);
+    }
+
+    #[test]
+    fn select_policy_grades_only_the_argmax_and_can_end_with_no_winner() {
+        // The critic picks w0 (0.9); it fails. w1 would have passed but is never
+        // graded — the honest cost of trusting the critic.
+        let d = MockDriver::new(vec![("w0", vec![(false, 0.0)]), ("w1", vec![(true, 1.0)])]);
+        let c = MockCritic::new(&[("w0", 0.9), ("w1", 0.3)]);
+        let v = run_dispatch_with(
+            &d,
+            2,
+            "task",
+            0,
+            &reward(),
+            None,
+            Some(&c),
+            CriticPolicy::Select,
+        );
+        assert_eq!(v.winner, None);
+        assert_eq!(v.workers[0].status, WorkerStatus::Failed);
+        assert_eq!(v.workers[1].status, WorkerStatus::Unverified);
+        assert_eq!(d.grades.borrow()["w1"].len(), 1);
+        let run = v.critic.as_ref().unwrap();
+        assert_eq!(run.verifier_runs, 1);
+        assert_eq!(run.verifier_runs_saved, 1);
+        assert!(d.pulls.borrow().is_empty());
+    }
+
+    #[test]
+    fn critic_failure_leaves_the_worker_unscored_but_graded() {
+        // A critic that errors must never turn a gradeable worker into Errored.
+        struct BrokenCritic;
+        impl Critic for BrokenCritic {
+            fn name(&self) -> &str {
+                "broken"
+            }
+            fn model(&self) -> &str {
+                "none"
+            }
+            fn score(&self, _state: &str) -> Result<CriticVerdict> {
+                bail!("HTTP 529")
+            }
+        }
+        let d = MockDriver::new(vec![("w0", vec![(true, 1.0)])]);
+        let v = run_dispatch_with(
+            &d,
+            1,
+            "task",
+            0,
+            &reward(),
+            None,
+            Some(&BrokenCritic),
+            CriticPolicy::Order,
+        );
+        assert_eq!(v.winner.as_deref(), Some("w0"));
+        assert_eq!(v.workers[0].status, WorkerStatus::Scored);
+        assert!(v.workers[0].critic.is_none());
+    }
+
+    #[test]
+    fn verdict_json_carries_critic_blocks_only_when_a_critic_ran() {
+        let plain = run_dispatch(
+            &MockDriver::new(vec![("w0", vec![(true, 1.0)])]),
+            1,
+            "task",
+            0,
+            &reward(),
+            None,
+        );
+        let val = plain.to_json_value();
+        assert!(val.get("critic").is_none());
+        assert!(val["workers"][0].get("critic").is_none());
+
+        let d = MockDriver::new(vec![("w0", vec![(true, 1.0)])]);
+        let c = MockCritic::new(&[("w0", 0.77)]);
+        let with = run_dispatch_with(
+            &d,
+            1,
+            "task",
+            0,
+            &reward(),
+            None,
+            Some(&c),
+            CriticPolicy::Record,
+        );
+        let val = with.to_json_value();
+        assert_eq!(val["critic"]["kind"], "mock");
+        assert_eq!(val["critic"]["policy"], "record");
+        assert_eq!(val["critic"]["verifier_runs"], 1);
+        assert_eq!(val["workers"][0]["critic"]["p"], 0.77);
+        assert_eq!(val["workers"][0]["critic"]["n_edits"], 1);
+    }
+
+    #[test]
+    fn unverified_never_wins_and_costs_no_verifier_run() {
+        let ws = vec![
+            outcome("a", None, 0, WorkerStatus::Unverified),
+            outcome("b", Some(0.9), 0, WorkerStatus::Failed),
+        ];
+        assert_eq!(select_winner(&ws), None);
+        assert_eq!(ws[0].verifier_runs(), 0);
+        assert_eq!(ws[1].verifier_runs(), 1);
+        assert_eq!(
+            serde_json::to_value(WorkerStatus::Unverified).unwrap(),
+            "unverified"
+        );
     }
 
     #[test]
@@ -1721,6 +2498,9 @@ mod tests {
             segments: None,
             prompt: vec![],
             json: false,
+            critic: None,
+            critic_policy: "record".into(),
+            critic_model: "jev-latest".into(),
         }
     }
 
@@ -1782,6 +2562,7 @@ mod tests {
             ],
             pulled_to: Some(PathBuf::from("/tmp/session-abc123")),
             selection_rationale: Some("only passing worker (score 1.00)".into()),
+            critic: None,
         }
     }
 
@@ -1812,6 +2593,7 @@ mod tests {
             workers: vec![],
             pulled_to: None,
             selection_rationale: None,
+            critic: None,
         };
         let val = v.to_json_value();
         assert!(val["winner"].is_null());
@@ -1902,6 +2684,7 @@ mod tests {
                 workers: vec![w],
                 pulled_to: None,
                 selection_rationale: Some("only passing worker (score 1.00)".into()),
+                critic: None,
             };
 
             record_worker_summaries(&pb, &verdict, "implement add()");

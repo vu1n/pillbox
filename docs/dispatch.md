@@ -59,6 +59,9 @@ pillbox dispatch --from-bookmark seg-3 -k 3 --rubric grade.txt \
 | `--memory` | off | Wire in kypp swarm-memory (`--memory`) for each worker (scoped briefing + post-run capture). |
 | `--ttl DURATION` | — | Per-worker retention TTL (`30m`/`24h`/`7d`), forwarded to every forked worker. Losers are left **running** (not auto-killed) so their §0 evidence stays readable; a TTL is how a dispatch campaign reaps them via `session prune` instead of leaking `k` VMs per run. See **Cleanup** below. |
 | `--json` | off | Emit the verdict as JSON on stdout instead of the human banner. |
+| `--critic KIND` | — | Score each worker's edits with a calibrated **System One critic** before the verifier runs (`typesafe` = TypeSafe `jev-latest`; needs `TYPESAFE_API_KEY`). The verifier stays the reward; the critic's probability is recorded next to it. See **Critic** below. |
+| `--critic-policy POLICY` | `record` | What the probabilities do: `record` (measure only, grading unchanged) \| `order` (grade in descending `p`, stop at the first passer) \| `select` (grade ONLY the argmax-`p` worker). Requires `--critic`; `order`/`select` are fork-`k` only. |
+| `--critic-model MODEL` | `jev-latest` | The critic's model id. |
 | `-- <PROMPT>…` | — | The task prompt handed to every worker (trailing args). **Required** in fork-`k` mode; **optional** in `--segments` mode (the segments carry the work — given, it's context prepended to segment 1). |
 
 The grader is a required, mutually-exclusive group: exactly one of `--cmd` /
@@ -156,13 +159,17 @@ pillbox's `--json` surface.
                                  // produced a gradeable result (status "errored")
         "passed": true,          // did the grade pass (--cmd exit 0, or all rubric criteria)
         "retries_used": 0,       // retries this worker consumed (sum across segments in --segments mode)
-        "status": "scored",      // "scored" | "failed" | "errored" (see below)
+        "status": "scored",      // "scored" | "failed" | "errored" | "unverified" (see below)
         // ADDITIVE — present ONLY for a --segments worker; omitted in fork-k mode.
         // The per-checkpoint trajectory, in order; `score` is the gate score.
         "segments": [
           { "name": "reroot",   "passed": true, "score": 1.0, "retries_used": 0 },
           { "name": "pathfind", "passed": true, "score": 1.0, "retries_used": 1 }
-        ]
+        ],
+        // ADDITIVE — present ONLY when --critic scored this worker (see Critic).
+        "critic": { "critic": "typesafe", "model": "jev-latest", "p": 0.91,
+                    "latency_ms": 180, "cost_usd": 0.00004, "input_tokens": 950,
+                    "truncated": false, "n_edits": 2 }
       },
       { "session": "def456...", "score": 0.5, "passed": false, "retries_used": 1, "status": "failed" },
       { "session": "ghi789...", "score": null, "passed": false, "retries_used": 0, "status": "errored" }
@@ -173,7 +180,10 @@ pillbox's `--json` surface.
     "pulled_to": "/tmp/pillbox-dispatch-019eef4f.../winner-abc123def456",
     // Why the winner was selected — its score + the tie-break that decided it,
     // tied to the verifier output. Null when no worker passed.
-    "selection_rationale": "only passing worker (score 1.00)"
+    "selection_rationale": "only passing worker (score 1.00)",
+    // ADDITIVE — present ONLY when --critic was given.
+    "critic": { "kind": "typesafe", "policy": "order", "model": "jev-latest",
+                "verifier_runs": 1, "verifier_runs_saved": 2 }
   }
 }
 ```
@@ -185,6 +195,7 @@ pillbox's `--json` surface.
 | `scored` | Graded and **passed** (`--cmd` exit 0, or every `--rubric` criterion). |
 | `failed` | Ran and was graded, but didn't pass after exhausting its retries. |
 | `errored` | Never reached a gradeable result (boot / drive / score error); `score` is `null`. |
+| `unverified` | Reached idle but was **never graded** — a `--critic-policy order` run found a passer earlier in critic order, or `select` picked another worker. `score` is `null`; `critic.p` is the only signal about it. Never a pass, never a winner. |
 
 A worker that fails to fork, or whose turn doesn't go idle within the per-turn
 timeout, becomes `errored` — one stuck/broken worker never sinks the batch (the
@@ -223,7 +234,8 @@ The body schema:
   "grader": "rubric:r.txt",      // absent for an errored worker
   "criteria": [ { "name": "tests", "passed": true, "feedback": "5 passed" } ],
   "feedback": "…the grader's combined output…",
-  "judge_report_ref": null       // GHOST-011 hook (below)
+  "judge_report_ref": null,      // GHOST-011 hook (below)
+  "critic": { "critic": "typesafe", "p": 0.91, … }   // only when --critic ran (see Critic)
 }
 ```
 
@@ -240,6 +252,60 @@ When the cross-vendor judge / Fusion lane lands, it attaches a `judge.report`
 artifact and points this ref at it — purely *advisory* (a Goodhart guard / a
 critique of the winner), **never** a selection input: the execution-grounded
 verifier decides the winner, a judge panel never overrides it.
+
+## Critic (`--critic`)
+
+The verifier is the reward — exact, exit-derived, unforgeable — and also the
+expensive, slow, last step. With `-k` workers most verifier runs are spent on
+losers. A **critic** is a cheap, calibrated System One judgment on a worker's
+edits *before* the verifier runs: it returns a **probability** that the verifier
+would pass, not a verdict. The verifier still decides every winner.
+
+```sh
+export TYPESAFE_API_KEY=…   # console.typesafe.ai/settings/keys
+pillbox dispatch --from-bookmark seg-3 -k 4 --rubric grade.txt --agent opencode \
+  --critic typesafe --critic-policy order -- "Implement the parser for segment 3."
+```
+
+What the critic sees is the worker's **edits from its own §0 log** (`session log
+<id> --type tool_call`, completed `edit`/`write` calls) rendered with the task
+prompt — the same representation the offline calibration harness scores, so a
+Brier/ECE number measured offline is the number the live loop gets. Shell writes
+(`cat > f`, `sed -i`) are not recovered; that blind spot is the extractor's, and
+it is stated rather than papered over. One `noul` question, phrased in
+TypeSafe's own idiom; the probability comes back natively (no verbalized
+confidence). The only critic today is `typesafe` (`jev-latest`); the seam is a
+trait (`commands/critic.rs`).
+
+Three policies:
+
+| policy | what happens | what it's for |
+|---|---|---|
+| `record` (default) | Every worker is scored right before **each** of its grades; grading is unchanged. | Measurement. Every dispatch becomes a labeled `(p, passed)` pair — the harness grades its own critic for free. Composes with `--segments` (the critic judges the finished chain before the reward). |
+| `order` | All forks are settled to idle first, then graded in **descending `p`**; the loop stops at the first passer. The rest are `unverified`. A worker that fails its first grade still gets its `--retries` before the loop moves on. | Saving verifier runs when the critic ranks well. `verifier_runs_saved` in the verdict is the count. |
+| `select` | Settle all, score all, grade **only the argmax-`p`** worker. If it fails after retries, there is no winner (exit 1). | The "critic instead of verifier" claim, ground-truthed on the one worker it picked. The honest cost of trusting the critic is visible in the exit code. |
+
+A critic failure (HTTP error, unreadable log) never sinks a worker: it is logged
+to stderr and that worker simply carries no `critic` block (and ranks last under
+`order`/`select`). A missing `TYPESAFE_API_KEY` is a usage error (exit 2) before
+any VM boots. `order`/`select` with `--segments` is a usage error — a chain
+grades once at the end, so there is nothing to reorder; use `record`.
+
+Evidence: alongside the `dispatch.worker_summary` artifact (which now carries
+`critic`), each scored worker gets a **`dispatch.critic_verdict` artifact of
+class `signal`** — `p`, pass/fail, score, retries, policy; no prompt, no code —
+so critic calibration can pool across runs without egressing content:
+
+```sh
+pillbox session log <worker-id> --type artifact | grep critic_verdict
+pillbox session artifact get <worker-id> --ref <blobRef>
+# { "session": "…", "critic": { "critic": "typesafe", "p": 0.91, … },
+#   "policy": "order", "status": "scored", "verified": true, "passed": true,
+#   "score": 1.0, "retries_used": 0 }
+```
+
+Without `--critic`, nothing above exists: the verdict, banner, and artifacts are
+byte-identical to before.
 
 ## Exit codes
 

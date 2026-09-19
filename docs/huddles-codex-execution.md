@@ -48,6 +48,23 @@ it has no host command or production dispatch yet. The Cloudflare adapter is
 pure and injected-client based so its lifecycle contract is testable without
 changing Huddles orchestration or the deployment image.
 
+### ACP v1 session primitives
+
+ACP v1 stabilised more than the two calls the spike drives. Each primitive has
+a fixed stance here so nobody "helpfully" adopts one and moves orchestration
+across the boundary:
+
+| ACP primitive                        | Stance in this boundary                                                                                                                                                                                               |
+| ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `initialize`, `session/new`          | Used. One session per invocation; `session/new` receives only the policy-derived `mcpServers: []`.                                                                                                                    |
+| `session/prompt`, `session/update`   | Used. The prompt is exactly the sealed `rendered_input`; update notifications are normalised into §0 events and never re-exposed as ACP.                                                                             |
+| `session/cancel`                     | Used as Huddles' cancellation intent. The invocation is `cancelled` only when the turn reports it.                                                                                                                    |
+| `session/request_permission`         | Not answered by the adapter. Under `deny_all` no tool is advertised, so none arises. A future permission request maps to a typed Huddles `requires` entry (reserved as `input_required` in the lifecycle mapping below), never to an adapter auto-accept. |
+| `session/fork`                       | Never. A Huddles fork is a compile-pipeline fork that seals a new packet and invocation; a copied ACP session would carry mutable context past the seal.                                                              |
+| `session/load` (resume)              | Never. Continuation is Huddles orchestration: a new invocation whose packet names its lineage. The runtime never resumes a terminal invocation.                                                                        |
+| `session/list`, `session/close`      | Not used as signals. Cleanup and respawn are adapter-internal and only ever prepare a later invocation.                                                                                                               |
+| Elicitation, MCP-over-ACP            | Not used. Huddles owns every human-facing question and the tool policy; the adapter neither forwards a question to a person nor mounts an MCP server the packet did not seal.                                          |
+
 ## Versioned boundary
 
 Pillbox exposes the private `pillbox.execution/2` contract in
@@ -112,6 +129,28 @@ sequencing/cancellation, and returning terminal evidence. This envelope carries
 no credential field; any future credential capability must be specified and
 scoped before the runtime adapter resolves one. Unknown or unenforceable policy
 revisions must fail before Codex starts.
+
+### Lifecycle mapping
+
+The result `status` union is deliberately shape-compatible with the MCP tasks
+lifecycle (SEP-2663) so a tasks-backed runtime can sit behind the same Huddles
+adapter with no wire change. Huddles fixes the mapping in
+`docs/hcp/COMPILATION.md` §9.1 and pins the status set with a contract test;
+Pillbox conforms to it rather than the reverse:
+
+```text
+running      -> working         retry_after_ms is the poll interval
+completed    -> completed
+failed       -> failed
+interrupted  -> failed          runtime lost; retry is a Huddles decision
+cancelled    -> cancelled       only after cancel intent was received
+conflict     -> (none)          idempotency conflict, the packet never ran
+input_required  reserved        not emitted until Huddles specifies the typed request
+```
+
+Cancellation is intent, not a state transition: `cancel` is idempotent and is
+answered with a status result. Terminal results are final; a later turn on the
+same session is a new invocation.
 
 ## Remaining runtime gates
 

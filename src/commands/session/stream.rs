@@ -686,16 +686,91 @@ mod tests {
     fn guard_rejects_missing_or_changed_detached_producer() {
         let dir = tempfile::tempdir().unwrap();
         assert!(super::check_detached_producer(dir.path(), None).is_err());
-        let pid = std::process::id() as i32;
+
+        // The detached producer owns this flock in a separate process. Holding
+        // it in the test harness makes the drop assertion timing-dependent:
+        // a concurrent fork can inherit the harness's open descriptor and keep
+        // the kernel lock alive past `drop` on macOS.
+        const CHILD_ENV: &str = "PILLBOX_TEST_DETACHED_PRODUCER_LOCK_CHILD";
+        const READY: &str = "__pillbox_detached_lock_ready__";
+        const RELEASED: &str = "__pillbox_detached_lock_released__";
+        let child_dir = std::env::var_os(CHILD_ENV);
+        if let Some(child_dir) = child_dir {
+            let held = crate::commands::session::DetachedProducerLock::try_acquire(
+                std::path::Path::new(&child_dir),
+            )
+            .unwrap();
+            println!("{READY}");
+            let mut stdout = std::io::stdout();
+            std::io::Write::flush(&mut stdout).unwrap();
+
+            let mut command = String::new();
+            std::io::stdin().read_line(&mut command).unwrap();
+            assert_eq!(command.trim(), "release");
+            drop(held);
+            println!("{RELEASED}");
+            std::io::Write::flush(&mut stdout).unwrap();
+
+            command.clear();
+            std::io::stdin().read_line(&mut command).unwrap();
+            assert_eq!(command.trim(), "exit");
+            return;
+        }
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::session::stream::tests::guard_rejects_missing_or_changed_detached_producer",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, dir.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut child_stdin = child.stdin.take().unwrap();
+        let mut child_stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        let mut ready = false;
+        for _ in 0..16 {
+            line.clear();
+            if std::io::BufRead::read_line(&mut child_stdout, &mut line).unwrap() == 0 {
+                break;
+            }
+            if line.contains(READY) {
+                ready = true;
+                break;
+            }
+        }
+        assert!(ready, "detached producer child did not signal readiness");
+
+        let pid = child.id() as i32;
         let pid_file = dir.path().join(crate::commands::session::TAILER_PID_FILE);
         std::fs::write(&pid_file, pid.to_string()).unwrap();
-        let held = crate::commands::session::DetachedProducerLock::try_acquire(dir.path()).unwrap();
         super::check_detached_producer(dir.path(), Some(pid)).unwrap();
-        drop(held);
+
+        std::io::Write::write_all(&mut child_stdin, b"release\n").unwrap();
+        std::io::Write::flush(&mut child_stdin).unwrap();
+        let mut released = false;
+        for _ in 0..16 {
+            line.clear();
+            if std::io::BufRead::read_line(&mut child_stdout, &mut line).unwrap() == 0 {
+                break;
+            }
+            if line.contains(RELEASED) {
+                released = true;
+                break;
+            }
+        }
+        assert!(released, "detached producer child did not release its lock");
         assert!(super::check_detached_producer(dir.path(), Some(pid))
             .unwrap_err()
             .to_string()
             .contains("ownership lock"));
+
+        std::io::Write::write_all(&mut child_stdin, b"exit\n").unwrap();
+        drop(child_stdin);
+        assert!(child.wait().unwrap().success());
         std::fs::remove_file(pid_file).unwrap();
         assert!(super::check_detached_producer(dir.path(), Some(pid)).is_err());
     }

@@ -171,3 +171,4 @@ ghost-extraction-trigger conforms: Removing the unused test-only drive_segments 
 managed-tier-do-gateway conforms: Temporary R2 credentials may share the parent access-key ID but require a nonempty fresh secret and session token; the parent secret fails closed and prefix scoping is unchanged.
 managed-store-of-record conforms: Only transfer credential validation changes; rustic-over-R2 remains authoritative and no new storage or fork mechanism is introduced.
 docs-governance conforms: The managed-tier guide records the temporary response shape and fresh-secret boundary alongside the recovered implementation.
+session-event-log-spine conforms: The detached-producer guard test uses a synchronized child to isolate flock ownership from concurrent test forks; runtime ownership checks, event sequencing, and producer lifecycle are unchanged.

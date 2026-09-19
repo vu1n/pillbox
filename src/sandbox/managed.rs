@@ -1122,9 +1122,11 @@ mod r2_scope {
     }
 
     /// Parse the CF envelope into a scoped [`S3Config`]: the same coordinates as
-    /// `parent` (endpoint/region/bucket/prefix) with the temp key + its session
-    /// token swapped in. Fail-closed — a non-`success` envelope or any missing /
-    /// empty credential field is an error, never a partial credential.
+    /// `parent` (endpoint/region/bucket/prefix) with the temporary credential
+    /// fields and session token swapped in. Cloudflare may reuse the access-key
+    /// ID; validation below enforces the fresh secret boundary. Fail-closed — a
+    /// non-`success` envelope or any missing / empty credential field is an error,
+    /// never a partial credential.
     fn parse_scoped(body: &str, parent: &S3Config) -> Result<S3Config> {
         let env: TempCredEnvelope =
             serde_json::from_str(body).context("parse R2 temp-credential response")?;
@@ -1167,11 +1169,12 @@ mod r2_scope {
             .session_token
             .as_deref()
             .is_some_and(|token| !token.trim().is_empty());
-        let fresh_key = scoped.access_key != parent.access_key
-            && scoped.secret_key != parent.secret_key
-            && !scoped.access_key.trim().is_empty()
-            && !scoped.secret_key.trim().is_empty();
-        if !has_session_token || !fresh_key {
+        // Cloudflare may reuse the parent access-key ID for a temporary
+        // credential. The secret must never fall back to the bucket-wide parent.
+        let has_access_key_id = !scoped.access_key.trim().is_empty();
+        let fresh_secret =
+            !scoped.secret_key.trim().is_empty() && scoped.secret_key != parent.secret_key;
+        if !has_session_token || !has_access_key_id || !fresh_secret {
             return Err(PillboxError::runtime(
                 "run",
                 "R2 temp-credential mint did not return a fresh scoped credential",
@@ -1308,7 +1311,7 @@ mod r2_scope {
                     assert_eq!(account_id, "abc123");
                     assert_eq!(prefix, "proj/");
                     Ok(S3Config {
-                        access_key: "TMP_AK".into(),
+                        access_key: received_parent.access_key.clone(),
                         secret_key: "TMP_SK".into(),
                         session_token: Some("TMP_ST".into()),
                         ..received_parent.clone()
@@ -1317,10 +1320,9 @@ mod r2_scope {
             )
             .expect("fresh scoped credential accepted");
 
-            assert_eq!(scoped.access_key, "TMP_AK");
+            assert_eq!(scoped.access_key, original.access_key);
             assert_eq!(scoped.secret_key, "TMP_SK");
             assert_eq!(scoped.session_token.as_deref(), Some("TMP_ST"));
-            assert_ne!(scoped.access_key, original.access_key);
             assert_ne!(scoped.secret_key, original.secret_key);
         }
 
@@ -1335,6 +1337,16 @@ mod r2_scope {
 
             let err = scope_for_transfer_with(&original, "mint-authority", |parent, _, _, _| {
                 Ok(S3Config {
+                    access_key: "FORGED_AK".into(),
+                    session_token: Some("FORGED_ST".into()),
+                    ..parent.clone()
+                })
+            })
+            .expect_err("changed ID and token must not disguise the parent secret");
+            assert!(err.to_string().contains("fresh scoped credential"));
+
+            let err = scope_for_transfer_with(&original, "mint-authority", |parent, _, _, _| {
+                Ok(S3Config {
                     access_key: "TMP_AK".into(),
                     secret_key: "TMP_SK".into(),
                     session_token: Some("  ".into()),
@@ -1343,6 +1355,30 @@ mod r2_scope {
             })
             .expect_err("blank session token must fail closed");
             assert!(err.to_string().contains("fresh scoped credential"));
+        }
+
+        #[test]
+        fn parse_scoped_rejects_each_missing_or_blank_credential_field() {
+            for field in ["accessKeyId", "secretAccessKey", "sessionToken"] {
+                for value in [None, Some("  ")] {
+                    let mut result = serde_json::json!({
+                        "accessKeyId": "PARENT_AK",
+                        "secretAccessKey": "TMP_SK",
+                        "sessionToken": "TMP_ST"
+                    });
+                    match value {
+                        Some(value) => result[field] = value.into(),
+                        None => {
+                            result.as_object_mut().unwrap().remove(field);
+                        }
+                    }
+                    let response = serde_json::json!({"success": true, "result": result});
+                    assert!(
+                        parse_scoped(&response.to_string(), &parent()).is_err(),
+                        "{field}: {value:?}"
+                    );
+                }
+            }
         }
 
         #[test]

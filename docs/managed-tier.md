@@ -34,6 +34,9 @@ namespace retirement needs a separate retention/export review.
    its workspace to its rustic-on-R2 repository, and sends scoped, short-lived
    transfer credentials with that identity and an exact provision capability to
    `POST /v2/workspaces/provision`.
+   Cloudflare's temporary-credential response may reuse the parent access-key
+   ID; the client therefore requires a nonempty fresh secret access key and
+   nonempty session token, and never accepts the bucket-wide parent secret.
 2. Before Sandbox lookup or restore, D1 atomically binds the session to an opaque
    authorization owner and reserves one reviewed invocation allowance. Exact
    provision retries never restore twice; an ambiguous `provisioning` row stays

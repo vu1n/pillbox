@@ -1158,21 +1158,6 @@ fn drive_one_inner(
     Ok(outcome_from_grade(id, grade, used, verdict))
 }
 
-/// Drive one worker through a SEGMENT CHAIN to a terminal outcome (errors → an
-/// `Errored` outcome, like [`drive_one`]).
-#[cfg(test)]
-fn drive_segments(
-    driver: &dyn WorkerDriver,
-    i: usize,
-    id: String,
-    context: &str,
-    segments: &[ResolvedSegment],
-    reward: &Grader,
-    retries: u32,
-) -> WorkerOutcome {
-    drive_segments_with(driver, i, id, context, segments, reward, retries, None)
-}
-
 #[allow(clippy::too_many_arguments)]
 fn drive_segments_with(
     driver: &dyn WorkerDriver,

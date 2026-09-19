@@ -168,3 +168,11 @@ managed-tier-do-gateway conforms: Receipt v2 adds only operator-side source-back
 docs-governance conforms: The managed-tier guide, Durable Object policy, and burn-in receipt/runbook distinguish artifact budgets from measured operator overhead and namespace retention; no production enablement or complete dollar attribution is implied.
 managed-tier-do-gateway conforms: Receipt validation bounds malformed operator evidence and brackets the vendor lifecycle baseline without changing runtime authority, persistence, or immutable cost envelopes.
 ghost-extraction-trigger conforms: Removing the unused test-only drive_segments wrapper changes no dispatch mechanism; the segment-chain executor stays in pillbox behind drive_segments_with and ghost still consumes only the CLI and §0 contracts.
+managed-tier-do-gateway conforms: Temporary R2 credentials may share the parent access-key ID but require a nonempty fresh secret and session token; the parent secret fails closed and prefix scoping is unchanged.
+managed-store-of-record conforms: Only transfer credential validation changes; rustic-over-R2 remains authoritative and no new storage or fork mechanism is introduced.
+docs-governance conforms: The managed-tier guide records the temporary response shape and fresh-secret boundary alongside the recovered implementation.
+session-event-log-spine conforms: The detached-producer guard test uses a synchronized child to isolate flock ownership from concurrent test forks; runtime ownership checks, event sequencing, and producer lifecycle are unchanged.
+dx-zero-config-local conforms: The lock-test child uses local temporary files and pipes only; no runtime dependency or privileged event-reader path is introduced.
+gateway-no-daemon conforms: The short-lived test helper models detached lock ownership and exits under its test parent; no resident runtime coordinator is added.
+optimization-external-substrate-primitives conforms: The test-only synchronization changes no reward, optimization, event, or pooling contract.
+substrate-plane-livesession conforms: The guard regression fixture remains backend-independent and changes neither LiveSession capabilities nor runtime command dispatch.

@@ -47,6 +47,20 @@ checks, and bring one passing workspace back for review.
 > not yet a hosted product or a polished end-user service. The gaps are listed
 > openly below.
 
+| You want to… | pillbox gives you |
+|---|---|
+| Run a coding agent in a hardware-isolated microVM on your machine | `pillbox run` |
+| Keep one durable, ordered, replayable record of what it did | the **§0 log**: `session log`, `session watch`, `session subscribe` |
+| Hand a live session to another terminal, person, or orchestrator | `--detach`, `session attach` / `send` / `annotate` |
+| Give the agent credentials it can use but never read | `secret add` + `--vault` (stub-swap at the network boundary) |
+| Fence the network to an explicit host list | `--egress-allow` / `--egress-deny`, or a `[preset]` in `pillbox.toml` |
+| Declare a run environment once and reuse it by name | `[preset.NAME]` + `pillbox run --preset NAME` |
+| Know whether a run is going, waiting on you, or done | `session diagnose`, `conditions[]` on every `session … --json` |
+| Fork N workers from one snapshot and keep the one that passes real checks | `pillbox dispatch` |
+| Measure a harness change under rerun variance, not one lucky run | `pillbox eval` + `session score` |
+| Snapshot, bookmark, and rehydrate workspaces | `push` / `pull` / `bookmark`, `session pull` |
+| See the whole lifecycle end to end in a few minutes | [`scripts/demo.sh`](./scripts/demo.sh) |
+
 ## One runtime contract, two placements
 
 Local Pillbox runs the agent in a libkrun microVM and keeps the session log on
@@ -119,7 +133,9 @@ pillbox run
 Pillbox also integrates Codex, opencode, and pi. See the [command
 reference](./docs/commands.md) and [local microVM
 architecture](./docs/libkrun-sandbox.md) for current prerequisites and agent
-profiles.
+profiles. To watch the whole lifecycle — boot, drive a turn, read the log,
+pull the result, grade it — run [`scripts/demo.sh`](./scripts/demo.sh); it
+prints every command the way you would type it.
 
 ### Hand a live session to another terminal or actor
 

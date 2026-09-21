@@ -176,3 +176,8 @@ dx-zero-config-local conforms: The lock-test child uses local temporary files an
 gateway-no-daemon conforms: The short-lived test helper models detached lock ownership and exits under its test parent; no resident runtime coordinator is added.
 optimization-external-substrate-primitives conforms: The test-only synchronization changes no reward, optimization, event, or pooling contract.
 substrate-plane-livesession conforms: The guard regression fixture remains backend-independent and changes neither LiveSession capabilities nor runtime command dispatch.
+dx-zero-config-local conforms: `conditions[]` is derived from the existing per-session log fold and printed by the same local `session info|diagnose|list` readers; no collector, daemon, or privileged reader is introduced, and `--preset` only folds descriptor fields under the existing run flags.
+substrate-plane-livesession conforms: The condition set is computed from `events::status::summarize` and the lifecycle sink, not from backend-specific dispatch; `LiveSession` capabilities and command routing are unchanged.
+gateway-no-daemon conforms: Conditions are a read-only projection over the log at command time; no resident process, lock holder, or seq authority is added.
+optimization-external-substrate-primitives conforms: Presets and conditions are substrate ergonomics (declared run environments, a typed status projection); no reward, selection, or optimization policy moves into pillbox.
+docs-governance conforms: AGENTS.md gains one quick-start line for `--preset`; the canonical descriptor doc (docs/config.md) and command reference carry the full contract, and the stale backend note in docs/dx.md now matches `select_backend`.

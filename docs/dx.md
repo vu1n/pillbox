@@ -1,11 +1,11 @@
 # Developer experience — the bundle is the product
 
-> **Scope.** pillbox is **local-only**: two local backends — Docker (default,
-> cross-platform) and libkrun (a local microVM, opt-in via
-> `PILLBOX_BACKEND=libkrun`, see [libkrun-sandbox.md](./libkrun-sandbox.md)).
-> This doc covers the local-first inner loops and the drive/§0 surface. "Remote"
-> returns later as a managed/Cloudflare tier with a different shape; mentions of
-> it here are forward-looking, not current.
+> **Scope.** pillbox is **local-first**: the backend is the libkrun microVM
+> (the default build; see [libkrun-sandbox.md](./libkrun-sandbox.md)) — Docker
+> is deprecated and only reachable via `PILLBOX_BACKEND=docker`. This doc covers
+> the local-first inner loops and the drive/§0 surface. "Remote" is the
+> managed/Cloudflare tier ([managed-tier.md](./managed-tier.md)), a different
+> shape; mentions of it here are forward-looking, not current.
 
 Status: design / proposed. Sibling to [vnext.md](./vnext.md).
 
@@ -123,27 +123,23 @@ authority). The user never picks; the mode follows interactive-vs-`--detach`.
 Remote — a managed/Cloudflare tier with a different shape — returns later; this
 doc's contracts are scoped to the local backends.
 
-## The profile primitive (currently 0% surface)
+## The profile primitive — shipped as `[preset]`, the store is still open
 
 vNext leans on "pillbox already has profiles" for Aquifer-parity and the
 compounding-moat story (meta-harness tunes profiles; sharing scrubbed profiles
-is the circulation play). But `rg -i profile src/{cli,config}.rs` → **0 hits**:
-no `[profile]` table, no `--profile`, no store. v0.6 even dropped the v0.5
-per-project run-defaults (`with`/`mount`/`env`), leaving "wrap it in a shell
-alias" — which keeps the recurring-injection ergonomics *out* of the bundle
-that's supposed to travel. Without a typed profile, the external optimization
-project has nothing to consume or emit, and a diffable config delta is
-impossible.
+is the circulation play). The first half now exists as **`[preset.NAME]`** in
+`pillbox.toml` + `pillbox run --preset NAME` ([config.md](./config.md#presets--a-run-environment-by-name)):
+`agent + model + temperature + mounts + secret/env NAME-refs + MCP servers +
+egress allowlist`, composable via the existing global→project cascade,
+name-references only (never plaintext secrets), and it re-fixes the v0.5
+run-defaults v0.6 dropped. (The name is `preset` because `--profile` was
+already taken by the *model* profile the orchestrator hands the harness.)
 
-Ship a concrete **versioned, frozen profile object** — `agent + runner image +
-mounts + env/secret NAME-refs + context policy + model` — with `pillbox profile
-create|edit|export|import|diff` and `pillbox run --profile NAME`. Home: a
-`[profile]` / `[run]`-defaults table in `pillbox.toml` (also re-fixes the
-dropped run-defaults) + a content-addressed, pinnable store (reuse rustic
-content-addressing), composable via the existing global→project inheritance.
-**Share the NAME manifest only, never plaintext secrets.** Stamp every session
-record with the exact profile version it ran under so `session diff` shows a
-clean config delta.
+Still open, in order of leverage: stamp every session record with the preset
+it ran under so `session diff` can show a clean config delta; let an eval
+`[[variants]]` entry reference a preset instead of re-declaring its fields; and
+the content-addressed, pinnable store with `preset export|import|diff` — a
+frozen version is what the external optimization loop consumes and emits.
 
 ## Latent wins the plan under-sells
 

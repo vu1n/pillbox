@@ -40,7 +40,7 @@ global pillbox regardless of where you are.
 | `pillbox sidecar [--bind] [--json]` | Standalone vault sidecar process. |
 | `pillbox session list [--json]` | List sessions started from this pillbox (oldest first). |
 | `pillbox session info ID [--json]` | Show one session (accepts unique id prefix ≥ 4 chars). Structured-session JSON separates the persisted `execution.requested` provider/model/profile/reasoning request from `served_model` and `effective_limits`. Reported runtime facts cite their session-log `seq`; missing facts are explicit `unavailable` values and are never filled from the request. |
-| `pillbox session diagnose ID [--json]` | Diagnose one session: derived status, failure detail, and an activity summary from the durable log — the "what happened / why is it stuck" companion to `info`. Accepts an id prefix ≥ 4 chars. |
+| `pillbox session diagnose ID [--json]` | Diagnose one session: derived status, failure detail, an activity summary from the durable log, and the **conditions table** (`Ready` / `AwaitingInput` / `Finished` / `ResultAvailable`, each True/False with a reason and a since-time) — the "what happened / why is it stuck" companion to `info`. `--json` carries the same `conditions[]` as `info`/`list` (schema below). Accepts an id prefix ≥ 4 chars. |
 | `pillbox session attach ID` | Reattach to a detached local libkrun PTY session. Detach again with Ctrl-A + D or `pillbox session detach ID` from another shell. Managed sessions have no host PTY; the deprecated Docker backend remains compatibility residue. |
 | `pillbox session detach ID` | Signal a currently-attached pillbox to detach (SIGTERM, no-op if already detached). |
 | `pillbox session send ID TEXT` | Drive a running session through `LiveSession`: raw input for a local libkrun PTY, a structured prompt for server-mode/managed agents. Pair with `session subscribe` or `watch` to read the response. Bytes are sent as-is; add a trailing newline/`\r` for a TUI agent. |
@@ -111,6 +111,7 @@ PTY-free exec channel an orchestrator drives. Docker-backed today.
 | `--ttl DURATION` | — | Per-session retention TTL — `30m` / `24h` / `7d` (`s`/`m`/`h`/`d` units only, max 365d). Writes `expires_at` to the record. `pillbox session prune` drops expired sessions. Requires `--detach`. |
 | `--label TEXT` | — | Human label for a detached session, surfaced in `pillbox session list`. Only meaningful with `--detach`. |
 | `--json` | — | Emit the started session as `{version:1, session:{id,…}}` on stdout instead of the human banner — `pillbox run --json \| jq -r .session.id`. Needs a persisted session: a `--detach` run (any agent) or a server-mode agent (`opencode`, always reparented). A foreground PTY run has nothing to emit and is rejected at dispatch. |
+| `--preset NAME` | — | Apply the descriptor's `[preset.NAME]` — mounts, secret refs, env bundles, MCP servers, the egress allowlist and model knobs declared once in `pillbox.toml`. Explicit flags still win (lists union, scalars override, booleans or). Prints one stderr line saying what the preset contributed. Not `--profile` (the model profile). See [docs/config.md](./docs/config.md#presets--a-run-environment-by-name). |
 | `--model PROVIDER/MODEL` | agent default | Requested model for a structured server agent, e.g. `openai/gpt-5.6-luna`. The provider and model are validated and persisted separately; compare them with runtime evidence in `session info --json`. |
 | `--profile PROFILE` | explicit none | Optional exact model profile selected by the caller. Pillbox transports and records it; it does not choose Sol/Terra/Luna. Rejected for PTY-only integrations. |
 | `--reasoning-effort low\|medium\|high` | harness default | Normalized requested reasoning effort. Runtime-native names remain observed evidence and do not widen this enum. Rejected for PTY-only integrations. |
@@ -385,6 +386,45 @@ future releases; the version bumps on restructure. Pin against
   "pillbox": "myapp"
 }
 ```
+
+```jsonc
+// pillbox session info ID --json   (list and diagnose carry the same session shape)
+{
+  "version": 1,
+  "session": {
+    "id": "a1b2c3d4e5f6", "backend": "libkrun", "placement": "local",
+    "agent_id": "opencode", "started_at": "2026-09-21T06:00:00Z",
+    "status": "needs-input",           // running | needs-input | done | failed (derived from the §0 log)
+    "result_snapshot": null, "expires_at": null, "attached_pid": null,
+    // Typed facts in the Kubernetes condition shape — the field an
+    // orchestrator branches on instead of parsing `status` or the prose.
+    // `AwaitingInput` is the one a send→wait-idle driver waits on;
+    // `Finished` is the one a one-shot run waits on; `ResultAvailable`
+    // says whether `session pull` has a snapshot to rehydrate.
+    "conditions": [
+      { "type": "Ready",           "status": "True",  "reason": "AwaitingInput",
+        "message": "the agent ended its turn; drive it with `pillbox session send a1b2c3d4e5f6 …`",
+        "last_transition_time": "2026-09-21T06:01:12Z" },
+      { "type": "AwaitingInput",   "status": "True",  "reason": "TurnEnded",
+        "message": "…", "last_transition_time": "2026-09-21T06:01:12Z" },
+      { "type": "Finished",        "status": "False", "reason": "InProgress",
+        "message": "no host-visible terminal outcome yet" },
+      { "type": "ResultAvailable", "status": "False", "reason": "NotPushed",
+        "message": "no result snapshot on the record yet" }
+    ],
+    "execution": { "requested": { … }, "served_model": { … } }   // structured agents only
+  }
+}
+```
+
+`status` is `"True"` or `"False"`, never `"Unknown"`: a fact the host can't see
+reads as its resting value (a detached session with no host-visible signal is
+`Ready=True/Running`), per the deriver's honesty rule. `last_transition_time` is
+the `at` of the event that produced the value and is omitted when the log has
+none. Reasons per type: `Ready` → `Running` \| `AwaitingInput` \| `Completed` \|
+`Failed`; `AwaitingInput` → `TurnEnded` \| `Busy` \| `Finished`; `Finished` →
+`Completed` \| `Failed` \| `InProgress`; `ResultAvailable` → `SnapshotPushed` \|
+`NotPushed`.
 
 ---
 

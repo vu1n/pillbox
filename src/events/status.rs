@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::contract::{
     AttentionReason, EffectiveRuntimeLimitsEvidence, Payload, Role, ServedRunProfile,
@@ -74,6 +74,10 @@ pub(crate) struct Diagnosis {
     pub(crate) assistant_turns: u64,
     pub(crate) tool_calls: u64,
     pub(crate) last_at: String,
+    /// `at` of the log event that last flipped the agent between producing
+    /// and awaiting input — the transition time behind the non-terminal
+    /// [`Condition`]s. Empty when the log carried no such event.
+    pub(crate) status_at: String,
     pub(crate) log_seq: u64,
     /// Latest model the runtime reported on a completed assistant message.
     /// This is response evidence, distinct from the model requested at launch.
@@ -112,11 +116,22 @@ fn served_profile_from_message(model: String) -> ServedRunProfileEvidence {
 pub(crate) enum Terminal {
     Done {
         exit_code: Option<i64>,
+        /// The lifecycle line's `ended_at`, when it carried one.
+        at: Option<String>,
     },
     Failed {
         reason: String,
         exit_code: Option<i64>,
+        at: Option<String>,
     },
+}
+
+impl Terminal {
+    fn at(&self) -> Option<&str> {
+        match self {
+            Terminal::Done { at, .. } | Terminal::Failed { at, .. } => at.as_deref(),
+        }
+    }
 }
 
 /// Only the fields of an `events.jsonl` line we need. Everything else is
@@ -131,6 +146,8 @@ struct LifecycleLine {
     reason: Option<String>,
     #[serde(default)]
     exit_code: Option<i64>,
+    #[serde(default)]
+    ended_at: Option<String>,
 }
 
 /// Fold the shared lifecycle sink once into the latest terminal outcome per
@@ -156,10 +173,12 @@ pub(crate) fn terminal_outcomes(pb: &Pillbox) -> Result<HashMap<String, Terminal
         let outcome = match parsed.event.as_str() {
             "session.completed" => Terminal::Done {
                 exit_code: parsed.exit_code,
+                at: parsed.ended_at,
             },
             "session.failed" => Terminal::Failed {
                 reason: parsed.reason.unwrap_or_default(),
                 exit_code: parsed.exit_code,
+                at: parsed.ended_at,
             },
             _ => continue,
         };
@@ -185,6 +204,7 @@ pub(crate) fn summarize(
     // `MessageStart` always precedes the `Delta`/`End` of its turn, so it alone
     // covers "the agent is producing again" — Delta/End add nothing.
     let mut pending_input = false;
+    let mut status_at = String::new();
     let mut assistant_turns = 0;
     let mut tool_calls = 0;
     let mut last_at = String::new();
@@ -196,12 +216,20 @@ pub(crate) fn summarize(
         if !ev.at.is_empty() {
             last_at = ev.at;
         }
+        // Record the transition time only when the resting state actually
+        // flips, so a burst of deltas doesn't keep bumping "since when".
+        let mut set_pending = |next: bool, status_at: &mut String| {
+            if pending_input != next {
+                pending_input = next;
+                *status_at = last_at.clone();
+            }
+        };
         match ev.payload {
             Payload::AttentionRequired(a) if a.reason == AttentionReason::NeedsInput => {
-                pending_input = true;
+                set_pending(true, &mut status_at);
             }
             Payload::MessageStart(m) => {
-                pending_input = false;
+                set_pending(false, &mut status_at);
                 if m.role == Role::Assistant {
                     assistant_turns += 1;
                 }
@@ -209,10 +237,10 @@ pub(crate) fn summarize(
             // A tool call lands twice (Running, then its correlated result);
             // count the Running side so the number is invocations, not events.
             Payload::ToolCall(t) if t.status == ToolStatus::Running => {
-                pending_input = false;
+                set_pending(false, &mut status_at);
                 tool_calls += 1;
             }
-            Payload::Thinking(_) => pending_input = false,
+            Payload::Thinking(_) => set_pending(false, &mut status_at),
             Payload::MessageEnd(m) if !m.model.is_empty() => {
                 served_model = Some(SourcedEvidence {
                     evidence: served_profile_from_message(m.model),
@@ -252,10 +280,192 @@ pub(crate) fn summarize(
         assistant_turns,
         tool_calls,
         last_at,
+        status_at,
         log_seq,
         served_model,
         effective_limits,
     })
+}
+
+/// One named, typed fact about a session, in the Kubernetes condition shape
+/// (`type` / `status` / `reason` / `message` / `lastTransitionTime`): the one
+/// stable field an orchestrator branches on instead of parsing the status label
+/// or the human readout. Emitted on `session info|diagnose|list --json` as
+/// `conditions[]`.
+///
+/// The set is small on purpose and each answers one question:
+///
+/// | type | True when | the one to wait on for… |
+/// |---|---|---|
+/// | `Ready` | the session is live and driveable (not terminal) | — |
+/// | `AwaitingInput` | the agent ended its turn and is waiting to be driven | a `send` → `wait-idle` loop |
+/// | `Finished` | a host-visible terminal outcome exists | a one-shot run |
+/// | `ResultAvailable` | a result snapshot is recorded on the session | `session pull` |
+///
+/// `status` is `"True"` / `"False"` (never `"Unknown"`: the deriver's honesty
+/// rule is that a host-invisible fact reads as its resting value, see the
+/// module doc). `last_transition_time` is the `at` of the event that produced
+/// the current value when the log carries one, else absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct Condition {
+    pub(crate) r#type: &'static str,
+    pub(crate) status: &'static str,
+    pub(crate) reason: &'static str,
+    pub(crate) message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) last_transition_time: Option<String>,
+}
+
+impl Condition {
+    fn new(
+        r#type: &'static str,
+        truth: bool,
+        reason: &'static str,
+        message: impl Into<String>,
+        at: Option<&str>,
+    ) -> Self {
+        Condition {
+            r#type,
+            status: if truth { "True" } else { "False" },
+            reason,
+            message: message.into(),
+            last_transition_time: at.filter(|a| !a.is_empty()).map(str::to_string),
+        }
+    }
+}
+
+/// Derive the [`Condition`] set from a [`summarize`] fold — the same fold `list`,
+/// `info` and `diagnose` already run, so the conditions can never disagree with
+/// the status label.
+pub(crate) fn conditions(
+    session: &Session,
+    d: &Diagnosis,
+    terminal: Option<&Terminal>,
+) -> Vec<Condition> {
+    let terminal_at = terminal.and_then(Terminal::at);
+    // Non-terminal transitions come from the per-session log; a session with
+    // no log yet has only its launch time.
+    let live_at = if d.status_at.is_empty() {
+        session.started_at.as_str()
+    } else {
+        d.status_at.as_str()
+    };
+    let exit_suffix = |code: Option<i64>| code.map(|c| format!(" (exit {c})")).unwrap_or_default();
+    let drive_hint = format!(
+        "the agent ended its turn; drive it with `pillbox session send {} …`",
+        session.id
+    );
+
+    let (ready, awaiting, finished) = match d.status {
+        SessionStatus::Running => (
+            Condition::new(
+                "Ready",
+                true,
+                "Running",
+                "the agent is producing output or running tools",
+                Some(live_at),
+            ),
+            Condition::new(
+                "AwaitingInput",
+                false,
+                "Busy",
+                "the agent is mid-turn",
+                Some(live_at),
+            ),
+            Condition::new(
+                "Finished",
+                false,
+                "InProgress",
+                "no host-visible terminal outcome yet",
+                None,
+            ),
+        ),
+        SessionStatus::NeedsInput => (
+            Condition::new(
+                "Ready",
+                true,
+                "AwaitingInput",
+                drive_hint.clone(),
+                Some(live_at),
+            ),
+            Condition::new(
+                "AwaitingInput",
+                true,
+                "TurnEnded",
+                drive_hint.clone(),
+                Some(live_at),
+            ),
+            Condition::new(
+                "Finished",
+                false,
+                "InProgress",
+                "no host-visible terminal outcome yet",
+                None,
+            ),
+        ),
+        SessionStatus::Done => {
+            let (message, at) = match terminal {
+                Some(Terminal::Done { exit_code, at }) => (
+                    format!("completed{}", exit_suffix(*exit_code)),
+                    at.as_deref(),
+                ),
+                // `Done` without a lifecycle line: the result snapshot alone
+                // proved completion (see `summarize`'s precedence).
+                _ => ("completed (result snapshot recorded)".to_string(), None),
+            };
+            (
+                Condition::new("Ready", false, "Completed", message.clone(), at),
+                Condition::new("AwaitingInput", false, "Finished", message.clone(), at),
+                Condition::new("Finished", true, "Completed", message, at),
+            )
+        }
+        SessionStatus::Failed => {
+            let (message, at) = match terminal {
+                Some(Terminal::Failed {
+                    reason,
+                    exit_code,
+                    at,
+                }) => (
+                    format!(
+                        "{}{}",
+                        if reason.is_empty() {
+                            "failed"
+                        } else {
+                            reason.as_str()
+                        },
+                        exit_suffix(*exit_code)
+                    ),
+                    at.as_deref(),
+                ),
+                _ => ("failed".to_string(), None),
+            };
+            (
+                Condition::new("Ready", false, "Failed", message.clone(), at),
+                Condition::new("AwaitingInput", false, "Finished", message.clone(), at),
+                Condition::new("Finished", true, "Failed", message, at),
+            )
+        }
+    };
+    let result = match &session.result_snapshot {
+        Some(handle) => Condition::new(
+            "ResultAvailable",
+            true,
+            "SnapshotPushed",
+            format!(
+                "result snapshot {handle}; rehydrate with `pillbox session pull {}`",
+                session.id
+            ),
+            terminal_at,
+        ),
+        None => Condition::new(
+            "ResultAvailable",
+            false,
+            "NotPushed",
+            "no result snapshot on the record yet",
+            None,
+        ),
+    };
+    vec![ready, awaiting, finished, result]
 }
 
 /// Status-only view for `list`/`info` — [`summarize`] then the status.
@@ -321,8 +531,12 @@ mod tests {
             let failed = Terminal::Failed {
                 reason: "boom".into(),
                 exit_code: Some(1),
+                at: None,
             };
-            let done = Terminal::Done { exit_code: Some(0) };
+            let done = Terminal::Done {
+                exit_code: Some(0),
+                at: None,
+            };
             assert_eq!(
                 derive(&pb, &s, Some(&failed)).unwrap(),
                 SessionStatus::Failed
@@ -358,6 +572,92 @@ mod tests {
             log.append(&[Event::session(&s.id, msg(Role::User))])
                 .unwrap();
             assert_eq!(derive(&pb, &s, None).unwrap(), SessionStatus::Running);
+        });
+    }
+
+    #[test]
+    fn conditions_follow_the_status_fold() {
+        with_isolated_home("status-conditions", || {
+            let pb = crate::pillbox::global();
+            let mut s = sess("ffff11112222");
+            s.started_at = "2026-01-01T00:00:00Z".into();
+            let by_type =
+                |c: &[Condition], t: &str| c.iter().find(|c| c.r#type == t).cloned().expect(t);
+
+            // Fresh record, no log: live, not awaiting, not finished, no result —
+            // and the only transition time the host knows is the launch.
+            let d = summarize(&pb, &s, None).unwrap();
+            let c = conditions(&s, &d, None);
+            assert_eq!(c.len(), 4);
+            let ready = by_type(&c, "Ready");
+            assert_eq!((ready.status, ready.reason), ("True", "Running"));
+            assert_eq!(
+                ready.last_transition_time.as_deref(),
+                Some("2026-01-01T00:00:00Z")
+            );
+            assert_eq!(by_type(&c, "AwaitingInput").status, "False");
+            assert_eq!(by_type(&c, "Finished").status, "False");
+            assert_eq!(by_type(&c, "ResultAvailable").reason, "NotPushed");
+
+            // A turn ends awaiting input: AwaitingInput flips True, stamped with
+            // the attention event's `at`, and the message carries the drive verb.
+            let mut log = SessionLog::open(&pb, &s.id).unwrap();
+            log.append(&[
+                Event::session(&s.id, msg(Role::Assistant)),
+                Event::session(&s.id, needs_input()),
+            ])
+            .unwrap();
+            let d = summarize(&pb, &s, None).unwrap();
+            assert!(!d.status_at.is_empty(), "the flip records its event time");
+            let c = conditions(&s, &d, None);
+            let awaiting = by_type(&c, "AwaitingInput");
+            assert_eq!((awaiting.status, awaiting.reason), ("True", "TurnEnded"));
+            assert_eq!(
+                awaiting.last_transition_time.as_deref(),
+                Some(d.status_at.as_str())
+            );
+            assert!(awaiting
+                .message
+                .contains("pillbox session send ffff11112222"));
+            assert_eq!(by_type(&c, "Ready").reason, "AwaitingInput");
+
+            // A host-visible failure: Ready False, Finished True/Failed with the
+            // reason + exit code, stamped with the lifecycle line's ended_at.
+            let failed = Terminal::Failed {
+                reason: "boom".into(),
+                exit_code: Some(3),
+                at: Some("2026-01-01T00:01:00Z".into()),
+            };
+            let d = summarize(&pb, &s, Some(&failed)).unwrap();
+            let c = conditions(&s, &d, Some(&failed));
+            let finished = by_type(&c, "Finished");
+            assert_eq!((finished.status, finished.reason), ("True", "Failed"));
+            assert_eq!(finished.message, "boom (exit 3)");
+            assert_eq!(
+                finished.last_transition_time.as_deref(),
+                Some("2026-01-01T00:01:00Z")
+            );
+            assert_eq!(by_type(&c, "Ready").status, "False");
+            assert_eq!(by_type(&c, "AwaitingInput").status, "False");
+
+            // A pushed result: ResultAvailable True with the handle and pull verb.
+            s.result_snapshot = Some("abc123".into());
+            let d = summarize(&pb, &s, None).unwrap();
+            let c = conditions(&s, &d, None);
+            let result = by_type(&c, "ResultAvailable");
+            assert_eq!((result.status, result.reason), ("True", "SnapshotPushed"));
+            assert!(result.message.contains("abc123") && result.message.contains("session pull"));
+            // …and the snapshot alone proves completion (no lifecycle line).
+            assert_eq!(
+                by_type(&c, "Finished").message,
+                "completed (result snapshot recorded)"
+            );
+
+            // The JSON shape is the Kubernetes one; an absent time is omitted.
+            let v = serde_json::to_value(by_type(&c, "Finished")).unwrap();
+            assert_eq!(v["type"], "Finished");
+            assert_eq!(v["status"], "True");
+            assert!(v.get("last_transition_time").is_none());
         });
     }
 
@@ -494,19 +794,26 @@ mod tests {
                 &path,
                 concat!(
                     "{\"event\":\"session.started\",\"session_id\":\"s1\"}\n",
-                    "{\"event\":\"session.completed\",\"session_id\":\"s1\",\"exit_code\":0}\n",
+                    "{\"event\":\"session.completed\",\"session_id\":\"s1\",\"exit_code\":0,\"ended_at\":\"2026-01-01T00:00:09Z\"}\n",
                     "{\"event\":\"session.failed\",\"session_id\":\"s2\",\"reason\":\"nope\",\"exit_code\":2}\n",
                     "this is not json\n",
                 ),
             )
             .unwrap();
             let map = terminal_outcomes(&pb).unwrap();
-            assert_eq!(map.get("s1"), Some(&Terminal::Done { exit_code: Some(0) }));
+            assert_eq!(
+                map.get("s1"),
+                Some(&Terminal::Done {
+                    exit_code: Some(0),
+                    at: Some("2026-01-01T00:00:09Z".into()),
+                })
+            );
             assert_eq!(
                 map.get("s2"),
                 Some(&Terminal::Failed {
                     reason: "nope".into(),
-                    exit_code: Some(2)
+                    exit_code: Some(2),
+                    at: None,
                 })
             );
             assert!(!map.contains_key("s3"));

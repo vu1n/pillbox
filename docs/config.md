@@ -31,6 +31,14 @@ backend = "local"         # or "s3"
 # prefix = "pillbox/"
 # access_key_env = "R2_ACCESS_KEY"   # env var NAME, not the secret value
 # secret_key_env = "R2_SECRET_KEY"
+
+# Named run environments — `pillbox run --preset dev`. See "Presets" below.
+[preset.dev]
+with = ["ANTHROPIC_API_KEY"]                      # secret NAMES, never values
+mcp = ["code-search=http://localhost:8123"]
+egress_allow = ["api.anthropic.com", "crates.io", "static.crates.io"]
+egress_deny = true
+vault = true
 ```
 
 Unknown top-level fields are rejected with exit 3. The `[workspace]`
@@ -51,6 +59,7 @@ typos *inside* `[workspace]` are silently ignored at parse time.
 | `[workspace].prefix` | string | S3-only. Object key prefix inside the bucket. |
 | `[workspace].access_key_env` | string | S3-only. Env var NAME (not value) that holds the access key. |
 | `[workspace].secret_key_env` | string | S3-only. Env var NAME (not value) that holds the secret key. |
+| `[preset.NAME].*` | table | A named run environment selected with `pillbox run --preset NAME`. Fields below. |
 
 The S3 credentials are referenced by env-var **name**, not by value, so
 `pillbox.toml` stays safe to check into git. Set the env vars in your
@@ -153,18 +162,61 @@ pillbox --pillbox -Users-vuln-work-myapp info   # by path key
 
 `--pillbox` is global — works on every per-pillbox command.
 
-## What's NOT in pillbox.toml (v0.6 PR 2)
+## Presets — a run environment by name
 
-v0.5 had multi-value defaults (`with`, `mount`, `env_file`, `env`) for
-the `run` flags. v0.6 drops them — they sprawled the descriptor and
-hid behavior. CLI flags are the single source of truth for those.
-Re-add by alias if you need:
+A `[preset.NAME]` table is the set of `pillbox run` flags a project keeps
+re-typing, declared once and selected by name:
 
 ```sh
-# Old v0.5: pillbox.toml had `with = ["ANTHROPIC_API_KEY"]`
-# New v0.6: pass at the command line, or wrap in a shell alias.
-alias pbrun='pillbox run --with ANTHROPIC_API_KEY'
+pillbox run --preset dev
+pillbox run --preset dev --with GH_TOKEN --egress-allow github.com   # extend it
 ```
+
+The environment then lives in a file that is reviewed and diffed, not in
+shell history — which matters most for `egress_allow`, the one list you do
+not want widened by whoever is in a hurry. (This is the descriptor-side
+version of a Workspace + Gateway resource: authored once, bound by
+reference. It is **not** `--profile`, which is the *model* profile handed to
+the harness.)
+
+| Field | Same as | Merge with an explicit flag |
+|---|---|---|
+| `agent` | `--agent` | flag wins |
+| `model` | `--model` | flag wins |
+| `temperature` | `--temperature` | flag wins |
+| `vault` | `--vault` | or-ed (a flag can turn it on, not off) |
+| `memory` | `--memory` | or-ed |
+| `egress_deny` | `--egress-deny` | or-ed |
+| `mount` | `--mount HOST:GUEST` | preset entries first, then the flag's |
+| `with` | `--with NAME[=ENV_VAR]` | preset first, then flags |
+| `env` | `--env BUNDLE` | preset first, then flags |
+| `env_file` | `--env-file PATH` | preset first, then flags; a relative path resolves against the directory of the descriptor that declared it |
+| `mcp` | `--mcp NAME=URL` | preset first, then flags |
+| `mcp_token` | `--mcp-token NAME=SECRET_NAME` | preset first, then flags |
+| `egress_allow` | `--egress-allow HOST` | preset first, then flags |
+
+Rules:
+
+- Every value is a **name** or a non-secret setting. `with` names a secret in
+  the store; a preset never holds a value, so it is safe to commit.
+- A preset is strict: an unknown field (`mounts = …`) fails at load with exit 3,
+  before any VM boots. `--preset NAME` for a name that isn't declared also
+  fails with exit 3 and lists the presets that are.
+- Presets **cascade by name**: a `[preset.dev]` in the project descriptor
+  replaces a global `[preset.dev]` whole (no field-wise merge — a preset is one
+  reviewable unit); global presets the project does not redeclare stay
+  selectable.
+- The applied preset prints one stderr line before the run
+  (`pillbox: preset \`dev\`: 1 secret(s), vault, egress default-deny [...]`) so
+  a mis-targeted run is visible before the agent reaches the wrong endpoint.
+- Precedence overall: `CLI flag > --preset > project pillbox.toml >
+  ~/.pillbox/global/pillbox.toml > built-in default`.
+
+Presets replace the v0.5 top-level run defaults (`with = [...]`, `mount`,
+`env`, `env_file`) that v0.6 dropped for sprawling the descriptor. Those
+top-level keys are still rejected; the same lists now live under a **name**,
+which is what keeps them from hiding behavior — a bare `pillbox run` applies no
+preset.
 
 ## Anti-patterns
 

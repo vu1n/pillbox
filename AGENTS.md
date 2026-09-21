@@ -73,6 +73,7 @@ pillbox new --name myapp                    # writes pillbox.toml + state
 # Use it
 pillbox secret add ANTHROPIC_API_KEY        # paste, then Ctrl-D
 pillbox run                                 # mounts cwd at /workspace/myapp
+pillbox run --preset dev                    # …with a [preset.dev] from pillbox.toml (docs/config.md)
 ```
 
 Stop reading if that's all you need.

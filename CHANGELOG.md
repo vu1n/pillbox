@@ -10,6 +10,25 @@ transport (in-sandbox pty-host + frame protocol; local detach/reattach).
 
 ## Unreleased — managed foreground path + public launch surface
 
+- Added `[preset.NAME]` to `pillbox.toml` and `pillbox run --preset NAME`: a
+  named, reusable run environment (agent, model, temperature, mounts, secret
+  and env-bundle names, MCP servers, the egress allowlist and default-deny)
+  declared once in the descriptor and cascading global→project by name.
+  Explicit flags still win (lists union, scalars override, booleans or); the
+  applied preset prints one stderr line. Re-fixes the v0.5 run-defaults v0.6
+  dropped, now under a name rather than at the top level.
+- Added `conditions[]` to `session list|info|diagnose --json` and a conditions
+  table to the human `diagnose` readout: `Ready`, `AwaitingInput`, `Finished`,
+  `ResultAvailable`, each True/False with a reason, message, and the
+  transition time when the log carries one (the Kubernetes condition shape).
+  `session.completed`/`failed` lifecycle lines now surface their `ended_at`.
+- Added `scripts/demo.sh`: the full local lifecycle in one scripted run —
+  doctor, new, run, send, wait-idle, diagnose, log, pull, score — printing each
+  command as you would type it.
+- README opens with a "You want to… / pillbox gives you" table;
+  `docs/agent-io-contract.md` gains a "what an emitter must do" contract +
+  checklist.
+
 - Added the experimental Cloudflare `ManagedBackend`: rustic-on-R2 workspace
   provision, structured agent drive through the per-session Durable Object,
   wait-for-idle, finalize, and result-snapshot recording.

@@ -74,6 +74,63 @@ needs in-sandbox permission-prompt routing (a permission-prompt tool / SDK
 callback) that is a phase-2 build, not free. Flip to `INTERACTIVE` when that
 routing lands; no schema rework required.
 
+## What an emitter must do
+
+The contract from the emitter's side — what a per-agent adapter (or anything
+that wants to speak `agent.proto` to pillbox's consumers) has to honor. Read
+top to bottom; the checklist at the end is the same list compressed.
+
+**Speak the vocabulary, not the harness.** Emit the `Event` oneof —
+lifecycle (`RunStarted` / `RunFinished` / `RunFailed`), output (`MessageStart`
+/ `MessageDelta` / `MessageEnd` / `ToolCall` / `Thinking` / `Usage`),
+human-in-the-loop (`PermissionRequested` / `AttentionRequired`), workspace
+(`Checkpoint` / `ResultReady`) — never the harness's own frames. Harness-specific
+data that has no arm goes in `Custom`, not in a new arm.
+
+**Never a TTY.** Run the agent headless on its native structured protocol
+(stream-json, `opencode serve`, `codex proto`). A PTY bypasses the
+vault/workspace/audit envelope; the interactive attach transport is a separate
+surface and is not this contract.
+
+**Degrade to lifecycle, not to nothing.** Coverage is uneven across harnesses.
+Whatever else is missing, a consumer always gets `RunStarted`, a final answer,
+and `RunFinished { result_snapshot }` or `RunFailed { reason, exit_code }`.
+
+**Mark durability honestly.** `ephemeral = true` is for high-rate telemetry
+(`PhaseChanged`, `TodosUpdated`, partial phases) that may be dropped under
+backpressure. Everything a consumer would replay — lifecycle, messages, tool
+calls, results — is durable.
+
+**Number durable events, and only those.** `seq` is monotonic per emitter
+(per run / per exec) on durable events; ephemeral events carry `seq = 0`. A
+consumer reconnects with `SubscribeRequest.from_seq` and expects to catch up
+without a separate store, so a gap or a reused `seq` breaks replay.
+
+**Signal the turn boundary.** When the agent ends a turn and is waiting to be
+driven, emit `AttentionRequired { reason: NeedsInput }`. This is what
+`session wait-idle`, the `needs-input` status, and the `AwaitingInput`
+condition are derived from; an adapter that forgets it leaves every driver
+polling.
+
+**Correlate.** `ToolCall` lands twice (Running, then its result) under one
+`tool_call_id`; `Usage` names its `message_id`; `RunStarted.parent_run_id`
+carries lineage. Consumers count invocations and stitch trees from these ids,
+not from ordering.
+
+**Ship the result as a handle.** The agent's output workspace is a snapshot
+handle on `RunFinished` / `ResultReady`, not a path and not inlined bytes.
+
+### Checklist
+
+- Emits the `Event` oneof; harness extras go in `Custom`
+- Runs the agent with no TTY, on its structured protocol
+- Always produces `RunStarted` and a terminal `RunFinished` / `RunFailed`
+- Sets `ephemeral` on telemetry; durable on everything replayable
+- `seq` monotonic per emitter on durable events, `0` on ephemeral, no gaps or reuse
+- Emits `AttentionRequired { NeedsInput }` at every turn boundary
+- Correlates tool results, usage, and lineage by id
+- Reports the result workspace as a snapshot handle
+
 ## Suggested phasing
 
 1. **claude (stream-json + hooks)** end-to-end: `Spawn` → events → `ResultReady`;

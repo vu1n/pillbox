@@ -257,6 +257,14 @@ enum Command {
         /// the workspace before launching the agent.
         #[arg(long = "from-bookmark", value_name = "NAME")]
         from_bookmark: Option<String>,
+        /// Apply a named run environment from `pillbox.toml` (`[preset.NAME]`):
+        /// mounts, secret refs, env bundles, MCP servers, the egress allowlist
+        /// and model knobs, declared once and reused by name. Explicit flags
+        /// still win: lists union with the preset's, scalars override it,
+        /// booleans or with it. Not `--profile`, which is the model profile
+        /// handed to the harness. See docs/config.md.
+        #[arg(long, value_name = "NAME")]
+        preset: Option<String>,
         /// Model for a server-integration agent (opencode): `PROVIDER/MODEL`,
         /// e.g. `zai-coding-plan/glm-4.5-air`. Ignored by PTY agents.
         #[arg(long, value_name = "PROVIDER/MODEL")]
@@ -754,6 +762,7 @@ fn run(cli: Cli) -> Result<()> {
             ttl,
             parent,
             from_bookmark,
+            preset,
             model,
             profile,
             reasoning_effort,
@@ -813,35 +822,43 @@ fn run(cli: Cli) -> Result<()> {
                 Some(s) => Some(session::parse_ttl_seconds(&s)?),
                 None => None,
             };
-            dispatch_run(
-                &resolved,
-                agent,
-                RunOpts {
-                    workspace,
-                    name,
-                    mounts,
-                    withs,
-                    env_bundles,
-                    env_files,
-                    vault,
-                    memory,
-                    memory_briefed: Vec::new(), // dispatch_run fills this from the kypp briefing
-                    mcps,
-                    mcp_tokens,
-                    args,
-                    detach,
-                    label,
-                    json,
-                    ttl_seconds,
-                    from_bookmark,
-                    model,
-                    profile,
-                    reasoning_effort,
-                    temperature,
-                    egress_allow,
-                    egress_deny,
-                },
-            )
+            let mut agent = agent;
+            let mut opts = RunOpts {
+                workspace,
+                name,
+                mounts,
+                withs,
+                env_bundles,
+                env_files,
+                vault,
+                memory,
+                memory_briefed: Vec::new(), // dispatch_run fills this from the kypp briefing
+                mcps,
+                mcp_tokens,
+                args,
+                detach,
+                label,
+                json,
+                ttl_seconds,
+                from_bookmark,
+                model,
+                profile,
+                reasoning_effort,
+                temperature,
+                egress_allow,
+                egress_deny,
+            };
+            // `--preset NAME` folds the descriptor's `[preset.NAME]` under the
+            // explicit flags (flag > preset > descriptor > built-in), then a
+            // one-line banner says what it contributed — the environment came
+            // from a file, so say so where the user is looking.
+            if let Some(name) = &preset {
+                let cfg = config::resolve_run_config(&resolved);
+                let p = cfg.preset(name)?;
+                apply_preset(name, p, &mut agent, &mut opts)?;
+                eprintln!("{}", preset_banner(name, p));
+            }
+            dispatch_run(&resolved, agent, opts)
         }
         Command::Dispatch {
             from_bookmark,
@@ -1098,6 +1115,94 @@ fn resolve_agent_spec(
     agents::lookup("run", &id)
 }
 
+/// Fold a `[preset.NAME]` under the flags already parsed into `opts`: a list
+/// field becomes preset entries then CLI entries (so a flag can extend a preset
+/// and a later duplicate wins wherever "last wins" applies), a scalar keeps the
+/// explicit flag when one was given, and a boolean is or-ed. `--mcp`-shaped
+/// strings go through the same parsers the flags use, so a malformed preset
+/// entry fails with the flag's own message, prefixed with where it came from.
+fn apply_preset(
+    name: &str,
+    p: &config::Preset,
+    agent: &mut Option<String>,
+    opts: &mut RunOpts,
+) -> Result<()> {
+    if agent.is_none() {
+        *agent = p.agent.clone();
+    }
+    if opts.model.is_none() {
+        opts.model = p.model.clone();
+    }
+    if opts.temperature.is_none() {
+        opts.temperature = p.temperature;
+    }
+    opts.vault |= p.vault;
+    opts.memory |= p.memory;
+    opts.egress_deny |= p.egress_deny;
+    fn prepend<T: Clone>(preset: &[T], cli: &mut Vec<T>) {
+        let mut merged = preset.to_vec();
+        merged.append(cli);
+        *cli = merged;
+    }
+    prepend(&p.mount, &mut opts.mounts);
+    prepend(&p.with, &mut opts.withs);
+    prepend(&p.env, &mut opts.env_bundles);
+    prepend(&p.env_files_resolved(), &mut opts.env_files);
+    prepend(&p.egress_allow, &mut opts.egress_allow);
+    let in_preset = |field: &str, e: anyhow::Error| {
+        PillboxError::config("run --preset", format!("[preset.{name}] {field}: {e}"))
+    };
+    let mcps = p
+        .mcp
+        .iter()
+        .map(|raw| agents::McpAttachment::parse(raw).map_err(|e| in_preset("mcp", e)))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    prepend(&mcps, &mut opts.mcps);
+    let tokens = p
+        .mcp_token
+        .iter()
+        .map(|raw| agents::McpTokenSpec::parse(raw).map_err(|e| in_preset("mcp_token", e)))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    prepend(&tokens, &mut opts.mcp_tokens);
+    Ok(())
+}
+
+/// The one-line stderr receipt for an applied preset: what it contributed, so a
+/// mis-targeted run (wrong preset, wrong descriptor) is visible before the VM
+/// boots rather than after the agent has hit the wrong endpoint.
+fn preset_banner(name: &str, p: &config::Preset) -> String {
+    let mut parts = Vec::new();
+    if let Some(a) = &p.agent {
+        parts.push(format!("agent {a}"));
+    }
+    if let Some(m) = &p.model {
+        parts.push(format!("model {m}"));
+    }
+    let count = |n: usize, what: &str| (n > 0).then(|| format!("{n} {what}"));
+    parts.extend(count(p.mount.len(), "mount(s)"));
+    parts.extend(count(p.with.len(), "secret(s)"));
+    parts.extend(count(p.env.len() + p.env_file.len(), "env source(s)"));
+    parts.extend(count(p.mcp.len(), "mcp"));
+    if p.vault {
+        parts.push("vault".into());
+    }
+    if p.memory {
+        parts.push("memory".into());
+    }
+    if !p.egress_allow.is_empty() || p.egress_deny {
+        parts.push(format!(
+            "egress {}[{}]",
+            if p.egress_deny { "default-deny " } else { "" },
+            p.egress_allow.join(", ")
+        ));
+    }
+    if parts.is_empty() {
+        format!("pillbox: preset `{name}` (empty)")
+    } else {
+        format!("pillbox: preset `{name}`: {}", parts.join(", "))
+    }
+}
+
 fn dispatch_run(resolved: &Pillbox, agent: Option<String>, mut opts: RunOpts) -> Result<()> {
     // Resolve the agent + apply pillbox.toml defaults; the backend
     // selection happens below.
@@ -1279,6 +1384,155 @@ mod tests {
         assert_eq!(model.as_deref(), Some("openai/gpt-5.6-sol"));
         assert_eq!(profile.as_deref(), Some("sol"));
         assert_eq!(reasoning_effort, Some(contract::ReasoningEffort::High));
+    }
+
+    fn run_opts(cli: Cli) -> (Option<String>, RunOpts) {
+        let Command::Run {
+            agent,
+            workspace,
+            name,
+            mounts,
+            withs,
+            env_bundles,
+            env_files,
+            vault,
+            memory,
+            mcps,
+            mcp_tokens,
+            detach,
+            label,
+            json,
+            from_bookmark,
+            model,
+            profile,
+            reasoning_effort,
+            temperature,
+            egress_allow,
+            egress_deny,
+            args,
+            ..
+        } = cli.command
+        else {
+            panic!("expected run");
+        };
+        (
+            agent,
+            RunOpts {
+                workspace,
+                name,
+                mounts,
+                withs,
+                env_bundles,
+                env_files,
+                vault,
+                memory,
+                memory_briefed: Vec::new(),
+                mcps,
+                mcp_tokens,
+                args,
+                detach,
+                label,
+                json,
+                ttl_seconds: None,
+                from_bookmark,
+                model,
+                profile,
+                reasoning_effort,
+                temperature,
+                egress_allow,
+                egress_deny,
+            },
+        )
+    }
+
+    fn dev_preset() -> config::Preset {
+        config::Preset {
+            agent: Some("opencode".into()),
+            model: Some("preset/model".into()),
+            temperature: Some(0.0),
+            vault: true,
+            mount: vec!["/p:/p".into()],
+            with: vec!["ANTHROPIC_API_KEY".into()],
+            env_file: vec!["local.env".into()],
+            mcp: vec!["search=http://example.com:8123".into()],
+            mcp_token: vec!["search=SEARCH_TOKEN".into()],
+            egress_allow: vec!["api.anthropic.com".into()],
+            egress_deny: true,
+            dir: Some(PathBuf::from("/proj")),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn preset_fills_gaps_and_flags_win() {
+        // Bare `run --preset dev`: everything comes from the preset.
+        let cli = Cli::try_parse_from(["pillbox", "run", "--preset", "dev"]).unwrap();
+        let (mut agent, mut opts) = run_opts(cli);
+        apply_preset("dev", &dev_preset(), &mut agent, &mut opts).unwrap();
+        assert_eq!(agent.as_deref(), Some("opencode"));
+        assert_eq!(opts.model.as_deref(), Some("preset/model"));
+        assert_eq!(opts.temperature, Some(0.0));
+        assert!(opts.vault && opts.egress_deny && !opts.memory);
+        assert_eq!(opts.mounts, vec!["/p:/p"]);
+        assert_eq!(opts.env_files, vec![PathBuf::from("/proj/local.env")]);
+        assert_eq!(opts.mcps[0].name, "search");
+        assert_eq!(opts.mcp_tokens[0].secret_name, "SEARCH_TOKEN");
+        assert_eq!(opts.egress_allow, vec!["api.anthropic.com"]);
+
+        // Explicit flags: scalars override, lists extend (preset first).
+        let cli = Cli::try_parse_from([
+            "pillbox",
+            "run",
+            "--preset",
+            "dev",
+            "--agent",
+            "claude",
+            "--model",
+            "cli/model",
+            "--with",
+            "GH_TOKEN",
+            "--egress-allow",
+            "github.com",
+        ])
+        .unwrap();
+        let (mut agent, mut opts) = run_opts(cli);
+        apply_preset("dev", &dev_preset(), &mut agent, &mut opts).unwrap();
+        assert_eq!(agent.as_deref(), Some("claude"));
+        assert_eq!(opts.model.as_deref(), Some("cli/model"));
+        assert_eq!(opts.withs, vec!["ANTHROPIC_API_KEY", "GH_TOKEN"]);
+        assert_eq!(opts.egress_allow, vec!["api.anthropic.com", "github.com"]);
+    }
+
+    #[test]
+    fn preset_malformed_mcp_is_a_config_error_naming_the_preset() {
+        let cli = Cli::try_parse_from(["pillbox", "run", "--preset", "dev"]).unwrap();
+        let (mut agent, mut opts) = run_opts(cli);
+        let p = config::Preset {
+            mcp: vec!["no-equals-sign".into()],
+            ..Default::default()
+        };
+        let err = apply_preset("dev", &p, &mut agent, &mut opts).unwrap_err();
+        let s = format!("{err}");
+        assert!(s.contains("[preset.dev] mcp"), "{s}");
+        assert!(matches!(
+            err.downcast_ref::<PillboxError>().map(|e| e.category),
+            Some(errors::ExitCategory::Config)
+        ));
+    }
+
+    #[test]
+    fn preset_banner_says_what_it_contributed() {
+        let b = preset_banner("dev", &dev_preset());
+        assert!(
+            b.starts_with("pillbox: preset `dev`: agent opencode, model preset/model"),
+            "{b}"
+        );
+        assert!(b.contains("1 secret(s)") && b.contains("vault"), "{b}");
+        assert!(b.contains("egress default-deny [api.anthropic.com]"), "{b}");
+        assert_eq!(
+            preset_banner("empty", &config::Preset::default()),
+            "pillbox: preset `empty` (empty)"
+        );
     }
 
     #[test]

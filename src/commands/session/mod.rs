@@ -423,13 +423,16 @@ fn session_list(resolved: &Pillbox, json: bool) -> Result<()> {
         let arr: Vec<serde_json::Value> = entries
             .iter()
             .map(|s| {
-                let d = events::status::summarize(resolved, s, terminal.get(&s.id))?;
-                Ok(session_json_with_status(
+                let terminal = terminal.get(&s.id);
+                let d = events::status::summarize(resolved, s, terminal)?;
+                let mut v = session_json_with_status(
                     s,
                     d.status,
                     d.served_model.as_ref(),
                     d.effective_limits.as_ref(),
-                ))
+                );
+                insert_conditions(&mut v, s, &d, terminal);
+                Ok(v)
             })
             .collect::<Result<_>>()?;
         println!(
@@ -485,6 +488,7 @@ fn session_info(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
             d.served_model.as_ref(),
             d.effective_limits.as_ref(),
         );
+        insert_conditions(&mut v, &s, &d, terminal.get(&s.id));
         // Expose the host path of the result-workspace when the backend has one
         // (libkrun: the agent's CoW clone) — so graders/orchestrators read it
         // from this surface instead of parsing the session record. A backend with
@@ -531,12 +535,13 @@ fn session_diagnose(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
     let d = events::status::summarize(resolved, &s, terminal)?;
 
     let (fail_reason, exit_code) = match terminal {
-        Some(events::status::Terminal::Failed { reason, exit_code }) => {
-            (Some(reason.as_str()), *exit_code)
-        }
-        Some(events::status::Terminal::Done { exit_code }) => (None, *exit_code),
+        Some(events::status::Terminal::Failed {
+            reason, exit_code, ..
+        }) => (Some(reason.as_str()), *exit_code),
+        Some(events::status::Terminal::Done { exit_code, .. }) => (None, *exit_code),
         None => (None, None),
     };
+    let conditions = events::status::conditions(&s, &d, terminal);
 
     if json {
         let mut v = session_json_with_status(
@@ -545,6 +550,7 @@ fn session_diagnose(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
             d.served_model.as_ref(),
             d.effective_limits.as_ref(),
         );
+        insert_conditions(&mut v, &s, &d, terminal);
         if let Some(obj) = v.as_object_mut() {
             obj.insert("log_seq".into(), d.log_seq.into());
             obj.insert("assistant_turns".into(), d.assistant_turns.into());
@@ -609,7 +615,40 @@ fn session_diagnose(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
             println!("  last event at {}", d.last_at);
         }
     }
+    // The condition table: one line per typed fact, so "what is this session
+    // waiting on" is read off a column rather than inferred from the prose.
+    println!("Conditions:");
+    for c in &conditions {
+        println!(
+            "  {:<16} {:<6} {:<15} {}{}",
+            c.r#type,
+            c.status,
+            c.reason,
+            c.message,
+            c.last_transition_time
+                .as_deref()
+                .map(|t| format!("  (since {t})"))
+                .unwrap_or_default()
+        );
+    }
     Ok(())
+}
+
+/// Merge `conditions[]` into a session's `--json` object. One helper so
+/// `list`/`info`/`diagnose` emit the identical shape.
+fn insert_conditions(
+    v: &mut serde_json::Value,
+    s: &session::Session,
+    d: &events::status::Diagnosis,
+    terminal: Option<&events::status::Terminal>,
+) {
+    if let Some(obj) = v.as_object_mut() {
+        let conditions = events::status::conditions(s, d, terminal);
+        obj.insert(
+            "conditions".into(),
+            serde_json::to_value(conditions).unwrap_or(serde_json::Value::Array(Vec::new())),
+        );
+    }
 }
 
 fn session_attach(resolved: &Pillbox, id: &str) -> Result<()> {

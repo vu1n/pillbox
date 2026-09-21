@@ -24,6 +24,14 @@
 //! # prefix = "pillbox/"
 //! # access_key_env = "R2_ACCESS_KEY"
 //! # secret_key_env = "R2_SECRET_KEY"
+//!
+//! # optional named run environments — `pillbox run --preset dev`
+//! [preset.dev]
+//! with = ["ANTHROPIC_API_KEY"]            # secret NAMES, never values
+//! mcp = ["code-search=http://localhost:8123"]
+//! egress_allow = ["api.anthropic.com", "crates.io", "static.crates.io"]
+//! egress_deny = true
+//! vault = true
 //! ```
 //!
 //! **Discovery + cascade** (CLAUDE.md-style): walk up from cwd until a
@@ -36,6 +44,7 @@
 //! [`resolve_run_config`].
 
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -136,6 +145,82 @@ pub(crate) struct RunnerConfig {
     pub(crate) image: Option<String>,
 }
 
+/// `[preset.NAME]` table — a named, reusable run environment: the `pillbox run`
+/// flags a project keeps re-typing (mounts, secret refs, MCP servers, the egress
+/// allowlist, model knobs) declared once and selected with `pillbox run --preset
+/// NAME`. The descriptor-side analogue of a bound Workspace + Gateway resource:
+/// authored in a file that is reviewed and diffed, referenced by name at run
+/// time. Distinct from `--profile`, which is the *model* profile handed to the
+/// harness.
+///
+/// Every field is a NAME reference or a non-secret value (`with` names a secret
+/// in the store, never its value), so a preset is safe to commit. Strict
+/// (`deny_unknown_fields`) like the eval spec: a typo fails at load, before any
+/// VM boots. Lists are unioned with the CLI's repeatable flags; scalars lose to
+/// an explicit flag; booleans are or-ed (a flag can switch a preset's `vault`
+/// on, never off).
+#[derive(Debug, Default, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Preset {
+    /// Agent to launch. Sits between `--agent` and the descriptor's `agent`.
+    #[serde(default)]
+    pub(crate) agent: Option<String>,
+    /// `provider/model`, as `--model`.
+    #[serde(default)]
+    pub(crate) model: Option<String>,
+    /// Sampling temperature, as `--temperature`.
+    #[serde(default)]
+    pub(crate) temperature: Option<f64>,
+    /// `--vault`.
+    #[serde(default)]
+    pub(crate) vault: bool,
+    /// `--memory`.
+    #[serde(default)]
+    pub(crate) memory: bool,
+    /// `--mount HOST:GUEST` entries.
+    #[serde(default)]
+    pub(crate) mount: Vec<String>,
+    /// `--with NAME[=ENV_VAR]` entries — secret names, never values.
+    #[serde(default)]
+    pub(crate) with: Vec<String>,
+    /// `--env BUNDLE` names.
+    #[serde(default)]
+    pub(crate) env: Vec<String>,
+    /// `--env-file PATH` entries. A relative path resolves against the
+    /// directory of the descriptor the preset was read from.
+    #[serde(default)]
+    pub(crate) env_file: Vec<PathBuf>,
+    /// `--mcp NAME=URL` entries.
+    #[serde(default)]
+    pub(crate) mcp: Vec<String>,
+    /// `--mcp-token NAME=SECRET_NAME` entries.
+    #[serde(default)]
+    pub(crate) mcp_token: Vec<String>,
+    /// `--egress-allow HOST` entries.
+    #[serde(default)]
+    pub(crate) egress_allow: Vec<String>,
+    /// `--egress-deny`.
+    #[serde(default)]
+    pub(crate) egress_deny: bool,
+    /// Directory of the descriptor this preset was read from (relative
+    /// `env_file` paths resolve against it). Set by the loader, never parsed.
+    #[serde(skip)]
+    pub(crate) dir: Option<PathBuf>,
+}
+
+impl Preset {
+    /// `env_file` entries with relative paths resolved against [`Preset::dir`].
+    pub(crate) fn env_files_resolved(&self) -> Vec<PathBuf> {
+        self.env_file
+            .iter()
+            .map(|p| match (&self.dir, p.is_relative()) {
+                (Some(dir), true) => dir.join(p),
+                _ => p.clone(),
+            })
+            .collect()
+    }
+}
+
 #[derive(Debug, Default, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 #[allow(dead_code)] // `agent`, `workspace`, `source` consumed by PR 3 + later
@@ -159,6 +244,9 @@ pub(crate) struct Config {
     /// Per-pillbox runner image override. See [`RunnerConfig`].
     #[serde(default)]
     pub(crate) runner: RunnerConfig,
+    /// Named run environments, keyed by preset name. See [`Preset`].
+    #[serde(default)]
+    pub(crate) preset: BTreeMap<String, Preset>,
 
     /// Path the config was loaded from. Useful for `info` output.
     #[serde(skip)]
@@ -184,7 +272,39 @@ impl Config {
             .into());
         }
         cfg.source = Some(path.to_path_buf());
+        cfg.stamp_preset_dirs();
         Ok(cfg)
+    }
+
+    /// Record the descriptor's directory on every preset so relative
+    /// `env_file` paths resolve against the file that declared them.
+    fn stamp_preset_dirs(&mut self) {
+        let dir = self
+            .source
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(Path::to_path_buf);
+        for preset in self.preset.values_mut() {
+            preset.dir = dir.clone();
+        }
+    }
+
+    /// Look up a `[preset.NAME]` after the cascade. Unknown → config error (exit
+    /// 3) naming the presets that do exist, so a typo is one line to fix.
+    pub(crate) fn preset(&self, name: &str) -> Result<&Preset> {
+        self.preset.get(name).ok_or_else(|| {
+            let known = if self.preset.is_empty() {
+                "none declared".to_string()
+            } else {
+                self.preset.keys().cloned().collect::<Vec<_>>().join(", ")
+            };
+            PillboxError::config(
+                "run --preset",
+                format!("no `[preset.{name}]` in pillbox.toml (available: {known})"),
+            )
+            .with_next("add a `[preset.NAME]` table to pillbox.toml — see docs/config.md")
+            .into()
+        })
     }
 
     /// Load the user-global defaults (`~/.pillbox/global/pillbox.toml`) — the BASE
@@ -193,10 +313,14 @@ impl Config {
     /// defaults (`Config::default`) rather than an error — a missing global file is
     /// the normal case, not a failure.
     pub(crate) fn global_defaults() -> Config {
-        fs::read_to_string(crate::pillbox::global_config_path())
+        let path = crate::pillbox::global_config_path();
+        let mut cfg = fs::read_to_string(&path)
             .ok()
             .and_then(|raw| toml::from_str::<Config>(&raw).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        cfg.source = Some(path);
+        cfg.stamp_preset_dirs();
+        cfg
     }
 
     /// Overlay `self` (higher precedence — e.g. a project descriptor) onto `base`
@@ -219,6 +343,15 @@ impl Config {
             } else {
                 self.workspace
             },
+            // Presets merge by NAME: a project `[preset.dev]` replaces a global
+            // `[preset.dev]` whole (no field-wise merge — a preset is one
+            // reviewable unit), and global presets the project doesn't redeclare
+            // stay selectable.
+            preset: {
+                let mut merged = base.preset;
+                merged.extend(self.preset);
+                merged
+            },
             source: self.source.or(base.source),
         }
     }
@@ -228,7 +361,7 @@ impl Config {
 /// the project `pillbox.toml` (found by walking up from cwd, read FRESH so edits
 /// take effect immediately) overlaid on `~/.pillbox/global/pillbox.toml`. Callers
 /// apply the higher-precedence layers (CLI flag, env) and the built-in default on
-/// top of the field they read (`agent` / `model` / `runner.image`).
+/// top of the field they read (`agent` / `model` / `runner.image` / a `preset`).
 pub(crate) fn resolve_run_config(resolved: &crate::pillbox::Pillbox) -> Config {
     let global = Config::global_defaults();
     match &resolved.scope {
@@ -382,6 +515,96 @@ secret_key_env = "R2_SECRET_KEY"
             cfg.workspace.access_key_env.as_deref(),
             Some("R2_ACCESS_KEY")
         );
+    }
+
+    #[test]
+    fn preset_parses_every_field_and_stamps_dir() {
+        let root = TempDir::new().unwrap();
+        write_config(
+            root.path(),
+            r#"name = "x"
+
+[preset.dev]
+agent = "opencode"
+model = "prov/m"
+temperature = 0.0
+vault = true
+memory = true
+mount = ["/h:/g"]
+with = ["ANTHROPIC_API_KEY", "GH_TOKEN=GITHUB_TOKEN"]
+env = ["ci"]
+env_file = ["local.env", "/abs/other.env"]
+mcp = ["search=http://localhost:8123"]
+mcp_token = ["search=SEARCH_TOKEN"]
+egress_allow = ["api.anthropic.com", ".crates.io"]
+egress_deny = true
+"#,
+        );
+        let cfg = Config::load_from(&root.path().join("pillbox.toml")).unwrap();
+        let p = cfg.preset("dev").unwrap();
+        assert_eq!(p.agent.as_deref(), Some("opencode"));
+        assert_eq!(p.model.as_deref(), Some("prov/m"));
+        assert_eq!(p.temperature, Some(0.0));
+        assert!(p.vault && p.memory && p.egress_deny);
+        assert_eq!(p.with.len(), 2);
+        assert_eq!(p.egress_allow, vec!["api.anthropic.com", ".crates.io"]);
+        // Relative env_file resolves against the descriptor's dir; absolute is kept.
+        let files = p.env_files_resolved();
+        assert_eq!(files[0], root.path().join("local.env"));
+        assert_eq!(files[1], PathBuf::from("/abs/other.env"));
+    }
+
+    #[test]
+    fn preset_rejects_unknown_field_and_secret_values() {
+        // A typo (`mounts`) fails at load — before any VM boots.
+        let root = TempDir::new().unwrap();
+        write_config(
+            root.path(),
+            "name = \"x\"\n[preset.dev]\nmounts = [\"/a:/b\"]\n",
+        );
+        let err = Config::load_from(&root.path().join("pillbox.toml")).unwrap_err();
+        let s = format!("{err}");
+        assert!(s.contains("mounts") || s.contains("unknown"), "{s}");
+    }
+
+    #[test]
+    fn preset_lookup_names_the_available_ones() {
+        let root = TempDir::new().unwrap();
+        write_config(root.path(), "name = \"x\"\n[preset.dev]\n[preset.ci]\n");
+        let cfg = Config::load_from(&root.path().join("pillbox.toml")).unwrap();
+        let err = cfg.preset("prod").unwrap_err();
+        let s = format!("{err}");
+        assert!(s.contains("prod") && s.contains("ci, dev"), "{s}");
+    }
+
+    #[test]
+    fn overlay_merges_presets_by_name_project_wins() {
+        let mut global = Config::default();
+        global.preset.insert(
+            "dev".into(),
+            Preset {
+                vault: true,
+                ..Default::default()
+            },
+        );
+        global.preset.insert("shared".into(), Preset::default());
+        let mut project = Config {
+            name: Some("proj".into()),
+            ..Default::default()
+        };
+        project.preset.insert(
+            "dev".into(),
+            Preset {
+                egress_deny: true,
+                ..Default::default()
+            },
+        );
+        let m = project.overlay_on(global);
+        // Project's `dev` replaces global's whole (vault from global does NOT leak in).
+        let dev = m.preset("dev").unwrap();
+        assert!(dev.egress_deny && !dev.vault);
+        // Global-only presets stay selectable.
+        assert!(m.preset("shared").is_ok());
     }
 
     #[test]

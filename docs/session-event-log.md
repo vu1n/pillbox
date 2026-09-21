@@ -369,13 +369,16 @@ The global `events.jsonl` becomes a **lifecycle-only projection** derived from
 per-session logs (keeps `session list` / `session events --follow` working);
 the per-session log is the source of truth.
 
-**`session list`/`info` must project status from the log.** Today `session list`
-reads only `attached_pid` (PTY ownership), so done/failed/blocked/running look
-identical — it must join against the log for a status + needs-attention column
-(see [dx.md](./dx.md)). The same log enables **`pillbox session diagnose ID`** —
-a collector-free post-mortem (failure reason + last N tool calls + pending gate
-+ `pull this snapshot to reproduce`), a flagship feature the log gives almost
-for free.
+**`session list`/`info`/`diagnose` project status from the log.** One fold
+(`events/status.rs`) joins the per-session log with the lifecycle sink and yields
+the `running | needs-input | done | failed` status column, plus a typed
+`conditions[]` set on every `--json` (`Ready`, `AwaitingInput`, `Finished`,
+`ResultAvailable`, in the Kubernetes condition shape) so an orchestrator branches
+on one field instead of the prose. `pillbox session diagnose ID` is the
+collector-free post-mortem the log gives almost for free (status, failure reason,
+activity counts, the condition table); "last N tool calls" and "pull this
+snapshot to reproduce" are still `session log --type tool_call` and `session
+pull` by hand.
 
 ## Versioning / forward-compat
 

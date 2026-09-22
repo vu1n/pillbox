@@ -7,16 +7,20 @@ use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, ensure, Context, Result};
+use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
 use super::{EgressSpec, RefreshSpec, SwapPair, VmSpec, VsockAttach};
+use crate::execution::files::FileTree;
+use crate::execution::verifier::{self, VerifierConfiguration};
+use crate::execution::Verifier;
 use crate::paths::write_private_file;
 use crate::vault::providers::codex_execution::CodexAccessRelease;
 
@@ -24,9 +28,10 @@ const PROVIDER_HOST: &str = "chatgpt.com";
 const RPC_PORT: u32 = 1067;
 const MAX_DURATION: Duration = Duration::from_secs(86_400);
 const MAX_OUTPUT: u64 = 64 * 1024 * 1024;
-const MAX_FRAME: usize = 4 * 1024 * 1024;
+const MAX_FRAME: usize = crate::execution::MAX_FRAME_BYTES as usize;
 const MAX_GENERATED_FILE: usize = 4 * 1024 * 1024;
 const COMMAND_OUTPUT_LIMIT: u64 = 64 * 1024;
+const COMMAND_REPORT_LIMIT: usize = 96 * 1024;
 const MAX_IMAGE_ARCHIVE: u64 = 16 * 1024 * 1024 * 1024;
 const POLL: Duration = Duration::from_millis(20);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -43,6 +48,15 @@ pub(crate) struct BuilderInput {
     pub(crate) guest_auth: Vec<u8>,
     pub(crate) access_release: CodexAccessRelease,
     pub(crate) refresh_credentials: PathBuf,
+}
+
+/// The verifier definition was sealed before the builder received any input.
+/// The supervisor is selected internally; callers cannot replace its report code.
+pub(crate) struct VerifierInput {
+    pub(crate) image_id: String,
+    pub(crate) tree: FileTree,
+    pub(crate) verifier: Verifier,
+    pub(crate) configuration: VerifierConfiguration,
 }
 
 #[derive(Clone, Copy)]
@@ -76,6 +90,26 @@ pub(super) struct OwnershipSpec {
     remaining_ms: u64,
 }
 
+/// A caller must not seal a terminal result when this marker is in the error
+/// chain: process ownership still needs recovery and sampling must not restart.
+#[derive(Debug)]
+pub(crate) struct TeardownUnconfirmed;
+
+impl std::fmt::Display for TeardownUnconfirmed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("owned execution teardown was not confirmed")
+    }
+}
+
+impl std::error::Error for TeardownUnconfirmed {}
+
+fn cleanup_failure(error: anyhow::Error, cleanup: Result<ExitStatus>) -> anyhow::Error {
+    match cleanup {
+        Ok(_) => error,
+        Err(cleanup) => cleanup.context(format!("original operation failed: {error:#}")),
+    }
+}
+
 /// Holds the private rootfs and host-side CA until termination is confirmed.
 pub(crate) struct OwnedVm {
     process: OwnedProcess,
@@ -89,11 +123,12 @@ pub(crate) struct OwnedVm {
 impl OwnedVm {
     pub(crate) fn connect_rpc(&mut self, cancelled: &dyn Fn() -> bool) -> Result<UnixStream> {
         loop {
-            self.check_running(cancelled)?;
+            check_live(self.deadline, cancelled)?;
+            self.process.drain()?;
             let listener = self
                 .rpc_listener
                 .as_ref()
-                .context("builder RPC connection was already consumed")?;
+                .context("VM RPC connection was already consumed")?;
             match listener.accept() {
                 Ok((stream, _)) => {
                     self.rpc_listener.take();
@@ -102,9 +137,13 @@ impl OwnedVm {
                     return Ok(stream);
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(POLL)
+                    ensure!(
+                        self.process.exited()?.is_none(),
+                        "owned VMM exited before RPC connection"
+                    );
+                    std::thread::sleep(POLL);
                 }
-                Err(error) => return Err(error).context("accept builder RPC"),
+                Err(error) => return Err(error).context("accept VM RPC"),
             }
         }
     }
@@ -114,7 +153,7 @@ impl OwnedVm {
         self.process.drain()?;
         ensure!(
             self.process.exited()?.is_none(),
-            "builder VMM exited before completion"
+            "owned VMM exited before completion"
         );
         Ok(())
     }
@@ -133,12 +172,10 @@ impl OwnedVm {
         self.rpc_listener.take();
         let status = self.process.stop_and_reap()?;
         if let Some(runtime) = self.runtime.take() {
-            runtime
-                .close()
-                .context("remove stopped builder rootfs and CA")?;
+            runtime.close().context("remove stopped VM runtime")?;
         }
         if let Some(sockets) = self.sockets.take() {
-            sockets.close().context("remove stopped builder sockets")?;
+            sockets.close().context("remove stopped VM sockets")?;
         }
         Ok(status)
     }
@@ -167,28 +204,7 @@ pub(crate) fn launch_builder(
     let deadline = Instant::now()
         .checked_add(limits.max_duration)
         .context("VM deadline overflow")?;
-    check_live(deadline, cancelled)?;
-    super::host::virtualization_available().map_err(anyhow::Error::msg)?;
-    super::host::runtime_deps_present().map_err(anyhow::Error::msg)?;
-    let cache_root = super::krun_cache_dir()?.join("repository-images-v1");
-    fs::create_dir_all(&cache_root)?;
-    crate::paths::ensure_mode_0700(&cache_root)?;
-    let free = super::host::disk_headroom(&cache_root);
-    ensure!(
-        free >= super::host::MIN_HEADROOM_BYTES,
-        "insufficient or unknown disk headroom for bounded VM"
-    );
-    let base = provision_image(&input.image_id, &cache_root, deadline, cancelled)?;
-    check_live(deadline, cancelled)?;
-    let runtime = tempfile::Builder::new()
-        .prefix("invocation-")
-        .tempdir_in(&cache_root)?;
-    let rootfs = runtime.path().join("rootfs");
-    let method = crate::workspace::cow::cow_clone_dir(&base, &rootfs)?;
-    if method == crate::workspace::cow::CloneMethod::Copied {
-        eprintln!("pillbox: bounded rootfs fork fell back to a full copy");
-    }
-    check_live(deadline, cancelled)?;
+    let (runtime, rootfs) = prepare_rootfs(&input.image_id, deadline, cancelled)?;
     let ca_dir = runtime.path().join("ca");
     fs::create_dir(&ca_dir)?;
     crate::paths::ensure_mode_0700(&ca_dir)?;
@@ -202,19 +218,110 @@ pub(crate) fn launch_builder(
         remaining_ms(deadline)?,
     )?;
 
+    let mut vm = launch_prepared(
+        runtime,
+        limits,
+        deadline,
+        cancelled,
+        true,
+        |owner, rpc, remaining| builder_spec(&rootfs, &ca_dir, owner, rpc, &input, remaining),
+    )?;
+    let delivery = (|| -> Result<()> {
+        let swaps = vec![SwapPair {
+            stub: input.access_release.stub,
+            real: input.access_release.real,
+            hosts: vec![PROVIDER_HOST.into()],
+        }];
+        let bytes = serde_json::to_vec(&swaps)?;
+        let mut stdin = vm
+            .process
+            .child
+            .stdin
+            .take()
+            .context("VMM credential channel missing")?;
+        nonblocking(stdin.as_raw_fd())?;
+        write_until(&mut stdin, &bytes, deadline, cancelled)?;
+        drop(stdin);
+        Ok(())
+    })();
+    if let Err(error) = delivery {
+        let cleanup = vm.stop_and_reap();
+        return Err(cleanup_failure(error, cleanup));
+    }
+    Ok(vm)
+}
+
+pub(crate) fn launch_verifier(
+    input: VerifierInput,
+    limits: VmLimits,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<OwnedVm> {
+    limits.validate()?;
+    validate_verifier_input(&input)?;
+    let deadline = Instant::now()
+        .checked_add(limits.max_duration)
+        .context("VM deadline overflow")?;
+    let (runtime, rootfs) = prepare_rootfs(&input.image_id, deadline, cancelled)?;
+    prepare_verifier_guest(&rootfs, &input)?;
+    check_live(deadline, cancelled)?;
+    launch_prepared(
+        runtime,
+        limits,
+        deadline,
+        cancelled,
+        false,
+        |owner, rpc, remaining| verifier_spec(&rootfs, owner, rpc, remaining),
+    )
+}
+
+fn prepare_rootfs(
+    image_id: &str,
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(TempDir, PathBuf)> {
+    check_live(deadline, cancelled)?;
+    super::host::virtualization_available().map_err(anyhow::Error::msg)?;
+    super::host::runtime_deps_present().map_err(anyhow::Error::msg)?;
+    let cache_root = super::krun_cache_dir()?.join("repository-images-v1");
+    fs::create_dir_all(&cache_root)?;
+    crate::paths::ensure_mode_0700(&cache_root)?;
+    let free = super::host::disk_headroom(&cache_root);
+    ensure!(
+        free >= super::host::MIN_HEADROOM_BYTES,
+        "insufficient or unknown disk headroom for bounded VM"
+    );
+    let runtime = tempfile::Builder::new()
+        .prefix("invocation-")
+        .tempdir_in(&cache_root)?;
+    let rootfs = runtime.path().join("rootfs");
+    if let Err(error) = provision_image(image_id, &cache_root, &rootfs, deadline, cancelled) {
+        if error.is::<TeardownUnconfirmed>() {
+            eprintln!(
+                "pillbox: preserved unconfirmed preparation at {}",
+                runtime.keep().display()
+            );
+        }
+        return Err(error);
+    }
+    check_live(deadline, cancelled)?;
+    Ok((runtime, rootfs))
+}
+
+fn launch_prepared(
+    runtime: TempDir,
+    limits: VmLimits,
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+    credential_channel: bool,
+    make_spec: impl FnOnce(&Path, &Path, u64) -> VmSpec,
+) -> Result<OwnedVm> {
+    check_live(deadline, cancelled)?;
     let sockets = socket_directory()?;
     let owner_path = sockets.path().join("owner.sock");
     let rpc_path = sockets.path().join("rpc.sock");
     let owner_listener = bind_listener(&owner_path)?;
     let rpc_listener = bind_listener(&rpc_path)?;
-    let spec = builder_spec(
-        &rootfs,
-        &ca_dir,
-        &owner_path,
-        &rpc_path,
-        &input,
-        remaining_ms(deadline)?,
-    );
+    let spec = make_spec(&owner_path, &rpc_path, remaining_ms(deadline)?);
     let spec_path = runtime.path().join("vm.json");
     write_private_file(&spec_path, &serde_json::to_vec(&spec)?)?;
     let mut command = Command::new(std::env::current_exe()?);
@@ -223,7 +330,7 @@ pub(crate) fn launch_builder(
         .arg(&spec_path)
         .env_clear()
         .envs(super::boot::static_child_env());
-    let process = OwnedProcess::spawn(&mut command, limits.max_output_bytes, true)?;
+    let process = OwnedProcess::spawn(&mut command, limits.max_output_bytes, credential_channel)?;
     let mut vm = OwnedVm {
         process,
         owner: None,
@@ -232,28 +339,90 @@ pub(crate) fn launch_builder(
         runtime: Some(runtime),
         sockets: Some(sockets),
     };
-    vm.owner = Some(accept_owner(
-        &owner_listener,
-        &mut vm.process,
-        deadline,
-        cancelled,
-    )?);
-    let swaps = vec![SwapPair {
-        stub: input.access_release.stub,
-        real: input.access_release.real,
-        hosts: vec![PROVIDER_HOST.into()],
-    }];
-    let bytes = serde_json::to_vec(&swaps)?;
-    let mut stdin = vm
-        .process
-        .child
-        .stdin
-        .take()
-        .context("VMM credential channel missing")?;
-    nonblocking(stdin.as_raw_fd())?;
-    write_until(&mut stdin, &bytes, deadline, cancelled)?;
-    drop(stdin);
+    match accept_owner(&owner_listener, &mut vm.process, deadline, cancelled) {
+        Ok(owner) => vm.owner = Some(owner),
+        Err(error) => {
+            let cleanup = vm.stop_and_reap();
+            return Err(cleanup_failure(error, cleanup));
+        }
+    }
     Ok(vm)
+}
+
+fn validate_verifier_input(input: &VerifierInput) -> Result<()> {
+    validate_image_id(&input.image_id)?;
+    ensure!(
+        input.configuration.result_snapshot_digest == input.tree.digest(),
+        "verifier configuration does not bind the exact result tree"
+    );
+    let expected = verifier::configuration(
+        &input.verifier,
+        &input.configuration.output_id,
+        &input.configuration.result_digest,
+        input.tree.digest(),
+    )?;
+    ensure!(
+        serde_json::to_vec(&expected)? == serde_json::to_vec(&input.configuration)?,
+        "verifier configuration does not match the sealed definition"
+    );
+    Ok(())
+}
+
+fn verifier_spec(rootfs: &Path, owner: &Path, rpc: &Path, remaining_ms: u64) -> VmSpec {
+    VmSpec {
+        rootfs: rootfs.to_string_lossy().into_owned(),
+        vcpus: 2,
+        ram_mib: 2048,
+        shares: vec![],
+        exec: vec![
+            "/usr/bin/python3".into(),
+            "-I".into(),
+            "-S".into(),
+            verifier::SUPERVISOR_PATH.into(),
+        ],
+        vsock: Some(VsockAttach {
+            port: verifier::REPORT_PORT,
+            host_sock: rpc.to_string_lossy().into_owned(),
+            listen: false,
+        }),
+        egress: None,
+        ownership: Some(OwnershipSpec {
+            socket: owner.to_string_lossy().into_owned(),
+            remaining_ms,
+        }),
+    }
+}
+
+fn prepare_verifier_guest(rootfs: &Path, input: &VerifierInput) -> Result<()> {
+    for path in [GUEST_RUNTIME, GUEST_HOME, "/workspace", "/tmp"] {
+        fresh_directory(rootfs, path)?;
+    }
+    let runtime = rootfs.join(GUEST_RUNTIME.trim_start_matches('/'));
+    let tree = rootfs.join(verifier::INPUT_PATH.trim_start_matches('/'));
+    fs::create_dir(&tree)?;
+    crate::paths::ensure_mode_0700(&tree)?;
+    crate::execution::snapshot::materialize(&input.tree, &tree)?;
+    let source = rootfs.join(verifier::SOURCE_PATH.trim_start_matches('/'));
+    write_private_file(&source, input.verifier.definition.source.as_bytes())?;
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o444))?;
+    let config = rootfs.join(verifier::CONFIG_PATH.trim_start_matches('/'));
+    write_private_file(&config, &serde_json::to_vec(&input.configuration)?)?;
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o400))?;
+    let supervisor = rootfs.join(verifier::SUPERVISOR_PATH.trim_start_matches('/'));
+    write_private_file(&supervisor, verifier::guest_script().as_bytes())?;
+    fs::set_permissions(&supervisor, fs::Permissions::from_mode(0o400))?;
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o755))?;
+    fs::set_permissions(rootfs.join("tmp"), fs::Permissions::from_mode(0o1777))?;
+    // Only freshly generated subtrees receive guest-root metadata. The image
+    // cache and the rest of the private rootfs retain their original metadata.
+    prepare_generated_metadata(rootfs, &[GUEST_RUNTIME, GUEST_HOME, "/workspace", "/tmp"])
+}
+
+fn prepare_generated_metadata(rootfs: &Path, paths: &[&str]) -> Result<()> {
+    for path in paths {
+        super::metadata::prepare_guest_clone_metadata(&rootfs.join(path.trim_start_matches('/')))?;
+    }
+    Ok(())
 }
 
 fn validate_input(input: &BuilderInput) -> Result<()> {
@@ -365,7 +534,7 @@ fn prepare_guest(
             "max_frame_bytes": limits.max_frame_bytes,
         }))?,
     )?;
-    Ok(())
+    prepare_generated_metadata(rootfs, &[GUEST_RUNTIME, GUEST_HOME, "/workspace"])
 }
 
 fn fresh_directory(rootfs: &Path, guest_path: &str) -> Result<()> {
@@ -393,7 +562,12 @@ fn fresh_directory(rootfs: &Path, guest_path: &str) -> Result<()> {
 }
 
 pub(super) fn arm_vmm_ownership(spec: &OwnershipSpec) -> Result<()> {
-    let mut owner = connect_owner(spec)?;
+    watched_owner(spec).map(drop)
+}
+
+fn watched_owner(spec: &OwnershipSpec) -> Result<UnixStream> {
+    let report = connect_owner(spec)?;
+    let mut owner = report.try_clone()?;
     let group = unsafe { libc::getpgrp() };
     ensure!(
         group == std::process::id() as i32 && group > 1,
@@ -417,7 +591,7 @@ pub(super) fn arm_vmm_ownership(spec: &OwnershipSpec) -> Result<()> {
             }
         })
         .context("start invocation ownership watcher")?;
-    Ok(())
+    Ok(report)
 }
 
 fn connect_owner(spec: &OwnershipSpec) -> Result<UnixStream> {
@@ -466,10 +640,6 @@ fn accept_owner(
     loop {
         check_live(deadline, cancelled)?;
         process.drain()?;
-        ensure!(
-            process.exited()?.is_none(),
-            "owned child exited before ownership handshake"
-        );
         match listener.accept() {
             Ok((mut stream, _)) => {
                 stream.set_nonblocking(true)?;
@@ -491,7 +661,12 @@ fn accept_owner(
                 return Ok(stream);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(POLL)
+                ensure!(
+                    process.exited()?.is_none(),
+                    "owned child exited before ownership handshake: {}",
+                    String::from_utf8_lossy(&process.stderr_bytes)
+                );
+                std::thread::sleep(POLL);
             }
             Err(error) => return Err(error).context("accept invocation owner"),
         }
@@ -555,6 +730,7 @@ fn write_until(
 struct OwnedProcess {
     child: Child,
     group: i32,
+    owns_group: bool,
     stdout: Option<ChildStdout>,
     stderr: Option<ChildStderr>,
     stdout_bytes: Vec<u8>,
@@ -566,14 +742,23 @@ struct OwnedProcess {
 
 impl OwnedProcess {
     fn spawn(command: &mut Command, output_limit: u64, stdin: bool) -> Result<Self> {
+        Self::spawn_scoped(command, output_limit, stdin, true)
+    }
+
+    fn spawn_scoped(
+        command: &mut Command,
+        output_limit: u64,
+        stdin: bool,
+        owns_group: bool,
+    ) -> Result<Self> {
         command
             .stdin(if stdin { Stdio::piped() } else { Stdio::null() })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        // Every host child owns a group; stopping the leader alone leaves helpers.
+        // Guardians own groups; foreign helpers inherit that already-watched group.
         unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() < 0 {
+            command.pre_exec(move || {
+                if owns_group && libc::setsid() < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 let limit = libc::rlimit {
@@ -589,8 +774,9 @@ impl OwnedProcess {
         let mut child = command.spawn().context("spawn invocation-owned process")?;
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
-        let process = Self {
+        let mut process = Self {
             group: child.id() as i32,
+            owns_group,
             child,
             stdout,
             stderr,
@@ -600,20 +786,27 @@ impl OwnedProcess {
             status: None,
             stopped: false,
         };
-        nonblocking(
-            process
-                .stdout
-                .as_ref()
-                .context("child stdout missing")?
-                .as_raw_fd(),
-        )?;
-        nonblocking(
-            process
-                .stderr
-                .as_ref()
-                .context("child stderr missing")?
-                .as_raw_fd(),
-        )?;
+        let configured = (|| -> Result<()> {
+            nonblocking(
+                process
+                    .stdout
+                    .as_ref()
+                    .context("child stdout missing")?
+                    .as_raw_fd(),
+            )?;
+            nonblocking(
+                process
+                    .stderr
+                    .as_ref()
+                    .context("child stderr missing")?
+                    .as_raw_fd(),
+            )?;
+            Ok(())
+        })();
+        if let Err(error) = configured {
+            let cleanup = process.stop_and_reap();
+            return Err(cleanup_failure(error, cleanup));
+        }
         Ok(process)
     }
 
@@ -653,10 +846,21 @@ impl OwnedProcess {
     }
 
     fn stop_and_reap(&mut self) -> Result<ExitStatus> {
+        self.stop_inner().context(TeardownUnconfirmed)
+    }
+
+    fn stop_inner(&mut self) -> Result<ExitStatus> {
         if self.stopped {
             return self.status.context("stopped process has no exit status");
         }
-        signal_group(self.group, libc::SIGKILL)?;
+        if self.owns_group {
+            signal_group(self.group, libc::SIGKILL)?;
+        } else if unsafe { libc::kill(self.group, libc::SIGKILL) } < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error).context("stop guarded helper process");
+            }
+        }
         let deadline = Instant::now() + STOP_TIMEOUT;
         loop {
             if let Some(status) = self.exited()? {
@@ -720,10 +924,38 @@ fn drain_pipe<T: Read>(pipe: &mut Option<T>, output: &mut Vec<u8>, remaining: u6
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(tag = "role", rename_all = "snake_case")]
+enum PreparationSpec {
+    Image(ImageSpec),
+    Command(CommandSpec),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ImageSpec {
     image_id: String,
     cache_root: PathBuf,
+    destination: PathBuf,
     ownership: OwnershipSpec,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommandSpec {
+    program: PathBuf,
+    args: Vec<String>,
+    ownership: OwnershipSpec,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommandReport {
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    stdout_base64: String,
+    stderr_base64: String,
+    error: Option<String>,
+    teardown_unconfirmed: bool,
 }
 
 fn validate_image_id(image_id: &str) -> Result<()> {
@@ -738,82 +970,181 @@ fn validate_image_id(image_id: &str) -> Result<()> {
     Ok(())
 }
 
+fn preparation_command(spec_path: &Path) -> Result<Command> {
+    let mut command = Command::new(std::env::current_exe()?);
+    #[cfg(not(test))]
+    command.arg("__repository-image").arg(spec_path);
+    #[cfg(test)]
+    command
+        .args([
+            "--exact",
+            "sandbox::libkrun::repository::tests::preparation_guardian_fixture",
+            "--nocapture",
+        ])
+        .env("PILLBOX_TEST_PREPARATION_SPEC", spec_path);
+    Ok(command)
+}
+
 fn provision_image(
     image_id: &str,
     cache_root: &Path,
+    destination: &Path,
     deadline: Instant,
     cancelled: &dyn Fn() -> bool,
-) -> Result<PathBuf> {
+) -> Result<()> {
     let sockets = socket_directory()?;
     let owner_path = sockets.path().join("image-owner.sock");
     let listener = bind_listener(&owner_path)?;
-    let spec = ImageSpec {
+    let spec = PreparationSpec::Image(ImageSpec {
         image_id: image_id.into(),
         cache_root: cache_root.into(),
+        destination: destination.into(),
         ownership: OwnershipSpec {
             socket: owner_path.to_string_lossy().into_owned(),
             remaining_ms: remaining_ms(deadline)?,
         },
-    };
+    });
     let spec_path = sockets.path().join("image.json");
     write_private_file(&spec_path, &serde_json::to_vec(&spec)?)?;
-    let mut command = Command::new(std::env::current_exe()?);
-    command.arg("__repository-image").arg(&spec_path);
+    let mut command = preparation_command(&spec_path)?;
     let mut process = OwnedProcess::spawn(&mut command, COMMAND_OUTPUT_LIMIT, false)?;
-    let owner = accept_owner(&listener, &mut process, deadline, cancelled)?;
+    let owner = match accept_owner(&listener, &mut process, deadline, cancelled) {
+        Ok(owner) => owner,
+        Err(error) => {
+            let cleanup = process.stop_and_reap();
+            return Err(cleanup_failure(error, cleanup));
+        }
+    };
     let result = process.wait(deadline, cancelled);
     drop(owner);
-    // Give the guardian its own bounded cleanup window before forcing termination.
-    if result.is_err() {
-        if let Err(error) = process.wait(Instant::now() + STOP_TIMEOUT, &|| false) {
-            eprintln!("pillbox: image guardian cleanup did not finish: {error:#}");
-        }
-    }
     process.stop_and_reap()?;
     let status = result?;
+    if status.code() == Some(76) {
+        return Err(anyhow::Error::new(TeardownUnconfirmed)
+            .context(String::from_utf8_lossy(&process.stderr_bytes).into_owned()));
+    }
     ensure!(
         status.success(),
         "exact image preparation failed ({status}): {}",
         String::from_utf8_lossy(&process.stderr_bytes)
     );
     sockets.close().context("remove image guardian sockets")?;
-    let rootfs = cache_root.join(&image_id[7..]).join("rootfs");
     ensure!(
-        cache_complete(&rootfs, image_id)?,
+        cache_complete(&cache_root.join(&image_id[7..]).join("rootfs"), image_id)?,
         "image guardian returned without an exact completed rootfs"
     );
-    Ok(rootfs)
+    let metadata = fs::symlink_metadata(destination).context("inspect private rootfs clone")?;
+    ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "image guardian returned without a private rootfs clone"
+    );
+    Ok(())
 }
 
-/// Internal dispatch only: the caller retains the owner socket for this entire
-/// export transaction. EOF stops command groups and removes the stopped container.
+/// Internal dispatch only. Every foreign helper gets a watchdog before exec and
+/// shares its guardian's group; losing any supervisor closes its lifetime channel.
 pub(crate) fn image_child_main() -> ! {
-    let result = (|| -> Result<()> {
-        let path = std::env::args_os()
-            .nth(2)
-            .context("missing image guardian spec")?;
-        let mut bytes = vec![];
-        File::open(path)?
-            .take(64 * 1024 + 1)
-            .read_to_end(&mut bytes)?;
-        ensure!(bytes.len() <= 64 * 1024, "image guardian spec too large");
-        let spec: ImageSpec = serde_json::from_slice(&bytes)?;
-        validate_image_id(&spec.image_id)?;
-        ensure!(
-            spec.cache_root.is_absolute(),
-            "image cache path must be absolute"
-        );
-        let owner = std::cell::RefCell::new(connect_owner(&spec.ownership)?);
-        let cancelled = || owner_gone(&mut owner.borrow_mut()).unwrap_or(true);
-        let deadline = Instant::now() + Duration::from_millis(spec.ownership.remaining_ms);
-        materialize_exact(&spec.image_id, &spec.cache_root, deadline, &cancelled)
-    })();
+    let result = std::env::args_os()
+        .nth(2)
+        .context("missing preparation guardian spec")
+        .and_then(|path| preparation_child(Path::new(&path)));
+    finish_preparation(result)
+}
+
+fn finish_preparation(result: Result<()>) -> ! {
     match result {
         Ok(()) => std::process::exit(0),
         Err(error) => {
-            eprintln!("repository-image: {error:#}");
-            std::process::exit(70);
+            eprintln!("repository-preparation: {error:#}");
+            std::process::exit(if error.is::<TeardownUnconfirmed>() {
+                76
+            } else {
+                70
+            });
         }
+    }
+}
+
+fn preparation_child(path: &Path) -> Result<()> {
+    let mut bytes = vec![];
+    File::open(path)?
+        .take(64 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() <= 64 * 1024,
+        "preparation guardian spec too large"
+    );
+    match serde_json::from_slice::<PreparationSpec>(&bytes)? {
+        PreparationSpec::Image(spec) => {
+            validate_image_id(&spec.image_id)?;
+            ensure!(
+                spec.cache_root.is_absolute() && spec.destination.is_absolute(),
+                "image preparation paths must be absolute"
+            );
+            let owner = std::cell::RefCell::new(watched_owner(&spec.ownership)?);
+            let cancelled = || owner_gone(&mut owner.borrow_mut()).unwrap_or(true);
+            let deadline = Instant::now() + Duration::from_millis(spec.ownership.remaining_ms);
+            materialize_exact(&spec.image_id, &spec.cache_root, deadline, &cancelled)?;
+            check_live(deadline, &cancelled)?;
+            let base = spec.cache_root.join(&spec.image_id[7..]).join("rootfs");
+            let method = crate::workspace::cow::cow_clone_dir(&base, &spec.destination)?;
+            if method == crate::workspace::cow::CloneMethod::Copied {
+                eprintln!("pillbox: bounded rootfs fork fell back to a full copy");
+            }
+            check_live(deadline, &cancelled)
+        }
+        PreparationSpec::Command(spec) => {
+            let group = unsafe { libc::getpgrp() };
+            ensure!(
+                group == std::process::id() as i32 && group > 1,
+                "command guardian is not its group leader"
+            );
+            let result = command_child(spec);
+            if let Err(error) = result {
+                eprintln!("repository-command: {error:#}");
+            }
+            // A guardian must never exit while an inherited helper group lives.
+            signal_group(group, libc::SIGKILL)?;
+            bail!("command guardian survived group termination")
+        }
+    }
+}
+
+fn command_child(spec: CommandSpec) -> Result<()> {
+    let mut owner = watched_owner(&spec.ownership)?;
+    let deadline = Instant::now() + Duration::from_millis(spec.ownership.remaining_ms);
+    let mut command = Command::new(&spec.program);
+    command.args(&spec.args);
+    let mut process = OwnedProcess::spawn_scoped(&mut command, COMMAND_OUTPUT_LIMIT, false, false)?;
+    let result = process.wait(deadline, &|| false);
+    let stopped = process.stop_and_reap();
+    let teardown_unconfirmed = stopped
+        .as_ref()
+        .is_err_and(|error| error.is::<TeardownUnconfirmed>());
+    let (status, error) = match (result, stopped) {
+        (Ok(status), Ok(_)) => (Some(status), None),
+        (Err(error), Ok(status)) => (Some(status), Some(error.to_string())),
+        (_, Err(error)) => (None, Some(error.to_string())),
+    };
+    let report = CommandReport {
+        exit_code: status.and_then(|status| status.code()),
+        signal: status.and_then(|status| status.signal()),
+        stdout_base64: STANDARD.encode(&process.stdout_bytes),
+        stderr_base64: STANDARD.encode(&process.stderr_bytes),
+        error,
+        teardown_unconfirmed,
+    };
+    let mut bytes = serde_json::to_vec(&report)?;
+    bytes.push(b'\n');
+    ensure!(
+        bytes.len() <= COMMAND_REPORT_LIMIT,
+        "helper report exceeds bound"
+    );
+    write_until(&mut owner, &bytes, deadline, &|| false)?;
+    // The parent consumes the observed status, then closes ownership and kills
+    // this entire group. Staying alive closes the post-report orphan window.
+    loop {
+        std::thread::sleep(POLL);
     }
 }
 
@@ -942,7 +1273,12 @@ fn materialize_exact(
         "remove runner export container",
     );
     match (export, cleanup) {
-        (Err(error), Err(cleanup)) => bail!("{error:#}; export cleanup also failed: {cleanup:#}"),
+        (Err(error), Err(cleanup)) => {
+            if cleanup.is::<TeardownUnconfirmed>() {
+                return Err(cleanup.context(format!("export also failed: {error:#}")));
+            }
+            return Err(error.context(format!("export cleanup also failed: {cleanup:#}")));
+        }
         (Err(error), Ok(_)) => return Err(error),
         (Ok(()), Err(error)) => return Err(error),
         (Ok(()), Ok(_)) => {}
@@ -966,19 +1302,116 @@ fn run_command(
     purpose: &str,
 ) -> Result<Vec<u8>> {
     check_live(deadline, cancelled)?;
-    let mut process = OwnedProcess::spawn(command, COMMAND_OUTPUT_LIMIT, false)
-        .with_context(|| purpose.to_owned())?;
-    let result = process.wait(deadline, cancelled);
+    let sockets = socket_directory()?;
+    let owner_path = sockets.path().join("command-owner.sock");
+    let listener = bind_listener(&owner_path)?;
+    let spec = PreparationSpec::Command(CommandSpec {
+        program: command.get_program().into(),
+        args: command
+            .get_args()
+            .map(|value| {
+                value
+                    .to_str()
+                    .map(str::to_owned)
+                    .context("helper argument is not UTF-8")
+            })
+            .collect::<Result<_>>()?,
+        ownership: OwnershipSpec {
+            socket: owner_path.to_string_lossy().into_owned(),
+            remaining_ms: remaining_ms(deadline)?,
+        },
+    });
+    let spec_path = sockets.path().join("command.json");
+    write_private_file(&spec_path, &serde_json::to_vec(&spec)?)?;
+    let mut guardian = preparation_command(&spec_path)?;
+    let mut process = OwnedProcess::spawn(&mut guardian, COMMAND_OUTPUT_LIMIT, false)?;
+    let mut owner = match accept_owner(&listener, &mut process, deadline, cancelled) {
+        Ok(owner) => owner,
+        Err(error) => {
+            let cleanup = process.stop_and_reap();
+            return Err(cleanup_failure(error, cleanup));
+        }
+    };
+    let result = read_helper_report(&mut owner, &mut process, deadline, cancelled);
+    drop(owner);
     process
         .stop_and_reap()
-        .with_context(|| format!("stop {purpose}"))?;
-    let status = result.with_context(|| purpose.to_owned())?;
+        .with_context(|| format!("stop {purpose} guardian"))?;
+    let report = result.with_context(|| purpose.to_owned())?;
+    let stdout = STANDARD
+        .decode(report.stdout_base64)
+        .context("decode helper stdout")?;
+    let stderr = STANDARD
+        .decode(report.stderr_base64)
+        .context("decode helper stderr")?;
     ensure!(
-        status.success(),
-        "{purpose} failed ({status}): {}",
-        String::from_utf8_lossy(&process.stderr_bytes)
+        stdout.len() + stderr.len() <= COMMAND_OUTPUT_LIMIT as usize,
+        "helper report output exceeds bound"
     );
-    Ok(std::mem::take(&mut process.stdout_bytes))
+    if report.teardown_unconfirmed {
+        return Err(anyhow::Error::new(TeardownUnconfirmed).context(format!(
+            "{purpose}: {}",
+            report.error.as_deref().unwrap_or("helper teardown failed")
+        )));
+    }
+    if let Some(error) = report.error {
+        bail!("{purpose}: {error}");
+    }
+    ensure!(
+        report.exit_code.is_some() != report.signal.is_some(),
+        "helper reported no terminal status"
+    );
+    ensure!(
+        report.exit_code == Some(0),
+        "{purpose} failed (exit {:?}, signal {:?}): {}",
+        report.exit_code,
+        report.signal,
+        String::from_utf8_lossy(&stderr)
+    );
+    sockets.close().context("remove helper guardian sockets")?;
+    Ok(stdout)
+}
+
+fn read_helper_report(
+    owner: &mut UnixStream,
+    process: &mut OwnedProcess,
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<CommandReport> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        check_live(deadline, cancelled)?;
+        process.drain()?;
+        let available = buffer.len().min(COMMAND_REPORT_LIMIT + 1 - bytes.len());
+        match owner.read(&mut buffer[..available]) {
+            Ok(0) => bail!("helper guardian closed without a complete report"),
+            Ok(count) => {
+                bytes.extend_from_slice(&buffer[..count]);
+                ensure!(
+                    bytes.len() <= COMMAND_REPORT_LIMIT,
+                    "helper report exceeds bound"
+                );
+                if bytes.contains(&b'\n') {
+                    ensure!(
+                        bytes.last() == Some(&b'\n')
+                            && bytes.iter().filter(|byte| **byte == b'\n').count() == 1,
+                        "invalid helper report framing"
+                    );
+                    return serde_json::from_slice(&bytes).context("parse helper report");
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                ensure!(
+                    process.exited()?.is_none(),
+                    "helper guardian exited without a report"
+                );
+                std::thread::sleep(POLL);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error).context("read helper report"),
+        }
+    }
 }
 
 // Guest transport is fixed trusted code. It owns no repository data and never
@@ -1493,5 +1926,367 @@ except RuntimeError:
             assert!(!status.success());
             process.stop_and_reap().unwrap();
         }
+    }
+
+    fn verifier_input() -> VerifierInput {
+        use crate::execution::files::{FileEntry, FileLimits};
+        let tree = FileTree::new(
+            vec![
+                FileEntry {
+                    path: "main.py".into(),
+                    executable: true,
+                    bytes: b"print(7)\n".to_vec(),
+                },
+                FileEntry {
+                    path: "src/data.bin".into(),
+                    executable: false,
+                    bytes: vec![0, 255, 13, 10],
+                },
+            ],
+            &FileLimits {
+                max_file_bytes: 1024,
+                max_snapshot_bytes: 4096,
+                max_tool_calls: 10,
+                max_output_bytes: 4096,
+            },
+        )
+        .unwrap();
+        let definition = crate::execution::VerifierDefinition {
+            runtime: "python3".into(),
+            source: "assert open('main.py').read() == 'print(7)\\n'\n".into(),
+            timeout_ms: 1000,
+            max_output_bytes: 1024,
+        };
+        let verifier = Verifier {
+            verifier_id: "unit-test".into(),
+            run_id: "unit-run".into(),
+            definition_digest: crate::execution::canonical_digest(&definition).unwrap(),
+            definition,
+        };
+        let configuration = verifier::configuration(
+            &verifier,
+            "unit-output",
+            &format!("sha256:{}", "b".repeat(64)),
+            tree.digest(),
+        )
+        .unwrap();
+        VerifierInput {
+            image_id: input().image_id,
+            tree,
+            verifier,
+            configuration,
+        }
+    }
+
+    #[test]
+    fn verifier_spec_is_offline_without_auth_or_repository_shares() {
+        let spec = verifier_spec(
+            Path::new("/private/verifier-rootfs"),
+            Path::new("/private/owner"),
+            Path::new("/private/report"),
+            1000,
+        );
+        assert!(spec.egress.is_none());
+        assert!(spec.shares.is_empty());
+        assert!(spec.ownership.is_some());
+        assert_eq!(
+            spec.exec,
+            ["/usr/bin/python3", "-I", "-S", verifier::SUPERVISOR_PATH]
+        );
+        let vsock = spec.vsock.as_ref().unwrap();
+        assert_eq!(vsock.port, verifier::REPORT_PORT);
+        assert!(!vsock.listen);
+        let bytes = serde_json::to_string(&spec).unwrap();
+        for excluded in ["ca_dir", "creds_path", "access_stub", "chatgpt.com"] {
+            assert!(!bytes.contains(excluded));
+        }
+    }
+
+    #[test]
+    fn verifier_admission_requires_exact_tree_and_sealed_definition() {
+        assert!(validate_verifier_input(&verifier_input()).is_ok());
+        let mut value = verifier_input();
+        value.configuration.result_snapshot_digest = format!("sha256:{}", "c".repeat(64));
+        assert!(validate_verifier_input(&value)
+            .unwrap_err()
+            .to_string()
+            .contains("exact result tree"));
+        let mut value = verifier_input();
+        value
+            .verifier
+            .definition
+            .source
+            .push_str("print('changed')\n");
+        assert!(validate_verifier_input(&value).is_err());
+        let mut value = verifier_input();
+        value.configuration.timeout_ms += 1;
+        assert!(validate_verifier_input(&value)
+            .unwrap_err()
+            .to_string()
+            .contains("sealed definition"));
+        let mut value = verifier_input();
+        value.configuration.verifier_id = "another-verifier".into();
+        assert!(validate_verifier_input(&value).is_err());
+    }
+
+    #[test]
+    fn verifier_materializes_exact_tree_and_sealed_files_in_fresh_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let rootfs = directory.path().canonicalize().unwrap();
+        fs::create_dir_all(rootfs.join("home/pillbox/.codex")).unwrap();
+        fs::write(rootfs.join("home/pillbox/.codex/auth.json"), b"ambient").unwrap();
+        fs::create_dir_all(rootfs.join("opt/pillbox-execution")).unwrap();
+        fs::write(rootfs.join("opt/pillbox-execution/ca.key"), b"old-key").unwrap();
+        let input = verifier_input();
+        let digest = input.tree.digest().to_owned();
+        prepare_verifier_guest(&rootfs, &input).unwrap();
+        assert_eq!(input.tree.digest(), digest);
+        assert_eq!(
+            fs::read(rootfs.join(verifier::SOURCE_PATH.trim_start_matches('/'))).unwrap(),
+            input.verifier.definition.source.as_bytes()
+        );
+        assert_eq!(
+            fs::read(rootfs.join(verifier::SUPERVISOR_PATH.trim_start_matches('/'))).unwrap(),
+            verifier::guest_script().as_bytes()
+        );
+        let config: VerifierConfiguration = serde_json::from_slice(
+            &fs::read(rootfs.join(verifier::CONFIG_PATH.trim_start_matches('/'))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config.result_snapshot_digest, digest);
+        let tree = rootfs.join(verifier::INPUT_PATH.trim_start_matches('/'));
+        for entry in input.tree.entries() {
+            assert_eq!(fs::read(tree.join(&entry.path)).unwrap(), entry.bytes);
+            assert_eq!(
+                fs::metadata(tree.join(&entry.path))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                if entry.executable { 0o700 } else { 0o600 }
+            );
+        }
+        for (path, mode) in [
+            (GUEST_RUNTIME, 0o755),
+            (verifier::SOURCE_PATH, 0o444),
+            (verifier::CONFIG_PATH, 0o400),
+            (verifier::SUPERVISOR_PATH, 0o400),
+            (verifier::INPUT_PATH, 0o700),
+            ("/workspace", 0o700),
+            ("/tmp", 0o1777),
+        ] {
+            let path = rootfs.join(path.trim_start_matches('/'));
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+                mode
+            );
+            #[cfg(target_os = "macos")]
+            assert_guest_root_metadata(&path);
+        }
+        assert_eq!(fs::read_dir(rootfs.join("workspace")).unwrap().count(), 0);
+        assert_eq!(
+            fs::read_dir(rootfs.join("home/pillbox")).unwrap().count(),
+            0
+        );
+        assert!(!rootfs.join("opt/pillbox-execution/ca.key").exists());
+        assert!(!rootfs.join("opt/pillbox-execution/ca.crt").exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_guest_root_metadata(path: &Path) {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let path_c = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let mut buffer = [0_u8; 64];
+        let length = unsafe {
+            libc::getxattr(
+                path_c.as_ptr(),
+                c"user.containers.override_stat".as_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                0,
+                libc::XATTR_NOFOLLOW,
+            )
+        };
+        assert!(
+            length > 0,
+            "missing guest-root metadata: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            std::str::from_utf8(&buffer[..length as usize]).unwrap(),
+            format!(
+                "0:0:0{:o}",
+                fs::symlink_metadata(path).unwrap().permissions().mode()
+            )
+        );
+    }
+
+    #[test]
+    fn frame_limit_matches_protocol_and_accepts_maximum_file_payload() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        assert_eq!(MAX_FRAME as u64, crate::execution::MAX_FRAME_BYTES);
+        let encoded = STANDARD.encode(vec![0_u8; crate::execution::files::MAX_FILE_BYTES as usize]);
+        let frame = serde_json::to_vec(&serde_json::json!({"jsonrpc":"2.0", "id":1,
+            "result":{"content_base64":encoded}}))
+        .unwrap();
+        assert!(frame.len() > 4 * 1024 * 1024);
+        assert!(frame.len() <= MAX_FRAME);
+        let mut limit = limits();
+        limit.max_frame_bytes = MAX_FRAME;
+        assert!(limit.validate().is_ok());
+        limit.max_frame_bytes += 1;
+        assert!(limit.validate().is_err());
+    }
+
+    #[test]
+    fn preparation_guardian_fixture() {
+        let Some(path) = std::env::var_os("PILLBOX_TEST_PREPARATION_SPEC") else {
+            return;
+        };
+        finish_preparation(preparation_child(Path::new(&path)));
+    }
+
+    fn helper_with_descendant(pid_file: &Path, wait: bool) -> Command {
+        let script = format!(
+            r#"import os, subprocess, sys, time
+child = subprocess.Popen(['/bin/sleep', '30'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+with open(sys.argv[1], 'w') as output:
+    output.write(str(os.getpid()) + '\n' + str(child.pid) + '\n')
+{}
+"#,
+            if wait { "time.sleep(30)" } else { "" }
+        );
+        let mut command = Command::new("python3");
+        command.args(["-I", "-S", "-c", &script]).arg(pid_file);
+        command
+    }
+
+    fn await_helper_pids(path: &Path) -> Vec<i32> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(bytes) = fs::read_to_string(path) {
+                let values: Vec<i32> = bytes.lines().filter_map(|line| line.parse().ok()).collect();
+                if values.len() == 2 {
+                    return values;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "helper never recorded child identities"
+            );
+            std::thread::sleep(POLL);
+        }
+    }
+
+    fn await_no_processes(pids: &[i32]) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if pids.iter().all(|pid| unsafe { libc::kill(*pid, 0) } < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)) { return; }
+            assert!(
+                Instant::now() < deadline,
+                "owned processes survived teardown: {pids:?}"
+            );
+            std::thread::sleep(POLL);
+        }
+    }
+
+    #[test]
+    fn nested_supervisor_fixture() {
+        let Some(path) = std::env::var_os("PILLBOX_TEST_NESTED_PIDS") else {
+            return;
+        };
+        let mut command = helper_with_descendant(Path::new(&path), true);
+        run_command(
+            &mut command,
+            Instant::now() + Duration::from_secs(20),
+            &|| false,
+            "nested lifetime fixture",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn killed_supervisor_cannot_orphan_helper_or_descendant_groups() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_file = directory.path().join("pids");
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "sandbox::libkrun::repository::tests::nested_supervisor_fixture",
+                "--nocapture",
+            ])
+            .env("PILLBOX_TEST_NESTED_PIDS", &pid_file);
+        let mut supervisor =
+            OwnedProcess::spawn(&mut command, COMMAND_OUTPUT_LIMIT, false).unwrap();
+        let mut pids = await_helper_pids(&pid_file);
+        let guardian = unsafe { libc::getpgid(pids[0]) };
+        assert!(guardian > 1 && guardian != supervisor.group);
+        pids.push(guardian);
+        supervisor.stop_and_reap().unwrap();
+        await_no_processes(&pids);
+    }
+
+    #[test]
+    fn successful_command_report_is_followed_by_descendant_teardown() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_file = directory.path().join("pids");
+        let mut command = helper_with_descendant(&pid_file, false);
+        run_command(
+            &mut command,
+            Instant::now() + Duration::from_secs(5),
+            &|| false,
+            "successful helper with descendant",
+        )
+        .unwrap();
+        let pids = await_helper_pids(&pid_file);
+        await_no_processes(&pids);
+    }
+
+    #[test]
+    fn exact_cached_image_is_cloned_inside_guarded_preparation() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = directory.path().canonicalize().unwrap();
+        let image_id = input().image_id;
+        let stage = tempfile::tempdir_in(&cache).unwrap();
+        fs::create_dir(stage.path().join("rootfs")).unwrap();
+        fs::write(stage.path().join("rootfs/proof"), b"pristine").unwrap();
+        commit_generation(stage, &cache.join(&image_id[7..]), &image_id).unwrap();
+        let destination = cache.join("private-rootfs");
+        provision_image(
+            &image_id,
+            &cache,
+            &destination,
+            Instant::now() + Duration::from_secs(5),
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(fs::read(destination.join("proof")).unwrap(), b"pristine");
+        fs::write(destination.join("proof"), b"private edit").unwrap();
+        assert_eq!(
+            fs::read(cache.join(&image_id[7..]).join("rootfs/proof")).unwrap(),
+            b"pristine"
+        );
+    }
+
+    #[test]
+    fn teardown_marker_survives_context_without_hiding_original_failure() {
+        let error = cleanup_failure(
+            anyhow::anyhow!("launch failed"),
+            Err(anyhow::anyhow!("reap failed").context(TeardownUnconfirmed)),
+        );
+        assert!(error.is::<TeardownUnconfirmed>());
+        let text = format!("{error:#}");
+        assert!(text.contains("launch failed") && text.contains("reap failed"));
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        let mut process = OwnedProcess::spawn(&mut command, 1024, false).unwrap();
+        let group = process.group;
+        process.group = 1;
+        let error = process.stop_and_reap().unwrap_err();
+        assert!(error.is::<TeardownUnconfirmed>());
+        process.group = group;
+        process.stop_and_reap().unwrap();
     }
 }

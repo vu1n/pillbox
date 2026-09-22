@@ -405,6 +405,9 @@ fn prepare_verifier_guest(rootfs: &Path, input: &VerifierInput) -> Result<()> {
     let source = rootfs.join(verifier::SOURCE_PATH.trim_start_matches('/'));
     write_private_file(&source, input.verifier.definition.source.as_bytes())?;
     fs::set_permissions(&source, fs::Permissions::from_mode(0o444))?;
+    let evaluator = rootfs.join(verifier::EVALUATOR_PATH.trim_start_matches('/'));
+    write_private_file(&evaluator, verifier::evaluator_script().as_bytes())?;
+    fs::set_permissions(&evaluator, fs::Permissions::from_mode(0o444))?;
     let config = rootfs.join(verifier::CONFIG_PATH.trim_start_matches('/'));
     write_private_file(&config, &serde_json::to_vec(&input.configuration)?)?;
     fs::set_permissions(&config, fs::Permissions::from_mode(0o400))?;
@@ -2080,6 +2083,10 @@ except RuntimeError:
             fs::read(rootfs.join(verifier::SUPERVISOR_PATH.trim_start_matches('/'))).unwrap(),
             verifier::guest_script().as_bytes()
         );
+        assert_eq!(
+            fs::read(rootfs.join(verifier::EVALUATOR_PATH.trim_start_matches('/'))).unwrap(),
+            verifier::evaluator_script().as_bytes()
+        );
         let config: VerifierConfiguration = serde_json::from_slice(
             &fs::read(rootfs.join(verifier::CONFIG_PATH.trim_start_matches('/'))).unwrap(),
         )
@@ -2100,6 +2107,7 @@ except RuntimeError:
         for (path, mode) in [
             (GUEST_RUNTIME, 0o755),
             (verifier::SOURCE_PATH, 0o444),
+            (verifier::EVALUATOR_PATH, 0o444),
             (verifier::CONFIG_PATH, 0o400),
             (verifier::SUPERVISOR_PATH, 0o400),
             (verifier::INPUT_PATH, 0o700),

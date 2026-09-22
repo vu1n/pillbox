@@ -864,12 +864,14 @@ impl OwnedProcess {
         let deadline = Instant::now() + STOP_TIMEOUT;
         loop {
             if let Some(status) = self.exited()? {
-                self.stopped = true;
-                return Ok(status);
+                if !self.owns_group || !group_exists(self.group)? {
+                    self.stopped = true;
+                    return Ok(status);
+                }
             }
             ensure!(
                 Instant::now() < deadline,
-                "owned process did not reap after SIGKILL"
+                "owned process group did not terminate and reap after SIGKILL"
             );
             std::thread::sleep(POLL);
         }
@@ -893,6 +895,19 @@ fn signal_group(group: i32, signal: i32) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn group_exists(group: i32) -> Result<bool> {
+    ensure!(group > 1, "refusing invalid owned process group");
+    if unsafe { libc::killpg(group, 0) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(false)
+    } else {
+        Err(error).context("confirm owned process group disappeared")
+    }
 }
 
 fn drain_pipe<T: Read>(pipe: &mut Option<T>, output: &mut Vec<u8>, remaining: u64) -> Result<()> {
@@ -2288,5 +2303,19 @@ with open(sys.argv[1], 'w') as output:
         assert!(error.is::<TeardownUnconfirmed>());
         process.group = group;
         process.stop_and_reap().unwrap();
+    }
+
+    #[test]
+    fn stop_confirms_group_disappears_after_leader_already_exited() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 30 </dev/null >/dev/null 2>&1 &"]);
+        let mut process = OwnedProcess::spawn(&mut command, 1024, false).unwrap();
+        let status = process
+            .wait(Instant::now() + Duration::from_secs(2), &|| false)
+            .unwrap();
+        assert!(status.success());
+        assert!(group_exists(process.group).unwrap());
+        process.stop_and_reap().unwrap();
+        assert!(!group_exists(process.group).unwrap());
     }
 }

@@ -108,7 +108,7 @@ impl FileTree {
         limits.validate()?;
         validate_entries(&entries, limits)?;
         let total_bytes = entries.iter().map(|entry| entry.bytes.len() as u64).sum();
-        let digest = tree_digest(&entries)?;
+        let digest = digest(&tree_manifest(&entries)?);
         Ok(Self {
             entries,
             total_bytes,
@@ -122,6 +122,10 @@ impl FileTree {
 
     pub(crate) fn digest(&self) -> &str {
         &self.digest
+    }
+
+    pub(crate) fn manifest_bytes(&self) -> Result<Vec<u8>> {
+        tree_manifest(&self.entries)
     }
 }
 
@@ -143,6 +147,7 @@ pub(crate) struct FileBroker {
 #[derive(Debug)]
 pub(crate) struct FileResult {
     pub(crate) base_digest: String,
+    pub(crate) base: FileTree,
     pub(crate) result_digest: String,
     pub(crate) changed_paths: Vec<String>,
     pub(crate) tree: FileTree,
@@ -255,7 +260,8 @@ impl FileBroker {
         changed_paths.sort();
         let tree = FileTree::new(self.entries, &self.policy.limits)?;
         Ok(FileResult {
-            base_digest: self.base.digest,
+            base_digest: self.base.digest.clone(),
+            base: self.base,
             result_digest: tree.digest.clone(),
             changed_paths,
             tree,
@@ -378,7 +384,7 @@ fn paths_overlap(left: &str, right: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-fn tree_digest(entries: &[FileEntry]) -> Result<String> {
+fn tree_manifest(entries: &[FileEntry]) -> Result<Vec<u8>> {
     // These fields are already in UTF-16 key order. No raw bytes or host metadata
     // enter the tree manifest, and ASCII paths preserve UTF-16 entry ordering.
     #[derive(Serialize)]
@@ -395,7 +401,7 @@ fn tree_digest(entries: &[FileEntry]) -> Result<String> {
             sha256: digest(&entry.bytes),
         })
         .collect();
-    Ok(digest(&serde_json::to_vec(&manifest)?))
+    Ok(serde_json::to_vec(&manifest)?)
 }
 
 fn digest(bytes: &[u8]) -> String {

@@ -257,6 +257,18 @@ pub(crate) struct Completion {
     pub(crate) text: ArtifactRef,
 }
 
+/// Coarse durable phase observations, including evidence from failed invocations.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ExecutionProgress {
+    pub(crate) admission: AdmissionReceipt,
+    pub(crate) builder_evidence: EvidenceRef,
+    pub(crate) native_evidence: Option<ArtifactRef>,
+    pub(crate) result: Option<RepositoryResult>,
+    pub(crate) verifier_session_id: Option<String>,
+    pub(crate) verifier_evidence: Option<EvidenceRef>,
+}
+
 impl ExecuteRequest {
     pub(crate) fn validate(&self) -> Result<FilePolicy> {
         ensure!(

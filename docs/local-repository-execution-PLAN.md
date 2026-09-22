@@ -167,6 +167,7 @@ Exact model/effort/version is checked, provider fallback disabled, unknown input
 
 ```yaml
 id: LE-004
+status: complete
 task_type: feature
 depth: deep
 depends_on: [LE-002A, LE-003, LE-004A, LE-004C, LE-004D, LE-004E, LE-004F]
@@ -189,7 +190,10 @@ gate: "Admission and native-protocol tests reject changed retry, unsupported pol
 
 LE-005A supplies the VM process primitive; this integration binds it to the admitted invocation,
 the exact result tree and separate verifier evidence. Existing offline grading is not reused:
-libkrun must have implicit TSI explicitly disabled, not merely an absent NIC.
+libkrun must have implicit TSI explicitly disabled, not merely an absent NIC. The fixed evaluator
+bootstrap establishes and verifies nondumpability after Python exec and before loading sealed
+source; the VM installs it as a root-owned read-only file. This closes same-UID descendant
+inspection of the evaluator without changing the sealed verifier definition.
 
 ```yaml
 id: LE-005
@@ -203,6 +207,7 @@ footprint:
     - "src/sandbox/docker.rs::*"
     - "src/sandbox/managed.rs::*"
     - "src/sandbox/libkrun/repository.rs::*"
+    - "src/execution/verifier.rs::*"
     - "src/execution/mod.rs::*"
     - "src/commands/execution.rs::*"
   creates:
@@ -260,6 +265,9 @@ footprint:
     - "docs/huddles-codex-execution.md::*"
     - "docs/commands.md::*"
     - "docs/substrate-plane.md::*"
+    - "src/execution/files.rs::*"
+    - "src/execution/evidence.rs::*"
+    - "src/execution/local.rs::*"
 gate: "Tighten and mandatory structure/correctness/security review complete, Brief and required CI green, PR merged, integrated content verified, and actual proof or remaining blocker recorded without claiming SB-004 prematurely."
 ```
 
@@ -361,6 +369,7 @@ to execution/2 or Huddles scopes. Fix any proven stream fixture scheduling issue
 
 ```yaml
 id: LE-004F
+status: complete
 task_type: feature
 depth: deep
 depends_on: [LE-004C, LE-004B]

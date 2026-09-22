@@ -118,3 +118,8 @@ uses the same canonical sorted `{executable,path,sha256}` format as FileTree; ea
 also persisted under that digest in the same session. Returned references verify stored bytes and
 synchronize them before terminal commit. A large model answer is an artifact, not unbounded
 inline lifecycle state. No model-written object can serve as completion or verification evidence.
+
+Running claims retain coarse progress references to the builder log, captured native frames,
+result, and separate verifier session. Failure and owner-loss recovery preserve those references.
+Raw verifier report bytes (including malformed or partial reports) are stored and linked before
+interpretation, so a transport or parser failure remains inspectable without being called a verdict.

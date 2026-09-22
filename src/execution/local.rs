@@ -63,7 +63,15 @@ pub(crate) fn execute(
         effective_model_catalog_digest: protocol::EFFECTIVE_CATALOG_SHA256.into(),
         evidence: evidence.reference(),
     };
-    owner.running(serde_json::to_value(&admission)?)?;
+    let mut progress = ExecutionProgress {
+        builder_evidence: evidence.reference(),
+        admission,
+        native_evidence: None,
+        result: None,
+        verifier_session_id: None,
+        verifier_evidence: None,
+    };
+    owner.running(serde_json::to_value(&progress)?)?;
     let result = run_builder(
         pb,
         request,
@@ -72,7 +80,7 @@ pub(crate) fn execute(
         base,
         policy,
         &mut evidence,
-        admission,
+        &mut progress,
     );
     if let Err(error) = &result {
         // Native success is never inferred from a model response. This is a runtime
@@ -81,6 +89,8 @@ pub(crate) fn execute(
             "repository.execution.failed",
             json!({"error": format!("{error:#}")}),
         ));
+        progress.builder_evidence = evidence.reference();
+        let recorded = recorded.and_then(|_| owner.observe(serde_json::to_value(&progress)?));
         if let Err(persistence) = recorded {
             // Preserve an unconfirmed teardown as the root error: callers must not
             // turn a logging failure into permission to commit terminal state.
@@ -96,12 +106,12 @@ pub(crate) fn execute(
 fn run_builder(
     pb: &Pillbox,
     request: &ExecuteRequest,
-    owner: &OwnedInvocation,
+    owner: &mut OwnedInvocation,
     deadline: Instant,
     base: FileTree,
     policy: files::FilePolicy,
     evidence: &mut ExecutionEvidence,
-    admission: AdmissionReceipt,
+    progress: &mut ExecutionProgress,
 ) -> Result<Completion> {
     check_live(owner, deadline)?;
     let spec = crate::agents::lookup("execution", "codex")?;
@@ -140,7 +150,7 @@ fn run_builder(
     // error at the orchestration boundary instead of treating it as no cancellation.
     let cancelled = || !matches!(owner.cancelled(), Ok(false));
     let mut vm = repository::launch_builder(input, vm_limits(request, deadline)?, &cancelled)?;
-    let mut broker = FileBroker::new(base.clone(), policy)?;
+    let mut broker = FileBroker::new(base, policy)?;
     let operations: Vec<_> = request
         .manifest
         .scope
@@ -176,17 +186,25 @@ fn run_builder(
     let diagnostics = vm.diagnostics();
     vm.stop_and_reap()?;
     // Capture starts only after confirmed producer termination, including errors.
+    if let Ok(observed) = &native {
+        let frames = match observed {
+            Ok(done) => &done.evidence,
+            Err(failed) => &failed.evidence,
+        };
+        progress.native_evidence = Some(evidence.native_frames(frames)?);
+        progress.builder_evidence = evidence.reference();
+        owner.observe(serde_json::to_value(&progress)?)?;
+    }
     let diagnostics = evidence.artifact(&diagnostics?, "text/plain")?;
     evidence.append(custom(
         "repository.builder.stopped",
         json!({"diagnostics": diagnostics}),
     ))?;
     let native = native?;
-    let frames = match &native {
-        Ok(done) => &done.evidence,
-        Err(failed) => &failed.evidence,
-    };
-    let native_evidence = evidence.native_frames(frames)?;
+    let native_evidence = progress
+        .native_evidence
+        .clone()
+        .context("native capture is absent")?;
     let native = native.map_err(|failure| failure.error)?;
     check_live(owner, deadline)?;
     let usage = broker.usage();
@@ -198,17 +216,17 @@ fn run_builder(
     ))?;
     let result = broker.finish()?;
     ensure!(
-        result.base_digest == base.digest(),
+        result.base_digest == progress.admission.input_snapshot_digest,
         "broker base identity changed"
     );
     ensure!(
         result.changed_paths.len() <= limits.max_changed_paths,
         "changed-path limit exceeded"
     );
-    let patch = snapshot::capture_patch(&base, &result.tree, limits.max_patch_bytes)?;
+    let patch = snapshot::capture_patch(&result.base, &result.tree, limits.max_patch_bytes)?;
     let patch = evidence.artifact(&patch, "text/x-diff")?;
     let snapshot_manifest = evidence.snapshot(&result.tree)?;
-    let text = evidence.artifact(native.text.as_bytes(), "text/plain; charset=utf-8")?;
+    let text = capture_text(evidence, &native.text)?;
     evidence.append(custom(
         "repository.result.captured",
         json!({
@@ -227,8 +245,8 @@ fn run_builder(
     }))?;
     let captured = RepositoryResult {
         invocation_id: request.invocation_id.clone(),
-        request_hash: admission.request_hash.clone(),
-        manifest_digest: admission.manifest_digest.clone(),
+        request_hash: progress.admission.request_hash.clone(),
+        manifest_digest: progress.admission.manifest_digest.clone(),
         output_id: request.manifest.output_id.clone(),
         base: request.manifest.base.clone(),
         execution: request.execution.clone(),
@@ -238,9 +256,21 @@ fn run_builder(
         changed_paths: result.changed_paths,
         evidence: evidence.reference(),
     };
-    let verification = run_verifier(pb, request, owner, deadline, &captured, result.tree)?;
+    progress.result = Some(captured.clone());
+    progress.builder_evidence = evidence.reference();
+    owner.observe(serde_json::to_value(&progress)?)?;
+    let verification = run_verifier(
+        pb,
+        request,
+        owner,
+        deadline,
+        &captured,
+        result.tree,
+        evidence,
+        progress,
+    )?;
     Ok(Completion {
-        admission,
+        admission: progress.admission.clone(),
         result: captured,
         verification,
         native_evidence,
@@ -248,13 +278,16 @@ fn run_builder(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_verifier(
     pb: &Pillbox,
     request: &ExecuteRequest,
-    owner: &OwnedInvocation,
+    owner: &mut OwnedInvocation,
     deadline: Instant,
     captured: &RepositoryResult,
     tree: FileTree,
+    builder_evidence: &mut ExecutionEvidence,
+    progress: &mut ExecutionProgress,
 ) -> Result<Verification> {
     check_live(owner, deadline)?;
     let sealed = &request.manifest.verifier;
@@ -266,102 +299,140 @@ fn run_verifier(
         session_id != request.session_ref.session_id,
         "verifier session collision"
     );
+    progress.verifier_session_id = Some(session_id.clone());
+    builder_evidence.append(custom(
+        "repository.verifier.prepared",
+        json!({
+            "session_id": session_id, "configuration": configuration,
+        }),
+    ))?;
+    progress.builder_evidence = builder_evidence.reference();
+    owner.observe(serde_json::to_value(&progress)?)?;
     let mut evidence = ExecutionEvidence::start(
         pb,
         &session_id,
         &sealed.run_id,
         serde_json::to_value(&configuration)?,
     )?;
-    let cancelled = || !matches!(owner.cancelled(), Ok(false));
-    let mut vm = repository::launch_verifier(
-        VerifierInput {
-            image_id: request.manifest.runner_image_id.clone(),
-            tree,
-            verifier: sealed.clone(),
-            configuration: configuration.clone(),
-        },
-        vm_limits(request, deadline)?,
-        &cancelled,
-    )?;
-    let report = (|| -> Result<Vec<u8>> {
-        let mut stream = vm.connect_rpc(&cancelled)?;
-        let mut bytes = Vec::new();
-        loop {
-            check_live(owner, deadline)?;
-            let mut chunk = [0; 8192];
-            match stream.read(&mut chunk) {
-                Ok(0) => {
-                    ensure!(!bytes.is_empty(), "verifier disconnected without a report");
-                    return Ok(bytes);
-                }
-                Ok(n) => {
-                    ensure!(
-                        bytes.len() + n <= configuration.max_report_bytes(),
-                        "verifier report limit exceeded"
-                    );
-                    bytes.extend_from_slice(&chunk[..n]);
-                    if bytes.contains(&b'\n') {
-                        return Ok(bytes);
+    progress.verifier_evidence = Some(evidence.reference());
+    owner.observe(serde_json::to_value(&progress)?)?;
+    let outcome = (|| -> Result<Verification> {
+        let cancelled = || !matches!(owner.cancelled(), Ok(false));
+        let mut vm = repository::launch_verifier(
+            VerifierInput {
+                image_id: request.manifest.runner_image_id.clone(),
+                tree,
+                verifier: sealed.clone(),
+                configuration: configuration.clone(),
+            },
+            vm_limits(request, deadline)?,
+            &cancelled,
+        )?;
+        let mut report = Vec::new();
+        let received = (|| -> Result<()> {
+            let mut stream = vm.connect_rpc(&cancelled)?;
+            loop {
+                check_live(owner, deadline)?;
+                let mut chunk = [0; 8192];
+                match stream.read(&mut chunk) {
+                    Ok(0) => {
+                        ensure!(!report.is_empty(), "verifier disconnected without a report");
+                        return Ok(());
                     }
+                    Ok(n) => {
+                        let accepted = n.min(configuration.max_report_bytes() - report.len());
+                        report.extend_from_slice(&chunk[..accepted]);
+                        ensure!(accepted == n, "verifier report limit exceeded");
+                        if report.contains(&b'\n') {
+                            return Ok(());
+                        }
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock
+                                | io::ErrorKind::TimedOut
+                                | io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        // A verifier may exit immediately after sending its report.
+                        // Drain queued bytes before interpreting process exit.
+                        vm.check_running(&cancelled)?;
+                    }
+                    Err(error) => return Err(error).context("receive independent verifier report"),
                 }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock
-                            | io::ErrorKind::TimedOut
-                            | io::ErrorKind::Interrupted
-                    ) =>
-                {
-                    // A verifier may exit immediately after sending its report.
-                    // Drain queued bytes before interpreting process exit.
-                    vm.check_running(&cancelled)?;
-                }
-                Err(error) => return Err(error).context("receive independent verifier report"),
             }
-        }
+        })();
+        let diagnostics = vm.diagnostics();
+        vm.stop_and_reap()?;
+        let artifact = capture_verifier_report(&mut evidence, &report, received.is_ok())?;
+        let diagnostics = evidence.artifact(&diagnostics?, "text/plain")?;
+        evidence.append(custom(
+            "repository.verifier.stopped",
+            json!({"diagnostics": diagnostics}),
+        ))?;
+        received?;
+        let observation = verifier::parse_report(&report, &configuration)?;
+        let passed = observation.outcome == verifier::VerifierOutcome::Passed;
+        evidence.append(custom(
+            "repository.verifier.observed",
+            json!({
+                "report": artifact, "configuration": configuration,
+                "exit_code": observation.exit_code, "signal": observation.signal,
+                "timed_out": observation.timed_out, "output_limited": observation.output_limited,
+            }),
+        ))?;
+        evidence.append(Payload::Scored(Scored {
+            grader: sealed.verifier_id.clone(),
+            passed,
+            score: if passed { 1.0 } else { 0.0 },
+            feedback: format!("Sealed verifier report: {}", artifact.digest),
+            criteria: vec![],
+        }))?;
+        check_live(owner, deadline)?;
+        Ok(Verification {
+            verifier_id: sealed.verifier_id.clone(),
+            run_id: sealed.run_id.clone(),
+            definition_digest: sealed.definition_digest.clone(),
+            output_id: captured.output_id.clone(),
+            result_digest,
+            result_snapshot_digest: captured.result_snapshot_digest.clone(),
+            outcome: if passed {
+                VerificationOutcome::Pass
+            } else {
+                VerificationOutcome::Fail
+            },
+            report: artifact,
+            evidence: evidence.reference(),
+        })
     })();
-    let diagnostics = vm.diagnostics();
-    vm.stop_and_reap()?;
-    let diagnostics = evidence.artifact(&diagnostics?, "text/plain")?;
+    progress.verifier_evidence = Some(evidence.reference());
+    if let Err(persistence) = owner.observe(serde_json::to_value(&progress)?) {
+        return match outcome {
+            Err(error) => Err(error.context(format!(
+                "verifier progress was not persisted: {persistence:#}"
+            ))),
+            Ok(_) => Err(persistence),
+        };
+    }
+    outcome
+}
+
+fn capture_verifier_report(
+    evidence: &mut ExecutionEvidence,
+    report: &[u8],
+    transport_complete: bool,
+) -> Result<ArtifactRef> {
+    let artifact = evidence.artifact(report, "application/json")?;
     evidence.append(custom(
-        "repository.verifier.stopped",
-        json!({"diagnostics": diagnostics}),
+        "repository.verifier.report_captured",
+        json!({"report": artifact, "transport_complete": transport_complete}),
     ))?;
-    let report = report?;
-    let artifact = evidence.artifact(&report, "application/json")?;
-    let observation = verifier::parse_report(&report, &configuration)?;
-    let passed = observation.outcome == verifier::VerifierOutcome::Passed;
-    evidence.append(custom(
-        "repository.verifier.observed",
-        json!({
-            "report": artifact, "configuration": configuration,
-            "exit_code": observation.exit_code, "signal": observation.signal,
-            "timed_out": observation.timed_out, "output_limited": observation.output_limited,
-        }),
-    ))?;
-    evidence.append(Payload::Scored(Scored {
-        grader: sealed.verifier_id.clone(),
-        passed,
-        score: if passed { 1.0 } else { 0.0 },
-        feedback: format!("Sealed verifier report: {}", artifact.digest),
-        criteria: vec![],
-    }))?;
-    check_live(owner, deadline)?;
-    Ok(Verification {
-        verifier_id: sealed.verifier_id.clone(),
-        run_id: sealed.run_id.clone(),
-        definition_digest: sealed.definition_digest.clone(),
-        output_id: captured.output_id.clone(),
-        result_digest,
-        result_snapshot_digest: captured.result_snapshot_digest.clone(),
-        outcome: if passed {
-            VerificationOutcome::Pass
-        } else {
-            VerificationOutcome::Fail
-        },
-        report: artifact,
-        evidence: evidence.reference(),
-    })
+    Ok(artifact)
+}
+
+fn capture_text(evidence: &ExecutionEvidence, text: &str) -> Result<ArtifactRef> {
+    evidence.artifact(text.as_bytes(), "text/plain;charset=utf-8")
 }
 
 fn custom(name: &str, payload: serde_json::Value) -> Payload {
@@ -388,4 +459,53 @@ fn vm_limits(request: &ExecuteRequest, deadline: Instant) -> Result<VmLimits> {
         max_output_bytes: request.manifest.limits.max_evidence_bytes,
         max_frame_bytes: request.manifest.limits.max_frame_bytes as usize,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::{blob::BlobStore, log::SessionLog};
+    use crate::pillbox::Scope;
+
+    #[test]
+    fn final_text_and_invalid_report_remain_retrievable_as_exact_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let pb = Pillbox {
+            scope: Scope::Global,
+            state_dir: temp.path().to_path_buf(),
+            meta: None,
+        };
+        let mut evidence = ExecutionEvidence::start(&pb, "verifier-1", "run-1", json!({})).unwrap();
+        let blobs = BlobStore::open(&pb, "verifier-1").unwrap();
+        for text in ["", "Done: café ✓\n"] {
+            let artifact = capture_text(&evidence, text).unwrap();
+            assert_eq!(artifact.media_type, "text/plain;charset=utf-8");
+            assert_eq!(
+                blobs
+                    .get(artifact.digest.strip_prefix("sha256:").unwrap())
+                    .unwrap(),
+                text.as_bytes()
+            );
+        }
+        let malformed = b"{partial report";
+        let artifact = capture_verifier_report(&mut evidence, malformed, false).unwrap();
+        assert_eq!(
+            blobs
+                .get(artifact.digest.strip_prefix("sha256:").unwrap())
+                .unwrap(),
+            malformed
+        );
+        let events = SessionLog::open(&pb, "verifier-1")
+            .unwrap()
+            .read_from(0)
+            .unwrap();
+        let Payload::Custom(record) = &events.last().unwrap().payload else {
+            panic!("report reference missing")
+        };
+        assert_eq!(record.name, "repository.verifier.report_captured");
+        let payload = record.payload.as_ref().unwrap();
+        assert_eq!(payload["report"], serde_json::to_value(artifact).unwrap());
+        assert_eq!(payload["transport_complete"], false);
+        assert_eq!(evidence.reference().seq_range, [1, 2]);
+    }
 }

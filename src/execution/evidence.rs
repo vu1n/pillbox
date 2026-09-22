@@ -7,7 +7,6 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{ensure, Context, Result};
-use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -214,24 +213,10 @@ impl ExecutionEvidence {
     }
 
     pub(crate) fn snapshot(&self, tree: &FileTree) -> Result<ArtifactRef> {
-        // Field order is the FileTree canonical manifest contract (UTF-16 key order).
-        #[derive(Serialize)]
-        struct Entry<'a> {
-            executable: bool,
-            path: &'a str,
-            sha256: String,
-        }
-        let mut manifest = Vec::with_capacity(tree.entries().len());
         for entry in tree.entries() {
-            let content = self.artifact(&entry.bytes, "application/octet-stream")?;
-            manifest.push(Entry {
-                executable: entry.executable,
-                path: &entry.path,
-                sha256: content.digest,
-            });
+            self.artifact(&entry.bytes, "application/octet-stream")?;
         }
-        let bytes =
-            serde_json::to_vec(&manifest).context("serialize complete execution snapshot")?;
+        let bytes = tree.manifest_bytes()?;
         ensure!(
             digest(&bytes) == tree.digest(),
             "execution snapshot manifest differs from FileTree identity"

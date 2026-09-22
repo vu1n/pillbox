@@ -206,6 +206,14 @@ impl OwnedInvocation {
         self.write_state(Status::Running, detail)
     }
 
+    pub(crate) fn observe(&mut self, detail: Value) -> Result<()> {
+        ensure!(
+            self.record.status == Status::Running,
+            "execution is not running"
+        );
+        self.write_state(Status::Running, detail)
+    }
+
     /// Caller must stop/reap the producer and durably capture evidence first.
     pub(crate) fn finish(&mut self, status: Status, detail: Value) -> Result<()> {
         let _transition = transition_lock(&self.directory)?;
@@ -277,7 +285,9 @@ fn recover_record(directory: &Path, original: &Original, owner_lost: bool) -> Re
     };
     if owner_lost && !record.status.terminal() {
         record.status = Status::Interrupted;
-        record.detail = serde_json::json!({"reason": "invocation_owner_lost"});
+        record.detail = serde_json::json!({
+            "reason": "invocation_owner_lost", "evidence": record.detail,
+        });
         atomic_json(directory, "state.json", &record)?;
     }
     Ok(record)
@@ -447,6 +457,31 @@ mod tests {
             panic!("reacquired abandoned invocation")
         };
         assert_eq!(record.status, Status::Interrupted);
+    }
+
+    #[test]
+    fn progress_is_durable_preserved_on_owner_loss_and_immutable_after_finish() {
+        let root = tempfile::tempdir().unwrap();
+        let store = InvocationStore::new(root.path()).unwrap();
+        let mut owner = owned(&store);
+        assert!(owner.observe(Value::Null).is_err());
+        owner.running(Value::Null).unwrap();
+        let progress = serde_json::json!({"verifier_session_id":"verifier-1","builder_evidence":{"seq_range":[1,7]}});
+        owner.observe(progress.clone()).unwrap();
+        assert_eq!(store.status("inv-1").unwrap().detail, progress);
+        drop(owner);
+        let interrupted = store.status("inv-1").unwrap();
+        assert_eq!(interrupted.status, Status::Interrupted);
+        assert_eq!(interrupted.detail["evidence"], progress);
+        assert_eq!(store.status("inv-1").unwrap().detail, interrupted.detail);
+
+        let Claim::Owned(mut second) = store.claim("inv-2", "{}").unwrap() else {
+            panic!("new invocation not owned")
+        };
+        second.running(progress.clone()).unwrap();
+        second.finish(Status::Failed, progress.clone()).unwrap();
+        assert!(second.observe(Value::Null).is_err());
+        assert_eq!(store.status("inv-2").unwrap().detail, progress);
     }
 
     #[test]

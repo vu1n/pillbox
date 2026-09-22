@@ -853,26 +853,42 @@ impl OwnedProcess {
         if self.stopped {
             return self.status.context("stopped process has no exit status");
         }
-        if self.owns_group {
-            signal_group(self.group, libc::SIGKILL)?;
+        // Darwin may reject signalling a group whose last member has become a
+        // zombie. Retain that error, but let confirmed reap + disappearance win.
+        let mut stop_error = if self.owns_group {
+            signal_group(self.group, libc::SIGKILL).err()
         } else if unsafe { libc::kill(self.group, libc::SIGKILL) } < 0 {
             let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) {
-                return Err(error).context("stop guarded helper process");
-            }
-        }
+            (error.raw_os_error() != Some(libc::ESRCH))
+                .then(|| anyhow::Error::new(error).context("stop guarded helper process"))
+        } else {
+            None
+        };
         let deadline = Instant::now() + STOP_TIMEOUT;
         loop {
             if let Some(status) = self.exited()? {
-                if !self.owns_group || !group_exists(self.group)? {
+                let gone = if self.owns_group {
+                    match group_exists(self.group) {
+                        Ok(exists) => !exists,
+                        Err(error) => {
+                            stop_error = Some(error);
+                            false
+                        }
+                    }
+                } else {
+                    true
+                };
+                if gone {
                     self.stopped = true;
                     return Ok(status);
                 }
             }
-            ensure!(
-                Instant::now() < deadline,
-                "owned process group did not terminate and reap after SIGKILL"
-            );
+            if Instant::now() >= deadline {
+                return Err(stop_error.unwrap_or_else(|| {
+                    anyhow::anyhow!("owned process group remains after SIGKILL")
+                }))
+                .context("owned process group did not terminate and reap after SIGKILL");
+            }
             std::thread::sleep(POLL);
         }
     }
@@ -2316,6 +2332,16 @@ with open(sys.argv[1], 'w') as output:
         assert!(status.success());
         assert!(group_exists(process.group).unwrap());
         process.stop_and_reap().unwrap();
+        assert!(!group_exists(process.group).unwrap());
+    }
+    #[test]
+    fn already_exited_group_can_be_reaped_and_confirmed() {
+        let mut process =
+            OwnedProcess::spawn(Command::new("/bin/sh").args(["-c", "exit 0"]), 1024, false)
+                .unwrap();
+        // Leave the exited leader unreaped: Darwin can return EPERM to killpg.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(process.stop_and_reap().unwrap().success());
         assert!(!group_exists(process.group).unwrap());
     }
 }

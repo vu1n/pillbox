@@ -477,3 +477,19 @@ Two version namespaces, on purpose:
   label, so don't expect them to match.
 
 If a command shape here disagrees with your binary, trust `pillbox --help`.
+
+## Sealed repository execution (SB-004; release gate pending)
+
+The local execution/3 adapter is being validated. Its exact wire shape, lifecycle and evidence
+format are documented in [bounded local repository execution](local-repository-execution.md).
+
+```sh
+pillbox execution snapshot --repository /path/to/repo --commit FULL_GIT_OID
+pillbox execution execute --request request.json --repository /path/to/repo
+pillbox execution status INVOCATION_ID
+pillbox execution cancel INVOCATION_ID
+```
+
+Execute runs in the foreground; use another process for status/cancel. Matching retries return
+the durable original invocation. A changed request conflicts and a lost owner never resamples.
+Only the local microVM backend can execute; no backend fallback grants this capability.

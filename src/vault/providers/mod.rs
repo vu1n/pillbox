@@ -27,6 +27,8 @@ use hudsucker::{
 
 pub(crate) mod anthropic;
 pub(crate) mod codex;
+#[cfg(any(feature = "libkrun", test))]
+pub(crate) mod codex_execution;
 pub(crate) mod github;
 pub(crate) mod openai;
 

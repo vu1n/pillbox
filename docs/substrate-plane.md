@@ -93,6 +93,7 @@ struct Caps {
     real_egress_fence: bool,  // DNS-level allow/deny (not proxy-only)
     detached_vault: bool,     // --detach + --vault together
     post_hoc_ingest: bool,    // ingest (headless capture drain)
+    repository_execution: bool, // sealed execution/3, exact host-brokered files
 }
 ```
 
@@ -128,6 +129,7 @@ is gated once, and callers branch on `caps()`, not on the feature.
 | `--detach` + `--vault` | ❌ | ✅ | TBD |
 | `score --in-sandbox` | ❌→**port** (`docker run --rm --network none`) | ✅ | ✅ |
 | `ingest` | n/a (tails live) | ✅ | n/a (tails live) |
+| sealed repository execution/3 | ❌ | Implementation in progress; [release gate](local-repository-execution.md) | ❌ |
 
 KVM-only isolation (real fence, in-VM MITM) stays **uniquely libkrun** — and CF
 Containers will likely decline it too. That asymmetry is correct and permanent;

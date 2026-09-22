@@ -47,6 +47,7 @@ impl SandboxBackend for DockerBackend {
     /// docs/substrate-plane.md.
     fn capabilities(&self) -> Caps {
         Caps {
+            repository_execution: false,
             pty_drive: true,
             live_pty_tail: true,
             server_mode: true,

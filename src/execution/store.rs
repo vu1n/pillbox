@@ -169,11 +169,14 @@ impl InvocationStore {
     }
 
     pub(crate) fn cancel(&self, invocation_id: &str) -> Result<Record> {
+        validate_id(invocation_id)?;
+        let directory = self.root.join(invocation_id);
+        let _transition = transition_lock(&directory)?;
         let record = self.status(invocation_id)?;
         if !record.status.terminal() {
             // Cancellation is only intent. It cannot overwrite a concurrent
             // terminal result, and the owner must reap execution before sealing.
-            atomic_json(&self.root.join(invocation_id), "cancel.json", &true)?;
+            atomic_json(&directory, "cancel.json", &true)?;
         }
         Ok(record)
     }
@@ -205,6 +208,7 @@ impl OwnedInvocation {
 
     /// Caller must stop/reap the producer and durably capture evidence first.
     pub(crate) fn finish(&mut self, status: Status, detail: Value) -> Result<()> {
+        let _transition = transition_lock(&self.directory)?;
         ensure!(
             status.terminal(),
             "a final execution status must be terminal"
@@ -216,6 +220,13 @@ impl OwnedInvocation {
             );
             return Ok(());
         }
+        // Serialize with cancel(): intent acknowledged before this commit wins;
+        // a later cancel sees the immutable terminal record instead.
+        let status = if self.cancelled()? {
+            Status::Cancelled
+        } else {
+            status
+        };
         self.write_state(status, detail)
     }
 
@@ -317,6 +328,34 @@ fn try_lock(directory: &Path) -> Result<Option<File>> {
         Ok(None)
     } else {
         Err(error).context("lock execution ownership")
+    }
+}
+
+fn transition_lock(directory: &Path) -> Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(directory.join("transition.lock"))
+        .context("open execution transition lock")?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(file);
+        }
+        let error = std::io::Error::last_os_error();
+        ensure!(
+            error.kind() == std::io::ErrorKind::WouldBlock,
+            "lock execution transition: {error}"
+        );
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "execution transition lock timed out"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
@@ -427,6 +466,35 @@ mod tests {
         assert_eq!(store.cancel("inv-1").unwrap().status, Status::Cancelled);
         drop(owner);
         assert_eq!(store.status("inv-1").unwrap().status, Status::Cancelled);
+    }
+
+    #[test]
+    fn cancellation_and_terminal_commit_have_one_observable_order() {
+        for _ in 0..20 {
+            let root = tempfile::tempdir().unwrap();
+            let store = InvocationStore::new(root.path()).unwrap();
+            let mut owner = owned(&store);
+            owner.running(Value::Null).unwrap();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            std::thread::scope(|scope| {
+                let barrier_child = barrier.clone();
+                let store_ref = &store;
+                let cancel = scope.spawn(move || {
+                    barrier_child.wait();
+                    store_ref.cancel("inv-1").unwrap()
+                });
+                barrier.wait();
+                owner.finish(Status::Completed, Value::Null).unwrap();
+                let observed = cancel.join().unwrap();
+                let expected = if observed.status == Status::Running {
+                    Status::Cancelled
+                } else {
+                    Status::Completed
+                };
+                assert_eq!(owner.record().status, expected);
+                assert_eq!(store.status("inv-1").unwrap().status, expected);
+            });
+        }
     }
 
     #[test]

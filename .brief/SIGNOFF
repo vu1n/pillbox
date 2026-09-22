@@ -193,3 +193,12 @@ gateway-no-daemon conforms: Local repository execution retains one foreground in
 docs-governance conforms: The additive execution/3 CLI, capability, immutable results and pending release gates are documented together in the local runtime, command, and substrate guides.
 libkrun-is-the-backend conforms: LE-005C launches a separate offline libkrun verifier with implicit TSI disabled, no NIC or credentials, and sealed source outside the result tree; invocation-owned image/command guardians now cover CoW preparation and terminate descendant groups on owner loss.
 libkrun-env-fork-substrate conforms: LE-005C normalizes guest metadata only on fresh generated private subtrees, preserves the pristine rootfs cache, and leaves real OAuth credentials in the existing host TokenStore and provider-bound MITM path.
+libkrun-is-the-backend conforms: The execution CLI dispatches sealed repository work only through LibkrunBackend's declared repository_execution capability; no second execution implementation is added.
+docker-backend-deleted conforms: DockerBackend only declares the new capability false; its deprecated execution behavior receives no feature or fix.
+qemu-parked conforms: The additive backend capability and trait method retain the existing seam without adding or selecting a QEMU backend.
+libkrun-env-fork-substrate conforms: The LibkrunBackend method delegates to the new bounded runtime's fresh-home, provider-bound credential path; legacy session environment and authentication behavior is unchanged.
+managed-store-of-record conforms: ManagedBackend only declares repository_execution false; managed workspace transfer and rustic-over-R2 authority are unchanged.
+managed-tier-do-gateway conforms: The new local execution command owns bounded runtime claims and artifacts only; managed execution remains unsupported for this policy, with no new Durable Object or Huddles collaboration authority.
+remote-backend-plane-removed conforms: The local execution entrypoint adds no URL transport, SSH runtime, remote flag, or remote backend implementation.
+substrate-plane-livesession conforms: Commands query the additive repository_execution capability and call the backend trait; existing LiveSession behavior and backend selection remain unchanged.
+workspace-ingest-sovereignty conforms: New session.rs dispatch enters the exact immutable Git and host file-broker runtime, while existing workspace ingest and committed-copy behavior is unchanged.

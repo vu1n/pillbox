@@ -1,12 +1,13 @@
 # Bounded local repository execution
 
-Status: implementation in progress. No public execution command currently admits this policy.
+Status: implementation in progress on the SB-004 branch. The CLI is wired; real microVM, provider,
+and independent verification gates remain pending. This is not a released execution capability.
 
 This is the Pillbox-owned runtime work for Huddles SB-004. It does not add Huddles workspace,
 thread, packet, or event authority to Pillbox. Existing `pillbox.execution/2` requests retain their
-closed wire shape and tool policy meanings. A separately versioned execution/3 request will bind
+closed wire shape and tool policy meanings. A separately versioned execution/3 request binds
 the exact generic request, repository manifest, immutable input, and verifier before provisioning
-or credential access. The command remains unavailable until the end-to-end gate passes.
+or credential access. The command must not be promoted as supported until the end-to-end gate passes.
 
 ## Enforcement boundary
 
@@ -26,7 +27,8 @@ this source adapter. An independent verifier executes sealed source outside the 
 tree; the source and its runtime/output limits are included in `definition_digest`.
 
 The first supported policy is a host-owned file broker. The agent VM receives no repository mount.
-An immutable, complete input snapshot is materialized by the host before admission; a bounded
+The sealed request binds an immutable, complete input snapshot, which the host verifies before
+credential access or VM provisioning; a bounded
 in-memory file tree owns edits. Only runtime-provided read, write, and remove tools can access that
 tree. Native environment tools are disabled by the pinned Codex app-server configuration, whose
 handler registration must be verified against the runner version. Prompts are not enforcement.
@@ -43,7 +45,7 @@ JSON containing the sorted `{path, executable, sha256}` entries. Byte digests in
 prefix; JSON object keys use UTF-16 ordering and integer values only. This format has no host paths,
 timestamps, owner IDs, directory entries, symlinks, devices, or `.git` contents. Unsupported input
 fails closed rather than being silently omitted. Git commit identity is separately bound by the
-runtime admission adapter; this tree digest identifies the exact input bytes, including dirty input.
+runtime admission adapter; this tree digest identifies the exact input bytes; this Git adapter does not admit dirty input.
 
 The first broker revision accepts ASCII paths only, with no absolute paths, traversal, empty
 segments, backslashes, control characters, colons, wildcards, `.git` segments, or Pillbox-owned
@@ -53,6 +55,12 @@ Write-only permission must not return existing bytes. Removing a file requires i
 grant. A tool/operation pair is required independently of the path grant. Unsupported pairs fail
 before launch. All mutations preserve the original immutable tree for a complete changed-path
 manifest. A no-op write does not fabricate a changed path.
+
+Native file tools use an explicit content codec: write arguments are `{path, executable, encoding,
+content}`, where `encoding` is `utf8` or `base64`. Reads prefer UTF-8 for valid text and otherwise
+return base64, with the same explicit encoding/content fields. The broker still receives exact
+bytes; the codec grants no filesystem or process access. Both decoded byte limits and actual
+serialized frame/evidence limits apply, including JSON escaping overhead.
 
 Per-file, total snapshot, tool-call, and output byte limits are finite and enforced before allocation
 or mutation. Failed operations do not partially mutate the tree. The sealed result includes every
@@ -76,10 +84,37 @@ An atomic durable claim binds canonical invocation ID, complete request digest, 
 input digest, and adapter/policy revision before any provisioning, credential read, or sampling.
 An identical retry returns the same claim. Changed content conflicts. An invocation that loses
 its supervisor becomes interrupted and never samples again. Cancellation is idempotent intent
-until the supervisor has stopped the builder; terminal evidence is immutable. No resident daemon
+until the supervisor has stopped the builder. Intent acknowledged before terminal commit wins
+under a short transition lock; later cancellation observes the immutable terminal record. No resident daemon
 or Huddles collaboration state is introduced.
 
 The supported command must prove these properties with boundary tests and a real local microVM
 execution, independent verifier, interruption, and retry evidence. A fixture response, model-written
 JSON, successful CLI exit, or post-run diff is not proof of confinement. Until those gates pass,
 this document describes unfinished work, not an available execution capability.
+
+## CLI and evidence
+
+The foreground interface is `pillbox execution execute --request request.json --repository /path/to/repo`.
+The repository path is a host source locator; the sealed full commit and complete snapshot digest
+identify the admitted bytes. `pillbox execution snapshot --repository /path/to/repo --commit FULL_OID`
+computes that digest without credentials or execution. `pillbox execution status INVOCATION_ID` and
+`pillbox execution cancel INVOCATION_ID` operate on the same resolved Pillbox state directory.
+All four commands emit the existing JSON v1 envelope; execute/status/cancel contain an `execution`
+record with `invocation_id`, `request_hash`, `status`, and `detail`. A recorded failure is a returned
+execution state; malformed requests and invocation conflicts are CLI errors.
+
+The libkrun backend alone declares `repository_execution`; backend selection never silently turns
+this request into an unconfined run. Execute retains the ownership lock for its entire foreground
+lifetime. A request observed after owner loss becomes `interrupted`, including a crash between
+physical completion and terminal commit. It is never relaunched under that identity.
+
+A successful detail contains separate admission, repository result, and verification records.
+`verification.outcome` is `pass` or `fail`; `completed` is not a synonym for a passing verifier.
+Every record binds request/manifest/input/output identities and existing SessionLog positions.
+Raw native RPC frames, final text, patch, verifier report, and complete snapshot manifest are
+content-addressed artifacts in the referenced session's existing BlobStore. The snapshot manifest
+uses the same canonical sorted `{executable,path,sha256}` format as FileTree; each file's bytes are
+also persisted under that digest in the same session. Returned references verify stored bytes and
+synchronize them before terminal commit. A large model answer is an artifact, not unbounded
+inline lifecycle state. No model-written object can serve as completion or verification evidence.

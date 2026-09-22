@@ -169,17 +169,17 @@ Exact model/effort/version is checked, provider fallback disabled, unknown input
 id: LE-004
 task_type: feature
 depth: deep
-depends_on: [LE-002A, LE-003, LE-004A, LE-004C, LE-004D, LE-004E]
+depends_on: [LE-002A, LE-003, LE-004A, LE-004C, LE-004D, LE-004E, LE-004F]
 footprint:
   modifies:
+    - "src/execution/store.rs::*"
     - "src/main.rs::*"
     - "src/commands/mod.rs::*"
     - "src/vault/providers/mod.rs::*"
     - "docs/local-repository-execution.md::*"
     - "src/execution/mod.rs::*"
-  creates:
-    - "src/commands/execution.rs"
-    - "src/execution/local.rs"
+    - "src/commands/execution.rs::*"
+    - "src/execution/local.rs::*"
 produces:
   - "src/execution/mod.rs"
 gate: "Admission and native-protocol tests reject changed retry, unsupported policy/configuration, unknown interactions and malformed or uncorrelated terminal data before claiming completion; persisted recovery never starts a second turn."
@@ -259,6 +259,7 @@ footprint:
     - "docs/local-repository-execution.md::*"
     - "docs/huddles-codex-execution.md::*"
     - "docs/commands.md::*"
+    - "docs/substrate-plane.md::*"
 gate: "Tighten and mandatory structure/correctness/security review complete, Brief and required CI green, PR merged, integrated content verified, and actual proof or remaining blocker recorded without claiming SB-004 prematurely."
 ```
 
@@ -292,12 +293,13 @@ is copied from the runtime-materialized result; no model or credentials enter th
 
 ```yaml
 id: LE-005B
+status: complete
 task_type: feature
 depth: deep
 depends_on: [LE-004D]
 footprint:
-  creates:
-    - "src/execution/verifier.rs"
+  modifies:
+    - "src/execution/verifier.rs::*"
 produces:
   - "src/execution/verifier.rs::guest_script"
   - "src/execution/verifier.rs::parse_report"
@@ -312,12 +314,13 @@ native frames and produce canonical per-file snapshot manifests with recoverable
 
 ```yaml
 id: LE-004E
+status: complete
 task_type: feature
 depth: deep
 depends_on: [LE-004D, LE-002A]
 footprint:
-  creates:
-    - "src/execution/evidence.rs"
+  modifies:
+    - "src/execution/evidence.rs::*"
 produces:
   - "src/execution/evidence.rs::ExecutionEvidence"
 gate: "Tests prove collision rejection, authoritative inclusive log positions, verified durable blob references and a complete canonical snapshot manifest whose identity matches FileTree; never claim absent frames were observed."
@@ -331,6 +334,7 @@ The report channel is accepted once and bounded by caller-controlled limits.
 
 ```yaml
 id: LE-005C
+status: complete
 task_type: feature
 depth: deep
 depends_on: [LE-005A, LE-005B]
@@ -348,6 +352,27 @@ gate: "Spec/materialization tests prove separate exact image, no egress/auth, im
   settled, so disjoint modules can progress independently. The integration gate still requires
   real VM/provider execution and does not treat unit tests as proof of confinement.
 
+## LE-004F — Text-friendly bounded file transport
+
+Keep one exact read/write/remove broker and unchanged byte-level FileCall. Dynamic write arguments
+use required path/executable/encoding/content, where encoding is utf8 or base64. Reads prefer text
+when valid UTF-8 and otherwise base64. This is the internal unreleased native profile, not a change
+to execution/2 or Huddles scopes. Fix any proven stream fixture scheduling issue in the same module.
+
+```yaml
+id: LE-004F
+task_type: feature
+depth: deep
+depends_on: [LE-004C, LE-004B]
+footprint:
+  modifies:
+    - "src/execution/native.rs::*"
+    - "src/execution/protocol.rs::*"
+produces:
+  - "src/execution/protocol.rs::parse_dynamic_call"
+gate: "Pinned closed tool schemas accept only explicit utf8/base64 codecs; exact decoded byte limits, serialized frame limits, binary round trips and independent read/write grants remain enforced; source edits require no model-side base64 encoding."
+```
+
 ## Graph
 
 ```mermaid
@@ -362,6 +387,9 @@ flowchart TD
   LE_004A --> LE_004
   LE_004B --> LE_004C["LE-004C Native turn · deep"]
   LE_004C --> LE_004
+  LE_004C --> LE_004F["LE-004F Text file codec"]
+  LE_004B --> LE_004F
+  LE_004F --> LE_004
   LE_002 --> LE_004D["LE-004D Wire schema · deep"]
   LE_004D --> LE_004
   LE_004D --> LE_004E["LE-004E Durable evidence"]

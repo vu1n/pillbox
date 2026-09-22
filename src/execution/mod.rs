@@ -1,9 +1,18 @@
 //! Bounded repository execution is a separate protocol from managed execution/2.
+#![cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 
+#[cfg(any(feature = "libkrun", test))]
+pub(crate) mod evidence;
 pub(crate) mod files;
+#[cfg(feature = "libkrun")]
+pub(crate) mod local;
+#[cfg(any(feature = "libkrun", test))]
+pub(crate) mod native;
 pub(crate) mod protocol;
 pub(crate) mod snapshot;
 pub(crate) mod store;
+#[cfg(any(feature = "libkrun", test))]
+pub(crate) mod verifier;
 
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -245,7 +254,7 @@ pub(crate) struct Completion {
     pub(crate) result: RepositoryResult,
     pub(crate) verification: Verification,
     pub(crate) native_evidence: ArtifactRef,
-    pub(crate) text: String,
+    pub(crate) text: ArtifactRef,
 }
 
 impl ExecuteRequest {
@@ -462,7 +471,7 @@ fn bounded(value: u64, maximum: u64, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn canonical_json(value: &Value) -> Result<String> {
+pub(crate) fn canonical_json(value: &Value) -> Result<String> {
     fn write(value: &Value, output: &mut String) -> Result<()> {
         match value {
             Value::Null => output.push_str("null"),

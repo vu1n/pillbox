@@ -96,6 +96,7 @@ impl SandboxBackend for ManagedBackend {
     /// persistent remote event authority.
     fn capabilities(&self) -> Caps {
         Caps {
+            repository_execution: false,
             // Drive is the structured agent channel, not raw keystrokes.
             pty_drive: false,
             live_pty_tail: false,

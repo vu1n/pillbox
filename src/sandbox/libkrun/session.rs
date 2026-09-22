@@ -38,6 +38,16 @@ use super::{
 };
 
 impl SandboxBackend for LibkrunBackend {
+    fn execute_repository(
+        &self,
+        resolved: &Pillbox,
+        repository: &std::path::Path,
+        request: &crate::execution::ExecuteRequest,
+        owner: &mut crate::execution::store::OwnedInvocation,
+    ) -> Result<crate::execution::Completion> {
+        crate::execution::local::execute(resolved, repository, request, owner)
+    }
+
     /// The microVM family: KVM-isolation features are uniquely libkrun's
     /// (real egress fence, in-sandbox grading, detached vault, post-hoc ingest).
     /// `pty_drive` drives the guest pty-host over the persistent attach socket;
@@ -45,6 +55,7 @@ impl SandboxBackend for LibkrunBackend {
     /// creds clone. No long-lived exec target. See docs/substrate-plane.md.
     fn capabilities(&self) -> Caps {
         Caps {
+            repository_execution: true,
             pty_drive: true,
             live_pty_tail: true,
             server_mode: true,

@@ -48,6 +48,8 @@ use crate::session::{Backend, Session};
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Caps {
+    /// Sealed repository execution with exact file capabilities.
+    pub(crate) repository_execution: bool,
     /// `session send` into a PTY agent.
     pub(crate) pty_drive: bool,
     /// Live `watch`/`subscribe`/`wait-idle` for a PTY agent.
@@ -90,6 +92,16 @@ impl Caps {
 /// docs/substrate-plane.md. Takes a resolved [`Pillbox`] so the backend can
 /// locate the auth home + vault state for the right scope.
 pub(crate) trait SandboxBackend {
+    fn execute_repository(
+        &self,
+        _resolved: &Pillbox,
+        _repository: &std::path::Path,
+        _request: &crate::execution::ExecuteRequest,
+        _owner: &mut crate::execution::store::OwnedInvocation,
+    ) -> Result<crate::execution::Completion> {
+        Err(self.capabilities().unsupported("execution execute"))
+    }
+
     fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>;
 
     /// What this backend can do — queried before (or instead of) attempting a

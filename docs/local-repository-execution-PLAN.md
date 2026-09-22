@@ -212,6 +212,8 @@ footprint:
     - "src/commands/execution.rs::*"
   creates:
     - "scripts/smoke/repository-execution.sh"
+    - "scripts/smoke/repository-execution/*.py"
+    - "scripts/smoke/repository-execution/README.md"
 produces:
   - "src/sandbox/libkrun/repository.rs"
 gate: "Real isolated local execution proves bounded file/tool/network/credential policy and exact model; identical retry samples once, changed retry conflicts, cancellation is idempotent, crash recovery does not resample, and captured result has positional evidence and separate offline verifier evidence."
@@ -414,3 +416,23 @@ flowchart TD
   LE_005C --> LE_005
   LE_005 ==> LE_006["LE-006 Review and ship · deep"]
 ```
+
+## Review and proof checkpoint — 2026-09-22
+
+- Correctness: fixed final-text MIME rejection, preserved failure/interruption progress and verifier
+  report references, and required whole owned-group disappearance before capture. The independent
+  reviewer rechecked all three findings and found no remaining issue in that scope.
+- Structure: reused the exact FileTree manifest serializer and moved its owned base into the final
+  broker result, removing a duplicate full-tree copy. The optional image-command value-type change
+  is deferred; all current callers use only the represented program and arguments.
+- Security: evaluator descendant process inspection was conditionally confirmed and fixed by the
+  post-exec protected bootstrap; independent static recheck and actual VM protection passed.
+  Bounded native JSON allocation was refuted as proportional resource usage (exclusion1).
+  Git object expansion before snapshot admission remains a LOW finding under active remediation.
+- Validation:104 focused execution tests passed after evidence fixes; all-target Clippy passed with
+  libkrun. Actual offline VM proof passed five cases on final evaluator source; the active-host
+  supervisor-death proof confirmed both observed owned groups disappeared.
+- Pending: live provider proof was rejected by automatic approval review, requiring specific payload
+  and destination authorization. A single synthetic gpt-5.6-sol call to chatgpt.com using the existing
+  managed login has been presented for approval. No provider call or managed credential read has
+  occurred. Retry/cancel/crash integration, portable smoke, security closure, CI and merge remain open.

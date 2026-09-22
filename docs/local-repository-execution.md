@@ -1,7 +1,8 @@
 # Bounded local repository execution
 
-Status: implementation in progress on the SB-004 branch. The CLI is wired; real microVM, provider,
-and independent verification gates remain pending. This is not a released execution capability.
+Status: implementation in progress on the SB-004 branch. The CLI and offline verifier VM are
+implemented and locally verified. The live provider and complete lifecycle integration gates
+remain pending. This is not a released execution capability.
 
 This is the Pillbox-owned runtime work for Huddles SB-004. It does not add Huddles workspace,
 thread, packet, or event authority to Pillbox. Existing `pillbox.execution/2` requests retain their
@@ -68,6 +69,10 @@ changed path and the exact complete output tree digest. The producer must be sto
 before capturing results. A separate offline verifier VM receives a private copy of that exact
 result and the trusted verifier definition; it receives no model credential. Build completion and
 verification pass/fail are separate observations with separate positional SessionRefs.
+The sealed Python evaluator runs after a fixed, root-owned bootstrap disables and verifies
+process dumpability. Same-UID repository subprocesses cannot inspect its memory through proc/ptrace.
+Trusted verifier source owns its evaluation semantics; importing repository code into its own
+interpreter does not create a process isolation boundary.
 
 ## Credentials and transport
 
@@ -123,3 +128,24 @@ Running claims retain coarse progress references to the builder log, captured na
 result, and separate verifier session. Failure and owner-loss recovery preserve those references.
 Raw verifier report bytes (including malformed or partial reports) are stored and linked before
 interpretation, so a transport or parser failure remains inspectable without being called a verdict.
+
+## Verification record — 2026-09-22
+
+The signed local verifier probe used immutable image
+`sha256:3af5c7cbb9e111e817960a30b01983f9b3891a7efb811a124c2a35d22c7126b2`.
+Its five actual VM cases passed: privilege/filesystem/network restrictions and post-exec evaluator
+protection, forged stdout, bounded output overflow, descendant timeout, and an escaped guest
+session followed by whole-VM teardown. Each completed host stop/reap and left no observed owned
+processes. Killing an active host supervisor also removed both observed owned groups within89ms.
+The lifecycle gate requires both leader reap and process-group disappearance; a signal error or
+leader exit alone is insufficient.
+
+The guest exposed loopback and a down virtual dummy interface, with no device-backed NIC or
+non-loopback route. TCP and UDP probes returned ENETUNREACH. The original fixture's stricter
+interface-name assumption and the Darwin teardown race it subsequently exposed were retained as
+failed observations; revised fixtures and the cleanup fix were tested independently.
+
+These checks used synthetic data and no provider credentials. They establish the offline verifier
+and owned-process boundaries, not model delivery, complete execution/3 integration, or Huddles
+self-build. The first live provider proof is pending explicit authorization for its synthetic
+payload and destination after automatic approval review rejected that call.

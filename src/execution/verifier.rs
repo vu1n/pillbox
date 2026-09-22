@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use super::{canonical_digest, identity, valid_digest, Verifier, MAX_TIMEOUT_MS};
 
 pub(crate) const SUPERVISOR_PATH: &str = "/opt/pillbox-execution/verifier-supervisor.py";
+pub(crate) const EVALUATOR_PATH: &str = "/opt/pillbox-execution/verifier-evaluator.py";
 pub(crate) const SOURCE_PATH: &str = "/opt/pillbox-execution/verifier-source.py";
 pub(crate) const CONFIG_PATH: &str = "/opt/pillbox-execution/verifier-config.json";
 pub(crate) const INPUT_PATH: &str = "/opt/pillbox-execution/input-tree";
@@ -214,6 +215,36 @@ pub(crate) fn guest_script() -> &'static str {
     GUEST_SCRIPT
 }
 
+/// Root-owned bootstrap run after Python's exec resets dumpability. It protects
+/// the verifier from same-UID subprocesses; code imported into the interpreter
+/// remains the verifier author's responsibility. Kernel enforcement is a VM gate.
+pub(crate) fn evaluator_script() -> &'static str {
+    EVALUATOR_SCRIPT
+}
+
+const EVALUATOR_SCRIPT: &str = r#"import ctypes
+
+SOURCE_PATH = '/opt/pillbox-execution/verifier-source.py'
+
+def main():
+    library = ctypes.CDLL(None, use_errno=True)
+    prctl = library.prctl
+    prctl.argtypes = [ctypes.c_int] + [ctypes.c_ulong] * 4
+    prctl.restype = ctypes.c_int
+    if prctl(4, 0, 0, 0, 0) != 0:  # PR_SET_DUMPABLE
+        raise OSError(ctypes.get_errno(), 'disable verifier dumpability failed')
+    dumpable = prctl(3, 0, 0, 0, 0)  # PR_GET_DUMPABLE
+    if dumpable < 0:
+        raise OSError(ctypes.get_errno(), 'read verifier dumpability failed')
+    if dumpable != 0:
+        raise RuntimeError('verifier is still dumpable')
+    import runpy
+    runpy.run_path(SOURCE_PATH, run_name='__main__')
+
+if __name__ == '__main__':
+    main()
+"#;
+
 const GUEST_SCRIPT: &str = r#"import base64
 import ctypes
 import hashlib
@@ -227,6 +258,7 @@ import subprocess
 import time
 
 ROOT = '/opt/pillbox-execution'
+EVALUATOR_PATH = ROOT + '/verifier-evaluator.py'
 REPORT_PORT = 1067
 IDENTITIES = ('version', 'verifier_id', 'run_id', 'definition_digest',
               'output_id', 'result_digest', 'result_snapshot_digest')
@@ -452,7 +484,7 @@ def main():
         check_parent(control)
         prepare_workspace(config)
         check_parent(control)
-        child = subprocess.Popen(['/usr/bin/python3', '-I', '-S', ROOT + '/verifier-source.py'],
+        child = subprocess.Popen(['/usr/bin/python3', '-I', '-S', EVALUATOR_PATH],
                                  cwd='/workspace', stdin=subprocess.DEVNULL,
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                  env={'PATH': '/usr/bin:/bin', 'HOME': '/workspace', 'TMPDIR': '/tmp'},
@@ -683,7 +715,10 @@ mod tests {
             .take()
             .unwrap()
             .write_all(
-                &serde_json::to_vec(&json!({"script": guest_script(), "config": config})).unwrap(),
+                &serde_json::to_vec(&json!({
+                    "script": guest_script(), "evaluator": evaluator_script(), "config": config,
+                }))
+                .unwrap(),
             )
             .unwrap();
         let output = process.wait_with_output().unwrap();
@@ -778,7 +813,7 @@ try:
     raise AssertionError('accepted changed source')
 except RuntimeError as error:
     assert str(error) == 'verifier definition mismatch'
-print(json.dumps([scope['ROOT'] + '/verifier-supervisor.py', scope['ROOT'] + '/verifier-source.py', scope['ROOT'] + '/verifier-config.json', scope['ROOT'] + '/input-tree', scope['REPORT_PORT']]))"#,
+print(json.dumps([scope['ROOT'] + '/verifier-supervisor.py', scope['EVALUATOR_PATH'], scope['ROOT'] + '/verifier-source.py', scope['ROOT'] + '/verifier-config.json', scope['ROOT'] + '/input-tree', scope['REPORT_PORT']]))"#,
             serde_json::to_string(&verifier.definition.source).unwrap(),
         );
         let paths: Value = serde_json::from_slice(&python_fixture(&body, &config)).unwrap();
@@ -786,6 +821,7 @@ print(json.dumps([scope['ROOT'] + '/verifier-supervisor.py', scope['ROOT'] + '/v
             paths,
             json!([
                 SUPERVISOR_PATH,
+                EVALUATOR_PATH,
                 SOURCE_PATH,
                 CONFIG_PATH,
                 INPUT_PATH,
@@ -822,6 +858,107 @@ try:
     raise AssertionError('ignored failed setuid')
 except OSError as error:
     assert str(error) == 'fixture privilege failure'"#;
+        assert!(python_fixture(body, &config).is_empty());
+    }
+
+    // These fixtures check bootstrap ordering and script semantics with a fake
+    // prctl. Real post-exec dumpability and descendant denial require Linux/VM.
+    #[test]
+    fn evaluator_rejects_dumpability_failures_before_loading_source() {
+        let (_, config) = fixture();
+        let body = r#"import ctypes, types
+evaluator = {'__name__': 'fixture'}
+exec(compile(payload['evaluator'], '<evaluator>', 'exec'), evaluator)
+assert evaluator['SOURCE_PATH'] == scope['ROOT'] + '/verifier-source.py'
+class Prctl:
+    def __init__(self, values): self.values, self.calls = iter(values), []
+    def __call__(self, *args):
+        self.calls.append(args)
+        return next(self.values)
+for values, expected, message in [
+    ([-1], OSError, 'disable verifier dumpability failed'),
+    ([0, -1], OSError, 'read verifier dumpability failed'),
+    ([0, 1], RuntimeError, 'verifier is still dumpable'),
+    ([0, 2], RuntimeError, 'verifier is still dumpable'),
+]:
+    prctl = Prctl(values)
+    evaluator['ctypes'] = types.SimpleNamespace(
+        CDLL=lambda *args, **kwargs: types.SimpleNamespace(prctl=prctl),
+        c_int=ctypes.c_int, c_ulong=ctypes.c_ulong, get_errno=lambda: 13)
+    try:
+        evaluator['main']()
+        raise AssertionError('loaded source after failed hardening')
+    except expected as error:
+        assert message in str(error), str(error)
+    assert prctl.calls == [(4, 0, 0, 0, 0), (3, 0, 0, 0, 0)][:len(values)]"#;
+        assert!(python_fixture(body, &config).is_empty());
+    }
+
+    #[test]
+    fn evaluator_preserves_sealed_script_semantics_after_hardening() {
+        let (_, config) = fixture();
+        let body = r#"import ctypes, tempfile, types
+evaluator = {'__name__': 'fixture'}
+exec(compile(payload['evaluator'], '<evaluator>', 'exec'), evaluator)
+calls = []
+def prctl(*args):
+    calls.append(args)
+    return 0
+evaluator['ctypes'] = types.SimpleNamespace(
+    CDLL=lambda *args, **kwargs: types.SimpleNamespace(prctl=prctl),
+    c_int=ctypes.c_int, c_ulong=ctypes.c_ulong)
+with tempfile.TemporaryDirectory() as directory:
+    source_path = os.path.join(directory, 'sealed.py')
+    source = ('import os, sys\nassert __name__ == "__main__"\n'
+              'assert __file__ == sys.argv[0] == ' + repr(source_path) + '\n'
+              'assert sys.flags.isolated and sys.flags.no_site\n'
+              'assert os.getcwd() == ' + repr(os.getcwd()) + '\n'
+              'assert "" not in sys.path and ' + repr(directory) + ' not in sys.path\n'
+              'os.write(1, b"sealed-output\\x00\\xff")\nraise SystemExit(17)\n')
+    with open(source_path, 'w') as file: file.write(source)
+    evaluator['SOURCE_PATH'] = source_path
+    try:
+        evaluator['main']()
+        raise AssertionError('lost sealed script exit status')
+    except SystemExit as error:
+        assert error.code == 17
+    assert calls == [(4, 0, 0, 0, 0), (3, 0, 0, 0, 0)]
+    with open(source_path) as file: assert file.read() == source"#;
+        assert_eq!(python_fixture(body, &config), b"sealed-output\0\xff");
+    }
+
+    #[test]
+    fn supervisor_launches_fixed_isolated_evaluator() {
+        let (_, config) = fixture();
+        let body = r#"import types
+class Control:
+    def __enter__(self): return self
+    def __exit__(self, *args): pass
+    def set_inheritable(self, value): assert value is False
+    def settimeout(self, value): pass
+    def connect(self, address): assert address == (2, scope['REPORT_PORT'])
+    def setblocking(self, value): pass
+scope['os'] = types.SimpleNamespace(geteuid=lambda: 0, umask=lambda mode: None)
+scope['libc_call'] = lambda *args: None
+scope['load_configuration'] = lambda: config
+scope['socket'] = types.SimpleNamespace(AF_VSOCK=40, SOCK_STREAM=1, socket=lambda *args: Control())
+scope['check_parent'] = lambda control: None
+scope['prepare_workspace'] = lambda config: None
+observed = []
+def launch(argv, **kwargs):
+    observed.append((argv, kwargs))
+    return 'child'
+scope['subprocess'] = types.SimpleNamespace(Popen=launch, DEVNULL=-3, PIPE=-1)
+scope['observe'] = lambda child, control, config: {'child': child}
+scope['send_report'] = lambda control, report: None
+scope['main']()
+assert len(observed) == 1
+argv, options = observed[0]
+assert argv == ['/usr/bin/python3', '-I', '-S', scope['EVALUATOR_PATH']]
+assert options['cwd'] == '/workspace'
+assert options['env'] == {'PATH': '/usr/bin:/bin', 'HOME': '/workspace', 'TMPDIR': '/tmp'}
+assert options['close_fds'] and options['start_new_session']
+assert options['preexec_fn'] is scope['drop_privileges']"#;
         assert!(python_fixture(body, &config).is_empty());
     }
 }

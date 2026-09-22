@@ -24,7 +24,14 @@ credential reference for purpose `model` are currently supported. The only guest
 
 The first source adapter resolves committed regular files using a full Git object ID, with ambient
 configuration, replace objects and network fetching disabled. Dirty worktree bytes are not part of
-this source adapter. An independent verifier executes sealed source outside the builder's result
+this source adapter. The source adapter additionally caps commit objects at1MiB, each tree at4MiB,
+total visited tree bytes at16MiB, tree entries at16,384 and depth at128. It preflights each exact
+object before a nonrecursive read and rejects larger metadata without treating it as an empty tree.
+Every Git child has verified16MiB allocation and32MiB mapping ceilings, bounded pack windows/cache,
+no commit-graph or multi-pack-index acceleration, and the existing aggregate deadline/output caps.
+These are object/working-buffer bounds, not a promise of a total process RSS limit. An unsupported
+Git allocation guard fails before reading repository objects.
+An independent verifier executes sealed source outside the builder's result
 tree; the source and its runtime/output limits are included in `definition_digest`.
 
 The first supported policy is a host-owned file broker. The agent VM receives no repository mount.
@@ -131,12 +138,14 @@ interpretation, so a transport or parser failure remains inspectable without bei
 
 ## Verification record — 2026-09-22
 
-The signed local verifier probe used immutable image
+The [recorded offline proof](./local-repository-execution-offline-proof.json) contains the sealed
+verifier definitions, exact report bytes/digests and observed results. It is a manual validation
+record, not an execution/3 receipt. The signed local verifier probe used immutable image
 `sha256:3af5c7cbb9e111e817960a30b01983f9b3891a7efb811a124c2a35d22c7126b2`.
 Its five actual VM cases passed: privilege/filesystem/network restrictions and post-exec evaluator
 protection, forged stdout, bounded output overflow, descendant timeout, and an escaped guest
 session followed by whole-VM teardown. Each completed host stop/reap and left no observed owned
-processes. Killing an active host supervisor also removed both observed owned groups within89ms.
+processes. Killing an active host supervisor also removed both observed owned groups within 89 ms.
 The lifecycle gate requires both leader reap and process-group disappearance; a signal error or
 leader exit alone is insufficient.
 

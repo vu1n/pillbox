@@ -1,0 +1,307 @@
+{
+  "record_kind": "manual_offline_vm_validation",
+  "date": "2026-09-22",
+  "not_a_live_execution_receipt": true,
+  "provenance": {
+    "source_revision": "da56889326adfe2af7fcb85d7a86f109092259f5",
+    "image_id": "sha256:3af5c7cbb9e111e817960a30b01983f9b3891a7efb811a124c2a35d22c7126b2",
+    "credentials_supplied": false,
+    "uses_model": false,
+    "sha256": {
+      "offline_harness-v2.rs": "6273dbbd3496bdc3e2f6c563137717a74077e1dab61f2b9452e735165173a952",
+      "offline-probe-v2-wiring.patch": "cf83a322836c28de0f1a350ec2be5aa967154ec33fa02074d159c9bf21ec7365",
+      "generated/offline-verifier-cases.json": "384d1f11545b51a347974a1ebe7752c51cbf96f8548851d0b9eacb64a377bce4",
+      "generated/expected-result-files.json": "549995a01aeb89335f9eeba9c5b0a153c34217c42ec604b09fdf3d67105736e2",
+      "hardening-v2/generated/offline-verifier-cases.json": "f726dc7aeccde847bdd7f6151f8989d9122daef8312c46c9c79bacffa79f5acd",
+      "supervisor-death-v1/generated/offline-verifier-cases.json": "87a63e52f725d5edacc582f5e327de26d60f25e418a7b4eb3ea20cc8a04983c5",
+      "src/sandbox/libkrun/repository.rs": "7f49ffc7e4921b5c966d07e952995871f720c9e7af13032e1d56838ca78b7976",
+      "src/sandbox/libkrun/mod.rs": "681c7e5a436ce6dcc095ed6252c233722723d42e6ad62a2c7bbcb8205525a855",
+      "src/execution/verifier.rs": "97710af18cdf8269598ec249be34eff70ab8122039d3c162eda3ee382afa6039",
+      "src/execution/snapshot.rs": "d0ae60e6bc56b2d00a98b6bc9955e2097759cab93cf6cab012e1ce0965ae2b70",
+      "krun/entitlements.plist": "70d65ae13874e183526aa48e55bb330f2156da94effca24f89b5e2f940262723",
+      "bin/pillbox-offline-probe-v4": "16e1d164f7fb5425dc3b48691df19d8b132fe1a1af72bdfef68e6fba4360b508",
+      "run_offline_case-v4.py": "67bad6cf160305d8e43cf891a24efb03234cc040ee4e5fada155afa7aabb7091",
+      "hardening-v3/source.py": "3e59c079be47d46a515f93d4b9876adb57a4eca0b44d0d6acf8861e64e83eec3",
+      "hardening-v3/generated/offline-verifier-cases.json": "b52f95dc17db14ec55e2c55717427e9be68dadea4d09cda22e695e149cb905ec",
+      "hardening-v3/generated/expected-result-files.json": "549995a01aeb89335f9eeba9c5b0a153c34217c42ec604b09fdf3d67105736e2"
+    },
+    "verifier_dependency": "ee4f64308615bcb1b8845ebda88b8a0499d6e70c"
+  },
+  "cases": [
+    {
+      "case": "hardening-probe-v4",
+      "interpretation": "all hardening-v3 assertions passed including post-exec dumpable0 and same-UID descendant proc access denied",
+      "verifier": {
+        "verifier_id": "smoke-verifier-hardening-v3",
+        "run_id": "smoke-verifier-run-hardening-v3",
+        "definition_digest": "sha256:bdf4778c3bdc5af2cc8b5a6c8d4eac93c81b764639e6e6740ef1159d9cdb0b89",
+        "definition": {
+          "runtime": "python3",
+          "source": "\"\"\"Only run as a sealed verifier in a fresh offline guest, never on the host.\"\"\"\nimport errno\nimport json\nimport os\nfrom pathlib import Path\nimport socket\nimport stat\n\nassert os.getcwd() == \"/workspace\"\nassert os.getuid() == os.geteuid() == os.getgid() == os.getegid() == 65534\nassert os.getgroups() == []\nstatus = dict(line.split(\":\", 1) for line in Path(\"/proc/self/status\").read_text().splitlines() if \":\" in line)\nassert status[\"NoNewPrivs\"].strip() == \"1\"\nassert int(status[\"CapEff\"].strip(), 16) == 0\nassert int(status[\"CapPrm\"].strip(), 16) == 0\nassert os.statvfs(\"/\").f_flag & os.ST_RDONLY\nsource = Path(\"/opt/pillbox-execution/verifier-source.py\").stat()\nassert source.st_uid == 0 and stat.S_IMODE(source.st_mode) == 0o444\ndenied = {}\nfor target in [\"/opt/pillbox-execution/forged-report\", \"/etc/pillbox-smoke-probe\"]:\n    try:\n        descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)\n    except OSError as error:\n        assert error.errno in (errno.EROFS, errno.EACCES, errno.EPERM)\n        denied[target] = error.errno\n    else:\n        os.close(descriptor)\n        raise AssertionError(\"wrote outside tmpfs: \" + target)\nfor key in [\"OPENAI_API_KEY\", \"ANTHROPIC_API_KEY\", \"CODEX_HOME\", \"AWS_ACCESS_KEY_ID\", \"AWS_SECRET_ACCESS_KEY\"]:\n    assert key not in os.environ, \"credential/environment key exposed: \" + key\nfor target in [\"/home/pillbox/.codex/auth.json\", \"/root/.codex/auth.json\", \"/workspace/.codex/auth.json\"]:\n    assert not os.path.lexists(target), \"auth file visible: \" + target\nmounts = {}\nfor line in Path(\"/proc/self/mountinfo\").read_text().splitlines():\n    before, after = line.split(\" - \", 1)\n    fields = before.split()\n    mounts[fields[4]] = (set(fields[5].split(\",\")), after.split()[0])\nscratch = {}\nfor target, maximum in [(\"/workspace\", 128 * 1024 * 1024), (\"/tmp\", 64 * 1024 * 1024)]:\n    flags, filesystem = mounts[target]\n    assert filesystem == \"tmpfs\" and {\"nosuid\", \"nodev\", \"rw\"}.issubset(flags)\n    info = os.statvfs(target)\n    size = info.f_blocks * info.f_frsize\n    assert 0 < size <= maximum\n    probe = Path(target) / \"smoke-write-probe\"\n    with probe.open(\"xb\") as handle:\n        handle.write(b\"bounded scratch probe\\n\")\n    probe.unlink()\n    scratch[target] = {\"bytes\": size, \"filesystem\": filesystem, \"mount_flags\": sorted(flags)}\ninterfaces = sorted(path.name for path in Path(\"/sys/class/net\").iterdir())\nassert interfaces == [\"dummy0\", \"lo\"], \"unexpected network interface\"\ndummy = Path(\"/sys/class/net/dummy0\")\nassert str(dummy.resolve()) == \"/sys/devices/virtual/net/dummy0\"\nassert not os.path.lexists(dummy / \"device\")\nassert (dummy / \"operstate\").read_text().strip() == \"down\"\nassert int((dummy / \"flags\").read_text().strip(), 16) & 1 == 0\nassert len(Path(\"/proc/net/route\").read_text().splitlines()) == 1\nassert all(line.split()[-1] == \"lo\" for line in Path(\"/proc/net/ipv6_route\").read_text().splitlines())\nwith socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as datagram:\n    try:\n        datagram.sendto(b\"\", (\"1.1.1.1\", 9))\n    except OSError as error:\n        udp_result = error.errno\n        assert udp_result == errno.ENETUNREACH\n    else:\n        raise AssertionError(\"UDP not positively denied\")\nwith socket.socket(socket.AF_INET, socket.SOCK_STREAM) as connection:\n    connection.settimeout(0.5)\n    result = connection.connect_ex((\"1.1.1.1\", 443))\n    assert result == errno.ENETUNREACH, \"TCP not positively denied\"\ntry:\n    os.kill(os.getppid(), 0)\nexcept PermissionError:\n    pass\nelse:\n    raise AssertionError(\"child may signal the root supervisor\")\ntry:\n    os.listdir(\"/proc/\" + str(os.getppid()) + \"/fd\")\nexcept PermissionError:\n    pass\nelse:\n    raise AssertionError(\"child can inspect supervisor descriptors\")\nfor descriptor in os.listdir(\"/proc/self/fd\"):\n    number = int(descriptor)\n    if number > 2:\n        try:\n            os.fstat(number)\n        except OSError as error:\n            assert error.errno == errno.EBADF\n        else:\n            raise AssertionError(\"extra inherited descriptor: \" + descriptor)\n# The post-exec evaluator must already have disabled dumpability here.\nimport ctypes\nimport subprocess\nlibrary = ctypes.CDLL(None, use_errno=True)\nprctl = library.prctl\nprctl.argtypes = [ctypes.c_int] + [ctypes.c_ulong] * 4\nprctl.restype = ctypes.c_int\nevaluator_dumpable = prctl(3, 0, 0, 0, 0)\nassert evaluator_dumpable == 0, 'evaluator is dumpable'\nevaluator = Path('/opt/pillbox-execution/verifier-evaluator.py').stat()\nassert evaluator.st_uid == 0 and stat.S_IMODE(evaluator.st_mode) == 0o444\naccess_probe = \"import errno, json, os, sys\\nparent = int(sys.argv[1])\\nassert os.getuid() == os.geteuid() == 65534\\nassert os.getppid() == parent\\nassert os.listdir('/proc/self/fd')\\ndenied = {}\\nfor name in ('fd', 'cwd', 'environ'):\\n    target = '/proc/' + str(parent) + '/' + name\\n    try:\\n        if name == 'fd':\\n            os.listdir(target)\\n        elif name == 'cwd':\\n            os.readlink(target)\\n        else:\\n            descriptor = os.open(target, os.O_RDONLY | os.O_CLOEXEC)\\n            os.close(descriptor)\\n    except PermissionError as error:\\n        assert error.errno in (errno.EACCES, errno.EPERM)\\n        denied[name] = error.errno\\n    else:\\n        raise AssertionError('same-UID descendant accessed evaluator ' + name)\\nprint(json.dumps(denied, sort_keys=True))\\n\"\nprobe = subprocess.run(['/usr/bin/python3', '-I', '-S', '-c', access_probe, str(os.getpid())],\n                       stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,\n                       env={'PATH': '/usr/bin:/bin'}, close_fds=True, timeout=3, check=True)\nassert not probe.stderr\ndescendant_access_errno = json.loads(probe.stdout)\nassert set(descendant_access_errno) == {'fd', 'cwd', 'environ'}\nprint(json.dumps({\"evaluator_dumpable\": evaluator_dumpable, \"descendant_access_errno\": descendant_access_errno, \"uid\": os.getuid(), \"gid\": os.getgid(), \"no_new_privs\": 1, \"root_read_only\": True,\n                  \"outside_write_errno\": denied, \"scratch\": scratch, \"interfaces\": interfaces,\n                  \"tcp_connect_errno\": result, \"udp_send_errno\": udp_result, \"dummy0_virtual_down_no_device\": True, \"known_auth_paths_absent\": True,\n                  \"supervisor_fd_access_denied\": True, \"extra_inherited_fds\": []}, sort_keys=True))\n",
+          "timeout_ms": 10000,
+          "max_output_bytes": 16384
+        }
+      },
+      "configuration": {
+        "version": "pillbox.verifier/1",
+        "verifier_id": "smoke-verifier-hardening-v3",
+        "run_id": "smoke-verifier-run-hardening-v3",
+        "definition_digest": "sha256:bdf4778c3bdc5af2cc8b5a6c8d4eac93c81b764639e6e6740ef1159d9cdb0b89",
+        "output_id": "offline-output-hardening-v3",
+        "result_digest": "sha256:a882c0bea2482f7359ce4c3c1c3c2f955e8bc273c14e296a31f5e2ba18b3e327",
+        "result_snapshot_digest": "sha256:7bcd19fd27d4b1d1e397a441722cd444d3fbbfc256bef9c8f8f0c3ac3a18714b",
+        "timeout_ms": 10000,
+        "max_output_bytes": 16384
+      },
+      "report_utf8": "{\"definition_digest\":\"sha256:bdf4778c3bdc5af2cc8b5a6c8d4eac93c81b764639e6e6740ef1159d9cdb0b89\",\"exit_code\":0,\"output_id\":\"offline-output-hardening-v3\",\"output_limited\":false,\"result_digest\":\"sha256:a882c0bea2482f7359ce4c3c1c3c2f955e8bc273c14e296a31f5e2ba18b3e327\",\"result_snapshot_digest\":\"sha256:7bcd19fd27d4b1d1e397a441722cd444d3fbbfc256bef9c8f8f0c3ac3a18714b\",\"run_id\":\"smoke-verifier-run-hardening-v3\",\"signal\":null,\"stderr_base64\":\"\",\"stdout_base64\":\"eyJkZXNjZW5kYW50X2FjY2Vzc19lcnJubyI6IHsiY3dkIjogMTMsICJlbnZpcm9uIjogMTMsICJmZCI6IDEzfSwgImR1bW15MF92aXJ0dWFsX2Rvd25fbm9fZGV2aWNlIjogdHJ1ZSwgImV2YWx1YXRvcl9kdW1wYWJsZSI6IDAsICJleHRyYV9pbmhlcml0ZWRfZmRzIjogW10sICJnaWQiOiA2NTUzNCwgImludGVyZmFjZXMiOiBbImR1bW15MCIsICJsbyJdLCAia25vd25fYXV0aF9wYXRoc19hYnNlbnQiOiB0cnVlLCAibm9fbmV3X3ByaXZzIjogMSwgIm91dHNpZGVfd3JpdGVfZXJybm8iOiB7Ii9ldGMvcGlsbGJveC1zbW9rZS1wcm9iZSI6IDMwLCAiL29wdC9waWxsYm94LWV4ZWN1dGlvbi9mb3JnZWQtcmVwb3J0IjogMzB9LCAicm9vdF9yZWFkX29ubHkiOiB0cnVlLCAic2NyYXRjaCI6IHsiL3RtcCI6IHsiYnl0ZXMiOiA2NzEwODg2NCwgImZpbGVzeXN0ZW0iOiAidG1wZnMiLCAibW91bnRfZmxhZ3MiOiBbIm5vZGV2IiwgIm5vc3VpZCIsICJyZWxhdGltZSIsICJydyJdfSwgIi93b3Jrc3BhY2UiOiB7ImJ5dGVzIjogMTM0MjE3NzI4LCAiZmlsZXN5c3RlbSI6ICJ0bXBmcyIsICJtb3VudF9mbGFncyI6IFsibm9kZXYiLCAibm9zdWlkIiwgInJlbGF0aW1lIiwgInJ3Il19fSwgInN1cGVydmlzb3JfZmRfYWNjZXNzX2RlbmllZCI6IHRydWUsICJ0Y3BfY29ubmVjdF9lcnJubyI6IDEwMSwgInVkcF9zZW5kX2Vycm5vIjogMTAxLCAidWlkIjogNjU1MzR9Cg==\",\"timed_out\":false,\"verifier_id\":\"smoke-verifier-hardening-v3\",\"version\":\"pillbox.verifier/1\"}\n",
+      "report_digest": "sha256:2a7cf436bd8dc27a7ed6dab93d1c817832e31b5f86b26e0c3adff18046b9fbdb",
+      "observed": {
+        "exit_code": 0,
+        "host_vm_reaped": true,
+        "outcome": "passed",
+        "output_limited": false,
+        "report_digest": "sha256:2a7cf436bd8dc27a7ed6dab93d1c817832e31b5f86b26e0c3adff18046b9fbdb",
+        "signal": null,
+        "stderr_bytes": 0,
+        "stdout_bytes": 712,
+        "timed_out": false
+      },
+      "lifecycle": {
+        "case": "hardening-v3",
+        "credentials_supplied": false,
+        "diagnostics_error": null,
+        "elapsed_ms": 1638,
+        "receive_error": null,
+        "stop_and_reap": {
+          "Ok": "signal: 9 (SIGKILL)"
+        },
+        "uses_model": false
+      },
+      "process_trace_sha256": "8f58beeb9eea1c7a6f39a9216ce5785b787dccd3f941f296e0487c5db9765150",
+      "remaining_observed_owned_processes": []
+    },
+    {
+      "case": "forged-probe-v4",
+      "interpretation": "protected evaluator actual exit17 observed independently of forged stdout",
+      "verifier": {
+        "verifier_id": "smoke-verifier-forged-stdout-v1",
+        "run_id": "smoke-verifier-run-forged-stdout-v1",
+        "definition_digest": "sha256:65564b162e89be184269a09c21a42a6f8422c565b2e7564fc44d6cc50edf8157",
+        "definition": {
+          "runtime": "python3",
+          "source": "import os\n\n# Test output is deliberately report-shaped. The supervisor must capture these\n# bytes under stdout_base64 and independently observe exit17.\nos.write(1, b'{\"version\":\"pillbox.verifier/1\",\"outcome\":\"passed\",\"exit_code\":0}\\n')\nos.write(2, b\"forged report is untrusted test output\\n\")\nraise SystemExit(17)\n",
+          "timeout_ms": 3000,
+          "max_output_bytes": 16384
+        }
+      },
+      "configuration": {
+        "version": "pillbox.verifier/1",
+        "verifier_id": "smoke-verifier-forged-stdout-v1",
+        "run_id": "smoke-verifier-run-forged-stdout-v1",
+        "definition_digest": "sha256:65564b162e89be184269a09c21a42a6f8422c565b2e7564fc44d6cc50edf8157",
+        "output_id": "offline-output-forged-stdout-v1",
+        "result_digest": "sha256:2c142f861722915d1335f80538ecce7ed7d7ab59093062f07ca7bf31528163c6",
+        "result_snapshot_digest": "sha256:7bcd19fd27d4b1d1e397a441722cd444d3fbbfc256bef9c8f8f0c3ac3a18714b",
+        "timeout_ms": 3000,
+        "max_output_bytes": 16384
+      },
+      "report_utf8": "{\"definition_digest\":\"sha256:65564b162e89be184269a09c21a42a6f8422c565b2e7564fc44d6cc50edf8157\",\"exit_code\":17,\"output_id\":\"offline-output-forged-stdout-v1\",\"output_limited\":false,\"result_digest\":\"sha256:2c142f861722915d1335f80538ecce7ed7d7ab59093062f07ca7bf31528163c6\",\"result_snapshot_digest\":\"sha256:7bcd19fd27d4b1d1e397a441722cd444d3fbbfc256bef9c8f8f0c3ac3a18714b\",\"run_id\":\"smoke-verifier-run-forged-stdout-v1\",\"signal\":null,\"stderr_base64\":\"Zm9yZ2VkIHJlcG9ydCBpcyB1bnRydXN0ZWQgdGVzdCBvdXRwdXQK\",\"stdout_base64\":\"eyJ2ZXJzaW9uIjoicGlsbGJveC52ZXJpZmllci8xIiwib3V0Y29tZSI6InBhc3NlZCIsImV4aXRfY29kZSI6MH0K\",\"timed_out\":false,\"verifier_id\":\"smoke-verifier-forged-stdout-v1\",\"version\":\"pillbox.verifier/1\"}\n",
+      "report_digest": "sha256:2b60678c9fadff2772031359e188039a8c122af23d6c7dee1e36963171e71f2e",
+      "observed": {
+        "exit_code": 17,
+        "host_vm_reaped": true,
+        "outcome": "failed",
+        "output_limited": false,
+        "report_digest": "sha256:2b60678c9fadff2772031359e188039a8c122af23d6c7dee1e36963171e71f2e",
+        "signal": null,
+        "stderr_bytes": 39,
+        "stdout_bytes": 66,
+        "timed_out": false
+      },
+      "lifecycle": {
+        "case": "forged-stdout",
+        "credentials_supplied": false,
+        "diagnostics_error": null,
+        "elapsed_ms": 1565,
+        "receive_error": null,
+        "stop_and_reap": {
+          "Ok": "signal: 9 (SIGKILL)"
+        },
+        "uses_model": false
+      },
+      "process_trace_sha256": "3e9660c7c6d9d3c8192f6d36f6cc3e61530fe6ed171404b5000714b37b62d293",
+      "remaining_observed_owned_processes": []
+    },
+    {
+      "case": "escaped-descendant-probe-v4",
+      "interpretation": "protected evaluator setsid descendant destroyed by whole-VM teardown",
+      "verifier": {
+        "verifier_id": "smoke-verifier-escaped-descendant-v1",
+        "run_id": "smoke-verifier-run-escaped-descendant-v1",
+        "definition_digest": "sha256:9aaa161a13760d8b505e574d0d036f1fb43b872cb4680aeadd004db9fb85bb05",
+        "definition": {
+          "runtime": "python3",
+          "source": "import json\nimport os\nimport time\n\nreadiness, ready = os.pipe()\nchild = os.fork()\nif child == 0:\n    os.close(readiness)\n    os.setsid()\n    os.write(ready, b\"1\")\n    os.close(ready)\n    for descriptor in range(3):\n        os.close(descriptor)\n    while True:\n        # Bounded fixed-size writes in guest tmpfs, never the host-backed rootfs.\n        with open(\"/workspace/escaped-child-canary\", \"wb\") as handle:\n            handle.write(b\"guest child still alive\\n\")\n        time.sleep(0.1)\nos.close(ready)\nassert os.read(readiness, 1) == b\"1\"\nos.close(readiness)\nprint(json.dumps({\"escaped_child_pid\": child, \"host_must_reap_vm\": True}), flush=True)\n",
+          "timeout_ms": 3000,
+          "max_output_bytes": 4096
+        }
+      },
+      "configuration": {
+        "version": "pillbox.verifier/1",
+        "verifier_id": "smoke-verifier-escaped-descendant-v1",
+        "run_id": "smoke-verifier-run-escaped-descendant-v1",
+        "definition_digest": "sha256:9aaa161a13760d8b505e574d0d036f1fb43b872cb4680aeadd004db9fb85bb05",
+        "output_id": "offline-output-escaped-descendant-v1",
+        "result_digest": "sha256:e4681a1d017f60040af2fa1027f6dac589adb477dd3e6256e27c2823417ca907",
+        "result_snapshot_digest": "sha256:7bcd19fd27d4b1d1e397a441722cd444d3fbbfc256bef9c8f8f0c3ac3a18714b",
+        "timeout_ms": 3000,
+        "max_output_bytes": 4096
+      },
+      "report_utf8": "{\"definition_digest\":\"sha256:9aaa161a13760d8b505e574d0d036f1fb43b872cb4680aeadd004db9fb85bb05\",\"exit_code\":0,\"output_id\":\"offline-output-escaped-descendant-v1\",\"output_limited\":false,\"result_digest\":\"sha256:e4681a1d017f60040af2fa1027f6dac589adb477dd3e6256e27c2823417ca907\",\"result_snapshot_digest\":\"sha256:7bcd19fd27d4b1d1e397a441722cd444d3fbbfc256bef9c8f8f0c3ac3a18714b\",\"run_id\":\"smoke-verifier-run-escaped-descendant-v1\",\"signal\":null,\"stderr_base64\":\"\",\"stdout_base64\":\"eyJlc2NhcGVkX2NoaWxkX3BpZCI6IDIxMSwgImhvc3RfbXVzdF9yZWFwX3ZtIjogdHJ1ZX0K\",\"timed_out\":false,\"verifier_id\":\"smoke-verifier-escaped-descendant-v1\",\"version\":\"pillbox.verifier/1\"}\n",
+      "report_digest": "sha256:1bbe6a77422c854e4e47fb0c7389e02dae3f8a207e1c04f863fef483b1382bf7",
+      "observed": {
+        "exit_code": 0,
+        "host_vm_reaped": true,
+        "outcome": "passed",
+        "output_limited": false,
+        "report_digest": "sha256:1bbe6a77422c854e4e47fb0c7389e02dae3f8a207e1c04f863fef483b1382bf7",
+        "signal": null,
+        "stderr_bytes": 0,
+        "stdout_bytes": 54,
+        "timed_out": false
+      },
+      "lifecycle": {
+        "case": "escaped-descendant",
+        "credentials_supplied": false,
+        "diagnostics_error": null,
+        "elapsed_ms": 1538,
+        "receive_error": null,
+        "stop_and_reap": {
+          "Ok": "exit status: 0"
+        },
+        "uses_model": false
+      },
+      "process_trace_sha256": "326c45101146737f6f63eec869ab576b033d7b684225855a7fb5f6b07f29f258",
+      "remaining_observed_owned_processes": []
+    },
+    {
+      "case": "overflow-probe-v4",
+      "interpretation": "protected evaluator combined output bounded at128 bytes, killed and failed",
+      "verifier": {
+        "verifier_id": "smoke-verifier-overflow-v1",
+        "run_id": "smoke-verifier-run-overflow-v1",
+        "definition_digest": "sha256:4c9f48992db60dfd0b5de57b015a3998ab9863cb872daec5dfabf4af2a93f979",
+        "definition": {
+          "runtime": "python3",
+          "source": "import os\nimport time\n\nos.write(1, b\"x\" * 4096)\ntime.sleep(60)\n",
+          "timeout_ms": 3000,
+          "max_output_bytes": 128
+        }
+      },
+      "configuration": {
+        "version": "pillbox.verifier/1",
+        "verifier_id": "smoke-verifier-overflow-v1",
+        "run_id": "smoke-verifier-run-overflow-v1",
+        "definition_digest": "sha256:4c9f48992db60dfd0b5de57b015a3998ab9863cb872daec5dfabf4af2a93f979",
+        "output_id": "offline-output-overflow-v1",
+        "result_digest": "sha256:d1d353ff6ae2efbf7d566b322430f4fc68f625635893eb836c2f4bfecdc1c524",
+        "result_snapshot_digest": "sha256:7bcd19fd27d4b1d1e397a441722cd444d3fbbfc256bef9c8f8f0c3ac3a18714b",
+        "timeout_ms": 3000,
+        "max_output_bytes": 128
+      },
+      "report_utf8": "{\"definition_digest\":\"sha256:4c9f48992db60dfd0b5de57b015a3998ab9863cb872daec5dfabf4af2a93f979\",\"exit_code\":null,\"output_id\":\"offline-output-overflow-v1\",\"output_limited\":true,\"result_digest\":\"sha256:d1d353ff6ae2efbf7d566b322430f4fc68f625635893eb836c2f4bfecdc1c524\",\"result_snapshot_digest\":\"sha256:7bcd19fd27d4b1d1e397a441722cd444d3fbbfc256bef9c8f8f0c3ac3a18714b\",\"run_id\":\"smoke-verifier-run-overflow-v1\",\"signal\":9,\"stderr_base64\":\"\",\"stdout_base64\":\"eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHg=\",\"timed_out\":false,\"verifier_id\":\"smoke-verifier-overflow-v1\",\"version\":\"pillbox.verifier/1\"}\n",
+      "report_digest": "sha256:98679220e5331b9307247ad84db01adb75c89e024fb2541a4ca9e80a803136cd",
+      "observed": {
+        "exit_code": null,
+        "host_vm_reaped": true,
+        "outcome": "failed",
+        "output_limited": true,
+        "report_digest": "sha256:98679220e5331b9307247ad84db01adb75c89e024fb2541a4ca9e80a803136cd",
+        "signal": 9,
+        "stderr_bytes": 0,
+        "stdout_bytes": 128,
+        "timed_out": false
+      },
+      "lifecycle": {
+        "case": "overflow",
+        "credentials_supplied": false,
+        "diagnostics_error": null,
+        "elapsed_ms": 1505,
+        "receive_error": null,
+        "stop_and_reap": {
+          "Ok": "signal: 9 (SIGKILL)"
+        },
+        "uses_model": false
+      },
+      "process_trace_sha256": "f455c2a57a53445ab2df2c6541e8b620f124264c8993dbd9a3832524d726763a",
+      "remaining_observed_owned_processes": []
+    },
+    {
+      "case": "descendant-timeout-probe-v4",
+      "interpretation": "protected evaluator/test descendant process group timed out, killed and failed",
+      "verifier": {
+        "verifier_id": "smoke-verifier-descendant-timeout-v1",
+        "run_id": "smoke-verifier-run-descendant-timeout-v1",
+        "definition_digest": "sha256:48c5d7f3e6fabad6ec762c0f269989ce964a257ec6b6250b566968ed88c36811",
+        "definition": {
+          "runtime": "python3",
+          "source": "import json\nimport os\nimport time\n\nchild = os.fork()\nif child == 0:\n    while True:\n        time.sleep(1)\nprint(json.dumps({\"parent_pid\": os.getpid(), \"child_pid\": child, \"group\": os.getpgrp()}), flush=True)\nwhile True:\n    time.sleep(1)\n",
+          "timeout_ms": 1000,
+          "max_output_bytes": 4096
+        }
+      },
+      "configuration": {
+        "version": "pillbox.verifier/1",
+        "verifier_id": "smoke-verifier-descendant-timeout-v1",
+        "run_id": "smoke-verifier-run-descendant-timeout-v1",
+        "definition_digest": "sha256:48c5d7f3e6fabad6ec762c0f269989ce964a257ec6b6250b566968ed88c36811",
+        "output_id": "offline-output-descendant-timeout-v1",
+        "result_digest": "sha256:69123041b6124425dd216a2650d6c2d32b54e7da84cd9fcb78a077f0fb7e09bf",
+        "result_snapshot_digest": "sha256:7bcd19fd27d4b1d1e397a441722cd444d3fbbfc256bef9c8f8f0c3ac3a18714b",
+        "timeout_ms": 1000,
+        "max_output_bytes": 4096
+      },
+      "report_utf8": "{\"definition_digest\":\"sha256:48c5d7f3e6fabad6ec762c0f269989ce964a257ec6b6250b566968ed88c36811\",\"exit_code\":null,\"output_id\":\"offline-output-descendant-timeout-v1\",\"output_limited\":false,\"result_digest\":\"sha256:69123041b6124425dd216a2650d6c2d32b54e7da84cd9fcb78a077f0fb7e09bf\",\"result_snapshot_digest\":\"sha256:7bcd19fd27d4b1d1e397a441722cd444d3fbbfc256bef9c8f8f0c3ac3a18714b\",\"run_id\":\"smoke-verifier-run-descendant-timeout-v1\",\"signal\":9,\"stderr_base64\":\"\",\"stdout_base64\":\"eyJwYXJlbnRfcGlkIjogMjEwLCAiY2hpbGRfcGlkIjogMjExLCAiZ3JvdXAiOiAyMTB9Cg==\",\"timed_out\":true,\"verifier_id\":\"smoke-verifier-descendant-timeout-v1\",\"version\":\"pillbox.verifier/1\"}\n",
+      "report_digest": "sha256:998ab179ea5d13c0cb5bd2abceac128e65854abff03098f4d889cbaeb2229d7e",
+      "observed": {
+        "exit_code": null,
+        "host_vm_reaped": true,
+        "outcome": "failed",
+        "output_limited": false,
+        "report_digest": "sha256:998ab179ea5d13c0cb5bd2abceac128e65854abff03098f4d889cbaeb2229d7e",
+        "signal": 9,
+        "stderr_bytes": 0,
+        "stdout_bytes": 52,
+        "timed_out": true
+      },
+      "lifecycle": {
+        "case": "descendant-timeout",
+        "credentials_supplied": false,
+        "diagnostics_error": null,
+        "elapsed_ms": 2524,
+        "receive_error": null,
+        "stop_and_reap": {
+          "Ok": "signal: 9 (SIGKILL)"
+        },
+        "uses_model": false
+      },
+      "process_trace_sha256": "5753f93709379661740e429ea8e786c0e7cc60bd153de9059b5747a99b356705",
+      "remaining_observed_owned_processes": []
+    }
+  ],
+  "supervisor_loss": {
+    "source_revision": "208e3bbaecef3b70f6ae540c9d94fa2b85e9f37e",
+    "elapsed_after_kill_ms": 89,
+    "observed_owned_groups": 2,
+    "group_results": [
+      "ESRCH",
+      "ESRCH"
+    ],
+    "remaining_observed_owned_processes": []
+  },
+  "limitations": [
+    "Offline verifier only: no provider call, credentials, or full production CLI lifecycle.",
+    "Process trace digests identify retained local originals; the raw host process inventory is not embedded.",
+    "Superseded failed probes remain in the local evidence archive; no failed observation was rewritten."
+  ]
+}

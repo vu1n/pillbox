@@ -199,7 +199,7 @@ inspection of the evaluator without changing the sealed verifier definition.
 id: LE-005
 task_type: feature
 depth: deep
-depends_on: [LE-004, LE-005A, LE-005B, LE-005C]
+depends_on: [LE-004, LE-005A, LE-005B, LE-005C, LE-005D]
 footprint:
   modifies:
     - "src/sandbox/mod.rs::*"
@@ -270,6 +270,7 @@ footprint:
     - "src/execution/files.rs::*"
     - "src/execution/evidence.rs::*"
     - "src/execution/local.rs::*"
+    - "docs/local-repository-execution-offline-proof.json::*"
 gate: "Tighten and mandatory structure/correctness/security review complete, Brief and required CI green, PR merged, integrated content verified, and actual proof or remaining blocker recorded without claiming SB-004 prematurely."
 ```
 
@@ -415,6 +416,27 @@ flowchart TD
   LE_005A --> LE_005C
   LE_005C --> LE_005
   LE_005 ==> LE_006["LE-006 Review and ship · deep"]
+```
+
+
+## LE-005D — Bound Git object expansion before traversal
+
+Security follow-up to LE-002A. Every Git child enforces verified per-allocation and per-mapping
+ceilings plus bounded pack/cache settings. Exact commit/tree objects are size-checked before
+content/traversal; iterative traversal applies finite metadata bytes, entries and depth ceilings.
+The gate covers compressed-object expansion; it does not claim a total subprocess RSS ceiling.
+
+```yaml
+id: LE-005D
+task_type: bug_fix
+depth: deep
+depends_on: [LE-002A]
+footprint:
+  modifies:
+    - "src/execution/snapshot.rs::*"
+produces:
+  - "src/execution/snapshot.rs::read_git_tree"
+gate: "Oversized loose and packed/delta object expansion fails before content capture under verified Git allocation guards; bounded iterative tree traversal preserves exact supported snapshots, existing patch/source tests pass, and unsupported Git guard behavior fails before untrusted repository reads."
 ```
 
 ## Review and proof checkpoint — 2026-09-22

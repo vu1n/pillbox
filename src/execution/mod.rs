@@ -170,6 +170,84 @@ pub(crate) struct VerifierDefinition {
     pub(crate) max_output_bytes: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EvidenceRef {
+    pub(crate) session_id: String,
+    /// Inclusive positions assigned by the existing local SessionLog.
+    pub(crate) seq_range: [u64; 2],
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ArtifactRef {
+    pub(crate) session_id: String,
+    pub(crate) digest: String,
+    pub(crate) bytes: u64,
+    pub(crate) media_type: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AdmissionReceipt {
+    pub(crate) invocation_id: String,
+    pub(crate) request_hash: String,
+    pub(crate) manifest_digest: String,
+    pub(crate) input_snapshot_digest: String,
+    pub(crate) runner_image_id: String,
+    pub(crate) adapter_revision: String,
+    pub(crate) policy_revision: String,
+    pub(crate) effective_model_catalog_digest: String,
+    pub(crate) evidence: EvidenceRef,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RepositoryResult {
+    pub(crate) invocation_id: String,
+    pub(crate) request_hash: String,
+    pub(crate) manifest_digest: String,
+    pub(crate) output_id: String,
+    pub(crate) base: RepositoryBase,
+    pub(crate) execution: InvocationExecution,
+    pub(crate) patch: ArtifactRef,
+    pub(crate) result_snapshot_digest: String,
+    pub(crate) snapshot_manifest: ArtifactRef,
+    pub(crate) changed_paths: Vec<String>,
+    pub(crate) evidence: EvidenceRef,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Verification {
+    pub(crate) verifier_id: String,
+    pub(crate) run_id: String,
+    pub(crate) definition_digest: String,
+    pub(crate) output_id: String,
+    pub(crate) result_digest: String,
+    pub(crate) result_snapshot_digest: String,
+    pub(crate) outcome: VerificationOutcome,
+    pub(crate) report: ArtifactRef,
+    pub(crate) evidence: EvidenceRef,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum VerificationOutcome {
+    Pass,
+    Fail,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Completion {
+    pub(crate) admission: AdmissionReceipt,
+    pub(crate) result: RepositoryResult,
+    pub(crate) verification: Verification,
+    pub(crate) native_evidence: ArtifactRef,
+    pub(crate) text: String,
+}
+
 impl ExecuteRequest {
     pub(crate) fn validate(&self) -> Result<FilePolicy> {
         ensure!(

@@ -147,12 +147,13 @@ evidence. Never retry a turn or treat a model-written object as runtime completi
 
 ```yaml
 id: LE-004C
+status: complete
 task_type: feature
 depth: deep
 depends_on: [LE-004B]
 footprint:
-  creates:
-    - "src/execution/native.rs"
+  modifies:
+    - "src/execution/native.rs::*"
 produces:
   - "src/execution/native.rs::run"
 gate: "A fake native peer exercises actual bounded stream I/O: exact configuration, one turn, typed file dispatch, budget failure before mutation, cancellation/deadline, fragmented frames, duplicate calls, unsupported interactions and mismatched completion; no model sampling in this lane."
@@ -168,7 +169,7 @@ Exact model/effort/version is checked, provider fallback disabled, unknown input
 id: LE-004
 task_type: feature
 depth: deep
-depends_on: [LE-002A, LE-003, LE-004A, LE-004C]
+depends_on: [LE-002A, LE-003, LE-004A, LE-004C, LE-004D, LE-004E]
 footprint:
   modifies:
     - "src/main.rs::*"
@@ -178,6 +179,7 @@ footprint:
     - "src/execution/mod.rs::*"
   creates:
     - "src/commands/execution.rs"
+    - "src/execution/local.rs"
 produces:
   - "src/execution/mod.rs"
 gate: "Admission and native-protocol tests reject changed retry, unsupported policy/configuration, unknown interactions and malformed or uncorrelated terminal data before claiming completion; persisted recovery never starts a second turn."
@@ -193,10 +195,13 @@ libkrun must have implicit TSI explicitly disabled, not merely an absent NIC.
 id: LE-005
 task_type: feature
 depth: deep
-depends_on: [LE-004, LE-005A]
+depends_on: [LE-004, LE-005A, LE-005B, LE-005C]
 footprint:
   modifies:
     - "src/sandbox/mod.rs::*"
+    - "src/sandbox/libkrun/session.rs::*"
+    - "src/sandbox/docker.rs::*"
+    - "src/sandbox/managed.rs::*"
     - "src/sandbox/libkrun/repository.rs::*"
     - "src/execution/mod.rs::*"
     - "src/commands/execution.rs::*"
@@ -219,6 +224,7 @@ disarm too early. Return bounded RPC transport and require explicit successful s
 
 ```yaml
 id: LE-005A
+status: complete
 task_type: feature
 depth: deep
 depends_on: [LE-003]
@@ -227,8 +233,7 @@ footprint:
     - "src/sandbox/libkrun/mod.rs::*"
     - "src/sandbox/libkrun/session.rs::*"
     - ".brief/SIGNOFF::*"
-  creates:
-    - "src/sandbox/libkrun/repository.rs"
+    - "src/sandbox/libkrun/repository.rs::*"
 produces:
   - "src/sandbox/libkrun/repository.rs::OwnedVm"
   - "src/sandbox/libkrun/repository.rs::launch_builder"
@@ -257,6 +262,92 @@ footprint:
 gate: "Tighten and mandatory structure/correctness/security review complete, Brief and required CI green, PR merged, integrated content verified, and actual proof or remaining blocker recorded without claiming SB-004 prematurely."
 ```
 
+## LE-004D — Closed execution/3 admission schema
+
+The sealed schema landed before entrypoint implementation. It binds exact transport/model,
+immutable Git/image/snapshot identities, file/tool/credential policy and the trusted verifier.
+
+```yaml
+id: LE-004D
+status: complete
+task_type: feature
+depth: deep
+depends_on: [LE-002]
+footprint:
+  modifies:
+    - "src/execution/mod.rs::*"
+produces:
+  - "src/execution/mod.rs::ExecuteRequest"
+  - "src/execution/mod.rs::VerifierDefinition"
+gate: "Closed-shape tests reject unknown nested fields, mismatched exact configuration, changed input/verifier hashes, scope widening, mutable Git/image names and unsupported limits; canonical hashes use UTF-16 key order."
+```
+
+## LE-005B — Trusted independent verifier supervisor
+
+Provide a fixed guest supervisor and strict report decoder, independent of VM launch. The supervisor
+establishes its private report connection before untrusted code, runs sealed Python source as an
+unprivileged user with no inherited report FD or new privileges, and observes the actual child exit.
+Finite tmpfs scratch and a read-only root prevent test code writing into host-backed rootfs. Input
+is copied from the runtime-materialized result; no model or credentials enter this VM.
+
+```yaml
+id: LE-005B
+task_type: feature
+depth: deep
+depends_on: [LE-004D]
+footprint:
+  creates:
+    - "src/execution/verifier.rs"
+produces:
+  - "src/execution/verifier.rs::guest_script"
+  - "src/execution/verifier.rs::parse_report"
+gate: "Boundary tests reject forged identities, malformed/nonterminal reports and oversized output; supervisor syntax and fixture checks prove separate report channel, privilege drop, finite output/deadline and actual process status; real VM hardening remains LE-005 evidence."
+```
+
+## LE-004E — Durable runtime evidence and artifacts
+
+Use the existing SessionLog and BlobStore to persist local execution evidence. New sessions must
+be empty at admission. Verify stored blob bytes and fsync before returning references; preserve
+native frames and produce canonical per-file snapshot manifests with recoverable CAS contents.
+
+```yaml
+id: LE-004E
+task_type: feature
+depth: deep
+depends_on: [LE-004D, LE-002A]
+footprint:
+  creates:
+    - "src/execution/evidence.rs"
+produces:
+  - "src/execution/evidence.rs::ExecutionEvidence"
+gate: "Tests prove collision rejection, authoritative inclusive log positions, verified durable blob references and a complete canonical snapshot manifest whose identity matches FileTree; never claim absent frames were observed."
+```
+
+## LE-005C — Launch the offline verifier VM
+
+Extend the owned VM primitive for a separate verifier role: exact result tree, sealed trusted
+supervisor/source/config, no auth or NIC, explicit plain vsock and the same lifetime supervision.
+The report channel is accepted once and bounded by caller-controlled limits.
+
+```yaml
+id: LE-005C
+task_type: feature
+depth: deep
+depends_on: [LE-005A, LE-005B]
+footprint:
+  modifies:
+    - "src/sandbox/libkrun/repository.rs::*"
+produces:
+  - "src/sandbox/libkrun/repository.rs::launch_verifier"
+gate: "Spec/materialization tests prove separate exact image, no egress/auth, immutable trusted verifier files, exact result snapshot and owned process teardown; real VM proof remains the integration gate."
+```
+
+## Deviations
+
+- Split durable evidence and verifier VM launch from final integration after the pure contracts
+  settled, so disjoint modules can progress independently. The integration gate still requires
+  real VM/provider execution and does not treat unit tests as proof of confinement.
+
 ## Graph
 
 ```mermaid
@@ -271,8 +362,18 @@ flowchart TD
   LE_004A --> LE_004
   LE_004B --> LE_004C["LE-004C Native turn · deep"]
   LE_004C --> LE_004
+  LE_002 --> LE_004D["LE-004D Wire schema · deep"]
+  LE_004D --> LE_004
+  LE_004D --> LE_004E["LE-004E Durable evidence"]
+  LE_002A --> LE_004E
+  LE_004E --> LE_004
   LE_004 ==> LE_005["LE-005 VM proof · deep"]
   LE_003 --> LE_005A["LE-005A Owned VM · deep"]
   LE_005A --> LE_005
+  LE_004D --> LE_005B["LE-005B Verifier supervisor · deep"]
+  LE_005B --> LE_005
+  LE_005B --> LE_005C["LE-005C Offline verifier VM"]
+  LE_005A --> LE_005C
+  LE_005C --> LE_005
   LE_005 ==> LE_006["LE-006 Review and ship · deep"]
 ```

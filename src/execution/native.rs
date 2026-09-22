@@ -4,6 +4,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
@@ -102,13 +103,13 @@ pub(crate) fn run(
     limits: NativeLimits,
     poll: impl FnMut() -> Result<()>,
 ) -> std::result::Result<NativeResult, NativeFailure> {
-    let mut wire = Wire::new(stream, limits, poll);
+    let mut wire = Wire::new(stream, limits, poll).map_err(|error| NativeFailure {
+        error,
+        evidence: Vec::new(),
+    })?;
     let outcome = (|| {
         limits.validate()?;
         wire.check()?;
-        wire.stream
-            .set_nonblocking(false)
-            .context("configure native stream blocking mode")?;
         // Validate static input before the first native request can have effects.
         let thread_params = profile.thread_start(operations)?;
         profile.turn_start("validation", rendered_input)?;
@@ -329,13 +330,12 @@ fn dispatch<P: FnMut() -> Result<()>>(
     let accepted = wire.prepare(tool_response(id, true, "{\"ok\":true}".into()))?;
     wire.check()?;
     let operation = match call.operation {
-        FileCall::Read { path } => broker.read(&path).map(|entry| {
-            Some(
-                json!({
-                    "contentBase64":BASE64.encode(&entry.bytes), "executable":entry.executable,
-                })
-                .to_string(),
-            )
+        FileCall::Read { path } => broker.read(&path).and_then(|entry| {
+            let limit = wire
+                .limits
+                .max_frame_bytes
+                .min((wire.limits.max_output_bytes - wire.output_bytes).saturating_sub(1) as usize);
+            file_contents(&entry, limit).map(Some)
         }),
         FileCall::Write {
             path,
@@ -352,6 +352,46 @@ fn dispatch<P: FnMut() -> Result<()>>(
             Err(error.context("native file operation rejected"))
         }
     }
+}
+
+fn file_contents(entry: &super::files::FileEntry, limit: usize) -> Result<String> {
+    let (encoding, content) = match std::str::from_utf8(&entry.bytes) {
+        Ok(text) => ("utf8", std::borrow::Cow::Borrowed(text)),
+        Err(_) => {
+            ensure!(
+                entry.bytes.len().div_ceil(3) * 4 <= limit,
+                "encoded read exceeds native frame limit"
+            );
+            (
+                "base64",
+                std::borrow::Cow::Owned(BASE64.encode(&entry.bytes)),
+            )
+        }
+    };
+    #[derive(serde::Serialize)]
+    struct Contents<'a> {
+        path: &'a str,
+        executable: bool,
+        encoding: &'a str,
+        content: &'a str,
+    }
+    // Text escaping is bounded here; the outer RPC/evidence encoding is bounded
+    // again by Wire::prepare before any bytes are sent.
+    let mut writer = BoundedBytes {
+        bytes: Vec::new(),
+        limit,
+    };
+    serde_json::to_writer(
+        &mut writer,
+        &Contents {
+            path: &entry.path,
+            executable: entry.executable,
+            encoding,
+            content: &content,
+        },
+    )
+    .context("file contents exceed native frame limit")?;
+    String::from_utf8(writer.bytes).context("invalid encoded file response")
 }
 
 fn tool_response(id: &Value, success: bool, text: String) -> Value {
@@ -378,8 +418,11 @@ struct Wire<P> {
 }
 
 impl<P: FnMut() -> Result<()>> Wire<P> {
-    fn new(stream: UnixStream, limits: NativeLimits, poll: P) -> Self {
-        Self {
+    fn new(stream: UnixStream, limits: NativeLimits, poll: P) -> Result<Self> {
+        stream
+            .set_nonblocking(true)
+            .context("configure native stream nonblocking mode")?;
+        Ok(Self {
             stream,
             limits,
             poll,
@@ -390,7 +433,7 @@ impl<P: FnMut() -> Result<()>> Wire<P> {
             output_bytes: 0,
             evidence_bytes: 0,
             evidence: Vec::new(),
-        }
+        })
     }
 
     fn check(&mut self) -> Result<Duration> {
@@ -404,15 +447,42 @@ impl<P: FnMut() -> Result<()>> Wire<P> {
         Ok(remaining.min(POLL_INTERVAL))
     }
 
+    fn wait_ready(&mut self, events: libc::c_short) -> Result<()> {
+        loop {
+            let remaining = self.check()?;
+            let mut descriptor = libc::pollfd {
+                fd: self.stream.as_raw_fd(),
+                events,
+                revents: 0,
+            };
+            // Poll retains the current deadline and can drain data after HUP.
+            // macOS rejects SO_RCVTIMEO updates on a disconnected Unix socket.
+            let ready =
+                unsafe { libc::poll(&mut descriptor, 1, remaining.as_millis() as libc::c_int) };
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error).context("poll native stream");
+            }
+            if ready > 0 {
+                ensure!(
+                    descriptor.revents & libc::POLLNVAL == 0,
+                    "invalid native stream descriptor"
+                );
+                self.check()?;
+                return Ok(());
+            }
+        }
+    }
+
     fn receive(&mut self) -> Result<(Value, usize)> {
         let mut line = Vec::new();
         loop {
             self.check()?;
             if self.start == self.end {
-                let timeout = self.check()?;
-                self.stream
-                    .set_read_timeout(Some(timeout))
-                    .context("set native read timeout")?;
+                self.wait_ready(libc::POLLIN)?;
                 let available = (self.limits.max_input_bytes - self.input_bytes + 1)
                     .min(self.chunk.len() as u64) as usize;
                 let count = match self.stream.read(&mut self.chunk[..available]) {
@@ -496,10 +566,7 @@ impl<P: FnMut() -> Result<()>> Wire<P> {
     fn send_prepared(&mut self, prepared: Prepared) -> Result<()> {
         let mut remaining = prepared.bytes.as_slice();
         while !remaining.is_empty() {
-            let timeout = self.check()?;
-            self.stream
-                .set_write_timeout(Some(timeout))
-                .context("set native write timeout")?;
+            self.wait_ready(libc::POLLOUT)?;
             match self.stream.write(remaining) {
                 Ok(0) => bail!("native stream stopped accepting output"),
                 Ok(count) => {
@@ -703,7 +770,7 @@ mod tests {
             id,
             call_id,
             "pillbox_write_file",
-            json!({"path":"a","executable":true,"contentBase64":BASE64.encode(bytes)}),
+            json!({"path":"a","executable":true,"encoding":"base64","content":BASE64.encode(bytes)}),
         )
     }
 
@@ -778,6 +845,118 @@ mod tests {
     }
 
     #[test]
+    fn text_write_and_read_round_trip_exact_utf8_without_base64() {
+        let mut broker = broker();
+        let text = "fn main() { println!(\"→\\n\"); }\n";
+        drive(&mut broker, limits(), move |peer| {
+            peer.started();
+            peer.send(tool(
+                10,
+                "write-text",
+                "pillbox_write_file",
+                json!({
+                    "path":"a", "executable":false, "encoding":"utf8", "content":text,
+                }),
+            ));
+            assert_eq!(peer.read()["result"]["success"], true);
+            peer.send(tool(
+                11,
+                "read-text",
+                "pillbox_read_file",
+                json!({"path":"a"}),
+            ));
+            let response = peer.read();
+            let contents: Value = serde_json::from_str(
+                response["result"]["contentItems"][0]["text"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                contents,
+                json!({
+                    "path":"a", "executable":false, "encoding":"utf8", "content":text,
+                })
+            );
+            peer.send(terminal());
+        })
+        .unwrap();
+        assert_eq!(
+            broker.finish().unwrap().tree.entries()[0].bytes,
+            text.as_bytes()
+        );
+    }
+
+    #[test]
+    fn text_byte_and_wire_limits_reject_before_mutation() {
+        for kind in ["bytes", "frame", "codec"] {
+            let mut broker = broker();
+            let mut limits = limits();
+            let content = match kind {
+                "bytes" => "→".repeat(342),
+                "frame" => {
+                    limits.max_frame_bytes = serde_json::to_vec(&json!({
+                        "id":"pillbox-thread", "method":"thread/start",
+                        "params":profile().thread_start(OPERATIONS).unwrap(),
+                    }))
+                    .unwrap()
+                    .len();
+                    "\0".repeat(1024)
+                }
+                _ => "valid text".into(),
+            };
+            let failure = drive(&mut broker, limits, move |peer| {
+                peer.started();
+                let call = tool(
+                    10,
+                    "write",
+                    "pillbox_write_file",
+                    json!({
+                        "path":"a", "executable":false,
+                        "encoding":if kind == "codec" { "hex" } else { "utf8" },
+                        "content":content,
+                    }),
+                );
+                let mut bytes = serde_json::to_vec(&call).unwrap();
+                bytes.push(b'\n');
+                peer.writer.write_all(&bytes).unwrap();
+                if kind != "frame" {
+                    assert_eq!(peer.read()["error"]["code"], -32601);
+                }
+            })
+            .unwrap_err();
+            assert!(
+                failure.to_string().contains(if kind == "frame" {
+                    "frame byte limit"
+                } else {
+                    "native file request rejected"
+                }),
+                "{kind}: {failure}"
+            );
+            assert_eq!(broker.usage().tool_calls, 0);
+            assert!(broker.finish().unwrap().changed_paths.is_empty());
+        }
+    }
+
+    #[test]
+    fn text_read_escaping_is_bounded_at_both_json_layers() {
+        let entry = FileEntry {
+            path: "a".into(),
+            executable: false,
+            bytes: vec![0; 64],
+        };
+        assert!(file_contents(&entry, 128).is_err());
+        let contents = file_contents(&entry, 1024).unwrap();
+        let (client, _server) = UnixStream::pair().unwrap();
+        let mut limits = limits();
+        limits.max_frame_bytes = contents.len();
+        let wire = Wire::new(client, limits, || Ok(())).unwrap();
+        assert!(wire
+            .prepare(tool_response(&json!(1), true, contents))
+            .is_err());
+    }
+
+    #[test]
     fn exact_handshake_one_turn_and_typed_file_operations_preserve_evidence() {
         let mut broker = broker();
         let result = drive(&mut broker, limits(), |peer| {
@@ -787,7 +966,7 @@ mod tests {
             assert_eq!(response["id"], 40);
             assert_eq!(response["result"]["success"], true);
             let contents: Value = serde_json::from_str(response["result"]["contentItems"][0]["text"].as_str().unwrap()).unwrap();
-            assert_eq!(contents,json!({"contentBase64":"AP8B","executable":false}));
+            assert_eq!(contents,json!({"path":"a","encoding":"base64","content":"AP8B","executable":false}));
             peer.send(write_call(41,"write-1",b"replacement"));
             assert_eq!(peer.read(),tool_response(&json!(41),true,"{\"ok\":true}".into()));
             peer.send(tool(42,"remove-1","pillbox_remove_file",json!({"path":"a"})));
@@ -966,8 +1145,7 @@ mod tests {
                     }
                     "path" => call["params"]["arguments"]["path"] = json!("ungranted"),
                     _ => {
-                        call["params"]["arguments"]["contentBase64"] =
-                            json!(BASE64.encode(vec![0; 1025]))
+                        call["params"]["arguments"]["content"] = json!(BASE64.encode(vec![0; 1025]))
                     }
                 }
                 peer.send(call);
@@ -1078,9 +1256,24 @@ mod tests {
             }
             server.write_all(b"\n").unwrap();
         });
-        let mut wire = Wire::new(client, limits, || Ok(()));
+        let mut wire = Wire::new(client, limits, || Ok(())).unwrap();
         assert_eq!(wire.receive().unwrap().0, frame);
         peer.join().unwrap();
+    }
+
+    #[test]
+    fn queued_frames_are_drained_after_peer_disconnect() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let frame = terminal();
+        server.write_all(format!("{frame}\n").as_bytes()).unwrap();
+        drop(server);
+        let mut wire = Wire::new(client, limits(), || Ok(())).unwrap();
+        assert_eq!(wire.receive().unwrap().0, frame);
+        assert!(wire
+            .receive()
+            .unwrap_err()
+            .to_string()
+            .contains("stream closed"));
     }
 
     #[test]
@@ -1103,7 +1296,7 @@ mod tests {
                 }
             };
             server.write_all(&bytes).unwrap();
-            let mut wire = Wire::new(client, limits, || Ok(()));
+            let mut wire = Wire::new(client, limits, || Ok(())).unwrap();
             assert!(
                 wire.receive().unwrap_err().to_string().contains(kind),
                 "{kind}"
@@ -1117,7 +1310,7 @@ mod tests {
         let (client, mut server) = UnixStream::pair().unwrap();
         let frame = json!({"id":1,"result":{},"error":{}});
         server.write_all(format!("{frame}\n").as_bytes()).unwrap();
-        let mut wire = Wire::new(client, limits(), || Ok(()));
+        let mut wire = Wire::new(client, limits(), || Ok(())).unwrap();
         assert!(wire.receive().is_err());
         assert_eq!(
             wire.evidence,
@@ -1145,7 +1338,10 @@ mod tests {
             || Ok(()),
         )
         .unwrap_err();
-        assert!(failure.to_string().contains("pending-frame limit"));
+        assert!(
+            failure.to_string().contains("pending-frame limit"),
+            "unexpected failure: {failure}"
+        );
         peer.join().unwrap();
     }
 
@@ -1185,7 +1381,7 @@ mod tests {
             let (client, _server) = UnixStream::pair().unwrap();
             let mut limits = limits();
             limits.deadline = Instant::now() + Duration::from_millis(40);
-            let mut wire = Wire::new(client, limits, || Ok(()));
+            let mut wire = Wire::new(client, limits, || Ok(())).unwrap();
             let start = Instant::now();
             let error = if write {
                 wire.send(json!({"method":"large","params":{"text":"x".repeat(900_000)}}))

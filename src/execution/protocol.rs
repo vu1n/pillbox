@@ -269,13 +269,14 @@ pub(crate) fn dynamic_tools(operations: &[FileOperation]) -> Result<Vec<Value>> 
     validate_operations(operations)?;
     Ok(operations.iter().map(|operation| {
         let (name, description, properties, required) = match operation {
-            FileOperation::Read => ("pillbox_read_file", "Read one exact authorized repository file. Returns base64 bytes and executable mode.", json!({"path": path_schema()}), json!(["path"])),
+            FileOperation::Read => ("pillbox_read_file", "Read one exact authorized repository file. Returns path, executable mode, encoding and content; UTF-8 when valid, otherwise base64.", json!({"path": path_schema()}), json!(["path"])),
             FileOperation::Remove => ("pillbox_remove_file", "Remove one exact authorized repository file.", json!({"path": path_schema()}), json!(["path"])),
-            FileOperation::Write => ("pillbox_write_file", "Replace one exact authorized repository file with base64 bytes and executable mode. Does not disclose previous contents.", json!({
+            FileOperation::Write => ("pillbox_write_file", "Replace one exact authorized repository file with content and executable mode. Use utf8 for text, base64 for binary. Does not disclose previous contents.", json!({
                 "path": path_schema(),
-                "contentBase64": {"type": "string", "maxLength": MAX_FILE_BYTES.div_ceil(3) * 4},
+                "encoding": {"type": "string", "enum": ["utf8", "base64"]},
+                "content": {"type": "string", "maxLength": MAX_FILE_BYTES.div_ceil(3) * 4},
                 "executable": {"type": "boolean"}
-            }), json!(["path", "contentBase64", "executable"])),
+            }), json!(["path", "executable", "encoding", "content"])),
         };
         json!({
             "type": "function", "name": name, "description": description,
@@ -336,10 +337,18 @@ struct PathArgs {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[serde(rename_all = "lowercase")]
+enum FileEncoding {
+    Utf8,
+    Base64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WriteArgs {
     path: String,
-    content_base64: String,
+    encoding: FileEncoding,
+    content: String,
     executable: bool,
 }
 
@@ -395,17 +404,43 @@ pub(crate) fn parse_dynamic_call(
             let args: WriteArgs =
                 serde_json::from_value(params.arguments).context("invalid write tool arguments")?;
             validate_path_size(&args.path)?;
-            ensure!(
-                args.content_base64.len() as u64 <= max_write_bytes.div_ceil(3) * 4,
-                "encoded write exceeds file byte limit"
-            );
-            let bytes = BASE64
-                .decode(args.content_base64)
-                .context("invalid base64 file contents")?;
-            ensure!(
-                bytes.len() as u64 <= max_write_bytes,
-                "decoded write exceeds file byte limit"
-            );
+            let bytes = match args.encoding {
+                FileEncoding::Utf8 => {
+                    ensure!(
+                        args.content.len() as u64 <= max_write_bytes,
+                        "UTF-8 write exceeds file byte limit"
+                    );
+                    args.content.into_bytes()
+                }
+                FileEncoding::Base64 => {
+                    ensure!(
+                        args.content.len() as u64 <= max_write_bytes.div_ceil(3) * 4,
+                        "encoded write exceeds file byte limit"
+                    );
+                    ensure!(
+                        args.content.len().is_multiple_of(4),
+                        "invalid base64 file contents"
+                    );
+                    let padding = args
+                        .content
+                        .bytes()
+                        .rev()
+                        .take_while(|byte| *byte == b'=')
+                        .count();
+                    ensure!(padding <= 2, "invalid base64 file contents");
+                    let decoded_len = args.content.len() / 4 * 3 - padding;
+                    ensure!(
+                        decoded_len as u64 <= max_write_bytes,
+                        "decoded write exceeds file byte limit"
+                    );
+                    let mut bytes = vec![0; decoded_len];
+                    let written = BASE64
+                        .decode_slice(args.content, &mut bytes)
+                        .context("invalid base64 file contents")?;
+                    ensure!(written == decoded_len, "invalid base64 decoded length");
+                    bytes
+                }
+            };
             FileCall::Write {
                 path: args.path,
                 executable: args.executable,
@@ -822,7 +857,7 @@ mod tests {
         let write = call(
             "pillbox_write_file",
             json!({"path":"bin", "executable":true,
-            "contentBase64":BASE64.encode(bytes)}),
+            "encoding":"base64", "content":BASE64.encode(bytes)}),
         );
         assert_eq!(
             parse_dynamic_call(&write, "thread-1", "turn-1", &[FileOperation::Write], 3)
@@ -837,16 +872,69 @@ mod tests {
         assert!(
             parse_dynamic_call(&write, "thread-1", "turn-1", &[FileOperation::Write], 2).is_err()
         );
-        for content in ["%%%", "Zm9v!", "a".repeat(100).as_str()] {
+        for content in ["%%%", "Zm9v!", "====", "YR==", "a".repeat(100).as_str()] {
             let invalid = call(
                 "pillbox_write_file",
-                json!({"path":"bin", "executable":false, "contentBase64":content}),
+                json!({"path":"bin", "executable":false, "encoding":"base64", "content":content}),
             );
             assert!(
                 parse_dynamic_call(&invalid, "thread-1", "turn-1", &[FileOperation::Write], 3)
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn text_writes_preserve_utf8_bytes_and_require_an_explicit_codec() {
+        let text = "→\n\"\\\0";
+        let write = call(
+            "pillbox_write_file",
+            json!({
+                "path":"source", "executable":false, "encoding":"utf8", "content":text,
+            }),
+        );
+        let parse = |value: &Value, limit| {
+            parse_dynamic_call(value, "thread-1", "turn-1", &[FileOperation::Write], limit)
+        };
+        assert_eq!(
+            parse(&write, text.len() as u64).unwrap().operation,
+            FileCall::Write {
+                path: "source".into(),
+                executable: false,
+                bytes: text.as_bytes().to_vec(),
+            }
+        );
+        assert!(parse(&write, text.len() as u64 - 1).is_err());
+        for encoding in [json!("UTF-8"), json!("hex"), Value::Null, json!(1)] {
+            let mut invalid = write.clone();
+            invalid["arguments"]["encoding"] = encoding;
+            assert!(parse(&invalid, 64).is_err());
+        }
+        for field in ["path", "executable", "encoding", "content"] {
+            let mut invalid = write.clone();
+            invalid["arguments"].as_object_mut().unwrap().remove(field);
+            assert!(parse(&invalid, 64).is_err(), "missing {field}");
+        }
+        let mut legacy = write.clone();
+        legacy["arguments"]["contentBase64"] = json!("eA==");
+        assert!(parse(&legacy, 64).is_err());
+        for encoding in ["utf8", "base64"] {
+            let mut empty = write.clone();
+            empty["arguments"]["encoding"] = json!(encoding);
+            empty["arguments"]["content"] = json!("");
+            assert!(
+                matches!(parse(&empty, 1).unwrap().operation, FileCall::Write { bytes, .. } if bytes.is_empty())
+            );
+        }
+        let one = call(
+            "pillbox_write_file",
+            json!({
+                "path":"bin", "executable":false, "encoding":"base64", "content":"/w==",
+            }),
+        );
+        assert!(
+            matches!(parse(&one, 1).unwrap().operation, FileCall::Write { bytes, .. } if bytes == [255])
+        );
     }
 
     #[test]

@@ -10,11 +10,32 @@ or credential access. The command remains unavailable until the end-to-end gate 
 
 ## Enforcement boundary
 
+The closed runtime wire types are in [execution/mod.rs](../src/execution/mod.rs). Execution/3
+requires `tool_policy: repository_files`, `execution_policy_revision: pillbox-local-files-v1`,
+Codex 0.151.0 with adapter `pillbox/local-repository-v1`, and local microVM placement. Its manifest
+contains the exact base, output identity, complete runner image ID, read/write and tool/secret
+requirements, provider host, finite limits, and sealed Python verifier source. Request and manifest
+digests use canonical JSON; duplicate delivery compares the complete original canonical request.
+Only `pillbox_repository` read/remove/write operations and the opaque `pillbox:codex:default`
+credential reference for purpose `model` are currently supported. The only guest provider host is
+`chatgpt.com`. These are explicit admission restrictions, not fallback defaults.
+
+The first source adapter resolves committed regular files using a full Git object ID, with ambient
+configuration, replace objects and network fetching disabled. Dirty worktree bytes are not part of
+this source adapter. An independent verifier executes sealed source outside the builder's result
+tree; the source and its runtime/output limits are included in `definition_digest`.
+
 The first supported policy is a host-owned file broker. The agent VM receives no repository mount.
 An immutable, complete input snapshot is materialized by the host before admission; a bounded
 in-memory file tree owns edits. Only runtime-provided read, write, and remove tools can access that
 tree. Native environment tools are disabled by the pinned Codex app-server configuration, whose
 handler registration must be verified against the runner version. Prompts are not enforcement.
+Codex 0.151.0 supports explicit `tool_mode: direct` model metadata. The new adapter preserves the
+requested provider/model/effort and original metadata as provenance, changing only this tool
+presentation field in its effective catalog. Code mode is disabled: its native `exec`/`wait`
+wrappers lack a fail-closed pre-call hook and cannot satisfy the sealed total tool-call budget.
+Every admitted function therefore reaches the host broker before execution. Real provider acceptance
+of this profile is still a required end-to-end gate; there is no model or tool-profile fallback.
 
 The file broker's input is a sorted sequence of regular files. Each entry has a canonical
 repository-relative path, executable bit, and bytes. The snapshot digest is SHA-256 of canonical

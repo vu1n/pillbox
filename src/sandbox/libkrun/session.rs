@@ -661,6 +661,7 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
     let _ = std::fs::remove_file(&attach_sock);
 
     let vmspec = VmSpec {
+        ownership: None,
         rootfs: rootfs.to_string_lossy().into_owned(),
         vcpus: 2,
         ram_mib: 2048,
@@ -920,6 +921,7 @@ fn launch_server_vm(
     let _ = std::fs::remove_file(&host_sock);
 
     let vmspec = VmSpec {
+        ownership: None,
         rootfs: rootfs.to_string_lossy().into_owned(),
         vcpus: 2,
         ram_mib: 2048,
@@ -1194,6 +1196,7 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
         &format!("{exports}{preamble}; exec {argv} > {events_q}"),
     )?;
     let vmspec = VmSpec {
+        ownership: None,
         rootfs: rootfs.to_string_lossy().into_owned(),
         vcpus: 2,
         ram_mib: 2048,
@@ -1790,6 +1793,7 @@ pub(crate) fn score_in_sandbox(
     )?;
 
     let vmspec = VmSpec {
+        ownership: None,
         rootfs: rootfs.to_string_lossy().into_owned(),
         vcpus: 2,
         ram_mib: 2048,

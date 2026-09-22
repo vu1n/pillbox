@@ -48,6 +48,7 @@ mod jit_refresh;
 mod local_forward;
 mod metadata;
 mod mitm;
+pub(crate) mod repository;
 mod session;
 mod vault;
 
@@ -103,6 +104,8 @@ pub(crate) mod ffi {
         ) -> c_int;
         pub fn krun_add_virtiofs(ctx_id: u32, c_tag: *const c_char, c_path: *const c_char)
             -> c_int;
+        pub fn krun_disable_implicit_vsock(ctx_id: u32) -> c_int;
+        pub fn krun_add_vsock(ctx_id: u32, tsi_features: u32) -> c_int;
         pub fn krun_set_exec(
             ctx_id: u32,
             exec_path: *const c_char,
@@ -132,6 +135,9 @@ struct VmSpec {
     /// Egress: when set, the child attaches a virtio-net device and runs the
     /// userspace stack (DNS fence over `allowlist`). Policy only — non-secret.
     egress: Option<EgressSpec>,
+    /// Bounded invocations retain owner liveness and use plain, non-TSI vsock.
+    #[serde(default)]
+    ownership: Option<repository::OwnershipSpec>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -257,6 +263,12 @@ pub(crate) fn vmm_child_main() -> ! {
         eprintln!("krun-vmm: spec.exec is empty");
         std::process::exit(2);
     }
+    if let Some(ownership) = &spec.ownership {
+        if let Err(error) = repository::arm_vmm_ownership(ownership) {
+            eprintln!("krun-vmm: cannot establish invocation ownership: {error:#}");
+            std::process::exit(2);
+        }
+    }
 
     // Self-destruct guard (detached/server launches only). A reparented VMM
     // outlives its launcher by design — but if the launcher is killed BEFORE it
@@ -335,6 +347,11 @@ pub(crate) fn vmm_child_main() -> ! {
         }
         let ctx = ctx as u32;
         let mut rc = ffi::krun_set_vm_config(ctx, spec.vcpus, spec.ram_mib);
+        if spec.ownership.is_some() {
+            // Omitting virtio-net otherwise enables implicit TSI in libkrun.
+            rc = rc.min(ffi::krun_disable_implicit_vsock(ctx));
+            rc = rc.min(ffi::krun_add_vsock(ctx, 0));
+        }
         rc = rc.min(ffi::krun_set_root(ctx, rootfs.as_ptr()));
         rc = rc.min(ffi::krun_set_workdir(ctx, workdir.as_ptr()));
         for (tag, host) in &shares {

@@ -2,8 +2,9 @@
 
 Status: implementation in progress on the SB-004 branch. The CLI and offline verifier VM are
 implemented and locally verified. The bounded live provider, independent verifier, and successful
-retry/conflict proofs pass. Active cancellation and owner-crash integration remain pending.
-This is not a released execution capability.
+retry/conflict proofs pass. Production CLI cancellation and owner-crash probes also pass
+during builder VM startup; final evidence review and CI remain pending. This is not a
+released execution capability.
 
 This is the Pillbox-owned runtime work for Huddles SB-004. It does not add Huddles workspace,
 thread, packet, or event authority to Pillbox. Existing `pillbox.execution/2` requests retain their
@@ -191,5 +192,27 @@ invocation and session fingerprints remained unchanged across both deliveries.
 The exact binary, request, artifact and result identities and inspected checks are
 recorded in [the live proof](./local-repository-execution-live-proof.json). Previous
 failed attempts remain intact. This closes successful provider, patch, verifier and
-retry proof; active cancellation and foreground-owner crash remain open. It is not
-Huddles-commissioned self-build evidence.
+retry proof. The separate startup cancellation and foreground-owner crash
+observations follow below. It is not Huddles-commissioned self-build evidence.
+
+## Bounded lifecycle observations
+
+Two separately approved synthetic invocations exercised the production CLI during
+builder startup. Each probe required a durable running admission and a single owned
+`__krun-vmm` process-group leader in the exact foreground owner's descendant tree,
+with no recorded result or verifier session. The probe saved only process metadata.
+
+- Cancellation: two cancel requests returned the same invocation; the foreground
+  owner returned `cancelled` and the observed VMM group disappeared. Identical
+  delivery reused the cancelled record, and changed content conflicted without
+  changing invocation/session fingerprints.
+- Owner loss: the probe sent SIGKILL only to its recorded foreground child. The
+  observed VMM group disappeared; status recovered `interrupted` with
+  `invocation_owner_lost` and preserved admission evidence. Identical and changed
+  delivery again preserved terminal and session bytes without relaunch.
+
+[Lifecycle proof metadata](./local-repository-execution-lifecycle-proof.json) records
+the process observations, terminal receipts and retry checks. These are host VMM
+startup observations, not proof that a guest finished booting or a provider turn was
+in flight at interruption. The separate v3 proof establishes model execution and
+independent verification. The probes never repurposed the successful invocation.

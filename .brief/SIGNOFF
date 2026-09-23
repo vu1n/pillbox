@@ -224,3 +224,4 @@ managed-tier-do-gateway conforms: Review fixes bind normalized effort to explici
 managed-tier-do-gateway conforms: Live smoke correction admits only completed native StructuredOutputError for the existing sealed-schema fallback; arbitrary tools, unrelated errors, and invalid output remain rejected.
 
 gateway-no-daemon conforms: Explicitly unlocking successfully acquired execution file locks on guard drop preserves one foreground owner and immutable claim recovery; it prevents unrelated forked children from retaining a normal-release lock and adds no resident controller.
+docs-governance conforms: Actual provider, verifier, retry and startup lifecycle receipts are recorded with explicit observation limits; Huddles self-build and release claims remain separate from the Pillbox proof.

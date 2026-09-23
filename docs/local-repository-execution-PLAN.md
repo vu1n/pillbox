@@ -510,6 +510,23 @@ gate: "Oversized loose and packed/delta object expansion fails before content ca
 - Safe proof metadata is in `local-repository-execution-live-proof.json`; raw captures
   remain under the original synthetic artifact directory. Earlier failed claims
   and their evidence are preserved.
-- Active production CLI cancellation and owner-crash recovery still require
-  separate selected invocations. The successful attempt is terminal and is not
-  repurposed for those gates. PR merge and Huddles self-build remain gated.
+- The successful attempt remains terminal and was not repurposed for lifecycle
+  gates. Subsequent separate startup cancellation and owner-crash observations
+  are recorded below. Final CI/review and Huddles self-build remain separate gates.
+
+
+## Approved startup lifecycle probes
+
+- Both separately approved one-shot probes passed against the production CLI and
+  the same signed binary used for successful v3 execution. Each observed a durable
+  running claim and one owned builder VMM process group before taking action.
+- Two cancel requests led to an immutable cancelled record. Killing the exact
+  foreground owner led to VM-group disappearance and recovered interrupted state.
+  Both identities reused their terminal records and rejected changed content with
+  unchanged invocation/session fingerprints.
+- `local-repository-execution-lifecycle-proof.json` records these startup observations;
+  it does not claim guest boot completion or a provider turn in flight at interruption.
+- Proof-commit CI exposed intermittent macOS lock-release failures under concurrent
+  process spawning. The explicit-unlock fix and deterministic fork regression passed independent
+  review, both feature-mode store tests and strict Clippy. The runtime remains
+  unmerged until the latest CI passes.

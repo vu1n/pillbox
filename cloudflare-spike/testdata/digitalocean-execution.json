@@ -1,0 +1,36 @@
+{
+  "request": {
+    "contract_version": "pillbox.execution/2",
+    "invocation_id": "do-conformance-1",
+    "idempotency_key": "do-conformance-1",
+    "session_ref": {
+      "session_id": "do-conformance-session"
+    },
+    "rendered_input": "Hello",
+    "rendered_input_hash": "sha256:185f8db32271fe25f561a6fc938b2e264306ec304eda518007d1764826381969",
+    "tool_policy": "deny_all",
+    "execution": {
+      "transport": {
+        "harness": "opencode",
+        "transport": "digitalocean-sandbox-exec",
+        "harness_version": "1.18.31",
+        "adapter_revision": "pillbox/digitalocean/1"
+      },
+      "requested": {
+        "provider": "openrouter",
+        "model": "openai/gpt-5-mini",
+        "profile": "openrouter-gpt5mini-digitalocean",
+        "reasoning_effort": "high"
+      },
+      "placement": "managed_container",
+      "context_renderer_revision": "planning-partner/cc-011"
+    },
+    "execution_policy_revision": "planning-execution/opencode-managed/1",
+    "output_format": {
+      "type": "text",
+      "retry_count": 0
+    }
+  },
+  "request_hash": "sha256:9ea46ab21895e9068382c2d38cb3ec1f63221f9afaec439c9d991c296d56be78",
+  "execution_digest": "sha256:cf7ec602c70f99774ff6470ecfbfa7a29ee7b8c9480cf37552007588c4c3229f"
+}

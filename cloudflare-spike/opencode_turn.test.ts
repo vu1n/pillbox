@@ -56,6 +56,7 @@ test("OpenCode turn returns exact structured output through the evidence sink", 
     sandbox: transport.sandbox,
     text: "Produce the document.",
     model: "zai-coding-plan/glm-4.7",
+    reasoningVariant: "pillbox-high",
     outputFormat,
     config: { env: {} },
     sink: evidence.sink,
@@ -63,6 +64,7 @@ test("OpenCode turn returns exact structured output through the evidence sink", 
 
   assert.equal(output, '{"kind":"document","text":"# Grill"}');
   assert.deepEqual(transport.promptPaths, ["/session/session:1/prompt_async"]);
+  assert.equal(transport.promptBodies[0].variant, "pillbox-high");
   assert.deepEqual(evidence.errors, []);
   assert.equal(
     evidence.agent.some(
@@ -229,6 +231,7 @@ function fakeTransport(
   readonly promptPaths: string[];
   readonly promptBodies: Array<{
     readonly parts: ReadonlyArray<{ readonly text: string }>;
+    readonly variant?: string;
   }>;
 } {
   let streamIndex = 0;
@@ -236,6 +239,7 @@ function fakeTransport(
   const promptPaths: string[] = [];
   const promptBodies: Array<{
     readonly parts: ReadonlyArray<{ readonly text: string }>;
+    readonly variant?: string;
   }> = [];
   const sandbox = {
     containerFetch: async (request: Request): Promise<Response> => {
@@ -260,6 +264,7 @@ function fakeTransport(
         promptBodies.push(
           (await request.json()) as {
             readonly parts: ReadonlyArray<{ readonly text: string }>;
+    readonly variant?: string;
           },
         );
         return new Response(null, { status: 204 });

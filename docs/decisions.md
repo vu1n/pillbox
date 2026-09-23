@@ -221,3 +221,11 @@ Format: `STATUS` · what · why · what it means concretely · what's rejected.
 - **Rejected:** custom per-session DO logs, per-delta relational rows, recurring
   polling alarms, startup/history scans, unbounded retention, and adopting
   Computer before per-task correctness and cost are measured.
+
+## 2026-09-23 — Optional DigitalOcean managed compute
+
+Maintainer-ratified `managed-tier-do-gateway@0003` permits DO Harness Runtime alongside
+default Cloudflare compute behind the existing authenticated execution service.
+D1 claims, R2 evidence, rustic workspace authority, Huddles collaboration ownership,
+and the prohibition on automatic cross-provider resampling remain unchanged.
+See [adapter scope and validation gates](../digitalocean/README.md).

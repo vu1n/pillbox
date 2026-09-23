@@ -14,13 +14,20 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, ensure, Context, Result};
 
-use super::files::{
-    validate_path, FileEntry, FileLimits, FileTree, MAX_FILES, MAX_OUTPUT_BYTES, MAX_PATH_BYTES,
-};
+use super::files::{validate_path, FileEntry, FileLimits, FileTree, MAX_FILES, MAX_OUTPUT_BYTES};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 const STDERR_LIMIT: usize = 64 * 1024;
-const TREE_LIST_LIMIT: usize = MAX_FILES * (MAX_PATH_BYTES + 128);
+// Object-size preflight cannot bound a packed delta's larger base. These guards
+// also constrain Git's expansion buffers; they do not represent total process RSS.
+const GIT_ALLOCATION_LIMIT: usize = 16 * 1024 * 1024;
+const GIT_MAPPING_LIMIT: usize = 32 * 1024 * 1024;
+const MAX_COMMIT_BYTES: u64 = 1024 * 1024;
+const MAX_TREE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_TREE_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_TREE_ENTRIES: usize = 16_384;
+const MAX_TREE_DEPTH: usize = 128;
+const TREE_LIST_LIMIT: usize = 4 * MAX_TREE_BYTES as usize;
 
 pub(crate) fn read_git_tree(repo: &Path, commit: &str, limits: &FileLimits) -> Result<FileTree> {
     limits.validate()?;
@@ -30,6 +37,7 @@ pub(crate) fn read_git_tree(repo: &Path, commit: &str, limits: &FileLimits) -> R
     );
     let isolated_home = private_directory().context("create isolated Git home")?;
     let deadline = Instant::now() + GIT_TIMEOUT;
+    verify_git_guards(isolated_home.path(), deadline)?;
     let git =
         |args: &[&str], cap| git_output(repo, isolated_home.path(), args, cap, deadline, false);
     let format = git(&["rev-parse", "--show-object-format=storage"], 32)?;
@@ -49,62 +57,89 @@ pub(crate) fn read_git_tree(repo: &Path, commit: &str, limits: &FileLimits) -> R
             .eq_ignore_ascii_case(commit),
         "Git resolved a different object identity"
     );
+    let commit_size = object_size(&git, commit, "commit", MAX_COMMIT_BYTES)?;
+    let bytes = git(&["cat-file", "commit", commit], commit_size as usize)?;
+    ensure!(bytes.len() as u64 == commit_size, "Git commit size changed");
+    let first = bytes
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    let root = first
+        .strip_prefix(b"tree ")
+        .context("Git commit has no root tree")?;
+    let root = std::str::from_utf8(root)?;
     ensure!(
-        git(&["cat-file", "-t", commit], 32)? == b"commit\n",
-        "snapshot object is not a commit"
+        root.len() == oid_length && valid_oid(root),
+        "invalid root tree identity"
     );
-    let listing = git(
-        &["ls-tree", "-r", "-z", "-l", "--full-tree", commit],
-        TREE_LIST_LIMIT,
-    )?;
+    let mut pending = vec![(String::new(), root.to_owned(), 0_usize)];
     let mut objects = Vec::new();
     let mut total = 0_u64;
-    ensure!(
-        listing.is_empty() || listing.last() == Some(&0),
-        "unterminated Git tree listing"
-    );
-    for terminated in listing.split_inclusive(|byte| *byte == 0) {
-        let record = &terminated[..terminated.len() - 1];
+    let mut budget = TreeBudget::default();
+    while let Some((prefix, oid, depth)) = pending.pop() {
+        let size = object_size(&git, &oid, "tree", MAX_TREE_BYTES)?;
+        budget.tree(size)?;
+        // Never let Git recurse into an object which has not passed preflight.
+        let listing = git(
+            &["ls-tree", "-z", "-l", "--full-tree", &oid],
+            TREE_LIST_LIMIT,
+        )?;
         ensure!(
-            objects.len() < MAX_FILES,
-            "snapshot file count exceeds {MAX_FILES}"
+            listing.is_empty() || listing.last() == Some(&0),
+            "unterminated Git tree listing"
         );
-        let tab = record
-            .iter()
-            .position(|byte| *byte == b'\t')
-            .context("Git tree entry has no path")?;
-        let header: Vec<_> = std::str::from_utf8(&record[..tab])?
-            .split_ascii_whitespace()
-            .collect();
-        ensure!(header.len() == 4, "malformed Git tree entry metadata");
-        ensure!(
-            matches!(header[0], "100644" | "100755") && header[1] == "blob",
-            "snapshot rejects symlinks, submodules and non-regular Git entries"
-        );
-        ensure!(
-            header[2].len() == oid_length && valid_oid(header[2]),
-            "malformed Git blob identity"
-        );
-        let path = std::str::from_utf8(&record[tab + 1..])?;
-        validate_path(path)?;
-        let size: u64 = header[3].parse().context("invalid Git blob size")?;
-        ensure!(
-            size <= limits.max_file_bytes,
-            "Git blob exceeds per-file byte limit"
-        );
-        total = total
-            .checked_add(size)
-            .context("Git snapshot size overflow")?;
-        ensure!(
-            total <= limits.max_snapshot_bytes,
-            "Git tree exceeds snapshot byte limit"
-        );
-        objects.push((
-            path.to_owned(),
-            header[0] == "100755",
-            header[2].to_owned(),
-            size,
-        ));
+        for terminated in listing.split_inclusive(|byte| *byte == 0) {
+            budget.entry(depth + 1)?;
+            let record = &terminated[..terminated.len() - 1];
+            let tab = record
+                .iter()
+                .position(|byte| *byte == b'\t')
+                .context("Git tree entry has no path")?;
+            let header: Vec<_> = std::str::from_utf8(&record[..tab])?
+                .split_ascii_whitespace()
+                .collect();
+            ensure!(header.len() == 4, "malformed Git tree entry metadata");
+            ensure!(
+                header[2].len() == oid_length && valid_oid(header[2]),
+                "malformed Git object identity"
+            );
+            let name = std::str::from_utf8(&record[tab + 1..])?;
+            ensure!(
+                !name.contains('/'),
+                "Git tree entry is not a single path component"
+            );
+            let path = if prefix.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            validate_path(&path)?;
+            if header[0] == "040000" && header[1] == "tree" && header[3] == "-" {
+                pending.push((path, header[2].to_owned(), depth + 1));
+                continue;
+            }
+            ensure!(
+                matches!(header[0], "100644" | "100755") && header[1] == "blob",
+                "snapshot rejects symlinks, submodules and non-regular Git entries"
+            );
+            ensure!(
+                objects.len() < MAX_FILES,
+                "snapshot file count exceeds {MAX_FILES}"
+            );
+            let size: u64 = header[3].parse().context("invalid Git blob size")?;
+            ensure!(
+                size <= limits.max_file_bytes,
+                "Git blob exceeds per-file byte limit"
+            );
+            total = total
+                .checked_add(size)
+                .context("Git snapshot size overflow")?;
+            ensure!(
+                total <= limits.max_snapshot_bytes,
+                "Git tree exceeds snapshot byte limit"
+            );
+            objects.push((path, header[0] == "100755", header[2].to_owned(), size));
+        }
     }
     objects.sort_by(|left, right| left.0.cmp(&right.0));
     validate_disk_paths(objects.iter().map(|entry| entry.0.as_str()))?;
@@ -122,6 +157,55 @@ pub(crate) fn read_git_tree(repo: &Path, commit: &str, limits: &FileLimits) -> R
         });
     }
     FileTree::new(entries, limits)
+}
+
+fn object_size(
+    git: &impl Fn(&[&str], usize) -> Result<Vec<u8>>,
+    oid: &str,
+    kind: &str,
+    cap: u64,
+) -> Result<u64> {
+    ensure!(
+        git(&["cat-file", "-t", oid], 32)? == format!("{kind}\n").as_bytes(),
+        "snapshot object is not a {kind}"
+    );
+    let bytes = git(&["cat-file", "-s", oid], 32)?;
+    let size: u64 = std::str::from_utf8(&bytes)?
+        .trim_end()
+        .parse()
+        .context("invalid Git object size")?;
+    ensure!(size <= cap, "Git {kind} object exceeds metadata byte limit");
+    Ok(size)
+}
+
+#[derive(Default)]
+struct TreeBudget {
+    bytes: u64,
+    entries: usize,
+}
+
+impl TreeBudget {
+    fn tree(&mut self, size: u64) -> Result<()> {
+        self.bytes = self
+            .bytes
+            .checked_add(size)
+            .context("Git tree metadata size overflow")?;
+        ensure!(
+            self.bytes <= MAX_TREE_TOTAL_BYTES,
+            "Git tree metadata exceeds aggregate byte limit"
+        );
+        Ok(())
+    }
+
+    fn entry(&mut self, depth: usize) -> Result<()> {
+        ensure!(depth <= MAX_TREE_DEPTH, "Git tree exceeds depth limit");
+        ensure!(
+            self.entries < MAX_TREE_ENTRIES,
+            "Git tree exceeds entry limit"
+        );
+        self.entries += 1;
+        Ok(())
+    }
 }
 
 /// `destination` must already be an empty, private directory owned by this user.
@@ -192,6 +276,8 @@ pub(crate) fn capture_patch(
     validate_disk_paths(result.entries().iter().map(|entry| entry.path.as_str()))?;
     let scratch = private_directory().context("create private patch directory")?;
     let scratch_path = scratch.path().canonicalize()?;
+    let deadline = Instant::now() + GIT_TIMEOUT;
+    verify_git_guards(&scratch_path, deadline)?;
     for (name, tree) in [("a", base), ("b", result)] {
         let destination = scratch_path.join(name);
         DirBuilder::new().mode(0o700).create(&destination)?;
@@ -218,7 +304,7 @@ pub(crate) fn capture_patch(
             "b",
         ],
         usize::try_from(max_patch_bytes)?,
-        Instant::now() + GIT_TIMEOUT,
+        deadline,
         true,
     )
 }
@@ -350,6 +436,53 @@ fn directory_is_empty(directory: &File) -> Result<bool> {
     result
 }
 
+fn verify_git_guards(home: &Path, deadline: Instant) -> Result<()> {
+    const OID: &str = "1111111111111111111111111111111111111111";
+    // This trusted zlib stream declares a 16MiB commit but contains one byte.
+    // A missing allocation guard produces a corruption error, never the exact
+    // allocation diagnostic required below. No repository input is involved.
+    const OBJECT: &[u8] = b"\x78\x9c\x4b\xce\xcf\xcd\xcd\x2c\x51\x30\x34\x33\x37\x37\x37\x32\x34\x63\xa8\x00\x00\x31\x3d\x04\xc7";
+    let repo = home.join("git-guard");
+    std::fs::create_dir_all(repo.join(".git/objects/11"))?;
+    std::fs::create_dir(repo.join(".git/refs"))?;
+    std::fs::write(repo.join(".git/HEAD"), b"ref: refs/heads/guard\n")?;
+    std::fs::write(repo.join(".git/objects/11").join(&OID[2..]), OBJECT)?;
+    let allocation = git_result(
+        &repo,
+        home,
+        &["cat-file", "commit", OID],
+        0,
+        deadline,
+        GIT_MAPPING_LIMIT,
+    )?;
+    expect_guard_failure(
+        &allocation,
+        &format!(
+            "fatal: attempting to allocate {} over limit {GIT_ALLOCATION_LIMIT}",
+            GIT_ALLOCATION_LIMIT + 1
+        ),
+    )?;
+    let mapping = git_result(&repo, home, &["cat-file", "-s", OID], 0, deadline, 1)?;
+    expect_guard_failure(
+        &mapping,
+        &format!("fatal: attempting to mmap {} over limit 1", OBJECT.len()),
+    )
+}
+
+fn expect_guard_failure(output: &GitOutput, diagnostic: &str) -> Result<()> {
+    ensure!(
+        output.status.code() == Some(128)
+            && output.stdout.is_empty()
+            && output
+                .stderr
+                .split(|byte| *byte == b'\n')
+                .any(|line| line == diagnostic.as_bytes()),
+        "installed Git does not demonstrate the required allocation/mapping guard: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
 fn git_output(
     cwd: &Path,
     home: &Path,
@@ -358,6 +491,31 @@ fn git_output(
     deadline: Instant,
     allow_diff: bool,
 ) -> Result<Vec<u8>> {
+    let output = git_result(cwd, home, args, cap, deadline, GIT_MAPPING_LIMIT)?;
+    ensure!(
+        output.status.success() || (allow_diff && output.status.code() == Some(1)),
+        "Git {} failed with {}: {}",
+        args[0],
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(output.stdout)
+}
+
+struct GitOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+fn git_result(
+    cwd: &Path,
+    home: &Path,
+    args: &[&str],
+    cap: usize,
+    deadline: Instant,
+    mapping_limit: usize,
+) -> Result<GitOutput> {
     ensure!(
         Instant::now() < deadline,
         "Git snapshot operation timed out"
@@ -379,6 +537,8 @@ fn git_output(
         .env("GIT_ALLOW_PROTOCOL", "")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_ALLOC_LIMIT", GIT_ALLOCATION_LIMIT.to_string())
+        .env("GIT_MMAP_LIMIT", mapping_limit.to_string())
         .args([
             "--no-replace-objects",
             "-c",
@@ -391,6 +551,16 @@ fn git_output(
             "core.fsmonitor=false",
             "-c",
             "core.attributesFile=/dev/null",
+            "-c",
+            "core.packedGitWindowSize=1m",
+            "-c",
+            "core.packedGitLimit=8m",
+            "-c",
+            "core.deltaBaseCacheLimit=1m",
+            "-c",
+            "core.commitGraph=false",
+            "-c",
+            "core.multiPackIndex=false",
         ])
         .args(args)
         .stdin(Stdio::null())
@@ -433,13 +603,11 @@ fn git_output(
         if let Some(status) = status {
             if out_closed && err_closed {
                 process.finished = true;
-                ensure!(
-                    status.success() || (allow_diff && status.code() == Some(1)),
-                    "Git {} failed with {status}: {}",
-                    args[0],
-                    String::from_utf8_lossy(&err)
-                );
-                return Ok(out);
+                return Ok(GitOutput {
+                    status,
+                    stdout: out,
+                    stderr: err,
+                });
             }
         }
         std::thread::sleep(Duration::from_millis(2));
@@ -843,5 +1011,285 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("timed out"));
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    fn raw_object(repo: &Path, kind: &str, bytes: &[u8]) -> String {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), bytes).unwrap();
+        String::from_utf8(fixture_git(
+            repo,
+            &[
+                "hash-object",
+                "--literally",
+                "-t",
+                kind,
+                "-w",
+                file.path().to_str().unwrap(),
+            ],
+        ))
+        .unwrap()
+        .trim()
+        .to_owned()
+    }
+
+    fn raw_commit(repo: &Path, tree: &str) -> String {
+        raw_object(repo, "commit", format!("tree {tree}\nauthor Snapshot <x@y> 0 +0000\ncommitter Snapshot <x@y> 0 +0000\n\nfixture\n").as_bytes())
+    }
+
+    fn oid_bytes(oid: &str) -> Vec<u8> {
+        (0..oid.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&oid[index..index + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn guards_require_the_precise_failure_from_the_installed_git() {
+        use std::os::unix::process::ExitStatusExt;
+        let home = private_directory().unwrap();
+        verify_git_guards(home.path(), Instant::now() + GIT_TIMEOUT).unwrap();
+        let diagnostic = "fatal: attempting to allocate 16777217 over limit 16777216";
+        let mut output = GitOutput {
+            status: ExitStatus::from_raw(128 << 8),
+            stdout: vec![],
+            stderr: b"fatal: corrupt object\n".to_vec(),
+        };
+        assert!(expect_guard_failure(&output, diagnostic).is_err());
+        output.stderr = format!("{diagnostic}\n").into_bytes();
+        assert!(expect_guard_failure(&output, diagnostic).is_ok());
+        output.status = ExitStatus::from_raw(0);
+        assert!(expect_guard_failure(&output, diagnostic).is_err());
+    }
+
+    #[test]
+    fn oversized_commit_and_root_or_nested_trees_fail_before_parsing() {
+        let repo = repository();
+        let empty = raw_object(repo.path(), "tree", b"");
+        let mut commit = format!("tree {empty}\n\n").into_bytes();
+        commit.resize(MAX_COMMIT_BYTES as usize + 1, b'x');
+        let oid = raw_object(repo.path(), "commit", &commit);
+        assert!(read_git_tree(repo.path(), &oid, &limits())
+            .unwrap_err()
+            .to_string()
+            .contains("commit object exceeds metadata"));
+        let oversized = raw_object(
+            repo.path(),
+            "tree",
+            &vec![b'x'; MAX_TREE_BYTES as usize + 1],
+        );
+        let mut nested = b"40000 nested\0".to_vec();
+        nested.extend_from_slice(&oid_bytes(&oversized));
+        let parent = raw_object(repo.path(), "tree", &nested);
+        for tree in [&oversized, &parent] {
+            let oid = raw_commit(repo.path(), tree);
+            assert!(read_git_tree(repo.path(), &oid, &limits())
+                .unwrap_err()
+                .to_string()
+                .contains("tree object exceeds metadata"));
+        }
+    }
+
+    #[test]
+    fn directory_entries_and_depth_are_bounded_even_without_files() {
+        let repo = repository();
+        let empty = raw_object(repo.path(), "tree", b"");
+        let mut tree = Vec::new();
+        for index in 0..=MAX_TREE_ENTRIES {
+            tree.extend_from_slice(format!("40000 dir-{index:05}\0").as_bytes());
+            tree.extend_from_slice(&oid_bytes(&empty));
+        }
+        let tree = raw_object(repo.path(), "tree", &tree);
+        let oid = raw_commit(repo.path(), &tree);
+        assert!(read_git_tree(repo.path(), &oid, &limits())
+            .unwrap_err()
+            .to_string()
+            .contains("entry limit"));
+        let mut tree = empty;
+        for _ in 0..=MAX_TREE_DEPTH {
+            let mut entry = b"40000 d\0".to_vec();
+            entry.extend_from_slice(&oid_bytes(&tree));
+            tree = raw_object(repo.path(), "tree", &entry);
+        }
+        let oid = raw_commit(repo.path(), &tree);
+        assert!(read_git_tree(repo.path(), &oid, &limits())
+            .unwrap_err()
+            .to_string()
+            .contains("depth limit"));
+    }
+
+    #[test]
+    fn repeated_tree_objects_consume_aggregate_metadata_budget() {
+        let repo = repository();
+        let empty = raw_object(repo.path(), "tree", b"");
+        // Valid entries with long names make each repeated tree exceed 1MiB.
+        let mut child = Vec::new();
+        for index in 0..4096 {
+            child.extend_from_slice(format!("40000 {index:04}{}\0", "x".repeat(240)).as_bytes());
+            child.extend_from_slice(&oid_bytes(&empty));
+        }
+        let child_oid = raw_object(repo.path(), "tree", &child);
+        let mut budget = TreeBudget::default();
+        let git = |args: &[&str], cap| {
+            git_output(
+                repo.path(),
+                repo.path(),
+                args,
+                cap,
+                Instant::now() + GIT_TIMEOUT,
+                false,
+            )
+        };
+        let size = object_size(&git, &child_oid, "tree", MAX_TREE_BYTES).unwrap();
+        assert_eq!(size, child.len() as u64);
+        for _ in 0..MAX_TREE_TOTAL_BYTES / size {
+            budget.tree(size).unwrap();
+        }
+        assert!(budget
+            .tree(size)
+            .unwrap_err()
+            .to_string()
+            .contains("aggregate byte limit"));
+    }
+
+    fn zlib_stored(bytes: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x78, 0x01];
+        for (index, chunk) in bytes.chunks(65535).enumerate() {
+            out.push(u8::from((index + 1) * 65535 >= bytes.len()));
+            let len = chunk.len() as u16;
+            out.extend_from_slice(&len.to_le_bytes());
+            out.extend_from_slice(&(!len).to_le_bytes());
+            out.extend_from_slice(chunk);
+        }
+        let (mut a, mut b) = (1_u32, 0_u32);
+        for byte in bytes {
+            a = (a + u32::from(*byte)) % 65521;
+            b = (b + a) % 65521;
+        }
+        out.extend_from_slice(&((b << 16) | a).to_be_bytes());
+        out
+    }
+
+    fn pack_header(kind: u8, mut size: usize) -> Vec<u8> {
+        let mut out = vec![(kind << 4) | (size as u8 & 15)];
+        size >>= 4;
+        while size != 0 {
+            *out.last_mut().unwrap() |= 128;
+            out.push(size as u8 & 127);
+            size >>= 7;
+        }
+        out
+    }
+
+    fn crc32(bytes: &[u8]) -> u32 {
+        let table: Vec<_> = (0..256)
+            .map(|mut crc| {
+                for _ in 0..8 {
+                    crc = (crc >> 1) ^ (0xedb88320 & (0_u32.wrapping_sub(crc & 1)));
+                }
+                crc
+            })
+            .collect();
+        let mut crc = !0_u32;
+        for byte in bytes {
+            crc = table[((crc as u8) ^ byte) as usize] ^ (crc >> 8);
+        }
+        !crc
+    }
+
+    fn install_delta_pack(repo: &Path, base_size: usize) -> String {
+        use sha2::{Digest, Sha256};
+        let base = vec![b'x'; base_size];
+        let mut hasher = Sha256::new();
+        hasher.update(format!("blob {base_size}\0"));
+        hasher.update(&base);
+        let base_oid = hasher.finalize().to_vec();
+        let result_oid = Sha256::digest(b"blob 1\0x").to_vec();
+        let mut pack = b"PACK\0\0\0\x02\0\0\0\x02".to_vec();
+        let base_offset = pack.len() as u32;
+        pack.extend_from_slice(&pack_header(3, base_size));
+        pack.extend_from_slice(&zlib_stored(&base));
+        let base_crc = crc32(&pack[base_offset as usize..]);
+        let mut delta = Vec::new();
+        let mut size = base_size;
+        loop {
+            delta.push((size as u8 & 127) | if size > 127 { 128 } else { 0 });
+            size >>= 7;
+            if size == 0 {
+                break;
+            }
+        }
+        delta.extend_from_slice(&[1, 1, b'x']); // target size, literal length, content
+        let result_offset = pack.len() as u32;
+        pack.extend_from_slice(&pack_header(7, delta.len()));
+        pack.extend_from_slice(&base_oid);
+        pack.extend_from_slice(&zlib_stored(&delta));
+        let result_crc = crc32(&pack[result_offset as usize..]);
+        let pack_hash = Sha256::digest(&pack).to_vec();
+        pack.extend_from_slice(&pack_hash);
+        let mut entries = [
+            (base_oid, base_crc, base_offset),
+            (result_oid.clone(), result_crc, result_offset),
+        ];
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut index = b"\xfftOc\0\0\0\x02".to_vec();
+        for byte in 0..256 {
+            index.extend_from_slice(
+                &(entries
+                    .iter()
+                    .filter(|entry| usize::from(entry.0[0]) <= byte)
+                    .count() as u32)
+                    .to_be_bytes(),
+            );
+        }
+        for entry in &entries {
+            index.extend_from_slice(&entry.0);
+        }
+        for entry in &entries {
+            index.extend_from_slice(&entry.1.to_be_bytes());
+        }
+        for entry in &entries {
+            index.extend_from_slice(&entry.2.to_be_bytes());
+        }
+        index.extend_from_slice(&pack_hash);
+        index.extend_from_slice(&Sha256::digest(&index));
+        let name = pack_hash
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let directory = repo.join(".git/objects/pack");
+        std::fs::write(directory.join(format!("pack-{name}.pack")), pack).unwrap();
+        std::fs::write(directory.join(format!("pack-{name}.idx")), index).unwrap();
+        result_oid
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    #[test]
+    fn packed_small_result_cannot_expand_an_oversized_delta_base() {
+        for base_size in [4096, GIT_ALLOCATION_LIMIT + 1] {
+            let repo = private_directory().unwrap();
+            fixture_git(repo.path(), &["init", "-q", "--object-format=sha256"]);
+            std::fs::write(repo.path().join("file"), b"x").unwrap();
+            let commit = commit(repo.path());
+            let blob = install_delta_pack(repo.path(), base_size);
+            std::fs::remove_file(
+                repo.path()
+                    .join(".git/objects")
+                    .join(&blob[..2])
+                    .join(&blob[2..]),
+            )
+            .unwrap();
+            assert_eq!(fixture_git(repo.path(), &["cat-file", "-s", &blob]), b"1\n");
+            let result = read_git_tree(repo.path(), &commit, &limits());
+            if base_size <= GIT_ALLOCATION_LIMIT {
+                assert_eq!(result.unwrap().entries()[0].bytes, b"x");
+            } else {
+                assert!(format!("{:#}", result.unwrap_err()).contains(&format!(
+                    "attempting to allocate {} over limit {GIT_ALLOCATION_LIMIT}",
+                    base_size + 1
+                )));
+            }
+        }
     }
 }

@@ -1,12 +1,13 @@
 # syntax=docker/dockerfile:1
 # Runner image for pillbox sandboxes.
 #
-# Six agent harnesses preinstalled at known paths:
+# Seven agent harnesses preinstalled at known paths:
 #   - claude  (Anthropic's native installer → /usr/local/bin/claude)
 #   - codex   (OpenAI's official installer → /usr/local/bin/codex)
 #   - amp     (npm: @ampcode/cli)
 #   - opencode (npm: opencode-ai)
 #   - pi      (npm: @earendil-works/pi-coding-agent)
+#   - prime-agent (Prime Intellect native release → /usr/local/bin/prime-agent)
 #   - cursor  (Cursor Agent CLI lab tarball → /usr/local/bin/agent)
 #
 # System tooling chosen to cover the agents' subagent + shell needs:
@@ -111,13 +112,15 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 # @anthropic-ai/claude-code npm package, so Renovate tracks that as the
 # source of truth (the version string is passed to install.sh below).
 # renovate: datasource=npm depName=@anthropic-ai/claude-code
-ARG CLAUDE_VERSION=2.1.251
+ARG CLAUDE_VERSION=2.1.280
 # renovate: datasource=github-releases depName=openai/codex extractVersion=^rust-v(?<version>.*)$
-ARG CODEX_VERSION=0.151.0
+ARG CODEX_VERSION=0.156.1
 # renovate: datasource=npm depName=opencode-ai
 ARG OPENCODE_VERSION=1.18.25
 # renovate: datasource=npm depName=@earendil-works/pi-coding-agent
-ARG PI_VERSION=0.84.4
+ARG PI_VERSION=0.87.1
+# Prime publishes a stable channel and checksummed native release archives.
+ARG PRIME_AGENT_VERSION=0.9.5
 # Cursor Agent CLI — no Renovate datasource; lab version string from
 # downloads.cursor.com/lab/<ver>/linux/<arch>/agent-cli-package.tar.gz
 ARG CURSOR_AGENT_VERSION=2026.08.25-3e8eec8
@@ -167,6 +170,16 @@ RUN curl -fsSL https://claude.ai/install.sh -o /tmp/claude-install.sh \
 	#   (its bundled runtime + node_modules, ~250MB). We've copied the
 	#   resolved binary into /usr/local/bin, so drop the scratch dir —
 	#   otherwise it rides along dead in the layer.
+
+# Prime Agent: keep the complete native release and its assets outside HOME.
+# Python kernel provisioning remains explicit; the CLI is available as a tool,
+# not yet as a Pillbox auth/session harness adapter.
+RUN curl --proto '=https' --proto-redir '=https' -fsSL https://app.primeintellect.ai/prime-agent/install.sh -o /tmp/prime-agent-install.sh \
+	&& PRIME_AGENT_INSTALL_METHOD=binary PRIME_AGENT_INSTALLER_NONINTERACTIVE=1 \
+		PRIME_AGENT_BOOTSTRAP_KERNEL_ON_INSTALL=0 PRIME_AGENT_INSTALL_DIR=/opt/prime-agent \
+		PRIME_AGENT_BIN_DIR=/usr/local/bin sh /tmp/prime-agent-install.sh "${PRIME_AGENT_VERSION}" \
+	&& test "$(prime-agent --version)" = "${PRIME_AGENT_VERSION}" \
+	&& rm /tmp/prime-agent-install.sh
 
 # Cursor Agent CLI: versioned lab tarball (same URL the install script uses).
 # Pin CURSOR_AGENT_VERSION and bump by hand when upgrading — Renovate cannot

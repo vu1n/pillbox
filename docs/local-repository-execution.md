@@ -1,8 +1,9 @@
 # Bounded local repository execution
 
 Status: implementation in progress on the SB-004 branch. The CLI and offline verifier VM are
-implemented and locally verified. The live provider and complete lifecycle integration gates
-remain pending. This is not a released execution capability.
+implemented and locally verified. The bounded live provider, independent verifier, and successful
+retry/conflict proofs pass. Active cancellation and owner-crash integration remain pending.
+This is not a released execution capability.
 
 This is the Pillbox-owned runtime work for Huddles SB-004. It does not add Huddles workspace,
 thread, packet, or event authority to Pillbox. Existing `pillbox.execution/2` requests retain their
@@ -175,3 +176,20 @@ as defined in `app-server-protocol/src/protocol/common.rs` at upstream commit
 only on server notifications. It never controls lifecycle, ordering, deadline, or
 SessionLog sequence; unknown envelope fields and timestamps on requests/responses
 remain errors. The v2 live smoke exposed this decoder omission before `turn/start`.
+
+## Successful bounded live proof
+
+Attempt `v3` used the signed decoder-repaired binary from `66bfa59`, the same pinned
+Codex 0.151.0 image, and the synthetic three-file fixture. It completed one native
+`gpt-5.6-sol` turn with three granted file calls: read the task, read the answer,
+and write `answer=42` to `src/answer.txt`. The ungranted canary was absent from
+native evidence. A separate offline verifier session passed the complete result.
+The captured patch reproduced the full expected snapshot, including executable bits.
+
+Identical redelivery returned the same completed record. Changed content conflicted;
+invocation and session fingerprints remained unchanged across both deliveries.
+The exact binary, request, artifact and result identities and inspected checks are
+recorded in [the live proof](./local-repository-execution-live-proof.json). Previous
+failed attempts remain intact. This closes successful provider, patch, verifier and
+retry proof; active cancellation and foreground-owner crash remain open. It is not
+Huddles-commissioned self-build evidence.

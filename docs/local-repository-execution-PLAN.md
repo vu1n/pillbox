@@ -499,3 +499,17 @@ gate: "Oversized loose and packed/delta object expansion fails before content ca
   overwrites an attempt automatically.
 - Another live attempt awaits a fresh go-ahead under the user's one-attempt/no-retry limit.
   Successful provider/verifier execution, active cancellation/crash, and merge remain pending.
+
+## Successful live provider and retry proof
+
+- After the user resumed ship-it, explicit attempt `v3` completed one native model
+  turn and three granted file calls. The separate offline verifier passed, all
+  artifact bytes and references checked, and the patch reproduced the full snapshot.
+- Identical delivery reused the exact completed record; changed delivery conflicted.
+  Invocation/session fingerprints were unchanged, with no additional native turn.
+- Safe proof metadata is in `local-repository-execution-live-proof.json`; raw captures
+  remain under the original synthetic artifact directory. Earlier failed claims
+  and their evidence are preserved.
+- Active production CLI cancellation and owner-crash recovery still require
+  separate selected invocations. The successful attempt is terminal and is not
+  repurposed for those gates. PR merge and Huddles self-build remain gated.

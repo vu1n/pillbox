@@ -106,6 +106,19 @@ class SmokeTest(unittest.TestCase):
         with self.assertRaises(AssertionError):
             prepare(self.root, IMAGE)
 
+    def test_new_attempt_requires_explicit_identity_and_fresh_artifacts(self):
+        other = Path(self.temp.name) / 'new attempt'
+        prepare(other, IMAGE, 'v2')
+        request = json.loads((other / 'generated/request.json').read_text())
+        self.assertEqual(request['invocation_id'], 'smoke-execution-v2')
+        self.assertEqual(request['idempotency_key'], request['invocation_id'])
+        self.assertEqual(request['session_ref']['session_id'], 'smoke-builder-session-v2')
+        prepare(other, IMAGE, 'v2')
+        with self.assertRaises(AssertionError):
+            prepare(self.root, IMAGE, 'v2')
+        with self.assertRaises(AssertionError):
+            prepare(other, IMAGE, '../invalid')
+
     def test_shell_defaults_to_offline_preparation(self):
         script = Path(__file__).resolve().parent.parent / 'repository-execution.sh'
         output = subprocess.run(['bash', str(script), '--artifacts', str(self.root), '--image', IMAGE],
@@ -174,7 +187,7 @@ class SmokeTest(unittest.TestCase):
         self.assertEqual(json.loads((directory / 'failure.command.json').read_text())['exit_code'], 17)
         with patch.object(smoke, 'runtime_identity') as runtime:
             with self.assertRaises(FileExistsError):
-                smoke.run_live(type('Args', (), {'artifacts': self.root, 'image': IMAGE, 'binary': Path('/unused')})())
+                smoke.run_live(type('Args', (), {'artifacts': self.root, 'image': IMAGE, 'binary': Path('/unused'), 'attempt': 'v1'})())
             runtime.assert_not_called()
 
 

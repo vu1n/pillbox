@@ -62,7 +62,7 @@ def runtime_identity(binary, root, directory):
 
 def run_live(args):
     root = args.artifacts.resolve()
-    prepare(root, args.image)
+    prepare(root, args.image, args.attempt)
     directory = root / "observations" / "live"
     directory.mkdir(parents=True)  # Existing attempt, even failed, is never overwritten/relaunched.
     binary, identity, state = runtime_identity(args.binary, root, directory)
@@ -86,7 +86,7 @@ def run_live(args):
 
 def verify_retry(args):
     root = args.artifacts.resolve()
-    prepare(root, args.image)
+    prepare(root, args.image, args.attempt)
     original = root / "observations/live"
     directory = root / "observations/retry"
     directory.mkdir()  # Explicit once-only proof, not an automatic recovery policy.
@@ -118,6 +118,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", nargs="?", default="prepare", choices=("prepare", "inspect", "fingerprint", "live", "verify-retry"))
     parser.add_argument("--artifacts", type=Path)
+    parser.add_argument("--attempt", default="v1", help="explicit attempt identity; changing it never retries an existing invocation")
     parser.add_argument("--image", help="complete sha256 image ID; never a tag")
     parser.add_argument("--binary", type=Path, help="exact signed executable; required for explicit live/retry")
     parser.add_argument("--state-dir", type=Path)
@@ -132,7 +133,7 @@ def main():
         if getattr(args, key) is None:
             parser.error("--" + key.replace("_", "-") + " is required for " + args.mode)
     if args.mode == "prepare":
-        result = prepare(args.artifacts, args.image)
+        result = prepare(args.artifacts, args.image, args.attempt)
     elif args.mode == "inspect":
         result = inspect_completion(args.artifacts, args.completion, args.state_dir, args.retry)
     elif args.mode == "fingerprint":

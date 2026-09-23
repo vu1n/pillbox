@@ -72,7 +72,8 @@ def sealed_verifier(name, source, timeout=10000, maximum=16384):
     return {"verifier_id": "smoke-verifier-" + name, "run_id": "smoke-verifier-run-" + name,
             "definition_digest": canonical_digest(program), "definition": program}
 
-def prepare(root, image):
+def prepare(root, image, attempt="v1"):
+    assert re.fullmatch(r"[a-z0-9][a-z0-9-]{0,31}", attempt), "attempt must be 1-32 lowercase letters, digits or hyphens"
     assert re.fullmatch(r"sha256:[0-9a-f]{64}", image), "image must be a complete immutable sha256 ID"
     root = root.resolve()
     repo, out = root / "repository", root / "generated"
@@ -111,8 +112,8 @@ def prepare(root, image):
     )
     request = {
         "contract_version": "pillbox.execution/3",
-        "session_ref": {"session_id": "smoke-builder-session-v1"},
-        "invocation_id": "smoke-execution-v1", "idempotency_key": "smoke-execution-v1",
+        "session_ref": {"session_id": "smoke-builder-session-" + attempt},
+        "invocation_id": "smoke-execution-" + attempt, "idempotency_key": "smoke-execution-" + attempt,
         "rendered_input": prompt, "rendered_input_hash": digest(prompt.encode()),
         "tool_policy": "repository_files", "execution_policy_revision": "pillbox-local-files-v1",
         "execution": {

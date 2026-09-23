@@ -44,6 +44,11 @@ provide descendant teardown. An outer timeout is failure, not teardown proof.
 Every command's arguments, status, stdout, and stderr stay in `observations/live/`, including failed
 attempts. That directory's existence prevents another live call from this tool. Keep failures and
 investigate before deliberately selecting any new invocation; do not delete the directory to retry.
+After investigating a failed invocation, an explicitly authorized new attempt can use
+`--attempt v2` and a fresh artifact directory. Pass the same attempt to preparation, live,
+and verify-retry. The default `v1` preserves the original fixture hashes. No failure
+automatically changes identity or launches another attempt.
+
 A completed CLI state alone is insufficient: `checked.json` appears only after all evidence checks.
 
 ## Inspect existing evidence offline

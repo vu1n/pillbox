@@ -210,10 +210,9 @@ footprint:
     - "src/execution/verifier.rs::*"
     - "src/execution/mod.rs::*"
     - "src/commands/execution.rs::*"
-  creates:
-    - "scripts/smoke/repository-execution.sh"
+    - "scripts/smoke/repository-execution.sh::*"
     - "scripts/smoke/repository-execution/*.py"
-    - "scripts/smoke/repository-execution/README.md"
+    - "scripts/smoke/repository-execution/README.md::*"
 produces:
   - "src/sandbox/libkrun/repository.rs"
 gate: "Real isolated local execution proves bounded file/tool/network/credential policy and exact model; identical retry samples once, changed retry conflicts, cancellation is idempotent, crash recovery does not resample, and captured result has positional evidence and separate offline verifier evidence."
@@ -271,6 +270,8 @@ footprint:
     - "src/execution/evidence.rs::*"
     - "src/execution/local.rs::*"
     - "docs/local-repository-execution-offline-proof.json::*"
+    - "docs/local-repository-execution-live-attempt.json::*"
+    - ".github/workflows/ci.yml::*"
 gate: "Tighten and mandatory structure/correctness/security review complete, Brief and required CI green, PR merged, integrated content verified, and actual proof or remaining blocker recorded without claiming SB-004 prematurely."
 ```
 
@@ -458,3 +459,22 @@ gate: "Oversized loose and packed/delta object expansion fails before content ca
   and destination authorization. A single synthetic gpt-5.6-sol call to chatgpt.com using the existing
   managed login has been presented for approval. No provider call or managed credential read has
   occurred. Retry/cancel/crash integration, portable smoke, security closure, CI and merge remain open.
+
+## Resumed verification — 2026-09-23
+
+- The first draft at `89841af` passed all five GitHub checks: governance, Cloudflare gateway,
+  Ubuntu/macOS no-default tests, and libkrun lint/tests.
+- LE-005D now rejects oversized commit/tree metadata before nonrecursive traversal and verifies
+  allocation/mapping guards for every Git child. All 13 focused snapshot tests passed, including
+  a valid packed one-byte result that depends on an oversized delta base; strict libkrun Clippy passed.
+- The portable smoke scripts landed with 8 offline regressions and an independent correctness
+  review with no findings. CI now runs those offline regressions on Ubuntu. Static security review
+  of the script boundary found no candidate; operator paths/binary choices remain trusted.
+- After explicit user approval, one signed production-CLI attempt at `9d9e599` failed during managed
+  OAuth refresh with 401 refresh_token_invalidated, before VM provisioning or model sampling.
+  Its failed claim and admission/failure evidence remain intact. Identical redelivery reused the
+  exact failed record; changed content conflicted; invocation/session fingerprints were unchanged.
+  This is pre-launch failure reuse evidence, not successful builder retry or active cancellation.
+- The user must renew the managed Codex login. A new invocation needs explicit authorization;
+  the failed invocation will not be relaunched. Live provider acceptance, independent verification
+  of a real build, active cancellation/crash and final merge remain pending.

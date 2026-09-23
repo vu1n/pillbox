@@ -156,5 +156,12 @@ failed observations; revised fixtures and the cleanup fix were tested independen
 
 These checks used synthetic data and no provider credentials. They establish the offline verifier
 and owned-process boundaries, not model delivery, complete execution/3 integration, or Huddles
-self-build. The first live provider proof is pending explicit authorization for its synthetic
-payload and destination after automatic approval review rejected that call.
+self-build. After explicit authorization, the [first production-CLI attempt](./local-repository-execution-live-attempt.json) on 2026-09-23 failed during managed
+OAuth refresh (401 refresh_token_invalidated), before any VM or model invocation. The failed claim
+and admission/failure evidence were preserved. Identical redelivery reused that record and changed
+content conflicted without changing invocation/session bytes. A renewed managed login and an
+explicit new invocation are required before live provider acceptance can be established.
+
+The [portable smoke entry point](../scripts/smoke/repository-execution.sh) defaults to offline
+preparation. Its [runbook](../scripts/smoke/repository-execution/README.md) separates explicit live
+execution, artifact inspection and retry proof, preserving every attempt without automatic sampling.

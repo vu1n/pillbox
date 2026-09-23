@@ -182,3 +182,5 @@ gateway-no-daemon conforms: Conditions are a read-only projection over the log a
 optimization-external-substrate-primitives conforms: Presets and conditions are substrate ergonomics (declared run environments, a typed status projection); no reward, selection, or optimization policy moves into pillbox.
 docs-governance conforms: AGENTS.md gains one quick-start line for `--preset`; the canonical descriptor doc (docs/config.md) and command reference carry the full contract, and the stale backend note in docs/dx.md now matches `select_backend`.
 runner-image-tags-name-roles conforms: Harness pins and Prime packaging change only image contents; dev remains the local build default and immutable images remain available for sealed profiles.
+
+managed-tier-do-gateway amend-proposed: Allow explicitly selected DigitalOcean managed execution alongside default Cloudflare, preserving authorization, exact retries, bounded D1/R2 persistence, and rustic workspace authority.

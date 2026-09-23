@@ -478,3 +478,24 @@ gate: "Oversized loose and packed/delta object expansion fails before content ca
 - The user must renew the managed Codex login. A new invocation needs explicit authorization;
   the failed invocation will not be relaunched. Live provider acceptance, independent verification
   of a real build, active cancellation/crash and final merge remain pending.
+
+## Resume after DigitalOcean support — 2026-09-23
+
+- DigitalOcean's managed execution/2 adapter now supports bounded deny-all planning calls.
+  It does not provide execution/3 repository confinement or replace this gate.
+- The user reported renewed Codex authentication. Explicit attempt `v2` used the same synthetic
+  fixture and limits with the existing signed binary. The VM initialized successfully, then the
+  adapter rejected the pinned native notification field `emittedAtMs` before any `turn/start`.
+  The failed claim and raw native evidence remain immutable; safe metadata is recorded in
+  `local-repository-execution-live-attempt-v2.json`. No model turn was launched.
+- Upstream commit `78c290807ce710180111df227df3b7a4fe845452` declares this optional int64 field
+  on `ServerNotificationEnvelope`. A regression reproduced the failure; the fix accepts that
+  field only on notifications and preserves it solely as raw evidence. Requests, responses,
+  malformed timestamps and unknown fields remain rejected. All 24 native tests pass in both
+  feature modes; strict libkrun all-target Clippy and signed build pass. Independent review
+  reports no remaining finding.
+- The smoke helper now accepts an explicit `--attempt` with a fresh artifact directory;
+  defaults retain the original v1 hashes. Nine offline smoke checks pass. It never retries or
+  overwrites an attempt automatically.
+- Another live attempt awaits a fresh go-ahead under the user's one-attempt/no-retry limit.
+  Successful provider/verifier execution, active cancellation/crash, and merge remain pending.

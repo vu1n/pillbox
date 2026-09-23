@@ -597,7 +597,7 @@ fn validate_envelope(frame: &Value) -> Result<()> {
     ensure!(
         object.keys().all(|key| matches!(
             key.as_str(),
-            "jsonrpc" | "id" | "method" | "params" | "result" | "error"
+            "jsonrpc" | "id" | "method" | "params" | "result" | "error" | "emittedAtMs"
         )),
         "unknown native RPC envelope field"
     );
@@ -605,6 +605,16 @@ fn validate_envelope(frame: &Value) -> Result<()> {
         frame.get("jsonrpc").is_none_or(|version| version == "2.0"),
         "invalid native RPC version"
     );
+    // Codex 0.151.0 ServerNotificationEnvelope adds an optional int64 timestamp.
+    // Preserve it as evidence only; requests/responses and lifecycle authority are unchanged.
+    if let Some(timestamp) = frame.get("emittedAtMs") {
+        ensure!(
+            frame.get("method").is_some()
+                && frame.get("id").is_none()
+                && timestamp.as_i64().is_some(),
+            "invalid native notification emission timestamp"
+        );
+    }
     if let Some(method) = frame.get("method") {
         ensure!(
             method.as_str().is_some_and(|method| !method.is_empty()),
@@ -1392,6 +1402,34 @@ mod tests {
             assert!(error.to_string().contains("deadline"));
             assert!(start.elapsed() < Duration::from_secs(1));
             assert!(wire.evidence.is_empty());
+        }
+    }
+
+    #[test]
+    fn pinned_server_notifications_preserve_emission_timestamps_without_authority() {
+        let result = drive(&mut broker(), limits(), |peer| {
+            peer.started();
+            peer.send(json!({"emittedAtMs":1790156306027_i64,
+                "method":"remoteControl/status/changed", "params":{"status":"disabled"}}));
+            let mut done = terminal();
+            done["emittedAtMs"] = json!(1790156306028_i64);
+            peer.send(done);
+        })
+        .unwrap();
+        assert!(result
+            .evidence
+            .iter()
+            .any(|frame| frame["message"]["emittedAtMs"] == 1790156306027_i64));
+        assert_eq!(result.turn_id, "turn-1");
+        for frame in [
+            json!({"id":1,"result":{},"emittedAtMs":1}),
+            json!({"id":1,"method":"request","params":{},"emittedAtMs":1}),
+            json!({"method":"notice","params":{},"emittedAtMs":"1"}),
+            json!({"method":"notice","params":{},"emittedAtMs":null}),
+            json!({"method":"notice","params":{},"emittedAtMs":1.5}),
+            json!({"method":"notice","params":{},"emittedAtMs":18446744073709551615_u64}),
+        ] {
+            assert!(validate_envelope(&frame).is_err());
         }
     }
 

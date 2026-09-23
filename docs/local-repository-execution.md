@@ -165,3 +165,13 @@ explicit new invocation are required before live provider acceptance can be esta
 The [portable smoke entry point](../scripts/smoke/repository-execution.sh) defaults to offline
 preparation. Its [runbook](../scripts/smoke/repository-execution/README.md) separates explicit live
 execution, artifact inspection and retry proof, preserving every attempt without automatic sampling.
+
+
+### Native notification metadata
+
+Codex 0.151.0's `ServerNotificationEnvelope` includes optional `emittedAtMs` (int64),
+as defined in `app-server-protocol/src/protocol/common.rs` at upstream commit
+`78c290807ce710180111df227df3b7a4fe845452`. The bounded adapter preserves this field
+only on server notifications. It never controls lifecycle, ordering, deadline, or
+SessionLog sequence; unknown envelope fields and timestamps on requests/responses
+remain errors. The v2 live smoke exposed this decoder omission before `turn/start`.

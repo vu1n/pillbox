@@ -222,3 +222,5 @@ docs-governance conforms: Managed-tier and DO adapter documentation identify sup
 managed-tier-do-gateway conforms: Review fixes bind normalized effort to explicit native OpenRouter variants, reject unsupported model/effort pairs before allocation, and preserve provider routing and exact retries.
 
 managed-tier-do-gateway conforms: Live smoke correction admits only completed native StructuredOutputError for the existing sealed-schema fallback; arbitrary tools, unrelated errors, and invalid output remain rejected.
+
+gateway-no-daemon conforms: Explicitly unlocking successfully acquired execution file locks on guard drop preserves one foreground owner and immutable claim recovery; it prevents unrelated forked children from retaining a normal-release lock and adds no resident controller.

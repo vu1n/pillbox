@@ -63,9 +63,22 @@ pub(crate) struct InvocationStore {
 pub(crate) struct OwnedInvocation {
     directory: PathBuf,
     record: Record,
-    // Closing this fd releases flock even after a process crash. The durable
-    // original outlives the lock and prevents a new owner from sampling again.
-    _lock: File,
+    // The durable original outlives the lock and prevents a new owner from
+    // sampling again. Explicit unlock also releases fork-inherited descriptors.
+    _lock: FileLock,
+}
+
+struct FileLock(File);
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        if unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) } != 0 {
+            eprintln!(
+                "failed to release execution file lock: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
 }
 
 impl InvocationStore {
@@ -319,7 +332,7 @@ fn private_directory(path: &Path) -> Result<()> {
     crate::paths::ensure_mode_0700(path)
 }
 
-fn try_lock(directory: &Path) -> Result<Option<File>> {
+fn try_lock(directory: &Path) -> Result<Option<FileLock>> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -331,7 +344,7 @@ fn try_lock(directory: &Path) -> Result<Option<File>> {
         .context("open execution ownership lock")?;
     let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if result == 0 {
-        return Ok(Some(file));
+        return Ok(Some(FileLock(file)));
     }
     let error = std::io::Error::last_os_error();
     if error.kind() == std::io::ErrorKind::WouldBlock {
@@ -341,7 +354,7 @@ fn try_lock(directory: &Path) -> Result<Option<File>> {
     }
 }
 
-fn transition_lock(directory: &Path) -> Result<File> {
+fn transition_lock(directory: &Path) -> Result<FileLock> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -354,7 +367,7 @@ fn transition_lock(directory: &Path) -> Result<File> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Ok(file);
+            return Ok(FileLock(file));
         }
         let error = std::io::Error::last_os_error();
         ensure!(
@@ -413,6 +426,7 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
 mod tests {
     use super::*;
     use std::io::{BufRead, Read, Write};
+    use std::os::fd::FromRawFd;
     use std::process::{Command, Stdio};
 
     fn owned(store: &InvocationStore) -> OwnedInvocation {
@@ -457,6 +471,64 @@ mod tests {
             panic!("reacquired abandoned invocation")
         };
         assert_eq!(record.status, Status::Interrupted);
+    }
+
+    #[test]
+    fn dropping_owner_unlocks_even_while_a_fork_holds_its_descriptor() {
+        let root = tempfile::tempdir().unwrap();
+        let store = InvocationStore::new(root.path()).unwrap();
+        let owner = owned(&store);
+        let mut ready = [0; 2];
+        let mut release = [0; 2];
+        assert_eq!(unsafe { libc::pipe(ready.as_mut_ptr()) }, 0);
+        assert_eq!(unsafe { libc::pipe(release.as_mut_ptr()) }, 0);
+        for fd in ready.iter().chain(release.iter()) {
+            assert_eq!(
+                unsafe { libc::fcntl(*fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                0
+            );
+        }
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            // Only async-signal-safe syscalls run in this child of the test harness.
+            unsafe {
+                libc::close(ready[0]);
+                libc::close(release[1]);
+                let signal = [1_u8];
+                if libc::write(ready[1], signal.as_ptr().cast(), 1) != 1 {
+                    libc::_exit(1);
+                }
+                let mut event = libc::pollfd {
+                    fd: release[0],
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                if libc::poll(&mut event, 1, 30_000) <= 0 {
+                    libc::_exit(2);
+                }
+                let mut proceed = 0_u8;
+                if libc::read(release[0], (&mut proceed as *mut u8).cast(), 1) != 1 {
+                    libc::_exit(3);
+                }
+                libc::_exit(0);
+            }
+        }
+        unsafe {
+            libc::close(ready[1]);
+            libc::close(release[0]);
+        }
+        let mut ready_reader = unsafe { File::from_raw_fd(ready[0]) };
+        let mut release_writer = unsafe { File::from_raw_fd(release[1]) };
+        let mut signal = [0_u8];
+        ready_reader.read_exact(&mut signal).unwrap();
+        drop(owner);
+        let observed = store.status("inv-1");
+        release_writer.write_all(&[1]).unwrap();
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert_eq!(status, 0);
+        assert_eq!(observed.unwrap().status, Status::Interrupted);
     }
 
     #[test]

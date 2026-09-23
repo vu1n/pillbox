@@ -1,7 +1,7 @@
 export type HuddlesToolPolicy = "deny_all";
 
 export type HuddlesOpencodeConfig = {
-  provider?: Record<string, { options?: { apiKey?: string } }>;
+  provider?: Record<string, { options?: { apiKey?: string }; models?: Record<string, unknown> }>;
 } & Record<string, unknown>;
 
 const OPENCODE_BUILTIN_TOOLS = [

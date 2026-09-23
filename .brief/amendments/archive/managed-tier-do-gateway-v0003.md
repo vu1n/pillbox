@@ -122,3 +122,8 @@ model availability alone is insufficient. Adding a provider expands credential,
 cleanup, and cost-accounting surfaces. Tests must prove those boundaries before
 advertising support. No automatic cross-provider fallback is permitted, and R2
 workspace portability must not be confused with live process migration.
+
+
+---
+ratified_rev: 0003
+ratified_by: maintainer

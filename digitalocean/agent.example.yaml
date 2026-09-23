@@ -1,0 +1,15 @@
+# Operator-owned config, reused by per-invocation sessions. No automatic model run.
+name: pillbox-opencode-v1
+agent: opencode
+size: mars-2vcpu-4gb
+idle_timeout: 5m
+persistent_workspace: false
+egress:
+  - openrouter.ai
+  - models.dev
+secrets:
+  OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+permissions:
+  default: deny
+  filesystem:
+    mode: workspace-write

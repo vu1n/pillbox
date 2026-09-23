@@ -1,6 +1,12 @@
-# Managed tier — bounded execution on Cloudflare
+# Managed tier — bounded execution with selectable compute
 
-Status: **experimental** (updated 2026-08-31).
+Status: **experimental** (updated 2026-09-23).
+
+Cloudflare remains the default workspace-capable substrate. The optional
+[DigitalOcean adapter](../digitalocean/README.md) supports fresh sealed deny-all
+OpenCode invocations using OpenRouter, with the same D1/R2 execution control plane.
+The lifecycle below describes Cloudflare workspace execution; DO workspace and
+native-session handoff are not enabled by provider selection.
 
 Managed Pillbox is a single-controller execution runtime. It restores one
 workspace into one Cloudflare Sandbox, runs one bounded agent turn, stores one
@@ -8,7 +14,7 @@ terminal claim and one immutable evidence object, then returns the evidence to
 the caller's local session log. It is not a multiplayer session service.
 
 <!-- brief:anchor managed-tier-runtime-boundary -->
-Context: `doc://pillbox/managed-tier-do-gateway@0002#managed-tier-do-gateway`
+Context: `doc://pillbox/managed-tier-do-gateway@0003#managed-tier-do-gateway`
 
 ## Ownership boundary
 

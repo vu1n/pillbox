@@ -184,3 +184,11 @@ docs-governance conforms: AGENTS.md gains one quick-start line for `--preset`; t
 runner-image-tags-name-roles conforms: Harness pins and Prime packaging change only image contents; dev remains the local build default and immutable images remain available for sealed profiles.
 
 managed-tier-do-gateway amend-proposed: Allow explicitly selected DigitalOcean managed execution alongside default Cloudflare, preserving authorization, exact retries, bounded D1/R2 persistence, and rustic workspace authority.
+
+managed-tier-do-gateway conforms: Ratified revision 0003 permits the explicit DO transport; bounded allocation records, exact execution hashes, owner-qualified cleanup, D1/R2 persistence, and deny-all admission preserve the execution boundary.
+managed-store-of-record conforms: The DO adapter accepts sealed prompt-only invocations and rejects adoption of provisioned workspaces; it introduces no alternative workspace store or snapshot handle.
+docs-governance conforms: Managed-tier and DO adapter documentation identify supported capabilities, immutable config setup, bounded cleanup, cost missingness, and unrun live release gates alongside the implementation.
+
+managed-tier-do-gateway conforms: Review fixes bind normalized effort to explicit native OpenRouter variants, reject unsupported model/effort pairs before allocation, and preserve provider routing and exact retries.
+
+managed-tier-do-gateway conforms: Live smoke correction admits only completed native StructuredOutputError for the existing sealed-schema fallback; arbitrary tools, unrelated errors, and invalid output remain rejected.

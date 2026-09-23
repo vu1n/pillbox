@@ -65,6 +65,7 @@ export interface Env {
   // Known provider keys are passed through as env so opencode auto-detects them.
   ANTHROPIC_API_KEY?: string;
   OPENAI_API_KEY?: string;
+  OPENROUTER_API_KEY?: string;
   // Z.AI GLM coding-plan subscription key — wired into opencode's `zai-coding-plan`
   // provider (a config overlay, since it isn't a standard-env auto-detect provider).
   ZAI_API_KEY?: string;
@@ -74,6 +75,11 @@ export interface Env {
   // Default model (`provider/modelID`) when an /input doesn't carry one.
   OPENCODE_MODEL?: string;
   SANDBOX_PROFILE?: string;
+  /** Independent opt-in for DO compute; the existing global allowance is still required. */
+  DIGITALOCEAN_EXECUTION_ENABLED?: string;
+  DIGITALOCEAN_API_TOKEN?: string;
+  DIGITALOCEAN_AGENT_CONFIG_ID?: string;
+  DIGITALOCEAN_ALLOCATION_NAMESPACE?: string;
 }
 
 export default {

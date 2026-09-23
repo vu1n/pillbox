@@ -40,6 +40,7 @@ export interface OpencodeTurnInput {
   readonly sandbox: SandboxHandle;
   readonly text: string;
   readonly model: string;
+  readonly reasoningVariant?: string;
   readonly toolPolicy?: HuddlesToolPolicy;
   readonly outputFormat?: JsonSchemaOutputFormat;
   readonly config: {
@@ -273,6 +274,7 @@ async function driveOpencodeAttempt(
       {
         parts: [{ type: "text", text: input.text }],
         model: { providerID: input.provider, modelID: input.modelId },
+        ...(input.reasoningVariant ? { variant: input.reasoningVariant } : undefined),
         ...(input.toolPolicy
           ? { tools: huddlesPromptTools(input.toolPolicy) }
           : undefined),

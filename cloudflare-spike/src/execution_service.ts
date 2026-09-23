@@ -1,3 +1,4 @@
+import { openRouterReasoning, openRouterReasoningAdmission } from "./opencode_reasoning.js";
 import type { getSandbox } from "@cloudflare/sandbox";
 import {
   computeExecutionIdentityDigest,
@@ -86,8 +87,10 @@ export interface RuntimeTurnResult {
 }
 
 export interface ExecutionRuntime {
+  preflight?(request: ExecuteInvocationV2Request): { code: "managed_disabled" | "unsupported_execution" | "unsupported_policy"; message: string } | undefined;
+  reconcile?(record: ExecutionRecord): Promise<void>;
   execute(request: ExecuteInvocationV2Request): Promise<RuntimeTurnResult>;
-  cancel(request: CancelInvocationV2Request, session_id: string): Promise<void>;
+  cancel(request: CancelInvocationV2Request, session_id: string, attribution?: ExecutionAttribution): Promise<void>;
 }
 
 export type ExecutionOperationAuthorization =
@@ -183,7 +186,7 @@ export class ExecutionService {
         cause.message,
       );
     }
-    const unsupported = unsupportedManagedRequest(request);
+    const unsupported = unsupportedManagedRequest(request) ?? this.runtime.preflight?.(request);
     if (unsupported !== undefined) {
       return this.preClaimFailureResult(
         request,
@@ -234,6 +237,13 @@ export class ExecutionService {
         requestHash,
         executionDigest,
       );
+    }
+    if (request.execution.transport.transport === "digitalocean-sandbox-exec" &&
+        reservation.record.source === "workspace_provision") {
+      return this.preClaimFailureResult(request, requestHash, executionDigest, {
+        code: "unsupported_execution",
+        message: "DigitalOcean cannot adopt a provisioned Cloudflare workspace",
+      });
     }
     if (reservation.record.status !== "ready") {
       throw new ExecutionNotFoundError(request.invocation_id);
@@ -310,7 +320,7 @@ export class ExecutionService {
         limit: MAX_EVIDENCE_PAGE_SIZE,
       });
     }
-    await this.runtime.cancel(request, record.session_id);
+    await this.runtime.cancel(request, record.session_id, record.attribution);
     const result = await this.finishTerminal(
       record,
       {
@@ -334,6 +344,9 @@ export class ExecutionService {
     record: ExecutionRecord,
     cursor: { readonly after: number; readonly limit: number },
   ): Promise<ExecuteInvocationV2Result> {
+    if (record.status !== "running" || record.lease_expires_at_ms <= this.now()) {
+      await this.runtime.reconcile?.(record);
+    }
     if (record.status === "running") {
       if (record.lease_expires_at_ms > this.now()) {
         return {
@@ -440,7 +453,7 @@ export class ExecutionService {
     this.costMeter?.observeEvidence(evidence);
     const cost = this.costMeter?.terminal(outcome.status, {
       sandbox_duration_ms: Math.max(0, this.now() - record.created_at_ms),
-      sandbox_profile: this.sandboxProfile,
+      sandbox_profile: record.attribution.transport === "digitalocean-sandbox-exec" ? "digitalocean/configured" : this.sandboxProfile,
       planned_d1_terminal_writes: 1,
       planned_r2_writes: 1,
       planned_analytics_points: this.analytics === undefined ? 0 : 1,
@@ -683,7 +696,7 @@ function unsupportedManagedRequest(
   const { harness, transport } = request.execution.transport;
   if (
     harness !== "opencode" ||
-    (transport !== "http" && transport !== "cloudflare-service-binding")
+    (transport !== "http" && transport !== "cloudflare-service-binding" && transport !== "digitalocean-sandbox-exec")
   ) {
     return {
       code: "unsupported_execution",
@@ -712,7 +725,13 @@ export class OpencodeExecutionRuntime implements ExecutionRuntime {
     this.options = options;
   }
 
+  preflight(request: ExecuteInvocationV2Request) {
+    return openRouterReasoningAdmission(request.execution.requested);
+  }
+
   async execute(request: ExecuteInvocationV2Request): Promise<RuntimeTurnResult> {
+    const unsupported = this.preflight(request);
+    if (unsupported) return { served_model: null, error: unsupported, evidence: [] };
     const evidence: JsonValue[] = [];
     let text = "";
     let evidenceBytes = 0;
@@ -741,6 +760,7 @@ export class OpencodeExecutionRuntime implements ExecutionRuntime {
       sandbox: await this.options.sandboxFor(request.session_ref.session_id),
       text: request.rendered_input,
       model: `${request.execution.requested.provider}/${request.execution.requested.model}`,
+      reasoningVariant: openRouterReasoning(request.execution.requested)?.variant,
       toolPolicy: request.tool_policy === "deny_all" ? "deny_all" : undefined,
       outputFormat:
         request.output_format.type === "json_schema"

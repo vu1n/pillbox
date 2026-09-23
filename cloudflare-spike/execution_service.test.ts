@@ -1031,3 +1031,53 @@ function deferred<T>(): {
   });
   return { promise, resolve };
 }
+
+test("provider admission runs after authorization and before reservations or allocation", async () => {
+  const never = (): never => { throw new Error("provider rejection reached persistence"); };
+  let authorized = false;
+  const service = new ExecutionService(
+    { claim: async () => never(), get: async () => never(), finish: async () => never() },
+    { write: async () => never(), read: async () => never() },
+    {
+      preflight: () => { assert.equal(authorized, true); return { code: "managed_disabled", message: "DO disabled" }; },
+      execute: async () => never(), cancel: async () => never(),
+    },
+    { ...fixedOptions(), authorizer: async () => { authorized = true; return executionOwner; } },
+  );
+  const input = await request();
+  const result = await service.executeInvocation({ ...input, execution: { ...input.execution,
+    transport: { ...input.execution.transport, transport: "digitalocean-sandbox-exec" } } });
+  assert.equal(result.status, "failed");
+  if (result.status === "failed") assert.equal(result.error.code, "managed_disabled");
+});
+
+test("provider cleanup receives only authorized expired or terminal execution records", async () => {
+  const input = await request();
+  const store = new MemoryStore();
+  await seedRunning(store, input, 1);
+  let cleanup = 0;
+  const service = new ExecutionService(store, new MemoryArtifacts(), {
+    execute: async () => { throw new Error("must not resample"); },
+    cancel: async () => {},
+    reconcile: async record => { cleanup++; assert.equal(record.invocation_id, input.invocation_id); },
+  }, { ...fixedOptions(), now: () => EXECUTION_OWNER_LEASE_MS + 2 });
+  const result = await service.getExecutionStatus({ contract_version: "pillbox.execution/2", invocation_id: input.invocation_id, evidence_after: 0, evidence_limit: 100 });
+  assert.equal(result.status, "interrupted");
+  assert.equal(cleanup, 1);
+});
+
+test("DO refuses to adopt a provisioned Cloudflare workspace before allocating runtime", async () => {
+  const original = await request();
+  const input = { ...original, execution: { ...original.execution, transport: { ...original.execution.transport, transport: "digitalocean-sandbox-exec" } } };
+  const reservations = new MemoryReservations();
+  await reservations.claimProvision({ invocation_id: input.invocation_id, session_id: input.session_ref.session_id,
+    owner: executionOwner, execution_request_hash: await computeInvocationRequestHash(input), source: "workspace_provision",
+    provision_request_digest: `sha256:${"f".repeat(64)}`, now_ms: 0 }, allowance);
+  await reservations.markReady({ invocation_id: input.invocation_id, owner: executionOwner, now_ms: 1 });
+  const runtime = new FakeRuntime({ served_model: null, output: { text: "must not run" }, evidence: [] });
+  const service = new ExecutionService(new MemoryStore(), new MemoryArtifacts(), runtime, { ...fixedOptions(), reservations });
+  const result = await service.executeInvocation(input);
+  assert.equal(result.status, "failed");
+  if (result.status === "failed") assert.equal(result.error.code, "unsupported_execution");
+  assert.equal(runtime.executions, 0);
+});

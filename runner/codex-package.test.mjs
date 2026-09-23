@@ -9,7 +9,8 @@ import test from "node:test";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const helperPath = join(repoRoot, "runner", "install-codex-package.sh");
-const codexVersion = "0.151.0";
+// Daily runner packaging contract; sealed execution profiles select their own image.
+const codexVersion = "0.156.1";
 
 async function executable(path, contents) {
   await writeFile(path, contents, "utf8");
@@ -124,7 +125,7 @@ test("preserves the complete package after installer scratch cleanup", async () 
     const dockerignore = await readFile(join(repoRoot, ".dockerignore"), "utf8");
     assert.match(dockerignore, /^!runner\/install-codex-package\.sh$/m);
     const dockerfile = await readFile(join(repoRoot, "runner", "Dockerfile"), "utf8");
-    assert.match(dockerfile, /^ARG CODEX_VERSION=0\.151\.0$/m);
+    assert.match(dockerfile, /^ARG CODEX_VERSION=0\.156\.1$/m);
     assert.match(dockerfile, /COPY runner\/install-codex-package\.sh/);
   } finally {
     await cleanup(fixtureData);
@@ -159,7 +160,7 @@ test("fails loudly when the pinned version does not match", async () => {
   try {
     const result = runHelper(fixtureData);
     assert.notEqual(result.status, 0);
-    assert.match(result.output, /does not match expected 0\.151\.0/);
+    assert.match(result.output, /does not match expected 0\.156\.1/);
   } finally {
     await cleanup(fixtureData);
   }

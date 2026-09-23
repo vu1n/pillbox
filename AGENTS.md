@@ -27,14 +27,14 @@ what you want.
 >
 > The **remote** backend plane was removed (`remote add/list/info/rm`,
 > `pillbox run --remote`, the `ssh://`/`e2b://`/`docker://` URL backends are gone).
-> "Remote" returns as the managed/Cloudflare tier — a different shape, built
-> fresh against CF's API, **not** a port of local docker (so docker earns no
+> "Remote" returns as the managed tier (Cloudflare by default, optional DigitalOcean compute) — a different shape, built
+> fresh against provider APIs, **not** a port of local docker (so docker earns no
 > "twin" credit). Managed Pillbox is a **single-controller execution runtime**:
 > Cloudflare's Sandbox Durable Object may own the container lifecycle, while
 > bounded invocation claims live in D1, immutable evidence lives in R2, and
 > collaboration belongs to Huddles. Pillbox must not introduce a custom Durable
 > Object, remote §0 log, driver arbitration, replay broker, or per-delta storage.
-> See `docs/managed-tier.md` and `docs/durable-object-usage.md`.
+> See `docs/managed-tier.md`, `digitalocean/README.md`, and `docs/durable-object-usage.md`.
 > Everything else (run, secrets, env, auth, vault, sessions, snapshots — and
 > local detach/reattach) is current.
 

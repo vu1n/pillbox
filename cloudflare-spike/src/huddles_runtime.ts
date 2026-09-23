@@ -1,3 +1,9 @@
+import { openRouterReasoning } from "./opencode_reasoning.js";
+import type { RequestedModelProfile } from "./codex_execution.js";
+import { DigitalOceanClient } from "./digitalocean_client.js";
+import { D1DigitalOceanAllocations } from "./digitalocean_allocations.js";
+import { DigitalOceanExecutionRuntime } from "./digitalocean_runtime.js";
+import { ManagedExecutionRuntime } from "./managed_runtime.js";
 import { getSandbox } from "@cloudflare/sandbox";
 import { WorkerEntrypoint } from "cloudflare:workers";
 import type { Env } from "./worker.js";
@@ -188,9 +194,19 @@ export function executionService(
     runtime = new OpencodeExecutionRuntime({
       sandboxFor: async (sessionId) =>
         getSandbox(sandboxNamespace, await deriveSandboxRuntimeId(sessionId)),
-      configFor: (request) => opencodeConfig(env, request.tool_policy),
+      configFor: (request) => opencodeConfig(env, request.tool_policy, request.execution.requested),
     });
   }
+  runtime = new ManagedExecutionRuntime(runtime, new DigitalOceanExecutionRuntime({
+    api: new DigitalOceanClient(env.DIGITALOCEAN_API_TOKEN ?? ""),
+    allocations: new D1DigitalOceanAllocations(env.EXECUTION_DB as unknown as RelationalDatabase, meter.observeRelational),
+    settings: {
+      enabled: env.DIGITALOCEAN_EXECUTION_ENABLED,
+      token: env.DIGITALOCEAN_API_TOKEN,
+      namespace: env.DIGITALOCEAN_ALLOCATION_NAMESPACE,
+      configId: env.DIGITALOCEAN_AGENT_CONFIG_ID,
+    },
+  }));
   return new ExecutionService(store, artifacts, runtime, {
     costMeter: meter,
     analytics:
@@ -238,9 +254,10 @@ class UnavailableExecutionRuntime implements ExecutionRuntime {
 function opencodeConfig(
   env: Env,
   toolPolicy: "deny_all" | "runtime_default",
+  requested: RequestedModelProfile,
 ): { readonly config?: unknown; readonly env: Readonly<Record<string, string>> } {
   const providerEnv: Record<string, string> = {};
-  for (const key of ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"] as const) {
+  for (const key of ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"] as const) {
     const value = env[key];
     if (value) providerEnv[key] = value;
   }
@@ -252,6 +269,19 @@ function opencodeConfig(
     config.provider ??= {};
     config.provider["zai-coding-plan"] ??= {
       options: { apiKey: env.ZAI_API_KEY },
+    };
+  }
+  const reasoning = openRouterReasoning(requested);
+  if (reasoning) {
+    config ??= {};
+    config.provider ??= {};
+    const provider = config.provider.openrouter ?? {};
+    config.provider.openrouter = {
+      ...provider,
+      models: {
+        ...provider.models,
+        [requested.model]: { variants: { [reasoning.variant]: reasoning.options } },
+      },
     };
   }
   if (config === undefined && Object.keys(providerEnv).length === 0) {

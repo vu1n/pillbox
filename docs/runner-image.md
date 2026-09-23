@@ -6,8 +6,7 @@
 > (krunvm/crun-krun style), or a slimmer custom rootfs. Build/publish mechanics
 > change; what's *in* the image mostly doesn't.
 
-The runner image is the Docker image pillbox launches sandboxes
-from. Source lives in [`runner/Dockerfile`](../runner/Dockerfile);
+The runner image is the OCI source that libkrun materializes as a microVM rootfs. Source lives in [`runner/Dockerfile`](../runner/Dockerfile);
 canonical builds are published to GitHub Container Registry on
 every tagged CLI release.
 
@@ -19,7 +18,7 @@ every tagged CLI release.
 
 ## What's in it
 
-Six agent CLIs preinstalled at known paths:
+Seven agent CLIs preinstalled at known paths:
 
 Every harness is **pinned** to a concrete version (an `ARG …_VERSION` in
 `runner/Dockerfile`) so Docker's layer cache reflects the version we ask for —
@@ -34,6 +33,20 @@ rebuild silently reuses the stale layer instead of pulling the newer agent.
 | amp | `npm i -g @ampcode/cli@<pinned>` | `AMP_VERSION` | no — timestamp+sha versions defeat semver; bump by hand |
 | opencode | `npm i -g opencode-ai@<pinned>` | `OPENCODE_VERSION` | yes — npm |
 | pi | `npm i -g @earendil-works/pi-coding-agent@<pinned>` | `PI_VERSION` | yes — npm |
+| prime-agent | official native installer, checksummed release archive under `/opt/prime-agent` | `PRIME_AGENT_VERSION` | no — stable feed via `build-runner.sh --update` |
+
+Prime Agent is bundled as a command-line tool. It is not yet registered as a
+Pillbox agent: `--agent prime-agent`, managed auth, and structured session events
+require a separate adapter. Its Python kernel dependencies are not pre-provisioned;
+workflows using that kernel still need an explicit setup step and network access.
+The complete native release lives outside the runtime HOME so its assets survive
+home-directory mounts.
+
+The September 23 refresh pins Claude 2.1.280, Codex 0.156.1, Pi 0.87.1, and
+Prime Agent 0.9.5. Other bundled harnesses retain their existing pins. Updating the
+daily-use runner does not migrate a sealed execution profile. A profile that
+requires Codex 0.151.0 must keep its matching immutable image until its adapter
+and protocol have been qualified against a newer release.
 
 Plus the system tooling agents tend to reach for: `bash`,
 `bubblewrap`, `ca-certificates`, `curl`, `gh`, `git`, `iproute2`
@@ -79,7 +92,7 @@ plus immutable versions:
 
 | Tag | Moving? | Cadence | Use it for |
 |---|---|---|---|
-| `dev` | moving | local `build-runner.sh` + CI on merge-to-main | day-to-day dev — pin it in your dev `pillbox.toml` |
+| `dev` | moving | local `build-runner.sh`; manual CI dispatch on main | day-to-day dev — pin it in your dev `pillbox.toml` |
 | `latest` | moving | CI on stable release (alias of newest `vX.Y.Z`) | prod / fresh installs — the built-in default |
 | `vX.Y.Z` | **immutable** | CI per release | reproducibility — pin this (and *only* this) for a frozen eval/σ̂ baseline |
 
@@ -195,9 +208,37 @@ image, pillbox CLI assumes:
 Renovate watches supported package/release pins in `runner/Dockerfile`
 (via `# renovate:` hint comments) and opens PRs on upstream bumps. Cursor and
 Amp are refreshed by `build-runner.sh --update` from their official installer
-and npm metadata respectively. CI rebuilds the image on the PR for
-verification. Patch + minor bumps auto-merge on green; major bumps hold for
-human review.
+and npm metadata respectively. The current runner-image workflow runs only on version tags or manual dispatch;
+it does not build pull requests or republish on every merge. Verify a local build
+before relying on changed pins. The next tagged release publishes the immutable
+version and stable `:latest` alias.
 
-After merge to `main`, the `:dev` tag is republished. The next CLI release
-stamps that image as `:vX.Y.Z` + `:latest`.
+
+## Proposed launch-time updates (not implemented)
+
+Decouple harness packages from the base OS image. At launch, the host would resolve
+an update policy before creating the session or sealing an execution request:
+
+- `pinned`: use exactly the requested version and digest; no update lookup.
+- `cached` (proposed interactive default): use a previously verified package,
+  check for updates at most once per day, and prepare newer packages for later sessions.
+- `latest`: resolve and prepare the current stable version before starting; a failed
+  update is an explicit launch failure, never an undisclosed older-version fallback.
+
+Packages would be cached by harness, platform, version, and content digest. A
+single updater stages and verifies a complete package in isolation, then publishes
+it atomically. Every new session records the selected package version/digest and
+base image ID. Running sessions keep their original package. Never install into a
+shared materialized rootfs or update an active invocation in place.
+
+This removes the image-release dependency without reinstalling four harnesses on
+every launch. Cached/offline launches should disclose the selected version and any
+failed freshness check. Updates need no user credentials; installation runs in a
+separate preparation environment. Sealed execution profiles remain pinned and
+require adapter compatibility qualification before accepting a newer package.
+
+The smallest first implementation is an explicit host-managed `harness update`
+operation backed by this cache, followed by optional freshness checks at launch.
+Package mounting, cache ownership, session provenance, and failure semantics need
+a runtime contract before implementation; this image refresh adds none of those
+runtime behaviors.

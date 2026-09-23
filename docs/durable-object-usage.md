@@ -1,7 +1,7 @@
 # Durable Object usage policy
 
 Status: **active** (2026-08-31). This policy implements
-`doc://pillbox/managed-tier-do-gateway@0002#managed-tier-do-gateway`.
+`doc://pillbox/managed-tier-do-gateway@0003#managed-tier-do-gateway`.
 
 ## Default rule
 

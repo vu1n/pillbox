@@ -95,15 +95,16 @@ if [ "$DO_UPDATE" = 1 ]; then
 	# @anthropic-ai/claude-code npm package. codex tracks the latest *stable*
 	# (non-prerelease) github release (rust-v<ver> tag). cursor's official
 	# installer pins the current lab artifact. amp/opencode/pi take the npm
-	# `latest` dist-tag.
+	# `latest` dist-tag; Prime uses its official installer's stable feed.
 	CLAUDE_NEW=$(npm view @anthropic-ai/claude-code version)
-	CODEX_NEW=$(gh api repos/openai/codex/releases \
-		--jq '[.[] | select(.prerelease==false and .draft==false)][0].tag_name' | sed 's/^rust-v//')
+	CODEX_NEW=$(gh api repos/openai/codex/releases/latest --jq .tag_name | sed 's/^rust-v//')
 	CURSOR_NEW=$(curl -fsSL https://cursor.com/install \
 		| sed -nE 's#^DOWNLOAD_URL="https://downloads\.cursor\.com/lab/([^/]+)/\$\{OS\}/\$\{ARCH\}/agent-cli-package\.tar\.gz"$#\1#p' \
 		| head -1)
 	OPENCODE_NEW=$(npm view opencode-ai version)
 	PI_NEW=$(npm view @earendil-works/pi-coding-agent version)
+	PRIME_AGENT_NEW=$(curl --proto '=https' --proto-redir '=https' -fsSL \
+		https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev/stable | tr -d '[:space:]' | sed 's/^v//')
 	AMP_NEW=$(npm view @ampcode/cli version)
 
 	changed=0
@@ -114,9 +115,10 @@ if [ "$DO_UPDATE" = 1 ]; then
 		"CURSOR_AGENT_VERSION:$CURSOR_NEW" \
 		"OPENCODE_VERSION:$OPENCODE_NEW" \
 		"PI_VERSION:$PI_NEW" \
+		"PRIME_AGENT_VERSION:$PRIME_AGENT_NEW" \
 		"AMP_VERSION:$AMP_NEW"; do
 		name=${row%%:*}; new=${row#*:}
-		[ -n "$new" ] || { echo "✗ could not resolve latest for $name" >&2; exit 1; }
+		[[ "$new" =~ ^[0-9][0-9A-Za-z.-]*$ ]] || { echo "✗ invalid or empty version for $name: $new" >&2; exit 1; }
 		old=$(cur "$name"); mark=""
 		[ "$old" != "$new" ] && { mark="  ←"; changed=1; }
 		printf '  %-13s %-28s → %s%s\n' "${name%_VERSION}" "$old" "$new" "$mark"
@@ -163,8 +165,10 @@ docker run --rm --entrypoint sh -e EXPECTED_CODEX_VERSION="$CODEX_VERSION_PIN" "
 
 echo "▶ agent versions baked into $TAG:"
 docker run --rm --entrypoint sh "$TAG" -c '
-	for a in claude codex amp opencode pi agent pillbox; do
-		printf "  %-9s %s\n" "$a" "$($a --version 2>&1 | head -1)"
+	set -eu
+	for a in claude codex amp opencode pi prime-agent agent pillbox; do
+		version=$("$a" --version 2>&1) || { printf "%s version probe failed: %s\n" "$a" "$version" >&2; exit 1; }
+		printf "  %-12s %s\n" "$a" "$(printf "%s\n" "$version" | head -1)"
 	done
 '
 

@@ -1,0 +1,165 @@
+{
+  "schema_version": 1,
+  "kind": "actual-local-repository-execution-proof",
+  "attempt": "v3",
+  "binary_source_commit": "66bfa59581931f4c7e23bd5d10e9e139d0bea18b",
+  "binary_sha256": "sha256:a7c8f89c46ffde0bcd2c5108a42d03d81c325e2eee703ce28c94f14c93f58024",
+  "fixture": {
+    "commit": "620d4a06f43044d3d0f074190c8d5ceb6260cb5e",
+    "image_id": "sha256:3af5c7cbb9e111e817960a30b01983f9b3891a7efb811a124c2a35d22c7126b2",
+    "input_snapshot_digest": "sha256:76616c5a731d71decb4b676a66b333a5bf0576b43907cf95d5e78365b9150555",
+    "expected_result_snapshot_digest": "sha256:7bcd19fd27d4b1d1e397a441722cd444d3fbbfc256bef9c8f8f0c3ac3a18714b",
+    "request_hash": "sha256:eb78bf3ad66e992994461271b89d67a4c2ab68f700e9ea777884932e9e4fe0d8",
+    "manifest_digest": "sha256:fa8a0801acdc9ab08718f96d2bead794eab8a5294b623f60a6f91caeb985aa6f",
+    "changed_request_hash": "sha256:1ed57aeb4f2955b97a6a58f082db4aeaddce18307072669347717519816dd5ce"
+  },
+  "invocation": {
+    "detail": {
+      "admission": {
+        "adapter_revision": "pillbox/local-repository-v1",
+        "effective_model_catalog_digest": "sha256:aa0ff087c5f495c6cf26cf979369b6d6b9080cd39239090444e8d1b968f56b8a",
+        "evidence": {
+          "seq_range": [
+            1,
+            1
+          ],
+          "session_id": "smoke-builder-session-v3"
+        },
+        "input_snapshot_digest": "sha256:76616c5a731d71decb4b676a66b333a5bf0576b43907cf95d5e78365b9150555",
+        "invocation_id": "smoke-execution-v3",
+        "manifest_digest": "sha256:fa8a0801acdc9ab08718f96d2bead794eab8a5294b623f60a6f91caeb985aa6f",
+        "policy_revision": "pillbox-local-files-v1",
+        "request_hash": "sha256:eb78bf3ad66e992994461271b89d67a4c2ab68f700e9ea777884932e9e4fe0d8",
+        "runner_image_id": "sha256:3af5c7cbb9e111e817960a30b01983f9b3891a7efb811a124c2a35d22c7126b2"
+      },
+      "native_evidence": {
+        "bytes": 31072,
+        "digest": "sha256:bad8a2956c96335438d1f82847ee03ceae44f8199f5360759f4636c061adddcd",
+        "media_type": "application/x-ndjson",
+        "session_id": "smoke-builder-session-v3"
+      },
+      "result": {
+        "base": {
+          "commit": "620d4a06f43044d3d0f074190c8d5ceb6260cb5e",
+          "object_format": "sha1",
+          "repository_id": "smoke-repository-v1",
+          "snapshot_digest": "sha256:76616c5a731d71decb4b676a66b333a5bf0576b43907cf95d5e78365b9150555"
+        },
+        "changed_paths": [
+          "src/answer.txt"
+        ],
+        "evidence": {
+          "seq_range": [
+            1,
+            63
+          ],
+          "session_id": "smoke-builder-session-v3"
+        },
+        "execution": {
+          "context_renderer_revision": "pillbox-smoke-renderer-v1",
+          "placement": "local_microvm",
+          "requested": {
+            "model": "gpt-5.6-sol",
+            "profile": "sol",
+            "provider": "openai",
+            "reasoning_effort": "low"
+          },
+          "transport": {
+            "adapter_revision": "pillbox/local-repository-v1",
+            "harness": "codex",
+            "harness_version": "0.151.0",
+            "transport": "app_server"
+          },
+          "verifier_ref": "smoke-verifier-edit-v1"
+        },
+        "invocation_id": "smoke-execution-v3",
+        "manifest_digest": "sha256:fa8a0801acdc9ab08718f96d2bead794eab8a5294b623f60a6f91caeb985aa6f",
+        "output_id": "smoke-output-v1",
+        "patch": {
+          "bytes": 216,
+          "digest": "sha256:dc185068980fc9fee422602782d4d97332d0b9899404b1c31c8885aeea983f1b",
+          "media_type": "text/x-diff",
+          "session_id": "smoke-builder-session-v3"
+        },
+        "request_hash": "sha256:eb78bf3ad66e992994461271b89d67a4c2ab68f700e9ea777884932e9e4fe0d8",
+        "result_snapshot_digest": "sha256:7bcd19fd27d4b1d1e397a441722cd444d3fbbfc256bef9c8f8f0c3ac3a18714b",
+        "snapshot_manifest": {
+          "bytes": 391,
+          "digest": "sha256:7bcd19fd27d4b1d1e397a441722cd444d3fbbfc256bef9c8f8f0c3ac3a18714b",
+          "media_type": "application/vnd.pillbox.file-tree+json",
+          "session_id": "smoke-builder-session-v3"
+        }
+      },
+      "text": {
+        "bytes": 90,
+        "digest": "sha256:c0c9e5c64f12e751c9b9ccb761781fb0aff0caa96086c2b4d3d0f21df91ea943",
+        "media_type": "text/plain;charset=utf-8",
+        "session_id": "smoke-builder-session-v3"
+      },
+      "verification": {
+        "definition_digest": "sha256:3f249814a0f4a296b51d123d9b9d3522333c38293f53017f87864656be21d99d",
+        "evidence": {
+          "seq_range": [
+            1,
+            5
+          ],
+          "session_id": "32e280217204"
+        },
+        "outcome": "pass",
+        "output_id": "smoke-output-v1",
+        "report": {
+          "bytes": 654,
+          "digest": "sha256:1bbc8ea9a9952de1a122fb76bec33de2693690d540aff3292ec391be8822ea00",
+          "media_type": "application/json",
+          "session_id": "32e280217204"
+        },
+        "result_digest": "sha256:4a7bc2924feb579425f618afcbbbd443e9ce503b037147d025419609e5c84bdd",
+        "result_snapshot_digest": "sha256:7bcd19fd27d4b1d1e397a441722cd444d3fbbfc256bef9c8f8f0c3ac3a18714b",
+        "run_id": "smoke-verifier-run-edit-v1",
+        "verifier_id": "smoke-verifier-edit-v1"
+      }
+    },
+    "invocation_id": "smoke-execution-v3",
+    "request_hash": "sha256:eb78bf3ad66e992994461271b89d67a4c2ab68f700e9ea777884932e9e4fe0d8",
+    "status": "completed"
+  },
+  "checks": {
+    "captured_bytes_checked": true,
+    "patch_reproduces_complete_snapshot": true,
+    "native_turn_start_count": 1,
+    "tool_calls": 3,
+    "changed_paths": [
+      "src/answer.txt"
+    ],
+    "request_hash": "sha256:eb78bf3ad66e992994461271b89d67a4c2ab68f700e9ea777884932e9e4fe0d8",
+    "result_digest": "sha256:4a7bc2924feb579425f618afcbbbd443e9ce503b037147d025419609e5c84bdd",
+    "result_snapshot_digest": "sha256:7bcd19fd27d4b1d1e397a441722cd444d3fbbfc256bef9c8f8f0c3ac3a18714b",
+    "builder_evidence": {
+      "seq_range": [
+        1,
+        63
+      ],
+      "session_id": "smoke-builder-session-v3"
+    },
+    "verifier_evidence": {
+      "seq_range": [
+        1,
+        5
+      ],
+      "session_id": "32e280217204"
+    },
+    "retry_record_equal": true,
+    "verification": "pass",
+    "changed_retry_conflicted_without_state_change": true
+  },
+  "bounds": {
+    "max_tool_calls": 10,
+    "timeout_ms": 600000
+  },
+  "automatic_retry": false,
+  "limitations": [
+    "Synthetic fixture, not a Huddles-commissioned repository change.",
+    "Active cancellation and foreground-owner crash proofs remain separate gates.",
+    "Native evidence records runtime observations, not provider internals, credential confinement, or OS isolation; those retain separate implementation and actual VM gates."
+  ]
+}

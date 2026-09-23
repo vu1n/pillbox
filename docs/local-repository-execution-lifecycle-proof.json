@@ -1,0 +1,272 @@
+{
+  "schema_version": 1,
+  "kind": "actual-production-cli-lifecycle-proof",
+  "binary_source_commit": "66bfa59581931f4c7e23bd5d10e9e139d0bea18b",
+  "probe_sha256": "96c9f4f3626bd48e75f9d384f2b1522dbf31af50fc5006db4c86599cf92af0f3",
+  "limits": {
+    "max_tool_calls_per_invocation": 10,
+    "timeout_ms_per_invocation": 600000,
+    "automatic_retry": false
+  },
+  "cases": {
+    "cancel": {
+      "binary": {
+        "sha256": "sha256:a7c8f89c46ffde0bcd2c5108a42d03d81c325e2eee703ce28c94f14c93f58024"
+      },
+      "owned_processes": {
+        "owner_pid": 96767,
+        "vmm": {
+          "pid": 96801,
+          "ppid": 96767,
+          "pgid": 96801
+        },
+        "owned_groups": [
+          96801
+        ],
+        "observed_descendants": [
+          {
+            "pid": 96801,
+            "ppid": 96767,
+            "pgid": 96801
+          }
+        ]
+      },
+      "teardown": {
+        "all_groups_disappeared": true,
+        "groups": [
+          96801
+        ]
+      },
+      "terminal": {
+        "execution": {
+          "detail": {
+            "error": "bounded execution cancelled",
+            "evidence": {
+              "admission": {
+                "adapter_revision": "pillbox/local-repository-v1",
+                "effective_model_catalog_digest": "sha256:aa0ff087c5f495c6cf26cf979369b6d6b9080cd39239090444e8d1b968f56b8a",
+                "evidence": {
+                  "seq_range": [
+                    1,
+                    1
+                  ],
+                  "session_id": "smoke-builder-session-cancel-v1"
+                },
+                "input_snapshot_digest": "sha256:76616c5a731d71decb4b676a66b333a5bf0576b43907cf95d5e78365b9150555",
+                "invocation_id": "smoke-execution-cancel-v1",
+                "manifest_digest": "sha256:fa8a0801acdc9ab08718f96d2bead794eab8a5294b623f60a6f91caeb985aa6f",
+                "policy_revision": "pillbox-local-files-v1",
+                "request_hash": "sha256:42b9ba2e1da6d42d47a710d4890aaa147e407dbfa764f086c66dea7618f964f4",
+                "runner_image_id": "sha256:3af5c7cbb9e111e817960a30b01983f9b3891a7efb811a124c2a35d22c7126b2"
+              },
+              "builder_evidence": {
+                "seq_range": [
+                  1,
+                  4
+                ],
+                "session_id": "smoke-builder-session-cancel-v1"
+              },
+              "native_evidence": null,
+              "result": null,
+              "verifier_evidence": null,
+              "verifier_session_id": null
+            }
+          },
+          "invocation_id": "smoke-execution-cancel-v1",
+          "request_hash": "sha256:42b9ba2e1da6d42d47a710d4890aaa147e407dbfa764f086c66dea7618f964f4",
+          "status": "cancelled"
+        },
+        "version": 1
+      },
+      "owner_exit": {
+        "owner_pid": 96767,
+        "exit_code": 0
+      },
+      "checks": {
+        "mode": "cancel",
+        "invocation_id": "smoke-execution-cancel-v1",
+        "status": "cancelled",
+        "owned_groups_disappeared": [
+          96801
+        ],
+        "same_id_reused_without_state_change": true,
+        "changed_content_conflicted_without_state_change": true
+      },
+      "request_hash": "sha256:42b9ba2e1da6d42d47a710d4890aaa147e407dbfa764f086c66dea7618f964f4",
+      "cancel_observations": [
+        {
+          "execution": {
+            "detail": {
+              "admission": {
+                "adapter_revision": "pillbox/local-repository-v1",
+                "effective_model_catalog_digest": "sha256:aa0ff087c5f495c6cf26cf979369b6d6b9080cd39239090444e8d1b968f56b8a",
+                "evidence": {
+                  "seq_range": [
+                    1,
+                    1
+                  ],
+                  "session_id": "smoke-builder-session-cancel-v1"
+                },
+                "input_snapshot_digest": "sha256:76616c5a731d71decb4b676a66b333a5bf0576b43907cf95d5e78365b9150555",
+                "invocation_id": "smoke-execution-cancel-v1",
+                "manifest_digest": "sha256:fa8a0801acdc9ab08718f96d2bead794eab8a5294b623f60a6f91caeb985aa6f",
+                "policy_revision": "pillbox-local-files-v1",
+                "request_hash": "sha256:42b9ba2e1da6d42d47a710d4890aaa147e407dbfa764f086c66dea7618f964f4",
+                "runner_image_id": "sha256:3af5c7cbb9e111e817960a30b01983f9b3891a7efb811a124c2a35d22c7126b2"
+              },
+              "builder_evidence": {
+                "seq_range": [
+                  1,
+                  1
+                ],
+                "session_id": "smoke-builder-session-cancel-v1"
+              },
+              "native_evidence": null,
+              "result": null,
+              "verifier_evidence": null,
+              "verifier_session_id": null
+            },
+            "invocation_id": "smoke-execution-cancel-v1",
+            "request_hash": "sha256:42b9ba2e1da6d42d47a710d4890aaa147e407dbfa764f086c66dea7618f964f4",
+            "status": "running"
+          },
+          "version": 1
+        },
+        {
+          "execution": {
+            "detail": {
+              "admission": {
+                "adapter_revision": "pillbox/local-repository-v1",
+                "effective_model_catalog_digest": "sha256:aa0ff087c5f495c6cf26cf979369b6d6b9080cd39239090444e8d1b968f56b8a",
+                "evidence": {
+                  "seq_range": [
+                    1,
+                    1
+                  ],
+                  "session_id": "smoke-builder-session-cancel-v1"
+                },
+                "input_snapshot_digest": "sha256:76616c5a731d71decb4b676a66b333a5bf0576b43907cf95d5e78365b9150555",
+                "invocation_id": "smoke-execution-cancel-v1",
+                "manifest_digest": "sha256:fa8a0801acdc9ab08718f96d2bead794eab8a5294b623f60a6f91caeb985aa6f",
+                "policy_revision": "pillbox-local-files-v1",
+                "request_hash": "sha256:42b9ba2e1da6d42d47a710d4890aaa147e407dbfa764f086c66dea7618f964f4",
+                "runner_image_id": "sha256:3af5c7cbb9e111e817960a30b01983f9b3891a7efb811a124c2a35d22c7126b2"
+              },
+              "builder_evidence": {
+                "seq_range": [
+                  1,
+                  1
+                ],
+                "session_id": "smoke-builder-session-cancel-v1"
+              },
+              "native_evidence": null,
+              "result": null,
+              "verifier_evidence": null,
+              "verifier_session_id": null
+            },
+            "invocation_id": "smoke-execution-cancel-v1",
+            "request_hash": "sha256:42b9ba2e1da6d42d47a710d4890aaa147e407dbfa764f086c66dea7618f964f4",
+            "status": "running"
+          },
+          "version": 1
+        }
+      ],
+      "fingerprints_unchanged": true
+    },
+    "crash": {
+      "binary": {
+        "sha256": "sha256:a7c8f89c46ffde0bcd2c5108a42d03d81c325e2eee703ce28c94f14c93f58024"
+      },
+      "owned_processes": {
+        "owner_pid": 97195,
+        "vmm": {
+          "pid": 97227,
+          "ppid": 97195,
+          "pgid": 97227
+        },
+        "owned_groups": [
+          97227
+        ],
+        "observed_descendants": [
+          {
+            "pid": 97227,
+            "ppid": 97195,
+            "pgid": 97227
+          }
+        ]
+      },
+      "teardown": {
+        "all_groups_disappeared": true,
+        "groups": [
+          97227
+        ]
+      },
+      "terminal": {
+        "execution": {
+          "detail": {
+            "evidence": {
+              "admission": {
+                "adapter_revision": "pillbox/local-repository-v1",
+                "effective_model_catalog_digest": "sha256:aa0ff087c5f495c6cf26cf979369b6d6b9080cd39239090444e8d1b968f56b8a",
+                "evidence": {
+                  "seq_range": [
+                    1,
+                    1
+                  ],
+                  "session_id": "smoke-builder-session-crash-v1"
+                },
+                "input_snapshot_digest": "sha256:76616c5a731d71decb4b676a66b333a5bf0576b43907cf95d5e78365b9150555",
+                "invocation_id": "smoke-execution-crash-v1",
+                "manifest_digest": "sha256:fa8a0801acdc9ab08718f96d2bead794eab8a5294b623f60a6f91caeb985aa6f",
+                "policy_revision": "pillbox-local-files-v1",
+                "request_hash": "sha256:da5e5705f31f7fde67ee97db745e039dba4319cc6610e931819f4cbd303084c3",
+                "runner_image_id": "sha256:3af5c7cbb9e111e817960a30b01983f9b3891a7efb811a124c2a35d22c7126b2"
+              },
+              "builder_evidence": {
+                "seq_range": [
+                  1,
+                  1
+                ],
+                "session_id": "smoke-builder-session-crash-v1"
+              },
+              "native_evidence": null,
+              "result": null,
+              "verifier_evidence": null,
+              "verifier_session_id": null
+            },
+            "reason": "invocation_owner_lost"
+          },
+          "invocation_id": "smoke-execution-crash-v1",
+          "request_hash": "sha256:da5e5705f31f7fde67ee97db745e039dba4319cc6610e931819f4cbd303084c3",
+          "status": "interrupted"
+        },
+        "version": 1
+      },
+      "owner_exit": {
+        "owner_pid": 97195,
+        "exit_code": -9
+      },
+      "checks": {
+        "mode": "crash",
+        "invocation_id": "smoke-execution-crash-v1",
+        "status": "interrupted",
+        "owned_groups_disappeared": [
+          97227
+        ],
+        "same_id_reused_without_state_change": true,
+        "changed_content_conflicted_without_state_change": true
+      },
+      "request_hash": "sha256:da5e5705f31f7fde67ee97db745e039dba4319cc6610e931819f4cbd303084c3",
+      "signal": {
+        "target_pid": 97195,
+        "signal": "SIGKILL"
+      },
+      "fingerprints_unchanged": true
+    }
+  },
+  "limitations": [
+    "The probes observed owned builder VMM host processes during startup; they do not establish a completed guest boot or an in-flight provider turn.",
+    "The separate successful v3 proof establishes model execution and independent verification.",
+    "Only process metadata and safe synthetic invocation receipts are committed; raw command captures and the operator probe remain local."
+  ]
+}

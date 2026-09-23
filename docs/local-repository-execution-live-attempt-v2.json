@@ -1,0 +1,63 @@
+{
+  "record_kind": "manual_presampling_protocol_failure_validation",
+  "date": "2026-09-23",
+  "source_commit": "9d9e5996a01ca3344a38dd5f67d75139c51efc3e",
+  "binary": {
+    "sha256": "sha256:8ec560c1761558553ead4220a9237a714682258c1f13d363d90bdc4d94a2a173"
+  },
+  "invocation": {
+    "detail": {
+      "error": "unknown native RPC envelope field",
+      "evidence": {
+        "admission": {
+          "adapter_revision": "pillbox/local-repository-v1",
+          "effective_model_catalog_digest": "sha256:aa0ff087c5f495c6cf26cf979369b6d6b9080cd39239090444e8d1b968f56b8a",
+          "evidence": {
+            "seq_range": [
+              1,
+              1
+            ],
+            "session_id": "smoke-builder-session-v2"
+          },
+          "input_snapshot_digest": "sha256:76616c5a731d71decb4b676a66b333a5bf0576b43907cf95d5e78365b9150555",
+          "invocation_id": "smoke-execution-v2",
+          "manifest_digest": "sha256:fa8a0801acdc9ab08718f96d2bead794eab8a5294b623f60a6f91caeb985aa6f",
+          "policy_revision": "pillbox-local-files-v1",
+          "request_hash": "sha256:44ee2c66e06c48ee376f95c622dee3485f8c2b637f06d0d88197ead4ec4e650f",
+          "runner_image_id": "sha256:3af5c7cbb9e111e817960a30b01983f9b3891a7efb811a124c2a35d22c7126b2"
+        },
+        "builder_evidence": {
+          "seq_range": [
+            1,
+            5
+          ],
+          "session_id": "smoke-builder-session-v2"
+        },
+        "native_evidence": {
+          "bytes": 2154,
+          "digest": "sha256:0df7647e57d67437e93b67abce2e07fb99fbadb3972bf0c8b7245aa54da67cc5",
+          "media_type": "application/x-ndjson",
+          "session_id": "smoke-builder-session-v2"
+        },
+        "result": null,
+        "verifier_evidence": null,
+        "verifier_session_id": null
+      }
+    },
+    "invocation_id": "smoke-execution-v2",
+    "request_hash": "sha256:44ee2c66e06c48ee376f95c622dee3485f8c2b637f06d0d88197ead4ec4e650f",
+    "status": "failed"
+  },
+  "vm_launched": true,
+  "model_turn_started": false,
+  "outbound_turn_start_count": 0,
+  "native_frames": 5,
+  "observed_unknown_field": "emittedAtMs",
+  "pinned_upstream_contract": {
+    "commit": "78c290807ce710180111df227df3b7a4fe845452",
+    "file": "codex-rs/app-server-protocol/src/protocol/common.rs",
+    "type": "ServerNotificationEnvelope",
+    "field": "emitted_at_ms: Option<i64>"
+  },
+  "automatic_retry": false
+}

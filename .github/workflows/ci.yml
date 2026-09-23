@@ -56,6 +56,11 @@ jobs:
       # (on ubuntu) to save macOS minutes (~10x cost).
       - if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --check
+      - name: Repository smoke fixtures (offline)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          bash -n scripts/smoke/repository-execution.sh
+          python3 -m unittest discover -s scripts/smoke/repository-execution -p 'test_*.py' -v
       - run: cargo test --no-default-features --all-targets
       - if: matrix.os == 'ubuntu-latest'
         run: cargo clippy --no-default-features --all-targets -- -D warnings

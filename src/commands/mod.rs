@@ -13,6 +13,7 @@ pub(crate) mod critic;
 pub(crate) mod dispatch;
 pub(crate) mod env;
 pub(crate) mod eval;
+pub(crate) mod execution;
 pub(crate) mod sandbox;
 pub(crate) mod secret;
 pub(crate) mod session;

@@ -33,6 +33,7 @@ mod doctor;
 mod envs;
 mod errors;
 mod events;
+mod execution;
 mod gateway;
 mod memory;
 mod paths;
@@ -73,6 +74,11 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Execute one sealed repository invocation in an isolated local microVM.
+    Execution {
+        #[command(subcommand)]
+        action: commands::execution::ExecutionAction,
+    },
     /// Create the global pillbox at `~/.pillbox/global/`. Idempotent.
     Init,
     /// Create a project pillbox in the current directory. Writes
@@ -639,6 +645,10 @@ fn main() -> ExitCode {
         };
         return ExitCode::from(code as u8);
     }
+    #[cfg(feature = "libkrun")]
+    if std::env::args().nth(1).as_deref() == Some("__repository-image") {
+        crate::sandbox::libkrun::repository::image_child_main();
+    }
     init_vault_trace();
     let cli = Cli::parse();
     let result = run(cli);
@@ -686,6 +696,10 @@ fn init_vault_trace() {
 fn run(cli: Cli) -> Result<()> {
     let pillbox_arg = cli.pillbox.as_deref();
     match cli.command {
+        Command::Execution { action } => {
+            let resolved = Pillbox::resolve(pillbox_arg)?;
+            commands::execution::dispatch(&resolved, action)
+        }
         Command::Init => pillbox::init(),
         Command::New {
             name,

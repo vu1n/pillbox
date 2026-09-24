@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString};
 use std::fs::{DirBuilder, File};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
@@ -28,6 +28,7 @@ const MAX_TREE_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TREE_ENTRIES: usize = 16_384;
 const MAX_TREE_DEPTH: usize = 128;
 const TREE_LIST_LIMIT: usize = 4 * MAX_TREE_BYTES as usize;
+const BLOB_BATCH_SIZE: usize = 64;
 
 pub(crate) fn read_git_tree(repo: &Path, commit: &str, limits: &FileLimits) -> Result<FileTree> {
     limits.validate()?;
@@ -144,19 +145,60 @@ pub(crate) fn read_git_tree(repo: &Path, commit: &str, limits: &FileLimits) -> R
     objects.sort_by(|left, right| left.0.cmp(&right.0));
     validate_disk_paths(objects.iter().map(|entry| entry.0.as_str()))?;
     let mut entries = Vec::with_capacity(objects.len());
-    for (path, executable, oid, size) in objects {
-        let bytes = git(&["cat-file", "blob", &oid], usize::try_from(size)?)?;
-        ensure!(
-            bytes.len() as u64 == size,
-            "Git blob size changed during snapshot read"
-        );
-        entries.push(FileEntry {
-            path,
-            executable,
-            bytes,
-        });
+    for batch in objects.chunks(BLOB_BATCH_SIZE) {
+        let mut input = Vec::with_capacity(batch.len() * (oid_length + 1));
+        let mut cap = 0_usize;
+        for (_, _, oid, size) in batch {
+            input.extend_from_slice(oid.as_bytes());
+            input.push(b'\n');
+            // A batch header contains the full ID, type, decimal size, and newline.
+            cap = cap
+                .checked_add(usize::try_from(*size)? + oid_length + 32)
+                .context("Git batch output size overflow")?;
+        }
+        let output = git_input_output(
+            repo,
+            isolated_home.path(),
+            &["cat-file", "--batch"],
+            &input,
+            cap,
+            deadline,
+        )?;
+        entries.extend(parse_blob_batch(batch, &output)?);
     }
     FileTree::new(entries, limits)
+}
+
+fn parse_blob_batch(
+    batch: &[(String, bool, String, u64)],
+    output: &[u8],
+) -> Result<Vec<FileEntry>> {
+    let mut cursor = output;
+    let mut entries = Vec::with_capacity(batch.len());
+    for (path, executable, oid, size) in batch {
+        let end = cursor
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .context("unterminated Git batch header")?;
+        ensure!(
+            &cursor[..end] == format!("{oid} blob {size}").as_bytes(),
+            "Git blob identity, type, or size changed during snapshot read"
+        );
+        cursor = &cursor[end + 1..];
+        let size = usize::try_from(*size)?;
+        ensure!(
+            cursor.len() > size && cursor[size] == b'\n',
+            "truncated Git batch blob"
+        );
+        entries.push(FileEntry {
+            path: path.clone(),
+            executable: *executable,
+            bytes: cursor[..size].to_vec(),
+        });
+        cursor = &cursor[size + 1..];
+    }
+    ensure!(cursor.is_empty(), "unexpected Git batch output");
+    Ok(entries)
 }
 
 fn object_size(
@@ -451,6 +493,7 @@ fn verify_git_guards(home: &Path, deadline: Instant) -> Result<()> {
         &repo,
         home,
         &["cat-file", "commit", OID],
+        None,
         0,
         deadline,
         GIT_MAPPING_LIMIT,
@@ -462,7 +505,7 @@ fn verify_git_guards(home: &Path, deadline: Instant) -> Result<()> {
             GIT_ALLOCATION_LIMIT + 1
         ),
     )?;
-    let mapping = git_result(&repo, home, &["cat-file", "-s", OID], 0, deadline, 1)?;
+    let mapping = git_result(&repo, home, &["cat-file", "-s", OID], None, 0, deadline, 1)?;
     expect_guard_failure(
         &mapping,
         &format!("fatal: attempting to mmap {} over limit 1", OBJECT.len()),
@@ -491,9 +534,36 @@ fn git_output(
     deadline: Instant,
     allow_diff: bool,
 ) -> Result<Vec<u8>> {
-    let output = git_result(cwd, home, args, cap, deadline, GIT_MAPPING_LIMIT)?;
+    let output = git_result(cwd, home, args, None, cap, deadline, GIT_MAPPING_LIMIT)?;
     ensure!(
         output.status.success() || (allow_diff && output.status.code() == Some(1)),
+        "Git {} failed with {}: {}",
+        args[0],
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(output.stdout)
+}
+
+fn git_input_output(
+    cwd: &Path,
+    home: &Path,
+    args: &[&str],
+    input: &[u8],
+    cap: usize,
+    deadline: Instant,
+) -> Result<Vec<u8>> {
+    let output = git_result(
+        cwd,
+        home,
+        args,
+        Some(input),
+        cap,
+        deadline,
+        GIT_MAPPING_LIMIT,
+    )?;
+    ensure!(
+        output.status.success(),
         "Git {} failed with {}: {}",
         args[0],
         output.status,
@@ -512,6 +582,7 @@ fn git_result(
     cwd: &Path,
     home: &Path,
     args: &[&str],
+    input: Option<&[u8]>,
     cap: usize,
     deadline: Instant,
     mapping_limit: usize,
@@ -520,6 +591,15 @@ fn git_result(
         Instant::now() < deadline,
         "Git snapshot operation timed out"
     );
+    // File-backed stdin lets Git stream large blob batches without a pipe deadlock.
+    let stdin = if let Some(input) = input {
+        let mut file = tempfile::tempfile_in(home)?;
+        file.write_all(input).context("write Git batch input")?;
+        file.seek(SeekFrom::Start(0))?;
+        Stdio::from(file)
+    } else {
+        Stdio::null()
+    };
     let mut command = Command::new("/usr/bin/git");
     command
         .current_dir(cwd)
@@ -563,7 +643,7 @@ fn git_result(
             "core.multiPackIndex=false",
         ])
         .args(args)
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
@@ -878,6 +958,56 @@ mod tests {
         fixture_git(repo.path(), &["config", "protocol.ext.allow", "always"]);
         assert!(read_git_tree(repo.path(), &oid, &limits()).is_err());
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn many_file_snapshot_reads_bounded_batches() {
+        let repo = repository();
+        for index in 0..1536 {
+            let directory = repo.path().join(format!("dir-{:02}", index / 64));
+            std::fs::create_dir_all(&directory).unwrap();
+            let path = directory.join(format!("file-{index:04}"));
+            std::fs::write(&path, vec![index as u8; 16 * 1024]).unwrap();
+            if index % 64 == 0 {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        let oid = commit(repo.path());
+        let limits = FileLimits {
+            max_file_bytes: 16 * 1024,
+            max_snapshot_bytes: 32 * 1024 * 1024,
+            ..limits()
+        };
+        let tree = read_git_tree(repo.path(), &oid, &limits).unwrap();
+        assert_eq!(tree.entries().len(), 1536);
+        assert_eq!(tree.entries()[0].path, "dir-00/file-0000");
+        assert!(tree.entries()[0].executable);
+        assert_eq!(tree.entries()[0].bytes, vec![0; 16 * 1024]);
+        assert_eq!(tree.entries().last().unwrap().path, "dir-23/file-1535");
+        assert_eq!(tree.entries().last().unwrap().bytes, vec![255; 16 * 1024]);
+    }
+
+    #[test]
+    fn batch_blob_framing_rejects_corruption() {
+        let oid = "1".repeat(40);
+        let batch = vec![("binary".into(), true, oid.clone(), 3)];
+        let valid = format!("{oid} blob 3\n").into_bytes();
+        let mut framed = valid.clone();
+        framed.extend_from_slice(&[0, b'\n', 255, b'\n']);
+        assert_eq!(
+            parse_blob_batch(&batch, &framed).unwrap()[0].bytes,
+            [0, b'\n', 255]
+        );
+        for corrupt in [
+            format!("{oid} tree 3\n").into_bytes(),
+            format!("{oid} blob 4\n").into_bytes(),
+            format!("{} blob 3\n", "2".repeat(40)).into_bytes(),
+            valid.clone(),
+            [valid.clone(), vec![0, b'\n', 255, 0]].concat(),
+            [framed.clone(), vec![0]].concat(),
+        ] {
+            assert!(parse_blob_batch(&batch, &corrupt).is_err());
+        }
     }
 
     #[test]

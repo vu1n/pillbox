@@ -301,7 +301,10 @@ impl ExecuteRequest {
         ensure!(
             execution.transport.harness == "codex"
                 && execution.transport.transport == "app_server"
-                && execution.transport.harness_version == "0.151.0"
+                && matches!(
+                    execution.transport.harness_version.as_str(),
+                    protocol::CODEX_VERSION | protocol::GPT6_CODEX_VERSION
+                )
                 && execution.transport.adapter_revision == ADAPTER_REVISION
                 && execution.placement == "local_microvm",
             "unsupported exact harness or placement"
@@ -312,13 +315,20 @@ impl ExecuteRequest {
         );
         ensure!(
             matches!(
-                execution.requested.profile.as_str(),
-                "sol" | "terra" | "luna"
-            ) && execution.requested.model == format!("gpt-5.6-{}", execution.requested.profile)
-                && matches!(
-                    execution.requested.reasoning_effort.as_str(),
-                    "low" | "medium" | "high"
+                (
+                    execution.transport.harness_version.as_str(),
+                    execution.requested.profile.as_str(),
+                    execution.requested.model.as_str()
                 ),
+                (protocol::CODEX_VERSION, "sol", "gpt-5.6-sol")
+                    | (protocol::CODEX_VERSION, "terra", "gpt-5.6-terra")
+                    | (protocol::CODEX_VERSION, "luna", "gpt-5.6-luna")
+                    | (protocol::GPT6_CODEX_VERSION, "sol", "gpt-6-sol")
+                    | (protocol::GPT6_CODEX_VERSION, "luna", "gpt-6-luna")
+            ) && matches!(
+                execution.requested.reasoning_effort.as_str(),
+                "low" | "medium" | "high"
+            ),
             "unsupported exact model profile or reasoning effort"
         );
         ensure!(
@@ -578,6 +588,39 @@ mod tests {
             hash,
             digest(request.canonical_request().unwrap().as_bytes())
         );
+    }
+
+    #[test]
+    fn exact_codex_release_and_model_cohorts_are_admitted() {
+        let mut request = request();
+        for (version, profile, model) in [
+            ("0.151.0", "sol", "gpt-5.6-sol"),
+            ("0.151.0", "terra", "gpt-5.6-terra"),
+            ("0.151.0", "luna", "gpt-5.6-luna"),
+            ("0.156.1", "sol", "gpt-6-sol"),
+            ("0.156.1", "luna", "gpt-6-luna"),
+        ] {
+            request.execution.transport.harness_version = version.into();
+            request.execution.requested.profile = profile.into();
+            request.execution.requested.model = model.into();
+            for effort in ["low", "medium", "high"] {
+                request.execution.requested.reasoning_effort = effort.into();
+                request.validate().unwrap();
+            }
+        }
+        for (version, profile, model, effort) in [
+            ("0.151.0", "sol", "gpt-6-sol", "high"),
+            ("0.156.1", "sol", "gpt-5.6-sol", "high"),
+            ("0.156.1", "terra", "gpt-6-terra", "high"),
+            ("0.155.0", "luna", "gpt-6-luna", "high"),
+            ("0.156.1", "luna", "gpt-6-luna", "max"),
+        ] {
+            request.execution.transport.harness_version = version.into();
+            request.execution.requested.profile = profile.into();
+            request.execution.requested.model = model.into();
+            request.execution.requested.reasoning_effort = effort.into();
+            assert!(request.validate().is_err(), "{version} {model} {effort}");
+        }
     }
 
     #[test]

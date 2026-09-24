@@ -359,8 +359,15 @@ fn native_identity(frames: &[Value]) -> Option<(String, String)> {
         msg.get("method").is_none() && msg.get("error").is_none() && msg["id"] == turn_request["id"]
     })?;
     let params = &turn_request["params"];
-    let profile =
-        protocol::CodexProfile::new(params["model"].as_str()?, params["effort"].as_str()?).ok()?;
+    let profile = protocol::CodexProfile::new_for_version(
+        thread_response["result"]["thread"]["cliVersion"].as_str()?,
+        params["model"].as_str()?,
+        params["effort"].as_str()?,
+    )
+    .ok()?;
+    if thread_request["params"]["model"] != profile.model() {
+        return None;
+    }
     let thread_id = profile
         .validate_thread_start(&thread_response["result"])
         .ok()?;
@@ -751,6 +758,26 @@ mod tests {
         params["threadId"] = json!("native-thread");
         params["turnId"] = json!("native-turn");
         envelope("inbound", json!({"method":method,"params":params}))
+    }
+
+    #[test]
+    fn native_identity_requires_a_matching_catalog_release_and_model() {
+        let mut frames = exchange();
+        frames[0]["message"]["params"]["model"] = json!("gpt-6-sol");
+        frames[1]["message"]["result"]["model"] = json!("gpt-6-sol");
+        frames[1]["message"]["result"]["thread"]["cliVersion"] =
+            json!(protocol::GPT6_CODEX_VERSION);
+        frames[2]["message"]["params"]["model"] = json!("gpt-6-sol");
+        assert_eq!(
+            native_identity(&frames),
+            Some(("native-thread".into(), "native-turn".into()))
+        );
+        frames[1]["message"]["result"]["thread"]["cliVersion"] = json!(protocol::CODEX_VERSION);
+        assert!(native_identity(&frames).is_none());
+        frames[1]["message"]["result"]["thread"]["cliVersion"] =
+            json!(protocol::GPT6_CODEX_VERSION);
+        frames[0]["message"]["params"]["model"] = json!("gpt-5.6-sol");
+        assert!(native_identity(&frames).is_none());
     }
 
     #[test]

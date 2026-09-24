@@ -25,6 +25,11 @@ pub(crate) fn execute(
 ) -> Result<Completion> {
     let deadline = Instant::now() + Duration::from_millis(request.manifest.limits.timeout_ms);
     let policy = request.validate()?;
+    let profile = CodexProfile::new_for_version(
+        &request.execution.transport.harness_version,
+        &request.execution.requested.model,
+        &request.execution.requested.reasoning_effort,
+    )?;
     let base = snapshot::read_git_tree(
         repository,
         &request.manifest.base.commit,
@@ -48,8 +53,8 @@ pub(crate) fn execute(
             "runner_image_id": request.manifest.runner_image_id,
             "adapter_revision": ADAPTER_REVISION,
             "policy_revision": POLICY_REVISION,
-            "effective_model_catalog_digest": protocol::EFFECTIVE_CATALOG_SHA256,
-            "source_model_catalog_digest": protocol::SOURCE_CATALOG_SHA256,
+            "effective_model_catalog_digest": profile.effective_catalog_digest(),
+            "source_model_catalog_digest": profile.source_catalog_digest(),
         }),
     )?;
     let admission = AdmissionReceipt {
@@ -60,7 +65,7 @@ pub(crate) fn execute(
         runner_image_id: request.manifest.runner_image_id.clone(),
         adapter_revision: ADAPTER_REVISION.into(),
         policy_revision: POLICY_REVISION.into(),
-        effective_model_catalog_digest: protocol::EFFECTIVE_CATALOG_SHA256.into(),
+        effective_model_catalog_digest: profile.effective_catalog_digest().into(),
         evidence: evidence.reference(),
     };
     let mut progress = ExecutionProgress {
@@ -79,6 +84,7 @@ pub(crate) fn execute(
         deadline,
         base,
         policy,
+        &profile,
         &mut evidence,
         &mut progress,
     );
@@ -110,6 +116,7 @@ fn run_builder(
     deadline: Instant,
     base: FileTree,
     policy: files::FilePolicy,
+    profile: &CodexProfile,
     evidence: &mut ExecutionEvidence,
     progress: &mut ExecutionProgress,
 ) -> Result<Completion> {
@@ -123,15 +130,11 @@ fn run_builder(
         &request.invocation_id,
     )
     .map_err(anyhow::Error::msg)?;
-    let profile = CodexProfile::new(
-        &request.execution.requested.model,
-        &request.execution.requested.reasoning_effort,
-    )?;
     evidence.append(custom(
         "repository.profile.configured",
         json!({
             "model": profile.model(), "reasoning_effort": profile.effort(),
-            "provider": protocol::PROVIDER_ID, "codex_version": protocol::CODEX_VERSION,
+            "provider": protocol::PROVIDER_ID, "codex_version": profile.version(),
         }),
     ))?;
     let input = BuilderInput {
@@ -139,7 +142,7 @@ fn run_builder(
         codex_config: profile
             .config_toml("/home/pillbox/.codex/models.json")?
             .into_bytes(),
-        model_catalog: protocol::effective_catalog_json()?.into_bytes(),
+        model_catalog: profile.effective_catalog_json()?.into_bytes(),
         guest_auth: serde_json::to_vec(&fresh.guest_credentials)?,
         access_release: fresh.access_release,
         refresh_credentials: credentials_path,
@@ -163,7 +166,7 @@ fn run_builder(
         let stream = vm.connect_rpc(&cancelled)?;
         let result = native::run(
             stream,
-            &profile,
+            profile,
             &request.rendered_input,
             &operations,
             &mut broker,

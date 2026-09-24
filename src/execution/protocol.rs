@@ -1,11 +1,13 @@
-//! I/O-free Codex 0.151.0 profile for the host-owned repository broker.
+//! I/O-free versioned Codex profiles for the host-owned repository broker.
 //!
-//! The adjacent catalog preserves the three model objects from OpenAI Codex tag
-//! `rust-v0.151.0`, commit `78c290807ce710180111df227df3b7a4fe845452`,
-//! `codex-rs/models-manager/models.json`. The source artifact is unchanged.
-//! The effective catalog changes only `tool_mode` to `direct`, a supported
-//! presentation setting. Code-mode exec/wait bypass pre-tool hooks, so only
-//! direct broker functions can satisfy a host-enforced budget for every tool.
+//! The adjacent source catalogs preserve exact model objects from OpenAI Codex
+//! tags `rust-v0.151.0` (commit `78c290807ce710180111df227df3b7a4fe845452`)
+//! and `rust-v0.156.1` (commit `b412ff32c417f855c2b2d1581b77058eed87c84b`).
+//! The legacy effective catalog changes
+//! only `tool_mode` to `direct`. The GPT-6 effective catalog also clears model-
+//! advertised utility tools, which otherwise bypass the broker-only surface.
+//! Code-mode exec/wait bypass pre-tool hooks, so only direct broker functions
+//! can satisfy a host-enforced budget for every tool.
 //! Model, provider, effort, and Responses Lite routing remain unchanged. Live
 //! provider acceptance is an integration gate; rejection must never fall back.
 //! Source `core/src/tools/spec_plan.rs` gates native environment handlers on an
@@ -21,30 +23,55 @@ use serde_json::{json, Value};
 use super::files::{FileOperation, MAX_FILE_BYTES, MAX_PATH_BYTES};
 
 pub(crate) const CODEX_VERSION: &str = "0.151.0";
+pub(crate) const GPT6_CODEX_VERSION: &str = "0.156.1";
 pub(crate) const PROVIDER_ID: &str = "pillbox_openai_http";
 pub(crate) const CODEX_CWD: &str = "/workspace";
 pub(crate) const PINNED_MODEL_CATALOG: &str = include_str!("codex-models-0.151.0.json");
+pub(crate) const GPT6_MODEL_CATALOG: &str = include_str!("codex-models-0.156.1-gpt6.json");
 pub(crate) const SOURCE_CATALOG_SHA256: &str =
     "sha256:fba33ea2414335b8bb3ba6741d17e72ef6e2b6f54a86470907b54451e5b772af";
 pub(crate) const EFFECTIVE_CATALOG_SHA256: &str =
     "sha256:aa0ff087c5f495c6cf26cf979369b6d6b9080cd39239090444e8d1b968f56b8a";
+pub(crate) const GPT6_SOURCE_CATALOG_SHA256: &str =
+    "sha256:4523084c4760faf6b4c20fe87bd4e94dd5315d8d1b1b63589dcc214fc152cebe";
+pub(crate) const GPT6_EFFECTIVE_CATALOG_SHA256: &str =
+    "sha256:f475bd3a7b94420fb9cbd4cc6214cf31e91f1e10bc6ed3a88fb7c73e772ed8e0";
 pub(crate) const MAX_RENDERED_INPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ID_BYTES: usize = 128;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CodexProfile {
+    version: &'static str,
     model: String,
     effort: String,
 }
 
 impl CodexProfile {
+    #[cfg(test)]
     pub(crate) fn new(model: &str, effort: &str) -> Result<Self> {
-        ensure!(
-            matches!(model, "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"),
-            "unsupported Codex model"
-        );
-        let catalog: Value = serde_json::from_str(PINNED_MODEL_CATALOG)
-            .context("invalid embedded Codex model catalog")?;
+        Self::new_for_version(CODEX_VERSION, model, effort)
+    }
+
+    pub(crate) fn new_for_version(version: &str, model: &str, effort: &str) -> Result<Self> {
+        let (version, catalog) = match version {
+            CODEX_VERSION => {
+                ensure!(
+                    matches!(model, "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"),
+                    "unsupported Codex model for version"
+                );
+                (CODEX_VERSION, PINNED_MODEL_CATALOG)
+            }
+            GPT6_CODEX_VERSION => {
+                ensure!(
+                    matches!(model, "gpt-6-sol" | "gpt-6-luna"),
+                    "unsupported Codex model for version"
+                );
+                (GPT6_CODEX_VERSION, GPT6_MODEL_CATALOG)
+            }
+            _ => bail!("unsupported Codex version"),
+        };
+        let catalog: Value =
+            serde_json::from_str(catalog).context("invalid embedded Codex model catalog")?;
         let metadata = catalog["models"]
             .as_array()
             .and_then(|models| models.iter().find(|entry| entry["slug"] == model))
@@ -56,6 +83,7 @@ impl CodexProfile {
             "unsupported reasoning effort for requested Codex model"
         );
         Ok(Self {
+            version,
             model: model.to_owned(),
             effort: effort.to_owned(),
         })
@@ -63,6 +91,26 @@ impl CodexProfile {
 
     pub(crate) fn model(&self) -> &str {
         &self.model
+    }
+
+    pub(crate) fn version(&self) -> &str {
+        self.version
+    }
+
+    pub(crate) fn source_catalog_digest(&self) -> &str {
+        match self.version {
+            CODEX_VERSION => SOURCE_CATALOG_SHA256,
+            GPT6_CODEX_VERSION => GPT6_SOURCE_CATALOG_SHA256,
+            _ => unreachable!("profile version is constructor validated"),
+        }
+    }
+
+    pub(crate) fn effective_catalog_digest(&self) -> &str {
+        match self.version {
+            CODEX_VERSION => EFFECTIVE_CATALOG_SHA256,
+            GPT6_CODEX_VERSION => GPT6_EFFECTIVE_CATALOG_SHA256,
+            _ => unreachable!("profile version is constructor validated"),
+        }
     }
 
     pub(crate) fn effort(&self) -> &str {
@@ -106,7 +154,7 @@ impl CodexProfile {
                     "requires_openai_auth": true,
                     "supports_websockets": false,
                     "supports_standalone_web_search": false,
-                    "http_headers": { "version": CODEX_VERSION }
+                    "http_headers": { "version": self.version }
                 }
             },
             "agents": { "enabled": false },
@@ -223,7 +271,7 @@ impl CodexProfile {
         );
         let thread = response.get("thread").context("missing Codex thread")?;
         ensure!(
-            thread["cliVersion"] == CODEX_VERSION,
+            thread["cliVersion"] == self.version,
             "unsupported Codex version"
         );
         ensure!(
@@ -244,18 +292,28 @@ impl CodexProfile {
     }
 }
 
-/// Keep the source artifact immutable and make the adapter's sole metadata
-/// override explicit. The caller writes these bytes at `config_toml`'s path.
-pub(crate) fn effective_catalog_json() -> Result<String> {
-    let mut catalog: Value = serde_json::from_str(PINNED_MODEL_CATALOG)
-        .context("invalid embedded Codex model catalog")?;
-    for model in catalog["models"]
-        .as_array_mut()
-        .context("missing embedded models")?
-    {
-        model["tool_mode"] = json!("direct");
+/// Preserve each source artifact and apply only the version's reviewed tool
+/// presentation overrides. The caller writes these bytes at `config_toml`'s path.
+impl CodexProfile {
+    pub(crate) fn effective_catalog_json(&self) -> Result<String> {
+        let source = match self.version {
+            CODEX_VERSION => PINNED_MODEL_CATALOG,
+            GPT6_CODEX_VERSION => GPT6_MODEL_CATALOG,
+            _ => unreachable!("profile version is constructor validated"),
+        };
+        let mut catalog: Value =
+            serde_json::from_str(source).context("invalid embedded Codex model catalog")?;
+        for model in catalog["models"]
+            .as_array_mut()
+            .context("missing embedded models")?
+        {
+            model["tool_mode"] = json!("direct");
+            if self.version == GPT6_CODEX_VERSION {
+                model["experimental_supported_tools"] = json!([]);
+            }
+        }
+        serde_json::to_string(&catalog).context("serialize effective Codex model catalog")
     }
-    serde_json::to_string(&catalog).context("serialize effective Codex model catalog")
 }
 
 pub(crate) fn initialize_params() -> Value {
@@ -594,18 +652,79 @@ mod tests {
         assert_eq!(
             format!(
                 "sha256:{:x}",
-                Sha256::digest(effective_catalog_json().unwrap().as_bytes())
+                Sha256::digest(profile().effective_catalog_json().unwrap().as_bytes())
             ),
             EFFECTIVE_CATALOG_SHA256
         );
         let source: Value = serde_json::from_str(PINNED_MODEL_CATALOG).unwrap();
         let mut effective: Value =
-            serde_json::from_str(&effective_catalog_json().unwrap()).unwrap();
+            serde_json::from_str(&profile().effective_catalog_json().unwrap()).unwrap();
         for model in effective["models"].as_array_mut().unwrap() {
             assert_eq!(model["tool_mode"], "direct");
             model["tool_mode"] = json!("code_mode_only");
         }
         assert_eq!(effective, source);
+    }
+
+    #[test]
+    fn gpt6_catalog_preserves_source_and_closes_advertised_utility_tools() {
+        let profile =
+            CodexProfile::new_for_version(GPT6_CODEX_VERSION, "gpt-6-sol", "high").unwrap();
+        assert_eq!(
+            format!("sha256:{:x}", Sha256::digest(GPT6_MODEL_CATALOG.as_bytes())),
+            GPT6_SOURCE_CATALOG_SHA256
+        );
+        let source: Value = serde_json::from_str(GPT6_MODEL_CATALOG).unwrap();
+        let models = source["models"].as_array().unwrap();
+        assert_eq!(models.len(), 2);
+        for (model, slug) in models.iter().zip(["gpt-6-sol", "gpt-6-luna"]) {
+            assert_eq!(model["slug"], slug);
+            assert_eq!(model["minimal_client_version"], "0.155.0");
+            assert_eq!(model["tool_mode"], "code_mode_only");
+            assert_eq!(model["use_responses_lite"], true);
+            assert_eq!(
+                model["experimental_supported_tools"],
+                json!(["send_user_message_async", "clock"])
+            );
+        }
+        let effective_json = profile.effective_catalog_json().unwrap();
+        assert_eq!(
+            format!("sha256:{:x}", Sha256::digest(effective_json.as_bytes())),
+            GPT6_EFFECTIVE_CATALOG_SHA256
+        );
+        let mut effective: Value = serde_json::from_str(&effective_json).unwrap();
+        for model in effective["models"].as_array_mut().unwrap() {
+            assert_eq!(model["tool_mode"], "direct");
+            assert_eq!(model["experimental_supported_tools"], json!([]));
+            model["tool_mode"] = json!("code_mode_only");
+            model["experimental_supported_tools"] = json!(["send_user_message_async", "clock"]);
+        }
+        assert_eq!(effective, source);
+    }
+
+    #[test]
+    fn model_versions_and_efforts_are_exact() {
+        for model in ["gpt-6-sol", "gpt-6-luna"] {
+            for effort in ["low", "medium", "high"] {
+                let profile =
+                    CodexProfile::new_for_version(GPT6_CODEX_VERSION, model, effort).unwrap();
+                assert_eq!(profile.version(), GPT6_CODEX_VERSION);
+                assert_eq!(
+                    profile.turn_start("thread-1", "input").unwrap()["effort"],
+                    effort
+                );
+            }
+        }
+        assert!(CodexProfile::new_for_version(GPT6_CODEX_VERSION, "gpt-6-sol", "ultra").is_ok());
+        assert!(CodexProfile::new_for_version(GPT6_CODEX_VERSION, "gpt-6-luna", "ultra").is_err());
+        for (version, model) in [
+            (CODEX_VERSION, "gpt-6-sol"),
+            (GPT6_CODEX_VERSION, "gpt-5.6-sol"),
+            ("0.155.0", "gpt-6-sol"),
+            ("0.156.0", "gpt-6-luna"),
+        ] {
+            assert!(CodexProfile::new_for_version(version, model, "high").is_err());
+        }
     }
 
     #[test]
@@ -707,6 +826,35 @@ mod tests {
         let quoted = "/adapter/a\"b.json";
         let config: toml::Value = profile().config_toml(quoted).unwrap().parse().unwrap();
         assert_eq!(config["model_catalog_json"].as_str(), Some(quoted));
+    }
+
+    #[test]
+    fn gpt6_config_and_response_bind_the_new_client_version() {
+        let profile =
+            CodexProfile::new_for_version(GPT6_CODEX_VERSION, "gpt-6-luna", "high").unwrap();
+        let config: toml::Value = profile
+            .config_toml("/adapter/models.json")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(config["model"].as_str(), Some("gpt-6-luna"));
+        assert_eq!(config["model_reasoning_effort"].as_str(), Some("high"));
+        assert_eq!(
+            config["model_providers"][PROVIDER_ID]["http_headers"]["version"].as_str(),
+            Some(GPT6_CODEX_VERSION)
+        );
+        assert_eq!(
+            config["model_providers"][PROVIDER_ID]["supports_websockets"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(config["features"]["shell_tool"].as_bool(), Some(false));
+        assert_eq!(config["features"]["code_mode_only"].as_bool(), Some(false));
+        let mut response = thread_response();
+        response["model"] = json!("gpt-6-luna");
+        response["thread"]["cliVersion"] = json!(GPT6_CODEX_VERSION);
+        assert!(profile.validate_thread_start(&response).is_ok());
+        response["thread"]["cliVersion"] = json!(CODEX_VERSION);
+        assert!(profile.validate_thread_start(&response).is_err());
     }
 
     #[test]
@@ -834,6 +982,8 @@ mod tests {
         );
         for (field, value) in [
             ("tool", json!("exec_command")),
+            ("tool", json!("send_user_message_async")),
+            ("tool", json!("clock")),
             ("namespace", json!("functions")),
             ("callId", json!("")),
             ("arguments", json!({"path":"x", "extra":true})),

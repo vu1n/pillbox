@@ -16,7 +16,9 @@ or credential access. The command must not be promoted as supported until the en
 
 The closed runtime wire types are in [execution/mod.rs](../src/execution/mod.rs). Execution/3
 requires `tool_policy: repository_files`, `execution_policy_revision: pillbox-local-files-v1`,
-Codex 0.151.0 with adapter `pillbox/local-repository-v1`, and local microVM placement. Its manifest
+Codex 0.151.0 for GPT-5.6 Sol/Terra/Luna or Codex 0.156.1 for GPT-6 Sol/Luna, with adapter
+`pillbox/local-repository-v1` and local microVM placement. The model and exact harness release
+must form one of those cohorts; both admit only `low`, `medium`, or `high` reasoning. Its manifest
 contains the exact base, output identity, complete runner image ID, read/write and tool/secret
 requirements, provider host, finite limits, and sealed Python verifier source. Request and manifest
 digests use canonical JSON; duplicate delivery compares the complete original canonical request.
@@ -42,9 +44,12 @@ credential access or VM provisioning; a bounded
 in-memory file tree owns edits. Only runtime-provided read, write, and remove tools can access that
 tree. Native environment tools are disabled by the pinned Codex app-server configuration, whose
 handler registration must be verified against the runner version. Prompts are not enforcement.
-Codex 0.151.0 supports explicit `tool_mode: direct` model metadata. The new adapter preserves the
-requested provider/model/effort and original metadata as provenance, changing only this tool
-presentation field in its effective catalog. Code mode is disabled: its native `exec`/`wait`
+The two immutable source catalogs preserve the model metadata from the exact Codex releases.
+Both effective catalogs set `tool_mode: direct`. The GPT-6 catalog also clears the model's
+advertised `send_user_message_async` and `clock` utility tools, which Codex otherwise registers
+even when their feature flags are off. This keeps the model-visible tool surface limited to the
+admitted broker functions. The old GPT-5.6 source and effective catalogs, digests, and client pin
+remain byte-for-byte stable for pending sealed requests. Code mode is disabled: its native `exec`/`wait`
 wrappers lack a fail-closed pre-call hook and cannot satisfy the sealed total tool-call budget.
 Every admitted function therefore reaches the host broker before execution. Real provider acceptance
 of this profile is still a required end-to-end gate; there is no model or tool-profile fallback.

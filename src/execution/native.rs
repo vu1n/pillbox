@@ -855,6 +855,49 @@ mod tests {
     }
 
     #[test]
+    fn gpt6_native_handshake_binds_model_effort_and_client_version() {
+        let profile =
+            CodexProfile::new_for_version(protocol::GPT6_CODEX_VERSION, "gpt-6-sol", "high")
+                .unwrap();
+        let peer_profile = profile.clone();
+        let (client, server) = UnixStream::pair().unwrap();
+        let peer = thread::spawn(move || {
+            let mut peer = Peer::new(server);
+            assert_eq!(peer.read()["method"], "initialize");
+            peer.send(json!({"id":"pillbox-init","result":{"userAgent":"codex/0.156.1"}}));
+            assert_eq!(peer.read()["method"], "initialized");
+            assert_eq!(
+                peer.read(),
+                json!({"id":"pillbox-thread","method":"thread/start",
+                    "params":peer_profile.thread_start(OPERATIONS).unwrap()})
+            );
+            let mut response = thread_result();
+            response["model"] = json!("gpt-6-sol");
+            response["thread"]["cliVersion"] = json!(protocol::GPT6_CODEX_VERSION);
+            peer.send(json!({"id":"pillbox-thread","result":response}));
+            assert_eq!(
+                peer.read(),
+                json!({"id":"pillbox-turn","method":"turn/start",
+                    "params":peer_profile.turn_start("thread-1", INPUT).unwrap()})
+            );
+            peer.send(json!({"id":"pillbox-turn","result":turn_result()}));
+            peer.send(terminal());
+        });
+        let mut broker = broker();
+        let result = run(
+            client,
+            &profile,
+            INPUT,
+            OPERATIONS,
+            &mut broker,
+            limits(),
+            || Ok(()),
+        );
+        peer.join().unwrap();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
     fn text_write_and_read_round_trip_exact_utf8_without_base64() {
         let mut broker = broker();
         let text = "fn main() { println!(\"→\\n\"); }\n";

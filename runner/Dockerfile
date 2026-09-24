@@ -112,7 +112,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 # @anthropic-ai/claude-code npm package, so Renovate tracks that as the
 # source of truth (the version string is passed to install.sh below).
 # renovate: datasource=npm depName=@anthropic-ai/claude-code
-ARG CLAUDE_VERSION=2.1.280
+ARG CLAUDE_VERSION=2.1.281
 # renovate: datasource=github-releases depName=openai/codex extractVersion=^rust-v(?<version>.*)$
 ARG CODEX_VERSION=0.156.1
 # renovate: datasource=npm depName=opencode-ai
@@ -120,7 +120,7 @@ ARG OPENCODE_VERSION=1.18.25
 # renovate: datasource=npm depName=@earendil-works/pi-coding-agent
 ARG PI_VERSION=0.87.1
 # Prime publishes a stable channel and checksummed native release archives.
-ARG PRIME_AGENT_VERSION=0.9.5
+ARG PRIME_AGENT_VERSION=0.9.6
 # Cursor Agent CLI — no Renovate datasource; lab version string from
 # downloads.cursor.com/lab/<ver>/linux/<arch>/agent-cli-package.tar.gz
 ARG CURSOR_AGENT_VERSION=2026.08.25-3e8eec8

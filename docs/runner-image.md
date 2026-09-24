@@ -42,8 +42,8 @@ workflows using that kernel still need an explicit setup step and network access
 The complete native release lives outside the runtime HOME so its assets survive
 home-directory mounts.
 
-The September 23 refresh pins Claude 2.1.280, Codex 0.156.1, Pi 0.87.1, and
-Prime Agent 0.9.5. Other bundled harnesses retain their existing pins. Updating the
+The September 24 refresh pins Claude 2.1.281, Codex 0.156.1, Pi 0.87.1, and
+Prime Agent 0.9.6. Other bundled harnesses retain their existing pins. Updating the
 daily-use runner does not migrate a sealed execution profile. A profile that
 requires Codex 0.151.0 must keep its matching immutable image until its adapter
 and protocol have been qualified against a newer release.

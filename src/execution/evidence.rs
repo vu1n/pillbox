@@ -19,9 +19,37 @@ use super::{digest, identity, protocol, ArtifactRef, EvidenceRef, MAX_EVIDENCE_B
 
 const MAX_NATIVE_FRAMES: usize = 16_384;
 const MAX_LOG_EVENT_BYTES: usize = 8 * 1024 * 1024;
-const ADMISSION_EVENT: &str = "repository.execution.admitted";
+#[derive(Clone, Copy)]
+enum EvidenceKind {
+    Repository,
+    Text,
+}
+
+impl EvidenceKind {
+    fn admission(self) -> &'static str {
+        match self {
+            Self::Repository => "repository.execution.admitted",
+            Self::Text => "text.execution.admitted",
+        }
+    }
+
+    fn producer(self) -> &'static str {
+        match self {
+            Self::Repository => "repository-execution",
+            Self::Text => "text-execution",
+        }
+    }
+
+    fn event(self, name: &str) -> String {
+        match self {
+            Self::Repository => format!("repository.{name}"),
+            Self::Text => format!("text.{name}"),
+        }
+    }
+}
 
 pub(crate) struct ExecutionEvidence {
+    kind: EvidenceKind,
     session_id: String,
     run_id: String,
     dir: PathBuf,
@@ -37,6 +65,25 @@ impl ExecutionEvidence {
         session_id: &str,
         run_id: &str,
         admission: Value,
+    ) -> Result<Self> {
+        Self::start_kind(pb, session_id, run_id, admission, EvidenceKind::Repository)
+    }
+
+    pub(crate) fn start_text(
+        pb: &Pillbox,
+        session_id: &str,
+        run_id: &str,
+        admission: Value,
+    ) -> Result<Self> {
+        Self::start_kind(pb, session_id, run_id, admission, EvidenceKind::Text)
+    }
+
+    fn start_kind(
+        pb: &Pillbox,
+        session_id: &str,
+        run_id: &str,
+        admission: Value,
+        kind: EvidenceKind,
     ) -> Result<Self> {
         identity(session_id)?;
         identity(run_id)?;
@@ -63,12 +110,12 @@ impl ExecutionEvidence {
         let event = Event::session(
             session_id,
             Payload::Custom(Custom {
-                name: ADMISSION_EVENT.into(),
+                name: kind.admission().into(),
                 payload: Some(admission),
             }),
         )
         .with_run(run_id)
-        .with_actor(runtime_actor());
+        .with_actor(Actor::service(kind.producer()));
         let last_seq = log.append_exact_batch(&[event], None, |pre_seq| {
             ensure!(
                 pre_seq == 0,
@@ -91,6 +138,7 @@ impl ExecutionEvidence {
         sync_directory(dir.parent().context("session directory has no parent")?)?;
         sync_directory(&pb.state_dir)?;
         Ok(Self {
+            kind,
             session_id: session_id.into(),
             run_id: run_id.into(),
             blobs: BlobStore::open_at(dir.clone()),
@@ -102,7 +150,7 @@ impl ExecutionEvidence {
     }
 
     pub(crate) fn append(&mut self, payload: Payload) -> Result<EvidenceRef> {
-        self.append_as(payload, runtime_actor())
+        self.append_as(payload, Actor::service(self.kind.producer()))
     }
 
     fn append_as(&mut self, payload: Payload, actor: Actor) -> Result<EvidenceRef> {
@@ -255,7 +303,7 @@ impl ExecutionEvidence {
         // Once any log append begins, replaying this method could duplicate observations.
         self.native_written = true;
         self.append(Payload::Artifact(Artifact {
-            kind: "repository.native_rpc".into(),
+            kind: self.kind.event("native_rpc"),
             summary: String::new(),
             content_type: artifact.media_type.clone(),
             class: ArtifactClass::Content,
@@ -296,7 +344,7 @@ impl ExecutionEvidence {
                         // Raw evidence remains complete when the optional projection
                         // cannot fit the existing session log's smaller record ceiling.
                         self.append(Payload::Custom(Custom {
-                            name: "repository.native_projection_omitted".into(),
+                            name: self.kind.event("native_projection_omitted"),
                             payload: Some(json!({"frameIndex":index,"artifact":artifact,"reason":"session_log_record_limit"})),
                         }))?;
                     } else {
@@ -307,10 +355,6 @@ impl ExecutionEvidence {
         }
         Ok(artifact)
     }
-}
-
-fn runtime_actor() -> Actor {
-    Actor::service("repository-execution")
 }
 
 fn regular_directory(path: &Path) -> Result<()> {
@@ -506,11 +550,14 @@ mod tests {
         let mut evidence = start(&pb);
         assert_eq!(evidence.reference().seq_range, [1, 1]);
         let admission = evidence.log.read_from(0).unwrap().remove(0);
-        assert_eq!(admission.actor, Some(runtime_actor()));
+        assert_eq!(
+            admission.actor,
+            Some(Actor::service(EvidenceKind::Repository.producer()))
+        );
         assert_eq!(admission.session_id, "evidence-1");
         assert_eq!(admission.run_id, "run-1");
         assert!(
-            matches!(admission.payload, Payload::Custom(Custom { ref name, .. }) if name == ADMISSION_EVENT)
+            matches!(admission.payload, Payload::Custom(Custom { ref name, .. }) if name == EvidenceKind::Repository.admission())
         );
         let mut other_writer = SessionLog::open(&pb, "evidence-1").unwrap();
         assert_eq!(

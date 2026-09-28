@@ -79,6 +79,12 @@ enum Command {
         #[command(subcommand)]
         action: commands::execution::ExecutionAction,
     },
+    /// Execute one sealed, tool-free text invocation in a local microVM.
+    #[cfg(feature = "libkrun")]
+    Text {
+        #[command(subcommand)]
+        action: commands::text::TextAction,
+    },
     /// Create the global pillbox at `~/.pillbox/global/`. Idempotent.
     Init,
     /// Create a project pillbox in the current directory. Writes
@@ -699,6 +705,11 @@ fn run(cli: Cli) -> Result<()> {
         Command::Execution { action } => {
             let resolved = Pillbox::resolve(pillbox_arg)?;
             commands::execution::dispatch(&resolved, action)
+        }
+        #[cfg(feature = "libkrun")]
+        Command::Text { action } => {
+            let resolved = Pillbox::resolve(pillbox_arg)?;
+            commands::text::dispatch(&resolved, action)
         }
         Command::Init => pillbox::init(),
         Command::New {

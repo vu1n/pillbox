@@ -1,4 +1,61 @@
-# Huddles managed Codex execution boundary
+# Huddles Codex execution boundaries
+
+## Local text invocation (`pillbox.text/1`)
+
+The local text producer is a distinct closed contract from managed
+`pillbox.execution/2` and repository `pillbox.execution/3`. It runs one fresh,
+tool-free Codex app-server turn in an owned libkrun microVM. Huddles supplies one
+sealed rendered input and canonical invocation ID; Pillbox never owns the Huddles
+conversation, agent principal, packet, or follow-up schedule.
+
+`pillbox text execute --request FILE`, `pillbox text status INVOCATION_ID`, and
+`pillbox text cancel INVOCATION_ID` use a separate durable claim namespace. The
+execute request has the exact fields below; unknown fields fail admission:
+
+```text
+contract_version: "pillbox.text/1"
+session_ref: { session_id }
+invocation_id
+idempotency_key: invocation_id
+rendered_input
+rendered_input_hash: sha256 of exact UTF-8 input
+tool_policy: "deny_all"
+execution: {
+  transport: { harness: "codex", transport: "app_server",
+               harness_version: "0.156.1", adapter_revision: "pillbox/local-text-v1" },
+  requested: { provider: "openai", model: "gpt-6-luna", profile: "luna",
+               reasoning_effort: "low" | "medium" | "high" },
+  placement: "local_microvm", context_renderer_revision
+}
+execution_policy_revision: "pillbox-local-text-v1"
+output_format: { type: "text", retry_count: 0 }
+runtime: {
+  runner_image_id, effective_model_catalog_digest,
+  credential_ref: "pillbox:codex:default", network_hosts: ["chatgpt.com"],
+  limits: { timeout_ms, max_final_text_bytes, max_frame_bytes,
+            max_evidence_bytes }
+}
+```
+
+Input is 1–524288 UTF-8 bytes. Limits are positive and bounded by 3600000 ms,
+1048576 final-text bytes, 12582912 frame bytes and 67108864 evidence bytes;
+the frame limit cannot exceed the evidence limit. The image ID is a full
+lowercase SHA-256 digest and the catalog digest must match the embedded pinned
+GPT-6 catalog. No tools or ambient workspace are exposed. Every server request,
+including a dynamic tool or approval, fails the invocation. An empty or absent
+final assistant answer fails rather than producing a chat reply.
+
+Admission persists the complete canonical request before provisioning,
+credentials or sampling. An identical retry returns its existing state; changed
+content conflicts. Lost ownership interrupts an incomplete claim, with no
+automatic resampling. Cancellation is intent until the owned process stops.
+Completed output binds the exact request, native thread/turn, bounded final text,
+its content-addressed artifact, raw native RPC artifact and local SessionLog
+range. The requested model is distinct from a provider-observed served model;
+the latter is unavailable unless supported by positional native evidence. This
+claim provides at-most-once dispatch, not an exactly-once sampling guarantee.
+
+## Managed Codex boundary
 
 Status: sealed-envelope plus bounded ACP adapter spike. The existing managed
 Huddles path remains OpenCode-only until the runtime and credential gates below

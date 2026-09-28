@@ -225,3 +225,9 @@ managed-tier-do-gateway conforms: Live smoke correction admits only completed na
 
 gateway-no-daemon conforms: Explicitly unlocking successfully acquired execution file locks on guard drop preserves one foreground owner and immutable claim recovery; it prevents unrelated forked children from retaining a normal-release lock and adds no resident controller.
 docs-governance conforms: Actual provider, verifier, retry and startup lifecycle receipts are recorded with explicit observation limits; Huddles self-build and release claims remain separate from the Pillbox proof.
+libkrun-is-the-backend conforms: pillbox.text/1 is exposed only in the libkrun build and uses the existing owned microVM; no alternate backend is added.
+agent-io-pty-free-contract conforms: the local text producer uses bounded Codex app-server frames and existing normalized SessionLog evidence while Huddles retains conversation and agent identity.
+session-event-log-spine conforms: text execution appends positional results and native evidence to the existing per-session log without another sequence authority.
+vault-broker-oauth conforms: the text producer uses the existing host TokenStore pre-refresh and stub-to-access-token broker; real refresh credentials never enter its guest input.
+gateway-no-daemon conforms: each text invocation has a foreground owner and durable on-disk claim; it introduces no resident gateway or replay broker.
+gateway-no-daemon conforms: local text failure recording preserves an unconfirmed-teardown marker through evidence persistence failure, so the foreground claim cannot be sealed terminal while its VM may live.

@@ -18,5 +18,7 @@ pub(crate) mod sandbox;
 pub(crate) mod secret;
 pub(crate) mod session;
 pub(crate) mod sidecar;
+#[cfg(feature = "libkrun")]
+pub(crate) mod text;
 pub(crate) mod vault;
 pub(crate) mod workspace;

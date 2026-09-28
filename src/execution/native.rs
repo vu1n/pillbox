@@ -103,12 +103,77 @@ pub(crate) fn run(
     limits: NativeLimits,
     poll: impl FnMut() -> Result<()>,
 ) -> std::result::Result<NativeResult, NativeFailure> {
+    run_inner(
+        stream,
+        profile,
+        rendered_input,
+        NativeMode::Repository { operations, broker },
+        limits,
+        poll,
+    )
+}
+
+/// One text-only turn: no dynamic tool is advertised and every native request is denied.
+pub(crate) fn run_text(
+    stream: UnixStream,
+    profile: &CodexProfile,
+    rendered_input: &str,
+    limits: NativeLimits,
+    max_final_text_bytes: usize,
+    poll: impl FnMut() -> Result<()>,
+) -> std::result::Result<NativeResult, NativeFailure> {
+    run_inner(
+        stream,
+        profile,
+        rendered_input,
+        NativeMode::Text {
+            max_final_text_bytes,
+        },
+        limits,
+        poll,
+    )
+}
+
+enum NativeMode<'a> {
+    Repository {
+        operations: &'a [FileOperation],
+        broker: &'a mut FileBroker,
+    },
+    Text {
+        max_final_text_bytes: usize,
+    },
+}
+
+fn run_inner(
+    stream: UnixStream,
+    profile: &CodexProfile,
+    rendered_input: &str,
+    mode: NativeMode<'_>,
+    limits: NativeLimits,
+    poll: impl FnMut() -> Result<()>,
+) -> std::result::Result<NativeResult, NativeFailure> {
+    let (operations, mut broker, max_final_text_bytes) = match mode {
+        NativeMode::Repository { operations, broker } => (operations, Some(broker), None),
+        NativeMode::Text {
+            max_final_text_bytes,
+        } => (&[][..], None, Some(max_final_text_bytes)),
+    };
     let mut wire = Wire::new(stream, limits, poll).map_err(|error| NativeFailure {
         error,
         evidence: Vec::new(),
     })?;
     let outcome = (|| {
         limits.validate()?;
+        if let Some(max) = max_final_text_bytes {
+            ensure!(
+                max > 0 && max <= 1024 * 1024,
+                "invalid final text byte limit"
+            );
+            ensure!(
+                operations.is_empty() && broker.is_none(),
+                "text invocation exposed tools"
+            );
+        }
         wire.check()?;
         // Validate static input before the first native request can have effects.
         let thread_params = profile.thread_start(operations)?;
@@ -122,6 +187,7 @@ pub(crate) fn run(
             protocol::initialize_params(),
             &mut pending,
             &mut server_ids,
+            broker.is_some(),
         )?;
         ensure!(initialized.is_object(), "invalid native initialize result");
         wire.send(json!({"method":"initialized","params":{}}))?;
@@ -132,6 +198,7 @@ pub(crate) fn run(
             thread_params,
             &mut pending,
             &mut server_ids,
+            broker.is_some(),
         )?;
         let thread_id = profile.validate_thread_start(&thread)?;
         let turn = request(
@@ -141,6 +208,7 @@ pub(crate) fn run(
             profile.turn_start(&thread_id, rendered_input)?,
             &mut pending,
             &mut server_ids,
+            broker.is_some(),
         )?;
         let turn_id = protocol::validate_turn_started(&turn)?;
         let mut calls = HashSet::new();
@@ -159,16 +227,31 @@ pub(crate) fn run(
                 .context("unexpected native RPC response")?;
             let params = &frame["params"];
             if let Some(id) = frame.get("id") {
-                if method != "item/tool/call" {
+                if method != "item/tool/call" || broker.is_none() {
                     wire.send(protocol::unsupported_server_request(id)?)?;
                     bail!("unsupported native server request");
                 }
                 dispatch(
-                    &mut wire, id, params, &thread_id, &turn_id, operations, broker, &mut calls,
+                    &mut wire,
+                    id,
+                    params,
+                    &thread_id,
+                    &turn_id,
+                    operations,
+                    broker
+                        .as_deref_mut()
+                        .context("native file broker missing")?,
+                    &mut calls,
                 )?;
                 continue;
             }
             correlate_notification(params, &thread_id, &turn_id)?;
+            if broker.is_none()
+                && matches!(method, "item/started" | "item/completed")
+                && tool_item(&params["item"])
+            {
+                bail!("tool activity in text-only invocation");
+            }
             match method {
                 "thread/started" => ensure!(
                     params["thread"]["id"] == thread_id,
@@ -184,7 +267,7 @@ pub(crate) fn run(
                         params["threadId"] == thread_id && params["turnId"] == turn_id,
                         "uncorrelated native item notification"
                     );
-                    harvest_text(&params["item"], &mut text)?;
+                    harvest_text(&params["item"], &mut text, max_final_text_bytes)?;
                 }
                 "model/rerouted" => bail!("native model rerouting is unsupported"),
                 "turn/completed" => {
@@ -195,13 +278,19 @@ pub(crate) fn run(
                     }
                     // Native terminal items can carry final text even without item notifications.
                     for item in params["turn"]["items"].as_array().unwrap() {
-                        harvest_text(item, &mut text)?;
+                        if broker.is_none() && tool_item(item) {
+                            bail!("tool activity in text-only terminal turn");
+                        }
+                        harvest_text(item, &mut text, max_final_text_bytes)?;
                     }
                     ensure!(
                         pending.is_empty(),
                         "native events queued after terminal completion"
                     );
                     wire.check()?;
+                    if max_final_text_bytes.is_some() {
+                        ensure!(!text.trim().is_empty(), "native final answer is absent");
+                    }
                     return Ok((text, thread_id, turn_id));
                 }
                 // Unrecognized notifications remain evidence, never lifecycle authority.
@@ -230,6 +319,7 @@ fn request<P: FnMut() -> Result<()>>(
     params: Value,
     pending: &mut VecDeque<usize>,
     server_ids: &mut HashSet<String>,
+    allow_tools: bool,
 ) -> Result<Value> {
     wire.send(json!({"id":id,"method":method,"params":params}))?;
     loop {
@@ -237,7 +327,7 @@ fn request<P: FnMut() -> Result<()>>(
         if frame.get("method").is_some() {
             observe_server_id(&frame, server_ids)?;
             if let Some(id) = frame.get("id") {
-                if frame["method"] != "item/tool/call" {
+                if frame["method"] != "item/tool/call" || !allow_tools {
                     wire.send(protocol::unsupported_server_request(id)?)?;
                     bail!("unsupported native server request");
                 }
@@ -283,14 +373,34 @@ fn correlate_notification(params: &Value, thread_id: &str, turn_id: &str) -> Res
     Ok(())
 }
 
-fn harvest_text(item: &Value, text: &mut String) -> Result<()> {
+fn harvest_text(item: &Value, text: &mut String, max_bytes: Option<usize>) -> Result<()> {
     if item["type"] == "agentMessage" && item["phase"] == "final_answer" {
-        *text = item["text"]
+        let final_text = item["text"]
             .as_str()
-            .context("invalid native final assistant text")?
-            .to_owned();
+            .context("invalid native final assistant text")?;
+        if let Some(max) = max_bytes {
+            ensure!(
+                final_text.len() <= max,
+                "native final text byte limit exceeded"
+            );
+        }
+        *text = final_text.to_owned();
     }
     Ok(())
+}
+
+fn tool_item(item: &Value) -> bool {
+    matches!(
+        item["type"].as_str(),
+        Some(
+            "commandExecution"
+                | "fileChange"
+                | "mcpToolCall"
+                | "dynamicToolCall"
+                | "webSearch"
+                | "collabAgentToolCall"
+        )
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -852,6 +962,124 @@ mod tests {
         );
         peer.join().unwrap();
         result
+    }
+
+    fn text_profile() -> CodexProfile {
+        CodexProfile::new_for_version(protocol::GPT6_CODEX_VERSION, "gpt-6-luna", "low").unwrap()
+    }
+
+    fn begin_text(peer: &mut Peer) {
+        let profile = text_profile();
+        assert_eq!(peer.read()["method"], "initialize");
+        peer.send(json!({"id":"pillbox-init","result":{"userAgent":"codex/0.156.1"}}));
+        assert_eq!(peer.read()["method"], "initialized");
+        assert_eq!(
+            peer.read(),
+            json!({"id":"pillbox-thread","method":"thread/start",
+            "params":profile.thread_start(&[]).unwrap()})
+        );
+        let mut response = thread_result();
+        response["model"] = json!("gpt-6-luna");
+        response["reasoningEffort"] = json!("low");
+        response["thread"]["cliVersion"] = json!(protocol::GPT6_CODEX_VERSION);
+        peer.send(json!({"id":"pillbox-thread","result":response}));
+        assert_eq!(
+            peer.read(),
+            json!({"id":"pillbox-turn","method":"turn/start",
+            "params":profile.turn_start("thread-1", INPUT).unwrap()})
+        );
+        peer.send(json!({"id":"pillbox-turn","result":turn_result()}));
+    }
+
+    fn drive_text(
+        max_final_text_bytes: usize,
+        script: impl FnOnce(&mut Peer) + Send + 'static,
+    ) -> std::result::Result<NativeResult, NativeFailure> {
+        let (client, server) = UnixStream::pair().unwrap();
+        let peer = thread::spawn(move || script(&mut Peer::new(server)));
+        let result = run_text(
+            client,
+            &text_profile(),
+            INPUT,
+            limits(),
+            max_final_text_bytes,
+            || Ok(()),
+        );
+        peer.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn text_turn_has_no_tools_and_requires_real_final_answer() {
+        let result = drive_text(1024, |peer| {
+            begin_text(peer);
+            peer.send(json!({"method":"turn/completed","params":{"threadId":"thread-1",
+                "turn":{"id":"turn-1","status":"completed","error":null,
+                    "items":[{"type":"agentMessage","phase":"final_answer","text":"Hello from Luna"}]}}}));
+        }).unwrap();
+        assert_eq!(result.text, "Hello from Luna");
+        assert_eq!(result.thread_id, "thread-1");
+        assert_eq!(result.turn_id, "turn-1");
+        assert!(result
+            .evidence
+            .iter()
+            .any(|frame| frame["message"]["method"] == "turn/completed"));
+
+        let absent = drive_text(1024, |peer| {
+            begin_text(peer);
+            peer.send(terminal());
+        });
+        assert!(absent
+            .unwrap_err()
+            .to_string()
+            .contains("final answer is absent"));
+        let oversized = drive_text(4, |peer| {
+            begin_text(peer);
+            peer.send(
+                json!({"method":"turn/completed","params":{"threadId":"thread-1",
+                "turn":{"id":"turn-1","status":"completed","error":null,
+                    "items":[{"type":"agentMessage","phase":"final_answer","text":"too long"}]}}}),
+            );
+        });
+        assert!(oversized.unwrap_err().to_string().contains("byte limit"));
+    }
+
+    #[test]
+    fn text_turn_denies_native_requests_and_tool_observations() {
+        for method in [
+            "item/tool/call",
+            "item/commandExecution/requestApproval",
+            "elicitation/request",
+        ] {
+            let method = method.to_string();
+            let result = drive_text(1024, move |peer| {
+                begin_text(peer);
+                peer.send(json!({"id":"unsafe-1","method":method,"params":{}}));
+                let denial = peer.read();
+                assert_eq!(denial["id"], "unsafe-1");
+                assert!(denial.get("error").is_some());
+            });
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported native server request"));
+        }
+        let tool = drive_text(1024, |peer| {
+            begin_text(peer);
+            peer.send(
+                json!({"method":"item/completed","params":{"threadId":"thread-1",
+                "turnId":"turn-1","item":{"type":"commandExecution","id":"tool-1"}}}),
+            );
+        });
+        assert!(tool.unwrap_err().to_string().contains("tool activity"));
+        let rerouted = drive_text(1024, |peer| {
+            begin_text(peer);
+            peer.send(
+                json!({"method":"model/rerouted","params":{"threadId":"thread-1",
+                "turnId":"turn-1"}}),
+            );
+        });
+        assert!(rerouted.unwrap_err().to_string().contains("rerouting"));
     }
 
     #[test]

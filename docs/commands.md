@@ -493,3 +493,21 @@ pillbox execution cancel INVOCATION_ID
 Execute runs in the foreground; use another process for status/cancel. Matching retries return
 the durable original invocation. A changed request conflicts and a lost owner never resamples.
 Only the local microVM backend can execute; no backend fallback grants this capability.
+
+## Sealed local text execution
+
+The `pillbox.text/1` request runs one tool-free Codex GPT-6 Luna turn under an
+immutable local microVM profile. Its exact request, bounds, and evidence
+contract are in [Huddles Codex execution](huddles-codex-execution.md).
+
+```sh
+pillbox text execute --request request.json
+pillbox text status INVOCATION_ID
+pillbox text cancel INVOCATION_ID
+```
+
+Execute is foreground. An identical retry returns the original durable state;
+changed content conflicts, and an invocation interrupted by owner loss is never
+sampled again under that ID. The CLI returns JSON v1 with an `execution`
+record. A completed record contains bounded final text and exact Pillbox
+SessionLog and blob references. No repository path or manifest is accepted.

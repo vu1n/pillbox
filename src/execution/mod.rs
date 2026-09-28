@@ -11,6 +11,8 @@ pub(crate) mod native;
 pub(crate) mod protocol;
 pub(crate) mod snapshot;
 pub(crate) mod store;
+#[cfg(feature = "libkrun")]
+pub(crate) mod text;
 #[cfg(any(feature = "libkrun", test))]
 pub(crate) mod verifier;
 

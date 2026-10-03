@@ -231,3 +231,4 @@ session-event-log-spine conforms: text execution appends positional results and 
 vault-broker-oauth conforms: the text producer uses the existing host TokenStore pre-refresh and stub-to-access-token broker; real refresh credentials never enter its guest input.
 gateway-no-daemon conforms: each text invocation has a foreground owner and durable on-disk claim; it introduces no resident gateway or replay broker.
 gateway-no-daemon conforms: local text failure recording preserves an unconfirmed-teardown marker through evidence persistence failure, so the foreground claim cannot be sealed terminal while its VM may live.
+docs-governance conforms: EDIT-001 updates the canonical local repository execution guide with the sealed edit tool, exact read/write grant, ambiguity and byte-limit contract alongside the runtime; no active decision is changed.

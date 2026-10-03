@@ -241,6 +241,8 @@ pub(crate) trait VaultProvider: Send + Sync + 'static {
 
     /// Inspect/rewrite an outbound request. OAuth token-endpoint requests from
     /// the guest must be rejected locally; only the host broker may rotate.
+    // async_trait adds must_use to a boxed Future; Rust 1.99 flags the generated duplicate.
+    #[allow(clippy::double_must_use)]
     async fn handle_request(&self, req: Request<Body>, server: &ServerInner) -> RequestOrResponse;
 
     /// Whether `(method, path)` is this provider's chat/generation

@@ -60,6 +60,7 @@ impl FileLimits {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum FileOperation {
+    Edit,
     Read,
     Remove,
     Write,
@@ -84,7 +85,7 @@ impl FilePolicy {
         validate_paths(&read_paths)?;
         validate_paths(&write_paths)?;
         ensure!(
-            operations.len() <= 3 && operations.windows(2).all(|pair| pair[0] < pair[1]),
+            operations.len() <= 4 && operations.windows(2).all(|pair| pair[0] < pair[1]),
             "file operations must be sorted and unique"
         );
         Ok(Self {
@@ -222,6 +223,45 @@ impl FileBroker {
         Ok(())
     }
 
+    pub(crate) fn edit(&mut self, path: &str, old_text: &str, new_text: &str) -> Result<()> {
+        self.authorize(FileOperation::Edit, path)?;
+        ensure!(!old_text.is_empty(), "old_text must be nonempty");
+        let index = self
+            .find(path)
+            .map_err(|_| anyhow::anyhow!("file does not exist"))?;
+        let original = &self.entries[index].bytes;
+        let text =
+            std::str::from_utf8(original).map_err(|_| anyhow::anyhow!("file is not UTF-8"))?;
+        let start = text
+            .find(old_text)
+            .ok_or_else(|| anyhow::anyhow!("old_text does not occur"))?;
+        // Search from the next character boundary so overlapping matches count too.
+        let next = start + text[start..].chars().next().unwrap().len_utf8();
+        ensure!(
+            !text[next..].contains(old_text),
+            "old_text occurs more than once"
+        );
+        let new_len = (original.len() - old_text.len())
+            .checked_add(new_text.len())
+            .ok_or_else(|| anyhow::anyhow!("file edit exceeds per-file byte limit"))?;
+        ensure!(
+            new_len as u64 <= self.policy.limits.max_file_bytes,
+            "file edit exceeds per-file byte limit"
+        );
+        let total_bytes = self.total_bytes - original.len() as u64 + new_len as u64;
+        ensure!(
+            total_bytes <= self.policy.limits.max_snapshot_bytes,
+            "file edit exceeds snapshot byte limit"
+        );
+        let mut replacement = String::with_capacity(new_len);
+        replacement.push_str(&text[..start]);
+        replacement.push_str(new_text);
+        replacement.push_str(&text[start + old_text.len()..]);
+        self.entries[index].bytes = replacement.into_bytes();
+        self.total_bytes = total_bytes;
+        Ok(())
+    }
+
     pub(crate) fn remove(&mut self, path: &str) -> Result<()> {
         self.authorize(FileOperation::Remove, path)?;
         if let Ok(index) = self.find(path) {
@@ -286,6 +326,21 @@ impl FileBroker {
             "file operation is not granted"
         );
         let paths = match operation {
+            FileOperation::Edit => {
+                ensure!(
+                    self.policy
+                        .read_paths
+                        .binary_search_by(|allowed| allowed.as_str().cmp(path))
+                        .is_ok()
+                        && self
+                            .policy
+                            .write_paths
+                            .binary_search_by(|allowed| allowed.as_str().cmp(path))
+                            .is_ok(),
+                    "exact file path is not granted"
+                );
+                return Ok(());
+            }
             FileOperation::Read => &self.policy.read_paths,
             FileOperation::Write | FileOperation::Remove => &self.policy.write_paths,
         };
@@ -771,6 +826,148 @@ mod tests {
         );
         assert!(broker.write("a/b", false, b"y").is_err());
         assert!(broker.write("b", false, b"y").is_err());
+        assert!(broker.finish().unwrap().changed_paths.is_empty());
+    }
+
+    #[test]
+    fn edit_replaces_one_utf8_match_and_preserves_mode_and_newlines() {
+        let mut original = entry("a", "first\r\n→ old\nlast".as_bytes());
+        original.executable = true;
+        let bounds = FileLimits {
+            max_file_bytes: 64,
+            max_snapshot_bytes: 64,
+            ..limits()
+        };
+        let mut broker = FileBroker::new(
+            FileTree::new(vec![original], &bounds).unwrap(),
+            policy(&["a"], &["a"], vec![FileOperation::Edit], bounds),
+        )
+        .unwrap();
+        broker.edit("a", "→ old", "→ new").unwrap();
+        assert_eq!(
+            broker.usage(),
+            BrokerUsage {
+                tool_calls: 1,
+                output_bytes: 0
+            }
+        );
+        let result = broker.finish().unwrap();
+        assert_eq!(result.changed_paths, ["a"]);
+        assert_eq!(
+            result.tree.entries()[0].bytes,
+            "first\r\n→ new\nlast".as_bytes()
+        );
+        assert!(result.tree.entries()[0].executable);
+    }
+
+    #[test]
+    fn edit_rejects_missing_overlapping_and_binary_matches_atomically() {
+        for (bytes, old, error) in [
+            (b"abcdef".as_slice(), "missing", "does not occur"),
+            (b"aaaa".as_slice(), "aaa", "more than once"),
+            ("ééé".as_bytes(), "éé", "more than once"),
+            (b"ab\xffcd".as_slice(), "ab", "not UTF-8"),
+        ] {
+            let bounds = limits();
+            let mut broker = FileBroker::new(
+                FileTree::new(vec![entry("a", bytes)], &bounds).unwrap(),
+                policy(&["a"], &["a"], vec![FileOperation::Edit], bounds),
+            )
+            .unwrap();
+            assert!(broker
+                .edit("a", old, "x")
+                .unwrap_err()
+                .to_string()
+                .contains(error));
+            assert_eq!(broker.usage().tool_calls, 1);
+            assert!(broker.finish().unwrap().changed_paths.is_empty());
+        }
+        let bounds = limits();
+        let mut broker = FileBroker::new(
+            FileTree::new(vec![], &bounds).unwrap(),
+            policy(&["a"], &["a"], vec![FileOperation::Edit], bounds),
+        )
+        .unwrap();
+        assert_eq!(
+            broker.edit("a", "old", "new").unwrap_err().to_string(),
+            "file does not exist"
+        );
+        assert!(broker.finish().unwrap().changed_paths.is_empty());
+    }
+
+    #[test]
+    fn edit_requires_both_paths_and_operation_without_disclosing_existence() {
+        for entries in [vec![entry("a", b"secret")], vec![]] {
+            for (read, write, operations) in [
+                (vec!["a"], vec![], vec![FileOperation::Edit]),
+                (vec![], vec!["a"], vec![FileOperation::Edit]),
+                (
+                    vec!["a"],
+                    vec!["a"],
+                    vec![FileOperation::Read, FileOperation::Write],
+                ),
+            ] {
+                let bounds = limits();
+                let mut broker = FileBroker::new(
+                    FileTree::new(entries.clone(), &bounds).unwrap(),
+                    policy(&read, &write, operations, bounds),
+                )
+                .unwrap();
+                let error = broker
+                    .edit("a", "secret", "changed")
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains("not granted"), "{error}");
+                assert_eq!(
+                    broker.usage(),
+                    BrokerUsage {
+                        tool_calls: 1,
+                        output_bytes: 0
+                    }
+                );
+                assert!(broker.finish().unwrap().changed_paths.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn edit_bounds_result_and_counts_rejected_attempts_once() {
+        let bounds = FileLimits {
+            max_file_bytes: 8,
+            max_snapshot_bytes: 8,
+            max_tool_calls: 3,
+            ..limits()
+        };
+        let mut broker = FileBroker::new(
+            FileTree::new(vec![entry("a", b"12345678")], &bounds).unwrap(),
+            policy(&["a"], &["a"], vec![FileOperation::Edit], bounds),
+        )
+        .unwrap();
+        assert!(broker.edit("a", "1", "longer").is_err());
+        assert!(broker.edit("a", "", "x").is_err());
+        broker.edit("a", "1", "x").unwrap();
+        assert!(broker.edit("a", "x", "y").is_err());
+        assert_eq!(broker.usage().tool_calls, 3);
+        assert_eq!(
+            broker.finish().unwrap().tree.entries()[0].bytes,
+            b"x2345678"
+        );
+
+        let bounds = FileLimits {
+            max_file_bytes: 8,
+            max_snapshot_bytes: 10,
+            ..limits()
+        };
+        let mut broker = FileBroker::new(
+            FileTree::new(vec![entry("a", b"12345"), entry("b", b"12345")], &bounds).unwrap(),
+            policy(&["a"], &["a"], vec![FileOperation::Edit], bounds),
+        )
+        .unwrap();
+        assert!(broker
+            .edit("a", "1", "xx")
+            .unwrap_err()
+            .to_string()
+            .contains("snapshot byte limit"));
         assert!(broker.finish().unwrap().changed_paths.is_empty());
     }
 }

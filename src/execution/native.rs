@@ -440,6 +440,11 @@ fn dispatch<P: FnMut() -> Result<()>>(
     let accepted = wire.prepare(tool_response(id, true, "{\"ok\":true}".into()))?;
     wire.check()?;
     let operation = match call.operation {
+        FileCall::Edit {
+            path,
+            old_text,
+            new_text,
+        } => broker.edit(&path, &old_text, &new_text).map(|()| None),
         FileCall::Read { path } => broker.read(&path).and_then(|entry| {
             let limit = wire
                 .limits
@@ -814,6 +819,7 @@ mod tests {
         FileOperation::Remove,
         FileOperation::Write,
     ];
+    const EDIT_OPERATIONS: &[FileOperation] = &[FileOperation::Edit];
     const INPUT: &str = "exact\ninput";
 
     fn profile() -> CodexProfile {
@@ -922,6 +928,9 @@ mod tests {
             self.writer.write_all(b"\n").unwrap();
         }
         fn begin(&mut self) {
+            self.begin_with_operations(OPERATIONS);
+        }
+        fn begin_with_operations(&mut self, operations: &[FileOperation]) {
             assert_eq!(
                 self.read(),
                 json!({"id":"pillbox-init","method":"initialize","params":protocol::initialize_params()})
@@ -930,7 +939,7 @@ mod tests {
             assert_eq!(self.read(), json!({"method":"initialized","params":{}}));
             assert_eq!(
                 self.read(),
-                json!({"id":"pillbox-thread","method":"thread/start","params":profile().thread_start(OPERATIONS).unwrap()})
+                json!({"id":"pillbox-thread","method":"thread/start","params":profile().thread_start(operations).unwrap()})
             );
             self.send(json!({"id":"pillbox-thread","result":thread_result()}));
             assert_eq!(
@@ -958,6 +967,25 @@ mod tests {
             OPERATIONS,
             broker,
             limits,
+            || Ok(()),
+        );
+        peer.join().unwrap();
+        result
+    }
+
+    fn drive_edit(
+        broker: &mut FileBroker,
+        script: impl FnOnce(&mut Peer) + Send + 'static,
+    ) -> std::result::Result<NativeResult, NativeFailure> {
+        let (client, server) = UnixStream::pair().unwrap();
+        let peer = thread::spawn(move || script(&mut Peer::new(server)));
+        let result = run(
+            client,
+            &profile(),
+            INPUT,
+            EDIT_OPERATIONS,
+            broker,
+            limits(),
             || Ok(()),
         );
         peer.join().unwrap();
@@ -1166,6 +1194,55 @@ mod tests {
             broker.finish().unwrap().tree.entries()[0].bytes,
             text.as_bytes()
         );
+    }
+
+    #[test]
+    fn sealed_edit_dispatches_one_broker_call_and_preserves_mode() {
+        let bounds = FileLimits {
+            max_file_bytes: 1024,
+            max_snapshot_bytes: 4096,
+            max_tool_calls: 10,
+            max_output_bytes: 4096,
+        };
+        let mut broker = FileBroker::new(
+            FileTree::new(
+                vec![FileEntry {
+                    path: "a".into(),
+                    executable: true,
+                    bytes: b"before\r\nafter".to_vec(),
+                }],
+                &bounds,
+            )
+            .unwrap(),
+            FilePolicy::new(
+                vec!["a".into()],
+                vec!["a".into()],
+                EDIT_OPERATIONS.to_vec(),
+                bounds,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        drive_edit(&mut broker, |peer| {
+            peer.begin_with_operations(EDIT_OPERATIONS);
+            peer.send(json!({"id":"pillbox-turn","result":turn_result()}));
+            peer.send(tool(
+                10,
+                "edit-1",
+                "pillbox_edit_file",
+                json!({"path":"a", "old_text":"before", "new_text":"now"}),
+            ));
+            assert_eq!(
+                peer.read(),
+                tool_response(&json!(10), true, "{\"ok\":true}".into())
+            );
+            peer.send(terminal());
+        })
+        .unwrap();
+        assert_eq!(broker.usage().tool_calls, 1);
+        let result = broker.finish().unwrap();
+        assert_eq!(result.tree.entries()[0].bytes, b"now\r\nafter");
+        assert!(result.tree.entries()[0].executable);
     }
 
     #[test]

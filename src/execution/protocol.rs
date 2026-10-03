@@ -327,6 +327,11 @@ pub(crate) fn dynamic_tools(operations: &[FileOperation]) -> Result<Vec<Value>> 
     validate_operations(operations)?;
     Ok(operations.iter().map(|operation| {
         let (name, description, properties, required) = match operation {
+            FileOperation::Edit => ("pillbox_edit_file", "Replace exactly one occurrence of old_text in an exact authorized UTF-8 repository file. Requires exact read and write grants, preserves executable mode, and fails if the text is absent or ambiguous.", json!({
+                "path": path_schema(),
+                "old_text": {"type": "string", "minLength": 1, "maxLength": MAX_FILE_BYTES},
+                "new_text": {"type": "string", "maxLength": MAX_FILE_BYTES}
+            }), json!(["path", "old_text", "new_text"])),
             FileOperation::Read => ("pillbox_read_file", "Read one exact authorized repository file. Returns path, executable mode, encoding and content; UTF-8 when valid, otherwise base64.", json!({"path": path_schema()}), json!(["path"])),
             FileOperation::Remove => ("pillbox_remove_file", "Remove one exact authorized repository file.", json!({"path": path_schema()}), json!(["path"])),
             FileOperation::Write => ("pillbox_write_file", "Replace one exact authorized repository file with content and executable mode. Use utf8 for text, base64 for binary. Does not disclose previous contents.", json!({
@@ -350,7 +355,7 @@ fn path_schema() -> Value {
 
 fn validate_operations(operations: &[FileOperation]) -> Result<()> {
     ensure!(
-        operations.len() <= 3 && operations.windows(2).all(|pair| pair[0] < pair[1]),
+        operations.len() <= 4 && operations.windows(2).all(|pair| pair[0] < pair[1]),
         "file operations must be sorted and unique"
     );
     Ok(())
@@ -358,6 +363,11 @@ fn validate_operations(operations: &[FileOperation]) -> Result<()> {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum FileCall {
+    Edit {
+        path: String,
+        old_text: String,
+        new_text: String,
+    },
     Read {
         path: String,
     },
@@ -392,6 +402,14 @@ struct DynamicCallParams {
 #[serde(deny_unknown_fields)]
 struct PathArgs {
     path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EditArgs {
+    path: String,
+    old_text: String,
+    new_text: String,
 }
 
 #[derive(Deserialize)]
@@ -438,6 +456,7 @@ pub(crate) fn parse_dynamic_call(
         "unsupported dynamic tool namespace"
     );
     let requested = match params.tool.as_str() {
+        "pillbox_edit_file" => FileOperation::Edit,
         "pillbox_read_file" => FileOperation::Read,
         "pillbox_remove_file" => FileOperation::Remove,
         "pillbox_write_file" => FileOperation::Write,
@@ -448,6 +467,22 @@ pub(crate) fn parse_dynamic_call(
         "dynamic tool operation not admitted"
     );
     let operation = match requested {
+        FileOperation::Edit => {
+            let args: EditArgs =
+                serde_json::from_value(params.arguments).context("invalid edit tool arguments")?;
+            validate_path_size(&args.path)?;
+            ensure!(!args.old_text.is_empty(), "old_text must be nonempty");
+            ensure!(
+                args.old_text.len() as u64 <= max_write_bytes
+                    && args.new_text.len() as u64 <= max_write_bytes,
+                "edit text exceeds file byte limit"
+            );
+            FileCall::Edit {
+                path: args.path,
+                old_text: args.old_text,
+                new_text: args.new_text,
+            }
+        }
         FileOperation::Read | FileOperation::Remove => {
             let args: PathArgs =
                 serde_json::from_value(params.arguments).context("invalid file tool arguments")?;
@@ -886,6 +921,24 @@ mod tests {
         assert!(dynamic_tools(&[]).unwrap().is_empty());
         assert!(dynamic_tools(&[FileOperation::Read, FileOperation::Read]).is_err());
         assert!(dynamic_tools(&[FileOperation::Write, FileOperation::Read]).is_err());
+        let edit = dynamic_tools(&[FileOperation::Edit]).unwrap();
+        assert_eq!(edit[0]["name"], "pillbox_edit_file");
+        assert_eq!(
+            edit[0]["inputSchema"]["required"],
+            json!(["path", "old_text", "new_text"])
+        );
+        assert_eq!(edit[0]["inputSchema"]["additionalProperties"], false);
+        assert_eq!(
+            dynamic_tools(&[
+                FileOperation::Edit,
+                FileOperation::Read,
+                FileOperation::Remove,
+                FileOperation::Write
+            ])
+            .unwrap()
+            .len(),
+            4
+        );
         let request = profile().thread_start(&operations).unwrap();
         assert_eq!(request["allowProviderModelFallback"], false);
         for field in [
@@ -997,6 +1050,46 @@ mod tests {
                 parse_dynamic_call(&invalid, "thread-1", "turn-1", &[FileOperation::Read], 8)
                     .is_err(),
                 "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn edits_parse_closed_utf8_arguments_only_when_sealed() {
+        let edit_call = call(
+            "pillbox_edit_file",
+            json!({
+                "path":"src/main.rs", "old_text":"a\r\n→", "new_text":"b\n→"
+            }),
+        );
+        assert_eq!(
+            parse_dynamic_call(&edit_call, "thread-1", "turn-1", &[FileOperation::Edit], 16)
+                .unwrap()
+                .operation,
+            FileCall::Edit {
+                path: "src/main.rs".into(),
+                old_text: "a\r\n→".into(),
+                new_text: "b\n→".into(),
+            }
+        );
+        assert!(parse_dynamic_call(
+            &edit_call,
+            "thread-1",
+            "turn-1",
+            &[FileOperation::Read, FileOperation::Write],
+            16
+        )
+        .is_err());
+        for arguments in [
+            json!({"path":"a", "old_text":"", "new_text":"x"}),
+            json!({"path":"a", "old_text":"x", "new_text":"123456789"}),
+            json!({"path":"a", "old_text":"x", "new_text":"y", "encoding":"utf8"}),
+            json!({"path":"a", "old_text":"x"}),
+        ] {
+            let invalid = call("pillbox_edit_file", arguments);
+            assert!(
+                parse_dynamic_call(&invalid, "thread-1", "turn-1", &[FileOperation::Edit], 8)
+                    .is_err()
             );
         }
     }

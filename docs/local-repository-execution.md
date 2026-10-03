@@ -22,7 +22,7 @@ must form one of those cohorts; both admit only `low`, `medium`, or `high` reaso
 contains the exact base, output identity, complete runner image ID, read/write and tool/secret
 requirements, provider host, finite limits, and sealed Python verifier source. Request and manifest
 digests use canonical JSON; duplicate delivery compares the complete original canonical request.
-Only `pillbox_repository` read/remove/write operations and the opaque `pillbox:codex:default`
+Only `pillbox_repository` edit/read/remove/write operations and the opaque `pillbox:codex:default`
 credential reference for purpose `model` are currently supported. The only guest provider host is
 `chatgpt.com`. These are explicit admission restrictions, not fallback defaults.
 
@@ -41,7 +41,7 @@ tree; the source and its runtime/output limits are included in `definition_diges
 The first supported policy is a host-owned file broker. The agent VM receives no repository mount.
 The sealed request binds an immutable, complete input snapshot, which the host verifies before
 credential access or VM provisioning; a bounded
-in-memory file tree owns edits. Only runtime-provided read, write, and remove tools can access that
+in-memory file tree owns edits. Only runtime-provided edit, read, write, and remove tools can access that
 tree. Native environment tools are disabled by the pinned Codex app-server configuration, whose
 handler registration must be verified against the runner version. Prompts are not enforcement.
 The two immutable source catalogs preserve the model metadata from the exact Codex releases.
@@ -67,7 +67,10 @@ segments, backslashes, control characters, colons, wildcards, `.git` segments, o
 secret exclusions. Non-ASCII input is an explicitly unsupported policy in this revision. No parent
 directory grant is inferred. Read and write sets are separately sorted, unique exact file names.
 Write-only permission must not return existing bytes. Removing a file requires its exact write
-grant. A tool/operation pair is required independently of the path grant. Unsupported pairs fail
+grant. The `edit` operation requires both exact read and write grants for the same path, plus its
+own sealed tool/operation pair; neither read nor write alone admits it. It is advertised as
+`pillbox_edit_file` only when `edit` is explicitly present in the sorted operation list. Older
+sealed read/remove/write requests retain exactly their original tool surface. Unsupported pairs fail
 before launch. All mutations preserve the original immutable tree for a complete changed-path
 manifest. A no-op write does not fabricate a changed path.
 
@@ -76,6 +79,15 @@ content}`, where `encoding` is `utf8` or `base64`. Reads prefer UTF-8 for valid 
 return base64, with the same explicit encoding/content fields. The broker still receives exact
 bytes; the codec grants no filesystem or process access. Both decoded byte limits and actual
 serialized frame/evidence limits apply, including JSON escaping overhead.
+
+Edit arguments are exactly `{path, old_text, new_text}`. The broker replaces one and only one
+occurrence of nonempty `old_text` in an existing UTF-8 file. Absent matches, overlapping or
+otherwise multiple matches, and binary files fail without mutation. The replacement retains the
+file's executable bit and all unaffected bytes, including newline style. The resulting file and
+snapshot must fit their sealed limits before mutation. Each admitted edit attempt consumes one
+tool call; edit returns only success or a bounded error, so it does not expose file bytes through
+the read output budget. A request lacking either path grant is rejected before file lookup, so
+read-only and write-only scopes do not disclose existing bytes or existence through edit.
 
 Per-file, total snapshot, tool-call, and output byte limits are finite and enforced before allocation
 or mutation. Failed operations do not partially mutate the tree. The sealed result includes every

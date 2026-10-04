@@ -254,3 +254,7 @@ gateway-no-daemon conforms: The producer-lock regression waits for transient inh
 optimization-external-substrate-primitives conforms: Test-only lifecycle polling changes no grader, reward, content sharing, or optimization contract.
 dx-zero-config-local conforms: Test-only lock polling preserves local stream surfaces and reader parity.
 substrate-plane-livesession conforms: Test-only lifecycle polling changes no LiveSession capabilities or backend dispatch.
+
+libkrun-is-the-backend conforms: The v0.3.0 package version changes no default features or backend boundary; runner publication adds the native arm64 rootfs needed by Apple Silicon libkrun.
+runner-image-tags-name-roles conforms: Native architecture builds publish verified digest-only images before a combined manifest; main dispatch updates dev, stable vX.Y.Z tags update the matching immutable image and latest.
+docs-governance conforms: The runner guide records refreshed stable pins, the v4 seed/private-root distinction, architecture verification, and unchanged sealed-profile qualification requirements.

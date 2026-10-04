@@ -8,7 +8,28 @@ moves the `:latest` runner image and ships the interactive attach
 transport (in-sandbox pty-host + frame protocol; local detach/reattach).
 `0.2.0` is the §0 multiplayer trust layer + the libkrun pivot (below).
 
-## Unreleased — managed foreground path + public launch surface
+## v0.3.0 — 2026-10-04
+
+- Isolate each local VM and grader in a private writable rootfs. Exclude old
+  shared caches from new launches; cloning failures stop launch. Cleanup waits
+  for confirmed shutdown and handles restrictive directory modes without
+  following symlinks. Existing VMs need restarting to acquire isolation.
+- Stop structured VMM process groups when their CLI owner dies, including
+  SIGKILL, while preserving intentional detached/server lifetimes.
+- Preserve the host project and cwd for implicit bookmark forks. Restoring into
+  a host directory requires explicit `--workspace` intent.
+- Add sealed, bounded local repository execution, tool-free text invocation,
+  and repository text edits for Huddles self-build.
+- Refresh all seven bundled harnesses to the stable versions recorded in
+  [runner-image.md](docs/runner-image.md). Sealed Codex profiles remain pinned
+  to their separately qualified versions.
+- Add the optional DigitalOcean managed execution runtime.
+
+### Additional changes since v0.2.0
+
+These notes record earlier iterations. Current managed authority and preview
+release gates are defined in [managed-tier.md](docs/managed-tier.md) and
+[durable-object-usage.md](docs/durable-object-usage.md).
 
 - Added `[preset.NAME]` to `pillbox.toml` and `pillbox run --preset NAME`: a
   named, reusable run environment (agent, model, temperature, mounts, secret

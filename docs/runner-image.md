@@ -7,8 +7,9 @@
 > change; what's *in* the image mostly doesn't.
 
 The runner image is the OCI source that libkrun materializes as a microVM rootfs. Source lives in [`runner/Dockerfile`](../runner/Dockerfile);
-canonical builds are published to GitHub Container Registry on
-every tagged CLI release.
+canonical amd64 and arm64 builds are published to GitHub Container Registry on
+every tagged CLI release. Each architecture builds on a native runner and passes
+package and CLI probes before the combined release manifest is tagged.
 
 > **Forward note:** image size is currently an *estimate* (nothing measures it —
 > add a CI image-size check). Image slimming (Wolfi/distroless + eStargz/SOCI
@@ -42,11 +43,12 @@ workflows using that kernel still need an explicit setup step and network access
 The complete native release lives outside the runtime HOME so its assets survive
 home-directory mounts.
 
-The September 24 refresh pins Claude 2.1.281, Codex 0.156.1, Pi 0.87.1, and
-Prime Agent 0.9.6. Other bundled harnesses retain their existing pins. Updating the
-daily-use runner does not migrate a sealed execution profile. A profile that
-requires Codex 0.151.0 must keep its matching immutable image until its adapter
-and protocol have been qualified against a newer release.
+The October 4 refresh pins Claude 2.1.289, Codex 0.160.0, Cursor
+2026.10.01-e373342, Amp 0.0.1791091069-gb9917f, OpenCode 1.18.34, Pi 1.0.2,
+and Prime Agent 0.9.8. Updating the daily-use runner does not migrate a sealed
+execution profile. Profiles requiring Codex 0.151.0 or 0.156.1 must keep their
+matching immutable images until their adapters and protocols have been qualified
+against a newer release.
 
 Plus the system tooling agents tend to reach for: `bash`,
 `bubblewrap`, `ca-certificates`, `curl`, `gh`, `git`, `iproute2`
@@ -109,7 +111,7 @@ the versions baked into the image.
 scripts/build-runner.sh --update --dry-run   # show what would change, no write/build
 scripts/build-runner.sh --update             # bump all agents to latest, rebuild, verify
 scripts/build-runner.sh                       # rebuild current pins (layer-cached), verify
-scripts/build-runner.sh --tag pillbox-runner:v0.2.0   # build an immutable version tag
+scripts/build-runner.sh --tag pillbox-runner:v0.3.0   # build an immutable version tag
 ```
 
 `--update` edits the `ARG …_VERSION` pins in `runner/Dockerfile`, so it's a
@@ -121,21 +123,22 @@ image gets a new id, so libkrun re-materializes its rootfs on the next run (add
 image reference under `~/.pillbox/krun/rootfs/`).
 
 libkrun's materialized cache format is versioned independently of image tags.
-The current `v3` layout is
-`rootfs/v3/<sha256-image-ref>/<sanitized-image-id>/{.materialized,rootfs/}`. Only the
-`rootfs/` child is served to the guest; the sibling authority marker is read as
-a bounded, no-follow regular file and binds the exact format, original image
+The current `v4` layout is
+`rootfs/v4/<sha256-image-ref>/<sanitized-image-id>/{.materialized,rootfs/}`. The
+`rootfs/` child is an image seed, never a writable guest root. The sibling
+authority marker is read as a bounded, no-follow regular file and binds the exact format, original image
 reference, and image ID. The hash namespace prevents distinct valid image refs
 from aliasing through lossy filename sanitization. Extraction preserves archive
 permissions, including `/tmp`'s required `01777` mode.
 
 Docker-unavailable fallback accepts only an exact current-format namespace and
-marker. Launch never deletes or rewrites a pre-existing generation because a
-running VM serves its rootfs directory live. Explicit `--prune-rootfs` considers
-only generations beneath the exact current v3 image-ref hash; legacy and v2
-directories remain untouched because their guest-writable metadata cannot
-authorize deletion. Materialized generations remain beneath Pillbox's
-host-owned `~/.pillbox` directory, whose mode is reasserted as `0700` on every
+marker. Launch never deletes or rewrites a pre-existing generation; image-cache
+maintenance and VM lifetime cleanup are separate. Explicit `--prune-rootfs` considers
+only generations beneath the exact current v4 image-ref hash; legacy, v2, and v3
+directories remain untouched. Those older caches may contain guest writes and
+are excluded from new launches. Each VM receives a private writable clone under
+`~/.pillbox/krun/vm-rootfs/vm-*/rootfs`; confirmed teardown removes that clone.
+Materialized generations remain beneath Pillbox's host-owned `~/.pillbox` directory, whose mode is reasserted as `0700` on every
 access; preserved setuid/setgid bits are therefore not exposed through a shared
 cache.
 

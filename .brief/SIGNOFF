@@ -232,3 +232,8 @@ vault-broker-oauth conforms: the text producer uses the existing host TokenStore
 gateway-no-daemon conforms: each text invocation has a foreground owner and durable on-disk claim; it introduces no resident gateway or replay broker.
 gateway-no-daemon conforms: local text failure recording preserves an unconfirmed-teardown marker through evidence persistence failure, so the foreground claim cannot be sealed terminal while its VM may live.
 docs-governance conforms: EDIT-001 updates the canonical local repository execution guide with the sealed edit tool, exact read/write grant, ambiguity and byte-limit contract alongside the runtime; no active decision is changed.
+
+libkrun-is-the-backend conforms: Structured one-shot runs reuse the local VMM lifetime socket and process-group watcher, terminating on CLI owner loss including SIGKILL; bounded deadlines and detached/server lifetimes retain their existing behavior.
+libkrun-env-fork-substrate conforms: Structured supervision adds only a host ownership socket, preserving guest environment, credential delivery, egress policy, and persistent detached/server sessions.
+docs-governance conforms: The command guide records supervised structured ownership and its distinction from intentional detach.
+workspace-ingest-sovereignty conforms: Structured VMM supervision changes only host process ownership and terminal failure recording; workspace ingest, the pillbox-owned secret denylist, exclusions reporting, and guest shares remain unchanged.

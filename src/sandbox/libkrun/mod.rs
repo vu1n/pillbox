@@ -135,7 +135,7 @@ struct VmSpec {
     /// Egress: when set, the child attaches a virtio-net device and runs the
     /// userspace stack (DNS fence over `allowlist`). Policy only — non-secret.
     egress: Option<EgressSpec>,
-    /// Bounded invocations retain owner liveness and use plain, non-TSI vsock.
+    /// One-shot VMMs retain owner liveness; bounded invocations also have a deadline.
     #[serde(default)]
     ownership: Option<repository::OwnershipSpec>,
 }
@@ -347,7 +347,11 @@ pub(crate) fn vmm_child_main() -> ! {
         }
         let ctx = ctx as u32;
         let mut rc = ffi::krun_set_vm_config(ctx, spec.vcpus, spec.ram_mib);
-        if spec.ownership.is_some() {
+        if spec
+            .ownership
+            .as_ref()
+            .is_some_and(repository::OwnershipSpec::is_bounded)
+        {
             // Omitting virtio-net otherwise enables implicit TSI in libkrun.
             rc = rc.min(ffi::krun_disable_implicit_vsock(ctx));
             rc = rc.min(ffi::krun_add_vsock(ctx, 0));

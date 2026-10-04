@@ -1120,6 +1120,44 @@ fn structured_vmm_diagnostic(stderr: &[u8]) -> Option<String> {
         .find_map(|line| line.strip_prefix("krun-vmm: ").map(str::to_string))
 }
 
+fn fail_structured_launch(
+    resolved: &Pillbox,
+    agent_id: &str,
+    session: &mut crate::session::Session,
+    requested: Option<crate::contract::RequestedRunProfile>,
+    log: &mut crate::events::log::SessionLog,
+    error: anyhow::Error,
+) -> Result<()> {
+    // An unconfirmed shutdown still owns recovery state; never announce completion.
+    if error
+        .downcast_ref::<super::repository::TeardownUnconfirmed>()
+        .is_some()
+    {
+        return Err(error);
+    }
+    session.attached_pid = None;
+    crate::session::write(resolved, session)?;
+    crate::sandbox::structured::append_unavailable_terminal(
+        agent_id,
+        &session.id,
+        requested,
+        1,
+        log,
+    )?;
+    crate::events::emit_session_event(
+        resolved,
+        crate::events::EventType::SessionFailed {
+            reason: error.to_string(),
+            exit_code: Some(1),
+            trace_path: None,
+            result_snapshot: None,
+        },
+        &session.id,
+        Some(session),
+    );
+    Err(error)
+}
+
 /// Run a [`Integration::Structured`] agent as a durable one-shot JSON worker.
 /// The VM has no PTY and no prompt API: the agent writes native JSONL to the
 /// host-readable cloned home, then the supervising host normalizes that capture
@@ -1291,21 +1329,9 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
         cmd.arg("__krun-vmm")
             .arg(&spec_path)
             .env_clear()
-            .envs(boot::static_child_env())
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped());
-        vmm_own_process_group(&mut cmd);
-        let mut child = cmd.spawn().context("spawn structured libkrun VMM")?;
-        if let Some(mut stdin) = child.stdin.take() {
-            use std::io::Write as _;
-            stdin
-                .write_all(b"[]")
-                .context("send empty structured swap set")?;
-        }
-        let output = child
-            .wait_with_output()
-            .context("wait for structured libkrun VMM")?;
+            .envs(boot::static_child_env());
+        let output = super::repository::run_supervised_vmm(&mut cmd, vmspec, &spec_path)
+            .context("run supervised structured libkrun VMM")?;
         let diagnostic = structured_vmm_diagnostic(&output.stderr);
         Ok((output.status, diagnostic))
     })();
@@ -1313,27 +1339,14 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
     let (status, vmm_diagnostic) = match execution {
         Ok(outcome) => outcome,
         Err(error) => {
-            session.attached_pid = None;
-            crate::session::write(resolved, &session)?;
-            structured_io::append_unavailable_terminal(
-                spec.id,
-                &session.id,
-                requested.clone(),
-                1,
-                &mut log,
-            )?;
-            crate::events::emit_session_event(
+            return fail_structured_launch(
                 resolved,
-                crate::events::EventType::SessionFailed {
-                    reason: error.to_string(),
-                    exit_code: Some(1),
-                    trace_path: None,
-                    result_snapshot: None,
-                },
-                &session.id,
-                Some(&session),
+                spec.id,
+                &mut session,
+                requested.clone(),
+                &mut log,
+                error,
             );
-            return Err(error);
         }
     };
     session.attached_pid = None;
@@ -2117,7 +2130,7 @@ fn parse_vmm_groups(ps_stdout: &str, spec: &str) -> Vec<(i32, i32)> {
 /// sessions and durable Pi one-shots, all of which commit a recoverable record.
 /// Unrecorded foreground PTY and grader VMs stay in the CLI group so interruption
 /// cannot orphan a VM with no teardown handle.
-fn vmm_own_process_group(cmd: &mut Command) {
+pub(super) fn vmm_own_process_group(cmd: &mut Command) {
     use std::os::unix::process::CommandExt as _;
     // SAFETY: `pre_exec` runs in the forked child before `exec`; the closure must be
     // async-signal-safe and touch no shared state. `setsid()` is a single bare
@@ -2492,6 +2505,61 @@ mod tests {
             assert!(mount < ownership && ownership < cd);
             assert_eq!(script.matches("chown ").count(), 1);
             assert!(script.contains("chmod \"$mode\""));
+        }
+    }
+
+    #[test]
+    fn structured_launch_failure_preserves_unconfirmed_recovery_state() {
+        for unconfirmed in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let resolved = Pillbox {
+                scope: crate::pillbox::Scope::Global,
+                state_dir: directory.path().join("state"),
+                meta: None,
+            };
+            let mut session = Session::test_fixture();
+            session.attached_pid = Some(12345);
+            crate::session::write(&resolved, &session).unwrap();
+            let mut log = crate::events::log::SessionLog::open(&resolved, &session.id).unwrap();
+            let error = if unconfirmed {
+                anyhow::Error::new(super::super::repository::TeardownUnconfirmed)
+                    .context("injected shutdown failure")
+            } else {
+                anyhow::anyhow!("injected startup failure")
+            };
+            let error = fail_structured_launch(
+                &resolved,
+                "pi",
+                &mut session,
+                Some(
+                    crate::contract::RequestedRunProfile::parse("test/model", None, None).unwrap(),
+                ),
+                &mut log,
+                error,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<super::super::repository::TeardownUnconfirmed>()
+                    .is_some(),
+                unconfirmed
+            );
+            let stored = crate::session::read(&resolved, &session.id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                stored.attached_pid,
+                if unconfirmed { Some(12345) } else { None }
+            );
+            assert_eq!(session.attached_pid, stored.attached_pid);
+            let events = log.read_from(0).unwrap();
+            assert_eq!(events.len(), usize::from(!unconfirmed));
+            if !unconfirmed {
+                assert!(matches!(
+                    events[0].payload,
+                    crate::contract::Payload::RunFinished(_)
+                ));
+            }
         }
     }
 

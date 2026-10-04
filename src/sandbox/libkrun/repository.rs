@@ -87,7 +87,14 @@ impl VmLimits {
 #[derive(Serialize, Deserialize)]
 pub(super) struct OwnershipSpec {
     socket: String,
-    remaining_ms: u64,
+    // Supervised interactive-length runs have no deadline, but always have an owner.
+    remaining_ms: Option<u64>,
+}
+
+impl OwnershipSpec {
+    pub(super) fn is_bounded(&self) -> bool {
+        self.remaining_ms.is_some()
+    }
 }
 
 /// A caller must not seal a terminal result when this marker is in the error
@@ -388,7 +395,7 @@ fn verifier_spec(rootfs: &Path, owner: &Path, rpc: &Path, remaining_ms: u64) -> 
         egress: None,
         ownership: Some(OwnershipSpec {
             socket: owner.to_string_lossy().into_owned(),
-            remaining_ms,
+            remaining_ms: Some(remaining_ms),
         }),
     }
 }
@@ -505,7 +512,7 @@ fn builder_spec(
         }),
         ownership: Some(OwnershipSpec {
             socket: owner.to_string_lossy().into_owned(),
-            remaining_ms,
+            remaining_ms: Some(remaining_ms),
         }),
     }
 }
@@ -564,6 +571,65 @@ fn fresh_directory(rootfs: &Path, guest_path: &str) -> Result<()> {
     crate::paths::ensure_mode_0700(&path)
 }
 
+/// Structured one-shot runs are owned until exit, including when the CLI is SIGKILLed.
+/// The child arms its watcher before starting guest or egress work; closing this socket
+/// stops its group even when no host-side Drop or signal handler can run.
+pub(super) fn run_supervised_vmm(
+    command: &mut Command,
+    mut spec: VmSpec,
+    spec_path: &Path,
+) -> Result<std::process::Output> {
+    let sockets = socket_directory()?;
+    let socket = sockets.path().join("owner.sock");
+    let listener = bind_listener(&socket)?;
+    spec.ownership = Some(OwnershipSpec {
+        socket: socket.to_string_lossy().into_owned(),
+        remaining_ms: None,
+    });
+    write_private_file(spec_path, &serde_json::to_vec(&spec)?)?;
+    // Ownership must not import bounded-execution limits into ordinary agent runs.
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    super::session::vmm_own_process_group(command);
+    let child = command.spawn().context("spawn supervised structured VMM")?;
+    let mut process = OwnedProcess::from_child(child, u64::MAX, true)?;
+    let outcome = (|| -> Result<std::process::Output> {
+        let _owner = accept_owner(
+            &listener,
+            &mut process,
+            Instant::now() + Duration::from_secs(5),
+            &|| false,
+        )?;
+        if let Some(mut stdin) = process.child.stdin.take() {
+            stdin
+                .write_all(b"[]")
+                .context("send empty structured swap set")?;
+        }
+        let status = loop {
+            process.drain()?;
+            if let Some(status) = process.exited()? {
+                break status;
+            }
+            std::thread::sleep(POLL);
+        };
+        // Descendants may hold stderr open after the VMM exits. Stop the group
+        // before waiting for EOF, then collect its final diagnostics.
+        process.stop_and_reap()?;
+        process.wait(Instant::now() + STOP_TIMEOUT, &|| false)?;
+        Ok(std::process::Output {
+            status,
+            stdout: std::mem::take(&mut process.stdout_bytes),
+            stderr: std::mem::take(&mut process.stderr_bytes),
+        })
+    })();
+    match outcome {
+        Ok(output) => Ok(output),
+        Err(error) => Err(cleanup_failure(error, process.stop_and_reap())),
+    }
+}
+
 pub(super) fn arm_vmm_ownership(spec: &OwnershipSpec) -> Result<()> {
     watched_owner(spec).map(drop)
 }
@@ -576,12 +642,16 @@ fn watched_owner(spec: &OwnershipSpec) -> Result<UnixStream> {
         group == std::process::id() as i32 && group > 1,
         "owned VMM is not its process-group leader"
     );
-    let deadline = Instant::now() + Duration::from_millis(spec.remaining_ms);
+    let deadline = spec
+        .remaining_ms
+        .map(|ms| Instant::now() + Duration::from_millis(ms));
     std::thread::Builder::new()
         .name("invocation-owner".into())
         .spawn(move || {
             loop {
-                if Instant::now() >= deadline || owner_gone(&mut owner).unwrap_or(true) {
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                    || owner_gone(&mut owner).unwrap_or(true)
+                {
                     // Group ownership was established before any guest or egress work.
                     if let Err(error) = signal_group(group, libc::SIGKILL) {
                         eprintln!(
@@ -599,7 +669,8 @@ fn watched_owner(spec: &OwnershipSpec) -> Result<UnixStream> {
 
 fn connect_owner(spec: &OwnershipSpec) -> Result<UnixStream> {
     ensure!(
-        spec.remaining_ms > 0 && spec.remaining_ms <= MAX_DURATION.as_millis() as u64,
+        spec.remaining_ms
+            .is_none_or(|ms| ms > 0 && ms <= MAX_DURATION.as_millis() as u64),
         "invalid owner deadline"
     );
     let mut stream = UnixStream::connect(&spec.socket).context("connect invocation owner")?;
@@ -774,7 +845,11 @@ impl OwnedProcess {
                 Ok(())
             });
         }
-        let mut child = command.spawn().context("spawn invocation-owned process")?;
+        let child = command.spawn().context("spawn invocation-owned process")?;
+        Self::from_child(child, output_limit, owns_group)
+    }
+
+    fn from_child(mut child: Child, output_limit: u64, owns_group: bool) -> Result<Self> {
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let mut process = Self {
@@ -790,13 +865,9 @@ impl OwnedProcess {
             stopped: false,
         };
         let configured = (|| -> Result<()> {
-            nonblocking(
-                process
-                    .stdout
-                    .as_ref()
-                    .context("child stdout missing")?
-                    .as_raw_fd(),
-            )?;
+            if let Some(stdout) = &process.stdout {
+                nonblocking(stdout.as_raw_fd())?;
+            }
             nonblocking(
                 process
                     .stderr
@@ -1035,7 +1106,7 @@ fn provision_image(
         destination: destination.into(),
         ownership: OwnershipSpec {
             socket: owner_path.to_string_lossy().into_owned(),
-            remaining_ms: remaining_ms(deadline)?,
+            remaining_ms: Some(remaining_ms(deadline)?),
         },
     });
     let spec_path = sockets.path().join("image.json");
@@ -1117,7 +1188,12 @@ fn preparation_child(path: &Path) -> Result<()> {
             );
             let owner = std::cell::RefCell::new(watched_owner(&spec.ownership)?);
             let cancelled = || owner_gone(&mut owner.borrow_mut()).unwrap_or(true);
-            let deadline = Instant::now() + Duration::from_millis(spec.ownership.remaining_ms);
+            let deadline = Instant::now()
+                + Duration::from_millis(
+                    spec.ownership
+                        .remaining_ms
+                        .context("guardian ownership deadline missing")?,
+                );
             materialize_exact(&spec.image_id, &spec.cache_root, deadline, &cancelled)?;
             check_live(deadline, &cancelled)?;
             let base = spec.cache_root.join(&spec.image_id[7..]).join("rootfs");
@@ -1146,7 +1222,12 @@ fn preparation_child(path: &Path) -> Result<()> {
 
 fn command_child(spec: CommandSpec) -> Result<()> {
     let mut owner = watched_owner(&spec.ownership)?;
-    let deadline = Instant::now() + Duration::from_millis(spec.ownership.remaining_ms);
+    let deadline = Instant::now()
+        + Duration::from_millis(
+            spec.ownership
+                .remaining_ms
+                .context("guardian ownership deadline missing")?,
+        );
     let mut command = Command::new(&spec.program);
     command.args(&spec.args);
     let mut process = OwnedProcess::spawn_scoped(&mut command, COMMAND_OUTPUT_LIMIT, false, false)?;
@@ -1352,7 +1433,7 @@ fn run_command(
             .collect::<Result<_>>()?,
         ownership: OwnershipSpec {
             socket: owner_path.to_string_lossy().into_owned(),
-            remaining_ms: remaining_ms(deadline)?,
+            remaining_ms: Some(remaining_ms(deadline)?),
         },
     });
     let spec_path = sockets.path().join("command.json");
@@ -1909,6 +1990,147 @@ except RuntimeError:
         assert!(cache_complete(&generation.join("rootfs"), &input().image_id).unwrap());
     }
 
+    fn supervised_fixture_spec() -> VmSpec {
+        serde_json::from_value(serde_json::json!({
+            "rootfs":"/unused", "vcpus":1, "ram_mib":64,
+            "shares":[], "exec":["unused"], "vsock":null, "egress":null
+        }))
+        .unwrap()
+    }
+
+    fn supervised_fixture_command(role: &str, directory: &Path) -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "sandbox::libkrun::repository::tests::supervised_vmm_fixture",
+                "--nocapture",
+            ])
+            .env("PILLBOX_TEST_SUPERVISED_ROLE", role)
+            .env("PILLBOX_TEST_SUPERVISED_DIRECTORY", directory);
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, &mut limit) },
+            0
+        );
+        command.env("PILLBOX_TEST_PARENT_FILE_LIMIT", limit.rlim_cur.to_string());
+        command
+    }
+
+    #[test]
+    // The descendant must outlive the fixture body so owner loss kills the whole group.
+    #[allow(clippy::zombie_processes)]
+    fn supervised_vmm_fixture() {
+        let Ok(role) = std::env::var("PILLBOX_TEST_SUPERVISED_ROLE") else {
+            return;
+        };
+        let directory =
+            PathBuf::from(std::env::var_os("PILLBOX_TEST_SUPERVISED_DIRECTORY").unwrap());
+        let spec_path = directory.join("vm.json");
+        if role == "owner" {
+            let mut command = supervised_fixture_command("worker", &directory);
+            run_supervised_vmm(&mut command, supervised_fixture_spec(), &spec_path).unwrap();
+            panic!("supervisor unexpectedly returned");
+        }
+        if role == "before-handshake" {
+            std::process::exit(23);
+        }
+        let spec: VmSpec = serde_json::from_slice(&fs::read(spec_path).unwrap()).unwrap();
+        arm_vmm_ownership(spec.ownership.as_ref().unwrap()).unwrap();
+        // Read the bootstrap channel only after ownership is armed, as the real VMM does.
+        let mut input = String::new();
+        std::io::stdin().read_to_string(&mut input).unwrap();
+        assert_eq!(input, "[]");
+        if role == "complete" {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(
+                unsafe { libc::getrlimit(libc::RLIMIT_FSIZE, &mut limit) },
+                0
+            );
+            assert_eq!(
+                limit.rlim_cur.to_string(),
+                std::env::var("PILLBOX_TEST_PARENT_FILE_LIMIT").unwrap()
+            );
+            std::io::stderr().write_all(&vec![b'x'; 65_536]).unwrap();
+            eprintln!("completed diagnostic");
+            return;
+        }
+        let descendant = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        fs::write(
+            directory.join("descendant.pid"),
+            descendant.id().to_string(),
+        )
+        .unwrap();
+        fs::write(directory.join("vmm.pid"), std::process::id().to_string()).unwrap();
+        std::thread::sleep(Duration::from_secs(10));
+        panic!("supervised VMM survived owner death");
+    }
+
+    #[test]
+    fn supervised_vmm_preserves_exit_and_diagnostic_and_reaps_failed_start() {
+        for role in ["complete", "before-handshake"] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut command = supervised_fixture_command(role, directory.path());
+            let result = run_supervised_vmm(
+                &mut command,
+                supervised_fixture_spec(),
+                &directory.path().join("vm.json"),
+            );
+            if role == "complete" {
+                let output = result.unwrap();
+                assert!(output.status.success());
+                assert_eq!(output.stderr.len(), 65_536 + "completed diagnostic\n".len());
+                assert!(String::from_utf8(output.stderr)
+                    .unwrap()
+                    .ends_with("completed diagnostic\n"));
+            } else {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("before ownership handshake"));
+            }
+        }
+    }
+
+    #[test]
+    fn supervised_vmm_owner_sigterm_and_sigkill_stop_only_its_group() {
+        for signal in [libc::SIGTERM, libc::SIGKILL] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut command = supervised_fixture_command("owner", directory.path());
+            let mut owner = OwnedProcess::spawn(&mut command, 4096, false).unwrap();
+            let mut unrelated_command = Command::new("/bin/sleep");
+            unrelated_command.arg("30");
+            let mut unrelated = OwnedProcess::spawn(&mut unrelated_command, 4096, false).unwrap();
+            let pid_path = directory.path().join("vmm.pid");
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !pid_path.exists() {
+                assert!(Instant::now() < deadline, "VMM fixture did not start");
+                assert!(owner.exited().unwrap().is_none());
+                std::thread::sleep(POLL);
+            }
+            let vmm: i32 = fs::read_to_string(pid_path).unwrap().parse().unwrap();
+            assert!(group_exists(vmm).unwrap());
+            assert_eq!(unsafe { libc::kill(owner.child.id() as i32, signal) }, 0);
+            let status = owner
+                .wait(Instant::now() + Duration::from_secs(3), &|| false)
+                .unwrap();
+            assert_eq!(status.signal(), Some(signal));
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while group_exists(vmm).unwrap() {
+                assert!(Instant::now() < deadline, "VMM group survived owner death");
+                std::thread::sleep(POLL);
+            }
+            assert!(unrelated.exited().unwrap().is_none());
+            unrelated.stop_and_reap().unwrap();
+        }
+    }
+
     #[test]
     fn ownership_watchdog_fixture() {
         let Some(serialized) = std::env::var_os("PILLBOX_TEST_OWNERSHIP_SPEC") else {
@@ -1928,7 +2150,7 @@ except RuntimeError:
             let listener = bind_listener(&socket).unwrap();
             let spec = OwnershipSpec {
                 socket: socket.to_str().unwrap().into(),
-                remaining_ms: if owner_loss { 2000 } else { 120 },
+                remaining_ms: Some(if owner_loss { 2000 } else { 120 }),
             };
             let mut command = Command::new(std::env::current_exe().unwrap());
             command

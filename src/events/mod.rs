@@ -254,9 +254,7 @@ pub(crate) enum EventType {
         /// sessions.
         parent_session_id: Option<String>,
         /// Host-side launch timing, present on host-emitted started
-        /// events when the backend can measure it. Sandbox-side
-        /// `session started` emits `None` because it only knows its own
-        /// wall-clock start.
+        /// events when the backend can measure it.
         startup: Option<StartupMetrics>,
     },
     SessionCompleted {
@@ -316,19 +314,14 @@ impl EventType {
 /// must not treat `emitter == "host"` as a trust boundary.
 const SANDBOX_SIDE_ENV: &str = "PILLBOX_SANDBOX_SIDE";
 
-/// Env var the host's `pillbox run --parent <id>` sets so both the
-/// host's own `session.started` emit and the sandbox-side
-/// `session started` CLI (via the helper's bash export) can pick up
-/// the parent reference without re-threading through call signatures.
+/// Env var the host's `pillbox run --parent <id>` sets so the host's
+/// own `session.started` emit can pick up the parent reference without
+/// re-threading through call signatures.
 pub(crate) const PARENT_SESSION_ID_ENV: &str = "PILLBOX_PARENT_SESSION_ID";
 
 /// Env var the wrapper script captures via `date -u -Iseconds` so the
-/// sandbox-side `session started` and `session done` invocations
-/// (different processes) read the SAME timestamp for the session's
-/// start. Used by `started_at` on the started event AND
-/// `span.start_time` on the terminal event's span — pinning both to
-/// one wall-clock read avoids microsecond skew between the two
-/// emitter paths.
+/// sandbox-side `session done` invocation reads the session's start
+/// for `span.start_time` on the terminal event's span.
 ///
 /// Like the other PILLBOX_* env vars, this is observability tagging
 /// only — anything that can write the process env can backdate the

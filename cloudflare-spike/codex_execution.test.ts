@@ -9,12 +9,10 @@ import {
   MAX_EVIDENCE_PAGE_SIZE,
   type ExecuteInvocationV2Request,
   type InvocationExecution,
-  UnsupportedAcpExecutionError,
   UnsupportedCodexExecutionError,
   validateExecuteInvocationV2Request,
   validateCancelInvocationV2Request,
   validateGetInvocationV2Request,
-  validateSupportedAcpExecution,
   validateSupportedCodexExecution,
 } from "./src/codex_execution.ts";
 import { sha256Hex } from "./src/runtime_identity.ts";
@@ -83,13 +81,6 @@ function assertUnsupported(error: unknown): boolean {
   );
 }
 
-function assertUnsupportedAcp(error: unknown): boolean {
-  return (
-    error instanceof UnsupportedAcpExecutionError &&
-    error.code === "unsupported_execution"
-  );
-}
-
 test("valid Codex app-server execution envelope validates", async () => {
   const request = await validRequest();
   const validated = await validateExecuteInvocationV2Request(request);
@@ -143,7 +134,7 @@ test("broad non-Codex execution validates, then fails the Codex capability check
   );
 });
 
-test("ACP is a separate generic capability beside native Codex app-server", async () => {
+test("an ACP transport is a distinct execution identity the Codex runtime rejects", async () => {
   const request = await validRequest({
     execution: {
       ...codexExecution,
@@ -154,10 +145,9 @@ test("ACP is a separate generic capability beside native Codex app-server", asyn
     },
   });
   const validated = await validateExecuteInvocationV2Request(request);
-  assert.deepEqual(validateSupportedAcpExecution(validated.execution), validated.execution);
   assert.throws(
-    () => validateSupportedAcpExecution(codexExecution),
-    assertUnsupportedAcp,
+    () => validateSupportedCodexExecution(validated.execution),
+    assertUnsupported,
   );
   assert.notEqual(
     await computeExecutionIdentityDigest(codexExecution, "policy/1"),

@@ -1,21 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
-  classifyRunningInvocation,
   enforceHuddlesOpencodePolicy,
   huddlesPromptTools,
-  isHuddlesSessionName,
   safeHuddlesRuntimeDiagnostic,
   structuredOutputRetryPrompt,
 } from "./src/huddles_policy.ts";
 import { deriveSandboxRuntimeId } from "./src/runtime_identity.ts";
-
-test("reserved Huddles session names are exact", () => {
-  assert.equal(isHuddlesSessionName(`ensure-${"a".repeat(64)}`), true);
-  assert.equal(isHuddlesSessionName(`ensure-${"A".repeat(64)}`), false);
-  assert.equal(isHuddlesSessionName(`ensure-${"a".repeat(63)}`), false);
-  assert.equal(isHuddlesSessionName("ordinary-session"), false);
-});
 
 test("Huddles OpenCode policy denies every server permission and prompt tool", () => {
   assert.deepEqual(
@@ -35,11 +26,6 @@ test("Huddles OpenCode policy denies every server permission and prompt tool", (
   const tools = huddlesPromptTools("deny_all");
   assert.ok(Object.keys(tools).length > 0);
   assert.ok(Object.values(tools).every((allowed) => allowed === false));
-});
-
-test("only the current isolate owner may report a durable invocation as running", () => {
-  assert.equal(classifyRunningInvocation(true), "running");
-  assert.equal(classifyRunningInvocation(false), "interrupted");
 });
 
 test("structured-output retries preserve the sealed prompt and demand the schema tool", () => {

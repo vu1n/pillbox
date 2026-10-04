@@ -501,36 +501,6 @@ fn validate_storage_id(id: &str, action: &'static str) -> Result<()> {
     Ok(())
 }
 
-impl Session {
-    /// Minimal stub for sandbox-side event emission. The full record
-    /// lives host-side in the registry; the sandbox only owns `id` +
-    /// its own wall-clock `started_at` (the cold-start latency
-    /// signal). All other fields are empty/None — consumers correlate
-    /// to the host's `session.started` via `id`.
-    ///
-    /// Single chokepoint so adding a new Session field doesn't require
-    /// hunting down every "I need a stub here" call site.
-    pub(crate) fn sandbox_stub(id: &str) -> Self {
-        Self {
-            id: id.to_string(),
-            label: None,
-            backend: String::new(),
-            sandbox_id: String::new(),
-            pty_pid: 0,
-            agent_id: String::new(),
-            started_at: now_rfc3339(),
-            attached_pid: None,
-            base_snapshot: None,
-            result_snapshot: None,
-            expires_at: None,
-            guest_cwd: String::new(),
-            placement: Placement::Local,
-            server: None,
-            requested_execution: None,
-        }
-    }
-}
-
 /// Resolve a user-typed id that may be a unique prefix (>=4 chars).
 /// Mirrors `pillbox snapshot show HANDLE` ergonomics. Returns the full
 /// session record; the caller can use `session.id` for any further

@@ -27,21 +27,10 @@ import {
   D1ManagedExecutionReservationStore,
   parseManagedExecutionAllowance,
 } from "./managed_reservation.js";
-import { publicControllerOwner } from "./managed_ownership.js";
 import {
   enforceHuddlesOpencodePolicy,
   type HuddlesOpencodeConfig,
 } from "./huddles_policy.js";
-import {
-  ensureLegacySession,
-  invokeLegacySession,
-  validateEnsureSessionRequest,
-  validateInvokeSessionRequest,
-  type EnsureSessionRequest,
-  type EnsureSessionResult,
-  type InvokeSessionRequest,
-  type InvokeSessionResult,
-} from "./legacy_huddles_adapter.js";
 import {
   authorizeExecutionOperation,
   requireManagedBurninBootstrap,
@@ -53,30 +42,11 @@ import {
 } from "./run_cost.js";
 import {
   managedAdmissionPolicy,
-  requireManagedAdmission,
 } from "./managed_admission.js";
 import { deriveSandboxRuntimeId } from "./runtime_identity.js";
 
-export {
-  deriveExecutionSessionName,
-  legacyExecutionRequest,
-  validateEnsureSessionRequest,
-  validateInvokeSessionRequest,
-} from "./legacy_huddles_adapter.js";
-export type {
-  CanonicalSessionRequest,
-  EffectCompletionAttribution,
-  EnsureSessionConflict,
-  EnsureSessionRequest,
-  EnsureSessionResponse,
-  EnsureSessionResult,
-  InvokeSessionRequest,
-  InvokeSessionResult,
-  SessionRef,
-} from "./legacy_huddles_adapter.js";
 export { canonicalJson } from "./codex_execution.js";
 export type { JsonSchemaOutputFormat, JsonValue } from "./codex_execution.js";
-export { isHuddlesSessionName } from "./huddles_policy.js";
 export { deriveSandboxRuntimeId, sha256Hex } from "./runtime_identity.js";
 
 /** Private same-account RPC surface for Huddles; execution/2 operation grants are mandatory. */
@@ -137,30 +107,6 @@ export class HuddlesRuntimeEntrypoint extends WorkerEntrypoint<Env> {
       captured_at: new Date().toISOString(),
       ...snapshot,
     };
-  }
-
-  async fetch(): Promise<Response> {
-    return new Response("not found\n", { status: 404 });
-  }
-}
-
-/** Local-test compatibility only; this class is never exported by the production Worker. */
-export class LocalLegacyRuntimeEntrypoint extends WorkerEntrypoint<Env> {
-  async ensureSession(request: EnsureSessionRequest): Promise<EnsureSessionResult> {
-    return ensureLegacySession(validateEnsureSessionRequest(request));
-  }
-
-  async invokeSession(request: InvokeSessionRequest): Promise<InvokeSessionResult> {
-    const validated = await validateInvokeSessionRequest(request);
-    requireManagedAdmission(
-      managedAdmissionPolicy(this.env.MANAGED_EXECUTION_ENABLED),
-    );
-    const service = executionService(this.env, async () =>
-      publicControllerOwner({ subject: "local-legacy-test" }),
-    );
-    return invokeLegacySession(validated, (execution) =>
-      service.executeInvocation(execution),
-    );
   }
 
   async fetch(): Promise<Response> {

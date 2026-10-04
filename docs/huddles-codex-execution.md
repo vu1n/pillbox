@@ -57,7 +57,9 @@ claim provides at-most-once dispatch, not an exactly-once sampling guarantee.
 
 ## Managed Codex boundary
 
-Status: sealed-envelope plus bounded ACP adapter spike. The existing managed
+Status: sealed envelope only. No ACP adapter exists: the Rust and Cloudflare
+ACP spikes were deleted on 2026-10-04 because nothing called them; the design
+below is what a future adapter must satisfy. The existing managed
 Huddles path remains OpenCode-only until the runtime and credential gates below
 are implemented.
 
@@ -81,10 +83,10 @@ execution.transport.transport = "acp"         # portable ACP adapter
 execution.transport.transport = "app_server"  # native Codex adapter
 ```
 
-ACP is a process/event boundary, not an orchestration boundary. The bounded
-spike borrows Buzz's substrate ideas—bounded NDJSON, correlated requests,
+ACP is a process/event boundary, not an orchestration boundary. An adapter
+should borrow Buzz's substrate ideas—bounded NDJSON, correlated requests,
 cancellation cleanup, crash interruption, and respawn for a later invocation—
-but omits its relay, durable prompt queue, and agent-pool claim scheduling. A
+but omit its relay, durable prompt queue, and agent-pool claim scheduling. A
 second active turn returns `runtime_busy`; it is never queued. There is no
 automatic ACP/app-server fallback.
 
@@ -96,14 +98,12 @@ packet, and the adapter emits neither HCP nor WorkEvent records. Huddles keeps
 ownership of HCP/WorkEvent orchestration, retries, sequencing, cancellation
 intent, and execution identity.
 
-The spike checks one ACP result against the sealed `output_format` schema and
+The adapter checks one ACP result against the sealed `output_format` schema and
 returns a safe structured-output failure without echoing provider content. It
 does not retry inside ACP; any retry decision remains Huddles orchestration.
 
-The Rust `sandbox::acp` module is deliberately a private supervisor seam only;
-it has no host command or production dispatch yet. The Cloudflare adapter is
-pure and injected-client based so its lifecycle contract is testable without
-changing Huddles orchestration or the deployment image.
+The deleted spikes (`src/sandbox/acp.rs`, `cloudflare-spike/src/acp_turn.ts`,
+commit bf38f5b) remain in git history as a reference for that lifecycle.
 
 ### ACP v1 session primitives
 
@@ -126,8 +126,8 @@ across the boundary:
 
 Pillbox exposes the private `pillbox.execution/2` contract in
 `cloudflare-spike/src/codex_execution.ts` as its only managed Huddles RPC.
-Historical OpenCode `ensureSession`/`invokeSession` adapters remain available
-only through a local-test entrypoint that accepts no managed authorization.
+The historical OpenCode `ensureSession`/`invokeSession` adapter and its
+local-test entrypoint were deleted on 2026-10-04.
 
 The v2 request binds the substrate execution identity to the exact invocation
 input and output contract:
@@ -148,9 +148,9 @@ output_format: { type: "json_schema", schema, retry_count: 2 }
 `execution` mirrors Huddles' authoritative broad contract: harness, transport,
 version, adapter revision, requested provider/model/profile/reasoning effort,
 optional placement, context-renderer revision, and optional verifier
-reference. The boundary validator accepts that shape. Separate capability
-checks refine it to native Codex over `app_server` or to any declared harness
-over `acp`.
+reference. The boundary validator accepts that shape. A separate capability
+check refines it to native Codex over `app_server`; `acp` still validates as a
+transport, but nothing in Pillbox drives it.
 
 Pillbox recomputes the rendered-input hash over exact UTF-8 bytes. It also
 computes an execution-identity digest over `{ execution,

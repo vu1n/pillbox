@@ -202,7 +202,6 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> 
         }
         SessionAction::Watch { id, from } => stream::session_watch(resolved, &id, from),
         SessionAction::Events { follow, json } => events::dispatch_events(resolved, follow, json),
-        SessionAction::Started { id } => session_started(resolved, &id),
         SessionAction::Done {
             id,
             status,
@@ -1471,34 +1470,6 @@ fn session_prune(resolved: &Pillbox, dry_run: bool) -> Result<()> {
     } else {
         println!("pillbox: ✓ pruned {pruned} session(s).");
     }
-    Ok(())
-}
-
-fn session_started(resolved: &Pillbox, id: &str) -> Result<()> {
-    validate_session_id(id)?;
-    // Both PARENT_SESSION_ID_ENV and SESSION_STARTED_AT_ENV come from
-    // the wrapper's bash exports. Shape was validated at the host's
-    // CLI boundary; the env hop is privileged so we trust the values.
-    let parent_session_id = events::parent_session_id_from_env();
-    let mut stub = session::Session::sandbox_stub(id);
-    // Prefer the wrapper-captured timestamp so the sandbox-side
-    // `started_at` matches what `session done` will use as
-    // span.start_time — single wall-clock read, no skew. Direct CLI
-    // invocations without the env keep the now() fallback baked into
-    // `sandbox_stub`.
-    if let Some(env_started_at) = events::session_started_at_from_env() {
-        stub.started_at = env_started_at;
-    }
-    events::emit_session_event(
-        resolved,
-        events::EventType::SessionStarted {
-            parent_session_id,
-            startup: None,
-        },
-        id,
-        Some(&stub),
-    );
-    println!("pillbox: ✓ session `{id}` started");
     Ok(())
 }
 

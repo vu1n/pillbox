@@ -823,9 +823,7 @@ fn run(cli: Cli) -> Result<()> {
             }
             // `--parent <id>` plumbing mirrors the webhook flow: shape-
             // validate, stash in `PILLBOX_PARENT_SESSION_ID`, and let
-            // both the host's `session.started` emit and the sandbox-
-            // side `session started` CLI (via the helper's bash export)
-            // pick it up off the env. Shape-only validation: the parent
+            // the host's `session.started` emit pick it up off the env. Shape-only validation: the parent
             // may live in another pillbox's registry, so we don't
             // reject "unknown" ids — the field is observability
             // metadata; consumers reconcile.

@@ -141,6 +141,11 @@ Decisions are **ratified constraints, not editable notes**. Develop *to* them:
   it is versioned and reviewed with the code, memory is not. Follow the decision and say
   which memory looked stale.
 
+If the repo has a feature map (a `.brief/docs` doc with `type: features`), run
+`brief features <files>` before changing code and read the Gotchas of each feature you
+touch. When you move or delete code, update that feature's `paths:` in the same change;
+when you hit a trap the next agent would hit too, add it to the feature's Gotchas.
+
 **Before committing, run `brief check`** (resolve anything it flags) and `brief pin`
 (freeze any `@latest`/`@current` refs you wrote to a concrete revision). CI runs the same
 check on PRs — that is the backstop; don't bypass it.

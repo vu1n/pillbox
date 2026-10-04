@@ -29,12 +29,15 @@ The cross-cutting dependencies that *look* separable but aren't. These are the
 ones that produced wrong "authoritative" answers — check here before claiming a
 change is clean.
 
-### libkrun rides on docker for its guest image `[verified 2026-06-20]`
-`materialize_rootfs` (src/sandbox/libkrun/mod.rs:~626) builds libkrun's virtio-fs
-root by `docker pull` → `docker create` → `docker export | tar -x`, cached under
-`~/.pillbox/krun/rootfs/<image-id>`. **So a libkrun run requires the docker daemon
-today.** Consequence: "delete docker" ≠ "remove the docker dependency" — see the
-two halves below.
+### libkrun uses Docker for fresh image exports
+`materialize_rootfs` exports an OCI image through Docker, then boots a private
+clone of its completed seed. On macOS, fresh ordinary `rootfs/v5` generations and
+bounded `repository-images-v2` generations share private case-sensitive APFS
+backing with their runtime clones; see [the storage contract](libkrun-sandbox.md).
+Docker is required for fresh exports and image-tag resolution. Ordinary launches
+may reuse a complete current-generation seed when Docker is unavailable, after
+validating its backing. This is image plumbing, separate from the retired Docker
+execution backend.
 
 ### `crate::docker` is two fused things `[verified 2026-06-20]`
 - **The backend** — `DockerBackend` / `DockerLiveSession` (run the agent in a

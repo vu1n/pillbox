@@ -21,7 +21,7 @@ cd "$(dirname "$0")/.."
 
 DOCKERFILE=runner/Dockerfile
 TAG=pillbox-runner:dev   # moving dev tag — every local script + a dev pillbox.toml default to it
-ROOTFS_CACHE_VERSION=v4  # mirrors ROOTFS_CACHE_VERSION in src/sandbox/libkrun/mod.rs
+ROOTFS_CACHE_VERSION=v5  # mirrors ROOTFS_CACHE_VERSION in src/sandbox/libkrun/mod.rs
 DO_UPDATE=0 DRY_RUN=0 NO_CACHE=0 PRUNE=0 PRINT_ROOTFS_NAMESPACE=
 
 usage() {
@@ -34,8 +34,8 @@ Usage: scripts/build-runner.sh [options]
       --dry-run      with --update: print what would change, don't write or build
   -t, --tag TAG      image tag to build (default: pillbox-runner:dev)
       --no-cache     force a clean rebuild (pass --no-cache to docker)
-      --prune-rootfs after build, drop stale libkrun rootfs generations for this
-                     tag (run only when no sessions are using the old image)
+      --prune-rootfs reserved: pruning mounted rootfs backing requires a
+                     validated maintenance operation; this flag fails closed
       --print-rootfs-cache-namespace IMAGE
                      print IMAGE's current cache namespace and exit (no build)
   -h, --help         this help
@@ -60,6 +60,11 @@ while [ $# -gt 0 ]; do
 	esac
 	shift
 done
+
+if [ "$PRUNE" = 1 ]; then
+	echo "✗ --prune-rootfs is unavailable: mounted rootfs backing requires validated maintenance" >&2
+	exit 2
+fi
 
 sha256_text() {
 	if command -v sha256sum >/dev/null 2>&1; then
@@ -140,26 +145,5 @@ args+=(.)
 docker "${args[@]}"
 
 bash scripts/verify-runner.sh "$TAG" "$(cur CODEX_VERSION)"
-
-# Each rebuild gives the image a new id, so libkrun re-materializes its rootfs
-# (`~/.pillbox/krun/rootfs/v4/<sha256-tag>/<sanitized-id>/rootfs`) on the next
-# run and prior generations linger. Opt-in prune is confined to THIS tag's exact
-# v4 hash namespace. Legacy/v2/v3 trees and other tags remain untouched.
-if [ "$PRUNE" = 1 ]; then
-	root="${HOME}/.pillbox/krun/rootfs"
-	if [ -d "$root" ]; then
-		san() { printf '%s' "$1" | sed 's/[^a-zA-Z0-9]/_/g'; }   # mirrors Rust sanitize()
-		new_id=$(docker image inspect "$TAG" --format '{{.Id}}')
-		namespace="$root/$(rootfs_namespace "$TAG")"
-		keep="$(san "$new_id")"
-		pruned=0
-		for d in "$namespace/sha256_"*; do
-			[ -d "$d" ] || continue
-			[ "$(basename "$d")" = "$keep" ] && continue
-			rm -rf "$d" && pruned=$((pruned + 1))
-		done
-		echo "▶ pruned $pruned stale rootfs generation(s) for $TAG"
-	fi
-fi
 
 echo "✓ $TAG ready"

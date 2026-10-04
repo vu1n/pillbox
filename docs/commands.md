@@ -94,8 +94,10 @@ Every local microVM uses a private writable rootfs clone, including `/tmp` and
 system directories. The image cache is never mounted as a guest's writable root.
 Detached/server sessions retain their own clone until `session rm` confirms
 shutdown. Failed teardown preserves their session record and private files.
-Cache versions through v3 are excluded from new launches because they may contain
-previous guest writes; a fresh image export is required to initialize the v4 seed.
+On macOS, seeds and clones use a private case-sensitive APFS sparse volume with
+a 64 GiB logical ceiling. Fresh v5 seeds replace older generations for new launches;
+old sessions retain their paths. The volume grows only as written and is not
+automatically resized or unmounted. Insufficient host or volume space fails clearly.
 
 ### Structured run ownership
 

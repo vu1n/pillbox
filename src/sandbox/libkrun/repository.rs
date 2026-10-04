@@ -568,9 +568,12 @@ fn prepare_rootfs(
     check_live(deadline, cancelled)?;
     super::host::virtualization_available().map_err(anyhow::Error::msg)?;
     super::host::runtime_deps_present().map_err(anyhow::Error::msg)?;
-    let cache_root = super::krun_cache_dir()?.join("repository-images-v1");
-    fs::create_dir_all(&cache_root)?;
-    crate::paths::ensure_mode_0700(&cache_root)?;
+    let backing = super::rootfs_backing::RootfsBacking::prepare(
+        &super::rootfs_backing::RootfsBacking::krun_dir()?,
+        deadline,
+        cancelled,
+    )?;
+    let cache_root = backing.namespace("repository-images-v2", deadline, cancelled)?;
     let free = super::host::disk_headroom(&cache_root);
     ensure!(
         free >= super::host::MIN_HEADROOM_BYTES,
@@ -1429,7 +1432,15 @@ fn drain_final_pipe<T: Read>(
 #[serde(tag = "role", rename_all = "snake_case")]
 enum PreparationSpec {
     Image(ImageSpec),
+    #[cfg(test)]
+    CachedImageFixture(ImageSpec),
     Command(CommandSpec),
+}
+
+enum ImagePreparationRole {
+    VerifiedBacking,
+    #[cfg(test)]
+    CachedFixture,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1494,10 +1505,28 @@ fn provision_image(
     deadline: Instant,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<()> {
+    provision_image_with_role(
+        image_id,
+        cache_root,
+        destination,
+        deadline,
+        cancelled,
+        ImagePreparationRole::VerifiedBacking,
+    )
+}
+
+fn provision_image_with_role(
+    image_id: &str,
+    cache_root: &Path,
+    destination: &Path,
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+    role: ImagePreparationRole,
+) -> Result<()> {
     let sockets = socket_directory()?;
     let owner_path = sockets.path().join("image-owner.sock");
     let listener = bind_listener(&owner_path)?;
-    let spec = PreparationSpec::Image(ImageSpec {
+    let image = ImageSpec {
         image_id: image_id.into(),
         cache_root: cache_root.into(),
         destination: destination.into(),
@@ -1505,7 +1534,12 @@ fn provision_image(
             socket: owner_path.to_string_lossy().into_owned(),
             remaining_ms: Some(remaining_ms(deadline)?),
         },
-    });
+    };
+    let spec = match role {
+        ImagePreparationRole::VerifiedBacking => PreparationSpec::Image(image),
+        #[cfg(test)]
+        ImagePreparationRole::CachedFixture => PreparationSpec::CachedImageFixture(image),
+    };
     let spec_path = sockets.path().join("image.json");
     write_private_file(&spec_path, &serde_json::to_vec(&spec)?)?;
     let mut command = preparation_command(&spec_path)?;
@@ -1578,27 +1612,11 @@ fn preparation_child(path: &Path) -> Result<()> {
     );
     match serde_json::from_slice::<PreparationSpec>(&bytes)? {
         PreparationSpec::Image(spec) => {
-            validate_image_id(&spec.image_id)?;
-            ensure!(
-                spec.cache_root.is_absolute() && spec.destination.is_absolute(),
-                "image preparation paths must be absolute"
-            );
-            let owner = std::cell::RefCell::new(watched_owner(&spec.ownership)?);
-            let cancelled = || owner_gone(&mut owner.borrow_mut()).unwrap_or(true);
-            let deadline = Instant::now()
-                + Duration::from_millis(
-                    spec.ownership
-                        .remaining_ms
-                        .context("guardian ownership deadline missing")?,
-                );
-            materialize_exact(&spec.image_id, &spec.cache_root, deadline, &cancelled)?;
-            check_live(deadline, &cancelled)?;
-            let base = spec.cache_root.join(&spec.image_id[7..]).join("rootfs");
-            let method = crate::workspace::cow::cow_clone_dir(&base, &spec.destination)?;
-            if method == crate::workspace::cow::CloneMethod::Copied {
-                eprintln!("pillbox: bounded rootfs fork fell back to a full copy");
-            }
-            check_live(deadline, &cancelled)
+            preparation_image_child(spec, ImagePreparationRole::VerifiedBacking)
+        }
+        #[cfg(test)]
+        PreparationSpec::CachedImageFixture(spec) => {
+            preparation_image_child(spec, ImagePreparationRole::CachedFixture)
         }
         PreparationSpec::Command(spec) => {
             let group = unsafe { libc::getpgrp() };
@@ -1615,6 +1633,102 @@ fn preparation_child(path: &Path) -> Result<()> {
             bail!("command guardian survived group termination")
         }
     }
+}
+
+fn preparation_image_child(spec: ImageSpec, role: ImagePreparationRole) -> Result<()> {
+    validate_image_id(&spec.image_id)?;
+    ensure!(
+        spec.cache_root.is_absolute() && spec.destination.is_absolute(),
+        "image preparation paths must be absolute"
+    );
+    let owner = std::cell::RefCell::new(watched_owner(&spec.ownership)?);
+    let cancelled = || owner_gone(&mut owner.borrow_mut()).unwrap_or(true);
+    let deadline = Instant::now()
+        + Duration::from_millis(
+            spec.ownership
+                .remaining_ms
+                .context("guardian ownership deadline missing")?,
+        );
+    let private_parent = spec
+        .destination
+        .parent()
+        .context("private rootfs parent missing")?;
+    ensure!(
+        private_parent.parent() == Some(spec.cache_root.as_path()),
+        "image preparation destination is outside cache namespace"
+    );
+    match role {
+        ImagePreparationRole::VerifiedBacking => {
+            let krun = super::rootfs_backing::RootfsBacking::krun_dir()?;
+            let expected = super::rootfs_backing::RootfsBacking::expected_root(&krun)
+                .join("repository-images-v2");
+            ensure!(
+                spec.cache_root == expected,
+                "image preparation paths are outside verified rootfs backing"
+            );
+            let backing =
+                super::rootfs_backing::RootfsBacking::reopen_bounded(&krun, deadline, &cancelled)?;
+            ensure!(
+                backing.namespace("repository-images-v2", deadline, &cancelled)? == spec.cache_root,
+                "image preparation namespace differs from verified backing"
+            );
+            materialize_and_clone(&spec, deadline, &cancelled, |path| {
+                backing.ensure_same_device(path)
+            })
+        }
+        #[cfg(test)]
+        ImagePreparationRole::CachedFixture => {
+            let device = verify_cached_fixture_directory(&spec.cache_root, None)?;
+            verify_cached_fixture_directory(private_parent, Some(device))?;
+            for path in [&spec.cache_root, private_parent] {
+                ensure!(
+                    fs::symlink_metadata(path)?.permissions().mode() & 0o077 == 0,
+                    "cached image fixture directory is not private: {}",
+                    path.display()
+                );
+            }
+            materialize_and_clone(&spec, deadline, &cancelled, |path| {
+                verify_cached_fixture_directory(path, Some(device)).map(|_| ())
+            })
+        }
+    }
+}
+
+fn materialize_and_clone(
+    spec: &ImageSpec,
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+    verify_directory: impl Fn(&Path) -> Result<()>,
+) -> Result<()> {
+    materialize_exact(&spec.image_id, &spec.cache_root, deadline, cancelled)?;
+    check_live(deadline, cancelled)?;
+    let base = spec.cache_root.join(&spec.image_id[7..]).join("rootfs");
+    verify_directory(&base)?;
+    verify_directory(
+        spec.destination
+            .parent()
+            .context("private rootfs parent missing")?,
+    )?;
+    let method = crate::workspace::cow::cow_clone_dir(&base, &spec.destination)?;
+    if method == crate::workspace::cow::CloneMethod::Copied {
+        eprintln!("pillbox: bounded rootfs fork fell back to a full copy");
+    }
+    check_live(deadline, cancelled)
+}
+
+#[cfg(test)]
+fn verify_cached_fixture_directory(path: &Path, device: Option<u64>) -> Result<u64> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect private cached image fixture {}", path.display()))?;
+    ensure!(
+        metadata.is_dir()
+            && !metadata.file_type().is_symlink()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && device.is_none_or(|expected| metadata.dev() == expected),
+        "cached image fixture is not a plain owned directory on one filesystem: {}",
+        path.display()
+    );
+    Ok(metadata.dev())
 }
 
 fn command_child(spec: CommandSpec) -> Result<()> {
@@ -1807,7 +1921,7 @@ fn commit_generation(stage: TempDir, generation: &Path, image_id: &str) -> Resul
     Ok(())
 }
 
-fn run_command(
+pub(super) fn run_command(
     command: &mut Command,
     deadline: Instant,
     cancelled: &dyn Fn() -> bool,
@@ -3218,21 +3332,25 @@ with open(sys.argv[1], 'w') as output:
     }
 
     #[test]
-    fn exact_cached_image_is_cloned_inside_guarded_preparation() {
+    fn cached_image_fixture_is_cloned_inside_guarded_preparation() {
         let directory = tempfile::tempdir().unwrap();
         let cache = directory.path().canonicalize().unwrap();
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o700)).unwrap();
         let image_id = input().image_id;
         let stage = tempfile::tempdir_in(&cache).unwrap();
         fs::create_dir(stage.path().join("rootfs")).unwrap();
         fs::write(stage.path().join("rootfs/proof"), b"pristine").unwrap();
         commit_generation(stage, &cache.join(&image_id[7..]), &image_id).unwrap();
-        let destination = cache.join("private-rootfs");
-        provision_image(
+        let private = tempfile::tempdir_in(&cache).unwrap();
+        fs::set_permissions(private.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let destination = private.path().join("rootfs");
+        provision_image_with_role(
             &image_id,
             &cache,
             &destination,
             Instant::now() + Duration::from_secs(5),
             &|| false,
+            ImagePreparationRole::CachedFixture,
         )
         .unwrap();
         assert_eq!(fs::read(destination.join("proof")).unwrap(), b"pristine");
@@ -3241,6 +3359,42 @@ with open(sys.argv[1], 'w') as output:
             fs::read(cache.join(&image_id[7..]).join("rootfs/proof")).unwrap(),
             b"pristine"
         );
+    }
+
+    #[test]
+    fn production_image_guardian_rejects_temp_cache_without_mutating_fixture() {
+        crate::test_util::with_isolated_home("invalid-image-guardian-cache", || {
+            let prior_home = std::env::var_os("HOME").unwrap();
+            std::env::set_var("HOME", fs::canonicalize(&prior_home).unwrap());
+            let directory = tempfile::tempdir().unwrap();
+            let cache = directory.path().canonicalize().unwrap();
+            let image_id = input().image_id;
+            let stage = tempfile::tempdir_in(&cache).unwrap();
+            fs::create_dir(stage.path().join("rootfs")).unwrap();
+            fs::write(stage.path().join("rootfs/proof"), b"pristine").unwrap();
+            commit_generation(stage, &cache.join(&image_id[7..]), &image_id).unwrap();
+            let private = tempfile::tempdir_in(&cache).unwrap();
+            let destination = private.path().join("rootfs");
+            let error = provision_image(
+                &image_id,
+                &cache,
+                &destination,
+                Instant::now() + Duration::from_secs(5),
+                &|| false,
+            )
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("outside verified rootfs backing"),
+                "unexpected production rejection: {error:#}"
+            );
+            assert_eq!(
+                fs::read(cache.join(&image_id[7..]).join("rootfs/proof")).unwrap(),
+                b"pristine"
+            );
+            assert!(!destination.exists());
+            assert!(!cache.join(format!("{}.lock", &image_id[7..])).exists());
+            std::env::set_var("HOME", prior_home);
+        });
     }
 
     #[test]

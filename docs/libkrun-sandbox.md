@@ -63,18 +63,32 @@ host: pillbox  ──FFI──▶ libkrun (KVM/HVF microVM)
   style), so the existing runner-image artifact survives the pivot; a slimmer
   custom rootfs is an option later.
 
-  **Isolation:** materialized image generations under `~/.pillbox/krun/rootfs/v4/`
-  are seed trees only. Each ordinary VM and grader boots an independent writable
-  CoW clone under `~/.pillbox/krun/vm-rootfs/`; bounded builders and verifiers retain
-  their existing private runtime clones. Writes to `/tmp`, `/etc`, installed tools,
-  and other root paths cannot reach the seed, concurrent VMs, or later runs. The
-  clone utility reports any supported full-copy fallback; otherwise launch fails.
-  Sharing the seed is never a fallback.
+  **Isolation and filesystem semantics:** on macOS every native rootfs uses a
+  Pillbox-owned case-sensitive APFS sparse bundle under the private krun namespace.
+  Its logical ceiling is 64 GiB; storage is allocated as written, not reserved in
+  advance. Ordinary image generations use the fresh `rootfs/v5/` namespace;
+  bounded repository images use `repository-images-v2/`. Seeds and writable
+  runtime clones share this volume so APFS CoW remains available. Each ordinary
+  VM, grader, builder, and verifier boots an independent private clone. Writes
+  cannot reach the seed, concurrent VMs, or later runs. No shared-root or
+  case-insensitive fallback is allowed.
 
-  Earlier cache generations were writable by guests and are never reused as seeds.
-  The first v4 launch needs a fresh image export; Docker-unavailable fallback only
-  accepts complete v4 generations. Existing sessions keep their older root paths.
-  Their live files must not be removed during this transition.
+  Backing creation and attachment are serialized and bounded. Before serving a
+  cache or preparing a VM, validate private ownership, the backing/mount identity,
+  actual case-sensitive lookup, and free space on both the host and mounted
+  volume. The existing 2 GiB headroom floor applies to both. Unsupported, foreign,
+  symlinked, or mismatched backing state fails clearly; never reformat, resize,
+  or silently substitute a filesystem. On Linux the native backing must likewise
+  pass the case-sensitivity check. VM CPU, memory, scratch, and network limits
+  are unchanged.
+
+  Export fresh seeds rather than copying old case-folded generations. Old caches
+  and existing sessions keep their paths; they are never migrated or reused for
+  new launches. Docker-unavailable fallback accepts only complete v5 generations
+  on verified backing. The volume remains mounted across CLI exits and VM cleanup
+  because detached or concurrent VMMs may still use it. Subsequent launches may
+  reattach the same validated backing after a host restart. No automatic unmount,
+  growth, cache collection, or deletion of an unknown mount is permitted.
 
   Private roots remain available after an intentional detach and are recorded in
   session handles. Cleanup requires confirmed VMM shutdown; failed attribution or

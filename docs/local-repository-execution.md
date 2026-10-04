@@ -107,6 +107,16 @@ Before boot, the private verifier clone receives a fixed `/etc/hosts` mapping fo
 to `127.0.0.1` and `::1`, so local test servers can resolve loopback without DNS. The cached
 image seed is unchanged; the verifier still has no egress network or external DNS access.
 
+Native rootfs preparation uses validated case-sensitive backing. On macOS, a private
+64 GiB APFS sparse bundle holds fresh `repository-images-v2` seeds and their private
+runtime clones on the same volume. Old `repository-images-v1` seeds are not migrated
+or reused; existing sessions retain their paths. Creation, attachment, and backing
+validation consume the original preparation deadline and obey cancellation. Preparation admission requires the existing 2 GiB free-space floor on both
+host and volume. Full, unknown,
+foreign, or case-folded backing fails without automatic growth or fallback. The
+backing remains mounted for concurrent and detached VMMs. This storage change adds
+no credentials or capabilities and changes no VM CPU, memory, scratch, or network limit.
+
 ## Credentials and transport
 
 The invocation receives a fresh home containing generated configuration and allowlisted synthetic

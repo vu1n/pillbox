@@ -2,7 +2,7 @@
 //! trees only; neither a guest nor a cleanup path may write through to that seed.
 
 use std::ops::Deref;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{ensure, Context, Result};
@@ -23,7 +23,15 @@ impl PrivateRootfs {
             super::plain_directory(runtimes),
             "private rootfs namespace must be a plain directory"
         );
+        ensure!(
+            std::fs::symlink_metadata(runtimes)?.uid() == unsafe { libc::geteuid() },
+            "private rootfs namespace has a foreign owner"
+        );
         crate::paths::ensure_mode_0700(runtimes)?;
+        ensure!(
+            std::fs::symlink_metadata(base)?.dev() == std::fs::symlink_metadata(runtimes)?.dev(),
+            "rootfs seed and private clone destination must share one filesystem"
+        );
         let directory = tempfile::Builder::new()
             .prefix("vm-")
             .permissions(std::fs::Permissions::from_mode(0o700))
@@ -62,7 +70,19 @@ impl Deref for PrivateRootfs {
 }
 
 pub(super) fn remove_owned(root: &Path) -> Result<()> {
-    remove_at(root, &super::krun_cache_dir()?.join("vm-rootfs"))
+    let krun = super::rootfs_backing::RootfsBacking::krun_dir()?;
+    let legacy = krun.join("vm-rootfs");
+    let new = krun.join("case-sensitive-rootfs/vm-rootfs");
+    if root.parent().and_then(Path::parent) == Some(legacy.as_path()) {
+        return remove_at(root, &legacy);
+    }
+    ensure!(
+        root.parent().and_then(Path::parent) == Some(new.as_path()),
+        "refuse to remove a rootfs outside a known private VM namespace"
+    );
+    let backing = super::rootfs_backing::RootfsBacking::reopen(&krun)?;
+    backing.ensure_same_device(&new)?;
+    remove_at(root, &new)
 }
 
 fn remove_at(root: &Path, runtimes: &Path) -> Result<()> {
@@ -243,6 +263,29 @@ mod tests {
         drop(root);
         assert!(!path.exists());
     }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn recorded_new_root_is_preserved_when_backing_is_unmounted() {
+        crate::test_util::with_isolated_home("unmounted-native-rootfs", || {
+            let prior_home = std::env::var_os("HOME").unwrap();
+            let canonical_home = fs::canonicalize(&prior_home).unwrap();
+            std::env::set_var("HOME", &canonical_home);
+            let krun = super::super::rootfs_backing::RootfsBacking::krun_dir().unwrap();
+            let root = krun.join("case-sensitive-rootfs/vm-rootfs/vm-test/rootfs");
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join("evidence"), b"retain").unwrap();
+            assert!(remove_owned(&root).is_err());
+            assert_eq!(fs::read(root.join("evidence")).unwrap(), b"retain");
+            let legacy = krun.join("vm-rootfs/vm-legacy/rootfs");
+            fs::create_dir_all(&legacy).unwrap();
+            fs::write(legacy.join("evidence"), b"old private clone").unwrap();
+            remove_owned(&legacy).unwrap();
+            assert!(!legacy.exists());
+            assert!(!krun.join("case-sensitive-rootfs.sparsebundle").exists());
+            std::env::set_var("HOME", prior_home);
+        });
+    }
     #[test]
     #[ignore = "requires signed libkrun binary and freshly exported offline runner rootfs"]
     fn live_concurrent_and_successor_vm_roots_are_isolated() {
@@ -256,9 +299,22 @@ mod tests {
         fs::create_dir(&probe).unwrap();
         assert!(!base.join("tmp/pb-isolation-secret").exists());
         assert!(!base.join("etc/pb-isolation-a").exists());
-        let runtimes = fixture.path().join("runtimes");
+        let backing = super::super::rootfs_backing::RootfsBacking::reopen(
+            &super::super::rootfs_backing::RootfsBacking::krun_dir().unwrap(),
+        )
+        .unwrap();
+        backing.ensure_same_device(&base).unwrap();
+        let runtimes = backing
+            .namespace(
+                "vm-rootfs",
+                super::super::rootfs_backing::RootfsBacking::ordinary_deadline().unwrap(),
+                &|| false,
+            )
+            .unwrap();
         let a = PrivateRootfs::fork(&base, &runtimes).unwrap();
         let b = PrivateRootfs::fork(&base, &runtimes).unwrap();
+        let a_owner = a.root.parent().unwrap().to_path_buf();
+        let b_owner = b.root.parent().unwrap().to_path_buf();
         let run = move |mut root: PrivateRootfs, script: &str, spec_path: PathBuf| {
             let spec = super::super::VmSpec {
                 rootfs: root.to_string_lossy().into_owned(),
@@ -317,6 +373,7 @@ mod tests {
         fs::write(probe.join("release"), "stop A").unwrap();
         owner_a.join().unwrap();
         let successor = PrivateRootfs::fork(&base, &runtimes).unwrap();
+        let successor_owner = successor.root.parent().unwrap().to_path_buf();
         run(
             successor,
             &format!("{clean} && touch /probe/successor-isolated"),
@@ -326,6 +383,12 @@ mod tests {
         assert!(!base.join("tmp/pb-isolation-secret").exists());
         assert!(!base.join("etc/pb-isolation-a").exists());
         assert!(!base.join("etc/pb-isolation-b").exists());
-        assert_eq!(fs::read_dir(&runtimes).unwrap().count(), 0);
+        for owner in [a_owner, b_owner, successor_owner] {
+            assert!(
+                !owner.exists(),
+                "stopped VM root remains: {}",
+                owner.display()
+            );
+        }
     }
 }

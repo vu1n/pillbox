@@ -88,6 +88,17 @@ PTY-free exec channel an orchestrator drives. Docker-backed today.
 | `pillbox sandbox list [--json]` | List sandboxes in the current pillbox. |
 | `pillbox sandbox destroy ID` | Kill the sandbox container and remove the record. |
 
+### Structured run ownership
+
+Local structured one-shot runs (`pi` and `cursor`) keep a lifetime socket to their
+supervising CLI. The VMM arms its watcher before guest or egress work starts. If
+the CLI exits or is killed, including SIGTERM and SIGKILL, the VMM terminates its
+own process group; a session record does not transfer ownership. Normal return
+also confirms teardown before reporting a result. This adds no run deadline.
+
+Explicit detached sessions and server-mode sessions retain their existing
+persistent ownership; `session attach` may still detach with SIGTERM.
+
 ### `pillbox run` flags
 
 | Flag | Default | Purpose |

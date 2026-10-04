@@ -5,7 +5,7 @@ adr-002-docker-backend-deleted:
 adr-003-qemu-parked:
   latest: 1
 adr-004-vault-broker-oauth:
-  latest: 1
+  latest: 2
 adr-005-docs-governance:
   latest: 1
 adr-006-rustic-cache-variant-gated:
@@ -23,17 +23,17 @@ dx-zero-config-local:
 gateway-no-daemon:
   latest: 1
 libkrun-env-fork-substrate:
-  latest: 1
+  latest: 2
 managed-store-of-record:
   latest: 1
 managed-tier-do-gateway:
-  latest: 3
+  latest: 4
 optimization-external-substrate-primitives:
   latest: 1
 remote-backend-plane-removed:
   latest: 1
 secret-on-disk-0600:
-  latest: 1
+  latest: 2
 session-event-log-spine:
   latest: 1
 stable-exit-codes:
@@ -41,6 +41,6 @@ stable-exit-codes:
 substrate-plane-livesession:
   latest: 1
 vault-egress-default-deny:
-  latest: 1
+  latest: 2
 workspace-ingest-sovereignty:
-  latest: 1
+  latest: 2

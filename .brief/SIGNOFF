@@ -273,3 +273,9 @@ gateway-no-daemon conforms: no coordinator or log-writer change; commands/sessio
 optimization-external-substrate-primitives conforms: `session score` and the Scored reward channel are untouched; only the `session started` verb is removed.
 remote-backend-plane-removed conforms: deleting the ACP spike adds no URL-transport backend; sandbox/mod.rs keeps only local and managed backends.
 substrate-plane-livesession conforms: LiveSession, Caps and select_backend are unchanged; the deleted ACP spike was never a LiveSession impl.
+vault-broker-oauth amend-proposed: add signoff: required (security boundary; brief v0.3.0 opt-in)
+libkrun-env-fork-substrate amend-proposed: add signoff: required (security boundary; brief v0.3.0 opt-in)
+secret-on-disk-0600 amend-proposed: add signoff: required (security boundary; brief v0.3.0 opt-in)
+vault-egress-default-deny amend-proposed: add signoff: required (security boundary; brief v0.3.0 opt-in)
+workspace-ingest-sovereignty amend-proposed: add signoff: required (security boundary; brief v0.3.0 opt-in)
+managed-tier-do-gateway amend-proposed: add signoff: required (cost boundary: no custom DO; brief v0.3.0 opt-in)

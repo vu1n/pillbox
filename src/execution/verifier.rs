@@ -325,7 +325,7 @@ def libc_call(name, *args):
 
 def prepare_workspace(config):
     for path, options in ((b'/workspace', b'size=134217728,mode=0700'),
-                          (b'/tmp', b'size=67108864,mode=1777')):
+                          (b'/tmp', b'size=134217728,mode=1777')):
         meta = os.lstat(path)
         require(stat.S_ISDIR(meta.st_mode) and meta.st_uid == 0, 'invalid scratch mountpoint')
         # MS_NOSUID | MS_NODEV. Scratch must not touch the host-backed rootfs.
@@ -828,6 +828,33 @@ print(json.dumps([scope['ROOT'] + '/verifier-supervisor.py', scope['EVALUATOR_PA
                 REPORT_PORT
             ])
         );
+    }
+
+    #[test]
+    fn guest_mounts_separate_bounded_scratch_before_reading_input() {
+        let (_, config) = fixture();
+        let body = r#"import types
+mode = scope['stat'].S_IFDIR | 0o755
+mountpoints = (b'/workspace', b'/tmp')
+def lstat(path):
+    if path in mountpoints:
+        return types.SimpleNamespace(st_mode=mode, st_uid=0)
+    raise RuntimeError('stop after mounts')
+scope['os'] = types.SimpleNamespace(lstat=lstat)
+calls = []
+def capture(name, source, path, filesystem, flags, options):
+    calls.append((name, source, path, filesystem, flags.value, options))
+scope['libc_call'] = capture
+try:
+    scope['prepare_workspace'](config)
+    raise AssertionError('did not inspect input after mounting scratch')
+except RuntimeError as error:
+    assert str(error) == 'stop after mounts'
+assert calls == [
+    ('mount', b'tmpfs', b'/workspace', b'tmpfs', 6, b'size=134217728,mode=0700'),
+    ('mount', b'tmpfs', b'/tmp', b'tmpfs', 6, b'size=134217728,mode=1777'),
+]"#;
+        assert!(python_fixture(body, &config).is_empty());
     }
 
     #[test]

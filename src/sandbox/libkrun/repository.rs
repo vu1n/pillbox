@@ -40,6 +40,7 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const GUEST_RUNTIME: &str = "/opt/pillbox-execution";
 const GUEST_HOME: &str = "/home/pillbox";
 const GUEST_CODEX_HOME: &str = "/home/pillbox/.codex";
+const OFFLINE_LOCALHOST_HOSTS: &[u8] = b"127.0.0.1 localhost\n::1 localhost\n";
 
 /// The caller has already admitted this invocation and pre-refreshed TokenStore.
 /// No Debug or Serialize implementation: access_release contains a real token.
@@ -561,6 +562,7 @@ fn verifier_spec(rootfs: &Path, owner: &Path, rpc: &Path, remaining_ms: u64) -> 
 }
 
 fn prepare_verifier_guest(rootfs: &Path, input: &VerifierInput) -> Result<()> {
+    prepare_verifier_hosts(rootfs)?;
     for path in [GUEST_RUNTIME, GUEST_HOME, "/workspace", "/tmp"] {
         fresh_directory(rootfs, path)?;
     }
@@ -586,6 +588,81 @@ fn prepare_verifier_guest(rootfs: &Path, input: &VerifierInput) -> Result<()> {
     // Only freshly generated subtrees receive guest-root metadata. The image
     // cache and the rest of the private rootfs retain their original metadata.
     prepare_generated_metadata(rootfs, &[GUEST_RUNTIME, GUEST_HOME, "/workspace", "/tmp"])
+}
+
+fn prepare_verifier_hosts(rootfs: &Path) -> Result<()> {
+    let etc_path = rootfs.join("etc");
+    let etc_metadata = fs::symlink_metadata(&etc_path).context("inspect verifier clone /etc")?;
+    ensure!(
+        etc_metadata.is_dir() && !etc_metadata.file_type().is_symlink(),
+        "verifier clone /etc is not a plain directory"
+    );
+    let owner = unsafe { libc::geteuid() };
+    ensure!(
+        etc_metadata.uid() == owner,
+        "verifier clone /etc has a different owner"
+    );
+    let etc = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(&etc_path)
+        .context("open verifier clone /etc")?;
+    let opened_etc = etc.metadata()?;
+    ensure!(
+        opened_etc.is_dir()
+            && opened_etc.uid() == owner
+            && opened_etc.dev() == etc_metadata.dev()
+            && opened_etc.ino() == etc_metadata.ino(),
+        "verifier clone /etc changed during preparation"
+    );
+    let mut hosts_stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe {
+        libc::fstatat(
+            etc.as_raw_fd(),
+            c"hosts".as_ptr(),
+            &mut hosts_stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error()).context("inspect verifier clone /etc/hosts");
+    }
+    ensure!(
+        hosts_stat.st_mode & libc::S_IFMT == libc::S_IFREG
+            && hosts_stat.st_uid == owner
+            && hosts_stat.st_dev as u64 == opened_etc.dev()
+            && hosts_stat.st_nlink == 1,
+        "verifier clone /etc/hosts is not a private regular file"
+    );
+    let fd = unsafe {
+        libc::openat(
+            etc.as_raw_fd(),
+            c"hosts".as_ptr(),
+            libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("open verifier clone /etc/hosts");
+    }
+    let mut hosts = unsafe { File::from_raw_fd(fd) };
+    let opened_hosts = hosts.metadata()?;
+    ensure!(
+        opened_hosts.is_file()
+            && opened_hosts.uid() == owner
+            && opened_hosts.dev() == opened_etc.dev()
+            && opened_hosts.ino() == hosts_stat.st_ino as u64
+            && opened_hosts.nlink() == 1,
+        "verifier clone /etc/hosts changed during preparation"
+    );
+    hosts
+        .set_len(0)
+        .context("clear verifier clone /etc/hosts")?;
+    hosts
+        .write_all(OFFLINE_LOCALHOST_HOSTS)
+        .context("write verifier clone localhost mapping")?;
+    hosts
+        .set_permissions(fs::Permissions::from_mode(0o644))
+        .context("make verifier clone localhost mapping readable")
 }
 
 fn prepare_generated_metadata(rootfs: &Path, paths: &[&str]) -> Result<()> {
@@ -2664,6 +2741,8 @@ except RuntimeError:
     fn verifier_materializes_exact_tree_and_sealed_files_in_fresh_directories() {
         let directory = tempfile::tempdir().unwrap();
         let rootfs = directory.path().canonicalize().unwrap();
+        fs::create_dir(rootfs.join("etc")).unwrap();
+        fs::write(rootfs.join("etc/hosts"), b"").unwrap();
         fs::create_dir_all(rootfs.join("home/pillbox/.codex")).unwrap();
         fs::write(rootfs.join("home/pillbox/.codex/auth.json"), b"ambient").unwrap();
         fs::create_dir_all(rootfs.join("opt/pillbox-execution")).unwrap();
@@ -2672,6 +2751,10 @@ except RuntimeError:
         let digest = input.tree.digest().to_owned();
         prepare_verifier_guest(&rootfs, &input).unwrap();
         assert_eq!(input.tree.digest(), digest);
+        assert_eq!(
+            fs::read(rootfs.join("etc/hosts")).unwrap(),
+            OFFLINE_LOCALHOST_HOSTS
+        );
         assert_eq!(
             fs::read(rootfs.join(verifier::SOURCE_PATH.trim_start_matches('/'))).unwrap(),
             input.verifier.definition.source.as_bytes()
@@ -2726,6 +2809,44 @@ except RuntimeError:
         );
         assert!(!rootfs.join("opt/pillbox-execution/ca.key").exists());
         assert!(!rootfs.join("opt/pillbox-execution/ca.crt").exists());
+    }
+
+    #[test]
+    fn verifier_localhost_mapping_changes_only_the_private_clone() {
+        let fixture = tempfile::tempdir().unwrap();
+        let seed = fixture.path().join("seed");
+        fs::create_dir_all(seed.join("etc")).unwrap();
+        fs::write(seed.join("etc/hosts"), b"").unwrap();
+        fs::write(seed.join("etc/resolv.conf"), b"").unwrap();
+        let clone = fixture.path().join("clone");
+        crate::workspace::cow::cow_clone_dir(&seed, &clone).unwrap();
+
+        prepare_verifier_hosts(&clone).unwrap();
+        assert_eq!(
+            fs::read(clone.join("etc/hosts")).unwrap(),
+            OFFLINE_LOCALHOST_HOSTS
+        );
+        assert_eq!(fs::read(seed.join("etc/hosts")).unwrap(), b"");
+        assert_eq!(fs::read(clone.join("etc/resolv.conf")).unwrap(), b"");
+        assert_eq!(fs::read(seed.join("etc/resolv.conf")).unwrap(), b"");
+    }
+
+    #[test]
+    fn verifier_localhost_mapping_rejects_symlink_without_touching_target() {
+        let fixture = tempfile::tempdir().unwrap();
+        let rootfs = fixture.path().join("rootfs");
+        let outside = fixture.path().join("outside-hosts");
+        fs::create_dir_all(rootfs.join("etc")).unwrap();
+        fs::write(&outside, b"outside").unwrap();
+        std::os::unix::fs::symlink(&outside, rootfs.join("etc/hosts")).unwrap();
+
+        assert!(prepare_verifier_hosts(&rootfs).is_err());
+        assert_eq!(fs::read(&outside).unwrap(), b"outside");
+        fs::remove_file(rootfs.join("etc/hosts")).unwrap();
+        fs::remove_dir(rootfs.join("etc")).unwrap();
+        std::os::unix::fs::symlink(fixture.path(), rootfs.join("etc")).unwrap();
+        assert!(prepare_verifier_hosts(&rootfs).is_err());
+        assert_eq!(fs::read(&outside).unwrap(), b"outside");
     }
 
     #[cfg(target_os = "macos")]

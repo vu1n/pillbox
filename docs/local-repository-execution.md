@@ -103,6 +103,9 @@ The verifier supervisor mounts separate 128 MiB tmpfs volumes at `/workspace` (m
 `/tmp` (mode 1777), both with `MS_NOSUID | MS_NODEV`, before the unprivileged evaluator starts.
 The root filesystem is remounted read-only. These scratch bounds do not alter the sealed verifier
 definition, input snapshot limit, or the VM's memory, CPU, PID, and network restrictions.
+Before boot, the private verifier clone receives a fixed `/etc/hosts` mapping for `localhost`
+to `127.0.0.1` and `::1`, so local test servers can resolve loopback without DNS. The cached
+image seed is unchanged; the verifier still has no egress network or external DNS access.
 
 ## Credentials and transport
 

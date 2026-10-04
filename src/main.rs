@@ -1228,6 +1228,28 @@ fn preset_banner(name: &str, p: &config::Preset) -> String {
     }
 }
 
+fn validate_bookmark_backend(opts: &RunOpts, backend: &str) -> Result<()> {
+    if opts.from_bookmark.is_some() && backend != crate::session::BACKEND_LIBKRUN {
+        return Err(PillboxError::usage(
+            "run",
+            "bookmark forks require the local libkrun microVM backend",
+        )
+        .with_next("use a libkrun-enabled Pillbox build with PILLBOX_BACKEND=libkrun")
+        .into());
+    }
+    Ok(())
+}
+
+fn apply_default_workspace(resolved: &Pillbox, opts: &mut RunOpts) {
+    // A bookmark restores into a host path only when a workspace override was supplied.
+    // Preserve None through dispatch so the backend can choose its immutable base cache.
+    if opts.workspace.is_none() && opts.from_bookmark.is_none() {
+        if let crate::pillbox::Scope::Project { source_dir, .. } = &resolved.scope {
+            opts.workspace = Some(source_dir.clone());
+        }
+    }
+}
+
 fn dispatch_run(resolved: &Pillbox, agent: Option<String>, mut opts: RunOpts) -> Result<()> {
     // Resolve the agent + apply pillbox.toml defaults; the backend
     // selection happens below.
@@ -1257,17 +1279,7 @@ fn dispatch_run(resolved: &Pillbox, agent: Option<String>, mut opts: RunOpts) ->
         opts.model = crate::config::resolve_run_config(resolved).model;
     }
 
-    // Workspace default: a PROJECT pillbox carries its repo path (`source_dir`),
-    // so `pillbox run --pillbox sakana` (or `pillbox project sakana`) mounts that
-    // repo from ANYWHERE — not just from inside it. `--workspace` still overrides;
-    // the global pillbox has no `source_dir`, so it falls through to the backend's
-    // cwd default. cwd-discovery already has `source_dir == cwd`, so this is a no-op
-    // there — only by-name invocation changes.
-    if opts.workspace.is_none() {
-        if let crate::pillbox::Scope::Project { source_dir, .. } = &resolved.scope {
-            opts.workspace = Some(source_dir.clone());
-        }
-    }
+    apply_default_workspace(resolved, &mut opts);
 
     // `--json` emits the started-session record; only `--detach` runs and
     // structured agents persist one. A foreground PTY run has nothing to emit,
@@ -1288,6 +1300,7 @@ fn dispatch_run(resolved: &Pillbox, agent: Option<String>, mut opts: RunOpts) ->
     crate::events::hint_workshop_if_unconfigured();
 
     let backend = crate::sandbox::select_backend();
+    validate_bookmark_backend(&opts, backend.id())?;
     if !opts.memory {
         return backend.run(spec, opts, resolved);
     }
@@ -1409,6 +1422,55 @@ mod tests {
         assert_eq!(model.as_deref(), Some("openai/gpt-5.6-sol"));
         assert_eq!(profile.as_deref(), Some("sol"));
         assert_eq!(reasoning_effort, Some(contract::ReasoningEffort::High));
+    }
+
+    #[test]
+    fn bookmark_dispatch_preserves_explicit_workspace_intent() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("project");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("README"), "uncommitted work").unwrap();
+        let resolved = Pillbox {
+            scope: crate::pillbox::Scope::Project {
+                key: "fixture".into(),
+                source_dir: source.clone(),
+            },
+            state_dir: directory.path().join("state"),
+            meta: None,
+        };
+        for (arguments, expected) in [
+            (vec!["pillbox", "run", "--from-bookmark", "base"], None),
+            (
+                vec![
+                    "pillbox",
+                    "run",
+                    "--from-bookmark",
+                    "base",
+                    "--workspace",
+                    "/explicit",
+                ],
+                Some(std::path::PathBuf::from("/explicit")),
+            ),
+            (vec!["pillbox", "run"], Some(source.clone())),
+        ] {
+            let (_, mut opts) = run_opts(Cli::try_parse_from(arguments).unwrap());
+            apply_default_workspace(&resolved, &mut opts);
+            assert_eq!(opts.workspace, expected);
+            assert!(validate_bookmark_backend(&opts, crate::session::BACKEND_LIBKRUN).is_ok());
+            for backend in [
+                crate::session::BACKEND_DOCKER,
+                crate::session::BACKEND_MANAGED,
+            ] {
+                assert_eq!(
+                    validate_bookmark_backend(&opts, backend).is_err(),
+                    opts.from_bookmark.is_some()
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(source.join("README")).unwrap(),
+                "uncommitted work"
+            );
+        }
     }
 
     fn run_opts(cli: Cli) -> (Option<String>, RunOpts) {

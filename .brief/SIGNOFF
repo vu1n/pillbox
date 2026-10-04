@@ -237,3 +237,8 @@ libkrun-is-the-backend conforms: Structured one-shot runs reuse the local VMM li
 libkrun-env-fork-substrate conforms: Structured supervision adds only a host ownership socket, preserving guest environment, credential delivery, egress policy, and persistent detached/server sessions.
 docs-governance conforms: The command guide records supervised structured ownership and its distinction from intentional detach.
 workspace-ingest-sovereignty conforms: Structured VMM supervision changes only host process ownership and terminal failure recording; workspace ingest, the pillbox-owned secret denylist, exclusions reporting, and guest shares remain unchanged.
+
+libkrun-is-the-backend conforms: Bookmark forks reject unsupported non-microVM placement before backend launch; libkrun remains the supported local backend.
+libkrun-env-fork-substrate conforms: Bookmark dispatch preserves explicit workspace intent without changing guest environment, credential delivery, or egress policy.
+workspace-ingest-sovereignty conforms: Implicit bookmark forks use the immutable base cache instead of restoring over the project source; the pillbox-controlled secret exclusion and reporting rules remain unchanged.
+docs-governance conforms: The command guide records bookmark destination intent and the supported microVM boundary alongside the CLI change.

@@ -402,7 +402,12 @@ fn launch_base(
 
     let workspace_host = match &opts.workspace {
         Some(p) => p.clone(),
-        None => std::env::current_dir().context("resolve current working directory")?,
+        None => match &resolved.scope {
+            crate::pillbox::Scope::Project { source_dir, .. } => source_dir.clone(),
+            crate::pillbox::Scope::Global => {
+                std::env::current_dir().context("resolve current working directory")?
+            }
+        },
     };
     // Pick the directory the guest's CoW clone forks from:
     //  • --from-bookmark WITHOUT an explicit --workspace (the dispatch/default

@@ -1648,8 +1648,21 @@ mod tests {
             .expect("another session has an independent producer lock");
 
         drop(held);
-        DetachedProducerLock::try_acquire(first_dir.path())
-            .expect("dropping the producer releases its session lock");
+        // Parallel tests can fork while the lock is held. CLOEXEC releases an
+        // inherited descriptor at exec, so allow that transient owner to finish.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            match DetachedProducerLock::try_acquire(first_dir.path()) {
+                Ok(_) => break,
+                Err(error) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "dropping the producer must release its session lock: {error:#}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
     }
 
     #[test]

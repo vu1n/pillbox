@@ -249,3 +249,8 @@ workspace-ingest-sovereignty conforms: Root image isolation leaves workspace for
 docs-governance conforms: Canonical command and substrate guides document private root lifetime, confirmed teardown, and the v4 cache migration alongside the implementation.
 
 runner-image-tags-name-roles conforms: The build script only advances the local rootfs cache namespace to v4; dev, latest, immutable release tags, and configuration pointer roles are unchanged.
+
+gateway-no-daemon conforms: The producer-lock regression waits for transient inherited descriptors to close; production locking and ephemeral writer ownership are unchanged.
+optimization-external-substrate-primitives conforms: Test-only lifecycle polling changes no grader, reward, content sharing, or optimization contract.
+dx-zero-config-local conforms: Test-only lock polling preserves local stream surfaces and reader parity.
+substrate-plane-livesession conforms: Test-only lifecycle polling changes no LiveSession capabilities or backend dispatch.

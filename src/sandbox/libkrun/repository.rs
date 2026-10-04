@@ -2123,8 +2123,16 @@ except RuntimeError:
                 .unwrap();
             assert_eq!(status.signal(), Some(signal));
             let deadline = Instant::now() + Duration::from_secs(3);
-            while group_exists(vmm).unwrap() {
-                assert!(Instant::now() < deadline, "VMM group survived owner death");
+            loop {
+                match group_exists(vmm) {
+                    Ok(false) => break,
+                    // Darwin can return EPERM while an orphaned zombie awaits
+                    // reaping. It is not proof of disappearance; keep polling.
+                    result => assert!(
+                        Instant::now() < deadline,
+                        "VMM group survived owner death or could not be checked: {result:?}"
+                    ),
+                }
                 std::thread::sleep(POLL);
             }
             assert!(unrelated.exited().unwrap().is_none());

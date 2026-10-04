@@ -279,3 +279,7 @@ secret-on-disk-0600 amend-proposed: add signoff: required (security boundary; br
 vault-egress-default-deny amend-proposed: add signoff: required (security boundary; brief v0.3.0 opt-in)
 workspace-ingest-sovereignty amend-proposed: add signoff: required (security boundary; brief v0.3.0 opt-in)
 managed-tier-do-gateway amend-proposed: add signoff: required (cost boundary: no custom DO; brief v0.3.0 opt-in)
+
+libkrun-is-the-backend conforms: The standalone project verifier probe is feature-gated to libkrun and reuses the offline verifier launcher; bounded final diagnostics preserve evidence after teardown without adding a backend or backend-selection fallback.
+stable-exit-codes conforms: A verifier fail and an infrastructure error retain runtime exit code 1; malformed probe input remains a CLI error and no documented exit category is renumbered.
+docs-governance conforms: The canonical command and bounded local repository execution guides document the separate operator probe contract alongside its implementation, without changing any active decision.

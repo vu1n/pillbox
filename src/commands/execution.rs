@@ -30,6 +30,14 @@ pub(crate) enum ExecutionAction {
         #[arg(long)]
         commit: String,
     },
+    /// Run a sealed offline verifier against one complete committed project tree.
+    #[cfg(feature = "libkrun")]
+    VerifyProject {
+        #[arg(long)]
+        probe: PathBuf,
+        #[arg(long)]
+        repository: PathBuf,
+    },
 }
 
 pub(crate) fn dispatch(pb: &Pillbox, action: ExecutionAction) -> Result<()> {
@@ -72,6 +80,8 @@ pub(crate) fn dispatch(pb: &Pillbox, action: ExecutionAction) -> Result<()> {
         ExecutionAction::Status { invocation_id } => store.status(&invocation_id)?,
         ExecutionAction::Cancel { invocation_id } => store.cancel(&invocation_id)?,
         ExecutionAction::Snapshot { .. } => unreachable!(),
+        #[cfg(feature = "libkrun")]
+        ExecutionAction::VerifyProject { .. } => unreachable!("probe bypasses Pillbox resolution"),
     };
     println!(
         "{}",

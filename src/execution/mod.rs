@@ -8,6 +8,8 @@ pub(crate) mod files;
 pub(crate) mod local;
 #[cfg(any(feature = "libkrun", test))]
 pub(crate) mod native;
+#[cfg(feature = "libkrun")]
+pub(crate) mod probe;
 pub(crate) mod protocol;
 pub(crate) mod snapshot;
 pub(crate) mod store;

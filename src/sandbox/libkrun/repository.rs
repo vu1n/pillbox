@@ -127,6 +127,12 @@ pub(crate) struct OwnedVm {
     sockets: Option<TempDir>,
 }
 
+pub(crate) struct VmDiagnostics {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) truncated: bool,
+    pub(crate) error: Option<anyhow::Error>,
+}
+
 impl OwnedVm {
     pub(crate) fn connect_rpc(&mut self, cancelled: &dyn Fn() -> bool) -> Result<UnixStream> {
         loop {
@@ -170,6 +176,41 @@ impl OwnedVm {
         let mut output = self.process.stdout_bytes.clone();
         output.extend_from_slice(&self.process.stderr_bytes);
         Ok(output)
+    }
+
+    /// Capture the queued tail only after the owned group is confirmed gone.
+    /// On an unconfirmed stop or read failure, retain the already bounded prefix.
+    pub(crate) fn final_diagnostics(&mut self) -> VmDiagnostics {
+        let mut truncated = self.process.output_limit_exceeded;
+        let mut error = None;
+        if self.process.stopped && !truncated {
+            let used = self.process.stdout_bytes.len() + self.process.stderr_bytes.len();
+            let mut remaining = self.process.output_limit.saturating_sub(used as u64);
+            match drain_final_pipe(
+                &mut self.process.stdout,
+                &mut self.process.stdout_bytes,
+                &mut remaining,
+            ) {
+                Ok(true) => truncated = true,
+                Ok(false) => match drain_final_pipe(
+                    &mut self.process.stderr,
+                    &mut self.process.stderr_bytes,
+                    &mut remaining,
+                ) {
+                    Ok(true) => truncated = true,
+                    Ok(false) => {}
+                    Err(failure) => error = Some(failure),
+                },
+                Err(failure) => error = Some(failure),
+            }
+        }
+        let mut bytes = self.process.stdout_bytes.clone();
+        bytes.extend_from_slice(&self.process.stderr_bytes);
+        VmDiagnostics {
+            bytes,
+            truncated,
+            error,
+        }
     }
 
     /// Must succeed before capturing results. Closing ownership also covers a VMM
@@ -815,6 +856,7 @@ struct OwnedProcess {
     stdout_bytes: Vec<u8>,
     stderr_bytes: Vec<u8>,
     output_limit: u64,
+    output_limit_exceeded: bool,
     status: Option<ExitStatus>,
     stopped: bool,
 }
@@ -866,6 +908,7 @@ impl OwnedProcess {
             stdout_bytes: vec![],
             stderr_bytes: vec![],
             output_limit,
+            output_limit_exceeded: false,
             status: None,
             stopped: false,
         };
@@ -898,12 +941,14 @@ impl OwnedProcess {
             &mut self.stdout,
             &mut self.stdout_bytes,
             self.output_limit.saturating_sub(used as u64),
+            &mut self.output_limit_exceeded,
         )?;
         let used = self.stdout_bytes.len() + self.stderr_bytes.len();
         drain_pipe(
             &mut self.stderr,
             &mut self.stderr_bytes,
             self.output_limit.saturating_sub(used as u64),
+            &mut self.output_limit_exceeded,
         )
     }
 
@@ -1001,7 +1046,12 @@ pub(super) fn group_exists(group: i32) -> Result<bool> {
     }
 }
 
-fn drain_pipe<T: Read>(pipe: &mut Option<T>, output: &mut Vec<u8>, remaining: u64) -> Result<()> {
+fn drain_pipe<T: Read>(
+    pipe: &mut Option<T>,
+    output: &mut Vec<u8>,
+    remaining: u64,
+    output_limit_exceeded: &mut bool,
+) -> Result<()> {
     let Some(reader) = pipe.as_mut() else {
         return Ok(());
     };
@@ -1013,11 +1063,12 @@ fn drain_pipe<T: Read>(pipe: &mut Option<T>, output: &mut Vec<u8>, remaining: u6
             pipe.take();
         }
         Ok(count) => {
-            ensure!(
-                count as u64 <= remaining,
-                "owned process output limit exceeded"
-            );
-            output.extend_from_slice(&buffer[..count]);
+            let accepted = count.min(remaining as usize);
+            output.extend_from_slice(&buffer[..accepted]);
+            if count != accepted {
+                *output_limit_exceeded = true;
+                bail!("owned process output limit exceeded");
+            }
         }
         Err(error)
             if matches!(
@@ -1027,6 +1078,37 @@ fn drain_pipe<T: Read>(pipe: &mut Option<T>, output: &mut Vec<u8>, remaining: u6
         Err(error) => return Err(error).context("read owned process output"),
     }
     Ok(())
+}
+
+fn drain_final_pipe<T: Read>(
+    pipe: &mut Option<T>,
+    output: &mut Vec<u8>,
+    remaining: &mut u64,
+) -> Result<bool> {
+    let Some(reader) = pipe.as_mut() else {
+        return Ok(false);
+    };
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let size = buffer.len().min(remaining.saturating_add(1) as usize);
+        match reader.read(&mut buffer[..size]) {
+            Ok(0) => {
+                pipe.take();
+                return Ok(false);
+            }
+            Ok(count) if count as u64 > *remaining => {
+                output.extend_from_slice(&buffer[..*remaining as usize]);
+                *remaining = 0;
+                return Ok(true);
+            }
+            Ok(count) => {
+                output.extend_from_slice(&buffer[..count]);
+                *remaining -= count as u64;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error).context("read stopped owned process output"),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1918,6 +2000,80 @@ mod tests {
         process.stop_and_reap().unwrap();
         assert!(process.exited().unwrap().is_some());
         process.stop_and_reap().unwrap();
+    }
+
+    #[test]
+    fn final_diagnostics_drains_queued_output_after_owned_exit() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "dd if=/dev/zero bs=1024 count=12 2>/dev/null"]);
+        let process = OwnedProcess::spawn(&mut command, 64 * 1024, false).unwrap();
+        let mut vm = OwnedVm {
+            process,
+            owner: None,
+            rpc_listener: None,
+            deadline: Instant::now() + Duration::from_secs(2),
+            runtime: None,
+            sockets: None,
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while vm.process.stdout_bytes.len() < 8192 {
+            assert!(
+                Instant::now() < deadline,
+                "fixture did not emit initial chunk"
+            );
+            vm.process.drain().unwrap();
+            std::thread::sleep(POLL);
+        }
+        while vm.process.exited().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "fixture did not finish writing");
+            std::thread::sleep(POLL);
+        }
+        vm.stop_and_reap().unwrap();
+        let captured = vm.final_diagnostics();
+        assert!(captured.error.is_none());
+        assert!(!captured.truncated);
+        assert_eq!(captured.bytes, vec![0; 12 * 1024]);
+    }
+
+    #[test]
+    fn final_diagnostics_retains_full_prefix_after_output_overflow() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "while :; do printf '0123456789abcdef'; done"]);
+        let process = OwnedProcess::spawn(&mut command, 64 * 1024, false).unwrap();
+        let mut vm = OwnedVm {
+            process,
+            owner: None,
+            rpc_listener: None,
+            deadline: Instant::now() + Duration::from_secs(2),
+            runtime: None,
+            sockets: None,
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut saw_prior_prefix = false;
+        let error = loop {
+            assert!(
+                Instant::now() < deadline,
+                "fixture did not reach output bound"
+            );
+            match vm.process.drain() {
+                Ok(()) => {
+                    saw_prior_prefix |= !vm.process.stdout_bytes.is_empty();
+                    std::thread::sleep(POLL);
+                }
+                Err(error) => break error,
+            }
+        };
+        assert!(saw_prior_prefix);
+        assert!(error.to_string().contains("output limit"));
+        vm.stop_and_reap().unwrap();
+        let captured = vm.final_diagnostics();
+        assert!(captured.error.is_none());
+        assert!(captured.truncated);
+        assert_eq!(captured.bytes.len(), 64 * 1024);
+        assert!(captured
+            .bytes
+            .chunks_exact(16)
+            .all(|chunk| chunk == b"0123456789abcdef"));
     }
 
     #[test]

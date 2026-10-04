@@ -508,11 +508,21 @@ pillbox execution snapshot --repository /path/to/repo --commit FULL_GIT_OID
 pillbox execution execute --request request.json --repository /path/to/repo
 pillbox execution status INVOCATION_ID
 pillbox execution cancel INVOCATION_ID
+pillbox execution verify-project --probe probe.json --repository /absolute/path/to/repo
 ```
 
 Execute runs in the foreground; use another process for status/cancel. Matching retries return
 the durable original invocation. A changed request conflicts and a lost owner never resamples.
 Only the local microVM backend can execute; no backend fallback grants this capability.
+
+`verify-project` is a separate operator probe. Its closed manifest binds a full committed Git
+tree, expected complete snapshot digest, immutable verifier image, output ID, outer deadline,
+and sealed Python verifier. It launches only the offline libkrun verifier VM and loads no Pillbox
+project, session, or credentials; the existing immutable image cache is still used. Its JSON v1
+`project_verifier_probe` record includes the complete canonical probe digest, outer deadline,
+raw supervisor report, bounded final diagnostics, and parsed observation after VM teardown; it is
+not an execution/3 receipt. A failed verifier returns exit 1 with a `fail` observation. Transport,
+report, diagnostic, and teardown errors have no verdict. See [the probe contract](local-repository-execution.md#standalone-project-verifier-probe).
 
 ## Sealed local text execution
 

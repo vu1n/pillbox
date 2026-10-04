@@ -660,6 +660,8 @@ fn main() -> ExitCode {
     let result = run(cli);
     match result {
         Ok(()) => ExitCode::SUCCESS,
+        #[cfg(feature = "libkrun")]
+        Err(error) if error.is::<execution::probe::ProbeExit>() => ExitCode::from(1),
         Err(e) => errors::report(&e),
     }
 }
@@ -703,6 +705,12 @@ fn run(cli: Cli) -> Result<()> {
     let pillbox_arg = cli.pillbox.as_deref();
     match cli.command {
         Command::Execution { action } => {
+            #[cfg(feature = "libkrun")]
+            if let commands::execution::ExecutionAction::VerifyProject { probe, repository } =
+                action
+            {
+                return execution::probe::run(&probe, &repository);
+            }
             let resolved = Pillbox::resolve(pillbox_arg)?;
             commands::execution::dispatch(&resolved, action)
         }
@@ -1869,5 +1877,24 @@ mod tests {
                 "{secret_flag} must not be accepted (secrets are env-only)"
             );
         }
+    }
+
+    #[cfg(feature = "libkrun")]
+    #[test]
+    fn project_verifier_cli_bypasses_pillbox_resolution() {
+        let cli = Cli::try_parse_from([
+            "pillbox",
+            "--pillbox",
+            "definitely-absent-pillbox",
+            "execution",
+            "verify-project",
+            "--probe",
+            "/definitely-absent-probe.json",
+            "--repository",
+            "/tmp/repository",
+        ])
+        .unwrap();
+        let error = run(cli).unwrap_err();
+        assert!(error.to_string().contains("open probe manifest"));
     }
 }

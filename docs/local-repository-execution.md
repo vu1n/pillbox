@@ -159,6 +159,57 @@ result, and separate verifier session. Failure and owner-loss recovery preserve 
 Raw verifier report bytes (including malformed or partial reports) are stored and linked before
 interpretation, so a transport or parser failure remains inspectable without being called a verdict.
 
+## Standalone project verifier probe
+
+`pillbox execution verify-project --probe probe.json --repository /absolute/path/to/repo` is a
+credential-free, manually selected operator probe. It does not create an execution/3 claim,
+Pillbox session, builder result, or Huddles evidence receipt. The closed manifest is:
+
+```json
+{
+  "contract_version": "pillbox.project-verifier-probe/1",
+  "commit": "FULL_GIT_COMMIT_OID",
+  "snapshot_digest": "sha256:FULL_LOWERCASE_DIGEST",
+  "image_id": "sha256:FULL_LOWERCASE_VERIFIER_IMAGE_ID",
+  "output_id": "operator-chosen-identity",
+  "max_duration_ms": 600000,
+  "verifier": {
+    "verifier_id": "operator-chosen-identity",
+    "run_id": "operator-chosen-identity",
+    "definition_digest": "sha256:FULL_LOWERCASE_DEFINITION_DIGEST",
+    "definition": {
+      "runtime": "python3",
+      "source": "import subprocess\nraise SystemExit(subprocess.call(['npm', 'test']))\n",
+      "timeout_ms": 300000,
+      "max_output_bytes": 16384
+    }
+  }
+}
+```
+
+The source is illustrative; the chosen verifier image must contain `/usr/bin/python3` and every
+project test dependency. The verifier definition digest is the canonical SHA-256 of the complete
+`definition` object. The full Git commit and expected snapshot are checked before VM launch;
+dirty worktree bytes, symlinks, submodules, non-ASCII paths, files over 8 MiB, trees over 64 MiB,
+and more than 4,096 files are rejected. The probe derives `probe_digest` from the complete
+canonical closed manifest, including image, outer deadline, and sealed verifier source. It then
+derives `result_digest` from canonical JSON
+`{version, probe_digest, commit, output_id, result_snapshot_digest}`. These bind this operator
+result identity, not a builder-produced `RepositoryResult`.
+
+`max_duration_ms` is a finite outer limit for image preparation, guest boot and evaluation, must
+exceed the sealed evaluator timeout, and is at most one hour. The existing verifier VM remains
+two CPUs, 2 GiB RAM, no repository share or egress, with separate 128 MiB tmpfs volumes at
+`/workspace` and `/tmp`. The JSON v1 record includes full configuration identity, raw supervisor
+report bytes in base64 and SHA-256, the outer `max_duration_ms`, parsed
+exit/signal/timeout/output-limit and output bytes, and `teardown_confirmed`. Diagnostics capture
+drains queued host VMM output after confirmed stop/reap, retains at most the existing 64 KiB
+prefix, and marks `diagnostics_truncated` when output exceeds that bound. On an unconfirmed stop,
+the record retains the available prefix and error context without a verdict. Pass exits 0; a
+verifier fail exits 1 with a `fail` observation. Malformed report, transport or diagnostic failure,
+truncated diagnostics, or unconfirmed teardown is an infrastructure error with no verdict.
+The record is a manual probe, never a production execution or independent Huddles receipt.
+
 ## Verification record — 2026-09-22
 
 The [recorded offline proof](./local-repository-execution-offline-proof.json) contains the sealed

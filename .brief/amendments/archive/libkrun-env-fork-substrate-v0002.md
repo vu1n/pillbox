@@ -21,3 +21,8 @@ The guest must never hold the real credential; egress is MITM-swapped in a host-
 
 Keeping the ask here means any change to that code gets an explicit "still conforms"
 line that a reviewer reads, instead of passing silently.
+
+
+---
+ratified_rev: 0002
+ratified_by: Vu (approved in project chat 2026-10-04)

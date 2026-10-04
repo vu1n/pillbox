@@ -38,6 +38,10 @@ jobs:
           context: .
           file: runner/Dockerfile
           platforms: linux/${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ github.ref_name }}
           outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/pillbox-runner,push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=runner-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=runner-${{ matrix.arch }}

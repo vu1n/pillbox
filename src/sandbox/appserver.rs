@@ -454,31 +454,4 @@ mod tests {
         assert_eq!(approval_response("item/tool/requestUserInput"), None);
         assert_eq!(approval_response("account/chatgptAuthTokens/refresh"), None);
     }
-
-    #[test]
-    fn request_serializes_without_jsonrpc_field() {
-        // The wire requires the `jsonrpc` field OMITTED. Build the message the
-        // way Client::request/notify does and assert the shape.
-        let req = json!({ "id": 0, "method": "initialize", "params": {"clientInfo": {"name": "pillbox"}} });
-        let s = serde_json::to_string(&req).unwrap();
-        assert!(!s.contains("jsonrpc"), "must omit jsonrpc: {s}");
-        assert!(s.contains("\"method\":\"initialize\""));
-
-        let notif = json!({ "method": "initialized", "params": {} });
-        let s = serde_json::to_string(&notif).unwrap();
-        assert!(!s.contains("jsonrpc"));
-        assert!(!s.contains("\"id\""), "notification has no id: {s}");
-    }
-
-    #[test]
-    fn turn_start_params_shape() {
-        // turn/start requires threadId + input[] of typed user-inputs.
-        let params = json!({
-            "threadId": "th_1",
-            "input": [{ "type": "text", "text": "hello" }],
-        });
-        assert_eq!(params["threadId"], "th_1");
-        assert_eq!(params["input"][0]["type"], "text");
-        assert_eq!(params["input"][0]["text"], "hello");
-    }
 }

@@ -777,18 +777,6 @@ fn rustic_err<E: std::fmt::Display>(action: &'static str, e: E) -> PillboxError 
     PillboxError::runtime(action, format!("rustic_core: {e}"))
 }
 
-// `FromStr` re-export so tests can build a `SnapshotHandle` via the
-// rustic id type without depending on rustic_core directly.
-#[cfg(test)]
-pub(crate) fn parse_full_handle(s: &str) -> Result<SnapshotHandle> {
-    use rustic_core::repofile::SnapshotId;
-    use std::str::FromStr;
-    SnapshotId::from_str(s).map_err(|e| {
-        PillboxError::usage("snapshot lookup", format!("invalid handle `{s}`: {e}"))
-    })?;
-    Ok(SnapshotHandle::new(s))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1207,13 +1195,6 @@ mod tests {
     fn snapshot_handle_short_is_clamped_for_shorter_input() {
         let h = SnapshotHandle::new("abc");
         assert_eq!(h.short(), "abc");
-    }
-
-    #[test]
-    fn parse_full_handle_accepts_valid_hex() {
-        let id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let h = parse_full_handle(id).unwrap();
-        assert_eq!(h.as_str(), id);
     }
 
     #[test]

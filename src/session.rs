@@ -1047,13 +1047,6 @@ mod tests {
     }
 
     #[test]
-    fn known_backend_labels_are_constants() {
-        let _: &str = BACKEND_DOCKER;
-        let _: &str = BACKEND_LIBKRUN;
-        let _: &str = SESSIONS_DIR;
-    }
-
-    #[test]
     fn backend_parse_round_trips_known_labels() {
         assert_eq!(Backend::parse(BACKEND_DOCKER), Some(Backend::Docker));
         assert_eq!(Backend::parse(BACKEND_LIBKRUN), Some(Backend::Libkrun));

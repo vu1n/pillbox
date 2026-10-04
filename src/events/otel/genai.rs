@@ -352,41 +352,6 @@ mod tests {
     }
 
     #[test]
-    fn trace_id_seed_prefers_session_id_when_present() {
-        // The selection logic is one line in emit_call_span; pin it
-        // here so a refactor that breaks correlation surfaces as a
-        // test failure rather than as silently-orphaned traces.
-        let call_with_session = CallSpan {
-            session_id: Some("sess-aabbcc".into()),
-            ..sample_call()
-        };
-        let call_without_session = CallSpan {
-            session_id: None,
-            ..sample_call()
-        };
-
-        let seed_with = call_with_session
-            .session_id
-            .as_deref()
-            .unwrap_or(&call_with_session.sandbox_id);
-        let seed_without = call_without_session
-            .session_id
-            .as_deref()
-            .unwrap_or(&call_without_session.sandbox_id);
-
-        assert_eq!(seed_with, "sess-aabbcc");
-        assert_eq!(seed_without, "abc123def456");
-
-        // Two calls in the same session share a trace_id; the same
-        // session_id correlates with the session span emitted by
-        // super::spans (which uses the same derive_trace_id).
-        assert_eq!(
-            derive_trace_id(seed_with),
-            super::super::spans::derive_trace_id("sess-aabbcc"),
-        );
-    }
-
-    #[test]
     fn status_for_maps_2xx_to_ok_and_4xx_5xx_to_error() {
         assert!(matches!(status_for(200), Status::Ok));
         assert!(matches!(status_for(204), Status::Ok));

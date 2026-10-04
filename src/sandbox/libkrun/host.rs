@@ -188,14 +188,6 @@ mod tests {
     }
 
     #[test]
-    fn probes_return_a_result() {
-        // Host-dependent: only exercise that they run and yield a typed Result
-        // (don't assert Ok/Err — the CI/dev host may or may not be VM-capable).
-        let _: Result<(), String> = virtualization_available();
-        let _: Result<(), String> = runtime_deps_present();
-    }
-
-    #[test]
     fn min_headroom_is_two_gib() {
         assert_eq!(MIN_HEADROOM_BYTES, 2 * 1024 * 1024 * 1024);
     }

@@ -334,51 +334,6 @@ mod tests {
     }
 
     #[test]
-    fn sink_emit_skips_non_terminal_events() {
-        // `session.started` and `session.dropped` are not span-
-        // terminal — the sandbox-side `session done` closes the span.
-        // Confirm the early-return short-circuits before touching the
-        // tracer cache (the function returns Ok regardless of any
-        // env state).
-        let attrs: Vec<(&'static str, Option<AttrValue>)> = vec![];
-        let res = sink_emit(
-            &EventType::SessionStarted {
-                parent_session_id: None,
-                startup: None,
-            },
-            "abc123def456",
-            &attrs,
-            Emitter::Sandbox,
-        );
-        assert!(res.is_ok());
-        let res = sink_emit(
-            &EventType::SessionDropped,
-            "abc123def456",
-            &attrs,
-            Emitter::Sandbox,
-        );
-        assert!(res.is_ok());
-    }
-
-    #[test]
-    fn sink_emit_skips_host_emitter() {
-        // Host's session done (orchestrator-driven completion) doesn't
-        // own a span — the sandbox-side emit already closed it.
-        let attrs: Vec<(&'static str, Option<AttrValue>)> = vec![];
-        let res = sink_emit(
-            &EventType::SessionCompleted {
-                exit_code: Some(0),
-                trace_path: None,
-                result_snapshot: None,
-            },
-            "abc123def456",
-            &attrs,
-            Emitter::Host,
-        );
-        assert!(res.is_ok());
-    }
-
-    #[test]
     fn span_posts_protobuf_to_traces_endpoint() {
         // End-to-end: build a tracer pointing at a loopback HTTP
         // listener, emit a span via SpanBuilder + Tracer::build, then

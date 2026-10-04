@@ -673,6 +673,13 @@ mod workspace_xfer {
         workspace: WorkspaceRepo<'a>,
     }
 
+    #[derive(Serialize)]
+    struct FinalizeBody<'a> {
+        #[serde(rename = "sessionId")]
+        session_id: &'a str,
+        workspace: WorkspaceRepo<'a>,
+    }
+
     pub(super) struct ProvisionIdentity<'a> {
         pub(super) session_id: &'a str,
         pub(super) invocation_id: &'a str,
@@ -733,12 +740,6 @@ mod workspace_xfer {
         password: &str,
         base_snapshot: &str,
     ) -> Result<String> {
-        #[derive(Serialize)]
-        struct FinalizeBody<'a> {
-            #[serde(rename = "sessionId")]
-            session_id: &'a str,
-            workspace: WorkspaceRepo<'a>,
-        }
         let body = serde_json::to_string(&FinalizeBody {
             session_id,
             workspace: WorkspaceRepo {
@@ -915,12 +916,6 @@ mod workspace_xfer {
         #[test]
         fn finalize_body_binds_the_base_snapshot() {
             let c = cfg();
-            #[derive(serde::Serialize)]
-            struct FinalizeBody<'a> {
-                #[serde(rename = "sessionId")]
-                session_id: &'a str,
-                workspace: WorkspaceRepo<'a>,
-            }
             let body = serde_json::to_value(FinalizeBody {
                 session_id: "session-1",
                 workspace: WorkspaceRepo {

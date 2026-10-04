@@ -3,12 +3,12 @@
 //! agent's output. **All `#[ignore]`d** — they spawn real subprocesses and are
 //! timing-sensitive, so they flake when the full `cargo test` suite saturates
 //! the CPU; run them deliberately on an idle machine with
-//! `cargo test --test attach -- --ignored` (the docker/ssh ones also need their
+//! `cargo test --test attach -- --ignored` (the docker one also needs its
 //! external deps). They do not gate routine `cargo test`.
 //!
 //!   - direct: a client on the pty-host's unix socket.
 //!   - relayed: a `pty-relay` child bridging that socket to its stdio (the
-//!     in-sandbox half of the docker/ssh transport, exercised without docker).
+//!     in-sandbox half of the docker transport, exercised without docker).
 //!
 //! The frame reader is hand-rolled (not the crate's `Frame`) so these also
 //! pin the wire format from the outside: `[type:u8][len:u32 BE][payload]`.
@@ -112,7 +112,7 @@ fn connect_retry(sock: &std::path::Path) -> UnixStream {
 // agent) as subprocesses and waits on wall-clock windows. Reliable on an idle
 // machine, but flakes when the full `cargo test` suite saturates the CPU (the
 // subprocesses get starved past even the generous timeouts above). So it's
-// `#[ignore]`d — like the docker/ssh transport tests below — and run deliberately:
+// `#[ignore]`d — like the docker transport test below — and run deliberately:
 // `cargo test --test attach -- --ignored`. It does NOT gate routine `cargo test`.
 #[test]
 #[ignore = "heavyweight + timing-sensitive; run with `cargo test --test attach -- --ignored`"]
@@ -231,127 +231,6 @@ fn docker_transport_propagates_output_and_exit_code() {
     assert!(
         acc.windows(b"/workspace".len()).any(|w| w == b"/workspace"),
         "agent did not start in the workspace cwd (got $HOME instead?)"
-    );
-    assert_eq!(
-        exit_code,
-        Some(7),
-        "agent exit code did not propagate as an Exit frame"
-    );
-}
-
-/// Full ssh transport (phase 4): launch the pty-host on a real remote over
-/// ssh, attach over an ssh-exec'd `pty-relay`, and assert the agent's
-/// output + exit code propagate as frames. The local→remote transport is
-/// identical to the docker case (relay + shared pump); only the exec layer
-/// differs (ssh vs `docker exec`), so this pins the ssh binding end to end.
-///
-/// Ignored by default — needs an ssh host reachable from this machine with
-/// pillbox installed at `/usr/local/bin/pillbox`. Point it at one and run:
-///
-/// ```sh
-/// PILLBOX_TEST_SSH_DEST=root@152.53.188.221 \
-///   cargo test --test attach -- --ignored ssh_transport
-/// # optional: PILLBOX_TEST_SSH_PORT=2222
-/// ```
-///
-/// (The parent verifies this against the real VPS; the sandbox can't reach
-/// it — ssh egress is blocked here.)
-#[test]
-#[ignore = "requires an ssh host with pillbox installed (set PILLBOX_TEST_SSH_DEST)"]
-fn ssh_transport_propagates_output_and_exit_code() {
-    const FRAME_EXIT: u8 = 8;
-    let dest = match std::env::var("PILLBOX_TEST_SSH_DEST") {
-        Ok(d) if !d.is_empty() => d,
-        _ => panic!("set PILLBOX_TEST_SSH_DEST=user@host to run this test"),
-    };
-    let remote_pillbox = std::env::var("PILLBOX_TEST_REMOTE_PILLBOX")
-        .unwrap_or_else(|_| "/usr/local/bin/pillbox".to_string());
-    let sock = format!("/tmp/pb-ssh-it-{}.sock", std::process::id());
-
-    fn ssh(dest: &str) -> Command {
-        let mut c = Command::new("ssh");
-        c.arg("-T").arg("-o").arg("ServerAliveInterval=30");
-        if let Ok(port) = std::env::var("PILLBOX_TEST_SSH_PORT") {
-            if !port.is_empty() {
-                c.arg("-p").arg(port);
-            }
-        }
-        c.arg(dest);
-        c
-    }
-
-    // Launch the pty-host detached so it survives this ssh exec closing.
-    // The agent prints a marker, sleeps, then exits 7 so we can assert
-    // exit-code propagation. The sleep must outlast the *relay's* ssh
-    // connection latency (a fresh ssh handshake to a real host is often
-    // 2-3s) — otherwise the agent exits and the host tears down before
-    // the relay connects, and we'd see zero frames. (docker exec is
-    // instant, so the docker test gets away with a short sleep; ssh isn't.)
-    let launch = format!(
-        "setsid {pb} pty-host --sock '{sock}' -- \
-         bash -c \"printf 'PILLBOXPHASE2OK\\n'; sleep 8; exit 7\" \
-         </dev/null >/tmp/pb-ssh-it-host.log 2>&1 &",
-        pb = remote_pillbox,
-        sock = sock,
-    );
-    let launched = ssh(&dest)
-        .arg(&launch)
-        .status()
-        .expect("ssh launch pty-host");
-    assert!(launched.success(), "remote pty-host launch failed");
-
-    struct KillRemote {
-        dest: String,
-        sock: String,
-    }
-    impl Drop for KillRemote {
-        fn drop(&mut self) {
-            let mut c = Command::new("ssh");
-            c.arg("-T");
-            if let Ok(port) = std::env::var("PILLBOX_TEST_SSH_PORT") {
-                if !port.is_empty() {
-                    c.arg("-p").arg(port);
-                }
-            }
-            let _ = c
-                .arg(&self.dest)
-                .arg(format!(
-                    "pkill -f 'pty-host --sock {s}'; rm -f '{s}'",
-                    s = self.sock
-                ))
-                .status();
-        }
-    }
-    let _kill = KillRemote {
-        dest: dest.clone(),
-        sock: sock.clone(),
-    };
-
-    // Attach over an ssh-exec'd relay. Hold stdin open (KillOnDrop keeps
-    // the child) until the host closes after the Exit frame.
-    let mut relay = ssh(&dest)
-        .arg(format!("{remote_pillbox} pty-relay --sock '{sock}'"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("ssh exec relay");
-    let mut stdout = relay.stdout.take().expect("relay stdout");
-    let _relay = KillOnDrop(relay);
-
-    let mut acc = Vec::new();
-    let mut exit_code = None;
-    while let Some((typ, payload)) = read_typed(&mut stdout) {
-        if typ == FRAME_EXIT && payload.len() == 4 {
-            exit_code = Some(i32::from_be_bytes([
-                payload[0], payload[1], payload[2], payload[3],
-            ]));
-        }
-        acc.extend_from_slice(&payload);
-    }
-
-    assert!(
-        acc.windows(MARKER.len()).any(|w| w == MARKER),
-        "agent output did not propagate through the ssh transport"
     );
     assert_eq!(
         exit_code,

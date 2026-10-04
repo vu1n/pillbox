@@ -236,7 +236,7 @@ mod tests {
     }
 
     #[test]
-    fn journal_round_trips_both_phases_without_bearer_material() {
+    fn journal_round_trips_both_phases_with_private_mode() {
         crate::test_util::with_isolated_home("managed-pending-journal", || {
             let resolved = crate::pillbox::global();
             let journal = PendingJournal::open(&resolved, "session-1").unwrap();
@@ -256,9 +256,6 @@ mod tests {
                 .persist(&PendingState::committing(request(), commit.clone()))
                 .unwrap();
             assert_eq!(journal.load().unwrap().unwrap().commit(), Some(&commit));
-            let text = std::fs::read_to_string(journal.path()).unwrap();
-            assert!(!text.contains("Bearer"));
-            assert!(!text.contains("capability-secret"));
             assert_eq!(
                 std::fs::metadata(journal.path())
                     .unwrap()

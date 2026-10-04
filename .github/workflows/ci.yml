@@ -26,6 +26,8 @@ jobs:
           cache-dependency-path: cloudflare-spike/package-lock.json
       - run: npm ci
       - run: npm test
+      # Runner image packaging contract (runner/install-codex-package.sh).
+      - run: node --test ../runner/codex-package.test.mjs
       - run: npx tsc --noEmit
       - run: python3 check-contract-parity.py
       # Real workerd + SQLite-backed DO, no account or paid container required.

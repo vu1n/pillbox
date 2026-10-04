@@ -213,6 +213,13 @@ verifier fail exits 1 with a `fail` observation. Malformed report, transport or 
 truncated diagnostics, or unconfirmed teardown is an infrastructure error with no verdict.
 The record is a manual probe, never a production execution or independent Huddles receipt.
 
+After confirmed VM stop/reap, private-runtime cleanup reopens directory identities from the
+anchored runtime root instead of holding every child directory open. Owner, device, inode and
+no-follow checks remain. Shared identity nodes have a 128 MiB accounting budget; queue and
+ancestor pointer vectors grow fallibly and are additional storage, so this is not a host RSS
+limit. Exceeding the identity budget is a loud infrastructure failure that preserves the private
+runtime for recovery and emits no verifier verdict. Cached seeds and external paths are untouched.
+
 ## Verification record — 2026-09-22
 
 The [recorded offline proof](./local-repository-execution-offline-proof.json) contains the sealed

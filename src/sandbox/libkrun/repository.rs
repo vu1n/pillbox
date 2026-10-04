@@ -2,7 +2,7 @@
 //! The host file broker is the only repository access: builder VMs have no
 //! repository shares. Live confinement and native-fork tests remain a release gate.
 
-use std::ffi::CString;
+use std::ffi::{CString, OsString};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
@@ -239,6 +239,34 @@ impl OwnedVm {
 /// Image clones retain their read-only host directory modes. Make only this
 /// stopped invocation's owned directories removable before TempDir closes it.
 fn prepare_owned_runtime_removal(root: &Path, stop_confirmed: bool) -> Result<()> {
+    // The live queue holds only this stopped invocation's directory identities.
+    // A corrupt or unusually broad image fails cleanup with its runtime preserved.
+    const MAX_QUEUED_IDENTITY_BYTES: usize = 128 * 1024 * 1024;
+    prepare_owned_runtime_removal_with_budget(root, stop_confirmed, MAX_QUEUED_IDENTITY_BYTES)
+}
+
+fn prepare_owned_runtime_removal_with_budget(
+    root: &Path,
+    stop_confirmed: bool,
+    max_queued_identity_bytes: usize,
+) -> Result<()> {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    struct PendingDirectory {
+        parent: Option<Rc<PendingDirectory>>,
+        name: OsString,
+        inode: u64,
+        live_bytes: Rc<Cell<usize>>,
+        bytes: usize,
+    }
+
+    impl Drop for PendingDirectory {
+        fn drop(&mut self) {
+            self.live_bytes.set(self.live_bytes.get() - self.bytes);
+        }
+    }
+
     ensure!(stop_confirmed, "VM stop/reap was not confirmed");
     let root_metadata = fs::symlink_metadata(root).context("inspect owned VM runtime root")?;
     ensure!(
@@ -258,8 +286,37 @@ fn prepare_owned_runtime_removal(root: &Path, stop_confirmed: bool) -> Result<()
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
         .open(root)
         .context("open owned VM runtime root")?;
-    let mut pending = vec![(root.to_path_buf(), root_directory)];
-    while let Some((path, directory)) = pending.pop() {
+    ensure!(
+        root_directory.metadata()?.ino() == root_metadata.ino(),
+        "owned VM runtime root changed during preparation"
+    );
+    // LIFO visits a branch while Rc shares its ancestor identities with queued
+    // siblings. The byte budget includes all live nodes, even on other branches.
+    let live_bytes = Rc::new(Cell::new(0usize));
+    let mut pending: Vec<Option<Rc<PendingDirectory>>> = vec![None];
+    while let Some(last) = pending.pop() {
+        let mut ancestors = Vec::new();
+        let mut cursor = last.as_deref();
+        while let Some(identity) = cursor {
+            ancestors
+                .try_reserve(1)
+                .context("reserve owned VM runtime ancestor chain")?;
+            ancestors.push(identity);
+            cursor = identity.parent.as_deref();
+        }
+        let mut path = root.to_path_buf();
+        let mut directory = root_directory.try_clone()?;
+        for identity in ancestors.iter().rev() {
+            path.push(&identity.name);
+            directory = open_owned_runtime_child(
+                &directory,
+                &identity.name,
+                identity.inode,
+                owner,
+                device,
+                &path,
+            )?;
+        }
         let metadata = directory.metadata()?;
         ensure!(
             metadata.is_dir() && metadata.uid() == owner && metadata.dev() == device,
@@ -303,50 +360,111 @@ fn prepare_owned_runtime_removal(root: &Path, stop_confirmed: bool) -> Result<()
                 "owned VM runtime directory is not local and owned: {}",
                 child_path.display()
             );
-            if (stat.st_mode as u32) & 0o700 != 0o700 {
-                let result = unsafe {
-                    libc::fchmodat(
-                        directory.as_raw_fd(),
-                        name_c.as_ptr(),
-                        (stat.st_mode as u32 | 0o700) as libc::mode_t,
-                        libc::AT_SYMLINK_NOFOLLOW,
-                    )
-                };
-                if result != 0 {
-                    return Err(std::io::Error::last_os_error()).with_context(|| {
-                        format!(
-                            "permit owned VM runtime removal at {}",
-                            child_path.display()
-                        )
-                    });
-                }
-            }
-            let fd = unsafe {
-                libc::openat(
-                    directory.as_raw_fd(),
-                    name_c.as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
-            if fd < 0 {
-                return Err(std::io::Error::last_os_error()).with_context(|| {
-                    format!("open owned VM runtime directory {}", child_path.display())
-                });
-            }
-            let child_directory = unsafe { File::from_raw_fd(fd) };
-            let child_metadata = child_directory.metadata()?;
+            let bytes = std::mem::size_of::<PendingDirectory>()
+                .checked_add(2 * std::mem::size_of::<usize>())
+                .and_then(|fixed| fixed.checked_add(name.as_bytes().len()))
+                .context("owned VM runtime identity size overflow")?;
+            let new_total = live_bytes
+                .get()
+                .checked_add(bytes)
+                .context("owned VM runtime identity budget overflow")?;
             ensure!(
-                child_metadata.is_dir()
-                    && child_metadata.uid() == owner
-                    && child_metadata.dev() == device
-                    && child_metadata.ino() == stat.st_ino as u64,
-                "owned VM runtime directory changed during preparation: {}",
+                new_total <= max_queued_identity_bytes,
+                "owned VM runtime queued directory identity budget exceeded ({} bytes) at {}",
+                max_queued_identity_bytes,
                 child_path.display()
             );
-            pending.push((child_path, child_directory));
+            pending
+                .try_reserve(1)
+                .context("reserve owned VM runtime directory queue")?;
+            let child_directory = open_owned_runtime_child(
+                &directory,
+                &name,
+                stat.st_ino as u64,
+                owner,
+                device,
+                &child_path,
+            )?;
+            drop(child_directory);
+            live_bytes.set(new_total);
+            pending.push(Some(Rc::new(PendingDirectory {
+                parent: last.clone(),
+                name,
+                inode: stat.st_ino as u64,
+                live_bytes: Rc::clone(&live_bytes),
+                bytes,
+            })));
         }
     }
     Ok(())
+}
+
+fn open_owned_runtime_child(
+    parent: &File,
+    name: &std::ffi::OsStr,
+    inode: u64,
+    owner: libc::uid_t,
+    device: u64,
+    path: &Path,
+) -> Result<File> {
+    let name_c = CString::new(name.as_bytes()).context("runtime entry contains NUL")?;
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name_c.as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("inspect owned VM runtime directory {}", path.display()));
+    }
+    ensure!(
+        stat.st_mode & libc::S_IFMT == libc::S_IFDIR
+            && stat.st_uid == owner
+            && stat.st_dev as u64 == device
+            && stat.st_ino as u64 == inode,
+        "owned VM runtime directory changed or is not local and owned: {}",
+        path.display()
+    );
+    if (stat.st_mode as u32) & 0o700 != 0o700 {
+        let result = unsafe {
+            libc::fchmodat(
+                parent.as_raw_fd(),
+                name_c.as_ptr(),
+                (stat.st_mode as u32 | 0o700) as libc::mode_t,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("permit owned VM runtime removal at {}", path.display()));
+        }
+    }
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("open owned VM runtime directory {}", path.display()));
+    }
+    let child = unsafe { File::from_raw_fd(fd) };
+    let metadata = child.metadata()?;
+    ensure!(
+        metadata.is_dir()
+            && metadata.uid() == owner
+            && metadata.dev() == device
+            && metadata.ino() == inode,
+        "owned VM runtime directory changed during preparation: {}",
+        path.display()
+    );
+    Ok(child)
 }
 
 impl Drop for OwnedVm {
@@ -2178,6 +2296,104 @@ mod tests {
             fs::read(write_search.join("nested-file")).unwrap(),
             b"fixture"
         );
+        runtime.close().unwrap();
+    }
+
+    #[test]
+    fn stopped_runtime_removal_handles_wide_tree_under_low_fd_limit() {
+        const TEST_NAME: &str = "sandbox::libkrun::repository::tests::stopped_runtime_removal_handles_wide_tree_under_low_fd_limit";
+        if std::env::var_os("PILLBOX_WIDE_RUNTIME_CLEANUP_CHILD").is_none() {
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child
+                .arg("--exact")
+                .arg(TEST_NAME)
+                .arg("--nocapture")
+                .env("PILLBOX_WIDE_RUNTIME_CLEANUP_CHILD", "1");
+            unsafe {
+                child.pre_exec(|| {
+                    let mut limit: libc::rlimit = std::mem::zeroed();
+                    if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    limit.rlim_cur = limit.rlim_cur.min(64);
+                    if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "low-FD cleanup failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .contains("wide runtime cleanup completed under low FD limit"),
+                "child test did not exercise low-FD cleanup: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+
+        let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        assert!(limit.rlim_cur <= 64);
+
+        let runtime = tempfile::tempdir().unwrap();
+        let rootfs = runtime.path().join("rootfs");
+        fs::create_dir(&rootfs).unwrap();
+        for index in 0..256 {
+            let parent = rootfs.join(format!("package-{index:03}"));
+            let nested = parent.join("nested");
+            fs::create_dir_all(&nested).unwrap();
+            fs::write(nested.join("data"), b"fixture").unwrap();
+            fs::set_permissions(&nested, fs::Permissions::from_mode(0o300)).unwrap();
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o100)).unwrap();
+        }
+
+        prepare_owned_runtime_removal(runtime.path(), true).unwrap();
+        assert_eq!(
+            fs::read(rootfs.join("package-255/nested/data")).unwrap(),
+            b"fixture"
+        );
+        runtime.close().unwrap();
+        println!("wide runtime cleanup completed under low FD limit");
+    }
+
+    #[test]
+    fn stopped_runtime_removal_reports_identity_budget_without_losing_private_files() {
+        let runtime = tempfile::tempdir().unwrap();
+        let rootfs = runtime.path().join("rootfs");
+        fs::create_dir(&rootfs).unwrap();
+        let mode = fs::metadata(&rootfs).unwrap().permissions().mode();
+        for index in 0..256 {
+            let directory = rootfs.join(format!("package-{index:03}"));
+            fs::create_dir(&directory).unwrap();
+            fs::write(directory.join("evidence"), b"private clone").unwrap();
+        }
+
+        let error = prepare_owned_runtime_removal_with_budget(runtime.path(), true, 4096)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("queued directory identity budget exceeded"),
+            "{error}"
+        );
+        assert_eq!(fs::metadata(&rootfs).unwrap().permissions().mode(), mode);
+        for index in 0..256 {
+            let directory = rootfs.join(format!("package-{index:03}"));
+            assert_eq!(fs::metadata(&directory).unwrap().permissions().mode(), mode);
+            assert_eq!(
+                fs::read(directory.join("evidence")).unwrap(),
+                b"private clone"
+            );
+        }
         runtime.close().unwrap();
     }
 

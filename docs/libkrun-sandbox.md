@@ -63,14 +63,24 @@ host: pillbox  ──FFI──▶ libkrun (KVM/HVF microVM)
   style), so the existing runner-image artifact survives the pivot; a slimmer
   custom rootfs is an option later.
 
-  *Known debt:* the materialized-rootfs cache (`~/.pillbox/krun/rootfs/`) is
-  keyed by image **id**, so every `docker pull` of a mutable tag strands the
-  previous multi-GB export — nothing GCs superseded generations. A naive
-  sweep is unsafe: `krun_set_root` serves the cache dir *live* to running
-  (possibly days-old detached) VMs, and the sanitized keys of distinct tags
-  can share a prefix. A sound GC needs a `rootfs/<image>/<id>/` layout plus
-  liveness against session records — do it as an explicit verb (`doctor`
-  surface or `session prune` sibling), not on the launch path.
+  **Isolation:** materialized image generations under `~/.pillbox/krun/rootfs/v4/`
+  are seed trees only. Each ordinary VM and grader boots an independent writable
+  CoW clone under `~/.pillbox/krun/vm-rootfs/`; bounded builders and verifiers retain
+  their existing private runtime clones. Writes to `/tmp`, `/etc`, installed tools,
+  and other root paths cannot reach the seed, concurrent VMs, or later runs. The
+  clone utility reports any supported full-copy fallback; otherwise launch fails.
+  Sharing the seed is never a fallback.
+
+  Earlier cache generations were writable by guests and are never reused as seeds.
+  The first v4 launch needs a fresh image export; Docker-unavailable fallback only
+  accepts complete v4 generations. Existing sessions keep their older root paths.
+  Their live files must not be removed during this transition.
+
+  Private roots remain available after an intentional detach and are recorded in
+  session handles. Cleanup requires confirmed VMM shutdown; failed attribution or
+  group teardown preserves the session and files for recovery. Roots abandoned by
+  abrupt CLI death can remain on disk, but cannot seed another VM. Seed-cache and
+  orphan-root GC remain explicit future work; do not sweep directories that may be live.
 - **Workspace** — host dir shared via **virtio-fs**; a **COW snapshot**
   (FICLONE / `clonefile(2)`) gives near-instant per-run isolation and is the
   clean local "fork N agents from one base" primitive. rustic stays the

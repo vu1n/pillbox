@@ -88,6 +88,15 @@ PTY-free exec channel an orchestrator drives. Docker-backed today.
 | `pillbox sandbox list [--json]` | List sandboxes in the current pillbox. |
 | `pillbox sandbox destroy ID` | Kill the sandbox container and remove the record. |
 
+### Local VM filesystem isolation
+
+Every local microVM uses a private writable rootfs clone, including `/tmp` and
+system directories. The image cache is never mounted as a guest's writable root.
+Detached/server sessions retain their own clone until `session rm` confirms
+shutdown. Failed teardown preserves their session record and private files.
+Cache versions through v3 are excluded from new launches because they may contain
+previous guest writes; a fresh image export is required to initialize the v4 seed.
+
 ### Structured run ownership
 
 Local structured one-shot runs (`pi` and `cursor`) keep a lifetime socket to their
@@ -116,7 +125,7 @@ persistent ownership; `session attach` may still detach with SIGTERM.
 | `--memory` | — | Wire in swarm memory (the external [`kypp`](https://github.com/vu1n/kypp) engine, attached not owned): brief the agent from project memory at start, capture this session's §0 log after. Host-side, best-effort — a missing/erroring `kypp` warns, never fails the run. |
 | `--mcp NAME=URL` | — | Attach a shared MCP server (`http(s)://`). NAME is what the agent sees; `localhost`/`127.0.0.1` are rewritten to `host.docker.internal`. Repeatable. See [docs/shared-mcp.md](./docs/shared-mcp.md). |
 | `--mcp-token NAME=SECRET_NAME` | — | Attach a bearer token (from the secret store) to a `--mcp NAME`. claude folds it into a 0600 headers tempfile; codex into an env var via `bearer_token_env_var`. Never lands in argv or shell history. Repeatable. |
-| `--from-bookmark NAME` | — | Start from a named snapshot bookmark — the **guest** workspace is forked from that snapshot before the agent launches. Without `--workspace`, the snapshot is materialized into a shared base cache and CoW-cloned per run (so `k` dispatch workers pay one restore, not `k`) and your **cwd is left untouched** — use `pillbox pull` to restore a snapshot into cwd. With `--workspace DIR`, the snapshot is restored into that dir. |
+| `--from-bookmark NAME` | — | Start from a named snapshot bookmark — the **guest** workspace is forked from that snapshot before the agent launches. Bookmark forks require the local libkrun backend. Without `--workspace`, the snapshot is materialized into a shared base cache and CoW-cloned per run (so `k` dispatch workers pay one restore, not `k`) and your **cwd and the selected project directory are left untouched** — use `pillbox pull` to restore a snapshot into cwd. With `--workspace DIR`, the snapshot is restored into that dir. |
 | `--detach` | — | Start a local libkrun session and immediately return; the microVM and its credential/egress broker keep running. Reattach with `pillbox session attach <id>`. Managed detached finalization is not implemented. |
 | `--events-webhook URL` | — | POST every lifecycle event to URL as JSON. Forwarded to the in-sandbox wrapper so terminal events (`session.completed`/`failed`) reach back to the orchestrator. Equivalent to `$PILLBOX_EVENTS_WEBHOOK`. See [docs/observability.md](./docs/observability.md) for the full sink reference (JSONL / webhook / OTLP via `$OTEL_EXPORTER_OTLP_ENDPOINT`). |
 | `--ttl DURATION` | — | Per-session retention TTL — `30m` / `24h` / `7d` (`s`/`m`/`h`/`d` units only, max 365d). Writes `expires_at` to the record. `pillbox session prune` drops expired sessions. Requires `--detach`. |

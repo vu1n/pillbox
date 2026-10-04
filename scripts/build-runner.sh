@@ -21,7 +21,7 @@ cd "$(dirname "$0")/.."
 
 DOCKERFILE=runner/Dockerfile
 TAG=pillbox-runner:dev   # moving dev tag — every local script + a dev pillbox.toml default to it
-ROOTFS_CACHE_VERSION=v3  # mirrors ROOTFS_CACHE_VERSION in src/sandbox/libkrun/mod.rs
+ROOTFS_CACHE_VERSION=v4  # mirrors ROOTFS_CACHE_VERSION in src/sandbox/libkrun/mod.rs
 DO_UPDATE=0 DRY_RUN=0 NO_CACHE=0 PRUNE=0 PRINT_ROOTFS_NAMESPACE=
 
 usage() {
@@ -173,9 +173,9 @@ docker run --rm --entrypoint sh "$TAG" -c '
 '
 
 # Each rebuild gives the image a new id, so libkrun re-materializes its rootfs
-# (`~/.pillbox/krun/rootfs/v3/<sha256-tag>/<sanitized-id>/rootfs`) on the next
+# (`~/.pillbox/krun/rootfs/v4/<sha256-tag>/<sanitized-id>/rootfs`) on the next
 # run and prior generations linger. Opt-in prune is confined to THIS tag's exact
-# v3 hash namespace. Legacy/v2 trees and other tags remain untouched.
+# v4 hash namespace. Legacy/v2/v3 trees and other tags remain untouched.
 if [ "$PRUNE" = 1 ]; then
 	root="${HOME}/.pillbox/krun/rootfs"
 	if [ -d "$root" ]; then

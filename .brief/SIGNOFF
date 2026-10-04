@@ -237,3 +237,20 @@ libkrun-is-the-backend conforms: Structured one-shot runs reuse the local VMM li
 libkrun-env-fork-substrate conforms: Structured supervision adds only a host ownership socket, preserving guest environment, credential delivery, egress policy, and persistent detached/server sessions.
 docs-governance conforms: The command guide records supervised structured ownership and its distinction from intentional detach.
 workspace-ingest-sovereignty conforms: Structured VMM supervision changes only host process ownership and terminal failure recording; workspace ingest, the pillbox-owned secret denylist, exclusions reporting, and guest shares remain unchanged.
+
+libkrun-is-the-backend conforms: Bookmark forks reject unsupported non-microVM placement before backend launch; libkrun remains the supported local backend.
+libkrun-env-fork-substrate conforms: Bookmark dispatch preserves explicit workspace intent without changing guest environment, credential delivery, or egress policy.
+workspace-ingest-sovereignty conforms: Implicit bookmark forks use the immutable base cache instead of restoring over the project source; the pillbox-controlled secret exclusion and reporting rules remain unchanged.
+docs-governance conforms: The command guide records bookmark destination intent and the supported microVM boundary alongside the CLI change.
+
+libkrun-is-the-backend conforms: Each ordinary local VM and grader receives a private writable image clone; bounded repository execution retains its existing owned runtime root and libkrun remains the supported local backend.
+libkrun-env-fork-substrate conforms: Private VM roots preserve per-VM egress, environment setup, and credential delivery; cloning fails closed instead of sharing a writable seed.
+workspace-ingest-sovereignty conforms: Root image isolation leaves workspace fork, secret exclusion, and reporting contracts unchanged; writable guest roots never become future image seeds.
+docs-governance conforms: Canonical command and substrate guides document private root lifetime, confirmed teardown, and the v4 cache migration alongside the implementation.
+
+runner-image-tags-name-roles conforms: The build script only advances the local rootfs cache namespace to v4; dev, latest, immutable release tags, and configuration pointer roles are unchanged.
+
+gateway-no-daemon conforms: The producer-lock regression waits for transient inherited descriptors to close; production locking and ephemeral writer ownership are unchanged.
+optimization-external-substrate-primitives conforms: Test-only lifecycle polling changes no grader, reward, content sharing, or optimization contract.
+dx-zero-config-local conforms: Test-only lock polling preserves local stream surfaces and reader parity.
+substrate-plane-livesession conforms: Test-only lifecycle polling changes no LiveSession capabilities or backend dispatch.

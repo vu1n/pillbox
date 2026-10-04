@@ -313,3 +313,39 @@ fn pillbox_toml_agent_field_picks_default() {
         "unexpected claude mention: {stderr}"
     );
 }
+
+#[test]
+fn bookmark_run_rejects_unsupported_backend_before_workspace_or_memory_work() {
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    std::fs::write(
+        cwd.path().join("pillbox.toml"),
+        "name = \"bookmark-fixture\"\n",
+    )
+    .unwrap();
+    std::fs::write(cwd.path().join("README"), "uncommitted source").unwrap();
+    for memory in [false, true] {
+        let mut arguments = vec!["run", "--agent", "claude", "--from-bookmark", "base"];
+        if memory {
+            arguments.push("--memory");
+        }
+        let out = common::run_with_env(
+            home.path(),
+            cwd.path(),
+            &[("PILLBOX_BACKEND", "docker")],
+            &arguments,
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(String::from_utf8_lossy(&out.stderr)
+            .contains("bookmark forks require the local libkrun"));
+        assert_eq!(
+            std::fs::read_to_string(cwd.path().join("README")).unwrap(),
+            "uncommitted source"
+        );
+    }
+}

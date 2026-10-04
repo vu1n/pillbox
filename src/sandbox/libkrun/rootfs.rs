@@ -82,7 +82,44 @@ fn remove_at(root: &Path, runtimes: &Path) -> Result<()> {
             "private rootfs owner must be a plain directory"
         ),
     }
+    // Image and guest directory modes survive cloning. Restore owner access only
+    // after shutdown, and never traverse a guest symlink while preparing deletion.
+    let mut pending = vec![directory.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let metadata = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("stat stopped rootfs directory {}", path.display()))?;
+        if !metadata.is_dir() {
+            continue;
+        }
+        std::fs::set_permissions(
+            &path,
+            std::fs::Permissions::from_mode(metadata.permissions().mode() | 0o700),
+        )
+        .with_context(|| format!("restore stopped rootfs directory access {}", path.display()))?;
+        for entry in std::fs::read_dir(&path)
+            .with_context(|| format!("read stopped rootfs directory {}", path.display()))?
+        {
+            let entry = entry.context("read stopped rootfs entry")?;
+            if entry
+                .file_type()
+                .context("stat stopped rootfs entry")?
+                .is_dir()
+            {
+                pending.push(entry.path());
+            }
+        }
+    }
     std::fs::remove_dir_all(directory).context("remove stopped private VM rootfs")
+}
+
+impl Drop for PrivateRootfs {
+    fn drop(&mut self) {
+        if self.directory.is_some() {
+            if let Err(error) = self.remove_stopped() {
+                eprintln!("pillbox: unspawned private rootfs cleanup failed: {error:#}");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -152,6 +189,44 @@ mod tests {
         let removed = b.root.clone();
         b.remove_stopped().unwrap();
         assert!(!removed.exists());
+    }
+
+    #[test]
+    fn cleanup_restores_private_directory_access_without_following_symlinks() {
+        let fixture = tempfile::tempdir().unwrap();
+        let base = fixture.path().join("base");
+        let readonly = base.join("readonly");
+        fs::create_dir_all(&readonly).unwrap();
+        fs::write(readonly.join("file"), "image file").unwrap();
+        fs::set_permissions(&readonly, fs::Permissions::from_mode(0o555)).unwrap();
+        let outside = fixture.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("file"), "outside file").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o555)).unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("outside-link")).unwrap();
+        let runtimes = fixture.path().join("runtimes");
+        let mut root = PrivateRootfs::fork(&base, &runtimes).unwrap();
+        fs::set_permissions(root.join("readonly"), fs::Permissions::from_mode(0o000)).unwrap();
+        root.preserve();
+        root.remove_stopped().unwrap();
+        assert!(!root.exists());
+        assert_eq!(
+            fs::read_to_string(outside.join("file")).unwrap(),
+            "outside file"
+        );
+        for path in [&readonly, &outside] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o555
+            );
+        }
+        let unspawned = PrivateRootfs::fork(&base, &runtimes).unwrap();
+        let unspawned_path = unspawned.to_path_buf();
+        drop(unspawned);
+        assert!(!unspawned_path.exists());
+        for path in [&readonly, &outside] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
     }
 
     #[test]

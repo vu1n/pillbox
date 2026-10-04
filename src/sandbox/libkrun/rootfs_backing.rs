@@ -19,11 +19,15 @@ impl RootfsBacking {
     pub(super) fn krun_dir() -> Result<PathBuf> {
         let home =
             std::env::var_os("HOME").context("could not resolve $HOME for rootfs backing")?;
-        let pillbox = PathBuf::from(home).join(".pillbox");
-        ensure!(
-            pillbox.is_absolute(),
-            "rootfs backing home must be absolute"
-        );
+        Self::krun_dir_for_home(Path::new(&home))
+    }
+
+    pub(super) fn krun_dir_for_home(home: &Path) -> Result<PathBuf> {
+        ensure!(home.is_absolute(), "rootfs backing home must be absolute");
+        // HOME is operator-owned input. Resolve its platform aliases once;
+        // never resolve a managed .pillbox or krun descendant through a symlink.
+        let home = fs::canonicalize(home).context("resolve trusted rootfs backing home")?;
+        let pillbox = home.join(".pillbox");
         owned_directory(&pillbox, true)?;
         fs::set_permissions(&pillbox, fs::Permissions::from_mode(0o700))?;
         let krun = pillbox.join("krun");
@@ -723,6 +727,33 @@ mod tests {
         if unsafe { libc::geteuid() } != 0 {
             assert!(owned_directory(Path::new("/"), false).is_err());
         }
+    }
+
+    #[test]
+    fn trusted_home_alias_resolves_before_managed_symlink_checks() {
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().join("real-home");
+        fs::create_dir(&home).unwrap();
+        let alias = fixture.path().join("home-alias");
+        std::os::unix::fs::symlink(&home, &alias).unwrap();
+        let expected = fs::canonicalize(&home).unwrap().join(".pillbox/krun");
+        assert_eq!(RootfsBacking::krun_dir_for_home(&alias).unwrap(), expected);
+        assert!(expected.is_dir());
+
+        fs::remove_dir(&expected).unwrap();
+        let pillbox = expected.parent().unwrap();
+        fs::remove_dir(pillbox).unwrap();
+        let foreign = fixture.path().join("foreign");
+        fs::create_dir(&foreign).unwrap();
+        std::os::unix::fs::symlink(&foreign, pillbox).unwrap();
+        assert!(RootfsBacking::krun_dir_for_home(&alias).is_err());
+        assert!(!foreign.join("krun").exists());
+
+        fs::remove_file(pillbox).unwrap();
+        fs::create_dir(pillbox).unwrap();
+        std::os::unix::fs::symlink(&foreign, &expected).unwrap();
+        assert!(RootfsBacking::krun_dir_for_home(&alias).is_err());
+        assert!(!foreign.join("krun").exists());
     }
 
     #[cfg(target_os = "macos")]

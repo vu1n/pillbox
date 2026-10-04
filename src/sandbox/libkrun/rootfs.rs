@@ -3,7 +3,7 @@
 
 use std::ops::Deref;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{ensure, Context, Result};
 
@@ -43,6 +43,7 @@ impl PrivateRootfs {
         if method == crate::workspace::cow::CloneMethod::Copied {
             eprintln!("pillbox: private rootfs fork fell back to a full copy");
         }
+        super::metadata::prepare_private_root(&root, directory.path())?;
         Ok(Self {
             directory: Some(directory),
             root,
@@ -70,11 +71,19 @@ impl Deref for PrivateRootfs {
 }
 
 pub(super) fn remove_owned(root: &Path) -> Result<()> {
-    let krun = super::rootfs_backing::RootfsBacking::krun_dir()?;
+    let raw_home = PathBuf::from(
+        std::env::var_os("HOME").context("could not resolve $HOME for rootfs cleanup")?,
+    );
+    let krun = super::rootfs_backing::RootfsBacking::krun_dir_for_home(&raw_home)?;
+    let canonical_home = krun
+        .parent()
+        .and_then(Path::parent)
+        .context("canonical rootfs home is missing")?;
+    let root = normalize_recorded_home_alias(root, &raw_home, canonical_home)?;
     let legacy = krun.join("vm-rootfs");
     let new = krun.join("case-sensitive-rootfs/vm-rootfs");
     if root.parent().and_then(Path::parent) == Some(legacy.as_path()) {
-        return remove_at(root, &legacy);
+        return remove_at(&root, &legacy);
     }
     ensure!(
         root.parent().and_then(Path::parent) == Some(new.as_path()),
@@ -82,7 +91,38 @@ pub(super) fn remove_owned(root: &Path) -> Result<()> {
     );
     let backing = super::rootfs_backing::RootfsBacking::reopen(&krun)?;
     backing.ensure_same_device(&new)?;
-    remove_at(root, &new)
+    remove_at(&root, &new)
+}
+
+fn normalize_recorded_home_alias(
+    root: &Path,
+    raw_home: &Path,
+    canonical_home: &Path,
+) -> Result<PathBuf> {
+    let raw_krun = raw_home.join(".pillbox/krun");
+    let Ok(suffix) = root.strip_prefix(&raw_krun) else {
+        return Ok(root.to_path_buf());
+    };
+    let parts: Vec<_> = suffix.components().collect();
+    let known_root = match parts.as_slice() {
+        [Component::Normal(namespace), Component::Normal(vm), Component::Normal(name)] => {
+            *namespace == "vm-rootfs"
+                && vm.to_string_lossy().starts_with("vm-")
+                && *name == "rootfs"
+        }
+        [Component::Normal(backing), Component::Normal(namespace), Component::Normal(vm), Component::Normal(name)] => {
+            *backing == "case-sensitive-rootfs"
+                && *namespace == "vm-rootfs"
+                && vm.to_string_lossy().starts_with("vm-")
+                && *name == "rootfs"
+        }
+        _ => false,
+    };
+    ensure!(
+        known_root,
+        "recorded rootfs has an unknown path beneath trusted HOME"
+    );
+    Ok(canonical_home.join(".pillbox/krun").join(suffix))
 }
 
 fn remove_at(root: &Path, runtimes: &Path) -> Result<()> {
@@ -149,6 +189,40 @@ mod tests {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     #[test]
+    fn recorded_home_alias_rewrites_only_known_vm_root_shapes() {
+        let fixture = tempfile::tempdir().unwrap();
+        let home = fixture.path().join("real-home");
+        fs::create_dir(&home).unwrap();
+        let alias = fixture.path().join("home-alias");
+        std::os::unix::fs::symlink(&home, &alias).unwrap();
+        let canonical = fs::canonicalize(&alias).unwrap();
+        for suffix in [
+            "vm-rootfs/vm-old/rootfs",
+            "case-sensitive-rootfs/vm-rootfs/vm-new/rootfs",
+        ] {
+            let raw = alias.join(".pillbox/krun").join(suffix);
+            let expected = canonical.join(".pillbox/krun").join(suffix);
+            assert_eq!(
+                normalize_recorded_home_alias(&raw, &alias, &canonical).unwrap(),
+                expected
+            );
+            assert_eq!(
+                normalize_recorded_home_alias(&expected, &alias, &canonical).unwrap(),
+                expected
+            );
+        }
+        let unknown = alias.join(".pillbox/krun/rootfs/v5/seed");
+        assert!(normalize_recorded_home_alias(&unknown, &alias, &canonical).is_err());
+        let traversal = alias.join(".pillbox/krun/vm-rootfs/../rootfs");
+        assert!(normalize_recorded_home_alias(&traversal, &alias, &canonical).is_err());
+        let outside = fixture.path().join("outside/vm-rootfs/vm-old/rootfs");
+        assert_eq!(
+            normalize_recorded_home_alias(&outside, &alias, &canonical).unwrap(),
+            outside
+        );
+    }
+
+    #[test]
     fn concurrent_and_successor_roots_do_not_share_writes_or_inodes() {
         let fixture = tempfile::tempdir().unwrap();
         let base = fixture.path().join("base");
@@ -157,6 +231,7 @@ mod tests {
         fs::write(base.join("etc/config"), "image default").unwrap();
         fs::set_permissions(base.join("tmp"), fs::Permissions::from_mode(0o1777)).unwrap();
         std::os::unix::fs::symlink("etc/config", base.join("config-link")).unwrap();
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
         let runtimes = fixture.path().join("runtimes");
         let mut a = PrivateRootfs::fork(&base, &runtimes).unwrap();
         let b = PrivateRootfs::fork(&base, &runtimes).unwrap();
@@ -175,6 +250,18 @@ mod tests {
                 .mode()
                 & 0o777,
             0o700
+        );
+        assert_eq!(
+            fs::metadata(&base).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&*a).unwrap().permissions().mode() & 0o7777,
+            0o755
+        );
+        assert_eq!(
+            fs::metadata(&*b).unwrap().permissions().mode() & 0o7777,
+            0o755
         );
         assert_eq!(
             fs::metadata(a.join("tmp")).unwrap().permissions().mode() & 0o7777,

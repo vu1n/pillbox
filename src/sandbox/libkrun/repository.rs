@@ -581,6 +581,7 @@ fn prepare_rootfs(
     );
     let runtime = tempfile::Builder::new()
         .prefix("invocation-")
+        .permissions(fs::Permissions::from_mode(0o700))
         .tempdir_in(&cache_root)?;
     let rootfs = runtime.path().join("rootfs");
     if let Err(error) = provision_image(image_id, &cache_root, &rootfs, deadline, cancelled) {
@@ -1713,6 +1714,12 @@ fn materialize_and_clone(
     if method == crate::workspace::cow::CloneMethod::Copied {
         eprintln!("pillbox: bounded rootfs fork fell back to a full copy");
     }
+    super::metadata::prepare_private_root(
+        &spec.destination,
+        spec.destination
+            .parent()
+            .context("private rootfs parent missing")?,
+    )?;
     check_live(deadline, cancelled)
 }
 
@@ -3340,6 +3347,11 @@ with open(sys.argv[1], 'w') as output:
         let stage = tempfile::tempdir_in(&cache).unwrap();
         fs::create_dir(stage.path().join("rootfs")).unwrap();
         fs::write(stage.path().join("rootfs/proof"), b"pristine").unwrap();
+        fs::set_permissions(
+            stage.path().join("rootfs"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
         commit_generation(stage, &cache.join(&image_id[7..]), &image_id).unwrap();
         let private = tempfile::tempdir_in(&cache).unwrap();
         fs::set_permissions(private.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -3353,6 +3365,30 @@ with open(sys.argv[1], 'w') as output:
             ImagePreparationRole::CachedFixture,
         )
         .unwrap();
+        assert_eq!(
+            fs::symlink_metadata(cache.join(&image_id[7..]).join("rootfs"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700
+        );
+        assert_eq!(
+            fs::symlink_metadata(&destination)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o755
+        );
+        assert_eq!(
+            fs::symlink_metadata(private.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700
+        );
         assert_eq!(fs::read(destination.join("proof")).unwrap(), b"pristine");
         fs::write(destination.join("proof"), b"private edit").unwrap();
         assert_eq!(

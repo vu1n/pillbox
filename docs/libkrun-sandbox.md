@@ -73,6 +73,11 @@ host: pillbox  ──FFI──▶ libkrun (KVM/HVF microVM)
   cannot reach the seed, concurrent VMs, or later runs. No shared-root or
   case-insensitive fallback is allowed.
 
+  Resolve aliases in the trusted operator HOME path before entering managed
+  storage (including macOS `/var` to `/private/var`). Symlinks inside `.pillbox`,
+  the krun namespace, or backing paths remain rejected. A recorded old root may
+  use that same trusted HOME alias; this never grants cleanup of another namespace.
+
   Backing creation and attachment are serialized and bounded. Before serving a
   cache or preparing a VM, validate private ownership, the backing/mount identity,
   actual case-sensitive lookup, and free space on both the host and mounted
@@ -89,6 +94,12 @@ host: pillbox  ──FFI──▶ libkrun (KVM/HVF microVM)
   because detached or concurrent VMMs may still use it. Subsequent launches may
   reattach the same validated backing after a host restart. No automatic unmount,
   growth, cache collection, or deletion of an unknown mount is permitted.
+
+  Before boot, a fresh private clone has a guest-searchable `0755` root,
+  independent of the operator umask. On macOS its root-only guest metadata maps
+  ownership to `0:0`; host ownership remains with the operator. Cache, backing,
+  and private clone parent directories stay `0700`. Normalize only the new clone,
+  never a published seed or an existing session root.
 
   Private roots remain available after an intentional detach and are recorded in
   session handles. Cleanup requires confirmed VMM shutdown; failed attribution or

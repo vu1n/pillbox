@@ -246,6 +246,42 @@ pub(crate) fn run(manifest_path: &Path, repository: &Path) -> Result<()> {
     }
 }
 
+fn receive_report(
+    vm: &mut repository::OwnedVm,
+    configuration: &verifier::VerifierConfiguration,
+    report: &mut Vec<u8>,
+) -> Result<()> {
+    let cancelled = || false;
+    let mut stream = vm.connect_rpc(&cancelled)?;
+    loop {
+        let mut chunk = [0; 8192];
+        match stream.read(&mut chunk) {
+            Ok(0) => {
+                ensure!(!report.is_empty(), "verifier disconnected without a report");
+                return Ok(());
+            }
+            Ok(n) => {
+                let remaining = configuration
+                    .max_report_bytes()
+                    .saturating_sub(report.len());
+                ensure!(n <= remaining, "verifier report limit exceeded");
+                report.extend_from_slice(&chunk[..n]);
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
+                ) =>
+            {
+                vm.check_running(&cancelled)?;
+            }
+            Err(error) => return Err(error).context("read verifier report"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::VerifierDefinition;
@@ -359,41 +395,5 @@ mod tests {
         std::fs::write(&path, vec![b' '; MAX_MANIFEST_BYTES as usize + 1]).unwrap();
         let error = run(&path, directory.path()).unwrap_err();
         assert!(error.to_string().contains("exceeds 1 MiB"));
-    }
-}
-
-fn receive_report(
-    vm: &mut repository::OwnedVm,
-    configuration: &verifier::VerifierConfiguration,
-    report: &mut Vec<u8>,
-) -> Result<()> {
-    let cancelled = || false;
-    let mut stream = vm.connect_rpc(&cancelled)?;
-    loop {
-        let mut chunk = [0; 8192];
-        match stream.read(&mut chunk) {
-            Ok(0) => {
-                ensure!(!report.is_empty(), "verifier disconnected without a report");
-                return Ok(());
-            }
-            Ok(n) => {
-                let remaining = configuration
-                    .max_report_bytes()
-                    .saturating_sub(report.len());
-                ensure!(n <= remaining, "verifier report limit exceeded");
-                report.extend_from_slice(&chunk[..n]);
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock
-                        | io::ErrorKind::TimedOut
-                        | io::ErrorKind::Interrupted
-                ) =>
-            {
-                vm.check_running(&cancelled)?;
-            }
-            Err(error) => return Err(error).context("read verifier report"),
-        }
     }
 }

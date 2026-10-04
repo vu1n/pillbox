@@ -2,10 +2,12 @@
 //! The host file broker is the only repository access: builder VMs have no
 //! repository shares. Live confinement and native-fork tests remain a release gate.
 
+use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
@@ -219,6 +221,10 @@ impl OwnedVm {
         self.owner.take();
         self.rpc_listener.take();
         let status = self.process.stop_and_reap()?;
+        if let Some(runtime) = self.runtime.as_ref() {
+            prepare_owned_runtime_removal(runtime.path(), self.process.stopped)
+                .context("prepare stopped VM runtime removal")?;
+        }
         if let Some(runtime) = self.runtime.take() {
             runtime.close().context("remove stopped VM runtime")?;
         }
@@ -227,6 +233,119 @@ impl OwnedVm {
         }
         Ok(status)
     }
+}
+
+/// Image clones retain their read-only host directory modes. Make only this
+/// stopped invocation's owned directories removable before TempDir closes it.
+fn prepare_owned_runtime_removal(root: &Path, stop_confirmed: bool) -> Result<()> {
+    ensure!(stop_confirmed, "VM stop/reap was not confirmed");
+    let root_metadata = fs::symlink_metadata(root).context("inspect owned VM runtime root")?;
+    ensure!(
+        root_metadata.is_dir() && !root_metadata.file_type().is_symlink(),
+        "owned VM runtime root is not a plain directory"
+    );
+    let owner = unsafe { libc::geteuid() };
+    ensure!(
+        root_metadata.uid() == owner,
+        "owned VM runtime root has a different owner"
+    );
+    let device = root_metadata.dev();
+    // The TempDir root is created with owner read access. Cloned descendants
+    // can be search-only, so prepare them relative to an already-open parent.
+    let root_directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(root)
+        .context("open owned VM runtime root")?;
+    let mut pending = vec![(root.to_path_buf(), root_directory)];
+    while let Some((path, directory)) = pending.pop() {
+        let metadata = directory.metadata()?;
+        ensure!(
+            metadata.is_dir() && metadata.uid() == owner && metadata.dev() == device,
+            "owned VM runtime directory is not local and owned: {}",
+            path.display()
+        );
+        let mode = metadata.permissions().mode();
+        if mode & 0o700 != 0o700 {
+            directory
+                .set_permissions(fs::Permissions::from_mode(mode | 0o700))
+                .with_context(|| {
+                    format!("permit owned VM runtime removal at {}", path.display())
+                })?;
+        }
+        for entry in fs::read_dir(&path)
+            .with_context(|| format!("list owned VM runtime directory {}", path.display()))?
+        {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name_c = CString::new(name.as_bytes()).context("runtime entry contains NUL")?;
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe {
+                libc::fstatat(
+                    directory.as_raw_fd(),
+                    name_c.as_ptr(),
+                    &mut stat,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+            {
+                return Err(std::io::Error::last_os_error()).with_context(|| {
+                    format!("inspect owned VM runtime entry {}", entry.path().display())
+                });
+            }
+            if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+                continue;
+            }
+            let child_path = path.join(&name);
+            ensure!(
+                stat.st_uid == owner && stat.st_dev as u64 == device,
+                "owned VM runtime directory is not local and owned: {}",
+                child_path.display()
+            );
+            if (stat.st_mode as u32) & 0o700 != 0o700 {
+                let result = unsafe {
+                    libc::fchmodat(
+                        directory.as_raw_fd(),
+                        name_c.as_ptr(),
+                        (stat.st_mode as u32 | 0o700) as libc::mode_t,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                };
+                if result != 0 {
+                    return Err(std::io::Error::last_os_error()).with_context(|| {
+                        format!(
+                            "permit owned VM runtime removal at {}",
+                            child_path.display()
+                        )
+                    });
+                }
+            }
+            let fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    name_c.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error()).with_context(|| {
+                    format!("open owned VM runtime directory {}", child_path.display())
+                });
+            }
+            let child_directory = unsafe { File::from_raw_fd(fd) };
+            let child_metadata = child_directory.metadata()?;
+            ensure!(
+                child_metadata.is_dir()
+                    && child_metadata.uid() == owner
+                    && child_metadata.dev() == device
+                    && child_metadata.ino() == stat.st_ino as u64,
+                "owned VM runtime directory changed during preparation: {}",
+                child_path.display()
+            );
+            pending.push((child_path, child_directory));
+        }
+    }
+    Ok(())
 }
 
 impl Drop for OwnedVm {
@@ -1941,6 +2060,95 @@ mod tests {
     }
 
     #[test]
+    fn stopped_runtime_removal_handles_nested_read_only_directories() {
+        let runtime = tempfile::tempdir().unwrap();
+        let nested = runtime.path().join("rootfs/opt/dependency");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("module.js"), b"fixture").unwrap();
+        for path in [nested.as_path(), nested.parent().unwrap()] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o555)).unwrap();
+        }
+
+        prepare_owned_runtime_removal(runtime.path(), true).unwrap();
+        assert_eq!(fs::read(nested.join("module.js")).unwrap(), b"fixture");
+        assert_eq!(
+            fs::metadata(&nested).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        runtime.close().unwrap();
+    }
+
+    #[test]
+    fn stopped_runtime_removal_handles_search_only_clone_directories() {
+        let runtime = tempfile::tempdir().unwrap();
+        let search_only = runtime.path().join("rootfs/search-only");
+        let write_search = search_only.join("write-search");
+        fs::create_dir_all(&write_search).unwrap();
+        fs::write(write_search.join("nested-file"), b"fixture").unwrap();
+        fs::set_permissions(&write_search, fs::Permissions::from_mode(0o300)).unwrap();
+        fs::set_permissions(&search_only, fs::Permissions::from_mode(0o100)).unwrap();
+
+        prepare_owned_runtime_removal(runtime.path(), true).unwrap();
+        assert_eq!(
+            fs::metadata(&search_only).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&write_search).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::read(write_search.join("nested-file")).unwrap(),
+            b"fixture"
+        );
+        runtime.close().unwrap();
+    }
+
+    #[test]
+    fn stopped_runtime_removal_never_follows_external_symlink() {
+        let runtime = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let external_dir = external.path().join("dependency");
+        fs::create_dir(&external_dir).unwrap();
+        fs::write(external_dir.join("untouched"), b"outside").unwrap();
+        fs::set_permissions(&external_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        std::os::unix::fs::symlink(&external_dir, runtime.path().join("link")).unwrap();
+
+        prepare_owned_runtime_removal(runtime.path(), true).unwrap();
+        runtime.close().unwrap();
+        assert_eq!(
+            fs::read(external_dir.join("untouched")).unwrap(),
+            b"outside"
+        );
+        assert_eq!(
+            fs::metadata(&external_dir).unwrap().permissions().mode() & 0o777,
+            0o555
+        );
+        fs::set_permissions(&external_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn unconfirmed_stop_does_not_change_private_runtime() {
+        let runtime = tempfile::tempdir().unwrap();
+        let nested = runtime.path().join("rootfs");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("evidence"), b"preserved").unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o555)).unwrap();
+
+        assert!(prepare_owned_runtime_removal(runtime.path(), false)
+            .unwrap_err()
+            .to_string()
+            .contains("stop/reap was not confirmed"));
+        assert_eq!(
+            fs::metadata(&nested).unwrap().permissions().mode() & 0o777,
+            0o555
+        );
+        assert_eq!(fs::read(nested.join("evidence")).unwrap(), b"preserved");
+        prepare_owned_runtime_removal(runtime.path(), true).unwrap();
+        runtime.close().unwrap();
+    }
+
+    #[test]
     fn cache_requires_exact_marker_and_plain_rootfs() {
         let dir = tempfile::tempdir().unwrap();
         let generation = dir.path().join("generation");
@@ -2072,7 +2280,9 @@ mod tests {
         assert_eq!(captured.bytes.len(), 64 * 1024);
         assert!(captured
             .bytes
-            .chunks_exact(16)
+            .as_chunks::<16>()
+            .0
+            .iter()
             .all(|chunk| chunk == b"0123456789abcdef"));
     }
 

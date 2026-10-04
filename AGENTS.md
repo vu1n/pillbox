@@ -133,8 +133,20 @@ Decisions are **ratified constraints, not editable notes**. Develop *to* them:
   yourself. Write `.brief/amendments/<anchor-id>.md` (what should change and why), record
   `<anchor-id> amend-proposed: <reason>` in `.brief/SIGNOFF`, and STOP — it needs human
   ratification before code can land. Never bypass the commit hook.
-- Prefer a short `// Context: doc://...#anchor` ref over re-explaining a decision in code.
+- At each site that embodies a decision, leave a one-line comment:
+  `// Context: doc://<project>/<doc-id>@latest#<anchor> — <the rule, in one line>`.
+  The ref makes it checkable; the one-line rule puts the constraint in front of the next
+  agent exactly where it touches the code. Keep the full reasoning in the decision doc.
+- If your memory, notes, or habits disagree with an active decision, the decision wins:
+  it is versioned and reviewed with the code, memory is not. Follow the decision and say
+  which memory looked stale.
 
 **Before committing, run `brief check`** (resolve anything it flags) and `brief pin`
 (freeze any `@latest`/`@current` refs you wrote to a concrete revision). CI runs the same
 check on PRs — that is the backstop; don't bypass it.
+
+**After authoring/publishing a decision — or before opening a PR — run `brief doctor`**
+and close what it flags (wire a `// Context:` ref into governed code, pin a floating ref,
+publish a draft you now rely on, re-verify a ref the latest revision made stale). It is
+advisory, not a gate: it exists so *you* catch latent drift instead of leaving it for a
+human to notice later.

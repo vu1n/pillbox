@@ -11,4 +11,4 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       # Pinned so a push to brief main can't silently change this repo's merge gate. Bump deliberately.
       - name: brief governance gate
-        run: uvx --from git+https://github.com/vu1n/brief@f2547491c06fbec1f7f9bf7b50d08f4c42b8191a brief check --base "origin/${{ github.base_ref }}"
+        run: uvx --from git+https://github.com/vu1n/brief@v0.1.0 brief check --base "origin/${{ github.base_ref }}"

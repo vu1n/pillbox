@@ -258,3 +258,4 @@ substrate-plane-livesession conforms: Test-only lifecycle polling changes no Liv
 libkrun-is-the-backend conforms: The v0.3.0 package version changes no default features or backend boundary; runner publication adds the native arm64 rootfs needed by Apple Silicon libkrun.
 runner-image-tags-name-roles conforms: Native architecture builds publish verified digest-only images before a combined manifest; main dispatch updates dev, stable vX.Y.Z tags update the matching immutable image and latest.
 docs-governance conforms: The runner guide records refreshed stable pins, the v4 seed/private-root distinction, architecture verification, and unchanged sealed-profile qualification requirements.
+docs-governance conforms: AGENTS.md change is only brief init's refresh of the generated Context Vault block (v0.1.0 convention text); the docs router, canonical-per-subsystem docs and decisions log are unchanged.

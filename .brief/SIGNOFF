@@ -278,3 +278,4 @@ libkrun-env-fork-substrate amend-proposed: add signoff: required (security bound
 secret-on-disk-0600 amend-proposed: add signoff: required (security boundary; brief v0.3.0 opt-in)
 vault-egress-default-deny amend-proposed: add signoff: required (security boundary; brief v0.3.0 opt-in)
 workspace-ingest-sovereignty amend-proposed: add signoff: required (security boundary; brief v0.3.0 opt-in)
+managed-tier-do-gateway amend-proposed: add signoff: required (cost boundary: no custom DO; brief v0.3.0 opt-in)

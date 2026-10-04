@@ -11,15 +11,15 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - name: brief governance gate
         # pinned; upgrade by re-running `brief init --ci` from a newer brief
-        run: uvx --from git+https://github.com/vu1n/brief@v0.2.0 brief check --base "origin/${{ github.base_ref }}"
+        run: uvx --from git+https://github.com/vu1n/brief@v0.4.2 brief check --base "origin/${{ github.base_ref }}"
       - name: brief doctor (advisory — latent drift; does not block)
         if: always()   # surface drift even when the gate blocks, for the human PR view
-        run: uvx --from git+https://github.com/vu1n/brief@v0.2.0 brief doctor --repo .
+        run: uvx --from git+https://github.com/vu1n/brief@v0.4.2 brief doctor --repo .
       - name: brief update check (advisory)
         if: always()
         run: |
-          latest=$(git ls-remote --tags --refs https://github.com/vu1n/brief 'v*' | sed 's|.*refs/tags/||' | sort -V | tail -1)
-          if [ -n "$latest" ] && [ "$latest" != "v0.2.0" ] \
-             && [ "$(printf '%s\n' v0.2.0 "$latest" | sort -V | tail -1)" = "$latest" ]; then
-            echo "::notice title=brief $latest is available (this repo pins v0.2.0)::Upgrade: uvx --from git+https://github.com/vu1n/brief@$latest brief init --ci --with-skills, then commit."
+          latest=$(git ls-remote --tags --refs https://github.com/vu1n/brief 'v*' | sed 's|.*refs/tags/||' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          if [ -n "$latest" ] && [ "$latest" != "v0.4.2" ] \
+             && [ "$(printf '%s\n' v0.4.2 "$latest" | sort -V | tail -1)" = "$latest" ]; then
+            echo "::notice title=brief $latest is available (this repo pins v0.4.2)::Read https://github.com/vu1n/brief/blob/$latest/UPGRADING.md for what to do, then run: uvx --from git+https://github.com/vu1n/brief@$latest brief init --ci --with-skills, and commit."
           fi

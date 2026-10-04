@@ -17,6 +17,7 @@ id: <doc-id>            # kebab, stable; e.g. adr-007-session-ownership
 project: <project>
 type: decision
 status: active          # draft = freely editable while forming; active/ratified = LOCKED
+signoff: required       # optional; omit unless silent drift is dangerous (see Rules)
 title: <one line>
 related_code:           # the governed surface — globs, not every file
   - "src/session/**"
@@ -37,11 +38,22 @@ related_code:           # the governed surface — globs, not every file
 
 ## Rules
 
+- **Is it a decision at all?** Only if a capable agent reading the code would plausibly do
+  the wrong thing AND that mistake is costly or hard to undo. Otherwise write a one-line
+  why-comment at the code (and a feature-map Gotcha) instead. Every extra decision dilutes
+  the ones that matter.
+- **`signoff: required` is for the dangerous few** (security boundaries, data loss, money,
+  irreversible formats). It makes `brief check` ask for a `conforms` line whenever a change
+  touches the code under this decision's `// Context:` refs. Without it the decision is
+  still read-only; its refs and one-line rules do the informing. Adding or removing it on
+  an active decision is an edit, so it goes through `brief ratify`.
+
 - **The anchor is a promise.** kebab-case, stable, never renamed after code references it.
   It is the citable API — pick it deliberately.
-- **Scope `related_code` to the governed surface**, not the whole repo. Over-scoping trips
-  the gate on every commit; under-scoping leaves the decision unenforced. Glob the files
-  that actually embody the decision.
+- **Scope `related_code` to the governed surface**, not the whole repo. Glob the files that
+  actually embody the decision. The `// Context:` refs narrow it further: with
+  `signoff: required`, only a change to the block under a ref (or to a governed file with
+  no ref at all) asks for a sign-off, so wire refs at the specific functions.
 - **Write the invariant to be conformance-checkable.** "Every event carries an actor" beats
   "actors matter." A good invariant can later get a `test://` link (L2 enforcement).
 - **Firmness:** start `draft` while forming (freely editable); promote to `active` once the

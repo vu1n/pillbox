@@ -242,3 +242,10 @@ libkrun-is-the-backend conforms: Bookmark forks reject unsupported non-microVM p
 libkrun-env-fork-substrate conforms: Bookmark dispatch preserves explicit workspace intent without changing guest environment, credential delivery, or egress policy.
 workspace-ingest-sovereignty conforms: Implicit bookmark forks use the immutable base cache instead of restoring over the project source; the pillbox-controlled secret exclusion and reporting rules remain unchanged.
 docs-governance conforms: The command guide records bookmark destination intent and the supported microVM boundary alongside the CLI change.
+
+libkrun-is-the-backend conforms: Each ordinary local VM and grader receives a private writable image clone; bounded repository execution retains its existing owned runtime root and libkrun remains the supported local backend.
+libkrun-env-fork-substrate conforms: Private VM roots preserve per-VM egress, environment setup, and credential delivery; cloning fails closed instead of sharing a writable seed.
+workspace-ingest-sovereignty conforms: Root image isolation leaves workspace fork, secret exclusion, and reporting contracts unchanged; writable guest roots never become future image seeds.
+docs-governance conforms: Canonical command and substrate guides document private root lifetime, confirmed teardown, and the v4 cache migration alongside the implementation.
+
+runner-image-tags-name-roles conforms: The build script only advances the local rootfs cache namespace to v4; dev, latest, immutable release tags, and configuration pointer roles are unchanged.

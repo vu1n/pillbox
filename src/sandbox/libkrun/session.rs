@@ -99,7 +99,7 @@ impl SandboxBackend for LibkrunBackend {
         // Build the launch packet (rootfs, CoW workspace + creds, env, CA, script,
         // VmSpec). The env-fork guard fails fast inside if a real credential leaked.
         let mut startup = StartupTimer::start();
-        let launch = prepare_launch(spec, &opts, resolved)?;
+        let mut launch = prepare_launch(spec, &opts, resolved)?;
         startup.mark("launch_prepare");
 
         // Detach: spawn the VM to outlive the CLI + record the session, then return.
@@ -152,6 +152,7 @@ impl SandboxBackend for LibkrunBackend {
         // would orphan it on a Ctrl-C in the boot window (before the pump's raw
         // mode forwards signals in-band). setsid is for the detached spawns only.
         let mut child = cmd.spawn().context("spawn the libkrun VMM subprocess")?;
+        launch.rootfs.preserve();
 
         // Hand the real credentials to the child's MITM out-of-band on stdin — the
         // reals never touch the guest env, argv, or the VmSpec file. Closing the
@@ -201,7 +202,11 @@ impl SandboxBackend for LibkrunBackend {
             }
             Err(e) => Err(e),
         };
-        let status = child.wait().ok();
+        let status = child
+            .wait()
+            .context("reap foreground VMM before rootfs cleanup")?;
+        confirm_vmm_stopped(&launch.spec_file.path().to_string_lossy())?;
+        launch.rootfs.remove_stopped()?;
         // Final drain of the agent's last transcript lines into the SessionLog.
         if let Some(tailer) = tailer {
             tailer.shutdown();
@@ -214,7 +219,7 @@ impl SandboxBackend for LibkrunBackend {
         // libkrun's undeclared dylibs). The attach/pump already failed with an
         // opaque "VMM exited" — replace it with the actionable cause when we can.
         if outcome.is_err() {
-            if let Some(deps_err) = sigabrt_boot_error(status) {
+            if let Some(deps_err) = sigabrt_boot_error(Some(status)) {
                 return Err(deps_err);
             }
         }
@@ -229,6 +234,7 @@ impl SandboxBackend for LibkrunBackend {
 /// supervise. `spec_file` (the VmSpec tempfile) must outlive the child's read, so
 /// it stays owned here; the CoW clones are torn down after the run.
 struct Launch {
+    rootfs: super::rootfs::PrivateRootfs,
     spec_file: tempfile::NamedTempFile,
     attach_sock: PathBuf,
     swap_pairs: Vec<SwapPair>,
@@ -284,7 +290,7 @@ fn guest_launch_preamble(ca_cert_pem: &str, guest_workspace: &str) -> String {
 /// in one place because it's security-sensitive setup the two paths must not let
 /// drift; they diverge *after* this on creds (stub vs raw), entrypoint, and VmSpec.
 struct LaunchBase {
-    rootfs: PathBuf,
+    rootfs: super::rootfs::PrivateRootfs,
     home: PathBuf,
     workspace_clone: PathBuf,
     guest_workspace: String,
@@ -718,6 +724,7 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
     serde_json::to_writer(&spec_file, &vmspec).context("write VMM spec")?;
 
     Ok(Launch {
+        rootfs,
         spec_file,
         attach_sock,
         swap_pairs,
@@ -726,6 +733,23 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
         guest_workspace,
         _ca: ca,
     })
+}
+
+fn commit_detached_session(
+    resolved: &Pillbox,
+    session: &crate::session::Session,
+    child: std::process::Child,
+    rootfs: &super::rootfs::PrivateRootfs,
+) -> Result<std::process::Child> {
+    if let Err(error) = crate::session::write(resolved, session) {
+        super::repository::stop_spawned_vmm(child)
+            .with_context(|| format!("detached session commit failed: {error:#}"))?;
+        rootfs
+            .remove_stopped()
+            .with_context(|| format!("detached session commit failed: {error:#}"))?;
+        return Err(error);
+    }
+    Ok(child)
 }
 
 /// Start the microVM detached: spawn the VMM child so it outlives the CLI (it's
@@ -740,7 +764,7 @@ fn run_detached(
     resolved: &Pillbox,
     session_id: &str,
     opts: &RunOpts,
-    launch: Launch,
+    mut launch: Launch,
     mut startup: StartupTimer,
 ) -> Result<()> {
     // The child reads the spec at startup, *after* we return — so persist it (a
@@ -766,6 +790,7 @@ fn run_detached(
     let mut child = cmd
         .spawn()
         .context("spawn the detached libkrun VMM subprocess")?;
+    launch.rootfs.preserve();
 
     // Env fork: hand the reals to the child's MITM on stdin (out-of-band), as the
     // foreground path does, then drop the pipe (EOF).
@@ -782,6 +807,7 @@ fn run_detached(
         creds: launch.creds_share.to_string_lossy().into_owned(),
         workspace: launch.workspace_clone.to_string_lossy().into_owned(),
         spec: spec_path.to_string_lossy().into_owned(),
+        rootfs: Some(launch.rootfs.to_string_lossy().into_owned()),
     };
     let session = crate::session::Session {
         id: session_id.to_string(),
@@ -800,7 +826,7 @@ fn run_detached(
         server: None,
         requested_execution: None,
     };
-    crate::session::write(resolved, &session)?;
+    let child = commit_detached_session(resolved, &session, child, &launch.rootfs)?;
     let startup_metrics = startup.finish("session_record");
     crate::events::emit_session_event(
         resolved,
@@ -816,7 +842,10 @@ fn run_detached(
         // wait-idle calls replay old turn boundaries. Tear the just-committed
         // session back down instead of returning a session that is known to be
         // unsafe to drive.
-        let _ = kill_session(resolved, &session);
+        super::repository::stop_spawned_vmm(child)
+            .with_context(|| format!("detached transcript tailer failed: {e:#}"))?;
+        kill_session(resolved, &session)
+            .with_context(|| format!("detached transcript tailer failed: {e:#}"))?;
         return Err(e).context("start detached session transcript tailer");
     }
     // Don't wait: the child (VM + egress + MITM, with the vault) is reparented to
@@ -897,7 +926,7 @@ fn launch_server_vm(
     // Server-mode VMs always reparent (regardless of `--detach`), so the CA must
     // outlive this process — `Persistent`, never a host tempdir.
     let LaunchBase {
-        rootfs,
+        mut rootfs,
         home,
         workspace_clone: clone,
         guest_workspace,
@@ -999,6 +1028,7 @@ fn launch_server_vm(
     arm_commit_guard(&mut cmd, resolved, &session_id);
     vmm_own_process_group(&mut cmd);
     let mut child = cmd.spawn().context("spawn the libkrun VMM subprocess")?;
+    rootfs.preserve();
     // No swap pairs (non-vault): hand the child's MITM an empty set + EOF.
     if let Some(mut sin) = child.stdin.take() {
         use std::io::Write as _;
@@ -1021,6 +1051,7 @@ fn launch_server_vm(
             creds: creds_share.to_string_lossy().into_owned(),
             workspace: clone.to_string_lossy().into_owned(),
             spec: spec_path.to_string_lossy().into_owned(),
+            rootfs: Some(rootfs.to_string_lossy().into_owned()),
         };
         let session = crate::session::Session {
             id: session_id.clone(),
@@ -1090,7 +1121,9 @@ fn launch_server_vm(
             // clobber that status with SIGKILL and mask the actionable cause.
             let self_status = child.try_wait().ok().flatten();
             let _ = child.kill();
-            let _ = child.wait();
+            child.wait().context("reap failed server VMM")?;
+            reap_vmm_by_spec(&spec_path.to_string_lossy())?;
+            rootfs.remove_stopped()?;
             let _ = std::fs::remove_file(&host_sock);
             let _ = std::fs::remove_file(&spec_path);
             let _ = std::fs::remove_dir_all(&creds_share);
@@ -1223,7 +1256,7 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
 
     let mut startup = StartupTimer::start();
     let LaunchBase {
-        rootfs,
+        mut rootfs,
         home,
         workspace_clone,
         guest_workspace,
@@ -1296,6 +1329,7 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
         creds: creds_share.to_string_lossy().into_owned(),
         workspace: workspace_clone.to_string_lossy().into_owned(),
         spec: spec_path.to_string_lossy().into_owned(),
+        rootfs: Some(rootfs.to_string_lossy().into_owned()),
     };
     let mut session = crate::session::Session {
         id: session_id.clone(),
@@ -1335,8 +1369,10 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
             .arg(&spec_path)
             .env_clear()
             .envs(boot::static_child_env());
+        rootfs.preserve();
         let output = super::repository::run_supervised_vmm(&mut cmd, vmspec, &spec_path)
             .context("run supervised structured libkrun VMM")?;
+        rootfs.remove_stopped()?;
         let diagnostic = structured_vmm_diagnostic(&output.stderr);
         Ok((output.status, diagnostic))
     })();
@@ -1344,6 +1380,11 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
     let (status, vmm_diagnostic) = match execution {
         Ok(outcome) => outcome,
         Err(error) => {
+            if !error.is::<super::repository::TeardownUnconfirmed>() {
+                rootfs
+                    .remove_stopped()
+                    .with_context(|| format!("structured launch failed: {error:#}"))?;
+            }
             return fail_structured_launch(
                 resolved,
                 spec.id,
@@ -1617,6 +1658,8 @@ struct LibkrunHandle {
     creds: String,
     workspace: String,
     spec: String,
+    #[serde(default)]
+    rootfs: Option<String>,
 }
 
 impl LibkrunHandle {
@@ -1746,7 +1789,7 @@ pub(crate) fn score_in_sandbox(
     // Same disk-pressure guard as the run path: the grader VM materializes the
     // rootfs and mounts the workspace clone — refuse below the floor, not mid-boot.
     disk_preflight()?;
-    let rootfs = materialize_rootfs(resolved)?;
+    let mut rootfs = materialize_rootfs(resolved)?;
 
     // Egress is opt-in: an empty allowlist keeps the bare/offline grader. When
     // hosts are declared, prepend the NIC-up + CA-trust preamble (so the guest's
@@ -1863,6 +1906,7 @@ pub(crate) fn score_in_sandbox(
                                               // No `setsid`: the grader is a supervised one-shot reaped via `child.wait`
                                               // below, not via `killpg` — same rationale as the foreground run.
     let mut child = cmd.spawn().context("spawn the grader VMM subprocess")?;
+    rootfs.preserve();
     let mut out = String::new();
     if let Some(mut so) = child.stdout.take() {
         so.read_to_string(&mut out).ok();
@@ -1872,6 +1916,8 @@ pub(crate) fn score_in_sandbox(
         .context("await grader VMM")?
         .code()
         .unwrap_or(-1);
+    confirm_vmm_stopped(&spec_file.path().to_string_lossy())?;
+    rootfs.remove_stopped()?;
     Ok((code, out))
 }
 
@@ -2013,7 +2059,10 @@ pub(crate) fn kill_session(resolved: &Pillbox, session: &crate::session::Session
         unsafe { libc::kill(pid, libc::SIGTERM) };
     }
     let handle = LibkrunHandle::decode(session)?;
-    reap_vmm_by_spec(&handle.spec);
+    reap_vmm_by_spec(&handle.spec)?;
+    if let Some(rootfs) = &handle.rootfs {
+        super::rootfs::remove_owned(Path::new(rootfs))?;
+    }
     let _ = std::fs::remove_file(&handle.sock);
     let _ = std::fs::remove_file(&handle.spec);
     let _ = std::fs::remove_dir_all(&handle.creds);
@@ -2051,57 +2100,69 @@ pub(crate) fn kill_session(resolved: &Pillbox, session: &crate::session::Session
 /// Attribution-safe: the spec path is unique to THIS session (a `.keep()`'d
 /// tempfile), so it can't match another pillbox's VM — never a blind host-wide
 /// sweep of `~/.pillbox/krun/` (shared across pillboxes). Nothing carrying the
-/// spec ⇒ the VM is already down (a clean no-op); if `ps` itself can't run,
-/// [`vmm_groups_for_spec`] warns rather than letting the leak go silent.
-fn reap_vmm_by_spec(spec: &str) {
-    let mut killed: Vec<i32> = Vec::new();
-    for (_pid, pgid) in vmm_groups_for_spec(spec) {
-        // pgid must be a real, positive group id: `killpg(0)` would signal OUR OWN
-        // process group (the pillbox CLI + whatever launched it) and a negative
-        // arg is invalid — never let a malformed `ps` line turn a reap into
-        // self-slaughter. A real VMM's pgid is its own pid (setsid), always > 1.
-        if pgid > 1 && !killed.contains(&pgid) {
+/// spec ⇒ the VM is already down. A failed scan or surviving group returns an
+/// error, preserving the session and its private files for recovery.
+fn reap_vmm_by_spec(spec: &str) -> Result<()> {
+    let mut killed = Vec::new();
+    for (_pid, pgid) in vmm_groups_for_spec(spec)? {
+        anyhow::ensure!(
+            pgid > 1 && pgid != unsafe { libc::getpgrp() },
+            "refuse unsafe VMM process group {pgid}"
+        );
+        if !killed.contains(&pgid) {
+            super::repository::signal_group(pgid, libc::SIGKILL)
+                .context(super::repository::TeardownUnconfirmed)?;
             killed.push(pgid);
-            // Result ignored: a group that exited between the scan and here (ESRCH)
-            // is already in the goal state; reaping is best-effort, not a gate.
-            unsafe { libc::killpg(pgid, libc::SIGKILL) };
         }
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut alive = false;
+        for group in &killed {
+            alive |= super::repository::group_exists(*group)
+                .context(super::repository::TeardownUnconfirmed)?;
+        }
+        if !alive {
+            return confirm_vmm_stopped(spec);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(anyhow::Error::new(super::repository::TeardownUnconfirmed)
+                .context("VMM process group survived session teardown"));
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
-/// `(pid, pgid)` of every live `__krun-vmm` whose argv carries `spec`. One
-/// host-wide `ps` read (`-ax` so a reparented, controlling-terminal-less VMM is
-/// still listed; `-ww` so the trailing `<spec>` arg isn't width-truncated — it
-/// sits at the END of `__krun-vmm <spec>`, exactly where a clipped line would drop
-/// it). Filtering on both the subcommand AND the unique spec path is the
-/// attribution; empty (VM down, or `ps` unavailable) ⇒ no group to reap.
-fn vmm_groups_for_spec(spec: &str) -> Vec<(i32, i32)> {
-    match Command::new("ps")
+fn confirm_vmm_stopped(spec: &str) -> Result<()> {
+    if !vmm_groups_for_spec(spec)?.is_empty() {
+        return Err(anyhow::Error::new(super::repository::TeardownUnconfirmed)
+            .context("VMM still serves its private filesystem"));
+    }
+    Ok(())
+}
+
+fn vmm_groups_for_spec(spec: &str) -> Result<Vec<(i32, i32)>> {
+    anyhow::ensure!(
+        !spec.is_empty(),
+        "cannot confirm VMM teardown without its spec path"
+    );
+    let output = Command::new("ps")
         .args(["-axww", "-o", "pid=,pgid=,command="])
         .output()
-    {
-        Ok(out) if out.status.success() => {
-            parse_vmm_groups(&String::from_utf8_lossy(&out.stdout), spec)
-        }
-        // `ps` couldn't run (missing/un-spawnable) or exited non-zero — we could
-        // NOT verify whether a VMM lingers, and `kill_session` is about to delete
-        // the record. Warn loudly rather than silently leak a credential-holding
-        // microVM; this is the user's only signal to reap it by hand. (Empty spec
-        // has nothing to attribute, so stays quiet.)
-        result => {
-            if !spec.is_empty() {
-                let why = result
-                    .err()
-                    .map(|e| e.to_string())
-                    .unwrap_or_else(|| "ps exited non-zero".to_string());
-                eprintln!(
-                    "pillbox: warning: couldn't scan for this session's microVM ({why}); \
-                     if a `__krun-vmm` lingers, reap it with `pkill -9 -f {spec}`."
-                );
-            }
-            Vec::new()
-        }
+        .context(super::repository::TeardownUnconfirmed)
+        .context("scan VMM ownership before filesystem cleanup")?;
+    if !output.status.success() {
+        return Err(
+            anyhow::Error::new(super::repository::TeardownUnconfirmed).context(format!(
+                "VMM ownership scan failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )),
+        );
     }
+    Ok(parse_vmm_groups(
+        &String::from_utf8_lossy(&output.stdout),
+        spec,
+    ))
 }
 
 /// Pure parser for [`vmm_groups_for_spec`]: keep `ps` lines whose command carries
@@ -2592,9 +2653,75 @@ mod tests {
             creds: "/nonexistent/pillbox-test-creds".to_string(),
             workspace: "/nonexistent/pillbox-test-workspace".to_string(),
             spec: "/nonexistent/pillbox-test-spec.json".to_string(),
+            rootfs: None,
         })
         .unwrap();
         s
+    }
+
+    #[test]
+    fn failed_detached_commit_stops_child_and_removes_owned_root() {
+        let fixture = tempfile::tempdir().unwrap();
+        let blocked = fixture.path().join("not-a-directory");
+        std::fs::write(&blocked, "block record creation").unwrap();
+        let resolved = Pillbox {
+            scope: crate::pillbox::Scope::Global,
+            state_dir: blocked,
+            meta: None,
+        };
+        let base = fixture.path().join("base");
+        std::fs::create_dir(&base).unwrap();
+        let mut root =
+            super::super::rootfs::PrivateRootfs::fork(&base, &fixture.path().join("runtimes"))
+                .unwrap();
+        let path = root.to_path_buf();
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        vmm_own_process_group(&mut command);
+        let child = command.spawn().unwrap();
+        let group = child.id() as i32;
+        root.preserve();
+        assert!(
+            commit_detached_session(&resolved, &Session::test_fixture(), child, &root).is_err()
+        );
+        assert!(!super::super::repository::group_exists(group).unwrap());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn failed_teardown_preserves_private_root_and_session_record() {
+        let fixture = tempfile::tempdir().unwrap();
+        let resolved = Pillbox {
+            scope: crate::pillbox::Scope::Global,
+            state_dir: fixture.path().join("state"),
+            meta: None,
+        };
+        let root = fixture.path().join("rootfs");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("private-data"), "retained for live VM").unwrap();
+        let mut session = libkrun_pty_session();
+        let mut handle = LibkrunHandle::decode(&session).unwrap();
+        handle.spec.clear(); // Attribution missing: teardown cannot be confirmed.
+        handle.rootfs = Some(root.to_string_lossy().into_owned());
+        session.sandbox_id = serde_json::to_string(&handle).unwrap();
+        crate::session::write(&resolved, &session).unwrap();
+        assert!(kill_session(&resolved, &session).is_err());
+        assert!(crate::session::read(&resolved, &session.id)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            std::fs::read_to_string(root.join("private-data")).unwrap(),
+            "retained for live VM"
+        );
+    }
+
+    #[test]
+    fn legacy_session_handle_has_no_owned_rootfs() {
+        let mut session = libkrun_pty_session();
+        let mut legacy: serde_json::Value = serde_json::from_str(&session.sandbox_id).unwrap();
+        legacy.as_object_mut().unwrap().remove("rootfs");
+        session.sandbox_id = legacy.to_string();
+        assert!(LibkrunHandle::decode(&session).unwrap().rootfs.is_none());
     }
 
     #[test]

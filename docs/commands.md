@@ -88,6 +88,15 @@ PTY-free exec channel an orchestrator drives. Docker-backed today.
 | `pillbox sandbox list [--json]` | List sandboxes in the current pillbox. |
 | `pillbox sandbox destroy ID` | Kill the sandbox container and remove the record. |
 
+### Local VM filesystem isolation
+
+Every local microVM uses a private writable rootfs clone, including `/tmp` and
+system directories. The image cache is never mounted as a guest's writable root.
+Detached/server sessions retain their own clone until `session rm` confirms
+shutdown. Failed teardown preserves their session record and private files.
+Cache versions through v3 are excluded from new launches because they may contain
+previous guest writes; a fresh image export is required to initialize the v4 seed.
+
 ### Structured run ownership
 
 Local structured one-shot runs (`pi` and `cursor`) keep a lifetime socket to their

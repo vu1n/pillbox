@@ -571,6 +571,11 @@ fn fresh_directory(rootfs: &Path, guest_path: &str) -> Result<()> {
     crate::paths::ensure_mode_0700(&path)
 }
 
+/// Abort a spawned persistent VMM before handing ownership to its session record.
+pub(super) fn stop_spawned_vmm(child: Child) -> Result<ExitStatus> {
+    OwnedProcess::from_child(child, u64::MAX, true)?.stop_and_reap()
+}
+
 /// Structured one-shot runs are owned until exit, including when the CLI is SIGKILLed.
 /// The child arms its watcher before starting guest or egress work; closing this socket
 /// stops its group even when no host-side Drop or signal handler can run.
@@ -868,13 +873,9 @@ impl OwnedProcess {
             if let Some(stdout) = &process.stdout {
                 nonblocking(stdout.as_raw_fd())?;
             }
-            nonblocking(
-                process
-                    .stderr
-                    .as_ref()
-                    .context("child stderr missing")?
-                    .as_raw_fd(),
-            )?;
+            if let Some(stderr) = &process.stderr {
+                nonblocking(stderr.as_raw_fd())?;
+            }
             Ok(())
         })();
         if let Err(error) = configured {
@@ -976,7 +977,7 @@ impl Drop for OwnedProcess {
     }
 }
 
-fn signal_group(group: i32, signal: i32) -> Result<()> {
+pub(super) fn signal_group(group: i32, signal: i32) -> Result<()> {
     ensure!(group > 1, "refusing invalid owned process group");
     if unsafe { libc::killpg(group, signal) } < 0 {
         let error = std::io::Error::last_os_error();
@@ -987,7 +988,7 @@ fn signal_group(group: i32, signal: i32) -> Result<()> {
     Ok(())
 }
 
-fn group_exists(group: i32) -> Result<bool> {
+pub(super) fn group_exists(group: i32) -> Result<bool> {
     ensure!(group > 1, "refusing invalid owned process group");
     if unsafe { libc::killpg(group, 0) } == 0 {
         return Ok(true);

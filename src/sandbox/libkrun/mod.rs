@@ -49,6 +49,7 @@ mod local_forward;
 mod metadata;
 mod mitm;
 pub(crate) mod repository;
+mod rootfs;
 mod session;
 mod vault;
 
@@ -697,10 +698,16 @@ fn unsupported(spec: &AgentSpec, what: &str) -> anyhow::Error {
     .into()
 }
 
-const ROOTFS_CACHE_VERSION: &str = "v3";
-const ROOTFS_CACHE_MARKER_MAGIC: &str = "pillbox-rootfs-cache/v3";
+const ROOTFS_CACHE_VERSION: &str = "v4";
+const ROOTFS_CACHE_MARKER_MAGIC: &str = "pillbox-rootfs-cache/v4";
 const MAX_ROOTFS_MARKER_BYTES: u64 = 1_024;
 const ROOTFS_TAR_EXTRACT_FLAG: &str = "-xpf";
+
+/// Never hand a cached generation to a VMM; each caller owns a writable clone.
+fn materialize_rootfs(resolved: &Pillbox) -> Result<rootfs::PrivateRootfs> {
+    let base = materialize_rootfs_base(resolved)?;
+    rootfs::PrivateRootfs::fork(&base, &krun_cache_dir()?.join("vm-rootfs"))
+}
 
 /// Materialize the runner OCI image into a cached on-disk directory usable as a
 /// virtio-fs root (libkrun's `krun_set_root` takes a *directory*, not an image).
@@ -708,7 +715,8 @@ const ROOTFS_TAR_EXTRACT_FLAG: &str = "-xpf";
 /// `~/.pillbox/krun/rootfs/`. The key includes Docker's image id, not just the
 /// tag string, so mutable tags (`:rolling`) rematerialize after `docker pull`
 /// instead of reusing an older exported rootfs.
-fn materialize_rootfs(resolved: &Pillbox) -> Result<PathBuf> {
+// v3 and earlier were served writable to guests. They are never trusted as seeds.
+fn materialize_rootfs_base(resolved: &Pillbox) -> Result<PathBuf> {
     let (image, _) = crate::docker::resolve_runner_image(resolved);
     let rootfs_root = krun_cache_dir()?.join("rootfs");
     // The id-keyed cache needs Docker to resolve the tag → id. When Docker is
@@ -860,7 +868,7 @@ fn rootfs_unavailable_message(
 }
 
 /// Newest materialized rootfs generation for `image`, or `None`. The fallback
-/// when Docker can't resolve the live image id scans only that image's hashed v3
+/// when Docker can't resolve the live image id scans only that image's hashed v4
 /// namespace. A sibling marker binds each generation's exact image and image id;
 /// the guest receives only its `rootfs` child. Legacy generations are ignored.
 fn find_cached_rootfs(root: &Path, image: &str) -> Option<PathBuf> {
@@ -1142,6 +1150,22 @@ mod tests {
         )
         .unwrap();
 
+        let contaminated = root
+            .path()
+            .join("v3")
+            .join(rootfs_image_ref_key(image))
+            .join("sha256_4444");
+        std::fs::create_dir_all(contaminated.join("rootfs")).unwrap();
+        std::fs::write(
+            contaminated.join(".materialized"),
+            format!("pillbox-rootfs-cache/v3\n{image}\nsha256:4444\n"),
+        )
+        .unwrap();
+        // Even a newer exact v3 marker was writable by guests and cannot seed a new VM.
+        std::fs::File::open(contaminated.join(".materialized"))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()))
+            .unwrap();
         let hit = find_cached_rootfs(root.path(), image).expect("a matching generation");
         assert_eq!(hit, new_generation.join("rootfs"));
     }
@@ -1183,7 +1207,7 @@ mod tests {
         for (contents, expected) in [
             (rootfs_marker_contents(image, image_id), true),
             (
-                format!("pillbox-rootfs-cache/v1\n{image}\n{image_id}\n"),
+                format!("pillbox-rootfs-cache/v3\n{image}\n{image_id}\n"),
                 false,
             ),
             (

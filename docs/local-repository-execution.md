@@ -99,6 +99,10 @@ The sealed Python evaluator runs after a fixed, root-owned bootstrap disables an
 process dumpability. Same-UID repository subprocesses cannot inspect its memory through proc/ptrace.
 Trusted verifier source owns its evaluation semantics; importing repository code into its own
 interpreter does not create a process isolation boundary.
+The verifier supervisor mounts separate 128 MiB tmpfs volumes at `/workspace` (mode 0700) and
+`/tmp` (mode 1777), both with `MS_NOSUID | MS_NODEV`, before the unprivileged evaluator starts.
+The root filesystem is remounted read-only. These scratch bounds do not alter the sealed verifier
+definition, input snapshot limit, or the VM's memory, CPU, PID, and network restrictions.
 
 ## Credentials and transport
 

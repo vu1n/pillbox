@@ -259,6 +259,7 @@ libkrun-is-the-backend conforms: The v0.3.0 package version changes no default f
 runner-image-tags-name-roles conforms: Native architecture builds publish verified digest-only images before a combined manifest; main dispatch updates dev, stable vX.Y.Z tags update the matching immutable image and latest.
 docs-governance conforms: The runner guide records refreshed stable pins, the v4 seed/private-root distinction, architecture verification, and unchanged sealed-profile qualification requirements.
 docs-governance conforms: AGENTS.md change is only brief init's refresh of the generated Context Vault block (v0.1.0 convention text); the docs router, canonical-per-subsystem docs and decisions log are unchanged.
+docs-governance conforms: AGENTS.md change is only brief init's v0.2.0 refresh of the generated Context Vault block (feature-map paragraph); the router/canonical-doc discipline is unchanged.
 libkrun-is-the-backend conforms: libkrun/host.rs only loses a no-assertion probe test; the headroom and probe code is unchanged.
 rustic-cache-variant-gated conforms: rustic.rs only loses the test-only parse_full_handle helper and its test; repo_opts and the cache variants are untouched.
 managed-store-of-record conforms: managed.rs hoists the existing FinalizeBody struct to module scope so its test serializes the real /finalize body; the wire shape and store-of-record flow are unchanged.

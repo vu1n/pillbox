@@ -39,13 +39,6 @@ export type SupportedCodexExecution = InvocationExecution & {
   };
 };
 
-/** The generic ACP capability, independent of the selected harness. */
-export type SupportedAcpExecution = InvocationExecution & {
-  readonly transport: HarnessTransport & {
-    readonly transport: "acp";
-  };
-};
-
 export interface JsonSchemaOutputFormat {
   readonly type: "json_schema";
   readonly schema: { readonly [key: string]: JsonValue };
@@ -202,15 +195,6 @@ export class UnsupportedCodexExecutionError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "UnsupportedCodexExecutionError";
-  }
-}
-
-export class UnsupportedAcpExecutionError extends Error {
-  readonly code = "unsupported_execution" as const;
-
-  constructor(message: string) {
-    super(message);
-    this.name = "UnsupportedAcpExecutionError";
   }
 }
 
@@ -403,18 +387,6 @@ export function validateSupportedCodexExecution(
     );
   }
   return execution as SupportedCodexExecution;
-}
-
-/** Refine a valid broad Huddles execution to the generic ACP capability. */
-export function validateSupportedAcpExecution(
-  execution: InvocationExecution,
-): SupportedAcpExecution {
-  if (execution.transport.transport !== "acp") {
-    throw new UnsupportedAcpExecutionError(
-      `transport '${execution.transport.transport}' is not supported by the ACP adapter`,
-    );
-  }
-  return execution as SupportedAcpExecution;
 }
 
 function validateInvocationExecution(value: JsonValue | undefined): InvocationExecution {

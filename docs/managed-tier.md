@@ -148,9 +148,9 @@ shared namespace delta. This adds no runtime write or deployment requirement.
 - Request bodies are capped at 1 MiB, OpenCode control responses and SSE frames
   are capped before parsing, evidence is capped at 2,000 events / 8 MiB, and
   responses, costs, and cursors are bounded and identity-checked by the CLI.
-- Historical `ensureSession`/`invokeSession` adapters are local-test-only and
-  accept no managed authorization. The production Huddles entrypoint exposes
-  only authenticated v2 execute/status/cancel operations.
+- The production Huddles entrypoint exposes only authenticated v2
+  execute/status/cancel operations. The historical `ensureSession`/`invokeSession`
+  adapter was deleted on 2026-10-04.
 
 ## Cloudflare Computer
 

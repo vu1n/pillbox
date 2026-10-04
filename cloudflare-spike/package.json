@@ -6,7 +6,6 @@
   "scripts": {
     "dev": "wrangler dev",
     "test": "node --test *.test.ts *.test.mjs",
-    "smoke:ensure": "node --test ensure_session.test.mjs",
     "deploy": "wrangler deploy",
     "burnin:dry-run": "wrangler deploy -c wrangler.burnin.toml --dry-run --containers-rollout=none",
     "burnin": "node scripts/burnin-fixed-workload.mjs",

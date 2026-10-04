@@ -25,7 +25,7 @@ pub fn run(home: &std::path::Path, cwd: &std::path::Path, args: &[&str]) -> Outp
 
 /// Like [`run`] but with additional environment variables overlaid on
 /// top of the parent's env. Used to exercise env-driven code paths
-/// (e.g. `PILLBOX_SANDBOX_SIDE=1` for sandbox-side emitter detection)
+/// (e.g. a forced env var for one invocation)
 /// without polluting the test process's own env or racing siblings.
 #[allow(dead_code)]
 pub fn run_with_env(

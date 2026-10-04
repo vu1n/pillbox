@@ -8,6 +8,14 @@ moves the `:latest` runner image and ships the interactive attach
 transport (in-sandbox pty-host + frame protocol; local detach/reattach).
 `0.2.0` is the §0 multiplayer trust layer + the libkrun pivot (below).
 
+## Unreleased
+
+- Remove the `pillbox session started` command. Nothing in the tree called it;
+  `session done` is unchanged.
+- Remove the unused ACP adapter spikes and the local-test-only legacy Huddles
+  `ensureSession`/`invokeSession` adapter. Managed Huddles execution uses only
+  the authenticated `pillbox.execution/2` operations, as before.
+
 ## v0.3.0 — 2026-10-04
 
 - Isolate each local VM and grader in a private writable rootfs. Exclude old

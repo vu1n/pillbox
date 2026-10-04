@@ -976,9 +976,11 @@ mod tests {
     }
 
     #[test]
-    fn malformed_input_returns_empty() {
-        assert!(parse_line("", 0).is_empty());
-        assert!(parse_line("not json", 0).is_empty());
+    fn malformed_input_fails_and_payloadless_records_are_empty() {
+        // Production (tailer, drain) propagates decode errors, so undecodable
+        // lines must fail loudly rather than parse to nothing.
+        assert!(Parser::default().parse_line_checked("", 0).is_err());
+        assert!(Parser::default().parse_line_checked("not json", 0).is_err());
         assert!(parse_line("{}", 0).is_empty());
         assert!(parse_line(r#"{"type":"response_item"}"#, 0).is_empty()); // no payload
     }

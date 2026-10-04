@@ -260,3 +260,16 @@ runner-image-tags-name-roles conforms: Native architecture builds publish verifi
 docs-governance conforms: The runner guide records refreshed stable pins, the v4 seed/private-root distinction, architecture verification, and unchanged sealed-profile qualification requirements.
 docs-governance conforms: AGENTS.md change is only brief init's refresh of the generated Context Vault block (v0.1.0 convention text); the docs router, canonical-per-subsystem docs and decisions log are unchanged.
 docs-governance conforms: AGENTS.md change is only brief init's v0.2.0 refresh of the generated Context Vault block (feature-map paragraph); the router/canonical-doc discipline is unchanged.
+libkrun-is-the-backend conforms: libkrun/host.rs only loses a no-assertion probe test; the headroom and probe code is unchanged.
+rustic-cache-variant-gated conforms: rustic.rs only loses the test-only parse_full_handle helper and its test; repo_opts and the cache variants are untouched.
+managed-store-of-record conforms: managed.rs hoists the existing FinalizeBody struct to module scope so its test serializes the real /finalize body; the wire shape and store-of-record flow are unchanged.
+managed-tier-do-gateway conforms: no Durable Object, endpoint or request shape changes; the managed.rs edit is a struct move for testability.
+secret-on-disk-0600 conforms: rustic.rs only loses the test-only parse_full_handle helper and its test; the repo-password write path through paths.rs is unchanged.
+session-event-log-spine conforms: transcripts/mod.rs and codex.rs change only tests (one no-assertion test removed; the codex malformed-line test now asserts parse_line_checked errors, as the tailer sees it); producer, seq and log code are unchanged.
+docker-backend-deleted conforms: sandbox/mod.rs only drops the unused ACP spike module; no docker backend code is added or changed.
+qemu-parked conforms: no backend is added; sandbox/mod.rs only loses the unwired ACP spike module.
+dx-zero-config-local conforms: removing the unused `session started` verb leaves the local JSONL log, subscribe, watch and the host's own session.started emit unchanged.
+gateway-no-daemon conforms: no coordinator or log-writer change; commands/session/mod.rs only drops the `session started` verb.
+optimization-external-substrate-primitives conforms: `session score` and the Scored reward channel are untouched; only the `session started` verb is removed.
+remote-backend-plane-removed conforms: deleting the ACP spike adds no URL-transport backend; sandbox/mod.rs keeps only local and managed backends.
+substrate-plane-livesession conforms: LiveSession, Caps and select_backend are unchanged; the deleted ACP spike was never a LiveSession impl.

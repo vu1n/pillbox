@@ -528,22 +528,4 @@ mod tests {
         assert!(out.ends_with('…'));
         // Doesn't panic; truncation walked back to a char boundary.
     }
-
-    #[test]
-    fn emit_is_noop_without_endpoint_configured() {
-        // tracer() returns None when OTEL_EXPORTER_OTLP_ENDPOINT is
-        // unset. drain_file should still parse + count even without
-        // emission. (As with the genai emit caveat, this exercises
-        // either path depending on test ordering in the binary; the
-        // observable result — counted parses, no panic — holds.)
-        let event = TranscriptEvent {
-            uuid: "u1".into(),
-            parent_uuid: None,
-            timestamp: SystemTime::now(),
-            kind: EventKind::UserPrompt {
-                content: "x".into(),
-            },
-        };
-        emit_event_span(&event, "sess-xyz", Harness::Claude); // no-op or live; either is OK
-    }
 }

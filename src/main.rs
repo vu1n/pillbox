@@ -823,9 +823,7 @@ fn run(cli: Cli) -> Result<()> {
             }
             // `--parent <id>` plumbing mirrors the webhook flow: shape-
             // validate, stash in `PILLBOX_PARENT_SESSION_ID`, and let
-            // both the host's `session.started` emit and the sandbox-
-            // side `session started` CLI (via the helper's bash export)
-            // pick it up off the env. Shape-only validation: the parent
+            // the host's `session.started` emit pick it up off the env. Shape-only validation: the parent
             // may live in another pillbox's registry, so we don't
             // reject "unknown" ids — the field is observability
             // metadata; consumers reconcile.
@@ -1846,21 +1844,28 @@ mod tests {
             "--repo-password",
             "--password",
         ] {
-            assert!(
-                Cli::try_parse_from([
-                    "pillbox",
-                    "workspace",
-                    "backup",
-                    "--endpoint",
-                    "https://x",
-                    "--bucket",
-                    "b",
-                    "--target",
-                    "/work",
-                    secret_flag,
-                    "leak",
-                ])
-                .is_err(),
+            // `--parent` is supplied so the only parse error left is the
+            // secret flag itself; otherwise MissingRequiredArgument would
+            // satisfy a bare `is_err()` and the test could never fail.
+            let err = Cli::try_parse_from([
+                "pillbox",
+                "workspace",
+                "backup",
+                "--endpoint",
+                "https://x",
+                "--bucket",
+                "b",
+                "--target",
+                "/work",
+                "--parent",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                secret_flag,
+                "leak",
+            ])
+            .unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::UnknownArgument,
                 "{secret_flag} must not be accepted (secrets are env-only)"
             );
         }

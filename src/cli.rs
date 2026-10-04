@@ -552,19 +552,6 @@ pub(crate) enum SessionAction {
         #[arg(long = "dry-run")]
         dry_run: bool,
     },
-    /// Emit a sandbox-side `session.started` event. Mirror of
-    /// [`Done`] for the front of the lifecycle: the in-sandbox
-    /// wrapper script calls this right before launching the agent
-    /// so consumers can compute cold-start latency from
-    /// `host.started_at` → `sandbox.started_at` (distinguished by
-    /// the `emitter` attribute on each event).
-    ///
-    /// No-op cost when no sink is configured. The event payload is
-    /// minimal — `session_id` + `started_at` + `emitter=sandbox` —
-    /// because the host's prior `session.started` already carries
-    /// the full record (agent_id, remote, backend, label, …);
-    /// consumers correlate by `session_id`.
-    Started { id: String },
     /// Mark a session done, emitting `session.completed` or
     /// `session.failed` to every configured sink (JSONL + webhook +
     /// OTel). Invoked manually for orchestrator-driven completion, or

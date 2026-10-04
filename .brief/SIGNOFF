@@ -283,3 +283,5 @@ managed-tier-do-gateway amend-proposed: add signoff: required (cost boundary: no
 libkrun-is-the-backend conforms: The standalone project verifier probe is feature-gated to libkrun and reuses the offline verifier launcher; bounded final diagnostics preserve evidence after teardown without adding a backend or backend-selection fallback.
 stable-exit-codes conforms: A verifier fail and an infrastructure error retain runtime exit code 1; malformed probe input remains a CLI error and no documented exit category is renumbered.
 docs-governance conforms: The canonical command and bounded local repository execution guides document the separate operator probe contract alongside its implementation, without changing any active decision.
+
+libkrun-is-the-backend conforms: After confirmed local libkrun VM stop and reap, cleanup restores owner directory access only within the private invocation root with UID/device/inode and no-follow checks; backend selection, guest limits and cached image authority are unchanged. Independently re-audited after the 0100/0300 cleanup fix.

@@ -6,9 +6,115 @@
 //! are prepared before they are mounted.  The non-macOS backend keeps the
 //! existing guest-side path in `boot.rs`.
 
+use std::ffi::CString;
+use std::fs::{self, File, OpenOptions};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{ensure, Context, Result};
+
+/// The cache seed may inherit the operator's umask. Only a new private clone's
+/// root is made guest-searchable; its verified owner directory stays private.
+pub(super) fn prepare_private_root(root: &Path, parent: &Path) -> Result<()> {
+    ensure!(
+        root.parent() == Some(parent),
+        "private rootfs is outside its owner directory"
+    );
+    let owner = unsafe { libc::geteuid() };
+    let parent_meta = fs::symlink_metadata(parent)
+        .with_context(|| format!("inspect private rootfs owner {}", parent.display()))?;
+    ensure!(
+        parent_meta.is_dir()
+            && !parent_meta.file_type().is_symlink()
+            && parent_meta.uid() == owner
+            && parent_meta.mode() & 0o7777 == 0o700,
+        "private rootfs owner must be a plain owned 0700 directory"
+    );
+    let parent_fd = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(parent)
+        .context("open private rootfs owner")?;
+    let opened_parent = parent_fd.metadata()?;
+    ensure!(
+        opened_parent.dev() == parent_meta.dev()
+            && opened_parent.ino() == parent_meta.ino()
+            && opened_parent.uid() == owner
+            && opened_parent.mode() & 0o7777 == 0o700,
+        "private rootfs owner changed while opening"
+    );
+    let root_meta = fs::symlink_metadata(root)
+        .with_context(|| format!("inspect private rootfs {}", root.display()))?;
+    ensure!(
+        root_meta.is_dir()
+            && !root_meta.file_type().is_symlink()
+            && root_meta.uid() == owner
+            && root_meta.dev() == opened_parent.dev(),
+        "private rootfs must be a plain owned directory on its owner's filesystem"
+    );
+    let name = CString::new(
+        root.file_name()
+            .context("private rootfs name missing")?
+            .as_bytes(),
+    )?;
+    let fd = unsafe {
+        libc::openat(
+            parent_fd.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("open private rootfs without following");
+    }
+    let root_fd = unsafe { File::from_raw_fd(fd) };
+    let opened_root = root_fd.metadata()?;
+    ensure!(
+        opened_root.is_dir()
+            && opened_root.uid() == owner
+            && opened_root.dev() == root_meta.dev()
+            && opened_root.ino() == root_meta.ino(),
+        "private rootfs changed while opening"
+    );
+    root_fd
+        .set_permissions(fs::Permissions::from_mode(0o755))
+        .context("make private clone root guest-searchable")?;
+    #[cfg(target_os = "macos")]
+    macos::set_private_root_override(&root_fd, root)?;
+    let normalized = root_fd.metadata()?;
+    ensure!(
+        normalized.dev() == opened_root.dev()
+            && normalized.ino() == opened_root.ino()
+            && normalized.uid() == owner
+            && normalized.mode() & 0o7777 == 0o755,
+        "private clone root mode or identity changed during normalization"
+    );
+    let current_parent = parent_fd.metadata()?;
+    ensure!(
+        current_parent.dev() == opened_parent.dev()
+            && current_parent.ino() == opened_parent.ino()
+            && current_parent.uid() == owner
+            && current_parent.mode() & 0o7777 == 0o700,
+        "private rootfs owner changed during normalization"
+    );
+    let current_root_path = fs::symlink_metadata(root)?;
+    let current_parent_path = fs::symlink_metadata(parent)?;
+    ensure!(
+        current_root_path.is_dir()
+            && !current_root_path.file_type().is_symlink()
+            && current_root_path.dev() == normalized.dev()
+            && current_root_path.ino() == normalized.ino()
+            && current_parent_path.is_dir()
+            && !current_parent_path.file_type().is_symlink()
+            && current_parent_path.dev() == current_parent.dev()
+            && current_parent_path.ino() == current_parent.ino(),
+        "private rootfs path changed during normalization"
+    );
+    Ok(())
+}
 
 #[cfg(not(target_os = "macos"))]
 pub(super) fn prepare_guest_clone_metadata(_root: &Path) -> Result<()> {
@@ -25,7 +131,7 @@ mod macos {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::path::Path;
 
-    use anyhow::{bail, Context, Result};
+    use anyhow::{bail, ensure, Context, Result};
 
     const OVERRIDE_STAT: &[u8] = b"user.containers.override_stat\0";
     const MAX_OVERRIDE_STAT: usize = 32;
@@ -33,6 +139,17 @@ mod macos {
     const ROOT_GID: u32 = 0;
 
     type OverrideStat = (Option<u32>, Option<u32>, Option<u32>);
+
+    pub(super) fn set_private_root_override(file: &File, path: &Path) -> Result<()> {
+        let mode = libc::S_IFDIR as u32 | 0o755;
+        set_override_fd(file, mode, path)?;
+        ensure!(
+            read_override(path, Some(file), None)?
+                == Some((Some(ROOT_UID), Some(ROOT_GID), Some(mode))),
+            "private clone root guest metadata did not normalize"
+        );
+        Ok(())
+    }
 
     pub(super) fn prepare_guest_clone_metadata(root: &Path) -> Result<()> {
         let metadata = fs::symlink_metadata(root)
@@ -567,6 +684,39 @@ mod macos {
             assert_eq!(mode(&outside), outside_mode);
             assert_eq!(fs::read(source.join("original")).unwrap(), source_bytes);
             assert_eq!(mode(&source.join("original")), source_mode);
+        }
+
+        #[test]
+        fn private_root_normalization_replaces_inherited_override_without_mutating_seed() {
+            let fixture = tempfile::tempdir().unwrap();
+            let seed = fixture.path().join("seed");
+            fs::create_dir(&seed).unwrap();
+            fs::write(seed.join("proof"), b"pristine").unwrap();
+            fs::set_permissions(&seed, fs::Permissions::from_mode(0o700)).unwrap();
+            write_override(&seed, "501:20:040700");
+            let parent = fixture.path().join("private");
+            fs::create_dir(&parent).unwrap();
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+            let clone = parent.join("rootfs");
+            crate::workspace::cow::cow_clone_dir(&seed, &clone).unwrap();
+            write_override(&clone, "501:20:040600");
+
+            super::super::prepare_private_root(&clone, &parent).unwrap();
+            assert_eq!(mode(&seed) & 0o7777, 0o700);
+            assert_eq!(read_override_text(&seed), "501:20:040700");
+            assert_eq!(fs::read(seed.join("proof")).unwrap(), b"pristine");
+            assert_eq!(mode(&parent) & 0o7777, 0o700);
+            assert_eq!(mode(&clone) & 0o7777, 0o755);
+            assert_eq!(read_override_text(&clone), "0:0:040755");
+            assert_eq!(fs::read(clone.join("proof")).unwrap(), b"pristine");
+
+            let alias = parent.join("alias");
+            symlink(&seed, &alias).unwrap();
+            assert!(super::super::prepare_private_root(&alias, &parent).is_err());
+            assert_eq!(mode(&seed) & 0o7777, 0o700);
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(super::super::prepare_private_root(&clone, &parent).is_err());
+            assert_eq!(mode(&clone) & 0o7777, 0o755);
         }
 
         #[test]

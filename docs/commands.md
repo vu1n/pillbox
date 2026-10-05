@@ -94,8 +94,10 @@ Every local microVM uses a private writable rootfs clone, including `/tmp` and
 system directories. The image cache is never mounted as a guest's writable root.
 Detached/server sessions retain their own clone until `session rm` confirms
 shutdown. Failed teardown preserves their session record and private files.
-Cache versions through v3 are excluded from new launches because they may contain
-previous guest writes; a fresh image export is required to initialize the v4 seed.
+On macOS, seeds and clones use a private case-sensitive APFS sparse volume with
+a 64 GiB logical ceiling. Fresh v5 seeds replace older generations for new launches;
+old sessions retain their paths. The volume grows only as written and is not
+automatically resized or unmounted. Insufficient host or volume space fails clearly.
 
 ### Structured run ownership
 
@@ -508,11 +510,21 @@ pillbox execution snapshot --repository /path/to/repo --commit FULL_GIT_OID
 pillbox execution execute --request request.json --repository /path/to/repo
 pillbox execution status INVOCATION_ID
 pillbox execution cancel INVOCATION_ID
+pillbox execution verify-project --probe probe.json --repository /absolute/path/to/repo
 ```
 
 Execute runs in the foreground; use another process for status/cancel. Matching retries return
 the durable original invocation. A changed request conflicts and a lost owner never resamples.
 Only the local microVM backend can execute; no backend fallback grants this capability.
+
+`verify-project` is a separate operator probe. Its closed manifest binds a full committed Git
+tree, expected complete snapshot digest, immutable verifier image, output ID, outer deadline,
+and sealed Python verifier. It launches only the offline libkrun verifier VM and loads no Pillbox
+project, session, or credentials; the existing immutable image cache is still used. Its JSON v1
+`project_verifier_probe` record includes the complete canonical probe digest, outer deadline,
+raw supervisor report, bounded final diagnostics, and parsed observation after VM teardown; it is
+not an execution/3 receipt. A failed verifier returns exit 1 with a `fail` observation. Transport,
+report, diagnostic, and teardown errors have no verdict. See [the probe contract](local-repository-execution.md#standalone-project-verifier-probe).
 
 ## Sealed local text execution
 

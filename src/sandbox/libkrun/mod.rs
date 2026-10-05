@@ -50,6 +50,7 @@ mod metadata;
 mod mitm;
 pub(crate) mod repository;
 mod rootfs;
+mod rootfs_backing;
 mod session;
 mod vault;
 
@@ -698,27 +699,47 @@ fn unsupported(spec: &AgentSpec, what: &str) -> anyhow::Error {
     .into()
 }
 
-const ROOTFS_CACHE_VERSION: &str = "v4";
-const ROOTFS_CACHE_MARKER_MAGIC: &str = "pillbox-rootfs-cache/v4";
+const ROOTFS_CACHE_VERSION: &str = "v5";
+const ROOTFS_CACHE_MARKER_MAGIC: &str = "pillbox-rootfs-cache/v5";
 const MAX_ROOTFS_MARKER_BYTES: u64 = 1_024;
 const ROOTFS_TAR_EXTRACT_FLAG: &str = "-xpf";
 
 /// Never hand a cached generation to a VMM; each caller owns a writable clone.
 fn materialize_rootfs(resolved: &Pillbox) -> Result<rootfs::PrivateRootfs> {
-    let base = materialize_rootfs_base(resolved)?;
-    rootfs::PrivateRootfs::fork(&base, &krun_cache_dir()?.join("vm-rootfs"))
+    let backing = rootfs_backing::RootfsBacking::prepare(
+        &rootfs_backing::RootfsBacking::krun_dir()?,
+        rootfs_backing::RootfsBacking::ordinary_deadline()?,
+        &|| false,
+    )?;
+    let base = materialize_rootfs_base(resolved, &backing)?;
+    backing.ensure_same_device(&base)?;
+    rootfs::PrivateRootfs::fork(
+        &base,
+        &backing.namespace(
+            "vm-rootfs",
+            rootfs_backing::RootfsBacking::ordinary_deadline()?,
+            &|| false,
+        )?,
+    )
 }
 
 /// Materialize the runner OCI image into a cached on-disk directory usable as a
 /// virtio-fs root (libkrun's `krun_set_root` takes a *directory*, not an image).
 /// One-time per concrete image via `docker export`; cached under
-/// `~/.pillbox/krun/rootfs/`. The key includes Docker's image id, not just the
+/// the verified backing's `rootfs/` namespace. The key includes Docker's image id, not just the
 /// tag string, so mutable tags (`:rolling`) rematerialize after `docker pull`
 /// instead of reusing an older exported rootfs.
-// v3 and earlier were served writable to guests. They are never trusted as seeds.
-fn materialize_rootfs_base(resolved: &Pillbox) -> Result<PathBuf> {
+// v3 and earlier were guest-writable; v4 may fold case. Export fresh v5 seeds.
+fn materialize_rootfs_base(
+    resolved: &Pillbox,
+    backing: &rootfs_backing::RootfsBacking,
+) -> Result<PathBuf> {
     let (image, _) = crate::docker::resolve_runner_image(resolved);
-    let rootfs_root = krun_cache_dir()?.join("rootfs");
+    let rootfs_root = backing.namespace(
+        "rootfs",
+        rootfs_backing::RootfsBacking::ordinary_deadline()?,
+        &|| false,
+    )?;
     // The id-keyed cache needs Docker to resolve the tag → id. When Docker is
     // unreachable (daemon down, image pruned) we can't compute the live key, but
     // a prior materialization may already be on disk — boot from the newest
@@ -868,7 +889,7 @@ fn rootfs_unavailable_message(
 }
 
 /// Newest materialized rootfs generation for `image`, or `None`. The fallback
-/// when Docker can't resolve the live image id scans only that image's hashed v4
+/// when Docker can't resolve the live image id scans only that image's hashed v5
 /// namespace. A sibling marker binds each generation's exact image and image id;
 /// the guest receives only its `rootfs` child. Legacy generations are ignored.
 fn find_cached_rootfs(root: &Path, image: &str) -> Option<PathBuf> {
@@ -1152,16 +1173,16 @@ mod tests {
 
         let contaminated = root
             .path()
-            .join("v3")
+            .join("v4")
             .join(rootfs_image_ref_key(image))
             .join("sha256_4444");
         std::fs::create_dir_all(contaminated.join("rootfs")).unwrap();
         std::fs::write(
             contaminated.join(".materialized"),
-            format!("pillbox-rootfs-cache/v3\n{image}\nsha256:4444\n"),
+            format!("pillbox-rootfs-cache/v4\n{image}\nsha256:4444\n"),
         )
         .unwrap();
-        // Even a newer exact v3 marker was writable by guests and cannot seed a new VM.
+        // A v4 marker may be case-folded and cannot seed a v5 VM.
         std::fs::File::open(contaminated.join(".materialized"))
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()))
@@ -1226,7 +1247,7 @@ mod tests {
     }
 
     #[test]
-    fn rootfs_image_ref_hash_separates_sanitize_aliases_and_matches_prune_script() {
+    fn rootfs_image_ref_hash_separates_sanitize_aliases_and_matches_build_script() {
         let dashed = "foo-bar:baz";
         let slashed = "foo/bar:baz";
         assert_ne!(rootfs_image_ref_key(dashed), rootfs_image_ref_key(slashed));

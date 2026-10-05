@@ -2,10 +2,12 @@
 //! The host file broker is the only repository access: builder VMs have no
 //! repository shares. Live confinement and native-fork tests remain a release gate.
 
+use std::ffi::{CString, OsString};
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
@@ -38,6 +40,7 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const GUEST_RUNTIME: &str = "/opt/pillbox-execution";
 const GUEST_HOME: &str = "/home/pillbox";
 const GUEST_CODEX_HOME: &str = "/home/pillbox/.codex";
+const OFFLINE_LOCALHOST_HOSTS: &[u8] = b"127.0.0.1 localhost\n::1 localhost\n";
 
 /// The caller has already admitted this invocation and pre-refreshed TokenStore.
 /// No Debug or Serialize implementation: access_release contains a real token.
@@ -127,6 +130,12 @@ pub(crate) struct OwnedVm {
     sockets: Option<TempDir>,
 }
 
+pub(crate) struct VmDiagnostics {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) truncated: bool,
+    pub(crate) error: Option<anyhow::Error>,
+}
+
 impl OwnedVm {
     pub(crate) fn connect_rpc(&mut self, cancelled: &dyn Fn() -> bool) -> Result<UnixStream> {
         loop {
@@ -172,12 +181,51 @@ impl OwnedVm {
         Ok(output)
     }
 
+    /// Capture the queued tail only after the owned group is confirmed gone.
+    /// On an unconfirmed stop or read failure, retain the already bounded prefix.
+    pub(crate) fn final_diagnostics(&mut self) -> VmDiagnostics {
+        let mut truncated = self.process.output_limit_exceeded;
+        let mut error = None;
+        if self.process.stopped && !truncated {
+            let used = self.process.stdout_bytes.len() + self.process.stderr_bytes.len();
+            let mut remaining = self.process.output_limit.saturating_sub(used as u64);
+            match drain_final_pipe(
+                &mut self.process.stdout,
+                &mut self.process.stdout_bytes,
+                &mut remaining,
+            ) {
+                Ok(true) => truncated = true,
+                Ok(false) => match drain_final_pipe(
+                    &mut self.process.stderr,
+                    &mut self.process.stderr_bytes,
+                    &mut remaining,
+                ) {
+                    Ok(true) => truncated = true,
+                    Ok(false) => {}
+                    Err(failure) => error = Some(failure),
+                },
+                Err(failure) => error = Some(failure),
+            }
+        }
+        let mut bytes = self.process.stdout_bytes.clone();
+        bytes.extend_from_slice(&self.process.stderr_bytes);
+        VmDiagnostics {
+            bytes,
+            truncated,
+            error,
+        }
+    }
+
     /// Must succeed before capturing results. Closing ownership also covers a VMM
     /// that reached its watchdog before the host sends the explicit group kill.
     pub(crate) fn stop_and_reap(&mut self) -> Result<ExitStatus> {
         self.owner.take();
         self.rpc_listener.take();
         let status = self.process.stop_and_reap()?;
+        if let Some(runtime) = self.runtime.as_ref() {
+            prepare_owned_runtime_removal(runtime.path(), self.process.stopped)
+                .context("prepare stopped VM runtime removal")?;
+        }
         if let Some(runtime) = self.runtime.take() {
             runtime.close().context("remove stopped VM runtime")?;
         }
@@ -186,6 +234,237 @@ impl OwnedVm {
         }
         Ok(status)
     }
+}
+
+/// Image clones retain their read-only host directory modes. Make only this
+/// stopped invocation's owned directories removable before TempDir closes it.
+fn prepare_owned_runtime_removal(root: &Path, stop_confirmed: bool) -> Result<()> {
+    // The live queue holds only this stopped invocation's directory identities.
+    // A corrupt or unusually broad image fails cleanup with its runtime preserved.
+    const MAX_QUEUED_IDENTITY_BYTES: usize = 128 * 1024 * 1024;
+    prepare_owned_runtime_removal_with_budget(root, stop_confirmed, MAX_QUEUED_IDENTITY_BYTES)
+}
+
+fn prepare_owned_runtime_removal_with_budget(
+    root: &Path,
+    stop_confirmed: bool,
+    max_queued_identity_bytes: usize,
+) -> Result<()> {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    struct PendingDirectory {
+        parent: Option<Rc<PendingDirectory>>,
+        name: OsString,
+        inode: u64,
+        live_bytes: Rc<Cell<usize>>,
+        bytes: usize,
+    }
+
+    impl Drop for PendingDirectory {
+        fn drop(&mut self) {
+            self.live_bytes.set(self.live_bytes.get() - self.bytes);
+        }
+    }
+
+    ensure!(stop_confirmed, "VM stop/reap was not confirmed");
+    let root_metadata = fs::symlink_metadata(root).context("inspect owned VM runtime root")?;
+    ensure!(
+        root_metadata.is_dir() && !root_metadata.file_type().is_symlink(),
+        "owned VM runtime root is not a plain directory"
+    );
+    let owner = unsafe { libc::geteuid() };
+    ensure!(
+        root_metadata.uid() == owner,
+        "owned VM runtime root has a different owner"
+    );
+    let device = root_metadata.dev();
+    // The TempDir root is created with owner read access. Cloned descendants
+    // can be search-only, so prepare them relative to an already-open parent.
+    let root_directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(root)
+        .context("open owned VM runtime root")?;
+    ensure!(
+        root_directory.metadata()?.ino() == root_metadata.ino(),
+        "owned VM runtime root changed during preparation"
+    );
+    // LIFO visits a branch while Rc shares its ancestor identities with queued
+    // siblings. The byte budget includes all live nodes, even on other branches.
+    let live_bytes = Rc::new(Cell::new(0usize));
+    let mut pending: Vec<Option<Rc<PendingDirectory>>> = vec![None];
+    while let Some(last) = pending.pop() {
+        let mut ancestors = Vec::new();
+        let mut cursor = last.as_deref();
+        while let Some(identity) = cursor {
+            ancestors
+                .try_reserve(1)
+                .context("reserve owned VM runtime ancestor chain")?;
+            ancestors.push(identity);
+            cursor = identity.parent.as_deref();
+        }
+        let mut path = root.to_path_buf();
+        let mut directory = root_directory.try_clone()?;
+        for identity in ancestors.iter().rev() {
+            path.push(&identity.name);
+            directory = open_owned_runtime_child(
+                &directory,
+                &identity.name,
+                identity.inode,
+                owner,
+                device,
+                &path,
+            )?;
+        }
+        let metadata = directory.metadata()?;
+        ensure!(
+            metadata.is_dir() && metadata.uid() == owner && metadata.dev() == device,
+            "owned VM runtime directory is not local and owned: {}",
+            path.display()
+        );
+        let mode = metadata.permissions().mode();
+        if mode & 0o700 != 0o700 {
+            directory
+                .set_permissions(fs::Permissions::from_mode(mode | 0o700))
+                .with_context(|| {
+                    format!("permit owned VM runtime removal at {}", path.display())
+                })?;
+        }
+        for entry in fs::read_dir(&path)
+            .with_context(|| format!("list owned VM runtime directory {}", path.display()))?
+        {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name_c = CString::new(name.as_bytes()).context("runtime entry contains NUL")?;
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe {
+                libc::fstatat(
+                    directory.as_raw_fd(),
+                    name_c.as_ptr(),
+                    &mut stat,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+            {
+                return Err(std::io::Error::last_os_error()).with_context(|| {
+                    format!("inspect owned VM runtime entry {}", entry.path().display())
+                });
+            }
+            if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+                continue;
+            }
+            let child_path = path.join(&name);
+            ensure!(
+                stat.st_uid == owner && stat.st_dev as u64 == device,
+                "owned VM runtime directory is not local and owned: {}",
+                child_path.display()
+            );
+            let bytes = std::mem::size_of::<PendingDirectory>()
+                .checked_add(2 * std::mem::size_of::<usize>())
+                .and_then(|fixed| fixed.checked_add(name.as_bytes().len()))
+                .context("owned VM runtime identity size overflow")?;
+            let new_total = live_bytes
+                .get()
+                .checked_add(bytes)
+                .context("owned VM runtime identity budget overflow")?;
+            ensure!(
+                new_total <= max_queued_identity_bytes,
+                "owned VM runtime queued directory identity budget exceeded ({} bytes) at {}",
+                max_queued_identity_bytes,
+                child_path.display()
+            );
+            pending
+                .try_reserve(1)
+                .context("reserve owned VM runtime directory queue")?;
+            let child_directory = open_owned_runtime_child(
+                &directory,
+                &name,
+                stat.st_ino as u64,
+                owner,
+                device,
+                &child_path,
+            )?;
+            drop(child_directory);
+            live_bytes.set(new_total);
+            pending.push(Some(Rc::new(PendingDirectory {
+                parent: last.clone(),
+                name,
+                inode: stat.st_ino as u64,
+                live_bytes: Rc::clone(&live_bytes),
+                bytes,
+            })));
+        }
+    }
+    Ok(())
+}
+
+fn open_owned_runtime_child(
+    parent: &File,
+    name: &std::ffi::OsStr,
+    inode: u64,
+    owner: libc::uid_t,
+    device: u64,
+    path: &Path,
+) -> Result<File> {
+    let name_c = CString::new(name.as_bytes()).context("runtime entry contains NUL")?;
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name_c.as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("inspect owned VM runtime directory {}", path.display()));
+    }
+    ensure!(
+        stat.st_mode & libc::S_IFMT == libc::S_IFDIR
+            && stat.st_uid == owner
+            && stat.st_dev as u64 == device
+            && stat.st_ino as u64 == inode,
+        "owned VM runtime directory changed or is not local and owned: {}",
+        path.display()
+    );
+    if (stat.st_mode as u32) & 0o700 != 0o700 {
+        let result = unsafe {
+            libc::fchmodat(
+                parent.as_raw_fd(),
+                name_c.as_ptr(),
+                (stat.st_mode as u32 | 0o700) as libc::mode_t,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("permit owned VM runtime removal at {}", path.display()));
+        }
+    }
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("open owned VM runtime directory {}", path.display()));
+    }
+    let child = unsafe { File::from_raw_fd(fd) };
+    let metadata = child.metadata()?;
+    ensure!(
+        metadata.is_dir()
+            && metadata.uid() == owner
+            && metadata.dev() == device
+            && metadata.ino() == inode,
+        "owned VM runtime directory changed during preparation: {}",
+        path.display()
+    );
+    Ok(child)
 }
 
 impl Drop for OwnedVm {
@@ -289,9 +568,12 @@ fn prepare_rootfs(
     check_live(deadline, cancelled)?;
     super::host::virtualization_available().map_err(anyhow::Error::msg)?;
     super::host::runtime_deps_present().map_err(anyhow::Error::msg)?;
-    let cache_root = super::krun_cache_dir()?.join("repository-images-v1");
-    fs::create_dir_all(&cache_root)?;
-    crate::paths::ensure_mode_0700(&cache_root)?;
+    let backing = super::rootfs_backing::RootfsBacking::prepare(
+        &super::rootfs_backing::RootfsBacking::krun_dir()?,
+        deadline,
+        cancelled,
+    )?;
+    let cache_root = backing.namespace("repository-images-v2", deadline, cancelled)?;
     let free = super::host::disk_headroom(&cache_root);
     ensure!(
         free >= super::host::MIN_HEADROOM_BYTES,
@@ -299,6 +581,7 @@ fn prepare_rootfs(
     );
     let runtime = tempfile::Builder::new()
         .prefix("invocation-")
+        .permissions(fs::Permissions::from_mode(0o700))
         .tempdir_in(&cache_root)?;
     let rootfs = runtime.path().join("rootfs");
     if let Err(error) = provision_image(image_id, &cache_root, &rootfs, deadline, cancelled) {
@@ -401,6 +684,7 @@ fn verifier_spec(rootfs: &Path, owner: &Path, rpc: &Path, remaining_ms: u64) -> 
 }
 
 fn prepare_verifier_guest(rootfs: &Path, input: &VerifierInput) -> Result<()> {
+    prepare_verifier_hosts(rootfs)?;
     for path in [GUEST_RUNTIME, GUEST_HOME, "/workspace", "/tmp"] {
         fresh_directory(rootfs, path)?;
     }
@@ -426,6 +710,81 @@ fn prepare_verifier_guest(rootfs: &Path, input: &VerifierInput) -> Result<()> {
     // Only freshly generated subtrees receive guest-root metadata. The image
     // cache and the rest of the private rootfs retain their original metadata.
     prepare_generated_metadata(rootfs, &[GUEST_RUNTIME, GUEST_HOME, "/workspace", "/tmp"])
+}
+
+fn prepare_verifier_hosts(rootfs: &Path) -> Result<()> {
+    let etc_path = rootfs.join("etc");
+    let etc_metadata = fs::symlink_metadata(&etc_path).context("inspect verifier clone /etc")?;
+    ensure!(
+        etc_metadata.is_dir() && !etc_metadata.file_type().is_symlink(),
+        "verifier clone /etc is not a plain directory"
+    );
+    let owner = unsafe { libc::geteuid() };
+    ensure!(
+        etc_metadata.uid() == owner,
+        "verifier clone /etc has a different owner"
+    );
+    let etc = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(&etc_path)
+        .context("open verifier clone /etc")?;
+    let opened_etc = etc.metadata()?;
+    ensure!(
+        opened_etc.is_dir()
+            && opened_etc.uid() == owner
+            && opened_etc.dev() == etc_metadata.dev()
+            && opened_etc.ino() == etc_metadata.ino(),
+        "verifier clone /etc changed during preparation"
+    );
+    let mut hosts_stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe {
+        libc::fstatat(
+            etc.as_raw_fd(),
+            c"hosts".as_ptr(),
+            &mut hosts_stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error()).context("inspect verifier clone /etc/hosts");
+    }
+    ensure!(
+        hosts_stat.st_mode & libc::S_IFMT == libc::S_IFREG
+            && hosts_stat.st_uid == owner
+            && hosts_stat.st_dev as u64 == opened_etc.dev()
+            && hosts_stat.st_nlink == 1,
+        "verifier clone /etc/hosts is not a private regular file"
+    );
+    let fd = unsafe {
+        libc::openat(
+            etc.as_raw_fd(),
+            c"hosts".as_ptr(),
+            libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("open verifier clone /etc/hosts");
+    }
+    let mut hosts = unsafe { File::from_raw_fd(fd) };
+    let opened_hosts = hosts.metadata()?;
+    ensure!(
+        opened_hosts.is_file()
+            && opened_hosts.uid() == owner
+            && opened_hosts.dev() == opened_etc.dev()
+            && opened_hosts.ino() == hosts_stat.st_ino as u64
+            && opened_hosts.nlink() == 1,
+        "verifier clone /etc/hosts changed during preparation"
+    );
+    hosts
+        .set_len(0)
+        .context("clear verifier clone /etc/hosts")?;
+    hosts
+        .write_all(OFFLINE_LOCALHOST_HOSTS)
+        .context("write verifier clone localhost mapping")?;
+    hosts
+        .set_permissions(fs::Permissions::from_mode(0o644))
+        .context("make verifier clone localhost mapping readable")
 }
 
 fn prepare_generated_metadata(rootfs: &Path, paths: &[&str]) -> Result<()> {
@@ -815,6 +1174,7 @@ struct OwnedProcess {
     stdout_bytes: Vec<u8>,
     stderr_bytes: Vec<u8>,
     output_limit: u64,
+    output_limit_exceeded: bool,
     status: Option<ExitStatus>,
     stopped: bool,
 }
@@ -866,6 +1226,7 @@ impl OwnedProcess {
             stdout_bytes: vec![],
             stderr_bytes: vec![],
             output_limit,
+            output_limit_exceeded: false,
             status: None,
             stopped: false,
         };
@@ -898,12 +1259,14 @@ impl OwnedProcess {
             &mut self.stdout,
             &mut self.stdout_bytes,
             self.output_limit.saturating_sub(used as u64),
+            &mut self.output_limit_exceeded,
         )?;
         let used = self.stdout_bytes.len() + self.stderr_bytes.len();
         drain_pipe(
             &mut self.stderr,
             &mut self.stderr_bytes,
             self.output_limit.saturating_sub(used as u64),
+            &mut self.output_limit_exceeded,
         )
     }
 
@@ -1001,7 +1364,12 @@ pub(super) fn group_exists(group: i32) -> Result<bool> {
     }
 }
 
-fn drain_pipe<T: Read>(pipe: &mut Option<T>, output: &mut Vec<u8>, remaining: u64) -> Result<()> {
+fn drain_pipe<T: Read>(
+    pipe: &mut Option<T>,
+    output: &mut Vec<u8>,
+    remaining: u64,
+    output_limit_exceeded: &mut bool,
+) -> Result<()> {
     let Some(reader) = pipe.as_mut() else {
         return Ok(());
     };
@@ -1013,11 +1381,12 @@ fn drain_pipe<T: Read>(pipe: &mut Option<T>, output: &mut Vec<u8>, remaining: u6
             pipe.take();
         }
         Ok(count) => {
-            ensure!(
-                count as u64 <= remaining,
-                "owned process output limit exceeded"
-            );
-            output.extend_from_slice(&buffer[..count]);
+            let accepted = count.min(remaining as usize);
+            output.extend_from_slice(&buffer[..accepted]);
+            if count != accepted {
+                *output_limit_exceeded = true;
+                bail!("owned process output limit exceeded");
+            }
         }
         Err(error)
             if matches!(
@@ -1029,11 +1398,50 @@ fn drain_pipe<T: Read>(pipe: &mut Option<T>, output: &mut Vec<u8>, remaining: u6
     Ok(())
 }
 
+fn drain_final_pipe<T: Read>(
+    pipe: &mut Option<T>,
+    output: &mut Vec<u8>,
+    remaining: &mut u64,
+) -> Result<bool> {
+    let Some(reader) = pipe.as_mut() else {
+        return Ok(false);
+    };
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let size = buffer.len().min(remaining.saturating_add(1) as usize);
+        match reader.read(&mut buffer[..size]) {
+            Ok(0) => {
+                pipe.take();
+                return Ok(false);
+            }
+            Ok(count) if count as u64 > *remaining => {
+                output.extend_from_slice(&buffer[..*remaining as usize]);
+                *remaining = 0;
+                return Ok(true);
+            }
+            Ok(count) => {
+                output.extend_from_slice(&buffer[..count]);
+                *remaining -= count as u64;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error).context("read stopped owned process output"),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "snake_case")]
 enum PreparationSpec {
     Image(ImageSpec),
+    #[cfg(test)]
+    CachedImageFixture(ImageSpec),
     Command(CommandSpec),
+}
+
+enum ImagePreparationRole {
+    VerifiedBacking,
+    #[cfg(test)]
+    CachedFixture,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1098,10 +1506,28 @@ fn provision_image(
     deadline: Instant,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<()> {
+    provision_image_with_role(
+        image_id,
+        cache_root,
+        destination,
+        deadline,
+        cancelled,
+        ImagePreparationRole::VerifiedBacking,
+    )
+}
+
+fn provision_image_with_role(
+    image_id: &str,
+    cache_root: &Path,
+    destination: &Path,
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+    role: ImagePreparationRole,
+) -> Result<()> {
     let sockets = socket_directory()?;
     let owner_path = sockets.path().join("image-owner.sock");
     let listener = bind_listener(&owner_path)?;
-    let spec = PreparationSpec::Image(ImageSpec {
+    let image = ImageSpec {
         image_id: image_id.into(),
         cache_root: cache_root.into(),
         destination: destination.into(),
@@ -1109,7 +1535,12 @@ fn provision_image(
             socket: owner_path.to_string_lossy().into_owned(),
             remaining_ms: Some(remaining_ms(deadline)?),
         },
-    });
+    };
+    let spec = match role {
+        ImagePreparationRole::VerifiedBacking => PreparationSpec::Image(image),
+        #[cfg(test)]
+        ImagePreparationRole::CachedFixture => PreparationSpec::CachedImageFixture(image),
+    };
     let spec_path = sockets.path().join("image.json");
     write_private_file(&spec_path, &serde_json::to_vec(&spec)?)?;
     let mut command = preparation_command(&spec_path)?;
@@ -1182,27 +1613,11 @@ fn preparation_child(path: &Path) -> Result<()> {
     );
     match serde_json::from_slice::<PreparationSpec>(&bytes)? {
         PreparationSpec::Image(spec) => {
-            validate_image_id(&spec.image_id)?;
-            ensure!(
-                spec.cache_root.is_absolute() && spec.destination.is_absolute(),
-                "image preparation paths must be absolute"
-            );
-            let owner = std::cell::RefCell::new(watched_owner(&spec.ownership)?);
-            let cancelled = || owner_gone(&mut owner.borrow_mut()).unwrap_or(true);
-            let deadline = Instant::now()
-                + Duration::from_millis(
-                    spec.ownership
-                        .remaining_ms
-                        .context("guardian ownership deadline missing")?,
-                );
-            materialize_exact(&spec.image_id, &spec.cache_root, deadline, &cancelled)?;
-            check_live(deadline, &cancelled)?;
-            let base = spec.cache_root.join(&spec.image_id[7..]).join("rootfs");
-            let method = crate::workspace::cow::cow_clone_dir(&base, &spec.destination)?;
-            if method == crate::workspace::cow::CloneMethod::Copied {
-                eprintln!("pillbox: bounded rootfs fork fell back to a full copy");
-            }
-            check_live(deadline, &cancelled)
+            preparation_image_child(spec, ImagePreparationRole::VerifiedBacking)
+        }
+        #[cfg(test)]
+        PreparationSpec::CachedImageFixture(spec) => {
+            preparation_image_child(spec, ImagePreparationRole::CachedFixture)
         }
         PreparationSpec::Command(spec) => {
             let group = unsafe { libc::getpgrp() };
@@ -1219,6 +1634,108 @@ fn preparation_child(path: &Path) -> Result<()> {
             bail!("command guardian survived group termination")
         }
     }
+}
+
+fn preparation_image_child(spec: ImageSpec, role: ImagePreparationRole) -> Result<()> {
+    validate_image_id(&spec.image_id)?;
+    ensure!(
+        spec.cache_root.is_absolute() && spec.destination.is_absolute(),
+        "image preparation paths must be absolute"
+    );
+    let owner = std::cell::RefCell::new(watched_owner(&spec.ownership)?);
+    let cancelled = || owner_gone(&mut owner.borrow_mut()).unwrap_or(true);
+    let deadline = Instant::now()
+        + Duration::from_millis(
+            spec.ownership
+                .remaining_ms
+                .context("guardian ownership deadline missing")?,
+        );
+    let private_parent = spec
+        .destination
+        .parent()
+        .context("private rootfs parent missing")?;
+    ensure!(
+        private_parent.parent() == Some(spec.cache_root.as_path()),
+        "image preparation destination is outside cache namespace"
+    );
+    match role {
+        ImagePreparationRole::VerifiedBacking => {
+            let krun = super::rootfs_backing::RootfsBacking::krun_dir()?;
+            let expected = super::rootfs_backing::RootfsBacking::expected_root(&krun)
+                .join("repository-images-v2");
+            ensure!(
+                spec.cache_root == expected,
+                "image preparation paths are outside verified rootfs backing"
+            );
+            let backing =
+                super::rootfs_backing::RootfsBacking::reopen_bounded(&krun, deadline, &cancelled)?;
+            ensure!(
+                backing.namespace("repository-images-v2", deadline, &cancelled)? == spec.cache_root,
+                "image preparation namespace differs from verified backing"
+            );
+            materialize_and_clone(&spec, deadline, &cancelled, |path| {
+                backing.ensure_same_device(path)
+            })
+        }
+        #[cfg(test)]
+        ImagePreparationRole::CachedFixture => {
+            let device = verify_cached_fixture_directory(&spec.cache_root, None)?;
+            verify_cached_fixture_directory(private_parent, Some(device))?;
+            for path in [&spec.cache_root, private_parent] {
+                ensure!(
+                    fs::symlink_metadata(path)?.permissions().mode() & 0o077 == 0,
+                    "cached image fixture directory is not private: {}",
+                    path.display()
+                );
+            }
+            materialize_and_clone(&spec, deadline, &cancelled, |path| {
+                verify_cached_fixture_directory(path, Some(device)).map(|_| ())
+            })
+        }
+    }
+}
+
+fn materialize_and_clone(
+    spec: &ImageSpec,
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+    verify_directory: impl Fn(&Path) -> Result<()>,
+) -> Result<()> {
+    materialize_exact(&spec.image_id, &spec.cache_root, deadline, cancelled)?;
+    check_live(deadline, cancelled)?;
+    let base = spec.cache_root.join(&spec.image_id[7..]).join("rootfs");
+    verify_directory(&base)?;
+    verify_directory(
+        spec.destination
+            .parent()
+            .context("private rootfs parent missing")?,
+    )?;
+    let method = crate::workspace::cow::cow_clone_dir(&base, &spec.destination)?;
+    if method == crate::workspace::cow::CloneMethod::Copied {
+        eprintln!("pillbox: bounded rootfs fork fell back to a full copy");
+    }
+    super::metadata::prepare_private_root(
+        &spec.destination,
+        spec.destination
+            .parent()
+            .context("private rootfs parent missing")?,
+    )?;
+    check_live(deadline, cancelled)
+}
+
+#[cfg(test)]
+fn verify_cached_fixture_directory(path: &Path, device: Option<u64>) -> Result<u64> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect private cached image fixture {}", path.display()))?;
+    ensure!(
+        metadata.is_dir()
+            && !metadata.file_type().is_symlink()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && device.is_none_or(|expected| metadata.dev() == expected),
+        "cached image fixture is not a plain owned directory on one filesystem: {}",
+        path.display()
+    );
+    Ok(metadata.dev())
 }
 
 fn command_child(spec: CommandSpec) -> Result<()> {
@@ -1411,7 +1928,7 @@ fn commit_generation(stage: TempDir, generation: &Path, image_id: &str) -> Resul
     Ok(())
 }
 
-fn run_command(
+pub(super) fn run_command(
     command: &mut Command,
     deadline: Instant,
     cancelled: &dyn Fn() -> bool,
@@ -1859,6 +2376,193 @@ mod tests {
     }
 
     #[test]
+    fn stopped_runtime_removal_handles_nested_read_only_directories() {
+        let runtime = tempfile::tempdir().unwrap();
+        let nested = runtime.path().join("rootfs/opt/dependency");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("module.js"), b"fixture").unwrap();
+        for path in [nested.as_path(), nested.parent().unwrap()] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o555)).unwrap();
+        }
+
+        prepare_owned_runtime_removal(runtime.path(), true).unwrap();
+        assert_eq!(fs::read(nested.join("module.js")).unwrap(), b"fixture");
+        assert_eq!(
+            fs::metadata(&nested).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        runtime.close().unwrap();
+    }
+
+    #[test]
+    fn stopped_runtime_removal_handles_search_only_clone_directories() {
+        let runtime = tempfile::tempdir().unwrap();
+        let search_only = runtime.path().join("rootfs/search-only");
+        let write_search = search_only.join("write-search");
+        fs::create_dir_all(&write_search).unwrap();
+        fs::write(write_search.join("nested-file"), b"fixture").unwrap();
+        fs::set_permissions(&write_search, fs::Permissions::from_mode(0o300)).unwrap();
+        fs::set_permissions(&search_only, fs::Permissions::from_mode(0o100)).unwrap();
+
+        prepare_owned_runtime_removal(runtime.path(), true).unwrap();
+        assert_eq!(
+            fs::metadata(&search_only).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&write_search).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::read(write_search.join("nested-file")).unwrap(),
+            b"fixture"
+        );
+        runtime.close().unwrap();
+    }
+
+    #[test]
+    fn stopped_runtime_removal_handles_wide_tree_under_low_fd_limit() {
+        const TEST_NAME: &str = "sandbox::libkrun::repository::tests::stopped_runtime_removal_handles_wide_tree_under_low_fd_limit";
+        if std::env::var_os("PILLBOX_WIDE_RUNTIME_CLEANUP_CHILD").is_none() {
+            let mut child = Command::new(std::env::current_exe().unwrap());
+            child
+                .arg("--exact")
+                .arg(TEST_NAME)
+                .arg("--nocapture")
+                .env("PILLBOX_WIDE_RUNTIME_CLEANUP_CHILD", "1");
+            unsafe {
+                child.pre_exec(|| {
+                    let mut limit: libc::rlimit = std::mem::zeroed();
+                    if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    limit.rlim_cur = limit.rlim_cur.min(64);
+                    if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "low-FD cleanup failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout)
+                    .contains("wide runtime cleanup completed under low FD limit"),
+                "child test did not exercise low-FD cleanup: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+
+        let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        assert!(limit.rlim_cur <= 64);
+
+        let runtime = tempfile::tempdir().unwrap();
+        let rootfs = runtime.path().join("rootfs");
+        fs::create_dir(&rootfs).unwrap();
+        for index in 0..256 {
+            let parent = rootfs.join(format!("package-{index:03}"));
+            let nested = parent.join("nested");
+            fs::create_dir_all(&nested).unwrap();
+            fs::write(nested.join("data"), b"fixture").unwrap();
+            fs::set_permissions(&nested, fs::Permissions::from_mode(0o300)).unwrap();
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o100)).unwrap();
+        }
+
+        prepare_owned_runtime_removal(runtime.path(), true).unwrap();
+        assert_eq!(
+            fs::read(rootfs.join("package-255/nested/data")).unwrap(),
+            b"fixture"
+        );
+        runtime.close().unwrap();
+        println!("wide runtime cleanup completed under low FD limit");
+    }
+
+    #[test]
+    fn stopped_runtime_removal_reports_identity_budget_without_losing_private_files() {
+        let runtime = tempfile::tempdir().unwrap();
+        let rootfs = runtime.path().join("rootfs");
+        fs::create_dir(&rootfs).unwrap();
+        let mode = fs::metadata(&rootfs).unwrap().permissions().mode();
+        for index in 0..256 {
+            let directory = rootfs.join(format!("package-{index:03}"));
+            fs::create_dir(&directory).unwrap();
+            fs::write(directory.join("evidence"), b"private clone").unwrap();
+        }
+
+        let error = prepare_owned_runtime_removal_with_budget(runtime.path(), true, 4096)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("queued directory identity budget exceeded"),
+            "{error}"
+        );
+        assert_eq!(fs::metadata(&rootfs).unwrap().permissions().mode(), mode);
+        for index in 0..256 {
+            let directory = rootfs.join(format!("package-{index:03}"));
+            assert_eq!(fs::metadata(&directory).unwrap().permissions().mode(), mode);
+            assert_eq!(
+                fs::read(directory.join("evidence")).unwrap(),
+                b"private clone"
+            );
+        }
+        runtime.close().unwrap();
+    }
+
+    #[test]
+    fn stopped_runtime_removal_never_follows_external_symlink() {
+        let runtime = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let external_dir = external.path().join("dependency");
+        fs::create_dir(&external_dir).unwrap();
+        fs::write(external_dir.join("untouched"), b"outside").unwrap();
+        fs::set_permissions(&external_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        std::os::unix::fs::symlink(&external_dir, runtime.path().join("link")).unwrap();
+
+        prepare_owned_runtime_removal(runtime.path(), true).unwrap();
+        runtime.close().unwrap();
+        assert_eq!(
+            fs::read(external_dir.join("untouched")).unwrap(),
+            b"outside"
+        );
+        assert_eq!(
+            fs::metadata(&external_dir).unwrap().permissions().mode() & 0o777,
+            0o555
+        );
+        fs::set_permissions(&external_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn unconfirmed_stop_does_not_change_private_runtime() {
+        let runtime = tempfile::tempdir().unwrap();
+        let nested = runtime.path().join("rootfs");
+        fs::create_dir(&nested).unwrap();
+        fs::write(nested.join("evidence"), b"preserved").unwrap();
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o555)).unwrap();
+
+        assert!(prepare_owned_runtime_removal(runtime.path(), false)
+            .unwrap_err()
+            .to_string()
+            .contains("stop/reap was not confirmed"));
+        assert_eq!(
+            fs::metadata(&nested).unwrap().permissions().mode() & 0o777,
+            0o555
+        );
+        assert_eq!(fs::read(nested.join("evidence")).unwrap(), b"preserved");
+        prepare_owned_runtime_removal(runtime.path(), true).unwrap();
+        runtime.close().unwrap();
+    }
+
+    #[test]
     fn cache_requires_exact_marker_and_plain_rootfs() {
         let dir = tempfile::tempdir().unwrap();
         let generation = dir.path().join("generation");
@@ -1918,6 +2622,82 @@ mod tests {
         process.stop_and_reap().unwrap();
         assert!(process.exited().unwrap().is_some());
         process.stop_and_reap().unwrap();
+    }
+
+    #[test]
+    fn final_diagnostics_drains_queued_output_after_owned_exit() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "dd if=/dev/zero bs=1024 count=12 2>/dev/null"]);
+        let process = OwnedProcess::spawn(&mut command, 64 * 1024, false).unwrap();
+        let mut vm = OwnedVm {
+            process,
+            owner: None,
+            rpc_listener: None,
+            deadline: Instant::now() + Duration::from_secs(2),
+            runtime: None,
+            sockets: None,
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while vm.process.stdout_bytes.len() < 8192 {
+            assert!(
+                Instant::now() < deadline,
+                "fixture did not emit initial chunk"
+            );
+            vm.process.drain().unwrap();
+            std::thread::sleep(POLL);
+        }
+        while vm.process.exited().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "fixture did not finish writing");
+            std::thread::sleep(POLL);
+        }
+        vm.stop_and_reap().unwrap();
+        let captured = vm.final_diagnostics();
+        assert!(captured.error.is_none());
+        assert!(!captured.truncated);
+        assert_eq!(captured.bytes, vec![0; 12 * 1024]);
+    }
+
+    #[test]
+    fn final_diagnostics_retains_full_prefix_after_output_overflow() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "while :; do printf '0123456789abcdef'; done"]);
+        let process = OwnedProcess::spawn(&mut command, 64 * 1024, false).unwrap();
+        let mut vm = OwnedVm {
+            process,
+            owner: None,
+            rpc_listener: None,
+            deadline: Instant::now() + Duration::from_secs(2),
+            runtime: None,
+            sockets: None,
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut saw_prior_prefix = false;
+        let error = loop {
+            assert!(
+                Instant::now() < deadline,
+                "fixture did not reach output bound"
+            );
+            match vm.process.drain() {
+                Ok(()) => {
+                    saw_prior_prefix |= !vm.process.stdout_bytes.is_empty();
+                    std::thread::sleep(POLL);
+                }
+                Err(error) => break error,
+            }
+        };
+        assert!(saw_prior_prefix);
+        assert!(error.to_string().contains("output limit"));
+        vm.stop_and_reap().unwrap();
+        let captured = vm.final_diagnostics();
+        assert!(captured.error.is_none());
+        assert!(captured.truncated);
+        assert_eq!(captured.bytes.len(), 64 * 1024);
+        assert!(captured
+            .bytes
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .all(|chunk| chunk == b"0123456789abcdef"));
     }
 
     #[test]
@@ -2298,6 +3078,8 @@ except RuntimeError:
     fn verifier_materializes_exact_tree_and_sealed_files_in_fresh_directories() {
         let directory = tempfile::tempdir().unwrap();
         let rootfs = directory.path().canonicalize().unwrap();
+        fs::create_dir(rootfs.join("etc")).unwrap();
+        fs::write(rootfs.join("etc/hosts"), b"").unwrap();
         fs::create_dir_all(rootfs.join("home/pillbox/.codex")).unwrap();
         fs::write(rootfs.join("home/pillbox/.codex/auth.json"), b"ambient").unwrap();
         fs::create_dir_all(rootfs.join("opt/pillbox-execution")).unwrap();
@@ -2306,6 +3088,10 @@ except RuntimeError:
         let digest = input.tree.digest().to_owned();
         prepare_verifier_guest(&rootfs, &input).unwrap();
         assert_eq!(input.tree.digest(), digest);
+        assert_eq!(
+            fs::read(rootfs.join("etc/hosts")).unwrap(),
+            OFFLINE_LOCALHOST_HOSTS
+        );
         assert_eq!(
             fs::read(rootfs.join(verifier::SOURCE_PATH.trim_start_matches('/'))).unwrap(),
             input.verifier.definition.source.as_bytes()
@@ -2360,6 +3146,44 @@ except RuntimeError:
         );
         assert!(!rootfs.join("opt/pillbox-execution/ca.key").exists());
         assert!(!rootfs.join("opt/pillbox-execution/ca.crt").exists());
+    }
+
+    #[test]
+    fn verifier_localhost_mapping_changes_only_the_private_clone() {
+        let fixture = tempfile::tempdir().unwrap();
+        let seed = fixture.path().join("seed");
+        fs::create_dir_all(seed.join("etc")).unwrap();
+        fs::write(seed.join("etc/hosts"), b"").unwrap();
+        fs::write(seed.join("etc/resolv.conf"), b"").unwrap();
+        let clone = fixture.path().join("clone");
+        crate::workspace::cow::cow_clone_dir(&seed, &clone).unwrap();
+
+        prepare_verifier_hosts(&clone).unwrap();
+        assert_eq!(
+            fs::read(clone.join("etc/hosts")).unwrap(),
+            OFFLINE_LOCALHOST_HOSTS
+        );
+        assert_eq!(fs::read(seed.join("etc/hosts")).unwrap(), b"");
+        assert_eq!(fs::read(clone.join("etc/resolv.conf")).unwrap(), b"");
+        assert_eq!(fs::read(seed.join("etc/resolv.conf")).unwrap(), b"");
+    }
+
+    #[test]
+    fn verifier_localhost_mapping_rejects_symlink_without_touching_target() {
+        let fixture = tempfile::tempdir().unwrap();
+        let rootfs = fixture.path().join("rootfs");
+        let outside = fixture.path().join("outside-hosts");
+        fs::create_dir_all(rootfs.join("etc")).unwrap();
+        fs::write(&outside, b"outside").unwrap();
+        std::os::unix::fs::symlink(&outside, rootfs.join("etc/hosts")).unwrap();
+
+        assert!(prepare_verifier_hosts(&rootfs).is_err());
+        assert_eq!(fs::read(&outside).unwrap(), b"outside");
+        fs::remove_file(rootfs.join("etc/hosts")).unwrap();
+        fs::remove_dir(rootfs.join("etc")).unwrap();
+        std::os::unix::fs::symlink(fixture.path(), rootfs.join("etc")).unwrap();
+        assert!(prepare_verifier_hosts(&rootfs).is_err());
+        assert_eq!(fs::read(&outside).unwrap(), b"outside");
     }
 
     #[cfg(target_os = "macos")]
@@ -2515,29 +3339,98 @@ with open(sys.argv[1], 'w') as output:
     }
 
     #[test]
-    fn exact_cached_image_is_cloned_inside_guarded_preparation() {
+    fn cached_image_fixture_is_cloned_inside_guarded_preparation() {
         let directory = tempfile::tempdir().unwrap();
         let cache = directory.path().canonicalize().unwrap();
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o700)).unwrap();
         let image_id = input().image_id;
         let stage = tempfile::tempdir_in(&cache).unwrap();
         fs::create_dir(stage.path().join("rootfs")).unwrap();
         fs::write(stage.path().join("rootfs/proof"), b"pristine").unwrap();
+        fs::set_permissions(
+            stage.path().join("rootfs"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
         commit_generation(stage, &cache.join(&image_id[7..]), &image_id).unwrap();
-        let destination = cache.join("private-rootfs");
-        provision_image(
+        let private = tempfile::tempdir_in(&cache).unwrap();
+        fs::set_permissions(private.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let destination = private.path().join("rootfs");
+        provision_image_with_role(
             &image_id,
             &cache,
             &destination,
             Instant::now() + Duration::from_secs(5),
             &|| false,
+            ImagePreparationRole::CachedFixture,
         )
         .unwrap();
+        assert_eq!(
+            fs::symlink_metadata(cache.join(&image_id[7..]).join("rootfs"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700
+        );
+        assert_eq!(
+            fs::symlink_metadata(&destination)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o755
+        );
+        assert_eq!(
+            fs::symlink_metadata(private.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700
+        );
         assert_eq!(fs::read(destination.join("proof")).unwrap(), b"pristine");
         fs::write(destination.join("proof"), b"private edit").unwrap();
         assert_eq!(
             fs::read(cache.join(&image_id[7..]).join("rootfs/proof")).unwrap(),
             b"pristine"
         );
+    }
+
+    #[test]
+    fn production_image_guardian_rejects_temp_cache_without_mutating_fixture() {
+        crate::test_util::with_isolated_home("invalid-image-guardian-cache", || {
+            let prior_home = std::env::var_os("HOME").unwrap();
+            std::env::set_var("HOME", fs::canonicalize(&prior_home).unwrap());
+            let directory = tempfile::tempdir().unwrap();
+            let cache = directory.path().canonicalize().unwrap();
+            let image_id = input().image_id;
+            let stage = tempfile::tempdir_in(&cache).unwrap();
+            fs::create_dir(stage.path().join("rootfs")).unwrap();
+            fs::write(stage.path().join("rootfs/proof"), b"pristine").unwrap();
+            commit_generation(stage, &cache.join(&image_id[7..]), &image_id).unwrap();
+            let private = tempfile::tempdir_in(&cache).unwrap();
+            let destination = private.path().join("rootfs");
+            let error = provision_image(
+                &image_id,
+                &cache,
+                &destination,
+                Instant::now() + Duration::from_secs(5),
+                &|| false,
+            )
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("outside verified rootfs backing"),
+                "unexpected production rejection: {error:#}"
+            );
+            assert_eq!(
+                fs::read(cache.join(&image_id[7..]).join("rootfs/proof")).unwrap(),
+                b"pristine"
+            );
+            assert!(!destination.exists());
+            assert!(!cache.join(format!("{}.lock", &image_id[7..])).exists());
+            std::env::set_var("HOME", prior_home);
+        });
     }
 
     #[test]

@@ -103,6 +103,19 @@ The verifier supervisor mounts separate 128 MiB tmpfs volumes at `/workspace` (m
 `/tmp` (mode 1777), both with `MS_NOSUID | MS_NODEV`, before the unprivileged evaluator starts.
 The root filesystem is remounted read-only. These scratch bounds do not alter the sealed verifier
 definition, input snapshot limit, or the VM's memory, CPU, PID, and network restrictions.
+Before boot, the private verifier clone receives a fixed `/etc/hosts` mapping for `localhost`
+to `127.0.0.1` and `::1`, so local test servers can resolve loopback without DNS. The cached
+image seed is unchanged; the verifier still has no egress network or external DNS access.
+
+Native rootfs preparation uses validated case-sensitive backing. On macOS, a private
+64 GiB APFS sparse bundle holds fresh `repository-images-v2` seeds and their private
+runtime clones on the same volume. Old `repository-images-v1` seeds are not migrated
+or reused; existing sessions retain their paths. Creation, attachment, and backing
+validation consume the original preparation deadline and obey cancellation. Preparation admission requires the existing 2 GiB free-space floor on both
+host and volume. Full, unknown,
+foreign, or case-folded backing fails without automatic growth or fallback. The
+backing remains mounted for concurrent and detached VMMs. This storage change adds
+no credentials or capabilities and changes no VM CPU, memory, scratch, or network limit.
 
 ## Credentials and transport
 
@@ -158,6 +171,64 @@ Running claims retain coarse progress references to the builder log, captured na
 result, and separate verifier session. Failure and owner-loss recovery preserve those references.
 Raw verifier report bytes (including malformed or partial reports) are stored and linked before
 interpretation, so a transport or parser failure remains inspectable without being called a verdict.
+
+## Standalone project verifier probe
+
+`pillbox execution verify-project --probe probe.json --repository /absolute/path/to/repo` is a
+credential-free, manually selected operator probe. It does not create an execution/3 claim,
+Pillbox session, builder result, or Huddles evidence receipt. The closed manifest is:
+
+```json
+{
+  "contract_version": "pillbox.project-verifier-probe/1",
+  "commit": "FULL_GIT_COMMIT_OID",
+  "snapshot_digest": "sha256:FULL_LOWERCASE_DIGEST",
+  "image_id": "sha256:FULL_LOWERCASE_VERIFIER_IMAGE_ID",
+  "output_id": "operator-chosen-identity",
+  "max_duration_ms": 600000,
+  "verifier": {
+    "verifier_id": "operator-chosen-identity",
+    "run_id": "operator-chosen-identity",
+    "definition_digest": "sha256:FULL_LOWERCASE_DEFINITION_DIGEST",
+    "definition": {
+      "runtime": "python3",
+      "source": "import subprocess\nraise SystemExit(subprocess.call(['npm', 'test']))\n",
+      "timeout_ms": 300000,
+      "max_output_bytes": 16384
+    }
+  }
+}
+```
+
+The source is illustrative; the chosen verifier image must contain `/usr/bin/python3` and every
+project test dependency. The verifier definition digest is the canonical SHA-256 of the complete
+`definition` object. The full Git commit and expected snapshot are checked before VM launch;
+dirty worktree bytes, symlinks, submodules, non-ASCII paths, files over 8 MiB, trees over 64 MiB,
+and more than 4,096 files are rejected. The probe derives `probe_digest` from the complete
+canonical closed manifest, including image, outer deadline, and sealed verifier source. It then
+derives `result_digest` from canonical JSON
+`{version, probe_digest, commit, output_id, result_snapshot_digest}`. These bind this operator
+result identity, not a builder-produced `RepositoryResult`.
+
+`max_duration_ms` is a finite outer limit for image preparation, guest boot and evaluation, must
+exceed the sealed evaluator timeout, and is at most one hour. The existing verifier VM remains
+two CPUs, 2 GiB RAM, no repository share or egress, with separate 128 MiB tmpfs volumes at
+`/workspace` and `/tmp`. The JSON v1 record includes full configuration identity, raw supervisor
+report bytes in base64 and SHA-256, the outer `max_duration_ms`, parsed
+exit/signal/timeout/output-limit and output bytes, and `teardown_confirmed`. Diagnostics capture
+drains queued host VMM output after confirmed stop/reap, retains at most the existing 64 KiB
+prefix, and marks `diagnostics_truncated` when output exceeds that bound. On an unconfirmed stop,
+the record retains the available prefix and error context without a verdict. Pass exits 0; a
+verifier fail exits 1 with a `fail` observation. Malformed report, transport or diagnostic failure,
+truncated diagnostics, or unconfirmed teardown is an infrastructure error with no verdict.
+The record is a manual probe, never a production execution or independent Huddles receipt.
+
+After confirmed VM stop/reap, private-runtime cleanup reopens directory identities from the
+anchored runtime root instead of holding every child directory open. Owner, device, inode and
+no-follow checks remain. Shared identity nodes have a 128 MiB accounting budget; queue and
+ancestor pointer vectors grow fallibly and are additional storage, so this is not a host RSS
+limit. Exceeding the identity budget is a loud infrastructure failure that preserves the private
+runtime for recovery and emits no verifier verdict. Cached seeds and external paths are untouched.
 
 ## Verification record — 2026-09-22
 

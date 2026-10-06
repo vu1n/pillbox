@@ -147,17 +147,10 @@ impl EventMapper {
     }
 
     fn on_text_delta(&mut self, d: &Value) -> Vec<Payload> {
-        let delta = str_of(d, "delta");
-        let id = msg_id(d);
-        if delta.is_empty() || id.is_empty() {
-            return vec![];
+        let out = self.text(msg_id(d), str_of(d, "delta"));
+        if !out.is_empty() {
+            self.text_streamed.insert(block_key(d));
         }
-        self.text_streamed.insert(block_key(d));
-        let mut out: Vec<Payload> = self.open(id).into_iter().collect();
-        out.push(Payload::MessageDelta(MessageDelta {
-            message_id: id.to_string(),
-            text: delta.to_string(),
-        }));
         out
     }
 
@@ -167,8 +160,12 @@ impl EventMapper {
         if self.text_streamed.remove(&block_key(d)) {
             return vec![];
         }
-        let text = str_of(d, "text");
-        let id = msg_id(d);
+        self.text(msg_id(d), str_of(d, "text"))
+    }
+
+    /// `text` as a delta of message `id`, opening it first if needed. Empty
+    /// text or id contributes nothing.
+    fn text(&mut self, id: &str, text: &str) -> Vec<Payload> {
         if text.is_empty() || id.is_empty() {
             return vec![];
         }

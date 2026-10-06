@@ -172,14 +172,10 @@ impl HarnessAdapter for ClaudeAdapter {
                     .get("is_error")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                if is_error {
-                    self.state.saw_error = true;
-                }
-                let mut out = vec![Payload::RunFinished(self.terminal_payload(if is_error {
-                    1
-                } else {
-                    0
-                }))];
+                self.state.saw_error |= is_error;
+                let mut out = vec![Payload::RunFinished(
+                    self.terminal_payload(i32::from(is_error)),
+                )];
                 // Cost/usage as a Custom event — orchestrators/Slack want spend
                 // visibility, especially once `-p` bills API.
                 if line.get("total_cost_usd").is_some() {
@@ -192,14 +188,13 @@ impl HarnessAdapter for ClaudeAdapter {
                         })),
                     }));
                 }
-                if line
+                if let Some(denials) = line
                     .get("permission_denials")
-                    .and_then(Value::as_array)
-                    .is_some_and(|denials| !denials.is_empty())
+                    .filter(|d| d.as_array().is_some_and(|a| !a.is_empty()))
                 {
                     out.push(Payload::Custom(Custom {
                         name: "permission_denials".into(),
-                        payload: line.get("permission_denials").cloned(),
+                        payload: Some(denials.clone()),
                     }));
                 }
                 out

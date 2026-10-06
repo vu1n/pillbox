@@ -294,23 +294,11 @@ pub const CLAUDE: AgentSpec = AgentSpec {
 /// auto`) — see [`harness::ClaudeAdapter::guest_root_argv`]. libkrun-only.
 pub const CLAUDE_STREAM: AgentSpec = AgentSpec {
     id: "claude-stream",
-    auth_id: "claude",
     integration: Integration::Structured,
-    cred_sentinel: ".claude/.credentials.json",
-    // Shares claude's auth home; a direct `auth login --agent claude-stream`
-    // runs claude's flow and writes the same shared home.
-    login_argv: &["claude", "auth", "login", "--claudeai"],
-    run_argv: &["claude"],
-    oauth_port: Some(54545),
-    post_login_finalize: Some(finalize_claude_onboarding),
-    vault_capable: true,
     // The structured one-shot rejects `--mcp` (no config injection yet).
     mcp_inject: None,
-    // Same permission posture as the PTY `claude` (root refuses bypass).
-    sandbox_args: CLAUDE.sandbox_args,
     // `-p` skips the workspace trust dialog and onboarding.
     prepare_workspace: None,
-    server: None,
     structured: Some(StructuredProfile {
         events_file: ".pillbox-claude-events.jsonl",
         // Bare alias or full name (`sonnet`, `claude-…`); `provider/model`
@@ -320,6 +308,9 @@ pub const CLAUDE_STREAM: AgentSpec = AgentSpec {
     }),
     #[cfg(feature = "libkrun")]
     libkrun_pty: None,
+    // Everything else is claude's: the shared auth home (`auth_id`), login,
+    // sentinel, vault posture and permission args (root refuses bypass).
+    ..CLAUDE
 };
 
 pub const CODEX: AgentSpec = AgentSpec {

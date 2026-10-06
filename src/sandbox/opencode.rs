@@ -82,7 +82,8 @@ pub(crate) fn serve_args() -> Vec<String> {
 
 /// Guest env for `opencode serve`: the pinned server password, and — when a
 /// sampling temperature was requested — an inline config that sets it on the
-/// session's model.
+/// session's model. Runs before the VM boots, so a malformed `--model` fails
+/// here rather than after bring-up.
 ///
 /// OpenCode 2 has no per-prompt temperature. The only placement verified to
 /// reach the provider request is the model's request `body` in config
@@ -92,12 +93,12 @@ pub(crate) fn serve_args() -> Vec<String> {
 /// a capturing provider on 2.0.24).
 #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) fn serve_env(model: &str, temperature: Option<f64>) -> Result<Vec<(String, String)>> {
+    let (provider, model_id) = split_model(model, ACTION)?;
     let mut env = vec![(
         "OPENCODE_SERVER_PASSWORD".to_string(),
         SERVER_PASSWORD.to_string(),
     )];
     if let Some(t) = temperature {
-        let (provider, model_id) = split_model(model, ACTION)?;
         let config = serde_json::json!({
             "providers": { provider: { "models": { model_id: { "body": { "temperature": t } } } } }
         });
@@ -119,11 +120,22 @@ fn split_model<'a>(model: &'a str, action: &'static str) -> Result<(&'a str, &'a
 
 /// Poll `GET /api/info` until the server answers `200` (the migration + boot
 /// can take a few seconds), bounded so a dead server fails loud instead of hanging.
+/// A `404` means the server is up but has no 2.x routes: the runner image still
+/// carries OpenCode 1.x, which this adapter does not speak.
 pub(crate) fn wait_ready(http: &dyn SandboxHttp) -> Result<()> {
     for _ in 0..60 {
         if let Ok(resp) = http.request("GET", "/api/info", None) {
-            if resp.status == 200 {
-                return Ok(());
+            match resp.status {
+                200 => return Ok(()),
+                404 => {
+                    return Err(PillboxError::runtime(
+                        ACTION,
+                        "opencode server has no /api/info: the runner image carries \
+                         OpenCode 1.x; rebuild or pull the runner (needs @opencode/cli 2.x)",
+                    )
+                    .into());
+                }
+                _ => {}
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(500));

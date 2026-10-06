@@ -1340,16 +1340,12 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
         let allowlist = vault_egress_allowlist(&opts, &with_hosts);
         (creds_share, swap_pairs, allowlist, refresh)
     } else {
-        let allowlist = crate::vault::providers::intercepted_hosts()
-            .into_iter()
-            .map(str::to_string)
-            .chain(
-                egress::standard_egress_hosts()
-                    .iter()
-                    .map(|host| (*host).to_string()),
-            )
-            .chain(opts.egress_allow.iter().cloned())
-            .collect();
+        let mut allowlist = vault_egress_allowlist(&opts, &[]);
+        allowlist.extend(
+            egress::standard_egress_hosts()
+                .iter()
+                .map(|host| (*host).to_string()),
+        );
         (cow_clone_home(&home)?, Vec::new(), allowlist, None)
     };
     let argv = structured_io::run_argv(spec.id, requested.clone(), &prompt)?

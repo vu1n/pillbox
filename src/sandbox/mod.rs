@@ -222,7 +222,8 @@ pub(crate) fn drive_server_prompt(
 ) -> Result<()> {
     let text = String::from_utf8_lossy(bytes);
     // codex-serve's bridge already holds the thread id, so its turn carries only
-    // the text; opencode needs the agent session id + model/temperature.
+    // the text; opencode needs its agent session id (the model and any
+    // temperature were bound when the server and session came up).
     if session.agent_id == crate::agents::CODEX_SERVE.id {
         return appserver_client::send_turn(http, &text);
     }
@@ -232,13 +233,7 @@ pub(crate) fn drive_server_prompt(
             format!("session `{}` has no server state", session.id),
         )
     })?;
-    opencode::send_prompt(
-        http,
-        &server.agent_session_id,
-        &text,
-        &server.model,
-        server.temperature,
-    )
+    opencode::send_prompt(http, &server.agent_session_id, &text)
 }
 
 #[cfg(test)]

@@ -228,9 +228,12 @@ impl CumulativeUsage {
         cache_write_reported: bool,
     ) -> crate::events::otel::genai::GenAiUsage {
         crate::events::otel::genai::GenAiUsage {
-            // Codex's input counter is inclusive of cache hits. Keep the
-            // canonical contract's input field billable/non-cached.
-            input_tokens: Some(self.non_cached_input()),
+            // Codex's input counter is inclusive of cache hits and writes. Keep
+            // the canonical contract's input field billable/non-cached.
+            input_tokens: Some(
+                self.non_cached_input()
+                    .saturating_sub(self.cache_write_input_tokens.unwrap_or(0)),
+            ),
             output_tokens: Some(self.output_tokens),
             cache_read_input_tokens: Some(self.cached_input_tokens),
             cache_creation_input_tokens: cache_write_reported
@@ -329,7 +332,10 @@ fn parse_message(
     }
     let content = payload.get("content").and_then(|v| v.as_array())?;
     let text = concat_text_blocks(content);
-    if text.is_empty() {
+    // Codex injects its `<environment_context>` (cwd, shell, date) as a
+    // user-role message ahead of the real prompt; like developer/system
+    // messages it is a harness prompt, not something the user typed.
+    if text.is_empty() || text.trim_start().starts_with("<environment_context>") {
         return None;
     }
     let uuid = format!("msg:{line_idx}");
@@ -837,7 +843,7 @@ mod tests {
             15,
         )
         .expect("first usage");
-        assert_eq!(first.input_tokens, Some(200));
+        assert_eq!(first.input_tokens, Some(196)); // 1000 - 800 read - 4 written
         assert_eq!(first.cache_read_input_tokens, Some(800));
         assert_eq!(first.cache_creation_input_tokens, Some(4));
         assert_eq!(first.output_tokens, Some(10));
@@ -854,7 +860,7 @@ mod tests {
             21,
         )
         .expect("changed usage");
-        assert_eq!(second.input_tokens, Some(50));
+        assert_eq!(second.input_tokens, Some(47)); // 250 - 200 read - 3 written
         assert_eq!(second.cache_read_input_tokens, Some(200));
         assert_eq!(second.cache_creation_input_tokens, Some(3));
         assert_eq!(second.output_tokens, Some(4));
@@ -983,5 +989,98 @@ mod tests {
         assert!(Parser::default().parse_line_checked("not json", 0).is_err());
         assert!(parse_line("{}", 0).is_empty());
         assert!(parse_line(r#"{"type":"response_item"}"#, 0).is_empty()); // no payload
+    }
+
+    /// A real rollout written by `codex exec` 0.160.0 (scripted model, no
+    /// credentials): a shell command, an apply_patch, a second command, the
+    /// final reply. Paths are rewritten and the long harness instructions
+    /// elided; the record types and shapes are codex's own.
+    #[test]
+    fn parses_a_live_codex_0_160_0_exec_rollout() {
+        let rollout = include_str!("../../../tests/fixtures/codex-0.160.0/exec-rollout.jsonl");
+        let mut parser = Parser::default();
+        let events: Vec<TranscriptEvent> = rollout
+            .lines()
+            .enumerate()
+            .flat_map(|(idx, line)| parser.parse_line_checked(line, idx).unwrap())
+            .collect();
+
+        let prompts: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::UserPrompt { content } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            prompts,
+            ["Create hello.txt and notes.md, then show hello.txt and list the directory."],
+            "the injected <environment_context> message is not a user prompt"
+        );
+
+        let calls: Vec<(&str, &str)> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::ToolUse {
+                    tool_use_id,
+                    tool_name,
+                    ..
+                } => Some((tool_use_id.as_str(), tool_name.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            calls,
+            [
+                ("call_1", "exec_command"),
+                ("call_2", "apply_patch"),
+                ("call_3", "exec_command"),
+            ]
+        );
+        let results: Vec<(&str, bool)> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::ToolResult {
+                    tool_use_id,
+                    is_error,
+                    ..
+                } => Some((tool_use_id.as_str(), *is_error)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            results,
+            [("call_1", false), ("call_2", false), ("call_3", false)]
+        );
+
+        // Four model responses → four cumulative token_count snapshots; the
+        // emitted deltas sum to the final cumulative total.
+        let usage: Vec<&crate::events::otel::genai::GenAiUsage> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                EventKind::Usage { usage } => Some(usage),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(usage.len(), 4);
+        let sum = |f: fn(&crate::events::otel::genai::GenAiUsage) -> Option<u64>| {
+            usage.iter().map(|u| f(u).unwrap_or(0)).sum::<u64>()
+        };
+        // Codex's input count includes cache reads and writes (its own
+        // `ResponseCompletedUsage` test: input 100 = 40 cached + 60 written).
+        assert_eq!(sum(|u| u.input_tokens), 410 - 160 - 40);
+        assert_eq!(sum(|u| u.cache_read_input_tokens), 160);
+        assert_eq!(sum(|u| u.cache_creation_input_tokens), 40);
+        assert_eq!(sum(|u| u.output_tokens), 80);
+
+        match &events.last().unwrap().kind {
+            EventKind::AssistantText {
+                text, stop_reason, ..
+            } => {
+                assert_eq!(text, "Wrote hello.txt and listed the directory.");
+                assert_eq!(stop_reason.as_deref(), Some("end_turn"));
+            }
+            other => panic!("expected the task_complete reply last, got {other:?}"),
+        }
     }
 }

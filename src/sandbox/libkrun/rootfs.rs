@@ -428,7 +428,7 @@ mod tests {
                 .envs(super::super::boot::static_child_env());
             root.preserve();
             let output =
-                super::super::repository::run_supervised_vmm(&mut command, spec, &spec_path)
+                super::super::repository::run_supervised_vmm(&mut command, spec, &spec_path, b"[]")
                     .unwrap();
             root.remove_stopped().unwrap();
             assert!(

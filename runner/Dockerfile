@@ -5,7 +5,7 @@
 #   - claude  (Anthropic's native installer → /usr/local/bin/claude)
 #   - codex   (OpenAI's official installer → /usr/local/bin/codex)
 #   - amp     (npm: @ampcode/cli)
-#   - opencode (npm: opencode-ai)
+#   - opencode (npm: @opencode/cli)
 #   - pi      (npm: @earendil-works/pi-coding-agent)
 #   - prime-agent (Prime Intellect native release → /usr/local/bin/prime-agent)
 #   - cursor  (Cursor Agent CLI lab tarball → /usr/local/bin/agent)
@@ -115,8 +115,10 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 ARG CLAUDE_VERSION=2.1.289
 # renovate: datasource=github-releases depName=openai/codex extractVersion=^rust-v(?<version>.*)$
 ARG CODEX_VERSION=0.160.0
-# renovate: datasource=npm depName=opencode-ai
-ARG OPENCODE_VERSION=1.18.34
+# OpenCode 2 ships as a new npm package (`@opencode/cli`); `opencode-ai` stays
+# on the 1.x line. Pillbox's local server adapter targets the 2.x server API.
+# renovate: datasource=npm depName=@opencode/cli
+ARG OPENCODE_VERSION=2.0.24
 # renovate: datasource=npm depName=@earendil-works/pi-coding-agent
 ARG PI_VERSION=1.0.2
 # Prime publishes a stable channel and checksummed native release archives.
@@ -132,7 +134,7 @@ ARG AMP_VERSION=0.0.1791091069-gb9917f
 
 RUN npm install -g \
 		@ampcode/cli@${AMP_VERSION} \
-		opencode-ai@${OPENCODE_VERSION} \
+		@opencode/cli@${OPENCODE_VERSION} \
 		@earendil-works/pi-coding-agent@${PI_VERSION} \
 	&& npm cache clean --force
 	# ^ the global install leaves a populated npm cache (~/.npm) in the

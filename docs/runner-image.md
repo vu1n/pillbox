@@ -32,7 +32,7 @@ rebuild silently reuses the stale layer instead of pulling the newer agent.
 | codex | native installer from `chatgpt.com/codex/install.sh`; complete native package preserved under `/opt/codex/packages/standalone/releases/<version>` | `CODEX_VERSION` | yes — github releases (`rust-v<ver>`) |
 | cursor | official `cursor.com/install` artifact | `CURSOR_AGENT_VERSION` | no — resolved from the official installer by `build-runner.sh --update` |
 | amp | `npm i -g @ampcode/cli@<pinned>` | `AMP_VERSION` | no — timestamp+sha versions defeat semver; bump by hand |
-| opencode | `npm i -g opencode-ai@<pinned>` | `OPENCODE_VERSION` | yes — npm |
+| opencode | `npm i -g @opencode/cli@<pinned>` (OpenCode 2; `opencode-ai` is the 1.x line) | `OPENCODE_VERSION` | yes — npm `@opencode/cli` |
 | pi | `npm i -g @earendil-works/pi-coding-agent@<pinned>` | `PI_VERSION` | yes — npm |
 | prime-agent | official native installer, checksummed release archive under `/opt/prime-agent` | `PRIME_AGENT_VERSION` | no — stable feed via `build-runner.sh --update` |
 
@@ -49,6 +49,14 @@ and Prime Agent 0.9.8. Updating the daily-use runner does not migrate a sealed
 execution profile. Profiles requiring Codex 0.151.0 or 0.156.1 must keep their
 matching immutable images until their adapters and protocols have been qualified
 against a newer release.
+
+On October 6 OpenCode moved to 2.0.24, installed from its new npm package
+`@opencode/cli` (OpenCode 2 is not published as `opencode-ai@2`). Its server
+API is a breaking change from 1.x (`/api/*` routes, a mandatory server password,
+renamed events), so the local `opencode` adapter now targets 2.x only. The
+managed Cloudflare and DigitalOcean images keep their own OpenCode 1.x pins
+(`cloudflare-spike/Dockerfile`, `digitalocean/`); they are sealed Huddles
+execution cohorts and move separately.
 
 Plus the system tooling agents tend to reach for: `bash`,
 `bubblewrap`, `ca-certificates`, `curl`, `gh`, `git`, `iproute2`

@@ -40,9 +40,44 @@ its native structured protocol on pipes:
 
 | Agent | PTY-free mechanism | Fidelity |
 |---|---|---|
-| Claude | `stream-json` in+out (conversation/tools/result) **+ hooks** (phase/activity) | full |
+| Claude | `claude-stream` (libkrun): `claude -p --output-format stream-json --verbose --permission-mode auto --permission-prompts none` one-shot → §0 SessionLog. Hooks not wired. | messages, tool calls, result, usage, retries/denials as `Custom` |
 | OpenCode | `opencode serve` (HTTP + SSE) | full |
-| Codex | `codex proto` / `exec` | lifecycle-only today |
+| Codex | `codex app-server` (JSON-RPC over stdio; the `codex-serve` agent, libkrun-only) | messages, tools, usage, idle (approvals auto-accepted, not routed); verified against Codex 0.160.0. The default PTY `codex` agent gets the same vocabulary from its rollout JSONL transcript |
+| pi / Cursor | `pi --mode json` / `agent -p --output-format stream-json` one-shots (libkrun) | messages, tool calls, result |
+
+**As built (code wins):** the interactive `claude` and `codex` agents stay PTY
+(their §0 comes from transcript tailing). The structured siblings are separate
+agent ids that share the PTY agent's auth home (`auth_id`): `codex-serve`
+(server mode) and `claude-stream` (one-shot `Integration::Structured`, like pi
+and cursor). A separate id rather than a flag because the integration kind is a
+per-spec property that routes the run, the backend check (docker rejects
+structured agents), and the capture/model policy.
+
+`claude-stream` notes, verified against Claude Code 2.1.289 (the runner pin)
+from captures of the real binary talking to a loopback API mock — no live
+model run:
+
+- **Credentials:** the run reuses the PTY path's vault env-fork. The guest
+  mounts a cloned home whose `claudeAiOauth` tokens are stubs; the supervised
+  VMM child's MITM swaps stub→real (reals reach it only on stdin). Egress is
+  the same vault allowlist as the PTY `claude`.
+- **Permissions:** the runner is root, and Claude refuses
+  `--dangerously-skip-permissions` and `bypassPermissions` as root, so the run
+  uses the PTY agent's `--permission-mode auto`. It also passes
+  `--permission-prompts none`, so anything auto mode would escalate is denied
+  (a `system/permission_denied` line, then the result's `permission_denials`)
+  instead of stalling. `--bare` is not used because bare mode never reads
+  OAuth credentials.
+- **Mapping:** `system/init` starts the run and records the served model;
+  `assistant` text blocks become message start/delta/end, and `tool_use` /
+  `tool_result` become tool calls. `result` produces `RunFinished`: `is_error`
+  decides failure, because `subtype` can be `success` on an API error. It also
+  emits `Custom` `usage` (cost, turns, `terminal_reason`) and, when there were
+  denials, `permission_denials`. `system/api_retry`, `system/permission_denied`
+  and `rate_limit_event` become `Custom` events. `stream_event` (partial
+  messages), `system/status` and `system/informational` are ignored. The
+  capture is drained after the run, so partial deltas would only duplicate
+  the complete lines.
 
 pillbox's value is **normalizing these into one vocabulary** (the `Event`
 oneof) via per-agent adapters that live *inside the sandbox emitter*.
@@ -88,7 +123,7 @@ human-in-the-loop (`PermissionRequested` / `AttentionRequired`), workspace
 data that has no arm goes in `Custom`, not in a new arm.
 
 **Never a TTY.** Run the agent headless on its native structured protocol
-(stream-json, `opencode serve`, `codex proto`). A PTY bypasses the
+(stream-json, `opencode serve`, `codex app-server`). A PTY bypasses the
 vault/workspace/audit envelope; the interactive attach transport is a separate
 surface and is not this contract.
 
@@ -136,5 +171,5 @@ handle on `RunFinished` / `ResultReady`, not a path and not inlined bytes.
 1. **claude (stream-json + hooks)** end-to-end: `Spawn` → events → `ResultReady`;
    `exec` channel; ship via in-proc callback + webhook + stdio. `AUTO_ALLOW`.
 2. **opencode serve** adapter (lum already has it); `SendInput` follow-ups.
-3. **codex proto** (lifecycle-first); interactive permission routing.
+3. **codex app-server** (`codex-serve`; done: approvals are auto-accepted inside the microVM); interactive permission routing.
 4. **`pillbox serve`** (WS/gRPC/REST + auth) — only if a network consumer needs it.

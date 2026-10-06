@@ -228,7 +228,8 @@ fn read_loop(stdout: impl Read, client: Arc<Client>, events_file: &str) -> Resul
                 client.pending.cv.notify_all();
             }
             MsgKind::ServerRequest(id, method) => {
-                if let Some(decision) = approval_response(&method) {
+                let params = msg.get("params").unwrap_or(&Value::Null);
+                if let Some(decision) = approval_response(&method, params) {
                     // Best-effort: a failed write means codex is gone; the serve
                     // loop will notice the child exit. Don't abort the reader.
                     let _ = client.write_msg(&json!({ "id": id, "result": decision }));
@@ -261,7 +262,9 @@ enum MsgKind {
     /// `id` present, `method` absent — a response to one of our requests.
     Response(i64),
     /// `id` and `method` both present — a request *from* codex (approval, etc.).
-    ServerRequest(i64, String),
+    /// The id stays a raw JSON value: the protocol's `RequestId` is a string or
+    /// an integer, and the response must echo it unchanged.
+    ServerRequest(Value, String),
     /// `method` present, `id` absent — a server notification (the event stream).
     Notification,
     /// Anything else (malformed / id without numeric form).
@@ -270,30 +273,42 @@ enum MsgKind {
 
 fn classify(msg: &Value) -> MsgKind {
     let method = msg.get("method").and_then(Value::as_str);
-    let id = msg.get("id").and_then(Value::as_i64);
+    let id = msg.get("id").filter(|id| id.is_string() || id.is_i64());
     match (id, method) {
-        (Some(id), Some(m)) => MsgKind::ServerRequest(id, m.to_string()),
-        (Some(id), None) => MsgKind::Response(id),
+        (Some(id), Some(m)) => MsgKind::ServerRequest(id.clone(), m.to_string()),
+        // Our own requests use integer ids, so only those can be responses.
+        (Some(id), None) => id.as_i64().map_or(MsgKind::Other, MsgKind::Response),
         (None, Some(_)) => MsgKind::Notification,
         (None, None) => MsgKind::Other,
     }
 }
 
-/// The auto-accept decision for an approval server-request, by method. The
+/// The auto-accept response for an approval server-request, by method. The
 /// microVM is the isolation boundary, so we accept what the agent wants to do
 /// (mirrors claude's `--permission-mode auto`). Returns `None` for server
-/// requests we don't recognize as approvals — those are left unanswered (codex
-/// times them out or proceeds), which is safer than guessing a decision shape.
-fn approval_response(method: &str) -> Option<Value> {
+/// requests that are not approvals (user input, MCP elicitation, dynamic tool
+/// calls, auth refresh, attestation): those are left unanswered, which is safer
+/// than guessing a response shape.
+///
+/// Shapes come from the `*Response` schemas of `codex app-server
+/// generate-json-schema` at codex 0.160.0; the command and file-change accepts
+/// were also exercised against a live 0.160.0 app-server.
+fn approval_response(method: &str, params: &Value) -> Option<Value> {
     match method {
-        // Command / file / patch / permission approvals all take a `decision`
-        // whose accept variant is the string `"accept"` (verified in the
-        // *RequestApprovalResponse schemas at codex 0.137.0).
-        "item/commandExecution/requestApproval"
-        | "item/fileChange/requestApproval"
-        | "item/permissions/requestApproval"
-        | "applyPatchApproval"
-        | "execCommandApproval" => Some(json!({ "decision": "accept" })),
+        // v2 command / file-change approvals: `{decision}`, accept = "accept".
+        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+            Some(json!({ "decision": "accept" }))
+        }
+        // v2 permission requests take no decision: the response grants a
+        // permission profile (`{permissions, scope}`, `permissions` required).
+        // Accepting means granting exactly what was requested, for this turn.
+        "item/permissions/requestApproval" => Some(json!({
+            "permissions": params.get("permissions").cloned().unwrap_or_else(|| json!({})),
+            "scope": "turn",
+        })),
+        // Legacy v1 approvals answer with a `ReviewDecision`, whose accept
+        // variant is "approved", not "accept".
+        "applyPatchApproval" | "execCommandApproval" => Some(json!({ "decision": "approved" })),
         _ => None,
     }
 }
@@ -427,9 +442,15 @@ mod tests {
         ));
         // Server-request: id AND method.
         match classify(&json!({"id": 5, "method": "item/commandExecution/requestApproval"})) {
-            MsgKind::ServerRequest(5, m) => {
+            MsgKind::ServerRequest(id, m) => {
+                assert_eq!(id, json!(5));
                 assert_eq!(m, "item/commandExecution/requestApproval")
             }
+            _ => panic!("expected ServerRequest"),
+        }
+        // `RequestId` may also be a string; it is echoed back verbatim.
+        match classify(&json!({"id": "req-7", "method": "item/fileChange/requestApproval"})) {
+            MsgKind::ServerRequest(id, _) => assert_eq!(id, json!("req-7")),
             _ => panic!("expected ServerRequest"),
         }
         // Notification: method, no id.
@@ -441,17 +462,75 @@ mod tests {
 
     #[test]
     fn approval_accepts_known_methods_only() {
+        let none = Value::Null;
         for m in [
             "item/commandExecution/requestApproval",
             "item/fileChange/requestApproval",
-            "item/permissions/requestApproval",
-            "applyPatchApproval",
-            "execCommandApproval",
         ] {
-            assert_eq!(approval_response(m), Some(json!({"decision": "accept"})));
+            assert_eq!(
+                approval_response(m, &none),
+                Some(json!({"decision": "accept"}))
+            );
         }
-        // An unrecognized server-request gets no canned decision.
-        assert_eq!(approval_response("item/tool/requestUserInput"), None);
-        assert_eq!(approval_response("account/chatgptAuthTokens/refresh"), None);
+        // Legacy v1 approvals take a ReviewDecision: "approved".
+        for m in ["applyPatchApproval", "execCommandApproval"] {
+            assert_eq!(
+                approval_response(m, &none),
+                Some(json!({"decision": "approved"}))
+            );
+        }
+        // Server-requests that are not approvals get no canned response.
+        for m in [
+            "item/tool/requestUserInput",
+            "mcpServer/elicitation/request",
+            "item/tool/call",
+            "account/chatgptAuthTokens/refresh",
+            "attestation/generate",
+        ] {
+            assert_eq!(approval_response(m, &none), None);
+        }
+    }
+
+    #[test]
+    fn permission_request_grants_exactly_what_was_requested_for_the_turn() {
+        let params = json!({
+            "threadId": "t", "turnId": "u", "itemId": "i", "cwd": "/workspace/demo",
+            "startedAtMs": 1,
+            "permissions": {"network": {"enabled": true}, "fileSystem": null},
+        });
+        assert_eq!(
+            approval_response("item/permissions/requestApproval", &params),
+            Some(json!({
+                "permissions": {"network": {"enabled": true}, "fileSystem": null},
+                "scope": "turn",
+            }))
+        );
+    }
+
+    /// Real server-requests captured from a codex 0.160.0 app-server turn
+    /// (driven through this bridge against a scripted model). Each must get an
+    /// accept its own `availableDecisions` (when listed) allows.
+    #[test]
+    fn answers_server_requests_captured_from_codex_0_160_0() {
+        let capture =
+            include_str!("../../tests/fixtures/codex-0.160.0/app-server-approval-requests.ndjson");
+        let mut answered = 0;
+        for line in capture.lines() {
+            let msg: Value = serde_json::from_str(line).unwrap();
+            let MsgKind::ServerRequest(id, method) = classify(&msg) else {
+                panic!("expected a server-request: {line}");
+            };
+            assert!(id.is_i64());
+            let params = &msg["params"];
+            let response = approval_response(&method, params).expect(&method);
+            if let Some(allowed) = params.get("availableDecisions").and_then(Value::as_array) {
+                assert!(
+                    allowed.contains(&response["decision"]),
+                    "{method}: {response}"
+                );
+            }
+            answered += 1;
+        }
+        assert_eq!(answered, 2);
     }
 }

@@ -11,7 +11,11 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::contract::{Actor, Artifact, ArtifactClass, Custom, Event, Payload};
-use crate::events::{blob::BlobStore, codex_serve::CodexServeMapper, log::SessionLog};
+use crate::events::{
+    blob::BlobStore,
+    codex_serve::{CodexServeMapper, UsageAccounting},
+    log::SessionLog,
+};
 use crate::pillbox::Pillbox;
 
 use super::files::FileTree;
@@ -312,7 +316,8 @@ impl ExecutionEvidence {
             worker_id: String::new(),
         }))?;
         if let Some((thread_id, turn_id)) = native_identity(frames) {
-            let mut mapper = CodexServeMapper::new();
+            // The evidence projection keeps its original per-response usage.
+            let mut mapper = CodexServeMapper::with_accounting(UsageAccounting::LastResponse);
             for (index, envelope) in frames.iter().enumerate() {
                 let message = &envelope["message"];
                 if envelope["direction"] != "inbound"

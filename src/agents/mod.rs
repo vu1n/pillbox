@@ -307,10 +307,13 @@ pub const CODEX: AgentSpec = AgentSpec {
 /// `= "codex"`): one `pillbox auth login --agent codex` covers both. The PTY
 /// `codex` stays the default; this is opt-in via `--agent codex-serve`, so if
 /// upstream ever closes the app-server surface the TUI path is unaffected.
-/// Codex 0.144.5 receives the exact structured model and reasoning request at
-/// thread creation and again on each turn; the generic named model-profile
-/// label remains Pillbox request metadata because Codex's config profile is a
-/// different, local-file concept.
+/// The bridge ([`crate::sandbox::appserver`]) and its normalizer
+/// ([`crate::events::codex_serve`]) are verified against Codex 0.160.0, the
+/// runner image's pin: its `generate-json-schema` protocol plus a live captured
+/// turn (`tests/fixtures/codex-0.160.0/`). The bridge sends `thread/start` and
+/// `turn/start` without a `model` or `effort`, so Codex uses its own configured
+/// default; `--model` is recorded only as Pillbox request metadata on the
+/// session, not forwarded to Codex.
 ///
 /// libkrun-only today (the server bring-up lives in the microVM run path; docker
 /// rejects it via [`ServerProfile::libkrun_only`]). **Non-vault v1**: the

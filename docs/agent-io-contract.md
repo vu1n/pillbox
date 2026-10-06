@@ -42,7 +42,7 @@ its native structured protocol on pipes:
 |---|---|---|
 | Claude | `stream-json` in+out (conversation/tools/result) **+ hooks** (phase/activity) | full |
 | OpenCode | `opencode serve` (HTTP + SSE) | full |
-| Codex | `codex proto` / `exec` | lifecycle-only today |
+| Codex | `codex app-server` (JSON-RPC over stdio; the `codex-serve` agent, libkrun-only) | messages, tools, usage, idle (approvals auto-accepted, not routed); verified against Codex 0.160.0. The default PTY `codex` agent gets the same vocabulary from its rollout JSONL transcript |
 
 pillbox's value is **normalizing these into one vocabulary** (the `Event`
 oneof) via per-agent adapters that live *inside the sandbox emitter*.
@@ -88,7 +88,7 @@ human-in-the-loop (`PermissionRequested` / `AttentionRequired`), workspace
 data that has no arm goes in `Custom`, not in a new arm.
 
 **Never a TTY.** Run the agent headless on its native structured protocol
-(stream-json, `opencode serve`, `codex proto`). A PTY bypasses the
+(stream-json, `opencode serve`, `codex app-server`). A PTY bypasses the
 vault/workspace/audit envelope; the interactive attach transport is a separate
 surface and is not this contract.
 
@@ -136,5 +136,5 @@ handle on `RunFinished` / `ResultReady`, not a path and not inlined bytes.
 1. **claude (stream-json + hooks)** end-to-end: `Spawn` → events → `ResultReady`;
    `exec` channel; ship via in-proc callback + webhook + stdio. `AUTO_ALLOW`.
 2. **opencode serve** adapter (lum already has it); `SendInput` follow-ups.
-3. **codex proto** (lifecycle-first); interactive permission routing.
+3. **codex app-server** (`codex-serve`; done: approvals are auto-accepted inside the microVM); interactive permission routing.
 4. **`pillbox serve`** (WS/gRPC/REST + auth) — only if a network consumer needs it.

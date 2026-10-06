@@ -4,35 +4,30 @@
 //! opencode is an [`Integration::Server`](crate::agents::Integration) agent: it
 //! runs as an HTTP server inside the sandbox and we drive/read it over its API
 //! rather than a PTY. Every call here goes through a [`SandboxHttp`] transport,
-//! so the bridge is backend-agnostic.
+//! so the bridge is backend-agnostic. Server agents run on the libkrun backend
+//! only; the turn's events are read from the guest capture ([`EVENTS_FILE`]).
 //!
 //! - [`serve_args`] / [`serve_env`] — the in-sandbox command and its env.
 //! - [`wait_ready`] — poll `GET /api/info` until the server answers.
 //! - [`create_session`] — `POST /api/session` (with the model) → the session id.
 //! - [`send_prompt`] — `POST /api/session/{id}/prompt` (admits the input; the
 //!   turn streams on `/api/event`).
-//! - [`spawn_event_bridge`] — `GET /api/event` (SSE) → [`drain_sse`] → durable log.
 //!
 //! Targets the OpenCode 2 server API (`@opencode/cli`, verified live against
 //! 2.0.24): every route lives under `/api/`, the server always requires a
 //! password (HTTP basic, user `opencode`), the model is chosen per session, and
 //! there is no per-prompt temperature. See docs/opencode-integration.md.
 
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
-
 use anyhow::Result;
 
 use crate::errors::PillboxError;
-use crate::events::log::SessionLog;
-use crate::events::opencode::drain_sse;
-use crate::events::transcripts::TailerHandle;
 use crate::sandbox::http::SandboxHttp;
 
 const ACTION: &str = "run (opencode server)";
 
 /// Port the in-sandbox `opencode serve` listens on (guest loopback only; reached
 /// by the backend's [`SandboxHttp`] transport).
+#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) const SERVE_PORT: u16 = 4096;
 
 /// HTTP basic-auth user OpenCode 2's server expects.
@@ -66,6 +61,7 @@ pub(crate) const DEFAULT_MODEL: &str = "zai-coding-plan/glm-4.5-air";
 pub(crate) const EVENTS_FILE: &str = ".pillbox-opencode-events.sse";
 
 /// The in-sandbox command: a headless opencode server bound to localhost.
+#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) fn serve_args() -> Vec<String> {
     [
         "opencode",
@@ -122,6 +118,7 @@ fn split_model<'a>(model: &'a str, action: &'static str) -> Result<(&'a str, &'a
 /// can take a few seconds), bounded so a dead server fails loud instead of hanging.
 /// A `404` means the server is up but has no 2.x routes: the runner image still
 /// carries OpenCode 1.x, which this adapter does not speak.
+#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) fn wait_ready(http: &dyn SandboxHttp) -> Result<()> {
     for _ in 0..60 {
         if let Ok(resp) = http.request("GET", "/api/info", None) {
@@ -145,6 +142,7 @@ pub(crate) fn wait_ready(http: &dyn SandboxHttp) -> Result<()> {
 
 /// `POST /api/session` with the model → the new session id (`ses_…`, under
 /// `data.id`). `model` is `provider/modelID`.
+#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) fn create_session(http: &dyn SandboxHttp, model: &str) -> Result<String> {
     let (provider, model_id) = split_model(model, ACTION)?;
     let body = serde_json::json!({ "model": { "providerID": provider, "id": model_id } });
@@ -175,6 +173,7 @@ pub(crate) fn create_session(http: &dyn SandboxHttp, model: &str) -> Result<Stri
 /// Drive the session: `POST /api/session/{id}/prompt` with the text. OpenCode
 /// admits the input durably and returns it (`200`); the turn itself streams on
 /// `/api/event` (read via [`spawn_event_bridge`] or the guest capture).
+#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) fn send_prompt(
     http: &dyn SandboxHttp,
     opencode_session: &str,
@@ -207,6 +206,7 @@ pub(crate) fn send_prompt(
 /// comes up ready and prompts are driven through `session send` (so the turn is
 /// captured by a subscribed `watch`/`subscribe`, not streamed to no one at
 /// start). If the user passed a prompt, the send hint pre-fills it.
+#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) fn print_started(
     session: &crate::session::Session,
     json: bool,
@@ -239,31 +239,4 @@ pub(crate) fn print_started(
             session.id
         ),
     }
-}
-
-/// Stream the server's `/api/event` SSE into the durable [`SessionLog`] — the
-/// `Server`-mode analog of the transcript tailer. The transport's `/api/event`
-/// stream feeds [`drain_sse`] on a thread; the returned handle stops the stream
-/// on shutdown (the blocking read can't observe the flag mid-frame). `None` if
-/// the stream can't open.
-pub(crate) fn spawn_event_bridge(
-    http: &dyn SandboxHttp,
-    session_id: &str,
-    log: SessionLog,
-) -> Option<TailerHandle> {
-    let stream = http
-        .open_stream("/api/event")
-        .map_err(|e| eprintln!("pillbox: warning: couldn't open the opencode event stream: {e:#}"))
-        .ok()?;
-    let body = stream.body;
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_thread = Arc::clone(&stop);
-    let sid = session_id.to_string();
-    let join = std::thread::spawn(move || {
-        let mut log = log;
-        if let Err(e) = drain_sse(body, &sid, &mut log, &stop_thread) {
-            eprintln!("pillbox: warning: opencode event stream stopped: {e:#}");
-        }
-    });
-    Some(TailerHandle::from_stopper(stop, stream.stopper, join))
 }

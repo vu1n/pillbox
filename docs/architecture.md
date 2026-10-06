@@ -57,6 +57,9 @@ capability-gated via `Caps`). The **only** two places that branch on backend are
 `select_backend()` and `live_session()`. Behavior also forks at ~38
 `#[cfg(feature = "libkrun")]` gates — collapsing those (libkrun-only) is the
 structural win when the docker backend is deleted.
+Docker runs PTY agents only: `run` refuses every server agent (`spec.server`,
+opencode/codex-serve) and structured agent, and `sandbox agent` drives only the
+stdout `HarnessAdapter` harnesses (src/agents/harness/).
 
 ### libkrun launch shape `[verified 2026-06-20]`
 `krun_create_ctx` → `set_vm_config` → `set_root(dir)` (virtio-fs root, *not* a

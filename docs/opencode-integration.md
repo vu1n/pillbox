@@ -19,9 +19,9 @@ OpenCode 2 is a new package, not `opencode-ai@2` (that package stays on the 1.x
 line), and its server API is a clean break from 1.x, so the adapter targets 2.x
 only. The managed Cloudflare/DigitalOcean paths keep their own OpenCode 1.x pins
 (`cloudflare-spike/Dockerfile`, `digitalocean/`) because they are sealed Huddles
-execution cohorts; they are not covered by this doc. The Docker `run_server` and
-`sandbox agent` paths are deprecated with the Docker backend and were not moved
-to 2.x.
+execution cohorts; they are not covered by this doc. opencode does not run on
+the deprecated Docker backend (`run` refuses every server agent there) and has
+no `sandbox agent` adapter; the OpenCode 1 Docker paths were deleted.
 
 **`run` does NOT auto-send** the initial prompt: it brings up a ready session; the
 first prompt goes through `session send` like every turn, captured by the guest

@@ -472,7 +472,7 @@ pub(crate) enum SessionAction {
     /// to fill the log: the reparented guest outlives `run`, so a host-side live
     /// tailer can't persist for it, but the guest's capture file does — so the
     /// full agent trajectory lands in the §0 log without racing the session.
-    /// libkrun opencode today; docker/PTY sessions drain live via
+    /// libkrun server agents today; PTY sessions drain live via
     /// `session subscribe`/`watch`. Re-running is a no-op (already ingested).
     Ingest {
         id: String,

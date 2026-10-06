@@ -229,3 +229,16 @@ default Cloudflare compute behind the existing authenticated execution service.
 D1 claims, R2 evidence, rustic workspace authority, Huddles collaboration ownership,
 and the prohibition on automatic cross-provider resampling remain unchanged.
 See [adapter scope and validation gates](../digitalocean/README.md).
+
+## 2026-10-06 — Agent I/O names the protocols as built; Docker server agents removed
+
+Maintainer-ratified `agent-io-pty-free-contract@0002` names codex `app-server`
+(plus its rollout transcript for the PTY agent) and claude `-p --output-format
+stream-json` instead of the removed `codex proto` and unwired claude hooks. The
+invariants are unchanged.
+
+As a step of ADR-002, server agents (opencode, codex-serve) now run on libkrun
+only: the Docker `run_server` path, the `sandbox agent` OpenCode 1 driver and its
+normalizer are deleted. Docker refuses server agents with a usage error.
+- **Rejected:** porting the Docker opencode path to OpenCode 2 (Docker gets no
+  fixes; see ADR-002).

@@ -58,14 +58,6 @@ CASES: dict[str, Case] = {
         "codex",
         "Docker backend, Codex PTY session",
     ),
-    "docker-opencode": Case(
-        "docker-opencode",
-        "docker",
-        "opencode",
-        "Docker backend, opencode server session",
-        needs_model=True,
-        runner_image="pillbox-runner:dev",
-    ),
     "libkrun-claude": Case(
         "libkrun-claude",
         "libkrun",

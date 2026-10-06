@@ -84,7 +84,7 @@ PTY-free exec channel an orchestrator drives. Docker-backed today.
 |---|---|
 | `pillbox sandbox spawn [--image IMG] [--agent A] [--workspace PATH] [--label TEXT]` | Spawn an idle sandbox with the workspace mounted; prints the sandbox id. `--agent` provisions its auth + runs non-root so the agent channel can drive it; omit for a bare exec-only sandbox. |
 | `pillbox sandbox exec ID [--json] -- ARGV…` | Run a command (PTY-free). Streams raw output + mirrors the exit code; `--json` emits `ExecStarted`/`ExecOutput`/`ExecExit` as JSONL. |
-| `pillbox sandbox agent ID [--json] -- PROMPT…` | Run an agent turn (the agent channel) in a sandbox spawned `--agent`. Streams contract events; `--json` for JSONL, else a human trace. |
+| `pillbox sandbox agent ID [--json] -- PROMPT…` | Run an agent turn (the agent channel) in a sandbox spawned `--agent`. Streams contract events; `--json` for JSONL, else a human trace. Only harnesses with a stdout adapter (`claude`, `cursor`, `pi`); server agents (`opencode`, `codex-serve`) have none and are a usage error. |
 | `pillbox sandbox list [--json]` | List sandboxes in the current pillbox. |
 | `pillbox sandbox destroy ID` | Kill the sandbox container and remove the record. |
 

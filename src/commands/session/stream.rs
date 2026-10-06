@@ -25,7 +25,7 @@ fn resolve_streaming_session(
 ) -> Result<(String, Option<events::transcripts::TailerHandle>)> {
     if let Ok(s) = session::resolve(resolved, id) {
         // Gate on the *capability*, not on catching every error: a backend that
-        // can host-tail this session (docker any session, libkrun a server one)
+        // can host-tail this session (docker a PTY one, libkrun a server one)
         // spawns the tailer and lets a genuine failure (registry miss, IO)
         // propagate loud; one that can't (a libkrun PTY session, an
         // unknown/removed backend) degrades to reading the existing log. Catching

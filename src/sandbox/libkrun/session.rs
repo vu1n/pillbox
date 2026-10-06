@@ -1095,7 +1095,7 @@ fn launch_server_vm(
     let pid = child.id() as i32;
     startup.mark("vmm_spawn");
 
-    let http = http::LibkrunHttp::new(host_sock.clone());
+    let http = server_http(spec, host_sock.clone());
     let prompt = opts.args.join(" ").trim().to_string();
 
     // Bring-up over the forward; capture the result so a failure tears the VM
@@ -1672,9 +1672,8 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
             )
         }),
         bringup: Box::new(move |http| {
-            let http = http.with_basic_auth(opencode::SERVER_USER, opencode::SERVER_PASSWORD);
-            opencode::wait_ready(&http)?;
-            opencode::create_session(&http, &session_model)
+            opencode::wait_ready(http)?;
+            opencode::create_session(http, &session_model)
         }),
     };
     launch_server_vm(spec, opts, resolved, launch)
@@ -1761,15 +1760,18 @@ pub(crate) fn opencode_http(
     session: &crate::session::Session,
 ) -> Result<Box<dyn crate::sandbox::http::SandboxHttp>> {
     let handle = LibkrunHandle::decode(session)?;
-    let http = http::LibkrunHttp::new(PathBuf::from(handle.sock));
-    if session.agent_id == crate::agents::OPENCODE.id {
-        use crate::sandbox::opencode;
-        return Ok(Box::new(http.with_basic_auth(
-            opencode::SERVER_USER,
-            opencode::SERVER_PASSWORD,
-        )));
+    let spec = crate::agents::lookup("session", &session.agent_id)?;
+    Ok(Box::new(server_http(spec, PathBuf::from(handle.sock))))
+}
+
+/// Transport to a server agent's in-guest HTTP server, with the agent's
+/// basic auth (if any) on every request.
+fn server_http(spec: &AgentSpec, sock: PathBuf) -> http::LibkrunHttp {
+    let http = http::LibkrunHttp::new(sock);
+    match spec.server.and_then(|server| server.basic_auth) {
+        Some((user, password)) => http.with_basic_auth(user, password),
+        None => http,
     }
-    Ok(Box::new(http))
 }
 
 /// Host-side path of a libkrun server session's event-capture file (inside the

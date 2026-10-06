@@ -87,6 +87,11 @@ pub(crate) struct ServerProfile {
     pub(crate) events_format: crate::events::EventsFormat,
     /// True for server agents that only run on libkrun (docker rejects them).
     pub(crate) libkrun_only: bool,
+    /// HTTP basic-auth `(user, password)` every host call to the guest server
+    /// carries (OpenCode 2 refuses to serve without a password). Consumed by the
+    /// libkrun transport; dead on a non-libkrun build.
+    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+    pub(crate) basic_auth: Option<(&'static str, &'static str)>,
 }
 
 /// The per-agent data a [`Integration::Structured`] agent needs beyond the
@@ -382,6 +387,7 @@ pub const CODEX_SERVE: AgentSpec = AgentSpec {
         events_file: crate::sandbox::appserver_client::EVENTS_FILE,
         events_format: crate::events::EventsFormat::Ndjson,
         libkrun_only: true,
+        basic_auth: None,
     }),
     structured: None,
     #[cfg(feature = "libkrun")]
@@ -411,6 +417,10 @@ pub const OPENCODE: AgentSpec = AgentSpec {
         events_file: crate::sandbox::opencode::EVENTS_FILE,
         events_format: crate::events::EventsFormat::Sse,
         libkrun_only: false,
+        basic_auth: Some((
+            crate::sandbox::opencode::SERVER_USER,
+            crate::sandbox::opencode::SERVER_PASSWORD,
+        )),
     }),
     structured: None,
     #[cfg(feature = "libkrun")]

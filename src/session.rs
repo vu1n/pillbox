@@ -306,14 +306,15 @@ pub(crate) struct Session {
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ServerSession {
     /// The agent-native session id its HTTP API uses (`ses_…`), distinct from
-    /// this record's pillbox id. `session send` (→ POST `/prompt_async`) and the
-    /// event bridge target it.
+    /// this record's pillbox id. `session send` (→ the agent's prompt route) and
+    /// the event bridge target it.
     pub(crate) agent_session_id: String,
-    /// The `providerID/modelID` to drive with (resolved from `--model` or a
-    /// default at run time, reused by every `session send`).
+    /// The `providerID/modelID` the session was created with (resolved from
+    /// `--model` or a default at run time).
     pub(crate) model: String,
-    /// Sampling temperature (`--temperature`) sent on every `session send`.
-    /// `None` → the model/provider default. `Some(0.0)` = greedy decoding.
+    /// Sampling temperature (`--temperature`), bound into the server's config at
+    /// start (OpenCode 2 has no per-prompt temperature); kept as a record of the
+    /// run. `None` → the model/provider default. `Some(0.0)` = greedy decoding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) temperature: Option<f64>,
 }

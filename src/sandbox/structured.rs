@@ -24,23 +24,7 @@ pub(crate) fn run_argv(
     requested: Option<RequestedRunProfile>,
     prompt: &str,
 ) -> Result<Vec<String>> {
-    Ok(match agent_id {
-        "pi" => {
-            let requested = requested.ok_or_else(|| {
-                anyhow::anyhow!("pi structured path requires a RequestedRunProfile")
-            })?;
-            PiAdapter::with_request(requested).run_argv(prompt)
-        }
-        "cursor" => match requested {
-            Some(profile) => CursorAdapter::with_request(profile).run_argv(prompt),
-            None => CursorAdapter::default().run_argv(prompt),
-        },
-        // The libkrun guest runs as root: never the docker adapter's
-        // `--dangerously-skip-permissions` argv (claude refuses it as root).
-        "claude-stream" => ClaudeAdapter::with_request(requested)
-            .guest_root_argv(crate::agents::CLAUDE_STREAM.sandbox_args, prompt),
-        other => anyhow::bail!("structured mode is not wired for agent `{other}`"),
-    })
+    Ok(Adapter::new(agent_id, requested)?.run_argv(prompt))
 }
 
 /// Persist the canonical start before the guest executes. Later harness
@@ -163,6 +147,16 @@ impl Adapter {
             }),
             "claude-stream" => Ok(Self::Claude(ClaudeAdapter::with_request(requested))),
             other => anyhow::bail!("structured mode is not wired for agent `{other}`"),
+        }
+    }
+
+    fn run_argv(&self, prompt: &str) -> Vec<String> {
+        match self {
+            Self::Pi(a) => a.run_argv(prompt),
+            Self::Cursor(a) => a.run_argv(prompt),
+            // The libkrun guest runs as root: never the docker adapter's
+            // `--dangerously-skip-permissions` argv (claude refuses it as root).
+            Self::Claude(a) => a.guest_root_argv(crate::agents::CLAUDE_STREAM.sandbox_args, prompt),
         }
     }
 

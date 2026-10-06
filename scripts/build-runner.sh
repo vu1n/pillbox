@@ -106,7 +106,7 @@ if [ "$DO_UPDATE" = 1 ]; then
 	CURSOR_NEW=$(curl -fsSL https://cursor.com/install \
 		| sed -nE 's#^DOWNLOAD_URL="https://downloads\.cursor\.com/lab/([^/]+)/\$\{OS\}/\$\{ARCH\}/agent-cli-package\.tar\.gz"$#\1#p' \
 		| head -1)
-	OPENCODE_NEW=$(npm view opencode-ai version)
+	OPENCODE_NEW=$(npm view @opencode/cli version)
 	PI_NEW=$(npm view @earendil-works/pi-coding-agent version)
 	PRIME_AGENT_NEW=$(curl --proto '=https' --proto-redir '=https' -fsSL \
 		https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev/stable | tr -d '[:space:]' | sed 's/^v//')

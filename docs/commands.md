@@ -137,7 +137,7 @@ persistent ownership; `session attach` may still detach with SIGTERM.
 | `--model PROVIDER/MODEL` | agent default | Requested model for a structured server agent, e.g. `openai/gpt-5.6-luna`. The provider and model are validated and persisted separately; compare them with runtime evidence in `session info --json`. |
 | `--profile PROFILE` | explicit none | Optional exact model profile selected by the caller. Pillbox transports and records it; it does not choose Sol/Terra/Luna. Rejected for PTY-only integrations. |
 | `--reasoning-effort low\|medium\|high` | harness default | Normalized requested reasoning effort. Runtime-native names remain observed evidence and do not widen this enum. Rejected for PTY-only integrations. |
-| `--temperature FLOAT` | — | Sampling temperature for a server-mode agent (`opencode`), sent on every `session send`. `0` = greedy/deterministic decoding (the eval rig's variance knob). Ignored by PTY agents. |
+| `--temperature FLOAT` | — | Sampling temperature for a server-mode agent (`opencode`), bound to the session's model when the server starts (OpenCode 2 has no per-prompt temperature). `0` = greedy/deterministic decoding (the eval rig's variance knob). Ignored by PTY agents. |
 | `--parent ID` | — | The session this run forked from. Carried to the lifecycle event as `parent_session_id` and to OTel as `parent_span_id`, so a forked trace stitches across pillboxes. Observability metadata — the parent need not exist in this pillbox. |
 
 Env composition order (later layers override earlier):

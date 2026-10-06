@@ -351,8 +351,12 @@ pub const OPENCODE: AgentSpec = AgentSpec {
     id: "opencode",
     auth_id: "opencode",
     integration: Integration::Server,
-    cred_sentinel: ".local/share/opencode/auth.json",
-    login_argv: &["opencode", "auth", "login"],
+    // OpenCode 2 keeps credentials in its SQLite store (`opencode.db`); it does
+    // not read OpenCode 1's `auth.json`, so a home logged in under 1.x must log
+    // in again. `--standalone` keeps the login sandbox from starting OpenCode's
+    // per-user background service.
+    cred_sentinel: ".local/share/opencode/opencode.db",
+    login_argv: &["opencode", "auth", "login", "--standalone"],
     run_argv: &["opencode"],
     // OpenCode owns its isolated provider store. Structured runs consume an
     // existing OAuth/API credential and do not open a callback during serve.
@@ -800,8 +804,8 @@ pub(crate) struct RunOpts {
     /// runtime evidence and are not accepted here.
     pub(crate) reasoning_effort: Option<crate::contract::ReasoningEffort>,
     /// `--temperature FLOAT` — sampling temperature for a `Server`-integration
-    /// agent (opencode), recorded on the session and sent on every `session
-    /// send`. `Some(0.0)` = greedy decoding (the eval's variance knob). `None` →
+    /// agent (opencode), recorded on the session and bound to its model when
+    /// the server starts. `Some(0.0)` = greedy decoding (the eval's variance knob). `None` →
     /// the model/provider default. Ignored by PTY agents.
     pub(crate) temperature: Option<f64>,
     /// `--egress-allow HOST` (repeatable) — hosts allowed through egress beyond

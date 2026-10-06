@@ -1,0 +1,115 @@
+data: {"id":"evt_1110718d4001zp17mHQ2sJnTLr","type":"server.connected","data":{}}
+
+: heartbeat
+
+data: {"id":"evt_111071cc3001kygcTSwKeXvqa7","created":1791287041219,"type":"session.created","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","slug":"calm-squid","version":"2.0.24","projectID":"f9a0dc7dac12018b64e0a530c0e2d1c966b7cced","location":{"directory":"/workspace/demo"},"subpath":"","model":{"id":"nemotron-3.5-lightning-free","providerID":"opencode"}},"durable":{"aggregateID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","seq":0,"version":1}}
+
+data: {"id":"evt_111071cfc001uWZhSphC5WSXWP","created":1791287041276,"type":"session.inbox.enqueued","location":{"directory":"/workspace/demo"},"data":{"inboxID":"msg_111071cfa0019RVrPLS2rFDojq","sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","item":{"type":"user","payload":{"text":"Create a file named hello.txt containing the word hi, then run `cat hello.txt` with the shell tool and tell me what it printed."},"delivery":"steer"}},"durable":{"aggregateID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","seq":1,"version":1}}
+
+data: {"id":"evt_111071d02001SOJs9ibo17pbt6","created":1791287041282,"type":"session.execution.started","data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE"},"durable":{"aggregateID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","seq":2,"version":1}}
+
+data: {"id":"evt_111071d16001sTdJPu4OyGwpGF","created":1791287041302,"metadata":{"instructions":{"initial":true}},"type":"session.instructions.updated","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","delta":{"core/codemode":"3a6c896ca4366410e84edccbf179835337f464e16493a692c18b854a528ce2e1","core/skill-guidance":"8394362d28c82fa4d13c7a9f5568c05680f6687e07db8f426a0e3c92f3027dc9","core/date":"5c8dae29775784bcbe6bd4435aceb4e9ac13dd0a6662c40384efc999abc05282","core/environment":"86570e49d68fe8b6e29045a81caede764ed02998900c34d701af1f604dbc74e9"}},"durable":{"aggregateID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","seq":3,"version":2}}
+
+data: {"id":"evt_111071d1b0012KibMk0PVercNx","created":1791287041307,"type":"session.inbox.delivered","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","inboxID":"msg_111071cfa0019RVrPLS2rFDojq"},"durable":{"aggregateID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","seq":4,"version":1}}
+
+data: {"id":"evt_111072675001derMasQPHgYbin","created":1791287043701,"type":"session.step.started","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","agent":"build","model":{"id":"nemotron-3.5-lightning-free","providerID":"opencode","variant":"default"},"assistantMessageID":"msg_111071d36001ong0vPhVzvwuB7","started":1791287041353},"durable":{"aggregateID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","seq":5,"version":1}}
+
+data: {"id":"evt_111072679001RDrDIiFrcgDFqX","created":1791287043705,"type":"session.reasoning.started","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_111071d36001ong0vPhVzvwuB7","ordinal":0,"state":{"reasoningField":"reasoning_content"}},"durable":{"aggregateID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","seq":6,"version":1}}
+
+data: {"id":"evt_1110726e1001ywM3NvM1L9e5T1","created":1791287043809,"type":"session.reasoning.delta","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_111071d36001ong0vPhVzvwuB7","ordinal":0,"delta":"The user wants me to"}}
+
+data: {"id":"evt_11107274e001k3buIObcsX6ENA","created":1791287043918,"type":"session.reasoning.delta","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_111071d36001ong0vPhVzvwuB7","ordinal":0,"delta":":\n1. Create a file named hello.txt containing the word"}}
+
+data: {"id":"evt_1110727ba001jgxNNCHXOjRRNG","created":1791287044026,"type":"session.reasoning.delta","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_111071d36001ong0vPhVzvwuB7","ordinal":0,"delta":" \"hi\"\n2. Run `cat hello.txt` with"}}
+
+data: {"id":"evt_1110728320010EZdLOrpTTApw2","created":1791287044146,"type":"session.reasoning.delta","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_111071d36001ong0vPhVzvwuB7","ordinal":0,"delta":" the shell tool\n3. Tell them what it printed\n\n"}}
+
+data: {"id":"evt_1110728a6001E5bhq6woIrY0iV","created":1791287044262,"type":"session.reasoning.delta","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_111071d36001ong0vPhVzvwuB7","ordinal":0,"delta":"I need to first create the file, then run the"}}
+
+data: {"id":"evt_11107290c0018bTHBr4aK6uXCj","created":1791287044365,"type":"session.reasoning.delta","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_111071d36001ong0vPhVzvwuB7","ordinal":0,"delta":" shell command to cat it.\n\nLet me start by"}}
+
+data: {"id":"evt_111072989001ZJFIgVBlg3b3oH","created":1791287044489,"type":"session.reasoning.delta","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_111071d36001ong0vPhVzvwuB7","ordinal":0,"delta":" creating the file using the write tool, then run the"}}
+
+data: {"id":"evt_111072ad4001peLOUQMdSldk6N","created":1791287044820,"type":"session.reasoning.delta","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_111071d36001ong0vPhVzvwuB7","ordinal":0,"delta":" shell command."}}
+
+data: {"id":"evt_111072dde001jR2hiVXxIGRVUc","created":1791287045598,"type":"session.tool.input.started","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_111071d36001ong0vPhVzvwuB7","id":"call-e86fd1c3-ac23-4346-8917-498b6b109619","name":"write"},"durable":{"aggregateID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","seq":7,"version":1}}
+
+data: {"id":"evt_111072e190019KIhRlnf8Ok7tI","created":1791287045657,"type":"session.reasoning.ended","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_111071d36001ong0vPhVzvwuB7","ordinal":0,"text":"The user wants me to:\n1. Create a file named hello.txt containing the word \"hi\"\n2. Run `cat hello.txt` with the shell tool\n3. Tell them what it printed\n\nI need to first create the file, then run the shell command to cat it.\n\nLet me start by creating the file using the write tool, then run the shell command.","state":{"reasoningField":"reasoning_content","reasoningDetails":[{"type":"reasoning.text","text":"The user wants me to:\n1. Create a file named hello.txt containing the word \"hi\"\n2. Run `cat hello.txt` with the shell tool\n3. Tell them what it printed\n\nI need to first create the file, then run the shell command to cat it.\n\nLet me start by creating the file using the write tool, then run the shell command.","format":"unknown","index":0}]}},"durable":{"aggregateID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","seq":8,"version":1}}
+
+data: {"id":"evt_111072e1d001U084D50Y9Btu2p","created":1791287045661,"type":"session.tool.input.ended","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_111071d36001ong0vPhVzvwuB7","id":"call-e86fd1c3-ac23-4346-8917-498b6b109619","text":"{\"path\":\"hello.txt\",\"content\":\"hi\"}"},"durable":{"aggregateID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","seq":9,"version":1}}
+
+data: {"id":"evt_111072e200017xUTyuQpZWsOJs","created":1791287045664,"type":"session.tool.called","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_111071d36001ong0vPhVzvwuB7","id":"call-e86fd1c3-ac23-4346-8917-498b6b109619","input":{"path":"hello.txt","content":"hi"},"executed":false},"durable":{"aggregateID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","seq":10,"version":1}}
+
+data: {"id":"evt_111072e24001oFcsVo93y5Pf9S","created":1791287045668,"type":"session.step.streamed","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_111071d36001ong0vPhVzvwuB7"},"durable":{"aggregateID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","seq":11,"version":1}}
+
+data: {"id":"evt_111072e2d001RUINQx2Mkqe0PE","created":1791287045677,"type":"session.tool.success","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_111071d36001ong0vPhVzvwuB7","id":"call-e86fd1c3-ac23-4346-8917-498b6b109619","content":[{"type":"text","text":"Created file successfully: hello.txt"}],"metadata":{"truncated":false},"executed":false},"durable":{"aggregateID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","seq":12,"version":2}}
+
+data: {"id":"evt_111072e30001xWiuSMvhaHVbkg","created":1791287045680,"type":"session.step.ended","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_111071d36001ong0vPhVzvwuB7","finish":"tool-calls","rawFinish":"tool_calls","cost":0,"tokens":{"input":5526,"output":32,"reasoning":80,"cache":{"read":0,"write":0}}},"durable":{"aggregateID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","seq":13,"version":1}}
+
+data: {"id":"evt_111072e34001EcJ7jvSqINUnUn","created":1791287045684,"type":"session.usage.updated","data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","cost":0,"tokens":{"input":5526,"output":32,"reasoning":80,"cache":{"read":0,"write":0}}}}
+
+: heartbeat
+
+data: {"id":"evt_11107593e001gFAx3YxQIe0tJa","created":1791287056702,"type":"session.step.started","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","agent":"build","model":{"id":"nemotron-3.5-lightning-free","providerID":"opencode","variant":"default"},"assistantMessageID":"msg_111072e41001tuL7LC5Ej4CEi7","started":1791287045713},"durable":{"aggregateID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","seq":14,"version":1}}
+
+data: {"id":"evt_111075943001X5KVL42HNMgaDB","created":1791287056707,"type":"session.reasoning.started","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_111072e41001tuL7LC5Ej4CEi7","ordinal":0,"state":{"reasoningField":"reasoning_content"}},"durable":{"aggregateID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","seq":15,"version":1}}
+
+data: {"id":"evt_1110759aa001GcwQWcI0fr7NGb","created":1791287056811,"type":"session.reasoning.delta","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_111072e41001tuL7LC5Ej4CEi7","ordinal":0,"delta":"Now let me"}}
+
+data: {"id":"evt_111075a25001nmjnEGE3Tnc5MP","created":1791287056933,"type":"session.reasoning.delta","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_111072e41001tuL7LC5Ej4CEi7","ordinal":0,"delta":" run"}}
+
+data: {"id":"evt_111075af3001Vu8tOzaq9PZlkN","created":1791287057139,"type":"session.reasoning.delta","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_111072e41001tuL7LC5Ej4CEi7","ordinal":0,"delta":" the cat command"}}
+
+data: {"id":"evt_111075bf0001McgvzWhTapEW0c","created":1791287057392,"type":"session.reasoning.delta","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_111072e41001tuL7LC5Ej4CEi7","ordinal":0,"delta":"."}}
+
+data: {"id":"evt_1110761f3001oNOAisTvPH95Wk","created":1791287058931,"type":"session.tool.input.started","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_111072e41001tuL7LC5Ej4CEi7","id":"call-24e2ef74-b447-4305-aea4-5fe55b21f428","name":"shell"},"durable":{"aggregateID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","seq":16,"version":1}}
+
+data: {"id":"evt_111076206001Teg4tFf4FKADi7","created":1791287058950,"type":"session.reasoning.ended","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_111072e41001tuL7LC5Ej4CEi7","ordinal":0,"text":"Now let me run the cat command.","state":{"reasoningField":"reasoning_content","reasoningDetails":[{"type":"reasoning.text","text":"Now let me run the cat command.","format":"unknown","index":0}]}},"durable":{"aggregateID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","seq":17,"version":1}}
+
+data: {"id":"evt_11107620a001xB52ZYB1jttsaq","created":1791287058954,"type":"session.tool.input.ended","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_111072e41001tuL7LC5Ej4CEi7","id":"call-24e2ef74-b447-4305-aea4-5fe55b21f428","text":"{\"command\":\"cat hello.txt\"}"},"durable":{"aggregateID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","seq":18,"version":1}}
+
+data: {"id":"evt_11107620d001S6ZXW2uJVQAKRv","created":1791287058957,"type":"session.tool.called","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_111072e41001tuL7LC5Ej4CEi7","id":"call-24e2ef74-b447-4305-aea4-5fe55b21f428","input":{"command":"cat hello.txt"},"executed":false},"durable":{"aggregateID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","seq":19,"version":1}}
+
+data: {"id":"evt_111076210001TIxrHbJthIAvCM","created":1791287058960,"type":"session.step.streamed","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_111072e41001tuL7LC5Ej4CEi7"},"durable":{"aggregateID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","seq":20,"version":1}}
+
+data: {"id":"evt_11107623c001Wldvdtd2p436dl","created":1791287059004,"type":"shell.created","location":{"directory":"/workspace/demo"},"data":{"info":{"id":"sh_1110762370016FnWWxdksl5YxU","status":"running","command":"cat hello.txt","cwd":"/workspace/demo","shell":"/bin/bash","file":"/root/.local/share/opencode/shell/f9a0dc7dac12018b64e0a530c0e2d1c966b7cced/sh_1110762370016FnWWxdksl5YxU.out","metadata":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE"},"time":{"started":1791287058999}}}}
+
+data: {"id":"evt_11107623d001ZrurJC20L9s8rs","created":1791287059005,"type":"session.tool.progress","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_111072e41001tuL7LC5Ej4CEi7","id":"call-24e2ef74-b447-4305-aea4-5fe55b21f428","metadata":{"shellID":"sh_1110762370016FnWWxdksl5YxU"}}}
+
+data: {"id":"evt_111076245001UEvfVVwtUHTdQX","created":1791287059013,"type":"shell.exited","location":{"directory":"/workspace/demo"},"data":{"id":"sh_1110762370016FnWWxdksl5YxU","exit":0,"status":"exited"}}
+
+data: {"id":"evt_111076247001eG90UO8vKcOzND","created":1791287059015,"type":"session.tool.success","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_111072e41001tuL7LC5Ej4CEi7","id":"call-24e2ef74-b447-4305-aea4-5fe55b21f428","content":[{"type":"text","text":"hi"}],"metadata":{"status":"completed","truncated":false,"exit":0},"executed":false},"durable":{"aggregateID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","seq":21,"version":2}}
+
+data: {"id":"evt_11107624b001UM0J64D2NnDj3K","created":1791287059019,"type":"session.step.ended","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_111072e41001tuL7LC5Ej4CEi7","finish":"tool-calls","rawFinish":"tool_calls","cost":0,"tokens":{"input":5661,"output":27,"reasoning":8,"cache":{"read":0,"write":0}}},"durable":{"aggregateID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","seq":22,"version":1}}
+
+data: {"id":"evt_11107624e001xkpVYwIghGK2wX","created":1791287059022,"type":"session.usage.updated","data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","cost":0,"tokens":{"input":11187,"output":59,"reasoning":88,"cache":{"read":0,"write":0}}}}
+
+data: {"id":"evt_111076760001tWd5JUAS4XEevA","created":1791287060320,"type":"session.step.started","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","agent":"build","model":{"id":"nemotron-3.5-lightning-free","providerID":"opencode","variant":"default"},"assistantMessageID":"msg_11107625c001RBAay9TVq3tMcs","started":1791287059056},"durable":{"aggregateID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","seq":23,"version":1}}
+
+data: {"id":"evt_111076765001k9JPEIdB4Lc7vj","created":1791287060326,"type":"session.reasoning.started","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_11107625c001RBAay9TVq3tMcs","ordinal":0,"state":{"reasoningField":"reasoning_content"}},"durable":{"aggregateID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","seq":24,"version":1}}
+
+data: {"id":"evt_1110767ce001QcKdTAm3khqJWz","created":1791287060430,"type":"session.reasoning.delta","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_11107625c001RBAay9TVq3tMcs","ordinal":0,"delta":"The shell command output shows \"hi\", which is the content"}}
+
+data: {"id":"evt_111076851001xhDpAnARpshoBf","created":1791287060561,"type":"session.reasoning.delta","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_11107625c001RBAay9TVq3tMcs","ordinal":0,"delta":" of the file. I need to tell the user what it"}}
+
+data: {"id":"evt_111076875001lebWbsr1r70BHZ","created":1791287060597,"type":"session.reasoning.delta","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_11107625c001RBAay9TVq3tMcs","ordinal":0,"delta":" printed."}}
+
+data: {"id":"evt_111076876001nCmB9t1wnND22t","created":1791287060598,"type":"session.text.started","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_11107625c001RBAay9TVq3tMcs","ordinal":0},"durable":{"aggregateID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","seq":25,"version":1}}
+
+data: {"id":"evt_1110768dd001NhJEmlB2m3AVUe","created":1791287060701,"type":"session.text.delta","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_11107625c001RBAay9TVq3tMcs","ordinal":0,"delta":"`cat hello.txt` printed:\n\n```\n"}}
+
+data: {"id":"evt_11107693d001xTkeLIdj79WBU7","created":1791287060797,"type":"session.reasoning.ended","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_11107625c001RBAay9TVq3tMcs","ordinal":0,"text":"The shell command output shows \"hi\", which is the content of the file. I need to tell the user what it printed.","state":{"reasoningField":"reasoning_content","reasoningDetails":[{"type":"reasoning.text","text":"The shell command output shows \"hi\", which is the content of the file. I need to tell the user what it printed.","format":"unknown","index":0}]}},"durable":{"aggregateID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","seq":26,"version":1}}
+
+data: {"id":"evt_111076940001lBQ5pLT2gBsA8i","created":1791287060801,"type":"session.text.delta","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_11107625c001RBAay9TVq3tMcs","ordinal":0,"delta":"hi\n```"}}
+
+data: {"id":"evt_111076941001x3Aec1U61bzMe0","created":1791287060801,"type":"session.text.ended","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_11107625c001RBAay9TVq3tMcs","ordinal":0,"text":"`cat hello.txt` printed:\n\n```\nhi\n```"},"durable":{"aggregateID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","seq":27,"version":1}}
+
+data: {"id":"evt_111076943001pnjZ00Q1vcLT0y","created":1791287060803,"type":"session.step.streamed","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_11107625c001RBAay9TVq3tMcs"},"durable":{"aggregateID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","seq":28,"version":1}}
+
+data: {"id":"evt_111076945001wmcds6iKfjSuT7","created":1791287060805,"type":"session.step.ended","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","assistantMessageID":"msg_11107625c001RBAay9TVq3tMcs","finish":"stop","rawFinish":"stop","cost":0,"tokens":{"input":1362,"output":11,"reasoning":28,"cache":{"read":4352,"write":0}}},"durable":{"aggregateID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","seq":29,"version":1}}
+
+data: {"id":"evt_11107694a001hw9hRJhAtd6qED","created":1791287060810,"type":"session.usage.updated","data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","cost":0,"tokens":{"input":12549,"output":70,"reasoning":116,"cache":{"read":4352,"write":0}}}}
+
+data: {"id":"evt_11107694c001jLVyEilWkV2kyW","created":1791287060812,"type":"session.execution.succeeded","data":{"sessionID":"ses_eeef8e342ffeRdnmhbPEi3HVxE"},"durable":{"aggregateID":"ses_eeef8e342ffeRdnmhbPEi3HVxE","seq":30,"version":1}}
+
+

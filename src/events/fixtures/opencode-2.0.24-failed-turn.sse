@@ -1,0 +1,28 @@
+data: {"id":"evt_1110b4913001OsVE1E40fHk51e","type":"server.connected","data":{}}
+
+: heartbeat
+
+data: {"id":"evt_1110b4d06001QkDs6YEL3m9Q5X","created":1791287315719,"type":"session.created","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef4b300ffeW3DZJnMQ77WHrc","slug":"misty-nebula","version":"2.0.24","projectID":"f9a0dc7dac12018b64e0a530c0e2d1c966b7cced","location":{"directory":"/workspace/demo"},"subpath":"","model":{"id":"glm-4.5-air","providerID":"zai-coding-plan"}},"durable":{"aggregateID":"ses_eeef4b300ffeW3DZJnMQ77WHrc","seq":0,"version":1}}
+
+data: {"id":"evt_1110b4d13001cR4krEfHCLAnvy","created":1791287315731,"type":"project.updated","data":{"id":"f9a0dc7dac12018b64e0a530c0e2d1c966b7cced","canonical":"/workspace/demo","time":{"created":1791287026359,"updated":1791287026359,"active":1791287315730},"sandboxes":[]}}
+
+data: {"id":"evt_1110b4d3f001PDj9CjFPESRHgg","created":1791287315775,"type":"session.inbox.enqueued","location":{"directory":"/workspace/demo"},"data":{"inboxID":"msg_1110b4d3d001BN33zUfpIOaoG9","sessionID":"ses_eeef4b300ffeW3DZJnMQ77WHrc","item":{"type":"user","payload":{"text":"hi"},"delivery":"steer"}},"durable":{"aggregateID":"ses_eeef4b300ffeW3DZJnMQ77WHrc","seq":1,"version":1}}
+
+data: {"id":"evt_1110b4d45001o8QaZol1btPaX2","created":1791287315781,"type":"session.execution.started","data":{"sessionID":"ses_eeef4b300ffeW3DZJnMQ77WHrc"},"durable":{"aggregateID":"ses_eeef4b300ffeW3DZJnMQ77WHrc","seq":2,"version":1}}
+
+data: {"id":"evt_1110b4d5a001B8VYMJbzDrJYjE","created":1791287315802,"metadata":{"instructions":{"initial":true}},"type":"session.instructions.updated","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef4b300ffeW3DZJnMQ77WHrc","delta":{"core/codemode":"3a6c896ca4366410e84edccbf179835337f464e16493a692c18b854a528ce2e1","core/skill-guidance":"8394362d28c82fa4d13c7a9f5568c05680f6687e07db8f426a0e3c92f3027dc9","core/date":"5c8dae29775784bcbe6bd4435aceb4e9ac13dd0a6662c40384efc999abc05282","core/environment":"86570e49d68fe8b6e29045a81caede764ed02998900c34d701af1f604dbc74e9"}},"durable":{"aggregateID":"ses_eeef4b300ffeW3DZJnMQ77WHrc","seq":3,"version":2}}
+
+data: {"id":"evt_1110b4d5e0014Ev8nRItOC3j4v","created":1791287315806,"type":"session.inbox.delivered","location":{"directory":"/workspace/demo"},"data":{"sessionID":"ses_eeef4b300ffeW3DZJnMQ77WHrc","inboxID":"msg_1110b4d3d001BN33zUfpIOaoG9"},"durable":{"aggregateID":"ses_eeef4b300ffeW3DZJnMQ77WHrc","seq":4,"version":1}}
+
+data: {"id":"evt_1110b4d6f001fdhoNdofA7oiMM","created":1791287315823,"type":"session.execution.failed","data":{"sessionID":"ses_eeef4b300ffeW3DZJnMQ77WHrc","error":{"type":"provider.no-route","message":"Model unavailable: zai-coding-plan/glm-4.5-air"}},"durable":{"aggregateID":"ses_eeef4b300ffeW3DZJnMQ77WHrc","seq":5,"version":1}}
+
+data: {"id":"evt_1110b7876001rUzjvQxCOxwjQU","created":1791287326838,"type":"provider.updated","location":{"directory":"/workspace/demo"},"data":{}}
+
+data: {"id":"evt_1110b788a001FEHQh4Jtl3bc7f","created":1791287326858,"type":"model.updated","location":{"directory":"/workspace/demo"},"data":{}}
+
+: heartbeat
+
+: heartbeat
+
+: heartbeat
+

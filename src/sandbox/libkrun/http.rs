@@ -9,8 +9,8 @@
 //! HTTP → read the response. One connection per call, so concurrent readiness
 //! polls and the long-lived `/event` stream are independent vsock streams.
 //!
-//! Why hand-rolled and not a crate: four trivial calls (`GET /doc`, `POST
-//! /session`, `POST /prompt_async`, `GET /event`) over a unix socket — pulling
+//! Why hand-rolled and not a crate: four trivial calls (`GET /api/info`, `POST
+//! /api/session`, `POST …/prompt`, `GET /api/event`) over a unix socket — pulling
 //! in an HTTP-client dep (with its own connector model) to reach a socket we
 //! already hold would be heavier than the ~30 lines here.
 
@@ -25,11 +25,34 @@ use crate::sandbox::http::{HttpResponse, SandboxHttp, SandboxStream};
 
 pub(crate) struct LibkrunHttp {
     host_sock: PathBuf,
+    /// A ready `Authorization` header value, sent on every request when set
+    /// (OpenCode 2's server always requires HTTP basic auth).
+    authorization: Option<String>,
 }
 
 impl LibkrunHttp {
     pub(crate) fn new(host_sock: PathBuf) -> Self {
-        Self { host_sock }
+        Self {
+            host_sock,
+            authorization: None,
+        }
+    }
+
+    /// The same forward, authenticating every request with HTTP basic auth.
+    pub(crate) fn with_basic_auth(&self, user: &str, password: &str) -> Self {
+        use base64::Engine as _;
+        let token = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"));
+        Self {
+            host_sock: self.host_sock.clone(),
+            authorization: Some(format!("Basic {token}")),
+        }
+    }
+
+    fn auth_header(&self) -> String {
+        self.authorization
+            .as_deref()
+            .map(|value| format!("Authorization: {value}\r\n"))
+            .unwrap_or_default()
     }
 
     fn connect(&self) -> Result<UnixStream> {
@@ -45,8 +68,9 @@ impl LibkrunHttp {
 /// Build a one-shot HTTP/1.1 request head with `Connection: close`, so the
 /// server closes after the body and `read_to_end` terminates. (The SSE stream
 /// builds its own keep-alive request inline in `open_stream`.)
-fn request_head(method: &str, path: &str, json_body: Option<&str>) -> String {
-    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n");
+fn request_head(method: &str, path: &str, json_body: Option<&str>, auth: &str) -> String {
+    let mut req =
+        format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n{auth}");
     if let Some(b) = json_body {
         req.push_str(&format!(
             "Content-Type: application/json\r\nContent-Length: {}\r\n",
@@ -83,7 +107,7 @@ fn parse_response(raw: &[u8]) -> Result<(u16, String)> {
 impl SandboxHttp for LibkrunHttp {
     fn request(&self, method: &str, path: &str, json_body: Option<&str>) -> Result<HttpResponse> {
         let mut s = self.connect()?;
-        s.write_all(request_head(method, path, json_body).as_bytes())?;
+        s.write_all(request_head(method, path, json_body, &self.auth_header()).as_bytes())?;
         if let Some(b) = json_body {
             s.write_all(b.as_bytes())?;
         }
@@ -98,8 +122,11 @@ impl SandboxHttp for LibkrunHttp {
         let s = self.connect()?;
         let mut w = s.try_clone().context("clone opencode stream socket")?;
         w.write_all(
-            format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/event-stream\r\n\r\n")
-                .as_bytes(),
+            format!(
+                "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{}Accept: text/event-stream\r\n\r\n",
+                self.auth_header()
+            )
+            .as_bytes(),
         )?;
         w.flush()?;
         // Consume the response headers; BufReader's leftover buffer holds any
@@ -210,6 +237,21 @@ mod tests {
         let (status, body) = parse_response(raw).unwrap();
         assert_eq!(status, 204);
         assert_eq!(body, "");
+    }
+
+    #[test]
+    fn basic_auth_header_rides_every_request() {
+        let http =
+            LibkrunHttp::new(PathBuf::from("/nonexistent")).with_basic_auth("opencode", "pw");
+        let head = request_head("GET", "/api/info", None, &http.auth_header());
+        // base64("opencode:pw") == "b3BlbmNvZGU6cHc="
+        assert!(
+            head.contains("Authorization: Basic b3BlbmNvZGU6cHc=\r\n"),
+            "{head}"
+        );
+        assert!(head.ends_with("\r\n\r\n"));
+        let plain = LibkrunHttp::new(PathBuf::from("/nonexistent"));
+        assert!(!request_head("GET", "/x", None, &plain.auth_header()).contains("Authorization"));
     }
 
     #[test]

@@ -1,43 +1,41 @@
-//! Map opencode's `/event` SSE envelopes into pillbox §0 `contract::Payload`s.
+//! Map OpenCode's `/api/event` SSE envelopes into pillbox §0 `contract::Payload`s.
 //!
 //! opencode is **structured-API-native**: `opencode serve` exposes a headless
-//! HTTP server whose `/event` endpoint streams typed events, so instead of
+//! HTTP server whose `/api/event` endpoint streams typed events, so instead of
 //! scraping a transcript file (the claude/codex `transcripts` path) we consume
-//! its event stream directly — structured, real-time, no file-tailing. This
-//! module is the pure mapping core; the SSE transport + the bridge that feeds
-//! the durable [`SessionLog`](crate::events::log::SessionLog) live in the
-//! sandbox run path.
+//! its event stream directly. This module is the pure mapping core; the SSE
+//! transport + the bridge that feeds the durable
+//! [`SessionLog`](crate::events::log::SessionLog) live in the sandbox run path.
 //!
-//! ## Which events carry the turn
+//! ## Which events carry the turn (OpenCode 2)
 //!
-//! Verified against a live GLM turn through `opencode serve` (not just the
-//! OpenAPI): the assistant turn streams over the **`message.*` family** —
+//! Verified against captured turns from `opencode serve` 2.0.24 (a write + shell
+//! tool round-trip, and a provider failure), not only the published types. The
+//! envelope is `{id, created, type, location?, durable?, data:{sessionID, …}}`;
+//! content streams per model step, and each step is its own assistant message
+//! (`assistantMessageID`):
 //!
-//! - `message.updated` → `info:{id, role, model, structured?}` — a message was
-//!   created / updated. The first sight of an `assistant` message id opens it;
-//!   a final schema-bound value is projected once into `MessageDelta` evidence.
-//! - `message.part.delta` → `{messageID, field, delta}` — incremental content
-//!   (`field:"text"` = assistant text; `field:"reasoning"` = thinking).
-//! - `message.part.updated` with `part.type == "tool"` → `{tool, callID,
-//!   state:{status, input, output}}` — a tool call's evolving state.
-//! - `message.part.updated` with `part.type == "step-finish"` → `{messageID,
-//!   tokens:{input, output, cache:{read, write}}}` — a finished model step's
-//!   token accounting, mapped to a §0 `Usage` (`source: native`). This is the
-//!   live-verified token source: `message.updated`'s `info` carries no tokens,
-//!   so the turn's cost lands here or nowhere.
-//! - `session.idle` → the turn went quiescent (end the open message + the
-//!   `NeedsInput` attention signal, matching the claude end_turn producer).
+//! - `session.text.started` / `.delta` / `.ended` → `MessageStart` /
+//!   `MessageDelta` (the deltas are canonical; `.ended` repeats the whole text
+//!   and is only used when no delta arrived).
+//! - `session.reasoning.delta` (or `.ended` without deltas) → `Thinking`.
+//! - `session.tool.input.started {id, name}` names the call;
+//!   `session.tool.called {id, input}` → `ToolCall{Running}`;
+//!   `session.tool.success {id, content}` → `ToolCall{Completed}`;
+//!   `session.tool.failed {id, error}` → `ToolCall{Error}`.
+//! - `session.step.ended` / `session.step.failed` → `Usage` (`source: native`)
+//!   from `tokens`/`cost`, and closes that step's message.
+//! - `session.execution.succeeded` → the turn ended: `AttentionRequired{NeedsInput}`.
+//!   `session.execution.failed` / `.interrupted` → `AttentionRequired{ErrorStalled}`
+//!   (the codex-serve convention). OpenCode 2 declares `session.idle` but did
+//!   not emit it in the captured turns, so it is not the boundary.
+//! - `permission.asked` → `Permission`; `form.created` (a question for the
+//!   user) → `NeedsInput`.
 //!
-//! The parallel `session.next.*` family exists in the OpenAPI but only emitted
-//! lifecycle bits (`agent.switched`, `model.switched`) in practice — it is
-//! *not* the content source, so we ignore it (along with the `text`/`reasoning`
-//! part *snapshots*, whose content the deltas already carry, and `step-start`,
-//! `session.{updated,status,diff}`, `server.*`).
-//!
-//! Stateful: deltas carry a `messageID` but no role, so we track which message
-//! ids we've opened as assistant (emit `MessageStart` once each); a tool's
-//! status is emitted only when it *changes* (`pending`→`running`→`completed`)
-//! so a chatty input-stream doesn't flood the log with duplicate `ToolCall`s.
+//! Everything else (`session.inbox.*`, `session.instructions.updated`,
+//! `session.step.started`/`.streamed`, `session.tool.input.delta`/`.progress`,
+//! `session.usage.updated` running totals, `shell.*`, `server.*`) is ignored.
+//! The OpenCode 1 `message.*` family no longer exists.
 
 use std::collections::{HashMap, HashSet};
 
@@ -52,23 +50,18 @@ use crate::events::log::SessionLog;
 /// Stateful opencode-event → §0-payload mapper. One per session stream.
 #[derive(Default)]
 pub(crate) struct EventMapper {
-    /// The currently-open assistant message id (set on the first `message.updated`
-    /// for an assistant message, cleared on `session.idle`). `message.updated`
-    /// fires repeatedly for the same message; comparing against this suppresses
-    /// duplicate `MessageStart`s without an ever-growing seen-set, since opencode
-    /// opens exactly one assistant message per turn (a new id only after idle).
-    open_msg: Option<String>,
-    /// The assistant message whose final schema-bound value was projected into
-    /// the MessageDelta evidence channel. Cleared when the turn goes idle.
-    structured_msg: Option<String>,
-    /// `callID → last emitted tool status`, so we only emit a `ToolCall` when a
-    /// tool's status actually changes, not on every input-stream tick. Keyed on
-    /// the *mapped* status so opencode's `pending`→`running` (both `Running`)
-    /// collapses to one event.
-    tool_status: HashMap<String, ToolStatus>,
-    /// Step part ids whose `step-finish` usage we've already emitted, so a
-    /// re-sent `part.updated` for the same step can't double-count tokens.
-    steps_seen: HashSet<String>,
+    /// Assistant message ids opened with a `MessageStart` and not yet ended.
+    open_msgs: Vec<String>,
+    /// `(assistantMessageID, ordinal)` text blocks that streamed at least one
+    /// delta, so a block's `.ended` (which repeats the whole text) is skipped.
+    text_streamed: HashSet<(String, u64)>,
+    /// Same, for reasoning blocks.
+    reasoning_streamed: HashSet<(String, u64)>,
+    /// Tool call id → tool name (`session.tool.input.started` is the only event
+    /// that names the tool).
+    tool_names: HashMap<String, String>,
+    /// Tool call id → input (from `session.tool.called`), echoed on the result.
+    tool_inputs: HashMap<String, Value>,
 }
 
 impl EventMapper {
@@ -76,231 +69,242 @@ impl EventMapper {
         Self::default()
     }
 
-    /// Map one opencode `/event` envelope into zero or more §0 payloads.
-    /// Unmapped types return empty (the stream carries far more than the turn —
-    /// lifecycle, sync, tui, lsp, step boundaries, …).
+    /// Map one opencode `/api/event` envelope into zero or more §0 payloads.
+    /// Unmapped types return empty (the stream carries far more than the turn).
     pub(crate) fn on_event(&mut self, ev: &Value) -> Vec<Payload> {
         let ty = ev.get("type").and_then(Value::as_str).unwrap_or_default();
-        let p = ev.get("properties").unwrap_or(&Value::Null);
+        let d = ev.get("data").unwrap_or(&Value::Null);
 
         match ty {
-            "message.updated" => self.on_message_updated(p),
-            "message.part.delta" => self.on_part_delta(p),
-            "message.part.updated" => self.on_part_updated(p),
-            // Turn went quiescent → close the open assistant message and raise
-            // the attention signal the driver waits on.
-            "session.idle" => {
-                let mut out = Vec::new();
-                if let Some(id) = self.open_msg.take() {
-                    out.push(Payload::MessageEnd(MessageEnd::new(id)));
+            "session.text.started" => self.open(msg_id(d)).into_iter().collect(),
+            "session.text.delta" => self.on_text_delta(d),
+            "session.text.ended" => self.on_text_ended(d),
+            "session.reasoning.delta" => {
+                self.reasoning_streamed.insert(block_key(d));
+                thinking(str_of(d, "delta"))
+            }
+            "session.reasoning.ended" => {
+                if self.reasoning_streamed.remove(&block_key(d)) {
+                    vec![]
+                } else {
+                    thinking(str_of(d, "text"))
                 }
-                self.structured_msg = None;
-                out.push(attention(AttentionReason::NeedsInput));
+            }
+            "session.tool.input.started" => {
+                self.tool_names
+                    .insert(str_of(d, "id").to_string(), str_of(d, "name").to_string());
+                vec![]
+            }
+            "session.tool.called" => self.on_tool_called(d),
+            "session.tool.success" => {
+                let output = tool_content_text(d.get("content"));
+                self.on_tool_finished(d, ToolStatus::Completed, output)
+            }
+            "session.tool.failed" => {
+                let output = structured_error_message(d.get("error"));
+                self.on_tool_finished(d, ToolStatus::Error, output)
+            }
+            "session.step.ended" | "session.step.failed" => {
+                let mut out: Vec<Payload> =
+                    usage_from_step(d).map(Payload::Usage).into_iter().collect();
+                out.extend(self.close(msg_id(d)));
                 out
             }
-            "permission.asked" => vec![attention(AttentionReason::Permission)],
-            "question.asked" => vec![attention(AttentionReason::NeedsInput)],
-            "session.error" => vec![Payload::AttentionRequired(AttentionRequired {
-                reason: AttentionReason::ErrorStalled,
-                message: error_message(p),
-            })],
+            "session.execution.succeeded" => {
+                self.end_turn(AttentionReason::NeedsInput, String::new())
+            }
+            "session.execution.failed" => {
+                let message = structured_error_message(d.get("error"));
+                self.end_turn(AttentionReason::ErrorStalled, message)
+            }
+            "session.execution.interrupted" => {
+                let message = format!("interrupted ({})", str_of(d, "reason"));
+                self.end_turn(AttentionReason::ErrorStalled, message)
+            }
+            "permission.asked" => vec![attention(AttentionReason::Permission, String::new())],
+            "form.created" => vec![attention(AttentionReason::NeedsInput, String::new())],
             _ => vec![],
         }
     }
 
-    /// `message.updated` — open an assistant message on its first sighting and
-    /// project OpenCode's final schema-bound value into the text evidence
-    /// channel. User messages and repeats without new structured output produce
-    /// nothing.
-    fn on_message_updated(&mut self, p: &Value) -> Vec<Payload> {
-        let info = p.get("info").unwrap_or(&Value::Null);
-        let role = info.get("role").and_then(Value::as_str).unwrap_or_default();
-        let id = info.get("id").and_then(Value::as_str).unwrap_or_default();
-        if role != "assistant" || id.is_empty() {
+    /// Open `id` as an assistant message (once). An empty id opens nothing.
+    fn open(&mut self, id: &str) -> Option<Payload> {
+        if id.is_empty() || self.open_msgs.iter().any(|m| m == id) {
+            return None;
+        }
+        self.open_msgs.push(id.to_string());
+        Some(Payload::MessageStart(MessageStart {
+            message_id: id.to_string(),
+            role: Role::Assistant,
+        }))
+    }
+
+    /// Close `id` if it is open.
+    fn close(&mut self, id: &str) -> Option<Payload> {
+        let pos = self.open_msgs.iter().position(|m| m == id)?;
+        let id = self.open_msgs.remove(pos);
+        Some(Payload::MessageEnd(MessageEnd::new(id)))
+    }
+
+    fn on_text_delta(&mut self, d: &Value) -> Vec<Payload> {
+        let delta = str_of(d, "delta");
+        let id = msg_id(d);
+        if delta.is_empty() || id.is_empty() {
             return vec![];
         }
-        let mut out = Vec::new();
-        if self.open_msg.as_deref() != Some(id) {
-            self.open_msg = Some(id.to_string());
-            out.push(Payload::MessageStart(MessageStart {
-                message_id: id.to_string(),
-                role: Role::Assistant,
-            }));
-        }
-        if self.structured_msg.as_deref() != Some(id) {
-            if let Some(structured) = info.get("structured") {
-                self.structured_msg = Some(id.to_string());
-                out.push(Payload::MessageDelta(MessageDelta {
-                    message_id: id.to_string(),
-                    text: structured.to_string(),
-                }));
-            }
-        }
+        self.text_streamed.insert(block_key(d));
+        let mut out: Vec<Payload> = self.open(id).into_iter().collect();
+        out.push(Payload::MessageDelta(MessageDelta {
+            message_id: id.to_string(),
+            text: delta.to_string(),
+        }));
         out
     }
 
-    /// `message.part.delta` — the streaming content. `field` selects the §0
-    /// channel: assistant text vs. reasoning/thinking. Empty deltas drop.
-    fn on_part_delta(&mut self, p: &Value) -> Vec<Payload> {
-        let delta = p.get("delta").and_then(Value::as_str).unwrap_or_default();
-        if delta.is_empty() {
+    /// `.ended` repeats the block's whole text: only a block that streamed no
+    /// delta contributes it.
+    fn on_text_ended(&mut self, d: &Value) -> Vec<Payload> {
+        if self.text_streamed.remove(&block_key(d)) {
             return vec![];
         }
-        match p.get("field").and_then(Value::as_str).unwrap_or("text") {
-            "reasoning" => vec![Payload::Thinking(Thinking {
-                text: delta.to_string(),
-            })],
-            // Default to text (the common case; opencode's deltas are `text`).
-            _ => {
-                // Attach to the delta's own messageID, falling back to the open
-                // assistant message. If neither exists there's nothing to attach
-                // to — drop it rather than emit a delta with an empty id.
-                let Some(message_id) = p
-                    .get("messageID")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .or_else(|| self.open_msg.clone())
-                else {
-                    return vec![];
-                };
-                vec![Payload::MessageDelta(MessageDelta {
-                    message_id,
-                    text: delta.to_string(),
-                })]
-            }
-        }
-    }
-
-    /// `message.part.updated` — two part kinds carry the turn: `tool` (a tool
-    /// call's evolving state) and `step-finish` (a model step's token
-    /// accounting). Other parts (text/reasoning snapshots duplicate the deltas;
-    /// `step-start` is a boundary) produce nothing.
-    fn on_part_updated(&mut self, p: &Value) -> Vec<Payload> {
-        let part = p.get("part").unwrap_or(&Value::Null);
-        match part.get("type").and_then(Value::as_str) {
-            Some("tool") => self.on_tool_part(part),
-            Some("step-finish") => self.on_step_finish(part),
-            _ => vec![],
-        }
-    }
-
-    /// A `tool` part. Emits a `ToolCall` only when the tool's status changes.
-    fn on_tool_part(&mut self, part: &Value) -> Vec<Payload> {
-        let call_id = part
-            .get("callID")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let state = part.get("state").unwrap_or(&Value::Null);
-        let status = map_tool_status(
-            state
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or("running"),
-        );
-        // De-dupe: a tool part updates repeatedly as its input streams; only the
-        // mapped-status transitions (Running → Completed/Error) are interesting.
-        if self.tool_status.get(&call_id) == Some(&status) {
+        let text = str_of(d, "text");
+        let id = msg_id(d);
+        if text.is_empty() || id.is_empty() {
             return vec![];
         }
-        self.tool_status.insert(call_id.clone(), status);
+        let mut out: Vec<Payload> = self.open(id).into_iter().collect();
+        out.push(Payload::MessageDelta(MessageDelta {
+            message_id: id.to_string(),
+            text: text.to_string(),
+        }));
+        out
+    }
+
+    fn on_tool_called(&mut self, d: &Value) -> Vec<Payload> {
+        let call_id = str_of(d, "id").to_string();
+        let input = d.get("input").filter(|v| !v.is_null()).cloned();
+        if let Some(input) = &input {
+            self.tool_inputs.insert(call_id.clone(), input.clone());
+        }
         vec![Payload::ToolCall(ToolCall {
+            name: self.tool_names.get(&call_id).cloned().unwrap_or_default(),
             tool_call_id: call_id,
-            name: part
-                .get("tool")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            status,
-            input: state.get("input").filter(|v| !v.is_null()).cloned(),
-            output: state
-                .get("output")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
+            status: ToolStatus::Running,
+            input,
+            output: String::new(),
             title: String::new(),
         })]
     }
 
-    /// A finished model step reports its token usage. Emit one §0 `Usage`
-    /// (`source: native`) per step, de-duped on the step part id so a re-sent
-    /// `part.updated` doesn't double-count. A step with no modelled token field
-    /// (e.g. a `{total}`-only shape) yields nothing.
-    fn on_step_finish(&mut self, part: &Value) -> Vec<Payload> {
-        let Some(usage) = usage_from_step(part) else {
-            return vec![];
-        };
-        if let Some(id) = part.get("id").and_then(Value::as_str) {
-            if !self.steps_seen.insert(id.to_string()) {
-                return vec![];
-            }
-        }
-        vec![Payload::Usage(usage)]
+    fn on_tool_finished(&mut self, d: &Value, status: ToolStatus, output: String) -> Vec<Payload> {
+        let call_id = str_of(d, "id").to_string();
+        vec![Payload::ToolCall(ToolCall {
+            name: self.tool_names.remove(&call_id).unwrap_or_default(),
+            input: self.tool_inputs.remove(&call_id),
+            tool_call_id: call_id,
+            status,
+            output,
+            title: String::new(),
+        })]
+    }
+
+    /// The turn ended: close every open message, then raise the attention
+    /// signal drivers wait on.
+    fn end_turn(&mut self, reason: AttentionReason, message: String) -> Vec<Payload> {
+        let mut out: Vec<Payload> = self
+            .open_msgs
+            .drain(..)
+            .map(|id| Payload::MessageEnd(MessageEnd::new(id)))
+            .collect();
+        self.text_streamed.clear();
+        self.reasoning_streamed.clear();
+        out.push(attention(reason, message));
+        out
     }
 }
 
-/// Map an opencode `step-finish` part's `tokens` into a §0 [`Usage`]
-/// (`source: native`, mirroring the transcript producer). Returns `None` when
-/// none of the modelled token fields are present, so a `{total}`-only or
-/// token-less step produces no event rather than an all-`None` `Usage`.
-fn usage_from_step(part: &Value) -> Option<Usage> {
-    let tokens = part.get("tokens")?;
+fn str_of<'a>(d: &'a Value, key: &str) -> &'a str {
+    d.get(key).and_then(Value::as_str).unwrap_or_default()
+}
+
+fn msg_id(d: &Value) -> &str {
+    str_of(d, "assistantMessageID")
+}
+
+fn block_key(d: &Value) -> (String, u64) {
+    (
+        msg_id(d).to_string(),
+        d.get("ordinal").and_then(Value::as_u64).unwrap_or(0),
+    )
+}
+
+fn thinking(text: &str) -> Vec<Payload> {
+    if text.is_empty() {
+        return vec![];
+    }
+    vec![Payload::Thinking(Thinking {
+        text: text.to_string(),
+    })]
+}
+
+/// Join a tool result's text content parts (`[{type:"text", text}]`).
+fn tool_content_text(content: Option<&Value>) -> String {
+    content
+        .and_then(Value::as_array)
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+/// Map a finished step's `tokens`/`cost` into a §0 [`Usage`] (`source:
+/// native`). `None` when the step carries no modelled token field.
+fn usage_from_step(d: &Value) -> Option<Usage> {
+    let tokens = d.get("tokens")?;
     let count = |obj: &Value, k: &str| obj.get(k).and_then(Value::as_u64);
     let cache = tokens.get("cache").unwrap_or(&Value::Null);
     let input = count(tokens, "input");
     let output = count(tokens, "output");
     let cache_read = count(cache, "read");
     let cache_creation = count(cache, "write");
-    // No modelled token field → no event (a `{total}`-only step yields nothing
-    // rather than an all-`None` Usage).
     input.or(output).or(cache_read).or(cache_creation)?;
     Some(Usage {
-        message_id: part
-            .get("messageID")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
+        message_id: msg_id(d).to_string(),
         input_tokens: input,
         output_tokens: output,
         cache_read_input_tokens: cache_read,
         cache_creation_input_tokens: cache_creation,
-        cost_usd: part.get("cost").and_then(Value::as_f64),
+        cost_usd: d.get("cost").and_then(Value::as_f64),
         source: UsageSource::Native,
     })
 }
 
-fn map_tool_status(s: &str) -> ToolStatus {
-    match s {
-        "completed" => ToolStatus::Completed,
-        "error" => ToolStatus::Error,
-        // pending / running / anything mid-flight
-        _ => ToolStatus::Running,
-    }
+fn attention(reason: AttentionReason, message: String) -> Payload {
+    Payload::AttentionRequired(AttentionRequired { reason, message })
 }
 
-fn attention(reason: AttentionReason) -> Payload {
-    Payload::AttentionRequired(AttentionRequired {
-        reason,
-        message: String::new(),
-    })
-}
-
-/// Pull a message out of a `session.error` event's `error` (string, or an object
-/// with `message` / `data.message`).
-fn error_message(props: &Value) -> String {
-    match props.get("error") {
+/// OpenCode 2's structured error is `{type, message}`; fall back to the type
+/// when there is no message.
+fn structured_error_message(error: Option<&Value>) -> String {
+    match error {
         Some(Value::String(s)) => s.clone(),
-        Some(obj @ Value::Object(_)) => obj
-            .get("message")
-            .or_else(|| obj.get("data").and_then(|d| d.get("message")))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
+        Some(obj @ Value::Object(_)) => {
+            let message = str_of(obj, "message");
+            if message.is_empty() {
+                str_of(obj, "type").to_string()
+            } else {
+                message.to_string()
+            }
+        }
         _ => String::new(),
     }
 }
 
-/// Drain an opencode `/event` SSE stream into the durable [`SessionLog`],
+/// Drain an opencode `/api/event` SSE stream into the durable [`SessionLog`],
 /// mapping each event through [`EventMapper`]. The transport-agnostic core: the
 /// caller hands a reader (a live HTTP body, or a `Cursor` in tests) and a stop
 /// flag; we parse SSE frames (`data:` lines terminated by a blank line), map
@@ -365,7 +369,7 @@ fn flush_frame(
     let parsed: Result<Value, _> = serde_json::from_str(data);
     data.clear();
     let Ok(value) = parsed else { return Ok(0) };
-    // opencode's `/event` stream is the agent's own output — stamp it `agent`
+    // opencode's `/api/event` stream is the agent's own output — stamp it `agent`
     // (the host knows it launched opencode; the guest can't claim a different actor).
     let events: Vec<Event> = mapper
         .on_event(&value)
@@ -381,7 +385,7 @@ fn flush_frame(
 }
 
 /// A [`Read`](std::io::Read) over a growing file that **blocks at EOF** (polling)
-/// instead of ending — so `drain_sse` follows the in-sandbox `/event` capture
+/// instead of ending — so `drain_sse` follows the in-sandbox `/api/event` capture
 /// file like `tail -F` (replay everything already there, then stream appends).
 /// Reading a file being appended is safe: at EOF the offset holds, and a later
 /// read returns bytes written past it. (Consumed by the libkrun file path;
@@ -453,245 +457,199 @@ impl std::io::Read for FollowReader {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::io::Cursor;
+    use std::sync::atomic::AtomicBool;
 
-    fn ev(ty: &str, props: Value) -> Value {
-        json!({ "id": "evt_x", "type": ty, "properties": props })
+    /// A real OpenCode 2.0.24 turn (free Zen model): write `hello.txt`, run
+    /// `cat hello.txt` through the shell tool, answer. Paths sanitized.
+    const TOOL_TURN: &str = include_str!("fixtures/opencode-2.0.24-tool-turn.sse");
+    /// A real OpenCode 2.0.24 turn that failed before sampling (no route to the
+    /// requested model).
+    const FAILED_TURN: &str = include_str!("fixtures/opencode-2.0.24-failed-turn.sse");
+
+    fn ev(ty: &str, data: Value) -> Value {
+        json!({ "id": "evt_x", "created": 1, "type": ty, "data": data })
     }
 
-    // Envelope shapes below are trimmed from a real GLM turn captured through
-    // `opencode serve` (opencode 1.15.10), so the mapper is tested against the
-    // wire format, not a guess.
-
-    #[test]
-    fn assistant_message_then_text_deltas_then_idle() {
+    /// Map every frame of a captured SSE stream (no log), in order.
+    fn map_capture(sse: &str) -> Vec<Payload> {
         let mut m = EventMapper::new();
-
-        // The user-message echo of our own prompt maps to nothing.
-        assert!(m
-            .on_event(&ev(
-                "message.updated",
-                json!({ "sessionID": "ses_a", "info": { "id": "msg_u", "role": "user" } }),
-            ))
-            .is_empty());
-
-        // First sight of the assistant message → MessageStart.
-        let start = m.on_event(&ev(
-            "message.updated",
-            json!({ "sessionID": "ses_a", "info": {
-                "id": "msg_a", "role": "assistant",
-                "model": { "providerID": "zai-coding-plan", "modelID": "glm-4.5-air" } } }),
-        ));
-        assert!(matches!(&start[..],
-            [Payload::MessageStart(s)] if s.message_id == "msg_a" && s.role == Role::Assistant));
-        // A repeat update of the same message does NOT re-open it.
-        assert!(m
-            .on_event(&ev(
-                "message.updated",
-                json!({ "sessionID": "ses_a", "info": { "id": "msg_a", "role": "assistant" } }),
-            ))
-            .is_empty());
-
-        // Streaming text deltas carry the messageID.
-        let d = m.on_event(&ev(
-            "message.part.delta",
-            json!({ "sessionID": "ses_a", "messageID": "msg_a", "partID": "prt_1",
-                    "field": "text", "delta": "hi" }),
-        ));
-        assert!(matches!(&d[..],
-            [Payload::MessageDelta(x)] if x.text == "hi" && x.message_id == "msg_a"));
-        // Empty deltas drop.
-        assert!(m
-            .on_event(&ev(
-                "message.part.delta",
-                json!({ "sessionID": "ses_a", "messageID": "msg_a", "field": "text", "delta": "" }),
-            ))
-            .is_empty());
-
-        // Idle ends the open message and raises NeedsInput.
-        let idle = m.on_event(&ev("session.idle", json!({ "sessionID": "ses_a" })));
-        assert!(matches!(&idle[..],
-            [Payload::MessageEnd(e), Payload::AttentionRequired(a)]
-            if e.message_id == "msg_a" && a.reason == AttentionReason::NeedsInput));
+        sse.lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+            .flat_map(|v| m.on_event(&v))
+            .collect()
     }
 
     #[test]
-    fn schema_bound_output_maps_once_into_message_evidence() {
-        let mut m = EventMapper::new();
-        let updated = ev(
-            "message.updated",
-            json!({ "sessionID": "ses_a", "info": {
-                "id": "msg_a",
-                "role": "assistant",
-                "structured": {
-                    "kind": "document",
-                    "text": "# Grill\n\nChallenge the assumptions."
-                }
-            } }),
+    fn captured_tool_turn_maps_tools_text_usage_and_the_boundary() {
+        let out = map_capture(TOOL_TURN);
+
+        let tools: Vec<&ToolCall> = out
+            .iter()
+            .filter_map(|p| match p {
+                Payload::ToolCall(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tools.len(),
+            4,
+            "two calls, each Running then Completed: {tools:?}"
         );
-        let output = m.on_event(&updated);
-        assert!(matches!(&output[..],
+        assert_eq!(
+            (tools[0].name.as_str(), tools[0].status),
+            ("write", ToolStatus::Running)
+        );
+        assert_eq!(
+            tools[0].input,
+            Some(json!({"path": "hello.txt", "content": "hi"}))
+        );
+        assert_eq!(tools[1].status, ToolStatus::Completed);
+        assert_eq!(tools[1].tool_call_id, tools[0].tool_call_id);
+        assert_eq!(tools[1].output, "Created file successfully: hello.txt");
+        assert_eq!(
+            (tools[2].name.as_str(), tools[2].status),
+            ("shell", ToolStatus::Running)
+        );
+        assert_eq!(
+            (
+                tools[3].name.as_str(),
+                tools[3].status,
+                tools[3].output.as_str()
+            ),
+            ("shell", ToolStatus::Completed, "hi")
+        );
+
+        let text: String = out
+            .iter()
+            .filter_map(|p| match p {
+                Payload::MessageDelta(d) => Some(d.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            text, "`cat hello.txt` printed:\n\n```\nhi\n```",
+            "deltas only, no .ended repeat"
+        );
+        assert!(out.iter().any(|p| matches!(p, Payload::Thinking(_))));
+
+        let usage: Vec<&Usage> = out
+            .iter()
+            .filter_map(|p| match p {
+                Payload::Usage(u) => Some(u),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(usage.len(), 3, "one per model step");
+        assert_eq!(usage[0].input_tokens, Some(5526));
+        assert_eq!(usage[2].cache_read_input_tokens, Some(4352));
+        assert!(usage.iter().all(|u| u.source == UsageSource::Native));
+
+        // Every message that started also ended, and the turn ends on NeedsInput.
+        let starts = out
+            .iter()
+            .filter(|p| matches!(p, Payload::MessageStart(_)))
+            .count();
+        let ends = out
+            .iter()
+            .filter(|p| matches!(p, Payload::MessageEnd(_)))
+            .count();
+        assert_eq!((starts, ends), (1, 1));
+        assert!(matches!(out.last(),
+            Some(Payload::AttentionRequired(a)) if a.reason == AttentionReason::NeedsInput));
+    }
+
+    #[test]
+    fn captured_failed_turn_raises_error_stalled_with_the_reason() {
+        let out = map_capture(FAILED_TURN);
+        assert!(matches!(&out[..],
+            [Payload::AttentionRequired(a)]
+                if a.reason == AttentionReason::ErrorStalled
+                    && a.message == "Model unavailable: zai-coding-plan/glm-4.5-air"));
+    }
+
+    #[test]
+    fn text_ended_without_deltas_supplies_the_text_once() {
+        let mut m = EventMapper::new();
+        let out = m.on_event(&ev(
+            "session.text.ended",
+            json!({"sessionID": "s", "assistantMessageID": "msg_1", "ordinal": 0, "text": "whole"}),
+        ));
+        assert!(matches!(&out[..],
             [Payload::MessageStart(s), Payload::MessageDelta(d)]
-            if s.message_id == "msg_a"
-                && d.message_id == "msg_a"
-                && d.text == "{\"kind\":\"document\",\"text\":\"# Grill\\n\\nChallenge the assumptions.\"}"));
-        assert!(m.on_event(&updated).is_empty());
-    }
-
-    #[test]
-    fn reasoning_delta_maps_to_thinking() {
-        let mut m = EventMapper::new();
-        let t = m.on_event(&ev(
-            "message.part.delta",
-            json!({ "sessionID": "s", "messageID": "m", "field": "reasoning", "delta": "hmm" }),
+                if s.message_id == "msg_1" && d.text == "whole"));
+        let end = m.on_event(&ev(
+            "session.step.ended",
+            json!({"sessionID": "s", "assistantMessageID": "msg_1"}),
         ));
-        assert!(matches!(&t[..], [Payload::Thinking(x)] if x.text == "hmm"));
+        assert!(matches!(&end[..], [Payload::MessageEnd(_)]));
     }
 
     #[test]
-    fn tool_part_emits_on_status_change_only() {
+    fn tool_failure_and_interruption_map_to_errors() {
         let mut m = EventMapper::new();
-        let tool = |status: &str, input: Value| {
-            ev(
-                "message.part.updated",
-                json!({ "sessionID": "s", "part": {
-                    "id": "prt_t", "messageID": "m", "type": "tool",
-                    "tool": "ls", "callID": "call_1",
-                    "state": { "status": status, "input": input } } }),
-            )
-        };
-        // pending → Running (with name + input).
-        let a = m.on_event(&tool("pending", json!({ "path": "." })));
-        assert!(matches!(&a[..], [Payload::ToolCall(t)]
-            if t.name == "ls" && t.tool_call_id == "call_1" && t.status == ToolStatus::Running
-               && t.input.as_ref().and_then(|i| i.get("path")).and_then(|x| x.as_str()) == Some(".")));
-        // running → still Running, but status unchanged from our mapping → no dup.
+        m.on_event(&ev(
+            "session.tool.input.started",
+            json!({"id": "c1", "name": "shell"}),
+        ));
+        let failed = m.on_event(&ev(
+            "session.tool.failed",
+            json!({"id": "c1", "error": {"type": "tool.denied", "message": "denied"}, "executed": false}),
+        ));
+        assert!(matches!(&failed[..],
+            [Payload::ToolCall(t)] if t.status == ToolStatus::Error && t.name == "shell" && t.output == "denied"));
+        let stopped = m.on_event(&ev(
+            "session.execution.interrupted",
+            json!({"sessionID": "s", "reason": "user"}),
+        ));
+        assert!(matches!(&stopped[..],
+            [Payload::AttentionRequired(a)]
+                if a.reason == AttentionReason::ErrorStalled && a.message == "interrupted (user)"));
+    }
+
+    #[test]
+    fn permission_and_form_raise_attention() {
+        let mut m = EventMapper::new();
+        assert!(
+            matches!(&m.on_event(&ev("permission.asked", json!({"id": "p", "action": "shell", "resources": []})))[..],
+            [Payload::AttentionRequired(a)] if a.reason == AttentionReason::Permission)
+        );
+        assert!(matches!(&m.on_event(&ev("form.created", json!({})))[..],
+            [Payload::AttentionRequired(a)] if a.reason == AttentionReason::NeedsInput));
+    }
+
+    #[test]
+    fn opencode_1_envelopes_map_to_nothing() {
+        let mut m = EventMapper::new();
+        let v1 = json!({"type": "message.part.delta",
+            "properties": {"messageID": "msg_a", "field": "text", "delta": "hi"}});
+        assert!(m.on_event(&v1).is_empty());
         assert!(m
-            .on_event(&tool("running", json!({ "path": "." })))
+            .on_event(&json!({"type": "session.idle", "properties": {}}))
             .is_empty());
-        // completed → Completed with output.
-        let done = ev(
-            "message.part.updated",
-            json!({ "sessionID": "s", "part": {
-                "type": "tool", "tool": "ls", "callID": "call_1",
-                "state": { "status": "completed", "output": "a\nb" } } }),
-        );
-        assert!(matches!(&m.on_event(&done)[..],
-            [Payload::ToolCall(t)] if t.status == ToolStatus::Completed && t.output == "a\nb"));
     }
 
-    #[test]
-    fn step_finish_emits_usage_native_once() {
-        let mut m = EventMapper::new();
-        let step = ev(
-            "message.part.updated",
-            json!({ "sessionID": "s", "part": {
-                "id": "prt_step", "messageID": "msg_a", "type": "step-finish",
-                "tokens": { "input": 120, "output": 30, "reasoning": 5,
-                            "cache": { "read": 100, "write": 20 } } } }),
-        );
-        let out = m.on_event(&step);
-        let [Payload::Usage(u)] = &out[..] else {
-            panic!("expected one Usage: {out:?}");
-        };
-        assert_eq!(u.message_id, "msg_a");
-        assert_eq!(u.input_tokens, Some(120));
-        assert_eq!(u.output_tokens, Some(30));
-        assert_eq!(u.cache_read_input_tokens, Some(100));
-        assert_eq!(u.cache_creation_input_tokens, Some(20));
-        assert_eq!(u.source, UsageSource::Native);
-        // A re-sent part.updated for the same step id must not double-count.
-        assert!(m.on_event(&step).is_empty());
-    }
-
-    #[test]
-    fn step_finish_without_modelled_tokens_is_ignored() {
-        let mut m = EventMapper::new();
-        // A `{total}`-only step (the trimmed fixture shape) carries nothing we
-        // model → no Usage rather than an all-`None` event.
-        let step = ev(
-            "message.part.updated",
-            json!({ "part": { "id": "prt_s", "type": "step-finish",
-                              "tokens": { "total": 10 } } }),
-        );
-        assert!(m.on_event(&step).is_empty());
-    }
-
-    #[test]
-    fn snapshots_and_lifecycle_and_session_next_are_ignored() {
-        let mut m = EventMapper::new();
-        // text/reasoning part *snapshots* (deltas already carry their content),
-        // step boundaries, session lifecycle, the session.next.* family, server.*
-        for e in [
-            ev(
-                "message.part.updated",
-                json!({ "part": { "type": "text", "text": "full text so far" } }),
-            ),
-            ev(
-                "message.part.updated",
-                json!({ "part": { "type": "step-finish", "tokens": { "total": 10 } } }),
-            ),
-            ev(
-                "session.next.text.delta",
-                json!({ "sessionID": "s", "delta": "x" }),
-            ),
-            ev("session.next.model.switched", json!({ "sessionID": "s" })),
-            ev("session.updated", json!({ "sessionID": "s" })),
-            ev("server.heartbeat", json!({})),
-        ] {
-            assert!(m.on_event(&e).is_empty(), "should ignore: {}", e["type"]);
-        }
-    }
-
-    /// End-to-end transport: a raw `/event` SSE byte stream (a text turn that
-    /// goes idle) drains into the durable log as the mapped §0 events — the same
-    /// sink `session watch`/`subscribe` read, so opencode lights up there with
-    /// no transcript file.
+    /// End-to-end over the real capture: raw SSE → `drain_sse` → the durable
+    /// `SessionLog` that `session watch`/`subscribe` read.
     #[test]
     fn drain_sse_feeds_the_durable_log() {
-        use std::io::Cursor;
-        use std::sync::atomic::AtomicBool;
-
         crate::test_util::with_isolated_home("opencode-drain-sse", || {
             let pb = crate::pillbox::global();
             let mut log = SessionLog::open(&pb, "ses-oc").expect("open log");
-
-            let stream = "\
-data: {\"type\":\"server.connected\",\"properties\":{}}\n\
-\n\
-data: {\"type\":\"message.updated\",\"properties\":{\"info\":{\"id\":\"msg_a\",\"role\":\"assistant\"}}}\n\
-\n\
-data: {\"type\":\"message.part.delta\",\"properties\":{\"messageID\":\"msg_a\",\"field\":\"text\",\"delta\":\"hi \"}}\n\
-\n\
-data: {\"type\":\"message.part.delta\",\"properties\":{\"messageID\":\"msg_a\",\"field\":\"text\",\"delta\":\"there\"}}\n\
-\n\
-data: {\"type\":\"message.part.updated\",\"properties\":{\"part\":{\"id\":\"prt_s\",\"messageID\":\"msg_a\",\"type\":\"step-finish\",\"tokens\":{\"input\":12,\"output\":4,\"cache\":{\"read\":8,\"write\":0}}}}}\n\
-\n\
-data: {\"type\":\"session.idle\",\"properties\":{\"sessionID\":\"ses_oc\"}}\n\
-\n";
-
             let stop = AtomicBool::new(false);
-            let n = drain_sse(Cursor::new(stream), "ses-oc", &mut log, &stop).expect("drain");
-            assert_eq!(n, 6, "start + 2 deltas + usage + end + attention");
+            let n = drain_sse(Cursor::new(TOOL_TURN), "ses-oc", &mut log, &stop).expect("drain");
+            assert_eq!(n, map_capture(TOOL_TURN).len());
 
             let events = SessionLog::open(&pb, "ses-oc")
                 .unwrap()
                 .read_from(0)
                 .unwrap();
-            use crate::contract::Payload as P;
-            assert!(matches!(events[0].payload, P::MessageStart(_)));
-            assert!(matches!(&events[1].payload, P::MessageDelta(d) if d.text == "hi "));
-            assert!(matches!(&events[2].payload, P::MessageDelta(d) if d.text == "there"));
-            assert!(matches!(&events[3].payload,
-                P::Usage(u) if u.input_tokens == Some(12) && u.output_tokens == Some(4)
-                    && u.cache_read_input_tokens == Some(8) && u.source == UsageSource::Native));
-            assert!(matches!(events[4].payload, P::MessageEnd(_)));
-            assert!(matches!(&events[5].payload,
-                P::AttentionRequired(a) if a.reason == AttentionReason::NeedsInput));
+            assert_eq!(events.len(), n);
             assert_eq!(
                 events.iter().map(|e| e.seq).collect::<Vec<_>>(),
-                vec![1, 2, 3, 4, 5, 6]
+                (1..=n as u64).collect::<Vec<_>>()
             );
-            // Every drained event is stamped as the opencode agent.
             assert!(events
                 .iter()
                 .all(|e| e.actor == Some(crate::contract::Actor::agent("opencode"))));

@@ -524,7 +524,7 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
     // failed bring-up doesn't leak a server.
     let built = (|| -> Result<Session> {
         super::opencode::wait_ready(&http)?;
-        let ocid = super::opencode::create_session(&http)?;
+        let ocid = super::opencode::create_session(&http, &model)?;
         startup.mark("server_ready");
         let session = Session {
             id: Session::new_id(),

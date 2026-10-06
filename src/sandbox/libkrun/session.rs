@@ -1550,6 +1550,7 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
         .model
         .clone()
         .unwrap_or_else(|| opencode::DEFAULT_MODEL.to_string());
+    let session_model = model.clone();
     let serve = opencode::serve_args()
         .iter()
         .map(|a| shell_quote(a))
@@ -1563,14 +1564,16 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
             .iter()
             .map(|s| s.to_string())
             .collect(),
-        // Node — CA trust is NODE_EXTRA_CA_CERTS (launch_base); needs no extra env.
-        extra_env: vec![],
+        // Node — CA trust is NODE_EXTRA_CA_CERTS (launch_base). The extra env is
+        // the pinned server password OpenCode 2 requires, plus the model's
+        // temperature when one was requested (it has no per-prompt setting).
+        extra_env: opencode::serve_env(&model, opts.temperature)?,
         // Opt-in: PILLBOX_LOCAL_MODEL_PORT lets the guest reach a host-run ollama.
         local_forward_port: std::env::var("PILLBOX_LOCAL_MODEL_PORT")
             .ok()
             .and_then(|s| s.parse::<u16>().ok()),
         model,
-        // §0 producer: a co-located, persistent /event capture (raw SSE → the
+        // §0 producer: a co-located, persistent /api/event capture (raw SSE → the
         // shared/CoW home file, host-readable). curl holds one long-lived SSE
         // connection open, so we reopen-per-line (`printf >> file` open+write+
         // close) to force a virtio-fs flush each line — else the appends sit in
@@ -1579,16 +1582,19 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
             format!(
                 "{preamble}; \
                  {serve} & \
-                 ( while :; do curl -sN http://127.0.0.1:{port}/event 2>/dev/null \
+                 ( while :; do curl -sN -u {user}:{password} http://127.0.0.1:{port}/api/event 2>/dev/null \
                      | while IFS= read -r l; do printf '%s\\n' \"$l\" >> {events_q}; done; \
                    sleep 1; done ) & \
                  exec pillbox vsock-forward --vsock-port {FORWARD_PORT} --to-port {port}",
                 port = opencode::SERVE_PORT,
+                user = opencode::SERVER_USER,
+                password = opencode::SERVER_PASSWORD,
             )
         }),
-        bringup: Box::new(|http| {
-            opencode::wait_ready(http)?;
-            opencode::create_session(http)
+        bringup: Box::new(move |http| {
+            let http = http.with_basic_auth(opencode::SERVER_USER, opencode::SERVER_PASSWORD);
+            opencode::wait_ready(&http)?;
+            opencode::create_session(&http, &session_model)
         }),
     };
     launch_server_vm(spec, opts, resolved, launch)
@@ -1675,7 +1681,15 @@ pub(crate) fn opencode_http(
     session: &crate::session::Session,
 ) -> Result<Box<dyn crate::sandbox::http::SandboxHttp>> {
     let handle = LibkrunHandle::decode(session)?;
-    Ok(Box::new(http::LibkrunHttp::new(PathBuf::from(handle.sock))))
+    let http = http::LibkrunHttp::new(PathBuf::from(handle.sock));
+    if session.agent_id == crate::agents::OPENCODE.id {
+        use crate::sandbox::opencode;
+        return Ok(Box::new(http.with_basic_auth(
+            opencode::SERVER_USER,
+            opencode::SERVER_PASSWORD,
+        )));
+    }
+    Ok(Box::new(http))
 }
 
 /// Host-side path of a libkrun server session's event-capture file (inside the

@@ -4,17 +4,19 @@
 //! opencode is an [`Integration::Server`](crate::agents::Integration) agent: it
 //! runs as an HTTP server inside the sandbox and we drive/read it over its API
 //! rather than a PTY. Every call here goes through a [`SandboxHttp`] transport,
-//! so the bridge is backend-agnostic: docker supplies `docker exec curl`,
-//! libkrun a real HTTP client over a forwarded vsock socket.
+//! so the bridge is backend-agnostic.
 //!
-//! - [`serve_args`] — the in-sandbox command (`opencode serve …`).
-//! - [`wait_ready`] — poll `/doc` until the server answers.
-//! - [`create_session`] — `POST /session` → the opencode session id.
-//! - [`send_prompt`] — `POST /session/{id}/prompt_async` (the streaming drive).
-//! - [`spawn_event_bridge`] — `GET /event` (SSE) → [`drain_sse`] → durable log.
+//! - [`serve_args`] / [`serve_env`] — the in-sandbox command and its env.
+//! - [`wait_ready`] — poll `GET /api/info` until the server answers.
+//! - [`create_session`] — `POST /api/session` (with the model) → the session id.
+//! - [`send_prompt`] — `POST /api/session/{id}/prompt` (admits the input; the
+//!   turn streams on `/api/event`).
+//! - [`spawn_event_bridge`] — `GET /api/event` (SSE) → [`drain_sse`] → durable log.
 //!
-//! Routes/shapes are the bare ones (`/session`, not `/api/session`) verified
-//! live against opencode 1.15.10; see docs/opencode-integration.md.
+//! Targets the OpenCode 2 server API (`@opencode/cli`, verified live against
+//! 2.0.24): every route lives under `/api/`, the server always requires a
+//! password (HTTP basic, user `opencode`), the model is chosen per session, and
+//! there is no per-prompt temperature. See docs/opencode-integration.md.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -29,23 +31,37 @@ use crate::sandbox::http::SandboxHttp;
 
 const ACTION: &str = "run (opencode server)";
 
-/// Port the in-sandbox `opencode serve` listens on (localhost-only; reached by
-/// the backend's [`SandboxHttp`] transport, so no auth/publish needed).
+/// Port the in-sandbox `opencode serve` listens on (guest loopback only; reached
+/// by the backend's [`SandboxHttp`] transport).
 pub(crate) const SERVE_PORT: u16 = 4096;
 
-/// Default model when `--model` isn't given. `provider/modelID`. opencode's
-/// `prompt_async` requires a model and the user's config sets no default, so we
-/// supply one; override with `pillbox run --agent opencode --model …`.
+/// HTTP basic-auth user OpenCode 2's server expects.
+#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+pub(crate) const SERVER_USER: &str = "opencode";
+
+/// The guest server's password. OpenCode 2 refuses to serve without one (it
+/// generates a random password when none is set), so the guest launch pins
+/// this value through `OPENCODE_SERVER_PASSWORD` and the host transport sends
+/// it. It is not a secret: the server binds guest loopback and is reached from
+/// the host only through the session's private vsock socket; the microVM is the
+/// boundary, not this password.
+#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+pub(crate) const SERVER_PASSWORD: &str = "pillbox-guest-loopback";
+
+/// Default model when `--model` isn't given. `provider/modelID`. OpenCode 2
+/// binds the model when the session is created, and the user's config sets no
+/// default, so we supply one; override with `pillbox run --agent opencode --model …`.
 pub(crate) const DEFAULT_MODEL: &str = "zai-coding-plan/glm-4.5-air";
 
-/// Filename (under the agent home) the in-sandbox `/event` capture is appended
-/// to — opencode's durable, gateway-free §0 transcript. A guest-side `curl -N
-/// /event` loop writes raw SSE here; because it lives in the shared/CoW home it
-/// persists + is host-readable, so the host drains it (replay + follow) on
-/// `watch`/`subscribe` and captures completely even for a late reader — the same
-/// file-transcript shape claude/codex use, no always-on host process. See
-/// [`crate::events::opencode::FollowReader`]. (Consumed by the libkrun file
-/// path; docker §0 still uses the live bridge.)
+/// Filename (under the agent home) the in-sandbox `/api/event` capture is
+/// appended to — opencode's durable, gateway-free §0 transcript. A guest-side
+/// `curl -N /api/event` loop writes raw SSE here; because it lives in the
+/// shared/CoW home it persists + is host-readable, so the host drains it
+/// (replay + follow) on `watch`/`subscribe` and captures completely even for a
+/// late reader. OpenCode documents its live stream as volatile (a slow consumer
+/// is dropped, events during a disconnect are missed), which is why the capture
+/// is a co-located file rather than a host-side subscription. See
+/// [`crate::events::opencode::FollowReader`].
 #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) const EVENTS_FILE: &str = ".pillbox-opencode-events.sse";
 
@@ -64,11 +80,48 @@ pub(crate) fn serve_args() -> Vec<String> {
     .collect()
 }
 
-/// Poll `GET /doc` until the server answers `200` (the migration + boot can take
-/// a few seconds), bounded so a dead server fails loud instead of hanging.
+/// Guest env for `opencode serve`: the pinned server password, and — when a
+/// sampling temperature was requested — an inline config that sets it on the
+/// session's model.
+///
+/// OpenCode 2 has no per-prompt temperature. The only placement verified to
+/// reach the provider request is the model's request `body` in config
+/// (`providers.<provider>.models.<model>.body.temperature`, merged over the
+/// built-in catalog); agent-level `request.body` and the v1 `temperature` /
+/// `options.temperature` fields were accepted but never sent (checked against
+/// a capturing provider on 2.0.24).
+#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+pub(crate) fn serve_env(model: &str, temperature: Option<f64>) -> Result<Vec<(String, String)>> {
+    let mut env = vec![(
+        "OPENCODE_SERVER_PASSWORD".to_string(),
+        SERVER_PASSWORD.to_string(),
+    )];
+    if let Some(t) = temperature {
+        let (provider, model_id) = split_model(model, ACTION)?;
+        let config = serde_json::json!({
+            "providers": { provider: { "models": { model_id: { "body": { "temperature": t } } } } }
+        });
+        env.push(("OPENCODE_CONFIG_CONTENT".to_string(), config.to_string()));
+    }
+    Ok(env)
+}
+
+/// `provider/modelID` → `(provider, modelID)`.
+fn split_model<'a>(model: &'a str, action: &'static str) -> Result<(&'a str, &'a str)> {
+    model.split_once('/').ok_or_else(|| {
+        PillboxError::usage(
+            action,
+            format!("--model must be `provider/modelID` (got `{model}`)"),
+        )
+        .into()
+    })
+}
+
+/// Poll `GET /api/info` until the server answers `200` (the migration + boot
+/// can take a few seconds), bounded so a dead server fails loud instead of hanging.
 pub(crate) fn wait_ready(http: &dyn SandboxHttp) -> Result<()> {
     for _ in 0..60 {
-        if let Ok(resp) = http.request("GET", "/doc", None) {
+        if let Ok(resp) = http.request("GET", "/api/info", None) {
             if resp.status == 200 {
                 return Ok(());
             }
@@ -78,63 +131,56 @@ pub(crate) fn wait_ready(http: &dyn SandboxHttp) -> Result<()> {
     Err(PillboxError::runtime(ACTION, "opencode server didn't become ready in 30s").into())
 }
 
-/// `POST /session` → the new opencode session id (`ses_…`).
-pub(crate) fn create_session(http: &dyn SandboxHttp) -> Result<String> {
-    let resp = http.request("POST", "/session", Some("{}"))?;
-    let body = resp.body.trim();
-    let value: serde_json::Value = serde_json::from_str(body).map_err(|_| {
+/// `POST /api/session` with the model → the new session id (`ses_…`, under
+/// `data.id`). `model` is `provider/modelID`.
+pub(crate) fn create_session(http: &dyn SandboxHttp, model: &str) -> Result<String> {
+    let (provider, model_id) = split_model(model, ACTION)?;
+    let body = serde_json::json!({ "model": { "providerID": provider, "id": model_id } });
+    let resp = http.request("POST", "/api/session", Some(&body.to_string()))?;
+    let raw = resp.body.trim();
+    if !(200..300).contains(&resp.status) {
+        return Err(PillboxError::runtime(
+            ACTION,
+            format!("create session failed (HTTP {}): {raw}", resp.status),
+        )
+        .into());
+    }
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| {
         PillboxError::runtime(
             ACTION,
-            format!("create session: unexpected response: {body}"),
+            format!("create session: unexpected response: {raw}"),
         )
     })?;
     value
-        .get("id")
+        .pointer("/data/id")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| {
-            PillboxError::runtime(ACTION, format!("create session: no id in {body}")).into()
+            PillboxError::runtime(ACTION, format!("create session: no data.id in {raw}")).into()
         })
 }
 
-/// Drive the session: `POST /session/{id}/prompt_async` with one text part and
-/// the model. Async/streaming — the response is `204` and the turn streams on
-/// `/event` (read via [`spawn_event_bridge`]). `model` is `provider/modelID`.
+/// Drive the session: `POST /api/session/{id}/prompt` with the text. OpenCode
+/// admits the input durably and returns it (`200`); the turn itself streams on
+/// `/api/event` (read via [`spawn_event_bridge`] or the guest capture).
 pub(crate) fn send_prompt(
     http: &dyn SandboxHttp,
     opencode_session: &str,
     text: &str,
-    model: &str,
-    temperature: Option<f64>,
 ) -> Result<()> {
-    let (provider, model_id) = model.split_once('/').ok_or_else(|| {
-        PillboxError::usage(
-            "session send",
-            format!("--model must be `provider/modelID` (got `{model}`)"),
-        )
-    })?;
-    let mut body = serde_json::json!({
-        "parts": [{ "type": "text", "text": text }],
-        "model": { "providerID": provider, "modelID": model_id },
-    });
-    // Top-level `temperature` on the prompt request (opencode forwards model
-    // options to the provider). Only set when requested, so a `None` run keeps
-    // the model default. NOTE: whether opencode honors per-prompt temperature is
-    // verified empirically by the eval's σ̂ measurement — if it silently no-ops,
-    // variance stays high and the sensitivity check reports "rig not sensitive".
-    if let Some(t) = temperature {
-        body["temperature"] = serde_json::json!(t);
-    }
-    let body = body.to_string();
-    let path = format!("/session/{opencode_session}/prompt_async");
+    let body = serde_json::json!({ "text": text }).to_string();
+    let path = format!("/api/session/{opencode_session}/prompt");
     let resp = http.request("POST", &path, Some(&body))?;
-    // Any 2xx is success (prompt_async returns 204).
     if (200..300).contains(&resp.status) {
         Ok(())
     } else {
         Err(PillboxError::runtime(
             "session send",
-            format!("opencode prompt failed (HTTP {})", resp.status),
+            format!(
+                "opencode prompt failed (HTTP {}): {}",
+                resp.status,
+                resp.body.trim()
+            ),
         )
         .into())
     }
@@ -183,8 +229,8 @@ pub(crate) fn print_started(
     }
 }
 
-/// Stream the server's `/event` SSE into the durable [`SessionLog`] — the
-/// `Server`-mode analog of the transcript tailer. The transport's `/event`
+/// Stream the server's `/api/event` SSE into the durable [`SessionLog`] — the
+/// `Server`-mode analog of the transcript tailer. The transport's `/api/event`
 /// stream feeds [`drain_sse`] on a thread; the returned handle stops the stream
 /// on shutdown (the blocking read can't observe the flag mid-frame). `None` if
 /// the stream can't open.
@@ -194,7 +240,7 @@ pub(crate) fn spawn_event_bridge(
     log: SessionLog,
 ) -> Option<TailerHandle> {
     let stream = http
-        .open_stream("/event")
+        .open_stream("/api/event")
         .map_err(|e| eprintln!("pillbox: warning: couldn't open the opencode event stream: {e:#}"))
         .ok()?;
     let body = stream.body;

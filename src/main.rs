@@ -289,8 +289,9 @@ enum Command {
         /// unsupported values fail at the CLI boundary.
         #[arg(long, value_name = "LOW|MEDIUM|HIGH")]
         reasoning_effort: Option<contract::ReasoningEffort>,
-        /// Sampling temperature for a server-integration agent (opencode), sent
-        /// on every `session send`. `0` = greedy/deterministic decoding — the
+        /// Sampling temperature for a server-integration agent (opencode), bound
+        /// to the session's model when the server starts (OpenCode 2 has no
+        /// per-prompt temperature). `0` = greedy/deterministic decoding — the
         /// variance-reduction knob the eval rig needs. Ignored by PTY agents.
         #[arg(long, value_name = "FLOAT")]
         temperature: Option<f64>,

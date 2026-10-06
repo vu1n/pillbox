@@ -3,8 +3,8 @@
 //!
 //! The opencode [`Integration::Server`](crate::agents::Integration) bridge
 //! (`sandbox::opencode`) drives a headless `opencode serve` over its HTTP API:
-//! poll readiness (`GET /doc`), create a session, push prompts, stream
-//! `/event`. Reaching an in-sandbox HTTP server is the primitive — and the one
+//! poll readiness (`GET /api/info`), create a session, push prompts, stream
+//! `/api/event`. Reaching an in-sandbox HTTP server is the primitive — and the one
 //! the documented gateway / multiplayer / §0 use cases all want (proxy the API,
 //! fan the event stream out to remote participants). This trait is that seam,
 //! so the bridge speaks HTTP once and each backend supplies the transport:

@@ -406,9 +406,10 @@ fn breakdown_delta(current: &Value, previous: Option<&Value>) -> Value {
 /// remainder as `inputTokens` — matching the non-overlapping Anthropic shape the
 /// §0 contract + cost-summer assume (which price cache-read separately, so an
 /// overlapping count would double-charge the cached tokens).
-/// `cacheWriteInputTokens` (new by codex 0.160.0, serde-defaulted to 0) becomes
-/// the cache-creation count; it is mapped exactly as the rollout-transcript
-/// parser maps `cache_write_input_tokens`, so the two codex paths agree.
+/// `cacheWriteInputTokens` (new by codex 0.160.0, serde-defaulted to 0) is also
+/// inside `inputTokens` (the 0.160.0 capture: `totalTokens` = input + output), so
+/// it becomes the cache-creation count and leaves the input remainder too —
+/// exactly as the rollout-transcript parser maps `cache_write_input_tokens`.
 /// `reasoningOutputTokens` is already part of `outputTokens` (a billed subset),
 /// so it gets no field of its own. Returns `None` when the breakdown carries no
 /// modelled count.
@@ -417,13 +418,17 @@ fn usage_from_breakdown(message_id: &str, b: &Value) -> Option<Usage> {
     let input_total = n("inputTokens");
     let output = n("outputTokens");
     let cached = n("cachedInputTokens");
+    let cache_write = n("cacheWriteInputTokens");
     input_total.or(output).or(cached)?;
     Some(Usage {
         message_id: message_id.to_string(),
-        input_tokens: input_total.map(|i| i.saturating_sub(cached.unwrap_or(0))),
+        input_tokens: input_total.map(|i| {
+            i.saturating_sub(cached.unwrap_or(0))
+                .saturating_sub(cache_write.unwrap_or(0))
+        }),
         output_tokens: output,
         cache_read_input_tokens: cached,
-        cache_creation_input_tokens: n("cacheWriteInputTokens"),
+        cache_creation_input_tokens: cache_write,
         cost_usd: None,
         source: UsageSource::Native,
     })
@@ -839,12 +844,12 @@ mod tests {
         let u = usages(&out);
         assert_eq!(u.len(), 2, "one Usage per turn: {out:?}");
         assert_eq!(u[0].message_id, "t1");
-        assert_eq!(u[0].input_tokens, Some(180)); // 300 - 120 cached
+        assert_eq!(u[0].input_tokens, Some(150)); // 300 - 120 read - 30 written
         assert_eq!(u[0].cache_read_input_tokens, Some(120));
         assert_eq!(u[0].cache_creation_input_tokens, Some(30));
         assert_eq!(u[0].output_tokens, Some(60));
         assert_eq!(u[1].message_id, "t2");
-        assert_eq!(u[1].input_tokens, Some(120)); // (450-300) - (150-120)
+        assert_eq!(u[1].input_tokens, Some(120)); // (450-300) - (150-120) - 0 written
         assert_eq!(u[1].cache_read_input_tokens, Some(30));
         assert_eq!(u[1].cache_creation_input_tokens, Some(0));
         assert_eq!(u[1].output_tokens, Some(30));
@@ -990,7 +995,7 @@ mod tests {
         // cached and 40 cache writes, output 80), not the last response's.
         let u = usages(&out);
         assert_eq!(u.len(), 1);
-        assert_eq!(u[0].input_tokens, Some(266));
+        assert_eq!(u[0].input_tokens, Some(226)); // 426 - 160 read - 40 written
         assert_eq!(u[0].cache_read_input_tokens, Some(160));
         assert_eq!(u[0].cache_creation_input_tokens, Some(40));
         assert_eq!(u[0].output_tokens, Some(80));

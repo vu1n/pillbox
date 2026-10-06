@@ -68,6 +68,11 @@ impl LibkrunHttp {
 /// Build a one-shot HTTP/1.1 request head with `Connection: close`, so the
 /// server closes after the body and `read_to_end` terminates. (The SSE stream
 /// builds its own keep-alive request inline in `open_stream`.)
+/// The SSE subscription request: same auth as a one-shot request, no body.
+fn stream_head(path: &str, auth: &str) -> String {
+    format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{auth}Accept: text/event-stream\r\n\r\n")
+}
+
 fn request_head(method: &str, path: &str, json_body: Option<&str>, auth: &str) -> String {
     let mut req =
         format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n{auth}");
@@ -121,13 +126,7 @@ impl SandboxHttp for LibkrunHttp {
     fn open_stream(&self, path: &str) -> Result<SandboxStream> {
         let s = self.connect()?;
         let mut w = s.try_clone().context("clone opencode stream socket")?;
-        w.write_all(
-            format!(
-                "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{}Accept: text/event-stream\r\n\r\n",
-                self.auth_header()
-            )
-            .as_bytes(),
-        )?;
+        w.write_all(stream_head(path, &self.auth_header()).as_bytes())?;
         w.flush()?;
         // Consume the response headers; BufReader's leftover buffer holds any
         // body bytes already read, so it continues correctly as the body.
@@ -252,6 +251,8 @@ mod tests {
         assert!(head.ends_with("\r\n\r\n"));
         let plain = LibkrunHttp::new(PathBuf::from("/nonexistent"));
         assert!(!request_head("GET", "/x", None, &plain.auth_header()).contains("Authorization"));
+        assert!(stream_head("/api/event", &http.auth_header())
+            .contains("Authorization: Basic b3BlbmNvZGU6cHc=\r\n"));
     }
 
     #[test]

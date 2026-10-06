@@ -65,6 +65,9 @@ fixtures `src/events/fixtures/opencode-2.0.24-{tool-turn,failed-turn}.sse`.
 ### Event mapping (`src/events/opencode.rs`)
 
 Each model step is its own assistant message (`assistantMessageID`).
+Only the driven session's `session.*` events map: the first `sessionID` on the
+stream (pillbox creates one session per fresh server), so a `task` subagent's
+child session can't end the parent's turn. `permission.*`/`form.*` are not filtered.
 
 | OpenCode 2 event | §0 |
 |---|---|

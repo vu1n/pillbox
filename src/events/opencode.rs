@@ -32,6 +32,13 @@
 //! - `permission.asked` → `Permission`; `form.created` (a question for the
 //!   user) → `NeedsInput`.
 //!
+//! Only the driven session's `session.*` events map. Pillbox starts a fresh
+//! server per run and creates exactly one session before any prompt, so the
+//! first `sessionID` on the stream (its `session.created`) is that session; a
+//! child session (a `task` subagent) gets its own id and is skipped, so its
+//! `execution.succeeded` can't end the parent's turn early. `permission.*` and
+//! `form.*` are not filtered: a child blocked on the user still blocks the turn.
+//!
 //! Everything else (`session.inbox.*`, `session.instructions.updated`,
 //! `session.step.started`/`.streamed`, `session.tool.input.delta`/`.progress`,
 //! `session.usage.updated` running totals, `shell.*`, `server.*`) is ignored.
@@ -62,6 +69,8 @@ pub(crate) struct EventMapper {
     tool_names: HashMap<String, String>,
     /// Tool call id → input (from `session.tool.called`), echoed on the result.
     tool_inputs: HashMap<String, Value>,
+    /// The driven session: the first `sessionID` seen on a `session.*` event.
+    session_id: Option<String>,
 }
 
 impl EventMapper {
@@ -74,6 +83,9 @@ impl EventMapper {
     pub(crate) fn on_event(&mut self, ev: &Value) -> Vec<Payload> {
         let ty = ev.get("type").and_then(Value::as_str).unwrap_or_default();
         let d = ev.get("data").unwrap_or(&Value::Null);
+        if ty.starts_with("session.") && !self.is_driven_session(str_of(d, "sessionID")) {
+            return vec![];
+        }
 
         match ty {
             "session.text.started" => self.open(msg_id(d)).into_iter().collect(),
@@ -125,6 +137,15 @@ impl EventMapper {
             "form.created" => vec![attention(AttentionReason::NeedsInput, String::new())],
             _ => vec![],
         }
+    }
+
+    /// Whether `id` is the driven session, adopting the first one seen. An event
+    /// without a session id is not attributable to another session, so it maps.
+    fn is_driven_session(&mut self, id: &str) -> bool {
+        if id.is_empty() {
+            return true;
+        }
+        self.session_id.get_or_insert_with(|| id.to_string()) == id
     }
 
     /// Open `id` as an assistant message (once). An empty id opens nothing.
@@ -215,6 +236,9 @@ impl EventMapper {
             .collect();
         self.text_streamed.clear();
         self.reasoning_streamed.clear();
+        // A failed or interrupted turn can leave calls that never finished.
+        self.tool_names.clear();
+        self.tool_inputs.clear();
         out.push(attention(reason, message));
         out
     }
@@ -581,6 +605,79 @@ mod tests {
             json!({"sessionID": "s", "assistantMessageID": "msg_1"}),
         ));
         assert!(matches!(&end[..], [Payload::MessageEnd(_)]));
+    }
+
+    #[test]
+    fn reasoning_ended_supplies_text_only_without_deltas() {
+        let mut m = EventMapper::new();
+        let block = json!({"sessionID": "s", "assistantMessageID": "msg_1", "ordinal": 0});
+        let mut streamed = block.clone();
+        streamed["delta"] = json!("step");
+        assert!(
+            matches!(&m.on_event(&ev("session.reasoning.delta", streamed))[..],
+            [Payload::Thinking(t)] if t.text == "step")
+        );
+        let mut ended = block.clone();
+        ended["text"] = json!("step");
+        assert!(m.on_event(&ev("session.reasoning.ended", ended)).is_empty());
+
+        let mut whole = block;
+        whole["ordinal"] = json!(1);
+        whole["text"] = json!("whole");
+        assert!(
+            matches!(&m.on_event(&ev("session.reasoning.ended", whole))[..],
+            [Payload::Thinking(t)] if t.text == "whole")
+        );
+    }
+
+    #[test]
+    fn turn_end_closes_messages_left_open() {
+        let mut m = EventMapper::new();
+        m.on_event(&ev(
+            "session.text.delta",
+            json!({"sessionID": "s", "assistantMessageID": "msg_1", "ordinal": 0, "delta": "hi"}),
+        ));
+        let out = m.on_event(&ev(
+            "session.execution.failed",
+            json!({"sessionID": "s", "error": {"type": "provider.error", "message": "boom"}}),
+        ));
+        assert!(matches!(&out[..],
+            [Payload::MessageEnd(e), Payload::AttentionRequired(a)]
+                if e.message_id == "msg_1" && a.reason == AttentionReason::ErrorStalled));
+    }
+
+    #[test]
+    fn step_usage_maps_cache_reads_and_writes() {
+        let mut m = EventMapper::new();
+        let out = m.on_event(&ev(
+            "session.step.ended",
+            json!({"sessionID": "s", "assistantMessageID": "msg_1", "cost": 0.5,
+                "tokens": {"input": 10, "output": 5, "reasoning": 0,
+                    "cache": {"read": 7, "write": 3}}}),
+        ));
+        assert!(matches!(&out[..],
+            [Payload::Usage(u)] if u.input_tokens == Some(10) && u.output_tokens == Some(5)
+                && u.cache_read_input_tokens == Some(7)
+                && u.cache_creation_input_tokens == Some(3)
+                && u.cost_usd == Some(0.5)));
+    }
+
+    #[test]
+    fn a_child_sessions_events_are_skipped() {
+        let mut m = EventMapper::new();
+        m.on_event(&ev("session.created", json!({"sessionID": "parent"})));
+        let child = |ty: &str| {
+            ev(
+                ty,
+                json!({"sessionID": "child", "assistantMessageID": "msg_c",
+            "ordinal": 0, "delta": "sub"}),
+            )
+        };
+        assert!(m.on_event(&child("session.text.delta")).is_empty());
+        assert!(m.on_event(&child("session.execution.succeeded")).is_empty());
+        assert!(matches!(&m.on_event(&ev("session.execution.succeeded",
+            json!({"sessionID": "parent"})))[..],
+            [Payload::AttentionRequired(a)] if a.reason == AttentionReason::NeedsInput));
     }
 
     #[test]

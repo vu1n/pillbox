@@ -228,9 +228,12 @@ impl CumulativeUsage {
         cache_write_reported: bool,
     ) -> crate::events::otel::genai::GenAiUsage {
         crate::events::otel::genai::GenAiUsage {
-            // Codex's input counter is inclusive of cache hits. Keep the
-            // canonical contract's input field billable/non-cached.
-            input_tokens: Some(self.non_cached_input()),
+            // Codex's input counter is inclusive of cache hits and writes. Keep
+            // the canonical contract's input field billable/non-cached.
+            input_tokens: Some(
+                self.non_cached_input()
+                    .saturating_sub(self.cache_write_input_tokens.unwrap_or(0)),
+            ),
             output_tokens: Some(self.output_tokens),
             cache_read_input_tokens: Some(self.cached_input_tokens),
             cache_creation_input_tokens: cache_write_reported
@@ -840,7 +843,7 @@ mod tests {
             15,
         )
         .expect("first usage");
-        assert_eq!(first.input_tokens, Some(200));
+        assert_eq!(first.input_tokens, Some(196)); // 1000 - 800 read - 4 written
         assert_eq!(first.cache_read_input_tokens, Some(800));
         assert_eq!(first.cache_creation_input_tokens, Some(4));
         assert_eq!(first.output_tokens, Some(10));
@@ -857,7 +860,7 @@ mod tests {
             21,
         )
         .expect("changed usage");
-        assert_eq!(second.input_tokens, Some(50));
+        assert_eq!(second.input_tokens, Some(47)); // 250 - 200 read - 3 written
         assert_eq!(second.cache_read_input_tokens, Some(200));
         assert_eq!(second.cache_creation_input_tokens, Some(3));
         assert_eq!(second.output_tokens, Some(4));
@@ -1063,7 +1066,9 @@ mod tests {
         let sum = |f: fn(&crate::events::otel::genai::GenAiUsage) -> Option<u64>| {
             usage.iter().map(|u| f(u).unwrap_or(0)).sum::<u64>()
         };
-        assert_eq!(sum(|u| u.input_tokens), 410 - 160);
+        // Codex's input count includes cache reads and writes (its own
+        // `ResponseCompletedUsage` test: input 100 = 40 cached + 60 written).
+        assert_eq!(sum(|u| u.input_tokens), 410 - 160 - 40);
         assert_eq!(sum(|u| u.cache_read_input_tokens), 160);
         assert_eq!(sum(|u| u.cache_creation_input_tokens), 40);
         assert_eq!(sum(|u| u.output_tokens), 80);

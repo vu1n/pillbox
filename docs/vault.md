@@ -99,6 +99,7 @@ The CA persists across runs — sandboxes share the trust root.
 | Surface | Status |
 |---|---|
 | `claude` agent, OAuth tokens (`claudeAiOauth` block) | ✅ |
+| `claude-stream` agent (libkrun structured one-shot, shares `claude`'s auth home) | ✅ Same env-fork as the PTY `claude`: stubbed `claudeAiOauth` in the guest, swap in the supervised VMM child |
 | `api.anthropic.com` request bodies / headers | ✅ Stub → real swap |
 | `console.anthropic.com/oauth/token`, `platform.claude.com/**/oauth/token` | ⛔ Guest request rejected locally; broker rotates host-side |
 | `codex` agent, ChatGPT-mode OAuth tokens (`tokens` block) | ✅ (v0.5) |

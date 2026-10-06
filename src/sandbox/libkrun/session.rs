@@ -545,10 +545,133 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
     // boot (claude); operates on host paths, like the docker path.
     spec.prepare_workspace_or_warn(&home, &guest_workspace);
 
-    // Env fork: CoW the auth home and stub its OAuth tokens (after the seed so the
-    // clone inherits it). The guest mounts the *stubbed* creds — the real tokens
-    // never enter the VM; the MITM swaps stub→real on the wire. The reals reach the
-    // child out-of-band on stdin (not env/argv/VmSpec).
+    // Env fork (after the seed above so the clone inherits it): stubbed creds
+    // clone + the stub→real swaps + the JIT refresh context.
+    let EnvFork {
+        creds_share,
+        swap_pairs,
+        with_hosts,
+        refresh,
+    } = env_fork_creds(spec, &home, with_vault, |creds_share| {
+        match spec.libkrun_pty {
+            Some(profile) => profile.prepare_cloned_home(creds_share, &guest_workspace),
+            None => Ok(()),
+        }
+    })?;
+
+    // The guest boot script: env exports, NIC + CA + workspace mount, then exec
+    // the agent under the in-guest pty-host (Frame over vsock). Written into the
+    // creds share and exec'd by the static cmdline bootstrap — the prompt in the
+    // agent argv (and any env value) may carry newlines/unicode the cmdline can't
+    // (see [`boot::boot_channel`]). Quote every interpolated path and argv element.
+    let agent_argv: Vec<String> = spec
+        .run_argv
+        .iter()
+        .map(|s| s.to_string())
+        .chain(spec.sandbox_args.iter().map(|s| s.to_string()))
+        .chain(opts.args.iter().cloned())
+        .collect();
+    let agent = agent_argv
+        .iter()
+        .map(|a| shell_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let preamble = guest_launch_preamble(&ca.cert_pem, &guest_workspace);
+    // Detach: the guest pty-host *listens* (so the attach socket persists for
+    // reattach after the parent returns); foreground: it dials the parent.
+    let vsock_flag = if opts.detach { " --vsock-listen" } else { "" };
+    let exports = boot::env_exports(&guest_env)?;
+    let boot_script = format!(
+        "{exports}{preamble}; \
+         exec pillbox pty-host --vsock-port {ATTACH_PORT}{vsock_flag} -- {agent}",
+    );
+
+    ensure_env_fork_sealed(&swap_pairs, &guest_env, &boot_script)?;
+    let (boot_share, boot_exec) = boot::boot_channel(
+        &creds_share,
+        "creds",
+        GUEST_HOME,
+        boot::MountedShareOwnership::GuestRootClone,
+        &boot_script,
+    )?;
+
+    let attach_sock =
+        krun_cache_dir()?.join(format!("attach-{}.sock", uuid::Uuid::now_v7().simple()));
+    let _ = std::fs::remove_file(&attach_sock);
+
+    let vmspec = VmSpec {
+        ownership: None,
+        rootfs: rootfs.to_string_lossy().into_owned(),
+        vcpus: 2,
+        ram_mib: 2048,
+        shares: vec![
+            boot_share,
+            Share {
+                tag: "workspace".into(),
+                host_path: clone.to_string_lossy().into_owned(),
+            },
+        ],
+        exec: boot_exec,
+        vsock: Some(VsockAttach {
+            port: ATTACH_PORT,
+            host_sock: attach_sock.to_string_lossy().into_owned(),
+            listen: opts.detach,
+        }),
+        egress: Some(EgressSpec {
+            allowlist: vault_egress_allowlist(opts, &with_hosts),
+            log_path: std::env::var("PILLBOX_KRUN_EGRESS_LOG").ok(),
+            ca_dir: Some(ca.dir.to_string_lossy().into_owned()),
+            local_forward_port: None, // vaulted agents: no local-model forward
+            refresh,
+        }),
+    };
+    let spec_file = tempfile::Builder::new()
+        .prefix("pillbox-krun-spec-")
+        .suffix(".json")
+        .tempfile()
+        .context("create VMM spec tempfile")?;
+    serde_json::to_writer(&spec_file, &vmspec).context("write VMM spec")?;
+
+    Ok(Launch {
+        rootfs,
+        spec_file,
+        attach_sock,
+        swap_pairs,
+        creds_share,
+        workspace_clone: clone,
+        guest_workspace,
+        _ca: ca,
+    })
+}
+
+/// A vault-capable agent's credentials after the env-fork: the stubbed home
+/// clone the guest mounts, the stub→real swaps for the in-VMM MITM (fed on the
+/// child's stdin, never the guest), the vaulted `--with` hosts for the egress
+/// allowlist, and the broker JIT refresh context.
+struct EnvFork {
+    creds_share: PathBuf,
+    swap_pairs: Vec<SwapPair>,
+    with_hosts: Vec<String>,
+    refresh: Option<RefreshSpec>,
+}
+
+/// The env-fork shared by every libkrun launch of a vault-capable agent (the
+/// PTY [`prepare_launch`] and the structured [`run_structured`]): CoW the auth
+/// home and stub its OAuth tokens so the guest never holds the real credential,
+/// fail closed when the stubbing can't be host-bound or produced nothing, and
+/// fold the vaulted `--with` swaps in. `prepare_clone` runs on the stubbed clone
+/// before the fail-closed guard (PTY agents' clone preparation).
+fn env_fork_creds(
+    spec: &AgentSpec,
+    home: &Path,
+    with_vault: Vec<WithSwap>,
+    prepare_clone: impl FnOnce(&Path) -> Result<()>,
+) -> Result<EnvFork> {
+    // Context: doc://pillbox/libkrun-env-fork-substrate@0001#libkrun-env-fork-substrate — the guest mounts stubs; the real credential reaches only the VMM child's MITM.
+    // Env fork: CoW the auth home and stub its OAuth tokens. The guest mounts the
+    // *stubbed* creds — the real tokens never enter the VM; the MITM swaps
+    // stub→real on the wire. The reals reach the child out-of-band on stdin (not
+    // env/argv/VmSpec).
     // OAuth tokens are bound to ONLY the agent's own provider hosts (its API +
     // OAuth/refresh endpoints), never the full cross-provider intercepted_hosts()
     // union — so a leaked OAuth stub can't be replayed to a *different* provider's
@@ -583,17 +706,15 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
         crate::vault::pre_refresh(&home.join(spec.cred_sentinel), spec.auth_id)?;
     }
 
-    let (creds_share, mut swap_pairs, access_stub) = stub_oauth_creds(&home, spec, &oauth_hosts)?;
-    if let Some(profile) = spec.libkrun_pty {
-        profile.prepare_cloned_home(&creds_share, &guest_workspace)?;
-    }
+    let (creds_share, mut swap_pairs, access_stub) = stub_oauth_creds(home, spec, &oauth_hosts)?;
+    prepare_clone(&creds_share)?;
     // Fail loud: a vault-capable agent whose credentials file produced no stubs
     // would mount the real token into the guest unstubbed (exfiltratable by a
     // prompt-injected agent). Refuse to launch rather than leak. Generalizing the
     // stubber to that agent's credential shape is the fix; until then this guard
     // keeps an unhandled shape safe. (Checked before the `--with` swaps are folded
     // in below, so their pairs can't mask an empty OAuth set.)
-    if env_fork_left_real_unstubbed(spec, &home, &swap_pairs) {
+    if env_fork_left_real_unstubbed(spec, home, &swap_pairs) {
         bail!(
             "libkrun env-fork: agent `{}` is vault-capable and has credentials at `{}`, but \
              the env-fork produced no credential stubs — its credential shape isn't handled \
@@ -625,43 +746,29 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
         access_stub: stub,
     });
 
-    // The guest boot script: env exports, NIC + CA + workspace mount, then exec
-    // the agent under the in-guest pty-host (Frame over vsock). Written into the
-    // creds share and exec'd by the static cmdline bootstrap — the prompt in the
-    // agent argv (and any env value) may carry newlines/unicode the cmdline can't
-    // (see [`boot::boot_channel`]). Quote every interpolated path and argv element.
-    let agent_argv: Vec<String> = spec
-        .run_argv
-        .iter()
-        .map(|s| s.to_string())
-        .chain(spec.sandbox_args.iter().map(|s| s.to_string()))
-        .chain(opts.args.iter().cloned())
-        .collect();
-    let agent = agent_argv
-        .iter()
-        .map(|a| shell_quote(a))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let preamble = guest_launch_preamble(&ca.cert_pem, &guest_workspace);
-    // Detach: the guest pty-host *listens* (so the attach socket persists for
-    // reattach after the parent returns); foreground: it dials the parent.
-    let vsock_flag = if opts.detach { " --vsock-listen" } else { "" };
-    let exports = boot::env_exports(&guest_env)?;
-    let boot_script = format!(
-        "{exports}{preamble}; \
-         exec pillbox pty-host --vsock-port {ATTACH_PORT}{vsock_flag} -- {agent}",
-    );
+    Ok(EnvFork {
+        creds_share,
+        swap_pairs,
+        with_hosts,
+        refresh,
+    })
+}
 
-    // ── env-fork invariant (the security thesis, guarded) ──
-    // Three channels into the VM, and the real credential belongs to exactly one:
-    // non-secret config → the boot script (env exports + argv; a guest- and
-    // host-readable file in the creds share); the real credential → ONLY the
-    // MITM swap, out-of-band on the child's stdin + held in the VMM child's memory.
-    // A real in a guest-readable channel is exfiltratable by a prompt-injected agent
-    // — fail fast rather than silently leak if a future change crosses channels.
-    // Raw env values are scanned pre-quoting (shell-quoting can mangle the needle,
-    // e.g. `'` → `'\''`); the rendered script catches argv/path interpolations.
-    for pair in &swap_pairs {
+/// ── env-fork invariant (the security thesis, guarded) ──
+/// Three channels into the VM, and the real credential belongs to exactly one:
+/// non-secret config → the boot script (env exports + argv; a guest- and
+/// host-readable file in the creds share); the real credential → ONLY the MITM
+/// swap, out-of-band on the child's stdin + held in the VMM child's memory. A
+/// real in a guest-readable channel is exfiltratable by a prompt-injected agent
+/// — fail fast rather than silently leak if a future change crosses channels.
+/// Raw env values are scanned pre-quoting (shell-quoting can mangle the needle,
+/// e.g. `'` → `'\''`); the rendered script catches argv/path interpolations.
+fn ensure_env_fork_sealed(
+    swap_pairs: &[SwapPair],
+    guest_env: &[(String, String)],
+    boot_script: &str,
+) -> Result<()> {
+    for pair in swap_pairs {
         if guest_env.iter().any(|(_, v)| v.contains(&pair.real)) || boot_script.contains(&pair.real)
         {
             bail!(
@@ -670,69 +777,20 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
             );
         }
     }
-    let (boot_share, boot_exec) = boot::boot_channel(
-        &creds_share,
-        "creds",
-        GUEST_HOME,
-        boot::MountedShareOwnership::GuestRootClone,
-        &boot_script,
-    )?;
+    Ok(())
+}
 
-    let attach_sock =
-        krun_cache_dir()?.join(format!("attach-{}.sock", uuid::Uuid::now_v7().simple()));
-    let _ = std::fs::remove_file(&attach_sock);
-
-    let vmspec = VmSpec {
-        ownership: None,
-        rootfs: rootfs.to_string_lossy().into_owned(),
-        vcpus: 2,
-        ram_mib: 2048,
-        shares: vec![
-            boot_share,
-            Share {
-                tag: "workspace".into(),
-                host_path: clone.to_string_lossy().into_owned(),
-            },
-        ],
-        exec: boot_exec,
-        vsock: Some(VsockAttach {
-            port: ATTACH_PORT,
-            host_sock: attach_sock.to_string_lossy().into_owned(),
-            listen: opts.detach,
-        }),
-        egress: Some(EgressSpec {
-            // The vault providers' full intercept set (API + OAuth/platform hosts;
-            // token endpoints remain intercepted for local rejection) plus
-            // any invoker-declared `--egress-allow` hosts (forwarded, no swap).
-            allowlist: crate::vault::providers::intercepted_hosts()
-                .into_iter()
-                .map(str::to_string)
-                .chain(opts.egress_allow.iter().cloned())
-                .chain(with_hosts.iter().cloned()) // vaulted --with hosts (the swap's destination)
-                .collect(),
-            log_path: std::env::var("PILLBOX_KRUN_EGRESS_LOG").ok(),
-            ca_dir: Some(ca.dir.to_string_lossy().into_owned()),
-            local_forward_port: None, // vaulted agents: no local-model forward
-            refresh,
-        }),
-    };
-    let spec_file = tempfile::Builder::new()
-        .prefix("pillbox-krun-spec-")
-        .suffix(".json")
-        .tempfile()
-        .context("create VMM spec tempfile")?;
-    serde_json::to_writer(&spec_file, &vmspec).context("write VMM spec")?;
-
-    Ok(Launch {
-        rootfs,
-        spec_file,
-        attach_sock,
-        swap_pairs,
-        creds_share,
-        workspace_clone: clone,
-        guest_workspace,
-        _ca: ca,
-    })
+/// Egress allowlist for an env-forked (vault) launch: the vault providers' full
+/// intercept set (API + OAuth/platform hosts; token endpoints remain intercepted
+/// for local rejection), any invoker-declared `--egress-allow` hosts (forwarded,
+/// no swap), and the vaulted `--with` hosts (the swap's destination).
+fn vault_egress_allowlist(opts: &RunOpts, with_hosts: &[String]) -> Vec<String> {
+    crate::vault::providers::intercepted_hosts()
+        .into_iter()
+        .map(str::to_string)
+        .chain(opts.egress_allow.iter().cloned())
+        .chain(with_hosts.iter().cloned())
+        .collect()
 }
 
 fn commit_detached_session(
@@ -1220,8 +1278,11 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
         )
         .into());
     }
+    // A vault-capable structured agent (claude-stream) always runs env-forked
+    // below, like the PTY path (`--vault` is a no-op there too); the others
+    // (pi, cursor) mount their own key and refuse the vault outright.
     let withs = resolve_with_entries(resolved, &opts.withs)?;
-    if opts.vault || withs.iter().any(|entry| entry.meta.is_some()) {
+    if !spec.vault_capable && (opts.vault || withs.iter().any(|entry| entry.meta.is_some())) {
         return Err(PillboxError::usage(
             "run",
             format!(
@@ -1262,9 +1323,35 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
         guest_workspace,
         guest_env,
         ca,
-        with_vault: _,
+        with_vault,
     } = launch_base(spec, &opts, resolved, CaLifetime::Ephemeral)?;
-    let creds_share = cow_clone_home(&home)?;
+    // Credentials. A vault-capable agent takes the PTY path's env-fork: the
+    // guest mounts stubbed OAuth tokens and the supervised VMM child's MITM swaps
+    // stub→real (reals on its stdin only). Non-vault agents (pi, cursor) mount
+    // their own key as-is — `with_vault` is empty for them (refused above).
+    let (creds_share, swap_pairs, allowlist, refresh) = if spec.vault_capable {
+        let EnvFork {
+            creds_share,
+            swap_pairs,
+            with_hosts,
+            refresh,
+        } = env_fork_creds(spec, &home, with_vault, |_| Ok(()))?;
+        // Same egress posture as the PTY agent sharing this auth home.
+        let allowlist = vault_egress_allowlist(&opts, &with_hosts);
+        (creds_share, swap_pairs, allowlist, refresh)
+    } else {
+        let allowlist = crate::vault::providers::intercepted_hosts()
+            .into_iter()
+            .map(str::to_string)
+            .chain(
+                egress::standard_egress_hosts()
+                    .iter()
+                    .map(|host| (*host).to_string()),
+            )
+            .chain(opts.egress_allow.iter().cloned())
+            .collect();
+        (cow_clone_home(&home)?, Vec::new(), allowlist, None)
+    };
     let argv = structured_io::run_argv(spec.id, requested.clone(), &prompt)?
         .iter()
         .map(|arg| shell_quote(arg))
@@ -1275,12 +1362,14 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
     let events_q = shell_quote(&events_guest);
     let preamble = guest_launch_preamble(&ca.cert_pem, &guest_workspace);
     let exports = boot::env_exports(&guest_env)?;
+    let boot_script = format!("{exports}{preamble}; exec {argv} > {events_q}");
+    ensure_env_fork_sealed(&swap_pairs, &guest_env, &boot_script)?;
     let (boot_share, boot_exec) = boot::boot_channel(
         &creds_share,
         "creds",
         GUEST_HOME,
         boot::MountedShareOwnership::GuestRootClone,
-        &format!("{exports}{preamble}; exec {argv} > {events_q}"),
+        &boot_script,
     )?;
     let vmspec = VmSpec {
         ownership: None,
@@ -1297,20 +1386,11 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
         exec: boot_exec,
         vsock: None,
         egress: Some(EgressSpec {
-            allowlist: crate::vault::providers::intercepted_hosts()
-                .into_iter()
-                .map(str::to_string)
-                .chain(
-                    egress::standard_egress_hosts()
-                        .iter()
-                        .map(|host| (*host).to_string()),
-                )
-                .chain(opts.egress_allow.iter().cloned())
-                .collect(),
+            allowlist,
             log_path: std::env::var("PILLBOX_KRUN_EGRESS_LOG").ok(),
             ca_dir: Some(ca.dir.to_string_lossy().into_owned()),
             local_forward_port: None,
-            refresh: None,
+            refresh,
         }),
     };
     let spec_file = tempfile::Builder::new()
@@ -1370,8 +1450,12 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
             .env_clear()
             .envs(boot::static_child_env());
         rootfs.preserve();
-        let output = super::repository::run_supervised_vmm(&mut cmd, vmspec, &spec_path)
-            .context("run supervised structured libkrun VMM")?;
+        // The real credentials reach the child's MITM only here, on its stdin
+        // (an empty set for non-vault agents).
+        let swap_blob = serde_json::to_vec(&swap_pairs).context("encode structured swap set")?;
+        let output =
+            super::repository::run_supervised_vmm(&mut cmd, vmspec, &spec_path, &swap_blob)
+                .context("run supervised structured libkrun VMM")?;
         rootfs.remove_stopped()?;
         let diagnostic = structured_vmm_diagnostic(&output.stderr);
         Ok((output.status, diagnostic))
@@ -1522,7 +1606,7 @@ fn resolve_structured_request(
                     .into());
                 }
                 Ok(Some(crate::contract::RequestedRunProfile {
-                    provider: spec.id.into(),
+                    provider: spec.auth_id.into(),
                     model: model.to_string(),
                     profile: opts.profile.clone(),
                     reasoning_effort: opts.reasoning_effort,

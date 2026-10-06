@@ -96,7 +96,7 @@ enum Command {
         /// Display name for the pillbox. Defaults to the cwd's basename.
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
-        /// Default agent for `pillbox run` (`claude` | `codex` | `opencode` | `pi` | `cursor`).
+        /// Default agent for `pillbox run` (`claude` | `claude-stream` | `codex` | `codex-serve` | `opencode` | `pi` | `cursor`).
         #[arg(long, value_name = "AGENT")]
         agent: Option<String>,
         /// Default model for `pillbox run` (`provider/model`). Written to `pillbox.toml`.
@@ -157,7 +157,7 @@ enum Command {
     },
     /// Launch an agent against the current pillbox.
     Run {
-        /// Agent to launch (`claude` | `codex` | `opencode` | `pi` | `cursor`). Defaults to the current
+        /// Agent to launch (`claude` | `claude-stream` | `codex` | `codex-serve` | `opencode` | `pi` | `cursor`). Defaults to the current
         /// pillbox's `agent =` field, or `claude` if unset.
         #[arg(long, value_name = "AGENT")]
         agent: Option<String>,

@@ -48,7 +48,7 @@ pub(crate) type McpInjectFn = fn(&[McpAttachment]) -> Result<McpInjection>;
 /// How pillbox talks to an agent. Most agents are a TUI we wrap in a PTY and
 /// observe by scraping their transcript file ([`Integration::Pty`]); a few
 /// (opencode) run as a headless server with a structured event stream + a
-/// prompt API ([`Integration::Server`]); pi and cursor run as one-shot
+/// prompt API ([`Integration::Server`]); pi, cursor and claude-stream run as one-shot
 /// structured JSON streams ([`Integration::Structured`]). Neither structured
 /// path uses a PTY.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -56,7 +56,8 @@ pub(crate) enum Integration {
     /// PTY + transcript-file scrape (claude, codex).
     Pty,
     /// Headless one-shot process + structured stdout (pi `--mode json`,
-    /// cursor `agent -p --output-format stream-json`).
+    /// cursor `agent -p --output-format stream-json`, claude-stream `claude -p
+    /// --output-format stream-json`).
     Structured,
     /// Headless HTTP server + SSE event stream + prompt API (opencode).
     Server,
@@ -275,6 +276,52 @@ pub const CLAUDE: AgentSpec = AgentSpec {
     libkrun_pty: None,
 };
 
+/// Claude Code as a headless structured one-shot (`claude -p --output-format
+/// stream-json`) — an [`Integration::Structured`] sibling of [`CLAUDE`], the way
+/// [`CODEX_SERVE`] is a structured sibling of [`CODEX`]. Opt-in via `--agent
+/// claude-stream`; the interactive PTY `claude` stays the default and is
+/// untouched. A separate id (not a flag on `claude`) because the integration
+/// kind is per-spec: it routes the run, the backend capability check (docker
+/// rejects Structured), and the events-file/model policy, and a sibling keeps
+/// each spec's contract fixed.
+///
+/// Shares `claude`'s auth home ([`auth_id`](AgentSpec::auth_id) `= "claude"`),
+/// so one `pillbox auth login --agent claude` covers both. **Vault-capable**:
+/// on libkrun the structured launch reuses the PTY path's env-fork — the guest
+/// mounts a cloned home whose OAuth tokens are stubs, and the in-VMM MITM swaps
+/// stub→real on the wire (`sandbox::libkrun::session::env_fork_creds`). The
+/// guest runs as root, so the argv takes `sandbox_args` (`--permission-mode
+/// auto`) — see [`harness::ClaudeAdapter::guest_root_argv`]. libkrun-only.
+pub const CLAUDE_STREAM: AgentSpec = AgentSpec {
+    id: "claude-stream",
+    auth_id: "claude",
+    integration: Integration::Structured,
+    cred_sentinel: ".claude/.credentials.json",
+    // Shares claude's auth home; a direct `auth login --agent claude-stream`
+    // runs claude's flow and writes the same shared home.
+    login_argv: &["claude", "auth", "login", "--claudeai"],
+    run_argv: &["claude"],
+    oauth_port: Some(54545),
+    post_login_finalize: Some(finalize_claude_onboarding),
+    vault_capable: true,
+    // The structured one-shot rejects `--mcp` (no config injection yet).
+    mcp_inject: None,
+    // Same permission posture as the PTY `claude` (root refuses bypass).
+    sandbox_args: CLAUDE.sandbox_args,
+    // `-p` skips the workspace trust dialog and onboarding.
+    prepare_workspace: None,
+    server: None,
+    structured: Some(StructuredProfile {
+        events_file: ".pillbox-claude-events.jsonl",
+        // Bare alias or full name (`sonnet`, `claude-…`); `provider/model`
+        // forwards only the model half.
+        model: StructuredModelPolicy::OptionalBare,
+        alt_auth_env: None,
+    }),
+    #[cfg(feature = "libkrun")]
+    libkrun_pty: None,
+};
+
 pub const CODEX: AgentSpec = AgentSpec {
     id: "codex",
     auth_id: "codex",
@@ -440,7 +487,15 @@ pub const PI: AgentSpec = AgentSpec {
     libkrun_pty: None,
 };
 
-pub const ALL: &[&AgentSpec] = &[&CLAUDE, &CODEX, &CODEX_SERVE, &OPENCODE, &PI, &CURSOR];
+pub const ALL: &[&AgentSpec] = &[
+    &CLAUDE,
+    &CLAUDE_STREAM,
+    &CODEX,
+    &CODEX_SERVE,
+    &OPENCODE,
+    &PI,
+    &CURSOR,
+];
 
 /// Look up an agent spec by id, or return a usage error listing the
 /// known ids. Centralized so every CLI surface that takes an
@@ -1364,5 +1419,23 @@ mod tests {
             DetachedTranscriptSource::from_token("transcript:unknown"),
             None
         );
+    }
+
+    /// `claude-stream` is the structured sibling of the PTY `claude`: same
+    /// credential store and vault posture, same root-safe permission args.
+    #[test]
+    fn claude_stream_shares_claude_auth_and_vault_posture() {
+        assert_eq!(
+            lookup("run", "claude-stream").unwrap().id(),
+            "claude-stream"
+        );
+        assert_eq!(CLAUDE_STREAM.auth_id, CLAUDE.id);
+        assert!(!CLAUDE_STREAM.owns_auth_home());
+        assert_eq!(CLAUDE_STREAM.cred_sentinel, CLAUDE.cred_sentinel);
+        assert_eq!(CLAUDE_STREAM.integration, Integration::Structured);
+        assert!(CLAUDE_STREAM.structured.is_some() && CLAUDE_STREAM.server.is_none());
+        const { assert!(CLAUDE_STREAM.vault_capable && CLAUDE.vault_capable) };
+        assert_eq!(CLAUDE_STREAM.sandbox_args, ["--permission-mode", "auto"]);
+        assert_eq!(CLAUDE.integration, Integration::Pty);
     }
 }

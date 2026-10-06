@@ -938,10 +938,13 @@ pub(super) fn stop_spawned_vmm(child: Child) -> Result<ExitStatus> {
 /// Structured one-shot runs are owned until exit, including when the CLI is SIGKILLed.
 /// The child arms its watcher before starting guest or egress work; closing this socket
 /// stops its group even when no host-side Drop or signal handler can run.
+/// `swap_blob` is the JSON stub→real swap set for the child's MITM — written to
+/// its stdin only after ownership is established (`[]` for a non-vault run).
 pub(super) fn run_supervised_vmm(
     command: &mut Command,
     mut spec: VmSpec,
     spec_path: &Path,
+    swap_blob: &[u8],
 ) -> Result<std::process::Output> {
     let sockets = socket_directory()?;
     let socket = sockets.path().join("owner.sock");
@@ -968,8 +971,8 @@ pub(super) fn run_supervised_vmm(
         )?;
         if let Some(mut stdin) = process.child.stdin.take() {
             stdin
-                .write_all(b"[]")
-                .context("send empty structured swap set")?;
+                .write_all(swap_blob)
+                .context("send structured swap set")?;
         }
         let status = loop {
             process.drain()?;
@@ -2813,7 +2816,7 @@ except RuntimeError:
         let spec_path = directory.join("vm.json");
         if role == "owner" {
             let mut command = supervised_fixture_command("worker", &directory);
-            run_supervised_vmm(&mut command, supervised_fixture_spec(), &spec_path).unwrap();
+            run_supervised_vmm(&mut command, supervised_fixture_spec(), &spec_path, b"[]").unwrap();
             panic!("supervisor unexpectedly returned");
         }
         if role == "before-handshake" {
@@ -2862,6 +2865,7 @@ except RuntimeError:
                 &mut command,
                 supervised_fixture_spec(),
                 &directory.path().join("vm.json"),
+                b"[]",
             );
             if role == "complete" {
                 let output = result.unwrap();

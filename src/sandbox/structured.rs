@@ -1,5 +1,5 @@
 //! Shared one-shot structured-stdout boundary for [`crate::agents::Integration::Structured`]
-//! agents (pi, cursor).
+//! agents (pi, cursor, claude-stream).
 //!
 //! Each harness owns its JSON wire format; Pillbox maps it immediately into the
 //! shared durable contract. Raw harness events are capture input only — never
@@ -9,7 +9,7 @@ use std::io::{BufRead as _, Read};
 
 use anyhow::{Context, Result};
 
-use crate::agents::harness::{CursorAdapter, HarnessAdapter, PiAdapter};
+use crate::agents::harness::{ClaudeAdapter, CursorAdapter, HarnessAdapter, PiAdapter};
 use crate::contract::{Actor, Event, Payload, RequestedRunProfile, RunFinished, RunStarted};
 use crate::events::log::SessionLog;
 
@@ -35,6 +35,10 @@ pub(crate) fn run_argv(
             Some(profile) => CursorAdapter::with_request(profile).run_argv(prompt),
             None => CursorAdapter::default().run_argv(prompt),
         },
+        // The libkrun guest runs as root: never the docker adapter's
+        // `--dangerously-skip-permissions` argv (claude refuses it as root).
+        "claude-stream" => ClaudeAdapter::with_request(requested)
+            .guest_root_argv(crate::agents::CLAUDE_STREAM.sandbox_args, prompt),
         other => anyhow::bail!("structured mode is not wired for agent `{other}`"),
     })
 }
@@ -141,6 +145,7 @@ pub(crate) fn append_unavailable_terminal(
 enum Adapter {
     Pi(PiAdapter),
     Cursor(CursorAdapter),
+    Claude(ClaudeAdapter),
 }
 
 impl Adapter {
@@ -156,6 +161,7 @@ impl Adapter {
                 Some(profile) => Self::Cursor(CursorAdapter::with_request(profile)),
                 None => Self::Cursor(CursorAdapter::default()),
             }),
+            "claude-stream" => Ok(Self::Claude(ClaudeAdapter::with_request(requested))),
             other => anyhow::bail!("structured mode is not wired for agent `{other}`"),
         }
     }
@@ -164,6 +170,7 @@ impl Adapter {
         match self {
             Self::Pi(a) => a.parse_line(line),
             Self::Cursor(a) => a.parse_line(line),
+            Self::Claude(a) => a.parse_line(line),
         }
     }
 
@@ -171,6 +178,94 @@ impl Adapter {
         match self {
             Self::Pi(a) => a.terminal_payload(exit_code),
             Self::Cursor(a) => a.terminal_payload(exit_code),
+            Self::Claude(a) => a.terminal_payload(exit_code),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Trimmed from a real `claude -p --output-format stream-json --verbose`
+    /// capture of Claude Code 2.1.289 (the runner pin) against a loopback
+    /// Anthropic-API mock.
+    const CLAUDE_2_1_289_CAPTURE: &str = r#"{"type":"system","subtype":"init","cwd":"/workspace/app","session_id":"a813","model":"claude-mock-1","permissionMode":"auto","apiKeySource":"ANTHROPIC_API_KEY","claude_code_version":"2.1.289"}
+{"type":"assistant","message":{"id":"msg_mock_1","type":"message","role":"assistant","model":"claude-mock-1","content":[{"type":"text","text":"Running it."}]},"parent_tool_use_id":null,"session_id":"a813"}
+{"type":"assistant","message":{"id":"msg_mock_1","type":"message","role":"assistant","model":"claude-mock-1","content":[{"type":"tool_use","id":"toolu_mock_1","name":"Bash","input":{"command":"echo HELLO","description":"say hello"}}]},"parent_tool_use_id":null,"session_id":"a813"}
+{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_mock_1","type":"tool_result","content":"HELLO","is_error":false}]},"parent_tool_use_id":null,"session_id":"a813","tool_use_result":{"stdout":"HELLO","stderr":"","interrupted":false}}
+{"type":"assistant","message":{"id":"msg_mock_2","type":"message","role":"assistant","model":"claude-mock-1","content":[{"type":"text","text":"done"}]},"parent_tool_use_id":null,"session_id":"a813"}
+{"type":"result","subtype":"success","is_error":false,"num_turns":2,"result":"done","total_cost_usd":0.00056,"permission_denials":[],"terminal_reason":"completed","session_id":"a813"}
+"#;
+
+    fn drain(capture: &str, process_exit: i32) -> (DrainOutcome, Vec<Event>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::open_at(dir.path().to_path_buf()).unwrap();
+        append_started("claude-stream", "s1", None, &mut log).unwrap();
+        let outcome = drain_jsonl(
+            "claude-stream",
+            capture.as_bytes(),
+            "s1",
+            None,
+            process_exit,
+            &mut log,
+        )
+        .unwrap();
+        let events = log.read_from(0).unwrap();
+        (outcome, events)
+    }
+
+    #[test]
+    fn claude_stream_argv_is_root_safe() {
+        let argv = run_argv("claude-stream", None, "-x fix it").unwrap();
+        assert!(!argv.iter().any(|a| a == "--dangerously-skip-permissions"));
+        assert!(argv
+            .windows(2)
+            .any(|w| w[0] == "--permission-mode" && w[1] == "auto"));
+        assert_eq!(&argv[argv.len() - 2..], ["--", "-x fix it"]);
+    }
+
+    #[test]
+    fn claude_stream_capture_drains_into_the_session_log() {
+        let (outcome, events) = drain(CLAUDE_2_1_289_CAPTURE, 0);
+        assert_eq!(outcome.exit_code, 0);
+        // The canonical start is the only RunStarted; the harness init is not
+        // a second lifecycle transition.
+        let starts = events
+            .iter()
+            .filter(|e| matches!(e.payload, Payload::RunStarted(_)))
+            .count();
+        assert_eq!(starts, 1);
+        let tools = events
+            .iter()
+            .filter(|e| matches!(e.payload, Payload::ToolCall(_)))
+            .count();
+        assert_eq!(tools, 2);
+        assert!(events
+            .iter()
+            .any(|e| matches!(&e.payload, Payload::RunFinished(r) if r.exit_code == 0)));
+        assert!(matches!(
+            events.last().map(|e| &e.payload),
+            Some(Payload::Custom(c)) if c.name == "usage"
+        ));
+        assert_eq!(outcome.events + 1, events.len());
+    }
+
+    #[test]
+    fn claude_stream_nonzero_exit_fails_and_missing_result_is_closed() {
+        let (outcome, _) = drain(CLAUDE_2_1_289_CAPTURE, 137);
+        assert_eq!(outcome.exit_code, 137);
+        // Killed before the `result` line: the drain still closes the run.
+        let truncated = CLAUDE_2_1_289_CAPTURE
+            .lines()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (outcome, events) = drain(&truncated, 1);
+        assert_eq!(outcome.exit_code, 1);
+        assert!(matches!(
+            events.last().map(|e| &e.payload),
+            Some(Payload::RunFinished(r)) if r.exit_code == 1
+        ));
     }
 }

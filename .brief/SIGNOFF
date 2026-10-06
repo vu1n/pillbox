@@ -288,3 +288,5 @@ libkrun-is-the-backend conforms: After confirmed local libkrun VM stop and reap,
 
 libkrun-is-the-backend conforms: The existing offline libkrun verifier prepares fixed loopback-only localhost mappings in its private clone with no-follow inode, owner and single-link checks; the cached seed, builder path, network attachment and resource bounds are unchanged. Independently reviewed before native qualification.
 docs-governance conforms: The canonical local repository execution guide records private verifier localhost bootstrap alongside the implementation; no active decision or documentation authority changes.
+managed-tier-do-gateway conforms: OpenCode 2 move only changes the local server-agent send (drive_server_prompt passes text to the session bound at bring-up); the managed backend's send, its sealed request and its OpenCode 1.x pin are untouched.
+workspace-ingest-sovereignty conforms: libkrun run_server only changes the opencode guest env (server password, optional model temperature config) and event-capture URL; workspace ingest and the secret denylist are untouched.

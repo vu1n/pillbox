@@ -149,9 +149,10 @@ impl Upstream {
         self.tls.writer().write(buf)
     }
 
-    /// Drive the socket: flush queued ciphertext out, pull any response ciphertext
-    /// in. Returns `false` when the upstream has closed or errored.
-    pub(super) fn pump(&mut self) -> bool {
+    /// Drive the socket: flush queued ciphertext out and, when `read`, pull any
+    /// response ciphertext in (leaving it in the socket backpressures the upstream).
+    /// Returns `false` when the upstream has closed or errored.
+    pub(super) fn pump(&mut self, read: bool) -> bool {
         while self.tls.wants_write() {
             match self.tls.write_tls(&mut self.sock) {
                 Ok(0) => break,
@@ -159,6 +160,9 @@ impl Upstream {
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(_) => return false,
             }
+        }
+        if !read {
+            return true;
         }
         match self.tls.read_tls(&mut self.sock) {
             Ok(0) => return false, // upstream closed

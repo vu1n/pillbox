@@ -140,6 +140,7 @@ pub(crate) trait LiveSession {
     fn spawn_log_tailer(&self, resolved: &Pillbox) -> Result<Option<TailerHandle>>;
 
     /// HTTP handle to a server-mode agent's in-sandbox server. `caps().server_mode`.
+    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     fn http(&self) -> Result<Box<dyn SandboxHttp>>;
 
     /// Host path of this session's (result) workspace.
@@ -215,6 +216,7 @@ pub(crate) fn live_session(session: &Session) -> Result<Box<dyn LiveSession>> {
 /// PTY agent — never re-branching on integration or backend. (The managed backend
 /// overrides `send` entirely: its turn goes to the DO's `/input`, not an HTTP
 /// server the host can reach.)
+#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) fn drive_server_prompt(
     session: &Session,
     http: &dyn SandboxHttp,

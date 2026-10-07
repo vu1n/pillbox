@@ -41,8 +41,8 @@ impl Drop for ContainerGuard {
 }
 
 impl SandboxBackend for DockerBackend {
-    /// The container family: full PTY drive/read + long-lived exec, opencode
-    /// server mode. No KVM-isolation features (real fence, in-sandbox grade,
+    /// The container family: full PTY drive/read + long-lived exec. No server
+    /// mode (server agents are libkrun-only). No KVM-isolation features (real fence, in-sandbox grade,
     /// detached vault); drains §0 live, so no post-hoc ingest. See
     /// docs/substrate-plane.md.
     fn capabilities(&self) -> Caps {
@@ -50,7 +50,8 @@ impl SandboxBackend for DockerBackend {
             repository_execution: false,
             pty_drive: true,
             live_pty_tail: true,
-            server_mode: true,
+            // Server agents (opencode, codex-serve) are libkrun-only.
+            server_mode: false,
             long_lived_exec: true,
             in_sandbox_grading: false,
             real_egress_fence: false,
@@ -75,11 +76,10 @@ impl SandboxBackend for DockerBackend {
             .with_next("unset PILLBOX_BACKEND or set PILLBOX_BACKEND=libkrun")
             .into());
         }
-        // Some server agents (codex-serve) only run on the libkrun backend — their
-        // run path lives in the microVM. Reject on docker rather than mis-routing
-        // through the opencode server path below. Keyed on the capability, not the
-        // id, so a future libkrun-only server agent is covered without a new branch.
-        if spec.server.is_some_and(|p| p.libkrun_only) {
+        // Server agents (opencode, codex-serve) run on the libkrun backend only —
+        // their bring-up lives in the microVM run path. Keyed on the profile, not
+        // the id, so a future server agent is covered without a new branch.
+        if spec.server.is_some() {
             return Err(PillboxError::usage(
                 "run",
                 format!(
@@ -87,14 +87,8 @@ impl SandboxBackend for DockerBackend {
                     spec.id
                 ),
             )
-            .with_next("pillbox run --agent codex   # the docker-capable PTY codex")
+            .with_next("unset PILLBOX_BACKEND or set PILLBOX_BACKEND=libkrun")
             .into());
-        }
-        // Server-integration agents (opencode) run headless + are driven/read
-        // over their HTTP API — a distinct path with no PTY. Keep it off the
-        // PTY path entirely so claude/codex are untouched.
-        if spec.integration == Integration::Server {
-            return run_server(spec, opts, resolved);
         }
         let mut startup = StartupTimer::start();
         let runner_image = docker::check_ready_for(resolved)?;
@@ -437,148 +431,6 @@ impl SandboxBackend for DockerBackend {
     }
 }
 
-/// Run a `Server`-integration agent (opencode) on the local daemon: launch
-/// `opencode serve` headless (no pty-host, no vault — opencode isn't
-/// vault-capable), record a session keyed to the opencode session id, optionally
-/// send an initial prompt, and return. There's no PTY to attach; the user reads
-/// with `session watch`/`subscribe` (which spawn the event bridge) and drives
-/// with `session send`. Always "background server" — `--detach` is implicit.
-fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
-    let action = "run";
-    let mut startup = StartupTimer::start();
-    let runner_image = docker::check_ready_for(resolved)?;
-    startup.mark("docker_preflight");
-
-    let home = spec.home_dir(resolved)?;
-    if !home.join(spec.cred_sentinel).exists() {
-        return Err(PillboxError::runtime(
-            action,
-            format!("no stored credentials for `{}`", spec.id),
-        )
-        .with_next(format!("pillbox auth login --agent {}", spec.id))
-        .into());
-    }
-    startup.mark("auth_check");
-    // opencode has no vault integration (`vault_capable: false`); refuse rather
-    // than silently hand the agent a stub it would ship to the provider.
-    if opts.vault {
-        return Err(PillboxError::usage(
-            action,
-            format!("--vault is not supported for `{}`", spec.id),
-        )
-        .into());
-    }
-    let withs_resolved = resolve_with_entries(resolved, &opts.withs)?;
-    if withs_resolved.iter().any(|w| w.meta.is_some()) {
-        return Err(PillboxError::usage(
-            action,
-            format!("vaulted secrets are not supported for `{}`", spec.id),
-        )
-        .into());
-    }
-
-    let workspace_host = match &opts.workspace {
-        Some(p) => p.clone(),
-        None => std::env::current_dir().context("resolve current working directory")?,
-    };
-    if let Some(name) = opts.from_bookmark.as_deref() {
-        let handle = crate::bookmarks::resolve_existing(resolved, name)?;
-        resolved.workspace()?.pull(&workspace_host, Some(&handle))?;
-    }
-    let workspace_name = workspace_mount_name(&workspace_host, opts.name.as_deref())?;
-    let guest_workspace = format!("{GUEST_WORKSPACE}/{workspace_name}");
-    let env_vars = resolve_run_env(resolved, &opts, &withs_resolved, None)?;
-    startup.mark("workspace_env_prepare");
-
-    // Detached container (no `-d` reap guard — the server outlives the CLI and
-    // is reaped by `session rm`). No pty-host: the command IS `opencode serve`.
-    let mut args = base_docker_args_detached();
-    args.extend([
-        "-v".into(),
-        format!("{}:{GUEST_HOME}", home.display()),
-        "-v".into(),
-        format!("{}:{guest_workspace}", workspace_host.display()),
-        "-w".into(),
-        guest_workspace.clone(),
-    ]);
-    for m in &opts.mounts {
-        args.push("-v".into());
-        args.push(m.clone());
-    }
-    // Secret env by name only (value via the Command env in run_detached) — not
-    // `-e KEY=VALUE` argv, which other local uids can read via `ps`.
-    docker::push_secret_env_flags(&mut args, &env_vars);
-    args.push(runner_image);
-    args.extend(super::opencode::serve_args());
-
-    let container = docker::run_detached(&args, &env_vars)?;
-    startup.mark("container_start");
-    let http = super::http::DockerHttp::new(container.clone(), super::opencode::SERVE_PORT);
-    let model = opts
-        .model
-        .clone()
-        .unwrap_or_else(|| super::opencode::DEFAULT_MODEL.to_string());
-    let prompt = opts.args.join(" ").trim().to_string();
-
-    // Everything after launch can fail; reap the container if it does so a
-    // failed bring-up doesn't leak a server.
-    let built = (|| -> Result<Session> {
-        super::opencode::wait_ready(&http)?;
-        let ocid = super::opencode::create_session(&http, &model)?;
-        startup.mark("server_ready");
-        let session = Session {
-            id: Session::new_id(),
-            label: opts.label.clone(),
-            backend: BACKEND_DOCKER.to_string(),
-            sandbox_id: container.clone(),
-            pty_pid: 0,
-            agent_id: spec.id.to_string(),
-            started_at: session::now_rfc3339(),
-            attached_pid: None,
-            base_snapshot: None,
-            result_snapshot: None,
-            expires_at: opts.ttl_seconds.map(session::expires_at_from_ttl),
-            guest_cwd: guest_workspace.clone(),
-            placement: session::Placement::Local,
-            server: Some(session::ServerSession {
-                agent_session_id: ocid.clone(),
-                model: model.clone(),
-                temperature: opts.temperature,
-            }),
-            requested_execution: Some(opts.requested_profile(&model)?),
-        };
-        session::write(resolved, &session)?;
-        let startup_metrics = startup.finish("session_record");
-        crate::events::emit_session_event(
-            resolved,
-            crate::events::EventType::SessionStarted {
-                parent_session_id: crate::events::parent_session_id_from_env(),
-                startup: Some(startup_metrics),
-            },
-            &session.id,
-            Some(&session),
-        );
-        Ok(session)
-    })();
-    let session = match built {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = docker::rm_force(&container);
-            return Err(e);
-        }
-    };
-
-    // No auto-send: opencode comes up ready (wait_ready), so the first prompt
-    // goes through `session send` like every other — captured by a subscribed
-    // watch instead of streamed to no one at start.
-    super::opencode::print_started(
-        &session,
-        opts.json,
-        (!prompt.is_empty()).then_some(prompt.as_str()),
-    );
-    Ok(())
-}
-
 /// Attach the terminal pump to a running pty-host container by execing the
 /// per-attach relay and pumping over its stdio. `detach_enabled` is false
 /// for a foreground `run` (no session to leave behind, so Ctrl-A passes
@@ -692,12 +544,6 @@ impl super::LiveSession for DockerLiveSession {
     }
 
     fn send(&self, _resolved: &Pillbox, bytes: &[u8]) -> Result<()> {
-        // A server agent's turn is a structured prompt over its HTTP API; a PTY
-        // agent's is raw keystrokes. Both flow through this one `send` so the
-        // command layer never branches on integration.
-        if self.session.integration() == crate::agents::Integration::Server {
-            return super::drive_server_prompt(&self.session, &*self.http()?, bytes);
-        }
         send_input(&self.session.sandbox_id, bytes)
     }
 
@@ -710,35 +556,24 @@ impl super::LiveSession for DockerLiveSession {
         resolved: &Pillbox,
     ) -> Result<Option<crate::events::transcripts::TailerHandle>> {
         let log = crate::events::log::SessionLog::open(resolved, &self.session.id)?;
-        // A server-mode agent (opencode) has no transcript file — bridge its HTTP
-        // `/event` stream into the log; a PTY agent's transcript lands on the
-        // bind-mounted host home, so tail that. Both fill the durable log the
-        // caller then opens to read (it owns the placement swap: file vs DO).
-        let tailer = if self.session.integration() == Integration::Server {
-            let http = self.docker_http()?;
-            super::opencode::spawn_event_bridge(&http, &self.session.id, log)
-        } else {
-            let spec = crate::agents::lookup("session", &self.session.agent_id)?;
-            let home = spec.home_dir(resolved)?;
-            crate::events::transcripts::spawn_attach_tailer(
-                log,
-                &home,
-                &self.session.agent_id,
-                &self.session.guest_cwd,
-                &self.session.id,
-            )
-        };
-        Ok(tailer)
+        // A PTY agent's transcript lands on the bind-mounted host home, so tail
+        // that into the durable log the caller then opens to read (it owns the
+        // placement swap: file vs DO).
+        let spec = crate::agents::lookup("session", &self.session.agent_id)?;
+        let home = spec.home_dir(resolved)?;
+        Ok(crate::events::transcripts::spawn_attach_tailer(
+            log,
+            &home,
+            &self.session.agent_id,
+            &self.session.guest_cwd,
+            &self.session.id,
+        ))
     }
 
     fn http(&self) -> Result<Box<dyn crate::sandbox::http::SandboxHttp>> {
-        // Only a server-mode agent runs an in-sandbox HTTP server to talk to; a
-        // PTY agent has none, so the verb is unsupported rather than handing back
-        // a handle that would `curl` a closed port.
-        if self.session.integration() != Integration::Server {
-            return Err(self.caps().unsupported("http"));
-        }
-        Ok(Box::new(self.docker_http()?))
+        // Docker runs PTY agents only (server agents are libkrun-only), so there
+        // is no in-sandbox HTTP server to talk to.
+        Err(self.caps().unsupported("http"))
     }
 
     fn workspace_path(&self) -> Result<std::path::PathBuf> {
@@ -750,7 +585,7 @@ impl super::LiveSession for DockerLiveSession {
     }
 
     fn ingest(&self, _resolved: &Pillbox) -> Result<usize> {
-        // Docker drains §0 live via the attach tailer / event bridge — there's no
+        // Docker drains §0 live via the attach tailer — there's no
         // headless capture file to drain post-hoc.
         Err(self.caps().unsupported("ingest"))
     }
@@ -763,17 +598,6 @@ impl super::LiveSession for DockerLiveSession {
 impl DockerLiveSession {
     pub(crate) fn new(session: Session) -> Self {
         Self { session }
-    }
-
-    /// The `docker exec curl` HTTP transport to this session's in-container
-    /// server — shared by [`event_source`](Self::event_source) (the opencode
-    /// bridge) and [`http`](Self::http). Mirrors the server bring-up in
-    /// `commands::session` so the dispatch sites converge on one construction.
-    fn docker_http(&self) -> Result<super::http::DockerHttp> {
-        Ok(super::http::DockerHttp::new(
-            self.session.sandbox_id.clone(),
-            super::opencode::SERVE_PORT,
-        ))
     }
 }
 

@@ -70,11 +70,12 @@ impl Integration {
 }
 
 /// The per-agent data a [`Integration::Server`] agent needs, beyond the common
-/// [`AgentSpec`] fields — the §0 capture filename + its wire format, and whether
-/// the agent only runs on the libkrun backend. `Some` iff `integration == Server`.
+/// [`AgentSpec`] fields — the §0 capture filename, its wire format, and the
+/// guest server's auth. `Some` iff `integration == Server`. Every server agent
+/// runs on the libkrun backend only (docker refuses `server.is_some()`).
 /// Carrying these here (rather than re-deriving `if agent_id == "…"` at each
-/// dispatch site) keeps the events-file name, drain-format selection, and
-/// docker-capability as one source of truth.
+/// dispatch site) keeps the events-file name and drain-format selection as one
+/// source of truth.
 #[derive(Clone, Copy)]
 pub(crate) struct ServerProfile {
     /// Capture filename under the agent home (the §0 source the host drains).
@@ -85,8 +86,6 @@ pub(crate) struct ServerProfile {
     /// libkrun §0 read path; dead on a non-libkrun build.
     #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) events_format: crate::events::EventsFormat,
-    /// True for server agents that only run on libkrun (docker rejects them).
-    pub(crate) libkrun_only: bool,
     /// HTTP basic-auth `(user, password)` every host call to the guest server
     /// carries (OpenCode 2 refuses to serve without a password). Consumed by the
     /// libkrun transport; dead on a non-libkrun build.
@@ -358,8 +357,8 @@ pub const CODEX: AgentSpec = AgentSpec {
 /// default; `--model` is recorded only as Pillbox request metadata on the
 /// session, not forwarded to Codex.
 ///
-/// libkrun-only today (the server bring-up lives in the microVM run path; docker
-/// rejects it via [`ServerProfile::libkrun_only`]). **Non-vault v1**: the
+/// libkrun-only, like every server agent (the server bring-up lives in the
+/// microVM run path; docker refuses any agent with a [`ServerProfile`]). **Non-vault v1**: the
 /// app-server's model egress is `wss://api.openai.com/v1/responses` (WebSocket,
 /// `api.openai.com`), which the [`codex` vault provider](crate::vault::providers)
 /// (chatgpt.com only) doesn't intercept — so `--vault` is rejected until that
@@ -386,7 +385,6 @@ pub const CODEX_SERVE: AgentSpec = AgentSpec {
     server: Some(ServerProfile {
         events_file: crate::sandbox::appserver_client::EVENTS_FILE,
         events_format: crate::events::EventsFormat::Ndjson,
-        libkrun_only: true,
         basic_auth: None,
     }),
     structured: None,
@@ -416,7 +414,6 @@ pub const OPENCODE: AgentSpec = AgentSpec {
     server: Some(ServerProfile {
         events_file: crate::sandbox::opencode::EVENTS_FILE,
         events_format: crate::events::EventsFormat::Sse,
-        libkrun_only: false,
         basic_auth: Some((
             crate::sandbox::opencode::SERVER_USER,
             crate::sandbox::opencode::SERVER_PASSWORD,

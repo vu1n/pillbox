@@ -49,13 +49,13 @@ Two more axes are **already abstracted** and stay as-is — orthogonal to this w
 - **Event placement:** every backend appends to concrete local `SessionLog`;
   managed evidence is copied there after a bounded execution response.
 - **Agent integration** (`Pty` ↔ `Server`): `Integration` + `ServerProfile`
-  (`src/agents/mod.rs:52`), already a single source of truth incl. a
-  `libkrun_only` capability bit.
+  (`src/agents/mod.rs`), already a single source of truth. Every server agent
+  is libkrun-only: docker refuses any agent with a `ServerProfile`.
 
 The remaining HTTP seam (`SandboxHttp` at `src/sandbox/http.rs`) is already
-backend-abstracted: `DockerHttp` + libkrun `opencode_http()` both return
-`Box<dyn SandboxHttp>`. This plan extends the same pattern to the one surface
-still doing string-match dispatch: the **PTY + lifecycle** surface.
+backend-abstracted: libkrun's `opencode_http()` returns `Box<dyn SandboxHttp>`
+(docker has no implementation; it runs no server agents). This plan extends the
+same pattern to the one surface still doing string-match dispatch: the **PTY + lifecycle** surface.
 
 ## Contract first (define the boundary before porting)
 
@@ -105,7 +105,7 @@ struct Caps {
 | `sandbox::docker::reattach` / `libkrun::session::reattach` | `attach` |
 | `sandbox::docker::kill_session` / `libkrun::session::kill_session` | `kill` |
 | `spawn_attach_tailer` / `libkrun_server_file_tailer` / `detached_tailer_alive` | `event_source` |
-| `http::DockerHttp::new` / `libkrun::session::opencode_http` (`server_http`) | `http` |
+| `libkrun::session::opencode_http` (`server_http`) | `http` (docker: unsupported) |
 | `libkrun::session::score_in_sandbox` (`libkrun_score_in_sandbox`) | `score_in_sandbox` (cap) |
 | `libkrun_ingest_events_file` | `ingest` (cap) |
 | `libkrun::session::workspace_path` (`libkrun_workspace_path`) | `workspace_path` |

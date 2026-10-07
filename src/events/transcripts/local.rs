@@ -70,13 +70,6 @@ enum TailerJoin {
 /// drop there rather than at end of scope).
 pub(crate) struct TailerHandle {
     stop: Arc<AtomicBool>,
-    /// The streaming variants tail a transport whose stdout the thread blocks
-    /// reading (docker `exec … tail -F`, opencode `exec curl -N /event`, a
-    /// libkrun vsock exec); a stop flag alone can't unblock that read, so this
-    /// closure tears the transport down (kill the exec / close the socket) to
-    /// EOF the read. `None` for the file-based local tailer, which self-stops
-    /// via its poll timeout.
-    stopper: Option<Box<dyn FnOnce() + Send>>,
     join: Option<TailerJoin>,
 }
 
@@ -103,31 +96,14 @@ impl TailerHandle {
         ))
     }
 
-    /// Wrap a tailer thread spawned elsewhere, given an explicit `stopper` that
-    /// tears down whatever transport the thread is reading (a killed exec, a
-    /// closed vsock). `stop` is the flag the thread observes between reads.
-    pub(crate) fn from_stopper(
-        stop: Arc<AtomicBool>,
-        stopper: Box<dyn FnOnce() + Send>,
-        join: JoinHandle<()>,
-    ) -> Self {
-        Self {
-            stop,
-            stopper: Some(stopper),
-            join: Some(TailerJoin::Infallible(join)),
-        }
-    }
-
     /// Wrap a tailer thread whose reader **self-terminates on the shared `stop`
     /// flag** (a poll-based follow reader, e.g. the libkrun opencode `/event`
     /// file drain) — there's no transport to tear down, so stop-and-join just
-    /// flips the flag and joins. Truer than handing [`from_stopper`](Self::from_stopper)
-    /// a no-op closure.
+    /// flips the flag and joins.
     #[cfg_attr(not(feature = "libkrun"), allow(dead_code))] // only the libkrun file-drain uses it
     pub(crate) fn from_flag(stop: Arc<AtomicBool>, join: JoinHandle<()>) -> Self {
         Self {
             stop,
-            stopper: None,
             join: Some(TailerJoin::Infallible(join)),
         }
     }
@@ -167,7 +143,6 @@ impl TailerHandle {
     pub(crate) fn finished_for_test(result: Result<()>) -> Self {
         Self {
             stop: Arc::new(AtomicBool::new(false)),
-            stopper: None,
             join: Some(TailerJoin::Producer(std::thread::spawn(move || result))),
         }
     }
@@ -176,16 +151,12 @@ impl TailerHandle {
         // Drop does the work; this just names the intent + forces it here.
     }
 
-    /// Flip the stop flag, tear down the streaming transport (if any) so a
-    /// parked read returns EOF, and join the tailer thread. Idempotent via
+    /// Flip the stop flag and join the tailer thread. Idempotent via
     /// `take()`, so a later `Drop` after `shutdown` is a no-op. The file-based
     /// tailer observes `stop` within one poll interval, does a final drain, and
     /// exits; a tailer still in discovery returns immediately.
     fn stop_and_join(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(stopper) = self.stopper.take() {
-            stopper();
-        }
         if let Some(join) = self.join.take() {
             if let Err(e) = join.wait() {
                 eprintln!("pillbox: warning: transcript tailer stopped: {e:#}");
@@ -345,7 +316,6 @@ fn spawn_tailer(
 
     TailerHandle {
         stop,
-        stopper: None,
         join: Some(TailerJoin::Producer(join)),
     }
 }

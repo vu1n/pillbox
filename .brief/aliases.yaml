@@ -15,7 +15,7 @@ adr-007-runner-image-tags-name-roles:
 adr-008-ghost-extraction-trigger:
   latest: 1
 agent-io-pty-free-contract:
-  latest: 1
+  latest: 2
 attach-frame-protocol:
   latest: 1
 dx-zero-config-local:

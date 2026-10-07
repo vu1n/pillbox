@@ -36,7 +36,7 @@ authoritative.** When a design doc and a banner disagree, the banner (newer) win
 | [shared-mcp.md](./shared-mcp.md) | `--mcp` shared MCP attachments |
 | [recipes.md](./recipes.md) | Copy-paste flows |
 | [security.md](./security.md) | Threat model + file layout. *VM-boundary upgrade tracked in libkrun-sandbox.md.* |
-| [opencode-integration.md](./opencode-integration.md) | opencode (server-mode) as a **first-class** run target on docker + libkrun — the `/event` wire contract + drive/read API. (pi backlogged.) |
+| [opencode-integration.md](./opencode-integration.md) | opencode (server-mode) as a **first-class** run target on libkrun — the `/event` wire contract + drive/read API. (pi backlogged.) |
 
 ## External consumer (separate project, not this repo)
 

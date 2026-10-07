@@ -10,11 +10,10 @@ timings.
 # One Docker PTY case, five measured runs after one warmup.
 scripts/bench/startup.py --case docker-claude --warmup 1 --repeat 5
 
-# Server-mode opencode on Docker and libkrun, with a fixed model.
+# Server-mode opencode (libkrun-only), with a fixed model.
 # Defaults to the same opencode image used by the smoke/eval scripts:
 # PILLBOX_RUNNER_IMAGE=pillbox-runner:dev.
 scripts/bench/startup.py \
-  --case docker-opencode \
   --case libkrun-opencode \
   --model zai-coding-plan/glm-4.5-air \
   --warmup 1 \

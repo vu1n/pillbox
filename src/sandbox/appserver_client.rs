@@ -5,9 +5,8 @@
 //! [`SandboxHttp`] transport (a vsock forward, for the libkrun backend) to the
 //! bridge's one-shot routes.
 //!
-//! Most of this is consumed only by the libkrun run path (codex-serve is
-//! libkrun-only), hence the `allow(dead_code)` on the non-libkrun build;
-//! [`send_turn`] is the exception — `session send` drives it on every build.
+//! All of this is consumed only by the libkrun backend (codex-serve is
+//! libkrun-only), hence the `allow(dead_code)` on the non-libkrun build.
 
 use serde_json::{json, Value};
 
@@ -71,6 +70,7 @@ pub(crate) fn create_session(http: &dyn SandboxHttp) -> Result<String> {
 /// Drive the session: `POST /turn` with the prompt text. The bridge issues
 /// `turn/start` and the turn streams as notifications to the events file (read
 /// via the §0 drain). Any 2xx is success (the bridge returns 204).
+#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) fn send_turn(http: &dyn SandboxHttp, text: &str) -> Result<()> {
     let body = json!({ "text": text }).to_string();
     let resp = http.request("POST", "/turn", Some(&body))?;

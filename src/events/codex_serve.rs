@@ -348,16 +348,19 @@ impl CodexServeMapper {
     /// also closes any open assistant message, so a turn that dies mid-stream
     /// without a following `turn/completed` doesn't leave a dangling `MessageStart`
     /// (an unbalanced §0 stream the next turn would never reconcile). A retriable
-    /// error leaves the message open — the same item resumes after reconnect.
+    /// error (codex's "Reconnecting... n/5") maps to nothing: the turn is still
+    /// running and the same item resumes after reconnect, so raising attention
+    /// would end `session wait-idle` early (seen live on codex 0.160.0). The turn's
+    /// real outcome still arrives as `turn/completed` or a terminal `error`.
     fn on_error(&mut self, p: &Value) -> Vec<Payload> {
         let mut out = Vec::new();
-        let terminal = !p.get("willRetry").and_then(Value::as_bool).unwrap_or(false);
-        if terminal {
-            if let Some(open) = self.open_msg.take() {
-                out.push(Payload::MessageEnd(MessageEnd::new(open)));
-            }
-            self.flush_usage(&mut out); // the turn's over — don't lose a failed turn's cost
+        if p.get("willRetry").and_then(Value::as_bool).unwrap_or(false) {
+            return out;
         }
+        if let Some(open) = self.open_msg.take() {
+            out.push(Payload::MessageEnd(MessageEnd::new(open)));
+        }
+        self.flush_usage(&mut out); // the turn's over — don't lose a failed turn's cost
         out.push(Payload::AttentionRequired(AttentionRequired {
             reason: AttentionReason::ErrorStalled,
             message: turn_error_message(p.get("error")),
@@ -1033,7 +1036,7 @@ mod tests {
     #[test]
     fn terminal_error_closes_open_message_retriable_leaves_it() {
         // A retriable error mid-stream must NOT close the message (the item
-        // resumes after reconnect) — just the stall signal.
+        // resumes after reconnect).
         let out = run(&[
             json!({"method":"item/agentMessage/delta","params":{
                 "itemId":"it_e","delta":"par","threadId":"th","turnId":"tu"}}),
@@ -1044,6 +1047,13 @@ mod tests {
         assert!(
             !out.iter().any(|p| matches!(p, Payload::MessageEnd(_))),
             "retriable error must not close the message: {out:?}"
+        );
+        // …nor raise attention: the turn is still running, and a waiter treats
+        // any AttentionRequired as the turn's end.
+        assert!(
+            !out.iter()
+                .any(|p| matches!(p, Payload::AttentionRequired(_))),
+            "retriable error must not raise attention: {out:?}"
         );
 
         // A terminal error closes the dangling message so the §0 stream balances.

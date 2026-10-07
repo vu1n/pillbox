@@ -1689,7 +1689,13 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
 fn run_codex_serve(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
     use crate::sandbox::appserver_client as appserver;
 
-    let model = opts.model.clone().unwrap_or_else(|| "codex-default".into());
+    // The bridge does not pass a model to codex (it uses its configured default),
+    // so the recorded default names that, in the PROVIDER/MODEL form the run
+    // profile requires (a bare `codex-default` refused every run without --model).
+    let model = opts
+        .model
+        .clone()
+        .unwrap_or_else(|| "openai/codex-default".into());
     let launch = ServerLaunch {
         vault_refusal: "the vault (codex-serve v1 is non-vault: the app-server's model egress is \
                         the ChatGPT backend over WebSocket, which the codex provider doesn't yet intercept)",

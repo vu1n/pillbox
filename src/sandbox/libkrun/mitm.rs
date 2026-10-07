@@ -153,6 +153,8 @@ const MAX_PLAINTEXT_CHUNK_BYTES: usize = 4 * 1024;
 struct RequestGate {
     state: RequestState,
     upstream_allowed: bool,
+    /// The upstream's status line, accumulated while a WebSocket upgrade waits.
+    status_line: Vec<u8>,
 }
 
 enum RequestState {
@@ -160,6 +162,16 @@ enum RequestState {
     Headers(Vec<u8>),
     FixedBody(usize),
     ChunkedBody(ChunkedBody),
+    /// A WebSocket upgrade's head went upstream; guest bytes are held until the
+    /// upstream answers. Only a `101` turns them into an opaque [`Self::Tunnel`]:
+    /// a refused upgrade leaves the connection HTTP, so tunnelling on the request
+    /// alone would let a guest slip a token-endpoint request past this gate.
+    UpgradePending(Vec<u8>),
+    /// The upstream switched to WebSocket: guest bytes are frames, not HTTP, and
+    /// relay raw. Parsing them as request lines rejected the first frame and wrote
+    /// the local 403 into the socket, which Codex read as a fragmented control
+    /// frame (`H` = 0x48 = FIN 0, RSV1, opcode Close under permessage-deflate).
+    Tunnel,
     Rejected,
 }
 
@@ -168,6 +180,7 @@ impl RequestGate {
         Self {
             state: RequestState::RequestLine(Vec::new()),
             upstream_allowed: false,
+            status_line: Vec::new(),
         }
     }
 
@@ -236,6 +249,10 @@ impl RequestGate {
                     };
                     released.extend_from_slice(buffer);
                     self.state = match framing {
+                        RequestFraming::Empty if is_websocket_upgrade(buffer) => {
+                            self.status_line.clear();
+                            RequestState::UpgradePending(Vec::new())
+                        }
                         RequestFraming::Empty => RequestState::RequestLine(Vec::new()),
                         RequestFraming::Fixed(length) => RequestState::FixedBody(length),
                         RequestFraming::Chunked => RequestState::ChunkedBody(ChunkedBody::new()),
@@ -263,10 +280,53 @@ impl RequestGate {
                         break;
                     }
                 }
+                RequestState::UpgradePending(held) => {
+                    if held.len() + input.len() > MAX_PENDING_UPSTREAM_BYTES {
+                        return self.reject();
+                    }
+                    held.append(&mut input);
+                }
+                RequestState::Tunnel => released.append(&mut input),
                 RequestState::Rejected => return Err(()),
             }
         }
         Ok((!released.is_empty()).then_some(released))
+    }
+
+    /// Watch the upstream's reply to a pending WebSocket upgrade. A `101` opens
+    /// the tunnel and returns the guest bytes held meanwhile (to relay raw). Any
+    /// other status keeps the connection HTTP; bytes the guest sent before
+    /// learning that fail closed, since they were never gated as requests.
+    fn observe_response(&mut self, bytes: &[u8]) -> Result<Option<Vec<u8>>, ()> {
+        let RequestState::UpgradePending(held) = &mut self.state else {
+            return Ok(None);
+        };
+        self.status_line.extend_from_slice(bytes);
+        let Some(line_end) = find_bytes(&self.status_line, b"\r\n") else {
+            if self.status_line.len() > MAX_REQUEST_LINE_BYTES {
+                return self.reject();
+            }
+            return Ok(None);
+        };
+        let switched = self.status_line[..line_end]
+            .split(|byte| *byte == b' ')
+            .nth(1)
+            == Some(b"101".as_slice());
+        let held = std::mem::take(held);
+        self.status_line = Vec::new();
+        if switched {
+            self.state = RequestState::Tunnel;
+            Ok(Some(held))
+        } else if held.is_empty() {
+            self.state = RequestState::RequestLine(Vec::new());
+            Ok(None)
+        } else {
+            self.reject()
+        }
+    }
+
+    fn is_tunnel(&self) -> bool {
+        matches!(self.state, RequestState::Tunnel)
     }
 
     fn is_allowed(&self) -> bool {
@@ -274,7 +334,10 @@ impl RequestGate {
     }
 
     fn at_request_boundary(&self) -> bool {
-        matches!(self.state, RequestState::RequestLine(_))
+        matches!(
+            self.state,
+            RequestState::RequestLine(_) | RequestState::UpgradePending(_) | RequestState::Tunnel
+        )
     }
 
     fn reject<T>(&mut self) -> Result<T, ()> {
@@ -321,6 +384,23 @@ fn request_framing(headers: &[u8]) -> Option<RequestFraming> {
     }
 }
 
+/// `Connection: upgrade` + `Upgrade: websocket`. Only WebSocket: an `h2c`
+/// upgrade would carry further HTTP requests the gate could no longer see.
+fn is_websocket_upgrade(headers: &[u8]) -> bool {
+    let Ok(headers) = std::str::from_utf8(headers) else {
+        return false;
+    };
+    let has = |name: &str, token: &str| {
+        headers.split("\r\n").any(|line| {
+            line.split_once(':').is_some_and(|(n, v)| {
+                n.trim().eq_ignore_ascii_case(name)
+                    && v.split(',').any(|t| t.trim().eq_ignore_ascii_case(token))
+            })
+        })
+    };
+    has("connection", "upgrade") && has("upgrade", "websocket")
+}
+
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
@@ -344,6 +424,11 @@ fn queue_swapped_request(
     gate: &RequestGate,
     allowed: &[u8],
 ) -> bool {
+    // WebSocket frames from the guest are masked, so a stub can't appear in them
+    // literally — and a length-changing swap would corrupt the framing.
+    if gate.is_tunnel() {
+        return queue_pending_upstream(outbound, allowed);
+    }
     if !queue_pending_upstream(outbound, &swap.push(allowed)) {
         return false;
     }
@@ -630,6 +715,22 @@ fn drive_conn(
         let alive = up.pump();
         let mut resp = Vec::new();
         up.recv_into(&mut resp);
+        match request_gate.observe_response(&resp) {
+            Ok(None) => {}
+            Ok(Some(held)) => {
+                if !queue_pending_upstream(outbound, &held) {
+                    sock.abort();
+                    return;
+                }
+            }
+            Err(()) => {
+                diag.log(&format!(
+                    "krun-egress: [mitm] {host} refused a WebSocket upgrade the guest already wrote past → RST"
+                ));
+                sock.abort();
+                return;
+            }
+        }
         if !resp.is_empty() {
             let _ = tls.writer().write_all(&resp);
         }
@@ -795,6 +896,102 @@ mod tests {
                 b"POST /v1/oauth/token HTTP/1.1\r\n\r\n",
             )
             .is_err());
+    }
+
+    const UPGRADE: &[u8] = b"GET /backend-api/codex/responses HTTP/1.1\r\nhost: chatgpt.com\r\nconnection: Upgrade\r\nupgrade: websocket\r\nsec-websocket-version: 13\r\nsec-websocket-extensions: permessage-deflate\r\nauthorization: Bearer stub-token\r\n\r\n";
+
+    /// A masked client text frame (zero mask key, so the payload is literal).
+    fn ws_frame(payload: &[u8]) -> Vec<u8> {
+        let mut frame = vec![0x81, 0x80 | payload.len() as u8, 0, 0, 0, 0];
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    // Regression: Codex's Responses WebSocket died with "Fragmented control
+    // frame". The gate parsed the first post-upgrade frame as a request line,
+    // rejected it, and wrote its local `HTTP/1.1 403` into the upgraded stream.
+    #[test]
+    fn websocket_frames_relay_raw_after_upstream_switches_protocols() {
+        let host = "chatgpt.com";
+        let mut gate = RequestGate::new();
+        let mut swap = StubSwap::new(vec![CredSwap {
+            stub: b"stub-token".to_vec(),
+            real: b"real-token".to_vec(),
+            hosts: vec![host.to_string()],
+        }]);
+        let mut outbound = Vec::new();
+
+        let head = gate.push(host, UPGRADE).unwrap().unwrap();
+        assert!(queue_swapped_request(
+            &mut outbound,
+            &mut swap,
+            &gate,
+            &head
+        ));
+        let first = ws_frame(b"{\"type\":\"response.create\"}\r\nstub-token");
+        // Sent before the 101 arrives: held, not parsed as HTTP.
+        assert!(matches!(gate.push(host, &first), Ok(None)));
+        assert_eq!(
+            gate.observe_response(b"HTTP/1.1 101 Switching").unwrap(),
+            None
+        );
+        let held = gate
+            .observe_response(b" Protocols\r\nupgrade: websocket\r\n\r\n")
+            .unwrap()
+            .unwrap();
+        assert!(queue_pending_upstream(&mut outbound, &held));
+        let second = ws_frame(b"\r\n\r\nPOST /oauth/token HTTP/1.1\r\n\r\n");
+        let relayed = gate.push(host, &second).unwrap().unwrap();
+        assert!(queue_swapped_request(
+            &mut outbound,
+            &mut swap,
+            &gate,
+            &relayed
+        ));
+        // Later upstream frames are not status lines.
+        assert_eq!(gate.observe_response(b"\x81\x02hi").unwrap(), None);
+
+        let mut expected = String::from_utf8(UPGRADE.to_vec())
+            .unwrap()
+            .replace("stub-token", "real-token")
+            .into_bytes();
+        expected.extend_from_slice(&first);
+        expected.extend_from_slice(&second);
+        assert_eq!(outbound, expected);
+    }
+
+    #[test]
+    fn refused_websocket_upgrade_stays_an_http_gate() {
+        let host = "auth.openai.com";
+        let upgrade = b"GET / HTTP/1.1\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\n";
+
+        // Refused with nothing pipelined: the next request is still classified.
+        let mut gate = RequestGate::new();
+        gate.push(host, upgrade).unwrap().unwrap();
+        assert_eq!(
+            gate.observe_response(b"HTTP/1.1 400 Bad Request\r\n")
+                .unwrap(),
+            None
+        );
+        assert!(gate
+            .push(host, b"POST /oauth/token HTTP/1.1\r\n\r\n")
+            .is_err());
+
+        // Refused after the guest already wrote past the upgrade: fail closed.
+        let mut gate = RequestGate::new();
+        gate.push(host, upgrade).unwrap().unwrap();
+        assert!(matches!(
+            gate.push(host, b"POST /oauth/token HTTP/1.1\r\n\r\n"),
+            Ok(None)
+        ));
+        assert!(gate
+            .observe_response(b"HTTP/1.1 401 Unauthorized\r\n")
+            .is_err());
+
+        // h2c could multiplex more requests, so it never becomes a tunnel.
+        assert!(!is_websocket_upgrade(
+            b"GET / HTTP/1.1\r\nconnection: Upgrade, HTTP2-Settings\r\nupgrade: h2c\r\n\r\n"
+        ));
     }
 
     fn push_pending(gate: &mut RequestGate, outbound: &mut Vec<u8>, chunk: &[u8]) -> bool {

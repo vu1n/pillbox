@@ -294,3 +294,4 @@ libkrun-env-fork-substrate conforms: The structured libkrun one-shot for the vau
 workspace-ingest-sovereignty conforms: The structured claude-stream run uses the same launch_base workspace CoW clone and pillbox-owned secret scrub as every libkrun launch; nothing in the change reads the denylist from the workspace or alters exclusion or reporting.
 managed-tier-do-gateway conforms: Docker server-agent removal only adds dead-code allows on the local LiveSession::http and drive_server_prompt for non-libkrun builds; the managed backend's send and its sealed request are untouched.
 workspace-ingest-sovereignty conforms: run_codex_serve only changes its default model string to PROVIDER/MODEL form; workspace ingest, the CoW clone and the secret denylist are untouched.
+libkrun-env-fork-substrate conforms: WebSocket upgrades tunnel raw only after the upstream's 101; the guest still never holds the real credential and the swap and destination binding are unchanged.

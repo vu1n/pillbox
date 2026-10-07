@@ -160,7 +160,10 @@ The broker model removes the trigger: **the agent never refreshes.** Three piece
    by provider-owned matchers and return a local 403. The libkrun credentials file
    contains a shape-valid refresh stub, but there is no refresh-token release pair;
    only the broker can read or POST the real refresh token. The host proxy likewise
-   has no response-side mutation or teardown persistence path.
+   has no response-side mutation or teardown persistence path. The libkrun MITM
+   classifies every HTTP/1.1 request line on a connection until a WebSocket
+   upgrade is answered `101`; after that the guest's frames relay raw (no swap),
+   and guest bytes sent before a refused upgrade fail closed.
 
 ## Broker model (v2 — the policy-bound egress broker)
 

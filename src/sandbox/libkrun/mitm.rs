@@ -50,6 +50,9 @@ struct Conn {
     request_gate: RequestGate,
     /// Gated request bytes not yet accepted by the upstream TLS buffer.
     outbound: Vec<u8>,
+    /// Response bytes not yet accepted by the guest TLS buffer. The upstream is read
+    /// only while this is empty, so a slow guest backpressures the upstream.
+    inbound: Vec<u8>,
     req_logged: bool,
     closing: bool,
 }
@@ -106,6 +109,7 @@ pub(super) fn drive_listeners(
                             swap: StubSwap::new(Vec::new()),
                             request_gate: RequestGate::new(),
                             outbound: Vec::new(),
+                            inbound: Vec::new(),
                             req_logged: false,
                             closing: false,
                         })
@@ -437,6 +441,15 @@ fn queue_swapped_request(
     !gate.at_request_boundary() || queue_pending_upstream(outbound, &swap.flush())
 }
 
+/// Hand pending response bytes to the guest TLS session, keeping whatever its
+/// bounded send buffer refuses for a later tick (never dropping it).
+fn relay_to_guest(
+    inbound: &mut Vec<u8>,
+    tls: &mut rustls::ServerConnection,
+) -> std::io::Result<()> {
+    forward_pending(inbound, |bytes| tls.writer().write(bytes))
+}
+
 fn forward_pending(
     outbound: &mut Vec<u8>,
     mut send: impl FnMut(&[u8]) -> std::io::Result<usize>,
@@ -573,6 +586,7 @@ fn drive_conn(
         swap,
         request_gate,
         outbound,
+        inbound,
         req_logged,
         closing,
     } = c;
@@ -659,7 +673,8 @@ fn drive_conn(
                     diag.log(&format!(
                         "krun-egress: [mitm] DENY guest OAuth rotation → {host} (local 403)"
                     ));
-                    let _ = tls.writer().write_all(&oauth_forbidden_response());
+                    // Behind any response bytes still owed to the guest, in order.
+                    inbound.extend_from_slice(&oauth_forbidden_response());
                     *closing = true;
                     *connecting = None;
                     *upstream = None;
@@ -704,6 +719,7 @@ fn drive_conn(
     // Relay gated request bytes upstream and provider response bytes back to the
     // guest. OAuth rotation responses cannot exist here because their requests
     // never leave the local gate.
+    let _ = relay_to_guest(inbound, tls);
     if let Some(up) = upstream.as_mut() {
         if let Err(error) = forward_pending(outbound, |bytes| up.send(bytes)) {
             diag.log(&format!(
@@ -712,7 +728,12 @@ fn drive_conn(
             sock.abort();
             return;
         }
-        let alive = up.pump();
+        // Read the upstream only once the guest TLS took every earlier response
+        // byte. The guest leg drains about one MSS per tick while the upstream
+        // delivers up to 4 KiB, so reading ahead filled rustls' 64 KiB send buffer
+        // and the overflow was dropped: a large response (Codex's `codex_apps`
+        // tools/list) reached the guest truncated and the client waited it out.
+        let alive = up.pump(inbound.is_empty());
         let mut resp = Vec::new();
         up.recv_into(&mut resp);
         match request_gate.observe_response(&resp) {
@@ -731,14 +752,14 @@ fn drive_conn(
                 return;
             }
         }
-        if !resp.is_empty() {
-            let _ = tls.writer().write_all(&resp);
-        }
+        inbound.append(&mut resp);
         if !alive {
             *closing = true;
             *upstream = None;
         }
     }
+
+    let _ = relay_to_guest(inbound, tls);
 
     // guest rustls → smoltcp tx
     while tls.wants_write() && sock.can_send() {
@@ -752,7 +773,7 @@ fn drive_conn(
         }
     }
     // Close the guest side once the upstream is gone and its response is flushed.
-    if *closing && !tls.wants_write() {
+    if *closing && inbound.is_empty() && !tls.wants_write() {
         sock.close();
     }
 }
@@ -1087,6 +1108,110 @@ mod tests {
         .unwrap();
         assert!(outbound.is_empty());
         assert_eq!(received, original);
+    }
+
+    /// A completed TLS session between the MITM's guest-side leg and a client
+    /// trusting the vault CA (the guest).
+    fn guest_session() -> (
+        rustls::ServerConnection,
+        rustls::ClientConnection,
+        std::path::PathBuf,
+    ) {
+        use rustls::pki_types::{pem::PemObject, CertificateDer, ServerName};
+        let dir = std::env::temp_dir().join(format!("pillbox-mitm-{}", uuid::Uuid::now_v7()));
+        let vault = Vault::new(dir.to_str().unwrap(), vec!["chatgpt.com".into()]).unwrap();
+        let ca = crate::vault::Ca::ensure(&dir).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from_pem_file(ca.cert_path()).unwrap())
+            .unwrap();
+        let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let mut client = rustls::ClientConnection::new(
+            std::sync::Arc::new(config),
+            ServerName::try_from("chatgpt.com").unwrap(),
+        )
+        .unwrap();
+        let mut server = vault.new_conn().unwrap();
+        while client.is_handshaking() || server.is_handshaking() {
+            let mut wire = Vec::new();
+            client.write_tls(&mut wire).unwrap();
+            server.read_tls(&mut wire.as_slice()).unwrap();
+            server.process_new_packets().unwrap();
+            let mut wire = Vec::new();
+            server.write_tls(&mut wire).unwrap();
+            client.read_tls(&mut wire.as_slice()).unwrap();
+            client.process_new_packets().unwrap();
+        }
+        (server, client, dir)
+    }
+
+    /// Codex's `codex_apps` tools/list hung 30s: the upstream outpaced the guest
+    /// leg, rustls' 64 KiB send buffer filled, and `write_all` dropped the rest.
+    #[test]
+    fn large_response_reaches_a_slow_guest_intact() {
+        let body: Vec<u8> = (0..512 * 1024).map(|i| (i % 251) as u8).collect();
+
+        // The old relay: one `write_all` of everything decrypted, result ignored.
+        let (mut old, _, old_dir) = guest_session();
+        assert!(
+            old.writer().write_all(&body).is_err(),
+            "rustls refuses past its buffer"
+        );
+        let _ = std::fs::remove_dir_all(&old_dir);
+
+        let (mut server, mut client, dir) = guest_session();
+
+        let (mut inbound, mut produced, mut received) = (Vec::new(), 0, Vec::new());
+        let mut plain = [0u8; 16 * 1024];
+        for _tick in 0..10_000 {
+            if received.len() >= body.len() {
+                break;
+            }
+            // The upstream is read (≤ 4 KiB per tick) only once the guest took the rest.
+            if inbound.is_empty() && produced < body.len() {
+                let end = (produced + 4096).min(body.len());
+                inbound.extend_from_slice(&body[produced..end]);
+                produced = end;
+            }
+            relay_to_guest(&mut inbound, &mut server).unwrap();
+            assert!(inbound.len() <= 4096);
+            // The guest leg drains one MSS of ciphertext per tick.
+            let mut wire = Mss(Vec::new());
+            if server.wants_write() {
+                server.write_tls(&mut wire).unwrap();
+            }
+            client.read_tls(&mut wire.0.as_slice()).unwrap();
+            client.process_new_packets().unwrap();
+            loop {
+                match client.reader().read(&mut plain) {
+                    Ok(0) => break,
+                    Ok(n) => received.extend_from_slice(&plain[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("{e}"),
+                }
+            }
+        }
+        assert!(received == body, "response bytes lost or reordered");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A socket that takes at most one MSS per write.
+    struct Mss(Vec<u8>);
+
+    impl Write for Mss {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(1460 - self.0.len());
+            self.0.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]

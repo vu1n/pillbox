@@ -58,6 +58,14 @@ managed Cloudflare and DigitalOcean images keep their own OpenCode 1.x pins
 (`cloudflare-spike/Dockerfile`, `digitalocean/`); they are sealed Huddles
 execution cohorts and move separately.
 
+The October 9 refresh moves the daily-use runner to Claude 2.1.295, Codex
+0.162.0, OpenCode 2.0.26, Pi 1.1.0, and Amp 0.0.1791504095-g229e99; Cursor
+2026.10.01-e373342 and Prime Agent 0.9.8 were already current. The bump was
+checked with `scripts/verify-runner.sh` (version probes and the Codex package
+layout) only. The structured adapters and their fixtures remain those captured
+from Claude 2.1.289, Codex 0.160.0, and OpenCode 2.0.24; they have not been
+re-qualified against the newer releases.
+
 Plus the system tooling agents tend to reach for: `bash`,
 `bubblewrap`, `ca-certificates`, `curl`, `gh`, `git`, `iproute2`
 (the `ip` tool the libkrun egress fence needs), `jq`, `openssl`,

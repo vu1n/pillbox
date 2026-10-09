@@ -63,6 +63,14 @@ impl StartupTimer {
         self.last = now;
     }
 
+    /// Stages marked so far, for a launch that reports progress before it finishes.
+    pub(crate) fn snapshot(&self) -> StartupMetrics {
+        StartupMetrics {
+            total_ms: duration_ms(self.last.duration_since(self.started)),
+            stages: self.stages.clone(),
+        }
+    }
+
     pub(crate) fn finish(mut self, final_stage: impl Into<String>) -> StartupMetrics {
         self.mark(final_stage);
         StartupMetrics {

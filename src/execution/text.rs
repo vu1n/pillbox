@@ -17,12 +17,79 @@ use super::{
 use crate::contract::{Custom, Payload};
 use crate::pillbox::Pillbox;
 use crate::sandbox::libkrun::repository::{self, BuilderInput, VmLimits};
+use crate::startup::StartupTimer;
 
 pub(crate) const CONTRACT_VERSION: &str = "pillbox.text/1";
 pub(crate) const ADAPTER_REVISION: &str = "pillbox/local-text-v1";
 pub(crate) const POLICY_REVISION: &str = "pillbox-local-text-v1";
 const MAX_RENDERED_INPUT_BYTES: usize = 512 * 1024;
 const MAX_FINAL_TEXT_BYTES: u64 = 1024 * 1024;
+/// Host-visible stages of one text invocation, in the order they complete.
+const STAGES: [&str; 6] = [
+    "credentials",
+    "image_prepare",
+    "guest_prepare",
+    "vmm_spawn",
+    "guest_rpc_ready",
+    "turn",
+];
+
+/// Stage timings for one text invocation. A sealed turn gets the same lifecycle
+/// telemetry as a `pillbox run` session (`session.*` events with `startup_stages`,
+/// OTel when configured) plus a `text.stage.completed` evidence event per stage, so
+/// a slow or failed turn says where the time went.
+struct Stages {
+    timer: StartupTimer,
+    completed: usize,
+    started_emitted: bool,
+}
+
+impl Stages {
+    fn start() -> Self {
+        Self {
+            timer: StartupTimer::start(),
+            completed: 0,
+            started_emitted: false,
+        }
+    }
+
+    /// The stage that was running when the invocation ended.
+    fn in_progress(&self) -> &'static str {
+        STAGES.get(self.completed).copied().unwrap_or("finalize")
+    }
+
+    fn complete(&mut self, name: &'static str, evidence: &mut ExecutionEvidence) -> Result<()> {
+        self.timer.mark(name);
+        self.completed += 1;
+        let duration_ms = self
+            .timer
+            .snapshot()
+            .stages
+            .last()
+            .map(|stage| stage.duration_ms);
+        evidence.append(Payload::Custom(Custom {
+            name: "text.stage.completed".into(),
+            payload: Some(json!({"stage": name, "duration_ms": duration_ms})),
+        }))?;
+        Ok(())
+    }
+
+    fn emit_started(&mut self, pb: &Pillbox, session_id: &str) {
+        if self.started_emitted {
+            return;
+        }
+        self.started_emitted = true;
+        crate::events::emit_session_event(
+            pb,
+            crate::events::EventType::SessionStarted {
+                parent_session_id: crate::events::parent_session_id_from_env(),
+                startup: Some(self.timer.snapshot()),
+            },
+            session_id,
+            None,
+        );
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -254,6 +321,7 @@ pub(crate) fn execute(
         native_evidence: None,
     };
     owner.running(serde_json::to_value(&progress)?)?;
+    let mut stages = Stages::start();
     let result = run_local(
         pb,
         request,
@@ -262,22 +330,58 @@ pub(crate) fn execute(
         &profile,
         &mut evidence,
         &mut progress,
+        &mut stages,
     );
+    let session_id = &request.session_ref.session_id;
+    stages.emit_started(pb, session_id);
     match result {
-        Ok(completion) => Ok(completion),
-        Err(error) => Err(record_failure(error, &mut evidence, owner, &mut progress)),
+        Ok(completion) => {
+            crate::events::emit_session_event(
+                pb,
+                crate::events::EventType::SessionCompleted {
+                    exit_code: Some(0),
+                    trace_path: None,
+                    result_snapshot: None,
+                },
+                session_id,
+                None,
+            );
+            Ok(completion)
+        }
+        Err(error) => {
+            let stage = stages.in_progress();
+            crate::events::emit_session_event(
+                pb,
+                crate::events::EventType::SessionFailed {
+                    reason: format!("{stage}: {error:#}"),
+                    exit_code: Some(1),
+                    trace_path: None,
+                    result_snapshot: None,
+                },
+                session_id,
+                None,
+            );
+            Err(record_failure(
+                error,
+                stage,
+                &mut evidence,
+                owner,
+                &mut progress,
+            ))
+        }
     }
 }
 
 fn record_failure(
     error: anyhow::Error,
+    stage: &'static str,
     evidence: &mut ExecutionEvidence,
     owner: &mut OwnedInvocation,
     progress: &mut TextProgress,
 ) -> anyhow::Error {
     let recorded = evidence.append(Payload::Custom(Custom {
         name: "text.execution.failed".into(),
-        payload: Some(json!({"error": format!("{error:#}")})),
+        payload: Some(json!({"error": format!("{error:#}"), "stage": stage})),
     }));
     progress.session_ref = evidence.reference();
     let recorded = recorded.and_then(|_| owner.observe(serde_json::to_value(&progress)?));
@@ -291,6 +395,7 @@ fn record_failure(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_local(
     pb: &Pillbox,
     request: &TextRequest,
@@ -299,6 +404,7 @@ fn run_local(
     profile: &CodexProfile,
     evidence: &mut ExecutionEvidence,
     progress: &mut TextProgress,
+    stages: &mut Stages,
 ) -> Result<TextCompletion> {
     let spec = crate::agents::lookup("execution", "codex")?;
     let credentials_path = spec.home_dir(pb)?.join(spec.cred_sentinel);
@@ -320,9 +426,11 @@ fn run_local(
         refresh_credentials: credentials_path,
     };
     drop(real);
+    stages.complete("credentials", evidence)?;
     check_live(owner, deadline)?;
     let cancelled = || !matches!(owner.cancelled(), Ok(false));
-    let mut vm = repository::launch_builder(
+    let mut stage_error = None;
+    let launched = repository::launch_builder_staged(
         input,
         VmLimits {
             max_duration: deadline
@@ -332,9 +440,20 @@ fn run_local(
             max_frame_bytes: request.runtime.limits.max_frame_bytes as usize,
         },
         &cancelled,
-    )?;
+        &mut |name| {
+            if let Err(error) = stages.complete(name, evidence) {
+                stage_error.get_or_insert(error);
+            }
+        },
+    );
+    let mut vm = launched?;
+    stages.emit_started(pb, &request.session_ref.session_id);
     let native = (|| -> Result<_> {
+        if let Some(error) = stage_error {
+            return Err(error.context("persist text stage evidence"));
+        }
         let stream = vm.connect_rpc(&cancelled)?;
+        stages.complete("guest_rpc_ready", evidence)?;
         let limits = &request.runtime.limits;
         Ok(native::run_text(
             stream,
@@ -358,6 +477,9 @@ fn run_local(
     })();
     let diagnostics = vm.diagnostics();
     vm.stop_and_reap()?;
+    if matches!(&native, Ok(Ok(_))) {
+        stages.complete("turn", evidence)?;
+    }
     if let Ok(observed) = &native {
         let frames = match observed {
             Ok(done) => &done.evidence,
@@ -537,6 +659,7 @@ mod tests {
         // Still admitted: owner.observe fails after the failure event append.
         let error = record_failure(
             anyhow::Error::new(TeardownUnconfirmed),
+            "image_prepare",
             &mut evidence,
             &mut owner,
             &mut progress,
@@ -553,5 +676,14 @@ mod tests {
             store.status("invocation-1").unwrap().status,
             Status::Interrupted
         );
+    }
+    #[test]
+    fn in_progress_stage_follows_completed_stages() {
+        let mut stages = Stages::start();
+        assert_eq!(stages.in_progress(), "credentials");
+        stages.completed = 1;
+        assert_eq!(stages.in_progress(), "image_prepare");
+        stages.completed = STAGES.len();
+        assert_eq!(stages.in_progress(), "finalize");
     }
 }

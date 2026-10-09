@@ -286,12 +286,39 @@ fn validate_id(value: &str) -> Result<()> {
     Ok(())
 }
 
+/// The stage that was running when a text invocation failed, carried in the error
+/// chain so a caller can report it without parsing the message.
+#[derive(Debug)]
+pub(crate) struct FailedStage(pub(crate) &'static str);
+
+impl std::fmt::Display for FailedStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "text invocation failed during {}", self.0)
+    }
+}
+
 pub(crate) fn execute(
     pb: &Pillbox,
     request: &TextRequest,
     owner: &mut OwnedInvocation,
 ) -> Result<TextCompletion> {
+    execute_with(pb, request, owner, true).map(|(completion, _)| completion)
+}
+
+/// [`execute`], also returning the Codex CLI version the guest reported. With
+/// `exact_cli_version` false the runner image decides the version and it is only recorded.
+pub(crate) fn execute_with(
+    pb: &Pillbox,
+    request: &TextRequest,
+    owner: &mut OwnedInvocation,
+    exact_cli_version: bool,
+) -> Result<(TextCompletion, Option<String>)> {
     let profile = request.validate()?;
+    let profile = if exact_cli_version {
+        profile
+    } else {
+        profile.observing_cli_version()
+    };
     let deadline = Instant::now() + Duration::from_millis(request.runtime.limits.timeout_ms);
     check_live(owner, deadline)?;
     let mut evidence = ExecutionEvidence::start_text(
@@ -361,13 +388,10 @@ pub(crate) fn execute(
                 session_id,
                 None,
             );
-            Err(record_failure(
-                error,
-                stage,
-                &mut evidence,
-                owner,
-                &mut progress,
-            ))
+            Err(
+                record_failure(error, stage, &mut evidence, owner, &mut progress)
+                    .context(FailedStage(stage)),
+            )
         }
     }
 }
@@ -405,7 +429,7 @@ fn run_local(
     evidence: &mut ExecutionEvidence,
     progress: &mut TextProgress,
     stages: &mut Stages,
-) -> Result<TextCompletion> {
+) -> Result<(TextCompletion, Option<String>)> {
     let spec = crate::agents::lookup("execution", "codex")?;
     let credentials_path = spec.home_dir(pb)?.join(spec.cred_sentinel);
     let real = crate::vault::pre_refresh(&credentials_path, "codex")?
@@ -495,6 +519,7 @@ fn run_local(
         payload: Some(json!({"diagnostics": diagnostics})),
     }))?;
     let native = native?.map_err(|failure| failure.error)?;
+    let cli_version = observed_cli_version(&native.evidence);
     check_live(owner, deadline)?;
     let text = evidence.artifact(native.text.as_bytes(), "text/plain;charset=utf-8")?;
     let native_evidence = progress
@@ -512,7 +537,7 @@ fn run_local(
     }))?;
     progress.session_ref = evidence.reference();
     owner.observe(serde_json::to_value(&progress)?)?;
-    Ok(TextCompletion {
+    let completion = TextCompletion {
         invocation_id: request.invocation_id.clone(),
         request_hash: owner.record().request_hash.clone(),
         execution_policy_revision: POLICY_REVISION.into(),
@@ -527,6 +552,16 @@ fn run_local(
         native_turn_id: native.turn_id,
         requested_model: profile.model().into(),
         served_model: None,
+    };
+    Ok((completion, cli_version))
+}
+
+/// The CLI version Codex reported in its `thread/start` response.
+fn observed_cli_version(frames: &[serde_json::Value]) -> Option<String> {
+    frames.iter().find_map(|frame| {
+        frame["message"]["result"]["thread"]["cliVersion"]
+            .as_str()
+            .map(str::to_owned)
     })
 }
 

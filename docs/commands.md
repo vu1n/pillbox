@@ -543,3 +543,23 @@ changed content conflicts, and an invocation interrupted by owner loss is never
 sampled again under that ID. The CLI returns JSON v1 with an `execution`
 record. A completed record contains bounded final text and exact Pillbox
 SessionLog and blob references. No repository path or manifest is accepted.
+
+`pillbox.text/2` is the harness-agnostic form of the same command. The request
+names the agent (`agent.harness`, `agent.model`, `agent.reasoning_effort`), the
+input and the limits, and nothing about how to run it: a request carrying a
+harness version, runner image, model catalog, credential or egress host is
+rejected. Pillbox resolves the runner image from the pillbox's configuration
+(`[runner].image`, `$PILLBOX_RUNNER_IMAGE`) and takes the harness version from
+that image. A completed record carries `resolved` (`harness`,
+`harness_version`, `adapter_revision`, `runner_image_id`, `requested_model`,
+`served_model`). A failed record carries a closed `code` (`runtime_unavailable`,
+`runtime_timeout`, `runtime_rejected`, `runtime_protocol_error`,
+`internal_error`) and the `stage` that was running (`resolve`, `credentials`,
+`image_prepare`, `guest_prepare`, `vmm_spawn`, `guest_rpc_ready`, `turn`,
+`finalize`); the message stays in the session log. Only `codex` has a text
+driver today; the other harnesses fail at `resolve` with `runtime_rejected`.
+
+Both versions append a `text.stage.completed` event per stage to the session
+log and emit `session.started` / `session.completed` / `session.failed`
+lifecycle events, so `session log`, `events.jsonl` and OTel show where a turn
+spent its time.

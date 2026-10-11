@@ -136,16 +136,18 @@ pub(crate) const GRADER_STARTED_PRINTF: &str = r"printf '\n\036PBSTART\n'";
 /// `sitecustomize.py` for an unprivileged (dropped) grader. With
 /// `PYTHONSAFEPATH=1` Python no longer puts the cwd or script dir FIRST on
 /// `sys.path`, so a worker's `pluggy.py`/`json.py` can't shadow the test
-/// runner or the stdlib; this puts that directory back at the END, so the
-/// project still imports from the workspace the way `python3 -m pytest` or
-/// `python3 script.py` expects. No `;` or `'` (it rides a `'…'` shell string
+/// runner or the stdlib; this puts the script dir (if any) and the cwd back at
+/// the END, so the project still imports from the workspace the way
+/// `python3 -m pytest`, a `pytest` console script or `python3 script.py`
+/// expects. No `;` or `'` (it rides a `'…'` shell string
 /// in an `&&` chain).
 const PY_BOOTSTRAP: &str = r#"import os
 import sys
 _a = sys.argv[0] if sys.argv else ""
-_d = os.getcwd() if _a in ("", "-c", "-m") else os.path.dirname(os.path.abspath(_a))
-if _d not in sys.path:
-    sys.path.append(_d)
+_ds = [] if _a in ("", "-c", "-m") else [os.path.dirname(os.path.abspath(_a))]
+for _d in _ds + [os.getcwd()]:
+    if _d not in sys.path:
+        sys.path.append(_d)
 "#;
 
 /// Where the guest writes [`PY_BOOTSTRAP`]: root-owned, so `nobody` can't edit it.
@@ -549,6 +551,16 @@ mod tests {
             py(&["tools/run.py"], ws.path(), true, boot.path()).unwrap(),
             0,
             "script dir still importable"
+        );
+        // A console script (`pytest`) lives outside the tree: the project
+        // still imports from the cwd.
+        let bin = tempfile::tempdir().unwrap();
+        let script = bin.path().join("console-script");
+        std::fs::write(&script, "import mypkg\n").unwrap();
+        assert_eq!(
+            py(&[script.to_str().unwrap()], ws.path(), true, boot.path()).unwrap(),
+            0,
+            "cwd importable under a console script"
         );
         let setup = dropped_grader_setup();
         assert!(!setup.contains(';'), "{setup}");

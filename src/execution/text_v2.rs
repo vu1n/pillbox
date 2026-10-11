@@ -49,6 +49,14 @@ pub(crate) struct TextRequestV2 {
     pub(crate) limits: TextLimits,
 }
 
+fn valid_identity(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
 /// A terminal state to record on the invocation. `Err` from [`execute`] is reserved
 /// for an unconfirmed VM teardown, which must not seal the invocation.
 pub(crate) enum Outcome {
@@ -86,6 +94,37 @@ impl TextRequestV2 {
                 "codex" | "claude_code" | "pi" | "opencode" | "grok_build"
             ),
             "unknown text harness"
+        );
+        ensure!(
+            valid_identity(&self.invocation_id) && valid_identity(&self.session_ref.session_id),
+            "text identity must contain 1..128 ASCII letters, digits, hyphens or underscores"
+        );
+        ensure!(
+            !self.rendered_input.is_empty()
+                && self.rendered_input.len() <= text::MAX_RENDERED_INPUT_BYTES,
+            "rendered input must contain 1..524288 UTF-8 bytes"
+        );
+        ensure!(
+            self.output_format.kind == "text" && self.output_format.retry_count == 0,
+            "unsupported text output format"
+        );
+        let limits = &self.limits;
+        ensure!(
+            (1..=super::MAX_TIMEOUT_MS).contains(&limits.timeout_ms),
+            "invalid text timeout"
+        );
+        ensure!(
+            (1..=text::MAX_FINAL_TEXT_BYTES).contains(&limits.max_final_text_bytes),
+            "invalid final text byte limit"
+        );
+        ensure!(
+            (1..=super::MAX_FRAME_BYTES).contains(&limits.max_frame_bytes),
+            "invalid native frame byte limit"
+        );
+        ensure!(
+            (1..=super::MAX_EVIDENCE_BYTES).contains(&limits.max_evidence_bytes)
+                && limits.max_frame_bytes <= limits.max_evidence_bytes,
+            "invalid native evidence byte limit"
         );
         Ok(())
     }
@@ -406,6 +445,26 @@ mod tests {
             request(harness, "any-model").validate().unwrap();
         }
         assert!(request("custom", "any-model").validate().is_err());
+    }
+
+    #[test]
+    fn grok_build_rejects_a_request_outside_the_closed_limits() {
+        let mut bad = request("grok_build", "grok-4.6");
+        bad.rendered_input.clear();
+        bad.rendered_input_hash = digest(b"");
+        assert!(bad.validate().is_err());
+        let mut bad = request("grok_build", "grok-4.6");
+        bad.limits.max_final_text_bytes = 0;
+        assert!(bad.validate().is_err());
+        let mut bad = request("grok_build", "grok-4.6");
+        bad.limits.timeout_ms = 0;
+        assert!(bad.validate().is_err());
+        let mut bad = request("grok_build", "grok-4.6");
+        bad.output_format.retry_count = 1;
+        assert!(bad.validate().is_err());
+        let mut bad = request("grok_build", "grok-4.6");
+        bad.session_ref.session_id = "has space".into();
+        assert!(bad.validate().is_err());
     }
 
     #[test]

@@ -1277,6 +1277,42 @@ fn artifact_ref_json(
 /// `session done` self-report); its combined output is the feedback gradient.
 /// `--cmd` is one command; `--rubric FILE` is N named criteria → per-criterion
 /// verdicts + a fractional score. `--in-sandbox` runs it in a one-shot microVM.
+/// Run a compiled grader script on the host in `dir` → `(exit code, combined
+/// raw output)`. Shared by `session score` (host path) and [`grade_dir`].
+fn run_host_grader(dir: &std::path::Path, exec_cmd: &str) -> Result<(i32, String)> {
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(exec_cmd)
+        .current_dir(dir)
+        .output()
+        .map_err(|e| PillboxError::runtime("session score", format!("run grader: {e}")))?;
+    Ok((
+        out.status.code().unwrap_or(-1),
+        grader::combine_streams(&out.stdout, &out.stderr),
+    ))
+}
+
+/// Grade a plain directory with a `--cmd` xor `--rubric` grader on the host,
+/// with no session and no §0 record — the same verdict `session score` would
+/// produce for that dir. `dispatch --baseline-check` uses it to grade the
+/// bookmark's base before any worker exists.
+pub(crate) fn grade_dir(
+    dir: &std::path::Path,
+    cmd: Option<&str>,
+    rubric: Option<&std::path::Path>,
+) -> Result<crate::contract::Scored> {
+    let spec = grader::GraderSpec::resolve(cmd, rubric)?;
+    let (code, raw) = run_host_grader(dir, &spec.exec_command())?;
+    let result = grader::grade_result(&spec, code, raw);
+    Ok(crate::contract::Scored {
+        grader: spec.label(),
+        passed: result.passed,
+        score: result.score,
+        feedback: result.feedback,
+        criteria: result.criteria,
+    })
+}
+
 #[allow(clippy::too_many_arguments)] // a CLI leaf handler — args mirror parsed flags 1:1
 fn session_score(
     resolved: &Pillbox,
@@ -1343,16 +1379,7 @@ fn session_score(
     let (code, raw) = if in_sandbox {
         libkrun_score_in_sandbox(resolved, &grade_dir, &exec_cmd, grader_egress)?
     } else {
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(&exec_cmd)
-            .current_dir(&grade_dir)
-            .output()
-            .map_err(|e| PillboxError::runtime("session score", format!("run grader: {e}")))?;
-        (
-            out.status.code().unwrap_or(-1),
-            grader::combine_streams(&out.stdout, &out.stderr),
-        )
+        run_host_grader(&grade_dir, &exec_cmd)?
     };
 
     // Score the (exit, output) into a verdict — binary for --cmd, fractional +

@@ -152,6 +152,8 @@ running during the grade can still create files there but can't rename or
 unlink the restored entries. The grader runs as `nobody` (`--drop-privileges`),
 because the virtiofs server writes as the host user and a root guest could
 `chmod` the lock off and let `build.rs` rewrite the tests before they compile.
+Git's `safe.directory` is set to `*` for the grader, since `nobody` doesn't own the
+mounted tree and git would otherwise refuse it as dubious ownership.
 `PYTHONDONTWRITEBYTECODE` is set so pytest does not need to write `__pycache__`
 into a locked `tests/`. `PYTHONSAFEPATH=1` plus a root-owned `sitecustomize.py`
 first import the image's test runners (pytest, pluggy and the like), block

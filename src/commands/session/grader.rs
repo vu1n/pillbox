@@ -199,12 +199,16 @@ const PY_BOOTSTRAP_DIR: &str = "/tmp/.pillbox-py";
 pub(crate) const RUNUSER: &str = "/usr/sbin/runuser";
 
 /// Guest setup that runs as root right before a grader drops to `nobody`: the
-/// grader env (`HOME`, no bytecode, the Python bootstrap). An `&&` chain with
+/// grader env (`HOME`, no bytecode, the Python bootstrap, and git's
+/// `safe.directory`, since `nobody` doesn't own the mounted tree and git would
+/// otherwise refuse it as dubious ownership; every repo in the VM is the
+/// worker's anyway). An `&&` chain with
 /// no `;`, so the caller's `mount && cd &&` prefix still gates the marker.
 #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) fn dropped_grader_setup() -> String {
     format!(
         "export HOME=/tmp PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PYTHONPATH={PY_BOOTSTRAP_DIR} \
+         GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*' \
          && mkdir -p {PY_BOOTSTRAP_DIR} && printf '%s' {} > {PY_BOOTSTRAP_DIR}/sitecustomize.py \
          && chmod 755 {PY_BOOTSTRAP_DIR} && chmod 644 {PY_BOOTSTRAP_DIR}/sitecustomize.py",
         sh_quote(&py_bootstrap())
@@ -647,6 +651,18 @@ mod tests {
             "rides a quoted && chain"
         );
         assert!(setup.contains("PYTHONSAFEPATH=1"), "{setup}");
+        // The setup's own env, in a shell: git trusts a tree nobody doesn't own.
+        let env = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "{} && git config --get safe.directory",
+                setup.split(" && ").next().unwrap()
+            ))
+            .output()
+            .unwrap();
+        if env.status.code() != Some(127) {
+            assert_eq!(String::from_utf8_lossy(&env.stdout).trim(), "*", "{setup}");
+        }
     }
 
     #[test]

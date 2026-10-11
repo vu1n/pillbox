@@ -250,8 +250,10 @@ normalizer are deleted. Docker refuses server agents with a usage error.
   moves to Stratus (`vu1n/stratus`, TypeScript). The `pillbox` binary becomes
   its engine, called only through JSON subcommands with versioned output.
 - **pillbox keeps:**
-  - the local microVM placement (libkrun per ADR-001; the VMM choice is being
-    evaluated separately and would change here, not in Stratus);
+  - the local microVM placement: libkrun on macOS per ADR-001, kept after a
+    2026-10-11 comparison (Firecracker, Cloud Hypervisor and Apple's VMs boot no
+    faster). Linux hosts without KVM use Stratus's container or Cloudflare
+    placements instead;
   - the vault credential proxy;
   - rustic workspace snapshots;
   - the §0 session log;

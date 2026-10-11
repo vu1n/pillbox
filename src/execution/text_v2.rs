@@ -83,10 +83,29 @@ impl TextRequestV2 {
         ensure!(
             matches!(
                 self.agent.harness.as_str(),
-                "codex" | "claude_code" | "pi" | "opencode"
+                "codex" | "claude_code" | "pi" | "opencode" | "prime-agent"
             ),
             "unknown text harness"
         );
+        if self.agent.harness == "prime-agent" {
+            ensure!(
+                !self.rendered_input.is_empty() && self.rendered_input.len() <= 512 * 1024,
+                "invalid Prime rendered input size"
+            );
+            ensure!(
+                self.output_format.kind == "text" && self.output_format.retry_count == 0,
+                "unsupported Prime output format"
+            );
+            ensure!(
+                (1..=super::MAX_TIMEOUT_MS).contains(&self.limits.timeout_ms)
+                    && (1..=super::prime_protocol::MAX_FINAL_TEXT as u64)
+                        .contains(&self.limits.max_final_text_bytes)
+                    && (1..=super::MAX_FRAME_BYTES).contains(&self.limits.max_frame_bytes)
+                    && (1..=super::MAX_EVIDENCE_BYTES).contains(&self.limits.max_evidence_bytes)
+                    && self.limits.max_frame_bytes <= self.limits.max_evidence_bytes,
+                "invalid Prime text limits"
+            );
+        }
         Ok(())
     }
 
@@ -147,6 +166,9 @@ pub(crate) fn execute(
     request: &TextRequestV2,
     owner: &mut OwnedInvocation,
 ) -> Result<Outcome> {
+    if request.agent.harness == "prime-agent" {
+        return super::prime_text::execute(pb, request, owner);
+    }
     let resolved = resolve(pb, request);
     let (lowered, runner_image_id) = match resolved {
         Ok(resolved) => resolved,
@@ -343,7 +365,7 @@ mod tests {
 
     #[test]
     fn every_pillbox_harness_is_a_valid_selection() {
-        for harness in ["codex", "claude_code", "pi", "opencode"] {
+        for harness in ["codex", "claude_code", "pi", "opencode", "prime-agent"] {
             request(harness, "any-model").validate().unwrap();
         }
         assert!(request("custom", "any-model").validate().is_err());

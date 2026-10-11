@@ -183,6 +183,11 @@ RUN curl --proto '=https' --proto-redir '=https' -fsSL https://app.primeintellec
 	&& test "$(prime-agent --version)" = "${PRIME_AGENT_VERSION}" \
 	&& rm /tmp/prime-agent-install.sh
 
+# Probe only the offline catalog, with a nonsecret placeholder and no prompt.
+COPY runner/prime-text-profile.py /tmp/prime-text-profile.py
+RUN python3 /tmp/prime-text-profile.py /usr/local/bin/prime-agent /opt/pillbox-prime-text/profile.json \
+	&& rm /tmp/prime-text-profile.py
+
 # Cursor Agent CLI: versioned lab tarball (same URL the install script uses).
 # Pin CURSOR_AGENT_VERSION and bump by hand when upgrading — Renovate cannot
 # track cursor.com/lab releases today.

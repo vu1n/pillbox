@@ -36,12 +36,24 @@ rebuild silently reuses the stale layer instead of pulling the newer agent.
 | pi | `npm i -g @earendil-works/pi-coding-agent@<pinned>` | `PI_VERSION` | yes — npm |
 | prime-agent | official native installer, checksummed release archive under `/opt/prime-agent` | `PRIME_AGENT_VERSION` | no — stable feed via `build-runner.sh --update` |
 
-Prime Agent is bundled as a command-line tool. It is not yet registered as a
-Pillbox agent: `--agent prime-agent`, managed auth, and structured session events
-require a separate adapter. Its Python kernel dependencies are not pre-provisioned;
+Prime Agent is registered as `--agent prime-agent`, with a global managed auth
+home, a Prime Inference vault adapter and structured session events. The sealed
+text driver uses the empty native tool registry; its Python kernel is disabled.
+Its Python kernel dependencies are not pre-provisioned;
 workflows using that kernel still need an explicit setup step and network access.
 The complete native release lives outside the runtime HOME so its assets survive
 home-directory mounts.
+
+Runner assembly probes the installed Prime binary's `--version` and offline
+RPC `get_available_models` without submitting a prompt, using a nonsecret
+placeholder in an empty HOME. It writes `/opt/pillbox-prime-text/profile.json`.
+This captures compiled Prime models that are absent from `models.bundled.json`.
+The text driver reads that profile from the exact immutable image clone at
+resolve and checks the native version again before the turn. Native 0.9.8 is
+the qualified cohort; changing its pin requires tool-denial and protocol
+qualification. Old runner images lacking the profile fail closed at resolve.
+See [Prime Agent text qualification](prime-agent-text.md) for the pending live
+macOS libkrun gate.
 
 The October 4 refresh pins Claude 2.1.289, Codex 0.160.0, Cursor
 2026.10.01-e373342, Amp 0.0.1791091069-gb9917f, OpenCode 1.18.34, Pi 1.0.2,

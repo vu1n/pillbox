@@ -34,6 +34,7 @@
 
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int};
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -598,11 +599,9 @@ fn read_swap_pairs() -> Vec<vault::CredSwap> {
         .collect()
 }
 
-/// CoW-clone the agent's auth home and replace its OAuth tokens with stubs, so the
-/// guest mounts *stubbed* creds — the real tokens never enter the VM; the MITM
-/// swaps stub→real on the wire. Returns the stubbed-creds dir to mount + the
-/// (stub, real) pairs. Anthropic-shaped (`claudeAiOauth` in the credentials file);
-/// other agents get the home cloned as-is + no pairs (transparent relay).
+/// CoW-clone the agent's auth home into a private, throwaway directory. Managed
+/// callers must scrub credentials and executable configuration before mounting
+/// this clone into a guest.
 fn cow_clone_home(home: &Path) -> Result<PathBuf> {
     let clone = krun_cache_dir()?
         .join("creds")
@@ -630,29 +629,41 @@ fn stub_oauth_creds(
     let mut pairs = Vec::new();
     let mut access_stub = None;
     let creds_file = clone.join(spec.cred_sentinel);
+    let provider = crate::vault::providers::provider_for(spec.auth_id);
+    let mut scrubbed_credentials = None;
     if let Ok(text) = std::fs::read_to_string(&creds_file) {
         if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&text) {
-            // The provider registry is the sole OAuth shape dispatch. Host-proxy
+            // The provider registry is the sole credential shape dispatch. Host-proxy
             // and libkrun stubbing are distinct codec operations because libkrun
             // can intentionally withhold a refresh-token release pair.
-            if let Some(provider) = crate::vault::providers::provider_for(spec.auth_id) {
-                if let Some(codec) = provider.oauth_codec() {
-                    let stubbed = codec.libkrun_stub(&mut json);
-                    access_stub = stubbed.access_stub;
-                    pairs.extend(stubbed.releases.into_iter().map(|release| SwapPair {
-                        stub: release.stub,
-                        real: release.real,
-                        hosts: hosts.to_vec(),
-                    }));
-                }
+            if let Some(provider) = provider.as_ref() {
+                let stubbed = provider
+                    .libkrun_credentials(&mut json)
+                    .map_err(anyhow::Error::msg)?;
+                access_stub = stubbed.access_stub;
+                pairs.extend(stubbed.releases.into_iter().map(|release| SwapPair {
+                    stub: release.stub,
+                    real: release.real,
+                    hosts: hosts.to_vec(),
+                }));
             }
             if !pairs.is_empty() {
-                let body = serde_json::to_string(&json).context("reserialize stubbed creds")?;
-                // The clone's file is already 0600 (clonefile preserves perms) and
-                // `write` truncates in place without changing them.
-                std::fs::write(&creds_file, body).context("write stubbed creds")?;
+                scrubbed_credentials = Some(json);
             }
         }
+    }
+    // Scrub even when the auth file is absent or unreadable: executable Prime
+    // configuration may itself contain credentials and must never reach a VM.
+    if let Some(provider) = provider {
+        provider.sanitize_cloned_home(&clone)?;
+    }
+    if let Some(json) = scrubbed_credentials {
+        let body = serde_json::to_string(&json).context("reserialize stubbed creds")?;
+        // Providers may recreate the cloned configuration tree. Always restrict
+        // the new or preserved credential file to its owner.
+        std::fs::write(&creds_file, body).context("write stubbed creds")?;
+        std::fs::set_permissions(&creds_file, std::fs::Permissions::from_mode(0o600))
+            .context("restrict stubbed credentials")?;
     }
     Ok((clone, pairs, access_stub))
 }

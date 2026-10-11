@@ -488,6 +488,31 @@ pub const PI: AgentSpec = AgentSpec {
     libkrun_pty: None,
 };
 
+/// Native Prime Agent with managed Prime Inference auth and JSONL session events.
+pub const PRIME_AGENT: AgentSpec = AgentSpec {
+    id: "prime-agent",
+    auth_id: "prime-agent",
+    integration: Integration::Structured,
+    cred_sentinel: ".prime/agent/auth.json",
+    // The pinned native CLI authenticates through TUI `/login`.
+    login_argv: &["prime-agent"],
+    run_argv: &["prime-agent"],
+    oauth_port: None,
+    post_login_finalize: None,
+    vault_capable: true,
+    mcp_inject: None,
+    sandbox_args: &[],
+    prepare_workspace: None,
+    server: None,
+    structured: Some(StructuredProfile {
+        events_file: ".pillbox-prime-events.jsonl",
+        model: StructuredModelPolicy::RequireProviderModel,
+        alt_auth_env: None,
+    }),
+    #[cfg(feature = "libkrun")]
+    libkrun_pty: None,
+};
+
 pub const ALL: &[&AgentSpec] = &[
     &CLAUDE,
     &CLAUDE_STREAM,
@@ -496,6 +521,7 @@ pub const ALL: &[&AgentSpec] = &[
     &OPENCODE,
     &PI,
     &CURSOR,
+    &PRIME_AGENT,
 ];
 
 /// Look up an agent spec by id, or return a usage error listing the

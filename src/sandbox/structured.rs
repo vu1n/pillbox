@@ -9,7 +9,9 @@ use std::io::{BufRead as _, Read};
 
 use anyhow::{Context, Result};
 
-use crate::agents::harness::{ClaudeAdapter, CursorAdapter, HarnessAdapter, PiAdapter};
+use crate::agents::harness::{
+    ClaudeAdapter, CursorAdapter, HarnessAdapter, PiAdapter, PrimeAdapter,
+};
 use crate::contract::{Actor, Event, Payload, RequestedRunProfile, RunFinished, RunStarted};
 use crate::events::log::SessionLog;
 
@@ -130,6 +132,7 @@ enum Adapter {
     Pi(PiAdapter),
     Cursor(CursorAdapter),
     Claude(ClaudeAdapter),
+    Prime(PrimeAdapter),
 }
 
 impl Adapter {
@@ -146,6 +149,12 @@ impl Adapter {
                 None => Self::Cursor(CursorAdapter::default()),
             }),
             "claude-stream" => Ok(Self::Claude(ClaudeAdapter::with_request(requested))),
+            "prime-agent" => {
+                let requested = requested.ok_or_else(|| {
+                    anyhow::anyhow!("Prime Agent structured path requires a RequestedRunProfile")
+                })?;
+                Ok(Self::Prime(PrimeAdapter::with_request(requested)))
+            }
             other => anyhow::bail!("structured mode is not wired for agent `{other}`"),
         }
     }
@@ -153,6 +162,7 @@ impl Adapter {
     fn run_argv(&self, prompt: &str) -> Vec<String> {
         match self {
             Self::Pi(a) => a.run_argv(prompt),
+            Self::Prime(a) => a.run_argv(prompt),
             Self::Cursor(a) => a.run_argv(prompt),
             // The libkrun guest runs as root: never the docker adapter's
             // `--dangerously-skip-permissions` argv (claude refuses it as root).
@@ -163,6 +173,7 @@ impl Adapter {
     fn parse_line(&mut self, line: &serde_json::Value) -> Vec<Payload> {
         match self {
             Self::Pi(a) => a.parse_line(line),
+            Self::Prime(a) => a.parse_line(line),
             Self::Cursor(a) => a.parse_line(line),
             Self::Claude(a) => a.parse_line(line),
         }
@@ -171,6 +182,7 @@ impl Adapter {
     fn terminal_payload(&self, exit_code: i32) -> RunFinished {
         match self {
             Self::Pi(a) => a.terminal_payload(exit_code),
+            Self::Prime(a) => a.terminal_payload(exit_code),
             Self::Cursor(a) => a.terminal_payload(exit_code),
             Self::Claude(a) => a.terminal_payload(exit_code),
         }

@@ -26,6 +26,8 @@ use crate::execution::Verifier;
 use crate::paths::write_private_file;
 use crate::vault::providers::codex_execution::CodexAccessRelease;
 
+pub(crate) mod opencode;
+
 const PROVIDER_HOST: &str = "chatgpt.com";
 const RPC_PORT: u32 = 1067;
 const MAX_DURATION: Duration = Duration::from_secs(86_400);

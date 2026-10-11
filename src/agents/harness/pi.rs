@@ -270,6 +270,12 @@ fn pi_message_end(line: &Value, state: &mut PiState) -> Vec<Payload> {
         state.open_messages.remove(&id);
         out.push(Payload::MessageEnd(MessageEnd::new(id)));
     }
+    if let Some(usage) = crate::execution::usage::TurnUsage::from_pi_message(msg) {
+        out.push(Payload::Custom(Custom {
+            name: "usage".into(),
+            payload: Some(serde_json::json!({"turn_usage": usage})),
+        }));
+    }
     out
 }
 
@@ -656,6 +662,22 @@ mod tests {
             json!({"type":"message_update","message":{"role":"assistant","timestamp":1},
                 "assistantMessageEvent":{"type":"thinking_delta","contentIndex":0,"delta":"hmm","partial":{}}}),
         ])
+        .is_empty());
+    }
+
+    #[test]
+    fn pi_terminal_usage_is_reported_and_absent_usage_is_not_invented() {
+        let out = pi_run(&[json!({"type":"message_end", "message": {
+            "role":"assistant", "stopReason":"stop", "content":[],
+            "usage":{"input":12,"output":3,"cacheRead":7,"cacheWrite":2,"cost":{"total":0.0123}}
+        }})]);
+        assert!(
+            matches!(out.as_slice(), [Payload::Custom(custom)] if custom.name == "usage"
+            && custom.payload.as_ref().unwrap()["turn_usage"]["input_tokens"] == 12)
+        );
+        assert!(pi_run(&[json!({"type":"message_end", "message": {
+            "role":"assistant", "stopReason":"stop", "content":[]
+        }})])
         .is_empty());
     }
 }

@@ -31,6 +31,60 @@ pub(crate) struct TurnUsage {
 }
 
 impl TurnUsage {
+    /// Native Responses counters precede Pi's terminal normalization. Preserve
+    /// reported spend even when the provider's terminal status must be refused.
+    pub(crate) fn from_pi_provider_usage(native: &Value) -> Option<Self> {
+        let cached = native["input_tokens_details"]["cached_tokens"].as_u64();
+        let writes = native["input_tokens_details"].get("cache_write_tokens");
+        let written = writes.and_then(Value::as_u64);
+        let exclusive = native["input_tokens"]
+            .as_u64()
+            .zip(cached)
+            .filter(|_| writes.is_none() || written.is_some())
+            .and_then(|(total, cached)| {
+                total.checked_sub(cached)?.checked_sub(written.unwrap_or(0))
+            });
+        Self::new(
+            None,
+            exclusive,
+            native["output_tokens"].as_u64(),
+            cached,
+            written,
+        )
+    }
+
+    /// Pi calculates a catalog cost after consuming a complete native response.
+    /// Its initialized zero fields are not evidence of reported usage. A cost
+    /// based on missing native inputs is likewise not a complete reported cost.
+    pub(crate) fn from_pi_text_message(message: &Value, native: &Value) -> Option<Self> {
+        let mut usage = Self::from_pi_provider_usage(native)?;
+        if message["role"] == "assistant"
+            && message["stopReason"] == "stop"
+            && usage.input_tokens.is_some()
+            && usage.output_tokens.is_some()
+            && usage.cache_read_tokens.is_some()
+        {
+            usage.cost_usd = Self::from_pi_message(message).and_then(|usage| usage.cost_usd);
+        }
+        Some(usage)
+    }
+
+    /// Pi's completed assistant usage is already exclusive of caches. Its cost
+    /// is Pi's catalog-derived figure, not a price calculated by Pillbox.
+    pub(crate) fn from_pi_message(message: &Value) -> Option<Self> {
+        if message["role"] != "assistant" {
+            return None;
+        }
+        let usage = &message["usage"];
+        Self::new(
+            usage["cost"]["total"].as_f64(),
+            usage["input"].as_u64(),
+            usage["output"].as_u64(),
+            usage["cacheRead"].as_u64(),
+            usage["cacheWrite"].as_u64(),
+        )
+    }
+
     fn new(
         cost_usd: Option<f64>,
         input_tokens: Option<u64>,
@@ -153,6 +207,10 @@ mod tests {
         );
         assert_eq!(TurnUsage::from_codex_frames(&codex_turn(&[])), None);
         assert_eq!(TurnUsage::from_codex_frames(&[]), None);
+        assert_eq!(
+            TurnUsage::from_pi_message(&json!({"role": "assistant"})),
+            None
+        );
     }
 
     #[test]
@@ -226,5 +284,26 @@ mod tests {
     fn the_shape_is_closed() {
         let extra = json!({"cost_usd": null, "input_tokens": 1, "total_tokens": 2});
         assert!(serde_json::from_value::<TurnUsage>(extra).is_err());
+    }
+
+    #[test]
+    fn pi_reports_cost_and_already_exclusive_counts_without_repricing() {
+        let usage = TurnUsage::from_pi_message(&json!({"role": "assistant", "usage": {
+            "input": 12, "output": 30, "cacheRead": 5000, "cacheWrite": 800,
+            "reasoning": 10, "cost": {"total": 0.0123}}}))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(usage).unwrap(),
+            json!({"cost_usd": 0.0123,
+            "input_tokens": 12, "output_tokens": 30, "cache_read_tokens": 5000, "cache_write_tokens": 800})
+        );
+        let tokens_only =
+            TurnUsage::from_pi_message(&json!({"role": "assistant", "usage": {"input": 7}}))
+                .unwrap();
+        assert_eq!(tokens_only.cost_usd, None);
+        assert_eq!(tokens_only.output_tokens, None);
+        assert!(
+            TurnUsage::from_pi_message(&json!({"role": "user", "usage": {"input": 7}})).is_none()
+        );
     }
 }

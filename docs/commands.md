@@ -556,8 +556,35 @@ that image. A completed record carries `resolved` (`harness`,
 `runtime_timeout`, `runtime_rejected`, `runtime_protocol_error`,
 `internal_error`) and the `stage` that was running (`resolve`, `credentials`,
 `image_prepare`, `guest_prepare`, `vmm_spawn`, `guest_rpc_ready`, `turn`,
-`finalize`); the message stays in the session log. Only `codex` has a text
-driver today; the other harnesses fail at `resolve` with `runtime_rejected`.
+`finalize`); the message stays in the session log. `codex` and `pi` have text
+drivers; the other harnesses fail at `resolve` with `runtime_rejected`.
+
+Pi probes the configured immutable runner image in an owned **libkrun VM with
+no egress or credentials** to resolve its version and offline model catalog.
+The qualified adapter currently accepts bundled Pi 1.0.2, the image's
+`openai-codex` text models (model ID or `openai-codex/ID`), and native `low`,
+`medium`, or `high` reasoning. Unsupported models or effort fail at `resolve`
+with `runtime_rejected`, before credentials or inference. Pi uses the existing
+managed Codex credential reference internally; absent, malformed, expired, or
+renewal-due credentials fail with `runtime_unavailable` at `credentials`. The bounded adapter leases an
+already-fresh credential; renew through the existing host broker before retrying.
+This does not enable vaulting
+for ordinary `pillbox run --agent pi`.
+
+The Pi SDK runs with an empty tool allowlist and empty resources: no MCP,
+extensions, filesystem tools, discovered context, or prompt templates. It uses
+an in-memory session and settings, disables retries, compaction, and cache
+warming, and allows one provider call. The fresh guest has no host shares;
+networking allows only `chatgpt.com` through the existing host vault. Both the
+bearer and account-routing identity are synthetic guest stubs; real values
+stay host-side. The original provider terminal status must be `completed`;
+empty, truncated, oversized, multiple, or unconfirmed answers fail with
+`runtime_protocol_error` at `turn`. Pi accepts final-text limits up to 32 KiB
+and never pads or truncates text. The deadline covers resolution and execution;
+the evidence budget covers both probe/turn raw output, diagnostics, and final
+text. Provider SSE bytes are also capped before SDK parsing, with the same frame
+and evidence limits. `served_model` comes from the provider's terminal response, or is `null`;
+Pi's assistant `model` field is the requested model and is not used as authority.
 
 A completed record, and a failed one whose turn already spent tokens, carries
 `usage` when the harness reported any:
@@ -581,19 +608,29 @@ nothing gets no `usage` key, never zeros. A value that is not a number, is
 negative or non-finite, or exceeds 10^10 tokens or $1,000,000 is dropped; when
 nothing valid remains, `usage` is absent.
 
-| field | codex (`thread/tokenUsage/updated`, `tokenUsage.total`) | claude_code (`result` line) |
-|---|---|---|
-| `cost_usd` | `null` (Codex reports no cost) | `total_cost_usd` (API-equivalent on a subscription, not a bill) |
-| `input_tokens` | `inputTokens` − `cachedInputTokens` − `cacheWriteInputTokens` (dropped if negative) | `usage.input_tokens` |
-| `output_tokens` | `outputTokens` | `usage.output_tokens` |
-| `cache_read_tokens` | `cachedInputTokens` | `usage.cache_read_input_tokens` |
-| `cache_write_tokens` | `cacheWriteInputTokens` | `usage.cache_creation_input_tokens` |
+| field | codex (`thread/tokenUsage/updated`, `tokenUsage.total`) | claude_code (`result` line) | pi (terminal assistant message) |
+|---|---|---|---|
+| `cost_usd` | `null` (Codex reports no cost) | `total_cost_usd` (API-equivalent on a subscription, not a bill) | `usage.cost.total` (Pi's catalog-equivalent figure, not a bill), or `null` |
+| `input_tokens` | `inputTokens` − `cachedInputTokens` − `cacheWriteInputTokens` (dropped if negative) | `usage.input_tokens` | `usage.input` (already excludes caches) |
+| `output_tokens` | `outputTokens` | `usage.output_tokens` | `usage.output` (includes reasoning) |
+| `cache_read_tokens` | `cachedInputTokens` | `usage.cache_read_input_tokens` | `usage.cacheRead` |
+| `cache_write_tokens` | `cacheWriteInputTokens` | `usage.cache_creation_input_tokens` | `usage.cacheWrite` |
 
 Codex's newest `total` for the invocation's thread and turn is the turn's usage,
 because a text invocation runs one turn on a fresh thread. The claude_code
 column is what the Claude harness writes as `turn_usage` in its `usage` session
 event, ready for when it gets a text driver. Both versions append the same
 `usage` event (`{"turn_usage": …}`) to the text session log.
+Pi text/2 preserves native field presence: input is native `input_tokens` minus
+reported cache reads and writes, output is `output_tokens`, and caches come from
+`input_tokens_details.cached_tokens` / `cache_write_tokens`. Absent fields stay
+omitted; input is omitted if cache reads are unavailable or the breakdown is
+invalid. Pi cost is forwarded only after complete native counters were normalized
+by Pi. Truncated/failed provider replies preserve native counts with a null cost
+when Pi did not finish reporting it. Initialized SDK zeros never become invented usage. The ordinary Pi harness
+also emits `turn_usage` for usage it reports on a terminal assistant message.
+Linux fake-transport and bundled-SDK tests do not replace the required
+authenticated macOS libkrun live-turn gate; see [the handoff](pi-text-v2-handoff.md).
 
 Both versions append a `text.stage.completed` event per stage to the session
 log and emit `session.started` / `session.completed` / `session.failed`

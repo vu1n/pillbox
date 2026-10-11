@@ -63,6 +63,19 @@ jobs:
         run: |
           bash -n scripts/smoke/repository-execution.sh
           python3 -m unittest discover -s scripts/smoke/repository-execution -p 'test_*.py' -v
+      - uses: actions/setup-node@v4
+        if: matrix.os == 'ubuntu-latest'
+        with:
+          node-version: '24'
+      - name: Pi text transport and bundled SDK (offline inference)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          node --test tests/pi_text_driver.test.mjs
+          python3 -m unittest discover -s tests -p 'pi_text_bridge_test.py'
+          PI_TEST_PACKAGE_DIR=$(mktemp -d)
+          npm pack @earendil-works/pi-coding-agent@1.0.2 --ignore-scripts --pack-destination "$PI_TEST_PACKAGE_DIR" --silent
+          tar -xzf "$PI_TEST_PACKAGE_DIR/earendil-works-pi-coding-agent-1.0.2.tgz" -C "$PI_TEST_PACKAGE_DIR"
+          node tests/pi_text_bundle.mjs "$PI_TEST_PACKAGE_DIR/package"
       - run: cargo test --no-default-features --all-targets
       - if: matrix.os == 'ubuntu-latest'
         run: cargo clippy --no-default-features --all-targets -- -D warnings

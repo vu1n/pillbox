@@ -246,30 +246,33 @@ normalizer are deleted. Docker refuses server agents with a usage error.
 ## 2026-10-11 — pillbox becomes Stratus's Rust engine
 **Status: Accepted by Vu (2026-10-11), pending ratification of this wording.**
 
-- **Decision:** the user-facing entry point for local and cloud agent sessions
-  moves to Stratus (`vu1n/stratus`, TypeScript). The `pillbox` binary becomes
-  its engine, called only through JSON subcommands with versioned output.
-- **pillbox keeps:**
-  - the local microVM placement: libkrun on macOS per ADR-001, kept after a
-    2026-10-11 comparison (Firecracker, Cloud Hypervisor and Apple's VMs boot no
-    faster). Linux hosts without KVM use Stratus's container or Cloudflare
-    placements instead;
+- **Decision:** Stratus (`vu1n/stratus`, TypeScript) becomes the user-facing
+  entry point for local and cloud agent sessions. The `pillbox` binary becomes
+  its engine: Stratus calls it only through JSON subcommands with versioned
+  output.
+- **The engine keeps:**
+  - local microVM placement: libkrun on macOS per ADR-001, kept after a
+    2026-10-11 comparison in which Firecracker, Cloud Hypervisor and Apple's
+    VMs booted no faster. Linux hosts without KVM use
+    Stratus's container or Cloudflare placements instead;
   - the vault credential proxy;
   - rustic workspace snapshots;
-  - the §0 session log;
-  - a new session packet (`checkpoint pack|unpack`).
-- **Session packet:** specified as JSON Schema, not Rust types. The
-  `--no-default-features` Linux build carries every packet subcommand, so
-  Cloudflare containers, which already ship a Linux `pillbox` for workspace
-  restore and backup, write the same packet as macOS.
-- **CLI surface:** no new user-facing commands. Existing ones keep working until
-  Stratus covers them, then are deprecated one entry at a time in this log.
-- **Why:** the cloud controller must be TypeScript (Workers can't run a Rust
-  CLI), and keeping a Rust entry point meant the same control logic in two
-  languages; the managed TypeScript was already a contract version behind.
-  Measured on Linux, Rust's advantage is in the engine (VMM and proxy, about
-  10 MB per process against 50–100 MB for Node, 2.5 ms against 150–240 ms per
-  CLI start), not in a controller whose share of a ~24 s turn is milliseconds.
+  - the §0 session log.
+- **The engine gains** a session packet (`checkpoint pack|unpack`), specified as
+  JSON Schema rather than Rust types. The `--no-default-features` Linux build
+  carries every packet subcommand, so Cloudflare containers, which already ship
+  a Linux `pillbox` for workspace restore and backup, write the same packet as
+  macOS.
+- **CLI surface:** no new user-facing commands; engine subcommands such as
+  `checkpoint` exist for Stratus. Existing commands keep working until Stratus
+  covers them, and each is then deprecated by its own entry in this log.
+- **Why:** the cloud controller must be TypeScript (Workers cannot run a Rust
+  CLI), so a Rust entry point meant the same control logic in two languages,
+  and the managed tier's TypeScript already lagged the Rust contract by a
+  version. Measured on Linux, Rust's advantage is in the engine (VMM and proxy:
+  about 10 MB per process against 50–100 MB for Node, and 2.5 ms against
+  150–240 ms per CLI start), not in a controller whose share of a ~24 s turn is
+  milliseconds.
 - **Rejected:** pillbox staying the entry point with Stratus as its cloud tier
-  (two controllers); retiring pillbox entirely (loses the microVM, the
+  (two controllers); retiring pillbox entirely (it loses the microVM, the
   subscription-friendly proxy and rustic, or re-implements them in TypeScript).

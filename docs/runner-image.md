@@ -50,6 +50,14 @@ execution profile. Profiles requiring Codex 0.151.0 or 0.156.1 must keep their
 matching immutable images until their adapters and protocols have been qualified
 against a newer release.
 
+The `pillbox.text/2` Claude lane uses the configured image's installed binary
+and records its observed `claude_code_version`; callers cannot pin it. The
+adapter's conservative model catalog and tool-free launch flags were qualified
+against 2.1.289. A runner that does not support this protocol fails closed.
+Its live release gate is a macOS libkrun turn with existing vault subscription
+OAuth. Linux fake-harness and offline mock tests do not satisfy that gate; see
+`scripts/smoke/claude-text.sh` and `scripts/smoke/claude-text-offline.py`.
+
 On October 6 OpenCode moved to 2.0.24, installed from its new npm package
 `@opencode/cli` (OpenCode 2 is not published as `opencode-ai@2`). Its server
 API is a breaking change from 1.x (`/api/*` routes, a mandatory server password,

@@ -39,14 +39,14 @@ const STAGES: [&str; 6] = [
 /// telemetry as a `pillbox run` session (`session.*` events with `startup_stages`,
 /// OTel when configured) plus a `text.stage.completed` evidence event per stage, so
 /// a slow or failed turn says where the time went.
-struct Stages {
+pub(super) struct Stages {
     timer: StartupTimer,
     completed: usize,
     started_emitted: bool,
 }
 
 impl Stages {
-    fn start() -> Self {
+    pub(super) fn start() -> Self {
         Self {
             timer: StartupTimer::start(),
             completed: 0,
@@ -55,11 +55,15 @@ impl Stages {
     }
 
     /// The stage that was running when the invocation ended.
-    fn in_progress(&self) -> &'static str {
+    pub(super) fn in_progress(&self) -> &'static str {
         STAGES.get(self.completed).copied().unwrap_or("finalize")
     }
 
-    fn complete(&mut self, name: &'static str, evidence: &mut ExecutionEvidence) -> Result<()> {
+    pub(super) fn complete(
+        &mut self,
+        name: &'static str,
+        evidence: &mut ExecutionEvidence,
+    ) -> Result<()> {
         self.timer.mark(name);
         self.completed += 1;
         let duration_ms = self
@@ -75,7 +79,7 @@ impl Stages {
         Ok(())
     }
 
-    fn emit_started(&mut self, pb: &Pillbox, session_id: &str) {
+    pub(super) fn emit_started(&mut self, pb: &Pillbox, session_id: &str) {
         if self.started_emitted {
             return;
         }
@@ -587,7 +591,7 @@ fn observed_cli_version(frames: &[serde_json::Value]) -> Option<String> {
     })
 }
 
-fn check_live(owner: &OwnedInvocation, deadline: Instant) -> Result<()> {
+pub(super) fn check_live(owner: &OwnedInvocation, deadline: Instant) -> Result<()> {
     ensure!(!owner.cancelled()?, "text invocation cancelled");
     ensure!(
         Instant::now() < deadline,

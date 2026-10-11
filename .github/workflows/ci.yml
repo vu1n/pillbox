@@ -63,6 +63,11 @@ jobs:
         run: |
           bash -n scripts/smoke/repository-execution.sh
           python3 -m unittest discover -s scripts/smoke/repository-execution -p 'test_*.py' -v
+      - name: Claude text smoke fixtures (offline)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          bash -n scripts/smoke/claude-text.sh
+          python3 scripts/smoke/test_claude_text_bridge.py
       - run: cargo test --no-default-features --all-targets
       - if: matrix.os == 'ubuntu-latest'
         run: cargo clippy --no-default-features --all-targets -- -D warnings

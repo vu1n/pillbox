@@ -258,7 +258,12 @@ impl Capture {
         loop {
             poll(false)?;
             let count = match stream.read(&mut chunk) {
-                Ok(0) => bail!("OpenCode guest closed the stream before the turn ended"),
+                Ok(0) => {
+                    // The guest closes without a frame when its own clock runs out, so an
+                    // expired deadline is reported as one, not as a protocol error.
+                    poll(false)?;
+                    bail!("OpenCode guest closed the stream before the turn ended")
+                }
                 Ok(count) => count,
                 Err(error)
                     if matches!(
@@ -273,11 +278,6 @@ impl Capture {
                 }
                 Err(error) => return Err(error).context("read the OpenCode guest stream"),
             };
-            self.bytes += count as u64;
-            ensure!(
-                self.bytes <= max_bytes,
-                "OpenCode evidence byte limit exceeded"
-            );
             for &byte in &chunk[..count] {
                 if byte != b'\n' {
                     ensure!(
@@ -294,8 +294,15 @@ impl Capture {
                 let frame: Value =
                     serde_json::from_slice(&line).context("invalid OpenCode guest frame")?;
                 line.clear();
-                self.frames
-                    .push(json!({"direction": "inbound", "message": frame}));
+                let envelope = json!({"direction": "inbound", "message": frame});
+                // Charge what the evidence store writes (envelope and newline), not the
+                // raw guest line, so the limit holds for the persisted artifact.
+                self.bytes += serde_json::to_vec(&envelope)?.len() as u64 + 1;
+                ensure!(
+                    self.bytes <= max_bytes,
+                    "OpenCode evidence byte limit exceeded"
+                );
+                self.frames.push(envelope);
                 if self.fold.observe(&frame)? {
                     return Ok(());
                 }
@@ -395,6 +402,46 @@ mod tests {
         assert!(read(100, 1 << 20).contains("frame byte limit"));
         assert!(read(1024, 100).contains("evidence byte limit"));
         assert!(read(1024, 1 << 20).contains("closed the stream"));
+    }
+
+    #[test]
+    fn the_byte_limit_charges_the_persisted_envelopes() {
+        let mut lines = opening();
+        lines.push(json!({"type": "session.execution.succeeded", "data": {"sessionID": "ses_1"}}));
+        let raw: u64 = lines
+            .iter()
+            .map(|line| line.to_string().len() as u64 + 1)
+            .sum();
+        let mut capture = Capture::default();
+        capture
+            .read(turn(&lines), 1024, 1 << 20, |_| Ok(()))
+            .unwrap();
+        let persisted: u64 = capture
+            .frames
+            .iter()
+            .map(|envelope| serde_json::to_vec(envelope).unwrap().len() as u64 + 1)
+            .sum();
+        assert!(raw < persisted - 1);
+        let read = |max_bytes| Capture::default().read(turn(&lines), 1024, max_bytes, |_| Ok(()));
+        read(persisted).unwrap();
+        let error = read(persisted - 1).unwrap_err().to_string();
+        assert!(error.contains("evidence byte limit"), "{error}");
+    }
+
+    #[test]
+    fn a_stream_closed_after_the_deadline_is_a_timeout() {
+        // The guest hangs up when its clock runs out; by then the host's has too.
+        let mut polls = 0;
+        let expired = |_: bool| -> Result<()> {
+            polls += 1;
+            ensure!(polls < 3, "text invocation deadline exceeded");
+            Ok(())
+        };
+        let error = Capture::default()
+            .read(turn(&opening()), 1024, 1 << 20, expired)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("deadline exceeded"), "{error}");
     }
 
     #[test]

@@ -3,8 +3,8 @@
 //! `sandbox::libkrun::repository::opencode`; this half is pure so Linux CI runs it.
 //!
 //! The guest drives `opencode serve` over its loopback HTTP API (create a session,
-//! prompt it) and relays each `/api/event` object to the host as one JSON line, after
-//! two control frames of its own (`{"pillbox":"info"|"session"|"error",...}`). The host
+//! prompt it) and relays each `/api/event` object to the host as one JSON line, with
+//! control frames of its own (`{"pillbox":"info"|"session"|"error"|"deadline",...}`). The host
 //! folds those lines with [`TurnFold`]. Shapes were captured from OpenCode 2.0.24
 //! (`fixtures/opencode-2.0.24-*.jsonl`), not read from its OpenAPI document.
 
@@ -238,6 +238,7 @@ impl TurnFold {
                 frame["stage"].as_str().unwrap_or("an unknown step"),
                 frame["status"]
             ),
+            "deadline" => bail!("OpenCode guest turn deadline exceeded"),
             other => bail!("unknown OpenCode guest frame {other}"),
         }
         Ok(())
@@ -504,6 +505,9 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("during prompt"));
+        let mut late = TurnFold::default();
+        let deadline = late.observe(&json!({"pillbox": "deadline"})).unwrap_err();
+        assert!(deadline.to_string().contains("deadline exceeded"));
         let mut early = TurnFold::default();
         assert!(early
             .observe(&json!({"pillbox": "session", "id": "ses_mine"}))

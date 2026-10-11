@@ -219,10 +219,14 @@ class Host:
         self.send(json.dumps(frame, separators=(',', ':')).encode())
 
 
+class Deadline(RuntimeError):
+    pass
+
+
 def remaining(deadline):
     left = deadline - time.monotonic()
     if left <= 0:
-        raise RuntimeError('turn deadline')
+        raise Deadline('turn deadline')
     return left
 
 
@@ -339,6 +343,13 @@ def main():
             event = json.loads(payload)
             if event.get('type') in TERMINAL and event.get('data', {}).get('sessionID') == session:
                 return
+    except (Deadline, socket.timeout, TimeoutError):
+        # Tell the host this was the clock, not a broken stream.
+        try:
+            host.control({'pillbox': 'deadline'})
+        except OSError:
+            pass
+        raise
     finally:
         stop(proc)
         sock.close()

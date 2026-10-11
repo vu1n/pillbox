@@ -1680,29 +1680,28 @@ impl<'a> CliDriver<'a> {
     }
 }
 
-/// The project directory `dir` sits in, if any. Candidates: the resolved
-/// pillbox's own directory (the one holding its `pillbox.toml`, whatever the
-/// cwd), and the nearest ancestor of the cwd holding `pillbox.toml` or `.git`
-/// (else the cwd itself) for a run on the global pillbox.
+/// The project directory `dir` sits in, if any: the resolved pillbox's own
+/// directory (the one holding its `pillbox.toml`, whatever the cwd), or, on the
+/// global pillbox, the nearest ancestor of the cwd holding `pillbox.toml` or
+/// `.git` (else the cwd itself).
 fn grader_files_inside_project(
     dir: &std::path::Path,
     resolved: Option<&std::path::Path>,
 ) -> Option<PathBuf> {
     let dir = dir.canonicalize().ok()?;
-    let from_cwd = std::env::current_dir()
-        .ok()
-        .and_then(|c| c.canonicalize().ok())
-        .map(|cwd| {
+    // A selected project pillbox is the only bookmark source; the cwd stands in
+    // for the project only on the global pillbox.
+    let project = match resolved {
+        Some(p) => p.canonicalize().ok()?,
+        None => {
+            let cwd = std::env::current_dir().ok()?.canonicalize().ok()?;
             cwd.ancestors()
                 .find(|a| a.join("pillbox.toml").exists() || a.join(".git").exists())
                 .unwrap_or(&cwd)
                 .to_path_buf()
-        });
-    resolved
-        .and_then(|p| p.canonicalize().ok())
-        .into_iter()
-        .chain(from_cwd)
-        .find(|project| dir.starts_with(project))
+        }
+    };
+    dir.starts_with(&project).then_some(project)
 }
 
 /// The `session score` argv that grades `tree` for worker `id` inside the
@@ -2336,6 +2335,11 @@ mod tests {
         std::fs::create_dir(project.path().join("hidden")).unwrap();
         let hidden = project.path().join("hidden");
         assert!(grader_files_inside_project(&hidden, Some(project.path())).is_some());
+        // With a project selected, a directory in the unrelated cwd repo is fine.
+        assert!(
+            grader_files_inside_project(std::path::Path::new("src"), Some(project.path()))
+                .is_none()
+        );
     }
     use std::cell::RefCell;
 

@@ -360,9 +360,11 @@ enum Command {
         #[arg(long = "baseline-check")]
         baseline_check: bool,
         /// Restate the positional task, verbatim inside `<original-task>`
-        /// delimiters, on every retry turn and ahead of every segment after the
+        /// delimiters (or `<original-task-N>` when the task already contains
+        /// those tags), on every retry turn and ahead of every segment after the
         /// first (segment 1 already carries it). Off by default: the task rides
-        /// only the first turn.
+        /// only the first turn. Agents with no server profile never retry, so
+        /// this changes nothing for them.
         #[arg(long = "restate-task")]
         restate_task: bool,
         /// Worker agent (`claude` | `codex` | `opencode` | …). Defaults to the

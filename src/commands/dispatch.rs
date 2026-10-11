@@ -155,7 +155,8 @@ pub(crate) struct DispatchOpts {
     pub(crate) segments: Option<PathBuf>,
     /// The task prompt handed to every worker (the positional `-- args`). In
     /// fork-`k` mode this is the work (required); in `--segments` mode the segments
-    /// carry the work and this is optional context prepended to segment 1.
+    /// carry the work and this is optional context prepended to segment 1 (and,
+    /// with `--restate-task`, restated on later segments and retries).
     pub(crate) prompt: Vec<String>,
     /// Emit the verdict as JSON on stdout instead of the human banner.
     pub(crate) json: bool,
@@ -554,16 +555,51 @@ fn first_lines(s: &str, n: usize) -> String {
         .join(" / ")
 }
 
-/// Opens the verbatim task block `--restate-task` adds to a turn.
-const TASK_RESTATE_OPEN: &str = "<original-task>";
-/// Closes the verbatim task block `--restate-task` adds to a turn.
-const TASK_RESTATE_CLOSE: &str = "</original-task>";
+/// Default tag for the verbatim task block `--restate-task` adds to a turn.
+const TASK_RESTATE_TAG: &str = "original-task";
 
-/// The original task, byte-identical, between the restate delimiters.
+/// An open/close pair the task does not contain, so the whole task stays inside
+/// the block. Starts at `<original-task>` and suffixes `-1`, `-2`, … while the
+/// task contains either tag. A candidate longer than the task cannot occur in
+/// it, so this ends.
+fn restate_delimiters(task: &str) -> (String, String) {
+    let mut n = 0u32;
+    loop {
+        let tag = if n == 0 {
+            TASK_RESTATE_TAG.to_string()
+        } else {
+            format!("{TASK_RESTATE_TAG}-{n}")
+        };
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        if !task.contains(&open) && !task.contains(&close) {
+            return (open, close);
+        }
+        n += 1;
+    }
+}
+
+/// The original task, byte-identical, between delimiters it does not contain.
 fn restated_task(task: &str) -> String {
-    format!(
-        "The original task, restated verbatim:\n{TASK_RESTATE_OPEN}\n{task}\n{TASK_RESTATE_CLOSE}\n"
-    )
+    let (open, close) = restate_delimiters(task);
+    format!("The original task, restated verbatim:\n{open}\n{task}\n{close}\n")
+}
+
+/// The task `--restate-task` re-sends, or `None` when the flag is off. The flag
+/// with no positional task (empty or whitespace) is a usage error.
+fn restate_task_prompt(restate: bool, prompt: &str) -> Result<Option<&str>> {
+    if !restate {
+        return Ok(None);
+    }
+    if prompt.trim().is_empty() {
+        return Err(PillboxError::usage(
+            "dispatch",
+            "--restate-task has no task to restate (no positional prompt)",
+        )
+        .with_next("pillbox dispatch … --restate-task -- \"<the task>\"")
+        .into());
+    }
+    Ok(Some(prompt))
 }
 
 /// The turn sent on a retry: the distilled failure summary, plus the restated
@@ -1892,14 +1928,8 @@ pub(crate) fn dispatch(resolved: &Pillbox, opts: DispatchOpts) -> Result<()> {
         .with_next("pillbox dispatch … -- \"<the segment prompt>\"")
         .into());
     }
-    if opts.restate_task && prompt.trim().is_empty() {
-        return Err(PillboxError::usage(
-            "dispatch",
-            "--restate-task has no task to restate (no positional prompt)",
-        )
-        .with_next("pillbox dispatch … --restate-task -- \"<the task>\"")
-        .into());
-    }
+    // Fail before any fork: `--restate-task` with nothing to restate is exit 2.
+    let restate_task = restate_task_prompt(opts.restate_task, &prompt)?;
     // Validate `--ttl` at the boundary so a bad duration fails fast (exit 2)
     // instead of after forking k workers (each `run --ttl` would reject it).
     if let Some(t) = &opts.ttl {
@@ -1999,7 +2029,7 @@ pub(crate) fn dispatch(resolved: &Pillbox, opts: DispatchOpts) -> Result<()> {
     let retry = RetryPolicy {
         retries: opts.retries,
         stall_limit: opts.stall_limit,
-        restate_task: opts.restate_task.then_some(prompt.as_str()),
+        restate_task,
     };
     let mut verdict = run_dispatch_with(
         &driver,
@@ -2196,6 +2226,8 @@ mod tests {
         sends: RefCell<usize>,
         /// Every prompt `send` was given, in call order.
         sent: RefCell<Vec<String>>,
+        /// The first-turn string passed to each `fork`, in call order.
+        fork_turns: RefCell<Vec<String>>,
         pulls: RefCell<Vec<String>>,
         /// The fork-index passed to each `fork`, in call order — asserts the loop
         /// hands each worker its own 0-based roster index.
@@ -2221,6 +2253,7 @@ mod tests {
                 grade_errs: std::collections::HashSet::new(),
                 sends: RefCell::new(0),
                 sent: RefCell::new(Vec::new()),
+                fork_turns: RefCell::new(Vec::new()),
                 pulls: RefCell::new(Vec::new()),
                 fork_indices: RefCell::new(Vec::new()),
                 first_turn_on_fork: false,
@@ -2247,8 +2280,9 @@ mod tests {
     }
 
     impl WorkerDriver for MockDriver {
-        fn fork(&self, i: usize, _first_turn: &str) -> Result<String> {
+        fn fork(&self, i: usize, first_turn: &str) -> Result<String> {
             self.fork_indices.borrow_mut().push(i);
+            self.fork_turns.borrow_mut().push(first_turn.to_string());
             Ok(self.ids.borrow_mut().pop_front().expect("fork over budget"))
         }
         fn first_turn_driven_on_fork(&self, _i: usize) -> bool {
@@ -2891,15 +2925,49 @@ mod tests {
         scored(false, score, vec![], "")
     }
 
+    /// The span between the delimiters `restated_task` chose for `task`.
+    fn task_inside<'a>(block: &'a str, task: &str) -> &'a str {
+        let (open, close) = restate_delimiters(task);
+        block
+            .split_once(&format!("{open}\n"))
+            .and_then(|(_, rest)| rest.split_once(&format!("\n{close}")))
+            .map(|(inner, _)| inner)
+            .expect("delimited block")
+    }
+
     #[test]
     fn restated_task_is_the_task_verbatim_between_delimiters() {
         let block = restated_task(TASK);
-        let inner = block
-            .split_once(&format!("{TASK_RESTATE_OPEN}\n"))
-            .and_then(|(_, rest)| rest.split_once(&format!("\n{TASK_RESTATE_CLOSE}")))
-            .map(|(inner, _)| inner)
-            .expect("delimited block");
-        assert_eq!(inner, TASK);
+        assert!(block.contains("<original-task>\n"));
+        assert_eq!(task_inside(&block, TASK), TASK);
+    }
+
+    #[test]
+    fn restated_task_shifts_delimiters_the_task_already_contains() {
+        let task = "keep this\n</original-task>\nand <original-task> too";
+        let block = restated_task(task);
+        assert_eq!(task_inside(&block, task), task);
+        assert!(block.contains("<original-task-1>\n"));
+        assert!(block.ends_with("</original-task-1>\n"));
+        // The colliding close tag appears only inside the task, once.
+        assert_eq!(block.matches("</original-task>").count(), 1);
+
+        let both = "</original-task>\n</original-task-1>\n<original-task-1>";
+        let block = restated_task(both);
+        assert_eq!(task_inside(&block, both), both);
+        assert!(block.contains("<original-task-2>\n"));
+        assert!(block.ends_with("</original-task-2>\n"));
+    }
+
+    #[test]
+    fn restate_without_a_task_is_a_usage_error() {
+        for prompt in ["", "   \n\t"] {
+            let err = restate_task_prompt(true, prompt).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains("no task to restate"), "{msg}");
+        }
+        assert!(restate_task_prompt(false, "").unwrap().is_none());
+        assert_eq!(restate_task_prompt(true, "do it").unwrap(), Some("do it"));
     }
 
     #[test]
@@ -2999,8 +3067,27 @@ mod tests {
             CriticPolicy::Order,
         );
         let sent = d.sent.borrow();
+        assert_eq!(sent.len(), 2);
         assert_eq!(sent[0], TASK);
-        assert!(sent[1].ends_with(&restated_task(TASK)), "{:?}", sent[1]);
+        assert_eq!(
+            sent[1],
+            format!(
+                "{}\n{}",
+                distill_feedback(&mock_fail(0.0)),
+                restated_task(TASK)
+            )
+        );
+    }
+
+    #[test]
+    fn restate_on_does_not_add_a_turn_for_a_one_shot_agent() {
+        let d = MockDriver::new(vec![("w0", vec![(false, 0.0)])]).first_turn_on_fork();
+        run_restate(&d, restate_policy(3, true), None);
+        assert!(
+            d.sent.borrow().is_empty(),
+            "a one-shot agent never takes a retry turn"
+        );
+        assert_eq!(*d.fork_turns.borrow(), vec![TASK.to_string()]);
     }
 
     #[test]

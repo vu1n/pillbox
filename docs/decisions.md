@@ -242,3 +242,32 @@ only: the Docker `run_server` path, the `sandbox agent` OpenCode 1 driver and it
 normalizer are deleted. Docker refuses server agents with a usage error.
 - **Rejected:** porting the Docker opencode path to OpenCode 2 (Docker gets no
   fixes; see ADR-002).
+
+## 2026-10-11 — pillbox becomes Stratus's Rust engine
+**Status: Accepted by Vu (2026-10-11), pending ratification of this wording.**
+
+- **Decision:** the user-facing entry point for local and cloud agent sessions
+  moves to Stratus (`vu1n/stratus`, TypeScript). The `pillbox` binary becomes
+  its engine, called only through JSON subcommands with versioned output.
+- **pillbox keeps:**
+  - the local microVM placement (libkrun per ADR-001; the VMM choice is being
+    evaluated separately and would change here, not in Stratus);
+  - the vault credential proxy;
+  - rustic workspace snapshots;
+  - the §0 session log;
+  - a new session packet (`checkpoint pack|unpack`).
+- **Session packet:** specified as JSON Schema, not Rust types. The
+  `--no-default-features` Linux build carries every packet subcommand, so
+  Cloudflare containers, which already ship a Linux `pillbox` for workspace
+  restore and backup, write the same packet as macOS.
+- **CLI surface:** no new user-facing commands. Existing ones keep working until
+  Stratus covers them, then are deprecated one entry at a time in this log.
+- **Why:** the cloud controller must be TypeScript (Workers can't run a Rust
+  CLI), and keeping a Rust entry point meant the same control logic in two
+  languages; the managed TypeScript was already a contract version behind.
+  Measured on Linux, Rust's advantage is in the engine (VMM and proxy, about
+  10 MB per process against 50–100 MB for Node, 2.5 ms against 150–240 ms per
+  CLI start), not in a controller whose share of a ~24 s turn is milliseconds.
+- **Rejected:** pillbox staying the entry point with Stratus as its cloud tier
+  (two controllers); retiring pillbox entirely (loses the microVM, the
+  subscription-friendly proxy and rustic, or re-implements them in TypeScript).

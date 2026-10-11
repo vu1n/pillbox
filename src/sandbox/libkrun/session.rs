@@ -1891,9 +1891,10 @@ pub(super) fn grade_exec(cmd: &str, drop_privileges: bool) -> String {
         // `&&` all the way: the caller prefixes `mount && cd &&` this string, and
         // a `;` would let the marker (and the grader) run when the mount failed.
         format!(
-            "{} && command -v runuser >/dev/null && {started} && runuser -u nobody --preserve-environment -- sh -c {}",
+            "{} && [ -x {runuser} ] && {started} && {runuser} -u nobody --preserve-environment -- sh -c {}",
             crate::commands::session::dropped_grader_setup(),
-            super::shell_quote(cmd)
+            super::shell_quote(cmd),
+            runuser = crate::commands::session::RUNUSER,
         )
     } else {
         format!("{started} && {{ {cmd} ; }}")
@@ -1948,8 +1949,9 @@ pub(crate) fn score_in_sandbox(
             // abort a failing command in the middle of an AND-list) never looks
             // like the grader started.
             format!(
-                "{setup} && command -v runuser >/dev/null && {started}; set +e; runuser -u nobody --preserve-environment -- sh -c {quoted}",
+                "{setup} && [ -x {runuser} ] && {started}; set +e; {runuser} -u nobody --preserve-environment -- sh -c {quoted}",
                 setup = crate::commands::session::dropped_grader_setup(),
+                runuser = crate::commands::session::RUNUSER,
                 started = crate::commands::session::GRADER_STARTED_PRINTF,
                 quoted = shell_quote(cmd),
             )
@@ -2776,9 +2778,10 @@ mod tests {
     #[test]
     fn dropped_grader_is_nobody_and_the_marker_follows_the_runuser_check() {
         let script = grade_exec("sh tests/check.sh", true);
-        let check = script.find("command -v runuser").unwrap();
+        // Absolute: the grader PATH has no sbin, where Debian keeps runuser.
+        let check = script.find("[ -x /usr/sbin/runuser ]").unwrap();
         let marker = script.find("PBSTART").unwrap();
-        let runuser = script.find("runuser -u nobody").unwrap();
+        let runuser = script.find("/usr/sbin/runuser -u nobody").unwrap();
         assert!(check < marker && marker < runuser, "{script}");
         assert!(
             !script[..marker].contains(';'),

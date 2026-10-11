@@ -153,6 +153,11 @@ for _d in _ds + [os.getcwd()]:
 /// Where the guest writes [`PY_BOOTSTRAP`]: root-owned, so `nobody` can't edit it.
 const PY_BOOTSTRAP_DIR: &str = "/tmp/.pillbox-py";
 
+/// `runuser` in the Debian runner image. It is in `sbin`, which the grader's
+/// PATH (`guest_path`) leaves out, so the dropped grader names it absolutely.
+#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+pub(crate) const RUNUSER: &str = "/usr/sbin/runuser";
+
 /// Guest setup that runs as root right before a grader drops to `nobody`: the
 /// grader env (`HOME`, no bytecode, the Python bootstrap). An `&&` chain with
 /// no `;`, so the caller's `mount && cd &&` prefix still gates the marker.

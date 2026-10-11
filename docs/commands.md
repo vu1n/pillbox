@@ -548,16 +548,20 @@ SessionLog and blob references. No repository path or manifest is accepted.
 names the agent (`agent.harness`, `agent.model`, `agent.reasoning_effort`), the
 input and the limits, and nothing about how to run it: a request carrying a
 harness version, runner image, model catalog, credential or egress host is
-rejected. Pillbox resolves the runner image from the pillbox's configuration
-(`[runner].image`, `$PILLBOX_RUNNER_IMAGE`) and takes the harness version from
-that image. A completed record carries `resolved` (`harness`,
+rejected, as is a malformed one (bad identity, input, output format or
+limits), before any record exists. Pillbox resolves the runner image
+(`$PILLBOX_RUNNER_IMAGE`, else `[runner].image`, else the default) and records
+the harness version that image reports. A completed record carries `resolved` (`harness`,
 `harness_version`, `adapter_revision`, `runner_image_id`, `requested_model`,
 `served_model`). A failed record carries a closed `code` (`runtime_unavailable`,
 `runtime_timeout`, `runtime_rejected`, `runtime_protocol_error`,
 `internal_error`) and the `stage` that was running (`resolve`, `credentials`,
 `image_prepare`, `guest_prepare`, `vmm_spawn`, `guest_rpc_ready`, `turn`,
-`finalize`); the message stays in the session log. Only `codex` has a text
-driver today; the other harnesses fail at `resolve` with `runtime_rejected`.
+`finalize`); the message stays in the session log, and `session_ref` is null
+when no session log was written. Only `codex` has a text driver today,
+for `gpt-6-luna` at `low`, `medium` or `high` effort: another harness, model or
+effort fails at `resolve` with `runtime_rejected`, and a runner image that is
+not available locally with `runtime_unavailable`.
 
 A completed record, and a failed one whose turn already spent tokens, carries
 `usage` when the harness reported any:

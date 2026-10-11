@@ -173,8 +173,8 @@ than 64 MiB is errored the same way.
 
 **The grader VM boots the runner image**, which ships `python3` (no pytest),
 `node`, `git` and core tools — **not** a Rust toolchain or pytest. A reward
-whose tool is missing there (the program the reward command names is not
-found, exit 127, or a leading `python3 -m` of a runner tool such as pytest that is
+whose tool is missing there (the first program the reward command names,
+after setup builtins such as `cd` or `export`, is not found, exit 127, or a leading `python3 -m` of a runner tool such as pytest that is
 not installed) is an
 **error**, so the worker is `errored`, never
 `failed`: otherwise every worker would "fail" identically and the run would

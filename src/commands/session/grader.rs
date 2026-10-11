@@ -352,16 +352,30 @@ fn missing_tool(spec: &GraderSpec, code: i32, raw: &str) -> Option<String> {
     }
 }
 
-/// [`missing_tool`] for one shell command, its exit code and its output. Each
-/// command of a top-level list counts (`cd backend && pytest` names pytest);
-/// the split ignores quoting, which at worst misses a tool, never invents one.
+/// [`missing_tool`] for one shell command, its exit code and its output. Setup
+/// builtins at the front of a top-level list are skipped (`cd backend &&
+/// pytest` names pytest), and only the first real command counts: a later one
+/// may never have run, so a nested `git: not found` from an earlier step must
+/// not be pinned on it. The split ignores quoting, which at worst misses a
+/// tool, never invents one.
 fn lead_tool_missing(command: &str, exit: i32, out: &str) -> Option<String> {
-    command
-        .split([';', '|', '&'])
-        .map(str::trim)
-        .filter(|c| !c.is_empty())
-        .find_map(|c| segment_tool_missing(c, exit, out))
+    for c in command.split([';', '|', '&']).map(str::trim) {
+        let prog = c
+            .split_whitespace()
+            .find(|w| !is_env_assignment(w) && !matches!(*w, "env" | "exec"));
+        match prog {
+            None => continue,
+            Some(p) if SETUP_BUILTINS.contains(&p) => continue,
+            Some(_) => return segment_tool_missing(c, exit, out),
+        }
+    }
+    None
 }
+
+/// Shell builtins a reward may run before its verifier; never the missing tool.
+const SETUP_BUILTINS: &[&str] = &[
+    "cd", "pushd", "export", "set", "unset", "umask", "source", ".", "true", ":",
+];
 
 /// [`lead_tool_missing`] for one simple command.
 fn segment_tool_missing(command: &str, exit: i32, out: &str) -> Option<String> {
@@ -653,6 +667,11 @@ mod tests {
         );
         let listed = GraderSpec::Cmd("cd crate && cargo test".into());
         assert!(missing_tool(&listed, 127, "sh: 1: cargo: not found").is_some());
+        let unrun = GraderSpec::Cmd("sh -c 'PATH=/nope git' && git status".into());
+        assert!(
+            missing_tool(&unrun, 127, "sh: 1: git: not found").is_none(),
+            "a later command may never have run"
+        );
         let worker_module = GraderSpec::Cmd("sh run.sh".into());
         assert!(missing_tool(&worker_module, 1, "python3: No module named app").is_none());
 

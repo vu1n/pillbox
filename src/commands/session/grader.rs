@@ -289,6 +289,69 @@ fn parse_rubric_output(raw: &str) -> Vec<Criterion> {
     crits
 }
 
+/// The grader tool a sandboxed grade could not find, if any: a command the shell
+/// could not find (exit 127), or a `python3 -m MOD` whose module is not
+/// installed (runpy's `…python3: No module named MOD`). In the grader microVM
+/// that means the runner image lacks the tool, so every worker would "fail"
+/// the same way; [`refuse_missing_tool`] turns it into an error instead.
+fn missing_tool(spec: &GraderSpec, code: i32, raw: &str) -> Option<String> {
+    let no_module = |out: &str| {
+        out.lines().map(str::trim).find_map(|l| {
+            let (exe, module) = l.split_once(": No module named ")?;
+            let exe = exe.rsplit('/').next().unwrap_or(exe);
+            (exe.starts_with("python") && !module.contains(' '))
+                .then(|| format!("python module `{module}`"))
+        })
+    };
+    match spec {
+        GraderSpec::Cmd(_) if code == 127 => Some("the --cmd command (exit 127)".into()),
+        GraderSpec::Cmd(_) => no_module(raw),
+        GraderSpec::Rubric { .. } => {
+            use base64::Engine as _;
+            let b64 = base64::engine::general_purpose::STANDARD;
+            raw.lines().find_map(|line| {
+                let mut f = line.strip_prefix(RUBRIC_MARKER)?.splitn(3, '\t');
+                let (exit, name) = (f.next()?.trim(), f.next()?);
+                let name = b64
+                    .decode(name.trim())
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+                    .unwrap_or_else(|_| name.to_string());
+                let out = f
+                    .next()
+                    .and_then(|o| b64.decode(o.trim()).ok())
+                    .map(|b| String::from_utf8_lossy(&b).into_owned())
+                    .unwrap_or_default();
+                if exit == "127" {
+                    Some(format!("criterion `{name}` (exit 127)"))
+                } else {
+                    no_module(&out).map(|m| format!("criterion `{name}`: {m}"))
+                }
+            })
+        }
+    }
+}
+
+/// Error out of a sandboxed grade whose tool is missing from the runner image
+/// (see [`missing_tool`]): that is the grader's environment failing, not the
+/// worker, so it must read as `errored`, never as a failed grade.
+pub(super) fn refuse_missing_tool(spec: &GraderSpec, code: i32, raw: &str) -> Result<()> {
+    match missing_tool(spec, code, raw) {
+        None => Ok(()),
+        Some(what) => Err(PillboxError::runtime(
+            "session score",
+            format!(
+                "the grader microVM could not find {what}; the runner image lacks a tool \
+                 this grader needs, so nothing was graded"
+            ),
+        )
+        .with_next(
+            "install the tool in a runner image built FROM the pillbox runner and set \
+             PILLBOX_RUNNER_IMAGE (see docs/dispatch.md, Grading)",
+        )
+        .into()),
+    }
+}
+
 /// A short `feedback`-field summary of a rubric grade — one `✓/✗ name` line per
 /// criterion. The structured detail lives in `criteria[]`.
 fn render_rubric_summary(criteria: &[Criterion]) -> String {
@@ -358,6 +421,48 @@ mod tests {
             .to_string();
         assert!(err.contains("before the grader started"), "{err}");
         assert!(err.contains("no such device"), "{err}");
+    }
+
+    fn run_rubric(criteria: &[(&str, &str)]) -> (GraderSpec, i32, String) {
+        let criteria: Vec<(String, String)> = criteria
+            .iter()
+            .map(|(n, c)| (n.to_string(), c.to_string()))
+            .collect();
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(compile_rubric(&criteria))
+            .output()
+            .unwrap();
+        let spec = GraderSpec::Rubric {
+            criteria,
+            label: "rubric:t".into(),
+        };
+        (
+            spec,
+            out.status.code().unwrap(),
+            combine_streams(&out.stdout, &out.stderr),
+        )
+    }
+
+    #[test]
+    fn missing_grader_tool_is_refused_not_graded() {
+        let cmd = GraderSpec::Cmd("cargo test".into());
+        assert!(missing_tool(&cmd, 127, "sh: cargo: not found").is_some());
+        assert!(missing_tool(&cmd, 1, "1 test failed").is_none());
+        assert!(missing_tool(&cmd, 0, "").is_none());
+        let py = missing_tool(&cmd, 1, "/usr/bin/python3: No module named pytest\n").unwrap();
+        assert!(py.contains("pytest"), "{py}");
+        // A test's own ImportError is a failed grade, not a missing tool.
+        assert!(missing_tool(&cmd, 1, "E   ModuleNotFoundError: No module named 'foo'").is_none());
+        assert!(refuse_missing_tool(&cmd, 127, "").is_err());
+        assert!(refuse_missing_tool(&cmd, 1, "assert 1 == 2").is_ok());
+
+        let (spec, code, raw) =
+            run_rubric(&[("fmt", "true"), ("tests", "pb-no-such-tool-xyz --check")]);
+        let what = missing_tool(&spec, code, &raw).unwrap();
+        assert!(what.contains("tests"), "{what}");
+        let (spec, code, raw) = run_rubric(&[("tests", "exit 1")]);
+        assert!(missing_tool(&spec, code, &raw).is_none());
     }
 
     #[test]

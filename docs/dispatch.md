@@ -56,6 +56,7 @@ pillbox dispatch --from-bookmark seg-3 -k 3 --rubric grade.txt \
 | `--protect PATTERN` | — | Extra protected path, repeatable, added to the defaults. Restored from the bookmark in the grade tree (see **Grading**). A name matches at any depth (`fixtures/`, `*.golden`); a pattern containing `/` is anchored at the workspace root (`ci/run.sh`, `/Makefile`). |
 | `--no-default-protect` | off | Drop the default protected set; only `--protect` patterns apply. For a task whose job is to change the tests. |
 | `--grader-egress HOST` | — | Repeatable. Let the grader microVM reach these hosts (a package registry the tests install from). The grader is offline by default — the same fence as `session score --grader-egress`. |
+| `--grader-files DIR` | — | Hidden grader files. `DIR` is copied into every grade tree (and the `--baseline-check` base) at `.pillbox-grader/`, locked, and never into a worker's workspace, so a worker can neither read nor edit them. Reference them from the reward: `--cmd 'sh .pillbox-grader/check.sh'`. `.pillbox-grader/` is protected, so a worker's own copy is removed. |
 | `--agent AGENT` | pillbox `agent =`, then `claude` | Worker agent (`claude` \| `codex` \| `opencode` \| …). |
 | `--model MODEL` | agent default | Worker model override, forwarded to each worker's run. |
 | `--temperature FLOAT` | agent default | Per-fork sampling temperature, forwarded to each worker — the diversity knob that keeps best-of-`k` non-degenerate. |
@@ -88,13 +89,33 @@ worker cannot change its reward by editing, deleting, renaming, or symlink-swapp
 them. The defaults cover test trees and test files (`tests/`, `test/`, `spec/`,
 `__tests__/`, `testdata/`, `*_test.go`, `*_test.rs`, `test_*.py`, `*_test.py`,
 `*.test.*`, `*.spec.*`), test-runner config (`conftest.py`, `pytest.ini`,
-`tox.ini`, `.cargo/`, `jest.config.*`, `vitest.config.*`), CI config (`.github/`, `.gitlab-ci.yml`,
+`tox.ini`, `.cargo/`, `jest.config.*`, `vitest.config.*`), root-level modules that
+would shadow a Python test runner (`/pytest.py`, `/pytest/`, `/_pytest/`,
+`/unittest.py`, `/unittest/`, `sitecustomize.py`, `usercustomize.py` — `python3 -m
+pytest` puts the workspace first on `sys.path`), CI config (`.github/`, `.gitlab-ci.yml`,
 `.circleci/`, `.buildkite/`, `.travis.yml`, `azure-pipelines.yml`, `Jenkinsfile`),
 and rubrics (`rubrics/`, `*.rubric`). A name matches at any depth; `--protect`
 adds more. Manifests the task itself is often supposed to edit — `Cargo.toml`,
 `package.json`, `pyproject.toml` — are not in the default set; a project that
 grades through one of those adds it with `--protect`. When a grade reverts
 something, dispatch names the paths on stderr; the verdict JSON is unchanged.
+
+What protection does **not** cover, so write the reward around it:
+
+- **Manifests can redirect a test run.** `autotests = false` in `Cargo.toml`
+  stops cargo building `tests/`; `addopts`/`testpaths` in `pyproject.toml`
+  redirect pytest; the `"test"` script in `package.json` replaces `npm test`.
+  Name explicit targets in the reward (`cargo test --test parser`,
+  `python3 -m pytest tests/test_parser.py`) so a vanished target fails, or
+  `--protect` the manifest when the task doesn't need to edit it.
+- **Tools resolved from the workspace** — `node_modules/.bin/*`, a `.venv` — are
+  worker-controlled.
+- **Inline tests** (`#[cfg(test)]` modules in source files) aren't paths.
+- **Tests the worker writes under a protected path are removed** before grading,
+  like any other edit there. A reward or gate has to check tests that exist on
+  the bookmark or come from `--grader-files`; a segment gate such as
+  `pytest -k path` collects nothing if the segment's own new test is its only
+  match. For a task whose job is writing the tests, use `--no-default-protect`.
 
 Protected paths then lose every write bit, owner included, and the rest of the
 copy becomes world-writable. The grader runs as `nobody` (`--drop-privileges`),
@@ -111,6 +132,18 @@ A grade that never starts is an error, not a failed grade: the guest prints a
 marker only after the workspace is mounted, and a missing marker (VM won't boot,
 mount fails) fails that worker as `errored`. There is no host fallback. A build
 without the `libkrun` feature is a usage error (exit 2) before any worker forks.
+
+**The grader VM boots the runner image**, which ships `python3` (no pytest),
+`node`, `git` and core tools — **not** a Rust toolchain or pytest. A reward
+whose tool is missing there (a command exiting 127, or `python3 -m MOD` with
+`MOD` not installed) is an **error**, so the worker is `errored`, never
+`failed`: otherwise every worker would "fail" identically and the run would
+read as a hard task. To grade with `cargo`, pytest or another toolchain, build
+an image `FROM` the pillbox runner with it installed and set
+`PILLBOX_RUNNER_IMAGE`; or install test deps inside the reward with
+`--grader-egress` naming the registry. `--baseline-check` grades on the host,
+so it can pass a reward the VM can't run; an `errored` worker after a clean
+baseline usually means exactly that.
 
 ## Segments (`--segments`)
 

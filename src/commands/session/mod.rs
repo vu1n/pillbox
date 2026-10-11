@@ -1411,6 +1411,11 @@ fn session_score(
     } else {
         run_host_grader(&grade_dir, &exec_cmd)?
     };
+    // In the microVM a missing grader tool is the runner image's gap, not the
+    // worker's: error out so it never reads as a failed grade.
+    if in_sandbox {
+        grader::refuse_missing_tool(&spec, code, &raw)?;
+    }
 
     // Score the (exit, output) into a verdict — binary for --cmd, fractional +
     // per-criterion for --rubric (the policy lives in `grader`).

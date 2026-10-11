@@ -44,7 +44,7 @@ use crate::errors::PillboxError;
 use crate::events::blob::BlobStore;
 use crate::events::log::SessionLog;
 use crate::pillbox::Pillbox;
-use crate::workspace::protect::{GradeTree, ProtectSet};
+use crate::workspace::protect::{GradeTree, ProtectSet, GRADER_FILES_DIR};
 use crate::workspace::WorkspaceBackend;
 
 /// Per-turn idle timeout (seconds) each worker gets before it's treated as stuck
@@ -174,6 +174,10 @@ pub(crate) struct DispatchOpts {
     /// `--grader-egress HOST`: hosts the grader microVM may reach. Empty (the
     /// default) keeps it offline.
     pub(crate) grader_egress: Vec<String>,
+    /// `--grader-files DIR`: hidden grader files copied into every grade tree
+    /// (and the baseline) at `.pillbox-grader/`, never into a worker's
+    /// workspace. The reward references them as `.pillbox-grader/…`.
+    pub(crate) grader_files: Option<PathBuf>,
 }
 
 /// Terminal state of one worker in a dispatch run. Serializes to the snake_case
@@ -1679,7 +1683,12 @@ impl WorkerDriver for CliDriver<'_> {
         // can't run fails `session score`, which errors this worker — there is
         // no host fallback.
         let ws = self.live_workspace(id)?;
-        let tree = GradeTree::prepare(&ws, self.base_tree()?, &self.protect)?;
+        let tree = GradeTree::prepare(
+            &ws,
+            self.base_tree()?,
+            &self.protect,
+            self.opts.grader_files.as_deref(),
+        )?;
         if let Some(note) = reverted_note(id, &tree.report.reverted) {
             eprintln!("{note}");
         }
@@ -1731,6 +1740,10 @@ impl WorkerDriver for CliDriver<'_> {
         // bookmark, not a worker's, and the check has to run where no microVM
         // can boot. Worker grades take the VM path (`grade`).
         let dir = self.restore_bookmark("--baseline-check")?;
+        // The baseline sees the same hidden grader files a worker's grade does.
+        if let Some(src) = &self.opts.grader_files {
+            crate::workspace::protect::inject_grader_files(dir.path(), src)?;
+        }
         let (cmd, rubric) = match grader {
             Grader::Cmd(c) => (Some(c.as_str()), None),
             Grader::Rubric(p) => (None, Some(p.as_path())),
@@ -2053,7 +2066,20 @@ pub(crate) fn dispatch(resolved: &Pillbox, opts: DispatchOpts) -> Result<()> {
         .into());
     }
 
-    let protect = ProtectSet::new(!opts.no_default_protect, &opts.protect).map_err(|e| {
+    // `--grader-files`: a real directory, and its landing spot is protected so
+    // a worker can't plant its own `.pillbox-grader/` (and the copy is locked).
+    let mut protect_patterns = opts.protect.clone();
+    if let Some(dir) = &opts.grader_files {
+        if !dir.is_dir() {
+            return Err(PillboxError::usage(
+                "dispatch",
+                format!("--grader-files {} is not a directory", dir.display()),
+            )
+            .into());
+        }
+        protect_patterns.push(format!("/{GRADER_FILES_DIR}/"));
+    }
+    let protect = ProtectSet::new(!opts.no_default_protect, &protect_patterns).map_err(|e| {
         PillboxError::usage("dispatch", format!("--protect: {e:#}"))
             .with_next("patterns are paths relative to the workspace, e.g. --protect 'ci/**'")
     })?;
@@ -3046,6 +3072,7 @@ mod tests {
             protect: vec![],
             no_default_protect: false,
             grader_egress: vec![],
+            grader_files: None,
         }
     }
 

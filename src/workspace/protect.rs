@@ -52,6 +52,17 @@ pub(crate) const DEFAULT_PROTECTED: &[&str] = &[
     ".cargo/",
     "jest.config.*",
     "vitest.config.*",
+    // Root-level modules that would shadow a Python test runner: `python3 -m
+    // pytest` puts the workspace first on sys.path, so a worker's `pytest.py`
+    // would run instead of the real one. (Not PYTHONSAFEPATH: that also stops
+    // tests importing the project from the root, which `-m pytest` relies on.)
+    "/pytest.py",
+    "/pytest/",
+    "/_pytest/",
+    "/unittest.py",
+    "/unittest/",
+    "sitecustomize.py",
+    "usercustomize.py",
     // CI config.
     ".github/",
     ".gitlab-ci.yml",
@@ -475,6 +486,20 @@ fn lock_node(root: &Path, path: &Path, set: &ProtectSet) -> Result<()> {
     Ok(())
 }
 
+/// Where `dispatch --grader-files DIR` lands in a grade tree: hidden grader
+/// files the worker never sees, referenced by the reward as
+/// `.pillbox-grader/…`. Dispatch protects this path, so a worker's own copy is
+/// removed and the injected one is locked like any protected path.
+pub(crate) const GRADER_FILES_DIR: &str = ".pillbox-grader";
+
+/// Copy the operator's hidden grader files into `tree` at [`GRADER_FILES_DIR`],
+/// replacing anything there. Symlinks in `src` are recreated, not followed.
+pub(crate) fn inject_grader_files(tree: &Path, src: &Path) -> Result<()> {
+    let dst = tree.join(GRADER_FILES_DIR);
+    force_remove(&dst)?;
+    copy_node(src, &dst).with_context(|| format!("inject grader files from {}", src.display()))
+}
+
 /// A scrubbed, protected-path-restored copy of a worker's workspace, removed on
 /// drop. This — never the live workspace — is what a dispatch grader sees.
 pub(crate) struct GradeTree {
@@ -488,9 +513,15 @@ pub(crate) struct GradeTree {
 
 impl GradeTree {
     /// CoW-clone `workspace`, scrub secrets (the same denylist as a worker's
-    /// clone), restore `set` from `base`, then lock protected paths against
-    /// the owner. The live tree's modes are put back even if the copy fails.
-    pub(crate) fn prepare(workspace: &Path, base: &Path, set: &ProtectSet) -> Result<Self> {
+    /// clone), restore `set` from `base`, inject `grader_files` (if any), then
+    /// lock protected paths against the owner. The live tree's modes are put
+    /// back even if the copy fails.
+    pub(crate) fn prepare(
+        workspace: &Path,
+        base: &Path,
+        set: &ProtectSet,
+        grader_files: Option<&Path>,
+    ) -> Result<Self> {
         let tmp = tempfile::Builder::new()
             .prefix("pillbox-grade-")
             .tempdir()
@@ -503,6 +534,9 @@ impl GradeTree {
         drop(modes);
         super::ingest::scrub_secrets(&path)?;
         let report = restore_protected(&path, base, set)?;
+        if let Some(src) = grader_files {
+            inject_grader_files(&path, src)?;
+        }
         lock_grade_tree(&path, set)?;
         Ok(Self {
             _tmp: tmp,
@@ -573,6 +607,14 @@ mod tests {
         assert!(!s.covers(Path::new("src/lib.rs")));
         assert!(!s.covers(Path::new("src/testing.rs")));
         assert!(!s.covers(Path::new("contest.py")));
+        assert!(s.covers(Path::new("pytest.py")));
+        assert!(s.covers(Path::new("pytest/__init__.py")));
+        assert!(s.covers(Path::new("_pytest/main.py")));
+        assert!(s.covers(Path::new("src/sitecustomize.py")));
+        assert!(
+            !s.covers(Path::new("src/pytest.py")),
+            "only a root shadow is protected"
+        );
     }
 
     #[test]
@@ -795,7 +837,7 @@ mod tests {
         let (_t, base, worker) = base_and_copy();
         write(&worker, "tests/check.sh", "exit 0\n");
         write(&worker, ".env", "SECRET=1\n");
-        let tree = GradeTree::prepare(&worker, &base, &defaults()).unwrap();
+        let tree = GradeTree::prepare(&worker, &base, &defaults(), None).unwrap();
         assert_eq!(read(tree.path(), "tests/check.sh"), "exit 1\n");
         assert!(!tree.path().join(".env").exists(), "secrets scrubbed");
         assert_eq!(
@@ -808,6 +850,34 @@ mod tests {
         let p = tree.path().to_path_buf();
         drop(tree);
         assert!(!p.exists(), "removed on drop");
+    }
+
+    #[test]
+    fn grader_files_are_injected_locked_and_replace_a_worker_copy() {
+        let (t, base, worker) = base_and_copy();
+        let hidden = t.path().join("hidden");
+        write(&hidden, "check.sh", "grep -q fixed src/lib.rs\n");
+        // A worker planting its own `.pillbox-grader/check.sh` gets it replaced.
+        write(&worker, ".pillbox-grader/check.sh", "exit 0\n");
+        let set = ProtectSet::new(true, &[format!("/{GRADER_FILES_DIR}/")]).unwrap();
+        let tree = GradeTree::prepare(&worker, &base, &set, Some(&hidden)).unwrap();
+        let injected = tree.path().join(GRADER_FILES_DIR).join("check.sh");
+        assert_eq!(
+            fs::read_to_string(&injected).unwrap(),
+            "grep -q fixed src/lib.rs\n"
+        );
+        assert_eq!(mode_of(&injected) & 0o222, 0, "injected grader is locked");
+        assert!(
+            tree.report
+                .reverted
+                .contains(&PathBuf::from(".pillbox-grader/check.sh")),
+            "{:?}",
+            tree.report.reverted
+        );
+        assert!(
+            !base.join(GRADER_FILES_DIR).exists() && worker.join(GRADER_FILES_DIR).exists(),
+            "base and live workspace are left alone"
+        );
     }
 
     fn mode_of(path: &Path) -> u32 {
@@ -824,7 +894,7 @@ mod tests {
         write(&worker, "src/lib.rs", "pub fn f() -> u8 { 1 }\n");
         write(&base, "tests/link-out", "");
         std::os::unix::fs::symlink("../src/lib.rs", base.join("tests/via")).unwrap();
-        let tree = GradeTree::prepare(&worker, &base, &defaults()).unwrap();
+        let tree = GradeTree::prepare(&worker, &base, &defaults(), None).unwrap();
         let tests = tree.path().join("tests/check.sh");
         assert_eq!(mode_of(&tests) & 0o222, 0, "protected file is not writable");
         assert!(
@@ -855,7 +925,7 @@ mod tests {
         write(&worker, "sealed/note.txt", "hi\n");
         fs::set_permissions(worker.join("sealed"), fs::Permissions::from_mode(0o000)).unwrap();
         fs::set_permissions(worker.join("tests"), fs::Permissions::from_mode(0o000)).unwrap();
-        let tree = GradeTree::prepare(&worker, &base, &defaults()).unwrap();
+        let tree = GradeTree::prepare(&worker, &base, &defaults(), None).unwrap();
         assert_eq!(read(tree.path(), "tests/check.sh"), "exit 1\n");
         assert_eq!(read(tree.path(), "sealed/note.txt"), "hi\n");
         assert_eq!(mode_of(&worker.join("tests")), 0o000);

@@ -376,6 +376,12 @@ enum Command {
         /// default; same fence as `session score --grader-egress`.
         #[arg(long = "grader-egress", value_name = "HOST")]
         grader_egress: Vec<String>,
+        /// Hidden grader files: copy DIR into every grade tree (and the
+        /// baseline) at `.pillbox-grader/`, locked, never into a worker's
+        /// workspace. Reference them from the reward, e.g.
+        /// `--cmd 'sh .pillbox-grader/check.sh'`.
+        #[arg(long = "grader-files", value_name = "DIR")]
+        grader_files: Option<PathBuf>,
         /// Worker agent (`claude` | `codex` | `opencode` | …). Defaults to the
         /// pillbox's `agent =`, then `claude`.
         #[arg(long, value_name = "AGENT")]
@@ -933,6 +939,7 @@ fn run(cli: Cli) -> Result<()> {
             protect,
             no_default_protect,
             grader_egress,
+            grader_files,
             agent,
             model,
             temperature,
@@ -977,6 +984,7 @@ fn run(cli: Cli) -> Result<()> {
                     protect,
                     no_default_protect,
                     grader_egress,
+                    grader_files,
                 },
             )
         }

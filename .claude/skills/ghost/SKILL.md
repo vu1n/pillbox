@@ -76,13 +76,19 @@ usage error). Prefer the **cheapest execution check that can't be faked**:
   - `rubrics/repro-script.rubric` — a repro script exists, is `+x`, exits 0.
   - `rubrics/doc-change.rubric` — a doc exists + holds its link/marker invariants.
 
-**Forge-resistance (the sharp edge).** The grader runs against each worker's *own,
-editable* workspace — so a check that lives **inside** it is gameable: a worker can
-weaken a committed test, or `touch` the file your `test -f` looks for. A forge-resistant
-reward either (a) checks state the task may not mutate, or (b) is **injected from
-outside the snapshot** at grade time — a host-side `--cmd` referencing a hidden grader
-by absolute path that the worker never sees (the way the σ̂ eval harness does). Reach
-for (b) whenever "done" can't be pinned to immutable state.
+**Forge-resistance (the sharp edge).** Dispatch grades a *copy* of each worker's
+workspace inside the grader microVM, with protected paths (tests, test-runner and CI
+config, rubrics; `--protect` adds more) reset to the bookmark and locked. A check that
+lives in an unprotected file is still gameable: a worker can `touch` the file your
+`test -f` looks for, or point `Cargo.toml`/`pyproject.toml` away from your tests. A
+forge-resistant reward either (a) checks state the task may not mutate (a protected
+path, or an explicit target like `cargo test --test parser`), or (b) is **injected
+from outside the snapshot** at grade time — `--grader-files DIR` copies hidden checks
+into the grade tree at `.pillbox-grader/` (`--cmd 'sh .pillbox-grader/check.sh'`); the
+worker never sees them. A host path does **not** work: the grader runs in the VM,
+which mounts only the grade tree. Reach for (b) whenever "done" can't be pinned to
+immutable state. The VM is the runner image — no `cargo`, no pytest — so a Rust or
+pytest reward needs an image built `FROM` the runner (`PILLBOX_RUNNER_IMAGE`).
 
 Reward discipline (`DECISIONS.md` GD-003): the reward is the **forge-resistant
 selector** and it is *yours* — author it from the task **before** you see any worker's

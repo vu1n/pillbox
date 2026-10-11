@@ -87,6 +87,25 @@ impl TextRequestV2 {
             ),
             "unknown text harness"
         );
+        if self.agent.harness == "pi" {
+            super::identity(&self.invocation_id)?;
+            super::identity(&self.session_ref.session_id)?;
+            ensure!(
+                !self.rendered_input.is_empty() && self.rendered_input.len() <= 512 * 1024,
+                "invalid Pi text input"
+            );
+            ensure!(
+                self.output_format.kind == "text" && self.output_format.retry_count == 0,
+                "unsupported Pi output format"
+            );
+            super::pi_text::Limits {
+                timeout_ms: self.limits.timeout_ms,
+                max_final_text_bytes: self.limits.max_final_text_bytes,
+                max_frame_bytes: self.limits.max_frame_bytes,
+                max_evidence_bytes: self.limits.max_evidence_bytes,
+            }
+            .validate()?;
+        }
         Ok(())
     }
 
@@ -147,6 +166,9 @@ pub(crate) fn execute(
     request: &TextRequestV2,
     owner: &mut OwnedInvocation,
 ) -> Result<Outcome> {
+    if request.agent.harness == "pi" {
+        return super::pi_text::runtime::execute(pb, request, owner);
+    }
     let resolved = resolve(pb, request);
     let (lowered, runner_image_id) = match resolved {
         Ok(resolved) => resolved,
@@ -208,7 +230,7 @@ fn resolve(
     pb: &Pillbox,
     request: &TextRequestV2,
 ) -> std::result::Result<(TextRequest, String), Rejection> {
-    // Only Codex has a tool-free text driver today. The other harnesses are valid
+    // Pi dispatches to its own resolver above. This resolver handles Codex; other harnesses are valid
     // selections that this build cannot run, which is a rejection, not a bad request.
     if request.agent.harness != "codex" {
         return Err(Rejection {

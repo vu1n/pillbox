@@ -52,6 +52,7 @@ pub(crate) mod repository;
 mod rootfs;
 mod rootfs_backing;
 mod session;
+pub(crate) mod text_harness;
 mod vault;
 
 // The control verbs (attach/teardown/§0 accessors) are driven through the
@@ -922,7 +923,7 @@ fn find_cached_rootfs(root: &Path, image: &str) -> Option<PathBuf> {
     best.map(|(cache, _)| cache)
 }
 
-fn docker_image_id(image: &str) -> Result<String> {
+pub(crate) fn docker_image_id(image: &str) -> Result<String> {
     let out = Command::new("docker")
         .arg("image")
         .arg("inspect")

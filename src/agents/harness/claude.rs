@@ -24,6 +24,7 @@ use crate::contract::{
     MessageStart, Payload, ReasoningEffort, RequestedRunProfile, Role, RunFinished, RunStarted,
     ServedRunProfile, ServedRunProfileEvidence, ToolCall, ToolStatus,
 };
+use crate::execution::usage::TurnUsage;
 
 use super::{str_field, HarnessAdapter};
 
@@ -177,14 +178,17 @@ impl HarnessAdapter for ClaudeAdapter {
                     self.terminal_payload(i32::from(is_error)),
                 )];
                 // Cost/usage as a Custom event — orchestrators/Slack want spend
-                // visibility, especially once `-p` bills API.
-                if line.get("total_cost_usd").is_some() {
+                // visibility, especially once `-p` bills API. `turn_usage` is the
+                // validated shape a text completion reports.
+                let turn_usage = TurnUsage::from_claude_result(line);
+                if line.get("total_cost_usd").is_some() || turn_usage.is_some() {
                     out.push(Payload::Custom(Custom {
                         name: "usage".into(),
                         payload: Some(serde_json::json!({
                             "total_cost_usd": line.get("total_cost_usd"),
                             "num_turns": line.get("num_turns"),
                             "terminal_reason": line.get("terminal_reason"),
+                            "turn_usage": turn_usage,
                         })),
                     }));
                 }
@@ -411,13 +415,20 @@ mod tests {
     #[test]
     fn result_maps_to_run_finished_plus_usage() {
         let out = run(&[
-            json!({"type":"result","subtype":"success","is_error":false,"result":"done","total_cost_usd":0.029,"num_turns":2}),
+            json!({"type":"result","subtype":"success","is_error":false,"result":"done","total_cost_usd":0.029,"num_turns":2,
+                "usage":{"input_tokens":9,"output_tokens":120,"cache_read_input_tokens":4000,"cache_creation_input_tokens":700}}),
         ]);
         match out.as_slice() {
             [Payload::RunFinished(r), Payload::Custom(c)] => {
                 assert_eq!(r.exit_code, 0);
                 assert_eq!(c.name, "usage");
-                assert_eq!(c.payload.as_ref().unwrap()["num_turns"], 2);
+                let payload = c.payload.as_ref().unwrap();
+                assert_eq!(payload["num_turns"], 2);
+                assert_eq!(
+                    payload["turn_usage"],
+                    json!({"cost_usd":0.029,"input_tokens":9,"output_tokens":120,
+                        "cache_read_tokens":4000,"cache_write_tokens":700})
+                );
             }
             other => panic!("expected RunFinished + usage Custom, got {other:?}"),
         }

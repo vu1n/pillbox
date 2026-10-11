@@ -57,6 +57,7 @@ pillbox dispatch --from-bookmark seg-3 -k 3 --rubric grade.txt \
 | `--no-default-protect` | off | Drop the default protected set; only `--protect` patterns apply. For a task whose job is to change the tests. |
 | `--grader-egress HOST` | — | Repeatable. Let the grader microVM reach these hosts (a package registry the tests install from). The grader is offline by default — the same fence as `session score --grader-egress`. |
 | `--grader-files DIR` | — | Hidden grader files. `DIR` is copied into every grade tree (and the `--baseline-check` base) at `.pillbox-grader/`, locked, and never into a worker's workspace, so a worker can neither read nor edit them. Reference them from the reward: `--cmd 'sh .pillbox-grader/check.sh'`. `.pillbox-grader/` is protected, so a worker's own copy is removed. |
+| `--restate-task` | off | Re-send the positional task with every retry turn and ahead of every segment after the first. Off, the task rides only the first turn: a retry carries only the distilled failure summary, and with `--segments` only segment 1 sees the task. On, each of those turns adds the task **verbatim** (byte-identical) inside a delimited block:<br>`The original task, restated verbatim:`<br>`<original-task>`<br>`…the task…`<br>`</original-task>`<br>If the task itself contains `<original-task>` or `</original-task>`, the tag becomes `<original-task-1>`, then `<original-task-2>`, and so on, until neither tag occurs in the task, so the whole task stays inside the block. A retry turn is the failure summary followed by the block (a segment retry adds the segment's prompt in a `<current-segment>` block after it, delimited the same way); a later segment is the block followed by its prompt. The first turn is unchanged (fork-`k` turn 1 *is* the task; segment 1 already has it prepended), so the task is never sent twice in one turn. Needs a positional prompt (exit 2 without one, including whitespace-only). Agents with no server profile (`claude`, `claude-stream`, `codex`, `cursor`, `pi`) never take a second turn, so the flag changes nothing for them; server agents (`opencode`, `codex-serve`) do. |
 | `--agent AGENT` | pillbox `agent =`, then `claude` | Worker agent (`claude` \| `codex` \| `opencode` \| …). |
 | `--model MODEL` | agent default | Worker model override, forwarded to each worker's run. |
 | `--temperature FLOAT` | agent default | Per-fork sampling temperature, forwarded to each worker — the diversity knob that keeps best-of-`k` non-degenerate. |
@@ -67,7 +68,7 @@ pillbox dispatch --from-bookmark seg-3 -k 3 --rubric grade.txt \
 | `--critic KIND` | — | Score each worker's edits with a calibrated **System One critic** before the verifier runs (`typesafe` = TypeSafe `jev-latest`; needs `TYPESAFE_API_KEY`). The verifier stays the reward; the critic's probability is recorded next to it. See **Critic** below. |
 | `--critic-policy POLICY` | `record` | What the probabilities do: `record` (measure only, grading unchanged) \| `order` (grade in descending `p`, stop at the first passer) \| `select` (grade ONLY the argmax-`p` worker). Requires `--critic`; `order`/`select` are fork-`k` only. |
 | `--critic-model MODEL` | `jev-latest` | The critic's model id. |
-| `-- <PROMPT>…` | — | The task prompt handed to every worker (trailing args). **Required** in fork-`k` mode; **optional** in `--segments` mode (the segments carry the work — given, it's context prepended to segment 1). |
+| `-- <PROMPT>…` | — | The task prompt handed to every worker (trailing args). **Required** in fork-`k` mode; **optional** in `--segments` mode (the segments carry the work — given, it's context prepended to segment 1, and to every later segment and retry with `--restate-task`). |
 
 The grader is a required, mutually-exclusive group: exactly one of `--cmd` /
 `--rubric` must be given (a clap `ArgGroup` enforces it → a missing/both case is
@@ -185,7 +186,9 @@ gate_cmd = "python3 -m pytest -k path"
 
 Per worker, each segment is: `send` its prompt → wait-idle → grade against its
 **gate** → on a failed gate with budget left, re-drive with the distilled summary
-(`--retries` per segment). **A failed gate does not abort the chain** — it advances
+(`--retries` per segment; with `--restate-task`, that summary plus the restated
+task and the segment's own prompt in a `<current-segment>` block, so the retry
+points back at this checkpoint rather than the whole task). **A failed gate does not abort the chain** — it advances
 and lets the run-level `--rubric`/`--cmd` **reward** be the authoritative final
 grade (the gate only steers progression; the reward selects the winner). The
 worker's `retries_used` is the sum across segments.

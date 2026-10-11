@@ -382,6 +382,14 @@ enum Command {
         /// `--cmd 'sh .pillbox-grader/check.sh'`.
         #[arg(long = "grader-files", value_name = "DIR")]
         grader_files: Option<PathBuf>,
+        /// Restate the positional task, verbatim inside `<original-task>`
+        /// delimiters (or `<original-task-N>` when the task already contains
+        /// those tags), on every retry turn and ahead of every segment after the
+        /// first (segment 1 already carries it). Off by default: the task rides
+        /// only the first turn. Agents with no server profile never retry, so
+        /// this changes nothing for them.
+        #[arg(long = "restate-task")]
+        restate_task: bool,
         /// Worker agent (`claude` | `codex` | `opencode` | …). Defaults to the
         /// pillbox's `agent =`, then `claude`.
         #[arg(long, value_name = "AGENT")]
@@ -940,6 +948,7 @@ fn run(cli: Cli) -> Result<()> {
             no_default_protect,
             grader_egress,
             grader_files,
+            restate_task,
             agent,
             model,
             temperature,
@@ -970,6 +979,7 @@ fn run(cli: Cli) -> Result<()> {
                     retries,
                     stall_limit,
                     baseline_check,
+                    restate_task,
                     agent,
                     model,
                     temperature,
@@ -1133,7 +1143,7 @@ fn wizard_new(
         .unwrap_or_else(|| "pillbox".into());
     let name = Some(prompt::line("name", name.as_deref().unwrap_or(&cwd_base))?);
 
-    let agents = ["claude", "codex", "opencode", "pi", "cursor"];
+    let agents = ["claude", "codex", "opencode", "pi", "prime-agent", "cursor"];
     let agent_idx = agents
         .iter()
         .position(|a| Some(*a) == agent.as_deref())

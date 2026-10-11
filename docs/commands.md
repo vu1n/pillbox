@@ -27,7 +27,7 @@ global pillbox regardless of where you are.
 | Command | What it does |
 |---|---|
 | `pillbox run [--agent A] [opts] [-- args]` | Launch the agent against the current pillbox. |
-| `pillbox dispatch --from-bookmark NAME -k N (--rubric FILE \| --cmd "VERIFIER") [--segments SPEC] [--retries N] [--stall-limit N] [--baseline-check] [--protect PATTERN]… [--no-default-protect] [--grader-egress HOST]… [--grader-files DIR] [--agent A] [--model M] [--temperature F] [--memory] [--ttl DURATION] [--json] -- PROMPT…` | Fork `k` detached worker sessions from a snapshot bookmark onto one prompt, drive each to idle, **grade** each (rubric/cmd) on a scrubbed copy inside the grader microVM (protected paths — tests, CI, rubrics — restored from the bookmark; `--protect` adds more; `--grader-files DIR` injects hidden checks at `.pillbox-grader/`), **retry** failures with distilled feedback (cut short by the `--stall-limit` breaker when a rubric score stops rising), **select** the highest-scoring passer (tie-break: fewer retries, then earliest), and **pull** its workspace. `--baseline-check` grades the untouched bookmark on the host and refuses a reward that already passes there. Emits a `DispatchVerdict` (`docs/dispatch.md`); exit 0 = winner, 1 = no worker passed, 2 = usage. **libkrun-only** (no grader VM → exit 2, no host fallback). Each worker's evidence lands as a `dispatch.worker_summary` §0 artifact. Losers are left running for `session rm`/`prune` (not auto-killed) — pass `--ttl` + `session prune` to reap a campaign. **Two axes:** fork-`k` = best-of-k **diversity** (use `--temperature`); **`--segments SPEC`** = the proven in-session **segmentation** lever — drive an ordered TOML chain of focused, checkpoint-gated sub-prompts in ONE session (the `--rubric`/`--cmd` stays the final reward; gates are per-segment). They compose. |
+| `pillbox dispatch --from-bookmark NAME -k N (--rubric FILE \| --cmd "VERIFIER") [--segments SPEC] [--retries N] [--stall-limit N] [--baseline-check] [--restate-task] [--protect PATTERN]… [--no-default-protect] [--grader-egress HOST]… [--grader-files DIR] [--agent A] [--model M] [--temperature F] [--memory] [--ttl DURATION] [--json] -- PROMPT…` | Fork `k` detached worker sessions from a snapshot bookmark onto one prompt, drive each to idle, **grade** each (rubric/cmd) on a scrubbed copy inside the grader microVM (protected paths — tests, CI, rubrics — restored from the bookmark; `--protect` adds more; `--grader-files DIR` injects hidden checks at `.pillbox-grader/`), **retry** failures with distilled feedback (cut short by the `--stall-limit` breaker when a rubric score stops rising), **select** the highest-scoring passer (tie-break: fewer retries, then earliest), and **pull** its workspace. `--baseline-check` grades the untouched bookmark on the host and refuses a reward that already passes there. `--restate-task` re-sends the task verbatim (in an `<original-task>` block) with every retry and every segment after the first; off by default. Emits a `DispatchVerdict` (`docs/dispatch.md`); exit 0 = winner, 1 = no worker passed, 2 = usage. **libkrun-only** (no grader VM → exit 2, no host fallback). Each worker's evidence lands as a `dispatch.worker_summary` §0 artifact. Losers are left running for `session rm`/`prune` (not auto-killed) — pass `--ttl` + `session prune` to reap a campaign. **Two axes:** fork-`k` = best-of-k **diversity** (use `--temperature`); **`--segments SPEC`** = the proven in-session **segmentation** lever — drive an ordered TOML chain of focused, checkpoint-gated sub-prompts in ONE session (the `--rubric`/`--cmd` stays the final reward; gates are per-segment). They compose. |
 | `pillbox secret add NAME [opts]` | Store a secret. Scope: resolved (use `--global` to force global). |
 | `pillbox secret list [--json]` | List secrets visible from the current pillbox (project + global, deduplicated). |
 | `pillbox secret show NAME [--reveal] [--to-stdout] [--json]` | Show one secret (inheritance applies). |
@@ -101,7 +101,7 @@ automatically resized or unmounted. Insufficient host or volume space fails clea
 
 ### Structured run ownership
 
-Local structured one-shot runs (`pi` and `cursor`) keep a lifetime socket to their
+Local structured one-shot runs (`pi`, `prime-agent` and `cursor`) keep a lifetime socket to their
 supervising CLI. The VMM arms its watcher before guest or egress work starts. If
 the CLI exits or is killed, including SIGTERM and SIGKILL, the VMM terminates its
 own process group; a session record does not transfer ownership. Normal return
@@ -114,7 +114,7 @@ persistent ownership; `session attach` may still detach with SIGTERM.
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--agent A` | `pillbox.toml` `agent` field, then `claude` | Agent to launch (`claude` \| `claude-stream` \| `codex` \| `codex-serve` \| `opencode` \| `pi` \| `cursor`). `pi`, `cursor` and `claude-stream` are libkrun-only structured one-shot agents (`stream-json` → §0; the prompt is everything after `--`). `claude-stream` runs `claude -p --output-format stream-json` headless, shares `claude`'s auth (one `auth login --agent claude`) and its vault env-fork (stubbed OAuth in the guest), takes an optional bare `--model` (`sonnet`, a full model id) plus `--reasoning-effort` (→ `--effort`), and rejects `--mcp`/`--detach`. The interactive PTY `claude` is the default and is unaffected. Cursor auth: `auth login --agent cursor` **or** inject `CURSOR_API_KEY` (see Cursor auth below). `codex-serve` drives `codex app-server` (codex's structured JSON-RPC protocol) as a server-mode agent — libkrun-only, shares `codex`'s auth (one `auth login --agent codex`), driven via `session send` + read via `session watch`/`subscribe`. The PTY `codex` is the default and unaffected. |
+| `--agent A` | `pillbox.toml` `agent` field, then `claude` | Agent to launch (`claude` \| `claude-stream` \| `codex` \| `codex-serve` \| `opencode` \| `pi` \| `prime-agent` \| `cursor`). `pi`, `prime-agent`, `cursor` and `claude-stream` are libkrun-only structured one-shot agents (`stream-json` → §0; the prompt is everything after `--`). `claude-stream` runs `claude -p --output-format stream-json` headless, shares `claude`'s auth (one `auth login --agent claude`) and its vault env-fork (stubbed OAuth in the guest), takes an optional bare `--model` (`sonnet`, a full model id) plus `--reasoning-effort` (→ `--effort`), and rejects `--mcp`/`--detach`. The interactive PTY `claude` is the default and is unaffected. `prime-agent` is Prime Intellect's fork of pi: same `--model PROVIDER/MODEL`, adapter and posture as `pi`, with its own auth home (`~/.prime/agent/auth.json`). Cursor auth: `auth login --agent cursor` **or** inject `CURSOR_API_KEY` (see Cursor auth below). `codex-serve` drives `codex app-server` (codex's structured JSON-RPC protocol) as a server-mode agent — libkrun-only, shares `codex`'s auth (one `auth login --agent codex`), driven via `session send` + read via `session watch`/`subscribe`. The PTY `codex` is the default and unaffected. |
 | `--workspace PATH` | cwd | Host directory to mount. |
 | `--name NAME` | `pillbox.toml` `name`, else basename(workspace) | Mount-point name (`/workspace/NAME`). |
 | `--mount HOST:GUEST` | — | Extra bind mount. Repeatable. |
@@ -543,3 +543,121 @@ changed content conflicts, and an invocation interrupted by owner loss is never
 sampled again under that ID. The CLI returns JSON v1 with an `execution`
 record. A completed record contains bounded final text and exact Pillbox
 SessionLog and blob references. No repository path or manifest is accepted.
+
+`pillbox.text/2` is the harness-agnostic form of the same command. The request
+names the agent (`agent.harness`, `agent.model`, `agent.reasoning_effort`), the
+input and the limits, and nothing about how to run it: a request carrying a
+harness version, runner image, model catalog, credential or egress host is
+rejected, as is a malformed one (bad identity, input, output format or
+limits), before any record exists. Pillbox resolves the runner image
+(`$PILLBOX_RUNNER_IMAGE`, else `[runner].image`, else the default) and records
+the harness version that image reports. A completed record carries `resolved` (`harness`,
+`harness_version`, `adapter_revision`, `runner_image_id`, `requested_model`,
+`served_model`). A failed record carries a closed `code` (`runtime_unavailable`,
+`runtime_timeout`, `runtime_rejected`, `runtime_protocol_error`,
+`internal_error`) and the `stage` that was running (`resolve`, `credentials`,
+`image_prepare`, `guest_prepare`, `vmm_spawn`, `guest_rpc_ready`, `turn`,
+`finalize`); the message stays in the session log, and `session_ref` is null
+when no session log was written. `codex`, `opencode`, `pi` and `prime-agent`
+have text drivers; `claude_code` fails at `resolve` with `runtime_rejected`
+until its driver lands. `codex` serves `gpt-6-luna` at `low`, `medium` or `high`
+effort; another model or effort fails at `resolve` with `runtime_rejected`, and
+a runner image that is not available locally with `runtime_unavailable`.
+
+The `opencode` driver runs OpenCode 2 (`opencode serve`, the version the runner
+image carries) in its own invocation-owned microVM, with no shares:
+
+- `agent.model` is OpenCode's `provider/model`. The provider must be one Pillbox
+  knows the API host of (`anthropic`, `deepseek`, `google`, `groq`, `mistral`,
+  `moonshotai`, `moonshotai-cn`, `openai`, `opencode`, `opencode-go`,
+  `openrouter`, `xai`, `zai`, `zai-coding-plan`, `zhipuai`,
+  `zhipuai-coding-plan`); egress is that host plus `models.dev`, OpenCode's
+  model catalog. Zen's `*-free` models are rejected at `resolve`, because the
+  free tier refuses a session without tools.
+- `agent.reasoning_effort` is sent as the model's variant. A model without that
+  variant fails the turn; it is never dropped. Variant names differ per model,
+  and some models have none, so those cannot run a text turn.
+- The input, `output_format` and `limits` are held to the same bounds as Codex
+  (`text/0` output only) before any VM work.
+- Tools are denied by a `deny` rule for every action, in the server config and
+  on the session, so OpenCode sends the model no tools. A tool call (in any
+  session, a subagent's included), a permission request or a form still fails
+  the turn (`runtime_protocol_error`
+  at `turn`) and the VM is stopped.
+- The key is the pillbox secret named after the variable OpenCode reads it
+  from (`ZHIPU_API_KEY` for every z.ai/Zhipu provider, `OPENROUTER_API_KEY`,
+  `ANTHROPIC_API_KEY`, ...; `pillbox secret add NAME`). Only that one key
+  enters the VM, as that variable, in a fresh OpenCode home: the user's own
+  OpenCode store holds every provider's credential and their history, so it is
+  never copied. Without the secret the turn fails at `credentials` with
+  `runtime_unavailable`.
+- `resolved.harness_version` is what the server reports at `/api/info`.
+  `served_model` is `null`: OpenCode does not surface the provider's model id.
+- The answer is the text of the last assistant message, at most
+  `max_final_text_bytes`; an empty or longer answer fails the turn.
+
+For `pi` and `prime-agent`, `agent.model` is the harness's own `PROVIDER/MODEL`
+(for example `zai/glm-5.3` or `anthropic/claude-sonnet-5`) and
+`agent.reasoning_effort` is `low`, `medium` or `high` (pi's `--thinking`). The
+provider must be `anthropic`, `openai`, `openrouter` or `zai`, and the model must
+be in the catalog Pillbox embeds for that harness
+(`src/execution/text-models-pi-1.0.2.json`,
+`src/execution/text-models-prime-agent-0.9.8.json`, taken from the bundled
+releases); anything else fails at `resolve` with `runtime_rejected`. The
+credential is the provider's API key stored by `/login` in the agent's Pillbox
+auth home (`pillbox auth login --agent pi` or `--agent prime-agent`). A missing
+entry, an OAuth login, or a `!command` key fails at `credentials` with
+`runtime_unavailable`. The guest gets a stub key; the VMM swaps in the real key
+only on that provider's host, which is the guest's only egress. The turn runs
+`--mode json` with the prompt on stdin and `--no-tools`, `--no-extensions`,
+`--no-skills`, `--no-prompt-templates`, `--no-context-files` and `--offline`.
+Any tool call in the stream, even one the harness refused, fails the turn with
+`runtime_protocol_error` at `turn`, as does an empty, cut-off (`stopReason`
+other than `stop`) or oversized answer. `harness_version` is the guest's
+`--version` output and `served_model` is the provider's `responseModel`, or
+`null`.
+
+A completed record, and a failed one whose turn already spent tokens, carries
+`usage` when the harness reported any:
+
+```json
+"usage": {
+  "cost_usd": 0.0123,
+  "input_tokens": 12,
+  "output_tokens": 340,
+  "cache_read_tokens": 5000,
+  "cache_write_tokens": 800
+}
+```
+
+The object is closed. `cost_usd` is always present: the harness's own figure,
+or `null` when it reports tokens but no cost. Pillbox never prices tokens. The
+token counts are non-negative integers, each omitted when the harness did not
+report it, and they do not overlap: `input_tokens` excludes cache reads and
+writes, and reasoning tokens are inside `output_tokens`. A harness that reports
+nothing gets no `usage` key, never zeros. A value that is not a number, is
+negative or non-finite, or exceeds 10^10 tokens or $1,000,000 is dropped; when
+nothing valid remains, `usage` is absent.
+
+| field | codex (`thread/tokenUsage/updated`, `tokenUsage.total`) | claude_code (`result` line) | opencode (`session.usage.updated`) | pi, prime-agent (every assistant `message_end`, summed) |
+|---|---|---|---|---|
+| `cost_usd` | `null` (Codex reports no cost) | `total_cost_usd` (API-equivalent on a subscription, not a bill) | `cost` (OpenCode's catalog price for the tokens) | `usage.cost.total` (pi's figure from its model catalog; `null` if any response lacks it) |
+| `input_tokens` | `inputTokens` − `cachedInputTokens` − `cacheWriteInputTokens` (dropped if negative) | `usage.input_tokens` | `tokens.input` | `usage.input` (pi already excludes cache reads and writes) |
+| `output_tokens` | `outputTokens` | `usage.output_tokens` | `tokens.output` + `tokens.reasoning` | `usage.output` |
+| `cache_read_tokens` | `cachedInputTokens` | `usage.cache_read_input_tokens` | `tokens.cache.read` | `usage.cacheRead` |
+| `cache_write_tokens` | `cacheWriteInputTokens` | `usage.cache_creation_input_tokens` | `tokens.cache.write` | `usage.cacheWrite` |
+
+Codex's newest `total` for the invocation's thread and turn is the turn's usage,
+because a text invocation runs one turn on a fresh thread. The claude_code
+column is what the Claude harness writes as `turn_usage` in its `usage` session
+event, ready for when it gets a text driver. OpenCode's latest
+`session.usage.updated` is the session total, and the session is fresh, so it
+is the turn's usage; without one, the `session.step.ended`/`.failed` figures are
+summed. Pillbox sets the session title so OpenCode makes no separate
+title-generation call. Both versions append the same
+`usage` event (`{"turn_usage": …}`) to the text session log.
+
+Both versions append a `text.stage.completed` event per stage to the session
+log and emit `session.started` / `session.completed` / `session.failed`
+lifecycle events, so `session log`, `events.jsonl` and OTel show where a turn
+spent its time.

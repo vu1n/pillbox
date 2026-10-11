@@ -506,7 +506,9 @@ pub(crate) fn force_remove(path: &Path) -> Result<()> {
 /// path it names.
 struct ModeGuard {
     root: Option<(PathBuf, u32)>,
-    saved: Vec<(Rc<OwnedFd>, CString, u32)>,
+    /// Parent fd, entry name, original mode, and the entry's path (used only
+    /// to label errors and to re-apply the mode to a copy).
+    saved: Vec<(Rc<OwnedFd>, CString, u32, PathBuf)>,
 }
 
 impl ModeGuard {
@@ -541,7 +543,7 @@ impl Drop for ModeGuard {
     fn drop(&mut self) {
         // Children first: restoring a parent's 0o000 mode before its children
         // would make the rest unrestorable.
-        for (dir, name, mode) in self.saved.iter().rev() {
+        for (dir, name, mode, _) in self.saved.iter().rev() {
             let _ = chmod_at(dir, name, *mode);
         }
         if let Some((root, mode)) = &self.root {
@@ -608,7 +610,7 @@ fn dir_names(dir: &OwnedFd) -> std::io::Result<Vec<CString>> {
 fn relax_dirs_at(
     dir: &Rc<OwnedFd>,
     path: &Path,
-    saved: &mut Vec<(Rc<OwnedFd>, CString, u32)>,
+    saved: &mut Vec<(Rc<OwnedFd>, CString, u32, PathBuf)>,
 ) -> Result<()> {
     for name in dir_names(dir).with_context(|| format!("read {}", path.display()))? {
         let child = path.join(std::ffi::OsStr::from_bytes(name.as_bytes()));
@@ -633,7 +635,7 @@ fn relax_dirs_at(
         if mode & 0o700 != 0o700 {
             chmod_at(dir, &name, mode | 0o700)
                 .with_context(|| format!("chmod {}", child.display()))?;
-            saved.push((Rc::clone(dir), name.clone(), mode));
+            saved.push((Rc::clone(dir), name.clone(), mode, child.clone()));
         }
         // A directory swapped for a link since the stat is not descended into.
         match open_dir_at(dir.as_raw_fd(), &name) {
@@ -850,6 +852,18 @@ pub(crate) fn snapshot_workspace(live: &Path, dst: &Path) -> Result<()> {
     let modes = ModeGuard::relax(live)?;
     super::cow::cow_clone_dir(live, dst)
         .with_context(|| format!("snapshot worker workspace {}", live.display()))?;
+    // The clone copied the relaxed modes; put the originals on it too, since it
+    // may be delivered as the winner. Children first, as in the guard's drop.
+    for (_, _, mode, path) in modes.saved.iter().rev() {
+        let rel = path.strip_prefix(live).unwrap_or(path);
+        let at = dst.join(rel);
+        std::fs::set_permissions(&at, std::fs::Permissions::from_mode(*mode))
+            .with_context(|| format!("chmod {}", at.display()))?;
+    }
+    if let Some((_, mode)) = &modes.root {
+        std::fs::set_permissions(dst, std::fs::Permissions::from_mode(*mode))
+            .with_context(|| format!("chmod {}", dst.display()))?;
+    }
     drop(modes);
     Ok(())
 }
@@ -1509,6 +1523,24 @@ mod tests {
         for dir in [worker.join("tests"), worker.join("sealed")] {
             fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
         }
+    }
+
+    #[test]
+    fn a_workspace_snapshot_keeps_the_original_directory_modes() {
+        let t = TempDir::new().unwrap();
+        let live = t.path().join("live");
+        write(&live, "ro/inner/f.txt", "x\n");
+        fs::set_permissions(live.join("ro/inner"), fs::Permissions::from_mode(0o550)).unwrap();
+        fs::set_permissions(live.join("ro"), fs::Permissions::from_mode(0o500)).unwrap();
+        let snap = t.path().join("snap");
+        snapshot_workspace(&live, &snap).unwrap();
+        assert_eq!(mode_of(&snap.join("ro")), 0o500);
+        assert_eq!(mode_of(&snap.join("ro/inner")), 0o550);
+        assert_eq!(mode_of(&live.join("ro")), 0o500, "live tree put back");
+        assert_eq!(read(&snap, "ro/inner/f.txt"), "x\n");
+        force_remove(&snap).unwrap();
+        fs::set_permissions(live.join("ro"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(live.join("ro/inner"), fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]

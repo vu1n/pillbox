@@ -99,7 +99,9 @@ and rubrics (`rubrics/`, `*.rubric`). A name matches at any depth; `--protect`
 adds more. A bookmark symlink inside the set that points at an unprotected path
 elsewhere in the tree (`tests/unit -> ../shared-tests`) is graded as the
 bookmark's copy of its target, so link to code under test by import path, not by
-symlink. Manifests the task itself is often supposed to edit — `Cargo.toml`,
+symlink. A protected symlink that is dangling or leaves the bookmark (absolute,
+or climbing above the root) errors the grade: the VM mounts the tree elsewhere
+and could resolve it to worker files. Manifests the task itself is often supposed to edit — `Cargo.toml`,
 `package.json`, `pyproject.toml` — are not in the default set; a project that
 grades through one of those adds it with `--protect`. When a grade reverts
 something, dispatch names the paths on stderr; the verdict JSON is unchanged.

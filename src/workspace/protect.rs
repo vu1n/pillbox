@@ -315,8 +315,10 @@ pub(crate) fn restore_protected(
 /// that a symlink resolving to an unprotected path elsewhere in the base
 /// (`tests -> shared-tests`, `tests/unit -> ../shared-tests`) is materialized
 /// from the base target, at any depth. Restoring just the link would let the
-/// worker's copy of the target decide the grade. A link to a protected path, a
-/// dangling one, or one that leaves the tree is copied as a link. `active`
+/// worker's copy of the target decide the grade. Only a relative link to a
+/// protected path that stays inside the tree is copied as a link; a dangling
+/// link, or one that leaves the bookmark, is an error, since the grader VM
+/// mounts the tree elsewhere and could resolve it to worker files. `active`
 /// holds the directories being copied, so a link back into one is an error
 /// rather than an endless copy.
 fn copy_protected(
@@ -329,9 +331,18 @@ fn copy_protected(
     let meta = std::fs::symlink_metadata(src).with_context(|| format!("stat {}", src.display()))?;
     let ft = meta.file_type();
     if ft.is_symlink() {
-        let Some(target) = unprotected_in_tree(root, set, src) else {
-            return copy_node(src, dst);
+        let Some(target) = in_tree_target(root, src) else {
+            bail!(
+                "protected path {} is a symlink that does not resolve inside the bookmark; \
+                 the grader VM could resolve it to worker files, so replace it with its \
+                 content or remove it",
+                src.display()
+            );
         };
+        let rel = target.strip_prefix(root).unwrap_or(&target);
+        if set.covers(rel) && link_stays_in_tree(root, src)? {
+            return copy_node(src, dst);
+        }
         if active.contains(&target) {
             bail!(
                 "protected path {} links back into {}; protect the target or break the cycle",
@@ -362,12 +373,35 @@ fn copy_protected(
     Ok(())
 }
 
-/// Where the symlink `link` points, when that is a path inside `root` (the
-/// canonical base) that `set` does not cover.
-fn unprotected_in_tree(root: &Path, set: &ProtectSet, link: &Path) -> Option<PathBuf> {
+/// Where the symlink `link` points on the host, when that is a path strictly
+/// inside `root` (the canonical base).
+fn in_tree_target(root: &Path, link: &Path) -> Option<PathBuf> {
     let target = std::fs::canonicalize(link).ok()?;
     let rel = target.strip_prefix(root).ok()?;
-    (!rel.as_os_str().is_empty() && !set.covers(rel)).then_some(target)
+    (!rel.as_os_str().is_empty()).then_some(target)
+}
+
+/// Whether the symlink `link` is relative and, read as text from its own
+/// directory, never climbs above `root`. Only such a link resolves the same way
+/// in the grader VM, where the tree is mounted somewhere else.
+fn link_stays_in_tree(root: &Path, link: &Path) -> Result<bool> {
+    let text = std::fs::read_link(link).with_context(|| format!("read {}", link.display()))?;
+    let parent = link.parent().unwrap_or(link);
+    let dir =
+        std::fs::canonicalize(parent).with_context(|| format!("resolve {}", parent.display()))?;
+    let Ok(dir) = dir.strip_prefix(root) else {
+        return Ok(false);
+    };
+    let mut depth = dir.components().count();
+    for comp in text.components() {
+        match comp {
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+            Component::ParentDir if depth > 0 => depth -= 1,
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
 }
 
 /// Make every component of `rel` under `root` a real, writable directory. A
@@ -985,6 +1019,30 @@ mod tests {
         symlink("../shared", base.join("tests/unit")).unwrap();
         let err = restore_protected(&copy, &base, &defaults()).unwrap_err();
         assert!(format!("{err:#}").contains("links back into"), "{err:#}");
+    }
+
+    #[test]
+    fn a_protected_link_that_could_resolve_differently_in_the_vm_is_an_error() {
+        for target in [
+            "/grade/shared-tests",
+            "../missing/check.sh",
+            "../../outside",
+        ] {
+            let (_t, base, copy) = base_and_copy();
+            symlink(target, base.join("tests/unit")).unwrap();
+            let err = restore_protected(&copy, &base, &defaults()).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("does not resolve inside the bookmark"),
+                "{target}: {err:#}"
+            );
+        }
+        // An absolute link into the bookmark is materialized, not kept.
+        let (_t, base, copy) = base_and_copy();
+        symlink(base.join("tests/check.sh"), base.join("tests/abs")).unwrap();
+        restore_protected(&copy, &base, &defaults()).unwrap();
+        let abs = copy.join("tests/abs");
+        assert!(fs::symlink_metadata(&abs).unwrap().file_type().is_file());
+        assert_eq!(read(&copy, "tests/abs"), "exit 1\n");
     }
 
     #[test]

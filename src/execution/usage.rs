@@ -6,27 +6,27 @@
 //! is dropped rather than replaced, so "not reported" never turns into a zero.
 //! When nothing valid is left, there is no usage at all.
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 
-/// Upper bounds shared with the run cost envelope (`crate::cost`).
+/// The same upper bounds the run cost envelope (`crate::cost`) accepts.
 const MAX_TOKENS: u64 = 10_000_000_000;
 const MAX_COST_USD: f64 = 1_000_000.0;
 
 /// Token counts do not overlap: `input_tokens` excludes cache reads and writes,
 /// which have their own fields, and reasoning tokens are inside `output_tokens`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Serialize-only: the constructors are the one place values are validated.
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct TurnUsage {
     /// The harness's reported cost; null when it reports tokens but no cost.
     pub(crate) cost_usd: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) input_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) output_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) cache_read_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) cache_write_tokens: Option<u64>,
 }
 
@@ -156,6 +156,41 @@ impl TurnUsage {
     }
 }
 
+impl TurnUsage {
+    /// pi's and Prime Agent's `--mode json` turn: every assistant `message_end`'s
+    /// `usage`, summed, because a retried or tool-looped turn makes several provider
+    /// calls and each one costs. `input` already excludes `cacheRead` and `cacheWrite`
+    /// (pi subtracts cached prompt tokens), and `cost.total` is pi's own figure from
+    /// its model catalog. A field missing from any response is not reported.
+    pub(crate) fn from_pi_frames(frames: &[Value]) -> Option<Self> {
+        let usages: Vec<&Value> = frames
+            .iter()
+            .filter(|frame| frame["type"] == "message_end")
+            .map(|frame| &frame["message"])
+            .filter(|message| message["role"] == "assistant" && message["usage"].is_object())
+            .map(|message| &message["usage"])
+            .collect();
+        if usages.is_empty() {
+            return None;
+        }
+        let sum = |key: &str| -> Option<u64> {
+            usages
+                .iter()
+                .try_fold(0u64, |total, usage| total.checked_add(usage[key].as_u64()?))
+        };
+        let cost = usages.iter().try_fold(0f64, |total, usage| {
+            Some(total + usage["cost"]["total"].as_f64()?)
+        });
+        Self::new(
+            cost,
+            sum("input"),
+            sum("output"),
+            sum("cacheRead"),
+            sum("cacheWrite"),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,6 +227,29 @@ mod tests {
             json!({"cost_usd": 0.0123, "input_tokens": 12, "output_tokens": 340,
                 "cache_read_tokens": 5000, "cache_write_tokens": 800})
         );
+    }
+
+    #[test]
+    fn pi_turn_sums_every_assistant_response() {
+        let end = |input: u64, cost: Value| {
+            json!({"type": "message_end", "message": {"role": "assistant", "usage": {
+                "input": input, "output": 7, "cacheRead": 20, "cacheWrite": 0,
+                "totalTokens": input + 27, "cost": {"total": cost}}}})
+        };
+        let user = json!({"type": "message_end", "message": {"role": "user", "content": "hi"}});
+        let usage =
+            TurnUsage::from_pi_frames(&[user.clone(), end(100, json!(0.25)), end(50, json!(0.5))])
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(&usage).unwrap(),
+            json!({"cost_usd": 0.75, "input_tokens": 150, "output_tokens": 14,
+                "cache_read_tokens": 40, "cache_write_tokens": 0})
+        );
+        // One response without a cost makes the turn's cost unknown, not partial.
+        let usage =
+            TurnUsage::from_pi_frames(&[end(100, json!(0.25)), end(50, json!(null))]).unwrap();
+        assert_eq!(usage.cost_usd, None);
+        assert_eq!(TurnUsage::from_pi_frames(&[user]), None);
     }
 
     #[test]
@@ -302,11 +360,5 @@ mod tests {
             serde_json::to_value(&usage).unwrap(),
             json!({"cost_usd": null, "input_tokens": 3})
         );
-    }
-
-    #[test]
-    fn the_shape_is_closed() {
-        let extra = json!({"cost_usd": null, "input_tokens": 1, "total_tokens": 2});
-        assert!(serde_json::from_value::<TurnUsage>(extra).is_err());
     }
 }

@@ -114,6 +114,30 @@ pub(crate) struct TextLimits {
     pub(crate) max_evidence_bytes: u64,
 }
 
+impl TextLimits {
+    /// The bounds every text driver runs inside, whatever the harness.
+    pub(crate) fn validate(&self) -> Result<()> {
+        ensure!(
+            (1..=super::MAX_TIMEOUT_MS).contains(&self.timeout_ms),
+            "invalid text timeout"
+        );
+        ensure!(
+            (1..=MAX_FINAL_TEXT_BYTES).contains(&self.max_final_text_bytes),
+            "invalid final text byte limit"
+        );
+        ensure!(
+            (1..=super::MAX_FRAME_BYTES).contains(&self.max_frame_bytes),
+            "invalid native frame byte limit"
+        );
+        ensure!(
+            (1..=super::MAX_EVIDENCE_BYTES).contains(&self.max_evidence_bytes)
+                && self.max_frame_bytes <= self.max_evidence_bytes,
+            "invalid native evidence byte limit"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TextRuntime {
@@ -190,15 +214,7 @@ impl TextRequest {
             self.idempotency_key == self.invocation_id,
             "invocation/idempotency mismatch"
         );
-        validate_turn_bounds(
-            &self.rendered_input,
-            &self.output_format,
-            &self.runtime.limits,
-        )?;
-        ensure!(
-            self.rendered_input_hash == digest(self.rendered_input.as_bytes()),
-            "rendered input digest mismatch"
-        );
+        validate_input(&self.rendered_input, &self.rendered_input_hash)?;
         ensure!(
             self.tool_policy == "deny_all",
             "unsupported text tool policy"
@@ -207,6 +223,7 @@ impl TextRequest {
             self.execution_policy_revision == POLICY_REVISION,
             "unsupported text execution policy"
         );
+        validate_output_format(&self.output_format)?;
         let execution = &self.execution;
         ensure!(
             execution.transport.harness == "codex"
@@ -253,46 +270,32 @@ impl TextRequest {
             runtime.network_hosts == ["chatgpt.com"],
             "unsupported text network policy"
         );
+        runtime.limits.validate()?;
         Ok(profile)
     }
 }
 
-/// The input, output and resource bounds every text driver enforces before it
-/// claims a VM, whatever the harness.
-pub(crate) fn validate_turn_bounds(
-    rendered_input: &str,
-    output_format: &TextOutputFormat,
-    limits: &TextLimits,
-) -> Result<()> {
+pub(crate) fn validate_input(rendered_input: &str, rendered_input_hash: &str) -> Result<()> {
     ensure!(
         !rendered_input.is_empty() && rendered_input.len() <= MAX_RENDERED_INPUT_BYTES,
         "rendered input must contain 1..524288 UTF-8 bytes"
     );
     ensure!(
-        output_format.kind == "text" && output_format.retry_count == 0,
-        "unsupported text output format"
-    );
-    ensure!(
-        (1..=super::MAX_TIMEOUT_MS).contains(&limits.timeout_ms),
-        "invalid text timeout"
-    );
-    ensure!(
-        (1..=MAX_FINAL_TEXT_BYTES).contains(&limits.max_final_text_bytes),
-        "invalid final text byte limit"
-    );
-    ensure!(
-        (1..=super::MAX_FRAME_BYTES).contains(&limits.max_frame_bytes),
-        "invalid native frame byte limit"
-    );
-    ensure!(
-        (1..=super::MAX_EVIDENCE_BYTES).contains(&limits.max_evidence_bytes)
-            && limits.max_frame_bytes <= limits.max_evidence_bytes,
-        "invalid native evidence byte limit"
+        rendered_input_hash == digest(rendered_input.as_bytes()),
+        "rendered input digest mismatch"
     );
     Ok(())
 }
 
-fn validate_id(value: &str) -> Result<()> {
+pub(crate) fn validate_output_format(format: &TextOutputFormat) -> Result<()> {
+    ensure!(
+        format.kind == "text" && format.retry_count == 0,
+        "unsupported text output format"
+    );
+    Ok(())
+}
+
+pub(crate) fn validate_id(value: &str) -> Result<()> {
     ensure!(
         !value.is_empty()
             && value.len() <= 128
@@ -321,7 +324,7 @@ impl std::fmt::Display for FailedStage {
 
 /// What the native turn reported about itself besides its text.
 pub(crate) struct Observed {
-    pub(crate) cli_version: Option<String>,
+    pub(crate) cli_version: String,
     pub(crate) usage: Option<TurnUsage>,
 }
 
@@ -460,7 +463,7 @@ fn run_local(
     progress: &mut TextProgress,
     stages: &mut Stages,
     usage: &mut Option<TurnUsage>,
-) -> Result<(TextCompletion, Option<String>)> {
+) -> Result<(TextCompletion, String)> {
     let spec = crate::agents::lookup("execution", "codex")?;
     let credentials_path = spec.home_dir(pb)?.join(spec.cred_sentinel);
     let real = crate::vault::pre_refresh(&credentials_path, "codex")?
@@ -542,7 +545,7 @@ fn run_local(
         };
         // Bounded: the frames are the native evidence, already capped by max_evidence_bytes.
         *usage = TurnUsage::from_codex_frames(frames);
-        progress.native_evidence = Some(evidence.native_frames(frames)?);
+        progress.native_evidence = Some(evidence.native_frames_for(frames, Some(profile))?);
         progress.session_ref = evidence.reference();
         owner.observe(serde_json::to_value(&progress)?)?;
     }
@@ -558,7 +561,8 @@ fn run_local(
         }))?;
     }
     let native = native?.map_err(|failure| failure.error)?;
-    let cli_version = observed_cli_version(&native.evidence);
+    let cli_version =
+        observed_cli_version(&native.evidence).context("Codex did not report its CLI version")?;
     check_live(owner, deadline)?;
     let text = evidence.artifact(native.text.as_bytes(), "text/plain;charset=utf-8")?;
     let native_evidence = progress

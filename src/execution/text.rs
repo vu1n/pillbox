@@ -110,6 +110,30 @@ pub(crate) struct TextLimits {
     pub(crate) max_evidence_bytes: u64,
 }
 
+impl TextLimits {
+    /// The bounds every text driver runs inside, whatever the harness.
+    pub(crate) fn validate(&self) -> Result<()> {
+        ensure!(
+            (1..=super::MAX_TIMEOUT_MS).contains(&self.timeout_ms),
+            "invalid text timeout"
+        );
+        ensure!(
+            (1..=MAX_FINAL_TEXT_BYTES).contains(&self.max_final_text_bytes),
+            "invalid final text byte limit"
+        );
+        ensure!(
+            (1..=super::MAX_FRAME_BYTES).contains(&self.max_frame_bytes),
+            "invalid native frame byte limit"
+        );
+        ensure!(
+            (1..=super::MAX_EVIDENCE_BYTES).contains(&self.max_evidence_bytes)
+                && self.max_frame_bytes <= self.max_evidence_bytes,
+            "invalid native evidence byte limit"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TextRuntime {
@@ -253,29 +277,12 @@ impl TextRequest {
             runtime.network_hosts == ["chatgpt.com"],
             "unsupported text network policy"
         );
-        let limits = &runtime.limits;
-        ensure!(
-            (1..=super::MAX_TIMEOUT_MS).contains(&limits.timeout_ms),
-            "invalid text timeout"
-        );
-        ensure!(
-            (1..=MAX_FINAL_TEXT_BYTES).contains(&limits.max_final_text_bytes),
-            "invalid final text byte limit"
-        );
-        ensure!(
-            (1..=super::MAX_FRAME_BYTES).contains(&limits.max_frame_bytes),
-            "invalid native frame byte limit"
-        );
-        ensure!(
-            (1..=super::MAX_EVIDENCE_BYTES).contains(&limits.max_evidence_bytes)
-                && limits.max_frame_bytes <= limits.max_evidence_bytes,
-            "invalid native evidence byte limit"
-        );
+        runtime.limits.validate()?;
         Ok(profile)
     }
 }
 
-fn validate_id(value: &str) -> Result<()> {
+pub(crate) fn validate_id(value: &str) -> Result<()> {
     ensure!(
         !value.is_empty()
             && value.len() <= 128

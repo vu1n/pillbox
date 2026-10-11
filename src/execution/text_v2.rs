@@ -81,6 +81,14 @@ impl TextRequestV2 {
             self.placement == "local_microvm",
             "unsupported text placement"
         );
+        // Every driver relies on these, not just the Codex lowering's own validate.
+        text::validate_id(&self.invocation_id)?;
+        text::validate_id(&self.session_ref.session_id)?;
+        ensure!(
+            self.output_format.kind == "text" && self.output_format.retry_count == 0,
+            "unsupported text output format"
+        );
+        self.limits.validate()?;
         ensure!(
             matches!(
                 self.agent.harness.as_str(),
@@ -438,6 +446,24 @@ mod tests {
             request(harness, "any-model").validate().unwrap();
         }
         assert!(request("custom", "any-model").validate().is_err());
+    }
+
+    #[test]
+    fn every_harness_is_held_to_the_same_bounds() {
+        for harness in ["codex", "pi", "prime-agent"] {
+            let mut zero = request(harness, "any-model");
+            zero.limits.timeout_ms = 0;
+            assert!(zero.validate().is_err());
+            let mut huge = request(harness, "any-model");
+            huge.limits.max_evidence_bytes = u64::MAX;
+            assert!(huge.validate().is_err());
+            let mut retry = request(harness, "any-model");
+            retry.output_format.retry_count = 1;
+            assert!(retry.validate().is_err());
+            let mut id = request(harness, "any-model");
+            id.session_ref.session_id = "../escape".into();
+            assert!(id.validate().is_err());
+        }
     }
 
     #[test]

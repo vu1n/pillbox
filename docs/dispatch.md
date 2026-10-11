@@ -56,7 +56,7 @@ pillbox dispatch --from-bookmark seg-3 -k 3 --rubric grade.txt \
 | `--protect PATTERN` | — | Extra protected path, repeatable, added to the defaults. Restored from the bookmark in the grade tree (see **Grading**). A name matches at any depth (`fixtures/`, `*.golden`); a pattern containing `/` is anchored at the workspace root (`ci/run.sh`, `/Makefile`). |
 | `--no-default-protect` | off | Drop the default protected set; only `--protect` patterns apply. For a task whose job is to change the tests. |
 | `--grader-egress HOST` | — | Repeatable. Let the grader microVM reach these hosts (a package registry the tests install from). The grader is offline by default — the same fence as `session score --grader-egress`. |
-| `--grader-files DIR` | — | Hidden grader files. `DIR` is copied into every grade tree (and the `--baseline-check` base) at `.pillbox-grader/`, locked, and never into a worker's workspace, so a worker can neither read nor edit them. Reference them from the reward: `--cmd 'sh .pillbox-grader/check.sh'`. `.pillbox-grader/` is protected, so a worker's own copy is removed. |
+| `--grader-files DIR` | — | Hidden grader files. `DIR` is copied into every grade tree (and the `--baseline-check` base) at `.pillbox-grader/`, locked, and never into a worker's workspace, so a worker can neither read nor edit them. Reference them from the reward: `--cmd 'sh .pillbox-grader/check.sh'`. `.pillbox-grader/` is protected, so a worker's own copy is removed. Symlinks inside `DIR` are copied as their targets' content; one that leaves `DIR` or dangles is an error. |
 | `--restate-task` | off | Re-send the positional task with every retry turn and ahead of every segment after the first. Off, the task rides only the first turn: a retry carries only the distilled failure summary, and with `--segments` only segment 1 sees the task. On, each of those turns adds the task **verbatim** (byte-identical) inside a delimited block:<br>`The original task, restated verbatim:`<br>`<original-task>`<br>`…the task…`<br>`</original-task>`<br>If the task itself contains `<original-task>` or `</original-task>`, the tag becomes `<original-task-1>`, then `<original-task-2>`, and so on, until neither tag occurs in the task, so the whole task stays inside the block. A retry turn is the failure summary followed by the block (a segment retry adds the segment's prompt in a `<current-segment>` block after it, delimited the same way); a later segment is the block followed by its prompt. The first turn is unchanged (fork-`k` turn 1 *is* the task; segment 1 already has it prepended), so the task is never sent twice in one turn. Needs a positional prompt (exit 2 without one, including whitespace-only). Agents with no server profile (`claude`, `claude-stream`, `codex`, `cursor`, `pi`) never take a second turn, so the flag changes nothing for them; server agents (`opencode`, `codex-serve`) do. |
 | `--agent AGENT` | pillbox `agent =`, then `claude` | Worker agent (`claude` \| `codex` \| `opencode` \| …). |
 | `--model MODEL` | agent default | Worker model override, forwarded to each worker's run. |
@@ -150,6 +150,10 @@ A grade that never starts is an error, not a failed grade: the guest prints a
 marker only after the workspace is mounted, and a missing marker (VM won't boot,
 mount fails) fails that worker as `errored`. There is no host fallback. A build
 without the `libkrun` feature is a usage error (exit 2) before any worker forks.
+
+On macOS, the grade tree also drops the `user.containers.override_stat` xattr
+from every directory and protected entry, so a worker's guest `chmod` cannot
+outlive the lock: the grader VM sees the locked backing modes.
 
 **The grader VM boots the runner image**, which ships `python3` (no pytest),
 `node`, `git` and core tools — **not** a Rust toolchain or pytest. A reward

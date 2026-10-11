@@ -592,8 +592,16 @@ fn lock_node(root: &Path, path: &Path, set: &ProtectSet, sticky: &BTreeSet<PathB
         0o666
     };
     if ft.is_file() || ft.is_dir() {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-            .with_context(|| format!("chmod {}", path.display()))?;
+        let chmod = |m: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(m))
+                .with_context(|| format!("chmod {}", path.display()))
+        };
+        if ft.is_dir() || covered {
+            // Removing a user xattr needs write access to the inode.
+            chmod(mode | 0o700)?;
+            clear_guest_override(path)?;
+        }
+        chmod(mode)?;
     }
     if ft.is_dir() {
         for entry in std::fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
@@ -601,6 +609,41 @@ fn lock_node(root: &Path, path: &Path, set: &ProtectSet, sticky: &BTreeSet<PathB
         }
     }
     Ok(())
+}
+
+/// The xattr through which macOS libkrun shows the guest a mode and owner other
+/// than the backing file's. The clone keeps the worker's copy of it, and a
+/// guest `chmod 0777 .` would otherwise outlive [`lock_grade_tree`].
+const GUEST_OVERRIDE_XATTR: &std::ffi::CStr = c"user.containers.override_stat";
+
+/// Drop `path`'s guest stat override, so the grader VM sees the locked backing
+/// mode. Fails closed on anything but "not set" or "xattrs unsupported here".
+fn clear_guest_override(path: &Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .with_context(|| format!("path with NUL {}", path.display()))?;
+    #[cfg(target_os = "macos")]
+    let rc = unsafe {
+        libc::removexattr(
+            c_path.as_ptr(),
+            GUEST_OVERRIDE_XATTR.as_ptr(),
+            libc::XATTR_NOFOLLOW,
+        )
+    };
+    #[cfg(not(target_os = "macos"))]
+    let rc = unsafe { libc::lremovexattr(c_path.as_ptr(), GUEST_OVERRIDE_XATTR.as_ptr()) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    #[cfg(target_os = "macos")]
+    let absent = libc::ENOATTR;
+    #[cfg(not(target_os = "macos"))]
+    let absent = libc::ENODATA;
+    match err.raw_os_error() {
+        Some(code) if code == absent || code == libc::ENOTSUP => Ok(()),
+        _ => Err(err).with_context(|| format!("clear guest metadata on {}", path.display())),
+    }
 }
 
 /// Where `dispatch --grader-files DIR` lands in a grade tree: hidden grader
@@ -618,7 +661,48 @@ pub(crate) fn inject_grader_files(tree: &Path, src: &Path) -> Result<()> {
         .with_context(|| format!("resolve grader files {}", src.display()))?;
     let dst = tree.join(GRADER_FILES_DIR);
     force_remove(&dst)?;
-    copy_node(&src, &dst).with_context(|| format!("inject grader files from {}", src.display()))
+    copy_grader_files(&src, &src, &dst, &mut Vec::new())
+        .with_context(|| format!("inject grader files from {}", src.display()))
+}
+
+/// Copy the grader files under `root` (canonical) with every symlink replaced by
+/// its target's content. A link copied as a link would resolve from inside the
+/// grade tree, where the worker controls what it names; a link that leaves
+/// `root`, dangles, or loops is an error.
+fn copy_grader_files(root: &Path, src: &Path, dst: &Path, active: &mut Vec<PathBuf>) -> Result<()> {
+    let meta = std::fs::symlink_metadata(src).with_context(|| format!("stat {}", src.display()))?;
+    if meta.file_type().is_symlink() {
+        let target = std::fs::canonicalize(src)
+            .ok()
+            .filter(|t| t.starts_with(root))
+            .with_context(|| {
+                format!(
+                    "grader file {} is a symlink that does not resolve inside {}",
+                    src.display(),
+                    root.display()
+                )
+            })?;
+        if active.contains(&target) {
+            bail!(
+                "grader file {} links back into {}",
+                src.display(),
+                target.display()
+            );
+        }
+        return copy_grader_files(root, &target, dst, active);
+    }
+    if !meta.file_type().is_dir() {
+        return copy_node(src, dst);
+    }
+    active.push(std::fs::canonicalize(src).with_context(|| format!("resolve {}", src.display()))?);
+    std::fs::create_dir(dst).with_context(|| format!("create {}", dst.display()))?;
+    for entry in std::fs::read_dir(src).with_context(|| format!("read {}", src.display()))? {
+        let entry = entry?;
+        copy_grader_files(root, &entry.path(), &dst.join(entry.file_name()), active)?;
+    }
+    std::fs::set_permissions(dst, meta.permissions())?;
+    active.pop();
+    Ok(())
 }
 
 /// A scrubbed, protected-path-restored copy of a worker's workspace, removed on
@@ -1046,6 +1130,74 @@ mod tests {
     }
 
     #[test]
+    fn a_worker_guest_mode_override_does_not_survive_the_lock() {
+        let (_t, base, worker) = base_and_copy();
+        let set_override = |p: &Path| {
+            use std::os::unix::ffi::OsStrExt;
+            let c = std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
+            let v = b"0:0:040777";
+            #[cfg(target_os = "macos")]
+            let rc = unsafe {
+                libc::setxattr(
+                    c.as_ptr(),
+                    GUEST_OVERRIDE_XATTR.as_ptr(),
+                    v.as_ptr().cast(),
+                    v.len(),
+                    0,
+                    0,
+                )
+            };
+            #[cfg(not(target_os = "macos"))]
+            let rc = unsafe {
+                libc::setxattr(
+                    c.as_ptr(),
+                    GUEST_OVERRIDE_XATTR.as_ptr(),
+                    v.as_ptr().cast(),
+                    v.len(),
+                    0,
+                )
+            };
+            rc == 0
+        };
+        // The worker's guest `chmod 0777 .` / `chmod 0777 tests`.
+        let check = worker.join("tests/check.sh");
+        if !set_override(&worker) || !set_override(&worker.join("tests")) || !set_override(&check) {
+            eprintln!("skipping: user xattrs unsupported on this filesystem");
+            return;
+        }
+        // Lock the worker tree in place: on Linux the CoW clone drops xattrs,
+        // so going through GradeTree would not exercise the clear.
+        let _ = &base;
+        lock_grade_tree(&worker, &defaults()).unwrap();
+        for rel in ["", "tests", "tests/check.sh"] {
+            let p = worker.join(rel);
+            let c = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+            #[cfg(target_os = "macos")]
+            let n = unsafe {
+                libc::getxattr(
+                    c.as_ptr(),
+                    GUEST_OVERRIDE_XATTR.as_ptr(),
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    0,
+                )
+            };
+            #[cfg(not(target_os = "macos"))]
+            let n = unsafe {
+                libc::getxattr(
+                    c.as_ptr(),
+                    GUEST_OVERRIDE_XATTR.as_ptr(),
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert!(n < 0, "override left on {rel:?}");
+        }
+        force_remove(&worker).unwrap();
+    }
+
+    #[test]
     fn ancestors_of_protected_paths_are_sticky_and_build_dirs_are_not() {
         let (_t, base, worker) = base_and_copy();
         write(&base, "src/foo_test.rs", "#[test] fn t() {}\n");
@@ -1102,6 +1254,24 @@ mod tests {
         let dir = tree.path().join(GRADER_FILES_DIR);
         assert!(fs::symlink_metadata(&dir).unwrap().file_type().is_dir());
         assert!(dir.join("check.sh").is_file());
+        drop(tree);
+
+        // A link inside the grader files is copied as its target's content…
+        symlink("check.sh", hidden.join("again.sh")).unwrap();
+        let tree = GradeTree::prepare(&worker, &base, &set, Some(&hidden)).unwrap();
+        let again = tree.path().join(GRADER_FILES_DIR).join("again.sh");
+        assert!(fs::symlink_metadata(&again).unwrap().file_type().is_file());
+        drop(tree);
+        // …and one that leaves them (here into the worker-controlled tree) is refused.
+        write(&t.path().join("shared-tests"), "check.sh", "exit 1\n");
+        symlink("../shared-tests/check.sh", hidden.join("escape.sh")).unwrap();
+        let err = GradeTree::prepare(&worker, &base, &set, Some(&hidden))
+            .err()
+            .expect("an escaping grader link is refused");
+        assert!(
+            format!("{err:#}").contains("does not resolve inside"),
+            "{err:#}"
+        );
     }
 
     fn mode_of(path: &Path) -> u32 {

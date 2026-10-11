@@ -154,6 +154,7 @@ the sandbox is useless to an attacker.
 pillbox secret add ANTHROPIC_API_KEY --vault            # api.anthropic.com / x-api-key
 pillbox secret add OPENAI_API_KEY    --vault            # api.openai.com    / Authorization: Bearer
 pillbox secret add GITHUB_TOKEN      --vault            # api.github.com    / Authorization: Bearer
+pillbox secret add XAI_API_KEY       --vault            # api.x.ai          / Authorization: Bearer
 
 # Custom name → known mapping:
 pillbox secret add MY_ANTHROPIC --vault --maps-to ANTHROPIC_API_KEY

@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # Runner image for pillbox sandboxes.
 #
-# Seven agent harnesses preinstalled at known paths:
+# Eight agent harnesses preinstalled at known paths:
 #   - claude  (Anthropic's native installer → /usr/local/bin/claude)
 #   - codex   (OpenAI's official installer → /usr/local/bin/codex)
 #   - amp     (npm: @ampcode/cli)
@@ -9,6 +9,7 @@
 #   - pi      (npm: @earendil-works/pi-coding-agent)
 #   - prime-agent (Prime Intellect native release → /usr/local/bin/prime-agent)
 #   - cursor  (Cursor Agent CLI lab tarball → /usr/local/bin/agent)
+#   - grok    (xAI installer → /usr/local/bin/grok; the installer's `agent` symlink is removed)
 #
 # System tooling chosen to cover the agents' subagent + shell needs:
 # bubblewrap (codex/claude subagent sandboxing), git/gh (vcs ops),
@@ -131,6 +132,8 @@ ARG CURSOR_AGENT_VERSION=2026.10.01-e373342
 # compare. Pinned anyway for a deterministic layer cache; bump by hand
 # (`npm view @ampcode/cli version`) when you want a newer amp.
 ARG AMP_VERSION=0.0.1791091069-gb9917f
+# renovate: datasource=npm depName=@xai-official/grok
+ARG GROK_VERSION=1.0.46
 
 RUN npm install -g \
 		@ampcode/cli@${AMP_VERSION} \
@@ -193,6 +196,17 @@ RUN ARCH="$(uname -m)" \
 	| tar --strip-components=1 -xzf - -C "/opt/cursor-agent/versions/${CURSOR_AGENT_VERSION}" \
 	&& ln -sf "/opt/cursor-agent/versions/${CURSOR_AGENT_VERSION}/cursor-agent" /usr/local/bin/agent \
 	&& ln -sf "/opt/cursor-agent/versions/${CURSOR_AGENT_VERSION}/cursor-agent" /usr/local/bin/cursor-agent
+
+# Grok Build (`grok`). The official installer also symlinks `agent` beside
+# the binary; that name is Cursor's CLI in this image, so only `grok` is
+# linked onto PATH. Keep /opt/grok: the binary symlink points at the
+# download under that HOME.
+RUN curl -fsSL https://x.ai/cli/install.sh -o /tmp/grok-install.sh \
+	&& HOME=/opt/grok GROK_BIN_DIR=/opt/grok/bin bash /tmp/grok-install.sh "${GROK_VERSION}" \
+	&& ln -sfn "$(readlink -f /opt/grok/bin/grok)" /usr/local/bin/grok \
+	&& rm -f /opt/grok/bin/agent \
+	&& test -x /usr/local/bin/grok \
+	&& rm /tmp/grok-install.sh
 
 # The in-sandbox pillbox: pty-host, event emitter, session-done wrapper.
 COPY --from=pillbox-build /pillbox /usr/local/bin/pillbox

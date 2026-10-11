@@ -4,6 +4,7 @@
 #[cfg(any(feature = "libkrun", test))]
 pub(crate) mod evidence;
 pub(crate) mod files;
+pub(crate) mod grok;
 #[cfg(feature = "libkrun")]
 pub(crate) mod local;
 #[cfg(any(feature = "libkrun", test))]

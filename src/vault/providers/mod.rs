@@ -31,6 +31,7 @@ pub(crate) mod codex;
 pub(crate) mod codex_execution;
 pub(crate) mod github;
 pub(crate) mod openai;
+pub(crate) mod xai;
 
 /// Marker provider_id for entries minted by `Server::lease_api_key`.
 /// These don't correspond to a [`VaultProvider`] — they're plain
@@ -268,6 +269,7 @@ pub(crate) fn registry() -> Vec<Box<dyn VaultProvider>> {
         Box::new(codex::CodexProvider),
         Box::new(openai::OpenAiApiKeyProvider),
         Box::new(github::GithubProvider),
+        Box::new(xai::XaiApiKeyProvider),
     ]
 }
 

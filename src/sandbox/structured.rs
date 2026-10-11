@@ -9,7 +9,9 @@ use std::io::{BufRead as _, Read};
 
 use anyhow::{Context, Result};
 
-use crate::agents::harness::{ClaudeAdapter, CursorAdapter, HarnessAdapter, PiAdapter};
+use crate::agents::harness::{
+    ClaudeAdapter, CursorAdapter, GrokAdapter, HarnessAdapter, PiAdapter,
+};
 use crate::contract::{Actor, Event, Payload, RequestedRunProfile, RunFinished, RunStarted};
 use crate::events::log::SessionLog;
 
@@ -130,6 +132,7 @@ enum Adapter {
     Pi(PiAdapter),
     Cursor(CursorAdapter),
     Claude(ClaudeAdapter),
+    Grok(GrokAdapter),
 }
 
 impl Adapter {
@@ -146,6 +149,10 @@ impl Adapter {
                 None => Self::Cursor(CursorAdapter::default()),
             }),
             "claude-stream" => Ok(Self::Claude(ClaudeAdapter::with_request(requested))),
+            "grok" => Ok(match requested {
+                Some(profile) => Self::Grok(GrokAdapter::with_request(profile)),
+                None => Self::Grok(GrokAdapter::default()),
+            }),
             other => anyhow::bail!("structured mode is not wired for agent `{other}`"),
         }
     }
@@ -157,6 +164,7 @@ impl Adapter {
             // The libkrun guest runs as root: never the docker adapter's
             // `--dangerously-skip-permissions` argv (claude refuses it as root).
             Self::Claude(a) => a.guest_root_argv(crate::agents::CLAUDE_STREAM.sandbox_args, prompt),
+            Self::Grok(a) => a.run_argv(prompt),
         }
     }
 
@@ -165,6 +173,7 @@ impl Adapter {
             Self::Pi(a) => a.parse_line(line),
             Self::Cursor(a) => a.parse_line(line),
             Self::Claude(a) => a.parse_line(line),
+            Self::Grok(a) => a.parse_line(line),
         }
     }
 
@@ -173,6 +182,7 @@ impl Adapter {
             Self::Pi(a) => a.terminal_payload(exit_code),
             Self::Cursor(a) => a.terminal_payload(exit_code),
             Self::Claude(a) => a.terminal_payload(exit_code),
+            Self::Grok(a) => a.terminal_payload(exit_code),
         }
     }
 }

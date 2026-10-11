@@ -23,8 +23,8 @@ use crate::startup::StartupTimer;
 pub(crate) const CONTRACT_VERSION: &str = "pillbox.text/1";
 pub(crate) const ADAPTER_REVISION: &str = "pillbox/local-text-v1";
 pub(crate) const POLICY_REVISION: &str = "pillbox-local-text-v1";
-const MAX_RENDERED_INPUT_BYTES: usize = 512 * 1024;
-const MAX_FINAL_TEXT_BYTES: u64 = 1024 * 1024;
+pub(crate) const MAX_RENDERED_INPUT_BYTES: usize = 512 * 1024;
+pub(crate) const MAX_FINAL_TEXT_BYTES: u64 = 1024 * 1024;
 /// Host-visible stages of one text invocation, in the order they complete.
 const STAGES: [&str; 6] = [
     "credentials",

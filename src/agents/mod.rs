@@ -488,6 +488,35 @@ pub const PI: AgentSpec = AgentSpec {
     libkrun_pty: None,
 };
 
+/// Grok Build CLI (`grok`) as a structured one-shot. Auth is `grok login
+/// --device-auth` → `.grok/auth.json`, or a non-vaulted `XAI_API_KEY` injected
+/// with `--with`. Not vault-capable: a vaulted `--with` is refused here so the
+/// real key is not mounted into an interactive guest. `pillbox.text/2` for
+/// harness `grok_build` is a separate path that stub-swaps `XAI_API_KEY`
+/// inside its own microVM. Model ids are bare (`grok-4.6`).
+pub const GROK: AgentSpec = AgentSpec {
+    id: "grok",
+    auth_id: "grok",
+    integration: Integration::Structured,
+    cred_sentinel: ".grok/auth.json",
+    login_argv: &["grok", "login", "--device-auth"],
+    run_argv: &["grok"],
+    oauth_port: None,
+    post_login_finalize: None,
+    vault_capable: false,
+    mcp_inject: None,
+    sandbox_args: &[],
+    prepare_workspace: None,
+    server: None,
+    structured: Some(StructuredProfile {
+        events_file: ".pillbox-grok-events.jsonl",
+        model: StructuredModelPolicy::OptionalBare,
+        alt_auth_env: Some("XAI_API_KEY"),
+    }),
+    #[cfg(feature = "libkrun")]
+    libkrun_pty: None,
+};
+
 pub const ALL: &[&AgentSpec] = &[
     &CLAUDE,
     &CLAUDE_STREAM,
@@ -496,6 +525,7 @@ pub const ALL: &[&AgentSpec] = &[
     &OPENCODE,
     &PI,
     &CURSOR,
+    &GROK,
 ];
 
 /// Look up an agent spec by id, or return a usage error listing the

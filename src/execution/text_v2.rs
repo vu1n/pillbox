@@ -166,9 +166,7 @@ pub(crate) fn execute(
                 "request_hash": completion.request_hash,
                 "resolved": {
                     "harness": request.agent.harness,
-                    "harness_version": observed
-                        .cli_version
-                        .context("Codex did not report its version")?,
+                    "harness_version": observed.cli_version,
                     "adapter_revision": ADAPTER_REVISION,
                     "runner_image_id": runner_image_id,
                     "requested_model": completion.requested_model,

@@ -319,7 +319,7 @@ impl std::fmt::Display for FailedStage {
 
 /// What the native turn reported about itself besides its text.
 pub(crate) struct Observed {
-    pub(crate) cli_version: Option<String>,
+    pub(crate) cli_version: String,
     pub(crate) usage: Option<TurnUsage>,
 }
 
@@ -458,7 +458,7 @@ fn run_local(
     progress: &mut TextProgress,
     stages: &mut Stages,
     usage: &mut Option<TurnUsage>,
-) -> Result<(TextCompletion, Option<String>)> {
+) -> Result<(TextCompletion, String)> {
     let spec = crate::agents::lookup("execution", "codex")?;
     let credentials_path = spec.home_dir(pb)?.join(spec.cred_sentinel);
     let real = crate::vault::pre_refresh(&credentials_path, "codex")?
@@ -556,7 +556,8 @@ fn run_local(
         }))?;
     }
     let native = native?.map_err(|failure| failure.error)?;
-    let cli_version = observed_cli_version(&native.evidence);
+    let cli_version =
+        observed_cli_version(&native.evidence).context("Codex did not report its CLI version")?;
     check_live(owner, deadline)?;
     let text = evidence.artifact(native.text.as_bytes(), "text/plain;charset=utf-8")?;
     let native_evidence = progress

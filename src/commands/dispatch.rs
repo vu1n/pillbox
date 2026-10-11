@@ -1472,8 +1472,6 @@ struct CliDriver<'a> {
     default_agent: String,
     /// Durable dir the winner is pulled into (a TempDir would drop it).
     rundir: PathBuf,
-    /// The bookmark restored once for `--baseline-check`, graded in place.
-    baseline_dir: std::cell::OnceCell<tempfile::TempDir>,
 }
 
 impl<'a> CliDriver<'a> {
@@ -1489,7 +1487,6 @@ impl<'a> CliDriver<'a> {
             opts,
             default_agent,
             rundir,
-            baseline_dir: std::cell::OnceCell::new(),
         })
     }
 
@@ -1623,19 +1620,12 @@ impl WorkerDriver for CliDriver<'_> {
     }
 
     fn grade_baseline(&self, grader: &Grader) -> Result<Scored> {
-        // Restore the bookmark's snapshot into a fresh temp dir (never the warm
-        // base cache the workers clone from: a grader may write build output) and
-        // grade it on the host, as `grade` grades a worker's clone.
-        let dir = match self.baseline_dir.get() {
-            Some(d) => d,
-            None => {
-                let tmp = tempfile::tempdir().context("temp dir for --baseline-check")?;
-                let handle =
-                    crate::bookmarks::resolve_existing(self.resolved, &self.opts.from_bookmark)?;
-                self.resolved.workspace()?.pull(tmp.path(), Some(&handle))?;
-                self.baseline_dir.get_or_init(|| tmp)
-            }
-        };
+        // Restore the bookmark's snapshot into a fresh temp dir PER grader: a
+        // grader may write build output, which must not leak into the next
+        // grader's baseline. Never the warm base cache the workers clone from.
+        let dir = tempfile::tempdir().context("temp dir for --baseline-check")?;
+        let handle = crate::bookmarks::resolve_existing(self.resolved, &self.opts.from_bookmark)?;
+        self.resolved.workspace()?.pull(dir.path(), Some(&handle))?;
         let (cmd, rubric) = match grader {
             Grader::Cmd(c) => (Some(c.as_str()), None),
             Grader::Rubric(p) => (None, Some(p.as_path())),

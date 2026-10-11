@@ -183,8 +183,9 @@ impl Capture {
 
     fn frame(&mut self, line: Value, max_final: usize) -> Result<()> {
         ensure!(!self.exited, "frame after harness exit");
-        if line["type"] == "result" {
+        if line["type"] == "result" && self.result.is_none() {
             // Preserve reported spend even if the terminal frame violates policy.
+            // A forbidden second result cannot erase or replace that report.
             self.usage = TurnUsage::from_claude_result(&line);
         }
         ensure!(
@@ -419,6 +420,20 @@ pub(crate) fn run(
     (capture, result)
 }
 
+/// Preserve reported spend before cleanup can fail, while requiring teardown
+/// even when native preparation failed. A teardown marker must remain intact.
+pub(super) fn finish_native(
+    native: Result<(Capture, Result<()>)>,
+    usage: &mut Option<TurnUsage>,
+    teardown: impl FnOnce() -> Result<()>,
+) -> Result<(Capture, Result<()>)> {
+    if let Ok((capture, _)) = &native {
+        *usage = capture.usage.clone();
+    }
+    teardown()?;
+    native
+}
+
 #[cfg(test)]
 pub(super) fn smoke_request() -> Value {
     let output = std::process::Command::new("bash")
@@ -572,6 +587,74 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_failure_retains_reported_usage_and_never_completes() {
+        let native = fake(&frames("hello"), 32768);
+        let expected = native.0.usage.clone();
+        let mut usage = None;
+        let mut called = 0;
+        let result = finish_native(Ok(native), &mut usage, || {
+            called += 1;
+            anyhow::bail!("remove stopped VM sockets");
+        });
+        assert!(result.is_err());
+        assert_eq!(called, 1);
+        assert_eq!(usage, expected);
+        assert_eq!(usage.unwrap().cost_usd, Some(0.25));
+    }
+
+    #[test]
+    fn native_preparation_failure_still_tears_down_once() {
+        let mut usage = None;
+        let mut called = 0;
+        let result = finish_native(
+            Err(anyhow::anyhow!("native preparation")),
+            &mut usage,
+            || {
+                called += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(result.err().unwrap().to_string(), "native preparation");
+        assert_eq!(called, 1);
+        assert!(usage.is_none());
+
+        let result = finish_native(
+            Err(anyhow::anyhow!("native preparation")),
+            &mut usage,
+            || anyhow::bail!("teardown failure"),
+        );
+        assert_eq!(result.err().unwrap().to_string(), "teardown failure");
+    }
+
+    #[cfg(feature = "libkrun")]
+    #[test]
+    fn unconfirmed_teardown_marker_survives_reported_usage_context() {
+        use crate::sandbox::libkrun::repository::TeardownUnconfirmed;
+        let mut usage = None;
+        let result = finish_native(Ok(fake(&frames("hello"), 32768)), &mut usage, || {
+            Err(anyhow::Error::new(TeardownUnconfirmed))
+        });
+        let error = result
+            .err()
+            .unwrap()
+            .context(super::super::text::FailedStage {
+                stage: "turn",
+                usage,
+            });
+        assert!(error.is::<TeardownUnconfirmed>());
+        assert_eq!(
+            error
+                .downcast_ref::<super::super::text::FailedStage>()
+                .unwrap()
+                .usage
+                .as_ref()
+                .unwrap()
+                .cost_usd,
+            Some(0.25)
+        );
+    }
+
+    #[test]
     fn fake_harness_refuses_every_tool_attempt_and_denial() {
         for tool in ["Bash", "Edit", "Write", "WebFetch", "mcp__server__read"] {
             let mut lines = frames("hello");
@@ -624,6 +707,33 @@ mod tests {
         lines.insert(3, lines[2].clone());
         assert!(fake(&lines, 32768).1.is_err());
         assert!(fake(&frames("hello")[..3], 32768).1.is_err());
+    }
+
+    #[test]
+    fn duplicate_result_cannot_erase_or_replace_reported_usage() {
+        for duplicate_usage in [json!({}), json!({"total_cost_usd":0.75})] {
+            let mut lines = frames("hello");
+            let mut duplicate = lines[2].clone();
+            duplicate.as_object_mut().unwrap().remove("usage");
+            duplicate.as_object_mut().unwrap().remove("total_cost_usd");
+            duplicate
+                .as_object_mut()
+                .unwrap()
+                .extend(duplicate_usage.as_object().unwrap().clone());
+            lines.insert(3, duplicate);
+            let (capture, result) = fake(&lines, 32768);
+            assert!(result.is_err());
+            assert_eq!(capture.usage.as_ref().unwrap().cost_usd, Some(0.25));
+            assert_eq!(capture.usage.as_ref().unwrap().input_tokens, Some(3));
+        }
+        let mut lines = frames("hello");
+        let duplicate = lines[2].clone();
+        lines[2].as_object_mut().unwrap().remove("usage");
+        lines[2].as_object_mut().unwrap().remove("total_cost_usd");
+        lines.insert(3, duplicate);
+        let (capture, result) = fake(&lines, 32768);
+        assert!(result.is_err());
+        assert!(capture.usage.is_none());
     }
 
     #[test]

@@ -74,6 +74,9 @@ to refute the security finding. Confirmed findings were fixed before publication
 - Prefix raw native lines with a fixed transport byte and emit exit proof only
   from the trusted supervisor after waiting for the child. Native JSON cannot
   forge exit success. Account for evidence envelopes and diagnostics in bounds.
+- Retain already reported usage before teardown, and preserve the first terminal
+  report when rejecting a duplicate. Cleanup failures still cannot produce a
+  completed record or hide an unconfirmed-teardown marker.
 
 The final reviews reported no remaining material correctness or security finding.
 The local cleanup pass retained explicit protocol guards, simplified the launch

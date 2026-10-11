@@ -90,9 +90,8 @@ pub(crate) fn execute(
         })();
         let diagnostics = vm.diagnostics();
         // Unconfirmed teardown stays in the error chain and prevents sealing.
-        vm.stop_and_reap()?;
-        let (capture, result) = native?;
-        usage = capture.usage.clone();
+        let (capture, result) =
+            super::finish_native(native, &mut usage, || vm.stop_and_reap().map(|_| ()))?;
         let diagnostics = diagnostics?;
         ensure!(
             capture.evidence_bytes()? + diagnostics.len() as u64 <= limits.max_evidence_bytes,

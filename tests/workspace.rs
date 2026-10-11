@@ -207,6 +207,48 @@ fn bookmark_set_show_and_pull_round_trip() {
 }
 
 #[test]
+fn dispatch_baseline_check_refuses_a_reward_the_base_already_passes() {
+    // The reward is graded on the restored bookmark before any worker boots, so
+    // this needs no VM: a reward the base already passes stops the run, exit 2.
+    let home = TempDir::new().unwrap();
+    let cwd = TempDir::new().unwrap();
+    assert_ok(
+        &run(home.path(), cwd.path(), &["new", "--name", "bl"]),
+        "new",
+    );
+    std::fs::write(cwd.path().join("app.txt"), b"base").unwrap();
+    assert_ok(&run(home.path(), cwd.path(), &["push"]), "push");
+    assert_ok(
+        &run(
+            home.path(),
+            cwd.path(),
+            &["bookmark", "set", "main", "latest"],
+        ),
+        "bookmark set",
+    );
+    // The bookmark is graded, not cwd: removing the file here changes nothing.
+    std::fs::remove_file(cwd.path().join("app.txt")).unwrap();
+
+    let out = run(
+        home.path(),
+        cwd.path(),
+        &[
+            "dispatch",
+            "--from-bookmark",
+            "main",
+            "--cmd",
+            "test -f app.txt",
+            "--baseline-check",
+            "--",
+            "task",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("already passes on the base"), "stderr: {err}");
+}
+
+#[test]
 fn push_pull_round_trips_the_workspace() {
     let home = TempDir::new().unwrap();
     let cwd = TempDir::new().unwrap();

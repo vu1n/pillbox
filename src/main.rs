@@ -347,6 +347,18 @@ enum Command {
         /// gate-retry budget.
         #[arg(long, value_name = "N", default_value_t = 1)]
         retries: u32,
+        /// Non-convergence breaker: stop retrying a worker after N retries in a
+        /// row that don't raise its best rubric score, even with `--retries`
+        /// budget left. Rubric grades only (a `--cmd` grade has no partial
+        /// progress to measure). 0 disables it.
+        #[arg(long = "stall-limit", value_name = "N", default_value_t = 2)]
+        stall_limit: u32,
+        /// Before forking, grade the untouched `--from-bookmark` base with the
+        /// reward and every segment gate. A reward that already passes there
+        /// can't tell a worker that did the task from one that didn't, so the
+        /// dispatch stops (exit 2) before any worker boots.
+        #[arg(long = "baseline-check")]
+        baseline_check: bool,
         /// Worker agent (`claude` | `codex` | `opencode` | …). Defaults to the
         /// pillbox's `agent =`, then `claude`.
         #[arg(long, value_name = "AGENT")]
@@ -899,6 +911,8 @@ fn run(cli: Cli) -> Result<()> {
             rubric,
             segments,
             retries,
+            stall_limit,
+            baseline_check,
             agent,
             model,
             temperature,
@@ -927,6 +941,8 @@ fn run(cli: Cli) -> Result<()> {
                     rubric,
                     segments,
                     retries,
+                    stall_limit,
+                    baseline_check,
                     agent,
                     model,
                     temperature,

@@ -589,7 +589,10 @@ line observed in the guest, not the image pin. `served_model` is the single
 `modelUsage` key on the terminal event, or null when that key is missing,
 `unknown`, or not unique. A `tool_call` event, empty text, a stop reason other
 than `end_turn`, or text over `max_final_text_bytes` fails with
-`runtime_protocol_error` at `turn`.
+`runtime_protocol_error` at `turn`. The argv denylist includes `x_search`:
+`--disable-web-search` removes hosted web search only, and `grok-4.6` still
+offers hosted X search unless that name is denied. The guest also sets
+`GROK_BACKEND_SEARCH=0`.
 
 A completed record, and a failed one whose turn already spent tokens, carries
 `usage` when the harness reported any:

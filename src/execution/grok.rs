@@ -34,16 +34,19 @@ const CATALOG: &[(&str, &[&str])] = &[
 ];
 
 /// Short tool ids from the 1.0.45 toolset, plus bare `Agent` (blocks subagent
-/// spawn). `--tools` is not a denylist: an unknown allowlist name keeps the
-/// full toolset, and an empty `--tools` means no restriction. The denylist
-/// runs first and wins. The driver also fails the turn if a `tool_call`
-/// event arrives.
+/// spawn) and `x_search`. `--disable-web-search` removes hosted `web_search`
+/// only; grok-build still offers hosted `x_search` on `grok-4.6` unless the
+/// denylist names it (`hosted_tool_allowed`). `--tools` is not a denylist: an
+/// unknown allowlist name keeps the full toolset, and an empty `--tools`
+/// means no restriction. The denylist runs first and wins. The driver also
+/// fails the turn if a `tool_call` event arrives.
 const DISALLOWED_TOOLS: &str = "Agent,ask_user_question,bash,deploy_app,edit,enter_plan_mode,\
 exit_plan_mode,get_task_output,get_terminal_command_output,glob,grep,image_edit,image_gen,\
 image_to_video,init_or_update_app,kill_task,kill_terminal_command,list_dir,lsp,memory_get,\
 memory_search,monitor,read,read_file,reference_to_video,run_terminal_cmd,scheduler_create,\
 scheduler_delete,scheduler_list,search_replace,search_tool,send_feedback,send_subagent_message,\
-task,todo_write,todowrite,update_goal,use_tool,wait_tasks,web_fetch,web_search,workflow,write";
+task,todo_write,todowrite,update_goal,use_tool,wait_tasks,web_fetch,web_search,workflow,write,\
+x_search";
 
 /// What a selection resolves to before a VM starts. The CLI version is not
 /// here: the guest observes it with `grok --version`.
@@ -336,6 +339,36 @@ pub(crate) fn completion_record(
     detail
 }
 
+/// Stages a grok_build turn walks, in order. `stage_at(0)` is credentials,
+/// before any stage has completed. The turn interpreter runs at `stage_at(5)`.
+const TEXT_STAGES: [&str; 6] = [
+    "credentials",
+    "image_prepare",
+    "guest_prepare",
+    "vmm_spawn",
+    "guest_rpc_ready",
+    "turn",
+];
+
+pub(crate) fn stage_at(completed: usize) -> &'static str {
+    TEXT_STAGES.get(completed).copied().unwrap_or("finalize")
+}
+
+/// Same closed mapping as `text_v2::failure_code`. Deadlines are timeouts
+/// wherever they hit; otherwise the stage decides.
+pub(crate) fn closed_failure_code(stage: &str, message: &str) -> &'static str {
+    if message.contains("deadline exceeded") {
+        return "runtime_timeout";
+    }
+    match stage {
+        "credentials" | "image_prepare" | "guest_prepare" | "vmm_spawn" | "guest_rpc_ready" => {
+            "runtime_unavailable"
+        }
+        "turn" => "runtime_protocol_error",
+        _ => "internal_error",
+    }
+}
+
 pub(crate) fn failure_record(
     invocation_id: &str,
     request_hash: &str,
@@ -374,19 +407,11 @@ pub(crate) fn run(
 
     use super::text_v2::Outcome;
 
-    const STAGES: [&str; 6] = [
-        "credentials",
-        "image_prepare",
-        "guest_prepare",
-        "vmm_spawn",
-        "guest_rpc_ready",
-        "turn",
-    ];
-
     struct Stages {
         timer: crate::startup::StartupTimer,
         completed: usize,
         started_emitted: bool,
+        failed: Option<&'static str>,
     }
 
     impl Stages {
@@ -395,16 +420,25 @@ pub(crate) fn run(
                 timer: crate::startup::StartupTimer::start(),
                 completed: 0,
                 started_emitted: false,
+                failed: None,
             }
         }
 
         fn in_progress(&self) -> &'static str {
-            STAGES.get(self.completed).copied().unwrap_or("finalize")
+            self.failed.unwrap_or_else(|| stage_at(self.completed))
+        }
+
+        fn fail(&mut self, name: &'static str) {
+            if self.failed.is_none() {
+                self.failed = Some(name);
+            }
         }
 
         fn complete(&mut self, name: &'static str, evidence: &mut ExecutionEvidence) -> Result<()> {
+            if self.failed.is_some() {
+                bail!("text stage evidence was not persisted");
+            }
             self.timer.mark(name);
-            self.completed += 1;
             let duration_ms = self
                 .timer
                 .snapshot()
@@ -415,6 +449,7 @@ pub(crate) fn run(
                 name: "text.stage.completed".into(),
                 payload: Some(json!({"stage": name, "duration_ms": duration_ms})),
             }))?;
+            self.completed += 1;
             Ok(())
         }
 
@@ -506,6 +541,7 @@ pub(crate) fn run(
         &cancelled,
         &mut |name| {
             if let Err(error) = stages.complete(name, &mut evidence) {
+                stages.fail(name);
                 stage_error.get_or_insert(error);
             }
         },
@@ -826,6 +862,7 @@ mod tests {
             "web_search",
             "write",
             "task",
+            "x_search",
         ] {
             assert!(
                 denied[1].split(',').any(|entry| entry == name),
@@ -941,11 +978,14 @@ mod tests {
         );
         let fault = interpret(&stdout, 32_768).unwrap_err();
         assert!(fault.message.contains("tool"));
+        // The interpreter runs after credentials through guest_rpc_ready.
+        let stage = stage_at(5);
+        let code = closed_failure_code(stage, &fault.message);
         let detail = failure_record(
             "chat_1",
             "sha256:ab",
-            "runtime_protocol_error",
-            "turn",
+            code,
+            stage,
             &session_ref(),
             fault.usage.as_ref(),
         );
@@ -1007,15 +1047,12 @@ mod tests {
     fn missing_credential_fails_at_credentials() {
         let (_dir, pb) = temp_pillbox();
         let error = load_credential(&pb, "chat_1").unwrap_err();
-        assert!(format!("{error:#}").contains("not in the secret store"));
-        let detail = failure_record(
-            "chat_1",
-            "sha256:ab",
-            "runtime_unavailable",
-            "credentials",
-            &session_ref(),
-            None,
-        );
+        let message = format!("{error:#}");
+        assert!(message.contains("not in the secret store"));
+        // Credential load is the first stage, before any stage completes.
+        let stage = stage_at(0);
+        let code = closed_failure_code(stage, &message);
+        let detail = failure_record("chat_1", "sha256:ab", code, stage, &session_ref(), None);
         assert_eq!(detail["code"], "runtime_unavailable");
         assert_eq!(detail["stage"], "credentials");
         assert!(detail.get("error").is_none());

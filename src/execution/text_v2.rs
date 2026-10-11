@@ -391,17 +391,7 @@ fn unresolved(
 /// Map a failed stage to the closed code set shared with the caller. Deadlines are
 /// timeouts wherever they hit; otherwise the stage decides.
 pub(crate) fn failure_code(stage: &str, error: &anyhow::Error) -> &'static str {
-    let message = format!("{error:#}");
-    if message.contains("deadline exceeded") {
-        return "runtime_timeout";
-    }
-    match stage {
-        "credentials" | "image_prepare" | "guest_prepare" | "vmm_spawn" | "guest_rpc_ready" => {
-            "runtime_unavailable"
-        }
-        "turn" => "runtime_protocol_error",
-        _ => "internal_error",
-    }
+    super::grok::closed_failure_code(stage, &format!("{error:#}"))
 }
 
 #[cfg(test)]

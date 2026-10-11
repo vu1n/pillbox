@@ -2528,6 +2528,8 @@ def main():
         'NODE_EXTRA_CA_CERTS': RUNTIME + '/ca.crt',
         'GROK_EXTRA_CA_BUNDLE': RUNTIME + '/ca.crt',
         'GROK_DISABLE_AUTOUPDATER': '1',
+        # Hosted x_search stays on when only web search is disabled.
+        'GROK_BACKEND_SEARCH': '0',
         'XAI_API_KEY': stub,
     }
     for cmd in (
@@ -2708,6 +2710,7 @@ mod tests {
             .to_string()
             .contains("real credential"));
         assert!(GROK_BRIDGE.contains("GROK_EXTRA_CA_BUNDLE"));
+        assert!(GROK_BRIDGE.contains("GROK_BACKEND_SEARCH"));
         assert!(!GROK_BRIDGE.contains(real));
     }
 

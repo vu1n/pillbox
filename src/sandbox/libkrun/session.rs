@@ -600,6 +600,7 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
     let _ = std::fs::remove_file(&attach_sock);
 
     let vmspec = VmSpec {
+        offline: false,
         ownership: None,
         rootfs: rootfs.to_string_lossy().into_owned(),
         vcpus: 2,
@@ -1024,6 +1025,7 @@ fn launch_server_vm(
     let _ = std::fs::remove_file(&host_sock);
 
     let vmspec = VmSpec {
+        offline: false,
         ownership: None,
         rootfs: rootfs.to_string_lossy().into_owned(),
         vcpus: 2,
@@ -1368,6 +1370,7 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
         &boot_script,
     )?;
     let vmspec = VmSpec {
+        offline: false,
         ownership: None,
         rootfs: rootfs.to_string_lossy().into_owned(),
         vcpus: 2,
@@ -1881,11 +1884,32 @@ pub(crate) fn workspace_path(session: &crate::session::Session) -> Result<PathBu
 /// `krun_start_enter` exits the child with the guest's code, so the child's exit
 /// IS the grader's exit, and the guest console (merged via `2>&1`) is the
 /// child's stdout.
+/// The guest commands that run after `/grade` is mounted and is the cwd.
+/// `drop_privileges` runs the grader as `nobody`: the grade tree has already
+/// been mode-locked on the host, and root could `chmod` that lock off.
+/// The start marker is printed only once this setup succeeded.
+pub(super) fn grade_exec(cmd: &str, drop_privileges: bool) -> String {
+    let started = crate::commands::session::GRADER_STARTED_PRINTF;
+    if drop_privileges {
+        // `&&` all the way: the caller prefixes `mount && cd &&` this string, and
+        // a `;` would let the marker (and the grader) run when the mount failed.
+        format!(
+            "{} && [ -x {runuser} ] && {started} && {runuser} -u nobody --preserve-environment -- sh -c {}",
+            crate::commands::session::dropped_grader_setup(),
+            super::shell_quote(cmd),
+            runuser = crate::commands::session::RUNUSER,
+        )
+    } else {
+        format!("{started} && {{ {cmd} ; }}")
+    }
+}
+
 pub(crate) fn score_in_sandbox(
     resolved: &Pillbox,
     workspace: &Path,
     cmd: &str,
     egress_allow: &[String],
+    drop_privileges: bool,
 ) -> Result<(i32, String)> {
     use std::io::Read as _;
     // Same disk-pressure guard as the run path: the grader VM materializes the
@@ -1901,8 +1925,12 @@ pub(crate) fn score_in_sandbox(
     let (egress, env_extra, script, _grade_ca) = if egress_allow.is_empty() {
         // Mount the workspace, cd in, run the grader with stderr merged to the
         // console. `&&` so a failed mount/cd surfaces; the grader's exit is last.
+        // The start marker is printed only once setup succeeded — the caller
+        // treats its absence as "the grade never ran". `2>&1` binds to the
+        // last command, which is the grader.
         let script = format!(
-            "mkdir -p /grade && mount -t virtiofs grade /grade && cd /grade && {{ {cmd} ; }} 2>&1"
+            "mkdir -p /grade && mount -t virtiofs grade /grade && cd /grade && {} 2>&1",
+            grade_exec(cmd, drop_privileges)
         );
         (None, Vec::new(), script, None)
     } else {
@@ -1919,11 +1947,28 @@ pub(crate) fn score_in_sandbox(
         // trusting that one cert is sufficient (the same single-cert trust agents
         // use via NODE_EXTRA_CA_CERTS). The PEM is shell-quoted straight in — it
         // rides the boot script (see [`boot::boot_channel`]), so no base64 detour.
+        let run = if drop_privileges {
+            // `&&` through the marker so a missing `runuser` (set -e does not
+            // abort a failing command in the middle of an AND-list) never looks
+            // like the grader started.
+            format!(
+                "{setup} && [ -x {runuser} ] && {started}; set +e; {runuser} -u nobody --preserve-environment -- sh -c {quoted}",
+                setup = crate::commands::session::dropped_grader_setup(),
+                runuser = crate::commands::session::RUNUSER,
+                started = crate::commands::session::GRADER_STARTED_PRINTF,
+                quoted = shell_quote(cmd),
+            )
+        } else {
+            format!(
+                "{started}; set +e; {cmd}",
+                started = crate::commands::session::GRADER_STARTED_PRINTF,
+            )
+        };
         let script = format!(
             "exec 2>&1; set -e; {net}; \
              printf '%s' {ca_q} > {GUEST_CA_PATH}; \
              mkdir -p /grade; mount -t virtiofs grade /grade; cd /grade; \
-             set +e; {cmd}",
+             {run}",
             ca_q = shell_quote(&ca.cert_pem),
         );
         let egress = Some(EgressSpec {
@@ -1967,6 +2012,10 @@ pub(crate) fn score_in_sandbox(
     )?;
 
     let vmspec = VmSpec {
+        // No allowlist means no network at all: without this, omitting
+        // virtio-net leaves libkrun's implicit TSI on, and worker code the
+        // grader runs could reach the Internet through the host.
+        offline: egress.is_none(),
         ownership: None,
         rootfs: rootfs.to_string_lossy().into_owned(),
         vcpus: 2,
@@ -2009,18 +2058,75 @@ pub(crate) fn score_in_sandbox(
                                               // below, not via `killpg` — same rationale as the foreground run.
     let mut child = cmd.spawn().context("spawn the grader VMM subprocess")?;
     rootfs.preserve();
-    let mut out = String::new();
-    if let Some(mut so) = child.stdout.take() {
-        so.read_to_string(&mut out).ok();
-    }
-    let code = child
-        .wait()
-        .context("await grader VMM")?
-        .code()
-        .unwrap_or(-1);
+    // Drain the console to EOF but keep at most GRADE_OUTPUT_CAP bytes: worker
+    // code can print without end, and the guest's memory limit doesn't bound
+    // this host-side buffer. Rubric markers are interspersed, so it's a hard
+    // cap that errors the grade, not a tail that could drop criteria.
+    let reader = child.stdout.take().map(|mut so| {
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let mut over = false;
+            let mut chunk = [0u8; 64 * 1024];
+            while let Ok(n) = so.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                if out.len() + n > GRADE_OUTPUT_CAP {
+                    over = true;
+                } else {
+                    out.extend_from_slice(&chunk[..n]);
+                }
+            }
+            (String::from_utf8_lossy(&out).into_owned(), over)
+        })
+    });
+    // Worker code runs inside the grade (tests, build scripts), so a hang must
+    // cost this worker its grade, not stall the whole dispatch.
+    let limit = grade_timeout();
+    let deadline = std::time::Instant::now() + limit;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("await grader VMM")? {
+            break Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let (out, over) = reader
+        .map(|r| r.join().unwrap_or_default())
+        .unwrap_or_default();
     confirm_vmm_stopped(&spec_file.path().to_string_lossy())?;
     rootfs.remove_stopped()?;
-    Ok((code, out))
+    if over {
+        bail!(
+            "the grader printed more than {} MiB and was not scored",
+            GRADE_OUTPUT_CAP >> 20
+        );
+    }
+    let Some(status) = status else {
+        bail!(
+            "the grader ran past its {}s deadline and was stopped (set PILLBOX_GRADE_TIMEOUT to change it)",
+            limit.as_secs()
+        );
+    };
+    Ok((status.code().unwrap_or(-1), out))
+}
+
+/// The most console output one grade keeps (see [`grade_exec`]'s reader).
+const GRADE_OUTPUT_CAP: usize = 64 << 20;
+
+/// How long one grader VM may run. Override with `PILLBOX_GRADE_TIMEOUT`
+/// (seconds).
+fn grade_timeout() -> std::time::Duration {
+    const DEFAULT_GRADE_TIMEOUT_SECS: u64 = 1800;
+    let secs = std::env::var("PILLBOX_GRADE_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_GRADE_TIMEOUT_SECS);
+    std::time::Duration::from_secs(secs)
 }
 
 /// Reattach to a detached libkrun session: dial the persistent attach socket
@@ -2674,6 +2780,24 @@ mod tests {
             assert_eq!(script.matches("chown ").count(), 1);
             assert!(script.contains("chmod \"$mode\""));
         }
+    }
+
+    #[test]
+    fn dropped_grader_is_nobody_and_the_marker_follows_the_runuser_check() {
+        let script = grade_exec("sh tests/check.sh", true);
+        // Absolute: the grader PATH has no sbin, where Debian keeps runuser.
+        let check = script.find("[ -x /usr/sbin/runuser ]").unwrap();
+        let marker = script.find("PBSTART").unwrap();
+        let runuser = script.find("/usr/sbin/runuser -u nobody").unwrap();
+        assert!(check < marker && marker < runuser, "{script}");
+        assert!(
+            !script[..marker].contains(';'),
+            "a semicolon before the marker breaks the mount && chain: {script}"
+        );
+        assert!(script.contains("PYTHONDONTWRITEBYTECODE=1"), "{script}");
+        assert!(script.contains("PYTHONSAFEPATH=1"), "{script}");
+        assert!(script.contains("sh -c 'sh tests/check.sh'"), "{script}");
+        assert!(!grade_exec("true", false).contains("runuser"));
     }
 
     #[test]

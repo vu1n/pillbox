@@ -141,6 +141,10 @@ struct VmSpec {
     /// One-shot VMMs retain owner liveness; bounded invocations also have a deadline.
     #[serde(default)]
     ownership: Option<repository::OwnershipSpec>,
+    /// No network: disable libkrun's implicit TSI, which it otherwise turns on
+    /// whenever no virtio-net device is attached. Set for an offline grader.
+    #[serde(default)]
+    offline: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -350,10 +354,11 @@ pub(crate) fn vmm_child_main() -> ! {
         }
         let ctx = ctx as u32;
         let mut rc = ffi::krun_set_vm_config(ctx, spec.vcpus, spec.ram_mib);
-        if spec
-            .ownership
-            .as_ref()
-            .is_some_and(repository::OwnershipSpec::is_bounded)
+        if spec.offline
+            || spec
+                .ownership
+                .as_ref()
+                .is_some_and(repository::OwnershipSpec::is_bounded)
         {
             // Omitting virtio-net otherwise enables implicit TSI in libkrun.
             rc = rc.min(ffi::krun_disable_implicit_vsock(ctx));

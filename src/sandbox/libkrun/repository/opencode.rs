@@ -128,6 +128,7 @@ fn spec(
     remaining_ms: u64,
 ) -> VmSpec {
     VmSpec {
+        offline: false,
         rootfs: rootfs.to_string_lossy().into_owned(),
         vcpus: 2,
         ram_mib: 2048,

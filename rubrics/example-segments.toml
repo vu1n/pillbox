@@ -8,22 +8,28 @@
 # Run it (segmentation + best-of-3 over chains):
 #   pillbox dispatch --from-bookmark base --segments rubrics/example-segments.toml \
 #     -k 3 --temperature 0.7 --rubric rubrics/test-pass.rubric \
+#     --grader-files ../hidden-tests/ \
 #     --agent opencode --json -- "Build the tree utilities described per segment."
 #
 # Each segment: prompt XOR prompt_file, and gate_rubric XOR gate_cmd.
 # Relative paths resolve against THIS file's directory. Unknown keys are an error.
-# Gates are SELF-CONTAINED — they run against the worker's live workspace as-is,
-# so each command tests only what this segment produced (scope it with -k <name>).
+# Gates run on a copy of the worker's workspace with protected paths (tests/,
+# test_*.py, …) reset to the bookmark, inside the grader microVM — see "Grading"
+# in docs/dispatch.md. A test the worker writes under tests/ is removed before
+# grading, so the checks here come from the operator: hidden tests passed with
+# --grader-files and run as .pillbox-grader/…, which the worker never sees.
+# Scope each gate to what THIS segment produced. pytest must be in the runner
+# image (build one FROM the pillbox runner and set PILLBOX_RUNNER_IMAGE).
 
 [[segment]]
 name     = "reroot"
-prompt   = "Add Tree.reroot(node): return a copy of the tree re-rooted at `node`, parent links flipped along the path. Add a focused test under tests/ named test_reroot."
-gate_cmd = "python3 -m pytest -q -k reroot"
+prompt   = "Add Tree.reroot(node): return a copy of the tree re-rooted at `node`, parent links flipped along the path."
+gate_cmd = "python3 -m pytest -q .pillbox-grader/test_reroot.py"
 
 [[segment]]
 name     = "pathfind"
-prompt   = "Implement Tree.path_to(from_node, to_node): return the list of nodes on the unique path between them. Add a focused test named test_path."
-gate_cmd = "python3 -m pytest -q -k path"
+prompt   = "Implement Tree.path_to(from_node, to_node): return the list of nodes on the unique path between them."
+gate_cmd = "python3 -m pytest -q .pillbox-grader/test_path.py"
 
 [[segment]]
 name     = "serialize"

@@ -93,9 +93,15 @@ Rules (from the contract):
   `gate_cmd`. Unknown keys are a parse error.
 - **Relative paths resolve against the spec file's directory** — keep prompt/rubric
   files next to the spec.
-- **Gates are self-contained** — they run against the worker's live workspace as-is.
-  Write each gate to test only what *this* segment produced (`pytest -k <segment>`,
-  not the whole suite), so a checkpoint fails for the right reason.
+- **Gates run on a protected copy, in the grader microVM** — the worker's workspace
+  with tests, test config, CI and rubrics reset to the bookmark (docs/dispatch.md,
+  Grading). A test the worker writes under `tests/` is removed first, so check
+  tests that exist on the bookmark or come from `--grader-files DIR` (run as
+  `.pillbox-grader/…`). Write each gate to test only what *this* segment produced,
+  so a checkpoint fails for the right reason.
+- **The grader VM is the runner image** — no Rust toolchain, no pytest. A missing
+  tool makes the worker `errored`, not `failed`; layer the toolchain into an image
+  built `FROM` the runner and set `PILLBOX_RUNNER_IMAGE`.
 - Segments are **ordered and cumulative** — segment N may rely on N-1's output. Order
   them so each gate is checkable the moment that segment finishes.
 

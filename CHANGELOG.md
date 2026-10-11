@@ -10,6 +10,13 @@ transport (in-sandbox pty-host + frame protocol; local detach/reattach).
 
 ## Unreleased
 
+- `pillbox dispatch` grades every worker on a copy of its workspace inside the
+  grader microVM, never on the host and never in the live tree. Tests, test
+  config, CI config and rubrics are reset to the bookmark and locked, and the
+  grader runs as `nobody` (`--protect`, `--no-default-protect`,
+  `--grader-egress`). `--grader-files DIR` injects hidden checks at
+  `.pillbox-grader/`. A grader tool missing from the runner image makes the
+  worker `errored`, not `failed`. A build without libkrun refuses to dispatch.
 - Add `pillbox dispatch --restate-task` (off by default). It re-sends the
   positional task, verbatim in an `<original-task>` block, with every retry
   turn and ahead of every segment after the first. If the task already contains

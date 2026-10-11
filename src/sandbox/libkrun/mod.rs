@@ -931,7 +931,7 @@ fn find_cached_rootfs(root: &Path, image: &str) -> Option<PathBuf> {
     best.map(|(cache, _)| cache)
 }
 
-fn docker_image_id(image: &str) -> Result<String> {
+pub(crate) fn docker_image_id(image: &str) -> Result<String> {
     let out = Command::new("docker")
         .arg("image")
         .arg("inspect")

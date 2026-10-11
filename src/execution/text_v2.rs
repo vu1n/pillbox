@@ -5,9 +5,7 @@
 //! egress itself, and reports what it ran in `resolved`. A failure carries one closed
 //! code and the stage that was running; free text stays in the session evidence.
 
-use std::process::Command;
-
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -237,19 +235,11 @@ fn resolve(
 /// The immutable id of the runner image this pillbox is configured to use.
 fn runner_image_id(pb: &Pillbox) -> Result<String> {
     let (image, _) = crate::docker::resolve_runner_image(pb);
-    let output = Command::new("docker")
-        .args(["image", "inspect", &image, "--format", "{{.Id}}"])
-        .output()
-        .context("run docker image inspect")?;
+    let id = crate::sandbox::libkrun::docker_image_id(&image)?;
     ensure!(
-        output.status.success(),
-        "runner image {image} is not available: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
+        super::valid_digest(&id),
+        "invalid runner image id for {image}"
     );
-    let id = String::from_utf8(output.stdout)?.trim().to_owned();
-    if !super::valid_digest(&id) {
-        bail!("Docker returned an invalid runner image id for {image}");
-    }
     Ok(id)
 }
 

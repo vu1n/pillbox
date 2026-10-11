@@ -26,6 +26,8 @@ use crate::execution::Verifier;
 use crate::paths::write_private_file;
 use crate::vault::providers::codex_execution::CodexAccessRelease;
 
+pub(crate) mod claude_text;
+
 const PROVIDER_HOST: &str = "chatgpt.com";
 const RPC_PORT: u32 = 1067;
 const MAX_DURATION: Duration = Duration::from_secs(86_400);
@@ -172,6 +174,12 @@ impl OwnedVm {
             "owned VMM exited before completion"
         );
         Ok(())
+    }
+
+    /// One-shot guests may exit with terminal bytes still queued on RPC. Drain
+    /// console bounds without treating that exit as a premature protocol failure.
+    pub(crate) fn drain_output(&mut self) -> Result<()> {
+        self.process.drain()
     }
 
     pub(crate) fn diagnostics(&mut self) -> Result<Vec<u8>> {

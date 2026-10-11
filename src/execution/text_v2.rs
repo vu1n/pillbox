@@ -11,6 +11,7 @@ use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use super::claude_text;
 use super::evidence::ExecutionEvidence;
 use super::protocol;
 use super::store::OwnedInvocation;
@@ -87,6 +88,35 @@ impl TextRequestV2 {
             ),
             "unknown text harness"
         );
+        if self.agent.harness == "claude_code" {
+            super::identity(&self.invocation_id)?;
+            super::identity(&self.session_ref.session_id)?;
+            ensure!(
+                !self.rendered_input.is_empty() && self.rendered_input.len() <= 512 * 1024,
+                "invalid rendered input length"
+            );
+            ensure!(
+                self.output_format.kind == "text" && self.output_format.retry_count == 0,
+                "unsupported text output format"
+            );
+            ensure!(
+                (1..=super::MAX_TIMEOUT_MS).contains(&self.limits.timeout_ms),
+                "invalid text timeout"
+            );
+            ensure!(
+                (1..=claude_text::MAX_FINAL_TEXT_BYTES).contains(&self.limits.max_final_text_bytes),
+                "invalid final text limit"
+            );
+            ensure!(
+                (1..=super::MAX_FRAME_BYTES).contains(&self.limits.max_frame_bytes),
+                "invalid native frame limit"
+            );
+            ensure!(
+                (1..=super::MAX_EVIDENCE_BYTES).contains(&self.limits.max_evidence_bytes)
+                    && self.limits.max_frame_bytes <= self.limits.max_evidence_bytes,
+                "invalid native evidence limit"
+            );
+        }
         Ok(())
     }
 
@@ -152,27 +182,34 @@ pub(crate) fn execute(
         Ok(resolved) => resolved,
         Err(rejection) => return unresolved(pb, request, owner, rejection),
     };
-    match text::execute_with(pb, &lowered, owner, false) {
-        Ok((completion, observed)) => {
-            let mut detail = json!({
-                "invocation_id": completion.invocation_id,
-                "request_hash": completion.request_hash,
-                "resolved": {
-                    "harness": request.agent.harness,
-                    "harness_version": observed
-                        .cli_version
-                        .context("Codex did not report its version")?,
-                    "adapter_revision": ADAPTER_REVISION,
-                    "runner_image_id": runner_image_id,
-                    "requested_model": completion.requested_model,
-                    "served_model": completion.served_model,
-                },
-                "session_ref": completion.session_ref,
-                "output_text": completion.output_text,
-            });
-            with_usage(&mut detail, observed.usage.as_ref());
-            Ok(Outcome::Completed(detail))
-        }
+    let result = match lowered {
+        ResolvedText::Claude(resolved) => claude_text::execute(pb, request, resolved, owner),
+        ResolvedText::Codex(lowered) => match text::execute_with(pb, &lowered, owner, false) {
+            Ok((completion, observed)) => {
+                let mut detail = json!({
+                    "invocation_id": completion.invocation_id,
+                    "request_hash": completion.request_hash,
+                    "resolved": {
+                        "harness": request.agent.harness,
+                        "harness_version": observed
+                            .cli_version
+                            .context("Codex did not report its version")?,
+                        "adapter_revision": ADAPTER_REVISION,
+                        "runner_image_id": runner_image_id,
+                        "requested_model": completion.requested_model,
+                        "served_model": completion.served_model,
+                    },
+                    "session_ref": completion.session_ref,
+                    "output_text": completion.output_text,
+                });
+                with_usage(&mut detail, observed.usage.as_ref());
+                return Ok(Outcome::Completed(detail));
+            }
+            Err(error) => Err(error),
+        },
+    };
+    match result {
+        Ok(detail) => Ok(Outcome::Completed(detail)),
         Err(error) if error.downcast_ref::<TeardownUnconfirmed>().is_some() => Err(error),
         Err(error) => {
             let failed = error.downcast_ref::<FailedStage>();
@@ -204,28 +241,48 @@ struct Rejection {
     error: anyhow::Error,
 }
 
+enum ResolvedText {
+    Codex(Box<TextRequest>),
+    Claude(claude_text::Resolved),
+}
+
 fn resolve(
     pb: &Pillbox,
     request: &TextRequestV2,
-) -> std::result::Result<(TextRequest, String), Rejection> {
-    // Only Codex has a tool-free text driver today. The other harnesses are valid
-    // selections that this build cannot run, which is a rejection, not a bad request.
-    if request.agent.harness != "codex" {
+) -> std::result::Result<(ResolvedText, String), Rejection> {
+    if !matches!(request.agent.harness.as_str(), "codex" | "claude_code") {
         return Err(Rejection {
             code: "runtime_rejected",
             error: anyhow::anyhow!("no text driver for harness {}", request.agent.harness),
         });
     }
+    if request.agent.harness == "claude_code" {
+        claude_text::Resolved::selection(&request.agent.model, &request.agent.reasoning_effort)
+            .map_err(|error| Rejection {
+                code: "runtime_rejected",
+                error,
+            })?;
+    }
     let runner_image_id = runner_image_id(pb).map_err(|error| Rejection {
         code: "runtime_unavailable",
         error,
     })?;
-    let lowered = request
-        .codex_request(runner_image_id.clone())
-        .map_err(|error| Rejection {
-            code: "runtime_rejected",
-            error,
-        })?;
+    let lowered = if request.agent.harness == "claude_code" {
+        claude_text::Resolved::new(
+            &request.agent.model,
+            &request.agent.reasoning_effort,
+            runner_image_id.clone(),
+        )
+        .map(ResolvedText::Claude)
+    } else {
+        request
+            .codex_request(runner_image_id.clone())
+            .map(|request| ResolvedText::Codex(Box::new(request)))
+    }
+    .map_err(|error| Rejection {
+        code: "runtime_rejected",
+        error,
+    })?;
     Ok((lowered, runner_image_id))
 }
 
@@ -342,6 +399,15 @@ mod tests {
     }
 
     #[test]
+    fn live_smoke_request_matches_v2_contract_before_inference() {
+        let request: TextRequestV2 = serde_json::from_value(claude_text::smoke_request()).unwrap();
+        request.validate().unwrap();
+        assert_eq!(request.agent.harness, "claude_code");
+        claude_text::Resolved::selection(&request.agent.model, &request.agent.reasoning_effort)
+            .unwrap();
+    }
+
+    #[test]
     fn every_pillbox_harness_is_a_valid_selection() {
         for harness in ["codex", "claude_code", "pi", "opencode"] {
             request(harness, "any-model").validate().unwrap();
@@ -392,5 +458,31 @@ mod tests {
         assert_eq!(failure_code("turn", &other), "runtime_protocol_error");
         assert_eq!(failure_code("vmm_spawn", &other), "runtime_unavailable");
         assert_eq!(failure_code("finalize", &other), "internal_error");
+        assert_eq!(failure_code("credentials", &other), "runtime_unavailable");
+    }
+
+    #[test]
+    fn unservable_claude_model_is_rejected_at_resolve_before_image_or_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let pb = Pillbox {
+            scope: crate::pillbox::Scope::Global,
+            state_dir: temp.path().into(),
+            meta: None,
+        };
+        let request = request("claude_code", "gpt-6-luna");
+        let store =
+            super::super::store::InvocationStore::new(&temp.path().join("invocations")).unwrap();
+        let super::super::store::Claim::Owned(mut owner) =
+            store.claim("chat_1", "sealed-request").unwrap()
+        else {
+            panic!()
+        };
+        let Outcome::Failed(detail) = execute(&pb, &request, &mut owner).unwrap() else {
+            panic!()
+        };
+        assert_eq!(detail["code"], "runtime_rejected");
+        assert_eq!(detail["stage"], "resolve");
+        assert!(detail.get("error").is_none());
+        assert!(detail.get("usage").is_none());
     }
 }

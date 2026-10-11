@@ -87,6 +87,33 @@ impl TextRequestV2 {
             ),
             "unknown text harness"
         );
+        for id in [&self.invocation_id, &self.session_ref.session_id] {
+            ensure!(
+                !id.is_empty()
+                    && id.len() <= 128
+                    && id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_')),
+                "invalid text identity"
+            );
+        }
+        ensure!(
+            !self.rendered_input.is_empty() && self.rendered_input.len() <= 512 * 1024,
+            "invalid rendered input size"
+        );
+        ensure!(
+            self.output_format.kind == "text" && self.output_format.retry_count == 0,
+            "unsupported text output format"
+        );
+        let limits = &self.limits;
+        ensure!(
+            (1..=super::MAX_TIMEOUT_MS).contains(&limits.timeout_ms)
+                && (1..=32_768).contains(&limits.max_final_text_bytes)
+                && (1..=super::MAX_FRAME_BYTES).contains(&limits.max_frame_bytes)
+                && (1..=super::MAX_EVIDENCE_BYTES).contains(&limits.max_evidence_bytes)
+                && limits.max_frame_bytes <= limits.max_evidence_bytes,
+            "invalid text limits"
+        );
         Ok(())
     }
 
@@ -147,6 +174,9 @@ pub(crate) fn execute(
     request: &TextRequestV2,
     owner: &mut OwnedInvocation,
 ) -> Result<Outcome> {
+    if request.agent.harness == "opencode" {
+        return super::opencode::execute(pb, request, owner);
+    }
     let resolved = resolve(pb, request);
     let (lowered, runner_image_id) = match resolved {
         Ok(resolved) => resolved,

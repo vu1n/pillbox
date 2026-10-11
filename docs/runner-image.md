@@ -58,6 +58,15 @@ managed Cloudflare and DigitalOcean images keep their own OpenCode 1.x pins
 (`cloudflare-spike/Dockerfile`, `digitalocean/`); they are sealed Huddles
 execution cohorts and move separately.
 
+The local `pillbox.text/2` OpenCode adapter requires
+`/opt/pillbox-opencode-text/catalog.json`. The runner build exports the bundled
+CLI's observed `/api/info` version and native model/variant catalog with an
+isolated home, registry fetching disabled, no credentials and no prompt or
+inference. Resolve reads the export from the exact immutable libkrun rootfs;
+the turn checks its version against the live guest server. Rebuild older runner
+images before using OpenCode text execution. This adds image metadata, not a
+Docker execution path. See the [macOS verification handoff](opencode-text-handoff.md).
+
 Plus the system tooling agents tend to reach for: `bash`,
 `bubblewrap`, `ca-certificates`, `curl`, `gh`, `git`, `iproute2`
 (the `ip` tool the libkrun egress fence needs), `jq`, `openssl`,

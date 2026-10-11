@@ -556,8 +556,29 @@ that image. A completed record carries `resolved` (`harness`,
 `runtime_timeout`, `runtime_rejected`, `runtime_protocol_error`,
 `internal_error`) and the `stage` that was running (`resolve`, `credentials`,
 `image_prepare`, `guest_prepare`, `vmm_spawn`, `guest_rpc_ready`, `turn`,
-`finalize`); the message stays in the session log. Only `codex` has a text
-driver today; the other harnesses fail at `resolve` with `runtime_rejected`.
+`finalize`); the message stays in the session log. `codex` and `opencode` have
+text drivers; the other harnesses fail at `resolve` with `runtime_rejected`.
+
+OpenCode resolves `agent.model` as `provider/modelID` and `reasoning_effort`
+as an exact variant in the selected image's bundled catalog. Native `openai`
+and `anthropic` API-key profiles are supported; other providers, disabled or
+non-text models, and unavailable variants fail at `resolve` with
+`runtime_rejected`. It reads the existing inherited `OPENAI_API_KEY` or
+`ANTHROPIC_API_KEY` secret internally. A missing key is
+`runtime_unavailable` at `credentials`. The guest receives a fresh stub and
+only its provider API host is reachable through the libkrun vault; no
+persistent OpenCode credential database, workspace shares, MCP, external
+plugins, file tools or network tools are loaded. `harness_version` is observed
+from `/api/info`; `served_model` is null because OpenCode's step model reference
+does not establish the upstream served identity. The runner needs its offline
+catalog export (see [runner image](runner-image.md)); a missing export fails
+`runtime_unavailable` at `resolve`.
+
+Version 2 admits a final-text limit of at most 32 KiB. Empty, incomplete,
+truncated or oversized answers fail `runtime_protocol_error` at `turn`.
+Pillbox never pads or truncates a final answer. The native frame, evidence and
+outer deadline limits also apply to the OpenCode driver. A live macOS libkrun
+turn remains a delivery gate; see the [safe handoff](opencode-text-handoff.md).
 
 A completed record, and a failed one whose turn already spent tokens, carries
 `usage` when the harness reported any:
@@ -581,19 +602,26 @@ nothing gets no `usage` key, never zeros. A value that is not a number, is
 negative or non-finite, or exceeds 10^10 tokens or $1,000,000 is dropped; when
 nothing valid remains, `usage` is absent.
 
-| field | codex (`thread/tokenUsage/updated`, `tokenUsage.total`) | claude_code (`result` line) |
-|---|---|---|
-| `cost_usd` | `null` (Codex reports no cost) | `total_cost_usd` (API-equivalent on a subscription, not a bill) |
-| `input_tokens` | `inputTokens` − `cachedInputTokens` − `cacheWriteInputTokens` (dropped if negative) | `usage.input_tokens` |
-| `output_tokens` | `outputTokens` | `usage.output_tokens` |
-| `cache_read_tokens` | `cachedInputTokens` | `usage.cache_read_input_tokens` |
-| `cache_write_tokens` | `cacheWriteInputTokens` | `usage.cache_creation_input_tokens` |
+| field | codex (`thread/tokenUsage/updated`, `tokenUsage.total`) | claude_code (`result` line) | opencode (per-step terminal events) |
+|---|---|---|---|
+| `cost_usd` | `null` (Codex reports no cost) | `total_cost_usd` (API-equivalent on a subscription, not a bill) | sum of reported step `cost`, or null |
+| `input_tokens` | `inputTokens` − `cachedInputTokens` − `cacheWriteInputTokens` (dropped if negative) | `usage.input_tokens` | sum of `tokens.input` (already excludes cache) |
+| `output_tokens` | `outputTokens` | `usage.output_tokens` | sum of `tokens.output` + `tokens.reasoning` (disjoint native counts) |
+| `cache_read_tokens` | `cachedInputTokens` | `usage.cache_read_input_tokens` | sum of `tokens.cache.read` |
+| `cache_write_tokens` | `cacheWriteInputTokens` | `usage.cache_creation_input_tokens` | sum of `tokens.cache.write` |
 
 Codex's newest `total` for the invocation's thread and turn is the turn's usage,
 because a text invocation runs one turn on a fresh thread. The claude_code
 column is what the Claude harness writes as `turn_usage` in its `usage` session
 event, ready for when it gets a text driver. Both versions append the same
 `usage` event (`{"turn_usage": …}`) to the text session log.
+
+OpenCode's `session.step.ended` and `.failed` are per-step spend (the same
+observations mapped to section 0 Usage events). `usage.rs` counts each driven
+`assistantMessageID` once and ignores `session.usage.updated` running totals,
+replayed terminal steps, and child sessions, so the turn never counts overlapping
+totals. Failed turns retain any spend already reported. A sum outside the usage
+ceiling is omitted rather than saturated.
 
 Both versions append a `text.stage.completed` event per stage to the session
 log and emit `session.started` / `session.completed` / `session.failed`

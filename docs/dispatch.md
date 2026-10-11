@@ -123,6 +123,15 @@ What protection does **not** cover, so write the reward around it:
   and tests together, or a `--grader-files` check that doesn't run project code
   first.
 - **Inline tests** (`#[cfg(test)]` modules in source files) aren't paths.
+- **Worker code the tests import runs inside the test process.** It can end
+  that process with exit 0 before any assertion fails. Protection keeps the
+  tests and the runner intact, not the process they share with the code under
+  test; a reward that only runs the worker's program as a subprocess and checks
+  its output is the stronger check.
+- **A project that is itself a Python test runner or pytest plugin** (pytest,
+  pluggy, coverage, hypothesis, `pytest-cov`…) is graded against the image's
+  copy: the grader loads those before the workspace, so a worker can't swap
+  them out.
 - **`--grader-files` are hidden from the worker's agent, not from its code.**
   The reward runs as one user, so worker code it executes (an imported module,
   `build.rs`) can read `.pillbox-grader/` and print it, and failure feedback

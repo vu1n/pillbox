@@ -137,10 +137,13 @@ pub(crate) const GRADER_STARTED_PRINTF: &str = r"printf '\n\036PBSTART\n'";
 /// `PYTHONSAFEPATH=1` Python no longer puts the cwd or script dir FIRST on
 /// `sys.path`, so a worker's `json.py` can't shadow the stdlib. This first
 /// imports whichever test runners the image has (pytest and pluggy among
-/// them) while the workspace is still off the path, so a worker's `pluggy.py`
-/// can't replace them either; then it puts the script dir (if any) and the cwd
-/// back AFTER the stdlib but BEFORE site-packages, so tests import the
-/// worker's project even when the image has a copy of it installed. No `;` or
+/// them) and every installed pytest plugin (`pytest11` entry points) while the
+/// workspace is still off the path, so a worker's `pluggy.py` or
+/// `pytest_cov/` can't replace them either. The cost: a project that IS one
+/// of those packages is graded against the image's copy, not the worker's.
+/// Then it puts the script dir (if any) and the cwd back AFTER the stdlib but
+/// BEFORE site-packages, so tests import the worker's project even when the
+/// image has some other copy of it installed. No `;` or
 /// `'` (it rides a `'…'` shell string in an `&&` chain).
 const PY_BOOTSTRAP: &str = r#"import importlib.util
 import os
@@ -151,6 +154,15 @@ for _m in ("pytest", "_pytest", "pluggy", "coverage", "hypothesis", "nose2", "to
             __import__(_m)
     except Exception:
         pass
+try:
+    from importlib.metadata import entry_points
+    for _e in entry_points(group="pytest11"):
+        try:
+            __import__(_e.module)
+        except Exception:
+            pass
+except Exception:
+    pass
 _a = sys.argv[0] if sys.argv else ""
 _ds = [] if _a in ("", "-c", "-m") else [os.path.dirname(os.path.abspath(_a))]
 _at = next((_i for _i, _p in enumerate(sys.path) if os.path.basename(_p) in ("site-packages", "dist-packages")), len(sys.path))

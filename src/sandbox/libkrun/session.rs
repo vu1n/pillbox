@@ -600,6 +600,7 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
     let _ = std::fs::remove_file(&attach_sock);
 
     let vmspec = VmSpec {
+        offline: false,
         ownership: None,
         rootfs: rootfs.to_string_lossy().into_owned(),
         vcpus: 2,
@@ -1024,6 +1025,7 @@ fn launch_server_vm(
     let _ = std::fs::remove_file(&host_sock);
 
     let vmspec = VmSpec {
+        offline: false,
         ownership: None,
         rootfs: rootfs.to_string_lossy().into_owned(),
         vcpus: 2,
@@ -1368,6 +1370,7 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
         &boot_script,
     )?;
     let vmspec = VmSpec {
+        offline: false,
         ownership: None,
         rootfs: rootfs.to_string_lossy().into_owned(),
         vcpus: 2,
@@ -2009,6 +2012,10 @@ pub(crate) fn score_in_sandbox(
     )?;
 
     let vmspec = VmSpec {
+        // No allowlist means no network at all: without this, omitting
+        // virtio-net leaves libkrun's implicit TSI on, and worker code the
+        // grader runs could reach the Internet through the host.
+        offline: egress.is_none(),
         ownership: None,
         rootfs: rootfs.to_string_lossy().into_owned(),
         vcpus: 2,

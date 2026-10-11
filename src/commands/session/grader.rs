@@ -383,6 +383,12 @@ fn lead_tool_missing(command: &str, exit: i32, out: &str) -> Option<String> {
             _ => {}
         }
     };
+    // Only a module a runner image provides: `python3 -m myproject.check`
+    // missing is the worker deleting its own package, a failed grade.
+    let top = module.split('.').next().unwrap_or(module);
+    if !RUNNER_TOOL_MODULES.contains(&top) {
+        return None;
+    }
     let expected = format!(": No module named {module}");
     out.lines()
         .map(str::trim)
@@ -394,6 +400,25 @@ fn lead_tool_missing(command: &str, exit: i32, out: &str) -> Option<String> {
         })
         .then(|| format!("python module `{module}`"))
 }
+
+/// Python test and lint tools a grader runs with `python3 -m` that come from the
+/// runner image, never from the worker's tree.
+const RUNNER_TOOL_MODULES: &[&str] = &[
+    "pytest",
+    "coverage",
+    "hypothesis",
+    "nose2",
+    "tox",
+    "nox",
+    "mypy",
+    "ruff",
+    "black",
+    "flake8",
+    "pylint",
+    "pyright",
+    "behave",
+    "pip",
+];
 
 fn is_env_assignment(word: &str) -> bool {
     word.split_once('=').is_some_and(|(k, _)| {
@@ -591,6 +616,12 @@ mod tests {
         let nested = GraderSpec::Cmd("sh .pillbox-grader/check.sh".into());
         let out = ".pillbox-grader/check.sh: 1: ./bin/tool: not found";
         assert!(missing_tool(&nested, 127, out).is_none());
+        let own = GraderSpec::Cmd("python3 -m myproject.check".into());
+        let out = "/usr/bin/python3: No module named myproject";
+        assert!(
+            missing_tool(&own, 1, out).is_none(),
+            "the worker's own package"
+        );
         let worker_module = GraderSpec::Cmd("sh run.sh".into());
         assert!(missing_tool(&worker_module, 1, "python3: No module named app").is_none());
 

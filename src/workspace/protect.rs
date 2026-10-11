@@ -27,8 +27,12 @@
 //!   worker put where a protected directory was is covered too.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{CStr, CString};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
 
 use anyhow::{bail, Context, Result};
 
@@ -494,17 +498,42 @@ pub(crate) fn force_remove(path: &Path) -> Result<()> {
 }
 
 /// Relaxed directory modes, put back when this drops — including on failure.
+///
+/// This touches the worker's LIVE tree, which a still-running worker can change
+/// underneath it, so below the root every step is relative to an open directory
+/// and never follows a symlink: a directory raced into a link to a host path
+/// gets its mode change refused (or applied to the link itself), never to the
+/// path it names.
 struct ModeGuard {
-    saved: Vec<(PathBuf, u32)>,
+    root: Option<(PathBuf, u32)>,
+    saved: Vec<(Rc<OwnedFd>, CString, u32)>,
 }
 
 impl ModeGuard {
     /// Make every real directory under `root` owner-traversable, remembering
     /// the modes to restore. Symlinks are not followed.
     fn relax(root: &Path) -> Result<Self> {
-        let mut saved = Vec::new();
-        relax_dirs(root, &mut saved)?;
-        Ok(Self { saved })
+        let mut guard = Self {
+            root: None,
+            saved: Vec::new(),
+        };
+        let meta =
+            std::fs::symlink_metadata(root).with_context(|| format!("stat {}", root.display()))?;
+        if !meta.file_type().is_dir() {
+            return Ok(guard);
+        }
+        let mode = meta.permissions().mode();
+        if mode & 0o700 != 0o700 {
+            std::fs::set_permissions(root, std::fs::Permissions::from_mode(mode | 0o700))
+                .with_context(|| format!("chmod {}", root.display()))?;
+            guard.root = Some((root.to_path_buf(), mode));
+        }
+        let c_root = CString::new(root.as_os_str().as_bytes())
+            .with_context(|| format!("path with NUL {}", root.display()))?;
+        let fd = open_dir_at(libc::AT_FDCWD, &c_root)
+            .with_context(|| format!("open {}", root.display()))?;
+        relax_dirs_at(&Rc::new(fd), root, &mut guard.saved)?;
+        Ok(guard)
     }
 }
 
@@ -512,28 +541,105 @@ impl Drop for ModeGuard {
     fn drop(&mut self) {
         // Children first: restoring a parent's 0o000 mode before its children
         // would make the rest unrestorable.
-        for (path, mode) in self.saved.iter().rev() {
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(*mode));
+        for (dir, name, mode) in self.saved.iter().rev() {
+            let _ = chmod_at(dir, name, *mode);
+        }
+        if let Some((root, mode)) = &self.root {
+            let _ = std::fs::set_permissions(root, std::fs::Permissions::from_mode(*mode));
         }
     }
 }
 
-fn relax_dirs(dir: &Path, saved: &mut Vec<(PathBuf, u32)>) -> Result<()> {
-    let meta = std::fs::symlink_metadata(dir).with_context(|| format!("stat {}", dir.display()))?;
-    if !meta.file_type().is_dir() {
-        return Ok(());
+const DIR_FLAGS: libc::c_int =
+    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+
+fn open_dir_at(dir: libc::c_int, name: &CStr) -> std::io::Result<OwnedFd> {
+    let fd = unsafe { libc::openat(dir, name.as_ptr(), DIR_FLAGS) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
     }
-    let mode = meta.permissions().mode();
-    if mode & 0o700 != 0o700 {
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode | 0o700))
-            .with_context(|| format!("chmod {}", dir.display()))?;
-        saved.push((dir.to_path_buf(), mode));
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// `chmod` of the entry `name` in `dir`, never through a symlink.
+fn chmod_at(dir: &OwnedFd, name: &CStr, mode: u32) -> std::io::Result<()> {
+    let rc = unsafe {
+        libc::fchmodat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            mode as libc::mode_t,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
-    for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
-        let entry = entry?;
-        let path = entry.path();
-        if std::fs::symlink_metadata(&path)?.file_type().is_dir() {
-            relax_dirs(&path, saved)?;
+}
+
+/// The names in the open directory `dir`, without `.` and `..`.
+fn dir_names(dir: &OwnedFd) -> std::io::Result<Vec<CString>> {
+    let dup = unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if dup < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let stream = unsafe { libc::fdopendir(dup) };
+    if stream.is_null() {
+        let err = std::io::Error::last_os_error();
+        unsafe { libc::close(dup) };
+        return Err(err);
+    }
+    let mut names = Vec::new();
+    loop {
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name != c"." && name != c".." {
+            names.push(name.to_owned());
+        }
+    }
+    unsafe { libc::closedir(stream) };
+    Ok(names)
+}
+
+fn relax_dirs_at(
+    dir: &Rc<OwnedFd>,
+    path: &Path,
+    saved: &mut Vec<(Rc<OwnedFd>, CString, u32)>,
+) -> Result<()> {
+    for name in dir_names(dir).with_context(|| format!("read {}", path.display()))? {
+        let child = path.join(std::ffi::OsStr::from_bytes(name.as_bytes()));
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::fstatat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("stat {}", child.display()));
+        }
+        if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            continue;
+        }
+        #[allow(clippy::useless_conversion)] // `mode_t` is u16 on macOS
+        let mode = u32::from(st.st_mode) & 0o7777;
+        if mode & 0o700 != 0o700 {
+            chmod_at(dir, &name, mode | 0o700)
+                .with_context(|| format!("chmod {}", child.display()))?;
+            saved.push((Rc::clone(dir), name.clone(), mode));
+        }
+        // A directory swapped for a link since the stat is not descended into.
+        match open_dir_at(dir.as_raw_fd(), &name) {
+            Ok(fd) => relax_dirs_at(&Rc::new(fd), &child, saved)?,
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) => {}
+            Err(e) => return Err(e).with_context(|| format!("open {}", child.display())),
         }
     }
     Ok(())
@@ -1327,5 +1433,23 @@ mod tests {
         for dir in [worker.join("tests"), worker.join("sealed")] {
             fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
         }
+    }
+
+    #[test]
+    fn restoring_relaxed_modes_never_follows_a_swapped_in_symlink() {
+        let t = TempDir::new().unwrap();
+        let live = t.path().join("live");
+        let outside = t.path().join("outside");
+        fs::create_dir_all(live.join("sealed")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o750)).unwrap();
+        fs::set_permissions(live.join("sealed"), fs::Permissions::from_mode(0o077)).unwrap();
+        let guard = ModeGuard::relax(&live).unwrap();
+        assert_eq!(mode_of(&live.join("sealed")) & 0o700, 0o700);
+        // A still-running worker swaps the directory for a link to a host path.
+        fs::remove_dir(live.join("sealed")).unwrap();
+        symlink(&outside, live.join("sealed")).unwrap();
+        drop(guard);
+        assert_eq!(mode_of(&outside), 0o750, "the host path keeps its mode");
     }
 }

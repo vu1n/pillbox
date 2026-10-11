@@ -485,12 +485,24 @@ pub(crate) fn launch_builder(
     limits: VmLimits,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<OwnedVm> {
+    launch_builder_staged(input, limits, cancelled, &mut |_| {})
+}
+
+/// [`launch_builder`], reporting each host-side stage as it completes
+/// (`image_prepare`, `guest_prepare`, `vmm_spawn`) so the caller can time them.
+pub(crate) fn launch_builder_staged(
+    input: BuilderInput,
+    limits: VmLimits,
+    cancelled: &dyn Fn() -> bool,
+    stage: &mut dyn FnMut(&'static str),
+) -> Result<OwnedVm> {
     limits.validate()?;
     validate_input(&input)?;
     let deadline = Instant::now()
         .checked_add(limits.max_duration)
         .context("VM deadline overflow")?;
     let (runtime, rootfs) = prepare_rootfs(&input.image_id, deadline, cancelled)?;
+    stage("image_prepare");
     let ca_dir = runtime.path().join("ca");
     fs::create_dir(&ca_dir)?;
     crate::paths::ensure_mode_0700(&ca_dir)?;
@@ -503,6 +515,7 @@ pub(crate) fn launch_builder(
         limits,
         remaining_ms(deadline)?,
     )?;
+    stage("guest_prepare");
 
     let mut vm = launch_prepared(
         runtime,
@@ -534,6 +547,7 @@ pub(crate) fn launch_builder(
         let cleanup = vm.stop_and_reap();
         return Err(cleanup_failure(error, cleanup));
     }
+    stage("vmm_spawn");
     Ok(vm)
 }
 

@@ -575,12 +575,16 @@ image carries) in its own invocation-owned microVM, with no shares:
 - The input, `output_format` and `limits` are held to the same bounds as Codex
   (`text/0` output only) before any VM work.
 - Tools are denied by a `deny` rule for every action, in the server config and
-  on the session, so OpenCode sends the model no tools. A tool call, a
-  permission request or a form still fails the turn (`runtime_protocol_error`
+  on the session, so OpenCode sends the model no tools. A tool call (in any
+  session, a subagent's included), a permission request or a form still fails
+  the turn (`runtime_protocol_error`
   at `turn`) and the VM is stopped.
-- OpenCode is not vault-capable. Its credential store (`opencode.db` in the
-  pillbox's OpenCode home, from `pillbox auth login --agent opencode`) is
-  copied into the VM; without one the turn fails at `credentials` with
+- The key is the pillbox secret named after the variable OpenCode reads it
+  from (`ZHIPU_API_KEY` for every z.ai/Zhipu provider, `OPENROUTER_API_KEY`,
+  `ANTHROPIC_API_KEY`, ...; `pillbox secret add NAME`). Only that one key
+  enters the VM, as that variable, in a fresh OpenCode home: the user's own
+  OpenCode store holds every provider's credential and their history, so it is
+  never copied. Without the secret the turn fails at `credentials` with
   `runtime_unavailable`.
 - `resolved.harness_version` is what the server reports at `/api/info`.
   `served_model` is `null`: OpenCode does not surface the provider's model id.

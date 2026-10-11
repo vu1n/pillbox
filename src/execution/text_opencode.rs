@@ -4,7 +4,6 @@
 
 use std::io::Read;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, ensure, Context, Result};
@@ -140,7 +139,8 @@ fn run(
     let input = OpencodeInput {
         image_id: runner_image_id.into(),
         turn: serde_json::to_vec(&opencode::turn_document(plan, &request.rendered_input))?,
-        credential_dir: credential_dir(pb)?,
+        key_env: plan.key_env.clone(),
+        key: provider_key(pb, &plan.key_env)?,
         hosts: plan.hosts.clone(),
     };
     stages.complete("credentials", evidence)?;
@@ -222,19 +222,14 @@ fn run(
     Ok((completed.text, completed.harness_version))
 }
 
-/// The directory of the OpenCode credential store. OpenCode is not vault-capable:
-/// its own store holds the provider key, and a pillbox without one cannot run it.
-fn credential_dir(pb: &Pillbox) -> Result<PathBuf> {
-    let spec = crate::agents::lookup("execution", "opencode")?;
-    let store = spec.home_dir(pb)?.join(spec.cred_sentinel);
-    ensure!(
-        store.is_file(),
-        "OpenCode has no credential store; run `pillbox auth login --agent opencode`"
-    );
-    Ok(store
-        .parent()
-        .context("OpenCode credential store has no directory")?
-        .into())
+/// The selected provider's key, from the pillbox secret named after the variable
+/// OpenCode reads it from. Only that key enters the VM: the user's own OpenCode
+/// store holds every provider's credential and their session history.
+fn provider_key(pb: &Pillbox, key_env: &str) -> Result<String> {
+    crate::secrets::read(pb, key_env)?
+        .map(|key| key.trim().to_owned())
+        .filter(|key| !key.is_empty())
+        .with_context(|| format!("no {key_env} secret; run `pillbox secret add {key_env}`"))
 }
 
 /// The guest's JSON lines as evidence envelopes, folded as they arrive.
@@ -332,23 +327,26 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_credential_store_fails_before_any_vm_work() {
-        // The OpenCode home resolves through the global pillbox, so keep it off
-        // the real one.
-        crate::test_util::with_isolated_home("text-opencode-credentials", || {
-            let temp = tempfile::tempdir().unwrap();
-            let pb = Pillbox {
-                scope: crate::pillbox::Scope::Global,
-                state_dir: temp.path().into(),
-                meta: None,
-            };
-            let error = credential_dir(&pb).unwrap_err().to_string();
-            assert!(error.contains("auth login --agent opencode"), "{error}");
-            let spec = crate::agents::lookup("test", "opencode").unwrap();
-            let store = spec.home_dir(&pb).unwrap().join(spec.cred_sentinel);
-            std::fs::create_dir_all(store.parent().unwrap()).unwrap();
-            std::fs::write(&store, b"sqlite").unwrap();
-            assert_eq!(credential_dir(&pb).unwrap(), store.parent().unwrap());
+    fn a_missing_provider_key_fails_before_any_vm_work() {
+        crate::test_util::with_isolated_home("text-opencode-key", || {
+            let pb = crate::pillbox::global();
+            let error = provider_key(&pb, "ZHIPU_API_KEY").unwrap_err().to_string();
+            assert!(
+                error.contains("pillbox secret add ZHIPU_API_KEY"),
+                "{error}"
+            );
+            std::env::set_var("__PILLBOX_TEST_OPENCODE_KEY", " k-1 ");
+            crate::secrets::add(
+                &pb,
+                crate::pillbox::WriteScope::Resolved,
+                "ZHIPU_API_KEY",
+                crate::secrets::AddSource::EnvVar("__PILLBOX_TEST_OPENCODE_KEY".into()),
+                false,
+                None,
+            )
+            .unwrap();
+            std::env::remove_var("__PILLBOX_TEST_OPENCODE_KEY");
+            assert_eq!(provider_key(&pb, "ZHIPU_API_KEY").unwrap(), "k-1");
         });
     }
 

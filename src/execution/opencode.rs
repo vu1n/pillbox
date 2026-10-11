@@ -17,25 +17,30 @@ use super::usage::TurnUsage;
 const CATALOG_HOST: &str = "models.dev";
 
 /// OpenCode provider id → the API host its catalog entry targets (models.dev
-/// `api`, or the SDK default where the entry has none). A provider not listed has
+/// `api`, or the SDK default where the entry has none), and the variable OpenCode
+/// reads the key from (the entry's `env`). A provider not listed has
 /// no egress in the text VM, so a selection naming it is rejected at `resolve`.
-const PROVIDERS: &[(&str, &str)] = &[
-    ("anthropic", "api.anthropic.com"),
-    ("deepseek", "api.deepseek.com"),
-    ("google", "generativelanguage.googleapis.com"),
-    ("groq", "api.groq.com"),
-    ("mistral", "api.mistral.ai"),
-    ("moonshotai", "api.moonshot.ai"),
-    ("moonshotai-cn", "api.moonshot.cn"),
-    ("openai", "api.openai.com"),
-    ("opencode", "opencode.ai"),
-    ("opencode-go", "opencode.ai"),
-    ("openrouter", "openrouter.ai"),
-    ("xai", "api.x.ai"),
-    ("zai", "api.z.ai"),
-    ("zai-coding-plan", "api.z.ai"),
-    ("zhipuai", "open.bigmodel.cn"),
-    ("zhipuai-coding-plan", "open.bigmodel.cn"),
+const PROVIDERS: &[(&str, &str, &str)] = &[
+    ("anthropic", "api.anthropic.com", "ANTHROPIC_API_KEY"),
+    ("deepseek", "api.deepseek.com", "DEEPSEEK_API_KEY"),
+    (
+        "google",
+        "generativelanguage.googleapis.com",
+        "GOOGLE_GENERATIVE_AI_API_KEY",
+    ),
+    ("groq", "api.groq.com", "GROQ_API_KEY"),
+    ("mistral", "api.mistral.ai", "MISTRAL_API_KEY"),
+    ("moonshotai", "api.moonshot.ai", "MOONSHOT_API_KEY"),
+    ("moonshotai-cn", "api.moonshot.cn", "MOONSHOT_API_KEY"),
+    ("openai", "api.openai.com", "OPENAI_API_KEY"),
+    ("opencode", "opencode.ai", "OPENCODE_API_KEY"),
+    ("opencode-go", "opencode.ai", "OPENCODE_API_KEY"),
+    ("openrouter", "openrouter.ai", "OPENROUTER_API_KEY"),
+    ("xai", "api.x.ai", "XAI_API_KEY"),
+    ("zai", "api.z.ai", "ZHIPU_API_KEY"),
+    ("zai-coding-plan", "api.z.ai", "ZHIPU_API_KEY"),
+    ("zhipuai", "open.bigmodel.cn", "ZHIPU_API_KEY"),
+    ("zhipuai-coding-plan", "open.bigmodel.cn", "ZHIPU_API_KEY"),
 ];
 
 /// Set on the session so OpenCode skips its title-generation request: without a
@@ -65,6 +70,9 @@ pub(crate) struct Plan {
     /// that variant fails the turn (`provider.no-route`); it is never dropped.
     pub(crate) variant: String,
     pub(crate) hosts: Vec<String>,
+    /// The variable OpenCode reads this provider's key from (its models.dev entry),
+    /// and the pillbox secret the key comes from.
+    pub(crate) key_env: String,
 }
 
 /// Resolve `provider/model` and the effort without the catalog, which only the
@@ -74,10 +82,10 @@ pub(crate) fn plan(model: &str, reasoning_effort: &str) -> Result<Plan> {
     let (provider, model_id) = model
         .split_once('/')
         .context("OpenCode model must be provider/model")?;
-    let host = PROVIDERS
+    let (host, key_env) = PROVIDERS
         .iter()
-        .find(|(id, _)| *id == provider)
-        .map(|(_, host)| *host)
+        .find(|(id, _, _)| *id == provider)
+        .map(|(_, host, key_env)| (*host, *key_env))
         .with_context(|| format!("OpenCode provider {provider} has no text egress"))?;
     ensure!(
         !model_id.is_empty()
@@ -103,6 +111,7 @@ pub(crate) fn plan(model: &str, reasoning_effort: &str) -> Result<Plan> {
         model: model_id.into(),
         variant: reasoning_effort.into(),
         hosts: vec![host.into(), CATALOG_HOST.into()],
+        key_env: key_env.into(),
     })
 }
 
@@ -161,13 +170,14 @@ impl TurnFold {
         if kind.starts_with("permission.") || kind.starts_with("form.") {
             bail!("OpenCode asked for a decision ({kind}) during a tool-free turn");
         }
+        // In any session: a subagent's child session must not run tools either.
+        if kind.starts_with("session.tool.") {
+            bail!("OpenCode attempted a tool call ({kind}) during a tool-free turn");
+        }
         if !ours {
             return Ok(false);
         }
         self.events.push(frame.clone());
-        if kind.starts_with("session.tool.") {
-            bail!("OpenCode attempted a tool call ({kind}) during a tool-free turn");
-        }
         match kind {
             "session.text.ended" => {
                 let message = data["assistantMessageID"].as_str().map(str::to_owned);
@@ -316,6 +326,7 @@ mod tests {
                 model: "glm-4.5-air".into(),
                 variant: "high".into(),
                 hosts: vec!["api.z.ai".into(), "models.dev".into()],
+                key_env: "ZHIPU_API_KEY".into(),
             }
         );
         let routed = super::plan("openrouter/anthropic/claude-sonnet-4", "low").unwrap();
@@ -482,8 +493,11 @@ mod tests {
             .unwrap();
         fold.observe(&json!({"pillbox": "session", "id": "ses_mine"}))
             .unwrap();
-        let foreign = json!({"type": "session.tool.called", "data": {"sessionID": "ses_other"}});
+        let foreign = json!({"type": "session.text.ended", "data": {"sessionID": "ses_other",
+            "assistantMessageID": "msg_x", "text": "not ours"}});
         assert!(!fold.observe(&foreign).unwrap());
+        let child_tool = json!({"type": "session.tool.called", "data": {"sessionID": "ses_child"}});
+        assert!(fold.observe(&child_tool).is_err());
         let failed = json!({"pillbox": "error", "stage": "prompt", "status": 400});
         assert!(fold
             .observe(&failed)

@@ -104,14 +104,16 @@ Browser-loopback OAuth providers still need the callback port forwarded
 the contract is in [commands](commands.md#sealed-local-text-execution)). The guest
 driver starts `opencode serve`, creates one session, prompts it and relays each
 `/api/event` object to the host as a JSON line until that session's
-`session.execution.*` outcome. Checked against 2.0.24 with a capturing
+`session.execution.*` outcome. The VM gets a fresh OpenCode home and only the
+selected provider's key (a pillbox secret named after OpenCode's variable for
+it), never the user's `opencode.db`. Checked against 2.0.24 with a capturing
 OpenAI-compatible provider (fixtures `src/execution/fixtures/opencode-2.0.24-*`):
 
 - A `{"action":"*","resource":"*","effect":"deny"}` rule, in config or on the
   session, removes every tool from the provider request (`tools` absent).
 - If the model calls a tool anyway, OpenCode answers it with `No tool named …`
   (`session.tool.called` with `executed: false`) and asks the model again; it
-  never runs it. The host stops the VM at the first `session.tool.*` event.
+  never runs it. The host stops the VM at the first `session.tool.*` event, in any session.
 - A session created without a `title` makes a second, hidden title-generation
   call; its tokens show in `session.usage.updated` but in no step. Setting the
   title skips it.

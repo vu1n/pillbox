@@ -540,7 +540,7 @@ fn run_local(
         };
         // Bounded: the frames are the native evidence, already capped by max_evidence_bytes.
         *usage = TurnUsage::from_codex_frames(frames);
-        progress.native_evidence = Some(evidence.native_frames(frames)?);
+        progress.native_evidence = Some(evidence.native_frames_for(frames, Some(profile))?);
         progress.session_ref = evidence.reference();
         owner.observe(serde_json::to_value(&progress)?)?;
     }

@@ -44,6 +44,8 @@ pub(crate) struct CodexProfile {
     version: &'static str,
     model: String,
     effort: String,
+    /// False when the caller records whatever CLI version the runner image carries.
+    exact_cli_version: bool,
 }
 
 impl CodexProfile {
@@ -86,7 +88,15 @@ impl CodexProfile {
             version,
             model: model.to_owned(),
             effort: effort.to_owned(),
+            exact_cli_version: true,
         })
+    }
+
+    /// Keep this profile's catalog and configuration, but accept any Codex CLI
+    /// version the runner image reports. Every other thread check still applies.
+    pub(crate) fn observing_cli_version(mut self) -> Self {
+        self.exact_cli_version = false;
+        self
     }
 
     pub(crate) fn model(&self) -> &str {
@@ -271,7 +281,13 @@ impl CodexProfile {
         );
         let thread = response.get("thread").context("missing Codex thread")?;
         ensure!(
-            thread["cliVersion"] == self.version,
+            if self.exact_cli_version {
+                thread["cliVersion"] == self.version
+            } else {
+                thread["cliVersion"]
+                    .as_str()
+                    .is_some_and(|version| !version.is_empty())
+            },
             "unsupported Codex version"
         );
         ensure!(

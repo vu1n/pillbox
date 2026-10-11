@@ -54,6 +54,11 @@ fn execute(pb: &Pillbox, store: &InvocationStore, value: Value) -> Result<Record
     if let Some(existing) = store.lookup(invocation_id, &canonical)? {
         return existing_record(existing);
     }
+    if value.get("contract_version").and_then(Value::as_str)
+        == Some(execution::text_v2::CONTRACT_VERSION)
+    {
+        return execute_v2(pb, store, value, &canonical);
+    }
     let request: execution::text::TextRequest = serde_json::from_value(value)?;
     request.validate()?;
     ensure!(
@@ -68,6 +73,31 @@ fn execute(pb: &Pillbox, store: &InvocationStore, value: Value) -> Result<Record
     };
     let outcome = execution::text::execute(pb, &request, &mut owner);
     settle(&mut owner, outcome)?;
+    Ok(owner.record().clone())
+}
+
+fn execute_v2(
+    pb: &Pillbox,
+    store: &InvocationStore,
+    value: Value,
+    canonical: &str,
+) -> Result<Record> {
+    let request: execution::text_v2::TextRequestV2 = serde_json::from_value(value)?;
+    request.validate()?;
+    ensure!(
+        execution::canonical_json(&serde_json::to_value(&request)?)? == canonical,
+        "closed text request canonicalization changed"
+    );
+    let mut owner = match store.claim(&request.invocation_id, canonical)? {
+        Claim::Owned(owner) => owner,
+        other => return existing_record(other),
+    };
+    match execution::text_v2::execute(pb, &request, &mut owner)? {
+        execution::text_v2::Outcome::Completed(detail) => {
+            owner.finish(Status::Completed, detail)?
+        }
+        execution::text_v2::Outcome::Failed(detail) => owner.finish(Status::Failed, detail)?,
+    }
     Ok(owner.record().clone())
 }
 

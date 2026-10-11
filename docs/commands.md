@@ -572,23 +572,25 @@ credential, or egress host. Resolve records credential ref
 `pillbox:cursor:default` and model-provider hosts `api2.cursor.sh` and
 `agentn.global.api5.cursor.sh`.
 
-A cursor_agent selection with no `auth.json` login sentinel and no stored
-`CURSOR_API_KEY` fails with `runtime_unavailable` at `credentials`. When a
-credential is present the driver still does not launch: the CLI posts the API
-key to `/auth/exchange_user_api_key` and keeps the returned access and refresh
+Execute has two outcomes for `cursor_agent`, and neither samples a model.
+No `auth.json` login sentinel and no stored `CURSOR_API_KEY` fails with
+`runtime_unavailable` at `credentials`. A present credential fails with
+`runtime_unavailable` at `guest_prepare`: the CLI posts the API key to
+`/auth/exchange_user_api_key` and keeps the returned access and refresh
 tokens, which would put the real credential in the guest, and the model
-transport defaults to HTTP/2 while the vault MITM speaks HTTP/1.1. That
-failure is `runtime_unavailable` at `guest_prepare`. The prepared guest argv
-is `agent -p --trust --output-format stream-json --sandbox enabled --model
-<id> -- <prompt>` with no `--force`, `--yolo`, or `--api-key`, and
-`~/.cursor/cli-config.json` denies `Shell(*)`, `Read(**)`, `Write(**)`,
-`WebFetch(*)`, and `Mcp(*:*)`. A stream that contains a tool call or
-interaction, or a final `result` that is empty or over `max_final_text_bytes`,
-fails with `runtime_protocol_error` at `turn` and is not truncated. `resolved`
-uses the version `agent --version` prints. `served_model` is null: the init
-event's `model` is a display name, not the model id. `reasoning_effort` is
-checked at resolve and is not forwarded as a model-parameter bracket until a
-live turn shows the CLI accepts it.
+transport defaults to HTTP/2 while the vault MITM speaks HTTP/1.1. A credential
+read error seals the same `credentials` / `runtime_unavailable` record. The
+message stays in the session log. `reasoning_effort` is checked at resolve
+and is not sent to the CLI (there is no `--effort` flag, and bracket overrides
+are unverified).
+
+The stream-json decoder is tested and not called by execute. When a turn does
+run, `result.usage` maps as in the table below, `served_model` stays null
+because init `model` is a display name, `harness_version` has to be the
+observed `agent --version` string, and a tool event, an empty or whitespace
+answer, or a result over `max_final_text_bytes` fails with
+`runtime_protocol_error` at `turn` without cutting the text. A failed decode
+keeps `usage` when the result line reported it.
 
 A completed record, and a failed one whose turn already spent tokens, carries
 `usage` when the harness reported any:
@@ -623,10 +625,10 @@ nothing valid remains, `usage` is absent.
 Codex's newest `total` for the invocation's thread and turn is the turn's usage,
 because a text invocation runs one turn on a fresh thread. The claude_code
 column is what the Claude harness writes as `turn_usage` in its `usage` session
-event, ready for when it gets a text driver. The cursor_agent column is the
-`usage` object on the stream-json `result` line (CLI `2026.10.01-e373342`);
-that turn is decoded and not sampled until the guest can run without holding
-the real token. Codex text/1 and text/2 append the same `usage` event
+event, ready for when it gets a text driver. The cursor_agent column is the `usage` object on the stream-json `result`
+line (CLI `2026.10.01-e373342`). Execute does not decode a stream; it stops
+at `credentials` or `guest_prepare`. Codex text/1 and text/2 append the same
+`usage` event
 (`{"turn_usage": …}`) to the text session log.
 
 Both versions append a `text.stage.completed` event per stage to the session

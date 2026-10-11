@@ -43,9 +43,10 @@ workflows using that kernel still need an explicit setup step and network access
 The complete native release lives outside the runtime HOME so its assets survive
 home-directory mounts.
 
-`pillbox.text/2` harness `cursor_agent` uses this cursor bundle. Its
-`harness_version` is the string `agent --version` prints from the image, not
-the `CURSOR_AGENT_VERSION` build arg copied into the record.
+`pillbox.text/2` harness `cursor_agent` targets this cursor bundle. Execute
+does not complete a turn, so it does not yet record `harness_version`. A
+completed record has to use the string `agent --version` prints, not the
+`CURSOR_AGENT_VERSION` build arg.
 
 The October 4 refresh pins Claude 2.1.289, Codex 0.160.0, Cursor
 2026.10.01-e373342, Amp 0.0.1791091069-gb9917f, OpenCode 1.18.34, Pi 1.0.2,

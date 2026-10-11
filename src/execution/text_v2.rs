@@ -247,30 +247,68 @@ fn execute_cursor(
     owner: &mut OwnedInvocation,
     lowered: super::cursor_text::Lowered,
 ) -> Result<Outcome> {
-    let ready = cursor_credentials_ready(pb)?;
-    let admission = super::cursor_text::admit(ready);
+    // Setup failures seal a closed record. `Err` is reserved for an unconfirmed
+    // VM teardown, and this path does not start a VM.
+    let (stage, code, message) = match cursor_credentials_ready(pb) {
+        Ok(ready) => {
+            let admission = super::cursor_text::admit(ready);
+            (
+                admission.stage(),
+                admission.code(),
+                admission.evidence_message().to_string(),
+            )
+        }
+        Err(error) => ("credentials", "runtime_unavailable", format!("{error:#}")),
+    };
+    let session_ref = record_cursor_evidence(
+        pb,
+        request,
+        &owner.record().request_hash,
+        &lowered,
+        stage,
+        &message,
+    );
+    let session_json = session_ref.and_then(|reference| serde_json::to_value(reference).ok());
+    Ok(Outcome::Failed(super::cursor_text::failure_detail(
+        &request.invocation_id,
+        &owner.record().request_hash,
+        code,
+        stage,
+        session_json.as_ref(),
+        None,
+    )))
+}
+
+/// Session evidence for a cursor_agent refusal. A failure to open the log omits
+/// `session_ref`; the message is not copied into the failure record.
+fn record_cursor_evidence(
+    pb: &Pillbox,
+    request: &TextRequestV2,
+    request_hash: &str,
+    lowered: &super::cursor_text::Lowered,
+    stage: &str,
+    message: &str,
+) -> Option<super::EvidenceRef> {
     let mut evidence = ExecutionEvidence::start_text(
         pb,
         &request.session_ref.session_id,
         &request.invocation_id,
         json!({
-            "request_hash": owner.record().request_hash,
+            "request_hash": request_hash,
             "adapter_revision": ADAPTER_REVISION,
             "agent": request.agent,
-            "launch": super::cursor_text::launch_plan(&lowered, &request.rendered_input),
+            "launch": super::cursor_text::launch_plan(lowered, &request.rendered_input),
         }),
-    )?;
-    evidence.append(Payload::Custom(Custom {
+    )
+    .ok()?;
+    let _ = evidence.append(Payload::Custom(Custom {
         name: "text.execution.failed".into(),
-        payload: Some(json!({
-            "error": admission.evidence_message(),
-            "stage": admission.stage(),
-        })),
-    }))?;
+        payload: Some(json!({"error": message, "stage": stage})),
+    }));
     crate::events::emit_session_event(
         pb,
         crate::events::EventType::SessionFailed {
-            reason: format!("{}: {}", admission.stage(), admission.evidence_message()),
+            reason: format!("{stage}: {message}"),
             exit_code: Some(1),
             trace_path: None,
             result_snapshot: None,
@@ -278,13 +316,7 @@ fn execute_cursor(
         &request.session_ref.session_id,
         None,
     );
-    Ok(Outcome::Failed(json!({
-        "invocation_id": request.invocation_id,
-        "request_hash": owner.record().request_hash,
-        "code": admission.code(),
-        "stage": admission.stage(),
-        "session_ref": evidence.reference(),
-    })))
+    Some(evidence.reference())
 }
 
 fn cursor_credentials_ready(pb: &Pillbox) -> Result<bool> {

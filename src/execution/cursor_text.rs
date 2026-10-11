@@ -253,34 +253,34 @@ pub(crate) fn interpret(
         message: "cursor CLI did not report a version".into(),
         usage: None,
     })?;
+    let mut saw_tool = false;
+    let mut extra_result = false;
     let mut result = None;
     for line in lines {
         match line.get("type").and_then(Value::as_str) {
-            Some("tool_call" | "interaction_query") => {
-                return Err(TurnError {
-                    message: "cursor turn attempted a tool or interaction".into(),
-                    usage: None,
-                });
-            }
-            Some("result") if result.is_some() => {
-                return Err(TurnError {
-                    message: "cursor stream contained more than one result".into(),
-                    usage: None,
-                });
-            }
+            Some("tool_call" | "interaction_query") => saw_tool = true,
+            Some("result") if result.is_some() => extra_result = true,
             Some("result") => result = Some(line),
             _ => {}
         }
+    }
+    // A tool event usually precedes the result that reports spend. Keep that
+    // usage on the protocol error instead of dropping it.
+    let usage = result.and_then(TurnUsage::from_cursor_result);
+    let fail = |message: String| TurnError {
+        message,
+        usage: usage.clone(),
+    };
+    if saw_tool {
+        return Err(fail("cursor turn attempted a tool or interaction".into()));
+    }
+    if extra_result {
+        return Err(fail("cursor stream contained more than one result".into()));
     }
     let result = result.ok_or_else(|| TurnError {
         message: "cursor stream ended without a result".into(),
         usage: None,
     })?;
-    let usage = TurnUsage::from_cursor_result(result);
-    let fail = |message: String| TurnError {
-        message,
-        usage: usage.clone(),
-    };
     if result.get("subtype").and_then(Value::as_str) != Some("success")
         || result.get("is_error").and_then(Value::as_bool) != Some(false)
     {
@@ -291,7 +291,7 @@ pub(crate) fn interpret(
     let Some(text) = result.get("result").and_then(Value::as_str) else {
         return Err(fail("cursor result omitted final text".into()));
     };
-    if text.is_empty() {
+    if text.trim().is_empty() {
         return Err(fail("cursor result text was empty".into()));
     }
     if text.len() > max_final_text_bytes {
@@ -330,6 +330,35 @@ pub(crate) fn completed_record(
         "output_text": turn.text,
     });
     if let Some(usage) = &turn.usage {
+        detail["usage"] = json!(usage);
+    }
+    detail
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const TURN_STAGE: &str = "turn";
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const TURN_CODE: &str = "runtime_protocol_error";
+
+/// Closed failure record. The message stays out of this object.
+pub(crate) fn failure_detail(
+    invocation_id: &str,
+    request_hash: &str,
+    code: &str,
+    stage: &str,
+    session_ref: Option<&Value>,
+    usage: Option<&TurnUsage>,
+) -> Value {
+    let mut detail = json!({
+        "invocation_id": invocation_id,
+        "request_hash": request_hash,
+        "code": code,
+        "stage": stage,
+    });
+    if let Some(session_ref) = session_ref {
+        detail["session_ref"] = session_ref.clone();
+    }
+    if let Some(usage) = usage {
         detail["usage"] = json!(usage);
     }
     detail
@@ -481,7 +510,20 @@ mod tests {
         ];
         let error = interpret(&lines, 32_768, "2026.10.01-e373342").unwrap_err();
         assert!(error.message.contains("tool"));
-        assert!(error.usage.is_none());
+        assert_eq!(error.usage.as_ref().unwrap().input_tokens, Some(3));
+        let detail = failure_detail(
+            "chat_1",
+            "hash",
+            TURN_CODE,
+            TURN_STAGE,
+            None,
+            error.usage.as_ref(),
+        );
+        assert_eq!(detail["code"], "runtime_protocol_error");
+        assert_eq!(detail["stage"], "turn");
+        assert_eq!(detail["usage"]["input_tokens"], 3);
+        assert!(detail.get("error").is_none());
+        assert!(detail.get("message").is_none());
         let interaction = vec![json!({"type":"interaction_query","subtype":"request"})];
         assert!(interpret(&interaction, 32_768, "2026.10.01-e373342").is_err());
     }
@@ -496,6 +538,9 @@ mod tests {
 
         let empty = vec![json!({"type":"result","subtype":"success","is_error":false,"result":""})];
         assert!(interpret(&empty, 32_768, "2026.10.01-e373342").is_err());
+        let blank =
+            vec![json!({"type":"result","subtype":"success","is_error":false,"result":" \n"})];
+        assert!(interpret(&blank, 32_768, "2026.10.01-e373342").is_err());
 
         let truncated =
             vec![json!({"type":"assistant","message":{"content":[{"text":"partial"}]}})];

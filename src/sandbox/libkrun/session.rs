@@ -2049,11 +2049,26 @@ pub(crate) fn score_in_sandbox(
                                               // below, not via `killpg` — same rationale as the foreground run.
     let mut child = cmd.spawn().context("spawn the grader VMM subprocess")?;
     rootfs.preserve();
+    // Drain the console to EOF but keep at most GRADE_OUTPUT_CAP bytes: worker
+    // code can print without end, and the guest's memory limit doesn't bound
+    // this host-side buffer. Rubric markers are interspersed, so it's a hard
+    // cap that errors the grade, not a tail that could drop criteria.
     let reader = child.stdout.take().map(|mut so| {
         std::thread::spawn(move || {
-            let mut out = String::new();
-            so.read_to_string(&mut out).ok();
-            out
+            let mut out = Vec::new();
+            let mut over = false;
+            let mut chunk = [0u8; 64 * 1024];
+            while let Ok(n) = so.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                if out.len() + n > GRADE_OUTPUT_CAP {
+                    over = true;
+                } else {
+                    out.extend_from_slice(&chunk[..n]);
+                }
+            }
+            (String::from_utf8_lossy(&out).into_owned(), over)
         })
     });
     // Worker code runs inside the grade (tests, build scripts), so a hang must
@@ -2071,11 +2086,17 @@ pub(crate) fn score_in_sandbox(
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     };
-    let out = reader
+    let (out, over) = reader
         .map(|r| r.join().unwrap_or_default())
         .unwrap_or_default();
     confirm_vmm_stopped(&spec_file.path().to_string_lossy())?;
     rootfs.remove_stopped()?;
+    if over {
+        bail!(
+            "the grader printed more than {} MiB and was not scored",
+            GRADE_OUTPUT_CAP >> 20
+        );
+    }
     let Some(status) = status else {
         bail!(
             "the grader ran past its {}s deadline and was stopped (set PILLBOX_GRADE_TIMEOUT to change it)",
@@ -2084,6 +2105,9 @@ pub(crate) fn score_in_sandbox(
     };
     Ok((status.code().unwrap_or(-1), out))
 }
+
+/// The most console output one grade keeps (see [`grade_exec`]'s reader).
+const GRADE_OUTPUT_CAP: usize = 64 << 20;
 
 /// How long one grader VM may run. Override with `PILLBOX_GRADE_TIMEOUT`
 /// (seconds).

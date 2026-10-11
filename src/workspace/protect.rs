@@ -677,7 +677,10 @@ fn lock_node(root: &Path, path: &Path, set: &ProtectSet, sticky: &BTreeSet<PathB
     }
     let rel = path.strip_prefix(root).unwrap_or(path);
     let covered = rel != Path::new("") && set.covers(rel);
-    let exec = meta.permissions().mode() & 0o111 != 0;
+    // On macOS the guest's chmod lives in the override xattr, not the backing
+    // mode: keep the exec bit the worker gave a file, never its owner or set-ID.
+    let shown = guest_override_mode(path).unwrap_or(meta.permissions().mode());
+    let exec = shown & 0o111 != 0;
     let mode = if ft.is_dir() {
         if covered {
             0o555
@@ -702,11 +705,9 @@ fn lock_node(root: &Path, path: &Path, set: &ProtectSet, sticky: &BTreeSet<PathB
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(m))
                 .with_context(|| format!("chmod {}", path.display()))
         };
-        if ft.is_dir() || covered {
-            // Removing a user xattr needs write access to the inode.
-            chmod(mode | 0o700)?;
-            clear_guest_override(path)?;
-        }
+        // Removing a user xattr needs write access to the inode.
+        chmod(mode | 0o700)?;
+        clear_guest_override(path)?;
         chmod(mode)?;
     }
     if ft.is_dir() {
@@ -718,9 +719,39 @@ fn lock_node(root: &Path, path: &Path, set: &ProtectSet, sticky: &BTreeSet<PathB
 }
 
 /// The xattr through which macOS libkrun shows the guest a mode and owner other
-/// than the backing file's. The clone keeps the worker's copy of it, and a
-/// guest `chmod 0777 .` would otherwise outlive [`lock_grade_tree`].
+/// than the backing file's. The clone keeps the worker's copy of it, so without
+/// clearing it a guest `chmod 0777 .` would outlive [`lock_grade_tree`], and a
+/// root-owned setuid file would hand the `nobody` grader back root.
 const GUEST_OVERRIDE_XATTR: &std::ffi::CStr = c"user.containers.override_stat";
+
+/// The mode `path`'s guest stat override shows (`uid:gid:mode`, mode in octal),
+/// if it has one that sets a mode.
+fn guest_override_mode(path: &Path) -> Option<u32> {
+    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut value = [0u8; 64];
+    #[cfg(target_os = "macos")]
+    let n = unsafe {
+        libc::getxattr(
+            c_path.as_ptr(),
+            GUEST_OVERRIDE_XATTR.as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+            0,
+            libc::XATTR_NOFOLLOW,
+        )
+    };
+    #[cfg(not(target_os = "macos"))]
+    let n = unsafe {
+        libc::lgetxattr(
+            c_path.as_ptr(),
+            GUEST_OVERRIDE_XATTR.as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+        )
+    };
+    let text = std::str::from_utf8(value.get(..usize::try_from(n).ok()?)?).ok()?;
+    u32::from_str_radix(text.split(':').nth(2)?, 8).ok()
+}
 
 /// Drop `path`'s guest stat override, so the grader VM sees the locked backing
 /// mode. Fails closed on anything but "not set" or "xattrs unsupported here".
@@ -1238,10 +1269,9 @@ mod tests {
     #[test]
     fn a_worker_guest_mode_override_does_not_survive_the_lock() {
         let (_t, base, worker) = base_and_copy();
-        let set_override = |p: &Path| {
+        let set_value = |p: &Path, v: &[u8]| {
             use std::os::unix::ffi::OsStrExt;
             let c = std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
-            let v = b"0:0:040777";
             #[cfg(target_os = "macos")]
             let rc = unsafe {
                 libc::setxattr(
@@ -1265,8 +1295,11 @@ mod tests {
             };
             rc == 0
         };
-        // The worker's guest `chmod 0777 .` / `chmod 0777 tests`.
+        let set_override = |p: &Path| set_value(p, b"0:0:040777");
+        // The worker's guest `chmod 0777 .` / `chmod 0777 tests`, and a
+        // root-owned setuid binary outside the protected set.
         let check = worker.join("tests/check.sh");
+        let suid = worker.join("src/lib.rs");
         if !set_override(&worker) || !set_override(&worker.join("tests")) || !set_override(&check) {
             eprintln!("skipping: user xattrs unsupported on this filesystem");
             return;
@@ -1274,8 +1307,11 @@ mod tests {
         // Lock the worker tree in place: on Linux the CoW clone drops xattrs,
         // so going through GradeTree would not exercise the clear.
         let _ = &base;
+        assert!(set_value(&suid, b"0:0:0104755"));
+        assert_eq!(guest_override_mode(&suid), Some(0o104755));
         lock_grade_tree(&worker, &defaults()).unwrap();
-        for rel in ["", "tests", "tests/check.sh"] {
+        assert_eq!(mode_of(&suid), 0o777, "exec kept, set-ID and owner dropped");
+        for rel in ["", "tests", "tests/check.sh", "src/lib.rs"] {
             let p = worker.join(rel);
             let c = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
             #[cfg(target_os = "macos")]

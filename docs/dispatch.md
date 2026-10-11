@@ -159,12 +159,14 @@ mount fails) fails that worker as `errored`. There is no host fallback. A build
 without the `libkrun` feature is a usage error (exit 2) before any worker forks.
 
 On macOS, the grade tree also drops the `user.containers.override_stat` xattr
-from every directory and protected entry, so a worker's guest `chmod` cannot
-outlive the lock: the grader VM sees the locked backing modes.
+from every entry, so a worker's guest `chmod` or a root-owned setuid file cannot
+outlive the lock: the grader VM sees the locked backing modes (a file keeps the
+exec bit the worker gave it).
 
 **Each grade has a deadline** (default 1800s, `PILLBOX_GRADE_TIMEOUT` to
 change it). A grader still running then is stopped and that worker is
-`errored`, so one hung test suite can't stall the run.
+`errored`, so one hung test suite can't stall the run. A grade that prints more
+than 64 MiB is errored the same way.
 
 **The grader VM boots the runner image**, which ships `python3` (no pytest),
 `node`, `git` and core tools — **not** a Rust toolchain or pytest. A reward

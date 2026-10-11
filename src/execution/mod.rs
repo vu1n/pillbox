@@ -17,6 +17,7 @@ pub(crate) mod store;
 pub(crate) mod text;
 #[cfg(feature = "libkrun")]
 pub(crate) mod text_v2;
+pub(crate) mod usage;
 #[cfg(any(feature = "libkrun", test))]
 pub(crate) mod verifier;
 

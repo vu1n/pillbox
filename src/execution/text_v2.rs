@@ -15,6 +15,7 @@ use super::evidence::ExecutionEvidence;
 use super::protocol;
 use super::store::OwnedInvocation;
 use super::text::{self, FailedStage, TextExecution, TextLimits, TextRequest, TextRuntime};
+use super::usage::TurnUsage;
 use super::{digest, HarnessTransport, ModelProfile, SessionIdentity, TextOutputFormat};
 use crate::contract::{Custom, Payload};
 use crate::pillbox::Pillbox;
@@ -152,33 +153,48 @@ pub(crate) fn execute(
         Err(rejection) => return unresolved(pb, request, owner, rejection),
     };
     match text::execute_with(pb, &lowered, owner, false) {
-        Ok((completion, cli_version)) => Ok(Outcome::Completed(json!({
-            "invocation_id": completion.invocation_id,
-            "request_hash": completion.request_hash,
-            "resolved": {
-                "harness": request.agent.harness,
-                "harness_version": cli_version.context("Codex did not report its version")?,
-                "adapter_revision": ADAPTER_REVISION,
-                "runner_image_id": runner_image_id,
-                "requested_model": completion.requested_model,
-                "served_model": completion.served_model,
-            },
-            "session_ref": completion.session_ref,
-            "output_text": completion.output_text,
-        }))),
+        Ok((completion, observed)) => {
+            let mut detail = json!({
+                "invocation_id": completion.invocation_id,
+                "request_hash": completion.request_hash,
+                "resolved": {
+                    "harness": request.agent.harness,
+                    "harness_version": observed
+                        .cli_version
+                        .context("Codex did not report its version")?,
+                    "adapter_revision": ADAPTER_REVISION,
+                    "runner_image_id": runner_image_id,
+                    "requested_model": completion.requested_model,
+                    "served_model": completion.served_model,
+                },
+                "session_ref": completion.session_ref,
+                "output_text": completion.output_text,
+            });
+            with_usage(&mut detail, observed.usage.as_ref());
+            Ok(Outcome::Completed(detail))
+        }
         Err(error) if error.downcast_ref::<TeardownUnconfirmed>().is_some() => Err(error),
         Err(error) => {
-            let stage = error
-                .downcast_ref::<FailedStage>()
-                .map_or("credentials", |stage| stage.0);
-            Ok(Outcome::Failed(json!({
+            let failed = error.downcast_ref::<FailedStage>();
+            let stage = failed.map_or("credentials", |failed| failed.stage);
+            let mut detail = json!({
                 "invocation_id": request.invocation_id,
                 "request_hash": owner.record().request_hash,
                 "code": failure_code(stage, &error),
                 "stage": stage,
                 "session_ref": owner.record().detail.get("session_ref"),
-            })))
+            });
+            with_usage(&mut detail, failed.and_then(|failed| failed.usage.as_ref()));
+            Ok(Outcome::Failed(detail))
         }
+    }
+}
+
+/// Add the turn's reported spend to a completed or failed record. A harness that
+/// reported nothing gets no `usage` key, never zeros.
+fn with_usage(detail: &mut Value, usage: Option<&TurnUsage>) {
+    if let Some(usage) = usage {
+        detail["usage"] = json!(usage);
     }
 }
 
@@ -352,6 +368,20 @@ mod tests {
         assert_eq!(lowered.runtime.runner_image_id, image);
         assert_eq!(lowered.execution.requested.profile, "luna");
         assert!(request("codex", "gpt-4").codex_request(image).is_err());
+    }
+
+    #[test]
+    fn usage_is_added_only_when_reported() {
+        let mut detail = json!({"invocation_id": "chat_1"});
+        with_usage(&mut detail, None);
+        assert_eq!(detail, json!({"invocation_id": "chat_1"}));
+        let usage = TurnUsage::from_claude_result(&json!({"total_cost_usd": 0.5,
+            "usage": {"input_tokens": 3, "output_tokens": 4}}));
+        with_usage(&mut detail, usage.as_ref());
+        assert_eq!(
+            detail["usage"],
+            json!({"cost_usd": 0.5, "input_tokens": 3, "output_tokens": 4})
+        );
     }
 
     #[test]

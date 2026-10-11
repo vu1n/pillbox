@@ -10,6 +10,7 @@ use super::evidence::ExecutionEvidence;
 use super::native::{self, NativeLimits};
 use super::protocol::{self, CodexProfile};
 use super::store::OwnedInvocation;
+use super::usage::TurnUsage;
 use super::{
     digest, valid_digest, ArtifactRef, EvidenceRef, HarnessTransport, ModelProfile,
     SessionIdentity, TextOutputFormat,
@@ -286,15 +287,25 @@ fn validate_id(value: &str) -> Result<()> {
     Ok(())
 }
 
-/// The stage that was running when a text invocation failed, carried in the error
-/// chain so a caller can report it without parsing the message.
+/// The stage that was running when a text invocation failed, and what the turn
+/// had already spent, carried in the error chain so a caller can report both
+/// without parsing the message.
 #[derive(Debug)]
-pub(crate) struct FailedStage(pub(crate) &'static str);
+pub(crate) struct FailedStage {
+    pub(crate) stage: &'static str,
+    pub(crate) usage: Option<TurnUsage>,
+}
 
 impl std::fmt::Display for FailedStage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "text invocation failed during {}", self.0)
+        write!(f, "text invocation failed during {}", self.stage)
     }
+}
+
+/// What the native turn reported about itself besides its text.
+pub(crate) struct Observed {
+    pub(crate) cli_version: Option<String>,
+    pub(crate) usage: Option<TurnUsage>,
 }
 
 pub(crate) fn execute(
@@ -305,14 +316,14 @@ pub(crate) fn execute(
     execute_with(pb, request, owner, true).map(|(completion, _)| completion)
 }
 
-/// [`execute`], also returning the Codex CLI version the guest reported. With
+/// [`execute`], also returning the Codex CLI version and turn usage the guest reported. With
 /// `exact_cli_version` false the runner image decides the version and it is only recorded.
 pub(crate) fn execute_with(
     pb: &Pillbox,
     request: &TextRequest,
     owner: &mut OwnedInvocation,
     exact_cli_version: bool,
-) -> Result<(TextCompletion, Option<String>)> {
+) -> Result<(TextCompletion, Observed)> {
     let profile = request.validate()?;
     let profile = if exact_cli_version {
         profile
@@ -349,6 +360,7 @@ pub(crate) fn execute_with(
     };
     owner.running(serde_json::to_value(&progress)?)?;
     let mut stages = Stages::start();
+    let mut usage = None;
     let result = run_local(
         pb,
         request,
@@ -358,11 +370,12 @@ pub(crate) fn execute_with(
         &mut evidence,
         &mut progress,
         &mut stages,
+        &mut usage,
     );
     let session_id = &request.session_ref.session_id;
     stages.emit_started(pb, session_id);
     match result {
-        Ok(completion) => {
+        Ok((completion, cli_version)) => {
             crate::events::emit_session_event(
                 pb,
                 crate::events::EventType::SessionCompleted {
@@ -373,7 +386,7 @@ pub(crate) fn execute_with(
                 session_id,
                 None,
             );
-            Ok(completion)
+            Ok((completion, Observed { cli_version, usage }))
         }
         Err(error) => {
             let stage = stages.in_progress();
@@ -390,7 +403,7 @@ pub(crate) fn execute_with(
             );
             Err(
                 record_failure(error, stage, &mut evidence, owner, &mut progress)
-                    .context(FailedStage(stage)),
+                    .context(FailedStage { stage, usage }),
             )
         }
     }
@@ -429,6 +442,7 @@ fn run_local(
     evidence: &mut ExecutionEvidence,
     progress: &mut TextProgress,
     stages: &mut Stages,
+    usage: &mut Option<TurnUsage>,
 ) -> Result<(TextCompletion, Option<String>)> {
     let spec = crate::agents::lookup("execution", "codex")?;
     let credentials_path = spec.home_dir(pb)?.join(spec.cred_sentinel);
@@ -509,6 +523,8 @@ fn run_local(
             Ok(done) => &done.evidence,
             Err(failed) => &failed.evidence,
         };
+        // Bounded: the frames are the native evidence, already capped by max_evidence_bytes.
+        *usage = TurnUsage::from_codex_frames(frames);
         progress.native_evidence = Some(evidence.native_frames(frames)?);
         progress.session_ref = evidence.reference();
         owner.observe(serde_json::to_value(&progress)?)?;
@@ -518,6 +534,12 @@ fn run_local(
         name: "text.builder.stopped".into(),
         payload: Some(json!({"diagnostics": diagnostics})),
     }))?;
+    if let Some(usage) = usage {
+        evidence.append(Payload::Custom(Custom {
+            name: "usage".into(),
+            payload: Some(json!({"turn_usage": usage})),
+        }))?;
+    }
     let native = native?.map_err(|failure| failure.error)?;
     let cli_version = observed_cli_version(&native.evidence);
     check_live(owner, deadline)?;

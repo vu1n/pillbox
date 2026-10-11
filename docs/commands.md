@@ -559,6 +559,42 @@ that image. A completed record carries `resolved` (`harness`,
 `finalize`); the message stays in the session log. Only `codex` has a text
 driver today; the other harnesses fail at `resolve` with `runtime_rejected`.
 
+A completed record, and a failed one whose turn already spent tokens, carries
+`usage` when the harness reported any:
+
+```json
+"usage": {
+  "cost_usd": 0.0123,
+  "input_tokens": 12,
+  "output_tokens": 340,
+  "cache_read_tokens": 5000,
+  "cache_write_tokens": 800
+}
+```
+
+The object is closed. `cost_usd` is always present: the harness's own figure,
+or `null` when it reports tokens but no cost. Pillbox never prices tokens. The
+token counts are non-negative integers, each omitted when the harness did not
+report it, and they do not overlap: `input_tokens` excludes cache reads and
+writes, and reasoning tokens are inside `output_tokens`. A harness that reports
+nothing gets no `usage` key, never zeros. A value that is not a number, is
+negative or non-finite, or exceeds 10^10 tokens or $1,000,000 is dropped; when
+nothing valid remains, `usage` is absent.
+
+| field | codex (`thread/tokenUsage/updated`, `tokenUsage.total`) | claude_code (`result` line) |
+|---|---|---|
+| `cost_usd` | `null` (Codex reports no cost) | `total_cost_usd` (API-equivalent on a subscription, not a bill) |
+| `input_tokens` | `inputTokens` − `cachedInputTokens` − `cacheWriteInputTokens` (dropped if negative) | `usage.input_tokens` |
+| `output_tokens` | `outputTokens` | `usage.output_tokens` |
+| `cache_read_tokens` | `cachedInputTokens` | `usage.cache_read_input_tokens` |
+| `cache_write_tokens` | `cacheWriteInputTokens` | `usage.cache_creation_input_tokens` |
+
+Codex's newest `total` for the invocation's thread and turn is the turn's usage,
+because a text invocation runs one turn on a fresh thread. The claude_code
+column is what the Claude harness writes as `turn_usage` in its `usage` session
+event, ready for when it gets a text driver. Both versions append the same
+`usage` event (`{"turn_usage": …}`) to the text session log.
+
 Both versions append a `text.stage.completed` event per stage to the session
 log and emit `session.started` / `session.completed` / `session.failed`
 lifecycle events, so `session log`, `events.jsonl` and OTel show where a turn

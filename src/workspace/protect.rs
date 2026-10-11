@@ -8,9 +8,12 @@
 //! additions, deletions, renames and symlink swaps inside the set are all undone;
 //! everything outside it is graded as the worker left it.
 //!
-//! The walks never follow a symlink, and every directory the restore writes
-//! through is checked to be a real directory, so a worker-planted link cannot
-//! redirect the restore outside the copy.
+//! The walks never follow a symlink in the worker's tree, and every directory
+//! the restore writes through is checked to be a real directory, so a
+//! worker-planted link cannot redirect the restore outside the copy. A base
+//! link inside the set that points at an unprotected path elsewhere in the base
+//! is copied as the base target's content, so the worker's copy of that target
+//! cannot decide the grade.
 //!
 //! Pattern syntax (a gitignore-flavoured subset):
 //! - a pattern with no `/` (other than a trailing one) matches that name at any
@@ -289,37 +292,82 @@ pub(crate) fn restore_protected(
     for rel in &worker.tops {
         force_remove(&tree.join(rel))?;
     }
+    let root =
+        std::fs::canonicalize(base).with_context(|| format!("resolve {}", base.display()))?;
     for rel in &reference.tops {
         if let Some(parent) = rel.parent() {
             ensure_real_dirs(tree, parent, &mut reverted)?;
         }
-        copy_node(&protected_source(base, rel)?, &tree.join(rel))?;
+        copy_protected(
+            &root,
+            set,
+            &base.join(rel),
+            &tree.join(rel),
+            &mut Vec::new(),
+        )?;
     }
     Ok(RestoreReport {
         reverted: reverted.into_iter().collect(),
     })
 }
 
-/// What to copy for the protected top `rel`: the entry itself, unless it is a
-/// symlink whose target is elsewhere in the base (`tests -> shared-tests`).
-/// Restoring just the link would leave the worker-editable target deciding the
-/// grade, so such a top is materialized from the base target instead. A link
-/// that leaves the tree is copied as a link (it can't resolve in the VM).
-fn protected_source(base: &Path, rel: &Path) -> Result<PathBuf> {
-    let src = base.join(rel);
-    let is_link = std::fs::symlink_metadata(&src)
-        .with_context(|| format!("stat {}", src.display()))?
-        .file_type()
-        .is_symlink();
-    if !is_link {
-        return Ok(src);
+/// Copy the protected base entry `src` to `dst` like [`copy_node`], except
+/// that a symlink resolving to an unprotected path elsewhere in the base
+/// (`tests -> shared-tests`, `tests/unit -> ../shared-tests`) is materialized
+/// from the base target, at any depth. Restoring just the link would let the
+/// worker's copy of the target decide the grade. A link to a protected path, a
+/// dangling one, or one that leaves the tree is copied as a link. `active`
+/// holds the directories being copied, so a link back into one is an error
+/// rather than an endless copy.
+fn copy_protected(
+    root: &Path,
+    set: &ProtectSet,
+    src: &Path,
+    dst: &Path,
+    active: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let meta = std::fs::symlink_metadata(src).with_context(|| format!("stat {}", src.display()))?;
+    let ft = meta.file_type();
+    if ft.is_symlink() {
+        let Some(target) = unprotected_in_tree(root, set, src) else {
+            return copy_node(src, dst);
+        };
+        if active.contains(&target) {
+            bail!(
+                "protected path {} links back into {}; protect the target or break the cycle",
+                src.display(),
+                target.display()
+            );
+        }
+        return copy_protected(root, set, &target, dst, active);
     }
-    let root =
-        std::fs::canonicalize(base).with_context(|| format!("resolve {}", base.display()))?;
-    match std::fs::canonicalize(&src) {
-        Ok(target) if target.starts_with(&root) && target != root => Ok(target),
-        _ => Ok(src),
+    if !ft.is_dir() {
+        return copy_node(src, dst);
     }
+    let here = std::fs::canonicalize(src).with_context(|| format!("resolve {}", src.display()))?;
+    active.push(here);
+    std::fs::create_dir(dst).with_context(|| format!("create {}", dst.display()))?;
+    for entry in std::fs::read_dir(src).with_context(|| format!("read {}", src.display()))? {
+        let entry = entry?;
+        copy_protected(
+            root,
+            set,
+            &entry.path(),
+            &dst.join(entry.file_name()),
+            active,
+        )?;
+    }
+    std::fs::set_permissions(dst, meta.permissions())?;
+    active.pop();
+    Ok(())
+}
+
+/// Where the symlink `link` points, when that is a path inside `root` (the
+/// canonical base) that `set` does not cover.
+fn unprotected_in_tree(root: &Path, set: &ProtectSet, link: &Path) -> Option<PathBuf> {
+    let target = std::fs::canonicalize(link).ok()?;
+    let rel = target.strip_prefix(root).ok()?;
+    (!rel.as_os_str().is_empty() && !set.covers(rel)).then_some(target)
 }
 
 /// Make every component of `rel` under `root` a real, writable directory. A
@@ -911,6 +959,35 @@ mod tests {
     }
 
     #[test]
+    fn a_nested_protected_link_into_the_base_is_materialized() {
+        let (_t, base, copy) = base_and_copy();
+        write(&base, "shared-tests/check.sh", "exit 1\n");
+        symlink("../shared-tests", base.join("tests/unit")).unwrap();
+        symlink("check.sh", base.join("tests/again")).unwrap(); // stays inside the set
+        write(&copy, "shared-tests/check.sh", "exit 0\n"); // worker edits the target
+        symlink("../shared-tests", copy.join("tests/unit")).unwrap();
+        restore_protected(&copy, &base, &defaults()).unwrap();
+        let unit = copy.join("tests/unit");
+        assert!(fs::symlink_metadata(&unit).unwrap().file_type().is_dir());
+        assert_eq!(read(&copy, "tests/unit/check.sh"), "exit 1\n");
+        assert_eq!(
+            fs::read_link(copy.join("tests/again")).unwrap(),
+            Path::new("check.sh"),
+            "a link to a protected path stays a link"
+        );
+    }
+
+    #[test]
+    fn a_protected_link_cycle_is_an_error_not_an_endless_copy() {
+        let (_t, base, copy) = base_and_copy();
+        write(&base, "shared/a.sh", "exit 1\n");
+        symlink("../shared", base.join("shared/loop")).unwrap();
+        symlink("../shared", base.join("tests/unit")).unwrap();
+        let err = restore_protected(&copy, &base, &defaults()).unwrap_err();
+        assert!(format!("{err:#}").contains("links back into"), "{err:#}");
+    }
+
+    #[test]
     fn ancestors_of_protected_paths_are_sticky_and_build_dirs_are_not() {
         let (_t, base, worker) = base_and_copy();
         write(&base, "src/foo_test.rs", "#[test] fn t() {}\n");
@@ -994,12 +1071,11 @@ mod tests {
             fs::write(tree.path().join("tests/extra.sh"), b"exit 0\n").is_err(),
             "cannot add a file under a protected directory"
         );
-        // The link is restored as a link, and locking it did not make the
-        // target immutable — that file is worker code.
-        assert!(fs::symlink_metadata(tree.path().join("tests/via"))
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        // A link out of the set to worker code is materialized from the base
+        // and locked, and locking it did not make the worker's file immutable.
+        let via = tree.path().join("tests/via");
+        assert!(fs::symlink_metadata(&via).unwrap().file_type().is_file());
+        assert_eq!(mode_of(&via) & 0o222, 0, "materialized copy is locked");
         fs::write(tree.path().join("src/lib.rs"), b"pub fn f() -> u8 { 2 }\n").unwrap();
         assert_ne!(
             mode_of(&worker.join("tests")) & 0o222,

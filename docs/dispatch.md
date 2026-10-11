@@ -96,7 +96,10 @@ would shadow a Python test runner (`/pytest.py`, `/pytest/`, `/_pytest/`,
 pytest` puts the workspace first on `sys.path`), CI config (`.github/`, `.gitlab-ci.yml`,
 `.circleci/`, `.buildkite/`, `.travis.yml`, `azure-pipelines.yml`, `Jenkinsfile`),
 and rubrics (`rubrics/`, `*.rubric`). A name matches at any depth; `--protect`
-adds more. Manifests the task itself is often supposed to edit — `Cargo.toml`,
+adds more. A bookmark symlink inside the set that points at an unprotected path
+elsewhere in the tree (`tests/unit -> ../shared-tests`) is graded as the
+bookmark's copy of its target, so link to code under test by import path, not by
+symlink. Manifests the task itself is often supposed to edit — `Cargo.toml`,
 `package.json`, `pyproject.toml` — are not in the default set; a project that
 grades through one of those adds it with `--protect`. When a grade reverts
 something, dispatch names the paths on stderr; the verdict JSON is unchanged.
@@ -148,10 +151,12 @@ without the `libkrun` feature is a usage error (exit 2) before any worker forks.
 
 **The grader VM boots the runner image**, which ships `python3` (no pytest),
 `node`, `git` and core tools — **not** a Rust toolchain or pytest. A reward
-whose tool is missing there (a command exiting 127, or `python3 -m MOD` with
-`MOD` not installed) is an **error**, so the worker is `errored`, never
+whose tool is missing there (the program the reward command names is not
+found, exit 127, or a leading `python3 -m MOD` with `MOD` not installed) is an
+**error**, so the worker is `errored`, never
 `failed`: otherwise every worker would "fail" identically and the run would
-read as a hard task. To grade with `cargo`, pytest or another toolchain, build
+read as a hard task. A program missing *inside* the reward (`sh check.sh`
+calling a `./bin/tool` the worker never built) is a failed grade. To grade with `cargo`, pytest or another toolchain, build
 an image `FROM` the pillbox runner with it installed and set
 `PILLBOX_RUNNER_IMAGE`; or install test deps inside the reward with
 `--grader-egress` naming the registry. `--baseline-check` grades on the host,

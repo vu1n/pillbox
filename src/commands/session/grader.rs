@@ -320,46 +320,87 @@ fn parse_rubric_output(raw: &str) -> Vec<Criterion> {
     crits
 }
 
-/// The grader tool a sandboxed grade could not find, if any: a command the shell
-/// could not find (exit 127), or a `python3 -m MOD` whose module is not
-/// installed (runpy's `…python3: No module named MOD`). In the grader microVM
-/// that means the runner image lacks the tool, so every worker would "fail"
-/// the same way; [`refuse_missing_tool`] turns it into an error instead.
+/// The grader tool a sandboxed grade could not find, if any. Only the program
+/// the grader command itself names counts: a bare `--cmd`/criterion program the
+/// shell could not find (exit 127 and the shell's `PROG: not found`), or the
+/// module of a leading `python3 -m MOD` that is not installed (runpy's
+/// `…python3: No module named MOD`). In the grader microVM that means the runner
+/// image lacks the tool, so every worker would "fail" the same way;
+/// [`refuse_missing_tool`] turns it into an error instead. A program missing
+/// further down (`sh check.sh` calling a `./bin/tool` the worker never built) is
+/// the worker's defect and stays a failed grade.
 fn missing_tool(spec: &GraderSpec, code: i32, raw: &str) -> Option<String> {
-    let no_module = |out: &str| {
-        out.lines().map(str::trim).find_map(|l| {
-            let (exe, module) = l.split_once(": No module named ")?;
-            let exe = exe.rsplit('/').next().unwrap_or(exe);
-            (exe.starts_with("python") && !module.contains(' '))
-                .then(|| format!("python module `{module}`"))
-        })
-    };
     match spec {
-        GraderSpec::Cmd(_) if code == 127 => Some("the --cmd command (exit 127)".into()),
-        GraderSpec::Cmd(_) => no_module(raw),
-        GraderSpec::Rubric { .. } => {
+        GraderSpec::Cmd(cmd) => lead_tool_missing(cmd, code, raw),
+        GraderSpec::Rubric { criteria, .. } => {
             use base64::Engine as _;
             let b64 = base64::engine::general_purpose::STANDARD;
-            raw.lines().find_map(|line| {
-                let mut f = line.strip_prefix(RUBRIC_MARKER)?.splitn(3, '\t');
-                let (exit, name) = (f.next()?.trim(), f.next()?);
-                let name = b64
-                    .decode(name.trim())
-                    .map(|b| String::from_utf8_lossy(&b).into_owned())
-                    .unwrap_or_else(|_| name.to_string());
+            let markers = raw.lines().filter_map(|l| l.strip_prefix(RUBRIC_MARKER));
+            markers.zip(criteria).find_map(|(line, (name, command))| {
+                let mut f = line.splitn(3, '\t');
+                let exit = f.next()?.trim().parse::<i32>().ok()?;
                 let out = f
-                    .next()
+                    .nth(1)
                     .and_then(|o| b64.decode(o.trim()).ok())
                     .map(|b| String::from_utf8_lossy(&b).into_owned())
                     .unwrap_or_default();
-                if exit == "127" {
-                    Some(format!("criterion `{name}` (exit 127)"))
-                } else {
-                    no_module(&out).map(|m| format!("criterion `{name}`: {m}"))
-                }
+                lead_tool_missing(command, exit, &out).map(|m| format!("criterion `{name}`: {m}"))
             })
         }
     }
+}
+
+/// [`missing_tool`] for one shell command, its exit code and its output.
+fn lead_tool_missing(command: &str, exit: i32, out: &str) -> Option<String> {
+    let mut words = command
+        .split_whitespace()
+        .skip_while(|w| matches!(*w, "env" | "exec") || is_env_assignment(w));
+    let prog = words.next()?;
+    if exit == 127 && !prog.contains('/') {
+        let not_found = [
+            format!(": {prog}: not found"),
+            format!(": {prog}: command not found"),
+        ];
+        if out
+            .lines()
+            .any(|l| not_found.iter().any(|n| l.trim_end().ends_with(n.as_str())))
+        {
+            return Some(format!("`{prog}` (exit 127)"));
+        }
+    }
+    if !prog
+        .rsplit('/')
+        .next()
+        .unwrap_or(prog)
+        .starts_with("python")
+    {
+        return None;
+    }
+    let module = loop {
+        match words.next()? {
+            "-m" => break words.next()?,
+            w if w.starts_with("-m") => break &w[2..],
+            _ => {}
+        }
+    };
+    let expected = format!(": No module named {module}");
+    out.lines()
+        .map(str::trim)
+        .any(|l| {
+            l.ends_with(&expected) && {
+                let exe = &l[..l.len() - expected.len()];
+                exe.rsplit('/').next().unwrap_or(exe).starts_with("python")
+            }
+        })
+        .then(|| format!("python module `{module}`"))
+}
+
+fn is_env_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(k, _)| {
+        !k.is_empty()
+            && !k.starts_with(|c: char| c.is_ascii_digit())
+            && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
 }
 
 /// Error out of a sandboxed grade whose tool is missing from the runner image
@@ -533,12 +574,25 @@ mod tests {
         assert!(missing_tool(&cmd, 127, "sh: cargo: not found").is_some());
         assert!(missing_tool(&cmd, 1, "1 test failed").is_none());
         assert!(missing_tool(&cmd, 0, "").is_none());
-        let py = missing_tool(&cmd, 1, "/usr/bin/python3: No module named pytest\n").unwrap();
+        let env = GraderSpec::Cmd("RUST_LOG=1 cargo test".into());
+        assert!(missing_tool(&env, 127, "bash: line 1: cargo: command not found").is_some());
+        let pytest = GraderSpec::Cmd("python3 -m pytest -q".into());
+        let py = missing_tool(&pytest, 1, "/usr/bin/python3: No module named pytest\n").unwrap();
         assert!(py.contains("pytest"), "{py}");
         // A test's own ImportError is a failed grade, not a missing tool.
-        assert!(missing_tool(&cmd, 1, "E   ModuleNotFoundError: No module named 'foo'").is_none());
-        assert!(refuse_missing_tool(&cmd, 127, "").is_err());
+        assert!(
+            missing_tool(&pytest, 1, "E   ModuleNotFoundError: No module named 'foo'").is_none()
+        );
+        assert!(refuse_missing_tool(&cmd, 127, "sh: 1: cargo: not found").is_err());
         assert!(refuse_missing_tool(&cmd, 1, "assert 1 == 2").is_ok());
+
+        // A program missing inside the grader (the worker never built it) is
+        // the worker's failure, not the runner image's.
+        let nested = GraderSpec::Cmd("sh .pillbox-grader/check.sh".into());
+        let out = ".pillbox-grader/check.sh: 1: ./bin/tool: not found";
+        assert!(missing_tool(&nested, 127, out).is_none());
+        let worker_module = GraderSpec::Cmd("sh run.sh".into());
+        assert!(missing_tool(&worker_module, 1, "python3: No module named app").is_none());
 
         let (spec, code, raw) =
             run_rubric(&[("fmt", "true"), ("tests", "pb-no-such-tool-xyz --check")]);
@@ -546,6 +600,8 @@ mod tests {
         assert!(what.contains("tests"), "{what}");
         let (spec, code, raw) = run_rubric(&[("tests", "exit 1")]);
         assert!(missing_tool(&spec, code, &raw).is_none());
+        let (spec, code, raw) = run_rubric(&[("built", "sh -c ./pb-not-built-xyz")]);
+        assert!(missing_tool(&spec, code, &raw).is_none(), "{raw}");
     }
 
     #[test]

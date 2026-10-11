@@ -10,6 +10,12 @@ transport (in-sandbox pty-host + frame protocol; local detach/reattach).
 
 ## Unreleased
 
+- Add `pillbox dispatch --restate-task` (off by default). It re-sends the
+  positional task, verbatim in an `<original-task>` block, with every retry
+  turn and ahead of every segment after the first. If the task already contains
+  those tags, the tag becomes `<original-task-N>` so the whole task stays inside
+  the block. Without the flag a retry carries only the failure summary and only
+  segment 1 sees the task.
 - Remove the `pillbox session started` command. Nothing in the tree called it;
   `session done` is unchanged.
 - Remove the unused ACP adapter spikes and the local-test-only legacy Huddles

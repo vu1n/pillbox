@@ -102,7 +102,7 @@ Rules (from the contract):
 ## Sensible defaults
 
 - **`-k 3`** for short horizons (k=3–5 saturates; diversity gains flatten beyond).
-  `-k 1` (the default) = pure segmentation with no diversity.
+  `-k 1` = pure segmentation with no diversity. Pass it explicitly: the CLI default is `-k 3`.
 - **`--retries 1`** (the default) — one distilled retry per failing gate. Raise only
   for flaky/hard checkpoints; it costs a full re-drive each.
 - **`--temperature 0.7`** whenever `-k > 1` — without it the forks are degenerate.

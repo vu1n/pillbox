@@ -154,9 +154,10 @@ pillbox's `--json` surface.
     "workers": [
       {
         "session": "abc123def456",
-        "score": 1.0,            // best normalized score in [0,1] across this
-                                 // worker's attempts, or null if it never
-                                 // produced a gradeable result (status "errored")
+        "score": 1.0,            // normalized score in [0,1] of this worker's
+                                 // LAST graded attempt (not the best across
+                                 // retries), or null if it never produced a
+                                 // gradeable result (status "errored")
         "passed": true,          // did the grade pass (--cmd exit 0, or all rubric criteria)
         "retries_used": 0,       // retries this worker consumed (sum across segments in --segments mode)
         "status": "scored",      // "scored" | "failed" | "errored" | "unverified" (see below)

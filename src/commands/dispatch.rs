@@ -214,13 +214,14 @@ pub(crate) struct SegmentOutcome {
     pub(crate) retries_used: u32,
 }
 
-/// One worker's outcome — its session, best score across retries, and how it
+/// One worker's outcome — its session, final-attempt score, and how it
 /// ended. Carried in input (fork) order in [`DispatchVerdict::workers`].
 pub(crate) struct WorkerOutcome {
     /// The worker's session id.
     pub(crate) session: String,
-    /// Best normalized score in `[0,1]` across this worker's attempts, or
-    /// `None` if it never produced a gradeable result (`Errored`).
+    /// Normalized score in `[0,1]` of this worker's LAST graded attempt (not the
+    /// best across retries), or `None` if it never produced a gradeable result
+    /// (`Errored`).
     pub(crate) score: Option<f64>,
     /// Retries this worker consumed (0 = passed/failed on the first attempt). In
     /// `--segments` mode this is the SUM of per-segment retries.

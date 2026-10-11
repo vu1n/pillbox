@@ -39,6 +39,24 @@ git diff 354428cc5cda503c078e6167b797271e22b604b9 HEAD -- \
   .github/workflows/ci.yml .brief/SIGNOFF
 ```
 
+Integration comparison on 2026-10-11 used the published Prime187 (`15a7d2a`),
+OpenCode188 (`cb811798`) and Pi191 (`150575e3`) snapshots. A read-only three-way
+merge against the shared PR180 base found these text conflicts:
+
+| Lane | Conflicting files |
+|---|---|
+| Prime187 | `docs/commands.md`, `src/execution/text_v2.rs`, `src/sandbox/libkrun/repository.rs` |
+| OpenCode188 | `docs/commands.md`, `src/execution/text_v2.rs` |
+| Pi191 | `.github/workflows/ci.yml`, `docs/commands.md`, `src/execution/text_v2.rs`, `src/sandbox/libkrun/repository.rs` |
+
+Keep each lane's early `execute` dispatch before the Claude/Codex resolver, retain
+all module declarations and offline CI steps, and combine the documented drivers
+and usage rows. OpenCode188 currently adds admission checks for every harness;
+reconcile those with Claude's scoped checks without changing existing Codex
+admission behavior. The other lanes do not touch Claude's stage, console-drain or
+bounded vault helpers. Claude needs only the existing PR180 usage parser; its
+driver has no dependency on their usage additions or runner-image changes.
+
 ## Cloud validation
 
 The actual `$ship-it` instructions were read from
@@ -81,6 +99,8 @@ cargo clippy --no-default-features --all-targets -- -D warnings
 cargo test --no-default-features --all-targets
 cargo check --features libkrun --all-targets
 bash -n scripts/smoke/claude-text.sh
+bash scripts/smoke/claude-text.sh --request-only
+cargo test --no-default-features smoke_request -- --nocapture
 python3 scripts/smoke/test_claude_text_bridge.py
 python3 scripts/smoke/claude-text-offline.py --claude /tmp/pillbox-claude-native/package/claude
 git diff --check
@@ -99,6 +119,14 @@ valid evidence passes and a native tool event fails.
 The final Linux all-target suite passed with 880 tests passed, zero failed and
 four ignored (829 unit and 51 integration tests). Format, strict
 no-default-features clippy, and the committed PR-range governance check passed.
+
+Mac preflight found that the original live script used `output_format.kind`,
+while the wire contract requires `output_format.type`. The corrected script uses
+one generator for `--request-only` and live execution. A Linux regression parses
+the generated output format with the actual serde type and rejects the old key;
+a libkrun unit test deserializes and validates the complete generated v2 request
+and model selection before inference. Run that full schema preflight on the Mac
+with `cargo test --all-targets --features libkrun smoke_request`.
 
 Linux libkrun compile-only checking passes. Additional strict Linux feature lint
 (`cargo clippy --features libkrun --all-targets -- -D warnings`) fails on the
@@ -126,6 +154,7 @@ git rev-parse HEAD
 cargo fmt --check
 cargo clippy --all-targets --features libkrun -- -D warnings
 cargo test --all-targets --features libkrun
+cargo test --all-targets --features libkrun smoke_request
 cargo build --features libkrun
 codesign -f --entitlements krun/entitlements.plist -s - target/debug/pillbox
 ```

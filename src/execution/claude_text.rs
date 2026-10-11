@@ -420,9 +420,41 @@ pub(crate) fn run(
 }
 
 #[cfg(test)]
+pub(super) fn smoke_request() -> Value {
+    let output = std::process::Command::new("bash")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/scripts/smoke/claude-text.sh"
+        ))
+        .arg("--request-only")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn smoke_request_uses_the_shared_output_format_wire_schema() {
+        let mut request = smoke_request();
+        let format: super::super::TextOutputFormat =
+            serde_json::from_value(request["output_format"].clone()).unwrap();
+        assert_eq!(format.kind, "text");
+        assert_eq!(format.retry_count, 0);
+        request["output_format"] = json!({"kind":"text","retry_count":0});
+        assert!(serde_json::from_value::<super::super::TextOutputFormat>(
+            request["output_format"].clone()
+        )
+        .is_err());
+    }
 
     #[test]
     fn missing_credential_fails_without_configuring_access() {

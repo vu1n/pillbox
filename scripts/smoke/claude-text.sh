@@ -1,16 +1,9 @@
 #!/usr/bin/env bash
 # Requires explicit live-turn authorization from the coordinating task.
 set -euo pipefail
-if [[ "${1:-}" != "--live" || "$(uname -s)" != Darwin ]]; then
-    echo "Usage on macOS after live-turn approval: $0 --live /path/to/pillbox [evidence-dir]" >&2
-    exit 2
-fi
-pillbox_bin="${2:?provide the freshly built, codesigned libkrun binary}"
-evidence_dir="${3:-$(mktemp -d "${TMPDIR:-/tmp}/pillbox-claude-live.XXXXXX")}"
-mkdir -p "$evidence_dir"
-chmod 700 "$evidence_dir"
-python3 - "$evidence_dir/request.json" <<'PY'
-import hashlib, json, sys, uuid
+generate_request() {
+python3 - <<'PY'
+import hashlib, json, uuid
 invocation = 'claude-text-' + uuid.uuid4().hex
 prompt = 'Reply with exactly PILLBOX_CLAUDE_TEXT_OK. Do not use any tool.'
 request = {
@@ -21,13 +14,27 @@ request = {
     'rendered_input_hash': 'sha256:' + hashlib.sha256(prompt.encode()).hexdigest(),
     'tool_policy': 'deny_all',
     'agent': {'harness': 'claude_code', 'model': 'claude-opus-4-8', 'reasoning_effort': 'low'},
-    'placement': 'local_microvm', 'output_format': {'kind': 'text', 'retry_count': 0},
+    'placement': 'local_microvm', 'output_format': {'type': 'text', 'retry_count': 0},
     'limits': {'timeout_ms': 120000, 'max_final_text_bytes': 32768,
                'max_frame_bytes': 1048576, 'max_evidence_bytes': 8388608},
 }
-with open(sys.argv[1], 'w') as handle:
-    json.dump(request, handle)
+print(json.dumps(request))
 PY
+}
+# The schema tests exercise the same generator without a binary, state or provider.
+if [[ "${1:-}" == "--request-only" && "$#" == 1 ]]; then
+    generate_request
+    exit 0
+fi
+if [[ "${1:-}" != "--live" || "$(uname -s)" != Darwin ]]; then
+    echo "Usage: $0 --request-only, or on macOS after approval: $0 --live /path/to/pillbox [evidence-dir]" >&2
+    exit 2
+fi
+pillbox_bin="${2:?provide the freshly built, codesigned libkrun binary}"
+evidence_dir="${3:-$(mktemp -d "${TMPDIR:-/tmp}/pillbox-claude-live.XXXXXX")}"
+mkdir -p "$evidence_dir"
+chmod 700 "$evidence_dir"
+generate_request > "$evidence_dir/request.json"
 chmod 600 "$evidence_dir/request.json"
 PILLBOX_BACKEND=libkrun "$pillbox_bin" text execute --request "$evidence_dir/request.json" > "$evidence_dir/result.json"
 session_id="$(python3 - "$evidence_dir/result.json" <<'PY'

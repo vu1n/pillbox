@@ -399,6 +399,15 @@ mod tests {
     }
 
     #[test]
+    fn live_smoke_request_matches_v2_contract_before_inference() {
+        let request: TextRequestV2 = serde_json::from_value(claude_text::smoke_request()).unwrap();
+        request.validate().unwrap();
+        assert_eq!(request.agent.harness, "claude_code");
+        claude_text::Resolved::selection(&request.agent.model, &request.agent.reasoning_effort)
+            .unwrap();
+    }
+
+    #[test]
     fn every_pillbox_harness_is_a_valid_selection() {
         for harness in ["codex", "claude_code", "pi", "opencode"] {
             request(harness, "any-model").validate().unwrap();

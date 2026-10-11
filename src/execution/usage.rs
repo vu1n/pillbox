@@ -31,6 +31,74 @@ pub(crate) struct TurnUsage {
 }
 
 impl TurnUsage {
+    /// OpenCode 2 emits per-step spend and separate running totals. Count each
+    /// driven step once; running totals and replayed terminal events add nothing.
+    /// Its output and reasoning counts are disjoint (core/session/usage.ts).
+    pub(crate) fn from_opencode_steps(frames: &[Value], session: &str) -> Option<Self> {
+        let mut seen = std::collections::HashSet::new();
+        let steps: Vec<_> = frames
+            .iter()
+            .filter_map(|event| {
+                let data = &event["data"];
+                if !matches!(
+                    event["type"].as_str(),
+                    Some("session.step.ended" | "session.step.failed")
+                ) || data["sessionID"] != session
+                {
+                    return None;
+                }
+                let id = data["assistantMessageID"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())?;
+                seen.insert(id).then_some(data)
+            })
+            .collect();
+        let sum = |values: Vec<Option<u64>>| {
+            let valid: Vec<_> = values
+                .into_iter()
+                .flatten()
+                .filter(|n| *n <= MAX_TOKENS)
+                .collect();
+            if valid.is_empty() {
+                return None;
+            }
+            valid
+                .into_iter()
+                .try_fold(0u64, |total, n| total.checked_add(n))
+                .filter(|total| *total <= MAX_TOKENS)
+        };
+        let costs: Vec<_> = steps
+            .iter()
+            .filter_map(|d| d["cost"].as_f64())
+            .filter(|v| v.is_finite() && (0.0..=MAX_COST_USD).contains(v))
+            .collect();
+        let cost = (!costs.is_empty()).then(|| costs.iter().sum::<f64>());
+        Self::new(
+            cost,
+            sum(steps
+                .iter()
+                .map(|d| d["tokens"]["input"].as_u64())
+                .collect()),
+            sum(steps
+                .iter()
+                .flat_map(|d| {
+                    [
+                        d["tokens"]["output"].as_u64(),
+                        d["tokens"]["reasoning"].as_u64(),
+                    ]
+                })
+                .collect()),
+            sum(steps
+                .iter()
+                .map(|d| d["tokens"]["cache"]["read"].as_u64())
+                .collect()),
+            sum(steps
+                .iter()
+                .map(|d| d["tokens"]["cache"]["write"].as_u64())
+                .collect()),
+        )
+    }
+
     fn new(
         cost_usd: Option<f64>,
         input_tokens: Option<u64>,
@@ -226,5 +294,51 @@ mod tests {
     fn the_shape_is_closed() {
         let extra = json!({"cost_usd": null, "input_tokens": 1, "total_tokens": 2});
         assert!(serde_json::from_value::<TurnUsage>(extra).is_err());
+    }
+
+    #[test]
+    fn opencode_sums_steps_once_without_running_totals_or_token_overlap() {
+        let first = json!({"type": "session.step.ended", "data": {"sessionID": "s", "assistantMessageID": "m1",
+            "cost": 0.1, "tokens": {"input": 12, "output": 5, "reasoning": 7, "cache": {"read": 30, "write": 2}}}});
+        let second = json!({"type": "session.step.failed", "data": {"sessionID": "s", "assistantMessageID": "m2",
+            "cost": 0.2, "tokens": {"input": 9, "output": 3, "reasoning": 2, "cache": {"read": 20, "write": 4}}}});
+        let mut child = second.clone();
+        child["data"]["sessionID"] = json!("child");
+        let frames = vec![
+            first.clone(),
+            first,
+            second,
+            child,
+            json!({"type": "session.usage.updated", "data": {"sessionID": "s", "cost": 1000,
+                "tokens": {"input": 1000, "output": 1000}}}),
+        ];
+        let usage = TurnUsage::from_opencode_steps(&frames, "s").unwrap();
+        assert!((usage.cost_usd.unwrap() - 0.3).abs() < 1e-12);
+        assert_eq!(usage.input_tokens, Some(21));
+        assert_eq!(usage.output_tokens, Some(17));
+        assert_eq!(usage.cache_read_tokens, Some(50));
+        assert_eq!(usage.cache_write_tokens, Some(6));
+        assert!(TurnUsage::from_opencode_steps(&[], "s").is_none());
+    }
+
+    #[test]
+    fn opencode_missing_or_invalid_usage_is_omitted_and_oversized_sum_dropped() {
+        let missing = json!({"type": "session.step.ended", "data": {"sessionID": "s", "assistantMessageID": "m"}});
+        assert!(TurnUsage::from_opencode_steps(std::slice::from_ref(&missing), "s").is_none());
+        let mut invalid = missing.clone();
+        invalid["data"]["cost"] = json!(-1);
+        invalid["data"]["tokens"] =
+            json!({"input": -1, "output": "3", "reasoning": 20_000_000_000_u64});
+        assert!(TurnUsage::from_opencode_steps(&[invalid], "s").is_none());
+        let mut large = missing.clone();
+        large["data"]["tokens"]["output"] = json!(MAX_TOKENS);
+        let mut next = missing;
+        next["data"]["assistantMessageID"] = json!("m2");
+        next["data"]["tokens"]["output"] = json!(1);
+        next["data"]["tokens"]["input"] = json!(2);
+        let usage = TurnUsage::from_opencode_steps(&[large, next], "s").unwrap();
+        assert_eq!(usage.output_tokens, None);
+        assert_eq!(usage.input_tokens, Some(2));
+        assert_eq!(usage.cost_usd, None);
     }
 }

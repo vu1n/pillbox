@@ -17,6 +17,7 @@ use crate::contract::Payload;
 
 mod claude;
 mod cursor;
+pub(crate) mod opencode;
 mod pi;
 
 pub(crate) use claude::ClaudeAdapter;

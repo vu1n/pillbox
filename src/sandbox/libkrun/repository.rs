@@ -42,6 +42,8 @@ const GUEST_HOME: &str = "/home/pillbox";
 const GUEST_CODEX_HOME: &str = "/home/pillbox/.codex";
 const OFFLINE_LOCALHOST_HOSTS: &[u8] = b"127.0.0.1 localhost\n::1 localhost\n";
 
+pub(crate) mod opencode;
+
 /// The caller has already admitted this invocation and pre-refreshed TokenStore.
 /// No Debug or Serialize implementation: access_release contains a real token.
 pub(crate) struct BuilderInput {

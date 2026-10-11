@@ -140,6 +140,12 @@ RUN npm install -g \
 	# ^ the global install leaves a populated npm cache (~/.npm) in the
 	#   layer that nothing reads at runtime — drop it.
 
+# Export the bundled OpenCode catalog offline, without credentials or a model turn.
+# Local text resolution reads this file from the exact immutable microVM image.
+COPY src/execution/opencode_bridge.py /opt/pillbox-opencode-text/export.py
+RUN env -i PATH=/usr/local/bin:/usr/bin:/bin python3 -I -S \
+    /opt/pillbox-opencode-text/export.py --export-image-metadata /opt/pillbox-opencode-text/catalog.json
+
 # Codex: official standalone installer (native binary; the npm wrapper is
 # no longer how upstream ships protocol-bearing builds like `app-server`).
 # Preserve the complete package before dropping the installer scratch HOME:

@@ -555,34 +555,44 @@ fn first_lines(s: &str, n: usize) -> String {
         .join(" / ")
 }
 
-/// Default tag for the verbatim task block `--restate-task` adds to a turn.
+/// Tags for the verbatim blocks `--restate-task` adds to a turn: the task, and
+/// on a segment retry the segment being retried.
 const TASK_RESTATE_TAG: &str = "original-task";
+const SEGMENT_RESTATE_TAG: &str = "current-segment";
 
-/// An open/close pair the task does not contain, so the whole task stays inside
-/// the block. Starts at `<original-task>` and suffixes `-1`, `-2`, … while the
-/// task contains either tag. A candidate longer than the task cannot occur in
-/// it, so this ends.
-fn restate_delimiters(task: &str) -> (String, String) {
+/// An open/close pair `text` does not contain, so all of it stays inside the
+/// block. Starts at `<tag>` and suffixes `-1`, `-2`, … while `text` contains
+/// either tag. A candidate longer than `text` cannot occur in it, so this ends.
+fn restate_delimiters(tag: &str, text: &str) -> (String, String) {
     let mut n = 0u32;
     loop {
-        let tag = if n == 0 {
-            TASK_RESTATE_TAG.to_string()
+        let t = if n == 0 {
+            tag.to_string()
         } else {
-            format!("{TASK_RESTATE_TAG}-{n}")
+            format!("{tag}-{n}")
         };
-        let open = format!("<{tag}>");
-        let close = format!("</{tag}>");
-        if !task.contains(&open) && !task.contains(&close) {
+        let open = format!("<{t}>");
+        let close = format!("</{t}>");
+        if !text.contains(&open) && !text.contains(&close) {
             return (open, close);
         }
         n += 1;
     }
 }
 
+/// `text`, byte-identical, under `header` between delimiters it does not contain.
+fn restated_block(header: &str, tag: &str, text: &str) -> String {
+    let (open, close) = restate_delimiters(tag, text);
+    format!("{header}\n{open}\n{text}\n{close}\n")
+}
+
 /// The original task, byte-identical, between delimiters it does not contain.
 fn restated_task(task: &str) -> String {
-    let (open, close) = restate_delimiters(task);
-    format!("The original task, restated verbatim:\n{open}\n{task}\n{close}\n")
+    restated_block(
+        "The original task, restated verbatim:",
+        TASK_RESTATE_TAG,
+        task,
+    )
 }
 
 /// The task `--restate-task` re-sends, or `None` when the flag is off. The flag
@@ -603,12 +613,21 @@ fn restate_task_prompt(restate: bool, prompt: &str) -> Result<Option<&str>> {
 }
 
 /// The turn sent on a retry: the distilled failure summary, plus the restated
-/// task under `--restate-task`.
+/// task under `--restate-task` and, on a segment retry, the segment prompt the
+/// gate is checking (so the worker doesn't drift into later segments' work).
 fn retry_turn(grade: &Scored, policy: RetryPolicy) -> String {
     let mut turn = distill_feedback(grade);
     if let Some(task) = policy.restate_task {
         turn.push('\n');
         turn.push_str(&restated_task(task));
+        if let Some(seg) = policy.restate_segment {
+            turn.push('\n');
+            turn.push_str(&restated_block(
+                "The segment you are working on now, restated verbatim:",
+                SEGMENT_RESTATE_TAG,
+                seg,
+            ));
+        }
     }
     turn
 }
@@ -623,6 +642,9 @@ struct RetryPolicy<'a> {
     /// ahead of every segment after the first. `None` = off (the task rides
     /// only the first turn).
     restate_task: Option<&'a str>,
+    /// The segment prompt a segment retry restates alongside the task (only
+    /// with `restate_task`). `None` outside a segment chain.
+    restate_segment: Option<&'a str>,
 }
 
 /// The `--stall-limit` default. With the default `--retries 1` it never fires;
@@ -638,6 +660,7 @@ impl RetryPolicy<'_> {
             retries,
             stall_limit: DEFAULT_STALL_LIMIT,
             restate_task: None,
+            restate_segment: None,
         }
     }
 }
@@ -1500,7 +1523,11 @@ fn drive_segments_inner(
         } else {
             seg.prompt.clone()
         };
-        let (grade, rounds) = drive_to_grade(driver, worker_i, id, &turn, &seg.gate, retries)?;
+        let seg_retries = RetryPolicy {
+            restate_segment: Some(&seg.prompt),
+            ..retries
+        };
+        let (grade, rounds) = drive_to_grade(driver, worker_i, id, &turn, &seg.gate, seg_retries)?;
         seg_outcomes.push(SegmentOutcome {
             name: seg.name.clone(),
             passed: grade.passed,
@@ -2030,6 +2057,7 @@ pub(crate) fn dispatch(resolved: &Pillbox, opts: DispatchOpts) -> Result<()> {
         retries: opts.retries,
         stall_limit: opts.stall_limit,
         restate_task,
+        restate_segment: None,
     };
     let mut verdict = run_dispatch_with(
         &driver,
@@ -2653,6 +2681,7 @@ mod tests {
             retries,
             stall_limit,
             restate_task: None,
+            restate_segment: None,
         };
         drive_one_with(d, 0, "w0".into(), "task", policy, &reward(), None)
     }
@@ -2927,7 +2956,7 @@ mod tests {
 
     /// The span between the delimiters `restated_task` chose for `task`.
     fn task_inside<'a>(block: &'a str, task: &str) -> &'a str {
-        let (open, close) = restate_delimiters(task);
+        let (open, close) = restate_delimiters(TASK_RESTATE_TAG, task);
         block
             .split_once(&format!("{open}\n"))
             .and_then(|(_, rest)| rest.split_once(&format!("\n{close}")))
@@ -3032,21 +3061,31 @@ mod tests {
         )]);
         run_restate(&d, restate_policy(1, true), Some(&segs));
         let sent = d.sent.borrow();
-        let retry = format!(
-            "{}\n{}",
-            distill_feedback(&mock_fail(0.0)),
-            restated_task(TASK)
-        );
+        // A segment retry restates the task AND the segment being retried, so
+        // the worker is pointed back at this checkpoint, not the whole task.
+        let retry = |seg: &str| {
+            format!(
+                "{}\n{}\n{}",
+                distill_feedback(&mock_fail(0.0)),
+                restated_task(TASK),
+                restated_block(
+                    "The segment you are working on now, restated verbatim:",
+                    SEGMENT_RESTATE_TAG,
+                    seg
+                )
+            )
+        };
         assert_eq!(
             *sent,
             vec![
                 // Segment 1 already carries the task: byte-identical to off.
                 format!("{TASK}\n\ndo a"),
-                retry.clone(),
+                retry("do a"),
                 format!("{}\ndo b", restated_task(TASK)),
-                retry,
+                retry("do b"),
             ]
         );
+        assert!(sent[1].contains("<current-segment>\ndo a\n</current-segment>"));
         for turn in sent.iter() {
             assert_eq!(turn.matches(TASK).count(), 1, "task exactly once: {turn:?}");
         }

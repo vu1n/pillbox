@@ -83,7 +83,7 @@ impl TextRequestV2 {
         ensure!(
             matches!(
                 self.agent.harness.as_str(),
-                "codex" | "claude_code" | "pi" | "opencode"
+                "codex" | "claude_code" | "pi" | "opencode" | "cursor_agent"
             ),
             "unknown text harness"
         );
@@ -149,7 +149,8 @@ pub(crate) fn execute(
 ) -> Result<Outcome> {
     let resolved = resolve(pb, request);
     let (lowered, runner_image_id) = match resolved {
-        Ok(resolved) => resolved,
+        Ok(Resolved::Codex(lowered, runner_image_id)) => (lowered, runner_image_id),
+        Ok(Resolved::Cursor(lowered)) => return execute_cursor(pb, request, owner, lowered),
         Err(rejection) => return unresolved(pb, request, owner, rejection),
     };
     match text::execute_with(pb, &lowered, owner, false) {
@@ -204,29 +205,135 @@ struct Rejection {
     error: anyhow::Error,
 }
 
-fn resolve(
-    pb: &Pillbox,
-    request: &TextRequestV2,
-) -> std::result::Result<(TextRequest, String), Rejection> {
-    // Only Codex has a tool-free text driver today. The other harnesses are valid
-    // selections that this build cannot run, which is a rejection, not a bad request.
-    if request.agent.harness != "codex" {
-        return Err(Rejection {
+enum Resolved {
+    Codex(Box<TextRequest>, String),
+    Cursor(super::cursor_text::Lowered),
+}
+
+fn resolve(pb: &Pillbox, request: &TextRequestV2) -> std::result::Result<Resolved, Rejection> {
+    // Harnesses without a tool-free text driver are valid selections this build
+    // cannot run, which is a rejection, not a bad request.
+    match request.agent.harness.as_str() {
+        "codex" => {
+            let runner_image_id = runner_image_id(pb).map_err(|error| Rejection {
+                code: "runtime_unavailable",
+                error,
+            })?;
+            let lowered = request
+                .codex_request(runner_image_id.clone())
+                .map_err(|error| Rejection {
+                    code: "runtime_rejected",
+                    error,
+                })?;
+            Ok(Resolved::Codex(Box::new(lowered), runner_image_id))
+        }
+        "cursor_agent" => super::cursor_text::resolve_selection(
+            &request.agent.model,
+            &request.agent.reasoning_effort,
+            runner_image_id(pb),
+        )
+        .map(Resolved::Cursor)
+        .map_err(|(code, error)| Rejection { code, error }),
+        _ => Err(Rejection {
             code: "runtime_rejected",
             error: anyhow::anyhow!("no text driver for harness {}", request.agent.harness),
-        });
+        }),
     }
-    let runner_image_id = runner_image_id(pb).map_err(|error| Rejection {
-        code: "runtime_unavailable",
-        error,
-    })?;
-    let lowered = request
-        .codex_request(runner_image_id.clone())
-        .map_err(|error| Rejection {
-            code: "runtime_rejected",
-            error,
-        })?;
-    Ok((lowered, runner_image_id))
+}
+
+fn execute_cursor(
+    pb: &Pillbox,
+    request: &TextRequestV2,
+    owner: &mut OwnedInvocation,
+    lowered: super::cursor_text::Lowered,
+) -> Result<Outcome> {
+    // Setup failures seal a closed record. `Err` is reserved for an unconfirmed
+    // VM teardown, and this path does not start a VM.
+    let (stage, code, message) = match cursor_credentials_ready(pb) {
+        Ok(ready) => {
+            let admission = super::cursor_text::admit(ready);
+            (
+                admission.stage(),
+                admission.code(),
+                admission.evidence_message().to_string(),
+            )
+        }
+        Err(error) => ("credentials", "runtime_unavailable", format!("{error:#}")),
+    };
+    let session_ref = record_cursor_evidence(
+        pb,
+        request,
+        &owner.record().request_hash,
+        &lowered,
+        stage,
+        &message,
+    );
+    let session_json = session_ref.and_then(|reference| serde_json::to_value(reference).ok());
+    Ok(Outcome::Failed(super::cursor_text::failure_detail(
+        &request.invocation_id,
+        &owner.record().request_hash,
+        code,
+        stage,
+        session_json.as_ref(),
+        None,
+    )))
+}
+
+/// Session evidence for a cursor_agent refusal. A failure to open the log omits
+/// `session_ref`; the message is not copied into the failure record.
+fn record_cursor_evidence(
+    pb: &Pillbox,
+    request: &TextRequestV2,
+    request_hash: &str,
+    lowered: &super::cursor_text::Lowered,
+    stage: &str,
+    message: &str,
+) -> Option<super::EvidenceRef> {
+    let mut evidence = ExecutionEvidence::start_text(
+        pb,
+        &request.session_ref.session_id,
+        &request.invocation_id,
+        json!({
+            "request_hash": request_hash,
+            "adapter_revision": ADAPTER_REVISION,
+            "agent": request.agent,
+            "launch": super::cursor_text::launch_plan(lowered, &request.rendered_input),
+        }),
+    )
+    .ok()?;
+    let _ = evidence.append(Payload::Custom(Custom {
+        name: "text.execution.failed".into(),
+        payload: Some(json!({"error": message, "stage": stage})),
+    }));
+    crate::events::emit_session_event(
+        pb,
+        crate::events::EventType::SessionFailed {
+            reason: format!("{stage}: {message}"),
+            exit_code: Some(1),
+            trace_path: None,
+            result_snapshot: None,
+        },
+        &request.session_ref.session_id,
+        None,
+    );
+    Some(evidence.reference())
+}
+
+fn cursor_credentials_ready(pb: &Pillbox) -> Result<bool> {
+    let spec = crate::agents::lookup("text", "cursor")?;
+    // Read path only. `home_dir` creates the auth directory, and a missing
+    // credential must not mint one.
+    let sentinel = spec
+        .auth_pillbox(pb)
+        .subdir_path("auth")
+        .join(spec.auth_id)
+        .join(spec.cred_sentinel)
+        .is_file();
+    let stored = crate::secrets::read_inherited(pb, "CURSOR_API_KEY")?;
+    Ok(super::cursor_text::credentials_ready(
+        sentinel,
+        stored.as_ref().map(|(value, _)| value.as_str()),
+    ))
 }
 
 /// The immutable id of the runner image this pillbox is configured to use.
@@ -343,7 +450,7 @@ mod tests {
 
     #[test]
     fn every_pillbox_harness_is_a_valid_selection() {
-        for harness in ["codex", "claude_code", "pi", "opencode"] {
+        for harness in ["codex", "claude_code", "pi", "opencode", "cursor_agent"] {
             request(harness, "any-model").validate().unwrap();
         }
         assert!(request("custom", "any-model").validate().is_err());

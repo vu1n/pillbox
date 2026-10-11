@@ -30,7 +30,7 @@ rebuild silently reuses the stale layer instead of pulling the newer agent.
 |---|---|---|---|
 | claude | native installer from `claude.ai/install.sh` (`claude install <ver>`) | `CLAUDE_VERSION` | yes — npm `@anthropic-ai/claude-code` (versions match the native release) |
 | codex | native installer from `chatgpt.com/codex/install.sh`; complete native package preserved under `/opt/codex/packages/standalone/releases/<version>` | `CODEX_VERSION` | yes — github releases (`rust-v<ver>`) |
-| cursor | official `cursor.com/install` artifact | `CURSOR_AGENT_VERSION` | no — resolved from the official installer by `build-runner.sh --update` |
+| cursor | official `cursor.com/install` artifact (`agent` / `cursor-agent`) | `CURSOR_AGENT_VERSION` | no — resolved from the official installer by `build-runner.sh --update` |
 | amp | `npm i -g @ampcode/cli@<pinned>` | `AMP_VERSION` | no — timestamp+sha versions defeat semver; bump by hand |
 | opencode | `npm i -g @opencode/cli@<pinned>` (OpenCode 2; `opencode-ai` is the 1.x line) | `OPENCODE_VERSION` | yes — npm `@opencode/cli` |
 | pi | `npm i -g @earendil-works/pi-coding-agent@<pinned>` | `PI_VERSION` | yes — npm |
@@ -42,6 +42,11 @@ require a separate adapter. Its Python kernel dependencies are not pre-provision
 workflows using that kernel still need an explicit setup step and network access.
 The complete native release lives outside the runtime HOME so its assets survive
 home-directory mounts.
+
+`pillbox.text/2` harness `cursor_agent` targets this cursor bundle. Execute
+does not complete a turn, so it does not yet record `harness_version`. A
+completed record has to use the string `agent --version` prints, not the
+`CURSOR_AGENT_VERSION` build arg.
 
 The October 4 refresh pins Claude 2.1.289, Codex 0.160.0, Cursor
 2026.10.01-e373342, Amp 0.0.1791091069-gb9917f, OpenCode 1.18.34, Pi 1.0.2,

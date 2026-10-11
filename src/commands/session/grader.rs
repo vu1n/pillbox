@@ -133,6 +133,37 @@ const GRADER_STARTED_MARKER: &str = "\u{1e}PBSTART";
 #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) const GRADER_STARTED_PRINTF: &str = r"printf '\n\036PBSTART\n'";
 
+/// `sitecustomize.py` for an unprivileged (dropped) grader. With
+/// `PYTHONSAFEPATH=1` Python no longer puts the cwd or script dir FIRST on
+/// `sys.path`, so a worker's `pluggy.py`/`json.py` can't shadow the test
+/// runner or the stdlib; this puts that directory back at the END, so the
+/// project still imports from the workspace the way `python3 -m pytest` or
+/// `python3 script.py` expects. No `;` or `'` (it rides a `'…'` shell string
+/// in an `&&` chain).
+const PY_BOOTSTRAP: &str = r#"import os
+import sys
+_a = sys.argv[0] if sys.argv else ""
+_d = os.getcwd() if _a in ("", "-c", "-m") else os.path.dirname(os.path.abspath(_a))
+if _d not in sys.path:
+    sys.path.append(_d)
+"#;
+
+/// Where the guest writes [`PY_BOOTSTRAP`]: root-owned, so `nobody` can't edit it.
+const PY_BOOTSTRAP_DIR: &str = "/tmp/.pillbox-py";
+
+/// Guest setup that runs as root right before a grader drops to `nobody`: the
+/// grader env (`HOME`, no bytecode, the Python bootstrap). An `&&` chain with
+/// no `;`, so the caller's `mount && cd &&` prefix still gates the marker.
+#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+pub(crate) fn dropped_grader_setup() -> String {
+    format!(
+        "export HOME=/tmp PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PYTHONPATH={PY_BOOTSTRAP_DIR} \
+         && mkdir -p {PY_BOOTSTRAP_DIR} && printf '%s' {} > {PY_BOOTSTRAP_DIR}/sitecustomize.py \
+         && chmod 755 {PY_BOOTSTRAP_DIR} && chmod 644 {PY_BOOTSTRAP_DIR}/sitecustomize.py",
+        sh_quote(PY_BOOTSTRAP)
+    )
+}
+
 /// Strip the grader microVM's console output down to what the grader printed.
 /// No marker means the VM failed before the grader ran (no boot, no mount, a
 /// setup step aborted) — an error, never a failing grade, so an unavailable VM
@@ -393,6 +424,58 @@ mod tests {
             ("All tests pass".to_string(), "pytest -q".to_string())
         );
         assert_eq!(r[1].1, "grep -q def f.py");
+    }
+
+    #[test]
+    fn python_bootstrap_stops_workspace_shadowing_but_keeps_project_imports() {
+        let py = |args: &[&str], dir: &Path, env: bool, boot: &Path| {
+            let mut c = std::process::Command::new("python3");
+            c.args(args).current_dir(dir);
+            if env {
+                c.env("PYTHONSAFEPATH", "1").env("PYTHONPATH", boot);
+            }
+            c.output().map(|o| o.status.code().unwrap_or(-1))
+        };
+        let ver = std::process::Command::new("python3")
+            .args(["-c", "import sys; print(sys.version_info >= (3, 11))"])
+            .output();
+        if !matches!(&ver, Ok(o) if String::from_utf8_lossy(&o.stdout).trim() == "True") {
+            eprintln!("skip: needs python3 >= 3.11 (PYTHONSAFEPATH)");
+            return;
+        }
+        let boot = tempfile::tempdir().unwrap();
+        std::fs::write(boot.path().join("sitecustomize.py"), PY_BOOTSTRAP).unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        // A worker shadow of a stdlib module the "runner" imports.
+        std::fs::write(ws.path().join("json.py"), "raise SystemExit(0)\n").unwrap();
+        std::fs::create_dir_all(ws.path().join("mypkg")).unwrap();
+        std::fs::write(ws.path().join("mypkg/__init__.py"), "X = 1\n").unwrap();
+        std::fs::create_dir_all(ws.path().join("tools")).unwrap();
+        std::fs::write(ws.path().join("tools/helper.py"), "Y = 2\n").unwrap();
+        std::fs::write(ws.path().join("tools/run.py"), "import helper\n").unwrap();
+        let shadow = ["-m", "json.tool", "/nonexistent-input"];
+        assert_eq!(
+            py(&shadow, ws.path(), false, boot.path()).unwrap(),
+            0,
+            "the shadow works without the bootstrap"
+        );
+        assert_ne!(
+            py(&shadow, ws.path(), true, boot.path()).unwrap(),
+            0,
+            "the real json.tool ran"
+        );
+        assert_eq!(
+            py(&["-c", "import mypkg"], ws.path(), true, boot.path()).unwrap(),
+            0
+        );
+        assert_eq!(
+            py(&["tools/run.py"], ws.path(), true, boot.path()).unwrap(),
+            0,
+            "script dir still importable"
+        );
+        let setup = dropped_grader_setup();
+        assert!(!setup.contains(';'), "{setup}");
+        assert!(setup.contains("PYTHONSAFEPATH=1"), "{setup}");
     }
 
     #[test]

@@ -110,6 +110,12 @@ What protection does **not** cover, so write the reward around it:
   `--protect` the manifest when the task doesn't need to edit it.
 - **Tools resolved from the workspace** — `node_modules/.bin/*`, a `.venv` — are
   worker-controlled.
+- **Worker code that runs during the grade** (`build.rs`, an earlier rubric
+  criterion that runs project code) can leave state for later steps: files under
+  `HOME=/tmp` (`$CARGO_HOME/config.toml`), build output, or a protected name the
+  bookmark doesn't have (a new root `conftest.py`). Prefer one command that builds
+  and tests together, or a `--grader-files` check that doesn't run project code
+  first.
 - **Inline tests** (`#[cfg(test)]` modules in source files) aren't paths.
 - **Tests the worker writes under a protected path are removed** before grading,
   like any other edit there. A reward or gate has to check tests that exist on
@@ -118,11 +124,17 @@ What protection does **not** cover, so write the reward around it:
   match. For a task whose job is writing the tests, use `--no-default-protect`.
 
 Protected paths then lose every write bit, owner included, and the rest of the
-copy becomes world-writable. The grader runs as `nobody` (`--drop-privileges`),
+copy becomes world-writable. Every directory on the way to a protected path
+(the tree root, `src/` holding `foo_test.rs`) also gets the sticky bit, so code
+running during the grade can still create files there but can't rename or
+unlink the restored entries. The grader runs as `nobody` (`--drop-privileges`),
 because the virtiofs server writes as the host user and a root guest could
 `chmod` the lock off and let `build.rs` rewrite the tests before they compile.
 `PYTHONDONTWRITEBYTECODE` is set so pytest does not need to write `__pycache__`
-into a locked `tests/`. `--no-default-protect` with no `--protect` leaves the
+into a locked `tests/`. `PYTHONSAFEPATH=1` plus a root-owned `sitecustomize.py`
+move the cwd (or script dir) from the front of `sys.path` to the end, so a
+worker's `pluggy.py` or `json.py` can't shadow the test runner or the stdlib,
+while the project still imports from the workspace. `--no-default-protect` with no `--protect` leaves the
 tree alone and runs the grader as root, the opt-out.
 
 The copy is removed after the grade. The winner pull still comes from the worker's

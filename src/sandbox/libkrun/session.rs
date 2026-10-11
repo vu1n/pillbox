@@ -1891,7 +1891,8 @@ pub(super) fn grade_exec(cmd: &str, drop_privileges: bool) -> String {
         // `&&` all the way: the caller prefixes `mount && cd &&` this string, and
         // a `;` would let the marker (and the grader) run when the mount failed.
         format!(
-            "export HOME=/tmp PYTHONDONTWRITEBYTECODE=1 && command -v runuser >/dev/null && {started} && runuser -u nobody --preserve-environment -- sh -c {}",
+            "{} && command -v runuser >/dev/null && {started} && runuser -u nobody --preserve-environment -- sh -c {}",
+            crate::commands::session::dropped_grader_setup(),
             super::shell_quote(cmd)
         )
     } else {
@@ -1947,7 +1948,8 @@ pub(crate) fn score_in_sandbox(
             // abort a failing command in the middle of an AND-list) never looks
             // like the grader started.
             format!(
-                "export HOME=/tmp PYTHONDONTWRITEBYTECODE=1 && command -v runuser >/dev/null && {started}; set +e; runuser -u nobody --preserve-environment -- sh -c {quoted}",
+                "{setup} && command -v runuser >/dev/null && {started}; set +e; runuser -u nobody --preserve-environment -- sh -c {quoted}",
+                setup = crate::commands::session::dropped_grader_setup(),
                 started = crate::commands::session::GRADER_STARTED_PRINTF,
                 quoted = shell_quote(cmd),
             )
@@ -2726,6 +2728,7 @@ mod tests {
             "a semicolon before the marker breaks the mount && chain: {script}"
         );
         assert!(script.contains("PYTHONDONTWRITEBYTECODE=1"), "{script}");
+        assert!(script.contains("PYTHONSAFEPATH=1"), "{script}");
         assert!(script.contains("sh -c 'sh tests/check.sh'"), "{script}");
         assert!(!grade_exec("true", false).contains("runuser"));
     }

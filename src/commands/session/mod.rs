@@ -22,7 +22,7 @@ mod grader;
 mod stream;
 
 #[cfg(feature = "libkrun")]
-pub(crate) use grader::GRADER_STARTED_PRINTF;
+pub(crate) use grader::{dropped_grader_setup, GRADER_STARTED_PRINTF};
 
 /// Pid file a detached §0 producer ([`run_detached_tailer`]) writes in the session
 /// dir, so teardown can SIGTERM it and live readers can tell a producer is keeping

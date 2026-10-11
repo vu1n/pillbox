@@ -440,14 +440,25 @@ fn relax_dirs(dir: &Path, saved: &mut Vec<(PathBuf, u32)>) -> Result<()> {
 /// everything else becomes world-writable so the unprivileged grader can
 /// emit build output. Symlinks are not followed, so a protected link cannot
 /// change the mode of the file it names.
+///
+/// Every directory on the way to a protected entry also gets the sticky bit:
+/// its own write bit stays (build output can land there), but `nobody` can no
+/// longer rename or unlink an entry it doesn't own, so worker code running
+/// during the grade (`build.rs`) can't move a restored `tests/` aside and put
+/// a passing one in its place. Only those ancestors: a sticky `target/` would
+/// stop the build replacing artifacts the host user owns.
 fn lock_grade_tree(root: &Path, set: &ProtectSet) -> Result<()> {
     if set.is_empty() {
         return Ok(());
     }
-    lock_node(root, root, set)
+    let mut sticky = BTreeSet::new();
+    for top in collect(root, set)?.tops {
+        sticky.extend(top.ancestors().skip(1).map(Path::to_path_buf));
+    }
+    lock_node(root, root, set, &sticky)
 }
 
-fn lock_node(root: &Path, path: &Path, set: &ProtectSet) -> Result<()> {
+fn lock_node(root: &Path, path: &Path, set: &ProtectSet, sticky: &BTreeSet<PathBuf>) -> Result<()> {
     let meta =
         std::fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
     let ft = meta.file_type();
@@ -460,6 +471,8 @@ fn lock_node(root: &Path, path: &Path, set: &ProtectSet) -> Result<()> {
     let mode = if ft.is_dir() {
         if covered {
             0o555
+        } else if sticky.contains(rel) {
+            0o1777
         } else {
             0o777
         }
@@ -480,7 +493,7 @@ fn lock_node(root: &Path, path: &Path, set: &ProtectSet) -> Result<()> {
     }
     if ft.is_dir() {
         for entry in std::fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
-            lock_node(root, &entry?.path(), set)?;
+            lock_node(root, &entry?.path(), set, sticky)?;
         }
     }
     Ok(())
@@ -495,9 +508,13 @@ pub(crate) const GRADER_FILES_DIR: &str = ".pillbox-grader";
 /// Copy the operator's hidden grader files into `tree` at [`GRADER_FILES_DIR`],
 /// replacing anything there. Symlinks in `src` are recreated, not followed.
 pub(crate) fn inject_grader_files(tree: &Path, src: &Path) -> Result<()> {
+    // Resolve a symlinked DIR itself: copying the link would leave a host path
+    // (or a link relative to the grade tree) that doesn't exist in the VM.
+    let src = std::fs::canonicalize(src)
+        .with_context(|| format!("resolve grader files {}", src.display()))?;
     let dst = tree.join(GRADER_FILES_DIR);
     force_remove(&dst)?;
-    copy_node(src, &dst).with_context(|| format!("inject grader files from {}", src.display()))
+    copy_node(&src, &dst).with_context(|| format!("inject grader files from {}", src.display()))
 }
 
 /// A scrubbed, protected-path-restored copy of a worker's workspace, removed on
@@ -853,6 +870,30 @@ mod tests {
     }
 
     #[test]
+    fn ancestors_of_protected_paths_are_sticky_and_build_dirs_are_not() {
+        let (_t, base, worker) = base_and_copy();
+        write(&base, "src/foo_test.rs", "#[test] fn t() {}\n");
+        write(&worker, "src/foo_test.rs", "#[test] fn t() {}\n");
+        write(&worker, "target/debug/out.bin", "x");
+        let tree = GradeTree::prepare(&worker, &base, &defaults(), None).unwrap();
+        let mode = |rel: &str| {
+            fs::symlink_metadata(tree.path().join(rel))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+        // The namespaces holding protected entries: no rename/unlink by nobody.
+        assert_eq!(mode(""), 0o1777, "tree root holds tests/ and .github/");
+        assert_eq!(mode("src"), 0o1777, "src/ holds foo_test.rs");
+        assert_eq!(mode("pkg"), 0o1777, "pkg/ holds pkg/tests/");
+        // Build output stays plain world-writable.
+        assert_eq!(mode("target"), 0o777);
+        assert_eq!(mode("target/debug"), 0o777);
+        assert_eq!(mode("tests"), 0o555);
+    }
+
+    #[test]
     fn grader_files_are_injected_locked_and_replace_a_worker_copy() {
         let (t, base, worker) = base_and_copy();
         let hidden = t.path().join("hidden");
@@ -878,6 +919,13 @@ mod tests {
             !base.join(GRADER_FILES_DIR).exists() && worker.join(GRADER_FILES_DIR).exists(),
             "base and live workspace are left alone"
         );
+        // A symlink to the grader dir is copied as its contents, not as a link.
+        let link = t.path().join("hidden-link");
+        std::os::unix::fs::symlink(&hidden, &link).unwrap();
+        let tree = GradeTree::prepare(&worker, &base, &set, Some(&link)).unwrap();
+        let dir = tree.path().join(GRADER_FILES_DIR);
+        assert!(fs::symlink_metadata(&dir).unwrap().file_type().is_dir());
+        assert!(dir.join("check.sh").is_file());
     }
 
     fn mode_of(path: &Path) -> u32 {

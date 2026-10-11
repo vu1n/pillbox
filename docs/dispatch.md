@@ -161,9 +161,10 @@ marker only after the workspace is mounted, and a missing marker (VM won't boot,
 mount fails) fails that worker as `errored`. There is no host fallback. A build
 without the `libkrun` feature is a usage error (exit 2) before any worker forks.
 
-On macOS, the grade tree also drops the `user.containers.override_stat` xattr
-from every entry, so a worker's guest `chmod` or a root-owned setuid file cannot
-outlive the lock: the grader VM sees the locked backing modes (a file keeps the
+On macOS, the grade tree also drops every xattr from every entry, including
+`user.containers.override_stat` and any `security.capability`, so a worker's
+guest `chmod`, a root-owned setuid file or a file capability cannot outlive the
+lock: the grader VM sees the locked backing modes (a file keeps the
 exec bit the worker gave it).
 
 **Each grade has a deadline** (default 1800s, `PILLBOX_GRADE_TIMEOUT` to

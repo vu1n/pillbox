@@ -709,7 +709,7 @@ fn lock_node(root: &Path, path: &Path, set: &ProtectSet, sticky: &BTreeSet<PathB
         };
         // Removing a user xattr needs write access to the inode.
         chmod(mode | 0o700)?;
-        clear_guest_override(path)?;
+        clear_guest_metadata(path)?;
         chmod(mode)?;
     }
     if ft.is_dir() {
@@ -755,33 +755,70 @@ fn guest_override_mode(path: &Path) -> Option<u32> {
     u32::from_str_radix(text.split(':').nth(2)?, 8).ok()
 }
 
-/// Drop `path`'s guest stat override, so the grader VM sees the locked backing
-/// mode. Fails closed on anything but "not set" or "xattrs unsupported here".
-fn clear_guest_override(path: &Path) -> Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+/// Drop every extended attribute on `path`: the guest stat override (so the
+/// grader VM sees the locked backing mode) and anything else the guest can map
+/// to metadata, such as `security.capability` file capabilities a worker set,
+/// which would hand the `nobody` grader `CAP_DAC_OVERRIDE`. Nothing a grade
+/// needs lives in an xattr. Fails closed on anything but "already gone" or
+/// "xattrs unsupported here"; Linux SELinux labels are left alone.
+fn clear_guest_metadata(path: &Path) -> Result<()> {
+    let c_path = CString::new(path.as_os_str().as_bytes())
         .with_context(|| format!("path with NUL {}", path.display()))?;
-    #[cfg(target_os = "macos")]
-    let rc = unsafe {
-        libc::removexattr(
-            c_path.as_ptr(),
-            GUEST_OVERRIDE_XATTR.as_ptr(),
-            libc::XATTR_NOFOLLOW,
-        )
-    };
-    #[cfg(not(target_os = "macos"))]
-    let rc = unsafe { libc::lremovexattr(c_path.as_ptr(), GUEST_OVERRIDE_XATTR.as_ptr()) };
-    if rc == 0 {
-        return Ok(());
-    }
-    let err = std::io::Error::last_os_error();
     #[cfg(target_os = "macos")]
     let absent = libc::ENOATTR;
     #[cfg(not(target_os = "macos"))]
     let absent = libc::ENODATA;
-    match err.raw_os_error() {
+    let fail = |err: std::io::Error| match err.raw_os_error() {
         Some(code) if code == absent || code == libc::ENOTSUP => Ok(()),
         _ => Err(err).with_context(|| format!("clear guest metadata on {}", path.display())),
+    };
+    for name in list_xattrs(&c_path).or_else(|e| fail(e).map(|()| Vec::new()))? {
+        if name.as_bytes() == b"security.selinux" {
+            continue;
+        }
+        #[cfg(target_os = "macos")]
+        let rc = unsafe { libc::removexattr(c_path.as_ptr(), name.as_ptr(), libc::XATTR_NOFOLLOW) };
+        #[cfg(not(target_os = "macos"))]
+        let rc = unsafe { libc::lremovexattr(c_path.as_ptr(), name.as_ptr()) };
+        if rc != 0 {
+            fail(std::io::Error::last_os_error())?;
+        }
+    }
+    Ok(())
+}
+
+/// The names of `path`'s extended attributes, not following a symlink.
+fn list_xattrs(path: &CStr) -> std::io::Result<Vec<CString>> {
+    let list = |buf: *mut libc::c_char, len: usize| {
+        #[cfg(target_os = "macos")]
+        let n = unsafe { libc::listxattr(path.as_ptr(), buf, len, libc::XATTR_NOFOLLOW) };
+        #[cfg(not(target_os = "macos"))]
+        let n = unsafe { libc::llistxattr(path.as_ptr(), buf, len) };
+        if n < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(n as usize)
+        }
+    };
+    loop {
+        let size = list(std::ptr::null_mut(), 0)?;
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        let mut buf = vec![0u8; size];
+        match list(buf.as_mut_ptr().cast(), buf.len()) {
+            Ok(n) => {
+                buf.truncate(n);
+                return Ok(buf
+                    .split(|b| *b == 0)
+                    .filter(|n| !n.is_empty())
+                    .filter_map(|n| CString::new(n).ok())
+                    .collect());
+            }
+            // Grew between the two calls: size it again.
+            Err(e) if e.raw_os_error() == Some(libc::ERANGE) => continue,
+            Err(e) => return Err(e),
+        }
     }
 }
 
@@ -1366,9 +1403,31 @@ mod tests {
         // so going through GradeTree would not exercise the clear.
         let _ = &base;
         assert!(set_value(&suid, b"0:0:0104755"));
+        // Any other guest metadata (file capabilities among it) goes too.
+        let other = c"user.pillbox.extra";
+        let c_suid = CString::new(suid.as_os_str().as_bytes()).unwrap();
+        #[cfg(target_os = "macos")]
+        let rc = unsafe {
+            libc::setxattr(
+                c_suid.as_ptr(),
+                other.as_ptr(),
+                b"x".as_ptr().cast(),
+                1,
+                0,
+                0,
+            )
+        };
+        #[cfg(not(target_os = "macos"))]
+        let rc =
+            unsafe { libc::setxattr(c_suid.as_ptr(), other.as_ptr(), b"x".as_ptr().cast(), 1, 0) };
+        assert_eq!(rc, 0);
         assert_eq!(guest_override_mode(&suid), Some(0o104755));
         lock_grade_tree(&worker, &defaults()).unwrap();
         assert_eq!(mode_of(&suid), 0o777, "exec kept, set-ID and owner dropped");
+        assert!(
+            list_xattrs(&c_suid).unwrap().is_empty(),
+            "every xattr cleared from src/lib.rs"
+        );
         for rel in ["", "tests", "tests/check.sh", "src/lib.rs"] {
             let p = worker.join(rel);
             let c = std::ffi::CString::new(p.to_str().unwrap()).unwrap();

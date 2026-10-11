@@ -300,7 +300,7 @@ PILLBOX_BACKEND=libkrun pillbox dispatch \
   --segments rubrics/example-segments.toml \
   -k 3 --temperature 0.7 \
   --rubric rubrics/rust-change.rubric \
-  --grader-files hidden-tests/ \
+  --grader-files ../myapp-hidden-tests/ \
   --agent opencode --json \
   -- "Implement the staged refactor described per segment."
 ```

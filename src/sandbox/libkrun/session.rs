@@ -2049,18 +2049,51 @@ pub(crate) fn score_in_sandbox(
                                               // below, not via `killpg` — same rationale as the foreground run.
     let mut child = cmd.spawn().context("spawn the grader VMM subprocess")?;
     rootfs.preserve();
-    let mut out = String::new();
-    if let Some(mut so) = child.stdout.take() {
-        so.read_to_string(&mut out).ok();
-    }
-    let code = child
-        .wait()
-        .context("await grader VMM")?
-        .code()
-        .unwrap_or(-1);
+    let reader = child.stdout.take().map(|mut so| {
+        std::thread::spawn(move || {
+            let mut out = String::new();
+            so.read_to_string(&mut out).ok();
+            out
+        })
+    });
+    // Worker code runs inside the grade (tests, build scripts), so a hang must
+    // cost this worker its grade, not stall the whole dispatch.
+    let limit = grade_timeout();
+    let deadline = std::time::Instant::now() + limit;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("await grader VMM")? {
+            break Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let out = reader
+        .map(|r| r.join().unwrap_or_default())
+        .unwrap_or_default();
     confirm_vmm_stopped(&spec_file.path().to_string_lossy())?;
     rootfs.remove_stopped()?;
-    Ok((code, out))
+    let Some(status) = status else {
+        bail!(
+            "the grader ran past its {}s deadline and was stopped (set PILLBOX_GRADE_TIMEOUT to change it)",
+            limit.as_secs()
+        );
+    };
+    Ok((status.code().unwrap_or(-1), out))
+}
+
+/// How long one grader VM may run. Override with `PILLBOX_GRADE_TIMEOUT`
+/// (seconds).
+fn grade_timeout() -> std::time::Duration {
+    const DEFAULT_GRADE_TIMEOUT_SECS: u64 = 1800;
+    let secs = std::env::var("PILLBOX_GRADE_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_GRADE_TIMEOUT_SECS);
+    std::time::Duration::from_secs(secs)
 }
 
 /// Reattach to a detached libkrun session: dial the persistent attach socket

@@ -8,7 +8,7 @@
 # Run it (segmentation + best-of-3 over chains):
 #   pillbox dispatch --from-bookmark base --segments rubrics/example-segments.toml \
 #     -k 3 --temperature 0.7 --rubric rubrics/test-pass.rubric \
-#     --grader-files hidden-tests/ \
+#     --grader-files ../hidden-tests/ \
 #     --agent opencode --json -- "Build the tree utilities described per segment."
 #
 # Each segment: prompt XOR prompt_file, and gate_rubric XOR gate_cmd.

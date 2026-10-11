@@ -1662,6 +1662,20 @@ impl<'a> CliDriver<'a> {
     }
 }
 
+/// The project directory `dir` sits in, if any: the nearest ancestor of the cwd
+/// holding `pillbox.toml` or `.git` (else the cwd itself), when the canonical
+/// `dir` is under it.
+fn grader_files_inside_project(dir: &std::path::Path) -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?.canonicalize().ok()?;
+    let project = cwd
+        .ancestors()
+        .find(|a| a.join("pillbox.toml").exists() || a.join(".git").exists())
+        .unwrap_or(&cwd)
+        .to_path_buf();
+    let dir = dir.canonicalize().ok()?;
+    dir.starts_with(&project).then_some(project)
+}
+
 /// The `session score` argv that grades `tree` for worker `id` inside the
 /// one-shot grader microVM.
 // Context: doc://pillbox/optimization-external-substrate-primitives@0001#optimization-external-substrate-primitives — the reward is an external grader's verdict; a worker must not be able to edit or run code outside the VM to change it.
@@ -2177,6 +2191,22 @@ pub(crate) fn dispatch(resolved: &Pillbox, opts: DispatchOpts) -> Result<()> {
             )
             .into());
         }
+        // Hidden only if the bookmark can't carry it: a directory inside the
+        // project ships to every worker's fork with the rest of the tree.
+        if let Some(project) = grader_files_inside_project(dir) {
+            return Err(PillboxError::usage(
+                "dispatch",
+                format!(
+                    "--grader-files {} is inside the project {}, so workers can read it",
+                    dir.display(),
+                    project.display()
+                ),
+            )
+            .with_next(
+                "keep hidden checks outside the project directory, e.g. ../myapp-hidden-tests/",
+            )
+            .into());
+        }
         protect_patterns.push(format!("/{GRADER_FILES_DIR}/"));
     }
     let protect = ProtectSet::new(!opts.no_default_protect, &protect_patterns).map_err(|e| {
@@ -2242,6 +2272,14 @@ pub(crate) fn dispatch(resolved: &Pillbox, opts: DispatchOpts) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grader_files_inside_the_project_are_refused() {
+        // Tests run from the package root, which holds Cargo.toml and .git.
+        assert!(grader_files_inside_project(std::path::Path::new("src")).is_some());
+        let outside = tempfile::TempDir::new().unwrap();
+        assert!(grader_files_inside_project(outside.path()).is_none());
+    }
     use std::cell::RefCell;
 
     fn outcome(

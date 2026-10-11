@@ -123,6 +123,13 @@ What protection does **not** cover, so write the reward around it:
   and tests together, or a `--grader-files` check that doesn't run project code
   first.
 - **Inline tests** (`#[cfg(test)]` modules in source files) aren't paths.
+- **`--grader-files` are hidden from the worker's agent, not from its code.**
+  The reward runs as one user, so worker code it executes (an imported module,
+  `build.rs`) can read `.pillbox-grader/` and print it, and failure feedback
+  carries that output into the retry. Hidden checks stop an agent reading the
+  answer key while it works, not a submission built to exfiltrate it. Dispatch
+  refuses a `--grader-files` directory inside the project, which every worker's
+  fork would already hold.
 - **Tests the worker writes under a protected path are removed** before grading,
   like any other edit there. A reward or gate has to check tests that exist on
   the bookmark or come from `--grader-files`; a segment gate such as
@@ -154,6 +161,10 @@ without the `libkrun` feature is a usage error (exit 2) before any worker forks.
 On macOS, the grade tree also drops the `user.containers.override_stat` xattr
 from every directory and protected entry, so a worker's guest `chmod` cannot
 outlive the lock: the grader VM sees the locked backing modes.
+
+**Each grade has a deadline** (default 1800s, `PILLBOX_GRADE_TIMEOUT` to
+change it). A grader still running then is stopped and that worker is
+`errored`, so one hung test suite can't stall the run.
 
 **The grader VM boots the runner image**, which ships `python3` (no pytest),
 `node`, `git` and core tools — **not** a Rust toolchain or pytest. A reward

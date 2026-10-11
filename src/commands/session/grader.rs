@@ -145,10 +145,25 @@ pub(crate) const GRADER_STARTED_PRINTF: &str = r"printf '\n\036PBSTART\n'";
 /// BEFORE site-packages, so tests import the worker's project even when the
 /// image has some other copy of it installed. No `;` or
 /// `'` (it rides a `'…'` shell string in an `&&` chain).
+#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+fn py_bootstrap() -> String {
+    // Every module the missing-tool check counts as image-provided, plus
+    // pytest's own internals.
+    let runners = RUNNER_TOOL_MODULES
+        .iter()
+        .chain(&["_pytest", "pluggy"])
+        .map(|m| format!("\"{m}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    PY_BOOTSTRAP.replace("RUNNERS", &runners)
+}
+
+/// [`py_bootstrap`]'s template; `RUNNERS` becomes the quoted module list.
+#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 const PY_BOOTSTRAP: &str = r#"import importlib.util
 import os
 import sys
-for _m in ("pytest", "_pytest", "pluggy", "coverage", "hypothesis", "nose2", "tox", "nox", "mypy", "black", "flake8", "pylint", "behave"):
+for _m in (RUNNERS,):
     try:
         if importlib.util.find_spec(_m) is not None:
             __import__(_m)
@@ -171,7 +186,7 @@ for _d in reversed(_ds + [os.getcwd()]):
         sys.path.insert(_at, _d)
 "#;
 
-/// Where the guest writes [`PY_BOOTSTRAP`]: root-owned, so `nobody` can't edit it.
+/// Where the guest writes [`py_bootstrap`]: root-owned, so `nobody` can't edit it.
 const PY_BOOTSTRAP_DIR: &str = "/tmp/.pillbox-py";
 
 /// `runuser` in the Debian runner image. It is in `sbin`, which the grader's
@@ -188,7 +203,7 @@ pub(crate) fn dropped_grader_setup() -> String {
         "export HOME=/tmp PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PYTHONPATH={PY_BOOTSTRAP_DIR} \
          && mkdir -p {PY_BOOTSTRAP_DIR} && printf '%s' {} > {PY_BOOTSTRAP_DIR}/sitecustomize.py \
          && chmod 755 {PY_BOOTSTRAP_DIR} && chmod 644 {PY_BOOTSTRAP_DIR}/sitecustomize.py",
-        sh_quote(PY_BOOTSTRAP)
+        sh_quote(&py_bootstrap())
     )
 }
 
@@ -563,7 +578,7 @@ mod tests {
             return;
         }
         let boot = tempfile::tempdir().unwrap();
-        std::fs::write(boot.path().join("sitecustomize.py"), PY_BOOTSTRAP).unwrap();
+        std::fs::write(boot.path().join("sitecustomize.py"), py_bootstrap()).unwrap();
         let ws = tempfile::tempdir().unwrap();
         // A worker shadow of a stdlib module the "runner" imports.
         std::fs::write(ws.path().join("json.py"), "raise SystemExit(0)\n").unwrap();
@@ -624,7 +639,7 @@ mod tests {
         let setup = dropped_grader_setup();
         assert!(!setup.contains(';'), "{setup}");
         assert!(
-            !PY_BOOTSTRAP.contains(['\'', ';']),
+            !py_bootstrap().contains(['\'', ';']),
             "rides a quoted && chain"
         );
         assert!(setup.contains("PYTHONSAFEPATH=1"), "{setup}");

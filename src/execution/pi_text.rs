@@ -1037,4 +1037,228 @@ mod tests {
             }
         });
     }
+
+    /// Real turns on `zai/glm-5.3-flash`, relayed by [`LocalGuest`] (version and exit
+    /// frames included). z.ai returns no response model, and Prime Agent 0.9.8 prices
+    /// GLM at zero.
+    const PI_LIVE: &str = include_str!("fixtures/pi-1.0.2-zai-live.jsonl");
+    const PRIME_LIVE: &str = include_str!("fixtures/prime-agent-0.9.8-zai-live.jsonl");
+    /// pi with no route to the provider: three retries, then `stopReason: "error"`, exit 0.
+    const PI_NO_EGRESS: &str = include_str!("fixtures/pi-1.0.2-zai-no-egress.jsonl");
+
+    fn frames(capture: &str) -> Vec<Value> {
+        capture
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn live_glm_captures_yield_the_answer_and_usage() {
+        for (capture, version, input, cost) in [
+            (PI_LIVE, "1.0.2", 44, Some(0.00001962)),
+            (PRIME_LIVE, "0.9.8", 895, Some(0.0)),
+        ] {
+            let frames = frames(capture);
+            let answer = answer(&frames, 32_768).unwrap();
+            assert_eq!(answer.text, "pong");
+            assert_eq!(answer.served_model, None);
+            let observed = observe(&frames);
+            assert_eq!(observed.harness_version.as_deref(), Some(version));
+            assert_eq!(observed.exit_code, Some(0));
+            let usage = observed.usage.unwrap();
+            assert_eq!(usage.input_tokens, Some(input));
+            assert_eq!(usage.cost_usd, cost);
+        }
+        let error = answer(&frames(PI_NO_EGRESS), 32_768).unwrap_err();
+        assert!(format!("{error:#}").contains("error"));
+    }
+
+    /// Runs the harness as a local process: the cloud stand-in for the guest when no
+    /// HVF/KVM host can boot one. The VMM's credential swap is done here instead: the
+    /// stub in `home_files` is replaced by the real key before the harness reads it.
+    /// It relays frames the way the guest bridge does (version, stdout, exit).
+    const PASSTHROUGH: [&str; 6] = [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "NO_PROXY",
+        "no_proxy",
+        "SSL_CERT_FILE",
+        "NODE_EXTRA_CA_CERTS",
+    ];
+
+    struct LocalGuest {
+        home: tempfile::TempDir,
+        workspace: tempfile::TempDir,
+        /// Prime Agent keys its daemon socket by `TMPDIR`, which the VM makes private.
+        tmp: tempfile::TempDir,
+        frames: Vec<Value>,
+    }
+
+    impl Guest for LocalGuest {
+        fn run(
+            &mut self,
+            turn: GuestTurn,
+            _limits: Limits,
+            _deadline: Instant,
+            live: &dyn Fn() -> Result<()>,
+            stage: &mut dyn FnMut(&'static str),
+        ) -> Result<GuestOutput> {
+            use std::io::Write;
+            use std::process::{Command, Stdio};
+            live()?;
+            stage("image_prepare");
+            for (path, bytes) in &turn.home_files {
+                let target = self.home.path().join(path);
+                std::fs::create_dir_all(target.parent().unwrap())?;
+                let swapped =
+                    String::from_utf8(bytes.clone())?.replace(&turn.stub_key, &turn.real_key);
+                std::fs::write(target, swapped)?;
+            }
+            stage("guest_prepare");
+            let command = |argv: &[String]| {
+                let mut command = Command::new(&argv[0]);
+                command
+                    .args(&argv[1..])
+                    .current_dir(self.workspace.path())
+                    .env_clear()
+                    .envs(turn.env.iter().cloned())
+                    .env("HOME", self.home.path())
+                    .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+                    .env("LANG", "C.UTF-8")
+                    .env("TMPDIR", self.tmp.path());
+                // The host's egress path stands in for the VMM's: its proxy and CA trust.
+                for name in PASSTHROUGH {
+                    if let Some(value) = std::env::var_os(name) {
+                        command.env(name, value);
+                    }
+                }
+                command
+            };
+            let version = command(&turn.version_argv)
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()?;
+            stage("vmm_spawn");
+            let mut child = command(&turn.argv)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
+            stage("guest_rpc_ready");
+            child.stdin.take().unwrap().write_all(&turn.stdin)?;
+            let output = child.wait_with_output()?;
+            // VM teardown would take Prime Agent's detached daemon with it.
+            let _ = Command::new("pkill")
+                .arg("-f")
+                .arg(self.tmp.path())
+                .status();
+            let mut frames = vec![json!({
+                "type": VERSION_FRAME,
+                "version": String::from_utf8_lossy(&version.stdout).trim(),
+            })];
+            for line in String::from_utf8(output.stdout)?.lines() {
+                if !line.trim().is_empty() {
+                    frames.push(serde_json::from_str(line)?);
+                }
+            }
+            frames.push(json!({"type": EXIT_FRAME, "code": output.status.code()}));
+            self.frames.clone_from(&frames);
+            Ok(GuestOutput {
+                frames,
+                diagnostics: output.stderr,
+                error: None,
+            })
+        }
+    }
+
+    /// One real turn against the real provider, outside a VM. Run with
+    /// `PILLBOX_LIVE_TEXT=1 cargo test pi_text::tests::live_ -- --ignored` with the
+    /// provider's `<PROVIDER>_API_KEY` set and the harness on PATH;
+    /// `PILLBOX_LIVE_CAPTURE_DIR` keeps the relayed frames.
+    fn live_turn(harness: PiHarness) {
+        if std::env::var_os("PILLBOX_LIVE_TEXT").is_none() {
+            return;
+        }
+        let model =
+            std::env::var("PILLBOX_LIVE_MODEL").unwrap_or_else(|_| "zai/glm-5.3-flash".to_owned());
+        let selection = Selection::resolve(harness, &model, "low").unwrap();
+        let key_var = format!("{}_API_KEY", selection.provider.to_uppercase());
+        let key = std::env::var(&key_var).unwrap_or_else(|_| panic!("{key_var} is not set"));
+        let temp = tempfile::tempdir().unwrap();
+        let pb = Pillbox {
+            scope: Scope::Global,
+            state_dir: temp.path().into(),
+            meta: None,
+        };
+        let agent = harness.agent();
+        let path = agent.home_dir(&pb).unwrap().join(agent.cred_sentinel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let auth = json!({selection.provider.as_str(): {"type": "api_key", "key": key}});
+        std::fs::write(path, auth.to_string()).unwrap();
+        let store = InvocationStore::new(&temp.path().join("text-executions")).unwrap();
+        let Claim::Owned(mut owner) = store.claim("chat_live", "sealed").unwrap() else {
+            panic!("fresh invocation")
+        };
+        let mut guest = LocalGuest {
+            home: tempfile::tempdir().unwrap(),
+            workspace: tempfile::tempdir().unwrap(),
+            tmp: tempfile::tempdir().unwrap(),
+            frames: Vec::new(),
+        };
+        let completion = execute(
+            &pb,
+            &Invocation {
+                session_id: "chat_live",
+                invocation_id: "chat_live",
+                rendered_input: "Reply with exactly one word: pong",
+                limits: Limits {
+                    timeout_ms: 180_000,
+                    max_final_text_bytes: 32_768,
+                    max_frame_bytes: 1_048_576,
+                    max_evidence_bytes: 8_388_608,
+                },
+            },
+            &selection,
+            &format!("sha256:{}", "c".repeat(64)),
+            &mut owner,
+            &mut guest,
+        );
+        let capture: String = guest
+            .frames
+            .iter()
+            .map(|frame| format!("{frame}\n"))
+            .collect();
+        assert!(!capture.contains(&key), "the real key reached the stream");
+        if let Some(dir) = std::env::var_os("PILLBOX_LIVE_CAPTURE_DIR") {
+            let file = format!("{}-live.jsonl", harness.name());
+            std::fs::write(std::path::Path::new(&dir).join(file), capture).unwrap();
+        }
+        let completion = completion.unwrap();
+        eprintln!(
+            "{}",
+            json!({
+                "harness": harness.name(),
+                "output_text": completion.output_text,
+                "harness_version": completion.harness_version,
+                "requested_model": completion.requested_model,
+                "served_model": completion.served_model,
+                "usage": completion.usage,
+            })
+        );
+        assert!(!completion.output_text.trim().is_empty());
+        assert!(completion.usage.is_some());
+    }
+
+    #[test]
+    #[ignore = "live: needs PILLBOX_LIVE_TEXT, a provider key and pi on PATH"]
+    fn live_pi_turn() {
+        crate::test_util::with_isolated_home("pi-text-live", || live_turn(PiHarness::Pi));
+    }
+
+    #[test]
+    #[ignore = "live: needs PILLBOX_LIVE_TEXT, a provider key and prime-agent on PATH"]
+    fn live_prime_agent_turn() {
+        crate::test_util::with_isolated_home("pi-text-live", || live_turn(PiHarness::PrimeAgent));
+    }
 }

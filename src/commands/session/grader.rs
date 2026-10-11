@@ -139,7 +139,9 @@ pub(crate) const GRADER_STARTED_PRINTF: &str = r"printf '\n\036PBSTART\n'";
 /// imports whichever test runners the image has (pytest and pluggy among
 /// them) and every installed pytest plugin (`pytest11` entry points) while the
 /// workspace is still off the path, so a worker's `pluggy.py` or
-/// `pytest_cov/` can't replace them either. The cost: a project that IS one
+/// `pytest_cov/` can't replace them either. A runner the image lacks is
+/// pinned to `None` in `sys.modules`, so a worker's `coverage.py` can't stand
+/// in for it and `python3 -m coverage` still reads as a missing tool. The cost: a project that IS one
 /// of those packages is graded against the image's copy, not the worker's.
 /// Then it puts the script dir (if any) and the cwd back AFTER the stdlib but
 /// BEFORE site-packages, so tests import the worker's project even when the
@@ -167,6 +169,8 @@ for _m in (RUNNERS,):
     try:
         if importlib.util.find_spec(_m) is not None:
             __import__(_m)
+        else:
+            sys.modules[_m] = None
     except Exception:
         pass
 try:

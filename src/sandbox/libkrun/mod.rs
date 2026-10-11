@@ -565,16 +565,7 @@ fn cow_clone_and_scrub(src: &Path) -> Result<PathBuf> {
              (filesystem has no reflink support)"
         );
     }
-    // Reuse the canonical walker + denylist; delete what it flags as secret.
-    let plan = crate::workspace::ingest::plan_ingest(&clone)?;
-    for rel in &plan.excluded_secrets {
-        let p = clone.join(rel);
-        let _ = if p.is_dir() {
-            std::fs::remove_dir_all(&p)
-        } else {
-            std::fs::remove_file(&p)
-        };
-    }
+    crate::workspace::ingest::scrub_secrets(&clone)?;
     metadata::prepare_guest_clone_metadata(&clone)?;
     Ok(clone)
 }

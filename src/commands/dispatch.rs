@@ -1623,9 +1623,12 @@ impl WorkerDriver for CliDriver<'_> {
         // Restore the bookmark's snapshot into a fresh temp dir PER grader: a
         // grader may write build output, which must not leak into the next
         // grader's baseline. Never the warm base cache the workers clone from.
+        // Scrub it like a worker's clone, so the baseline is the tree an
+        // untouched worker would be graded on.
         let dir = tempfile::tempdir().context("temp dir for --baseline-check")?;
         let handle = crate::bookmarks::resolve_existing(self.resolved, &self.opts.from_bookmark)?;
         self.resolved.workspace()?.pull(dir.path(), Some(&handle))?;
+        crate::workspace::ingest::scrub_secrets(dir.path())?;
         let (cmd, rubric) = match grader {
             Grader::Cmd(c) => (Some(c.as_str()), None),
             Grader::Rubric(p) => (None, Some(p.as_path())),

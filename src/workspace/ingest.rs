@@ -117,6 +117,22 @@ impl IngestPlan {
     }
 }
 
+/// Delete every path the canonical denylist flags as a secret from `dir`, in
+/// place — the scrub a libkrun worker's workspace clone gets before the agent
+/// runs, and that `dispatch --baseline-check` applies so it grades the same tree.
+pub(crate) fn scrub_secrets(dir: &Path) -> Result<()> {
+    let plan = plan_ingest(dir)?;
+    for rel in &plan.excluded_secrets {
+        let p = dir.join(rel);
+        let _ = if p.is_dir() {
+            std::fs::remove_dir_all(&p)
+        } else {
+            std::fs::remove_file(&p)
+        };
+    }
+    Ok(())
+}
+
 /// Walk `root`, applying the secret denylist, and return the [`IngestPlan`].
 /// Does **not** follow symlinks (they're recorded as included entries with no
 /// size, never traversed — bounds the walk and avoids loops). Secret
@@ -229,6 +245,24 @@ mod tests {
         assert!(!is_secret_dir(".git"));
         assert!(!is_secret_dir("node_modules"));
         assert!(!is_secret_dir("target"));
+    }
+
+    #[test]
+    fn scrub_secrets_deletes_denylisted_paths_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("main.rs"), b"fn main() {}").unwrap();
+        std::fs::write(root.join(".env"), b"SECRET=1").unwrap();
+        std::fs::write(root.join(".env.example"), b"SECRET=").unwrap();
+        std::fs::create_dir_all(root.join(".ssh")).unwrap();
+        std::fs::write(root.join(".ssh/id_ed25519"), b"key").unwrap();
+
+        scrub_secrets(root).unwrap();
+
+        assert!(root.join("main.rs").exists());
+        assert!(root.join(".env.example").exists());
+        assert!(!root.join(".env").exists());
+        assert!(!root.join(".ssh").exists());
     }
 
     #[test]

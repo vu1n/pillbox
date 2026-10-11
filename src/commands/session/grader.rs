@@ -350,8 +350,19 @@ fn missing_tool(spec: &GraderSpec, code: i32, raw: &str) -> Option<String> {
     }
 }
 
-/// [`missing_tool`] for one shell command, its exit code and its output.
+/// [`missing_tool`] for one shell command, its exit code and its output. Each
+/// command of a top-level list counts (`cd backend && pytest` names pytest);
+/// the split ignores quoting, which at worst misses a tool, never invents one.
 fn lead_tool_missing(command: &str, exit: i32, out: &str) -> Option<String> {
+    command
+        .split([';', '|', '&'])
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .find_map(|c| segment_tool_missing(c, exit, out))
+}
+
+/// [`lead_tool_missing`] for one simple command.
+fn segment_tool_missing(command: &str, exit: i32, out: &str) -> Option<String> {
     let mut words = command
         .split_whitespace()
         .skip_while(|w| matches!(*w, "env" | "exec") || is_env_assignment(w));
@@ -622,6 +633,14 @@ mod tests {
             missing_tool(&own, 1, out).is_none(),
             "the worker's own package"
         );
+        let listed = GraderSpec::Cmd("cd backend && python3 -m pytest -q".into());
+        let out = "/usr/bin/python3: No module named pytest";
+        assert!(
+            missing_tool(&listed, 1, out).is_some(),
+            "a tool after a setup step"
+        );
+        let listed = GraderSpec::Cmd("cd crate && cargo test".into());
+        assert!(missing_tool(&listed, 127, "sh: 1: cargo: not found").is_some());
         let worker_module = GraderSpec::Cmd("sh run.sh".into());
         assert!(missing_tool(&worker_module, 1, "python3: No module named app").is_none());
 

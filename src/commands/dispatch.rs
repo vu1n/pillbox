@@ -1662,18 +1662,29 @@ impl<'a> CliDriver<'a> {
     }
 }
 
-/// The project directory `dir` sits in, if any: the nearest ancestor of the cwd
-/// holding `pillbox.toml` or `.git` (else the cwd itself), when the canonical
-/// `dir` is under it.
-fn grader_files_inside_project(dir: &std::path::Path) -> Option<PathBuf> {
-    let cwd = std::env::current_dir().ok()?.canonicalize().ok()?;
-    let project = cwd
-        .ancestors()
-        .find(|a| a.join("pillbox.toml").exists() || a.join(".git").exists())
-        .unwrap_or(&cwd)
-        .to_path_buf();
+/// The project directory `dir` sits in, if any. Candidates: the resolved
+/// pillbox's own directory (the one holding its `pillbox.toml`, whatever the
+/// cwd), and the nearest ancestor of the cwd holding `pillbox.toml` or `.git`
+/// (else the cwd itself) for a run on the global pillbox.
+fn grader_files_inside_project(
+    dir: &std::path::Path,
+    resolved: Option<&std::path::Path>,
+) -> Option<PathBuf> {
     let dir = dir.canonicalize().ok()?;
-    dir.starts_with(&project).then_some(project)
+    let from_cwd = std::env::current_dir()
+        .ok()
+        .and_then(|c| c.canonicalize().ok())
+        .map(|cwd| {
+            cwd.ancestors()
+                .find(|a| a.join("pillbox.toml").exists() || a.join(".git").exists())
+                .unwrap_or(&cwd)
+                .to_path_buf()
+        });
+    resolved
+        .and_then(|p| p.canonicalize().ok())
+        .into_iter()
+        .chain(from_cwd)
+        .find(|project| dir.starts_with(project))
 }
 
 /// The `session score` argv that grades `tree` for worker `id` inside the
@@ -2193,7 +2204,11 @@ pub(crate) fn dispatch(resolved: &Pillbox, opts: DispatchOpts) -> Result<()> {
         }
         // Hidden only if the bookmark can't carry it: a directory inside the
         // project ships to every worker's fork with the rest of the tree.
-        if let Some(project) = grader_files_inside_project(dir) {
+        let source_dir = match &resolved.scope {
+            crate::pillbox::Scope::Project { source_dir, .. } => Some(source_dir.as_path()),
+            crate::pillbox::Scope::Global => None,
+        };
+        if let Some(project) = grader_files_inside_project(dir, source_dir) {
             return Err(PillboxError::usage(
                 "dispatch",
                 format!(
@@ -2276,9 +2291,14 @@ mod tests {
     #[test]
     fn grader_files_inside_the_project_are_refused() {
         // Tests run from the package root, which holds Cargo.toml and .git.
-        assert!(grader_files_inside_project(std::path::Path::new("src")).is_some());
+        assert!(grader_files_inside_project(std::path::Path::new("src"), None).is_some());
         let outside = tempfile::TempDir::new().unwrap();
-        assert!(grader_files_inside_project(outside.path()).is_none());
+        assert!(grader_files_inside_project(outside.path(), None).is_none());
+        // The selected pillbox's directory counts wherever the cwd is.
+        let project = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(project.path().join("hidden")).unwrap();
+        let hidden = project.path().join("hidden");
+        assert!(grader_files_inside_project(&hidden, Some(project.path())).is_some());
     }
     use std::cell::RefCell;
 

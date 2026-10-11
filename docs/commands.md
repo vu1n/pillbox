@@ -603,6 +603,8 @@ spent its time.
 `grok_bot` is not a text/2 harness. Grok Bot is a hosted teammate on a
 Cursor cloud computer, with no headless call that returns one tool-free final
 text, so Pillbox does not register it. A request that names `grok_bot` fails
-admission as an unknown harness. There is no usage mapping: a Bot does not
-report per-run tokens, cost, or a served model. The sources and the blockers
-are in [Grok Bot text driver](grok-bot-text-driver.md).
+admission as an unknown harness. There is no usage mapping. A turn does not
+return token counts or a cost a driver could pass to `usage`, so the key would
+be absent. Account usage analytics show which model served a request, but that
+is not a field on the turn, so `resolved.served_model` would be null. The
+sources and the blockers are in [Grok Bot text driver](grok-bot-text-driver.md).

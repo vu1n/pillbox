@@ -25,8 +25,8 @@ as an unknown harness, the right answer for a harness Pillbox does not have.
 
 Anything that could run headlessly here would be a Grok model behind some
 other harness, not a Grok Bot: either Grok Build (`grok -p`, xAI's official
-CLI, which a separate change covers) or a direct client for the xAI Responses
-API. Calling either of them `grok_bot` would misreport what ran in
+CLI) or a direct client for the xAI Responses API. This repo registers
+neither. Calling either of them `grok_bot` would misreport what ran in
 `resolved.harness`.
 
 ## What Grok Bot is (primary sources)
@@ -38,7 +38,7 @@ API. Calling either of them `grok_bot` would misreport what ran in
 | Where it runs | On a persistent cloud computer in Cursor's cloud, shared by every Bot on the account. Not installable in a runner image or a microVM. | [overview], [computer] |
 | Auth | A paid Cursor plan or a linked SuperGrok subscription, signed in through the app. A webhook key is per routine. No API-key path. | [overview], [webhook] |
 | Output format | Chat messages, voice memos and drafts in the app. No machine-readable stream. | [overview] |
-| Usage or served model | Not reported per run. Usage is a weekly plan allowance. | [overview] |
+| Usage or served model | A turn does not return token counts or a cost. There is no customer-facing model picker. Account usage analytics show the model that served each request, and billing follows that model. That is a dashboard after the fact, not a per-turn payload. | [overview], [security] |
 | Version | Not exposed. The product updates itself in the cloud. | [overview], [computer] |
 | Can all tools be denied | No. Each Bot has a browser, terminal, files and connectors. Auto Review and approvals gate risky actions but do not remove the tools. Local-computer settings "do not prevent the Bot from using its cloud computer." A routine test "does real work. It can change files and use connected plugins." Network allowlists are Enterprise-only and default to allow-all. | [computer], [approvals], [webhook], [security] |
 | State between turns | A Bot keeps memory, files, browser sessions and preferences across sessions by design. | [overview], [bots] |
@@ -61,9 +61,10 @@ driver requirements in the task (resolve, tool-free, one bounded final text,
    neither is enforceable by Pillbox. The vault cannot fence the egress of a
    machine Pillbox does not own (requirement 2). The task says to report this
    rather than weaken `deny_all`.
-3. **No one-prompt, one-final-text call.** The webhook is fire-and-forget,
-   with no response body, completion signal or callback. Getting the answer
-   back would mean scraping the Bot's chat through the app UI (requirement 3).
+3. **No one-prompt, one-final-text call.** A webhook `POST` is accepted with
+   HTTP 200 when a run starts. The routines page does not document a response
+   body that carries the answer, a completion signal, or a callback. The
+   result is in the Bot's chat (requirement 3).
 4. **Not a sealed, stateless turn.** Huddles owns the conversation and sends
    one sealed rendered input. A Bot folds every turn into its own memory and
    shares a computer, logins and files with the account's other Bots. The
@@ -73,9 +74,14 @@ driver requirements in the task (resolve, tool-free, one bounded final text,
    SuperGrok account plus per-routine webhook keys. There is no
    `pillbox:*:default` credential the vault can release for one invocation
    with a bounded egress host list (requirements 1 and 6).
-6. **No usage, served model or version.** Nothing per run feeds `usage.rs`.
-   `usage` and `served_model` could be omitted honestly, but `harness_version`
-   has to be observed and cannot be (requirements 4 and 5).
+6. **No per-turn usage, served model, or version.** A turn returns no token
+   counts and no cost, so `usage` would be absent, which is how text/2 treats
+   a harness that reports nothing. `resolved.served_model` is a different
+   shape: the record always includes it, and it is null unless the turn names
+   the model. Account usage analytics show the serving model later, including
+   failovers, and there is no customer-facing model picker, so a requested
+   `agent.model` cannot be checked or reported at `resolve`. No
+   `harness_version` is exposed to observe (requirements 1, 4 and 5).
 7. **Idempotency.** text/2 promises at-most-once dispatch per invocation ID.
    A webhook `POST` carries no idempotency key, and a retried `POST` can start
    a second run.
@@ -98,7 +104,8 @@ no tools and no memory writes. With that, the driver would be:
   Fail with `runtime_protocol_error` at `turn` if the answer is empty, over
   `max_final_text_bytes`, or shows any tool call.
 - **`resolved`.** `harness: "grok_bot"`, `harness_version` from the API
-  response, `served_model` only if the API reports it per response.
+  response, and `served_model` set to the model that response names, or null.
+  The key is always present.
 - **`usage`.** A `TurnUsage::from_grok_bot_*` constructor in
   `src/execution/usage.rs`, only if the API reports per-turn tokens or cost.
 
@@ -108,11 +115,11 @@ Until then, the honest Grok options belong to other harnesses.
 
 - **Keep `grok_bot` unregistered** (this change's position) until xAI
   documents a programmatic, tool-free Bot surface.
-- **Grok models in text/2 come through Grok Build.** Grok Build is xAI's
-  official headless CLI (`grok -p`, `--output-format json`, `--tools`,
-  `--disallowed-tools`, `--no-memory`, `--disable-web-search`). It is being
-  added as its own harness in a separate change, which is where a Grok-model
-  text turn belongs.
+- **A Grok model turn belongs on a Grok Build harness, not on `grok_bot`.**
+  Grok Build is xAI's official headless CLI (`grok -p`, `--output-format json`,
+  `--tools`, `--disallowed-tools`, `--no-memory`, `--disable-web-search`; see
+  the CLI reference under Sources). This repo does not register that harness.
+  Whether another change adds it is outside this assessment.
 - **Optional: a direct xAI Responses API harness.** A small in-guest client
   for `POST https://api.x.ai/v1/responses` with no `tools`, keyed by an xAI
   vault provider. `api.x.ai` is already in the libkrun standard egress list.

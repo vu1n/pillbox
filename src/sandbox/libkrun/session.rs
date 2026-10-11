@@ -1901,8 +1901,11 @@ pub(crate) fn score_in_sandbox(
     let (egress, env_extra, script, _grade_ca) = if egress_allow.is_empty() {
         // Mount the workspace, cd in, run the grader with stderr merged to the
         // console. `&&` so a failed mount/cd surfaces; the grader's exit is last.
+        // The start marker is printed only once setup succeeded — the caller
+        // treats its absence as "the grade never ran".
         let script = format!(
-            "mkdir -p /grade && mount -t virtiofs grade /grade && cd /grade && {{ {cmd} ; }} 2>&1"
+            "mkdir -p /grade && mount -t virtiofs grade /grade && cd /grade && {started} && {{ {cmd} ; }} 2>&1",
+            started = crate::commands::session::GRADER_STARTED_PRINTF,
         );
         (None, Vec::new(), script, None)
     } else {
@@ -1923,8 +1926,9 @@ pub(crate) fn score_in_sandbox(
             "exec 2>&1; set -e; {net}; \
              printf '%s' {ca_q} > {GUEST_CA_PATH}; \
              mkdir -p /grade; mount -t virtiofs grade /grade; cd /grade; \
-             set +e; {cmd}",
+             {started}; set +e; {cmd}",
             ca_q = shell_quote(&ca.cert_pem),
+            started = crate::commands::session::GRADER_STARTED_PRINTF,
         );
         let egress = Some(EgressSpec {
             // Only the invoker-declared hosts resolve — the tightest fence (no

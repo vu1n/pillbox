@@ -28,6 +28,7 @@
 //! exercised by the GHOST-004 smoke.
 // Context: doc://pillbox/adr-008-ghost-extraction-trigger@0001#ghost-extraction-trigger
 
+use std::cell::OnceCell;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -43,6 +44,7 @@ use crate::errors::PillboxError;
 use crate::events::blob::BlobStore;
 use crate::events::log::SessionLog;
 use crate::pillbox::Pillbox;
+use crate::workspace::protect::{GradeTree, ProtectSet};
 use crate::workspace::WorkspaceBackend;
 
 /// Per-turn idle timeout (seconds) each worker gets before it's treated as stuck
@@ -164,6 +166,14 @@ pub(crate) struct DispatchOpts {
     pub(crate) critic_policy: String,
     /// `--critic-model`: the critic's model id (`jev-latest`).
     pub(crate) critic_model: String,
+    /// `--protect PATTERN`: extra protected paths, restored from the bookmark
+    /// before every grade (on top of the defaults unless `no_default_protect`).
+    pub(crate) protect: Vec<String>,
+    /// `--no-default-protect`: drop [`crate::workspace::protect::DEFAULT_PROTECTED`].
+    pub(crate) no_default_protect: bool,
+    /// `--grader-egress HOST`: hosts the grader microVM may reach. Empty (the
+    /// default) keeps it offline.
+    pub(crate) grader_egress: Vec<String>,
 }
 
 /// Terminal state of one worker in a dispatch run. Serializes to the snake_case
@@ -1472,27 +1482,122 @@ struct CliDriver<'a> {
     default_agent: String,
     /// Durable dir the winner is pulled into (a TempDir would drop it).
     rundir: PathBuf,
+    /// Paths restored from the bookmark in every grade tree.
+    protect: ProtectSet,
+    /// The bookmark, restored and scrubbed once on the first grade — the source
+    /// protected paths are restored from. Read-only after that.
+    base: OnceCell<tempfile::TempDir>,
 }
 
 impl<'a> CliDriver<'a> {
-    fn new(resolved: &'a Pillbox, opts: &'a DispatchOpts, default_agent: String) -> Result<Self> {
+    fn new(
+        resolved: &'a Pillbox,
+        opts: &'a DispatchOpts,
+        default_agent: String,
+        protect: ProtectSet,
+    ) -> Result<Self> {
         let exe = std::env::current_exe().context("locate the pillbox binary")?;
+        Ok(Self::with_exe(exe, resolved, opts, default_agent, protect))
+    }
+
+    fn with_exe(
+        exe: PathBuf,
+        resolved: &'a Pillbox,
+        opts: &'a DispatchOpts,
+        default_agent: String,
+        protect: ProtectSet,
+    ) -> Self {
         let rundir = std::env::temp_dir().join(format!(
             "pillbox-dispatch-{}",
             uuid::Uuid::now_v7().simple()
         ));
-        Ok(Self {
+        Self {
             exe,
             resolved,
             opts,
             default_agent,
             rundir,
-        })
+            protect,
+            base: OnceCell::new(),
+        }
+    }
+
+    /// Restore `--from-bookmark` into a fresh temp dir and scrub it like a
+    /// worker's clone — never the warm base cache the workers clone from.
+    fn restore_bookmark(&self, purpose: &str) -> Result<tempfile::TempDir> {
+        let dir = tempfile::Builder::new()
+            .prefix("pillbox-dispatch-base-")
+            .tempdir()
+            .with_context(|| format!("temp dir for {purpose}"))?;
+        let handle = crate::bookmarks::resolve_existing(self.resolved, &self.opts.from_bookmark)?;
+        self.resolved.workspace()?.pull(dir.path(), Some(&handle))?;
+        crate::workspace::ingest::scrub_secrets(dir.path())?;
+        Ok(dir)
+    }
+
+    fn base_tree(&self) -> Result<&std::path::Path> {
+        if self.base.get().is_none() {
+            let dir = self.restore_bookmark("the protected-path base")?;
+            let _ = self.base.set(dir);
+        }
+        Ok(self.base.get().expect("base just set").path())
+    }
+
+    fn live_workspace(&self, id: &str) -> Result<PathBuf> {
+        // `.session.workspace` resolves via the session's `LiveSession`
+        // `workspace_path()` — libkrun sessions only.
+        let info = self.capture(&["session".into(), "info".into(), id.into(), "--json".into()])?;
+        let iv: serde_json::Value = serde_json::from_str(&info)
+            .with_context(|| format!("parse `session info --json`: {info:?}"))?;
+        iv["session"]["workspace"]
+            .as_str()
+            .map(PathBuf::from)
+            .context("`session info --json` had no session.workspace (libkrun-only today)")
     }
 
     fn effective_agent(&self, i: usize) -> String {
         effective_worker_agent(self.opts, i, &self.default_agent)
     }
+}
+
+/// The `session score` argv that grades `tree` for worker `id` inside the
+/// one-shot grader microVM.
+// Context: doc://pillbox/optimization-external-substrate-primitives@0001#optimization-external-substrate-primitives — the reward is an external grader's verdict; a worker must not be able to edit or run code outside the VM to change it.
+fn score_args(id: &str, tree: &std::path::Path, grader: &Grader, egress: &[String]) -> Vec<String> {
+    let mut args = vec![
+        "session".into(),
+        "score".into(),
+        id.into(),
+        "--workspace".into(),
+        tree.to_string_lossy().into_owned(),
+        "--in-sandbox".into(),
+    ];
+    for host in egress {
+        args.extend(["--grader-egress".into(), host.clone()]);
+    }
+    args.push("--json".into());
+    args.extend(grader.flags());
+    args
+}
+
+/// Stderr note for a worker whose grade tree had protected paths put back.
+fn reverted_note(id: &str, reverted: &[PathBuf]) -> Option<String> {
+    const SHOWN: usize = 5;
+    if reverted.is_empty() {
+        return None;
+    }
+    let mut list: Vec<String> = reverted
+        .iter()
+        .take(SHOWN)
+        .map(|p| p.display().to_string())
+        .collect();
+    if reverted.len() > SHOWN {
+        list.push(format!("+{} more", reverted.len() - SHOWN));
+    }
+    Some(format!(
+        "pillbox: dispatch: worker {id} changed protected paths; graded with the bookmark's copy: {}",
+        list.join(", ")
+    ))
 }
 
 impl WorkerDriver for CliDriver<'_> {
@@ -1560,31 +1665,21 @@ impl WorkerDriver for CliDriver<'_> {
     }
 
     fn grade(&self, id: &str, grader: &Grader) -> Result<Scored> {
-        // Grade the worker's *live* workspace clone in place (no pull): `session
-        // info --json` exposes its path, `session score --workspace` grades it.
-        // The winner is pulled to a durable dir separately (`pull_winner`).
-        // NOTE: `.session.workspace` resolves via the session's `LiveSession`
-        // `workspace_path()` — libkrun sessions only (docker has no result clone).
-        // Docker dispatch needs a different workspace resolution (see
-        // docs/dispatch.md Deferred); v1 is libkrun-only.
-        let info = self.capture(&["session".into(), "info".into(), id.into(), "--json".into()])?;
-        let iv: serde_json::Value = serde_json::from_str(&info)
-            .with_context(|| format!("parse `session info --json`: {info:?}"))?;
-        let ws = iv["session"]["workspace"]
-            .as_str()
-            .context("`session info --json` had no session.workspace (libkrun-only today)")?
-            .to_string();
-
-        let mut args = vec![
-            "session".into(),
-            "score".into(),
-            id.into(),
-            "--workspace".into(),
-            ws,
-            "--json".into(),
-        ];
-        args.extend(grader.flags());
-        let out = self.capture(&args)?;
+        // Never the live workspace: grade a scrubbed copy with the protected
+        // paths restored from the bookmark, inside the grader microVM. A VM that
+        // can't run fails `session score`, which errors this worker — there is
+        // no host fallback.
+        let ws = self.live_workspace(id)?;
+        let tree = GradeTree::prepare(&ws, self.base_tree()?, &self.protect)?;
+        if let Some(note) = reverted_note(id, &tree.report.reverted) {
+            eprintln!("{note}");
+        }
+        let out = self.capture(&score_args(
+            id,
+            tree.path(),
+            grader,
+            &self.opts.grader_egress,
+        ))?;
         parse_grade(&out)
     }
 
@@ -1620,15 +1715,12 @@ impl WorkerDriver for CliDriver<'_> {
     }
 
     fn grade_baseline(&self, grader: &Grader) -> Result<Scored> {
-        // Restore the bookmark's snapshot into a fresh temp dir PER grader: a
-        // grader may write build output, which must not leak into the next
-        // grader's baseline. Never the warm base cache the workers clone from.
-        // Scrub it like a worker's clone, so the baseline is the tree an
-        // untouched worker would be graded on.
-        let dir = tempfile::tempdir().context("temp dir for --baseline-check")?;
-        let handle = crate::bookmarks::resolve_existing(self.resolved, &self.opts.from_bookmark)?;
-        self.resolved.workspace()?.pull(dir.path(), Some(&handle))?;
-        crate::workspace::ingest::scrub_secrets(dir.path())?;
+        // A fresh restore PER grader: a grader may write build output, which
+        // must not leak into the next grader's baseline. Scrubbed like a
+        // worker's clone. Graded on the host — this tree is the trusted
+        // bookmark, not a worker's, and the check has to run where no microVM
+        // can boot. Worker grades take the VM path (`grade`).
+        let dir = self.restore_bookmark("--baseline-check")?;
         let (cmd, rubric) = match grader {
             Grader::Cmd(c) => (Some(c.as_str()), None),
             Grader::Rubric(p) => (None, Some(p.as_path())),
@@ -1674,6 +1766,12 @@ impl CliDriver<'_> {
         }
         Ok(())
     }
+}
+
+/// Whether this build can run the grader microVM. Without it dispatch refuses
+/// to start rather than grade worker code on the host.
+fn grader_vm_available() -> bool {
+    cfg!(feature = "libkrun")
 }
 
 /// Parse a `session score --json` envelope into the `contract::Scored` it
@@ -1945,14 +2043,31 @@ pub(crate) fn dispatch(resolved: &Pillbox, opts: DispatchOpts) -> Result<()> {
         .into());
     }
 
-    let driver = CliDriver::new(resolved, &opts, default_agent_id)?;
+    let protect = ProtectSet::new(!opts.no_default_protect, &opts.protect).map_err(|e| {
+        PillboxError::usage("dispatch", format!("--protect: {e:#}"))
+            .with_next("patterns are paths relative to the workspace, e.g. --protect 'ci/**'")
+    })?;
+
+    let driver = CliDriver::new(resolved, &opts, default_agent_id, protect)?;
     // `--baseline-check`: grade the untouched base first — a reward that already
-    // passes there stops the run (exit 2) before any worker boots.
+    // passes there stops the run (exit 2) before any worker boots. The base is
+    // the trusted bookmark, graded on the host, so this needs no microVM.
     let baseline = if opts.baseline_check {
         Some(run_baseline(&driver, &reward, segments.as_deref())?)
     } else {
         None
     };
+    // Worker grades run in the grader microVM. Refuse before forking rather
+    // than grade a worker's tree on the host. After the baseline, so a bad
+    // reward still reports on a build with no VM.
+    if !grader_vm_available() {
+        return Err(PillboxError::usage(
+            "dispatch",
+            "dispatch grades every worker inside a libkrun microVM, and this build has no libkrun backend",
+        )
+        .with_next("use a pillbox built with the default `libkrun` feature")
+        .into());
+    }
     let retry = RetryPolicy {
         retries: opts.retries,
         stall_limit: opts.stall_limit,
@@ -2918,6 +3033,9 @@ mod tests {
             critic: None,
             critic_policy: "record".into(),
             critic_model: "jev-latest".into(),
+            protect: vec![],
+            no_default_protect: false,
+            grader_egress: vec![],
         }
     }
 
@@ -3158,5 +3276,315 @@ mod tests {
         assert!(WorkerStatus::Scored.passed());
         assert!(!WorkerStatus::Failed.passed());
         assert!(!WorkerStatus::Errored.passed());
+    }
+
+    // ── CliDriver grading: a scrubbed copy, protected paths restored, VM only ──
+
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    /// The grader-VM stand-in runs the grader against the tree it was handed,
+    /// with an empty env, and reports the verdict.
+    const VM_RUNS_GRADER: &str = r#"if (cd "$tree" && env -i PATH=/usr/bin:/bin sh -c "$cmd") >/dev/null 2>&1; then p=true; s=1.0; else p=false; s=0.0; fi
+printf '{"grader":"cmd","passed":%s,"score":%s,"feedback":""}' "$p" "$s""#;
+    /// The grader-VM stand-in executes nothing and reports a failing grade.
+    const VM_RECORDS_ONLY: &str =
+        r#"printf '{"grader":"cmd","passed":false,"score":0.0,"feedback":""}'"#;
+    /// The grader VM can't run.
+    const VM_DOWN: &str =
+        r#"echo "the grader microVM exited (1) before the grader started" >&2; exit 1"#;
+
+    /// A `pillbox` executable standing in for the real one under [`CliDriver`]:
+    /// `session info` reports `ws` as the worker's live workspace; `session
+    /// score` refuses to grade without `--in-sandbox`, copies the tree it was
+    /// handed to `seen` (the grade tree is gone once `grade` returns), then
+    /// runs `vm` with `$tree` and `$cmd` set. Every argv is appended to `log`.
+    struct FakePillbox {
+        _dir: tempfile::TempDir,
+        exe: PathBuf,
+        log: PathBuf,
+        seen: PathBuf,
+    }
+
+    impl FakePillbox {
+        fn new(ws: &Path, vm: &str) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("argv.log");
+            let seen = dir.path().join("seen");
+            let exe = dir.path().join("pillbox");
+            let script = format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{log}'
+if [ "$1 $2" = "session info" ]; then
+  printf '{{"session":{{"workspace":"%s"}}}}' '{ws}'
+  exit 0
+fi
+[ "$1 $2" = "session score" ] || exit 64
+shift 3
+tree=""; cmd=""; sandboxed=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --workspace) tree="$2"; shift 2 ;;
+    --cmd) cmd="$2"; shift 2 ;;
+    --in-sandbox) sandboxed=1; shift ;;
+    *) shift ;;
+  esac
+done
+[ "$sandboxed" = 1 ] || {{ echo "host grading refused" >&2; exit 3; }}
+rm -rf '{seen}'; cp -R "$tree" '{seen}'
+{vm}
+"#,
+                log = log.display(),
+                ws = ws.display(),
+                seen = seen.display(),
+            );
+            std::fs::write(&exe, script).unwrap();
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+            Self {
+                _dir: dir,
+                exe,
+                log,
+                seen,
+            }
+        }
+
+        fn argv(&self) -> Vec<String> {
+            std::fs::read_to_string(&self.log)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    fn put(root: &Path, rel: &str, body: &str) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+
+    /// The bookmark (`base`) and a worker workspace forked from it (`ws`).
+    /// The base test passes only once `src/lib.rs` contains `fixed`.
+    struct Project {
+        base: tempfile::TempDir,
+        _root: tempfile::TempDir,
+        ws: PathBuf,
+    }
+
+    fn project() -> Project {
+        let base = tempfile::tempdir().unwrap();
+        put(base.path(), "src/lib.rs", "pub fn f() {}\n");
+        put(base.path(), "tests/check.sh", "grep -q fixed src/lib.rs\n");
+        let root = tempfile::tempdir().unwrap();
+        let ws = root.path().join("ws");
+        crate::workspace::cow::cow_clone_dir(base.path(), &ws).unwrap();
+        Project {
+            base,
+            _root: root,
+            ws,
+        }
+    }
+
+    fn grade_with(p: Project, fake: &FakePillbox, grader: &Grader) -> (Result<Scored>, Project) {
+        let resolved = crate::pillbox::global();
+        let opts = opts_for_resolve(None, None, None, None);
+        let driver = CliDriver::with_exe(
+            fake.exe.clone(),
+            &resolved,
+            &opts,
+            "opencode".into(),
+            ProtectSet::new(true, &[]).unwrap(),
+        );
+        let Project { base, _root, ws } = p;
+        driver.base.set(base).unwrap();
+        let r = driver.grade("w1", grader);
+        let base = driver.base.into_inner().unwrap();
+        (r, Project { base, _root, ws })
+    }
+
+    fn read(p: &Path) -> String {
+        std::fs::read_to_string(p).unwrap()
+    }
+
+    #[test]
+    fn a_worker_editing_a_protected_test_does_not_change_its_grade() {
+        let grader = Grader::Cmd("sh tests/check.sh".into());
+
+        // Untouched worker: fails, as on the base.
+        let p = project();
+        let fake = FakePillbox::new(&p.ws, VM_RUNS_GRADER);
+        let (untouched, _) = grade_with(p, &fake, &grader);
+        assert!(!untouched.unwrap().passed);
+
+        // A worker that rewrites the test to pass gets the same failing grade:
+        // the test is graded as the bookmark has it.
+        let p = project();
+        put(&p.ws, "tests/check.sh", "exit 0\n");
+        let fake = FakePillbox::new(&p.ws, VM_RUNS_GRADER);
+        let (tampered, p) = grade_with(p, &fake, &grader);
+        assert!(!tampered.unwrap().passed);
+        assert_eq!(
+            read(&fake.seen.join("tests/check.sh")),
+            "grep -q fixed src/lib.rs\n"
+        );
+        assert_eq!(
+            read(&p.ws.join("tests/check.sh")),
+            "exit 0\n",
+            "live workspace untouched"
+        );
+
+        // Deleting it, or swapping in a symlink to a passing script, changes nothing either.
+        let p = project();
+        std::fs::remove_file(p.ws.join("tests/check.sh")).unwrap();
+        let fake = FakePillbox::new(&p.ws, VM_RUNS_GRADER);
+        let (deleted, _) = grade_with(p, &fake, &grader);
+        assert!(!deleted.unwrap().passed);
+
+        let p = project();
+        put(&p.ws, "src/pass.sh", "exit 0\n");
+        std::fs::remove_file(p.ws.join("tests/check.sh")).unwrap();
+        std::os::unix::fs::symlink("../src/pass.sh", p.ws.join("tests/check.sh")).unwrap();
+        let fake = FakePillbox::new(&p.ws, VM_RUNS_GRADER);
+        let (linked, _) = grade_with(p, &fake, &grader);
+        assert!(!linked.unwrap().passed);
+
+        // A real fix outside the protected set still passes — the grade itself
+        // is unchanged, only what the worker may edit is.
+        let p = project();
+        put(&p.ws, "src/lib.rs", "pub fn f() {} // fixed\n");
+        let fake = FakePillbox::new(&p.ws, VM_RUNS_GRADER);
+        let (fixed, _) = grade_with(p, &fake, &grader);
+        assert!(fixed.unwrap().passed);
+    }
+
+    #[test]
+    fn worker_build_and_test_code_never_runs_on_the_host() {
+        let host = tempfile::tempdir().unwrap();
+        let marker = host.path().join("ran-on-host");
+        let touch = format!("touch '{}'\n", marker.display());
+
+        let p = project();
+        put(
+            &p.ws,
+            "build.rs",
+            &format!(
+                "fn main() {{ std::fs::write({:?}, b\"\").unwrap(); }}\n",
+                marker.display().to_string()
+            ),
+        );
+        put(&p.ws, "build.sh", &touch);
+        put(&p.ws, "tests/check.sh", &touch);
+        let live_ws = p.ws.clone();
+        let fake = FakePillbox::new(&p.ws, VM_RECORDS_ONLY);
+        let grader = Grader::Cmd("sh build.sh && cargo test".into());
+        let (r, _p) = grade_with(p, &fake, &grader);
+        assert!(!r.unwrap().passed);
+
+        assert!(!marker.exists(), "worker code executed on the host");
+        let score = fake
+            .argv()
+            .into_iter()
+            .find(|a| a.starts_with("session score"))
+            .expect("graded via `session score`");
+        assert!(score.contains("--in-sandbox"), "{score}");
+        assert!(
+            !score.contains(&format!("--workspace {} ", live_ws.display())),
+            "graded the live workspace: {score}"
+        );
+        // The VM got the worker's own code, and the bookmark's test.
+        assert!(fake.seen.join("build.rs").exists());
+        assert_eq!(
+            read(&fake.seen.join("tests/check.sh")),
+            "grep -q fixed src/lib.rs\n"
+        );
+    }
+
+    #[test]
+    fn an_unavailable_grader_vm_is_an_error_with_no_host_fallback() {
+        let host = tempfile::tempdir().unwrap();
+        let marker = host.path().join("ran-on-host");
+        let p = project();
+        put(
+            &p.ws,
+            "tests/check.sh",
+            &format!("touch '{}'\n", marker.display()),
+        );
+        let fake = FakePillbox::new(&p.ws, VM_DOWN);
+        let (r, _p) = grade_with(p, &fake, &Grader::Cmd("sh tests/check.sh".into()));
+        let err = format!("{:#}", r.unwrap_err());
+        assert!(err.contains("before the grader started"), "{err}");
+        assert!(!marker.exists());
+        let scores: Vec<String> = fake
+            .argv()
+            .into_iter()
+            .filter(|a| a.starts_with("session score"))
+            .collect();
+        assert_eq!(scores.len(), 1, "no second attempt: {scores:?}");
+        assert!(scores[0].contains("--in-sandbox"));
+    }
+
+    #[test]
+    fn score_args_grade_in_the_vm_with_the_requested_egress() {
+        let args = score_args(
+            "w1",
+            Path::new("/tmp/tree"),
+            &Grader::Rubric("r.txt".into()),
+            &["pypi.org".into()],
+        );
+        assert_eq!(
+            args,
+            [
+                "session",
+                "score",
+                "w1",
+                "--workspace",
+                "/tmp/tree",
+                "--in-sandbox",
+                "--grader-egress",
+                "pypi.org",
+                "--json",
+                "--rubric",
+                "r.txt"
+            ]
+        );
+    }
+
+    #[test]
+    fn reverted_note_lists_a_capped_set() {
+        assert_eq!(reverted_note("w1", &[]), None);
+        let many: Vec<PathBuf> = (0..7)
+            .map(|i| PathBuf::from(format!("tests/{i}")))
+            .collect();
+        let note = reverted_note("w1", &many).unwrap();
+        assert!(
+            note.contains("tests/0, tests/1, tests/2, tests/3, tests/4, +2 more"),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn a_bad_protect_pattern_is_a_usage_error_before_any_fork() {
+        let mut opts = opts_for_resolve(None, None, None, None);
+        opts.prompt = vec!["do it".into()];
+        opts.protect = vec!["../escape".into()];
+        let err = dispatch(&crate::pillbox::global(), opts).unwrap_err();
+        let pe = err.downcast_ref::<PillboxError>().expect("a PillboxError");
+        assert!(
+            matches!(pe.category, crate::errors::ExitCategory::Usage),
+            "{err:#}"
+        );
+        assert!(pe.reason.contains("--protect"), "{err:#}");
+    }
+
+    #[cfg(not(feature = "libkrun"))]
+    #[test]
+    fn dispatch_refuses_to_run_without_the_grader_vm() {
+        let mut opts = opts_for_resolve(None, None, None, None);
+        opts.prompt = vec!["do it".into()];
+        let err = format!(
+            "{:#}",
+            dispatch(&crate::pillbox::global(), opts).unwrap_err()
+        );
+        assert!(err.contains("no libkrun backend"), "{err}");
     }
 }

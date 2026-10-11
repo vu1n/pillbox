@@ -3,11 +3,9 @@
 **Status: shipped (GHOST-002 contract → GHOST-003 loop → GHOST-004 live e2e).**
 This documents the CLI surface, the verdict JSON schema, and the exit codes. The
 fork/score/select loop is implemented in `src/commands/dispatch.rs` and
-live-verified by `scripts/smoke/dispatch.sh`. **libkrun-only today** (the grader
-resolves each worker's live workspace via `session info --json` →
-`.session.workspace`, libkrun-only; docker workspace resolution is deferred — see
-"Deferred" below). Downstream programs against the contract on this page — change
-it here first.
+live-verified by `scripts/smoke/dispatch.sh`. **libkrun-only** (every grade runs in
+the grader microVM; a build without the `libkrun` feature refuses to dispatch).
+Downstream programs against the contract on this page — change it here first.
 
 > **Two axes (H4 + the enumerated control, `docs/optimization-gate.md`):** the σ̂
 > experiments found the *segmentation* lever is in-session focused-prompt chaining +
@@ -24,7 +22,8 @@ Fork `k` detached worker sessions from a snapshot **bookmark** onto the same
 segment prompt, drive each to idle, **grade** each with a `--cmd` or `--rubric`,
 **retry** the ones that fail (feeding the failing criteria back as the next
 prompt), then **select** the highest-scoring worker and **pull** its result
-workspace.
+workspace. Grading never touches the worker's live tree and never runs on the
+host — see **Grading** below. The verdict schema is unchanged.
 
 It's the runtime half of ghost: the interactive seat (you, or a chat agent)
 decomposes the work and calls `dispatch` per segment; the verb owns the
@@ -53,7 +52,10 @@ pillbox dispatch --from-bookmark seg-3 -k 3 --rubric grade.txt \
 | `--segments SPEC` | — | Drive an ordered **segment chain** (TOML, below) in ONE session per worker — the proven in-session segmentation lever (`docs/optimization-gate.md` §2026-06-19) — instead of one prompt. Composes with `-k` (best-of-k over chains). See **Segments** below. |
 | `--retries N` | `1` | Per-worker retry budget when the grade fails — the failing criteria are fed back as the next prompt and the worker is re-graded, up to `N` times. With `--segments`, this is the **per-segment** gate-retry budget. |
 | `--stall-limit N` | `2` | **Non-convergence breaker.** Stop re-driving a worker after `N` retries in a row that don't raise its best `--rubric` score, even with `--retries` budget left: it is going in circles (the same failures, or a new one for each one it fixes). Applies per segment with `--segments`. `--cmd` grades are 0 until they pass, so they carry no progress signal and keep the plain budget. Never fires at the default `--retries 1`; it matters once the budget is raised. `0` disables it. A worker the breaker stopped carries `"stalled": true`, independent of its `status`: in fork-`k` mode it ends `failed`, but with `--segments` the chain moves on past a stalled gate and the final reward can still pass. |
-| `--baseline-check` | off | Before forking, restore `--from-bookmark` into a fresh temp dir per grader (so one grader's build output can't leak into the next) and grade it with the reward and every segment gate. A gate has to **fail** on the untouched base to mean anything (the dispatch form of "a new test fails without the change"). A reward that already passes there stops the run with exit 2 before any worker boots; a segment gate that passes only warns. The result rides in the verdict as `baseline`. |
+| `--baseline-check` | off | Before forking, restore `--from-bookmark` into a fresh temp dir per grader (so one grader's build output can't leak into the next) and grade it on the host with the reward and every segment gate. The base is the trusted bookmark, so this needs no microVM. A gate has to **fail** on the untouched base to mean anything (the dispatch form of "a new test fails without the change"). A reward that already passes there stops the run with exit 2 before any worker boots; a segment gate that passes only warns. The result rides in the verdict as `baseline`. |
+| `--protect PATTERN` | — | Extra protected path, repeatable, added to the defaults. Restored from the bookmark in the grade tree (see **Grading**). A name matches at any depth (`fixtures/`, `*.golden`); a pattern containing `/` is anchored at the workspace root (`ci/run.sh`, `/Makefile`). |
+| `--no-default-protect` | off | Drop the default protected set; only `--protect` patterns apply. For a task whose job is to change the tests. |
+| `--grader-egress HOST` | — | Repeatable. Let the grader microVM reach these hosts (a package registry the tests install from). The grader is offline by default — the same fence as `session score --grader-egress`. |
 | `--agent AGENT` | pillbox `agent =`, then `claude` | Worker agent (`claude` \| `codex` \| `opencode` \| …). |
 | `--model MODEL` | agent default | Worker model override, forwarded to each worker's run. |
 | `--temperature FLOAT` | agent default | Per-fork sampling temperature, forwarded to each worker — the diversity knob that keeps best-of-`k` non-degenerate. |
@@ -70,6 +72,35 @@ The grader is a required, mutually-exclusive group: exactly one of `--cmd` /
 `--rubric` must be given (a clap `ArgGroup` enforces it → a missing/both case is
 a usage error, exit 2). This holds in `--segments` mode too — the reward is always
 required, distinct from the per-segment gates.
+
+## Grading
+
+A worker is graded on a **copy** of its workspace, never the live tree, and the
+grader runs in the one-shot libkrun microVM (`session score --in-sandbox`), never
+on the host. The copy is secret-scrubbed with the same denylist as a worker's
+clone. The VM starts with `env_clear` and only the grader's static env (`HOME`,
+`TERM`, `PATH`) — no host environment — and with no network unless
+`--grader-egress` names hosts. `--baseline-check` is the exception: it grades
+the trusted bookmark on the host, so it runs where a microVM can't boot.
+
+**Protected paths** are put back from the bookmark before the grader runs, so a
+worker cannot change its reward by editing, deleting, renaming, or symlink-swapping
+them. The defaults cover test trees and test files (`tests/`, `test/`, `spec/`,
+`__tests__/`, `testdata/`, `*_test.go`, `test_*.py`, `*_test.py`, `*.test.*`,
+`*.spec.*`), test-runner config (`conftest.py`, `pytest.ini`, `tox.ini`,
+`jest.config.*`, `vitest.config.*`), CI config (`.github/`, `.gitlab-ci.yml`,
+`.circleci/`, `.buildkite/`, `.travis.yml`, `azure-pipelines.yml`, `Jenkinsfile`),
+and rubrics (`rubrics/`, `*.rubric`). A name matches at any depth; `--protect`
+adds more. When a grade reverts something, dispatch names the paths on stderr; the
+verdict JSON is unchanged.
+
+The copy is removed after the grade. The winner pull still comes from the worker's
+real workspace, edits and all.
+
+A grade that never starts is an error, not a failed grade: the guest prints a
+marker only after the workspace is mounted, and a missing marker (VM won't boot,
+mount fails) fails that worker as `errored`. There is no host fallback. A build
+without the `libkrun` feature is a usage error (exit 2) before any worker forks.
 
 ## Segments (`--segments`)
 
@@ -104,8 +135,9 @@ and lets the run-level `--rubric`/`--cmd` **reward** be the authoritative final
 grade (the gate only steers progression; the reward selects the winner). The
 worker's `retries_used` is the sum across segments.
 
-Gates are **self-contained** — they run against the worker's live workspace as-is
-(same as `dispatch --rubric`). This is the boundary from the σ̂ eval harness
+Gates are **self-contained** — they run against the worker's grade tree (the
+scrubbed copy with protected paths restored; see **Grading**), same as the
+run-level reward. This is the boundary from the σ̂ eval harness
 (`scripts/eval/segmentation/`), which injects *hidden* test subsets at grade time;
 `--segments` is for real work whose tests live in the workspace.
 
@@ -375,20 +407,13 @@ Out of the v1 contract on purpose — each is a new *optional* flag (+ optional
 later is additive, **not** a breaking contract change. Noted here so GHOST-003
 treats them as deferred, not forgotten:
 
-- **`--in-sandbox` / `--grader-egress HOST` passthrough to the grader** — for
-  real-repo grading whose tests need the runner image's toolchain or to fetch
-  deps (the libkrun grader path). v1 grades on the host (`session score`'s
-  default); GHOST-003/004's gates don't need the sandboxed grader.
 - **`--to DIR` for the winner pull** — a deterministic output path for chaining
   segments. v1 pulls to a durable temp staging dir
   (`$TMPDIR/pillbox-dispatch-<run>/winner-<id>`), which the caller reads back from
   `pulled_to` (outside cwd, so it's never swept into a commit; reaped with `$TMPDIR`).
-- **Docker-backend dispatch** — v1 is **libkrun-only**: the grader resolves each
-  worker's *live* workspace via `session info --json` → `.session.workspace`,
-  which only libkrun sessions populate. A docker run needs a non-libkrun
-  workspace-resolution (pull-then-score, or score the `result_snapshot` after
-  `session done`). The loop itself is backend-agnostic; only the grade step is
-  coupled. (`scripts/smoke/dispatch.sh` skips non-libkrun backends.)
+- **Docker-backend dispatch** — dispatch grades inside the libkrun grader
+  microVM, so a docker build has nothing to grade with and `dispatch` refuses
+  to start. (`scripts/smoke/dispatch.sh` skips non-libkrun backends.)
 - **`files_changed` in the worker summary** — a per-worker diff-vs-base summary
   (the touched paths / a stat) is a natural evidence field, but needs a
   workspace-vs-`from_bookmark` diff op (rustic/git). The mining-critical evidence

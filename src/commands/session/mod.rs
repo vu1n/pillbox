@@ -21,6 +21,9 @@ use crate::{events, sandbox, session};
 mod grader;
 mod stream;
 
+#[cfg(feature = "libkrun")]
+pub(crate) use grader::GRADER_STARTED_PRINTF;
+
 /// Pid file a detached §0 producer ([`run_detached_tailer`]) writes in the session
 /// dir, so teardown can SIGTERM it and live readers can tell a producer is keeping
 /// the log fresh (and skip their own drain — the single-producer invariant).
@@ -168,7 +171,8 @@ fn libkrun_score_in_sandbox(
     cmd: &str,
     egress_allow: &[String],
 ) -> Result<(i32, String)> {
-    sandbox::libkrun::score_in_sandbox(resolved, workspace, cmd, egress_allow)
+    let (code, raw) = sandbox::libkrun::score_in_sandbox(resolved, workspace, cmd, egress_allow)?;
+    Ok((code, grader::grader_output_after_start(code, &raw)?))
 }
 #[cfg(not(feature = "libkrun"))]
 fn libkrun_score_in_sandbox(
@@ -1277,8 +1281,9 @@ fn artifact_ref_json(
 /// `session done` self-report); its combined output is the feedback gradient.
 /// `--cmd` is one command; `--rubric FILE` is N named criteria → per-criterion
 /// verdicts + a fractional score. `--in-sandbox` runs it in a one-shot microVM.
+///
 /// Run a compiled grader script on the host in `dir` → `(exit code, combined
-/// raw output)`. Shared by `session score` (host path) and [`grade_dir`].
+/// raw output)`. The host path of `session score`, and [`grade_dir`].
 fn run_host_grader(dir: &std::path::Path, exec_cmd: &str) -> Result<(i32, String)> {
     let out = std::process::Command::new("sh")
         .arg("-c")
@@ -1295,7 +1300,8 @@ fn run_host_grader(dir: &std::path::Path, exec_cmd: &str) -> Result<(i32, String
 /// Grade a plain directory with a `--cmd` xor `--rubric` grader on the host,
 /// with no session and no §0 record — the same verdict `session score` would
 /// produce for that dir. `dispatch --baseline-check` uses it to grade the
-/// bookmark's base before any worker exists.
+/// trusted bookmark before any worker exists; worker grades run in the
+/// microVM instead (a worker's tree is the untrusted one).
 pub(crate) fn grade_dir(
     dir: &std::path::Path,
     cmd: Option<&str>,

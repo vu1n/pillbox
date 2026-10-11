@@ -842,6 +842,18 @@ fn copy_grader_files(root: &Path, src: &Path, dst: &Path, active: &mut Vec<PathB
     Ok(())
 }
 
+/// CoW-clone a worker's LIVE workspace to `dst` (which must not exist), with
+/// its directory modes relaxed for the copy and put back after. Dispatch grades
+/// this frozen copy and later delivers it as the winner, so a process the worker
+/// left running cannot change the code between the grade and the pull.
+pub(crate) fn snapshot_workspace(live: &Path, dst: &Path) -> Result<()> {
+    let modes = ModeGuard::relax(live)?;
+    super::cow::cow_clone_dir(live, dst)
+        .with_context(|| format!("snapshot worker workspace {}", live.display()))?;
+    drop(modes);
+    Ok(())
+}
+
 /// A scrubbed, protected-path-restored copy of a worker's workspace, removed on
 /// drop. This — never the live workspace — is what a dispatch grader sees.
 pub(crate) struct GradeTree {

@@ -150,8 +150,11 @@ worker's `pluggy.py` or `json.py` can't shadow the test runner or the stdlib,
 while the project still imports from the workspace. `--no-default-protect` with no `--protect` leaves the
 tree alone and runs the grader as root, the opt-out.
 
-The copy is removed after the grade. The winner pull still comes from the worker's
-real workspace, edits and all.
+The grade copy is made from a snapshot of the worker's workspace, frozen at
+grade time and kept until the run ends. The winner delivered to `pulled_to` is
+that snapshot (unscrubbed, protected paths as the worker left them, edits and
+all), so a process the worker left running can't change the code between the
+grade and the pull. Losers' snapshots are removed when dispatch exits.
 
 A grade that never starts is an error, not a failed grade: the guest prints a
 marker only after the workspace is mounted, and a missing marker (VM won't boot,

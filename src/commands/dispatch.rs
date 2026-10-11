@@ -44,7 +44,9 @@ use crate::errors::PillboxError;
 use crate::events::blob::BlobStore;
 use crate::events::log::SessionLog;
 use crate::pillbox::Pillbox;
-use crate::workspace::protect::{GradeTree, ProtectSet, GRADER_FILES_DIR};
+use crate::workspace::protect::{
+    force_remove, snapshot_workspace, GradeTree, ProtectSet, GRADER_FILES_DIR,
+};
 use crate::workspace::WorkspaceBackend;
 
 /// Per-turn idle timeout (seconds) each worker gets before it's treated as stuck
@@ -1589,6 +1591,8 @@ struct CliDriver<'a> {
     /// The bookmark, restored and scrubbed once on the first grade — the source
     /// protected paths are restored from. Read-only after that.
     base: OnceCell<tempfile::TempDir>,
+    /// Each worker's last graded snapshot, by session id (see [`Self::grade`]).
+    graded: OnceCell<tempfile::TempDir>,
 }
 
 impl<'a> CliDriver<'a> {
@@ -1621,6 +1625,7 @@ impl<'a> CliDriver<'a> {
             rundir,
             protect,
             base: OnceCell::new(),
+            graded: OnceCell::new(),
         }
     }
 
@@ -1655,6 +1660,19 @@ impl<'a> CliDriver<'a> {
             .as_str()
             .map(PathBuf::from)
             .context("`session info --json` had no session.workspace (libkrun-only today)")
+    }
+
+    /// Where worker `id`'s last graded snapshot lives. The directory is a temp
+    /// dir dropped with the driver, so losers' snapshots don't outlive the run.
+    fn graded_snapshot(&self, id: &str) -> Result<PathBuf> {
+        if self.graded.get().is_none() {
+            let dir = tempfile::Builder::new()
+                .prefix("pillbox-dispatch-graded-")
+                .tempdir_in(std::env::temp_dir())
+                .context("temp dir for graded snapshots")?;
+            let _ = self.graded.set(dir);
+        }
+        Ok(self.graded.get().expect("graded just set").path().join(id))
     }
 
     fn effective_agent(&self, i: usize) -> String {
@@ -1805,9 +1823,17 @@ impl WorkerDriver for CliDriver<'_> {
         // paths restored from the bookmark, inside the grader microVM. A VM that
         // can't run fails `session score`, which errors this worker — there is
         // no host fallback.
+        // Grade a frozen snapshot, and keep it: `pull_winner` delivers exactly
+        // the tree that was graded, not whatever a background process the
+        // worker left running has made of the live workspace since.
         let ws = self.live_workspace(id)?;
+        let snap = self.graded_snapshot(id)?;
+        if snap.exists() {
+            force_remove(&snap)?;
+        }
+        snapshot_workspace(&ws, &snap)?;
         let tree = GradeTree::prepare(
-            &ws,
+            &snap,
             self.base_tree()?,
             &self.protect,
             self.opts.grader_files.as_deref(),
@@ -1833,6 +1859,17 @@ impl WorkerDriver for CliDriver<'_> {
         let to = self.rundir.join(format!("winner-{id}"));
         std::fs::create_dir_all(&self.rundir)
             .with_context(|| format!("create {:?}", self.rundir))?;
+        let snap = self.graded_snapshot(id)?;
+        if snap.exists() {
+            std::fs::rename(&snap, &to).with_context(|| {
+                format!(
+                    "move graded snapshot {} to {}",
+                    snap.display(),
+                    to.display()
+                )
+            })?;
+            return Ok(to);
+        }
         self.status(&[
             "session".into(),
             "pull".into(),
@@ -3831,6 +3868,35 @@ rm -rf '{seen}'; cp -R "$tree" '{seen}'
 
     fn read(p: &Path) -> String {
         std::fs::read_to_string(p).unwrap()
+    }
+
+    #[test]
+    fn the_winner_delivered_is_the_tree_that_was_graded() {
+        let grader = Grader::Cmd("sh tests/check.sh".into());
+        let p = project();
+        put(&p.ws, "src/lib.rs", "pub fn f() {} // fixed\n");
+        let fake = FakePillbox::new(&p.ws, VM_RUNS_GRADER);
+        let resolved = crate::pillbox::global();
+        let opts = opts_for_resolve(None, None, None, None);
+        let driver = CliDriver::with_exe(
+            fake.exe.clone(),
+            &resolved,
+            &opts,
+            "opencode".into(),
+            ProtectSet::new(true, &[]).unwrap(),
+        );
+        driver.base.set(p.base).unwrap();
+        assert!(driver.grade("w1", &grader).unwrap().passed);
+
+        // A process the worker left running undoes the fix after the grade.
+        put(&p.ws, "src/lib.rs", "pub fn f() {}\n");
+        let won = driver.pull_winner("w1").unwrap();
+        assert_eq!(read(&won.join("src/lib.rs")), "pub fn f() {} // fixed\n");
+        assert!(
+            !fake.argv().iter().any(|a| a.contains("session pull")),
+            "the graded snapshot is delivered, not a fresh pull of the live tree"
+        );
+        let _ = std::fs::remove_dir_all(&driver.rundir);
     }
 
     #[test]

@@ -258,13 +258,13 @@ normalizer are deleted. Docker refuses server agents with a usage error.
   - the vault credential proxy;
   - rustic workspace snapshots;
   - the §0 session log.
-- **The engine gains** a session packet (`checkpoint pack|unpack`), specified as
-  JSON Schema rather than Rust types. The `--no-default-features` Linux build
-  carries every packet subcommand, so Cloudflare containers, which already ship
-  a Linux `pillbox` for workspace restore and backup, write the same packet as
-  macOS.
+- **The engine will gain** a session packet (`checkpoint pack|unpack`, not built
+  yet), specified as JSON Schema rather than Rust types. The
+  `--no-default-features` Linux build must carry every packet subcommand, so
+  Cloudflare containers, which already ship a Linux `pillbox` for workspace
+  restore and backup, write the same packet as macOS.
 - **CLI surface:** no new user-facing commands; engine subcommands such as
-  `checkpoint` exist for Stratus. Existing commands keep working until Stratus
+  `checkpoint` will exist for Stratus. Existing commands keep working until Stratus
   covers them, and each is then deprecated by its own entry in this log.
 - **Why:** the cloud controller must be TypeScript (Workers cannot run a Rust
   CLI), so a Rust entry point meant the same control logic in two languages,

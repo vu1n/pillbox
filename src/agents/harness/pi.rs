@@ -50,24 +50,46 @@ struct PiState {
 ///     (`text_start`/`text_delta`/`text_end`) and the
 ///     `tool_execution_start`/`tool_execution_end` event fields
 ///     (`toolCallId`, `toolName`, `args`, `result`, `isError`).
-///   - NOT YET seen on a live wire: a *successful* assistant text turn and a
-///     real tool round-trip (the test account is out of quota). The text/tool
-///     branches are built to the declared `.d.ts` shapes; once a funded
-///     account is available, capture `pi -p --mode json "edit a file"` and
-///     re-confirm `text_delta.delta`, `tool_execution_end.result` content
-///     flattening, and the `agent_end` exit semantics against these fixtures.
-#[derive(Default)]
+///   - CAPTURED from pi 1.0.2 and Prime Agent 0.9.8 against a local
+///     OpenAI-compatible mock provider (`src/execution/fixtures/`): a
+///     successful streamed text turn (`text_delta.delta`, `message_end` with
+///     `usage`, `responseModel`, `agent_end`) and a tool call refused under
+///     `--no-tools` (`tool_execution_end.isError`, "Tool bash not found").
+///   - NOT YET seen on a live wire against a real provider, and no successful
+///     tool round-trip has been captured.
 pub(crate) struct PiAdapter {
     state: PiState,
     requested: Option<RequestedRunProfile>,
+    /// The agent id and command: `pi`, or `prime-agent`, a hard fork of pi that keeps
+    /// pi's CLI flags and `--mode json` stream.
+    agent: &'static str,
+}
+
+impl Default for PiAdapter {
+    fn default() -> Self {
+        Self {
+            state: PiState::default(),
+            requested: None,
+            agent: "pi",
+        }
+    }
 }
 
 impl PiAdapter {
     #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) fn with_request(requested: RequestedRunProfile) -> Self {
         Self {
-            state: PiState::default(),
             requested: Some(requested),
+            ..Self::default()
+        }
+    }
+
+    /// The same adapter driving `prime-agent` instead of `pi`.
+    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+    pub(crate) fn prime_agent(requested: RequestedRunProfile) -> Self {
+        Self {
+            agent: "prime-agent",
+            ..Self::with_request(requested)
         }
     }
 
@@ -103,7 +125,7 @@ impl HarnessAdapter for PiAdapter {
         // `--no-session` keeps the run ephemeral (no session file written into
         // the mounted workspace).
         let mut argv = vec![
-            "pi".into(),
+            self.agent.into(),
             "-p".into(),
             "--mode".into(),
             "json".into(),
@@ -138,7 +160,7 @@ impl HarnessAdapter for PiAdapter {
         match str_field(line, "type") {
             // The first line of `--mode json` output. It anchors the run.
             "session" => vec![Payload::RunStarted(RunStarted {
-                agent: "pi".into(),
+                agent: self.agent.into(),
                 parent_run_id: String::new(),
                 base_snapshot: String::new(),
                 requested: self.requested.clone(),
@@ -383,6 +405,48 @@ mod tests {
     fn pi_run(lines: &[Value]) -> Vec<Payload> {
         let mut a = PiAdapter::default();
         lines.iter().flat_map(|l| a.parse_line(l)).collect()
+    }
+
+    #[test]
+    fn real_1_0_2_and_prime_agent_0_9_8_text_turns_normalize() {
+        let captures = [
+            (
+                PiAdapter::default(),
+                include_str!("../../execution/fixtures/pi-1.0.2-text.jsonl"),
+            ),
+            (
+                PiAdapter::prime_agent(
+                    RequestedRunProfile::parse("mock/mock-1", None, None).unwrap(),
+                ),
+                include_str!("../../execution/fixtures/prime-agent-0.9.8-text.jsonl"),
+            ),
+        ];
+        for (mut adapter, capture) in captures {
+            let out: Vec<Payload> = capture
+                .lines()
+                .flat_map(|line| adapter.parse_line(&serde_json::from_str(line).unwrap()))
+                .collect();
+            let text: String = out
+                .iter()
+                .filter_map(|p| match p {
+                    Payload::MessageDelta(d) => Some(d.text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(text, "Hello from mock.");
+            let Some(Payload::RunFinished(finished)) = out.last() else {
+                panic!("run did not finish: {out:?}")
+            };
+            assert_eq!(finished.exit_code, 0);
+            assert!(matches!(
+                &finished.served_model,
+                Some(ServedRunProfileEvidence::Reported { profile }) if profile.model == "mock-served-1"
+            ));
+        }
+        let argv =
+            PiAdapter::prime_agent(RequestedRunProfile::parse("zai/glm-5.3", None, None).unwrap())
+                .run_argv("go");
+        assert_eq!(argv[0], "prime-agent");
     }
 
     #[test]

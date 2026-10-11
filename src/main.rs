@@ -1086,7 +1086,7 @@ fn wizard_new(
         .unwrap_or_else(|| "pillbox".into());
     let name = Some(prompt::line("name", name.as_deref().unwrap_or(&cwd_base))?);
 
-    let agents = ["claude", "codex", "opencode", "pi", "cursor"];
+    let agents = ["claude", "codex", "opencode", "pi", "prime-agent", "cursor"];
     let agent_idx = agents
         .iter()
         .position(|a| Some(*a) == agent.as_deref())

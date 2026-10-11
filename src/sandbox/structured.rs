@@ -1,5 +1,5 @@
 //! Shared one-shot structured-stdout boundary for [`crate::agents::Integration::Structured`]
-//! agents (pi, cursor, claude-stream).
+//! agents (pi, prime-agent, cursor, claude-stream).
 //!
 //! Each harness owns its JSON wire format; Pillbox maps it immediately into the
 //! shared durable contract. Raw harness events are capture input only — never
@@ -140,6 +140,12 @@ impl Adapter {
                     anyhow::anyhow!("pi structured path requires a RequestedRunProfile")
                 })?;
                 Ok(Self::Pi(PiAdapter::with_request(requested)))
+            }
+            "prime-agent" => {
+                let requested = requested.ok_or_else(|| {
+                    anyhow::anyhow!("prime-agent structured path requires a RequestedRunProfile")
+                })?;
+                Ok(Self::Pi(PiAdapter::prime_agent(requested)))
             }
             "cursor" => Ok(match requested {
                 Some(profile) => Self::Cursor(CursorAdapter::with_request(profile)),

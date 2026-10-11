@@ -16,7 +16,7 @@ use super::protocol;
 use super::store::OwnedInvocation;
 use super::text::{self, FailedStage, TextExecution, TextLimits, TextRequest, TextRuntime};
 use super::usage::TurnUsage;
-use super::{digest, HarnessTransport, ModelProfile, SessionIdentity, TextOutputFormat};
+use super::{HarnessTransport, ModelProfile, SessionIdentity, TextOutputFormat};
 use crate::contract::{Custom, Payload};
 use crate::pillbox::Pillbox;
 use crate::sandbox::libkrun::repository::TeardownUnconfirmed;
@@ -58,20 +58,21 @@ pub(crate) enum Outcome {
 
 impl TextRequestV2 {
     /// Checks that do not depend on what is installed. A request that fails here was
-    /// never admitted.
+    /// never admitted, so it must cover everything text/1 checks before its claim.
     pub(crate) fn validate(&self) -> Result<()> {
         ensure!(
             self.contract_version == CONTRACT_VERSION,
             "unsupported text contract"
         );
+        text::validate_id(&self.invocation_id)?;
+        text::validate_id(&self.session_ref.session_id)?;
         ensure!(
             self.idempotency_key == self.invocation_id,
             "invocation/idempotency mismatch"
         );
-        ensure!(
-            self.rendered_input_hash == digest(self.rendered_input.as_bytes()),
-            "rendered input digest mismatch"
-        );
+        text::validate_input(&self.rendered_input, &self.rendered_input_hash)?;
+        text::validate_output_format(&self.output_format)?;
+        self.limits.validate()?;
         ensure!(
             self.tool_policy == "deny_all",
             "unsupported text tool policy"
@@ -87,6 +88,12 @@ impl TextRequestV2 {
             ),
             "unknown text harness"
         );
+        for value in [&self.agent.model, &self.agent.reasoning_effort] {
+            ensure!(
+                !value.is_empty() && value.len() <= 128,
+                "agent model and reasoning effort must contain 1..128 bytes"
+            );
+        }
         Ok(())
     }
 
@@ -308,6 +315,7 @@ fn failure_code(stage: &str, error: &anyhow::Error) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{canonical_json, digest};
     use super::*;
 
     fn request(harness: &str, model: &str) -> TextRequestV2 {
@@ -347,6 +355,33 @@ mod tests {
             request(harness, "any-model").validate().unwrap();
         }
         assert!(request("custom", "any-model").validate().is_err());
+    }
+
+    #[test]
+    fn a_malformed_request_is_refused_before_any_claim() {
+        let malformed: [fn(&mut TextRequestV2); 5] = [
+            |r| r.invocation_id = "../escape".into(),
+            |r| r.session_ref.session_id = String::new(),
+            |r| r.limits.timeout_ms = 0,
+            |r| r.output_format.retry_count = 1,
+            |r| r.agent.model = "m".repeat(129),
+        ];
+        for mutate in malformed {
+            let mut request = request("pi", "any-model");
+            mutate(&mut request);
+            request.idempotency_key = request.invocation_id.clone();
+            assert!(request.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn a_parsed_request_reserializes_to_the_hashed_canonical_form() {
+        let value = serde_json::to_value(request("codex", "gpt-6-luna")).unwrap();
+        let parsed: TextRequestV2 = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(
+            canonical_json(&serde_json::to_value(&parsed).unwrap()).unwrap(),
+            canonical_json(&value).unwrap()
+        );
     }
 
     #[test]

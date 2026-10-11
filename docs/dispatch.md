@@ -52,7 +52,7 @@ pillbox dispatch --from-bookmark seg-3 -k 3 --rubric grade.txt \
 | `--rubric FILE` | — | Grader: a rubric file (`NAME :: COMMAND` per line, `#`/blank lines ignored) → per-criterion verdicts + a fractional score. Mutually exclusive with `--cmd`. Same format `session score --rubric` parses. In `--segments` mode this stays the **final reward** (the gates are per-segment). |
 | `--segments SPEC` | — | Drive an ordered **segment chain** (TOML, below) in ONE session per worker — the proven in-session segmentation lever (`docs/optimization-gate.md` §2026-06-19) — instead of one prompt. Composes with `-k` (best-of-k over chains). See **Segments** below. |
 | `--retries N` | `1` | Per-worker retry budget when the grade fails — the failing criteria are fed back as the next prompt and the worker is re-graded, up to `N` times. With `--segments`, this is the **per-segment** gate-retry budget. |
-| `--stall-limit N` | `2` | **Non-convergence breaker.** Stop re-driving a worker after `N` retries in a row that don't raise its best `--rubric` score, even with `--retries` budget left: it is going in circles (the same failures, or a new one for each one it fixes). Applies per segment with `--segments`. `--cmd` grades are 0 until they pass, so they carry no progress signal and keep the plain budget. Never fires at the default `--retries 1`; it matters once the budget is raised. `0` disables it. A stalled worker ends `failed` with `"stalled": true`. |
+| `--stall-limit N` | `2` | **Non-convergence breaker.** Stop re-driving a worker after `N` retries in a row that don't raise its best `--rubric` score, even with `--retries` budget left: it is going in circles (the same failures, or a new one for each one it fixes). Applies per segment with `--segments`. `--cmd` grades are 0 until they pass, so they carry no progress signal and keep the plain budget. Never fires at the default `--retries 1`; it matters once the budget is raised. `0` disables it. A worker the breaker stopped carries `"stalled": true`, independent of its `status`: in fork-`k` mode it ends `failed`, but with `--segments` the chain moves on past a stalled gate and the final reward can still pass. |
 | `--baseline-check` | off | Before forking, restore `--from-bookmark` into a fresh temp dir per grader (so one grader's build output can't leak into the next) and grade it with the reward and every segment gate. A gate has to **fail** on the untouched base to mean anything (the dispatch form of "a new test fails without the change"). A reward that already passes there stops the run with exit 2 before any worker boots; a segment gate that passes only warns. The result rides in the verdict as `baseline`. |
 | `--agent AGENT` | pillbox `agent =`, then `claude` | Worker agent (`claude` \| `codex` \| `opencode` \| …). |
 | `--model MODEL` | agent default | Worker model override, forwarded to each worker's run. |
@@ -164,7 +164,9 @@ pillbox's `--json` surface.
         "retries_used": 0,       // retries this worker consumed (sum across segments in --segments mode)
         "status": "scored",      // "scored" | "failed" | "errored" | "unverified" (see below)
         // ADDITIVE — present ONLY when the --stall-limit breaker ended this
-        // worker's retries early (always with status "failed").
+        // worker's retries early (in any segment). Independent of `status`:
+        // fork-k → always "failed"; --segments → the chain continues past a
+        // stalled gate, so the final reward may still pass ("scored").
         // "stalled": true,
         // ADDITIVE — present ONLY for a --segments worker; omitted in fork-k mode.
         // The per-checkpoint trajectory, in order; `score` is the gate score.

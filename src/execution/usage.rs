@@ -54,6 +54,22 @@ impl TurnUsage {
         reported.then_some(usage)
     }
 
+    /// Cursor Agent CLI stream-json `result` line, pinned CLI `2026.10.01-e373342`.
+    /// The printed `usage` object is `inputTokens`, `outputTokens`,
+    /// `cacheReadTokens`, `cacheWriteTokens`. The CLI already subtracts the cache
+    /// counts from `inputTokens` before printing, so those fields do not overlap
+    /// and must not be subtracted again. The result carries no cost.
+    pub(crate) fn from_cursor_result(line: &Value) -> Option<Self> {
+        let usage = line.get("usage").filter(|usage| usage.is_object())?;
+        Self::new(
+            None,
+            usage.get("inputTokens").and_then(Value::as_u64),
+            usage.get("outputTokens").and_then(Value::as_u64),
+            usage.get("cacheReadTokens").and_then(Value::as_u64),
+            usage.get("cacheWriteTokens").and_then(Value::as_u64),
+        )
+    }
+
     /// Claude Code's stream-json `result` line: `total_cost_usd` and `usage`
     /// (`input_tokens`, `output_tokens`, `cache_read_input_tokens`,
     /// `cache_creation_input_tokens`), already non-overlapping. On a subscription
@@ -220,6 +236,26 @@ mod tests {
         assert_eq!(usage.input_tokens, None);
         assert_eq!(usage.cache_read_tokens, Some(20));
         assert_eq!(usage.output_tokens, Some(3));
+    }
+
+    #[test]
+    fn cursor_result_keeps_the_cli_token_split_and_has_no_cost() {
+        let line = json!({"type":"result","subtype":"success","is_error":false,
+            "usage":{"inputTokens":100,"outputTokens":5,"cacheReadTokens":40,"cacheWriteTokens":10}});
+        let usage = TurnUsage::from_cursor_result(&line).unwrap();
+        assert_eq!(
+            serde_json::to_value(&usage).unwrap(),
+            json!({"cost_usd": null, "input_tokens": 100, "output_tokens": 5,
+                "cache_read_tokens": 40, "cache_write_tokens": 10})
+        );
+        assert_eq!(
+            TurnUsage::from_cursor_result(&json!({"type":"result"})),
+            None
+        );
+        assert_eq!(
+            TurnUsage::from_cursor_result(&json!({"usage":{"inputTokens":1.5,"outputTokens":"2"}})),
+            None
+        );
     }
 
     #[test]

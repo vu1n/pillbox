@@ -556,8 +556,39 @@ that image. A completed record carries `resolved` (`harness`,
 `runtime_timeout`, `runtime_rejected`, `runtime_protocol_error`,
 `internal_error`) and the `stage` that was running (`resolve`, `credentials`,
 `image_prepare`, `guest_prepare`, `vmm_spawn`, `guest_rpc_ready`, `turn`,
-`finalize`); the message stays in the session log. Only `codex` has a text
-driver today; the other harnesses fail at `resolve` with `runtime_rejected`.
+`finalize`); the message stays in the session log. `codex` runs a turn.
+`cursor_agent` resolves and then stops before the microVM launches (below).
+Any other harness fails at `resolve` with `runtime_rejected`.
+
+`cursor_agent` is the Cursor Agent CLI already registered as `--agent cursor`
+(`agent -p --output-format stream-json`, runner-image pin
+`CURSOR_AGENT_VERSION`). Resolve accepts a bare model id (`composer-2.5`,
+`grok-4.5`) and `reasoning_effort` of `low`, `medium`, or `high`. A
+provider-prefixed id (`openai/gpt-5`), whitespace, or a bracketed parameter
+is `runtime_rejected` at `resolve`: the CLI cannot be asked for that id. The
+account's live model list is not known here, so a bare id is not proof the
+account can serve it. The request still cannot pin a harness version, image,
+credential, or egress host. Resolve records credential ref
+`pillbox:cursor:default` and model-provider hosts `api2.cursor.sh` and
+`agentn.global.api5.cursor.sh`.
+
+A cursor_agent selection with no `auth.json` login sentinel and no stored
+`CURSOR_API_KEY` fails with `runtime_unavailable` at `credentials`. When a
+credential is present the driver still does not launch: the CLI posts the API
+key to `/auth/exchange_user_api_key` and keeps the returned access and refresh
+tokens, which would put the real credential in the guest, and the model
+transport defaults to HTTP/2 while the vault MITM speaks HTTP/1.1. That
+failure is `runtime_unavailable` at `guest_prepare`. The prepared guest argv
+is `agent -p --trust --output-format stream-json --sandbox enabled --model
+<id> -- <prompt>` with no `--force`, `--yolo`, or `--api-key`, and
+`~/.cursor/cli-config.json` denies `Shell(*)`, `Read(**)`, `Write(**)`,
+`WebFetch(*)`, and `Mcp(*:*)`. A stream that contains a tool call or
+interaction, or a final `result` that is empty or over `max_final_text_bytes`,
+fails with `runtime_protocol_error` at `turn` and is not truncated. `resolved`
+uses the version `agent --version` prints. `served_model` is null: the init
+event's `model` is a display name, not the model id. `reasoning_effort` is
+checked at resolve and is not forwarded as a model-parameter bracket until a
+live turn shows the CLI accepts it.
 
 A completed record, and a failed one whose turn already spent tokens, carries
 `usage` when the harness reported any:
@@ -581,19 +612,22 @@ nothing gets no `usage` key, never zeros. A value that is not a number, is
 negative or non-finite, or exceeds 10^10 tokens or $1,000,000 is dropped; when
 nothing valid remains, `usage` is absent.
 
-| field | codex (`thread/tokenUsage/updated`, `tokenUsage.total`) | claude_code (`result` line) |
-|---|---|---|
-| `cost_usd` | `null` (Codex reports no cost) | `total_cost_usd` (API-equivalent on a subscription, not a bill) |
-| `input_tokens` | `inputTokens` − `cachedInputTokens` − `cacheWriteInputTokens` (dropped if negative) | `usage.input_tokens` |
-| `output_tokens` | `outputTokens` | `usage.output_tokens` |
-| `cache_read_tokens` | `cachedInputTokens` | `usage.cache_read_input_tokens` |
-| `cache_write_tokens` | `cacheWriteInputTokens` | `usage.cache_creation_input_tokens` |
+| field | codex (`thread/tokenUsage/updated`, `tokenUsage.total`) | claude_code (`result` line) | cursor_agent (stream-json `result.usage`) |
+|---|---|---|---|
+| `cost_usd` | `null` (Codex reports no cost) | `total_cost_usd` (API-equivalent on a subscription, not a bill) | `null` (the result event has no cost field) |
+| `input_tokens` | `inputTokens` − `cachedInputTokens` − `cacheWriteInputTokens` (dropped if negative) | `usage.input_tokens` | `usage.inputTokens`, already exclusive of cache (the CLI subtracts `cacheReadTokens` and `cacheWriteTokens` before printing; pillbox does not subtract again) |
+| `output_tokens` | `outputTokens` | `usage.output_tokens` | `usage.outputTokens` |
+| `cache_read_tokens` | `cachedInputTokens` | `usage.cache_read_input_tokens` | `usage.cacheReadTokens` |
+| `cache_write_tokens` | `cacheWriteInputTokens` | `usage.cache_creation_input_tokens` | `usage.cacheWriteTokens` |
 
 Codex's newest `total` for the invocation's thread and turn is the turn's usage,
 because a text invocation runs one turn on a fresh thread. The claude_code
 column is what the Claude harness writes as `turn_usage` in its `usage` session
-event, ready for when it gets a text driver. Both versions append the same
-`usage` event (`{"turn_usage": …}`) to the text session log.
+event, ready for when it gets a text driver. The cursor_agent column is the
+`usage` object on the stream-json `result` line (CLI `2026.10.01-e373342`);
+that turn is decoded and not sampled until the guest can run without holding
+the real token. Codex text/1 and text/2 append the same `usage` event
+(`{"turn_usage": …}`) to the text session log.
 
 Both versions append a `text.stage.completed` event per stage to the session
 log and emit `session.started` / `session.completed` / `session.failed`

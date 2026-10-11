@@ -307,6 +307,7 @@ pub(crate) fn restore_protected(
             set,
             &base.join(rel),
             &tree.join(rel),
+            rel,
             &mut Vec::new(),
         )?;
     }
@@ -319,8 +320,10 @@ pub(crate) fn restore_protected(
 /// that a symlink resolving to an unprotected path elsewhere in the base
 /// (`tests -> shared-tests`, `tests/unit -> ../shared-tests`) is materialized
 /// from the base target, at any depth. Restoring just the link would let the
-/// worker's copy of the target decide the grade. Only a relative link to a
-/// protected path that stays inside the tree is copied as a link; a dangling
+/// worker's copy of the target decide the grade. A link is copied as a link
+/// only when, read as text from where it lands in the grade tree (`at`), it
+/// names exactly its protected host target: no `..` above the root and no
+/// symlink on the way, either of which the worker could steer. A dangling
 /// link, or one that leaves the bookmark, is an error, since the grader VM
 /// mounts the tree elsewhere and could resolve it to worker files. `active`
 /// holds the directories being copied, so a link back into one is an error
@@ -330,6 +333,7 @@ fn copy_protected(
     set: &ProtectSet,
     src: &Path,
     dst: &Path,
+    at: &Path,
     active: &mut Vec<PathBuf>,
 ) -> Result<()> {
     let meta = std::fs::symlink_metadata(src).with_context(|| format!("stat {}", src.display()))?;
@@ -344,7 +348,7 @@ fn copy_protected(
             );
         };
         let rel = target.strip_prefix(root).unwrap_or(&target);
-        if set.covers(rel) && link_stays_in_tree(root, src)? {
+        if set.covers(rel) && textual_target(at, src)?.as_deref() == Some(rel) {
             return copy_node(src, dst);
         }
         if active.contains(&target) {
@@ -354,7 +358,7 @@ fn copy_protected(
                 target.display()
             );
         }
-        return copy_protected(root, set, &target, dst, active);
+        return copy_protected(root, set, &target, dst, at, active);
     }
     if !ft.is_dir() {
         return copy_node(src, dst);
@@ -369,6 +373,7 @@ fn copy_protected(
             set,
             &entry.path(),
             &dst.join(entry.file_name()),
+            &at.join(entry.file_name()),
             active,
         )?;
     }
@@ -385,27 +390,22 @@ fn in_tree_target(root: &Path, link: &Path) -> Option<PathBuf> {
     (!rel.as_os_str().is_empty()).then_some(target)
 }
 
-/// Whether the symlink `link` is relative and, read as text from its own
-/// directory, never climbs above `root`. Only such a link resolves the same way
-/// in the grader VM, where the tree is mounted somewhere else.
-fn link_stays_in_tree(root: &Path, link: &Path) -> Result<bool> {
+/// The tree-relative path the symlink `link`, landing at `at`, names when its
+/// text is resolved lexically from `at`'s directory; `None` when it is absolute
+/// or climbs above the root. Lexical means no symlink is followed on the way.
+fn textual_target(at: &Path, link: &Path) -> Result<Option<PathBuf>> {
     let text = std::fs::read_link(link).with_context(|| format!("read {}", link.display()))?;
-    let parent = link.parent().unwrap_or(link);
-    let dir =
-        std::fs::canonicalize(parent).with_context(|| format!("resolve {}", parent.display()))?;
-    let Ok(dir) = dir.strip_prefix(root) else {
-        return Ok(false);
-    };
-    let mut depth = dir.components().count();
+    let mut out: Vec<&std::ffi::OsStr> =
+        at.parent().map(|p| p.iter().collect()).unwrap_or_default();
     for comp in text.components() {
         match comp {
-            Component::Normal(_) => depth += 1,
+            Component::Normal(name) => out.push(name),
             Component::CurDir => {}
-            Component::ParentDir if depth > 0 => depth -= 1,
-            _ => return Ok(false),
+            Component::ParentDir if out.pop().is_some() => {}
+            _ => return Ok(None),
         }
     }
-    Ok(true)
+    Ok(Some(out.iter().collect()))
 }
 
 /// Make every component of `rel` under `root` a real, writable directory. A
@@ -1301,6 +1301,34 @@ mod tests {
             assert!(n < 0, "override left on {rel:?}");
         }
         force_remove(&worker).unwrap();
+    }
+
+    #[test]
+    fn a_protected_link_through_an_unprotected_alias_is_materialized() {
+        let (_t, base, copy) = base_and_copy();
+        // tests/check -> ../alias/foo_test.py, alias -> real: the target is
+        // protected, but the worker controls `alias`.
+        write(&base, "real/foo_test.py", "assert False\n");
+        symlink("real", base.join("alias")).unwrap();
+        symlink("../alias/foo_test.py", base.join("tests/check")).unwrap();
+        write(&copy, "real/foo_test.py", "assert False\n");
+        write(&copy, "evil/foo_test.py", "pass\n");
+        symlink("evil", copy.join("alias")).unwrap(); // worker retargets the alias
+        restore_protected(&copy, &base, &defaults()).unwrap();
+        let check = copy.join("tests/check");
+        assert!(fs::symlink_metadata(&check).unwrap().file_type().is_file());
+        assert_eq!(read(&copy, "tests/check"), "assert False\n");
+        // Through a materialized top, a link is judged from where it lands.
+        let (_t, base, copy) = base_and_copy();
+        fs::remove_dir_all(base.join("tests")).unwrap();
+        write(&base, "deep/suite/check.sh", "exit 1\n");
+        symlink("check.sh", base.join("deep/suite/again")).unwrap();
+        symlink("deep/suite", base.join("tests")).unwrap();
+        restore_protected(&copy, &base, &defaults()).unwrap();
+        assert!(fs::symlink_metadata(copy.join("tests/again"))
+            .unwrap()
+            .file_type()
+            .is_file());
     }
 
     #[test]

@@ -181,7 +181,20 @@ impl TurnFold {
                 self.parts.push(text.to_owned());
             }
             kind if TERMINAL.contains(&kind) => {
-                self.outcome = Some(kind.to_owned());
+                let mut outcome = kind.to_owned();
+                // A failed execution says why (`provider.no-route`, `provider.quota`, ...).
+                if let Some(error) = data.get("error") {
+                    let reason = format!(
+                        "{}: {}",
+                        error["type"].as_str().unwrap_or("unknown"),
+                        error["message"].as_str().unwrap_or("")
+                    );
+                    outcome = format!(
+                        "{outcome} ({})",
+                        reason.chars().take(512).collect::<String>()
+                    );
+                }
+                self.outcome = Some(outcome);
                 return Ok(true);
             }
             _ => {}
@@ -211,8 +224,9 @@ impl TurnFold {
                 self.session = Some(id.to_owned());
             }
             "error" => bail!(
-                "OpenCode guest driver failed during {}",
-                frame["stage"].as_str().unwrap_or("an unknown step")
+                "OpenCode guest driver failed during {} (HTTP {})",
+                frame["stage"].as_str().unwrap_or("an unknown step"),
+                frame["status"]
             ),
             other => bail!("unknown OpenCode guest frame {other}"),
         }
@@ -257,6 +271,8 @@ mod tests {
     const DRIVER_TURN: &str = include_str!("fixtures/opencode-2.0.24-driver-text-turn.jsonl");
     const ZAI_TURN: &str = include_str!("fixtures/opencode-2.0.24-zai-coding-plan-turn.jsonl");
     const OPENROUTER_TURN: &str = include_str!("fixtures/opencode-2.0.24-openrouter-turn.jsonl");
+    const VARIANT_UNAVAILABLE: &str =
+        include_str!("fixtures/opencode-2.0.24-variant-unavailable.jsonl");
 
     fn session_of(capture: &str) -> String {
         capture
@@ -359,37 +375,63 @@ mod tests {
         assert_eq!(usage.unwrap().output_tokens, Some(7));
     }
 
-    /// The guest driver's output from real GLM turns, z.ai's coding plan
-    /// (which models.dev prices at zero) and OpenRouter, run outside a VM.
+    /// Folds the guest driver's output from a live run, asserting it was driven by
+    /// exactly the session `turn_document` builds for `model` at effort `high`.
+    fn live(capture: &str, model: &str) -> (Result<Completed>, Option<TurnUsage>) {
+        let plan = plan(model, "high").unwrap();
+        let sent = turn_document(&plan, "")["session"]["model"].clone();
+        let mut fold = TurnFold::default();
+        let mut done = false;
+        for line in capture.lines() {
+            assert!(!done, "frames after the outcome");
+            let frame: Value = serde_json::from_str(line).unwrap();
+            if frame["type"] == "session.created" {
+                assert_eq!(frame["data"]["model"], sent, "{model}");
+            }
+            done = fold.observe(&frame).unwrap();
+        }
+        assert!(done, "{model}");
+        fold.finish(32_768)
+    }
+
+    /// Real GLM turns, z.ai's coding plan (which models.dev prices at zero) and
+    /// OpenRouter, captured from the guest driver run outside a VM.
     #[test]
     fn live_glm_turns_fold_to_the_answer_and_usage() {
-        for (capture, model, cost, input, output) in [
-            (ZAI_TURN, "zai-coding-plan/glm-5.3-flash", 0.0, 354, 42),
+        for (capture, model, usage) in [
+            (
+                ZAI_TURN,
+                "zai-coding-plan/glm-5.3-flash",
+                json!({"cost_usd": 0.0, "input_tokens": 354, "output_tokens": 44,
+                    "cache_read_tokens": 0, "cache_write_tokens": 0}),
+            ),
             (
                 OPENROUTER_TURN,
-                "openrouter/z-ai/glm-4.5-air",
-                0.00010147,
-                349,
-                66,
+                "openrouter/z-ai/glm-5.3-flash",
+                json!({"cost_usd": 0.00002203, "input_tokens": 24, "output_tokens": 17,
+                    "cache_read_tokens": 331, "cache_write_tokens": 0}),
             ),
         ] {
-            assert!(plan(model, "low").is_ok(), "{model}");
-            let mut fold = TurnFold::default();
-            let mut done = false;
-            for line in capture.lines() {
-                assert!(!done, "frames after the outcome");
-                done = fold.observe(&serde_json::from_str(line).unwrap()).unwrap();
-            }
-            assert!(done, "{model}");
-            let (completed, usage) = fold.finish(32_768);
+            let (completed, spent) = live(capture, model);
             let completed = completed.unwrap();
             assert_eq!(completed.text, "The capital of France is Paris.");
             assert_eq!(completed.harness_version, "2.0.24");
-            let usage = usage.unwrap();
-            assert_eq!(usage.cost_usd, Some(cost), "{model}");
-            assert_eq!(usage.input_tokens, Some(input), "{model}");
-            assert_eq!(usage.output_tokens, Some(output), "{model}");
+            assert_eq!(
+                serde_json::to_value(spent.unwrap()).unwrap(),
+                usage,
+                "{model}"
+            );
         }
+    }
+
+    /// A model without the requested variant fails the turn; the effort is never
+    /// dropped to make it run.
+    #[test]
+    fn a_live_turn_without_the_variant_fails() {
+        let (completed, spent) = live(VARIANT_UNAVAILABLE, "openrouter/z-ai/glm-4.5-air");
+        let error = completed.unwrap_err().to_string();
+        assert!(error.contains("Variant unavailable"), "{error}");
+        assert_eq!(spent, None);
     }
 
     #[test]

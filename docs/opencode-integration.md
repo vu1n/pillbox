@@ -125,11 +125,15 @@ OpenAI-compatible provider (fixtures `src/execution/fixtures/opencode-2.0.24-*`)
 - The model catalog comes from `models.dev` at startup (an empty catalog when it
   is unreachable), so the text VM allows that host besides the provider's.
 - Real GLM turns through the guest driver (outside a VM) completed on
-  `zai-coding-plan/glm-5.3-flash` and `openrouter/z-ai/glm-4.5-air`, with the
-  key supplied through the provider's environment variable (`ZHIPU_API_KEY`
-  for both z.ai providers). Both answered in one step. OpenRouter reported a
-  nonzero cost; models.dev prices the coding plan at zero. Fixtures:
-  `opencode-2.0.24-{zai-coding-plan,openrouter}-turn.jsonl`.
+  `zai-coding-plan/glm-5.3-flash` and `openrouter/z-ai/glm-5.3-flash` at variant
+  `high`, with the key supplied through the provider's environment variable
+  (`ZHIPU_API_KEY` for both z.ai providers; `zai/` is z.ai's pay-as-you-go
+  endpoint, a separate balance). Both answered in one step; OpenRouter reported
+  cost and cache reads, and models.dev prices the coding plan at zero.
+  `openrouter/z-ai/glm-4.5-air` has no variants at all, so every effort fails it
+  with `provider.no-route`: a text turn can only select a model that has a
+  variant. Fixtures: `opencode-2.0.24-{zai-coding-plan,openrouter}-turn.jsonl`,
+  `opencode-2.0.24-variant-unavailable.jsonl`.
 
 ## Not verified
 

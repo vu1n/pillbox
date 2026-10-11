@@ -17,7 +17,9 @@ use super::protocol;
 use super::store::OwnedInvocation;
 use super::text::{self, FailedStage, TextExecution, TextLimits, TextRequest, TextRuntime};
 use super::usage::TurnUsage;
-use super::{digest, HarnessTransport, ModelProfile, SessionIdentity, TextOutputFormat};
+use super::{
+    digest, EvidenceRef, HarnessTransport, ModelProfile, SessionIdentity, TextOutputFormat,
+};
 use crate::contract::{Custom, Payload};
 use crate::pillbox::Pillbox;
 use crate::sandbox::libkrun::repository::TeardownUnconfirmed;
@@ -97,8 +99,15 @@ impl TextRequestV2 {
             "codex" => self
                 .codex_request(runner_image_id)
                 .map(|lowered| Lowered::Codex(Box::new(lowered))),
-            "opencode" => opencode::plan(&self.agent.model, &self.agent.reasoning_effort)
-                .map(Lowered::Opencode),
+            "opencode" => {
+                text::validate_turn_bounds(
+                    &self.rendered_input,
+                    &self.output_format,
+                    &self.limits,
+                )?;
+                opencode::plan(&self.agent.model, &self.agent.reasoning_effort)
+                    .map(Lowered::Opencode)
+            }
             other => bail!("no text driver for harness {other}"),
         }
     }
@@ -165,57 +174,55 @@ pub(crate) fn execute(
         Ok(resolved) => resolved,
         Err(rejection) => return unresolved(pb, request, owner, rejection),
     };
-    let lowered = match lowered {
-        Lowered::Codex(lowered) => *lowered,
+    let turn = match lowered {
+        Lowered::Codex(lowered) => match text::execute_with(pb, &lowered, owner, false) {
+            Ok((completion, observed)) => Ok(Turn {
+                harness_version: observed
+                    .cli_version
+                    .context("Codex did not report its version")?,
+                served_model: completion.served_model,
+                session_ref: completion.session_ref,
+                output_text: completion.output_text,
+                usage: observed.usage,
+            }),
+            Err(error) => Err(error),
+        },
         Lowered::Opencode(plan) => {
-            return match super::text_opencode::execute(pb, request, &plan, &runner_image_id, owner)
-            {
-                Ok(finished) => {
-                    let mut detail = json!({
-                        "invocation_id": request.invocation_id,
-                        "request_hash": owner.record().request_hash,
-                        "resolved": {
-                            "harness": request.agent.harness,
-                            "harness_version": finished.harness_version,
-                            "adapter_revision": ADAPTER_REVISION,
-                            "runner_image_id": runner_image_id,
-                            "requested_model": request.agent.model,
-                            // OpenCode does not surface the provider's model id.
-                            "served_model": null,
-                        },
-                        "session_ref": finished.session_ref,
-                        "output_text": finished.output_text,
-                    });
-                    with_usage(&mut detail, finished.usage.as_ref());
-                    Ok(Outcome::Completed(detail))
-                }
-                Err(error) => failed(request, owner, error),
-            };
+            super::text_opencode::execute(pb, request, &plan, &runner_image_id, owner)
         }
     };
-    match text::execute_with(pb, &lowered, owner, false) {
-        Ok((completion, observed)) => {
+    match turn {
+        Ok(turn) => {
             let mut detail = json!({
-                "invocation_id": completion.invocation_id,
-                "request_hash": completion.request_hash,
+                "invocation_id": request.invocation_id,
+                "request_hash": owner.record().request_hash,
                 "resolved": {
                     "harness": request.agent.harness,
-                    "harness_version": observed
-                        .cli_version
-                        .context("Codex did not report its version")?,
+                    "harness_version": turn.harness_version,
                     "adapter_revision": ADAPTER_REVISION,
                     "runner_image_id": runner_image_id,
-                    "requested_model": completion.requested_model,
-                    "served_model": completion.served_model,
+                    "requested_model": request.agent.model,
+                    "served_model": turn.served_model,
                 },
-                "session_ref": completion.session_ref,
-                "output_text": completion.output_text,
+                "session_ref": turn.session_ref,
+                "output_text": turn.output_text,
             });
-            with_usage(&mut detail, observed.usage.as_ref());
+            with_usage(&mut detail, turn.usage.as_ref());
             Ok(Outcome::Completed(detail))
         }
         Err(error) => failed(request, owner, error),
     }
+}
+
+/// A completed turn, whichever driver ran it.
+pub(crate) struct Turn {
+    pub(crate) output_text: String,
+    /// Reported by the harness itself, never assumed from the runner image.
+    pub(crate) harness_version: String,
+    /// The provider's own model id, when the harness surfaces it.
+    pub(crate) served_model: Option<String>,
+    pub(crate) session_ref: EvidenceRef,
+    pub(crate) usage: Option<TurnUsage>,
 }
 
 /// The failure record for a turn that started. An unconfirmed VM teardown is
@@ -441,7 +448,22 @@ mod tests {
         for model in ["opencode/big-pickle-free", "ollama/llama3", "glm-4.5-air"] {
             assert!(request("opencode", model).lower(image.clone()).is_err());
         }
-        assert!(request("pi", "any/model").lower(image).is_err());
+        assert!(request("pi", "any/model").lower(image.clone()).is_err());
+    }
+
+    #[test]
+    fn opencode_selection_is_held_to_the_shared_turn_bounds() {
+        let image = format!("sha256:{}", "b".repeat(64));
+        let model = "zai-coding-plan/glm-4.5-air";
+        let mut unbounded = request("opencode", model);
+        unbounded.limits.timeout_ms = u64::MAX;
+        let mut json_output = request("opencode", model);
+        json_output.output_format.kind = "json".into();
+        let mut empty = request("opencode", model);
+        empty.rendered_input.clear();
+        for invalid in [unbounded, json_output, empty] {
+            assert!(invalid.lower(image.clone()).is_err());
+        }
     }
 
     #[test]

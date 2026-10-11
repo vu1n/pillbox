@@ -190,11 +190,11 @@ impl TextRequest {
             self.idempotency_key == self.invocation_id,
             "invocation/idempotency mismatch"
         );
-        ensure!(
-            !self.rendered_input.is_empty()
-                && self.rendered_input.len() <= MAX_RENDERED_INPUT_BYTES,
-            "rendered input must contain 1..524288 UTF-8 bytes"
-        );
+        validate_turn_bounds(
+            &self.rendered_input,
+            &self.output_format,
+            &self.runtime.limits,
+        )?;
         ensure!(
             self.rendered_input_hash == digest(self.rendered_input.as_bytes()),
             "rendered input digest mismatch"
@@ -206,10 +206,6 @@ impl TextRequest {
         ensure!(
             self.execution_policy_revision == POLICY_REVISION,
             "unsupported text execution policy"
-        );
-        ensure!(
-            self.output_format.kind == "text" && self.output_format.retry_count == 0,
-            "unsupported text output format"
         );
         let execution = &self.execution;
         ensure!(
@@ -257,26 +253,43 @@ impl TextRequest {
             runtime.network_hosts == ["chatgpt.com"],
             "unsupported text network policy"
         );
-        let limits = &runtime.limits;
-        ensure!(
-            (1..=super::MAX_TIMEOUT_MS).contains(&limits.timeout_ms),
-            "invalid text timeout"
-        );
-        ensure!(
-            (1..=MAX_FINAL_TEXT_BYTES).contains(&limits.max_final_text_bytes),
-            "invalid final text byte limit"
-        );
-        ensure!(
-            (1..=super::MAX_FRAME_BYTES).contains(&limits.max_frame_bytes),
-            "invalid native frame byte limit"
-        );
-        ensure!(
-            (1..=super::MAX_EVIDENCE_BYTES).contains(&limits.max_evidence_bytes)
-                && limits.max_frame_bytes <= limits.max_evidence_bytes,
-            "invalid native evidence byte limit"
-        );
         Ok(profile)
     }
+}
+
+/// The input, output and resource bounds every text driver enforces before it
+/// claims a VM, whatever the harness.
+pub(crate) fn validate_turn_bounds(
+    rendered_input: &str,
+    output_format: &TextOutputFormat,
+    limits: &TextLimits,
+) -> Result<()> {
+    ensure!(
+        !rendered_input.is_empty() && rendered_input.len() <= MAX_RENDERED_INPUT_BYTES,
+        "rendered input must contain 1..524288 UTF-8 bytes"
+    );
+    ensure!(
+        output_format.kind == "text" && output_format.retry_count == 0,
+        "unsupported text output format"
+    );
+    ensure!(
+        (1..=super::MAX_TIMEOUT_MS).contains(&limits.timeout_ms),
+        "invalid text timeout"
+    );
+    ensure!(
+        (1..=MAX_FINAL_TEXT_BYTES).contains(&limits.max_final_text_bytes),
+        "invalid final text byte limit"
+    );
+    ensure!(
+        (1..=super::MAX_FRAME_BYTES).contains(&limits.max_frame_bytes),
+        "invalid native frame byte limit"
+    );
+    ensure!(
+        (1..=super::MAX_EVIDENCE_BYTES).contains(&limits.max_evidence_bytes)
+            && limits.max_frame_bytes <= limits.max_evidence_bytes,
+        "invalid native evidence byte limit"
+    );
+    Ok(())
 }
 
 fn validate_id(value: &str) -> Result<()> {

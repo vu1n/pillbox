@@ -570,7 +570,10 @@ image carries) in its own invocation-owned microVM, with no shares:
   model catalog. Zen's `*-free` models are rejected at `resolve`, because the
   free tier refuses a session without tools.
 - `agent.reasoning_effort` is sent as the model's variant. A model without that
-  variant fails the turn; it is never dropped.
+  variant fails the turn; it is never dropped. Variant names differ per model,
+  and some models have none, so those cannot run a text turn.
+- The input, `output_format` and `limits` are held to the same bounds as Codex
+  (`text/0` output only) before any VM work.
 - Tools are denied by a `deny` rule for every action, in the server config and
   on the session, so OpenCode sends the model no tools. A tool call, a
   permission request or a form still fails the turn (`runtime_protocol_error`

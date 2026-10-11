@@ -14,9 +14,8 @@ use super::evidence::ExecutionEvidence;
 use super::opencode::{self, Plan, TurnFold};
 use super::store::OwnedInvocation;
 use super::text::{check_live, FailedStage, Stages};
-use super::text_v2::{TextRequestV2, ADAPTER_REVISION};
+use super::text_v2::{TextRequestV2, Turn, ADAPTER_REVISION};
 use super::usage::TurnUsage;
-use super::EvidenceRef;
 use crate::contract::{Custom, Payload};
 use crate::pillbox::Pillbox;
 use crate::sandbox::libkrun::repository::opencode::{launch_staged, OpencodeInput};
@@ -26,20 +25,13 @@ use crate::sandbox::libkrun::repository::VmLimits;
 /// clear reason instead of at evidence time.
 const MAX_FRAMES: usize = 16_000;
 
-pub(crate) struct Finished {
-    pub(crate) output_text: String,
-    pub(crate) harness_version: String,
-    pub(crate) session_ref: EvidenceRef,
-    pub(crate) usage: Option<TurnUsage>,
-}
-
 pub(crate) fn execute(
     pb: &Pillbox,
     request: &TextRequestV2,
     plan: &Plan,
     runner_image_id: &str,
     owner: &mut OwnedInvocation,
-) -> Result<Finished> {
+) -> Result<Turn> {
     let deadline = Instant::now() + Duration::from_millis(request.limits.timeout_ms);
     check_live(owner, deadline)?;
     let session_id = &request.session_ref.session_id;
@@ -89,9 +81,11 @@ pub(crate) fn execute(
                 session_id,
                 None,
             );
-            Ok(Finished {
+            Ok(Turn {
                 output_text,
                 harness_version,
+                // OpenCode does not surface the provider's model id.
+                served_model: None,
                 session_ref: evidence.reference(),
                 usage,
             })
@@ -183,9 +177,12 @@ fn run(
             stream,
             limits.max_frame_bytes,
             limits.max_evidence_bytes,
-            || {
+            |idle| {
                 check_live(owner, deadline)?;
-                vm.check_running(&cancelled)
+                if idle {
+                    vm.check_running(&cancelled)?;
+                }
+                Ok(())
             },
         )
     })();
@@ -250,18 +247,21 @@ struct Capture {
 
 impl Capture {
     /// Read until the turn reaches an outcome. Frames read before a failure stay in
-    /// `frames`, so a refused tool call is still in the evidence.
+    /// `frames`, so a refused tool call is still in the evidence. `poll(idle)` runs
+    /// before every read and again when a read times out; only an idle poll may fail
+    /// on the VM having exited, because the guest exits right after it sends the
+    /// outcome, which can still be buffered in the stream.
     fn read(
         &mut self,
         mut stream: UnixStream,
         max_frame_bytes: u64,
         max_bytes: u64,
-        mut poll: impl FnMut() -> Result<()>,
+        mut poll: impl FnMut(bool) -> Result<()>,
     ) -> Result<()> {
         let mut line = Vec::new();
         let mut chunk = [0u8; 8192];
         loop {
-            poll()?;
+            poll(false)?;
             let count = match stream.read(&mut chunk) {
                 Ok(0) => bail!("OpenCode guest closed the stream before the turn ended"),
                 Ok(count) => count,
@@ -273,7 +273,8 @@ impl Capture {
                             | std::io::ErrorKind::Interrupted
                     ) =>
                 {
-                    continue
+                    poll(true)?;
+                    continue;
                 }
                 Err(error) => return Err(error).context("read the OpenCode guest stream"),
             };
@@ -332,19 +333,23 @@ mod tests {
 
     #[test]
     fn a_missing_credential_store_fails_before_any_vm_work() {
-        let temp = tempfile::tempdir().unwrap();
-        let pb = Pillbox {
-            scope: crate::pillbox::Scope::Global,
-            state_dir: temp.path().into(),
-            meta: None,
-        };
-        let error = credential_dir(&pb).unwrap_err().to_string();
-        assert!(error.contains("auth login --agent opencode"), "{error}");
-        let spec = crate::agents::lookup("test", "opencode").unwrap();
-        let store = spec.home_dir(&pb).unwrap().join(spec.cred_sentinel);
-        std::fs::create_dir_all(store.parent().unwrap()).unwrap();
-        std::fs::write(&store, b"sqlite").unwrap();
-        assert_eq!(credential_dir(&pb).unwrap(), store.parent().unwrap());
+        // The OpenCode home resolves through the global pillbox, so keep it off
+        // the real one.
+        crate::test_util::with_isolated_home("text-opencode-credentials", || {
+            let temp = tempfile::tempdir().unwrap();
+            let pb = Pillbox {
+                scope: crate::pillbox::Scope::Global,
+                state_dir: temp.path().into(),
+                meta: None,
+            };
+            let error = credential_dir(&pb).unwrap_err().to_string();
+            assert!(error.contains("auth login --agent opencode"), "{error}");
+            let spec = crate::agents::lookup("test", "opencode").unwrap();
+            let store = spec.home_dir(&pb).unwrap().join(spec.cred_sentinel);
+            std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+            std::fs::write(&store, b"sqlite").unwrap();
+            assert_eq!(credential_dir(&pb).unwrap(), store.parent().unwrap());
+        });
     }
 
     #[test]
@@ -355,9 +360,24 @@ mod tests {
         lines.push(json!({"type": "session.execution.succeeded", "data": {"sessionID": "ses_1"}}));
         let mut capture = Capture::default();
         capture
-            .read(turn(&lines), 1024, 1 << 20, || Ok(()))
+            .read(turn(&lines), 1024, 1 << 20, |_| Ok(()))
             .unwrap();
         assert_eq!(capture.frames.len(), 4);
+        assert_eq!(capture.fold.finish(16).0.unwrap().text, "hi");
+    }
+
+    #[test]
+    fn an_outcome_buffered_after_the_vm_exits_still_completes() {
+        let mut lines = opening();
+        lines.push(json!({"type": "session.text.ended",
+            "data": {"sessionID": "ses_1", "assistantMessageID": "msg_1", "text": "hi"}}));
+        lines.push(json!({"type": "session.execution.succeeded", "data": {"sessionID": "ses_1"}}));
+        let exited = |idle: bool| -> Result<()> {
+            ensure!(!idle, "owned VMM exited before completion");
+            Ok(())
+        };
+        let mut capture = Capture::default();
+        capture.read(turn(&lines), 1024, 1 << 20, exited).unwrap();
         assert_eq!(capture.fold.finish(16).0.unwrap().text, "hi");
     }
 
@@ -370,7 +390,7 @@ mod tests {
         );
         let read = |max_frame, max_bytes| {
             Capture::default()
-                .read(turn(&lines), max_frame, max_bytes, || Ok(()))
+                .read(turn(&lines), max_frame, max_bytes, |_| Ok(()))
                 .unwrap_err()
                 .to_string()
         };
@@ -384,7 +404,7 @@ mod tests {
         let mut lines = opening();
         lines.push(json!({"type": "session.tool.called", "data": {"sessionID": "ses_1"}}));
         let mut capture = Capture::default();
-        let error = capture.read(turn(&lines), 1024, 1 << 20, || Ok(()));
+        let error = capture.read(turn(&lines), 1024, 1 << 20, |_| Ok(()));
         assert!(error.unwrap_err().to_string().contains("tool"));
         assert_eq!(capture.frames.len(), 3);
     }

@@ -178,14 +178,21 @@ fn prepare_guest(
 /// Copy the credential store (never link it: the guest writes its session into the
 /// copy, which is discarded with the VM). The store itself must exist.
 fn copy_credentials(source: &Path, destination: &Path) -> Result<()> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
     let mut total = 0u64;
     for (index, name) in CREDENTIAL_FILES.iter().enumerate() {
-        let path = source.join(name);
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
+        // Checked on the opened handle, so a symlink or FIFO swapped in cannot be read.
+        let opened = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(source.join(name));
+        let file = match opened {
+            Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && index > 0 => continue,
             Err(error) => return Err(error).context("read the OpenCode credential store"),
         };
+        let metadata = file.metadata()?;
         ensure!(
             metadata.is_file(),
             "OpenCode credential store entry {name} is not a regular file"
@@ -195,7 +202,9 @@ fn copy_credentials(source: &Path, destination: &Path) -> Result<()> {
             total <= MAX_CREDENTIAL_STORE,
             "OpenCode credential store is larger than {MAX_CREDENTIAL_STORE} bytes"
         );
-        write_private_file(&destination.join(name), &fs::read(&path)?)?;
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.take(metadata.len()).read_to_end(&mut bytes)?;
+        write_private_file(&destination.join(name), &bytes)?;
     }
     Ok(())
 }
@@ -323,7 +332,7 @@ def main():
         if stream.status != 200:
             fail(host, 'events', stream.status, stream.read(4096))
         while True:
-            line = stream.fp.readline(limits['max_frame_bytes'] + 8)
+            line = stream.readline(limits['max_frame_bytes'] + 8)
             if not line:
                 raise RuntimeError('event stream closed')
             if line.startswith(b'data: ') and b'"server.connected"' in line:
@@ -339,7 +348,7 @@ def main():
             fail(host, 'prompt', status, body)
         while True:
             remaining(deadline)
-            line = stream.fp.readline(limits['max_frame_bytes'] + 8)
+            line = stream.readline(limits['max_frame_bytes'] + 8)
             if not line:
                 raise RuntimeError('event stream closed')
             if not line.startswith(b'data: '):
@@ -371,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn the_vm_has_no_shares_no_swap_and_only_the_resolved_hosts() {
+    fn the_vm_has_no_shares_or_refresh_and_only_the_resolved_hosts() {
         let value = input(Path::new("/host/opencode"));
         validate(&value).unwrap();
         let spec = spec(
@@ -408,5 +417,11 @@ mod tests {
             b"wal"
         );
         assert!(!destination.path().join("opencode.db-shm").exists());
+        std::os::unix::fs::symlink(
+            source.path().join("opencode.db"),
+            source.path().join("opencode.db-shm"),
+        )
+        .unwrap();
+        assert!(copy_credentials(source.path(), destination.path()).is_err());
     }
 }

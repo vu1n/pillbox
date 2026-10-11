@@ -23,6 +23,7 @@ The common changes are:
 | `src/sandbox/libkrun/repository.rs` | Register the Claude launcher and add console-only draining for a one-shot guest whose terminal RPC bytes remain queued after exit. Existing callers retain their liveness checks. |
 | `src/vault/refresh.rs`, `src/vault/mod.rs` | Add `pre_refresh_until(path, auth_id, deadline)`. Its lock wait and single HTTP grant share the invocation budget. Existing `pre_refresh` callers retain their 35-second lock and 30-second HTTP limits and rotation semantics. |
 | `.github/workflows/ci.yml` | Run the Claude supervisor fixtures and live-script syntax check offline on Linux. |
+| `.brief/SIGNOFF` | Record conformance of the bounded host refresh to the existing OAuth broker decision. |
 
 `src/execution/usage.rs` is unchanged: Claude's `result.total_cost_usd` and
 non-overlapping input/output/cache counts already have the required mapping.
@@ -35,7 +36,7 @@ For integration, inspect only the common diff with:
 git diff 354428cc5cda503c078e6167b797271e22b604b9 HEAD -- \
   src/execution/mod.rs src/execution/text.rs src/execution/text_v2.rs \
   src/sandbox/libkrun/repository.rs src/vault/mod.rs src/vault/refresh.rs \
-  .github/workflows/ci.yml
+  .github/workflows/ci.yml .brief/SIGNOFF
 ```
 
 ## Cloud validation
@@ -60,11 +61,16 @@ The final reviews reported no remaining material correctness or security finding
 The local cleanup pass retained explicit protocol guards, simplified the launch
 input and avoided a duplicate result parser in the guest supervisor.
 
-Exact validation commands (cloud-dev used a workspace-local stable Rust toolchain):
+Exact validation commands are below. In cloud-dev, each `cargo` invocation was
+prefixed with `CARGO_HOME=/workspace/pillbox-toolchain/cargo
+RUSTUP_HOME=/workspace/pillbox-toolchain/rustup` and used
+`/workspace/pillbox-toolchain/cargo/bin/cargo` (stable Rust 1.99.0).
 
 ```sh
 UV_CACHE_DIR=/tmp/pillbox-uv-cache UV_TOOL_DIR=/tmp/pillbox-uv-tools \
   uvx --from git+https://github.com/vu1n/brief@v0.4.2 brief pin
+UV_CACHE_DIR=/tmp/pillbox-uv-cache UV_TOOL_DIR=/tmp/pillbox-uv-tools \
+  uvx --from git+https://github.com/vu1n/brief@v0.4.2 brief check
 UV_CACHE_DIR=/tmp/pillbox-uv-cache UV_TOOL_DIR=/tmp/pillbox-uv-tools \
   uvx --from git+https://github.com/vu1n/brief@v0.4.2 brief check \
   --base origin/claude/project-thread-zucgk7

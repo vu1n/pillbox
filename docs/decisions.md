@@ -244,7 +244,7 @@ normalizer are deleted. Docker refuses server agents with a usage error.
   fixes; see ADR-002).
 
 ## 2026-10-11 — pillbox becomes Stratus's Rust engine
-**Status: Accepted by Vu (2026-10-11), pending ratification of this wording.**
+**Status: Accepted by Vu (2026-10-11); wording ratified 2026-10-11.**
 
 - **Decision:** Stratus (`vu1n/stratus`, TypeScript) becomes the user-facing
   entry point for local and cloud agent sessions. The `pillbox` binary becomes

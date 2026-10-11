@@ -104,7 +104,13 @@ Rules (from the contract):
 - **`-k 3`** for short horizons (k=3–5 saturates; diversity gains flatten beyond).
   `-k 1` = pure segmentation with no diversity. Pass it explicitly: the CLI default is `-k 3`.
 - **`--retries 1`** (the default) — one distilled retry per failing gate. Raise only
-  for flaky/hard checkpoints; it costs a full re-drive each.
+  for flaky/hard checkpoints; it costs a full re-drive each. With a `--rubric`
+  grade, `--stall-limit 2` (the default) stops a worker after two retries in a row
+  that don't raise its score, so a raised budget isn't spent on a worker going in
+  circles. A `stalled: true` worker is a signal to re-plan or escalate, not to retry.
+- **`--baseline-check`** whenever you wrote the reward yourself — it grades the
+  untouched bookmark first and refuses (exit 2) a reward that already passes there,
+  which would otherwise pick a worker that did nothing.
 - **`--temperature 0.7`** whenever `-k > 1` — without it the forks are degenerate.
 - **Reward is always required** — give exactly one of `--cmd` / `--rubric` (a missing
   or doubled grader is a usage error, exit 2).

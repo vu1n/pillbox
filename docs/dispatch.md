@@ -52,6 +52,8 @@ pillbox dispatch --from-bookmark seg-3 -k 3 --rubric grade.txt \
 | `--rubric FILE` | — | Grader: a rubric file (`NAME :: COMMAND` per line, `#`/blank lines ignored) → per-criterion verdicts + a fractional score. Mutually exclusive with `--cmd`. Same format `session score --rubric` parses. In `--segments` mode this stays the **final reward** (the gates are per-segment). |
 | `--segments SPEC` | — | Drive an ordered **segment chain** (TOML, below) in ONE session per worker — the proven in-session segmentation lever (`docs/optimization-gate.md` §2026-06-19) — instead of one prompt. Composes with `-k` (best-of-k over chains). See **Segments** below. |
 | `--retries N` | `1` | Per-worker retry budget when the grade fails — the failing criteria are fed back as the next prompt and the worker is re-graded, up to `N` times. With `--segments`, this is the **per-segment** gate-retry budget. |
+| `--stall-limit N` | `2` | **Non-convergence breaker.** Stop re-driving a worker after `N` retries in a row that don't raise its best `--rubric` score, even with `--retries` budget left: it is going in circles (the same failures, or a new one for each one it fixes). Applies per segment with `--segments`. `--cmd` grades are 0 until they pass, so they carry no progress signal and keep the plain budget. Never fires at the default `--retries 1`; it matters once the budget is raised. `0` disables it. A stalled worker ends `failed` with `"stalled": true`. |
+| `--baseline-check` | off | Before forking, restore `--from-bookmark` into a temp dir and grade it with the reward and every segment gate. A gate has to **fail** on the untouched base to mean anything (the dispatch form of "a new test fails without the change"). A reward that already passes there stops the run with exit 2 before any worker boots; a segment gate that passes only warns. The result rides in the verdict as `baseline`. |
 | `--agent AGENT` | pillbox `agent =`, then `claude` | Worker agent (`claude` \| `codex` \| `opencode` \| …). |
 | `--model MODEL` | agent default | Worker model override, forwarded to each worker's run. |
 | `--temperature FLOAT` | agent default | Per-fork sampling temperature, forwarded to each worker — the diversity knob that keeps best-of-`k` non-degenerate. |
@@ -161,11 +163,15 @@ pillbox's `--json` surface.
         "passed": true,          // did the grade pass (--cmd exit 0, or all rubric criteria)
         "retries_used": 0,       // retries this worker consumed (sum across segments in --segments mode)
         "status": "scored",      // "scored" | "failed" | "errored" | "unverified" (see below)
+        // ADDITIVE — present ONLY when the --stall-limit breaker ended this
+        // worker's retries early (always with status "failed").
+        // "stalled": true,
         // ADDITIVE — present ONLY for a --segments worker; omitted in fork-k mode.
         // The per-checkpoint trajectory, in order; `score` is the gate score.
         "segments": [
           { "name": "reroot",   "passed": true, "score": 1.0, "retries_used": 0 },
           { "name": "pathfind", "passed": true, "score": 1.0, "retries_used": 1 }
+          // a segment the breaker cut short also carries "stalled": true
         ],
         // ADDITIVE — present ONLY when --critic scored this worker (see Critic).
         "critic": { "critic": "typesafe", "model": "jev-latest", "p": 0.91,
@@ -184,7 +190,15 @@ pillbox's `--json` surface.
     "selection_rationale": "only passing worker (score 1.00)",
     // ADDITIVE — present ONLY when --critic was given.
     "critic": { "kind": "typesafe", "policy": "order", "model": "jev-latest",
-                "verifier_runs": 1, "verifier_runs_saved": 2 }
+                "verifier_runs": 1, "verifier_runs_saved": 2 },
+    // ADDITIVE — present ONLY with --baseline-check: how the reward and each
+    // segment gate graded the untouched bookmark. The reward always failed here
+    // (a passing one stops the run). `already_passing` lists rubric criteria that
+    // pass before any work, so they can't separate workers.
+    "baseline": {
+      "reward": { "passed": false, "score": 0.5, "already_passing": ["builds"] },
+      "segments": [ { "name": "reroot", "passed": false, "score": 0.0 } ]
+    }
   }
 }
 ```
@@ -236,7 +250,9 @@ The body schema:
   "criteria": [ { "name": "tests", "passed": true, "feedback": "5 passed" } ],
   "feedback": "…the grader's combined output…",
   "judge_report_ref": null,      // GHOST-011 hook (below)
-  "critic": { "critic": "typesafe", "p": 0.91, … }   // only when --critic ran (see Critic)
+  "critic": { "critic": "typesafe", "p": 0.91, … },  // only when --critic ran (see Critic)
+  "stalled": true,               // only when the --stall-limit breaker fired
+  "round_scores": [0.5, 0.5, 0.4]  // fork-k: the reward score of every graded attempt
 }
 ```
 

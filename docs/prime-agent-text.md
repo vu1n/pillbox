@@ -74,6 +74,67 @@ scripts/build-runner.sh --tag pillbox-runner:prime-text-qualification
 scripts/lk-build.sh
 ```
 
+The build script uses BuildKit to assemble the OCI image and runs package/version
+verification. Neither step invokes a model. libkrun extracts that image's rootfs
+and executes the turn in its owned VM. Cached images without the profile cannot
+be qualified by changing a tag or adding a host-side file; rebuild from this
+branch, then inspect the profile without starting a container:
+
+```sh
+python3 - <<'PY'
+import json, pathlib, subprocess, tempfile
+image = subprocess.check_output([
+    'docker', 'image', 'inspect', '--format', '{{.Id}}',
+    'pillbox-runner:prime-text-qualification'], text=True).strip()
+assert image.startswith('sha256:')
+container = subprocess.check_output(['docker', 'create', image], text=True).strip()
+try:
+    with tempfile.TemporaryDirectory(prefix='pillbox-prime-profile-') as directory:
+        profile_path = pathlib.Path(directory) / 'profile.json'
+        subprocess.run(['docker', 'cp',
+                        container + ':/opt/pillbox-prime-text/profile.json',
+                        str(profile_path)], check=True)
+        profile = json.loads(profile_path.read_text())
+        assert profile['schema_version'] == 1
+        assert profile['harness_version'] == '0.9.8'
+        model = next(m for m in profile['models']
+                     if m['id'] == 'openai/gpt-5-nano')
+        assert model['provider'] == 'prime-inference'
+        assert model['api'] == 'openai-completions'
+        assert model['baseUrl'] == 'https://api.pinference.ai/api/v1'
+        assert 'text' in model['input'] and model['reasoning']
+        assert model.get('thinkingLevelMap', {}).get('low', 'low') == 'low'
+        print(json.dumps({'runner_image_id': image,
+                          'harness_version': profile['harness_version'],
+                          'model': model['id'], 'catalog_cost': model.get('cost')},
+                         indent=2))
+finally:
+    subprocess.run(['docker', 'rm', container], check=True)
+PY
+```
+
+The credential prerequisite is an **already existing**
+`~/.pillbox/global/auth/prime-agent/.prime/agent/auth.json` containing a literal
+`prime-inference` entry with `type: "api_key"` and its owner's authorized Prime
+Inference key. The file must be owned by the current user, regular, single-link,
+private (0600), and at most 64 KiB. It must have Inference permission and enough
+credit in the key owner's personal Prime account: this adapter does not select
+a team billing account. Do not create/configure auth, borrow another harness's
+credential, or infer an account. If the file is absent, the live gate stays
+blocked (`runtime_unavailable` at `credentials`).
+
+For paid-turn approval, the qualified 0.9.8 catalog quotes GPT-5 Nano at
+$0.05 per million input tokens and $0.40 per million output tokens. The native
+default output limit is 32,000 tokens, including reasoning. At these catalog
+rates, 10,000 input tokens plus the full output limit costs $0.0133; **$0.02 for
+one invocation** is a conservative planning allowance for the marker request.
+This is not a driver-enforced dollar cap or a verified current Prime quote.
+Prime prices and availability can change; the parent must confirm both against
+the owner's Prime Inference account before approval. Stop if the chosen model
+is unavailable; no fallback or paid retry is authorized. See the official
+[Prime Inference overview](https://docs.primeintellect.ai/inference/overview)
+and [model catalog API](https://docs.primeintellect.ai/api-reference/inference-models).
+
 After approval, use a private directory for the request and result. This single
 small live request selects the image-owned `openai/gpt-5-nano` with low effort;
 if it is unavailable, stop and report resolve failure rather than substituting

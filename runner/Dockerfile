@@ -174,8 +174,8 @@ RUN curl -fsSL https://claude.ai/install.sh -o /tmp/claude-install.sh \
 	#   otherwise it rides along dead in the layer.
 
 # Prime Agent: keep the complete native release and its assets outside HOME.
-# Python kernel provisioning remains explicit; the CLI is available as a tool,
-# not yet as a Pillbox auth/session harness adapter.
+# Python kernel provisioning remains explicit; Pillbox registers the native
+# auth/session harness and qualifies its offline catalog for sealed text.
 RUN curl --proto '=https' --proto-redir '=https' -fsSL https://app.primeintellect.ai/prime-agent/install.sh -o /tmp/prime-agent-install.sh \
 	&& PRIME_AGENT_INSTALL_METHOD=binary PRIME_AGENT_INSTALLER_NONINTERACTIVE=1 \
 		PRIME_AGENT_BOOTSTRAP_KERNEL_ON_INSTALL=0 PRIME_AGENT_INSTALL_DIR=/opt/prime-agent \

@@ -52,6 +52,7 @@ pub(crate) mod repository;
 mod rootfs;
 mod rootfs_backing;
 mod session;
+pub(crate) mod text_harness;
 mod vault;
 
 // The control verbs (attach/teardown/§0 accessors) are driven through the

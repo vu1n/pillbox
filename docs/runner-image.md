@@ -36,12 +36,15 @@ rebuild silently reuses the stale layer instead of pulling the newer agent.
 | pi | `npm i -g @earendil-works/pi-coding-agent@<pinned>` | `PI_VERSION` | yes — npm |
 | prime-agent | official native installer, checksummed release archive under `/opt/prime-agent` | `PRIME_AGENT_VERSION` | no — stable feed via `build-runner.sh --update` |
 
-Prime Agent is bundled as a command-line tool. It is not yet registered as a
-Pillbox agent: `--agent prime-agent`, managed auth, and structured session events
-require a separate adapter. Its Python kernel dependencies are not pre-provisioned;
-workflows using that kernel still need an explicit setup step and network access.
-The complete native release lives outside the runtime HOME so its assets survive
-home-directory mounts.
+Prime Agent is registered as a Pillbox agent (`--agent prime-agent`, a structured
+one-shot like `pi`; it shares pi's adapter) and has a `pillbox.text/2` driver.
+`pillbox auth login --agent prime-agent` opens its TUI, where `/login` stores
+credentials in `~/.prime/agent/auth.json`. Its Python kernel is not pre-provisioned:
+a session that uses the Python REPL tool bootstraps it and needs network access,
+while tool-free text turns never load it. The complete native release lives outside
+the runtime HOME, under `/opt/prime-agent`, so its assets survive home-directory
+mounts; `/usr/local/bin/prime-agent` is a wrapper that execs its launcher. The
+installer is the Rust build's and takes the pin from `PRIME_AGENT_VERSION`.
 
 The October 4 refresh pins Claude 2.1.289, Codex 0.160.0, Cursor
 2026.10.01-e373342, Amp 0.0.1791091069-gb9917f, OpenCode 1.18.34, Pi 1.0.2,

@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::evidence::ExecutionEvidence;
+use super::pi_text::{self, PiHarness, Selection};
 use super::protocol;
 use super::store::OwnedInvocation;
 use super::text::{self, FailedStage, TextExecution, TextLimits, TextRequest, TextRuntime};
@@ -83,7 +84,7 @@ impl TextRequestV2 {
         ensure!(
             matches!(
                 self.agent.harness.as_str(),
-                "codex" | "claude_code" | "pi" | "opencode"
+                "codex" | "claude_code" | "pi" | "prime-agent" | "opencode"
             ),
             "unknown text harness"
         );
@@ -147,10 +148,15 @@ pub(crate) fn execute(
     request: &TextRequestV2,
     owner: &mut OwnedInvocation,
 ) -> Result<Outcome> {
-    let resolved = resolve(pb, request);
-    let (lowered, runner_image_id) = match resolved {
+    let (lowered, runner_image_id) = match resolve(pb, request) {
         Ok(resolved) => resolved,
         Err(rejection) => return unresolved(pb, request, owner, rejection),
+    };
+    let lowered = match lowered {
+        Lowered::Codex(lowered) => *lowered,
+        Lowered::Pi(selection) => {
+            return execute_pi(pb, request, owner, &selection, runner_image_id)
+        }
     };
     match text::execute_with(pb, &lowered, owner, false) {
         Ok((completion, observed)) => {
@@ -190,6 +196,70 @@ pub(crate) fn execute(
     }
 }
 
+/// Run a pi-family selection and seal its record the same way as Codex's.
+fn execute_pi(
+    pb: &Pillbox,
+    request: &TextRequestV2,
+    owner: &mut OwnedInvocation,
+    selection: &Selection,
+    runner_image_id: String,
+) -> Result<Outcome> {
+    let limits = &request.limits;
+    let invocation = pi_text::Invocation {
+        session_id: &request.session_ref.session_id,
+        invocation_id: &request.invocation_id,
+        rendered_input: &request.rendered_input,
+        limits: pi_text::Limits {
+            timeout_ms: limits.timeout_ms,
+            max_final_text_bytes: limits.max_final_text_bytes,
+            max_frame_bytes: limits.max_frame_bytes,
+            max_evidence_bytes: limits.max_evidence_bytes,
+        },
+    };
+    let mut guest = crate::sandbox::libkrun::text_harness::LibkrunTextGuest;
+    match pi_text::execute(
+        pb,
+        &invocation,
+        selection,
+        &runner_image_id,
+        owner,
+        &mut guest,
+    ) {
+        Ok(completion) => {
+            let mut detail = json!({
+                "invocation_id": request.invocation_id,
+                "request_hash": owner.record().request_hash,
+                "resolved": {
+                    "harness": request.agent.harness,
+                    "harness_version": completion.harness_version,
+                    "adapter_revision": pi_text::ADAPTER_REVISION,
+                    "runner_image_id": runner_image_id,
+                    "requested_model": completion.requested_model,
+                    "served_model": completion.served_model,
+                },
+                "session_ref": completion.session_ref,
+                "output_text": completion.output_text,
+            });
+            with_usage(&mut detail, completion.usage.as_ref());
+            Ok(Outcome::Completed(detail))
+        }
+        Err(error) if error.downcast_ref::<TeardownUnconfirmed>().is_some() => Err(error),
+        Err(error) => {
+            let failed = error.downcast_ref::<pi_text::Failed>();
+            let stage = failed.map_or("credentials", |failed| failed.stage);
+            let mut detail = json!({
+                "invocation_id": request.invocation_id,
+                "request_hash": owner.record().request_hash,
+                "code": failure_code(stage, &error),
+                "stage": stage,
+                "session_ref": owner.record().detail.get("session_ref"),
+            });
+            with_usage(&mut detail, failed.and_then(|failed| failed.usage.as_ref()));
+            Ok(Outcome::Failed(detail))
+        }
+    }
+}
+
 /// Add the turn's reported spend to a completed or failed record. A harness that
 /// reported nothing gets no `usage` key, never zeros.
 fn with_usage(detail: &mut Value, usage: Option<&TurnUsage>) {
@@ -204,28 +274,49 @@ struct Rejection {
     error: anyhow::Error,
 }
 
+/// What a selection resolved to, per driver.
+enum Lowered {
+    Codex(Box<TextRequest>),
+    Pi(Selection),
+}
+
 fn resolve(
     pb: &Pillbox,
     request: &TextRequestV2,
-) -> std::result::Result<(TextRequest, String), Rejection> {
-    // Only Codex has a tool-free text driver today. The other harnesses are valid
-    // selections that this build cannot run, which is a rejection, not a bad request.
-    if request.agent.harness != "codex" {
-        return Err(Rejection {
-            code: "runtime_rejected",
-            error: anyhow::anyhow!("no text driver for harness {}", request.agent.harness),
-        });
-    }
+) -> std::result::Result<(Lowered, String), Rejection> {
+    let rejected = |error| Rejection {
+        code: "runtime_rejected",
+        error,
+    };
+    // A harness without a tool-free text driver is a valid selection this build
+    // cannot run, which is a rejection, not a bad request. Models are checked before
+    // the image so an unservable one is rejected even where no image is available.
+    let pi = match request.agent.harness.as_str() {
+        "codex" => None,
+        harness => match PiHarness::from_selection(harness) {
+            Some(pi) => Some(
+                Selection::resolve(pi, &request.agent.model, &request.agent.reasoning_effort)
+                    .map_err(rejected)?,
+            ),
+            None => {
+                return Err(rejected(anyhow::anyhow!(
+                    "no text driver for harness {harness}"
+                )))
+            }
+        },
+    };
     let runner_image_id = runner_image_id(pb).map_err(|error| Rejection {
         code: "runtime_unavailable",
         error,
     })?;
-    let lowered = request
-        .codex_request(runner_image_id.clone())
-        .map_err(|error| Rejection {
-            code: "runtime_rejected",
-            error,
-        })?;
+    let lowered = match pi {
+        Some(selection) => Lowered::Pi(selection),
+        None => Lowered::Codex(Box::new(
+            request
+                .codex_request(runner_image_id.clone())
+                .map_err(rejected)?,
+        )),
+    };
     Ok((lowered, runner_image_id))
 }
 
@@ -343,7 +434,7 @@ mod tests {
 
     #[test]
     fn every_pillbox_harness_is_a_valid_selection() {
-        for harness in ["codex", "claude_code", "pi", "opencode"] {
+        for harness in ["codex", "claude_code", "pi", "prime-agent", "opencode"] {
             request(harness, "any-model").validate().unwrap();
         }
         assert!(request("custom", "any-model").validate().is_err());
@@ -368,6 +459,28 @@ mod tests {
         assert_eq!(lowered.runtime.runner_image_id, image);
         assert_eq!(lowered.execution.requested.profile, "luna");
         assert!(request("codex", "gpt-4").codex_request(image).is_err());
+    }
+
+    #[test]
+    fn pi_family_rejects_an_unservable_model_at_resolve() {
+        let temp = tempfile::tempdir().unwrap();
+        let pb = Pillbox {
+            scope: crate::pillbox::Scope::Global,
+            state_dir: temp.path().into(),
+            meta: None,
+        };
+        for harness in ["pi", "prime-agent"] {
+            for model in ["anthropic/claude-sonnet-404", "glm-5.3", "bedrock/nova"] {
+                let Err(rejection) = resolve(&pb, &request(harness, model)) else {
+                    panic!("{harness} resolved {model}")
+                };
+                assert_eq!(rejection.code, "runtime_rejected");
+            }
+        }
+        let Err(rejection) = resolve(&pb, &request("claude_code", "claude-sonnet-5")) else {
+            panic!("claude_code has no text driver here")
+        };
+        assert_eq!(rejection.code, "runtime_rejected");
     }
 
     #[test]

@@ -27,7 +27,7 @@ use crate::paths::write_private_file;
 use crate::vault::providers::codex_execution::CodexAccessRelease;
 
 const PROVIDER_HOST: &str = "chatgpt.com";
-const RPC_PORT: u32 = 1067;
+pub(super) const RPC_PORT: u32 = 1067;
 const MAX_DURATION: Duration = Duration::from_secs(86_400);
 const MAX_OUTPUT: u64 = 64 * 1024 * 1024;
 const MAX_FRAME: usize = crate::execution::MAX_FRAME_BYTES as usize;
@@ -37,8 +37,8 @@ const COMMAND_REPORT_LIMIT: usize = 96 * 1024;
 const MAX_IMAGE_ARCHIVE: u64 = 16 * 1024 * 1024 * 1024;
 const POLL: Duration = Duration::from_millis(20);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
-const GUEST_RUNTIME: &str = "/opt/pillbox-execution";
-const GUEST_HOME: &str = "/home/pillbox";
+pub(super) const GUEST_RUNTIME: &str = "/opt/pillbox-execution";
+pub(super) const GUEST_HOME: &str = "/home/pillbox";
 const GUEST_CODEX_HOME: &str = "/home/pillbox/.codex";
 const OFFLINE_LOCALHOST_HOSTS: &[u8] = b"127.0.0.1 localhost\n::1 localhost\n";
 
@@ -95,6 +95,14 @@ pub(super) struct OwnershipSpec {
 }
 
 impl OwnershipSpec {
+    /// Owner liveness on `socket`, with the bounded invocation's remaining time.
+    pub(super) fn bounded(socket: &Path, remaining_ms: u64) -> Self {
+        Self {
+            socket: socket.to_string_lossy().into_owned(),
+            remaining_ms: Some(remaining_ms),
+        }
+    }
+
     pub(super) fn is_bounded(&self) -> bool {
         self.remaining_ms.is_some()
     }
@@ -525,13 +533,26 @@ pub(crate) fn launch_builder_staged(
         true,
         |owner, rpc, remaining| builder_spec(&rootfs, &ca_dir, owner, rpc, &input, remaining),
     )?;
+    let swaps = vec![SwapPair {
+        stub: input.access_release.stub,
+        real: input.access_release.real,
+        hosts: vec![PROVIDER_HOST.into()],
+    }];
+    deliver_swaps(&mut vm, &swaps, deadline, cancelled)?;
+    stage("vmm_spawn");
+    Ok(vm)
+}
+
+/// Hand the VMM child its stub→real swap set on stdin, the only channel the real
+/// credential travels. On failure the VM is stopped before the error returns.
+pub(super) fn deliver_swaps(
+    vm: &mut OwnedVm,
+    swaps: &[SwapPair],
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<()> {
     let delivery = (|| -> Result<()> {
-        let swaps = vec![SwapPair {
-            stub: input.access_release.stub,
-            real: input.access_release.real,
-            hosts: vec![PROVIDER_HOST.into()],
-        }];
-        let bytes = serde_json::to_vec(&swaps)?;
+        let bytes = serde_json::to_vec(swaps)?;
         let mut stdin = vm
             .process
             .child
@@ -547,8 +568,7 @@ pub(crate) fn launch_builder_staged(
         let cleanup = vm.stop_and_reap();
         return Err(cleanup_failure(error, cleanup));
     }
-    stage("vmm_spawn");
-    Ok(vm)
+    Ok(())
 }
 
 pub(crate) fn launch_verifier(
@@ -574,7 +594,7 @@ pub(crate) fn launch_verifier(
     )
 }
 
-fn prepare_rootfs(
+pub(super) fn prepare_rootfs(
     image_id: &str,
     deadline: Instant,
     cancelled: &dyn Fn() -> bool,
@@ -611,7 +631,7 @@ fn prepare_rootfs(
     Ok((runtime, rootfs))
 }
 
-fn launch_prepared(
+pub(super) fn launch_prepared(
     runtime: TempDir,
     limits: VmLimits,
     deadline: Instant,
@@ -801,7 +821,7 @@ fn prepare_verifier_hosts(rootfs: &Path) -> Result<()> {
         .context("make verifier clone localhost mapping readable")
 }
 
-fn prepare_generated_metadata(rootfs: &Path, paths: &[&str]) -> Result<()> {
+pub(super) fn prepare_generated_metadata(rootfs: &Path, paths: &[&str]) -> Result<()> {
     for path in paths {
         super::metadata::prepare_guest_clone_metadata(&rootfs.join(path.trim_start_matches('/')))?;
     }
@@ -920,7 +940,7 @@ fn prepare_guest(
     prepare_generated_metadata(rootfs, &[GUEST_RUNTIME, GUEST_HOME, "/workspace"])
 }
 
-fn fresh_directory(rootfs: &Path, guest_path: &str) -> Result<()> {
+pub(super) fn fresh_directory(rootfs: &Path, guest_path: &str) -> Result<()> {
     let components: Vec<_> = guest_path.trim_start_matches('/').split('/').collect();
     let mut path = rootfs.to_path_buf();
     for (index, component) in components.iter().enumerate() {
@@ -1137,7 +1157,7 @@ fn check_live(deadline: Instant, cancelled: &dyn Fn() -> bool) -> Result<()> {
     Ok(())
 }
 
-fn remaining_ms(deadline: Instant) -> Result<u64> {
+pub(super) fn remaining_ms(deadline: Instant) -> Result<u64> {
     let remaining = deadline
         .checked_duration_since(Instant::now())
         .context("bounded execution deadline exceeded")?;
@@ -1489,7 +1509,7 @@ struct CommandReport {
     teardown_unconfirmed: bool,
 }
 
-fn validate_image_id(image_id: &str) -> Result<()> {
+pub(super) fn validate_image_id(image_id: &str) -> Result<()> {
     ensure!(
         image_id.len() == 71
             && image_id.starts_with("sha256:")

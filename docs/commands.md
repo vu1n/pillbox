@@ -101,7 +101,7 @@ automatically resized or unmounted. Insufficient host or volume space fails clea
 
 ### Structured run ownership
 
-Local structured one-shot runs (`pi` and `cursor`) keep a lifetime socket to their
+Local structured one-shot runs (`pi`, `prime-agent` and `cursor`) keep a lifetime socket to their
 supervising CLI. The VMM arms its watcher before guest or egress work starts. If
 the CLI exits or is killed, including SIGTERM and SIGKILL, the VMM terminates its
 own process group; a session record does not transfer ownership. Normal return
@@ -114,7 +114,7 @@ persistent ownership; `session attach` may still detach with SIGTERM.
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--agent A` | `pillbox.toml` `agent` field, then `claude` | Agent to launch (`claude` \| `claude-stream` \| `codex` \| `codex-serve` \| `opencode` \| `pi` \| `cursor`). `pi`, `cursor` and `claude-stream` are libkrun-only structured one-shot agents (`stream-json` → §0; the prompt is everything after `--`). `claude-stream` runs `claude -p --output-format stream-json` headless, shares `claude`'s auth (one `auth login --agent claude`) and its vault env-fork (stubbed OAuth in the guest), takes an optional bare `--model` (`sonnet`, a full model id) plus `--reasoning-effort` (→ `--effort`), and rejects `--mcp`/`--detach`. The interactive PTY `claude` is the default and is unaffected. Cursor auth: `auth login --agent cursor` **or** inject `CURSOR_API_KEY` (see Cursor auth below). `codex-serve` drives `codex app-server` (codex's structured JSON-RPC protocol) as a server-mode agent — libkrun-only, shares `codex`'s auth (one `auth login --agent codex`), driven via `session send` + read via `session watch`/`subscribe`. The PTY `codex` is the default and unaffected. |
+| `--agent A` | `pillbox.toml` `agent` field, then `claude` | Agent to launch (`claude` \| `claude-stream` \| `codex` \| `codex-serve` \| `opencode` \| `pi` \| `prime-agent` \| `cursor`). `pi`, `prime-agent`, `cursor` and `claude-stream` are libkrun-only structured one-shot agents (`stream-json` → §0; the prompt is everything after `--`). `claude-stream` runs `claude -p --output-format stream-json` headless, shares `claude`'s auth (one `auth login --agent claude`) and its vault env-fork (stubbed OAuth in the guest), takes an optional bare `--model` (`sonnet`, a full model id) plus `--reasoning-effort` (→ `--effort`), and rejects `--mcp`/`--detach`. The interactive PTY `claude` is the default and is unaffected. `prime-agent` is Prime Intellect's fork of pi: same `--model PROVIDER/MODEL`, adapter and posture as `pi`, with its own auth home (`~/.prime/agent/auth.json`). Cursor auth: `auth login --agent cursor` **or** inject `CURSOR_API_KEY` (see Cursor auth below). `codex-serve` drives `codex app-server` (codex's structured JSON-RPC protocol) as a server-mode agent — libkrun-only, shares `codex`'s auth (one `auth login --agent codex`), driven via `session send` + read via `session watch`/`subscribe`. The PTY `codex` is the default and unaffected. |
 | `--workspace PATH` | cwd | Host directory to mount. |
 | `--name NAME` | `pillbox.toml` `name`, else basename(workspace) | Mount-point name (`/workspace/NAME`). |
 | `--mount HOST:GUEST` | — | Extra bind mount. Repeatable. |
@@ -556,8 +556,30 @@ that image. A completed record carries `resolved` (`harness`,
 `runtime_timeout`, `runtime_rejected`, `runtime_protocol_error`,
 `internal_error`) and the `stage` that was running (`resolve`, `credentials`,
 `image_prepare`, `guest_prepare`, `vmm_spawn`, `guest_rpc_ready`, `turn`,
-`finalize`); the message stays in the session log. Only `codex` has a text
-driver today; the other harnesses fail at `resolve` with `runtime_rejected`.
+`finalize`); the message stays in the session log. `codex`, `pi` and
+`prime-agent` have text drivers; `claude_code` and `opencode` fail at `resolve`
+with `runtime_rejected` until theirs land.
+
+For `pi` and `prime-agent`, `agent.model` is the harness's own `PROVIDER/MODEL`
+(for example `zai/glm-5.3` or `anthropic/claude-sonnet-5`) and
+`agent.reasoning_effort` is `low`, `medium` or `high` (pi's `--thinking`). The
+provider must be `anthropic`, `openai`, `openrouter` or `zai`, and the model must
+be in the catalog Pillbox embeds for that harness
+(`src/execution/text-models-pi-1.0.2.json`,
+`src/execution/text-models-prime-agent-0.9.8.json`, taken from the bundled
+releases); anything else fails at `resolve` with `runtime_rejected`. The
+credential is the provider's API key stored by `/login` in the agent's Pillbox
+auth home (`pillbox auth login --agent pi` or `--agent prime-agent`). A missing
+entry, an OAuth login, or a `!command` key fails at `credentials` with
+`runtime_unavailable`. The guest gets a stub key; the VMM swaps in the real key
+only on that provider's host, which is the guest's only egress. The turn runs
+`--mode json` with the prompt on stdin and `--no-tools`, `--no-extensions`,
+`--no-skills`, `--no-prompt-templates`, `--no-context-files` and `--offline`.
+Any tool call in the stream, even one the harness refused, fails the turn with
+`runtime_protocol_error` at `turn`, as does an empty, cut-off (`stopReason`
+other than `stop`) or oversized answer. `harness_version` is the guest's
+`--version` output and `served_model` is the provider's `responseModel`, or
+`null`.
 
 A completed record, and a failed one whose turn already spent tokens, carries
 `usage` when the harness reported any:
@@ -581,13 +603,13 @@ nothing gets no `usage` key, never zeros. A value that is not a number, is
 negative or non-finite, or exceeds 10^10 tokens or $1,000,000 is dropped; when
 nothing valid remains, `usage` is absent.
 
-| field | codex (`thread/tokenUsage/updated`, `tokenUsage.total`) | claude_code (`result` line) |
-|---|---|---|
-| `cost_usd` | `null` (Codex reports no cost) | `total_cost_usd` (API-equivalent on a subscription, not a bill) |
-| `input_tokens` | `inputTokens` − `cachedInputTokens` − `cacheWriteInputTokens` (dropped if negative) | `usage.input_tokens` |
-| `output_tokens` | `outputTokens` | `usage.output_tokens` |
-| `cache_read_tokens` | `cachedInputTokens` | `usage.cache_read_input_tokens` |
-| `cache_write_tokens` | `cacheWriteInputTokens` | `usage.cache_creation_input_tokens` |
+| field | codex (`thread/tokenUsage/updated`, `tokenUsage.total`) | claude_code (`result` line) | pi, prime-agent (every assistant `message_end`, summed) |
+|---|---|---|---|
+| `cost_usd` | `null` (Codex reports no cost) | `total_cost_usd` (API-equivalent on a subscription, not a bill) | `usage.cost.total` (pi's figure from its model catalog; `null` if any response lacks it) |
+| `input_tokens` | `inputTokens` − `cachedInputTokens` − `cacheWriteInputTokens` (dropped if negative) | `usage.input_tokens` | `usage.input` (pi already excludes cache reads and writes) |
+| `output_tokens` | `outputTokens` | `usage.output_tokens` | `usage.output` |
+| `cache_read_tokens` | `cachedInputTokens` | `usage.cache_read_input_tokens` | `usage.cacheRead` |
+| `cache_write_tokens` | `cacheWriteInputTokens` | `usage.cache_creation_input_tokens` | `usage.cacheWrite` |
 
 Codex's newest `total` for the invocation's thread and turn is the turn's usage,
 because a text invocation runs one turn on a fresh thread. The claude_code

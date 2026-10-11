@@ -293,11 +293,33 @@ pub(crate) fn restore_protected(
         if let Some(parent) = rel.parent() {
             ensure_real_dirs(tree, parent, &mut reverted)?;
         }
-        copy_node(&base.join(rel), &tree.join(rel))?;
+        copy_node(&protected_source(base, rel)?, &tree.join(rel))?;
     }
     Ok(RestoreReport {
         reverted: reverted.into_iter().collect(),
     })
+}
+
+/// What to copy for the protected top `rel`: the entry itself, unless it is a
+/// symlink whose target is elsewhere in the base (`tests -> shared-tests`).
+/// Restoring just the link would leave the worker-editable target deciding the
+/// grade, so such a top is materialized from the base target instead. A link
+/// that leaves the tree is copied as a link (it can't resolve in the VM).
+fn protected_source(base: &Path, rel: &Path) -> Result<PathBuf> {
+    let src = base.join(rel);
+    let is_link = std::fs::symlink_metadata(&src)
+        .with_context(|| format!("stat {}", src.display()))?
+        .file_type()
+        .is_symlink();
+    if !is_link {
+        return Ok(src);
+    }
+    let root =
+        std::fs::canonicalize(base).with_context(|| format!("resolve {}", base.display()))?;
+    match std::fs::canonicalize(&src) {
+        Ok(target) if target.starts_with(&root) && target != root => Ok(target),
+        _ => Ok(src),
+    }
 }
 
 /// Make every component of `rel` under `root` a real, writable directory. A
@@ -867,6 +889,25 @@ mod tests {
         let p = tree.path().to_path_buf();
         drop(tree);
         assert!(!p.exists(), "removed on drop");
+    }
+
+    #[test]
+    fn a_protected_top_that_links_inside_the_base_is_materialized() {
+        let (_t, base, copy) = base_and_copy();
+        fs::remove_dir_all(base.join("tests")).unwrap();
+        write(&base, "shared-tests/check.sh", "exit 1\n");
+        std::os::unix::fs::symlink("shared-tests", base.join("tests")).unwrap();
+        fs::remove_dir_all(copy.join("tests")).unwrap();
+        write(&copy, "shared-tests/check.sh", "exit 0\n"); // worker edits the target
+        std::os::unix::fs::symlink("shared-tests", copy.join("tests")).unwrap();
+        restore_protected(&copy, &base, &defaults()).unwrap();
+        let tests = copy.join("tests");
+        assert!(fs::symlink_metadata(&tests).unwrap().file_type().is_dir());
+        assert_eq!(
+            read(&copy, "tests/check.sh"),
+            "exit 1\n",
+            "the base's test, not the worker's"
+        );
     }
 
     #[test]

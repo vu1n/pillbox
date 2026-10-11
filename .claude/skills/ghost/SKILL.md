@@ -99,7 +99,8 @@ pillbox dispatch --from-bookmark "ghost-<slug>" \
   --ttl 24h --json -- "<the task>"
 ```
 
-- **Default `-k 1`** for the first dogfood of a task — cheapest, proves the loop. Raise
+- **Start with `-k 1`** for the first dogfood of a task — cheapest, proves the loop. Pass it
+  explicitly: the CLI default is `-k 3`. Raise
   to `-k 3 --temperature 0.7` only when run-to-run **variance** matters (without the
   temperature the forks are degenerate and best-of-k buys nothing). If all `k` score
   identically, `k` was too high — the task had no variance to exploit and you paid `k`×

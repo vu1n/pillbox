@@ -122,6 +122,10 @@ pub(crate) struct DispatchOpts {
     /// `--baseline-check`: grade the untouched bookmark with the reward and each
     /// segment gate before forking; a reward that already passes stops the run.
     pub(crate) baseline_check: bool,
+    /// `--restate-task`: re-send the positional task, verbatim and delimited,
+    /// with every retry turn and ahead of every segment after the first. Off →
+    /// the task rides only the first turn (byte-identical prompts to before).
+    pub(crate) restate_task: bool,
     /// Worker agent (default: `pillbox.toml` `agent`, then `claude`).
     pub(crate) agent: Option<String>,
     /// Worker model override, forwarded to each worker's run.
@@ -550,12 +554,39 @@ fn first_lines(s: &str, n: usize) -> String {
         .join(" / ")
 }
 
+/// Opens the verbatim task block `--restate-task` adds to a turn.
+const TASK_RESTATE_OPEN: &str = "<original-task>";
+/// Closes the verbatim task block `--restate-task` adds to a turn.
+const TASK_RESTATE_CLOSE: &str = "</original-task>";
+
+/// The original task, byte-identical, between the restate delimiters.
+fn restated_task(task: &str) -> String {
+    format!(
+        "The original task, restated verbatim:\n{TASK_RESTATE_OPEN}\n{task}\n{TASK_RESTATE_CLOSE}\n"
+    )
+}
+
+/// The turn sent on a retry: the distilled failure summary, plus the restated
+/// task under `--restate-task`.
+fn retry_turn(grade: &Scored, policy: RetryPolicy) -> String {
+    let mut turn = distill_feedback(grade);
+    if let Some(task) = policy.restate_task {
+        turn.push('\n');
+        turn.push_str(&restated_task(task));
+    }
+    turn
+}
+
 /// How long a failing worker keeps getting re-driven: the `--retries` budget,
-/// cut short by the `--stall-limit` breaker.
+/// cut short by the `--stall-limit` breaker, and what each re-drive carries.
 #[derive(Debug, Clone, Copy)]
-struct RetryPolicy {
+struct RetryPolicy<'a> {
     retries: u32,
     stall_limit: u32,
+    /// `--restate-task`: the task re-sent verbatim with every retry turn and
+    /// ahead of every segment after the first. `None` = off (the task rides
+    /// only the first turn).
+    restate_task: Option<&'a str>,
 }
 
 /// The `--stall-limit` default. With the default `--retries 1` it never fires;
@@ -563,13 +594,14 @@ struct RetryPolicy {
 #[cfg(test)]
 const DEFAULT_STALL_LIMIT: u32 = 2;
 
-impl RetryPolicy {
-    /// A budget with the default breaker.
+impl RetryPolicy<'_> {
+    /// A budget with the default breaker and no task restating.
     #[cfg(test)]
     fn new(retries: u32) -> Self {
         Self {
             retries,
             stall_limit: DEFAULT_STALL_LIMIT,
+            restate_task: None,
         }
     }
 }
@@ -1200,7 +1232,7 @@ fn grade_from_idle(
         if driver.first_turn_driven_on_fork(i) || rounds.done(&grade, retries) {
             return Ok((grade, rounds));
         }
-        driver.send(id, &distill_feedback(&grade))?;
+        driver.send(id, &retry_turn(&grade, retries))?;
         driver.wait_idle(id)?;
     }
 }
@@ -1357,7 +1389,7 @@ fn drive_to_grade_with(
         if rounds.done(&grade, retries) {
             return Ok((grade, rounds, verdict));
         }
-        turn = distill_feedback(&grade);
+        turn = retry_turn(&grade, retries);
     }
 }
 
@@ -1423,9 +1455,12 @@ fn drive_segments_inner(
 ) -> Result<WorkerOutcome> {
     let mut seg_outcomes = Vec::with_capacity(segments.len());
     for (i, seg) in segments.iter().enumerate() {
-        // Optional positional context rides the FIRST segment's prompt only.
+        // Optional positional context rides the FIRST segment's prompt; with
+        // `--restate-task` every later segment repeats it, delimited.
         let turn = if i == 0 && !context.is_empty() {
             format!("{context}\n\n{}", seg.prompt)
+        } else if let Some(task) = retries.restate_task.filter(|_| i > 0) {
+            format!("{}\n{}", restated_task(task), seg.prompt)
         } else {
             seg.prompt.clone()
         };
@@ -1857,6 +1892,14 @@ pub(crate) fn dispatch(resolved: &Pillbox, opts: DispatchOpts) -> Result<()> {
         .with_next("pillbox dispatch … -- \"<the segment prompt>\"")
         .into());
     }
+    if opts.restate_task && prompt.trim().is_empty() {
+        return Err(PillboxError::usage(
+            "dispatch",
+            "--restate-task has no task to restate (no positional prompt)",
+        )
+        .with_next("pillbox dispatch … --restate-task -- \"<the task>\"")
+        .into());
+    }
     // Validate `--ttl` at the boundary so a bad duration fails fast (exit 2)
     // instead of after forking k workers (each `run --ttl` would reject it).
     if let Some(t) = &opts.ttl {
@@ -1956,6 +1999,7 @@ pub(crate) fn dispatch(resolved: &Pillbox, opts: DispatchOpts) -> Result<()> {
     let retry = RetryPolicy {
         retries: opts.retries,
         stall_limit: opts.stall_limit,
+        restate_task: opts.restate_task.then_some(prompt.as_str()),
     };
     let mut verdict = run_dispatch_with(
         &driver,
@@ -2150,6 +2194,8 @@ mod tests {
         /// Worker ids whose `grade` raises an error (models a stuck/broken worker).
         grade_errs: std::collections::HashSet<String>,
         sends: RefCell<usize>,
+        /// Every prompt `send` was given, in call order.
+        sent: RefCell<Vec<String>>,
         pulls: RefCell<Vec<String>>,
         /// The fork-index passed to each `fork`, in call order — asserts the loop
         /// hands each worker its own 0-based roster index.
@@ -2174,6 +2220,7 @@ mod tests {
                 grades: RefCell::new(grades),
                 grade_errs: std::collections::HashSet::new(),
                 sends: RefCell::new(0),
+                sent: RefCell::new(Vec::new()),
                 pulls: RefCell::new(Vec::new()),
                 fork_indices: RefCell::new(Vec::new()),
                 first_turn_on_fork: false,
@@ -2227,8 +2274,9 @@ mod tests {
             };
             Ok(scored(passed, score, criteria, ""))
         }
-        fn send(&self, _id: &str, _prompt: &str) -> Result<()> {
+        fn send(&self, _id: &str, prompt: &str) -> Result<()> {
             *self.sends.borrow_mut() += 1;
+            self.sent.borrow_mut().push(prompt.to_string());
             Ok(())
         }
         fn pull_winner(&self, id: &str) -> Result<PathBuf> {
@@ -2570,6 +2618,7 @@ mod tests {
         let policy = RetryPolicy {
             retries,
             stall_limit,
+            restate_task: None,
         };
         drive_one_with(d, 0, "w0".into(), "task", policy, &reward(), None)
     }
@@ -2798,6 +2847,162 @@ mod tests {
         assert_eq!(*d.sends.borrow(), 2);
     }
 
+    // ── `--restate-task` ──
+
+    const TASK: &str = "Fix the parser.\nKeep `parse()` stable & <public>.";
+
+    fn restate_policy(retries: u32, on: bool) -> RetryPolicy<'static> {
+        RetryPolicy {
+            restate_task: on.then_some(TASK),
+            ..RetryPolicy::new(retries)
+        }
+    }
+
+    fn two_segments() -> Vec<ResolvedSegment> {
+        vec![
+            ResolvedSegment {
+                name: "a".into(),
+                prompt: "do a".into(),
+                gate: Grader::Cmd("ga".into()),
+            },
+            ResolvedSegment {
+                name: "b".into(),
+                prompt: "do b".into(),
+                gate: Grader::Cmd("gb".into()),
+            },
+        ]
+    }
+
+    fn run_restate(d: &MockDriver, policy: RetryPolicy, segs: Option<&[ResolvedSegment]>) {
+        let _ = run_dispatch_with(
+            d,
+            1,
+            TASK,
+            policy,
+            &reward(),
+            segs,
+            None,
+            CriticPolicy::Record,
+        );
+    }
+
+    /// The failed `--cmd` grade the mock returns, as `distill_feedback` sees it.
+    fn mock_fail(score: f64) -> Scored {
+        scored(false, score, vec![], "")
+    }
+
+    #[test]
+    fn restated_task_is_the_task_verbatim_between_delimiters() {
+        let block = restated_task(TASK);
+        let inner = block
+            .split_once(&format!("{TASK_RESTATE_OPEN}\n"))
+            .and_then(|(_, rest)| rest.split_once(&format!("\n{TASK_RESTATE_CLOSE}")))
+            .map(|(inner, _)| inner)
+            .expect("delimited block");
+        assert_eq!(inner, TASK);
+    }
+
+    #[test]
+    fn restate_off_leaves_fork_k_prompts_unchanged() {
+        let d = MockDriver::new(vec![("w0", vec![(false, 0.0), (true, 1.0)])]);
+        run_restate(&d, restate_policy(1, false), None);
+        assert_eq!(
+            *d.sent.borrow(),
+            vec![TASK.to_string(), distill_feedback(&mock_fail(0.0))]
+        );
+    }
+
+    #[test]
+    fn restate_off_leaves_segment_prompts_unchanged() {
+        let segs = two_segments();
+        // a-gate pass, b-gate fail, b-gate pass, reward.
+        let d = MockDriver::new(vec![(
+            "w0",
+            vec![(true, 1.0), (false, 0.5), (true, 1.0), (true, 1.0)],
+        )]);
+        run_restate(&d, restate_policy(1, false), Some(&segs));
+        assert_eq!(
+            *d.sent.borrow(),
+            vec![
+                format!("{TASK}\n\ndo a"),
+                "do b".to_string(),
+                distill_feedback(&mock_fail(0.5)),
+            ]
+        );
+    }
+
+    #[test]
+    fn restate_on_repeats_the_task_on_every_fork_k_retry() {
+        let d = MockDriver::new(vec![("w0", vec![(false, 0.0), (false, 0.0), (true, 1.0)])]);
+        run_restate(&d, restate_policy(2, true), None);
+        let sent = d.sent.borrow();
+        assert_eq!(sent.len(), 3);
+        // Turn 1 is the task itself, once — no restate block on top of it.
+        assert_eq!(sent[0], TASK);
+        let retry = format!(
+            "{}\n{}",
+            distill_feedback(&mock_fail(0.0)),
+            restated_task(TASK)
+        );
+        assert_eq!(sent[1], retry);
+        assert_eq!(sent[2], retry);
+    }
+
+    #[test]
+    fn restate_on_repeats_the_task_on_every_segment_and_segment_retry() {
+        let segs = two_segments();
+        // a-gate fail, a-gate pass, b-gate fail, b-gate pass, reward.
+        let d = MockDriver::new(vec![(
+            "w0",
+            vec![
+                (false, 0.0),
+                (true, 1.0),
+                (false, 0.0),
+                (true, 1.0),
+                (true, 1.0),
+            ],
+        )]);
+        run_restate(&d, restate_policy(1, true), Some(&segs));
+        let sent = d.sent.borrow();
+        let retry = format!(
+            "{}\n{}",
+            distill_feedback(&mock_fail(0.0)),
+            restated_task(TASK)
+        );
+        assert_eq!(
+            *sent,
+            vec![
+                // Segment 1 already carries the task: byte-identical to off.
+                format!("{TASK}\n\ndo a"),
+                retry.clone(),
+                format!("{}\ndo b", restated_task(TASK)),
+                retry,
+            ]
+        );
+        for turn in sent.iter() {
+            assert_eq!(turn.matches(TASK).count(), 1, "task exactly once: {turn:?}");
+        }
+    }
+
+    #[test]
+    fn restate_on_reaches_critic_ranked_retries() {
+        let d = MockDriver::new(vec![("w0", vec![(false, 0.0), (true, 1.0)])]);
+        let critic = MockCritic::new(&[("w0", 0.9)]);
+        let _ = run_dispatch_with(
+            &d,
+            1,
+            TASK,
+            restate_policy(1, true),
+            &reward(),
+            None,
+            Some(&critic),
+            CriticPolicy::Order,
+        );
+        let sent = d.sent.borrow();
+        assert_eq!(sent[0], TASK);
+        assert!(sent[1].ends_with(&restated_task(TASK)), "{:?}", sent[1]);
+    }
+
     #[test]
     fn load_segments_parses_and_resolves() {
         let dir = std::env::temp_dir().join(format!("pb-seg-{}", uuid::Uuid::now_v7().simple()));
@@ -2906,6 +3111,7 @@ mod tests {
             retries: 0,
             stall_limit: 2,
             baseline_check: false,
+            restate_task: false,
             agent: agent.map(str::to_string),
             model: model.map(str::to_string),
             temperature,

@@ -359,6 +359,12 @@ enum Command {
         /// dispatch stops (exit 2) before any worker boots.
         #[arg(long = "baseline-check")]
         baseline_check: bool,
+        /// Restate the positional task, verbatim inside `<original-task>`
+        /// delimiters, on every retry turn and ahead of every segment after the
+        /// first (segment 1 already carries it). Off by default: the task rides
+        /// only the first turn.
+        #[arg(long = "restate-task")]
+        restate_task: bool,
         /// Worker agent (`claude` | `codex` | `opencode` | …). Defaults to the
         /// pillbox's `agent =`, then `claude`.
         #[arg(long, value_name = "AGENT")]
@@ -913,6 +919,7 @@ fn run(cli: Cli) -> Result<()> {
             retries,
             stall_limit,
             baseline_check,
+            restate_task,
             agent,
             model,
             temperature,
@@ -943,6 +950,7 @@ fn run(cli: Cli) -> Result<()> {
                     retries,
                     stall_limit,
                     baseline_check,
+                    restate_task,
                     agent,
                     model,
                     temperature,

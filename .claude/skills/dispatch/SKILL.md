@@ -111,6 +111,10 @@ Rules (from the contract):
 - **`--baseline-check`** whenever you wrote the reward yourself — it grades the
   untouched bookmark first and refuses (exit 2) a reward that already passes there,
   which would otherwise pick a worker that did nothing.
+- **`--restate-task`** when retries or later segments drift off the task — off by
+  default, a retry carries only the failure summary and only segment 1 sees the
+  positional task; on, each of those turns repeats it verbatim in an
+  `<original-task>` block.
 - **`--temperature 0.7`** whenever `-k > 1` — without it the forks are degenerate.
 - **Reward is always required** — give exactly one of `--cmd` / `--rubric` (a missing
   or doubled grader is a usage error, exit 2).

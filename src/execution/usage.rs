@@ -31,6 +31,18 @@ pub(crate) struct TurnUsage {
 }
 
 impl TurnUsage {
+    /// Prime's normalized assistant usage already excludes cache reads/writes
+    /// from input. `cost.total` is its own estimate; never price catalog tokens.
+    pub(crate) fn from_prime_message(message: &Value) -> Option<Self> {
+        let usage = &message["usage"];
+        Self::new(
+            usage["cost"]["total"].as_f64(),
+            usage["input"].as_u64(),
+            usage["output"].as_u64(),
+            usage["cacheRead"].as_u64(),
+            usage["cacheWrite"].as_u64(),
+        )
+    }
     fn new(
         cost_usd: Option<f64>,
         input_tokens: Option<u64>,

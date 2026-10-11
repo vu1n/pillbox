@@ -31,6 +31,7 @@ pub(crate) mod codex;
 pub(crate) mod codex_execution;
 pub(crate) mod github;
 pub(crate) mod openai;
+pub(crate) mod prime;
 
 /// Marker provider_id for entries minted by `Server::lease_api_key`.
 /// These don't correspond to a [`VaultProvider`] — they're plain
@@ -222,6 +223,29 @@ pub(crate) trait VaultProvider: Send + Sync + 'static {
         None
     }
 
+    /// Stub a managed credential file for the libkrun env fork. OAuth providers
+    /// keep their codec contract; API-key stores own their minimal file shape.
+    #[cfg(feature = "libkrun")]
+    fn libkrun_credentials(
+        &self,
+        real: &mut serde_json::Value,
+    ) -> Result<LibkrunOAuthStub, String> {
+        Ok(self
+            .oauth_codec()
+            .map(|codec| codec.libkrun_stub(real))
+            .unwrap_or(LibkrunOAuthStub {
+                access_stub: None,
+                releases: Vec::new(),
+            }))
+    }
+
+    /// Remove provider-specific executable configuration and credential copies
+    /// only from the throwaway HOME, before its stub file is written.
+    #[cfg(any(feature = "libkrun", test))]
+    fn sanitize_cloned_home(&self, _home: &Path) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Whether this host/path is a provider token endpoint that a guest must
     /// never drive. Both proxy implementations use this provider-owned matcher
     /// to reject rotation before any credential substitution or network send.
@@ -267,6 +291,7 @@ pub(crate) fn registry() -> Vec<Box<dyn VaultProvider>> {
         Box::new(anthropic::AnthropicProvider),
         Box::new(codex::CodexProvider),
         Box::new(openai::OpenAiApiKeyProvider),
+        Box::new(prime::PrimeProvider),
         Box::new(github::GithubProvider),
     ]
 }

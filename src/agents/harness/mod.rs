@@ -18,10 +18,12 @@ use crate::contract::Payload;
 mod claude;
 mod cursor;
 mod pi;
+mod prime;
 
 pub(crate) use claude::ClaudeAdapter;
 pub(crate) use cursor::CursorAdapter;
 pub(crate) use pi::PiAdapter;
+pub(crate) use prime::PrimeAdapter;
 
 /// A harness whose headless run streams structured JSON **lines over stdout**
 /// (claude `-p`, pi `--mode json`). The adapter carries its own state across
@@ -43,6 +45,7 @@ pub(crate) fn lookup(id: &str) -> Option<Box<dyn HarnessAdapter>> {
         "claude" => Some(Box::new(ClaudeAdapter::default())),
         "cursor" => Some(Box::new(CursorAdapter::default())),
         "pi" => Some(Box::new(PiAdapter::default())),
+        "prime-agent" => Some(Box::new(PrimeAdapter::default())),
         _ => None,
     }
 }

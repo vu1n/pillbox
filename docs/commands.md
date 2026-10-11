@@ -557,7 +557,12 @@ that image. A completed record carries `resolved` (`harness`,
 `internal_error`) and the `stage` that was running (`resolve`, `credentials`,
 `image_prepare`, `guest_prepare`, `vmm_spawn`, `guest_rpc_ready`, `turn`,
 `finalize`); the message stays in the session log. Only `codex` has a text
-driver today; the other harnesses fail at `resolve` with `runtime_rejected`.
+driver in the base cohort. `prime-agent` also has a tool-free text driver;
+the other harnesses fail at `resolve` with `runtime_rejected`. Prime resolves
+only exact Prime Inference models in the image-owned offline catalog. A missing
+model, unsupported effort or unqualified native cohort fails at `resolve` with
+`runtime_rejected`. No version, image, credential or egress field is accepted in
+the request. See [Prime Agent text qualification](prime-agent-text.md).
 
 A completed record, and a failed one whose turn already spent tokens, carries
 `usage` when the harness reported any:
@@ -581,13 +586,13 @@ nothing gets no `usage` key, never zeros. A value that is not a number, is
 negative or non-finite, or exceeds 10^10 tokens or $1,000,000 is dropped; when
 nothing valid remains, `usage` is absent.
 
-| field | codex (`thread/tokenUsage/updated`, `tokenUsage.total`) | claude_code (`result` line) |
-|---|---|---|
-| `cost_usd` | `null` (Codex reports no cost) | `total_cost_usd` (API-equivalent on a subscription, not a bill) |
-| `input_tokens` | `inputTokens` − `cachedInputTokens` − `cacheWriteInputTokens` (dropped if negative) | `usage.input_tokens` |
-| `output_tokens` | `outputTokens` | `usage.output_tokens` |
-| `cache_read_tokens` | `cachedInputTokens` | `usage.cache_read_input_tokens` |
-| `cache_write_tokens` | `cacheWriteInputTokens` | `usage.cache_creation_input_tokens` |
+| field | codex (`thread/tokenUsage/updated`, `tokenUsage.total`) | claude_code (`result` line) | prime-agent (assistant message) |
+|---|---|---|---|
+| `cost_usd` | `null` (Codex reports no cost) | `total_cost_usd` (API-equivalent on a subscription, not a bill) | `usage.cost.total` (native estimate) |
+| `input_tokens` | `inputTokens` − `cachedInputTokens` − `cacheWriteInputTokens` (dropped if negative) | `usage.input_tokens` | `usage.input` |
+| `output_tokens` | `outputTokens` | `usage.output_tokens` | `usage.output` |
+| `cache_read_tokens` | `cachedInputTokens` | `usage.cache_read_input_tokens` | `usage.cacheRead` |
+| `cache_write_tokens` | `cacheWriteInputTokens` | `usage.cache_creation_input_tokens` | `usage.cacheWrite` |
 
 Codex's newest `total` for the invocation's thread and turn is the turn's usage,
 because a text invocation runs one turn on a fresh thread. The claude_code
@@ -599,3 +604,27 @@ Both versions append a `text.stage.completed` event per stage to the session
 log and emit `session.started` / `session.completed` / `session.failed`
 lifecycle events, so `session log`, `events.jsonl` and OTel show where a turn
 spent its time.
+
+Prime Agent uses the same closed `usage` object. Its assistant-message
+`usage.input`, `usage.output`, `usage.cacheRead` and `usage.cacheWrite` map to
+`input_tokens`, `output_tokens`, `cache_read_tokens` and `cache_write_tokens`.
+Those native counts already exclude cache tokens from input; output includes
+reasoning. `usage.cost.total` maps to `cost_usd`: Prime's reported estimate,
+never a Pillbox price calculation. Missing cost is `null`; missing counts are
+omitted, and no report means no `usage` key. Repeated terminal copies of the
+same assistant message are not counted again. A failed turn retains any usage
+reported before refusal or a protocol failure.
+
+`pillbox run --agent prime-agent --model prime-inference/MODEL -- PROMPT`
+and `pillbox sandbox agent ID -- PROMPT` use Prime's structured JSONL adapter.
+Managed auth lives under the global `auth/prime-agent/.prime/agent/auth.json`;
+`pillbox auth login --agent prime-agent` opens its TUI for `/login`. Only a
+literal managed `prime-inference` API key is supported by the vault adapter.
+It is replaced by a stub in the private guest HOME and released only to
+`api.pinference.ai`. MCP attachments are rejected. The sealed text path uses
+a fresh HOME and workspace, no shares, extensions, skills, context files or
+prompt templates, and an empty native tool registry. It disables compaction,
+refinement, retry and telemetry. It accepts one final answer of at most 32 KiB;
+empty, truncated or oversized text fails at `turn` with
+`runtime_protocol_error` without padding or truncation. `served_model` is only
+the native `responseModel`, otherwise `null`.

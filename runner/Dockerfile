@@ -174,14 +174,19 @@ RUN curl -fsSL https://claude.ai/install.sh -o /tmp/claude-install.sh \
 	#   otherwise it rides along dead in the layer.
 
 # Prime Agent: keep the complete native release and its assets outside HOME.
-# Python kernel provisioning remains explicit; the CLI is available as a tool,
-# not yet as a Pillbox auth/session harness adapter.
+# Python kernel provisioning remains explicit; Pillbox registers the native
+# auth/session harness and qualifies its offline catalog for sealed text.
 RUN curl --proto '=https' --proto-redir '=https' -fsSL https://app.primeintellect.ai/prime-agent/install.sh -o /tmp/prime-agent-install.sh \
 	&& PRIME_AGENT_INSTALL_METHOD=binary PRIME_AGENT_INSTALLER_NONINTERACTIVE=1 \
 		PRIME_AGENT_BOOTSTRAP_KERNEL_ON_INSTALL=0 PRIME_AGENT_INSTALL_DIR=/opt/prime-agent \
 		PRIME_AGENT_BIN_DIR=/usr/local/bin sh /tmp/prime-agent-install.sh "${PRIME_AGENT_VERSION}" \
 	&& test "$(prime-agent --version)" = "${PRIME_AGENT_VERSION}" \
 	&& rm /tmp/prime-agent-install.sh
+
+# Probe only the offline catalog, with a nonsecret placeholder and no prompt.
+COPY runner/prime-text-profile.py /tmp/prime-text-profile.py
+RUN python3 /tmp/prime-text-profile.py /usr/local/bin/prime-agent /opt/pillbox-prime-text/profile.json \
+	&& rm /tmp/prime-text-profile.py
 
 # Cursor Agent CLI: versioned lab tarball (same URL the install script uses).
 # Pin CURSOR_AGENT_VERSION and bump by hand when upgrading — Renovate cannot

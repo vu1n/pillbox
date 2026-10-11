@@ -19,7 +19,7 @@ package and CLI probes before the combined release manifest is tagged.
 
 ## What's in it
 
-Seven agent CLIs preinstalled at known paths:
+Eight agent CLIs preinstalled at known paths:
 
 Every harness is **pinned** to a concrete version (an `ARG …_VERSION` in
 `runner/Dockerfile`) so Docker's layer cache reflects the version we ask for —
@@ -35,6 +35,12 @@ rebuild silently reuses the stale layer instead of pulling the newer agent.
 | opencode | `npm i -g @opencode/cli@<pinned>` (OpenCode 2; `opencode-ai` is the 1.x line) | `OPENCODE_VERSION` | yes — npm `@opencode/cli` |
 | pi | `npm i -g @earendil-works/pi-coding-agent@<pinned>` | `PI_VERSION` | yes — npm |
 | prime-agent | official native installer, checksummed release archive under `/opt/prime-agent` | `PRIME_AGENT_VERSION` | no — stable feed via `build-runner.sh --update` |
+| grok | official installer from `x.ai/cli/install.sh` (`bash install.sh <ver>`), binary linked at `/usr/local/bin/grok`. The installer's extra `agent` symlink is removed so it does not replace Cursor's `agent` | `GROK_VERSION` | yes — npm `@xai-official/grok` |
+
+Grok Build (`grok`, pin `GROK_VERSION` 1.0.46) is a registered agent
+(`--agent grok`) and the `grok_build` harness for `pillbox.text/2`. The
+installer also drops an `agent` symlink; the image removes that symlink so
+Cursor's `/usr/local/bin/agent` stays Cursor.
 
 Prime Agent is bundled as a command-line tool. It is not yet registered as a
 Pillbox agent: `--agent prime-agent`, managed auth, and structured session events

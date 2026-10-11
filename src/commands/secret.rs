@@ -88,7 +88,7 @@ fn resolve_vault_meta(
                 "secret add",
                 format!(
                     "--maps-to `{alias}` is not a known secret name. \
-                     Known: ANTHROPIC_API_KEY, OPENAI_API_KEY, GITHUB_TOKEN (alias GH_TOKEN)"
+                     Known: ANTHROPIC_API_KEY, OPENAI_API_KEY, GITHUB_TOKEN (alias GH_TOKEN), XAI_API_KEY"
                 ),
             )
         })?;

@@ -105,6 +105,33 @@ impl TurnUsage {
         });
         Self::new(None, input, count("outputTokens"), cached, cache_write)
     }
+
+    /// Grok Build's headless `end` (or error) object. `usage.input_tokens` is
+    /// already uncached; cache buckets are separate; `reasoning_tokens` sits
+    /// inside `output_tokens` and is not added again. `total_cost_usd` is the
+    /// harness's own figure. `usage_is_incomplete` drops the spend entirely.
+    /// `cost_is_partial` keeps tokens and leaves cost null. Per-model
+    /// `modelUsage` rows are not summed into a bill.
+    pub(crate) fn from_grok_end(end: &Value) -> Option<Self> {
+        if end.get("usage_is_incomplete").and_then(Value::as_bool) == Some(true) {
+            return None;
+        }
+        let cost = if end.get("cost_is_partial").and_then(Value::as_bool) == Some(true) {
+            None
+        } else {
+            end.get("total_cost_usd").and_then(Value::as_f64)
+        };
+        let usage = end.get("usage").unwrap_or(&Value::Null);
+        Self::new(
+            cost,
+            usage.get("input_tokens").and_then(Value::as_u64),
+            usage.get("output_tokens").and_then(Value::as_u64),
+            usage.get("cache_read_input_tokens").and_then(Value::as_u64),
+            usage
+                .get("cache_creation_input_tokens")
+                .and_then(Value::as_u64),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -143,6 +170,43 @@ mod tests {
             json!({"cost_usd": 0.0123, "input_tokens": 12, "output_tokens": 340,
                 "cache_read_tokens": 5000, "cache_write_tokens": 800})
         );
+    }
+
+    #[test]
+    fn grok_end_keeps_uncached_input_and_drops_incomplete_spend() {
+        let end = json!({
+            "type": "end",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 4,
+                "cache_read_input_tokens": 2,
+                "cache_creation_input_tokens": 1,
+                "reasoning_tokens": 9,
+                "total_tokens": 17
+            },
+            "total_cost_usd": 0.25,
+            "modelUsage": {"grok-4.6": {"costUSD": 9.0, "outputTokens": 99}}
+        });
+        let usage = TurnUsage::from_grok_end(&end).unwrap();
+        assert_eq!(
+            serde_json::to_value(&usage).unwrap(),
+            json!({"cost_usd": 0.25, "input_tokens": 10, "output_tokens": 4,
+                "cache_read_tokens": 2, "cache_write_tokens": 1})
+        );
+        let partial =
+            json!({"cost_is_partial": true, "usage": {"input_tokens": 3, "output_tokens": 1}});
+        let usage = TurnUsage::from_grok_end(&partial).unwrap();
+        assert_eq!(
+            serde_json::to_value(&usage).unwrap(),
+            json!({"cost_usd": null, "input_tokens": 3, "output_tokens": 1})
+        );
+        assert_eq!(
+            TurnUsage::from_grok_end(
+                &json!({"usage_is_incomplete": true, "usage": {"input_tokens": 8}, "total_cost_usd": 1.0})
+            ),
+            None
+        );
+        assert_eq!(TurnUsage::from_grok_end(&json!({"type": "end"})), None);
     }
 
     #[test]

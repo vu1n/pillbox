@@ -84,7 +84,7 @@ PTY-free exec channel an orchestrator drives. Docker-backed today.
 |---|---|
 | `pillbox sandbox spawn [--image IMG] [--agent A] [--workspace PATH] [--label TEXT]` | Spawn an idle sandbox with the workspace mounted; prints the sandbox id. `--agent` provisions its auth + runs non-root so the agent channel can drive it; omit for a bare exec-only sandbox. |
 | `pillbox sandbox exec ID [--json] -- ARGV…` | Run a command (PTY-free). Streams raw output + mirrors the exit code; `--json` emits `ExecStarted`/`ExecOutput`/`ExecExit` as JSONL. |
-| `pillbox sandbox agent ID [--json] -- PROMPT…` | Run an agent turn (the agent channel) in a sandbox spawned `--agent`. Streams contract events; `--json` for JSONL, else a human trace. Only harnesses with a stdout adapter (`claude`, `cursor`, `pi`); server agents (`opencode`, `codex-serve`) have none and are a usage error. |
+| `pillbox sandbox agent ID [--json] -- PROMPT…` | Run an agent turn (the agent channel) in a sandbox spawned `--agent`. Streams contract events; `--json` for JSONL, else a human trace. Only harnesses with a stdout adapter (`claude`, `cursor`, `pi`, `grok`); server agents (`opencode`, `codex-serve`) have none and are a usage error. `sandbox agent` itself still requires a Docker sandbox, which cannot spawn the structured `grok` agent. |
 | `pillbox sandbox list [--json]` | List sandboxes in the current pillbox. |
 | `pillbox sandbox destroy ID` | Kill the sandbox container and remove the record. |
 
@@ -101,7 +101,7 @@ automatically resized or unmounted. Insufficient host or volume space fails clea
 
 ### Structured run ownership
 
-Local structured one-shot runs (`pi` and `cursor`) keep a lifetime socket to their
+Local structured one-shot runs (`pi`, `cursor`, and `grok`) keep a lifetime socket to their
 supervising CLI. The VMM arms its watcher before guest or egress work starts. If
 the CLI exits or is killed, including SIGTERM and SIGKILL, the VMM terminates its
 own process group; a session record does not transfer ownership. Normal return
@@ -114,7 +114,7 @@ persistent ownership; `session attach` may still detach with SIGTERM.
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--agent A` | `pillbox.toml` `agent` field, then `claude` | Agent to launch (`claude` \| `claude-stream` \| `codex` \| `codex-serve` \| `opencode` \| `pi` \| `cursor`). `pi`, `cursor` and `claude-stream` are libkrun-only structured one-shot agents (`stream-json` → §0; the prompt is everything after `--`). `claude-stream` runs `claude -p --output-format stream-json` headless, shares `claude`'s auth (one `auth login --agent claude`) and its vault env-fork (stubbed OAuth in the guest), takes an optional bare `--model` (`sonnet`, a full model id) plus `--reasoning-effort` (→ `--effort`), and rejects `--mcp`/`--detach`. The interactive PTY `claude` is the default and is unaffected. Cursor auth: `auth login --agent cursor` **or** inject `CURSOR_API_KEY` (see Cursor auth below). `codex-serve` drives `codex app-server` (codex's structured JSON-RPC protocol) as a server-mode agent — libkrun-only, shares `codex`'s auth (one `auth login --agent codex`), driven via `session send` + read via `session watch`/`subscribe`. The PTY `codex` is the default and unaffected. |
+| `--agent A` | `pillbox.toml` `agent` field, then `claude` | Agent to launch (`claude` \| `claude-stream` \| `codex` \| `codex-serve` \| `opencode` \| `pi` \| `cursor` \| `grok`). `pi`, `cursor`, `grok` and `claude-stream` are libkrun-only structured one-shot agents (`stream-json` → §0; the prompt is everything after `--`). `claude-stream` runs `claude -p --output-format stream-json` headless, shares `claude`'s auth (one `auth login --agent claude`) and its vault env-fork (stubbed OAuth in the guest), takes an optional bare `--model` (`sonnet`, a full model id) plus `--reasoning-effort` (→ `--effort`), and rejects `--mcp`/`--detach`. The interactive PTY `claude` is the default and is unaffected. Cursor auth: `auth login --agent cursor` **or** inject `CURSOR_API_KEY` (see Cursor auth below). `codex-serve` drives `codex app-server` (codex's structured JSON-RPC protocol) as a server-mode agent — libkrun-only, shares `codex`'s auth (one `auth login --agent codex`), driven via `session send` + read via `session watch`/`subscribe`. The PTY `codex` is the default and unaffected. |
 | `--workspace PATH` | cwd | Host directory to mount. |
 | `--name NAME` | `pillbox.toml` `name`, else basename(workspace) | Mount-point name (`/workspace/NAME`). |
 | `--mount HOST:GUEST` | — | Extra bind mount. Repeatable. |
@@ -192,6 +192,29 @@ vault-capable yet — do not pass `--vault` for this agent.
 `--model` for cursor takes a **bare** model id (`composer-2.5`, `grok-4.5`),
 not `PROVIDER/MODEL`.
 
+#### Grok Build auth
+
+`grok` (`--agent grok`) accepts device login or a non-vaulted xAI API key.
+`pillbox.text/2` harness `grok_build` is separate: it requires
+`XAI_API_KEY` stored with `--vault` and swaps a stub inside its own microVM.
+That vaulted secret is refused by `pillbox run --agent grok --with XAI_API_KEY`
+because interactive grok is not vault-capable.
+
+```sh
+pillbox auth login --agent grok
+
+# Non-vaulted key for an interactive run (real value in the guest env).
+pillbox secret add XAI_API_KEY
+pillbox run --agent grok --with XAI_API_KEY -- "say hello"
+
+# Text/2 credential. Re-add with --vault; do not pass this secret to
+# `pillbox run --with` until grok is vault-capable.
+pillbox secret add XAI_API_KEY --vault
+```
+
+`--model` for grok takes a bare id (`grok-4.6`). Interactive runs allow tools.
+Text/2 does not: see the `pillbox.text/2` section.
+
 ### `pillbox secret add` flags
 
 | Flag | Purpose |
@@ -200,7 +223,7 @@ not `PROVIDER/MODEL`.
 | `--if-not-exists` | Fail if the secret already exists in the chosen scope. |
 | `--global` | Write to the global pillbox (default: resolved pillbox). |
 | `--vault` | Mark as vaulted (stub-swap at injection time). |
-| `--maps-to KNOWN` | Alias to a known name's vault config (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GITHUB_TOKEN`). |
+| `--maps-to KNOWN` | Alias to a known name's vault config (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GITHUB_TOKEN`, `XAI_API_KEY`). |
 | `--host H` `--header-scheme {x-api-key\|authorization-bearer}` `--prefix P` | Vault metadata for a custom name (all three required together). |
 
 ### Sessions — detach + reattach
@@ -556,8 +579,17 @@ that image. A completed record carries `resolved` (`harness`,
 `runtime_timeout`, `runtime_rejected`, `runtime_protocol_error`,
 `internal_error`) and the `stage` that was running (`resolve`, `credentials`,
 `image_prepare`, `guest_prepare`, `vmm_spawn`, `guest_rpc_ready`, `turn`,
-`finalize`); the message stays in the session log. Only `codex` has a text
-driver today; the other harnesses fail at `resolve` with `runtime_rejected`.
+`finalize`); the message stays in the session log. `codex` and `grok_build` have text drivers; the other harnesses fail at
+`resolve` with `runtime_rejected`. `grok_build` is xAI's `grok` CLI (Grok
+Build). Pillbox resolves model `grok-4.6` (efforts `low`, `medium`, `high`,
+`xhigh`) or `grok-4.5` (efforts `low`, `medium`, `high`) from the embedded
+catalog, credential `pillbox:grok_build:default` (`XAI_API_KEY`, vaulted for
+`api.x.ai`), and egress `api.x.ai`. The harness version is the `grok --version`
+line observed in the guest, not the image pin. `served_model` is the single
+`modelUsage` key on the terminal event, or null when that key is missing,
+`unknown`, or not unique. A `tool_call` event, empty text, a stop reason other
+than `end_turn`, or text over `max_final_text_bytes` fails with
+`runtime_protocol_error` at `turn`.
 
 A completed record, and a failed one whose turn already spent tokens, carries
 `usage` when the harness reported any:
@@ -581,19 +613,20 @@ nothing gets no `usage` key, never zeros. A value that is not a number, is
 negative or non-finite, or exceeds 10^10 tokens or $1,000,000 is dropped; when
 nothing valid remains, `usage` is absent.
 
-| field | codex (`thread/tokenUsage/updated`, `tokenUsage.total`) | claude_code (`result` line) |
-|---|---|---|
-| `cost_usd` | `null` (Codex reports no cost) | `total_cost_usd` (API-equivalent on a subscription, not a bill) |
-| `input_tokens` | `inputTokens` − `cachedInputTokens` − `cacheWriteInputTokens` (dropped if negative) | `usage.input_tokens` |
-| `output_tokens` | `outputTokens` | `usage.output_tokens` |
-| `cache_read_tokens` | `cachedInputTokens` | `usage.cache_read_input_tokens` |
-| `cache_write_tokens` | `cacheWriteInputTokens` | `usage.cache_creation_input_tokens` |
+| field | codex (`thread/tokenUsage/updated`, `tokenUsage.total`) | claude_code (`result` line) | grok_build (`end` event) |
+|---|---|---|---|
+| `cost_usd` | `null` (Codex reports no cost) | `total_cost_usd` (API-equivalent on a subscription, not a bill) | `total_cost_usd`, or `null` when `cost_is_partial` is true. Omitted entirely (no `usage` key) when `usage_is_incomplete` is true |
+| `input_tokens` | `inputTokens` − `cachedInputTokens` − `cacheWriteInputTokens` (dropped if negative) | `usage.input_tokens` | `usage.input_tokens` (already uncached) |
+| `output_tokens` | `outputTokens` | `usage.output_tokens` | `usage.output_tokens` (`reasoning_tokens` is inside this count and is not added again) |
+| `cache_read_tokens` | `cachedInputTokens` | `usage.cache_read_input_tokens` | `usage.cache_read_input_tokens` |
+| `cache_write_tokens` | `cacheWriteInputTokens` | `usage.cache_creation_input_tokens` | `usage.cache_creation_input_tokens` |
 
 Codex's newest `total` for the invocation's thread and turn is the turn's usage,
 because a text invocation runs one turn on a fresh thread. The claude_code
 column is what the Claude harness writes as `turn_usage` in its `usage` session
-event, ready for when it gets a text driver. Both versions append the same
-`usage` event (`{"turn_usage": …}`) to the text session log.
+event, ready for when it gets a text driver. grok_build reads the terminal
+`end` object's spend and does not sum `modelUsage` rows. All three append the
+same `usage` event (`{"turn_usage": …}`) to the text session log.
 
 Both versions append a `text.stage.completed` event per stage to the session
 log and emit `session.started` / `session.completed` / `session.failed`

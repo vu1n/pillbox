@@ -83,7 +83,7 @@ impl TextRequestV2 {
         ensure!(
             matches!(
                 self.agent.harness.as_str(),
-                "codex" | "claude_code" | "pi" | "opencode"
+                "codex" | "claude_code" | "pi" | "opencode" | "grok_build"
             ),
             "unknown text harness"
         );
@@ -147,6 +147,9 @@ pub(crate) fn execute(
     request: &TextRequestV2,
     owner: &mut OwnedInvocation,
 ) -> Result<Outcome> {
+    if request.agent.harness == "grok_build" {
+        return execute_grok(pb, request, owner);
+    }
     let resolved = resolve(pb, request);
     let (lowered, runner_image_id) = match resolved {
         Ok(resolved) => resolved,
@@ -204,12 +207,68 @@ struct Rejection {
     error: anyhow::Error,
 }
 
+fn execute_grok(
+    pb: &Pillbox,
+    request: &TextRequestV2,
+    owner: &mut OwnedInvocation,
+) -> Result<Outcome> {
+    // Model first, so an unservable selection is `runtime_rejected` even when
+    // the runner image is absent.
+    if let Err(error) =
+        super::grok::resolve_model(&request.agent.model, &request.agent.reasoning_effort)
+    {
+        return unresolved(
+            pb,
+            request,
+            owner,
+            Rejection {
+                code: "runtime_rejected",
+                error,
+            },
+        );
+    }
+    let runner_image_id = match runner_image_id(pb) {
+        Ok(id) => id,
+        Err(error) => {
+            return unresolved(
+                pb,
+                request,
+                owner,
+                Rejection {
+                    code: "runtime_unavailable",
+                    error,
+                },
+            );
+        }
+    };
+    let lowered = match super::grok::lower(
+        &request.agent.model,
+        &request.agent.reasoning_effort,
+        &runner_image_id,
+    ) {
+        Ok(lowered) => lowered,
+        Err(error) => {
+            return unresolved(
+                pb,
+                request,
+                owner,
+                Rejection {
+                    code: "runtime_rejected",
+                    error,
+                },
+            );
+        }
+    };
+    super::grok::run(pb, request, owner, lowered)
+}
+
 fn resolve(
     pb: &Pillbox,
     request: &TextRequestV2,
 ) -> std::result::Result<(TextRequest, String), Rejection> {
-    // Only Codex has a tool-free text driver today. The other harnesses are valid
-    // selections that this build cannot run, which is a rejection, not a bad request.
+    // Codex and grok_build have tool-free text drivers. grok_build is dispatched
+    // before this function. The other harnesses are valid selections this build
+    // cannot run, which is a rejection, not a bad request.
     if request.agent.harness != "codex" {
         return Err(Rejection {
             code: "runtime_rejected",
@@ -292,7 +351,7 @@ fn unresolved(
 
 /// Map a failed stage to the closed code set shared with the caller. Deadlines are
 /// timeouts wherever they hit; otherwise the stage decides.
-fn failure_code(stage: &str, error: &anyhow::Error) -> &'static str {
+pub(crate) fn failure_code(stage: &str, error: &anyhow::Error) -> &'static str {
     let message = format!("{error:#}");
     if message.contains("deadline exceeded") {
         return "runtime_timeout";
@@ -343,7 +402,7 @@ mod tests {
 
     #[test]
     fn every_pillbox_harness_is_a_valid_selection() {
-        for harness in ["codex", "claude_code", "pi", "opencode"] {
+        for harness in ["codex", "claude_code", "pi", "opencode", "grok_build"] {
             request(harness, "any-model").validate().unwrap();
         }
         assert!(request("custom", "any-model").validate().is_err());

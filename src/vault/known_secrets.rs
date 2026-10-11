@@ -123,6 +123,12 @@ const KNOWN: &[KnownSecret] = &[
         header_scheme: HeaderScheme::AuthorizationBearer,
         prefix: "ghp_",
     },
+    KnownSecret {
+        name: "XAI_API_KEY",
+        host: "api.x.ai",
+        header_scheme: HeaderScheme::AuthorizationBearer,
+        prefix: "xai-",
+    },
 ];
 
 /// Aliases that resolve to a canonical name. Keep small — most users
@@ -160,6 +166,11 @@ mod tests {
         let gh = lookup("GITHUB_TOKEN").expect("github known");
         assert_eq!(gh.host, "api.github.com");
         assert_eq!(gh.prefix, "ghp_");
+
+        let xai = lookup("XAI_API_KEY").expect("xai known");
+        assert_eq!(xai.host, "api.x.ai");
+        assert_eq!(xai.header_scheme, HeaderScheme::AuthorizationBearer);
+        assert_eq!(xai.prefix, "xai-");
     }
 
     #[test]

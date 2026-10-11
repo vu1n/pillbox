@@ -17,10 +17,12 @@ use crate::contract::Payload;
 
 mod claude;
 mod cursor;
+mod grok;
 mod pi;
 
 pub(crate) use claude::ClaudeAdapter;
 pub(crate) use cursor::CursorAdapter;
+pub(crate) use grok::GrokAdapter;
 pub(crate) use pi::PiAdapter;
 
 /// A harness whose headless run streams structured JSON **lines over stdout**
@@ -42,6 +44,7 @@ pub(crate) fn lookup(id: &str) -> Option<Box<dyn HarnessAdapter>> {
     match id {
         "claude" => Some(Box::new(ClaudeAdapter::default())),
         "cursor" => Some(Box::new(CursorAdapter::default())),
+        "grok" => Some(Box::new(GrokAdapter::default())),
         "pi" => Some(Box::new(PiAdapter::default())),
         _ => None,
     }

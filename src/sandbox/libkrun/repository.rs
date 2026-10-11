@@ -27,6 +27,7 @@ use crate::paths::write_private_file;
 use crate::vault::providers::codex_execution::CodexAccessRelease;
 
 const PROVIDER_HOST: &str = "chatgpt.com";
+const GROK_HOST: &str = "api.x.ai";
 const RPC_PORT: u32 = 1067;
 const MAX_DURATION: Duration = Duration::from_secs(86_400);
 const MAX_OUTPUT: u64 = 64 * 1024 * 1024;
@@ -551,6 +552,80 @@ pub(crate) fn launch_builder_staged(
     Ok(vm)
 }
 
+/// Tool-free grok_build text VM. The guest sees an xAI API-key stub; the real
+/// key is written to the VMM child's stdin after ownership, bound to `api.x.ai`.
+// Context: doc://pillbox/libkrun-env-fork-substrate@0002#libkrun-env-fork-substrate — the guest holds an xAI stub; the real key is released only on the VMM stdin swap bound to api.x.ai.
+// Context: doc://pillbox/vault-egress-default-deny@0002#vault-egress-default-deny — this text VM's egress allowlist is only api.x.ai.
+pub(crate) struct GrokInput {
+    pub(crate) image_id: String,
+    pub(crate) argv: Vec<String>,
+    pub(crate) prompt: String,
+    pub(crate) stub: String,
+    pub(crate) real: String,
+}
+
+pub(crate) fn launch_grok_text(
+    input: GrokInput,
+    limits: VmLimits,
+    cancelled: &dyn Fn() -> bool,
+    stage: &mut dyn FnMut(&'static str),
+) -> Result<OwnedVm> {
+    limits.validate()?;
+    validate_grok_input(&input)?;
+    let deadline = Instant::now()
+        .checked_add(limits.max_duration)
+        .context("VM deadline overflow")?;
+    let (runtime, rootfs) = prepare_rootfs(&input.image_id, deadline, cancelled)?;
+    stage("image_prepare");
+    let ca_dir = runtime.path().join("ca");
+    fs::create_dir(&ca_dir)?;
+    crate::paths::ensure_mode_0700(&ca_dir)?;
+    let ca = crate::vault::Ca::ensure(&ca_dir).map_err(anyhow::Error::msg)?;
+    let certificate = fs::read(ca.cert_path())?;
+    prepare_grok_guest(
+        &rootfs,
+        &input,
+        &certificate,
+        limits,
+        remaining_ms(deadline)?,
+    )?;
+    stage("guest_prepare");
+    let real = input.real.clone();
+    let stub = input.stub.clone();
+    let mut vm = launch_prepared(
+        runtime,
+        limits,
+        deadline,
+        cancelled,
+        true,
+        |owner, rpc, remaining| grok_spec(&rootfs, &ca_dir, owner, rpc, remaining),
+    )?;
+    let delivery = (|| -> Result<()> {
+        let swaps = vec![SwapPair {
+            stub,
+            real,
+            hosts: vec![GROK_HOST.into()],
+        }];
+        let bytes = serde_json::to_vec(&swaps)?;
+        let mut stdin = vm
+            .process
+            .child
+            .stdin
+            .take()
+            .context("VMM credential channel missing")?;
+        nonblocking(stdin.as_raw_fd())?;
+        write_until(&mut stdin, &bytes, deadline, cancelled)?;
+        drop(stdin);
+        Ok(())
+    })();
+    if let Err(error) = delivery {
+        let cleanup = vm.stop_and_reap();
+        return Err(cleanup_failure(error, cleanup));
+    }
+    stage("vmm_spawn");
+    Ok(vm)
+}
+
 pub(crate) fn launch_verifier(
     input: VerifierInput,
     limits: VmLimits,
@@ -909,6 +984,110 @@ fn prepare_guest(
     let runtime = rootfs.join(GUEST_RUNTIME.trim_start_matches('/'));
     write_private_file(&runtime.join("bridge.py"), BRIDGE.as_bytes())?;
     write_private_file(&runtime.join("ca.crt"), certificate)?;
+    write_private_file(
+        &runtime.join("limits.json"),
+        &serde_json::to_vec(&serde_json::json!({
+            "duration_ms": remaining_ms,
+            "max_output_bytes": limits.max_output_bytes,
+            "max_frame_bytes": limits.max_frame_bytes,
+        }))?,
+    )?;
+    prepare_generated_metadata(rootfs, &[GUEST_RUNTIME, GUEST_HOME, "/workspace"])
+}
+
+fn validate_grok_input(input: &GrokInput) -> Result<()> {
+    validate_image_id(&input.image_id)?;
+    ensure!(
+        !input.prompt.is_empty() && input.prompt.len() <= 512 * 1024,
+        "grok prompt is empty or too large"
+    );
+    ensure!(
+        !input.argv.is_empty()
+            && input
+                .argv
+                .iter()
+                .all(|arg| !arg.is_empty() && arg.len() <= 64 * 1024),
+        "grok argv is empty or too large"
+    );
+    ensure!(
+        !input.real.is_empty() && input.real.len() <= 64 * 1024,
+        "credential release is empty or too large"
+    );
+    ensure!(
+        !input.stub.is_empty()
+            && input.stub.len() <= 64 * 1024
+            && input.stub != input.real
+            && !input.stub.contains(&input.real)
+            && !input.real.contains(&input.stub),
+        "credential stub is invalid"
+    );
+    let real = input.real.as_bytes();
+    ensure!(
+        !contains_bytes(input.prompt.as_bytes(), real)
+            && input
+                .argv
+                .iter()
+                .all(|arg| !contains_bytes(arg.as_bytes(), real))
+            && !contains_bytes(input.stub.as_bytes(), real),
+        "real credential appeared in guest input"
+    );
+    Ok(())
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|part| part == needle)
+}
+
+fn grok_spec(rootfs: &Path, ca_dir: &Path, owner: &Path, rpc: &Path, remaining_ms: u64) -> VmSpec {
+    VmSpec {
+        rootfs: rootfs.to_string_lossy().into_owned(),
+        vcpus: 2,
+        ram_mib: 2048,
+        shares: vec![],
+        exec: vec![
+            "/usr/bin/python3".into(),
+            "-I".into(),
+            "-S".into(),
+            format!("{GUEST_RUNTIME}/bridge.py"),
+        ],
+        vsock: Some(VsockAttach {
+            port: RPC_PORT,
+            host_sock: rpc.to_string_lossy().into_owned(),
+            listen: false,
+        }),
+        egress: Some(EgressSpec {
+            allowlist: vec![GROK_HOST.into()],
+            log_path: None,
+            ca_dir: Some(ca_dir.to_string_lossy().into_owned()),
+            local_forward_port: None,
+            refresh: None,
+        }),
+        ownership: Some(OwnershipSpec {
+            socket: owner.to_string_lossy().into_owned(),
+            remaining_ms: Some(remaining_ms),
+        }),
+    }
+}
+
+fn prepare_grok_guest(
+    rootfs: &Path,
+    input: &GrokInput,
+    certificate: &[u8],
+    limits: VmLimits,
+    remaining_ms: u64,
+) -> Result<()> {
+    fresh_directory(rootfs, GUEST_HOME)?;
+    fresh_directory(rootfs, GUEST_RUNTIME)?;
+    fresh_directory(rootfs, "/workspace")?;
+    let runtime = rootfs.join(GUEST_RUNTIME.trim_start_matches('/'));
+    write_private_file(&runtime.join("bridge.py"), GROK_BRIDGE.as_bytes())?;
+    write_private_file(&runtime.join("ca.crt"), certificate)?;
+    write_private_file(&runtime.join("stub"), input.stub.as_bytes())?;
+    write_private_file(&runtime.join("prompt.txt"), input.prompt.as_bytes())?;
+    write_private_file(
+        &runtime.join("argv.json"),
+        &serde_json::to_vec(&input.argv)?,
+    )?;
     write_private_file(
         &runtime.join("limits.json"),
         &serde_json::to_vec(&serde_json::json!({
@@ -2246,6 +2425,154 @@ if __name__ == '__main__':
     main()
 "#;
 
+const GROK_BRIDGE: &str = r#"import json
+import os
+import select
+import signal
+import socket
+import subprocess
+import time
+
+RUNTIME = '/opt/pillbox-execution'
+GROK = '/usr/local/bin/grok'
+
+def stop(proc):
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=2)
+    except Exception:
+        pass
+
+def send_all(sock, payload, deadline):
+    view = memoryview(payload)
+    while len(view):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError('bounded execution deadline exceeded')
+        _, writable, _ = select.select([], [sock], [], min(remaining, 0.1))
+        if sock in writable:
+            sent = sock.send(view)
+            if sent <= 0:
+                raise RuntimeError('bridge write made no progress')
+            view = view[sent:]
+
+def relay(sock, proc, limits, deadline):
+    used = 0
+    out_open = True
+    err_open = True
+    output_fd = proc.stdout.fileno()
+    error_fd = proc.stderr.fileno()
+    for fd in (output_fd, error_fd):
+        os.set_blocking(fd, False)
+    sock.setblocking(False)
+    pending = bytearray()
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError('bounded execution deadline exceeded')
+        if not out_open and not err_open and not pending:
+            proc.wait(timeout=min(remaining, 2))
+            return
+        reads = []
+        if out_open:
+            reads.append(output_fd)
+        if err_open:
+            reads.append(error_fd)
+        writes = [sock] if pending else []
+        readable, writable, _ = select.select(reads, writes, [], min(remaining, 0.1))
+        for source in readable:
+            if source == output_fd:
+                budget = limits['max_output_bytes'] - used
+                try:
+                    data = os.read(source, min(65536, max(budget, 0) + 1))
+                except BlockingIOError:
+                    continue
+                used += len(data)
+                if used > limits['max_output_bytes']:
+                    raise RuntimeError('turn output limit')
+                if data:
+                    pending.extend(data)
+                else:
+                    out_open = False
+            else:
+                try:
+                    data = os.read(source, 65536)
+                except BlockingIOError:
+                    continue
+                if not data:
+                    err_open = False
+        if sock in writable and pending:
+            try:
+                sent = sock.send(pending)
+            except BlockingIOError:
+                sent = 0
+            if sent:
+                del pending[:sent]
+
+def main():
+    with open(RUNTIME + '/limits.json', 'rb') as handle:
+        limits = json.load(handle)
+    with open(RUNTIME + '/argv.json', 'rb') as handle:
+        argv = json.load(handle)
+    with open(RUNTIME + '/stub', 'rb') as handle:
+        stub = handle.read().decode('utf-8')
+    deadline = time.monotonic() + limits['duration_ms'] / 1000
+    env = {
+        'HOME': '/home/pillbox',
+        'PATH': '/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin',
+        'LANG': 'C.UTF-8',
+        'SSL_CERT_FILE': RUNTIME + '/ca.crt',
+        'NODE_EXTRA_CA_CERTS': RUNTIME + '/ca.crt',
+        'GROK_EXTRA_CA_BUNDLE': RUNTIME + '/ca.crt',
+        'GROK_DISABLE_AUTOUPDATER': '1',
+        'XAI_API_KEY': stub,
+    }
+    for cmd in (
+        ['/usr/sbin/ip', 'link', 'set', 'eth0', 'up'],
+        ['/usr/sbin/ip', 'addr', 'add', '10.0.2.15/24', 'dev', 'eth0'],
+        ['/usr/sbin/ip', 'route', 'add', 'default', 'via', '10.0.2.2'],
+    ):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError('bounded execution deadline exceeded')
+        subprocess.run(cmd, env=env, check=True, stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=min(remaining, 5))
+    with open('/etc/resolv.conf', 'w') as handle:
+        handle.write('nameserver 10.0.2.2\n')
+    sock = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+    proc = None
+    try:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError('bounded execution deadline exceeded')
+        sock.settimeout(min(remaining, 10))
+        sock.connect((2, 1067))
+        ver = subprocess.run([GROK, '--version'], env=env, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             timeout=min(max(deadline - time.monotonic(), 0.1), 10),
+                             check=False)
+        text = ver.stdout.decode('utf-8', 'replace').strip().splitlines()
+        version = text[0].strip() if text else ''
+        line = json.dumps({'type': 'pillbox.harness_version', 'version': version}) + '\n'
+        send_all(sock, line.encode(), deadline)
+        proc = subprocess.Popen(argv, cwd='/workspace', env=env,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, bufsize=0,
+                                close_fds=True, start_new_session=True)
+        relay(sock, proc, limits, deadline)
+    finally:
+        sock.close()
+        if proc is not None:
+            stop(proc)
+
+if __name__ == '__main__':
+    main()
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2345,6 +2672,43 @@ mod tests {
         let serialized = serde_json::to_string(&spec).unwrap();
         assert!(!serialized.contains(&value.access_release.real));
         assert!(serialized.contains(&value.access_release.stub));
+    }
+
+    #[test]
+    fn grok_text_spec_has_no_shares_and_only_provider_egress() {
+        let real = "xai-host-only-real-key";
+        let input = GrokInput {
+            image_id: format!("sha256:{}", "c".repeat(64)),
+            argv: crate::execution::grok::text_argv("grok-4.6", "low"),
+            prompt: "say hello".into(),
+            stub: "xai-stub-only".into(),
+            real: real.into(),
+        };
+        assert!(validate_grok_input(&input).is_ok());
+        let spec = grok_spec(
+            Path::new("/private/rootfs"),
+            Path::new("/private/ca"),
+            Path::new("/private/owner"),
+            Path::new("/private/rpc"),
+            100,
+        );
+        assert!(spec.shares.is_empty());
+        let egress = spec.egress.as_ref().unwrap();
+        assert_eq!(egress.allowlist, ["api.x.ai"]);
+        assert!(egress.refresh.is_none());
+        assert!(egress.local_forward_port.is_none());
+        let serialized = serde_json::to_string(&spec).unwrap();
+        assert!(!serialized.contains(real));
+        assert!(!serialized.contains("xai-stub-only"));
+        assert!(!serialized.contains("say hello"));
+        let mut leaked = input;
+        leaked.prompt = format!("leak {real}");
+        assert!(validate_grok_input(&leaked)
+            .unwrap_err()
+            .to_string()
+            .contains("real credential"));
+        assert!(GROK_BRIDGE.contains("GROK_EXTRA_CA_BUNDLE"));
+        assert!(!GROK_BRIDGE.contains(real));
     }
 
     #[test]

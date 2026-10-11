@@ -556,8 +556,33 @@ that image. A completed record carries `resolved` (`harness`,
 `runtime_timeout`, `runtime_rejected`, `runtime_protocol_error`,
 `internal_error`) and the `stage` that was running (`resolve`, `credentials`,
 `image_prepare`, `guest_prepare`, `vmm_spawn`, `guest_rpc_ready`, `turn`,
-`finalize`); the message stays in the session log. Only `codex` has a text
-driver today; the other harnesses fail at `resolve` with `runtime_rejected`.
+`finalize`); the message stays in the session log. `codex` and `opencode` have
+text drivers; the other harnesses fail at `resolve` with `runtime_rejected`.
+
+The `opencode` driver runs OpenCode 2 (`opencode serve`, the version the runner
+image carries) in its own invocation-owned microVM, with no shares:
+
+- `agent.model` is OpenCode's `provider/model`. The provider must be one Pillbox
+  knows the API host of (`anthropic`, `deepseek`, `google`, `groq`, `mistral`,
+  `moonshotai`, `moonshotai-cn`, `openai`, `opencode`, `opencode-go`,
+  `openrouter`, `xai`, `zai`, `zai-coding-plan`, `zhipuai`,
+  `zhipuai-coding-plan`); egress is that host plus `models.dev`, OpenCode's
+  model catalog. Zen's `*-free` models are rejected at `resolve`, because the
+  free tier refuses a session without tools.
+- `agent.reasoning_effort` is sent as the model's variant. A model without that
+  variant fails the turn; it is never dropped.
+- Tools are denied by a `deny` rule for every action, in the server config and
+  on the session, so OpenCode sends the model no tools. A tool call, a
+  permission request or a form still fails the turn (`runtime_protocol_error`
+  at `turn`) and the VM is stopped.
+- OpenCode is not vault-capable. Its credential store (`opencode.db` in the
+  pillbox's OpenCode home, from `pillbox auth login --agent opencode`) is
+  copied into the VM; without one the turn fails at `credentials` with
+  `runtime_unavailable`.
+- `resolved.harness_version` is what the server reports at `/api/info`.
+  `served_model` is `null`: OpenCode does not surface the provider's model id.
+- The answer is the text of the last assistant message, at most
+  `max_final_text_bytes`; an empty or longer answer fails the turn.
 
 A completed record, and a failed one whose turn already spent tokens, carries
 `usage` when the harness reported any:
@@ -581,18 +606,22 @@ nothing gets no `usage` key, never zeros. A value that is not a number, is
 negative or non-finite, or exceeds 10^10 tokens or $1,000,000 is dropped; when
 nothing valid remains, `usage` is absent.
 
-| field | codex (`thread/tokenUsage/updated`, `tokenUsage.total`) | claude_code (`result` line) |
-|---|---|---|
-| `cost_usd` | `null` (Codex reports no cost) | `total_cost_usd` (API-equivalent on a subscription, not a bill) |
-| `input_tokens` | `inputTokens` − `cachedInputTokens` − `cacheWriteInputTokens` (dropped if negative) | `usage.input_tokens` |
-| `output_tokens` | `outputTokens` | `usage.output_tokens` |
-| `cache_read_tokens` | `cachedInputTokens` | `usage.cache_read_input_tokens` |
-| `cache_write_tokens` | `cacheWriteInputTokens` | `usage.cache_creation_input_tokens` |
+| field | codex (`thread/tokenUsage/updated`, `tokenUsage.total`) | claude_code (`result` line) | opencode (`session.usage.updated`) |
+|---|---|---|---|
+| `cost_usd` | `null` (Codex reports no cost) | `total_cost_usd` (API-equivalent on a subscription, not a bill) | `cost` (OpenCode's catalog price for the tokens) |
+| `input_tokens` | `inputTokens` − `cachedInputTokens` − `cacheWriteInputTokens` (dropped if negative) | `usage.input_tokens` | `tokens.input` |
+| `output_tokens` | `outputTokens` | `usage.output_tokens` | `tokens.output` + `tokens.reasoning` |
+| `cache_read_tokens` | `cachedInputTokens` | `usage.cache_read_input_tokens` | `tokens.cache.read` |
+| `cache_write_tokens` | `cacheWriteInputTokens` | `usage.cache_creation_input_tokens` | `tokens.cache.write` |
 
 Codex's newest `total` for the invocation's thread and turn is the turn's usage,
 because a text invocation runs one turn on a fresh thread. The claude_code
 column is what the Claude harness writes as `turn_usage` in its `usage` session
-event, ready for when it gets a text driver. Both versions append the same
+event, ready for when it gets a text driver. OpenCode's latest
+`session.usage.updated` is the session total, and the session is fresh, so it
+is the turn's usage; without one, the `session.step.ended`/`.failed` figures are
+summed. Pillbox sets the session title so OpenCode makes no separate
+title-generation call. Both versions append the same
 `usage` event (`{"turn_usage": …}`) to the text session log.
 
 Both versions append a `text.stage.completed` event per stage to the session

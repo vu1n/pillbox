@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::evidence::ExecutionEvidence;
+use super::opencode::{self, Plan};
 use super::protocol;
 use super::store::OwnedInvocation;
 use super::text::{self, FailedStage, TextExecution, TextLimits, TextRequest, TextRuntime};
@@ -90,6 +91,18 @@ impl TextRequestV2 {
         Ok(())
     }
 
+    /// The run this selection resolves to on `runner_image_id`.
+    fn lower(&self, runner_image_id: String) -> Result<Lowered> {
+        match self.agent.harness.as_str() {
+            "codex" => self
+                .codex_request(runner_image_id)
+                .map(|lowered| Lowered::Codex(Box::new(lowered))),
+            "opencode" => opencode::plan(&self.agent.model, &self.agent.reasoning_effort)
+                .map(Lowered::Opencode),
+            other => bail!("no text driver for harness {other}"),
+        }
+    }
+
     /// The Codex request this selection resolves to on `runner_image_id`. The embedded
     /// catalog cohort is an implementation detail; the CLI version is observed, not required.
     fn codex_request(&self, runner_image_id: String) -> Result<TextRequest> {
@@ -152,6 +165,34 @@ pub(crate) fn execute(
         Ok(resolved) => resolved,
         Err(rejection) => return unresolved(pb, request, owner, rejection),
     };
+    let lowered = match lowered {
+        Lowered::Codex(lowered) => *lowered,
+        Lowered::Opencode(plan) => {
+            return match super::text_opencode::execute(pb, request, &plan, &runner_image_id, owner)
+            {
+                Ok(finished) => {
+                    let mut detail = json!({
+                        "invocation_id": request.invocation_id,
+                        "request_hash": owner.record().request_hash,
+                        "resolved": {
+                            "harness": request.agent.harness,
+                            "harness_version": finished.harness_version,
+                            "adapter_revision": ADAPTER_REVISION,
+                            "runner_image_id": runner_image_id,
+                            "requested_model": request.agent.model,
+                            // OpenCode does not surface the provider's model id.
+                            "served_model": null,
+                        },
+                        "session_ref": finished.session_ref,
+                        "output_text": finished.output_text,
+                    });
+                    with_usage(&mut detail, finished.usage.as_ref());
+                    Ok(Outcome::Completed(detail))
+                }
+                Err(error) => failed(request, owner, error),
+            };
+        }
+    };
     match text::execute_with(pb, &lowered, owner, false) {
         Ok((completion, observed)) => {
             let mut detail = json!({
@@ -173,21 +214,31 @@ pub(crate) fn execute(
             with_usage(&mut detail, observed.usage.as_ref());
             Ok(Outcome::Completed(detail))
         }
-        Err(error) if error.downcast_ref::<TeardownUnconfirmed>().is_some() => Err(error),
-        Err(error) => {
-            let failed = error.downcast_ref::<FailedStage>();
-            let stage = failed.map_or("credentials", |failed| failed.stage);
-            let mut detail = json!({
-                "invocation_id": request.invocation_id,
-                "request_hash": owner.record().request_hash,
-                "code": failure_code(stage, &error),
-                "stage": stage,
-                "session_ref": owner.record().detail.get("session_ref"),
-            });
-            with_usage(&mut detail, failed.and_then(|failed| failed.usage.as_ref()));
-            Ok(Outcome::Failed(detail))
-        }
+        Err(error) => failed(request, owner, error),
     }
+}
+
+/// The failure record for a turn that started. An unconfirmed VM teardown is
+/// returned as an error instead, so the invocation is not sealed.
+fn failed(
+    request: &TextRequestV2,
+    owner: &OwnedInvocation,
+    error: anyhow::Error,
+) -> Result<Outcome> {
+    if error.downcast_ref::<TeardownUnconfirmed>().is_some() {
+        return Err(error);
+    }
+    let failed = error.downcast_ref::<FailedStage>();
+    let stage = failed.map_or("credentials", |failed| failed.stage);
+    let mut detail = json!({
+        "invocation_id": request.invocation_id,
+        "request_hash": owner.record().request_hash,
+        "code": failure_code(stage, &error),
+        "stage": stage,
+        "session_ref": owner.record().detail.get("session_ref"),
+    });
+    with_usage(&mut detail, failed.and_then(|failed| failed.usage.as_ref()));
+    Ok(Outcome::Failed(detail))
 }
 
 /// Add the turn's reported spend to a completed or failed record. A harness that
@@ -196,6 +247,12 @@ fn with_usage(detail: &mut Value, usage: Option<&TurnUsage>) {
     if let Some(usage) = usage {
         detail["usage"] = json!(usage);
     }
+}
+
+/// What a selection resolved to: the request one of this build's drivers runs.
+enum Lowered {
+    Codex(Box<TextRequest>),
+    Opencode(Plan),
 }
 
 /// Why a selection could not be turned into a run, with the closed code to report.
@@ -207,10 +264,10 @@ struct Rejection {
 fn resolve(
     pb: &Pillbox,
     request: &TextRequestV2,
-) -> std::result::Result<(TextRequest, String), Rejection> {
-    // Only Codex has a tool-free text driver today. The other harnesses are valid
+) -> std::result::Result<(Lowered, String), Rejection> {
+    // Codex and OpenCode have tool-free text drivers. The other harnesses are valid
     // selections that this build cannot run, which is a rejection, not a bad request.
-    if request.agent.harness != "codex" {
+    if !matches!(request.agent.harness.as_str(), "codex" | "opencode") {
         return Err(Rejection {
             code: "runtime_rejected",
             error: anyhow::anyhow!("no text driver for harness {}", request.agent.harness),
@@ -221,7 +278,7 @@ fn resolve(
         error,
     })?;
     let lowered = request
-        .codex_request(runner_image_id.clone())
+        .lower(runner_image_id.clone())
         .map_err(|error| Rejection {
             code: "runtime_rejected",
             error,
@@ -368,6 +425,23 @@ mod tests {
         assert_eq!(lowered.runtime.runner_image_id, image);
         assert_eq!(lowered.execution.requested.profile, "luna");
         assert!(request("codex", "gpt-4").codex_request(image).is_err());
+    }
+
+    #[test]
+    fn opencode_selection_lowers_to_its_provider_egress() {
+        let image = format!("sha256:{}", "b".repeat(64));
+        let Lowered::Opencode(plan) = request("opencode", "zai-coding-plan/glm-4.5-air")
+            .lower(image.clone())
+            .unwrap()
+        else {
+            panic!("opencode lowered to another driver");
+        };
+        assert_eq!(plan.hosts, ["api.z.ai", "models.dev"]);
+        assert_eq!(plan.variant, "low");
+        for model in ["opencode/big-pickle-free", "ollama/llama3", "glm-4.5-air"] {
+            assert!(request("opencode", model).lower(image.clone()).is_err());
+        }
+        assert!(request("pi", "any/model").lower(image).is_err());
     }
 
     #[test]

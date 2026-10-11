@@ -69,6 +69,55 @@ impl TurnUsage {
         )
     }
 
+    /// One OpenCode 2 turn on a fresh session, from that session's events. The
+    /// latest `session.usage.updated` is the session total, which also covers model
+    /// calls outside a step (title generation, compaction); without one, the
+    /// `session.step.ended`/`.failed` figures are summed. OpenCode's `cost` is its
+    /// catalog price for the tokens. Its `input` already excludes cache reads and
+    /// writes, and `reasoning` is reported beside `output`, so it is added back.
+    pub(crate) fn from_opencode_events(events: &[Value]) -> Option<Self> {
+        let total = events
+            .iter()
+            .rev()
+            .find(|event| event["type"] == "session.usage.updated");
+        let reports: Vec<&Value> = match total {
+            Some(event) => vec![&event["data"]],
+            None => events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event["type"].as_str(),
+                        Some("session.step.ended" | "session.step.failed")
+                    )
+                })
+                .map(|event| &event["data"])
+                .collect(),
+        };
+        if reports.is_empty() {
+            return None;
+        }
+        let count = |report: &Value, path: &str| report.pointer(path).and_then(Value::as_u64);
+        let sum = |field: &dyn Fn(&Value) -> Option<u64>| {
+            reports
+                .iter()
+                .try_fold(0u64, |total, report| total.checked_add(field(report)?))
+        };
+        let output = |report: &Value| {
+            count(report, "/tokens/output")?
+                .checked_add(count(report, "/tokens/reasoning").unwrap_or(0))
+        };
+        let cost = reports
+            .iter()
+            .try_fold(0f64, |total, report| Some(total + report["cost"].as_f64()?));
+        Self::new(
+            cost,
+            sum(&|report| count(report, "/tokens/input")),
+            sum(&output),
+            sum(&|report| count(report, "/tokens/cache/read")),
+            sum(&|report| count(report, "/tokens/cache/write")),
+        )
+    }
+
     /// The Codex app-server turn in `frames` (native evidence envelopes): the
     /// newest `thread/tokenUsage/updated` correlated with the thread and turn that
     /// `thread/start` and `turn/start` returned. Its `total` is the turn's usage
@@ -220,6 +269,39 @@ mod tests {
         assert_eq!(usage.input_tokens, None);
         assert_eq!(usage.cache_read_tokens, Some(20));
         assert_eq!(usage.output_tokens, Some(3));
+    }
+
+    fn opencode(kind: &str, cost: f64, input: u64, output: u64, reasoning: u64) -> Value {
+        json!({"type": kind, "data": {"sessionID": "ses_1", "cost": cost, "tokens": {
+            "input": input, "output": output, "reasoning": reasoning,
+            "cache": {"read": 10, "write": 1}}}})
+    }
+
+    #[test]
+    fn opencode_prefers_the_session_total_and_counts_reasoning_as_output() {
+        let steps = [
+            opencode("session.step.ended", 0.25, 100, 5, 2),
+            opencode("session.step.failed", 0.5, 50, 1, 0),
+        ];
+        let summed = TurnUsage::from_opencode_events(&steps).unwrap();
+        assert_eq!(
+            serde_json::to_value(&summed).unwrap(),
+            json!({"cost_usd": 0.75, "input_tokens": 150, "output_tokens": 8,
+                "cache_read_tokens": 20, "cache_write_tokens": 2})
+        );
+        let mut with_total = steps.to_vec();
+        with_total.push(opencode("session.usage.updated", 1.0, 200, 9, 3));
+        let total = TurnUsage::from_opencode_events(&with_total).unwrap();
+        assert_eq!(total.cost_usd, Some(1.0));
+        assert_eq!(total.input_tokens, Some(200));
+        assert_eq!(total.output_tokens, Some(12));
+        assert_eq!(TurnUsage::from_opencode_events(&[]), None);
+        let unpriced = json!({"type": "session.step.ended", "data": {"tokens": {"input": 3}}});
+        let usage = TurnUsage::from_opencode_events(&[unpriced]).unwrap();
+        assert_eq!(
+            serde_json::to_value(&usage).unwrap(),
+            json!({"cost_usd": null, "input_tokens": 3})
+        );
     }
 
     #[test]

@@ -97,6 +97,34 @@ in a sandbox). Provider keys in the environment (`--with`) are also picked up.
 Browser-loopback OAuth providers still need the callback port forwarded
 (`oauth_port` is `None` for opencode), so prefer API-key/device-code providers.
 
+## Tool-free text turns (`pillbox.text/2`)
+
+`pillbox text execute` drives one OpenCode turn in an invocation-owned microVM
+(`src/execution/text_opencode.rs`, `src/sandbox/libkrun/repository/opencode.rs`;
+the contract is in [commands](commands.md#sealed-local-text-execution)). The guest
+driver starts `opencode serve`, creates one session, prompts it and relays each
+`/api/event` object to the host as a JSON line until that session's
+`session.execution.*` outcome. Checked against 2.0.24 with a capturing
+OpenAI-compatible provider (fixtures `src/execution/fixtures/opencode-2.0.24-*`):
+
+- A `{"action":"*","resource":"*","effect":"deny"}` rule, in config or on the
+  session, removes every tool from the provider request (`tools` absent).
+- If the model calls a tool anyway, OpenCode answers it with `No tool named …`
+  (`session.tool.called` with `executed: false`) and asks the model again; it
+  never runs it. The host stops the VM at the first `session.tool.*` event.
+- A session created without a `title` makes a second, hidden title-generation
+  call; its tokens show in `session.usage.updated` but in no step. Setting the
+  title skips it.
+- `tokens.input` excludes cache reads, and `tokens.reasoning` is reported beside
+  `tokens.output` and priced as output.
+- An unknown model variant fails the turn with `provider.no-route`
+  ("Variant unavailable …"); variant names differ per model.
+- Zen's free models refuse a session whose tools were removed (403
+  `FreeTierError`, "OpenCode's free tier can only be used from within
+  OpenCode"), so text turns reject them at `resolve`.
+- The model catalog comes from `models.dev` at startup (an empty catalog when it
+  is unreachable), so the text VM allows that host besides the provider's.
+
 ## Not verified
 
 - A full `pillbox run --agent opencode` inside a libkrun microVM with 2.0.24

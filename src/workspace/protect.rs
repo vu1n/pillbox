@@ -854,17 +854,49 @@ pub(crate) fn snapshot_workspace(live: &Path, dst: &Path) -> Result<()> {
         .with_context(|| format!("snapshot worker workspace {}", live.display()))?;
     // The clone copied the relaxed modes; put the originals on it too, since it
     // may be delivered as the winner. Children first, as in the guard's drop.
+    // The worker may have swapped a directory for a link before the clone, so
+    // walk the snapshot by fd and never follow a link, as `ModeGuard` does.
     for (_, _, mode, path) in modes.saved.iter().rev() {
         let rel = path.strip_prefix(live).unwrap_or(path);
         let at = dst.join(rel);
-        std::fs::set_permissions(&at, std::fs::Permissions::from_mode(*mode))
-            .with_context(|| format!("chmod {}", at.display()))?;
+        chmod_dir_no_follow(dst, rel, *mode).with_context(|| format!("chmod {}", at.display()))?;
     }
     if let Some((_, mode)) = &modes.root {
         std::fs::set_permissions(dst, std::fs::Permissions::from_mode(*mode))
             .with_context(|| format!("chmod {}", dst.display()))?;
     }
     drop(modes);
+    Ok(())
+}
+
+/// Set `root/rel`'s mode if it is still a real directory, opening each step
+/// with `O_NOFOLLOW`. A step that is now a link or not a directory is left as is.
+fn chmod_dir_no_follow(root: &Path, rel: &Path, mode: u32) -> Result<()> {
+    let names = rel
+        .components()
+        .map(|c| match c {
+            Component::Normal(n) => CString::new(n.as_bytes()).context("path with NUL"),
+            _ => bail!("unexpected component in {}", rel.display()),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let Some((last, parents)) = names.split_last() else {
+        return Ok(());
+    };
+    let c_root = CString::new(root.as_os_str().as_bytes()).context("path with NUL")?;
+    let mut dir = open_dir_at(libc::AT_FDCWD, &c_root)?;
+    for name in parents.iter().chain(std::iter::once(last)) {
+        match open_dir_at(dir.as_raw_fd(), name) {
+            Ok(fd) if std::ptr::eq(name, last) => {
+                drop(fd);
+                return Ok(chmod_at(&dir, last, mode)?);
+            }
+            Ok(fd) => dir = fd,
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) => {
+                return Ok(())
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
     Ok(())
 }
 
@@ -1541,6 +1573,22 @@ mod tests {
         force_remove(&snap).unwrap();
         fs::set_permissions(live.join("ro"), fs::Permissions::from_mode(0o700)).unwrap();
         fs::set_permissions(live.join("ro/inner"), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn snapshot_mode_restore_never_follows_a_link_in_the_snapshot() {
+        let t = TempDir::new().unwrap();
+        let snap = t.path().join("snap");
+        let outside = t.path().join("outside");
+        fs::create_dir_all(snap.join("real")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o750)).unwrap();
+        symlink(&outside, snap.join("sealed")).unwrap();
+        chmod_dir_no_follow(&snap, Path::new("sealed"), 0o000).unwrap();
+        chmod_dir_no_follow(&snap, Path::new("sealed/x"), 0o000).unwrap();
+        assert_eq!(mode_of(&outside), 0o750, "the link target keeps its mode");
+        chmod_dir_no_follow(&snap, Path::new("real"), 0o550).unwrap();
+        assert_eq!(mode_of(&snap.join("real")), 0o550);
     }
 
     #[test]

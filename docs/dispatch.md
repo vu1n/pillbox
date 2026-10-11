@@ -86,13 +86,23 @@ the trusted bookmark on the host, so it runs where a microVM can't boot.
 **Protected paths** are put back from the bookmark before the grader runs, so a
 worker cannot change its reward by editing, deleting, renaming, or symlink-swapping
 them. The defaults cover test trees and test files (`tests/`, `test/`, `spec/`,
-`__tests__/`, `testdata/`, `*_test.go`, `test_*.py`, `*_test.py`, `*.test.*`,
-`*.spec.*`), test-runner config (`conftest.py`, `pytest.ini`, `tox.ini`,
-`jest.config.*`, `vitest.config.*`), CI config (`.github/`, `.gitlab-ci.yml`,
+`__tests__/`, `testdata/`, `*_test.go`, `*_test.rs`, `test_*.py`, `*_test.py`,
+`*.test.*`, `*.spec.*`), test-runner config (`conftest.py`, `pytest.ini`,
+`tox.ini`, `.cargo/`, `jest.config.*`, `vitest.config.*`), CI config (`.github/`, `.gitlab-ci.yml`,
 `.circleci/`, `.buildkite/`, `.travis.yml`, `azure-pipelines.yml`, `Jenkinsfile`),
 and rubrics (`rubrics/`, `*.rubric`). A name matches at any depth; `--protect`
-adds more. When a grade reverts something, dispatch names the paths on stderr; the
-verdict JSON is unchanged.
+adds more. Manifests the task itself is often supposed to edit — `Cargo.toml`,
+`package.json`, `pyproject.toml` — are not in the default set; a project that
+grades through one of those adds it with `--protect`. When a grade reverts
+something, dispatch names the paths on stderr; the verdict JSON is unchanged.
+
+Protected paths then lose every write bit, owner included, and the rest of the
+copy becomes world-writable. The grader runs as `nobody` (`--drop-privileges`),
+because the virtiofs server writes as the host user and a root guest could
+`chmod` the lock off and let `build.rs` rewrite the tests before they compile.
+`PYTHONDONTWRITEBYTECODE` is set so pytest does not need to write `__pycache__`
+into a locked `tests/`. `--no-default-protect` with no `--protect` leaves the
+tree alone and runs the grader as root, the opt-out.
 
 The copy is removed after the grade. The winner pull still comes from the worker's
 real workspace, edits and all.

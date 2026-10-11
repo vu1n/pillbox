@@ -1563,7 +1563,13 @@ impl<'a> CliDriver<'a> {
 /// The `session score` argv that grades `tree` for worker `id` inside the
 /// one-shot grader microVM.
 // Context: doc://pillbox/optimization-external-substrate-primitives@0001#optimization-external-substrate-primitives — the reward is an external grader's verdict; a worker must not be able to edit or run code outside the VM to change it.
-fn score_args(id: &str, tree: &std::path::Path, grader: &Grader, egress: &[String]) -> Vec<String> {
+fn score_args(
+    id: &str,
+    tree: &std::path::Path,
+    grader: &Grader,
+    egress: &[String],
+    drop_privileges: bool,
+) -> Vec<String> {
     let mut args = vec![
         "session".into(),
         "score".into(),
@@ -1572,6 +1578,9 @@ fn score_args(id: &str, tree: &std::path::Path, grader: &Grader, egress: &[Strin
         tree.to_string_lossy().into_owned(),
         "--in-sandbox".into(),
     ];
+    if drop_privileges {
+        args.push("--drop-privileges".into());
+    }
     for host in egress {
         args.extend(["--grader-egress".into(), host.clone()]);
     }
@@ -1679,6 +1688,7 @@ impl WorkerDriver for CliDriver<'_> {
             tree.path(),
             grader,
             &self.opts.grader_egress,
+            tree.locked,
         ))?;
         parse_grade(&out)
     }
@@ -3427,6 +3437,23 @@ rm -rf '{seen}'; cp -R "$tree" '{seen}'
             read(&fake.seen.join("tests/check.sh")),
             "grep -q fixed src/lib.rs\n"
         );
+        // The tree handed to `session score` is locked: the owner (who the
+        // virtiofs server writes as) cannot rewrite the restored test, and can
+        // still write the worker's own code.
+        let test_mode = std::fs::symlink_metadata(fake.seen.join("tests/check.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(test_mode & 0o222, 0, "protected file stays unwritable");
+        assert!(
+            std::fs::write(fake.seen.join("tests/check.sh"), b"exit 0\n").is_err(),
+            "owner write of the restored test refused"
+        );
+        assert!(
+            std::fs::write(fake.seen.join("tests/planted.sh"), b"exit 0\n").is_err(),
+            "cannot add a file under the locked tests directory"
+        );
+        std::fs::write(fake.seen.join("src/lib.rs"), b"pub fn f() {}\n").unwrap();
         assert_eq!(
             read(&p.ws.join("tests/check.sh")),
             "exit 0\n",
@@ -3488,6 +3515,10 @@ rm -rf '{seen}'; cp -R "$tree" '{seen}'
             .expect("graded via `session score`");
         assert!(score.contains("--in-sandbox"), "{score}");
         assert!(
+            score.contains("--drop-privileges"),
+            "grader must not run as root: {score}"
+        );
+        assert!(
             !score.contains(&format!("--workspace {} ", live_ws.display())),
             "graded the live workspace: {score}"
         );
@@ -3530,6 +3561,7 @@ rm -rf '{seen}'; cp -R "$tree" '{seen}'
             Path::new("/tmp/tree"),
             &Grader::Rubric("r.txt".into()),
             &["pypi.org".into()],
+            true,
         );
         assert_eq!(
             args,
@@ -3540,6 +3572,7 @@ rm -rf '{seen}'; cp -R "$tree" '{seen}'
                 "--workspace",
                 "/tmp/tree",
                 "--in-sandbox",
+                "--drop-privileges",
                 "--grader-egress",
                 "pypi.org",
                 "--json",
@@ -3547,6 +3580,15 @@ rm -rf '{seen}'; cp -R "$tree" '{seen}'
                 "r.txt"
             ]
         );
+        assert!(!score_args(
+            "w1",
+            Path::new("/tmp/tree"),
+            &Grader::Cmd("true".into()),
+            &[],
+            false,
+        )
+        .iter()
+        .any(|a| a == "--drop-privileges"));
     }
 
     #[test]

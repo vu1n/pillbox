@@ -40,6 +40,7 @@ pub(crate) const DEFAULT_PROTECTED: &[&str] = &[
     "testdata/",
     // Test files that live next to the code.
     "*_test.go",
+    "*_test.rs",
     "test_*.py",
     "*_test.py",
     "*.test.*",
@@ -48,6 +49,7 @@ pub(crate) const DEFAULT_PROTECTED: &[&str] = &[
     "conftest.py",
     "pytest.ini",
     "tox.ini",
+    ".cargo/",
     "jest.config.*",
     "vitest.config.*",
     // CI config.
@@ -200,6 +202,9 @@ fn collect(root: &Path, set: &ProtectSet) -> Result<Protected> {
     let mut stack: Vec<(PathBuf, bool)> = vec![(PathBuf::new(), false)];
     while let Some((dir_rel, dir_covered)) = stack.pop() {
         let dir = root.join(&dir_rel);
+        // A 0o000 directory is still owned by us: chmod before listing, or one
+        // unreadable dir turns the grade into an error instead of a verdict.
+        make_owner_writable(&dir)?;
         let entries = std::fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))?;
         for entry in entries {
             let entry = entry.with_context(|| format!("entry under {}", dir.display()))?;
@@ -373,32 +378,137 @@ pub(crate) fn force_remove(path: &Path) -> Result<()> {
     }
 }
 
+/// Relaxed directory modes, put back when this drops — including on failure.
+struct ModeGuard {
+    saved: Vec<(PathBuf, u32)>,
+}
+
+impl ModeGuard {
+    /// Make every real directory under `root` owner-traversable, remembering
+    /// the modes to restore. Symlinks are not followed.
+    fn relax(root: &Path) -> Result<Self> {
+        let mut saved = Vec::new();
+        relax_dirs(root, &mut saved)?;
+        Ok(Self { saved })
+    }
+}
+
+impl Drop for ModeGuard {
+    fn drop(&mut self) {
+        // Children first: restoring a parent's 0o000 mode before its children
+        // would make the rest unrestorable.
+        for (path, mode) in self.saved.iter().rev() {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(*mode));
+        }
+    }
+}
+
+fn relax_dirs(dir: &Path, saved: &mut Vec<(PathBuf, u32)>) -> Result<()> {
+    let meta = std::fs::symlink_metadata(dir).with_context(|| format!("stat {}", dir.display()))?;
+    if !meta.file_type().is_dir() {
+        return Ok(());
+    }
+    let mode = meta.permissions().mode();
+    if mode & 0o700 != 0o700 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode | 0o700))
+            .with_context(|| format!("chmod {}", dir.display()))?;
+        saved.push((dir.to_path_buf(), mode));
+    }
+    for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        if std::fs::symlink_metadata(&path)?.file_type().is_dir() {
+            relax_dirs(&path, saved)?;
+        }
+    }
+    Ok(())
+}
+
+/// After the restore: protected files and directories lose every write bit
+/// (the owner included — that is who the virtiofs server writes as), and
+/// everything else becomes world-writable so the unprivileged grader can
+/// emit build output. Symlinks are not followed, so a protected link cannot
+/// change the mode of the file it names.
+fn lock_grade_tree(root: &Path, set: &ProtectSet) -> Result<()> {
+    if set.is_empty() {
+        return Ok(());
+    }
+    lock_node(root, root, set)
+}
+
+fn lock_node(root: &Path, path: &Path, set: &ProtectSet) -> Result<()> {
+    let meta =
+        std::fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    let ft = meta.file_type();
+    if ft.is_symlink() {
+        return Ok(());
+    }
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    let covered = rel != Path::new("") && set.covers(rel);
+    let exec = meta.permissions().mode() & 0o111 != 0;
+    let mode = if ft.is_dir() {
+        if covered {
+            0o555
+        } else {
+            0o777
+        }
+    } else if covered {
+        if exec {
+            0o555
+        } else {
+            0o444
+        }
+    } else if exec {
+        0o777
+    } else {
+        0o666
+    };
+    if ft.is_file() || ft.is_dir() {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .with_context(|| format!("chmod {}", path.display()))?;
+    }
+    if ft.is_dir() {
+        for entry in std::fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
+            lock_node(root, &entry?.path(), set)?;
+        }
+    }
+    Ok(())
+}
+
 /// A scrubbed, protected-path-restored copy of a worker's workspace, removed on
 /// drop. This — never the live workspace — is what a dispatch grader sees.
 pub(crate) struct GradeTree {
     _tmp: tempfile::TempDir,
     path: PathBuf,
     pub(crate) report: RestoreReport,
+    /// `set` was non-empty, so [`lock_grade_tree`] ran and the grader must
+    /// drop privileges (root could otherwise chmod the lock off).
+    pub(crate) locked: bool,
 }
 
 impl GradeTree {
     /// CoW-clone `workspace`, scrub secrets (the same denylist as a worker's
-    /// clone), then restore `set` from `base`.
+    /// clone), restore `set` from `base`, then lock protected paths against
+    /// the owner. The live tree's modes are put back even if the copy fails.
     pub(crate) fn prepare(workspace: &Path, base: &Path, set: &ProtectSet) -> Result<Self> {
         let tmp = tempfile::Builder::new()
             .prefix("pillbox-grade-")
             .tempdir()
             .context("temp dir for the grade tree")?;
         let path = tmp.path().join("ws");
+        let modes = ModeGuard::relax(workspace)?;
         super::cow::cow_clone_dir(workspace, &path).with_context(|| {
             format!("copy worker workspace {} for grading", workspace.display())
         })?;
+        drop(modes);
         super::ingest::scrub_secrets(&path)?;
         let report = restore_protected(&path, base, set)?;
+        lock_grade_tree(&path, set)?;
         Ok(Self {
             _tmp: tmp,
             path,
             report,
+            locked: !set.is_empty(),
         })
     }
 
@@ -455,6 +565,8 @@ mod tests {
         assert!(s.covers(Path::new("tests/a/b.rs")));
         assert!(s.covers(Path::new("crates/x/tests/it.rs")));
         assert!(s.covers(Path::new("pkg/foo_test.go")));
+        assert!(s.covers(Path::new("src/foo_test.rs")));
+        assert!(s.covers(Path::new(".cargo/config.toml")));
         assert!(s.covers(Path::new("web/app.test.tsx")));
         assert!(s.covers(Path::new(".github/workflows/ci.yml")));
         assert!(s.covers(Path::new("rubrics/grade.txt")));
@@ -692,8 +804,65 @@ mod tests {
             "live workspace untouched"
         );
         assert_eq!(tree.report.reverted, vec![PathBuf::from("tests/check.sh")]);
+        assert!(tree.locked);
         let p = tree.path().to_path_buf();
         drop(tree);
         assert!(!p.exists(), "removed on drop");
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn the_owner_cannot_rewrite_a_locked_protected_path() {
+        // The virtiofs server writes as the host user, who owns this tree.
+        // Stripping the owner's write bit is what stops a root guest whose
+        // chmod we refused (the grader runs as nobody) from sticking.
+        let (_t, base, worker) = base_and_copy();
+        write(&worker, "src/lib.rs", "pub fn f() -> u8 { 1 }\n");
+        write(&base, "tests/link-out", "");
+        std::os::unix::fs::symlink("../src/lib.rs", base.join("tests/via")).unwrap();
+        let tree = GradeTree::prepare(&worker, &base, &defaults()).unwrap();
+        let tests = tree.path().join("tests/check.sh");
+        assert_eq!(mode_of(&tests) & 0o222, 0, "protected file is not writable");
+        assert!(
+            fs::write(&tests, b"exit 0\n").is_err(),
+            "owner write refused"
+        );
+        assert!(
+            fs::write(tree.path().join("tests/extra.sh"), b"exit 0\n").is_err(),
+            "cannot add a file under a protected directory"
+        );
+        // The link is restored as a link, and locking it did not make the
+        // target immutable — that file is worker code.
+        assert!(fs::symlink_metadata(tree.path().join("tests/via"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        fs::write(tree.path().join("src/lib.rs"), b"pub fn f() -> u8 { 2 }\n").unwrap();
+        assert_ne!(
+            mode_of(&worker.join("tests")) & 0o222,
+            0,
+            "the live tree keeps its write bit"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_directory_does_not_fail_the_grade_or_stick() {
+        let (_t, base, worker) = base_and_copy();
+        write(&worker, "sealed/note.txt", "hi\n");
+        fs::set_permissions(worker.join("sealed"), fs::Permissions::from_mode(0o000)).unwrap();
+        fs::set_permissions(worker.join("tests"), fs::Permissions::from_mode(0o000)).unwrap();
+        let tree = GradeTree::prepare(&worker, &base, &defaults()).unwrap();
+        assert_eq!(read(tree.path(), "tests/check.sh"), "exit 1\n");
+        assert_eq!(read(tree.path(), "sealed/note.txt"), "hi\n");
+        assert_eq!(mode_of(&worker.join("tests")), 0o000);
+        assert_eq!(mode_of(&worker.join("sealed")), 0o000);
+        // The tempdir has to be able to remove what the worker sealed.
+        for dir in [worker.join("tests"), worker.join("sealed")] {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        }
     }
 }

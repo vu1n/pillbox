@@ -170,8 +170,15 @@ fn libkrun_score_in_sandbox(
     workspace: &std::path::Path,
     cmd: &str,
     egress_allow: &[String],
+    drop_privileges: bool,
 ) -> Result<(i32, String)> {
-    let (code, raw) = sandbox::libkrun::score_in_sandbox(resolved, workspace, cmd, egress_allow)?;
+    let (code, raw) = sandbox::libkrun::score_in_sandbox(
+        resolved,
+        workspace,
+        cmd,
+        egress_allow,
+        drop_privileges,
+    )?;
     Ok((code, grader::grader_output_after_start(code, &raw)?))
 }
 #[cfg(not(feature = "libkrun"))]
@@ -180,6 +187,7 @@ fn libkrun_score_in_sandbox(
     _workspace: &std::path::Path,
     _cmd: &str,
     _egress_allow: &[String],
+    _drop_privileges: bool,
 ) -> Result<(i32, String)> {
     Err(PillboxError::usage(
         "session score",
@@ -231,6 +239,7 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> 
             workspace,
             in_sandbox,
             grader_egress,
+            drop_privileges,
             json,
         } => session_score(
             resolved,
@@ -241,6 +250,7 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> 
             workspace.as_deref(),
             in_sandbox,
             &grader_egress,
+            drop_privileges,
             json,
         ),
         SessionAction::Ingest { id, json } => session_ingest(resolved, &id, json),
@@ -1329,6 +1339,7 @@ fn session_score(
     workspace: Option<&std::path::Path>,
     in_sandbox: bool,
     grader_egress: &[String],
+    drop_privileges: bool,
     json: bool,
 ) -> Result<()> {
     use crate::workspace::{SnapshotHandle, WorkspaceBackend};
@@ -1339,6 +1350,13 @@ fn session_score(
         return Err(PillboxError::usage(
             "session score",
             "--grader-egress only applies to --in-sandbox (the host grader uses the host network)",
+        )
+        .into());
+    }
+    if drop_privileges && !in_sandbox {
+        return Err(PillboxError::usage(
+            "session score",
+            "--drop-privileges only applies to --in-sandbox (the host grader is the host user)",
         )
         .into());
     }
@@ -1383,7 +1401,13 @@ fn session_score(
     // rubric's frame markers are interspersed, so capping here (tail-only) could
     // drop early criteria. `--in-sandbox` runs it in a one-shot microVM.
     let (code, raw) = if in_sandbox {
-        libkrun_score_in_sandbox(resolved, &grade_dir, &exec_cmd, grader_egress)?
+        libkrun_score_in_sandbox(
+            resolved,
+            &grade_dir,
+            &exec_cmd,
+            grader_egress,
+            drop_privileges,
+        )?
     } else {
         run_host_grader(&grade_dir, &exec_cmd)?
     };

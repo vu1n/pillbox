@@ -255,6 +255,9 @@ mod tests {
     const TOOL_ATTEMPT: &str = include_str!("fixtures/opencode-2.0.24-tool-attempt.jsonl");
     const FREE_TIER: &str = include_str!("fixtures/opencode-2.0.24-free-tier-refused.jsonl");
     const DRIVER_TURN: &str = include_str!("fixtures/opencode-2.0.24-driver-text-turn.jsonl");
+    /// A real `zai-coding-plan/glm-5.3-flash` turn: the guest driver run outside a VM
+    /// by `scripts/text-live-opencode.py`, control frames included.
+    const LIVE_GLM: &str = include_str!("fixtures/opencode-2.0.24-zai-coding-plan-live.jsonl");
 
     fn session_of(capture: &str) -> String {
         capture
@@ -355,6 +358,29 @@ mod tests {
         let (completed, usage) = fold.finish(32_768);
         assert_eq!(completed.unwrap().text, "pong");
         assert_eq!(usage.unwrap().output_tokens, Some(7));
+    }
+
+    #[test]
+    fn a_live_glm_turn_folds_to_the_answer_and_usage() {
+        let plan = plan("zai-coding-plan/glm-5.3-flash", "low").unwrap();
+        assert_eq!(plan.hosts, ["api.z.ai", "models.dev"]);
+        let mut fold = TurnFold::default();
+        let mut done = false;
+        for line in LIVE_GLM.lines() {
+            assert!(!done, "frames after the outcome");
+            done = fold.observe(&serde_json::from_str(line).unwrap()).unwrap();
+        }
+        assert!(done);
+        let (completed, usage) = fold.finish(32_768);
+        let completed = completed.unwrap();
+        assert_eq!(completed.text, "pong");
+        assert_eq!(completed.harness_version, "2.0.24");
+        // The Coding Plan is a subscription, so models.dev prices it at zero.
+        assert_eq!(
+            serde_json::to_value(usage.unwrap()).unwrap(),
+            json!({"cost_usd": 0.0, "input_tokens": 347, "output_tokens": 29,
+                "cache_read_tokens": 0, "cache_write_tokens": 0})
+        );
     }
 
     #[test]

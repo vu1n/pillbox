@@ -210,15 +210,7 @@ impl TextRequest {
             self.idempotency_key == self.invocation_id,
             "invocation/idempotency mismatch"
         );
-        ensure!(
-            !self.rendered_input.is_empty()
-                && self.rendered_input.len() <= MAX_RENDERED_INPUT_BYTES,
-            "rendered input must contain 1..524288 UTF-8 bytes"
-        );
-        ensure!(
-            self.rendered_input_hash == digest(self.rendered_input.as_bytes()),
-            "rendered input digest mismatch"
-        );
+        validate_input(&self.rendered_input, &self.rendered_input_hash)?;
         ensure!(
             self.tool_policy == "deny_all",
             "unsupported text tool policy"
@@ -227,10 +219,7 @@ impl TextRequest {
             self.execution_policy_revision == POLICY_REVISION,
             "unsupported text execution policy"
         );
-        ensure!(
-            self.output_format.kind == "text" && self.output_format.retry_count == 0,
-            "unsupported text output format"
-        );
+        validate_output_format(&self.output_format)?;
         let execution = &self.execution;
         ensure!(
             execution.transport.harness == "codex"
@@ -282,6 +271,26 @@ impl TextRequest {
     }
 }
 
+pub(crate) fn validate_input(rendered_input: &str, rendered_input_hash: &str) -> Result<()> {
+    ensure!(
+        !rendered_input.is_empty() && rendered_input.len() <= MAX_RENDERED_INPUT_BYTES,
+        "rendered input must contain 1..524288 UTF-8 bytes"
+    );
+    ensure!(
+        rendered_input_hash == digest(rendered_input.as_bytes()),
+        "rendered input digest mismatch"
+    );
+    Ok(())
+}
+
+pub(crate) fn validate_output_format(format: &TextOutputFormat) -> Result<()> {
+    ensure!(
+        format.kind == "text" && format.retry_count == 0,
+        "unsupported text output format"
+    );
+    Ok(())
+}
+
 pub(crate) fn validate_id(value: &str) -> Result<()> {
     ensure!(
         !value.is_empty()
@@ -311,7 +320,7 @@ impl std::fmt::Display for FailedStage {
 
 /// What the native turn reported about itself besides its text.
 pub(crate) struct Observed {
-    pub(crate) cli_version: Option<String>,
+    pub(crate) cli_version: String,
     pub(crate) usage: Option<TurnUsage>,
 }
 
@@ -450,7 +459,7 @@ fn run_local(
     progress: &mut TextProgress,
     stages: &mut Stages,
     usage: &mut Option<TurnUsage>,
-) -> Result<(TextCompletion, Option<String>)> {
+) -> Result<(TextCompletion, String)> {
     let spec = crate::agents::lookup("execution", "codex")?;
     let credentials_path = spec.home_dir(pb)?.join(spec.cred_sentinel);
     let real = crate::vault::pre_refresh(&credentials_path, "codex")?
@@ -532,7 +541,7 @@ fn run_local(
         };
         // Bounded: the frames are the native evidence, already capped by max_evidence_bytes.
         *usage = TurnUsage::from_codex_frames(frames);
-        progress.native_evidence = Some(evidence.native_frames(frames)?);
+        progress.native_evidence = Some(evidence.native_frames_for(frames, Some(profile))?);
         progress.session_ref = evidence.reference();
         owner.observe(serde_json::to_value(&progress)?)?;
     }
@@ -548,7 +557,8 @@ fn run_local(
         }))?;
     }
     let native = native?.map_err(|failure| failure.error)?;
-    let cli_version = observed_cli_version(&native.evidence);
+    let cli_version =
+        observed_cli_version(&native.evidence).context("Codex did not report its CLI version")?;
     check_live(owner, deadline)?;
     let text = evidence.artifact(native.text.as_bytes(), "text/plain;charset=utf-8")?;
     let native_evidence = progress

@@ -6,27 +6,27 @@
 //! is dropped rather than replaced, so "not reported" never turns into a zero.
 //! When nothing valid is left, there is no usage at all.
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 
-/// Upper bounds shared with the run cost envelope (`crate::cost`).
+/// The same upper bounds the run cost envelope (`crate::cost`) accepts.
 const MAX_TOKENS: u64 = 10_000_000_000;
 const MAX_COST_USD: f64 = 1_000_000.0;
 
 /// Token counts do not overlap: `input_tokens` excludes cache reads and writes,
 /// which have their own fields, and reasoning tokens are inside `output_tokens`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Serialize-only: the constructors are the one place values are validated.
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct TurnUsage {
     /// The harness's reported cost; null when it reports tokens but no cost.
     pub(crate) cost_usd: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) input_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) output_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) cache_read_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) cache_write_tokens: Option<u64>,
 }
 
@@ -278,11 +278,5 @@ mod tests {
         assert_eq!(usage.input_tokens, None);
         assert_eq!(usage.cache_read_tokens, Some(20));
         assert_eq!(usage.output_tokens, Some(3));
-    }
-
-    #[test]
-    fn the_shape_is_closed() {
-        let extra = json!({"cost_usd": null, "input_tokens": 1, "total_tokens": 2});
-        assert!(serde_json::from_value::<TurnUsage>(extra).is_err());
     }
 }

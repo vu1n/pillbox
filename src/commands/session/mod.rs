@@ -21,6 +21,9 @@ use crate::{events, sandbox, session};
 mod grader;
 mod stream;
 
+#[cfg(feature = "libkrun")]
+pub(crate) use grader::GRADER_STARTED_PRINTF;
+
 /// Pid file a detached §0 producer ([`run_detached_tailer`]) writes in the session
 /// dir, so teardown can SIGTERM it and live readers can tell a producer is keeping
 /// the log fresh (and skip their own drain — the single-producer invariant).
@@ -167,8 +170,16 @@ fn libkrun_score_in_sandbox(
     workspace: &std::path::Path,
     cmd: &str,
     egress_allow: &[String],
+    drop_privileges: bool,
 ) -> Result<(i32, String)> {
-    sandbox::libkrun::score_in_sandbox(resolved, workspace, cmd, egress_allow)
+    let (code, raw) = sandbox::libkrun::score_in_sandbox(
+        resolved,
+        workspace,
+        cmd,
+        egress_allow,
+        drop_privileges,
+    )?;
+    Ok((code, grader::grader_output_after_start(code, &raw)?))
 }
 #[cfg(not(feature = "libkrun"))]
 fn libkrun_score_in_sandbox(
@@ -176,6 +187,7 @@ fn libkrun_score_in_sandbox(
     _workspace: &std::path::Path,
     _cmd: &str,
     _egress_allow: &[String],
+    _drop_privileges: bool,
 ) -> Result<(i32, String)> {
     Err(PillboxError::usage(
         "session score",
@@ -227,6 +239,7 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> 
             workspace,
             in_sandbox,
             grader_egress,
+            drop_privileges,
             json,
         } => session_score(
             resolved,
@@ -237,6 +250,7 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> 
             workspace.as_deref(),
             in_sandbox,
             &grader_egress,
+            drop_privileges,
             json,
         ),
         SessionAction::Ingest { id, json } => session_ingest(resolved, &id, json),
@@ -1277,8 +1291,9 @@ fn artifact_ref_json(
 /// `session done` self-report); its combined output is the feedback gradient.
 /// `--cmd` is one command; `--rubric FILE` is N named criteria → per-criterion
 /// verdicts + a fractional score. `--in-sandbox` runs it in a one-shot microVM.
+///
 /// Run a compiled grader script on the host in `dir` → `(exit code, combined
-/// raw output)`. Shared by `session score` (host path) and [`grade_dir`].
+/// raw output)`. The host path of `session score`, and [`grade_dir`].
 fn run_host_grader(dir: &std::path::Path, exec_cmd: &str) -> Result<(i32, String)> {
     let out = std::process::Command::new("sh")
         .arg("-c")
@@ -1295,7 +1310,8 @@ fn run_host_grader(dir: &std::path::Path, exec_cmd: &str) -> Result<(i32, String
 /// Grade a plain directory with a `--cmd` xor `--rubric` grader on the host,
 /// with no session and no §0 record — the same verdict `session score` would
 /// produce for that dir. `dispatch --baseline-check` uses it to grade the
-/// bookmark's base before any worker exists.
+/// trusted bookmark before any worker exists; worker grades run in the
+/// microVM instead (a worker's tree is the untrusted one).
 pub(crate) fn grade_dir(
     dir: &std::path::Path,
     cmd: Option<&str>,
@@ -1323,6 +1339,7 @@ fn session_score(
     workspace: Option<&std::path::Path>,
     in_sandbox: bool,
     grader_egress: &[String],
+    drop_privileges: bool,
     json: bool,
 ) -> Result<()> {
     use crate::workspace::{SnapshotHandle, WorkspaceBackend};
@@ -1333,6 +1350,13 @@ fn session_score(
         return Err(PillboxError::usage(
             "session score",
             "--grader-egress only applies to --in-sandbox (the host grader uses the host network)",
+        )
+        .into());
+    }
+    if drop_privileges && !in_sandbox {
+        return Err(PillboxError::usage(
+            "session score",
+            "--drop-privileges only applies to --in-sandbox (the host grader is the host user)",
         )
         .into());
     }
@@ -1377,7 +1401,13 @@ fn session_score(
     // rubric's frame markers are interspersed, so capping here (tail-only) could
     // drop early criteria. `--in-sandbox` runs it in a one-shot microVM.
     let (code, raw) = if in_sandbox {
-        libkrun_score_in_sandbox(resolved, &grade_dir, &exec_cmd, grader_egress)?
+        libkrun_score_in_sandbox(
+            resolved,
+            &grade_dir,
+            &exec_cmd,
+            grader_egress,
+            drop_privileges,
+        )?
     } else {
         run_host_grader(&grade_dir, &exec_cmd)?
     };

@@ -124,6 +124,42 @@ pub(super) fn grade_result(spec: &GraderSpec, code: i32, raw: String) -> GradeRe
     }
 }
 
+/// Line the grader microVM prints right before it runs the grader, after boot,
+/// network setup and the workspace mount succeeded. [`GRADER_STARTED_PRINTF`]
+/// emits it (on its own line) from the guest's boot script.
+const GRADER_STARTED_MARKER: &str = "\u{1e}PBSTART";
+
+/// The guest shell command that prints [`GRADER_STARTED_MARKER`].
+#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+pub(crate) const GRADER_STARTED_PRINTF: &str = r"printf '\n\036PBSTART\n'";
+
+/// Strip the grader microVM's console output down to what the grader printed.
+/// No marker means the VM failed before the grader ran (no boot, no mount, a
+/// setup step aborted) — an error, never a failing grade, so an unavailable VM
+/// never reads as a worker that failed its tests.
+#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+pub(super) fn grader_output_after_start(code: i32, raw: &str) -> Result<String> {
+    let Some(at) = raw.find(GRADER_STARTED_MARKER) else {
+        let tail: String = raw
+            .lines()
+            .rev()
+            .take(10)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(PillboxError::runtime(
+            "session score",
+            format!("the grader microVM exited ({code}) before the grader started; nothing was graded. VM output:\n{tail}"),
+        )
+        .into());
+    };
+    let rest = &raw[at + GRADER_STARTED_MARKER.len()..];
+    let rest = rest.strip_prefix('\r').unwrap_or(rest);
+    Ok(rest.strip_prefix('\n').unwrap_or(rest).to_string())
+}
+
 /// Combine a grader's stdout+stderr into one feedback string (uncapped) — the raw
 /// gradient the executor hands to [`grade_result`]. Kept RAW until after rubric
 /// markers are parsed (capping tail-only would drop early criteria).
@@ -294,6 +330,34 @@ mod tests {
             ("All tests pass".to_string(), "pytest -q".to_string())
         );
         assert_eq!(r[1].1, "grep -q def f.py");
+    }
+
+    #[test]
+    fn grader_started_printf_emits_the_marker_on_its_own_line() {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(GRADER_STARTED_PRINTF)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            format!("\n{GRADER_STARTED_MARKER}\n")
+        );
+    }
+
+    #[test]
+    fn grader_output_after_start_drops_boot_noise() {
+        let raw = format!("kernel: booted\n\n{GRADER_STARTED_MARKER}\r\n3 passed\n");
+        assert_eq!(grader_output_after_start(0, &raw).unwrap(), "3 passed\n");
+    }
+
+    #[test]
+    fn missing_start_marker_is_an_error_not_a_failed_grade() {
+        let err = grader_output_after_start(1, "mount: virtiofs: no such device\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("before the grader started"), "{err}");
+        assert!(err.contains("no such device"), "{err}");
     }
 
     #[test]

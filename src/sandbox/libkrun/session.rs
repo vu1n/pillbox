@@ -1881,11 +1881,30 @@ pub(crate) fn workspace_path(session: &crate::session::Session) -> Result<PathBu
 /// `krun_start_enter` exits the child with the guest's code, so the child's exit
 /// IS the grader's exit, and the guest console (merged via `2>&1`) is the
 /// child's stdout.
+/// The guest commands that run after `/grade` is mounted and is the cwd.
+/// `drop_privileges` runs the grader as `nobody`: the grade tree has already
+/// been mode-locked on the host, and root could `chmod` that lock off.
+/// The start marker is printed only once this setup succeeded.
+pub(super) fn grade_exec(cmd: &str, drop_privileges: bool) -> String {
+    let started = crate::commands::session::GRADER_STARTED_PRINTF;
+    if drop_privileges {
+        // `&&` all the way: the caller prefixes `mount && cd &&` this string, and
+        // a `;` would let the marker (and the grader) run when the mount failed.
+        format!(
+            "export HOME=/tmp PYTHONDONTWRITEBYTECODE=1 && command -v runuser >/dev/null && {started} && runuser -u nobody --preserve-environment -- sh -c {}",
+            super::shell_quote(cmd)
+        )
+    } else {
+        format!("{started} && {{ {cmd} ; }}")
+    }
+}
+
 pub(crate) fn score_in_sandbox(
     resolved: &Pillbox,
     workspace: &Path,
     cmd: &str,
     egress_allow: &[String],
+    drop_privileges: bool,
 ) -> Result<(i32, String)> {
     use std::io::Read as _;
     // Same disk-pressure guard as the run path: the grader VM materializes the
@@ -1901,8 +1920,12 @@ pub(crate) fn score_in_sandbox(
     let (egress, env_extra, script, _grade_ca) = if egress_allow.is_empty() {
         // Mount the workspace, cd in, run the grader with stderr merged to the
         // console. `&&` so a failed mount/cd surfaces; the grader's exit is last.
+        // The start marker is printed only once setup succeeded — the caller
+        // treats its absence as "the grade never ran". `2>&1` binds to the
+        // last command, which is the grader.
         let script = format!(
-            "mkdir -p /grade && mount -t virtiofs grade /grade && cd /grade && {{ {cmd} ; }} 2>&1"
+            "mkdir -p /grade && mount -t virtiofs grade /grade && cd /grade && {} 2>&1",
+            grade_exec(cmd, drop_privileges)
         );
         (None, Vec::new(), script, None)
     } else {
@@ -1919,11 +1942,26 @@ pub(crate) fn score_in_sandbox(
         // trusting that one cert is sufficient (the same single-cert trust agents
         // use via NODE_EXTRA_CA_CERTS). The PEM is shell-quoted straight in — it
         // rides the boot script (see [`boot::boot_channel`]), so no base64 detour.
+        let run = if drop_privileges {
+            // `&&` through the marker so a missing `runuser` (set -e does not
+            // abort a failing command in the middle of an AND-list) never looks
+            // like the grader started.
+            format!(
+                "export HOME=/tmp PYTHONDONTWRITEBYTECODE=1 && command -v runuser >/dev/null && {started}; set +e; runuser -u nobody --preserve-environment -- sh -c {quoted}",
+                started = crate::commands::session::GRADER_STARTED_PRINTF,
+                quoted = shell_quote(cmd),
+            )
+        } else {
+            format!(
+                "{started}; set +e; {cmd}",
+                started = crate::commands::session::GRADER_STARTED_PRINTF,
+            )
+        };
         let script = format!(
             "exec 2>&1; set -e; {net}; \
              printf '%s' {ca_q} > {GUEST_CA_PATH}; \
              mkdir -p /grade; mount -t virtiofs grade /grade; cd /grade; \
-             set +e; {cmd}",
+             {run}",
             ca_q = shell_quote(&ca.cert_pem),
         );
         let egress = Some(EgressSpec {
@@ -2674,6 +2712,22 @@ mod tests {
             assert_eq!(script.matches("chown ").count(), 1);
             assert!(script.contains("chmod \"$mode\""));
         }
+    }
+
+    #[test]
+    fn dropped_grader_is_nobody_and_the_marker_follows_the_runuser_check() {
+        let script = grade_exec("sh tests/check.sh", true);
+        let check = script.find("command -v runuser").unwrap();
+        let marker = script.find("PBSTART").unwrap();
+        let runuser = script.find("runuser -u nobody").unwrap();
+        assert!(check < marker && marker < runuser, "{script}");
+        assert!(
+            !script[..marker].contains(';'),
+            "a semicolon before the marker breaks the mount && chain: {script}"
+        );
+        assert!(script.contains("PYTHONDONTWRITEBYTECODE=1"), "{script}");
+        assert!(script.contains("sh -c 'sh tests/check.sh'"), "{script}");
+        assert!(!grade_exec("true", false).contains("runuser"));
     }
 
     #[test]

@@ -359,6 +359,23 @@ enum Command {
         /// dispatch stops (exit 2) before any worker boots.
         #[arg(long = "baseline-check")]
         baseline_check: bool,
+        /// Add a protected path (repeatable). Every grade runs on a copy of the
+        /// worker's workspace in which protected paths are reset to the
+        /// bookmark's version, so a worker can't change its grade by editing
+        /// them. A name matches at any depth (`fixtures/`, `*.golden`); a path
+        /// with `/` is anchored at the workspace root (`ci/run.sh`). Added to
+        /// the defaults (tests, test-runner and CI config, rubrics).
+        #[arg(long = "protect", value_name = "PATTERN")]
+        protect: Vec<String>,
+        /// Drop the default protected paths; only `--protect` patterns apply.
+        /// For a task whose job is to change the tests themselves.
+        #[arg(long = "no-default-protect")]
+        no_default_protect: bool,
+        /// Let the grader microVM reach these hosts (repeatable), e.g. a
+        /// package registry the tests install from. The grader is offline by
+        /// default; same fence as `session score --grader-egress`.
+        #[arg(long = "grader-egress", value_name = "HOST")]
+        grader_egress: Vec<String>,
         /// Worker agent (`claude` | `codex` | `opencode` | …). Defaults to the
         /// pillbox's `agent =`, then `claude`.
         #[arg(long, value_name = "AGENT")]
@@ -913,6 +930,9 @@ fn run(cli: Cli) -> Result<()> {
             retries,
             stall_limit,
             baseline_check,
+            protect,
+            no_default_protect,
+            grader_egress,
             agent,
             model,
             temperature,
@@ -954,6 +974,9 @@ fn run(cli: Cli) -> Result<()> {
                     critic,
                     critic_policy,
                     critic_model,
+                    protect,
+                    no_default_protect,
+                    grader_egress,
                 },
             )
         }

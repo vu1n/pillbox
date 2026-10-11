@@ -255,6 +255,8 @@ mod tests {
     const TOOL_ATTEMPT: &str = include_str!("fixtures/opencode-2.0.24-tool-attempt.jsonl");
     const FREE_TIER: &str = include_str!("fixtures/opencode-2.0.24-free-tier-refused.jsonl");
     const DRIVER_TURN: &str = include_str!("fixtures/opencode-2.0.24-driver-text-turn.jsonl");
+    const ZAI_TURN: &str = include_str!("fixtures/opencode-2.0.24-zai-coding-plan-turn.jsonl");
+    const OPENROUTER_TURN: &str = include_str!("fixtures/opencode-2.0.24-openrouter-turn.jsonl");
 
     fn session_of(capture: &str) -> String {
         capture
@@ -355,6 +357,39 @@ mod tests {
         let (completed, usage) = fold.finish(32_768);
         assert_eq!(completed.unwrap().text, "pong");
         assert_eq!(usage.unwrap().output_tokens, Some(7));
+    }
+
+    /// The guest driver's output from real GLM turns, z.ai's coding plan
+    /// (which models.dev prices at zero) and OpenRouter, run outside a VM.
+    #[test]
+    fn live_glm_turns_fold_to_the_answer_and_usage() {
+        for (capture, model, cost, input, output) in [
+            (ZAI_TURN, "zai-coding-plan/glm-5.3-flash", 0.0, 354, 42),
+            (
+                OPENROUTER_TURN,
+                "openrouter/z-ai/glm-4.5-air",
+                0.00010147,
+                349,
+                66,
+            ),
+        ] {
+            assert!(plan(model, "low").is_ok(), "{model}");
+            let mut fold = TurnFold::default();
+            let mut done = false;
+            for line in capture.lines() {
+                assert!(!done, "frames after the outcome");
+                done = fold.observe(&serde_json::from_str(line).unwrap()).unwrap();
+            }
+            assert!(done, "{model}");
+            let (completed, usage) = fold.finish(32_768);
+            let completed = completed.unwrap();
+            assert_eq!(completed.text, "The capital of France is Paris.");
+            assert_eq!(completed.harness_version, "2.0.24");
+            let usage = usage.unwrap();
+            assert_eq!(usage.cost_usd, Some(cost), "{model}");
+            assert_eq!(usage.input_tokens, Some(input), "{model}");
+            assert_eq!(usage.output_tokens, Some(output), "{model}");
+        }
     }
 
     #[test]

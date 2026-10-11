@@ -145,9 +145,10 @@ because the virtiofs server writes as the host user and a root guest could
 `chmod` the lock off and let `build.rs` rewrite the tests before they compile.
 `PYTHONDONTWRITEBYTECODE` is set so pytest does not need to write `__pycache__`
 into a locked `tests/`. `PYTHONSAFEPATH=1` plus a root-owned `sitecustomize.py`
-move the cwd (or script dir) from the front of `sys.path` to the end, so a
+first import the image's test runners (pytest, pluggy and the like) and then
+put the cwd (or script dir) after the stdlib but before site-packages, so a
 worker's `pluggy.py` or `json.py` can't shadow the test runner or the stdlib,
-while the project still imports from the workspace. `--no-default-protect` with no `--protect` leaves the
+while tests import the worker's project, even over a copy installed in the image. `--no-default-protect` with no `--protect` leaves the
 tree alone and runs the grader as root, the opt-out.
 
 The grade copy is made from a snapshot of the worker's workspace, frozen at

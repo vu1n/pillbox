@@ -135,19 +135,28 @@ pub(crate) const GRADER_STARTED_PRINTF: &str = r"printf '\n\036PBSTART\n'";
 
 /// `sitecustomize.py` for an unprivileged (dropped) grader. With
 /// `PYTHONSAFEPATH=1` Python no longer puts the cwd or script dir FIRST on
-/// `sys.path`, so a worker's `pluggy.py`/`json.py` can't shadow the test
-/// runner or the stdlib; this puts the script dir (if any) and the cwd back at
-/// the END, so the project still imports from the workspace the way
-/// `python3 -m pytest`, a `pytest` console script or `python3 script.py`
-/// expects. No `;` or `'` (it rides a `'…'` shell string
-/// in an `&&` chain).
-const PY_BOOTSTRAP: &str = r#"import os
+/// `sys.path`, so a worker's `json.py` can't shadow the stdlib. This first
+/// imports whichever test runners the image has (pytest and pluggy among
+/// them) while the workspace is still off the path, so a worker's `pluggy.py`
+/// can't replace them either; then it puts the script dir (if any) and the cwd
+/// back AFTER the stdlib but BEFORE site-packages, so tests import the
+/// worker's project even when the image has a copy of it installed. No `;` or
+/// `'` (it rides a `'…'` shell string in an `&&` chain).
+const PY_BOOTSTRAP: &str = r#"import importlib.util
+import os
 import sys
+for _m in ("pytest", "_pytest", "pluggy", "coverage", "hypothesis", "nose2", "tox", "nox", "mypy", "black", "flake8", "pylint", "behave"):
+    try:
+        if importlib.util.find_spec(_m) is not None:
+            __import__(_m)
+    except Exception:
+        pass
 _a = sys.argv[0] if sys.argv else ""
 _ds = [] if _a in ("", "-c", "-m") else [os.path.dirname(os.path.abspath(_a))]
-for _d in _ds + [os.getcwd()]:
+_at = next((_i for _i, _p in enumerate(sys.path) if os.path.basename(_p) in ("site-packages", "dist-packages")), len(sys.path))
+for _d in reversed(_ds + [os.getcwd()]):
     if _d not in sys.path:
-        sys.path.append(_d)
+        sys.path.insert(_at, _d)
 "#;
 
 /// Where the guest writes [`PY_BOOTSTRAP`]: root-owned, so `nobody` can't edit it.
@@ -581,8 +590,31 @@ mod tests {
             0,
             "cwd importable under a console script"
         );
+        // The image has its own copy of the project installed: the worker's
+        // copy in the workspace is the one tests import.
+        let site = tempfile::tempdir().unwrap();
+        let installed = site.path().join("site-packages");
+        std::fs::create_dir_all(installed.join("mypkg")).unwrap();
+        std::fs::write(installed.join("mypkg/__init__.py"), "X = 2\n").unwrap();
+        let path = std::env::join_paths([boot.path(), installed.as_path()]).unwrap();
+        let out = std::process::Command::new("python3")
+            .args(["-c", "import mypkg, sys\nsys.exit(mypkg.X)"])
+            .current_dir(ws.path())
+            .env("PYTHONSAFEPATH", "1")
+            .env("PYTHONPATH", path)
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "the workspace copy wins over an installed one"
+        );
         let setup = dropped_grader_setup();
         assert!(!setup.contains(';'), "{setup}");
+        assert!(
+            !PY_BOOTSTRAP.contains(['\'', ';']),
+            "rides a quoted && chain"
+        );
         assert!(setup.contains("PYTHONSAFEPATH=1"), "{setup}");
     }
 

@@ -70,11 +70,22 @@ pub(crate) fn execute(
                 .downcast_ref::<super::FailureAtDetection>()
                 .map_or_else(|| Instant::now() >= deadline, |failure| failure.timed_out);
             let code = super::failure_code(stage, timed_out, rejection);
-            evidence.append(Payload::Custom(Custom {
-                name: "text.execution.failed".into(),
-                payload: Some(json!({"stage": stage, "error": format!("{error:#}")})),
-            }))?;
-            owner.observe(json!({"session_ref": evidence.reference()}))?;
+            let recorded = (|| -> Result<()> {
+                evidence.append(Payload::Custom(Custom {
+                    name: "text.execution.failed".into(),
+                    payload: Some(json!({"stage": stage, "error": format!("{error:#}")})),
+                }))?;
+                owner.observe(json!({"session_ref": evidence.reference()}))
+            })();
+            if let Err(record_error) = recorded {
+                // A failed evidence write must not erase the ownership fence.
+                if error.downcast_ref::<TeardownUnconfirmed>().is_some() {
+                    return Err(
+                        error.context(format!("Pi failure evidence unavailable: {record_error:#}"))
+                    );
+                }
+                return Err(record_error);
+            }
             crate::events::emit_session_event(
                 pb,
                 crate::events::EventType::SessionFailed {

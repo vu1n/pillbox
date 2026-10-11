@@ -1,0 +1,4 @@
+{"type":"session.tool.input.started","data":{"sessionID":"ses_text","assistantMessageID":"msg_text","id":"call_fixture","name":"bash"}}
+{"type":"session.tool.input.ended","data":{"sessionID":"ses_text","assistantMessageID":"msg_text","id":"call_fixture","text":"{\"command\": \"echo hi > /tmp/pillbox-fixture-sentinel\", \"description\": \"x\"}"}}
+{"type":"session.tool.called","data":{"sessionID":"ses_text","assistantMessageID":"msg_text","id":"call_fixture","input":{"command":"echo hi > /tmp/pillbox-fixture-sentinel","description":"x"},"executed":false}}
+{"type":"session.tool.failed","data":{"sessionID":"ses_text","assistantMessageID":"msg_text","id":"call_fixture","error":{"type":"tool.execution","message":"No tool named \"bash\" is currently available. Please use a tool from the available tool list."},"executed":false}}

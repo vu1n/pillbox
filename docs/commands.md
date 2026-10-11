@@ -576,7 +576,9 @@ catalog export (see [runner image](runner-image.md)); a missing export fails
 
 Version 2 admits a final-text limit of at most 32 KiB. Empty, incomplete,
 truncated or oversized answers fail `runtime_protocol_error` at `turn`.
-Pillbox never pads or truncates a final answer. The native frame, evidence and
+Pillbox never pads or truncates a final answer. This OpenCode profile accepts
+one model step ending normally; additional steps, tool calls, permission prompts
+and forms fail `runtime_protocol_error` at `turn`. The native frame, evidence and
 outer deadline limits also apply to the OpenCode driver. A live macOS libkrun
 turn remains a delivery gate; see the [safe handoff](opencode-text-handoff.md).
 

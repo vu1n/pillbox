@@ -490,6 +490,19 @@ mod tests {
     }
 
     #[test]
+    fn sanitized_native_tool_events_each_fail_the_host_deny_all_gate() {
+        let fixture = include_str!("fixtures/opencode-2.0.24-denied-tool.jsonl");
+        for line in fixture.lines() {
+            let native: Value = serde_json::from_str(line).unwrap();
+            let mut attempted = frames("unused");
+            attempted.insert(4, native);
+            let (turn, result) = fake_harness(attempted, 1_048_576, 8_388_608);
+            assert!(format!("{:#}", result.unwrap_err()).contains("deny_all"));
+            assert!(turn.text.is_empty());
+        }
+    }
+
+    #[test]
     fn empty_oversized_truncated_or_abnormally_finished_answers_fail() {
         for text in ["".to_owned(), " ".into(), "é".repeat(16_385)] {
             let (turn, result) = fake_harness(frames(&text), 1_048_576, 8_388_608);

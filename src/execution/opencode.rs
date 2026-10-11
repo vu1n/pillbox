@@ -272,6 +272,16 @@ impl std::fmt::Display for RejectedModel {
 }
 impl std::error::Error for RejectedModel {}
 
+#[cfg(feature = "libkrun")]
+fn check_live(owner: &super::store::OwnedInvocation, deadline: std::time::Instant) -> Result<()> {
+    ensure!(!owner.cancelled()?, "text invocation cancelled");
+    ensure!(
+        std::time::Instant::now() < deadline,
+        "text deadline exceeded"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,14 +351,4 @@ mod tests {
             "runtime_timeout"
         );
     }
-}
-
-#[cfg(feature = "libkrun")]
-fn check_live(owner: &super::store::OwnedInvocation, deadline: std::time::Instant) -> Result<()> {
-    ensure!(!owner.cancelled()?, "text invocation cancelled");
-    ensure!(
-        std::time::Instant::now() < deadline,
-        "text deadline exceeded"
-    );
-    Ok(())
 }

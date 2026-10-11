@@ -1,7 +1,10 @@
 # OpenCode text delivery gate
 
 The cloud checks validate the adapter, fake-harness refusal/protocol limits,
-usage aggregation and credential-free native catalog export. They do not
+usage aggregation, credential-free native catalog export, and forced native
+tool refusal against a local fake provider with the sealed production profile.
+The transport-only test override is verified as loopback before any prompt;
+no live model service or credential is involved. These checks do not
 establish that a macOS libkrun VM can complete a live provider turn. The draft
 must remain gated on that turn and required CI; do not merge or bypass checks.
 
@@ -11,10 +14,11 @@ Use the draft PR's final reported SHA. Fetching the branch and preparing a
 detached worktree needs no credentials or inference:
 
 ```sh
+OPENCODE_TEXT_SHA='REPLACE_WITH_FINAL_REMOTE_SHA'
 git fetch origin codex/text-v2-opencode
-git worktree add --detach /tmp/pillbox-opencode-mac FETCH_HEAD
+git worktree add --detach /tmp/pillbox-opencode-mac "$OPENCODE_TEXT_SHA"
 cd /tmp/pillbox-opencode-mac
-git rev-parse HEAD
+test "$(git rev-parse HEAD)" = "$OPENCODE_TEXT_SHA"
 cargo fmt --check
 cargo clippy --all-targets --features libkrun -- -D warnings
 cargo test --all-targets --features libkrun
@@ -23,6 +27,21 @@ cargo build --features libkrun
 codesign --force --sign - --entitlements krun/entitlements.plist target/debug/pillbox
 scripts/build-runner.sh --tag pillbox-runner:dev
 ```
+
+The Python suite's two native probes are skipped unless a native CLI path is
+provided. They ran in the cloud against OpenCode 2.0.24; a skipped probe on the
+Mac must not be reported as passed. To repeat them with an existing matching
+Mac CLI, verify its version and run the same suite with the explicit path:
+
+```sh
+OPENCODE_NATIVE_BIN=$(command -v opencode)
+test "$("$OPENCODE_NATIVE_BIN" --version)" = "2.0.24"
+PILLBOX_OPENCODE_TEST_BINARY="$OPENCODE_NATIVE_BIN" \
+  python3 -m unittest discover -s scripts/smoke/opencode-text -p 'test_*.py' -v
+```
+
+If that CLI is absent or the version differs from the runner pin, report this
+probe as blocked rather than prompting a live provider to replace it.
 
 The runner rebuild includes the offline OpenCode catalog export. Its export
 starts the bundled CLI with an isolated home, no credentials, registry fetching
@@ -37,6 +56,13 @@ log a credential. Supported profiles internally map `openai` to
 not accepted. Select an approved model and exact variant present in the
 rebuild's catalog. The request generator below never embeds an image, harness
 version, catalog, credential reference, or host.
+
+The current profile permits one normally completed model step, native provider
+API keys, and text output only. Additional model steps, tool/permission/form
+events, empty or incomplete text, and text beyond 32 KiB fail at `turn`; the
+adapter never repairs or truncates them. Other provider and OAuth profiles fail
+at `resolve`. A native selected model reference does not prove which model the
+upstream served, so `served_model` remains null.
 
 ## Live turn — parent approval required
 

@@ -96,6 +96,10 @@ advertised empty tools/MCP and executed no tool. It used no vault or provider.
 The live script was also exercised with a temporary fake Pillbox/evidence fixture:
 valid evidence passes and a native tool event fails.
 
+The final Linux all-target suite passed with 880 tests passed, zero failed and
+four ignored (829 unit and 51 integration tests). Format, strict
+no-default-features clippy, and the committed PR-range governance check passed.
+
 Linux libkrun compile-only checking passes. Additional strict Linux feature lint
 (`cargo clippy --features libkrun --all-targets -- -D warnings`) fails on the
 pre-existing unused `bail` import in `src/sandbox/libkrun/rootfs_backing.rs:9`;
@@ -116,7 +120,7 @@ the final remote SHA in the handoff. From that checkout, run:
 
 ```sh
 git fetch origin codex/text-v2-claude
-git worktree add ../pillbox-claude-live --detach origin/codex/text-v2-claude
+git worktree add ../pillbox-claude-live --detach FETCH_HEAD
 cd ../pillbox-claude-live
 git rev-parse HEAD
 cargo fmt --check
@@ -130,7 +134,7 @@ Then, only after the live-turn authorization:
 
 ```sh
 evidence_dir="$(mktemp -d "${TMPDIR:-/tmp}/pillbox-claude-live.XXXXXX")"
-bash scripts/smoke/claude-text.sh --live "$PWD/target/debug/pillbox" "$evidence_dir"
+/usr/bin/time -p bash scripts/smoke/claude-text.sh --live "$PWD/target/debug/pillbox" "$evidence_dir"
 ```
 
 The script uses the configured runner image and existing credential store. Its

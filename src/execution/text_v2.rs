@@ -10,12 +10,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::evidence::ExecutionEvidence;
+use super::opencode::{self, Plan};
 use super::pi_text::{self, PiHarness, Selection};
 use super::protocol;
 use super::store::OwnedInvocation;
 use super::text::{self, FailedStage, TextExecution, TextLimits, TextRequest, TextRuntime};
 use super::usage::TurnUsage;
-use super::{HarnessTransport, ModelProfile, SessionIdentity, TextOutputFormat};
+use super::{EvidenceRef, HarnessTransport, ModelProfile, SessionIdentity, TextOutputFormat};
 use crate::contract::{Custom, Payload};
 use crate::pillbox::Pillbox;
 use crate::sandbox::libkrun::repository::TeardownUnconfirmed;
@@ -162,6 +163,9 @@ pub(crate) fn execute(
         Lowered::Pi(selection) => {
             return execute_pi(pb, request, owner, &selection, runner_image_id)
         }
+        Lowered::Opencode(plan) => {
+            return execute_opencode(pb, request, owner, &plan, runner_image_id)
+        }
     };
     match text::execute_with(pb, &lowered, owner, false) {
         Ok((completion, observed)) => {
@@ -180,6 +184,61 @@ pub(crate) fn execute(
                 "output_text": completion.output_text,
             });
             with_usage(&mut detail, observed.usage.as_ref());
+            Ok(Outcome::Completed(detail))
+        }
+        Err(error) if error.downcast_ref::<TeardownUnconfirmed>().is_some() => Err(error),
+        Err(error) => {
+            let failed = error.downcast_ref::<FailedStage>();
+            let stage = failed.map_or("credentials", |failed| failed.stage);
+            let mut detail = json!({
+                "invocation_id": request.invocation_id,
+                "request_hash": owner.record().request_hash,
+                "code": failure_code(stage, &error),
+                "stage": stage,
+                "session_ref": owner.record().detail.get("session_ref"),
+            });
+            with_usage(&mut detail, failed.and_then(|failed| failed.usage.as_ref()));
+            Ok(Outcome::Failed(detail))
+        }
+    }
+}
+
+/// A completed OpenCode turn.
+pub(crate) struct Turn {
+    pub(crate) output_text: String,
+    /// Reported by the harness itself, never assumed from the runner image.
+    pub(crate) harness_version: String,
+    /// The provider's own model id, when the harness surfaces it.
+    pub(crate) served_model: Option<String>,
+    pub(crate) session_ref: EvidenceRef,
+    pub(crate) usage: Option<TurnUsage>,
+}
+
+/// Run an OpenCode plan and seal its record the same way as Codex's.
+fn execute_opencode(
+    pb: &Pillbox,
+    request: &TextRequestV2,
+    owner: &mut OwnedInvocation,
+    plan: &Plan,
+    runner_image_id: String,
+) -> Result<Outcome> {
+    match super::text_opencode::execute(pb, request, plan, &runner_image_id, owner) {
+        Ok(turn) => {
+            let mut detail = json!({
+                "invocation_id": request.invocation_id,
+                "request_hash": owner.record().request_hash,
+                "resolved": {
+                    "harness": request.agent.harness,
+                    "harness_version": turn.harness_version,
+                    "adapter_revision": ADAPTER_REVISION,
+                    "runner_image_id": runner_image_id,
+                    "requested_model": request.agent.model,
+                    "served_model": turn.served_model,
+                },
+                "session_ref": turn.session_ref,
+                "output_text": turn.output_text,
+            });
+            with_usage(&mut detail, turn.usage.as_ref());
             Ok(Outcome::Completed(detail))
         }
         Err(error) if error.downcast_ref::<TeardownUnconfirmed>().is_some() => Err(error),
@@ -281,6 +340,7 @@ struct Rejection {
 enum Lowered {
     Codex(Box<TextRequest>),
     Pi(Selection),
+    Opencode(Plan),
 }
 
 fn resolve(
@@ -294,13 +354,17 @@ fn resolve(
     // A harness without a tool-free text driver is a valid selection this build
     // cannot run, which is a rejection, not a bad request. Models are checked before
     // the image so an unservable one is rejected even where no image is available.
-    let pi = match request.agent.harness.as_str() {
+    let selected = match request.agent.harness.as_str() {
         "codex" => None,
+        "opencode" => Some(Lowered::Opencode(
+            opencode::plan(&request.agent.model, &request.agent.reasoning_effort)
+                .map_err(rejected)?,
+        )),
         harness => match PiHarness::from_selection(harness) {
-            Some(pi) => Some(
+            Some(pi) => Some(Lowered::Pi(
                 Selection::resolve(pi, &request.agent.model, &request.agent.reasoning_effort)
                     .map_err(rejected)?,
-            ),
+            )),
             None => {
                 return Err(rejected(anyhow::anyhow!(
                     "no text driver for harness {harness}"
@@ -312,8 +376,8 @@ fn resolve(
         code: "runtime_unavailable",
         error,
     })?;
-    let lowered = match pi {
-        Some(selection) => Lowered::Pi(selection),
+    let lowered = match selected {
+        Some(lowered) => lowered,
         None => Lowered::Codex(Box::new(
             request
                 .codex_request(runner_image_id.clone())
@@ -456,7 +520,7 @@ mod tests {
 
     #[test]
     fn every_harness_is_held_to_the_same_bounds() {
-        for harness in ["codex", "pi", "prime-agent"] {
+        for harness in ["codex", "opencode", "pi", "prime-agent"] {
             let mut zero = request(harness, "any-model");
             zero.limits.timeout_ms = 0;
             assert!(zero.validate().is_err());
@@ -518,6 +582,25 @@ mod tests {
         assert_eq!(lowered.runtime.runner_image_id, image);
         assert_eq!(lowered.execution.requested.profile, "luna");
         assert!(request("codex", "gpt-4").codex_request(image).is_err());
+    }
+
+    #[test]
+    fn opencode_selection_plans_its_provider_egress() {
+        let plan = opencode::plan("zai-coding-plan/glm-4.5-air", "low").unwrap();
+        assert_eq!(plan.hosts, ["api.z.ai", "models.dev"]);
+        assert_eq!(plan.variant, "low");
+        let temp = tempfile::tempdir().unwrap();
+        let pb = Pillbox {
+            scope: crate::pillbox::Scope::Global,
+            state_dir: temp.path().into(),
+            meta: None,
+        };
+        for model in ["opencode/big-pickle-free", "ollama/llama3", "glm-4.5-air"] {
+            let Err(rejection) = resolve(&pb, &request("opencode", model)) else {
+                panic!("opencode resolved {model}")
+            };
+            assert_eq!(rejection.code, "runtime_rejected");
+        }
     }
 
     #[test]

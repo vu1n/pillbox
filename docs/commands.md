@@ -558,11 +558,43 @@ the harness version that image reports. A completed record carries `resolved` (`
 `internal_error`) and the `stage` that was running (`resolve`, `credentials`,
 `image_prepare`, `guest_prepare`, `vmm_spawn`, `guest_rpc_ready`, `turn`,
 `finalize`); the message stays in the session log, and `session_ref` is null
-when no session log was written. `codex`, `pi` and `prime-agent` have text
-drivers; `claude_code` and `opencode` fail at `resolve` with `runtime_rejected`
-until theirs land. `codex` serves `gpt-6-luna` at `low`, `medium` or `high`
+when no session log was written. `codex`, `opencode`, `pi` and `prime-agent`
+have text drivers; `claude_code` fails at `resolve` with `runtime_rejected`
+until its driver lands. `codex` serves `gpt-6-luna` at `low`, `medium` or `high`
 effort; another model or effort fails at `resolve` with `runtime_rejected`, and
 a runner image that is not available locally with `runtime_unavailable`.
+
+The `opencode` driver runs OpenCode 2 (`opencode serve`, the version the runner
+image carries) in its own invocation-owned microVM, with no shares:
+
+- `agent.model` is OpenCode's `provider/model`. The provider must be one Pillbox
+  knows the API host of (`anthropic`, `deepseek`, `google`, `groq`, `mistral`,
+  `moonshotai`, `moonshotai-cn`, `openai`, `opencode`, `opencode-go`,
+  `openrouter`, `xai`, `zai`, `zai-coding-plan`, `zhipuai`,
+  `zhipuai-coding-plan`); egress is that host plus `models.dev`, OpenCode's
+  model catalog. Zen's `*-free` models are rejected at `resolve`, because the
+  free tier refuses a session without tools.
+- `agent.reasoning_effort` is sent as the model's variant. A model without that
+  variant fails the turn; it is never dropped. Variant names differ per model,
+  and some models have none, so those cannot run a text turn.
+- The input, `output_format` and `limits` are held to the same bounds as Codex
+  (`text/0` output only) before any VM work.
+- Tools are denied by a `deny` rule for every action, in the server config and
+  on the session, so OpenCode sends the model no tools. A tool call (in any
+  session, a subagent's included), a permission request or a form still fails
+  the turn (`runtime_protocol_error`
+  at `turn`) and the VM is stopped.
+- The key is the pillbox secret named after the variable OpenCode reads it
+  from (`ZHIPU_API_KEY` for every z.ai/Zhipu provider, `OPENROUTER_API_KEY`,
+  `ANTHROPIC_API_KEY`, ...; `pillbox secret add NAME`). Only that one key
+  enters the VM, as that variable, in a fresh OpenCode home: the user's own
+  OpenCode store holds every provider's credential and their history, so it is
+  never copied. Without the secret the turn fails at `credentials` with
+  `runtime_unavailable`.
+- `resolved.harness_version` is what the server reports at `/api/info`.
+  `served_model` is `null`: OpenCode does not surface the provider's model id.
+- The answer is the text of the last assistant message, at most
+  `max_final_text_bytes`; an empty or longer answer fails the turn.
 
 For `pi` and `prime-agent`, `agent.model` is the harness's own `PROVIDER/MODEL`
 (for example `zai/glm-5.3` or `anthropic/claude-sonnet-5`) and
@@ -607,18 +639,22 @@ nothing gets no `usage` key, never zeros. A value that is not a number, is
 negative or non-finite, or exceeds 10^10 tokens or $1,000,000 is dropped; when
 nothing valid remains, `usage` is absent.
 
-| field | codex (`thread/tokenUsage/updated`, `tokenUsage.total`) | claude_code (`result` line) | pi, prime-agent (every assistant `message_end`, summed) |
-|---|---|---|---|
-| `cost_usd` | `null` (Codex reports no cost) | `total_cost_usd` (API-equivalent on a subscription, not a bill) | `usage.cost.total` (pi's figure from its model catalog; `null` if any response lacks it) |
-| `input_tokens` | `inputTokens` − `cachedInputTokens` − `cacheWriteInputTokens` (dropped if negative) | `usage.input_tokens` | `usage.input` (pi already excludes cache reads and writes) |
-| `output_tokens` | `outputTokens` | `usage.output_tokens` | `usage.output` |
-| `cache_read_tokens` | `cachedInputTokens` | `usage.cache_read_input_tokens` | `usage.cacheRead` |
-| `cache_write_tokens` | `cacheWriteInputTokens` | `usage.cache_creation_input_tokens` | `usage.cacheWrite` |
+| field | codex (`thread/tokenUsage/updated`, `tokenUsage.total`) | claude_code (`result` line) | opencode (`session.usage.updated`) | pi, prime-agent (every assistant `message_end`, summed) |
+|---|---|---|---|---|
+| `cost_usd` | `null` (Codex reports no cost) | `total_cost_usd` (API-equivalent on a subscription, not a bill) | `cost` (OpenCode's catalog price for the tokens) | `usage.cost.total` (pi's figure from its model catalog; `null` if any response lacks it) |
+| `input_tokens` | `inputTokens` − `cachedInputTokens` − `cacheWriteInputTokens` (dropped if negative) | `usage.input_tokens` | `tokens.input` | `usage.input` (pi already excludes cache reads and writes) |
+| `output_tokens` | `outputTokens` | `usage.output_tokens` | `tokens.output` + `tokens.reasoning` | `usage.output` |
+| `cache_read_tokens` | `cachedInputTokens` | `usage.cache_read_input_tokens` | `tokens.cache.read` | `usage.cacheRead` |
+| `cache_write_tokens` | `cacheWriteInputTokens` | `usage.cache_creation_input_tokens` | `tokens.cache.write` | `usage.cacheWrite` |
 
 Codex's newest `total` for the invocation's thread and turn is the turn's usage,
 because a text invocation runs one turn on a fresh thread. The claude_code
 column is what the Claude harness writes as `turn_usage` in its `usage` session
-event, ready for when it gets a text driver. Both versions append the same
+event, ready for when it gets a text driver. OpenCode's latest
+`session.usage.updated` is the session total, and the session is fresh, so it
+is the turn's usage; without one, the `session.step.ended`/`.failed` figures are
+summed. Pillbox sets the session title so OpenCode makes no separate
+title-generation call. Both versions append the same
 `usage` event (`{"turn_usage": …}`) to the text session log.
 
 Both versions append a `text.stage.completed` event per stage to the session

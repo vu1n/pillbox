@@ -38,6 +38,12 @@ authoritative.** When a design doc and a banner disagree, the banner (newer) win
 | [security.md](./security.md) | Threat model + file layout. *VM-boundary upgrade tracked in libkrun-sandbox.md.* |
 | [opencode-integration.md](./opencode-integration.md) | opencode (server-mode) as a **first-class** run target on libkrun — the `/event` wire contract + drive/read API. (pi backlogged.) |
 
+## Assessments (not shipped behavior)
+
+| File | What |
+|---|---|
+| [grok-bot-text-driver.md](./grok-bot-text-driver.md) | Why `grok_bot` is not a `pillbox.text/2` harness. Blocked; no driver. |
+
 ## External consumer (separate project, not this repo)
 
 | File | What |

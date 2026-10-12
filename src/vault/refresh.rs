@@ -18,7 +18,7 @@
 //! credential or a refresh response containing real tokens.
 
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use serde_json::Value;
@@ -73,13 +73,51 @@ pub(crate) const STUB_FAR_FUTURE_EXPIRES_AT_MS: u64 = 4_102_444_800_000;
 ///   next-step rather than handing the run a doomed token.
 // Context: doc://pillbox/adr-004-vault-broker-oauth@0001#vault-broker-oauth
 pub(crate) fn pre_refresh(creds_path: &Path, agent_id: &str) -> Result<Option<Value>> {
+    pre_refresh_with_deadline(creds_path, agent_id, None)
+}
+
+/// Sealed text uses the caller's remaining budget for both lock wait and the
+/// single refresh POST. Existing interactive callers keep their fixed bounds.
+#[cfg(any(feature = "libkrun", test))]
+pub(crate) fn pre_refresh_until(
+    creds_path: &Path,
+    agent_id: &str,
+    deadline: Instant,
+) -> Result<Option<Value>> {
+    let result = pre_refresh_with_deadline(creds_path, agent_id, Some(deadline));
+    anyhow::ensure!(
+        Instant::now() < deadline,
+        "text invocation deadline exceeded during credentials"
+    );
+    result
+}
+
+fn refresh_budget(deadline: Option<Instant>, maximum: Duration) -> Result<Duration> {
+    match deadline {
+        Some(deadline) => deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .map(|remaining| remaining.min(maximum))
+            .ok_or_else(|| anyhow::anyhow!("text invocation deadline exceeded during credentials")),
+        None => Ok(maximum),
+    }
+}
+
+fn pre_refresh_with_deadline(
+    creds_path: &Path,
+    agent_id: &str,
+    deadline: Option<Instant>,
+) -> Result<Option<Value>> {
     let Some(provider) = providers::provider_for(agent_id) else {
         return Ok(None);
     };
     let Some(codec) = provider.oauth_codec() else {
         return Ok(None);
     };
-    let store = TokenStore::new(creds_path.to_path_buf(), PRE_REFRESH_LOCK_WAIT);
+    let store = TokenStore::new(
+        creds_path.to_path_buf(),
+        refresh_budget(deadline, PRE_REFRESH_LOCK_WAIT)?,
+    );
     match store.begin(codec)? {
         Begin::Coalesced(creds) => Ok(Some(creds)),
         Begin::DegradedLease(creds) => {
@@ -89,7 +127,16 @@ pub(crate) fn pre_refresh(creds_path: &Path, agent_id: &str) -> Result<Option<Va
             );
             Ok(Some(creds))
         }
-        Begin::Rotate(guard) => rotate(guard, codec, agent_id).map(Some),
+        Begin::Rotate(guard) => {
+            let timeout = match refresh_budget(deadline, REFRESH_HTTP_TIMEOUT) {
+                Ok(timeout) => timeout,
+                Err(error) => {
+                    guard.abort_intact()?;
+                    return Err(error);
+                }
+            };
+            rotate(guard, codec, agent_id, timeout, deadline).map(Some)
+        }
         Begin::ReauthRequired(reason) => Err(PillboxError::runtime(
             "vault",
             format!("could not establish a fresh OAuth token for `{agent_id}`: {reason}"),
@@ -169,9 +216,15 @@ pub(crate) fn broker_expiry(creds_path: &Path, agent_id: &str) -> Option<u64> {
 /// We won the race: POST the refresh grant exactly once, then resolve the guard.
 /// The branch in [`post_refresh`] that we reach decides which resolution the
 /// at-most-once invariant permits.
-fn rotate(guard: RotateGuard, codec: &dyn OAuthCodec, agent_id: &str) -> Result<Value> {
+fn rotate(
+    guard: RotateGuard,
+    codec: &dyn OAuthCodec,
+    agent_id: &str,
+    timeout: Duration,
+    deadline: Option<Instant>,
+) -> Result<Value> {
     let refresh = guard.refresh_token().to_owned();
-    match post_refresh(codec, &refresh) {
+    match post_refresh(codec, &refresh, timeout, deadline) {
         Ok(resp) => {
             let mut new_creds = guard.base_creds().clone();
             if let Err(e) =
@@ -279,6 +332,8 @@ const OAUTH_GRANT_REJECTION_CODES: &[&str] = &[
 fn post_refresh(
     codec: &dyn OAuthCodec,
     refresh_token: &str,
+    timeout: Duration,
+    deadline: Option<Instant>,
 ) -> std::result::Result<Value, RotateError> {
     let request = codec.refresh_request(refresh_token);
     let body = serde_json::to_vec(&request.body)
@@ -286,19 +341,28 @@ fn post_refresh(
         .map_err(|e| RotateError::Definite(format!("serialize refresh body: {e}")))?;
 
     let client = reqwest::blocking::Client::builder()
-        .timeout(REFRESH_HTTP_TIMEOUT)
+        .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
         .build()
         // Building the client never reaches the network → token intact.
         .map_err(|e| RotateError::Definite(format!("build refresh client: {e}")))?;
 
-    let resp = match client
+    let request = client
         .post(request.endpoint)
         .header("content-type", "application/json")
         .header("accept-encoding", "identity")
-        .body(body)
-        .send()
-    {
+        .body(body);
+    // Bound the whole request, including its body, and recheck after client
+    // startup before a single-use grant can reach the wire.
+    let request = if deadline.is_some() {
+        let remaining = refresh_budget(deadline, timeout).map_err(|_| {
+            RotateError::Definite("text invocation deadline exceeded before refresh POST".into())
+        })?;
+        request.timeout(remaining)
+    } else {
+        request
+    };
+    let resp = match request.send() {
         Ok(r) => r,
         // A pure connect failure provably never delivered the token. Exclude a
         // connect *timeout* (`is_connect() && is_timeout()`): a timeout can never be
@@ -389,6 +453,34 @@ fn is_safe_error_code(code: &str) -> bool {
 mod tests {
     use super::*;
     use base64::Engine as _;
+
+    #[test]
+    fn bounded_refresh_lock_wait_obeys_the_invocation_deadline_without_sending() {
+        use std::os::fd::AsRawFd;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("missing.json");
+        let lock =
+            std::fs::File::create(temp.path().join("missing.json.pillbox-rotation.lock")).unwrap();
+        // SAFETY: flock only uses the live file descriptor and holds no Rust references.
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let start = Instant::now();
+        let error =
+            pre_refresh_until(&path, "claude", start + Duration::from_millis(50)).unwrap_err();
+        assert!(format!("{error:#}").contains("deadline exceeded"));
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(!path.exists());
+        assert!(!temp
+            .path()
+            .join("missing.json.pillbox-rotation.json")
+            .exists());
+        assert_eq!(
+            refresh_budget(None, REFRESH_HTTP_TIMEOUT).unwrap(),
+            REFRESH_HTTP_TIMEOUT
+        );
+    }
 
     fn codex_jwt(expiry_ms: u64) -> String {
         let payload = serde_json::to_vec(&serde_json::json!({

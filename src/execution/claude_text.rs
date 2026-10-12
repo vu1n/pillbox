@@ -528,10 +528,12 @@ mod tests {
         let worker = std::thread::spawn(move || {
             let _ = child.write_all(bytes.as_bytes());
         });
+        // The fake ends on EOF; a generous deadline keeps a loaded CI runner from
+        // failing the turn before the worker thread has written anything.
         let observed = run(
             host,
             Limits {
-                deadline: Instant::now() + Duration::from_secs(2),
+                deadline: Instant::now() + Duration::from_secs(30),
                 max_frame_bytes: 1_048_576,
                 max_evidence_bytes: 8_388_608,
                 max_final_text_bytes: max_final,
@@ -589,6 +591,7 @@ mod tests {
     #[test]
     fn cleanup_failure_retains_reported_usage_and_never_completes() {
         let native = fake(&frames("hello"), 32768);
+        assert!(native.1.is_ok(), "fake turn failed: {:?}", native.1);
         let expected = native.0.usage.clone();
         let mut usage = None;
         let mut called = 0;

@@ -28,6 +28,7 @@
 //! exercised by the GHOST-004 smoke.
 // Context: doc://pillbox/adr-008-ghost-extraction-trigger@0001#ghost-extraction-trigger
 
+use std::cell::OnceCell;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -43,6 +44,10 @@ use crate::errors::PillboxError;
 use crate::events::blob::BlobStore;
 use crate::events::log::SessionLog;
 use crate::pillbox::Pillbox;
+use crate::workspace::protect::{
+    force_remove, snapshot_workspace, GradeTree, ProtectSet, GRADER_FILES_DIR,
+};
+use crate::workspace::WorkspaceBackend;
 
 /// Per-turn idle timeout (seconds) each worker gets before it's treated as stuck
 /// (→ an `Errored` worker, not a whole-dispatch hang). Generous — agent turns run
@@ -115,6 +120,16 @@ pub(crate) struct DispatchOpts {
     /// Per-worker retry budget when the grade fails — the loop feeds a distilled
     /// failure summary back as the next prompt and re-grades, up to this many times.
     pub(crate) retries: u32,
+    /// `--stall-limit`: stop retrying after this many retries in a row that don't
+    /// raise the best rubric score (the non-convergence breaker). 0 = off.
+    pub(crate) stall_limit: u32,
+    /// `--baseline-check`: grade the untouched bookmark with the reward and each
+    /// segment gate before forking; a reward that already passes stops the run.
+    pub(crate) baseline_check: bool,
+    /// `--restate-task`: re-send the positional task, verbatim and delimited,
+    /// with every retry turn and ahead of every segment after the first. Off →
+    /// the task rides only the first turn (byte-identical prompts to before).
+    pub(crate) restate_task: bool,
     /// Worker agent (default: `pillbox.toml` `agent`, then `claude`).
     pub(crate) agent: Option<String>,
     /// Worker model override, forwarded to each worker's run.
@@ -144,7 +159,8 @@ pub(crate) struct DispatchOpts {
     pub(crate) segments: Option<PathBuf>,
     /// The task prompt handed to every worker (the positional `-- args`). In
     /// fork-`k` mode this is the work (required); in `--segments` mode the segments
-    /// carry the work and this is optional context prepended to segment 1.
+    /// carry the work and this is optional context prepended to segment 1 (and,
+    /// with `--restate-task`, restated on later segments and retries).
     pub(crate) prompt: Vec<String>,
     /// Emit the verdict as JSON on stdout instead of the human banner.
     pub(crate) json: bool,
@@ -157,6 +173,18 @@ pub(crate) struct DispatchOpts {
     pub(crate) critic_policy: String,
     /// `--critic-model`: the critic's model id (`jev-latest`).
     pub(crate) critic_model: String,
+    /// `--protect PATTERN`: extra protected paths, restored from the bookmark
+    /// before every grade (on top of the defaults unless `no_default_protect`).
+    pub(crate) protect: Vec<String>,
+    /// `--no-default-protect`: drop [`crate::workspace::protect::DEFAULT_PROTECTED`].
+    pub(crate) no_default_protect: bool,
+    /// `--grader-egress HOST`: hosts the grader microVM may reach. Empty (the
+    /// default) keeps it offline.
+    pub(crate) grader_egress: Vec<String>,
+    /// `--grader-files DIR`: hidden grader files copied into every grade tree
+    /// (and the baseline) at `.pillbox-grader/`, never into a worker's
+    /// workspace. The reward references them as `.pillbox-grader/…`.
+    pub(crate) grader_files: Option<PathBuf>,
 }
 
 /// Terminal state of one worker in a dispatch run. Serializes to the snake_case
@@ -212,15 +240,19 @@ pub(crate) struct SegmentOutcome {
     pub(crate) passed: bool,
     pub(crate) score: f64,
     pub(crate) retries_used: u32,
+    /// The stall breaker ended this segment's retries early (see [`Rounds`]).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) stalled: bool,
 }
 
-/// One worker's outcome — its session, best score across retries, and how it
+/// One worker's outcome — its session, final-attempt score, and how it
 /// ended. Carried in input (fork) order in [`DispatchVerdict::workers`].
 pub(crate) struct WorkerOutcome {
     /// The worker's session id.
     pub(crate) session: String,
-    /// Best normalized score in `[0,1]` across this worker's attempts, or
-    /// `None` if it never produced a gradeable result (`Errored`).
+    /// Normalized score in `[0,1]` of this worker's LAST graded attempt (not the
+    /// best across retries), or `None` if it never produced a gradeable result
+    /// (`Errored`).
     pub(crate) score: Option<f64>,
     /// Retries this worker consumed (0 = passed/failed on the first attempt). In
     /// `--segments` mode this is the SUM of per-segment retries.
@@ -243,6 +275,13 @@ pub(crate) struct WorkerOutcome {
     /// grade (`--critic`). `None` without a critic, or when the critic call
     /// failed (a critic failure never sinks a worker — it just goes unscored).
     pub(crate) critic: Option<CriticVerdict>,
+    /// The stall breaker stopped this worker's retries (in any segment) before
+    /// the `--retries` budget ran out.
+    pub(crate) stalled: bool,
+    /// The reward score of every graded attempt, in order (fork-`k` only; a
+    /// `--segments` worker's per-checkpoint trail is `segments`). Evidence for
+    /// whoever escalates a stalled worker; not in the verdict JSON.
+    pub(crate) round_scores: Vec<f64>,
 }
 
 impl WorkerOutcome {
@@ -262,6 +301,10 @@ impl WorkerOutcome {
         // Additive: only present when a `--critic` scored this worker.
         if let Some(c) = &self.critic {
             v["critic"] = serde_json::to_value(c).unwrap_or(serde_json::Value::Null);
+        }
+        // Additive: only present when the stall breaker fired.
+        if self.stalled {
+            v["stalled"] = json!(true);
         }
         v
     }
@@ -309,6 +352,9 @@ pub(crate) struct DispatchVerdict {
     /// The critic that ran and what it saved — `None` without `--critic`, so the
     /// envelope is byte-identical to before.
     pub(crate) critic: Option<CriticRun>,
+    /// What the reward and gates said about the untouched base — `None` without
+    /// `--baseline-check`.
+    pub(crate) baseline: Option<BaselineCheck>,
 }
 
 impl DispatchVerdict {
@@ -324,6 +370,10 @@ impl DispatchVerdict {
         // Additive: only present when a `--critic` ran.
         if let Some(c) = &self.critic {
             v["critic"] = serde_json::to_value(c).unwrap_or(serde_json::Value::Null);
+        }
+        // Additive: only present with `--baseline-check`.
+        if let Some(b) = &self.baseline {
+            v["baseline"] = serde_json::to_value(b).unwrap_or(serde_json::Value::Null);
         }
         v
     }
@@ -362,6 +412,9 @@ impl DispatchVerdict {
                 c.verifier_runs_saved
             );
         }
+        if let Some(b) = &self.baseline {
+            println!("  baseline: {}", b.headline());
+        }
         for w in &self.workers {
             let score = w
                 .score
@@ -372,8 +425,9 @@ impl DispatchVerdict {
                 .as_ref()
                 .map(|c| format!(" critic_p={:.2}", c.p))
                 .unwrap_or_default();
+            let stalled = if w.stalled { " stalled" } else { "" };
             println!(
-                "  {} {}  score={score} retries={}{critic}",
+                "  {} {}  score={score} retries={}{stalled}{critic}",
                 w.status.as_marker(),
                 w.session,
                 w.retries_used
@@ -406,6 +460,9 @@ trait WorkerDriver {
     fn pull_winner(&self, id: &str) -> Result<PathBuf>;
     /// The worker's edits so far, from its §0 log — what a `--critic` judges.
     fn edits(&self, id: &str) -> Result<Vec<EditRecord>>;
+    /// Grade the untouched `--from-bookmark` base (no worker, no session) —
+    /// what `--baseline-check` compares the reward and gates against.
+    fn grade_baseline(&self, grader: &Grader) -> Result<Scored>;
 }
 
 /// The critic, threaded through the drive paths as one handle. `None` = no
@@ -514,6 +571,257 @@ fn first_lines(s: &str, n: usize) -> String {
         .join(" / ")
 }
 
+/// Tags for the verbatim blocks `--restate-task` adds to a turn: the task, and
+/// on a segment retry the segment being retried.
+const TASK_RESTATE_TAG: &str = "original-task";
+const SEGMENT_RESTATE_TAG: &str = "current-segment";
+
+/// An open/close pair `text` does not contain, so all of it stays inside the
+/// block. Starts at `<tag>` and suffixes `-1`, `-2`, … while `text` contains
+/// either tag. A candidate longer than `text` cannot occur in it, so this ends.
+fn restate_delimiters(tag: &str, text: &str) -> (String, String) {
+    let mut n = 0u32;
+    loop {
+        let t = if n == 0 {
+            tag.to_string()
+        } else {
+            format!("{tag}-{n}")
+        };
+        let open = format!("<{t}>");
+        let close = format!("</{t}>");
+        if !text.contains(&open) && !text.contains(&close) {
+            return (open, close);
+        }
+        n += 1;
+    }
+}
+
+/// `text`, byte-identical, under `header` between delimiters it does not contain.
+fn restated_block(header: &str, tag: &str, text: &str) -> String {
+    let (open, close) = restate_delimiters(tag, text);
+    format!("{header}\n{open}\n{text}\n{close}\n")
+}
+
+/// The original task, byte-identical, between delimiters it does not contain.
+fn restated_task(task: &str) -> String {
+    restated_block(
+        "The original task, restated verbatim:",
+        TASK_RESTATE_TAG,
+        task,
+    )
+}
+
+/// The task `--restate-task` re-sends, or `None` when the flag is off. The flag
+/// with no positional task (empty or whitespace) is a usage error.
+fn restate_task_prompt(restate: bool, prompt: &str) -> Result<Option<&str>> {
+    if !restate {
+        return Ok(None);
+    }
+    if prompt.trim().is_empty() {
+        return Err(PillboxError::usage(
+            "dispatch",
+            "--restate-task has no task to restate (no positional prompt)",
+        )
+        .with_next("pillbox dispatch … --restate-task -- \"<the task>\"")
+        .into());
+    }
+    Ok(Some(prompt))
+}
+
+/// The turn sent on a retry: the distilled failure summary, plus the restated
+/// task under `--restate-task` and, on a segment retry, the segment prompt the
+/// gate is checking (so the worker doesn't drift into later segments' work).
+fn retry_turn(grade: &Scored, policy: RetryPolicy) -> String {
+    let mut turn = distill_feedback(grade);
+    if let Some(task) = policy.restate_task {
+        turn.push('\n');
+        turn.push_str(&restated_task(task));
+        if let Some(seg) = policy.restate_segment {
+            turn.push('\n');
+            turn.push_str(&restated_block(
+                "The segment you are working on now, restated verbatim:",
+                SEGMENT_RESTATE_TAG,
+                seg,
+            ));
+        }
+    }
+    turn
+}
+
+/// How long a failing worker keeps getting re-driven: the `--retries` budget,
+/// cut short by the `--stall-limit` breaker, and what each re-drive carries.
+#[derive(Debug, Clone, Copy)]
+struct RetryPolicy<'a> {
+    retries: u32,
+    stall_limit: u32,
+    /// `--restate-task`: the task re-sent verbatim with every retry turn and
+    /// ahead of every segment after the first. `None` = off (the task rides
+    /// only the first turn).
+    restate_task: Option<&'a str>,
+    /// The segment prompt a segment retry restates alongside the task (only
+    /// with `restate_task`). `None` outside a segment chain.
+    restate_segment: Option<&'a str>,
+}
+
+/// The `--stall-limit` default. With the default `--retries 1` it never fires;
+/// it starts to matter once the budget is raised.
+#[cfg(test)]
+const DEFAULT_STALL_LIMIT: u32 = 2;
+
+impl RetryPolicy<'_> {
+    /// A budget with the default breaker and no task restating.
+    #[cfg(test)]
+    fn new(retries: u32) -> Self {
+        Self {
+            retries,
+            stall_limit: DEFAULT_STALL_LIMIT,
+            restate_task: None,
+            restate_segment: None,
+        }
+    }
+}
+
+/// The graded attempts of one retry loop, and the non-convergence breaker over
+/// them. A retry that doesn't raise the best score so far is a stall; after
+/// `stall_limit` stalls in a row the loop stops, even with budget left — the
+/// worker is going in circles (same failures, or a new one for every one it
+/// fixes), and more re-drives only spend tokens. Only rubric grades count: a
+/// `--cmd` grade is 0 until it passes, so it carries no progress signal and
+/// keeps today's plain budget.
+// Context: doc://pillbox/adr-008-ghost-extraction-trigger@0001#ghost-extraction-trigger — the breaker is loop mechanism; what to do with a stalled worker (pivot, escalate) is ghost policy.
+#[derive(Debug, Default)]
+struct Rounds {
+    scores: Vec<f64>,
+    best: f64,
+    stalls_in_a_row: u32,
+    stalled: bool,
+}
+
+impl Rounds {
+    /// Record one graded attempt.
+    fn record(&mut self, grade: &Scored) {
+        let first = self.scores.is_empty();
+        self.scores.push(grade.score);
+        if first || grade.score > self.best {
+            self.best = self.best.max(grade.score);
+            self.stalls_in_a_row = 0;
+        } else if !grade.criteria.is_empty() {
+            self.stalls_in_a_row += 1;
+        }
+    }
+
+    /// Retries consumed so far (attempts after the first).
+    fn used(&self) -> u32 {
+        self.scores.len().saturating_sub(1) as u32
+    }
+
+    /// Whether the loop stops here: the last grade passed, the budget is spent,
+    /// or the breaker trips (which marks the loop `stalled`).
+    fn done(&mut self, grade: &Scored, policy: RetryPolicy) -> bool {
+        if grade.passed || self.used() >= policy.retries {
+            return true;
+        }
+        if policy.stall_limit > 0 && self.stalls_in_a_row >= policy.stall_limit {
+            self.stalled = true;
+            return true;
+        }
+        false
+    }
+}
+
+/// One grader's verdict on the untouched base (`--baseline-check`).
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct GateBaseline {
+    /// The segment this gate belongs to; absent for the run-level reward.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    passed: bool,
+    score: f64,
+    /// Rubric criteria that already pass before any work — they can't separate
+    /// workers. Expected for guard criteria ("still builds"), suspect for the
+    /// ones meant to prove the task was done.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    already_passing: Vec<String>,
+}
+
+impl GateBaseline {
+    fn from_grade(name: Option<String>, g: &Scored) -> Self {
+        Self {
+            name,
+            passed: g.passed,
+            score: g.score,
+            already_passing: g
+                .criteria
+                .iter()
+                .filter(|c| c.passed)
+                .map(|c| c.name.clone())
+                .collect(),
+        }
+    }
+}
+
+/// The `--baseline-check` result: how the reward and each segment gate grade
+/// the bookmark before any worker touches it. A gate must FAIL there to mean
+/// anything — the dispatch analogue of "a new test fails without the change".
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct BaselineCheck {
+    reward: GateBaseline,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    segments: Vec<GateBaseline>,
+}
+
+impl BaselineCheck {
+    fn headline(&self) -> String {
+        let passing: Vec<&str> = self
+            .segments
+            .iter()
+            .filter(|g| g.passed)
+            .filter_map(|g| g.name.as_deref())
+            .collect();
+        let mut s = format!("reward fails on the base (score {:.2})", self.reward.score);
+        if !passing.is_empty() {
+            s.push_str(&format!("; gates already passing: {}", passing.join(", ")));
+        }
+        s
+    }
+}
+
+/// Grade the base with the reward and each segment gate. The reward passing
+/// there is a usage error (exit 2, before any fork): it would select a worker
+/// that did nothing. A segment gate passing there only warns — it still steers
+/// the chain, it just can't tell that segment's work was done.
+fn run_baseline(
+    driver: &dyn WorkerDriver,
+    reward: &Grader,
+    segments: Option<&[ResolvedSegment]>,
+) -> Result<BaselineCheck> {
+    let rg = driver.grade_baseline(reward)?;
+    if rg.passed {
+        return Err(PillboxError::usage(
+            "dispatch",
+            "the reward already passes on the base bookmark, before any work — it can't tell a worker that did the task from one that did nothing",
+        )
+        .with_next("add a check to the reward that only the finished task makes pass, or drop --baseline-check")
+        .into());
+    }
+    let mut gates = Vec::new();
+    for seg in segments.unwrap_or_default() {
+        let g =
+            GateBaseline::from_grade(Some(seg.name.clone()), &driver.grade_baseline(&seg.gate)?);
+        if g.passed {
+            eprintln!(
+                "pillbox: warning: segment `{}` gate already passes on the base — it can't show that segment's work was done",
+                seg.name
+            );
+        }
+        gates.push(g);
+    }
+    Ok(BaselineCheck {
+        reward: GateBaseline::from_grade(None, &rg),
+        segments: gates,
+    })
+}
+
 /// Index of the winning worker: the highest-scoring worker that **passed**,
 /// tie-broken by fewest retries then earliest fork order. `None` when no worker
 /// passed (the exit-1 case) — partial-score workers are reported in the verdict
@@ -613,6 +921,14 @@ struct WorkerSummary {
     /// signal artifact so it can pool without this content-class body.
     #[serde(skip_serializing_if = "Option::is_none")]
     critic: Option<CriticVerdict>,
+    /// The stall breaker ended this worker's retries early — the handoff signal
+    /// for whatever escalates it (a stronger model, a re-plan, a human).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    stalled: bool,
+    /// The reward score of every graded attempt, in order (fork-`k` workers):
+    /// the trajectory behind `stalled`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    round_scores: Vec<f64>,
 }
 
 impl WorkerSummary {
@@ -640,6 +956,8 @@ impl WorkerSummary {
             segments: o.segments.clone(),
             judge_report_ref: None,
             critic: o.critic.clone(),
+            stalled: o.stalled,
+            round_scores: o.round_scores.clone(),
         }
     }
 
@@ -781,7 +1099,7 @@ fn run_dispatch(
         driver,
         k,
         prompt,
-        retries,
+        RetryPolicy::new(retries),
         reward,
         segments,
         None,
@@ -798,7 +1116,7 @@ fn run_dispatch_with(
     driver: &dyn WorkerDriver,
     k: u32,
     prompt: &str,
-    retries: u32,
+    retries: RetryPolicy,
     reward: &Grader,
     segments: Option<&[ResolvedSegment]>,
     critic: Option<&dyn Critic>,
@@ -891,6 +1209,7 @@ fn run_dispatch_with(
         pulled_to,
         selection_rationale,
         critic: critic_run,
+        baseline: None,
     }
 }
 
@@ -906,7 +1225,7 @@ fn drive_ranked(
     driver: &dyn WorkerDriver,
     forked: Vec<(usize, Result<String>)>,
     prompt: &str,
-    retries: u32,
+    retries: RetryPolicy,
     reward: &Grader,
     cx: &CriticCtx,
     policy: CriticPolicy,
@@ -950,7 +1269,7 @@ fn drive_ranked(
         }
         graded_any = true;
         let outcome = match grade_from_idle(driver, i, &id, reward, retries) {
-            Ok((grade, used)) => outcome_from_grade(&id, grade, used, verdict),
+            Ok((grade, rounds)) => outcome_from_grade(&id, grade, rounds, verdict),
             Err(e) => errored(id, e),
         };
         found_pass |= outcome.status.passed();
@@ -979,17 +1298,17 @@ fn grade_from_idle(
     i: usize,
     id: &str,
     grader: &Grader,
-    retries: u32,
-) -> Result<(Scored, u32)> {
-    let mut used = 0u32;
+    retries: RetryPolicy,
+) -> Result<(Scored, Rounds)> {
+    let mut rounds = Rounds::default();
     loop {
         let grade = driver.grade(id, grader)?;
-        if grade.passed || used >= retries || driver.first_turn_driven_on_fork(i) {
-            return Ok((grade, used));
+        rounds.record(&grade);
+        if driver.first_turn_driven_on_fork(i) || rounds.done(&grade, retries) {
+            return Ok((grade, rounds));
         }
-        driver.send(id, &distill_feedback(&grade))?;
+        driver.send(id, &retry_turn(&grade, retries))?;
         driver.wait_idle(id)?;
-        used += 1;
     }
 }
 
@@ -997,17 +1316,19 @@ fn grade_from_idle(
 fn outcome_from_grade(
     id: &str,
     grade: Scored,
-    used: u32,
+    rounds: Rounds,
     critic: Option<CriticVerdict>,
 ) -> WorkerOutcome {
     WorkerOutcome {
         session: id.to_string(),
         score: Some(grade.score),
-        retries_used: used,
+        retries_used: rounds.used(),
         status: status_of(&grade),
         grade: Some(grade),
         segments: vec![],
         critic,
+        stalled: rounds.stalled,
+        round_scores: rounds.scores,
     }
 }
 
@@ -1021,6 +1342,8 @@ fn unverified(id: String, critic: Option<CriticVerdict>) -> WorkerOutcome {
         grade: None,
         segments: vec![],
         critic,
+        stalled: false,
+        round_scores: vec![],
     }
 }
 
@@ -1034,6 +1357,8 @@ fn fork_failed() -> WorkerOutcome {
         grade: None,
         segments: vec![],
         critic: None,
+        stalled: false,
+        round_scores: vec![],
     }
 }
 
@@ -1048,7 +1373,15 @@ fn drive_one(
     retries: u32,
     reward: &Grader,
 ) -> WorkerOutcome {
-    drive_one_with(driver, i, id, prompt, retries, reward, None)
+    drive_one_with(
+        driver,
+        i,
+        id,
+        prompt,
+        RetryPolicy::new(retries),
+        reward,
+        None,
+    )
 }
 
 fn drive_one_with(
@@ -1056,7 +1389,7 @@ fn drive_one_with(
     i: usize,
     id: String,
     prompt: &str,
-    retries: u32,
+    retries: RetryPolicy,
     reward: &Grader,
     critic: Option<&CriticCtx>,
 ) -> WorkerOutcome {
@@ -1076,6 +1409,8 @@ fn errored(id: String, e: anyhow::Error) -> WorkerOutcome {
         grade: None,
         segments: vec![],
         critic: None,
+        stalled: false,
+        round_scores: vec![],
     }
 }
 
@@ -1091,11 +1426,11 @@ fn drive_to_grade(
     id: &str,
     first_turn: &str,
     grader: &Grader,
-    retries: u32,
-) -> Result<(Scored, u32)> {
-    let (grade, used, _critic) =
+    retries: RetryPolicy,
+) -> Result<(Scored, Rounds)> {
+    let (grade, rounds, _critic) =
         drive_to_grade_with(driver, i, id, first_turn, grader, retries, None)?;
-    Ok((grade, used))
+    Ok((grade, rounds))
 }
 
 /// [`drive_to_grade`] with an optional critic scored right before EACH grade —
@@ -1107,28 +1442,29 @@ fn drive_to_grade_with(
     id: &str,
     first_turn: &str,
     grader: &Grader,
-    retries: u32,
+    retries: RetryPolicy,
     critic: Option<&CriticCtx>,
-) -> Result<(Scored, u32, Option<CriticVerdict>)> {
+) -> Result<(Scored, Rounds, Option<CriticVerdict>)> {
+    let mut rounds = Rounds::default();
     if driver.first_turn_driven_on_fork(i) {
         driver.wait_idle(id)?;
         let verdict = critic.and_then(|c| c.score(driver, id));
         let grade = driver.grade(id, grader)?;
-        return Ok((grade, 0, verdict));
+        rounds.record(&grade);
+        return Ok((grade, rounds, verdict));
     }
 
     let mut turn = first_turn.to_string();
-    let mut used = 0u32;
     loop {
         driver.send(id, &turn)?;
         driver.wait_idle(id)?;
         let verdict = critic.and_then(|c| c.score(driver, id));
         let grade = driver.grade(id, grader)?;
-        if grade.passed || used >= retries {
-            return Ok((grade, used, verdict));
+        rounds.record(&grade);
+        if rounds.done(&grade, retries) {
+            return Ok((grade, rounds, verdict));
         }
-        turn = distill_feedback(&grade);
-        used += 1;
+        turn = retry_turn(&grade, retries);
     }
 }
 
@@ -1149,13 +1485,13 @@ fn drive_one_inner(
     i: usize,
     id: &str,
     prompt: &str,
-    retries: u32,
+    retries: RetryPolicy,
     reward: &Grader,
     critic: Option<&CriticCtx>,
 ) -> Result<WorkerOutcome> {
-    let (grade, used, verdict) =
+    let (grade, rounds, verdict) =
         drive_to_grade_with(driver, i, id, prompt, reward, retries, critic)?;
-    Ok(outcome_from_grade(id, grade, used, verdict))
+    Ok(outcome_from_grade(id, grade, rounds, verdict))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1166,7 +1502,7 @@ fn drive_segments_with(
     context: &str,
     segments: &[ResolvedSegment],
     reward: &Grader,
-    retries: u32,
+    retries: RetryPolicy,
     critic: Option<&CriticCtx>,
 ) -> WorkerOutcome {
     drive_segments_inner(driver, i, &id, context, segments, reward, retries, critic)
@@ -1189,23 +1525,31 @@ fn drive_segments_inner(
     context: &str,
     segments: &[ResolvedSegment],
     reward: &Grader,
-    retries: u32,
+    retries: RetryPolicy,
     critic: Option<&CriticCtx>,
 ) -> Result<WorkerOutcome> {
     let mut seg_outcomes = Vec::with_capacity(segments.len());
     for (i, seg) in segments.iter().enumerate() {
-        // Optional positional context rides the FIRST segment's prompt only.
+        // Optional positional context rides the FIRST segment's prompt; with
+        // `--restate-task` every later segment repeats it, delimited.
         let turn = if i == 0 && !context.is_empty() {
             format!("{context}\n\n{}", seg.prompt)
+        } else if let Some(task) = retries.restate_task.filter(|_| i > 0) {
+            format!("{}\n{}", restated_task(task), seg.prompt)
         } else {
             seg.prompt.clone()
         };
-        let (grade, used) = drive_to_grade(driver, worker_i, id, &turn, &seg.gate, retries)?;
+        let seg_retries = RetryPolicy {
+            restate_segment: Some(&seg.prompt),
+            ..retries
+        };
+        let (grade, rounds) = drive_to_grade(driver, worker_i, id, &turn, &seg.gate, seg_retries)?;
         seg_outcomes.push(SegmentOutcome {
             name: seg.name.clone(),
             passed: grade.passed,
             score: grade.score,
-            retries_used: used,
+            retries_used: rounds.used(),
+            stalled: rounds.stalled,
         });
     }
     // The critic judges the finished chain, right before the reward — the gates
@@ -1215,6 +1559,7 @@ fn drive_segments_inner(
     // graded once after the chain — no retry.
     let final_grade = driver.grade(id, reward)?;
     let retries_used = seg_outcomes.iter().map(|s| s.retries_used).sum();
+    let stalled = seg_outcomes.iter().any(|s| s.stalled);
     Ok(WorkerOutcome {
         session: id.to_string(),
         score: Some(final_grade.score),
@@ -1223,6 +1568,8 @@ fn drive_segments_inner(
         grade: Some(final_grade),
         segments: seg_outcomes,
         critic: verdict,
+        stalled,
+        round_scores: vec![],
     })
 }
 
@@ -1234,30 +1581,176 @@ fn drive_segments_inner(
 /// `grade`/`pull`).
 struct CliDriver<'a> {
     exe: PathBuf,
+    resolved: &'a Pillbox,
     opts: &'a DispatchOpts,
     default_agent: String,
     /// Durable dir the winner is pulled into (a TempDir would drop it).
     rundir: PathBuf,
+    /// Paths restored from the bookmark in every grade tree.
+    protect: ProtectSet,
+    /// The bookmark, restored and scrubbed once on the first grade — the source
+    /// protected paths are restored from. Read-only after that.
+    base: OnceCell<tempfile::TempDir>,
+    /// Each worker's last graded snapshot, by session id (see [`Self::grade`]).
+    graded: OnceCell<tempfile::TempDir>,
 }
 
 impl<'a> CliDriver<'a> {
-    fn new(opts: &'a DispatchOpts, default_agent: String) -> Result<Self> {
+    fn new(
+        resolved: &'a Pillbox,
+        opts: &'a DispatchOpts,
+        default_agent: String,
+        protect: ProtectSet,
+    ) -> Result<Self> {
         let exe = std::env::current_exe().context("locate the pillbox binary")?;
+        Ok(Self::with_exe(exe, resolved, opts, default_agent, protect))
+    }
+
+    fn with_exe(
+        exe: PathBuf,
+        resolved: &'a Pillbox,
+        opts: &'a DispatchOpts,
+        default_agent: String,
+        protect: ProtectSet,
+    ) -> Self {
         let rundir = std::env::temp_dir().join(format!(
             "pillbox-dispatch-{}",
             uuid::Uuid::now_v7().simple()
         ));
-        Ok(Self {
+        Self {
             exe,
+            resolved,
             opts,
             default_agent,
             rundir,
-        })
+            protect,
+            base: OnceCell::new(),
+            graded: OnceCell::new(),
+        }
+    }
+
+    /// Restore `--from-bookmark` into a fresh temp dir and scrub it like a
+    /// worker's clone — never the warm base cache the workers clone from.
+    fn restore_bookmark(&self, purpose: &str) -> Result<tempfile::TempDir> {
+        let dir = tempfile::Builder::new()
+            .prefix("pillbox-dispatch-base-")
+            .tempdir()
+            .with_context(|| format!("temp dir for {purpose}"))?;
+        let handle = crate::bookmarks::resolve_existing(self.resolved, &self.opts.from_bookmark)?;
+        self.resolved.workspace()?.pull(dir.path(), Some(&handle))?;
+        crate::workspace::ingest::scrub_secrets(dir.path())?;
+        Ok(dir)
+    }
+
+    fn base_tree(&self) -> Result<&std::path::Path> {
+        if self.base.get().is_none() {
+            let dir = self.restore_bookmark("the protected-path base")?;
+            let _ = self.base.set(dir);
+        }
+        Ok(self.base.get().expect("base just set").path())
+    }
+
+    fn live_workspace(&self, id: &str) -> Result<PathBuf> {
+        // `.session.workspace` resolves via the session's `LiveSession`
+        // `workspace_path()` — libkrun sessions only.
+        let info = self.capture(&["session".into(), "info".into(), id.into(), "--json".into()])?;
+        let iv: serde_json::Value = serde_json::from_str(&info)
+            .with_context(|| format!("parse `session info --json`: {info:?}"))?;
+        iv["session"]["workspace"]
+            .as_str()
+            .map(PathBuf::from)
+            .context("`session info --json` had no session.workspace (libkrun-only today)")
+    }
+
+    /// Where worker `id`'s last graded snapshot lives. The directory is a temp
+    /// dir dropped with the driver, so losers' snapshots don't outlive the run.
+    fn graded_snapshot(&self, id: &str) -> Result<PathBuf> {
+        if self.graded.get().is_none() {
+            let dir = tempfile::Builder::new()
+                .prefix("pillbox-dispatch-graded-")
+                .tempdir_in(std::env::temp_dir())
+                .context("temp dir for graded snapshots")?;
+            let _ = self.graded.set(dir);
+        }
+        Ok(self.graded.get().expect("graded just set").path().join(id))
     }
 
     fn effective_agent(&self, i: usize) -> String {
         effective_worker_agent(self.opts, i, &self.default_agent)
     }
+}
+
+/// The project directory `dir` sits in, if any: the resolved pillbox's own
+/// directory (the one holding its `pillbox.toml`, whatever the cwd), or, on the
+/// global pillbox, the nearest ancestor of the cwd holding `pillbox.toml` or
+/// `.git` (else the cwd itself).
+fn grader_files_inside_project(
+    dir: &std::path::Path,
+    resolved: Option<&std::path::Path>,
+) -> Option<PathBuf> {
+    let dir = dir.canonicalize().ok()?;
+    // A selected project pillbox is the only bookmark source; the cwd stands in
+    // for the project only on the global pillbox.
+    let project = match resolved {
+        Some(p) => p.canonicalize().ok()?,
+        None => {
+            let cwd = std::env::current_dir().ok()?.canonicalize().ok()?;
+            cwd.ancestors()
+                .find(|a| a.join("pillbox.toml").exists() || a.join(".git").exists())
+                .unwrap_or(&cwd)
+                .to_path_buf()
+        }
+    };
+    dir.starts_with(&project).then_some(project)
+}
+
+/// The `session score` argv that grades `tree` for worker `id` inside the
+/// one-shot grader microVM.
+// Context: doc://pillbox/optimization-external-substrate-primitives@0001#optimization-external-substrate-primitives — the reward is an external grader's verdict; a worker must not be able to edit or run code outside the VM to change it.
+fn score_args(
+    id: &str,
+    tree: &std::path::Path,
+    grader: &Grader,
+    egress: &[String],
+    drop_privileges: bool,
+) -> Vec<String> {
+    let mut args = vec![
+        "session".into(),
+        "score".into(),
+        id.into(),
+        "--workspace".into(),
+        tree.to_string_lossy().into_owned(),
+        "--in-sandbox".into(),
+    ];
+    if drop_privileges {
+        args.push("--drop-privileges".into());
+    }
+    for host in egress {
+        args.extend(["--grader-egress".into(), host.clone()]);
+    }
+    args.push("--json".into());
+    args.extend(grader.flags());
+    args
+}
+
+/// Stderr note for a worker whose grade tree had protected paths put back.
+fn reverted_note(id: &str, reverted: &[PathBuf]) -> Option<String> {
+    const SHOWN: usize = 5;
+    if reverted.is_empty() {
+        return None;
+    }
+    let mut list: Vec<String> = reverted
+        .iter()
+        .take(SHOWN)
+        .map(|p| p.display().to_string())
+        .collect();
+    if reverted.len() > SHOWN {
+        list.push(format!("+{} more", reverted.len() - SHOWN));
+    }
+    Some(format!(
+        "pillbox: dispatch: worker {id} changed protected paths; graded with the bookmark's copy: {}",
+        list.join(", ")
+    ))
 }
 
 impl WorkerDriver for CliDriver<'_> {
@@ -1325,31 +1818,35 @@ impl WorkerDriver for CliDriver<'_> {
     }
 
     fn grade(&self, id: &str, grader: &Grader) -> Result<Scored> {
-        // Grade the worker's *live* workspace clone in place (no pull): `session
-        // info --json` exposes its path, `session score --workspace` grades it.
-        // The winner is pulled to a durable dir separately (`pull_winner`).
-        // NOTE: `.session.workspace` resolves via the session's `LiveSession`
-        // `workspace_path()` — libkrun sessions only (docker has no result clone).
-        // Docker dispatch needs a different workspace resolution (see
-        // docs/dispatch.md Deferred); v1 is libkrun-only.
-        let info = self.capture(&["session".into(), "info".into(), id.into(), "--json".into()])?;
-        let iv: serde_json::Value = serde_json::from_str(&info)
-            .with_context(|| format!("parse `session info --json`: {info:?}"))?;
-        let ws = iv["session"]["workspace"]
-            .as_str()
-            .context("`session info --json` had no session.workspace (libkrun-only today)")?
-            .to_string();
-
-        let mut args = vec![
-            "session".into(),
-            "score".into(),
-            id.into(),
-            "--workspace".into(),
-            ws,
-            "--json".into(),
-        ];
-        args.extend(grader.flags());
-        let out = self.capture(&args)?;
+        // Never the live workspace: grade a scrubbed copy with the protected
+        // paths restored from the bookmark, inside the grader microVM. A VM that
+        // can't run fails `session score`, which errors this worker — there is
+        // no host fallback.
+        // Grade a frozen snapshot, and keep it: `pull_winner` delivers exactly
+        // the tree that was graded, not whatever a background process the
+        // worker left running has made of the live workspace since.
+        let ws = self.live_workspace(id)?;
+        let snap = self.graded_snapshot(id)?;
+        if snap.exists() {
+            force_remove(&snap)?;
+        }
+        snapshot_workspace(&ws, &snap)?;
+        let tree = GradeTree::prepare(
+            &snap,
+            self.base_tree()?,
+            &self.protect,
+            self.opts.grader_files.as_deref(),
+        )?;
+        if let Some(note) = reverted_note(id, &tree.report.reverted) {
+            eprintln!("{note}");
+        }
+        let out = self.capture(&score_args(
+            id,
+            tree.path(),
+            grader,
+            &self.opts.grader_egress,
+            tree.locked,
+        ))?;
         parse_grade(&out)
     }
 
@@ -1361,6 +1858,17 @@ impl WorkerDriver for CliDriver<'_> {
         let to = self.rundir.join(format!("winner-{id}"));
         std::fs::create_dir_all(&self.rundir)
             .with_context(|| format!("create {:?}", self.rundir))?;
+        let snap = self.graded_snapshot(id)?;
+        if snap.exists() {
+            std::fs::rename(&snap, &to).with_context(|| {
+                format!(
+                    "move graded snapshot {} to {}",
+                    snap.display(),
+                    to.display()
+                )
+            })?;
+            return Ok(to);
+        }
         self.status(&[
             "session".into(),
             "pull".into(),
@@ -1382,6 +1890,24 @@ impl WorkerDriver for CliDriver<'_> {
             "tool_call".into(),
         ])?;
         Ok(edits_from_log(&out))
+    }
+
+    fn grade_baseline(&self, grader: &Grader) -> Result<Scored> {
+        // A fresh restore PER grader: a grader may write build output, which
+        // must not leak into the next grader's baseline. Scrubbed like a
+        // worker's clone. Graded on the host — this tree is the trusted
+        // bookmark, not a worker's, and the check has to run where no microVM
+        // can boot. Worker grades take the VM path (`grade`).
+        let dir = self.restore_bookmark("--baseline-check")?;
+        // The baseline sees the same hidden grader files a worker's grade does.
+        if let Some(src) = &self.opts.grader_files {
+            crate::workspace::protect::inject_grader_files(dir.path(), src)?;
+        }
+        let (cmd, rubric) = match grader {
+            Grader::Cmd(c) => (Some(c.as_str()), None),
+            Grader::Rubric(p) => (None, Some(p.as_path())),
+        };
+        crate::commands::session::grade_dir(dir.path(), cmd, rubric)
     }
 }
 
@@ -1422,6 +1948,12 @@ impl CliDriver<'_> {
         }
         Ok(())
     }
+}
+
+/// Whether this build can run the grader microVM. Without it dispatch refuses
+/// to start rather than grade worker code on the host.
+fn grader_vm_available() -> bool {
+    cfg!(feature = "libkrun")
 }
 
 /// Parse a `session score --json` envelope into the `contract::Scored` it
@@ -1605,6 +2137,8 @@ pub(crate) fn dispatch(resolved: &Pillbox, opts: DispatchOpts) -> Result<()> {
         .with_next("pillbox dispatch … -- \"<the segment prompt>\"")
         .into());
     }
+    // Fail before any fork: `--restate-task` with nothing to restate is exit 2.
+    let restate_task = restate_task_prompt(opts.restate_task, &prompt)?;
     // Validate `--ttl` at the boundary so a bad duration fails fast (exit 2)
     // instead of after forking k workers (each `run --ttl` would reject it).
     if let Some(t) = &opts.ttl {
@@ -1693,17 +2227,81 @@ pub(crate) fn dispatch(resolved: &Pillbox, opts: DispatchOpts) -> Result<()> {
         .into());
     }
 
-    let driver = CliDriver::new(&opts, default_agent_id)?;
-    let verdict = run_dispatch_with(
+    // `--grader-files`: a real directory, and its landing spot is protected so
+    // a worker can't plant its own `.pillbox-grader/` (and the copy is locked).
+    let mut protect_patterns = opts.protect.clone();
+    if let Some(dir) = &opts.grader_files {
+        if !dir.is_dir() {
+            return Err(PillboxError::usage(
+                "dispatch",
+                format!("--grader-files {} is not a directory", dir.display()),
+            )
+            .into());
+        }
+        // Hidden only if the bookmark can't carry it: a directory inside the
+        // project ships to every worker's fork with the rest of the tree.
+        let source_dir = match &resolved.scope {
+            crate::pillbox::Scope::Project { source_dir, .. } => Some(source_dir.as_path()),
+            crate::pillbox::Scope::Global => None,
+        };
+        if let Some(project) = grader_files_inside_project(dir, source_dir) {
+            return Err(PillboxError::usage(
+                "dispatch",
+                format!(
+                    "--grader-files {} is inside the project {}, so workers can read it",
+                    dir.display(),
+                    project.display()
+                ),
+            )
+            .with_next(
+                "keep hidden checks outside the project directory, e.g. ../myapp-hidden-tests/",
+            )
+            .into());
+        }
+        protect_patterns.push(format!("/{GRADER_FILES_DIR}/"));
+    }
+    let protect = ProtectSet::new(!opts.no_default_protect, &protect_patterns).map_err(|e| {
+        PillboxError::usage("dispatch", format!("--protect: {e:#}"))
+            .with_next("patterns are paths relative to the workspace, e.g. --protect 'ci/**'")
+    })?;
+
+    let driver = CliDriver::new(resolved, &opts, default_agent_id, protect)?;
+    // `--baseline-check`: grade the untouched base first — a reward that already
+    // passes there stops the run (exit 2) before any worker boots. The base is
+    // the trusted bookmark, graded on the host, so this needs no microVM.
+    let baseline = if opts.baseline_check {
+        Some(run_baseline(&driver, &reward, segments.as_deref())?)
+    } else {
+        None
+    };
+    // Worker grades run in the grader microVM. Refuse before forking rather
+    // than grade a worker's tree on the host. After the baseline, so a bad
+    // reward still reports on a build with no VM.
+    if !grader_vm_available() {
+        return Err(PillboxError::usage(
+            "dispatch",
+            "dispatch grades every worker inside a libkrun microVM, and this build has no libkrun backend",
+        )
+        .with_next("use a pillbox built with the default `libkrun` feature")
+        .into());
+    }
+    let retry = RetryPolicy {
+        retries: opts.retries,
+        stall_limit: opts.stall_limit,
+        restate_task,
+        restate_segment: None,
+    };
+    let mut verdict = run_dispatch_with(
         &driver,
         k,
         &prompt,
-        opts.retries,
+        retry,
         &reward,
         segments.as_deref(),
         critic.as_ref().map(|c| c as &dyn Critic),
         critic_policy,
     );
+    verdict.baseline = baseline;
 
     // Persist each worker's evidence to its §0 log (#73) before reporting —
     // best-effort, so a log-write hiccup never changes the dispatch outcome.
@@ -1725,6 +2323,24 @@ pub(crate) fn dispatch(resolved: &Pillbox, opts: DispatchOpts) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grader_files_inside_the_project_are_refused() {
+        // Tests run from the package root, which holds Cargo.toml and .git.
+        assert!(grader_files_inside_project(std::path::Path::new("src"), None).is_some());
+        let outside = tempfile::TempDir::new().unwrap();
+        assert!(grader_files_inside_project(outside.path(), None).is_none());
+        // The selected pillbox's directory counts wherever the cwd is.
+        let project = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(project.path().join("hidden")).unwrap();
+        let hidden = project.path().join("hidden");
+        assert!(grader_files_inside_project(&hidden, Some(project.path())).is_some());
+        // With a project selected, a directory in the unrelated cwd repo is fine.
+        assert!(
+            grader_files_inside_project(std::path::Path::new("src"), Some(project.path()))
+                .is_none()
+        );
+    }
     use std::cell::RefCell;
 
     fn outcome(
@@ -1741,6 +2357,8 @@ mod tests {
             grade: None,
             segments: vec![],
             critic: None,
+            stalled: false,
+            round_scores: vec![],
         }
     }
 
@@ -1884,11 +2502,20 @@ mod tests {
         /// Worker ids whose `grade` raises an error (models a stuck/broken worker).
         grade_errs: std::collections::HashSet<String>,
         sends: RefCell<usize>,
+        /// Every prompt `send` was given, in call order.
+        sent: RefCell<Vec<String>>,
+        /// The first-turn string passed to each `fork`, in call order.
+        fork_turns: RefCell<Vec<String>>,
         pulls: RefCell<Vec<String>>,
         /// The fork-index passed to each `fork`, in call order — asserts the loop
         /// hands each worker its own 0-based roster index.
         fork_indices: RefCell<Vec<usize>>,
         first_turn_on_fork: bool,
+        /// Grade like a rubric (one criterion per grade), so the stall breaker,
+        /// which ignores `--cmd` grades, applies.
+        rubric: bool,
+        /// Scripted `grade_baseline` verdicts, in call order.
+        baseline: RefCell<std::collections::VecDeque<Scored>>,
     }
 
     impl MockDriver {
@@ -1903,10 +2530,22 @@ mod tests {
                 grades: RefCell::new(grades),
                 grade_errs: std::collections::HashSet::new(),
                 sends: RefCell::new(0),
+                sent: RefCell::new(Vec::new()),
+                fork_turns: RefCell::new(Vec::new()),
                 pulls: RefCell::new(Vec::new()),
                 fork_indices: RefCell::new(Vec::new()),
                 first_turn_on_fork: false,
+                rubric: false,
+                baseline: RefCell::new(std::collections::VecDeque::new()),
             }
+        }
+        fn rubric(mut self) -> Self {
+            self.rubric = true;
+            self
+        }
+        fn baseline(self, grades: Vec<Scored>) -> Self {
+            *self.baseline.borrow_mut() = grades.into_iter().collect();
+            self
         }
         fn failing_grade(mut self, id: &str) -> Self {
             self.grade_errs.insert(id.to_string());
@@ -1919,8 +2558,9 @@ mod tests {
     }
 
     impl WorkerDriver for MockDriver {
-        fn fork(&self, i: usize, _first_turn: &str) -> Result<String> {
+        fn fork(&self, i: usize, first_turn: &str) -> Result<String> {
             self.fork_indices.borrow_mut().push(i);
+            self.fork_turns.borrow_mut().push(first_turn.to_string());
             Ok(self.ids.borrow_mut().pop_front().expect("fork over budget"))
         }
         fn first_turn_driven_on_fork(&self, _i: usize) -> bool {
@@ -1939,10 +2579,16 @@ mod tests {
                 .get_mut(id)
                 .and_then(|q| q.pop_front())
                 .expect("grade over budget");
-            Ok(scored(passed, score, vec![], ""))
+            let criteria = if self.rubric {
+                vec![criterion("check", passed, "")]
+            } else {
+                vec![]
+            };
+            Ok(scored(passed, score, criteria, ""))
         }
-        fn send(&self, _id: &str, _prompt: &str) -> Result<()> {
+        fn send(&self, _id: &str, prompt: &str) -> Result<()> {
             *self.sends.borrow_mut() += 1;
+            self.sent.borrow_mut().push(prompt.to_string());
             Ok(())
         }
         fn pull_winner(&self, id: &str) -> Result<PathBuf> {
@@ -1958,6 +2604,13 @@ mod tests {
                 old: String::new(),
                 new: format!("// {id}"),
             }])
+        }
+        fn grade_baseline(&self, _grader: &Grader) -> Result<Scored> {
+            Ok(self
+                .baseline
+                .borrow_mut()
+                .pop_front()
+                .expect("baseline grade over budget"))
         }
     }
 
@@ -1976,7 +2629,7 @@ mod tests {
             &d,
             2,
             "task",
-            2,
+            RetryPolicy::new(2),
             &reward(),
             None,
             Some(&c),
@@ -2008,7 +2661,7 @@ mod tests {
             &d,
             3,
             "task",
-            1,
+            RetryPolicy::new(1),
             &reward(),
             None,
             Some(&c),
@@ -2055,7 +2708,7 @@ mod tests {
             &d,
             2,
             "task",
-            0,
+            RetryPolicy::new(0),
             &reward(),
             None,
             Some(&c),
@@ -2088,7 +2741,7 @@ mod tests {
             &d,
             2,
             "task",
-            1,
+            RetryPolicy::new(1),
             &reward(),
             None,
             Some(&c),
@@ -2112,7 +2765,7 @@ mod tests {
             &d,
             2,
             "task",
-            0,
+            RetryPolicy::new(0),
             &reward(),
             None,
             Some(&c),
@@ -2148,7 +2801,7 @@ mod tests {
             &d,
             1,
             "task",
-            0,
+            RetryPolicy::new(0),
             &reward(),
             None,
             Some(&BrokenCritic),
@@ -2179,7 +2832,7 @@ mod tests {
             &d,
             1,
             "task",
-            0,
+            RetryPolicy::new(0),
             &reward(),
             None,
             Some(&c),
@@ -2269,6 +2922,145 @@ mod tests {
         assert_eq!(w.score, Some(0.3));
         assert_eq!(*d.sends.borrow(), 0);
         assert!(d.pulls.borrow().is_empty());
+    }
+
+    // ── the stall breaker (`--stall-limit`) ──
+
+    fn drive_with(d: &MockDriver, retries: u32, stall_limit: u32) -> WorkerOutcome {
+        let policy = RetryPolicy {
+            retries,
+            stall_limit,
+            restate_task: None,
+            restate_segment: None,
+        };
+        drive_one_with(d, 0, "w0".into(), "task", policy, &reward(), None)
+    }
+
+    #[test]
+    fn breaker_stops_a_rubric_worker_that_stops_improving() {
+        // 0.5 → 0.5 (stall 1) → 0.4 (stall 2): trips with 3 of 5 retries unspent.
+        let d = MockDriver::new(vec![(
+            "w0",
+            vec![(false, 0.5), (false, 0.5), (false, 0.4), (true, 1.0)],
+        )])
+        .rubric();
+        let w = drive_with(&d, 5, 2);
+        assert!(w.stalled);
+        assert_eq!(w.status, WorkerStatus::Failed);
+        assert_eq!(w.retries_used, 2);
+        assert_eq!(w.round_scores, vec![0.5, 0.5, 0.4]);
+        assert_eq!(*d.sends.borrow(), 3);
+    }
+
+    #[test]
+    fn progress_resets_the_breaker() {
+        // Every rise resets the count, so the worker reaches its pass.
+        let d = MockDriver::new(vec![(
+            "w0",
+            vec![
+                (false, 0.2),
+                (false, 0.2),
+                (false, 0.4),
+                (false, 0.4),
+                (true, 1.0),
+            ],
+        )])
+        .rubric();
+        let w = drive_with(&d, 5, 2);
+        assert!(!w.stalled);
+        assert_eq!(w.status, WorkerStatus::Scored);
+        assert_eq!(w.retries_used, 4);
+    }
+
+    #[test]
+    fn breaker_ignores_cmd_grades_and_zero_disables_it() {
+        // A `--cmd` grade is 0 until it passes: no progress signal, full budget.
+        let d = MockDriver::new(vec![("w0", vec![(false, 0.0); 4])]);
+        let w = drive_with(&d, 3, 1);
+        assert!(!w.stalled);
+        assert_eq!(w.retries_used, 3);
+        // `--stall-limit 0` keeps the plain budget for rubric grades too.
+        let d = MockDriver::new(vec![("w0", vec![(false, 0.5); 4])]).rubric();
+        let w = drive_with(&d, 3, 0);
+        assert!(!w.stalled);
+        assert_eq!(w.retries_used, 3);
+    }
+
+    #[test]
+    fn breaker_stops_a_segment_and_marks_the_worker() {
+        let segs = vec![ResolvedSegment {
+            name: "a".into(),
+            prompt: "do a".into(),
+            gate: Grader::Cmd("ga".into()),
+        }];
+        // Gate: 0.5, 0.5, 0.5 → trips at stall 2; then the reward grade.
+        let d = MockDriver::new(vec![(
+            "w0",
+            vec![(false, 0.5), (false, 0.5), (false, 0.5), (false, 0.5)],
+        )])
+        .rubric();
+        let v = run_dispatch(&d, 1, "", 5, &reward(), Some(&segs));
+        let w = &v.workers[0];
+        assert!(w.segments[0].stalled);
+        assert_eq!(w.segments[0].retries_used, 2);
+        assert!(w.stalled);
+        assert_eq!(w.to_json_value()["stalled"], json!(true));
+        assert_eq!(w.to_json_value()["segments"][0]["stalled"], json!(true));
+    }
+
+    #[test]
+    fn stalled_is_absent_from_json_unless_it_fired() {
+        let w = outcome("w0", Some(1.0), 0, WorkerStatus::Scored);
+        assert!(w.to_json_value().get("stalled").is_none());
+    }
+
+    // ── the baseline check (`--baseline-check`) ──
+
+    #[test]
+    fn baseline_refuses_a_reward_that_already_passes() {
+        let d = MockDriver::new(vec![]).baseline(vec![scored(true, 1.0, vec![], "")]);
+        let err = run_baseline(&d, &reward(), None).unwrap_err();
+        assert!(err.to_string().contains("already passes"), "{err:#}");
+    }
+
+    #[test]
+    fn baseline_records_gates_and_criteria_already_passing() {
+        let segs = vec![
+            ResolvedSegment {
+                name: "a".into(),
+                prompt: "do a".into(),
+                gate: Grader::Cmd("ga".into()),
+            },
+            ResolvedSegment {
+                name: "b".into(),
+                prompt: "do b".into(),
+                gate: Grader::Cmd("gb".into()),
+            },
+        ];
+        let d = MockDriver::new(vec![]).baseline(vec![
+            scored(
+                false,
+                0.5,
+                vec![
+                    criterion("builds", true, ""),
+                    criterion("parses", false, ""),
+                ],
+                "",
+            ),
+            scored(true, 1.0, vec![], ""),
+            scored(false, 0.0, vec![], ""),
+        ]);
+        let b = run_baseline(&d, &reward(), Some(&segs)).expect("reward fails on base");
+        assert_eq!(b.reward.already_passing, vec!["builds".to_string()]);
+        assert!(b.segments[0].passed && !b.segments[1].passed);
+        assert!(
+            b.headline().contains("gates already passing: a"),
+            "{}",
+            b.headline()
+        );
+        let j = serde_json::to_value(&b).unwrap();
+        assert!(j["reward"].get("name").is_none());
+        assert_eq!(j["segments"][0]["name"], json!("a"));
     }
 
     #[test]
@@ -2366,6 +3158,225 @@ mod tests {
         assert_eq!(v.winner, None);
         // sends: a (1) + b (1) = 2 (no retries at budget 0).
         assert_eq!(*d.sends.borrow(), 2);
+    }
+
+    // ── `--restate-task` ──
+
+    const TASK: &str = "Fix the parser.\nKeep `parse()` stable & <public>.";
+
+    fn restate_policy(retries: u32, on: bool) -> RetryPolicy<'static> {
+        RetryPolicy {
+            restate_task: on.then_some(TASK),
+            ..RetryPolicy::new(retries)
+        }
+    }
+
+    fn two_segments() -> Vec<ResolvedSegment> {
+        vec![
+            ResolvedSegment {
+                name: "a".into(),
+                prompt: "do a".into(),
+                gate: Grader::Cmd("ga".into()),
+            },
+            ResolvedSegment {
+                name: "b".into(),
+                prompt: "do b".into(),
+                gate: Grader::Cmd("gb".into()),
+            },
+        ]
+    }
+
+    fn run_restate(d: &MockDriver, policy: RetryPolicy, segs: Option<&[ResolvedSegment]>) {
+        let _ = run_dispatch_with(
+            d,
+            1,
+            TASK,
+            policy,
+            &reward(),
+            segs,
+            None,
+            CriticPolicy::Record,
+        );
+    }
+
+    /// The failed `--cmd` grade the mock returns, as `distill_feedback` sees it.
+    fn mock_fail(score: f64) -> Scored {
+        scored(false, score, vec![], "")
+    }
+
+    /// The span between the delimiters `restated_task` chose for `task`.
+    fn task_inside<'a>(block: &'a str, task: &str) -> &'a str {
+        let (open, close) = restate_delimiters(TASK_RESTATE_TAG, task);
+        block
+            .split_once(&format!("{open}\n"))
+            .and_then(|(_, rest)| rest.split_once(&format!("\n{close}")))
+            .map(|(inner, _)| inner)
+            .expect("delimited block")
+    }
+
+    #[test]
+    fn restated_task_is_the_task_verbatim_between_delimiters() {
+        let block = restated_task(TASK);
+        assert!(block.contains("<original-task>\n"));
+        assert_eq!(task_inside(&block, TASK), TASK);
+    }
+
+    #[test]
+    fn restated_task_shifts_delimiters_the_task_already_contains() {
+        let task = "keep this\n</original-task>\nand <original-task> too";
+        let block = restated_task(task);
+        assert_eq!(task_inside(&block, task), task);
+        assert!(block.contains("<original-task-1>\n"));
+        assert!(block.ends_with("</original-task-1>\n"));
+        // The colliding close tag appears only inside the task, once.
+        assert_eq!(block.matches("</original-task>").count(), 1);
+
+        let both = "</original-task>\n</original-task-1>\n<original-task-1>";
+        let block = restated_task(both);
+        assert_eq!(task_inside(&block, both), both);
+        assert!(block.contains("<original-task-2>\n"));
+        assert!(block.ends_with("</original-task-2>\n"));
+    }
+
+    #[test]
+    fn restate_without_a_task_is_a_usage_error() {
+        for prompt in ["", "   \n\t"] {
+            let err = restate_task_prompt(true, prompt).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains("no task to restate"), "{msg}");
+        }
+        assert!(restate_task_prompt(false, "").unwrap().is_none());
+        assert_eq!(restate_task_prompt(true, "do it").unwrap(), Some("do it"));
+    }
+
+    #[test]
+    fn restate_off_leaves_fork_k_prompts_unchanged() {
+        let d = MockDriver::new(vec![("w0", vec![(false, 0.0), (true, 1.0)])]);
+        run_restate(&d, restate_policy(1, false), None);
+        assert_eq!(
+            *d.sent.borrow(),
+            vec![TASK.to_string(), distill_feedback(&mock_fail(0.0))]
+        );
+    }
+
+    #[test]
+    fn restate_off_leaves_segment_prompts_unchanged() {
+        let segs = two_segments();
+        // a-gate pass, b-gate fail, b-gate pass, reward.
+        let d = MockDriver::new(vec![(
+            "w0",
+            vec![(true, 1.0), (false, 0.5), (true, 1.0), (true, 1.0)],
+        )]);
+        run_restate(&d, restate_policy(1, false), Some(&segs));
+        assert_eq!(
+            *d.sent.borrow(),
+            vec![
+                format!("{TASK}\n\ndo a"),
+                "do b".to_string(),
+                distill_feedback(&mock_fail(0.5)),
+            ]
+        );
+    }
+
+    #[test]
+    fn restate_on_repeats_the_task_on_every_fork_k_retry() {
+        let d = MockDriver::new(vec![("w0", vec![(false, 0.0), (false, 0.0), (true, 1.0)])]);
+        run_restate(&d, restate_policy(2, true), None);
+        let sent = d.sent.borrow();
+        assert_eq!(sent.len(), 3);
+        // Turn 1 is the task itself, once — no restate block on top of it.
+        assert_eq!(sent[0], TASK);
+        let retry = format!(
+            "{}\n{}",
+            distill_feedback(&mock_fail(0.0)),
+            restated_task(TASK)
+        );
+        assert_eq!(sent[1], retry);
+        assert_eq!(sent[2], retry);
+    }
+
+    #[test]
+    fn restate_on_repeats_the_task_on_every_segment_and_segment_retry() {
+        let segs = two_segments();
+        // a-gate fail, a-gate pass, b-gate fail, b-gate pass, reward.
+        let d = MockDriver::new(vec![(
+            "w0",
+            vec![
+                (false, 0.0),
+                (true, 1.0),
+                (false, 0.0),
+                (true, 1.0),
+                (true, 1.0),
+            ],
+        )]);
+        run_restate(&d, restate_policy(1, true), Some(&segs));
+        let sent = d.sent.borrow();
+        // A segment retry restates the task AND the segment being retried, so
+        // the worker is pointed back at this checkpoint, not the whole task.
+        let retry = |seg: &str| {
+            format!(
+                "{}\n{}\n{}",
+                distill_feedback(&mock_fail(0.0)),
+                restated_task(TASK),
+                restated_block(
+                    "The segment you are working on now, restated verbatim:",
+                    SEGMENT_RESTATE_TAG,
+                    seg
+                )
+            )
+        };
+        assert_eq!(
+            *sent,
+            vec![
+                // Segment 1 already carries the task: byte-identical to off.
+                format!("{TASK}\n\ndo a"),
+                retry("do a"),
+                format!("{}\ndo b", restated_task(TASK)),
+                retry("do b"),
+            ]
+        );
+        assert!(sent[1].contains("<current-segment>\ndo a\n</current-segment>"));
+        for turn in sent.iter() {
+            assert_eq!(turn.matches(TASK).count(), 1, "task exactly once: {turn:?}");
+        }
+    }
+
+    #[test]
+    fn restate_on_reaches_critic_ranked_retries() {
+        let d = MockDriver::new(vec![("w0", vec![(false, 0.0), (true, 1.0)])]);
+        let critic = MockCritic::new(&[("w0", 0.9)]);
+        let _ = run_dispatch_with(
+            &d,
+            1,
+            TASK,
+            restate_policy(1, true),
+            &reward(),
+            None,
+            Some(&critic),
+            CriticPolicy::Order,
+        );
+        let sent = d.sent.borrow();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0], TASK);
+        assert_eq!(
+            sent[1],
+            format!(
+                "{}\n{}",
+                distill_feedback(&mock_fail(0.0)),
+                restated_task(TASK)
+            )
+        );
+    }
+
+    #[test]
+    fn restate_on_does_not_add_a_turn_for_a_one_shot_agent() {
+        let d = MockDriver::new(vec![("w0", vec![(false, 0.0)])]).first_turn_on_fork();
+        run_restate(&d, restate_policy(3, true), None);
+        assert!(
+            d.sent.borrow().is_empty(),
+            "a one-shot agent never takes a retry turn"
+        );
+        assert_eq!(*d.fork_turns.borrow(), vec![TASK.to_string()]);
     }
 
     #[test]
@@ -2474,6 +3485,9 @@ mod tests {
             cmd: Some("true".into()),
             rubric: None,
             retries: 0,
+            stall_limit: 2,
+            baseline_check: false,
+            restate_task: false,
             agent: agent.map(str::to_string),
             model: model.map(str::to_string),
             temperature,
@@ -2486,6 +3500,10 @@ mod tests {
             critic: None,
             critic_policy: "record".into(),
             critic_model: "jev-latest".into(),
+            protect: vec![],
+            no_default_protect: false,
+            grader_egress: vec![],
+            grader_files: None,
         }
     }
 
@@ -2548,6 +3566,7 @@ mod tests {
             pulled_to: Some(PathBuf::from("/tmp/session-abc123")),
             selection_rationale: Some("only passing worker (score 1.00)".into()),
             critic: None,
+            baseline: None,
         }
     }
 
@@ -2579,6 +3598,7 @@ mod tests {
             pulled_to: None,
             selection_rationale: None,
             critic: None,
+            baseline: None,
         };
         let val = v.to_json_value();
         assert!(val["winner"].is_null());
@@ -2670,6 +3690,7 @@ mod tests {
                 pulled_to: None,
                 selection_rationale: Some("only passing worker (score 1.00)".into()),
                 critic: None,
+                baseline: None,
             };
 
             record_worker_summaries(&pb, &verdict, "implement add()");
@@ -2723,5 +3744,376 @@ mod tests {
         assert!(WorkerStatus::Scored.passed());
         assert!(!WorkerStatus::Failed.passed());
         assert!(!WorkerStatus::Errored.passed());
+    }
+
+    // ── CliDriver grading: a scrubbed copy, protected paths restored, VM only ──
+
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    /// The grader-VM stand-in runs the grader against the tree it was handed,
+    /// with an empty env, and reports the verdict.
+    const VM_RUNS_GRADER: &str = r#"if (cd "$tree" && env -i PATH=/usr/bin:/bin sh -c "$cmd") >/dev/null 2>&1; then p=true; s=1.0; else p=false; s=0.0; fi
+printf '{"grader":"cmd","passed":%s,"score":%s,"feedback":""}' "$p" "$s""#;
+    /// The grader-VM stand-in executes nothing and reports a failing grade.
+    const VM_RECORDS_ONLY: &str =
+        r#"printf '{"grader":"cmd","passed":false,"score":0.0,"feedback":""}'"#;
+    /// The grader VM can't run.
+    const VM_DOWN: &str =
+        r#"echo "the grader microVM exited (1) before the grader started" >&2; exit 1"#;
+
+    /// A `pillbox` executable standing in for the real one under [`CliDriver`]:
+    /// `session info` reports `ws` as the worker's live workspace; `session
+    /// score` refuses to grade without `--in-sandbox`, copies the tree it was
+    /// handed to `seen` (the grade tree is gone once `grade` returns), then
+    /// runs `vm` with `$tree` and `$cmd` set. Every argv is appended to `log`.
+    struct FakePillbox {
+        _dir: tempfile::TempDir,
+        exe: PathBuf,
+        log: PathBuf,
+        seen: PathBuf,
+    }
+
+    impl FakePillbox {
+        fn new(ws: &Path, vm: &str) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("argv.log");
+            let seen = dir.path().join("seen");
+            let exe = dir.path().join("pillbox");
+            let script = format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{log}'
+if [ "$1 $2" = "session info" ]; then
+  printf '{{"session":{{"workspace":"%s"}}}}' '{ws}'
+  exit 0
+fi
+[ "$1 $2" = "session score" ] || exit 64
+shift 3
+tree=""; cmd=""; sandboxed=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --workspace) tree="$2"; shift 2 ;;
+    --cmd) cmd="$2"; shift 2 ;;
+    --in-sandbox) sandboxed=1; shift ;;
+    *) shift ;;
+  esac
+done
+[ "$sandboxed" = 1 ] || {{ echo "host grading refused" >&2; exit 3; }}
+rm -rf '{seen}'; cp -R "$tree" '{seen}'
+{vm}
+"#,
+                log = log.display(),
+                ws = ws.display(),
+                seen = seen.display(),
+            );
+            std::fs::write(&exe, script).unwrap();
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+            Self {
+                _dir: dir,
+                exe,
+                log,
+                seen,
+            }
+        }
+
+        fn argv(&self) -> Vec<String> {
+            std::fs::read_to_string(&self.log)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    fn put(root: &Path, rel: &str, body: &str) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+
+    /// The bookmark (`base`) and a worker workspace forked from it (`ws`).
+    /// The base test passes only once `src/lib.rs` contains `fixed`.
+    struct Project {
+        base: tempfile::TempDir,
+        _root: tempfile::TempDir,
+        ws: PathBuf,
+    }
+
+    fn project() -> Project {
+        let base = tempfile::tempdir().unwrap();
+        put(base.path(), "src/lib.rs", "pub fn f() {}\n");
+        put(base.path(), "tests/check.sh", "grep -q fixed src/lib.rs\n");
+        let root = tempfile::tempdir().unwrap();
+        let ws = root.path().join("ws");
+        crate::workspace::cow::cow_clone_dir(base.path(), &ws).unwrap();
+        Project {
+            base,
+            _root: root,
+            ws,
+        }
+    }
+
+    fn grade_with(p: Project, fake: &FakePillbox, grader: &Grader) -> (Result<Scored>, Project) {
+        let resolved = crate::pillbox::global();
+        let opts = opts_for_resolve(None, None, None, None);
+        let driver = CliDriver::with_exe(
+            fake.exe.clone(),
+            &resolved,
+            &opts,
+            "opencode".into(),
+            ProtectSet::new(true, &[]).unwrap(),
+        );
+        let Project { base, _root, ws } = p;
+        driver.base.set(base).unwrap();
+        let r = driver.grade("w1", grader);
+        let base = driver.base.into_inner().unwrap();
+        (r, Project { base, _root, ws })
+    }
+
+    fn read(p: &Path) -> String {
+        std::fs::read_to_string(p).unwrap()
+    }
+
+    #[test]
+    fn the_winner_delivered_is_the_tree_that_was_graded() {
+        let grader = Grader::Cmd("sh tests/check.sh".into());
+        let p = project();
+        put(&p.ws, "src/lib.rs", "pub fn f() {} // fixed\n");
+        let fake = FakePillbox::new(&p.ws, VM_RUNS_GRADER);
+        let resolved = crate::pillbox::global();
+        let opts = opts_for_resolve(None, None, None, None);
+        let driver = CliDriver::with_exe(
+            fake.exe.clone(),
+            &resolved,
+            &opts,
+            "opencode".into(),
+            ProtectSet::new(true, &[]).unwrap(),
+        );
+        driver.base.set(p.base).unwrap();
+        assert!(driver.grade("w1", &grader).unwrap().passed);
+
+        // A process the worker left running undoes the fix after the grade.
+        put(&p.ws, "src/lib.rs", "pub fn f() {}\n");
+        let won = driver.pull_winner("w1").unwrap();
+        assert_eq!(read(&won.join("src/lib.rs")), "pub fn f() {} // fixed\n");
+        assert!(
+            !fake.argv().iter().any(|a| a.contains("session pull")),
+            "the graded snapshot is delivered, not a fresh pull of the live tree"
+        );
+        let _ = std::fs::remove_dir_all(&driver.rundir);
+    }
+
+    #[test]
+    fn a_worker_editing_a_protected_test_does_not_change_its_grade() {
+        let grader = Grader::Cmd("sh tests/check.sh".into());
+
+        // Untouched worker: fails, as on the base.
+        let p = project();
+        let fake = FakePillbox::new(&p.ws, VM_RUNS_GRADER);
+        let (untouched, _) = grade_with(p, &fake, &grader);
+        assert!(!untouched.unwrap().passed);
+
+        // A worker that rewrites the test to pass gets the same failing grade:
+        // the test is graded as the bookmark has it.
+        let p = project();
+        put(&p.ws, "tests/check.sh", "exit 0\n");
+        let fake = FakePillbox::new(&p.ws, VM_RUNS_GRADER);
+        let (tampered, p) = grade_with(p, &fake, &grader);
+        assert!(!tampered.unwrap().passed);
+        assert_eq!(
+            read(&fake.seen.join("tests/check.sh")),
+            "grep -q fixed src/lib.rs\n"
+        );
+        // The tree handed to `session score` is locked: the owner (who the
+        // virtiofs server writes as) cannot rewrite the restored test, and can
+        // still write the worker's own code.
+        let test_mode = std::fs::symlink_metadata(fake.seen.join("tests/check.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(test_mode & 0o222, 0, "protected file stays unwritable");
+        assert!(
+            std::fs::write(fake.seen.join("tests/check.sh"), b"exit 0\n").is_err(),
+            "owner write of the restored test refused"
+        );
+        assert!(
+            std::fs::write(fake.seen.join("tests/planted.sh"), b"exit 0\n").is_err(),
+            "cannot add a file under the locked tests directory"
+        );
+        std::fs::write(fake.seen.join("src/lib.rs"), b"pub fn f() {}\n").unwrap();
+        assert_eq!(
+            read(&p.ws.join("tests/check.sh")),
+            "exit 0\n",
+            "live workspace untouched"
+        );
+
+        // Deleting it, or swapping in a symlink to a passing script, changes nothing either.
+        let p = project();
+        std::fs::remove_file(p.ws.join("tests/check.sh")).unwrap();
+        let fake = FakePillbox::new(&p.ws, VM_RUNS_GRADER);
+        let (deleted, _) = grade_with(p, &fake, &grader);
+        assert!(!deleted.unwrap().passed);
+
+        let p = project();
+        put(&p.ws, "src/pass.sh", "exit 0\n");
+        std::fs::remove_file(p.ws.join("tests/check.sh")).unwrap();
+        std::os::unix::fs::symlink("../src/pass.sh", p.ws.join("tests/check.sh")).unwrap();
+        let fake = FakePillbox::new(&p.ws, VM_RUNS_GRADER);
+        let (linked, _) = grade_with(p, &fake, &grader);
+        assert!(!linked.unwrap().passed);
+
+        // A real fix outside the protected set still passes — the grade itself
+        // is unchanged, only what the worker may edit is.
+        let p = project();
+        put(&p.ws, "src/lib.rs", "pub fn f() {} // fixed\n");
+        let fake = FakePillbox::new(&p.ws, VM_RUNS_GRADER);
+        let (fixed, _) = grade_with(p, &fake, &grader);
+        assert!(fixed.unwrap().passed);
+    }
+
+    #[test]
+    fn worker_build_and_test_code_never_runs_on_the_host() {
+        let host = tempfile::tempdir().unwrap();
+        let marker = host.path().join("ran-on-host");
+        let touch = format!("touch '{}'\n", marker.display());
+
+        let p = project();
+        put(
+            &p.ws,
+            "build.rs",
+            &format!(
+                "fn main() {{ std::fs::write({:?}, b\"\").unwrap(); }}\n",
+                marker.display().to_string()
+            ),
+        );
+        put(&p.ws, "build.sh", &touch);
+        put(&p.ws, "tests/check.sh", &touch);
+        let live_ws = p.ws.clone();
+        let fake = FakePillbox::new(&p.ws, VM_RECORDS_ONLY);
+        let grader = Grader::Cmd("sh build.sh && cargo test".into());
+        let (r, _p) = grade_with(p, &fake, &grader);
+        assert!(!r.unwrap().passed);
+
+        assert!(!marker.exists(), "worker code executed on the host");
+        let score = fake
+            .argv()
+            .into_iter()
+            .find(|a| a.starts_with("session score"))
+            .expect("graded via `session score`");
+        assert!(score.contains("--in-sandbox"), "{score}");
+        assert!(
+            score.contains("--drop-privileges"),
+            "grader must not run as root: {score}"
+        );
+        assert!(
+            !score.contains(&format!("--workspace {} ", live_ws.display())),
+            "graded the live workspace: {score}"
+        );
+        // The VM got the worker's own code, and the bookmark's test.
+        assert!(fake.seen.join("build.rs").exists());
+        assert_eq!(
+            read(&fake.seen.join("tests/check.sh")),
+            "grep -q fixed src/lib.rs\n"
+        );
+    }
+
+    #[test]
+    fn an_unavailable_grader_vm_is_an_error_with_no_host_fallback() {
+        let host = tempfile::tempdir().unwrap();
+        let marker = host.path().join("ran-on-host");
+        let p = project();
+        put(
+            &p.ws,
+            "tests/check.sh",
+            &format!("touch '{}'\n", marker.display()),
+        );
+        let fake = FakePillbox::new(&p.ws, VM_DOWN);
+        let (r, _p) = grade_with(p, &fake, &Grader::Cmd("sh tests/check.sh".into()));
+        let err = format!("{:#}", r.unwrap_err());
+        assert!(err.contains("before the grader started"), "{err}");
+        assert!(!marker.exists());
+        let scores: Vec<String> = fake
+            .argv()
+            .into_iter()
+            .filter(|a| a.starts_with("session score"))
+            .collect();
+        assert_eq!(scores.len(), 1, "no second attempt: {scores:?}");
+        assert!(scores[0].contains("--in-sandbox"));
+    }
+
+    #[test]
+    fn score_args_grade_in_the_vm_with_the_requested_egress() {
+        let args = score_args(
+            "w1",
+            Path::new("/tmp/tree"),
+            &Grader::Rubric("r.txt".into()),
+            &["pypi.org".into()],
+            true,
+        );
+        assert_eq!(
+            args,
+            [
+                "session",
+                "score",
+                "w1",
+                "--workspace",
+                "/tmp/tree",
+                "--in-sandbox",
+                "--drop-privileges",
+                "--grader-egress",
+                "pypi.org",
+                "--json",
+                "--rubric",
+                "r.txt"
+            ]
+        );
+        assert!(!score_args(
+            "w1",
+            Path::new("/tmp/tree"),
+            &Grader::Cmd("true".into()),
+            &[],
+            false,
+        )
+        .iter()
+        .any(|a| a == "--drop-privileges"));
+    }
+
+    #[test]
+    fn reverted_note_lists_a_capped_set() {
+        assert_eq!(reverted_note("w1", &[]), None);
+        let many: Vec<PathBuf> = (0..7)
+            .map(|i| PathBuf::from(format!("tests/{i}")))
+            .collect();
+        let note = reverted_note("w1", &many).unwrap();
+        assert!(
+            note.contains("tests/0, tests/1, tests/2, tests/3, tests/4, +2 more"),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn a_bad_protect_pattern_is_a_usage_error_before_any_fork() {
+        let mut opts = opts_for_resolve(None, None, None, None);
+        opts.prompt = vec!["do it".into()];
+        opts.protect = vec!["../escape".into()];
+        let err = dispatch(&crate::pillbox::global(), opts).unwrap_err();
+        let pe = err.downcast_ref::<PillboxError>().expect("a PillboxError");
+        assert!(
+            matches!(pe.category, crate::errors::ExitCategory::Usage),
+            "{err:#}"
+        );
+        assert!(pe.reason.contains("--protect"), "{err:#}");
+    }
+
+    #[cfg(not(feature = "libkrun"))]
+    #[test]
+    fn dispatch_refuses_to_run_without_the_grader_vm() {
+        let mut opts = opts_for_resolve(None, None, None, None);
+        opts.prompt = vec!["do it".into()];
+        let err = format!(
+            "{:#}",
+            dispatch(&crate::pillbox::global(), opts).unwrap_err()
+        );
+        assert!(err.contains("no libkrun backend"), "{err}");
     }
 }

@@ -488,6 +488,39 @@ pub const PI: AgentSpec = AgentSpec {
     libkrun_pty: None,
 };
 
+/// Prime Agent (Prime Intellect's hard fork of pi, bundled at `/opt/prime-agent` in
+/// the runner image) as a structured one-shot. It keeps pi's CLI flags, `--mode
+/// json` event stream and `auth.json` shape, so it reuses [`harness::PiAdapter`];
+/// only the command, config dir (`~/.prime/agent`) and events file differ.
+/// Verified against Prime Agent 0.9.8. JSON mode also starts a detached
+/// per-user daemon supervisor; in the one-shot guest it dies with the VM.
+pub const PRIME_AGENT: AgentSpec = AgentSpec {
+    id: "prime-agent",
+    auth_id: "prime-agent",
+    integration: Integration::Structured,
+    cred_sentinel: ".prime/agent/auth.json",
+    // Like pi: no headless login subcommand; `/login` in the TUI. Its pi-ai OAuth
+    // flows keep pi's 127.0.0.1:53692 callback (present in the 0.9.8 binary).
+    login_argv: &["prime-agent"],
+    run_argv: &["prime-agent"],
+    oauth_port: Some(53692),
+    post_login_finalize: None,
+    // Same posture as pi for `pillbox run`: mounts its own auth home, no vault.
+    // The text/2 driver vaults its API key separately (`execution::pi_text`).
+    vault_capable: false,
+    mcp_inject: None,
+    sandbox_args: &[],
+    prepare_workspace: None,
+    server: None,
+    structured: Some(StructuredProfile {
+        events_file: ".pillbox-prime-agent-events.jsonl",
+        model: StructuredModelPolicy::RequireProviderModel,
+        alt_auth_env: None,
+    }),
+    #[cfg(feature = "libkrun")]
+    libkrun_pty: None,
+};
+
 pub const ALL: &[&AgentSpec] = &[
     &CLAUDE,
     &CLAUDE_STREAM,
@@ -495,6 +528,7 @@ pub const ALL: &[&AgentSpec] = &[
     &CODEX_SERVE,
     &OPENCODE,
     &PI,
+    &PRIME_AGENT,
     &CURSOR,
 ];
 

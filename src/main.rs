@@ -347,6 +347,49 @@ enum Command {
         /// gate-retry budget.
         #[arg(long, value_name = "N", default_value_t = 1)]
         retries: u32,
+        /// Non-convergence breaker: stop retrying a worker after N retries in a
+        /// row that don't raise its best rubric score, even with `--retries`
+        /// budget left. Rubric grades only (a `--cmd` grade has no partial
+        /// progress to measure). 0 disables it.
+        #[arg(long = "stall-limit", value_name = "N", default_value_t = 2)]
+        stall_limit: u32,
+        /// Before forking, grade the untouched `--from-bookmark` base with the
+        /// reward and every segment gate. A reward that already passes there
+        /// can't tell a worker that did the task from one that didn't, so the
+        /// dispatch stops (exit 2) before any worker boots.
+        #[arg(long = "baseline-check")]
+        baseline_check: bool,
+        /// Add a protected path (repeatable). Every grade runs on a copy of the
+        /// worker's workspace in which protected paths are reset to the
+        /// bookmark's version, so a worker can't change its grade by editing
+        /// them. A name matches at any depth (`fixtures/`, `*.golden`); a path
+        /// with `/` is anchored at the workspace root (`ci/run.sh`). Added to
+        /// the defaults (tests, test-runner and CI config, rubrics).
+        #[arg(long = "protect", value_name = "PATTERN")]
+        protect: Vec<String>,
+        /// Drop the default protected paths; only `--protect` patterns apply.
+        /// For a task whose job is to change the tests themselves.
+        #[arg(long = "no-default-protect")]
+        no_default_protect: bool,
+        /// Let the grader microVM reach these hosts (repeatable), e.g. a
+        /// package registry the tests install from. The grader is offline by
+        /// default; same fence as `session score --grader-egress`.
+        #[arg(long = "grader-egress", value_name = "HOST")]
+        grader_egress: Vec<String>,
+        /// Hidden grader files: copy DIR into every grade tree (and the
+        /// baseline) at `.pillbox-grader/`, locked, never into a worker's
+        /// workspace. Reference them from the reward, e.g.
+        /// `--cmd 'sh .pillbox-grader/check.sh'`.
+        #[arg(long = "grader-files", value_name = "DIR")]
+        grader_files: Option<PathBuf>,
+        /// Restate the positional task, verbatim inside `<original-task>`
+        /// delimiters (or `<original-task-N>` when the task already contains
+        /// those tags), on every retry turn and ahead of every segment after the
+        /// first (segment 1 already carries it). Off by default: the task rides
+        /// only the first turn. Agents with no server profile never retry, so
+        /// this changes nothing for them.
+        #[arg(long = "restate-task")]
+        restate_task: bool,
         /// Worker agent (`claude` | `codex` | `opencode` | …). Defaults to the
         /// pillbox's `agent =`, then `claude`.
         #[arg(long, value_name = "AGENT")]
@@ -899,6 +942,13 @@ fn run(cli: Cli) -> Result<()> {
             rubric,
             segments,
             retries,
+            stall_limit,
+            baseline_check,
+            protect,
+            no_default_protect,
+            grader_egress,
+            grader_files,
+            restate_task,
             agent,
             model,
             temperature,
@@ -927,6 +977,9 @@ fn run(cli: Cli) -> Result<()> {
                     rubric,
                     segments,
                     retries,
+                    stall_limit,
+                    baseline_check,
+                    restate_task,
                     agent,
                     model,
                     temperature,
@@ -938,6 +991,10 @@ fn run(cli: Cli) -> Result<()> {
                     critic,
                     critic_policy,
                     critic_model,
+                    protect,
+                    no_default_protect,
+                    grader_egress,
+                    grader_files,
                 },
             )
         }
@@ -1086,7 +1143,7 @@ fn wizard_new(
         .unwrap_or_else(|| "pillbox".into());
     let name = Some(prompt::line("name", name.as_deref().unwrap_or(&cwd_base))?);
 
-    let agents = ["claude", "codex", "opencode", "pi", "cursor"];
+    let agents = ["claude", "codex", "opencode", "pi", "prime-agent", "cursor"];
     let agent_idx = agents
         .iter()
         .position(|a| Some(*a) == agent.as_deref())

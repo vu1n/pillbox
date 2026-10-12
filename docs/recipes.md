@@ -300,9 +300,15 @@ PILLBOX_BACKEND=libkrun pillbox dispatch \
   --segments rubrics/example-segments.toml \
   -k 3 --temperature 0.7 \
   --rubric rubrics/rust-change.rubric \
+  --grader-files ../myapp-hidden-tests/ \
   --agent opencode --json \
   -- "Implement the staged refactor described per segment."
 ```
+
+Every grade runs on a protected copy of the worker's workspace inside the grader
+microVM, which boots the runner image: a Rust reward needs an image built `FROM` the
+runner with a toolchain (`PILLBOX_RUNNER_IMAGE`). See "Grading" in
+[docs/dispatch.md](./dispatch.md).
 
 `-k`/`--temperature` is the **best-of-k diversity** axis; `--segments` is the
 **in-session decomposition** axis; they compose. The per-segment gate steers

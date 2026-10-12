@@ -5,18 +5,18 @@
 //! egress itself, and reports what it ran in `resolved`. A failure carries one closed
 //! code and the stage that was running; free text stays in the session evidence.
 
-use std::process::Command;
-
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::evidence::ExecutionEvidence;
+use super::opencode::{self, Plan};
+use super::pi_text::{self, PiHarness, Selection};
 use super::protocol;
 use super::store::OwnedInvocation;
 use super::text::{self, FailedStage, TextExecution, TextLimits, TextRequest, TextRuntime};
 use super::usage::TurnUsage;
-use super::{digest, HarnessTransport, ModelProfile, SessionIdentity, TextOutputFormat};
+use super::{EvidenceRef, HarnessTransport, ModelProfile, SessionIdentity, TextOutputFormat};
 use crate::contract::{Custom, Payload};
 use crate::pillbox::Pillbox;
 use crate::sandbox::libkrun::repository::TeardownUnconfirmed;
@@ -58,20 +58,21 @@ pub(crate) enum Outcome {
 
 impl TextRequestV2 {
     /// Checks that do not depend on what is installed. A request that fails here was
-    /// never admitted.
+    /// never admitted, so it must cover everything text/1 checks before its claim.
     pub(crate) fn validate(&self) -> Result<()> {
         ensure!(
             self.contract_version == CONTRACT_VERSION,
             "unsupported text contract"
         );
+        text::validate_id(&self.invocation_id)?;
+        text::validate_id(&self.session_ref.session_id)?;
         ensure!(
             self.idempotency_key == self.invocation_id,
             "invocation/idempotency mismatch"
         );
-        ensure!(
-            self.rendered_input_hash == digest(self.rendered_input.as_bytes()),
-            "rendered input digest mismatch"
-        );
+        text::validate_input(&self.rendered_input, &self.rendered_input_hash)?;
+        text::validate_output_format(&self.output_format)?;
+        self.limits.validate()?;
         ensure!(
             self.tool_policy == "deny_all",
             "unsupported text tool policy"
@@ -83,10 +84,16 @@ impl TextRequestV2 {
         ensure!(
             matches!(
                 self.agent.harness.as_str(),
-                "codex" | "claude_code" | "pi" | "opencode"
+                "codex" | "claude_code" | "pi" | "prime-agent" | "opencode"
             ),
             "unknown text harness"
         );
+        for value in [&self.agent.model, &self.agent.reasoning_effort] {
+            ensure!(
+                !value.is_empty() && value.len() <= 128,
+                "agent model and reasoning effort must contain 1..128 bytes"
+            );
+        }
         Ok(())
     }
 
@@ -147,10 +154,18 @@ pub(crate) fn execute(
     request: &TextRequestV2,
     owner: &mut OwnedInvocation,
 ) -> Result<Outcome> {
-    let resolved = resolve(pb, request);
-    let (lowered, runner_image_id) = match resolved {
+    let (lowered, runner_image_id) = match resolve(pb, request) {
         Ok(resolved) => resolved,
-        Err(rejection) => return unresolved(pb, request, owner, rejection),
+        Err(rejection) => return Ok(unresolved(pb, request, owner, rejection)),
+    };
+    let lowered = match lowered {
+        Lowered::Codex(lowered) => *lowered,
+        Lowered::Pi(selection) => {
+            return execute_pi(pb, request, owner, &selection, runner_image_id)
+        }
+        Lowered::Opencode(plan) => {
+            return execute_opencode(pb, request, owner, &plan, runner_image_id)
+        }
     };
     match text::execute_with(pb, &lowered, owner, false) {
         Ok((completion, observed)) => {
@@ -159,9 +174,7 @@ pub(crate) fn execute(
                 "request_hash": completion.request_hash,
                 "resolved": {
                     "harness": request.agent.harness,
-                    "harness_version": observed
-                        .cli_version
-                        .context("Codex did not report its version")?,
+                    "harness_version": observed.cli_version,
                     "adapter_revision": ADAPTER_REVISION,
                     "runner_image_id": runner_image_id,
                     "requested_model": completion.requested_model,
@@ -190,6 +203,125 @@ pub(crate) fn execute(
     }
 }
 
+/// A completed OpenCode turn.
+pub(crate) struct Turn {
+    pub(crate) output_text: String,
+    /// Reported by the harness itself, never assumed from the runner image.
+    pub(crate) harness_version: String,
+    /// The provider's own model id, when the harness surfaces it.
+    pub(crate) served_model: Option<String>,
+    pub(crate) session_ref: EvidenceRef,
+    pub(crate) usage: Option<TurnUsage>,
+}
+
+/// Run an OpenCode plan and seal its record the same way as Codex's.
+fn execute_opencode(
+    pb: &Pillbox,
+    request: &TextRequestV2,
+    owner: &mut OwnedInvocation,
+    plan: &Plan,
+    runner_image_id: String,
+) -> Result<Outcome> {
+    match super::text_opencode::execute(pb, request, plan, &runner_image_id, owner) {
+        Ok(turn) => {
+            let mut detail = json!({
+                "invocation_id": request.invocation_id,
+                "request_hash": owner.record().request_hash,
+                "resolved": {
+                    "harness": request.agent.harness,
+                    "harness_version": turn.harness_version,
+                    "adapter_revision": ADAPTER_REVISION,
+                    "runner_image_id": runner_image_id,
+                    "requested_model": request.agent.model,
+                    "served_model": turn.served_model,
+                },
+                "session_ref": turn.session_ref,
+                "output_text": turn.output_text,
+            });
+            with_usage(&mut detail, turn.usage.as_ref());
+            Ok(Outcome::Completed(detail))
+        }
+        Err(error) if error.downcast_ref::<TeardownUnconfirmed>().is_some() => Err(error),
+        Err(error) => {
+            let failed = error.downcast_ref::<FailedStage>();
+            let stage = failed.map_or("credentials", |failed| failed.stage);
+            let mut detail = json!({
+                "invocation_id": request.invocation_id,
+                "request_hash": owner.record().request_hash,
+                "code": failure_code(stage, &error),
+                "stage": stage,
+                "session_ref": owner.record().detail.get("session_ref"),
+            });
+            with_usage(&mut detail, failed.and_then(|failed| failed.usage.as_ref()));
+            Ok(Outcome::Failed(detail))
+        }
+    }
+}
+
+/// Run a pi-family selection and seal its record the same way as Codex's.
+fn execute_pi(
+    pb: &Pillbox,
+    request: &TextRequestV2,
+    owner: &mut OwnedInvocation,
+    selection: &Selection,
+    runner_image_id: String,
+) -> Result<Outcome> {
+    let limits = &request.limits;
+    let invocation = pi_text::Invocation {
+        session_id: &request.session_ref.session_id,
+        invocation_id: &request.invocation_id,
+        rendered_input: &request.rendered_input,
+        limits: pi_text::Limits {
+            timeout_ms: limits.timeout_ms,
+            max_final_text_bytes: limits.max_final_text_bytes,
+            max_frame_bytes: limits.max_frame_bytes,
+            max_evidence_bytes: limits.max_evidence_bytes,
+        },
+    };
+    let mut guest = crate::sandbox::libkrun::text_harness::LibkrunTextGuest;
+    match pi_text::execute(
+        pb,
+        &invocation,
+        selection,
+        &runner_image_id,
+        owner,
+        &mut guest,
+    ) {
+        Ok(completion) => {
+            let mut detail = json!({
+                "invocation_id": request.invocation_id,
+                "request_hash": owner.record().request_hash,
+                "resolved": {
+                    "harness": request.agent.harness,
+                    "harness_version": completion.harness_version,
+                    "adapter_revision": pi_text::ADAPTER_REVISION,
+                    "runner_image_id": runner_image_id,
+                    "requested_model": completion.requested_model,
+                    "served_model": completion.served_model,
+                },
+                "session_ref": completion.session_ref,
+                "output_text": completion.output_text,
+            });
+            with_usage(&mut detail, completion.usage.as_ref());
+            Ok(Outcome::Completed(detail))
+        }
+        Err(error) if error.downcast_ref::<TeardownUnconfirmed>().is_some() => Err(error),
+        Err(error) => {
+            let failed = error.downcast_ref::<pi_text::Failed>();
+            let stage = failed.map_or("credentials", |failed| failed.stage);
+            let mut detail = json!({
+                "invocation_id": request.invocation_id,
+                "request_hash": owner.record().request_hash,
+                "code": failure_code(stage, &error),
+                "stage": stage,
+                "session_ref": owner.record().detail.get("session_ref"),
+            });
+            with_usage(&mut detail, failed.and_then(|failed| failed.usage.as_ref()));
+            Ok(Outcome::Failed(detail))
+        }
+    }
+}
+
 /// Add the turn's reported spend to a completed or failed record. A harness that
 /// reported nothing gets no `usage` key, never zeros.
 fn with_usage(detail: &mut Value, usage: Option<&TurnUsage>) {
@@ -204,90 +336,126 @@ struct Rejection {
     error: anyhow::Error,
 }
 
+/// What a selection resolved to, per driver.
+enum Lowered {
+    Codex(Box<TextRequest>),
+    Pi(Selection),
+    Opencode(Plan),
+}
+
 fn resolve(
     pb: &Pillbox,
     request: &TextRequestV2,
-) -> std::result::Result<(TextRequest, String), Rejection> {
-    // Only Codex has a tool-free text driver today. The other harnesses are valid
-    // selections that this build cannot run, which is a rejection, not a bad request.
-    if request.agent.harness != "codex" {
-        return Err(Rejection {
-            code: "runtime_rejected",
-            error: anyhow::anyhow!("no text driver for harness {}", request.agent.harness),
-        });
-    }
+) -> std::result::Result<(Lowered, String), Rejection> {
+    let rejected = |error| Rejection {
+        code: "runtime_rejected",
+        error,
+    };
+    // A harness without a tool-free text driver is a valid selection this build
+    // cannot run, which is a rejection, not a bad request. Models are checked before
+    // the image so an unservable one is rejected even where no image is available.
+    let selected = match request.agent.harness.as_str() {
+        "codex" => None,
+        "opencode" => Some(Lowered::Opencode(
+            opencode::plan(&request.agent.model, &request.agent.reasoning_effort)
+                .map_err(rejected)?,
+        )),
+        harness => match PiHarness::from_selection(harness) {
+            Some(pi) => Some(Lowered::Pi(
+                Selection::resolve(pi, &request.agent.model, &request.agent.reasoning_effort)
+                    .map_err(rejected)?,
+            )),
+            None => {
+                return Err(rejected(anyhow::anyhow!(
+                    "no text driver for harness {harness}"
+                )))
+            }
+        },
+    };
     let runner_image_id = runner_image_id(pb).map_err(|error| Rejection {
         code: "runtime_unavailable",
         error,
     })?;
-    let lowered = request
-        .codex_request(runner_image_id.clone())
-        .map_err(|error| Rejection {
-            code: "runtime_rejected",
-            error,
-        })?;
+    let lowered = match selected {
+        Some(lowered) => lowered,
+        None => Lowered::Codex(Box::new(
+            request
+                .codex_request(runner_image_id.clone())
+                .map_err(rejected)?,
+        )),
+    };
     Ok((lowered, runner_image_id))
 }
 
 /// The immutable id of the runner image this pillbox is configured to use.
 fn runner_image_id(pb: &Pillbox) -> Result<String> {
     let (image, _) = crate::docker::resolve_runner_image(pb);
-    let output = Command::new("docker")
-        .args(["image", "inspect", &image, "--format", "{{.Id}}"])
-        .output()
-        .context("run docker image inspect")?;
+    let id = crate::sandbox::libkrun::docker_image_id(&image)?;
     ensure!(
-        output.status.success(),
-        "runner image {image} is not available: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
+        super::valid_digest(&id),
+        "invalid runner image id for {image}"
     );
-    let id = String::from_utf8(output.stdout)?.trim().to_owned();
-    if !super::valid_digest(&id) {
-        bail!("Docker returned an invalid runner image id for {image}");
-    }
     Ok(id)
 }
 
-/// Record a failure that happened before any VM work, so it has session evidence
-/// like every later failure.
+/// Record a failure that happened before any VM work, with session evidence and
+/// lifecycle events like every later failure. Always seals: a failure to persist
+/// the evidence leaves `session_ref` null rather than the invocation unsealed.
 fn unresolved(
     pb: &Pillbox,
     request: &TextRequestV2,
-    owner: &mut OwnedInvocation,
+    owner: &OwnedInvocation,
     rejection: Rejection,
-) -> Result<Outcome> {
-    let mut evidence = ExecutionEvidence::start_text(
+) -> Outcome {
+    let session_id = &request.session_ref.session_id;
+    let recorded = (|| -> Result<_> {
+        let mut evidence = ExecutionEvidence::start_text(
+            pb,
+            session_id,
+            &request.invocation_id,
+            json!({
+                "request_hash": owner.record().request_hash,
+                "adapter_revision": ADAPTER_REVISION,
+                "agent": request.agent,
+            }),
+        )?;
+        evidence.append(Payload::Custom(Custom {
+            name: "text.execution.failed".into(),
+            payload: Some(json!({"error": format!("{:#}", rejection.error), "stage": "resolve"})),
+        }))?;
+        Ok(evidence.reference())
+    })();
+    let mut reason = format!("resolve: {:#}", rejection.error);
+    if let Err(error) = &recorded {
+        reason.push_str(&format!("; failure evidence was not persisted: {error:#}"));
+    }
+    crate::events::emit_session_event(
         pb,
-        &request.session_ref.session_id,
-        &request.invocation_id,
-        json!({
-            "request_hash": owner.record().request_hash,
-            "adapter_revision": ADAPTER_REVISION,
-            "agent": request.agent,
-        }),
-    )?;
-    evidence.append(Payload::Custom(Custom {
-        name: "text.execution.failed".into(),
-        payload: Some(json!({"error": format!("{:#}", rejection.error), "stage": "resolve"})),
-    }))?;
+        crate::events::EventType::SessionStarted {
+            parent_session_id: crate::events::parent_session_id_from_env(),
+            startup: None,
+        },
+        session_id,
+        None,
+    );
     crate::events::emit_session_event(
         pb,
         crate::events::EventType::SessionFailed {
-            reason: format!("resolve: {:#}", rejection.error),
+            reason,
             exit_code: Some(1),
             trace_path: None,
             result_snapshot: None,
         },
-        &request.session_ref.session_id,
+        session_id,
         None,
     );
-    Ok(Outcome::Failed(json!({
+    Outcome::Failed(json!({
         "invocation_id": request.invocation_id,
         "request_hash": owner.record().request_hash,
         "code": rejection.code,
         "stage": "resolve",
-        "session_ref": evidence.reference(),
-    })))
+        "session_ref": recorded.ok(),
+    }))
 }
 
 /// Map a failed stage to the closed code set shared with the caller. Deadlines are
@@ -308,6 +476,7 @@ fn failure_code(stage: &str, error: &anyhow::Error) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{canonical_json, digest};
     use super::*;
 
     fn request(harness: &str, model: &str) -> TextRequestV2 {
@@ -343,10 +512,55 @@ mod tests {
 
     #[test]
     fn every_pillbox_harness_is_a_valid_selection() {
-        for harness in ["codex", "claude_code", "pi", "opencode"] {
+        for harness in ["codex", "claude_code", "pi", "prime-agent", "opencode"] {
             request(harness, "any-model").validate().unwrap();
         }
         assert!(request("custom", "any-model").validate().is_err());
+    }
+
+    #[test]
+    fn every_harness_is_held_to_the_same_bounds() {
+        for harness in ["codex", "opencode", "pi", "prime-agent"] {
+            let mut zero = request(harness, "any-model");
+            zero.limits.timeout_ms = 0;
+            assert!(zero.validate().is_err());
+            let mut huge = request(harness, "any-model");
+            huge.limits.max_evidence_bytes = u64::MAX;
+            assert!(huge.validate().is_err());
+            let mut retry = request(harness, "any-model");
+            retry.output_format.retry_count = 1;
+            assert!(retry.validate().is_err());
+            let mut id = request(harness, "any-model");
+            id.session_ref.session_id = "../escape".into();
+            assert!(id.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn a_malformed_request_is_refused_before_any_claim() {
+        let malformed: [fn(&mut TextRequestV2); 5] = [
+            |r| r.invocation_id = "../escape".into(),
+            |r| r.session_ref.session_id = String::new(),
+            |r| r.limits.timeout_ms = 0,
+            |r| r.output_format.retry_count = 1,
+            |r| r.agent.model = "m".repeat(129),
+        ];
+        for mutate in malformed {
+            let mut request = request("pi", "any-model");
+            mutate(&mut request);
+            request.idempotency_key = request.invocation_id.clone();
+            assert!(request.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn a_parsed_request_reserializes_to_the_hashed_canonical_form() {
+        let value = serde_json::to_value(request("codex", "gpt-6-luna")).unwrap();
+        let parsed: TextRequestV2 = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(
+            canonical_json(&serde_json::to_value(&parsed).unwrap()).unwrap(),
+            canonical_json(&value).unwrap()
+        );
     }
 
     #[test]
@@ -371,6 +585,47 @@ mod tests {
     }
 
     #[test]
+    fn opencode_selection_plans_its_provider_egress() {
+        let plan = opencode::plan("zai-coding-plan/glm-4.5-air", "low").unwrap();
+        assert_eq!(plan.hosts, ["api.z.ai", "models.dev"]);
+        assert_eq!(plan.variant, "low");
+        let temp = tempfile::tempdir().unwrap();
+        let pb = Pillbox {
+            scope: crate::pillbox::Scope::Global,
+            state_dir: temp.path().into(),
+            meta: None,
+        };
+        for model in ["opencode/big-pickle-free", "ollama/llama3", "glm-4.5-air"] {
+            let Err(rejection) = resolve(&pb, &request("opencode", model)) else {
+                panic!("opencode resolved {model}")
+            };
+            assert_eq!(rejection.code, "runtime_rejected");
+        }
+    }
+
+    #[test]
+    fn pi_family_rejects_an_unservable_model_at_resolve() {
+        let temp = tempfile::tempdir().unwrap();
+        let pb = Pillbox {
+            scope: crate::pillbox::Scope::Global,
+            state_dir: temp.path().into(),
+            meta: None,
+        };
+        for harness in ["pi", "prime-agent"] {
+            for model in ["anthropic/claude-sonnet-404", "glm-5.3", "bedrock/nova"] {
+                let Err(rejection) = resolve(&pb, &request(harness, model)) else {
+                    panic!("{harness} resolved {model}")
+                };
+                assert_eq!(rejection.code, "runtime_rejected");
+            }
+        }
+        let Err(rejection) = resolve(&pb, &request("claude_code", "claude-sonnet-5")) else {
+            panic!("claude_code has no text driver here")
+        };
+        assert_eq!(rejection.code, "runtime_rejected");
+    }
+
+    #[test]
     fn usage_is_added_only_when_reported() {
         let mut detail = json!({"invocation_id": "chat_1"});
         with_usage(&mut detail, None);
@@ -382,6 +637,39 @@ mod tests {
             detail["usage"],
             json!({"cost_usd": 0.5, "input_tokens": 3, "output_tokens": 4})
         );
+    }
+
+    #[test]
+    fn an_unrunnable_harness_seals_a_free_text_free_failure() {
+        use super::super::store::{Claim, InvocationStore};
+        let temp = tempfile::tempdir().unwrap();
+        let pb = Pillbox {
+            scope: crate::pillbox::Scope::Global,
+            state_dir: temp.path().into(),
+            meta: None,
+        };
+        let store = InvocationStore::new(&temp.path().join("text-executions")).unwrap();
+        for (session, evidence_writable) in [("chat_1", true), ("chat_2", false)] {
+            let mut request = request("pi", "any-model");
+            request.session_ref.session_id = session.into();
+            request.invocation_id = session.into();
+            request.idempotency_key = session.into();
+            if !evidence_writable {
+                let path = crate::session::session_dir_path(&pb, session);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, b"not a directory").unwrap();
+            }
+            let Claim::Owned(mut owner) = store.claim(session, "sealed-request").unwrap() else {
+                panic!()
+            };
+            let Outcome::Failed(detail) = execute(&pb, &request, &mut owner).unwrap() else {
+                panic!("an unrunnable harness must fail")
+            };
+            assert_eq!(detail["code"], "runtime_rejected");
+            assert_eq!(detail["stage"], "resolve");
+            assert_eq!(detail["session_ref"].is_object(), evidence_writable);
+            assert!(!detail.to_string().contains("no text driver"));
+        }
     }
 
     #[test]

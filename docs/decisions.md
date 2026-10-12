@@ -242,3 +242,37 @@ only: the Docker `run_server` path, the `sandbox agent` OpenCode 1 driver and it
 normalizer are deleted. Docker refuses server agents with a usage error.
 - **Rejected:** porting the Docker opencode path to OpenCode 2 (Docker gets no
   fixes; see ADR-002).
+
+## 2026-10-11 — pillbox becomes Stratus's Rust engine
+**Status: Accepted by Vu (2026-10-11); wording ratified 2026-10-11.**
+
+- **Decision:** Stratus (`vu1n/stratus`, TypeScript) becomes the user-facing
+  entry point for local and cloud agent sessions. The `pillbox` binary becomes
+  its engine: Stratus calls it only through JSON subcommands with versioned
+  output.
+- **The engine keeps:**
+  - local microVM placement: libkrun on macOS per ADR-001, kept after a
+    2026-10-11 comparison in which Firecracker, Cloud Hypervisor and Apple's
+    VMs booted no faster. Linux hosts without KVM use
+    Stratus's container or Cloudflare placements instead;
+  - the vault credential proxy;
+  - rustic workspace snapshots;
+  - the §0 session log.
+- **The engine will gain** a session packet (`checkpoint pack|unpack`, not built
+  yet), specified as JSON Schema rather than Rust types. The
+  `--no-default-features` Linux build must carry every packet subcommand, so
+  Cloudflare containers, which already ship a Linux `pillbox` for workspace
+  restore and backup, write the same packet as macOS.
+- **CLI surface:** no new user-facing commands; engine subcommands such as
+  `checkpoint` will exist for Stratus. Existing commands keep working until Stratus
+  covers them, and each is then deprecated by its own entry in this log.
+- **Why:** the cloud controller must be TypeScript (Workers cannot run a Rust
+  CLI), so a Rust entry point meant the same control logic in two languages,
+  and the managed tier's TypeScript already lagged the Rust contract by a
+  version. Measured on Linux, Rust's advantage is in the engine (VMM and proxy:
+  about 10 MB per process against 50–100 MB for Node, and 2.5 ms against
+  150–240 ms per CLI start), not in a controller whose share of a ~24 s turn is
+  milliseconds.
+- **Rejected:** pillbox staying the entry point with Stratus as its cloud tier
+  (two controllers); retiring pillbox entirely (it loses the microVM, the
+  subscription-friendly proxy and rustic, or re-implements them in TypeScript).

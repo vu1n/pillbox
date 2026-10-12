@@ -95,7 +95,9 @@ gate_cmd = "python3 -m pytest -k path"
 ```
 
 Gates are **self-contained** — they run against the worker's live workspace as-is
-(same as today's `dispatch --rubric`). This is the deliberate boundary from the
+(same as today's `dispatch --rubric`). *(Superseded: every grade now runs on a
+protected copy in the grader microVM, and `--grader-files` injects hidden checks;
+see "Grading" in `docs/dispatch.md`.)* This is the deliberate boundary from the
 eval harness: the eval family injects *hidden* test subsets at grade time (which
 is why `run.sh` reuses dispatch's primitives instead of shelling `dispatch`); the
 shipped verb is for **real work** whose tests live in the workspace. The harness

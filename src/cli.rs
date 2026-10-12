@@ -459,10 +459,18 @@ pub(crate) enum SessionAction {
         /// reproducibility guarantee for reachability. Only valid with `--in-sandbox`.
         #[arg(long = "grader-egress", value_name = "HOST")]
         grader_egress: Vec<String>,
+        /// Run the `--in-sandbox` grader as `nobody`. Dispatch sets this after
+        /// locking protected paths (no write bit, owner included) and making the
+        /// rest of the grade tree world-writable, so a root `build.rs` cannot
+        /// chmod the tests back and rewrite them. Requires `--in-sandbox`.
+        #[arg(long = "drop-privileges")]
+        drop_privileges: bool,
         /// Emit the verdict as JSON on stdout — `{version, session, grader,
         /// passed, score, feedback, seq}` — so a caller reads the structured
         /// result directly instead of scraping stdout text or the §0 log. The
-        /// `scored` event is still appended either way; `seq` is its log seq.
+        /// `scored` event is appended when the grader ran; a microVM that exits
+        /// before the grader starts is an error and records nothing. `seq` is
+        /// the event's log seq.
         #[arg(long)]
         json: bool,
     },

@@ -9,6 +9,7 @@ use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use super::claude_text;
 use super::evidence::ExecutionEvidence;
 use super::opencode::{self, Plan};
 use super::pi_text::{self, PiHarness, Selection};
@@ -94,6 +95,12 @@ impl TextRequestV2 {
                 "agent model and reasoning effort must contain 1..128 bytes"
             );
         }
+        if self.agent.harness == "claude_code" {
+            ensure!(
+                self.limits.max_final_text_bytes <= claude_text::MAX_FINAL_TEXT_BYTES,
+                "invalid final text limit"
+            );
+        }
         Ok(())
     }
 
@@ -166,6 +173,7 @@ pub(crate) fn execute(
         Lowered::Opencode(plan) => {
             return execute_opencode(pb, request, owner, &plan, runner_image_id)
         }
+        Lowered::Claude(resolved) => return execute_claude(pb, request, owner, resolved),
     };
     match text::execute_with(pb, &lowered, owner, false) {
         Ok((completion, observed)) => {
@@ -241,6 +249,33 @@ fn execute_opencode(
             with_usage(&mut detail, turn.usage.as_ref());
             Ok(Outcome::Completed(detail))
         }
+        Err(error) if error.downcast_ref::<TeardownUnconfirmed>().is_some() => Err(error),
+        Err(error) => {
+            let failed = error.downcast_ref::<FailedStage>();
+            let stage = failed.map_or("credentials", |failed| failed.stage);
+            let mut detail = json!({
+                "invocation_id": request.invocation_id,
+                "request_hash": owner.record().request_hash,
+                "code": failure_code(stage, &error),
+                "stage": stage,
+                "session_ref": owner.record().detail.get("session_ref"),
+            });
+            with_usage(&mut detail, failed.and_then(|failed| failed.usage.as_ref()));
+            Ok(Outcome::Failed(detail))
+        }
+    }
+}
+
+/// Run a Claude Code selection and seal its record the same way as Codex's. The
+/// driver builds the completed detail itself; failures carry [`FailedStage`].
+fn execute_claude(
+    pb: &Pillbox,
+    request: &TextRequestV2,
+    owner: &mut OwnedInvocation,
+    resolved: claude_text::Resolved,
+) -> Result<Outcome> {
+    match claude_text::execute(pb, request, resolved, owner) {
+        Ok(detail) => Ok(Outcome::Completed(detail)),
         Err(error) if error.downcast_ref::<TeardownUnconfirmed>().is_some() => Err(error),
         Err(error) => {
             let failed = error.downcast_ref::<FailedStage>();
@@ -341,6 +376,7 @@ enum Lowered {
     Codex(Box<TextRequest>),
     Pi(Selection),
     Opencode(Plan),
+    Claude(claude_text::Resolved),
 }
 
 fn resolve(
@@ -356,6 +392,11 @@ fn resolve(
     // the image so an unservable one is rejected even where no image is available.
     let selected = match request.agent.harness.as_str() {
         "codex" => None,
+        "claude_code" => {
+            claude_text::Resolved::selection(&request.agent.model, &request.agent.reasoning_effort)
+                .map_err(rejected)?;
+            None
+        }
         "opencode" => Some(Lowered::Opencode(
             opencode::plan(&request.agent.model, &request.agent.reasoning_effort)
                 .map_err(rejected)?,
@@ -378,6 +419,14 @@ fn resolve(
     })?;
     let lowered = match selected {
         Some(lowered) => lowered,
+        None if request.agent.harness == "claude_code" => Lowered::Claude(
+            claude_text::Resolved::new(
+                &request.agent.model,
+                &request.agent.reasoning_effort,
+                runner_image_id.clone(),
+            )
+            .map_err(rejected)?,
+        ),
         None => Lowered::Codex(Box::new(
             request
                 .codex_request(runner_image_id.clone())
@@ -620,7 +669,7 @@ mod tests {
             }
         }
         let Err(rejection) = resolve(&pb, &request("claude_code", "claude-sonnet-5")) else {
-            panic!("claude_code has no text driver here")
+            panic!("claude_code resolved a model outside its catalog")
         };
         assert_eq!(rejection.code, "runtime_rejected");
     }
@@ -680,5 +729,45 @@ mod tests {
         assert_eq!(failure_code("turn", &other), "runtime_protocol_error");
         assert_eq!(failure_code("vmm_spawn", &other), "runtime_unavailable");
         assert_eq!(failure_code("finalize", &other), "internal_error");
+        assert_eq!(failure_code("credentials", &other), "runtime_unavailable");
+    }
+
+    #[test]
+    fn live_smoke_request_matches_v2_contract_before_inference() {
+        let request: TextRequestV2 = serde_json::from_value(claude_text::smoke_request()).unwrap();
+        request.validate().unwrap();
+        assert_eq!(request.agent.harness, "claude_code");
+        claude_text::Resolved::selection(&request.agent.model, &request.agent.reasoning_effort)
+            .unwrap();
+    }
+
+    #[test]
+    fn claude_final_text_limit_is_bounded_before_any_claim() {
+        let mut request = request("claude_code", "claude-opus-4-8");
+        request.limits.max_final_text_bytes = claude_text::MAX_FINAL_TEXT_BYTES + 1;
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn unservable_claude_model_is_rejected_at_resolve_before_image_or_credentials() {
+        use super::super::store::{Claim, InvocationStore};
+        let temp = tempfile::tempdir().unwrap();
+        let pb = Pillbox {
+            scope: crate::pillbox::Scope::Global,
+            state_dir: temp.path().into(),
+            meta: None,
+        };
+        let request = request("claude_code", "gpt-6-luna");
+        let store = InvocationStore::new(&temp.path().join("invocations")).unwrap();
+        let Claim::Owned(mut owner) = store.claim("chat_1", "sealed-request").unwrap() else {
+            panic!()
+        };
+        let Outcome::Failed(detail) = execute(&pb, &request, &mut owner).unwrap() else {
+            panic!()
+        };
+        assert_eq!(detail["code"], "runtime_rejected");
+        assert_eq!(detail["stage"], "resolve");
+        assert!(detail.get("error").is_none());
+        assert!(detail.get("usage").is_none());
     }
 }

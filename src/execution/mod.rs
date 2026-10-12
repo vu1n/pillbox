@@ -2,6 +2,8 @@
 #![cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 
 #[cfg(any(feature = "libkrun", test))]
+pub(crate) mod claude_text;
+#[cfg(any(feature = "libkrun", test))]
 pub(crate) mod evidence;
 pub(crate) mod files;
 #[cfg(feature = "libkrun")]

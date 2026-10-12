@@ -558,9 +558,8 @@ the harness version that image reports. A completed record carries `resolved` (`
 `internal_error`) and the `stage` that was running (`resolve`, `credentials`,
 `image_prepare`, `guest_prepare`, `vmm_spawn`, `guest_rpc_ready`, `turn`,
 `finalize`); the message stays in the session log, and `session_ref` is null
-when no session log was written. `codex`, `opencode`, `pi` and `prime-agent`
-have text drivers; `claude_code` fails at `resolve` with `runtime_rejected`
-until its driver lands. `codex` serves `gpt-6-luna` at `low`, `medium` or `high`
+when no session log was written. `codex`, `claude_code`, `opencode`, `pi` and
+`prime-agent` have text drivers. `codex` serves `gpt-6-luna` at `low`, `medium` or `high`
 effort; another model or effort fails at `resolve` with `runtime_rejected`, and
 a runner image that is not available locally with `runtime_unavailable`.
 
@@ -617,6 +616,21 @@ other than `stop`) or oversized answer. `harness_version` is the guest's
 `--version` output and `served_model` is the provider's `responseModel`, or
 `null`.
 
+For `claude_code`, the final text limit is at most 32 KiB. Empty, oversized, incomplete or
+tool-bearing Claude answers fail with `runtime_protocol_error` at `turn`;
+answers are never padded or truncated.
+
+Claude uses the existing vault subscription OAuth store (`claude` auth), a
+private libkrun guest with no host workspace shares, and provider egress only
+to `api.anthropic.com`. Built-in tools, MCP servers, hooks and skills are
+disabled. Any native tool event or nonempty `permission_denials` fails the turn.
+The adapter's conservative internal model catalog accepts `claude-opus-4-8`,
+`claude-opus-4-7`, `claude-opus-4-6` and `claude-sonnet-4-6`, with `low`,
+`medium` or `high` effort. Aliases and other selections are rejected at
+`resolve` before reading credentials. The observed version comes from native
+`system/init`; `served_model` comes from assistant API-message metadata, or is
+null when absent. The init-selected model is never substituted for it.
+
 A completed record, and a failed one whose turn already spent tokens, carries
 `usage` when the harness reported any:
 
@@ -649,8 +663,8 @@ nothing valid remains, `usage` is absent.
 
 Codex's newest `total` for the invocation's thread and turn is the turn's usage,
 because a text invocation runs one turn on a fresh thread. The claude_code
-column is what the Claude harness writes as `turn_usage` in its `usage` session
-event, ready for when it gets a text driver. OpenCode's latest
+column is parsed by `execution/usage.rs` from the terminal `result`, including
+a result subsequently rejected for policy or output limits. OpenCode's latest
 `session.usage.updated` is the session total, and the session is fresh, so it
 is the turn's usage; without one, the `session.step.ended`/`.failed` figures are
 summed. Pillbox sets the session title so OpenCode makes no separate

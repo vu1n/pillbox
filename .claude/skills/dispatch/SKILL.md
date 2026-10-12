@@ -93,18 +93,36 @@ Rules (from the contract):
   `gate_cmd`. Unknown keys are a parse error.
 - **Relative paths resolve against the spec file's directory** — keep prompt/rubric
   files next to the spec.
-- **Gates are self-contained** — they run against the worker's live workspace as-is.
-  Write each gate to test only what *this* segment produced (`pytest -k <segment>`,
-  not the whole suite), so a checkpoint fails for the right reason.
+- **Gates run on a protected copy, in the grader microVM** — the worker's workspace
+  with tests, test config, CI and rubrics reset to the bookmark (docs/dispatch.md,
+  Grading). A test the worker writes under `tests/` is removed first, so check
+  tests that exist on the bookmark or come from `--grader-files DIR` (run as
+  `.pillbox-grader/…`). Write each gate to test only what *this* segment produced,
+  so a checkpoint fails for the right reason.
+- **The grader VM is the runner image** — no Rust toolchain, no pytest. A missing
+  tool makes the worker `errored`, not `failed`; layer the toolchain into an image
+  built `FROM` the runner and set `PILLBOX_RUNNER_IMAGE`.
 - Segments are **ordered and cumulative** — segment N may rely on N-1's output. Order
   them so each gate is checkable the moment that segment finishes.
 
 ## Sensible defaults
 
 - **`-k 3`** for short horizons (k=3–5 saturates; diversity gains flatten beyond).
-  `-k 1` (the default) = pure segmentation with no diversity.
+  `-k 1` = pure segmentation with no diversity. Pass it explicitly: the CLI default is `-k 3`.
 - **`--retries 1`** (the default) — one distilled retry per failing gate. Raise only
-  for flaky/hard checkpoints; it costs a full re-drive each.
+  for flaky/hard checkpoints; it costs a full re-drive each. With a `--rubric`
+  grade, `--stall-limit 2` (the default) stops a worker after two retries in a row
+  that don't raise its score, so a raised budget isn't spent on a worker going in
+  circles. A `stalled: true` worker is a signal to re-plan or escalate, not to retry.
+- **`--baseline-check`** whenever you wrote the reward yourself — it grades the
+  untouched bookmark first and refuses (exit 2) a reward that already passes there,
+  which would otherwise pick a worker that did nothing.
+- **`--restate-task`** when retries or later segments drift off the task — off by
+  default, a retry carries only the failure summary and only segment 1 sees the
+  positional task; on, each of those turns repeats it verbatim in an
+  `<original-task>` block (the tag gains `-N` if the task already contains that
+  markup). It only changes prompts for server agents (`opencode`, `codex-serve`);
+  agents with no server profile never take a retry turn.
 - **`--temperature 0.7`** whenever `-k > 1` — without it the forks are degenerate.
 - **Reward is always required** — give exactly one of `--cmd` / `--rubric` (a missing
   or doubled grader is a usage error, exit 2).

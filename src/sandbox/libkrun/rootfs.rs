@@ -404,6 +404,7 @@ mod tests {
         let b_owner = b.root.parent().unwrap().to_path_buf();
         let run = move |mut root: PrivateRootfs, script: &str, spec_path: PathBuf| {
             let spec = super::super::VmSpec {
+                offline: false,
                 rootfs: root.to_string_lossy().into_owned(),
                 vcpus: 1,
                 ram_mib: 512,

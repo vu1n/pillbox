@@ -7,7 +7,7 @@
 #   - amp     (npm: @ampcode/cli)
 #   - opencode (npm: @opencode/cli)
 #   - pi      (npm: @earendil-works/pi-coding-agent)
-#   - prime-agent (Prime Intellect native release → /usr/local/bin/prime-agent)
+#   - prime-agent (Prime Intellect native release → /opt/prime-agent, /usr/local/bin/prime-agent)
 #   - cursor  (Cursor Agent CLI lab tarball → /usr/local/bin/agent)
 #
 # System tooling chosen to cover the agents' subagent + shell needs:
@@ -173,15 +173,21 @@ RUN curl -fsSL https://claude.ai/install.sh -o /tmp/claude-install.sh \
 	#   resolved binary into /usr/local/bin, so drop the scratch dir —
 	#   otherwise it rides along dead in the layer.
 
-# Prime Agent: keep the complete native release and its assets outside HOME.
-# Python kernel provisioning remains explicit; the CLI is available as a tool,
-# not yet as a Pillbox auth/session harness adapter.
+# Prime Agent: keep the complete native release and its assets outside HOME, under
+# /opt/prime-agent (launcher in bin/, payload in share/). The installer is now the
+# Rust build's: it takes the pin from PRIME_AGENT_VERSION (a positional version is
+# rejected) and still verifies the release manifest and SHA256SUMS. Its Python
+# kernel pre-warm lands in the scratch HOME, which is dropped; a session that needs
+# the kernel (the Python REPL tool) bootstraps it, while tool-free runs never do.
+# The launcher resolves its payload from its own path, so /usr/local/bin gets a
+# wrapper, not a symlink.
 RUN curl --proto '=https' --proto-redir '=https' -fsSL https://app.primeintellect.ai/prime-agent/install.sh -o /tmp/prime-agent-install.sh \
-	&& PRIME_AGENT_INSTALL_METHOD=binary PRIME_AGENT_INSTALLER_NONINTERACTIVE=1 \
-		PRIME_AGENT_BOOTSTRAP_KERNEL_ON_INSTALL=0 PRIME_AGENT_INSTALL_DIR=/opt/prime-agent \
-		PRIME_AGENT_BIN_DIR=/usr/local/bin sh /tmp/prime-agent-install.sh "${PRIME_AGENT_VERSION}" \
+	&& HOME=/opt/prime-agent-install PRIME_AGENT_VERSION=${PRIME_AGENT_VERSION} \
+		PRIME_AGENT_RUST_PREFIX=/opt/prime-agent sh /tmp/prime-agent-install.sh </dev/null \
+	&& printf '#!/bin/sh\nexec /opt/prime-agent/bin/prime-agent "$@"\n' > /usr/local/bin/prime-agent \
+	&& chmod 0755 /usr/local/bin/prime-agent \
 	&& test "$(prime-agent --version)" = "${PRIME_AGENT_VERSION}" \
-	&& rm /tmp/prime-agent-install.sh
+	&& rm -rf /tmp/prime-agent-install.sh /opt/prime-agent-install
 
 # Cursor Agent CLI: versioned lab tarball (same URL the install script uses).
 # Pin CURSOR_AGENT_VERSION and bump by hand when upgrading — Renovate cannot

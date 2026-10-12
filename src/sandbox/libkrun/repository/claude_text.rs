@@ -48,26 +48,13 @@ pub(crate) fn launch(
         true,
         |owner, rpc, remaining| spec(&rootfs, &ca_dir, owner, rpc, &input, remaining),
     )?;
-    let delivery = (|| -> Result<()> {
-        let swaps = vec![SwapPair {
-            stub: input.credentials.stub,
-            real: input.credentials.real,
-            hosts: vec![PROVIDER_HOST.into()],
-        }];
-        let bytes = serde_json::to_vec(&swaps)?;
-        let mut stdin = vm
-            .process
-            .child
-            .stdin
-            .take()
-            .context("VMM credential channel missing")?;
-        nonblocking(stdin.as_raw_fd())?;
-        write_until(&mut stdin, &bytes, deadline, cancelled)?;
-        Ok(())
-    })();
-    if let Err(error) = delivery {
-        return Err(cleanup_failure(error, vm.stop_and_reap()));
-    }
+    // Context: doc://pillbox/libkrun-env-fork-substrate@0002#libkrun-env-fork-substrate — the guest holds the stub; the real token reaches only the VMM child, bound to the provider host.
+    let swaps = [SwapPair {
+        stub: input.credentials.stub,
+        real: input.credentials.real,
+        hosts: vec![PROVIDER_HOST.into()],
+    }];
+    deliver_swaps(&mut vm, &swaps, deadline, cancelled)?;
     stage("vmm_spawn");
     Ok(vm)
 }
@@ -82,6 +69,7 @@ fn spec(
     remaining: u64,
 ) -> VmSpec {
     VmSpec {
+        offline: false,
         rootfs: rootfs.to_string_lossy().into_owned(),
         vcpus: 2,
         ram_mib: 2048,
@@ -108,10 +96,7 @@ fn spec(
                 access_stub: input.credentials.stub.clone(),
             }),
         }),
-        ownership: Some(OwnershipSpec {
-            socket: owner.to_string_lossy().into_owned(),
-            remaining_ms: Some(remaining),
-        }),
+        ownership: Some(OwnershipSpec::bounded(owner, remaining)),
     }
 }
 

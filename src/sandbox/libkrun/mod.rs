@@ -52,6 +52,7 @@ pub(crate) mod repository;
 mod rootfs;
 mod rootfs_backing;
 mod session;
+pub(crate) mod text_harness;
 mod vault;
 
 // The control verbs (attach/teardown/§0 accessors) are driven through the
@@ -140,6 +141,10 @@ struct VmSpec {
     /// One-shot VMMs retain owner liveness; bounded invocations also have a deadline.
     #[serde(default)]
     ownership: Option<repository::OwnershipSpec>,
+    /// No network: disable libkrun's implicit TSI, which it otherwise turns on
+    /// whenever no virtio-net device is attached. Set for an offline grader.
+    #[serde(default)]
+    offline: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -349,10 +354,11 @@ pub(crate) fn vmm_child_main() -> ! {
         }
         let ctx = ctx as u32;
         let mut rc = ffi::krun_set_vm_config(ctx, spec.vcpus, spec.ram_mib);
-        if spec
-            .ownership
-            .as_ref()
-            .is_some_and(repository::OwnershipSpec::is_bounded)
+        if spec.offline
+            || spec
+                .ownership
+                .as_ref()
+                .is_some_and(repository::OwnershipSpec::is_bounded)
         {
             // Omitting virtio-net otherwise enables implicit TSI in libkrun.
             rc = rc.min(ffi::krun_disable_implicit_vsock(ctx));
@@ -565,16 +571,7 @@ fn cow_clone_and_scrub(src: &Path) -> Result<PathBuf> {
              (filesystem has no reflink support)"
         );
     }
-    // Reuse the canonical walker + denylist; delete what it flags as secret.
-    let plan = crate::workspace::ingest::plan_ingest(&clone)?;
-    for rel in &plan.excluded_secrets {
-        let p = clone.join(rel);
-        let _ = if p.is_dir() {
-            std::fs::remove_dir_all(&p)
-        } else {
-            std::fs::remove_file(&p)
-        };
-    }
+    crate::workspace::ingest::scrub_secrets(&clone)?;
     metadata::prepare_guest_clone_metadata(&clone)?;
     Ok(clone)
 }
@@ -931,7 +928,7 @@ fn find_cached_rootfs(root: &Path, image: &str) -> Option<PathBuf> {
     best.map(|(cache, _)| cache)
 }
 
-fn docker_image_id(image: &str) -> Result<String> {
+pub(crate) fn docker_image_id(image: &str) -> Result<String> {
     let out = Command::new("docker")
         .arg("image")
         .arg("inspect")

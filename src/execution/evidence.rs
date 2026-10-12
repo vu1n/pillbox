@@ -278,6 +278,17 @@ impl ExecutionEvidence {
 
     /// Called once with the complete observed exchange, including on native failure.
     pub(crate) fn native_frames(&mut self, frames: &[Value]) -> Result<ArtifactRef> {
+        self.native_frames_for(frames, None)
+    }
+
+    /// [`Self::native_frames`] for a run whose `profile` is known. The §0 projection
+    /// then correlates against it, so a profile that observes the CLI version still
+    /// projects a Codex version outside the embedded catalog releases.
+    pub(crate) fn native_frames_for(
+        &mut self,
+        frames: &[Value],
+        profile: Option<&protocol::CodexProfile>,
+    ) -> Result<ArtifactRef> {
         ensure!(
             !self.native_written,
             "native execution evidence was already recorded"
@@ -315,7 +326,7 @@ impl ExecutionEvidence {
             bytes: artifact.bytes,
             worker_id: String::new(),
         }))?;
-        if let Some((thread_id, turn_id)) = native_identity(frames) {
+        if let Some((thread_id, turn_id)) = native_identity(frames, profile) {
             // The evidence projection keeps its original per-response usage.
             let mut mapper = CodexServeMapper::with_accounting(UsageAccounting::LastResponse);
             for (index, envelope) in frames.iter().enumerate() {
@@ -394,7 +405,10 @@ fn unique_message<'a>(
     matching.next().is_none().then_some(first)
 }
 
-fn native_identity(frames: &[Value]) -> Option<(String, String)> {
+fn native_identity(
+    frames: &[Value],
+    expected: Option<&protocol::CodexProfile>,
+) -> Option<(String, String)> {
     let thread_request = unique_message(frames, "outbound", |msg| msg["method"] == "thread/start")?;
     protocol::unsupported_server_request(thread_request.get("id")?).ok()?;
     let thread_response = unique_message(frames, "inbound", |msg| {
@@ -408,12 +422,20 @@ fn native_identity(frames: &[Value]) -> Option<(String, String)> {
         msg.get("method").is_none() && msg.get("error").is_none() && msg["id"] == turn_request["id"]
     })?;
     let params = &turn_request["params"];
-    let profile = protocol::CodexProfile::new_for_version(
-        thread_response["result"]["thread"]["cliVersion"].as_str()?,
-        params["model"].as_str()?,
-        params["effort"].as_str()?,
-    )
-    .ok()?;
+    let profile = match expected {
+        Some(profile)
+            if params["model"] == profile.model() && params["effort"] == profile.effort() =>
+        {
+            profile.clone()
+        }
+        Some(_) => return None,
+        None => protocol::CodexProfile::new_for_version(
+            thread_response["result"]["thread"]["cliVersion"].as_str()?,
+            params["model"].as_str()?,
+            params["effort"].as_str()?,
+        )
+        .ok()?,
+    };
     if thread_request["params"]["model"] != profile.model() {
         return None;
     }
@@ -821,15 +843,29 @@ mod tests {
             json!(protocol::GPT6_CODEX_VERSION);
         frames[2]["message"]["params"]["model"] = json!("gpt-6-sol");
         assert_eq!(
-            native_identity(&frames),
+            native_identity(&frames, None),
             Some(("native-thread".into(), "native-turn".into()))
         );
         frames[1]["message"]["result"]["thread"]["cliVersion"] = json!(protocol::CODEX_VERSION);
-        assert!(native_identity(&frames).is_none());
+        assert!(native_identity(&frames, None).is_none());
         frames[1]["message"]["result"]["thread"]["cliVersion"] =
             json!(protocol::GPT6_CODEX_VERSION);
         frames[0]["message"]["params"]["model"] = json!("gpt-5.6-sol");
-        assert!(native_identity(&frames).is_none());
+        assert!(native_identity(&frames, None).is_none());
+    }
+
+    #[test]
+    fn native_identity_follows_an_observing_profile_to_an_unlisted_cli_version() {
+        let mut frames = exchange();
+        frames[1]["message"]["result"]["thread"]["cliVersion"] = json!("9.9.9");
+        let profile = |effort| protocol::CodexProfile::new("gpt-5.6-sol", effort).unwrap();
+        let identity = Some(("native-thread".into(), "native-turn".into()));
+        assert!(native_identity(&frames, None).is_none());
+        assert!(native_identity(&frames, Some(&profile("high"))).is_none());
+        let observing = profile("high").observing_cli_version();
+        assert_eq!(native_identity(&frames, Some(&observing)), identity);
+        let other_effort = profile("low").observing_cli_version();
+        assert!(native_identity(&frames, Some(&other_effort)).is_none());
     }
 
     #[test]

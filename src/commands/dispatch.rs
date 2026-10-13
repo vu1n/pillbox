@@ -40,6 +40,7 @@ use crate::commands::critic::{
     edits_from_log, render_state, Critic, CriticPolicy, CriticVerdict, EditRecord, TypesafeCritic,
 };
 use crate::contract::{Actor, Artifact, ArtifactClass, Criterion, Event, Payload, Scored};
+use crate::cost::ObservedUsage;
 use crate::errors::PillboxError;
 use crate::events::blob::BlobStore;
 use crate::events::log::SessionLog;
@@ -248,6 +249,10 @@ pub(crate) struct SegmentOutcome {
 /// One worker's outcome — its session, final-attempt score, and how it
 /// ended. Carried in input (fork) order in [`DispatchVerdict::workers`].
 pub(crate) struct WorkerOutcome {
+    /// Recorded worker usage at verdict finalization, across all its turns.
+    /// Independent of the grade and of critic accounting; live workers may
+    /// continue consuming tokens after this snapshot.
+    pub(crate) usage: Option<ObservedUsage>,
     /// The worker's session id.
     pub(crate) session: String,
     /// Normalized score in `[0,1]` of this worker's LAST graded attempt (not the
@@ -292,9 +297,9 @@ impl WorkerOutcome {
             "passed": self.status.passed(),
             "retries_used": self.retries_used,
             "status": self.status,
+            "usage": self.usage,
         });
-        // Additive: only present for a `--segments` worker, so fork-`k` output is
-        // byte-identical to before.
+        // Only present for a `--segments` worker.
         if !self.segments.is_empty() {
             v["segments"] = serde_json::to_value(&self.segments).unwrap_or_else(|_| json!([]));
         }
@@ -463,6 +468,8 @@ trait WorkerDriver {
     /// Grade the untouched `--from-bookmark` base (no worker, no session) —
     /// what `--baseline-check` compares the reward and gates against.
     fn grade_baseline(&self, grader: &Grader) -> Result<Scored>;
+    /// Snapshot the worker's normalized session usage, including failed turns.
+    fn usage(&self, id: &str) -> Result<Option<ObservedUsage>>;
 }
 
 /// The critic, threaded through the drive paths as one handle. `None` = no
@@ -888,6 +895,7 @@ struct WorkerSummary {
     passed: bool,
     score: Option<f64>,
     retries_used: u32,
+    usage: Option<ObservedUsage>,
     /// The segment prompt this worker was driven with (turn 1).
     prompt: String,
     /// Whether this worker was the selected winner.
@@ -947,6 +955,7 @@ impl WorkerSummary {
             passed: o.status.passed(),
             score: o.score,
             retries_used: o.retries_used,
+            usage: o.usage.clone(),
             prompt: prompt.to_string(),
             winner,
             selection_rationale: winner.then(|| rationale.map(str::to_string)).flatten(),
@@ -1143,7 +1152,7 @@ fn run_dispatch_with(
             (i, driver.fork(i, fork_first_turn))
         })
         .collect();
-    let workers: Vec<WorkerOutcome> = match (ctx.as_ref(), policy, segments) {
+    let mut workers: Vec<WorkerOutcome> = match (ctx.as_ref(), policy, segments) {
         // The critic reorders/prunes grading: every worker must be idle BEFORE the
         // first grade, so the drive is two-phase (settle all → grade in p order).
         (Some(cx), CriticPolicy::Order | CriticPolicy::Select, None) => {
@@ -1203,6 +1212,19 @@ fn run_dispatch_with(
         }
         None => (None, None, None),
     };
+    // Observability happens after selection and pull. A read failure must not
+    // change a worker's grade, retry behavior, or the selected winner.
+    for worker in &mut workers {
+        if !worker.session.is_empty() {
+            worker.usage = driver.usage(&worker.session).unwrap_or_else(|e| {
+                eprintln!(
+                    "pillbox: note: worker usage unavailable for `{}`: {e:#}",
+                    worker.session
+                );
+                None
+            });
+        }
+    }
     DispatchVerdict {
         winner,
         workers,
@@ -1320,6 +1342,7 @@ fn outcome_from_grade(
     critic: Option<CriticVerdict>,
 ) -> WorkerOutcome {
     WorkerOutcome {
+        usage: None,
         session: id.to_string(),
         score: Some(grade.score),
         retries_used: rounds.used(),
@@ -1335,6 +1358,7 @@ fn outcome_from_grade(
 /// A worker the critic policy left ungraded — no score, no grade, just `p`.
 fn unverified(id: String, critic: Option<CriticVerdict>) -> WorkerOutcome {
     WorkerOutcome {
+        usage: None,
         session: id,
         score: None,
         retries_used: 0,
@@ -1350,6 +1374,7 @@ fn unverified(id: String, critic: Option<CriticVerdict>) -> WorkerOutcome {
 /// The outcome for a fork that never produced a session.
 fn fork_failed() -> WorkerOutcome {
     WorkerOutcome {
+        usage: None,
         session: String::new(),
         score: None,
         retries_used: 0,
@@ -1402,6 +1427,7 @@ fn drive_one_with(
 fn errored(id: String, e: anyhow::Error) -> WorkerOutcome {
     eprintln!("pillbox: worker `{id}` errored: {e:#}");
     WorkerOutcome {
+        usage: None,
         session: id,
         score: None,
         retries_used: 0,
@@ -1561,6 +1587,7 @@ fn drive_segments_inner(
     let retries_used = seg_outcomes.iter().map(|s| s.retries_used).sum();
     let stalled = seg_outcomes.iter().any(|s| s.stalled);
     Ok(WorkerOutcome {
+        usage: None,
         session: id.to_string(),
         score: Some(final_grade.score),
         retries_used,
@@ -1890,6 +1917,11 @@ impl WorkerDriver for CliDriver<'_> {
             "tool_call".into(),
         ])?;
         Ok(edits_from_log(&out))
+    }
+
+    fn usage(&self, id: &str) -> Result<Option<ObservedUsage>> {
+        let events = crate::events::log::read_log(self.resolved, id)?;
+        Ok(ObservedUsage::from_events(&events))
     }
 
     fn grade_baseline(&self, grader: &Grader) -> Result<Scored> {
@@ -2350,6 +2382,7 @@ mod tests {
         status: WorkerStatus,
     ) -> WorkerOutcome {
         WorkerOutcome {
+            usage: None,
             session: session.into(),
             score,
             retries_used: retries,
@@ -2516,6 +2549,10 @@ mod tests {
         rubric: bool,
         /// Scripted `grade_baseline` verdicts, in call order.
         baseline: RefCell<std::collections::VecDeque<Scored>>,
+        usage_events: RefCell<std::collections::HashMap<String, Vec<Event>>>,
+        usage_reads: RefCell<Vec<String>>,
+        usage_errs: std::collections::HashSet<String>,
+        record_usage: bool,
     }
 
     impl MockDriver {
@@ -2537,6 +2574,10 @@ mod tests {
                 first_turn_on_fork: false,
                 rubric: false,
                 baseline: RefCell::new(std::collections::VecDeque::new()),
+                usage_events: RefCell::new(std::collections::HashMap::new()),
+                usage_reads: RefCell::new(vec![]),
+                usage_errs: std::collections::HashSet::new(),
+                record_usage: false,
             }
         }
         fn rubric(mut self) -> Self {
@@ -2586,9 +2627,14 @@ mod tests {
             };
             Ok(scored(passed, score, criteria, ""))
         }
-        fn send(&self, _id: &str, prompt: &str) -> Result<()> {
+        fn send(&self, id: &str, prompt: &str) -> Result<()> {
             *self.sends.borrow_mut() += 1;
             self.sent.borrow_mut().push(prompt.to_string());
+            if self.record_usage {
+                let mut logs = self.usage_events.borrow_mut();
+                let events = logs.entry(id.into()).or_default();
+                events.push(usage_event(id, &format!("turn-{}", events.len()), 10));
+            }
             Ok(())
         }
         fn pull_winner(&self, id: &str) -> Result<PathBuf> {
@@ -2605,6 +2651,19 @@ mod tests {
                 new: format!("// {id}"),
             }])
         }
+        fn usage(&self, id: &str) -> Result<Option<ObservedUsage>> {
+            self.usage_reads.borrow_mut().push(id.into());
+            if self.usage_errs.contains(id) {
+                bail!("mock: log unreadable");
+            }
+            Ok(ObservedUsage::from_events(
+                self.usage_events
+                    .borrow()
+                    .get(id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+            ))
+        }
         fn grade_baseline(&self, _grader: &Grader) -> Result<Scored> {
             Ok(self
                 .baseline
@@ -2612,6 +2671,118 @@ mod tests {
                 .pop_front()
                 .expect("baseline grade over budget"))
         }
+    }
+
+    fn usage_event(id: &str, message: &str, input: u64) -> Event {
+        Event::session(
+            id,
+            Payload::Usage(crate::contract::Usage {
+                message_id: message.into(),
+                input_tokens: Some(input),
+                output_tokens: Some(0),
+                cache_read_input_tokens: Some(0),
+                cache_creation_input_tokens: Some(0),
+                cost_usd: None,
+                source: crate::contract::UsageSource::Native,
+            }),
+        )
+    }
+
+    #[test]
+    fn usage_is_snapshotted_once_after_all_retries_and_segments() {
+        for segmented in [false, true] {
+            let script = if segmented {
+                vec![(false, 0.0), (true, 1.0), (true, 1.0), (true, 1.0)]
+            } else {
+                vec![(false, 0.0), (true, 1.0)]
+            };
+            let mut d = MockDriver::new(vec![("w0", script)]);
+            d.record_usage = true;
+            let segments = two_segments();
+            let verdict = run_dispatch(
+                &d,
+                1,
+                "task",
+                1,
+                &reward(),
+                segmented.then_some(segments.as_slice()),
+            );
+            assert_eq!(verdict.winner.as_deref(), Some("w0"));
+            assert_eq!(verdict.workers[0].retries_used, 1);
+            assert_eq!(
+                verdict.workers[0].usage.as_ref().unwrap().input_tokens,
+                Some(if segmented { 30 } else { 20 })
+            );
+            assert_eq!(*d.usage_reads.borrow(), vec!["w0"]);
+        }
+    }
+
+    #[test]
+    fn failed_errored_and_unverified_workers_retain_usage() {
+        let mut d = MockDriver::new(vec![
+            ("failed", vec![(false, 0.0)]),
+            ("errored", vec![]),
+            ("winner", vec![(true, 1.0)]),
+            ("unverified", vec![]),
+        ])
+        .failing_grade("errored");
+        d.record_usage = true;
+        let c = MockCritic::new(&[
+            ("failed", 0.9),
+            ("errored", 0.8),
+            ("winner", 0.7),
+            ("unverified", 0.6),
+        ]);
+        let v = run_dispatch_with(
+            &d,
+            4,
+            "task",
+            RetryPolicy::new(0),
+            &reward(),
+            None,
+            Some(&c),
+            CriticPolicy::Order,
+        );
+        assert_eq!(v.winner.as_deref(), Some("winner"));
+        assert_eq!(
+            v.workers.iter().map(|w| w.status).collect::<Vec<_>>(),
+            vec![
+                WorkerStatus::Failed,
+                WorkerStatus::Errored,
+                WorkerStatus::Scored,
+                WorkerStatus::Unverified
+            ]
+        );
+        for w in &v.workers {
+            assert_eq!(w.usage.as_ref().unwrap().input_tokens, Some(10));
+            let summary = WorkerSummary::build(w, "task", false, None);
+            assert_eq!(
+                serde_json::to_value(summary).unwrap()["usage"],
+                w.to_json_value()["usage"]
+            );
+        }
+        assert_eq!(
+            *d.usage_reads.borrow(),
+            vec!["failed", "errored", "winner", "unverified"]
+        );
+    }
+
+    #[test]
+    fn usage_read_failure_leaves_selection_and_retry_behavior_unchanged() {
+        let mut d = MockDriver::new(vec![("w0", vec![(false, 0.0), (true, 1.0)])]);
+        d.usage_errs.insert("w0".into());
+        let v = run_dispatch(&d, 1, "task", 1, &reward(), None);
+        assert_eq!(v.winner.as_deref(), Some("w0"));
+        assert_eq!(v.pulled_to, Some(PathBuf::from("/tmp/winner-w0")));
+        assert_eq!(v.workers[0].status, WorkerStatus::Scored);
+        assert_eq!(v.workers[0].score, Some(1.0));
+        assert_eq!(v.workers[0].retries_used, 1);
+        assert_eq!(*d.sends.borrow(), 2);
+        assert_eq!(*d.pulls.borrow(), vec!["w0"]);
+        assert_eq!(
+            v.workers[0].to_json_value()["usage"],
+            serde_json::Value::Null
+        );
     }
 
     // ── the critic policies (`--critic`) ──
@@ -3585,9 +3756,24 @@ mod tests {
         assert_eq!(w0["passed"], true);
         assert_eq!(w0["retries_used"], 0);
         assert_eq!(w0["status"], "scored");
-        // fork-`k` worker → `segments` is omitted (additive field), so existing
-        // consumers see byte-identical output.
+        // fork-`k` workers omit segment evidence, but expose unknown usage.
         assert!(w0.get("segments").is_none());
+        assert_eq!(w0["usage"], serde_json::Value::Null);
+        assert_eq!(
+            w0.as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec![
+                "passed",
+                "retries_used",
+                "score",
+                "session",
+                "status",
+                "usage"
+            ]
+        );
     }
 
     #[test]
@@ -3678,6 +3864,22 @@ mod tests {
             crate::session::write(&pb, &s).unwrap();
 
             let mut w = outcome(&s.id, Some(1.0), 1, WorkerStatus::Scored);
+            let mut log = SessionLog::open(&pb, &s.id).unwrap();
+            log.append(&[
+                usage_event(&s.id, "turn-1", 10),
+                usage_event(&s.id, "retry-1", 20),
+            ])
+            .unwrap();
+            let opts = opts_for_resolve(None, None, None, None);
+            let driver = CliDriver::with_exe(
+                PathBuf::from("unused"),
+                &pb,
+                &opts,
+                "opencode".into(),
+                ProtectSet::new(true, &[]).unwrap(),
+            );
+            w.usage = driver.usage(&s.id).unwrap();
+            assert_eq!(w.usage.as_ref().unwrap().input_tokens, Some(30));
             w.grade = Some(scored(
                 true,
                 1.0,
@@ -3694,6 +3896,9 @@ mod tests {
             };
 
             record_worker_summaries(&pb, &verdict, "implement add()");
+            // A live worker may append later; the artifact keeps its finalized snapshot.
+            log.append(&[usage_event(&s.id, "later-turn", 40)]).unwrap();
+            assert_eq!(driver.usage(&s.id).unwrap().unwrap().input_tokens, Some(70));
 
             // The worker's §0 log now carries one dispatch.worker_summary artifact...
             let events = crate::events::log::SessionLog::open(&pb, &s.id)
@@ -3724,6 +3929,34 @@ mod tests {
             );
             assert_eq!(parsed["prompt"], "implement add()");
             assert_eq!(parsed["criteria"][0]["name"], "tests");
+            assert_eq!(
+                parsed["usage"],
+                json!({"input_tokens":30,"output_tokens":0,
+                "cache_read_input_tokens":0,"cache_creation_input_tokens":0})
+            );
+            assert_eq!(parsed["usage"], verdict.workers[0].to_json_value()["usage"]);
+        });
+    }
+
+    #[test]
+    fn cli_usage_read_failure_and_absent_log_are_distinct() {
+        crate::test_util::with_isolated_home("dispatch-usage-read", || {
+            let pb = crate::pillbox::global();
+            let s = crate::session::Session::test_fixture();
+            crate::session::write(&pb, &s).unwrap();
+            let opts = opts_for_resolve(None, None, None, None);
+            let driver = CliDriver::with_exe(
+                PathBuf::from("unused"),
+                &pb,
+                &opts,
+                "opencode".into(),
+                ProtectSet::new(true, &[]).unwrap(),
+            );
+            assert_eq!(driver.usage(&s.id).unwrap(), None);
+            // Opening a directory as a JSONL file reliably fails even for root.
+            std::fs::create_dir_all(crate::session::session_dir_path(&pb, &s.id).join("log.jsonl"))
+                .unwrap();
+            assert!(driver.usage(&s.id).is_err());
         });
     }
 

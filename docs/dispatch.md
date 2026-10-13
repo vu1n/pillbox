@@ -296,6 +296,12 @@ pillbox's `--json` surface.
         "passed": true,          // did the grade pass (--cmd exit 0, or all rubric criteria)
         "retries_used": 0,       // retries this worker consumed (sum across segments in --segments mode)
         "status": "scored",      // "scored" | "failed" | "errored" | "unverified" (see below)
+        "usage": {               // recorded worker usage snapshot; null when unavailable
+          "input_tokens": 1200,
+          "output_tokens": 300,
+          "cache_read_input_tokens": 800,
+          "cache_creation_input_tokens": null
+        },
         // ADDITIVE — present ONLY when the --stall-limit breaker ended this
         // worker's retries early (in any segment). Independent of `status`:
         // fork-k → always "failed"; --segments → the chain continues past a
@@ -313,8 +319,8 @@ pillbox's `--json` surface.
                     "latency_ms": 180, "cost_usd": 0.00004, "input_tokens": 950,
                     "truncated": false, "n_edits": 2 }
       },
-      { "session": "def456...", "score": 0.5, "passed": false, "retries_used": 1, "status": "failed" },
-      { "session": "ghi789...", "score": null, "passed": false, "retries_used": 0, "status": "errored" }
+      { "session": "def456...", "score": 0.5, "passed": false, "retries_used": 1, "status": "failed", "usage": null },
+      { "session": "ghi789...", "score": null, "passed": false, "retries_used": 0, "status": "errored", "usage": null }
     ],
     // Host directory the winner's result workspace was pulled to (a durable temp
     // staging dir, `$TMPDIR/pillbox-dispatch-<run>/winner-<id>`), or null when
@@ -352,6 +358,47 @@ timeout, becomes `errored` — one stuck/broken worker never sinks the batch (th
 others are still driven and selected). The per-turn idle timeout defaults to
 30 min; override with `PILLBOX_DISPATCH_TURN_TIMEOUT=<seconds>`.
 
+### Recorded worker token usage
+
+Every worker row and `dispatch.worker_summary` body has `usage`: either `null`
+(no normalized usage events, no session, or an unreadable log), or an object
+with the four nullable counters shown above. Dispatch reads each worker's own
+session log **once at verdict finalization**, after selection and pull, and
+copies that snapshot into its artifact. All recorded turns, retries, and segments
+contribute regardless of `status`, including `errored` and `unverified` workers.
+Log-read/write failures warn without changing grades, retries, selection, or exit
+status. Critic `input_tokens` remains critic-only and is excluded from worker usage.
+
+The fold shares `session cost`'s message identity and native-over-wire preference:
+one observation per `message_id`, highest-ranked source wins, and equal-ranked
+redeliveries keep the first. It sums normalized additive `Usage` events; it
+doesn't sum raw cumulative session snapshots, legacy cost envelopes, or multiply
+by retry counts. It never fills missing native fields from wire observations.
+Each counter is a total only when **every selected observation reports that
+field** and checked addition fits `u64`; otherwise that counter is `null`, even
+if some events report a subtotal. Explicit reported zero stays `0`. Cache
+counters stay separate from normalized non-cached input and output.
+
+These are **recorded observations**, not a claim of complete provider billing.
+Unreported calls, skipped malformed log records, or producer lag cannot be
+reconstructed. Workers may remain live and spend more after the snapshot;
+dispatch doesn't stop them or wait for additional usage solely for accounting.
+The legacy `session cost --json` schema and its zero-default behavior stay unchanged.
+
+For fork-`k` and cross-model H5 validation, retain worker agent/model assignments,
+the verdict, and the worker logs with each run. At partial and full budget
+checkpoints, plot reward against cumulative **all-worker** tokens, including
+losers and errors, using all four counters when the intended x-axis includes
+cache tokens. Treat any required `null` as an unknown x-coordinate rather than
+zero. These verdicts provide the finalization checkpoint; earlier checkpoints
+require folding normalized event prefixes from the retained logs with the same
+deduplication rule. When reading multiple snapshots of one session, use the
+latest cumulative snapshot at the checkpoint; don't sum those snapshots. Sum
+across independent worker sessions instead. Keep critic/grader spend separate,
+record how token budgets/checkpoints were imposed externally, and report
+observation gaps with the comparison. This instrumentation doesn't impose a
+token budget or run the benchmark.
+
 ## Worker evidence (the `dispatch.worker_summary` artifact)
 
 The `--json` verdict is the *summary*; the durable, mineable evidence is a §0
@@ -378,6 +425,8 @@ The body schema:
   "passed": true,
   "score": 1.0,
   "retries_used": 1,
+  "usage": { "input_tokens": 1200, "output_tokens": 300,
+             "cache_read_input_tokens": 800, "cache_creation_input_tokens": null },
   "prompt": "<the segment prompt this worker was driven with>",
   "winner": true,
   "selection_rationale": "only passing worker (score 1.00)",  // winner only

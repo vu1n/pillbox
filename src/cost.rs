@@ -4,6 +4,54 @@ use serde::{Deserialize, Serialize};
 
 use crate::contract::{Event, Payload, Usage, UsageSource};
 
+/// Snapshot of normalized usage observations, rather than a billing envelope.
+/// A counter is unknown if any selected observation omits it or its sum overflows.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct ObservedUsage {
+    pub(crate) input_tokens: Option<u64>,
+    pub(crate) output_tokens: Option<u64>,
+    pub(crate) cache_read_input_tokens: Option<u64>,
+    pub(crate) cache_creation_input_tokens: Option<u64>,
+}
+
+impl ObservedUsage {
+    pub(crate) fn from_events(events: &[Event]) -> Option<Self> {
+        let usages = usage_by_message(events);
+        if usages.is_empty() {
+            return None;
+        }
+        let sum = |counter: fn(&Usage) -> Option<u64>| {
+            usages
+                .values()
+                .try_fold(0u64, |total, usage| total.checked_add(counter(usage)?))
+        };
+        Some(Self {
+            input_tokens: sum(|u| u.input_tokens),
+            output_tokens: sum(|u| u.output_tokens),
+            cache_read_input_tokens: sum(|u| u.cache_read_input_tokens),
+            cache_creation_input_tokens: sum(|u| u.cache_creation_input_tokens),
+        })
+    }
+}
+
+/// Preserve the cost fold's identity and source preference across consumers.
+/// Equal-ranked redeliveries keep the first observation; fields aren't merged
+/// across sources because the normalized accounting semantics may differ.
+fn usage_by_message(events: &[Event]) -> BTreeMap<&str, &Usage> {
+    let mut by_message: BTreeMap<&str, &Usage> = BTreeMap::new();
+    for event in events {
+        if let Payload::Usage(usage) = &event.payload {
+            let replace = by_message
+                .get(usage.message_id.as_str())
+                .is_none_or(|current| source_rank(usage.source) > source_rank(current.source));
+            if replace {
+                by_message.insert(&usage.message_id, usage);
+            }
+        }
+    }
+    by_message
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ModelUsageCost {
     pub(crate) input_tokens: u64,
@@ -86,7 +134,7 @@ impl RunCostEnvelope {
     }
 
     pub(crate) fn from_events(events: &[Event]) -> Self {
-        let mut by_message: BTreeMap<&str, &Usage> = BTreeMap::new();
+        let by_message = usage_by_message(events);
         let mut managed_envelope = None;
         let mut fallback_provider_cost = 0.0;
         let mut has_fallback_cost = false;
@@ -94,16 +142,6 @@ impl RunCostEnvelope {
 
         for event in events {
             match &event.payload {
-                Payload::Usage(usage) => {
-                    let replace = by_message
-                        .get(usage.message_id.as_str())
-                        .is_none_or(|current| {
-                            source_rank(usage.source) > source_rank(current.source)
-                        });
-                    if replace {
-                        by_message.insert(&usage.message_id, usage);
-                    }
-                }
                 Payload::RunFinished(_) => status = "completed",
                 Payload::RunFailed(_) => status = "failed",
                 Payload::Custom(custom) if custom.name == "usage" => {
@@ -245,6 +283,113 @@ mod tests {
         assert_eq!(summary.model.input_tokens, 10);
         assert_eq!(summary.known_cost_usd, Some(0.01));
         assert_eq!(summary.estimated_total_cost_usd, None);
+    }
+
+    #[test]
+    fn observed_usage_distinguishes_missing_from_reported_zero() {
+        assert_eq!(ObservedUsage::from_events(&[]), None);
+        let mut zero = usage("m1", UsageSource::Native, 0, None);
+        let Payload::Usage(u) = &mut zero.payload else {
+            unreachable!()
+        };
+        u.output_tokens = Some(0);
+        u.cache_read_input_tokens = Some(0);
+        u.cache_creation_input_tokens = Some(0);
+        assert_eq!(
+            serde_json::to_value(ObservedUsage::from_events(&[zero])).unwrap(),
+            serde_json::json!({"input_tokens":0,"output_tokens":0,
+                "cache_read_input_tokens":0,"cache_creation_input_tokens":0})
+        );
+    }
+
+    #[test]
+    fn observed_usage_nulls_incomplete_counters_without_losing_other_fields() {
+        let first = usage("m1", UsageSource::Native, 10, None);
+        let mut second = usage("m2", UsageSource::Native, 20, None);
+        let Payload::Usage(u) = &mut second.payload else {
+            unreachable!()
+        };
+        u.input_tokens = None;
+        u.cache_creation_input_tokens = None;
+        let total = ObservedUsage::from_events(&[first, second]).unwrap();
+        assert_eq!(total.input_tokens, None); // 10 is an incomplete subtotal.
+        assert_eq!(total.output_tokens, Some(4));
+        assert_eq!(total.cache_read_input_tokens, Some(6));
+        assert_eq!(total.cache_creation_input_tokens, None);
+    }
+
+    #[test]
+    fn observed_usage_reuses_cost_identity_and_source_preference() {
+        for events in [
+            vec![
+                usage("m1", UsageSource::Wire, 100, None),
+                usage("m1", UsageSource::Native, 10, None),
+                usage("m1", UsageSource::Native, 50, None),
+            ],
+            vec![
+                usage("m1", UsageSource::Native, 10, None),
+                usage("m1", UsageSource::Wire, 100, None),
+            ],
+        ] {
+            let observed = ObservedUsage::from_events(&events).unwrap();
+            assert_eq!(observed.input_tokens, Some(10));
+            assert_eq!(observed.output_tokens, Some(2));
+            assert_eq!(RunCostEnvelope::from_events(&events).model.input_tokens, 10);
+        }
+        let mut native = usage("m1", UsageSource::Native, 10, None);
+        let Payload::Usage(u) = &mut native.payload else {
+            unreachable!()
+        };
+        u.output_tokens = None;
+        // A wire field must not fill a missing native field using different semantics.
+        let total =
+            ObservedUsage::from_events(&[usage("m1", UsageSource::Wire, 100, None), native])
+                .unwrap();
+        assert_eq!(total.output_tokens, None);
+    }
+
+    #[test]
+    fn observed_usage_adds_normalized_events_and_ignores_session_snapshots() {
+        let events = [
+            usage("turn-1", UsageSource::Native, 10, None),
+            usage("retry-1", UsageSource::Native, 20, None),
+            usage("segment-2", UsageSource::Native, 30, None),
+            usage("retry-1", UsageSource::Native, 20, None),
+            Event::session(
+                "session-1",
+                Payload::Custom(crate::contract::Custom {
+                    name: "usage".into(),
+                    payload: Some(serde_json::json!({"input_tokens": 60})),
+                }),
+            ),
+            Event::session(
+                "session-1",
+                Payload::Custom(crate::contract::Custom {
+                    name: "run_cost".into(),
+                    payload: Some(serde_json::json!({"model":{"input_tokens": 60}})),
+                }),
+            ),
+        ];
+        let total = ObservedUsage::from_events(&events).unwrap();
+        assert_eq!(total.input_tokens, Some(60));
+        assert_eq!(total.output_tokens, Some(6));
+        assert_eq!(total.cache_read_input_tokens, Some(9));
+        assert_eq!(total.cache_creation_input_tokens, Some(12));
+    }
+
+    #[test]
+    fn observed_usage_overflow_is_unknown_per_counter() {
+        let first = usage("m1", UsageSource::Native, u64::MAX, None);
+        assert_eq!(
+            ObservedUsage::from_events(std::slice::from_ref(&first))
+                .unwrap()
+                .input_tokens,
+            Some(u64::MAX)
+        );
+        let second = usage("m2", UsageSource::Native, 1, None);
+        let total = ObservedUsage::from_events(&[first, second]).unwrap();
+        assert_eq!(total.input_tokens, None);
+        assert_eq!(total.output_tokens, Some(4));
     }
 
     #[test]

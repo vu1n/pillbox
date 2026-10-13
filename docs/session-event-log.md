@@ -353,6 +353,13 @@ cost schema. Consequently, a zero in the legacy JSON cost envelope is not by
 itself proof that measured zero usage was observed; use the durable `usage`
 events when that distinction matters.
 
+Dispatch's worker verdicts and `dispatch.worker_summary` artifacts expose a
+nullable `usage` snapshot folded from these normalized additive events. Unlike
+the legacy cost JSON, missing fields and overflowing sums remain `null`, and a
+field omitted by any selected observation cannot become a complete subtotal.
+See [recorded worker token usage](./dispatch.md#recorded-worker-token-usage) for
+deduplication, snapshot timing, and partial/full-budget validation semantics.
+
 Session-log open and replay scan with bounded record buffers. A fresh append
 holds the existing per-session `flock` and recovers the authoritative sequence
 in progressively larger windows starting at 64 KiB, up to 16 MiB plus two LF

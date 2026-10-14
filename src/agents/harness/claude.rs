@@ -22,7 +22,7 @@ use serde_json::Value;
 use crate::contract::{
     Custom, EffectiveRuntimeLimitsEvidence, EvidenceUnavailableReason, MessageDelta, MessageEnd,
     MessageStart, Payload, ReasoningEffort, RequestedRunProfile, Role, RunFinished, RunStarted,
-    ServedRunProfile, ServedRunProfileEvidence, ToolCall, ToolStatus,
+    ServedRunProfile, ServedRunProfileEvidence, ToolCall, ToolStatus, Usage, UsageSource,
 };
 use crate::execution::usage::TurnUsage;
 
@@ -192,6 +192,12 @@ impl HarnessAdapter for ClaudeAdapter {
                         })),
                     }));
                 }
+                // Tokens also as the normalized additive `Usage` event, so the
+                // session cost fold and dispatch's per-worker usage see this run.
+                // The result line is the whole one-shot run's total, once per run.
+                if let Some(usage) = turn_usage.as_ref().and_then(|u| run_usage(line, u)) {
+                    out.push(Payload::Usage(usage));
+                }
                 if let Some(denials) = line
                     .get("permission_denials")
                     .filter(|d| d.as_array().is_some_and(|a| !a.is_empty()))
@@ -215,6 +221,29 @@ impl HarnessAdapter for ClaudeAdapter {
             _ => Vec::new(),
         }
     }
+}
+
+/// The `result` line's validated tokens as one native [`Usage`] observation, or
+/// `None` when it reports no token count (a cost alone is not usage). Keyed by
+/// the result's `uuid` (else `session_id`) so a redelivered line dedups.
+fn run_usage(line: &Value, turn: &TurnUsage) -> Option<Usage> {
+    let reported = turn.input_tokens.is_some()
+        || turn.output_tokens.is_some()
+        || turn.cache_read_tokens.is_some()
+        || turn.cache_write_tokens.is_some();
+    let id = [str_field(line, "uuid"), str_field(line, "session_id")]
+        .into_iter()
+        .find(|id| !id.is_empty())
+        .unwrap_or("run");
+    reported.then(|| Usage {
+        message_id: format!("claude-result:{id}"),
+        input_tokens: turn.input_tokens,
+        output_tokens: turn.output_tokens,
+        cache_read_input_tokens: turn.cache_read_tokens,
+        cache_creation_input_tokens: turn.cache_write_tokens,
+        cost_usd: turn.cost_usd,
+        source: UsageSource::Native,
+    })
 }
 
 fn custom(name: &str, line: &Value) -> Payload {
@@ -416,10 +445,22 @@ mod tests {
     fn result_maps_to_run_finished_plus_usage() {
         let out = run(&[
             json!({"type":"result","subtype":"success","is_error":false,"result":"done","total_cost_usd":0.029,"num_turns":2,
-                "usage":{"input_tokens":9,"output_tokens":120,"cache_read_input_tokens":4000,"cache_creation_input_tokens":700}}),
+                "uuid":"res-1","usage":{"input_tokens":9,"output_tokens":120,"cache_read_input_tokens":4000,"cache_creation_input_tokens":700}}),
         ]);
         match out.as_slice() {
-            [Payload::RunFinished(r), Payload::Custom(c)] => {
+            [Payload::RunFinished(r), Payload::Custom(c), Payload::Usage(u)] => {
+                assert_eq!(u.message_id, "claude-result:res-1");
+                assert_eq!(u.source, UsageSource::Native);
+                assert_eq!(
+                    (
+                        u.input_tokens,
+                        u.output_tokens,
+                        u.cache_read_input_tokens,
+                        u.cache_creation_input_tokens
+                    ),
+                    (Some(9), Some(120), Some(4000), Some(700))
+                );
+                assert_eq!(u.cost_usd, Some(0.029));
                 assert_eq!(r.exit_code, 0);
                 assert_eq!(c.name, "usage");
                 let payload = c.payload.as_ref().unwrap();
@@ -430,8 +471,37 @@ mod tests {
                         "cache_read_tokens":4000,"cache_write_tokens":700})
                 );
             }
-            other => panic!("expected RunFinished + usage Custom, got {other:?}"),
+            other => panic!("expected RunFinished + usage Custom + Usage, got {other:?}"),
         }
+    }
+
+    /// Dispatch's per-worker usage and `session cost` read only normalized
+    /// `Usage` events; a claude-stream run must reach both, with a missing
+    /// counter staying unknown and a redelivered result counted once.
+    #[test]
+    fn result_usage_reaches_observed_usage_and_session_cost() {
+        let line = json!({"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.5,
+            "session_id":"s1","usage":{"input_tokens":9,"output_tokens":120,"cache_read_input_tokens":4000}});
+        let events: Vec<_> = run(&[line.clone(), line])
+            .into_iter()
+            .map(|p| crate::contract::Event::session("s1", p))
+            .collect();
+        let observed = crate::cost::ObservedUsage::from_events(&events).unwrap();
+        assert_eq!(observed.input_tokens, Some(9));
+        assert_eq!(observed.output_tokens, Some(120));
+        assert_eq!(observed.cache_read_input_tokens, Some(4000));
+        assert_eq!(observed.cache_creation_input_tokens, None);
+        let cost = crate::cost::RunCostEnvelope::from_events(&events);
+        assert_eq!(cost.model.output_tokens, 120);
+        assert_eq!(cost.known_cost_usd, Some(0.5));
+    }
+
+    #[test]
+    fn result_with_cost_but_no_tokens_emits_no_usage_event() {
+        let out = run(&[
+            json!({"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.1}),
+        ]);
+        assert!(!out.iter().any(|p| matches!(p, Payload::Usage(_))));
     }
 
     #[test]

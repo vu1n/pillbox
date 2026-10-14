@@ -72,8 +72,10 @@ model run:
   `assistant` text blocks become message start/delta/end, and `tool_use` /
   `tool_result` become tool calls. `result` produces `RunFinished`: `is_error`
   decides failure, because `subtype` can be `success` on an API error. It also
-  emits `Custom` `usage` (cost, turns, `terminal_reason`) and, when there were
-  denials, `permission_denials`. `system/api_retry`, `system/permission_denied`
+  emits `Custom` `usage` (cost, turns, `terminal_reason`), a native `Usage`
+  event with the run's token totals when the result reports any (one per run,
+  keyed by the result's `uuid`, so `session cost` and dispatch's per-worker
+  `usage` see it), and, when there were denials, `permission_denials`. `system/api_retry`, `system/permission_denied`
   and `rate_limit_event` become `Custom` events. `stream_event` (partial
   messages), `system/status` and `system/informational` are ignored. The
   capture is drained after the run, so partial deltas would only duplicate

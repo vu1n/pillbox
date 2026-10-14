@@ -379,6 +379,11 @@ field** and checked addition fits `u64`; otherwise that counter is `null`, even
 if some events report a subtotal. Explicit reported zero stays `0`. Cache
 counters stay separate from normalized non-cached input and output.
 
+Which agents produce these events on a libkrun worker: `codex` (rollout
+transcript), server agents such as `opencode` and `codex-serve` (event capture),
+and `claude-stream` (its `result` line). The PTY `claude`, `pi` and `cursor`
+record none yet, so their workers report `usage: null`.
+
 These are **recorded observations**, not a claim of complete provider billing.
 Unreported calls, skipped malformed log records, or producer lag cannot be
 reconstructed. Workers may remain live and spend more after the snapshot;

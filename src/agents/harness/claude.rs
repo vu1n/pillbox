@@ -227,6 +227,7 @@ impl HarnessAdapter for ClaudeAdapter {
 /// `None` when it reports no token count (a cost alone is not usage). Keyed by
 /// the result's `uuid` (else `session_id`) so a redelivered line dedups.
 fn run_usage(line: &Value, turn: &TurnUsage) -> Option<Usage> {
+    // Context: doc://pillbox/agent-io-pty-free-contract@0002#agent-io-pty-free-contract — map the native result into the shared Usage vocabulary.
     let reported = turn.input_tokens.is_some()
         || turn.output_tokens.is_some()
         || turn.cache_read_tokens.is_some()

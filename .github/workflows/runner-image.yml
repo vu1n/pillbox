@@ -1,8 +1,15 @@
 name: runner-image
-# Version tags publish releases; manual main dispatch refreshes dev only.
+# Tag pushes publish immutable vX.Y.Z + the latest alias; pushes to main
+# (refresh-PR merges, harness/Dockerfile changes, in-sandbox pillbox src
+# changes) rebuild and republish the moving dev tag; PRs that touch runner
+# packaging build both architectures WITHOUT publishing, so a refresh PR is
+# image-tested before anyone merges it.
 on:
   push:
+    branches: [main]
     tags: ['v*']
+  pull_request:
+    paths: ['runner/**', 'scripts/build-runner.sh']
   workflow_dispatch:
 
 permissions:
@@ -15,6 +22,9 @@ concurrency:
 
 jobs:
   build:
+    # Fork PRs get a read-only token — they cannot push digests to ghcr, so
+    # they skip image CI entirely (same-repo PRs run it).
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     strategy:
       fail-fast: false
       matrix:
@@ -67,6 +77,8 @@ jobs:
 
   publish:
     needs: build
+    # PRs build-only: nothing is ever tagged from a pull request.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

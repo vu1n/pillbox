@@ -119,7 +119,7 @@ plus immutable versions:
 
 | Tag | Moving? | Cadence | Use it for |
 |---|---|---|---|
-| `dev` | moving | local `build-runner.sh`; manual CI dispatch on main | day-to-day dev — pin it in your dev `pillbox.toml` |
+| `dev` | moving | CI on every push to main (build + verify, then publish) | day-to-day dev — pin it in your dev `pillbox.toml` |
 | `latest` | moving | CI on stable release (alias of newest `vX.Y.Z`) | prod / fresh installs — the built-in default |
 | `vX.Y.Z` | **immutable** | CI per release | reproducibility — pin this (and *only* this) for a frozen eval/σ̂ baseline |
 
@@ -233,14 +233,35 @@ image, pillbox CLI assumes:
 
 ## Harness updates
 
-Renovate watches supported package/release pins in `runner/Dockerfile`
-(via `# renovate:` hint comments) and opens PRs on upstream bumps. Cursor and
-Amp are refreshed by `build-runner.sh --update` from their official installer
-and npm metadata respectively. The current runner-image workflow runs only on version tags or manual dispatch;
-it does not build pull requests or republish on every merge. Verify a local build
-before relying on changed pins. The next tagged release publishes the immutable
-version and stable `:latest` alias.
+`scripts/build-runner.sh --update` is the resolver: it rewrites every pin in
+`runner/Dockerfile` from upstream (`npm view` for amp/opencode/pi, the codex
+GitHub release, the Cursor installer probe, the Prime stable feed). Three
+automations carry a refresh from upstream to the published image:
 
+1. **`harness-refresh`** (daily cron) resolves versions and opens ONE rolling
+   PR (`bot/harness-refresh`) whose body carries the version table and a
+   qualification checklist. No automerge: merging is the deliberate act —
+   the `pillbox.text/2` lanes record the harness versions they observe, and
+   the docs note what each model catalog was qualified against.
+2. **`runner-image`** builds both architectures on every PR that touches
+   `runner/**`, without publishing — a refresh PR is image-tested before
+   anyone merges it. Fork PRs skip image CI (their token cannot push digests).
+   A failed probe leaves an untagged digest, never a tag alias.
+3. **Publishing**: every push to main (a refresh-PR merge, a Dockerfile edit,
+   or an `src/**` change that moves the in-sandbox pillbox binary) rebuilds
+   and republishes `dev`. Tag pushes publish the immutable `vX.Y.Z` image and
+   move the `latest` alias, as before. Manual dispatch on main still works.
+
+The refresh PR is authored by `github-actions[bot]`; GitHub does not run
+`pull_request` workflows for its PRs. Set a `REFRESH_PAT` repo secret to get
+PR-time image CI on bot PRs — without it, rely on the verify gate in the
+publish run, which fails closed before `dev` can move.
+
+Renovate's regex manager over the same `# renovate:` hint comments is
+configured but the Renovate app is not installed on this repo — the bot above
+covers all seven harnesses instead (Renovate cannot track cursor/amp/prime
+without custom datasources). Install Renovate for the cargo dependency PRs
+and prune the harness custom manager if you do; the hints stay as metadata.
 
 ## Proposed launch-time updates (not implemented)
 

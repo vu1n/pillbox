@@ -22,7 +22,7 @@ cd "$(dirname "$0")/.."
 DOCKERFILE=runner/Dockerfile
 TAG=pillbox-runner:dev   # moving dev tag — every local script + a dev pillbox.toml default to it
 ROOTFS_CACHE_VERSION=v5  # mirrors ROOTFS_CACHE_VERSION in src/sandbox/libkrun/mod.rs
-DO_UPDATE=0 DRY_RUN=0 NO_CACHE=0 PRUNE=0 PRINT_ROOTFS_NAMESPACE=
+DO_UPDATE=0 DRY_RUN=0 NO_CACHE=0 PINS_ONLY=0 PRUNE=0 PRINT_ROOTFS_NAMESPACE=
 
 usage() {
 	cat <<'EOF'
@@ -31,6 +31,8 @@ Usage: scripts/build-runner.sh [options]
   (no options)       rebuild the current pins (layer-cached) and verify
   -u, --update       resolve each agent's latest version, rewrite the pins in
                      runner/Dockerfile, rebuild, verify
+      --pins-only    with --update: rewrite the pins and exit — no build, no
+                     verify (CI builds the image; keep local loops short)
       --dry-run      with --update: print what would change, don't write or build
   -t, --tag TAG      image tag to build (default: pillbox-runner:dev)
       --no-cache     force a clean rebuild (pass --no-cache to docker)
@@ -49,6 +51,7 @@ while [ $# -gt 0 ]; do
 		-u|--update)     DO_UPDATE=1 ;;
 		--dry-run)       DRY_RUN=1 ;;
 		--no-cache)      NO_CACHE=1 ;;
+		--pins-only)     PINS_ONLY=1 ;;
 		--prune-rootfs)  PRUNE=1 ;;
 		--print-rootfs-cache-namespace)
 			PRINT_ROOTFS_NAMESPACE="${2:?--print-rootfs-cache-namespace needs an image}"
@@ -86,8 +89,16 @@ if [ -n "$PRINT_ROOTFS_NAMESPACE" ]; then
 	exit 0
 fi
 
+# --pins-only rewrites pins and stops; it never builds, so it also never needs
+# docker (the refresh bot runs it where no builder exists). --dry-run still
+# wins: print, don't write.
+if [ "$PINS_ONLY" = 1 ]; then
+	[ "$DO_UPDATE" = 1 ] || { echo "✗ --pins-only needs --update" >&2; usage >&2; exit 2; }
+	SKIP_BUILD=1
+fi
+
 need() { command -v "$1" >/dev/null 2>&1 || { echo "✗ missing dependency: $1" >&2; exit 1; }; }
-need docker
+[ "${SKIP_BUILD:-0}" = 1 ] || need docker
 
 # Current pinned value of an ARG (e.g. `cur CLAUDE_VERSION` → 2.1.185).
 cur() { grep -E "^ARG ${1}=" "$DOCKERFILE" | head -1 | sed -E "s/^ARG ${1}=//"; }
@@ -136,6 +147,7 @@ if [ "$DO_UPDATE" = 1 ]; then
 	[ "$changed" = 1 ] \
 		&& echo "→ bumped runner/Dockerfile pins; review \`git diff $DOCKERFILE\` and commit" \
 		|| echo "→ all pins already latest — runner/Dockerfile unchanged"
+	[ "${SKIP_BUILD:-0}" = 1 ] && exit 0
 fi
 
 echo "▶ building $TAG (native arch, layer-cached)…"

@@ -1,0 +1,83 @@
+name: harness-refresh
+# Daily bot: resolve every bundled harness's latest version, rewrite the pins,
+# and open ONE rolling refresh PR. A human merges it (the body carries a
+# qualification checklist — adapters record the harness versions they observe);
+# the merge push to main then triggers runner-image to rebuild + republish dev.
+#
+# GITHUB_TOKEN-authored PRs do not trigger pull_request workflows (GitHub's
+# recursion rule). With no REFRESH_PAT secret the refresh PR opens without
+# image CI; the verify gate in runner-image's publish step still fails closed
+# before dev can move. Set a REFRESH_PAT repo secret to get PR-time image CI.
+on:
+  schedule:
+    - cron: '17 21 * * *' # daily 21:17 UTC — off the hour, avoids top-of-hour contention
+  workflow_dispatch:
+
+permissions:
+  contents: write # push the bot branch
+  pull-requests: write # open the PR
+
+concurrency:
+  group: harness-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve latest harness versions
+        env:
+          GH_TOKEN: ${{ github.token }} # `gh api` reads the codex release feed
+        run: |
+          set -euo pipefail
+          scripts/build-runner.sh --update --dry-run | tee /tmp/refresh-diff.txt
+          if grep -q '←' /tmp/refresh-diff.txt; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "All pins already latest — nothing to refresh."
+          fi
+        id: resolve
+      - name: Apply pins
+        if: steps.resolve.outputs.changed == 'true'
+        run: scripts/build-runner.sh --update --pins-only
+      - name: Open or update the rolling refresh PR
+        if: steps.resolve.outputs.changed == 'true'
+        env:
+          # A PAT (if configured) makes the PR CI-triggering; see header note.
+          GH_TOKEN: ${{ secrets.REFRESH_PAT || github.token }}
+        run: |
+          set -euo pipefail
+          date=$(date -u +%F)
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B bot/harness-refresh
+          git commit -am "Refresh runner harnesses ($date)"
+          git push --force origin bot/harness-refresh
+
+          # --body-file + single-quoted echos: markdown backticks must reach the
+          # PR body literally (an unquoted heredoc would command-substitute them).
+          {
+            echo "## Runner harness refresh — $date"
+            echo
+            echo "Resolved by 'build-runner.sh --update' (all seven harnesses):"
+            echo
+            echo '```'
+            cat /tmp/refresh-diff.txt
+            echo '```'
+            echo
+            echo '### Qualification checklist (merge is the deliberate act)'
+            echo '- [ ] Which `pillbox.text/2` lanes observe new versions here? (claude / codex / opencode / pi / prime-agent)'
+            echo '- [ ] Update the "qualified against" notes in `docs/runner-image.md` if a catalog needs re-qualification'
+            echo '- [ ] Smoke the touched harnesses (`scripts/smoke/`)'
+            echo '- [ ] Sealed profiles on immutable `vX.Y.Z` images are unaffected — confirm no bump must be re-qualified before the next tag'
+            echo
+            echo 'Merging triggers runner-image on main, which rebuilds both architectures,'
+            echo 'verifies them, and republishes `dev`. A failed verify leaves an untagged'
+            echo 'digest — `dev` never moves on a failed probe.'
+          } > /tmp/pr-body.md
+          gh pr create --base main --head bot/harness-refresh \
+            --title "Refresh runner harnesses ($date)" \
+            --body-file /tmp/pr-body.md \
+            || echo "Rolling refresh PR already open — branch update pushed to it."

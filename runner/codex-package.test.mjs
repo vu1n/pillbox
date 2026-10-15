@@ -9,8 +9,13 @@ import test from "node:test";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const helperPath = join(repoRoot, "runner", "install-codex-package.sh");
-// Daily runner packaging contract; sealed execution profiles select their own image.
-const codexVersion = "0.160.0";
+// The packaging contract is version-independent — the ARG pin belongs to the
+// daily runner's refresh cycle (Renovate / `build-runner.sh --update`), not to
+// this test. Read the pin instead of hardcoding it, so a harness refresh never
+// breaks the contract tests; sealed execution profiles select their own image.
+const dockerfile = await readFile(join(repoRoot, "runner", "Dockerfile"), "utf8");
+const codexVersion = dockerfile.match(/^ARG CODEX_VERSION=(\S+)$/m)?.[1];
+assert.ok(codexVersion, "runner/Dockerfile must pin ARG CODEX_VERSION");
 
 async function executable(path, contents) {
   await writeFile(path, contents, "utf8");
@@ -124,8 +129,6 @@ test("preserves the complete package after installer scratch cleanup", async () 
 
     const dockerignore = await readFile(join(repoRoot, ".dockerignore"), "utf8");
     assert.match(dockerignore, /^!runner\/install-codex-package\.sh$/m);
-    const dockerfile = await readFile(join(repoRoot, "runner", "Dockerfile"), "utf8");
-    assert.match(dockerfile, /^ARG CODEX_VERSION=0\.160\.0$/m);
     assert.match(dockerfile, /COPY runner\/install-codex-package\.sh/);
   } finally {
     await cleanup(fixtureData);
@@ -160,7 +163,10 @@ test("fails loudly when the pinned version does not match", async () => {
   try {
     const result = runHelper(fixtureData);
     assert.notEqual(result.status, 0);
-    assert.match(result.output, /does not match expected 0\.160\.0/);
+    assert.match(
+      result.output,
+      new RegExp(`does not match expected ${codexVersion.replace(/\./g, "\\.")}`),
+    );
   } finally {
     await cleanup(fixtureData);
   }

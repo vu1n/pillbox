@@ -34,7 +34,7 @@ rebuild silently reuses the stale layer instead of pulling the newer agent.
 | amp | `npm i -g @ampcode/cli@<pinned>` | `AMP_VERSION` | no — timestamp+sha versions defeat semver; bump by hand |
 | opencode | `npm i -g @opencode/cli@<pinned>` (OpenCode 2; `opencode-ai` is the 1.x line) | `OPENCODE_VERSION` | yes — npm `@opencode/cli` |
 | pi | `npm i -g @earendil-works/pi-coding-agent@<pinned>` | `PI_VERSION` | yes — npm |
-| prime-agent | official native installer, checksummed release archive under `/opt/prime-agent` | `PRIME_AGENT_VERSION` | no — stable feed via `build-runner.sh --update` |
+| prime-agent | official env-driven installer (`PRIME_AGENT_VERSION`); launcher + payload under `/opt/prime-agent`, exec wrapper at `/usr/local/bin/prime-agent` | `PRIME_AGENT_VERSION` | no — stable feed via `build-runner.sh --update` |
 
 Prime Agent is registered as a Pillbox agent (`--agent prime-agent`, a structured
 one-shot like `pi`; it shares pi's adapter) and has a `pillbox.text/2` driver.
@@ -52,6 +52,12 @@ and Prime Agent 0.9.8. Updating the daily-use runner does not migrate a sealed
 execution profile. Profiles requiring Codex 0.151.0 or 0.156.1 must keep their
 matching immutable images until their adapters and protocols have been qualified
 against a newer release.
+
+The October 15 refresh pins Claude 2.1.300, Codex 0.162.1, Cursor
+2026.10.14-941492e, Amp 0.0.1792036844-g99022c, OpenCode 2.0.29, Pi 1.2.0, and
+Prime Agent 0.10.0. The `pillbox.text/2` Claude lane will now observe
+`claude_code_version` 2.1.300; the adapter's conservative model catalog was
+qualified against 2.1.289 and its tool-free launch flags are unchanged.
 
 The `pillbox.text/2` Claude lane uses the configured image's installed binary
 and records its observed `claude_code_version`; callers cannot pin it. The

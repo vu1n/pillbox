@@ -130,7 +130,7 @@ ARG CURSOR_AGENT_VERSION=2026.10.14-941492e
 # (e.g. 0.0.1782062050-gbe2b79), which Renovate's semver matcher can't
 # compare. Pinned anyway for a deterministic layer cache; bump by hand
 # (`npm view @ampcode/cli version`) when you want a newer amp.
-ARG AMP_VERSION=0.0.1792036844-g99022c
+ARG AMP_VERSION=0.0.1792065649-g5a30fc
 
 RUN npm install -g \
 		@ampcode/cli@${AMP_VERSION} \

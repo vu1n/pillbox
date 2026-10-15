@@ -26,9 +26,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The PAT (when configured) attributes the branch push and PR to a
+          # real user, so pull_request workflows run on the bot's PR; falls
+          # back to GITHUB_TOKEN otherwise (PR then opens without PR CI).
+          token: ${{ secrets.REFRESH_PAT || github.token }}
       - name: Resolve latest harness versions
         env:
-          GH_TOKEN: ${{ github.token }} # `gh api` reads the codex release feed
+          GH_TOKEN: ${{ secrets.REFRESH_PAT || github.token }} # `gh api` reads the codex release feed
         run: |
           set -euo pipefail
           scripts/build-runner.sh --update --dry-run | tee /tmp/refresh-diff.txt
@@ -41,6 +46,8 @@ jobs:
         id: resolve
       - name: Apply pins
         if: steps.resolve.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.REFRESH_PAT || github.token }} # apply re-resolves: gh api needs a token here too
         run: scripts/build-runner.sh --update --pins-only
       - name: Open or update the rolling refresh PR
         if: steps.resolve.outputs.changed == 'true'

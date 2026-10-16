@@ -37,6 +37,8 @@ Run several independent verifiers and take majority when the call is close.
 ## Output
 
 Record the verdict with the change (PR comment, or appended to the amendment file). A
-`VIOLATES` or `REVERSAL_BY_FIAT` verdict blocks merge until the code is fixed or a human
-ratifies (L3). **L1 advises; it never auto-ratifies** — only a human turns an amendment into
-a new `active` decision.
+`VIOLATES` or `REVERSAL_BY_FIAT` verdict means don't merge until the code is fixed or the
+amendment is reworked. **This skill advises; it never merges** — merging the amendment PR
+is the ratification (L3). The System One triage (`brief triage --amendments`) is the cheap
+first pass: it labels anything the owner should see, or anything it can't judge
+`needs-ratification`, which is where this review earns its cost.

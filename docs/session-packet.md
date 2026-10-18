@@ -73,8 +73,9 @@ Never packed from either tree (reported in `excluded` with reason `credential`):
 Also never packed from the `harness/` tree: the basename of every agent's
 credential sentinel in `src/agents/mod.rs` (`ALL[*].cred_sentinel`), today
 `.credentials.json`, `auth.json` (codex, cursor, pi, prime-agent) and
-`opencode.db`. In the workspace tree those names are ordinary source files and
-are kept.
+`opencode.db`, plus each one's SQLite sidecars (`-wal`, `-shm`, `-journal`), where
+an unflushed credential write lives. In the workspace tree those names are
+ordinary source files and are kept.
 
 Sockets, FIFOs and devices are skipped with reason `special`. The workspace
 ingest denylist (`.env*`, `*.pem`, `.ssh/`, …; `src/workspace/ingest.rs`) is

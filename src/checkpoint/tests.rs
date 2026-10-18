@@ -33,6 +33,14 @@ fn fixture(root: &Path) -> (PathBuf, PathBuf) {
     write(&home.join(".credentials.json"), "{\"claudeAiOauth\":{}}\n");
     write(&home.join("nested/auth.json"), "{\"token\":\"x\"}\n");
     write(&home.join("settings.json"), "{}\n");
+    for name in [
+        "opencode.db",
+        "opencode.db-wal",
+        "opencode.db-shm",
+        "opencode.db-journal",
+    ] {
+        write(&home.join(name), "\"token\"\n");
+    }
     (ws, home)
 }
 
@@ -159,6 +167,10 @@ fn credential_files_are_never_packed() {
         "workspace/.credentials.json",
         "harness/.credentials.json",
         "harness/nested/auth.json",
+        "harness/opencode.db",
+        "harness/opencode.db-wal",
+        "harness/opencode.db-shm",
+        "harness/opencode.db-journal",
     ] {
         assert!(!paths.contains(&gone), "{gone} was packed");
         assert!(packed.excluded.contains(&Excluded {

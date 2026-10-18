@@ -291,8 +291,8 @@ Implements the packet the 2026-10-11 entry calls for. Spec:
   another symlink. The digest is the SHA-256 of the file. Limits: 1 GiB,
   250,000 entries.
 - **Exclusions:** `.credentials.json` and the vault CA files from both trees;
-  every agent's credential-sentinel basename (`auth.json`, `opencode.db`) from
-  `harness/` only. The workspace ingest denylist is not applied, because a
+  every agent's credential-sentinel basename (`auth.json`, `opencode.db`) and
+  its SQLite sidecars (`-wal`, `-shm`, `-journal`) from `harness/` only. The workspace ingest denylist is not applied, because a
   packet must give back the workspace the agent left.
 - **Rejected:** the `tar` crate. A hand-written writer and strict reader (about
   400 lines, no new dependency) refuse any header the writer would not produce.

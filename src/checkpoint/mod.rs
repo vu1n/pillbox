@@ -68,15 +68,26 @@ impl Tree {
     }
 }
 
+/// SQLite companions of a database file: an unflushed write (a token refresh
+/// in WAL mode, say) lives in these, not in the database itself.
+const SQLITE_SIDECARS: [&str; 3] = ["-wal", "-shm", "-journal"];
+
 /// Is `name` a credential file that must not enter a packet from `tree`? The
 /// harness tree also drops every agent's credential sentinel (`auth.json`,
-/// `opencode.db`, …), since that tree is an agent home's state.
+/// `opencode.db`, …) and its SQLite sidecars, since that tree is an agent
+/// home's state.
 fn is_credential(tree: Tree, name: &str) -> bool {
     CREDENTIAL_FILES.contains(&name)
         || (tree == Tree::Harness
-            && crate::agents::ALL
-                .iter()
-                .any(|a| a.cred_sentinel.rsplit('/').next() == Some(name)))
+            && crate::agents::ALL.iter().any(|a| {
+                let Some(sentinel) = a.cred_sentinel.rsplit('/').next() else {
+                    return false;
+                };
+                name == sentinel
+                    || SQLITE_SIDECARS
+                        .iter()
+                        .any(|suffix| name.strip_suffix(suffix) == Some(sentinel))
+            }))
 }
 
 /// `packet.json`. Closed: unknown fields are refused, and absent optionals are

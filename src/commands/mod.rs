@@ -8,6 +8,7 @@
 
 pub(crate) mod auth;
 pub(crate) mod bookmark;
+pub(crate) mod checkpoint;
 pub(crate) mod collect;
 pub(crate) mod critic;
 pub(crate) mod dispatch;

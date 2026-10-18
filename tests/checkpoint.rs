@@ -132,3 +132,87 @@ fn checkpoint_is_hidden_from_help() {
         "checkpoint pack --help",
     );
 }
+
+#[test]
+fn unpack_restores_directory_modes_under_a_narrow_umask() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
+    let home = TempDir::new().unwrap();
+    let t = TempDir::new().unwrap();
+    let ws = t.path().join("repo");
+    fs::create_dir_all(ws.join("src/inner")).unwrap();
+    fs::write(ws.join("src/inner/lib.rs"), "pub fn f() {}\n").unwrap();
+    let packet = t.path().join("out.packet");
+    let s = |p: &std::path::Path| p.to_str().unwrap().to_string();
+    let out = run(
+        home.path(),
+        t.path(),
+        &[
+            "checkpoint",
+            "pack",
+            "--workspace",
+            &s(&ws),
+            "--harness",
+            "claude_code",
+            "--out",
+            &s(&packet),
+            "--json",
+        ],
+    );
+    assert_ok(&out, "pack");
+    let digest = json(&out)["digest"].as_str().unwrap().to_string();
+
+    let restored = t.path().join("restore");
+    let mut cmd = std::process::Command::new(common::pillbox_bin());
+    cmd.env("HOME", home.path()).current_dir(t.path()).args([
+        "checkpoint",
+        "unpack",
+        "--packet",
+        &s(&packet),
+        "--expect",
+        &digest,
+        "--workspace",
+        &s(&restored),
+        "--json",
+    ]);
+    // SAFETY: umask is async-signal-safe and touches only the child.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::umask(0o077);
+            Ok(())
+        });
+    }
+    let out = cmd.output().unwrap();
+    assert_ok(&out, "unpack");
+    let mode = |p: &std::path::Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&restored.join("src")), 0o755);
+    assert_eq!(mode(&restored.join("src/inner")), 0o755);
+    assert_eq!(mode(&restored.join("src/inner/lib.rs")), 0o644);
+}
+
+#[test]
+fn pack_refuses_an_output_inside_a_packed_tree() {
+    let home = TempDir::new().unwrap();
+    let t = TempDir::new().unwrap();
+    let ws = t.path().join("repo");
+    fs::create_dir_all(&ws).unwrap();
+    fs::write(ws.join("a.txt"), "a\n").unwrap();
+    let s = |p: &std::path::Path| p.to_str().unwrap().to_string();
+    let out = run(
+        home.path(),
+        t.path(),
+        &[
+            "checkpoint",
+            "pack",
+            "--workspace",
+            &s(&ws),
+            "--harness",
+            "claude_code",
+            "--out",
+            &s(&ws.join("out.packet")),
+            "--json",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    assert!(!ws.join("out.packet").exists());
+}

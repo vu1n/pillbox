@@ -16,6 +16,9 @@ pillbox checkpoint unpack --packet FILE --expect sha256:<hex> --workspace DIR \
 Both are hidden engine subcommands (see [commands.md](./commands.md#engine-subcommands-stratus))
 and are in the `--no-default-features` Linux build. Code: `src/checkpoint/`.
 
+`--out` may not be inside `--workspace` or `--harness-state` (exit 2), since the next pack
+would pack the old packet. Unpack sets every directory it creates to 0755 whatever the umask.
+
 ## Specification
 
 The manifest is specified by the JSON Schema

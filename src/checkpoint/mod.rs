@@ -211,6 +211,23 @@ pub(crate) fn pack(opts: &PackOptions) -> Result<Packed> {
         return Err(usage(PACK, "--transcript needs --harness-state"));
     }
 
+    // A packet written inside a packed tree would be packed by the next run.
+    let out_dir = match opts.out.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    if let Ok(out_dir) = out_dir.canonicalize() {
+        let roots = std::iter::once(&opts.workspace).chain(opts.harness_state.as_ref());
+        for root in roots {
+            if out_dir.starts_with(root.canonicalize()?) {
+                return Err(usage(
+                    PACK,
+                    format!("--out {} is inside {}", opts.out.display(), root.display()),
+                ));
+            }
+        }
+    }
+
     let mut planned: Vec<(Entry, Option<PathBuf>)> = Vec::new();
     let mut excluded = Vec::new();
     walk(
@@ -616,7 +633,9 @@ pub(crate) fn unpack(opts: &UnpackOptions) -> Result<Unpacked> {
         let dest = target.staging.path().join(rel);
         match entry {
             Entry::Dir { .. } => {
-                fs::create_dir(&dest).with_context(|| format!("create {}", dest.display()))?
+                fs::create_dir(&dest).with_context(|| format!("create {}", dest.display()))?;
+                // The umask must not narrow the format's normalized directory mode.
+                fs::set_permissions(&dest, fs::Permissions::from_mode(0o755))?;
             }
             Entry::Symlink { target, .. } => std::os::unix::fs::symlink(target, &dest)
                 .with_context(|| format!("create {}", dest.display()))?,

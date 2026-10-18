@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/vu1n/pillbox/proto/pillbox/session-packet-1.schema.json",
+  "title": "pillbox.session-packet/1 manifest (packet.json)",
+  "description": "The manifest stored as the first entry, packet.json, of a pillbox session packet. The packet is one deterministic POSIX ustar archive (pax headers only for long paths): packet.json, then every entry below in this order, under workspace/ and harness/. Written and read only by `pillbox checkpoint pack|unpack`; docs/session-packet.md specifies the tar layout, the credential exclusions and the size limits. Every object is closed and an absent optional field is omitted, never null. The packet digest is sha256: plus the lowercase hex SHA-256 of the whole tar.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "harness", "entries"],
+  "properties": {
+    "format": {
+      "const": "pillbox.session-packet/1"
+    },
+    "harness": {
+      "description": "The harness whose state is under harness/, e.g. claude_code.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,63}$"
+    },
+    "harness_session_id": {
+      "description": "The harness's own session id, e.g. Claude Code's session UUID.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$"
+    },
+    "transcript": {
+      "description": "Path of the harness transcript, relative to harness/. Must name a file entry.",
+      "$ref": "#/$defs/relative_path"
+    },
+    "entries": {
+      "description": "Every directory, regular file and symlink in the two trees, sorted by path in byte order with no duplicates. Each entry's parent is a tree root or an earlier dir entry.",
+      "type": "array",
+      "maxItems": 250000,
+      "items": {
+        "oneOf": [
+          { "$ref": "#/$defs/dir" },
+          { "$ref": "#/$defs/file" },
+          { "$ref": "#/$defs/symlink" }
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "entry_path": {
+      "description": "workspace/... or harness/...: slash-separated, with no empty, . or .. component.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^(workspace|harness)(/(?!\\.\\.?(/|$))[^/\\u0000]+)+$"
+    },
+    "relative_path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4087,
+      "pattern": "^(?!\\.\\.?(/|$))[^/\\u0000]+(/(?!\\.\\.?(/|$))[^/\\u0000]+)*$"
+    },
+    "dir": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "path"],
+      "properties": {
+        "kind": { "const": "dir" },
+        "path": { "$ref": "#/$defs/entry_path" }
+      }
+    },
+    "file": {
+      "description": "A regular file; unpacked with mode 0755 when executable, else 0644.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "path", "size", "sha256", "executable"],
+      "properties": {
+        "kind": { "const": "file" },
+        "path": { "$ref": "#/$defs/entry_path" },
+        "size": { "type": "integer", "minimum": 0, "maximum": 1073741824 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "executable": { "type": "boolean" }
+      }
+    },
+    "symlink": {
+      "description": "A symlink. The target is relative and resolves inside the link's own tree without passing through another symlink in the packet; pack refuses any other link.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "path", "target"],
+      "properties": {
+        "kind": { "const": "symlink" },
+        "path": { "$ref": "#/$defs/entry_path" },
+        "target": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096,
+          "pattern": "^[^/\\u0000][^\\u0000]*$"
+        }
+      }
+    }
+  }
+}

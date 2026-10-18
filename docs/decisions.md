@@ -276,3 +276,26 @@ normalizer are deleted. Docker refuses server agents with a usage error.
 - **Rejected:** pillbox staying the entry point with Stratus as its cloud tier
   (two controllers); retiring pillbox entirely (it loses the microVM, the
   subscription-friendly proxy and rustic, or re-implements them in TypeScript).
+
+## 2026-10-18 — Session packet layout and exclusions
+**Status: Proposed by the implementing agent (2026-10-18); awaiting maintainer review.**
+
+Implements the packet the 2026-10-11 entry calls for. Spec:
+[session-packet.md](./session-packet.md) and
+`proto/pillbox/session-packet-1.schema.json`.
+
+- **Decision:** one deterministic ustar file (pax only for long names):
+  `packet.json` first, then byte-sorted `workspace/` and `harness/` entries,
+  including directories so empty ones survive. Directory entries are the only
+  parents, and symlinks must stay in their own tree without passing through
+  another symlink. The digest is the SHA-256 of the file. Limits: 1 GiB,
+  250,000 entries.
+- **Exclusions:** `.credentials.json` and the vault CA files from both trees;
+  every agent's credential-sentinel basename (`auth.json`, `opencode.db`) from
+  `harness/` only. The workspace ingest denylist is not applied, because a
+  packet must give back the workspace the agent left.
+- **Rejected:** the `tar` crate. A hand-written writer and strict reader (about
+  400 lines, no new dependency) refuse any header the writer would not produce.
+  Also rejected: compression inside the format (the transport can compress), and
+  applying the ingest denylist, which would drop checked-in `*.pem` fixtures
+  between turns.

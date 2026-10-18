@@ -227,6 +227,21 @@ Sessions are NOT inherited across pillboxes — they live in the
 pillbox that started them. A project pillbox's `session list` shows
 only its own sessions; the global pillbox's list shows global ones.
 
+### Engine subcommands (Stratus)
+
+Hidden from `pillbox --help`: Stratus calls these, users do not
+([decisions.md](./decisions.md), 2026-10-11). They resolve no pillbox, are in
+the `--no-default-features` build, and print one versioned JSON object with
+`--json`.
+
+| Command | What it does |
+|---|---|
+| `pillbox checkpoint pack --workspace DIR [--harness-state DIR] --harness NAME [--harness-session-id ID] [--transcript REL] --out FILE [--json]` | Write a deterministic session packet (`pillbox.session-packet/1`): `packet.json`, then `workspace/…` and `harness/…`. Credential files are never packed and are reported in `excluded`. Same trees, same digest. Prints `{version, format, digest, bytes, manifest, excluded}`. |
+| `pillbox checkpoint unpack --packet FILE --expect sha256:HEX --workspace DIR [--harness-state DIR] [--allow-nonempty] [--json]` | Verify the digest, then every entry against the manifest, then unpack; nothing is written unless the packet verifies. Refuses traversal, escaping symlinks, unlisted entries and a non-empty target (unless `--allow-nonempty`). Prints `{version, format, digest, manifest}`. Exit 1 = refused packet, 2 = bad flags or non-empty target. |
+
+Layout, exclusions, limits and checks: [session-packet.md](./session-packet.md);
+schema: [`proto/pillbox/session-packet-1.schema.json`](../proto/pillbox/session-packet-1.schema.json).
+
 ---
 
 ## Inheritance rules

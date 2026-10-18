@@ -23,6 +23,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 mod agents;
 mod attach;
 mod bookmarks;
+mod checkpoint;
 mod cli;
 mod commands;
 mod config;
@@ -584,6 +585,14 @@ enum Command {
         #[arg(value_name = "SHELL")]
         shell: clap_complete::Shell,
     },
+    /// Engine: write or verify-and-unpack a session packet
+    /// (`pillbox.session-packet/1`). Called by Stratus, not a user-facing
+    /// command; JSON output is versioned. See docs/session-packet.md.
+    #[command(hide = true)]
+    Checkpoint {
+        #[command(subcommand)]
+        action: commands::checkpoint::CheckpointAction,
+    },
     /// Internal: run the interactive attach pty-host. Owns the agent's
     /// PTY + a screen model and serves the attach-transport frame
     /// protocol on a unix socket. Invoked by pillbox inside a sandbox
@@ -1098,6 +1107,8 @@ fn run(cli: Cli) -> Result<()> {
                 commands::workspace::dispatch(&resolved, other)
             }
         },
+        // Engine subcommands for Stratus: self-contained from flags, no pillbox.
+        Command::Checkpoint { action } => commands::checkpoint::dispatch(action),
         // Internal attach-transport commands. No pillbox resolution: they
         // operate on a raw PTY + socket and are invoked by pillbox itself.
         Command::PtyHost {

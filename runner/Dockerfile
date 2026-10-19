@@ -112,25 +112,27 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 # @anthropic-ai/claude-code npm package, so Renovate tracks that as the
 # source of truth (the version string is passed to install.sh below).
 # renovate: datasource=npm depName=@anthropic-ai/claude-code
-ARG CLAUDE_VERSION=2.1.300
+ARG CLAUDE_VERSION=2.1.303
+# Held at 0.162.1: the 0.163.0 standalone package drops codex-resources/zsh,
+# which install-codex-package.sh requires. Bump once that check is revisited.
 # renovate: datasource=github-releases depName=openai/codex extractVersion=^rust-v(?<version>.*)$
 ARG CODEX_VERSION=0.162.1
 # OpenCode 2 ships as a new npm package (`@opencode/cli`); `opencode-ai` stays
 # on the 1.x line. Pillbox's local server adapter targets the 2.x server API.
 # renovate: datasource=npm depName=@opencode/cli
-ARG OPENCODE_VERSION=2.0.29
+ARG OPENCODE_VERSION=2.0.32
 # renovate: datasource=npm depName=@earendil-works/pi-coding-agent
-ARG PI_VERSION=1.2.0
+ARG PI_VERSION=1.3.0
 # Prime publishes a stable channel and checksummed native release archives.
 ARG PRIME_AGENT_VERSION=0.10.0
 # Cursor Agent CLI — no Renovate datasource; lab version string from
 # downloads.cursor.com/lab/<ver>/linux/<arch>/agent-cli-package.tar.gz
-ARG CURSOR_AGENT_VERSION=2026.10.14-941492e
+ARG CURSOR_AGENT_VERSION=2026.10.16-e3cb207
 # amp has no Renovate-trackable pin: its publish scheme is timestamp+sha
 # (e.g. 0.0.1782062050-gbe2b79), which Renovate's semver matcher can't
 # compare. Pinned anyway for a deterministic layer cache; bump by hand
 # (`npm view @ampcode/cli version`) when you want a newer amp.
-ARG AMP_VERSION=0.0.1792065649-g5a30fc
+ARG AMP_VERSION=0.0.1792353656-g2a6ff8
 
 RUN npm install -g \
 		@ampcode/cli@${AMP_VERSION} \

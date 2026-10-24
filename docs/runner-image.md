@@ -29,7 +29,7 @@ rebuild silently reuses the stale layer instead of pulling the newer agent.
 | Harness | Install method | Pin | Tracked by Renovate |
 |---|---|---|---|
 | claude | native installer from `claude.ai/install.sh` (`claude install <ver>`) | `CLAUDE_VERSION` | yes — npm `@anthropic-ai/claude-code` (versions match the native release) |
-| codex | native installer from `chatgpt.com/codex/install.sh`; complete native package preserved under `/opt/codex/packages/standalone/releases/<version>` | `CODEX_VERSION` | yes — github releases (`rust-v<ver>`) |
+| codex | native installer from `releases.openai.com/codex/install.sh`; complete native package preserved under `/opt/codex/packages/standalone/releases/<version>` | `CODEX_VERSION` | yes — github releases (`rust-v<ver>`) |
 | cursor | official `cursor.com/install` artifact | `CURSOR_AGENT_VERSION` | no — resolved from the official installer by `build-runner.sh --update` |
 | amp | `npm i -g @ampcode/cli@<pinned>` | `AMP_VERSION` | no — timestamp+sha versions defeat semver; bump by hand |
 | opencode | `npm i -g @opencode/cli@<pinned>` (OpenCode 2; `opencode-ai` is the 1.x line) | `OPENCODE_VERSION` | yes — npm `@opencode/cli` |

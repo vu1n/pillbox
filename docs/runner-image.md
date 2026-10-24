@@ -29,7 +29,7 @@ rebuild silently reuses the stale layer instead of pulling the newer agent.
 | Harness | Install method | Pin | Tracked by Renovate |
 |---|---|---|---|
 | claude | native installer from `claude.ai/install.sh` (`claude install <ver>`) | `CLAUDE_VERSION` | yes — npm `@anthropic-ai/claude-code` (versions match the native release) |
-| codex | native installer from `chatgpt.com/codex/install.sh`; complete native package preserved under `/opt/codex/packages/standalone/releases/<version>` | `CODEX_VERSION` | yes — github releases (`rust-v<ver>`) |
+| codex | native installer from `releases.openai.com/codex/install.sh`; complete native package preserved under `/opt/codex/packages/standalone/releases/<version>` | `CODEX_VERSION` | yes — github releases (`rust-v<ver>`) |
 | cursor | official `cursor.com/install` artifact | `CURSOR_AGENT_VERSION` | no — resolved from the official installer by `build-runner.sh --update` |
 | amp | `npm i -g @ampcode/cli@<pinned>` | `AMP_VERSION` | no — timestamp+sha versions defeat semver; bump by hand |
 | opencode | `npm i -g @opencode/cli@<pinned>` (OpenCode 2; `opencode-ai` is the 1.x line) | `OPENCODE_VERSION` | yes — npm `@opencode/cli` |
@@ -58,6 +58,10 @@ The October 15 refresh pins Claude 2.1.300, Codex 0.162.1, Cursor
 Prime Agent 0.10.0. The `pillbox.text/2` Claude lane will now observe
 `claude_code_version` 2.1.300; the adapter's conservative model catalog was
 qualified against 2.1.289 and its tool-free launch flags are unchanged.
+
+From 0.163.0 on, the Codex standalone package ships without `codex-resources/zsh`. The image
+accepts either layout and checks bundled zsh only when the package carries it, so Codex follows
+the latest release like the other harnesses.
 
 The `pillbox.text/2` Claude lane uses the configured image's installed binary
 and records its observed `claude_code_version`; callers cannot pin it. The

@@ -110,8 +110,10 @@ resources="$package_root/$resources_dir"
 path_tools="$package_root/$path_dir"
 [ -x "$entrypoint" ] || die "manifest entrypoint is missing or not executable: $entrypoint"
 [ -x "$helper" ] || die "code-mode host is missing or not executable: $helper"
-[ -d "$resources/zsh/bin" ] || die "bundled zsh resources are missing: $resources/zsh/bin"
-[ -x "$resources/zsh/bin/zsh" ] || die "bundled zsh is missing or not executable: $resources/zsh/bin/zsh"
+[ -d "$resources" ] || die "bundled resources are missing: $resources"
+# Packages up to 0.162 bundle zsh; 0.163 on ship without it. Check it only when it is there.
+[ ! -e "$resources/zsh" ] || [ -x "$resources/zsh/bin/zsh" ] ||
+	die "bundled zsh is present but not executable: $resources/zsh/bin/zsh"
 [ -d "$path_tools" ] || die "bundled path tools are missing: $path_tools"
 [ -x "$path_tools/rg" ] || die "bundled ripgrep is missing or not executable: $path_tools/rg"
 

@@ -17,7 +17,8 @@ docker run --rm --entrypoint sh -e EXPECTED_CODEX_VERSION="$CODEX_VERSION_PIN" "
 	test "$(jq -er ".pathDir == \"codex-path\"" "$manifest")" = true
 	test -x "$package_root/bin/codex"
 	test -x "$package_root/bin/codex-code-mode-host"
-	test -x "$package_root/codex-resources/zsh/bin/zsh"
+	test -d "$package_root/codex-resources"
+	test ! -e "$package_root/codex-resources/zsh" || test -x "$package_root/codex-resources/zsh/bin/zsh"
 	test -x "$package_root/codex-path/rg"
 	test -L /usr/local/bin/codex
 	test -L /usr/local/bin/codex-code-mode-host

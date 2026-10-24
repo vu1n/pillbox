@@ -113,10 +113,8 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 # source of truth (the version string is passed to install.sh below).
 # renovate: datasource=npm depName=@anthropic-ai/claude-code
 ARG CLAUDE_VERSION=2.1.303
-# Held at 0.162.1: the 0.163.0 standalone package drops codex-resources/zsh,
-# which install-codex-package.sh requires. Bump once that check is revisited.
 # renovate: datasource=github-releases depName=openai/codex extractVersion=^rust-v(?<version>.*)$
-ARG CODEX_VERSION=0.162.1
+ARG CODEX_VERSION=0.164.0
 # OpenCode 2 ships as a new npm package (`@opencode/cli`); `opencode-ai` stays
 # on the 1.x line. Pillbox's local server adapter targets the 2.x server API.
 # renovate: datasource=npm depName=@opencode/cli
@@ -145,11 +143,11 @@ RUN npm install -g \
 # Codex: official standalone installer (native binary; the npm wrapper is
 # no longer how upstream ships protocol-bearing builds like `app-server`).
 # Preserve the complete package before dropping the installer scratch HOME:
-# the package contains the code-mode host, bundled zsh, and path tools that
+# the package contains the code-mode host, bundled resources, and path tools that
 # the native CLI needs at runtime.
 ENV CODEX_PACKAGE_ROOT=/opt/codex/packages/standalone/releases/${CODEX_VERSION}
 COPY runner/install-codex-package.sh /tmp/install-codex-package.sh
-RUN curl -fsSL https://chatgpt.com/codex/install.sh -o /tmp/codex-install.sh \
+RUN curl -fsSL https://releases.openai.com/codex/install.sh -o /tmp/codex-install.sh \
 	&& HOME=/opt/codex-install CODEX_RELEASE=${CODEX_VERSION} CODEX_NON_INTERACTIVE=1 \
 		sh /tmp/codex-install.sh \
 	&& sh /tmp/install-codex-package.sh /opt/codex-install "${CODEX_VERSION}" /opt/codex /usr/local/bin \

@@ -149,7 +149,7 @@ RUN npm install -g \
 # the native CLI needs at runtime.
 ENV CODEX_PACKAGE_ROOT=/opt/codex/packages/standalone/releases/${CODEX_VERSION}
 COPY runner/install-codex-package.sh /tmp/install-codex-package.sh
-RUN curl -fsSL https://chatgpt.com/codex/install.sh -o /tmp/codex-install.sh \
+RUN curl -fsSL https://releases.openai.com/codex/install.sh -o /tmp/codex-install.sh \
 	&& HOME=/opt/codex-install CODEX_RELEASE=${CODEX_VERSION} CODEX_NON_INTERACTIVE=1 \
 		sh /tmp/codex-install.sh \
 	&& sh /tmp/install-codex-package.sh /opt/codex-install "${CODEX_VERSION}" /opt/codex /usr/local/bin \

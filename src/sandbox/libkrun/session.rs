@@ -2167,6 +2167,9 @@ pub(crate) fn reattach(resolved: &Pillbox, session: &crate::session::Session) ->
 /// frame is written (libkrun bridges the unix socket straight to the guest's
 /// listening pty-host, no exec cold-start), so it's short.
 const SEND_SETTLE: Duration = Duration::from_millis(300);
+/// The pause between a turn's body and its submit key, so the TUI has taken the body into its
+/// composer before Enter arrives. Agent Relay's PTY delivery uses the same 250 ms.
+const SUBMIT_GAP: Duration = Duration::from_millis(250);
 /// A detached run returns after the VMM is spawned, before the guest necessarily
 /// reaches its vsock accept loop. An immediate `session send` therefore waits
 /// for the pty-host handshake instead of treating the first ENOENT/ECONNREFUSED
@@ -2187,14 +2190,19 @@ const SEND_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// serial loop won't accept this connection until the attached client leaves, and
 /// the socket is torn down after the bounded settle below. Concurrent
 /// drive-while-attached needs a threaded accept loop.
-fn pty_send(sock: &str, bytes: &[u8]) -> Result<()> {
-    pty_send_with_timing(sock, bytes, SEND_READY_TIMEOUT, SEND_SETTLE)
+///
+/// The body and the submit key go as two `Input` frames, `SUBMIT_GAP` apart. Writing them is not
+/// proof the agent took the turn (a body can sit in the composer as a draft): `session wait-idle`
+/// or the session log shows whether a turn ran.
+fn pty_send(sock: &str, turn: &crate::agents::PtyTurn<'_>) -> Result<()> {
+    pty_send_with_timing(sock, turn, SEND_READY_TIMEOUT, SUBMIT_GAP, SEND_SETTLE)
 }
 
 fn pty_send_with_timing(
     sock: &str,
-    bytes: &[u8],
+    turn: &crate::agents::PtyTurn<'_>,
     ready_timeout: Duration,
+    submit_gap: Duration,
     settle: Duration,
 ) -> Result<()> {
     use std::io::Write as _;
@@ -2248,8 +2256,19 @@ fn pty_send_with_timing(
     }
 
     stream.set_write_timeout(Some(settle)).ok();
-    crate::attach::driver::send_input(&mut stream, bytes).context("frame the session input")?;
-    stream.flush().context("flush the session input")?;
+    if !turn.body.is_empty() {
+        crate::attach::driver::send_input(&mut stream, &turn.body)
+            .context("frame the session input")?;
+        stream.flush().context("flush the session input")?;
+    }
+    if let Some(submit) = turn.submit {
+        if !turn.body.is_empty() {
+            std::thread::sleep(submit_gap);
+        }
+        crate::attach::driver::send_input(&mut stream, submit)
+            .context("frame the session submit key")?;
+        stream.flush().context("flush the session submit key")?;
+    }
     // No data-plane InputAck exists yet. Keep the accepted connection alive for
     // one bounded settle so the guest read loop can forward this exact frame to
     // the PTY; the pre-send Snapshot is the fail-closed readiness proof.
@@ -2570,12 +2589,12 @@ impl crate::sandbox::LiveSession for LibkrunLiveSession {
         if self.session.integration() == Integration::Server {
             return crate::sandbox::drive_server_prompt(&self.session, &*self.http()?, bytes);
         }
-        let input = crate::agents::lookup("session", &self.session.agent_id)
+        let turn = crate::agents::lookup("session", &self.session.agent_id)
             .ok()
             .and_then(|spec| spec.libkrun_pty)
             .map(|profile| profile.frame_input(bytes))
-            .unwrap_or_else(|| std::borrow::Cow::Borrowed(bytes));
-        pty_send(&LibkrunHandle::decode(&self.session)?.sock, &input)
+            .unwrap_or_else(|| crate::agents::PtyTurn::raw(bytes));
+        pty_send(&LibkrunHandle::decode(&self.session)?.sock, &turn)
     }
 
     fn attach(&self, resolved: &Pillbox) -> Result<()> {
@@ -3007,7 +3026,7 @@ mod tests {
     }
 
     #[test]
-    fn pty_send_waits_for_readiness_snapshot_before_delivering_exact_input() {
+    fn pty_send_waits_for_readiness_snapshot_then_sends_body_and_submit_apart() {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("delayed.sock");
         let sock_for_server = sock.clone();
@@ -3021,39 +3040,86 @@ mod tests {
             crate::attach::frame::Frame::Snapshot(b"ready".to_vec())
                 .encode(&mut stream)
                 .unwrap();
-            let input = crate::attach::frame::Frame::decode(&mut stream).unwrap();
-            tx.send(input).unwrap();
+            let body = crate::attach::frame::Frame::decode(&mut stream).unwrap();
+            let body_at = Instant::now();
+            let submit = crate::attach::frame::Frame::decode(&mut stream).unwrap();
+            tx.send((body, submit, body_at.elapsed())).unwrap();
         });
 
-        let input = b"second turn\n";
         pty_send_with_timing(
             sock.to_str().unwrap(),
-            input,
+            &crate::agents::PtyTurn::raw(b"second turn\n"),
             Duration::from_secs(2),
+            Duration::from_millis(50),
             Duration::from_millis(1),
         )
         .unwrap();
+        let (body, submit, gap) = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        // Two writes whose bytes join to exactly the input, the submit key last and alone.
         assert_eq!(
-            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            Some(crate::attach::frame::Frame::Input(input.to_vec()))
+            body,
+            Some(crate::attach::frame::Frame::Input(b"second turn".to_vec()))
+        );
+        assert_eq!(
+            submit,
+            Some(crate::attach::frame::Frame::Input(b"\n".to_vec()))
+        );
+        assert!(
+            gap >= Duration::from_millis(40),
+            "submit came {gap:?} after the body"
         );
         server.join().unwrap();
     }
 
     #[test]
-    fn codex_profile_frames_newline_terminated_turn_as_paste_then_enter() {
+    fn pty_send_without_a_terminator_sends_one_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("draft.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            crate::attach::frame::Frame::Snapshot(b"ready".to_vec())
+                .encode(&mut stream)
+                .unwrap();
+            let first = crate::attach::frame::Frame::decode(&mut stream).unwrap();
+            // The sender closes after its settle: nothing else arrives.
+            let next = crate::attach::frame::Frame::decode(&mut stream)
+                .ok()
+                .flatten();
+            tx.send((first, next)).unwrap();
+        });
+
+        pty_send_with_timing(
+            sock.to_str().unwrap(),
+            &crate::agents::PtyTurn::raw(b"typed, not submitted"),
+            Duration::from_secs(2),
+            Duration::from_millis(50),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        let (first, next) = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            first,
+            Some(crate::attach::frame::Frame::Input(
+                b"typed, not submitted".to_vec()
+            ))
+        );
+        assert_eq!(next, None);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn codex_profile_frames_newline_terminated_turn_as_paste_then_separate_enter() {
         let profile = crate::agents::CODEX
             .libkrun_pty
             .expect("Codex declares a libkrun PTY profile");
-        let input = b"line one\nline two\n";
-        assert_eq!(
-            profile.frame_input(input).as_ref(),
-            b"\x1b[200~line one\nline two\x1b[201~\r"
-        );
-        assert_eq!(
-            profile.frame_input(b"windows newline\r\n").as_ref(),
-            b"\x1b[200~windows newline\x1b[201~\r"
-        );
+        let turn = profile.frame_input(b"line one\nline two\n");
+        assert_eq!(turn.body.as_ref(), b"\x1b[200~line one\nline two\x1b[201~");
+        assert_eq!(turn.submit, Some(b"\r".as_slice()));
+        let turn = profile.frame_input(b"windows newline\r\n");
+        assert_eq!(turn.body.as_ref(), b"\x1b[200~windows newline\x1b[201~");
+        assert_eq!(turn.submit, Some(b"\r".as_slice()));
     }
 
     #[test]
@@ -3062,21 +3128,31 @@ mod tests {
             .libkrun_pty
             .expect("Codex declares a libkrun PTY profile");
         let input = b"typed but not submitted";
-        let framed = profile.frame_input(input);
-        assert!(matches!(framed, std::borrow::Cow::Borrowed(_)));
-        assert_eq!(framed.as_ref(), input);
+        let turn = profile.frame_input(input);
+        assert!(matches!(turn.body, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(turn.body.as_ref(), input);
+        assert_eq!(turn.submit, None);
     }
 
     #[test]
-    fn pty_agent_without_profile_keeps_raw_input() {
+    fn pty_agent_without_profile_keeps_raw_bytes_and_splits_off_the_terminator() {
         assert!(crate::agents::CLAUDE.libkrun_pty.is_none());
-        let input = b"raw newline stays raw for generic PTY agents\n";
-        let framed = crate::agents::CLAUDE
-            .libkrun_pty
-            .map(|profile| profile.frame_input(input))
-            .unwrap_or_else(|| std::borrow::Cow::Borrowed(input));
-        assert!(matches!(framed, std::borrow::Cow::Borrowed(_)));
-        assert_eq!(framed.as_ref(), input);
+        for (input, body, submit) in [
+            (
+                b"raw newline\n".as_slice(),
+                b"raw newline".as_slice(),
+                Some(b"\n".as_slice()),
+            ),
+            (b"raw cr\r", b"raw cr", Some(b"\r".as_slice())),
+            (b"raw crlf\r\n", b"raw crlf", Some(b"\r\n".as_slice())),
+            (b"no terminator", b"no terminator", None),
+            (b"\r", b"", Some(b"\r".as_slice())),
+        ] {
+            let turn = crate::agents::PtyTurn::raw(input);
+            assert!(matches!(turn.body, std::borrow::Cow::Borrowed(_)));
+            assert_eq!(turn.body.as_ref(), body);
+            assert_eq!(turn.submit, submit);
+        }
     }
 
     #[test]

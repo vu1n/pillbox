@@ -198,9 +198,41 @@ impl LibkrunPtyProfile {
         self.detached_transcript
     }
 
-    pub(crate) fn frame_input<'a>(self, bytes: &'a [u8]) -> Cow<'a, [u8]> {
+    pub(crate) fn frame_input<'a>(self, bytes: &'a [u8]) -> PtyTurn<'a> {
         match self.input_framing {
             PtyInputFraming::BracketedPasteLfTurn => frame_bracketed_paste_lf_turn(bytes),
+        }
+    }
+}
+
+/// Input for a PTY agent as two writes: the body, then the key that submits it. A TUI composer
+/// that gets the body and its Enter in one write can keep both as an unsent draft (Agent Relay
+/// reproduced this with Codex: the body showed on screen, no turn started), so the submit key
+/// always goes on its own, after a pause. Joined, the writes are the turn's bytes.
+#[cfg(feature = "libkrun")]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PtyTurn<'a> {
+    pub(crate) body: Cow<'a, [u8]>,
+    pub(crate) submit: Option<&'a [u8]>,
+}
+
+#[cfg(feature = "libkrun")]
+impl<'a> PtyTurn<'a> {
+    /// Raw input for an agent with no framing of its own: the bytes unchanged, with a trailing
+    /// `\r\n`, `\r` or `\n` split off as the submit write.
+    pub(crate) fn raw(bytes: &'a [u8]) -> Self {
+        let terminator = [b"\r\n".as_slice(), b"\r", b"\n"]
+            .into_iter()
+            .find(|terminator| bytes.ends_with(terminator));
+        match terminator {
+            Some(terminator) => Self {
+                body: Cow::Borrowed(&bytes[..bytes.len() - terminator.len()]),
+                submit: Some(&bytes[bytes.len() - terminator.len()..]),
+            },
+            None => Self {
+                body: Cow::Borrowed(bytes),
+                submit: None,
+            },
         }
     }
 }
@@ -626,19 +658,25 @@ fn prepare_fresh_codex_home(home: &Path, guest_workspace: &str) -> Result<()> {
 
 /// Codex 0.151's raw-mode TUI treats LF as text rather than `KeyCode::Enter`.
 /// A trailing LF explicitly marks a complete turn, so paste the body as one
-/// input event and submit it with a following CR. Non-terminated bytes remain
-/// exactly raw.
+/// input event and submit it with a CR in a later write. Non-terminated bytes
+/// remain exactly raw.
 #[cfg(feature = "libkrun")]
-fn frame_bracketed_paste_lf_turn(bytes: &[u8]) -> Cow<'_, [u8]> {
+fn frame_bracketed_paste_lf_turn(bytes: &[u8]) -> PtyTurn<'_> {
     let Some(body) = bytes.strip_suffix(b"\n") else {
-        return Cow::Borrowed(bytes);
+        return PtyTurn {
+            body: Cow::Borrowed(bytes),
+            submit: None,
+        };
     };
     let body = body.strip_suffix(b"\r").unwrap_or(body);
-    let mut framed = Vec::with_capacity(body.len() + 13);
+    let mut framed = Vec::with_capacity(body.len() + 12);
     framed.extend_from_slice(b"\x1b[200~");
     framed.extend_from_slice(body);
-    framed.extend_from_slice(b"\x1b[201~\r");
-    Cow::Owned(framed)
+    framed.extend_from_slice(b"\x1b[201~");
+    PtyTurn {
+        body: Cow::Owned(framed),
+        submit: Some(b"\r"),
+    }
 }
 
 /// Pre-accept claude's workspace trust dialog for `guest_workspace` by seeding

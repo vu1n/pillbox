@@ -59,6 +59,10 @@ Prime Agent 0.10.0. The `pillbox.text/2` Claude lane will now observe
 `claude_code_version` 2.1.300; the adapter's conservative model catalog was
 qualified against 2.1.289 and its tool-free launch flags are unchanged.
 
+From 0.163.0 on, the Codex standalone package ships without `codex-resources/zsh`. The image
+accepts either layout and checks bundled zsh only when the package carries it, so Codex follows
+the latest release like the other harnesses.
+
 The `pillbox.text/2` Claude lane uses the configured image's installed binary
 and records its observed `claude_code_version`; callers cannot pin it. The
 adapter's conservative model catalog and tool-free launch flags were qualified

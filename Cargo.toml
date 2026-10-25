@@ -169,6 +169,15 @@ libkrun = ["dep:smoltcp"]
 # `UPDATE_SCHEMA=1 cargo test --features contract-schema contract_schema_is_current`.
 contract-schema = ["dep:schemars"]
 
+# rustic pays a scrypt key derivation on every repo open. Unoptimized, that is
+# seconds per open, and the snapshot tests open repos hundreds of times: it was
+# ~85% of `cargo test` time (~12 of CI's ~14 min). Optimizing just these two
+# crates in dev/test builds cuts the suite from minutes to seconds.
+[profile.dev.package.scrypt]
+opt-level = 3
+[profile.dev.package.salsa20]
+opt-level = 3
+
 [profile.release]
 strip = true
 lto = "thin"

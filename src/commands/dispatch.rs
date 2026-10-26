@@ -26,7 +26,7 @@
 //! precisely for this. The loop sits behind [`WorkerDriver`] so the selection /
 //! retry **policy** is unit-tested over a mock, while the live [`CliDriver`] is
 //! exercised by the GHOST-004 smoke.
-// Context: doc://pillbox/adr-008-ghost-extraction-trigger@0001#ghost-extraction-trigger
+// ghost is an in-repo tenant that uses only pillbox's public contract (CLIs, §0 events), never its internals.
 
 use std::cell::OnceCell;
 use std::path::PathBuf;
@@ -695,7 +695,7 @@ impl RetryPolicy<'_> {
 /// fixes), and more re-drives only spend tokens. Only rubric grades count: a
 /// `--cmd` grade is 0 until it passes, so it carries no progress signal and
 /// keeps today's plain budget.
-// Context: doc://pillbox/adr-008-ghost-extraction-trigger@0001#ghost-extraction-trigger — the breaker is loop mechanism; what to do with a stalled worker (pivot, escalate) is ghost policy.
+// The breaker is loop mechanism; what to do with a stalled worker (pivot, escalate) is ghost policy.
 #[derive(Debug, Default)]
 struct Rounds {
     scores: Vec<f64>,
@@ -1733,7 +1733,7 @@ fn grader_files_inside_project(
 
 /// The `session score` argv that grades `tree` for worker `id` inside the
 /// one-shot grader microVM.
-// Context: doc://pillbox/optimization-external-substrate-primitives@0001#optimization-external-substrate-primitives — the reward is an external grader's verdict; a worker must not be able to edit or run code outside the VM to change it.
+// The reward is an external grader's verdict; a worker must not be able to edit or run code outside the VM to change it.
 fn score_args(
     id: &str,
     tree: &std::path::Path,

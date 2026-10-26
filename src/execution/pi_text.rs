@@ -131,7 +131,7 @@ impl PiHarness {
     /// One tool-free JSON-mode turn. The prompt arrives on stdin, so it is never parsed
     /// as a flag and is not bound by the kernel's per-argument length limit.
     pub(crate) fn argv(self, selection: &Selection) -> Vec<String> {
-        // Context: doc://pillbox/agent-io-pty-free-contract@0002#agent-io-pty-free-contract — structured stdout events, no PTY.
+        // Structured stdout events, no PTY.
         let mut argv: Vec<String> = [
             self.name(),
             "-p",

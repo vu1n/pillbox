@@ -118,7 +118,7 @@ Resolution order (highest precedence first):
 
 Tags name **roles, not history** — there is no `l5`/`l6`/`l7` generation scheme
 (that conflated "libkrun dev phase" with "the image you run" and caused endless
-"which tag is current?" churn; see [decisions.md](./decisions.md)). Three tags,
+"which tag is current?" churn). Three tags,
 plus immutable versions:
 
 | Tag | Moving? | Cadence | Use it for |

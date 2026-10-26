@@ -16,8 +16,7 @@ then implement the smallest end-to-end slice.
   stable. Do not extract it or claim design-only planner features as shipped.
 
 Read [`AGENTS.md`](./AGENTS.md) and the relevant canonical document before
-changing a subsystem. Ratified decisions in [`.brief/docs/`](./.brief/docs/) are
-constraints, not editable notes.
+changing a subsystem.
 
 ## Development checks
 
@@ -43,16 +42,6 @@ python3 check-contract-parity.py
 The libkrun feature path needs the local libkrun toolchain. See
 [`docs/libkrun-sandbox.md`](./docs/libkrun-sandbox.md) and CI for the current
 macOS installation recipe.
-
-Before committing a change governed by Context Vault:
-
-```sh
-brief check
-brief pin
-```
-
-Record the required conformance or amendment line in `.brief/SIGNOFF`. Do not
-bypass the hook or edit an active decision to fit the implementation.
 
 ## Pull requests
 

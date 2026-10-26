@@ -1,7 +1,6 @@
 # Remote backends + sessions
 
-Status: **superseded** (see `.brief/docs/remote-backend-plane-removed.md`,
-`doc://pillbox/remote-backend-plane-removed`).
+Status: **superseded**: pillbox is local-only.
 
 > **⚠️ SUPERSEDED / REMOVED (2026-06-01; verified removed 2026-07-01).** The whole
 > remote-backend line (`ssh://`, `e2b://`, `docker://`) was retired: "remote" is

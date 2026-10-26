@@ -71,7 +71,7 @@ pub(crate) const STUB_FAR_FUTURE_EXPIRES_AT_MS: u64 = 4_102_444_800_000;
 ///   is a fresh one: the agent won't self-refresh (far-future stub expiry), so a
 ///   stale access token would simply 401 with no recovery. Surfaces a retry/re-auth
 ///   next-step rather than handing the run a doomed token.
-// Context: doc://pillbox/adr-004-vault-broker-oauth@0001#vault-broker-oauth
+// The vault broker refreshes OAuth tokens; the agent never does.
 pub(crate) fn pre_refresh(creds_path: &Path, agent_id: &str) -> Result<Option<Value>> {
     pre_refresh_with_deadline(creds_path, agent_id, None)
 }

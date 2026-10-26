@@ -12,8 +12,7 @@ Status: **local transport only** (updated 2026-08-31).
   intent, replay policy, and fan-out.
 
 Managed Pillbox does not host the second responsibility. The former custom
-Cloudflare `SessionGateway` Durable Object was removed under
-`doc://pillbox/managed-tier-do-gateway@0002#managed-tier-do-gateway`.
+Cloudflare `SessionGateway` Durable Object was removed.
 
 ## Local invariant
 

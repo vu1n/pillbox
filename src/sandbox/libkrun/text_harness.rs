@@ -92,7 +92,7 @@ fn launch(
         true,
         |owner, rpc, remaining| spec(&rootfs, &ca_dir, owner, rpc, &turn.host, remaining),
     )?;
-    // Context: doc://pillbox/libkrun-env-fork-substrate@0002#libkrun-env-fork-substrate — the guest holds the stub; the real key reaches only the VMM child, bound to the provider host.
+    // The guest holds the stub; the real key reaches only the VMM child, bound to the provider host.
     let swaps = [SwapPair {
         stub: turn.stub_key.clone(),
         real: turn.real_key.clone(),
@@ -172,7 +172,7 @@ fn spec(
             host_sock: rpc.to_string_lossy().into_owned(),
             listen: false,
         }),
-        // Context: doc://pillbox/vault-egress-default-deny@0002#vault-egress-default-deny — only the provider host resolves.
+        // Only the provider host resolves.
         egress: Some(EgressSpec {
             allowlist: vec![host.into()],
             log_path: None,

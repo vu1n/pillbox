@@ -4,7 +4,7 @@
 > `LiveSession` + `Caps` are the shipped plane; libkrun PTY drive/live tail and
 > the experimental foreground Cloudflare managed backend are wired through it.
 > The phase narrative below is retained as implementation history. Its old
-> "Docker as a co-equal local twin" framing is superseded by ADR-001/002:
+> "Docker as a co-equal local twin" framing is superseded:
 > libkrun is the one local backend and the Docker agent backend is pending
 > deletion.
 

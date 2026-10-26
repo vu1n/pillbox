@@ -1,14 +1,14 @@
 # ghost — Decisions (ADR log)
 
 The load-bearing decisions for **ghost** (the meta-harness / conductor layer that
-runs on pillbox + kypp). Same contract as pillbox's `docs/decisions.md`: this is
+runs on pillbox + kypp). This is
 the anti-drift record — if you think "didn't we decide X?", it's here. Changing a
 decision = a new dated entry that supersedes, never a quiet reversal. Each entry
 says what was **rejected**, so it doesn't get re-proposed.
 
 > Scope note: ghost is a **tenant in this repo today** and is slated to extract to
-> its own repo (see pillbox `docs/decisions.md` ADR-008). These decisions travel
-> with ghost. pillbox-substrate decisions live in pillbox's log, not here.
+> its own repo once the pillbox contract it uses settles. These decisions travel
+> with ghost.
 
 Format: `STATUS` · what · why · what it means concretely · what's rejected.
 Most are **design-accepted, not yet built** — they gate the build order, they are

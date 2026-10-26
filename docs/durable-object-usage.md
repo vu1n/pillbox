@@ -1,7 +1,7 @@
 # Durable Object usage policy
 
-Status: **active** (2026-08-31). This policy implements
-`doc://pillbox/managed-tier-do-gateway@0003#managed-tier-do-gateway`.
+Status: **active**. Huddles owns collaboration; managed Pillbox is a
+single-controller execution runtime.
 
 ## Default rule
 
@@ -11,7 +11,7 @@ in the current managed topology is the Cloudflare Sandbox SDK's vendor-owned
 
 A new Pillbox-authored DO class requires all of the following before code:
 
-1. a ratified Brief amendment naming why D1, R2, Queues, Workflows, or local
+1. a written case, approved by the maintainer, naming why D1, R2, Queues, Workflows, or local
    state cannot satisfy the requirement;
 2. an operation budget for every request path (rows read, rows written, bytes,
    alarms, WebSocket messages, and retained state);
@@ -130,8 +130,8 @@ Record, per successful task:
 The evaluation fails if Computer requires unbounded VFS growth, per-delta
 persistence, lifecycle scans, unclear cleanup, or if its cost cannot be
 attributed per run. Preview status alone forbids production adoption. Passing
-the benchmark only authorizes an architecture proposal; adoption still needs a
-ratified amendment and explicit budgets.
+the benchmark only authorizes an architecture proposal; adoption still needs the
+maintainer's approval and explicit budgets.
 
 References:
 

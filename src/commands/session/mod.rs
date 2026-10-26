@@ -5,8 +5,8 @@
 //!
 //! Lives in `commands/` (not the registry-storage `session.rs`) so
 //! the CLI surface stays decoupled from the on-disk record format.
-// Context: doc://pillbox/dx-zero-config-local@0001#dx-zero-config-local
-// Context: doc://pillbox/optimization-external-substrate-primitives@0001#optimization-external-substrate-primitives
+// Every load-bearing journey works zero-config locally; collectors are opt-in.
+// Optimization and swarm memory live outside pillbox; this ships primitives, not the loop.
 
 use anyhow::{Context, Result};
 use std::os::unix::fs::OpenOptionsExt as _;

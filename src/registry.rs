@@ -31,7 +31,7 @@
 //! - **Sessions' no-inheritance** is encoded by not implementing
 //!   [`InheritedRegistry`], so the project→global `read_inherited`
 //!   walk never applies to them.
-// Context: doc://pillbox/adr-007-runner-image-tags-name-roles@0001#runner-image-tags-name-roles
+// Runner image tags name roles, not history.
 
 use std::{
     fs,

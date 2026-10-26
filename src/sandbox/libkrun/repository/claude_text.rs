@@ -10,7 +10,7 @@ pub(crate) struct Input {
     pub(crate) refresh_credentials: PathBuf,
 }
 
-// Context: doc://pillbox/adr-001-libkrun-is-the-backend@0001#libkrun-is-the-backend — sealed text runs in an owned microVM.
+// Sealed text runs in an owned microVM.
 pub(crate) fn launch(
     input: Input,
     limits: VmLimits,
@@ -48,7 +48,7 @@ pub(crate) fn launch(
         true,
         |owner, rpc, remaining| spec(&rootfs, &ca_dir, owner, rpc, &input, remaining),
     )?;
-    // Context: doc://pillbox/libkrun-env-fork-substrate@0002#libkrun-env-fork-substrate — the guest holds the stub; the real token reaches only the VMM child, bound to the provider host.
+    // The guest holds the stub; the real token reaches only the VMM child, bound to the provider host.
     let swaps = [SwapPair {
         stub: input.credentials.stub,
         real: input.credentials.real,
@@ -59,7 +59,7 @@ pub(crate) fn launch(
     Ok(vm)
 }
 
-// Context: doc://pillbox/vault-egress-default-deny@0002#vault-egress-default-deny — only provider egress, no workspace or auth shares.
+// Only provider egress, no workspace or auth shares.
 fn spec(
     rootfs: &Path,
     ca: &Path,
@@ -100,7 +100,7 @@ fn spec(
     }
 }
 
-// Context: doc://pillbox/adr-004-vault-broker-oauth@0001#vault-broker-oauth — fresh guest gets only stubs; host owns rotation.
+// Fresh guest gets only stubs; host owns rotation.
 fn prepare_guest(
     rootfs: &Path,
     input: &Input,

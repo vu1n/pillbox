@@ -15,7 +15,7 @@
 //! Lifetime: serves until Ctrl-C. An ephemeral exit-when-the-session-ends
 //! (watching the log for a terminal event) is a follow-up, as is auth — today
 //! it binds localhost only.
-// Context: doc://pillbox/gateway-no-daemon@0001#gateway-no-daemon
+// The gateway is an ephemeral single writer that holds the append lock only while a session is live; never a resident daemon.
 
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::AtomicBool;

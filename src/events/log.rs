@@ -126,7 +126,7 @@ impl SessionLog {
     /// last durable sequence from a bounded tail scan rather than trust the cache. The
     /// cross-process single-writer coordination this lock provides is the cheap
     /// stand-in for the resident sequencer.
-    // Context: doc://pillbox/session-event-log-spine@0001#session-event-log-spine
+    // One per-session append-only log is the durable spine; every write goes through this append.
     pub(crate) fn append(&mut self, events: &[Event]) -> Result<u64> {
         self.append_exact_batch(events, None, |_| Ok(()))
     }

@@ -13,9 +13,6 @@ workspace into one Cloudflare Sandbox, runs one bounded agent turn, stores one
 terminal claim and one immutable evidence object, then returns the evidence to
 the caller's local session log. It is not a multiplayer session service.
 
-<!-- brief:anchor managed-tier-runtime-boundary -->
-Context: `doc://pillbox/managed-tier-do-gateway@0003#managed-tier-do-gateway`
-
 ## Ownership boundary
 
 | Concern | Owner |

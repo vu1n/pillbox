@@ -126,7 +126,7 @@ Running `--vault` for an agent that isn't `vault_capable` errors with exit 2.
 > uses the shared `OAuthCodec` + `TokenStore` broker. The maintained libkrun MITM
 > also performs JIT refresh through that same broker for sessions that outlive an
 > access token. The deprecated host proxy retains pre-run refresh and rejects
-> guest token-endpoint requests rather than capturing their responses. ADR-004.
+> guest token-endpoint requests rather than capturing their responses.
 
 The problem the in-proxy refresh design hit: if the guest agent refreshes its own
 OAuth token (a single-use `refresh_token` grant), pillbox has to intercept, swap,

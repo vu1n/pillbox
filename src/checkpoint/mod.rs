@@ -7,9 +7,8 @@
 //! exclusions and limits); the Rust types here follow that schema, not the
 //! reverse.
 //!
-//! Governed by docs/decisions.md 2026-10-11 (the packet is specified as JSON
-//! Schema; the `--no-default-features` build carries every packet subcommand)
-//! and 2026-10-18 (layout and exclusions).
+//! The packet is specified as JSON Schema, and the `--no-default-features`
+//! build carries every packet subcommand.
 
 mod tar;
 

@@ -10,7 +10,7 @@
 //!   `libkrun`; the default on that build).
 //! - [`docker::DockerBackend`] — host Docker daemon (the no-KVM compat
 //!   backend; opt in via `PILLBOX_BACKEND=docker`).
-// Context: doc://pillbox/adr-003-qemu-parked@0001#qemu-parked
+// QEMU is parked; keep the backend trait seam open for it.
 
 pub(crate) mod appserver;
 pub(crate) mod appserver_client;
@@ -121,7 +121,7 @@ pub(crate) trait SandboxBackend {
 ///
 /// The method set maps 1:1 to the backend-string dispatch sites it replaces
 /// (`send`/`attach`/`kill`/`event_source`/`http`/`ingest`).
-// Context: doc://pillbox/substrate-plane-livesession@0001#substrate-plane-livesession
+// Backends dispatch through one LiveSession + Caps, never by matching on the backend name.
 pub(crate) trait LiveSession {
     /// This session's backend capabilities (the per-session view of [`Caps`]).
     fn caps(&self) -> Caps;

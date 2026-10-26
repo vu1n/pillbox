@@ -6,7 +6,7 @@
 //! `--detach`, and the opencode server path), reattach/kill, and the §0/opencode
 //! accessors `commands::session` calls. The VMM child entry, the spec types, and
 //! the CoW/stub/rootfs helpers stay in [`super`] (shared with `vmm_child_main`).
-// Context: doc://pillbox/libkrun-env-fork-substrate@0001#libkrun-env-fork-substrate
+// The microVM owns egress in userspace; the guest never holds the real credential.
 
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -668,7 +668,7 @@ fn env_fork_creds(
     with_vault: Vec<WithSwap>,
     prepare_clone: impl FnOnce(&Path) -> Result<()>,
 ) -> Result<EnvFork> {
-    // Context: doc://pillbox/libkrun-env-fork-substrate@0001#libkrun-env-fork-substrate — the guest mounts stubs; the real credential reaches only the VMM child's MITM.
+    // The guest mounts stubs; the real credential reaches only the VMM child's MITM.
     // Env fork: CoW the auth home and stub its OAuth tokens. The guest mounts the
     // *stubbed* creds — the real tokens never enter the VM; the MITM swaps
     // stub→real on the wire. The reals reach the child out-of-band on stdin (not

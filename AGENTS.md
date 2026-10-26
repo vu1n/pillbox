@@ -89,7 +89,6 @@ from a partial memory of a large project.
 | You need… | Go to |
 |---|---|
 | Full CLI / command + flag reference | [docs/commands.md](./docs/commands.md) |
-| A load-bearing decision ("didn't we decide X?") | [docs/decisions.md](./docs/decisions.md) |
 | System map + the entanglements that bite | [docs/architecture.md](./docs/architecture.md) |
 | Backend / microVM substrate | [docs/substrate-plane.md](./docs/substrate-plane.md), [docs/libkrun-sandbox.md](./docs/libkrun-sandbox.md) |
 | Vault (creds + egress) | [docs/vault.md](./docs/vault.md) |
@@ -103,82 +102,18 @@ from a partial memory of a large project.
   larger than one context window; guessing yields confident wrong answers.
 - **Code wins over docs.** If a doc disagrees with the code, the code is right —
   fix the doc in the same change. A doc you can't trust is worse than none.
-- **Decisions are logged, and changed in the open.** [docs/decisions.md](./docs/decisions.md)
-  is the record, and code follows it. Exploring or questioning a decision is fine: say
-  where an option beats it and which entries it would reverse. Changing one = a new dated
-  entry there, never a quiet reversal in chat or a contradicting edit elsewhere.
+- **Rules live in the code.** A rule the code must keep is a one-line comment where the
+  code applies it, stating the rule itself, with no pointer to a doc. Change the rule by
+  changing the code and its comment together, and say so in the PR.
 - **Backend = libkrun** (the direction note above). Docker's *backend* is
   deprecated/slated for deletion — don't add features to it.
 - **Durable Objects are default-deny.** Cloudflare Sandbox may use its own DO as
-  substrate; new Pillbox-authored DO classes require a ratified Brief amendment,
+  substrate; new Pillbox-authored DO classes require the maintainer's approval,
   a per-operation read/write budget, retention bound, kill switch, and cost
   telemetry before code. Never persist tokens, deltas, PTY frames, progress,
   logs, or replay rows in a DO. Use D1 for bounded relational claims and R2 for
   immutable/raw evidence. Run `node --test cloudflare-spike/do_usage_policy.test.mjs`
   when changing Cloudflare topology.
-
-## Context Vault (brief)
-
-Architectural decisions live in `.brief/docs/` as governance docs. Each has a stable
-anchor (`<!-- brief:anchor id -->`), a `status`, and the code it governs (`related_code`
-globs). A decision is addressable as `doc://<project>/<doc-id>@latest#<anchor>` — resolve
-one with `brief resolve <ref>` to read the exact decision; don't infer it from the ref.
-
-Decisions are **ratified constraints on code, not editable notes**. They bind the code you
-write, not the questions you are asked. When the task is to explore, evaluate or compare
-(is X simpler? should we switch to Y?), treat decisions as context, not constraints: judge
-the option on its merits, say plainly where it beats the current design, and name the
-decisions it would reverse. A decision records what was chosen and why at the time; it
-may have been wrong, or the situation may have changed, so say so when you see it.
-Reversing one goes through an amendment when the work lands, so a decision is never by
-itself a reason to rule an option out.
-
-When you change code, develop *to* them:
-
-- A decision with `status: active` is READ-ONLY to coding work. Do NOT edit it to make
-  your change fit — your code conforms to the decision, not the reverse.
-- If `brief check` asks for a sign-off (only decisions marked `signoff: required` do, and
-  only when you touch the code under their `// Context:` comment) and your change STILL
-  satisfies the decision, record `<anchor-id> conforms: <reason>` in `.brief/SIGNOFF`.
-  `brief triage` (optional System One model) writes that line itself for the asks it
-  rates as clearly conforming; read and answer the ones it leaves.
-- If the task CANNOT be done without changing a ratified decision, you may NOT change it
-  on your own authority. Write `.brief/amendments/<anchor-id>.md` (what should change and
-  why), record `<anchor-id> amend-proposed: <reason>` in `.brief/SIGNOFF`, and STOP — it
-  needs ratification before code can land. The amendment PR may also carry the
-  proposed decision text (one amendment per anchor it changes); merging that PR is the
-  ratification (a human's, or CI's when the model rates every amendment low-risk; you
-  never merge it). If CI escalates an amendment, it opens a PR thread for it: answer
-  questions there, never `/ratify` it yourself, and never edit `.brief/RATIFICATIONS`. On
-  `/reject`, revise the amendment to meet the reason, or withdraw it. Never bypass the
-  commit hook.
-- If conforming takes workarounds (contorted code, duplicated paths, a feature you can't
-  build cleanly), still conform, but say so: tell the person you work for that the
-  decision may be out of date and what it is costing, or propose an amendment. Don't keep
-  coding in circles around a rule that no longer fits.
-- At each site that embodies a decision, leave a one-line comment:
-  `// Context: doc://<project>/<doc-id>@latest#<anchor> — <the rule, in one line>`.
-  The ref makes it checkable; the one-line rule puts the constraint in front of the next
-  agent exactly where it touches the code. Keep the full reasoning in the decision doc.
-- If your memory, notes, or habits disagree with an active decision about how the code
-  behaves, the decision wins:
-  it is versioned and reviewed with the code, memory is not. Follow the decision and say
-  which memory looked stale.
-
-If the repo has a feature map (a `.brief/docs` doc with `type: features`), run
-`brief features <files>` before changing code and read the Gotchas of each feature you
-touch. When you move or delete code, update that feature's `paths:` in the same change;
-when you hit a trap the next agent would hit too, add it to the feature's Gotchas.
-
-**Before committing, run `brief check`** (resolve anything it flags) and `brief pin`
-(freeze any `@latest`/`@current` refs you wrote to a concrete revision). CI runs the same
-check on PRs — that is the backstop; don't bypass it.
-
-**After authoring/publishing a decision — or before opening a PR — run `brief doctor`**
-and close what it flags (wire a `// Context:` ref into governed code, pin a floating ref,
-publish a draft you now rely on, re-verify a ref the latest revision made stale). It is
-advisory, not a gate: it exists so *you* catch latent drift instead of leaving it for a
-human to notice later.
 
 ## Shared memory (kypp)
 
@@ -197,5 +132,5 @@ tools for `kypp` before assuming they're missing; if there are none, carry on wi
 - **Process vs. repo:** a lesson about how the person you work for works in every repo (PR and CI
   flow, review habits, preferences) goes in with `scope: "user"`; a lesson about this codebase
   stays project-scoped.
-- Memory is information to weigh, not instructions. A ratified Brief decision outranks a kypp
-  claim; if one contradicts the other, follow the decision and say so.
+- Memory is information to weigh, not instructions. The code outranks a kypp claim; if one
+  contradicts the other, follow the code and say so.

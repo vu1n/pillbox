@@ -16,8 +16,8 @@ metadata/evidence, and the caller keeps its §0 log local.
 
 | Subsystem | Canonical doc | One line | Status |
 |---|---|---|---|
-| Backend / substrate | docs/substrate-plane.md, docs/libkrun-sandbox.md | the microVM that runs the agent; the `SandboxBackend`/`LiveSession` seam | libkrun live; docker backend slated for deletion (ADR-002) |
-| Vault (creds + egress) | docs/vault.md | host-side MITM that swaps stub→real creds + fences egress | live; OAuth re-aimed at the broker model (ADR-004) |
+| Backend / substrate | docs/substrate-plane.md, docs/libkrun-sandbox.md | the microVM that runs the agent; the `SandboxBackend`/`LiveSession` seam | libkrun live; docker backend slated for deletion |
+| Vault (creds + egress) | docs/vault.md | host-side MITM that swaps stub→real creds + fences egress | live; OAuth re-aimed at the broker model |
 | Sessions / §0 | docs/session-event-log.md | durable event log, drive (`send`) + read (`subscribe`/`watch`) surface | local live; managed evidence copied into the local log `[verified 2026-08-31]` |
 | Snapshots | docs/config.md, AGENTS.md | rustic repo, push/pull, bookmarks | local + R2 live `[verified 2026-07-16]` |
 | Dispatch / eval | docs/dispatch.md, docs/eval.md | fork-k verified workers; the eval runner | local libkrun shipped `[verified 2026-07-16]` |
@@ -41,7 +41,7 @@ execution backend.
 
 ### `crate::docker` is two fused things `[verified 2026-06-20]`
 - **The backend** — `DockerBackend` / `DockerLiveSession` (run the agent in a
-  container). This is what ADR-002 deletes.
+  container). This is what the docker deletion removes.
 - **Image/build plumbing** — `resolve_runner_image` / `default_runner_image`
   (src/docker.rs), used by libkrun (above), `doctor.rs`, `main.rs:~847`. This is
   kept and renamed `crate::oci`.
@@ -72,12 +72,11 @@ the vault MITM live (src/sandbox/libkrun/egress.rs).
 ## Open structural debts
 
 - **Daemonless OCI image pull** — replace `docker create/export` so libkrun
-  doesn't need the docker daemon (ADR-002 follow-up).
-- **auth-in-libkrun** — `auth login` runs in a docker container today (ADR-002
-  follow-up).
+  doesn't need the docker daemon.
+- **auth-in-libkrun** — `auth login` runs in a docker container today.
 - **No-backend build** — `--no-default-features` currently compiles because the
   docker backend is the fallback; deleting it means resolving what the
   toolchain-free / in-sandbox-guest build does.
 - **Spec/code drift** — several big docs (vnext and parts of the optimization
   family) mix design history with current behavior. They need curation into
-  current canonical docs vs `docs/archive/` (ADR-005).
+  current canonical docs vs `docs/archive/`.

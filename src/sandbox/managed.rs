@@ -46,8 +46,8 @@
 //!   - **Token provisioning / trust.** Where a real user's token/secret comes
 //!     from (vs the spike's `/tmp` file) is unresolved; the env config above is
 //!     the interim surface.
-// Context: doc://pillbox/managed-store-of-record@0001#managed-store-of-record
-// Context: doc://pillbox/managed-tier-do-gateway@0003#managed-tier-do-gateway
+// Rustic-over-R2 is the managed store of record; Cloudflare snapshots are only a fork mechanism.
+// Huddles owns collaboration; managed pillbox is a single-controller runtime with no Pillbox-authored Durable Object.
 
 use std::path::PathBuf;
 

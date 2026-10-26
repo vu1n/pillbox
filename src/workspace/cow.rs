@@ -13,7 +13,7 @@
 //!
 //! Compiled unconditionally (like [`super::ingest`]) so both CI targets
 //! (ubuntu + macOS) exercise it; used behind the `libkrun` feature today.
-//! Context: doc://pillbox/workspace-cow-fork@latest#workspace-cow-fork
+//! A workspace fork is a base cache materialized once plus a copy-on-write clone.
 #![allow(dead_code)]
 
 use std::path::Path;

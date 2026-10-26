@@ -3,7 +3,7 @@
 The full `pillbox` CLI surface — the detail behind the AGENTS.md router.
 
 > **NOTE:** docker-backend commands/flags below are **deprecated** — libkrun
-> is THE backend ([decisions.md](./decisions.md) ADR-001/002). They remain
+> is THE backend. They remain
 > documented until the docker backend is deleted.
 
 ## Command surface
@@ -229,8 +229,7 @@ only its own sessions; the global pillbox's list shows global ones.
 
 ### Engine subcommands (Stratus)
 
-Hidden from `pillbox --help`: Stratus calls these, users do not
-([decisions.md](./decisions.md), 2026-10-11). They resolve no pillbox, are in
+Hidden from `pillbox --help`: Stratus calls these, users do not. They resolve no pillbox, are in
 the `--no-default-features` build, and print one versioned JSON object with
 `--json`.
 

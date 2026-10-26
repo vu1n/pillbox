@@ -13,7 +13,7 @@
 //! `pillbox sandbox` runtime (`commands::sandbox`) is the per-emitter producer
 //! today; the per-session [`crate::events::log::SessionLog`] is the durable
 //! spine new producers target (see docs/session-event-log.md).
-// Context: doc://pillbox/agent-io-pty-free-contract@0002#agent-io-pty-free-contract
+// Agent I/O is a PTY-free structured channel; pillbox produces it and is not a platform.
 
 // Contract surface lands ahead of its first producer (contract-first).
 #![allow(dead_code)]

@@ -11,7 +11,7 @@
 //!
 //! Compiled unconditionally (like [`super::cow`] / [`super::ingest`]) so its
 //! flock/concurrency tests run on every CI target, not only the libkrun build.
-//! Context: doc://pillbox/workspace-cow-fork@latest#workspace-cow-fork
+//! A workspace fork is a base cache materialized once plus a copy-on-write clone.
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};

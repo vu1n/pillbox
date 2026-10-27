@@ -4,6 +4,10 @@ Topic-organized deep dives. For the agent-facing command reference, see
 [../AGENTS.md](../AGENTS.md). **This index is the map — it marks what's
 authoritative.** When a design doc and a banner disagree, the banner (newer) wins.
 
+Start from the [feature maps](features/README.md) for behavior, implementation entry
+points and functional test commands. [Retired decision records](archive/brief/README.md)
+preserve historical status, including unratified proposals; they are not current authority.
+
 ## Direction (read these first — current strategy + substrate)
 
 | File | What |

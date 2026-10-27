@@ -18,6 +18,14 @@ then implement the smallest end-to-end slice.
 Read [`AGENTS.md`](./AGENTS.md) and the relevant canonical document before
 changing a subsystem.
 
+## Feature maps
+
+Use [docs/features/README.md](docs/features/README.md) to find the affected behavior
+and its tests before editing. Update the map alongside implementation changes.
+Run `python3 scripts/featuremap.py check` and
+`python3 -m unittest discover -s scripts -p 'test_featuremap.py' -v` for map tooling.
+The map is descriptive; historical decision status stays in the archive.
+
 ## Development checks
 
 The platform-independent Rust path:

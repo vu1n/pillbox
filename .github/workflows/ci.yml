@@ -58,6 +58,11 @@ jobs:
       # (on ubuntu) to save macOS minutes (~10x cost).
       - if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --check
+      - name: Feature map pointers and helper
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          python3 scripts/featuremap.py check
+          python3 -m unittest discover -s scripts -p 'test_featuremap.py' -v
       - name: Repository smoke fixtures (offline)
         if: matrix.os == 'ubuntu-latest'
         run: |

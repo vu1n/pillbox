@@ -88,6 +88,7 @@ from a partial memory of a large project.
 
 | You need… | Go to |
 |---|---|
+| Feature behavior, code entry points and functional tests | [docs/features/README.md](./docs/features/README.md) |
 | Full CLI / command + flag reference | [docs/commands.md](./docs/commands.md) |
 | System map + the entanglements that bite | [docs/architecture.md](./docs/architecture.md) |
 | Backend / microVM substrate | [docs/substrate-plane.md](./docs/substrate-plane.md), [docs/libkrun-sandbox.md](./docs/libkrun-sandbox.md) |
@@ -100,6 +101,9 @@ from a partial memory of a large project.
 - **Retrieve before asserting.** Before stating how a subsystem works or changing
   it, read its canonical doc (map above) **and** the relevant code. The project is
   larger than one context window; guessing yields confident wrong answers.
+- Before changing code, run `python3 scripts/featuremap.py features <files...>` and
+  read the matching tests and Gotchas. Update affected maps in the same PR and run
+  `python3 scripts/featuremap.py check`; see the feature index for driving conventions.
 - **Code wins over docs.** If a doc disagrees with the code, the code is right —
   fix the doc in the same change. A doc you can't trust is worse than none.
 - **Rules live in the code.** A rule the code must keep is a one-line comment where the

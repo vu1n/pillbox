@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# vendored from vu1n/dev@065e973785d468d06812f0fc60c74b09d5915bb3; sha256 9a5862396bfe1a5e9a392d322e7a94cc7ca337c227e806bf9944b34be3343043
+# vendored from vu1n/dev@baa1c6f2b1225bc5644ec045eb0d9dbec9663d4e; sha256 e4a074e6c3ef7cd1e821b9dab914ef01304959beadb7e119f3ad22e5d1e376d1
 """A repo's feature map: which code and tests implement each feature, and whether the map's
 pointers still resolve.
 
@@ -258,8 +258,10 @@ def check_drive(root: Path, scenario: str) -> str | None:
         text = doc.read_text(errors="replace") if doc.relative_to(root).as_posix() in tracked and doc.is_file() else ""
         for line in re.findall(r"^\s*Scenarios:(.*)$", text, re.M):
             known.update(w for quoted in re.findall(r"`([^`]+)`", line) for w in quoted.split())
-        # The whole token is the scenario (`send.v2`), less a sentence's closing punctuation.
-        known.update(t.rstrip(".,;:") for t in re.findall(r"drive\.sh\s+([^\s`'\"|()]+)", text))
+        # The whole token is the scenario (`send.v2`), less a sentence's closing punctuation; a
+        # token with a placeholder (`<scenario>`, `send$v`, `{a,b}`) names none, not even its prefix.
+        known.update(t.rstrip(".,;:") for t in re.findall(r"drive\.sh\s+([^\s`'\"|()]+)", text)
+                     if not re.search(r"[<>${}]", t))
     name = scenario.split()[0]
     return None if name in known else f"no scenario {name!r} in the verify skill"
 

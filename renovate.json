@@ -1,7 +1,6 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:recommended", ":dependencyDashboard"],
-  "labels": ["dependencies"],
+  "extends": ["local>vu1n/dev:renovate-preset"],
   "customManagers": [
     {
       "customType": "regex",
@@ -13,9 +12,10 @@
   ],
   "packageRules": [
     {
-      "description": "Auto-merge harness patch + minor bumps once CI is green",
+      "description": "Harness bumps stay on despite the preset turning routine bumps off; patch + minor auto-merge once CI is green",
       "matchManagers": ["custom.regex"],
       "matchUpdateTypes": ["patch", "minor"],
+      "enabled": true,
       "automerge": true,
       "automergeType": "pr",
       "platformAutomerge": true
@@ -24,13 +24,8 @@
       "description": "Major bumps hold for human review",
       "matchManagers": ["custom.regex"],
       "matchUpdateTypes": ["major"],
+      "enabled": true,
       "automerge": false
-    },
-    {
-      "description": "Cargo dependencies group into one PR weekly",
-      "matchManagers": ["cargo"],
-      "schedule": ["before 6am on monday"],
-      "groupName": "cargo dependencies"
     }
   ]
 }

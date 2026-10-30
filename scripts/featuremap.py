@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# vendored from vu1n/dev@fb56315bbdb7ccfa7dbe8027b3f8e95a34794d98; sha256 116502ee8f9ab9a1af6a9a2f6e7a7573551bd89db3bd3d9c5604fb289d109376
+# vendored from vu1n/dev@8ffc64ba7fd58f4beb22931d4ac004bf5af745ff; sha256 164c543e24efebc7af498e756ac0be71b3a100da34d9c34acaa7a9576cf43c8b
 """A repo's feature map: which code and tests implement each feature, and whether the map's
 pointers still resolve.
 
@@ -28,6 +28,11 @@ seen on a screen: the node shows `img: "shot:<id>.png"`), or gap (nothing covers
 the flow's `gap` class). `check` fails when a node has no row, a row names no node, a label and its
 node disagree, a pointer doesn't resolve, a shot isn't under `shots/<feature id>/`, a node can't be
 reached from the start, or a node with no arrow out isn't in an end class (done, nothing, stopped).
+
+A feature can add a `## Rules` table, `| Rule | Proof | Fails on |`: a promise, the test, drive or
+`model:<spec>.tla#<RULE>` that checks it (or `gap`), and the break it was seen to catch. `check`
+fails when a proof doesn't resolve, a model rule isn't in its spec and its config's INVARIANT or
+PROPERTY lines, or a proved rule names no break.
 
 Stdlib only, so a repo can vendor it as scripts/featuremap.py and run it in CI. A user flow is
 parsed by Pele, the Mermaid parser, run with node and imported from beside this script.
@@ -178,6 +183,7 @@ def check(root: Path, features: list[Feature]) -> tuple[list[str], list[str]]:
         if not f.tests:
             notes.append(f"{where}: lists no tests")
         problems += [f"{where}: user flow: {p}" for p in check_flow(root, f)]
+        problems += [f"{where}: rules: {p}" for p in check_rules(root, f)]
     return problems, notes
 
 
@@ -339,16 +345,122 @@ def check_flow(root: Path, f: Feature) -> list[str]:
         # ✓ needs a named test (file:test) or a drive; a bare file asserts nothing.
         if label == "✓" and not drives and not any(_pointer(root, r)[1] for r in tests):
             problems.append(f"`{node}`: asserted, but its proof names no test or drive")
-        for scenario in drives:
+        problems += [f"`{node}`: {p}" for p in check_proofs(root, refs)]
+    return problems
+
+
+def check_proofs(root: Path, refs: list[str]) -> list[str]:
+    """Why each proof pointer, a `drive.sh <scenario>`, a `file:test name` or a
+    `model:<spec>.tla#<RULE>`, doesn't resolve."""
+    problems = []
+    for ref in refs:
+        if ref.startswith("drive.sh "):
+            scenario = ref[len("drive.sh "):].strip()
             problem = check_drive(root, scenario)
             if problem:
-                problems.append(f"`{node}`: proof `drive.sh {scenario}`: {problem}")
-        for ref in tests:
+                problems.append(f"proof `drive.sh {scenario}`: {problem}")
+        elif ref.startswith("model:"):
+            problem = check_model(root, ref[len("model:"):])
+            if problem:
+                problems.append(f"proof `{ref}`: {problem}")
+        else:
             file, name = _pointer(root, ref)
             if not file.is_file():
-                problems.append(f"`{node}`: proof {ref!r}: no file {file.relative_to(root) if file.is_relative_to(root) else file}")
+                problems.append(f"proof {ref!r}: no file {file.relative_to(root) if file.is_relative_to(root) else file}")
             elif name and name not in file.read_text(errors="replace"):
-                problems.append(f"`{node}`: proof {ref!r}: {name!r} not found in the file")
+                problems.append(f"proof {ref!r}: {name!r} not found in the file")
+    return problems
+
+
+_CFG_KEYWORDS = {
+    "CONSTANT", "CONSTANTS", "CHECK_DEADLOCK", "INIT", "NEXT", "SPECIFICATION", "VIEW", "SYMMETRY",
+    "TYPE", "TYPE_CONSTRAINT", "INVARIANT", "INVARIANTS", "PROPERTY", "PROPERTIES", "CONSTRAINT",
+    "CONSTRAINTS", "ACTION_CONSTRAINT", "ACTION_CONSTRAINTS", "POSTCONDITION", "ALIAS",
+}
+
+
+def _tla_code(text: str) -> str:
+    """TLA+ or TLC config text without its comments (`\\*` to the line's end, and `(* *)`, nested)
+    or the contents of its strings, so neither can define or list a rule."""
+    out, depth, i = [], 0, 0
+    while i < len(text):
+        two = text[i:i + 2]
+        if two == "(*":
+            # A comment separates tokens, as whitespace does.
+            out.append(" " if not depth else "")
+            depth, i = depth + 1, i + 2
+        elif two == "*)" and depth:
+            depth, i = depth - 1, i + 2
+        elif depth:
+            out.append("\n" if text[i] == "\n" else "")
+            i += 1
+        elif text[i] == '"':
+            end = re.compile(r'"(?:\\.|[^"\\\n])*"').match(text, i)
+            out.append('""')
+            i = end.end() if end else i + 1
+        elif two == "\\*":
+            end = text.find("\n", i)
+            i = len(text) if end < 0 else end
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
+def check_model(root: Path, ref: str) -> str | None:
+    """Why `<spec>.tla#<RULE>` names no rule TLC checks, or None: the spec defines RULE, and the
+    config beside it (`<spec>.cfg`, as `statechart` reads it) lists it as an INVARIANT or PROPERTY."""
+    spec, _, rule = ref.partition("#")
+    if not spec.endswith(".tla") or not rule:
+        return "is not <spec>.tla#<RULE>"
+    tla, cfg = root / spec, root / (spec[: -len(".tla")] + ".cfg")
+    if not tla.is_file():
+        return f"no file {spec}"
+    if not re.search(rf"^[ \t]*{re.escape(rule)}\s*==", _tla_code(tla.read_text(errors="replace")), re.M):
+        return f"{spec} defines no {rule}"
+    if not cfg.is_file():
+        return f"no config {cfg.relative_to(root)} beside the spec"
+    # A config names rules after INVARIANT(S) or PROPERTY(IES), up to TLC's next config keyword.
+    listed, keyword = set(), None
+    for word in re.findall(r"\w+", _tla_code(cfg.read_text(errors="replace"))):
+        if word in _CFG_KEYWORDS:
+            keyword = word
+        elif keyword in ("INVARIANT", "INVARIANTS", "PROPERTY", "PROPERTIES"):
+            listed.add(word)
+    return None if rule in listed else f"{cfg.relative_to(root)} doesn't check {rule}"
+
+
+def check_rules(root: Path, f: Feature) -> list[str]:
+    """What a feature's `## Rules` gets wrong. Each row is a promise in the reader's words, the
+    proof that checks it, and the break that proof was seen to catch; or `gap` and nothing."""
+    if not re.search(r"^## Rules\s*$", f.body, re.M):
+        return []
+    rows, problems = [], []
+    for line in f.section("Rules").splitlines():
+        if not line.lstrip().startswith("|"):
+            continue
+        # Cells split on unescaped pipes; a row that isn't three cells is reported, never skipped.
+        cells = [c.strip().replace("\\|", "|") for c in re.split(r"(?<!\\)\|", line.strip())[1:]]
+        if cells and cells[-1] == "":
+            cells.pop()
+        if len(cells) != 3:
+            problems.append(f"row {line.strip()!r} isn't `| Rule | Proof | Fails on |`")
+        elif not re.fullmatch(r":?-+:?", cells[0]) and cells[0] != "Rule":
+            rows.append(tuple(cells))
+    if not rows and not problems:
+        return ["no `| Rule | Proof | Fails on |` table"]
+    for rule, proof, fails in rows:
+        short = rule if len(rule) <= 40 else rule[:37] + "..."
+        if proof == "gap":
+            continue
+        refs = re.findall(r"`([^`]+)`", proof)
+        named = [r for r in refs if r.startswith(("drive.sh ", "model:")) or _pointer(root, r)[1]]
+        # A proof never seen to fail proves nothing: say what break it caught.
+        if not named:
+            problems.append(f"{short!r}: proof names no test, drive or model (or write gap)")
+        if not fails or re.fullmatch(r"[-–—]", fails):
+            problems.append(f"{short!r}: no break it was seen to fail on")
+        problems += [f"{short!r}: {p}" for p in check_proofs(root, refs)]
     return problems
 
 

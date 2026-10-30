@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# vendored from vu1n/dev@baa1c6f2b1225bc5644ec045eb0d9dbec9663d4e; sha256 e4a074e6c3ef7cd1e821b9dab914ef01304959beadb7e119f3ad22e5d1e376d1
+# vendored from vu1n/dev@fb56315bbdb7ccfa7dbe8027b3f8e95a34794d98; sha256 116502ee8f9ab9a1af6a9a2f6e7a7573551bd89db3bd3d9c5604fb289d109376
 """A repo's feature map: which code and tests implement each feature, and whether the map's
 pointers still resolve.
 
@@ -439,6 +439,7 @@ def main(argv: list[str] | None = None) -> int:
     fe.add_argument("--base", help="diff BASE...HEAD instead of naming files")
     fe.add_argument("files", nargs="*")
     sub.add_parser("check", help="exit 1 when a pointer no longer resolves")
+    sub.add_parser("stale", help="every feature whose paths changed after its file last did")
     a = ap.parse_args(argv)
     try:
         root = Path(git(Path(a.root), "rev-parse", "--show-toplevel").strip())
@@ -454,6 +455,10 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"error: {p}")
             print(f"{len(features)} features, {len(problems)} broken pointer(s)")
             return 1 if problems else 0
+        if a.cmd == "stale":
+            hit = [f for f in features if stale(root, f)]
+            print(render(root, hit, []) if hit else "No feature is possibly stale.\n", end="")
+            return 0
         if not a.files and not a.base:
             ap.error("features needs FILE ... or --base REF")
         files = a.files or changed_files(root, a.base)

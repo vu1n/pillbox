@@ -1,6 +1,6 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["local>vu1n/dev:renovate-preset"],
+  "extends": ["github>vu1n/renovate-config"],
   "customManagers": [
     {
       "customType": "regex",

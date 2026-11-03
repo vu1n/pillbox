@@ -151,8 +151,9 @@ struct VmSpec {
 struct EgressSpec {
     /// DNS-fence allowlist: only these hosts resolve; everything else NXDOMAINs.
     allowlist: Vec<String>,
-    /// Optional host-side diagnostics file (the guest console eats the child's
-    /// stderr). Set from `PILLBOX_KRUN_EGRESS_LOG`; `None` falls back to stderr.
+    /// Host-side diagnostics file (the guest console eats the child's stderr):
+    /// `PILLBOX_KRUN_EGRESS_LOG`, else one per run under `~/.pillbox/krun/egress/`
+    /// ([`egress_log_path`]). `None` falls back to stderr.
     log_path: Option<String>,
     /// Host path of the vault CA dir. When set, the child loads the CA (key stays
     /// host-side) to mint per-SNI MITM leaves; `None` = DNS-fence only.
@@ -1026,6 +1027,61 @@ fn krun_cache_dir() -> Result<PathBuf> {
     Ok(crate::paths::pillbox_root()?.join("krun"))
 }
 
+/// How long a run's egress log is kept before a later run prunes it.
+const EGRESS_LOG_RETENTION: std::time::Duration = std::time::Duration::from_secs(14 * 24 * 3600);
+
+/// Where a VM's egress fence writes its DNS and TLS decisions: `PILLBOX_KRUN_EGRESS_LOG`, else a
+/// fresh file under `~/.pillbox/krun/egress/`. A refusal always lands where a person can read it,
+/// since libkrun swallows the VMM child's stderr.
+pub(super) fn egress_log_path() -> Option<String> {
+    if let Ok(path) = std::env::var("PILLBOX_KRUN_EGRESS_LOG") {
+        return Some(path);
+    }
+    let dir = krun_cache_dir().ok()?.join("egress");
+    std::fs::create_dir_all(&dir).ok()?;
+    crate::paths::ensure_mode_0700(&dir).ok()?;
+    prune_egress_logs(&dir);
+    let file = dir.join(format!("{}.log", uuid::Uuid::now_v7().simple()));
+    Some(file.to_string_lossy().into_owned())
+}
+
+fn prune_egress_logs(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > EGRESS_LOG_RETENTION);
+        if old {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// The names the fence refused, sorted and once each, as its log records them: an NXDOMAIN'd
+/// lookup (egress.rs `serve_dns`) or a TLS connection whose SNI skipped the resolver (mitm.rs).
+pub(super) fn egress_refusals(log: &str) -> Vec<String> {
+    let mut names: Vec<String> = log
+        .lines()
+        .filter_map(|line| {
+            if let Some(rest) = line.split("] NXDOMAIN ").nth(1) {
+                return rest.split_whitespace().next().map(str::to_string);
+            }
+            let rest = line.split("] DENY sni=").nth(1)?;
+            rest.split_whitespace()
+                .next()
+                .map(|s| s.trim_matches('"').to_string())
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// Filesystem-safe cache key for an image ref (`a/b:c` → `a_b_c`).
 fn sanitize(image: &str) -> String {
     image
@@ -1040,6 +1096,23 @@ fn cstr(s: &str) -> CString {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn egress_refusals_lists_each_refused_name_once() {
+        let log = "krun-egress: [dns] NXDOMAIN metadata.google.internal (not on allowlist — fenced)\n\
+                   krun-egress: [dns] pin api.anthropic.com\n\
+                   krun-egress: [mitm] ALLOW sni=\"api.anthropic.com\" → DNS-pinned, terminating\n\
+                   krun-egress: [mitm] DENY sni=\"evil.example\" → RST (SNI not resolved via our resolver)\n\
+                   krun-egress: [dns] NXDOMAIN metadata.google.internal (not on allowlist — fenced)\n";
+        assert_eq!(
+            super::egress_refusals(log),
+            vec![
+                "evil.example".to_string(),
+                "metadata.google.internal".to_string()
+            ]
+        );
+        assert!(super::egress_refusals("").is_empty());
+    }
+
     use std::process::Command;
 
     use base64::Engine as _;

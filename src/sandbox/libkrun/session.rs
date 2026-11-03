@@ -215,6 +215,27 @@ impl SandboxBackend for LibkrunBackend {
         let _ = std::fs::remove_file(&launch.attach_sock);
         let _ = std::fs::remove_dir_all(&launch.creds_share);
         let _ = std::fs::remove_dir_all(&launch.workspace_clone);
+        // A refused lookup or connection is said out loud: it is how a probing agent shows itself.
+        if let Some(path) = &launch.egress_log {
+            let refused = std::fs::read_to_string(path)
+                .map(|log| super::egress_refusals(&log))
+                .unwrap_or_default();
+            if !refused.is_empty() {
+                let shown = refused
+                    .iter()
+                    .take(5)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let more = refused.len().saturating_sub(5);
+                let more = if more > 0 {
+                    format!(" and {more} more")
+                } else {
+                    String::new()
+                };
+                eprintln!("pillbox: the egress fence refused {shown}{more} this run; see {path}");
+            }
+        }
         // A SIGABRT'd VMM is the missing-runtime-dep footgun (`brew cleanup` swept
         // libkrun's undeclared dylibs). The attach/pump already failed with an
         // opaque "VMM exited" — replace it with the actionable cause when we can.
@@ -241,6 +262,8 @@ struct Launch {
     creds_share: PathBuf,
     workspace_clone: PathBuf,
     guest_workspace: String,
+    /// The fence's log for this run, read after it for the refusal count.
+    egress_log: Option<String>,
     /// The run's vault CA — held so its per-run ephemeral backing dir (if any)
     /// outlives the supervised VMM child and is dropped after the run.
     _ca: VaultCa,
@@ -599,6 +622,7 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
         krun_cache_dir()?.join(format!("attach-{}.sock", uuid::Uuid::now_v7().simple()));
     let _ = std::fs::remove_file(&attach_sock);
 
+    let egress_log = super::egress_log_path();
     let vmspec = VmSpec {
         offline: false,
         ownership: None,
@@ -620,7 +644,7 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
         }),
         egress: Some(EgressSpec {
             allowlist: vault_egress_allowlist(opts, &with_hosts),
-            log_path: std::env::var("PILLBOX_KRUN_EGRESS_LOG").ok(),
+            log_path: egress_log.clone(),
             ca_dir: Some(ca.dir.to_string_lossy().into_owned()),
             local_forward_port: None, // vaulted agents: no local-model forward
             refresh,
@@ -641,6 +665,7 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
         creds_share,
         workspace_clone: clone,
         guest_workspace,
+        egress_log,
         _ca: ca,
     })
 }
@@ -1054,7 +1079,7 @@ fn launch_server_vm(
                 .chain(launch.egress_extra)
                 .chain(opts.egress_allow.iter().cloned())
                 .collect(),
-            log_path: std::env::var("PILLBOX_KRUN_EGRESS_LOG").ok(),
+            log_path: super::egress_log_path(),
             ca_dir: Some(ca.dir.to_string_lossy().into_owned()),
             local_forward_port: launch.local_forward_port,
             refresh: None, // opencode server mode: non-vault, holds its own real key
@@ -1386,7 +1411,7 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
         vsock: None,
         egress: Some(EgressSpec {
             allowlist,
-            log_path: std::env::var("PILLBOX_KRUN_EGRESS_LOG").ok(),
+            log_path: super::egress_log_path(),
             ca_dir: Some(ca.dir.to_string_lossy().into_owned()),
             local_forward_port: None,
             refresh,
@@ -1975,7 +2000,7 @@ pub(crate) fn score_in_sandbox(
             // Only the invoker-declared hosts resolve — the tightest fence (no
             // provider/standard-egress union; the grader reaches deps, nothing else).
             allowlist: egress_allow.to_vec(),
-            log_path: std::env::var("PILLBOX_KRUN_EGRESS_LOG").ok(),
+            log_path: super::egress_log_path(),
             ca_dir: Some(ca.dir.to_string_lossy().into_owned()),
             local_forward_port: None, // grader: tightest fence, no local forward
             refresh: None,            // grader holds no credentials — nothing to refresh

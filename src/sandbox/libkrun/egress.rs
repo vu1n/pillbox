@@ -110,8 +110,8 @@ impl PinTable {
 }
 
 /// Host-side diagnostics sink. libkrun wires the guest console to the VMM child's
-/// stdio, so the egress thread's `eprintln` is swallowed — write to a file when
-/// one is configured (`PILLBOX_KRUN_EGRESS_LOG`), else fall back to stderr. (A
+/// stdio, so the egress thread's `eprintln` is swallowed — write to the run's
+/// file (`super::egress_log_path`), else fall back to stderr. (A
 /// stopgap until L5c routes these as §0 events.) Shared with [`super::mitm`].
 pub(super) struct Diag(Option<Mutex<std::fs::File>>);
 

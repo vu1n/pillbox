@@ -160,8 +160,9 @@ pub(super) fn nxdomain_line(name: &str) -> String {
     format!("krun-egress: [dns] NXDOMAIN {name:?} (not on allowlist — fenced)")
 }
 
-pub(super) fn deny_sni_line(sni: &str) -> String {
-    format!("krun-egress: [mitm] DENY sni={sni:?} → RST (SNI not resolved via our resolver)")
+/// `why` is the gate that refused it: the allowlist (no cert minted) or the DNS pin.
+pub(super) fn deny_sni_line(sni: &str, why: &str) -> String {
+    format!("krun-egress: [mitm] DENY sni={sni:?} → RST ({why})")
 }
 
 /// Run the egress stack on the host end of the passt socketpair until the process

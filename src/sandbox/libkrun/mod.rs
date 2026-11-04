@@ -1116,7 +1116,7 @@ mod tests {
             nxdomain_line("metadata.google.internal"),
             "krun-egress: [dns] api.anthropic.com → A 10.0.2.2 (allowlisted, pinned)".into(),
             "krun-egress: [mitm] ALLOW sni=\"api.anthropic.com\" → DNS-pinned, terminating".into(),
-            deny_sni_line("evil.example"),
+            deny_sni_line("evil.example", "SNI not resolved via our resolver"),
             nxdomain_line("metadata.google.internal"),
         ]
         .join("\n");

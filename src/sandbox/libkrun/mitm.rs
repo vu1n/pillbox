@@ -565,6 +565,16 @@ fn oauth_forbidden_response() -> Vec<u8> {
     .into_bytes()
 }
 
+/// The log line for a guest handshake that failed. rustls records the SNI before it asks the
+/// resolver for a cert, so a name refused by the allowlist gate is still known here and logged as a
+/// refusal the post-run summary reports.
+fn tls_error_line(tls: &rustls::ServerConnection, e: &rustls::Error) -> String {
+    match tls.server_name() {
+        Some(sni) => super::egress::deny_sni_line(sni, &format!("not on allowlist: {e}")),
+        None => format!("krun-egress: [mitm] TLS error → RST ({e})"),
+    }
+}
+
 /// Pump one MITM session: smoltcp rx → guest rustls, gate on the DNS-pin (the
 /// allowlist is already enforced by the cert resolver — a non-allowlisted SNI
 /// never got a cert), then relay decrypted bytes to/from the upstream TLS, guest
@@ -604,7 +614,7 @@ fn drive_conn(
         // A handshake failure lands here — including a non-allowlisted SNI, whose
         // cert the resolver refused to mint. Log the RST (the only place we see it).
         if let Err(e) = tls.process_new_packets() {
-            diag.log(&format!("krun-egress: [mitm] TLS error → RST ({e})"));
+            diag.log(&tls_error_line(tls, &e));
             sock.abort();
             return;
         }
@@ -618,7 +628,10 @@ fn drive_conn(
         if let Some(sni) = tls.server_name() {
             let sni = sni.to_string();
             if !pins.contains(&sni) {
-                diag.log(&super::egress::deny_sni_line(&sni));
+                diag.log(&super::egress::deny_sni_line(
+                    &sni,
+                    "SNI not resolved via our resolver",
+                ));
                 sock.abort();
                 return;
             }
@@ -779,6 +792,33 @@ fn drive_conn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A real ClientHello for a name off the allowlist fails at the cert gate, and the summary
+    // reader still names it.
+    #[test]
+    fn a_handshake_refused_at_the_cert_gate_reaches_the_refusal_summary() {
+        let dir = std::env::temp_dir().join(format!("pillbox-krun-gate-{}", uuid::Uuid::now_v7()));
+        let vault = Vault::new(dir.to_str().unwrap(), vec!["api.anthropic.com".into()]).unwrap();
+        let mut server = vault.new_conn().unwrap();
+        let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        let name = rustls::pki_types::ServerName::try_from("evil.example").unwrap();
+        let mut client = rustls::ClientConnection::new(std::sync::Arc::new(config), name).unwrap();
+        let mut hello = Vec::new();
+        client.write_tls(&mut hello).unwrap();
+        server.read_tls(&mut hello.as_slice()).unwrap();
+        let err = server.process_new_packets().unwrap_err();
+        let line = tls_error_line(&server, &err);
+        assert_eq!(
+            super::super::egress_refusals(&line),
+            vec!["evil.example".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn pair(stub: &str, hosts: &[&str]) -> CredSwap {
         CredSwap {

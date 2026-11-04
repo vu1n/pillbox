@@ -565,6 +565,18 @@ fn oauth_forbidden_response() -> Vec<u8> {
     .into_bytes()
 }
 
+/// The log line for a guest handshake that failed. rustls records the SNI before it asks the
+/// resolver for a cert, so a name the allowlist gate refused is logged as a refusal the post-run
+/// summary reports; any other TLS failure, an allowlisted host's included, stays a TLS error.
+fn tls_error_line(tls: &rustls::ServerConnection, vault: &Vault, e: &rustls::Error) -> String {
+    match tls.server_name() {
+        Some(sni) if !vault.allows(sni) => {
+            super::egress::deny_sni_line(sni, &format!("not on allowlist: {e}"))
+        }
+        _ => format!("krun-egress: [mitm] TLS error → RST ({e})"),
+    }
+}
+
 /// Pump one MITM session: smoltcp rx → guest rustls, gate on the DNS-pin (the
 /// allowlist is already enforced by the cert resolver — a non-allowlisted SNI
 /// never got a cert), then relay decrypted bytes to/from the upstream TLS, guest
@@ -604,7 +616,7 @@ fn drive_conn(
         // A handshake failure lands here — including a non-allowlisted SNI, whose
         // cert the resolver refused to mint. Log the RST (the only place we see it).
         if let Err(e) = tls.process_new_packets() {
-            diag.log(&format!("krun-egress: [mitm] TLS error → RST ({e})"));
+            diag.log(&tls_error_line(tls, vault, &e));
             sock.abort();
             return;
         }
@@ -618,8 +630,9 @@ fn drive_conn(
         if let Some(sni) = tls.server_name() {
             let sni = sni.to_string();
             if !pins.contains(&sni) {
-                diag.log(&format!(
-                    "krun-egress: [mitm] DENY sni={sni:?} → RST (SNI not resolved via our resolver)"
+                diag.log(&super::egress::deny_sni_line(
+                    &sni,
+                    "SNI not resolved via our resolver",
                 ));
                 sock.abort();
                 return;
@@ -781,6 +794,54 @@ fn drive_conn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A real ClientHello for a name off the allowlist fails at the cert gate, and the summary
+    // reader still names it.
+    #[test]
+    fn a_handshake_refused_at_the_cert_gate_reaches_the_refusal_summary() {
+        let dir = std::env::temp_dir().join(format!("pillbox-krun-gate-{}", uuid::Uuid::now_v7()));
+        let vault = Vault::new(dir.to_str().unwrap(), vec!["api.anthropic.com".into()]).unwrap();
+        let hello = |host: &str| {
+            let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+            let config = rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth();
+            let name = rustls::pki_types::ServerName::try_from(host.to_string()).unwrap();
+            let mut client =
+                rustls::ClientConnection::new(std::sync::Arc::new(config), name).unwrap();
+            let mut bytes = Vec::new();
+            client.write_tls(&mut bytes).unwrap();
+            bytes
+        };
+
+        let mut denied = vault.new_conn().unwrap();
+        denied
+            .read_tls(&mut hello("evil.example").as_slice())
+            .unwrap();
+        let err = denied.process_new_packets().unwrap_err();
+        let line = tls_error_line(&denied, &vault, &err);
+        assert_eq!(
+            super::super::egress_refusals(&line),
+            vec!["evil.example".to_string()]
+        );
+
+        // An allowlisted host whose handshake breaks later is a TLS error, not a refusal.
+        let mut allowed = vault.new_conn().unwrap();
+        allowed
+            .read_tls(&mut hello("api.anthropic.com").as_slice())
+            .unwrap();
+        allowed.process_new_packets().unwrap();
+        allowed
+            .read_tls(&mut &b"\x17\x03\x03\x00\x05junk!"[..])
+            .unwrap();
+        let err = allowed.process_new_packets().unwrap_err();
+        let line = tls_error_line(&allowed, &vault, &err);
+        assert!(line.contains("TLS error"), "{line}");
+        assert!(super::super::egress_refusals(&line).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn pair(stub: &str, hosts: &[&str]) -> CredSwap {
         CredSwap {

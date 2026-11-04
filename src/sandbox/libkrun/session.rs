@@ -215,6 +215,8 @@ impl SandboxBackend for LibkrunBackend {
         let _ = std::fs::remove_file(&launch.attach_sock);
         let _ = std::fs::remove_dir_all(&launch.creds_share);
         let _ = std::fs::remove_dir_all(&launch.workspace_clone);
+        // A refused lookup or connection is said out loud: it is how a probing agent shows itself.
+        report_egress_refusals(launch.egress_log.as_deref());
         // A SIGABRT'd VMM is the missing-runtime-dep footgun (`brew cleanup` swept
         // libkrun's undeclared dylibs). The attach/pump already failed with an
         // opaque "VMM exited" — replace it with the actionable cause when we can.
@@ -230,6 +232,46 @@ impl SandboxBackend for LibkrunBackend {
     }
 }
 
+/// After a foreground run, name the hosts its fence refused on stderr.
+fn report_egress_refusals(log: Option<&str>) {
+    let shared = std::env::var_os("PILLBOX_KRUN_EGRESS_LOG").is_some();
+    if let Some(line) = log.and_then(|path| egress_refusal_summary(path, shared)) {
+        eprintln!("{line}");
+    }
+}
+
+/// The one-line refusal summary for a run's egress log, or None when it refused nothing. A shared
+/// `PILLBOX_KRUN_EGRESS_LOG` mixes concurrent runs' lines, so it gets no per-run summary.
+fn egress_refusal_summary(path: &str, shared: bool) -> Option<String> {
+    use std::io::Read;
+    if shared {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(super::egress::EGRESS_LOG_CAP + 4096)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let refused = super::egress_refusals(&String::from_utf8_lossy(&bytes));
+    if refused.is_empty() {
+        return None;
+    }
+    let shown = refused
+        .iter()
+        .take(5)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = match refused.len().saturating_sub(5) {
+        0 => String::new(),
+        n => format!(" and {n} more"),
+    };
+    Some(format!(
+        "pillbox: the egress fence refused {shown}{more} this run; see {path}"
+    ))
+}
+
 /// The artifacts [`prepare_launch`] builds for [`LibkrunBackend::run`] to spawn +
 /// supervise. `spec_file` (the VmSpec tempfile) must outlive the child's read, so
 /// it stays owned here; the CoW clones are torn down after the run.
@@ -241,6 +283,8 @@ struct Launch {
     creds_share: PathBuf,
     workspace_clone: PathBuf,
     guest_workspace: String,
+    /// The fence's log for this run, read after it for the refusal count.
+    egress_log: Option<String>,
     /// The run's vault CA — held so its per-run ephemeral backing dir (if any)
     /// outlives the supervised VMM child and is dropped after the run.
     _ca: VaultCa,
@@ -599,6 +643,7 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
         krun_cache_dir()?.join(format!("attach-{}.sock", uuid::Uuid::now_v7().simple()));
     let _ = std::fs::remove_file(&attach_sock);
 
+    let egress_log = super::egress_log_path();
     let vmspec = VmSpec {
         offline: false,
         ownership: None,
@@ -620,7 +665,7 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
         }),
         egress: Some(EgressSpec {
             allowlist: vault_egress_allowlist(opts, &with_hosts),
-            log_path: std::env::var("PILLBOX_KRUN_EGRESS_LOG").ok(),
+            log_path: egress_log.clone(),
             ca_dir: Some(ca.dir.to_string_lossy().into_owned()),
             local_forward_port: None, // vaulted agents: no local-model forward
             refresh,
@@ -641,6 +686,7 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
         creds_share,
         workspace_clone: clone,
         guest_workspace,
+        egress_log,
         _ca: ca,
     })
 }
@@ -1054,7 +1100,7 @@ fn launch_server_vm(
                 .chain(launch.egress_extra)
                 .chain(opts.egress_allow.iter().cloned())
                 .collect(),
-            log_path: std::env::var("PILLBOX_KRUN_EGRESS_LOG").ok(),
+            log_path: super::egress_log_path(),
             ca_dir: Some(ca.dir.to_string_lossy().into_owned()),
             local_forward_port: launch.local_forward_port,
             refresh: None, // opencode server mode: non-vault, holds its own real key
@@ -1369,6 +1415,7 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
         boot::MountedShareOwnership::GuestRootClone,
         &boot_script,
     )?;
+    let egress_log = super::egress_log_path();
     let vmspec = VmSpec {
         offline: false,
         ownership: None,
@@ -1386,7 +1433,7 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
         vsock: None,
         egress: Some(EgressSpec {
             allowlist,
-            log_path: std::env::var("PILLBOX_KRUN_EGRESS_LOG").ok(),
+            log_path: egress_log.clone(),
             ca_dir: Some(ca.dir.to_string_lossy().into_owned()),
             local_forward_port: None,
             refresh,
@@ -1478,6 +1525,7 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
             );
         }
     };
+    report_egress_refusals(egress_log.as_deref());
     session.attached_pid = None;
     crate::session::write(resolved, &session)?;
     let process_exit = status.code().unwrap_or(1);
@@ -1975,7 +2023,7 @@ pub(crate) fn score_in_sandbox(
             // Only the invoker-declared hosts resolve — the tightest fence (no
             // provider/standard-egress union; the grader reaches deps, nothing else).
             allowlist: egress_allow.to_vec(),
-            log_path: std::env::var("PILLBOX_KRUN_EGRESS_LOG").ok(),
+            log_path: super::egress_log_path(),
             ca_dir: Some(ca.dir.to_string_lossy().into_owned()),
             local_forward_port: None, // grader: tightest fence, no local forward
             refresh: None,            // grader holds no credentials — nothing to refresh
@@ -2774,6 +2822,29 @@ mod tests {
     use super::*;
     use crate::sandbox::LiveSession;
     use crate::session::{Session, BACKEND_LIBKRUN};
+
+    // The summary every foreground run (attached and structured) prints after its VMM exits.
+    #[test]
+    fn egress_refusal_summary_names_this_runs_refusals_and_skips_a_shared_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.log");
+        let path = path.to_str().unwrap();
+        std::fs::write(path, "krun-egress: [dns] api.anthropic.com → A 10.0.2.2\n").unwrap();
+        assert_eq!(egress_refusal_summary(path, false), None);
+        let refused = (0..7)
+            .map(|i| super::super::egress::nxdomain_line(&format!("h{i}.internal")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(path, refused).unwrap();
+        let line = egress_refusal_summary(path, false).unwrap();
+        assert!(line.contains("h0.internal, h1.internal"), "{line}");
+        assert!(line.contains(" and 2 more this run; see "), "{line}");
+        assert_eq!(egress_refusal_summary(path, true), None);
+        assert_eq!(
+            egress_refusal_summary(&format!("{path}.missing"), false),
+            None
+        );
+    }
 
     #[test]
     fn guest_preamble_owns_only_mounted_workspace_before_agent_exec() {

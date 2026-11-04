@@ -151,8 +151,9 @@ struct VmSpec {
 struct EgressSpec {
     /// DNS-fence allowlist: only these hosts resolve; everything else NXDOMAINs.
     allowlist: Vec<String>,
-    /// Optional host-side diagnostics file (the guest console eats the child's
-    /// stderr). Set from `PILLBOX_KRUN_EGRESS_LOG`; `None` falls back to stderr.
+    /// Host-side diagnostics file (the guest console eats the child's stderr):
+    /// `PILLBOX_KRUN_EGRESS_LOG`, else one per run under `~/.pillbox/krun/egress/`
+    /// ([`egress_log_path`]). `None` falls back to stderr.
     log_path: Option<String>,
     /// Host path of the vault CA dir. When set, the child loads the CA (key stays
     /// host-side) to mint per-SNI MITM leaves; `None` = DNS-fence only.
@@ -1026,6 +1027,74 @@ fn krun_cache_dir() -> Result<PathBuf> {
     Ok(crate::paths::pillbox_root()?.join("krun"))
 }
 
+/// How long a run's egress log is kept before a later run prunes it.
+const EGRESS_LOG_RETENTION: std::time::Duration = std::time::Duration::from_secs(14 * 24 * 3600);
+
+/// Where a VM's egress fence writes its DNS and TLS decisions: `PILLBOX_KRUN_EGRESS_LOG`, else a
+/// fresh file under `~/.pillbox/krun/egress/`. A refusal always lands where a person can read it,
+/// since libkrun swallows the VMM child's stderr.
+pub(super) fn egress_log_path() -> Option<String> {
+    if let Ok(path) = std::env::var("PILLBOX_KRUN_EGRESS_LOG") {
+        return Some(path);
+    }
+    let dir = krun_cache_dir().ok()?.join("egress");
+    std::fs::create_dir_all(&dir).ok()?;
+    crate::paths::ensure_mode_0700(&dir).ok()?;
+    prune_egress_logs(&dir);
+    let file = dir.join(format!("{}.log", uuid::Uuid::now_v7().simple()));
+    Some(file.to_string_lossy().into_owned())
+}
+
+fn prune_egress_logs(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > EGRESS_LOG_RETENTION);
+        if old {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// The names the fence refused, sorted and once each, as its log records them: an NXDOMAIN'd
+/// lookup (egress.rs `serve_dns`) or a TLS connection whose SNI skipped the resolver (mitm.rs).
+/// Each name is cut to hostname characters, since it goes to the user's terminal and the guest
+/// chose its bytes.
+pub(super) fn egress_refusals(log: &str) -> Vec<String> {
+    let mut names: Vec<String> = log
+        .lines()
+        .filter_map(|line| {
+            let rest = line
+                .split("] NXDOMAIN \"")
+                .nth(1)
+                .or_else(|| line.split("] DENY sni=\"").nth(1))?;
+            let quoted = rest.split('"').next()?;
+            Some(
+                quoted
+                    .chars()
+                    .take(253)
+                    .map(|c| {
+                        if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                            c
+                        } else {
+                            '?'
+                        }
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// Filesystem-safe cache key for an image ref (`a/b:c` → `a_b_c`).
 fn sanitize(image: &str) -> String {
     image
@@ -1040,6 +1109,38 @@ fn cstr(s: &str) -> CString {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn egress_refusals_lists_each_refused_name_once() {
+        use super::egress::{deny_sni_line, nxdomain_line};
+        let log = [
+            nxdomain_line("metadata.google.internal"),
+            "krun-egress: [dns] api.anthropic.com → A 10.0.2.2 (allowlisted, pinned)".into(),
+            "krun-egress: [mitm] ALLOW sni=\"api.anthropic.com\" → DNS-pinned, terminating".into(),
+            deny_sni_line("evil.example", "SNI not resolved via our resolver"),
+            nxdomain_line("metadata.google.internal"),
+        ]
+        .join("\n");
+        assert_eq!(
+            super::egress_refusals(&log),
+            vec![
+                "evil.example".to_string(),
+                "metadata.google.internal".to_string()
+            ]
+        );
+        assert!(super::egress_refusals("").is_empty());
+    }
+
+    #[test]
+    fn egress_refusals_never_echo_terminal_control_bytes() {
+        let hostile = "x\u{1b}]52;c;cG93bmVk\u{7}\nkrun-egress: forged.example";
+        let log = super::egress::nxdomain_line(hostile);
+        let names = super::egress_refusals(&log);
+        assert_eq!(names.len(), 1);
+        assert!(names[0]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '?')));
+    }
+
     use std::process::Command;
 
     use base64::Engine as _;

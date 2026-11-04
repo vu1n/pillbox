@@ -217,7 +217,7 @@ impl SandboxBackend for LibkrunBackend {
         let _ = std::fs::remove_dir_all(&launch.workspace_clone);
         // A refused lookup or connection is said out loud: it is how a probing agent shows itself.
         if let Some(path) = &launch.egress_log {
-            let refused = std::fs::read_to_string(path)
+            let refused = read_run_egress_log(path, launch.egress_log_start)
                 .map(|log| super::egress_refusals(&log))
                 .unwrap_or_default();
             if !refused.is_empty() {
@@ -251,6 +251,17 @@ impl SandboxBackend for LibkrunBackend {
     }
 }
 
+/// The part of an egress log this run wrote, read no further than the fence's cap allows.
+fn read_run_egress_log(path: &str, start: u64) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.take(super::egress::EGRESS_LOG_CAP + 4096)
+        .read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 /// The artifacts [`prepare_launch`] builds for [`LibkrunBackend::run`] to spawn +
 /// supervise. `spec_file` (the VmSpec tempfile) must outlive the child's read, so
 /// it stays owned here; the CoW clones are torn down after the run.
@@ -264,6 +275,8 @@ struct Launch {
     guest_workspace: String,
     /// The fence's log for this run, read after it for the refusal count.
     egress_log: Option<String>,
+    /// Where this run's lines begin in it: a `PILLBOX_KRUN_EGRESS_LOG` file keeps earlier runs'.
+    egress_log_start: u64,
     /// The run's vault CA — held so its per-run ephemeral backing dir (if any)
     /// outlives the supervised VMM child and is dropped after the run.
     _ca: VaultCa,
@@ -623,6 +636,10 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
     let _ = std::fs::remove_file(&attach_sock);
 
     let egress_log = super::egress_log_path();
+    let egress_log_start = egress_log
+        .as_deref()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map_or(0, |m| m.len());
     let vmspec = VmSpec {
         offline: false,
         ownership: None,
@@ -666,6 +683,7 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
         workspace_clone: clone,
         guest_workspace,
         egress_log,
+        egress_log_start,
         _ca: ca,
     })
 }

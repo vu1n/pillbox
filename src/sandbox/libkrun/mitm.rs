@@ -618,9 +618,7 @@ fn drive_conn(
         if let Some(sni) = tls.server_name() {
             let sni = sni.to_string();
             if !pins.contains(&sni) {
-                diag.log(&format!(
-                    "krun-egress: [mitm] DENY sni={sni:?} → RST (SNI not resolved via our resolver)"
-                ));
+                diag.log(&super::egress::deny_sni_line(&sni));
                 sock.abort();
                 return;
             }

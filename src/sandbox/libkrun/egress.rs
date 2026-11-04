@@ -113,7 +113,11 @@ impl PinTable {
 /// stdio, so the egress thread's `eprintln` is swallowed — write to the run's
 /// file (`super::egress_log_path`), else fall back to stderr. (A
 /// stopgap until L5c routes these as §0 events.) Shared with [`super::mitm`].
-pub(super) struct Diag(Option<Mutex<std::fs::File>>);
+pub(super) struct Diag(Option<Mutex<(std::fs::File, u64)>>);
+
+/// The most a run writes to its fence log: the guest picks what gets logged, so it must not be
+/// able to grow a host file without bound.
+pub(super) const EGRESS_LOG_CAP: u64 = 4 << 20;
 
 impl Diag {
     pub(super) fn open(path: Option<String>) -> Self {
@@ -125,18 +129,39 @@ impl Diag {
                     .open(p)
                     .ok()
             })
-            .map(Mutex::new),
+            .map(|f| Mutex::new((f, 0))),
         )
     }
 
     pub(super) fn log(&self, msg: &str) {
         match &self.0 {
-            Some(f) => {
-                let _ = writeln!(f.lock().unwrap(), "{msg}");
+            Some(sink) => {
+                let mut sink = sink.lock().unwrap();
+                let (file, written) = &mut *sink;
+                let len = msg.len() as u64 + 1;
+                if *written + len <= EGRESS_LOG_CAP {
+                    let _ = writeln!(file, "{msg}");
+                } else if *written <= EGRESS_LOG_CAP {
+                    let _ = writeln!(
+                        file,
+                        "krun-egress: log capped at {EGRESS_LOG_CAP} bytes; later lines dropped"
+                    );
+                }
+                *written += len;
             }
             None => eprintln!("{msg}"),
         }
     }
+}
+
+/// The fence's refusal lines, shared by the writers and `super::egress_refusals`, which reads them
+/// back. Names are Debug-quoted: the guest chooses their bytes, control characters included.
+pub(super) fn nxdomain_line(name: &str) -> String {
+    format!("krun-egress: [dns] NXDOMAIN {name:?} (not on allowlist — fenced)")
+}
+
+pub(super) fn deny_sni_line(sni: &str) -> String {
+    format!("krun-egress: [mitm] DENY sni={sni:?} → RST (SNI not resolved via our resolver)")
 }
 
 /// Run the egress stack on the host end of the passt socketpair until the process
@@ -333,9 +358,7 @@ fn serve_dns(sock: &mut udp::Socket, allowlist: &[String], pins: &mut PinTable, 
                 }
             }
             DnsOutcome::NxDomain(name) => {
-                diag.log(&format!(
-                    "krun-egress: [dns] NXDOMAIN {name} (not on allowlist — fenced)"
-                ));
+                diag.log(&nxdomain_line(&name));
             }
             DnsOutcome::Empty => {}
         }
@@ -503,6 +526,20 @@ fn interrupted() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_guest_cannot_grow_the_fence_log_past_its_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("egress.log");
+        let diag = Diag::open(Some(path.to_string_lossy().into_owned()));
+        let line = nxdomain_line(&"a".repeat(200));
+        for _ in 0..(EGRESS_LOG_CAP / 200 + 100) {
+            diag.log(&line);
+        }
+        let log = std::fs::read_to_string(&path).unwrap();
+        assert!(log.len() as u64 <= EGRESS_LOG_CAP + 200);
+        assert_eq!(log.matches("log capped").count(), 1);
+    }
 
     fn query(name: &str, qtype: u16) -> Vec<u8> {
         let mut q = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];

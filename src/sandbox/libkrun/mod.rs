@@ -1064,17 +1064,30 @@ fn prune_egress_logs(dir: &Path) {
 
 /// The names the fence refused, sorted and once each, as its log records them: an NXDOMAIN'd
 /// lookup (egress.rs `serve_dns`) or a TLS connection whose SNI skipped the resolver (mitm.rs).
+/// Each name is cut to hostname characters, since it goes to the user's terminal and the guest
+/// chose its bytes.
 pub(super) fn egress_refusals(log: &str) -> Vec<String> {
     let mut names: Vec<String> = log
         .lines()
         .filter_map(|line| {
-            if let Some(rest) = line.split("] NXDOMAIN ").nth(1) {
-                return rest.split_whitespace().next().map(str::to_string);
-            }
-            let rest = line.split("] DENY sni=").nth(1)?;
-            rest.split_whitespace()
-                .next()
-                .map(|s| s.trim_matches('"').to_string())
+            let rest = line
+                .split("] NXDOMAIN \"")
+                .nth(1)
+                .or_else(|| line.split("] DENY sni=\"").nth(1))?;
+            let quoted = rest.split('"').next()?;
+            Some(
+                quoted
+                    .chars()
+                    .take(253)
+                    .map(|c| {
+                        if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                            c
+                        } else {
+                            '?'
+                        }
+                    })
+                    .collect(),
+            )
         })
         .collect();
     names.sort();
@@ -1098,19 +1111,34 @@ fn cstr(s: &str) -> CString {
 mod tests {
     #[test]
     fn egress_refusals_lists_each_refused_name_once() {
-        let log = "krun-egress: [dns] NXDOMAIN metadata.google.internal (not on allowlist — fenced)\n\
-                   krun-egress: [dns] pin api.anthropic.com\n\
-                   krun-egress: [mitm] ALLOW sni=\"api.anthropic.com\" → DNS-pinned, terminating\n\
-                   krun-egress: [mitm] DENY sni=\"evil.example\" → RST (SNI not resolved via our resolver)\n\
-                   krun-egress: [dns] NXDOMAIN metadata.google.internal (not on allowlist — fenced)\n";
+        use super::egress::{deny_sni_line, nxdomain_line};
+        let log = [
+            nxdomain_line("metadata.google.internal"),
+            "krun-egress: [dns] api.anthropic.com → A 10.0.2.2 (allowlisted, pinned)".into(),
+            "krun-egress: [mitm] ALLOW sni=\"api.anthropic.com\" → DNS-pinned, terminating".into(),
+            deny_sni_line("evil.example"),
+            nxdomain_line("metadata.google.internal"),
+        ]
+        .join("\n");
         assert_eq!(
-            super::egress_refusals(log),
+            super::egress_refusals(&log),
             vec![
                 "evil.example".to_string(),
                 "metadata.google.internal".to_string()
             ]
         );
         assert!(super::egress_refusals("").is_empty());
+    }
+
+    #[test]
+    fn egress_refusals_never_echo_terminal_control_bytes() {
+        let hostile = "x\u{1b}]52;c;cG93bmVk\u{7}\nkrun-egress: forged.example";
+        let log = super::egress::nxdomain_line(hostile);
+        let names = super::egress_refusals(&log);
+        assert_eq!(names.len(), 1);
+        assert!(names[0]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '?')));
     }
 
     use std::process::Command;

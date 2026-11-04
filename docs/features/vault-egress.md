@@ -18,6 +18,8 @@ tests:
   - "src/vault/token_store.rs:abort_intact_clears_pending_and_next_begin_retries"
   - "src/vault/egress.rs:default_deny_blocks_unmatched"
   - "src/sandbox/libkrun/mod.rs:egress_refusals_lists_each_refused_name_once"
+  - "src/sandbox/libkrun/mod.rs:egress_refusals_never_echo_terminal_control_bytes"
+  - "src/sandbox/libkrun/egress.rs:a_guest_cannot_grow_the_fence_log_past_its_cap"
 ---
 
 # Credential vault and outbound policy
@@ -29,7 +31,7 @@ The vault supplies guest-visible credential stubs and releases real access token
 - Provider-scoped OAuth/API-key substitution and token-endpoint refusal.
 - Single-writer pre-refresh, pending-state recovery and libkrun JIT refresh.
 - Host/IP policy, explicit allowlists, per-run CA and optional persistent CA.
-- Refusal record: the libkrun fence logs every NXDOMAIN and SNI denial to a per-run file under `~/.pillbox/krun/egress/` (or `PILLBOX_KRUN_EGRESS_LOG`), and a foreground run names the refused hosts when it ends.
+- Refusal record: the libkrun fence logs every NXDOMAIN and SNI denial to a per-run file under `~/.pillbox/krun/egress/` (or `PILLBOX_KRUN_EGRESS_LOG`), capped at 4 MiB a run, and a foreground run names the hosts it refused when it ends, cut to hostname characters.
 
 ## How to get to it (user POV)
 

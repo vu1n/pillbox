@@ -714,8 +714,10 @@ Docker untouched until step 8. Slices (each its own commit, default build green)
         stdio**, so the egress thread's stderr is swallowed — host-side egress
         diagnostics go to a file (`PILLBOX_KRUN_EGRESS_LOG`, else one per run under
         `~/.pillbox/krun/egress/`, kept 14 days, carried via `VmSpec` past the
-        child's `env_clear`) until L5c routes them as §0 events. A foreground run
-        names the hosts the fence refused when it ends. (2) the
+        child's `env_clear`) until L5c routes them as §0 events. A run writes at
+        most 4 MiB to it. A foreground run names the hosts the fence refused when
+        it ends, reading only its own lines and cutting names to hostname
+        characters, since the guest picks their bytes. (2) the
         allowlist holds `api.github.com`, so bare `github.com` is (correctly)
         fenced — the L5b allowlist should track the *vaulted secrets in play*, not
         a static provider list.

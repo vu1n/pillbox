@@ -33,6 +33,10 @@ pub(crate) enum CheckpointAction {
         /// Packet file to write (replaced atomically).
         #[arg(long, value_name = "FILE")]
         out: PathBuf,
+        /// Leave every workspace directory with this name out, with all under
+        /// it (e.g. `node_modules`); repeatable. Reported as `skipped`.
+        #[arg(long = "skip-dir", value_name = "NAME")]
+        skip_dirs: Vec<String>,
         /// Print the versioned JSON result on stdout.
         #[arg(long)]
         json: bool,
@@ -72,6 +76,7 @@ pub(crate) fn dispatch(action: CheckpointAction) -> Result<()> {
             harness_session_id,
             transcript,
             out,
+            skip_dirs,
             json,
         } => {
             let packed = checkpoint::pack(&PackOptions {
@@ -81,6 +86,7 @@ pub(crate) fn dispatch(action: CheckpointAction) -> Result<()> {
                 harness_session_id,
                 transcript,
                 out: out.clone(),
+                skip_dirs,
             })?;
             for e in &packed.excluded {
                 eprintln!(

@@ -52,6 +52,7 @@ fn pack_opts(ws: &Path, home: Option<&Path>, out: &Path) -> PackOptions {
         harness_session_id: home.map(|_| "sid-1".into()),
         transcript: home.map(|_| "projects/-workspace-repo/sid-1.jsonl".into()),
         out: out.to_path_buf(),
+        skip_dirs: Vec::new(),
     }
 }
 
@@ -185,6 +186,58 @@ fn credential_files_are_never_packed() {
     assert!(
         !hay.contains("claudeAiOauth") && !hay.contains("\"secret\"") && !hay.contains("\"token\"")
     );
+}
+
+#[test]
+fn skipped_directories_are_left_out_wherever_they_occur() {
+    let t = TempDir::new().unwrap();
+    let (ws, home) = fixture(t.path());
+    write(&ws.join("node_modules/dep/index.js"), "x\n");
+    write(&ws.join("packages/a/node_modules/dep/index.js"), "x\n");
+    // Only a directory by that name is skipped; a file by it is source.
+    write(&ws.join("docs/node_modules"), "notes\n");
+    // The harness tree keeps whatever it holds.
+    write(&home.join("node_modules/kept.js"), "x\n");
+    let out = t.path().join("p.packet");
+    let mut opts = pack_opts(&ws, Some(&home), &out);
+    opts.skip_dirs = vec!["node_modules".into()];
+    let packed = pack(&opts).unwrap();
+    let paths: Vec<&str> = packed.manifest.entries.iter().map(Entry::path).collect();
+    assert!(!paths
+        .iter()
+        .any(|p| p.starts_with("workspace/node_modules")));
+    assert!(!paths
+        .iter()
+        .any(|p| p.starts_with("workspace/packages/a/node_modules")));
+    assert!(paths.contains(&"workspace/docs/node_modules"));
+    assert!(paths.contains(&"harness/node_modules/kept.js"));
+    for gone in [
+        "workspace/node_modules",
+        "workspace/packages/a/node_modules",
+    ] {
+        assert!(packed.excluded.contains(&Excluded {
+            path: gone.into(),
+            reason: "skipped"
+        }));
+    }
+    // Without the flag the same tree packs its dependencies.
+    let all = pack(&pack_opts(&ws, Some(&home), &t.path().join("q.packet"))).unwrap();
+    assert!(all
+        .manifest
+        .entries
+        .iter()
+        .any(|e| e.path() == "workspace/node_modules/dep/index.js"));
+}
+
+#[test]
+fn skip_dir_must_be_one_name() {
+    let t = TempDir::new().unwrap();
+    let (ws, _) = fixture(t.path());
+    for bad in ["", ".", "..", "a/b"] {
+        let mut opts = pack_opts(&ws, None, &t.path().join("p.packet"));
+        opts.skip_dirs = vec![bad.into()];
+        assert!(pack(&opts).is_err(), "{bad:?} was accepted");
+    }
 }
 
 #[test]

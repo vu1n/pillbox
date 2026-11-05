@@ -153,8 +153,9 @@ impl Entry {
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Excluded {
     pub(crate) path: String,
-    /// `credential` (a file on the exclusion list) or `special` (a socket,
-    /// FIFO or device, which a packet cannot carry).
+    /// `credential` (a file on the exclusion list), `special` (a socket,
+    /// FIFO or device, which a packet cannot carry) or `skipped` (a workspace
+    /// directory named by `--skip-dir`, left out with everything under it).
     pub(crate) reason: &'static str,
 }
 
@@ -165,6 +166,10 @@ pub(crate) struct PackOptions {
     pub(crate) harness_session_id: Option<String>,
     pub(crate) transcript: Option<String>,
     pub(crate) out: PathBuf,
+    /// Directory basenames left out of the workspace tree wherever they occur,
+    /// such as `node_modules`: what an install regenerates need not ride in the
+    /// packet, and a monorepo's install alone can pass the 1 GiB limit.
+    pub(crate) skip_dirs: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -240,14 +245,23 @@ pub(crate) fn pack(opts: &PackOptions) -> Result<Packed> {
 
     let mut planned: Vec<(Entry, Option<PathBuf>)> = Vec::new();
     let mut excluded = Vec::new();
+    for name in &opts.skip_dirs {
+        if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+            return Err(usage(
+                PACK,
+                format!("--skip-dir {name:?} must be one directory name"),
+            ));
+        }
+    }
     walk(
         Tree::Workspace,
         &opts.workspace,
+        &opts.skip_dirs,
         &mut planned,
         &mut excluded,
     )?;
     if let Some(dir) = &opts.harness_state {
-        walk(Tree::Harness, dir, &mut planned, &mut excluded)?;
+        walk(Tree::Harness, dir, &[], &mut planned, &mut excluded)?;
     }
     planned.sort_by(|a, b| a.0.path().cmp(b.0.path()));
     excluded.sort_by(|a, b| a.path.cmp(&b.path));
@@ -323,6 +337,7 @@ pub(crate) fn pack(opts: &PackOptions) -> Result<Packed> {
 fn walk(
     tree: Tree,
     root: &Path,
+    skip_dirs: &[String],
     planned: &mut Vec<(Entry, Option<PathBuf>)>,
     excluded: &mut Vec<Excluded>,
 ) -> Result<()> {
@@ -353,6 +368,11 @@ fn walk(
                     },
                     None,
                 ));
+            } else if file_type.is_dir() && skip_dirs.contains(&name) {
+                excluded.push(Excluded {
+                    path,
+                    reason: "skipped",
+                });
             } else if file_type.is_dir() {
                 planned.push((Entry::Dir { path: path.clone() }, None));
                 stack.push((source, path));

@@ -22,7 +22,7 @@ Engine callers such as Stratus can transfer a workspace and harness state betwee
 ## Sub-features
 
 - Canonical manifest/schema and deterministic ustar/pax serialization.
-- Credential exclusions, directory/symlink validation and size bounds.
+- Credential exclusions, `--skip-dir` for regenerable workspace directories (Stratus skips `node_modules`), directory/symlink validation and size bounds.
 - Digest-checked staged unpack with explicit nonempty-target handling.
 
 ## How to get to it (user POV)

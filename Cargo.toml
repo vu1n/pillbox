@@ -95,7 +95,7 @@ reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-fea
 # when the wrapper has exported `PILLBOX_SESSION_STARTED_AT` so
 # span.start_time is meaningful.
 opentelemetry = "0.30"
-opentelemetry_sdk = { version = "0.30", default-features = false, features = ["logs", "trace"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["logs", "trace"] }
 opentelemetry-otlp = { version = "0.30", default-features = false, features = ["logs", "trace", "http-proto", "reqwest-blocking-client"] }
 # rustic_core re-exposes timestamps as jiff::Zoned — depend on jiff
 # directly so the helper that normalizes to strict RFC3339 doesn't

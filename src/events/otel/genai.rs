@@ -25,7 +25,7 @@ use opentelemetry::trace::{
 use opentelemetry::Context as OtelContext;
 use opentelemetry::KeyValue;
 
-use super::spans::{derive_session_span_id, derive_trace_id, tracer};
+use super::spans::{derive_session_span_id, derive_trace_id, override_span_ids, tracer};
 
 /// One captured LLM API call. Built by the vault handler from the
 /// request/response pair it intercepts and handed off to
@@ -109,8 +109,9 @@ pub(crate) struct GenAiUsage {
 /// Emit one OTLP span for a completed LLM API call. Best-effort skip
 /// when the OTel tracer isn't configured. The vault calls this from
 /// the response-completion path; the function itself does no I/O
-/// until the SDK's simple processor flushes on `.end()`, matching
-/// the session-span sink's sync model.
+/// until the SDK's simple processor flushes on `end_with_timestamp`,
+/// matching the session-span sink's sync model. The end timestamp is
+/// the call's own end, not the export instant.
 pub(crate) fn emit_call_span(call: CallSpan) {
     let Some(tracer) = tracer() else {
         return;
@@ -125,10 +126,7 @@ pub(crate) fn emit_call_span(call: CallSpan) {
     let trace_seed = call.session_id.as_deref().unwrap_or(&call.sandbox_id);
     let trace_id = derive_trace_id(trace_seed);
     let builder = SpanBuilder::from_name(span_name)
-        .with_trace_id(trace_id)
         .with_start_time(call.start)
-        .with_end_time(call.end)
-        .with_status(status_for(call.status_code))
         .with_attributes(build_attributes(&call));
     // Parent under the session span when session_id is known. The
     // session span's span_id is deterministic (see
@@ -136,7 +134,9 @@ pub(crate) fn emit_call_span(call: CallSpan) {
     // session span itself to have been emitted first — Workshop /
     // collectors stitch the link by id. OTel propagates parent via
     // Context, so we build a remote SpanContext on the parent_id
-    // and pass it through `build_with_context`.
+    // and pass it through `build_with_context`. The child inherits
+    // that trace id; its own span id stays a fresh generator id so
+    // multiple calls in one trace stay distinct.
     let parent_ctx = match call.session_id.as_deref() {
         Some(session_id) => OtelContext::new().with_remote_span_context(SpanContext::new(
             trace_id,
@@ -147,10 +147,15 @@ pub(crate) fn emit_call_span(call: CallSpan) {
         )),
         None => OtelContext::new(),
     };
-    // No `with_span_id` — the SDK's id generator mints a fresh per-
-    // span id so multiple calls within the same trace stay distinct.
+    // No parent: the generator would mint a random trace id. Pin it
+    // to the sandbox id so every call in the lease shares one trace.
+    let _ids = call
+        .session_id
+        .is_none()
+        .then(|| override_span_ids(Some(trace_id), None));
     let mut span = tracer.build_with_context(builder, &parent_ctx);
-    span.end();
+    span.set_status(status_for(call.status_code));
+    span.end_with_timestamp(call.end);
 }
 
 /// OTel GenAI semantic conventions + standard `http.*` / `server.*`

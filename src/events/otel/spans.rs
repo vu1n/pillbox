@@ -12,6 +12,7 @@
 //!   itself at session start (Unset status) — see that fn for why
 //!   up-front rather than at exit.
 
+use std::cell::RefCell;
 use std::{collections::HashMap, sync::OnceLock, time::SystemTime};
 
 use anyhow::{Context, Result};
@@ -21,7 +22,7 @@ use opentelemetry::trace::{
 use opentelemetry::Context as OtelContext;
 use opentelemetry::KeyValue;
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
-use opentelemetry_sdk::trace::SdkTracer;
+use opentelemetry_sdk::trace::{IdGenerator, RandomIdGenerator, SdkTracer};
 
 use super::super::{
     session_started_at_from_env, AttrValue, Emitter, EventType, EVENTS_SINK_TIMEOUT,
@@ -70,20 +71,23 @@ pub(in crate::events) fn sink_emit(
 /// emitters. No-op when the tracer is unconfigured.
 ///
 /// The SDK's simple span processor exports on `.end()`, so building +
-/// dropping the span here triggers the export inline (matches the log
+/// ending the span here triggers the export inline (matches the log
 /// sink's sync emit model).
 fn emit_session_span(session_id: &str, start: SystemTime, status: Status, attrs: Vec<KeyValue>) {
     let Some(tracer) = tracer() else {
         return;
     };
+    // Root span: nothing to inherit ids from. Pin both so every emitter
+    // that parents under `derive_session_span_id` still stitches.
+    let _ids = override_span_ids(
+        Some(derive_trace_id(session_id)),
+        Some(derive_session_span_id(session_id)),
+    );
     let span_builder = SpanBuilder::from_name("session")
-        .with_trace_id(derive_trace_id(session_id))
-        .with_span_id(derive_session_span_id(session_id))
         .with_start_time(start)
-        .with_end_time(SystemTime::now())
-        .with_status(status)
         .with_attributes(attrs);
     let mut span = tracer.build_with_context(span_builder, &OtelContext::new());
+    span.set_status(status);
     span.end();
 }
 
@@ -150,9 +154,93 @@ fn build_otel_tracer(
         .build();
     let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
         .with_resource(resource)
+        // 0.32 dropped SpanBuilder::with_trace_id / with_span_id. Ids come
+        // only from this generator (or from a parent context's trace id).
+        // Root spans that must stay deterministic install a one-shot
+        // override on the calling thread; everyone else gets a random id.
+        .with_id_generator(OverridingIdGenerator::default())
         .with_simple_exporter(exporter)
         .build();
     Ok(provider.tracer("pillbox"))
+}
+
+/// Ids the next `build_with_context` on this thread should mint.
+/// Cleared on drop so a build that never asks the generator (shutdown,
+/// suppressed telemetry) cannot leak the pin onto a later span.
+struct PendingSpanIds {
+    trace_id: Option<TraceId>,
+    span_id: Option<SpanId>,
+}
+
+thread_local! {
+    static PENDING_SPAN_IDS: RefCell<PendingSpanIds> = const {
+        RefCell::new(PendingSpanIds {
+            trace_id: None,
+            span_id: None,
+        })
+    };
+}
+
+/// Guard that installs [`override_span_ids`] for one span build.
+pub(in crate::events) struct SpanIdOverride {
+    _private: (),
+}
+
+impl Drop for SpanIdOverride {
+    fn drop(&mut self) {
+        PENDING_SPAN_IDS.with(|slot| {
+            *slot.borrow_mut() = PendingSpanIds {
+                trace_id: None,
+                span_id: None,
+            };
+        });
+    }
+}
+
+/// Pin the trace id and/or span id the SDK generator returns on the
+/// next call from this thread. `None` leaves that id random.
+///
+/// Child spans must not call this: they inherit `trace_id` from the
+/// parent context passed to `build_with_context`, and a fresh span id
+/// is what keeps two calls in one trace distinct. Only a root span
+/// (no parent context) needs a pin — the session span pins both, a
+/// sandbox-rooted gen_ai span pins the trace id alone.
+pub(in crate::events) fn override_span_ids(
+    trace_id: Option<TraceId>,
+    span_id: Option<SpanId>,
+) -> SpanIdOverride {
+    PENDING_SPAN_IDS.with(|slot| {
+        *slot.borrow_mut() = PendingSpanIds { trace_id, span_id };
+    });
+    SpanIdOverride { _private: () }
+}
+
+/// [`IdGenerator`] that honors a one-shot thread-local pin, then falls
+/// back to the SDK's random generator. The SDK calls `new_span_id`
+/// for every span and `new_trace_id` only when the span has no parent.
+#[derive(Debug, Default)]
+struct OverridingIdGenerator {
+    random: RandomIdGenerator,
+}
+
+impl IdGenerator for OverridingIdGenerator {
+    fn new_trace_id(&self) -> TraceId {
+        PENDING_SPAN_IDS.with(|slot| {
+            slot.borrow_mut()
+                .trace_id
+                .take()
+                .unwrap_or_else(|| self.random.new_trace_id())
+        })
+    }
+
+    fn new_span_id(&self) -> SpanId {
+        PENDING_SPAN_IDS.with(|slot| {
+            slot.borrow_mut()
+                .span_id
+                .take()
+                .unwrap_or_else(|| self.random.new_span_id())
+        })
+    }
 }
 
 /// Parse `expires_at`-shaped RFC3339 (UTC, second precision) into a
@@ -259,6 +347,27 @@ mod tests {
     };
 
     #[test]
+    fn overriding_generator_returns_pinned_ids_once_then_random() {
+        // 0.32 mints ids only through the provider generator. The pin
+        // is one-shot and thread-local so a session span can demand
+        // its deterministic ids without forcing the next span on this
+        // thread (a gen_ai child) to reuse them.
+        use opentelemetry_sdk::trace::IdGenerator;
+
+        let gen = OverridingIdGenerator::default();
+        let trace = derive_trace_id("abc123def456");
+        let span = derive_session_span_id("abc123def456");
+        {
+            let _guard = override_span_ids(Some(trace), Some(span));
+            // SDK calls new_span_id first, then new_trace_id, for a root.
+            assert_eq!(gen.new_span_id(), span);
+            assert_eq!(gen.new_trace_id(), trace);
+        }
+        assert_ne!(gen.new_span_id(), span);
+        assert_ne!(gen.new_trace_id(), trace);
+    }
+
+    #[test]
     fn derive_ids_are_stable_across_calls() {
         // Span id correlation depends on host's and sandbox's derive
         // calls producing the same bytes for the same session id;
@@ -358,13 +467,13 @@ mod tests {
         let tracer = build_otel_tracer(&endpoint, HashMap::new(), "pillbox-test")
             .expect("build OTel tracer");
         let span_start = SystemTime::now() - Duration::from_secs(2);
-        let builder = SpanBuilder::from_name("session")
-            .with_trace_id(derive_trace_id("abc123def456"))
-            .with_span_id(derive_session_span_id("abc123def456"))
-            .with_start_time(span_start)
-            .with_end_time(SystemTime::now())
-            .with_status(Status::Ok);
+        let _ids = override_span_ids(
+            Some(derive_trace_id("abc123def456")),
+            Some(derive_session_span_id("abc123def456")),
+        );
+        let builder = SpanBuilder::from_name("session").with_start_time(span_start);
         let mut span = tracer.build_with_context(builder, &OtelContext::new());
+        span.set_status(Status::Ok);
         span.end();
         drop(tracer);
 

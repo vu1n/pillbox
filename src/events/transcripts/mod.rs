@@ -241,12 +241,13 @@ pub(super) fn emit_event_span(event: &TranscriptEvent, session_id: &str, harness
         TraceState::default(),
     ));
     let builder = SpanBuilder::from_name(span_name(&event.kind))
-        .with_trace_id(trace_id)
         .with_start_time(event.timestamp)
-        .with_end_time(event.timestamp)
         .with_attributes(build_attributes(event, harness));
+    // Parent context carries the session trace id, so the generator
+    // only mints a fresh span id. End at the transcript timestamp:
+    // these events are historical, not "now".
     let mut span = tracer.build_with_context(builder, &parent_ctx);
-    span.end();
+    span.end_with_timestamp(event.timestamp);
 }
 
 fn span_name(kind: &EventKind) -> String {

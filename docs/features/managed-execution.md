@@ -12,6 +12,8 @@ entry:
   - "cloudflare-spike/src/execution_service.ts:ExecutionService"
   - "cloudflare-spike/src/execution_store.ts"
 tests:
+  - "src/sandbox/managed/execution_client.rs:managed_turn_lock_rejects_same_session_without_cross_session_contention"
+  - "src/sandbox/managed/execution_client.rs:managed_turn_lock_releases_while_an_inherited_descriptor_stays_open"
   - "cloudflare-spike/execution_service.test.ts:exact retry does not resample"
   - "cloudflare-spike/execution_service.test.ts:authorization failures precede every persistence access"
   - "cloudflare-spike/workspace_finalize.test.ts"
@@ -34,10 +36,15 @@ A configured controller submits a sealed invocation to `POST /v2/executions`, th
 
 ## Driving it with the repository harness
 
+From the repository root, run `cargo test --no-default-features managed_turn_lock`.
+These tests check same-session exclusion, cross-session independence and immediate
+owner-drop release even when a fork-equivalent duplicate descriptor remains open.
+
 From `cloudflare-spike/`, run `npm ci`, `npm test`, `npx tsc --noEmit` and `python3 check-contract-parity.py`. Tests exercise exact retries, authorization before persistence and workspace-finalize failures. Then `../scripts/smoke/cf.sh` starts local workerd, checks capability crypto and expects HTTP 401 for an unauthenticated execution request. That smoke starts no paid agent/container and is not a managed burn-in.
 
 ## Gotchas
 
+- Managed turn guards explicitly unlock on drop: closing only the owner's descriptor leaves the lock held while a concurrent fork retains its copy, even with close-on-exec.
 - Managed execution is currently OpenCode-only and public execution is deny-all; unsupported agents must fail before charged work.
 - No custom Pillbox Durable Object, remote event log or collaboration/replay broker is implemented. Huddles owns collaboration.
 - The optional DigitalOcean adapter does not imply automatic cross-provider retry. Exact identity and no-resampling still apply.

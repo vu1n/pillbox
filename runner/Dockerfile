@@ -112,7 +112,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 # @anthropic-ai/claude-code npm package, so Renovate tracks that as the
 # source of truth (the version string is passed to install.sh below).
 # renovate: datasource=npm depName=@anthropic-ai/claude-code
-ARG CLAUDE_VERSION=2.1.316
+ARG CLAUDE_VERSION=2.1.318
 # renovate: datasource=github-releases depName=openai/codex extractVersion=^rust-v(?<version>.*)$
 ARG CODEX_VERSION=0.166.0
 # OpenCode 2 ships as a new npm package (`@opencode/cli`); `opencode-ai` stays
@@ -120,7 +120,7 @@ ARG CODEX_VERSION=0.166.0
 # renovate: datasource=npm depName=@opencode/cli
 ARG OPENCODE_VERSION=2.2.5
 # renovate: datasource=npm depName=@earendil-works/pi-coding-agent
-ARG PI_VERSION=1.4.0
+ARG PI_VERSION=1.5.0
 # Prime publishes a stable channel and checksummed native release archives.
 ARG PRIME_AGENT_VERSION=0.10.2
 # Cursor Agent CLI — no Renovate datasource; lab version string from
@@ -130,7 +130,7 @@ ARG CURSOR_AGENT_VERSION=2026.10.22-27dcf5f
 # (e.g. 0.0.1782062050-gbe2b79), which Renovate's semver matcher can't
 # compare. Pinned anyway for a deterministic layer cache; bump by hand
 # (`npm view @ampcode/cli version`) when you want a newer amp.
-ARG AMP_VERSION=0.0.1793577666-g2e4e3d
+ARG AMP_VERSION=0.0.1793836860-gb8120f
 
 RUN npm install -g \
 		@ampcode/cli@${AMP_VERSION} \

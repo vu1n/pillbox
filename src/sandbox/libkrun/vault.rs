@@ -45,6 +45,12 @@ const LEAF_VALIDITY_DAYS: i64 = 7;
 pub(super) struct Vault {
     config: Arc<ServerConfig>,
     client_config: Arc<ClientConfig>,
+    allowlist: Vec<String>,
+}
+
+/// The cert gate: only an allowlisted SNI gets a leaf, case-insensitively.
+fn on_allowlist(allowlist: &[String], sni: &str) -> bool {
+    allowlist.iter().any(|h| h.eq_ignore_ascii_case(sni))
 }
 
 impl Vault {
@@ -57,7 +63,7 @@ impl Vault {
         let issuer = ca.issuer().map_err(|e| anyhow!("build CA issuer: {e}"))?;
         let resolver = Arc::new(CertResolver {
             issuer,
-            allowlist,
+            allowlist: allowlist.clone(),
             cache: Mutex::new(HashMap::new()),
         });
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
@@ -84,7 +90,13 @@ impl Vault {
         Ok(Vault {
             config: Arc::new(config),
             client_config: Arc::new(client_config),
+            allowlist,
         })
+    }
+
+    /// Whether the cert gate mints a leaf for `sni`.
+    pub(super) fn allows(&self, sni: &str) -> bool {
+        on_allowlist(&self.allowlist, sni)
     }
 
     /// A fresh server-side TLS connection for an accepted socket.
@@ -301,7 +313,7 @@ impl std::fmt::Debug for CertResolver {
 impl ResolvesServerCert for CertResolver {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         let sni = hello.server_name()?;
-        if !self.allowlist.iter().any(|h| h.eq_ignore_ascii_case(sni)) {
+        if !on_allowlist(&self.allowlist, sni) {
             return None; // allowlist gate: no cert for a non-allowlisted SNI
         }
         let mut cache = self.cache.lock().unwrap();

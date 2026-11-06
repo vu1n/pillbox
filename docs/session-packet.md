@@ -77,6 +77,12 @@ credential sentinel in `src/agents/mod.rs` (`ALL[*].cred_sentinel`), today
 an unflushed credential write lives. In the workspace tree those names are
 ordinary source files and are kept.
 
+Each `--skip-dir NAME` (repeatable) leaves every directory with that basename
+out of the `workspace/` tree, with all under it, reported once per directory
+with reason `skipped`. Stratus passes `--skip-dir node_modules`: an install
+regenerates it, and a monorepo's install alone can pass the 1 GiB limit. A file
+with that name is still packed, and the `harness/` tree is never skipped.
+
 Sockets, FIFOs and devices are skipped with reason `special`. The workspace
 ingest denylist (`.env*`, `*.pem`, `.ssh/`, …; `src/workspace/ingest.rs`) is
 **not** applied: it governs what enters a sandbox, and a packet must restore

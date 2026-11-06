@@ -712,8 +712,13 @@ Docker untouched until step 8. Slices (each its own commit, default build green)
         (`platform.claude.com`, `downloads.claude.ai`, datadog) were all fenced.
         *Two findings:* (1) **libkrun wires the guest console to the VMM child's
         stdio**, so the egress thread's stderr is swallowed — host-side egress
-        diagnostics go to a file (`PILLBOX_KRUN_EGRESS_LOG`, carried via `VmSpec`
-        past the child's `env_clear`) until L5c routes them as §0 events. (2) the
+        diagnostics go to a file (`PILLBOX_KRUN_EGRESS_LOG`, else one per run under
+        `~/.pillbox/krun/egress/`, kept 14 days, carried via `VmSpec` past the
+        child's `env_clear`) until L5c routes them as §0 events. A run writes at
+        most 4 MiB to it. A foreground run, attached or structured, names the
+        hosts the fence refused when it ends (cut to hostname characters, since
+        the guest picks their bytes); a shared `PILLBOX_KRUN_EGRESS_LOG` gets no
+        summary, since concurrent runs mix their lines there. (2) the
         allowlist holds `api.github.com`, so bare `github.com` is (correctly)
         fenced — the L5b allowlist should track the *vaulted secrets in play*, not
         a static provider list.

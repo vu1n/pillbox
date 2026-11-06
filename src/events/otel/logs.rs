@@ -254,4 +254,46 @@ mod tests {
             "expected OTLP protobuf content-type, got: {req}"
         );
     }
+
+    #[test]
+    fn otel_sink_starts_tls_for_https_logs_endpoint() {
+        // reqwest 0.13 (the exporter's client) does not inherit TLS from
+        // the app's reqwest 0.12. Without `reqwest-rustls`, an https URL
+        // is written as a plaintext HTTP request. A TLS ClientHello
+        // (record type 0x16) is the proof the handshake started. The
+        // listener speaks no TLS, so the handshake cannot finish; spans
+        // use this same client.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let endpoint = format!("https://{addr}/v1/logs");
+
+        let received: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let recv_clone = Arc::clone(&received);
+        let server = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            sock.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            let mut buf = [0u8; 64];
+            let n = sock.read(&mut buf).unwrap_or(0);
+            *recv_clone.lock().unwrap() = buf[..n].to_vec();
+        });
+
+        let logger = build_otel_logger(&endpoint, HashMap::new(), "pillbox-test")
+            .expect("build OTel logger");
+        let mut record = logger.create_log_record();
+        let session = Session::test_fixture();
+        let ty = EventType::SessionStarted {
+            parent_session_id: None,
+            startup: None,
+        };
+        let attrs = build_attributes(&ty, "abc123def456", Some(&session));
+        fill_log_record(&mut record, &ty, attrs);
+        logger.emit(record);
+
+        server.join().expect("server thread");
+        let bytes = received.lock().unwrap().clone();
+        assert!(
+            bytes.len() >= 3 && bytes[0] == 0x16 && bytes[1] == 0x03,
+            "expected a TLS ClientHello, got {bytes:?}"
+        );
+    }
 }

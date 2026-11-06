@@ -94,9 +94,13 @@ reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-fea
 # model). Spans are sandbox-only and only emitted at terminal events
 # when the wrapper has exported `PILLBOX_SESSION_STARTED_AT` so
 # span.start_time is meaningful.
+# `reqwest-rustls` is required for HTTPS. opentelemetry-otlp 0.32 uses
+# its own reqwest 0.13; the direct reqwest 0.12 `rustls-tls` feature
+# does not apply to that crate, so without this flag an https endpoint
+# is sent as plaintext and the export fails.
 opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["logs", "trace"] }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["logs", "trace", "http-proto", "reqwest-blocking-client"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["logs", "trace", "http-proto", "reqwest-blocking-client", "reqwest-rustls"] }
 # rustic_core re-exposes timestamps as jiff::Zoned — depend on jiff
 # directly so the helper that normalizes to strict RFC3339 doesn't
 # look at types it can't name.

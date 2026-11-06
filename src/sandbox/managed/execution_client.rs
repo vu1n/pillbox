@@ -22,7 +22,19 @@ const TURN_LOCK_FILE: &str = ".managed-turn.lock";
 /// behind a potentially ten-minute network operation. The inode may remain after
 /// release; ownership is the open file description's advisory lock, not presence.
 struct ManagedTurnLock {
-    _file: fs::File,
+    file: fs::File,
+}
+
+impl Drop for ManagedTurnLock {
+    fn drop(&mut self) {
+        // Release ownership even while a concurrent fork retains the open file description.
+        if unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) } != 0 {
+            eprintln!(
+                "failed to release managed turn lock: {}",
+                io::Error::last_os_error()
+            );
+        }
+    }
 }
 
 impl ManagedTurnLock {
@@ -48,7 +60,7 @@ impl ManagedTurnLock {
             }
             return Err(error).with_context(|| format!("lock {}", path.display()));
         }
-        Ok(Self { _file: file })
+        Ok(Self { file })
     }
 }
 
@@ -613,6 +625,33 @@ mod tests {
             drop(held);
             ManagedTurnLock::try_acquire(&resolved, "session-a")
                 .expect("dropping the owner releases the session lock");
+        });
+    }
+
+    #[test]
+    fn managed_turn_lock_releases_while_an_inherited_descriptor_stays_open() {
+        crate::test_util::with_isolated_home("managed-turn-lock-inherited", || {
+            let resolved = crate::pillbox::global();
+            let held = ManagedTurnLock::try_acquire(&resolved, "session-a").unwrap();
+            // A duplicate shares the open file description, just like fork inheritance.
+            let inherited = held.file.try_clone().unwrap();
+            assert!(ManagedTurnLock::try_acquire(&resolved, "session-a").is_err());
+            assert!(
+                ManagedTurnLock::try_acquire(&resolved, "session-a").is_err(),
+                "dropping a rejected contender must not release the owner's lock"
+            );
+
+            drop(held);
+            let successor = ManagedTurnLock::try_acquire(&resolved, "session-a")
+                .expect("owner drop releases the lock even before a child closes its copy");
+            drop(inherited);
+            assert!(
+                ManagedTurnLock::try_acquire(&resolved, "session-a").is_err(),
+                "closing the old descriptor must not release the successor's lock"
+            );
+            drop(successor);
+            ManagedTurnLock::try_acquire(&resolved, "session-a")
+                .expect("the successor also releases its lock on drop");
         });
     }
 

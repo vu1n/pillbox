@@ -112,7 +112,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 # @anthropic-ai/claude-code npm package, so Renovate tracks that as the
 # source of truth (the version string is passed to install.sh below).
 # renovate: datasource=npm depName=@anthropic-ai/claude-code
-ARG CLAUDE_VERSION=2.1.318
+ARG CLAUDE_VERSION=2.1.319
 # renovate: datasource=github-releases depName=openai/codex extractVersion=^rust-v(?<version>.*)$
 ARG CODEX_VERSION=0.166.0
 # OpenCode 2 ships as a new npm package (`@opencode/cli`); `opencode-ai` stays

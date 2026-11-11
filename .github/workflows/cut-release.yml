@@ -24,6 +24,7 @@ concurrency:
   group: cut-release
   cancel-in-progress: false
 env:
+  REQUIRE: "ci.yml"  # space-separated push workflows that must have passed on the commit; a [skip ci] commit has none
   FOLLOW: "runner-image.yml"  # space-separated workflow files to dispatch on the new tag
 jobs:
   cut:
@@ -66,6 +67,10 @@ jobs:
             bad=$(gh api --paginate "repos/$R/actions/runs?head_sha=$sha&event=push&per_page=100" --jq \
               '.workflow_runs[] | select(.status != "completed" or (.conclusion | IN("success","neutral","skipped") | not)) | "\(.name)=\(.status)/\(.conclusion)"')
             [ -z "$bad" ] || fail "workflow runs on ${sha:0:7} not passed: $bad"
+            for w in $REQUIRE; do
+              n=$(gh api "repos/$R/actions/workflows/$w/runs?head_sha=$sha&event=push&status=success" --jq .total_count)
+              [ "$n" -gt 0 ] || fail "$w has no passed push run on ${sha:0:7}"
+            done
             # Every check run on main's head passed, this job's own excepted; a running one is not a pass.
             bad=$(gh api --paginate "repos/$R/commits/$sha/check-runs?per_page=100" --jq \
               '.check_runs[] | select(.name != "cut") | select(.status != "completed" or (.conclusion | IN("success","neutral","skipped") | not)) | "\(.name)=\(.status)/\(.conclusion)"')

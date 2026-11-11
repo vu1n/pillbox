@@ -1,0 +1,67 @@
+name: cut-release
+# The one way a release tag is made: an agent (or anyone) dispatches this with a vX.Y.Z tag, and it
+# tags main's head only when every check on it passed and the VPS reviewer's release verdict for
+# everything since the last tag is success. Cloud agent sessions can't push tags; this job can.
+# Tags made with this job's token start no workflows, so it dispatches the repo's tag workflows
+# (FOLLOW) on the new tag itself.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "vX.Y.Z, higher than every release tag so far"
+        required: true
+      baseline:
+        description: "The repo's first tag: skips the release review, which has no last tag to start from"
+        type: boolean
+        default: false
+permissions:
+  contents: write
+  actions: write
+  checks: read
+  statuses: read
+concurrency:
+  group: cut-release
+  cancel-in-progress: false
+env:
+  FOLLOW: "runner-image.yml"  # space-separated workflow files to dispatch on the new tag
+jobs:
+  cut:
+    runs-on: ubuntu-latest
+    steps:
+      - name: check and tag main's head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          R: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          TAG: ${{ inputs.tag }}
+          BASELINE: ${{ inputs.baseline }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "$TAG is not vX.Y.Z"
+          sha=$(gh api "repos/$R/branches/main" --jq .commit.sha)
+          last=$(gh api --paginate "repos/$R/tags?per_page=100" --jq '.[].name' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)
+          if [ -n "$last" ]; then
+            [ "$BASELINE" = "false" ] || fail "baseline is for a repo's first tag; this one has $last"
+            [ "$TAG" != "$last" ] && [ "$(printf '%s\n%s\n' "$last" "$TAG" | sort -V | tail -n 1)" = "$TAG" ] || fail "$TAG is not above $last"
+          else
+            [ "$BASELINE" = "true" ] || fail "no release tag yet: cut the first one with baseline"
+          fi
+          # Every check run on main's head passed, this job's own excepted; a running one is not a pass.
+          bad=$(gh api --paginate "repos/$R/commits/$sha/check-runs?per_page=100" --jq \
+            '.check_runs[] | select(.name != "cut") | select(.status != "completed" or (.conclusion | IN("success","neutral","skipped") | not)) | "\(.name)=\(.status)/\(.conclusion)"')
+          [ -z "$bad" ] || fail "checks on ${sha:0:7} not passed: $bad"
+          # Each status context's newest state passed; release verdicts count only from the owner's account.
+          statuses=$(gh api --paginate "repos/$R/commits/$sha/statuses?per_page=100" --jq '.[] | {context, state, by: .creator.login}' | jq -s .)
+          bad=$(jq -r 'group_by(.context) | map(.[0]) | .[] | select(.state != "success") | "\(.context)=\(.state)"' <<<"$statuses")
+          [ -z "$bad" ] || fail "statuses on ${sha:0:7} not passed: $bad"
+          if [ -n "$last" ]; then
+            for ctx in "release/vps since $last" "release/vps-security since $last"; do
+              state=$(jq -r --arg c "$ctx" --arg o "$OWNER" '[.[] | select(.context == $c and .by == $o)][0].state // "missing"' <<<"$statuses")
+              [ "$state" = "success" ] || fail "$ctx is $state on ${sha:0:7}"
+            done
+          fi
+          gh api -X POST "repos/$R/git/refs" -f "ref=refs/tags/$TAG" -f "sha=$sha" >/dev/null
+          gh release create "$TAG" -R "$R" --verify-tag --generate-notes --title "$TAG"
+          for w in $FOLLOW; do gh workflow run "$w" -R "$R" --ref "$TAG"; done
+          echo "tagged $TAG at ${sha:0:7}"

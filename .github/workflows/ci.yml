@@ -18,8 +18,8 @@ jobs:
       run:
         working-directory: cloudflare-spike
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
@@ -40,7 +40,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install rust
         run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
       # rust-cache keys on rustc + Cargo.lock, prunes the registry to used crates,
@@ -49,7 +49,7 @@ jobs:
       # old hand-rolled actions/cache of the whole target/ bloated toward the 10GB
       # repo limit and evicted, forcing cold rebuilds (the ~20min CI).
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       # `--no-default-features` = the toolchain-free build (docker backend + the
       # backend-agnostic core), so this job needs no libkrun toolchain. libkrun
       # itself is covered by the dedicated `libkrun` job. Default is now libkrun,
@@ -95,11 +95,11 @@ jobs:
     # libkrun toolchain's supported CI architecture.
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install rust
         run: rustup toolchain install stable --profile minimal --component clippy
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: libkrun   # distinct from the no-default-features `test` job's artifacts
       - name: Install libkrun

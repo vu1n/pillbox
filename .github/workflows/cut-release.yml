@@ -58,10 +58,11 @@ jobs:
             else
               [ "$BASELINE" = "true" ] || fail "no release tag yet: cut the first one with baseline"
             fi
-            # Workflow runs register the moment main is pushed, before their jobs post check runs: a
-            # commit younger than that window, or with a push run not yet passed, is not tested yet.
-            age=$(( $(date +%s) - $(date -d "$(gh api "repos/$R/commits/$sha" --jq .commit.committer.date)" +%s) ))
-            [ "$age" -ge 120 ] || fail "${sha:0:7} landed ${age}s ago; its CI may not have registered yet, retry in two minutes"
+            # Workflow runs register the moment a commit lands on main, before their jobs post check
+            # runs, and a commit's own date says nothing about when it landed: watch main hold this
+            # commit for 90s, so whatever CI it starts has registered before it is judged.
+            sleep 90
+            [ "$(gh api "repos/$R/branches/main" --jq .commit.sha)" = "$sha" ] || fail "main moved past ${sha:0:7} while it was being checked; dispatch again"
             bad=$(gh api --paginate "repos/$R/actions/runs?head_sha=$sha&event=push&per_page=100" --jq \
               '.workflow_runs[] | select(.status != "completed" or (.conclusion | IN("success","neutral","skipped") | not)) | "\(.name)=\(.status)/\(.conclusion)"')
             [ -z "$bad" ] || fail "workflow runs on ${sha:0:7} not passed: $bad"

@@ -1,0 +1,103 @@
+name: cut-release
+# The one way a release tag is made: an agent (or anyone) dispatches this with a vX.Y.Z tag, and it
+# tags main's head only when every check on it passed and the VPS reviewer's release verdict for
+# everything since the last tag is success. Cloud agent sessions can't push tags; this job can.
+# Tags made with this job's token start no workflows, so it dispatches the repo's tag workflows
+# (FOLLOW) on the new tag itself. Rerunning it with the newest tag re-checks that tag's commit and
+# finishes a release whose notes or follow workflows failed.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "vX.Y.Z, higher than every release tag so far"
+        required: true
+      baseline:
+        description: "The repo's first tag: skips the release review, which has no last tag to start from"
+        type: boolean
+        default: false
+permissions:
+  contents: write
+  actions: write
+  checks: read
+  statuses: read
+concurrency:
+  group: cut-release
+  cancel-in-progress: false
+env:
+  REQUIRE: "ci.yml"  # space-separated push workflows that must have passed on the commit; a [skip ci] commit has none
+  FOLLOW: "runner-image.yml"  # space-separated workflow files to dispatch on the new tag
+jobs:
+  cut:
+    runs-on: ubuntu-latest
+    steps:
+      - name: check and tag main's head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          R: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          TAG: ${{ inputs.tag }}
+          BASELINE: ${{ inputs.baseline }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "$TAG is not vX.Y.Z"
+          # A failed or partial tag listing must stop the job, never read as "no tags yet".
+          tags=$(gh api --paginate "repos/$R/tags?per_page=100" --jq '.[].name')
+          versions=$( (grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' <<<"$tags" || true) | sort -V)
+          last=$(tail -n 1 <<<"$versions")
+          if [ "$TAG" = "$last" ]; then
+            # A rerun with the tag a failed run already made resumes it. The tag alone proves nothing
+            # (it may have been made outside this workflow), so every gate below runs again on its
+            # commit, against the release before it; only the new-tag checks are skipped.
+            resume=true
+            sha=$(gh api "repos/$R/commits/$TAG" --jq .sha)
+            last=$( (grep -vx "$TAG" <<<"$versions" || true) | tail -n 1)
+            ahead=$(gh api "repos/$R/compare/$sha...main" --jq .status)
+            [[ "$ahead" = identical || "$ahead" = ahead ]] || fail "$TAG (${sha:0:7}) is not on main"
+          else
+            resume=false
+            sha=$(gh api "repos/$R/branches/main" --jq .commit.sha)
+            [ -z "$last" ] || [ "$(printf '%s\n%s\n' "$last" "$TAG" | sort -V | tail -n 1)" = "$TAG" ] || fail "$TAG is not above $last"
+            # Workflow runs register the moment a commit lands on main, before their jobs post check
+            # runs, and a commit's own date says nothing about when it landed: watch main hold this
+            # commit for 90s, so whatever CI it starts has registered before it is judged.
+            sleep 90
+            [ "$(gh api "repos/$R/branches/main" --jq .commit.sha)" = "$sha" ] || fail "main moved past ${sha:0:7} while it was being checked; dispatch again"
+          fi
+          if [ -n "$last" ]; then
+            [ "$BASELINE" = "false" ] || fail "baseline is for a repo's first tag; this one has $last"
+          else
+            [ "$BASELINE" = "true" ] || fail "no release tag before $TAG: cut the first one with baseline"
+          fi
+          # Actions are judged by their push runs on the commit; the tag workflows this job starts run
+          # on the same commit by dispatch, so they never count for or against it.
+          bad=$(gh api --paginate "repos/$R/actions/runs?head_sha=$sha&event=push&per_page=100" --jq \
+            '.workflow_runs[] | select(.status != "completed" or (.conclusion | IN("success","neutral","skipped") | not)) | "\(.name)=\(.status)/\(.conclusion)"')
+          [ -z "$bad" ] || fail "workflow runs on ${sha:0:7} not passed: $bad"
+          for w in $REQUIRE; do
+            n=$(gh api "repos/$R/actions/workflows/$w/runs?head_sha=$sha&event=push&status=success" --jq .total_count)
+            [ "$n" -gt 0 ] || fail "$w has no passed push run on ${sha:0:7}"
+          done
+          # Every other app's check run on the commit passed; a running one is not a pass.
+          bad=$(gh api --paginate "repos/$R/commits/$sha/check-runs?per_page=100" --jq \
+            '.check_runs[] | select(.app.slug != "github-actions") | select(.status != "completed" or (.conclusion | IN("success","neutral","skipped") | not)) | "\(.name)=\(.status)/\(.conclusion)"')
+          [ -z "$bad" ] || fail "checks on ${sha:0:7} not passed: $bad"
+          # Each status context's newest state passed; release verdicts count only from the owner's account.
+          statuses=$(gh api --paginate "repos/$R/commits/$sha/statuses?per_page=100" --jq '.[] | {context, state, by: .creator.login}' | jq -s .)
+          bad=$(jq -r 'group_by(.context) | map(.[0]) | .[] | select(.state != "success") | "\(.context)=\(.state)"' <<<"$statuses")
+          [ -z "$bad" ] || fail "statuses on ${sha:0:7} not passed: $bad"
+          if [ -n "$last" ]; then
+            for ctx in "release/vps since $last" "release/vps-security since $last"; do
+              state=$(jq -r --arg c "$ctx" --arg o "$OWNER" '[.[] | select(.context == $c and .by == $o)][0].state // "missing"' <<<"$statuses")
+              [ "$state" = "success" ] || fail "$ctx is $state on ${sha:0:7}"
+            done
+          fi
+          $resume || gh api -X POST "repos/$R/git/refs" -f "ref=refs/tags/$TAG" -f "sha=$sha" >/dev/null
+          gh api "repos/$R/releases/tags/$TAG" >/dev/null 2>&1 || gh release create "$TAG" -R "$R" --verify-tag --generate-notes --title "$TAG"
+          for w in $FOLLOW; do
+            # A follow workflow already passed or running on the tag is not started again.
+            done_runs=$(gh api "repos/$R/actions/workflows/$w/runs?branch=$TAG&per_page=100" --jq \
+              '[.workflow_runs[] | select(.status != "completed" or .conclusion == "success")] | length')
+            [ "$done_runs" -gt 0 ] || gh workflow run "$w" -R "$R" --ref "$TAG"
+          done
+          echo "released $TAG at ${sha:0:7}"

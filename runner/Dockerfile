@@ -120,7 +120,7 @@ ARG CODEX_VERSION=0.166.0
 # renovate: datasource=npm depName=@opencode/cli
 ARG OPENCODE_VERSION=2.2.5
 # renovate: datasource=npm depName=@earendil-works/pi-coding-agent
-ARG PI_VERSION=1.5.0
+ARG PI_VERSION=1.5.2
 # Prime publishes a stable channel and checksummed native release archives.
 ARG PRIME_AGENT_VERSION=0.10.2
 # Cursor Agent CLI — no Renovate datasource; lab version string from

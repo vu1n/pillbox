@@ -118,7 +118,7 @@ ARG CODEX_VERSION=0.166.0
 # OpenCode 2 ships as a new npm package (`@opencode/cli`); `opencode-ai` stays
 # on the 1.x line. Pillbox's local server adapter targets the 2.x server API.
 # renovate: datasource=npm depName=@opencode/cli
-ARG OPENCODE_VERSION=2.2.5
+ARG OPENCODE_VERSION=2.3.0
 # renovate: datasource=npm depName=@earendil-works/pi-coding-agent
 ARG PI_VERSION=1.5.2
 # Prime publishes a stable channel and checksummed native release archives.

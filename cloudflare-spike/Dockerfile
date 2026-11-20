@@ -1,7 +1,7 @@
 # The Sandbox SDK's prebuilt container server (default variant: node/bun + the
 # exec/files/process control plane on :3000). The DO drives it via getSandbox().
 # Bump in lockstep with the @cloudflare/sandbox version in package.json.
-FROM docker.io/cloudflare/sandbox:0.11.0
+FROM docker.io/cloudflare/sandbox:0.11.0@sha256:c9f58f118dfaf90933c55d6b412fc9fad25435671b2ab58f2bc17ccf98244b80
 
 # opencode CLI — createOpencodeServer runs `opencode serve` and expects the binary
 # on PATH; the base sandbox image ships node/npm/bun but NOT opencode (a missing

@@ -41,7 +41,7 @@
 # (`pillbox pty-host`) and the in-sandbox emitter / `session done` wrapper
 # all run *inside* the sandbox, matching what the e2b/ssh backends already
 # assume. Same glibc (bookworm) as the runtime stage below.
-FROM rust:1-bookworm AS pillbox-build
+FROM rust:1-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea AS pillbox-build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
@@ -62,7 +62,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --profile runner --locked --no-default-features && cp target/runner/pillbox /pillbox
 
 # ---- runtime stage -----------------------------------------------------
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV NPM_CONFIG_UPDATE_NOTIFIER=false

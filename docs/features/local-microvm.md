@@ -42,3 +42,4 @@ With the macOS libkrun toolchain, runner image and agent auth prepared, build/si
 - GitHub macOS CI compiles/links and runs non-VM tests; it cannot prove HVF boot.
 - Fresh OCI exports still need Docker as image plumbing. That does not make the deprecated Docker execution backend a maintained alternative.
 - A rebuild can replace the signed binary; use the build/sign script before a manual VM run.
+- The egress fence logs its DNS and TLS decisions to `PILLBOX_KRUN_EGRESS_LOG`, else to a per-run file under `~/.pillbox/krun/egress/` (pruned after 14 days, capped at 4 MiB). A foreground run prints the hosts it refused when it ends; a shared `PILLBOX_KRUN_EGRESS_LOG` gets no summary, since it mixes runs.

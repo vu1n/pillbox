@@ -114,7 +114,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 # renovate: datasource=npm depName=@anthropic-ai/claude-code
 ARG CLAUDE_VERSION=2.1.329
 # renovate: datasource=github-releases depName=openai/codex extractVersion=^rust-v(?<version>.*)$
-ARG CODEX_VERSION=0.166.0
+ARG CODEX_VERSION=0.169.0
 # OpenCode 2 ships as a new npm package (`@opencode/cli`); `opencode-ai` stays
 # on the 1.x line. Pillbox's local server adapter targets the 2.x server API.
 # renovate: datasource=npm depName=@opencode/cli

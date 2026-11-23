@@ -514,7 +514,7 @@ mod tests {
     }
 
     fn fake(lines: &[Value], max_final: usize) -> (Capture, Result<()>) {
-        let (host, mut child) = UnixStream::pair().unwrap();
+        let (host, child) = UnixStream::pair().unwrap();
         let bytes = lines
             .iter()
             .map(|l| {
@@ -525,9 +525,8 @@ mod tests {
                 }
             })
             .collect::<String>();
-        let worker = std::thread::spawn(move || {
-            let _ = child.write_all(bytes.as_bytes());
-        });
+        let mut pending_writer = Some((child, bytes));
+        let mut worker = None;
         // The fake ends on EOF; a generous deadline keeps a loaded CI runner from
         // failing the turn before the worker thread has written anything.
         let observed = run(
@@ -538,9 +537,24 @@ mod tests {
                 max_evidence_bytes: 8_388_608,
                 max_final_text_bytes: max_final,
             },
-            || Ok(()),
+            || {
+                // The first liveness check runs after the reader sets its timeout.
+                // On macOS that setup can fail if the peer has already closed.
+                if let Some((mut child, bytes)) = pending_writer.take() {
+                    worker = Some(std::thread::spawn(move || {
+                        child.write_all(bytes.as_bytes())
+                    }));
+                }
+                Ok(())
+            },
         );
-        worker.join().unwrap();
+        if let Some(worker) = worker {
+            let write_result = worker.join().unwrap();
+            // A rejected frame can make the reader close early.
+            if observed.1.is_ok() {
+                write_result.expect("write fake native frames");
+            }
+        }
         observed
     }
 

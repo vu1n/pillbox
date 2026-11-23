@@ -541,7 +541,9 @@ mod tests {
                 // The first liveness check runs after the reader sets its timeout.
                 // On macOS that setup can fail if the peer has already closed.
                 if let Some((mut child, bytes)) = pending_writer.take() {
-                    worker = Some(std::thread::spawn(move || child.write_all(bytes.as_bytes())));
+                    worker = Some(std::thread::spawn(move || {
+                        child.write_all(bytes.as_bytes())
+                    }));
                 }
                 Ok(())
             },

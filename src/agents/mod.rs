@@ -256,6 +256,11 @@ pub struct AgentSpec {
     /// Read only by the libkrun login VM's OAuth callback relay.
     #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) oauth_port: Option<u16>,
+    /// Hosts this agent's `auth login` reaches beyond the vault providers' hosts,
+    /// for every provider its login can pick. Exact names: the fence has no wildcards.
+    // Read only by the login VM's fence: a run, session or sandbox launch never gets these hosts.
+    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+    pub(crate) login_hosts: &'static [&'static str],
     #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) post_login_finalize: Option<fn(&Path) -> Result<()>>,
     pub(crate) vault_capable: bool,
@@ -301,6 +306,7 @@ pub const CLAUDE: AgentSpec = AgentSpec {
     login_argv: &["claude", "auth", "login", "--claudeai"],
     run_argv: &["claude"],
     oauth_port: Some(54545),
+    login_hosts: &["claude.ai"],
     post_login_finalize: Some(finalize_claude_onboarding),
     vault_capable: true,
     mcp_inject: Some(mcp::claude_inject),
@@ -362,6 +368,8 @@ pub const CODEX: AgentSpec = AgentSpec {
     login_argv: &["codex", "login", "--device-auth"],
     run_argv: &["codex"],
     oauth_port: None,
+    // Its device flow and token exchange are all on auth.openai.com, a vault provider host.
+    login_hosts: &[],
     post_login_finalize: None,
     vault_capable: true,
     mcp_inject: Some(mcp::codex_inject),
@@ -414,6 +422,7 @@ pub const CODEX_SERVE: AgentSpec = AgentSpec {
     // via the appserver-host bridge, not this argv) — kept honest, not launched.
     run_argv: &["codex", "app-server"],
     oauth_port: None,
+    login_hosts: CODEX.login_hosts,
     post_login_finalize: None,
     vault_capable: true,
     mcp_inject: Some(mcp::codex_inject),
@@ -443,6 +452,7 @@ pub const OPENCODE: AgentSpec = AgentSpec {
     // OpenCode owns its isolated provider store. Structured runs consume an
     // existing OAuth/API credential and do not open a callback during serve.
     oauth_port: None,
+    login_hosts: &["models.dev", "github.com"],
     post_login_finalize: None,
     vault_capable: false,
     mcp_inject: Some(mcp::opencode_inject),
@@ -474,6 +484,7 @@ pub const CURSOR: AgentSpec = AgentSpec {
     run_argv: &["agent"],
     // Remote URL + poll login — no localhost OAuth callback to forward.
     oauth_port: None,
+    login_hosts: &["cursor.com", "www.cursor.com", "api2.cursor.sh"],
     post_login_finalize: None,
     vault_capable: false,
     mcp_inject: None,
@@ -488,6 +499,16 @@ pub const CURSOR: AgentSpec = AgentSpec {
     #[cfg(feature = "libkrun")]
     libkrun_pty: None,
 };
+
+/// The non-vault hosts pi-ai's `/login` OAuth flows reach (pi and its fork Prime Agent):
+/// Anthropic, GitHub Copilot's device flow, and Google's Gemini CLI / Antigravity.
+const PI_AI_LOGIN_HOSTS: &[&str] = &[
+    "claude.ai",
+    "github.com",
+    "oauth2.googleapis.com",
+    "www.googleapis.com",
+    "cloudcode-pa.googleapis.com",
+];
 
 pub const PI: AgentSpec = AgentSpec {
     id: "pi",
@@ -505,6 +526,7 @@ pub const PI: AgentSpec = AgentSpec {
     login_argv: &["pi"],
     run_argv: &["pi"],
     oauth_port: Some(53692),
+    login_hosts: PI_AI_LOGIN_HOSTS,
     post_login_finalize: None,
     // Not wired into the vault stub-swap proxy (no custom-CA / proxy routing
     // integration yet) — mirrors opencode. `--vault` and vaulted secrets are
@@ -541,6 +563,7 @@ pub const PRIME_AGENT: AgentSpec = AgentSpec {
     login_argv: &["prime-agent"],
     run_argv: &["prime-agent"],
     oauth_port: Some(53692),
+    login_hosts: PI_AI_LOGIN_HOSTS,
     post_login_finalize: None,
     // Same posture as pi for `pillbox run`: mounts its own auth home, no vault.
     // The text/2 driver vaults its API key separately (`execution::pi_text`).

@@ -34,7 +34,7 @@ global pillbox regardless of where you are.
 | `pillbox secret rm NAME [--global]` | Delete a secret. |
 | `pillbox env load NAME PATH [--global]` | Parse `.env` file, store as bundle. |
 | `pillbox env list/show/rm` | Same shape as secrets. |
-| `pillbox auth login --agent A` | Run the agent's OAuth flow inside a sandbox. Always writes to global. For `cursor`, browser login (`agent login`) is one path; API-key auth is also supported via a stored `CURSOR_API_KEY` (see Cursor auth below). |
+| `pillbox auth login --agent A` | Run the agent's OAuth flow inside a sandbox. Always writes to global. The login microVM reaches only the vault providers' hosts plus the hosts that agent's login flows need (e.g. `github.com` for GitHub Copilot's device flow in opencode/pi/prime-agent); a provider on any other host (GitHub Enterprise, a custom OpenAI-compatible base URL) fails at DNS, and the login ends with `pillbox: the egress fence refused <host> …`. For `cursor`, browser login (`agent login`) is one path; API-key auth is also supported via a stored `CURSOR_API_KEY` (see Cursor auth below). |
 | `pillbox auth list/rm` | List/remove agent OAuth state. |
 | `pillbox vault ca/status [--json]` | Inspect the per-pillbox vault CA. |
 | `pillbox sidecar [--bind] [--json]` | Standalone vault sidecar process. |

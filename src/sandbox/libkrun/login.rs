@@ -216,28 +216,18 @@ fn login_vm_spec(
 }
 
 /// The login VM's fence: every vault provider's hosts (API + OAuth/token
-/// endpoints) plus the hosts only this agent's login flow reaches.
+/// endpoints) plus the hosts this agent's login flow declares.
 fn login_allowlist(spec: &AgentSpec) -> Vec<String> {
     let mut hosts: Vec<String> = crate::vault::providers::intercepted_hosts()
         .into_iter()
         .map(str::to_string)
         .collect();
-    for host in login_only_hosts(spec) {
+    for host in spec.login_hosts {
         if !hosts.iter().any(|h| h == host) {
             hosts.push((*host).to_string());
         }
     }
     hosts
-}
-
-/// Hosts an agent's login flow reaches beyond the vault providers' hosts.
-fn login_only_hosts(spec: &AgentSpec) -> &'static [&'static str] {
-    match spec.auth_id {
-        "claude" | "pi" | "prime-agent" => &["claude.ai"],
-        "cursor" => &["cursor.com", "www.cursor.com", "api2.cursor.sh"],
-        "opencode" => &["models.dev"],
-        _ => &[],
-    }
 }
 
 /// Host loopback listener(s) on the agent's OAuth callback port, relaying each
@@ -512,7 +502,142 @@ mod tests {
                 spec.id
             );
         }
-        let prime = ALL.iter().find(|s| s.auth_id == "prime-agent").unwrap();
-        assert_eq!(login_only_hosts(prime), &["claude.ai"]);
+    }
+
+    /// Every agent's login flow, by the providers it can pick: the hosts each
+    /// flow's CLI contacts (vault hosts included). Adding an agent fails here until
+    /// its login flow is listed.
+    const LOGIN_FLOWS: &[(&str, &[&str])] = &[
+        (
+            "claude",
+            &["claude.ai", "platform.claude.com", "api.anthropic.com"],
+        ),
+        (
+            "claude-stream",
+            &["claude.ai", "platform.claude.com", "api.anthropic.com"],
+        ),
+        ("codex", &["auth.openai.com"]),
+        ("codex-serve", &["auth.openai.com"]),
+        (
+            "opencode",
+            &[
+                "models.dev",
+                "github.com",
+                "api.github.com",
+                "console.anthropic.com",
+                "api.anthropic.com",
+                "auth.openai.com",
+            ],
+        ),
+        (
+            "pi",
+            &[
+                "claude.ai",
+                "console.anthropic.com",
+                "github.com",
+                "api.github.com",
+                "auth.openai.com",
+                "oauth2.googleapis.com",
+                "www.googleapis.com",
+                "cloudcode-pa.googleapis.com",
+            ],
+        ),
+        (
+            "prime-agent",
+            &[
+                "claude.ai",
+                "console.anthropic.com",
+                "github.com",
+                "api.github.com",
+                "auth.openai.com",
+                "oauth2.googleapis.com",
+                "www.googleapis.com",
+                "cloudcode-pa.googleapis.com",
+            ],
+        ),
+        (
+            "cursor",
+            &["cursor.com", "www.cursor.com", "api2.cursor.sh"],
+        ),
+    ];
+
+    #[test]
+    fn every_agent_login_fence_covers_its_login_flow_hosts() {
+        let ids: Vec<&str> = ALL.iter().map(|s| s.id).collect();
+        let listed: Vec<&str> = LOGIN_FLOWS.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            ids, listed,
+            "every agent's login flow is listed, in ALL's order"
+        );
+        let vault = crate::vault::providers::intercepted_hosts();
+        for spec in ALL {
+            let (_, flow) = LOGIN_FLOWS.iter().find(|(id, _)| *id == spec.id).unwrap();
+            let (vm, _, _dir) = build(spec, spec.oauth_port);
+            let allow = &vm.egress.as_ref().unwrap().allowlist;
+            for host in *flow {
+                assert!(
+                    allow.iter().any(|h| h == host),
+                    "{}: login fence lacks {host}",
+                    spec.id
+                );
+            }
+            for host in spec.login_hosts {
+                // The fence matches exact names, so a declared host is a plain lowercase name.
+                assert!(
+                    !host.is_empty()
+                        && host.chars().all(|c| c.is_ascii_lowercase()
+                            || c.is_ascii_digit()
+                            || c == '.'
+                            || c == '-'),
+                    "{}: {host:?}",
+                    spec.id
+                );
+                assert!(
+                    !vault.contains(host),
+                    "{}: {host} is already a vault host",
+                    spec.id
+                );
+                assert!(
+                    flow.contains(host),
+                    "{}: {host} is declared but no flow needs it",
+                    spec.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn copilot_device_flow_resolves_github_com_at_login() {
+        for id in ["opencode", "pi", "prime-agent"] {
+            let spec = ALL.iter().find(|s| s.id == id).unwrap();
+            let (vm, _, _dir) = build(spec, spec.oauth_port);
+            let egress = vm.egress.as_ref().unwrap();
+            assert!(egress.opens_token_endpoints());
+            // Device code + token poll on github.com, then the Copilot token on api.github.com.
+            for host in ["github.com", "api.github.com"] {
+                assert!(egress.allowlist.iter().any(|h| h == host), "{id}: {host}");
+            }
+        }
+        assert!(!login_allowlist(&CODEX).iter().any(|h| h == "github.com"));
+    }
+
+    #[test]
+    fn login_hosts_never_reach_a_non_login_launch() {
+        let run = super::super::session::standard_allowlist(&[]);
+        let standard = super::super::egress::standard_egress_hosts();
+        for spec in ALL {
+            for host in spec.login_hosts {
+                if !standard.contains(host) {
+                    assert!(
+                        !run.iter().any(|h| h == host),
+                        "{}: login-only {host} is on the run fence",
+                        spec.id
+                    );
+                }
+            }
+        }
+        assert!(!run.iter().any(|h| h == "github.com"));
+        let fence = EgressSpec::fence(run, None, None, None, None);
+        assert!(!fence.opens_token_endpoints());
     }
 }

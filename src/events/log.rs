@@ -54,7 +54,7 @@ use crate::pillbox::Pillbox;
 
 /// The append-only spine file inside a session's directory.
 const LOG_FILE: &str = "log.jsonl";
-const MAX_LOG_LINE_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_LOG_LINE_BYTES: usize = 8 * 1024 * 1024;
 const LOG_TAIL_READ_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_LOG_TAIL_SCAN_BYTES: usize = 2 * (MAX_LOG_LINE_BYTES + 1);
 

@@ -400,7 +400,8 @@ impl Tailer {
     /// - File doesn't exist yet at first pump. Returns 0 — the
     ///   caller's notify watch will retry as soon as it appears.
     pub(crate) fn pump(&mut self) -> Result<usize> {
-        let mut file = match std::fs::File::open(&self.path) {
+        // The agent writes this transcript: a symlink, FIFO or device at the path is refused.
+        let mut file = match crate::events::capture::open_guest_file(&self.path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
             Err(e) => return Err(e).with_context(|| format!("open {}", self.path.display())),

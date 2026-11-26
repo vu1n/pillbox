@@ -1524,7 +1524,7 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
     let process_exit = status.code().unwrap_or(1);
     let capture = creds_share.join(events_file);
     let drained = (|| -> Result<(usize, i32)> {
-        let file = std::fs::File::open(&capture).with_context(|| match vmm_diagnostic.as_deref() {
+        let file = crate::events::capture::open_guest_file(&capture).with_context(|| match vmm_diagnostic.as_deref() {
             Some(diagnostic) => format!(
                 "{} VMM exited with code {process_exit} before creating structured capture: {diagnostic}",
                 spec.id
@@ -2709,7 +2709,7 @@ impl crate::sandbox::LiveSession for LibkrunLiveSession {
         // than tailing, and the never-set stop flag is meaningless on this path.
         let path = server_events_file(&self.session)?;
         let format = self.events_format()?;
-        let file = std::fs::File::open(&path).map_err(|e| {
+        let file = crate::events::capture::open_guest_file(&path).map_err(|e| {
             PillboxError::runtime(
                 "session ingest",
                 format!("open events file {}: {e}", path.display()),

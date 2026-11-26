@@ -177,10 +177,18 @@ fn agent_exit_code(json: bool, harness_code: i32, finished: Option<i32>) -> i32 
 struct AgentDriver {
     adapter: Box<dyn HarnessAdapter>,
     emitter: EventEmitter,
+    /// The current line's bytes so far; never holds a newline, never exceeds
+    /// [`MAX_AGENT_LINE_BYTES`].
     buf: Vec<u8>,
+    /// True while discarding the rest of an overlong line, up to its newline.
+    skipping: bool,
     /// The exit code of the turn's `run_finished`, once one is emitted.
     finished: Option<i32>,
 }
+
+/// Longest harness stdout line the driver buffers. Bounds the host's memory against
+/// a guest that never sends a newline.
+const MAX_AGENT_LINE_BYTES: usize = 8 * 1024 * 1024;
 
 impl AgentDriver {
     fn new(adapter: Box<dyn HarnessAdapter>, sink: Box<dyn EventSink>, sandbox_id: String) -> Self {
@@ -189,16 +197,35 @@ impl AgentDriver {
             adapter,
             emitter: EventEmitter::new(sink, sandbox_id, Correlation::Run(run_id)),
             buf: Vec::new(),
+            skipping: false,
             finished: None,
         }
     }
 
     /// Feed a raw stdout chunk; emits events for every complete line it sees.
-    fn feed(&mut self, bytes: &[u8]) -> Result<()> {
-        self.buf.extend_from_slice(bytes);
-        while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = self.buf.drain(..=pos).collect();
-            self.emit_line(&line[..line.len() - 1])?;
+    /// Each byte is scanned once: `buf` holds no newline, so only `bytes` is searched.
+    fn feed(&mut self, mut bytes: &[u8]) -> Result<()> {
+        while !bytes.is_empty() {
+            let end = bytes.iter().position(|&b| b == b'\n');
+            let piece = &bytes[..end.unwrap_or(bytes.len())];
+            bytes = end.map_or(&[][..], |pos| &bytes[pos + 1..]);
+            // A line longer than MAX_AGENT_LINE_BYTES is dropped whole, never buffered or parsed.
+            if !self.skipping && self.buf.len() + piece.len() > MAX_AGENT_LINE_BYTES {
+                eprintln!(
+                    "pillbox: warning: dropped an agent output line over {MAX_AGENT_LINE_BYTES} bytes"
+                );
+                self.buf = Vec::new();
+                self.skipping = true;
+            }
+            if !self.skipping {
+                self.buf.extend_from_slice(piece);
+            }
+            if end.is_some() {
+                let line = std::mem::take(&mut self.buf);
+                if !std::mem::replace(&mut self.skipping, false) {
+                    self.emit_line(&line)?;
+                }
+            }
         }
         Ok(())
     }
@@ -206,6 +233,9 @@ impl AgentDriver {
     /// Flush a trailing line that arrived without a newline.
     fn finish(&mut self) -> Result<()> {
         let rest = std::mem::take(&mut self.buf);
+        if std::mem::replace(&mut self.skipping, false) {
+            return Ok(());
+        }
         self.emit_line(&rest)
     }
 
@@ -640,5 +670,41 @@ mod tests {
             }
             _ => panic!("expected two tool calls"),
         }
+    }
+
+    #[test]
+    fn driver_drops_an_overlong_line_without_buffering_it_and_keeps_the_next() {
+        let collected = Rc::new(RefCell::new(Vec::new()));
+        let mut driver = AgentDriver::new(
+            Box::new(ClaudeAdapter::default()),
+            Box::new(CollectSink(collected.clone())),
+            "sb-test".into(),
+        );
+        // A newline-free flood well past the cap, in output-frame-sized chunks.
+        let flood = vec![b'x'; 64 * 1024];
+        for _ in 0..(MAX_AGENT_LINE_BYTES / flood.len() + 2) {
+            driver.feed(&flood).unwrap();
+            assert!(driver.buf.len() <= MAX_AGENT_LINE_BYTES);
+        }
+        assert!(driver.skipping && driver.buf.is_empty());
+        let ok = b"\n{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"pong\"}\n";
+        driver.feed(ok).unwrap();
+        driver.finish().unwrap();
+        assert_eq!(driver.finished, Some(0));
+        assert!(!driver.skipping);
+
+        // A line of exactly the cap is kept, one byte over is not.
+        let mut at_cap = AgentDriver::new(
+            Box::new(ClaudeAdapter::default()),
+            Box::new(CollectSink(Rc::new(RefCell::new(Vec::new())))),
+            "sb-test".into(),
+        );
+        at_cap.feed(&vec![b' '; MAX_AGENT_LINE_BYTES]).unwrap();
+        assert!(!at_cap.skipping);
+        at_cap.feed(b" ").unwrap();
+        assert!(at_cap.skipping && at_cap.buf.is_empty());
+        // finish() after an unterminated overlong line emits nothing.
+        at_cap.finish().unwrap();
+        assert_eq!(at_cap.finished, None);
     }
 }

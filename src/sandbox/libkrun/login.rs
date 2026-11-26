@@ -42,8 +42,10 @@ const GUEST_LOGIN_WORKSPACE: &str = "login";
 /// the credential sentinel and finalizes. `home` is `spec`'s real auth home.
 pub(crate) fn login(spec: &AgentSpec, resolved: &Pillbox, home: &Path) -> Result<i32> {
     disk_preflight()?;
-    let rootfs = materialize_rootfs(resolved)?;
-    let ca = provision_vault_ca(resolved, CaLifetime::Ephemeral)?;
+    // Shadowed so nothing below can reach the current (possibly untrusted) project.
+    let resolved = login_pillbox(spec, resolved);
+    let rootfs = materialize_rootfs(&resolved)?;
+    let ca = provision_vault_ca(&resolved, CaLifetime::Ephemeral)?;
 
     // Private, empty, and removed with the VM: the boot-script share and the
     // workspace the shared preamble mounts. The real auth home is never removed.
@@ -108,6 +110,13 @@ pub(crate) fn login(spec: &AgentSpec, resolved: &Pillbox, home: &Path) -> Result
             bail!("the login VM disconnected before `{}` exited", spec.id)
         }
     }
+}
+
+/// The pillbox a login VM's rootfs (runner image) and vault CA come from: the
+/// agent's auth pillbox, never the current project. The login VM holds the real
+/// credentials read-write, so a repo's `pillbox.toml` must not pick what runs there.
+fn login_pillbox(spec: &AgentSpec, resolved: &Pillbox) -> Pillbox {
+    spec.auth_pillbox(resolved)
 }
 
 /// Host paths a login VmSpec points at.
@@ -224,7 +233,7 @@ fn login_allowlist(spec: &AgentSpec) -> Vec<String> {
 /// Hosts an agent's login flow reaches beyond the vault providers' hosts.
 fn login_only_hosts(spec: &AgentSpec) -> &'static [&'static str] {
     match spec.auth_id {
-        "claude" | "pi" | "prime" => &["claude.ai"],
+        "claude" | "pi" | "prime-agent" => &["claude.ai"],
         "cursor" => &["cursor.com", "www.cursor.com", "api2.cursor.sh"],
         "opencode" => &["models.dev"],
         _ => &[],
@@ -323,7 +332,7 @@ fn relay_conn(tcp: TcpStream, forward_sock: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agents::{CLAUDE, CODEX};
+    use crate::agents::{ALL, CLAUDE, CODEX};
 
     fn build(spec: &AgentSpec, oauth_port: Option<u16>) -> (VmSpec, String, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -416,5 +425,57 @@ mod tests {
             .allowlist
             .iter()
             .any(|h| h == "auth.openai.com"));
+    }
+
+    #[test]
+    fn a_project_runner_image_does_not_reach_the_login_vm() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("repo");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(
+            source.join("pillbox.toml"),
+            "name = \"evil\"\n[runner]\nimage = \"attacker/runner:latest\"\n",
+        )
+        .unwrap();
+        let project = Pillbox {
+            scope: crate::pillbox::Scope::Project {
+                key: "evil".into(),
+                source_dir: source,
+            },
+            state_dir: dir.path().join("state"),
+            meta: None,
+        };
+        // The fixture is live: the project itself resolves to the attacker's image.
+        if std::env::var(crate::docker::RUNNER_IMAGE_ENV).is_err() {
+            assert_eq!(
+                crate::docker::resolve_runner_image(&project).0,
+                "attacker/runner:latest"
+            );
+        }
+        for spec in ALL {
+            let login = login_pillbox(spec, &project);
+            assert!(matches!(login.scope, crate::pillbox::Scope::Global));
+            assert_ne!(
+                crate::docker::resolve_runner_image(&login).0,
+                "attacker/runner:latest",
+                "{}",
+                spec.id
+            );
+        }
+    }
+
+    #[test]
+    fn every_claude_oauth_agent_reaches_claude_ai_at_login() {
+        for spec in ALL {
+            let claude_oauth = matches!(spec.auth_id, "claude" | "pi" | "prime-agent");
+            assert_eq!(
+                login_allowlist(spec).iter().any(|h| h == "claude.ai"),
+                claude_oauth || crate::vault::providers::intercepted_hosts().contains(&"claude.ai"),
+                "{}",
+                spec.id
+            );
+        }
+        let prime = ALL.iter().find(|s| s.auth_id == "prime-agent").unwrap();
+        assert_eq!(login_only_hosts(prime), &["claude.ai"]);
     }
 }

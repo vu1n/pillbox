@@ -91,7 +91,8 @@ pub(crate) fn run_vsock(port: u32, listen: bool, argv: &[String]) -> Result<()> 
     // Dial the host, retrying only until the bridge + parent listener are ready
     // (the guest boots well after the parent binds, so this connects promptly).
     let stream = loop {
-        let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) };
+        // CLOEXEC: the agent this pty-host spawns must not inherit its host channel.
+        let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
         if fd < 0 {
             anyhow::bail!("AF_VSOCK socket: {}", std::io::Error::last_os_error());
         }
@@ -120,17 +121,33 @@ pub(crate) fn run_vsock(port: u32, listen: bool, argv: &[String]) -> Result<()> 
 /// ([`crate::sandbox::exec_channel::run_exec_host`]).
 #[cfg(target_os = "linux")]
 pub(crate) fn vsock_serve(port: u32, mut handler: impl FnMut(UnixStream)) -> Result<()> {
-    use std::os::unix::io::FromRawFd;
     let lfd = vsock_listen(port)?;
     loop {
-        let cfd = unsafe { libc::accept(lfd, std::ptr::null_mut(), std::ptr::null_mut()) };
-        if cfd < 0 {
-            thread::sleep(Duration::from_millis(100));
-            continue;
+        match accept_cloexec(lfd) {
+            Ok(conn) => handler(conn),
+            Err(_) => thread::sleep(Duration::from_millis(100)),
         }
-        // SAFETY: `cfd` is a freshly accepted socket this stream now solely owns.
-        handler(unsafe { UnixStream::from_raw_fd(cfd) });
     }
+}
+
+/// Accept one connection on the listening socket `lfd`.
+#[cfg(target_os = "linux")]
+fn accept_cloexec(lfd: i32) -> std::io::Result<UnixStream> {
+    use std::os::unix::io::FromRawFd;
+    // CLOEXEC: a command spawned for one connection must not inherit another's socket.
+    let cfd = unsafe {
+        libc::accept4(
+            lfd,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            libc::SOCK_CLOEXEC,
+        )
+    };
+    if cfd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `cfd` is a freshly accepted socket this stream now solely owns.
+    Ok(unsafe { UnixStream::from_raw_fd(cfd) })
 }
 
 /// Bind + listen a guest-side vsock listener on `port` (CID_ANY). libkrun binds
@@ -139,7 +156,8 @@ pub(crate) fn vsock_serve(port: u32, mut handler: impl FnMut(UnixStream)) -> Res
 #[cfg(target_os = "linux")]
 fn vsock_listen(port: u32) -> Result<i32> {
     const VMADDR_CID_ANY: u32 = 0xffff_ffff;
-    let lfd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) };
+    // CLOEXEC: no spawned command may inherit the listener (and hold or reuse the port).
+    let lfd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
     if lfd < 0 {
         anyhow::bail!("AF_VSOCK socket: {}", std::io::Error::last_os_error());
     }
@@ -419,6 +437,39 @@ fn handle_client(
             // control + signal forwarding land in phase 5 / later).
             Ok(Some(_)) => {}
             Ok(None) | Err(_) => break,
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    fn cloexec(fd: i32) -> bool {
+        // SAFETY: F_GETFD on an fd the test owns.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert!(flags >= 0, "{}", std::io::Error::last_os_error());
+        flags & libc::FD_CLOEXEC != 0
+    }
+
+    #[test]
+    fn guest_channel_sockets_are_close_on_exec() {
+        use std::os::fd::AsRawFd as _;
+        // Accepted connections (accept4 is family-agnostic; vsock loopback may be absent).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("l.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let _client = UnixStream::connect(&path).unwrap();
+        let conn = accept_cloexec(listener.as_raw_fd()).unwrap();
+        assert!(cloexec(conn.as_raw_fd()));
+        // The vsock listener, where this kernel has AF_VSOCK.
+        match vsock_listen(40_000 + std::process::id() % 20_000) {
+            Ok(lfd) => {
+                assert!(cloexec(lfd));
+                // SAFETY: closing the listener this test opened.
+                unsafe { libc::close(lfd) };
+            }
+            Err(e) => eprintln!("skipping the vsock listener check: {e:#}"),
         }
     }
 }

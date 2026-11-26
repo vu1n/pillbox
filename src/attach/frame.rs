@@ -195,6 +195,32 @@ fn invalid(msg: &str) -> io::Error {
 mod tests {
     use super::*;
 
+    /// Serves a frame header, then fails the test if the payload is ever read.
+    struct HeaderOnly {
+        hdr: [u8; 5],
+        served: usize,
+    }
+    impl Read for HeaderOnly {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            assert!(self.served < 5, "read past the header of an over-cap frame");
+            let n = buf.len().min(5 - self.served);
+            buf[..n].copy_from_slice(&self.hdr[self.served..self.served + n]);
+            self.served += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn read_frame_refuses_a_declared_length_over_the_cap_before_reading_the_payload() {
+        let mut hdr = [7u8; 5];
+        hdr[1..].copy_from_slice(&u32::MAX.to_be_bytes());
+        let mut r = HeaderOnly { hdr, served: 0 };
+        let err = read_frame(&mut r, 1024).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("exceeds cap 1024"), "{err}");
+        assert_eq!(r.served, 5);
+    }
+
     fn round_trip(f: Frame) {
         let mut buf = Vec::new();
         f.encode(&mut buf).unwrap();

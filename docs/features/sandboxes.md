@@ -11,7 +11,16 @@ entry:
   - "src/sandbox/mod.rs:sandbox_target"
 tests:
   - "src/sandbox/libkrun/sandbox_vm.rs:libkrun_declares_long_lived_exec"
-  - "src/sandbox/libkrun/sandbox_vm.rs:agent_boot_script_hands_files_to_uid_1000_and_drops_before_exec_host"
+  - "src/sandbox/libkrun/sandbox_vm.rs:agent_boot_script_hands_files_to_uid_1000_and_exec_host_stays_root_dropping_each_command"
+  - "src/sandbox/libkrun/sandbox_vm.rs:building_a_sandbox_boot_script_that_leaks_a_swap_secret_fails"
+  - "src/sandbox/libkrun/sandbox_vm.rs:exec_readiness_deadline_bounds_a_probe_that_trickles_output"
+  - "src/sandbox/exec_channel.rs:a_run_as_command_runs_as_that_uid_with_no_supplementary_groups"
+  - "src/sandbox/exec_channel.rs:a_cwd_problem_is_named_as_one"
+  - "src/sandbox/exec_channel.rs:run_exec_refuses_a_guest_output_frame_over_one_chunk"
+  - "src/sandbox/exec_channel.rs:the_post_exit_relay_sends_only_what_was_buffered_when_it_started"
+  - "src/attach/host.rs:guest_channel_sockets_are_close_on_exec"
+  - "src/commands/sandbox.rs:driver_drops_an_overlong_line_without_buffering_it_and_keeps_the_next"
+  - "src/sandbox/libkrun/rootfs.rs:removal_never_follows_a_link_a_live_guest_swaps_in_mid_walk"
   - "src/sandbox/libkrun/sandbox_vm.rs:exec_readiness_waits_for_the_channel_and_fails_on_vmm_exit_or_timeout"
   - "src/sandbox/libkrun/sandbox_vm.rs:libkrun_record_round_trips_to_a_target_and_destroy_removes_files_then_record"
   - "src/sandbox/exec_channel.rs:exec_channel_serve_and_run_deliver_both_streams_and_exit_code"
@@ -49,26 +58,38 @@ destroy drops the record, names what was left (`docker rm -f <container>`), and 
   goes through `SpawnedVm::commit` → `abandon_launch`, as a failed server bring-up does,
   which tears the VM and its files down. If the CLI itself dies first (Ctrl-C during the
   readiness wait), the VMM's commit guard removes the spec, shares, sockets and the private
-  rootfs clone, then exits.
+  rootfs clone, then exits. The guest is still running while that happens, so the rootfs
+  removal is fd-relative (`rootfs::remove_tree_nofollow`): it never resolves a path, so a
+  link the guest swaps in mid-walk is unlinked, never followed or chmodded through.
 - `--agent`: the structured run's creds (`agent_launch_creds`). Only an agent that is
   vault-capable and has a stdout adapter is accepted (`claude` today; `sandbox_agents`);
   anything else is a usage error before any launch, so the guest never holds a real
   credential — stubs in the guest, the real token only on the VMM child's stdin.
-  The guest runs commands as uid 1000. A bare sandbox gets an empty home and runs as root.
+  `sealed_boot_script` is the only way to build a sandbox boot script, and it fails if a
+  real swap credential appears anywhere in it.
+- Identity: `exec-host` always runs as guest root. In an agent sandbox it drops each
+  command to uid:gid 1000:1000 with no supplementary groups (`--run-as-uid 1000`), so the
+  agent can't kill `exec-host` or take vsock port 1026 and forge another command's output.
+  A bare sandbox holds no credential, so it gets an empty home and its commands run as root.
+  Every guest vsock socket is close-on-exec, so no command inherits a channel.
 - Exec channel: framed request (argv, cwd = guest workspace) and stdout/stderr/exit
   frames over vsock port 1026, one connection per command (the codec is
-  `attach::frame::{read_frame,write_frame}` with a 16 MiB cap). The command runs in its
+  `attach::frame::{read_frame,write_frame}`; the guest reads the request with a 16 MiB cap,
+  and the host refuses any guest frame over one 64 KiB output chunk). The command runs in its
   own process group: if the host closes the connection, the guest kills the group. Output
   is relayed one chunk per pipe per wake-up, so the command's exit is never starved. Exit
   is sent when the command itself exits, after only what the pipes held at that moment;
   a background child still holding stdout keeps running, and its later output is
   discarded. A command that can't start exits 127 (not found) or 126 (not executable,
-  permission denied, unusable cwd) with the reason on stderr, so `exec --json` always
+  permission denied, or a cwd that is missing, not a directory, or not searchable by the
+  command's uid, which the reason names) with the reason on stderr, so `exec --json` always
   ends in `exec_exit`. The target dials the channel before `exec_started` is emitted, so
   a refusal or dead VM fails with no events.
 - Destroy: the same `teardown_handle` as `session rm` on libkrun, then the record, and
   `✓ sandbox … destroyed`. A record pillbox can't drive is just dropped (see above), and
   the CLI says the record was dropped and nothing was torn down.
+- Agent stream: the driver buffers at most 8 MiB of one harness stdout line; a longer line
+  is dropped whole with a warning on stderr, and the next line is parsed as usual.
 - Agent exit code: plain `sandbox agent` exits with the turn's outcome; `--json` exits 0
   only when `run_finished` already carries it (a harness failure it didn't report, or no
   `run_finished` at all, exits non-zero).
@@ -122,5 +143,6 @@ readiness wait, exec over a real exec-channel server, and destroy.
   a permission error from a command that writes it.
 - `--agent cursor`/`pi` are refused: they aren't vault-capable, so their real key would
   sit in the guest. Add one only once it is env-forked and has a stdout adapter.
-- `spawn` waits up to 120 s for the exec channel; a slow boot over a large workspace
+- `spawn` waits up to 120 s for the exec channel, covering each probe too (a guest that
+  keeps a probe busy with output can't stretch it); a slow boot over a large workspace
   clone can hit that and is torn down.

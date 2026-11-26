@@ -131,14 +131,17 @@ pub(super) fn env_exports(env: &[(String, String)]) -> Result<String> {
 /// The in-guest `pillbox exec-host` line a sandbox boot script `exec`s. Every
 /// token is a shell-safe literal, so scripts join them with spaces; the CLI test
 /// below parses these exact argv, so a renamed flag fails here, not in a booted VM.
-pub(super) fn exec_host_cmd(vsock_port: u32) -> String {
-    [
-        "pillbox",
-        "exec-host",
-        "--vsock-port",
-        &vsock_port.to_string(),
-    ]
-    .join(" ")
+pub(super) fn exec_host_cmd(vsock_port: u32, run_as_uid: Option<u32>) -> String {
+    let mut argv = vec![
+        "pillbox".to_string(),
+        "exec-host".into(),
+        "--vsock-port".into(),
+        vsock_port.to_string(),
+    ];
+    if let Some(uid) = run_as_uid {
+        argv.extend(["--run-as-uid".into(), uid.to_string()]);
+    }
+    argv.join(" ")
 }
 
 /// The in-guest `pillbox vsock-forward` relay line (server agents, login callback).
@@ -204,9 +207,14 @@ mod tests {
                 .unwrap_or_else(|e| panic!("`{line}` does not parse: {e}"))
                 .command
         };
-        match parse(&exec_host_cmd(1026)) {
-            crate::Command::ExecHost { vsock_port } => assert_eq!(vsock_port, 1026),
-            other => panic!("{other:?}"),
+        for run_as in [None, Some(1000)] {
+            match parse(&exec_host_cmd(1026, run_as)) {
+                crate::Command::ExecHost {
+                    vsock_port,
+                    run_as_uid,
+                } => assert_eq!((vsock_port, run_as_uid), (1026, run_as)),
+                other => panic!("{other:?}"),
+            }
         }
         match parse(&vsock_forward_cmd(1025, 54545)) {
             crate::Command::VsockForward {

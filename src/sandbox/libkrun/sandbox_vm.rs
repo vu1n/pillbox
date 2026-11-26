@@ -38,7 +38,7 @@ use super::session::{
 use super::{boot, krun_cache_dir, shell_quote, EgressSpec, Share, SwapPair, VmSpec, VsockAttach};
 
 /// Guest vsock port `exec-host` listens on. Distinct from the attach (1024) and
-/// forward (1025) ports, and ≥ 1024 so a non-root `exec-host` may bind it.
+/// forward (1025) ports.
 pub(super) const EXEC_PORT: u32 = 1026;
 
 /// The uid:gid an agent sandbox's commands run as (the docker `--user 1000:1000`).
@@ -145,10 +145,13 @@ fn prepare(resolved: &Pillbox, agent: Option<&AgentSpec>, workspace: &Path) -> R
     };
     guest_env.extend(stub_env);
 
-    let preamble = guest_launch_preamble(&ca.cert_pem, &guest_workspace);
-    let exports = boot::env_exports(&guest_env)?;
-    let script = boot_script(&exports, &preamble, &guest_workspace, agent.is_some());
-    ensure_env_fork_sealed(&swap_pairs, &guest_env, &script)?;
+    let script = sealed_boot_script(
+        &guest_env,
+        &ca.cert_pem,
+        &guest_workspace,
+        agent.is_some(),
+        &swap_pairs,
+    )?;
     let (boot_share, boot_exec) = boot::boot_channel(
         &creds_share,
         "creds",
@@ -195,30 +198,44 @@ fn empty_home() -> Result<PathBuf> {
 }
 
 /// The guest boot script: env exports, the shared preamble (NIC, CA, workspace
-/// mount), then `exec-host` listening on [`EXEC_PORT`]. An agent sandbox first
-/// hands the home and workspace to uid 1000 and runs `exec-host` (so every exec'd
-/// command) as that user.
-fn boot_script(exports: &str, preamble: &str, guest_workspace: &str, agent: bool) -> String {
-    let exec_host = boot::exec_host_cmd(EXEC_PORT);
-    if !agent {
-        return format!("{exports}{preamble}; exec {exec_host}");
-    }
-    // claude refuses skip-permissions as root, so an agent sandbox's commands run as uid 1000.
-    let uid = AGENT_UID;
-    let home_q = shell_quote(GUEST_HOME);
-    let gw_q = shell_quote(guest_workspace);
-    let runuser = crate::commands::session::RUNUSER;
-    format!(
-        "{exports}{preamble}; \
-         getent group {uid} >/dev/null || echo 'pillbox:x:{uid}:' >> /etc/group; \
-         AGENT_USER=$(getent passwd {uid} | cut -d: -f1); \
-         if [ -z \"$AGENT_USER\" ]; then \
-             echo 'pillbox:x:{uid}:{uid}:pillbox:{GUEST_HOME}:/bin/sh' >> /etc/passwd; AGENT_USER=pillbox; \
-         fi; \
-         chown -R {uid}:{uid} {home_q} {gw_q} || \
-             echo 'pillbox: warning: some sandbox files could not be handed to uid {uid}' >&2; \
-         exec {runuser} -u \"$AGENT_USER\" --preserve-environment -- {exec_host}"
-    )
+/// mount), then `exec-host` listening on [`EXEC_PORT`], sealed against a real
+/// swap credential: the only way to build a sandbox boot script, so no launch
+/// can skip the seal. An agent sandbox first hands the home and workspace to
+/// uid 1000, whose identity every exec'd command then runs as.
+fn sealed_boot_script(
+    guest_env: &[(String, String)],
+    ca_cert_pem: &str,
+    guest_workspace: &str,
+    agent: bool,
+    swap_pairs: &[SwapPair],
+) -> Result<String> {
+    let exports = boot::env_exports(guest_env)?;
+    let preamble = guest_launch_preamble(ca_cert_pem, guest_workspace);
+    // A bare sandbox holds no credential, so its commands run as guest root; an agent
+    // sandbox's run as uid 1000 under a root exec-host they cannot kill or impersonate.
+    let script = if !agent {
+        format!(
+            "{exports}{preamble}; exec {}",
+            boot::exec_host_cmd(EXEC_PORT, None)
+        )
+    } else {
+        // claude refuses skip-permissions as root, so an agent sandbox's commands run as uid 1000.
+        let uid = AGENT_UID;
+        let home_q = shell_quote(GUEST_HOME);
+        let gw_q = shell_quote(guest_workspace);
+        format!(
+            "{exports}{preamble}; \
+             getent group {uid} >/dev/null || echo 'pillbox:x:{uid}:' >> /etc/group; \
+             getent passwd {uid} >/dev/null || \
+                 echo 'pillbox:x:{uid}:{uid}:pillbox:{GUEST_HOME}:/bin/sh' >> /etc/passwd; \
+             chown -R {uid}:{uid} {home_q} {gw_q} || \
+                 echo 'pillbox: warning: some sandbox files could not be handed to uid {uid}' >&2; \
+             exec {exec_host}",
+            exec_host = boot::exec_host_cmd(EXEC_PORT, Some(uid)),
+        )
+    };
+    ensure_env_fork_sealed(swap_pairs, guest_env, &script)?;
+    Ok(script)
 }
 
 /// The sandbox VM: the boot share, the workspace clone, and one guest-listening
@@ -302,7 +319,7 @@ fn wait_exec_ready(
 ) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
-        let last = match probe_exec(sock, guest_workspace) {
+        let last = match probe_exec(sock, guest_workspace, deadline) {
             Ok(0) => return Ok(()),
             Ok(code) => anyhow::anyhow!("readiness probe exited {code}"),
             Err(e) => e,
@@ -320,16 +337,54 @@ fn wait_exec_ready(
     }
 }
 
-fn probe_exec(sock: &Path, guest_workspace: &str) -> Result<i32> {
+fn probe_exec(sock: &Path, guest_workspace: &str, deadline: Instant) -> Result<i32> {
     let stream = UnixStream::connect(sock).context("dial the sandbox exec socket")?;
-    stream.set_read_timeout(Some(PROBE_IO_TIMEOUT)).ok();
-    stream.set_write_timeout(Some(PROBE_IO_TIMEOUT)).ok();
     exec_channel::run_exec(
-        stream,
+        DeadlineStream { stream, deadline },
         &["true".to_string()],
         Some(guest_workspace),
         |_, _| Ok(()),
     )
+}
+
+/// A probe's stream: every read and write fails once `deadline` passes, so a guest
+/// trickling frames can't hold readiness past its timeout.
+struct DeadlineStream {
+    stream: UnixStream,
+    deadline: Instant,
+}
+
+impl DeadlineStream {
+    /// Bound the next socket call by the time left (and by [`PROBE_IO_TIMEOUT`]).
+    fn arm(&self) -> std::io::Result<()> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "readiness probe deadline passed",
+            ));
+        }
+        let bound = Some(left.min(PROBE_IO_TIMEOUT));
+        self.stream.set_read_timeout(bound)?;
+        self.stream.set_write_timeout(bound)
+    }
+}
+
+impl std::io::Read for DeadlineStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.arm()?;
+        self.stream.read(buf)
+    }
+}
+
+impl std::io::Write for DeadlineStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.arm()?;
+        self.stream.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
 }
 
 /// A running libkrun sandbox, addressed by its record's handle.
@@ -403,36 +458,35 @@ mod tests {
         assert!(super::super::LibkrunBackend.capabilities().long_lived_exec);
     }
 
+    fn script(env: &[(String, String)], agent: bool, pairs: &[SwapPair]) -> Result<String> {
+        sealed_boot_script(env, "PEM", "/workspace/my app", agent, pairs)
+    }
+
     #[test]
-    fn bare_boot_script_runs_exec_host_as_root_on_the_exec_port() {
-        let s = boot_script(
-            "export A='1'\n",
-            "set -e; cd /workspace/app",
-            "/workspace/app",
-            false,
-        );
+    fn bare_boot_script_runs_exec_host_and_its_commands_as_root_on_the_exec_port() {
+        let env = vec![("A".to_string(), "1".to_string())];
+        let s = script(&env, false, &[]).unwrap();
+        assert!(s.starts_with("export A='1'\n"), "{s}");
         assert!(
             s.ends_with("exec pillbox exec-host --vsock-port 1026"),
             "{s}"
         );
-        assert!(!s.contains("runuser") && !s.contains("chown"), "{s}");
+        assert!(
+            !s.contains("runuser") && !s.contains("chown -R 1000"),
+            "{s}"
+        );
     }
 
     #[test]
-    fn agent_boot_script_hands_files_to_uid_1000_and_drops_before_exec_host() {
-        let s = boot_script(
-            "",
-            "set -e; cd '/workspace/my app'",
-            "/workspace/my app",
-            true,
-        );
+    fn agent_boot_script_hands_files_to_uid_1000_and_exec_host_stays_root_dropping_each_command() {
+        let s = script(&[], true, &[]).unwrap();
         let chown = s.find("chown -R 1000:1000 '/home/pillbox' '/workspace/my app'");
-        let drop = s.find(
-            "exec /usr/sbin/runuser -u \"$AGENT_USER\" --preserve-environment -- \
-             pillbox exec-host --vsock-port 1026",
-        );
-        assert!(chown.is_some() && drop.is_some(), "{s}");
-        assert!(chown < drop);
+        // exec-host is exec'd as root (no runuser); it drops each command to uid 1000.
+        let exec_host = s.find("exec pillbox exec-host --vsock-port 1026 --run-as-uid 1000");
+        assert!(chown.is_some() && exec_host.is_some(), "{s}");
+        assert!(chown < exec_host);
+        assert!(s.ends_with("exec pillbox exec-host --vsock-port 1026 --run-as-uid 1000"));
+        assert!(!s.contains("runuser"), "{s}");
         assert!(s.contains("getent passwd 1000"), "{s}");
         let parsed = std::process::Command::new("sh")
             .args(["-n", "-c", &s])
@@ -442,18 +496,26 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_boot_script_is_sealed_against_the_real_credential() {
+    fn building_a_sandbox_boot_script_that_leaks_a_swap_secret_fails() {
         let pair = SwapPair {
             stub: "sk-ant-oat01-STUB".into(),
             real: "sk-ant-oat01-REAL".into(),
             hosts: vec!["api.anthropic.com".into()],
         };
-        let env = vec![("TOKEN".to_string(), pair.stub.clone())];
-        let exports = boot::env_exports(&env).unwrap();
-        let ok = boot_script(&exports, "set -e", "/workspace/app", true);
-        assert!(ensure_env_fork_sealed(std::slice::from_ref(&pair), &env, &ok).is_ok());
-        let leaked = boot_script(&exports, "echo sk-ant-oat01-REAL", "/workspace/app", true);
-        assert!(ensure_env_fork_sealed(&[pair], &env, &leaked).is_err());
+        let pairs = std::slice::from_ref(&pair);
+        let stubbed = vec![("TOKEN".to_string(), pair.stub.clone())];
+        for agent in [false, true] {
+            assert!(script(&stubbed, agent, pairs).is_ok());
+            // A real in an exported env value…
+            let leaked = vec![("TOKEN".to_string(), pair.real.clone())];
+            let err = script(&leaked, agent, pairs).unwrap_err().to_string();
+            assert!(err.contains("env-fork violated"), "{err}");
+            // …or anywhere else in the rendered script (here, the preamble's CA text).
+            let err = sealed_boot_script(&stubbed, &pair.real, "/workspace/app", agent, pairs)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("env-fork violated"), "{err}");
+        }
     }
 
     #[test]
@@ -522,7 +584,7 @@ mod tests {
         std::thread::spawn(move || {
             for conn in listener.incoming().flatten() {
                 std::thread::spawn(move || {
-                    let _ = exec_channel::serve_exec(conn);
+                    let _ = exec_channel::serve_exec(conn, None);
                 });
             }
         });
@@ -553,6 +615,42 @@ mod tests {
         });
         wait_exec_ready(&sock, &cwd, Duration::from_secs(30), || Ok(None)).unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn exec_readiness_deadline_bounds_a_probe_that_trickles_output() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("exec.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        // A guest that answers every probe with an endless trickle of stdout frames.
+        std::thread::spawn(move || {
+            for mut conn in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let _ = exec_channel::ExecFrame::decode(&mut conn);
+                    loop {
+                        if exec_channel::ExecFrame::Stdout(b"x".to_vec())
+                            .encode(&mut conn)
+                            .is_err()
+                        {
+                            return;
+                        }
+                        let _ = conn.flush();
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                });
+            }
+        });
+        let started = Instant::now();
+        let err = wait_exec_ready(&sock, "/", Duration::from_millis(500), || Ok(None))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("timed out"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     fn handle_in(dir: &Path) -> LibkrunHandle {

@@ -28,7 +28,8 @@ hosts neither the agent run nor the OAuth login (both run in libkrun microVMs).
 |---|---|
 | Agent reads `~/.claude` or `~/.codex` on the host | Sandbox only mounts the resolved auth pillbox's `auth/<agent>/` dir; the agent never sees the host's real config directories. |
 | Agent reads host environment variables | Guest env is built from explicit pillbox inputs only. The host's `$ANTHROPIC_API_KEY` etc. do not leak in. |
-| Login flow contaminated by host state | The login runs in a fresh libkrun microVM on a private rootfs clone; only the agent's own pillbox auth dir is mounted (read-write, for the credential the login writes). |
+| Login flow contaminated by host state | The login runs in a fresh libkrun microVM on a private rootfs clone of the global pillbox's runner image (a project's `pillbox.toml` can't pick it); only the agent's own pillbox auth dir is mounted (read-write, for the credential the login writes). |
+| Sandbox agent forges `sandbox exec` results | In an agent sandbox `exec-host` runs as guest root and drops each command to uid 1000 with no supplementary groups; its vsock sockets are close-on-exec, so the agent can neither kill it, inherit a channel, nor take its port. |
 | Other host tools accidentally consuming pillbox state | Everything is namespaced under `~/.pillbox/` with restrictive perms. |
 | `pillbox secret show --reveal` accidentally piped to logs | Refused unless `--to-stdout` is also passed. |
 | Agent crosses the normal local sandbox boundary | The local agent runs in a hardware-isolated libkrun microVM, not a shared-kernel container. Guest egress terminates at the host-owned broker. |

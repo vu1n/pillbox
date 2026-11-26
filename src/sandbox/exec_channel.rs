@@ -27,6 +27,7 @@ use crate::attach::frame::{read_frame, write_frame};
 const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 
 /// Read size for the child's stdout/stderr pipes — one output frame at most.
+/// The host decodes every guest frame with this cap ([`run_exec`]).
 const CHUNK_BYTES: usize = 64 * 1024;
 
 // Frame tags. Stable; add new tags at the end.
@@ -73,7 +74,12 @@ impl ExecFrame {
     /// (including a partial header), oversized, unknown-tag or malformed frame is
     /// an `InvalidData` error.
     pub(crate) fn decode(r: &mut impl Read) -> io::Result<Option<ExecFrame>> {
-        match read_frame(r, MAX_FRAME_LEN)? {
+        Self::decode_capped(r, MAX_FRAME_LEN)
+    }
+
+    /// [`decode`](Self::decode) with a smaller payload cap.
+    fn decode_capped(r: &mut impl Read, cap: usize) -> io::Result<Option<ExecFrame>> {
+        match read_frame(r, cap)? {
             Some((tag, payload)) => Ok(Some(ExecFrame::from_wire(tag, payload)?)),
             None => Ok(None),
         }
@@ -142,7 +148,8 @@ pub(crate) fn run_exec<S: Read + Write>(
     .encode(&mut stream)
     .context("send exec request")?;
     loop {
-        match ExecFrame::decode(&mut stream).context("read exec channel")? {
+        // Every guest frame (output chunk, exit code, refusal) fits one CHUNK_BYTES read.
+        match ExecFrame::decode_capped(&mut stream, CHUNK_BYTES).context("read exec channel")? {
             Some(ExecFrame::Stdout(b)) => on_chunk(false, &b)?,
             Some(ExecFrame::Stderr(b)) => on_chunk(true, &b)?,
             Some(ExecFrame::Exit(code)) => return Ok(code),
@@ -153,7 +160,17 @@ pub(crate) fn run_exec<S: Read + Write>(
     }
 }
 
-/// Guest side: serve one command on `stream`.
+/// The uid:gid a sandbox command is dropped to, with no supplementary groups.
+/// `exec-host` itself stays root, so a command can neither kill it nor take its
+/// vsock port and forge another command's output or exit code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RunAs {
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+}
+
+/// Guest side: serve one command on `stream`, as `run_as` when given (else as
+/// `exec-host`'s own identity).
 ///
 /// Reads the `Request` and spawns its argv in a new process group (stdin empty,
 /// stdout/stderr piped). Until the command's own process exits, it relays both
@@ -168,7 +185,7 @@ pub(crate) fn run_exec<S: Read + Write>(
 /// command that can't be started gets a shell-style `Exit` (see [`spawn_failure`]).
 // Its caller, `exec-host`, is Linux-only (the libkrun guest).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) fn serve_exec(mut stream: UnixStream) -> Result<()> {
+pub(crate) fn serve_exec(mut stream: UnixStream, run_as: Option<RunAs>) -> Result<()> {
     use std::os::unix::process::CommandExt as _;
     use std::process::{Command, Stdio};
 
@@ -189,13 +206,18 @@ pub(crate) fn serve_exec(mut stream: UnixStream) -> Result<()> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
+    if let Some(RunAs { uid, gid }) = run_as {
+        // std drops from root as setgroups(0) (no supplementary groups), setgid, setuid,
+        // then chdir: the cwd is entered as the command's user, never as root.
+        cmd.uid(uid).gid(gid);
+    }
     if let Some(cwd) = &req.cwd {
         cmd.current_dir(cwd);
     }
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
-            let (code, reason) = spawn_failure(program, req.cwd.as_deref(), &e);
+            let (code, reason) = spawn_failure(program, req.cwd.as_deref(), run_as, &e);
             ExecFrame::Stderr(format!("pillbox exec: {reason}\n").into_bytes())
                 .encode(&mut stream)?;
             ExecFrame::Exit(code).encode(&mut stream)?;
@@ -448,16 +470,77 @@ fn host_gone(stream: &mut UnixStream) -> bool {
 /// The shell-style exit code and reason for a command that could not be started:
 /// 127 when the program isn't found, 126 when it can't be run (permission denied,
 /// not an executable, or an unusable `cwd`).
-fn spawn_failure(program: &str, cwd: Option<&str>, e: &io::Error) -> (i32, String) {
+fn spawn_failure(
+    program: &str,
+    cwd: Option<&str>,
+    run_as: Option<RunAs>,
+    e: &io::Error,
+) -> (i32, String) {
     // The child chdirs before exec, so a bad cwd fails the spawn with the same errno as
-    // a missing program; tell them apart by looking at the cwd.
-    if let Some(cwd) = cwd.filter(|cwd| !std::path::Path::new(cwd).is_dir()) {
-        return (126, format!("cwd `{cwd}` is not a usable directory: {e}"));
+    // a bad program; tell them apart by checking the cwd as the command's user.
+    if let Some(problem) = cwd.and_then(|cwd| cwd_problem(cwd, run_as)) {
+        return (126, problem);
     }
     match e.kind() {
         io::ErrorKind::NotFound => (127, format!("{program}: command not found")),
         _ => (126, format!("{program}: cannot execute: {e}")),
     }
+}
+
+/// Why the command's user can't enter `cwd`, if it can't: missing, not a
+/// directory, or (EACCES) a directory on its path it may not search.
+fn cwd_problem(cwd: &str, run_as: Option<RunAs>) -> Option<String> {
+    let path = std::path::Path::new(cwd);
+    match std::fs::metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Some(format!("cwd `{cwd}` does not exist"))
+        }
+        Err(e) => return Some(format!("cwd `{cwd}` is not usable: {e}")),
+        Ok(meta) if !meta.is_dir() => return Some(format!("cwd `{cwd}` is not a directory")),
+        Ok(_) => {}
+    }
+    let who = match run_as {
+        Some(RunAs { uid, gid }) => {
+            if searchable_by(path, uid, gid) {
+                return None;
+            }
+            format!("uid {uid}")
+        }
+        None => {
+            let c = std::ffi::CString::new(cwd).ok()?;
+            // SAFETY: access() reads a valid NUL-terminated path.
+            if unsafe { libc::access(c.as_ptr(), libc::X_OK) } == 0 {
+                return None;
+            }
+            // SAFETY: getuid() has no preconditions.
+            format!("uid {}", unsafe { libc::getuid() })
+        }
+    };
+    Some(format!(
+        "cwd `{cwd}` is not accessible to {who}: permission denied"
+    ))
+}
+
+/// Whether `uid`:`gid` (no supplementary groups) may search `dir` and every
+/// directory above it, by their mode bits. uid 0 always may.
+fn searchable_by(dir: &std::path::Path, uid: u32, gid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    if uid == 0 {
+        return true;
+    }
+    dir.ancestors().all(|d| {
+        let Ok(meta) = std::fs::metadata(d) else {
+            return false;
+        };
+        let bit = if meta.uid() == uid {
+            0o100
+        } else if meta.gid() == gid {
+            0o010
+        } else {
+            0o001
+        };
+        meta.mode() & bit != 0
+    })
 }
 
 /// A shell-style exit code: the code, or 128+signo when a signal killed it.
@@ -471,13 +554,15 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
         .unwrap_or(1)
 }
 
-/// `pillbox exec-host --vsock-port N`: listen on guest vsock `port` and serve each
-/// connection's command on its own thread. Blocks until the VM is torn down.
+/// `pillbox exec-host --vsock-port N [--run-as-uid U]`: listen on guest vsock
+/// `port` and serve each connection's command on its own thread, as uid:gid U:U
+/// when given. Blocks until the VM is torn down.
 #[cfg(target_os = "linux")]
-pub(crate) fn run_exec_host(port: u32) -> Result<()> {
-    crate::attach::host::vsock_serve(port, |conn| {
+pub(crate) fn run_exec_host(port: u32, run_as_uid: Option<u32>) -> Result<()> {
+    let run_as = run_as_uid.map(|uid| RunAs { uid, gid: uid });
+    crate::attach::host::vsock_serve(port, move |conn| {
         std::thread::spawn(move || {
-            if let Err(e) = serve_exec(conn) {
+            if let Err(e) = serve_exec(conn, run_as) {
                 eprintln!("pillbox exec-host: {e:#}");
             }
         });
@@ -550,8 +635,16 @@ mod tests {
     }
 
     fn exec_over_pair(argv: &[&str], cwd: Option<&str>) -> (Result<i32>, Vec<u8>, Vec<u8>) {
+        exec_over_pair_as(argv, cwd, None)
+    }
+
+    fn exec_over_pair_as(
+        argv: &[&str],
+        cwd: Option<&str>,
+        run_as: Option<RunAs>,
+    ) -> (Result<i32>, Vec<u8>, Vec<u8>) {
         let (host, guest) = UnixStream::pair().unwrap();
-        let server = std::thread::spawn(move || serve_exec(guest));
+        let server = std::thread::spawn(move || serve_exec(guest, run_as));
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
         let code = run_exec(host, &argv, cwd, |is_stderr, bytes| {
@@ -616,7 +709,7 @@ mod tests {
                 &["true"],
                 Some("/nonexistent/pillbox-cwd"),
                 126,
-                "not a usable directory",
+                "does not exist",
             ),
         ];
         for (argv, cwd, want, reason) in cases {
@@ -648,7 +741,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pidfile = dir.path().join("pid");
         let (mut host, guest) = UnixStream::pair().unwrap();
-        let server = std::thread::spawn(move || serve_exec(guest));
+        let server = std::thread::spawn(move || serve_exec(guest, None));
         let script = format!("echo $$ > '{}'; exec sleep 60", pidfile.display());
         ExecFrame::Request(ExecRequest {
             argv: vec!["sh".into(), "-c".into(), script],
@@ -701,5 +794,157 @@ mod tests {
     fn exec_channel_rejects_empty_argv() {
         let (host, _guest) = UnixStream::pair().unwrap();
         assert!(run_exec(host, &[], None, |_, _| Ok(())).is_err());
+    }
+
+    #[test]
+    fn run_exec_refuses_a_guest_output_frame_over_one_chunk() {
+        for (len, ok) in [(CHUNK_BYTES, true), (CHUNK_BYTES + 1, false)] {
+            let (host, mut guest) = UnixStream::pair().unwrap();
+            let guest = std::thread::spawn(move || {
+                let _ = ExecFrame::decode(&mut guest);
+                // Encoded with the guest's own (larger) cap, as a hostile guest could.
+                let _ = ExecFrame::Stdout(vec![b'x'; len]).encode(&mut guest);
+                let _ = ExecFrame::Exit(0).encode(&mut guest);
+            });
+            let mut seen = 0;
+            let result = run_exec(host, &["true".into()], None, |_, b| {
+                seen += b.len();
+                Ok(())
+            });
+            guest.join().unwrap();
+            if ok {
+                assert_eq!(result.unwrap(), 0);
+                assert_eq!(seen, len);
+            } else {
+                let err = format!("{:#}", result.unwrap_err());
+                assert!(err.contains("exceeds cap"), "{err}");
+                assert_eq!(seen, 0);
+            }
+        }
+    }
+
+    /// A frame sink that, like a background writer racing the post-exit relay,
+    /// pushes more bytes into the pipe each time a frame is written.
+    struct RacingSink {
+        frames: Vec<u8>,
+        writer: std::fs::File,
+        added: usize,
+    }
+    impl Write for RacingSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.added < 40 * 1024 {
+                self.writer.write_all(&[b'y'; 4096])?;
+                self.added += 4096;
+            }
+            self.frames.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_post_exit_relay_sends_only_what_was_buffered_when_it_started() {
+        use std::os::fd::FromRawFd as _;
+        let mut fds = [0; 2];
+        // SAFETY: pipe() fills two fds this test then owns.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (read, mut write) = unsafe {
+            (
+                std::os::fd::OwnedFd::from_raw_fd(fds[0]),
+                std::fs::File::from_raw_fd(fds[1]),
+            )
+        };
+        const BUFFERED: usize = 1000;
+        write.write_all(&[b'x'; BUFFERED]).unwrap();
+        let mut pipe = OutPipe::new(read, false).unwrap();
+        let mut sink = RacingSink {
+            frames: Vec::new(),
+            writer: write,
+            added: 0,
+        };
+        pipe.relay_buffered(&mut sink).unwrap();
+        assert!(sink.added > 0, "the racing writer never ran");
+        let mut relayed = Vec::new();
+        let mut frames = sink.frames.as_slice();
+        while let Some(frame) = ExecFrame::decode(&mut frames).unwrap() {
+            match frame {
+                ExecFrame::Stdout(b) => relayed.extend(b),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(relayed, vec![b'x'; BUFFERED]);
+    }
+
+    #[test]
+    fn a_cwd_problem_is_named_as_one() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file");
+        std::fs::write(&file, "x").unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let inner = locked.join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let stranger = Some(RunAs {
+            uid: 54_321,
+            gid: 54_321,
+        });
+        let problem = |p: &std::path::Path, who| cwd_problem(p.to_str().unwrap(), who);
+        assert!(problem(&dir.path().join("missing"), None)
+            .unwrap()
+            .contains("does not exist"));
+        assert!(problem(&file, None).unwrap().contains("is not a directory"));
+        // A searchable path is fine; a 0700 directory, or one under it, is not for another uid.
+        assert_eq!(problem(dir.path(), None), None);
+        for p in [&locked, &inner] {
+            let msg = problem(p, stranger).unwrap();
+            assert!(
+                msg.contains("is not accessible to uid 54321"),
+                "{p:?}: {msg}"
+            );
+        }
+        // Root may search anything.
+        assert_eq!(problem(&inner, Some(RunAs { uid: 0, gid: 0 })), None);
+        // The spawn failure for that cwd names it, not the program.
+        let denied = io::Error::from_raw_os_error(libc::EACCES);
+        let (code, reason) = spawn_failure("true", inner.to_str(), stranger, &denied);
+        assert_eq!(code, 126);
+        assert!(
+            reason.contains("cwd") && !reason.contains("cannot execute"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn a_run_as_command_runs_as_that_uid_with_no_supplementary_groups() {
+        // SAFETY: geteuid() has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!(
+                "skipping: dropping to another uid needs root (exec-host is root in the guest)"
+            );
+            return;
+        }
+        let run_as = Some(RunAs {
+            uid: 54_321,
+            gid: 54_322,
+        });
+        let (code, out, err) =
+            exec_over_pair_as(&["sh", "-c", "id -u; id -g; id -G"], Some("/"), run_as);
+        assert_eq!(code.unwrap(), 0, "{}", String::from_utf8_lossy(&err));
+        assert_eq!(String::from_utf8(out).unwrap(), "54321\n54322\n54322\n");
+        // A cwd the dropped user can't enter is reported as a cwd problem.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let (code, _, err) = exec_over_pair_as(&["true"], dir.path().to_str(), run_as);
+        assert_eq!(code.unwrap(), 126);
+        let err = String::from_utf8(err).unwrap();
+        assert!(err.contains("is not accessible to uid 54321"), "{err}");
     }
 }

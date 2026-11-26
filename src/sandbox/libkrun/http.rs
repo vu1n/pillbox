@@ -112,6 +112,36 @@ fn content_length(head: &[u8]) -> Result<Option<usize>> {
     Ok(None)
 }
 
+/// Wait until `stream` is ready for `events` (`POLLIN`/`POLLOUT`) or `deadline` passes;
+/// `false` means the deadline passed. Hang-up and error count as ready, so the next
+/// read or write reports them.
+fn ready_before(stream: &UnixStream, events: libc::c_short, deadline: Instant) -> Result<bool> {
+    use std::os::fd::AsRawFd as _;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        let ms = remaining.as_millis().clamp(1, libc::c_int::MAX as u128) as libc::c_int;
+        let mut fd = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd for an fd `stream` keeps open for the call.
+        match unsafe { libc::poll(&mut fd, 1, ms) } {
+            0 => continue,
+            n if n > 0 => return Ok(true),
+            _ => {
+                let e = std::io::Error::last_os_error();
+                if e.kind() != ErrorKind::Interrupted {
+                    return Err(e).context("guest server reply: poll");
+                }
+            }
+        }
+    }
+}
+
 /// Send `request` on `stream` and read the reply. The guest server on the other end is
 /// untrusted: the reply is bounded by `MAX_RESPONSE_BYTES` and the whole exchange by
 /// `timeout`, so a server that streams forever or never closes errors instead of
@@ -119,22 +149,18 @@ fn content_length(head: &[u8]) -> Result<Option<usize>> {
 fn exchange(mut stream: UnixStream, request: &[u8], timeout: Duration) -> Result<(u16, String)> {
     let deadline = Instant::now() + timeout;
     let timed_out = || anyhow::anyhow!("guest server reply: no complete reply within {timeout:?}");
-    // Writes share the read deadline: each write gets only the time left, so a guest that
-    // never reads cannot hold the request past `timeout`.
+    // The deadline is kept by poll on a non-blocking socket, not by socket timeouts: macOS
+    // rejects setting one after the peer closes, and restarts it whenever a write progresses.
+    stream.set_nonblocking(true)?;
     let mut sent = 0;
     while sent < request.len() {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+        if !ready_before(&stream, libc::POLLOUT, deadline)? {
             return Err(timed_out());
         }
-        stream.set_write_timeout(Some(remaining))?;
         match stream.write(&request[sent..]) {
             Ok(0) => bail!("guest server reply: connection closed while sending the request"),
             Ok(n) => sent += n,
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                return Err(timed_out())
-            }
+            Err(e) if matches!(e.kind(), ErrorKind::Interrupted | ErrorKind::WouldBlock) => {}
             Err(e) => return Err(e.into()),
         }
     }
@@ -159,16 +185,13 @@ fn exchange(mut stream: UnixStream, request: &[u8], timeout: Duration) -> Result
                 break;
             }
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+        if !ready_before(&stream, libc::POLLIN, deadline)? {
             return Err(timed_out());
         }
-        stream.set_read_timeout(Some(remaining))?;
         let n = match stream.read(&mut chunk) {
             Ok(n) => n,
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                return Err(timed_out())
+            Err(e) if matches!(e.kind(), ErrorKind::Interrupted | ErrorKind::WouldBlock) => {
+                continue
             }
             Err(e) => return Err(e.into()),
         };

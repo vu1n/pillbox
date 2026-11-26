@@ -163,6 +163,37 @@ test("OpenCode turn rejects an oversized session response before JSON parsing", 
   assert.match(evidence.errors[0] ?? "", /response exceeded 262144 bytes/);
 });
 
+test("OpenCode turn replaces an already-reachable server before prompting under deny_all", async () => {
+  const transport = fakeTransport([
+    sse(
+      event("message.part.delta", {
+        messageID: "msg:1",
+        partID: "part:1",
+        field: "text",
+        delta: "done",
+      }),
+      event("session.idle", {}),
+    ),
+  ]);
+  const evidence = captureEvidence();
+
+  await driveOpencodeTurn({
+    sandbox: transport.sandbox,
+    text: "hello",
+    model: "zai-coding-plan/glm-4.7",
+    toolPolicy: "deny_all",
+    config: { env: {} },
+    sink: evidence.sink,
+  });
+
+  // The fake's first /doc probe succeeds, so a server predating this request is already up.
+  assert.deepEqual(transport.lifecycle, ["kill", "start", "prompt"]);
+  const tools = transport.promptBodies[0].tools ?? {};
+  assert.ok(Object.keys(tools).length > 0);
+  assert.ok(Object.values(tools).every((allowed) => allowed === false));
+  assert.deepEqual(evidence.errors, []);
+});
+
 test("OpenCode turn rejects an oversized SSE frame before accumulation", async () => {
   const transport = fakeTransport([`data: ${"x".repeat(256 * 1024 + 1)}\n\n`]);
   const evidence = captureEvidence();
@@ -236,8 +267,11 @@ function fakeTransport(
   readonly promptBodies: Array<{
     readonly parts: ReadonlyArray<{ readonly text: string }>;
     readonly variant?: string;
+    readonly tools?: Record<string, boolean>;
   }>;
+  readonly lifecycle: string[];
 } {
+  const lifecycle: string[] = [];
   let streamIndex = 0;
   let sessionIndex = 0;
   const promptPaths: string[] = [];
@@ -267,11 +301,13 @@ function fakeTransport(
         return Response.json({ id: `session:${sessionIndex}` });
       }
       if (request.method === "POST" && path.endsWith("/prompt_async")) {
+        lifecycle.push("prompt");
         promptPaths.push(path);
         promptBodies.push(
           (await request.json()) as {
             readonly parts: ReadonlyArray<{ readonly text: string }>;
-    readonly variant?: string;
+            readonly variant?: string;
+            readonly tools?: Record<string, boolean>;
           },
         );
         return new Response(null, { status: 204 });
@@ -279,9 +315,11 @@ function fakeTransport(
       return new Response("not found", { status: 404 });
     },
     killAllProcesses: async () => {
+      lifecycle.push("kill");
       serving = false;
     },
     startProcess: async () => {
+      lifecycle.push("start");
       serving = true;
     },
   };
@@ -289,6 +327,7 @@ function fakeTransport(
     sandbox: sandbox as never,
     promptPaths,
     promptBodies,
+    lifecycle,
   };
 }
 

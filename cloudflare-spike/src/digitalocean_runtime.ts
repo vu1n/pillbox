@@ -44,6 +44,8 @@ export class DigitalOceanExecutionRuntime implements ExecutionRuntime {
     const unsupported = this.preflight(request);
     if (unsupported) return { served_model: null, error: unsupported, evidence: [] };
     const { allocations, settings } = this.options;
+    // Resolve the request's tool policy before any allocation or droplet spend so an unenforceable policy fails closed.
+    const tools = opencodePromptTools(request.tool_policy);
     const name = await allocationName(settings.namespace!, request.invocation_id);
     if (!(await allocations.reserve(request.invocation_id, name, settings.configId!))) {
       throw new Error(
@@ -53,7 +55,7 @@ export class DigitalOceanExecutionRuntime implements ExecutionRuntime {
     let turn: RuntimeTurnResult | undefined;
     let failure: unknown;
     try {
-      turn = await this.runAllocated(request, name);
+      turn = await this.runAllocated(request, name, tools);
     } catch (cause) {
       failure = cause;
     }
@@ -86,10 +88,9 @@ export class DigitalOceanExecutionRuntime implements ExecutionRuntime {
   private async runAllocated(
     request: ExecuteInvocationV2Request,
     name: string,
+    tools: Record<string, false>,
   ): Promise<RuntimeTurnResult> {
     const { api, allocations, settings } = this.options;
-    // Resolve the request's tool policy before any droplet spend so an unenforceable policy fails closed.
-    const tools = opencodePromptTools(request.tool_policy);
     const created = await api.create(name, settings.configId!);
     if (!(await allocations.attach(request.invocation_id, created.session_id))) {
       throw new Error("DigitalOcean allocation was cancelled during creation");

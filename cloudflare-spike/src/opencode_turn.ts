@@ -150,7 +150,6 @@ async function ensureOpencodeReady(input: OpencodeTurnInput): Promise<boolean> {
       return false;
     }
   }
-  if (probe.ok) return true;
 
   const env: Record<string, string> = { ...input.config.env };
   if (input.config.config !== undefined) {

@@ -185,6 +185,7 @@ pub(crate) trait LiveSession {
     fn ingest(&self, resolved: &Pillbox) -> Result<usize>;
 
     /// Tear down the backend (kill sandbox/VM) and release its artifacts.
+    // Rule: kill never prints to stdout (in-process callers keep `--json` pure); callers report.
     fn kill(&self, resolved: &Pillbox) -> Result<()>;
 }
 

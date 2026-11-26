@@ -411,6 +411,7 @@ pub(super) fn session_guard(
         return Ok(());
     };
     sandbox::live_session(&s)?.kill(resolved)?;
+    super::print_removed(&s);
     println!("pillbox: ✓ guard killed session `{sid}` ({reason})");
     Ok(())
 }

@@ -447,10 +447,6 @@ impl LiveSession for ManagedLiveSession {
             Some(&self.session),
         );
         session::delete(resolved, &self.session.id)?;
-        println!(
-            "pillbox: ✓ managed session `{}` record removed.",
-            self.session.id
-        );
         Ok(())
     }
 }

@@ -2334,7 +2334,6 @@ pub(crate) fn kill_session(resolved: &Pillbox, session: &crate::session::Session
     // host-wide `__krun-vmm` sweep (`~/.pillbox/krun/` is shared across pillboxes,
     // so a scan can't tell a dead local orphan from another pillbox's *live* VM;
     // the spec path is the attribution that makes the reap safe).
-    println!("pillbox: ✓ session `{}` removed.", session.id);
     Ok(())
 }
 

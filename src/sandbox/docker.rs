@@ -517,7 +517,6 @@ pub(crate) fn kill_session(resolved: &Pillbox, session: &Session) -> Result<()> 
         Some(session),
     );
     session::delete(resolved, &session.id)?;
-    println!("pillbox: ✓ session `{}` removed.", session.id);
     Ok(())
 }
 

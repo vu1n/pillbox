@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Live e2e smoke for `pillbox dispatch` (GHOST-004): fork k workers from a
 # bookmark → drive each (send the segment prompt) → score → select → pull. The
-# first real exercise of the dispatch CliDriver on booted VMs — unit tests cover
+# first real exercise of the dispatch SessionDriver (in-process) on booted VMs — unit tests cover
 # the selection/retry POLICY, this covers the fork/drive/score/pull WIRING and
 # the agent turn-semantics they can't reach.
 #

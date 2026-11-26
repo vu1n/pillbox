@@ -786,6 +786,15 @@ fn session_detach(resolved: &Pillbox, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// The `session rm` success banner; managed sessions only have a local record to drop.
+pub(crate) fn print_removed(s: &session::Session) {
+    if s.placement == session::Placement::Managed {
+        println!("pillbox: ✓ managed session `{}` record removed.", s.id);
+    } else {
+        println!("pillbox: ✓ session `{}` removed.", s.id);
+    }
+}
+
 fn session_rm(resolved: &Pillbox, id: &str) -> Result<()> {
     let s = session::resolve(resolved, id)?;
     // A backend this binary can construct → tear down its sandbox via the plane.
@@ -793,7 +802,11 @@ fn session_rm(resolved: &Pillbox, id: &str) -> Result<()> {
     // on a build without the feature) can't have its sandbox reached, but the
     // orphaned record must still be removable — drop it with a warning.
     match sandbox::live_session(&s) {
-        Ok(live) => live.kill(resolved),
+        Ok(live) => {
+            live.kill(resolved)?;
+            print_removed(&s);
+            Ok(())
+        }
         Err(_) => {
             eprintln!(
                 "pillbox: warning: session `{}` has an unsupported backend `{}` \

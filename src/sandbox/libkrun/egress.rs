@@ -169,7 +169,11 @@ pub(super) fn deny_sni_line(sni: &str, why: &str) -> String {
 /// exits (the sibling `krun_start_enter` thread tears it down). `allowlist` is the
 /// DNS fence: only these hosts resolve; everything else is NXDOMAIN'd. When
 /// `ca_dir` is set, a TLS MITM ([`Vault`]) terminates the allowlisted hosts'
-/// connections at the gateway; otherwise the stack is DNS-fence only.
+/// connections at the gateway; otherwise the stack is DNS-fence only. `login`
+/// opens the providers' OAuth token endpoints through the MITM (see
+/// [`super::mitm::drive_listeners`]); only the `auth login` VM sets it.
+// The egress inputs arrive field-by-field from the VmSpec; a struct would only rename them.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn run(
     fd: c_int,
     allowlist: Vec<String>,
@@ -178,6 +182,7 @@ pub(super) fn run(
     diag_path: Option<String>,
     local_forward_port: Option<u16>,
     refresh: Option<super::jit_refresh::RefreshCtx>,
+    login: bool,
 ) {
     let diag = Diag::open(diag_path);
     // Broker JIT refresh: when armed, rotate the real OAuth token near its expiry and
@@ -242,9 +247,10 @@ pub(super) fn run(
         super::local_forward::replenish(&mut forwarders, &mut sockets, port);
     }
     diag.log(&format!(
-        "krun-egress: smoltcp up (gw 10.0.2.2, dns :{DNS_PORT}, mitm :{}, local-fwd :{}); fence allowlist={allowlist:?}",
+        "krun-egress: smoltcp up (gw 10.0.2.2, dns :{DNS_PORT}, mitm :{}, local-fwd :{}, token-endpoints :{}); fence allowlist={allowlist:?}",
         if vault.is_some() { "443" } else { "off" },
         local_forward_port.map_or_else(|| "off".to_string(), |p| p.to_string()),
+        if login { "open (auth login)" } else { "rejected" },
     ));
 
     loop {
@@ -270,6 +276,7 @@ pub(super) fn run(
                 &pins,
                 &swap_pairs,
                 &diag,
+                login,
             );
             super::mitm::replenish_listeners(&mut listeners, &mut sockets);
         }

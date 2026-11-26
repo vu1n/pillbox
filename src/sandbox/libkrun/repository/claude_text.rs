@@ -80,11 +80,11 @@ fn spec(
             "-S".into(),
             format!("{GUEST_RUNTIME}/bridge.py"),
         ],
-        vsock: Some(VsockAttach {
+        vsock: vec![VsockAttach {
             port: RPC_PORT,
             host_sock: rpc.to_string_lossy().into_owned(),
             listen: false,
-        }),
+        }],
         egress: Some(EgressSpec {
             allowlist: vec![PROVIDER_HOST.into()],
             log_path: None,
@@ -95,6 +95,7 @@ fn spec(
                 auth_id: "claude".into(),
                 access_stub: input.credentials.stub.clone(),
             }),
+            login: false,
         }),
         ownership: Some(OwnershipSpec::bounded(owner, remaining)),
     }

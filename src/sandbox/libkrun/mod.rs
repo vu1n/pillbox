@@ -46,11 +46,13 @@ mod host;
 mod http;
 mod jit_refresh;
 mod local_forward;
+pub(crate) mod login;
 mod metadata;
 mod mitm;
 pub(crate) mod repository;
 mod rootfs;
 mod rootfs_backing;
+pub(crate) mod sandbox_vm;
 mod session;
 pub(crate) mod text_harness;
 mod vault;
@@ -132,9 +134,11 @@ struct VmSpec {
     shares: Vec<Share>,
     /// Guest entrypoint argv (`exec[0]` is the path).
     exec: Vec<String>,
-    /// Attach channel: the guest pty-host listens on this vsock port, the parent
-    /// connects via the host unix socket (`krun_add_vsock_port2`, listen=true).
-    vsock: Option<VsockAttach>,
+    /// vsock channels, each a guest port bridged to a host unix socket (attach,
+    /// HTTP forward, exec, OAuth callback relay…). Every entry is registered with
+    /// libkrun, and a self-destructing [`CommitGuard`] scrubs every `host_sock`.
+    #[serde(default)]
+    vsock: Vec<VsockAttach>,
     /// Egress: when set, the child attaches a virtio-net device and runs the
     /// userspace stack (DNS fence over `allowlist`). Policy only — non-secret.
     egress: Option<EgressSpec>,
@@ -171,6 +175,11 @@ struct EgressSpec {
     /// is read host-side by the child. `None` = no JIT (non-vault / non-broker agent).
     #[serde(default)]
     refresh: Option<RefreshSpec>,
+    /// `pillbox auth login` only: let the guest reach the providers' OAuth token
+    /// endpoints, which the MITM otherwise rejects locally (a login must mint the
+    /// credential there). Defaults false; only the login launch sets it.
+    #[serde(default)]
+    login: bool,
 }
 
 /// Serde form of the broker-JIT context handed to the VMM child in the spec file
@@ -305,10 +314,11 @@ pub(crate) fn vmm_child_main() -> ! {
         .iter()
         .map(|s| (cstr(&s.tag), cstr(&s.host_path)))
         .collect();
-    let vsock = spec
+    let vsock: Vec<(u32, CString, bool)> = spec
         .vsock
-        .as_ref()
-        .map(|v| (v.port, cstr(&v.host_sock), v.listen));
+        .iter()
+        .map(|v| (v.port, cstr(&v.host_sock), v.listen))
+        .collect();
     // Egress: a passt socketpair — one end to libkrun's virtio-net, the other to
     // our userspace stack (which the child runs in a thread beside the VM).
     struct NetAttach {
@@ -319,6 +329,7 @@ pub(crate) fn vmm_child_main() -> ! {
         log_path: Option<String>,
         local_forward_port: Option<u16>,
         refresh: Option<RefreshSpec>,
+        login: bool,
     }
     let net: Option<NetAttach> = spec.egress.as_ref().map(|e| {
         let mut fds = [0 as c_int; 2];
@@ -337,6 +348,7 @@ pub(crate) fn vmm_child_main() -> ! {
             log_path: e.log_path.clone(),
             local_forward_port: e.local_forward_port,
             refresh: e.refresh.clone(),
+            login: e.login,
         }
     });
     // Read the stub→real credential pairs the parent pipes on stdin (the env-fork
@@ -370,7 +382,7 @@ pub(crate) fn vmm_child_main() -> ! {
         for (tag, host) in &shares {
             rc = rc.min(ffi::krun_add_virtiofs(ctx, tag.as_ptr(), host.as_ptr()));
         }
-        if let Some((port, host_sock, listen)) = &vsock {
+        for (port, host_sock, listen) in &vsock {
             // Foreground (listen=false): the guest pty-host dials `port`, libkrun
             // bridges to the parent's pre-bound listener at `host_sock` — no race
             // (the parent's accept waits for us). Detach (listen=true): the guest
@@ -419,6 +431,7 @@ pub(crate) fn vmm_child_main() -> ! {
                         auth_id: r.auth_id,
                         access_stub: r.access_stub.into_bytes(),
                     }),
+                    n.login,
                 )
             });
         }
@@ -474,7 +487,7 @@ struct CommitGuard {
     /// recycled/hung owner pid). The owner-death path handles the common case promptly.
     deadline: std::time::Duration,
     /// VM artifacts to best-effort remove on self-destruct (this spec file, the CoW
-    /// share clones, the attach socket) — the disk side of the leak. Mirrors what
+    /// share clones, every vsock host socket) — the disk side of the leak. Mirrors what
     /// `kill_session` scrubs for a recorded session.
     scrub: Vec<std::path::PathBuf>,
 }
@@ -504,9 +517,11 @@ impl CommitGuard {
                 .iter()
                 .map(|s| std::path::PathBuf::from(&s.host_path)),
         );
-        if let Some(v) = &spec.vsock {
-            scrub.push(std::path::PathBuf::from(&v.host_sock));
-        }
+        scrub.extend(
+            spec.vsock
+                .iter()
+                .map(|v| std::path::PathBuf::from(&v.host_sock)),
+        );
         Some(CommitGuard {
             owner_pid,
             record_path: std::path::PathBuf::from(record_path),
@@ -1712,6 +1727,42 @@ mod tests {
         // Backstop: owner pid still "alive" (recycled or hung) but the deadline passed
         // with no record → abandoned anyway, so an uncommitted VM can't wait forever.
         assert_eq!(commit_state(false, true, true), CommitState::Abandoned);
+    }
+
+    #[test]
+    fn egress_login_defaults_false_and_vsock_defaults_empty() {
+        // A spec without the keys (every non-login launch's serde shape) must never
+        // open the token endpoints or invent a vsock channel.
+        let egress: super::EgressSpec =
+            serde_json::from_str(r#"{"allowlist":[],"log_path":null,"ca_dir":null}"#).unwrap();
+        assert!(!egress.login);
+        let spec: super::VmSpec = serde_json::from_str(
+            r#"{"rootfs":"/r","vcpus":1,"ram_mib":256,"shares":[],"exec":["/bin/true"],"egress":null}"#,
+        )
+        .unwrap();
+        assert!(spec.vsock.is_empty());
+    }
+
+    #[test]
+    fn commit_guard_scrubs_every_vsock_host_socket() {
+        let spec: super::VmSpec = serde_json::from_str(
+            r#"{"rootfs":"/r","vcpus":1,"ram_mib":256,"shares":[],"exec":["/bin/true"],"egress":null,
+                "vsock":[{"port":1024,"host_sock":"/tmp/a.sock","listen":true},
+                         {"port":1026,"host_sock":"/tmp/b.sock"}]}"#,
+        )
+        .unwrap();
+        // Only this test sets the PILLBOX_COMMIT_* vars; from_env clears them again.
+        std::env::set_var("PILLBOX_COMMIT_OWNER_PID", "1");
+        std::env::set_var("PILLBOX_COMMIT_RECORD", "/tmp/record.toml");
+        std::env::set_var("PILLBOX_COMMIT_DEADLINE", "5");
+        let guard = super::CommitGuard::from_env(&spec, "/tmp/spec.json").unwrap();
+        for p in ["/tmp/spec.json", "/tmp/a.sock", "/tmp/b.sock"] {
+            assert!(
+                guard.scrub.contains(&std::path::PathBuf::from(p)),
+                "{p} not scrubbed"
+            );
+        }
+        assert!(std::env::var_os("PILLBOX_COMMIT_RECORD").is_none());
     }
 
     #[test]

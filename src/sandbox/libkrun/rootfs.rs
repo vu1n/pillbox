@@ -417,7 +417,7 @@ mod tests {
                     "-c".into(),
                     format!("mkdir -p /probe; mount -t virtiofs probe /probe && {script}"),
                 ],
-                vsock: None,
+                vsock: Vec::new(),
                 egress: None,
                 ownership: None,
             };

@@ -15,6 +15,7 @@
 pub(crate) mod appserver;
 pub(crate) mod appserver_client;
 pub(crate) mod docker;
+pub(crate) mod exec_channel;
 pub(crate) mod http;
 #[cfg(feature = "libkrun")]
 pub(crate) mod libkrun;
@@ -110,6 +111,117 @@ pub(crate) trait SandboxBackend {
     /// active, rather than inferring it from a capability bit (which silently
     /// breaks the moment two backends share that capability).
     fn id(&self) -> &'static str;
+
+    /// Boot a long-lived exec target (`sandbox spawn`) and return its record,
+    /// already written to the registry. The caller then addresses it through
+    /// [`sandbox_target`]. Only a backend declaring `long_lived_exec` overrides
+    /// this; every other backend refuses with the plane's unsupported error.
+    // The sandbox verbs (commands/sandbox.rs) are its caller.
+    #[allow(dead_code)]
+    fn spawn_sandbox(
+        &self,
+        _resolved: &Pillbox,
+        _req: &SandboxSpawn,
+    ) -> Result<crate::sandboxes::Sandbox> {
+        Err(self.capabilities().unsupported("sandbox spawn"))
+    }
+}
+
+/// What `sandbox spawn` asks a backend for: an optional agent harness to
+/// provision (its credentials env-forked, the guest user non-root), the host
+/// workspace to clone into the sandbox, and an optional `sandbox list` label.
+// The sandbox verbs (commands/sandbox.rs) build it.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct SandboxSpawn {
+    pub(crate) agent: Option<String>,
+    pub(crate) workspace: PathBuf,
+    pub(crate) label: Option<String>,
+}
+
+/// One live sandbox, addressed by its registry record (see [`sandbox_target`]) —
+/// what `sandbox exec`/`agent`/`destroy` drive without branching on the backend.
+// The sandbox verbs (commands/sandbox.rs) are its callers.
+#[allow(dead_code)]
+pub(crate) trait SandboxTarget {
+    /// Run `argv` to completion in the sandbox's workspace, handing each output
+    /// chunk to `on_chunk(is_stderr, bytes)` as it arrives (stdin is empty).
+    /// Returns the command's exit code (128+signo when a signal killed it).
+    fn exec(
+        &self,
+        argv: &[String],
+        on_chunk: &mut dyn FnMut(bool, &[u8]) -> Result<()>,
+    ) -> Result<i32>;
+
+    /// Stop the sandbox, release its artifacts, and delete its record.
+    fn destroy(&self, resolved: &Pillbox) -> Result<()>;
+}
+
+/// Build the [`SandboxTarget`] for a sandbox record — the one place that branches
+/// on `record.backend`. A Docker record can only be dropped: Docker is deprecated,
+/// so exec is refused and destroy removes the record but leaves the container.
+// The sandbox verbs (commands/sandbox.rs) are its caller.
+#[allow(dead_code)]
+pub(crate) fn sandbox_target(record: &crate::sandboxes::Sandbox) -> Result<Box<dyn SandboxTarget>> {
+    match record.backend.as_str() {
+        crate::sandboxes::BACKEND_DOCKER => Ok(Box::new(DockerSandboxRecord(record.clone()))),
+        #[cfg(feature = "libkrun")]
+        crate::sandboxes::BACKEND_LIBKRUN => libkrun::sandbox_vm::target(record),
+        // Usage (exit 2), like `live_session` for a libkrun record on this build.
+        #[cfg(not(feature = "libkrun"))]
+        crate::sandboxes::BACKEND_LIBKRUN => Err(PillboxError::usage(
+            "sandbox",
+            format!(
+                "sandbox `{}` is libkrun-backed, but this pillbox was built without libkrun support",
+                record.id
+            ),
+        )
+        .into()),
+        other => Err(PillboxError::config(
+            "sandbox",
+            format!("unknown sandbox backend `{other}` for sandbox `{}`", record.id),
+        )
+        .into()),
+    }
+}
+
+/// A sandbox record left by the deprecated Docker backend. Nothing runs it any
+/// more: exec is refused, destroy only drops the record and names the container
+/// the user must remove themselves.
+struct DockerSandboxRecord(crate::sandboxes::Sandbox);
+
+impl SandboxTarget for DockerSandboxRecord {
+    fn exec(
+        &self,
+        _argv: &[String],
+        _on_chunk: &mut dyn FnMut(bool, &[u8]) -> Result<()>,
+    ) -> Result<i32> {
+        Err(PillboxError::usage(
+            "sandbox exec",
+            format!(
+                "sandbox `{}` is docker-backed; docker is deprecated, so it can't be exec'd \
+                 (destroy only drops the record)",
+                self.0.id
+            ),
+        )
+        .with_next(format!("pillbox sandbox destroy {}", self.0.id))
+        .into())
+    }
+
+    fn destroy(&self, resolved: &Pillbox) -> Result<()> {
+        // Docker is deprecated: drop the record, never drive the daemon.
+        crate::sandboxes::delete(resolved, &self.0.id)?;
+        Err(PillboxError::runtime(
+            "sandbox destroy",
+            format!(
+                "dropped the record of docker sandbox `{}`; docker is deprecated, so its \
+                 container `{}` was left running",
+                self.0.id, self.0.backend_ref
+            ),
+        )
+        .with_next(format!("docker rm -f {}", self.0.backend_ref))
+        .into())
+    }
 }
 
 /// The live session — **the plane**. A running (foreground or detached) agent
@@ -257,14 +369,9 @@ mod tests {
     /// reads/writes `PILLBOX_BACKEND` in this process.
     static BACKEND_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// `select_backend` reports a stable id for the chosen backend, so the test
-    /// can assert which one was picked without naming a concrete type.
+    /// The stable `id()` of the backend `select_backend` picks.
     fn selected_backend_id() -> &'static str {
-        if select_backend().capabilities().long_lived_exec {
-            BACKEND_DOCKER // docker is the long-lived-exec family
-        } else {
-            "libkrun"
-        }
+        select_backend().id()
     }
 
     #[test]
@@ -316,6 +423,67 @@ mod tests {
         // with no host PTY — the honest profile the plane gates verbs on.
         assert!(live.caps().server_mode);
         assert!(!live.caps().pty_drive);
+    }
+
+    fn sandbox_record(backend: &str) -> crate::sandboxes::Sandbox {
+        crate::sandboxes::Sandbox {
+            id: "abcdef012345".into(),
+            backend: backend.into(),
+            backend_ref: "container-abc".into(),
+            image: "pillbox:latest".into(),
+            agent: None,
+            workspace: "/work/app".into(),
+            label: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            status: "ready".into(),
+        }
+    }
+
+    #[test]
+    fn sandbox_target_refuses_docker_exec_and_unknown_backends() {
+        let docker = sandbox_target(&sandbox_record(crate::sandboxes::BACKEND_DOCKER))
+            .expect("a docker record still resolves, so it can be destroyed");
+        let err = docker
+            .exec(&["true".into()], &mut |_, _| Ok(()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("deprecated"), "got: {err}");
+
+        let err = sandbox_target(&sandbox_record("e2b"))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("unknown sandbox backend `e2b`"), "got: {err}");
+    }
+
+    #[test]
+    fn docker_sandbox_destroy_drops_the_record_and_names_the_container() {
+        crate::test_util::with_isolated_home("sandbox-docker-destroy", || {
+            let g = crate::pillbox::global();
+            let record = sandbox_record(crate::sandboxes::BACKEND_DOCKER);
+            crate::sandboxes::write(&g, &record).unwrap();
+            let err = sandbox_target(&record)
+                .unwrap()
+                .destroy(&g)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("container-abc"), "got: {err}");
+            assert!(crate::sandboxes::resolve(&g, &record.id).is_err());
+        });
+    }
+
+    #[test]
+    fn spawn_sandbox_defaults_to_unsupported() {
+        let req = SandboxSpawn {
+            agent: None,
+            workspace: PathBuf::from("/work/app"),
+            label: None,
+        };
+        let err = managed::ManagedBackend
+            .spawn_sandbox(&crate::pillbox::global(), &req)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sandbox spawn"), "got: {err}");
     }
 
     #[test]

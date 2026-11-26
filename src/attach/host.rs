@@ -123,10 +123,11 @@ pub(crate) fn run_vsock(port: u32, listen: bool, argv: &[String]) -> Result<()> 
 
 /// Bind + listen a guest-side vsock listener on `port` (CID_ANY). libkrun binds
 /// the host side (`krun_add_vsock_port2` listen=true); the host dials it.
-/// Shared by the detach reattach loop ([`run_vsock`]) and the opencode
-/// port-forward relay ([`run_vsock_forward`]).
+/// Shared by the detach reattach loop ([`run_vsock`]), the opencode
+/// port-forward relay ([`run_vsock_forward`]), and the sandbox `exec-host`
+/// ([`crate::sandbox::exec_channel::run_exec_host`]). Returns the listening fd.
 #[cfg(target_os = "linux")]
-fn vsock_listen(port: u32) -> Result<i32> {
+pub(crate) fn vsock_listen(port: u32) -> Result<i32> {
     const VMADDR_CID_ANY: u32 = 0xffff_ffff;
     let lfd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) };
     if lfd < 0 {

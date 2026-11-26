@@ -714,11 +714,11 @@ fn verifier_spec(rootfs: &Path, owner: &Path, rpc: &Path, remaining_ms: u64) -> 
             "-S".into(),
             verifier::SUPERVISOR_PATH.into(),
         ],
-        vsock: Some(VsockAttach {
+        vsock: vec![VsockAttach {
             port: verifier::REPORT_PORT,
             host_sock: rpc.to_string_lossy().into_owned(),
             listen: false,
-        }),
+        }],
         egress: None,
         ownership: Some(OwnershipSpec {
             socket: owner.to_string_lossy().into_owned(),
@@ -898,11 +898,11 @@ fn builder_spec(
             "-S".into(),
             format!("{GUEST_RUNTIME}/bridge.py"),
         ],
-        vsock: Some(VsockAttach {
+        vsock: vec![VsockAttach {
             port: RPC_PORT,
             host_sock: rpc.to_string_lossy().into_owned(),
             listen: false,
-        }),
+        }],
         egress: Some(EgressSpec {
             allowlist: vec![PROVIDER_HOST.into()],
             log_path: None,
@@ -913,6 +913,7 @@ fn builder_spec(
                 auth_id: "codex".into(),
                 access_stub: input.access_release.stub.clone(),
             }),
+            login: false,
         }),
         ownership: Some(OwnershipSpec {
             socket: owner.to_string_lossy().into_owned(),
@@ -2382,7 +2383,7 @@ mod tests {
     fn legacy_vm_spec_defaults_to_no_invocation_owner() {
         let spec: VmSpec = serde_json::from_value(serde_json::json!({
             "rootfs":"/rootfs", "vcpus":1, "ram_mib":512,
-            "shares":[], "exec":["/bin/true"], "vsock":null, "egress":null
+            "shares":[], "exec":["/bin/true"], "vsock":[], "egress":null
         }))
         .unwrap();
         assert!(spec.ownership.is_none());
@@ -2822,7 +2823,7 @@ except RuntimeError:
     fn supervised_fixture_spec() -> VmSpec {
         serde_json::from_value(serde_json::json!({
             "rootfs":"/unused", "vcpus":1, "ram_mib":64,
-            "shares":[], "exec":["unused"], "vsock":null, "egress":null
+            "shares":[], "exec":["unused"], "vsock":[], "egress":null
         }))
         .unwrap()
     }
@@ -3087,7 +3088,9 @@ except RuntimeError:
             spec.exec,
             ["/usr/bin/python3", "-I", "-S", verifier::SUPERVISOR_PATH]
         );
-        let vsock = spec.vsock.as_ref().unwrap();
+        let [vsock] = spec.vsock.as_slice() else {
+            panic!("verifier spec carries exactly one vsock channel")
+        };
         assert_eq!(vsock.port, verifier::REPORT_PORT);
         assert!(!vsock.listen);
         let bytes = serde_json::to_string(&spec).unwrap();

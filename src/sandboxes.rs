@@ -26,16 +26,19 @@ const SANDBOXES_DIR: &str = "sandboxes";
 /// Backend label written into the record. String (not enum) on disk so a
 /// future binary that adds a backend can still read older records.
 pub(crate) const BACKEND_DOCKER: &str = "docker";
+/// A libkrun microVM sandbox; its `backend_ref` is the libkrun handle JSON.
+pub(crate) const BACKEND_LIBKRUN: &str = crate::session::BACKEND_LIBKRUN;
 
 /// On-disk shape. Forward-compatible: serde ignores unknown fields.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct Sandbox {
     /// Short hex id (12 chars) — registry filename + the `exec`/`destroy` arg.
     pub(crate) id: String,
-    /// Backend kind — [`BACKEND_DOCKER`] today; `e2b` / `ssh` later.
+    /// Backend kind — [`BACKEND_LIBKRUN`], or [`BACKEND_DOCKER`] for a record the
+    /// deprecated Docker backend left.
     pub(crate) backend: String,
-    /// Opaque handle the backend uses to find the container again. For
-    /// docker: the container id. For e2b (future): the sandbox id.
+    /// Opaque handle the backend uses to find the sandbox again. For libkrun:
+    /// the handle JSON (sockets, spec, clones). For docker: the container id.
     pub(crate) backend_ref: String,
     /// Runner image the container was started from.
     pub(crate) image: String,
@@ -59,6 +62,15 @@ impl Sandbox {
     /// Mint a 12-hex-char id — see [`crate::registry::new_id`].
     pub(crate) fn new_id() -> String {
         reg::new_id()
+    }
+
+    /// Where [`write`] persists sandbox `id`: `<pillbox>/sandboxes/<id>.toml`. A
+    /// reparented libkrun VMM's commit guard watches it — the VM self-destructs if
+    /// this file doesn't appear before its launcher dies.
+    // The libkrun sandbox spawn (sandbox_vm) is its caller.
+    #[allow(dead_code)]
+    pub(crate) fn record_path(pb: &Pillbox, id: &str) -> std::path::PathBuf {
+        SandboxRegistry::path_read(pb, id)
     }
 }
 
@@ -125,6 +137,17 @@ mod tests {
             created_at: crate::session::now_rfc3339(),
             status: "ready".into(),
         }
+    }
+
+    #[test]
+    fn record_path_is_where_write_persists() {
+        with_isolated_home("sandbox-record-path", || {
+            let g = pillbox::global();
+            let s = make();
+            assert!(!Sandbox::record_path(&g, &s.id).exists());
+            write(&g, &s).unwrap();
+            assert!(Sandbox::record_path(&g, &s.id).exists());
+        });
     }
 
     #[test]

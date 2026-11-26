@@ -636,6 +636,16 @@ enum Command {
         #[arg(long, value_name = "PORT")]
         to_port: u16,
     },
+    /// Internal: guest-side sandbox exec server (libkrun; Linux-only). Listens on
+    /// a vsock port and runs each connection's command, streaming its output and
+    /// exit code back over the exec channel (`sandbox::exec_channel`). The libkrun
+    /// sandbox's guest workload. Not user-facing.
+    #[command(hide = true)]
+    ExecHost {
+        /// vsock port the guest listens on (libkrun binds the host side).
+        #[arg(long, value_name = "PORT")]
+        vsock_port: u32,
+    },
     /// Internal: guest-side `codex app-server` bridge (libkrun codex-serve).
     /// Spawns `codex app-server`, does the JSON-RPC `initialize` + `thread/start`
     /// handshake, captures every notification line to `--events-file` (the §0
@@ -1130,6 +1140,7 @@ fn run(cli: Cli) -> Result<()> {
             vsock_port,
             to_port,
         } => vsock_forward(vsock_port, to_port),
+        Command::ExecHost { vsock_port } => exec_host(vsock_port),
         Command::AppserverHost {
             port,
             events_file,
@@ -1423,6 +1434,17 @@ fn vsock_forward(vsock_port: u32, to_port: u16) -> Result<()> {
 #[cfg(not(target_os = "linux"))]
 fn vsock_forward(_vsock_port: u32, _to_port: u16) -> Result<()> {
     Err(PillboxError::usage("vsock-forward", "Linux-only (the libkrun guest)").into())
+}
+
+/// Dispatch `exec-host` — Linux-only (the libkrun guest). Serves the sandbox exec
+/// channel on a listening vsock port.
+#[cfg(target_os = "linux")]
+fn exec_host(vsock_port: u32) -> Result<()> {
+    sandbox::exec_channel::run_exec_host(vsock_port)
+}
+#[cfg(not(target_os = "linux"))]
+fn exec_host(_vsock_port: u32) -> Result<()> {
+    Err(PillboxError::usage("exec-host", "Linux-only (the libkrun guest)").into())
 }
 
 /// Validate an `--events-webhook URL`:

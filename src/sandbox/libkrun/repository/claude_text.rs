@@ -118,13 +118,11 @@ fn prepare_guest(
         fresh_directory(rootfs, path)?;
     }
     let home = rootfs.join("home/pillbox");
-    let auth_dir = home.join(".claude");
-    fs::create_dir(&auth_dir)?;
-    crate::paths::ensure_mode_0700(&auth_dir)?;
-    write_private_file(
-        &home.join(pillbox_credentials::CLAUDE),
-        &input.credentials.guest_auth,
-    )?;
+    let credentials = home.join(pillbox_credentials::CLAUDE);
+    let auth_dir = credentials.parent().expect("CLAUDE is under a directory");
+    fs::create_dir(auth_dir)?;
+    crate::paths::ensure_mode_0700(auth_dir)?;
+    write_private_file(&credentials, &input.credentials.guest_auth)?;
     write_private_file(
         &home.join(".claude.json"),
         br#"{"hasCompletedOnboarding":true}"#,

@@ -1025,9 +1025,12 @@ pub(crate) fn resolve_with_entries(
     Ok(out)
 }
 
+/// Compose a run's env: `env_bundles` (stored), then `env_files` (.env), then
+/// the resolved `--with` entries, each layer shadowing the one before.
 pub(crate) fn resolve_run_env(
     resolved: &Pillbox,
-    opts: &RunOpts,
+    env_bundles: &[String],
+    env_files: &[PathBuf],
     withs: &[ResolvedWith],
     mut vault: Option<&mut crate::vault::VaultSession>,
 ) -> Result<std::collections::BTreeMap<String, String>> {
@@ -1035,7 +1038,7 @@ pub(crate) fn resolve_run_env(
     let mut env: BTreeMap<String, String> = BTreeMap::new();
 
     // Layer 1: stored env bundles (inheritance applies).
-    for bundle_name in &opts.env_bundles {
+    for bundle_name in env_bundles {
         let vars = crate::envs::read(resolved, bundle_name)?.ok_or_else(|| {
             PillboxError::runtime("run", format!("env bundle `{bundle_name}` not found"))
                 .with_next("pillbox env list  # see what's stored".to_string())
@@ -1051,7 +1054,7 @@ pub(crate) fn resolve_run_env(
     }
 
     // Layer 2: ad-hoc .env files.
-    for path in &opts.env_files {
+    for path in env_files {
         let raw = std::fs::read_to_string(path).map_err(|e| {
             PillboxError::runtime(
                 "run",
@@ -1208,7 +1211,8 @@ mod tests {
 
             let opts = run_opts_with_withs(vec!["PLAIN_KEY"]);
             let withs = resolve_with_entries(&g, &opts.withs).unwrap();
-            let env = resolve_run_env(&g, &opts, &withs, None).unwrap();
+            let env =
+                resolve_run_env(&g, &opts.env_bundles, &opts.env_files, &withs, None).unwrap();
             assert_eq!(env.get("PLAIN_KEY").map(String::as_str), Some("raw-value"));
         });
     }
@@ -1242,7 +1246,14 @@ mod tests {
             .unwrap();
             let opts = run_opts_with_withs(vec!["VAULTED_KEY"]);
             let withs = resolve_with_entries(&g, &opts.withs).unwrap();
-            let env = resolve_run_env(&g, &opts, &withs, Some(&mut session)).unwrap();
+            let env = resolve_run_env(
+                &g,
+                &opts.env_bundles,
+                &opts.env_files,
+                &withs,
+                Some(&mut session),
+            )
+            .unwrap();
 
             let injected = env.get("VAULTED_KEY").cloned().unwrap();
             assert!(injected.starts_with("sk-ant-api03-"), "got {injected}");
@@ -1290,7 +1301,14 @@ mod tests {
             .unwrap();
             let opts = run_opts_with_withs(vec!["MIX_PLAIN", "MIX_VAULTED=GITHUB_TOKEN"]);
             let withs = resolve_with_entries(&g, &opts.withs).unwrap();
-            let env = resolve_run_env(&g, &opts, &withs, Some(&mut session)).unwrap();
+            let env = resolve_run_env(
+                &g,
+                &opts.env_bundles,
+                &opts.env_files,
+                &withs,
+                Some(&mut session),
+            )
+            .unwrap();
 
             assert_eq!(env.get("MIX_PLAIN").map(String::as_str), Some("plain-val"));
             let stub = env.get("GITHUB_TOKEN").cloned().unwrap();
@@ -1361,7 +1379,8 @@ mod tests {
 
             let opts = run_opts_with_withs(vec!["NO_SESSION_KEY"]);
             let withs = resolve_with_entries(&g, &opts.withs).unwrap();
-            let err = resolve_run_env(&g, &opts, &withs, None).unwrap_err();
+            let err =
+                resolve_run_env(&g, &opts.env_bundles, &opts.env_files, &withs, None).unwrap_err();
             let s = format!("{err}");
             assert!(s.contains("vaulted"), "expected vaulted error, got: {s}");
         });

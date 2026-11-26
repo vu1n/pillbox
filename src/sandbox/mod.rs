@@ -153,14 +153,32 @@ pub(crate) trait SandboxTarget {
 }
 
 /// Build the [`SandboxTarget`] for a sandbox record — the one place that branches
-/// on `record.backend`. A Docker record can only be dropped: Docker is deprecated,
-/// so exec is refused and destroy removes the record but leaves the container.
+/// on `record.backend`. A record nothing here can drive — the deprecated Docker
+/// backend's, an unknown backend's, or a libkrun record whose handle won't decode —
+/// resolves to a [`RecordOnly`] target: exec is refused, destroy drops the record.
 pub(crate) fn sandbox_target(record: &crate::sandboxes::Sandbox) -> Result<Box<dyn SandboxTarget>> {
     match record.backend.as_str() {
-        crate::sandboxes::BACKEND_DOCKER => Ok(Box::new(DockerSandboxRecord(record.clone()))),
+        crate::sandboxes::BACKEND_DOCKER => Ok(Box::new(RecordOnly {
+            record: record.clone(),
+            why: "is docker-backed, and docker is deprecated".into(),
+            left: format!(
+                "its container `{}` was left running; pillbox no longer drives docker, remove it \
+                 with `docker rm -f {}`",
+                record.backend_ref, record.backend_ref
+            ),
+        })),
         #[cfg(feature = "libkrun")]
-        crate::sandboxes::BACKEND_LIBKRUN => libkrun::sandbox_vm::target(record),
+        crate::sandboxes::BACKEND_LIBKRUN => {
+            libkrun::sandbox_vm::target(record).or_else(|e| -> Result<Box<dyn SandboxTarget>> {
+                Ok(Box::new(RecordOnly {
+                    record: record.clone(),
+                    why: format!("has a libkrun handle that can't be decoded ({e:#})"),
+                    left: "any VM or files it named were not torn down".into(),
+                }))
+            })
+        }
         // Usage (exit 2), like `live_session` for a libkrun record on this build.
+        // Not dropped: its VM may be live, and only a libkrun build can tear it down.
         #[cfg(not(feature = "libkrun"))]
         crate::sandboxes::BACKEND_LIBKRUN => Err(PillboxError::usage(
             "sandbox",
@@ -170,20 +188,25 @@ pub(crate) fn sandbox_target(record: &crate::sandboxes::Sandbox) -> Result<Box<d
             ),
         )
         .into()),
-        other => Err(PillboxError::config(
-            "sandbox",
-            format!("unknown sandbox backend `{other}` for sandbox `{}`", record.id),
-        )
-        .into()),
+        other => Ok(Box::new(RecordOnly {
+            record: record.clone(),
+            why: format!("has an unknown backend `{other}`"),
+            left: "nothing it ran was torn down".into(),
+        })),
     }
 }
 
-/// A sandbox record left by the deprecated Docker backend. Nothing runs it any
-/// more: exec is refused, destroy only drops the record and names the container
-/// the user must remove themselves.
-struct DockerSandboxRecord(crate::sandboxes::Sandbox);
+/// A sandbox record pillbox can't drive (see [`sandbox_target`]). Exec is refused;
+/// destroy drops the record, says on stderr what it left behind, and succeeds.
+struct RecordOnly {
+    record: crate::sandboxes::Sandbox,
+    /// Why it can't be driven, completing "sandbox `id` …".
+    why: String,
+    /// What destroy leaves behind, and the manual cleanup if any.
+    left: String,
+}
 
-impl SandboxTarget for DockerSandboxRecord {
+impl SandboxTarget for RecordOnly {
     fn exec(
         &self,
         _argv: &[String],
@@ -192,28 +215,21 @@ impl SandboxTarget for DockerSandboxRecord {
         Err(PillboxError::usage(
             "sandbox exec",
             format!(
-                "sandbox `{}` is docker-backed; docker is deprecated, so it can't be exec'd \
-                 (destroy only drops the record)",
-                self.0.id
+                "sandbox `{}` {}, so it can't be exec'd (destroy only drops the record)",
+                self.record.id, self.why
             ),
         )
-        .with_next(format!("pillbox sandbox destroy {}", self.0.id))
+        .with_next(format!("pillbox sandbox destroy {}", self.record.id))
         .into())
     }
 
     fn destroy(&self, resolved: &Pillbox) -> Result<()> {
-        // Docker is deprecated: drop the record, never drive the daemon.
-        crate::sandboxes::delete(resolved, &self.0.id)?;
-        Err(PillboxError::runtime(
-            "sandbox destroy",
-            format!(
-                "dropped the record of docker sandbox `{}`; docker is deprecated, so its \
-                 container `{}` was left running",
-                self.0.id, self.0.backend_ref
-            ),
-        )
-        .with_next(format!("docker rm -f {}", self.0.backend_ref))
-        .into())
+        crate::sandboxes::delete(resolved, &self.record.id)?;
+        eprintln!(
+            "pillbox: sandbox `{}` {}: dropped its record; {}",
+            self.record.id, self.why, self.left
+        );
+        Ok(())
     }
 }
 
@@ -434,36 +450,40 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sandbox_target_refuses_docker_exec_and_unknown_backends() {
-        let docker = sandbox_target(&sandbox_record(crate::sandboxes::BACKEND_DOCKER))
-            .expect("a docker record still resolves, so it can be destroyed");
-        let err = docker
-            .exec(&["true".into()], &mut |_, _| Ok(()))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("deprecated"), "got: {err}");
-
-        let err = sandbox_target(&sandbox_record("e2b"))
-            .err()
-            .unwrap()
-            .to_string();
-        assert!(err.contains("unknown sandbox backend `e2b`"), "got: {err}");
+    /// Records nothing here can drive: docker's, an unknown backend's, and (on a
+    /// libkrun build) a libkrun record whose "container-abc" ref isn't a handle.
+    fn undrivable_records() -> Vec<crate::sandboxes::Sandbox> {
+        let backends = [crate::sandboxes::BACKEND_DOCKER, "e2b"].into_iter();
+        #[cfg(feature = "libkrun")]
+        let backends = backends.chain([crate::sandboxes::BACKEND_LIBKRUN]);
+        backends.map(sandbox_record).collect()
     }
 
     #[test]
-    fn docker_sandbox_destroy_drops_the_record_and_names_the_container() {
-        crate::test_util::with_isolated_home("sandbox-docker-destroy", || {
+    fn sandbox_target_refuses_exec_on_records_it_cannot_drive() {
+        for record in undrivable_records() {
+            let target = sandbox_target(&record).expect("resolves, so it can be destroyed");
+            let err = target
+                .exec(&["true".into()], &mut |_, _| Ok(()))
+                .unwrap_err();
+            assert!(err.to_string().contains("can't be exec'd"), "{err}");
+            assert!(err.downcast_ref::<PillboxError>().is_some());
+        }
+    }
+
+    #[test]
+    fn destroying_a_record_it_cannot_drive_drops_it_and_succeeds() {
+        crate::test_util::with_isolated_home("sandbox-record-only-destroy", || {
             let g = crate::pillbox::global();
-            let record = sandbox_record(crate::sandboxes::BACKEND_DOCKER);
-            crate::sandboxes::write(&g, &record).unwrap();
-            let err = sandbox_target(&record)
-                .unwrap()
-                .destroy(&g)
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("container-abc"), "got: {err}");
-            assert!(crate::sandboxes::resolve(&g, &record.id).is_err());
+            for record in undrivable_records() {
+                crate::sandboxes::write(&g, &record).unwrap();
+                sandbox_target(&record).unwrap().destroy(&g).unwrap();
+                assert!(
+                    crate::sandboxes::resolve(&g, &record.id).is_err(),
+                    "{} record survived destroy",
+                    record.backend
+                );
+            }
         });
     }
 

@@ -144,14 +144,13 @@ fn spec(
             host_sock: rpc.to_string_lossy().into_owned(),
             listen: false,
         }],
-        egress: Some(EgressSpec {
-            allowlist: hosts.to_vec(),
-            log_path: None,
-            ca_dir: Some(ca_dir.to_string_lossy().into_owned()),
-            local_forward_port: None,
-            refresh: None,
-            login: false,
-        }),
+        egress: Some(EgressSpec::fence(
+            hosts.to_vec(),
+            None,
+            Some(ca_dir.to_string_lossy().into_owned()),
+            None,
+            None,
+        )),
         ownership: Some(OwnershipSpec {
             socket: owner.to_string_lossy().into_owned(),
             remaining_ms: Some(remaining_ms),

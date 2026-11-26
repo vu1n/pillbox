@@ -5,21 +5,23 @@
 //! `pillbox exec-host`) runs in the in-guest `--no-default-features` binary, the
 //! host side ([`run_exec`]) in the CLI.
 //!
-//! Wire: `[tag:u8][len:u32 BE][payload]`, the framing of `attach::frame`. The host
+//! Wire: `[tag:u8][len:u32 BE][payload]`, read and written by `attach::frame`'s
+//! shared codec (with this channel's own cap and a strict tag set). The host
 //! sends one `Request` (JSON `{argv, cwd}`); the guest answers with any number of
 //! `Stdout`/`Stderr` chunks, then exactly one `Exit(i32 BE)`, or a single
 //! `Error(utf8)` when the command could not be started. One connection carries one
 //! command; concurrent commands use concurrent connections.
 
 use std::io::{self, Read, Write};
-use std::process::{Command, Stdio};
-use std::sync::{mpsc, Arc, Mutex};
+use std::os::unix::net::UnixStream;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::attach::frame::{read_frame, write_frame};
+
 /// Cap on one frame's payload. The length prefix is peer-controlled, so `decode`
-/// refuses anything larger instead of allocating it. Output chunks are
+/// refuses anything larger instead of allocating it (attach's cap is 64 MiB). Output chunks are
 /// [`CHUNK_BYTES`]; only a request's argv could approach this.
 const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 
@@ -62,38 +64,17 @@ impl ExecFrame {
     /// Serialize and write the frame, then flush.
     pub(crate) fn encode(&self, w: &mut impl Write) -> io::Result<()> {
         let (tag, payload) = self.to_wire()?;
-        if payload.len() > MAX_FRAME_LEN {
-            return Err(invalid(&format!(
-                "frame length {} exceeds cap {MAX_FRAME_LEN}",
-                payload.len()
-            )));
-        }
-        let mut hdr = [0u8; 5];
-        hdr[0] = tag;
-        hdr[1..].copy_from_slice(&(payload.len() as u32).to_be_bytes());
-        w.write_all(&hdr)?;
-        w.write_all(&payload)?;
-        w.flush()
+        write_frame(w, tag, &payload, MAX_FRAME_LEN)
     }
 
-    /// Read one frame. `Ok(None)` is a clean EOF between frames; a truncated,
-    /// oversized, unknown-tag or malformed frame is an `InvalidData` error.
+    /// Read one frame. `Ok(None)` is a clean EOF between frames; a truncated
+    /// (including a partial header), oversized, unknown-tag or malformed frame is
+    /// an `InvalidData` error.
     pub(crate) fn decode(r: &mut impl Read) -> io::Result<Option<ExecFrame>> {
-        let mut hdr = [0u8; 5];
-        match r.read_exact(&mut hdr) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(e),
+        match read_frame(r, MAX_FRAME_LEN)? {
+            Some((tag, payload)) => Ok(Some(ExecFrame::from_wire(tag, payload)?)),
+            None => Ok(None),
         }
-        let len = u32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]) as usize;
-        if len > MAX_FRAME_LEN {
-            return Err(invalid(&format!(
-                "frame length {len} exceeds cap {MAX_FRAME_LEN}"
-            )));
-        }
-        let mut payload = vec![0u8; len];
-        r.read_exact(&mut payload)?;
-        Ok(Some(ExecFrame::from_wire(hdr[0], payload)?))
     }
 
     fn to_wire(&self) -> io::Result<(u8, Vec<u8>)> {
@@ -126,6 +107,7 @@ impl ExecFrame {
             T_ERROR => ExecFrame::Error(
                 String::from_utf8(payload).map_err(|_| invalid("Error payload is not UTF-8"))?,
             ),
+            // Strict, unlike attach: both ends ship in one binary, so an unknown tag is corruption.
             other => return Err(invalid(&format!("unknown exec frame tag {other}"))),
         })
     }
@@ -138,8 +120,9 @@ fn invalid(msg: &str) -> io::Error {
 /// Host side: run `argv` (in `cwd`) through the guest at the other end of
 /// `stream`, handing each output chunk to `on_chunk(is_stderr, bytes)` in arrival
 /// order, and return the command's exit code. An `Err` from `on_chunk` aborts the
-/// exchange (closing the stream; the guest then kills the command). A guest that
-/// could not start the command, or a stream that closes before `Exit`, is an error.
+/// exchange (closing the stream; the guest then kills the command's process
+/// group). A guest that could not start the command, or a stream that closes
+/// before `Exit`, is an error.
 #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) fn run_exec<S: Read + Write>(
     mut stream: S,
@@ -168,13 +151,24 @@ pub(crate) fn run_exec<S: Read + Write>(
     }
 }
 
-/// Guest side: serve one command on `stream`. Reads the `Request`, spawns its argv
-/// with stdin empty and stdout/stderr piped, relays both pipes concurrently as
-/// frames, then sends `Exit`. A spawn failure is answered with `Error`. If the host
-/// goes away mid-command, the command is killed rather than left running.
+/// Guest side: serve one command on `stream`.
+///
+/// Reads the `Request` and spawns its argv in a new process group (stdin empty,
+/// stdout/stderr piped). Until the command's own process exits, it relays both
+/// pipes as frames and watches the host end: if the host closes the stream (or a
+/// frame write fails), it SIGKILLs the whole process group and returns an error.
+/// Once the command's own process exits, it relays the output already buffered in
+/// the pipes and sends `Exit` without waiting for pipe EOF, so a backgrounded
+/// descendant still holding them (`sh -c 'server &'`) does not hold the exchange
+/// open. Such descendants keep running after `Exit`; anything they write later is
+/// read and discarded by a detached thread until they close the pipes. A spawn
+/// failure is answered with `Error`.
 // Its caller, `exec-host`, is Linux-only (the libkrun guest).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub(crate) fn serve_exec<S: Read + Write + Send + 'static>(mut stream: S) -> Result<()> {
+pub(crate) fn serve_exec(mut stream: UnixStream) -> Result<()> {
+    use std::os::unix::process::CommandExt as _;
+    use std::process::{Command, Stdio};
+
     let req = match ExecFrame::decode(&mut stream).context("read exec request")? {
         Some(ExecFrame::Request(req)) => req,
         Some(other) => bail!("exec channel: expected Request, got {other:?}"),
@@ -188,7 +182,8 @@ pub(crate) fn serve_exec<S: Read + Write + Send + 'static>(mut stream: S) -> Res
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .process_group(0);
     if let Some(cwd) = &req.cwd {
         cmd.current_dir(cwd);
     }
@@ -199,59 +194,214 @@ pub(crate) fn serve_exec<S: Read + Write + Send + 'static>(mut stream: S) -> Res
             return Ok(());
         }
     };
+    let group = child.id() as libc::pid_t;
+    let mut pipes: Vec<OutPipe> = vec![
+        OutPipe::new(child.stdout.take().expect("stdout is piped"), false)?,
+        OutPipe::new(child.stderr.take().expect("stderr is piped"), true)?,
+    ];
+    // The waiter reaps the command and wakes the poll loop through `exited`.
+    let (exited, mut exited_tx) = UnixStream::pair().context("exec exit notifier")?;
+    let waiter = std::thread::spawn(move || {
+        let status = child.wait();
+        let _ = exited_tx.write_all(&[1]);
+        status
+    });
+    let kill_group = |waiter: std::thread::JoinHandle<io::Result<std::process::ExitStatus>>| {
+        unsafe { libc::killpg(group, libc::SIGKILL) };
+        let _ = waiter.join();
+    };
 
-    let writer = Arc::new(Mutex::new(stream));
-    let (done_tx, done_rx) = mpsc::channel::<io::Result<()>>();
-    let stdout = child.stdout.take().expect("stdout is piped");
-    let stderr = child.stderr.take().expect("stderr is piped");
-    for (pipe, is_stderr) in [
-        (Box::new(stdout) as Box<dyn Read + Send>, false),
-        (Box::new(stderr) as Box<dyn Read + Send>, true),
-    ] {
-        let writer = Arc::clone(&writer);
-        let done_tx = done_tx.clone();
-        std::thread::spawn(move || {
-            let _ = done_tx.send(relay(pipe, is_stderr, &writer));
-        });
-    }
-    drop(done_tx);
-    let mut relay_err = None;
-    for result in done_rx {
-        if let Err(e) = result {
-            // The host is gone (or the pipe broke): don't leave the command running.
-            let _ = child.kill();
-            relay_err.get_or_insert(e);
+    loop {
+        match wait_readable(&stream, &exited, &pipes) {
+            Ok(Ready {
+                host,
+                exited: done,
+                pipes: ready,
+            }) => {
+                if host && host_gone(&mut stream) {
+                    kill_group(waiter);
+                    bail!("the host closed the exec channel; killed the command's process group");
+                }
+                for (pipe, readable) in pipes.iter_mut().zip(ready) {
+                    if readable {
+                        if let Err(e) = pipe.relay_available(&mut stream) {
+                            kill_group(waiter);
+                            return Err(e).context("relay exec output");
+                        }
+                    }
+                }
+                pipes.retain(|p| p.open);
+                if done {
+                    break;
+                }
+            }
+            Err(e) => {
+                kill_group(waiter);
+                return Err(e).context("poll the exec channel");
+            }
         }
     }
-    let status = child.wait().context("wait for exec'd command")?;
-    if let Some(e) = relay_err {
-        return Err(e).context("relay exec output");
+    // The command's own process is gone: relay what it left in the pipes.
+    for pipe in &mut pipes {
+        pipe.relay_available(&mut stream)
+            .context("relay exec output")?;
     }
-    let mut stream = writer.lock().unwrap_or_else(|p| p.into_inner());
-    ExecFrame::Exit(exit_code(status)).encode(&mut *stream)?;
+    let status = waiter
+        .join()
+        .map_err(|_| anyhow::anyhow!("exec waiter panicked"))?
+        .context("wait for exec'd command")?;
+    pipes.retain(|p| p.open);
+    if !pipes.is_empty() {
+        // Background descendants still hold the pipes: drain them so they never hit SIGPIPE.
+        std::thread::spawn(move || {
+            for pipe in pipes {
+                pipe.discard_until_eof();
+            }
+        });
+    }
+    ExecFrame::Exit(exit_code(status)).encode(&mut stream)?;
     Ok(())
 }
 
-/// Copy `pipe` to the shared stream as `Stdout`/`Stderr` frames until EOF.
-// Its caller, `exec-host`, is Linux-only (the libkrun guest).
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn relay<S: Write>(mut pipe: impl Read, is_stderr: bool, writer: &Mutex<S>) -> io::Result<()> {
-    let mut buf = vec![0u8; CHUNK_BYTES];
+/// One of the command's output pipes, non-blocking, relayed as `Stdout`/`Stderr`.
+struct OutPipe {
+    file: std::fs::File,
+    is_stderr: bool,
+    /// False once the pipe hit EOF (every writer closed it).
+    open: bool,
+}
+
+impl OutPipe {
+    fn new(pipe: impl Into<std::os::fd::OwnedFd>, is_stderr: bool) -> Result<Self> {
+        use std::os::fd::AsRawFd as _;
+        let file = std::fs::File::from(pipe.into());
+        let fd = file.as_raw_fd();
+        // SAFETY: plain fcntl on an fd this struct owns.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error()).context("make an exec pipe non-blocking");
+        }
+        Ok(Self {
+            file,
+            is_stderr,
+            open: true,
+        })
+    }
+
+    /// Relay every byte readable right now as frames; stops at "would block" or EOF.
+    fn relay_available(&mut self, stream: &mut impl Write) -> io::Result<()> {
+        let mut buf = vec![0u8; CHUNK_BYTES];
+        while self.open {
+            match self.file.read(&mut buf) {
+                Ok(0) => self.open = false,
+                Ok(n) => {
+                    let chunk = buf[..n].to_vec();
+                    let frame = if self.is_stderr {
+                        ExecFrame::Stderr(chunk)
+                    } else {
+                        ExecFrame::Stdout(chunk)
+                    };
+                    frame.encode(stream)?;
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// Read and drop everything until every writer has closed the pipe.
+    fn discard_until_eof(mut self) {
+        let mut buf = vec![0u8; CHUNK_BYTES];
+        while self.open {
+            match wait_one(&self.file) {
+                Ok(()) => match self.file.read(&mut buf) {
+                    Ok(0) => self.open = false,
+                    Ok(_) => {}
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(_) => self.open = false,
+                },
+                Err(_) => self.open = false,
+            }
+        }
+    }
+}
+
+/// Which of the poll loop's descriptors are readable.
+struct Ready {
+    host: bool,
+    exited: bool,
+    pipes: Vec<bool>,
+}
+
+/// Block until the host stream, the exit notifier, or an open pipe is readable
+/// (or hung up). No timeout: every wake-up has a cause.
+fn wait_readable(host: &UnixStream, exited: &UnixStream, pipes: &[OutPipe]) -> io::Result<Ready> {
+    use std::os::fd::AsRawFd as _;
+    let mut fds: Vec<libc::pollfd> = [host.as_raw_fd(), exited.as_raw_fd()]
+        .into_iter()
+        .chain(pipes.iter().map(|p| p.file.as_raw_fd()))
+        .map(|fd| libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
     loop {
-        let n = match pipe.read(&mut buf) {
-            Ok(0) => return Ok(()),
-            Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        };
-        let chunk = buf[..n].to_vec();
-        let frame = if is_stderr {
-            ExecFrame::Stderr(chunk)
-        } else {
-            ExecFrame::Stdout(chunk)
-        };
-        let mut w = writer.lock().unwrap_or_else(|p| p.into_inner());
-        frame.encode(&mut *w)?;
+        // SAFETY: `fds` is a valid, exclusively borrowed pollfd array.
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+        if rc >= 0 {
+            break;
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+    let woke = |p: &libc::pollfd| p.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0;
+    Ok(Ready {
+        host: woke(&fds[0]),
+        exited: woke(&fds[1]),
+        pipes: fds[2..].iter().map(woke).collect(),
+    })
+}
+
+/// Block until `file` is readable or hung up.
+fn wait_one(file: &std::fs::File) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    let mut fd = libc::pollfd {
+        fd: file.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: one valid pollfd.
+        if unsafe { libc::poll(&mut fd, 1, -1) } >= 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
+/// The host stream polled readable: true when the host has gone (EOF or a read
+/// error). The host sends nothing after its `Request`, so stray bytes are dropped.
+fn host_gone(stream: &mut UnixStream) -> bool {
+    let mut buf = [0u8; 256];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => return true,
+            Ok(_) => return false,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return true,
+        }
     }
 }
 
@@ -270,23 +420,13 @@ fn exit_code(status: std::process::ExitStatus) -> i32 {
 /// connection's command on its own thread. Blocks until the VM is torn down.
 #[cfg(target_os = "linux")]
 pub(crate) fn run_exec_host(port: u32) -> Result<()> {
-    use std::os::unix::io::FromRawFd as _;
-    use std::os::unix::net::UnixStream;
-    let lfd = crate::attach::host::vsock_listen(port)?;
-    loop {
-        let cfd = unsafe { libc::accept(lfd, std::ptr::null_mut(), std::ptr::null_mut()) };
-        if cfd < 0 {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            continue;
-        }
-        // SAFETY: `cfd` is a freshly accepted socket this stream now solely owns.
-        let conn = unsafe { UnixStream::from_raw_fd(cfd) };
+    crate::attach::host::vsock_serve(port, |conn| {
         std::thread::spawn(move || {
             if let Err(e) = serve_exec(conn) {
                 eprintln!("pillbox exec-host: {e:#}");
             }
         });
-    }
+    })
 }
 
 #[cfg(test)]
@@ -324,6 +464,12 @@ mod tests {
     #[test]
     fn exec_channel_clean_eof_and_truncation() {
         assert!(ExecFrame::decode(&mut [].as_slice()).unwrap().is_none());
+        // A partial header then EOF is a torn frame, not a clean close.
+        for cut in 1..5 {
+            let partial = [T_STDOUT, 0, 0, 0, 1];
+            let err = ExecFrame::decode(&mut &partial[..cut]).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "cut at {cut}");
+        }
         let mut buf = Vec::new();
         ExecFrame::Stdout(b"abcdef".to_vec())
             .encode(&mut buf)
@@ -391,6 +537,59 @@ mod tests {
         let msg = code.unwrap_err().to_string();
         assert!(msg.contains("could not start"), "got: {msg}");
         assert!(out.is_empty() && err.is_empty());
+    }
+
+    /// Poll until `path` holds a pid (the command wrote it), bounded.
+    fn read_pid(path: &std::path::Path) -> libc::pid_t {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(pid) = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+            {
+                return pid;
+            }
+            assert!(std::time::Instant::now() < deadline, "no pid in {path:?}");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn exec_channel_kills_a_quiet_command_when_the_host_disconnects() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let (mut host, guest) = UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || serve_exec(guest));
+        let script = format!("echo $$ > '{}'; exec sleep 60", pidfile.display());
+        ExecFrame::Request(ExecRequest {
+            argv: vec!["sh".into(), "-c".into(), script],
+            cwd: None,
+        })
+        .encode(&mut host)
+        .unwrap();
+        let pid = read_pid(&pidfile);
+        let started = std::time::Instant::now();
+        drop(host);
+        let err = server.join().unwrap().unwrap_err().to_string();
+        assert!(err.contains("host closed"), "{err}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        // serve_exec reaped it before returning: the pid no longer exists.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "sleep {pid} survived");
+    }
+
+    #[test]
+    fn exec_channel_exits_when_the_command_does_even_if_a_background_child_holds_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("bg");
+        let script = format!("echo hi; sleep 60 & echo $! > '{}'", pidfile.display());
+        let started = std::time::Instant::now();
+        let (code, out, _) = exec_over_pair(&["sh", "-c", &script], None);
+        let elapsed = started.elapsed();
+        let bg = read_pid(&pidfile);
+        unsafe { libc::kill(bg, libc::SIGKILL) };
+        assert_eq!(code.unwrap(), 0);
+        assert_eq!(out, b"hi\n");
+        assert!(elapsed < std::time::Duration::from_secs(10), "{elapsed:?}");
     }
 
     #[test]

@@ -8,9 +8,10 @@
 //!
 //! The VM takes the run path's [`launch_base`] prologue: a private rootfs clone, a
 //! CoW secret-scrubbed workspace clone (never the host directory itself), the
-//! egress fence and the vault CA. With `--agent`, it takes the structured run's
-//! creds ([`agent_launch_creds`]): a vault-capable agent's env-fork puts stubbed
-//! creds in the guest and the reals only on the VMM child's stdin.
+//! egress fence and the vault CA. `--agent` takes only a vault-capable agent with a
+//! stdout harness adapter ([`sandbox_agent`]), whose env-fork
+//! ([`agent_launch_creds`]) puts stubbed creds in the guest and the reals only on
+//! the VMM child's stdin.
 //!
 //! Wired in: `LibkrunBackend::spawn_sandbox` calls [`spawn`], and
 //! `sandbox::sandbox_target` calls [`target`] for a libkrun record.
@@ -21,7 +22,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
-use crate::agents::{AgentSpec, RunOpts, GUEST_HOME};
+use crate::agents::harness;
+use crate::agents::{AgentSpec, GUEST_HOME};
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
 use crate::sandbox::exec_channel;
@@ -29,9 +31,9 @@ use crate::sandbox::{SandboxSpawn, SandboxTarget};
 use crate::sandboxes::{self, Sandbox};
 
 use super::session::{
-    abandon_launch, agent_launch_creds, authenticated_home, ensure_env_fork_sealed,
-    guest_launch_preamble, launch_base, spawn_vmm, standard_allowlist, teardown_handle,
-    write_vm_spec, CaLifetime, LaunchBase, LaunchCreds, LibkrunHandle, VaultCa, VmmTether,
+    agent_launch_creds, authenticated_home, ensure_env_fork_sealed, guest_launch_preamble,
+    launch_base, spawn_reparented, standard_allowlist, teardown_handle, CaLifetime, LaunchBase,
+    LaunchCreds, LaunchInputs, LibkrunHandle, OwnedPath, PendingVm, VaultCa,
 };
 use super::{boot, krun_cache_dir, shell_quote, EgressSpec, Share, SwapPair, VmSpec, VsockAttach};
 
@@ -52,14 +54,39 @@ const PROBE_IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// Boot a sandbox VM for `req`, wait until its exec channel answers, and write
 /// its record. Any failure after the VMM spawn tears the VM and its files down.
 pub(super) fn spawn(resolved: &Pillbox, req: &SandboxSpawn) -> Result<Sandbox> {
-    let agent = req
-        .agent
-        .as_deref()
-        .map(|a| crate::agents::lookup("sandbox spawn", a))
-        .transpose()?;
+    let agent = req.agent.as_deref().map(sandbox_agent).transpose()?;
     let id = Sandbox::new_id();
-    let prepared = prepare(resolved, agent, &sandbox_run_opts(&req.workspace))?;
+    let prepared = prepare(resolved, agent, &req.workspace)?;
     launch(resolved, &id, req, agent, prepared)
+}
+
+/// The agent `sandbox spawn --agent` may provision: env-forked (vault-capable,
+/// so the guest only ever holds stubs) and drivable by `sandbox agent` (it has a
+/// stdout harness adapter). Refused before any rootfs or clone exists.
+fn sandbox_agent(id: &str) -> Result<&'static AgentSpec> {
+    let spec = crate::agents::lookup("sandbox spawn", id)?;
+    // Any other agent would mount its real credential in the guest, or could never be driven.
+    if spec.vault_capable && harness::lookup(spec.id).is_some() {
+        return Ok(spec);
+    }
+    Err(PillboxError::usage(
+        "sandbox spawn",
+        format!(
+            "`--agent {id}` can't run in a sandbox: only an agent whose credential is \
+             env-forked and whose output `sandbox agent` can read is supported ({})",
+            sandbox_agents().join(", ")
+        ),
+    )
+    .into())
+}
+
+/// Every agent [`sandbox_agent`] accepts.
+fn sandbox_agents() -> Vec<&'static str> {
+    crate::agents::ALL
+        .iter()
+        .filter(|spec| spec.vault_capable && harness::lookup(spec.id).is_some())
+        .map(|spec| spec.id)
+        .collect()
 }
 
 /// The live target for a libkrun sandbox record.
@@ -72,103 +99,51 @@ pub(crate) fn target(record: &Sandbox) -> Result<Box<dyn SandboxTarget>> {
     }))
 }
 
-/// The run options a sandbox launch feeds the shared prologue: only the workspace.
-/// No `--with`, bundles, bookmark or extra egress — a sandbox takes none of them.
-fn sandbox_run_opts(workspace: &Path) -> RunOpts {
-    RunOpts {
-        workspace: Some(workspace.to_path_buf()),
-        name: None,
-        mounts: Vec::new(),
-        withs: Vec::new(),
-        env_bundles: Vec::new(),
-        env_files: Vec::new(),
-        vault: false,
-        memory: false,
-        memory_briefed: Vec::new(),
-        mcps: Vec::new(),
-        mcp_tokens: Vec::new(),
-        args: Vec::new(),
-        detach: true,
-        label: None,
-        json: false,
-        ttl_seconds: None,
-        from_bookmark: None,
-        model: None,
-        profile: None,
-        reasoning_effort: None,
-        temperature: None,
-        egress_allow: Vec::new(),
-        egress_deny: false,
-    }
-}
-
-/// Host directories created for a launch that is not yet owned by a running VM;
-/// removed on drop unless [`release`](Self::release)d to the VM's handle.
-#[derive(Default)]
-struct Scratch(Vec<PathBuf>);
-
-impl Scratch {
-    fn keep(&mut self, dir: &Path) {
-        self.0.push(dir.to_path_buf());
-    }
-    fn release(mut self) {
-        self.0.clear();
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        for dir in &self.0 {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-    }
-}
-
 /// Everything [`launch`] needs, built before any VMM exists.
 struct Prepared {
-    rootfs: super::rootfs::PrivateRootfs,
-    spec_path: PathBuf,
-    sock: PathBuf,
-    creds_share: PathBuf,
-    workspace_clone: PathBuf,
+    vm: PendingVm,
     guest_workspace: String,
     swap_pairs: Vec<SwapPair>,
-    scratch: Scratch,
     _ca: VaultCa,
 }
 
-/// Build the launch: the shared prologue, the creds share, the boot script
+/// Build the launch: the shared prologue over `workspace` (a sandbox takes no
+/// `--with`, bundles, bookmark or extra egress), the creds share, the boot script
 /// (sealed against a leaked real credential), and the persisted VmSpec.
-fn prepare(resolved: &Pillbox, agent: Option<&AgentSpec>, opts: &RunOpts) -> Result<Prepared> {
-    let mut scratch = Scratch::default();
-    let home = agent
-        .map(|spec| authenticated_home(spec, opts, resolved, "sandbox spawn"))
+fn prepare(resolved: &Pillbox, agent: Option<&AgentSpec>, workspace: &Path) -> Result<Prepared> {
+    let inputs = LaunchInputs {
+        workspace: Some(workspace),
+        ..LaunchInputs::default()
+    };
+    let agent = agent
+        .map(|spec| authenticated_home(spec, &inputs, resolved, "sandbox spawn"))
         .transpose()?;
     // The sandbox VM reparents past this CLI, so its CA must persist.
     let LaunchBase {
         rootfs,
         workspace_clone,
         guest_workspace,
-        guest_env,
+        mut guest_env,
         ca,
-        with_vault,
-    } = launch_base(agent, opts, resolved, CaLifetime::Persistent)?;
-    scratch.keep(&workspace_clone);
+        vaulted,
+    } = launch_base(&inputs, resolved, CaLifetime::Persistent)?;
     let LaunchCreds {
         creds_share,
         swap_pairs,
         allowlist,
         refresh,
-    } = match agent.zip(home.as_deref()) {
-        Some((spec, home)) => agent_launch_creds(spec, home, opts, with_vault)?,
+        stub_env,
+    } = match &agent {
+        Some(agent) => agent_launch_creds(agent, resolved, &[], &vaulted)?,
         None => LaunchCreds {
-            creds_share: empty_home()?,
+            creds_share: OwnedPath::new(empty_home()?),
             swap_pairs: Vec::new(),
-            allowlist: standard_allowlist(opts),
+            allowlist: standard_allowlist(&[]),
             refresh: None,
+            stub_env: Vec::new(),
         },
     };
-    scratch.keep(&creds_share);
+    guest_env.extend(stub_env);
 
     let preamble = guest_launch_preamble(&ca.cert_pem, &guest_workspace);
     let exports = boot::env_exports(&guest_env)?;
@@ -190,29 +165,19 @@ fn prepare(resolved: &Pillbox, agent: Option<&AgentSpec>, opts: &RunOpts) -> Res
         boot_exec,
         &workspace_clone,
         &sock,
-        EgressSpec {
+        EgressSpec::fence(
             allowlist,
-            log_path: super::egress_log_path(),
-            ca_dir: Some(ca.dir.to_string_lossy().into_owned()),
-            local_forward_port: None,
+            super::egress_log_path(),
+            Some(ca.dir.to_string_lossy().into_owned()),
+            None,
             refresh,
-            // Only `auth login` opens the token endpoints; a sandbox never does.
-            login: false,
-        },
+        ),
     );
-    let spec_file = write_vm_spec(&vmspec)?;
-    // The reparented child reads the spec after this CLI returns: persist it.
-    let (_, spec_path) = spec_file.keep().context("persist VMM spec")?;
-
+    let vm = PendingVm::new(rootfs, workspace_clone, creds_share, &vmspec, sock)?;
     Ok(Prepared {
-        rootfs,
-        spec_path,
-        sock,
-        creds_share,
-        workspace_clone,
+        vm,
         guest_workspace,
         swap_pairs,
-        scratch,
         _ca: ca,
     })
 }
@@ -234,7 +199,7 @@ fn empty_home() -> Result<PathBuf> {
 /// hands the home and workspace to uid 1000 and runs `exec-host` (so every exec'd
 /// command) as that user.
 fn boot_script(exports: &str, preamble: &str, guest_workspace: &str, agent: bool) -> String {
-    let exec_host = format!("pillbox exec-host --vsock-port {EXEC_PORT}");
+    let exec_host = boot::exec_host_cmd(EXEC_PORT);
     if !agent {
         return format!("{exports}{preamble}; exec {exec_host}");
     }
@@ -296,51 +261,32 @@ fn launch(
     id: &str,
     req: &SandboxSpawn,
     agent: Option<&AgentSpec>,
-    mut prepared: Prepared,
+    prepared: Prepared,
 ) -> Result<Sandbox> {
     let record_path = Sandbox::record_path(resolved, id);
-    let mut child = spawn_vmm(
-        &prepared.spec_path,
-        VmmTether::Reparented {
-            record: &record_path,
-        },
-        &prepared.swap_pairs,
-    )?;
-    // From here the handle's teardown owns the rootfs and clones.
-    prepared.rootfs.preserve();
-    prepared.scratch.release();
-    let handle = LibkrunHandle {
-        sock: prepared.sock.to_string_lossy().into_owned(),
-        pid: child.id() as i32,
-        creds: prepared.creds_share.to_string_lossy().into_owned(),
-        workspace: prepared.workspace_clone.to_string_lossy().into_owned(),
-        spec: prepared.spec_path.to_string_lossy().into_owned(),
-        rootfs: Some(prepared.rootfs.to_string_lossy().into_owned()),
-    };
-    let committed = (|| -> Result<Sandbox> {
-        wait_exec_ready(
-            &prepared.sock,
-            &prepared.guest_workspace,
-            EXEC_READY_TIMEOUT,
-            || child.try_wait().context("poll the sandbox VMM"),
-        )?;
+    let guest_workspace = prepared.guest_workspace;
+    let sock = prepared.vm.sock.clone();
+    let spawned = spawn_reparented(prepared.vm, &record_path, &prepared.swap_pairs)?;
+    spawned.commit("sandbox spawn", |child, handle| {
+        wait_exec_ready(&sock, &guest_workspace, EXEC_READY_TIMEOUT, || {
+            child.try_wait().context("poll the sandbox VMM")
+        })?;
         let record = Sandbox {
             id: id.to_string(),
             backend: sandboxes::BACKEND_LIBKRUN.into(),
-            backend_ref: serde_json::to_string(&handle).context("encode libkrun handle")?,
+            backend_ref: serde_json::to_string(handle).context("encode libkrun handle")?,
             image: crate::docker::resolve_runner_image(resolved).0,
             agent: agent.map(|spec| spec.id.to_string()),
             workspace: req.workspace.display().to_string(),
             workspace_clone: Some(handle.workspace.clone()),
-            guest_workspace: Some(prepared.guest_workspace.clone()),
+            guest_workspace: Some(guest_workspace.clone()),
             label: req.label.clone(),
             created_at: crate::session::now_rfc3339(),
             status: "ready".into(),
         };
         sandboxes::write(resolved, &record)?;
         Ok(record)
-    })();
-    committed.map_err(|e| abandon_launch("sandbox spawn", &mut child, &handle, e))
+    })
 }
 
 /// Poll the sandbox's exec channel until a `true` runs to exit 0 in the guest
@@ -500,14 +446,7 @@ mod tests {
             vec!["/bin/sh".into()],
             Path::new("/ws-clone"),
             Path::new("/k/exec.sock"),
-            EgressSpec {
-                allowlist: vec!["api.anthropic.com".into()],
-                log_path: None,
-                ca_dir: None,
-                local_forward_port: None,
-                refresh: None,
-                login: false,
-            },
+            EgressSpec::fence(vec!["api.anthropic.com".into()], None, None, None, None),
         );
         assert_eq!(spec.vsock.len(), 1);
         assert_eq!(spec.vsock[0].port, EXEC_PORT);
@@ -515,15 +454,45 @@ mod tests {
         assert_eq!(spec.vsock[0].host_sock, "/k/exec.sock");
         assert_eq!(spec.shares[1].tag, "workspace");
         assert_eq!(spec.shares[1].host_path, "/ws-clone");
-        assert!(!spec.egress.as_ref().unwrap().login);
+        assert!(!spec.egress.as_ref().unwrap().opens_token_endpoints());
         assert!(!spec.offline);
     }
 
     #[test]
-    fn sandbox_run_opts_carry_only_the_workspace() {
-        let opts = sandbox_run_opts(Path::new("/work/app"));
-        assert_eq!(opts.workspace.as_deref(), Some(Path::new("/work/app")));
-        assert!(opts.withs.is_empty() && opts.egress_allow.is_empty() && !opts.vault);
+    fn spawn_refuses_agents_that_are_not_env_forked_or_drivable_before_any_launch() {
+        assert_eq!(sandbox_agents(), ["claude"]);
+        assert_eq!(sandbox_agent("claude").unwrap().id, "claude");
+        for id in [
+            "pi",
+            "cursor",
+            "opencode",
+            "prime-agent",
+            "codex",
+            "claude-stream",
+        ] {
+            let Err(err) = sandbox_agent(id) else {
+                panic!("{id} accepted")
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.contains("can't run in a sandbox") && msg.contains("(claude)"),
+                "{id}: {msg}"
+            );
+            assert!(
+                err.downcast_ref::<PillboxError>().is_some(),
+                "{id}: not a usage error"
+            );
+        }
+        // The refusal comes from `spawn` before any rootfs or clone exists.
+        let req = SandboxSpawn {
+            agent: Some("pi".into()),
+            workspace: PathBuf::from("/nonexistent/pillbox-sandbox-ws"),
+            label: None,
+        };
+        let msg = spawn(&crate::pillbox::global(), &req)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("can't run in a sandbox"), "{msg}");
     }
 
     /// A host socket served by the real guest-side exec channel, as `exec-host` would.
@@ -677,21 +646,5 @@ mod tests {
                 assert!(!Path::new(p).exists(), "{p} survived destroy");
             }
         });
-    }
-
-    #[test]
-    fn scratch_removes_unreleased_dirs_only() {
-        let dir = tempfile::tempdir().unwrap();
-        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
-        std::fs::create_dir_all(&a).unwrap();
-        std::fs::create_dir_all(&b).unwrap();
-        let mut dropped = Scratch::default();
-        dropped.keep(&a);
-        drop(dropped);
-        let mut released = Scratch::default();
-        released.keep(&b);
-        released.release();
-        assert!(!a.exists());
-        assert!(b.exists());
     }
 }

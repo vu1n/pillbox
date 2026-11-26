@@ -23,7 +23,7 @@ tests:
   - "src/config.rs:overlay_project_wins_global_fills_gaps"
   - "src/sandbox/libkrun/login.rs:claude_login_vm_opens_token_endpoints_mounts_the_real_home_and_forwards_the_callback"
   - "src/sandbox/libkrun/login.rs:login_without_an_oauth_port_has_no_callback_forward"
-  - "src/sandbox/libkrun/login.rs:no_other_launch_builder_sets_login"
+  - "src/sandbox/libkrun/egress.rs:only_the_login_constructor_opens_token_endpoints_and_the_spec_file_keeps_it"
 ---
 
 # Project bundles and configuration
@@ -50,4 +50,4 @@ Run `pillbox init`, then `pillbox new --name demo` in a disposable project. `pil
 
 - Discovery selects one project; defaults overlay global fields rather than merging every ancestor descriptor.
 - Unknown top-level config fields fail, while the workspace table is permissive.
-- `auth login` runs in a foreground libkrun microVM, never Docker; a build without libkrun refuses it. The agent's real auth home (`~/.pillbox/global/auth/<agent>/`) is mounted read-write, without the env-fork or the ownership normalization runs apply to their clones, and the boot script lives in a separate scratch share, so nothing but the agent's own files lands there. It is the only launch whose egress sets `login: true`, which lets the guest reach the providers' OAuth token endpoints; `no_other_launch_builder_sets_login` fails if any other `EgressSpec` literal omits `login: false`. An agent with an OAuth callback port (claude 54545, pi/prime-agent 53692, override with `PILLBOX_<AGENT>_OAUTH_PORT`) gets a host listener on `127.0.0.1:<port>`, relayed over vsock to the guest's `vsock-forward`, so a busy port fails the login before boot.
+- `auth login` runs in a foreground libkrun microVM, never Docker; a build without libkrun refuses it. The agent's real auth home (`~/.pillbox/global/auth/<agent>/`) is mounted read-write, without the env-fork or the ownership normalization runs apply to their clones, and the boot script lives in a separate scratch share, so nothing but the agent's own files lands there. It is the only launch built with `EgressSpec::for_login`, which lets the guest reach the providers' OAuth token endpoints; the `login` field is private to `egress.rs`, so every other launch uses `EgressSpec::fence` and can't open them. The login VM stays foreground (`run_foreground_attached`): a reparented VM's commit guard scrubs every share, and this share is the real auth home. codex gets `SSL_CERT_FILE` pointed at the vault CA so its Rust TLS stack trusts the MITM. An agent with an OAuth callback port (claude 54545, pi/prime-agent 53692, override with `PILLBOX_<AGENT>_OAUTH_PORT`) gets a host listener on `127.0.0.1:<port>`, relayed over vsock to the guest's `vsock-forward`, so a busy port fails the login before boot.

@@ -59,8 +59,18 @@ impl PrivateRootfs {
     }
 
     pub(super) fn remove_stopped(&self) -> Result<()> {
-        remove_at(&self.root, self.root.parent().unwrap().parent().unwrap())
+        remove_stopped_root(&self.root)
     }
+}
+
+/// Remove a private root this process forked (its `vm-*/rootfs` path, as a
+/// launch's handle records it) once its VMM is confirmed stopped.
+pub(super) fn remove_stopped_root(root: &Path) -> Result<()> {
+    let runtimes = root
+        .parent()
+        .and_then(Path::parent)
+        .context("private rootfs namespace missing")?;
+    remove_at(root, runtimes)
 }
 
 impl Deref for PrivateRootfs {
@@ -74,6 +84,13 @@ pub(super) fn remove_owned(root: &Path) -> Result<()> {
     let raw_home = PathBuf::from(
         std::env::var_os("HOME").context("could not resolve $HOME for rootfs cleanup")?,
     );
+    remove_owned_under(root, &raw_home)
+}
+
+/// [`remove_owned`] against an explicit host home — for the VMM child, whose `HOME`
+/// is the guest's. Only a root inside `raw_home`'s private VM namespace is removed.
+pub(super) fn remove_owned_under(root: &Path, raw_home: &Path) -> Result<()> {
+    let raw_home = raw_home.to_path_buf();
     let krun = super::rootfs_backing::RootfsBacking::krun_dir_for_home(&raw_home)?;
     let canonical_home = krun
         .parent()
@@ -376,7 +393,6 @@ mod tests {
     #[test]
     #[ignore = "requires signed libkrun binary and freshly exported offline runner rootfs"]
     fn live_concurrent_and_successor_vm_roots_are_isolated() {
-        use std::process::Command;
         use std::time::{Duration, Instant};
         let binary = std::env::var_os("PILLBOX_ISOLATION_BINARY").expect("signed binary path");
         let base =
@@ -403,6 +419,7 @@ mod tests {
         let a_owner = a.root.parent().unwrap().to_path_buf();
         let b_owner = b.root.parent().unwrap().to_path_buf();
         let run = move |mut root: PrivateRootfs, script: &str, spec_path: PathBuf| {
+            let owner = super::super::repository::SupervisedOwner::bind().unwrap();
             let spec = super::super::VmSpec {
                 offline: false,
                 rootfs: root.to_string_lossy().into_owned(),
@@ -419,18 +436,17 @@ mod tests {
                 ],
                 vsock: Vec::new(),
                 egress: None,
-                ownership: None,
+                ownership: Some(owner.ownership()),
             };
-            let mut command = Command::new(&binary);
-            command
-                .arg("__krun-vmm")
-                .arg(&spec_path)
-                .env_clear()
-                .envs(super::super::boot::static_child_env());
+            fs::write(&spec_path, serde_json::to_vec(&spec).unwrap()).unwrap();
+            let mut command = super::super::session::vmm_command_for(
+                Path::new(&binary),
+                &spec_path,
+                super::super::session::VmmTether::Supervised,
+            );
             root.preserve();
             let output =
-                super::super::repository::run_supervised_vmm(&mut command, spec, &spec_path, b"[]")
-                    .unwrap();
+                super::super::repository::run_supervised_vmm(&mut command, owner, b"[]").unwrap();
             root.remove_stopped().unwrap();
             assert!(
                 output.status.success(),

@@ -2,14 +2,14 @@
 //! the agent's login under the in-guest `pty-host`, with the agent's real auth home
 //! as its read-write creds share (no env-fork: the login writes the credential).
 //!
-//! Its egress is the one launch that sets [`EgressSpec`](super::EgressSpec)`.login`,
-//! which opens the providers' OAuth token endpoints through the MITM; every run,
-//! session and sandbox launch leaves it false. A second vsock entry in
+//! Its egress is the one built by [`EgressSpec::for_login`], which opens the
+//! providers' OAuth token endpoints through the MITM; every run, session and
+//! sandbox launch builds [`EgressSpec::fence`], which keeps them rejected. A second vsock entry in
 //! [`VmSpec`](super::VmSpec)`.vsock` can relay an agent's loopback OAuth callback
 //! port. Shared launch helpers live in [`super::session`] (`pub(super)`).
 
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -23,9 +23,8 @@ use crate::attach::pump;
 use crate::pillbox::Pillbox;
 
 use super::session::{
-    accept_attach, confirm_vmm_stopped, disk_preflight, guest_launch_preamble, provision_vault_ca,
-    report_egress_refusals, sigabrt_boot_error, spawn_vmm, write_vm_spec, CaLifetime, VmmTether,
-    ATTACH_PORT, FORWARD_PORT,
+    disk_preflight, guest_launch_preamble, provision_vault_ca, run_foreground_attached,
+    rust_tls_ca_env, CaLifetime, OwnedPath, PendingVm, RemoveOnDrop, ATTACH_PORT, FORWARD_PORT,
 };
 use super::{
     boot, krun_cache_dir, materialize_rootfs, shell_quote, EgressSpec, Share, VmSpec, VsockAttach,
@@ -42,27 +41,29 @@ const GUEST_LOGIN_WORKSPACE: &str = "login";
 /// the credential sentinel and finalizes. `home` is `spec`'s real auth home.
 pub(crate) fn login(spec: &AgentSpec, resolved: &Pillbox, home: &Path) -> Result<i32> {
     disk_preflight()?;
-    let mut rootfs = materialize_rootfs(resolved)?;
+    let rootfs = materialize_rootfs(resolved)?;
     let ca = provision_vault_ca(resolved, CaLifetime::Ephemeral)?;
 
-    // Private, empty, and removed with their guards: the boot-script share and the
+    // Private, empty, and removed with the VM: the boot-script share and the
     // workspace the shared preamble mounts. The real auth home is never removed.
-    let boot_dir = tempfile::Builder::new()
-        .prefix("pillbox-login-boot-")
-        .tempdir()
-        .context("create login boot dir")?;
-    let workspace = tempfile::Builder::new()
-        .prefix("pillbox-login-ws-")
-        .tempdir()
-        .context("create login scratch workspace")?;
+    let scratch = |prefix: &str, what: &str| -> Result<OwnedPath> {
+        let dir = tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir()
+            .with_context(|| format!("create {what}"))?;
+        Ok(OwnedPath::new(dir.keep()))
+    };
+    let boot_dir = scratch("pillbox-login-boot-", "login boot dir")?;
+    let workspace = scratch("pillbox-login-ws-", "login scratch workspace")?;
 
     let cache = krun_cache_dir()?;
     std::fs::create_dir_all(&cache).with_context(|| format!("create {}", cache.display()))?;
     let id = uuid::Uuid::now_v7().simple().to_string();
     let attach_sock = cache.join(format!("attach-{id}.sock"));
     let forward_sock = cache.join(format!("login-fwd-{id}.sock"));
-    let _ = std::fs::remove_file(&attach_sock);
     let _ = std::fs::remove_file(&forward_sock);
+    // libkrun binds the callback socket for the guest's listener; it goes on every path.
+    let _forward_sock = RemoveOnDrop(forward_sock.clone());
 
     let oauth_port = spec.resolved_oauth_port();
     let egress_log = super::egress_log_path();
@@ -73,64 +74,32 @@ pub(crate) fn login(spec: &AgentSpec, resolved: &Pillbox, home: &Path) -> Result
         &LoginPaths {
             rootfs: &rootfs,
             home,
-            boot_dir: boot_dir.path(),
-            workspace: workspace.path(),
+            boot_dir: &boot_dir,
+            workspace: &workspace,
             attach_sock: &attach_sock,
             forward_sock: &forward_sock,
             ca_dir: &ca.dir,
             egress_log: egress_log.clone(),
         },
     )?;
-    let spec_file = write_vm_spec(&vmspec)?;
+    let mut vm = PendingVm::new(rootfs, workspace, boot_dir, &vmspec, attach_sock)?;
 
     // The host side of the OAuth callback: bound before boot so a busy port fails
-    // the login before a VM exists.
-    let relay = match oauth_port {
+    // the login before a VM exists. Stopped when dropped, on every path.
+    let _relay = match oauth_port {
         Some(port) => Some(CallbackRelay::start(port, forward_sock.clone())?),
         None => None,
     };
-    // libkrun (in the child) dials the attach socket when the guest pty-host
-    // connects out, so it must exist before boot.
-    let listener = UnixListener::bind(&attach_sock)
-        .with_context(|| format!("bind attach socket {}", attach_sock.display()))?;
-    listener.set_nonblocking(true).ok();
 
     eprintln!(
         "pillbox: libkrun backend — launching `{}` login in a microVM",
         spec.id
     );
+    // The login VM must stay Foreground: a reparented VM's CommitGuard scrubs every
+    // share on an abandoned launch, and this VM's creds share is the user's real auth home.
     // No swap pairs: the login holds no credential to swap, it mints one.
-    let mut child = spawn_vmm(spec_file.path(), VmmTether::Foreground, &[])?;
-    rootfs.preserve();
-
-    let outcome = match accept_attach(&listener, &mut child) {
-        Ok(stream) => stream
-            .try_clone()
-            .context("clone attach stream")
-            .and_then(|write_half| pump::attach_terminal(stream, write_half, false)),
-        Err(e) => Err(e),
-    };
-    let status = child
-        .wait()
-        .context("reap login VMM before rootfs cleanup")?;
-    if let Some(relay) = relay {
-        relay.stop();
-    }
-    confirm_vmm_stopped(&spec_file.path().to_string_lossy())?;
-    rootfs.remove_stopped()?;
-    // `home` is the user's real auth home: it is never removed here.
-    let _ = std::fs::remove_file(&attach_sock);
-    let _ = std::fs::remove_file(&forward_sock);
-    drop(spec_file);
-    drop(boot_dir);
-    drop(workspace);
-    report_egress_refusals(egress_log.as_deref());
-    if outcome.is_err() {
-        if let Some(deps_err) = sigabrt_boot_error(Some(status)) {
-            return Err(deps_err);
-        }
-    }
-    match outcome? {
+    let outcome = run_foreground_attached(&mut vm, &[], egress_log.as_deref(), &mut ())?;
+    match outcome {
         pump::Outcome::Exited(code) => Ok(code),
         pump::Outcome::Detached | pump::Outcome::Disconnected => {
             bail!("the login VM disconnected before `{}` exited", spec.id)
@@ -161,12 +130,13 @@ fn login_vm_spec(
     let guest_workspace = format!("{GUEST_WORKSPACE}/{GUEST_LOGIN_WORKSPACE}");
     let mut guest_env = boot::static_child_env();
     guest_env.push(("NODE_EXTRA_CA_CERTS".into(), super::GUEST_CA_PATH.into()));
+    guest_env.extend(rust_tls_ca_env(spec));
     let exports = boot::env_exports(&guest_env)?;
     let preamble = guest_launch_preamble(ca_cert_pem, &guest_workspace);
     let home_q = shell_quote(GUEST_HOME);
     let forward = match oauth_port {
         Some(port) => {
-            format!("pillbox vsock-forward --vsock-port {FORWARD_PORT} --to-port {port} & ")
+            format!("{} & ", boot::vsock_forward_cmd(FORWARD_PORT, port))
         }
         None => String::new(),
     };
@@ -179,7 +149,8 @@ fn login_vm_spec(
     let script = format!(
         "{exports}{preamble}; \
          mkdir -p {home_q}; mount -t virtiofs creds {home_q}; \
-         {forward}exec pillbox pty-host --vsock-port {ATTACH_PORT} -- {argv}"
+         {forward}exec {pty_host} {argv}",
+        pty_host = boot::pty_host_cmd(ATTACH_PORT, false),
     );
     // The real auth home keeps its host ownership: only disposable clones are normalized.
     let (boot_share, exec) = boot::boot_channel(
@@ -223,15 +194,11 @@ fn login_vm_spec(
         ],
         exec,
         vsock,
-        egress: Some(EgressSpec {
-            allowlist: login_allowlist(spec),
-            log_path: paths.egress_log.clone(),
-            ca_dir: Some(paths.ca_dir.to_string_lossy().into_owned()),
-            local_forward_port: None,
-            refresh: None,
-            // Only the auth-login VM may open the OAuth token endpoints; every other launch sets false.
-            login: true,
-        }),
+        egress: Some(EgressSpec::for_login(
+            login_allowlist(spec),
+            paths.egress_log.clone(),
+            Some(paths.ca_dir.to_string_lossy().into_owned()),
+        )),
     };
     Ok((vmspec, script))
 }
@@ -296,10 +263,13 @@ impl CallbackRelay {
         }
         Ok(Self { stop, threads })
     }
+}
 
-    fn stop(self) {
+impl Drop for CallbackRelay {
+    /// Stop accepting and release the port; in-flight relays finish on their own.
+    fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        for t in self.threads {
+        for t in std::mem::take(&mut self.threads) {
             let _ = t.join();
         }
     }
@@ -381,7 +351,7 @@ mod tests {
     fn claude_login_vm_opens_token_endpoints_mounts_the_real_home_and_forwards_the_callback() {
         let (vm, script, dir) = build(&CLAUDE, Some(54545));
         let egress = vm.egress.as_ref().unwrap();
-        assert!(egress.login);
+        assert!(egress.opens_token_endpoints());
         assert!(egress.refresh.is_none());
         assert!(egress.allowlist.iter().any(|h| h == "platform.claude.com"));
         let creds = vm.shares.iter().find(|s| s.tag == "creds").unwrap();
@@ -409,13 +379,33 @@ mod tests {
     }
 
     #[test]
+    fn dropping_the_callback_relay_releases_the_oauth_port() {
+        let port = TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let relay = super::CallbackRelay::start(port, PathBuf::from("/nonexistent.sock")).unwrap();
+        assert!(
+            TcpListener::bind(("127.0.0.1", port)).is_err(),
+            "relay holds the port"
+        );
+        drop(relay);
+        TcpListener::bind(("127.0.0.1", port)).expect("an early return frees the port");
+    }
+
+    #[test]
     fn login_without_an_oauth_port_has_no_callback_forward() {
         assert_eq!(CODEX.oauth_port, None);
         let (vm, script, _dir) = build(&CODEX, None);
-        assert!(vm.egress.as_ref().unwrap().login);
+        assert!(vm.egress.as_ref().unwrap().opens_token_endpoints());
         assert_eq!(vm.vsock.len(), 1);
         assert_eq!(vm.vsock[0].port, ATTACH_PORT);
         assert!(!script.contains("vsock-forward"));
+        // codex's Rust TLS trusts the login MITM only through SSL_CERT_FILE.
+        assert!(script.contains(&format!("SSL_CERT_FILE='{}'", super::super::GUEST_CA_PATH)));
+        let (_, claude_script, _dir) = build(&CLAUDE, None);
+        assert!(!claude_script.contains("SSL_CERT_FILE"));
         assert!(vm
             .egress
             .as_ref()
@@ -423,57 +413,5 @@ mod tests {
             .allowlist
             .iter()
             .any(|h| h == "auth.openai.com"));
-    }
-
-    /// Every `EgressSpec { .. }` literal outside this file sets `login: false`.
-    #[test]
-    fn no_other_launch_builder_sets_login() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut stack = vec![root];
-        let mut checked = 0;
-        while let Some(dir) = stack.pop() {
-            for entry in std::fs::read_dir(&dir).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
-                    stack.push(path);
-                    continue;
-                }
-                if path.extension().is_none_or(|e| e != "rs") || path.ends_with("libkrun/login.rs")
-                {
-                    continue;
-                }
-                let text = std::fs::read_to_string(&path).unwrap();
-                for (at, _) in text.match_indices("EgressSpec {") {
-                    if text[..at].ends_with("struct ") {
-                        continue;
-                    }
-                    let body = literal_body(&text[at..]);
-                    checked += 1;
-                    assert!(
-                        body.contains("login: false"),
-                        "{}: an EgressSpec literal must set `login: false`:\n{body}",
-                        path.display()
-                    );
-                }
-            }
-        }
-        assert!(checked >= 5, "found only {checked} EgressSpec literals");
-    }
-
-    fn literal_body(from: &str) -> &str {
-        let mut depth = 0;
-        for (i, c) in from.char_indices() {
-            match c {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return &from[..=i];
-                    }
-                }
-                _ => {}
-            }
-        }
-        from
     }
 }

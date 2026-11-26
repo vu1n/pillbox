@@ -85,18 +85,17 @@ fn spec(
             host_sock: rpc.to_string_lossy().into_owned(),
             listen: false,
         }],
-        egress: Some(EgressSpec {
-            allowlist: vec![PROVIDER_HOST.into()],
-            log_path: None,
-            ca_dir: Some(ca.to_string_lossy().into_owned()),
-            local_forward_port: None,
-            refresh: Some(RefreshSpec {
+        egress: Some(EgressSpec::fence(
+            vec![PROVIDER_HOST.into()],
+            None,
+            Some(ca.to_string_lossy().into_owned()),
+            None,
+            Some(RefreshSpec {
                 creds_path: input.refresh_credentials.to_string_lossy().into_owned(),
                 auth_id: "claude".into(),
                 access_stub: input.credentials.stub.clone(),
             }),
-            login: false,
-        }),
+        )),
         ownership: Some(OwnershipSpec::bounded(owner, remaining)),
     }
 }

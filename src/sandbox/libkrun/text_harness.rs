@@ -173,14 +173,13 @@ fn spec(
             listen: false,
         }],
         // Only the provider host resolves.
-        egress: Some(EgressSpec {
-            allowlist: vec![host.into()],
-            log_path: None,
-            ca_dir: Some(ca_dir.to_string_lossy().into_owned()),
-            local_forward_port: None,
-            refresh: None,
-            login: false,
-        }),
+        egress: Some(EgressSpec::fence(
+            vec![host.into()],
+            None,
+            Some(ca_dir.to_string_lossy().into_owned()),
+            None,
+            None,
+        )),
         ownership: Some(repository::OwnershipSpec::bounded(owner, remaining_ms)),
     }
 }

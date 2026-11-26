@@ -71,6 +71,7 @@ use crate::agents::AgentSpec;
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
 use crate::workspace::cow::{cow_clone_dir, CloneMethod};
+use egress::EgressSpec;
 
 /// libkrun C API bindings — the single home for the `unsafe extern "C"`
 /// signatures (header: `/opt/homebrew/include/libkrun.h`; linked + rpath'd by
@@ -149,37 +150,6 @@ struct VmSpec {
     /// whenever no virtio-net device is attached. Set for an offline grader.
     #[serde(default)]
     offline: bool,
-}
-
-#[derive(Serialize, Deserialize)]
-struct EgressSpec {
-    /// DNS-fence allowlist: only these hosts resolve; everything else NXDOMAINs.
-    allowlist: Vec<String>,
-    /// Host-side diagnostics file (the guest console eats the child's stderr):
-    /// `PILLBOX_KRUN_EGRESS_LOG`, else one per run under `~/.pillbox/krun/egress/`
-    /// ([`egress_log_path`]). `None` falls back to stderr.
-    log_path: Option<String>,
-    /// Host path of the vault CA dir. When set, the child loads the CA (key stays
-    /// host-side) to mint per-SNI MITM leaves; `None` = DNS-fence only.
-    ca_dir: Option<String>,
-    /// Opt-in local-model forward: relay `gateway:PORT` → host `127.0.0.1:PORT`
-    /// (e.g. ollama on 11434), so a guest agent reaches a model the host runs.
-    /// Deliberately punches the default-deny fence; set only when a local worker
-    /// is requested. `None` = no forward. See [`super::local_forward`].
-    #[serde(default)]
-    local_forward_port: Option<u16>,
-    /// Broker JIT refresh: when set, the in-VMM MITM rotates the real OAuth token near
-    /// its expiry (the guest never refreshes — far-future stub expiry) and splices the
-    /// fresh token into the live swap, so a session outliving the token lifetime keeps
-    /// working. Non-secret (a path + agent id + the public access stub); the real token
-    /// is read host-side by the child. `None` = no JIT (non-vault / non-broker agent).
-    #[serde(default)]
-    refresh: Option<RefreshSpec>,
-    /// `pillbox auth login` only: let the guest reach the providers' OAuth token
-    /// endpoints, which the MITM otherwise rejects locally (a login must mint the
-    /// credential there). Defaults false; only the login launch sets it.
-    #[serde(default)]
-    login: bool,
 }
 
 /// Serde form of the broker-JIT context handed to the VMM child in the spec file
@@ -269,7 +239,7 @@ pub(crate) fn vmm_child_main() -> ! {
             std::process::exit(2);
         }
     };
-    let spec: VmSpec = match serde_json::from_str(&raw) {
+    let mut spec: VmSpec = match serde_json::from_str(&raw) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("krun-vmm: parse spec {spec_path}: {e}");
@@ -321,17 +291,7 @@ pub(crate) fn vmm_child_main() -> ! {
         .collect();
     // Egress: a passt socketpair — one end to libkrun's virtio-net, the other to
     // our userspace stack (which the child runs in a thread beside the VM).
-    struct NetAttach {
-        libkrun_fd: c_int,
-        host_fd: c_int,
-        allowlist: Vec<String>,
-        ca_dir: Option<String>,
-        log_path: Option<String>,
-        local_forward_port: Option<u16>,
-        refresh: Option<RefreshSpec>,
-        login: bool,
-    }
-    let net: Option<NetAttach> = spec.egress.as_ref().map(|e| {
+    let net: Option<(c_int, c_int, EgressSpec)> = spec.egress.take().map(|e| {
         let mut fds = [0 as c_int; 2];
         if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) } != 0 {
             eprintln!(
@@ -340,16 +300,7 @@ pub(crate) fn vmm_child_main() -> ! {
             );
             std::process::exit(1);
         }
-        NetAttach {
-            libkrun_fd: fds[0],
-            host_fd: fds[1],
-            allowlist: e.allowlist.clone(),
-            ca_dir: e.ca_dir.clone(),
-            log_path: e.log_path.clone(),
-            local_forward_port: e.local_forward_port,
-            refresh: e.refresh.clone(),
-            login: e.login,
-        }
+        (fds[0], fds[1], e)
     });
     // Read the stub→real credential pairs the parent pipes on stdin (the env-fork
     // channel — reals arrive out-of-band, never in the guest env/argv/VmSpec).
@@ -394,11 +345,11 @@ pub(crate) fn vmm_child_main() -> ! {
                 ffi::krun_add_vsock_port(ctx, *port, host_sock.as_ptr())
             });
         }
-        if let Some(n) = net.as_ref() {
+        if let Some((libkrun_fd, _, _)) = net.as_ref() {
             rc = rc.min(ffi::krun_add_net_unixstream(
                 ctx,
                 std::ptr::null(),
-                n.libkrun_fd,
+                *libkrun_fd,
                 egress::GUEST_MAC.as_ptr(),
                 0,
                 0,
@@ -417,23 +368,8 @@ pub(crate) fn vmm_child_main() -> ! {
         // Run the userspace egress stack on our end of the socketpair before the
         // VM boots, so it's servicing frames the moment the guest's NIC comes up.
         // The thread dies when start_enter exit()s this process on VM shutdown.
-        if let Some(n) = net {
-            std::thread::spawn(move || {
-                egress::run(
-                    n.host_fd,
-                    n.allowlist,
-                    n.ca_dir,
-                    swap_pairs,
-                    n.log_path,
-                    n.local_forward_port,
-                    n.refresh.map(|r| jit_refresh::RefreshCtx {
-                        creds_path: r.creds_path.into(),
-                        auth_id: r.auth_id,
-                        access_stub: r.access_stub.into_bytes(),
-                    }),
-                    n.login,
-                )
-            });
+        if let Some((_, host_fd, egress)) = net {
+            std::thread::spawn(move || egress::run(host_fd, egress, swap_pairs));
         }
         // Arm the self-destruct watcher just before boot: it self-destructs an
         // abandoned launch (launcher gone before the record commits). On commit it
@@ -490,6 +426,9 @@ struct CommitGuard {
     /// share clones, every vsock host socket) — the disk side of the leak. Mirrors what
     /// `kill_session` scrubs for a recorded session.
     scrub: Vec<std::path::PathBuf>,
+    /// The VM's private rootfs clone and the host home that owns it (the VMM's own
+    /// `HOME` is the guest's). Removed on self-destruct under the `remove_owned` rule.
+    rootfs: Option<(std::path::PathBuf, std::path::PathBuf)>,
 }
 
 impl CommitGuard {
@@ -501,20 +440,24 @@ impl CommitGuard {
         let owner = std::env::var("PILLBOX_COMMIT_OWNER_PID").ok();
         let record = std::env::var("PILLBOX_COMMIT_RECORD").ok();
         let deadline = std::env::var("PILLBOX_COMMIT_DEADLINE").ok();
+        let home = std::env::var_os("PILLBOX_COMMIT_HOME");
         for k in [
             "PILLBOX_COMMIT_OWNER_PID",
             "PILLBOX_COMMIT_RECORD",
             "PILLBOX_COMMIT_DEADLINE",
+            "PILLBOX_COMMIT_HOME",
         ] {
             std::env::remove_var(k);
         }
-        Self::new(
+        let mut guard = Self::new(
             spec,
             spec_path,
             owner.as_deref(),
             record.as_deref(),
             deadline.as_deref(),
-        )
+        )?;
+        guard.rootfs = home.map(|home| (std::path::PathBuf::from(&spec.rootfs), home.into()));
+        Some(guard)
     }
 
     /// Build from the raw `PILLBOX_COMMIT_*` values; `None` when any is absent or
@@ -545,6 +488,7 @@ impl CommitGuard {
             record_path: std::path::PathBuf::from(record_path),
             deadline: std::time::Duration::from_secs(deadline_secs),
             scrub,
+            rootfs: None,
         })
     }
 
@@ -576,11 +520,26 @@ impl CommitGuard {
                         self.record_path.display(),
                         self.owner_pid
                     );
-                    for p in &self.scrub {
-                        let _ = std::fs::remove_file(p).or_else(|_| std::fs::remove_dir_all(p));
-                    }
+                    self.scrub_abandoned();
                     std::process::exit(70);
                 }
+            }
+        }
+    }
+}
+
+impl CommitGuard {
+    /// Remove what an abandoned launch left on disk: the scrub list, then the private
+    /// rootfs clone. Best-effort — the VMM exits next either way.
+    fn scrub_abandoned(&self) {
+        for p in &self.scrub {
+            let _ = std::fs::remove_file(p).or_else(|_| std::fs::remove_dir_all(p));
+        }
+        // Only a root inside the host home's private VM namespace is removed — the
+        // same rule `session rm` applies to a recorded rootfs.
+        if let Some((root, home)) = &self.rootfs {
+            if let Err(e) = rootfs::remove_owned_under(root, home) {
+                eprintln!("krun-vmm: left private rootfs {}: {e:#}", root.display());
             }
         }
     }
@@ -1753,7 +1712,7 @@ mod tests {
         // open the token endpoints or invent a vsock channel.
         let egress: super::EgressSpec =
             serde_json::from_str(r#"{"allowlist":[],"log_path":null,"ca_dir":null}"#).unwrap();
-        assert!(!egress.login);
+        assert!(!egress.opens_token_endpoints());
         let spec: super::VmSpec = serde_json::from_str(
             r#"{"rootfs":"/r","vcpus":1,"ram_mib":256,"shares":[],"exec":["/bin/true"],"egress":null}"#,
         )
@@ -1799,7 +1758,66 @@ mod tests {
             record_path: rec.path().to_path_buf(),
             deadline: std::time::Duration::from_secs(5),
             scrub: Vec::new(),
+            rootfs: None,
         };
         guard.watch();
+    }
+
+    #[test]
+    fn an_abandoned_launch_removes_its_private_rootfs_and_nothing_outside_the_namespace() {
+        crate::test_util::with_isolated_home("commit-guard-rootfs", || {
+            let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+            let krun = super::rootfs_backing::RootfsBacking::krun_dir_for_home(&home).unwrap();
+            // A legacy-namespace clone needs no mounted backing, so this runs anywhere.
+            let root = krun.join("vm-rootfs/vm-abandoned/rootfs");
+            std::fs::create_dir_all(root.join("etc")).unwrap();
+            std::fs::write(root.join("etc/hostname"), b"guest").unwrap();
+            let outside = home.join("not-a-vm/rootfs");
+            std::fs::create_dir_all(&outside).unwrap();
+
+            let spec_file = home.join("spec.json");
+            std::fs::write(&spec_file, b"{}").unwrap();
+            let spec: super::VmSpec = serde_json::from_str(&format!(
+                r#"{{"rootfs":{:?},"vcpus":1,"ram_mib":256,"shares":[],"exec":["/bin/true"],"egress":null}}"#,
+                root.to_str().unwrap()
+            ))
+            .unwrap();
+            let mut guard = super::CommitGuard::new(
+                &spec,
+                spec_file.to_str().unwrap(),
+                Some("1"),
+                Some("/nonexistent/record.toml"),
+                Some("5"),
+            )
+            .unwrap();
+            guard.rootfs = Some((std::path::PathBuf::from(&spec.rootfs), home.clone()));
+            guard.scrub_abandoned();
+            assert!(!spec_file.exists(), "spec scrubbed");
+            assert!(!root.parent().unwrap().exists(), "private rootfs removed");
+
+            guard.rootfs = Some((outside.clone(), home.clone()));
+            guard.scrub_abandoned();
+            assert!(outside.exists(), "a root outside the namespace is refused");
+        });
+    }
+
+    #[test]
+    fn the_commit_guard_takes_the_host_home_from_its_own_env_var_and_clears_it() {
+        crate::test_util::with_isolated_home("commit-guard-env", || {
+            let spec: super::VmSpec = serde_json::from_str(
+                r#"{"rootfs":"/r/vm-x/rootfs","vcpus":1,"ram_mib":256,"shares":[],"exec":["/bin/true"],"egress":null}"#,
+            )
+            .unwrap();
+            std::env::set_var("PILLBOX_COMMIT_OWNER_PID", "1");
+            std::env::set_var("PILLBOX_COMMIT_RECORD", "/r/record.toml");
+            std::env::set_var("PILLBOX_COMMIT_DEADLINE", "5");
+            std::env::set_var("PILLBOX_COMMIT_HOME", "/host/home");
+            let guard = super::CommitGuard::from_env(&spec, "/s").unwrap();
+            assert_eq!(
+                guard.rootfs,
+                Some(("/r/vm-x/rootfs".into(), "/host/home".into()))
+            );
+            assert!(std::env::var_os("PILLBOX_COMMIT_HOME").is_none());
+        });
     }
 }

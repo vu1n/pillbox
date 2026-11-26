@@ -82,19 +82,10 @@ pub(crate) fn run_vsock(port: u32, listen: bool, argv: &[String]) -> Result<()> 
     let session = spawn_pty_session(argv)?;
 
     if listen {
-        let lfd = vsock_listen(port)?;
         // Accept reattach clients one at a time; the agent (and its screen) live in
-        // `session` across them. On an accept error, back off + retry rather than
-        // return — returning here would drop `session` and kill a live agent; the
-        // agent's own exit (reader thread → process::exit) is the real terminator.
-        loop {
-            let cfd = unsafe { libc::accept(lfd, std::ptr::null_mut(), std::ptr::null_mut()) };
-            if cfd < 0 {
-                std::thread::sleep(Duration::from_millis(100));
-                continue;
-            }
-            session.serve_blocking(unsafe { UnixStream::from_raw_fd(cfd) });
-        }
+        // `session` across them. The agent's own exit (reader thread →
+        // process::exit) is the real terminator.
+        return vsock_serve(port, |conn| session.serve_blocking(conn));
     }
 
     // Dial the host, retrying only until the bridge + parent listener are ready
@@ -121,13 +112,32 @@ pub(crate) fn run_vsock(port: u32, listen: bool, argv: &[String]) -> Result<()> 
     Ok(())
 }
 
+/// Listen on guest vsock `port` and hand every accepted connection to `handler`,
+/// forever. An accept error backs off and retries rather than returning: the
+/// caller's process (a live agent, a relay) must not end because one accept
+/// failed. Shared by the detach reattach loop ([`run_vsock`]), the port-forward
+/// relay ([`run_vsock_forward`]), and the sandbox `exec-host`
+/// ([`crate::sandbox::exec_channel::run_exec_host`]).
+#[cfg(target_os = "linux")]
+pub(crate) fn vsock_serve(port: u32, mut handler: impl FnMut(UnixStream)) -> Result<()> {
+    use std::os::unix::io::FromRawFd;
+    let lfd = vsock_listen(port)?;
+    loop {
+        let cfd = unsafe { libc::accept(lfd, std::ptr::null_mut(), std::ptr::null_mut()) };
+        if cfd < 0 {
+            thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        // SAFETY: `cfd` is a freshly accepted socket this stream now solely owns.
+        handler(unsafe { UnixStream::from_raw_fd(cfd) });
+    }
+}
+
 /// Bind + listen a guest-side vsock listener on `port` (CID_ANY). libkrun binds
 /// the host side (`krun_add_vsock_port2` listen=true); the host dials it.
-/// Shared by the detach reattach loop ([`run_vsock`]), the opencode
-/// port-forward relay ([`run_vsock_forward`]), and the sandbox `exec-host`
-/// ([`crate::sandbox::exec_channel::run_exec_host`]). Returns the listening fd.
+/// Returns the listening fd.
 #[cfg(target_os = "linux")]
-pub(crate) fn vsock_listen(port: u32) -> Result<i32> {
+fn vsock_listen(port: u32) -> Result<i32> {
     const VMADDR_CID_ANY: u32 = 0xffff_ffff;
     let lfd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) };
     if lfd < 0 {
@@ -155,17 +165,9 @@ pub(crate) fn vsock_listen(port: u32) -> Result<i32> {
 /// surface in the guest. Blocks forever (the VM teardown kills it).
 #[cfg(target_os = "linux")]
 pub(crate) fn run_vsock_forward(port: u32, to_port: u16) -> Result<()> {
-    use std::os::unix::io::FromRawFd;
-    let lfd = vsock_listen(port)?;
-    loop {
-        let cfd = unsafe { libc::accept(lfd, std::ptr::null_mut(), std::ptr::null_mut()) };
-        if cfd < 0 {
-            std::thread::sleep(Duration::from_millis(100));
-            continue;
-        }
-        let client = unsafe { UnixStream::from_raw_fd(cfd) };
+    vsock_serve(port, |client| {
         thread::spawn(move || forward_conn(client, to_port));
-    }
+    })
 }
 
 /// Bridge one client connection to `127.0.0.1:<to_port>`, copying both ways

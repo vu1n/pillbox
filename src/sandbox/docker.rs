@@ -221,7 +221,13 @@ impl SandboxBackend for DockerBackend {
             None
         };
 
-        let env_vars = resolve_run_env(resolved, &opts, &withs_resolved, vault_session.as_mut())?;
+        let env_vars = resolve_run_env(
+            resolved,
+            &opts.env_bundles,
+            &opts.env_files,
+            &withs_resolved,
+            vault_session.as_mut(),
+        )?;
         startup.mark("env_prepare");
 
         // Bind `mcp` (rather than letting the expression be the

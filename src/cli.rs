@@ -74,10 +74,11 @@ pub(crate) enum SandboxAction {
         /// (`[runner] image` in pillbox.toml). Passing it is a usage error.
         #[arg(long, value_name = "IMAGE", hide = true)]
         image: Option<String>,
-        /// Provision for an agent harness (`claude` | `cursor` | `pi`): its
-        /// credentials are env-forked (the guest gets stubs) and commands run
-        /// as uid 1000 so the agent channel can drive it headlessly. Omit for
-        /// a bare exec-only sandbox (commands run as root).
+        /// Provision for an agent harness (`claude` today: only an env-forked
+        /// agent with a stdout adapter qualifies, so the guest never holds a
+        /// real credential). Commands then run as uid 1000 so the agent channel
+        /// can drive it headlessly. Omit for a bare exec-only sandbox (commands
+        /// run as root).
         #[arg(long, value_name = "AGENT")]
         agent: Option<String>,
         /// Host directory the sandbox's workspace clone is taken from (default: cwd).

@@ -4,7 +4,8 @@
 //! substrate in [`super`]: building the launch packet ([`prepare_launch`] /
 //! [`launch_base`]), the [`SandboxBackend::run`] entry (foreground PTY pump,
 //! `--detach`, and the opencode server path), reattach/kill, and the §0/opencode
-//! accessors `commands::session` calls. The VMM child entry, the spec types, and
+//! accessors `commands::session` calls. `login` and `sandbox_vm` reuse its launch
+//! prologue, VMM spawn ([`spawn_vmm`]) and teardown ([`teardown_handle`]). The VMM child entry, the spec types, and
 //! the CoW/stub/rootfs helpers stay in [`super`] (shared with `vmm_child_main`).
 // The microVM owns egress in userspace; the guest never holds the real credential.
 
@@ -136,41 +137,23 @@ impl SandboxBackend for LibkrunBackend {
         );
 
         // Spawn the VMM child (it becomes the VM), attach over vsock + pump the
-        // terminal, then reap + tear down. `env_clear` + the static base so the
-        // kernel cmdline (which carries the child's env) stays printable-ASCII;
-        // the composed guest env rides the boot script, the real creds stdin.
+        // terminal, then reap + tear down.
         eprintln!(
             "pillbox: libkrun backend — launching `{}` in a microVM",
             spec.id
         );
-        let exe = std::env::current_exe().context("locate the pillbox binary to re-exec as VMM")?;
         // Bind the attach listener BEFORE booting: libkrun (in the child) dials it
         // when the guest pty-host connects out, so it must already exist.
         let listener = UnixListener::bind(&launch.attach_sock)
             .with_context(|| format!("bind attach socket {}", launch.attach_sock.display()))?;
         listener.set_nonblocking(true).ok();
 
-        let mut cmd = Command::new(&exe);
-        cmd.arg("__krun-vmm")
-            .arg(launch.spec_file.path())
-            .env_clear()
-            .envs(boot::static_child_env())
-            .stdin(std::process::Stdio::piped());
-        // No `setsid` here: a foreground run reaps its VMM synchronously via
-        // `child.wait` + the teardown below, and putting it in its own session
-        // would orphan it on a Ctrl-C in the boot window (before the pump's raw
-        // mode forwards signals in-band). setsid is for the detached spawns only.
-        let mut child = cmd.spawn().context("spawn the libkrun VMM subprocess")?;
+        let mut child = spawn_vmm(
+            launch.spec_file.path(),
+            VmmTether::Foreground,
+            &launch.swap_pairs,
+        )?;
         launch.rootfs.preserve();
-
-        // Hand the real credentials to the child's MITM out-of-band on stdin — the
-        // reals never touch the guest env, argv, or the VmSpec file. Closing the
-        // pipe (drop) signals EOF so the child's read completes.
-        if let Some(mut sin) = child.stdin.take() {
-            let blob = serde_json::to_string(&launch.swap_pairs).unwrap_or_else(|_| "[]".into());
-            use std::io::Write as _;
-            let _ = sin.write_all(blob.as_bytes());
-        }
         startup.mark("vmm_spawn");
 
         // Poll the listener until the guest pty-host dials in (across VM boot), then
@@ -335,16 +318,17 @@ pub(super) fn guest_launch_preamble(ca_cert_pem: &str, guest_workspace: &str) ->
     )
 }
 
-/// The launch prologue shared by both libkrun paths — `prepare_launch` (PTY
-/// agents) and `run_server` (opencode): materialize the rootfs, check the creds
-/// exist, CoW + secret-scrub the workspace, compose the guest env (base vars +
-/// bundles/`--with`, no vault layer), and ensure the vault CA (cert trusted in
-/// the guest via `NODE_EXTRA_CA_CERTS` + the preamble; key stays host-side). Kept
-/// in one place because it's security-sensitive setup the two paths must not let
-/// drift; they diverge *after* this on creds (stub vs raw), entrypoint, and VmSpec.
+/// The launch prologue shared by every libkrun agent and sandbox launch — PTY
+/// ([`prepare_launch`]), server ([`launch_server_vm`]), structured
+/// ([`run_structured`]) and `sandbox spawn`: materialize the rootfs, CoW +
+/// secret-scrub the workspace, compose the guest env (base vars + bundles/`--with`,
+/// no vault layer), and ensure the vault CA (cert trusted in the guest via
+/// `NODE_EXTRA_CA_CERTS` + the preamble; key stays host-side). Kept in one place
+/// because it's security-sensitive setup the paths must not let drift; they
+/// diverge *after* this on creds (stub vs raw vs none), entrypoint, and VmSpec.
+/// The credential check is [`authenticated_home`], which agent launches run first.
 pub(super) struct LaunchBase {
     pub(super) rootfs: super::rootfs::PrivateRootfs,
-    pub(super) home: PathBuf,
     pub(super) workspace_clone: PathBuf,
     pub(super) guest_workspace: String,
     pub(super) guest_env: Vec<(String, String)>,
@@ -424,8 +408,43 @@ fn alt_auth_configured(resolved: &Pillbox, opts: &RunOpts, env_var: &str) -> Res
     Ok(env.get(env_var).is_some_and(|value| !value.is_empty()))
 }
 
-pub(super) fn launch_base(
+/// The agent's auth home, refusing the launch (as `verb`) when it holds no stored
+/// credential and no configured alternate auth env var. Runs before [`launch_base`]
+/// so a missing login fails before any rootfs or clone exists.
+pub(super) fn authenticated_home(
     spec: &AgentSpec,
+    opts: &RunOpts,
+    resolved: &Pillbox,
+    verb: &'static str,
+) -> Result<PathBuf> {
+    let home = spec.home_dir(resolved)?;
+    if home.join(spec.cred_sentinel).exists() {
+        return Ok(home);
+    }
+    let alt_env = spec.structured.and_then(|p| p.alt_auth_env);
+    if let Some(var) = alt_env {
+        if alt_auth_configured(resolved, opts, var)? {
+            return Ok(home);
+        }
+    }
+    let next = match alt_env {
+        Some(var) => format!(
+            "pillbox auth login --agent {}   # or: pillbox secret add {var} && run with --with {var}",
+            spec.id
+        ),
+        None => format!("pillbox auth login --agent {}", spec.id),
+    };
+    Err(
+        PillboxError::runtime(verb, format!("no stored credentials for `{}`", spec.id))
+            .with_next(next)
+            .into(),
+    )
+}
+
+/// `agent` is the launch's agent, `None` for a bare sandbox; it decides whether
+/// vaulted `--with` secrets are allowed and mints their stubs.
+pub(super) fn launch_base(
+    agent: Option<&AgentSpec>,
     opts: &RunOpts,
     resolved: &Pillbox,
     ca_lifetime: CaLifetime,
@@ -435,29 +454,6 @@ pub(super) fn launch_base(
     // half-allocated rather than failing — so refuse loudly here, before any clone.
     disk_preflight()?;
     let rootfs = materialize_rootfs(resolved)?;
-
-    let home = spec.home_dir(resolved)?;
-    if !home.join(spec.cred_sentinel).exists() {
-        let alt_ok = match spec.structured.and_then(|p| p.alt_auth_env) {
-            Some(var) => alt_auth_configured(resolved, opts, var)?,
-            None => false,
-        };
-        if !alt_ok {
-            let next = match spec.structured.and_then(|p| p.alt_auth_env) {
-                Some(var) => format!(
-                    "pillbox auth login --agent {}   # or: pillbox secret add {var} && run with --with {var}",
-                    spec.id
-                ),
-                None => format!("pillbox auth login --agent {}", spec.id),
-            };
-            return Err(PillboxError::runtime(
-                "run",
-                format!("no stored credentials for `{}`", spec.id),
-            )
-            .with_next(next)
-            .into());
-        }
-    }
 
     let workspace_host = match &opts.workspace {
         Some(p) => p.clone(),
@@ -504,13 +500,16 @@ pub(super) fn launch_base(
     let (vaulted, plain): (Vec<_>, Vec<_>) = resolve_with_entries(resolved, &opts.withs)?
         .into_iter()
         .partition(|w| w.meta.is_some());
-    if !vaulted.is_empty() && !spec.vault_capable {
+    let vault_agent = agent.filter(|spec| spec.vault_capable);
+    if !vaulted.is_empty() && vault_agent.is_none() {
         let names: Vec<&str> = vaulted.iter().map(|w| w.secret_name.as_str()).collect();
+        let who = agent.map_or("a sandbox without an agent".to_string(), |spec| {
+            format!("agent `{}`", spec.id)
+        });
         return Err(PillboxError::usage(
             "run",
             format!(
-                "agent `{}` does not support the vault, so it can't use vaulted secret(s): {}",
-                spec.id,
+                "{who} does not support the vault, so it can't use vaulted secret(s): {}",
                 names.join(", ")
             ),
         )
@@ -525,32 +524,35 @@ pub(super) fn launch_base(
     // real reaches only the in-child MITM via stdin; the host allowlist binds the
     // swap to its destination (the guard in `prepare_launch` fails loud otherwise).
     let mut with_vault = Vec::with_capacity(vaulted.len());
-    for w in &vaulted {
-        let real = crate::secrets::read(resolved, &w.secret_name)?
-            .ok_or_else(|| {
-                PillboxError::runtime("run", format!("secret `{}` not found", w.secret_name))
-                    .with_next(format!("pillbox secret add {}", w.secret_name))
-            })?
-            .trim_end()
-            .to_string();
-        let meta = w.meta.as_ref().expect("partitioned into vaulted");
-        // Mint the stub from the secret's *declared* prefix, never from the real
-        // value: deriving a prefix off `real` would copy body bytes into the stub
-        // for keys whose public prefix isn't exactly 3 hyphen-segments (OpenAI
-        // `sk-proj-…`, `sk-svcacct-…`), and that stub lands in the guest env. The
-        // curated prefix also keeps the stub format-valid (e.g. GitHub `ghp_…`) so
-        // in-guest SDK validators accept it. (Matches the docker host-side path.)
-        let stub = crate::vault::providers::mint_stub(&meta.vault.prefix, spec.id);
-        guest_env.push((w.env_var.clone(), stub.clone()));
-        with_vault.push(WithSwap {
-            swap: SwapPair {
-                stub,
-                real,
-                // Bound to this secret's declared host — the swap fires only there.
-                hosts: vec![meta.vault.host.clone()],
-            },
-            host: meta.vault.host.clone(),
-        });
+    // `vaulted` is non-empty only with a vault-capable agent (refused above).
+    if let Some(spec) = vault_agent {
+        for w in &vaulted {
+            let real = crate::secrets::read(resolved, &w.secret_name)?
+                .ok_or_else(|| {
+                    PillboxError::runtime("run", format!("secret `{}` not found", w.secret_name))
+                        .with_next(format!("pillbox secret add {}", w.secret_name))
+                })?
+                .trim_end()
+                .to_string();
+            let meta = w.meta.as_ref().expect("partitioned into vaulted");
+            // Mint the stub from the secret's *declared* prefix, never from the real
+            // value: deriving a prefix off `real` would copy body bytes into the stub
+            // for keys whose public prefix isn't exactly 3 hyphen-segments (OpenAI
+            // `sk-proj-…`, `sk-svcacct-…`), and that stub lands in the guest env. The
+            // curated prefix also keeps the stub format-valid (e.g. GitHub `ghp_…`) so
+            // in-guest SDK validators accept it. (Matches the docker host-side path.)
+            let stub = crate::vault::providers::mint_stub(&meta.vault.prefix, spec.id);
+            guest_env.push((w.env_var.clone(), stub.clone()));
+            with_vault.push(WithSwap {
+                swap: SwapPair {
+                    stub,
+                    real,
+                    // Bound to this secret's declared host — the swap fires only there.
+                    hosts: vec![meta.vault.host.clone()],
+                },
+                host: meta.vault.host.clone(),
+            });
+        }
     }
 
     let ca = provision_vault_ca(resolved, ca_lifetime)?;
@@ -564,7 +566,6 @@ pub(super) fn launch_base(
 
     Ok(LaunchBase {
         rootfs,
-        home,
         workspace_clone,
         guest_workspace,
         guest_env,
@@ -584,15 +585,15 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
     } else {
         CaLifetime::Ephemeral
     };
+    let home = authenticated_home(spec, opts, resolved, "run")?;
     let LaunchBase {
         rootfs,
-        home,
         workspace_clone: clone,
         guest_workspace,
         guest_env,
         ca,
         with_vault,
-    } = launch_base(spec, opts, resolved, ca_lifetime)?;
+    } = launch_base(Some(spec), opts, resolved, ca_lifetime)?;
 
     // Pre-accept the agent's workspace-trust dialog on the live auth home before
     // boot (claude); operates on host paths, like the docker path.
@@ -681,12 +682,7 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
             login: false,
         }),
     };
-    let spec_file = tempfile::Builder::new()
-        .prefix("pillbox-krun-spec-")
-        .suffix(".json")
-        .tempfile()
-        .context("create VMM spec tempfile")?;
-    serde_json::to_writer(&spec_file, &vmspec).context("write VMM spec")?;
+    let spec_file = write_vm_spec(&vmspec)?;
 
     Ok(Launch {
         rootfs,
@@ -705,11 +701,11 @@ fn prepare_launch(spec: &AgentSpec, opts: &RunOpts, resolved: &Pillbox) -> Resul
 /// clone the guest mounts, the stub→real swaps for the in-VMM MITM (fed on the
 /// child's stdin, never the guest), the vaulted `--with` hosts for the egress
 /// allowlist, and the broker JIT refresh context.
-pub(super) struct EnvFork {
-    pub(super) creds_share: PathBuf,
-    pub(super) swap_pairs: Vec<SwapPair>,
-    pub(super) with_hosts: Vec<String>,
-    pub(super) refresh: Option<RefreshSpec>,
+struct EnvFork {
+    creds_share: PathBuf,
+    swap_pairs: Vec<SwapPair>,
+    with_hosts: Vec<String>,
+    refresh: Option<RefreshSpec>,
 }
 
 /// The env-fork shared by every libkrun launch of a vault-capable agent (the
@@ -718,7 +714,7 @@ pub(super) struct EnvFork {
 /// fail closed when the stubbing can't be host-bound or produced nothing, and
 /// fold the vaulted `--with` swaps in. `prepare_clone` runs on the stubbed clone
 /// before the fail-closed guard (PTY agents' clone preparation).
-pub(super) fn env_fork_creds(
+fn env_fork_creds(
     spec: &AgentSpec,
     home: &Path,
     with_vault: Vec<WithSwap>,
@@ -841,13 +837,67 @@ pub(super) fn ensure_env_fork_sealed(
 /// intercept set (API + OAuth/platform hosts; token endpoints remain intercepted
 /// for local rejection), any invoker-declared `--egress-allow` hosts (forwarded,
 /// no swap), and the vaulted `--with` hosts (the swap's destination).
-pub(super) fn vault_egress_allowlist(opts: &RunOpts, with_hosts: &[String]) -> Vec<String> {
+fn vault_egress_allowlist(opts: &RunOpts, with_hosts: &[String]) -> Vec<String> {
     crate::vault::providers::intercepted_hosts()
         .into_iter()
         .map(str::to_string)
         .chain(opts.egress_allow.iter().cloned())
         .chain(with_hosts.iter().cloned())
         .collect()
+}
+
+/// [`vault_egress_allowlist`] plus the standard egress hosts: the fence for a
+/// launch holding no vaulted credential (a non-vault agent, a bare sandbox).
+pub(super) fn standard_allowlist(opts: &RunOpts) -> Vec<String> {
+    let mut allowlist = vault_egress_allowlist(opts, &[]);
+    allowlist.extend(
+        egress::standard_egress_hosts()
+            .iter()
+            .map(|host| (*host).to_string()),
+    );
+    allowlist
+}
+
+/// A launch's creds share and the MITM swap set, egress allowlist and JIT
+/// refresh context that go with it.
+pub(super) struct LaunchCreds {
+    pub(super) creds_share: PathBuf,
+    pub(super) swap_pairs: Vec<SwapPair>,
+    pub(super) allowlist: Vec<String>,
+    pub(super) refresh: Option<RefreshSpec>,
+}
+
+/// The creds of a structured run or an agent sandbox. A vault-capable agent takes
+/// the PTY path's env-fork (stubbed tokens in the guest, reals only on the VMM
+/// child's stdin) and that agent's egress posture. A non-vault agent (pi, cursor)
+/// mounts a clone of its own key with the standard egress hosts; `launch_base`
+/// already refused vaulted `--with` for it, so `with_vault` is empty.
+pub(super) fn agent_launch_creds(
+    spec: &AgentSpec,
+    home: &Path,
+    opts: &RunOpts,
+    with_vault: Vec<WithSwap>,
+) -> Result<LaunchCreds> {
+    if !spec.vault_capable {
+        return Ok(LaunchCreds {
+            creds_share: cow_clone_home(home)?,
+            swap_pairs: Vec::new(),
+            allowlist: standard_allowlist(opts),
+            refresh: None,
+        });
+    }
+    let EnvFork {
+        creds_share,
+        swap_pairs,
+        with_hosts,
+        refresh,
+    } = env_fork_creds(spec, home, with_vault, |_| Ok(()))?;
+    Ok(LaunchCreds {
+        creds_share,
+        swap_pairs,
+        allowlist: vault_egress_allowlist(opts, &with_hosts),
+        refresh,
+    })
 }
 
 fn commit_detached_session(
@@ -889,31 +939,13 @@ fn run_detached(
         .keep()
         .context("persist VMM spec for detach")?;
 
-    let exe = std::env::current_exe().context("locate the pillbox binary to re-exec as VMM")?;
-    let mut cmd = Command::new(&exe);
-    cmd.arg("__krun-vmm")
-        .arg(&spec_path)
-        .env_clear()
-        .envs(boot::static_child_env())
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    // Self-destruct if this CLI dies before the record commits below (an abandoned
-    // detached launch must not orphan its reparented VM).
-    arm_commit_guard(&mut cmd, resolved, session_id);
-    vmm_own_process_group(&mut cmd);
-    let mut child = cmd
-        .spawn()
-        .context("spawn the detached libkrun VMM subprocess")?;
+    let record = crate::session::record_path(resolved, session_id);
+    let child = spawn_vmm(
+        &spec_path,
+        VmmTether::Reparented { record: &record },
+        &launch.swap_pairs,
+    )?;
     launch.rootfs.preserve();
-
-    // Env fork: hand the reals to the child's MITM on stdin (out-of-band), as the
-    // foreground path does, then drop the pipe (EOF).
-    if let Some(mut sin) = child.stdin.take() {
-        let blob = serde_json::to_string(&launch.swap_pairs).unwrap_or_else(|_| "[]".into());
-        use std::io::Write as _;
-        let _ = sin.write_all(blob.as_bytes());
-    }
     startup.mark("vmm_spawn");
 
     let handle = LibkrunHandle {
@@ -1038,17 +1070,17 @@ fn launch_server_vm(
         .server
         .expect("launch_server_vm requires a Server-integration agent");
 
+    let home = authenticated_home(spec, &opts, resolved, "run")?;
     // Server-mode VMs always reparent (regardless of `--detach`), so the CA must
     // outlive this process — `Persistent`, never a host tempdir.
     let LaunchBase {
         mut rootfs,
-        home,
         workspace_clone: clone,
         guest_workspace,
         mut guest_env,
         ca,
         with_vault: _, // server agents refuse vaulted --with above; always empty here
-    } = launch_base(spec, &opts, resolved, CaLifetime::Persistent)?;
+    } = launch_base(Some(spec), &opts, resolved, CaLifetime::Persistent)?;
     guest_env.extend(launch.extra_env); // per-agent additions (codex's SSL_CERT_FILE)
 
     // Creds: CoW clone the *real* auth home (no stub — the agent authenticates to
@@ -1117,12 +1149,7 @@ fn launch_server_vm(
             login: false,
         }),
     };
-    let spec_file = tempfile::Builder::new()
-        .prefix("pillbox-krun-spec-")
-        .suffix(".json")
-        .tempfile()
-        .context("create VMM spec tempfile")?;
-    serde_json::to_writer(&spec_file, &vmspec).context("write VMM spec")?;
+    let spec_file = write_vm_spec(&vmspec)?;
     // The child reads the spec after we return (detached) — persist it.
     let (_, spec_path) = spec_file.keep().context("persist VMM spec")?;
     startup.mark("launch_prepare");
@@ -1132,27 +1159,20 @@ fn launch_server_vm(
     // this reparented server VM).
     let session_id = crate::session::Session::new_id();
 
-    // Spawn the VM detached (it runs the server + relay, reparented to init).
-    let exe = std::env::current_exe().context("locate the pillbox binary to re-exec as VMM")?;
-    let mut cmd = Command::new(&exe);
-    cmd.arg("__krun-vmm")
-        .arg(&spec_path)
-        .env_clear()
-        .envs(boot::static_child_env())
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    arm_commit_guard(&mut cmd, resolved, &session_id);
-    vmm_own_process_group(&mut cmd);
-    let mut child = cmd.spawn().context("spawn the libkrun VMM subprocess")?;
+    // Spawn the VM detached (it runs the server + relay, reparented to init). No
+    // swap pairs: server agents are non-vault.
+    let record = crate::session::record_path(resolved, &session_id);
+    let mut child = spawn_vmm(&spec_path, VmmTether::Reparented { record: &record }, &[])?;
     rootfs.preserve();
-    // No swap pairs (non-vault): hand the child's MITM an empty set + EOF.
-    if let Some(mut sin) = child.stdin.take() {
-        use std::io::Write as _;
-        let _ = sin.write_all(b"[]");
-    }
-    let pid = child.id() as i32;
     startup.mark("vmm_spawn");
+    let handle = LibkrunHandle {
+        sock: host_sock.to_string_lossy().into_owned(),
+        pid: child.id() as i32,
+        creds: creds_share.to_string_lossy().into_owned(),
+        workspace: clone.to_string_lossy().into_owned(),
+        spec: spec_path.to_string_lossy().into_owned(),
+        rootfs: Some(rootfs.to_string_lossy().into_owned()),
+    };
 
     let http = server_http(spec, host_sock.clone());
     let prompt = opts.args.join(" ").trim().to_string();
@@ -1162,14 +1182,6 @@ fn launch_server_vm(
     let built = (|| -> Result<crate::session::Session> {
         let agent_session_id = (launch.bringup)(&http)?;
         startup.mark("server_ready");
-        let handle = LibkrunHandle {
-            sock: host_sock.to_string_lossy().into_owned(),
-            pid,
-            creds: creds_share.to_string_lossy().into_owned(),
-            workspace: clone.to_string_lossy().into_owned(),
-            spec: spec_path.to_string_lossy().into_owned(),
-            rootfs: Some(rootfs.to_string_lossy().into_owned()),
-        };
         let session = crate::session::Session {
             id: session_id.clone(),
             label: opts.label.clone(),
@@ -1225,38 +1237,9 @@ fn launch_server_vm(
         );
         Ok(session)
     })();
-    let session = match built {
-        Ok(s) => s,
-        Err(e) => {
-            // Bring-up failed: kill AND reap the VMM child (we still own it — it
-            // hasn't reparented to init yet) before scrubbing the CoW clones, so
-            // we don't leave a zombie and don't race the dying child's virtio-fs
-            // mounts on the clones we're removing. (The success path leaves the
-            // child running, reparented; `kill_session` reaps that one by spec path.)
-            // Read the child's own status FIRST: a SIGABRT'd-at-boot VMM (the swept
-            // runtime-dep footgun) has already exited, and our `kill` would otherwise
-            // clobber that status with SIGKILL and mask the actionable cause.
-            let self_status = child.try_wait().ok().flatten();
-            let _ = child.kill();
-            child.wait().context("reap failed server VMM")?;
-            reap_vmm_by_spec(&spec_path.to_string_lossy())?;
-            rootfs.remove_stopped()?;
-            let _ = std::fs::remove_file(&host_sock);
-            let _ = std::fs::remove_file(&spec_path);
-            let _ = std::fs::remove_dir_all(&creds_share);
-            let _ = std::fs::remove_dir_all(&clone);
-            if let Some(deps_err) = sigabrt_boot_error(self_status) {
-                return Err(deps_err);
-            }
-            // `try_wait` can race the dying child, so a SIGABRT-at-boot may not be
-            // caught above. A swept runtime dep is the likeliest cause of a boot
-            // failure regardless — surface it instead of the opaque generic error.
-            if let Err(reason) = runtime_deps_present() {
-                return Err(PillboxError::runtime("run", reason).into());
-            }
-            return Err(e);
-        }
-    };
+    // The success path leaves the child running, reparented; `kill_session` reaps
+    // that one by spec path.
+    let session = built.map_err(|e| abandon_launch(&mut child, &handle, e))?;
 
     // No auto-send: the server came up ready (wait_ready in bringup), so the first
     // prompt goes through `session send` — captured by a subscribed watch.
@@ -1375,38 +1358,21 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
     let requested_execution = requested.clone();
 
     let mut startup = StartupTimer::start();
+    let home = authenticated_home(spec, &opts, resolved, "run")?;
     let LaunchBase {
         mut rootfs,
-        home,
         workspace_clone,
         guest_workspace,
         guest_env,
         ca,
         with_vault,
-    } = launch_base(spec, &opts, resolved, CaLifetime::Ephemeral)?;
-    // Credentials. A vault-capable agent takes the PTY path's env-fork: the
-    // guest mounts stubbed OAuth tokens and the supervised VMM child's MITM swaps
-    // stub→real (reals on its stdin only). Non-vault agents (pi, cursor) mount
-    // their own key as-is — `with_vault` is empty for them (refused above).
-    let (creds_share, swap_pairs, allowlist, refresh) = if spec.vault_capable {
-        let EnvFork {
-            creds_share,
-            swap_pairs,
-            with_hosts,
-            refresh,
-        } = env_fork_creds(spec, &home, with_vault, |_| Ok(()))?;
-        // Same egress posture as the PTY agent sharing this auth home.
-        let allowlist = vault_egress_allowlist(&opts, &with_hosts);
-        (creds_share, swap_pairs, allowlist, refresh)
-    } else {
-        let mut allowlist = vault_egress_allowlist(&opts, &[]);
-        allowlist.extend(
-            egress::standard_egress_hosts()
-                .iter()
-                .map(|host| (*host).to_string()),
-        );
-        (cow_clone_home(&home)?, Vec::new(), allowlist, None)
-    };
+    } = launch_base(Some(spec), &opts, resolved, CaLifetime::Ephemeral)?;
+    let LaunchCreds {
+        creds_share,
+        swap_pairs,
+        allowlist,
+        refresh,
+    } = agent_launch_creds(spec, &home, &opts, with_vault)?;
     let argv = structured_io::run_argv(spec.id, requested.clone(), &prompt)?
         .iter()
         .map(|arg| shell_quote(arg))
@@ -1451,12 +1417,7 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
             login: false,
         }),
     };
-    let spec_file = tempfile::Builder::new()
-        .prefix("pillbox-krun-spec-")
-        .suffix(".json")
-        .tempfile()
-        .context("create structured VMM spec tempfile")?;
-    serde_json::to_writer(&spec_file, &vmspec).context("write structured VMM spec")?;
+    let spec_file = write_vm_spec(&vmspec)?;
     let (_, spec_path) = spec_file.keep().context("persist structured VMM spec")?;
     startup.mark("launch_prepare");
 
@@ -2415,7 +2376,7 @@ pub(super) fn teardown_handle(handle: &LibkrunHandle) -> Result<()> {
 /// sweep of `~/.pillbox/krun/` (shared across pillboxes). Nothing carrying the
 /// spec ⇒ the VM is already down. A failed scan or surviving group returns an
 /// error, preserving the session and its private files for recovery.
-pub(super) fn reap_vmm_by_spec(spec: &str) -> Result<()> {
+fn reap_vmm_by_spec(spec: &str) -> Result<()> {
     let mut killed = Vec::new();
     for (_pid, pgid) in vmm_groups_for_spec(spec)? {
         anyhow::ensure!(
@@ -2607,24 +2568,103 @@ fn human_bytes(n: u64) -> String {
 /// path handles the common watchdog-`kill -9` case promptly, well before here.
 const COMMIT_DEADLINE_SECS: u64 = 600;
 
-/// Arm a detached VMM's self-destruct guard by setting the `PILLBOX_COMMIT_*` env on
-/// its Command (read + cleared by [`CommitGuard::from_env`](super::CommitGuard) in the
-/// child, so it never reaches the guest). ONLY the reparenting spawns (`run_detached`,
-/// `launch_server_vm`) call this — foreground/grader VMMs are reaped via `child.wait`
-/// and need no guard. The owner pid is THIS launching CLI; the record path is where the
-/// commit lands.
-fn arm_commit_guard(cmd: &mut Command, resolved: &Pillbox, session_id: &str) {
-    arm_commit_guard_at(cmd, &crate::session::record_path(resolved, session_id));
-}
-
-/// [`arm_commit_guard`] for any durable record: the VMM self-destructs unless
-/// `record_path` exists before this CLI dies (or the deadline passes). A reparented
-/// VMM must arm this against the exact file its launch commits, e.g. a sandbox
-/// record ([`crate::sandboxes::Sandbox::record_path`]).
-pub(super) fn arm_commit_guard_at(cmd: &mut Command, record_path: &Path) {
+/// Arm a reparenting VMM's self-destruct guard by setting the `PILLBOX_COMMIT_*` env
+/// on its Command (read + cleared by [`CommitGuard::from_env`](super::CommitGuard) in
+/// the child, so it never reaches the guest): the VMM self-destructs unless
+/// `record_path` exists before this CLI dies (or the deadline passes). Only
+/// [`VmmTether::Reparented`] spawns arm it; foreground/grader VMMs are reaped via
+/// `child.wait` and need no guard.
+fn arm_commit_guard(cmd: &mut Command, record_path: &Path) {
     cmd.env("PILLBOX_COMMIT_OWNER_PID", std::process::id().to_string())
         .env("PILLBOX_COMMIT_RECORD", record_path)
         .env("PILLBOX_COMMIT_DEADLINE", COMMIT_DEADLINE_SECS.to_string());
+}
+
+/// Write `vmspec` to a fresh `pillbox-krun-spec-*.json` tempfile — the path is the
+/// VMM's argv, and so the key `reap_vmm_by_spec` attributes it by. A reparenting
+/// caller `keep()`s it, since its VMM reads the spec after this CLI returns.
+pub(super) fn write_vm_spec(vmspec: &VmSpec) -> Result<tempfile::NamedTempFile> {
+    let spec_file = tempfile::Builder::new()
+        .prefix("pillbox-krun-spec-")
+        .suffix(".json")
+        .tempfile()
+        .context("create VMM spec tempfile")?;
+    serde_json::to_writer(&spec_file, vmspec).context("write VMM spec")?;
+    Ok(spec_file)
+}
+
+/// How a spawned VMM relates to the launching CLI.
+pub(super) enum VmmTether<'a> {
+    /// Supervised to exit by this CLI (`child.wait` + teardown). It stays in the
+    /// CLI's process group so a Ctrl-C in the boot window cannot orphan it.
+    Foreground,
+    /// Outlives this CLI: its own process group (so `reap_vmm_by_spec` can
+    /// `killpg` it), output discarded, and it self-destructs unless `record` —
+    /// the session or sandbox record its launch commits — exists before this CLI
+    /// dies.
+    Reparented { record: &'a Path },
+}
+
+/// Spawn `pillbox __krun-vmm <spec_path>` and hand its MITM `swap_pairs` on stdin,
+/// then EOF: the real credentials never touch the guest env, argv or the spec file.
+/// `env_clear` + the static base keep the kernel cmdline (which carries the child's
+/// env) printable ASCII; the composed guest env rides the boot script.
+pub(super) fn spawn_vmm(
+    spec_path: &Path,
+    tether: VmmTether<'_>,
+    swap_pairs: &[SwapPair],
+) -> Result<std::process::Child> {
+    let exe = std::env::current_exe().context("locate the pillbox binary to re-exec as VMM")?;
+    let mut cmd = Command::new(&exe);
+    cmd.arg("__krun-vmm")
+        .arg(spec_path)
+        .env_clear()
+        .envs(boot::static_child_env())
+        .stdin(std::process::Stdio::piped());
+    if let VmmTether::Reparented { record } = tether {
+        cmd.stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        arm_commit_guard(&mut cmd, record);
+        vmm_own_process_group(&mut cmd);
+    }
+    let mut child = cmd.spawn().context("spawn the libkrun VMM subprocess")?;
+    if let Some(mut sin) = child.stdin.take() {
+        let blob = serde_json::to_string(swap_pairs).unwrap_or_else(|_| "[]".into());
+        use std::io::Write as _;
+        let _ = sin.write_all(blob.as_bytes());
+    }
+    Ok(child)
+}
+
+/// Undo a reparenting launch that failed before its record committed, while this
+/// CLI still owns the VMM child: kill and reap it, tear its files down, and return
+/// the error to surface — the missing-runtime-deps cause when the VMM aborted at
+/// boot, else `cause`.
+pub(super) fn abandon_launch(
+    child: &mut std::process::Child,
+    handle: &LibkrunHandle,
+    cause: anyhow::Error,
+) -> anyhow::Error {
+    // Read the child's own status FIRST: a SIGABRT'd-at-boot VMM (the swept
+    // runtime-dep footgun) has already exited, and our `kill` would otherwise
+    // clobber that status with SIGKILL and mask the actionable cause. Reap before
+    // removing the clones so we don't race the dying child's virtio-fs mounts.
+    let self_status = child.try_wait().ok().flatten();
+    let _ = child.kill();
+    let _ = child.wait();
+    if let Err(teardown) = teardown_handle(handle) {
+        return teardown.context(format!("launch failed: {cause:#}"));
+    }
+    if let Some(deps_err) = sigabrt_boot_error(self_status) {
+        return deps_err;
+    }
+    // `try_wait` can race the dying child, so a SIGABRT-at-boot may not be caught
+    // above. A swept runtime dep is the likeliest cause of a boot failure
+    // regardless, so surface it instead of the opaque generic error.
+    if let Err(reason) = runtime_deps_present() {
+        return PillboxError::runtime("run", reason).into();
+    }
+    cause
 }
 
 /// vsock port the guest pty-host dials for the attach channel.

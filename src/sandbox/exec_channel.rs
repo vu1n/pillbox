@@ -140,8 +140,7 @@ fn invalid(msg: &str) -> io::Error {
 /// order, and return the command's exit code. An `Err` from `on_chunk` aborts the
 /// exchange (closing the stream; the guest then kills the command). A guest that
 /// could not start the command, or a stream that closes before `Exit`, is an error.
-// The libkrun sandbox target (sandbox_vm) is its caller.
-#[allow(dead_code)]
+#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) fn run_exec<S: Read + Write>(
     mut stream: S,
     argv: &[String],

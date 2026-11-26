@@ -28,6 +28,7 @@ The maintained local backend runs agents inside libkrun microVMs with a private 
 - OCI image resolution, rootfs materialization/cache and private clones.
 - Guest boot, vsock control, exec and PTY/server-agent transport.
 - Workspace/auth environment fork and supervised VMM lifetime.
+- One prologue (`session.rs:launch_base`: disk preflight, rootfs, scrubbed workspace clone, guest env, vault CA) and one VMM spawn (`session.rs:spawn_vmm`) shared by the PTY, server, structured, `auth login` and `sandbox spawn` launches. A foreground VMM stays in the CLI's process group so a Ctrl-C in the boot window can't orphan it; a reparented one gets its own group and a commit guard on the record its launch writes, and a failed reparented launch goes through `abandon_launch`.
 
 ## How to get to it (user POV)
 

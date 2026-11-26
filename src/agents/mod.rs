@@ -109,7 +109,7 @@ pub(crate) struct StructuredProfile {
     pub(crate) model: StructuredModelPolicy,
     /// Guest env var that authenticates without the login sentinel (e.g.
     /// `CURSOR_API_KEY`). Checked at launch against the resolved run env.
-    /// Consumed by the libkrun launch_base gate; dead on a non-libkrun build.
+    /// Consumed by the libkrun `authenticated_home` gate; dead on a non-libkrun build.
     #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) alt_auth_env: Option<&'static str>,
 }
@@ -256,6 +256,7 @@ pub struct AgentSpec {
     /// Read only by the libkrun login VM's OAuth callback relay.
     #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) oauth_port: Option<u16>,
+    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) post_login_finalize: Option<fn(&Path) -> Result<()>>,
     pub(crate) vault_capable: bool,
     /// Build a per-run MCP config injection from `--mcp` flags.

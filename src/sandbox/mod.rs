@@ -116,8 +116,6 @@ pub(crate) trait SandboxBackend {
     /// already written to the registry. The caller then addresses it through
     /// [`sandbox_target`]. Only a backend declaring `long_lived_exec` overrides
     /// this; every other backend refuses with the plane's unsupported error.
-    // The sandbox verbs (commands/sandbox.rs) are its caller.
-    #[allow(dead_code)]
     fn spawn_sandbox(
         &self,
         _resolved: &Pillbox,
@@ -130,8 +128,7 @@ pub(crate) trait SandboxBackend {
 /// What `sandbox spawn` asks a backend for: an optional agent harness to
 /// provision (its credentials env-forked, the guest user non-root), the host
 /// workspace to clone into the sandbox, and an optional `sandbox list` label.
-// The sandbox verbs (commands/sandbox.rs) build it.
-#[allow(dead_code)]
+#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 #[derive(Clone, Debug)]
 pub(crate) struct SandboxSpawn {
     pub(crate) agent: Option<String>,
@@ -141,8 +138,6 @@ pub(crate) struct SandboxSpawn {
 
 /// One live sandbox, addressed by its registry record (see [`sandbox_target`]) —
 /// what `sandbox exec`/`agent`/`destroy` drive without branching on the backend.
-// The sandbox verbs (commands/sandbox.rs) are its callers.
-#[allow(dead_code)]
 pub(crate) trait SandboxTarget {
     /// Run `argv` to completion in the sandbox's workspace, handing each output
     /// chunk to `on_chunk(is_stderr, bytes)` as it arrives (stdin is empty).

@@ -30,13 +30,16 @@ backend refuses spawn and can only drop an old record.
 
 ## Sub-features
 
-- Spawn: the run path's launch prologue (private rootfs, CoW secret-scrubbed workspace
-  clone, egress fence, vault CA), a detached VMM in its own process group with a commit
-  guard on the sandbox record, and a wait until the guest `exec-host` answers before the
-  record is written. A failure after the VMM spawn tears the VM and its files down.
-- `--agent`: a vault-capable agent (claude) gets the PTY path's env-fork — stubbed
-  credentials in the guest, the real token only on the VMM child's stdin — and the guest
-  runs commands as uid 1000. A bare sandbox gets an empty home and runs as root.
+- Spawn: the run path's own `launch_base` prologue (private rootfs, CoW secret-scrubbed
+  workspace clone, egress fence, vault CA), a detached VMM spawned by the shared
+  `spawn_vmm` in its own process group with a commit guard on the sandbox record, and a
+  wait until the guest `exec-host` answers before the record is written. A failure after
+  the VMM spawn goes through the same `abandon_launch` as a failed server bring-up, which
+  tears the VM and its files down.
+- `--agent`: the structured run's creds (`agent_launch_creds`). A vault-capable agent
+  (claude) gets the env-fork — stubbed credentials in the guest, the real token only on
+  the VMM child's stdin; a non-vault agent (cursor, pi) mounts a clone of its own key.
+  The guest runs commands as uid 1000. A bare sandbox gets an empty home and runs as root.
 - Exec channel: framed request (argv, cwd = guest workspace) and stdout/stderr/exit
   frames over vsock port 1026, one connection per command.
 - Destroy: the same `teardown_handle` as `session rm` on libkrun, then the record.

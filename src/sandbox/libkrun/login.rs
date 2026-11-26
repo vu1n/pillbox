@@ -8,11 +8,9 @@
 //! [`VmSpec`](super::VmSpec)`.vsock` can relay an agent's loopback OAuth callback
 //! port. Shared launch helpers live in [`super::session`] (`pub(super)`).
 
-use std::io::Write as _;
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -26,7 +24,8 @@ use crate::pillbox::Pillbox;
 
 use super::session::{
     accept_attach, confirm_vmm_stopped, disk_preflight, guest_launch_preamble, provision_vault_ca,
-    report_egress_refusals, sigabrt_boot_error, CaLifetime, ATTACH_PORT, FORWARD_PORT,
+    report_egress_refusals, sigabrt_boot_error, spawn_vmm, write_vm_spec, CaLifetime, VmmTether,
+    ATTACH_PORT, FORWARD_PORT,
 };
 use super::{
     boot, krun_cache_dir, materialize_rootfs, shell_quote, EgressSpec, Share, VmSpec, VsockAttach,
@@ -83,12 +82,7 @@ pub(crate) fn login(spec: &AgentSpec, resolved: &Pillbox) -> Result<i32> {
             egress_log: egress_log.clone(),
         },
     )?;
-    let spec_file = tempfile::Builder::new()
-        .prefix("pillbox-krun-spec-")
-        .suffix(".json")
-        .tempfile()
-        .context("create VMM spec tempfile")?;
-    serde_json::to_writer(&spec_file, &vmspec).context("write VMM spec")?;
+    let spec_file = write_vm_spec(&vmspec)?;
 
     // The host side of the OAuth callback: bound before boot so a busy port fails
     // the login before a VM exists.
@@ -106,20 +100,9 @@ pub(crate) fn login(spec: &AgentSpec, resolved: &Pillbox) -> Result<i32> {
         "pillbox: libkrun backend — launching `{}` login in a microVM",
         spec.id
     );
-    let exe = std::env::current_exe().context("locate the pillbox binary to re-exec as VMM")?;
-    let mut cmd = Command::new(&exe);
-    cmd.arg("__krun-vmm")
-        .arg(spec_file.path())
-        .env_clear()
-        .envs(boot::static_child_env())
-        .stdin(std::process::Stdio::piped());
-    // Foreground VMM stays in the CLI's process group so a Ctrl-C in the boot window cannot orphan it.
-    let mut child = cmd.spawn().context("spawn the libkrun VMM subprocess")?;
-    rootfs.preserve();
     // No swap pairs: the login holds no credential to swap, it mints one.
-    if let Some(mut sin) = child.stdin.take() {
-        let _ = sin.write_all(b"[]");
-    }
+    let mut child = spawn_vmm(spec_file.path(), VmmTether::Foreground, &[])?;
+    rootfs.preserve();
 
     let outcome = match accept_attach(&listener, &mut child) {
         Ok(stream) => stream

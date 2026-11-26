@@ -65,7 +65,6 @@ pub(crate) struct Sandbox {
 
 impl Sandbox {
     /// Mint a 12-hex-char id — see [`crate::registry::new_id`].
-    // Its caller, the libkrun sandbox spawn, is feature-gated.
     #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) fn new_id() -> String {
         reg::new_id()
@@ -74,7 +73,6 @@ impl Sandbox {
     /// Where [`write`] persists sandbox `id`: `<pillbox>/sandboxes/<id>.toml`. A
     /// reparented libkrun VMM's commit guard watches it — the VM self-destructs if
     /// this file doesn't appear before its launcher dies.
-    // Its caller, the libkrun sandbox spawn, is feature-gated.
     #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) fn record_path(pb: &Pillbox, id: &str) -> std::path::PathBuf {
         SandboxRegistry::path_read(pb, id)
@@ -104,7 +102,6 @@ impl IdRegistry for SandboxRegistry {
     }
 }
 
-// Its caller, the libkrun sandbox spawn, is feature-gated.
 #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) fn write(pb: &Pillbox, sandbox: &Sandbox) -> Result<()> {
     let body = toml::to_string(sandbox)

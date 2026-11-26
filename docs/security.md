@@ -32,7 +32,7 @@ tamper with those inputs even though it does not host the normal agent run.
 | Other host tools accidentally consuming pillbox state | Everything is namespaced under `~/.pillbox/` with restrictive perms. |
 | `pillbox secret show --reveal` accidentally piped to logs | Refused unless `--to-stdout` is also passed. |
 | Agent crosses the normal local sandbox boundary | The local agent runs in a hardware-isolated libkrun microVM, not a shared-kernel container. Guest egress terminates at the host-owned broker. |
-| Managed caller invokes another run | Public Worker routes require an expiring capability bound to one operation, exact bounded request bytes, and exact session/invocation id; Huddles uses the trusted service binding and owns participant authorization. |
+| Managed caller invokes another run | Every Worker route is public HTTP and requires an expiring capability bound to one operation, exact bounded request bytes, and exact session/invocation id; the calling controller owns participant authorization. |
 | Managed workspace credential reaches outside its project | When scoping is enabled, the host mints a fresh prefix-scoped R2 credential per transfer; mint/shape failures abort rather than falling back silently. |
 
 ## What pillbox does NOT defend against
@@ -152,7 +152,7 @@ tracked migration debts, not supported alternative agent placements.
   R2 stores one immutable terminal artifact, Analytics Engine receives at most
   one compact terminal point, and returned evidence is copied into the caller's
   local session log.
-- Public requests carry short-lived controller capabilities scoped to one
+- Every request carries a short-lived controller capability (HMAC, `MANAGED_CAPABILITY_SECRET`) scoped to one
   operation, exact bounded request bytes, and exact resource. They are not
   participant credentials and cannot be replayed with another request body or
   for another status read, cancellation, session, or invocation.
@@ -171,7 +171,7 @@ tracked migration debts, not supported alternative agent placements.
   Sandbox. The backup records the provisioned base as its parent; the host
   resolves that canonical 64-hex result in rustic and verifies the lineage
   before persisting it.
-- Public managed turns are tool-denied until provider/workspace credentials are
+- Managed turns are tool-denied (`tool_policy` must be `deny_all`; the public route answers 400 `unsupported_policy` otherwise) until provider/workspace credentials are
   brokered outside prompt-controlled processes. User-facing capability issuance,
   reconnect semantics, detached finalization, and teardown remain experimental.
 

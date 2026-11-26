@@ -25,12 +25,13 @@ the log resumes from disk on the next local reader/writer.
 It does not imply a remote Durable Object placement. Managed execution returns
 bounded evidence to the caller, which appends it to the same local log.
 
-## Ownership contract with Huddles
+## Ownership contract with a collaboration layer
 
-Huddles may call Pillbox's bounded execution API with a stable invocation and
-idempotency key. Pillbox returns runtime evidence and result references. Huddles
-then decides how those results participate in its collaborative order and
-visibility model. Pillbox must not infer or persist Huddles participant state.
+A collaboration service such as Huddles may call Pillbox's bounded execution API
+as an ordinary controller, with a stable invocation and idempotency key. Pillbox
+returns runtime evidence and result references. The collaboration layer then
+decides how those results participate in its collaborative order and
+visibility model. Pillbox must not infer or persist participant state.
 
 If a future request needs a hosted broker inside Pillbox, it is an architecture
 change: propose a Brief amendment and satisfy

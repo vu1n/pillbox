@@ -9,29 +9,20 @@ single-controller execution service, not a multiplayer gateway.
 - D1 `execution`: bounded invocation claims and terminal references
 - R2 `EXECUTION_EVIDENCE`: one immutable terminal artifact per invocation
 - Analytics Engine `RUN_COSTS`: at most one compact point per terminal run
-- Worker/service-binding routes: execute, status, cancel, workspace provision
+- Public Worker routes: execute, status, cancel, workspace provision
   (bound to a prepared invocation ID and execution request hash),
   and workspace finalize
 
 There is no Pillbox-authored Durable Object class, Agents SDK, per-event SQLite
 log, WebSocket replay stream, driver lease, or participant roster.
 
-Managed Huddles execute/status/cancel calls carry signed Ed25519
-`huddles.execution-operation-grant/2` sidecars. Pillbox verifies exact request
-binding and rechecks the separate, authorize-only
-`PillboxAuthorizationCurrentness` service before persistence or charged access,
-including exact D1 retries. The signing issuer is not bound to Pillbox.
-Credential bindings fail closed until a bounded, non-Durable-Object broker
-exists.
-
-Historical ensure/invoke compatibility is local-test-only, accepts no managed
-authorization, and is not exported by the production Worker.
-
-Public HTTP routes require short-lived HMAC capabilities bound to one operation
-and exact session/invocation id (`MANAGED_CAPABILITY_SECRET`). Huddles uses the
-same-account service binding instead. Public execution is `deny_all`: managed
-runtime tools stay disabled until credentials can be brokered without placing
-provider or workspace secrets in a prompt-controlled process.
+Every route is public HTTP and requires a short-lived HMAC capability
+(`MANAGED_CAPABILITY_SECRET`) bound to one operation, the exact request bytes,
+and the session/invocation id. Pillbox verifies it before any D1 or R2 access;
+the capability subject is the durable execution owner. Public execution is
+`deny_all`: the request's `tool_policy` must be `deny_all`, and managed runtime
+tools stay disabled until credentials can be brokered without placing provider
+or workspace secrets in a prompt-controlled process.
 
 ## Checks
 

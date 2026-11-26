@@ -9,7 +9,7 @@ export type JsonValue =
 export type Harness = "claude_code" | "codex" | "opencode" | "pi" | "custom";
 export type ReasoningEffort = "low" | "medium" | "high";
 
-/** The broad InvocationExecution wire shape owned by Huddles. */
+/** The broad InvocationExecution wire shape accepted by managed execution. */
 export interface HarnessTransport {
   readonly harness: Harness;
   readonly transport: string;
@@ -372,7 +372,7 @@ export function validateCancelInvocationV2Request(
   };
 }
 
-/** Refine a valid broad Huddles execution to the currently implemented Codex capability. */
+/** Refine a valid broad execution to the currently implemented Codex capability. */
 export function validateSupportedCodexExecution(
   execution: InvocationExecution,
 ): SupportedCodexExecution {

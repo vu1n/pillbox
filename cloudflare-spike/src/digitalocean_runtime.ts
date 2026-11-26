@@ -17,7 +17,7 @@ import {
   DIGITALOCEAN_POLL,
 } from "./digitalocean_guest.js";
 import { openRouterReasoning } from "./opencode_reasoning.js";
-import { huddlesPromptTools } from "./huddles_policy.js";
+import { opencodePromptTools } from "./tool_policy.js";
 import { sha256Hex } from "./runtime_identity.js";
 import { inspectRawStructuredOutput } from "./structured_output.js";
 
@@ -44,6 +44,8 @@ export class DigitalOceanExecutionRuntime implements ExecutionRuntime {
     const unsupported = this.preflight(request);
     if (unsupported) return { served_model: null, error: unsupported, evidence: [] };
     const { allocations, settings } = this.options;
+    // Resolve the request's tool policy before any allocation or droplet spend so an unenforceable policy fails closed.
+    const tools = opencodePromptTools(request.tool_policy);
     const name = await allocationName(settings.namespace!, request.invocation_id);
     if (!(await allocations.reserve(request.invocation_id, name, settings.configId!))) {
       throw new Error(
@@ -53,7 +55,7 @@ export class DigitalOceanExecutionRuntime implements ExecutionRuntime {
     let turn: RuntimeTurnResult | undefined;
     let failure: unknown;
     try {
-      turn = await this.runAllocated(request, name);
+      turn = await this.runAllocated(request, name, tools);
     } catch (cause) {
       failure = cause;
     }
@@ -86,6 +88,7 @@ export class DigitalOceanExecutionRuntime implements ExecutionRuntime {
   private async runAllocated(
     request: ExecuteInvocationV2Request,
     name: string,
+    tools: Record<string, false>,
   ): Promise<RuntimeTurnResult> {
     const { api, allocations, settings } = this.options;
     const created = await api.create(name, settings.configId!);
@@ -114,7 +117,7 @@ export class DigitalOceanExecutionRuntime implements ExecutionRuntime {
       model: request.execution.requested.model,
       reasoning: openRouterReasoning(request.execution.requested),
       harness_version: DIGITALOCEAN_HARNESS_VERSION,
-      tools: huddlesPromptTools("deny_all"),
+      tools,
       output_format: request.output_format,
     });
     if ((await allocations.get(request.invocation_id))?.state !== "ready")

@@ -18,7 +18,7 @@ The runner image pins **OpenCode 2.0.24** from the npm package `@opencode/cli`.
 OpenCode 2 is a new package, not `opencode-ai@2` (that package stays on the 1.x
 line), and its server API is a clean break from 1.x, so the adapter targets 2.x
 only. The managed Cloudflare/DigitalOcean paths keep their own OpenCode 1.x pins
-(`cloudflare-spike/Dockerfile`, `digitalocean/`) because they are sealed Huddles
+(`cloudflare-spike/Dockerfile`, `digitalocean/`) because they are sealed managed
 execution cohorts; they are not covered by this doc. opencode does not run on
 the deprecated Docker backend (`run` refuses every server agent there) and has
 no `sandbox agent` adapter; the OpenCode 1 Docker paths were deleted.

@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
-use crate::agents::{workspace_mount_name, AgentSpec, RunOpts, GUEST_HOME, GUEST_WORKSPACE};
+use crate::agents::{AgentSpec, RunOpts, GUEST_HOME};
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
 use crate::sandbox::exec_channel;
@@ -68,16 +68,8 @@ pub(crate) fn target(record: &Sandbox) -> Result<Box<dyn SandboxTarget>> {
         id: record.id.clone(),
         handle: LibkrunHandle::parse(&record.backend_ref)
             .with_context(|| format!("sandbox `{}`", record.id))?,
-        guest_workspace: guest_workspace_for(Path::new(&record.workspace))?,
+        guest_workspace: record.guest_workspace.clone(),
     }))
-}
-
-/// Where the guest mounts the workspace clone of host workspace `host`.
-fn guest_workspace_for(host: &Path) -> Result<String> {
-    Ok(format!(
-        "{GUEST_WORKSPACE}/{}",
-        workspace_mount_name(host, None)?
-    ))
 }
 
 /// The run options a sandbox launch feeds the shared prologue: only the workspace.
@@ -307,20 +299,13 @@ fn launch(
     mut prepared: Prepared,
 ) -> Result<Sandbox> {
     let record_path = Sandbox::record_path(resolved, id);
-    let spawned = spawn_vmm(
+    let mut child = spawn_vmm(
         &prepared.spec_path,
         VmmTether::Reparented {
             record: &record_path,
         },
         &prepared.swap_pairs,
-    );
-    let mut child = match spawned {
-        Ok(child) => child,
-        Err(e) => {
-            let _ = std::fs::remove_file(&prepared.spec_path);
-            return Err(e);
-        }
-    };
+    )?;
     // From here the handle's teardown owns the rootfs and clones.
     prepared.rootfs.preserve();
     prepared.scratch.release();
@@ -347,6 +332,7 @@ fn launch(
             agent: agent.map(|spec| spec.id.to_string()),
             workspace: req.workspace.display().to_string(),
             workspace_clone: Some(handle.workspace.clone()),
+            guest_workspace: Some(prepared.guest_workspace.clone()),
             label: req.label.clone(),
             created_at: crate::session::now_rfc3339(),
             status: "ready".into(),
@@ -354,7 +340,7 @@ fn launch(
         sandboxes::write(resolved, &record)?;
         Ok(record)
     })();
-    committed.map_err(|e| abandon_launch(&mut child, &handle, e))
+    committed.map_err(|e| abandon_launch("sandbox spawn", &mut child, &handle, e))
 }
 
 /// Poll the sandbox's exec channel until a `true` runs to exit 0 in the guest
@@ -402,7 +388,9 @@ fn probe_exec(sock: &Path, guest_workspace: &str) -> Result<i32> {
 struct LibkrunSandbox {
     id: String,
     handle: LibkrunHandle,
-    guest_workspace: String,
+    /// The exec cwd. Every libkrun record is written with it; a record without
+    /// one can still be destroyed, never exec'd.
+    guest_workspace: Option<String>,
 }
 
 impl SandboxTarget for LibkrunSandbox {
@@ -411,6 +399,13 @@ impl SandboxTarget for LibkrunSandbox {
         argv: &[String],
         on_chunk: &mut dyn FnMut(bool, &[u8]) -> Result<()>,
     ) -> Result<i32> {
+        let guest_workspace = self.guest_workspace.as_deref().ok_or_else(|| {
+            PillboxError::config(
+                "sandbox exec",
+                format!("sandbox `{}` has no guest workspace in its record", self.id),
+            )
+            .with_next(format!("pillbox sandbox destroy {}", self.id))
+        })?;
         let stream = UnixStream::connect(&self.handle.sock).map_err(|e| {
             PillboxError::runtime(
                 "sandbox exec",
@@ -418,7 +413,7 @@ impl SandboxTarget for LibkrunSandbox {
             )
             .with_next(format!("pillbox sandbox destroy {}", self.id))
         })?;
-        exec_channel::run_exec(stream, argv, Some(&self.guest_workspace), |is_stderr, b| {
+        exec_channel::run_exec(stream, argv, Some(guest_workspace), |is_stderr, b| {
             on_chunk(is_stderr, b)
         })
     }
@@ -529,10 +524,6 @@ mod tests {
         let opts = sandbox_run_opts(Path::new("/work/app"));
         assert_eq!(opts.workspace.as_deref(), Some(Path::new("/work/app")));
         assert!(opts.withs.is_empty() && opts.egress_allow.is_empty() && !opts.vault);
-        assert_eq!(
-            guest_workspace_for(Path::new("/work/app")).unwrap(),
-            "/workspace/app"
-        );
     }
 
     /// A host socket served by the real guest-side exec channel, as `exec-host` would.
@@ -599,7 +590,7 @@ mod tests {
         std::fs::write(dir.path().join("ws/marker"), "x").unwrap();
         let target = LibkrunSandbox {
             id: "abcdef012345".into(),
-            guest_workspace: handle.workspace.clone(),
+            guest_workspace: Some(handle.workspace.clone()),
             handle,
         };
         let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -623,7 +614,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let target = LibkrunSandbox {
             id: "abcdef012345".into(),
-            guest_workspace: "/workspace/app".into(),
+            guest_workspace: Some("/workspace/app".into()),
             handle: handle_in(dir.path()),
         };
         let err = target
@@ -631,6 +622,27 @@ mod tests {
             .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("can't reach sandbox"), "{msg}");
+    }
+
+    #[test]
+    fn a_record_without_a_guest_workspace_refuses_exec_and_names_destroy() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = handle_in(dir.path());
+        serve_on(Path::new(&handle.sock));
+        let target = LibkrunSandbox {
+            id: "abcdef012345".into(),
+            guest_workspace: None,
+            handle,
+        };
+        let err = target
+            .exec(&["true".into()], &mut |_, _| Ok(()))
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no guest workspace"), "{msg}");
+        let next = err.downcast_ref::<PillboxError>().unwrap().next.clone();
+        assert!(next
+            .unwrap()
+            .contains("pillbox sandbox destroy abcdef012345"));
     }
 
     #[test]
@@ -647,6 +659,7 @@ mod tests {
                 agent: Some("claude".into()),
                 workspace: "/work/app".into(),
                 workspace_clone: Some(handle.workspace.clone()),
+                guest_workspace: Some("/workspace/app".into()),
                 label: None,
                 created_at: crate::session::now_rfc3339(),
                 status: "ready".into(),

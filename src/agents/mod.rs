@@ -818,7 +818,7 @@ impl AgentSpec {
             println!("pillbox: follow the prompts (and any URL) printed by the sandbox below.");
             println!();
 
-            let code = crate::sandbox::libkrun::login::login(self, resolved)?;
+            let code = crate::sandbox::libkrun::login::login(self, resolved, &home)?;
             if code != 0 {
                 return Err(PillboxError::runtime(
                     "login",

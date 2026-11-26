@@ -427,6 +427,7 @@ mod tests {
             agent: None,
             workspace: "/work/app".into(),
             workspace_clone: None,
+            guest_workspace: None,
             label: None,
             created_at: "2026-01-01T00:00:00Z".into(),
             status: "ready".into(),

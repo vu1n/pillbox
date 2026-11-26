@@ -1239,7 +1239,7 @@ fn launch_server_vm(
     })();
     // The success path leaves the child running, reparented; `kill_session` reaps
     // that one by spec path.
-    let session = built.map_err(|e| abandon_launch(&mut child, &handle, e))?;
+    let session = built.map_err(|e| abandon_launch("run", &mut child, &handle, e))?;
 
     // No auto-send: the server came up ready (wait_ready in bringup), so the first
     // prompt goes through `session send` — captured by a subscribed watch.
@@ -2614,8 +2614,40 @@ pub(super) fn spawn_vmm(
     tether: VmmTether<'_>,
     swap_pairs: &[SwapPair],
 ) -> Result<std::process::Child> {
-    let exe = std::env::current_exe().context("locate the pillbox binary to re-exec as VMM")?;
-    let mut cmd = Command::new(&exe);
+    spawn_vmm_as(std::env::current_exe(), spec_path, tether, swap_pairs)
+}
+
+fn spawn_vmm_as(
+    exe: std::io::Result<PathBuf>,
+    spec_path: &Path,
+    tether: VmmTether<'_>,
+    swap_pairs: &[SwapPair],
+) -> Result<std::process::Child> {
+    let spawned = exe
+        .context("locate the pillbox binary to re-exec as VMM")
+        .and_then(|exe| {
+            vmm_command(&exe, spec_path, tether)
+                .spawn()
+                .context("spawn the libkrun VMM subprocess")
+        });
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(e) => {
+            // The spec belongs to the VMM that reads it; with no VMM, nothing else removes it.
+            let _ = std::fs::remove_file(spec_path);
+            return Err(e);
+        }
+    };
+    if let Some(mut sin) = child.stdin.take() {
+        let blob = serde_json::to_string(swap_pairs).unwrap_or_else(|_| "[]".into());
+        use std::io::Write as _;
+        let _ = sin.write_all(blob.as_bytes());
+    }
+    Ok(child)
+}
+
+fn vmm_command(exe: &Path, spec_path: &Path, tether: VmmTether<'_>) -> Command {
+    let mut cmd = Command::new(exe);
     cmd.arg("__krun-vmm")
         .arg(spec_path)
         .env_clear()
@@ -2627,20 +2659,15 @@ pub(super) fn spawn_vmm(
         arm_commit_guard(&mut cmd, record);
         vmm_own_process_group(&mut cmd);
     }
-    let mut child = cmd.spawn().context("spawn the libkrun VMM subprocess")?;
-    if let Some(mut sin) = child.stdin.take() {
-        let blob = serde_json::to_string(swap_pairs).unwrap_or_else(|_| "[]".into());
-        use std::io::Write as _;
-        let _ = sin.write_all(blob.as_bytes());
-    }
-    Ok(child)
+    cmd
 }
 
 /// Undo a reparenting launch that failed before its record committed, while this
 /// CLI still owns the VMM child: kill and reap it, tear its files down, and return
 /// the error to surface — the missing-runtime-deps cause when the VMM aborted at
-/// boot, else `cause`.
+/// boot, else `cause`. `verb` is the command that launched it.
 pub(super) fn abandon_launch(
+    verb: &'static str,
     child: &mut std::process::Child,
     handle: &LibkrunHandle,
     cause: anyhow::Error,
@@ -2653,7 +2680,7 @@ pub(super) fn abandon_launch(
     let _ = child.kill();
     let _ = child.wait();
     if let Err(teardown) = teardown_handle(handle) {
-        return teardown.context(format!("launch failed: {cause:#}"));
+        return teardown.context(format!("{verb} failed: {cause:#}"));
     }
     if let Some(deps_err) = sigabrt_boot_error(self_status) {
         return deps_err;
@@ -2662,7 +2689,7 @@ pub(super) fn abandon_launch(
     // above. A swept runtime dep is the likeliest cause of a boot failure
     // regardless, so surface it instead of the opaque generic error.
     if let Err(reason) = runtime_deps_present() {
-        return PillboxError::runtime("run", reason).into();
+        return PillboxError::runtime(verb, reason).into();
     }
     cause
 }
@@ -2908,6 +2935,22 @@ fn warm_base(resolved: &Pillbox, handle: &SnapshotHandle) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spawn_vmm_removes_the_spec_when_no_vmm_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = dir.path().join("pillbox-krun-spec-test.json");
+        let record = dir.path().join("record.toml");
+        for exe in [
+            Err(std::io::Error::other("no exe")),
+            Ok(dir.path().join("no-such-pillbox")),
+        ] {
+            std::fs::write(&spec, "{}").unwrap();
+            let tether = VmmTether::Reparented { record: &record };
+            assert!(spawn_vmm_as(exe, &spec, tether, &[]).is_err());
+            assert!(!spec.exists(), "a failed spawn leaked its spec file");
+        }
+    }
     use crate::sandbox::LiveSession;
     use crate::session::{Session, BACKEND_LIBKRUN};
 

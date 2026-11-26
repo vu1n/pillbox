@@ -16,6 +16,7 @@ tests:
   - "src/sandbox/libkrun/sandbox_vm.rs:libkrun_record_round_trips_to_a_target_and_destroy_removes_files_then_record"
   - "src/sandbox/exec_channel.rs:exec_channel_serve_and_run_deliver_both_streams_and_exit_code"
   - "src/commands/sandbox.rs:exec_json_emits_started_output_per_stream_and_exit_code"
+  - "src/commands/sandbox.rs:agent_exit_code_is_zero_in_json_only_when_run_finished_carries_the_outcome"
 ---
 
 # Sandboxes
@@ -43,6 +44,11 @@ backend refuses spawn and can only drop an old record.
 - Exec channel: framed request (argv, cwd = guest workspace) and stdout/stderr/exit
   frames over vsock port 1026, one connection per command.
 - Destroy: the same `teardown_handle` as `session rm` on libkrun, then the record.
+- Agent exit code: plain `sandbox agent` exits with the turn's outcome; `--json` exits 0
+  only when `run_finished` already carries it (a harness failure it didn't report, or no
+  `run_finished` at all, exits non-zero).
+- The record stores `guest_workspace`, the exec cwd. A record without it can be
+  destroyed but not exec'd.
 
 ## How to get to it (user POV)
 

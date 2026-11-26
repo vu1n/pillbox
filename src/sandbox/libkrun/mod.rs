@@ -508,9 +508,27 @@ impl CommitGuard {
         ] {
             std::env::remove_var(k);
         }
-        let owner_pid: i32 = owner?.parse().ok()?;
-        let deadline_secs: u64 = deadline?.parse().ok()?;
-        let record_path = record?;
+        Self::new(
+            spec,
+            spec_path,
+            owner.as_deref(),
+            record.as_deref(),
+            deadline.as_deref(),
+        )
+    }
+
+    /// Build from the raw `PILLBOX_COMMIT_*` values; `None` when any is absent or
+    /// unparsable.
+    fn new(
+        spec: &VmSpec,
+        spec_path: &str,
+        owner_pid: Option<&str>,
+        record_path: Option<&str>,
+        deadline_secs: Option<&str>,
+    ) -> Option<Self> {
+        let owner_pid: i32 = owner_pid?.parse().ok()?;
+        let deadline_secs: u64 = deadline_secs?.parse().ok()?;
+        let record_path = record_path?;
         let mut scrub: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from(spec_path)];
         scrub.extend(
             spec.shares
@@ -1751,18 +1769,22 @@ mod tests {
                          {"port":1026,"host_sock":"/tmp/b.sock"}]}"#,
         )
         .unwrap();
-        // Only this test sets the PILLBOX_COMMIT_* vars; from_env clears them again.
-        std::env::set_var("PILLBOX_COMMIT_OWNER_PID", "1");
-        std::env::set_var("PILLBOX_COMMIT_RECORD", "/tmp/record.toml");
-        std::env::set_var("PILLBOX_COMMIT_DEADLINE", "5");
-        let guard = super::CommitGuard::from_env(&spec, "/tmp/spec.json").unwrap();
+        let guard = super::CommitGuard::new(
+            &spec,
+            "/tmp/spec.json",
+            Some("1"),
+            Some("/tmp/record.toml"),
+            Some("5"),
+        )
+        .unwrap();
         for p in ["/tmp/spec.json", "/tmp/a.sock", "/tmp/b.sock"] {
             assert!(
                 guard.scrub.contains(&std::path::PathBuf::from(p)),
                 "{p} not scrubbed"
             );
         }
-        assert!(std::env::var_os("PILLBOX_COMMIT_RECORD").is_none());
+        assert!(super::CommitGuard::new(&spec, "/s", None, Some("/r"), Some("5")).is_none());
+        assert!(super::CommitGuard::new(&spec, "/s", Some("x"), Some("/r"), Some("5")).is_none());
     }
 
     #[test]

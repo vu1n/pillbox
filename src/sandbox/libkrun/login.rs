@@ -39,11 +39,10 @@ const GUEST_LOGIN_WORKSPACE: &str = "login";
 
 /// Boot a foreground microVM that runs `spec.login_argv`, pump the terminal until
 /// it exits, tear the VM down, and return the guest's exit code. The caller checks
-/// the credential sentinel and finalizes.
-pub(crate) fn login(spec: &AgentSpec, resolved: &Pillbox) -> Result<i32> {
+/// the credential sentinel and finalizes. `home` is `spec`'s real auth home.
+pub(crate) fn login(spec: &AgentSpec, resolved: &Pillbox, home: &Path) -> Result<i32> {
     disk_preflight()?;
     let mut rootfs = materialize_rootfs(resolved)?;
-    let home = spec.home_dir(resolved)?;
     let ca = provision_vault_ca(resolved, CaLifetime::Ephemeral)?;
 
     // Private, empty, and removed with their guards: the boot-script share and the
@@ -73,7 +72,7 @@ pub(crate) fn login(spec: &AgentSpec, resolved: &Pillbox) -> Result<i32> {
         &ca.cert_pem,
         &LoginPaths {
             rootfs: &rootfs,
-            home: &home,
+            home,
             boot_dir: boot_dir.path(),
             workspace: workspace.path(),
             attach_sock: &attach_sock,

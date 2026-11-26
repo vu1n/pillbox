@@ -127,8 +127,22 @@ fn agent(resolved: &Pillbox, id: &str, json: bool, prompt: Vec<String>) -> Resul
         Box::new(HumanSink)
     };
     let argv = adapter.run_argv(&prompt);
-    let mut driver = AgentDriver::new(adapter, sink, record.id.clone());
-    target.exec(&argv, &mut |is_stderr, bytes| {
+    let driver = AgentDriver::new(adapter, sink, record.id.clone());
+    let (harness_code, finished) = run_agent_turn(target.as_ref(), driver, &argv)?;
+    match agent_exit_code(json, harness_code, finished) {
+        0 => Ok(()),
+        code => std::process::exit(code),
+    }
+}
+
+/// Run the harness `argv` in `target` through `driver`; returns the harness's
+/// exit code and the `run_finished` exit code the turn reported, if any.
+fn run_agent_turn(
+    target: &dyn SandboxTarget,
+    mut driver: AgentDriver,
+    argv: &[String],
+) -> Result<(i32, Option<i32>)> {
+    let harness_code = target.exec(argv, &mut |is_stderr, bytes| {
         // the harness emits its protocol on stdout; stderr is diagnostics
         if is_stderr {
             Ok(())
@@ -136,7 +150,25 @@ fn agent(resolved: &Pillbox, id: &str, json: bool, prompt: Vec<String>) -> Resul
             driver.feed(bytes)
         }
     })?;
-    driver.finish()
+    driver.finish()?;
+    Ok((harness_code, driver.finished))
+}
+
+/// The code `sandbox agent` exits with. The turn's outcome is the harness's
+/// non-zero exit, else `run_finished`'s exit code, else 1 (no terminal event).
+// --json exits 0 only when run_finished already reports the outcome, as exec's ExecExit does.
+fn agent_exit_code(json: bool, harness_code: i32, finished: Option<i32>) -> i32 {
+    let outcome = match (harness_code, finished) {
+        (0, Some(code)) => code,
+        (0, None) => 1,
+        (code, _) => code,
+    };
+    let reported = finished.is_some_and(|code| (code != 0) == (outcome != 0));
+    if json && reported {
+        0
+    } else {
+        outcome
+    }
 }
 
 /// The shared agent-channel driver: buffers a harness's stdout into JSON
@@ -146,6 +178,8 @@ struct AgentDriver {
     adapter: Box<dyn HarnessAdapter>,
     emitter: EventEmitter,
     buf: Vec<u8>,
+    /// The exit code of the turn's `run_finished`, once one is emitted.
+    finished: Option<i32>,
 }
 
 impl AgentDriver {
@@ -155,6 +189,7 @@ impl AgentDriver {
             adapter,
             emitter: EventEmitter::new(sink, sandbox_id, Correlation::Run(run_id)),
             buf: Vec::new(),
+            finished: None,
         }
     }
 
@@ -182,6 +217,9 @@ impl AgentDriver {
             return Ok(()); // tolerate non-JSON noise on the stream
         };
         for payload in self.adapter.parse_line(&value) {
+            if let Payload::RunFinished(finished) = &payload {
+                self.finished = Some(finished.exit_code);
+            }
             self.emitter.emit(payload)?;
         }
         Ok(())
@@ -428,6 +466,44 @@ mod tests {
         }
     }
 
+    fn claude_turn(lines: &[&'static [u8]], harness_code: i32) -> (i32, Option<i32>) {
+        let collected = Rc::new(RefCell::new(Vec::new()));
+        let driver = AgentDriver::new(
+            Box::new(ClaudeAdapter::default()),
+            Box::new(CollectSink(collected)),
+            "sb-test".into(),
+        );
+        let target = FakeTarget(lines.iter().map(|l| (false, *l)).collect(), harness_code);
+        run_agent_turn(&target, driver, &["claude".into()]).unwrap()
+    }
+
+    #[test]
+    fn agent_turn_reports_run_finished_and_the_harness_exit_code() {
+        let ok: &[u8] = b"{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"pong\"}\n";
+        let failed: &[u8] = b"{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\"result\":\"api error\"}\n";
+        assert_eq!(claude_turn(&[ok], 0), (0, Some(0)));
+        assert_eq!(claude_turn(&[failed], 0), (0, Some(1)));
+        assert_eq!(claude_turn(&[], 2), (2, None));
+    }
+
+    #[test]
+    fn agent_exit_code_is_zero_in_json_only_when_run_finished_carries_the_outcome() {
+        // A clean turn exits 0 in both modes.
+        assert_eq!(agent_exit_code(false, 0, Some(0)), 0);
+        assert_eq!(agent_exit_code(true, 0, Some(0)), 0);
+        // A failure run_finished reports: plain mirrors it, --json leaves it in the events.
+        assert_eq!(agent_exit_code(false, 0, Some(1)), 1);
+        assert_eq!(agent_exit_code(true, 0, Some(1)), 0);
+        assert_eq!(agent_exit_code(true, 3, Some(3)), 0);
+        // A failure the events don't carry exits non-zero in both modes.
+        assert_eq!(agent_exit_code(true, 3, Some(0)), 3);
+        assert_eq!(agent_exit_code(true, 3, None), 3);
+        assert_eq!(agent_exit_code(false, 3, None), 3);
+        // No run_finished at all: the turn never finished.
+        assert_eq!(agent_exit_code(true, 0, None), 1);
+        assert_eq!(agent_exit_code(false, 0, None), 1);
+    }
+
     #[test]
     fn spawn_rejects_image_before_touching_a_backend() {
         let err = spawn(
@@ -452,6 +528,7 @@ mod tests {
             agent: None,
             workspace: "/work/app".into(),
             workspace_clone: Some("/k/ws/1".into()),
+            guest_workspace: Some("/workspace/app".into()),
             label: None,
             created_at: "2026-01-01T00:00:00Z".into(),
             status: "ready".into(),

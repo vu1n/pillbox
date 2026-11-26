@@ -53,6 +53,9 @@ pub(crate) struct Sandbox {
     /// where its writes land; `None` for a docker record (it mounted `workspace`).
     #[serde(default)]
     pub(crate) workspace_clone: Option<String>,
+    /// Where the guest mounts that clone (libkrun): the cwd of every exec.
+    #[serde(default)]
+    pub(crate) guest_workspace: Option<String>,
     /// Optional human label, surfaced in `sandbox list`.
     #[serde(default)]
     pub(crate) label: Option<String>,
@@ -140,6 +143,7 @@ mod tests {
             agent: None,
             workspace: "/work/app".into(),
             workspace_clone: None,
+            guest_workspace: None,
             label: None,
             created_at: crate::session::now_rfc3339(),
             status: "ready".into(),

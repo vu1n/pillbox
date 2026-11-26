@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Read;
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 
 use anyhow::{Context, Result};
@@ -170,19 +170,6 @@ pub fn check_ready(image: &str) -> Result<()> {
         .into());
     }
     Err(PillboxError::resource("docker pre-flight", stderr.into_owned()).into())
-}
-
-/// Run `docker run <args...>` with stdio inherited from the parent.
-pub fn run_interactive(args: &[String]) -> Result<ExitStatus> {
-    let status = Command::new("docker")
-        .arg("run")
-        .args(args)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .context("invoking `docker run`")?;
-    Ok(status)
 }
 
 /// `docker rm -f <container>` — force-remove (kills if running). Best-effort

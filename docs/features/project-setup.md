@@ -12,6 +12,7 @@ paths:
   - "src/commands/env.rs"
   - "src/commands/auth.rs"
   - "src/agents/mod.rs"
+  - "src/sandbox/libkrun/login.rs"
 entry:
   - "src/pillbox.rs:discover_from"
   - "src/config.rs:resolve_run_config"
@@ -20,6 +21,9 @@ tests:
   - "tests/lifecycle.rs:discovery_walks_up_to_find_descriptor"
   - "tests/lifecycle.rs:secret_inheritance_global_to_project"
   - "src/config.rs:overlay_project_wins_global_fills_gaps"
+  - "src/sandbox/libkrun/login.rs:claude_login_vm_opens_token_endpoints_mounts_the_real_home_and_forwards_the_callback"
+  - "src/sandbox/libkrun/login.rs:login_without_an_oauth_port_has_no_callback_forward"
+  - "src/sandbox/libkrun/login.rs:no_other_launch_builder_sets_login"
 ---
 
 # Project bundles and configuration
@@ -40,8 +44,10 @@ Run `pillbox init`, then `pillbox new --name demo` in a disposable project. `pil
 
 `cargo test --no-default-features --test lifecycle` runs the real CLI in temporary homes and directories. Expect descriptor/state creation, nested discovery, explicit selection and secret inheritance assertions to pass. `cargo test --no-default-features config::tests` exercises default overlays and rejects malformed configuration without starting an agent.
 
+`auth login` needs a real HVF boot. On the Mac, stop Docker Desktop's daemon (the runner rootfs must already be cached under `~/.pillbox/krun/`) and run `pillbox auth login --agent claude`. A microVM boots and shows claude's login prompt; open the printed URL, finish in the browser (the callback reaches the guest through the relay), and expect `✓ claude authenticated` with `~/.pillbox/global/auth/claude/.claude/.credentials.json` written. `cargo test sandbox::libkrun::login` checks the login VM spec (token endpoints open, real home share, callback forward only with an OAuth port) without a boot.
+
 ## Gotchas
 
 - Discovery selects one project; defaults overlay global fields rather than merging every ancestor descriptor.
 - Unknown top-level config fields fail, while the workspace table is permissive.
-- `auth login` still has Docker image/container plumbing; this map does not claim the auth flow was ported to libkrun.
+- `auth login` runs in a foreground libkrun microVM, never Docker; a build without libkrun refuses it. The agent's real auth home (`~/.pillbox/global/auth/<agent>/`) is mounted read-write, without the env-fork or the ownership normalization runs apply to their clones, and the boot script lives in a separate scratch share, so nothing but the agent's own files lands there. It is the only launch whose egress sets `login: true`, which lets the guest reach the providers' OAuth token endpoints; `no_other_launch_builder_sets_login` fails if any other `EgressSpec` literal omits `login: false`. An agent with an OAuth callback port (claude 54545, pi/prime-agent 53692, override with `PILLBOX_<AGENT>_OAUTH_PORT`) gets a host listener on `127.0.0.1:<port>`, relayed over vsock to the guest's `vsock-forward`, so a busy port fails the login before boot.

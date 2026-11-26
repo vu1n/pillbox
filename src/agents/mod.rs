@@ -20,8 +20,8 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 
+use crate::errors::PillboxError;
 use crate::pillbox::{self, Pillbox};
-use crate::{docker, errors::PillboxError};
 
 pub(crate) mod harness;
 pub(crate) mod mcp;
@@ -249,8 +249,12 @@ pub struct AgentSpec {
     /// How pillbox runs + observes this agent (PTY-and-scrape vs server-API).
     pub(crate) integration: Integration,
     pub(crate) cred_sentinel: &'static str,
+    /// Read only by the libkrun login VM (`sandbox::libkrun::login`).
+    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) login_argv: &'static [&'static str],
     pub(crate) run_argv: &'static [&'static str],
+    /// Read only by the libkrun login VM's OAuth callback relay.
+    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
     pub(crate) oauth_port: Option<u16>,
     pub(crate) post_login_finalize: Option<fn(&Path) -> Result<()>>,
     pub(crate) vault_capable: bool,
@@ -779,7 +783,8 @@ impl AgentSpec {
         }
     }
 
-    fn resolved_oauth_port(&self) -> Option<u16> {
+    #[cfg(feature = "libkrun")]
+    pub(crate) fn resolved_oauth_port(&self) -> Option<u16> {
         let default = self.oauth_port?;
         let var = format!("PILLBOX_{}_OAUTH_PORT", self.id.to_uppercase());
         let port = std::env::var(&var)
@@ -790,34 +795,45 @@ impl AgentSpec {
     }
 
     pub(crate) fn login(&self, resolved: &Pillbox) -> Result<()> {
-        let image = docker::check_ready_for(resolved)?;
+        // auth login runs only in the libkrun microVM; there is no Docker fallback.
+        #[cfg(not(feature = "libkrun"))]
+        let _ = resolved;
+        #[cfg(not(feature = "libkrun"))]
+        return Err(PillboxError::usage(
+            "login",
+            format!(
+                "`pillbox auth login --agent {}` needs the libkrun microVM backend, and this pillbox was built without it",
+                self.id
+            ),
+        )
+        .with_next("rebuild pillbox with the default `libkrun` feature")
+        .into());
 
-        let home = self.home_dir(resolved)?;
+        #[cfg(feature = "libkrun")]
+        {
+            let home = self.home_dir(resolved)?;
 
-        let mut args = base_docker_args();
-        if let Some(port) = self.resolved_oauth_port() {
-            args.push("-p".into());
-            args.push(format!("{port}:{port}"));
+            println!("pillbox: starting {} login inside a sandbox.", self.id);
+            println!("pillbox: follow the prompts (and any URL) printed by the sandbox below.");
+            println!();
+
+            let code = crate::sandbox::libkrun::login::login(self, resolved)?;
+            if code != 0 {
+                return Err(PillboxError::runtime(
+                    "login",
+                    format!("{} exited with status {code}", self.id),
+                )
+                .with_next(format!("pillbox auth login --agent {}", self.id))
+                .into());
+            }
+            self.finish_login(&home)
         }
-        args.push("-v".into());
-        args.push(format!("{}:{GUEST_HOME}", home.display()));
-        args.push(image);
-        args.extend(self.login_argv.iter().map(|s| s.to_string()));
+    }
 
-        println!("pillbox: starting {} login inside a sandbox.", self.id);
-        println!("pillbox: follow the prompts (and any URL) printed by the sandbox below.");
-        println!();
-
-        let status = docker::run_interactive(&args)?;
-        if !status.success() {
-            return Err(PillboxError::runtime(
-                "login",
-                format!("{} exited with status {status}", self.id),
-            )
-            .with_next(format!("pillbox auth login --agent {}", self.id))
-            .into());
-        }
-
+    /// The post-login checks: the credential sentinel exists, then the agent's
+    /// optional finalize hook runs (best-effort).
+    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+    fn finish_login(&self, home: &Path) -> Result<()> {
         if !home.join(self.cred_sentinel).exists() {
             return Err(PillboxError::runtime(
                 "login",
@@ -835,7 +851,7 @@ impl AgentSpec {
         }
 
         if let Some(finalize) = self.post_login_finalize {
-            if let Err(e) = finalize(&home) {
+            if let Err(e) = finalize(home) {
                 eprintln!(
                     "pillbox: warning: could not finalize {} setup: {e}",
                     self.id
@@ -1088,9 +1104,8 @@ pub(crate) fn resolve_run_env(
 }
 
 /// `docker run` args common to every local launch: host-gateway alias +
-/// the HOME/TERM/PATH env scaffolding. `stdio_prefix` is the per-mode head:
-/// `["-it", "--rm"]` for a foreground run, `["-d"]` for the detached
-/// attach-transport flow.
+/// the HOME/TERM/PATH env scaffolding. `stdio_prefix` is the per-mode head
+/// (`["-d"]` for the detached attach-transport flow).
 fn base_docker_args_with(stdio_prefix: &[&str]) -> Vec<String> {
     let mut v: Vec<String> = stdio_prefix.iter().map(|s| (*s).into()).collect();
     v.extend([
@@ -1108,10 +1123,6 @@ fn base_docker_args_with(stdio_prefix: &[&str]) -> Vec<String> {
         format!("PATH={}", guest_path()),
     ]);
     v
-}
-
-pub(crate) fn base_docker_args() -> Vec<String> {
-    base_docker_args_with(&["-it", "--rm"])
 }
 
 /// Detached base args for the attach-transport flow: `-d`, no `--rm`, so the

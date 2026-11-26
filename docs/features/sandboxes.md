@@ -26,6 +26,7 @@ tests:
   - "src/sandbox/exec_channel.rs:exec_channel_serve_and_run_deliver_both_streams_and_exit_code"
   - "src/sandbox/exec_channel.rs:exec_channel_kills_a_quiet_command_when_the_host_disconnects"
   - "src/sandbox/exec_channel.rs:exit_arrives_promptly_even_while_a_background_writer_floods_stdout"
+  - "src/sandbox/exec_channel.rs:a_background_process_holding_stdout_can_still_flood_stderr_after_exit"
   - "src/sandbox/exec_channel.rs:a_command_that_cannot_start_exits_127_or_126_with_the_reason_on_stderr"
   - "src/commands/sandbox.rs:exec_json_emits_nothing_when_the_target_refuses_before_the_command_starts"
   - "src/sandbox/exec_channel.rs:exec_channel_exits_when_the_command_does_even_if_a_background_child_holds_stdout"

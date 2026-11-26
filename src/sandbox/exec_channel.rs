@@ -292,12 +292,11 @@ pub(crate) fn serve_exec(mut stream: UnixStream, run_as: Option<RunAs>) -> Resul
         .context("wait for exec'd command")?;
     pipes.retain(|p| p.open);
     if !pipes.is_empty() {
-        // Background descendants still hold the pipes: drain them so they never hit SIGPIPE.
-        std::thread::spawn(move || {
-            for pipe in pipes {
-                pipe.discard_until_eof();
-            }
-        });
+        // Background descendants still hold the pipes: drain them all concurrently so none
+        // blocks on a full pipe behind another that never reaches EOF.
+        for pipe in pipes {
+            std::thread::spawn(move || pipe.discard_until_eof());
+        }
     }
     ExecFrame::Exit(exit_code(status)).encode(&mut stream)?;
     Ok(())
@@ -788,6 +787,34 @@ mod tests {
         let writer = read_pid(&pidfile);
         unsafe { libc::kill(writer, libc::SIGKILL) };
         assert_eq!(outcome.expect("Exit never arrived").unwrap(), 0);
+    }
+
+    #[test]
+    fn a_background_process_holding_stdout_can_still_flood_stderr_after_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("bg");
+        let marker = dir.path().join("done");
+        // After the command exits, the background subshell (stdout never closed) writes
+        // 256 KiB to stderr, more than a pipe buffer, then touches the marker.
+        let script = format!(
+            "(sleep 1; head -c 262144 /dev/zero >&2; touch '{}'; sleep 30) & echo $! > '{}'",
+            marker.display(),
+            pidfile.display()
+        );
+        let (code, _, _) = exec_over_pair(&["sh", "-c", &script], None);
+        assert_eq!(code.unwrap(), 0);
+        let bg = read_pid(&pidfile);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let finished = marker.exists();
+        // Kill the subshell and its `sleep 30`.
+        let _ = std::process::Command::new("pkill")
+            .args(["-KILL", "-P", &bg.to_string()])
+            .status();
+        unsafe { libc::kill(bg, libc::SIGKILL) };
+        assert!(finished, "background writer blocked on a full stderr pipe");
     }
 
     #[test]

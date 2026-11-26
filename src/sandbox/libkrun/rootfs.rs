@@ -287,9 +287,12 @@ fn empty_dir_at(dir: &std::os::fd::OwnedFd, depth: usize) -> Result<()> {
 }
 
 #[cfg(test)]
+type StatHook = Box<dyn FnMut(&std::ffi::CStr)>;
+
+#[cfg(test)]
 thread_local! {
     /// Test seam: runs between an entry's stat and its chmod, as a racing guest would.
-    static AFTER_STAT: std::cell::RefCell<Option<Box<dyn FnMut(&std::ffi::CStr)>>> =
+    static AFTER_STAT: std::cell::RefCell<Option<StatHook>> =
         const { std::cell::RefCell::new(None) };
 }
 

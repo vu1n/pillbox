@@ -7,7 +7,8 @@
 // stamped with the agent actor (never self-reported by opencode-in-the-box).
 //
 // Kept 1:1 with the Rust mapper. The payload *shapes* come from contract.ts,
-// which is generated from contract.rs, so `tsc` rejects a payload Rust can't read;
+// which is generated from contract.rs, so `tsc` rejects a payload *shape* Rust
+// doesn't declare (Rust's own decode checks and integer ranges still apply);
 // `opencode_mapper.test.ts` checks the mapping *logic* against fixtures cribbed
 // from opencode.rs's own tests. Change both sides together.
 //

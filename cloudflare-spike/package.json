@@ -10,8 +10,8 @@
     "burnin:dry-run": "wrangler deploy -c wrangler.burnin.toml --dry-run --containers-rollout=none",
     "burnin": "node scripts/burnin-fixed-workload.mjs",
     "burnin:reconcile": "node scripts/reconcile-burnin.mjs",
-    "gen:contract": "json2ts --input contract.schema.json --output src/contract.ts --no-additionalProperties --unknownAny --bannerComment '// GENERATED from contract.schema.json, which src/contract.rs emits. Do not edit; change src/contract.rs, then run\n// UPDATE_SCHEMA=1 cargo test --no-default-features --features contract-schema contract_schema_is_current && npm run gen:contract'",
-    "check:contract": "npm run --silent gen:contract && git diff --exit-code -- src/contract.ts"
+    "gen:contract": "node scripts/gen-contract.mjs",
+    "check:contract": "node scripts/gen-contract.mjs --check"
   },
   "dependencies": {
     "@cfworker/json-schema": "^4.1.1",

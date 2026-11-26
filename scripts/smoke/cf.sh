@@ -13,7 +13,7 @@ PORT="${SMOKE_CF_PORT:-8799}"
 echo "▶ CF managed smokes (wrangler dev :$PORT)"
 # src/contract.ts is generated from contract.schema.json (itself emitted by src/contract.rs);
 # fail fast before spinning wrangler if it is stale.
-npm run --silent check:contract || { echo "  ✗ src/contract.ts is stale: run npm run gen:contract"; exit 1; }
+npm run --silent check:contract || { echo "  ✗ check:contract failed (see above)"; exit 1; }
 echo "  ✓ §0 contract.ts is current"
 npx tsc --noEmit || { echo "  ✗ tsc --noEmit failed"; exit 1; }
 echo "  ✓ tsc clean"

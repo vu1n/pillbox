@@ -33,6 +33,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::contract::{Event, Payload, ToolStatus};
 use crate::errors::PillboxError;
 
 /// Env var the live critic reads its key from (no secret ever lands in argv).
@@ -141,43 +142,36 @@ const EDIT_TOOLS: &[&str] = &[
     "create_file",
 ];
 
-/// Parse a `session log` dump (one event JSON per line) into the worker's edit
-/// list, in order. Only *completed* edit tool calls with an input count; a
-/// `running` frame carries no input yet, and reads/greps/shell are not edits.
-/// Shell writes (`cat > f`, `sed -i`) are NOT recovered — same blind spot as the
-/// offline extractor, stated rather than papered over.
-pub(crate) fn edits_from_log(log_jsonl: &str) -> Vec<EditRecord> {
-    let mut out = Vec::new();
-    for line in log_jsonl.lines() {
-        let Ok(ev) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let p = &ev["payload"];
-        if p["type"] != "tool_call" || p["status"] != "completed" {
-            continue;
-        }
-        let name = p["name"].as_str().unwrap_or_default();
-        if !EDIT_TOOLS.contains(&name) {
-            continue;
-        }
-        let input = &p["input"];
-        if !input.is_object() {
-            continue;
-        }
-        let file = first_str(input, &["filePath", "path", "file_path"]);
-        let old = first_str(input, &["oldString", "old_string"]);
-        let new = first_str(input, &["newString", "new_string", "content"]);
-        if file.is_empty() && old.is_empty() && new.is_empty() {
-            continue;
-        }
-        out.push(EditRecord {
-            tool: name.to_string(),
-            file,
-            old,
-            new,
-        });
-    }
-    out
+/// The worker's edit list, in order, from its typed §0 events. Only
+/// *completed* edit tool calls with an object input count; a `running` frame
+/// carries no input yet, and reads/greps/shell are not edits. Shell writes
+/// (`cat > f`, `sed -i`) are NOT recovered — same blind spot as the offline
+/// extractor, stated rather than papered over.
+pub(crate) fn edits_from_events(events: &[Event]) -> Vec<EditRecord> {
+    events
+        .iter()
+        .filter_map(|ev| {
+            let Payload::ToolCall(call) = &ev.payload else {
+                return None;
+            };
+            if call.status != ToolStatus::Completed || !EDIT_TOOLS.contains(&call.name.as_str()) {
+                return None;
+            }
+            let input = call.input.as_ref().filter(|v| v.is_object())?;
+            let file = first_str(input, &["filePath", "path", "file_path"]);
+            let old = first_str(input, &["oldString", "old_string"]);
+            let new = first_str(input, &["newString", "new_string", "content"]);
+            if file.is_empty() && old.is_empty() && new.is_empty() {
+                return None;
+            }
+            Some(EditRecord {
+                tool: call.name.clone(),
+                file,
+                old,
+                new,
+            })
+        })
+        .collect()
 }
 
 fn first_str(v: &Value, keys: &[&str]) -> String {
@@ -401,20 +395,70 @@ mod tests {
         assert_eq!(count_edits(&s), 1);
     }
 
+    fn tool_call(seq: u64, name: &str, status: ToolStatus, input: Option<Value>) -> Event {
+        let mut ev = Event::session(
+            "w1",
+            Payload::ToolCall(crate::contract::ToolCall {
+                tool_call_id: format!("t{seq}"),
+                name: name.into(),
+                status,
+                input,
+                output: String::new(),
+                title: String::new(),
+            }),
+        );
+        ev.seq = seq;
+        ev
+    }
+
     #[test]
-    fn edits_from_log_keeps_completed_edit_calls_only_in_order() {
-        let log = [
-            r#"{"seq":1,"payload":{"type":"tool_call","name":"read","status":"completed","input":{"filePath":"/ws/a.py"}}}"#,
-            r#"{"seq":2,"payload":{"type":"tool_call","name":"edit","status":"running","input":{}}}"#,
-            r#"{"seq":3,"payload":{"type":"tool_call","name":"edit","status":"completed","input":{"filePath":"/ws/a.py","oldString":"1","newString":"2"}}}"#,
-            r#"{"seq":4,"payload":{"type":"tool_call","name":"Write","status":"completed","input":{"file_path":"/ws/b.py","content":"hi"}}}"#,
-            r#"{"seq":5,"payload":{"type":"scored","passed":true}}"#,
-            "not json",
-        ]
-        .join("\n");
-        let edits = edits_from_log(&log);
+    fn edits_from_events_keeps_completed_edit_calls_only_in_order() {
+        let events = [
+            tool_call(
+                1,
+                "read",
+                ToolStatus::Completed,
+                Some(json!({"filePath": "/ws/a.py"})),
+            ),
+            tool_call(2, "edit", ToolStatus::Running, Some(json!({}))),
+            tool_call(
+                3,
+                "edit",
+                ToolStatus::Completed,
+                Some(json!({"filePath": "/ws/a.py", "oldString": "1", "newString": "2"})),
+            ),
+            tool_call(4, "edit", ToolStatus::Completed, None),
+            tool_call(
+                5,
+                "edit",
+                ToolStatus::Completed,
+                Some(json!("not an object")),
+            ),
+            tool_call(
+                6,
+                "edit",
+                ToolStatus::Error,
+                Some(json!({"filePath": "/ws/x.py"})),
+            ),
+            tool_call(
+                7,
+                "Write",
+                ToolStatus::Completed,
+                Some(json!({"file_path": "/ws/b.py", "content": "hi"})),
+            ),
+            Event::session(
+                "w1",
+                Payload::Scored(crate::contract::Scored {
+                    grader: "cmd".into(),
+                    passed: true,
+                    score: 1.0,
+                    feedback: String::new(),
+                    criteria: vec![],
+                }),
+            ),
+        ];
         assert_eq!(
-            edits,
+            edits_from_events(&events),
             vec![
                 EditRecord {
                     tool: "edit".into(),

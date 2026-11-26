@@ -35,11 +35,12 @@ Create a base snapshot/bookmark and a verifier, then use `pillbox dispatch --fro
 
 ## Driving it with the repository harness
 
-`cargo test --no-default-features commands::dispatch` runs offline parsing, selection and fake-grader tests, including protected tests and absence of host execution. On a signed libkrun build with configured image/auth, `scripts/smoke/dispatch.sh` and `scripts/smoke/dispatch-segments.sh` drive live worker selection and segment behavior; these consume model turns.
+`cargo test --no-default-features commands::dispatch` runs offline parsing, selection and fake-grader tests, including protected tests and absence of host execution. The live driver (`SessionDriver`) calls the session API in-process; its workspace lookup, grading and pull go through the `SessionOps` seam, which the grading tests replace with a recorder that refuses non-`in_sandbox` grades. On a signed libkrun build with configured image/auth, `scripts/smoke/dispatch.sh` and `scripts/smoke/dispatch-segments.sh` drive live worker selection and segment behavior; these consume model turns.
 
 ## Gotchas
 
 - A segment gate steers progression; it is not the authoritative run-level reward.
 - Worker-edited tests are restored/protected for grading. Grader unavailability is an error, not a host fallback.
 - Inspect `pulled_to`, not only winner/exit status; result recovery can fail separately.
+- Dispatch never re-executes `pillbox` or parses CLI `--json`; a fork that comes back as anything but a detached/server session (or a structured run that exited 0) errors that worker.
 - A general Ghost planner/conductor DAG remains design history, not a feature implied by the implemented segment chain.

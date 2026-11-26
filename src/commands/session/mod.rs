@@ -354,6 +354,8 @@ fn session_transcript(
         // so Workshop's Overview renders — there's no MITM here to do it.
         let mut tailer = events::transcripts::Tailer::new(
             file.to_path_buf(),
+            // FILE is an operator CLI argument, not a guest-discovered path: opened as named.
+            events::transcripts::TranscriptSource::Operator,
             session_id.into(),
             harness,
             true,

@@ -28,7 +28,7 @@ Users can inspect and drive sessions, replay attributed events, read artifacts/c
 - Registry lookup, prefix resolution, status, completion, labels and expiry/pruning.
 - Durable sequenced events, transcript adapters, blobs and read-side exporters.
 - Input/send, local subscription/watch, PTY transport and detach/reattach.
-- Typed in-process session calls (`send`, `stream::wait_idle`, `workspace_of`, `score`, `log_events`, `rehydrate_result`) that the CLI handlers render; their `--json` output is one client, not the API.
+- Typed in-process session calls (`send`, `stream::wait_idle`, `workspace_of`, `score`, `rehydrate_result`) that the CLI handlers render; their `--json` output is one client, not the API.
 
 ## How to get to it (user POV)
 

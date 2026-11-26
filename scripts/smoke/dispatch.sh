@@ -21,8 +21,8 @@ export PILLBOX_BACKEND="$BACKEND" PILLBOX_RUNNER_IMAGE="$IMAGE"
 fail() { echo "  ✗ dispatch: $1"; exit 1; }
 
 # libkrun-only today: dispatch's grader resolves each worker's *live* workspace
-# via `session info --json` → `.session.workspace`, which only libkrun sessions
-# populate (`libkrun_workspace_path`). Docker dispatch needs a non-libkrun
+# in-process via `commands::session::workspace_of` (the session's
+# `LiveSession::workspace_path`), which only libkrun sessions provide. Docker dispatch needs a non-libkrun
 # workspace-resolution path (pull-then-score, or score-by-result-snapshot) —
 # deferred, see docs/dispatch.md. Skip (don't fail the suite) on docker.
 if [ "$BACKEND" != libkrun ]; then

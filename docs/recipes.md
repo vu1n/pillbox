@@ -186,8 +186,8 @@ detach/reattach — works the same. See
 ```sh
 # Start, immediately return — agent keeps running in the background.
 pillbox run --detach --label "nightly-refactor"
-# pillbox: ✓ session `abc123def456` started in background.
-#          pillbox session attach abc123def456  # reattach
+# pillbox: ✓ session `abc123def456` started in background (libkrun)
+#   Next: pillbox session attach abc123def456
 
 # Browse:
 pillbox session list                       # human

@@ -1423,29 +1423,8 @@ mod tests {
 
     fn run_opts() -> RunOpts {
         RunOpts {
-            workspace: None,
-            name: None,
-            mounts: Vec::new(),
-            withs: Vec::new(),
-            env_bundles: Vec::new(),
-            env_files: Vec::new(),
-            vault: false,
-            memory: false,
-            memory_briefed: Vec::new(),
-            mcps: Vec::new(),
-            mcp_tokens: Vec::new(),
             args: vec!["must-not-run".into()],
-            detach: false,
-            label: None,
-            json: false,
-            ttl_seconds: None,
-            from_bookmark: None,
-            model: None,
-            profile: None,
-            reasoning_effort: None,
-            temperature: None,
-            egress_allow: Vec::new(),
-            egress_deny: false,
+            ..RunOpts::default()
         }
     }
 

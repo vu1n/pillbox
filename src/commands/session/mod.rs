@@ -788,7 +788,7 @@ fn session_detach(resolved: &Pillbox, id: &str) -> Result<()> {
 
 /// The `session rm` success banner; managed sessions only have a local record to drop.
 pub(crate) fn print_removed(s: &session::Session) {
-    if s.placement == session::Placement::Managed {
+    if s.backend == session::BACKEND_MANAGED {
         println!("pillbox: ✓ managed session `{}` record removed.", s.id);
     } else {
         println!("pillbox: ✓ session `{}` removed.", s.id);
@@ -1151,7 +1151,7 @@ fn session_log(
 /// rendering. A missing log reads as empty (see [`SessionLog::read_from`]).
 ///
 /// [`SessionLog::read_from`]: crate::events::log::SessionLog::read_from
-pub(crate) fn log_events(
+fn log_events(
     resolved: &Pillbox,
     id: &str,
     types: &[String],

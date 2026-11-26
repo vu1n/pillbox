@@ -916,13 +916,11 @@ fn run(cli: Cli) -> Result<()> {
                 env_files,
                 vault,
                 memory,
-                memory_briefed: Vec::new(), // commands::run::start fills this from the kypp briefing
                 mcps,
                 mcp_tokens,
                 args,
                 detach,
                 label,
-                json,
                 ttl_seconds,
                 from_bookmark,
                 model,
@@ -931,6 +929,8 @@ fn run(cli: Cli) -> Result<()> {
                 temperature,
                 egress_allow,
                 egress_deny,
+                // memory_briefed: commands::run::start fills it from the kypp briefing.
+                ..RunOpts::default()
             };
             // `--preset NAME` folds the descriptor's `[preset.NAME]` under the
             // explicit flags (flag > preset > descriptor > built-in), then a
@@ -942,7 +942,21 @@ fn run(cli: Cli) -> Result<()> {
                 apply_preset(name, p, &mut agent, &mut opts)?;
                 eprintln!("{}", preset_banner(name, p));
             }
-            dispatch_run(&resolved, agent, opts)
+            // `--json` needs a persisted session to report; a foreground PTY run has none,
+            // so it is refused before launch rather than printing nothing after it. (Not a
+            // clap `requires`: server-mode validity depends on the resolved agent.)
+            if json && !opts.detach {
+                let spec = commands::run::resolve_agent_spec(&resolved, agent.as_deref())?;
+                if !spec.integration.supports_execution_request() {
+                    return Err(PillboxError::usage(
+                        "run",
+                        "--json needs a persisted session: add --detach, or run a structured agent",
+                    )
+                    .with_next(format!("pillbox run --agent {} --detach --json", spec.id))
+                    .into());
+                }
+            }
+            dispatch_run(&resolved, agent, opts, json)
         }
         Command::Dispatch {
             from_bookmark,
@@ -1289,8 +1303,12 @@ fn preset_banner(name: &str, p: &config::Preset) -> String {
 }
 
 /// `pillbox run`: start the run in-process, then render what started.
-fn dispatch_run(resolved: &Pillbox, agent: Option<String>, opts: RunOpts) -> Result<()> {
-    let json = opts.json;
+fn dispatch_run(
+    resolved: &Pillbox,
+    agent: Option<String>,
+    opts: RunOpts,
+    json: bool,
+) -> Result<()> {
     // Nudge if Raindrop Workshop is installed but no OTLP endpoint is set, so a
     // silent "no events" doesn't surprise the user.
     crate::events::hint_workshop_if_unconfigured();
@@ -1464,7 +1482,6 @@ mod tests {
             mcp_tokens,
             detach,
             label,
-            json,
             from_bookmark,
             model,
             profile,
@@ -1489,14 +1506,11 @@ mod tests {
                 env_files,
                 vault,
                 memory,
-                memory_briefed: Vec::new(),
                 mcps,
                 mcp_tokens,
                 args,
                 detach,
                 label,
-                json,
-                ttl_seconds: None,
                 from_bookmark,
                 model,
                 profile,
@@ -1504,6 +1518,7 @@ mod tests {
                 temperature,
                 egress_allow,
                 egress_deny,
+                ..RunOpts::default()
             },
         )
     }

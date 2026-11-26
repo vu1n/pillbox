@@ -36,7 +36,6 @@ use crate::commands::{self};
 use crate::contract::Scored;
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
-use crate::sandbox::Started;
 
 /// Default per-turn idle cap (seconds) — generous; an agent turn runs minutes.
 /// The monolithic-truncation lesson (docs/optimization-gate.md): too small a cap
@@ -370,32 +369,18 @@ struct Runner<'a> {
 fn run_opts(spec: &EvalSpec, v: &Variant) -> Result<RunOpts> {
     Ok(RunOpts {
         workspace: spec.workspace.as_ref().map(PathBuf::from),
-        name: None,
-        mounts: Vec::new(),
-        withs: Vec::new(),
-        env_bundles: Vec::new(),
-        env_files: Vec::new(),
-        vault: false,
         memory: v.memory,
-        memory_briefed: Vec::new(), // commands::run::start fills this from the kypp briefing
         mcps: v
             .mcp
             .iter()
             .map(|m| McpAttachment::parse(m))
             .collect::<Result<_>>()?,
-        mcp_tokens: Vec::new(),
-        args: Vec::new(),
         detach: true,
-        label: None,
-        json: false,
-        ttl_seconds: None,
         from_bookmark: spec.from_bookmark.clone(), // validate() rejects workspace + bookmark together
         model: v.model.clone(),
-        profile: None,
-        reasoning_effort: None,
         temperature: v.temperature,
-        egress_allow: Vec::new(),
-        egress_deny: false,
+        // memory_briefed: commands::run::start fills it from the kypp briefing.
+        ..RunOpts::default()
     })
 }
 
@@ -439,18 +424,12 @@ impl<'a> Runner<'a> {
         let session = self.start_session(spec, v)?;
         // Drive the prompt as turn 1, then block until idle (bounded by budget).
         session::send(self.resolved, &session, prompt)?;
-        let idle = stream::wait_idle(
+        stream::wait_idle(
             self.resolved,
             &session,
             Some(Duration::from_secs(spec.max_seconds())),
             None,
         )?;
-        if !idle {
-            bail!(
-                "session {session} not idle within {}s (--max-seconds)",
-                spec.max_seconds()
-            );
-        }
         let grade = self.grade(&session, spec)?;
         Ok((session, grade))
     }
@@ -459,21 +438,9 @@ impl<'a> Runner<'a> {
     fn start_session(&self, spec: &EvalSpec, v: &Variant) -> Result<String> {
         // A variant's agent overrides the spec default.
         let agent = v.agent.as_ref().or(spec.agent.as_ref());
-        match commands::run::start(self.resolved, agent.map(String::as_str), run_opts(spec, v)?)? {
-            Started::Detached(s) => Ok(s.id),
-            Started::StructuredFinished {
-                session, exit_code, ..
-            } if exit_code != 0 => {
-                bail!(
-                    "session {} exited {exit_code} before the prompt",
-                    session.id
-                )
-            }
-            Started::StructuredFinished { session, .. }
-            | Started::ServerReady { session, .. }
-            | Started::ManagedFinished(session) => Ok(session.id),
-            Started::Foreground => bail!("`run` started a foreground session, not a detached one"),
-        }
+        let started =
+            commands::run::start(self.resolved, agent.map(String::as_str), run_opts(spec, v)?)?;
+        Ok(started.into_live_session()?.id)
     }
 
     /// Grade the run's live workspace clone in place (libkrun-only, like
@@ -530,7 +497,7 @@ mod tests {
         )
         .unwrap();
         let o = run_opts(&spec, &spec.resolved_variants()[0]).unwrap();
-        assert!(o.detach && o.memory && !o.json && !o.vault);
+        assert!(o.detach && o.memory && !o.vault);
         assert_eq!(o.from_bookmark.as_deref(), Some("base"));
         assert!(o.workspace.is_none());
         assert_eq!(o.model.as_deref(), Some("p/m"));

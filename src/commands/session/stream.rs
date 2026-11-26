@@ -210,34 +210,28 @@ pub(super) fn session_wait_idle(
     from: Option<u64>,
 ) -> Result<()> {
     let s = session::resolve(resolved, id)?;
-    if wait_idle(
+    wait_idle(
         resolved,
         &s.id,
         timeout.map(std::time::Duration::from_secs),
         from,
-    )? {
-        println!("pillbox: session `{}` idle", s.id);
-        Ok(())
-    } else {
-        Err(PillboxError::runtime(
-            "session wait-idle",
-            format!("session `{}` did not go idle within the timeout", s.id),
-        )
-        .into())
-    }
+    )?;
+    println!("pillbox: session `{}` idle", s.id);
+    Ok(())
 }
 
 /// Block until the session's current turn goes idle, or `timeout` passes —
-/// `session wait-idle` without its banner. `Ok(true)` = idle, `Ok(false)` = timed
-/// out. With `from` = `None` it waits for the next idle after the current log
-/// tail, and an already-finished current turn counts as idle; `Some(seq)`
-/// replays exactly from that seq.
+/// `session wait-idle` without its banner. A timeout returns the error the CLI
+/// prints ("session `<id>` did not go idle within the timeout"). With `from` =
+/// `None` it waits for the next idle after the current log tail, and an
+/// already-finished current turn counts as idle; `Some(seq)` replays exactly
+/// from that seq.
 pub(crate) fn wait_idle(
     resolved: &Pillbox,
     id: &str,
     timeout: Option<std::time::Duration>,
     from: Option<u64>,
-) -> Result<bool> {
+) -> Result<()> {
     use crate::contract::Payload;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
@@ -287,7 +281,7 @@ pub(crate) fn wait_idle(
             .max()
             .unwrap_or(0);
         if last_idle > last_turn {
-            return Ok(true);
+            return Ok(());
         }
     }
 
@@ -313,7 +307,14 @@ pub(crate) fn wait_idle(
         !done // keep subscribing until a turn-done event (or `stop`/timeout)
     })?;
 
-    Ok(idle)
+    if !idle {
+        return Err(PillboxError::runtime(
+            "session wait-idle",
+            format!("session `{}` did not go idle within the timeout", s.id),
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// A deadline for [`wait_idle`]: its thread sets `stop` once `timeout` passes.
@@ -595,14 +596,13 @@ mod tests {
 
             let began = std::time::Instant::now();
             // `from` set: skip the already-idle fast path and take the subscribe path.
-            let idle = super::wait_idle(
+            super::wait_idle(
                 &pb,
                 &s.id,
                 Some(std::time::Duration::from_secs(3600)),
                 Some(1),
             )
             .unwrap();
-            assert!(idle);
             // Returning at all means the 1-hour deadline thread was cancelled and joined.
             assert!(began.elapsed() < std::time::Duration::from_secs(30));
         });

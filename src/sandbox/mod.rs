@@ -165,6 +165,48 @@ pub(crate) enum Started {
     ManagedFinished(Session),
 }
 
+impl Started {
+    /// The session this run persisted; `None` for a foreground run.
+    pub(crate) fn session(&self) -> Option<&Session> {
+        match self {
+            Started::Foreground => None,
+            Started::Detached(session)
+            | Started::ServerReady { session, .. }
+            | Started::StructuredFinished { session, .. }
+            | Started::ManagedFinished(session) => Some(session),
+        }
+    }
+
+    /// The session a caller can go on driving locally (`session send`,
+    /// `wait-idle`, score its workspace): a detached PTY session, a ready
+    /// server, or a structured run whose agent exited 0.
+    // A failed structured run, a foreground run and a managed run are not drivable local sessions.
+    pub(crate) fn into_live_session(self) -> Result<Session> {
+        match self {
+            Started::Detached(session) | Started::ServerReady { session, .. } => Ok(session),
+            Started::StructuredFinished {
+                session, exit_code, ..
+            } => {
+                if exit_code != 0 {
+                    anyhow::bail!(
+                        "{} structured run `{}` exited {exit_code}",
+                        session.agent_id,
+                        session.id
+                    );
+                }
+                Ok(session)
+            }
+            Started::Foreground => {
+                anyhow::bail!("started a foreground run, not a detached session")
+            }
+            Started::ManagedFinished(session) => anyhow::bail!(
+                "started a managed run (`{}`), not a local detached session",
+                session.id
+            ),
+        }
+    }
+}
+
 /// The live session — **the plane**. A running (foreground or detached) agent
 /// the command layer drives and reads *without branching on the backend*: every
 /// `session send`/`attach`/`watch`/`kill`/… resolves to one of these. Each
@@ -319,6 +361,36 @@ mod tests {
         } else {
             "libkrun"
         }
+    }
+
+    #[test]
+    fn only_a_live_or_cleanly_finished_run_is_a_live_session() {
+        let s = Session::test_fixture();
+        assert_eq!(
+            Started::Detached(s.clone()).into_live_session().unwrap().id,
+            s.id
+        );
+        let server = Started::ServerReady {
+            session: s.clone(),
+            pending_prompt: None,
+        };
+        assert_eq!(server.session().map(|x| x.id.as_str()), Some(s.id.as_str()));
+        assert_eq!(server.into_live_session().unwrap().id, s.id);
+        let finished = |exit_code| Started::StructuredFinished {
+            session: s.clone(),
+            events: 3,
+            exit_code,
+        };
+        assert_eq!(finished(0).into_live_session().unwrap().id, s.id);
+        let err = format!("{:#}", finished(2).into_live_session().unwrap_err());
+        assert!(err.contains("exited 2"), "{err}");
+        assert!(Started::Foreground.session().is_none());
+        let err = format!("{:#}", Started::Foreground.into_live_session().unwrap_err());
+        assert!(err.contains("foreground"), "{err}");
+        let managed = Started::ManagedFinished(s.clone());
+        assert!(managed.session().is_some());
+        let err = format!("{:#}", managed.into_live_session().unwrap_err());
+        assert!(err.contains("managed"), "{err}");
     }
 
     #[test]

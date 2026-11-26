@@ -42,5 +42,6 @@ Create a base snapshot/bookmark and a verifier, then use `pillbox dispatch --fro
 - A segment gate steers progression; it is not the authoritative run-level reward.
 - Worker-edited tests are restored/protected for grading. Grader unavailability is an error, not a host fallback.
 - Inspect `pulled_to`, not only winner/exit status; result recovery can fail separately.
-- Dispatch never re-executes `pillbox` or parses CLI `--json`; a fork that comes back as anything but a detached/server session (or a structured run that exited 0) errors that worker.
+- Dispatch never re-executes `pillbox` or parses CLI `--json`; a fork that comes back as anything but a detached/server session (or a structured run that exited 0) errors that worker (`Started::into_live_session`).
+- Forks run `run::start` inside the long-lived dispatch process, so each detached `__krun-vmm`/`__session-tailer` child is handed to `sandbox::reap_detached`; a dropped `Child` that exits would stay a zombie that the tailer's signal-0 liveness probe reads as alive, and `wait_idle` would never start a replacement tailer.
 - A general Ghost planner/conductor DAG remains design history, not a feature implied by the implemented segment chain.

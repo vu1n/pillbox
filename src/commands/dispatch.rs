@@ -18,8 +18,8 @@
 //!
 //! **Orchestration is in-process over the typed session calls.** The loop forks
 //! workers with `run::start` and drives, grades, pulls and reads them through the
-//! session API (`send`, `wait_idle`, `workspace_of`, `score`, `rehydrate_result`,
-//! `log_events`) — the same calls the `pillbox run` / `session …` CLI renders, so
+//! session API (`send`, `wait_idle`, `workspace_of`, `score`, `rehydrate_result`)
+//! and the §0 log reader (`events::log::read_log`) — the same calls the `pillbox run` / `session …` CLI renders, so
 //! a change to a CLI `--json` shape cannot break dispatch. The loop sits behind
 //! [`WorkerDriver`] so the selection / retry **policy** is unit-tested over a
 //! mock; the live [`SessionDriver`] takes its grade-side calls through
@@ -45,7 +45,6 @@ use crate::errors::PillboxError;
 use crate::events::blob::BlobStore;
 use crate::events::log::SessionLog;
 use crate::pillbox::Pillbox;
-use crate::sandbox::Started;
 use crate::workspace::protect::{
     force_remove, snapshot_workspace, GradeTree, ProtectSet, GRADER_FILES_DIR,
 };
@@ -1755,7 +1754,7 @@ fn grader_files_inside_project(
 }
 
 /// The `RunOpts` (and agent override) that fork worker `i` — what `pillbox run
-/// --from-bookmark B --detach --json [--agent A] [--model M] [--temperature T]
+/// --from-bookmark B --detach [--agent A] [--model M] [--temperature T]
 /// [--memory] [--ttl D] [-- FIRST_TURN]` parses to, every other flag at its clap
 /// default. `first_turn` is `Some` only when the worker's agent takes its first
 /// turn on the launch argv.
@@ -1774,63 +1773,21 @@ fn fork_run_opts(
         None => None,
     };
     let run = crate::agents::RunOpts {
-        workspace: None,
-        name: None,
-        mounts: Vec::new(),
-        withs: Vec::new(),
-        env_bundles: Vec::new(),
-        env_files: Vec::new(),
-        vault: false,
         memory: opts.memory,
-        memory_briefed: Vec::new(), // run::start fills this from the kypp briefing
-        mcps: Vec::new(),
-        mcp_tokens: Vec::new(),
         // Server-mode workers get no positional prompt: a `--detach` server comes
         // up idle and the first turn is driven via `session::send` (see
         // `drive_one_inner`); a server treats a baked positional as a pre-fill
         // hint, not a turn.
         args: first_turn.map(|t| vec![t.to_string()]).unwrap_or_default(),
         detach: true,
-        label: None,
-        json: true,
         ttl_seconds,
         from_bookmark: Some(opts.from_bookmark.clone()),
         model,
-        profile: None,
-        reasoning_effort: None,
         temperature,
-        egress_allow: Vec::new(),
-        egress_deny: false,
+        // memory_briefed: run::start fills it from the kypp briefing.
+        ..crate::agents::RunOpts::default()
     };
     Ok((agent, run))
-}
-
-/// The worker session a fork started. A detached PTY session or a ready server
-/// is a live worker; a structured run that already finished is one only if its
-/// agent exited 0. Anything else is not a worker dispatch can drive.
-fn forked_session_id(started: Started) -> Result<String> {
-    match started {
-        Started::Detached(session) | Started::ServerReady { session, .. } => Ok(session.id),
-        Started::StructuredFinished {
-            session, exit_code, ..
-        } => {
-            if exit_code != 0 {
-                bail!(
-                    "worker fork: {} structured run `{}` exited {exit_code}",
-                    session.agent_id,
-                    session.id
-                );
-            }
-            Ok(session.id)
-        }
-        Started::Foreground => {
-            bail!("worker fork started a foreground run, not a detached session")
-        }
-        Started::ManagedFinished(session) => bail!(
-            "worker fork started a managed run (`{}`), not a local detached session",
-            session.id
-        ),
-    }
 }
 
 /// The score request that grades `tree` inside the one-shot grader microVM.
@@ -1879,7 +1836,7 @@ impl WorkerDriver for SessionDriver<'_> {
         let launch_turn = self.first_turn_driven_on_fork(i).then_some(first_turn);
         let (agent, run) = fork_run_opts(self.opts, i, launch_turn)?;
         let started = crate::commands::run::start(self.resolved, agent.as_deref(), run)?;
-        forked_session_id(started)
+        Ok(started.into_live_session().context("worker fork")?.id)
     }
 
     fn first_turn_driven_on_fork(&self, i: usize) -> bool {
@@ -1889,17 +1846,12 @@ impl WorkerDriver for SessionDriver<'_> {
     fn wait_idle(&self, id: &str) -> Result<()> {
         // Bounded so one stuck worker becomes an Errored worker (the caller maps
         // this Err → Errored), not a whole-dispatch hang.
-        let secs = turn_timeout_secs();
-        let idle = crate::commands::session::stream::wait_idle(
+        crate::commands::session::stream::wait_idle(
             self.resolved,
             id,
-            Some(std::time::Duration::from_secs(secs)),
+            Some(std::time::Duration::from_secs(turn_timeout_secs())),
             None,
-        )?;
-        if !idle {
-            bail!("worker `{id}` did not go idle within {secs}s");
-        }
-        Ok(())
+        )
     }
 
     fn grade(&self, id: &str, grader: &Grader) -> Result<Scored> {
@@ -1956,8 +1908,7 @@ impl WorkerDriver for SessionDriver<'_> {
     fn edits(&self, id: &str) -> Result<Vec<EditRecord>> {
         // The worker's own §0 log is the source — the same events the offline
         // harness extracts, so the live critic sees exactly what was measured.
-        let events =
-            crate::commands::session::log_events(self.resolved, id, &["tool_call".into()], 0)?;
+        let events = crate::events::log::read_log(self.resolved, id)?;
         Ok(edits_from_events(&events))
     }
 
@@ -4349,7 +4300,7 @@ mod tests {
         let (agent, run) = fork_run_opts(&opts, 0, Some("do it")).unwrap();
         assert_eq!(agent.as_deref(), Some("codex"));
         assert_eq!(run.from_bookmark.as_deref(), Some("base"));
-        assert!(run.detach && run.json && run.memory);
+        assert!(run.detach && run.memory);
         assert_eq!(run.ttl_seconds, Some(1800));
         assert_eq!(run.model.as_deref(), Some("m/x"));
         assert_eq!(run.temperature, Some(0.5));
@@ -4367,38 +4318,6 @@ mod tests {
         let (agent, run) = fork_run_opts(&opts, 0, None).unwrap();
         assert_eq!(agent, None);
         assert!(run.args.is_empty() && !run.memory && run.ttl_seconds.is_none());
-    }
-
-    #[test]
-    fn a_fork_yields_a_session_only_for_a_live_or_cleanly_finished_worker() {
-        let s = crate::session::Session::test_fixture();
-        assert_eq!(
-            forked_session_id(Started::Detached(s.clone())).unwrap(),
-            s.id
-        );
-        assert_eq!(
-            forked_session_id(Started::ServerReady {
-                session: s.clone(),
-                pending_prompt: None
-            })
-            .unwrap(),
-            s.id
-        );
-        let finished = |exit_code| Started::StructuredFinished {
-            session: s.clone(),
-            events: 3,
-            exit_code,
-        };
-        assert_eq!(forked_session_id(finished(0)).unwrap(), s.id);
-        let err = format!("{:#}", forked_session_id(finished(2)).unwrap_err());
-        assert!(err.contains("exited 2"), "{err}");
-        let err = format!("{:#}", forked_session_id(Started::Foreground).unwrap_err());
-        assert!(err.contains("foreground"), "{err}");
-        let err = format!(
-            "{:#}",
-            forked_session_id(Started::ManagedFinished(s.clone())).unwrap_err()
-        );
-        assert!(err.contains("managed"), "{err}");
     }
 
     #[test]

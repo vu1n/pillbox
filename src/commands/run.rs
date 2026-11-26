@@ -90,18 +90,6 @@ pub(crate) fn start(resolved: &Pillbox, agent: Option<&str>, mut opts: RunOpts) 
 
     apply_default_workspace(resolved, &mut opts);
 
-    // `--json` needs a persisted session to report; a foreground PTY run has none,
-    // so it is refused before launch rather than printing nothing after it. (Not a
-    // clap `requires`: server-mode validity depends on the resolved agent.)
-    if opts.json && !opts.detach && !spec.integration.supports_execution_request() {
-        return Err(PillboxError::usage(
-            "run",
-            "--json needs a persisted session: add --detach, or run a structured agent",
-        )
-        .with_next(format!("pillbox run --agent {} --detach --json", spec.id))
-        .into());
-    }
-
     let backend = crate::sandbox::select_backend();
     validate_bookmark_backend(&opts, backend.id())?;
     if !opts.memory {
@@ -133,7 +121,7 @@ pub(crate) fn start(resolved: &Pillbox, agent: Option<&str>, mut opts: RunOpts) 
 /// envelope, or the human banner for that lifecycle. Pure, so the shapes are
 /// pinned by tests.
 fn started_lines(started: &Started, json: bool) -> Vec<String> {
-    let Some(session) = started_session(started) else {
+    let Some(session) = started.session() else {
         return Vec::new();
     };
     if json {
@@ -141,20 +129,10 @@ fn started_lines(started: &Started, json: bool) -> Vec<String> {
     }
     match started {
         Started::Foreground => Vec::new(),
-        Started::Detached(session) if session.backend == crate::session::BACKEND_DOCKER => {
-            let short = &session.sandbox_id[..session.sandbox_id.len().min(12)];
-            vec![
-                format!(
-                    "pillbox: ✓ session `{}` started in background (container `{short}`).",
-                    session.id
-                ),
-                format!("         pillbox session attach {}  # reattach", session.id),
-            ]
-        }
         Started::Detached(session) => vec![
             format!(
-                "pillbox: ✓ session `{}` started in background (libkrun)",
-                session.id
+                "pillbox: ✓ session `{}` started in background ({})",
+                session.id, session.backend
             ),
             format!("  Next: pillbox session attach {}", session.id),
         ],
@@ -204,16 +182,6 @@ fn started_lines(started: &Started, json: bool) -> Vec<String> {
                 session.id
             ),
         ],
-    }
-}
-
-fn started_session(started: &Started) -> Option<&crate::session::Session> {
-    match started {
-        Started::Foreground => None,
-        Started::Detached(session)
-        | Started::ServerReady { session, .. }
-        | Started::StructuredFinished { session, .. }
-        | Started::ManagedFinished(session) => Some(session),
     }
 }
 
@@ -273,16 +241,14 @@ mod tests {
 
     #[test]
     fn human_banners_match_the_backend_banners() {
-        let docker = Session {
-            sandbox_id: "0123456789abcdef".into(),
-            ..Session::test_fixture()
-        };
+        // One detached banner for every backend, naming the session's backend.
+        let docker = Session::test_fixture();
         assert_eq!(docker.backend, BACKEND_DOCKER);
         assert_eq!(
             started_lines(&Started::Detached(docker), false),
             vec![
-                "pillbox: ✓ session `abc123def456` started in background (container `0123456789ab`).",
-                "         pillbox session attach abc123def456  # reattach",
+                "pillbox: ✓ session `abc123def456` started in background (docker)",
+                "  Next: pillbox session attach abc123def456",
             ]
         );
         assert_eq!(

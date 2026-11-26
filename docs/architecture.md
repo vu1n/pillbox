@@ -67,11 +67,16 @@ stdout `HarnessAdapter` harnesses (src/agents/harness/).
 ### Session verbs are in-process calls; the CLI is one client `[verified 2026-11-26]`
 `commands::run::start` (resolve agent + descriptor defaults, validate, `--memory`,
 `backend.run`) and the session cores in `src/commands/session/` — `send`,
-`stream::wait_idle`, `workspace_of`, `score`, `log_events`, `rehydrate_result` —
-return typed values and print nothing to stdout. The `pillbox run`/`session …`
-handlers render those values; the `--json` shapes (`session::started_json`,
-`session_info`, `score_verdict_json`) live only in that rendering, so in-process
-callers must not depend on them.
+`stream::wait_idle`, `workspace_of`, `score`, `rehydrate_result` — return typed
+values and print nothing to stdout; in-process readers of a session's §0 log use
+`events::log::read_log`. The `pillbox run`/`session …` handlers render those
+values; the `--json` shapes (`session::started_json`, `session_info`,
+`score_verdict_json`) live only in that rendering, so in-process callers must not
+depend on them. `Started::into_live_session` is the one place that decides which
+run outcomes a caller can go on driving. Because `run::start` runs inside
+long-lived callers, every detached child it spawns (`__krun-vmm`,
+`__session-tailer`) is handed to `sandbox::reap_detached`, so an exited child
+never lingers as a zombie that signal-0 liveness probes read as alive.
 
 ### libkrun launch shape `[verified 2026-06-20]`
 `krun_create_ctx` → `set_vm_config` → `set_root(dir)` (virtio-fs root, *not* a

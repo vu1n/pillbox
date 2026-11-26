@@ -160,8 +160,6 @@ pub(crate) trait SandboxTarget {
 /// Build the [`SandboxTarget`] for a sandbox record — the one place that branches
 /// on `record.backend`. A Docker record can only be dropped: Docker is deprecated,
 /// so exec is refused and destroy removes the record but leaves the container.
-// The sandbox verbs (commands/sandbox.rs) are its caller.
-#[allow(dead_code)]
 pub(crate) fn sandbox_target(record: &crate::sandboxes::Sandbox) -> Result<Box<dyn SandboxTarget>> {
     match record.backend.as_str() {
         crate::sandboxes::BACKEND_DOCKER => Ok(Box::new(DockerSandboxRecord(record.clone()))),
@@ -407,7 +405,7 @@ mod tests {
         let _guard = BackendEnvGuard;
         // `PILLBOX_BACKEND=managed` selects the managed tier on every build (it
         // needs no host capability). Asserted via the stable `id()` discriminant,
-        // since managed shares `long_lived_exec=false` with libkrun.
+        // not a capability bit (two backends can share one).
         std::env::set_var("PILLBOX_BACKEND", "managed");
         assert_eq!(select_backend().id(), BACKEND_MANAGED);
     }
@@ -433,6 +431,7 @@ mod tests {
             image: "pillbox:latest".into(),
             agent: None,
             workspace: "/work/app".into(),
+            workspace_clone: None,
             label: None,
             created_at: "2026-01-01T00:00:00Z".into(),
             status: "ready".into(),

@@ -74,19 +74,25 @@ global pillbox regardless of where you are.
 | `pillbox bookmark rm NAME` | Remove a bookmark; the underlying snapshot is untouched. |
 | `pillbox workspace rekey` | Rotate the rustic repo password. **Caveat:** rustic_core 0.11 has no public API to delete the prior key; both passwords keep working until upstream lands deletion. Treat the old password as compromised. |
 
-### Sandboxes — a long-lived exec target (Docker)
+### Sandboxes — a long-lived exec target (microVM)
 
 `pillbox run` launches one agent turn. The `sandbox` group instead spawns a
-**long-lived** sandbox you keep around and `exec`/`agent` into repeatedly — the
-PTY-free exec channel an orchestrator drives. Docker-backed today.
+**long-lived** libkrun microVM you keep around and `exec`/`agent` into
+repeatedly — the PTY-free exec channel an orchestrator drives. The VM works on
+its own CoW, secret-scrubbed clone of the workspace (never the host directory):
+its writes land in the clone, whose host path `sandbox list --json` reports as
+`workspace_clone`. Docker is deprecated: with `PILLBOX_BACKEND=docker` (or a
+build without libkrun) `spawn` is refused, and an old docker record can only be
+destroyed (its container is left for you to remove). See
+[sandboxes](features/sandboxes.md).
 
 | Command | What it does |
 |---|---|
-| `pillbox sandbox spawn [--image IMG] [--agent A] [--workspace PATH] [--label TEXT]` | Spawn an idle sandbox with the workspace mounted; prints the sandbox id. `--agent` provisions its auth + runs non-root so the agent channel can drive it; omit for a bare exec-only sandbox. |
-| `pillbox sandbox exec ID [--json] -- ARGV…` | Run a command (PTY-free). Streams raw output + mirrors the exit code; `--json` emits `ExecStarted`/`ExecOutput`/`ExecExit` as JSONL. |
+| `pillbox sandbox spawn [--agent A] [--workspace PATH] [--label TEXT]` | Boot an idle sandbox VM on a clone of the workspace (default: cwd); returns once its exec channel answers and prints the sandbox id. `--agent` (`claude`, `cursor`, `pi`) provisions the agent's credentials — env-forked for a vault-capable agent, so the guest only ever holds stubs — and runs commands as uid 1000; omit for a bare exec-only sandbox (commands run as root). `--image` is a usage error: the VM boots this pillbox's runner image. |
+| `pillbox sandbox exec ID [--json] -- ARGV…` | Run a command (PTY-free) in the guest workspace. Streams raw output + mirrors the exit code; `--json` emits `ExecStarted`/`ExecOutput`/`ExecExit` as JSONL. Each exec is its own connection, so execs may run concurrently. |
 | `pillbox sandbox agent ID [--json] -- PROMPT…` | Run an agent turn (the agent channel) in a sandbox spawned `--agent`. Streams contract events; `--json` for JSONL, else a human trace. Only harnesses with a stdout adapter (`claude`, `cursor`, `pi`); server agents (`opencode`, `codex-serve`) have none and are a usage error. |
-| `pillbox sandbox list [--json]` | List sandboxes in the current pillbox. |
-| `pillbox sandbox destroy ID` | Kill the sandbox container and remove the record. |
+| `pillbox sandbox list [--json]` | List sandboxes in the current pillbox (`--json` adds `workspace_clone` for a microVM sandbox). |
+| `pillbox sandbox destroy ID` | Stop the sandbox VM, remove its rootfs and clones, then its record. A VM that can't be confirmed stopped keeps its record and files. |
 
 ### Local VM filesystem isolation
 

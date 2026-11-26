@@ -52,14 +52,15 @@ impl SandboxBackend for LibkrunBackend {
     /// (real egress fence, in-sandbox grading, detached vault, post-hoc ingest).
     /// `pty_drive` drives the guest pty-host over the persistent attach socket;
     /// `live_pty_tail` tails the agent's transcript out of the host-readable
-    /// creds clone. No long-lived exec target. See docs/substrate-plane.md.
+    /// creds clone. `long_lived_exec`: `sandbox spawn` boots a detached VM whose
+    /// guest `exec-host` serves the exec channel. See docs/substrate-plane.md.
     fn capabilities(&self) -> Caps {
         Caps {
             repository_execution: true,
             pty_drive: true,
             live_pty_tail: true,
             server_mode: true,
-            long_lived_exec: false,
+            long_lived_exec: true,
             in_sandbox_grading: true,
             real_egress_fence: true,
             detached_vault: true,

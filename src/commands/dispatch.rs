@@ -38,17 +38,16 @@ use crate::commands::critic::{
     edits_from_events, render_state, Critic, CriticPolicy, CriticVerdict, EditRecord,
     TypesafeCritic,
 };
-use crate::commands::session::ScoreRequest;
+use crate::commands::grading::{
+    grade_worker, grader_vm_available, restore_bookmark, GradePolicy, LiveSessions, SessionOps,
+};
 use crate::contract::{Actor, Artifact, ArtifactClass, Criterion, Event, Payload, Scored};
 use crate::cost::ObservedUsage;
 use crate::errors::PillboxError;
 use crate::events::blob::BlobStore;
 use crate::events::log::SessionLog;
 use crate::pillbox::Pillbox;
-use crate::workspace::protect::{
-    force_remove, snapshot_workspace, GradeTree, ProtectSet, GRADER_FILES_DIR,
-};
-use crate::workspace::WorkspaceBackend;
+use crate::workspace::protect::{ProtectSet, GRADER_FILES_DIR};
 
 /// Per-turn idle timeout (seconds) each worker gets before it's treated as stuck
 /// (→ an `Errored` worker, not a whole-dispatch hang). Generous — agent turns run
@@ -1601,40 +1600,6 @@ fn drive_segments_inner(
 
 // ── the live driver (typed in-process session calls) ────────────────────────
 
-/// The session calls a grade and a winner pull go through. The live
-/// [`LiveSessions`] is the session API; tests substitute a recorder so the
-/// grading properties (VM only, the scrubbed snapshot with protected paths
-/// restored, no host fallback) are asserted without booting a VM.
-trait SessionOps {
-    /// The live workspace directory of session `id` (libkrun sessions only).
-    fn workspace(&self, resolved: &Pillbox, id: &str) -> Result<PathBuf>;
-    /// Grade per `request` and record the verdict on the session's §0 log.
-    fn score(&self, resolved: &Pillbox, id: &str, request: &ScoreRequest) -> Result<Scored>;
-    /// Rehydrate session `id`'s result tree into `to`.
-    fn pull(&self, resolved: &Pillbox, id: &str, to: &std::path::Path) -> Result<()>;
-}
-
-/// [`SessionOps`] over the session API — what `dispatch` runs with.
-struct LiveSessions;
-
-impl SessionOps for LiveSessions {
-    fn workspace(&self, resolved: &Pillbox, id: &str) -> Result<PathBuf> {
-        let session = crate::session::resolve(resolved, id)?;
-        crate::commands::session::workspace_of(&session)
-            .with_context(|| format!("workspace of worker `{id}` (libkrun-only today)"))
-    }
-
-    fn score(&self, resolved: &Pillbox, id: &str, request: &ScoreRequest) -> Result<Scored> {
-        Ok(crate::commands::session::score(resolved, id, request)?.scored)
-    }
-
-    fn pull(&self, resolved: &Pillbox, id: &str, to: &std::path::Path) -> Result<()> {
-        let session = crate::session::resolve(resolved, id)?;
-        crate::commands::session::rehydrate_result(resolved, &session, to, "dispatch")?;
-        Ok(())
-    }
-}
-
 /// Drives workers through the typed session calls in-process: `run::start`
 /// forks, `stream::wait_idle` / `session::send` drive turns, grades and the
 /// winner pull go through [`SessionOps`], and critic edits are read from the
@@ -1690,17 +1655,9 @@ impl<'a> SessionDriver<'a> {
         }
     }
 
-    /// Restore `--from-bookmark` into a fresh temp dir and scrub it like a
-    /// worker's clone — never the warm base cache the workers clone from.
+    /// Restore `--from-bookmark` into a fresh scrubbed temp dir.
     fn restore_bookmark(&self, purpose: &str) -> Result<tempfile::TempDir> {
-        let dir = tempfile::Builder::new()
-            .prefix("pillbox-dispatch-base-")
-            .tempdir()
-            .with_context(|| format!("temp dir for {purpose}"))?;
-        let handle = crate::bookmarks::resolve_existing(self.resolved, &self.opts.from_bookmark)?;
-        self.resolved.workspace()?.pull(dir.path(), Some(&handle))?;
-        crate::workspace::ingest::scrub_secrets(dir.path())?;
-        Ok(dir)
+        restore_bookmark(self.resolved, &self.opts.from_bookmark, purpose)
     }
 
     fn base_tree(&self) -> Result<&std::path::Path> {
@@ -1790,47 +1747,6 @@ fn fork_run_opts(
     Ok((agent, run))
 }
 
-/// The score request that grades `tree` inside the one-shot grader microVM.
-// The reward is an external grader's verdict; a worker must not be able to edit or run code outside the VM to change it.
-fn grade_request<'r>(
-    tree: &'r std::path::Path,
-    grader: &'r Grader,
-    egress: &'r [String],
-    drop_privileges: bool,
-) -> ScoreRequest<'r> {
-    let (cmd, rubric) = grader.parts();
-    ScoreRequest {
-        cmd,
-        rubric,
-        snapshot: None,
-        workspace: Some(tree),
-        // Worker trees grade only in the grader microVM, never on the host.
-        in_sandbox: true,
-        grader_egress: egress,
-        drop_privileges,
-    }
-}
-
-/// Stderr note for a worker whose grade tree had protected paths put back.
-fn reverted_note(id: &str, reverted: &[PathBuf]) -> Option<String> {
-    const SHOWN: usize = 5;
-    if reverted.is_empty() {
-        return None;
-    }
-    let mut list: Vec<String> = reverted
-        .iter()
-        .take(SHOWN)
-        .map(|p| p.display().to_string())
-        .collect();
-    if reverted.len() > SHOWN {
-        list.push(format!("+{} more", reverted.len() - SHOWN));
-    }
-    Some(format!(
-        "pillbox: dispatch: worker {id} changed protected paths; graded with the bookmark's copy: {}",
-        list.join(", ")
-    ))
-}
-
 impl WorkerDriver for SessionDriver<'_> {
     fn fork(&self, i: usize, first_turn: &str) -> Result<String> {
         let launch_turn = self.first_turn_driven_on_fork(i).then_some(first_turn);
@@ -1862,23 +1778,16 @@ impl WorkerDriver for SessionDriver<'_> {
         // Grade a frozen snapshot, and keep it: `pull_winner` delivers exactly
         // the tree that was graded, not whatever a background process the
         // worker left running has made of the live workspace since.
-        let ws = self.ops.workspace(self.resolved, id)?;
+        let (cmd, rubric) = grader.parts();
+        let policy = GradePolicy {
+            base: self.base_tree()?,
+            protect: &self.protect,
+            grader_files: self.opts.grader_files.as_deref(),
+            egress: &self.opts.grader_egress,
+            command: "dispatch",
+        };
         let snap = self.graded_snapshot(id)?;
-        if snap.exists() {
-            force_remove(&snap)?;
-        }
-        snapshot_workspace(&ws, &snap)?;
-        let tree = GradeTree::prepare(
-            &snap,
-            self.base_tree()?,
-            &self.protect,
-            self.opts.grader_files.as_deref(),
-        )?;
-        if let Some(note) = reverted_note(id, &tree.report.reverted) {
-            eprintln!("{note}");
-        }
-        let request = grade_request(tree.path(), grader, &self.opts.grader_egress, tree.locked);
-        self.ops.score(self.resolved, id, &request)
+        grade_worker(self.ops, self.resolved, id, &snap, cmd, rubric, &policy)
     }
 
     fn send(&self, id: &str, prompt: &str) -> Result<()> {
@@ -1931,12 +1840,6 @@ impl WorkerDriver for SessionDriver<'_> {
         let (cmd, rubric) = grader.parts();
         crate::commands::session::grade_dir(dir.path(), cmd, rubric)
     }
-}
-
-/// Whether this build can run the grader microVM. Without it dispatch refuses
-/// to start rather than grade worker code on the host.
-fn grader_vm_available() -> bool {
-    cfg!(feature = "libkrun")
 }
 
 // ── segment spec (`--segments`, TOML) ───────────────────────────────────────
@@ -3924,141 +3827,10 @@ mod tests {
 
     // ── SessionDriver grading: a scrubbed copy, protected paths restored, VM only ──
 
+    use crate::commands::grading::testing::{project, put, read, FakeSessions, Project, Vm};
+    use crate::commands::grading::{grade_request, reverted_note};
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
-
-    /// What the grader-VM stand-in does with the tree it is handed.
-    #[derive(Clone, Copy)]
-    enum Vm {
-        /// Runs the grader against the tree, with an empty env, and reports the verdict.
-        RunsGrader,
-        /// Executes nothing and reports a failing grade.
-        RecordsOnly,
-        /// The grader VM can't run.
-        Down,
-    }
-
-    /// One `score` the driver asked for, kept as owned data.
-    #[derive(Debug, Clone)]
-    struct ScoreCall {
-        id: String,
-        workspace: Option<PathBuf>,
-        snapshot: Option<String>,
-        in_sandbox: bool,
-        drop_privileges: bool,
-        egress: Vec<String>,
-        cmd: Option<String>,
-    }
-
-    /// The session API standing in under [`SessionDriver`]: `workspace` reports
-    /// `ws` as the worker's live workspace; `score` records the request, refuses
-    /// to grade without `in_sandbox`, copies the tree it was handed to `seen`
-    /// (the grade tree is gone once `grade` returns), then does what `vm` says.
-    /// Every `pull` is recorded too.
-    struct FakeSessions {
-        _dir: tempfile::TempDir,
-        ws: PathBuf,
-        vm: Vm,
-        seen: PathBuf,
-        scores: RefCell<Vec<ScoreCall>>,
-        pulls: RefCell<Vec<String>>,
-    }
-
-    impl FakeSessions {
-        fn new(ws: &Path, vm: Vm) -> Self {
-            let dir = tempfile::tempdir().unwrap();
-            let seen = dir.path().join("seen");
-            Self {
-                _dir: dir,
-                ws: ws.to_path_buf(),
-                vm,
-                seen,
-                scores: RefCell::new(Vec::new()),
-                pulls: RefCell::new(Vec::new()),
-            }
-        }
-
-        fn scores(&self) -> Vec<ScoreCall> {
-            self.scores.borrow().clone()
-        }
-    }
-
-    impl SessionOps for FakeSessions {
-        fn workspace(&self, _: &Pillbox, _: &str) -> Result<PathBuf> {
-            Ok(self.ws.clone())
-        }
-
-        fn score(&self, _: &Pillbox, id: &str, request: &ScoreRequest) -> Result<Scored> {
-            self.scores.borrow_mut().push(ScoreCall {
-                id: id.into(),
-                workspace: request.workspace.map(Path::to_path_buf),
-                snapshot: request.snapshot.map(str::to_string),
-                in_sandbox: request.in_sandbox,
-                drop_privileges: request.drop_privileges,
-                egress: request.grader_egress.to_vec(),
-                cmd: request.cmd.map(str::to_string),
-            });
-            if !request.in_sandbox {
-                bail!("host grading refused");
-            }
-            let tree = request.workspace.context("no tree to grade")?;
-            let _ = std::fs::remove_dir_all(&self.seen);
-            let copied = std::process::Command::new("cp")
-                .arg("-R")
-                .arg(tree)
-                .arg(&self.seen)
-                .status()
-                .unwrap();
-            assert!(copied.success());
-            let passed = match self.vm {
-                Vm::Down => bail!("the grader microVM exited (1) before the grader started"),
-                Vm::RecordsOnly => false,
-                Vm::RunsGrader => std::process::Command::new("env")
-                    .args(["-i", "PATH=/usr/bin:/bin", "sh", "-c"])
-                    .arg(request.cmd.unwrap_or("false"))
-                    .current_dir(tree)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .is_ok_and(|s| s.success()),
-            };
-            Ok(scored(passed, if passed { 1.0 } else { 0.0 }, vec![], ""))
-        }
-
-        fn pull(&self, _: &Pillbox, id: &str, to: &Path) -> Result<()> {
-            self.pulls.borrow_mut().push(id.into());
-            std::fs::create_dir_all(to)?;
-            Ok(())
-        }
-    }
-
-    fn put(root: &Path, rel: &str, body: &str) {
-        let p = root.join(rel);
-        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        std::fs::write(p, body).unwrap();
-    }
-
-    /// The bookmark (`base`) and a worker workspace forked from it (`ws`).
-    /// The base test passes only once `src/lib.rs` contains `fixed`.
-    struct Project {
-        base: tempfile::TempDir,
-        _root: tempfile::TempDir,
-        ws: PathBuf,
-    }
-
-    fn project() -> Project {
-        let base = tempfile::tempdir().unwrap();
-        put(base.path(), "src/lib.rs", "pub fn f() {}\n");
-        put(base.path(), "tests/check.sh", "grep -q fixed src/lib.rs\n");
-        let root = tempfile::tempdir().unwrap();
-        let ws = root.path().join("ws");
-        crate::workspace::cow::cow_clone_dir(base.path(), &ws).unwrap();
-        Project {
-            base,
-            _root: root,
-            ws,
-        }
-    }
 
     fn grade_with(p: Project, fake: &FakeSessions, grader: &Grader) -> (Result<Scored>, Project) {
         let resolved = crate::pillbox::global();
@@ -4075,10 +3847,6 @@ mod tests {
         let r = driver.grade("w1", grader);
         let base = driver.base.into_inner().unwrap();
         (r, Project { base, _root, ws })
-    }
-
-    fn read(p: &Path) -> String {
-        std::fs::read_to_string(p).unwrap()
     }
 
     #[test]
@@ -4275,7 +4043,8 @@ mod tests {
     fn grade_request_grades_in_the_vm_with_the_requested_egress() {
         let egress = vec!["pypi.org".to_string()];
         let rubric = Grader::Rubric("r.txt".into());
-        let req = grade_request(Path::new("/tmp/tree"), &rubric, &egress, true);
+        let (c, r) = rubric.parts();
+        let req = grade_request(Path::new("/tmp/tree"), c, r, &egress, true);
         assert_eq!(req.workspace, Some(Path::new("/tmp/tree")));
         assert_eq!(req.snapshot, None);
         assert!(req.in_sandbox);
@@ -4285,7 +4054,8 @@ mod tests {
         assert_eq!(req.rubric, Some(Path::new("r.txt")));
 
         let cmd = Grader::Cmd("true".into());
-        let req = grade_request(Path::new("/tmp/tree"), &cmd, &[], false);
+        let (c, r) = cmd.parts();
+        let req = grade_request(Path::new("/tmp/tree"), c, r, &[], false);
         assert!(req.in_sandbox);
         assert!(!req.drop_privileges);
         assert_eq!(req.cmd, Some("true"));
@@ -4383,11 +4153,11 @@ mod tests {
 
     #[test]
     fn reverted_note_lists_a_capped_set() {
-        assert_eq!(reverted_note("w1", &[]), None);
+        assert_eq!(reverted_note("dispatch", "w1", &[]), None);
         let many: Vec<PathBuf> = (0..7)
             .map(|i| PathBuf::from(format!("tests/{i}")))
             .collect();
-        let note = reverted_note("w1", &many).unwrap();
+        let note = reverted_note("dispatch", "w1", &many).unwrap();
         assert!(
             note.contains("tests/0, tests/1, tests/2, tests/3, tests/4, +2 more"),
             "{note}"

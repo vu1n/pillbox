@@ -15,6 +15,7 @@ pub(crate) mod dispatch;
 pub(crate) mod env;
 pub(crate) mod eval;
 pub(crate) mod execution;
+pub(crate) mod grading;
 pub(crate) mod run;
 pub(crate) mod sandbox;
 pub(crate) mod secret;

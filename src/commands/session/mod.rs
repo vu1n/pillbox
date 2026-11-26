@@ -1440,7 +1440,8 @@ fn session_score(resolved: &Pillbox, id: &str, request: &ScoreRequest, json: boo
 }
 
 /// What to grade and how — the `session score` flags as one value.
-#[derive(Debug, Default, Clone, Copy)]
+// No Default: every caller states `in_sandbox`, so host grading is never an omission.
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct ScoreRequest<'a> {
     /// One grader command (exclusive with `rubric`).
     pub(crate) cmd: Option<&'a str>,
@@ -2218,16 +2219,24 @@ mod tests {
                 (
                     ScoreRequest {
                         cmd: Some("true"),
+                        rubric: None,
+                        snapshot: None,
+                        workspace: None,
+                        in_sandbox: false,
                         grader_egress: &egress,
-                        ..ScoreRequest::default()
+                        drop_privileges: false,
                     },
                     "--grader-egress only applies to --in-sandbox",
                 ),
                 (
                     ScoreRequest {
                         cmd: Some("true"),
+                        rubric: None,
+                        snapshot: None,
+                        workspace: None,
+                        in_sandbox: false,
+                        grader_egress: &[],
                         drop_privileges: true,
-                        ..ScoreRequest::default()
                     },
                     "--drop-privileges only applies to --in-sandbox",
                 ),
@@ -2251,8 +2260,13 @@ mod tests {
                 &s.id[..6],
                 &ScoreRequest {
                     cmd: Some("test -f ok"),
+                    rubric: None,
+                    snapshot: None,
                     workspace: Some(dir.path()),
-                    ..ScoreRequest::default()
+                    // A test-owned tree: host grading is the point here.
+                    in_sandbox: false,
+                    grader_egress: &[],
+                    drop_privileges: false,
                 },
             )
             .unwrap();

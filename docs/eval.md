@@ -11,7 +11,7 @@ every run with the same verifier, and emits a machine-readable comparison plus a
 ## What it is (and isn't)
 
 It's the spec-driven, first-class front-end over primitives pillbox already has —
-each cell is the same run → send → wait-idle → score chain `dispatch` and the
+each cell is the same run → send → wait-idle → grade chain `dispatch` and the
 bash eval rig (`scripts/eval/*`) use, driven in-process through the typed
 session calls (`commands::run::start`, `session::send`, `stream::wait_idle`,
 `session::workspace_of`, `session::score`) rather than by self-exec'ing the
@@ -123,10 +123,17 @@ The hard-won lessons the σ̂ campaigns paid for (see
 
 ## Limits (v1)
 
-- **libkrun-only grading** — like `dispatch`, `eval` scores each run's *live*
-  workspace clone (`session::workspace_of`), which only
-  libkrun sessions populate. A docker path (pull-then-score) is the same deferred
-  resolution noted in [dispatch.md](./dispatch.md).
+- **Grading is dispatch's grading** (`commands::grading::grade_worker`). A run's
+  workspace is written by the agent inside its microVM, so it is untrusted: eval
+  freezes a copy of it (`session::workspace_of`, libkrun sessions only), restores
+  the default protected paths (`tests/`, `*_test.rs`, fixtures — see
+  `workspace::protect::DEFAULT_PROTECTED`) from a trusted base, and runs the
+  verifier only inside the one-shot grader microVM — offline, as the unprivileged
+  user. A cell that rewrites a test is graded against the base's copy; a grader VM
+  that cannot run errors the cell (score 0), never a host retry. The base is the
+  spec's `from_bookmark` restored, or else a scrubbed copy of the workspace
+  directory (`workspace`, the project dir, or the cwd) taken before the first
+  cell. A build without the libkrun backend refuses to start `eval`.
 - **`cost` is 0** in the records — usage capture is an additive follow-up; it's
   off the σ̂/score metric the comparison turns on.
 - **`max_turns`** is parsed but not enforced (pillbox has no per-session turn cap;

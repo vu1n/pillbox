@@ -18,10 +18,12 @@
 //! command away (`paired-stats.py --baseline A --treatment B <records>`).
 //!
 //! Spec format is **TOML** (matches `pillbox.toml`; the #71 sketch was YAML, but
-//! TOML avoids a new dep and is the repo convention). Grading is libkrun-only in
-//! v1 — like [`crate::commands::dispatch`], it scores each run's *live* workspace
-//! clone via `session::workspace_of`; a docker path (pull-
-//! then-score) is the same deferred resolution dispatch notes.
+//! TOML avoids a new dep and is the repo convention). Grading is exactly
+//! dispatch's ([`crate::commands::grading`]): each run's live workspace is
+//! untrusted, so it is frozen, protected paths (tests, fixtures) are restored from
+//! a trusted base — the spec's bookmark, else a copy of the workspace directory
+//! taken before the first cell — and the verifier runs only inside the grader
+//! microVM. A build without the grader VM refuses to start.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -31,11 +33,16 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::agents::{McpAttachment, RunOpts};
-use crate::commands::session::{self, stream, ScoreRequest};
+use crate::commands::grading::{
+    copy_base_dir, grade_worker, grader_vm_available, restore_bookmark, GradePolicy, LiveSessions,
+    SessionOps,
+};
+use crate::commands::session::{self, stream};
 use crate::commands::{self};
 use crate::contract::Scored;
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
+use crate::workspace::protect::{force_remove, ProtectSet};
 
 /// Default per-turn idle cap (seconds) — generous; an agent turn runs minutes.
 /// The monolithic-truncation lesson (docs/optimization-gate.md): too small a cap
@@ -95,6 +102,17 @@ struct Verify {
     /// A rubric file (`NAME :: COMMAND` per line) → per-criterion + fractional. Xor `cmd`.
     #[serde(default)]
     rubric: Option<PathBuf>,
+}
+
+impl Verify {
+    /// The (cmd, rubric) pair a score request takes.
+    fn parts(&self) -> Result<(Option<&str>, Option<&Path>)> {
+        match (&self.cmd, &self.rubric) {
+            (Some(c), _) => Ok((Some(c.as_str()), None)),
+            (_, Some(r)) => Ok((None, Some(r.as_path()))),
+            _ => bail!("no verifier (validate() should have caught this)"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -224,7 +242,19 @@ pub(crate) fn eval(resolved: &Pillbox, opts: EvalOpts) -> Result<()> {
     spec.validate()?;
     let prompt = spec.prompt_text()?;
     let variants = spec.resolved_variants();
-    let runner = Runner::new(resolved);
+    // Cell grades run in the grader microVM. Refuse before starting any cell
+    // rather than grade a worker's tree on the host.
+    if !grader_vm_available() {
+        return Err(PillboxError::usage(
+            "eval",
+            "eval grades every cell inside a libkrun microVM, and this build has no libkrun backend",
+        )
+        .with_next("use a pillbox built with the default `libkrun` feature")
+        .into());
+    }
+    let (_base_dir, base) = eval_base(resolved, &spec)?;
+    let protect = ProtectSet::new(true, &[])?;
+    let runner = Runner::new(resolved, &LiveSessions, &base, protect)?;
 
     let records_path = opts
         .out
@@ -361,6 +391,39 @@ fn first_line(s: &str) -> String {
 
 struct Runner<'a> {
     resolved: &'a Pillbox,
+    /// Workspace lookup and scoring — the session API outside tests.
+    ops: &'a dyn SessionOps,
+    /// The trusted tree protected paths are restored from in every grade.
+    base: &'a Path,
+    protect: ProtectSet,
+    /// Holds each cell's frozen snapshot while it is graded.
+    scratch: tempfile::TempDir,
+}
+
+/// The trusted base every cell's protected paths are restored from, and the temp
+/// dir that holds it: the spec's bookmark restored, or else a copy of the
+/// workspace directory the cells are cloned from, taken before any cell runs.
+fn eval_base(resolved: &Pillbox, spec: &EvalSpec) -> Result<(tempfile::TempDir, PathBuf)> {
+    const PURPOSE: &str = "eval's protected-path base";
+    if let Some(bookmark) = &spec.from_bookmark {
+        let dir = restore_bookmark(resolved, bookmark, PURPOSE)?;
+        let path = dir.path().to_path_buf();
+        return Ok((dir, path));
+    }
+    // The directory `run::start` clones each cell from: the spec's workspace, else
+    // the project directory, else the cwd.
+    let mut opts = RunOpts {
+        workspace: spec.workspace.as_ref().map(PathBuf::from),
+        ..RunOpts::default()
+    };
+    commands::run::apply_default_workspace(resolved, &mut opts);
+    let src = match opts.workspace {
+        Some(dir) => dir,
+        None => std::env::current_dir().context("resolve current working directory")?,
+    };
+    let dir = copy_base_dir(&src, PURPOSE)?;
+    let path = dir.path().join("ws");
+    Ok((dir, path))
 }
 
 /// The `run --detach` options a (spec, variant) pair asks for — the same
@@ -390,8 +453,23 @@ fn cell_agent<'s>(spec: &'s EvalSpec, v: &'s Variant) -> Option<&'s str> {
 }
 
 impl<'a> Runner<'a> {
-    fn new(resolved: &'a Pillbox) -> Self {
-        Self { resolved }
+    fn new(
+        resolved: &'a Pillbox,
+        ops: &'a dyn SessionOps,
+        base: &'a Path,
+        protect: ProtectSet,
+    ) -> Result<Self> {
+        let scratch = tempfile::Builder::new()
+            .prefix("pillbox-eval-graded-")
+            .tempdir()
+            .context("temp dir for graded snapshots")?;
+        Ok(Self {
+            resolved,
+            ops,
+            base,
+            protect,
+            scratch,
+        })
     }
 
     /// Run one (variant, trial): start a session, drive the prompt, grade its
@@ -445,28 +523,24 @@ impl<'a> Runner<'a> {
         Ok(started.into_live_session()?.id)
     }
 
-    /// Grade the run's live workspace clone in place (libkrun-only, like
-    /// dispatch), on the host (no `--in-sandbox`), no grader egress.
+    /// Grade the run exactly as dispatch grades a worker: a frozen copy of its
+    /// live workspace with protected paths restored from the trusted base, scored
+    /// inside the grader microVM (offline). The snapshot is dropped afterwards.
     fn grade(&self, id: &str, spec: &EvalSpec) -> Result<Scored> {
-        let session = crate::session::resolve(self.resolved, id)?;
-        let ws = session::workspace_of(&session)
-            .context("no live session workspace (libkrun-only today)")?;
-        let (cmd, rubric) = match (&spec.verify.cmd, &spec.verify.rubric) {
-            (Some(c), _) => (Some(c.as_str()), None),
-            (_, Some(r)) => (None, Some(r.as_path())),
-            _ => bail!("no verifier (validate() should have caught this)"),
+        let (cmd, rubric) = spec.verify.parts()?;
+        let policy = GradePolicy {
+            base: self.base,
+            protect: &self.protect,
+            grader_files: None,
+            egress: &[],
+            command: "eval",
         };
-        let outcome = session::score(
-            self.resolved,
-            id,
-            &ScoreRequest {
-                cmd,
-                rubric,
-                workspace: Some(&ws),
-                ..Default::default()
-            },
-        )?;
-        Ok(outcome.scored)
+        let snap = self.scratch.path().join(id);
+        let graded = grade_worker(self.ops, self.resolved, id, &snap, cmd, rubric, &policy);
+        if snap.exists() {
+            force_remove(&snap)?;
+        }
+        graded
     }
 }
 
@@ -712,5 +786,130 @@ mod tests {
         assert_eq!(s["variants"][1]["pass_rate"], 1.0);
         assert_eq!(s["variants"][1]["mean_score"], 1.0);
         assert_eq!(s["variants"][1]["scores"].as_array().unwrap().len(), 2);
+    }
+
+    // ── grading: a frozen copy, protected paths restored, grader VM only ──
+
+    use crate::commands::grading::testing::{project, put, read, FakeSessions, Project, Vm};
+
+    /// Grade cell `c1` of a spec whose verifier is `cmd`, with `fake` standing in
+    /// for the session API and `p.base` as the trusted base.
+    fn grade_cell(p: &Project, fake: &FakeSessions, cmd: &str) -> Result<Scored> {
+        let resolved = crate::pillbox::global();
+        let spec = parse(&format!("name='t'\nprompt='p'\n[verify]\ncmd={cmd:?}\n")).unwrap();
+        let runner = Runner::new(
+            &resolved,
+            fake,
+            p.base.path(),
+            ProtectSet::new(true, &[]).unwrap(),
+        )
+        .unwrap();
+        runner.grade("c1", &spec)
+    }
+
+    #[test]
+    fn eval_never_grades_a_cell_tree_on_the_host() {
+        let host = tempfile::tempdir().unwrap();
+        let marker = host.path().join("ran-on-host");
+        let touch = format!("touch '{}'\n", marker.display());
+        let p = project();
+        put(&p.ws, "build.sh", &touch);
+        put(&p.ws, "tests/check.sh", &touch);
+        let fake = FakeSessions::new(&p.ws, Vm::RecordsOnly);
+        assert!(
+            !grade_cell(&p, &fake, "sh build.sh && sh tests/check.sh")
+                .unwrap()
+                .passed
+        );
+
+        assert!(!marker.exists(), "cell code executed on the host");
+        let scores = fake.scores();
+        assert_eq!(scores.len(), 1, "graded exactly once: {scores:?}");
+        let score = &scores[0];
+        assert_eq!(score.id, "c1");
+        assert!(score.in_sandbox, "{score:?}");
+        assert!(
+            score.drop_privileges,
+            "grader must not run as root: {score:?}"
+        );
+        assert_eq!(score.snapshot, None, "{score:?}");
+        assert!(
+            score.egress.is_empty(),
+            "the grader VM is offline: {score:?}"
+        );
+        let tree = score.workspace.as_deref().expect("graded an explicit tree");
+        assert!(
+            !tree.starts_with(&p.ws),
+            "graded the live workspace: {score:?}"
+        );
+        // The VM got the cell's own code, and the base's test.
+        assert!(fake.seen.join("build.sh").exists());
+        assert_eq!(
+            read(&fake.seen.join("tests/check.sh")),
+            "grep -q fixed src/lib.rs\n"
+        );
+    }
+
+    #[test]
+    fn a_cell_editing_a_protected_test_does_not_change_its_grade() {
+        let check = "sh tests/check.sh";
+
+        let p = project();
+        let fake = FakeSessions::new(&p.ws, Vm::RunsGrader);
+        assert!(!grade_cell(&p, &fake, check).unwrap().passed);
+
+        // Rewriting the test to pass grades as the base has it: still failing.
+        let p = project();
+        put(&p.ws, "tests/check.sh", "exit 0\n");
+        let fake = FakeSessions::new(&p.ws, Vm::RunsGrader);
+        assert!(!grade_cell(&p, &fake, check).unwrap().passed);
+        assert_eq!(
+            read(&fake.seen.join("tests/check.sh")),
+            "grep -q fixed src/lib.rs\n"
+        );
+        assert_eq!(
+            read(&p.ws.join("tests/check.sh")),
+            "exit 0\n",
+            "live tree untouched"
+        );
+
+        // A real fix outside the protected set still passes.
+        let p = project();
+        put(&p.ws, "src/lib.rs", "pub fn f() {} // fixed\n");
+        let fake = FakeSessions::new(&p.ws, Vm::RunsGrader);
+        assert!(grade_cell(&p, &fake, check).unwrap().passed);
+    }
+
+    #[test]
+    fn a_grader_vm_that_cannot_run_errors_the_cell_with_no_host_retry() {
+        let p = project();
+        let fake = FakeSessions::new(&p.ws, Vm::Down);
+        let err = format!("{:#}", grade_cell(&p, &fake, "true").unwrap_err());
+        assert!(err.contains("before the grader started"), "{err}");
+        let scores = fake.scores();
+        assert_eq!(scores.len(), 1, "no second attempt: {scores:?}");
+        assert!(scores[0].in_sandbox);
+    }
+
+    #[cfg(not(feature = "libkrun"))]
+    #[test]
+    fn eval_refuses_to_start_without_the_grader_vm() {
+        crate::test_util::with_isolated_home("eval-no-grader-vm", || {
+            let dir = tempfile::tempdir().unwrap();
+            let spec = dir.path().join("spec.toml");
+            std::fs::write(&spec, "name='t'\nprompt='p'\n[verify]\ncmd='true'\n").unwrap();
+            let out = dir.path().join("records.jsonl");
+            let err = eval(
+                &crate::pillbox::global(),
+                EvalOpts {
+                    spec,
+                    json: false,
+                    out: Some(out.clone()),
+                },
+            )
+            .unwrap_err();
+            assert!(format!("{err:#}").contains("libkrun"), "{err:#}");
+            assert!(!out.exists(), "no cell ran");
+        });
     }
 }

@@ -81,9 +81,9 @@ same encoding rules as `contract.rs`).
 
 This section is the **spec**, ahead of the code. The implemented contract is
 `src/contract.rs` alone; `cloudflare-spike/src/contract.ts` is generated from it
-(`cloudflare-spike/contract-sync.md`). Fields and payloads here that `contract.rs`
-lacks (`v`, `causationId`, `class`, `idempotencyKey`, `driver_changed`) exist in
-neither the Rust nor the TS contract.
+(`cloudflare-spike/contract-sync.md`). The envelope fields and payloads here that
+`contract.rs` lacks (envelope `v`, `causationId`, `class`, `idempotencyKey`; the
+`driver_changed` payload) exist in neither the Rust nor the TS contract.
 
 ```jsonc
 {

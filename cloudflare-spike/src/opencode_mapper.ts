@@ -14,8 +14,7 @@
 // Faithfulness note: contract.rs omits empty/None fields on the wire
 // (`skip_serializing_if`), so this mapper likewise omits `output`/`input`/the
 // absent token counts rather than emitting empty strings — so a future
-// cross-language fixture diff (the documented sequel to the contract-parity gate)
-// can compare serialized payloads byte-for-byte.
+// cross-language fixture diff can compare serialized payloads byte-for-byte.
 //
 // The opencode event inputs are typed `any` on purpose: they're untyped wire JSON
 // (the analog of opencode.rs's `&serde_json::Value`). The strong contract is the

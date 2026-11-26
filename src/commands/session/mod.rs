@@ -787,12 +787,17 @@ fn session_detach(resolved: &Pillbox, id: &str) -> Result<()> {
 }
 
 /// The `session rm` success banner; managed sessions only have a local record to drop.
-pub(crate) fn print_removed(s: &session::Session) {
+pub(crate) fn removed_line(s: &session::Session) -> String {
     if s.backend == session::BACKEND_MANAGED {
-        println!("pillbox: ✓ managed session `{}` record removed.", s.id);
+        format!("pillbox: ✓ managed session `{}` record removed.", s.id)
     } else {
-        println!("pillbox: ✓ session `{}` removed.", s.id);
+        format!("pillbox: ✓ session `{}` removed.", s.id)
     }
+}
+
+/// Print [`removed_line`] for `s` on stdout.
+pub(crate) fn print_removed(s: &session::Session) {
+    println!("{}", removed_line(s));
 }
 
 fn session_rm(resolved: &Pillbox, id: &str) -> Result<()> {
@@ -814,7 +819,7 @@ fn session_rm(resolved: &Pillbox, id: &str) -> Result<()> {
                 s.id, s.backend
             );
             session::delete(resolved, &s.id)?;
-            println!("pillbox: ✓ session `{}` removed.", s.id);
+            print_removed(&s);
             Ok(())
         }
     }
@@ -1737,6 +1742,28 @@ pub(crate) fn validate_session_id(id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removed_line_says_only_the_record_went_for_a_managed_session() {
+        let mut s = session::Session::test_fixture();
+        for (backend, line) in [
+            (
+                session::BACKEND_MANAGED,
+                "pillbox: ✓ managed session `abc123def456` record removed.",
+            ),
+            (
+                session::BACKEND_LIBKRUN,
+                "pillbox: ✓ session `abc123def456` removed.",
+            ),
+            (
+                session::BACKEND_DOCKER,
+                "pillbox: ✓ session `abc123def456` removed.",
+            ),
+        ] {
+            s.backend = backend.to_string();
+            assert_eq!(removed_line(&s), line, "{backend}");
+        }
+    }
 
     #[test]
     fn session_tokens_distinguish_missing_from_measured_zero() {

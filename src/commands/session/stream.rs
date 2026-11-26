@@ -619,7 +619,45 @@ mod tests {
         // Drop joins the thread, so it returning promptly means the thread ended.
         drop(watchdog);
         assert!(began.elapsed() < std::time::Duration::from_secs(5));
+        // The thread's clone of `stop` is gone the moment drop returns: Drop both
+        // cancelled the thread and joined it (a detached thread would still hold it).
+        assert_eq!(std::sync::Arc::strong_count(&stop), 1);
         assert!(!stop.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn wait_idle_that_never_goes_idle_reports_the_timeout() {
+        use crate::contract::{Event, Input, InputTarget, Payload};
+        crate::test_util::with_isolated_home("wait-idle-timeout", || {
+            let pb = crate::pillbox::global();
+            // Unreachable backend: no tailer, so the log stays exactly as written.
+            let mut s = crate::session::Session::test_fixture();
+            s.backend = "retired".into();
+            crate::session::write(&pb, &s).unwrap();
+            let mut log = crate::events::log::SessionLog::open(&pb, &s.id).unwrap();
+            log.append(&[Event::session(
+                &s.id,
+                Payload::Input(Input {
+                    text: "go".into(),
+                    target: InputTarget::Pty,
+                }),
+            )])
+            .unwrap();
+
+            let err = super::wait_idle(
+                &pb,
+                &s.id,
+                Some(std::time::Duration::from_millis(100)),
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(
+                err.downcast::<crate::errors::PillboxError>()
+                    .unwrap()
+                    .to_string(),
+                "session wait-idle failed. session `abc123def456` did not go idle within the timeout"
+            );
+        });
     }
 
     #[test]

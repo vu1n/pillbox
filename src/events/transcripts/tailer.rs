@@ -127,7 +127,7 @@ impl DurableCursor {
         log: &mut SessionLog,
         expected_version: u8,
     ) -> Result<Self> {
-        let (device, inode) = source_identity(transcript)?;
+        let (device, inode) = transcript_identity(transcript)?;
         let state = read_cursor(&path, session_id)?;
         let initializing = state.is_none();
         if state.as_ref().is_some_and(|state| {
@@ -274,16 +274,25 @@ fn persist_cursor(path: &Path, state: &CursorState) -> Result<()> {
         .with_context(|| format!("fsync {}", dir.display()))
 }
 
-fn source_identity(path: &Path) -> Result<(u64, u64)> {
+/// `(device, inode)` of the regular file at `path`; a symlink or non-file is refused.
+pub(crate) fn transcript_identity(path: &Path) -> Result<(u64, u64)> {
     let metadata = std::fs::symlink_metadata(path)
-        .with_context(|| format!("stat detached transcript {}", path.display()))?;
+        .with_context(|| format!("stat transcript {}", path.display()))?;
     if !metadata.file_type().is_file() {
-        anyhow::bail!(
-            "detached transcript is not a regular file: {}",
-            path.display()
-        );
+        anyhow::bail!("transcript is not a regular file: {}", path.display());
     }
     Ok((metadata.dev(), metadata.ino()))
+}
+
+/// Who wrote the path a [`Tailer`] reads, which decides how each pump opens it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TranscriptSource {
+    /// A file the operator named (`session transcript FILE`): opened like any
+    /// operator path, symlinks followed.
+    Operator,
+    /// A transcript discovered in a guest-writable tree, bound to the `(device,
+    /// inode)` discovery saw.
+    Guest { device: u64, inode: u64 },
 }
 
 fn hash_events(events: &[Event]) -> Result<String> {
@@ -296,6 +305,10 @@ fn hash_events(events: &[Event]) -> Result<String> {
 /// FS-event wakeups.
 pub(crate) struct Tailer {
     path: PathBuf,
+    source: TranscriptSource,
+    /// Set once a best-effort guest path stopped naming the discovered file;
+    /// every later pump reads nothing.
+    abandoned: bool,
     session_id: String,
     harness: Harness,
     offset: u64,
@@ -323,6 +336,7 @@ pub(crate) struct Tailer {
 impl Tailer {
     pub(crate) fn new(
         path: PathBuf,
+        source: TranscriptSource,
         session_id: String,
         harness: Harness,
         include_usage: bool,
@@ -331,6 +345,8 @@ impl Tailer {
         let synth = super::synth::ChatSynthesizer::new(session_id.clone(), harness, include_usage);
         Self {
             path,
+            source,
+            abandoned: false,
             session_id,
             harness,
             offset: 0,
@@ -375,6 +391,11 @@ impl Tailer {
             .then(|| codex::Parser::from_state(cursor.position.codex_parser.clone()));
         let synth = super::synth::ChatSynthesizer::new(session_id.clone(), harness, include_usage);
         Ok(Self {
+            source: TranscriptSource::Guest {
+                device: cursor.position.device,
+                inode: cursor.position.inode,
+            },
+            abandoned: false,
             path,
             session_id,
             harness,
@@ -400,7 +421,16 @@ impl Tailer {
     /// - File doesn't exist yet at first pump. Returns 0 — the
     ///   caller's notify watch will retry as soon as it appears.
     pub(crate) fn pump(&mut self) -> Result<usize> {
-        let mut file = match std::fs::File::open(&self.path) {
+        if self.abandoned {
+            return Ok(0);
+        }
+        let opened = match self.source {
+            // An operator-named file opens as the operator named it, symlinks included.
+            TranscriptSource::Operator => std::fs::File::open(&self.path),
+            // The agent writes this transcript: a symlink, FIFO or device at the path is refused.
+            TranscriptSource::Guest { .. } => crate::events::capture::open_guest_file(&self.path),
+        };
+        let mut file = match opened {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
             Err(e) => return Err(e).with_context(|| format!("open {}", self.path.display())),
@@ -408,13 +438,24 @@ impl Tailer {
         let metadata = file
             .metadata()
             .with_context(|| format!("stat {}", self.path.display()))?;
-        if self.cursor.as_ref().is_some_and(|cursor| {
-            metadata.dev() != cursor.position.device || metadata.ino() != cursor.position.inode
-        }) {
-            anyhow::bail!(
-                "detached transcript {} changed file identity behind its durable cursor",
-                self.path.display()
-            );
+        // A guest path is read only while it opens the file discovery bound: O_NOFOLLOW guards
+        // just the last component, and a swapped parent directory changes the opened identity.
+        if let TranscriptSource::Guest { device, inode } = self.source {
+            if metadata.dev() != device || metadata.ino() != inode {
+                if self.cursor.is_some() {
+                    anyhow::bail!(
+                        "detached transcript {} changed file identity behind its durable cursor",
+                        self.path.display()
+                    );
+                }
+                eprintln!(
+                    "pillbox: warning: transcript {} no longer names the discovered file; \
+                     stopped reading it",
+                    self.path.display()
+                );
+                self.abandoned = true;
+                return Ok(0);
+            }
         }
         let len = metadata.len();
         if len < self.offset {
@@ -660,6 +701,12 @@ mod tests {
 
     use super::*;
     use crate::events::log::SessionLog;
+
+    /// A guest source bound to the file now at `path`, as discovery binds it.
+    fn guest(path: &Path) -> TranscriptSource {
+        let (device, inode) = transcript_identity(path).unwrap();
+        TranscriptSource::Guest { device, inode }
+    }
 
     fn fixture_line(uuid: &str, content: &str) -> String {
         format!(
@@ -919,7 +966,7 @@ mod tests {
                         .with_actor(Actor::agent(Harness::Codex.agent_id()))
                 })
                 .collect::<Vec<_>>();
-            let (device, inode) = source_identity(&transcript).unwrap();
+            let (device, inode) = transcript_identity(&transcript).unwrap();
             let position = CursorPosition {
                 transcript,
                 device,
@@ -1091,8 +1138,15 @@ mod tests {
                 writeln!(f, "{}", fixture_line("u1", "hello")).unwrap();
             }
 
-            let mut tailer =
-                Tailer::new(path, "sess-tail".into(), Harness::Claude, false, Some(log));
+            let source = guest(&path);
+            let mut tailer = Tailer::new(
+                path,
+                source,
+                "sess-tail".into(),
+                Harness::Claude,
+                false,
+                Some(log),
+            );
             assert_eq!(tailer.pump().expect("pump"), 1, "one transcript event");
 
             // Read the log back through a fresh handle (appends are flushed).
@@ -1125,7 +1179,14 @@ mod tests {
             writeln!(f, "{}", fixture_line("u2", "second")).unwrap();
         }
 
-        let mut tailer = Tailer::new(path.clone(), "sess".into(), Harness::Claude, false, None);
+        let mut tailer = Tailer::new(
+            path.clone(),
+            guest(&path),
+            "sess".into(),
+            Harness::Claude,
+            false,
+            None,
+        );
         let first = tailer.pump().expect("pump");
         assert_eq!(first, 2, "initial pump should drain both seeded lines");
 
@@ -1149,7 +1210,14 @@ mod tests {
     fn pump_buffers_partial_lines_across_calls() {
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         let path = tmp.path().to_path_buf();
-        let mut tailer = Tailer::new(path.clone(), "sess".into(), Harness::Claude, false, None);
+        let mut tailer = Tailer::new(
+            path.clone(),
+            guest(&path),
+            "sess".into(),
+            Harness::Claude,
+            false,
+            None,
+        );
 
         // Write half a line (no trailing \n yet).
         let full = fixture_line("u1", "split-line");
@@ -1185,7 +1253,8 @@ mod tests {
         assert_eq!(line.find('🌶').unwrap(), TRANSCRIPT_READ_CHUNK_BYTES - 1);
         let bytes = format!("{line}\n").into_bytes();
 
-        let mut tailer = Tailer::new(path, "sess".into(), Harness::Codex, false, None);
+        let source = guest(&path);
+        let mut tailer = Tailer::new(path, source, "sess".into(), Harness::Codex, false, None);
         assert_eq!(
             tailer
                 .ingest_bytes(&bytes[..TRANSCRIPT_READ_CHUNK_BYTES])
@@ -1254,7 +1323,14 @@ mod tests {
     fn pump_handles_file_truncation_by_rewinding() {
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         let path = tmp.path().to_path_buf();
-        let mut tailer = Tailer::new(path.clone(), "sess".into(), Harness::Claude, false, None);
+        let mut tailer = Tailer::new(
+            path.clone(),
+            guest(&path),
+            "sess".into(),
+            Harness::Claude,
+            false,
+            None,
+        );
 
         {
             let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
@@ -1275,12 +1351,105 @@ mod tests {
     }
 
     #[test]
+    fn an_operator_named_symlink_is_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real.jsonl");
+        std::fs::write(&target, format!("{}\n", fixture_line("u1", "hi"))).unwrap();
+        let link = dir.path().join("link.jsonl");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut tailer = Tailer::new(
+            link,
+            TranscriptSource::Operator,
+            "sess".into(),
+            Harness::Claude,
+            false,
+            None,
+        );
+        assert_eq!(tailer.pump().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_guest_symlinked_transcript_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real.jsonl");
+        std::fs::write(&target, format!("{}\n", fixture_line("u1", "hi"))).unwrap();
+        let link = dir.path().join("link.jsonl");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let source = guest(&target);
+        let mut tailer = Tailer::new(link, source, "sess".into(), Harness::Claude, false, None);
+        let error = tailer.pump().unwrap_err();
+        assert!(format!("{error:#}").contains("symlink"), "{error:#}");
+    }
+
+    /// O_NOFOLLOW guards only the last component: a guest swapping a parent
+    /// directory for a symlink to a host directory with a same-named file must
+    /// not get that file read in best-effort mode.
+    #[test]
+    fn a_swapped_parent_directory_stops_the_best_effort_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let share = dir.path().join("share");
+        let project = share.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let path = project.join("session.jsonl");
+        std::fs::write(&path, format!("{}\n", fixture_line("u1", "guest"))).unwrap();
+        let host = dir.path().join("host");
+        std::fs::create_dir(&host).unwrap();
+        std::fs::write(
+            host.join("session.jsonl"),
+            format!(
+                "{}\n{}\n",
+                fixture_line("h1", "host-secret"),
+                fixture_line("h2", "host-secret")
+            ),
+        )
+        .unwrap();
+
+        let source = guest(&path);
+        let mut tailer = Tailer::new(
+            path.clone(),
+            source,
+            "sess".into(),
+            Harness::Claude,
+            false,
+            None,
+        );
+        assert_eq!(tailer.pump().unwrap(), 1);
+
+        std::fs::rename(&project, share.join("project.old")).unwrap();
+        std::os::unix::fs::symlink(&host, &project).unwrap();
+        assert!(
+            std::fs::File::open(&path).is_ok(),
+            "the swapped path resolves"
+        );
+        assert_eq!(tailer.pump().unwrap(), 0, "the host file must not be read");
+        assert!(tailer.abandoned);
+        assert_eq!(
+            tailer.offset,
+            std::fs::metadata(share.join("project.old/session.jsonl"))
+                .unwrap()
+                .len()
+        );
+
+        // Restoring the directory does not resume the tail either.
+        std::fs::remove_file(&project).unwrap();
+        std::fs::rename(share.join("project.old"), &project).unwrap();
+        assert_eq!(tailer.pump().unwrap(), 0);
+    }
+
+    #[test]
     fn pump_handles_missing_file_silently() {
         let path = PathBuf::from(format!(
             "/tmp/pillbox-tailer-missing-{}.jsonl",
             uuid::Uuid::now_v7(),
         ));
-        let mut tailer = Tailer::new(path, "sess".into(), Harness::Claude, false, None);
+        let mut tailer = Tailer::new(
+            path,
+            TranscriptSource::Operator,
+            "sess".into(),
+            Harness::Claude,
+            false,
+            None,
+        );
         assert_eq!(tailer.pump().unwrap(), 0);
     }
 
@@ -1551,7 +1720,7 @@ mod tests {
             let transcript = session_dir.join("rollout-test.jsonl");
             let line = codex_complete("one", "recover me");
             std::fs::write(&transcript, format!("{line}\n")).unwrap();
-            let (device, inode) = source_identity(&transcript).unwrap();
+            let (device, inode) = transcript_identity(&transcript).unwrap();
             let parsed = parse_with(Harness::Codex, &line, 0);
             let events: Vec<_> = parsed
                 .iter()

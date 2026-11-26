@@ -869,6 +869,7 @@ impl AgentSpec {
     }
 }
 
+#[derive(Debug, Default, PartialEq)]
 pub(crate) struct RunOpts {
     pub(crate) workspace: Option<PathBuf>,
     pub(crate) name: Option<String>,
@@ -885,7 +886,7 @@ pub(crate) struct RunOpts {
     /// brief the agent from project memory at start, capture the §0 log after. pillbox attaches,
     /// doesn't own; see `crate::memory`.
     pub(crate) memory: bool,
-    /// Claim handles `--memory` briefed this run with (set by `dispatch_run` from kypp's digest).
+    /// Claim handles `--memory` briefed this run with (set by `commands::run::start` from kypp's digest).
     /// The data channel into the backend so a reparented server agent's bring-up can stash it on the
     /// session for the post-drain usage capture (`session ingest`). Empty when --memory is off/empty.
     pub(crate) memory_briefed: Vec<String>,
@@ -907,12 +908,6 @@ pub(crate) struct RunOpts {
     /// `--label TEXT` — human label for a detached session, surfaced
     /// in `pillbox session list`. Only meaningful with `--detach`.
     pub(crate) label: Option<String>,
-    /// `--json` — when `--detach` succeeds, emit the new session as
-    /// `{"version":1,"session":{...}}` on stdout instead of the human
-    /// "session started" banner. Lets orchestrators capture the id
-    /// with `jq -r '.session.id'` instead of regex-scraping the
-    /// banner. Only meaningful with `--detach`.
-    pub(crate) json: bool,
     /// `--ttl DURATION` — session-retention TTL in seconds. Parsed
     /// from `30m`/`24h`/`7d` shapes at the CLI boundary via
     /// `session::parse_ttl_seconds`. Recorded on the session record
@@ -966,7 +961,7 @@ impl RunOpts {
     }
 
     /// The kypp project for `--memory` (the pillbox name, else "default"); `None` when --memory is
-    /// off. Single-sources the derivation shared by `dispatch_run` and the server bring-up's stash.
+    /// off. Single-sources the derivation shared by `commands::run::start` and the server bring-up's stash.
     pub(crate) fn memory_project(&self) -> Option<String> {
         self.memory
             .then(|| self.name.clone().unwrap_or_else(|| "default".to_string()))
@@ -1155,29 +1150,8 @@ mod tests {
 
     fn run_opts_with_withs(withs: Vec<&str>) -> RunOpts {
         RunOpts {
-            workspace: None,
-            name: None,
-            mounts: Vec::new(),
             withs: withs.into_iter().map(String::from).collect(),
-            env_bundles: Vec::new(),
-            env_files: Vec::new(),
-            vault: false,
-            memory: false,
-            memory_briefed: Vec::new(),
-            mcps: Vec::new(),
-            mcp_tokens: Vec::new(),
-            args: Vec::new(),
-            detach: false,
-            label: None,
-            json: false,
-            ttl_seconds: None,
-            from_bookmark: None,
-            model: None,
-            profile: None,
-            reasoning_effort: None,
-            temperature: None,
-            egress_allow: Vec::new(),
-            egress_deny: false,
+            ..RunOpts::default()
         }
     }
 

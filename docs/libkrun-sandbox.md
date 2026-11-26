@@ -817,7 +817,9 @@ Docker untouched until step 8. Slices (each its own commit, default build green)
       loop (a dropped client doesn't kill the live agent).
     - **`run_detached`** persists the `VmSpec` tempfile (the child reads it *after*
       the parent returns), spawns the `__krun-vmm` child with null stdio (don't
-      wait — it reparents to init), pipes the real creds to its stdin (the
+      wait — it is a `sandbox::DetachedChild`, whose waiter thread reaps it if it exits while
+      a long-lived caller such as dispatch lives; it reparents to init once the
+      caller exits), pipes the real creds to its stdin (the
       env-fork channel, unchanged), and writes a `Session` whose `sandbox_id` is a
       JSON `LibkrunHandle { sock, pid, creds, workspace, spec }`. No cleanup on
       return — the child owns the VM.

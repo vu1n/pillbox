@@ -5,12 +5,13 @@
 //! shared durable contract. Raw harness events are capture input only — never
 //! orchestration state and never a PTY transcript.
 
-use std::io::{BufRead as _, Read};
+use std::io::Read;
 
 use anyhow::{Context, Result};
 
 use crate::agents::harness::{ClaudeAdapter, CursorAdapter, HarnessAdapter, PiAdapter};
 use crate::contract::{Actor, Event, Payload, RequestedRunProfile, RunFinished, RunStarted};
+use crate::events::capture::{read_line_capped, CappedLine, MAX_CAPTURE_LINE_BYTES};
 use crate::events::log::SessionLog;
 
 pub(crate) struct DrainOutcome {
@@ -64,12 +65,29 @@ pub(crate) fn drain_jsonl<R: Read>(
     let mut saw_terminal = false;
     let mut terminal_exit = process_exit;
 
-    for (index, line) in std::io::BufReader::new(reader).lines().enumerate() {
-        let line = line.with_context(|| format!("read {agent_id} JSONL line {}", index + 1))?;
+    let mut reader = std::io::BufReader::new(reader);
+    let mut raw = Vec::new();
+    for index in 0.. {
+        // The guest writes this capture: a line past the cap is skipped, never buffered.
+        match read_line_capped(&mut reader, &mut raw, MAX_CAPTURE_LINE_BYTES)
+            .with_context(|| format!("read {agent_id} JSONL line {}", index + 1))?
+        {
+            CappedLine::Eof => break,
+            CappedLine::Oversized(n) => {
+                eprintln!(
+                    "pillbox: warning: skipped {agent_id} JSONL line {}: {n} bytes (cap {MAX_CAPTURE_LINE_BYTES})",
+                    index + 1
+                );
+                continue;
+            }
+            CappedLine::Line => {}
+        }
+        let line = std::str::from_utf8(&raw)
+            .with_context(|| format!("read {agent_id} JSONL line {}", index + 1))?;
         if line.trim().is_empty() {
             continue;
         }
-        let value = serde_json::from_str(&line)
+        let value = serde_json::from_str(line)
             .with_context(|| format!("parse {agent_id} JSONL line {}", index + 1))?;
         let events: Vec<Event> = adapter
             .parse_line(&value)

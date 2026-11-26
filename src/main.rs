@@ -828,35 +828,16 @@ fn run(cli: Cli) -> Result<()> {
         Command::List { json } => pillbox::list(json),
         Command::Rm { name } => pillbox::rm(&name),
         Command::Info { json } => pillbox::info(pillbox_arg, json),
-        Command::Run {
-            agent,
-            workspace,
-            name,
-            mounts,
-            withs,
-            env_bundles,
-            env_files,
-            vault,
-            memory,
-            mcps,
-            mcp_tokens,
-            detach,
-            label,
-            json,
-            events_webhook,
-            ttl,
-            parent,
-            from_bookmark,
-            preset,
-            model,
-            profile,
-            reasoning_effort,
-            temperature,
-            egress_allow,
-            egress_deny,
-            args,
-        } => {
+        command @ Command::Run { .. } => {
             let resolved = Pillbox::resolve(pillbox_arg)?;
+            let RunRequest {
+                mut agent,
+                mut opts,
+                json,
+                preset,
+                events_webhook,
+                parent,
+            } = run_request(command)?;
             // `--events-webhook URL` sets the env var for the duration of
             // this process so every downstream `emit_session_event` call
             // (here and threaded through to the helper subprocess) picks
@@ -875,62 +856,23 @@ fn run(cli: Cli) -> Result<()> {
             // so subsequent `env::var` reads (from the pump thread,
             // from `emit_session_event`, from the helper subprocess)
             // race only against this single completed write.
+            // `run_request` already validated the URL.
             if let Some(url) = &events_webhook {
-                let validated = validate_events_webhook_url(url)?;
                 unsafe {
-                    std::env::set_var("PILLBOX_EVENTS_WEBHOOK", &validated);
+                    std::env::set_var("PILLBOX_EVENTS_WEBHOOK", url);
                 }
             }
-            // `--parent <id>` plumbing mirrors the webhook flow: shape-
-            // validate, stash in `PILLBOX_PARENT_SESSION_ID`, and let
-            // the host's `session.started` emit pick it up off the env. Shape-only validation: the parent
-            // may live in another pillbox's registry, so we don't
-            // reject "unknown" ids — the field is observability
-            // metadata; consumers reconcile.
+            // `--parent <id>` plumbing mirrors the webhook flow: stash the
+            // (shape-validated) id in `PILLBOX_PARENT_SESSION_ID`, and let
+            // the host's `session.started` emit pick it up off the env.
             //
             // SAFETY: same single-threaded justification as the
             // PILLBOX_EVENTS_WEBHOOK `set_var` above.
             if let Some(id) = &parent {
-                commands::session::validate_session_id(id)?;
                 unsafe {
                     std::env::set_var(events::PARENT_SESSION_ID_ENV, id);
                 }
             }
-            // Parse `--ttl 30m` / `24h` / `7d` at the CLI boundary.
-            // Stored as seconds on `RunOpts` so the backend converts
-            // to an absolute RFC3339 `expires_at` close to the actual
-            // session-write time (no clock drift between parse and
-            // persist).
-            let ttl_seconds = match ttl {
-                Some(s) => Some(session::parse_ttl_seconds(&s)?),
-                None => None,
-            };
-            let mut agent = agent;
-            let mut opts = RunOpts {
-                workspace,
-                name,
-                mounts,
-                withs,
-                env_bundles,
-                env_files,
-                vault,
-                memory,
-                memory_briefed: Vec::new(), // dispatch_run fills this from the kypp briefing
-                mcps,
-                mcp_tokens,
-                args,
-                detach,
-                label,
-                json,
-                ttl_seconds,
-                from_bookmark,
-                model,
-                profile,
-                reasoning_effort,
-                temperature,
-                egress_allow,
-                egress_deny,
-            };
             // `--preset NAME` folds the descriptor's `[preset.NAME]` under the
             // explicit flags (flag > preset > descriptor > built-in), then a
             // one-line banner says what it contributed — the environment came
@@ -941,7 +883,9 @@ fn run(cli: Cli) -> Result<()> {
                 apply_preset(name, p, &mut agent, &mut opts)?;
                 eprintln!("{}", preset_banner(name, p));
             }
-            dispatch_run(&resolved, agent, opts)
+            let spec = commands::run::resolve_agent_spec(&resolved, agent.as_deref())?;
+            commands::run::validate_run_request(spec, &opts, json)?;
+            dispatch_run(&resolved, agent, opts, json)
         }
         Command::Dispatch {
             from_bookmark,
@@ -1199,19 +1143,110 @@ fn wizard_new(
     ))
 }
 
-fn resolve_agent_spec(
-    resolved: &Pillbox,
-    override_id: Option<&str>,
-) -> Result<&'static agents::AgentSpec> {
-    let id = match override_id {
-        Some(id) => id.to_string(),
-        // Descriptor cascade (project pillbox.toml → ~/.pillbox/global → built-in),
-        // read fresh so an edited `agent =` takes effect without a meta rewrite.
-        None => crate::config::resolve_run_config(resolved)
-            .agent
-            .unwrap_or_else(|| "claude".into()),
+/// What `pillbox run`'s flags ask for, before the descriptor and any preset fold in.
+struct RunRequest {
+    agent: Option<String>,
+    opts: RunOpts,
+    json: bool,
+    preset: Option<String>,
+    events_webhook: Option<String>,
+    parent: Option<String>,
+}
+
+/// Map a parsed `pillbox run` onto the [`RunOpts`] it asks for. The one mapping
+/// both the CLI and the dispatch/eval parity tests go through.
+fn run_request(command: Command) -> Result<RunRequest> {
+    let Command::Run {
+        agent,
+        workspace,
+        name,
+        mounts,
+        withs,
+        env_bundles,
+        env_files,
+        vault,
+        memory,
+        mcps,
+        mcp_tokens,
+        detach,
+        label,
+        json,
+        events_webhook,
+        ttl,
+        parent,
+        from_bookmark,
+        preset,
+        model,
+        profile,
+        reasoning_effort,
+        temperature,
+        egress_allow,
+        egress_deny,
+        args,
+    } = command
+    else {
+        unreachable!("run_request takes a `pillbox run` command");
     };
-    agents::lookup("run", &id)
+    // Usage errors in the order the CLI has always reported them: webhook, parent, ttl.
+    let events_webhook = match events_webhook {
+        Some(url) => Some(validate_events_webhook_url(&url)?),
+        None => None,
+    };
+    // Shape-only validation: the parent may live in another pillbox's registry, so
+    // an "unknown" id is not rejected — the field is observability metadata.
+    if let Some(id) = &parent {
+        commands::session::validate_session_id(id)?;
+    }
+    // Parse `--ttl 30m` / `24h` / `7d` at the CLI boundary.
+    // Stored as seconds on `RunOpts` so the backend converts
+    // to an absolute RFC3339 `expires_at` close to the actual
+    // session-write time (no clock drift between parse and
+    // persist).
+    let ttl_seconds = match ttl {
+        Some(s) => Some(session::parse_ttl_seconds(&s)?),
+        None => None,
+    };
+    let opts = RunOpts {
+        workspace,
+        name,
+        mounts,
+        withs,
+        env_bundles,
+        env_files,
+        vault,
+        memory,
+        mcps,
+        mcp_tokens,
+        args,
+        detach,
+        label,
+        ttl_seconds,
+        from_bookmark,
+        model,
+        profile,
+        reasoning_effort,
+        temperature,
+        egress_allow,
+        egress_deny,
+        // memory_briefed: commands::run::start fills it from the kypp briefing.
+        ..RunOpts::default()
+    };
+    Ok(RunRequest {
+        agent,
+        opts,
+        json,
+        preset,
+        events_webhook,
+        parent,
+    })
+}
+
+/// Parse a `pillbox run …` argv into the agent override and [`RunOpts`] the CLI
+/// would start, so in-process callers can be checked against the old argv.
+#[cfg(test)]
+pub(crate) fn parse_run_argv(argv: &[&str]) -> (Option<String>, RunOpts) {
+    let request = run_request(Cli::try_parse_from(argv).unwrap().command).unwrap();
+    (request.agent, request.opts)
 }
 
 /// Fold a `[preset.NAME]` under the flags already parsed into `opts`: a list
@@ -1302,102 +1337,18 @@ fn preset_banner(name: &str, p: &config::Preset) -> String {
     }
 }
 
-fn validate_bookmark_backend(opts: &RunOpts, backend: &str) -> Result<()> {
-    if opts.from_bookmark.is_some() && backend != crate::session::BACKEND_LIBKRUN {
-        return Err(PillboxError::usage(
-            "run",
-            "bookmark forks require the local libkrun microVM backend",
-        )
-        .with_next("use a libkrun-enabled Pillbox build with PILLBOX_BACKEND=libkrun")
-        .into());
-    }
-    Ok(())
-}
-
-fn apply_default_workspace(resolved: &Pillbox, opts: &mut RunOpts) {
-    // A bookmark restores into a host path only when a workspace override was supplied.
-    // Preserve None through dispatch so the backend can choose its immutable base cache.
-    if opts.workspace.is_none() && opts.from_bookmark.is_none() {
-        if let crate::pillbox::Scope::Project { source_dir, .. } = &resolved.scope {
-            opts.workspace = Some(source_dir.clone());
-        }
-    }
-}
-
-fn dispatch_run(resolved: &Pillbox, agent: Option<String>, mut opts: RunOpts) -> Result<()> {
-    // Resolve the agent + apply pillbox.toml defaults; the backend
-    // selection happens below.
-    let spec = resolve_agent_spec(resolved, agent.as_deref())?;
-    if let Some(meta) = &resolved.meta {
-        if opts.name.is_none() {
-            opts.name = Some(meta.name.clone());
-        }
-    }
-
-    if !spec.integration.supports_execution_request()
-        && (opts.profile.is_some() || opts.reasoning_effort.is_some())
-    {
-        return Err(PillboxError::usage(
-            "run",
-            format!(
-                "agent `{}` has no structured profile transport; use a structured agent integration",
-                spec.id
-            ),
-        )
-        .into());
-    }
-
-    // Model cascade: `--model` wins, else the descriptor (project `pillbox.toml`
-    // → `~/.pillbox/global/pillbox.toml`), else the agent's own default (`None`).
-    if opts.model.is_none() {
-        opts.model = crate::config::resolve_run_config(resolved).model;
-    }
-
-    apply_default_workspace(resolved, &mut opts);
-
-    // `--json` emits the started-session record; only `--detach` runs and
-    // structured agents persist one. A foreground PTY run has nothing to emit,
-    // so reject loudly here rather than print
-    // nothing. (Can't be a clap `requires` — server-mode validity depends on the
-    // resolved agent, not a flag.)
-    if opts.json && !opts.detach && !spec.integration.supports_execution_request() {
-        return Err(PillboxError::usage(
-            "run",
-            "--json needs a persisted session: add --detach, or run a structured agent",
-        )
-        .with_next(format!("pillbox run --agent {} --detach --json", spec.id))
-        .into());
-    }
-
+/// `pillbox run`: start the run in-process, then render what started.
+fn dispatch_run(
+    resolved: &Pillbox,
+    agent: Option<String>,
+    opts: RunOpts,
+    json: bool,
+) -> Result<()> {
     // Nudge if Raindrop Workshop is installed but no OTLP endpoint is set, so a
     // silent "no events" doesn't surprise the user.
     crate::events::hint_workshop_if_unconfigured();
-
-    let backend = crate::sandbox::select_backend();
-    validate_bookmark_backend(&opts, backend.id())?;
-    if !opts.memory {
-        return backend.run(spec, opts, resolved);
-    }
-    // --memory: brief the agent from kypp at start, capture THIS run's §0 log after. Host-side +
-    // best-effort. Detached runs skip the post-capture — the agent outlives this call, so the §0 log
-    // isn't complete yet; a scheduled `kypp sweep` (cron) catches them. Project scope = pillbox name.
-    let project = opts.name.clone().unwrap_or_else(|| "default".to_string());
-    let is_server = spec.integration == crate::agents::Integration::Server;
-    let capture_after = !opts.detach;
-    let briefed = crate::memory::brief_into_args(&mut opts.args, &project);
-    opts.memory_briefed = briefed.clone(); // carried into the backend so a server bring-up can stash it
-    let started = std::time::SystemTime::now(); // run-window start: capture only logs written after this
-    let result = backend.run(spec, opts, resolved);
-    // A FOREGROUND (PTY) agent finalizes its §0 log before `run` returns → capture now. A SERVER agent
-    // (opencode) is reparented: the log drains LATER, so capturing here would race an empty log —
-    // `session ingest` does the capture instead, from the brief the bring-up stashed (crate::memory).
-    if capture_after && !is_server {
-        let sessions = crate::session::sessions_root_path(resolved);
-        crate::memory::capture_run(&sessions, &project, started);
-        // record which briefed claims this run saw, for later credit assignment
-        crate::memory::record_brief_usage(&sessions, &project, started, &briefed);
-    }
-    result
+    let started = commands::run::start(resolved, agent.as_deref(), opts)?;
+    commands::run::render_started(&started, json)
 }
 
 /// Dispatch `pty-host --vsock-port` — Linux-only. The libkrun guest serves the
@@ -1527,16 +1478,20 @@ mod tests {
             ),
             (vec!["pillbox", "run"], Some(source.clone())),
         ] {
-            let (_, mut opts) = run_opts(Cli::try_parse_from(arguments).unwrap());
-            apply_default_workspace(&resolved, &mut opts);
+            let (_, mut opts) = parse_run_argv(&arguments);
+            commands::run::apply_default_workspace(&resolved, &mut opts);
             assert_eq!(opts.workspace, expected);
-            assert!(validate_bookmark_backend(&opts, crate::session::BACKEND_LIBKRUN).is_ok());
+            assert!(commands::run::validate_bookmark_backend(
+                &opts,
+                crate::session::BACKEND_LIBKRUN
+            )
+            .is_ok());
             for backend in [
                 crate::session::BACKEND_DOCKER,
                 crate::session::BACKEND_MANAGED,
             ] {
                 assert_eq!(
-                    validate_bookmark_backend(&opts, backend).is_err(),
+                    commands::run::validate_bookmark_backend(&opts, backend).is_err(),
                     opts.from_bookmark.is_some()
                 );
             }
@@ -1548,62 +1503,8 @@ mod tests {
     }
 
     fn run_opts(cli: Cli) -> (Option<String>, RunOpts) {
-        let Command::Run {
-            agent,
-            workspace,
-            name,
-            mounts,
-            withs,
-            env_bundles,
-            env_files,
-            vault,
-            memory,
-            mcps,
-            mcp_tokens,
-            detach,
-            label,
-            json,
-            from_bookmark,
-            model,
-            profile,
-            reasoning_effort,
-            temperature,
-            egress_allow,
-            egress_deny,
-            args,
-            ..
-        } = cli.command
-        else {
-            panic!("expected run");
-        };
-        (
-            agent,
-            RunOpts {
-                workspace,
-                name,
-                mounts,
-                withs,
-                env_bundles,
-                env_files,
-                vault,
-                memory,
-                memory_briefed: Vec::new(),
-                mcps,
-                mcp_tokens,
-                args,
-                detach,
-                label,
-                json,
-                ttl_seconds: None,
-                from_bookmark,
-                model,
-                profile,
-                reasoning_effort,
-                temperature,
-                egress_allow,
-                egress_deny,
-            },
-        )
+        let request = run_request(cli.command).unwrap();
+        (request.agent, request.opts)
     }
 
     fn dev_preset() -> config::Preset {

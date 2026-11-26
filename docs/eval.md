@@ -11,9 +11,11 @@ every run with the same verifier, and emits a machine-readable comparison plus a
 ## What it is (and isn't)
 
 It's the spec-driven, first-class front-end over primitives pillbox already has —
-each cell is the same `run --detach --json` → `session send` → `session
-wait-idle` → `session score` chain `dispatch` and the bash eval rig
-(`scripts/eval/*`) use. The new bits are the **declarative spec** and the
+each cell is the same run → send → wait-idle → grade chain `dispatch` and the
+bash eval rig (`scripts/eval/*`) use, driven in-process through the typed
+session calls (`commands::run::start`, `session::send`, `stream::wait_idle`,
+`session::workspace_of`, `session::score`) rather than by self-exec'ing the
+binary. The new bits are the **declarative spec** and the
 **variant × trial matrix**.
 
 It does **not** reimplement the variance statistics: `eval` emits records in the
@@ -52,8 +54,31 @@ mcp = ["code-search=http://localhost:8123"]   # each forwarded to `run --mcp`
 Spec format is **TOML** (matches `pillbox.toml` and avoids a new dependency; the
 #71 sketch was YAML — TOML is the repo convention). Unknown fields are rejected
 loudly (`deny_unknown_fields`), and the cross-field invariants (exactly one
-verifier, exactly one prompt source, not both workspace + bookmark, `trials ≥ 1`)
-fail at parse — **before any VM boots**.
+verifier, exactly one prompt source, not both workspace + bookmark, `trials ≥ 1`,
+the grading knobs below) fail at parse — **before any VM boots**.
+
+### Grading knobs (`[verify]`)
+
+Cells grade offline with the default protected set unless `[verify]` says
+otherwise. These keys are dispatch's grading flags, validated and applied by the
+same code (`commands::grading::grade_protect_set`, `GradePolicy`):
+
+| `[verify]` key | dispatch flag | Effect |
+|---|---|---|
+| `grader_egress = ["host", …]` | `--grader-egress HOST` | hosts the grader microVM may reach (default: none, offline) |
+| `protect = ["pattern", …]` | `--protect PATTERN` | extra paths restored from the base before every grade |
+| `no_default_protect = true` | `--no-default-protect` | drop `workspace::protect::DEFAULT_PROTECTED` |
+| `grader_files = "dir"` | `--grader-files DIR` | hidden files copied into every grade tree at `.pillbox-grader/`, never into a cell's workspace; must be a directory outside the directory the cells clone from (the spec's `workspace`, else the project directory, else the cwd; its landing spot is protected) |
+
+A Rust verifier that fetches crates and runs a hidden acceptance check:
+
+```toml
+[verify]
+cmd = "cargo test && sh .pillbox-grader/acceptance.sh"
+grader_egress = ["index.crates.io", "static.crates.io"]
+protect = ["ci/**", "Cargo.lock"]
+grader_files = "../myapp-hidden-tests"   # relative to the cwd, like the flag
+```
 
 ## Run it
 
@@ -121,17 +146,25 @@ The hard-won lessons the σ̂ campaigns paid for (see
 
 ## Limits (v1)
 
-- **libkrun-only grading** — like `dispatch`, `eval` scores each run's *live*
-  workspace clone (`session info --json` → `.session.workspace`), which only
-  libkrun sessions populate. A docker path (pull-then-score) is the same deferred
-  resolution noted in [dispatch.md](./dispatch.md).
+- **Grading is dispatch's grading** (`commands::grading::grade_worker`). A run's
+  workspace is written by the agent inside its microVM, so it is untrusted: eval
+  freezes a copy of it (`session::workspace_of`, libkrun sessions only), restores
+  the default protected paths (`tests/`, `*_test.rs`, fixtures — see
+  `workspace::protect::DEFAULT_PROTECTED`, adjusted by the `[verify]` grading
+  knobs above) from a trusted base, and runs the verifier only inside the
+  one-shot grader microVM — offline unless `grader_egress` names hosts, as the
+  unprivileged user. A cell that rewrites a test is graded against the base's copy; a grader VM
+  that cannot run errors the cell (score 0), never a host retry. The base is the
+  spec's `from_bookmark` restored, or else a scrubbed copy of the workspace
+  directory (`workspace`, the project dir, or the cwd) taken before the first
+  cell. A build without the libkrun backend refuses to start `eval`.
 - **`cost` is 0** in the records — usage capture is an additive follow-up; it's
   off the σ̂/score metric the comparison turns on.
 - **`max_turns`** is parsed but not enforced (pillbox has no per-session turn cap;
   the agent's own scaffold bounds turns).
 - A live end-to-end **smoke** (mirroring `scripts/smoke/dispatch.sh`) is the
   follow-up that exercises the run loop on real VMs; the loop reuses dispatch's
-  live-proven run→drive→grade subprocess chain, and the spec/validation/summary
+  same run→drive→grade chain (now the typed in-process calls), and the spec/validation/summary
   are unit + CLI tested.
 
 ## Relationship to other verbs

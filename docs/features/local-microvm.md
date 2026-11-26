@@ -2,6 +2,7 @@
 id: local-microvm
 paths:
   - "src/sandbox/mod.rs"
+  - "src/commands/run.rs"
   - "src/sandbox/libkrun/**"
   - "src/docker.rs"
   - "src/startup.rs"
@@ -11,11 +12,18 @@ paths:
   - "build.rs"
 entry:
   - "src/sandbox/mod.rs:select_backend"
+  - "src/commands/run.rs:start"
   - "src/sandbox/libkrun/session.rs:prepare_launch"
   - "src/sandbox/libkrun/rootfs.rs"
 tests:
   - "src/sandbox/libkrun/boot.rs:boot_channel_binds_share_to_exec_and_writes_script"
   - "src/sandbox/libkrun/mod.rs:rootfs_tar_extraction_preserves_sticky_world_writable_mode"
+  - "src/commands/run.rs:json_envelope_is_the_same_for_every_lifecycle"
+  - "src/sandbox/mod.rs:dropping_a_detached_child_reaps_it"
+  - "src/sandbox/mod.rs:an_explicitly_stopped_detached_child_is_waited_once"
+  - "src/sandbox/libkrun/http.rs:an_endless_body_errors_at_the_cap"
+  - "src/sandbox/libkrun/http.rs:a_silent_guest_errors_at_the_timeout"
+  - "src/sandbox/libkrun/http.rs:a_guest_that_reads_a_trickle_errors_at_the_deadline"
   - "scripts/smoke/libkrun.sh"
 ---
 
@@ -42,4 +50,6 @@ With the macOS libkrun toolchain, runner image and agent auth prepared, build/si
 - GitHub macOS CI compiles/links and runs non-VM tests; it cannot prove HVF boot.
 - Fresh OCI exports still need Docker as image plumbing. That does not make the deprecated Docker execution backend a maintained alternative.
 - A rebuild can replace the signed binary; use the build/sign script before a manual VM run.
+- `run::start` also runs inside long-lived callers (dispatch, eval): a detached `__krun-vmm` or `__session-tailer` child is spawned as a `sandbox::DetachedChild` (never a bare `Child`): dropping it hands it to a waiter thread, and the failure paths consume it (`kill_and_wait`, or `into_child` for `stop_spawned_vmm`), so an exit never leaves a zombie that signal-0 probes read as alive.
 - The egress fence logs its DNS and TLS decisions to `PILLBOX_KRUN_EGRESS_LOG`, else to a per-run file under `~/.pillbox/krun/egress/` (pruned after 14 days, capped at 4 MiB). A foreground run prints the hosts it refused when it ends; a shared `PILLBOX_KRUN_EGRESS_LOG` gets no summary, since it mixes runs.
+- The host's HTTP client to the guest server (`sandbox/libkrun/http.rs`; opencode or the codex app-server bridge) treats the guest as untrusted: a reply is capped at `MAX_RESPONSE_BYTES` (16 MiB) and a whole exchange, request write included, at `RESPONSE_TIMEOUT` (60 s), because dispatch/eval call it in-process and an unbounded read would take down the orchestrator. Its tests need the libkrun feature (a stub `libkrun.so` is enough on Linux); the `--no-default-features` gate does not run them.

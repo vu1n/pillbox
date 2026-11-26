@@ -38,6 +38,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 
+use super::tailer::{transcript_identity, TranscriptSource};
 use super::{Harness, Tailer};
 use crate::events::log::SessionLog;
 
@@ -284,19 +285,20 @@ fn spawn_tailer(
                 Tailer::durable_source(cursor_path, &session_id)?
             }
         };
-        let path = loop {
+        let (path, (device, inode)) = loop {
             if stop_thread.load(Ordering::Relaxed) {
                 return Ok(()); // asked to stop before the transcript appeared
             }
-            if let Some(path) = resumed.as_ref() {
-                if std::fs::symlink_metadata(path)
-                    .is_ok_and(|metadata| metadata.file_type().is_file())
-                {
-                    break path.clone();
-                }
-            } else if let Some(path) = find_new_jsonl(&watch_root, scope_dir.as_deref(), &exclude)?
+            let found = match resumed.as_ref() {
+                Some(path) => Some(path.clone()),
+                None => find_new_jsonl(&watch_root, scope_dir.as_deref(), &exclude)?,
+            };
+            // The tail binds to the regular file discovery saw; a vanished or swapped one is retried.
+            if let Some(identity) = found
+                .as_ref()
+                .and_then(|path| transcript_identity(path).ok())
             {
-                break path;
+                break (found.expect("identity implies a path"), identity);
             }
             std::thread::sleep(Duration::from_millis(200));
         };
@@ -304,9 +306,14 @@ fn spawn_tailer(
             TailPersistence::Durable { log, cursor_path } => {
                 Tailer::new_durable(path, session_id, harness, include_usage, log, cursor_path)?
             }
-            TailPersistence::BestEffort(log) => {
-                Tailer::new(path, session_id, harness, include_usage, log)
-            }
+            TailPersistence::BestEffort(log) => Tailer::new(
+                path,
+                TranscriptSource::Guest { device, inode },
+                session_id,
+                harness,
+                include_usage,
+                log,
+            ),
         };
         tailer
             .follow_until(&stop_thread)

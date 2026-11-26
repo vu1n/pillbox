@@ -34,8 +34,8 @@ use serde_json::json;
 
 use crate::agents::{McpAttachment, RunOpts};
 use crate::commands::grading::{
-    copy_base_dir, grade_worker, grader_vm_available, restore_bookmark, GradePolicy, LiveSessions,
-    SessionOps,
+    copy_base_dir, grade_protect_set, grade_worker, grader_vm_available, restore_bookmark,
+    GradeKnobs, GradePolicy, KnobNames, LiveSessions, SessionOps,
 };
 use crate::commands::session::{self, stream};
 use crate::commands::{self};
@@ -102,6 +102,21 @@ struct Verify {
     /// A rubric file (`NAME :: COMMAND` per line) → per-criterion + fractional. Xor `cmd`.
     #[serde(default)]
     rubric: Option<PathBuf>,
+    /// Hosts the grader microVM may reach (dispatch's `--grader-egress`). Empty
+    /// keeps grading offline.
+    #[serde(default)]
+    grader_egress: Vec<String>,
+    /// Extra protected path patterns restored from the base before every grade
+    /// (dispatch's `--protect`).
+    #[serde(default)]
+    protect: Vec<String>,
+    /// Drop the default protected set (dispatch's `--no-default-protect`).
+    #[serde(default)]
+    no_default_protect: bool,
+    /// Hidden grader files copied into every grade tree at `.pillbox-grader/`,
+    /// never into a cell's workspace (dispatch's `--grader-files`).
+    #[serde(default)]
+    grader_files: Option<PathBuf>,
 }
 
 impl Verify {
@@ -149,10 +164,11 @@ struct Variant {
 
 impl EvalSpec {
     /// Validate the cross-field invariants TOML's type-check can't: exactly one
-    /// verifier, exactly one prompt source, a positive trial count, and not both
-    /// workspace + bookmark. Loud + specific so a bad spec fails at parse, not
-    /// mid-run after booting VMs.
-    fn validate(&self) -> Result<()> {
+    /// verifier, exactly one prompt source, a positive trial count, not both
+    /// workspace + bookmark, and the `[verify]` grading knobs exactly as dispatch
+    /// validates its flags. Returns the protected set every grade restores. Loud +
+    /// specific so a bad spec fails at parse, not mid-run after booting VMs.
+    fn validate(&self, resolved: &Pillbox) -> Result<ProtectSet> {
         let err = |m: &str| PillboxError::usage("eval", m).into();
         if self.verify.cmd.is_some() == self.verify.rubric.is_some() {
             return Err(err("[verify] needs exactly one of `cmd` or `rubric`"));
@@ -168,7 +184,20 @@ impl EvalSpec {
         if self.trials < 1 {
             return Err(err("`trials` must be ≥ 1"));
         }
-        Ok(())
+        grade_protect_set(
+            resolved,
+            &GradeKnobs {
+                protect: &self.verify.protect,
+                no_default_protect: self.verify.no_default_protect,
+                grader_files: self.verify.grader_files.as_deref(),
+            },
+            &KnobNames {
+                command: "eval",
+                protect: "[verify] protect",
+                grader_files: "[verify] grader_files",
+                protect_example: "protect = [\"ci/**\"] under [verify]",
+            },
+        )
     }
 
     /// The prompt text (inline or read from `prompt_file`).
@@ -239,7 +268,7 @@ pub(crate) fn eval(resolved: &Pillbox, opts: EvalOpts) -> Result<()> {
     let spec: EvalSpec = toml::from_str(&raw).map_err(|e| {
         PillboxError::usage("eval", format!("parse spec {}: {e}", opts.spec.display()))
     })?;
-    spec.validate()?;
+    let protect = spec.validate(resolved)?;
     let prompt = spec.prompt_text()?;
     let variants = spec.resolved_variants();
     // Cell grades run in the grader microVM. Refuse before starting any cell
@@ -253,7 +282,6 @@ pub(crate) fn eval(resolved: &Pillbox, opts: EvalOpts) -> Result<()> {
         .into());
     }
     let (_base_dir, base) = eval_base(resolved, &spec)?;
-    let protect = ProtectSet::new(true, &[])?;
     let runner = Runner::new(resolved, &LiveSessions, &base, protect)?;
 
     let records_path = opts
@@ -524,15 +552,16 @@ impl<'a> Runner<'a> {
     }
 
     /// Grade the run exactly as dispatch grades a worker: a frozen copy of its
-    /// live workspace with protected paths restored from the trusted base, scored
-    /// inside the grader microVM (offline). The snapshot is dropped afterwards.
+    /// live workspace with protected paths restored from the trusted base (plus
+    /// any `[verify]` grader files), scored inside the grader microVM, offline
+    /// unless `[verify] grader_egress` names hosts. The snapshot is dropped afterwards.
     fn grade(&self, id: &str, spec: &EvalSpec) -> Result<Scored> {
         let (cmd, rubric) = spec.verify.parts()?;
         let policy = GradePolicy {
             base: self.base,
             protect: &self.protect,
-            grader_files: None,
-            egress: &[],
+            grader_files: spec.verify.grader_files.as_deref(),
+            egress: &spec.verify.grader_egress,
             command: "eval",
         };
         let snap = self.scratch.path().join(id);
@@ -549,9 +578,13 @@ mod tests {
     use super::*;
 
     fn parse(s: &str) -> Result<EvalSpec> {
+        parse_with_protect(s).map(|(spec, _)| spec)
+    }
+
+    fn parse_with_protect(s: &str) -> Result<(EvalSpec, ProtectSet)> {
         let spec: EvalSpec = toml::from_str(s)?;
-        spec.validate()?;
-        Ok(spec)
+        let protect = spec.validate(&crate::pillbox::global())?;
+        Ok((spec, protect))
     }
 
     #[test]
@@ -795,16 +828,117 @@ mod tests {
     /// Grade cell `c1` of a spec whose verifier is `cmd`, with `fake` standing in
     /// for the session API and `p.base` as the trusted base.
     fn grade_cell(p: &Project, fake: &FakeSessions, cmd: &str) -> Result<Scored> {
+        grade_cell_with(p, fake, cmd, "")
+    }
+
+    /// [`grade_cell`] with extra `[verify]` keys (TOML lines) in the spec.
+    fn grade_cell_with(
+        p: &Project,
+        fake: &FakeSessions,
+        cmd: &str,
+        verify: &str,
+    ) -> Result<Scored> {
         let resolved = crate::pillbox::global();
-        let spec = parse(&format!("name='t'\nprompt='p'\n[verify]\ncmd={cmd:?}\n")).unwrap();
-        let runner = Runner::new(
-            &resolved,
-            fake,
-            p.base.path(),
-            ProtectSet::new(true, &[]).unwrap(),
+        let (spec, protect) = parse_with_protect(&format!(
+            "name='t'\nprompt='p'\n[verify]\ncmd={cmd:?}\n{verify}"
+        ))
+        .unwrap();
+        let runner = Runner::new(&resolved, fake, p.base.path(), protect).unwrap();
+        runner.grade("c1", &spec)
+    }
+
+    #[test]
+    fn verify_grader_egress_reaches_the_score_request() {
+        let p = project();
+        let fake = FakeSessions::new(&p.ws, Vm::RecordsOnly);
+        grade_cell_with(
+            &p,
+            &fake,
+            "cargo test",
+            "grader_egress = ['index.crates.io', 'static.crates.io']\n",
         )
         .unwrap();
-        runner.grade("c1", &spec)
+        let scores = fake.scores();
+        assert_eq!(scores[0].egress, ["index.crates.io", "static.crates.io"]);
+        assert!(scores[0].in_sandbox);
+    }
+
+    #[test]
+    fn verify_protect_restores_an_extra_pattern_in_the_grade_tree() {
+        let p = project();
+        put(p.base.path(), "ci/gate.sh", "exit 1\n");
+        let ws_gate = p.ws.join("ci/gate.sh");
+        put(&p.ws, "ci/gate.sh", "exit 0\n");
+        let fake = FakeSessions::new(&p.ws, Vm::RecordsOnly);
+        grade_cell_with(&p, &fake, "sh ci/gate.sh", "protect = ['ci/**']\n").unwrap();
+        assert_eq!(read(&fake.seen.join("ci/gate.sh")), "exit 1\n");
+        assert_eq!(read(&ws_gate), "exit 0\n", "live tree untouched");
+
+        // Without the pattern the cell's own copy is graded.
+        let fake = FakeSessions::new(&p.ws, Vm::RecordsOnly);
+        grade_cell(&p, &fake, "sh ci/gate.sh").unwrap();
+        assert_eq!(read(&fake.seen.join("ci/gate.sh")), "exit 0\n");
+    }
+
+    #[test]
+    fn verify_no_default_protect_grades_the_cells_own_tests() {
+        let p = project();
+        put(&p.ws, "tests/check.sh", "exit 0\n");
+        let fake = FakeSessions::new(&p.ws, Vm::RunsGrader);
+        assert!(
+            grade_cell_with(
+                &p,
+                &fake,
+                "sh tests/check.sh",
+                "no_default_protect = true\n"
+            )
+            .unwrap()
+            .passed
+        );
+        assert_eq!(read(&fake.seen.join("tests/check.sh")), "exit 0\n");
+    }
+
+    #[test]
+    fn verify_grader_files_land_in_the_grade_tree_only() {
+        let hidden = tempfile::tempdir().unwrap();
+        put(hidden.path(), "hidden.sh", "grep -q fixed src/lib.rs\n");
+        let p = project();
+        put(&p.ws, "src/lib.rs", "pub fn f() {} // fixed\n");
+        let fake = FakeSessions::new(&p.ws, Vm::RunsGrader);
+        let verify = format!("grader_files = {:?}\n", hidden.path().display().to_string());
+        assert!(
+            grade_cell_with(&p, &fake, "sh .pillbox-grader/hidden.sh", &verify)
+                .unwrap()
+                .passed
+        );
+        assert_eq!(
+            read(&fake.seen.join(".pillbox-grader/hidden.sh")),
+            "grep -q fixed src/lib.rs\n"
+        );
+        assert!(
+            !p.ws.join(".pillbox-grader").exists(),
+            "never in the cell's workspace"
+        );
+    }
+
+    #[test]
+    fn bad_verify_grading_knobs_fail_spec_validation() {
+        let spec = |verify: &str| format!("name='t'\nprompt='p'\n[verify]\ncmd='true'\n{verify}");
+        let err = parse(&spec("protect = ['../escape']\n")).unwrap_err();
+        let pe = err.downcast_ref::<PillboxError>().expect("a PillboxError");
+        assert!(pe.reason.contains("[verify] protect"), "{err:#}");
+
+        let missing = tempfile::tempdir().unwrap().path().join("nope");
+        let err = parse(&spec(&format!(
+            "grader_files = {:?}\n",
+            missing.display().to_string()
+        )))
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("not a directory"), "{err:#}");
+
+        // Tests run from the package root: a directory inside it would ship to every cell.
+        let err = parse(&spec("grader_files = 'src'\n")).unwrap_err();
+        assert!(format!("{err:#}").contains("inside the project"), "{err:#}");
     }
 
     #[test]

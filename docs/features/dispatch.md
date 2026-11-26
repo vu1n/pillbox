@@ -21,6 +21,7 @@ tests:
   - "src/commands/eval.rs:a_cell_starts_exactly_what_the_old_cli_argv_asked_for"
   - "src/commands/eval.rs:eval_never_grades_a_cell_tree_on_the_host"
   - "src/commands/eval.rs:a_cell_editing_a_protected_test_does_not_change_its_grade"
+  - "src/commands/eval.rs:verify_grader_files_land_in_the_grade_tree_only"
   - "scripts/smoke/dispatch.sh"
   - "scripts/smoke/dispatch-segments.sh"
 ---
@@ -47,7 +48,7 @@ Create a base snapshot/bookmark and a verifier, then use `pillbox dispatch --fro
 
 - A segment gate steers progression; it is not the authoritative run-level reward.
 - Worker-edited tests are restored/protected for grading. Grader unavailability is an error, not a host fallback.
-- `eval` grades each cell through the same `commands::grading::grade_worker` as dispatch: a frozen copy of the live workspace, default protected paths restored from the trusted base, scored only in the grader microVM, offline, privileges dropped. The base is the spec's `from_bookmark` restored, else a copy of the workspace directory (spec `workspace`, project dir or cwd) taken before the first cell. A build without libkrun refuses to start `eval`, as it refuses `dispatch`.
+- `eval` grades each cell through the same `commands::grading::grade_worker` as dispatch: a frozen copy of the live workspace, protected paths restored from the trusted base, scored only in the grader microVM, privileges dropped. Its spec's `[verify]` `grader_egress`/`protect`/`no_default_protect`/`grader_files` are dispatch's grading flags, validated by the same `commands::grading::grade_protect_set` (default: offline, default protected set). The base is the spec's `from_bookmark` restored, else a copy of the workspace directory (spec `workspace`, project dir or cwd) taken before the first cell. A build without libkrun refuses to start `eval`, as it refuses `dispatch`.
 - `ScoreRequest` has no `Default`: every caller writes `in_sandbox`, so grading on the host is never an omitted field. Only `session score` without `--in-sandbox` and dispatch's `--baseline-check` (the trusted bookmark, via `grade_dir`) grade on the host.
 - Inspect `pulled_to`, not only winner/exit status; result recovery can fail separately.
 - Dispatch never re-executes `pillbox` or parses CLI `--json`; a fork that comes back as anything but a detached/server session (or a structured run that exited 0) errors that worker (`Started::into_live_session`).

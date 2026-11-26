@@ -54,8 +54,31 @@ mcp = ["code-search=http://localhost:8123"]   # each forwarded to `run --mcp`
 Spec format is **TOML** (matches `pillbox.toml` and avoids a new dependency; the
 #71 sketch was YAML — TOML is the repo convention). Unknown fields are rejected
 loudly (`deny_unknown_fields`), and the cross-field invariants (exactly one
-verifier, exactly one prompt source, not both workspace + bookmark, `trials ≥ 1`)
-fail at parse — **before any VM boots**.
+verifier, exactly one prompt source, not both workspace + bookmark, `trials ≥ 1`,
+the grading knobs below) fail at parse — **before any VM boots**.
+
+### Grading knobs (`[verify]`)
+
+Cells grade offline with the default protected set unless `[verify]` says
+otherwise. These keys are dispatch's grading flags, validated and applied by the
+same code (`commands::grading::grade_protect_set`, `GradePolicy`):
+
+| `[verify]` key | dispatch flag | Effect |
+|---|---|---|
+| `grader_egress = ["host", …]` | `--grader-egress HOST` | hosts the grader microVM may reach (default: none, offline) |
+| `protect = ["pattern", …]` | `--protect PATTERN` | extra paths restored from the base before every grade |
+| `no_default_protect = true` | `--no-default-protect` | drop `workspace::protect::DEFAULT_PROTECTED` |
+| `grader_files = "dir"` | `--grader-files DIR` | hidden files copied into every grade tree at `.pillbox-grader/`, never into a cell's workspace; must be a directory outside the project (its landing spot is protected) |
+
+A Rust verifier that fetches crates and runs a hidden acceptance check:
+
+```toml
+[verify]
+cmd = "cargo test && sh .pillbox-grader/acceptance.sh"
+grader_egress = ["index.crates.io", "static.crates.io"]
+protect = ["ci/**", "Cargo.lock"]
+grader_files = "../myapp-hidden-tests"   # relative to the cwd, like the flag
+```
 
 ## Run it
 
@@ -127,9 +150,10 @@ The hard-won lessons the σ̂ campaigns paid for (see
   workspace is written by the agent inside its microVM, so it is untrusted: eval
   freezes a copy of it (`session::workspace_of`, libkrun sessions only), restores
   the default protected paths (`tests/`, `*_test.rs`, fixtures — see
-  `workspace::protect::DEFAULT_PROTECTED`) from a trusted base, and runs the
-  verifier only inside the one-shot grader microVM — offline, as the unprivileged
-  user. A cell that rewrites a test is graded against the base's copy; a grader VM
+  `workspace::protect::DEFAULT_PROTECTED`, adjusted by the `[verify]` grading
+  knobs above) from a trusted base, and runs the verifier only inside the
+  one-shot grader microVM — offline unless `grader_egress` names hosts, as the
+  unprivileged user. A cell that rewrites a test is graded against the base's copy; a grader VM
   that cannot run errors the cell (score 0), never a host retry. The base is the
   spec's `from_bookmark` restored, or else a scrubbed copy of the workspace
   directory (`workspace`, the project dir, or the cwd) taken before the first

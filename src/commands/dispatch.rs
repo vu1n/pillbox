@@ -39,7 +39,8 @@ use crate::commands::critic::{
     TypesafeCritic,
 };
 use crate::commands::grading::{
-    grade_worker, grader_vm_available, restore_bookmark, GradePolicy, LiveSessions, SessionOps,
+    grade_protect_set, grade_worker, grader_vm_available, restore_bookmark, GradeKnobs,
+    GradePolicy, KnobNames, LiveSessions, SessionOps,
 };
 use crate::contract::{Actor, Artifact, ArtifactClass, Criterion, Event, Payload, Scored};
 use crate::cost::ObservedUsage;
@@ -47,7 +48,7 @@ use crate::errors::PillboxError;
 use crate::events::blob::BlobStore;
 use crate::events::log::SessionLog;
 use crate::pillbox::Pillbox;
-use crate::workspace::protect::{ProtectSet, GRADER_FILES_DIR};
+use crate::workspace::protect::ProtectSet;
 
 /// Per-turn idle timeout (seconds) each worker gets before it's treated as stuck
 /// (→ an `Errored` worker, not a whole-dispatch hang). Generous — agent turns run
@@ -1686,30 +1687,6 @@ impl<'a> SessionDriver<'a> {
     }
 }
 
-/// The project directory `dir` sits in, if any: the resolved pillbox's own
-/// directory (the one holding its `pillbox.toml`, whatever the cwd), or, on the
-/// global pillbox, the nearest ancestor of the cwd holding `pillbox.toml` or
-/// `.git` (else the cwd itself).
-fn grader_files_inside_project(
-    dir: &std::path::Path,
-    resolved: Option<&std::path::Path>,
-) -> Option<PathBuf> {
-    let dir = dir.canonicalize().ok()?;
-    // A selected project pillbox is the only bookmark source; the cwd stands in
-    // for the project only on the global pillbox.
-    let project = match resolved {
-        Some(p) => p.canonicalize().ok()?,
-        None => {
-            let cwd = std::env::current_dir().ok()?.canonicalize().ok()?;
-            cwd.ancestors()
-                .find(|a| a.join("pillbox.toml").exists() || a.join(".git").exists())
-                .unwrap_or(&cwd)
-                .to_path_buf()
-        }
-    };
-    dir.starts_with(&project).then_some(project)
-}
-
 /// The `RunOpts` (and agent override) that fork worker `i` — what `pillbox run
 /// --from-bookmark B --detach [--agent A] [--model M] [--temperature T]
 /// [--memory] [--ttl D] [-- FIRST_TURN]` parses to, every other flag at its clap
@@ -2107,43 +2084,20 @@ pub(crate) fn dispatch(resolved: &Pillbox, opts: DispatchOpts) -> Result<()> {
         .into());
     }
 
-    // `--grader-files`: a real directory, and its landing spot is protected so
-    // a worker can't plant its own `.pillbox-grader/` (and the copy is locked).
-    let mut protect_patterns = opts.protect.clone();
-    if let Some(dir) = &opts.grader_files {
-        if !dir.is_dir() {
-            return Err(PillboxError::usage(
-                "dispatch",
-                format!("--grader-files {} is not a directory", dir.display()),
-            )
-            .into());
-        }
-        // Hidden only if the bookmark can't carry it: a directory inside the
-        // project ships to every worker's fork with the rest of the tree.
-        let source_dir = match &resolved.scope {
-            crate::pillbox::Scope::Project { source_dir, .. } => Some(source_dir.as_path()),
-            crate::pillbox::Scope::Global => None,
-        };
-        if let Some(project) = grader_files_inside_project(dir, source_dir) {
-            return Err(PillboxError::usage(
-                "dispatch",
-                format!(
-                    "--grader-files {} is inside the project {}, so workers can read it",
-                    dir.display(),
-                    project.display()
-                ),
-            )
-            .with_next(
-                "keep hidden checks outside the project directory, e.g. ../myapp-hidden-tests/",
-            )
-            .into());
-        }
-        protect_patterns.push(format!("/{GRADER_FILES_DIR}/"));
-    }
-    let protect = ProtectSet::new(!opts.no_default_protect, &protect_patterns).map_err(|e| {
-        PillboxError::usage("dispatch", format!("--protect: {e:#}"))
-            .with_next("patterns are paths relative to the workspace, e.g. --protect 'ci/**'")
-    })?;
+    let protect = grade_protect_set(
+        resolved,
+        &GradeKnobs {
+            protect: &opts.protect,
+            no_default_protect: opts.no_default_protect,
+            grader_files: opts.grader_files.as_deref(),
+        },
+        &KnobNames {
+            command: "dispatch",
+            protect: "--protect",
+            grader_files: "--grader-files",
+            protect_example: "--protect 'ci/**'",
+        },
+    )?;
 
     let driver = SessionDriver::new(resolved, &opts, default_agent_id, protect);
     // `--baseline-check`: grade the untouched base first — a reward that already
@@ -2204,23 +2158,6 @@ pub(crate) fn dispatch(resolved: &Pillbox, opts: DispatchOpts) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn grader_files_inside_the_project_are_refused() {
-        // Tests run from the package root, which holds Cargo.toml and .git.
-        assert!(grader_files_inside_project(std::path::Path::new("src"), None).is_some());
-        let outside = tempfile::TempDir::new().unwrap();
-        assert!(grader_files_inside_project(outside.path(), None).is_none());
-        // The selected pillbox's directory counts wherever the cwd is.
-        let project = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir(project.path().join("hidden")).unwrap();
-        let hidden = project.path().join("hidden");
-        assert!(grader_files_inside_project(&hidden, Some(project.path())).is_some());
-        // With a project selected, a directory in the unrelated cwd repo is fine.
-        assert!(
-            grader_files_inside_project(std::path::Path::new("src"), Some(project.path()))
-                .is_none()
-        );
-    }
     use std::cell::RefCell;
 
     fn outcome(

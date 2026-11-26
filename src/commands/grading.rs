@@ -12,8 +12,11 @@ use anyhow::{Context, Result};
 
 use crate::commands::session::ScoreRequest;
 use crate::contract::Scored;
+use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
-use crate::workspace::protect::{force_remove, snapshot_workspace, GradeTree, ProtectSet};
+use crate::workspace::protect::{
+    force_remove, snapshot_workspace, GradeTree, ProtectSet, GRADER_FILES_DIR,
+};
 use crate::workspace::WorkspaceBackend;
 
 /// The session calls a grade and a winner pull go through. The live
@@ -122,6 +125,105 @@ pub(crate) struct GradePolicy<'a> {
     pub(crate) command: &'static str,
 }
 
+/// The protected-path knobs of a grade, as `dispatch` takes them in flags and
+/// `eval` in its spec's `[verify]` table.
+pub(crate) struct GradeKnobs<'a> {
+    /// Extra protected path patterns, relative to the workspace.
+    pub(crate) protect: &'a [String],
+    /// Drop [`crate::workspace::protect::DEFAULT_PROTECTED`].
+    pub(crate) no_default_protect: bool,
+    /// Hidden grader files injected into every grade tree.
+    pub(crate) grader_files: Option<&'a Path>,
+}
+
+/// How the caller's user spells each knob, so a usage error names what they wrote.
+pub(crate) struct KnobNames {
+    pub(crate) command: &'static str,
+    pub(crate) protect: &'static str,
+    pub(crate) grader_files: &'static str,
+    /// An example extra protected pattern, in the caller's syntax.
+    pub(crate) protect_example: &'static str,
+}
+
+/// Validate `knobs` and build the protected set every grade restores: the
+/// defaults (unless dropped) plus the extra patterns, and, with grader files,
+/// their `.pillbox-grader/` landing spot.
+pub(crate) fn grade_protect_set(
+    resolved: &Pillbox,
+    knobs: &GradeKnobs,
+    names: &KnobNames,
+) -> Result<ProtectSet> {
+    let mut protect_patterns = knobs.protect.to_vec();
+    if let Some(dir) = knobs.grader_files {
+        if !dir.is_dir() {
+            return Err(PillboxError::usage(
+                names.command,
+                format!(
+                    "{} {} is not a directory",
+                    names.grader_files,
+                    dir.display()
+                ),
+            )
+            .into());
+        }
+        // Hidden only if the bookmark can't carry it: a directory inside the
+        // project ships to every worker's fork with the rest of the tree.
+        let source_dir = match &resolved.scope {
+            crate::pillbox::Scope::Project { source_dir, .. } => Some(source_dir.as_path()),
+            crate::pillbox::Scope::Global => None,
+        };
+        if let Some(project) = grader_files_inside_project(dir, source_dir) {
+            return Err(PillboxError::usage(
+                names.command,
+                format!(
+                    "{} {} is inside the project {}, so workers can read it",
+                    names.grader_files,
+                    dir.display(),
+                    project.display()
+                ),
+            )
+            .with_next(
+                "keep hidden checks outside the project directory, e.g. ../myapp-hidden-tests/",
+            )
+            .into());
+        }
+        // A worker can't plant its own `.pillbox-grader/`: the landing spot is protected (and locked).
+        protect_patterns.push(format!("/{GRADER_FILES_DIR}/"));
+    }
+    ProtectSet::new(!knobs.no_default_protect, &protect_patterns).map_err(|e| {
+        PillboxError::usage(names.command, format!("{}: {e:#}", names.protect))
+            .with_next(format!(
+                "patterns are paths relative to the workspace, e.g. {}",
+                names.protect_example
+            ))
+            .into()
+    })
+}
+
+/// The project directory `dir` sits in, if any: the resolved pillbox's own
+/// directory (the one holding its `pillbox.toml`, whatever the cwd), or, on the
+/// global pillbox, the nearest ancestor of the cwd holding `pillbox.toml` or
+/// `.git` (else the cwd itself).
+fn grader_files_inside_project(
+    dir: &std::path::Path,
+    resolved: Option<&std::path::Path>,
+) -> Option<PathBuf> {
+    let dir = dir.canonicalize().ok()?;
+    // A selected project pillbox is the only bookmark source; the cwd stands in
+    // for the project only on the global pillbox.
+    let project = match resolved {
+        Some(p) => p.canonicalize().ok()?,
+        None => {
+            let cwd = std::env::current_dir().ok()?.canonicalize().ok()?;
+            cwd.ancestors()
+                .find(|a| a.join("pillbox.toml").exists() || a.join(".git").exists())
+                .unwrap_or(&cwd)
+                .to_path_buf()
+        }
+    };
+    dir.starts_with(&project).then_some(project)
+}
+
 /// Grade worker `id`: freeze its live workspace into `snap` (left in place, so a
 /// caller can deliver exactly the graded tree), prepare a [`GradeTree`] from it
 /// with protected paths restored from `policy.base`, and score that inside the
@@ -166,6 +268,29 @@ pub(crate) fn reverted_note(command: &str, id: &str, reverted: &[PathBuf]) -> Op
         "pillbox: {command}: worker {id} changed protected paths; graded with the base's copy: {}",
         list.join(", ")
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grader_files_inside_the_project_are_refused() {
+        // Tests run from the package root, which holds Cargo.toml and .git.
+        assert!(grader_files_inside_project(std::path::Path::new("src"), None).is_some());
+        let outside = tempfile::TempDir::new().unwrap();
+        assert!(grader_files_inside_project(outside.path(), None).is_none());
+        // The selected pillbox's directory counts wherever the cwd is.
+        let project = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(project.path().join("hidden")).unwrap();
+        let hidden = project.path().join("hidden");
+        assert!(grader_files_inside_project(&hidden, Some(project.path())).is_some());
+        // With a project selected, a directory in the unrelated cwd repo is fine.
+        assert!(
+            grader_files_inside_project(std::path::Path::new("src"), Some(project.path()))
+                .is_none()
+        );
+    }
 }
 
 /// The recording [`SessionOps`] stand-in dispatch's and eval's grading tests share.

@@ -19,7 +19,7 @@ use crate::pillbox::Pillbox;
 use crate::{events, sandbox, session};
 
 mod grader;
-mod stream;
+pub(crate) mod stream;
 
 #[cfg(feature = "libkrun")]
 pub(crate) use grader::{dropped_grader_setup, GRADER_STARTED_PRINTF, RUNUSER};
@@ -244,13 +244,15 @@ pub(crate) fn dispatch(resolved: &Pillbox, action: SessionAction) -> Result<()> 
         } => session_score(
             resolved,
             &id,
-            cmd.as_deref(),
-            rubric.as_deref(),
-            snapshot.as_deref(),
-            workspace.as_deref(),
-            in_sandbox,
-            &grader_egress,
-            drop_privileges,
+            &ScoreRequest {
+                cmd: cmd.as_deref(),
+                rubric: rubric.as_deref(),
+                snapshot: snapshot.as_deref(),
+                workspace: workspace.as_deref(),
+                in_sandbox,
+                grader_egress: &grader_egress,
+                drop_privileges,
+            },
             json,
         ),
         SessionAction::Ingest { id, json } => session_ingest(resolved, &id, json),
@@ -506,9 +508,8 @@ fn session_info(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
         // (libkrun: the agent's CoW clone) — so graders/orchestrators read it
         // from this surface instead of parsing the session record. A backend with
         // no recoverable host workspace reports it unsupported → omit the field.
-        let workspace = sandbox::live_session(&s)
+        let workspace = workspace_of(&s)
             .ok()
-            .and_then(|ls| ls.workspace_path().ok())
             .map(|p| p.to_string_lossy().into_owned());
         if let (Some(obj), Some(ws)) = (v.as_object_mut(), workspace) {
             obj.insert("workspace".into(), ws.into());
@@ -534,6 +535,14 @@ fn session_info(resolved: &Pillbox, id: &str, json: bool) -> Result<()> {
         }
     );
     Ok(())
+}
+
+/// Host path of `session`'s result workspace (libkrun: the agent's CoW clone) —
+/// what `session info --json` reports as `session.workspace`. Errors when the
+/// session's backend can't be reached from this build or keeps no host
+/// workspace; `session info` omits the field then.
+pub(crate) fn workspace_of(session: &session::Session) -> Result<std::path::PathBuf> {
+    sandbox::live_session(session)?.workspace_path()
 }
 
 /// `pillbox session diagnose ID` — the "what happened / why is it stuck"
@@ -799,6 +808,32 @@ fn session_rm(resolved: &Pillbox, id: &str) -> Result<()> {
 }
 
 fn session_send(resolved: &Pillbox, id: &str, text: &str) -> Result<()> {
+    let sent = send(resolved, id, text)?;
+    match sent.target {
+        crate::contract::InputTarget::Agent => {
+            eprintln!("pillbox: sent prompt to session `{}`", sent.session_id)
+        }
+        _ => eprintln!(
+            "pillbox: sent {} byte(s) to session `{}`",
+            text.len(),
+            sent.session_id
+        ),
+    }
+    Ok(())
+}
+
+/// Where a [`send`] delivered its input.
+#[derive(Debug)]
+pub(crate) struct Sent {
+    /// The full id the given id/prefix resolved to.
+    pub(crate) session_id: String,
+    /// `Agent` for a server agent's prompt API, `Pty` for raw keystrokes.
+    pub(crate) target: crate::contract::InputTarget,
+}
+
+/// Drive a running session with `text` and record it on the §0 log as an
+/// attributed `Input` — `session send` without its banner.
+pub(crate) fn send(resolved: &Pillbox, id: &str, text: &str) -> Result<Sent> {
     // Drive targets a RUNNING session (a pty-host to write to), so resolve
     // against the session registry — not `resolve_logged` (the read side's
     // foreground log dirs).
@@ -816,13 +851,10 @@ fn session_send(resolved: &Pillbox, id: &str, text: &str) -> Result<()> {
         crate::contract::InputTarget::Pty
     };
     record_input(resolved, &s.id, text, target);
-    match target {
-        crate::contract::InputTarget::Agent => {
-            eprintln!("pillbox: sent prompt to session `{}`", s.id)
-        }
-        _ => eprintln!("pillbox: sent {} byte(s) to session `{}`", text.len(), s.id),
-    }
-    Ok(())
+    Ok(Sent {
+        session_id: s.id,
+        target,
+    })
 }
 
 /// Record `session send` as a durable, attributed §0 [`Input`](crate::contract::Input)
@@ -1082,9 +1114,7 @@ fn session_log(
 ) -> Result<()> {
     use std::io::Write;
 
-    let session = session::resolve(resolved, id)?;
-    let log = crate::events::log::SessionLog::open(resolved, &session.id)?;
-    let matched = select_log_events(log.read_from(from)?, types, last)?;
+    let matched = select_log_events(log_events(resolved, id, types, from)?, last)?;
 
     // One writer, one flush — a large trajectory dump shouldn't pay a syscall
     // per line. BrokenPipe (downstream `head`/`grep -q` closed early) is a clean
@@ -1103,44 +1133,68 @@ fn session_log(
     Ok(())
 }
 
-/// Serialize + filter §0 events for `session log`: keep those whose payload
-/// `type` is in `types` (empty = keep all), then trim to the last match if
-/// `last`. Pure (no I/O) so the `--type`/`--last` semantics are unit-testable.
-fn select_log_events(
+/// A session's durable §0 events from seq `from` on, kept when their payload
+/// `type` tag is in `types` (empty keeps all) — `session log` without the JSONL
+/// rendering. A missing log reads as empty (see [`SessionLog::read_from`]).
+///
+/// [`SessionLog::read_from`]: crate::events::log::SessionLog::read_from
+pub(crate) fn log_events(
+    resolved: &Pillbox,
+    id: &str,
+    types: &[String],
+    from: u64,
+) -> Result<Vec<crate::contract::Event>> {
+    let session = session::resolve(resolved, id)?;
+    let log = crate::events::log::SessionLog::open(resolved, &session.id)?;
+    filter_events_by_type(log.read_from(from)?, types)
+}
+
+/// Keep the events whose serialized payload `type` tag is in `types` (empty =
+/// keep all). Pure (no I/O) so the `--type` semantics are unit-testable.
+fn filter_events_by_type(
     events: Vec<crate::contract::Event>,
     types: &[String],
-    last: bool,
-) -> Result<Vec<serde_json::Value>> {
-    let want: Option<std::collections::HashSet<&str>> = if types.is_empty() {
-        None
-    } else {
-        Some(types.iter().map(String::as_str).collect())
-    };
-
-    let mut matched: Vec<serde_json::Value> = Vec::new();
-    for ev in events {
-        let v = serde_json::to_value(&ev)
-            .map_err(|e| PillboxError::runtime("session log", format!("serialize event: {e}")))?;
-        if let Some(want) = &want {
-            // Match on the serialized payload `type` tag. A foreign/forward
-            // payload lands as `Payload::Unknown`, which re-serializes as
-            // `{"type":"unknown"}` — so `--type unknown` deliberately selects it;
-            // a missing tag (shouldn't happen) is unmatchable.
-            match v
-                .get("payload")
-                .and_then(|p| p.get("type"))
-                .and_then(serde_json::Value::as_str)
-            {
-                Some(t) if want.contains(t) => {}
-                _ => continue,
-            }
-        }
-        matched.push(v);
+) -> Result<Vec<crate::contract::Event>> {
+    if types.is_empty() {
+        return Ok(events);
     }
-    if last && matched.len() > 1 {
-        matched.drain(..matched.len() - 1);
+    let want: std::collections::HashSet<&str> = types.iter().map(String::as_str).collect();
+    let mut matched = Vec::new();
+    for ev in events {
+        let payload = serde_json::to_value(&ev.payload)
+            .map_err(|e| PillboxError::runtime("session log", format!("serialize event: {e}")))?;
+        // Match on the serialized payload `type` tag. A foreign/forward payload
+        // lands as `Payload::Unknown`, which re-serializes as `{"type":"unknown"}`
+        // — so `--type unknown` deliberately selects it; a missing tag (shouldn't
+        // happen) is unmatchable.
+        if payload
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|t| want.contains(t))
+        {
+            matched.push(ev);
+        }
     }
     Ok(matched)
+}
+
+/// Render events as `session log` prints them: one JSON value per event,
+/// trimmed to the last one when `last`.
+fn select_log_events(
+    mut events: Vec<crate::contract::Event>,
+    last: bool,
+) -> Result<Vec<serde_json::Value>> {
+    if last && events.len() > 1 {
+        events.drain(..events.len() - 1);
+    }
+    events
+        .iter()
+        .map(|ev| {
+            serde_json::to_value(ev).map_err(|e| {
+                PillboxError::runtime("session log", format!("serialize event: {e}")).into()
+            })
+        })
+        .collect()
 }
 
 /// `session artifact …` — write/read a structured artifact + its blob.
@@ -1329,20 +1383,73 @@ pub(crate) fn grade_dir(
     })
 }
 
-#[allow(clippy::too_many_arguments)] // a CLI leaf handler — args mirror parsed flags 1:1
-fn session_score(
-    resolved: &Pillbox,
-    id: &str,
-    cmd: Option<&str>,
-    rubric: Option<&std::path::Path>,
-    snapshot: Option<&str>,
-    workspace: Option<&std::path::Path>,
-    in_sandbox: bool,
-    grader_egress: &[String],
-    drop_privileges: bool,
-    json: bool,
-) -> Result<()> {
+fn session_score(resolved: &Pillbox, id: &str, request: &ScoreRequest, json: bool) -> Result<()> {
+    let ScoreOutcome {
+        session_id,
+        scored,
+        seq,
+    } = score(resolved, id, request)?;
+    if json {
+        println!("{}", score_verdict_json(&session_id, &scored, seq));
+    } else {
+        let mark = if scored.passed { "✓" } else { "✗" };
+        println!(
+            "pillbox: {mark} session `{}` scored {:.2} ({})",
+            session_id,
+            scored.score,
+            if scored.passed { "passed" } else { "failed" }
+        );
+        println!("  grader: {}", scored.grader);
+        // List each criterion for a rubric grade — the at-a-glance "which failed".
+        for c in &scored.criteria {
+            println!("  {} {}", if c.passed { "✓" } else { "✗" }, c.name);
+        }
+    }
+    Ok(())
+}
+
+/// What to grade and how — the `session score` flags as one value.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct ScoreRequest<'a> {
+    /// One grader command (exclusive with `rubric`).
+    pub(crate) cmd: Option<&'a str>,
+    /// A rubric file of named criteria (exclusive with `cmd`).
+    pub(crate) rubric: Option<&'a std::path::Path>,
+    /// Snapshot to grade; defaults to the session's `result_snapshot`.
+    pub(crate) snapshot: Option<&'a str>,
+    /// A directory to grade instead of any snapshot.
+    pub(crate) workspace: Option<&'a std::path::Path>,
+    /// Grade in a one-shot grader microVM instead of on the host.
+    pub(crate) in_sandbox: bool,
+    /// Hosts the grader microVM may reach (`in_sandbox` only).
+    pub(crate) grader_egress: &'a [String],
+    /// Run the grader as the unprivileged user (`in_sandbox` only).
+    pub(crate) drop_privileges: bool,
+}
+
+/// A recorded grade: the verdict and where it landed on the §0 log.
+#[derive(Debug)]
+pub(crate) struct ScoreOutcome {
+    /// The full id the given id/prefix resolved to.
+    pub(crate) session_id: String,
+    pub(crate) scored: crate::contract::Scored,
+    /// The log seq of the appended `Scored` event.
+    pub(crate) seq: u64,
+}
+
+/// Grade a session's result and record the verdict on its §0 log as a
+/// `service(grader)` `Scored` event — `session score` without the rendering.
+pub(crate) fn score(resolved: &Pillbox, id: &str, request: &ScoreRequest) -> Result<ScoreOutcome> {
     use crate::workspace::{SnapshotHandle, WorkspaceBackend};
+    let ScoreRequest {
+        cmd,
+        rubric,
+        snapshot,
+        workspace,
+        in_sandbox,
+        grader_egress,
+        drop_privileges,
+    } = *request;
 
     // Egress is a property of the in-sandbox grader-VM's network fence; on the
     // host grader there's nothing to fence (it already has the host's network).
@@ -1436,24 +1543,11 @@ fn session_score(
         crate::contract::Payload::Scored(scored.clone()),
     )
     .with_actor(crate::contract::Actor::service("grader"))])?;
-
-    if json {
-        println!("{}", score_verdict_json(&session.id, &scored, seq));
-    } else {
-        let mark = if scored.passed { "✓" } else { "✗" };
-        println!(
-            "pillbox: {mark} session `{}` scored {:.2} ({})",
-            session.id,
-            scored.score,
-            if scored.passed { "passed" } else { "failed" }
-        );
-        println!("  grader: {}", scored.grader);
-        // List each criterion for a rubric grade — the at-a-glance "which failed".
-        for c in &scored.criteria {
-            println!("  {} {}", if c.passed { "✓" } else { "✗" }, c.name);
-        }
-    }
-    Ok(())
+    Ok(ScoreOutcome {
+        session_id: session.id,
+        scored,
+        seq,
+    })
 }
 
 /// The `score --json` verdict — the structured result a caller reads instead of
@@ -2001,6 +2095,74 @@ mod tests {
     }
 
     #[test]
+    fn score_verdict_json_bytes_are_unchanged() {
+        let v = score_verdict_json("abc123", &scored("pytest -q", true, 1.0, "5 passed"), 7);
+        assert_eq!(
+            v.to_string(),
+            r#"{"feedback":"5 passed","grader":"pytest -q","passed":true,"score":1.0,"seq":7,"session":"abc123","version":1}"#
+        );
+    }
+
+    #[test]
+    fn score_rejects_sandbox_only_flags_before_touching_the_session() {
+        crate::test_util::with_isolated_home("session-score-validation", || {
+            let pb = crate::pillbox::global();
+            let egress = vec!["pypi.org".to_string()];
+            for (request, flag) in [
+                (
+                    ScoreRequest {
+                        cmd: Some("true"),
+                        grader_egress: &egress,
+                        ..ScoreRequest::default()
+                    },
+                    "--grader-egress only applies to --in-sandbox",
+                ),
+                (
+                    ScoreRequest {
+                        cmd: Some("true"),
+                        drop_privileges: true,
+                        ..ScoreRequest::default()
+                    },
+                    "--drop-privileges only applies to --in-sandbox",
+                ),
+            ] {
+                let error = score(&pb, "no-such-session", &request).unwrap_err();
+                assert!(error.to_string().contains(flag), "{error}");
+            }
+        });
+    }
+
+    #[test]
+    fn score_grades_a_workspace_and_records_the_verdict() {
+        crate::test_util::with_isolated_home("session-score-core", || {
+            let pb = crate::pillbox::global();
+            let s = session::Session::test_fixture();
+            session::write(&pb, &s).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("ok"), "").unwrap();
+            let outcome = score(
+                &pb,
+                &s.id[..6],
+                &ScoreRequest {
+                    cmd: Some("test -f ok"),
+                    workspace: Some(dir.path()),
+                    ..ScoreRequest::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(outcome.session_id, s.id);
+            assert!(outcome.scored.passed);
+            let recorded = log_events(&pb, &s.id, &["scored".to_string()], 0).unwrap();
+            assert_eq!(recorded.len(), 1);
+            assert_eq!(recorded[0].seq, outcome.seq);
+            assert_eq!(
+                recorded[0].payload,
+                crate::contract::Payload::Scored(outcome.scored)
+            );
+        });
+    }
+
+    #[test]
     fn score_verdict_json_escapes_arbitrary_feedback() {
         // Grader output with quotes/newlines must round-trip as one JSON value —
         // the whole reason for serde over a format string.
@@ -2027,7 +2189,7 @@ mod tests {
     }
 
     #[test]
-    fn select_log_events_filters_by_type_and_last() {
+    fn log_events_filter_by_type_and_render_last() {
         use crate::contract::{Event, Payload, Scored, ToolCall, ToolStatus};
         let ev = |p: Payload| Event::session("s", p);
         let tool = |name: &str| {
@@ -2050,6 +2212,10 @@ mod tests {
             }))
         };
         let events = vec![tool("read"), scored(0.0), tool("edit"), scored(1.0)];
+        // `session log` = the typed core's filter, then the CLI's rendering.
+        let select_log_events = |events: Vec<Event>, types: &[String], last: bool| {
+            select_log_events(filter_events_by_type(events, types)?, last)
+        };
 
         // No filter → all four, in order.
         let all = select_log_events(events.clone(), &[], false).unwrap();

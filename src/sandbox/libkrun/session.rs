@@ -24,7 +24,7 @@ use crate::agents::{
 use crate::attach::pump;
 use crate::errors::PillboxError;
 use crate::pillbox::Pillbox;
-use crate::sandbox::{Caps, SandboxBackend};
+use crate::sandbox::{Caps, SandboxBackend, Started};
 use crate::startup::StartupTimer;
 use crate::workspace::{SnapshotHandle, WorkspaceBackend};
 
@@ -71,7 +71,7 @@ impl SandboxBackend for LibkrunBackend {
         crate::session::BACKEND_LIBKRUN
     }
 
-    fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
+    fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<Started> {
         if spec.integration == Integration::Structured {
             return run_structured(spec, opts, resolved);
         }
@@ -227,7 +227,7 @@ impl SandboxBackend for LibkrunBackend {
         }
         match outcome? {
             pump::Outcome::Exited(code) if code != 0 => std::process::exit(code),
-            _ => Ok(()),
+            _ => Ok(Started::Foreground),
         }
     }
 }
@@ -871,7 +871,7 @@ fn run_detached(
     opts: &RunOpts,
     mut launch: Launch,
     mut startup: StartupTimer,
-) -> Result<()> {
+) -> Result<Started> {
     // The child reads the spec at startup, *after* we return — so persist it (a
     // `NamedTempFile` would delete on drop); `kill_session` removes it.
     let (_, spec_path) = launch
@@ -955,16 +955,7 @@ fn run_detached(
     }
     // Don't wait: the child (VM + egress + MITM, with the vault) is reparented to
     // init and keeps running.
-    if opts.json {
-        crate::session::print_started_json(&session);
-    } else {
-        println!(
-            "pillbox: ✓ session `{}` started in background (libkrun)",
-            session.id
-        );
-        println!("  Next: pillbox session attach {}", session.id);
-    }
-    Ok(())
+    Ok(Started::Detached(session))
 }
 
 /// Builds the guest entrypoint script from `(preamble, quoted_events_path)`.
@@ -1005,7 +996,7 @@ struct ServerLaunch {
 /// per-agent differences (guest script, events file, egress, bring-up calls)
 /// arrive as a [`ServerLaunch`]; everything else (CoW creds, the `VmSpec`, the
 /// detached `__krun-vmm` spawn, the empty-swap stdin, the session record + event,
-/// the error-path teardown, `print_started`) is identical and lives here so a
+/// the error-path teardown, the returned [`Started::ServerReady`]) is identical and lives here so a
 /// launch invariant can't drift between the two agents. The VM outlives the CLI
 /// (reaped by `session rm`); the call returns once the agent session exists and
 /// does NOT auto-send (the first prompt goes through `session send`). Differs
@@ -1016,7 +1007,7 @@ fn launch_server_vm(
     opts: RunOpts,
     resolved: &Pillbox,
     launch: ServerLaunch,
-) -> Result<()> {
+) -> Result<Started> {
     let mut startup = StartupTimer::start();
     // Non-vault: refuse --vault / vaulted --with before anything else (the shared
     // base would otherwise compose them into the guest env).
@@ -1249,12 +1240,10 @@ fn launch_server_vm(
 
     // No auto-send: the server came up ready (wait_ready in bringup), so the first
     // prompt goes through `session send` — captured by a subscribed watch.
-    crate::sandbox::opencode::print_started(
-        &session,
-        opts.json,
-        (!prompt.is_empty()).then_some(prompt.as_str()),
-    );
-    Ok(())
+    Ok(Started::ServerReady {
+        session,
+        pending_prompt: (!prompt.is_empty()).then_some(prompt),
+    })
 }
 
 fn structured_vmm_diagnostic(stderr: &[u8]) -> Option<String> {
@@ -1264,14 +1253,14 @@ fn structured_vmm_diagnostic(stderr: &[u8]) -> Option<String> {
         .find_map(|line| line.strip_prefix("krun-vmm: ").map(str::to_string))
 }
 
-fn fail_structured_launch(
+fn fail_structured_launch<T>(
     resolved: &Pillbox,
     agent_id: &str,
     session: &mut crate::session::Session,
     requested: Option<crate::contract::RequestedRunProfile>,
     log: &mut crate::events::log::SessionLog,
     error: anyhow::Error,
-) -> Result<()> {
+) -> Result<T> {
     // An unconfirmed shutdown still owns recovery state; never announce completion.
     if error
         .downcast_ref::<super::repository::TeardownUnconfirmed>()
@@ -1306,7 +1295,7 @@ fn fail_structured_launch(
 /// The VM has no PTY and no prompt API: the agent writes native JSONL to the
 /// host-readable cloned home, then the supervising host normalizes that capture
 /// into the session log before returning.
-fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
+fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<Started> {
     use crate::sandbox::structured as structured_io;
 
     let profile = spec.structured.as_ref().ok_or_else(|| {
@@ -1588,20 +1577,12 @@ fn run_structured(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result
         }
     };
     crate::events::emit_session_event(resolved, terminal, &session.id, Some(&session));
-    if opts.json {
-        crate::session::print_started_json(&session);
-    } else {
-        println!(
-            "pillbox: ✓ {} session `{}` finished ({} durable events)",
-            spec.id,
-            session.id,
-            outcome_events + 1
-        );
-    }
-    if outcome_exit_code != 0 {
-        bail!("{} structured run exited {}", spec.id, outcome_exit_code);
-    }
-    Ok(())
+    // The terminal event above is durable too, so it counts.
+    Ok(Started::StructuredFinished {
+        session,
+        events: outcome_events + 1,
+        exit_code: outcome_exit_code,
+    })
 }
 
 /// Resolve the structured agent's `--model` request from its [`StructuredProfile`]
@@ -1674,7 +1655,7 @@ fn resolve_structured_request(
 }
 
 /// opencode via `opencode serve` — fills a [`ServerLaunch`] for [`launch_server_vm`].
-fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
+fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<Started> {
     use crate::sandbox::opencode;
 
     let model = opts
@@ -1737,7 +1718,7 @@ fn run_server(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>
 /// login), which the [`codex` vault provider](crate::vault::providers) doesn't yet
 /// intercept — so `--vault` is rejected until that interception lands; the egress
 /// fence still confines the VM to the OpenAI/ChatGPT hosts.
-fn run_codex_serve(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
+fn run_codex_serve(spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<Started> {
     use crate::sandbox::appserver_client as appserver;
 
     // The bridge does not pass a model to codex (it uses its configured default),
@@ -2909,7 +2890,7 @@ mod tests {
             } else {
                 anyhow::anyhow!("injected startup failure")
             };
-            let error = fail_structured_launch(
+            let error = fail_structured_launch::<()>(
                 &resolved,
                 "pi",
                 &mut session,

@@ -916,7 +916,7 @@ fn run(cli: Cli) -> Result<()> {
                 env_files,
                 vault,
                 memory,
-                memory_briefed: Vec::new(), // dispatch_run fills this from the kypp briefing
+                memory_briefed: Vec::new(), // commands::run::start fills this from the kypp briefing
                 mcps,
                 mcp_tokens,
                 args,
@@ -1200,21 +1200,6 @@ fn wizard_new(
     ))
 }
 
-fn resolve_agent_spec(
-    resolved: &Pillbox,
-    override_id: Option<&str>,
-) -> Result<&'static agents::AgentSpec> {
-    let id = match override_id {
-        Some(id) => id.to_string(),
-        // Descriptor cascade (project pillbox.toml → ~/.pillbox/global → built-in),
-        // read fresh so an edited `agent =` takes effect without a meta rewrite.
-        None => crate::config::resolve_run_config(resolved)
-            .agent
-            .unwrap_or_else(|| "claude".into()),
-    };
-    agents::lookup("run", &id)
-}
-
 /// Fold a `[preset.NAME]` under the flags already parsed into `opts`: a list
 /// field becomes preset entries then CLI entries (so a flag can extend a preset
 /// and a later duplicate wins wherever "last wins" applies), a scalar keeps the
@@ -1303,102 +1288,14 @@ fn preset_banner(name: &str, p: &config::Preset) -> String {
     }
 }
 
-fn validate_bookmark_backend(opts: &RunOpts, backend: &str) -> Result<()> {
-    if opts.from_bookmark.is_some() && backend != crate::session::BACKEND_LIBKRUN {
-        return Err(PillboxError::usage(
-            "run",
-            "bookmark forks require the local libkrun microVM backend",
-        )
-        .with_next("use a libkrun-enabled Pillbox build with PILLBOX_BACKEND=libkrun")
-        .into());
-    }
-    Ok(())
-}
-
-fn apply_default_workspace(resolved: &Pillbox, opts: &mut RunOpts) {
-    // A bookmark restores into a host path only when a workspace override was supplied.
-    // Preserve None through dispatch so the backend can choose its immutable base cache.
-    if opts.workspace.is_none() && opts.from_bookmark.is_none() {
-        if let crate::pillbox::Scope::Project { source_dir, .. } = &resolved.scope {
-            opts.workspace = Some(source_dir.clone());
-        }
-    }
-}
-
-fn dispatch_run(resolved: &Pillbox, agent: Option<String>, mut opts: RunOpts) -> Result<()> {
-    // Resolve the agent + apply pillbox.toml defaults; the backend
-    // selection happens below.
-    let spec = resolve_agent_spec(resolved, agent.as_deref())?;
-    if let Some(meta) = &resolved.meta {
-        if opts.name.is_none() {
-            opts.name = Some(meta.name.clone());
-        }
-    }
-
-    if !spec.integration.supports_execution_request()
-        && (opts.profile.is_some() || opts.reasoning_effort.is_some())
-    {
-        return Err(PillboxError::usage(
-            "run",
-            format!(
-                "agent `{}` has no structured profile transport; use a structured agent integration",
-                spec.id
-            ),
-        )
-        .into());
-    }
-
-    // Model cascade: `--model` wins, else the descriptor (project `pillbox.toml`
-    // → `~/.pillbox/global/pillbox.toml`), else the agent's own default (`None`).
-    if opts.model.is_none() {
-        opts.model = crate::config::resolve_run_config(resolved).model;
-    }
-
-    apply_default_workspace(resolved, &mut opts);
-
-    // `--json` emits the started-session record; only `--detach` runs and
-    // structured agents persist one. A foreground PTY run has nothing to emit,
-    // so reject loudly here rather than print
-    // nothing. (Can't be a clap `requires` — server-mode validity depends on the
-    // resolved agent, not a flag.)
-    if opts.json && !opts.detach && !spec.integration.supports_execution_request() {
-        return Err(PillboxError::usage(
-            "run",
-            "--json needs a persisted session: add --detach, or run a structured agent",
-        )
-        .with_next(format!("pillbox run --agent {} --detach --json", spec.id))
-        .into());
-    }
-
+/// `pillbox run`: start the run in-process, then render what started.
+fn dispatch_run(resolved: &Pillbox, agent: Option<String>, opts: RunOpts) -> Result<()> {
+    let json = opts.json;
     // Nudge if Raindrop Workshop is installed but no OTLP endpoint is set, so a
     // silent "no events" doesn't surprise the user.
     crate::events::hint_workshop_if_unconfigured();
-
-    let backend = crate::sandbox::select_backend();
-    validate_bookmark_backend(&opts, backend.id())?;
-    if !opts.memory {
-        return backend.run(spec, opts, resolved);
-    }
-    // --memory: brief the agent from kypp at start, capture THIS run's §0 log after. Host-side +
-    // best-effort. Detached runs skip the post-capture — the agent outlives this call, so the §0 log
-    // isn't complete yet; a scheduled `kypp sweep` (cron) catches them. Project scope = pillbox name.
-    let project = opts.name.clone().unwrap_or_else(|| "default".to_string());
-    let is_server = spec.integration == crate::agents::Integration::Server;
-    let capture_after = !opts.detach;
-    let briefed = crate::memory::brief_into_args(&mut opts.args, &project);
-    opts.memory_briefed = briefed.clone(); // carried into the backend so a server bring-up can stash it
-    let started = std::time::SystemTime::now(); // run-window start: capture only logs written after this
-    let result = backend.run(spec, opts, resolved);
-    // A FOREGROUND (PTY) agent finalizes its §0 log before `run` returns → capture now. A SERVER agent
-    // (opencode) is reparented: the log drains LATER, so capturing here would race an empty log —
-    // `session ingest` does the capture instead, from the brief the bring-up stashed (crate::memory).
-    if capture_after && !is_server {
-        let sessions = crate::session::sessions_root_path(resolved);
-        crate::memory::capture_run(&sessions, &project, started);
-        // record which briefed claims this run saw, for later credit assignment
-        crate::memory::record_brief_usage(&sessions, &project, started, &briefed);
-    }
-    result
+    let started = commands::run::start(resolved, agent.as_deref(), opts)?;
+    commands::run::render_started(&started, json)
 }
 
 /// Dispatch `pty-host --vsock-port` — Linux-only. The libkrun guest serves the
@@ -1529,15 +1426,19 @@ mod tests {
             (vec!["pillbox", "run"], Some(source.clone())),
         ] {
             let (_, mut opts) = run_opts(Cli::try_parse_from(arguments).unwrap());
-            apply_default_workspace(&resolved, &mut opts);
+            commands::run::apply_default_workspace(&resolved, &mut opts);
             assert_eq!(opts.workspace, expected);
-            assert!(validate_bookmark_backend(&opts, crate::session::BACKEND_LIBKRUN).is_ok());
+            assert!(commands::run::validate_bookmark_backend(
+                &opts,
+                crate::session::BACKEND_LIBKRUN
+            )
+            .is_ok());
             for backend in [
                 crate::session::BACKEND_DOCKER,
                 crate::session::BACKEND_MANAGED,
             ] {
                 assert_eq!(
-                    validate_bookmark_backend(&opts, backend).is_err(),
+                    commands::run::validate_bookmark_backend(&opts, backend).is_err(),
                     opts.from_bookmark.is_some()
                 );
             }

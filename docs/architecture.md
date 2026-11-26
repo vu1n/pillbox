@@ -57,9 +57,21 @@ capability-gated via `Caps`). The **only** two places that branch on backend are
 `select_backend()` and `live_session()`. Behavior also forks at ~38
 `#[cfg(feature = "libkrun")]` gates — collapsing those (libkrun-only) is the
 structural win when the docker backend is deleted.
+`run` returns a typed `Started` and prints nothing; `pillbox run`'s `--json`
+envelope and banners are rendered by `commands::run::render_started`
+(src/commands/run.rs) `[verified 2026-11-26]`.
 Docker runs PTY agents only: `run` refuses every server agent (`spec.server`,
 opencode/codex-serve) and structured agent, and `sandbox agent` drives only the
 stdout `HarnessAdapter` harnesses (src/agents/harness/).
+
+### Session verbs are in-process calls; the CLI is one client `[verified 2026-11-26]`
+`commands::run::start` (resolve agent + descriptor defaults, validate, `--memory`,
+`backend.run`) and the session cores in `src/commands/session/` — `send`,
+`stream::wait_idle`, `workspace_of`, `score`, `log_events`, `rehydrate_result` —
+return typed values and print nothing to stdout. The `pillbox run`/`session …`
+handlers render those values; the `--json` shapes (`session::started_json`,
+`session_info`, `score_verdict_json`) live only in that rendering, so in-process
+callers must not depend on them.
 
 ### libkrun launch shape `[verified 2026-06-20]`
 `krun_create_ctx` → `set_vm_config` → `set_root(dir)` (virtio-fs root, *not* a

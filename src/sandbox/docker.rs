@@ -10,7 +10,7 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 
-use super::{Caps, SandboxBackend};
+use super::{Caps, SandboxBackend, Started};
 use crate::agents::{
     base_docker_args_detached, resolve_run_env, resolve_with_entries, workspace_mount_name,
     AgentSpec, Integration, RunOpts, GUEST_HOME, GUEST_WORKSPACE,
@@ -64,7 +64,7 @@ impl SandboxBackend for DockerBackend {
         BACKEND_DOCKER
     }
 
-    fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()> {
+    fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<Started> {
         if spec.integration == Integration::Structured {
             return Err(PillboxError::usage(
                 "run",
@@ -342,17 +342,7 @@ impl SandboxBackend for DockerBackend {
                 &session.id,
                 Some(&session),
             );
-            if opts.json {
-                session::print_started_json(&session);
-            } else {
-                let short = &session.sandbox_id[..session.sandbox_id.len().min(12)];
-                println!(
-                    "pillbox: ✓ session `{}` started in background (container `{short}`).",
-                    session.id
-                );
-                println!("         pillbox session attach {}  # reattach", session.id);
-            }
-            return Ok(());
+            return Ok(Started::Detached(session));
         }
 
         // Foreground run: rm the container on every exit path — including an
@@ -421,7 +411,9 @@ impl SandboxBackend for DockerBackend {
         }
 
         match outcome? {
-            Outcome::Exited(0) | Outcome::Detached | Outcome::Disconnected => Ok(()),
+            Outcome::Exited(0) | Outcome::Detached | Outcome::Disconnected => {
+                Ok(Started::Foreground)
+            }
             Outcome::Exited(code) => Err(PillboxError::runtime(
                 "run",
                 format!("{} exited with status {code}", spec.id),

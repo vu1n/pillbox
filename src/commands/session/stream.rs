@@ -209,8 +209,37 @@ pub(super) fn session_wait_idle(
     timeout: Option<u64>,
     from: Option<u64>,
 ) -> Result<()> {
+    let s = session::resolve(resolved, id)?;
+    if wait_idle(
+        resolved,
+        &s.id,
+        timeout.map(std::time::Duration::from_secs),
+        from,
+    )? {
+        println!("pillbox: session `{}` idle", s.id);
+        Ok(())
+    } else {
+        Err(PillboxError::runtime(
+            "session wait-idle",
+            format!("session `{}` did not go idle within the timeout", s.id),
+        )
+        .into())
+    }
+}
+
+/// Block until the session's current turn goes idle, or `timeout` passes —
+/// `session wait-idle` without its banner. `Ok(true)` = idle, `Ok(false)` = timed
+/// out. With `from` = `None` it waits for the next idle after the current log
+/// tail, and an already-finished current turn counts as idle; `Some(seq)`
+/// replays exactly from that seq.
+pub(crate) fn wait_idle(
+    resolved: &Pillbox,
+    id: &str,
+    timeout: Option<std::time::Duration>,
+    from: Option<u64>,
+) -> Result<bool> {
     use crate::contract::Payload;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
     // Capture the log tail BEFORE the drain spawns, so the default "wait for the
@@ -258,8 +287,7 @@ pub(super) fn session_wait_idle(
             .max()
             .unwrap_or(0);
         if last_idle > last_turn {
-            println!("pillbox: session `{}` idle", s.id);
-            return Ok(());
+            return Ok(true);
         }
     }
 
@@ -269,14 +297,9 @@ pub(super) fn session_wait_idle(
     let log = crate::events::log::SessionLog::open(resolved, &sid)?;
 
     let stop = Arc::new(AtomicBool::new(false));
-    if let Some(secs) = timeout {
-        // Watchdog: flip `stop` after the deadline, which ends `subscribe`'s wait.
-        let stop = Arc::clone(&stop);
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(secs));
-            stop.store(true, Ordering::Relaxed);
-        });
-    }
+    // Flips `stop` at the deadline, which ends `subscribe`'s wait; dropped (and
+    // joined) when this call returns, so no deadline outlives the wait.
+    let _deadline = timeout.map(|timeout| Watchdog::arm(timeout, Arc::clone(&stop)));
 
     let mut idle = false;
     log.subscribe(from, &stop, |ev| {
@@ -290,15 +313,42 @@ pub(super) fn session_wait_idle(
         !done // keep subscribing until a turn-done event (or `stop`/timeout)
     })?;
 
-    if idle {
-        println!("pillbox: session `{sid}` idle");
-        Ok(())
-    } else {
-        Err(PillboxError::runtime(
-            "session wait-idle",
-            format!("session `{sid}` did not go idle within the timeout"),
-        )
-        .into())
+    Ok(idle)
+}
+
+/// A deadline for [`wait_idle`]: its thread sets `stop` once `timeout` passes.
+// The deadline ends with its wait: dropping a Watchdog cancels and joins its thread.
+struct Watchdog {
+    cancel: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Watchdog {
+    fn arm(
+        timeout: std::time::Duration,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        let (cancel, cancelled) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            // Only a real timeout trips `stop`; a cancel (sender dropped) just ends the thread.
+            if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = cancelled.recv_timeout(timeout)
+            {
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        Self {
+            cancel: Some(cancel),
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        drop(self.cancel.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -510,6 +560,81 @@ impl PathologyDetector {
 #[cfg(test)]
 mod tests {
     use super::{format_watch_event, PathologyDetector};
+
+    #[test]
+    fn wait_idle_that_goes_idle_early_leaves_no_deadline_thread() {
+        use crate::contract::{Event, Input, InputTarget, Payload};
+        crate::test_util::with_isolated_home("wait-idle-deadline", || {
+            let pb = crate::pillbox::global();
+            // An unreachable backend reads the existing log (no tailer), so the
+            // wait runs through `subscribe` without a VM.
+            let mut s = crate::session::Session::test_fixture();
+            s.backend = "retired".into();
+            crate::session::write(&pb, &s).unwrap();
+            let mut log = crate::events::log::SessionLog::open(&pb, &s.id).unwrap();
+            log.append(&[
+                Event::session(
+                    &s.id,
+                    Payload::Input(Input {
+                        text: "go".into(),
+                        target: InputTarget::Pty,
+                    }),
+                ),
+                Event::session(
+                    &s.id,
+                    Payload::RunFinished(crate::contract::RunFinished {
+                        result_snapshot: String::new(),
+                        exit_code: 0,
+                        served_model: None,
+                        effective_limits: None,
+                    }),
+                ),
+            ])
+            .unwrap();
+
+            let began = std::time::Instant::now();
+            // `from` set: skip the already-idle fast path and take the subscribe path.
+            let idle = super::wait_idle(
+                &pb,
+                &s.id,
+                Some(std::time::Duration::from_secs(3600)),
+                Some(1),
+            )
+            .unwrap();
+            assert!(idle);
+            // Returning at all means the 1-hour deadline thread was cancelled and joined.
+            assert!(began.elapsed() < std::time::Duration::from_secs(30));
+        });
+    }
+
+    #[test]
+    fn dropping_a_watchdog_ends_its_thread_without_tripping_stop() {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watchdog = super::Watchdog::arm(
+            std::time::Duration::from_secs(3600),
+            std::sync::Arc::clone(&stop),
+        );
+        let began = std::time::Instant::now();
+        // Drop joins the thread, so it returning promptly means the thread ended.
+        drop(watchdog);
+        assert!(began.elapsed() < std::time::Duration::from_secs(5));
+        assert!(!stop.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn watchdog_trips_stop_when_its_timeout_passes() {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watchdog = super::Watchdog::arm(
+            std::time::Duration::from_millis(10),
+            std::sync::Arc::clone(&stop),
+        );
+        let began = std::time::Instant::now();
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            assert!(began.elapsed() < std::time::Duration::from_secs(30));
+            std::thread::yield_now();
+        }
+        drop(watchdog);
+    }
     use crate::contract::{
         Actor, Annotation, Event, Input, InputTarget, MessageDelta, Payload, Role, RunFailed,
         ToolCall, ToolStatus, Usage, UsageSource,

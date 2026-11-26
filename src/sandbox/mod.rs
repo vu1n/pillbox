@@ -99,7 +99,9 @@ pub(crate) trait SandboxBackend {
         Err(self.capabilities().unsupported("execution execute"))
     }
 
-    fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<()>;
+    /// Launch one run and hand back what started (or finished). Backends never
+    /// print the outcome: the CLI renders it, and dispatch/eval read it typed.
+    fn run(&self, spec: &AgentSpec, opts: RunOpts, resolved: &Pillbox) -> Result<Started>;
 
     /// What this backend can do — queried before (or instead of) attempting a
     /// verb. The honest current-state profile, per docs/substrate-plane.md.
@@ -110,6 +112,39 @@ pub(crate) trait SandboxBackend {
     /// active, rather than inferring it from a capability bit (which silently
     /// breaks the moment two backends share that capability).
     fn id(&self) -> &'static str;
+}
+
+/// What one [`SandboxBackend::run`] produced. A backend returns it and never
+/// prints it; `commands::run::render_started` is the CLI's rendering, and
+/// in-process callers (dispatch, eval) read the session from it directly.
+#[derive(Debug)]
+pub(crate) enum Started {
+    /// A foreground PTY run. The terminal was the whole report; there is no
+    /// persisted session to hand back.
+    Foreground,
+    /// A detached PTY session, left running in the background.
+    Detached(Session),
+    /// A server-mode agent, up and ready for `session send`. `run` does not
+    /// auto-send for server agents, so `pending_prompt` is the prompt `run` was
+    /// given (if any), for the caller to send.
+    // Only the libkrun backend runs server and structured agents.
+    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+    ServerReady {
+        session: Session,
+        pending_prompt: Option<String>,
+    },
+    /// A one-shot structured run that has finished. `events` counts the durable
+    /// events it wrote, including the terminal one; a non-zero `exit_code` is the
+    /// agent's failure, which the caller decides how to surface.
+    // Only the libkrun backend runs server and structured agents.
+    #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+    StructuredFinished {
+        session: Session,
+        events: usize,
+        exit_code: i32,
+    },
+    /// A managed turn that has finished, with its result snapshot recorded.
+    ManagedFinished(Session),
 }
 
 /// The live session — **the plane**. A running (foreground or detached) agent

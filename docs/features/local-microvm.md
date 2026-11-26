@@ -2,6 +2,7 @@
 id: local-microvm
 paths:
   - "src/sandbox/mod.rs"
+  - "src/commands/run.rs"
   - "src/sandbox/libkrun/**"
   - "src/docker.rs"
   - "src/startup.rs"
@@ -11,11 +12,13 @@ paths:
   - "build.rs"
 entry:
   - "src/sandbox/mod.rs:select_backend"
+  - "src/commands/run.rs:start"
   - "src/sandbox/libkrun/session.rs:prepare_launch"
   - "src/sandbox/libkrun/rootfs.rs"
 tests:
   - "src/sandbox/libkrun/boot.rs:boot_channel_binds_share_to_exec_and_writes_script"
   - "src/sandbox/libkrun/mod.rs:rootfs_tar_extraction_preserves_sticky_world_writable_mode"
+  - "src/commands/run.rs:json_envelope_is_the_same_for_every_lifecycle"
   - "scripts/smoke/libkrun.sh"
 ---
 

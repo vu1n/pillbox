@@ -6,10 +6,10 @@
 // artifact preserves and the caller can append to its own event log —
 // stamped with the agent actor (never self-reported by opencode-in-the-box).
 //
-// Kept 1:1 with the Rust mapper. Two gates guard the "one §0, two backends"
-// promise: `check-contract-parity.py` checks the payload *shapes* (contract.ts ↔
-// contract.rs); `opencode_mapper.test.ts` checks the mapping *logic* against
-// fixtures cribbed from opencode.rs's own tests. Change both sides together.
+// Kept 1:1 with the Rust mapper. The payload *shapes* come from contract.ts,
+// which is generated from contract.rs, so `tsc` rejects a payload Rust can't read;
+// `opencode_mapper.test.ts` checks the mapping *logic* against fixtures cribbed
+// from opencode.rs's own tests. Change both sides together.
 //
 // Faithfulness note: contract.rs omits empty/None fields on the wire
 // (`skip_serializing_if`), so this mapper likewise omits `output`/`input`/the
@@ -22,11 +22,11 @@
 // `Payload[]` OUTPUT; `unknown` would force a cast at every `?.` access the chains
 // already guard, so `any` is the deliberate boundary type here, not lazy typing.
 
-import type { Payload } from "./contract.js";
+import type { AttentionReason, Payload, ToolStatus } from "./contract.js";
 
 // opencode status → §0 ToolStatus (snake_case): pending/running → "running";
 // "completed"; "error". Mirrors opencode.rs::map_tool_status.
-function mapToolStatus(s: string): string {
+function mapToolStatus(s: string): ToolStatus {
   switch (s) {
     case "completed":
       return "completed";
@@ -37,7 +37,7 @@ function mapToolStatus(s: string): string {
   }
 }
 
-function attention(reason: string): Payload {
+function attention(reason: AttentionReason): Payload {
   return { type: "attention_required", reason, message: "" };
 }
 
@@ -112,7 +112,7 @@ export class OpencodeMapper {
   private textByPart = new Map<string, string>();
   // callID → last emitted (mapped) tool status, so a ToolCall is emitted only on
   // a status transition, not on every input-stream tick.
-  private toolStatus = new Map<string, string>();
+  private toolStatus = new Map<string, ToolStatus>();
   // step part ids whose step-finish usage we've already emitted, so a re-sent
   // part.updated for the same step can't double-count tokens.
   private stepsSeen = new Set<string>();

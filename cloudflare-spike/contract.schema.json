@@ -105,6 +105,61 @@
         "text"
       ]
     },
+    "Artifact": {
+      "description": "A **structured session artifact** — a typed, durable output that is NOT an\nordinary agent message: a grader report, a judge critique, a dispatch\nworker summary, a code-exploration citation set, a self-harness proposal,\npatch metadata. The log line stays small (kind + summary + a content-\naddressed blob ref); the payload body lives in the session's blob store\n(`sessions/<id>/blobs/<sha256>`), dereferenced lazily — large tool output\nnever inlines into the spine. The enabling primitive for the eval loop, the\ndispatch evidence channel (#73), and any host-side tool (a FastContext\nexplorer, a grader) that wants to attach output without overloading the\ntranscript. See docs/session-event-log.md §Payload taxonomy / §Blob store.",
+      "type": "object",
+      "properties": {
+        "blobRef": {
+          "description": "The body, by reference: a content-addressed blob handle (sha256 hex) in\nthe session's blob store. The large payload never inlines into the log.",
+          "type": "string"
+        },
+        "bytes": {
+          "description": "Size of the referenced blob in bytes (0 if none).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "class": {
+          "description": "Poolability class (docs/session-event-log.md §Content vs signal):\n`content` is local-only (raw code/output/critique); `signal` is the\nscrub-poolable metadata (scores, counts, names). Defaults to `content`\n— the safe default, so a body never egresses unless a producer asserts\nit is poolable signal.",
+          "$ref": "#/$defs/ArtifactClass",
+          "default": "content"
+        },
+        "contentType": {
+          "description": "MIME-ish content type of the body (`application/json`, `text/plain`,\n`application/x-ndjson`, …). Empty = opaque bytes.",
+          "type": "string"
+        },
+        "kind": {
+          "description": "Typed kind in a dotted namespace: `eval.grader_report`, `judge.report`,\n`dispatch.worker_summary`, `code_explore.citations`,\n`self_harness.proposal`, `patch.summary`, … A free-form string (not an\nenum) so a new producer adds a kind without a contract bump; readers\nfilter by prefix.",
+          "type": "string"
+        },
+        "summary": {
+          "description": "One-line summary — enough to triage from the log without dereferencing\nthe blob.",
+          "type": "string"
+        },
+        "workerId": {
+          "description": "Worker correlation for fan-out artifacts (a dispatch worker id), so a\nreader can group a run's per-worker summaries. Empty when not applicable.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    "ArtifactClass": {
+      "description": "The content-vs-signal poolability split (docs/session-event-log.md): a\nstructural gate so \"pool the metadata, not the code\" is enforced by the\nschema, not by remembering to redact. `Content` is the safe default.",
+      "oneOf": [
+        {
+          "description": "Local-only: raw code, prompts, messages, tool I/O, critiques. Never egresses.",
+          "type": "string",
+          "const": "content"
+        },
+        {
+          "description": "Poolable after scrub: scores, exit codes, pass/fail, counts, names.",
+          "type": "string",
+          "const": "signal"
+        }
+      ]
+    },
     "AttentionReason": {
       "type": "string",
       "enum": [
@@ -174,6 +229,68 @@
       },
       "required": [
         "name"
+      ]
+    },
+    "EffectiveRuntimeLimitsEvidence": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "contextWindowTokens": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            },
+            "maxOutputTokens": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            },
+            "status": {
+              "type": "string",
+              "const": "reported"
+            },
+            "supportedReasoningProfiles": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "reason": {
+              "$ref": "#/$defs/EvidenceUnavailableReason"
+            },
+            "status": {
+              "type": "string",
+              "const": "unavailable"
+            }
+          },
+          "required": [
+            "status",
+            "reason"
+          ]
+        }
+      ]
+    },
+    "EvidenceUnavailableReason": {
+      "type": "string",
+      "enum": [
+        "not_reported",
+        "unsupported",
+        "redacted"
       ]
     },
     "ExecExit": {
@@ -296,16 +413,22 @@
       "description": "Typed payload. Internally tagged on `type` (snake_case), so an\n`exec_output` serializes as `{\"type\":\"exec_output\",\"stream\":\"stdout\",...}`.",
       "oneOf": [
         {
-          "type": "object",
-          "properties": {
-            "type": {
-              "type": "string",
-              "const": "sandbox_provisioned"
+          "allOf": [
+            {
+              "$ref": "#/$defs/SandboxProvisioned"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "sandbox_provisioned"
+                }
+              },
+              "required": [
+                "type"
+              ]
             }
-          },
-          "$ref": "#/$defs/SandboxProvisioned",
-          "required": [
-            "type"
           ]
         },
         {
@@ -321,315 +444,478 @@
           ]
         },
         {
-          "type": "object",
-          "properties": {
-            "type": {
-              "type": "string",
-              "const": "sandbox_destroyed"
+          "allOf": [
+            {
+              "$ref": "#/$defs/SandboxDestroyed"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "sandbox_destroyed"
+                }
+              },
+              "required": [
+                "type"
+              ]
             }
-          },
-          "$ref": "#/$defs/SandboxDestroyed",
-          "required": [
-            "type"
           ]
         },
         {
-          "type": "object",
-          "properties": {
-            "type": {
-              "type": "string",
-              "const": "run_started"
+          "allOf": [
+            {
+              "$ref": "#/$defs/RunStarted"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "run_started"
+                }
+              },
+              "required": [
+                "type"
+              ]
             }
-          },
-          "$ref": "#/$defs/RunStarted",
-          "required": [
-            "type"
           ]
         },
         {
-          "type": "object",
-          "properties": {
-            "type": {
-              "type": "string",
-              "const": "run_finished"
+          "allOf": [
+            {
+              "$ref": "#/$defs/RunFinished"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "run_finished"
+                }
+              },
+              "required": [
+                "type"
+              ]
             }
-          },
-          "$ref": "#/$defs/RunFinished",
-          "required": [
-            "type"
           ]
         },
         {
-          "type": "object",
-          "properties": {
-            "type": {
-              "type": "string",
-              "const": "run_failed"
+          "allOf": [
+            {
+              "$ref": "#/$defs/RunFailed"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "run_failed"
+                }
+              },
+              "required": [
+                "type"
+              ]
             }
-          },
-          "$ref": "#/$defs/RunFailed",
-          "required": [
-            "type"
           ]
         },
         {
-          "type": "object",
-          "properties": {
-            "type": {
-              "type": "string",
-              "const": "message_start"
+          "allOf": [
+            {
+              "$ref": "#/$defs/MessageStart"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "message_start"
+                }
+              },
+              "required": [
+                "type"
+              ]
             }
-          },
-          "$ref": "#/$defs/MessageStart",
-          "required": [
-            "type"
           ]
         },
         {
-          "type": "object",
-          "properties": {
-            "type": {
-              "type": "string",
-              "const": "message_delta"
+          "allOf": [
+            {
+              "$ref": "#/$defs/MessageDelta"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "message_delta"
+                }
+              },
+              "required": [
+                "type"
+              ]
             }
-          },
-          "$ref": "#/$defs/MessageDelta",
-          "required": [
-            "type"
           ]
         },
         {
-          "type": "object",
-          "properties": {
-            "type": {
-              "type": "string",
-              "const": "message_end"
+          "allOf": [
+            {
+              "$ref": "#/$defs/MessageEnd"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "message_end"
+                }
+              },
+              "required": [
+                "type"
+              ]
             }
-          },
-          "$ref": "#/$defs/MessageEnd",
-          "required": [
-            "type"
           ]
         },
         {
-          "type": "object",
-          "properties": {
-            "type": {
-              "type": "string",
-              "const": "tool_call"
+          "allOf": [
+            {
+              "$ref": "#/$defs/ToolCall"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "tool_call"
+                }
+              },
+              "required": [
+                "type"
+              ]
             }
-          },
-          "$ref": "#/$defs/ToolCall",
-          "required": [
-            "type"
           ]
         },
         {
-          "type": "object",
-          "properties": {
-            "type": {
-              "type": "string",
-              "const": "thinking"
+          "allOf": [
+            {
+              "$ref": "#/$defs/Thinking"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "thinking"
+                }
+              },
+              "required": [
+                "type"
+              ]
             }
-          },
-          "$ref": "#/$defs/Thinking",
-          "required": [
-            "type"
           ]
         },
         {
-          "type": "object",
-          "properties": {
-            "type": {
-              "type": "string",
-              "const": "usage"
+          "allOf": [
+            {
+              "$ref": "#/$defs/Usage"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "usage"
+                }
+              },
+              "required": [
+                "type"
+              ]
             }
-          },
-          "$ref": "#/$defs/Usage",
-          "required": [
-            "type"
           ]
         },
         {
-          "type": "object",
-          "properties": {
-            "type": {
-              "type": "string",
-              "const": "phase_changed"
+          "allOf": [
+            {
+              "$ref": "#/$defs/PhaseChanged"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "phase_changed"
+                }
+              },
+              "required": [
+                "type"
+              ]
             }
-          },
-          "$ref": "#/$defs/PhaseChanged",
-          "required": [
-            "type"
           ]
         },
         {
-          "type": "object",
-          "properties": {
-            "type": {
-              "type": "string",
-              "const": "todos_updated"
+          "allOf": [
+            {
+              "$ref": "#/$defs/TodosUpdated"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "todos_updated"
+                }
+              },
+              "required": [
+                "type"
+              ]
             }
-          },
-          "$ref": "#/$defs/TodosUpdated",
-          "required": [
-            "type"
           ]
         },
         {
-          "type": "object",
-          "properties": {
-            "type": {
-              "type": "string",
-              "const": "permission_requested"
+          "allOf": [
+            {
+              "$ref": "#/$defs/PermissionRequested"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "permission_requested"
+                }
+              },
+              "required": [
+                "type"
+              ]
             }
-          },
-          "$ref": "#/$defs/PermissionRequested",
-          "required": [
-            "type"
           ]
         },
         {
-          "type": "object",
-          "properties": {
-            "type": {
-              "type": "string",
-              "const": "permission_resolved"
+          "allOf": [
+            {
+              "$ref": "#/$defs/PermissionResolved"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "permission_resolved"
+                }
+              },
+              "required": [
+                "type"
+              ]
             }
-          },
-          "$ref": "#/$defs/PermissionResolved",
-          "required": [
-            "type"
           ]
         },
         {
-          "type": "object",
-          "properties": {
-            "type": {
-              "type": "string",
-              "const": "attention_required"
+          "allOf": [
+            {
+              "$ref": "#/$defs/AttentionRequired"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "attention_required"
+                }
+              },
+              "required": [
+                "type"
+              ]
             }
-          },
-          "$ref": "#/$defs/AttentionRequired",
-          "required": [
-            "type"
           ]
         },
         {
-          "type": "object",
-          "properties": {
-            "type": {
-              "type": "string",
-              "const": "input"
+          "allOf": [
+            {
+              "$ref": "#/$defs/Input"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "input"
+                }
+              },
+              "required": [
+                "type"
+              ]
             }
-          },
-          "$ref": "#/$defs/Input",
-          "required": [
-            "type"
           ]
         },
         {
-          "type": "object",
-          "properties": {
-            "type": {
-              "type": "string",
-              "const": "annotation"
+          "allOf": [
+            {
+              "$ref": "#/$defs/Annotation"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "annotation"
+                }
+              },
+              "required": [
+                "type"
+              ]
             }
-          },
-          "$ref": "#/$defs/Annotation",
-          "required": [
-            "type"
           ]
         },
         {
-          "type": "object",
-          "properties": {
-            "type": {
-              "type": "string",
-              "const": "checkpoint"
+          "allOf": [
+            {
+              "$ref": "#/$defs/Checkpoint"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "checkpoint"
+                }
+              },
+              "required": [
+                "type"
+              ]
             }
-          },
-          "$ref": "#/$defs/Checkpoint",
-          "required": [
-            "type"
           ]
         },
         {
-          "type": "object",
-          "properties": {
-            "type": {
-              "type": "string",
-              "const": "result_ready"
+          "allOf": [
+            {
+              "$ref": "#/$defs/ResultReady"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "result_ready"
+                }
+              },
+              "required": [
+                "type"
+              ]
             }
-          },
-          "$ref": "#/$defs/ResultReady",
-          "required": [
-            "type"
           ]
         },
         {
-          "type": "object",
-          "properties": {
-            "type": {
-              "type": "string",
-              "const": "scored"
+          "allOf": [
+            {
+              "$ref": "#/$defs/Scored"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "scored"
+                }
+              },
+              "required": [
+                "type"
+              ]
             }
-          },
-          "$ref": "#/$defs/Scored",
-          "required": [
-            "type"
           ]
         },
         {
-          "type": "object",
-          "properties": {
-            "type": {
-              "type": "string",
-              "const": "exec_started"
+          "allOf": [
+            {
+              "$ref": "#/$defs/Artifact"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "artifact"
+                }
+              },
+              "required": [
+                "type"
+              ]
             }
-          },
-          "$ref": "#/$defs/ExecStarted",
-          "required": [
-            "type"
           ]
         },
         {
-          "type": "object",
-          "properties": {
-            "type": {
-              "type": "string",
-              "const": "exec_output"
+          "allOf": [
+            {
+              "$ref": "#/$defs/ExecStarted"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "exec_started"
+                }
+              },
+              "required": [
+                "type"
+              ]
             }
-          },
-          "$ref": "#/$defs/ExecOutput",
-          "required": [
-            "type"
           ]
         },
         {
-          "type": "object",
-          "properties": {
-            "type": {
-              "type": "string",
-              "const": "exec_exit"
+          "allOf": [
+            {
+              "$ref": "#/$defs/ExecOutput"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "exec_output"
+                }
+              },
+              "required": [
+                "type"
+              ]
             }
-          },
-          "$ref": "#/$defs/ExecExit",
-          "required": [
-            "type"
           ]
         },
         {
-          "type": "object",
-          "properties": {
-            "type": {
-              "type": "string",
-              "const": "custom"
+          "allOf": [
+            {
+              "$ref": "#/$defs/ExecExit"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "exec_exit"
+                }
+              },
+              "required": [
+                "type"
+              ]
             }
-          },
-          "$ref": "#/$defs/Custom",
-          "required": [
-            "type"
+          ]
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Custom"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "const": "custom"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            }
           ]
         },
         {
@@ -701,6 +987,47 @@
         "phase"
       ]
     },
+    "ReasoningEffort": {
+      "type": "string",
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    "RequestedRunProfile": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "profile": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "provider": {
+          "type": "string"
+        },
+        "reasoningEffort": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReasoningEffort"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "provider",
+        "model"
+      ]
+    },
     "ResultReady": {
       "type": "object",
       "properties": {
@@ -740,12 +1067,32 @@
     "RunFinished": {
       "type": "object",
       "properties": {
+        "effectiveLimits": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EffectiveRuntimeLimitsEvidence"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "exitCode": {
           "type": "integer",
           "format": "int32"
         },
         "resultSnapshot": {
           "type": "string"
+        },
+        "servedModel": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ServedRunProfileEvidence"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -763,6 +1110,16 @@
         },
         "parentRunId": {
           "type": "string"
+        },
+        "requested": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RequestedRunProfile"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -825,6 +1182,60 @@
         "passed",
         "score",
         "feedback"
+      ]
+    },
+    "ServedRunProfileEvidence": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "model": {
+              "type": "string"
+            },
+            "profile": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "provider": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reasoningProfile": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "status": {
+              "type": "string",
+              "const": "reported"
+            }
+          },
+          "required": [
+            "status",
+            "model"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "reason": {
+              "$ref": "#/$defs/EvidenceUnavailableReason"
+            },
+            "status": {
+              "type": "string",
+              "const": "unavailable"
+            }
+          },
+          "required": [
+            "status",
+            "reason"
+          ]
+        }
       ]
     },
     "StdStream": {
@@ -939,6 +1350,13 @@
           ],
           "format": "uint64",
           "minimum": 0
+        },
+        "costUsd": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
         },
         "inputTokens": {
           "type": [

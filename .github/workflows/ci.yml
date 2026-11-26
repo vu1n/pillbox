@@ -29,7 +29,8 @@ jobs:
       # Runner image packaging contract (runner/install-codex-package.sh).
       - run: node --test ../runner/codex-package.test.mjs
       - run: npx tsc --noEmit
-      - run: python3 check-contract-parity.py
+      # src/contract.ts must equal what json2ts generates from contract.schema.json.
+      - run: npm run check:contract
       # Real workerd + SQLite-backed DO, no account or paid container required.
       - run: ../scripts/smoke/cf.sh
 
@@ -74,8 +75,11 @@ jobs:
           bash -n scripts/smoke/claude-text.sh
           python3 scripts/smoke/test_claude_text_bridge.py
       - run: cargo test --no-default-features --all-targets
+      # contract.schema.json must equal what schemars emits from src/contract.rs.
       - if: matrix.os == 'ubuntu-latest'
-        run: cargo clippy --no-default-features --all-targets -- -D warnings
+        run: cargo test --no-default-features --features contract-schema contract_schema_is_current
+      - if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy --no-default-features --all-targets --features contract-schema -- -D warnings
       # NOTE: the docker:// mechanism tests (workspace staging + container
       # lifecycle, `#[ignore]`d) deliberately do NOT run here — a docker job
       # burns the free-minutes allocation. Run them locally / on a self-hosted

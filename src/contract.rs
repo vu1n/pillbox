@@ -14,6 +14,7 @@
 //! today; the per-session [`crate::events::log::SessionLog`] is the durable
 //! spine new producers target (see docs/session-event-log.md).
 // Agent I/O is a PTY-free structured channel; pillbox produces it and is not a platform.
+// This file is the only hand-written §0 contract; cloudflare-spike/src/contract.ts is generated from it.
 
 // Contract surface lands ahead of its first producer (contract-first).
 #![allow(dead_code)]
@@ -1301,12 +1302,13 @@ mod tests {
     }
 }
 
-/// Cross-language contract sync gate. `contract.rs` is canonical; the committed
-/// JSON Schema (`cloudflare-spike/contract.schema.json`) is generated from it,
-/// and the TS contract is generated from that schema. This test fails if the
-/// schema is stale, so a contract change that isn't propagated can't merge.
-/// Regenerate after a deliberate change:
-///   `UPDATE_SCHEMA=1 cargo test --features contract-schema contract_schema_is_current`
+/// Cross-language contract gate, Rust half. The committed JSON Schema
+/// (`cloudflare-spike/contract.schema.json`) is generated from this file, and
+/// `cloudflare-spike/src/contract.ts` is generated from that schema (its gate is
+/// `npm run check:contract`). This test fails if the schema is stale. Regenerate
+/// after a deliberate change:
+///   `UPDATE_SCHEMA=1 cargo test --no-default-features --features contract-schema contract_schema_is_current`
+///   then `npm run gen:contract` in cloudflare-spike/
 #[cfg(all(test, feature = "contract-schema"))]
 mod schema_gate {
     /// The canonical schema's path, relative to the crate root.
@@ -1319,10 +1321,38 @@ mod schema_gate {
         // `Event` is the root; schemars walks the whole reachable graph (Payload +
         // every variant struct + the enums), honoring the serde attrs (camelCase,
         // the internally-tagged `type` discriminant, default/skip → optional).
-        let schema = schemars::schema_for!(super::Event);
+        let mut settings = schemars::generate::SchemaSettings::default();
+        settings.transforms.push(Box::new(tag_beside_ref_to_all_of));
+        let schema = settings
+            .into_generator()
+            .into_root_schema_for::<super::Event>();
         let mut json = serde_json::to_string_pretty(&schema).expect("serialize schema");
         json.push('\n');
         json
+    }
+
+    /// A tagged Payload variant renders as its struct's `$ref` plus a sibling `type`
+    /// property, and json-schema-to-typescript drops one of the two, so the tag
+    /// object moves into its own `allOf` branch beside the `$ref`.
+    fn tag_beside_ref_to_all_of(schema: &mut schemars::Schema) {
+        schemars::transform::transform_subschemas(&mut tag_beside_ref_to_all_of, schema);
+        let Some(obj) = schema.as_object_mut() else {
+            return;
+        };
+        if !(obj.contains_key("$ref") && obj.contains_key("properties")) {
+            return;
+        }
+        let reference = obj.remove("$ref").expect("checked above");
+        let mut tag = serde_json::Map::new();
+        for key in ["type", "properties", "required"] {
+            if let Some(value) = obj.remove(key) {
+                tag.insert(key.to_owned(), value);
+            }
+        }
+        obj.insert(
+            "allOf".to_owned(),
+            serde_json::json!([{ "$ref": reference }, tag]),
+        );
     }
 
     #[test]
@@ -1336,8 +1366,9 @@ mod schema_gate {
         assert_eq!(
             committed, rendered,
             "§0 JSON Schema is stale — contract.rs changed without regenerating. Run: \
-             UPDATE_SCHEMA=1 cargo test --features contract-schema contract_schema_is_current \
-             (then regenerate the TS: `npm run gen:contract` in cloudflare-spike/)"
+             UPDATE_SCHEMA=1 cargo test --no-default-features --features contract-schema \
+             contract_schema_is_current (then regenerate the TS: `npm run gen:contract` in \
+             cloudflare-spike/)"
         );
     }
 }

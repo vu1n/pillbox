@@ -11,10 +11,10 @@ cd "$(dirname "$0")/../../cloudflare-spike"
 
 PORT="${SMOKE_CF_PORT:-8799}"
 echo "▶ CF managed smokes (wrangler dev :$PORT)"
-# §0 contract parity FIRST — pure file-parse, no deps, fails fast before spinning wrangler.
-# Guards "one §0, two backends": contract.ts must stay faithful to contract.rs.
-python3 check-contract-parity.py || { echo "  ✗ §0 contract parity drift (see above)"; exit 1; }
-echo "  ✓ §0 contract parity holds"
+# src/contract.ts is generated from contract.schema.json (itself emitted by src/contract.rs);
+# fail fast before spinning wrangler if it is stale.
+npm run --silent check:contract || { echo "  ✗ src/contract.ts is stale: run npm run gen:contract"; exit 1; }
+echo "  ✓ §0 contract.ts is current"
 npx tsc --noEmit || { echo "  ✗ tsc --noEmit failed"; exit 1; }
 echo "  ✓ tsc clean"
 

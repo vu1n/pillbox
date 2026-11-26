@@ -79,6 +79,12 @@ a snapshot seq), dereferencing blobs lazily.
 Per line (JSON; protobuf-JSON faithful, camelCase, `type`-tagged payload —
 same encoding rules as `contract.rs`).
 
+This section is the **spec**, ahead of the code. The implemented contract is
+`src/contract.rs` alone; `cloudflare-spike/src/contract.ts` is generated from it
+(`cloudflare-spike/contract-sync.md`). Fields and payloads here that `contract.rs`
+lacks (`v`, `causationId`, `class`, `idempotencyKey`, `driver_changed`) exist in
+neither the Rust nor the TS contract.
+
 ```jsonc
 {
   "v": 1,                       // schema version (per-line; bump on breaking change)

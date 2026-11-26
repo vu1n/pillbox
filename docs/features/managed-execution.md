@@ -40,7 +40,7 @@ From the repository root, run `cargo test --no-default-features managed_turn_loc
 These tests check same-session exclusion, cross-session independence and immediate
 owner-drop release even when a fork-equivalent duplicate descriptor remains open.
 
-From `cloudflare-spike/`, run `npm ci`, `npm test`, `npx tsc --noEmit` and `python3 check-contract-parity.py`. Tests exercise exact retries, authorization before persistence and workspace-finalize failures. Then `../scripts/smoke/cf.sh` starts local workerd, checks capability crypto and expects HTTP 401 for an unauthenticated execution request. That smoke starts no paid agent/container and is not a managed burn-in.
+From `cloudflare-spike/`, run `npm ci`, `npm test`, `npx tsc --noEmit` and `npm run check:contract` (fails when `src/contract.ts` differs from what json2ts generates from `contract.schema.json`). Tests exercise exact retries, authorization before persistence and workspace-finalize failures. Then `../scripts/smoke/cf.sh` starts local workerd, checks capability crypto and expects HTTP 401 for an unauthenticated execution request. That smoke starts no paid agent/container and is not a managed burn-in.
 
 ## Gotchas
 

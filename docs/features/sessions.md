@@ -6,6 +6,7 @@ paths:
   - "src/events/**"
   - "src/gateway.rs"
   - "src/contract.rs"
+  - "cloudflare-spike/contract.schema.json"
   - "src/attach/**"
   - "src/cost.rs"
   - "proto/pillbox/v1/**"
@@ -17,6 +18,7 @@ tests:
   - "tests/session.rs:session_done_emits_completed_event"
   - "src/events/log.rs:concurrent_appenders_get_unique_contiguous_seqs"
   - "tests/attach.rs:direct_socket_attach_carries_agent_output"
+  - "src/contract.rs:contract_schema_is_current"
 ---
 
 # Session control, events and attachment
@@ -35,10 +37,11 @@ Users can inspect and drive sessions, replay attributed events, read artifacts/c
 
 ## Driving it with the repository harness
 
-`cargo test --no-default-features --test session` exercises the CLI against planted local records and verifies completion events and prefix handling. `cargo test --no-default-features events::log::tests` verifies replay/recovery and concurrent sequence assignment. `cargo test --no-default-features --test attach direct_socket_attach_carries_agent_output -- --ignored` explicitly runs the ignored local PTY-host test and checks an output marker without a VM; use an idle machine because it is timing-sensitive.
+`cargo test --no-default-features --test session` exercises the CLI against planted local records and verifies completion events and prefix handling. `cargo test --no-default-features events::log::tests` verifies replay/recovery and concurrent sequence assignment. `cargo test --no-default-features --test attach direct_socket_attach_carries_agent_output -- --ignored` explicitly runs the ignored local PTY-host test and checks an output marker without a VM; use an idle machine because it is timing-sensitive. `cargo test --no-default-features --features contract-schema contract_schema_is_current` checks the committed JSON Schema against `src/contract.rs`.
 
 ## Gotchas
 
 - The local registry/log is scoped to the selected pillbox; use the project directory or `--pillbox`.
 - Local log/WS subscription does not imply a managed replay broker. Managed returned evidence is copied into the local log.
 - Read-side replay and producer lifetime are separate concerns; a successful log read does not prove a detached producer is healthy.
+- `src/contract.rs` is the only hand-written §0 contract. `cloudflare-spike/contract.schema.json` and `cloudflare-spike/src/contract.ts` are generated from it; a contract change regenerates both (`cloudflare-spike/contract-sync.md`), or `contract_schema_is_current` (needs `--features contract-schema`) and `npm run check:contract` fail.

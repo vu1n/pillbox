@@ -170,7 +170,7 @@ libkrun = ["dep:smoltcp"]
 # JSON Schema (`cloudflare-spike/contract.schema.json`) — the single source the TS
 # contract is generated from. OFF by default, so `schemars` stays out of the
 # shipped binary. Regenerate with
-# `UPDATE_SCHEMA=1 cargo test --features contract-schema contract_schema_is_current`.
+# `UPDATE_SCHEMA=1 cargo test --no-default-features --features contract-schema contract_schema_is_current`.
 contract-schema = ["dep:schemars"]
 
 # rustic pays a scrypt key derivation on every repo open. Unoptimized, that is

@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/vu1n/pillbox/proto/pillbox/session-packet-1.schema.json",
+  "$id": "https://github.com/vu1n/pillbox/crates/packet/session-packet-1.schema.json",
   "title": "pillbox.session-packet/1 manifest (packet.json)",
-  "description": "The manifest stored as the first entry, packet.json, of a pillbox session packet. The packet is one deterministic POSIX ustar archive (pax headers only for long paths): packet.json, then every entry below in this order, under workspace/ and harness/. Written and read only by `pillbox checkpoint pack|unpack`; docs/session-packet.md specifies the tar layout, the credential exclusions and the size limits. Every object is closed and an absent optional field is omitted, never null. The packet digest is sha256: plus the lowercase hex SHA-256 of the whole tar.",
+  "description": "The manifest stored as the first entry, packet.json, of a pillbox session packet. The packet is one deterministic POSIX ustar archive (pax headers only for long paths): packet.json, then every entry below in this order, under workspace/ and harness/. Written and read only by the pillbox-packet crate (`pillbox-packet pack|unpack`, also run as `pillbox checkpoint pack|unpack`); session-packet.md beside this schema specifies the tar layout, the credential exclusions and the size limits. Every object is closed and an absent optional field is omitted, never null. The packet digest is sha256: plus the lowercase hex SHA-256 of the whole tar.",
   "type": "object",
   "additionalProperties": false,
   "required": ["format", "harness", "entries"],

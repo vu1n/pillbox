@@ -106,6 +106,22 @@ impl std::fmt::Display for PillboxError {
 
 impl std::error::Error for PillboxError {}
 
+/// A session packet error keeps its exit code: refused = Runtime (1), bad
+/// flags or a non-empty target = Usage (2).
+impl From<pillbox_packet::PacketError> for PillboxError {
+    fn from(e: pillbox_packet::PacketError) -> Self {
+        use pillbox_packet::{Category, Op};
+        let action = match e.op {
+            Op::Pack => "checkpoint pack",
+            Op::Unpack => "checkpoint unpack",
+        };
+        match e.category {
+            Category::Runtime => Self::runtime(action, e.reason),
+            Category::Usage => Self::usage(action, e.reason),
+        }
+    }
+}
+
 /// Print a top-level error in the documented format and return the
 /// matching exit code. Anyhow errors without a `PillboxError` downcast
 /// surface as runtime errors with no `Next:` line — least-info default.

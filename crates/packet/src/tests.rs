@@ -7,7 +7,7 @@ use tempfile::TempDir;
 
 use super::*;
 
-const SCHEMA: &str = include_str!("../../proto/pillbox/session-packet-1.schema.json");
+const SCHEMA: &str = include_str!("../session-packet-1.schema.json");
 
 fn write(path: &Path, body: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -161,10 +161,25 @@ fn round_trip_restores_both_trees() {
 fn credential_files_are_never_packed() {
     let t = TempDir::new().unwrap();
     let (ws, home) = fixture(t.path());
+    // The vault CA is left out of both trees, nested or not.
+    for dir in [&ws, &home.join("vault")] {
+        write(
+            &dir.join("pillbox-vault-ca.crt"),
+            "-----BEGIN CERTIFICATE-----\n",
+        );
+        write(
+            &dir.join("pillbox-vault-ca.key"),
+            "-----BEGIN PRIVATE KEY-----\n",
+        );
+    }
     let out = t.path().join("p.packet");
     let packed = pack(&pack_opts(&ws, Some(&home), &out)).unwrap();
     let paths: Vec<&str> = packed.manifest.entries.iter().map(Entry::path).collect();
     for gone in [
+        "workspace/pillbox-vault-ca.crt",
+        "workspace/pillbox-vault-ca.key",
+        "harness/vault/pillbox-vault-ca.crt",
+        "harness/vault/pillbox-vault-ca.key",
         "workspace/.credentials.json",
         "harness/.credentials.json",
         "harness/nested/auth.json",
@@ -186,6 +201,7 @@ fn credential_files_are_never_packed() {
     assert!(
         !hay.contains("claudeAiOauth") && !hay.contains("\"secret\"") && !hay.contains("\"token\"")
     );
+    assert!(!hay.contains("BEGIN PRIVATE KEY") && !hay.contains("BEGIN CERTIFICATE"));
 }
 
 #[test]

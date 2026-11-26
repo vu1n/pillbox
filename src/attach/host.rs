@@ -192,7 +192,7 @@ pub(crate) fn run_vsock_forward(port: u32, to_port: u16) -> Result<()> {
 /// until either side closes. Errors are logged, not propagated — one failed
 /// connection mustn't kill the relay.
 #[cfg(target_os = "linux")]
-fn forward_conn(client: UnixStream, to_port: u16) {
+pub(crate) fn forward_conn(client: UnixStream, to_port: u16) {
     use std::net::Shutdown;
     let upstream = match std::net::TcpStream::connect(("127.0.0.1", to_port)) {
         Ok(s) => s,

@@ -433,6 +433,53 @@ mod tests {
         drop(relay);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_callback_relay_and_guest_forward_carry_a_callback_end_to_end() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+
+        let ephemeral = || {
+            TcpListener::bind(("127.0.0.1", 0))
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port()
+        };
+        // The agent's callback server inside the guest.
+        let agent = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let agent_port = agent.local_addr().unwrap().port();
+        let agent_side = std::thread::spawn(move || {
+            let (mut conn, _) = agent.accept().unwrap();
+            conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut req = [0u8; 17];
+            conn.read_exact(&mut req).unwrap();
+            conn.write_all(b"HTTP/1.1 200 OK\r\n\r\nbye").unwrap();
+            req // hang up: the close must travel back through both relays
+        });
+        // The forward socket: each accepted connection goes to the real guest forwarder.
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("fwd.sock");
+        let fwd = UnixListener::bind(&sock).unwrap();
+        std::thread::spawn(move || {
+            let (conn, _) = fwd.accept().unwrap();
+            crate::attach::host::forward_conn(conn, agent_port);
+        });
+        let port = ephemeral();
+        let relay = super::CallbackRelay::start(port, sock).unwrap();
+
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client.write_all(b"GET /cb?code=abc ").unwrap();
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).unwrap();
+        assert_eq!(resp, b"HTTP/1.1 200 OK\r\n\r\nbye");
+        assert_eq!(&agent_side.join().unwrap(), b"GET /cb?code=abc ");
+        drop(relay);
+    }
+
     #[test]
     fn login_without_an_oauth_port_has_no_callback_forward() {
         assert_eq!(CODEX.oauth_port, None);
@@ -557,9 +604,40 @@ mod tests {
         ),
         (
             "cursor",
-            &["cursor.com", "www.cursor.com", "api2.cursor.sh"],
+            &[
+                "cursor.com",
+                "www.cursor.com",
+                "api2.cursor.sh",
+                "authenticator.cursor.sh",
+            ],
         ),
     ];
+
+    #[test]
+    fn cursor_login_flow_covers_every_host_the_egress_table_labels_login() {
+        // The egress table's trailing comments say what each host is for; a cursor host it
+        // labels login/auth must be in cursor's login flow.
+        let src = include_str!("egress.rs");
+        let (_, flow) = LOGIN_FLOWS.iter().find(|(id, _)| *id == "cursor").unwrap();
+        let mut seen = 0;
+        for line in src.lines() {
+            let Some((code, note)) = line.split_once("//") else {
+                continue;
+            };
+            let host = code.trim().trim_end_matches(',').trim_matches('"');
+            if host.ends_with(".cursor.sh") || host.ends_with("cursor.com") {
+                let note = note.to_ascii_lowercase();
+                if note.contains("login") || note.contains("auth") {
+                    seen += 1;
+                    assert!(
+                        flow.contains(&host),
+                        "egress table says {host} is login: {note}"
+                    );
+                }
+            }
+        }
+        assert!(seen >= 2, "egress table labels cursor login hosts: {seen}");
+    }
 
     #[test]
     fn every_agent_login_fence_covers_its_login_flow_hosts() {

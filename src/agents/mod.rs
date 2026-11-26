@@ -484,7 +484,12 @@ pub const CURSOR: AgentSpec = AgentSpec {
     run_argv: &["agent"],
     // Remote URL + poll login — no localhost OAuth callback to forward.
     oauth_port: None,
-    login_hosts: &["cursor.com", "www.cursor.com", "api2.cursor.sh"],
+    login_hosts: &[
+        "cursor.com",
+        "www.cursor.com",
+        "api2.cursor.sh",
+        "authenticator.cursor.sh",
+    ],
     post_login_finalize: None,
     vault_capable: false,
     mcp_inject: None,

@@ -149,7 +149,7 @@ pub(crate) struct KnobNames {
 /// defaults (unless dropped) plus the extra patterns, and, with grader files,
 /// their `.pillbox-grader/` landing spot.
 pub(crate) fn grade_protect_set(
-    resolved: &Pillbox,
+    clone_source: &Path,
     knobs: &GradeKnobs,
     names: &KnobNames,
 ) -> Result<ProtectSet> {
@@ -166,13 +166,9 @@ pub(crate) fn grade_protect_set(
             )
             .into());
         }
-        // Hidden only if the bookmark can't carry it: a directory inside the
-        // project ships to every worker's fork with the rest of the tree.
-        let source_dir = match &resolved.scope {
-            crate::pillbox::Scope::Project { source_dir, .. } => Some(source_dir.as_path()),
-            crate::pillbox::Scope::Global => None,
-        };
-        if let Some(project) = grader_files_inside_project(dir, source_dir) {
+        // Hidden only if the clone can't carry it: a directory inside the
+        // clone source ships to every worker with the rest of the tree.
+        if let Some(project) = grader_files_inside(dir, clone_source) {
             return Err(PillboxError::usage(
                 names.command,
                 format!(
@@ -200,28 +196,28 @@ pub(crate) fn grade_protect_set(
     })
 }
 
-/// The project directory `dir` sits in, if any: the resolved pillbox's own
+/// The directory dispatch's workers fork from: the resolved pillbox's own
 /// directory (the one holding its `pillbox.toml`, whatever the cwd), or, on the
 /// global pillbox, the nearest ancestor of the cwd holding `pillbox.toml` or
 /// `.git` (else the cwd itself).
-fn grader_files_inside_project(
-    dir: &std::path::Path,
-    resolved: Option<&std::path::Path>,
-) -> Option<PathBuf> {
+pub(crate) fn dispatch_clone_source(resolved: &Pillbox) -> PathBuf {
+    if let crate::pillbox::Scope::Project { source_dir, .. } = &resolved.scope {
+        return source_dir.clone();
+    }
+    let cwd = std::env::current_dir()
+        .and_then(|c| c.canonicalize())
+        .unwrap_or_default();
+    cwd.ancestors()
+        .find(|a| a.join("pillbox.toml").exists() || a.join(".git").exists())
+        .unwrap_or(&cwd)
+        .to_path_buf()
+}
+
+/// `clone_source` (canonical) if `dir` sits inside it; unresolvable paths pass.
+fn grader_files_inside(dir: &Path, clone_source: &Path) -> Option<PathBuf> {
     let dir = dir.canonicalize().ok()?;
-    // A selected project pillbox is the only bookmark source; the cwd stands in
-    // for the project only on the global pillbox.
-    let project = match resolved {
-        Some(p) => p.canonicalize().ok()?,
-        None => {
-            let cwd = std::env::current_dir().ok()?.canonicalize().ok()?;
-            cwd.ancestors()
-                .find(|a| a.join("pillbox.toml").exists() || a.join(".git").exists())
-                .unwrap_or(&cwd)
-                .to_path_buf()
-        }
-    };
-    dir.starts_with(&project).then_some(project)
+    let source = clone_source.canonicalize().ok()?;
+    dir.starts_with(&source).then_some(source)
 }
 
 /// Grade worker `id`: freeze its live workspace into `snap` (left in place, so a
@@ -275,21 +271,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn grader_files_inside_the_project_are_refused() {
-        // Tests run from the package root, which holds Cargo.toml and .git.
-        assert!(grader_files_inside_project(std::path::Path::new("src"), None).is_some());
+    fn grader_files_inside_the_clone_source_are_refused() {
+        let source = tempfile::TempDir::new().unwrap();
+        let hidden = source.path().join("hidden");
+        std::fs::create_dir(&hidden).unwrap();
+        assert!(grader_files_inside(&hidden, source.path()).is_some());
         let outside = tempfile::TempDir::new().unwrap();
-        assert!(grader_files_inside_project(outside.path(), None).is_none());
-        // The selected pillbox's directory counts wherever the cwd is.
-        let project = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir(project.path().join("hidden")).unwrap();
-        let hidden = project.path().join("hidden");
-        assert!(grader_files_inside_project(&hidden, Some(project.path())).is_some());
-        // With a project selected, a directory in the unrelated cwd repo is fine.
-        assert!(
-            grader_files_inside_project(std::path::Path::new("src"), Some(project.path()))
-                .is_none()
-        );
+        assert!(grader_files_inside(outside.path(), source.path()).is_none());
     }
 }
 

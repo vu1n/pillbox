@@ -34,8 +34,8 @@ use serde_json::json;
 
 use crate::agents::{McpAttachment, RunOpts};
 use crate::commands::grading::{
-    copy_base_dir, grade_protect_set, grade_worker, grader_vm_available, restore_bookmark,
-    GradeKnobs, GradePolicy, KnobNames, LiveSessions, SessionOps,
+    copy_base_dir, dispatch_clone_source, grade_protect_set, grade_worker, grader_vm_available,
+    restore_bookmark, GradeKnobs, GradePolicy, KnobNames, LiveSessions, SessionOps,
 };
 use crate::commands::session::{self, stream};
 use crate::commands::{self};
@@ -185,7 +185,7 @@ impl EvalSpec {
             return Err(err("`trials` must be ≥ 1"));
         }
         grade_protect_set(
-            resolved,
+            &eval_clone_source(resolved, self)?,
             &GradeKnobs {
                 protect: &self.verify.protect,
                 no_default_protect: self.verify.no_default_protect,
@@ -428,6 +428,24 @@ struct Runner<'a> {
     scratch: tempfile::TempDir,
 }
 
+/// The directory `run::start` clones each cell from: the spec's workspace, else
+/// the project directory, else the cwd. Validation and cloning both use it. A
+/// bookmark spec forks from the bookmark, so it keeps dispatch's project rule.
+fn eval_clone_source(resolved: &Pillbox, spec: &EvalSpec) -> Result<PathBuf> {
+    if spec.from_bookmark.is_some() {
+        return Ok(dispatch_clone_source(resolved));
+    }
+    let mut opts = RunOpts {
+        workspace: spec.workspace.as_ref().map(PathBuf::from),
+        ..RunOpts::default()
+    };
+    commands::run::apply_default_workspace(resolved, &mut opts);
+    match opts.workspace {
+        Some(dir) => Ok(dir),
+        None => std::env::current_dir().context("resolve current working directory"),
+    }
+}
+
 /// The trusted base every cell's protected paths are restored from, and the temp
 /// dir that holds it: the spec's bookmark restored, or else a copy of the
 /// workspace directory the cells are cloned from, taken before any cell runs.
@@ -438,17 +456,7 @@ fn eval_base(resolved: &Pillbox, spec: &EvalSpec) -> Result<(tempfile::TempDir, 
         let path = dir.path().to_path_buf();
         return Ok((dir, path));
     }
-    // The directory `run::start` clones each cell from: the spec's workspace, else
-    // the project directory, else the cwd.
-    let mut opts = RunOpts {
-        workspace: spec.workspace.as_ref().map(PathBuf::from),
-        ..RunOpts::default()
-    };
-    commands::run::apply_default_workspace(resolved, &mut opts);
-    let src = match opts.workspace {
-        Some(dir) => dir,
-        None => std::env::current_dir().context("resolve current working directory")?,
-    };
+    let src = eval_clone_source(resolved, spec)?;
     let dir = copy_base_dir(&src, PURPOSE)?;
     let path = dir.path().join("ws");
     Ok((dir, path))
@@ -939,6 +947,25 @@ mod tests {
         // Tests run from the package root: a directory inside it would ship to every cell.
         let err = parse(&spec("grader_files = 'src'\n")).unwrap_err();
         assert!(format!("{err:#}").contains("inside the project"), "{err:#}");
+    }
+
+    #[test]
+    fn grader_files_are_refused_inside_the_spec_workspace_wherever_it_is() {
+        // The workspace is outside the cwd project; cells clone from it, not the cwd.
+        let ws = tempfile::tempdir().unwrap();
+        let inside = ws.path().join("hidden-tests");
+        std::fs::create_dir(&inside).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let spec = |ws: &Path, gf: &Path| {
+            format!(
+                "name='t'\nprompt='p'\nworkspace = {:?}\n[verify]\ncmd='true'\ngrader_files = {:?}\n",
+                ws.display().to_string(),
+                gf.display().to_string()
+            )
+        };
+        let err = parse(&spec(ws.path(), &inside)).unwrap_err();
+        assert!(format!("{err:#}").contains("inside the project"), "{err:#}");
+        assert!(parse(&spec(ws.path(), outside.path())).is_ok());
     }
 
     #[test]

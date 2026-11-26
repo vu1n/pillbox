@@ -39,8 +39,8 @@ use crate::commands::critic::{
     TypesafeCritic,
 };
 use crate::commands::grading::{
-    grade_protect_set, grade_worker, grader_vm_available, restore_bookmark, GradeKnobs,
-    GradePolicy, KnobNames, LiveSessions, SessionOps,
+    dispatch_clone_source, grade_protect_set, grade_worker, grader_vm_available, restore_bookmark,
+    GradeKnobs, GradePolicy, KnobNames, LiveSessions, SessionOps,
 };
 use crate::contract::{Actor, Artifact, ArtifactClass, Criterion, Event, Payload, Scored};
 use crate::cost::ObservedUsage;
@@ -2085,7 +2085,7 @@ pub(crate) fn dispatch(resolved: &Pillbox, opts: DispatchOpts) -> Result<()> {
     }
 
     let protect = grade_protect_set(
-        resolved,
+        &dispatch_clone_source(resolved),
         &GradeKnobs {
             protect: &opts.protect,
             no_default_protect: opts.no_default_protect,

@@ -68,7 +68,7 @@ same code (`commands::grading::grade_protect_set`, `GradePolicy`):
 | `grader_egress = ["host", …]` | `--grader-egress HOST` | hosts the grader microVM may reach (default: none, offline) |
 | `protect = ["pattern", …]` | `--protect PATTERN` | extra paths restored from the base before every grade |
 | `no_default_protect = true` | `--no-default-protect` | drop `workspace::protect::DEFAULT_PROTECTED` |
-| `grader_files = "dir"` | `--grader-files DIR` | hidden files copied into every grade tree at `.pillbox-grader/`, never into a cell's workspace; must be a directory outside the project (its landing spot is protected) |
+| `grader_files = "dir"` | `--grader-files DIR` | hidden files copied into every grade tree at `.pillbox-grader/`, never into a cell's workspace; must be a directory outside the directory the cells clone from (the spec's `workspace`, else the project directory, else the cwd; its landing spot is protected) |
 
 A Rust verifier that fetches crates and runs a hidden acceptance check:
 

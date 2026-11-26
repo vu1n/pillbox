@@ -19,6 +19,7 @@ tests:
   - "src/events/log.rs:concurrent_appenders_get_unique_contiguous_seqs"
   - "tests/attach.rs:direct_socket_attach_carries_agent_output"
   - "src/contract.rs:contract_schema_is_current"
+  - "cloudflare-spike/contract_codegen.test.mjs"
 ---
 
 # Session control, events and attachment
@@ -37,7 +38,7 @@ Users can inspect and drive sessions, replay attributed events, read artifacts/c
 
 ## Driving it with the repository harness
 
-`cargo test --no-default-features --test session` exercises the CLI against planted local records and verifies completion events and prefix handling. `cargo test --no-default-features events::log::tests` verifies replay/recovery and concurrent sequence assignment. `cargo test --no-default-features --test attach direct_socket_attach_carries_agent_output -- --ignored` explicitly runs the ignored local PTY-host test and checks an output marker without a VM; use an idle machine because it is timing-sensitive. `cargo test --no-default-features --features contract-schema contract_schema_is_current` checks the committed JSON Schema against `src/contract.rs`.
+`cargo test --no-default-features --test session` exercises the CLI against planted local records and verifies completion events and prefix handling. `cargo test --no-default-features events::log::tests` verifies replay/recovery and concurrent sequence assignment. `cargo test --no-default-features --test attach direct_socket_attach_carries_agent_output -- --ignored` explicitly runs the ignored local PTY-host test and checks an output marker without a VM; use an idle machine because it is timing-sensitive. `cargo test --no-default-features --features contract-schema contract_schema_is_current` checks the committed JSON Schema against `src/contract.rs`; `node --test cloudflare-spike/contract_codegen.test.mjs` checks that `check:contract` catches a stale or hand-edited `contract.ts` without rewriting it.
 
 ## Gotchas
 

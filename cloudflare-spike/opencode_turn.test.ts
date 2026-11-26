@@ -22,6 +22,7 @@ registerHooks({
 const { driveOpencodeTurn, readStreamChunkWithTimeout } = await import(
   "./src/opencode_turn.ts"
 );
+const { enforceOpencodeToolPolicy } = await import("./src/tool_policy.ts");
 
 const outputFormat = {
   type: "json_schema" as const,
@@ -182,7 +183,13 @@ test("OpenCode turn replaces an already-reachable server before prompting under 
     text: "hello",
     model: "zai-coding-plan/glm-4.7",
     toolPolicy: "deny_all",
-    config: { env: {} },
+    config: {
+      config: enforceOpencodeToolPolicy(
+        { permission: "allow", provider: { openrouter: { options: { apiKey: "k" } } } },
+        "deny_all",
+      ),
+      env: {},
+    },
     sink: evidence.sink,
   });
 
@@ -192,6 +199,10 @@ test("OpenCode turn replaces an already-reachable server before prompting under 
   assert.ok(Object.keys(tools).length > 0);
   assert.ok(Object.values(tools).every((allowed) => allowed === false));
   assert.deepEqual(evidence.errors, []);
+  // The restarted server boots with the server-side deny policy, not just per-prompt switches.
+  const content = transport.startEnvs[0]?.OPENCODE_CONFIG_CONTENT;
+  assert.equal(typeof content, "string");
+  assert.equal(JSON.parse(content!).permission, "deny");
 });
 
 test("OpenCode turn rejects an oversized SSE frame before accumulation", async () => {
@@ -270,8 +281,10 @@ function fakeTransport(
     readonly tools?: Record<string, boolean>;
   }>;
   readonly lifecycle: string[];
+  readonly startEnvs: Array<Record<string, string> | undefined>;
 } {
   const lifecycle: string[] = [];
+  const startEnvs: Array<Record<string, string> | undefined> = [];
   let streamIndex = 0;
   let sessionIndex = 0;
   const promptPaths: string[] = [];
@@ -318,8 +331,12 @@ function fakeTransport(
       lifecycle.push("kill");
       serving = false;
     },
-    startProcess: async () => {
+    startProcess: async (
+      _command: string,
+      options?: { readonly env?: Record<string, string> },
+    ) => {
       lifecycle.push("start");
+      startEnvs.push(options?.env);
       serving = true;
     },
   };
@@ -328,6 +345,7 @@ function fakeTransport(
     promptPaths,
     promptBodies,
     lifecycle,
+    startEnvs,
   };
 }
 

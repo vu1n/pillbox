@@ -866,7 +866,7 @@ impl AgentSpec {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default, PartialEq)]
 pub(crate) struct RunOpts {
     pub(crate) workspace: Option<PathBuf>,
     pub(crate) name: Option<String>,

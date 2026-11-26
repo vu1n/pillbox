@@ -4320,6 +4320,67 @@ mod tests {
         assert!(run.args.is_empty() && !run.memory && run.ttl_seconds.is_none());
     }
 
+    /// The `pillbox run …` argv dispatch built for a fork before it called
+    /// `run::start` in-process (base 0d2e275 `CliDriver::fork`), verbatim.
+    fn old_fork_argv(opts: &DispatchOpts, i: usize, first_turn: Option<&str>) -> Vec<String> {
+        let (agent, model, temperature) = resolve_worker(opts, i);
+        let mut args: Vec<String> = vec![
+            "pillbox".into(),
+            "run".into(),
+            "--from-bookmark".into(),
+            opts.from_bookmark.clone(),
+            "--detach".into(),
+            "--json".into(),
+        ];
+        if let Some(a) = &agent {
+            args.extend(["--agent".into(), a.clone()]);
+        }
+        if let Some(m) = &model {
+            args.extend(["--model".into(), m.clone()]);
+        }
+        if let Some(t) = &temperature {
+            args.extend(["--temperature".into(), t.to_string()]);
+        }
+        if opts.memory {
+            args.push("--memory".into());
+        }
+        if let Some(t) = &opts.ttl {
+            args.extend(["--ttl".into(), t.clone()]);
+        }
+        if let Some(turn) = first_turn {
+            args.extend(["--".into(), turn.into()]);
+        }
+        args
+    }
+
+    #[test]
+    fn a_fork_starts_exactly_what_the_old_cli_argv_asked_for() {
+        let mut full = opts_for_resolve(Some("codex"), Some("m/x"), Some(0.25), None);
+        full.memory = true;
+        full.ttl = Some("30m".into());
+        let mut roster = opts_for_resolve(Some("claude"), Some("run/level"), None, None);
+        roster.workers_spec = Some(vec![
+            worker_spec(Some("opencode"), Some("zai/glm"), Some(0.0)),
+            worker_spec(None, None, None),
+        ]);
+        let bare = opts_for_resolve(None, None, None, None);
+        for (opts, i, turn) in [
+            (&full, 0, Some("do it")),
+            (&full, 0, None),
+            (&roster, 0, None),
+            (&roster, 1, Some("turn one")),
+            (&bare, 0, None),
+        ] {
+            let argv = old_fork_argv(opts, i, turn);
+            let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+            assert_eq!(
+                fork_run_opts(opts, i, turn).unwrap(),
+                crate::parse_run_argv(&argv),
+                "{argv:?}"
+            );
+        }
+    }
+
     #[test]
     fn reverted_note_lists_a_capped_set() {
         assert_eq!(reverted_note("w1", &[]), None);

@@ -384,6 +384,11 @@ fn run_opts(spec: &EvalSpec, v: &Variant) -> Result<RunOpts> {
     })
 }
 
+/// The agent a cell runs: the variant's, else the spec default.
+fn cell_agent<'s>(spec: &'s EvalSpec, v: &'s Variant) -> Option<&'s str> {
+    v.agent.as_deref().or(spec.agent.as_deref())
+}
+
 impl<'a> Runner<'a> {
     fn new(resolved: &'a Pillbox) -> Self {
         Self { resolved }
@@ -436,10 +441,7 @@ impl<'a> Runner<'a> {
 
     /// Start a detached session with the variant's config → the new session id.
     fn start_session(&self, spec: &EvalSpec, v: &Variant) -> Result<String> {
-        // A variant's agent overrides the spec default.
-        let agent = v.agent.as_ref().or(spec.agent.as_ref());
-        let started =
-            commands::run::start(self.resolved, agent.map(String::as_str), run_opts(spec, v)?)?;
+        let started = commands::run::start(self.resolved, cell_agent(spec, v), run_opts(spec, v)?)?;
         Ok(started.into_live_session()?.id)
     }
 
@@ -504,6 +506,74 @@ mod tests {
         assert_eq!(o.temperature, Some(0.0));
         assert_eq!(o.mcps.len(), 1);
         assert!(o.args.is_empty());
+    }
+
+    /// The `pillbox run …` argv eval built for a cell before it called
+    /// `run::start` in-process (base 0d2e275 `start_session`), verbatim.
+    fn old_cell_argv(spec: &EvalSpec, v: &Variant) -> Vec<String> {
+        let mut args: Vec<String> = vec![
+            "pillbox".into(),
+            "run".into(),
+            "--detach".into(),
+            "--json".into(),
+        ];
+        match (&spec.workspace, &spec.from_bookmark) {
+            (Some(w), _) => args.extend(["--workspace".into(), w.clone()]),
+            (_, Some(b)) => args.extend(["--from-bookmark".into(), b.clone()]),
+            _ => {}
+        }
+        if let Some(a) = v.agent.as_ref().or(spec.agent.as_ref()) {
+            args.extend(["--agent".into(), a.clone()]);
+        }
+        if let Some(m) = &v.model {
+            args.extend(["--model".into(), m.clone()]);
+        }
+        if let Some(t) = v.temperature {
+            args.extend(["--temperature".into(), t.to_string()]);
+        }
+        if v.memory {
+            args.push("--memory".into());
+        }
+        for m in &v.mcp {
+            args.extend(["--mcp".into(), m.clone()]);
+        }
+        args
+    }
+
+    #[test]
+    fn a_cell_starts_exactly_what_the_old_cli_argv_asked_for() {
+        let bookmark = parse(
+            r#"
+            name = "t"
+            prompt = "p"
+            from_bookmark = "base"
+            agent = "claude"
+            [verify]
+            cmd = "true"
+            [[variants]]
+            name = "a"
+            agent = "opencode"
+            model = "p/m"
+            temperature = 0.7
+            memory = true
+            mcp = ["docs=https://x.example/mcp", "search=http://example.com:8123"]
+            [[variants]]
+            name = "b"
+            "#,
+        )
+        .unwrap();
+        let workspace =
+            parse("name = \"t\"\nprompt = \"p\"\nworkspace = \"/w\"\n[verify]\ncmd = \"true\"\n")
+                .unwrap();
+        for spec in [&bookmark, &workspace] {
+            for v in spec.resolved_variants() {
+                let argv = old_cell_argv(spec, &v);
+                let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+                let (agent, opts) = crate::parse_run_argv(&argv);
+                assert_eq!(cell_agent(spec, &v), agent.as_deref(), "{argv:?}");
+                assert_eq!(run_opts(spec, &v).unwrap(), opts, "{argv:?}");
+            }
+        }
     }
 
     #[test]

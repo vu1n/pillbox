@@ -40,6 +40,39 @@ pub(crate) fn validate_bookmark_backend(opts: &RunOpts, backend: &str) -> Result
     Ok(())
 }
 
+/// The usage errors a run request raises before launch, in the order the CLI
+/// reports them. `json` is the CLI's `--json`; in-process callers pass `false`.
+pub(crate) fn validate_run_request(
+    spec: &agents::AgentSpec,
+    opts: &RunOpts,
+    json: bool,
+) -> Result<()> {
+    let structured = spec.integration.supports_execution_request();
+    // A profile or reasoning effort needs a structured transport; checked before `--json`.
+    if !structured && (opts.profile.is_some() || opts.reasoning_effort.is_some()) {
+        return Err(PillboxError::usage(
+            "run",
+            format!(
+                "agent `{}` has no structured profile transport; use a structured agent integration",
+                spec.id
+            ),
+        )
+        .into());
+    }
+    // `--json` needs a persisted session to report; a foreground PTY run has none,
+    // so it is refused before launch rather than printing nothing after it. (Not a
+    // clap `requires`: server-mode validity depends on the resolved agent.)
+    if json && !opts.detach && !structured {
+        return Err(PillboxError::usage(
+            "run",
+            "--json needs a persisted session: add --detach, or run a structured agent",
+        )
+        .with_next(format!("pillbox run --agent {} --detach --json", spec.id))
+        .into());
+    }
+    Ok(())
+}
+
 /// Default the workspace to the project directory when none was given.
 pub(crate) fn apply_default_workspace(resolved: &Pillbox, opts: &mut RunOpts) {
     // A bookmark restores into a host path only when a workspace override was supplied.
@@ -69,18 +102,7 @@ pub(crate) fn start(resolved: &Pillbox, agent: Option<&str>, mut opts: RunOpts) 
         }
     }
 
-    if !spec.integration.supports_execution_request()
-        && (opts.profile.is_some() || opts.reasoning_effort.is_some())
-    {
-        return Err(PillboxError::usage(
-            "run",
-            format!(
-                "agent `{}` has no structured profile transport; use a structured agent integration",
-                spec.id
-            ),
-        )
-        .into());
-    }
+    validate_run_request(spec, &opts, false)?;
 
     // Model cascade: `--model` wins, else the descriptor (project `pillbox.toml`
     // → `~/.pillbox/global/pillbox.toml`), else the agent's own default (`None`).
@@ -211,6 +233,48 @@ mod tests {
     /// The `run --json` envelope, byte for byte as the backends printed it
     /// before they returned [`Started`] instead.
     const FIXTURE_ENVELOPE: &str = r#"{"session":{"agent_id":"claude","attached_pid":null,"backend":"docker","base_snapshot":null,"expires_at":null,"id":"abc123def456","label":"test","placement":"local","pty_pid":0,"result_snapshot":null,"sandbox_id":"sb_test","started_at":"2026-05-23T13:37:00Z"},"version":1}"#;
+
+    fn usage_reason(err: anyhow::Error) -> String {
+        err.downcast::<PillboxError>().unwrap().to_string()
+    }
+
+    const NO_PROFILE_TRANSPORT: &str =
+        "agent `claude` has no structured profile transport; use a structured agent integration";
+    const JSON_NEEDS_SESSION: &str =
+        "--json needs a persisted session: add --detach, or run a structured agent";
+
+    #[test]
+    fn run_request_reports_the_profile_error_before_the_json_error() {
+        let claude = agents::lookup("run", "claude").unwrap();
+        // `run --agent claude --profile fast --json` (no --detach): both checks fail;
+        // the profile one is reported, as on base.
+        let opts = RunOpts {
+            profile: Some("fast".into()),
+            ..RunOpts::default()
+        };
+        let err = usage_reason(validate_run_request(claude, &opts, true).unwrap_err());
+        assert!(err.contains(NO_PROFILE_TRANSPORT), "{err}");
+        // In-process callers (json=false) still get the profile check.
+        let err = usage_reason(validate_run_request(claude, &opts, false).unwrap_err());
+        assert!(err.contains(NO_PROFILE_TRANSPORT), "{err}");
+    }
+
+    #[test]
+    fn run_request_refuses_json_without_a_persisted_session() {
+        let claude = agents::lookup("run", "claude").unwrap();
+        let foreground = RunOpts::default();
+        let err = usage_reason(validate_run_request(claude, &foreground, true).unwrap_err());
+        assert!(err.contains(JSON_NEEDS_SESSION), "{err}");
+        assert!(validate_run_request(claude, &foreground, false).is_ok());
+        let detached = RunOpts {
+            detach: true,
+            ..RunOpts::default()
+        };
+        assert!(validate_run_request(claude, &detached, true).is_ok());
+        // A structured agent persists a session even in the foreground.
+        let opencode = agents::lookup("run", "opencode").unwrap();
+        assert!(validate_run_request(opencode, &foreground, true).is_ok());
+    }
 
     fn libkrun_fixture() -> Session {
         let mut s = Session::test_fixture();

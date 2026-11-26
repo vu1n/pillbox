@@ -697,7 +697,7 @@ function unsupportedManagedRequest(
   const { harness, transport } = request.execution.transport;
   if (
     harness !== "opencode" ||
-    (transport !== "http" && transport !== "cloudflare-service-binding" && transport !== "digitalocean-sandbox-exec")
+    (transport !== "http" && transport !== "digitalocean-sandbox-exec")
   ) {
     return {
       code: "unsupported_execution",

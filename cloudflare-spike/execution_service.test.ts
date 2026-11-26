@@ -308,6 +308,42 @@ test("unsupported managed transport rejects repeatably before allowance reservat
   assert.equal(claims, 0);
 });
 
+test("retired service-binding transport is refused before any claim", async () => {
+  let claims = 0;
+  const supported = await request();
+  const runtime = new FakeRuntime({ served_model: null, evidence: [] });
+  const service = new ExecutionService(
+    {
+      claim: async () => {
+        claims += 1;
+        throw new Error("unsupported execution reached D1 claim");
+      },
+      get: async () => null,
+      finish: async () => false,
+    },
+    new MemoryArtifacts(),
+    runtime,
+    fixedOptions(),
+  );
+  const input = await request({
+    execution: {
+      ...supported.execution,
+      transport: {
+        ...supported.execution.transport,
+        transport: "cloudflare-service-binding",
+      },
+    },
+  });
+
+  const result = await service.executeInvocation(input);
+  assert.equal(result.status, "failed");
+  if (result.status === "failed") {
+    assert.equal(result.error.code, "unsupported_execution");
+  }
+  assert.equal(runtime.executions, 0);
+  assert.equal(claims, 0);
+});
+
 test("disabled managed execution returns a typed failure before charged access", async () => {
   const never = (): never => {
     throw new Error("disabled admission crossed into a charged dependency");

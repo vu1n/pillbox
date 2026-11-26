@@ -40,7 +40,6 @@ Commit `contract.rs`, `contract.schema.json` and `src/contract.ts` together.
 
 Both npm scripts run `scripts/gen-contract.mjs`, which holds the json2ts options.
 
-
 - **schemars, not typeshare.** `Payload` is an internally-tagged serde enum
   (`#[serde(tag = "type")]`), which typeshare cannot represent, and typeshare rejects
   `u64`. schemars follows the serde attrs: camelCase fields, a `type` const per

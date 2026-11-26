@@ -4,9 +4,10 @@ import { spawnSync } from "node:child_process";
 import { cpSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-const here = new URL(".", import.meta.url).pathname;
+const here = fileURLToPath(new URL(".", import.meta.url));
 
 function copyTree() {
   const dir = mkdtempSync(join(tmpdir(), "contract-codegen-"));

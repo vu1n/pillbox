@@ -2,6 +2,7 @@
 // `--check` compares in memory and touches no file, so it works on an unstaged or
 // git-less tree; CI and scripts/smoke/cf.sh run it.
 import { readFile, writeFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { compile } from "json-schema-to-typescript";
 
 const root = new URL("../", import.meta.url);
@@ -19,7 +20,7 @@ const generated = await compile(schema, "Event", {
   additionalProperties: false,
   // serde_json::Value fields become `unknown`, not `any`.
   unknownAny: true,
-  cwd: new URL(".", root).pathname,
+  cwd: fileURLToPath(root),
 });
 
 if (process.argv.includes("--check")) {

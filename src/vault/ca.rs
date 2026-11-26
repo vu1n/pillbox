@@ -15,8 +15,8 @@ use std::{
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose};
 use time::{Duration, OffsetDateTime};
 
-const CA_CERT_FILE: &str = "pillbox-vault-ca.crt";
-const CA_KEY_FILE: &str = "pillbox-vault-ca.key";
+const CA_CERT_FILE: &str = pillbox_credentials::VAULT_CA_CERT;
+const CA_KEY_FILE: &str = pillbox_credentials::VAULT_CA_KEY;
 const CA_VALIDITY_DAYS: i64 = 365 * 5;
 const CA_COMMON_NAME: &str = "Pillbox Vault Local CA";
 

@@ -58,7 +58,7 @@ jobs:
       # Lint+format gates are platform-independent; only run them once
       # (on ubuntu) to save macOS minutes (~10x cost).
       - if: matrix.os == 'ubuntu-latest'
-        run: cargo fmt --check
+        run: cargo fmt --all --check
       - name: Feature map pointers and helper
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -74,12 +74,19 @@ jobs:
         run: |
           bash -n scripts/smoke/claude-text.sh
           python3 scripts/smoke/test_claude_text_bridge.py
-      - run: cargo test --no-default-features --all-targets
+      # `--workspace` covers crates/ too: the session packet (`pillbox-packet`)
+      # and the credential-name table it shares with the agent registry.
+      - run: cargo test --workspace --no-default-features --all-targets --locked
       # contract.schema.json must equal what schemars emits from src/contract.rs.
       - if: matrix.os == 'ubuntu-latest'
-        run: cargo test --no-default-features --features contract-schema contract_schema_is_current
+        run: cargo test --no-default-features --features contract-schema contract_schema_is_current --locked
       - if: matrix.os == 'ubuntu-latest'
-        run: cargo clippy --no-default-features --all-targets --features contract-schema -- -D warnings
+        run: cargo clippy --workspace --no-default-features --features contract-schema --all-targets --locked -- -D warnings
+      # Callers (Stratus) build the packet crate alone, without pillbox or its
+      # toolchain; prove it still builds that way.
+      - name: Session packet builds alone
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo build -p pillbox-packet --locked
       # NOTE: the docker:// mechanism tests (workspace staging + container
       # lifecycle, `#[ignore]`d) deliberately do NOT run here — a docker job
       # burns the free-minutes allocation. Run them locally / on a self-hosted

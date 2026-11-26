@@ -45,6 +45,9 @@ FROM rust:1-bookworm AS pillbox-build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+# Workspace members (the session packet + credential-name crates) that the
+# root package depends on; cargo needs every member's manifest to build.
+COPY crates ./crates
 # Cache mounts keep the cargo registry + compiled deps on the build daemon, so
 # a rebuild on the same host only recompiles changed crates (minutes → seconds
 # on iteration — the BYO/on-target build loop). The `runner` profile skips

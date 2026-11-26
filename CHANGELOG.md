@@ -10,6 +10,15 @@ transport (in-sandbox pty-host + frame protocol; local detach/reattach).
 
 ## Unreleased
 
+- The session packet (`pillbox.session-packet/1`) is now its own workspace
+  crate, `pillbox-packet` (`crates/packet/`), with a standalone
+  `pillbox-packet pack|unpack` binary that builds without the rest of pillbox
+  (`cargo build -p pillbox-packet`). Its flags, JSON, exit codes and packets are
+  unchanged and identical to `pillbox checkpoint pack|unpack`, which stays. The
+  format spec and schema moved beside the crate
+  (`crates/packet/session-packet.md`, `crates/packet/session-packet-1.schema.json`).
+  Credential file names the packet excludes and the agent registry uses now come
+  from one table, the `pillbox-credentials` crate (`crates/credentials/`).
 - Remove the managed tier's private Workers RPC entry point
   (`HuddlesRuntimeEntrypoint`), its Ed25519 operation-grant protocol, the
   authorization-currentness service binding, the Huddles owner domain, and the

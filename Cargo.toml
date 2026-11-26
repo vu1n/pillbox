@@ -1,22 +1,48 @@
-[package]
-name = "pillbox"
+# The root package is the `pillbox` binary; `crates/` holds pieces other
+# programs build without it (the session packet, the credential-name table).
+[workspace]
+members = [".", "crates/credentials", "crates/packet"]
+
+[workspace.package]
 version = "0.3.0"
 edition = "2021"
-authors = ["vu1n"]
 license = "MIT OR Apache-2.0"
-description = "Durable coding-agent sessions on Cloudflare and local libkrun microVMs."
 repository = "https://github.com/vu1n/pillbox"
+
+# Versions shared by more than one member, so the lockfile holds one copy.
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+pillbox-credentials = { path = "crates/credentials", version = "0.3.0" }
+pillbox-packet = { path = "crates/packet", version = "0.3.0" }
+
+[package]
+name = "pillbox"
+version.workspace = true
+edition.workspace = true
+authors = ["vu1n"]
+license.workspace = true
+description = "Durable coding-agent sessions on Cloudflare and local libkrun microVMs."
+repository.workspace = true
 homepage = "https://github.com/vu1n/pillbox"
 keywords = ["sandbox", "agent", "cloudflare", "durable-objects", "libkrun"]
 categories = ["command-line-utilities", "development-tools"]
 readme = "README.md"
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
+clap.workspace = true
 clap_complete = "4"
-anyhow = "1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# The session packet (`pillbox checkpoint`) and the credential-name table the
+# agent registry and vault read; both live in crates/.
+pillbox-packet.workspace = true
+pillbox-credentials.workspace = true
 toml = "0.8"
 
 # Credential vault — MITM HTTPS proxy that swaps stub creds for real
@@ -43,7 +69,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 http-body-util = "0.1"
 time = "0.3"
 uuid = { version = "1", features = ["v7"] }
-tempfile = "3"
+tempfile.workspace = true
 
 # Workspace versioning — rustic_core is a Rust port of restic. Each
 # pillbox owns one rustic repository (local on disk, or S3-shaped via
@@ -57,7 +83,7 @@ base64 = "0.22"
 # SHA-256 for the §0 blob store's content addressing (`sessions/<id>/blobs/
 # <sha256>`) — structured artifact bodies are stored by content hash. Already
 # in the lockfile via rustic; this makes the dependency direct.
-sha2 = "0.10"
+sha2.workspace = true
 # Cross-platform FS watcher — `pillbox session transcript --follow`
 # tails an agent's JSONL transcript by waiting on inotify/kqueue/
 # FSEvents notifications. Drives the live-trace UX for transcripts;

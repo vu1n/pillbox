@@ -4,17 +4,24 @@ A session packet carries one session's workspace and its harness's state
 between turns, on every placement (Cloudflare container, local container
 runner, local microVM). It replaces Stratus's ad hoc
 `tar cf --exclude=.credentials.json workspace/repo root/.claude/projects` plus
-a side metadata JSON. The engine is its only writer and reader:
+a side metadata JSON. This crate (`pillbox-packet`) is its only writer and
+reader:
 
 ```sh
-pillbox checkpoint pack   --workspace DIR [--harness-state DIR] --harness NAME \
-                          [--harness-session-id ID] [--transcript REL] --out FILE [--json]
-pillbox checkpoint unpack --packet FILE --expect sha256:<hex> --workspace DIR \
-                          [--harness-state DIR] [--allow-nonempty] [--json]
+pillbox-packet pack   --workspace DIR [--harness-state DIR] --harness NAME \
+                      [--harness-session-id ID] [--transcript REL] --out FILE [--json]
+pillbox-packet unpack --packet FILE --expect sha256:<hex> --workspace DIR \
+                      [--harness-state DIR] [--allow-nonempty] [--json]
 ```
 
-Both are hidden engine subcommands (see [commands.md](./commands.md#engine-subcommands-stratus))
-and are in the `--no-default-features` Linux build. Code: `src/checkpoint/`.
+`pillbox checkpoint pack|unpack` are the same subcommands inside `pillbox`
+(hidden engine subcommands, see [commands.md](../../docs/commands.md#engine-subcommands-stratus)):
+same flags, JSON and exit codes; only the program name on stderr and human lines
+differs. The crate depends on nothing else in pillbox, so a caller builds it alone
+(`cargo build -p pillbox-packet --release`). Code: `crates/packet/`.
+
+Exit codes: 0 success, 1 a refused packet or tree (digest mismatch, a limit,
+a malformed manifest), 2 bad flags or a non-empty target.
 
 `--out` may not be inside `--workspace` or `--harness-state` (exit 2), since the next pack
 would pack the old packet. Unpack sets every directory it creates to 0755 whatever the umask.
@@ -22,7 +29,7 @@ would pack the old packet. Unpack sets every directory it creates to 0755 whatev
 ## Specification
 
 The manifest is specified by the JSON Schema
-[`proto/pillbox/session-packet-1.schema.json`](../proto/pillbox/session-packet-1.schema.json);
+[`session-packet-1.schema.json`](./session-packet-1.schema.json);
 the Rust types follow it. Every object is closed (`additionalProperties: false`)
 and an absent optional is omitted, never `null`.
 
@@ -55,7 +62,7 @@ trees therefore always give the same bytes.
 | `transcript` | optional; transcript path relative to `harness/`, must name a file entry |
 | `entries` | `{kind:"dir",path}`, `{kind:"file",path,size,sha256,executable}`, `{kind:"symlink",path,target}` |
 
-Entry rules (`checkpoint::validate`, run by both `pack` and `unpack`): paths
+Entry rules (`pillbox_packet::validate`, run by both `pack` and `unpack`): paths
 start with `workspace/` or `harness/`, have no empty, `.` or `..` component, no
 NUL, at most 4096 bytes; entries are sorted and unique; each entry's parent is
 a tree root or an earlier `dir` entry (so nothing is written through a symlink).
@@ -67,11 +74,13 @@ link instead of dropping it.
 
 Never packed from either tree (reported in `excluded` with reason `credential`):
 
-- `.credentials.json` (Claude OAuth), `pillbox-vault-ca.crt`, `pillbox-vault-ca.key`
-  (the vault CA).
+- the basename of each path in `NEVER_PACKED` of the `pillbox-credentials`
+  crate (`crates/credentials/`): `.credentials.json` (Claude OAuth),
+  `pillbox-vault-ca.crt`, `pillbox-vault-ca.key` (the vault CA).
 
-Also never packed from the `harness/` tree: the basename of every agent's
-credential sentinel in `src/agents/mod.rs` (`ALL[*].cred_sentinel`), today
+Also never packed from the `harness/` tree: the basename of every agent
+credential path in that crate's `AGENT_CREDENTIALS` (the same consts pillbox's
+agent registry uses as each agent's `cred_sentinel`), today
 `.credentials.json`, `auth.json` (codex, cursor, pi, prime-agent) and
 `opencode.db`, plus each one's SQLite sidecars (`-wal`, `-shm`, `-journal`), where
 an unflushed credential write lives. In the workspace tree those names are
@@ -84,7 +93,7 @@ regenerates it, and a monorepo's install alone can pass the 1 GiB limit. A file
 with that name is still packed, and the `harness/` tree is never skipped.
 
 Sockets, FIFOs and devices are skipped with reason `special`. The workspace
-ingest denylist (`.env*`, `*.pem`, `.ssh/`, …; `src/workspace/ingest.rs`) is
+ingest denylist (`.env*`, `*.pem`, `.ssh/`, …; pillbox's `src/workspace/ingest.rs`) is
 **not** applied: it governs what enters a sandbox, and a packet must restore
 the workspace the agent left, including checked-in key fixtures.
 
@@ -121,13 +130,13 @@ writes:
 ## JSON output
 
 ```jsonc
-// pillbox checkpoint pack --json
+// pillbox-packet pack --json  (= pillbox checkpoint pack --json)
 { "version": 1, "format": "pillbox.session-packet/1",
   "digest": "sha256:…", "bytes": 10240,
   "manifest": { … packet.json … },
   "excluded": [ { "path": "harness/.credentials.json", "reason": "credential" } ] }
 
-// pillbox checkpoint unpack --json
+// pillbox-packet unpack --json
 { "version": 1, "format": "pillbox.session-packet/1",
   "digest": "sha256:…", "manifest": { … } }
 ```

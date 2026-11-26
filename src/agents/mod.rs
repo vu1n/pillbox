@@ -248,7 +248,10 @@ pub struct AgentSpec {
     pub(crate) auth_id: &'static str,
     /// How pillbox runs + observes this agent (PTY-and-scrape vs server-API).
     pub(crate) integration: Integration,
-    pub(crate) cred_sentinel: &'static str,
+    /// Credential file relative to the agent home. An `AgentCredential` can only
+    /// come from `pillbox_credentials`' table, which also lists it in
+    /// `AGENT_CREDENTIALS`, so the session packet always leaves it out.
+    pub(crate) cred_sentinel: pillbox_credentials::AgentCredential,
     pub(crate) login_argv: &'static [&'static str],
     pub(crate) run_argv: &'static [&'static str],
     pub(crate) oauth_port: Option<u16>,
@@ -292,7 +295,7 @@ pub const CLAUDE: AgentSpec = AgentSpec {
     id: "claude",
     auth_id: "claude",
     integration: Integration::Pty,
-    cred_sentinel: ".claude/.credentials.json",
+    cred_sentinel: pillbox_credentials::CLAUDE,
     login_argv: &["claude", "auth", "login", "--claudeai"],
     run_argv: &["claude"],
     oauth_port: Some(54545),
@@ -353,7 +356,7 @@ pub const CODEX: AgentSpec = AgentSpec {
     id: "codex",
     auth_id: "codex",
     integration: Integration::Pty,
-    cred_sentinel: ".codex/auth.json",
+    cred_sentinel: pillbox_credentials::CODEX,
     login_argv: &["codex", "login", "--device-auth"],
     run_argv: &["codex"],
     oauth_port: None,
@@ -400,7 +403,7 @@ pub const CODEX_SERVE: AgentSpec = AgentSpec {
     id: "codex-serve",
     auth_id: "codex",
     integration: Integration::Server,
-    cred_sentinel: ".codex/auth.json",
+    cred_sentinel: pillbox_credentials::CODEX,
     // No standalone login: shares codex's auth home, so `auth login --agent
     // codex` is the path. Point login_argv at codex's flow for the rare direct
     // `auth login --agent codex-serve` (writes the same shared home).
@@ -432,7 +435,7 @@ pub const OPENCODE: AgentSpec = AgentSpec {
     // not read OpenCode 1's `auth.json`, so a home logged in under 1.x must log
     // in again. `--standalone` keeps the login sandbox from starting OpenCode's
     // per-user background service.
-    cred_sentinel: ".local/share/opencode/opencode.db",
+    cred_sentinel: pillbox_credentials::OPENCODE,
     login_argv: &["opencode", "auth", "login", "--standalone"],
     run_argv: &["opencode"],
     // OpenCode owns its isolated provider store. Structured runs consume an
@@ -464,7 +467,7 @@ pub const CURSOR: AgentSpec = AgentSpec {
     id: "cursor",
     auth_id: "cursor",
     integration: Integration::Structured,
-    cred_sentinel: ".config/cursor/auth.json",
+    cred_sentinel: pillbox_credentials::CURSOR,
     login_argv: &["agent", "login"],
     run_argv: &["agent"],
     // Remote URL + poll login — no localhost OAuth callback to forward.
@@ -491,7 +494,7 @@ pub const PI: AgentSpec = AgentSpec {
     // pi (npm `@earendil-works/pi-coding-agent`) stores provider credentials —
     // OAuth tokens or API keys saved via `/login` — at `~/.pi/agent/auth.json`
     // (config dir `~/.pi`, agent subdir `agent`). Verified against pi 0.80.10.
-    cred_sentinel: ".pi/agent/auth.json",
+    cred_sentinel: pillbox_credentials::PI,
     // pi has no headless `login` subcommand; authentication is the interactive
     // `/login` slash command inside the TUI. Launching bare `pi` boots that TUI
     // in the sandbox so the user can run `/login` (the login path execs this
@@ -530,7 +533,7 @@ pub const PRIME_AGENT: AgentSpec = AgentSpec {
     id: "prime-agent",
     auth_id: "prime-agent",
     integration: Integration::Structured,
-    cred_sentinel: ".prime/agent/auth.json",
+    cred_sentinel: pillbox_credentials::PRIME_AGENT,
     // Like pi: no headless login subcommand; `/login` in the TUI. Its pi-ai OAuth
     // flows keep pi's 127.0.0.1:53692 callback (present in the 0.9.8 binary).
     login_argv: &["prime-agent"],

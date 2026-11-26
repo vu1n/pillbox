@@ -1,16 +1,17 @@
 //! `SandboxHttp` over a libkrun microVM — a small HTTP/1.1 client that reaches
-//! the in-guest `opencode serve` through a vsock socket.
+//! a server agent's in-guest HTTP server (`opencode serve`, or the codex
+//! app-server bridge) through a vsock socket.
 //!
 //! The guest runs `pillbox vsock-forward` ([`attach::host::run_vsock_forward`]),
 //! which listens on a vsock port and bridges each connection to
-//! `127.0.0.1:<opencode port>`. libkrun binds the host side of that vsock port
+//! `127.0.0.1:<server port>`. libkrun binds the host side of that vsock port
 //! at `host_sock` (`krun_add_vsock_port2` listen=true — the same guest-listens
 //! mechanism `--detach` uses). So each call here is: connect `host_sock` → speak
 //! HTTP → read the response. One connection per call, so concurrent readiness
 //! polls are independent vsock streams.
 //!
-//! Why hand-rolled and not a crate: three trivial calls (`GET /api/info`, `POST
-//! /api/session`, `POST …/prompt`) over a unix socket — pulling
+//! Why hand-rolled and not a crate: a few trivial one-shot calls (`GET /api/info`,
+//! `POST /api/session`, `POST …/prompt`) over a unix socket — pulling
 //! in an HTTP-client dep (with its own connector model) to reach a socket we
 //! already hold would be heavier than the ~30 lines here.
 
@@ -68,15 +69,15 @@ impl LibkrunHttp {
     fn connect(&self) -> Result<UnixStream> {
         UnixStream::connect(&self.host_sock).with_context(|| {
             format!(
-                "connecting to the guest opencode forward at {}",
+                "connecting to the guest server forward at {}",
                 self.host_sock.display()
             )
         })
     }
 }
 
-/// Build a one-shot HTTP/1.1 request head with `Connection: close`, so the
-/// a server that omits `Content-Length` still ends the body by closing.
+/// Build a one-shot HTTP/1.1 request head with `Connection: close`, so a server
+/// that omits `Content-Length` still ends the body by closing.
 fn request_head(method: &str, path: &str, json_body: Option<&str>, auth: &str) -> String {
     let mut req =
         format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n{auth}");
@@ -103,7 +104,7 @@ fn content_length(head: &[u8]) -> Result<Option<usize>> {
                 let len = value
                     .trim()
                     .parse()
-                    .with_context(|| format!("opencode response: bad Content-Length {value:?}"))?;
+                    .with_context(|| format!("guest server reply: bad Content-Length {value:?}"))?;
                 return Ok(Some(len));
             }
         }
@@ -117,13 +118,25 @@ fn content_length(head: &[u8]) -> Result<Option<usize>> {
 /// exhausting or wedging the host.
 fn exchange(mut stream: UnixStream, request: &[u8], timeout: Duration) -> Result<(u16, String)> {
     let deadline = Instant::now() + timeout;
-    let timed_out = || anyhow::anyhow!("opencode response: no complete reply within {timeout:?}");
-    stream.set_write_timeout(Some(timeout))?;
-    match stream.write_all(request).and_then(|()| stream.flush()) {
-        Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-            return Err(timed_out())
+    let timed_out = || anyhow::anyhow!("guest server reply: no complete reply within {timeout:?}");
+    // Writes share the read deadline: each write gets only the time left, so a guest that
+    // never reads cannot hold the request past `timeout`.
+    let mut sent = 0;
+    while sent < request.len() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(timed_out());
         }
-        other => other?,
+        stream.set_write_timeout(Some(remaining))?;
+        match stream.write(&request[sent..]) {
+            Ok(0) => bail!("guest server reply: connection closed while sending the request"),
+            Ok(n) => sent += n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                return Err(timed_out())
+            }
+            Err(e) => return Err(e.into()),
+        }
     }
     let mut raw = Vec::new();
     let mut chunk = [0u8; 64 * 1024];
@@ -134,7 +147,7 @@ fn exchange(mut stream: UnixStream, request: &[u8], timeout: Duration) -> Result
             if let Some(end) = head_end(&raw) {
                 if let Some(len) = content_length(&raw[..end])? {
                     if len > MAX_RESPONSE_BYTES - end {
-                        bail!("opencode response: Content-Length {len} exceeds the {MAX_RESPONSE_BYTES}-byte cap");
+                        bail!("guest server reply: Content-Length {len} exceeds the {MAX_RESPONSE_BYTES}-byte cap");
                     }
                     want = Some(end + len);
                 }
@@ -162,12 +175,12 @@ fn exchange(mut stream: UnixStream, request: &[u8], timeout: Duration) -> Result
         if n == 0 {
             // Connection: close, no Content-Length: EOF ends the body.
             if want.is_some() {
-                bail!("opencode response: connection closed before Content-Length bytes arrived");
+                bail!("guest server reply: connection closed before Content-Length bytes arrived");
             }
             break;
         }
         if raw.len() + n > MAX_RESPONSE_BYTES {
-            bail!("opencode response: exceeds the {MAX_RESPONSE_BYTES}-byte cap");
+            bail!("guest server reply: exceeds the {MAX_RESPONSE_BYTES}-byte cap");
         }
         raw.extend_from_slice(&chunk[..n]);
     }
@@ -176,12 +189,12 @@ fn exchange(mut stream: UnixStream, request: &[u8], timeout: Duration) -> Result
 
 /// Parse a full HTTP/1.1 response (status line + headers + body, headers
 /// terminated by CRLFCRLF). Returns (status, body verbatim — no de-chunking;
-/// opencode's one-shot replies are small `Content-Length` bodies).
+/// the guest servers' one-shot replies are small `Content-Length` bodies).
 fn parse_response(raw: &[u8]) -> Result<(u16, String)> {
     let split = raw
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
-        .context("opencode response: no header terminator")?;
+        .context("guest server reply: no header terminator")?;
     let status_line = raw[..split]
         .split(|&b| b == b'\n')
         .next()
@@ -192,7 +205,7 @@ fn parse_response(raw: &[u8]) -> Result<(u16, String)> {
         .split_whitespace()
         .nth(1)
         .and_then(|s| s.parse().ok())
-        .with_context(|| format!("opencode response: bad status line: {status_line:?}"))?;
+        .with_context(|| format!("guest server reply: bad status line: {status_line:?}"))?;
     let body = String::from_utf8_lossy(&raw[split + 4..]).to_string();
     Ok((status, body))
 }
@@ -316,6 +329,45 @@ mod tests {
             exchange(host, b"GET / HTTP/1.1\r\n\r\n", Duration::from_millis(200)).unwrap_err();
         assert!(err.to_string().contains("within"), "{err:#}");
         assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    #[test]
+    fn a_guest_that_never_reads_errors_at_the_deadline() {
+        let (host, peer) = UnixStream::pair().unwrap();
+        // The peer holds its end open and never reads, so the socket buffer fills.
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(5));
+            drop(peer);
+        });
+        let mut request = request_head("POST", "/x", Some(""), "").into_bytes();
+        request.resize(request.len() + 64 * 1024 * 1024, b'x');
+        let timeout = Duration::from_millis(300);
+        let started = Instant::now();
+        let err = exchange(host, &request, timeout).unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(err.to_string().contains("within"), "{err:#}");
+        assert!(elapsed >= timeout / 2, "{elapsed:?}");
+        assert!(elapsed < timeout + Duration::from_secs(2), "{elapsed:?}");
+    }
+
+    /// Each write makes progress here, so only a whole-request deadline bounds it.
+    #[test]
+    fn a_guest_that_reads_a_trickle_errors_at_the_deadline() {
+        let (host, mut peer) = UnixStream::pair().unwrap();
+        std::thread::spawn(move || {
+            let mut sip = [0u8; 4096];
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(5) && peer.read(&mut sip).is_ok() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let mut request = request_head("POST", "/x", Some(""), "").into_bytes();
+        request.resize(request.len() + 64 * 1024 * 1024, b'x');
+        let timeout = Duration::from_millis(300);
+        let started = Instant::now();
+        let err = exchange(host, &request, timeout).unwrap_err();
+        assert!(err.to_string().contains("within"), "{err:#}");
+        assert!(started.elapsed() < timeout + Duration::from_secs(2));
     }
 
     #[test]

@@ -852,6 +852,18 @@ pub(crate) struct Sent {
 /// Drive a running session with `text` and record it on the §0 log as an
 /// attributed `Input` — `session send` without its banner.
 pub(crate) fn send(resolved: &Pillbox, id: &str, text: &str) -> Result<Sent> {
+    send_via(resolved, id, text, |s, bytes| {
+        sandbox::live_session(s)?.send(resolved, bytes)
+    })
+}
+
+/// [`send`] with the delivery step passed in (tests deliver without a VM).
+fn send_via(
+    resolved: &Pillbox,
+    id: &str,
+    text: &str,
+    deliver: impl FnOnce(&session::Session, &[u8]) -> Result<()>,
+) -> Result<Sent> {
     // Drive targets a RUNNING session (a pty-host to write to), so resolve
     // against the session registry — not `resolve_logged` (the read side's
     // foreground log dirs).
@@ -862,12 +874,13 @@ pub(crate) fn send(resolved: &Pillbox, id: &str, text: &str) -> Result<Sent> {
     // for a PTY agent. The command layer no longer branches on integration or
     // backend; a backend that can't drive rejects with the standard unsupported
     // shape.
-    sandbox::live_session(&s)?.send(resolved, text.as_bytes())?;
+    deliver(&s, text.as_bytes())?;
     let target = if s.integration() == Integration::Server {
         crate::contract::InputTarget::Agent
     } else {
         crate::contract::InputTarget::Pty
     };
+    // Every delivered input is recorded on the §0 log as an attributed `Input`.
     record_input(resolved, &s.id, text, target);
     Ok(Sent {
         session_id: s.id,
@@ -2003,6 +2016,59 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
+    }
+
+    #[test]
+    fn send_records_what_it_delivered_on_the_session_log() {
+        crate::test_util::with_isolated_home("session-send-records", || {
+            let pb = crate::pillbox::global();
+            for (agent, target) in [
+                ("opencode", crate::contract::InputTarget::Agent),
+                ("claude", crate::contract::InputTarget::Pty),
+            ] {
+                let mut s = session::Session::test_fixture();
+                s.id = format!("send{agent}");
+                s.agent_id = agent.into();
+                session::write(&pb, &s).unwrap();
+                let mut delivered = Vec::new();
+                let sent = send_via(&pb, &s.id, "fix it", |to, bytes| {
+                    delivered.push((to.id.clone(), bytes.to_vec()));
+                    Ok(())
+                })
+                .unwrap();
+                assert_eq!(delivered, [(s.id.clone(), b"fix it".to_vec())]);
+                assert_eq!(
+                    (sent.session_id.as_str(), sent.target),
+                    (s.id.as_str(), target)
+                );
+                let events = crate::events::log::SessionLog::open(&pb, &s.id)
+                    .unwrap()
+                    .read_from(0)
+                    .unwrap();
+                assert_eq!(events.len(), 1, "{agent}");
+                assert!(
+                    matches!(&events[0].payload, crate::contract::Payload::Input(i)
+                        if i.text == "fix it" && i.target == target),
+                    "{agent}: {:?}",
+                    events[0].payload
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn send_that_fails_to_deliver_records_nothing() {
+        crate::test_util::with_isolated_home("session-send-undelivered", || {
+            let pb = crate::pillbox::global();
+            let s = session::Session::test_fixture();
+            session::write(&pb, &s).unwrap();
+            assert!(send_via(&pb, &s.id, "x", |_, _| anyhow::bail!("no VM")).is_err());
+            let events = crate::events::log::SessionLog::open(&pb, &s.id)
+                .unwrap()
+                .read_from(0)
+                .unwrap();
+            assert!(events.is_empty());
+        });
     }
 
     #[test]

@@ -12,7 +12,7 @@ import {
 import type { ManagedExecutionOwner } from "./src/managed_ownership.ts";
 
 const owner: ManagedExecutionOwner = {
-  domain: "huddles_workspace",
+  domain: "public_controller",
   digest: `sha256:${"d".repeat(64)}`,
 };
 

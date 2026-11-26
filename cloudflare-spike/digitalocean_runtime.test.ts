@@ -351,7 +351,7 @@ test("HTTP client rejects ambiguous name lookup, oversized bodies, and mismatche
   await assert.rejects(mismatch.create("different", configId), /identity mismatch/);
 });
 
-test("DO request hash matches the shared Huddles execution/2 fixture", async () => {
+test("DO request hash matches the shared execution/2 fixture", async () => {
   const fixture = JSON.parse(
     readFileSync(new URL("./testdata/digitalocean-execution.json", import.meta.url), "utf8"),
   );

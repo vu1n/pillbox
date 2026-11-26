@@ -10,6 +10,17 @@ transport (in-sandbox pty-host + frame protocol; local detach/reattach).
 
 ## Unreleased
 
+- Remove the managed tier's private Workers RPC entry point
+  (`HuddlesRuntimeEntrypoint`), its Ed25519 operation-grant protocol, the
+  authorization-currentness service binding, the Huddles owner domain, and the
+  manual Huddles-recorded burn-in (bootstrap validator, fixed-workload recorder,
+  reconciler, cost receipt and cost accounting scripts, `wrangler.burnin.toml`,
+  `docs/burn-in/`). The Worker serves only the public HTTP routes, authorized by
+  short-lived HMAC capabilities; the owner is always `public_controller`, and
+  `tool_policy` must be `deny_all` (HTTP 400 `unsupported_policy` otherwise). The
+  D1 allowance is the cost breaker. A managed preview deployment now needs a new
+  Pillbox-recorded burn-in, which does not exist yet.
+- Rename `docs/huddles-codex-execution.md` to `docs/codex-execution.md`.
 - `pillbox dispatch` grades every worker on a copy of its workspace inside the
   grader microVM, never on the host and never in the live tree. Tests, test
   config, CI config and rubrics are reset to the bookmark and locked, and the

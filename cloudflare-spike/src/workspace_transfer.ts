@@ -1,6 +1,6 @@
 import { getSandbox, type Sandbox } from "@cloudflare/sandbox";
 import { bearerToken, verifyManagedCapability } from "./auth.js";
-import { safeHuddlesRuntimeDiagnostic } from "./huddles_policy.js";
+import { safeRuntimeDiagnostic } from "./runtime_diagnostic.js";
 import { deriveSandboxRuntimeId } from "./runtime_identity.js";
 import { OPENCODE_WORKSPACE_DIR } from "./opencode_turn.js";
 import {
@@ -259,7 +259,7 @@ export async function routeWorkspaceTransfer(
       {
         error: {
           code: "invalid_workspace_transfer",
-          message: safeHuddlesRuntimeDiagnostic(cause),
+          message: safeRuntimeDiagnostic(cause),
         },
       },
       { status: cause instanceof RequestBodyTooLargeError ? 413 : 400 },
@@ -324,7 +324,7 @@ async function finalizeWorkspace(input: {
       resultSnapshot,
     });
   } catch (cause) {
-    const message = redact(safeHuddlesRuntimeDiagnostic(cause));
+    const message = redact(safeRuntimeDiagnostic(cause));
     await input.store.fail({
       finalize_id: identity.finalize_id,
       target_owner: input.targetOwner,

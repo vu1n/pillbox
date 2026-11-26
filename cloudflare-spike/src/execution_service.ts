@@ -40,7 +40,7 @@ import {
   type ManagedExecutionAllowance,
   type ManagedExecutionReservationStore,
 } from "./managed_reservation.js";
-import { safeHuddlesRuntimeDiagnostic } from "./huddles_policy.js";
+import { safeRuntimeDiagnostic } from "./runtime_diagnostic.js";
 import {
   ManagedAdmissionError,
   managedAdmissionPolicy,
@@ -291,7 +291,7 @@ export class ExecutionService {
           {
             type: "attention_required",
             reason: "error_stalled",
-            message: safeHuddlesRuntimeDiagnostic(cause),
+            message: safeRuntimeDiagnostic(cause),
           },
         ],
       };
@@ -527,7 +527,7 @@ export class ExecutionService {
     } catch (cause) {
       console.warn(
         "Pillbox terminal Analytics emission failed after authoritative commit:",
-        safeHuddlesRuntimeDiagnostic(cause),
+        safeRuntimeDiagnostic(cause),
       );
     }
   }
@@ -686,6 +686,7 @@ function unsupportedManagedRequest(
       readonly message: string;
     }
   | undefined {
+  // Managed execution enforces only tool_policy deny_all; any other policy is refused before a claim.
   if (request.tool_policy !== "deny_all") {
     return {
       code: "unsupported_policy",
@@ -761,7 +762,7 @@ export class OpencodeExecutionRuntime implements ExecutionRuntime {
       text: request.rendered_input,
       model: `${request.execution.requested.provider}/${request.execution.requested.model}`,
       reasoningVariant: openRouterReasoning(request.execution.requested)?.variant,
-      toolPolicy: request.tool_policy === "deny_all" ? "deny_all" : undefined,
+      toolPolicy: request.tool_policy,
       outputFormat:
         request.output_format.type === "json_schema"
           ? request.output_format

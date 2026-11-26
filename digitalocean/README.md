@@ -3,14 +3,14 @@
 Status: experimental, disabled by default. A live DO adapter smoke on 2026-09-23
 passed text/schema output, exact retry, status/cancel, and cleanup after fixing the
 native structured-output fallback. The control plane used local SQLite/filesystem
-ports: deployed Worker/D1/R2 and signed-grant/currentness integration remain
-unverified. No production rollout is implied. Sanitized results live in Huddles'
-`docs/evaluations/digitalocean-runtime-smoke-2026-09-23.md`.
+ports: deployed Worker/D1/R2 integration remains unverified. No production rollout is
+implied. The smoke's sanitized results are not kept in this repository.
 
 Pillbox's existing Cloudflare-hosted authenticated execution/2 service can select
 DigitalOcean Harness Runtime as compute. It continues to use D1 for bounded claims,
-R2 for one immutable terminal artifact, and Huddles for authorization/collaboration.
-The provider choice lives in the existing hashed/signed transport field:
+R2 for one immutable terminal artifact. Authorization is the public capability
+(`MANAGED_CAPABILITY_SECRET`); collaboration belongs to the calling controller.
+The provider choice lives in the existing hashed transport field:
 
 | Field | DO value |
 | --- | --- |
@@ -26,12 +26,13 @@ Managed OpenRouter runs currently admit only `openai/gpt-5-mini` with normalized
 `low`, `medium`, or `high` effort. The adapter installs an explicit OpenCode variant
 with OpenRouter `reasoning.effort` and `provider.require_parameters: true`, then
 selects that variant in the native request. Unsupported pairs (including Qwen3
-Coder) fail before allocation. Huddles' optional profiles seal `high`.
+Coder) fail before allocation.
 
 The rest of execution/2 is unchanged. Old Cloudflare requests keep their hashes;
 old deployments reject the new transport before runtime allocation. There is no
-cross-provider fallback. Huddles' `openrouter-gpt5mini-digitalocean` profile chooses
-GPT-5 mini; `openrouter-gpt5mini-cloudflare` chooses the same inference on Cloudflare.
+cross-provider fallback. A controller selects DigitalOcean by sending this
+transport; the same inference on Cloudflare uses the Cloudflare OpenCode
+transport.
 
 ## Supported boundary
 
@@ -62,8 +63,7 @@ the workspace store; adding its DO transfer requires a separate tested capabilit
 ## Configure an isolated environment
 
 1. Apply `cloudflare-spike/migrations/0005_digitalocean_allocations.sql` after the
-   existing four migrations. Keep the existing authorization bootstrap and allowance
-   setup. Migration 0005 is used only by the DO path.
+   existing four migrations. Keep the existing allowance setup. Migration 0005 is used only by the DO path.
 2. With a scoped DO token in the operator environment, create an immutable config:
 
    ```sh
@@ -84,8 +84,8 @@ the workspace store; adding its DO transfer requires a separate tested capabilit
    this execution realm, and stable until its allocation records are retired.
 4. Keep both switches at `0` until a reviewed allowance is seeded. Enable both
    `MANAGED_EXECUTION_ENABLED` and `DIGITALOCEAN_EXECUTION_ENABLED` only for the
-   authorized test. Select the DO transport in a signed private invocation or an
-   exact public execution capability; merely changing the Worker config does not
+   authorized test. Select the DO transport in the request bound by an exact public
+   execution capability; merely changing the Worker config does not
    rewrite any previously sealed invocation.
 5. Observe one new invocation, exact retry, bounded status, cancellation, cleanup,
    and actual DO/OpenRouter billing. Disable DO admission after the smoke. Existing

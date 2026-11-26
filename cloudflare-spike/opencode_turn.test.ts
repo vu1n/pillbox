@@ -58,6 +58,7 @@ test("OpenCode turn returns exact structured output through the evidence sink", 
     model: "zai-coding-plan/glm-4.7",
     reasoningVariant: "pillbox-high",
     outputFormat,
+    toolPolicy: "deny_all",
     config: { env: {} },
     sink: evidence.sink,
   });
@@ -109,6 +110,7 @@ test("OpenCode turn retries in a fresh session and records raw JSON acceptance",
       text: "Produce the document.",
       model: "zai-coding-plan/glm-4.7",
       outputFormat,
+      toolPolicy: "deny_all",
       config: { env: {} },
       sink: evidence.sink,
     });
@@ -152,6 +154,7 @@ test("OpenCode turn rejects an oversized session response before JSON parsing", 
     sandbox: transport.sandbox,
     text: "hello",
     model: "zai-coding-plan/glm-4.7",
+    toolPolicy: "deny_all",
     config: { env: {} },
     sink: evidence.sink,
   });
@@ -168,6 +171,7 @@ test("OpenCode turn rejects an oversized SSE frame before accumulation", async (
     sandbox: transport.sandbox,
     text: "hello",
     model: "zai-coding-plan/glm-4.7",
+    toolPolicy: "deny_all",
     config: { env: {} },
     sink: evidence.sink,
   });
@@ -241,11 +245,14 @@ function fakeTransport(
     readonly parts: ReadonlyArray<{ readonly text: string }>;
     readonly variant?: string;
   }> = [];
+  let serving = true;
   const sandbox = {
     containerFetch: async (request: Request): Promise<Response> => {
       const path = new URL(request.url).pathname;
       if (request.method === "GET" && path === "/doc") {
-        return new Response("ok");
+        return serving
+          ? new Response("ok")
+          : new Response("starting", { status: 503 });
       }
       if (request.method === "GET" && path === "/event") {
         const body = eventStreams[streamIndex++];
@@ -271,8 +278,12 @@ function fakeTransport(
       }
       return new Response("not found", { status: 404 });
     },
-    killAllProcesses: async () => {},
-    startProcess: async () => {},
+    killAllProcesses: async () => {
+      serving = false;
+    },
+    startProcess: async () => {
+      serving = true;
+    },
   };
   return {
     sandbox: sandbox as never,

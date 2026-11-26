@@ -1,6 +1,6 @@
 # Managed tier — bounded execution with selectable compute
 
-Status: **experimental** (updated 2026-09-23).
+Status: **experimental** (updated 2026-11-26).
 
 Cloudflare remains the default workspace-capable substrate. The optional
 [DigitalOcean adapter](../digitalocean/README.md) supports fresh sealed deny-all
@@ -11,13 +11,15 @@ native-session handoff are not enabled by provider selection.
 Managed Pillbox is a single-controller execution runtime. It restores one
 workspace into one Cloudflare Sandbox, runs one bounded agent turn, stores one
 terminal claim and one immutable evidence object, then returns the evidence to
-the caller's local session log. It is not a multiplayer session service.
+the caller's local session log. It is not a multiplayer session service. Every
+caller is a public-HTTP controller holding a short-lived capability; there is
+no private caller class.
 
 ## Ownership boundary
 
 | Concern | Owner |
 |---|---|
-| Collaboration, participants, ordering, retries, cancel intent, fan-out | Huddles |
+| Collaboration, participants, ordering, retries, cancel intent, fan-out | The calling controller (a collaboration service such as Huddles, outside Pillbox) |
 | Runtime policy, Sandbox placement, agent execution, output, cancellation, snapshot/evidence references | Pillbox |
 | Container lifecycle and isolation | Cloudflare Sandbox SDK and its vendor-owned Durable Object |
 | Bounded invocation/idempotency claim | D1 |
@@ -70,16 +72,14 @@ bounded pages of at most 100 events.
 There are no per-token, per-delta, PTY-frame, progress, or replay writes.
 
 The allowance bounds genuinely new managed invocations, not total spend.
-Incoming Worker, authorization/currentness, status, and D1 reads, operator-side
+Incoming Worker, capability verification, status, and D1 reads, operator-side
 rustic snapshot traffic, and provider infrastructure remain separately
 attributable costs.
 
-Public HMAC and private Huddles authorization deliberately produce different
-owner domains. A session provisioned by a public controller can only be executed
-by that public controller owner; a private Huddles grant cannot adopt it. The
-current Huddles burn-in uses direct private execution and trusted operator
-finalize. A future Huddles workspace restore needs an authenticated,
-owner-preserving broker contract rather than a cross-domain bypass.
+Every session is owned by the `public_controller` domain, keyed by a digest of
+the verified capability subject. A session provisioned under one capability
+subject can only be executed by that subject. Migration 0004's CHECK constraint
+still admits a retired second owner domain; nothing writes it any more.
 
 ## Cost evidence
 
@@ -101,23 +101,17 @@ The terminal commit order is immutable R2 artifact, conditional D1 terminal
 update, then at most one best-effort Analytics emission by the D1 winner. A D1
 terminal row prevents retries and recovery from emitting again. Analytics
 failure is logged after commit and cannot undo terminal execution. Provider-
-observed Analytics writes are attached later during burn-in reconciliation with
-an explicit `observed - planned` variance; they never rewrite the envelope.
+observed Analytics writes, if an operator reconciles them, are recorded outside
+the envelope with an explicit `observed - planned` variance; they never rewrite
+it.
 Analytics contains no prompt, output, secret, repository path, or participant
 identity.
 
 The v1 envelope is sealed before terminal persistence: its D1 reads are pre-seal
-measurements and its writes include one planned terminal write. Full burn-in
-reconciliation requires an identity/artifact-bound [cost receipt](burn-in/cost-receipt.md)
-with separately observed commit rows and container lifecycle allocation units.
-It never rewrites the artifact or assumes execution duration equals billed
-lifecycle duration. Missing receipt observations keep the gate closed.
-Receipt v2 additionally reconciles explicit D1 inspection, artifact versus
-snapshot/verification R2 traffic, runtime versus authority Worker calls, and
-vendor DO execute versus cleanup/idle usage. Each scope has retained source
-records and an independently measured total. Namespace retention remains a
-separate before/after observation, never a per-run allocation inferred from a
-shared namespace delta. This adds no runtime write or deployment requirement.
+measurements and its writes include one planned terminal write. It does not
+include post-seal commit rows or container lifecycle allocation, and execution
+duration is not billed lifecycle duration. No reconciliation tooling ships in
+this repository; compare envelopes with provider billing views by hand.
 
 ## Current limits
 
@@ -129,25 +123,27 @@ shared namespace delta. This adds no runtime write or deployment requirement.
   persistence, scoped credential minting, provisioning, execution allowance,
   or network access. This gate does not affect Codex on the local libkrun
   backend.
-- Public HTTP uses short-lived controller capabilities bound to one operation,
-  the exact bounded request bytes, and the exact session/invocation id. Huddles
-  uses the trusted same-account service binding and owns participant/driver
-  authorization.
-- Every session is durably bound to one opaque owner domain and digest at its
-  first invocation reservation. Huddles ownership derives from the verified
-  installation, execution realm, organization, and workspace; public HMAC
-  controllers occupy a separate domain. Principal, policy, grant, signer, and
-  credential material are not persisted. Legacy rows without that provenance
-  fail closed.
-- Public managed execution is `tool_policy: deny_all`. Tool-enabled execution is
-  disabled until provider and workspace credentials have a brokered boundary;
+- Every route is public HTTP. Each request carries a short-lived HMAC
+  capability (`MANAGED_CAPABILITY_SECRET`) bound to one operation, the exact
+  bounded request bytes, and the exact session/invocation id. The Worker
+  verifies it before any D1 or R2 access. Participant and driver authorization
+  belong to the calling controller, not to Pillbox.
+- Every session is durably bound to one opaque owner (`public_controller` plus a
+  digest of the capability subject) at its first invocation reservation. Only the
+  owner digest is persisted; capability, secret, and credential material are not.
+  Legacy rows without owner provenance fail closed.
+- Tool policy is request data (`tool_policy`) and must be `deny_all`. The public
+  execute route rejects anything else with 400 `unsupported_policy` before D1
+  access, and the DigitalOcean runtime rejects it too. Tool-enabled execution
+  is disabled until provider and workspace credentials have a brokered boundary;
   local microVM tools are unaffected.
 - Request bodies are capped at 1 MiB, OpenCode control responses and SSE frames
   are capped before parsing, evidence is capped at 2,000 events / 8 MiB, and
   responses, costs, and cursors are bounded and identity-checked by the CLI.
-- The production Huddles entrypoint exposes only authenticated v2
-  execute/status/cancel operations. The historical `ensureSession`/`invokeSession`
-  adapter was deleted on 2026-10-04.
+- The Worker exposes only the v2 execute/status/cancel and workspace
+  provision/finalize routes. There is no private RPC entry point, service-binding
+  caller, or operation-grant protocol; the historical
+  `ensureSession`/`invokeSession` adapter was deleted on 2026-10-04.
 
 ## Cloudflare Computer
 
@@ -160,46 +156,39 @@ become a production dependency.
 
 ## Managed preview release gate
 
-Before any managed preview deployment, run the fixed burn-in described in
-[docs/burn-in/managed-preview-template.md](burn-in/managed-preview-template.md)
-against a namespace whose Worker, D1 database, R2 bucket, Analytics dataset,
-and Sandbox container class are all distinct from the existing preview. The
-first reviewed workload has exactly **one genuinely new execution**: one
-deny-all OpenCode execute, one exact retry, two status pages capped at 100
-events, a managed-Codex preflight rejection, and one kill-before-transfer
-finalize. The retry/status/finalize calls do not increase the execution claim
-allowance. Therefore the initial environment must set:
+No burn-in harness exists now. The earlier manual burn-in, its workload
+recorder, reconciler and cost-receipt scripts were removed along with the
+private caller they served. A managed preview deployment needs a new
+Pillbox-recorded burn-in first; that is future work and is not defined here.
+
+What exists today is the application cost breaker. An isolated deployment must
+use a Worker, D1 database, R2 bucket, Analytics dataset, and Sandbox container
+class distinct from the existing preview, and start with:
 
 ```toml
 MANAGED_EXECUTION_ENABLED = "0"
-MANAGED_EXECUTION_EPOCH = "burnin-2026-09-01-v1"
-MANAGED_EXECUTION_LIMIT = "1"
+MANAGED_EXECUTION_EPOCH = "<reviewed epoch>"
+MANAGED_EXECUTION_LIMIT = "<reviewed limit>"
 ```
 
-The operator applies migration 0002 first, seeds the singleton
+The operator applies migration 0002, seeds the singleton
 `managed_execution_allowance` row with the same epoch and limit, and only then
-explicitly enables the isolated Worker. The application allowance is the hard
-breaker and never auto-resets; changing the epoch/limit is a new reviewed run.
-There is no production deploy automation.
+explicitly enables the Worker. The application allowance is the hard breaker and
+never auto-resets; changing the epoch or limit is a new reviewed run. There is
+no production deploy automation.
 
-The gate must:
+Checks that exist now:
 
-- run the topology policy test and the full TypeScript/Rust suites;
-- verify the Wrangler binding list contains no Pillbox-authored DO class;
-- execute the deterministic workload, including an exact retry and bounded
-  status pages;
-- run `scripts/smoke/managed-agent-preflight.sh` through the workload recorder
-  and retain its observed rejection output/hash and zero provision, network,
-  and state-write counters; copied manifest expectations are not release
-  evidence;
-- reconcile every `RunCostEnvelope` against captured D1, R2, Container, Worker,
-  Analytics Engine, and vendor Sandbox/DO counters, keeping planned Analytics
-  units separate from provider-observed writes and recording their variance;
-- fail on unexplained counter deltas, more than one immutable artifact or
-  Analytics point per new run, any custom DO class, or custom DO storage growth;
-- configure account budget alerts at 50%, 75%, and 90% of the small preview
-  cap, and verify the documented kill switch stops managed execution without
-  affecting local Pillbox.
+- `npm test` in `cloudflare-spike/`, including `managed_policy.test.ts` and
+  `managed_public_route.test.mjs` (the public route over wrangler
+  `unstable_dev`), and `node --test do_usage_policy.test.mjs`, which fails on any
+  Pillbox-authored DO class;
+- `scripts/smoke/managed-agent-preflight.sh`, a standalone smoke of the Rust
+  `ManagedBackend` admission boundary: Codex is rejected as unsupported with zero
+  provision, network, and state-write counters;
+- account budget alerts at 50%, 75%, and 90% of the preview cap, and the
+  documented kill switch, which stops managed execution without affecting local
+  Pillbox.
 
 The detailed default-deny rules are canonical in
 [durable-object-usage.md](./durable-object-usage.md).

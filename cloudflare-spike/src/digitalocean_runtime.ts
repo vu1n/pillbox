@@ -17,7 +17,7 @@ import {
   DIGITALOCEAN_POLL,
 } from "./digitalocean_guest.js";
 import { openRouterReasoning } from "./opencode_reasoning.js";
-import { huddlesPromptTools } from "./huddles_policy.js";
+import { opencodePromptTools } from "./tool_policy.js";
 import { sha256Hex } from "./runtime_identity.js";
 import { inspectRawStructuredOutput } from "./structured_output.js";
 
@@ -88,6 +88,8 @@ export class DigitalOceanExecutionRuntime implements ExecutionRuntime {
     name: string,
   ): Promise<RuntimeTurnResult> {
     const { api, allocations, settings } = this.options;
+    // Resolve the request's tool policy before any droplet spend so an unenforceable policy fails closed.
+    const tools = opencodePromptTools(request.tool_policy);
     const created = await api.create(name, settings.configId!);
     if (!(await allocations.attach(request.invocation_id, created.session_id))) {
       throw new Error("DigitalOcean allocation was cancelled during creation");
@@ -114,7 +116,7 @@ export class DigitalOceanExecutionRuntime implements ExecutionRuntime {
       model: request.execution.requested.model,
       reasoning: openRouterReasoning(request.execution.requested),
       harness_version: DIGITALOCEAN_HARNESS_VERSION,
-      tools: huddlesPromptTools("deny_all"),
+      tools,
       output_format: request.output_format,
     });
     if ((await allocations.get(request.invocation_id))?.state !== "ready")

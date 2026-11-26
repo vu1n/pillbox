@@ -63,7 +63,7 @@ const allowance: ManagedExecutionAllowance = {
   execution_limit: 3,
 };
 const executionOwner: ManagedExecutionOwner = {
-  domain: "huddles_workspace",
+  domain: "public_controller",
   digest: `sha256:${"d".repeat(64)}`,
 };
 
@@ -651,7 +651,7 @@ test("foreign owners cannot read evidence, status, or cancel an invocation", asy
   });
   await new ExecutionService(store, artifacts, runtime, fixedOptions()).executeInvocation(input);
   const foreignOwner: ManagedExecutionOwner = {
-    domain: "huddles_workspace",
+    domain: "public_controller",
     digest: `sha256:${"e".repeat(64)}`,
   };
   const foreign = new ExecutionService(store, artifacts, runtime, {
@@ -930,10 +930,6 @@ class MemoryReservations implements ManagedExecutionReservationStore {
 
   async markFailed(input: { invocation_id: string; owner: ManagedExecutionOwner; error_code: string; now_ms: number }): Promise<boolean> {
     return this.transition(input, "failed", input.error_code);
-  }
-
-  async getAllowance(config: ManagedExecutionAllowance) {
-    return { ...config, reserved_executions: this.rows.size };
   }
 
   private async claim(

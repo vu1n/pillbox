@@ -544,7 +544,7 @@ report, diagnostic, and teardown errors have no verdict. See [the probe contract
 
 The `pillbox.text/1` request runs one tool-free Codex GPT-6 Luna turn under an
 immutable local microVM profile. Its exact request, bounds, and evidence
-contract are in [Huddles Codex execution](huddles-codex-execution.md).
+contract are in [Codex execution](codex-execution.md).
 
 ```sh
 pillbox text execute --request request.json

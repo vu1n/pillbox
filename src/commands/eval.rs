@@ -225,7 +225,7 @@ pub(crate) fn eval(resolved: &Pillbox, opts: EvalOpts) -> Result<()> {
     spec.validate()?;
     let prompt = spec.prompt_text()?;
     let variants = spec.resolved_variants();
-    let runner = Runner::new(resolved)?;
+    let runner = Runner::new(resolved);
 
     let records_path = opts
         .out
@@ -400,8 +400,8 @@ fn run_opts(spec: &EvalSpec, v: &Variant) -> Result<RunOpts> {
 }
 
 impl<'a> Runner<'a> {
-    fn new(resolved: &'a Pillbox) -> Result<Self> {
-        Ok(Self { resolved })
+    fn new(resolved: &'a Pillbox) -> Self {
+        Self { resolved }
     }
 
     /// Run one (variant, trial): start a session, drive the prompt, grade its

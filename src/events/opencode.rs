@@ -446,16 +446,23 @@ fn flush_frame(
 /// - **Opens only a regular file.** The guest owns the path, so the open goes
 ///   through [`open_guest_file`]: a symlink, FIFO or device there ends the read
 ///   with an error instead of being followed or blocking.
-/// - **Reads before checking `stop`.** On stop we do a final read first, so any
-///   frames the guest flushed during the last poll sleep are still drained
-///   (mirrors the file tailer's final-pump); only a genuine EOF *and* `stop`
-///   ends the drain.
+/// - **Drains a bounded tail after `stop`.** Once `stop` is seen, reads go on so
+///   frames the guest flushed during the last poll sleep still land (mirrors the
+///   file tailer's final-pump), but at most [`FOLLOW_FINAL_DRAIN_BYTES`] more: a
+///   guest can grow its capture without end (a huge sparse file, one endless
+///   line), and the thread that set `stop` is joining this one.
 #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) struct FollowReader {
     path: std::path::PathBuf,
     file: Option<std::fs::File>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Bytes still allowed after `stop` was first seen; `None` until then.
+    final_budget: Option<usize>,
 }
+
+/// Most bytes a [`FollowReader`] reads once `stop` is set: two whole capture lines,
+/// room for the frames of one poll sleep and never an unbounded guest backlog.
+pub(crate) const FOLLOW_FINAL_DRAIN_BYTES: usize = 2 * MAX_CAPTURE_LINE_BYTES;
 
 impl FollowReader {
     #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
@@ -467,6 +474,7 @@ impl FollowReader {
             path,
             file: None,
             stop,
+            final_budget: None,
         }
     }
 }
@@ -491,9 +499,24 @@ impl std::io::Read for FollowReader {
                     Err(e) => return Err(e),
                 }
             }
-            // Read FIRST, then decide on `stop` — so a final read after stop is
-            // observed still drains frames flushed during the previous nap.
-            let n = self.file.as_mut().expect("opened above").read(buf)?;
+            // After stop, only a bounded tail is read, so a guest-grown capture cannot hold off the join.
+            if self.final_budget.is_none() && self.stop.load(Ordering::Relaxed) {
+                self.final_budget = Some(FOLLOW_FINAL_DRAIN_BYTES);
+            }
+            let want = match self.final_budget {
+                Some(0) => return Ok(0),
+                Some(left) => buf.len().min(left),
+                None => buf.len(),
+            };
+            // Read before deciding on `stop`, so frames flushed during the previous nap still drain.
+            let n = self
+                .file
+                .as_mut()
+                .expect("opened above")
+                .read(&mut buf[..want])?;
+            if let Some(left) = self.final_budget.as_mut() {
+                *left -= n;
+            }
             if n > 0 {
                 return Ok(n);
             }
@@ -805,6 +828,77 @@ mod tests {
             let n = drain_sse(Cursor::new(sse), "ses-oc", &mut log, &stop).expect("drain");
             assert_eq!(n, map_capture(TOOL_TURN).len());
         });
+    }
+
+    /// A guest can grow its capture into a huge sparse file holding one endless line.
+    /// Once the tailer is stopped (a `wait_idle` timeout, a kill), both server drains
+    /// end within the bounded final tail instead of reading the line to its end, so
+    /// the thread joining the tailer is never held off by the guest.
+    #[test]
+    fn a_stopped_follow_drain_ends_inside_an_endless_line() {
+        use crate::events::EventsFormat;
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+        crate::test_util::with_isolated_home("opencode-follow-stop-endless", || {
+            for format in [EventsFormat::Sse, EventsFormat::Ndjson] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("events.capture");
+                // 1 TiB of zeros, no newline, costing no disk.
+                std::fs::File::create(&path)
+                    .unwrap()
+                    .set_len(1 << 40)
+                    .unwrap();
+                let pb = crate::pillbox::global();
+                let mut log = SessionLog::open(&pb, "ses-endless").expect("open log");
+                let stop = Arc::new(AtomicBool::new(false));
+                let (tx, rx) = std::sync::mpsc::channel();
+                let thread_stop = Arc::clone(&stop);
+                let join = std::thread::spawn(move || {
+                    let reader = FollowReader::new(path, Arc::clone(&thread_stop));
+                    let result = crate::events::drain_server_capture(
+                        format,
+                        reader,
+                        "ses-endless",
+                        &mut log,
+                        &thread_stop,
+                    );
+                    let _ = tx.send(result.map_err(|e| e.to_string()));
+                });
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                stop.store(true, Ordering::Relaxed);
+                let result = rx
+                    .recv_timeout(std::time::Duration::from_secs(20))
+                    .expect("a stopped drain must end inside an endless guest line");
+                assert_eq!(result, Ok(0));
+                join.join().unwrap();
+            }
+        });
+    }
+
+    /// After stop the follower still returns what the guest flushed during the last
+    /// nap, then ends at EOF.
+    #[test]
+    fn a_stopped_follow_reader_drains_its_final_tail() {
+        use std::io::{Read as _, Write as _};
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.sse");
+        std::fs::write(&path, "data: {}\n\n").unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut reader = FollowReader::new(path.clone(), Arc::clone(&stop));
+        let mut first = [0u8; 4];
+        reader.read_exact(&mut first).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"data: {\"late\":1}\n\n")
+            .unwrap();
+        stop.store(true, Ordering::Relaxed);
+        let mut rest = String::new();
+        reader.read_to_string(&mut rest).unwrap();
+        assert_eq!(rest, ": {}\n\ndata: {\"late\":1}\n\n");
     }
 
     /// The follower opens the guest-owned capture path itself: a symlink (to a host

@@ -1,16 +1,21 @@
 //! The session packet (`pillbox.session-packet/1`): one deterministic tar that
 //! carries a workspace tree and a harness's state tree between turns, on every
-//! placement. `pillbox checkpoint pack|unpack` are its only writer and reader.
+//! placement. This crate is its only writer and reader, run as the
+//! `pillbox-packet pack|unpack` binary or as `pillbox checkpoint pack|unpack`
+//! (both through [`run`]). It depends on nothing else in pillbox, so a caller
+//! can build it alone.
 //!
-//! The format is specified by `proto/pillbox/session-packet-1.schema.json`
-//! (the `packet.json` manifest) and `docs/session-packet.md` (the tar layout,
-//! exclusions and limits); the Rust types here follow that schema, not the
-//! reverse.
-//!
-//! The packet is specified as JSON Schema, and the `--no-default-features`
-//! build carries every packet subcommand.
+//! The format is specified by `session-packet-1.schema.json` (the
+//! `packet.json` manifest) and `session-packet.md` (the tar layout, exclusions
+//! and limits), both beside this crate; the Rust types here follow that schema,
+//! not the reverse.
 
+mod cli;
+mod error;
 mod tar;
+
+pub use cli::{run, Command, Names};
+pub use error::{exit_code, Category, Op, PacketError};
 
 use std::collections::BTreeSet;
 use std::fs::{self, File};
@@ -22,26 +27,16 @@ use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::errors::PillboxError;
-
-pub(crate) const FORMAT: &str = "pillbox.session-packet/1";
+pub const FORMAT: &str = "pillbox.session-packet/1";
 /// Largest packet `pack` writes or `unpack` reads, in bytes (1 GiB).
-pub(crate) const MAX_PACKET_BYTES: u64 = 1 << 30;
+pub const MAX_PACKET_BYTES: u64 = 1 << 30;
 /// Most entries one manifest may list.
-pub(crate) const MAX_ENTRIES: usize = 250_000;
+pub const MAX_ENTRIES: usize = 250_000;
 /// Largest `packet.json` `unpack` will parse.
 const MAX_MANIFEST_BYTES: u64 = 64 << 20;
 /// Longest entry path, symlink target or transcript path, in bytes.
 const MAX_PATH_BYTES: usize = 4096;
 const MANIFEST_NAME: &str = "packet.json";
-
-/// Basenames never packed from either tree: harness OAuth credentials and the
-/// vault's CA material.
-const CREDENTIAL_FILES: &[&str] = &[
-    ".credentials.json",
-    "pillbox-vault-ca.crt",
-    "pillbox-vault-ca.key",
-];
 
 /// The two trees a packet carries; each unpacks to its own directory.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -71,15 +66,19 @@ impl Tree {
 /// in WAL mode, say) lives in these, not in the database itself.
 const SQLITE_SIDECARS: [&str; 3] = ["-wal", "-shm", "-journal"];
 
-/// Is `name` a credential file that must not enter a packet from `tree`? The
-/// harness tree also drops every agent's credential sentinel (`auth.json`,
+/// Is `name` a credential file that must not enter a packet from `tree`? Every
+/// tree drops the basenames in `pillbox_credentials::NEVER_PACKED`; the
+/// harness tree also drops every agent credential's basename (`auth.json`,
 /// `opencode.db`, …) and its SQLite sidecars, since that tree is an agent
 /// home's state.
 fn is_credential(tree: Tree, name: &str) -> bool {
-    CREDENTIAL_FILES.contains(&name)
+    let basename = |path: &'static str| path.rsplit('/').next();
+    pillbox_credentials::NEVER_PACKED
+        .iter()
+        .any(|p| basename(p) == Some(name))
         || (tree == Tree::Harness
-            && crate::agents::ALL.iter().any(|a| {
-                let Some(sentinel) = a.cred_sentinel.rsplit('/').next() else {
+            && pillbox_credentials::AGENT_CREDENTIALS.iter().any(|p| {
+                let Some(sentinel) = basename(p.path()) else {
                     return false;
                 };
                 name == sentinel
@@ -93,20 +92,20 @@ fn is_credential(tree: Tree, name: &str) -> bool {
 /// omitted (never `null`), matching the schema.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Manifest {
-    pub(crate) format: String,
-    pub(crate) harness: String,
+pub struct Manifest {
+    pub format: String,
+    pub harness: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) harness_session_id: Option<String>,
+    pub harness_session_id: Option<String>,
     /// Path of the harness transcript, relative to `harness/`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) transcript: Option<String>,
-    pub(crate) entries: Vec<Entry>,
+    pub transcript: Option<String>,
+    pub entries: Vec<Entry>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) enum Entry {
+pub enum Entry {
     Dir {
         path: String,
     },
@@ -123,7 +122,7 @@ pub(crate) enum Entry {
 }
 
 impl Entry {
-    pub(crate) fn path(&self) -> &str {
+    pub fn path(&self) -> &str {
         match self {
             Entry::Dir { path } | Entry::File { path, .. } | Entry::Symlink { path, .. } => path,
         }
@@ -151,61 +150,61 @@ impl Entry {
 
 /// A path `pack` left out, reported so nothing is dropped silently.
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Excluded {
-    pub(crate) path: String,
+pub struct Excluded {
+    pub path: String,
     /// `credential` (a file on the exclusion list), `special` (a socket,
     /// FIFO or device, which a packet cannot carry) or `skipped` (a workspace
     /// directory named by `--skip-dir`, left out with everything under it).
-    pub(crate) reason: &'static str,
+    pub reason: &'static str,
 }
 
-pub(crate) struct PackOptions {
-    pub(crate) workspace: PathBuf,
-    pub(crate) harness_state: Option<PathBuf>,
-    pub(crate) harness: String,
-    pub(crate) harness_session_id: Option<String>,
-    pub(crate) transcript: Option<String>,
-    pub(crate) out: PathBuf,
+pub struct PackOptions {
+    pub workspace: PathBuf,
+    pub harness_state: Option<PathBuf>,
+    pub harness: String,
+    pub harness_session_id: Option<String>,
+    pub transcript: Option<String>,
+    pub out: PathBuf,
     /// Directory basenames left out of the workspace tree wherever they occur,
     /// such as `node_modules`: what an install regenerates need not ride in the
     /// packet, and a monorepo's install alone can pass the 1 GiB limit.
-    pub(crate) skip_dirs: Vec<String>,
+    pub skip_dirs: Vec<String>,
 }
 
 #[derive(Debug)]
-pub(crate) struct Packed {
-    pub(crate) digest: String,
-    pub(crate) bytes: u64,
-    pub(crate) manifest: Manifest,
-    pub(crate) excluded: Vec<Excluded>,
+pub struct Packed {
+    pub digest: String,
+    pub bytes: u64,
+    pub manifest: Manifest,
+    pub excluded: Vec<Excluded>,
 }
 
-pub(crate) struct UnpackOptions {
-    pub(crate) packet: PathBuf,
-    pub(crate) expect: String,
-    pub(crate) workspace: PathBuf,
-    pub(crate) harness_state: Option<PathBuf>,
-    pub(crate) allow_nonempty: bool,
+pub struct UnpackOptions {
+    pub packet: PathBuf,
+    pub expect: String,
+    pub workspace: PathBuf,
+    pub harness_state: Option<PathBuf>,
+    pub allow_nonempty: bool,
 }
 
 #[derive(Debug)]
-pub(crate) struct Unpacked {
-    pub(crate) digest: String,
-    pub(crate) manifest: Manifest,
+pub struct Unpacked {
+    pub digest: String,
+    pub manifest: Manifest,
 }
 
-const PACK: &str = "checkpoint pack";
-const UNPACK: &str = "checkpoint unpack";
+const PACK: Op = Op::Pack;
+const UNPACK: Op = Op::Unpack;
 
-fn refuse(action: &'static str, reason: impl Into<String>) -> anyhow::Error {
-    PillboxError::runtime(action, reason).into()
+fn refuse(op: Op, reason: impl Into<String>) -> anyhow::Error {
+    PacketError::refuse(op, reason)
 }
 
-fn usage(action: &'static str, reason: impl Into<String>) -> anyhow::Error {
-    PillboxError::usage(action, reason).into()
+fn usage(op: Op, reason: impl Into<String>) -> anyhow::Error {
+    PacketError::usage(op, reason)
 }
 
-pub(crate) fn pack(opts: &PackOptions) -> Result<Packed> {
+pub fn pack(opts: &PackOptions) -> Result<Packed> {
     if !opts.workspace.is_dir() {
         return Err(usage(
             PACK,
@@ -425,10 +424,10 @@ fn walk(
     Ok(())
 }
 
-/// Check every rule of the schema and `docs/session-packet.md` that a manifest
+/// Check every rule of the schema and `session-packet.md` that a manifest
 /// alone can show. `pack` runs it on what it is about to write, `unpack` on
 /// what it read.
-pub(crate) fn validate(m: &Manifest) -> Result<()> {
+pub fn validate(m: &Manifest) -> Result<()> {
     ensure!(m.format == FORMAT, "format is {:?}, not {FORMAT}", m.format);
     ensure!(
         valid_harness(&m.harness),
@@ -579,7 +578,7 @@ fn check_link(path: &str, target: &str, symlinks: &BTreeSet<&str>) -> Result<()>
     Ok(())
 }
 
-pub(crate) fn unpack(opts: &UnpackOptions) -> Result<Unpacked> {
+pub fn unpack(opts: &UnpackOptions) -> Result<Unpacked> {
     let expect = opts.expect.as_str();
     let well_formed = expect.strip_prefix("sha256:").is_some_and(|h| {
         h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))

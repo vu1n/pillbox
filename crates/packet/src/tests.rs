@@ -7,7 +7,7 @@ use tempfile::TempDir;
 
 use super::*;
 
-const SCHEMA: &str = include_str!("../../proto/pillbox/session-packet-1.schema.json");
+const SCHEMA: &str = include_str!("../session-packet-1.schema.json");
 
 fn write(path: &Path, body: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();

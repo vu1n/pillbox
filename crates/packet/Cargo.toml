@@ -1,0 +1,17 @@
+[package]
+name = "pillbox-packet"
+description = "The pillbox session packet (pillbox.session-packet/1): a library and the pillbox-packet pack|unpack binary."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "session-packet.md"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+pillbox-credentials.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true

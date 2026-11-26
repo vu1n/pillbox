@@ -2975,6 +2975,8 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "pillbox-credentials",
+ "pillbox-packet",
  "portable-pty",
  "rand 0.9.4",
  "rcgen",
@@ -2997,6 +2999,23 @@ dependencies = [
  "uuid",
  "vt100",
  "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "pillbox-credentials"
+version = "0.3.0"
+
+[[package]]
+name = "pillbox-packet"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "pillbox-credentials",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]

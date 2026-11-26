@@ -63,7 +63,7 @@ const allowance: ManagedExecutionAllowance = {
   execution_limit: 3,
 };
 const executionOwner: ManagedExecutionOwner = {
-  domain: "huddles_workspace",
+  domain: "public_controller",
   digest: `sha256:${"d".repeat(64)}`,
 };
 
@@ -305,6 +305,42 @@ test("unsupported managed transport rejects repeatably before allowance reservat
   if (first.status === "failed") {
     assert.equal(first.error.code, "unsupported_execution");
   }
+  assert.equal(claims, 0);
+});
+
+test("retired service-binding transport is refused before any claim", async () => {
+  let claims = 0;
+  const supported = await request();
+  const runtime = new FakeRuntime({ served_model: null, evidence: [] });
+  const service = new ExecutionService(
+    {
+      claim: async () => {
+        claims += 1;
+        throw new Error("unsupported execution reached D1 claim");
+      },
+      get: async () => null,
+      finish: async () => false,
+    },
+    new MemoryArtifacts(),
+    runtime,
+    fixedOptions(),
+  );
+  const input = await request({
+    execution: {
+      ...supported.execution,
+      transport: {
+        ...supported.execution.transport,
+        transport: "cloudflare-service-binding",
+      },
+    },
+  });
+
+  const result = await service.executeInvocation(input);
+  assert.equal(result.status, "failed");
+  if (result.status === "failed") {
+    assert.equal(result.error.code, "unsupported_execution");
+  }
+  assert.equal(runtime.executions, 0);
   assert.equal(claims, 0);
 });
 
@@ -651,7 +687,7 @@ test("foreign owners cannot read evidence, status, or cancel an invocation", asy
   });
   await new ExecutionService(store, artifacts, runtime, fixedOptions()).executeInvocation(input);
   const foreignOwner: ManagedExecutionOwner = {
-    domain: "huddles_workspace",
+    domain: "public_controller",
     digest: `sha256:${"e".repeat(64)}`,
   };
   const foreign = new ExecutionService(store, artifacts, runtime, {
@@ -930,10 +966,6 @@ class MemoryReservations implements ManagedExecutionReservationStore {
 
   async markFailed(input: { invocation_id: string; owner: ManagedExecutionOwner; error_code: string; now_ms: number }): Promise<boolean> {
     return this.transition(input, "failed", input.error_code);
-  }
-
-  async getAllowance(config: ManagedExecutionAllowance) {
-    return { ...config, reserved_executions: this.rows.size };
   }
 
   private async claim(

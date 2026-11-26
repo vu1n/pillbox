@@ -76,7 +76,7 @@ On October 6 OpenCode moved to 2.0.24, installed from its new npm package
 API is a breaking change from 1.x (`/api/*` routes, a mandatory server password,
 renamed events), so the local `opencode` adapter now targets 2.x only. The
 managed Cloudflare and DigitalOcean images keep their own OpenCode 1.x pins
-(`cloudflare-spike/Dockerfile`, `digitalocean/`); they are sealed Huddles
+(`cloudflare-spike/Dockerfile`, `digitalocean/`); they are sealed managed
 execution cohorts and move separately.
 
 Plus the system tooling agents tend to reach for: `bash`,

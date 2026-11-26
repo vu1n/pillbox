@@ -185,6 +185,20 @@ test("disabled, unsupported and oversized DO requests cause zero allocation/API 
   assert.equal(await allocations.get(r.invocation_id), null);
 });
 
+test("DO runtime resolves the request's tool policy before any droplet spend", async () => {
+  const { runtime, api, allocations } = setup();
+  const value = { ...(await request()), tool_policy: "runtime_default" as const };
+  // Bypass admission so the runtime's own policy resolution is what must fail closed.
+  runtime.preflight = () => undefined;
+  await assert.rejects(
+    runtime.execute(value),
+    /unsupported tool policy: runtime_default/,
+  );
+  assert.equal(api.creates, 0);
+  assert.equal(api.launches, 0);
+  assert.equal(await allocations.get(value.invocation_id), null);
+});
+
 test("ambiguous create is reconciled by exact name/config and never repeated", async () => {
   const api = new Api();
   const create = api.create.bind(api);
@@ -351,7 +365,7 @@ test("HTTP client rejects ambiguous name lookup, oversized bodies, and mismatche
   await assert.rejects(mismatch.create("different", configId), /identity mismatch/);
 });
 
-test("DO request hash matches the shared Huddles execution/2 fixture", async () => {
+test("DO request hash matches the shared execution/2 fixture", async () => {
   const fixture = JSON.parse(
     readFileSync(new URL("./testdata/digitalocean-execution.json", import.meta.url), "utf8"),
   );

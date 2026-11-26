@@ -1,11 +1,11 @@
-# Huddles Codex execution boundaries
+# Codex execution boundaries
 
 ## Local text invocation (`pillbox.text/1`)
 
 The local text producer is a distinct closed contract from managed
 `pillbox.execution/2` and repository `pillbox.execution/3`. It runs one fresh,
-tool-free Codex app-server turn in an owned libkrun microVM. Huddles supplies one
-sealed rendered input and canonical invocation ID; Pillbox never owns the Huddles
+tool-free Codex app-server turn in an owned libkrun microVM. The caller supplies one
+sealed rendered input and canonical invocation ID; Pillbox never owns the caller's
 conversation, agent principal, packet, or follow-up schedule.
 
 `pillbox text execute --request FILE`, `pillbox text status INVOCATION_ID`, and
@@ -60,7 +60,7 @@ claim provides at-most-once dispatch, not an exactly-once sampling guarantee.
 Status: sealed envelope only. No ACP adapter exists: the Rust and Cloudflare
 ACP spikes were deleted on 2026-10-04 because nothing called them; the design
 below is what a future adapter must satisfy. The existing managed
-Huddles path remains OpenCode-only until the runtime and credential gates below
+path remains OpenCode-only until the runtime and credential gates below
 are implemented.
 
 ## Finding
@@ -93,14 +93,14 @@ automatic ACP/app-server fallback.
 For ACP, `session/new` receives only the policy-derived `mcpServers: []`, and
 `prompt` receives exactly the sealed `rendered_input`. The injected event sink
 gets `session_ref`, `invocation_id`, the computed execution digest, and policy
-revision for attribution. No mutable ACP context can override the sealed HCP
-packet, and the adapter emits neither HCP nor WorkEvent records. Huddles keeps
-ownership of HCP/WorkEvent orchestration, retries, sequencing, cancellation
+revision for attribution. No mutable ACP context can override the sealed
+packet, and the adapter emits no controller-level orchestration records. The
+controller keeps ownership of orchestration, retries, sequencing, cancellation
 intent, and execution identity.
 
 The adapter checks one ACP result against the sealed `output_format` schema and
 returns a safe structured-output failure without echoing provider content. It
-does not retry inside ACP; any retry decision remains Huddles orchestration.
+does not retry inside ACP; any retry decision remains the controller's.
 
 The deleted spikes (`src/sandbox/acp.rs`, `cloudflare-spike/src/acp_turn.ts`,
 commit bf38f5b) remain in git history as a reference for that lifecycle.
@@ -115,19 +115,22 @@ across the boundary:
 | ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `initialize`, `session/new`          | Used. One session per invocation; `session/new` receives only the policy-derived `mcpServers: []`.                                                                                                                    |
 | `session/prompt`, `session/update`   | Used. The prompt is exactly the sealed `rendered_input`; update notifications are normalised into §0 events and never re-exposed as ACP.                                                                             |
-| `session/cancel`                     | Used as Huddles' cancellation intent. The invocation is `cancelled` only when the turn reports it.                                                                                                                    |
-| `session/request_permission`         | Not answered by the adapter. Under `deny_all` no tool is advertised, so none arises. A future permission request maps to a typed Huddles `requires` entry (reserved as `input_required` in the lifecycle mapping below), never to an adapter auto-accept. |
-| `session/fork`                       | Never. A Huddles fork is a compile-pipeline fork that seals a new packet and invocation; a copied ACP session would carry mutable context past the seal.                                                              |
-| `session/load` (resume)              | Never. Continuation is Huddles orchestration: a new invocation whose packet names its lineage. The runtime never resumes a terminal invocation.                                                                        |
+| `session/cancel`                     | Used as the controller's cancellation intent. The invocation is `cancelled` only when the turn reports it.                                                                                                                    |
+| `session/request_permission`         | Not answered by the adapter. Under `deny_all` no tool is advertised, so none arises. A future permission request maps to a typed controller-visible requirement (reserved as `input_required` in the lifecycle mapping below), never to an adapter auto-accept. |
+| `session/fork`                       | Never. A controller fork seals a new packet and invocation; a copied ACP session would carry mutable context past the seal.                                                              |
+| `session/load` (resume)              | Never. Continuation is controller orchestration: a new invocation whose packet names its lineage. The runtime never resumes a terminal invocation.                                                                        |
 | `session/list`, `session/close`      | Not used as signals. Cleanup and respawn are adapter-internal and only ever prepare a later invocation.                                                                                                               |
-| Elicitation, MCP-over-ACP            | Not used. Huddles owns every human-facing question and the tool policy; the adapter neither forwards a question to a person nor mounts an MCP server the packet did not seal.                                          |
+| Elicitation, MCP-over-ACP            | Not used. The controller owns every human-facing question and the tool policy; the adapter neither forwards a question to a person nor mounts an MCP server the packet did not seal.                                          |
 
 ## Versioned boundary
 
-Pillbox exposes the private `pillbox.execution/2` contract in
-`cloudflare-spike/src/codex_execution.ts` as its only managed Huddles RPC.
-The historical OpenCode `ensureSession`/`invokeSession` adapter and its
-local-test entrypoint were deleted on 2026-10-04.
+The managed execute route (`POST /v2/executions`) accepts the
+`pillbox.execution/2` contract defined in
+`cloudflare-spike/src/codex_execution.ts`. Callers reach it over public HTTP
+with a short-lived capability bound to the operation, the exact request bytes
+and the session/invocation id; there is no private RPC entry point. The
+historical OpenCode `ensureSession`/`invokeSession` adapter was deleted on
+2026-10-04.
 
 The v2 request binds the substrate execution identity to the exact invocation
 input and output contract:
@@ -140,12 +143,12 @@ idempotency_key
 rendered_input
 rendered_input_hash: sha256:<64 lowercase hex>
 tool_policy: "deny_all"
-execution: Huddles InvocationExecution
+execution: InvocationExecution
 execution_policy_revision
 output_format: { type: "json_schema", schema, retry_count: 2 }
 ```
 
-`execution` mirrors Huddles' authoritative broad contract: harness, transport,
+`execution` is the broad caller-supplied contract: harness, transport,
 version, adapter revision, requested provider/model/profile/reasoning effort,
 optional placement, context-renderer revision, and optional verifier
 reference. The boundary validator accepts that shape. A separate capability
@@ -160,7 +163,7 @@ execution capabilities remain fail-closed adapter decisions.
 
 The boundary intentionally omits `workspace_id`, `effect_id`,
 `delivery_receipt_id`, scheduling, retry, and claim/lock fields. Those are
-Huddles orchestration identities or semantics. There is no generic mutex or
+controller orchestration identities or semantics. There is no generic mutex or
 claim protocol.
 
 The result carries terminal status, disposition, the computed execution digest
@@ -169,12 +172,12 @@ and policy revision, a positional `SessionRef`, and Codex attribution
 `auth_unavailable`, `runtime_busy`, interruption, cancellation, or structured
 output failure without exposing provider diagnostics in the public result.
 
-## Huddles integration contract
+## Controller contract
 
-Huddles remains responsible for constructing and authorizing
+The controller remains responsible for constructing and authorizing
 `InvocationExecution`, selecting and sealing the execution policy revision,
 workspace and effect identities, scheduling, retries, cancellation intent, and
-interpreting the result. Its Pillbox adapter calls the v2 private method with
+interpreting the result. It calls the v2 execute route with
 the rendered input, input hash, output format, and sealed
 `execution_policy_revision`; it should not derive a second execution profile or
 turn the policy revision into Pillbox orchestration.
@@ -190,19 +193,17 @@ revisions must fail before Codex starts.
 ### Lifecycle mapping
 
 The result `status` union is deliberately shape-compatible with the MCP tasks
-lifecycle (SEP-2663) so a tasks-backed runtime can sit behind the same Huddles
-adapter with no wire change. Huddles fixes the mapping in
-`docs/hcp/COMPILATION.md` §9.1 and pins the status set with a contract test;
-Pillbox conforms to it rather than the reverse:
+lifecycle (SEP-2663) so a tasks-backed runtime can sit behind the same
+caller with no wire change:
 
 ```text
 running      -> working         retry_after_ms is the poll interval
 completed    -> completed
 failed       -> failed
-interrupted  -> failed          runtime lost; retry is a Huddles decision
+interrupted  -> failed          runtime lost; retry is a controller decision
 cancelled    -> cancelled       only after cancel intent was received
 conflict     -> (none)          idempotency conflict, the packet never ran
-input_required  reserved        not emitted until Huddles specifies the typed request
+input_required  reserved        not emitted until a typed request is specified
 ```
 
 Cancellation is intent, not a state transition: `cancel` is idempotent and is
@@ -215,9 +216,9 @@ same session is a new invocation.
    invocation-scoped credential capabilities.
 2. Prove the sealed `deny_all` policy at that ACP boundary. Empty MCP alone is
    not proof of tool denial.
-3. Cut Huddles over to the generic execution methods while keeping actor,
-   collaboration order, retry intent, and visibility policy in Huddles.
-4. If native app-server is enabled in managed Huddles, replace the local
+3. Route callers to the generic execution methods while keeping actor,
+   ordering, retry intent, and visibility policy with the controller.
+4. If native app-server is enabled in managed execution, replace the local
    auto-accept approval behavior with enforceable denial and separately review
    its managed credential path. It remains local-microVM-only for now.
 

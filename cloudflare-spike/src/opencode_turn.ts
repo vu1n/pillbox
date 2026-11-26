@@ -1,14 +1,13 @@
 import type { getSandbox } from "@cloudflare/sandbox";
 import type { Payload } from "./contract.js";
-import {
-  huddlesPromptTools,
-  safeHuddlesRuntimeDiagnostic,
-  structuredOutputRetryPrompt,
-  type HuddlesToolPolicy,
-} from "./huddles_policy.js";
 import type { JsonSchemaOutputFormat } from "./codex_execution.js";
 import { OpencodeMapper } from "./opencode_mapper.js";
-import { inspectRawStructuredOutput } from "./structured_output.js";
+import { safeRuntimeDiagnostic } from "./runtime_diagnostic.js";
+import {
+  inspectRawStructuredOutput,
+  structuredOutputRetryPrompt,
+} from "./structured_output.js";
+import { opencodePromptTools, type ToolPolicy } from "./tool_policy.js";
 
 export const OPENCODE_WORKSPACE_DIR = "/workspace";
 export const DEFAULT_OPENCODE_MODEL = "zai-coding-plan/glm-4.5-air";
@@ -41,7 +40,7 @@ export interface OpencodeTurnInput {
   readonly text: string;
   readonly model: string;
   readonly reasoningVariant?: string;
-  readonly toolPolicy?: HuddlesToolPolicy;
+  readonly toolPolicy: ToolPolicy;
   readonly outputFormat?: JsonSchemaOutputFormat;
   readonly config: {
     readonly config?: unknown;
@@ -130,7 +129,8 @@ export async function driveOpencodeTurn(
 
 async function ensureOpencodeReady(input: OpencodeTurnInput): Promise<boolean> {
   let probe = await probeDoc(input.sandbox);
-  if (input.toolPolicy && probe.ok) {
+  // A reachable server may predate this request's tool policy, so replace it before prompting.
+  if (probe.ok) {
     try {
       await input.sandbox.killAllProcesses();
     } catch {
@@ -150,7 +150,6 @@ async function ensureOpencodeReady(input: OpencodeTurnInput): Promise<boolean> {
       return false;
     }
   }
-  if (probe.ok) return true;
 
   const env: Record<string, string> = { ...input.config.env };
   if (input.config.config !== undefined) {
@@ -275,9 +274,7 @@ async function driveOpencodeAttempt(
         parts: [{ type: "text", text: input.text }],
         model: { providerID: input.provider, modelID: input.modelId },
         ...(input.reasoningVariant ? { variant: input.reasoningVariant } : undefined),
-        ...(input.toolPolicy
-          ? { tools: huddlesPromptTools(input.toolPolicy) }
-          : undefined),
+        tools: opencodePromptTools(input.toolPolicy),
         ...(input.outputFormat
           ? {
               format: {
@@ -291,7 +288,7 @@ async function driveOpencodeAttempt(
       REQUEST_TIMEOUT_MS,
     );
     if (!prompted.ok) {
-      const detail = safeHuddlesRuntimeDiagnostic(
+      const detail = safeRuntimeDiagnostic(
         await readResponseTextBounded(
           prompted,
           MAX_OPENCODE_RESPONSE_BYTES,
@@ -320,7 +317,7 @@ async function driveOpencodeAttempt(
       step = await iterator.next();
     } catch (cause) {
       input.sink.appendError(
-        `opencode /event stream rejected: ${safeHuddlesRuntimeDiagnostic(cause)}`,
+        `opencode /event stream rejected: ${safeRuntimeDiagnostic(cause)}`,
       );
       await iterator.return?.(undefined);
       return failed(appended);
@@ -472,7 +469,7 @@ async function cancelBody(body: ReadableStream<Uint8Array>): Promise<void> {
   } catch (cause) {
     console.warn(
       "opencode event stream cleanup failed",
-      safeHuddlesRuntimeDiagnostic(cause),
+      safeRuntimeDiagnostic(cause),
     );
   }
 }

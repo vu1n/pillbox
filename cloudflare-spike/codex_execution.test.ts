@@ -32,7 +32,7 @@ const codexExecution: InvocationExecution = {
   },
   placement: "managed_container",
   context_renderer_revision: "planning-partner/cc-011",
-  verifier_ref: "huddles/verifier/1",
+  verifier_ref: "pillbox/verifier/1",
 };
 
 const output_format = {

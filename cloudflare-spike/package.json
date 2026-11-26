@@ -7,9 +7,6 @@
     "dev": "wrangler dev",
     "test": "node --test *.test.ts *.test.mjs",
     "deploy": "wrangler deploy",
-    "burnin:dry-run": "wrangler deploy -c wrangler.burnin.toml --dry-run --containers-rollout=none",
-    "burnin": "node scripts/burnin-fixed-workload.mjs",
-    "burnin:reconcile": "node scripts/reconcile-burnin.mjs",
     "gen:contract": "node scripts/gen-contract.mjs",
     "check:contract": "node scripts/gen-contract.mjs --check"
   },

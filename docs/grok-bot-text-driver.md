@@ -4,7 +4,7 @@ STATUS: blocked, no driver. Researched 2026-10-11 against the SpaceXAI (xAI)
 docs listed under [Sources](#sources). This is an assessment, not a canonical
 subsystem doc; the text contract itself is in [commands.md](./commands.md)
 ("Sealed local text execution") and
-[huddles-codex-execution.md](./huddles-codex-execution.md).
+[codex-execution.md](./codex-execution.md).
 
 ## Finding
 
@@ -65,7 +65,7 @@ driver requirements in the task (resolve, tool-free, one bounded final text,
    HTTP 200 when a run starts. The routines page does not document a response
    body that carries the answer, a completion signal, or a callback. The
    result is in the Bot's chat (requirement 3).
-4. **Not a sealed, stateless turn.** Huddles owns the conversation and sends
+4. **Not a sealed, stateless turn.** The caller owns the conversation and sends
    one sealed rendered input. A Bot folds every turn into its own memory and
    shares a computer, logins and files with the account's other Bots. The
    output depends on hidden state Pillbox cannot pin or record, and the input

@@ -9,7 +9,6 @@ test("managed topology binds only Cloudflare Sandbox as a Durable Object", () =>
     read("./wrangler.toml"),
     read("./wrangler.container.toml"),
     read("./wrangler.runtime-test.toml"),
-    read("./wrangler.managed-auth-test.toml"),
   ]) {
     const bindings = [...config.matchAll(/\[\[durable_objects\.bindings\]\][\s\S]*?class_name\s*=\s*"([^"]+)"/g)]
       .map((match) => match[1]);

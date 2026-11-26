@@ -1,17 +1,8 @@
-import { openRouterReasoning } from "./opencode_reasoning.js";
-import type { RequestedModelProfile } from "./codex_execution.js";
-import { DigitalOceanClient } from "./digitalocean_client.js";
-import { D1DigitalOceanAllocations } from "./digitalocean_allocations.js";
-import { DigitalOceanExecutionRuntime } from "./digitalocean_runtime.js";
-import { ManagedExecutionRuntime } from "./managed_runtime.js";
 import { getSandbox } from "@cloudflare/sandbox";
-import { WorkerEntrypoint } from "cloudflare:workers";
-import type { Env } from "./worker.js";
-import {
-  type CancelInvocationV2Request,
-  type ExecuteInvocationV2Request,
-  type GetInvocationV2Request,
-} from "./codex_execution.js";
+import type { RequestedModelProfile } from "./codex_execution.js";
+import { D1DigitalOceanAllocations } from "./digitalocean_allocations.js";
+import { DigitalOceanClient } from "./digitalocean_client.js";
+import { DigitalOceanExecutionRuntime } from "./digitalocean_runtime.js";
 import { R2ExecutionArtifactStore } from "./execution_artifacts.js";
 import {
   ExecutionService,
@@ -23,102 +14,30 @@ import {
   D1ExecutionStore,
   type RelationalDatabase,
 } from "./execution_store.js";
+import { managedAdmissionPolicy } from "./managed_admission.js";
 import {
   D1ManagedExecutionReservationStore,
   parseManagedExecutionAllowance,
 } from "./managed_reservation.js";
-import {
-  enforceHuddlesOpencodePolicy,
-  type HuddlesOpencodeConfig,
-} from "./huddles_policy.js";
-import {
-  authorizeExecutionOperation,
-  requireManagedBurninBootstrap,
-} from "./managed_auth.js";
-import type { PillboxExecutionOperationGrantIssueResponse } from "./managed_contract.js";
+import { ManagedExecutionRuntime } from "./managed_runtime.js";
+import { openRouterReasoning } from "./opencode_reasoning.js";
 import {
   RunCostMeter,
   WorkersAnalyticsEngineRunCost,
 } from "./run_cost.js";
-import {
-  managedAdmissionPolicy,
-} from "./managed_admission.js";
 import { deriveSandboxRuntimeId } from "./runtime_identity.js";
+import {
+  enforceOpencodeToolPolicy,
+  type OpencodeConfig,
+  type ToolPolicy,
+} from "./tool_policy.js";
+import type { Env } from "./worker.js";
 
-export { canonicalJson } from "./codex_execution.js";
-export type { JsonSchemaOutputFormat, JsonValue } from "./codex_execution.js";
-export { deriveSandboxRuntimeId, sha256Hex } from "./runtime_identity.js";
-
-/** Private same-account RPC surface for Huddles; execution/2 operation grants are mandatory. */
-export class HuddlesRuntimeEntrypoint extends WorkerEntrypoint<Env> {
-  async executeInvocation(
-    request: ExecuteInvocationV2Request,
-    authorization: PillboxExecutionOperationGrantIssueResponse,
-  ) {
-    return executionService(
-      this.env,
-      operationAuthorizer(this.env, authorization),
-    ).executeInvocation(request);
-  }
-
-  async getExecutionStatus(
-    request: GetInvocationV2Request,
-    authorization: PillboxExecutionOperationGrantIssueResponse,
-  ) {
-    return executionService(
-      this.env,
-      operationAuthorizer(this.env, authorization),
-    ).getExecutionStatus(request);
-  }
-
-  async cancelInvocation(
-    request: CancelInvocationV2Request,
-    authorization: PillboxExecutionOperationGrantIssueResponse,
-  ) {
-    return executionService(
-      this.env,
-      operationAuthorizer(this.env, authorization),
-    ).cancelInvocation(request);
-  }
-
-  /** Read the live D1 allowance under the same invocation-scoped status grant. */
-  async getManagedExecutionAllowance(
-    request: GetInvocationV2Request,
-    authorization: PillboxExecutionOperationGrantIssueResponse,
-  ) {
-    requireManagedBurninBootstrap(this.env);
-    await authorizeExecutionOperation(this.env, authorization, "status", request);
-    const configured = parseManagedExecutionAllowance(
-      this.env.MANAGED_EXECUTION_EPOCH,
-      this.env.MANAGED_EXECUTION_LIMIT,
-    );
-    if (configured === null) {
-      throw new Error("managed execution allowance configuration is invalid");
-    }
-    const store = new D1ManagedExecutionReservationStore(
-      this.env.EXECUTION_DB as unknown as RelationalDatabase,
-    );
-    const snapshot = await store.getAllowance(configured);
-    if (snapshot === null) {
-      throw new Error("managed execution allowance row does not match configuration");
-    }
-    return {
-      source: "pillbox-d1-live" as const,
-      captured_at: new Date().toISOString(),
-      ...snapshot,
-    };
-  }
-
-  async fetch(): Promise<Response> {
-    return new Response("not found\n", { status: 404 });
-  }
-}
-
+/** Compose the D1/R2/runtime execution service for one already-authorized caller. */
 export function executionService(
   env: Env,
   authorizer: ExecutionOperationAuthorizer,
 ): ExecutionService {
-  requireManagedBurninBootstrap(env);
   const meter = new RunCostMeter();
   const store = new D1ExecutionStore(
     env.EXECUTION_DB as unknown as RelationalDatabase,
@@ -170,14 +89,6 @@ export function executionService(
   });
 }
 
-function operationAuthorizer(
-  env: Env,
-  authorization: PillboxExecutionOperationGrantIssueResponse,
-): ExecutionOperationAuthorizer {
-  return ({ operation, request }) =>
-    authorizeExecutionOperation(env, authorization, operation, request);
-}
-
 class UnavailableExecutionRuntime implements ExecutionRuntime {
   async execute(): Promise<{
     served_model: null;
@@ -199,7 +110,7 @@ class UnavailableExecutionRuntime implements ExecutionRuntime {
 
 function opencodeConfig(
   env: Env,
-  toolPolicy: "deny_all" | "runtime_default",
+  toolPolicy: ToolPolicy,
   requested: RequestedModelProfile,
 ): { readonly config?: unknown; readonly env: Readonly<Record<string, string>> } {
   const providerEnv: Record<string, string> = {};
@@ -207,8 +118,8 @@ function opencodeConfig(
     const value = env[key];
     if (value) providerEnv[key] = value;
   }
-  let config: HuddlesOpencodeConfig | undefined = env.OPENCODE_CONFIG_JSON
-    ? (JSON.parse(env.OPENCODE_CONFIG_JSON) as HuddlesOpencodeConfig)
+  let config: OpencodeConfig | undefined = env.OPENCODE_CONFIG_JSON
+    ? (JSON.parse(env.OPENCODE_CONFIG_JSON) as OpencodeConfig)
     : undefined;
   if (env.ZAI_API_KEY) {
     config ??= {};
@@ -234,10 +145,7 @@ function opencodeConfig(
     throw new Error("no opencode provider configured");
   }
   return {
-    config:
-      toolPolicy === "deny_all"
-        ? enforceHuddlesOpencodePolicy(config, toolPolicy)
-        : config,
+    config: enforceOpencodeToolPolicy(config, toolPolicy),
     env: providerEnv,
   };
 }

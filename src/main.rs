@@ -23,7 +23,6 @@ use clap::{CommandFactory, Parser, Subcommand};
 mod agents;
 mod attach;
 mod bookmarks;
-mod checkpoint;
 mod cli;
 mod commands;
 mod config;
@@ -587,7 +586,7 @@ enum Command {
     },
     /// Engine: write or verify-and-unpack a session packet
     /// (`pillbox.session-packet/1`). Called by Stratus, not a user-facing
-    /// command; JSON output is versioned. See docs/session-packet.md.
+    /// command; JSON output is versioned. See crates/packet/session-packet.md.
     #[command(hide = true)]
     Checkpoint {
         #[command(subcommand)]

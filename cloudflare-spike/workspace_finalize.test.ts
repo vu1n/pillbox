@@ -20,7 +20,7 @@ const migrations = [
   "0004_managed_reservation_ownership.sql",
 ].map((name) => readFileSync(new URL(`./migrations/${name}`, import.meta.url), "utf8"));
 const targetOwner = {
-  domain: "huddles_workspace" as const,
+  domain: "public_controller" as const,
   digest: `sha256:${"a".repeat(64)}` as const,
 };
 

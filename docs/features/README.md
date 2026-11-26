@@ -17,8 +17,8 @@ Live local smokes require macOS/HVF, libkrun/libkrunfw, a signed binary from
 `scripts/lk-build.sh`, prepared runner images and agent auth. They consume model
 turns and are separate from the offline checks. Managed tests use Node.js 22 as in
 CI (a version supporting native TypeScript stripping), installed npm dependencies
-and local workerd. Managed production burn-in and observed cost evidence are
-separate release gates. Test references are existing evidence to inspect or run,
+and local workerd. No managed burn-in harness exists; a preview deployment needs a new
+Pillbox-recorded burn-in first. Test references are existing evidence to inspect or run,
 not a claim that every live path was re-driven while writing this map.
 
 | Feature | What to find |

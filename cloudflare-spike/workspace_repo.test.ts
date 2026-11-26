@@ -208,7 +208,7 @@ function transferEnv() {
   return {
     EXECUTION_DB: {} as D1Database,
     MANAGED_CAPABILITY_SECRET: capabilitySecret,
-    MANAGED_EXECUTION_EPOCH: "burnin-test",
+    MANAGED_EXECUTION_EPOCH: "preview-test",
     MANAGED_EXECUTION_LIMIT: "2",
   };
 }
@@ -252,8 +252,5 @@ class MemoryReservations implements ManagedExecutionReservationStore {
     if (this.record === null) return false;
     this.record = { ...this.record, status: "failed", error_code: input.error_code };
     return true;
-  }
-  async getAllowance(allowance: ManagedExecutionAllowance) {
-    return { ...allowance, reserved_executions: this.record === null ? 0 : 1 };
   }
 }

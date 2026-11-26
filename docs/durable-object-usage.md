@@ -1,7 +1,7 @@
 # Durable Object usage policy
 
-Status: **active**. Huddles owns collaboration; managed Pillbox is a
-single-controller execution runtime.
+Status: **active**. Collaboration belongs to the calling controller (Huddles,
+outside Pillbox); managed Pillbox is a single-controller execution runtime.
 
 ## Default rule
 
@@ -49,15 +49,9 @@ After the immutable R2 write and conditional terminal D1 update, only that D1
 winner attempts one derivative Analytics point. Failure is logged but cannot
 undo terminal execution; retries and status reads emit no additional points.
 
-An external [cost receipt](burn-in/cost-receipt.md) binds post-seal commit and
-lifecycle observations to the immutable artifact and execution identity. It
-reconciles measured scopes against the envelope's planned terminal write,
-rather than inventing a fixed terminal-read correction or mutating evidence.
-The receipt does not waive missing vendor DO counters or other release gates.
-Receipt v2 names vendor SQL row units separately from non-SQLite storage units,
-records lifecycle GB-seconds independently of execution milliseconds, and keeps
-namespace retention outside additive per-run totals. Source-backed snapshot and
-authority scopes cannot explain away extra execution artifacts or Analytics points.
+No reconciliation tooling ships in this repository. A post-seal commit or
+container lifecycle observation is not part of the envelope, and nothing may
+rewrite the immutable artifact to include one.
 
 Release owners must compare these envelopes with Cloudflare's D1, R2,
 Containers, Workers, Analytics Engine, and Durable Objects metrics/billing
@@ -67,15 +61,16 @@ still mandatory.
 
 ## Managed preview cost controls
 
-The fixed managed-preview burn-in is deliberately limited to one genuinely new
-execution. An exact retry reuses the D1 claim and immutable R2 artifact; bounded
-status pages are read-only; unsupported managed Codex is rejected before
-Sandbox provisioning; finalize is a separate kill-before-transfer operation.
-The first environment therefore seeds `MANAGED_EXECUTION_LIMIT = 1` and the
-matching `MANAGED_EXECUTION_EPOCH` after migration 0002. The D1 allowance is the
-hard application breaker, does not auto-reset, and is reseeded only as a new
-operator-reviewed epoch. `MANAGED_EXECUTION_ENABLED = 0` remains the default
-kill switch and does not affect local libkrun Pillbox.
+No burn-in harness exists now; a managed preview deployment needs a new
+Pillbox-recorded burn-in first (future work, not defined here). The enforceable
+controls that do exist are the D1 allowance and the admission switch. An exact
+retry reuses the D1 claim and immutable R2 artifact; bounded status pages are
+read-only; unsupported managed Codex is rejected before Sandbox provisioning;
+finalize is a separate operation. The first environment seeds a reviewed
+`MANAGED_EXECUTION_LIMIT` and matching `MANAGED_EXECUTION_EPOCH` after migration
+0002. The D1 allowance is the hard application breaker, does not auto-reset, and
+is reseeded only as a new operator-reviewed epoch. `MANAGED_EXECUTION_ENABLED = 0`
+remains the default kill switch and does not affect local libkrun Pillbox.
 
 A genuinely new invocation first inserts one durable reservation. The insert
 atomically binds or checks the session owner and increments the allowance;
@@ -90,13 +85,10 @@ the same invocation's D1, R2, Container, Worker, Analytics Engine, and vendor
 Sandbox/DO counters. Provider-observed Analytics writes remain outside the
 immutable envelope and record explicit `observed - planned` variance; `-1` is a
 truthful best-effort miss, while a positive variance violates the max-one plan.
-Reconcile retry/status/finalize read-only activity in a separate bounded counter
-set; never explain a second artifact, Analytics point, or model turn as a retry.
-Fail closed on an unexplained delta, a status page
-larger than 100 events, more than one artifact/Analytics point per new run, a
-custom DO class, or any custom DO storage growth. The executable fixture and
-operator report template are in
-[docs/burn-in/managed-preview-template.md](burn-in/managed-preview-template.md).
+Never explain a second artifact, Analytics point, or model turn as a retry.
+Fail closed on an unexplained delta, a status page larger than 100 events, more
+than one artifact/Analytics point per new run, a custom DO class, or any custom
+DO storage growth.
 
 For each environment, record an absolute monthly cap and configure alerts at:
 

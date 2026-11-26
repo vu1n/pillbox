@@ -1,31 +1,23 @@
 import type { Sandbox } from "@cloudflare/sandbox";
-import { HuddlesRuntimeEntrypoint, executionService } from "./huddles_runtime.js";
 import {
   bearerToken,
   verifyManagedCapability,
   type ManagedOperation,
 } from "./auth.js";
 import type { ExecuteInvocationV2Result } from "./codex_execution.js";
-import { safeHuddlesRuntimeDiagnostic } from "./huddles_policy.js";
 import {
   readBoundedJsonWithDigest,
   RequestBodyTooLargeError,
 } from "./request_body.js";
 import { routeWorkspaceTransfer } from "./workspace_transfer.js";
-import type { PillboxAuthorizationCurrentness } from "./managed_auth.js";
-import {
-  ManagedBootstrapError,
-  requireManagedBurninHttpBootstrap,
-} from "./managed_auth.js";
 import {
   ManagedAdmissionError,
   managedAdmissionPolicy,
   requireManagedAdmission,
 } from "./managed_admission.js";
+import { executionService } from "./managed_execution.js";
 import { publicControllerOwner } from "./managed_ownership.js";
-// Named entrypoint: Huddles reaches only authenticated execution/2 lifecycle
-// methods through a same-account service binding.
-export { HuddlesRuntimeEntrypoint };
+import { safeRuntimeDiagnostic } from "./runtime_diagnostic.js";
 // Re-export the SDK's container-owning DO so wrangler can bind it.
 export { Sandbox } from "@cloudflare/sandbox";
 
@@ -37,22 +29,8 @@ export interface Env {
   // config (wrangler.container.toml). Absent in the free/§0-only deploy.
   Sandbox?: DurableObjectNamespace<Sandbox>;
   // HMAC issuer secret for short-lived public controller capabilities bound to
-  // exact request bytes, operation, and resource. Huddles reaches the private
-  // service binding and does not use this public bearer-token surface.
+  // exact request bytes, operation, and resource. Every managed request needs one.
   MANAGED_CAPABILITY_SECRET?: string;
-  /** Makes the isolated burn-in reject every request until its full bootstrap is installed. */
-  PILLBOX_BOOTSTRAP_REQUIRED?: string;
-  /** Private Huddles currentness binding. Transport auth is not workload auth. */
-  PillboxAuthorizationCurrentness?: PillboxAuthorizationCurrentness;
-  /** Public verification half of the active Huddles Ed25519 grant key. */
-  PILLBOX_GRANT_KEY_ID?: string;
-  PILLBOX_GRANT_PUBLIC_KEY?: string;
-  PILLBOX_INSTALLATION_ID?: string;
-  PILLBOX_EXECUTION_REALM_ID?: string;
-  PILLBOX_PROTOCOL_REVISION?: string;
-  PILLBOX_ORGANIZATION_ID?: string;
-  /** Must match both the Huddles bootstrap limit and Wrangler container max_instances. */
-  PILLBOX_MANAGED_CONCURRENCY?: string;
   /** Exact "1" admits new managed executions and workspace provisioning. */
   MANAGED_EXECUTION_ENABLED?: string;
   /** Operator-reviewed epoch and hard cap for genuinely new managed claims. */
@@ -84,15 +62,6 @@ export interface Env {
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
-    try {
-      requireManagedBurninHttpBootstrap(env);
-    } catch (cause) {
-      if (!(cause instanceof ManagedBootstrapError)) throw cause;
-      return Response.json(
-        { error: { code: cause.code, message: cause.message } },
-        { status: 503 },
-      );
-    }
     if (
       req.method === "POST" &&
       new URL(req.url).pathname === "/v2/workspaces/provision"
@@ -153,6 +122,7 @@ async function routeExecutionRequest(
     if (!capability) {
       return Response.json({ error: { code: "unauthenticated" } }, { status: 401 });
     }
+    // Public execution accepts only tool_policy deny_all, rejected before any D1 access.
     if (
       operation === "execute" &&
       typeof body === "object" &&
@@ -188,7 +158,7 @@ async function routeExecutionRequest(
       {
         error: {
           code,
-          message: safeHuddlesRuntimeDiagnostic(cause),
+          message: safeRuntimeDiagnostic(cause),
         },
       },
       {

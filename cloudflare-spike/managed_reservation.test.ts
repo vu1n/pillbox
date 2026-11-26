@@ -30,15 +30,15 @@ const migrations = [1, 2, 3, 4].map((number) =>
   ),
 );
 const allowance: ManagedExecutionAllowance = {
-  deployment_epoch: "burnin-2026-09-08-a",
+  deployment_epoch: "preview-2026-09-08-a",
   execution_limit: 2,
 };
 const ownerA: ManagedExecutionOwner = {
-  domain: "huddles_workspace",
+  domain: "public_controller",
   digest: `sha256:${"a".repeat(64)}`,
 };
 const ownerB: ManagedExecutionOwner = {
-  domain: "huddles_workspace",
+  domain: "public_controller",
   digest: `sha256:${"b".repeat(64)}`,
 };
 const requestHash = `sha256:${"c".repeat(64)}` as const;
@@ -231,7 +231,7 @@ test("SQL rejects malformed owner digests and immutable reservation identity upd
   assert.throws(
     () => sqlite.prepare(
       `INSERT INTO managed_session_owner (session_id, owner_domain, owner_digest, created_at_ms)
-       VALUES ('bad', 'huddles_workspace', ?, 1)`,
+       VALUES ('bad', 'public_controller', ?, 1)`,
     ).run(`sha256:${"a".repeat(63)}z`),
     /CHECK constraint failed/,
   );

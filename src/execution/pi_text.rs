@@ -77,14 +77,6 @@ impl PiHarness {
         }
     }
 
-    /// Where the harness reads `auth.json`, relative to the guest home.
-    pub(crate) fn config_dir(self) -> &'static str {
-        match self {
-            Self::Pi => ".pi/agent",
-            Self::PrimeAgent => ".prime/agent",
-        }
-    }
-
     fn catalog_source(self) -> &'static str {
         match self {
             Self::Pi => PI_CATALOG,
@@ -624,7 +616,8 @@ fn run(
         version_argv: harness.version_argv(),
         env: harness.env(),
         home_files: vec![(
-            format!("{}/auth.json", harness.config_dir()),
+            // The guest reads its credentials where the host keeps them.
+            agent.cred_sentinel.path().to_owned(),
             guest_auth(&selection.provider, &stub_key),
         )],
         stdin: invocation.rendered_input.as_bytes().to_vec(),

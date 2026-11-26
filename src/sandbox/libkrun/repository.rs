@@ -931,7 +931,10 @@ fn prepare_guest(
     fs::create_dir(&codex_home)?;
     crate::paths::ensure_mode_0700(&codex_home)?;
     write_private_file(&codex_home.join("config.toml"), &input.codex_config)?;
-    write_private_file(&codex_home.join("auth.json"), &input.guest_auth)?;
+    write_private_file(
+        &codex_home.join(pillbox_credentials::CODEX.file_name()),
+        &input.guest_auth,
+    )?;
     write_private_file(&codex_home.join("models.json"), &input.model_catalog)?;
     let runtime = rootfs.join(GUEST_RUNTIME.trim_start_matches('/'));
     write_private_file(&runtime.join("bridge.py"), BRIDGE.as_bytes())?;

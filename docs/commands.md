@@ -244,8 +244,11 @@ the `--no-default-features` build, and print one versioned JSON object with
 | `pillbox checkpoint pack --workspace DIR [--harness-state DIR] --harness NAME [--harness-session-id ID] [--transcript REL] --out FILE [--json]` | Write a deterministic session packet (`pillbox.session-packet/1`): `packet.json`, then `workspace/…` and `harness/…`. Credential files are never packed and are reported in `excluded`. Same trees, same digest. Prints `{version, format, digest, bytes, manifest, excluded}`. |
 | `pillbox checkpoint unpack --packet FILE --expect sha256:HEX --workspace DIR [--harness-state DIR] [--allow-nonempty] [--json]` | Verify the digest, then every entry against the manifest, then unpack; nothing is written unless the packet verifies. Refuses traversal, escaping symlinks, unlisted entries and a non-empty target (unless `--allow-nonempty`). Prints `{version, format, digest, manifest}`. Exit 1 = refused packet, 2 = bad flags or non-empty target. |
 
-Layout, exclusions, limits and checks: [session-packet.md](./session-packet.md);
-schema: [`proto/pillbox/session-packet-1.schema.json`](../proto/pillbox/session-packet-1.schema.json).
+The same subcommands ship alone as the `pillbox-packet` binary (`pillbox-packet pack|unpack`,
+crate `crates/packet/`), for callers that build the packet without the rest of pillbox.
+
+Layout, exclusions, limits and checks: [session-packet.md](../crates/packet/session-packet.md);
+schema: [`crates/packet/session-packet-1.schema.json`](../crates/packet/session-packet-1.schema.json).
 
 ---
 
@@ -550,7 +553,7 @@ report, diagnostic, and teardown errors have no verdict. See [the probe contract
 
 The `pillbox.text/1` request runs one tool-free Codex GPT-6 Luna turn under an
 immutable local microVM profile. Its exact request, bounds, and evidence
-contract are in [Huddles Codex execution](huddles-codex-execution.md).
+contract are in [Codex execution](codex-execution.md).
 
 ```sh
 pillbox text execute --request request.json

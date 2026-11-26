@@ -58,7 +58,7 @@ const CHATGPT_HOST_DOT: &str = ".chatgpt.com";
 const CHAT_OPENAI_HOST: &str = "chat.openai.com";
 const AUTH_OPENAI_HOST: &str = "auth.openai.com";
 const OAUTH_TOKEN_PATH_SUFFIX: &str = "/oauth/token";
-const CREDS_PATH: &str = ".codex/auth.json";
+const CREDS_PATH: &str = pillbox_credentials::CODEX.path();
 const OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OAUTH_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
 

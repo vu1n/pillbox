@@ -10,6 +10,30 @@ transport (in-sandbox pty-host + frame protocol; local detach/reattach).
 
 ## Unreleased
 
+- The session packet (`pillbox.session-packet/1`) is now its own workspace
+  crate, `pillbox-packet` (`crates/packet/`), with a standalone
+  `pillbox-packet pack|unpack` binary that builds without the rest of pillbox
+  (`cargo build -p pillbox-packet`). Its flags, JSON, exit codes and packets are
+  unchanged and identical to `pillbox checkpoint pack|unpack`, which stays. The
+  format spec and schema moved beside the crate
+  (`crates/packet/session-packet.md`, `crates/packet/session-packet-1.schema.json`).
+  Credential file names the packet excludes and the agent registry uses now come
+  from one table, the `pillbox-credentials` crate (`crates/credentials/`).
+- Remove the managed tier's private Workers RPC entry point
+  (`HuddlesRuntimeEntrypoint`), its Ed25519 operation-grant protocol, the
+  authorization-currentness service binding, the Huddles owner domain, and the
+  manual Huddles-recorded burn-in (bootstrap validator, fixed-workload recorder,
+  reconciler, cost receipt and cost accounting scripts, `wrangler.burnin.toml`,
+  `docs/burn-in/`). The Worker serves only the public HTTP routes, authorized by
+  short-lived HMAC capabilities; the owner is always `public_controller`, and
+  `tool_policy` must be `deny_all` (HTTP 400 `unsupported_policy` otherwise). The
+  D1 allowance is the cost breaker. A managed preview deployment now needs a new
+  Pillbox-recorded burn-in, which does not exist yet.
+- Managed execution no longer admits the execution transport label
+  `cloudflare-service-binding`, which described only the deleted private RPC
+  caller. A public request carrying it now gets `unsupported_execution`, and no
+  in-repo client sends it.
+- Rename `docs/huddles-codex-execution.md` to `docs/codex-execution.md`.
 - `pillbox dispatch` grades every worker on a copy of its workspace inside the
   grader microVM, never on the host and never in the live tree. Tests, test
   config, CI config and rubrics are reset to the bookmark and locked, and the

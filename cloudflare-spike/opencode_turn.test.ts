@@ -22,6 +22,7 @@ registerHooks({
 const { driveOpencodeTurn, readStreamChunkWithTimeout } = await import(
   "./src/opencode_turn.ts"
 );
+const { enforceOpencodeToolPolicy } = await import("./src/tool_policy.ts");
 
 const outputFormat = {
   type: "json_schema" as const,
@@ -58,6 +59,7 @@ test("OpenCode turn returns exact structured output through the evidence sink", 
     model: "zai-coding-plan/glm-4.7",
     reasoningVariant: "pillbox-high",
     outputFormat,
+    toolPolicy: "deny_all",
     config: { env: {} },
     sink: evidence.sink,
   });
@@ -109,6 +111,7 @@ test("OpenCode turn retries in a fresh session and records raw JSON acceptance",
       text: "Produce the document.",
       model: "zai-coding-plan/glm-4.7",
       outputFormat,
+      toolPolicy: "deny_all",
       config: { env: {} },
       sink: evidence.sink,
     });
@@ -152,12 +155,54 @@ test("OpenCode turn rejects an oversized session response before JSON parsing", 
     sandbox: transport.sandbox,
     text: "hello",
     model: "zai-coding-plan/glm-4.7",
+    toolPolicy: "deny_all",
     config: { env: {} },
     sink: evidence.sink,
   });
 
   assert.equal(output, undefined);
   assert.match(evidence.errors[0] ?? "", /response exceeded 262144 bytes/);
+});
+
+test("OpenCode turn replaces an already-reachable server before prompting under deny_all", async () => {
+  const transport = fakeTransport([
+    sse(
+      event("message.part.delta", {
+        messageID: "msg:1",
+        partID: "part:1",
+        field: "text",
+        delta: "done",
+      }),
+      event("session.idle", {}),
+    ),
+  ]);
+  const evidence = captureEvidence();
+
+  await driveOpencodeTurn({
+    sandbox: transport.sandbox,
+    text: "hello",
+    model: "zai-coding-plan/glm-4.7",
+    toolPolicy: "deny_all",
+    config: {
+      config: enforceOpencodeToolPolicy(
+        { permission: "allow", provider: { openrouter: { options: { apiKey: "k" } } } },
+        "deny_all",
+      ),
+      env: {},
+    },
+    sink: evidence.sink,
+  });
+
+  // The fake's first /doc probe succeeds, so a server predating this request is already up.
+  assert.deepEqual(transport.lifecycle, ["kill", "start", "prompt"]);
+  const tools = transport.promptBodies[0].tools ?? {};
+  assert.ok(Object.keys(tools).length > 0);
+  assert.ok(Object.values(tools).every((allowed) => allowed === false));
+  assert.deepEqual(evidence.errors, []);
+  // The restarted server boots with the server-side deny policy, not just per-prompt switches.
+  const content = transport.startEnvs[0]?.OPENCODE_CONFIG_CONTENT;
+  assert.equal(typeof content, "string");
+  assert.equal(JSON.parse(content!).permission, "deny");
 });
 
 test("OpenCode turn rejects an oversized SSE frame before accumulation", async () => {
@@ -168,6 +213,7 @@ test("OpenCode turn rejects an oversized SSE frame before accumulation", async (
     sandbox: transport.sandbox,
     text: "hello",
     model: "zai-coding-plan/glm-4.7",
+    toolPolicy: "deny_all",
     config: { env: {} },
     sink: evidence.sink,
   });
@@ -232,8 +278,13 @@ function fakeTransport(
   readonly promptBodies: Array<{
     readonly parts: ReadonlyArray<{ readonly text: string }>;
     readonly variant?: string;
+    readonly tools?: Record<string, boolean>;
   }>;
+  readonly lifecycle: string[];
+  readonly startEnvs: Array<Record<string, string> | undefined>;
 } {
+  const lifecycle: string[] = [];
+  const startEnvs: Array<Record<string, string> | undefined> = [];
   let streamIndex = 0;
   let sessionIndex = 0;
   const promptPaths: string[] = [];
@@ -241,11 +292,14 @@ function fakeTransport(
     readonly parts: ReadonlyArray<{ readonly text: string }>;
     readonly variant?: string;
   }> = [];
+  let serving = true;
   const sandbox = {
     containerFetch: async (request: Request): Promise<Response> => {
       const path = new URL(request.url).pathname;
       if (request.method === "GET" && path === "/doc") {
-        return new Response("ok");
+        return serving
+          ? new Response("ok")
+          : new Response("starting", { status: 503 });
       }
       if (request.method === "GET" && path === "/event") {
         const body = eventStreams[streamIndex++];
@@ -260,24 +314,38 @@ function fakeTransport(
         return Response.json({ id: `session:${sessionIndex}` });
       }
       if (request.method === "POST" && path.endsWith("/prompt_async")) {
+        lifecycle.push("prompt");
         promptPaths.push(path);
         promptBodies.push(
           (await request.json()) as {
             readonly parts: ReadonlyArray<{ readonly text: string }>;
-    readonly variant?: string;
+            readonly variant?: string;
+            readonly tools?: Record<string, boolean>;
           },
         );
         return new Response(null, { status: 204 });
       }
       return new Response("not found", { status: 404 });
     },
-    killAllProcesses: async () => {},
-    startProcess: async () => {},
+    killAllProcesses: async () => {
+      lifecycle.push("kill");
+      serving = false;
+    },
+    startProcess: async (
+      _command: string,
+      options?: { readonly env?: Record<string, string> },
+    ) => {
+      lifecycle.push("start");
+      startEnvs.push(options?.env);
+      serving = true;
+    },
   };
   return {
     sandbox: sandbox as never,
     promptPaths,
     promptBodies,
+    lifecycle,
+    startEnvs,
   };
 }
 

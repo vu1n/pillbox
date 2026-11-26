@@ -843,9 +843,9 @@ fn vault_egress_allowlist(opts: &RunOpts, with_hosts: &[String]) -> Vec<String> 
 fn commit_detached_session(
     resolved: &Pillbox,
     session: &crate::session::Session,
-    child: std::process::Child,
+    child: crate::sandbox::DetachedChild,
     rootfs: &super::rootfs::PrivateRootfs,
-) -> Result<std::process::Child> {
+) -> Result<crate::sandbox::DetachedChild> {
     if let Err(error) = crate::session::write(resolved, session) {
         super::repository::stop_spawned_vmm(child)
             .with_context(|| format!("detached session commit failed: {error:#}"))?;
@@ -893,14 +893,13 @@ fn run_detached(
     // detached launch must not orphan its reparented VM).
     arm_commit_guard(&mut cmd, resolved, session_id);
     vmm_own_process_group(&mut cmd);
-    let mut child = cmd
-        .spawn()
+    let mut child = crate::sandbox::DetachedChild::spawn(&mut cmd)
         .context("spawn the detached libkrun VMM subprocess")?;
     launch.rootfs.preserve();
 
     // Env fork: hand the reals to the child's MITM on stdin (out-of-band), as the
     // foreground path does, then drop the pipe (EOF).
-    if let Some(mut sin) = child.stdin.take() {
+    if let Some(mut sin) = child.take_stdin() {
         let blob = serde_json::to_string(&launch.swap_pairs).unwrap_or_else(|_| "[]".into());
         use std::io::Write as _;
         let _ = sin.write_all(blob.as_bytes());
@@ -955,8 +954,9 @@ fn run_detached(
         return Err(e).context("start detached session transcript tailer");
     }
     // Don't wait: the child (VM + egress + MITM, with the vault) keeps running;
-    // a waiter thread reaps it if it exits while this process lives.
-    crate::sandbox::reap_detached(child);
+    // dropping it hands it to a waiter thread that reaps it if it exits while this
+    // process lives.
+    drop(child);
     Ok(Started::Detached(session))
 }
 
@@ -1126,10 +1126,11 @@ fn launch_server_vm(
         .stderr(std::process::Stdio::null());
     arm_commit_guard(&mut cmd, resolved, &session_id);
     vmm_own_process_group(&mut cmd);
-    let mut child = cmd.spawn().context("spawn the libkrun VMM subprocess")?;
+    let mut child = crate::sandbox::DetachedChild::spawn(&mut cmd)
+        .context("spawn the libkrun VMM subprocess")?;
     rootfs.preserve();
     // No swap pairs (non-vault): hand the child's MITM an empty set + EOF.
-    if let Some(mut sin) = child.stdin.take() {
+    if let Some(mut sin) = child.take_stdin() {
         use std::io::Write as _;
         let _ = sin.write_all(b"[]");
     }
@@ -1219,8 +1220,7 @@ fn launch_server_vm(
             // runtime-dep footgun) has already exited, and our `kill` would otherwise
             // clobber that status with SIGKILL and mask the actionable cause.
             let self_status = child.try_wait().ok().flatten();
-            let _ = child.kill();
-            child.wait().context("reap failed server VMM")?;
+            child.kill_and_wait().context("reap failed server VMM")?;
             reap_vmm_by_spec(&spec_path.to_string_lossy())?;
             rootfs.remove_stopped()?;
             let _ = std::fs::remove_file(&host_sock);
@@ -1240,7 +1240,8 @@ fn launch_server_vm(
         }
     };
 
-    crate::sandbox::reap_detached(child);
+    // The VMM keeps running; dropping `child` hands it to a waiter thread.
+    drop(child);
     // No auto-send: the server came up ready (wait_ready in bringup), so the first
     // prompt goes through `session send` — captured by a subscribed watch.
     Ok(Started::ServerReady {
@@ -1854,23 +1855,23 @@ fn spawn_session_tailer(
     };
     let dir = crate::session::session_dir(resolved, &session.id)?;
     let exe = std::env::current_exe().context("locate pillbox transcript tailer executable")?;
-    let mut child = Command::new(exe)
-        .arg("__session-tailer")
-        .arg(&dir)
-        .arg(&capture)
-        .arg(source.as_token())
-        .arg(&session.id)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .context("spawn detached session transcript tailer")?;
+    let mut child = crate::sandbox::DetachedChild::spawn(
+        Command::new(exe)
+            .arg("__session-tailer")
+            .arg(&dir)
+            .arg(&capture)
+            .arg(source.as_token())
+            .arg(&session.id)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )
+    .context("spawn detached session transcript tailer")?;
 
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         if crate::commands::session::detached_tailer_alive(resolved, session) {
-            crate::sandbox::reap_detached(child);
-            return Ok(());
+            return Ok(()); // `child` drops into a waiter thread
         }
         if let Some(status) = child
             .try_wait()
@@ -1879,8 +1880,7 @@ fn spawn_session_tailer(
             bail!("detached transcript tailer exited before readiness ({status})");
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = child.kill_and_wait();
             bail!("timed out waiting for the detached transcript tailer to become ready");
         }
         std::thread::sleep(Duration::from_millis(25));
@@ -2978,7 +2978,7 @@ mod tests {
         let mut command = Command::new("/bin/sleep");
         command.arg("30");
         vmm_own_process_group(&mut command);
-        let child = command.spawn().unwrap();
+        let child = crate::sandbox::DetachedChild::spawn(&mut command).unwrap();
         let group = child.id() as i32;
         root.preserve();
         assert!(

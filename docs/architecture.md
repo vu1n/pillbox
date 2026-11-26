@@ -75,8 +75,9 @@ values; the `--json` shapes (`session::started_json`, `session_info`,
 depend on them. `Started::into_live_session` is the one place that decides which
 run outcomes a caller can go on driving. Because `run::start` runs inside
 long-lived callers, every detached child it spawns (`__krun-vmm`,
-`__session-tailer`) is handed to `sandbox::reap_detached`, so an exited child
-never lingers as a zombie that signal-0 liveness probes read as alive.
+`__session-tailer`) is spawned as a `sandbox::DetachedChild`, whose `Drop` hands
+it to a waiter thread, so an exited child never lingers as a zombie that
+signal-0 liveness probes read as alive.
 
 ### libkrun launch shape `[verified 2026-06-20]`
 `krun_create_ctx` → `set_vm_config` → `set_root(dir)` (virtio-fs root, *not* a

@@ -15,6 +15,8 @@ entry:
 tests:
   - "src/commands/dispatch.rs:a_worker_editing_a_protected_test_does_not_change_its_grade"
   - "src/commands/dispatch.rs:worker_build_and_test_code_never_runs_on_the_host"
+  - "src/commands/dispatch.rs:a_fork_starts_exactly_what_the_old_cli_argv_asked_for"
+  - "src/commands/eval.rs:a_cell_starts_exactly_what_the_old_cli_argv_asked_for"
   - "scripts/smoke/dispatch.sh"
   - "scripts/smoke/dispatch-segments.sh"
 ---
@@ -43,5 +45,5 @@ Create a base snapshot/bookmark and a verifier, then use `pillbox dispatch --fro
 - Worker-edited tests are restored/protected for grading. Grader unavailability is an error, not a host fallback.
 - Inspect `pulled_to`, not only winner/exit status; result recovery can fail separately.
 - Dispatch never re-executes `pillbox` or parses CLI `--json`; a fork that comes back as anything but a detached/server session (or a structured run that exited 0) errors that worker (`Started::into_live_session`).
-- Forks run `run::start` inside the long-lived dispatch process, so each detached `__krun-vmm`/`__session-tailer` child is handed to `sandbox::reap_detached`; a dropped `Child` that exits would stay a zombie that the tailer's signal-0 liveness probe reads as alive, and `wait_idle` would never start a replacement tailer.
+- Forks run `run::start` inside the long-lived dispatch process, so each detached `__krun-vmm`/`__session-tailer` child is a `sandbox::DetachedChild` whose `Drop` hands it to a waiter thread; a bare dropped `Child` that exits would stay a zombie that the tailer's signal-0 liveness probe reads as alive, and `wait_idle` would never start a replacement tailer.
 - A general Ghost planner/conductor DAG remains design history, not a feature implied by the implemented segment chain.

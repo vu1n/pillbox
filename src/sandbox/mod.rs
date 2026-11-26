@@ -34,21 +34,73 @@ use crate::pillbox::Pillbox;
 use crate::sandbox::http::SandboxHttp;
 use crate::session::{Backend, Session};
 
-/// Hand a detached child (a VMM or §0 tailer that outlives its launch call) to a
-/// waiter thread. The launch may run inside a long-lived caller (dispatch, eval),
-/// where a dropped `Child` that exits would stay a zombie of that caller.
-// A detached child is reaped by a waiter thread, so a dead child never reads as alive to signal-0 probes.
+/// A child that outlives its launch call: a detached VMM or §0 tailer. The
+/// launch may run inside a long-lived caller (dispatch, eval), where an exited
+/// child nobody waits on stays a zombie of that caller. Dropping it hands the
+/// child to a waiter thread; the explicit methods consume it instead.
+// A detached child is reaped when dropped, so a dead child never reads as alive to signal-0 probes.
 #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
-pub(crate) fn reap_detached(mut child: std::process::Child) {
-    let reaper = std::thread::Builder::new()
-        .name(format!("reap-{}", child.id()))
-        .spawn(move || {
-            let _ = child.wait();
-        });
-    if let Err(error) = reaper {
-        eprintln!(
-            "pillbox: warning: could not start a reaper thread for a detached child: {error}"
-        );
+pub(crate) struct DetachedChild(Option<std::process::Child>);
+
+#[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
+impl DetachedChild {
+    pub(crate) fn spawn(cmd: &mut std::process::Command) -> std::io::Result<Self> {
+        Ok(Self(Some(cmd.spawn()?)))
+    }
+
+    fn child(&mut self) -> &mut std::process::Child {
+        self.0
+            .as_mut()
+            .expect("a DetachedChild holds its child until consumed")
+    }
+
+    pub(crate) fn id(&self) -> u32 {
+        self.0.as_ref().map_or(0, std::process::Child::id)
+    }
+
+    pub(crate) fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
+        self.child().stdin.take()
+    }
+
+    /// The child's exit status if it has exited (and is then reaped), without blocking.
+    pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child().try_wait()
+    }
+
+    /// SIGKILL the child (a no-op if it already exited) and wait for it here.
+    pub(crate) fn kill_and_wait(mut self) -> std::io::Result<std::process::ExitStatus> {
+        let mut child = self.0.take().expect("a DetachedChild holds its child");
+        let _ = child.kill();
+        child.wait()
+    }
+
+    /// Give up the reaper: the caller now owns waiting for the child.
+    pub(crate) fn into_child(mut self) -> std::process::Child {
+        self.0.take().expect("a DetachedChild holds its child")
+    }
+}
+
+impl Drop for DetachedChild {
+    fn drop(&mut self) {
+        let Some(mut child) = self.0.take() else {
+            return;
+        };
+        // Already exited and reaped by a `try_wait`: nothing left to wait for.
+        if let Ok(Some(_)) = child.try_wait() {
+            return;
+        }
+        #[cfg(test)]
+        tests::REAPERS_STARTED.with(|n| n.set(n.get() + 1));
+        let reaper = std::thread::Builder::new()
+            .name(format!("reap-{}", child.id()))
+            .spawn(move || {
+                let _ = child.wait();
+            });
+        if let Err(error) = reaper {
+            eprintln!(
+                "pillbox: warning: could not start a reaper thread for a detached child: {error}"
+            );
+        }
     }
 }
 
@@ -393,12 +445,17 @@ mod tests {
         assert!(err.contains("managed"), "{err}");
     }
 
-    #[test]
-    fn reap_detached_leaves_no_zombie() {
-        let child = std::process::Command::new("true").spawn().unwrap();
-        let pid = child.id() as i32;
-        reap_detached(child);
-        // An unreaped exited child would keep answering signal-0 as a zombie.
+    thread_local! {
+        /// Reaper threads `DetachedChild::drop` started on this test's thread.
+        pub(super) static REAPERS_STARTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn reapers_started() -> usize {
+        REAPERS_STARTED.with(std::cell::Cell::get)
+    }
+
+    /// Wait (bounded) until `pid` no longer answers signal-0: it exited AND was reaped.
+    fn assert_reaped(pid: i32) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while unsafe { libc::kill(pid, 0) } == 0 {
             assert!(
@@ -407,6 +464,52 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn dropping_a_detached_child_reaps_it() {
+        // One that may already have exited at drop, and one still running that exits later.
+        for (program, args) in [("true", &[][..]), ("sleep", &["0.2"][..])] {
+            let child =
+                DetachedChild::spawn(std::process::Command::new(program).args(args)).unwrap();
+            let pid = child.id() as i32;
+            drop(child);
+            assert_reaped(pid);
+        }
+        // A running child is handed to exactly one reaper thread.
+        let before = reapers_started();
+        let child = DetachedChild::spawn(std::process::Command::new("sleep").arg("0.2")).unwrap();
+        let pid = child.id() as i32;
+        drop(child);
+        assert_eq!(reapers_started(), before + 1);
+        assert_reaped(pid);
+    }
+
+    #[test]
+    fn an_explicitly_stopped_detached_child_is_waited_once() {
+        let before = reapers_started();
+        let child = DetachedChild::spawn(std::process::Command::new("sleep").arg("30")).unwrap();
+        let pid = child.id() as i32;
+        let status = child.kill_and_wait().unwrap();
+        assert!(!status.success());
+        // Waited here, synchronously: no zombie, and no reaper thread waits it again.
+        assert_ne!(unsafe { libc::kill(pid, 0) }, 0);
+        assert_eq!(reapers_started(), before);
+
+        // A child `try_wait` already reaped needs no reaper either.
+        let mut child = DetachedChild::spawn(&mut std::process::Command::new("true")).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        drop(child);
+        assert_eq!(reapers_started(), before);
+
+        // Handing the child over gives up the reaper; the new owner waits.
+        let child = DetachedChild::spawn(&mut std::process::Command::new("true")).unwrap();
+        child.into_child().wait().unwrap();
+        assert_eq!(reapers_started(), before);
     }
 
     #[test]

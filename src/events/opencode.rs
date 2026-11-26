@@ -446,11 +446,11 @@ fn flush_frame(
 /// - **Opens only a regular file.** The guest owns the path, so the open goes
 ///   through [`open_guest_file`]: a symlink, FIFO or device there ends the read
 ///   with an error instead of being followed or blocking.
-/// - **Drains a bounded tail after `stop`.** Once `stop` is seen, reads go on so
-///   frames the guest flushed during the last poll sleep still land (mirrors the
-///   file tailer's final-pump), but at most [`FOLLOW_FINAL_DRAIN_BYTES`] more: a
-///   guest can grow its capture without end (a huge sparse file, one endless
-///   line), and the thread that set `stop` is joining this one.
+/// - **Reads a bounded tail after `stop`.** Once `stop` is seen, reads go on so a
+///   drain can finish the line it is in (the drains themselves stop at the next
+///   line boundary), but at most [`FOLLOW_FINAL_DRAIN_BYTES`] more: a guest can
+///   grow its capture without end (a huge sparse file, one endless line), and the
+///   thread that set `stop` is joining this one.
 #[cfg_attr(not(feature = "libkrun"), allow(dead_code))]
 pub(crate) struct FollowReader {
     path: std::path::PathBuf,
@@ -461,7 +461,7 @@ pub(crate) struct FollowReader {
 }
 
 /// Most bytes a [`FollowReader`] reads once `stop` is set: two whole capture lines,
-/// room for the frames of one poll sleep and never an unbounded guest backlog.
+/// more than any line a drain could still log, and never an unbounded guest backlog.
 pub(crate) const FOLLOW_FINAL_DRAIN_BYTES: usize = 2 * MAX_CAPTURE_LINE_BYTES;
 
 impl FollowReader {
@@ -875,8 +875,8 @@ mod tests {
         });
     }
 
-    /// After stop the follower still returns what the guest flushed during the last
-    /// nap, then ends at EOF.
+    /// After stop the follower still returns what is left in the file, so a drain can
+    /// finish its current line, then ends at EOF.
     #[test]
     fn a_stopped_follow_reader_drains_its_final_tail() {
         use std::io::{Read as _, Write as _};

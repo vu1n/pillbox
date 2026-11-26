@@ -241,9 +241,10 @@ fn empty_dir_at(dir: &std::os::fd::OwnedFd, depth: usize) -> Result<()> {
                 {
                     let err = std::io::Error::last_os_error();
                     // Linux refuses a no-follow chmod of a link swapped in since the stat.
+                    // A guard, not an or-pattern: ENOTSUP == EOPNOTSUPP on Linux but not macOS.
                     let swapped = matches!(
                         err.raw_os_error(),
-                        Some(libc::ENOTSUP) | Some(libc::EOPNOTSUPP) | Some(libc::ENOENT)
+                        Some(e) if e == libc::ENOTSUP || e == libc::EOPNOTSUPP || e == libc::ENOENT
                     );
                     if !swapped {
                         return Err(err).with_context(|| {

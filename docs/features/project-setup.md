@@ -23,6 +23,7 @@ tests:
   - "src/config.rs:overlay_project_wins_global_fills_gaps"
   - "src/sandbox/libkrun/login.rs:claude_login_vm_opens_token_endpoints_mounts_the_real_home_and_forwards_the_callback"
   - "src/sandbox/libkrun/login.rs:login_without_an_oauth_port_has_no_callback_forward"
+  - "src/sandbox/libkrun/login.rs:the_callback_relay_carries_bytes_both_ways_and_closes_cleanly"
   - "src/sandbox/libkrun/login.rs:a_project_runner_image_does_not_reach_the_login_vm"
   - "src/sandbox/libkrun/login.rs:every_claude_oauth_agent_reaches_claude_ai_at_login"
   - "src/sandbox/libkrun/egress.rs:only_the_login_constructor_opens_token_endpoints_and_the_spec_file_keeps_it"

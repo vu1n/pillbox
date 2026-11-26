@@ -407,6 +407,43 @@ mod tests {
     }
 
     #[test]
+    fn the_callback_relay_carries_bytes_both_ways_and_closes_cleanly() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("fwd.sock");
+        let guest = UnixListener::bind(&sock).unwrap();
+        let port = TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let relay = super::CallbackRelay::start(port, sock).unwrap();
+
+        // Stands in for the guest's vsock-forward: read the request, answer, hang up.
+        let guest_side = std::thread::spawn(move || {
+            let (mut conn, _) = guest.accept().unwrap();
+            conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut req = [0u8; 17];
+            conn.read_exact(&mut req).unwrap();
+            conn.write_all(b"HTTP/1.1 200 OK\r\n\r\nbye").unwrap();
+            req
+        });
+
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client.write_all(b"GET /cb?code=abc ").unwrap();
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).unwrap(); // EOF proves the relay closed cleanly
+        assert_eq!(resp, b"HTTP/1.1 200 OK\r\n\r\nbye");
+        assert_eq!(&guest_side.join().unwrap(), b"GET /cb?code=abc ");
+        drop(relay);
+    }
+
+    #[test]
     fn login_without_an_oauth_port_has_no_callback_forward() {
         assert_eq!(CODEX.oauth_port, None);
         let (vm, script, _dir) = build(&CODEX, None);
